@@ -11,7 +11,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use gascan_apple::{CommandOutput, CommandRunner, CommandSpec, ProcessRunner};
+use gascan_apple::{
+    AppleAttach, AttachSession, CommandOutput, CommandRunner, CommandSpec, ProcessRunner,
+};
 use serde_json::Value;
 
 pub type TestError = Box<dyn std::error::Error + Send + Sync>;
@@ -174,6 +176,15 @@ impl LiveContext {
     pub async fn exec(&self, command: &str) -> Result<CommandOutput, TestError> {
         let name = self.container.lock().unwrap().clone();
         self.run_ok(["exec", &name, "sh", "-c", command]).await
+    }
+
+    pub async fn attach<I, A>(&self, argv: I, tty: bool) -> Result<AttachSession, TestError>
+    where
+        I: IntoIterator<Item = A>,
+        A: AsRef<str>,
+    {
+        let name = self.container.lock().unwrap().clone();
+        Ok(AppleAttach::default().exec(name, argv, tty).await?)
     }
 
     pub async fn write_host(&self, name: &str, contents: &str) -> Result<(), TestError> {

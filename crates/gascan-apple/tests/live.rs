@@ -1,3 +1,5 @@
+#[path = "live/attach.rs"]
+mod attach;
 #[path = "live/common/mod.rs"]
 mod common;
 #[path = "live/lifecycle.rs"]
