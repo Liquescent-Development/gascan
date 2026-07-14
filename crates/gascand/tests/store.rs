@@ -439,6 +439,47 @@ fn superficially_similar_but_weakened_v1_schemas_are_rejected() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn version_one_rejects_every_unexpected_user_schema_object() -> TestResult {
+    const MIGRATION: &str = include_str!("../migrations/001_initial.sql");
+    let extras = [
+        (
+            "sandbox-trigger",
+            "CREATE TRIGGER extra_sandbox_trigger AFTER UPDATE ON sandboxes BEGIN SELECT 1; END;",
+        ),
+        (
+            "operation-trigger",
+            "CREATE TRIGGER extra_operation_trigger AFTER UPDATE ON operations BEGIN SELECT 1; END;",
+        ),
+        (
+            "required-table-index",
+            "CREATE INDEX extra_sandbox_index ON sandboxes(desired_state);",
+        ),
+        ("extra-table", "CREATE TABLE extra_table (value TEXT);"),
+        (
+            "extra-view",
+            "CREATE VIEW extra_view AS SELECT id FROM sandboxes;",
+        ),
+        (
+            "unrelated-index",
+            "CREATE TABLE unrelated (value TEXT); CREATE INDEX unrelated_index ON unrelated(value);",
+        ),
+    ];
+    for (name, extra) in extras {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join(format!("{name}.db"));
+        let connection = rusqlite::Connection::open(&path)?;
+        connection.execute_batch(MIGRATION)?;
+        connection.execute_batch(extra)?;
+        drop(connection);
+        assert!(
+            matches!(Store::open(path), Err(StoreError::SchemaMismatch(_))),
+            "unexpected schema object was accepted: {name}"
+        );
+    }
+    Ok(())
+}
+
 fn run_crash_child(mode: &str, path: &std::path::Path) -> TestResult {
     let status = Command::new(std::env::current_exe()?)
         .args(["--exact", "sqlite_crash_child", "--nocapture"])

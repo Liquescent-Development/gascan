@@ -645,6 +645,7 @@ fn validate_terminal_actual_transition(
 }
 
 fn validate_v1_schema(connection: &Connection) -> Result<(), StoreError> {
+    validate_schema_inventory(connection)?;
     validate_table_columns(
         connection,
         "sandboxes",
@@ -718,6 +719,85 @@ fn validate_v1_schema(connection: &Connection) -> Result<(), StoreError> {
     validate_trigger(connection, "operation_events_no_update", "before update")?;
     validate_trigger(connection, "operation_events_no_delete", "before delete")?;
     Ok(())
+}
+
+fn validate_schema_inventory(connection: &Connection) -> Result<(), StoreError> {
+    const USER_OBJECTS: &[(&str, &str, &str)] = &[
+        ("table", "schema_version", "schema_version"),
+        ("table", "sandboxes", "sandboxes"),
+        ("table", "operations", "operations"),
+        ("table", "operation_events", "operation_events"),
+        ("index", "one_pending_operation_per_sandbox", "operations"),
+        ("trigger", "operation_events_no_update", "operation_events"),
+        ("trigger", "operation_events_no_delete", "operation_events"),
+    ];
+    let mut statement = connection
+        .prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name")
+        .map_err(schema_error)?;
+    let objects = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(schema_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(schema_error)?;
+    let mut user_objects = Vec::new();
+    for (object_type, name, table, sql) in objects {
+        if name == "sqlite_sequence" {
+            let valid = object_type == "table"
+                && table == "sqlite_sequence"
+                && sql.as_deref().is_some_and(|definition| {
+                    normalize_sql(definition) == "create table sqlite_sequence(name,seq)"
+                });
+            if !valid {
+                return Err(unexpected_schema_object(&object_type, &name));
+            }
+            continue;
+        }
+        if name.starts_with("sqlite_") {
+            let expected_autoindex = matches!(
+                (name.as_str(), table.as_str()),
+                ("sqlite_autoindex_sandboxes_1", "sandboxes")
+                    | ("sqlite_autoindex_sandboxes_2", "sandboxes")
+            );
+            if object_type != "index" || sql.is_some() || !expected_autoindex {
+                return Err(unexpected_schema_object(&object_type, &name));
+            }
+            continue;
+        }
+        user_objects.push((object_type, name, table));
+    }
+    let expected = USER_OBJECTS
+        .iter()
+        .map(|(object_type, name, table)| {
+            (
+                (*object_type).to_owned(),
+                (*name).to_owned(),
+                (*table).to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    user_objects.sort();
+    let mut expected = expected;
+    expected.sort();
+    if user_objects == expected {
+        Ok(())
+    } else {
+        Err(StoreError::SchemaMismatch(
+            "sqlite_master contains unexpected or missing user objects".to_owned(),
+        ))
+    }
+}
+
+fn unexpected_schema_object(object_type: &str, name: &str) -> StoreError {
+    StoreError::SchemaMismatch(format!(
+        "unexpected SQLite-owned schema object {object_type} {name}"
+    ))
 }
 
 fn validate_table_columns(
