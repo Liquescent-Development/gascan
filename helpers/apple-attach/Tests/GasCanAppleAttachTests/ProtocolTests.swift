@@ -97,3 +97,33 @@ private actor CompletionFlag {
     #expect(returnedWithinBound)
     try? pipe.fileHandleForWriting.close()
 }
+
+@Test func inputFailureWinsAndCancelsProcessWait() async throws {
+    let waitCancelled = CompletionFlag()
+    let inputTask = Task<Void, any Error> {
+        throw ProtocolFailure.duplicateStart
+    }
+    let waitTask = Task<Int32, any Error> {
+        defer { Task { await waitCancelled.set() } }
+        try await Task.sleep(for: .seconds(30))
+        return 0
+    }
+
+    await #expect(throws: ProtocolFailure.self) {
+        try await superviseSession(inputTask: inputTask, waitTask: waitTask)
+    }
+    while !(await waitCancelled.value) {
+        await Task.yield()
+    }
+}
+
+@Test func normalInputCompletionDoesNotPreemptExactExit() async throws {
+    let inputTask = Task<Void, any Error> {}
+    let waitTask = Task<Int32, any Error> {
+        try await Task.sleep(for: .milliseconds(20))
+        return 42
+    }
+
+    let code = try await superviseSession(inputTask: inputTask, waitTask: waitTask)
+    #expect(code == 42)
+}

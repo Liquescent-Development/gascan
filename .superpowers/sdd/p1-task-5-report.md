@@ -26,10 +26,10 @@ Implemented the approved scoped Swift attach-helper architecture. Cross-platform
 - Added version 1 single-session NDJSON frames with base64 stdin/stdout/stderr payloads.
 - Rust sends exactly one start frame, validates guest argv and protocol versions, permits TTY-only resize, translates TTY SIGINT to terminal byte `0x03`, and promptly rejects every other signal combination as unsupported.
 - Bounded Rust channels provide backpressure; every input write is acknowledged.
-- Rust only accepts typed helper stdout/stderr/error/exit frames and never derives guest exit from helper status or diagnostic text.
+- Rust only accepts typed helper stdout/stderr/error/exit frames and never derives guest exit from helper status or diagnostic text. Valid helper terminal errors retain their structured `operation`, `code`, and `message` in `RuntimeError::HelperError`; malformed frames alone use `InvalidOutput`.
 - Session drop closes input and requests termination of only the owned helper child.
 - Swift validates the start version before any `ContainerClient` request, creates one guest process with private pipes, retains its `ClientProcess`, and calls only `start`, `resize`, and `wait`; it never calls the broken 1.1.0 `kill` path.
-- Swift emits serialized frames through one actor, ensuring at most one typed terminal error or exact exit event.
+- Swift supervises process wait and post-start input handling concurrently. A normal input close keeps waiting for the exact process exit, while malformed/version/duplicate-start/resize failures cancel the wait, close the owned session pipes, and flow through one serialized actor, ensuring at most one typed terminal error or exact exit event.
 - The helper exposes no socket, image, registry, mount, network, lifecycle, or arbitrary-XPC operation.
 - Removed obsolete `portable-pty`, direct `nix`, and `anyhow` dependencies. A dependency-tree check found none of those direct implementation dependencies.
 

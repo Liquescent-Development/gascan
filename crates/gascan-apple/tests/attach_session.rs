@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use gascan_apple::{AppleAttach, AttachInput, AttachOutput};
+use gascan_core::runtime::RuntimeError;
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -41,7 +42,14 @@ async fn fake_helper_proves_binary_streams_control_and_exact_exit() -> Result<()
         .exec("start-error", ["missing"], false)
         .await?;
     let error = missing.exit().await.expect_err("start must fail");
-    assert!(error.to_string().contains("helper error apple_api"));
+    assert!(matches!(
+        error,
+        RuntimeError::HelperError {
+            code,
+            message,
+            ..
+        } if code == "apple_api" && message == "failed to find target executable"
+    ));
     Ok(())
 }
 

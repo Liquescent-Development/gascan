@@ -131,9 +131,11 @@ impl HelperOutput {
             Self::Stdout { data, .. } => Ok(AttachOutput::Stdout(data)),
             Self::Stderr { data, .. } => Ok(AttachOutput::Stderr(data)),
             Self::Exit { code, .. } => Ok(AttachOutput::Exit(code)),
-            Self::Error { code, message, .. } => {
-                Err(protocol_error(format!("helper error {code}: {message}")))
-            }
+            Self::Error { code, message, .. } => Err(RuntimeError::HelperError {
+                operation: "gascan-apple-attach".to_owned(),
+                code,
+                message,
+            }),
         }
     }
 }

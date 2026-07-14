@@ -117,6 +117,48 @@ actor FrameEmitter {
     }
 }
 
+private enum SessionTaskEvent: @unchecked Sendable {
+    case input(Result<Void, any Error>)
+    case process(Result<Int32, any Error>)
+}
+
+func superviseSession(
+    inputTask: Task<Void, any Error>,
+    waitTask: Task<Int32, any Error>
+) async throws -> Int32 {
+    let (events, continuation) = AsyncStream<SessionTaskEvent>.makeStream(
+        bufferingPolicy: .bufferingNewest(2)
+    )
+    let inputObserver = Task {
+        continuation.yield(.input(await inputTask.result))
+    }
+    let waitObserver = Task {
+        continuation.yield(.process(await waitTask.result))
+    }
+    defer {
+        continuation.finish()
+        inputObserver.cancel()
+        waitObserver.cancel()
+    }
+
+    for await event in events {
+        switch event {
+        case .input(.success):
+            continue
+        case .input(.failure(let error)):
+            waitTask.cancel()
+            throw error
+        case .process(.success(let code)):
+            inputTask.cancel()
+            return code
+        case .process(.failure(let error)):
+            inputTask.cancel()
+            throw error
+        }
+    }
+    throw CancellationError()
+}
+
 struct GasCanAppleAttach {
     static func runMain() async {
         let emitter = FrameEmitter()
@@ -180,17 +222,28 @@ struct GasCanAppleAttach {
                 try await emitter.emit(.stderr(data))
             }
         }
-        let inputTask = Task {
+        let inputTask = Task<Void, any Error> {
             try await handleInputs(
                 process: process,
                 input: inputPipe.fileHandleForWriting,
                 lines: &inputLines
             )
         }
-
-        let code = try await process.wait()
+        let waitTask = Task<Int32, any Error> {
+            try await process.wait()
+        }
+        let code: Int32
+        do {
+            code = try await superviseSession(inputTask: inputTask, waitTask: waitTask)
+        } catch {
+            inputTask.cancel()
+            waitTask.cancel()
+            stdoutRelay.cancel()
+            stderrRelay?.cancel()
+            try? inputPipe.fileHandleForWriting.close()
+            throw error
+        }
         diagnostic("guest wait returned \(code); draining output")
-        inputTask.cancel()
         try? inputPipe.fileHandleForWriting.close()
         var relays = [stdoutRelay]
         if let stderrRelay {

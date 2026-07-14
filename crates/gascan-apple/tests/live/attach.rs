@@ -1,4 +1,5 @@
 use gascan_apple::{AttachInput, AttachOutput};
+use gascan_core::runtime::RuntimeError;
 use std::time::Duration;
 
 use super::common::{LiveContext, TestError};
@@ -81,7 +82,10 @@ async fn attach_preserves_binary_streams_and_exact_exit_codes() -> Result<(), Te
         .exit()
         .await
         .expect_err("missing executable must fail start");
-    assert!(error.to_string().contains("helper error apple_api"));
+    assert!(matches!(
+        error,
+        RuntimeError::HelperError { code, .. } if code == "apple_api"
+    ));
     ctx.cleanup().await
 }
 

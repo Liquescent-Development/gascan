@@ -51,6 +51,12 @@ pub enum RuntimeError {
     },
     #[error("invalid output from {operation}: {message}")]
     InvalidOutput { operation: String, message: String },
+    #[error("{operation} helper error {code}: {message}")]
+    HelperError {
+        operation: String,
+        code: String,
+        message: String,
+    },
     #[error("unsupported runtime version {found:?}; supported versions: {supported}")]
     UnsupportedVersion {
         found: RuntimeVersion,
