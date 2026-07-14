@@ -90,3 +90,45 @@ Review-wave TDD evidence:
 - GREEN: expanded socket security passed 8/8 under the required UDS escalation.
 - GREEN: real daemon lifecycle/SIGTERM suite passed 5/5.
 - GREEN: metadata API unit tests passed 3/3 and Store passed 23/23.
+
+## Third review correction
+
+Darwin has no `bindat`/`connectat`, and cap-std 4.0.2 leaves its advertised
+directory-relative Unix listener and stream methods as `todo!()`. Under the
+explicit same-effective-UID trust boundary, Darwin therefore resolves the
+retained directory with `F_GETPATH` only for a cryptographically random staging
+bind. The staging node is never published until descriptor-relative stat proves
+its device, inode, socket type, and UID inside the retained directory. A
+deterministic test swaps the directory after resolution but before bind: the
+escaped exact inode is quarantined through a newly opened nofollow parent
+capability, the foreign replacement is retained, the escaped bind is rejected,
+and the bounded retry succeeds in the retained directory without hidden
+staging remnants.
+
+Staging names use seven bytes from the OS CSPRNG (56 bits) encoded without
+padding. Darwin's `SUN_LEN` applies to the whole path; this keeps staging no
+longer than the public `gascand.sock` name so every otherwise-valid runtime
+path remains bindable. Binding is bounded to 64 attempts. Every accepted stage
+immediately acquires an RAII guard. Chmod, publish collision, or later failure
+quarantines and removes only the exact staged inode. A publish-collision test
+proves no hidden stage remains.
+
+Stale handling now attempts connection before reading deletion evidence. Only
+after connection failure does it verify anchored type, UID, and exact identity,
+then quarantine, reverify the moved inode, and unlink. Mismatch restores or
+preserves the entry and fails closed.
+
+SIGTERM now resolves Tonic's shutdown future immediately to stop accepting,
+waits up to two seconds for durable operation leases, cancels event-forwarding
+tasks (which own full-stream activity leases), and bounds remaining connection
+drain by another two seconds. A deliberately source-held event stream closes
+on cancellation, while the child-process delayed-provision test continues to
+prove durable work drains before exit.
+
+Third-wave verification:
+
+- `cargo test -p gascand socket::tests --lib` — Darwin swap and RAII tests 2/2.
+- `cargo test -p gascand --test socket_security` — 8/8.
+- `cargo test -p gascand --test daemon_idle` — 5/5.
+- `cargo test -p gascand` — 6 library, 5 daemon, 24 lifecycle, 7 reconcile, 8 socket, 23 store, and 2 doctests passed.
+- `cargo clippy -p gascand --all-targets -- -D warnings` — passed.

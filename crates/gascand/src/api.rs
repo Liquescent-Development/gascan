@@ -14,7 +14,7 @@ use gascan_proto::{
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -31,6 +31,8 @@ struct ActivityInner {
     operations: AtomicUsize,
     generation: AtomicUsize,
     changed: Notify,
+    shutting_down: AtomicBool,
+    shutdown: Notify,
 }
 
 impl Default for ActivityTracker {
@@ -47,6 +49,8 @@ impl ActivityTracker {
                 operations: AtomicUsize::new(0),
                 generation: AtomicUsize::new(0),
                 changed: Notify::new(),
+                shutting_down: AtomicBool::new(false),
+                shutdown: Notify::new(),
             }),
         }
     }
@@ -80,6 +84,19 @@ impl ActivityTracker {
     fn idle(&self) -> bool {
         self.inner.leases.load(Ordering::Acquire) == 0
             && self.inner.operations.load(Ordering::Acquire) == 0
+    }
+    async fn wait_for_operations(&self) {
+        loop {
+            let changed = self.inner.changed.notified();
+            if self.inner.operations.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+    fn cancel_streams(&self) {
+        self.inner.shutting_down.store(true, Ordering::Release);
+        self.inner.shutdown.notify_waiters();
     }
     pub async fn wait_for_idle(&self, timeout: Duration) -> io::Result<()> {
         loop {
@@ -133,6 +150,7 @@ pub struct DaemonConfig {
     pub paths: SocketPaths,
     pub idle_timeout: Duration,
     activity: ActivityTracker,
+    shutdown_timeout: Duration,
 }
 impl DaemonConfig {
     #[must_use]
@@ -141,6 +159,7 @@ impl DaemonConfig {
             paths,
             idle_timeout,
             activity: ActivityTracker::new(),
+            shutdown_timeout: Duration::from_secs(2),
         }
     }
     #[must_use]
@@ -195,17 +214,26 @@ impl Daemon {
         };
         #[cfg(not(unix))]
         let terminated = std::future::pending::<io::Result<()>>();
+        let (began_tx, began_rx) = tokio::sync::oneshot::channel();
         let shutdown = async move {
             tokio::select! {
                 result = idle => { let _ = result; }
                 result = terminated => { let _ = result; }
             }
+            let _ = began_tx.send(());
         };
-        tonic::transport::Server::builder()
+        let server = tonic::transport::Server::builder()
             .add_service(GasCanServer::new(service))
-            .serve_with_incoming_shutdown(incoming, shutdown)
-            .await
-            .map_err(io::Error::other)?;
+            .serve_with_incoming_shutdown(incoming, shutdown);
+        tokio::pin!(server);
+        tokio::select! {
+            result = &mut server => { result.map_err(io::Error::other)?; }
+            _ = async { let _ = began_rx.await; } => {
+                let _ = tokio::time::timeout(config.shutdown_timeout, tracker.wait_for_operations()).await;
+                tracker.cancel_streams();
+                tokio::time::timeout(config.shutdown_timeout, &mut server).await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "daemon connections did not close after stream cancellation"))?.map_err(io::Error::other)?;
+            }
+        }
         drop(owned);
         Ok(())
     }
@@ -228,8 +256,31 @@ impl<B: RuntimeBackend> SandboxApi<B> {
 }
 
 pub struct ApiEventStream {
-    inner: tokio_stream::wrappers::ReceiverStream<StoredEvent>,
-    _lease: ActivityLease,
+    inner: tokio_stream::wrappers::ReceiverStream<Result<v1::OperationEvent, tonic::Status>>,
+}
+impl ApiEventStream {
+    fn new(
+        mut source: tokio::sync::mpsc::Receiver<StoredEvent>,
+        activity: ActivityTracker,
+    ) -> Self {
+        let (sender, receiver) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(async move {
+            let _lease = activity.lease();
+            loop {
+                let cancelled = activity.inner.shutdown.notified();
+                if activity.inner.shutting_down.load(Ordering::Acquire) {
+                    break;
+                }
+                tokio::select! {
+                    event = source.recv() => match event { Some(event) => { if sender.send(Ok(wire_event(event))).await.is_err() { break; } }, None => break },
+                    () = cancelled => break,
+                }
+            }
+        });
+        Self {
+            inner: tokio_stream::wrappers::ReceiverStream::new(receiver),
+        }
+    }
 }
 impl tokio_stream::Stream for ApiEventStream {
     type Item = Result<v1::OperationEvent, tonic::Status>;
@@ -239,9 +290,7 @@ impl tokio_stream::Stream for ApiEventStream {
     )]
     fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        Pin::new(&mut this.inner)
-            .poll_next(context)
-            .map(|item| item.map(|event| Ok(wire_event(event))))
+        Pin::new(&mut this.inner).poll_next(context)
     }
 }
 
@@ -452,10 +501,10 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             .up(ServiceUpRequest::new(spec))
             .await
             .map_err(service_status)?;
-        Ok(tonic::Response::new(ApiEventStream {
-            inner: tokio_stream::wrappers::ReceiverStream::new(operation.events),
-            _lease: self.activity.lease(),
-        }))
+        Ok(tonic::Response::new(ApiEventStream::new(
+            operation.events,
+            self.activity.clone(),
+        )))
     }
     type ApplyStream = ApiEventStream;
     async fn apply(
@@ -471,10 +520,10 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             .apply(ServiceUpRequest::new(spec))
             .await
             .map_err(service_status)?;
-        Ok(tonic::Response::new(ApiEventStream {
-            inner: tokio_stream::wrappers::ReceiverStream::new(operation.events),
-            _lease: self.activity.lease(),
-        }))
+        Ok(tonic::Response::new(ApiEventStream::new(
+            operation.events,
+            self.activity.clone(),
+        )))
     }
     type RunStream = EventStream;
     async fn run(
@@ -500,10 +549,10 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         let _operation = self.activity.operation();
         let id = selector_id(request.into_inner().sandbox).map_err(ApiInputError::status)?;
         let operation = self.service.stop(&id).await.map_err(service_status)?;
-        Ok(tonic::Response::new(ApiEventStream {
-            inner: tokio_stream::wrappers::ReceiverStream::new(operation.events),
-            _lease: self.activity.lease(),
-        }))
+        Ok(tonic::Response::new(ApiEventStream::new(
+            operation.events,
+            self.activity.clone(),
+        )))
     }
     type DestroyStream = ApiEventStream;
     async fn destroy(
@@ -513,10 +562,10 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         let _operation = self.activity.operation();
         let id = selector_id(request.into_inner().sandbox).map_err(ApiInputError::status)?;
         let operation = self.service.destroy(&id).await.map_err(service_status)?;
-        Ok(tonic::Response::new(ApiEventStream {
-            inner: tokio_stream::wrappers::ReceiverStream::new(operation.events),
-            _lease: self.activity.lease(),
-        }))
+        Ok(tonic::Response::new(ApiEventStream::new(
+            operation.events,
+            self.activity.clone(),
+        )))
     }
     type LogsStream = EventStream;
     async fn logs(
@@ -538,7 +587,10 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiInputError, service_status, spec_for_root, wire_event, wire_status};
+    use super::{
+        ActivityTracker, ApiEventStream, ApiInputError, service_status, spec_for_root, wire_event,
+        wire_status,
+    };
     use crate::{
         ActualState, DesiredState, OperationEvent, OperationId, OperationStatus, SandboxRecord,
         ServiceError, StoreError,
@@ -547,6 +599,7 @@ mod tests {
     use gascan_core::sandbox::SandboxId;
     use gascan_proto::error_code;
     use serde_json::json;
+    use tokio_stream::StreamExt;
 
     #[tokio::test]
     async fn project_roots_are_absolute_and_manifest_bound()
@@ -572,6 +625,19 @@ mod tests {
             spec.canonical_root().as_std_path(),
             directory.path().canonicalize()?
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_a_client_held_open_event_stream()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let activity = ActivityTracker::new();
+        let (_held_sender, receiver) = tokio::sync::mpsc::channel(1);
+        let mut stream = ApiEventStream::new(receiver, activity.clone());
+        activity.cancel_streams();
+        let item =
+            tokio::time::timeout(std::time::Duration::from_millis(100), stream.next()).await?;
+        assert!(item.is_none());
         Ok(())
     }
 

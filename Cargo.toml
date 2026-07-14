@@ -25,6 +25,7 @@ prost-types = "0.13"
 tonic = "0.12"
 tower = "0.4"
 hyper-util = { version = "0.1", features = ["tokio"] }
+getrandom = "0.4"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -19,6 +19,8 @@ tokio-stream.workspace = true
 rustix.workspace = true
 tonic.workspace = true
 gascan-proto = { path = "../gascan-proto" }
+getrandom.workspace = true
+base64.workspace = true
 prost-types.workspace = true
 
 [dev-dependencies]
