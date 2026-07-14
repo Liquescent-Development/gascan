@@ -18,10 +18,9 @@ fn root() -> &'static Path {
 
 #[test]
 fn mise_defaults_exactly_match_locked_polyglot_versions() {
-    let lock: Lock = toml::from_str(
-        &fs::read_to_string(root().join("images/workspace/versions.lock")).unwrap(),
-    )
-    .unwrap();
+    let lock: Lock =
+        toml::from_str(&fs::read_to_string(root().join("images/workspace/versions.lock")).unwrap())
+            .unwrap();
     let config_text =
         fs::read_to_string(root().join("images/workspace/etc/mise/config.toml")).unwrap();
     let config: MiseConfig = toml::from_str(&config_text).unwrap();
@@ -43,14 +42,39 @@ fn dockerfile_installs_only_reviewed_system_tools_and_verified_artifacts() {
         "images/workspace/etc/profile.d/mise.sh",
         "mise install --yes",
         "/opt/gascan/image-tool-versions.json",
-        "playwright-chromium-linux-arm64.zip",
+        ".artifacts/playwright-chromium-reviewed/chrome-linux",
         "/opt/gascan/tests/playwright-smoke.mjs",
+        "/home/workspace/.cache/gascan-image/resolved-tool-versions.json",
+        "USER root",
+        "jq --exit-status --slurpfile expected",
+        "install -o root -g root -m 0444",
         "rm -rf /var/lib/apt/lists/*",
     ] {
-        assert!(dockerfile.contains(required), "missing image contract: {required}");
+        assert!(
+            dockerfile.contains(required),
+            "missing image contract: {required}"
+        );
     }
-    for forbidden in ["curl ", "wget ", "mise use", "npm install", "apt-get upgrade"] {
-        assert!(!dockerfile.contains(forbidden), "unlocked install path: {forbidden}");
+    for forbidden in [
+        "curl ",
+        "wget ",
+        "mise use",
+        "npm install",
+        "apt-get upgrade",
+    ] {
+        assert!(
+            !dockerfile.contains(forbidden),
+            "unlocked install path: {forbidden}"
+        );
+    }
+    assert!(!dockerfile.contains("> /opt/gascan/image-tool-versions.json"));
+
+    let build = fs::read_to_string(root().join("scripts/build-workspace-image.sh")).unwrap();
+    for required in ["extract-reviewed-chromium", "validate-tool-versions"] {
+        assert!(
+            build.contains(required),
+            "missing pre-build validator: {required}"
+        );
     }
 }
 
@@ -70,7 +94,14 @@ fn smoke_covers_every_runtime_native_tools_and_browser() {
         "git --version",
         "gh --version",
         "cc --version",
+        "image-tool-versions.json",
+        "jq --exit-status",
+        "mise current elixir",
+        "mise current rust",
     ] {
-        assert!(smoke.contains(required), "missing smoke coverage: {required}");
+        assert!(
+            smoke.contains(required),
+            "missing smoke coverage: {required}"
+        );
     }
 }

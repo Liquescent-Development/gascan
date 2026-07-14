@@ -33,6 +33,7 @@ libxrandr2
 libyaml-dev
 patch
 pkg-config
+jq
 sudo
 tini
 unzip
