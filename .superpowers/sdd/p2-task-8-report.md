@@ -18,6 +18,8 @@ Lifecycle RPCs publish the checked durable operation ID and live Pending stream 
 
 Lifecycle startup publication carries either the live operation or a typed pre-begin rejection; direct RPC tests preserve NotFound, InvalidArgument, AlreadyExists/operation-conflict, and Unavailable instead of collapsing to Internal. Autostart bounds the complete initial UDS connect, HTTP/2 setup, and Handshake probe before daemon election as well as later readiness probes. A withholding-UDS regression accepts the initial connection without speaking HTTP/2 and proves startup still advances within the bound.
 
+The daemon arms its SIGTERM receiver before binding or publishing the owned socket, then carries that already-registered termination future into the bound server. A 20-iteration subprocess regression sends TERM immediately when the socket pathname appears and proves exit zero plus owned-socket cleanup every time.
+
 ## TDD and verification
 
 - Initial RED: the real-process scenario failed because the CLI binary was absent.

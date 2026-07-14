@@ -212,7 +212,29 @@ impl Daemon {
     where
         T: GasCan,
     {
+        #[cfg(unix)]
+        let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        #[cfg(unix)]
+        let terminated = async move {
+            let _ = signal.recv().await;
+            Ok::<(), io::Error>(())
+        };
+        #[cfg(not(unix))]
+        let terminated = std::future::pending::<io::Result<()>>();
         let owned = config.paths.bind()?;
+        Self::serve_bound(config, service, owned, terminated).await
+    }
+
+    async fn serve_bound<T, F>(
+        config: DaemonConfig,
+        service: T,
+        owned: crate::socket::OwnedSocket,
+        terminated: F,
+    ) -> io::Result<()>
+    where
+        T: GasCan,
+        F: std::future::Future<Output = io::Result<()>>,
+    {
         if let Some(pid_path) = std::env::var_os("GASCAN_PID_PATH") {
             std::fs::write(pid_path, std::process::id().to_string())?;
         }
@@ -238,21 +260,15 @@ impl Daemon {
             });
         let tracker = config.activity();
         let idle = tracker.wait_for_idle(config.idle_timeout);
-        #[cfg(unix)]
-        let terminated = async {
-            let mut signal =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-            let _ = signal.recv().await;
-            Ok::<(), io::Error>(())
-        };
-        #[cfg(not(unix))]
-        let terminated = std::future::pending::<io::Result<()>>();
         let (began_tx, began_rx) = tokio::sync::oneshot::channel();
         let shutdown_tracker = tracker.clone();
         let shutdown = async move {
-            tokio::select! {
-                result = idle => { let _ = result; }
-                result = terminated => { let _ = result; }
+            let reason = tokio::select! {
+                result = idle => { let _ = result; "idle" }
+                result = terminated => { let _ = result; "terminated" }
+            };
+            if std::env::var_os("GASCAN_DAEMON_STDERR_PATH").is_some() {
+                eprintln!("daemon shutdown began: {reason}");
             }
             shutdown_tracker.begin_shutdown();
             let _ = began_tx.send(());
@@ -262,7 +278,12 @@ impl Daemon {
             .serve_with_incoming_shutdown(incoming, shutdown);
         tokio::pin!(server);
         tokio::select! {
-            result = &mut server => { result.map_err(io::Error::other)?; }
+            result = &mut server => {
+                if std::env::var_os("GASCAN_DAEMON_STDERR_PATH").is_some() {
+                    eprintln!("daemon server ended: {result:?}");
+                }
+                result.map_err(io::Error::other)?;
+            }
             _ = async { let _ = began_rx.await; } => {
                 tracker.wait_for_operations().await;
                 tracker.cancel_streams();
