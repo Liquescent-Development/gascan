@@ -162,3 +162,54 @@ Self-review:
 - No Task 4, Plan 3, or Apple files were changed. Downstream Plan 3 examples that mention `CreateRequest::fixture` will need conversion to validated integration helpers when that plan is implemented.
 
 Concerns: no Task 3 blocker remains. The temporary directory is required while loading and compiling policy; the returned request intentionally owns its canonical source path value, matching the backend contract's value-oriented API even after helper-local temporary cleanup.
+
+## Important review follow-up: fixture root lifetime
+
+Final review found that the first integration helper returned only `CreateRequest`. Its local `TempDir` was therefore dropped on return, deleting the canonical bind source before a backend could consume the request.
+
+TDD RED command:
+
+```text
+cargo test -p gascan-core --test backend_contract validated_fixture_keeps_its_canonical_bind_source_alive -- --exact
+```
+
+RED result: exit 101. The focused test failed its `fixture.bind_mounts()[0].source.exists()` assertion, directly reproducing that the canonical source had already been removed.
+
+Focused GREEN commands:
+
+```text
+cargo fmt --all
+cargo test -p gascan-core --test backend_contract validated_fixture_keeps_its_canonical_bind_source_alive -- --exact
+cargo test -p gascan-core --test backend_contract
+```
+
+GREEN result: every command exited 0. The lifetime regression passed, followed by all 9 backend-contract tests.
+
+Final verification commands:
+
+```text
+cargo test -p gascan-core --test policy --test backend_contract
+cargo test -p gascan-core --doc
+cargo test -p gascan-core --all-targets
+cargo clippy -p gascan-core --all-targets -- -D warnings
+cargo fmt --all -- --check
+git diff --check
+```
+
+Final result before commit: every command exited 0. Policy passed 10 tests, backend contract passed 9 tests, all 8 doctests passed, and the full core suite passed all 35 integration tests. Strict Clippy, formatting, and diff checks were clean.
+
+Files changed:
+
+- `crates/gascan-core/tests/common/mod.rs`: `create_request` now returns an integration-only `CreateRequestFixture` that owns both the `TempDir` guard and compiled request. It exposes immutable dereference access and a cloned request for backend consumption.
+- `crates/gascan-core/tests/backend_contract.rs`: every backend setup retains the owning fixture across `.await` calls, including the create-failure branch; added direct canonical bind-source lifetime coverage.
+- `.superpowers/sdd/p2-task-3-report.md`: appended this follow-up's exact RED/GREEN and review evidence.
+
+Self-review:
+
+- The `TempDir` guard and `CreateRequest` now have the same owner, so the canonical source cannot disappear while a test retains its fixture.
+- No test passes `create_request(...)` as a temporary expression into an async backend call. Each fixture is bound to a local variable before cloning its request, and the owner remains in scope across `.await`.
+- Request clones retain sealed policy values but do not own filesystem lifetime; the test-only fixture makes that distinction explicit without adding a constructor or filesystem policy to production library or `FakeRuntime` code.
+- The focused regression observes the exact external invariant: the compiler-emitted canonical bind source exists while the fixture is alive.
+- No Task 4, Plan 3, or Apple files were changed.
+
+Concerns: no Task 3 blocker remains. Backend adapter integration tests should follow this owning-fixture pattern whenever a runtime may inspect or mount request source paths asynchronously.
