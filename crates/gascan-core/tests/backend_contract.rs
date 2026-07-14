@@ -116,25 +116,40 @@ fn create_outcome_rejects_resources_not_authorized_by_the_request() {
     assert_eq!(error.code(), "ownership_mismatch");
 }
 
+#[test]
+fn create_outcome_rejects_duplicate_resource_identities() {
+    let fixture = create_request("duplicate-outcome");
+    let container = RuntimeResource::discovered(
+        ResourceIdentity::new(ResourceKind::Container, fixture.id().to_string()).unwrap(),
+        Some(fixture.id().clone()),
+        ResourceOwnership::GasCanOwned,
+    );
+    let error =
+        CreateOutcome::new(&fixture.request(), vec![container.clone(), container]).unwrap_err();
+    assert_eq!(error.code(), "ownership_mismatch");
+}
+
 #[tokio::test]
 async fn create_collision_reports_resources_created_before_the_collision() {
-    let backend = FakeRuntime::new(capabilities());
-    let fixture = create_request("partial-collision");
-    let collision = &fixture.volumes()[1];
-    backend
-        .seed_volume(
-            &collision.name,
-            Some(SandboxId::test("foreign-volume-owner")),
-            ResourceOwnership::Foreign,
-        )
-        .await
-        .unwrap();
+    for collision_index in [1, 2] {
+        let backend = FakeRuntime::new(capabilities());
+        let fixture = create_request(&format!("partial-collision-{collision_index}"));
+        let collision = &fixture.volumes()[collision_index];
+        backend
+            .seed_volume(
+                &collision.name,
+                Some(SandboxId::test("foreign-volume-owner")),
+                ResourceOwnership::Foreign,
+            )
+            .await
+            .unwrap();
 
-    let failure = backend.create(fixture.request()).await.unwrap_err();
+        let failure = backend.create(fixture.request()).await.unwrap_err();
 
-    assert_eq!(failure.code(), "resource_conflict");
-    assert_eq!(failure.created().len(), 1);
-    assert_eq!(failure.created()[0].name(), fixture.volumes()[0].name);
+        assert_eq!(failure.code(), "resource_conflict");
+        assert_eq!(failure.created().len(), collision_index);
+        assert_eq!(failure.created()[0].name(), fixture.volumes()[0].name);
+    }
 }
 
 #[tokio::test]
