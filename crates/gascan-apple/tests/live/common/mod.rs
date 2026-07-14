@@ -311,7 +311,7 @@ pub fn configured_resource(value: &Value, name: &str) -> Option<u64> {
 
 pub fn guest_argv(published: bool) -> Vec<String> {
     let script = if published {
-        "mkdir -p /www && printf ok > /www/index.html && exec busybox httpd -f -p 8080 -h /www"
+        "printf '%s\\n' '#!/bin/sh' \"printf 'HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\nConnection: close\\r\\n\\r\\nok'\" > /tmp/respond && chmod +x /tmp/respond && exec nc -l -p 8080 -e /tmp/respond"
     } else {
         "while :; do sleep 3600; done"
     };

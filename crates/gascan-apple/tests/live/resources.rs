@@ -32,14 +32,14 @@ fn command_construction_rejects_non_loopback_publish() {
 }
 
 #[test]
-fn published_guest_uses_deterministic_busybox_httpd_argv() {
+fn published_guest_uses_deterministic_netcat_responder_argv() {
     assert_eq!(
         guest_argv(true),
         [
             "docker.io/library/alpine:3.20",
             "sh",
             "-c",
-            "mkdir -p /www && printf ok > /www/index.html && exec busybox httpd -f -p 8080 -h /www",
+            "printf '%s\\n' '#!/bin/sh' \"printf 'HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\nConnection: close\\r\\n\\r\\nok'\" > /tmp/respond && chmod +x /tmp/respond && exec nc -l -p 8080 -e /tmp/respond",
         ]
     );
 }
