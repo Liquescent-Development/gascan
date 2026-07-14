@@ -110,3 +110,55 @@ git diff --check
 ```
 
 Every command exited 0. The full core suite passed 34 integration tests, all 4 doctests passed, and strict Clippy, formatting, and diff checks were clean. No Task 4 or Apple work was performed.
+
+## Critical review follow-up: fixture constructor removal
+
+Review confirmed that the unconditional public `CreateRequest::fixture` remained a production policy bypass. Its hard-coded request combined an arbitrary `/tmp/code` bind mount, offline networking with a published port, and empty resource limits without calling `PolicyCompiler`.
+
+TDD RED command:
+
+```text
+cargo test -p gascan-core --doc
+```
+
+RED result: exit 101. The new standalone `CreateRequest::fixture` compile-fail example compiled successfully while the other 4 doctests passed, specifically proving the public fixture constructor was still exposed before its removal.
+
+Focused GREEN commands:
+
+```text
+cargo test -p gascan-core --test backend_contract
+cargo test -p gascan-core --doc
+cargo test -p gascan-core --test policy --test backend_contract
+cargo test -p gascan-core --doc
+```
+
+GREEN result: every command exited 0. Backend contract passed 8 tests, policy passed 10 tests, and the expanded doctest suite passed all 8 cases.
+
+Final verification commands:
+
+```text
+cargo test -p gascan-core --all-targets
+cargo clippy -p gascan-core --all-targets -- -D warnings
+cargo fmt --all -- --check
+git diff --check
+```
+
+Final result before commit: every command exited 0. The full core suite passed all 34 integration tests; strict Clippy, formatting, and diff checks were clean.
+
+Files changed:
+
+- `crates/gascan-core/src/runtime.rs`: removed `CreateRequest::fixture`, documented `PolicyCompiler` as the sole construction path, and split external compile-fail coverage across fixture, `new`, `builder`, struct literal, struct update, and deserialization bypasses.
+- `crates/gascan-core/tests/common/mod.rs`: added the shared integration-test request helper. It creates a real temporary root, writes and loads a valid offline manifest, builds a sealed `SandboxSpec`, and compiles the request with all mandatory capabilities.
+- `crates/gascan-core/tests/backend_contract.rs`: replaced every unchecked create fixture with the shared validated helper. `FakeRuntime::failing_once` remains limited to its capabilities fixture and does not construct policy state.
+- `.superpowers/sdd/p2-task-3-report.md`: recorded this review follow-up and its exact verification evidence.
+
+Self-review:
+
+- Production library code contains no public or private fixture/new/builder constructor for `CreateRequest`; construction remains inside `PolicyCompiler` through crate-private fields.
+- `CreateRequest` remains `Serialize` with immutable getters and remains non-`Deserialize`. No `From`, `TryFrom`, mutable accessor, deserializer, or alternate request factory was introduced.
+- Each external API bypass has an independent compile-fail example, so an unrelated earlier compiler error cannot mask accidental exposure of fixture, generic constructor, builder, struct literal/update, or deserialization.
+- Backend tests compile the library normally and keep all test-only request assembly in the integration-test helper rather than relying on library `cfg(test)` code.
+- The helper's default offline manifest emits no ports and the compiler supplies bounded CPU, memory, disk, and process limits plus the canonical temporary-root bind mount.
+- No Task 4, Plan 3, or Apple files were changed. Downstream Plan 3 examples that mention `CreateRequest::fixture` will need conversion to validated integration helpers when that plan is implemented.
+
+Concerns: no Task 3 blocker remains. The temporary directory is required while loading and compiling policy; the returned request intentionally owns its canonical source path value, matching the backend contract's value-oriented API even after helper-local temporary cleanup.

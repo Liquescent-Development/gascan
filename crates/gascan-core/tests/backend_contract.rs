@@ -1,30 +1,15 @@
+mod common;
+
+use common::{capabilities, create_request};
 use gascan_core::fake_runtime::{FailureBoundary, FakeRuntime};
-use gascan_core::runtime::{
-    CreateRequest, ExecRequest, RuntimeBackend, RuntimeCall, RuntimeCapabilities, RuntimeError,
-    RuntimeVersion,
-};
+use gascan_core::runtime::{ExecRequest, RuntimeBackend, RuntimeCall, RuntimeError};
 use gascan_core::sandbox::SandboxId;
 
-fn capabilities() -> RuntimeCapabilities {
-    RuntimeCapabilities {
-        version: RuntimeVersion::new(1, 0, 0),
-        bind_mounts: true,
-        named_volumes: true,
-        tty: true,
-        signals: true,
-        loopback_publish: true,
-        resource_limits: true,
-        offline: gascan_core::runtime::NetworkIsolation::Proven,
-    }
-}
-
 pub async fn backend_contract(backend: &dyn RuntimeBackend) {
-    let id = SandboxId::test("contract");
+    let request = create_request("contract");
+    let id = request.id().clone();
     assert_eq!(backend.inspect(&id).await.unwrap(), None);
-    backend
-        .create(CreateRequest::fixture(id.clone()))
-        .await
-        .unwrap();
+    backend.create(request).await.unwrap();
     assert_eq!(
         backend.inspect(&id).await.unwrap().unwrap().state,
         gascan_core::runtime::ContainerState::Stopped
@@ -52,8 +37,8 @@ async fn fake_runtime_satisfies_backend_contract_through_trait_object() {
 #[tokio::test]
 async fn duplicate_create_is_rejected_and_start_stop_are_idempotent() {
     let backend = FakeRuntime::new(capabilities());
-    let id = SandboxId::test("lifecycle");
-    let request = CreateRequest::fixture(id.clone());
+    let request = create_request("lifecycle");
+    let id = request.id().clone();
     backend.create(request.clone()).await.unwrap();
     let error = backend.create(request).await.unwrap_err();
     assert_eq!(error.code(), "resource_conflict");
@@ -67,11 +52,9 @@ async fn duplicate_create_is_rejected_and_start_stop_are_idempotent() {
 #[tokio::test]
 async fn owned_listing_filters_unowned_resources() {
     let backend = FakeRuntime::new(capabilities());
-    let owned = SandboxId::test("owned");
-    backend
-        .create(CreateRequest::fixture(owned.clone()))
-        .await
-        .unwrap();
+    let request = create_request("owned");
+    let owned = request.id().clone();
+    backend.create(request).await.unwrap();
     let foreign = SandboxId::test("foreign");
     backend.seed_unowned(foreign.clone()).await;
 
@@ -87,11 +70,9 @@ async fn owned_listing_filters_unowned_resources() {
 #[tokio::test]
 async fn exec_and_logs_preserve_binary_bytes_and_exact_exit_code() {
     let backend = FakeRuntime::new(capabilities());
-    let id = SandboxId::test("binary");
-    backend
-        .create(CreateRequest::fixture(id.clone()))
-        .await
-        .unwrap();
+    let request = create_request("binary");
+    let id = request.id().clone();
+    backend.create(request).await.unwrap();
     backend.start(&id).await.unwrap();
     backend
         .set_exec_result(vec![0, 255, 1], vec![254, 0], 42)
@@ -111,8 +92,8 @@ async fn exec_and_logs_preserve_binary_bytes_and_exact_exit_code() {
 #[tokio::test]
 async fn literal_requests_are_recorded_in_order() {
     let backend = FakeRuntime::new(capabilities());
-    let id = SandboxId::test("recording");
-    let create = CreateRequest::fixture(id.clone());
+    let create = create_request("recording");
+    let id = create.id().clone();
     let exec = ExecRequest::fixture(id.clone(), ["printf", "%s", "literal value"]);
     backend.create(create.clone()).await.unwrap();
     backend.start(&id).await.unwrap();
@@ -131,11 +112,9 @@ async fn literal_requests_are_recorded_in_order() {
 #[tokio::test]
 async fn named_failure_is_injected_once_at_the_call_boundary() {
     let backend = FakeRuntime::failing_once(FailureBoundary::Start);
-    let id = SandboxId::test("failure");
-    backend
-        .create(CreateRequest::fixture(id.clone()))
-        .await
-        .unwrap();
+    let request = create_request("failure");
+    let id = request.id().clone();
+    backend.create(request).await.unwrap();
 
     let error = backend.start(&id).await.unwrap_err();
     assert_eq!(error.code(), "injected_failure");
@@ -155,7 +134,7 @@ async fn every_backend_boundary_supports_fail_once_injection() {
             FailureBoundary::Capabilities => backend.capabilities().await.unwrap_err(),
             FailureBoundary::Inspect => backend.inspect(&id).await.unwrap_err(),
             FailureBoundary::Create => backend
-                .create(CreateRequest::fixture(id))
+                .create(create_request(boundary.as_str()))
                 .await
                 .unwrap_err(),
             _ => continue,
@@ -172,11 +151,9 @@ async fn every_backend_boundary_supports_fail_once_injection() {
         FailureBoundary::ListOwned,
     ] {
         let backend = FakeRuntime::failing_once(boundary);
-        let id = SandboxId::test(boundary.as_str());
-        backend
-            .create(CreateRequest::fixture(id.clone()))
-            .await
-            .unwrap();
+        let request = create_request(boundary.as_str());
+        let id = request.id().clone();
+        backend.create(request).await.unwrap();
         if matches!(boundary, FailureBoundary::Stop | FailureBoundary::Exec) {
             backend.start(&id).await.unwrap();
         }

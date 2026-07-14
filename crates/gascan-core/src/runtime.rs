@@ -53,18 +53,67 @@ pub struct OwnershipMetadata {
 ///
 /// Its nested request-shape types remain public for backend inspection, but
 /// they cannot be inserted into or used to mutate this sealed request. The
-/// compiler and the fixed fixture are the only construction paths.
+/// [`crate::policy::PolicyCompiler`] is the only construction path.
 ///
-/// External callers cannot replace fields with an unchecked struct update.
+/// External callers cannot construct a request through a test fixture.
 ///
 /// ```compile_fail
 /// use gascan_core::runtime::CreateRequest;
 /// use gascan_core::sandbox::SandboxId;
 ///
-/// let fixture = CreateRequest::fixture(SandboxId::test("sealed"));
+/// let _unchecked = CreateRequest::fixture(SandboxId::test("unchecked"));
+/// ```
+///
+/// There is no generic constructor or builder API.
+///
+/// ```compile_fail
+/// use gascan_core::runtime::CreateRequest;
+///
+/// let _unchecked = CreateRequest::new();
+/// ```
+///
+/// ```compile_fail
+/// use gascan_core::runtime::CreateRequest;
+///
+/// let _unchecked = CreateRequest::builder();
+/// ```
+///
+/// External callers cannot construct requests with a struct literal.
+///
+/// ```compile_fail
+/// use gascan_core::runtime::CreateRequest;
+/// use gascan_core::sandbox::SandboxId;
+///
 /// let _unchecked = CreateRequest {
 ///     image: "mutable.example/workspace:latest".to_owned(),
-///     ..fixture
+///     id: SandboxId::test("sealed"),
+///     bind_mounts: Vec::new(),
+///     volumes: Vec::new(),
+///     ports: Vec::new(),
+///     environment: Default::default(),
+///     resources: Default::default(),
+///     network: gascan_core::runtime::RuntimeNetwork::Offline,
+///     user: gascan_core::runtime::RuntimeUser::Workspace,
+///     init: true,
+///     ownership: gascan_core::runtime::OwnershipMetadata {
+///         managed_by: "gascan".to_owned(),
+///         sandbox_id: SandboxId::test("sealed"),
+///     },
+/// };
+/// ```
+///
+/// Nor can callers replace fields on a validated request with struct update syntax.
+///
+/// ```compile_fail
+/// use gascan_core::runtime::CreateRequest;
+///
+/// fn validated_request() -> CreateRequest {
+///     todo!()
+/// }
+///
+/// let _unchecked = CreateRequest {
+///     image: "mutable.example/workspace:latest".to_owned(),
+///     ..validated_request()
 /// };
 /// ```
 ///
@@ -136,34 +185,6 @@ pub enum RuntimeUser {
 }
 
 impl CreateRequest {
-    /// Policy-shaped request for backend contract tests and downstream adapter fixtures.
-    pub fn fixture(id: SandboxId) -> Self {
-        Self {
-            ownership: OwnershipMetadata {
-                managed_by: "gascan".to_owned(),
-                sandbox_id: id.clone(),
-            },
-            id,
-            image: "fixture.invalid/workspace@sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
-            bind_mounts: vec![RuntimeBindMount {
-                source: Utf8PathBuf::from("/tmp/code"),
-                target: Utf8PathBuf::from("/workspace"),
-                writable: true,
-            }],
-            volumes: Vec::new(),
-            ports: vec![RuntimePort {
-                host_address: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                host_port: 3000,
-                guest_port: 3000,
-            }],
-            environment: BTreeMap::new(),
-            resources: RuntimeResourceLimits::default(),
-            network: RuntimeNetwork::Offline,
-            user: RuntimeUser::Workspace,
-            init: true,
-        }
-    }
-
     pub const fn id(&self) -> &SandboxId {
         &self.id
     }
