@@ -298,10 +298,119 @@ impl ExecSession {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceKind {
+    Container,
+    Volume,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceOwnership {
+    GasCanOwned,
+    Foreign,
+    Mismatched,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct ResourceIdentity {
+    kind: ResourceKind,
+    name: String,
+}
+
+impl ResourceIdentity {
+    pub fn new(kind: ResourceKind, name: impl Into<String>) -> Result<Self, RuntimeError> {
+        let name = name.into();
+        if name.trim().is_empty() || name.chars().any(char::is_control) {
+            return Err(RuntimeError::InvalidResourceIdentity { name });
+        }
+        Ok(Self { kind, name })
+    }
+
+    pub const fn kind(&self) -> ResourceKind {
+        self.kind
+    }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct OwnedResource {
-    pub id: SandboxId,
-    pub ownership: OwnershipMetadata,
+pub struct RuntimeResource {
+    identity: ResourceIdentity,
+    sandbox_id: Option<SandboxId>,
+    ownership: ResourceOwnership,
+}
+
+impl RuntimeResource {
+    pub fn discovered(
+        identity: ResourceIdentity,
+        sandbox_id: Option<SandboxId>,
+        ownership: ResourceOwnership,
+    ) -> Self {
+        Self {
+            identity,
+            sandbox_id,
+            ownership,
+        }
+    }
+
+    pub const fn identity(&self) -> &ResourceIdentity {
+        &self.identity
+    }
+    pub const fn kind(&self) -> ResourceKind {
+        self.identity.kind
+    }
+    pub fn name(&self) -> &str {
+        &self.identity.name
+    }
+    pub const fn sandbox_id(&self) -> Option<&SandboxId> {
+        self.sandbox_id.as_ref()
+    }
+    pub const fn ownership(&self) -> ResourceOwnership {
+        self.ownership
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateOutcome {
+    pub created: Vec<RuntimeResource>,
+}
+
+impl CreateOutcome {
+    pub fn new(created: Vec<RuntimeResource>) -> Result<Self, RuntimeError> {
+        if created
+            .iter()
+            .any(|resource| resource.ownership != ResourceOwnership::GasCanOwned)
+        {
+            return Err(RuntimeError::OwnershipMismatch {
+                resource: "create outcome".to_owned(),
+            });
+        }
+        Ok(Self { created })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoveRequest {
+    resources: Vec<RuntimeResource>,
+}
+
+impl RemoveRequest {
+    pub fn from_resources(resources: Vec<RuntimeResource>) -> Result<Self, RuntimeError> {
+        if resources.is_empty() {
+            return Err(RuntimeError::InvalidState {
+                resource: "remove request".to_owned(),
+                message: "at least one exact resource is required".to_owned(),
+            });
+        }
+        Ok(Self { resources })
+    }
+
+    pub fn resources(&self) -> &[RuntimeResource] {
+        &self.resources
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -311,23 +420,23 @@ pub enum RuntimeCall {
     Create(CreateRequest),
     Start(SandboxId),
     Stop(SandboxId),
-    Remove(SandboxId),
+    Remove(RemoveRequest),
     Exec(ExecRequest),
     Logs(SandboxId),
-    ListOwned,
+    ListResources,
 }
 
 #[async_trait]
 pub trait RuntimeBackend: Send + Sync {
     async fn capabilities(&self) -> Result<RuntimeCapabilities, RuntimeError>;
     async fn inspect(&self, id: &SandboxId) -> Result<Option<RuntimeSandbox>, RuntimeError>;
-    async fn create(&self, request: CreateRequest) -> Result<(), RuntimeError>;
+    async fn create(&self, request: CreateRequest) -> Result<CreateOutcome, RuntimeError>;
     async fn start(&self, id: &SandboxId) -> Result<(), RuntimeError>;
     async fn stop(&self, id: &SandboxId) -> Result<(), RuntimeError>;
-    async fn remove(&self, id: &SandboxId) -> Result<(), RuntimeError>;
+    async fn remove(&self, request: RemoveRequest) -> Result<(), RuntimeError>;
     async fn exec(&self, request: ExecRequest) -> Result<ExecSession, RuntimeError>;
     async fn logs(&self, id: &SandboxId) -> Result<Vec<u8>, RuntimeError>;
-    async fn list_owned(&self) -> Result<Vec<OwnedResource>, RuntimeError>;
+    async fn list_resources(&self) -> Result<Vec<RuntimeResource>, RuntimeError>;
 }
 
 #[derive(Debug, Error)]
@@ -358,6 +467,10 @@ pub enum RuntimeError {
     UnsupportedCapability { capability: String },
     #[error("resource ownership mismatch: {resource}")]
     OwnershipMismatch { resource: String },
+    #[error("refusing to remove foreign resource: {resource}")]
+    ForeignResourceRefused { resource: String },
+    #[error("invalid resource identity: {name:?}")]
+    InvalidResourceIdentity { name: String },
     #[error("resource conflict for {resource}: {message}")]
     Conflict { resource: String, message: String },
     #[error("resource not found: {resource}")]
@@ -380,6 +493,8 @@ impl RuntimeError {
             Self::UnsupportedVersion { .. } => "unsupported_version",
             Self::UnsupportedCapability { .. } => "unsupported_capability",
             Self::OwnershipMismatch { .. } => "ownership_mismatch",
+            Self::ForeignResourceRefused { .. } => "foreign_resource_refused",
+            Self::InvalidResourceIdentity { .. } => "invalid_resource_identity",
             Self::Conflict { .. } => "resource_conflict",
             Self::NotFound { .. } => "not_found",
             Self::InvalidState { .. } => "invalid_state",

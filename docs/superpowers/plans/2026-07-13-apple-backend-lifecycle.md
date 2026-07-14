@@ -82,7 +82,7 @@ git commit -m "feat: translate Gas Can policy to Apple runtime"
 
 **Interfaces:**
 - Produces: `AppleInspector<R>::inspect(&SandboxId) -> Result<Option<RuntimeSandbox>, RuntimeError>`.
-- Produces: `AppleInspector<R>::list_owned() -> Result<Vec<OwnedResource>, RuntimeError>`.
+- Produces: `AppleInspector<R>::list_resources() -> Result<Vec<RuntimeResource>, RuntimeError>` with owned, foreign, and mismatched classifications.
 - Unknown fields are tolerated; absent/invalid required identity and state fields are errors.
 
 - [ ] **Step 1: Write fixture tests for state and ownership**
@@ -91,7 +91,7 @@ git commit -m "feat: translate Gas Can policy to Apple runtime"
 #[tokio::test]
 async fn mixed_list_returns_only_valid_gascan_owned_resources() {
     let inspector = inspector_with_fixture("container-list-mixed-1.0.json");
-    let owned = inspector.list_owned().await.unwrap();
+    let resources = inspector.list_resources().await.unwrap();
     assert_eq!(owned.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["code-a1b2c3"]);
 }
 ```
@@ -144,7 +144,7 @@ async fn apple_backend_satisfies_runtime_contract() {
 #[tokio::test]
 async fn remove_refuses_identity_mismatch() {
     let backend = backend_reporting_wrong_digest();
-    let error = backend.remove(&SandboxId::test("code")).await.unwrap_err();
+    let error = backend.remove(exact_remove_request).await.unwrap_err();
     assert_eq!(error.code(), "ownership_mismatch");
 }
 ```

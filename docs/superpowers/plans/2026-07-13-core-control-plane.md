@@ -85,8 +85,8 @@ git commit -m "feat: define sandbox manifest and identity"
 - Test: `crates/gascan-core/tests/backend_contract.rs`
 
 **Interfaces:**
-- Produces async `RuntimeBackend::{capabilities, inspect, create, start, stop, remove, exec, logs, list_owned}`.
-- Request/response types: `CreateRequest`, `ContainerState`, `ExecRequest`, `ExecSession`, `OwnedResource`, and typed `RuntimeError`.
+- Produces exactly nine async methods: `RuntimeBackend::{capabilities, inspect, create, start, stop, remove, exec, logs, list_resources}`. This Task 2/Task 5 joint interface revision makes creation and deletion resource-exact.
+- Request/response types include `CreateRequest`, `CreateOutcome { created }`, typed full `RuntimeResource` inventory, `RemoveRequest`, `ContainerState`, `ExecRequest`, `ExecSession`, and typed `RuntimeError`.
 - Produces `FakeRuntime::new(capabilities)` with deterministic failure injection and call recording.
 
 - [ ] **Step 1: Write the reusable backend contract suite**
@@ -95,12 +95,12 @@ git commit -m "feat: define sandbox manifest and identity"
 pub async fn backend_contract<B: RuntimeBackend>(backend: &B) {
     let id = SandboxId::test("contract");
     assert_eq!(backend.inspect(&id).await.unwrap(), None);
-    backend.create(CreateRequest::fixture(id.clone())).await.unwrap();
+    let outcome = backend.create(validated_request).await.unwrap();
     assert_eq!(backend.inspect(&id).await.unwrap().unwrap().state, ContainerState::Stopped);
     backend.start(&id).await.unwrap();
     assert_eq!(backend.exec(ExecRequest::fixture(id.clone(), ["true"])).await.unwrap().exit_code(), 0);
     backend.stop(&id).await.unwrap();
-    backend.remove(&id).await.unwrap();
+    backend.remove(RemoveRequest::from_resources(outcome.created)?).await.unwrap();
     assert_eq!(backend.inspect(&id).await.unwrap(), None);
 }
 ```
@@ -113,7 +113,7 @@ Expected: FAIL listing undefined request and backend methods.
 
 - [ ] **Step 3: Implement contract types and in-memory behavior**
 
-Use object-safe async methods, byte-oriented exec streams, stable error codes, and ownership metadata. `FakeRuntime` stores state behind a Tokio mutex, rejects duplicate create, makes start/stop idempotent, records literal requests, and can fail once at a named call boundary.
+Use object-safe async methods, byte-oriented exec streams, stable error codes, and ownership metadata that distinguishes GasCan-owned, foreign, and mismatched resources. `create` reports only resources created by that call; `remove` revalidates each exact identity and expected ownership. `FakeRuntime` stores state behind a Tokio mutex, models containers and volumes, rejects collisions, makes start/stop idempotent, records literal requests/outcomes, and can fail once at a named call boundary.
 
 - [ ] **Step 4: Run contract tests under normal and injected failure modes**
 
@@ -266,7 +266,7 @@ Expected: FAIL because `SandboxService` is undefined.
 
 - [ ] **Step 3: Implement transactional orchestration**
 
-For `up`: validate/canonicalize, persist pending, compile policy, create only absent resources, start, provision/health-check through injected hooks, persist ready, and emit events. Track resources created by the operation for rollback. Reconcile desired and actual state after restart; report but never delete unknown resources. Implement explicit `apply` change detection and non-destructive failure behavior.
+For `up`: validate/canonicalize, persist pending, compile policy, create only absent resources, start, provision/health-check through injected hooks, persist ready, and emit events. Roll back only `CreateOutcome.created`. Destroy inventories and removes only exact resources classified as owned for the target. Reconcile desired and actual state after restart; report unknown owned, unknown unowned, and mismatched resources but never delete unknown resources. Implement explicit `apply` change detection and non-destructive failure behavior.
 
 - [ ] **Step 4: Run lifecycle and reconciliation tests**
 
