@@ -8,37 +8,23 @@ const MANIFEST_FILE: &str = "gascan.toml";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Manifest {
-    pub version: u32,
-    pub name: Option<String>,
-    pub network: NetworkMode,
-    pub user: UserMode,
-    pub gascamp: GascampSource,
-    pub setup: Option<Utf8PathBuf>,
-    pub resources: Resources,
-    pub tools: BTreeMap<String, String>,
-    pub ports: BTreeMap<String, u16>,
-}
-
-impl Default for Manifest {
-    fn default() -> Self {
-        Self {
-            version: 1,
-            name: None,
-            network: NetworkMode::Offline,
-            user: UserMode::Workspace,
-            gascamp: GascampSource::Bundled,
-            setup: None,
-            resources: Resources::default(),
-            tools: BTreeMap::new(),
-            ports: BTreeMap::new(),
-        }
-    }
+    version: u32,
+    name: Option<String>,
+    network: NetworkMode,
+    user: UserMode,
+    gascamp: GascampSource,
+    setup: Option<Utf8PathBuf>,
+    resources: Resources,
+    tools: BTreeMap<String, String>,
+    ports: BTreeMap<String, u16>,
+    #[serde(skip)]
+    canonical_root: Utf8PathBuf,
 }
 
 impl Manifest {
-    pub fn parse(source: &str) -> Result<Self, ManifestError> {
+    fn parse(source: &str, canonical_root: &Utf8Path) -> Result<Self, ManifestError> {
         let raw: RawManifest = toml::from_str(source)?;
-        raw.validate()
+        raw.validate(canonical_root)
     }
 
     pub fn load(root: &Utf8Path) -> Result<Self, ManifestError> {
@@ -53,16 +39,76 @@ impl Manifest {
             Utf8PathBuf::from_path_buf(canonical).map_err(ManifestError::NonUtf8Path)?;
         let path = canonical.join(MANIFEST_FILE);
         match std::fs::read_to_string(&path) {
-            Ok(source) => {
-                let manifest = Self::parse(&source)?;
-                if let Some(setup) = manifest.setup.as_deref() {
-                    validate_setup_containment(&canonical, setup)?;
-                }
-                Ok(manifest)
+            Ok(source) => Self::parse(&source, &canonical),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                Ok(Self::defaults_for_root(canonical))
             }
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(source) => Err(ManifestError::Io { path, source }),
         }
+    }
+
+    fn defaults_for_root(canonical_root: Utf8PathBuf) -> Self {
+        Self {
+            version: 1,
+            name: None,
+            network: NetworkMode::Offline,
+            user: UserMode::Workspace,
+            gascamp: GascampSource::bundled(),
+            setup: None,
+            resources: Resources::default(),
+            tools: BTreeMap::new(),
+            ports: BTreeMap::new(),
+            canonical_root,
+        }
+    }
+
+    pub(crate) fn validate_for_root(&self, canonical_root: &Utf8Path) -> Result<(), ManifestError> {
+        if self.canonical_root != canonical_root {
+            return Err(ManifestError::RootMismatch {
+                loaded: self.canonical_root.clone(),
+                requested: canonical_root.to_owned(),
+            });
+        }
+        if let Some(setup) = self.setup.as_deref() {
+            validate_setup_containment(canonical_root, setup)?;
+        }
+        Ok(())
+    }
+
+    pub const fn version(&self) -> u32 {
+        self.version
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    pub const fn network(&self) -> NetworkMode {
+        self.network
+    }
+
+    pub const fn user(&self) -> UserMode {
+        self.user
+    }
+
+    pub const fn gascamp(&self) -> &GascampSource {
+        &self.gascamp
+    }
+
+    pub fn setup(&self) -> Option<&Utf8Path> {
+        self.setup.as_deref()
+    }
+
+    pub const fn resources(&self) -> &Resources {
+        &self.resources
+    }
+
+    pub const fn tools(&self) -> &BTreeMap<String, String> {
+        &self.tools
+    }
+
+    pub const fn ports(&self) -> &BTreeMap<String, u16> {
+        &self.ports
     }
 }
 
@@ -82,19 +128,56 @@ pub enum UserMode {
     Root,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
-pub enum GascampSource {
-    #[default]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct GascampSource(GascampSourceKind);
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+enum GascampSourceKind {
     Bundled,
     Workspace(Utf8PathBuf),
+}
+
+impl GascampSource {
+    fn bundled() -> Self {
+        Self(GascampSourceKind::Bundled)
+    }
+
+    fn workspace(path: Utf8PathBuf) -> Self {
+        Self(GascampSourceKind::Workspace(path))
+    }
+
+    pub const fn is_bundled(&self) -> bool {
+        matches!(self.0, GascampSourceKind::Bundled)
+    }
+
+    pub fn workspace_path(&self) -> Option<&Utf8Path> {
+        match &self.0 {
+            GascampSourceKind::Bundled => None,
+            GascampSourceKind::Workspace(path) => Some(path),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Resources {
-    pub cpus: Option<u16>,
-    pub memory: Option<ResourceSize>,
-    pub disk: Option<ResourceSize>,
+    cpus: Option<u16>,
+    memory: Option<ResourceSize>,
+    disk: Option<ResourceSize>,
+}
+
+impl Resources {
+    pub const fn cpus(&self) -> Option<u16> {
+        self.cpus
+    }
+
+    pub const fn memory(&self) -> Option<ResourceSize> {
+        self.memory
+    }
+
+    pub const fn disk(&self) -> Option<ResourceSize> {
+        self.disk
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -157,6 +240,11 @@ pub enum ManifestError {
         setup: Utf8PathBuf,
         root: Utf8PathBuf,
     },
+    #[error("manifest was loaded for a different root: loaded {loaded}, requested {requested}")]
+    RootMismatch {
+        loaded: Utf8PathBuf,
+        requested: Utf8PathBuf,
+    },
     #[error("path is not valid UTF-8: {0:?}")]
     NonUtf8Path(std::path::PathBuf),
     #[error("could not access {path}: {source}")]
@@ -187,7 +275,7 @@ struct RawManifest {
 }
 
 impl RawManifest {
-    fn validate(self) -> Result<Manifest, ManifestError> {
+    fn validate(self, canonical_root: &Utf8Path) -> Result<Manifest, ManifestError> {
         if self.version != 1 {
             return Err(ManifestError::UnsupportedVersion {
                 found: self.version,
@@ -200,9 +288,10 @@ impl RawManifest {
         }
         if let Some(setup) = self.setup.as_deref() {
             validate_workspace_relative_path("setup", setup)?;
+            validate_setup_containment(canonical_root, setup)?;
         }
         let gascamp = match self.gascamp.as_deref() {
-            None | Some("bundled") => GascampSource::Bundled,
+            None | Some("bundled") => GascampSource::bundled(),
             Some(value) => {
                 let path = Utf8PathBuf::from(value);
                 let allowed = Utf8Path::new("/workspace/gascamp");
@@ -215,7 +304,7 @@ impl RawManifest {
                         "gascamp workspace path must be beneath {allowed}"
                     )));
                 }
-                GascampSource::Workspace(path)
+                GascampSource::workspace(path)
             }
         };
         Ok(Manifest {
@@ -228,6 +317,7 @@ impl RawManifest {
             resources: self.resources,
             tools: self.tools,
             ports: self.ports,
+            canonical_root: canonical_root.to_owned(),
         })
     }
 }

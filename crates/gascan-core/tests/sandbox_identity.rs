@@ -45,7 +45,8 @@ fn spec_canonicalizes_symlinks_and_mounts_only_the_root() {
     std::os::unix::fs::symlink(&real, &link).expect("root symlink");
     let link = Utf8Path::from_path(&link).expect("UTF-8 fixture path");
 
-    let spec = SandboxSpec::from_root("code", link, Manifest::default()).expect("valid spec");
+    let manifest = Manifest::load(link).expect("default manifest");
+    let spec = SandboxSpec::from_root("code", link, manifest).expect("valid spec");
     let canonical_path = std::fs::canonicalize(&real).expect("canonical fixture root");
     let canonical = Utf8Path::from_path(&canonical_path).expect("UTF-8 canonical path");
     assert_eq!(spec.canonical_root(), canonical);
@@ -65,6 +66,47 @@ fn spec_rejects_missing_roots_and_non_directories() {
     let file = root.join("file");
     std::fs::write(&file, "data").expect("file fixture");
 
-    assert!(SandboxSpec::from_root("code", &file, Manifest::default()).is_err());
-    assert!(SandboxSpec::from_root("code", &root.join("missing"), Manifest::default()).is_err());
+    let manifest = Manifest::load(root).expect("default manifest");
+    assert!(SandboxSpec::from_root("code", &file, manifest).is_err());
+    assert!(Manifest::load(&root.join("missing")).is_err());
+}
+
+#[test]
+fn manifest_loaded_for_another_root_is_rejected() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let base = Utf8Path::from_path(temp.path()).expect("UTF-8 fixture path");
+    let first = base.join("first");
+    let second = base.join("second");
+    std::fs::create_dir(&first).expect("first root");
+    std::fs::create_dir(&second).expect("second root");
+    let manifest = Manifest::load(&first).expect("first manifest");
+
+    let error = SandboxSpec::from_root("code", &second, manifest)
+        .expect_err("manifest provenance must match the sandbox root");
+    assert!(error.to_string().contains("loaded for a different root"));
+}
+
+#[test]
+fn sandbox_id_deserialization_rejects_unchecked_strings() {
+    for invalid in [
+        "code",
+        "Code-0123456789ab",
+        "code--0123456789ab",
+        "code-0123456789a",
+        "code-0123456789az",
+        "-0123456789ab",
+    ] {
+        let encoded = format!("\"{invalid}\"");
+        assert!(
+            serde_json::from_str::<SandboxId>(&encoded).is_err(),
+            "accepted {invalid}"
+        );
+    }
+
+    let generated = SandboxId::from_root("code", Utf8Path::new("/workspace/code"));
+    let encoded = serde_json::to_string(&generated).expect("serialize generated ID");
+    assert_eq!(
+        serde_json::from_str::<SandboxId>(&encoded).expect("deserialize checked ID"),
+        generated
+    );
 }

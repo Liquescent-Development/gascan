@@ -146,3 +146,63 @@ cargo test -p gascan-core && cargo fmt --all -- --check && git diff --check
 Result: exit 0; 13 core integration tests passed (7 manifest, 5 sandbox identity, 1 pre-existing runtime capability), 0 failed; doc tests, formatting, and diff checks passed.
 
 Review-fix commit: `694dc7d fix: enforce sandbox manifest invariants`.
+
+## Controller Fix Cycle 2
+
+### Findings Addressed
+
+- Made every `Manifest` and `Resources` field private and added immutable accessors for version, name, network, user, Gascamp source, setup, resources, tools, and ports.
+- Replaced the publicly constructible `GascampSource::Workspace(Utf8PathBuf)` enum variant with a public opaque `GascampSource` whose representation and constructors are private. Callers have ergonomic `is_bundled` and `workspace_path` read access.
+- Removed public rootless `Manifest::parse` and public `Default` construction. `Manifest::load` is now the public construction boundary, including the ergonomic no-file defaults case.
+- Recorded the canonical root privately in every loaded/default manifest. `SandboxSpec::from_root` verifies that provenance and reruns root-dependent setup containment immediately before constructing the spec.
+- Replaced derived `SandboxId` deserialization with checked deserialization through typed `SandboxIdError` validation. Accepted IDs require a nonempty normalized slug, one separator, and exactly 12 lowercase hexadecimal digest characters.
+- Added explicit regressions for unknown `[resources]` fields, zero CPUs, zero resource sizes, overflowing resource sizes, a malformed Gascamp sibling path, cross-root manifest reuse, and malformed serialized sandbox IDs.
+
+### RED Evidence
+
+Focused command after test-only API/regression changes:
+
+```text
+cargo test -p gascan-core --test manifest --test sandbox_identity
+```
+
+Result: exit 101 with 19 `E0599` errors because immutable `Manifest`, `Resources`, and `GascampSource` accessors did not exist.
+
+Independent behavioral RED command:
+
+```text
+cargo test -p gascan-core --test sandbox_identity
+```
+
+Result: exit 101; 5 passed and 2 failed. `sandbox_id_deserialization_rejects_unchecked_strings` reported `accepted code`, and `manifest_loaded_for_another_root_is_rejected` received `Ok(SandboxSpec { ... })` for a manifest loaded from root A and consumed at root B.
+
+### GREEN Evidence
+
+Focused command:
+
+```text
+cargo fmt --all && cargo test -p gascan-core --test manifest --test sandbox_identity
+```
+
+Result: exit 0; 8 manifest tests and 7 sandbox identity tests passed, 0 failed.
+
+Full verification command:
+
+```text
+cargo clippy -p gascan-core --all-targets -- -D warnings && cargo test -p gascan-core && cargo fmt --all -- --check && git diff --check
+```
+
+Result: exit 0; strict all-target clippy passed; 16 core integration tests passed (8 manifest, 7 sandbox identity, 1 pre-existing runtime capability), 0 failed; doc tests, formatting, and diff checks passed.
+
+### Controller-Fix Self-Review
+
+- Construction boundary: external code cannot construct or mutate `Manifest`, `Resources`, `ResourceSize`, or `GascampSource` policy state. The only public manifest constructor is root-aware `Manifest::load`.
+- Provenance: no-file defaults also carry canonical-root provenance; cross-root consumption fails before sandbox identity or mounts are constructed.
+- Revalidation: setup containment is checked both during load and during `SandboxSpec::from_root`, catching a changed symlink at spec construction time.
+- ID validation: tuple storage remains private; generated IDs round-trip through Serde, while uppercase, missing/short/invalid digests, empty slugs, and noncanonical separators fail.
+- Production constraints: no unsafe blocks, unwraps, expects, or panics were introduced.
+- Scope: only Task 1 core source/tests changed; no Apple or Task 2 paths changed.
+
+### Remaining Concern
+
+- As before, execution-time filesystem race resistance is owned by the later setup execution policy; Task 1 validates at manifest load and spec construction boundaries.

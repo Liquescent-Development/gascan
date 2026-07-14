@@ -1,13 +1,13 @@
 use crate::manifest::Manifest;
 use camino::{Utf8Path, Utf8PathBuf};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use thiserror::Error;
 
 pub const WORKSPACE_TARGET: &str = "/workspace";
 
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct SandboxId(String);
 
 impl SandboxId {
@@ -23,6 +23,25 @@ impl SandboxId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl TryFrom<String> for SandboxId {
+    type Error = SandboxIdError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        validate_sandbox_id(&value)?;
+        Ok(Self(value))
+    }
+}
+
+impl<'de> Deserialize<'de> for SandboxId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::try_from(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -76,6 +95,7 @@ impl SandboxSpec {
         }
         let canonical_root =
             Utf8PathBuf::from_path_buf(canonical).map_err(SandboxError::NonUtf8Path)?;
+        manifest.validate_for_root(&canonical_root)?;
         let id = SandboxId::from_root(name, &canonical_root);
         let bind_mounts = vec![BindMount {
             source: canonical_root.clone(),
@@ -120,6 +140,53 @@ pub enum SandboxError {
         #[source]
         source: std::io::Error,
     },
+    #[error(transparent)]
+    InvalidManifest(#[from] crate::manifest::ManifestError),
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[error("invalid sandbox ID: {message}")]
+pub struct SandboxIdError {
+    message: String,
+}
+
+fn validate_sandbox_id(value: &str) -> Result<(), SandboxIdError> {
+    const DIGEST_LENGTH: usize = 12;
+    let Some(prefix_length) = value.len().checked_sub(DIGEST_LENGTH + 1) else {
+        return Err(invalid_id("expected a slug and 12-character digest"));
+    };
+    let (slug_and_separator, digest) = value.split_at(prefix_length + 1);
+    let Some(slug) = slug_and_separator.strip_suffix('-') else {
+        return Err(invalid_id("missing digest separator"));
+    };
+    let valid_slug = !slug.is_empty()
+        && slug
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && !slug.starts_with('-')
+        && !slug.ends_with('-')
+        && !slug.contains("--");
+    if !valid_slug {
+        return Err(invalid_id(
+            "slug must use lowercase letters, digits, and single hyphens",
+        ));
+    }
+    if digest.len() != DIGEST_LENGTH
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(invalid_id(
+            "digest must be exactly 12 lowercase hexadecimal characters",
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_id(message: &str) -> SandboxIdError {
+    SandboxIdError {
+        message: message.to_owned(),
+    }
 }
 
 fn slugify(name: &str) -> String {
