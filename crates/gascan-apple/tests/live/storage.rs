@@ -2,25 +2,35 @@ use super::common::{LiveContext, TestError, exact_workspace_bind};
 
 #[test]
 fn bind_inspect_requires_one_exact_read_write_workspace_source() {
-    let source = std::path::Path::new("/tmp/gascan-feas-42-workspace");
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let alias = temp.path().join("workspace-alias");
+    std::os::unix::fs::symlink(&workspace, &alias).unwrap();
+    let source = std::fs::canonicalize(&workspace).unwrap();
     let exact = serde_json::json!([{"configuration":{"mounts":[
-        {"type":{"virtiofs":{}},"source":source,"destination":"/workspace","options":[]},
+        {"type":{"virtiofs":{}},"source":alias,"destination":"/workspace","options":[]},
         {"type":{"virtiofs":{}},"source":"/var/lib/container/volumes/cache","destination":"/opt/gascan","options":[]}
     ]}}]);
-    assert!(exact_workspace_bind(&exact, source).is_some());
+    assert!(exact_workspace_bind(&exact, &source).is_some());
     let broader = serde_json::json!([{"configuration":{"mounts":[{
-        "type":{"virtiofs":{}},"source":"/tmp","destination":"/workspace","options":["rw"]
+        "type":{"virtiofs":{}},"source":temp.path(),"destination":"/workspace","options":["rw"]
     }]}}]);
-    assert!(exact_workspace_bind(&broader, source).is_none());
+    assert!(exact_workspace_bind(&broader, &source).is_none());
+    let broader_extra = serde_json::json!([{"configuration":{"mounts":[
+        {"type":{"virtiofs":{}},"source":alias,"destination":"/workspace","options":[]},
+        {"type":{"virtiofs":{}},"source":temp.path(),"destination":"/broader","options":[]}
+    ]}}]);
+    assert!(exact_workspace_bind(&broader_extra, &source).is_none());
     let named_volume = serde_json::json!([{"configuration":{"mounts":[{
         "type":{"volume":{}},"source":source,"destination":"/workspace","options":["rw"]
     }]}}]);
-    assert!(exact_workspace_bind(&named_volume, source).is_none());
+    assert!(exact_workspace_bind(&named_volume, &source).is_none());
     let duplicate_workspace = serde_json::json!([{"configuration":{"mounts":[
-        {"type":{"virtiofs":{}},"source":source,"destination":"/workspace","options":[]},
+        {"type":{"virtiofs":{}},"source":alias,"destination":"/workspace","options":[]},
         {"type":{"virtiofs":{}},"source":"/tmp/other","destination":"/workspace","options":[]}
     ]}}]);
-    assert!(exact_workspace_bind(&duplicate_workspace, source).is_none());
+    assert!(exact_workspace_bind(&duplicate_workspace, &source).is_none());
 }
 
 #[tokio::test]

@@ -465,6 +465,10 @@ pub fn exact_workspace_bind<'a>(value: &'a Value, source: &Path) -> Option<&'a V
         .is_some_and(|kind| {
             kind.len() == 1 && kind.get("virtiofs") == Some(&Value::Object(Default::default()))
         });
+    let canonical_mount_source = mount
+        .get("source")
+        .and_then(Value::as_str)
+        .and_then(|path| fs::canonicalize(path).ok());
     let broader_source_exists = mounts
         .iter()
         .filter(|candidate| !std::ptr::eq(*candidate, mount))
@@ -472,14 +476,14 @@ pub fn exact_workspace_bind<'a>(value: &'a Value, source: &Path) -> Option<&'a V
             candidate
                 .get("source")
                 .and_then(Value::as_str)
-                .map(Path::new)
+                .and_then(|path| fs::canonicalize(path).ok())
                 .is_some_and(|candidate_source| {
-                    candidate_source != source && source.starts_with(candidate_source)
+                    candidate_source != source && source.starts_with(&candidate_source)
                 })
         });
     if workspace_mounts.next().is_some()
         || !exact_virtiofs
-        || mount.get("source").and_then(Value::as_str) != source.to_str()
+        || canonical_mount_source.as_deref() != Some(source)
         || mount
             .get("options")
             .and_then(Value::as_array)
