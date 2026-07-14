@@ -106,9 +106,13 @@ async fn connect(path: &Path) -> Result<GasCanClient<Channel>, ClientError> {
 }
 
 async fn negotiate(mut api: GasCanClient<Channel>) -> Result<Client, ClientError> {
+    let requested_major = std::env::var("GASCAN_API_MAJOR")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(API_MAJOR);
     let response = api
         .handshake(gascan_proto::v1::HandshakeRequest {
-            api_major: API_MAJOR,
+            api_major: requested_major,
             api_minor: API_MINOR,
             requested_capabilities: Vec::new(),
         })

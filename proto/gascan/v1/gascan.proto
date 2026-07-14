@@ -89,14 +89,20 @@ message HandshakeResponse {
 
 message SandboxSelector { string sandbox_id = 1; reserved 2; }
 message ManifestPayload { bytes content = 1; string format = 2; reserved 3; }
-message CommandPayload { repeated bytes argv = 1; bytes stdin = 2; reserved 3; }
+message CommandPayload {
+  repeated bytes argv = 1;
+  bytes stdin = 2;
+  map<string, string> environment = 3;
+  bool tty = 4;
+  reserved 5;
+}
 
 // Absolute UTF-8 workspace root. The daemon canonicalizes it and loads the
 // manifest itself so request bytes cannot bypass root-bound validation.
 message UpRequest { string project_root = 1; reserved 2; }
 message ApplyRequest { string project_root = 1; reserved 2; }
 message RunRequest { SandboxSelector sandbox = 1; CommandPayload command = 2; reserved 3; }
-message ShellRequest { SandboxSelector sandbox = 1; repeated bytes argv = 2; reserved 3; }
+message ShellRequest { SandboxSelector sandbox = 1; CommandPayload command = 2; reserved 3; }
 message DownRequest { SandboxSelector sandbox = 1; reserved 2; }
 message DestroyRequest { SandboxSelector sandbox = 1; reserved 2; }
 message LogsRequest { SandboxSelector sandbox = 1; google.protobuf.Timestamp since = 2; bool follow = 3; reserved 4; }

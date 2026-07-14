@@ -3,6 +3,7 @@ use crate::terminal::RawTerminal;
 use clap::{Parser, Subcommand};
 use gascan_proto::v1;
 use std::io::{IsTerminal, Read, Write};
+use std::os::fd::AsFd;
 
 const EXIT_USAGE: i32 = 64;
 const EXIT_DAEMON: i32 = 69;
@@ -22,9 +23,13 @@ struct Arguments {
 enum Command {
     Up {
         project_root: String,
+        #[arg(long)]
+        json: bool,
     },
     Apply {
         project_root: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     Shell {
         #[arg(last = true)]
@@ -34,10 +39,15 @@ enum Command {
         #[arg(last = true, required = true)]
         argv: Vec<String>,
     },
-    Down,
+    Down {
+        #[arg(long)]
+        json: bool,
+    },
     Destroy {
         #[arg(long)]
         yes: bool,
+        #[arg(long)]
+        json: bool,
     },
     List {
         #[arg(long)]
@@ -50,6 +60,8 @@ enum Command {
     Logs {
         #[arg(long)]
         follow: bool,
+        #[arg(long)]
+        since_millis: Option<i64>,
     },
     Doctor {
         #[arg(long)]
@@ -69,6 +81,7 @@ impl CliError {
         match self {
             Self::Usage(_) => EXIT_USAGE,
             Self::Client(ClientError::Api(_)) => EXIT_API,
+            Self::Client(ClientError::Rpc(_)) => EXIT_RUNTIME,
             Self::Client(_) => EXIT_DAEMON,
             Self::Runtime(_) | Self::Io(_) => EXIT_RUNTIME,
         }
@@ -103,17 +116,18 @@ pub async fn execute() -> Result<i32, CliError> {
     let arguments = Arguments::try_parse().map_err(|error| CliError::Usage(error.to_string()))?;
     let mut client = Client::connect_or_start().await?;
     match arguments.command {
-        Command::Up { project_root } => {
+        Command::Up { project_root, json } => {
             operation(
                 client
                     .api
                     .up(v1::UpRequest { project_root })
                     .await?
                     .into_inner(),
+                json,
             )
             .await
         }
-        Command::Apply { project_root } => {
+        Command::Apply { project_root, json } => {
             let root = match project_root {
                 Some(root) => root,
                 None => std::env::current_dir()?.to_string_lossy().into_owned(),
@@ -124,10 +138,11 @@ pub async fn execute() -> Result<i32, CliError> {
                     .apply(v1::ApplyRequest { project_root: root })
                     .await?
                     .into_inner(),
+                json,
             )
             .await
         }
-        Command::Down => {
+        Command::Down { json } => {
             let selector = selector(&mut client, arguments.sandbox).await?;
             operation(
                 client
@@ -137,10 +152,11 @@ pub async fn execute() -> Result<i32, CliError> {
                     })
                     .await?
                     .into_inner(),
+                json,
             )
             .await
         }
-        Command::Destroy { yes } => {
+        Command::Destroy { yes, json } => {
             if !yes {
                 confirm_destroy()?;
             }
@@ -153,6 +169,7 @@ pub async fn execute() -> Result<i32, CliError> {
                     })
                     .await?
                     .into_inner(),
+                json,
             )
             .await
         }
@@ -189,7 +206,10 @@ pub async fn execute() -> Result<i32, CliError> {
         }
         Command::Run { argv } => run(&mut client, arguments.sandbox, argv, false).await,
         Command::Shell { argv } => run(&mut client, arguments.sandbox, argv, true).await,
-        Command::Logs { follow } => logs(&mut client, arguments.sandbox, follow).await,
+        Command::Logs {
+            follow,
+            since_millis,
+        } => logs(&mut client, arguments.sandbox, follow, since_millis).await,
     }
 }
 
@@ -222,15 +242,24 @@ async fn selector(
     }
 }
 
-async fn operation(mut stream: tonic::Streaming<v1::OperationEvent>) -> Result<i32, CliError> {
+async fn operation(
+    mut stream: tonic::Streaming<v1::OperationEvent>,
+    json: bool,
+) -> Result<i32, CliError> {
     while let Some(event) = stream.message().await? {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"operation_id":event.operation_id.map(|id|id.value),"sequence":event.sequence,"phase":event.phase,"status":event.status,"error":event.error.as_ref().map(|error|serde_json::json!({"code":error.code,"message":error.message}))})
+            );
+        }
         if let Some(error) = event.error {
             return Err(CliError::Runtime(format!(
                 "{}: {}",
                 error.code, error.message
             )));
         }
-        if !event.phase.is_empty() {
+        if !json && !event.phase.is_empty() {
             eprintln!("{}", event.phase);
         }
     }
@@ -244,27 +273,36 @@ async fn run(
     shell: bool,
 ) -> Result<i32, CliError> {
     let selector = selector(client, explicit).await?;
+    let environment = allowed_environment();
+    let mut stdin = Vec::new();
+    let stdin_is_tty = std::io::stdin().is_terminal();
+    if !stdin_is_tty {
+        std::io::stdin().read_to_end(&mut stdin)?;
+    }
     let mut events = if shell {
         client
             .api
             .shell(v1::ShellRequest {
                 sandbox: Some(selector),
-                argv: argv.into_iter().map(String::into_bytes).collect(),
+                command: Some(v1::CommandPayload {
+                    argv: argv.into_iter().map(String::into_bytes).collect(),
+                    stdin: Vec::new(),
+                    environment,
+                    tty: true,
+                }),
             })
             .await?
             .into_inner()
     } else {
-        let mut stdin = Vec::new();
-        if !std::io::stdin().is_terminal() {
-            std::io::stdin().read_to_end(&mut stdin)?;
-        }
         client
             .api
             .run(v1::RunRequest {
                 sandbox: Some(selector),
                 command: Some(v1::CommandPayload {
                     argv: argv.into_iter().map(String::into_bytes).collect(),
-                    stdin,
+                    stdin: Vec::new(),
+                    environment,
+                    tty: false,
                 }),
             })
             .await?
@@ -284,13 +322,37 @@ async fn run(
     } else {
         None
     };
-    let frame = v1::ClientFrame {
-        frame: Some(v1::client_frame::Frame::Close(v1::Close {})),
-        session_token: event.session_token,
-    };
+    let token = event.session_token;
+    let (input_sender, input_receiver) = tokio::sync::mpsc::channel(16);
+    if shell && stdin_is_tty {
+        let producer = input_sender.clone();
+        let producer_token = token.clone();
+        let restore = _terminal.as_ref().map(RawTerminal::restore_handle);
+        tokio::spawn(async move {
+            forward_terminal_input(producer, producer_token, restore).await;
+        });
+    } else if !stdin.is_empty() {
+        input_sender
+            .send(v1::ClientFrame {
+                frame: Some(v1::client_frame::Frame::Stdin(stdin)),
+                session_token: token.clone(),
+            })
+            .await
+            .map_err(|_| CliError::Runtime("attach input closed".to_owned()))?;
+    }
+    if !(shell && stdin_is_tty) {
+        input_sender
+            .send(v1::ClientFrame {
+                frame: Some(v1::client_frame::Frame::Close(v1::Close {})),
+                session_token: token,
+            })
+            .await
+            .map_err(|_| CliError::Runtime("attach input closed".to_owned()))?;
+    }
+    drop(input_sender);
     let mut attached = client
         .api
-        .attach(tokio_stream::iter([frame]))
+        .attach(tokio_stream::wrappers::ReceiverStream::new(input_receiver))
         .await?
         .into_inner();
     while let Some(frame) = attached.message().await? {
@@ -316,17 +378,113 @@ async fn run(
     ))
 }
 
+async fn forward_terminal_input(
+    sender: tokio::sync::mpsc::Sender<v1::ClientFrame>,
+    token: Vec<u8>,
+    restore: Option<crate::terminal::TerminalRestore>,
+) {
+    use tokio::io::AsyncReadExt;
+    let size = rustix::termios::tcgetwinsize(std::io::stdin().as_fd()).ok();
+    if let Some(size) = size {
+        if sender
+            .send(v1::ClientFrame {
+                frame: Some(v1::client_frame::Frame::Resize(v1::Resize {
+                    columns: u32::from(size.ws_col),
+                    rows: u32::from(size.ws_row),
+                })),
+                session_token: token.clone(),
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+    let mut interrupt =
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+            Ok(signal) => signal,
+            Err(_) => return,
+        };
+    let mut terminate =
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(signal) => signal,
+            Err(_) => return,
+        };
+    let mut resize =
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()) {
+            Ok(signal) => signal,
+            Err(_) => return,
+        };
+    let mut stdin = tokio::io::stdin();
+    let mut bytes = vec![0_u8; 4096];
+    loop {
+        let frame = tokio::select! {
+            read = stdin.read(&mut bytes) => match read { Ok(0) | Err(_) => v1::client_frame::Frame::Close(v1::Close {}), Ok(count) => v1::client_frame::Frame::Stdin(bytes[..count].to_vec()) },
+            _ = interrupt.recv() => v1::client_frame::Frame::Signal(v1::Signal { number: 2 }),
+            _ = terminate.recv() => v1::client_frame::Frame::Signal(v1::Signal { number: 15 }),
+            _ = resize.recv() => {
+                let size = rustix::termios::tcgetwinsize(std::io::stdin().as_fd()).ok();
+                let Some(size) = size else { continue; };
+                v1::client_frame::Frame::Resize(v1::Resize { columns: u32::from(size.ws_col), rows: u32::from(size.ws_row) })
+            }
+        };
+        let terminal = matches!(
+            frame,
+            v1::client_frame::Frame::Close(_) | v1::client_frame::Frame::Signal(_)
+        );
+        if matches!(frame, v1::client_frame::Frame::Signal(_)) {
+            if let Some(restore) = &restore {
+                restore.restore();
+            }
+        }
+        if sender
+            .send(v1::ClientFrame {
+                frame: Some(frame),
+                session_token: token.clone(),
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if terminal {
+            let _ = sender
+                .send(v1::ClientFrame {
+                    frame: Some(v1::client_frame::Frame::Close(v1::Close {})),
+                    session_token: token.clone(),
+                })
+                .await;
+            return;
+        }
+    }
+}
+
+fn allowed_environment() -> std::collections::HashMap<String, String> {
+    ["TERM", "COLORTERM", "LANG", "LC_ALL", "LC_CTYPE"]
+        .into_iter()
+        .filter_map(|name| {
+            std::env::var(name)
+                .ok()
+                .map(|value| (name.to_owned(), value))
+        })
+        .collect()
+}
+
 async fn logs(
     client: &mut Client,
     explicit: Option<String>,
     follow: bool,
+    since_millis: Option<i64>,
 ) -> Result<i32, CliError> {
     let selector = selector(client, explicit).await?;
     let mut stream = client
         .api
         .logs(v1::LogsRequest {
             sandbox: Some(selector),
-            since: None,
+            since: since_millis.map(|millis| prost_types::Timestamp {
+                seconds: millis.div_euclid(1_000),
+                nanos: (millis.rem_euclid(1_000) * 1_000_000) as i32,
+            }),
             follow,
         })
         .await?

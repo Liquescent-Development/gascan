@@ -274,9 +274,49 @@ impl Daemon {
 pub struct SandboxApi<B: RuntimeBackend> {
     service: Arc<SandboxService<B>>,
     activity: ActivityTracker,
-    sessions: Arc<
-        tokio::sync::Mutex<std::collections::HashMap<Vec<u8>, gascan_core::runtime::ExecSession>>,
-    >,
+    sessions: Arc<tokio::sync::Mutex<SessionRegistry>>,
+}
+
+#[derive(Debug)]
+struct PendingSession {
+    id: SandboxId,
+    argv: Vec<String>,
+    stdin: Vec<u8>,
+    environment: std::collections::BTreeMap<String, String>,
+    tty: bool,
+    expires: tokio::time::Instant,
+}
+
+#[derive(Default)]
+struct SessionRegistry {
+    pending: std::collections::HashMap<Vec<u8>, PendingSession>,
+    expired: std::collections::VecDeque<Vec<u8>>,
+}
+
+impl SessionRegistry {
+    fn insert(&mut self, token: Vec<u8>, session: PendingSession) {
+        self.pending.insert(token, session);
+    }
+    fn claim(&mut self, token: &[u8]) -> Result<PendingSession, &'static str> {
+        if let Some(session) = self.pending.remove(token) {
+            if session.expires > tokio::time::Instant::now() {
+                return Ok(session);
+            }
+            self.remember_expired(token.to_vec());
+            return Err(error_code::EXPIRED_SESSION_TOKEN);
+        }
+        if self.expired.iter().any(|expired| expired == token) {
+            Err(error_code::EXPIRED_SESSION_TOKEN)
+        } else {
+            Err(error_code::UNKNOWN_SESSION_TOKEN)
+        }
+    }
+    fn remember_expired(&mut self, token: Vec<u8>) {
+        if self.expired.len() == 1024 {
+            let _ = self.expired.pop_front();
+        }
+        self.expired.push_back(token);
+    }
 }
 impl<B: RuntimeBackend> SandboxApi<B> {
     #[must_use]
@@ -284,7 +324,7 @@ impl<B: RuntimeBackend> SandboxApi<B> {
         Self {
             service,
             activity,
-            sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            sessions: Arc::new(tokio::sync::Mutex::new(SessionRegistry::default())),
         }
     }
 }
@@ -442,6 +482,17 @@ fn timestamp_from_millis(millis: i64) -> prost_types::Timestamp {
     }
 }
 
+fn timestamp_millis(timestamp: prost_types::Timestamp) -> Result<i64, ApiInputError> {
+    if !(0..1_000_000_000).contains(&timestamp.nanos) {
+        return Err(ApiInputError::Invalid);
+    }
+    timestamp
+        .seconds
+        .checked_mul(1_000)
+        .and_then(|seconds| seconds.checked_add(i64::from(timestamp.nanos / 1_000_000)))
+        .ok_or(ApiInputError::Invalid)
+}
+
 async fn spec_for_root(project_root: String) -> Result<SandboxSpec, ApiInputError> {
     if project_root.is_empty() {
         return Err(ApiInputError::Invalid);
@@ -496,15 +547,44 @@ fn argv_from_wire(argv: Vec<Vec<u8>>) -> Result<Vec<String>, ApiInputError> {
         .collect()
 }
 
-fn allowed_environment() -> std::collections::BTreeMap<String, String> {
-    ["TERM", "LANG", "LC_ALL", "COLORTERM"]
-        .into_iter()
-        .filter_map(|name| {
-            std::env::var(name)
-                .ok()
-                .map(|value| (name.to_owned(), value))
-        })
-        .collect()
+fn exec_input(frame: v1::ClientFrame) -> Result<gascan_core::runtime::ExecInput, ApiInputError> {
+    match frame.frame {
+        Some(v1::client_frame::Frame::Stdin(bytes)) => {
+            Ok(gascan_core::runtime::ExecInput::Stdin(bytes))
+        }
+        Some(v1::client_frame::Frame::Resize(size)) => {
+            Ok(gascan_core::runtime::ExecInput::Resize {
+                columns: size.columns,
+                rows: size.rows,
+            })
+        }
+        Some(v1::client_frame::Frame::Signal(signal)) => {
+            Ok(gascan_core::runtime::ExecInput::Signal(signal.number))
+        }
+        Some(v1::client_frame::Frame::Close(_)) => Ok(gascan_core::runtime::ExecInput::Close),
+        None => Err(ApiInputError::Invalid),
+    }
+}
+
+fn server_output(output: gascan_core::runtime::ExecOutput) -> v1::ServerFrame {
+    let frame = match output {
+        gascan_core::runtime::ExecOutput::Stdout(bytes) => v1::server_frame::Frame::Stdout(bytes),
+        gascan_core::runtime::ExecOutput::Stderr(bytes) => v1::server_frame::Frame::Stderr(bytes),
+        gascan_core::runtime::ExecOutput::Exit { code, signal } => {
+            v1::server_frame::Frame::Exit(v1::Exit { code, signal })
+        }
+    };
+    v1::ServerFrame { frame: Some(frame) }
+}
+
+fn server_error(code: impl Into<String>, message: impl Into<String>) -> v1::ServerFrame {
+    v1::ServerFrame {
+        frame: Some(v1::server_frame::Frame::Error(v1::Error {
+            code: code.into(),
+            message: message.into(),
+            details: Vec::new(),
+        })),
+    }
 }
 
 #[tonic::async_trait]
@@ -627,20 +707,23 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         let command = request
             .command
             .ok_or_else(|| tonic::Status::invalid_argument(error_code::INVALID_REQUEST))?;
-        let session = self
-            .service
-            .exec(
-                &id,
-                argv_from_wire(command.argv).map_err(ApiInputError::status)?,
-                command.stdin,
-                allowed_environment(),
-                false,
-            )
+        self.service
+            .validate_exec(&id)
             .await
             .map_err(service_status)?;
         let mut token = vec![0_u8; 24];
         getrandom::fill(&mut token).map_err(|_| tonic::Status::internal(error_code::INTERNAL))?;
-        self.sessions.lock().await.insert(token.clone(), session);
+        self.sessions.lock().await.insert(
+            token.clone(),
+            PendingSession {
+                id,
+                argv: argv_from_wire(command.argv).map_err(ApiInputError::status)?,
+                stdin: command.stdin,
+                environment: command.environment.into_iter().collect(),
+                tty: command.tty,
+                expires: tokio::time::Instant::now() + Duration::from_secs(30),
+            },
+        );
         Ok(tonic::Response::new(event_stream(session_event(token))))
     }
     type ShellStream = EventStream;
@@ -652,19 +735,34 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         let _lease = self.activity.lease();
         let request = request.into_inner();
         let id = selector_id(request.sandbox).map_err(ApiInputError::status)?;
-        let argv = if request.argv.is_empty() {
+        let command = request.command.unwrap_or(v1::CommandPayload {
+            argv: Vec::new(),
+            stdin: Vec::new(),
+            environment: Default::default(),
+            tty: true,
+        });
+        let argv = if command.argv.is_empty() {
             vec!["sh".to_owned()]
         } else {
-            argv_from_wire(request.argv).map_err(ApiInputError::status)?
+            argv_from_wire(command.argv).map_err(ApiInputError::status)?
         };
-        let session = self
-            .service
-            .exec(&id, argv, Vec::new(), allowed_environment(), true)
+        self.service
+            .validate_exec(&id)
             .await
             .map_err(service_status)?;
         let mut token = vec![0_u8; 24];
         getrandom::fill(&mut token).map_err(|_| tonic::Status::internal(error_code::INTERNAL))?;
-        self.sessions.lock().await.insert(token.clone(), session);
+        self.sessions.lock().await.insert(
+            token.clone(),
+            PendingSession {
+                id,
+                argv,
+                stdin: command.stdin,
+                environment: command.environment.into_iter().collect(),
+                tty: true,
+                expires: tokio::time::Instant::now() + Duration::from_secs(30),
+            },
+        );
         Ok(tonic::Response::new(event_stream(session_event(token))))
     }
     type DownStream = ApiEventStream;
@@ -700,9 +798,20 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
     ) -> Result<tonic::Response<Self::LogsStream>, tonic::Status> {
         self.activity.ensure_accepting().map_err(admission_status)?;
         let _lease = self.activity.lease();
-        let id = selector_id(request.into_inner().sandbox).map_err(ApiInputError::status)?;
-        let bytes = self.service.logs(&id).await.map_err(service_status)?;
-        Ok(tonic::Response::new(event_stream(v1::OperationEvent {
+        let request = request.into_inner();
+        let since_millis = request
+            .since
+            .map(timestamp_millis)
+            .transpose()
+            .map_err(ApiInputError::status)?;
+        let id = selector_id(request.sandbox).map_err(ApiInputError::status)?;
+        let bytes = self
+            .service
+            .logs(&id, since_millis)
+            .await
+            .map_err(service_status)?;
+        let baseline = bytes.clone();
+        let event = v1::OperationEvent {
             operation_id: None,
             timestamp: None,
             phase: "logs".to_owned(),
@@ -712,7 +821,39 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             status: v1::OperationStatus::Completed as i32,
             content_type: "application/octet-stream".to_owned(),
             session_token: Vec::new(),
-        })))
+        };
+        if !request.follow {
+            return Ok(tonic::Response::new(event_stream(event)));
+        }
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let activity = self.activity.clone();
+        let service = self.service.clone();
+        tokio::spawn(async move {
+            let _lease = activity.lease();
+            if sender.send(Ok(event)).await.is_err() {
+                return;
+            }
+            let mut previous = baseline;
+            loop {
+                tokio::select! {
+                    () = activity.inner.shutdown.notified() => break,
+                    () = sender.closed() => break,
+                    () = tokio::time::sleep(Duration::from_millis(50)) => {
+                        let current = match service.logs(&id, since_millis).await { Ok(bytes) => bytes, Err(error) => { let _ = sender.send(Err(service_status(error))).await; break; } };
+                        if let Some(appended) = current.strip_prefix(previous.as_slice()) {
+                            if !appended.is_empty() {
+                                let event = v1::OperationEvent { operation_id: None, timestamp: None, phase: "logs".to_owned(), payload: appended.to_vec(), error: None, sequence: 1, status: v1::OperationStatus::Pending as i32, content_type: "application/octet-stream".to_owned(), session_token: Vec::new() };
+                                if sender.send(Ok(event)).await.is_err() { break; }
+                            }
+                        }
+                        previous = current;
+                    }
+                }
+            }
+        });
+        Ok(tonic::Response::new(
+            tokio_stream::wrappers::ReceiverStream::new(receiver),
+        ))
     }
     type AttachStream = AttachStream;
     async fn attach(
@@ -730,38 +871,76 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         binder
             .validate_frame(&first.session_token)
             .map_err(|error| tonic::Status::invalid_argument(error.code()))?;
-        let session = self
-            .sessions
-            .lock()
+        let token = first.session_token.clone();
+        let first_input = exec_input(first).map_err(ApiInputError::status)?;
+        let pending = self.sessions.lock().await.claim(&token).map_err(|code| {
+            if code == error_code::EXPIRED_SESSION_TOKEN {
+                tonic::Status::failed_precondition(code)
+            } else {
+                tonic::Status::not_found(code)
+            }
+        })?;
+        let mut session = self
+            .service
+            .exec(
+                &pending.id,
+                pending.argv,
+                pending.stdin,
+                pending.environment,
+                pending.tty,
+            )
             .await
-            .remove(&first.session_token)
-            .ok_or_else(|| tonic::Status::not_found(error_code::UNKNOWN_SESSION_TOKEN))?;
-        while let Some(frame) = input.message().await? {
-            binder
-                .validate_frame(&frame.session_token)
-                .map_err(|error| tonic::Status::invalid_argument(error.code()))?;
-        }
-        let (sender, receiver) = tokio::sync::mpsc::channel(3);
-        for frame in [
-            v1::ServerFrame {
-                frame: Some(v1::server_frame::Frame::Stdout(session.stdout().to_vec())),
-            },
-            v1::ServerFrame {
-                frame: Some(v1::server_frame::Frame::Stderr(session.stderr().to_vec())),
-            },
-            v1::ServerFrame {
-                frame: Some(v1::server_frame::Frame::Exit(v1::Exit {
-                    code: session.exit_code(),
-                    signal: 0,
-                })),
-            },
-        ] {
-            sender
-                .send(Ok(frame))
-                .await
-                .map_err(|_| tonic::Status::internal(error_code::INTERNAL))?;
-        }
-        drop(sender);
+            .map_err(service_status)?;
+        let (sender, receiver) = tokio::sync::mpsc::channel(16);
+        let activity = self.activity.clone();
+        tokio::spawn(async move {
+            let _lease = activity.lease();
+            let mut input_closed = matches!(first_input, gascan_core::runtime::ExecInput::Close);
+            if session.send(first_input).await.is_err() {
+                return;
+            }
+            loop {
+                tokio::select! {
+                    biased;
+                    output = session.next() => match output {
+                        Some(Ok(output)) => {
+                            if sender.send(Ok(server_output(output))).await.is_err() { break; }
+                        }
+                        Some(Err(error)) => {
+                            let _ = sender.send(Ok(server_error(error.code(), error.to_string()))).await;
+                            break;
+                        }
+                        None => break,
+                    },
+                    frame = input.message(), if !input_closed => match frame {
+                        Ok(Some(frame)) => {
+                            let input_frame = if let v1::ClientFrame { frame: Some(_), .. } = &frame {
+                                match binder.validate_frame(&frame.session_token) {
+                                    Ok(()) => exec_input(frame),
+                                    Err(error) => Err(match error { gascan_proto::AttachSessionError::Empty | gascan_proto::AttachSessionError::Mismatch => ApiInputError::Invalid }),
+                                }
+                            } else { Err(ApiInputError::Invalid) };
+                            match input_frame {
+                                Ok(frame) => {
+                                    input_closed = matches!(frame, gascan_core::runtime::ExecInput::Close);
+                                    if session.send(frame).await.is_err() { break; }
+                                }
+                                Err(_) => {
+                                    let _ = session.send(gascan_core::runtime::ExecInput::Close).await;
+                                    let _ = sender.send(Ok(server_error(error_code::SESSION_TOKEN_MISMATCH, "attach frame rejected"))).await;
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            input_closed = true;
+                            let _ = session.send(gascan_core::runtime::ExecInput::Close).await;
+                        }
+                        Err(error) => { let _ = sender.send(Err(error)).await; break; }
+                    }
+                }
+            }
+        });
         Ok(tonic::Response::new(
             tokio_stream::wrappers::ReceiverStream::new(receiver),
         ))
@@ -771,8 +950,8 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivityTracker, ApiEventStream, ApiInputError, service_status, spec_for_root, wire_event,
-        wire_status,
+        ActivityTracker, ApiEventStream, ApiInputError, PendingSession, SessionRegistry,
+        service_status, spec_for_root, wire_event, wire_status,
     };
     use crate::{
         ActualState, DesiredState, OperationEvent, OperationId, OperationStatus, SandboxRecord,
@@ -783,6 +962,41 @@ mod tests {
     use gascan_proto::error_code;
     use serde_json::json;
     use tokio_stream::StreamExt;
+
+    #[test]
+    fn session_claim_is_atomic_and_distinguishes_expired_from_unknown() {
+        let id = SandboxId::test("session-registry");
+        let pending = |expires| PendingSession {
+            id: id.clone(),
+            argv: vec!["true".to_owned()],
+            stdin: Vec::new(),
+            environment: Default::default(),
+            tty: false,
+            expires,
+        };
+        let mut registry = SessionRegistry::default();
+        registry.insert(
+            b"live".to_vec(),
+            pending(tokio::time::Instant::now() + std::time::Duration::from_secs(1)),
+        );
+        assert!(registry.claim(b"live").is_ok());
+        assert_eq!(
+            registry.claim(b"live").err(),
+            Some(gascan_proto::error_code::UNKNOWN_SESSION_TOKEN)
+        );
+        registry.insert(
+            b"old".to_vec(),
+            pending(tokio::time::Instant::now() - std::time::Duration::from_secs(1)),
+        );
+        assert_eq!(
+            registry.claim(b"old").err(),
+            Some(gascan_proto::error_code::EXPIRED_SESSION_TOKEN)
+        );
+        assert_eq!(
+            registry.claim(b"old").err(),
+            Some(gascan_proto::error_code::EXPIRED_SESSION_TOKEN)
+        );
+    }
 
     #[tokio::test]
     async fn project_roots_are_absolute_and_manifest_bound()

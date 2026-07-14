@@ -1,17 +1,41 @@
 use crate::runtime::{
-    ContainerState, CreateFailure, CreateOutcome, CreateRequest, ExecRequest, ExecSession,
-    RemoveRequest, ResourceIdentity, ResourceKind, ResourceOwnership, RuntimeBackend, RuntimeCall,
-    RuntimeCapabilities, RuntimeError, RuntimeOutcome, RuntimeResource, RuntimeSandbox,
+    ContainerState, CreateFailure, CreateOutcome, CreateRequest, ExecInput, ExecOutput,
+    ExecRequest, ExecSession, RemoveRequest, ResourceIdentity, ResourceKind, ResourceOwnership,
+    RuntimeBackend, RuntimeCall, RuntimeCapabilities, RuntimeError, RuntimeOutcome,
+    RuntimeResource, RuntimeSandbox,
 };
 use crate::sandbox::SandboxId;
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 
 #[derive(Clone)]
 pub struct FakeRuntime {
     inner: Arc<Mutex<FakeState>>,
+    persistence: Arc<Option<PathBuf>>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct FakeSnapshot {
+    sandboxes: Vec<RuntimeSandbox>,
+    resources: Vec<PersistedResource>,
+    logs: Vec<FakeLogRecord>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct FakeLogRecord {
+    timestamp_millis: i64,
+    bytes: Vec<u8>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedResource {
+    kind: ResourceKind,
+    name: String,
+    sandbox_id: Option<SandboxId>,
+    ownership: ResourceOwnership,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -52,8 +76,8 @@ struct FakeState {
     outcomes: Vec<RuntimeOutcome>,
     failures: HashSet<FailureBoundary>,
     create_failure_after_mutations: Option<usize>,
-    exec_result: ExecSession,
-    logs: Vec<u8>,
+    exec_result: (Vec<u8>, Vec<u8>, i32),
+    logs: Vec<FakeLogRecord>,
 }
 
 impl FakeRuntime {
@@ -68,10 +92,23 @@ impl FakeRuntime {
                 outcomes: Vec::new(),
                 failures: HashSet::new(),
                 create_failure_after_mutations: None,
-                exec_result: ExecSession::from_output(Vec::new(), Vec::new(), 0),
+                exec_result: (Vec::new(), Vec::new(), 0),
                 logs: Vec::new(),
             })),
+            persistence: Arc::new(None),
         }
+    }
+
+    pub async fn persistent(
+        capabilities: RuntimeCapabilities,
+        path: impl AsRef<Path>,
+    ) -> Result<Self, RuntimeError> {
+        let path = path.as_ref().to_owned();
+        let runtime = Self {
+            inner: Arc::new(Mutex::new(load_state(capabilities, &path)?)),
+            persistence: Arc::new(Some(path)),
+        };
+        Ok(runtime)
     }
 
     pub fn failing_once(boundary: FailureBoundary) -> Self {
@@ -130,11 +167,16 @@ impl FakeRuntime {
     }
 
     pub async fn set_exec_result(&self, stdout: Vec<u8>, stderr: Vec<u8>, exit_code: i32) {
-        self.inner.lock().await.exec_result = ExecSession::from_output(stdout, stderr, exit_code);
+        self.inner.lock().await.exec_result = (stdout, stderr, exit_code);
     }
 
     pub async fn set_logs(&self, logs: Vec<u8>) {
-        self.inner.lock().await.logs = logs;
+        let mut state = self.inner.lock().await;
+        state.logs = vec![FakeLogRecord {
+            timestamp_millis: 0,
+            bytes: logs,
+        }];
+        let _ = persist_state(&state, self.persistence.as_deref());
     }
 
     pub async fn seed_owned(&self, id: SandboxId) {
@@ -248,6 +290,131 @@ fn missing(id: &SandboxId) -> RuntimeError {
     }
 }
 
+fn load_state(capabilities: RuntimeCapabilities, path: &Path) -> Result<FakeState, RuntimeError> {
+    let snapshot = match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice::<FakeSnapshot>(&bytes).map_err(|error| {
+            RuntimeError::InvalidOutput {
+                operation: "fake_runtime_load".to_owned(),
+                message: error.to_string(),
+            }
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => FakeSnapshot {
+            sandboxes: Vec::new(),
+            resources: Vec::new(),
+            logs: Vec::new(),
+        },
+        Err(error) => {
+            return Err(RuntimeError::CommandIo {
+                operation: "fake_runtime_load".to_owned(),
+                message: error.to_string(),
+            });
+        }
+    };
+    let resources = snapshot
+        .resources
+        .into_iter()
+        .map(|resource| {
+            let identity = ResourceIdentity::new(resource.kind, resource.name)?;
+            Ok((
+                identity.clone(),
+                RuntimeResource::discovered(identity, resource.sandbox_id, resource.ownership),
+            ))
+        })
+        .collect::<Result<HashMap<_, _>, RuntimeError>>()?;
+    Ok(FakeState {
+        capabilities,
+        sandboxes: snapshot
+            .sandboxes
+            .into_iter()
+            .map(|sandbox| (sandbox.id.clone(), sandbox))
+            .collect(),
+        resources,
+        gates: HashMap::new(),
+        calls: Vec::new(),
+        outcomes: Vec::new(),
+        failures: HashSet::new(),
+        create_failure_after_mutations: None,
+        exec_result: (Vec::new(), Vec::new(), 0),
+        logs: snapshot.logs,
+    })
+}
+
+fn persist_state(state: &FakeState, path: Option<&Path>) -> Result<(), RuntimeError> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let snapshot = FakeSnapshot {
+        sandboxes: state.sandboxes.values().cloned().collect(),
+        resources: state
+            .resources
+            .values()
+            .map(|resource| PersistedResource {
+                kind: resource.kind(),
+                name: resource.name().to_owned(),
+                sandbox_id: resource.sandbox_id().cloned(),
+                ownership: resource.ownership(),
+            })
+            .collect(),
+        logs: state.logs.clone(),
+    };
+    let bytes = serde_json::to_vec(&snapshot).map_err(|error| RuntimeError::InvalidOutput {
+        operation: "fake_runtime_save".to_owned(),
+        message: error.to_string(),
+    })?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| RuntimeError::CommandIo {
+            operation: "fake_runtime_save".to_owned(),
+            message: error.to_string(),
+        })?;
+    }
+    let temporary = path.with_extension("tmp");
+    std::fs::write(&temporary, bytes)
+        .and_then(|()| std::fs::rename(&temporary, path))
+        .map_err(|error| RuntimeError::CommandIo {
+            operation: "fake_runtime_save".to_owned(),
+            message: error.to_string(),
+        })
+}
+
+fn interpret_fake_command(
+    argv: &[String],
+    environment: &std::collections::BTreeMap<String, String>,
+    stdin: Vec<u8>,
+    configured: (Vec<u8>, Vec<u8>, i32),
+) -> (Vec<u8>, Vec<u8>, i32) {
+    match argv.first().map(String::as_str) {
+        Some("fake-echo-stdin") => (stdin, Vec::new(), 0),
+        Some("fake-exit") => (
+            Vec::new(),
+            Vec::new(),
+            argv.get(1)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(64),
+        ),
+        Some("fake-stdout") => (
+            argv.get(1)
+                .map_or_else(Vec::new, |value| value.as_bytes().to_vec()),
+            Vec::new(),
+            0,
+        ),
+        Some("fake-stderr") => (
+            Vec::new(),
+            argv.get(1)
+                .map_or_else(Vec::new, |value| value.as_bytes().to_vec()),
+            0,
+        ),
+        Some("fake-env") => (
+            argv.get(1)
+                .and_then(|name| environment.get(name))
+                .map_or_else(Vec::new, |value| value.as_bytes().to_vec()),
+            Vec::new(),
+            0,
+        ),
+        Some("true") | Some("sh") => (Vec::new(), Vec::new(), 0),
+        _ => configured,
+    }
+}
+
 #[async_trait]
 impl RuntimeBackend for FakeRuntime {
     async fn capabilities(&self) -> Result<RuntimeCapabilities, RuntimeError> {
@@ -331,6 +498,7 @@ impl RuntimeBackend for FakeRuntime {
         state
             .outcomes
             .push(RuntimeOutcome::Created(outcome.clone()));
+        persist_state(&state, self.persistence.as_deref()).map_err(CreateFailure::from_source)?;
         Ok(outcome)
     }
 
@@ -348,6 +516,7 @@ impl RuntimeBackend for FakeRuntime {
             .get_mut(id)
             .ok_or_else(|| missing(id))?
             .state = ContainerState::Running;
+        persist_state(&state, self.persistence.as_deref())?;
         Ok(())
     }
 
@@ -360,6 +529,7 @@ impl RuntimeBackend for FakeRuntime {
             .get_mut(id)
             .ok_or_else(|| missing(id))?
             .state = ContainerState::Stopped;
+        persist_state(&state, self.persistence.as_deref())?;
         Ok(())
     }
 
@@ -395,6 +565,7 @@ impl RuntimeBackend for FakeRuntime {
             }
         }
         state.outcomes.push(RuntimeOutcome::Removed(request));
+        persist_state(&state, self.persistence.as_deref())?;
         Ok(())
     }
 
@@ -412,32 +583,69 @@ impl RuntimeBackend for FakeRuntime {
                 message: "exec requires a running sandbox".to_owned(),
             });
         }
-        if request.argv.as_slice() == ["sh", "-c", "exit 42"] {
-            return Ok(ExecSession::from_output(Vec::new(), Vec::new(), 42));
-        }
-        if request.argv.len() == 3 && request.argv[0] == "sh" && request.argv[1] == "-c" {
-            if let Some(payload) = request.argv[2]
-                .strip_prefix("printf '")
-                .and_then(|value| value.strip_suffix('\''))
-            {
-                return Ok(ExecSession::from_output(
-                    payload.as_bytes().to_vec(),
-                    Vec::new(),
-                    0,
-                ));
+        let configured = state.exec_result.clone();
+        let runtime = self.clone();
+        let (input, mut inputs) = tokio::sync::mpsc::channel(16);
+        let (outputs, output) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(async move {
+            let mut stdin = request.stdin;
+            let mut signal = 0;
+            while let Some(frame) = inputs.recv().await {
+                match frame {
+                    ExecInput::Stdin(bytes) => stdin.extend(bytes),
+                    ExecInput::Resize { .. } => {}
+                    ExecInput::Signal(number) => signal = number,
+                    ExecInput::Close => break,
+                }
             }
-        }
-        Ok(state.exec_result.clone())
+            let (stdout, stderr, code) =
+                interpret_fake_command(&request.argv, &request.environment, stdin, configured);
+            {
+                let mut state = runtime.inner.lock().await;
+                let timestamp_millis = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+                    .unwrap_or(i64::MAX);
+                state.logs.push(FakeLogRecord {
+                    timestamp_millis,
+                    bytes: [stdout.as_slice(), stderr.as_slice()].concat(),
+                });
+                let _ = persist_state(&state, runtime.persistence.as_deref());
+            }
+            if !stdout.is_empty() && outputs.send(Ok(ExecOutput::Stdout(stdout))).await.is_err() {
+                return;
+            }
+            if !stderr.is_empty() && outputs.send(Ok(ExecOutput::Stderr(stderr))).await.is_err() {
+                return;
+            }
+            let code = if signal == 0 {
+                code
+            } else {
+                128_i32.saturating_add(signal)
+            };
+            let _ = outputs.send(Ok(ExecOutput::Exit { code, signal })).await;
+        });
+        Ok(ExecSession::live(input, output))
     }
 
-    async fn logs(&self, id: &SandboxId) -> Result<Vec<u8>, RuntimeError> {
+    async fn logs(
+        &self,
+        id: &SandboxId,
+        since_millis: Option<i64>,
+    ) -> Result<Vec<u8>, RuntimeError> {
         let mut state = self.inner.lock().await;
         state.calls.push(RuntimeCall::Logs(id.clone()));
         fail_once(&mut state, FailureBoundary::Logs)?;
         if !state.sandboxes.contains_key(id) {
             return Err(missing(id));
         }
-        Ok(state.logs.clone())
+        Ok(state
+            .logs
+            .iter()
+            .filter(|record| since_millis.is_none_or(|since| record.timestamp_millis >= since))
+            .flat_map(|record| record.bytes.iter().copied())
+            .collect())
     }
 
     async fn list_resources(&self) -> Result<Vec<RuntimeResource>, RuntimeError> {
@@ -477,7 +685,7 @@ fn fail_after_create_mutation(
     Ok(())
 }
 
-fn fixture_capabilities() -> RuntimeCapabilities {
+pub fn fixture_capabilities() -> RuntimeCapabilities {
     RuntimeCapabilities {
         version: crate::runtime::RuntimeVersion::new(1, 0, 0),
         bind_mounts: true,

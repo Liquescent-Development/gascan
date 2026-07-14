@@ -141,9 +141,20 @@ impl<B: RuntimeBackend> SandboxService<B> {
             .map_err(Into::into)
     }
 
-    pub async fn logs(&self, id: &SandboxId) -> Result<Vec<u8>, ServiceError> {
+    pub async fn validate_exec(&self, id: &SandboxId) -> Result<(), ServiceError> {
+        self.require_owned_running(id).await
+    }
+
+    pub async fn logs(
+        &self,
+        id: &SandboxId,
+        since_millis: Option<i64>,
+    ) -> Result<Vec<u8>, ServiceError> {
         self.require_owned(id).await?;
-        self.runtime.logs(id).await.map_err(Into::into)
+        self.runtime
+            .logs(id, since_millis)
+            .await
+            .map_err(Into::into)
     }
 
     async fn require_owned_running(&self, id: &SandboxId) -> Result<(), ServiceError> {

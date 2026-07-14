@@ -274,29 +274,58 @@ impl ExecRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExecInput {
+    Stdin(Vec<u8>),
+    Resize { columns: u32, rows: u32 },
+    Signal(i32),
+    Close,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExecOutput {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    Exit { code: i32, signal: i32 },
+}
+
+#[derive(Debug)]
 pub struct ExecSession {
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    exit_code: i32,
+    input: tokio::sync::mpsc::Sender<ExecInput>,
+    output: tokio::sync::mpsc::Receiver<Result<ExecOutput, RuntimeError>>,
 }
 
 impl ExecSession {
     pub fn from_output(stdout: Vec<u8>, stderr: Vec<u8>, exit_code: i32) -> Self {
-        Self {
-            stdout,
-            stderr,
-            exit_code,
-        }
+        let (input, _inputs) = tokio::sync::mpsc::channel(1);
+        let (outputs, output) = tokio::sync::mpsc::channel(3);
+        let _ = outputs.try_send(Ok(ExecOutput::Stdout(stdout)));
+        let _ = outputs.try_send(Ok(ExecOutput::Stderr(stderr)));
+        let _ = outputs.try_send(Ok(ExecOutput::Exit {
+            code: exit_code,
+            signal: 0,
+        }));
+        Self { input, output }
     }
 
-    pub fn stdout(&self) -> &[u8] {
-        &self.stdout
+    pub fn live(
+        input: tokio::sync::mpsc::Sender<ExecInput>,
+        output: tokio::sync::mpsc::Receiver<Result<ExecOutput, RuntimeError>>,
+    ) -> Self {
+        Self { input, output }
     }
-    pub fn stderr(&self) -> &[u8] {
-        &self.stderr
+
+    pub async fn send(&self, input: ExecInput) -> Result<(), RuntimeError> {
+        self.input
+            .send(input)
+            .await
+            .map_err(|_| RuntimeError::CommandIo {
+                operation: "exec_input".to_owned(),
+                message: "session input is closed".to_owned(),
+            })
     }
-    pub const fn exit_code(&self) -> i32 {
-        self.exit_code
+
+    pub async fn next(&mut self) -> Option<Result<ExecOutput, RuntimeError>> {
+        self.output.recv().await
     }
 }
 
@@ -570,7 +599,11 @@ pub trait RuntimeBackend: Send + Sync {
     async fn stop(&self, id: &SandboxId) -> Result<(), RuntimeError>;
     async fn remove(&self, request: RemoveRequest) -> Result<(), RuntimeError>;
     async fn exec(&self, request: ExecRequest) -> Result<ExecSession, RuntimeError>;
-    async fn logs(&self, id: &SandboxId) -> Result<Vec<u8>, RuntimeError>;
+    async fn logs(
+        &self,
+        id: &SandboxId,
+        since_millis: Option<i64>,
+    ) -> Result<Vec<u8>, RuntimeError>;
     async fn list_resources(&self) -> Result<Vec<RuntimeResource>, RuntimeError>;
 }
 

@@ -2,7 +2,6 @@
 #![deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use gascan_core::fake_runtime::FakeRuntime;
-use gascan_core::runtime::RuntimeBackend;
 use gascand::{
     Daemon, DaemonConfig, ProvisionRequest, ProvisionResolution, Provisioner, SandboxApi,
     SandboxService, ServiceError, SocketPaths, Store,
@@ -37,6 +36,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_or(Duration::from_secs(300), Duration::from_millis);
     let paths = SocketPaths::for_user()?;
     paths.prepare_directory()?;
+    if let Some(pid_path) = std::env::var_os("GASCAN_PID_PATH") {
+        std::fs::write(pid_path, std::process::id().to_string())?;
+    }
     let state_path = std::env::var_os("GASCAN_STATE_PATH")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| paths.directory().join("state.sqlite3"));
@@ -45,15 +47,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .map_or(Duration::ZERO, Duration::from_millis);
-    let runtime = FakeRuntime::default();
-    for record in store.list_sandboxes()? {
-        if record.actual_state != gascand::ActualState::Absent {
-            runtime.seed_owned(record.id.clone()).await;
-            if record.actual_state == gascand::ActualState::Running {
-                runtime.start(&record.id).await?;
-            }
-        }
-    }
+    let fake_state_path = std::env::var_os("GASCAN_FAKE_STATE_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| paths.directory().join("fake-runtime.json"));
+    let runtime = FakeRuntime::persistent(
+        gascan_core::fake_runtime::fixture_capabilities(),
+        fake_state_path,
+    )
+    .await?;
     let service = Arc::new(SandboxService::new(
         runtime,
         store,

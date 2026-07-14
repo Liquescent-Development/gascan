@@ -3,10 +3,71 @@ mod common;
 use common::{capabilities, create_request};
 use gascan_core::fake_runtime::{FailureBoundary, FakeRuntime};
 use gascan_core::runtime::{
-    CreateOutcome, ExecRequest, RemoveRequest, ResourceIdentity, ResourceKind, ResourceOwnership,
-    RuntimeBackend, RuntimeCall, RuntimeError, RuntimeOutcome, RuntimeResource,
+    CreateOutcome, ExecInput, ExecOutput, ExecRequest, RemoveRequest, ResourceIdentity,
+    ResourceKind, ResourceOwnership, RuntimeBackend, RuntimeCall, RuntimeError, RuntimeOutcome,
+    RuntimeResource,
 };
 use gascan_core::sandbox::SandboxId;
+
+#[tokio::test]
+async fn exec_session_is_live_bidirectional_and_emits_one_exit() {
+    let backend = FakeRuntime::new(capabilities());
+    let fixture = create_request("live-exec");
+    let id = fixture.id().clone();
+    backend.create(fixture.request()).await.unwrap();
+    backend.start(&id).await.unwrap();
+    let mut session = backend
+        .exec(ExecRequest::fixture(id, ["fake-echo-stdin"]))
+        .await
+        .unwrap();
+    session
+        .send(ExecInput::Stdin(vec![0, 0xff, b'a']))
+        .await
+        .unwrap();
+    session
+        .send(ExecInput::Resize {
+            columns: 123,
+            rows: 45,
+        })
+        .await
+        .unwrap();
+    session.send(ExecInput::Signal(15)).await.unwrap();
+    session.send(ExecInput::Close).await.unwrap();
+    assert_eq!(
+        session.next().await.unwrap().unwrap(),
+        ExecOutput::Stdout(vec![0, 0xff, b'a'])
+    );
+    assert_eq!(
+        session.next().await.unwrap().unwrap(),
+        ExecOutput::Exit {
+            code: 143,
+            signal: 15
+        }
+    );
+    assert!(session.next().await.is_none());
+}
+
+#[tokio::test]
+async fn persistent_fake_runtime_reopens_runtime_truth_without_controller_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("runtime.json");
+    let fixture = create_request("persistent-fake");
+    let id = fixture.id().clone();
+    let backend = FakeRuntime::persistent(capabilities(), &path)
+        .await
+        .unwrap();
+    backend.create(fixture.request()).await.unwrap();
+    backend.start(&id).await.unwrap();
+    drop(backend);
+    let reopened = FakeRuntime::persistent(capabilities(), &path)
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened.inspect(&id).await.unwrap().unwrap().state,
+        gascan_core::runtime::ContainerState::Running
+    );
+    assert!(!reopened.list_resources().await.unwrap().is_empty());
+}
 
 pub async fn backend_contract(backend: &dyn RuntimeBackend) {
     let fixture = create_request("contract");
@@ -24,13 +85,14 @@ pub async fn backend_contract(backend: &dyn RuntimeBackend) {
         gascan_core::runtime::ContainerState::Stopped
     );
     backend.start(&id).await.unwrap();
+    let mut session = backend
+        .exec(ExecRequest::fixture(id.clone(), ["true"]))
+        .await
+        .unwrap();
+    session.send(ExecInput::Close).await.unwrap();
     assert_eq!(
-        backend
-            .exec(ExecRequest::fixture(id.clone(), ["true"]))
-            .await
-            .unwrap()
-            .exit_code(),
-        0
+        session.next().await.unwrap().unwrap(),
+        ExecOutput::Exit { code: 0, signal: 0 }
     );
     backend.stop(&id).await.unwrap();
     backend
@@ -230,14 +292,31 @@ async fn exec_and_logs_preserve_binary_bytes_and_exact_exit_code() {
         .await;
     backend.set_logs(vec![0, 255, 10]).await;
 
-    let session = backend
+    let mut session = backend
         .exec(ExecRequest::fixture(id.clone(), ["binary-command"]))
         .await
         .unwrap();
-    assert_eq!(session.stdout(), &[0, 255, 1]);
-    assert_eq!(session.stderr(), &[254, 0]);
-    assert_eq!(session.exit_code(), 42);
-    assert_eq!(backend.logs(&id).await.unwrap(), vec![0, 255, 10]);
+    session.send(ExecInput::Close).await.unwrap();
+    assert_eq!(
+        session.next().await.unwrap().unwrap(),
+        ExecOutput::Stdout(vec![0, 255, 1])
+    );
+    assert_eq!(
+        session.next().await.unwrap().unwrap(),
+        ExecOutput::Stderr(vec![254, 0])
+    );
+    assert_eq!(
+        session.next().await.unwrap().unwrap(),
+        ExecOutput::Exit {
+            code: 42,
+            signal: 0
+        }
+    );
+    assert_eq!(
+        backend.logs(&id, None).await.unwrap(),
+        vec![0, 255, 10, 0, 255, 1, 254, 0]
+    );
+    assert!(backend.logs(&id, Some(i64::MAX)).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -326,7 +405,7 @@ async fn every_backend_boundary_supports_fail_once_injection() {
                 .exec(ExecRequest::fixture(id.clone(), ["true"]))
                 .await
                 .unwrap_err(),
-            FailureBoundary::Logs => backend.logs(&id).await.unwrap_err(),
+            FailureBoundary::Logs => backend.logs(&id, None).await.unwrap_err(),
             FailureBoundary::ListResources => backend.list_resources().await.unwrap_err(),
             _ => continue,
         };

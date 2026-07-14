@@ -239,7 +239,7 @@ fn public_error_codes_are_stable_and_unique() {
 
 #[test]
 fn v1_descriptor_has_exact_event_and_attach_layout() {
-    use field_descriptor_proto::Type::{Bytes, Enum, Message, String, Uint64};
+    use field_descriptor_proto::Type::{Bool, Bytes, Enum, Message, String, Uint64};
     let descriptor =
         FileDescriptorSet::decode(FILE_DESCRIPTOR_SET).expect("descriptor must decode");
     let file = api_file(&descriptor);
@@ -300,10 +300,12 @@ fn v1_descriptor_has_exact_event_and_attach_layout() {
     assert_field(manifest, "content", 1, Bytes, None);
     assert_field(manifest, "format", 2, String, None);
     let command = message(file, "CommandPayload");
-    assert_eq!(command.field.len(), 2);
+    assert_eq!(command.field.len(), 4);
     assert_field(command, "argv", 1, Bytes, None);
     assert!(command.field[0].label() == prost_types::field_descriptor_proto::Label::Repeated);
     assert_field(command, "stdin", 2, Bytes, None);
+    assert_field(command, "environment", 3, Message, None);
+    assert_field(command, "tty", 4, Bool, None);
 }
 
 #[test]
@@ -486,9 +488,21 @@ fn v1_descriptor_exactly_covers_every_exported_message_enum_and_rpc() {
         ),
         (
             "CommandPayload",
-            &[f!("argv", 1, Bytes, R, None, None), f!("stdin", 2, Bytes)],
+            &[
+                f!("argv", 1, Bytes, R, None, None),
+                f!("stdin", 2, Bytes),
+                f!(
+                    "environment",
+                    3,
+                    Message,
+                    R,
+                    None,
+                    Some(".gascan.v1.CommandPayload.EnvironmentEntry")
+                ),
+                f!("tty", 4, Bool),
+            ],
             &[],
-            &[(3, 4)],
+            &[(5, 6)],
         ),
         (
             "UpRequest",
@@ -536,7 +550,14 @@ fn v1_descriptor_exactly_covers_every_exported_message_enum_and_rpc() {
                     None,
                     Some(".gascan.v1.SandboxSelector")
                 ),
-                f!("argv", 2, Bytes, R, None, None),
+                f!(
+                    "command",
+                    2,
+                    Message,
+                    O,
+                    None,
+                    Some(".gascan.v1.CommandPayload")
+                ),
             ],
             &[],
             &[(3, 4)],

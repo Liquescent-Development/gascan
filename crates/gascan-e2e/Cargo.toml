@@ -30,6 +30,7 @@ tower.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+rustix-openpty = "0.2"
 
 [lints]
 workspace = true

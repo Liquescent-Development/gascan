@@ -42,3 +42,26 @@ The CLI forwards only `TERM`, `LANG`, `LC_ALL`, and `COLORTERM`. It never forwar
 ## Review status
 
 Task 8 implementation is complete and pending independent review.
+
+## Review correction: live sessions, independent runtime truth, and adversarial E2E
+
+The first implementation completed backend execution before Attach and buffered its result. The correction changes `ExecSession` into a backend-neutral live session with bounded input/output channels. `RuntimeBackend` remains exactly nine methods. Inputs are byte stdin, resize, signal, and close; outputs are byte stdout/stderr and exactly one exit. FakeRuntime interprets explicit fake commands from literal argv without invoking a host shell.
+
+Run and Shell now validate the selected sandbox but allocate only a pending session. Pending tokens expire after 30 seconds, use a bounded expired-token history, and are claimed atomically. Attach validates the first token and frame before claiming it, then concurrently forwards bounded inputs and outputs. Every later frame is validated against the bound token before forwarding. A mismatch closes the live backend session and emits the stable mismatch error. Replay and simultaneous claims cannot execute twice.
+
+The invoking CLI, not the daemon environment, supplies the fixed TERM/COLORTERM/LANG/LC allowlist. The pre-release v1 payload correction adds environment and TTY to `CommandPayload` and makes Shell use that payload; exhaustive descriptor compatibility remains 10/10. RPC application failures now use runtime exit 70 while connection/daemon failures remain 69. Lifecycle commands accept JSON event rendering while retaining human phase progress.
+
+TTY Attach uses a real bounded mpsc producer/consumer. It sends the initial terminal size, subsequent SIGWINCH sizes, stdin chunks, SIGINT/SIGTERM controls, and Close on EOF. A shared idempotent restore handle restores the terminal before a signal frame is forwarded; the RAII Drop path covers success, errors, and unwinding.
+
+Fake runtime truth is no longer inferred from controller SQLite. A distinct `GASCAN_FAKE_STATE_PATH` atomically snapshots exact containers, volumes, states, timestamped binary logs, and reconstructs fresh process-local removal observations on reopen. SIGKILL and idle-restart E2Es prove the runtime state, rather than SandboxRecord, permits subsequent execution.
+
+Logs are timestamped append-only records in fake runtime truth. The nine-method backend contract accepts an optional millisecond boundary. `--since-millis` filters actual records. Follow polls the backend-neutral append-only view, emits only new byte suffixes with backpressure, owns an activity lease, and ends on client cancellation or daemon shutdown.
+
+Review-correction TDD evidence:
+
+- RED: live session tests failed because ExecInput/ExecOutput/send/next did not exist.
+- RED: persistence reopen failed because FakeRuntime had no independent state source.
+- RED: the descriptor reported two CommandPayload fields instead of four.
+- GREEN: backend contract 18/18 and API compatibility 10/10.
+- GREEN: real-process fake backend 11/11, including concurrent autostart, two sandboxes, API mismatch, SIGKILL restart, binary/environment isolation, one-use concurrent token claims, since/follow, and real PTY resize/SIGINT/SIGTERM/restoration.
+- GREEN: strict workspace Clippy and the full workspace test/doc suite; 9 Apple live tests remained ignored.
