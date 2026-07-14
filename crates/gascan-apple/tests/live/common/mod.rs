@@ -40,6 +40,7 @@ pub struct LiveContext {
     container: Mutex<String>,
     volume: String,
     publish: Option<(u16, u16)>,
+    offline: bool,
     records: Mutex<Records>,
     owner_token: String,
     drop_cleanup: bool,
@@ -47,14 +48,22 @@ pub struct LiveContext {
 
 impl LiveContext {
     pub async fn new(case: &str) -> Result<Self, TestError> {
-        Self::new_inner(case, None).await
+        Self::new_inner(case, None, false).await
     }
 
     pub async fn new_published(case: &str, host_port: u16) -> Result<Self, TestError> {
-        Self::new_inner(case, Some((host_port, 8080))).await
+        Self::new_inner(case, Some((host_port, 8080)), false).await
     }
 
-    async fn new_inner(case: &str, publish: Option<(u16, u16)>) -> Result<Self, TestError> {
+    pub async fn offline(case: &str) -> Result<Self, TestError> {
+        Self::new_inner(case, None, true).await
+    }
+
+    async fn new_inner(
+        case: &str,
+        publish: Option<(u16, u16)>,
+        offline: bool,
+    ) -> Result<Self, TestError> {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let prefix = format!("gascan-feas-{}-{case}-{nonce}", std::process::id());
         let owner_token = random_owner_token()?;
@@ -70,6 +79,7 @@ impl LiveContext {
             container: Mutex::new(container),
             volume: volume.clone(),
             publish,
+            offline,
             records: Mutex::new(Records {
                 paths: vec![workspace],
                 owner_token: owner_token.clone(),
@@ -147,6 +157,9 @@ impl LiveContext {
         ];
         if let Some((host, guest)) = self.publish {
             args.extend(publish_args(IpAddr::V4(Ipv4Addr::LOCALHOST), host, guest)?);
+        }
+        if self.offline {
+            args.extend(["--network".to_owned(), "none".to_owned()]);
         }
         args.extend(guest_argv(self.publish.is_some()));
         match self.run_vec(args).await {
@@ -238,6 +251,22 @@ impl LiveContext {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         ))
+    }
+
+    pub async fn can_reach(&self, target: &str) -> Result<bool, TestError> {
+        if target.is_empty()
+            || !target
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b":/._-".contains(&byte))
+        {
+            return Err("network target contains unsupported characters".into());
+        }
+        let output = self
+            .exec(&format!(
+                "if wget -q -T 2 -O /dev/null '{target}'; then printf reachable; else printf blocked; fi"
+            ))
+            .await?;
+        Ok(output.stdout == b"reachable")
     }
 
     pub async fn stop(&self) -> Result<(), TestError> {
@@ -822,6 +851,7 @@ mod tests {
             container: Mutex::new("gascan-feas-42-case-container".into()),
             volume: "gascan-feas-42-case-volume".into(),
             publish: None,
+            offline: false,
             records: Mutex::new(Records {
                 containers,
                 volumes,

@@ -71,9 +71,24 @@ impl<R: CommandRunner> AppleProbe<R> {
             signals: false,
             loopback_publish: false,
             resource_limits: false,
-            offline: NetworkIsolation::Unverified,
+            offline: NetworkIsolation::Unsupported,
         })
     }
+}
+
+/// Constructs the Apple no-network arguments only after live isolation proof.
+/// Mount construction is deliberately sequenced after this fail-closed gate.
+pub fn offline_network_args(
+    capability: NetworkIsolation,
+    construct_mount: impl FnOnce(),
+) -> Result<Vec<String>, RuntimeError> {
+    if capability != NetworkIsolation::Proven {
+        return Err(RuntimeError::UnsupportedCapability {
+            capability: "hard offline networking".to_owned(),
+        });
+    }
+    construct_mount();
+    Ok(vec!["--network".to_owned(), "none".to_owned()])
 }
 
 fn parse_version(value: &str) -> Result<RuntimeVersion, RuntimeError> {

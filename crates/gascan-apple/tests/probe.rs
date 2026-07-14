@@ -52,7 +52,31 @@ async fn leaves_live_capabilities_unverified() {
     assert!(!capabilities.signals);
     assert!(!capabilities.loopback_publish);
     assert!(!capabilities.resource_limits);
-    assert_eq!(capabilities.offline, NetworkIsolation::Unverified);
+    assert_eq!(capabilities.offline, NetworkIsolation::Unsupported);
+}
+
+#[test]
+fn offline_request_is_rejected_before_mount_construction_without_proof() {
+    let mut mount_constructed = false;
+    let result = gascan_apple::offline_network_args(NetworkIsolation::Unsupported, || {
+        mount_constructed = true;
+    });
+    assert!(matches!(
+        result,
+        Err(RuntimeError::UnsupportedCapability { .. })
+    ));
+    assert!(!mount_constructed);
+}
+
+#[test]
+fn proven_offline_form_is_exact_and_constructs_mount_after_gate() {
+    let mut mount_constructed = false;
+    let args = gascan_apple::offline_network_args(NetworkIsolation::Proven, || {
+        mount_constructed = true;
+    })
+    .unwrap();
+    assert_eq!(args, ["--network", "none"]);
+    assert!(mount_constructed);
 }
 
 #[tokio::test]
