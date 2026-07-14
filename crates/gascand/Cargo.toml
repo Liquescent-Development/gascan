@@ -19,6 +19,7 @@ tokio-stream.workspace = true
 rustix.workspace = true
 tonic.workspace = true
 gascan-proto = { path = "../gascan-proto" }
+prost-types.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

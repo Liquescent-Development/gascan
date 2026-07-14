@@ -6,12 +6,13 @@ use serde_json::Value;
 use std::fmt;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIAL_MIGRATION: &str = include_str!("../migrations/001_initial.sql");
+const DURABLE_METADATA_MIGRATION: &str = include_str!("../migrations/002_durable_metadata.sql");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DesiredState {
@@ -111,6 +112,8 @@ pub struct SandboxRecord {
     pub setup_resolution: Option<SetupResolution>,
     pub tool_resolution: Option<ToolResolution>,
     pub image_resolution: Option<ImageResolution>,
+    pub last_operation_id: Option<OperationId>,
+    pub updated_at_millis: i64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -129,6 +132,8 @@ pub struct OperationEvent {
     pub operation_id: OperationId,
     pub status: OperationStatus,
     pub details: Option<Value>,
+    pub error_code: Option<String>,
+    pub timestamp_millis: i64,
 }
 
 #[derive(Clone)]
@@ -172,6 +177,8 @@ pub enum StoreError {
     InvalidOperationId(i64),
     #[error("stored value is invalid: {0}")]
     CorruptData(String),
+    #[error("system clock cannot be represented as a Unix timestamp")]
+    InvalidSystemTime,
 }
 
 impl Store {
@@ -236,8 +243,8 @@ impl Store {
         )?;
         let id = OperationId::new(transaction.last_insert_rowid())?;
         transaction.execute(
-            "INSERT INTO operation_events (operation_id, status) VALUES (?1, ?2)",
-            params![id.get(), OperationStatus::Pending.as_db()],
+            "INSERT INTO operation_events (operation_id, status, timestamp_millis) VALUES (?1, ?2, ?3)",
+            params![id.get(), OperationStatus::Pending.as_db(), current_time_millis()?],
         )?;
         let operation =
             load_operation(&transaction, id)?.ok_or(StoreError::OperationNotFound(id))?;
@@ -283,7 +290,7 @@ impl Store {
     ) -> Result<Vec<OperationEvent>, StoreError> {
         let connection = self.lock()?;
         let mut statement = connection.prepare(
-            "SELECT sequence, operation_id, status, details FROM operation_events WHERE operation_id = ?1 ORDER BY sequence",
+            "SELECT sequence, operation_id, status, details, error_code, timestamp_millis FROM operation_events WHERE operation_id = ?1 ORDER BY sequence",
         )?;
         let rows = statement.query_map([operation_id.get()], event_from_row)?;
         collect_rows(rows)
@@ -306,20 +313,28 @@ impl Store {
         }
         let encoded = serde_json::to_string(&details)?;
         transaction.execute(
-            "INSERT INTO operation_events (operation_id, status, details) VALUES (?1, ?2, ?3)",
+            "INSERT INTO operation_events (operation_id, status, details, timestamp_millis) VALUES (?1, ?2, ?3, ?4)",
             params![
                 operation_id.get(),
                 OperationStatus::Pending.as_db(),
-                encoded
+                encoded,
+                current_time_millis()?
             ],
         )?;
         let sequence = transaction.last_insert_rowid();
+        let timestamp_millis: i64 = transaction.query_row(
+            "SELECT timestamp_millis FROM operation_events WHERE sequence = ?1",
+            [sequence],
+            |row| row.get(0),
+        )?;
         transaction.commit()?;
         Ok(OperationEvent {
             sequence,
             operation_id,
             status: OperationStatus::Pending,
             details: Some(details),
+            error_code: None,
+            timestamp_millis,
         })
     }
 
@@ -358,16 +373,20 @@ impl Store {
             .map(serde_json::to_string)
             .transpose()?;
         transaction.execute(
-            "UPDATE sandboxes SET actual_state = ?1 WHERE id = ?2",
-            params![actual_state.as_db(), operation.sandbox_id.as_str()],
+            "UPDATE sandboxes SET actual_state = ?1, updated_at_millis = ?2 WHERE id = ?3",
+            params![
+                actual_state.as_db(),
+                current_time_millis()?,
+                operation.sandbox_id.as_str()
+            ],
         )?;
         transaction.execute(
             "UPDATE operations SET status = ?1, error_code = ?2, error_details = ?3 WHERE id = ?4",
             params![status.as_db(), error_code, details_json, id.get()],
         )?;
         transaction.execute(
-            "INSERT INTO operation_events (operation_id, status, details) VALUES (?1, ?2, ?3)",
-            params![id.get(), status.as_db(), details_json],
+            "INSERT INTO operation_events (operation_id, status, details, error_code, timestamp_millis) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id.get(), status.as_db(), details_json, error_code, current_time_millis()?],
         )?;
         let updated = load_operation(&transaction, id)?.ok_or(StoreError::OperationNotFound(id))?;
         transaction.commit()?;
@@ -408,10 +427,17 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), StoreError> {
                 "schema_version singleton must equal 1".to_owned(),
             ));
         }
-        return if version == SCHEMA_VERSION {
-            validate_v1_schema(connection)
-        } else {
-            Err(StoreError::UnsupportedSchemaVersion(version))
+        return match version {
+            1 => {
+                validate_v1_schema(connection)?;
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                transaction.execute_batch(DURABLE_METADATA_MIGRATION)?;
+                transaction.commit()?;
+                validate_v2_schema(connection)
+            }
+            SCHEMA_VERSION => validate_v2_schema(connection),
+            _ => Err(StoreError::UnsupportedSchemaVersion(version)),
         };
     }
     let object_count: i64 = connection.query_row(
@@ -426,11 +452,12 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), StoreError> {
     }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(INITIAL_MIGRATION)?;
+    transaction.execute_batch(DURABLE_METADATA_MIGRATION)?;
     transaction.commit()?;
-    Ok(())
+    validate_v2_schema(connection)
 }
 
-const SANDBOX_SELECT: &str = "SELECT id, canonical_root, desired_state, actual_state, setup_resolution_version, setup_resolution_details, tool_resolution_version, tool_resolution_details, image_resolution_version, image_resolution_details FROM sandboxes";
+const SANDBOX_SELECT: &str = "SELECT id, canonical_root, desired_state, actual_state, setup_resolution_version, setup_resolution_details, tool_resolution_version, tool_resolution_details, image_resolution_version, image_resolution_details, (SELECT id FROM operations WHERE sandbox_id = sandboxes.id ORDER BY id DESC LIMIT 1), updated_at_millis FROM sandboxes";
 const OPERATION_SELECT: &str =
     "SELECT id, sandbox_id, kind, status, error_code, error_details FROM operations";
 
@@ -468,8 +495,8 @@ fn put_sandbox_in(
     let tools = encode_resolution(sandbox.tool_resolution.as_ref())?;
     let image = encode_resolution(sandbox.image_resolution.as_ref())?;
     transaction.execute(
-        "INSERT INTO sandboxes (id, canonical_root, desired_state, actual_state, setup_resolution_version, setup_resolution_details, tool_resolution_version, tool_resolution_details, image_resolution_version, image_resolution_details) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT(id) DO UPDATE SET desired_state = excluded.desired_state, actual_state = excluded.actual_state, setup_resolution_version = excluded.setup_resolution_version, setup_resolution_details = excluded.setup_resolution_details, tool_resolution_version = excluded.tool_resolution_version, tool_resolution_details = excluded.tool_resolution_details, image_resolution_version = excluded.image_resolution_version, image_resolution_details = excluded.image_resolution_details",
-        params![sandbox.id.as_str(), sandbox.canonical_root.as_str(), sandbox.desired_state.as_db(), sandbox.actual_state.as_db(), setup.0, setup.1, tools.0, tools.1, image.0, image.1],
+        "INSERT INTO sandboxes (id, canonical_root, desired_state, actual_state, setup_resolution_version, setup_resolution_details, tool_resolution_version, tool_resolution_details, image_resolution_version, image_resolution_details, updated_at_millis) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT(id) DO UPDATE SET desired_state = excluded.desired_state, actual_state = excluded.actual_state, setup_resolution_version = excluded.setup_resolution_version, setup_resolution_details = excluded.setup_resolution_details, tool_resolution_version = excluded.tool_resolution_version, tool_resolution_details = excluded.tool_resolution_details, image_resolution_version = excluded.image_resolution_version, image_resolution_details = excluded.image_resolution_details, updated_at_millis = excluded.updated_at_millis",
+        params![sandbox.id.as_str(), sandbox.canonical_root.as_str(), sandbox.desired_state.as_db(), sandbox.actual_state.as_db(), setup.0, setup.1, tools.0, tools.1, image.0, image.1, current_time_millis()?],
     )?;
     Ok(())
 }
@@ -499,6 +526,8 @@ struct RawSandbox {
     setup: (Option<u32>, Option<String>),
     tools: (Option<u32>, Option<String>),
     image: (Option<u32>, Option<String>),
+    last_operation_id: Option<i64>,
+    updated_at_millis: i64,
 }
 
 impl TryFrom<RawSandbox> for SandboxRecord {
@@ -513,6 +542,8 @@ impl TryFrom<RawSandbox> for SandboxRecord {
             setup_resolution: decode_resolution(raw.setup, SetupResolution::new)?,
             tool_resolution: decode_resolution(raw.tools, ToolResolution::new)?,
             image_resolution: decode_resolution(raw.image, ImageResolution::new)?,
+            last_operation_id: raw.last_operation_id.map(OperationId::new).transpose()?,
+            updated_at_millis: raw.updated_at_millis,
         })
     }
 }
@@ -526,6 +557,8 @@ fn raw_sandbox_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSandbox>
         setup: (row.get(4)?, row.get(5)?),
         tools: (row.get(6)?, row.get(7)?),
         image: (row.get(8)?, row.get(9)?),
+        last_operation_id: row.get(10)?,
+        updated_at_millis: row.get(11)?,
     })
 }
 
@@ -585,7 +618,17 @@ fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationEvent> {
             .map(|json| serde_json::from_str(&json))
             .transpose()
             .map_err(to_sql_conversion_error)?,
+        error_code: row.get(4)?,
+        timestamp_millis: row.get(5)?,
     })
+}
+
+fn current_time_millis() -> Result<i64, StoreError> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| StoreError::InvalidSystemTime)?
+        .as_millis();
+    i64::try_from(millis).map_err(|_| StoreError::InvalidSystemTime)
 }
 
 fn collect_rows<T>(
@@ -755,14 +798,34 @@ fn validate_v1_schema(connection: &Connection) -> Result<(), StoreError> {
     )?;
     validate_table_columns(
         connection,
-        "operations",
+        "operation_events",
         &[
-            ("id", "INTEGER", 0, 1),
-            ("sandbox_id", "TEXT", 1, 0),
-            ("kind", "TEXT", 1, 0),
+            ("sequence", "INTEGER", 0, 1),
+            ("operation_id", "INTEGER", 1, 0),
             ("status", "TEXT", 1, 0),
-            ("error_code", "TEXT", 0, 0),
-            ("error_details", "TEXT", 0, 0),
+            ("details", "TEXT", 0, 0),
+        ],
+    )?;
+    validate_operations_and_constraints(connection)
+}
+
+fn validate_v2_schema(connection: &Connection) -> Result<(), StoreError> {
+    validate_schema_inventory(connection)?;
+    validate_table_columns(
+        connection,
+        "sandboxes",
+        &[
+            ("id", "TEXT", 1, 1),
+            ("canonical_root", "TEXT", 1, 0),
+            ("desired_state", "TEXT", 1, 0),
+            ("actual_state", "TEXT", 1, 0),
+            ("setup_resolution_version", "INTEGER", 0, 0),
+            ("setup_resolution_details", "TEXT", 0, 0),
+            ("tool_resolution_version", "INTEGER", 0, 0),
+            ("tool_resolution_details", "TEXT", 0, 0),
+            ("image_resolution_version", "INTEGER", 0, 0),
+            ("image_resolution_details", "TEXT", 0, 0),
+            ("updated_at_millis", "INTEGER", 1, 0),
         ],
     )?;
     validate_table_columns(
@@ -773,6 +836,24 @@ fn validate_v1_schema(connection: &Connection) -> Result<(), StoreError> {
             ("operation_id", "INTEGER", 1, 0),
             ("status", "TEXT", 1, 0),
             ("details", "TEXT", 0, 0),
+            ("error_code", "TEXT", 0, 0),
+            ("timestamp_millis", "INTEGER", 1, 0),
+        ],
+    )?;
+    validate_operations_and_constraints(connection)
+}
+
+fn validate_operations_and_constraints(connection: &Connection) -> Result<(), StoreError> {
+    validate_table_columns(
+        connection,
+        "operations",
+        &[
+            ("id", "INTEGER", 0, 1),
+            ("sandbox_id", "TEXT", 1, 0),
+            ("kind", "TEXT", 1, 0),
+            ("status", "TEXT", 1, 0),
+            ("error_code", "TEXT", 0, 0),
+            ("error_details", "TEXT", 0, 0),
         ],
     )?;
     validate_foreign_keys(connection, "sandboxes", &[])?;

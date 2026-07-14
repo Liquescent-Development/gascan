@@ -270,7 +270,9 @@ fn wire_event(event: StoredEvent) -> v1::OperationEvent {
         StoredStatus::Failed => v1::OperationStatus::Failed,
     } as i32;
     let error = (event.status == StoredStatus::Failed).then(|| v1::Error {
-        code: error_code::INTERNAL.to_owned(),
+        code: event
+            .error_code
+            .unwrap_or_else(|| error_code::INTERNAL.to_owned()),
         message: details
             .get("message")
             .and_then(serde_json::Value::as_str)
@@ -282,7 +284,7 @@ fn wire_event(event: StoredEvent) -> v1::OperationEvent {
         operation_id: Some(v1::OperationId {
             value: event.operation_id.get() as u64,
         }),
-        timestamp: None,
+        timestamp: Some(timestamp_from_millis(event.timestamp_millis)),
         phase,
         payload,
         error,
@@ -309,8 +311,10 @@ fn wire_status(record: crate::SandboxRecord) -> v1::SandboxStatus {
         sandbox_id: record.id.to_string(),
         desired_state,
         actual_state,
-        last_operation_id: None,
-        updated_at: None,
+        last_operation_id: record.last_operation_id.map(|id| v1::OperationId {
+            value: id.get() as u64,
+        }),
+        updated_at: Some(timestamp_from_millis(record.updated_at_millis)),
         capabilities: Vec::new(),
     }
 }
@@ -336,12 +340,22 @@ fn selector_id(selector: Option<v1::SandboxSelector>) -> Result<SandboxId, ApiIn
 
 fn service_status(error: ServiceError) -> tonic::Status {
     match error {
+        ServiceError::Store(crate::StoreError::PendingOperationExists { .. }) => {
+            tonic::Status::already_exists(error_code::OPERATION_CONFLICT)
+        }
         ServiceError::Missing(_) => tonic::Status::not_found(error_code::SANDBOX_NOT_FOUND),
         ServiceError::Runtime(_) => tonic::Status::unavailable(error_code::BACKEND_UNAVAILABLE),
         ServiceError::Policy(_) | ServiceError::Sandbox(_) | ServiceError::Manifest(_) => {
             tonic::Status::invalid_argument(error_code::INVALID_REQUEST)
         }
         _ => tonic::Status::internal(error_code::INTERNAL),
+    }
+}
+
+fn timestamp_from_millis(millis: i64) -> prost_types::Timestamp {
+    prost_types::Timestamp {
+        seconds: millis.div_euclid(1_000),
+        nanos: (millis.rem_euclid(1_000) * 1_000_000) as i32,
     }
 }
 
@@ -648,7 +662,15 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiInputError, spec_for_root};
+    use super::{ApiInputError, service_status, spec_for_root, wire_event, wire_status};
+    use crate::{
+        ActualState, DesiredState, OperationEvent, OperationId, OperationStatus, SandboxRecord,
+        ServiceError, StoreError,
+    };
+    use camino::Utf8PathBuf;
+    use gascan_core::sandbox::SandboxId;
+    use gascan_proto::error_code;
+    use serde_json::json;
 
     #[tokio::test]
     async fn project_roots_are_absolute_and_manifest_bound()
@@ -675,5 +697,60 @@ mod tests {
             directory.path().canonicalize()?
         );
         Ok(())
+    }
+
+    #[test]
+    fn wire_metadata_uses_durable_store_values() -> Result<(), Box<dyn std::error::Error>> {
+        let operation_id = OperationId::new(17)?;
+        let event = wire_event(OperationEvent {
+            sequence: 2,
+            operation_id,
+            status: OperationStatus::Failed,
+            details: Some(json!({"message":"broken"})),
+            error_code: Some("backend_unavailable".to_owned()),
+            timestamp_millis: 1_725_000_000_123,
+        });
+        assert_eq!(
+            event.error.map(|error| error.code),
+            Some("backend_unavailable".to_owned())
+        );
+        assert_eq!(
+            event
+                .timestamp
+                .map(|timestamp| (timestamp.seconds, timestamp.nanos)),
+            Some((1_725_000_000, 123_000_000))
+        );
+
+        let root = Utf8PathBuf::from("/workspace/api-metadata");
+        let status = wire_status(SandboxRecord {
+            id: SandboxId::from_root("metadata", &root),
+            canonical_root: root,
+            desired_state: DesiredState::Running,
+            actual_state: ActualState::Running,
+            setup_resolution: None,
+            tool_resolution: None,
+            image_resolution: None,
+            last_operation_id: Some(operation_id),
+            updated_at_millis: 1_725_000_001_456,
+        });
+        assert_eq!(status.last_operation_id.map(|id| id.value), Some(17));
+        assert_eq!(
+            status
+                .updated_at
+                .map(|timestamp| (timestamp.seconds, timestamp.nanos)),
+            Some((1_725_000_001, 456_000_000))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pending_operations_map_to_operation_conflict() {
+        let root = Utf8PathBuf::from("/workspace/conflict");
+        let sandbox_id = SandboxId::from_root("conflict", &root);
+        let status = service_status(ServiceError::Store(StoreError::PendingOperationExists {
+            sandbox_id,
+        }));
+        assert_eq!(status.code(), tonic::Code::AlreadyExists);
+        assert_eq!(status.message(), error_code::OPERATION_CONFLICT);
     }
 }

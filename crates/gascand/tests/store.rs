@@ -46,6 +46,8 @@ fn fixture(root: &str) -> SandboxRecord {
         )),
         tool_resolution: Some(ToolResolution::new(1, json!({"node":"22.1.0"}))),
         image_resolution: Some(ImageResolution::new(1, json!({"digest":"sha256:abc"}))),
+        last_operation_id: None,
+        updated_at_millis: 0,
     }
 }
 
@@ -72,10 +74,38 @@ fn sandbox_round_trips_and_lists_in_id_order() -> TestResult {
     store.put_sandbox(&two)?;
     store.put_sandbox(&one)?;
 
-    assert_eq!(store.sandbox(&one.id)?, Some(one.clone()));
-    let mut expected = vec![one, two];
+    let stored_one = store.sandbox(&one.id)?.ok_or("first sandbox missing")?;
+    let stored_two = store.sandbox(&two.id)?.ok_or("second sandbox missing")?;
+    assert!(stored_one.updated_at_millis > 0);
+    let mut expected = vec![stored_one, stored_two];
     expected.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
     assert_eq!(store.list_sandboxes()?, expected);
+    Ok(())
+}
+
+#[test]
+fn sandbox_metadata_and_operation_event_timestamps_are_durable() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("state.db");
+    let store = Store::open(&path)?;
+    let sandbox = fixture("/workspace/metadata");
+    store.put_sandbox(&sandbox)?;
+    let initial = store.sandbox(&sandbox.id)?.ok_or("sandbox missing")?;
+    assert!(initial.updated_at_millis > 0);
+    assert_eq!(initial.last_operation_id, None);
+
+    let operation = store.begin_operation(&sandbox, OperationKind::Create)?;
+    let events = store.operation_events(operation.id)?;
+    assert_eq!(events.len(), 1);
+    assert!(events[0].timestamp_millis >= initial.updated_at_millis);
+    let active = store.sandbox(&sandbox.id)?.ok_or("sandbox missing")?;
+    assert_eq!(active.last_operation_id, Some(operation.id));
+    assert!(active.updated_at_millis >= initial.updated_at_millis);
+    drop(store);
+
+    let reopened = Store::open(path)?;
+    assert_eq!(reopened.sandbox(&sandbox.id)?, Some(active));
+    assert_eq!(reopened.operation_events(operation.id)?, events);
     Ok(())
 }
 
@@ -148,6 +178,12 @@ fn operations_complete_or_fail_once_and_events_are_append_only() -> TestResult {
         json!({"retryable":true}),
     )?;
     assert_eq!(failed.status, OperationStatus::Failed);
+    let failed_event = store
+        .operation_events(failed.id)?
+        .into_iter()
+        .last()
+        .ok_or("terminal event missing")?;
+    assert_eq!(failed_event.error_code.as_deref(), Some("runtime_error"));
     assert_eq!(store.pending_operations()?, Vec::new());
     assert_eq!(
         store
@@ -256,7 +292,11 @@ fn separate_connections_can_read_while_the_store_is_open() -> TestResult {
     let sandbox = fixture("/workspace/one");
     writer.put_sandbox(&sandbox)?;
     let reader = Store::open(&path)?;
-    assert_eq!(reader.sandbox(&sandbox.id)?, Some(sandbox));
+    let loaded = reader.sandbox(&sandbox.id)?.ok_or("sandbox missing")?;
+    assert!(loaded.updated_at_millis > 0);
+    let mut expected = sandbox;
+    expected.updated_at_millis = loaded.updated_at_millis;
+    assert_eq!(loaded, expected);
     Ok(())
 }
 
@@ -279,7 +319,10 @@ fn wal_reader_keeps_reading_during_an_uncommitted_write() -> TestResult {
         rusqlite::params!["stopped", sandbox.id.as_str()],
     )?;
 
-    assert_eq!(store.sandbox(&sandbox.id)?, Some(sandbox));
+    let loaded = store.sandbox(&sandbox.id)?.ok_or("sandbox missing")?;
+    let mut expected = sandbox;
+    expected.updated_at_millis = loaded.updated_at_millis;
+    assert_eq!(loaded, expected);
     writer.execute_batch("ROLLBACK")?;
     Ok(())
 }
@@ -290,11 +333,11 @@ fn newer_and_unknown_schema_versions_are_rejected() -> TestResult {
     let path = temp.path().join("state.db");
     drop(Store::open(&path)?);
     let connection = rusqlite::Connection::open(&path)?;
-    connection.execute("UPDATE schema_version SET version = ?1", [2])?;
+    connection.execute("UPDATE schema_version SET version = ?1", [3])?;
     drop(connection);
     assert!(matches!(
         Store::open(&path),
-        Err(StoreError::UnsupportedSchemaVersion(2))
+        Err(StoreError::UnsupportedSchemaVersion(3))
     ));
 
     let empty = temp.path().join("unknown.db");
