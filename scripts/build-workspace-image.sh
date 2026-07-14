@@ -21,15 +21,34 @@ section_value() {
 }
 
 fetch_verified() {
-  local url=$1 expected=$2 destination=$3 temporary actual
+  local url=$1 expected=$2 destination=$3 temporary effective_file effective_url actual
   test ${#expected} -eq 64 || { printf 'invalid SHA-256 for %s\n' "$destination" >&2; exit 1; }
+  validate_download_url "$url"
   temporary="$destination.tmp.$$"
-  trap 'rm -f "$temporary"' RETURN
-  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --output "$temporary" "$url"
+  effective_file="$destination.effective.$$"
+  trap 'rm -f "$temporary" "$effective_file"' RETURN
+  printf 'Downloading verified image artifact: %s\n' "$url" >&2
+  curl --fail --show-error --progress-bar --location \
+    --connect-timeout 15 --max-time 120 \
+    --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    --output "$temporary" --write-out '%{url_effective}' "$url" >"$effective_file"
+  effective_url=$(cat "$effective_file")
+  validate_download_url "$effective_url"
   actual=$(shasum -a 256 "$temporary" | awk '{print $1}')
   test "$actual" = "$expected" || { printf 'SHA-256 mismatch for %s\n' "$url" >&2; exit 1; }
   mv "$temporary" "$destination"
   trap - RETURN
+}
+
+validate_download_url() {
+  case "$1" in
+    https://github.com/* | \
+    https://objects.githubusercontent.com/* | \
+    https://release-assets.githubusercontent.com/* | \
+    https://cdn.playwright.dev/* | \
+    https://playwright.download.prss.microsoft.com/*) ;;
+    *) printf 'artifact URL host is not approved: %s\n' "$1" >&2; exit 1 ;;
+  esac
 }
 
 base_image=$(top_value base_image)
@@ -54,6 +73,6 @@ container build \
   "$root"
 
 inspect=$(container image inspect --format json "$tag")
-digest=$(printf '%s' "$inspect" | sed -n 's/.*"digest"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-test -n "$digest" || { printf 'built image inspect omitted digest\n' >&2; exit 1; }
+digest=$(printf '%s' "$inspect" | cargo run --quiet --locked --offline \
+  --manifest-path "$root/scripts/Cargo.toml" --bin validate-image-inspect)
 printf '%s@%s\n' "$tag" "$digest" | tee "$artifacts/workspace-image-ref"

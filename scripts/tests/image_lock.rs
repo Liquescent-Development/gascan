@@ -77,3 +77,23 @@ fn artifact_shape_requires_url_and_checksum() {
     assert!(artifact.url.starts_with("https://"));
     assert!(sha256_is_lower_hex(&artifact.sha256));
 }
+
+#[test]
+fn build_script_bounds_downloads_and_validates_redirect_hosts() {
+    let script = include_str!("../build-workspace-image.sh");
+    for required in [
+        "--connect-timeout 15",
+        "--max-time 120",
+        "--progress-bar",
+        "--proto-redir '=https'",
+        "validate_download_url",
+        "release-assets.githubusercontent.com",
+        "cdn.playwright.dev",
+        "validate-image-inspect",
+    ] {
+        assert!(
+            script.contains(required),
+            "missing build safeguard: {required}"
+        );
+    }
+}
