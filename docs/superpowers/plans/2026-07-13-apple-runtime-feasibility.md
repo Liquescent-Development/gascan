@@ -306,7 +306,7 @@ async fn attached_process_reports_resize_signal_and_exit() -> Result<(), TestErr
     let mut session = live_workspace().await?.attach(["sh", "-c", "trap 'exit 42' TERM; stty size; sleep 30"], true).await?;
     session.send(AttachInput::Resize { rows: 41, cols: 113 }).await?;
     assert!(session.read_until(b"41 113").await?.is_some());
-    session.send(AttachInput::Signal(libc::SIGTERM)).await?;
+    session.send(AttachInput::Signal(libc::SIGINT)).await?;
     assert_eq!(session.exit().await?, 42);
     Ok(())
 }
@@ -320,13 +320,13 @@ Expected: initial FAIL for missing attach implementation.
 
 - [ ] **Step 3: Implement the scoped Swift attach helper and Rust bridge**
 
-Build the helper against Apple `container` 1.1.0's public `ContainerAPIClient`, pinned exactly in `Package.swift`. It accepts one `start` frame, creates one guest process with private pipes, and then accepts only stdin, resize, signal, and close frames for that process. It emits stdout/stderr bytes, typed errors, and exactly one exit frame from `ClientProcess.wait()`. It must not expose lifecycle, image, registry, mount, network, or arbitrary XPC operations. The Rust bridge spawns the helper with literal argv, validates protocol version and signals, applies backpressure, owns helper cleanup, and never infers guest state or exit status from helper process text/status. Cross-platform Rust tests use a fake helper; Swift and live integration tests run only on a supported Mac.
+Build the helper against Apple `container` 1.1.0's public `ContainerAPIClient`, pinned exactly in `Package.swift`. It accepts one `start` frame, creates one guest process with private pipes, and then accepts stdin, resize, and close frames for that process. TTY SIGINT is encoded as the terminal control byte `0x03`; non-TTY SIGINT and all other signals return a typed unsupported-capability error without calling the hanging 1.1.0 signal API. It emits stdout/stderr bytes, typed start errors, and exactly one exit frame from `ClientProcess.wait()` for every process that starts. It must not expose lifecycle, image, registry, mount, network, or arbitrary XPC operations. The Rust bridge spawns the helper with literal argv, validates protocol version and the support matrix, applies backpressure, owns helper cleanup, and never infers guest state or exit status from helper process text/status. Cross-platform Rust tests use a fake helper; Swift and live integration tests run only on a supported Mac.
 
 - [ ] **Step 4: Run attach tests**
 
 Run: `swift test --package-path helpers/apple-attach && cargo test -p gascan-apple --test attach_protocol && ./scripts/build-apple-attach-helper.sh && cargo test -p gascan-apple --test live attach -- --ignored --test-threads=1`
 
-Expected: PASS for binary I/O, resize, SIGINT/SIGTERM, disconnect, and exit codes 0, 42, and 127.
+Expected: PASS for binary I/O, resize, TTY SIGINT, prompt typed rejection of unsupported signals, disconnect, exact exit codes 0 and 42 for processes that start, and a typed Apple start error for a missing executable.
 
 - [ ] **Step 5: Commit the attachment proof**
 

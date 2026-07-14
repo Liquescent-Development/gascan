@@ -207,13 +207,13 @@ Expected: FAIL because the API does not yet delegate real attach sessions.
 
 - [ ] **Step 3: Implement bidirectional bridging**
 
-Forward stdin, resize, signal, and close independently from stdout/stderr/exit. On client disconnect close input and cancel the guest process according to documented semantics. On daemon shutdown signal the process, wait a bounded grace period, and return a typed error if forced termination is necessary.
+Forward stdin, resize, the verified signal support matrix, and close independently from stdout/stderr/exit. For pinned Apple 1.1.0, translate TTY SIGINT to byte `0x03` and promptly reject non-TTY SIGINT and all other signals as unsupported. On client disconnect close input and cancel the guest process according to documented semantics. On daemon shutdown use the documented backend lifecycle path, wait a bounded grace period, and return a typed error if forced termination is necessary.
 
 - [ ] **Step 4: Run fake and live attach tests**
 
 Run: `cargo test -p gascand --test attach_bridge && cargo test -p gascan-apple --test live attach_backend -- --ignored --test-threads=1`
 
-Expected: PASS for binary data, backpressure, resize, SIGINT/SIGTERM, disconnect, daemon shutdown, and exit 42.
+Expected: PASS for binary data, backpressure, resize, TTY SIGINT, prompt typed rejection of unsupported signals, disconnect, daemon shutdown, and exact exit 42 for a process that starts.
 
 - [ ] **Step 5: Commit attachment integration**
 

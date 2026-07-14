@@ -23,12 +23,16 @@ import Testing
     #expect((error as? [String: Any])?["code"] as? String == "bad_frame")
 }
 
-@Test func versionAndSignalAllowlistAreStrict() throws {
+@Test func versionAndSignalRejectionAreStrict() throws {
     #expect(throws: ProtocolFailure.self) {
         try validateVersion(.close(version: 2))
     }
-    try validateSignal(SIGINT)
-    try validateSignal(SIGTERM)
+    #expect(throws: ProtocolFailure.self) {
+        try validateSignal(SIGINT)
+    }
+    #expect(throws: ProtocolFailure.self) {
+        try validateSignal(SIGTERM)
+    }
     #expect(throws: ProtocolFailure.self) {
         try validateSignal(SIGKILL)
     }

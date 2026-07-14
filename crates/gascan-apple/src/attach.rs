@@ -12,7 +12,6 @@ use crate::{HelperInput, HelperOutput};
 
 const OPERATION: &str = "gascan-apple-attach";
 const SIGINT: i32 = 2;
-const SIGTERM: i32 = 15;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AttachInput {
@@ -134,14 +133,22 @@ pub struct AttachSession {
 
 impl AttachSession {
     pub async fn send(&self, input: AttachInput) -> Result<(), RuntimeError> {
-        if let AttachInput::Signal(signal) = &input {
-            validate_signal(*signal)?;
-        }
         if matches!(input, AttachInput::Resize { .. }) && !self.tty {
             return Err(RuntimeError::UnsupportedCapability {
                 capability: "resize requires a TTY attachment".to_owned(),
             });
         }
+        let input = match input {
+            AttachInput::Signal(SIGINT) if self.tty => AttachInput::Stdin(vec![0x03]),
+            AttachInput::Signal(signal) => {
+                return Err(RuntimeError::UnsupportedCapability {
+                    capability: format!(
+                        "attachment signal {signal}; Apple ContainerAPIClient 1.1.0 supports only SIGINT for TTY attachments"
+                    ),
+                });
+            }
+            input => input,
+        };
         let (reply, response) = oneshot::channel();
         self.input
             .send(InputRequest { input, reply })
@@ -292,18 +299,6 @@ async fn read_outputs<R>(
                 break;
             }
         }
-    }
-}
-
-fn validate_signal(signal: i32) -> Result<(), RuntimeError> {
-    if signal == SIGINT || signal == SIGTERM {
-        Ok(())
-    } else {
-        Err(RuntimeError::UnsupportedCapability {
-            capability: format!(
-                "attachment signal {signal}; only SIGINT and SIGTERM are supported"
-            ),
-        })
     }
 }
 

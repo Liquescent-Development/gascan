@@ -37,13 +37,16 @@ async fn fake_helper_proves_binary_streams_control_and_exact_exit() -> Result<()
     assert_eq!(stderr, [254, 1]);
     assert_eq!(exit, 42);
 
-    let mut missing = fake_helper().exec("exit-127", ["missing"], false).await?;
-    assert_eq!(missing.exit().await?, 127);
+    let mut missing = fake_helper()
+        .exec("start-error", ["missing"], false)
+        .await?;
+    let error = missing.exit().await.expect_err("start must fail");
+    assert!(error.to_string().contains("helper error apple_api"));
     Ok(())
 }
 
 #[tokio::test]
-async fn fake_helper_proves_resize_signal_and_protocol_validation() -> Result<(), TestError> {
+async fn fake_helper_proves_resize_tty_sigint_and_protocol_validation() -> Result<(), TestError> {
     let mut session = fake_helper().exec("container-id", ["guest"], true).await?;
     session
         .send(AttachInput::Resize {
@@ -52,7 +55,7 @@ async fn fake_helper_proves_resize_signal_and_protocol_validation() -> Result<()
         })
         .await?;
     assert!(session.read_until(b"41 113").await?.is_some());
-    session.send(AttachInput::Signal(15)).await?;
+    session.send(AttachInput::Signal(2)).await?;
     assert_eq!(session.exit().await?, 42);
 
     let mut mismatch = fake_helper().exec("bad-version", ["guest"], false).await?;
@@ -64,13 +67,18 @@ async fn fake_helper_proves_resize_signal_and_protocol_validation() -> Result<()
 
 #[tokio::test]
 async fn bridge_rejects_unportable_controls_before_writing() -> Result<(), TestError> {
-    let session = fake_helper().exec("container-id", ["guest"], false).await?;
+    let non_tty = fake_helper().exec("container-id", ["guest"], false).await?;
     assert!(
-        session
+        non_tty
             .send(AttachInput::Resize { rows: 1, cols: 1 })
             .await
             .is_err()
     );
-    assert!(session.send(AttachInput::Signal(9)).await.is_err());
+    assert!(non_tty.send(AttachInput::Signal(2)).await.is_err());
+    assert!(non_tty.send(AttachInput::Signal(15)).await.is_err());
+
+    let tty = fake_helper().exec("container-id", ["guest"], true).await?;
+    assert!(tty.send(AttachInput::Signal(15)).await.is_err());
+    assert!(tty.send(AttachInput::Signal(9)).await.is_err());
     Ok(())
 }

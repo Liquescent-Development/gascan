@@ -13,19 +13,22 @@ fn main() -> io::Result<()> {
     if start.contains("no-terminal") {
         return Ok(());
     }
-    if start.contains("exit-127") {
-        output(r#"{"version":1,"type":"exit","code":127}"#)?;
+    if start.contains("start-error") {
+        output(r#"{"version":1,"type":"error","code":"apple_api","message":"failed to find target executable"}"#)?;
         return Ok(());
     }
 
     for line in lines {
         let line = line?;
-        if line.contains(r#""type":"stdin""#) {
+        if line.contains(r#""type":"stdin""#) && line.contains(r#""data":"Aw==""#) {
+            output(r#"{"version":1,"type":"exit","code":42}"#)?;
+            return Ok(());
+        } else if line.contains(r#""type":"stdin""#) {
             output(r#"{"version":1,"type":"stdout","data":"AP8="}"#)?;
         } else if line.contains(r#""type":"resize""#) {
             output(r#"{"version":1,"type":"stdout","data":"NDEgMTEz"}"#)?;
         } else if line.contains(r#""type":"signal""#) {
-            output(r#"{"version":1,"type":"exit","code":42}"#)?;
+            output(r#"{"version":1,"type":"error","code":"unexpected_signal","message":"bridge called unsupported helper signal"}"#)?;
             return Ok(());
         } else if line.contains(r#""type":"close""#) {
             output(r#"{"version":1,"type":"stderr","data":"/gE="}"#)?;

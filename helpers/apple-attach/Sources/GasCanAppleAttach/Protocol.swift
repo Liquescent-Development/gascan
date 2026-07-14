@@ -126,7 +126,5 @@ func validateVersion(_ frame: InputFrame) throws {
 }
 
 func validateSignal(_ signal: Int32) throws {
-    guard signal == SIGINT || signal == SIGTERM else {
-        throw ProtocolFailure.invalidSignal(signal)
-    }
+    throw ProtocolFailure.invalidSignal(signal)
 }

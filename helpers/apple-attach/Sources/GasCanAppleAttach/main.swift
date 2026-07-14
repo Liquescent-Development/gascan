@@ -225,9 +225,6 @@ struct GasCanAppleAttach {
                 try await process.resize(.init(width: cols, height: rows))
             case .signal(_, let signal):
                 try validateSignal(signal)
-                diagnostic("sending signal \(signal) to guest process")
-                try await process.kill(signal)
-                diagnostic("guest signal request completed")
             case .close:
                 try input.close()
                 return

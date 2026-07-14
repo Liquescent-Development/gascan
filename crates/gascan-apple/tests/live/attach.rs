@@ -12,7 +12,7 @@ async fn attached_process_reports_resize_signal_and_exit() -> Result<(), TestErr
             [
                 "sh",
                 "-c",
-                "trap 'stty size' WINCH; trap 'exit 42' TERM; stty size; sleep 30",
+                "trap 'stty size' WINCH; trap 'exit 42' INT; stty size; while :; do :; done",
             ],
             true,
         )
@@ -24,7 +24,7 @@ async fn attached_process_reports_resize_signal_and_exit() -> Result<(), TestErr
         })
         .await?;
     assert!(session.read_until(b"41 113").await?.is_some());
-    session.send(AttachInput::Signal(libc::SIGTERM)).await?;
+    session.send(AttachInput::Signal(libc::SIGINT)).await?;
     assert_eq!(session.exit().await?, 42);
     ctx.cleanup().await
 }
@@ -77,7 +77,11 @@ async fn attach_preserves_binary_streams_and_exact_exit_codes() -> Result<(), Te
     assert_eq!(exit, 42);
 
     let mut missing = ctx.attach(["gascan-command-does-not-exist"], false).await?;
-    assert_eq!(missing.exit().await?, 127);
+    let error = missing
+        .exit()
+        .await
+        .expect_err("missing executable must fail start");
+    assert!(error.to_string().contains("helper error apple_api"));
     ctx.cleanup().await
 }
 
@@ -99,7 +103,6 @@ async fn attached_process_forwards_sigint_and_closes_stdin() -> Result<(), TestE
         .await
         .map_err(|_| "timed out waiting for guest signal readiness")??
         .ok_or("guest exited before signal readiness")?;
-    eprintln!("attach diagnostic: guest signal trap is ready");
     signal.send(AttachInput::Signal(libc::SIGINT)).await?;
     let signal_exit = tokio::time::timeout(Duration::from_secs(10), signal.exit())
         .await
@@ -119,52 +122,29 @@ async fn attached_process_forwards_sigint_and_closes_stdin() -> Result<(), TestE
 
 #[tokio::test]
 #[ignore = "requires Apple silicon macOS 26+ with container service"]
-async fn client_process_kill_term_reaches_single_target() -> Result<(), TestError> {
-    let ctx = LiveContext::new("attach-term").await?;
-    let mut session = ctx
-        .attach(
-            [
-                "sh",
-                "-c",
-                "trap 'exit 42' TERM; printf 'term-ready\\n'; while :; do :; done",
-            ],
-            false,
-        )
-        .await?;
-    tokio::time::timeout(Duration::from_secs(10), session.read_until(b"term-ready"))
-        .await
-        .map_err(|_| "timed out waiting for SIGTERM guest readiness")??
-        .ok_or("guest exited before SIGTERM readiness")?;
-    session.send(AttachInput::Signal(libc::SIGTERM)).await?;
-    let exit = tokio::time::timeout(Duration::from_secs(10), session.exit())
-        .await
-        .map_err(|_| "timed out waiting for SIGTERM guest exit")??;
-    assert_eq!(exit, 42);
-    ctx.cleanup().await
-}
+async fn unsupported_signal_matrix_returns_promptly() -> Result<(), TestError> {
+    let ctx = LiveContext::new("attach-signals").await?;
+    let non_tty = ctx.attach(["sh", "-c", "cat"], false).await?;
+    let tty = ctx.attach(["sh", "-c", "cat"], true).await?;
 
-#[tokio::test]
-#[ignore = "requires Apple silicon macOS 26+ with container service"]
-async fn tty_ctrl_c_byte_reaches_foreground_process_group() -> Result<(), TestError> {
-    let ctx = LiveContext::new("attach-ctrl-c").await?;
-    let mut session = ctx
-        .attach(
-            [
-                "sh",
-                "-c",
-                "trap 'exit 42' INT; printf 'ctrl-c-ready\\n'; while :; do :; done",
-            ],
-            true,
+    for result in [
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            non_tty.send(AttachInput::Signal(libc::SIGINT)),
         )
-        .await?;
-    tokio::time::timeout(Duration::from_secs(10), session.read_until(b"ctrl-c-ready"))
-        .await
-        .map_err(|_| "timed out waiting for Ctrl-C guest readiness")??
-        .ok_or("guest exited before Ctrl-C readiness")?;
-    session.send(AttachInput::Stdin(vec![0x03])).await?;
-    let exit = tokio::time::timeout(Duration::from_secs(10), session.exit())
-        .await
-        .map_err(|_| "timed out waiting for Ctrl-C guest exit")??;
-    assert_eq!(exit, 42);
+        .await,
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            non_tty.send(AttachInput::Signal(libc::SIGTERM)),
+        )
+        .await,
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tty.send(AttachInput::Signal(libc::SIGTERM)),
+        )
+        .await,
+    ] {
+        assert!(result.is_ok_and(|send| send.is_err()));
+    }
     ctx.cleanup().await
 }

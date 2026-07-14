@@ -4,7 +4,7 @@
 
 Gas Can is a secure, CLI-first sandbox for agentic coding and orchestration. The macOS MVP runs one long-lived OCI workspace container per selected host code root. Apple's Containerization stack places that container inside its own lightweight Linux VM, which is the hard security boundary.
 
-Gas Can does not implement a container runtime or VM platform. It owns developer experience, lifecycle, policy, and reproducibility while delegating images, VM creation, mounts, networking, and volumes to Apple's `container` CLI through a narrow backend adapter. Attached process execution uses a bundled Swift helper linked to Apple's public `ContainerAPIClient`, because the CLI subprocess surface does not expose the guest process identity required for exact exit, resize, and arbitrary signal control.
+Gas Can does not implement a container runtime or VM platform. It owns developer experience, lifecycle, policy, and reproducibility while delegating images, VM creation, mounts, networking, and volumes to Apple's `container` CLI through a narrow backend adapter. Attached process execution uses a bundled Swift helper linked to Apple's public `ContainerAPIClient`, because the CLI subprocess surface does not expose the guest process identity required for exact exit, resize, and supported terminal interrupt control.
 
 The first release requires Apple silicon and macOS 26 or newer. A later Linux backend may implement the same runtime contract with Firecracker.
 
@@ -61,14 +61,14 @@ The daemon owns:
 
 The macOS `RuntimeBackend` invokes Apple's `container` executable with argument arrays, never shell-constructed commands. It uses structured output for inspection and discovery and hides Apple-specific identifiers and schemas from clients.
 
-For attached processes only, the adapter starts a bundled `gascan-apple-attach` Swift helper linked to the matching Apple `ContainerAPIClient` 1.x package. The helper creates the guest process and retains its private process identifier, forwarding framed stdin/stdout/stderr, resize, signal, close, error, and exact-exit events over private pipes. It exposes no socket, registry, image, mount, network, or lifecycle operation. The Rust adapter validates every outbound request and treats a helper/protocol version mismatch as a compatibility error.
+For attached processes only, the adapter starts a bundled `gascan-apple-attach` Swift helper linked exactly to Apple `ContainerAPIClient` 1.1.0. The helper creates the guest process and forwards framed stdin/stdout/stderr, resize, close, error, and exact-exit events over private pipes. TTY SIGINT is delivered as terminal byte `0x03`; non-TTY SIGINT and every other signal are rejected promptly as unsupported because the public 1.1.0 signal call has a verified wire mismatch and can hang. It exposes no socket, registry, image, mount, network, or lifecycle operation. The Rust adapter validates every outbound request and treats a helper/protocol version mismatch as a compatibility error.
 
 The backend contract covers:
 
 - Capability and version probing.
 - Image resolution and pulling.
 - Container creation, start, stop, inspection, and deletion.
-- Command execution with TTY, resize, signals, environment, working directory, and exit status.
+- Command execution with TTY, resize, TTY SIGINT, typed rejection of unsupported signals, environment, working directory, and exact exit status for every process that starts.
 - Host bind mounts and named volumes.
 - CPU, memory, disk, process, network, and published-port policy.
 - Logs and runtime events.
@@ -99,7 +99,7 @@ Applies changed tool declarations or a changed setup script to an existing sandb
 
 ### `gascan run [name] -- <command>`
 
-Executes a command in `/workspace`, preserving terminal behavior, signals, and the exact exit code. It starts an existing stopped sandbox but does not create an absent sandbox. Only terminal and locale variables (`TERM`, `COLORTERM`, `LANG`, and `LC_*`) cross from the host by default. The guest supplies its own `PATH`, home, and tool environment; arbitrary host environment inheritance is forbidden.
+Executes a command in `/workspace`, preserving terminal behavior, the pinned Apple 1.1.0 signal support matrix, and the exact exit code for every process that starts. A missing executable is a typed Apple start error, not a synthetic exit 127. It starts an existing stopped sandbox but does not create an absent sandbox. Only terminal and locale variables (`TERM`, `COLORTERM`, `LANG`, and `LC_*`) cross from the host by default. The guest supplies its own `PATH`, home, and tool environment; arbitrary host environment inheritance is forbidden.
 
 ### `gascan down [name]`
 
