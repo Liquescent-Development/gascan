@@ -1,12 +1,12 @@
 # Apple container feasibility evidence
 
-Status: **BLOCKED — offline live proof pending**
+Status: **BLOCKED — administrator authentication and offline live proof pending**
 
 ## Environment and established evidence
 
-- Supported host previously observed: Apple silicon macOS 26+.
-- Apple container application previously observed: 1.1.0.
-- Guest image used by the live harness: `docker.io/library/alpine:3.20` (runtime previously reported Alpine 3.22.2 content; resolved digest must be captured by the controller).
+- Controller preflight: **PASS** on macOS 26.5.1 (`arm64`).
+- Apple `container` and `container-apiserver`: 1.1.0, commit `5973b9cc626a3e7a499bb316a958237ebe14e2ed`.
+- Guest image: `docker.io/library/alpine:3.20`; index digest `sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc`; resolved arm64 variant digest `sha256:45e09956dc667c5eff3583c9d94830261fb1ca0be10a0a7db36266edf5de9e1d`.
 - Lifecycle, exact canonical bind, named-volume persistence, configured/cgroup resource limits, loopback publishing, ownership-token cleanup, TTY, exact exits, binary streams, resize, and supported signal behavior have passing Task 4/5 evidence.
 
 ## Offline mechanism source evidence
@@ -29,13 +29,14 @@ The test creates a cryptographically unique `gascan-<128-bit-lowercase-hex>.test
 
 Ownership is fail-closed despite Apple 1.1 listing only domain names: the harness proves the generated domain is absent before creation, rejects collisions, proves exactly one identical domain exists afterward, and re-lists it immediately before an exact-name delete. It never deletes an unfamiliar or ambiguous name. On ordinary and error-path teardown, deletion uses literal argv without a shell; a bounded drop fallback applies the same exact-domain identity check. A normal owned networked container must reach the temporary host server through this domain, and the offline container reuses the identical URL before and after guest-root mutation. Any ownership mismatch is reported and deliberately retained for manual inspection.
 
+The controller's focused attempt stopped safely before mutation: `sudo -n` exited 1 with `a password is required`, and no `gascan-*.test` mapping was created. Earlier failures involving the Docker-only alias and default-network gateway were test-fixture failures; those approaches have been removed and are not evidence against Apple offline isolation. The sole remaining blocker is administrator authentication followed by a passing focused adversarial test. Network isolation remains `Unsupported`, not `Proven`.
+
 ## Controller commands required to resolve BLOCKED
 
 ```sh
-./scripts/apple-test-preflight.sh
-container image inspect docker.io/library/alpine:3.20
+sudo -v
 cargo test -p gascan-apple --test live -- --ignored --test-threads=1 offline_workspace_cannot_reach_external_or_host_networks
-cargo test -p gascan-apple --test live -- --ignored --test-threads=1
+sudo -n container system dns list --format json
 ```
 
-`container image inspect` emits Apple 1.1 JSON by default; copy the immutable digest for the resolved Alpine image into the environment section. The focused network test requires `sudo -n` permission for the exact `container system dns list/create/delete` commands. Afterward, confirm structured lists contain no current-prefix containers, volumes, networks, or `gascan-*.test` DNS mappings. Until all commands pass and evidence is appended, Gate 2 remains **BLOCKED**.
+Run `sudo -v` interactively immediately before the focused test so its literal `sudo -n container system dns list/create/delete` commands can use the cached credential. Afterward, the final command must return a structured list containing no test-owned `gascan-*.test` mapping. Until the focused test passes and its observations and cleanup are recorded, Gate 2 remains **BLOCKED**.
