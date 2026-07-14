@@ -278,16 +278,24 @@ git add crates/gascan-apple/tests/live scripts/apple-test-preflight.sh
 git commit -m "test: prove Apple lifecycle and storage capabilities"
 ```
 
-### Task 5: Prove TTY, signal, and exact exit behavior
+### Task 5: Prove TTY, signal, and exact exit behavior through the Apple attach helper
 
 **Files:**
 - Create: `crates/gascan-apple/src/attach.rs`
+- Create: `crates/gascan-apple/src/helper_protocol.rs`
+- Create: `helpers/apple-attach/Package.swift`
+- Create: `helpers/apple-attach/Sources/GasCanAppleAttach/main.swift`
+- Create: `helpers/apple-attach/Sources/GasCanAppleAttach/Protocol.swift`
+- Create: `helpers/apple-attach/Tests/GasCanAppleAttachTests/ProtocolTests.swift`
+- Create: `scripts/build-apple-attach-helper.sh`
 - Create: `crates/gascan-apple/tests/live/attach.rs`
 - Test: `crates/gascan-apple/tests/attach_protocol.rs`
 
 **Interfaces:**
 - Produces: `AttachInput::{Stdin(Vec<u8>), Resize { rows, cols }, Signal(i32), Close}` and `AttachOutput::{Stdout(Vec<u8>), Stderr(Vec<u8>), Exit(i32)}`.
 - Produces: `AppleAttach::exec(container, argv, tty) -> AttachSession`; Plan 3 uses this interface for daemon streaming.
+- Produces: `gascan-apple-attach`, a single-session helper using a versioned newline-delimited JSON protocol with base64 byte payloads. The helper retains the Apple guest process identity and is the only component allowed to call `ClientProcess.resize`, `ClientProcess.kill`, and `ClientProcess.wait`.
+- Requires: the helper dependency is pinned to Apple `container` 1.1.0, and its protocol version is validated before the guest process starts.
 
 - [ ] **Step 1: Write protocol and ignored live tests**
 
@@ -310,20 +318,20 @@ Run: `cargo test -p gascan-apple --test attach_protocol && cargo test -p gascan-
 
 Expected: initial FAIL for missing attach implementation.
 
-- [ ] **Step 3: Implement direct stdio attachment**
+- [ ] **Step 3: Implement the scoped Swift attach helper and Rust bridge**
 
-Spawn `container exec` directly, forward stdin/stdout/stderr as byte streams, map resize and signal operations to the exact supported Apple CLI/API behavior established during the spike, and convert process termination to one `Exit` event. Do not infer exit status from stderr text.
+Build the helper against Apple `container` 1.1.0's public `ContainerAPIClient`, pinned exactly in `Package.swift`. It accepts one `start` frame, creates one guest process with private pipes, and then accepts only stdin, resize, signal, and close frames for that process. It emits stdout/stderr bytes, typed errors, and exactly one exit frame from `ClientProcess.wait()`. It must not expose lifecycle, image, registry, mount, network, or arbitrary XPC operations. The Rust bridge spawns the helper with literal argv, validates protocol version and signals, applies backpressure, owns helper cleanup, and never infers guest state or exit status from helper process text/status. Cross-platform Rust tests use a fake helper; Swift and live integration tests run only on a supported Mac.
 
 - [ ] **Step 4: Run attach tests**
 
-Run: `cargo test -p gascan-apple --test attach_protocol && cargo test -p gascan-apple --test live attach -- --ignored --test-threads=1`
+Run: `swift test --package-path helpers/apple-attach && cargo test -p gascan-apple --test attach_protocol && ./scripts/build-apple-attach-helper.sh && cargo test -p gascan-apple --test live attach -- --ignored --test-threads=1`
 
 Expected: PASS for binary I/O, resize, SIGINT/SIGTERM, disconnect, and exit codes 0, 42, and 127.
 
 - [ ] **Step 5: Commit the attachment proof**
 
 ```bash
-git add crates/gascan-apple/src/attach.rs crates/gascan-apple/tests
+git add helpers/apple-attach scripts/build-apple-attach-helper.sh crates/gascan-apple/src/attach.rs crates/gascan-apple/src/helper_protocol.rs crates/gascan-apple/tests
 git commit -m "feat: prove Apple process attachment semantics"
 ```
 
