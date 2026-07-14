@@ -95,3 +95,36 @@ fn load_uses_gascan_toml_and_rejects_non_directories() {
     std::fs::write(&file, "data").expect("write fixture");
     assert!(Manifest::load(&file).is_err());
 }
+
+#[cfg(unix)]
+#[test]
+fn load_rejects_setup_symlink_that_escapes_the_canonical_root() {
+    let temp = tempfile::tempdir().expect("temporary root");
+    let root = Utf8Path::from_path(temp.path()).expect("UTF-8 temporary path");
+    let outside = tempfile::tempdir().expect("outside directory");
+    std::os::unix::fs::symlink(outside.path(), root.join("escape")).expect("escape symlink");
+    std::fs::write(
+        root.join("gascan.toml"),
+        "version = 1\nsetup = './escape/setup.sh'\n",
+    )
+    .expect("write manifest");
+
+    let error = Manifest::load(root).expect_err("setup symlink escape must fail closed");
+    assert!(error.to_string().contains("outside the workspace root"));
+}
+
+#[test]
+fn load_allows_a_not_yet_created_setup_path_beneath_root() {
+    let temp = tempfile::tempdir().expect("temporary root");
+    let root = Utf8Path::from_path(temp.path()).expect("UTF-8 temporary path");
+    std::fs::write(
+        root.join("gascan.toml"),
+        "version = 1\nsetup = './future/setup.sh'\n",
+    )
+    .expect("write manifest");
+
+    assert_eq!(
+        Manifest::load(root).expect("contained future path").setup,
+        Some(Utf8Path::new("./future/setup.sh").to_owned())
+    );
+}

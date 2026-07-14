@@ -53,7 +53,13 @@ impl Manifest {
             Utf8PathBuf::from_path_buf(canonical).map_err(ManifestError::NonUtf8Path)?;
         let path = canonical.join(MANIFEST_FILE);
         match std::fs::read_to_string(&path) {
-            Ok(source) => Self::parse(&source),
+            Ok(source) => {
+                let manifest = Self::parse(&source)?;
+                if let Some(setup) = manifest.setup.as_deref() {
+                    validate_setup_containment(&canonical, setup)?;
+                }
+                Ok(manifest)
+            }
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(source) => Err(ManifestError::Io { path, source }),
         }
@@ -146,6 +152,11 @@ pub enum ManifestError {
     Invalid(String),
     #[error("manifest root is not a directory: {0}")]
     RootNotDirectory(Utf8PathBuf),
+    #[error("setup path {setup} resolves outside the workspace root {root}")]
+    SetupOutsideRoot {
+        setup: Utf8PathBuf,
+        root: Utf8PathBuf,
+    },
     #[error("path is not valid UTF-8: {0:?}")]
     NonUtf8Path(std::path::PathBuf),
     #[error("could not access {path}: {source}")]
@@ -245,4 +256,45 @@ fn validate_workspace_relative_path(label: &str, path: &Utf8Path) -> Result<(), 
         )));
     }
     Ok(())
+}
+
+fn validate_setup_containment(
+    canonical_root: &Utf8Path,
+    setup: &Utf8Path,
+) -> Result<(), ManifestError> {
+    let mut candidate = canonical_root.join(setup);
+    loop {
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(_) => {
+                let resolved =
+                    std::fs::canonicalize(&candidate).map_err(|source| ManifestError::Io {
+                        path: candidate.clone(),
+                        source,
+                    })?;
+                let resolved =
+                    Utf8PathBuf::from_path_buf(resolved).map_err(ManifestError::NonUtf8Path)?;
+                if !resolved.starts_with(canonical_root) {
+                    return Err(ManifestError::SetupOutsideRoot {
+                        setup: setup.to_owned(),
+                        root: canonical_root.to_owned(),
+                    });
+                }
+                return Ok(());
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                if !candidate.pop() {
+                    return Err(ManifestError::Io {
+                        path: canonical_root.join(setup),
+                        source,
+                    });
+                }
+            }
+            Err(source) => {
+                return Err(ManifestError::Io {
+                    path: candidate,
+                    source,
+                });
+            }
+        }
+    }
 }

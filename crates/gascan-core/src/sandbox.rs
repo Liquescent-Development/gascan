@@ -34,17 +34,31 @@ impl fmt::Display for SandboxId {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BindMount {
-    pub source: Utf8PathBuf,
-    pub target: Utf8PathBuf,
-    pub writable: bool,
+    source: Utf8PathBuf,
+    target: Utf8PathBuf,
+    writable: bool,
+}
+
+impl BindMount {
+    pub fn source(&self) -> &Utf8Path {
+        &self.source
+    }
+
+    pub fn target(&self) -> &Utf8Path {
+        &self.target
+    }
+
+    pub const fn is_writable(&self) -> bool {
+        self.writable
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SandboxSpec {
-    pub id: SandboxId,
-    pub canonical_root: Utf8PathBuf,
-    pub manifest: Manifest,
-    pub bind_mounts: Vec<BindMount>,
+    id: SandboxId,
+    canonical_root: Utf8PathBuf,
+    manifest: Manifest,
+    bind_mounts: Vec<BindMount>,
 }
 
 impl SandboxSpec {
@@ -74,6 +88,22 @@ impl SandboxSpec {
             manifest,
             bind_mounts,
         })
+    }
+
+    pub fn id(&self) -> &SandboxId {
+        &self.id
+    }
+
+    pub fn canonical_root(&self) -> &Utf8Path {
+        &self.canonical_root
+    }
+
+    pub const fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
+    pub fn bind_mounts(&self) -> &[BindMount] {
+        &self.bind_mounts
     }
 }
 

@@ -48,11 +48,14 @@ fn spec_canonicalizes_symlinks_and_mounts_only_the_root() {
     let spec = SandboxSpec::from_root("code", link, Manifest::default()).expect("valid spec");
     let canonical_path = std::fs::canonicalize(&real).expect("canonical fixture root");
     let canonical = Utf8Path::from_path(&canonical_path).expect("UTF-8 canonical path");
-    assert_eq!(spec.canonical_root, canonical);
-    assert_eq!(spec.bind_mounts.len(), 1);
-    assert_eq!(spec.bind_mounts[0].source, canonical);
-    assert_eq!(spec.bind_mounts[0].target, Utf8Path::new(WORKSPACE_TARGET));
-    assert!(spec.bind_mounts[0].writable);
+    assert_eq!(spec.canonical_root(), canonical);
+    assert_eq!(spec.bind_mounts().len(), 1);
+    assert_eq!(spec.bind_mounts()[0].source(), canonical);
+    assert_eq!(
+        spec.bind_mounts()[0].target(),
+        Utf8Path::new(WORKSPACE_TARGET)
+    );
+    assert!(spec.bind_mounts()[0].is_writable());
 }
 
 #[test]
