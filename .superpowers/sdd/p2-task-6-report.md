@@ -85,3 +85,16 @@ Fresh second-wave completion gate:
 - `cargo clippy -p gascan-proto --all-targets -- -D warnings` — passed.
 - `cargo test --workspace` — passed; 9 Apple live tests remained ignored.
 - `cargo fmt --all -- --check` and `git diff --check` — passed.
+
+## Task 7 integration correction
+
+Task 7 exposed that an untrusted local client cannot safely supply manifest
+bytes without the root that binds manifest validation, workspace mounts, and
+the stable sandbox ID. Pre-release v1 `UpRequest` and `ApplyRequest` therefore
+now carry one absolute UTF-8 `project_root` string at field 1. The daemon
+canonicalizes that root and loads `gascan.toml` itself; it never derives the
+project from ambient daemon state. The exhaustive descriptor test was changed
+first and failed on the former `manifest` field before the schema correction.
+
+- RED: `cargo test -p gascan-proto --test api_compatibility v1_descriptor_exactly_covers_every_exported_message_enum_and_rpc` failed on `UpRequest.manifest` versus `project_root`.
+- GREEN: `cargo test -p gascan-proto --test api_compatibility` passed 10/10.

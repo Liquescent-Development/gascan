@@ -91,8 +91,10 @@ message SandboxSelector { string sandbox_id = 1; reserved 2; }
 message ManifestPayload { bytes content = 1; string format = 2; reserved 3; }
 message CommandPayload { repeated bytes argv = 1; bytes stdin = 2; reserved 3; }
 
-message UpRequest { ManifestPayload manifest = 1; reserved 2; }
-message ApplyRequest { ManifestPayload manifest = 1; reserved 2; }
+// Absolute UTF-8 workspace root. The daemon canonicalizes it and loads the
+// manifest itself so request bytes cannot bypass root-bound validation.
+message UpRequest { string project_root = 1; reserved 2; }
+message ApplyRequest { string project_root = 1; reserved 2; }
 message RunRequest { SandboxSelector sandbox = 1; CommandPayload command = 2; reserved 3; }
 message ShellRequest { SandboxSelector sandbox = 1; repeated bytes argv = 2; reserved 3; }
 message DownRequest { SandboxSelector sandbox = 1; reserved 2; }

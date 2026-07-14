@@ -492,27 +492,13 @@ fn v1_descriptor_exactly_covers_every_exported_message_enum_and_rpc() {
         ),
         (
             "UpRequest",
-            &[f!(
-                "manifest",
-                1,
-                Message,
-                O,
-                None,
-                Some(".gascan.v1.ManifestPayload")
-            )],
+            &[f!("project_root", 1, String)],
             &[],
             &[(2, 3)],
         ),
         (
             "ApplyRequest",
-            &[f!(
-                "manifest",
-                1,
-                Message,
-                O,
-                None,
-                Some(".gascan.v1.ManifestPayload")
-            )],
+            &[f!("project_root", 1, String)],
             &[],
             &[(2, 3)],
         ),
