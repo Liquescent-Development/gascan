@@ -12,7 +12,7 @@ Fake runtime truth is independent of controller SQLite. `GASCAN_FAKE_STATE_PATH`
 
 The pre-release v1 command payload carries repeated `EnvironmentVariable` entries and TTY state; repeated entries preserve duplicate detection. The daemon rejects empty/control/NUL/duplicate/disallowed environment entries, then applies `gascan_core::policy::filtered_host_environment`. The CLI sends TERM, COLORTERM, LANG, and every nonempty `LC_*`; direct Tonic callers cannot inject secrets.
 
-TTY Attach sends the initial size, SIGWINCH changes, stdin, SIGINT/SIGTERM, and Close. A shared idempotent restore handle restores termios before forwarding a terminating signal; Drop restores on success, errors, and unwind.
+TTY Attach sends the initial size, SIGWINCH changes, stdin, SIGINT/SIGTERM, and Close. A shared idempotent restore handle retains a duplicate of the exact terminal descriptor and restores termios before forwarding a terminating signal; Drop restores on success, exact nonzero command exit, daemon/Attach loss, and panic unwind. Real PTY subprocess tests cover all of those paths, and a test-only `catch_unwind` proves Drop restoration during unwinding without adding a production panic path.
 
 ## TDD and verification
 
@@ -21,7 +21,7 @@ TTY Attach sends the initial size, SIGWINCH changes, stdin, SIGINT/SIGTERM, and 
 - Rereview RED: logs were not sandbox-scoped, direct API environment injection crossed the boundary, resize was unobservable, and abandoned registries were unbounded.
 - Backend contract: 19 tests, including live control flow, exact log isolation, and persistence reopen.
 - API compatibility: 10 exhaustive v1 tests.
-- Real-process fake E2E: lifecycle, binary streams/logs, environment defense, autostart race, two sandboxes, idle and SIGKILL restart, API mismatch, atomic token misuse, since/follow, and real PTY resize/SIGINT/SIGTERM/restoration.
+- Real-process fake E2E: 12 tests covering lifecycle, binary streams/logs, environment defense, autostart race, two sandboxes, idle and SIGKILL restart, API mismatch, atomic token misuse, since/follow, and real PTY success/nonzero/connection loss/resize/SIGINT/SIGTERM/restoration. A separate real-PTY unit test covers panic unwind.
 - Managed execution denies UDS bind; identical approved-escalation commands are required. Production security was not weakened.
 - Strict workspace Clippy, full workspace tests/doctests, formatting, and diff checks are the final gate. Apple live tests remain ignored and no Apple integration was added.
 

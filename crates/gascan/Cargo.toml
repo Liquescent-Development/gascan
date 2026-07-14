@@ -20,3 +20,6 @@ tower.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+rustix-openpty = "0.2"

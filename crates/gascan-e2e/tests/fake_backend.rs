@@ -72,6 +72,63 @@ impl Environment {
     }
 }
 
+fn assert_termios_restored(
+    restored: &rustix_openpty::rustix::termios::Termios,
+    saved: &rustix_openpty::rustix::termios::Termios,
+) {
+    let mut restored_local = restored.local_modes;
+    let mut saved_local = saved.local_modes;
+    // PENDIN reports kernel input-queue state rather than a persistent terminal setting.
+    restored_local.remove(rustix_openpty::rustix::termios::LocalModes::PENDIN);
+    saved_local.remove(rustix_openpty::rustix::termios::LocalModes::PENDIN);
+    assert_eq!(restored.input_modes, saved.input_modes);
+    assert_eq!(restored.output_modes, saved.output_modes);
+    assert_eq!(restored.control_modes, saved.control_modes);
+    assert_eq!(restored_local, saved_local);
+}
+
+fn normalized_termios(
+    fd: impl std::os::fd::AsFd,
+) -> std::io::Result<rustix_openpty::rustix::termios::Termios> {
+    use rustix_openpty::rustix;
+    let mut initial = rustix::termios::tcgetattr(fd.as_fd())?;
+    initial
+        .local_modes
+        .remove(rustix::termios::LocalModes::PENDIN);
+    let mut raw = initial.clone();
+    raw.make_raw();
+    rustix::termios::tcsetattr(fd.as_fd(), rustix::termios::OptionalActions::Now, &raw)?;
+    rustix::termios::tcsetattr(fd.as_fd(), rustix::termios::OptionalActions::Now, &initial)?;
+    let mut normalized = rustix::termios::tcgetattr(fd.as_fd())?;
+    normalized
+        .local_modes
+        .remove(rustix::termios::LocalModes::PENDIN);
+    rustix::termios::tcsetattr(
+        fd.as_fd(),
+        rustix::termios::OptionalActions::Now,
+        &normalized,
+    )?;
+    Ok(rustix::termios::tcgetattr(fd.as_fd())?)
+}
+
+fn run_pty_to_eof(env: &Environment, arguments: &[&str]) -> TestResult<std::process::Output> {
+    use rustix_openpty::rustix;
+    let pty = rustix_openpty::openpty(None, None)?;
+    let saved = normalized_termios(&pty.user)?;
+    let stdin = std::fs::File::from(rustix::io::dup(&pty.user)?);
+    let mut command = env.command(arguments);
+    let child = command
+        .stdin(stdin)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    drop(pty.controller);
+    let output = child.wait_with_output()?;
+    assert_termios_restored(&rustix::termios::tcgetattr(&pty.user)?, &saved);
+    Ok(output)
+}
+
 #[test]
 fn complete_cli_lifecycle_uses_daemon_api() -> TestResult {
     let env = Environment::new()?;
@@ -287,7 +344,7 @@ fn real_pty_resize_signals_and_terminal_restoration_are_exact() -> TestResult {
                 ws_ypixel: 0,
             }),
         )?;
-        let saved = rustix::termios::tcgetattr(&pty.user)?;
+        let saved = normalized_termios(&pty.user)?;
         let stdin = std::fs::File::from(rustix::io::dup(&pty.user)?);
         let stdout = std::fs::File::from(rustix::io::dup(&pty.user)?);
         let stderr = std::fs::File::from(rustix::io::dup(&pty.user)?);
@@ -310,13 +367,52 @@ fn real_pty_resize_signals_and_terminal_restoration_are_exact() -> TestResult {
         rustix::process::kill_process(pid, signal)?;
         assert_eq!(child.wait()?.code(), Some(expected));
         let restored = rustix::termios::tcgetattr(&pty.user)?;
-        assert_eq!(restored.input_modes, saved.input_modes);
-        assert_eq!(restored.output_modes, saved.output_modes);
-        assert_eq!(restored.control_modes, saved.control_modes);
-        assert_eq!(restored.local_modes, saved.local_modes);
+        assert_termios_restored(&restored, &saved);
     }
     let logs = env.invoke(&["logs"])?;
     assert!(logs.stdout.windows(6).any(|window| window == b"132x47"));
+    Ok(())
+}
+
+#[test]
+fn real_pty_success_nonzero_and_connection_error_restore_terminal() -> TestResult {
+    use rustix_openpty::rustix;
+    let env = Environment::new()?;
+    assert!(env.invoke(&["up", env.root()?])?.status.success());
+    assert_eq!(
+        run_pty_to_eof(&env, &["shell", "--", "fake-exit", "0"])?
+            .status
+            .code(),
+        Some(0)
+    );
+    assert_eq!(
+        run_pty_to_eof(&env, &["shell", "--", "fake-exit", "37"])?
+            .status
+            .code(),
+        Some(37)
+    );
+
+    let pty = rustix_openpty::openpty(None, None)?;
+    let saved = normalized_termios(&pty.user)?;
+    let stdin = std::fs::File::from(rustix::io::dup(&pty.user)?);
+    let mut command = env.command(&["shell", "--", "fake-exit", "0"]);
+    let child = command
+        .stdin(stdin)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let pid = std::fs::read_to_string(env.runtime_root.join("daemon.pid"))?;
+    assert!(
+        Command::new("kill")
+            .args(["-KILL", pid.trim()])
+            .status()?
+            .success()
+    );
+    drop(pty.controller);
+    let output = child.wait_with_output()?;
+    assert_eq!(output.status.code(), Some(70));
+    assert_termios_restored(&rustix::termios::tcgetattr(&pty.user)?, &saved);
     Ok(())
 }
 
