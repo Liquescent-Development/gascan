@@ -29,6 +29,12 @@ pub mod error_code {
     pub const INTERNAL: &str = "internal";
     /// An attach frame omitted its Run/Shell session token.
     pub const EMPTY_SESSION_TOKEN: &str = super::SESSION_TOKEN_EMPTY;
+    /// A token does not identify a session known to this daemon.
+    pub const UNKNOWN_SESSION_TOKEN: &str = "unknown_session_token";
+    /// A known session token is no longer attachable.
+    pub const EXPIRED_SESSION_TOKEN: &str = "expired_session_token";
+    /// A later frame tried to change the session bound by the first frame.
+    pub const SESSION_TOKEN_MISMATCH: &str = "session_token_mismatch";
 
     /// All codes defined by API v1.
     pub const ALL: &[&str] = &[
@@ -39,6 +45,9 @@ pub mod error_code {
         BACKEND_UNAVAILABLE,
         INTERNAL,
         EMPTY_SESSION_TOKEN,
+        UNKNOWN_SESSION_TOKEN,
+        EXPIRED_SESSION_TOKEN,
+        SESSION_TOKEN_MISMATCH,
     ];
 }
 
@@ -65,6 +74,59 @@ pub const fn validate_session_token(token: &[u8]) -> Result<(), SessionTokenErro
         Err(SessionTokenError::Empty)
     } else {
         Ok(())
+    }
+}
+
+/// Stateful validator that binds one Attach stream to exactly one session.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AttachSessionBinder {
+    token: Option<Vec<u8>>,
+}
+
+impl AttachSessionBinder {
+    /// Creates an unbound stream validator.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { token: None }
+    }
+
+    /// Binds the first valid frame and requires the same token thereafter.
+    pub fn validate_frame(&mut self, token: &[u8]) -> Result<(), AttachSessionError> {
+        validate_session_token(token).map_err(|_| AttachSessionError::Empty)?;
+        match &self.token {
+            Some(bound) if bound.as_slice() != token => Err(AttachSessionError::Mismatch),
+            Some(_) => Ok(()),
+            None => {
+                self.token = Some(token.to_vec());
+                Ok(())
+            }
+        }
+    }
+
+    /// Returns the token established by the first valid frame, if any.
+    #[must_use]
+    pub fn session_token(&self) -> Option<&[u8]> {
+        self.token.as_deref()
+    }
+}
+
+/// A stream-local Attach session binding failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachSessionError {
+    /// A frame omitted its session token.
+    Empty,
+    /// A later frame's token differs from the first frame's token.
+    Mismatch,
+}
+
+impl AttachSessionError {
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Empty => error_code::EMPTY_SESSION_TOKEN,
+            Self::Mismatch => error_code::SESSION_TOKEN_MISMATCH,
+        }
     }
 }
 
@@ -163,12 +225,12 @@ impl TryFrom<v1::OperationId> for CheckedOperationId {
 
 /// A validated positive sequence number in a durable operation event stream.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct CheckedEventSequence(u64);
+pub struct CheckedEventSequence(i64);
 
 impl CheckedEventSequence {
     /// Returns the validated positive sequence number.
     #[must_use]
-    pub const fn get(self) -> u64 {
+    pub const fn get(self) -> i64 {
         self.0
     }
 }
@@ -178,6 +240,8 @@ impl CheckedEventSequence {
 pub enum EventSequenceError {
     /// Zero cannot identify an append-only event position.
     Zero,
+    /// The unsigned wire value cannot fit in the signed durable representation.
+    OutOfRange,
 }
 
 impl TryFrom<u64> for CheckedEventSequence {
@@ -185,10 +249,11 @@ impl TryFrom<u64> for CheckedEventSequence {
 
     fn try_from(value: u64) -> Result<Self, Self::Error> {
         if value == 0 {
-            Err(EventSequenceError::Zero)
-        } else {
-            Ok(Self(value))
+            return Err(EventSequenceError::Zero);
         }
+        i64::try_from(value)
+            .map(Self)
+            .map_err(|_| EventSequenceError::OutOfRange)
     }
 }
 
