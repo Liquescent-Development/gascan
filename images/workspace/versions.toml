@@ -1,0 +1,14 @@
+ubuntu = "24.04"
+ubuntu_snapshot = "2026-07-13T00:00:00Z"
+mise = "2026.5.0"
+playwright_chromium_channel = "chromium"
+gascamp_revision = "f6b248c5926240856dbea83d1d2c5c90ea1c1456"
+
+[tools]
+elixir = "latest"
+go = "1"
+java = "lts"
+node = "lts"
+python = "3"
+ruby = "3"
+rust = "stable"
