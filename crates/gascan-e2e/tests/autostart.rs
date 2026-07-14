@@ -27,8 +27,9 @@ impl Environment {
         })
     }
 
-    fn invoke(&self) -> Result<std::process::Output, std::io::Error> {
-        Command::new(&self.gascan)
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.gascan);
+        command
             .args(["doctor", "--json"])
             .env("XDG_RUNTIME_DIR", &self.runtime_root)
             .env("GASCAN_STATE_PATH", self.runtime_root.join("state.sqlite3"))
@@ -37,8 +38,16 @@ impl Environment {
                 self.runtime_root.join("runtime.json"),
             )
             .env("GASCAN_PID_PATH", self.runtime_root.join("daemon.pid"))
-            .env("GASCAN_DAEMON", &self.gascand)
-            .output()
+            .env(
+                "GASCAN_DAEMON_STDERR_PATH",
+                self.runtime_root.join("daemon.stderr"),
+            )
+            .env("GASCAN_DAEMON", &self.gascand);
+        command
+    }
+
+    fn invoke(&self) -> Result<std::process::Output, std::io::Error> {
+        self.command().output()
     }
 
     fn shutdown_daemon(&self) -> TestResult {
@@ -65,6 +74,49 @@ impl Environment {
     }
 }
 
+#[test]
+fn accepted_socket_without_http2_cannot_block_initial_probe() -> TestResult {
+    use std::os::unix::fs::PermissionsExt as _;
+    let env = Environment::new()?;
+    let directory = env.runtime_root.join("gascan");
+    std::fs::create_dir(&directory)?;
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+    let socket = directory.join("gascand.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket)?;
+    let held_socket = socket.clone();
+    let holder = std::thread::spawn(move || -> std::io::Result<()> {
+        let (stream, _) = listener.accept()?;
+        std::fs::remove_file(held_socket)?;
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        drop(stream);
+        Ok(())
+    });
+    let started = std::time::Instant::now();
+    let mut command = env.command();
+    let mut cli = command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let deadline = started + std::time::Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = cli.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            cli.kill()?;
+            let _ = cli.wait()?;
+            return Err("initial readiness probe exceeded its bound".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert!(status.success());
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    holder
+        .join()
+        .map_err(|_| "withholding socket thread panicked")??;
+    Ok(())
+}
+
 impl Drop for Environment {
     fn drop(&mut self) {
         let _ = self.shutdown_daemon();
@@ -84,12 +136,34 @@ fn concurrent_clients_converge_on_one_private_daemon() -> TestResult {
     let left = spawn(env.clone(), barrier.clone());
     let right = spawn(env.clone(), barrier.clone());
     barrier.wait();
+    let started_at = std::time::Instant::now();
     let left = left.join().map_err(|_| "left thread panicked")??;
     let right = right.join().map_err(|_| "right thread panicked")??;
+    let daemon_stderr = std::fs::read_to_string(env.runtime_root.join("daemon.stderr"))
+        .unwrap_or_else(|error| format!("<unavailable: {error}>"));
+    let daemon_pid = std::fs::read_to_string(env.runtime_root.join("daemon.pid"))
+        .unwrap_or_else(|error| format!("<unavailable: {error}>"));
+    let daemon_alive = Command::new("kill")
+        .args(["-0", daemon_pid.trim()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    let socket_live =
+        std::os::unix::net::UnixStream::connect(env.runtime_root.join("gascan/gascand.sock"))
+            .is_ok();
+    let diagnostic = format!(
+        "elapsed={:?}, daemon_pid={}, alive={}, socket_live={}, daemon_stderr={}",
+        started_at.elapsed(),
+        daemon_pid,
+        daemon_alive,
+        socket_live,
+        daemon_stderr
+    );
     for (side, output) in [("left", left), ("right", right)] {
         assert!(
             output.status.success(),
-            "{side} autostart failed: status={:?}, stdout={}, stderr={}",
+            "{side} autostart failed: status={:?}, stdout={}, stderr={}, {diagnostic}",
             output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)

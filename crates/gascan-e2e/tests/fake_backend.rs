@@ -887,3 +887,116 @@ async fn post_begin_failure_keeps_operation_id_and_streams_failed_terminal() -> 
     assert!(failed.error.is_some());
     Ok(())
 }
+
+#[tokio::test]
+async fn pre_begin_rpc_failures_keep_stable_statuses() -> TestResult {
+    use gascan_proto::v1;
+    let env = Environment::new()?;
+    assert!(
+        env.command(&["doctor", "--json"])
+            .env("GASCAN_FAKE_PROVISION_DELAY_MS", "600")
+            .output()?
+            .status
+            .success()
+    );
+    let mut client = api_client(env.runtime_root.clone()).await?;
+    let missing = gascan_core::sandbox::SandboxId::test("missing").to_string();
+    let down = client
+        .down(v1::DownRequest {
+            sandbox: Some(v1::SandboxSelector {
+                sandbox_id: missing.clone(),
+            }),
+        })
+        .await
+        .err()
+        .ok_or("missing stop unexpectedly succeeded")?;
+    assert_eq!(down.code(), tonic::Code::NotFound);
+    assert_eq!(down.message(), gascan_proto::error_code::SANDBOX_NOT_FOUND);
+    let destroy = client
+        .destroy(v1::DestroyRequest {
+            sandbox: Some(v1::SandboxSelector {
+                sandbox_id: missing,
+            }),
+        })
+        .await
+        .err()
+        .ok_or("missing destroy unexpectedly succeeded")?;
+    assert_eq!(destroy.code(), tonic::Code::NotFound);
+
+    std::fs::write(
+        env.root.path().join("gascan.toml"),
+        "version = 1\nnetwork = 'offline'\n[ports]\nweb = 3000\n",
+    )?;
+    let invalid = client
+        .up(v1::UpRequest {
+            project_root: env.root()?.to_owned(),
+        })
+        .await
+        .err()
+        .ok_or("invalid policy unexpectedly succeeded")?;
+    assert_eq!(invalid.code(), tonic::Code::InvalidArgument);
+
+    std::fs::write(
+        env.root.path().join("gascan.toml"),
+        "version = 1\nnetwork = 'offline'\n",
+    )?;
+    let mut first = client
+        .up(v1::UpRequest {
+            project_root: env.root()?.to_owned(),
+        })
+        .await?
+        .into_inner();
+    while let Some(event) = first.message().await? {
+        if event.status == v1::OperationStatus::Completed as i32 {
+            break;
+        }
+    }
+    let id = client
+        .list(v1::ListRequest {})
+        .await?
+        .into_inner()
+        .sandboxes
+        .into_iter()
+        .next()
+        .ok_or("sandbox missing")?
+        .sandbox_id;
+    let id = gascan_core::sandbox::SandboxId::try_from(id)?;
+    let store = gascand::Store::open(env.runtime_root.join("state.sqlite3"))?;
+    let record = store.sandbox(&id)?.ok_or("sandbox record missing")?;
+    let _pending = store.begin_operation(&record, gascand::OperationKind::Apply)?;
+    let conflict = client
+        .down(v1::DownRequest {
+            sandbox: Some(v1::SandboxSelector {
+                sandbox_id: id.to_string(),
+            }),
+        })
+        .await
+        .err()
+        .ok_or("pending conflict unexpectedly succeeded")?;
+    assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
+    assert_eq!(
+        conflict.message(),
+        gascan_proto::error_code::OPERATION_CONFLICT
+    );
+
+    let failing = Environment::new()?;
+    assert!(
+        failing
+            .command(&["doctor", "--json"])
+            .env("GASCAN_FAKE_CAPABILITIES_FAIL", "1")
+            .output()?
+            .status
+            .success()
+    );
+    let mut failing_client = api_client(failing.runtime_root.clone()).await?;
+    let unavailable = failing_client
+        .up(v1::UpRequest {
+            project_root: failing.root()?.to_owned(),
+        })
+        .await
+        .err()
+        .ok_or("capabilities failure unexpectedly succeeded")?;
+    assert_eq!(unavailable.code(), tonic::Code::Unavailable);
+    assert_ne!(unavailable.code(), tonic::Code::Internal);
+    Ok(())
+}

@@ -16,6 +16,8 @@ TTY Attach sends the initial size, SIGWINCH changes, stdin, SIGINT/SIGTERM, and 
 
 Lifecycle RPCs publish the checked durable operation ID and live Pending stream immediately after `begin_operation`; keyed mutation and its daemon activity lease continue in a spawned task independent of client cancellation, with post-begin errors persisted and streamed as the same operation's Failed terminal. Command payload field 2 is reserved: all stdin travels only through bounded 16 KiB Attach frames with channel backpressure after token acquisition. An unbounded-producer E2E proves flushed output arrives before EOF while cancellation closes the producer promptly. Follow logs use Pending snapshot/appends with strictly increasing sequence and emit one Completed terminal only on graceful server shutdown (or one Failed terminal on backend error); client cancellation fabricates no terminal and releases the activity lease, while non-follow remains Completed sequence 1.
 
+Lifecycle startup publication carries either the live operation or a typed pre-begin rejection; direct RPC tests preserve NotFound, InvalidArgument, AlreadyExists/operation-conflict, and Unavailable instead of collapsing to Internal. Autostart bounds the complete initial UDS connect, HTTP/2 setup, and Handshake probe before daemon election as well as later readiness probes. A withholding-UDS regression accepts the initial connection without speaking HTTP/2 and proves startup still advances within the bound.
+
 ## TDD and verification
 
 - Initial RED: the real-process scenario failed because the CLI binary was absent.

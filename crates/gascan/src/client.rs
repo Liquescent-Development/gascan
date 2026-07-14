@@ -49,21 +49,34 @@ pub struct Client {
 impl Client {
     pub async fn connect_or_start() -> Result<Self, ClientError> {
         let socket = socket_path();
-        if let Ok(client) = connect(&socket).await {
-            match negotiate(client).await {
-                Ok(client) => return Ok(client),
-                Err(error @ ClientError::Api(_)) => return Err(error),
-                Err(_) => {}
-            }
+        let initial = tokio::time::timeout(Duration::from_millis(250), async {
+            negotiate(connect(&socket).await?).await
+        })
+        .await;
+        match initial {
+            Ok(Ok(client)) => return Ok(client),
+            Ok(Err(error @ ClientError::Api(_))) => return Err(error),
+            Ok(Err(_)) | Err(_) => {}
         }
         let daemon = daemon_path()?;
-        let _child = tokio::process::Command::new(daemon)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
+        let mut command = tokio::process::Command::new(daemon);
+        command.stdin(Stdio::null()).stdout(Stdio::null());
+        if let Some(path) = std::env::var_os("GASCAN_DAEMON_STDERR_PATH") {
+            command.stderr(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?,
+            );
+        } else {
+            command.stderr(Stdio::null());
+        }
+        let _child = command.spawn()?;
+        let started_at = tokio::time::Instant::now();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut probes = 0_u64;
         loop {
+            probes = probes.saturating_add(1);
             let result = tokio::time::timeout(Duration::from_millis(250), async {
                 negotiate(connect(&socket).await?).await
             })
@@ -78,7 +91,15 @@ impl Client {
                 Ok(client) => return Ok(client),
                 Err(error @ ClientError::Api(_)) => return Err(error),
                 Err(error) if !startup_transient(&error) => return Err(error),
-                Err(error) if tokio::time::Instant::now() >= deadline => return Err(error),
+                Err(error) if tokio::time::Instant::now() >= deadline => {
+                    return Err(ClientError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "daemon readiness exhausted after {probes} probes in {:?}; last error: {error}",
+                            started_at.elapsed()
+                        ),
+                    )));
+                }
                 Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
             }
         }

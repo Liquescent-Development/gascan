@@ -57,6 +57,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fake_state_path,
     )
     .await?;
+    if std::env::var_os("GASCAN_FAKE_CAPABILITIES_FAIL").is_some() {
+        runtime
+            .inject_failure(gascan_core::fake_runtime::FailureBoundary::Capabilities)
+            .await;
+    }
     if let Some(delay) = std::env::var("GASCAN_FAKE_LOGS_FAIL_AFTER_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())

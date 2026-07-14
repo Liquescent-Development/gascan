@@ -67,7 +67,31 @@ pub struct Operation {
     pub events: mpsc::Receiver<OperationEvent>,
 }
 
-type OperationStarted = tokio::sync::oneshot::Sender<Operation>;
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PreBeginFailure {
+    Conflict,
+    Missing,
+    Runtime,
+    Invalid,
+    Internal,
+}
+
+impl From<&ServiceError> for PreBeginFailure {
+    fn from(error: &ServiceError) -> Self {
+        match error {
+            ServiceError::Store(StoreError::PendingOperationExists { .. }) => Self::Conflict,
+            ServiceError::Missing(_) => Self::Missing,
+            ServiceError::Runtime(_) => Self::Runtime,
+            ServiceError::Policy(_) | ServiceError::Sandbox(_) | ServiceError::Manifest(_) => {
+                Self::Invalid
+            }
+            _ => Self::Internal,
+        }
+    }
+}
+
+pub(crate) type OperationStart = Result<Operation, PreBeginFailure>;
+type OperationStarted = mpsc::Sender<OperationStart>;
 
 fn publish_operation(
     started: Option<OperationStarted>,
@@ -75,10 +99,10 @@ fn publish_operation(
     receiver: mpsc::Receiver<OperationEvent>,
 ) -> Option<mpsc::Receiver<OperationEvent>> {
     if let Some(started) = started {
-        let _ = started.send(Operation {
+        let _ = started.try_send(Ok(Operation {
             id,
             events: receiver,
-        });
+        }));
         None
     } else {
         Some(receiver)

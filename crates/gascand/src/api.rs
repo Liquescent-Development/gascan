@@ -1,3 +1,4 @@
+use crate::service::PreBeginFailure;
 use crate::{
     ActualState, DesiredState, OperationEvent as StoredEvent, OperationStatus as StoredStatus,
     SandboxService, ServiceError, SocketPaths, UpRequest as ServiceUpRequest,
@@ -510,6 +511,16 @@ fn service_status(error: ServiceError) -> tonic::Status {
     }
 }
 
+fn pre_begin_status(error: PreBeginFailure) -> tonic::Status {
+    match error {
+        PreBeginFailure::Conflict => tonic::Status::already_exists(error_code::OPERATION_CONFLICT),
+        PreBeginFailure::Missing => tonic::Status::not_found(error_code::SANDBOX_NOT_FOUND),
+        PreBeginFailure::Runtime => tonic::Status::unavailable(error_code::BACKEND_UNAVAILABLE),
+        PreBeginFailure::Invalid => tonic::Status::invalid_argument(error_code::INVALID_REQUEST),
+        PreBeginFailure::Internal => tonic::Status::internal(error_code::INTERNAL),
+    }
+}
+
 fn timestamp_from_millis(millis: i64) -> prost_types::Timestamp {
     prost_types::Timestamp {
         seconds: millis.div_euclid(1_000),
@@ -726,16 +737,21 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             .await
             .map_err(ApiInputError::status)?;
         let service = self.service.clone();
-        let (started, operation) = tokio::sync::oneshot::channel();
+        let (started, mut operation) = tokio::sync::mpsc::channel(1);
         tokio::spawn(async move {
             let _operation_lease = operation_lease;
-            let _ = service
-                .up_started(ServiceUpRequest::new(spec), started)
-                .await;
+            if let Err(error) = service
+                .up_started(ServiceUpRequest::new(spec), started.clone())
+                .await
+            {
+                let _ = started.send(Err((&error).into())).await;
+            }
         });
         let operation = operation
+            .recv()
             .await
-            .map_err(|_| tonic::Status::internal(error_code::INTERNAL))?;
+            .ok_or_else(|| tonic::Status::internal(error_code::INTERNAL))?
+            .map_err(pre_begin_status)?;
         Ok(tonic::Response::new(ApiEventStream::new(
             operation.events,
             self.activity.clone(),
@@ -751,16 +767,21 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             .await
             .map_err(ApiInputError::status)?;
         let service = self.service.clone();
-        let (started, operation) = tokio::sync::oneshot::channel();
+        let (started, mut operation) = tokio::sync::mpsc::channel(1);
         tokio::spawn(async move {
             let _operation_lease = operation_lease;
-            let _ = service
-                .apply_started(ServiceUpRequest::new(spec), started)
-                .await;
+            if let Err(error) = service
+                .apply_started(ServiceUpRequest::new(spec), started.clone())
+                .await
+            {
+                let _ = started.send(Err((&error).into())).await;
+            }
         });
         let operation = operation
+            .recv()
             .await
-            .map_err(|_| tonic::Status::internal(error_code::INTERNAL))?;
+            .ok_or_else(|| tonic::Status::internal(error_code::INTERNAL))?
+            .map_err(pre_begin_status)?;
         Ok(tonic::Response::new(ApiEventStream::new(
             operation.events,
             self.activity.clone(),
@@ -843,14 +864,18 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         let operation_lease = self.activity.admit_operation().map_err(admission_status)?;
         let id = selector_id(request.into_inner().sandbox).map_err(ApiInputError::status)?;
         let service = self.service.clone();
-        let (started, operation) = tokio::sync::oneshot::channel();
+        let (started, mut operation) = tokio::sync::mpsc::channel(1);
         tokio::spawn(async move {
             let _operation_lease = operation_lease;
-            let _ = service.stop_started(&id, started).await;
+            if let Err(error) = service.stop_started(&id, started.clone()).await {
+                let _ = started.send(Err((&error).into())).await;
+            }
         });
         let operation = operation
+            .recv()
             .await
-            .map_err(|_| tonic::Status::internal(error_code::INTERNAL))?;
+            .ok_or_else(|| tonic::Status::internal(error_code::INTERNAL))?
+            .map_err(pre_begin_status)?;
         Ok(tonic::Response::new(ApiEventStream::new(
             operation.events,
             self.activity.clone(),
@@ -864,14 +889,18 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         let operation_lease = self.activity.admit_operation().map_err(admission_status)?;
         let id = selector_id(request.into_inner().sandbox).map_err(ApiInputError::status)?;
         let service = self.service.clone();
-        let (started, operation) = tokio::sync::oneshot::channel();
+        let (started, mut operation) = tokio::sync::mpsc::channel(1);
         tokio::spawn(async move {
             let _operation_lease = operation_lease;
-            let _ = service.destroy_started(&id, started).await;
+            if let Err(error) = service.destroy_started(&id, started.clone()).await {
+                let _ = started.send(Err((&error).into())).await;
+            }
         });
         let operation = operation
+            .recv()
             .await
-            .map_err(|_| tonic::Status::internal(error_code::INTERNAL))?;
+            .ok_or_else(|| tonic::Status::internal(error_code::INTERNAL))?
+            .map_err(pre_begin_status)?;
         Ok(tonic::Response::new(ApiEventStream::new(
             operation.events,
             self.activity.clone(),
