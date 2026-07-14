@@ -87,17 +87,32 @@ async fn attached_process_forwards_sigint_and_closes_stdin() -> Result<(), TestE
     let ctx = LiveContext::new("attach-input").await?;
     let mut signal = ctx
         .attach(
-            ["sh", "-c", "trap 'exit 42' INT; while :; do sleep 1; done"],
+            [
+                "sh",
+                "-c",
+                "trap 'exit 42' INT; printf 'signal-ready\\n'; while :; do sleep 1; done",
+            ],
             true,
         )
         .await?;
+    tokio::time::timeout(Duration::from_secs(10), signal.read_until(b"signal-ready"))
+        .await
+        .map_err(|_| "timed out waiting for guest signal readiness")??
+        .ok_or("guest exited before signal readiness")?;
+    eprintln!("attach diagnostic: guest signal trap is ready");
     signal.send(AttachInput::Signal(libc::SIGINT)).await?;
-    assert_eq!(signal.exit().await?, 42);
+    let signal_exit = tokio::time::timeout(Duration::from_secs(10), signal.exit())
+        .await
+        .map_err(|_| "timed out waiting for SIGINT guest exit")??;
+    assert_eq!(signal_exit, 42);
 
     let mut close = ctx
         .attach(["sh", "-c", "cat >/dev/null; exit 0"], false)
         .await?;
     close.send(AttachInput::Close).await?;
-    assert_eq!(close.exit().await?, 0);
+    let close_exit = tokio::time::timeout(Duration::from_secs(10), close.exit())
+        .await
+        .map_err(|_| "timed out waiting for stdin-close guest exit")??;
+    assert_eq!(close_exit, 0);
     ctx.cleanup().await
 }
