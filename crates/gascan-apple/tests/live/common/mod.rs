@@ -2,6 +2,7 @@
 
 use std::{
     fs,
+    io::Read,
     net::{IpAddr, Ipv4Addr},
     path::{Path, PathBuf},
     process::Command,
@@ -16,6 +17,7 @@ pub type TestError = Box<dyn std::error::Error + Send + Sync>;
 
 const IMAGE: &str = "docker.io/library/alpine:3.20";
 const LABEL: &str = "dev.gascan.test=true";
+const OWNER_LABEL: &str = "dev.gascan.test.owner";
 
 #[derive(Default)]
 struct Records {
@@ -23,6 +25,7 @@ struct Records {
     volumes: Vec<String>,
     networks: Vec<String>,
     paths: Vec<PathBuf>,
+    owner_token: String,
 }
 
 pub struct LiveContext {
@@ -33,6 +36,7 @@ pub struct LiveContext {
     volume: String,
     publish: Option<(u16, u16)>,
     records: Mutex<Records>,
+    owner_token: String,
     drop_cleanup: bool,
 }
 
@@ -48,6 +52,8 @@ impl LiveContext {
     async fn new_inner(case: &str, publish: Option<(u16, u16)>) -> Result<Self, TestError> {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let prefix = format!("gascan-feas-{}-{case}-{nonce}", std::process::id());
+        let owner_token = random_owner_token()?;
+        let owner_label = format!("{OWNER_LABEL}={owner_token}");
         let workspace = std::env::temp_dir().join(&prefix);
         fs::create_dir(&workspace)?;
         let volume = format!("{prefix}-volume");
@@ -61,8 +67,10 @@ impl LiveContext {
             publish,
             records: Mutex::new(Records {
                 paths: vec![workspace],
+                owner_token: owner_token.clone(),
                 ..Records::default()
             }),
+            owner_token,
             drop_cleanup: true,
         };
 
@@ -72,13 +80,15 @@ impl LiveContext {
                 "create",
                 "--label",
                 LABEL,
+                "--label",
+                &owner_label,
                 "-s",
                 "104857600",
                 &ctx.volume,
             ])
             .await;
         match volume_result {
-            Ok(_) => ctx.records.lock().unwrap().volumes.push(ctx.volume.clone()),
+            Ok(_) => ctx.verify_and_record_volume(&ctx.volume).await?,
             Err(create_error) => {
                 if let Err(reconcile_error) = ctx.reconcile_volume(&ctx.volume).await {
                     return Err(format!(
@@ -107,12 +117,15 @@ impl LiveContext {
             self.workspace.display()
         );
         let volume = format!("{}:/opt/gascan", self.volume);
+        let owner_label = format!("{OWNER_LABEL}={}", self.owner_token);
         let mut args = vec![
             "run".to_owned(),
             "--name".to_owned(),
             name.clone(),
             "--label".to_owned(),
             LABEL.to_owned(),
+            "--label".to_owned(),
+            owner_label,
             "--mount".to_owned(),
             mount,
             "--volume".to_owned(),
@@ -129,10 +142,7 @@ impl LiveContext {
         }
         args.extend(guest_argv(self.publish.is_some()));
         match self.run_vec(args).await {
-            Ok(_) => {
-                self.records.lock().unwrap().containers.push(name);
-                Ok(())
-            }
+            Ok(_) => self.verify_and_record_container(&name, true).await,
             Err(create_error) => {
                 if let Err(reconcile_error) = self.reconcile_container(&name).await {
                     return Err(format!(
@@ -246,10 +256,25 @@ impl LiveContext {
     }
 
     async fn reconcile_container(&self, name: &str) -> Result<(), TestError> {
+        self.verify_and_record_container(name, false).await
+    }
+
+    async fn verify_and_record_container(
+        &self,
+        name: &str,
+        require_present: bool,
+    ) -> Result<(), TestError> {
         let Some(value) = self.inspect_container_if_present(name).await? else {
-            return Ok(());
+            return if require_present {
+                Err(
+                    format!("created container {name} is absent during ownership verification")
+                        .into(),
+                )
+            } else {
+                Ok(())
+            };
         };
-        require_owned_container(&value, name, &self.prefix)?;
+        require_owned_container(&value, name, &self.prefix, &self.owner_token)?;
         self.records
             .lock()
             .unwrap()
@@ -264,11 +289,22 @@ impl LiveContext {
         match volume_record(&value, name) {
             None => Ok(()),
             Some(record) => {
-                require_owned_volume(record, name, &self.prefix)?;
+                require_owned_volume(record, name, &self.prefix, &self.owner_token)?;
                 self.records.lock().unwrap().volumes.push(name.to_owned());
                 Ok(())
             }
         }
+    }
+
+    async fn verify_and_record_volume(&self, name: &str) -> Result<(), TestError> {
+        let output = self.run_ok(["volume", "list", "--format", "json"]).await?;
+        let value: Value = serde_json::from_slice(&output.stdout)?;
+        let record = volume_record(&value, name).ok_or_else(|| {
+            format!("created volume {name} is absent during ownership verification")
+        })?;
+        require_owned_volume(record, name, &self.prefix, &self.owner_token)?;
+        self.records.lock().unwrap().volumes.push(name.to_owned());
+        Ok(())
     }
 
     async fn delete_container(&self, name: &str) -> Result<(), TestError> {
@@ -280,13 +316,13 @@ impl LiveContext {
                 .retain(|item| item != name);
             return Ok(());
         };
-        require_owned_container(&value, name, &self.prefix)?;
+        require_owned_container(&value, name, &self.prefix, &self.owner_token)?;
         if container_state(&value) == Some("running") {
             self.run_ok(["stop", "--time", "5", name]).await?;
         }
         let inspect = self.run_ok(["inspect", name]).await?;
         let value: Value = serde_json::from_slice(&inspect.stdout)?;
-        require_owned_container(&value, name, &self.prefix)?;
+        require_owned_container(&value, name, &self.prefix, &self.owner_token)?;
         self.run_ok(["delete", name]).await?;
         self.records
             .lock()
@@ -389,7 +425,7 @@ impl LiveContext {
         let Some(record) = volume_record(&value, name) else {
             return Ok(false);
         };
-        require_owned_volume(record, name, &self.prefix)?;
+        require_owned_volume(record, name, &self.prefix, &self.owner_token)?;
         Ok(true)
     }
 }
@@ -403,15 +439,15 @@ impl Drop for LiveContext {
             return;
         };
         for name in records.containers.iter().rev() {
-            if blocking_owned_container(name, &self.prefix) {
+            if blocking_owned_container(name, &self.prefix, &records.owner_token) {
                 cleanup_command(["stop", "--time", "5", name]);
-                if blocking_owned_container(name, &self.prefix) {
+                if blocking_owned_container(name, &self.prefix, &records.owner_token) {
                     cleanup_command(["delete", name]);
                 }
             }
         }
         for name in records.volumes.iter().rev() {
-            if blocking_owned_volume(name, &self.prefix) {
+            if blocking_owned_volume(name, &self.prefix, &records.owner_token) {
                 cleanup_command(["volume", "delete", name]);
             }
         }
@@ -495,19 +531,19 @@ pub fn exact_workspace_bind<'a>(value: &'a Value, source: &Path) -> Option<&'a V
     Some(mount)
 }
 
-fn has_ownership_label(value: &Value) -> bool {
-    value
-        .get("labels")
-        .and_then(Value::as_object)
-        .and_then(|labels| labels.get("dev.gascan.test"))
-        .and_then(Value::as_str)
-        == Some("true")
+fn has_ownership_labels(value: &Value, owner_token: &str) -> bool {
+    let Some(labels) = value.get("labels").and_then(Value::as_object) else {
+        return false;
+    };
+    labels.get("dev.gascan.test").and_then(Value::as_str) == Some("true")
+        && labels.get(OWNER_LABEL).and_then(Value::as_str) == Some(owner_token)
 }
 
 fn require_owned_container<'a>(
     value: &'a Value,
     name: &str,
     prefix: &str,
+    owner_token: &str,
 ) -> Result<&'a Value, TestError> {
     if !name.starts_with(prefix) {
         return Err(format!("unexpected container identity: {name}").into());
@@ -517,7 +553,7 @@ fn require_owned_container<'a>(
         .get("configuration")
         .ok_or("inspect missing configuration")?;
     if configuration.get("id").and_then(Value::as_str) != Some(name)
-        || !has_ownership_label(configuration)
+        || !has_ownership_labels(configuration, owner_token)
     {
         return Err(format!("ownership mismatch for container {name}").into());
     }
@@ -546,10 +582,11 @@ fn require_owned_volume<'a>(
     record: &'a Value,
     name: &str,
     prefix: &str,
+    owner_token: &str,
 ) -> Result<&'a Value, TestError> {
     if !name.starts_with(prefix)
         || record.get("name").and_then(Value::as_str) != Some(name)
-        || !has_ownership_label(record)
+        || !has_ownership_labels(record, owner_token)
     {
         return Err(format!("ownership mismatch for volume {name}").into());
     }
@@ -608,17 +645,23 @@ fn blocking_output<const N: usize>(args: [&str; N]) -> Option<Vec<u8>> {
     None
 }
 
-fn blocking_owned_container(name: &str, prefix: &str) -> bool {
+fn blocking_owned_container(name: &str, prefix: &str, owner_token: &str) -> bool {
     blocking_output(["inspect", name])
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .is_some_and(|value| require_owned_container(&value, name, prefix).is_ok())
+        .is_some_and(|value| require_owned_container(&value, name, prefix, owner_token).is_ok())
 }
 
-fn blocking_owned_volume(name: &str, prefix: &str) -> bool {
+fn blocking_owned_volume(name: &str, prefix: &str, owner_token: &str) -> bool {
     blocking_output(["volume", "list", "--format", "json"])
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
         .and_then(|value| volume_record(&value, name).cloned())
-        .is_some_and(|record| require_owned_volume(&record, name, prefix).is_ok())
+        .is_some_and(|record| require_owned_volume(&record, name, prefix, owner_token).is_ok())
+}
+
+fn random_owner_token() -> Result<String, TestError> {
+    let mut bytes = [0_u8; 16];
+    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 pub fn publish_args(
@@ -664,6 +707,8 @@ mod tests {
 
     use super::*;
 
+    const TOKEN: &str = "00112233445566778899aabbccddeeff";
+
     struct ScriptedRunner(Mutex<VecDeque<Result<CommandOutput, RuntimeError>>>);
 
     #[async_trait]
@@ -694,7 +739,15 @@ mod tests {
     }
 
     fn owned_container(name: &str) -> Value {
-        json!([{"configuration":{"id":name,"labels":{"dev.gascan.test":"true"}},"status":{"state":"stopped"}}])
+        container_with(name, TOKEN, "stopped")
+    }
+
+    fn container_with(name: &str, token: &str, state: &str) -> Value {
+        json!([{"configuration":{"id":name,"labels":{"dev.gascan.test":"true","dev.gascan.test.owner":token}},"status":{"state":state}}])
+    }
+
+    fn volume_with(name: &str, token: &str) -> Value {
+        json!([{"name":name,"labels":{"dev.gascan.test":"true","dev.gascan.test.owner":token}}])
     }
 
     fn context(
@@ -712,19 +765,23 @@ mod tests {
             records: Mutex::new(Records {
                 containers,
                 volumes,
+                owner_token: TOKEN.into(),
                 ..Records::default()
             }),
+            owner_token: TOKEN.into(),
             drop_cleanup: false,
         }
     }
 
     #[tokio::test]
-    async fn failed_create_collision_with_wrong_label_is_never_recorded() {
+    async fn failed_create_collision_with_wrong_owner_token_is_never_recorded() {
         let name = "gascan-feas-42-case-container";
         let ctx = context(
-            vec![output(
-                json!([{"configuration":{"id":name,"labels":{"dev.gascan.test":"false"}}}]),
-            )],
+            vec![output(container_with(
+                name,
+                "ffeeddccbbaa99887766554433221100",
+                "stopped",
+            ))],
             vec![],
             vec![],
         );
@@ -736,6 +793,75 @@ mod tests {
                 .contains("ownership mismatch")
         );
         assert!(ctx.records.lock().unwrap().containers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_volume_collision_with_wrong_owner_token_is_never_recorded() {
+        let name = "gascan-feas-42-case-volume";
+        let ctx = context(
+            vec![output(volume_with(
+                name,
+                "ffeeddccbbaa99887766554433221100",
+            ))],
+            vec![],
+            vec![],
+        );
+        assert!(
+            ctx.reconcile_volume(name)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("ownership mismatch")
+        );
+        assert!(ctx.records.lock().unwrap().volumes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn successful_post_create_verification_records_exact_token() {
+        let container = "gascan-feas-42-case-container";
+        let volume = "gascan-feas-42-case-volume";
+        let ctx = context(
+            vec![
+                output(container_with(container, TOKEN, "running")),
+                output(volume_with(volume, TOKEN)),
+            ],
+            vec![],
+            vec![],
+        );
+        ctx.verify_and_record_container(container, true)
+            .await
+            .unwrap();
+        ctx.verify_and_record_volume(volume).await.unwrap();
+        let records = ctx.records.lock().unwrap();
+        assert_eq!(records.containers, [container]);
+        assert_eq!(records.volumes, [volume]);
+        assert_eq!(records.owner_token, TOKEN);
+    }
+
+    #[tokio::test]
+    async fn owner_token_mismatch_after_stop_prevents_delete() {
+        let name = "gascan-feas-42-case-container";
+        let ctx = context(
+            vec![
+                output(container_with(name, TOKEN, "running")),
+                output(json!(null)),
+                output(container_with(
+                    name,
+                    "ffeeddccbbaa99887766554433221100",
+                    "stopped",
+                )),
+            ],
+            vec![name.into()],
+            vec![],
+        );
+        assert!(
+            ctx.cleanup()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("ownership mismatch")
+        );
+        assert_eq!(ctx.records.lock().unwrap().containers, [name]);
     }
 
     #[tokio::test]
