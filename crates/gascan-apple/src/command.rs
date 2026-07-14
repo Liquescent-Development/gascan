@@ -62,10 +62,14 @@ impl CommandRunner for ProcessRunner {
             })?;
 
         if !spec.stdin.is_empty() {
-            child
+            let stdin = child
                 .stdin
                 .as_mut()
-                .expect("piped stdin is available")
+                .ok_or_else(|| RuntimeError::CommandIo {
+                    operation: operation.clone(),
+                    message: "piped stdin handle is unavailable".to_owned(),
+                })?;
+            stdin
                 .write_all(&spec.stdin)
                 .await
                 .map_err(|error| RuntimeError::CommandIo {
