@@ -37,6 +37,8 @@ Record structured empty attachment evidence and the result before and after gues
 - `http://192.0.2.1` (non-routable adversarial IPv4);
 - the owned host probe reached through the unique temporary `gascan-<128-bit-hex>.test` mapping created by `sudo -n container system dns create --localhost 203.0.113.113 <domain>`.
 
+The default-network control must reach the exact owned host endpoint used by the offline container. Record public DNS plus HTTP and direct external IPv4 reachability as diagnostics, not prerequisite positive controls: their offline failures corroborate isolation but are non-discriminating when the host's Apple containers have no usable WAN path.
+
 ## Cleanup
 
 List every owned resource prefix/token and confirm structured container, volume, network, and `gascan-*.test` DNS lists contain none after cleanup. Record that this mapping is a global DNS/PF mutation, requires administrative access, can disable iCloud Private Relay, and has a PF redirect that Apple removes on restart.

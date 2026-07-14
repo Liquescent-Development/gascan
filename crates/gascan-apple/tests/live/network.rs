@@ -176,12 +176,42 @@ fn has_no_network_attachments(value: &serde_json::Value) -> bool {
         .is_some_and(Vec::is_empty)
 }
 
-fn network_targets(host_url: String) -> [(&'static str, String); 4] {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProbeRole {
+    Diagnostic,
+    DenialOnly,
+    RequiredPositive,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct NetworkTarget {
+    mechanism: &'static str,
+    url: String,
+    role: ProbeRole,
+}
+
+fn network_targets(host_url: String) -> [NetworkTarget; 4] {
     [
-        ("DNS plus external HTTP", "http://example.com".to_owned()),
-        ("direct external IPv4", "http://1.1.1.1".to_owned()),
-        ("TEST-NET IPv4", "http://192.0.2.1".to_owned()),
-        ("owned host DNS/PF mapping", host_url),
+        NetworkTarget {
+            mechanism: "DNS plus external HTTP",
+            url: "http://example.com".to_owned(),
+            role: ProbeRole::Diagnostic,
+        },
+        NetworkTarget {
+            mechanism: "direct external IPv4",
+            url: "http://1.1.1.1".to_owned(),
+            role: ProbeRole::Diagnostic,
+        },
+        NetworkTarget {
+            mechanism: "TEST-NET IPv4",
+            url: "http://192.0.2.1".to_owned(),
+            role: ProbeRole::DenialOnly,
+        },
+        NetworkTarget {
+            mechanism: "owned host DNS/PF mapping",
+            url: host_url,
+            role: ProbeRole::RequiredPositive,
+        },
     ]
 }
 
@@ -201,29 +231,48 @@ async fn offline_workspace_cannot_reach_external_or_host_networks() -> Result<()
     let mut mapping = HostDnsMapping::create().await?;
     let control = LiveContext::new("network-control").await?;
     let targets = network_targets(mapping.url(host.port()));
-    for (mechanism, target) in [&targets[0], &targets[1], &targets[3]] {
-        assert!(
-            control.can_reach(target).await?,
-            "networked positive control failed for {mechanism}: {target}"
+    for target in targets
+        .iter()
+        .filter(|target| target.role == ProbeRole::Diagnostic)
+    {
+        let reachable = control.can_reach(&target.url).await?;
+        eprintln!(
+            "networked diagnostic for {}: reachable={reachable} ({})",
+            target.mechanism, target.url
         );
     }
+    let host_target = targets
+        .iter()
+        .find(|target| target.role == ProbeRole::RequiredPositive)
+        .ok_or("owned host positive control is missing")?;
+    assert!(
+        control.can_reach(&host_target.url).await?,
+        "networked positive control failed for {}: {}",
+        host_target.mechanism,
+        host_target.url
+    );
     control.cleanup().await?;
 
     let ctx = LiveContext::offline("network").await?;
     assert!(has_no_network_attachments(&ctx.inspect().await?));
-    for (mechanism, target) in &targets {
+    for target in &targets {
         assert!(
-            !ctx.can_reach(target).await?,
-            "offline target unexpectedly reachable through {mechanism}: {target}"
+            !ctx.can_reach(&target.url).await?,
+            "offline target unexpectedly reachable through {}: {}",
+            target.mechanism,
+            target.url
         );
     }
     ctx.exec("test -d /workspace && ip link show lo >/dev/null")
         .await?;
     ctx.exec("ip link add gascan0 type dummy 2>/dev/null || true; ip route add default via 192.0.2.1 2>/dev/null || true").await?;
-    for (mechanism, target) in &targets {
+    assert!(has_no_network_attachments(&ctx.inspect().await?));
+    for target in &targets {
         assert!(
-            !ctx.can_reach(target).await?,
-            "guest-root mutation made {mechanism} reachable: {target}"
+            !ctx.can_reach(&target.url).await?,
+            "guest-root mutation made {} reachable: {}",
+            target.mechanism,
+            target.url
         );
     }
     ctx.cleanup().await?;
@@ -242,8 +291,12 @@ mod tests {
     #[test]
     fn target_matrix_uses_busybox_http_and_keeps_all_offline_mechanisms() {
         let targets = network_targets("http://gascan-owner.test:1234".into());
+        assert_eq!(targets[0].role, ProbeRole::Diagnostic);
+        assert_eq!(targets[1].role, ProbeRole::Diagnostic);
+        assert_eq!(targets[2].role, ProbeRole::DenialOnly);
+        assert_eq!(targets[3].role, ProbeRole::RequiredPositive);
         assert_eq!(
-            targets,
+            targets.map(|target| (target.mechanism, target.url)),
             [
                 ("DNS plus external HTTP", "http://example.com".to_owned()),
                 ("direct external IPv4", "http://1.1.1.1".to_owned()),
