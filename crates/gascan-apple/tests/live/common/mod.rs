@@ -112,9 +112,12 @@ impl LiveContext {
             args.extend(publish_args(IpAddr::V4(Ipv4Addr::LOCALHOST), host, guest)?);
         }
         args.extend([
-            IMAGE.to_owned(), "sh".to_owned(), "-c".to_owned(),
+            IMAGE.to_owned(),
+            "sh".to_owned(),
+            "-c".to_owned(),
             if self.publish.is_some() {
-                "while :; do printf 'HTTP/1.0 200 OK\\r\\nContent-Length: 6\\r\\n\\r\\ngascan' | nc -l -p 8080; done".to_owned()
+                "mkdir -p /www; printf gascan > /www/index.html; exec httpd -f -p 8080 -h /www"
+                    .to_owned()
             } else {
                 "while :; do sleep 3600; done".to_owned()
             },
@@ -190,9 +193,11 @@ impl LiveContext {
     }
 
     pub async fn is_running(&self) -> Result<bool, TestError> {
-        Ok(find_status(&self.inspect().await?).is_some_and(|status| {
-            status.eq_ignore_ascii_case("running") || status.starts_with("Up ")
-        }))
+        Ok(
+            container_state(&self.inspect().await?).is_some_and(|status| {
+                status.eq_ignore_ascii_case("running") || status.starts_with("Up ")
+            }),
+        )
     }
 
     async fn run_ok<const N: usize>(&self, args: [&str; N]) -> Result<CommandOutput, TestError> {
@@ -281,16 +286,27 @@ impl Drop for LiveContext {
     }
 }
 
-fn find_status(value: &Value) -> Option<&str> {
+pub fn container_record(value: &Value) -> Option<&Value> {
     match value {
-        Value::Object(fields) => fields
-            .iter()
-            .find(|(key, value)| key.eq_ignore_ascii_case("status") && value.is_string())
-            .and_then(|(_, value)| value.as_str())
-            .or_else(|| fields.values().find_map(find_status)),
-        Value::Array(values) => values.iter().find_map(find_status),
+        Value::Object(_) => Some(value),
+        Value::Array(values) if values.len() == 1 => values.first(),
         _ => None,
     }
+}
+
+pub fn container_state(value: &Value) -> Option<&str> {
+    container_record(value)?
+        .get("status")?
+        .get("state")?
+        .as_str()
+}
+
+pub fn configured_resource(value: &Value, name: &str) -> Option<u64> {
+    container_record(value)?
+        .get("configuration")?
+        .get("resources")?
+        .get(name)?
+        .as_u64()
 }
 
 fn cleanup_command<const N: usize>(args: [&str; N]) {

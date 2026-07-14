@@ -1,4 +1,16 @@
-use super::common::{LiveContext, TestError};
+use serde_json::json;
+
+use super::common::{LiveContext, TestError, container_state};
+
+#[test]
+fn reads_lifecycle_state_from_the_exact_apple_status_path() {
+    let inspect = json!([{
+        "status": {"networks": [], "state": "running"},
+        "configuration": {"status": "not-the-runtime-state"}
+    }]);
+    assert_eq!(container_state(&inspect), Some("running"));
+    assert_eq!(container_state(&json!({"status": "running"})), None);
+}
 
 #[tokio::test]
 #[ignore = "requires Apple silicon macOS 26+ with container service"]

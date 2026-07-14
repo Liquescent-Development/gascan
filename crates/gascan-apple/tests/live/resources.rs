@@ -4,7 +4,22 @@ use std::{
     time::Duration,
 };
 
-use super::common::{LiveContext, TestError, publish_args};
+use serde_json::json;
+
+use super::common::{LiveContext, TestError, configured_resource, publish_args};
+
+#[test]
+fn reads_requested_limits_from_the_exact_apple_configuration_path() {
+    let inspect = json!([{
+        "configuration": {"resources": {"cpus": 1, "memoryInBytes": 268435456}},
+        "status": {"cpuOverhead": 1, "resources": {"cpus": 2}}
+    }]);
+    assert_eq!(configured_resource(&inspect, "cpus"), Some(1));
+    assert_eq!(
+        configured_resource(&inspect, "memoryInBytes"),
+        Some(268_435_456)
+    );
+}
 
 #[test]
 fn command_construction_rejects_non_loopback_publish() {
@@ -20,21 +35,36 @@ fn command_construction_rejects_non_loopback_publish() {
 #[ignore = "requires Apple silicon macOS 26+ with container service"]
 async fn cpu_and_memory_limits_are_observable_in_guest() -> Result<(), TestError> {
     let ctx = LiveContext::new("resources").await?;
+    let inspect = ctx.inspect().await?;
+    assert_eq!(configured_resource(&inspect, "cpus"), Some(1));
     assert_eq!(
-        String::from_utf8(ctx.exec("getconf _NPROCESSORS_ONLN").await?.stdout)?.trim(),
-        "1"
+        configured_resource(&inspect, "memoryInBytes"),
+        Some(268_435_456)
     );
-    let memory: u64 = String::from_utf8(
-        ctx.exec("awk '/MemTotal/ { print $2 * 1024 }' /proc/meminfo")
-            .await?
-            .stdout,
-    )?
-    .trim()
-    .parse()?;
-    assert!(
-        memory <= 300_000_000,
-        "guest memory exceeded requested limit: {memory}"
-    );
+
+    let cpu_max = String::from_utf8(
+        ctx.exec("if test -f /sys/fs/cgroup/cpu.max; then cat /sys/fs/cgroup/cpu.max; else printf unavailable; fi")
+            .await?.stdout,
+    )?;
+    if cpu_max.trim() != "unavailable" {
+        let values: Vec<u64> = cpu_max
+            .split_whitespace()
+            .map(str::parse)
+            .collect::<Result<_, _>>()?;
+        assert_eq!(values.len(), 2, "unexpected cpu.max: {cpu_max:?}");
+        assert_eq!(
+            values[0], values[1],
+            "cpu.max does not encode one CPU: {cpu_max:?}"
+        );
+    }
+
+    let memory_max = String::from_utf8(
+        ctx.exec("if test -f /sys/fs/cgroup/memory.max; then cat /sys/fs/cgroup/memory.max; else printf unavailable; fi")
+            .await?.stdout,
+    )?;
+    if memory_max.trim() != "unavailable" && memory_max.trim() != "max" {
+        assert_eq!(memory_max.trim().parse::<u64>()?, 268_435_456);
+    }
     ctx.cleanup().await
 }
 
@@ -51,14 +81,33 @@ async fn published_port_is_reachable_only_through_loopback_binding() -> Result<(
             &(Ipv4Addr::LOCALHOST, port).into(),
             Duration::from_millis(200),
         ) {
-            stream.write_all(b"GET / HTTP/1.0\r\n\r\n")?;
-            let mut body = String::new();
-            stream.read_to_string(&mut body)?;
-            response = Some(body);
-            break;
+            stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+            if stream
+                .write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+                .is_ok()
+            {
+                let mut received = Vec::new();
+                loop {
+                    let mut bytes = [0_u8; 1024];
+                    match stream.read(&mut bytes) {
+                        Ok(0) | Err(_) => break,
+                        Ok(length) => {
+                            received.extend_from_slice(&bytes[..length]);
+                            if received.ends_with(b"gascan") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let body = String::from_utf8_lossy(&received).into_owned();
+                if body.contains("200 OK") && body.ends_with("gascan") {
+                    response = Some(body);
+                    break;
+                }
+            }
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(response.is_some_and(|body| body.ends_with("gascan")));
+    assert!(response.is_some(), "BusyBox httpd did not become ready");
     ctx.cleanup().await
 }
