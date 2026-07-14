@@ -1,4 +1,9 @@
+use crate::sandbox::SandboxId;
+use async_trait::async_trait;
+use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::net::IpAddr;
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -38,6 +43,199 @@ pub struct RuntimeCapabilities {
     pub offline: NetworkIsolation,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OwnershipMetadata {
+    pub managed_by: String,
+    pub sandbox_id: SandboxId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CreateRequest {
+    pub id: SandboxId,
+    pub image: String,
+    pub bind_mounts: Vec<RuntimeBindMount>,
+    pub volumes: Vec<RuntimeVolume>,
+    pub ports: Vec<RuntimePort>,
+    pub environment: BTreeMap<String, String>,
+    pub resources: RuntimeResourceLimits,
+    pub network: RuntimeNetwork,
+    pub user: RuntimeUser,
+    pub ownership: OwnershipMetadata,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeBindMount {
+    pub source: Utf8PathBuf,
+    pub target: Utf8PathBuf,
+    pub writable: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeVolume {
+    pub name: String,
+    pub target: Utf8PathBuf,
+    pub writable: bool,
+    pub ownership: OwnershipMetadata,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimePort {
+    pub host_address: IpAddr,
+    pub host_port: u16,
+    pub guest_port: u16,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeResourceLimits {
+    pub cpus: Option<u16>,
+    pub memory_bytes: Option<u64>,
+    pub disk_bytes: Option<u64>,
+    pub process_count: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeNetwork {
+    Networked,
+    Offline,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeUser {
+    Workspace,
+    Root,
+}
+
+impl CreateRequest {
+    /// Policy-shaped request for backend contract tests and downstream adapter fixtures.
+    pub fn fixture(id: SandboxId) -> Self {
+        Self {
+            ownership: OwnershipMetadata {
+                managed_by: "gascan".to_owned(),
+                sandbox_id: id.clone(),
+            },
+            id,
+            image: "fixture.invalid/workspace@sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+            bind_mounts: vec![RuntimeBindMount {
+                source: Utf8PathBuf::from("/tmp/code"),
+                target: Utf8PathBuf::from("/workspace"),
+                writable: true,
+            }],
+            volumes: Vec::new(),
+            ports: vec![RuntimePort {
+                host_address: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                host_port: 3000,
+                guest_port: 3000,
+            }],
+            environment: BTreeMap::new(),
+            resources: RuntimeResourceLimits::default(),
+            network: RuntimeNetwork::Offline,
+            user: RuntimeUser::Workspace,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerState {
+    Creating,
+    Running,
+    Stopped,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeSandbox {
+    pub id: SandboxId,
+    pub state: ContainerState,
+    pub ownership: OwnershipMetadata,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExecRequest {
+    pub id: SandboxId,
+    pub argv: Vec<String>,
+    pub stdin: Vec<u8>,
+    pub environment: BTreeMap<String, String>,
+    pub tty: bool,
+}
+
+impl ExecRequest {
+    /// Byte-safe request fixture; it deliberately bypasses no sandbox-ID validation.
+    pub fn fixture<I, S>(id: SandboxId, argv: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            id,
+            argv: argv.into_iter().map(Into::into).collect(),
+            stdin: Vec::new(),
+            environment: BTreeMap::new(),
+            tty: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecSession {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    exit_code: i32,
+}
+
+impl ExecSession {
+    pub fn from_output(stdout: Vec<u8>, stderr: Vec<u8>, exit_code: i32) -> Self {
+        Self {
+            stdout,
+            stderr,
+            exit_code,
+        }
+    }
+
+    pub fn stdout(&self) -> &[u8] {
+        &self.stdout
+    }
+    pub fn stderr(&self) -> &[u8] {
+        &self.stderr
+    }
+    pub const fn exit_code(&self) -> i32 {
+        self.exit_code
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OwnedResource {
+    pub id: SandboxId,
+    pub ownership: OwnershipMetadata,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimeCall {
+    Capabilities,
+    Inspect(SandboxId),
+    Create(CreateRequest),
+    Start(SandboxId),
+    Stop(SandboxId),
+    Remove(SandboxId),
+    Exec(ExecRequest),
+    Logs(SandboxId),
+    ListOwned,
+}
+
+#[async_trait]
+pub trait RuntimeBackend: Send + Sync {
+    async fn capabilities(&self) -> Result<RuntimeCapabilities, RuntimeError>;
+    async fn inspect(&self, id: &SandboxId) -> Result<Option<RuntimeSandbox>, RuntimeError>;
+    async fn create(&self, request: CreateRequest) -> Result<(), RuntimeError>;
+    async fn start(&self, id: &SandboxId) -> Result<(), RuntimeError>;
+    async fn stop(&self, id: &SandboxId) -> Result<(), RuntimeError>;
+    async fn remove(&self, id: &SandboxId) -> Result<(), RuntimeError>;
+    async fn exec(&self, request: ExecRequest) -> Result<ExecSession, RuntimeError>;
+    async fn logs(&self, id: &SandboxId) -> Result<Vec<u8>, RuntimeError>;
+    async fn list_owned(&self) -> Result<Vec<OwnedResource>, RuntimeError>;
+}
+
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum RuntimeError {
@@ -68,4 +266,28 @@ pub enum RuntimeError {
     OwnershipMismatch { resource: String },
     #[error("resource conflict for {resource}: {message}")]
     Conflict { resource: String, message: String },
+    #[error("resource not found: {resource}")]
+    NotFound { resource: String },
+    #[error("invalid state for {resource}: {message}")]
+    InvalidState { resource: String, message: String },
+    #[error("injected failure at {boundary}")]
+    InjectedFailure { boundary: String },
+}
+
+impl RuntimeError {
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::CommandIo { .. } => "command_io",
+            Self::CommandFailed { .. } => "command_failed",
+            Self::InvalidOutput { .. } => "invalid_output",
+            Self::HelperError { .. } => "helper_error",
+            Self::UnsupportedVersion { .. } => "unsupported_version",
+            Self::UnsupportedCapability { .. } => "unsupported_capability",
+            Self::OwnershipMismatch { .. } => "ownership_mismatch",
+            Self::Conflict { .. } => "resource_conflict",
+            Self::NotFound { .. } => "not_found",
+            Self::InvalidState { .. } => "invalid_state",
+            Self::InjectedFailure { .. } => "injected_failure",
+        }
+    }
 }

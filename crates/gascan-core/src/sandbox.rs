@@ -24,6 +24,13 @@ impl SandboxId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Builds a deterministic, valid identity for public test fixtures.
+    ///
+    /// Production identities must continue to enter through [`Self::from_root`].
+    pub fn test(name: &str) -> Self {
+        Self::from_root(name, Utf8Path::new("/gascan/test-fixture"))
+    }
 }
 
 impl TryFrom<String> for SandboxId {
