@@ -1,0 +1,138 @@
+syntax = "proto3";
+
+package gascan.v1;
+
+import "google/protobuf/timestamp.proto";
+
+service GasCan {
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+  rpc Status(StatusRequest) returns (StatusResponse);
+  rpc List(ListRequest) returns (ListResponse);
+  rpc Doctor(DoctorRequest) returns (DoctorResponse);
+  rpc Up(UpRequest) returns (stream OperationEvent);
+  rpc Apply(ApplyRequest) returns (stream OperationEvent);
+  rpc Run(RunRequest) returns (stream OperationEvent);
+  rpc Shell(ShellRequest) returns (stream OperationEvent);
+  rpc Down(DownRequest) returns (stream OperationEvent);
+  rpc Destroy(DestroyRequest) returns (stream OperationEvent);
+  rpc Logs(LogsRequest) returns (stream OperationEvent);
+  rpc Attach(stream ClientFrame) returns (stream ServerFrame);
+}
+
+message OperationId { uint64 value = 1; reserved 2; }
+
+enum DesiredState {
+  DESIRED_STATE_UNSPECIFIED = 0;
+  DESIRED_STATE_RUNNING = 1;
+  DESIRED_STATE_STOPPED = 2;
+  DESIRED_STATE_ABSENT = 3;
+}
+
+enum ActualState {
+  ACTUAL_STATE_UNSPECIFIED = 0;
+  ACTUAL_STATE_PENDING = 1;
+  ACTUAL_STATE_RUNNING = 2;
+  ACTUAL_STATE_STOPPED = 3;
+  ACTUAL_STATE_ABSENT = 4;
+  ACTUAL_STATE_FAILED = 5;
+  ACTUAL_STATE_UNKNOWN = 6;
+}
+
+message Capability {
+  string name = 1;
+  bool available = 2;
+  string detail = 3;
+  reserved 4;
+}
+
+message Error {
+  string code = 1;
+  string message = 2;
+  bytes details = 3;
+  reserved 4;
+}
+
+message TransportSecurity {
+  bool local_only = 1;
+  uint32 socket_directory_mode = 2;
+  uint32 socket_mode = 3;
+  bool require_same_user = 4;
+  reserved 5;
+}
+
+message HandshakeRequest {
+  uint32 api_major = 1;
+  uint32 api_minor = 2;
+  repeated string requested_capabilities = 3;
+  reserved 4;
+}
+
+message HandshakeResponse {
+  uint32 api_major = 1;
+  uint32 api_minor = 2;
+  repeated Capability capabilities = 3;
+  TransportSecurity transport_security = 4;
+  Error rejection = 5;
+  reserved 6;
+}
+
+message SandboxSelector { string sandbox_id = 1; reserved 2; }
+message ManifestPayload { bytes content = 1; string format = 2; reserved 3; }
+message CommandPayload { repeated bytes argv = 1; bytes stdin = 2; reserved 3; }
+
+message UpRequest { ManifestPayload manifest = 1; reserved 2; }
+message ApplyRequest { ManifestPayload manifest = 1; reserved 2; }
+message RunRequest { SandboxSelector sandbox = 1; CommandPayload command = 2; reserved 3; }
+message ShellRequest { SandboxSelector sandbox = 1; repeated bytes argv = 2; reserved 3; }
+message DownRequest { SandboxSelector sandbox = 1; reserved 2; }
+message DestroyRequest { SandboxSelector sandbox = 1; reserved 2; }
+message LogsRequest { SandboxSelector sandbox = 1; google.protobuf.Timestamp since = 2; bool follow = 3; reserved 4; }
+
+message OperationEvent {
+  OperationId operation_id = 1;
+  google.protobuf.Timestamp timestamp = 2;
+  string phase = 3;
+  bytes payload = 4;
+  Error error = 5;
+  reserved 6;
+}
+
+message StatusRequest { SandboxSelector sandbox = 1; reserved 2; }
+message SandboxStatus {
+  string sandbox_id = 1;
+  DesiredState desired_state = 2;
+  ActualState actual_state = 3;
+  OperationId last_operation_id = 4;
+  google.protobuf.Timestamp updated_at = 5;
+  repeated Capability capabilities = 6;
+  reserved 7;
+}
+message StatusResponse { SandboxStatus sandbox = 1; reserved 2; }
+message ListRequest { reserved 1; }
+message ListResponse { repeated SandboxStatus sandboxes = 1; reserved 2; }
+message DoctorRequest { reserved 1; }
+message DoctorResponse { repeated Capability capabilities = 1; repeated Error findings = 2; reserved 3; }
+
+message Resize { uint32 columns = 1; uint32 rows = 2; reserved 3; }
+message Signal { int32 number = 1; reserved 2; }
+message Close { reserved 1; }
+message ClientFrame {
+  oneof frame {
+    bytes stdin = 1;
+    Resize resize = 2;
+    Signal signal = 3;
+    Close close = 4;
+  }
+  reserved 5;
+}
+
+message Exit { int32 code = 1; int32 signal = 2; reserved 3; }
+message ServerFrame {
+  oneof frame {
+    bytes stdout = 1;
+    bytes stderr = 2;
+    Exit exit = 3;
+    Error error = 4;
+  }
+  reserved 5;
+}
