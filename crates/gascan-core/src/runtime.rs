@@ -60,6 +60,8 @@ pub struct CreateRequest {
     pub resources: RuntimeResourceLimits,
     pub network: RuntimeNetwork,
     pub user: RuntimeUser,
+    /// Requires the backend to run the workspace under an init process.
+    pub init: bool,
     pub ownership: OwnershipMetadata,
 }
 
@@ -132,6 +134,7 @@ impl CreateRequest {
             resources: RuntimeResourceLimits::default(),
             network: RuntimeNetwork::Offline,
             user: RuntimeUser::Workspace,
+            init: true,
         }
     }
 }

@@ -3,5 +3,6 @@
 
 pub mod fake_runtime;
 pub mod manifest;
+pub mod policy;
 pub mod runtime;
 pub mod sandbox;
