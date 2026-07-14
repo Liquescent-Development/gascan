@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::{
+    collections::HashSet,
     fs,
     io::Read,
     net::{IpAddr, Ipv4Addr},
@@ -26,6 +27,8 @@ struct Records {
     networks: Vec<String>,
     paths: Vec<PathBuf>,
     owner_token: String,
+    usable_containers: HashSet<String>,
+    usable_volumes: HashSet<String>,
 }
 
 pub struct LiveContext {
@@ -88,7 +91,10 @@ impl LiveContext {
             ])
             .await;
         match volume_result {
-            Ok(_) => ctx.verify_and_record_volume(&ctx.volume).await?,
+            Ok(_) => {
+                ctx.record_pending_volume(&ctx.volume);
+                ctx.verify_and_mark_volume(&ctx.volume, false).await?;
+            }
             Err(create_error) => {
                 if let Err(reconcile_error) = ctx.reconcile_volume(&ctx.volume).await {
                     return Err(format!(
@@ -142,7 +148,10 @@ impl LiveContext {
         }
         args.extend(guest_argv(self.publish.is_some()));
         match self.run_vec(args).await {
-            Ok(_) => self.verify_and_record_container(&name, true).await,
+            Ok(_) => {
+                self.record_pending_container(&name);
+                self.verify_and_mark_container(&name, true, false).await
+            }
             Err(create_error) => {
                 if let Err(reconcile_error) = self.reconcile_container(&name).await {
                     return Err(format!(
@@ -256,13 +265,21 @@ impl LiveContext {
     }
 
     async fn reconcile_container(&self, name: &str) -> Result<(), TestError> {
-        self.verify_and_record_container(name, false).await
+        self.verify_and_mark_container(name, false, true).await
     }
 
-    async fn verify_and_record_container(
+    fn record_pending_container(&self, name: &str) {
+        let mut records = self.records.lock().unwrap();
+        if !records.containers.iter().any(|item| item == name) {
+            records.containers.push(name.to_owned());
+        }
+    }
+
+    async fn verify_and_mark_container(
         &self,
         name: &str,
         require_present: bool,
+        record_on_success: bool,
     ) -> Result<(), TestError> {
         let Some(value) = self.inspect_container_if_present(name).await? else {
             return if require_present {
@@ -275,11 +292,11 @@ impl LiveContext {
             };
         };
         require_owned_container(&value, name, &self.prefix, &self.owner_token)?;
-        self.records
-            .lock()
-            .unwrap()
-            .containers
-            .push(name.to_owned());
+        let mut records = self.records.lock().unwrap();
+        if record_on_success && !records.containers.iter().any(|item| item == name) {
+            records.containers.push(name.to_owned());
+        }
+        records.usable_containers.insert(name.to_owned());
         Ok(())
     }
 
@@ -290,30 +307,47 @@ impl LiveContext {
             None => Ok(()),
             Some(record) => {
                 require_owned_volume(record, name, &self.prefix, &self.owner_token)?;
-                self.records.lock().unwrap().volumes.push(name.to_owned());
+                let mut records = self.records.lock().unwrap();
+                if !records.volumes.iter().any(|item| item == name) {
+                    records.volumes.push(name.to_owned());
+                }
+                records.usable_volumes.insert(name.to_owned());
                 Ok(())
             }
         }
     }
 
-    async fn verify_and_record_volume(&self, name: &str) -> Result<(), TestError> {
+    fn record_pending_volume(&self, name: &str) {
+        let mut records = self.records.lock().unwrap();
+        if !records.volumes.iter().any(|item| item == name) {
+            records.volumes.push(name.to_owned());
+        }
+    }
+
+    async fn verify_and_mark_volume(
+        &self,
+        name: &str,
+        record_on_success: bool,
+    ) -> Result<(), TestError> {
         let output = self.run_ok(["volume", "list", "--format", "json"]).await?;
         let value: Value = serde_json::from_slice(&output.stdout)?;
         let record = volume_record(&value, name).ok_or_else(|| {
             format!("created volume {name} is absent during ownership verification")
         })?;
         require_owned_volume(record, name, &self.prefix, &self.owner_token)?;
-        self.records.lock().unwrap().volumes.push(name.to_owned());
+        let mut records = self.records.lock().unwrap();
+        if record_on_success && !records.volumes.iter().any(|item| item == name) {
+            records.volumes.push(name.to_owned());
+        }
+        records.usable_volumes.insert(name.to_owned());
         Ok(())
     }
 
     async fn delete_container(&self, name: &str) -> Result<(), TestError> {
         let Some(value) = self.inspect_container_if_present(name).await? else {
-            self.records
-                .lock()
-                .unwrap()
-                .containers
-                .retain(|item| item != name);
+            let mut records = self.records.lock().unwrap();
+            records.containers.retain(|item| item != name);
+            records.usable_containers.remove(name);
             return Ok(());
         };
         require_owned_container(&value, name, &self.prefix, &self.owner_token)?;
@@ -324,11 +358,9 @@ impl LiveContext {
         let value: Value = serde_json::from_slice(&inspect.stdout)?;
         require_owned_container(&value, name, &self.prefix, &self.owner_token)?;
         self.run_ok(["delete", name]).await?;
-        self.records
-            .lock()
-            .unwrap()
-            .containers
-            .retain(|item| item != name);
+        let mut records = self.records.lock().unwrap();
+        records.containers.retain(|item| item != name);
+        records.usable_containers.remove(name);
         Ok(())
     }
 
@@ -368,19 +400,17 @@ impl LiveContext {
         let volumes = self.records.lock().unwrap().volumes.clone();
         for name in volumes.into_iter().rev() {
             match self.verify_volume(&name).await {
-                Ok(false) => self
-                    .records
-                    .lock()
-                    .unwrap()
-                    .volumes
-                    .retain(|item| item != &name),
+                Ok(false) => {
+                    let mut records = self.records.lock().unwrap();
+                    records.volumes.retain(|item| item != &name);
+                    records.usable_volumes.remove(&name);
+                }
                 Ok(true) => match self.run_ok(["volume", "delete", &name]).await {
-                    Ok(_) => self
-                        .records
-                        .lock()
-                        .unwrap()
-                        .volumes
-                        .retain(|item| item != &name),
+                    Ok(_) => {
+                        let mut records = self.records.lock().unwrap();
+                        records.volumes.retain(|item| item != &name);
+                        records.usable_volumes.remove(&name);
+                    }
                     Err(error) => errors.push(format!("volume {name}: {error}")),
                 },
                 Err(error) => errors.push(format!("volume {name}: {error}")),
@@ -863,14 +893,63 @@ mod tests {
             vec![],
             vec![],
         );
-        ctx.verify_and_record_container(container, true)
+        ctx.record_pending_container(container);
+        ctx.verify_and_mark_container(container, true, false)
             .await
             .unwrap();
-        ctx.verify_and_record_volume(volume).await.unwrap();
+        ctx.record_pending_volume(volume);
+        ctx.verify_and_mark_volume(volume, false).await.unwrap();
         let records = ctx.records.lock().unwrap();
         assert_eq!(records.containers, [container]);
         assert_eq!(records.volumes, [volume]);
         assert_eq!(records.owner_token, TOKEN);
+        assert_eq!(records.usable_containers.len(), 1);
+        assert_eq!(records.usable_volumes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn transient_post_create_inspect_failure_leaves_pending_for_safe_cleanup_retry() {
+        let name = "gascan-feas-42-case-container";
+        let owned = container_with(name, TOKEN, "stopped");
+        let listed = json!([{"configuration":{"id":name}}]);
+        let ctx = context(
+            vec![
+                failure(),
+                output(listed),
+                output(owned.clone()),
+                output(owned),
+                output(json!(null)),
+            ],
+            vec![],
+            vec![],
+        );
+        ctx.record_pending_container(name);
+        assert!(
+            ctx.verify_and_mark_container(name, true, false)
+                .await
+                .is_err()
+        );
+        assert_eq!(ctx.records.lock().unwrap().containers, [name]);
+        assert!(ctx.records.lock().unwrap().usable_containers.is_empty());
+        ctx.cleanup().await.unwrap();
+        assert!(ctx.records.lock().unwrap().containers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_wrong_token_is_retained_and_never_deleted() {
+        let name = "gascan-feas-42-case-container";
+        let ctx = context(
+            vec![output(container_with(
+                name,
+                "ffeeddccbbaa99887766554433221100",
+                "stopped",
+            ))],
+            vec![name.into()],
+            vec![],
+        );
+        assert!(ctx.cleanup().await.is_err());
+        assert_eq!(ctx.records.lock().unwrap().containers, [name]);
+        assert!(ctx.records.lock().unwrap().usable_containers.is_empty());
     }
 
     #[tokio::test]
