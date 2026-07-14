@@ -126,6 +126,6 @@ When each gate passes, update this section in a dedicated commit with the commit
 |---|---|---|---|
 | 1 — Probe seam freeze | workspace tests and reviewed probe contracts | `48a7a18` | passed |
 | 2 — Apple feasibility | `docs/feasibility/apple-container-report.md` | `6bedef8` | passed |
-| 3 — Fake E2E | core/daemon/CLI test transcript | not-run | pending |
+| 3 — Fake E2E | `docs/evidence/gate-3-fake-e2e.md` | `7c7d083` | passed |
 | 4 — Real lifecycle | Apple integration test transcript | not-run | pending |
 | 5 — Release | clean-host and security reports | not-run | pending |
