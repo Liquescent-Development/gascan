@@ -1,13 +1,13 @@
 use crate::runtime::{
     ContainerState, CreateOutcome, CreateRequest, ExecRequest, ExecSession, RemoveRequest,
     ResourceIdentity, ResourceKind, ResourceOwnership, RuntimeBackend, RuntimeCall,
-    RuntimeCapabilities, RuntimeError, RuntimeResource, RuntimeSandbox,
+    RuntimeCapabilities, RuntimeError, RuntimeOutcome, RuntimeResource, RuntimeSandbox,
 };
 use crate::sandbox::SandboxId;
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 #[derive(Clone)]
 pub struct FakeRuntime {
@@ -47,7 +47,9 @@ struct FakeState {
     capabilities: RuntimeCapabilities,
     sandboxes: HashMap<SandboxId, RuntimeSandbox>,
     resources: HashMap<ResourceIdentity, RuntimeResource>,
+    gates: HashMap<FailureBoundary, Arc<Semaphore>>,
     calls: Vec<RuntimeCall>,
+    outcomes: Vec<RuntimeOutcome>,
     failures: HashSet<FailureBoundary>,
     exec_result: ExecSession,
     logs: Vec<u8>,
@@ -60,7 +62,9 @@ impl FakeRuntime {
                 capabilities,
                 sandboxes: HashMap::new(),
                 resources: HashMap::new(),
+                gates: HashMap::new(),
                 calls: Vec::new(),
+                outcomes: Vec::new(),
                 failures: HashSet::new(),
                 exec_result: ExecSession::from_output(Vec::new(), Vec::new(), 0),
                 logs: Vec::new(),
@@ -78,6 +82,28 @@ impl FakeRuntime {
 
     pub async fn calls(&self) -> Vec<RuntimeCall> {
         self.inner.lock().await.calls.clone()
+    }
+
+    pub async fn outcomes(&self) -> Vec<RuntimeOutcome> {
+        self.inner.lock().await.outcomes.clone()
+    }
+
+    pub async fn gate(&self, boundary: FailureBoundary) {
+        self.inner
+            .lock()
+            .await
+            .gates
+            .insert(boundary, Arc::new(Semaphore::new(0)));
+    }
+
+    pub async fn release(&self, boundary: FailureBoundary, permits: usize) {
+        if let Some(gate) = self.inner.lock().await.gates.get(&boundary).cloned() {
+            gate.add_permits(permits);
+        }
+    }
+
+    pub async fn inject_failure(&self, boundary: FailureBoundary) {
+        self.inner.lock().await.failures.insert(boundary);
     }
 
     pub async fn seed_unowned(&self, id: SandboxId) {
@@ -173,6 +199,15 @@ impl FakeRuntime {
     }
 }
 
+async fn wait_gate(runtime: &FakeRuntime, boundary: FailureBoundary) {
+    let gate = runtime.inner.lock().await.gates.get(&boundary).cloned();
+    if let Some(gate) = gate {
+        if let Ok(permit) = gate.acquire().await {
+            permit.forget();
+        }
+    }
+}
+
 fn insert_container_resource(state: &mut FakeState, id: SandboxId, ownership: ResourceOwnership) {
     if let Ok(identity) = ResourceIdentity::new(ResourceKind::Container, id.to_string()) {
         state.resources.insert(
@@ -190,6 +225,10 @@ impl Default for FakeRuntime {
 
 fn fail_once(state: &mut FakeState, boundary: FailureBoundary) -> Result<(), RuntimeError> {
     if state.failures.remove(&boundary) {
+        state.outcomes.push(RuntimeOutcome::Failure {
+            boundary: boundary.as_str().to_owned(),
+            code: "injected_failure".to_owned(),
+        });
         return Err(RuntimeError::InjectedFailure {
             boundary: boundary.as_str().to_owned(),
         });
@@ -272,12 +311,21 @@ impl RuntimeBackend for FakeRuntime {
         );
         state.resources.insert(identity, resource.clone());
         created.push(resource);
-        CreateOutcome::new(created)
+        let outcome = CreateOutcome::new(created)?;
+        state
+            .outcomes
+            .push(RuntimeOutcome::Created(outcome.clone()));
+        Ok(outcome)
     }
 
     async fn start(&self, id: &SandboxId) -> Result<(), RuntimeError> {
+        self.inner
+            .lock()
+            .await
+            .calls
+            .push(RuntimeCall::Start(id.clone()));
+        wait_gate(self, FailureBoundary::Start).await;
         let mut state = self.inner.lock().await;
-        state.calls.push(RuntimeCall::Start(id.clone()));
         fail_once(&mut state, FailureBoundary::Start)?;
         state
             .sandboxes
@@ -333,6 +381,7 @@ impl RuntimeBackend for FakeRuntime {
                 }
             }
         }
+        state.outcomes.push(RuntimeOutcome::Removed(request));
         Ok(())
     }
 

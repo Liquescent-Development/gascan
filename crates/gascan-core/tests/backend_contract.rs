@@ -4,7 +4,7 @@ use common::{capabilities, create_request};
 use gascan_core::fake_runtime::{FailureBoundary, FakeRuntime};
 use gascan_core::runtime::{
     ExecRequest, RemoveRequest, ResourceKind, ResourceOwnership, RuntimeBackend, RuntimeCall,
-    RuntimeError,
+    RuntimeError, RuntimeOutcome,
 };
 use gascan_core::sandbox::SandboxId;
 
@@ -169,7 +169,7 @@ async fn literal_requests_are_recorded_in_order() {
     let create = fixture.request();
     let id = create.id().clone();
     let exec = ExecRequest::fixture(id.clone(), ["printf", "%s", "literal value"]);
-    backend.create(create.clone()).await.unwrap();
+    let outcome = backend.create(create.clone()).await.unwrap();
     backend.start(&id).await.unwrap();
     backend.exec(exec.clone()).await.unwrap();
 
@@ -180,6 +180,10 @@ async fn literal_requests_are_recorded_in_order() {
             RuntimeCall::Start(id.clone()),
             RuntimeCall::Exec(exec),
         ]
+    );
+    assert_eq!(
+        backend.outcomes().await,
+        vec![RuntimeOutcome::Created(outcome)]
     );
 }
 

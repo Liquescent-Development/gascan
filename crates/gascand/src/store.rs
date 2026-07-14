@@ -245,6 +245,46 @@ impl Store {
         collect_rows(rows)
     }
 
+    pub fn append_operation_event(
+        &self,
+        operation_id: i64,
+        details: Value,
+    ) -> Result<OperationEvent, StoreError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let operation = load_operation(&transaction, operation_id)?
+            .ok_or(StoreError::OperationNotFound(operation_id))?;
+        if operation.status != OperationStatus::Pending {
+            return Err(StoreError::InvalidTransition {
+                from: operation.status.as_db().to_owned(),
+                to: OperationStatus::Pending.as_db().to_owned(),
+            });
+        }
+        let encoded = serde_json::to_string(&details)?;
+        transaction.execute(
+            "INSERT INTO operation_events (operation_id, status, details) VALUES (?1, ?2, ?3)",
+            params![operation_id, OperationStatus::Pending.as_db(), encoded],
+        )?;
+        let sequence = transaction.last_insert_rowid();
+        transaction.commit()?;
+        Ok(OperationEvent {
+            sequence,
+            operation_id,
+            status: OperationStatus::Pending,
+            details: Some(details),
+        })
+    }
+
+    pub fn latest_operation(&self) -> Result<Option<OperationRecord>, StoreError> {
+        let connection = self.lock()?;
+        let mut statement =
+            connection.prepare(&format!("{OPERATION_SELECT} ORDER BY id DESC LIMIT 1"))?;
+        statement
+            .query_row([], operation_from_row)
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     fn finish_operation(
         &self,
         id: i64,

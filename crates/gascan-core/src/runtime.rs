@@ -426,6 +426,13 @@ pub enum RuntimeCall {
     ListResources,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimeOutcome {
+    Created(CreateOutcome),
+    Removed(RemoveRequest),
+    Failure { boundary: String, code: String },
+}
+
 #[async_trait]
 pub trait RuntimeBackend: Send + Sync {
     async fn capabilities(&self) -> Result<RuntimeCapabilities, RuntimeError>;
