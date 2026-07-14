@@ -455,22 +455,36 @@ pub fn exact_workspace_bind<'a>(value: &'a Value, source: &Path) -> Option<&'a V
         .get("configuration")?
         .get("mounts")?
         .as_array()?;
-    let mut binds = mounts.iter().filter(|mount| {
-        mount
-            .get("type")
-            .and_then(Value::as_object)
-            .is_some_and(|kind| {
-                kind.len() == 1 && kind.get("virtiofs") == Some(&Value::Object(Default::default()))
-            })
-    });
-    let mount = binds.next()?;
-    if binds.next().is_some()
+    let mut workspace_mounts = mounts
+        .iter()
+        .filter(|mount| mount.get("destination").and_then(Value::as_str) == Some("/workspace"));
+    let mount = workspace_mounts.next()?;
+    let exact_virtiofs = mount
+        .get("type")
+        .and_then(Value::as_object)
+        .is_some_and(|kind| {
+            kind.len() == 1 && kind.get("virtiofs") == Some(&Value::Object(Default::default()))
+        });
+    let broader_source_exists = mounts
+        .iter()
+        .filter(|candidate| !std::ptr::eq(*candidate, mount))
+        .any(|candidate| {
+            candidate
+                .get("source")
+                .and_then(Value::as_str)
+                .map(Path::new)
+                .is_some_and(|candidate_source| {
+                    candidate_source != source && source.starts_with(candidate_source)
+                })
+        });
+    if workspace_mounts.next().is_some()
+        || !exact_virtiofs
         || mount.get("source").and_then(Value::as_str) != source.to_str()
-        || mount.get("destination").and_then(Value::as_str) != Some("/workspace")
         || mount
             .get("options")
             .and_then(Value::as_array)
             .is_some_and(|options| options.iter().any(|option| option.as_str() == Some("ro")))
+        || broader_source_exists
     {
         return None;
     }
