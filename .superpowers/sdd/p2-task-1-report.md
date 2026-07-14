@@ -206,3 +206,51 @@ Result: exit 0; strict all-target clippy passed; 16 core integration tests passe
 ### Remaining Concern
 
 - As before, execution-time filesystem race resistance is owned by the later setup execution policy; Task 1 validates at manifest load and spec construction boundaries.
+
+## Controller Fix Cycle 3
+
+### Finding Addressed
+
+- Removed `Deserialize` from the public validated `Resources` type, sealing the standalone Serde construction path that could create an invalid zero-CPU policy.
+- Added a private `RawResources` deserialization schema with `deny_unknown_fields`; `RawManifest::validate` now checks CPU policy and converts the private raw values into `Resources` only inside the manifest validation boundary.
+- Preserved `ResourceSize`'s checked positive-unit parsing, resource-size overflow rejection, unknown resource-key rejection, and existing validation error text.
+
+### RED Evidence
+
+Command after adding the focused public-API regression and before changing production behavior:
+
+```text
+cargo test -p gascan-core --doc
+```
+
+Result: exit 101. The `compile_fail` regression failed with `Test compiled successfully, but it's marked compile_fail.` because `toml::from_str::<Resources>("cpus = 0")` was still accepted by the type system.
+
+### GREEN Evidence
+
+Focused command:
+
+```text
+cargo fmt --all && cargo test -p gascan-core --test manifest --test sandbox_identity && cargo test -p gascan-core --doc
+```
+
+Result: exit 0; 8 manifest tests, 7 sandbox identity tests, and the focused `Resources` compile-fail doctest passed, 0 failed.
+
+Fresh full verification command:
+
+```text
+cargo test -p gascan-core && cargo clippy -p gascan-core --all-targets -- -D warnings && cargo fmt --all -- --check && git diff --check
+```
+
+Result: exit 0; 16 core integration tests and 1 compile-fail doctest passed, 0 failed; strict all-target clippy, formatting, and diff checks passed.
+
+### Controller-Fix Self-Review
+
+- Construction boundary: `Resources` no longer implements `Deserialize`; only private `RawResources` accepts manifest input, and conversion occurs after the zero-CPU check.
+- Strictness: `RawResources` retains `deny_unknown_fields`, while `ResourceSize` continues rejecting zero sizes, invalid units, and checked-arithmetic overflow with the existing messages.
+- API regression: the compile-fail doctest directly proves external code cannot deserialize standalone `Resources`; it failed against the prior implementation and passed after the fix.
+- Production constraints: no unsafe code, unwraps, expects, or panics were introduced.
+- Scope: only Task 1 manifest source and this report changed; no Task 2 or Apple paths changed.
+
+### Remaining Concern
+
+- `NetworkMode` and `UserMode` remain independently deserializable value enums, but they contain no invalid representable policy state; validated aggregate construction remains sealed behind `Manifest::load`.

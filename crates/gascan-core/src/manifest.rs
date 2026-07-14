@@ -158,9 +158,27 @@ impl GascampSource {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+/// Validated resource policy loaded as part of a [`Manifest`].
+///
+/// Resource policy cannot be deserialized independently of the manifest's
+/// validation boundary.
+///
+/// ```compile_fail
+/// use gascan_core::manifest::Resources;
+///
+/// let _: Resources = toml::from_str("cpus = 0")?;
+/// # Ok::<(), toml::de::Error>(())
+/// ```
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct Resources {
+    cpus: Option<u16>,
+    memory: Option<ResourceSize>,
+    disk: Option<ResourceSize>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawResources {
     cpus: Option<u16>,
     memory: Option<ResourceSize>,
     disk: Option<ResourceSize>,
@@ -267,7 +285,7 @@ struct RawManifest {
     gascamp: Option<String>,
     setup: Option<Utf8PathBuf>,
     #[serde(default)]
-    resources: Resources,
+    resources: RawResources,
     #[serde(default)]
     tools: BTreeMap<String, String>,
     #[serde(default)]
@@ -286,6 +304,11 @@ impl RawManifest {
                 "resources.cpus must be greater than zero".to_owned(),
             ));
         }
+        let resources = Resources {
+            cpus: self.resources.cpus,
+            memory: self.resources.memory,
+            disk: self.resources.disk,
+        };
         if let Some(setup) = self.setup.as_deref() {
             validate_workspace_relative_path("setup", setup)?;
             validate_setup_containment(canonical_root, setup)?;
@@ -314,7 +337,7 @@ impl RawManifest {
             user: self.user,
             gascamp,
             setup: self.setup,
-            resources: self.resources,
+            resources,
             tools: self.tools,
             ports: self.ports,
             canonical_root: canonical_root.to_owned(),
