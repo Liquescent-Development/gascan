@@ -55,7 +55,7 @@ impl Manifest {
             user: UserMode::Workspace,
             gascamp: GascampSource::bundled(),
             setup: None,
-            resources: Resources::default(),
+            resources: Resources::empty(),
             tools: BTreeMap::new(),
             ports: BTreeMap::new(),
             canonical_root,
@@ -169,7 +169,13 @@ impl GascampSource {
 /// let _: Resources = toml::from_str("cpus = 0")?;
 /// # Ok::<(), toml::de::Error>(())
 /// ```
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+///
+/// ```compile_fail
+/// use gascan_core::manifest::Resources;
+///
+/// let _ = Resources::default();
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct Resources {
     cpus: Option<u16>,
     memory: Option<ResourceSize>,
@@ -185,6 +191,14 @@ struct RawResources {
 }
 
 impl Resources {
+    const fn empty() -> Self {
+        Self {
+            cpus: None,
+            memory: None,
+            disk: None,
+        }
+    }
+
     pub const fn cpus(&self) -> Option<u16> {
         self.cpus
     }

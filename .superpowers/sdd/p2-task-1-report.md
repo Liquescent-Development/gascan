@@ -254,3 +254,47 @@ Result: exit 0; 16 core integration tests and 1 compile-fail doctest passed, 0 f
 ### Remaining Concern
 
 - `NetworkMode` and `UserMode` remain independently deserializable value enums, but they contain no invalid representable policy state; validated aggregate construction remains sealed behind `Manifest::load`.
+
+## Controller Fix Cycle 4
+
+### Finding Addressed
+
+- Removed the public `Default` implementation from `Resources`, closing the remaining external `Resources::default()` construction path.
+- Replaced no-file manifest default construction with private `Resources::empty()`, preserving the empty resource policy exclusively inside the manifest construction boundary.
+- Added a second compile-fail public-API regression alongside the standalone-deserialization regression.
+
+### RED Evidence
+
+Command after adding the `Resources::default()` compile-fail regression and before removing the trait:
+
+```text
+cargo test -p gascan-core --doc
+```
+
+Result: exit 101; the existing standalone-deserialization compile-fail test passed, while the new default-construction regression failed with `Test compiled successfully, but it's marked compile_fail.`
+
+### GREEN Evidence
+
+Focused command:
+
+```text
+cargo fmt --all && cargo test -p gascan-core --test manifest --test sandbox_identity && cargo test -p gascan-core --doc
+```
+
+Result: exit 0; 8 manifest tests, 7 sandbox identity tests, and both `Resources` compile-fail doctests passed, 0 failed. The no-file/default-policy behavior remained covered by the manifest suite.
+
+Fresh full verification command:
+
+```text
+cargo test -p gascan-core && cargo clippy -p gascan-core --all-targets -- -D warnings && cargo fmt --all -- --check && git diff --check
+```
+
+Result: exit 0; 16 core integration tests and 2 compile-fail doctests passed, 0 failed; strict all-target clippy, formatting, and diff checks passed.
+
+### Controller-Fix Self-Review
+
+- Construction boundary: public `Resources` implements neither `Deserialize` nor `Default`; its fields remain private and no public constructor exists.
+- Defaults: `Manifest::load` still produces the documented empty resource policy when `gascan.toml` is absent, using the private `Resources::empty()` helper.
+- Validation: private `RawResources` retains `deny_unknown_fields`; CPU, resource-size, unit, and overflow validation paths are unchanged.
+- Production constraints: no unsafe code, unwraps, expects, or panics were introduced.
+- Scope: only Task 1 manifest source and this report changed; no Task 2 or Apple paths changed.
