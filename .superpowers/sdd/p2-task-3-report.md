@@ -163,6 +163,8 @@ Self-review:
 
 Concerns: no Task 3 blocker remains. The temporary directory is required while loading and compiling policy; the returned request intentionally owns its canonical source path value, matching the backend contract's value-oriented API even after helper-local temporary cleanup.
 
+Controller seam hardening adds `PolicyCompiler::expected_resource_identities(&SandboxId)`, which derives the exact deterministic container and managed-volume identities without constructing or weakening sealed `CreateRequest`. `CreateOutcome` and partial `CreateFailure` construction validate every reported identity and sandbox association against the sealed request.
+
 ## Important review follow-up: fixture root lifetime
 
 Final review found that the first integration helper returned only `CreateRequest`. Its local `TempDir` was therefore dropped on return, deleting the canonical bind source before a backend could consume the request.

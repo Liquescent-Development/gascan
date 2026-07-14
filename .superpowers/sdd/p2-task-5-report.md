@@ -36,13 +36,13 @@ Final focused counts:
 
 | Concern | Contract |
 |---|---|
-| Create | `create(CreateRequest) -> CreateOutcome { created }` |
-| Inventory | `list_resources() -> Vec<RuntimeResource>` |
+| Create | `create(CreateRequest) -> Result<CreateOutcome, CreateFailure>`; both success and failure expose only request-validated resources created by that call |
+| Inventory | `list_resources() -> Vec<RuntimeResource>`; each observation carries an opaque process-local removal proof and cannot be deserialized |
 | Identity | Backend-neutral `ResourceIdentity { kind, name }` |
 | Kinds | `Container`, `Volume` |
 | Association | Optional validated `SandboxId` |
 | Ownership | `GasCanOwned`, `Foreign`, `Mismatched` |
-| Remove | `RemoveRequest` carries exact selected resources and expected ownership |
+| Remove | `RemoveRequest` carries exact selected owned resources and opaque proof; the backend revalidates the complete current observation |
 | Refusal | Stable `foreign_resource_refused` and `ownership_mismatch` codes |
 
 `FakeRuntime` models containers and volumes, collisions, full ownership inventory, selective removal, fail-once boundaries, deterministic gates, literal calls, and success/failure outcomes.
@@ -64,7 +64,8 @@ Same-sandbox mutations serialize through keyed async locks. Different sandbox ke
 | Failure | Cleanup/result |
 |---|---|
 | Create collision | Foreign volume retained; typed conflict |
-| Start after create | Remove only `CreateOutcome.created` |
+| Start after create | Remove only `CreateOutcome::created()` |
+| Create fails after mutation | Remove only `CreateFailure::created()` |
 | Preexisting owned volume | Preserved during rollback |
 | Newly created volumes/container | Removed during rollback |
 | Provision failure | Created resources removed; Failed durable terminal |

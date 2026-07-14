@@ -86,7 +86,7 @@ git commit -m "feat: define sandbox manifest and identity"
 
 **Interfaces:**
 - Produces exactly nine async methods: `RuntimeBackend::{capabilities, inspect, create, start, stop, remove, exec, logs, list_resources}`. This Task 2/Task 5 joint interface revision makes creation and deletion resource-exact.
-- Request/response types include `CreateRequest`, `CreateOutcome { created }`, typed full `RuntimeResource` inventory, `RemoveRequest`, `ContainerState`, `ExecRequest`, `ExecSession`, and typed `RuntimeError`.
+- Request/response types include sealed `CreateRequest`, request-validated `CreateOutcome`, structured `CreateFailure { created, source }`, typed full `RuntimeResource` inventory with opaque process-local removal proof, `RemoveRequest`, `ContainerState`, `ExecRequest`, `ExecSession`, and typed `RuntimeError`.
 - Produces `FakeRuntime::new(capabilities)` with deterministic failure injection and call recording.
 
 - [ ] **Step 1: Write the reusable backend contract suite**
@@ -100,7 +100,7 @@ pub async fn backend_contract<B: RuntimeBackend>(backend: &B) {
     backend.start(&id).await.unwrap();
     assert_eq!(backend.exec(ExecRequest::fixture(id.clone(), ["true"])).await.unwrap().exit_code(), 0);
     backend.stop(&id).await.unwrap();
-    backend.remove(RemoveRequest::from_resources(outcome.created)?).await.unwrap();
+    backend.remove(RemoveRequest::from_resources(outcome.created().to_vec())?).await.unwrap();
     assert_eq!(backend.inspect(&id).await.unwrap(), None);
 }
 ```
@@ -113,7 +113,7 @@ Expected: FAIL listing undefined request and backend methods.
 
 - [ ] **Step 3: Implement contract types and in-memory behavior**
 
-Use object-safe async methods, byte-oriented exec streams, stable error codes, and ownership metadata that distinguishes GasCan-owned, foreign, and mismatched resources. `create` reports only resources created by that call; `remove` revalidates each exact identity and expected ownership. `FakeRuntime` stores state behind a Tokio mutex, models containers and volumes, rejects collisions, makes start/stop idempotent, records literal requests/outcomes, and can fail once at a named call boundary.
+Use object-safe async methods, byte-oriented exec streams, and stable error codes. `RuntimeResource` classification distinguishes GasCan-owned, foreign, and mismatched resources, is not deserializable, and carries an opaque process-local removal proof preserved only through inventory/outcome clones. `CreateOutcome` validates its exact identities and sandbox association against `CreateRequest`; create failures structurally return every resource created before failure. `remove` accepts only owned inventory/outcome resources and revalidates their exact identity, association, ownership, and proof. `PolicyCompiler::expected_resource_identities` derives the exact deterministic container/volume set without constructing a request. `FakeRuntime` models containers and volumes, collisions after partial mutation, post-mutation failures, idempotent start/stop, literal calls/outcomes, and one-shot boundary failures.
 
 - [ ] **Step 4: Run contract tests under normal and injected failure modes**
 
@@ -266,7 +266,7 @@ Expected: FAIL because `SandboxService` is undefined.
 
 - [ ] **Step 3: Implement transactional orchestration**
 
-For `up`: validate/canonicalize, persist pending, compile policy, create only absent resources, start, provision/health-check through injected hooks, persist ready, and emit events. Roll back only `CreateOutcome.created`. Destroy inventories and removes only exact resources classified as owned for the target. Reconcile desired and actual state after restart; report unknown owned, unknown unowned, and mismatched resources but never delete unknown resources. Implement explicit `apply` change detection and non-destructive failure behavior.
+For `up`: validate/canonicalize, persist pending, compile policy, create only absent resources, start, provision/health-check through injected hooks, persist ready, and emit events. Roll back only `CreateOutcome::created()` or `CreateFailure::created()`. Destroy derives expected identities, intersects them with current inventory, and removes only exact resources whose opaque removal proof came from that inventory/create call. Reconcile desired and actual state after restart; report unknown owned, unknown unowned, and mismatched resources but never delete unknown resources. Implement explicit `apply` change detection and non-destructive failure behavior.
 
 - [ ] **Step 4: Run lifecycle and reconciliation tests**
 

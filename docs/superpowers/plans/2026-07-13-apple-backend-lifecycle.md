@@ -82,7 +82,7 @@ git commit -m "feat: translate Gas Can policy to Apple runtime"
 
 **Interfaces:**
 - Produces: `AppleInspector<R>::inspect(&SandboxId) -> Result<Option<RuntimeSandbox>, RuntimeError>`.
-- Produces: `AppleInspector<R>::list_resources() -> Result<Vec<RuntimeResource>, RuntimeError>` with owned, foreign, and mismatched classifications.
+- Produces: `AppleInspector<R>::list_resources() -> Result<Vec<RuntimeResource>, RuntimeError>` with owned, foreign, and mismatched classifications and fresh opaque process-local removal proofs. Resources are not deserializable; removal must re-inventory and revalidate the proof against current Apple state.
 - Unknown fields are tolerated; absent/invalid required identity and state fields are errors.
 
 - [ ] **Step 1: Write fixture tests for state and ownership**

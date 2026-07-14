@@ -5,7 +5,8 @@ use gascan_core::policy::{
     MAX_DISK_BYTES, MAX_MEMORY_BYTES, PolicyCompiler, filtered_host_environment,
 };
 use gascan_core::runtime::{
-    NetworkIsolation, RuntimeCapabilities, RuntimeNetwork, RuntimeUser, RuntimeVersion,
+    NetworkIsolation, ResourceKind, RuntimeCapabilities, RuntimeNetwork, RuntimeUser,
+    RuntimeVersion,
 };
 use gascan_core::sandbox::{SandboxSpec, WORKSPACE_TARGET};
 use serde_json::Value;
@@ -143,6 +144,32 @@ fn canonical_request_has_one_root_mount_owned_volumes_loopback_ports_and_init() 
     assert!(request.ports().iter().all(|port| {
         port.host_address == IpAddr::V4(Ipv4Addr::LOCALHOST) && port.host_port == port.guest_port
     }));
+}
+
+#[test]
+fn expected_resource_identities_are_derived_from_the_sealed_sandbox_id() {
+    let id = gascan_core::sandbox::SandboxId::test("expected-resources");
+
+    let identities = PolicyCompiler::expected_resource_identities(&id).unwrap();
+
+    assert_eq!(identities.len(), 4);
+    assert_eq!(identities[0].kind(), ResourceKind::Container);
+    assert_eq!(identities[0].name(), id.as_str());
+    assert_eq!(
+        identities
+            .iter()
+            .skip(1)
+            .map(|identity| (identity.kind(), identity.name()))
+            .collect::<Vec<_>>(),
+        [
+            (ResourceKind::Volume, format!("gascan-mise-{id}")),
+            (ResourceKind::Volume, format!("gascan-cache-{id}")),
+            (ResourceKind::Volume, format!("gascan-config-{id}")),
+        ]
+        .iter()
+        .map(|(kind, name)| (*kind, name.as_str()))
+        .collect::<Vec<_>>()
+    );
 }
 
 #[test]

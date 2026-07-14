@@ -1,7 +1,8 @@
 use crate::manifest::{NetworkMode, UserMode};
 use crate::runtime::{
-    CreateRequest, NetworkIsolation, OwnershipMetadata, RuntimeBindMount, RuntimeCapabilities,
-    RuntimeNetwork, RuntimePort, RuntimeResourceLimits, RuntimeUser, RuntimeVolume,
+    CreateRequest, NetworkIsolation, OwnershipMetadata, ResourceIdentity, ResourceKind,
+    RuntimeBindMount, RuntimeCapabilities, RuntimeError, RuntimeNetwork, RuntimePort,
+    RuntimeResourceLimits, RuntimeUser, RuntimeVolume,
 };
 use crate::sandbox::{SandboxSpec, WORKSPACE_TARGET};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -23,6 +24,19 @@ const WORKSPACE_IMAGE: &str = "ghcr.io/gascan/workspace@sha256:7c45e19c71c72fdac
 pub struct PolicyCompiler;
 
 impl PolicyCompiler {
+    pub fn expected_resource_identities(
+        id: &crate::sandbox::SandboxId,
+    ) -> Result<Vec<ResourceIdentity>, RuntimeError> {
+        let mut identities = vec![ResourceIdentity::new(
+            ResourceKind::Container,
+            id.to_string(),
+        )?];
+        for name in managed_volume_names(id.as_str()) {
+            identities.push(ResourceIdentity::new(ResourceKind::Volume, name)?);
+        }
+        Ok(identities)
+    }
+
     pub fn compile(
         spec: SandboxSpec,
         capabilities: &RuntimeCapabilities,
@@ -183,19 +197,24 @@ fn compile_resources(
 }
 
 fn managed_volumes(sandbox_id: &str, ownership: &OwnershipMetadata) -> Vec<RuntimeVolume> {
-    [
-        ("mise", "/home/workspace/.local/share/mise"),
-        ("cache", "/home/workspace/.cache"),
-        ("config", "/home/workspace/.config/gascan"),
-    ]
-    .into_iter()
-    .map(|(kind, target)| RuntimeVolume {
-        name: format!("gascan-{kind}-{sandbox_id}"),
-        target: Utf8PathBuf::from(target),
-        writable: true,
-        ownership: ownership.clone(),
-    })
-    .collect()
+    managed_volume_names(sandbox_id)
+        .into_iter()
+        .zip([
+            "/home/workspace/.local/share/mise",
+            "/home/workspace/.cache",
+            "/home/workspace/.config/gascan",
+        ])
+        .map(|(name, target)| RuntimeVolume {
+            name,
+            target: Utf8PathBuf::from(target),
+            writable: true,
+            ownership: ownership.clone(),
+        })
+        .collect()
+}
+
+fn managed_volume_names(sandbox_id: &str) -> [String; 3] {
+    ["mise", "cache", "config"].map(|kind| format!("gascan-{kind}-{sandbox_id}"))
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]

@@ -38,8 +38,8 @@ Exit: `0`. Results: all gascan-core unit/integration/doc tests passed (8 backend
 - The nine boundaries are `capabilities`, `inspect`, `create`, `start`, `stop`, `remove`, `exec`, `logs`, and `list_owned`.
 - `CreateRequest` is backend-neutral and policy-shaped: immutable image reference text, typed bind mounts, volumes, loopback-capable IP/port mappings, environment, resource limits, network/user policy, and explicit ownership metadata. It contains no Apple command, program, option, or argv shape.
 - `ExecRequest` records argv literally and keeps stdin as bytes. `ExecSession` retains stdout/stderr as bytes and the exact signed exit code. Logs are bytes.
-- `RuntimeError::code()` provides stable category strings while retaining structured diagnostic fields.
-- `OwnedResource` and `RuntimeSandbox` carry the sandbox identity and ownership metadata explicitly.
+- `RuntimeError::code()` provides stable category strings while retaining structured diagnostic fields; `CreateFailure` adds stable source/code plus validated partial created resources.
+- `RuntimeResource` and `RuntimeSandbox` carry sandbox identity and ownership metadata explicitly. Resources are not deserializable and carry an opaque process-local proof that inventory/create clones preserve for exact removal.
 - `FakeRuntime` uses a Tokio mutex, deterministic sorted owned listing, literal call records, exact configured output, and one-shot boundary failures.
 - `SandboxId::test`, `CreateRequest::fixture`, and `ExecRequest::fixture` are documented public fixture helpers. The sandbox helper delegates to `SandboxId::from_root`, so it does not introduce an unchecked identity constructor or weaken deserialization validation.
 

@@ -3,7 +3,9 @@ use async_trait::async_trait;
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::net::IpAddr;
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -336,11 +338,46 @@ impl ResourceIdentity {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone)]
+struct RemovalProof(Arc<()>);
+
+impl RemovalProof {
+    fn new() -> Self {
+        Self(Arc::new(()))
+    }
+}
+
+impl std::fmt::Debug for RemovalProof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RemovalProof(<opaque>)")
+    }
+}
+
+impl PartialEq for RemovalProof {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for RemovalProof {}
+
+/// A runtime observation carrying an opaque, process-local removal proof.
+///
+/// Serialized observations are diagnostic-only and cannot be deserialized into
+/// a deletion capability.
+///
+/// ```compile_fail
+/// use gascan_core::runtime::RuntimeResource;
+///
+/// let _: RuntimeResource = serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RuntimeResource {
     identity: ResourceIdentity,
     sandbox_id: Option<SandboxId>,
     ownership: ResourceOwnership,
+    #[serde(skip)]
+    removal_proof: RemovalProof,
 }
 
 impl RuntimeResource {
@@ -353,6 +390,7 @@ impl RuntimeResource {
             identity,
             sandbox_id,
             ownership,
+            removal_proof: RemovalProof::new(),
         }
     }
 
@@ -375,21 +413,103 @@ impl RuntimeResource {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateOutcome {
-    pub created: Vec<RuntimeResource>,
+    created: Vec<RuntimeResource>,
 }
 
 impl CreateOutcome {
-    pub fn new(created: Vec<RuntimeResource>) -> Result<Self, RuntimeError> {
-        if created
-            .iter()
-            .any(|resource| resource.ownership != ResourceOwnership::GasCanOwned)
-        {
-            return Err(RuntimeError::OwnershipMismatch {
-                resource: "create outcome".to_owned(),
-            });
-        }
+    pub fn new(
+        request: &CreateRequest,
+        created: Vec<RuntimeResource>,
+    ) -> Result<Self, RuntimeError> {
+        validate_created_resources(request, &created, true)?;
         Ok(Self { created })
     }
+
+    pub fn created(&self) -> &[RuntimeResource] {
+        &self.created
+    }
+}
+
+#[derive(Debug)]
+pub struct CreateFailure {
+    created: Vec<RuntimeResource>,
+    source: RuntimeError,
+}
+
+impl CreateFailure {
+    pub fn new(
+        request: &CreateRequest,
+        created: Vec<RuntimeResource>,
+        source: RuntimeError,
+    ) -> Result<Self, RuntimeError> {
+        validate_created_resources(request, &created, false)?;
+        Ok(Self { created, source })
+    }
+
+    pub fn from_source(source: RuntimeError) -> Self {
+        Self {
+            created: Vec::new(),
+            source,
+        }
+    }
+
+    pub fn created(&self) -> &[RuntimeResource] {
+        &self.created
+    }
+
+    pub const fn source(&self) -> &RuntimeError {
+        &self.source
+    }
+
+    pub const fn code(&self) -> &'static str {
+        self.source.code()
+    }
+}
+
+impl std::fmt::Display for CreateFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for CreateFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn validate_created_resources(
+    request: &CreateRequest,
+    created: &[RuntimeResource],
+    require_container: bool,
+) -> Result<(), RuntimeError> {
+    let container = ResourceIdentity::new(ResourceKind::Container, request.id.to_string())?;
+    let allowed_volumes = request
+        .volumes()
+        .iter()
+        .map(|volume| ResourceIdentity::new(ResourceKind::Volume, volume.name.clone()))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let mut identities = BTreeSet::new();
+    for resource in created {
+        let allowed =
+            resource.identity == container || allowed_volumes.contains(&resource.identity);
+        if !allowed
+            || resource.ownership != ResourceOwnership::GasCanOwned
+            || resource.sandbox_id.as_ref() != Some(&request.id)
+            || !identities.insert(resource.identity.clone())
+        {
+            return Err(RuntimeError::OwnershipMismatch {
+                resource: resource.name().to_owned(),
+            });
+        }
+    }
+    if require_container && !identities.contains(&container) {
+        return Err(RuntimeError::InvalidState {
+            resource: request.id.to_string(),
+            message: "create outcome does not contain the requested container".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -403,6 +523,14 @@ impl RemoveRequest {
             return Err(RuntimeError::InvalidState {
                 resource: "remove request".to_owned(),
                 message: "at least one exact resource is required".to_owned(),
+            });
+        }
+        if resources
+            .iter()
+            .any(|resource| resource.ownership != ResourceOwnership::GasCanOwned)
+        {
+            return Err(RuntimeError::OwnershipMismatch {
+                resource: "remove request".to_owned(),
             });
         }
         Ok(Self { resources })
@@ -437,7 +565,7 @@ pub enum RuntimeOutcome {
 pub trait RuntimeBackend: Send + Sync {
     async fn capabilities(&self) -> Result<RuntimeCapabilities, RuntimeError>;
     async fn inspect(&self, id: &SandboxId) -> Result<Option<RuntimeSandbox>, RuntimeError>;
-    async fn create(&self, request: CreateRequest) -> Result<CreateOutcome, RuntimeError>;
+    async fn create(&self, request: CreateRequest) -> Result<CreateOutcome, CreateFailure>;
     async fn start(&self, id: &SandboxId) -> Result<(), RuntimeError>;
     async fn stop(&self, id: &SandboxId) -> Result<(), RuntimeError>;
     async fn remove(&self, request: RemoveRequest) -> Result<(), RuntimeError>;

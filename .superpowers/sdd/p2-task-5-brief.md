@@ -33,7 +33,7 @@ Expected: FAIL because `SandboxService` is undefined.
 
 - [ ] **Step 3: Implement transactional orchestration**
 
-For `up`: validate/canonicalize, persist pending, compile policy, create only absent resources, start, provision/health-check through injected hooks, persist ready, and emit events. Roll back only `CreateOutcome.created`. Destroy inventories and removes only exact known owned resources for the target. Reconcile desired and actual state after restart; report unknown owned, unknown unowned, and mismatched resources but never delete unknown resources. Implement explicit `apply` change detection and non-destructive failure behavior. This is the controller-authorized joint Task 2/Task 5 seam revision; the backend retains exactly nine methods and uses `list_resources` plus typed `RemoveRequest`.
+For `up`: validate/canonicalize, persist pending, compile policy, create only absent resources, start, provision/health-check through injected hooks, persist ready, and emit events. Roll back only resources structurally returned by `CreateOutcome::created()` or `CreateFailure::created()`. Destroy derives exact expected identities, intersects them with fresh inventory, and removes only resources carrying that inventory's opaque process-local removal proof. Reconcile desired and actual state after restart; report unknown owned, unknown unowned, and mismatched resources but never delete unknown resources. Implement explicit `apply` change detection and non-destructive failure behavior. This is the controller-authorized joint Task 2/Task 5 seam revision; the backend retains exactly nine methods and uses `list_resources` plus typed `RemoveRequest`.
 
 - [ ] **Step 4: Run lifecycle and reconciliation tests**
 

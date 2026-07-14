@@ -1,6 +1,6 @@
 use crate::runtime::{
-    ContainerState, CreateOutcome, CreateRequest, ExecRequest, ExecSession, RemoveRequest,
-    ResourceIdentity, ResourceKind, ResourceOwnership, RuntimeBackend, RuntimeCall,
+    ContainerState, CreateFailure, CreateOutcome, CreateRequest, ExecRequest, ExecSession,
+    RemoveRequest, ResourceIdentity, ResourceKind, ResourceOwnership, RuntimeBackend, RuntimeCall,
     RuntimeCapabilities, RuntimeError, RuntimeOutcome, RuntimeResource, RuntimeSandbox,
 };
 use crate::sandbox::SandboxId;
@@ -51,6 +51,7 @@ struct FakeState {
     calls: Vec<RuntimeCall>,
     outcomes: Vec<RuntimeOutcome>,
     failures: HashSet<FailureBoundary>,
+    create_failure_after_mutations: Option<usize>,
     exec_result: ExecSession,
     logs: Vec<u8>,
 }
@@ -66,6 +67,7 @@ impl FakeRuntime {
                 calls: Vec::new(),
                 outcomes: Vec::new(),
                 failures: HashSet::new(),
+                create_failure_after_mutations: None,
                 exec_result: ExecSession::from_output(Vec::new(), Vec::new(), 0),
                 logs: Vec::new(),
             })),
@@ -104,6 +106,10 @@ impl FakeRuntime {
 
     pub async fn inject_failure(&self, boundary: FailureBoundary) {
         self.inner.lock().await.failures.insert(boundary);
+    }
+
+    pub async fn fail_create_after_mutations(&self, mutations: usize) {
+        self.inner.lock().await.create_failure_after_mutations = Some(mutations);
     }
 
     pub async fn seed_unowned(&self, id: SandboxId) {
@@ -258,32 +264,39 @@ impl RuntimeBackend for FakeRuntime {
         Ok(state.sandboxes.get(id).cloned())
     }
 
-    async fn create(&self, request: CreateRequest) -> Result<CreateOutcome, RuntimeError> {
+    async fn create(&self, request: CreateRequest) -> Result<CreateOutcome, CreateFailure> {
         let mut state = self.inner.lock().await;
         state.calls.push(RuntimeCall::Create(request.clone()));
-        fail_once(&mut state, FailureBoundary::Create)?;
+        fail_once(&mut state, FailureBoundary::Create).map_err(CreateFailure::from_source)?;
         if request.id != request.ownership.sandbox_id {
-            return Err(RuntimeError::OwnershipMismatch {
-                resource: request.id.to_string(),
-            });
+            return Err(CreateFailure::from_source(
+                RuntimeError::OwnershipMismatch {
+                    resource: request.id.to_string(),
+                },
+            ));
         }
         if state.sandboxes.contains_key(&request.id) {
-            return Err(RuntimeError::Conflict {
+            return Err(CreateFailure::from_source(RuntimeError::Conflict {
                 resource: request.id.to_string(),
                 message: "sandbox already exists".to_owned(),
-            });
+            }));
         }
         let mut created = Vec::new();
         for volume in request.volumes() {
-            let identity = ResourceIdentity::new(ResourceKind::Volume, volume.name.clone())?;
+            let identity = ResourceIdentity::new(ResourceKind::Volume, volume.name.clone())
+                .map_err(CreateFailure::from_source)?;
             if let Some(existing) = state.resources.get(&identity) {
                 if existing.ownership() != ResourceOwnership::GasCanOwned
                     || existing.sandbox_id() != Some(&request.id)
                 {
-                    return Err(RuntimeError::Conflict {
-                        resource: volume.name.clone(),
-                        message: "volume exists with different ownership".to_owned(),
-                    });
+                    return Err(create_failure(
+                        &request,
+                        created,
+                        RuntimeError::Conflict {
+                            resource: volume.name.clone(),
+                            message: "volume exists with different ownership".to_owned(),
+                        },
+                    ));
                 }
             } else {
                 let resource = RuntimeResource::discovered(
@@ -293,6 +306,7 @@ impl RuntimeBackend for FakeRuntime {
                 );
                 state.resources.insert(identity, resource.clone());
                 created.push(resource);
+                fail_after_create_mutation(&mut state, &request, &created)?;
             }
         }
         state.sandboxes.insert(
@@ -300,18 +314,20 @@ impl RuntimeBackend for FakeRuntime {
             RuntimeSandbox {
                 id: request.id.clone(),
                 state: ContainerState::Stopped,
-                ownership: request.ownership,
+                ownership: request.ownership.clone(),
             },
         );
-        let identity = ResourceIdentity::new(ResourceKind::Container, request.id.to_string())?;
+        let identity = ResourceIdentity::new(ResourceKind::Container, request.id.to_string())
+            .map_err(CreateFailure::from_source)?;
         let resource = RuntimeResource::discovered(
             identity.clone(),
-            Some(request.id),
+            Some(request.id.clone()),
             ResourceOwnership::GasCanOwned,
         );
         state.resources.insert(identity, resource.clone());
         created.push(resource);
-        let outcome = CreateOutcome::new(created)?;
+        fail_after_create_mutation(&mut state, &request, &created)?;
+        let outcome = CreateOutcome::new(&request, created).map_err(CreateFailure::from_source)?;
         state
             .outcomes
             .push(RuntimeOutcome::Created(outcome.clone()));
@@ -364,10 +380,7 @@ impl RuntimeBackend for FakeRuntime {
                     resource: actual.name().to_owned(),
                 });
             }
-            if actual.ownership() != ResourceOwnership::GasCanOwned
-                || actual.sandbox_id() != expected.sandbox_id()
-                || expected.ownership() != ResourceOwnership::GasCanOwned
-            {
+            if actual != expected {
                 return Err(RuntimeError::OwnershipMismatch {
                     resource: actual.name().to_owned(),
                 });
@@ -420,6 +433,33 @@ impl RuntimeBackend for FakeRuntime {
         resources.sort_by(|left, right| left.identity().cmp(right.identity()));
         Ok(resources)
     }
+}
+
+fn create_failure(
+    request: &CreateRequest,
+    created: Vec<RuntimeResource>,
+    source: RuntimeError,
+) -> CreateFailure {
+    CreateFailure::new(request, created, source).unwrap_or_else(CreateFailure::from_source)
+}
+
+fn fail_after_create_mutation(
+    state: &mut FakeState,
+    request: &CreateRequest,
+    created: &[RuntimeResource],
+) -> Result<(), CreateFailure> {
+    if state.create_failure_after_mutations == Some(created.len()) {
+        state.create_failure_after_mutations = None;
+        let source = RuntimeError::InjectedFailure {
+            boundary: "create_after_mutation".to_owned(),
+        };
+        state.outcomes.push(RuntimeOutcome::Failure {
+            boundary: "create_after_mutation".to_owned(),
+            code: source.code().to_owned(),
+        });
+        return Err(create_failure(request, created.to_vec(), source));
+    }
+    Ok(())
 }
 
 fn fixture_capabilities() -> RuntimeCapabilities {

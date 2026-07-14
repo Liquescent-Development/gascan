@@ -3,8 +3,8 @@ mod common;
 use common::{capabilities, create_request};
 use gascan_core::fake_runtime::{FailureBoundary, FakeRuntime};
 use gascan_core::runtime::{
-    ExecRequest, RemoveRequest, ResourceKind, ResourceOwnership, RuntimeBackend, RuntimeCall,
-    RuntimeError, RuntimeOutcome,
+    CreateOutcome, ExecRequest, RemoveRequest, ResourceIdentity, ResourceKind, ResourceOwnership,
+    RuntimeBackend, RuntimeCall, RuntimeError, RuntimeOutcome, RuntimeResource,
 };
 use gascan_core::sandbox::SandboxId;
 
@@ -15,7 +15,7 @@ pub async fn backend_contract(backend: &dyn RuntimeBackend) {
     let created = backend.create(fixture.request()).await.unwrap();
     assert!(
         created
-            .created
+            .created()
             .iter()
             .any(|resource| resource.kind() == ResourceKind::Container)
     );
@@ -34,7 +34,7 @@ pub async fn backend_contract(backend: &dyn RuntimeBackend) {
     );
     backend.stop(&id).await.unwrap();
     backend
-        .remove(RemoveRequest::from_resources(created.created).unwrap())
+        .remove(RemoveRequest::from_resources(created.created().to_vec()).unwrap())
         .await
         .unwrap();
     assert_eq!(backend.inspect(&id).await.unwrap(), None);
@@ -66,7 +66,7 @@ async fn inventory_reports_owned_foreign_and_mismatched_resources() {
 }
 
 #[tokio::test]
-async fn exact_remove_revalidates_ownership_and_refuses_foreign_resources() {
+async fn remove_request_refuses_foreign_inventory_resources() {
     let backend = FakeRuntime::new(capabilities());
     let foreign = SandboxId::test("foreign-remove");
     backend.seed_unowned(foreign.clone()).await;
@@ -78,12 +78,75 @@ async fn exact_remove_revalidates_ownership_and_refuses_foreign_resources() {
         .find(|resource| resource.sandbox_id() == Some(&foreign))
         .unwrap();
 
+    let error = RemoveRequest::from_resources(vec![resource]).unwrap_err();
+    assert_eq!(error.code(), "ownership_mismatch");
+    assert!(backend.inspect(&foreign).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn exact_remove_rejects_a_forged_owned_resource_without_inventory_proof() {
+    let backend = FakeRuntime::new(capabilities());
+    let id = SandboxId::test("forged-remove");
+    backend.seed_owned(id.clone()).await;
+    let forged_identity = ResourceIdentity::new(ResourceKind::Container, id.to_string()).unwrap();
+    let forged = RuntimeResource::discovered(
+        forged_identity,
+        Some(id.clone()),
+        ResourceOwnership::GasCanOwned,
+    );
+
     let error = backend
-        .remove(RemoveRequest::from_resources(vec![resource]).unwrap())
+        .remove(RemoveRequest::from_resources(vec![forged]).unwrap())
         .await
         .unwrap_err();
-    assert_eq!(error.code(), "foreign_resource_refused");
-    assert!(backend.inspect(&foreign).await.unwrap().is_some());
+
+    assert_eq!(error.code(), "ownership_mismatch");
+    assert!(backend.inspect(&id).await.unwrap().is_some());
+}
+
+#[test]
+fn create_outcome_rejects_resources_not_authorized_by_the_request() {
+    let fixture = create_request("outcome-validation");
+    let other = SandboxId::test("other-sandbox");
+    let identity = ResourceIdentity::new(ResourceKind::Container, other.to_string()).unwrap();
+    let resource =
+        RuntimeResource::discovered(identity, Some(other), ResourceOwnership::GasCanOwned);
+
+    let error = CreateOutcome::new(&fixture.request(), vec![resource]).unwrap_err();
+    assert_eq!(error.code(), "ownership_mismatch");
+}
+
+#[tokio::test]
+async fn create_collision_reports_resources_created_before_the_collision() {
+    let backend = FakeRuntime::new(capabilities());
+    let fixture = create_request("partial-collision");
+    let collision = &fixture.volumes()[1];
+    backend
+        .seed_volume(
+            &collision.name,
+            Some(SandboxId::test("foreign-volume-owner")),
+            ResourceOwnership::Foreign,
+        )
+        .await
+        .unwrap();
+
+    let failure = backend.create(fixture.request()).await.unwrap_err();
+
+    assert_eq!(failure.code(), "resource_conflict");
+    assert_eq!(failure.created().len(), 1);
+    assert_eq!(failure.created()[0].name(), fixture.volumes()[0].name);
+}
+
+#[tokio::test]
+async fn injected_post_mutation_create_failure_reports_partial_resources() {
+    let backend = FakeRuntime::new(capabilities());
+    backend.fail_create_after_mutations(2).await;
+    let fixture = create_request("partial-injected");
+
+    let failure = backend.create(fixture.request()).await.unwrap_err();
+
+    assert_eq!(failure.code(), "injected_failure");
+    assert_eq!(failure.created().len(), 2);
 }
 
 #[tokio::test]
@@ -213,7 +276,9 @@ async fn every_backend_boundary_supports_fail_once_injection() {
             FailureBoundary::Inspect => backend.inspect(&id).await.unwrap_err(),
             FailureBoundary::Create => {
                 let fixture = create_request(boundary.as_str());
-                backend.create(fixture.request()).await.unwrap_err()
+                let error = backend.create(fixture.request()).await.unwrap_err();
+                assert_eq!(error.code(), "injected_failure");
+                continue;
             }
             _ => continue,
         };
@@ -239,7 +304,7 @@ async fn every_backend_boundary_supports_fail_once_injection() {
             FailureBoundary::Start => backend.start(&id).await.unwrap_err(),
             FailureBoundary::Stop => backend.stop(&id).await.unwrap_err(),
             FailureBoundary::Remove => backend
-                .remove(RemoveRequest::from_resources(created.created).unwrap())
+                .remove(RemoveRequest::from_resources(created.created().to_vec()).unwrap())
                 .await
                 .unwrap_err(),
             FailureBoundary::Exec => backend
