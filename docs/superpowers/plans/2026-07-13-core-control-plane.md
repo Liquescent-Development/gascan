@@ -85,8 +85,8 @@ git commit -m "feat: define sandbox manifest and identity"
 - Test: `crates/gascan-core/tests/backend_contract.rs`
 
 **Interfaces:**
-- Produces async `RuntimeBackend::{capabilities, inspect, create, start, stop, remove, exec, logs, list_owned}`.
-- Request/response types: `CreateRequest`, `ContainerState`, `ExecRequest`, `ExecSession`, `OwnedResource`, and typed `RuntimeError`.
+- Produces exactly nine async methods: `RuntimeBackend::{capabilities, inspect, create, start, stop, remove, exec, logs, list_resources}`. This Task 2/Task 5 joint interface revision makes creation and deletion resource-exact.
+- Request/response types include sealed `CreateRequest`, request-validated `CreateOutcome`, structured `CreateFailure { created, source }`, typed full `RuntimeResource` inventory with opaque process-local removal proof, `RemoveRequest`, `ContainerState`, `ExecRequest`, `ExecSession`, and typed `RuntimeError`.
 - Produces `FakeRuntime::new(capabilities)` with deterministic failure injection and call recording.
 
 - [ ] **Step 1: Write the reusable backend contract suite**
@@ -95,12 +95,12 @@ git commit -m "feat: define sandbox manifest and identity"
 pub async fn backend_contract<B: RuntimeBackend>(backend: &B) {
     let id = SandboxId::test("contract");
     assert_eq!(backend.inspect(&id).await.unwrap(), None);
-    backend.create(CreateRequest::fixture(id.clone())).await.unwrap();
+    let outcome = backend.create(validated_request).await.unwrap();
     assert_eq!(backend.inspect(&id).await.unwrap().unwrap().state, ContainerState::Stopped);
     backend.start(&id).await.unwrap();
     assert_eq!(backend.exec(ExecRequest::fixture(id.clone(), ["true"])).await.unwrap().exit_code(), 0);
     backend.stop(&id).await.unwrap();
-    backend.remove(&id).await.unwrap();
+    backend.remove(RemoveRequest::from_resources(outcome.created().to_vec())?).await.unwrap();
     assert_eq!(backend.inspect(&id).await.unwrap(), None);
 }
 ```
@@ -113,7 +113,7 @@ Expected: FAIL listing undefined request and backend methods.
 
 - [ ] **Step 3: Implement contract types and in-memory behavior**
 
-Use object-safe async methods, byte-oriented exec streams, stable error codes, and ownership metadata. `FakeRuntime` stores state behind a Tokio mutex, rejects duplicate create, makes start/stop idempotent, records literal requests, and can fail once at a named call boundary.
+Use object-safe async methods, byte-oriented exec streams, and stable error codes. `RuntimeResource` classification distinguishes GasCan-owned, foreign, and mismatched resources, is not deserializable, and carries an opaque process-local removal proof preserved only through inventory/outcome clones. `CreateOutcome` validates its exact identities and sandbox association against `CreateRequest`; create failures structurally return every resource created before failure. `remove` accepts only owned inventory/outcome resources and revalidates their exact identity, association, ownership, and proof. `PolicyCompiler::expected_resource_identities` derives the exact deterministic container/volume set without constructing a request. `FakeRuntime` models containers and volumes, collisions after partial mutation, post-mutation failures, idempotent start/stop, literal calls/outcomes, and one-shot boundary failures.
 
 - [ ] **Step 4: Run contract tests under normal and injected failure modes**
 
@@ -241,8 +241,8 @@ git commit -m "feat: persist sandbox lifecycle state"
 
 **Interfaces:**
 - Produces: `SandboxService<B: RuntimeBackend>` methods `up`, `apply`, `start`, `stop`, `destroy`, `status`, `list`, and `reconcile`.
-- Operations return an `OperationId` and structured `OperationEvent` stream.
-- A keyed async lock serializes mutations for one sandbox while allowing unrelated sandboxes concurrently.
+- Operations return a checked positive `OperationId` and structured append-only `OperationEvent` stream.
+- Weak keyed async locks serialize mutations for one sandbox without retaining stale sandbox keys. Async methods dispatch all SQLite Store access to blocking workers.
 
 - [ ] **Step 1: Write rollback and reconciliation tests using `FakeRuntime`**
 
@@ -266,13 +266,13 @@ Expected: FAIL because `SandboxService` is undefined.
 
 - [ ] **Step 3: Implement transactional orchestration**
 
-For `up`: validate/canonicalize, persist pending, compile policy, create only absent resources, start, provision/health-check through injected hooks, persist ready, and emit events. Track resources created by the operation for rollback. Reconcile desired and actual state after restart; report but never delete unknown resources. Implement explicit `apply` change detection and non-destructive failure behavior.
+For `up`: validate/canonicalize, persist pending, compile policy, create only absent resources, start, persist explicit before/after provision and health phases, and persist actual versioned hook resolution under a desired-content fingerprint. Roll back only `CreateOutcome::created()` or `CreateFailure::created()`. Destroy always inventories, derives expected identities, intersects them with current inventory, and removes only exact associated owned resources whose opaque proof came from that inventory/create call. Reconcile reports extra owned, unknown unowned, and mismatched resources but never deletes unknown resources. Pending Create/Apply cannot complete from runtime state alone; durable successful resolution and health evidence is required. Apply skips hooks only for a matching durable fingerprint and records actual runtime state after failure.
 
 - [ ] **Step 4: Run lifecycle and reconciliation tests**
 
 Run: `cargo test -p gascand --test lifecycle --test reconcile`
 
-Expected: PASS for idempotent up/down, stopped auto-start, missing sandbox refusal, concurrent operations, every injected crash point, unknown owned/unowned resources, and setup failure.
+Expected: PASS for idempotent up/down, fingerprinted retry/apply, stopped auto-start and failed-hook reality, missing sandbox refusal, concurrent operations, deterministic hook interruption recovery, extra owned/unowned resources, partial-create rollback, nonblocking SQLite access, weak lock cleanup, and setup failure.
 
 - [ ] **Step 5: Commit orchestration**
 

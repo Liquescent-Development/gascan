@@ -1,0 +1,25 @@
+[package]
+name = "gascan"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+clap.workspace = true
+gascan-proto = { path = "../gascan-proto" }
+gascan-core = { path = "../gascan-core" }
+hyper-util.workspace = true
+prost-types.workspace = true
+rustix = { workspace = true, features = ["termios"] }
+serde_json.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tower.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+rustix-openpty = "0.2"
