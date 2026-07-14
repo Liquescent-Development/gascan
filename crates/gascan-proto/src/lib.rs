@@ -6,6 +6,12 @@
 pub const API_MAJOR: u32 = 1;
 /// Current backwards-compatible API minor version.
 pub const API_MINOR: u32 = 0;
+/// Required POSIX permission bits for the local socket directory (`0700`).
+pub const SOCKET_DIRECTORY_MODE: u32 = 0o700;
+/// Required POSIX permission bits for the local socket (`0600`).
+pub const SOCKET_MODE: u32 = 0o600;
+/// Stable code returned when an attach frame has no session token.
+pub const SESSION_TOKEN_EMPTY: &str = "empty_session_token";
 
 /// Stable machine-readable values carried by [`v1::Error::code`].
 pub mod error_code {
@@ -21,6 +27,8 @@ pub mod error_code {
     pub const BACKEND_UNAVAILABLE: &str = "backend_unavailable";
     /// The daemon encountered an unexpected internal failure.
     pub const INTERNAL: &str = "internal";
+    /// An attach frame omitted its Run/Shell session token.
+    pub const EMPTY_SESSION_TOKEN: &str = super::SESSION_TOKEN_EMPTY;
 
     /// All codes defined by API v1.
     pub const ALL: &[&str] = &[
@@ -30,7 +38,77 @@ pub mod error_code {
         OPERATION_CONFLICT,
         BACKEND_UNAVAILABLE,
         INTERNAL,
+        EMPTY_SESSION_TOKEN,
     ];
+}
+
+/// Reason an opaque Run/Shell attachment token is invalid.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionTokenError {
+    /// Empty tokens cannot bind a frame to a session.
+    Empty,
+}
+
+impl SessionTokenError {
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Empty => SESSION_TOKEN_EMPTY,
+        }
+    }
+}
+
+/// Validates the opaque token carried by every attach frame.
+pub const fn validate_session_token(token: &[u8]) -> Result<(), SessionTokenError> {
+    if token.is_empty() {
+        Err(SessionTokenError::Empty)
+    } else {
+        Ok(())
+    }
+}
+
+/// Returns the only transport-security contract accepted by API v1.
+#[must_use]
+pub const fn local_transport_security() -> v1::TransportSecurity {
+    v1::TransportSecurity {
+        local_only: true,
+        socket_directory_mode: SOCKET_DIRECTORY_MODE,
+        socket_mode: SOCKET_MODE,
+        require_same_user: true,
+    }
+}
+
+/// Reason a reported local transport contract is unsafe or incompatible.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransportSecurityError {
+    /// The endpoint was not declared local-only.
+    NotLocalOnly,
+    /// Directory permission bits differ from `0700`.
+    DirectoryMode,
+    /// Socket permission bits differ from `0600`.
+    SocketMode,
+    /// Effective-UID authentication through Unix peer credentials is disabled.
+    SameUserNotRequired,
+}
+
+/// Validates local-only transport, exact POSIX modes, and same-user authentication.
+pub const fn validate_transport_security(
+    security: &v1::TransportSecurity,
+) -> Result<(), TransportSecurityError> {
+    if !security.local_only {
+        return Err(TransportSecurityError::NotLocalOnly);
+    }
+    if security.socket_directory_mode != SOCKET_DIRECTORY_MODE {
+        return Err(TransportSecurityError::DirectoryMode);
+    }
+    if security.socket_mode != SOCKET_MODE {
+        return Err(TransportSecurityError::SocketMode);
+    }
+    if !security.require_same_user {
+        return Err(TransportSecurityError::SameUserNotRequired);
+    }
+    Ok(())
 }
 
 /// A validated operation identifier suitable for the durable signed store.
@@ -80,6 +158,37 @@ impl TryFrom<v1::OperationId> for CheckedOperationId {
 
     fn try_from(value: v1::OperationId) -> Result<Self, Self::Error> {
         Self::try_from(value.value)
+    }
+}
+
+/// A validated positive sequence number in a durable operation event stream.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CheckedEventSequence(u64);
+
+impl CheckedEventSequence {
+    /// Returns the validated positive sequence number.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Reason a durable event sequence number is invalid.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventSequenceError {
+    /// Zero cannot identify an append-only event position.
+    Zero,
+}
+
+impl TryFrom<u64> for CheckedEventSequence {
+    type Error = EventSequenceError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        if value == 0 {
+            Err(EventSequenceError::Zero)
+        } else {
+            Ok(Self(value))
+        }
     }
 }
 

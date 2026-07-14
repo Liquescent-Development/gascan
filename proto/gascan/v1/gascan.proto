@@ -38,6 +38,14 @@ enum ActualState {
   ACTUAL_STATE_UNKNOWN = 6;
 }
 
+// Stable durable operation status values. Numeric values must never change.
+enum OperationStatus {
+  OPERATION_STATUS_UNSPECIFIED = 0;
+  OPERATION_STATUS_PENDING = 1;
+  OPERATION_STATUS_COMPLETED = 2;
+  OPERATION_STATUS_FAILED = 3;
+}
+
 message Capability {
   string name = 1;
   bool available = 2;
@@ -54,8 +62,11 @@ message Error {
 
 message TransportSecurity {
   bool local_only = 1;
+  // POSIX permission bits only (no file-type bits); v1 requires 0700 (448).
   uint32 socket_directory_mode = 2;
+  // POSIX permission bits only (no file-type bits); v1 requires 0600 (384).
   uint32 socket_mode = 3;
+  // Authenticate the effective UID through Unix-domain peer credentials.
   bool require_same_user = 4;
   reserved 5;
 }
@@ -91,10 +102,20 @@ message LogsRequest { SandboxSelector sandbox = 1; google.protobuf.Timestamp sin
 message OperationEvent {
   OperationId operation_id = 1;
   google.protobuf.Timestamp timestamp = 2;
+  // Stable lowercase phase identifier; interpretation is scoped to content_type.
   string phase = 3;
+  // Opaque event content encoded according to content_type; never assumed UTF-8.
   bytes payload = 4;
   Error error = 5;
-  reserved 6;
+  // Positive, strictly increasing per operation; persisted order used for replay.
+  uint64 sequence = 6;
+  // Pending for progress; completed or failed is the single terminal event.
+  OperationStatus status = 7;
+  // Media type for payload, or empty only when payload is empty.
+  string content_type = 8;
+  // Opaque attachment token emitted by Run/Shell; empty for unrelated operations.
+  bytes session_token = 9;
+  reserved 10;
 }
 
 message StatusRequest { SandboxSelector sandbox = 1; reserved 2; }
@@ -124,6 +145,8 @@ message ClientFrame {
     Close close = 4;
   }
   reserved 5;
+  // Required on every frame; binds it to the Run/Shell session that emitted it.
+  bytes session_token = 6;
 }
 
 message Exit { int32 code = 1; int32 signal = 2; reserved 3; }
