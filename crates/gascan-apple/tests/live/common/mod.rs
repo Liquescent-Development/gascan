@@ -561,10 +561,14 @@ fn require_owned_container<'a>(
 }
 
 fn volume_record<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
-    value
-        .as_array()?
-        .iter()
-        .find(|record| record.get("name").and_then(Value::as_str) == Some(name))
+    value.as_array()?.iter().find(|record| {
+        record.get("id").and_then(Value::as_str) == Some(name)
+            && record
+                .get("configuration")
+                .and_then(|configuration| configuration.get("name"))
+                .and_then(Value::as_str)
+                == Some(name)
+    })
 }
 
 fn listed_container<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
@@ -584,9 +588,13 @@ fn require_owned_volume<'a>(
     prefix: &str,
     owner_token: &str,
 ) -> Result<&'a Value, TestError> {
+    let configuration = record
+        .get("configuration")
+        .ok_or("volume record missing configuration")?;
     if !name.starts_with(prefix)
-        || record.get("name").and_then(Value::as_str) != Some(name)
-        || !has_ownership_labels(record, owner_token)
+        || record.get("id").and_then(Value::as_str) != Some(name)
+        || configuration.get("name").and_then(Value::as_str) != Some(name)
+        || !has_ownership_labels(configuration, owner_token)
     {
         return Err(format!("ownership mismatch for volume {name}").into());
     }
@@ -747,7 +755,11 @@ mod tests {
     }
 
     fn volume_with(name: &str, token: &str) -> Value {
-        json!([{"name":name,"labels":{"dev.gascan.test":"true","dev.gascan.test.owner":token}}])
+        json!([{"configuration":{
+            "creationDate":"2026-07-14T00:00:00Z","driver":"local","format":"ext4",
+            "labels":{"dev.gascan.test":"true","dev.gascan.test.owner":token},
+            "name":name,"options":{"size":"104857600"},"sizeInBytes":104857600,"source":"/tmp/volume.img"
+        },"id":name}])
     }
 
     fn context(
@@ -814,6 +826,29 @@ mod tests {
                 .contains("ownership mismatch")
         );
         assert!(ctx.records.lock().unwrap().volumes.is_empty());
+    }
+
+    #[test]
+    fn apple_volume_schema_requires_matching_id_name_and_nested_token_labels() {
+        let name = "gascan-feas-42-case-volume";
+        let exact = volume_with(name, TOKEN);
+        let record = volume_record(&exact, name).unwrap();
+        assert!(require_owned_volume(record, name, "gascan-feas-42-case", TOKEN).is_ok());
+
+        for malformed in [
+            json!([{"id":name,"configuration":{"name":"different","labels":{"dev.gascan.test":"true","dev.gascan.test.owner":TOKEN}}}]),
+            json!([{"id":"different","configuration":{"name":name,"labels":{"dev.gascan.test":"true","dev.gascan.test.owner":TOKEN}}}]),
+        ] {
+            assert!(volume_record(&malformed, name).is_none());
+        }
+
+        let top_level_labels = json!([{"id":name,"configuration":{"name":name},"labels":{"dev.gascan.test":"true","dev.gascan.test.owner":TOKEN}}]);
+        let record = volume_record(&top_level_labels, name).unwrap();
+        assert!(require_owned_volume(record, name, "gascan-feas-42-case", TOKEN).is_err());
+
+        let wrong_token = volume_with(name, "ffeeddccbbaa99887766554433221100");
+        let record = volume_record(&wrong_token, name).unwrap();
+        assert!(require_owned_volume(record, name, "gascan-feas-42-case", TOKEN).is_err());
     }
 
     #[tokio::test]
