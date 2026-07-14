@@ -1,6 +1,6 @@
 # Apple container feasibility evidence
 
-Status: **BLOCKED — administrator authentication and offline live proof pending**
+Status: **PASS — hard offline isolation proven for Apple container 1.1.0**
 
 ## Environment and established evidence
 
@@ -19,19 +19,19 @@ container run ... --network none ...
 
 `container network create --internal` is only host-only networking and is not offline isolation. DNS suppression is explicitly rejected as evidence.
 
-## Current capability decision
+## Verified offline evidence and capability decision
 
-`AppleProbe::base_capabilities()` reports `NetworkIsolation::Unsupported` fail-closed. `offline_network_args` rejects before invoking mount construction unless passed `NetworkIsolation::Proven`; its only proven-form output is the literal pair `--network`, `none`.
+The controller ran `network::offline_workspace_cannot_reach_external_or_host_networks` alone with serialized ignored-test execution. It passed 1/1 in 36.19 seconds. The default-network container reached the owned DNS/PF host service, proving the ordinary VM-to-host path. Public `http://example.com` and direct `http://1.1.1.1` were both unreachable from that control on this host and were recorded as non-discriminating diagnostics. The offline container denied all four target roles—including the exact owned host endpoint proven reachable—with structured `configuration.networks=[]` both before and after guest-root route/interface mutation. Cleanup verification `sudo -n container system dns list --format json` returned exactly `[]`.
 
-Promotion to `Proven` is forbidden until the controller runs the ignored adversarial test, first proves that the default-network control reaches the owned host endpoint, and then records that structured attachments are empty and all DNS plus external HTTP, direct external IPv4, TEST-NET, and the exact proven host endpoint fail both before and after guest-root route/interface mutation.
+`AppleProbe::base_capabilities()` now reports `NetworkIsolation::Proven` only for the exactly verified runtime version 1.1.0. Other parseable Apple 1.x versions remain `Unsupported` for offline isolation; absent, duplicate, malformed, or unsupported-major version evidence returns an error and cannot promote the capability. `offline_network_args` still rejects before invoking mount construction unless passed `NetworkIsolation::Proven`; its only proven-form output is the literal pair `--network`, `none`.
 
 The test creates a cryptographically unique `gascan-<128-bit-lowercase-hex>.test` host mapping with the literal command `sudo -n container system dns create --localhost 203.0.113.113 <domain>`. This is a temporary **global host DNS/PF mutation**: Apple documents that creating a localhost domain disables iCloud Private Relay, and its PF redirect is removed on restart. Run the ignored test only on a dedicated controller where non-interactive administrative access and temporary Private Relay disruption are acceptable.
 
 Ownership is fail-closed despite Apple 1.1 listing only domain names: the harness proves the generated domain is absent before creation, rejects collisions, proves exactly one identical domain exists afterward, and re-lists it immediately before an exact-name delete. It never deletes an unfamiliar or ambiguous name. On ordinary and error-path teardown, deletion uses literal argv without a shell; a bounded drop fallback applies the same exact-domain identity check. A normal owned networked container must reach the temporary host server through this domain, and the offline container reuses the identical URL before and after guest-root mutation. Any ownership mismatch is reported and deliberately retained for manual inspection.
 
-The first controller attempt stopped safely before mutation because `sudo -n` required a password. After authentication, mapping creation and control-container startup succeeded. `https://example.com` first exposed Alpine BusyBox TLS/CA as an invalid generic oracle; the subsequent `http://example.com` attempt showed that this host's default-network Apple containers have no usable public HTTP path. Public DNS plus HTTP and direct external IPv4 are therefore recorded diagnostics and their offline failures are corroborating evidence, but they are non-discriminating on this host and are not required positive controls. The required positive control is the owned DNS/PF host service: the default-network container must reach it, and the offline container must fail that exact endpoint with structured `networks=[]` both before and after guest-root route/interface mutation. This structural result plus a host path proven reachable under normal attachment does not assume WAN availability. Earlier Docker-only alias and default-network gateway failures were also removed fixture failures, not isolation evidence. The remaining blocker is a passing focused adversarial test. Network isolation remains `Unsupported`, not `Proven`.
+The initial password, Alpine BusyBox HTTPS/TLS, Docker-only alias, and default-network gateway failures were fixture or setup failures and are not isolation evidence. Public DNS plus HTTP and direct external IPv4 negatives remain corroborating but non-discriminating on this host because its default-network Apple containers had no usable WAN path. The discriminating proof is structural empty attachment plus denial of the identical owned host path that normal attachment reached.
 
-## Controller commands required to resolve BLOCKED
+## Passing test mapping and limitations
 
 ```sh
 sudo -v
@@ -39,4 +39,4 @@ cargo test -p gascan-apple --test live -- --ignored --nocapture --test-threads=1
 sudo -n container system dns list --format json
 ```
 
-Run `sudo -v` interactively immediately before the focused test so its literal `sudo -n container system dns list/create/delete` commands can use the cached credential. Afterward, the final command must return a structured list containing no test-owned `gascan-*.test` mapping. Until the focused test passes and its observations and cleanup are recorded, Gate 2 remains **BLOCKED**.
+This proof is limited to Apple container 1.1.0 on the environment and image digests recorded above, using the exact `--network none` mechanism. The test temporarily mutates global DNS/PF state, requires cached administrator authentication, can disable iCloud Private Relay, and must end with an empty structured DNS list. It does not promote later Apple versions by inference. Gate 2 is **PASS** for this exact verified capability; the broader ignored live suite remains a separate controller action.

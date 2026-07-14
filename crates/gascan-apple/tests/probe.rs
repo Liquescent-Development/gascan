@@ -40,7 +40,7 @@ async fn accepts_supported_major_and_rejects_future_major() {
 }
 
 #[tokio::test]
-async fn leaves_live_capabilities_unverified() {
+async fn promotes_only_the_live_verified_apple_1_1_0_offline_mechanism() {
     let capabilities = probe_with_output(include_bytes!("fixtures/system-version-1.0.0.json"))
         .base_capabilities()
         .await
@@ -53,12 +53,45 @@ async fn leaves_live_capabilities_unverified() {
     assert!(!capabilities.loopback_publish);
     assert!(!capabilities.resource_limits);
     assert_eq!(capabilities.offline, NetworkIsolation::Unsupported);
+
+    for output in [
+        br#"[{"appName":"container","version":"1.1.0"}]"#.as_slice(),
+        br#"[{"appName":"helper","version":"9.0.0"},{"appName":"container","version":"1.1.0","future":true}]"#.as_slice(),
+    ] {
+        assert_eq!(
+            probe_with_output(output)
+                .base_capabilities()
+                .await
+                .unwrap()
+                .offline,
+            NetworkIsolation::Proven
+        );
+    }
+
+    for output in [
+        br#"[{"appName":"container","version":"1.1.1"}]"#.as_slice(),
+        br#"[{"appName":"container","version":"1.9.3"}]"#.as_slice(),
+    ] {
+        assert_eq!(
+            probe_with_output(output)
+                .base_capabilities()
+                .await
+                .unwrap()
+                .offline,
+            NetworkIsolation::Unsupported
+        );
+    }
 }
 
-#[test]
-fn offline_request_is_rejected_before_mount_construction_without_proof() {
+#[tokio::test]
+async fn offline_request_is_rejected_before_mount_construction_without_proof() {
+    let capability = probe_with_output(br#"[{"appName":"container","version":"1.1.1"}]"#)
+        .base_capabilities()
+        .await
+        .unwrap()
+        .offline;
     let mut mount_constructed = false;
-    let result = gascan_apple::offline_network_args(NetworkIsolation::Unsupported, || {
+    let result = gascan_apple::offline_network_args(capability, || {
         mount_constructed = true;
     });
     assert!(matches!(

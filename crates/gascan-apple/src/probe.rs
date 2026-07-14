@@ -63,15 +63,20 @@ impl<R: CommandRunner> AppleProbe<R> {
 
     /// Returns the conservative capability baseline for a supported runtime.
     pub async fn base_capabilities(&self) -> Result<RuntimeCapabilities, RuntimeError> {
+        let version = self.version().await?;
         Ok(RuntimeCapabilities {
-            version: self.version().await?,
+            offline: if version == RuntimeVersion::new(1, 1, 0) {
+                NetworkIsolation::Proven
+            } else {
+                NetworkIsolation::Unsupported
+            },
+            version,
             bind_mounts: false,
             named_volumes: false,
             tty: false,
             signals: false,
             loopback_publish: false,
             resource_limits: false,
-            offline: NetworkIsolation::Unsupported,
         })
     }
 }
