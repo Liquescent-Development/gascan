@@ -60,11 +60,15 @@ fn smoke_fixture_uses_built_ref_and_checks_signal_and_zombies() {
     let smoke = fs::read_to_string(root().join("tests/image/user-and-volumes.sh")).unwrap();
     for required in [
         ".artifacts/workspace-image-ref",
-        "container run --detach",
+        "\"$container_bin\" create",
+        "--label dev.gascan.test=true",
+        "dev.gascan.test.owner=$owner_token",
         "--mount \"type=bind,source=$root,target=/workspace\"",
-        "container exec",
+        "--bin validate-owned-container",
+        "\"$container_bin\" start",
+        "\"$container_bin\" exec",
         "/proc/[0-9]*/status",
-        "container stop --time 5",
+        "\"$container_bin\" stop --time 5",
         "test \"$elapsed\" -le 5",
     ] {
         assert!(
@@ -72,4 +76,6 @@ fn smoke_fixture_uses_built_ref_and_checks_signal_and_zombies() {
             "missing live smoke contract: {required}"
         );
     }
+    assert_eq!(smoke.matches("--mount ").count(), 1);
+    assert!(!smoke.contains("container run"));
 }
