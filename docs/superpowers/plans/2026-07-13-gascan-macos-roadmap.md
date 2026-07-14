@@ -55,9 +55,9 @@ flowchart LR
 
 Owner: Plan 1.
 
-- [ ] Execute Plan 1 Tasks 1-3 to create the Rust workspace, shared runtime capability types, Apple command runner, and version fixtures.
-- [ ] Review the `RuntimeCapabilities`, `CommandRunner`, and error interfaces before other plans consume them. Plan 2 owns the backend-neutral `RuntimeBackend` contract.
-- [ ] Tag the interface-freeze commit in the roadmap notes.
+- [x] Execute Plan 1 Tasks 1-3 to create the Rust workspace, shared runtime capability types, Apple command runner, and version fixtures.
+- [x] Review the `RuntimeCapabilities`, `CommandRunner`, and error interfaces before other plans consume them. Plan 2 owns the backend-neutral `RuntimeBackend` contract.
+- [x] Record the interface-freeze commit in the roadmap notes.
 
 **Gate 1:** `cargo test --workspace` passes; fixtures cover supported and unsupported Apple versions; command execution is injectable; no Apple command shape leaks into core capability types.
 
@@ -124,8 +124,8 @@ When each gate passes, update this section in a dedicated commit with the commit
 
 | Gate | Required evidence | Commit | Status |
 |---|---|---|---|
-| 1 — Probe seam freeze | workspace tests and reviewed probe contracts | not-run | pending |
-| 2 — Apple feasibility | `docs/feasibility/apple-container-report.md` | not-run | pending |
+| 1 — Probe seam freeze | workspace tests and reviewed probe contracts | `48a7a18` | passed |
+| 2 — Apple feasibility | `docs/feasibility/apple-container-report.md` | `6bedef8` | passed |
 | 3 — Fake E2E | core/daemon/CLI test transcript | not-run | pending |
 | 4 — Real lifecycle | Apple integration test transcript | not-run | pending |
 | 5 — Release | clean-host and security reports | not-run | pending |
