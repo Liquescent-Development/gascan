@@ -32,7 +32,7 @@ Record literal argv for create/run, inspect, stop/start/delete, volume lifecycle
 
 Record structured empty attachment evidence and the result before and after guest-root route/interface mutation for:
 
-- `https://example.com` (DNS plus HTTPS);
+- `http://example.com` (DNS plus external HTTP using BusyBox-supported behavior);
 - `http://1.1.1.1` (direct external IPv4, independent of DNS);
 - `http://192.0.2.1` (non-routable adversarial IPv4);
 - the owned host probe reached through the unique temporary `gascan-<128-bit-hex>.test` mapping created by `sudo -n container system dns create --localhost 203.0.113.113 <domain>`.

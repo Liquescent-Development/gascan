@@ -176,6 +176,15 @@ fn has_no_network_attachments(value: &serde_json::Value) -> bool {
         .is_some_and(Vec::is_empty)
 }
 
+fn network_targets(host_url: String) -> [(&'static str, String); 4] {
+    [
+        ("DNS plus external HTTP", "http://example.com".to_owned()),
+        ("direct external IPv4", "http://1.1.1.1".to_owned()),
+        ("TEST-NET IPv4", "http://192.0.2.1".to_owned()),
+        ("owned host DNS/PF mapping", host_url),
+    ]
+}
+
 #[test]
 fn exact_none_form_has_empty_structured_attachments() {
     let value = serde_json::json!([{"configuration":{"networks":[]}}]);
@@ -191,35 +200,30 @@ async fn offline_workspace_cannot_reach_external_or_host_networks() -> Result<()
     let host = host_server::HostServer::start()?;
     let mut mapping = HostDnsMapping::create().await?;
     let control = LiveContext::new("network-control").await?;
-    let targets = [
-        "https://example.com".to_owned(),
-        "http://1.1.1.1".to_owned(),
-        "http://192.0.2.1".to_owned(),
-        mapping.url(host.port()),
-    ];
-    for target in [&targets[0], &targets[1], &targets[3]] {
+    let targets = network_targets(mapping.url(host.port()));
+    for (mechanism, target) in [&targets[0], &targets[1], &targets[3]] {
         assert!(
             control.can_reach(target).await?,
-            "networked positive control could not reach: {target}"
+            "networked positive control failed for {mechanism}: {target}"
         );
     }
     control.cleanup().await?;
 
     let ctx = LiveContext::offline("network").await?;
     assert!(has_no_network_attachments(&ctx.inspect().await?));
-    for target in &targets {
+    for (mechanism, target) in &targets {
         assert!(
             !ctx.can_reach(target).await?,
-            "offline target unexpectedly reachable: {target}"
+            "offline target unexpectedly reachable through {mechanism}: {target}"
         );
     }
     ctx.exec("test -d /workspace && ip link show lo >/dev/null")
         .await?;
     ctx.exec("ip link add gascan0 type dummy 2>/dev/null || true; ip route add default via 192.0.2.1 2>/dev/null || true").await?;
-    for target in &targets {
+    for (mechanism, target) in &targets {
         assert!(
             !ctx.can_reach(target).await?,
-            "guest-root mutation made target reachable: {target}"
+            "guest-root mutation made {mechanism} reachable: {target}"
         );
     }
     ctx.cleanup().await?;
@@ -234,6 +238,23 @@ mod tests {
     use gascan_core::runtime::RuntimeError;
 
     use super::*;
+
+    #[test]
+    fn target_matrix_uses_busybox_http_and_keeps_all_offline_mechanisms() {
+        let targets = network_targets("http://gascan-owner.test:1234".into());
+        assert_eq!(
+            targets,
+            [
+                ("DNS plus external HTTP", "http://example.com".to_owned()),
+                ("direct external IPv4", "http://1.1.1.1".to_owned()),
+                ("TEST-NET IPv4", "http://192.0.2.1".to_owned()),
+                (
+                    "owned host DNS/PF mapping",
+                    "http://gascan-owner.test:1234".to_owned()
+                ),
+            ]
+        );
+    }
 
     struct ScriptedRunner {
         responses: Mutex<VecDeque<Result<CommandOutput, RuntimeError>>>,
