@@ -7,8 +7,14 @@ fn root() -> &'static Path {
 #[test]
 fn dockerfile_declares_workspace_user_init_and_persistent_layout() {
     let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
+    let system_tools = fs::read_to_string(root().join("tests/image/system-tools.txt")).unwrap();
+    for required in ["sudo", "tini"] {
+        assert!(
+            system_tools.lines().any(|package| package == required),
+            "missing image package: {required}"
+        );
+    }
     for required in [
-        "sudo tini",
         "COPY --chmod=0440 images/workspace/etc/sudoers.d/workspace /etc/sudoers.d/workspace",
         "groupadd --gid 1000 workspace",
         "useradd --uid 1000 --gid 1000",
