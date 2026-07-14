@@ -33,6 +33,12 @@ struct ActivityInner {
     changed: Notify,
     shutting_down: AtomicBool,
     shutdown: Notify,
+    accepting: AtomicBool,
+}
+#[derive(Clone, Copy)]
+struct AdmissionClosed;
+fn admission_status(_: AdmissionClosed) -> tonic::Status {
+    tonic::Status::unavailable(error_code::BACKEND_UNAVAILABLE)
 }
 
 impl Default for ActivityTracker {
@@ -51,6 +57,7 @@ impl ActivityTracker {
                 changed: Notify::new(),
                 shutting_down: AtomicBool::new(false),
                 shutdown: Notify::new(),
+                accepting: AtomicBool::new(true),
             }),
         }
     }
@@ -77,6 +84,18 @@ impl ActivityTracker {
             tracker: self.clone(),
         }
     }
+    fn admit_operation(&self) -> Result<OperationLease, AdmissionClosed> {
+        self.ensure_accepting()?;
+        self.operation_started();
+        if self.inner.accepting.load(Ordering::Acquire) {
+            Ok(OperationLease {
+                tracker: self.clone(),
+            })
+        } else {
+            self.operation_finished();
+            Err(AdmissionClosed)
+        }
+    }
     fn touch(&self) {
         self.inner.generation.fetch_add(1, Ordering::AcqRel);
         self.inner.changed.notify_waiters();
@@ -97,6 +116,16 @@ impl ActivityTracker {
     fn cancel_streams(&self) {
         self.inner.shutting_down.store(true, Ordering::Release);
         self.inner.shutdown.notify_waiters();
+    }
+    fn begin_shutdown(&self) {
+        self.inner.accepting.store(false, Ordering::Release);
+    }
+    fn ensure_accepting(&self) -> Result<(), AdmissionClosed> {
+        if self.inner.accepting.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(AdmissionClosed)
+        }
     }
     pub async fn wait_for_idle(&self, timeout: Duration) -> io::Result<()> {
         loop {
@@ -215,11 +244,13 @@ impl Daemon {
         #[cfg(not(unix))]
         let terminated = std::future::pending::<io::Result<()>>();
         let (began_tx, began_rx) = tokio::sync::oneshot::channel();
+        let shutdown_tracker = tracker.clone();
         let shutdown = async move {
             tokio::select! {
                 result = idle => { let _ = result; }
                 result = terminated => { let _ = result; }
             }
+            shutdown_tracker.begin_shutdown();
             let _ = began_tx.send(());
         };
         let server = tonic::transport::Server::builder()
@@ -229,7 +260,7 @@ impl Daemon {
         tokio::select! {
             result = &mut server => { result.map_err(io::Error::other)?; }
             _ = async { let _ = began_rx.await; } => {
-                let _ = tokio::time::timeout(config.shutdown_timeout, tracker.wait_for_operations()).await;
+                tracker.wait_for_operations().await;
                 tracker.cancel_streams();
                 tokio::time::timeout(config.shutdown_timeout, &mut server).await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "daemon connections did not close after stream cancellation"))?.map_err(io::Error::other)?;
             }
@@ -272,7 +303,18 @@ impl ApiEventStream {
                     break;
                 }
                 tokio::select! {
-                    event = source.recv() => match event { Some(event) => { if sender.send(Ok(wire_event(event))).await.is_err() { break; } }, None => break },
+                    event = source.recv() => match event {
+                        Some(event) => {
+                            let cancelled = activity.inner.shutdown.notified();
+                            if activity.inner.shutting_down.load(Ordering::Acquire) { break; }
+                            let permit = tokio::select! {
+                                permit = sender.reserve() => match permit { Ok(permit) => permit, Err(_) => break },
+                                () = cancelled => break,
+                            };
+                            permit.send(Ok(wire_event(event)));
+                        },
+                        None => break,
+                    },
                     () = cancelled => break,
                 }
             }
@@ -427,6 +469,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         &self,
         request: tonic::Request<v1::HandshakeRequest>,
     ) -> Result<tonic::Response<v1::HandshakeResponse>, tonic::Status> {
+        self.activity.ensure_accepting().map_err(admission_status)?;
         let _lease = self.activity.lease();
         let request = request.into_inner();
         let rejection = validate_api_major(request.api_major)
@@ -451,6 +494,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         &self,
         request: tonic::Request<v1::StatusRequest>,
     ) -> Result<tonic::Response<v1::StatusResponse>, tonic::Status> {
+        self.activity.ensure_accepting().map_err(admission_status)?;
         let _lease = self.activity.lease();
         let id = selector_id(request.into_inner().sandbox).map_err(ApiInputError::status)?;
         let store = self.service.store().clone();
@@ -467,6 +511,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         &self,
         _: tonic::Request<v1::ListRequest>,
     ) -> Result<tonic::Response<v1::ListResponse>, tonic::Status> {
+        self.activity.ensure_accepting().map_err(admission_status)?;
         let _lease = self.activity.lease();
         let store = self.service.store().clone();
         let records = tokio::task::spawn_blocking(move || store.list_sandboxes())
@@ -481,6 +526,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         &self,
         _: tonic::Request<v1::DoctorRequest>,
     ) -> Result<tonic::Response<v1::DoctorResponse>, tonic::Status> {
+        self.activity.ensure_accepting().map_err(admission_status)?;
         let _lease = self.activity.lease();
         Ok(tonic::Response::new(v1::DoctorResponse {
             capabilities: Vec::new(),
@@ -492,7 +538,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         &self,
         request: tonic::Request<v1::UpRequest>,
     ) -> Result<tonic::Response<Self::UpStream>, tonic::Status> {
-        let _operation = self.activity.operation();
+        let _operation = self.activity.admit_operation().map_err(admission_status)?;
         let spec = spec_for_root(request.into_inner().project_root)
             .await
             .map_err(ApiInputError::status)?;
@@ -511,7 +557,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         &self,
         request: tonic::Request<v1::ApplyRequest>,
     ) -> Result<tonic::Response<Self::ApplyStream>, tonic::Status> {
-        let _operation = self.activity.operation();
+        let _operation = self.activity.admit_operation().map_err(admission_status)?;
         let spec = spec_for_root(request.into_inner().project_root)
             .await
             .map_err(ApiInputError::status)?;
@@ -530,6 +576,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         &self,
         _: tonic::Request<v1::RunRequest>,
     ) -> Result<tonic::Response<Self::RunStream>, tonic::Status> {
+        self.activity.ensure_accepting().map_err(admission_status)?;
         let _lease = self.activity.lease();
         Err(unavailable())
     }
@@ -538,6 +585,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         &self,
         _: tonic::Request<v1::ShellRequest>,
     ) -> Result<tonic::Response<Self::ShellStream>, tonic::Status> {
+        self.activity.ensure_accepting().map_err(admission_status)?;
         let _lease = self.activity.lease();
         Err(unavailable())
     }
@@ -546,7 +594,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         &self,
         request: tonic::Request<v1::DownRequest>,
     ) -> Result<tonic::Response<Self::DownStream>, tonic::Status> {
-        let _operation = self.activity.operation();
+        let _operation = self.activity.admit_operation().map_err(admission_status)?;
         let id = selector_id(request.into_inner().sandbox).map_err(ApiInputError::status)?;
         let operation = self.service.stop(&id).await.map_err(service_status)?;
         Ok(tonic::Response::new(ApiEventStream::new(
@@ -559,7 +607,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         &self,
         request: tonic::Request<v1::DestroyRequest>,
     ) -> Result<tonic::Response<Self::DestroyStream>, tonic::Status> {
-        let _operation = self.activity.operation();
+        let _operation = self.activity.admit_operation().map_err(admission_status)?;
         let id = selector_id(request.into_inner().sandbox).map_err(ApiInputError::status)?;
         let operation = self.service.destroy(&id).await.map_err(service_status)?;
         Ok(tonic::Response::new(ApiEventStream::new(
@@ -572,6 +620,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         &self,
         _: tonic::Request<v1::LogsRequest>,
     ) -> Result<tonic::Response<Self::LogsStream>, tonic::Status> {
+        self.activity.ensure_accepting().map_err(admission_status)?;
         let _lease = self.activity.lease();
         Err(unavailable())
     }
@@ -580,6 +629,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         &self,
         _: tonic::Request<tonic::Streaming<v1::ClientFrame>>,
     ) -> Result<tonic::Response<Self::AttachStream>, tonic::Status> {
+        self.activity.ensure_accepting().map_err(admission_status)?;
         let _lease = self.activity.lease();
         Err(unavailable())
     }
@@ -632,12 +682,30 @@ mod tests {
     async fn shutdown_cancels_a_client_held_open_event_stream()
     -> Result<(), Box<dyn std::error::Error>> {
         let activity = ActivityTracker::new();
-        let (_held_sender, receiver) = tokio::sync::mpsc::channel(1);
+        let (held_sender, receiver) = tokio::sync::mpsc::channel(32);
         let mut stream = ApiEventStream::new(receiver, activity.clone());
+        let operation_id = OperationId::new(1)?;
+        for sequence in 1..=24 {
+            held_sender.try_send(OperationEvent {
+                sequence,
+                operation_id,
+                status: OperationStatus::Pending,
+                details: None,
+                error_code: None,
+                timestamp_millis: sequence,
+            })?;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         activity.cancel_streams();
-        let item =
-            tokio::time::timeout(std::time::Duration::from_millis(100), stream.next()).await?;
-        assert!(item.is_none());
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            activity.wait_for_idle(std::time::Duration::from_millis(1)),
+        )
+        .await??;
+        while tokio::time::timeout(std::time::Duration::from_millis(100), stream.next())
+            .await?
+            .is_some()
+        {}
         Ok(())
     }
 

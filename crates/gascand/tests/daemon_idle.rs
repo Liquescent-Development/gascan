@@ -152,7 +152,7 @@ async fn sigterm_waits_for_active_durable_operation_then_closes_connection() -> 
         .env("XDG_RUNTIME_DIR", &runtime_root)
         .env("GASCAN_STATE_PATH", runtime_root.join("state.sqlite3"))
         .env("GASCAN_IDLE_TIMEOUT_MS", "30000")
-        .env("GASCAN_FAKE_PROVISION_DELAY_MS", "300")
+        .env("GASCAN_FAKE_PROVISION_DELAY_MS", "2500")
         .spawn()?;
     tokio::time::timeout(Duration::from_secs(2), async {
         while !socket.exists() {
@@ -188,12 +188,12 @@ async fn sigterm_waits_for_active_durable_operation_then_closes_connection() -> 
     let pid = rustix::process::Pid::from_raw(child.id().ok_or("daemon has no process id")? as i32)
         .ok_or("daemon process id is zero")?;
     rustix::process::kill_process(pid, rustix::process::Signal::TERM)?;
-    tokio::time::sleep(Duration::from_millis(75)).await;
+    tokio::time::sleep(Duration::from_millis(2100)).await;
     assert!(
         child.try_wait()?.is_none(),
-        "daemon exited before durable operation drained"
+        "daemon applied its former two-second timeout to durable work"
     );
-    tokio::time::timeout(Duration::from_secs(2), operation).await???;
+    tokio::time::timeout(Duration::from_secs(3), operation).await???;
     assert!(
         tokio::time::timeout(Duration::from_secs(2), child.wait())
             .await??

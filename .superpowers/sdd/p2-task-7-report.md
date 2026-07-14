@@ -45,6 +45,27 @@ The managed command sandbox denies Unix socket bind with OS `EPERM`. Re-running 
 - `cargo test --workspace` (approved escalation for UDS bind) — all non-live tests passed; 9 Apple live tests ignored.
 - `cargo doc -p gascand --no-deps` — passed.
 - `cargo clippy -p gascand --all-targets -- -D warnings` — passed.
+
+## Final shutdown correction
+
+The daemon no longer applies its connection-drain timeout to durable work.
+SIGTERM atomically closes operation admission and resolves Tonic shutdown so
+new accepts stop, then awaits the durable operation count to reach zero without
+a daemon-level timeout. Operation admission increments and rechecks the gate,
+so a request racing shutdown is either counted before the wait or rejected.
+Only after durable work drains does the daemon cancel client streams and apply
+the explicit two-second bound to stream/connection closure.
+
+Event forwarding is cancellation-aware even when its 16-item client buffer is
+saturated: after receiving a durable event it selects cancellation against
+`reserve`, rather than awaiting `send` unconditionally. The saturated-buffer
+test holds the source and client sides open, fills beyond 16 events, cancels,
+and proves the forwarding activity lease releases and the stream closes.
+
+The child-process durable-shutdown regression now delays provisioning for 2.5
+seconds. After SIGTERM it proves the daemon is still alive beyond the former
+two-second timeout, then observes operation completion and bounded connection
+and socket cleanup.
 - `cargo fmt --all -- --check` and `git diff --check` — passed.
 
 Task 7 implementation is complete and pending independent review.
