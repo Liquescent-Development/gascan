@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")/../.." && pwd -P)
+revision=f6b248c5926240856dbea83d1d2c5c90ea1c1456
+selector="$root/images/workspace/bin/select-gascamp"
+dockerfile="$root/images/workspace/Dockerfile"
+
+test -x "$selector"
+grep -Fq "ARG GASCAMP_REVISION=$revision" "$dockerfile"
+grep -Fq 'checkout --detach "${GASCAMP_REVISION}"' "$dockerfile"
+grep -Fq 'cargo test --locked' "$dockerfile"
+grep -Fq '/opt/gascan/gascamp/bin/camp' "$dockerfile"
+grep -Fq 'campd' "$dockerfile"
+grep -Fq 'select-gascamp' "$dockerfile"
+
+reference_file=${GASCAN_IMAGE_REF_FILE:-"$root/.artifacts/workspace-image-ref"}
+if [[ ! -f "$reference_file" ]]; then
+  printf 'SKIP live Gascamp image smoke: missing image reference %s\n' "$reference_file"
+  exit 0
+fi
+
+container_bin=${CONTAINER_BIN:-container}
+image=$(cat "$reference_file")
+"$container_bin" run --rm "$image" bash -ceu '
+  revision=f6b248c5926240856dbea83d1d2c5c90ea1c1456
+  test "$(cat /opt/gascan/gascamp/REVISION)" = "$revision"
+  /opt/gascan/gascamp/bin/camp --version
+  test -L /opt/gascan/gascamp/bin/campd
+  test "$(readlink /opt/gascan/gascamp/bin/campd)" = camp
+  timeout 10 /opt/gascan/gascamp/bin/campd --version
+
+  metadata=$(select-gascamp)
+  test "$(printf "%s" "$metadata" | jq -r .source)" = bundled
+  test "$(printf "%s" "$metadata" | jq -r .revision)" = "$revision"
+  test "$(printf "%s" "$metadata" | jq -r .trusted)" = true
+
+  mkdir -p /workspace/gascamp/bin
+  cp /opt/gascan/gascamp/bin/camp /workspace/gascamp/bin/camp
+  metadata=$(select-gascamp /workspace/gascamp)
+  test "$(printf "%s" "$metadata" | jq -r .source)" = workspace
+  test "$(printf "%s" "$metadata" | jq -r .path)" = /workspace/gascamp
+  test "$(printf "%s" "$metadata" | jq -r .trusted)" = false
+
+  rm /workspace/gascamp/bin/camp
+  ln -s /opt/gascan/gascamp/bin/camp /workspace/gascamp/bin/camp
+  ! select-gascamp /workspace/gascamp
+  rm /workspace/gascamp/bin/camp
+  cp /opt/gascan/gascamp/bin/camp /workspace/gascamp/bin/camp
+
+  ! select-gascamp /opt/gascan/gascamp
+  ! select-gascamp /workspace/gascamp-link-outside
+  mv /workspace/gascamp /workspace/gascamp-real
+  ln -s /opt/gascan/gascamp /workspace/gascamp
+  ! select-gascamp /workspace/gascamp
+'

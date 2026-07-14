@@ -2,6 +2,7 @@
 #![deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 pub mod fake_runtime;
+pub mod gascamp;
 pub mod manifest;
 pub mod policy;
 pub mod runtime;

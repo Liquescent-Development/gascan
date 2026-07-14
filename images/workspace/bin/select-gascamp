@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+revision=f6b248c5926240856dbea83d1d2c5c90ea1c1456
+bundled=/opt/gascan/gascamp/bin/camp
+requested=${1:-bundled}
+
+if [[ "$requested" == bundled ]]; then
+  test -x "$bundled" || { printf 'bundled Gascamp is not executable: %s\n' "$bundled" >&2; exit 1; }
+  jq --null-input --compact-output \
+    --arg revision "$revision" \
+    --arg path "$bundled" \
+    '{source: "bundled", revision: $revision, path: $path, trusted: true}'
+  exit 0
+fi
+
+lexical=$(realpath --canonicalize-missing -- "$requested")
+case "$lexical" in
+  /workspace/gascamp|/workspace/gascamp/*) ;;
+  *) printf 'local Gascamp must be beneath /workspace/gascamp: %s\n' "$requested" >&2; exit 1 ;;
+esac
+
+canonical=$(realpath --canonicalize-existing -- "$requested") || {
+  printf 'local Gascamp does not exist: %s\n' "$requested" >&2
+  exit 1
+}
+case "$canonical" in
+  /workspace/gascamp|/workspace/gascamp/*) ;;
+  *) printf 'local Gascamp escapes /workspace/gascamp: %s\n' "$requested" >&2; exit 1 ;;
+esac
+
+camp="$canonical/bin/camp"
+test -x "$camp" || { printf 'local Gascamp camp is not executable: %s\n' "$camp" >&2; exit 1; }
+canonical_camp=$(realpath --canonicalize-existing -- "$camp") || {
+  printf 'local Gascamp camp cannot be resolved: %s\n' "$camp" >&2
+  exit 1
+}
+case "$canonical_camp" in
+  "$canonical"/*) ;;
+  *) printf 'local Gascamp camp escapes its checkout: %s\n' "$camp" >&2; exit 1 ;;
+esac
+jq --null-input --compact-output \
+  --arg path "$canonical" \
+  --arg executable "$canonical_camp" \
+  '{source: "workspace", path: $path, executable: $executable, trusted: false}'
