@@ -76,14 +76,18 @@ impl AppleAttach {
             return Err(io_error("guest argv must not be empty"));
         }
 
-        let mut child = Command::new(&self.helper)
+        let mut command = Command::new(&self.helper);
+        command
             .args(&self.helper_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(command_error)?;
+            .stderr(if std::env::var_os("GASCAN_ATTACH_DIAGNOSTICS").is_some() {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
+            .kill_on_drop(true);
+        let mut child = command.spawn().map_err(command_error)?;
         let mut stdin = child.stdin.take().ok_or_else(|| missing_pipe("stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| missing_pipe("stdout"))?;
 

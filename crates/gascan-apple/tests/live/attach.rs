@@ -1,4 +1,5 @@
 use gascan_apple::{AttachInput, AttachOutput};
+use std::time::Duration;
 
 use super::common::{LiveContext, TestError};
 
@@ -31,24 +32,43 @@ async fn attached_process_reports_resize_signal_and_exit() -> Result<(), TestErr
 #[tokio::test]
 #[ignore = "requires Apple silicon macOS 26+ with container service"]
 async fn attach_preserves_binary_streams_and_exact_exit_codes() -> Result<(), TestError> {
+    eprintln!("attach diagnostic: creating live context");
     let ctx = LiveContext::new("attach-pipes").await?;
-    let mut session = ctx
-        .attach(
+    eprintln!("attach diagnostic: starting non-TTY guest process");
+    let mut session = tokio::time::timeout(
+        Duration::from_secs(15),
+        ctx.attach(
             [
                 "sh",
                 "-c",
                 "printf '\\000\\377'; printf '\\376\\001' >&2; exit 42",
             ],
             false,
-        )
-        .await?;
+        ),
+    )
+    .await
+    .map_err(|_| "timed out starting helper session")??;
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let exit = loop {
-        match session.recv().await? {
-            Some(AttachOutput::Stdout(bytes)) => stdout.extend(bytes),
-            Some(AttachOutput::Stderr(bytes)) => stderr.extend(bytes),
-            Some(AttachOutput::Exit(code)) => break code,
+        let event = tokio::time::timeout(Duration::from_secs(10), session.recv())
+            .await
+            .map_err(|_| {
+                format!("timed out waiting for helper event; stdout={stdout:?}, stderr={stderr:?}")
+            })??;
+        match event {
+            Some(AttachOutput::Stdout(bytes)) => {
+                eprintln!("attach diagnostic: stdout {} byte(s)", bytes.len());
+                stdout.extend(bytes);
+            }
+            Some(AttachOutput::Stderr(bytes)) => {
+                eprintln!("attach diagnostic: stderr {} byte(s)", bytes.len());
+                stderr.extend(bytes);
+            }
+            Some(AttachOutput::Exit(code)) => {
+                eprintln!("attach diagnostic: exit {code}");
+                break code;
+            }
             None => return Err("attachment ended without exact exit".into()),
         }
     };

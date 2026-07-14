@@ -1,6 +1,13 @@
 import ContainerAPIClient
 import Foundation
 
+func diagnostic(_ message: String) {
+    guard ProcessInfo.processInfo.environment["GASCAN_ATTACH_DIAGNOSTICS"] != nil else {
+        return
+    }
+    try? FileHandle.standardError.write(contentsOf: Data("gascan-apple-attach: \(message)\n".utf8))
+}
+
 actor FrameEmitter {
     private var terminal = false
     private let encoder = JSONEncoder()
@@ -40,6 +47,7 @@ struct GasCanAppleAttach {
         }
         let first = try JSONDecoder().decode(InputFrame.self, from: Data(firstLine.utf8))
         try validateVersion(first)
+        diagnostic("validated start frame")
         guard case .start(_, let containerID, let argv, let tty) = first else {
             throw ProtocolFailure.expectedStart
         }
@@ -52,6 +60,7 @@ struct GasCanAppleAttach {
         let errorPipe = tty ? nil : Pipe()
         let client = ContainerClient()
         let container = try await client.get(id: containerID)
+        diagnostic("resolved container")
         var configuration = container.configuration.initProcess
         configuration.executable = executable
         configuration.arguments = Array(argv.dropFirst())
@@ -67,7 +76,9 @@ struct GasCanAppleAttach {
                 errorPipe?.fileHandleForWriting,
             ]
         )
+        diagnostic("created guest process \(process.id)")
         try await process.start()
+        diagnostic("started guest process")
         try inputPipe.fileHandleForReading.close()
         try outputPipe.fileHandleForWriting.close()
         try errorPipe?.fileHandleForWriting.close()
@@ -76,6 +87,7 @@ struct GasCanAppleAttach {
             try await forward(
                 outputPipe.fileHandleForReading,
                 frame: OutputFrame.stdout,
+                name: "stdout",
                 emitter: emitter
             )
         }
@@ -84,6 +96,7 @@ struct GasCanAppleAttach {
                 try await forward(
                     errorPipe.fileHandleForReading,
                     frame: OutputFrame.stderr,
+                    name: "stderr",
                     emitter: emitter
                 )
             }
@@ -97,10 +110,12 @@ struct GasCanAppleAttach {
         }
 
         let code = try await process.wait()
+        diagnostic("guest wait returned \(code); draining output")
         inputTask.cancel()
         try? inputPipe.fileHandleForWriting.close()
         try await stdoutTask.value
         try await stderrTask.value
+        diagnostic("output drain completed; emitting exit")
         try await emitter.emit(.exit(code))
     }
 
@@ -134,12 +149,14 @@ struct GasCanAppleAttach {
     private static func forward(
         _ input: FileHandle,
         frame: @escaping @Sendable (Data) -> OutputFrame,
+        name: String,
         emitter: FrameEmitter
     ) async throws {
         for try await byte in input.bytes {
             try Task.checkCancellation()
             try await emitter.emit(frame(Data([byte])))
         }
+        diagnostic("\(name) reached EOF")
     }
 }
 
