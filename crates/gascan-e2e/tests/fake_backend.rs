@@ -576,11 +576,19 @@ async fn logs_since_and_follow_emit_new_byte_exact_records_then_cancel() -> Test
             .status
             .success()
     );
-    let since = std::time::SystemTime::now()
+    let since_millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis()
-        .to_string();
-    std::thread::sleep(std::time::Duration::from_millis(2));
+        .checked_add(1)
+        .ok_or("millisecond boundary overflow")?;
+    while std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis()
+        < since_millis
+    {
+        tokio::task::yield_now().await;
+    }
+    let since = since_millis.to_string();
     assert!(
         env.invoke(&["run", "--", "fake-stdout", "after-marker"])?
             .status

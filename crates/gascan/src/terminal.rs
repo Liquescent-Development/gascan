@@ -26,16 +26,29 @@ impl RawTerminal {
         Self::acquire_fd(stdin.as_fd())
     }
     fn acquire_fd(fd: impl AsFd) -> std::io::Result<Self> {
+        Self::acquire_fd_with(
+            fd,
+            |fd| rustix::io::dup(fd).map_err(std::io::Error::from),
+            || Ok(()),
+        )
+    }
+    fn acquire_fd_with(
+        fd: impl AsFd,
+        duplicate: impl FnOnce(std::os::fd::BorrowedFd<'_>) -> std::io::Result<std::os::fd::OwnedFd>,
+        after_raw: impl FnOnce() -> std::io::Result<()>,
+    ) -> std::io::Result<Self> {
         let saved = rustix::termios::tcgetattr(fd.as_fd())?;
+        let terminal = Self {
+            state: std::sync::Arc::new(std::sync::Mutex::new(Some(TerminalState {
+                fd: duplicate(fd.as_fd())?,
+                saved: saved.clone(),
+            }))),
+        };
         let mut raw = saved.clone();
         raw.make_raw();
         rustix::termios::tcsetattr(fd.as_fd(), rustix::termios::OptionalActions::Now, &raw)?;
-        Ok(Self {
-            state: std::sync::Arc::new(std::sync::Mutex::new(Some(TerminalState {
-                fd: rustix::io::dup(fd.as_fd())?,
-                saved,
-            }))),
-        })
+        after_raw()?;
+        Ok(terminal)
     }
     pub fn restore_handle(&self) -> TerminalRestore {
         TerminalRestore {
@@ -71,6 +84,17 @@ impl Drop for RawTerminal {
 mod tests {
     use super::RawTerminal;
 
+    fn assert_modes_equal(left: &rustix::termios::Termios, right: &rustix::termios::Termios) {
+        let mut left_local = left.local_modes;
+        let mut right_local = right.local_modes;
+        left_local.remove(rustix::termios::LocalModes::PENDIN);
+        right_local.remove(rustix::termios::LocalModes::PENDIN);
+        assert_eq!(left.input_modes, right.input_modes);
+        assert_eq!(left.output_modes, right.output_modes);
+        assert_eq!(left.control_modes, right.control_modes);
+        assert_eq!(left_local, right_local);
+    }
+
     #[test]
     #[allow(clippy::panic, reason = "test-only unwind is the behavior under test")]
     fn panic_unwind_restores_a_real_pty() -> Result<(), Box<dyn std::error::Error>> {
@@ -105,6 +129,29 @@ mod tests {
         restored_local.remove(rustix::termios::LocalModes::PENDIN);
         saved_local.remove(rustix::termios::LocalModes::PENDIN);
         assert_eq!(restored_local, saved_local);
+        Ok(())
+    }
+
+    #[test]
+    fn setup_failures_never_leave_a_real_pty_raw() -> Result<(), Box<dyn std::error::Error>> {
+        let pty = rustix_openpty::openpty(None, None)?;
+        let saved = rustix::termios::tcgetattr(&pty.user)?;
+
+        let duplicate_error = RawTerminal::acquire_fd_with(
+            &pty.user,
+            |_| Err(std::io::Error::other("injected duplicate failure")),
+            || Ok(()),
+        );
+        assert!(duplicate_error.is_err());
+        assert_modes_equal(&rustix::termios::tcgetattr(&pty.user)?, &saved);
+
+        let setup_error = RawTerminal::acquire_fd_with(
+            &pty.user,
+            |fd| rustix::io::dup(fd).map_err(std::io::Error::from),
+            || Err(std::io::Error::other("injected post-mutation failure")),
+        );
+        assert!(setup_error.is_err());
+        assert_modes_equal(&rustix::termios::tcgetattr(&pty.user)?, &saved);
         Ok(())
     }
 }

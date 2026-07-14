@@ -347,6 +347,11 @@ async fn exec_and_logs_preserve_binary_bytes_and_exact_exit_code() {
         backend.logs(&id, None).await.unwrap(),
         vec![0, 255, 10, 0, 255, 1, 254, 0]
     );
+    // `since` is inclusive: the fixture record stamped at the exact boundary is retained.
+    assert_eq!(
+        backend.logs(&id, Some(0)).await.unwrap(),
+        vec![0, 255, 10, 0, 255, 1, 254, 0]
+    );
     assert!(backend.logs(&id, Some(i64::MAX)).await.unwrap().is_empty());
 }
 
