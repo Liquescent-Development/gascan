@@ -1,0 +1,25 @@
+base_image = "ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab"
+ubuntu_snapshot = "2026-07-13T00:00:00Z"
+workspace_tag = "gascan-workspace:d4964500a3295a33"
+
+[mise]
+version = "2026.5.0"
+url = "https://github.com/jdx/mise/releases/download/v2026.5.0/mise-v2026.5.0-linux-arm64"
+sha256 = "fba7c8a383cf3c59eb5a9995d5299fd2c78eba7eb1daace48d75fe491362f79a"
+
+[playwright_chromium]
+version = "149.0.7827.55+1228"
+url = "https://cdn.playwright.dev/dbazure/download/playwright/builds/chromium/1228/chromium-linux-arm64.zip"
+sha256 = "ec044b50ed065adeb4c5ffdb42d1529901cbaf897cdf542bfef8af01d6e0cc79"
+
+[gascamp]
+revision = "f6b248c5926240856dbea83d1d2c5c90ea1c1456"
+
+[tools]
+elixir = "1.20.2-otp-29"
+go = "1.26.5"
+java = "25.0.2"
+node = "24.18.0"
+python = "3.14.6"
+ruby = "3.4.10"
+rust = "1.97.0"
