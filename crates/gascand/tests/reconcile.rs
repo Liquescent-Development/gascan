@@ -11,6 +11,7 @@ use gascand::{
 };
 use serde_json::json;
 use std::error::Error;
+use std::os::unix::process::ExitStatusExt;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
@@ -249,7 +250,11 @@ async fn provision_and_health_kill_point_phase_matrix_has_exact_recovery_status(
             .env("GASCAN_HOOK_CRASH_TARGET", target)
             .env("GASCAN_HOOK_CRASH_DELAY_MS", delay_ms.to_string())
             .status()?;
-        assert!(!status.success(), "child must terminate at the kill point");
+        assert_eq!(
+            status.signal(),
+            Some(6),
+            "child must terminate via SIGABRT at the kill point"
+        );
         let store = Store::open(&path)?;
         let id = store
             .list_sandboxes()?
