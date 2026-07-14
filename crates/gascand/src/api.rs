@@ -270,19 +270,22 @@ impl Daemon {
     }
 }
 
-fn unavailable() -> tonic::Status {
-    tonic::Status::unimplemented(error_code::BACKEND_UNAVAILABLE)
-}
-
 /// Tonic adapter for the durable sandbox lifecycle service.
 pub struct SandboxApi<B: RuntimeBackend> {
     service: Arc<SandboxService<B>>,
     activity: ActivityTracker,
+    sessions: Arc<
+        tokio::sync::Mutex<std::collections::HashMap<Vec<u8>, gascan_core::runtime::ExecSession>>,
+    >,
 }
 impl<B: RuntimeBackend> SandboxApi<B> {
     #[must_use]
     pub fn new(service: Arc<SandboxService<B>>, activity: ActivityTracker) -> Self {
-        Self { service, activity }
+        Self {
+            service,
+            activity,
+            sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        }
     }
 }
 
@@ -460,8 +463,49 @@ async fn spec_for_root(project_root: String) -> Result<SandboxSpec, ApiInputErro
     .map_err(|_| ApiInputError::Internal)?
 }
 
-type EventStream = tokio_stream::Empty<Result<v1::OperationEvent, tonic::Status>>;
-type AttachStream = tokio_stream::Empty<Result<v1::ServerFrame, tonic::Status>>;
+type EventStream =
+    tokio_stream::wrappers::ReceiverStream<Result<v1::OperationEvent, tonic::Status>>;
+type AttachStream = tokio_stream::wrappers::ReceiverStream<Result<v1::ServerFrame, tonic::Status>>;
+
+fn session_event(token: Vec<u8>) -> v1::OperationEvent {
+    v1::OperationEvent {
+        operation_id: None,
+        timestamp: None,
+        phase: "session_ready".to_owned(),
+        payload: Vec::new(),
+        error: None,
+        sequence: 1,
+        status: v1::OperationStatus::Completed as i32,
+        content_type: String::new(),
+        session_token: token,
+    }
+}
+
+fn event_stream(event: v1::OperationEvent) -> EventStream {
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    let _ = sender.try_send(Ok(event));
+    tokio_stream::wrappers::ReceiverStream::new(receiver)
+}
+
+fn argv_from_wire(argv: Vec<Vec<u8>>) -> Result<Vec<String>, ApiInputError> {
+    if argv.is_empty() {
+        return Err(ApiInputError::Invalid);
+    }
+    argv.into_iter()
+        .map(|argument| String::from_utf8(argument).map_err(|_| ApiInputError::Invalid))
+        .collect()
+}
+
+fn allowed_environment() -> std::collections::BTreeMap<String, String> {
+    ["TERM", "LANG", "LC_ALL", "COLORTERM"]
+        .into_iter()
+        .filter_map(|name| {
+            std::env::var(name)
+                .ok()
+                .map(|value| (name.to_owned(), value))
+        })
+        .collect()
+}
 
 #[tonic::async_trait]
 impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
@@ -574,20 +618,54 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
     type RunStream = EventStream;
     async fn run(
         &self,
-        _: tonic::Request<v1::RunRequest>,
+        request: tonic::Request<v1::RunRequest>,
     ) -> Result<tonic::Response<Self::RunStream>, tonic::Status> {
         self.activity.ensure_accepting().map_err(admission_status)?;
         let _lease = self.activity.lease();
-        Err(unavailable())
+        let request = request.into_inner();
+        let id = selector_id(request.sandbox).map_err(ApiInputError::status)?;
+        let command = request
+            .command
+            .ok_or_else(|| tonic::Status::invalid_argument(error_code::INVALID_REQUEST))?;
+        let session = self
+            .service
+            .exec(
+                &id,
+                argv_from_wire(command.argv).map_err(ApiInputError::status)?,
+                command.stdin,
+                allowed_environment(),
+                false,
+            )
+            .await
+            .map_err(service_status)?;
+        let mut token = vec![0_u8; 24];
+        getrandom::fill(&mut token).map_err(|_| tonic::Status::internal(error_code::INTERNAL))?;
+        self.sessions.lock().await.insert(token.clone(), session);
+        Ok(tonic::Response::new(event_stream(session_event(token))))
     }
     type ShellStream = EventStream;
     async fn shell(
         &self,
-        _: tonic::Request<v1::ShellRequest>,
+        request: tonic::Request<v1::ShellRequest>,
     ) -> Result<tonic::Response<Self::ShellStream>, tonic::Status> {
         self.activity.ensure_accepting().map_err(admission_status)?;
         let _lease = self.activity.lease();
-        Err(unavailable())
+        let request = request.into_inner();
+        let id = selector_id(request.sandbox).map_err(ApiInputError::status)?;
+        let argv = if request.argv.is_empty() {
+            vec!["sh".to_owned()]
+        } else {
+            argv_from_wire(request.argv).map_err(ApiInputError::status)?
+        };
+        let session = self
+            .service
+            .exec(&id, argv, Vec::new(), allowed_environment(), true)
+            .await
+            .map_err(service_status)?;
+        let mut token = vec![0_u8; 24];
+        getrandom::fill(&mut token).map_err(|_| tonic::Status::internal(error_code::INTERNAL))?;
+        self.sessions.lock().await.insert(token.clone(), session);
+        Ok(tonic::Response::new(event_stream(session_event(token))))
     }
     type DownStream = ApiEventStream;
     async fn down(
@@ -618,20 +696,75 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
     type LogsStream = EventStream;
     async fn logs(
         &self,
-        _: tonic::Request<v1::LogsRequest>,
+        request: tonic::Request<v1::LogsRequest>,
     ) -> Result<tonic::Response<Self::LogsStream>, tonic::Status> {
         self.activity.ensure_accepting().map_err(admission_status)?;
         let _lease = self.activity.lease();
-        Err(unavailable())
+        let id = selector_id(request.into_inner().sandbox).map_err(ApiInputError::status)?;
+        let bytes = self.service.logs(&id).await.map_err(service_status)?;
+        Ok(tonic::Response::new(event_stream(v1::OperationEvent {
+            operation_id: None,
+            timestamp: None,
+            phase: "logs".to_owned(),
+            payload: bytes,
+            error: None,
+            sequence: 1,
+            status: v1::OperationStatus::Completed as i32,
+            content_type: "application/octet-stream".to_owned(),
+            session_token: Vec::new(),
+        })))
     }
     type AttachStream = AttachStream;
     async fn attach(
         &self,
-        _: tonic::Request<tonic::Streaming<v1::ClientFrame>>,
+        request: tonic::Request<tonic::Streaming<v1::ClientFrame>>,
     ) -> Result<tonic::Response<Self::AttachStream>, tonic::Status> {
         self.activity.ensure_accepting().map_err(admission_status)?;
         let _lease = self.activity.lease();
-        Err(unavailable())
+        let mut input = request.into_inner();
+        let first = input
+            .message()
+            .await?
+            .ok_or_else(|| tonic::Status::invalid_argument(error_code::EMPTY_SESSION_TOKEN))?;
+        let mut binder = gascan_proto::AttachSessionBinder::new();
+        binder
+            .validate_frame(&first.session_token)
+            .map_err(|error| tonic::Status::invalid_argument(error.code()))?;
+        let session = self
+            .sessions
+            .lock()
+            .await
+            .remove(&first.session_token)
+            .ok_or_else(|| tonic::Status::not_found(error_code::UNKNOWN_SESSION_TOKEN))?;
+        while let Some(frame) = input.message().await? {
+            binder
+                .validate_frame(&frame.session_token)
+                .map_err(|error| tonic::Status::invalid_argument(error.code()))?;
+        }
+        let (sender, receiver) = tokio::sync::mpsc::channel(3);
+        for frame in [
+            v1::ServerFrame {
+                frame: Some(v1::server_frame::Frame::Stdout(session.stdout().to_vec())),
+            },
+            v1::ServerFrame {
+                frame: Some(v1::server_frame::Frame::Stderr(session.stderr().to_vec())),
+            },
+            v1::ServerFrame {
+                frame: Some(v1::server_frame::Frame::Exit(v1::Exit {
+                    code: session.exit_code(),
+                    signal: 0,
+                })),
+            },
+        ] {
+            sender
+                .send(Ok(frame))
+                .await
+                .map_err(|_| tonic::Status::internal(error_code::INTERNAL))?;
+        }
+        drop(sender);
+        Ok(tonic::Response::new(
+            tokio_stream::wrappers::ReceiverStream::new(receiver),
+        ))
     }
 }
 

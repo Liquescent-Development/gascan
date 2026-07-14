@@ -2,6 +2,7 @@
 #![deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use gascan_core::fake_runtime::FakeRuntime;
+use gascan_core::runtime::RuntimeBackend;
 use gascand::{
     Daemon, DaemonConfig, ProvisionRequest, ProvisionResolution, Provisioner, SandboxApi,
     SandboxService, ServiceError, SocketPaths, Store,
@@ -44,8 +45,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .map_or(Duration::ZERO, Duration::from_millis);
+    let runtime = FakeRuntime::default();
+    for record in store.list_sandboxes()? {
+        if record.actual_state != gascand::ActualState::Absent {
+            runtime.seed_owned(record.id.clone()).await;
+            if record.actual_state == gascand::ActualState::Running {
+                runtime.start(&record.id).await?;
+            }
+        }
+    }
     let service = Arc::new(SandboxService::new(
-        FakeRuntime::default(),
+        runtime,
         store,
         Arc::new(ConfiguredProvisioner {
             delay: provision_delay,

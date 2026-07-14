@@ -412,6 +412,21 @@ impl RuntimeBackend for FakeRuntime {
                 message: "exec requires a running sandbox".to_owned(),
             });
         }
+        if request.argv.as_slice() == ["sh", "-c", "exit 42"] {
+            return Ok(ExecSession::from_output(Vec::new(), Vec::new(), 42));
+        }
+        if request.argv.len() == 3 && request.argv[0] == "sh" && request.argv[1] == "-c" {
+            if let Some(payload) = request.argv[2]
+                .strip_prefix("printf '")
+                .and_then(|value| value.strip_suffix('\''))
+            {
+                return Ok(ExecSession::from_output(
+                    payload.as_bytes().to_vec(),
+                    Vec::new(),
+                    0,
+                ));
+            }
+        }
         Ok(state.exec_result.clone())
     }
 

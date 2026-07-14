@@ -119,6 +119,60 @@ impl<B: RuntimeBackend> SandboxService<B> {
     pub const fn store(&self) -> &Store {
         &self.store
     }
+
+    pub async fn exec(
+        &self,
+        id: &SandboxId,
+        argv: Vec<String>,
+        stdin: Vec<u8>,
+        environment: std::collections::BTreeMap<String, String>,
+        tty: bool,
+    ) -> Result<gascan_core::runtime::ExecSession, ServiceError> {
+        self.require_owned_running(id).await?;
+        self.runtime
+            .exec(gascan_core::runtime::ExecRequest {
+                id: id.clone(),
+                argv,
+                stdin,
+                environment,
+                tty,
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn logs(&self, id: &SandboxId) -> Result<Vec<u8>, ServiceError> {
+        self.require_owned(id).await?;
+        self.runtime.logs(id).await.map_err(Into::into)
+    }
+
+    async fn require_owned_running(&self, id: &SandboxId) -> Result<(), ServiceError> {
+        let sandbox = self.require_owned(id).await?;
+        if sandbox.state != ContainerState::Running {
+            return Err(ServiceError::Runtime(RuntimeError::InvalidState {
+                resource: id.to_string(),
+                message: "exec requires a running sandbox".to_owned(),
+            }));
+        }
+        Ok(())
+    }
+
+    async fn require_owned(
+        &self,
+        id: &SandboxId,
+    ) -> Result<gascan_core::runtime::RuntimeSandbox, ServiceError> {
+        let sandbox = self
+            .runtime
+            .inspect(id)
+            .await?
+            .ok_or_else(|| ServiceError::Missing(id.clone()))?;
+        if sandbox.ownership.managed_by != "gascan" || sandbox.ownership.sandbox_id != *id {
+            return Err(ServiceError::Runtime(RuntimeError::OwnershipMismatch {
+                resource: id.to_string(),
+            }));
+        }
+        Ok(sandbox)
+    }
     pub fn list(&self) -> Result<Vec<SandboxRecord>, ServiceError> {
         Ok(self.store.list_sandboxes()?)
     }

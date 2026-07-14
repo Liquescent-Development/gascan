@@ -4,7 +4,7 @@
 
 - Added a Unix-domain-only Tonic daemon, private socket-path management, same-effective-UID peer authentication, lifecycle API adapter, activity accounting, idle shutdown, and SIGTERM cleanup.
 - Added the narrowly authorized pre-release v1 correction that binds Up/Apply to an absolute project root; it is committed separately as `c8b78c6`.
-- Run, Shell, Logs, and Attach return the stable `backend_unavailable` code because Task 5 exposes no session/log lifecycle seam. Task 8 was not started.
+- At the Task 7 review boundary, Run, Shell, Logs, and Attach returned the stable `backend_unavailable` code. Task 8 subsequently filled those execution stubs through the existing backend exec/logs methods without changing the nine-method runtime contract.
 
 ## TDD evidence
 

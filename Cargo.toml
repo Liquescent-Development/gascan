@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/gascan-apple", "crates/gascan-core", "crates/gascan-proto", "crates/gascand"]
+members = ["crates/gascan", "crates/gascan-apple", "crates/gascan-core", "crates/gascan-e2e", "crates/gascan-proto", "crates/gascand"]
 resolver = "3"
 
 [workspace.package]
@@ -26,6 +26,7 @@ tonic = "0.12"
 tower = "0.4"
 hyper-util = { version = "0.1", features = ["tokio"] }
 getrandom = "0.4"
+clap = { version = "4", features = ["derive"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
