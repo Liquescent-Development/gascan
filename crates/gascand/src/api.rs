@@ -253,8 +253,7 @@ impl Daemon {
                     {
                         Some(Ok(stream))
                     }
-                    Ok(_) => None,
-                    Err(error) => Some(Err(error)),
+                    Ok(_) | Err(_) => None,
                 },
                 Err(error) => Some(Err(error)),
             });

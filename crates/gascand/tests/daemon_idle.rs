@@ -77,6 +77,61 @@ async fn sigterm_stops_daemon_and_removes_owned_socket() -> TestResult {
 }
 
 #[tokio::test]
+async fn raw_liveness_probe_disconnect_does_not_end_server() -> TestResult {
+    for _ in 0..20 {
+        let temp = TempDir::new()?;
+        let runtime_root = temp.path().canonicalize()?;
+        let socket = runtime_root.join("gascan/gascand.sock");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_gascand"))
+            .env("XDG_RUNTIME_DIR", &runtime_root)
+            .env("GASCAN_STATE_PATH", runtime_root.join("state.sqlite3"))
+            .env("GASCAN_IDLE_TIMEOUT_MS", "30000")
+            .spawn()?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !socket.exists() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await?;
+        drop(std::os::unix::net::UnixStream::connect(&socket)?);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(child.try_wait()?.is_none());
+        let endpoint = tonic::transport::Endpoint::try_from("http://[::]:50051")?;
+        let connect_path = socket.clone();
+        let channel = endpoint
+            .connect_with_connector(service_fn(move |_| {
+                let path = connect_path.clone();
+                async move {
+                    tokio::net::UnixStream::connect(path)
+                        .await
+                        .map(hyper_util::rt::TokioIo::new)
+                }
+            }))
+            .await?;
+        let response = GasCanClient::new(channel)
+            .handshake(HandshakeRequest {
+                api_major: 1,
+                api_minor: 0,
+                requested_capabilities: Vec::new(),
+            })
+            .await?
+            .into_inner();
+        assert!(response.rejection.is_none());
+        let pid =
+            rustix::process::Pid::from_raw(child.id().ok_or("daemon has no process id")? as i32)
+                .ok_or("daemon process id is zero")?;
+        rustix::process::kill_process(pid, rustix::process::Signal::TERM)?;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), child.wait())
+                .await??
+                .success()
+        );
+        assert!(!socket.exists());
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn real_uds_tonic_lifecycle_request_reaches_sandbox_service() -> TestResult {
     let temp = TempDir::new()?;
     let runtime_root = temp.path().canonicalize()?;
