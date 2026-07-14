@@ -55,29 +55,19 @@ async fn cpu_and_memory_limits_are_observable_in_guest() -> Result<(), TestError
         Some(268_435_456)
     );
 
-    let cpu_max = String::from_utf8(
-        ctx.exec("if test -f /sys/fs/cgroup/cpu.max; then cat /sys/fs/cgroup/cpu.max; else printf unavailable; fi")
-            .await?.stdout,
-    )?;
-    if cpu_max.trim() != "unavailable" {
-        let values: Vec<u64> = cpu_max
-            .split_whitespace()
-            .map(str::parse)
-            .collect::<Result<_, _>>()?;
-        assert_eq!(values.len(), 2, "unexpected cpu.max: {cpu_max:?}");
-        assert_eq!(
-            values[0], values[1],
-            "cpu.max does not encode one CPU: {cpu_max:?}"
-        );
-    }
+    let cpu_max = String::from_utf8(ctx.exec("cat /sys/fs/cgroup/cpu.max").await?.stdout)?;
+    let values: Vec<u64> = cpu_max
+        .split_whitespace()
+        .map(str::parse)
+        .collect::<Result<_, _>>()?;
+    assert_eq!(values.len(), 2, "unexpected cpu.max: {cpu_max:?}");
+    assert_eq!(
+        values[0], values[1],
+        "cpu.max does not encode one CPU: {cpu_max:?}"
+    );
 
-    let memory_max = String::from_utf8(
-        ctx.exec("if test -f /sys/fs/cgroup/memory.max; then cat /sys/fs/cgroup/memory.max; else printf unavailable; fi")
-            .await?.stdout,
-    )?;
-    if memory_max.trim() != "unavailable" && memory_max.trim() != "max" {
-        assert_eq!(memory_max.trim().parse::<u64>()?, 268_435_456);
-    }
+    let memory_max = String::from_utf8(ctx.exec("cat /sys/fs/cgroup/memory.max").await?.stdout)?;
+    assert_eq!(memory_max.trim().parse::<u64>()?, 268_435_456);
     ctx.cleanup().await
 }
 
@@ -128,6 +118,6 @@ async fn published_port_is_reachable_only_through_loopback_binding() -> Result<(
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(response.is_some(), "BusyBox httpd did not become ready");
+    assert!(response.is_some(), "netcat responder did not become ready");
     ctx.cleanup().await
 }
