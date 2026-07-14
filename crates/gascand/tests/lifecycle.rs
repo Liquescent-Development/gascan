@@ -117,6 +117,50 @@ async fn stopped_apply_that_starts_then_fails_records_running_reality() -> TestR
 }
 
 #[tokio::test]
+async fn unchanged_apply_inspects_and_starts_stopped_runtime_without_rerunning_hooks() -> TestResult
+{
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let make_spec = || SandboxSpec::from_root("unchanged-apply", root, Manifest::load(root)?);
+    let id = make_spec()?.id().clone();
+    let runtime = FakeRuntime::default();
+    let provisioner = Arc::new(ControlledProvisioner::default());
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        provisioner.clone(),
+    );
+    service.up(UpRequest::new(make_spec()?)).await?;
+    runtime.stop(&id).await?;
+    service.apply(UpRequest::new(make_spec()?)).await?;
+    assert_eq!(
+        runtime.inspect(&id).await?.ok_or("runtime")?.state,
+        gascan_core::runtime::ContainerState::Running
+    );
+    assert_eq!(provisioner.provisions.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn up_after_destroy_reprovisions_the_fresh_runtime() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let make_spec = || SandboxSpec::from_root("recreate-hooks", root, Manifest::load(root)?);
+    let id = make_spec()?.id().clone();
+    let provisioner = Arc::new(ControlledProvisioner::default());
+    let service = SandboxService::new(
+        FakeRuntime::default(),
+        gascand::Store::open(root.join("state.db"))?,
+        provisioner.clone(),
+    );
+    service.up(UpRequest::new(make_spec()?)).await?;
+    service.destroy(&id).await?;
+    service.up(UpRequest::new(make_spec()?)).await?;
+    assert_eq!(provisioner.provisions.load(Ordering::SeqCst), 2);
+    Ok(())
+}
+
+#[tokio::test]
 async fn provision_and_health_failures_roll_back_new_resources() -> TestResult {
     for health in [false, true] {
         let root = tempfile::tempdir()?;
@@ -317,6 +361,28 @@ async fn failed_create_preserves_preexisting_volume_and_removes_only_new_resourc
 }
 
 #[tokio::test]
+async fn successful_create_accepts_expected_preexisting_owned_volume_without_claiming_it_created()
+-> TestResult {
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let make_spec = || SandboxSpec::from_root("preexisting-success", root, Manifest::load(root)?);
+    let runtime = FakeRuntime::default();
+    let id = make_spec()?.id().clone();
+    let names = volume_names(&runtime, make_spec()?).await?;
+    runtime
+        .seed_volume(&names[0], Some(id), ResourceOwnership::GasCanOwned)
+        .await?;
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    );
+    service.up(UpRequest::new(make_spec()?)).await?;
+    assert!(runtime.volume_exists(&names[0]).await);
+    Ok(())
+}
+
+#[tokio::test]
 async fn foreign_volume_collision_is_refused_and_preserved() -> TestResult {
     let root = tempfile::tempdir()?;
     let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
@@ -509,6 +575,40 @@ async fn different_keys_reach_the_runtime_concurrently() -> TestResult {
     runtime.release(FailureBoundary::Start, 2).await;
     first.await??;
     second.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconcile_waits_for_live_same_sandbox_mutation_instead_of_terminalizing_it() -> TestResult
+{
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let spec = SandboxSpec::from_root("reconcile-live", root, Manifest::load(root)?)?;
+    let runtime = FakeRuntime::default();
+    runtime.gate(FailureBoundary::Start).await;
+    let service = Arc::new(SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    ));
+    let up = tokio::spawn({
+        let service = service.clone();
+        async move { service.up(UpRequest::new(spec)).await }
+    });
+    wait_for_start_calls(&runtime, 1).await?;
+    let reconcile = tokio::spawn({
+        let service = service.clone();
+        async move { service.reconcile().await }
+    });
+    tokio::task::yield_now().await;
+    assert!(!reconcile.is_finished());
+    runtime.release(FailureBoundary::Start, 1).await;
+    up.await??;
+    reconcile.await??;
+    assert_eq!(
+        service.latest_operation()?.ok_or("operation")?.status,
+        OperationStatus::Completed
+    );
     Ok(())
 }
 

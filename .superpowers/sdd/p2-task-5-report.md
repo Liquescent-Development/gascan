@@ -129,3 +129,11 @@ Focused TDD evidence in this wave:
 | Async database | direct Store calls could block the sole worker | blocked-writer current-thread test progresses under one second |
 
 No Task 6 API or Apple implementation was added.
+
+### Independent review corrections
+
+The first independent review found four important gaps, all corrected before handoff: recovery now acquires the same sandbox lock as live mutations and rechecks that the operation remains Pending; unchanged apply still inspects ownership and starts a stopped runtime before completing; a newly created runtime always provisions even when an old same-fingerprint resolution remains after destroy; and initial event failures after begin receive best-effort durable failure terminalization. Regressions cover reconcile racing a gated live `up`, unchanged stopped apply, and recreate-after-destroy provisioning.
+
+Hook recovery accepts evidence only in durable sequence order: `before_provision < after_provision(version 1) < before_health < after_health`, with one matching fingerprint. Reused prior resolution is accepted only when both stored setup/tool resolution fingerprints match and ordered current health evidence succeeds. An out-of-order event regression fails recovery. The kill matrix now runs the real `SandboxService`, provisioner, and health-check path in child processes; an external test watcher aborts at before/during/after provision and before/during/after health boundaries rather than inserting synthetic events.
+
+`CreateOutcome::created()` deliberately permits a subset of requested volumes because exact, already-existing owned volumes were not created by the call and must never enter rollback. It still requires the newly created container, permits only request-authorized identities with exact sandbox association/current ownership, and rejects duplicates. A successful lifecycle regression retains an expected preexisting owned volume.

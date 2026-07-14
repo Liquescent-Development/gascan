@@ -196,9 +196,20 @@ impl<B: RuntimeBackend> SandboxService<B> {
             })
             .await?;
         let (sender, receiver) = mpsc::channel(16);
-        self.send_initial(operation.id, &sender).await?;
-        self.emit(operation.id, json!({"phase":"validated"}), &sender)
+        self.initialize_operation(operation.id, &id, record.actual_state, &sender)
             .await?;
+        if let Err(error) = self
+            .emit(operation.id, json!({"phase":"validated"}), &sender)
+            .await
+        {
+            let actual = self.runtime_actual(&id, record.actual_state).await;
+            let code = error.code();
+            let details = json!({"message":error.to_string(),"phase":"validated"});
+            let _ = self
+                .database(move |store| store.fail_operation(operation.id, actual, code, details))
+                .await;
+            return Err(error);
+        }
         let result = self
             .up_runtime(
                 &request.spec,
@@ -299,7 +310,8 @@ impl<B: RuntimeBackend> SandboxService<B> {
             }
             self.emit(operation_id, json!({"phase":"started"}), sender)
                 .await?;
-            let durable_match = prior.is_some_and(|record| resolution_matches(record, desired_fingerprint));
+            let durable_match = inspected.is_some()
+                && prior.is_some_and(|record| resolution_matches(record, desired_fingerprint));
             let resolution = if !durable_match {
                 self.emit(operation_id, json!({"phase":"before_provision","desired_fingerprint":desired_fingerprint}), sender).await?;
                 self.provisioner
@@ -381,7 +393,8 @@ impl<B: RuntimeBackend> SandboxService<B> {
             })
             .await?;
         let (sender, receiver) = mpsc::channel(16);
-        self.send_initial(operation.id, &sender).await?;
+        self.initialize_operation(operation.id, id, record.actual_state, &sender)
+            .await?;
         let result = async {
             let runtime = self
                 .runtime
@@ -439,7 +452,8 @@ impl<B: RuntimeBackend> SandboxService<B> {
             })
             .await?;
         let (sender, receiver) = mpsc::channel(16);
-        self.send_initial(operation.id, &sender).await?;
+        self.initialize_operation(operation.id, id, record.actual_state, &sender)
+            .await?;
         let result = async {
             if let Some(runtime) = self.runtime.inspect(id).await? {
                 if runtime.ownership.managed_by != "gascan" || runtime.ownership.sandbox_id != *id {
@@ -524,19 +538,10 @@ impl<B: RuntimeBackend> SandboxService<B> {
             })
             .await?;
         let (sender, receiver) = mpsc::channel(16);
-        self.send_initial(operation.id, &sender).await?;
-        if unchanged {
-            let actual = record.actual_state;
-            self.database(move |store| store.complete_operation(operation.id, actual))
-                .await?;
-            self.send_terminal(operation.id, &sender).await?;
-            return Ok(Operation {
-                id: operation.id,
-                events: receiver,
-            });
-        }
+        self.initialize_operation(operation.id, &id, record.actual_state, &sender)
+            .await?;
         let prior_actual = record.actual_state;
-        let result = async {
+        let preflight = async {
             let runtime = self
                 .runtime
                 .inspect(&id)
@@ -548,6 +553,30 @@ impl<B: RuntimeBackend> SandboxService<B> {
             if runtime.state != ContainerState::Running {
                 self.runtime.start(&id).await?;
             }
+            Ok::<_, ServiceError>(())
+        }
+        .await;
+        if let Err(error) = preflight {
+            let actual = self.runtime_actual(&id, prior_actual).await;
+            let code = error.code();
+            let details = json!({"message":error.to_string()});
+            self.database(move |store| store.fail_operation(operation.id, actual, code, details))
+                .await?;
+            self.send_terminal(operation.id, &sender).await?;
+            return Err(error);
+        }
+        if unchanged {
+            self.database(move |store| {
+                store.complete_operation(operation.id, ActualState::Running)
+            })
+            .await?;
+            self.send_terminal(operation.id, &sender).await?;
+            return Ok(Operation {
+                id: operation.id,
+                events: receiver,
+            });
+        }
+        let result = async {
             self.emit(operation.id, json!({"phase":"before_provision","desired_fingerprint":desired_fingerprint}), &sender).await?;
             let resolution = self.provisioner
                 .provision(ProvisionRequest {
@@ -667,29 +696,28 @@ impl<B: RuntimeBackend> SandboxService<B> {
 
     async fn recover_pending(&self) -> Result<(), ServiceError> {
         for operation in self.database(|store| store.pending_operations()).await? {
+            let lock = self.keyed_lock(&operation.sandbox_id)?;
+            let _guard = lock.lock().await;
+            let still_pending = self
+                .database({
+                    let id = operation.id;
+                    move |store| {
+                        Ok(store
+                            .pending_operations()?
+                            .into_iter()
+                            .any(|item| item.id == id))
+                    }
+                })
+                .await?;
+            if !still_pending {
+                continue;
+            }
             let events = self
                 .database({
                     let id = operation.id;
                     move |store| store.operation_events(id)
                 })
                 .await?;
-            let phase_fingerprint = |phase: &str| {
-                events.iter().find_map(|event| {
-                    let details = event.details.as_ref()?;
-                    (details.get("phase").and_then(Value::as_str) == Some(phase))
-                        .then(|| details.get("desired_fingerprint").and_then(Value::as_str))
-                        .flatten()
-                })
-            };
-            let provision_fingerprint = events.iter().find_map(|event| {
-                let details = event.details.as_ref()?;
-                (details.get("phase").and_then(Value::as_str) == Some("after_provision")
-                    && details.get("resolution_version").and_then(Value::as_u64) == Some(1))
-                .then(|| details.get("desired_fingerprint").and_then(Value::as_str))
-                .flatten()
-            });
-            let hook_evidence = provision_fingerprint.is_some()
-                && provision_fingerprint == phase_fingerprint("after_health");
             let mut record = self
                 .database({
                     let id = operation.sandbox_id.clone();
@@ -697,6 +725,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 })
                 .await?
                 .ok_or_else(|| ServiceError::Missing(operation.sandbox_id.clone()))?;
+            let hook_evidence = ordered_hook_evidence(&events, &record);
             let inspected = self.runtime.inspect(&operation.sandbox_id).await?;
             if inspected.as_ref().is_some_and(|runtime| {
                 runtime.ownership.managed_by != "gascan"
@@ -850,6 +879,25 @@ impl<B: RuntimeBackend> SandboxService<B> {
         }
         Ok(())
     }
+
+    async fn initialize_operation(
+        &self,
+        operation_id: OperationId,
+        sandbox_id: &SandboxId,
+        fallback: ActualState,
+        sender: &mpsc::Sender<OperationEvent>,
+    ) -> Result<(), ServiceError> {
+        if let Err(error) = self.send_initial(operation_id, sender).await {
+            let actual = self.runtime_actual(sandbox_id, fallback).await;
+            let code = error.code();
+            let details = json!({"message":error.to_string(),"phase":"initial_event"});
+            let _ = self
+                .database(move |store| store.fail_operation(operation_id, actual, code, details))
+                .await;
+            return Err(error);
+        }
+        Ok(())
+    }
 }
 
 impl ServiceError {
@@ -885,6 +933,48 @@ fn resolution_matches(record: &SandboxRecord, fingerprint: &str) -> bool {
             .tool_resolution
             .as_ref()
             .is_some_and(|value| matches(&value.details))
+}
+
+fn ordered_hook_evidence(events: &[OperationEvent], record: &SandboxRecord) -> bool {
+    let phases = events
+        .iter()
+        .filter_map(|event| event.details.as_ref())
+        .filter_map(|details| {
+            Some((
+                details.get("phase")?.as_str()?,
+                details.get("desired_fingerprint").and_then(Value::as_str),
+                details.get("resolution_version").and_then(Value::as_u64),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let before_health = phases
+        .iter()
+        .position(|(phase, _, _)| *phase == "before_health");
+    let after_health = phases
+        .iter()
+        .rposition(|(phase, _, _)| *phase == "after_health");
+    let (Some(before_health), Some(after_health)) = (before_health, after_health) else {
+        return false;
+    };
+    if before_health >= after_health {
+        return false;
+    }
+    let Some(health_fingerprint) = phases[after_health].1 else {
+        return false;
+    };
+    let before_provision = phases
+        .iter()
+        .position(|(phase, _, _)| *phase == "before_provision");
+    let after_provision = phases
+        .iter()
+        .position(|(phase, _, version)| *phase == "after_provision" && *version == Some(1));
+    match (before_provision, after_provision) {
+        (Some(before), Some(after)) if before < after && after < before_health => {
+            phases[after].1 == Some(health_fingerprint)
+        }
+        (None, None) => resolution_matches(record, health_fingerprint),
+        _ => false,
+    }
 }
 
 async fn desired_fingerprint(spec: &SandboxSpec) -> Result<String, ServiceError> {
