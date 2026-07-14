@@ -1,8 +1,9 @@
 CREATE TABLE schema_version (
-    version INTEGER NOT NULL PRIMARY KEY
+    singleton INTEGER NOT NULL PRIMARY KEY CHECK (singleton = 1),
+    version INTEGER NOT NULL
 );
 
-INSERT INTO schema_version (version) VALUES (1);
+INSERT INTO schema_version (singleton, version) VALUES (1, 1);
 
 CREATE TABLE sandboxes (
     id TEXT NOT NULL PRIMARY KEY,
@@ -32,6 +33,10 @@ CREATE TABLE operation_events (
     status TEXT NOT NULL,
     details TEXT
 );
+
+CREATE UNIQUE INDEX one_pending_operation_per_sandbox
+ON operations(sandbox_id)
+WHERE status = 'pending';
 
 CREATE TRIGGER operation_events_no_update
 BEFORE UPDATE ON operation_events

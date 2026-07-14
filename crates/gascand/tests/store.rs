@@ -6,6 +6,7 @@ use gascand::{
 };
 use serde_json::json;
 use std::error::Error;
+use std::process::Command;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -66,14 +67,14 @@ fn sandbox_id_and_canonical_root_are_both_unique() -> TestResult {
     duplicate_id.id = one.id.clone();
     assert!(matches!(
         store.put_sandbox(&duplicate_id),
-        Err(StoreError::Conflict(_))
+        Err(StoreError::DuplicateSandboxId { .. })
     ));
 
     let mut duplicate_root = fixture("/workspace/one");
     duplicate_root.id = SandboxId::from_root("other", &duplicate_root.canonical_root);
     assert!(matches!(
         store.put_sandbox(&duplicate_root),
-        Err(StoreError::Conflict(_))
+        Err(StoreError::DuplicateCanonicalRoot { .. })
     ));
     Ok(())
 }
@@ -146,26 +147,81 @@ fn operations_complete_or_fail_once_and_events_are_append_only() -> TestResult {
 }
 
 #[test]
-fn invalid_terminal_transition_rolls_back_operation_and_sandbox_atomically() -> TestResult {
+fn failed_create_can_record_successful_cleanup_to_absent() -> TestResult {
     let temp = tempfile::tempdir()?;
     let path = temp.path().join("state.db");
     let store = Store::open(&path)?;
     let sandbox = fixture("/workspace/one");
     let operation = store.begin_operation(&sandbox, OperationKind::Create)?;
-    assert!(matches!(
-        store.fail_operation(operation.id, ActualState::Absent, "crash", json!({})),
-        Err(StoreError::InvalidTransition { .. })
-    ));
+    let failed = store.fail_operation(
+        operation.id,
+        ActualState::Absent,
+        "create_failed",
+        json!({}),
+    )?;
     drop(store);
 
     let reopened = Store::open(path)?;
-    assert_eq!(reopened.pending_operations()?, vec![operation]);
+    assert_eq!(failed.status, OperationStatus::Failed);
+    assert!(reopened.pending_operations()?.is_empty());
     assert_eq!(
         reopened
             .sandbox(&sandbox.id)?
             .map(|record| record.actual_state),
-        Some(ActualState::Creating)
+        Some(ActualState::Absent)
     );
+    Ok(())
+}
+
+#[test]
+fn failed_destroy_can_restore_the_verified_running_or_stopped_state() -> TestResult {
+    for restored in [ActualState::Running, ActualState::Stopped] {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path().join("state.db"))?;
+        let mut sandbox = fixture("/workspace/one");
+        store.put_sandbox(&sandbox)?;
+        sandbox.actual_state = ActualState::Running;
+        store.put_sandbox(&sandbox)?;
+        sandbox.actual_state = ActualState::Destroying;
+        let operation = store.begin_operation(&sandbox, OperationKind::Destroy)?;
+        store.fail_operation(operation.id, restored, "destroy_failed", json!({}))?;
+        assert_eq!(
+            store
+                .sandbox(&sandbox.id)?
+                .map(|record| record.actual_state),
+            Some(restored)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn completed_operations_do_not_use_failure_rollback_edges() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let store = Store::open(temp.path().join("state.db"))?;
+    let sandbox = fixture("/workspace/one");
+    let create = store.begin_operation(&sandbox, OperationKind::Create)?;
+    assert!(matches!(
+        store.complete_operation(create.id, ActualState::Absent),
+        Err(StoreError::InvalidTransition { .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn one_pending_operation_per_sandbox_is_durable() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("state.db");
+    let store = Store::open(&path)?;
+    let sandbox = fixture("/workspace/one");
+    let first = store.begin_operation(&sandbox, OperationKind::Create)?;
+    drop(store);
+    let reopened = Store::open(path)?;
+    assert!(matches!(
+        reopened.begin_operation(&sandbox, OperationKind::Apply),
+        Err(StoreError::PendingOperationExists { sandbox_id }) if sandbox_id == sandbox.id
+    ));
+    assert_eq!(reopened.pending_operations()?, vec![first]);
     Ok(())
 }
 
@@ -224,6 +280,175 @@ fn newer_and_unknown_schema_versions_are_rejected() -> TestResult {
     drop(connection);
     assert!(matches!(Store::open(empty), Err(StoreError::UnknownSchema)));
     Ok(())
+}
+
+#[test]
+fn malformed_version_one_schemas_are_rejected_at_open() -> TestResult {
+    const MIGRATION: &str = include_str!("../migrations/001_initial.sql");
+    for (name, statements) in [
+        ("missing-table", "DROP TABLE operation_events;"),
+        (
+            "missing-column",
+            "ALTER TABLE sandboxes DROP COLUMN tool_resolution_details;",
+        ),
+        (
+            "missing-trigger",
+            "DROP TRIGGER operation_events_no_update;",
+        ),
+        (
+            "missing-pending-index",
+            "DROP INDEX one_pending_operation_per_sandbox;",
+        ),
+        ("missing-foreign-key", ""),
+        ("missing-event-foreign-key", ""),
+        ("missing-root-unique", ""),
+        ("nullable-required-column", ""),
+        ("missing-version-check", ""),
+    ] {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join(format!("{name}.db"));
+        let connection = rusqlite::Connection::open(&path)?;
+        if statements.is_empty() {
+            let malformed = match name {
+                "missing-foreign-key" => MIGRATION.replace(
+                    "sandbox_id TEXT NOT NULL REFERENCES sandboxes(id)",
+                    "sandbox_id TEXT NOT NULL",
+                ),
+                "missing-event-foreign-key" => MIGRATION.replace(
+                    "operation_id INTEGER NOT NULL REFERENCES operations(id)",
+                    "operation_id INTEGER NOT NULL",
+                ),
+                "missing-root-unique" => MIGRATION.replace(
+                    "canonical_root TEXT NOT NULL UNIQUE",
+                    "canonical_root TEXT NOT NULL",
+                ),
+                "nullable-required-column" => {
+                    MIGRATION.replace("desired_state TEXT NOT NULL", "desired_state TEXT")
+                }
+                "missing-version-check" => {
+                    MIGRATION.replace("PRIMARY KEY CHECK (singleton = 1)", "PRIMARY KEY")
+                }
+                other => return Err(format!("unhandled malformed schema {other}").into()),
+            };
+            connection.execute_batch(&malformed)?;
+        } else {
+            connection.execute_batch(MIGRATION)?;
+            connection.execute_batch(statements)?;
+        }
+        drop(connection);
+        assert!(matches!(
+            Store::open(path),
+            Err(StoreError::SchemaMismatch(_))
+        ));
+    }
+
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("multiple-versions.db");
+    let connection = rusqlite::Connection::open(&path)?;
+    connection.execute_batch(MIGRATION)?;
+    connection.execute_batch(
+        "DROP TABLE schema_version;
+         CREATE TABLE schema_version (singleton INTEGER, version INTEGER NOT NULL);
+         INSERT INTO schema_version VALUES (1, 1), (2, 1);",
+    )?;
+    drop(connection);
+    assert!(matches!(
+        Store::open(path),
+        Err(StoreError::SchemaMismatch(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn partial_version_one_schema_is_rejected_at_open() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("partial.db");
+    let connection = rusqlite::Connection::open(&path)?;
+    connection.execute_batch(
+        "CREATE TABLE schema_version (singleton INTEGER PRIMARY KEY, version INTEGER NOT NULL);
+         INSERT INTO schema_version VALUES (1, 1);",
+    )?;
+    drop(connection);
+    assert!(matches!(
+        Store::open(path),
+        Err(StoreError::SchemaMismatch(_))
+    ));
+    Ok(())
+}
+
+fn run_crash_child(mode: &str, path: &std::path::Path) -> TestResult {
+    let status = Command::new(std::env::current_exe()?)
+        .args(["--exact", "sqlite_crash_child", "--nocapture"])
+        .env("GASCAN_STORE_CRASH_MODE", mode)
+        .env("GASCAN_STORE_CRASH_DB", path)
+        .status()?;
+    assert!(!status.success());
+    Ok(())
+}
+
+#[test]
+fn subprocess_crash_rolls_back_partial_begin_transaction() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("begin-crash.db");
+    drop(Store::open(&path)?);
+    run_crash_child("begin", &path)?;
+    let reopened = Store::open(path)?;
+    assert!(reopened.list_sandboxes()?.is_empty());
+    assert!(reopened.pending_operations()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn subprocess_crash_rolls_back_partial_terminal_transaction() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("terminal-crash.db");
+    let store = Store::open(&path)?;
+    let sandbox = fixture("/workspace/one");
+    let pending = store.begin_operation(&sandbox, OperationKind::Create)?;
+    drop(store);
+    run_crash_child("terminal", &path)?;
+    let reopened = Store::open(path)?;
+    assert_eq!(reopened.pending_operations()?, vec![pending]);
+    assert_eq!(
+        reopened
+            .sandbox(&sandbox.id)?
+            .map(|record| record.actual_state),
+        Some(ActualState::Creating)
+    );
+    Ok(())
+}
+
+#[test]
+fn sqlite_crash_child() -> TestResult {
+    let Ok(mode) = std::env::var("GASCAN_STORE_CRASH_MODE") else {
+        return Ok(());
+    };
+    let path = std::env::var("GASCAN_STORE_CRASH_DB")?;
+    let connection = rusqlite::Connection::open(path)?;
+    connection.execute_batch("PRAGMA foreign_keys = ON; BEGIN IMMEDIATE;")?;
+    match mode.as_str() {
+        "begin" => {
+            let sandbox = fixture("/workspace/crashed");
+            connection.execute(
+                "INSERT INTO sandboxes (id, canonical_root, desired_state, actual_state) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![sandbox.id.as_str(), sandbox.canonical_root.as_str(), "running", "creating"],
+            )?;
+            connection.execute(
+                "INSERT INTO operations (sandbox_id, kind, status) VALUES (?1, ?2, ?3)",
+                rusqlite::params![sandbox.id.as_str(), "create", "pending"],
+            )?;
+        }
+        "terminal" => {
+            connection.execute("UPDATE sandboxes SET actual_state = ?1", ["running"])?;
+            connection.execute("UPDATE operations SET status = ?1", ["completed"])?;
+            connection.execute(
+                "INSERT INTO operation_events (operation_id, status) SELECT id, ?1 FROM operations",
+                ["completed"],
+            )?;
+        }
+        other => return Err(format!("unknown crash mode {other}").into()),
+    }
+    std::process::abort();
 }
 
 #[test]

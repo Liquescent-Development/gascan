@@ -61,3 +61,47 @@ Final verification commands:
 - Public records deliberately expose their fields to keep Task 5 construction straightforward; persistence still validates IDs, versions, database enum values, uniqueness, and state transitions.
 - Resolution detail schemas are intentionally versioned rather than hard-coded into Task 4. Task 5 should define the semantic payload contents it owns and bump the corresponding record version when those shapes change.
 - The store serializes calls made through one `Store` handle with a mutex around one SQLite connection. Separate handles can read concurrently under WAL, as tested. Task 5 remains responsible for per-sandbox operation serialization at the service layer.
+
+## Review Fix Follow-up
+
+### Additional RED / GREEN Evidence
+
+- First review RED: `cargo test -p gascand --test store` failed to compile because the new stable error contracts (`DuplicateSandboxId`, `DuplicateCanonicalRoot`, `PendingOperationExists`, and `SchemaMismatch`) were absent.
+- Schema-hardening RED: the malformed-v1 focused test failed because a spoofed `schema_version` table without singleton enforcement was accepted.
+- Final review GREEN: `cargo test -p gascand --test store` passed all 18 tests, including two deterministic subprocess-abort recovery tests.
+
+### Failure Transition Correction
+
+- Normal `put_sandbox` transitions and completed operations retain the forward lifecycle graph.
+- Failed operations additionally validate operation-kind-specific rollback results: failed Create may record `creating -> absent` after verified cleanup, and failed Destroy may record `destroying -> running|stopped` after verified rollback/reconciliation. Same-state failure outcomes remain valid.
+- Tests cover both Destroy restoration outcomes, Create cleanup to absent, and rejection of the Create rollback edge for a completed operation.
+
+### Durable Serialization and Typed Conflicts
+
+- Schema v1 now has a partial unique index on `operations(sandbox_id)` where status is pending, enforcing at most one pending operation per sandbox across connections and daemon restarts.
+- Mutations use `BEGIN IMMEDIATE` transactions. Identity and pending-operation conflicts are prechecked inside the acquired writer transaction, producing stable typed errors instead of SQLite diagnostic strings.
+- Exact tests assert duplicate ID, duplicate canonical root, and durable pending-operation error variants.
+
+### Schema Validation
+
+- `schema_version` now has a single primary-key sentinel constrained to value 1, with exactly one row required.
+- Opening v1 validates exact ordered columns, declared SQLite types, nullability, and primary-key positions for all required tables.
+- Opening also validates both foreign keys, canonical-root uniqueness, the named partial pending-operation index and predicate, plus both append-only trigger definitions.
+- Parameterized SQLite table-valued PRAGMA queries are used for structural inspection; schema identifiers are not interpolated into SQL.
+- Tests reject partial v1 schemas, missing tables/columns/nullability, both missing FKs, both missing uniqueness mechanisms, missing/malformed singleton representation, missing triggers, and multiple version rows.
+
+### Genuine Crash Recovery
+
+- Parent tests spawn the current integration-test executable in an environment-gated child mode.
+- The child opens the real database, starts `BEGIN IMMEDIATE`, performs partial parameterized writes matching either begin-operation or terminal-operation transaction shapes, then aborts the process before commit.
+- The parent requires abnormal child exit, reopens through `Store`, and proves SQLite recovered only pre-transaction state: no partially begun sandbox/operation survives, while a partially terminalized operation remains pending with its original actual state.
+- Normal committed begin/complete/fail tests remain the fully committed controls.
+
+### Follow-up Verification and Self-review
+
+- `cargo test -p gascand` passed all 18 store tests plus unit/doc targets.
+- `cargo test -p gascan-core` passed all core and doc tests.
+- `cargo test --workspace` passed all enabled workspace tests; 9 existing Apple live tests remained ignored by their platform gates.
+- `cargo clippy -p gascand --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` passed.
+- The partial unique index is the durable global guard; Task 5 keyed locks can improve wait/progress behavior but must treat `PendingOperationExists` as authoritative across processes/restarts.
+- Crash simulation is test-only and contains no production failpoint or timing dependency.

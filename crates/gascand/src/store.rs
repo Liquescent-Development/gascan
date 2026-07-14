@@ -1,6 +1,6 @@
 use camino::Utf8PathBuf;
 use gascan_core::sandbox::{SandboxId, SandboxIdError};
-use rusqlite::{Connection, ErrorCode, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::Value;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -111,8 +111,20 @@ pub enum StoreError {
     UnknownSchema,
     #[error("unsupported database schema version {0}")]
     UnsupportedSchemaVersion(i64),
-    #[error("conflicting sandbox identity: {0}")]
-    Conflict(String),
+    #[error("sandbox ID {sandbox_id} already belongs to canonical root {existing_root}")]
+    DuplicateSandboxId {
+        sandbox_id: SandboxId,
+        existing_root: Utf8PathBuf,
+    },
+    #[error("canonical root {canonical_root} already belongs to sandbox ID {existing_id}")]
+    DuplicateCanonicalRoot {
+        canonical_root: Utf8PathBuf,
+        existing_id: SandboxId,
+    },
+    #[error("sandbox {sandbox_id} already has a pending operation")]
+    PendingOperationExists { sandbox_id: SandboxId },
+    #[error("database schema does not match version 1: {0}")]
+    SchemaMismatch(String),
     #[error("invalid transition from {from} to {to}")]
     InvalidTransition { from: String, to: String },
     #[error("operation {0} does not exist")]
@@ -136,7 +148,7 @@ impl Store {
     pub fn put_sandbox(&self, sandbox: &SandboxRecord) -> Result<(), StoreError> {
         validate_resolutions(sandbox)?;
         let mut connection = self.lock()?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         put_sandbox_in(&transaction, sandbox)?;
         transaction.commit()?;
         Ok(())
@@ -161,8 +173,18 @@ impl Store {
     ) -> Result<OperationRecord, StoreError> {
         validate_resolutions(sandbox)?;
         let mut connection = self.lock()?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         put_sandbox_in(&transaction, sandbox)?;
+        let has_pending: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE sandbox_id = ?1 AND status = ?2)",
+            params![sandbox.id.as_str(), OperationStatus::Pending.as_db()],
+            |row| row.get(0),
+        )?;
+        if has_pending {
+            return Err(StoreError::PendingOperationExists {
+                sandbox_id: sandbox.id.clone(),
+            });
+        }
         transaction.execute(
             "INSERT INTO operations (sandbox_id, kind, status) VALUES (?1, ?2, ?3)",
             params![
@@ -232,7 +254,7 @@ impl Store {
         error_details: Option<Value>,
     ) -> Result<OperationRecord, StoreError> {
         let mut connection = self.lock()?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let operation =
             load_operation(&transaction, id)?.ok_or(StoreError::OperationNotFound(id))?;
         validate_operation_transition(operation.status, status)?;
@@ -242,7 +264,7 @@ impl Store {
             |row| row.get(0),
         )?;
         let current_state = ActualState::from_db(&current_state)?;
-        validate_actual_transition(current_state, actual_state)?;
+        validate_terminal_actual_transition(current_state, actual_state, operation.kind, status)?;
         let details_json = error_details
             .as_ref()
             .map(serde_json::to_string)
@@ -276,10 +298,30 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), StoreError> {
         |row| row.get(0),
     )?;
     if has_schema {
-        let version =
-            connection.query_row("SELECT version FROM schema_version", [], |row| row.get(0))?;
+        validate_table_columns(
+            connection,
+            "schema_version",
+            &[("singleton", "INTEGER", 1, 1), ("version", "INTEGER", 1, 0)],
+        )?;
+        validate_schema_version_constraint(connection)?;
+        let rows: i64 = schema_query(connection, "SELECT COUNT(*) FROM schema_version")?;
+        if rows != 1 {
+            return Err(StoreError::SchemaMismatch(
+                "schema_version must contain exactly one row".to_owned(),
+            ));
+        }
+        let (singleton, version): (i64, i64) = connection
+            .query_row("SELECT singleton, version FROM schema_version", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .map_err(schema_error)?;
+        if singleton != 1 {
+            return Err(StoreError::SchemaMismatch(
+                "schema_version singleton must equal 1".to_owned(),
+            ));
+        }
         return if version == SCHEMA_VERSION {
-            Ok(())
+            validate_v1_schema(connection)
         } else {
             Err(StoreError::UnsupportedSchemaVersion(version))
         };
@@ -294,7 +336,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), StoreError> {
     if object_count != 0 || user_version != 0 {
         return Err(StoreError::UnknownSchema);
     }
-    let transaction = connection.transaction()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(INITIAL_MIGRATION)?;
     transaction.commit()?;
     Ok(())
@@ -311,25 +353,37 @@ fn put_sandbox_in(
     let existing = load_sandbox(transaction, sandbox.id.as_str())?;
     if let Some(existing) = existing {
         if existing.canonical_root != sandbox.canonical_root {
-            return Err(StoreError::Conflict(format!(
-                "sandbox ID {} already belongs to {}",
-                sandbox.id, existing.canonical_root
-            )));
+            return Err(StoreError::DuplicateSandboxId {
+                sandbox_id: sandbox.id.clone(),
+                existing_root: existing.canonical_root,
+            });
         }
         validate_actual_transition(existing.actual_state, sandbox.actual_state)?;
+    }
+    let root_owner: Option<String> = transaction
+        .query_row(
+            "SELECT id FROM sandboxes WHERE canonical_root = ?1",
+            [sandbox.canonical_root.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(root_owner) = root_owner {
+        let existing_id = SandboxId::try_from(root_owner)?;
+        if existing_id != sandbox.id {
+            return Err(StoreError::DuplicateCanonicalRoot {
+                canonical_root: sandbox.canonical_root.clone(),
+                existing_id,
+            });
+        }
     }
     let setup = encode_resolution(sandbox.setup_resolution.as_ref())?;
     let tools = encode_resolution(sandbox.tool_resolution.as_ref())?;
     let image = encode_resolution(sandbox.image_resolution.as_ref())?;
-    let result = transaction.execute(
+    transaction.execute(
         "INSERT INTO sandboxes (id, canonical_root, desired_state, actual_state, setup_resolution_version, setup_resolution_details, tool_resolution_version, tool_resolution_details, image_resolution_version, image_resolution_details) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT(id) DO UPDATE SET desired_state = excluded.desired_state, actual_state = excluded.actual_state, setup_resolution_version = excluded.setup_resolution_version, setup_resolution_details = excluded.setup_resolution_details, tool_resolution_version = excluded.tool_resolution_version, tool_resolution_details = excluded.tool_resolution_details, image_resolution_version = excluded.image_resolution_version, image_resolution_details = excluded.image_resolution_details",
         params![sandbox.id.as_str(), sandbox.canonical_root.as_str(), sandbox.desired_state.as_db(), sandbox.actual_state.as_db(), setup.0, setup.1, tools.0, tools.1, image.0, image.1],
-    );
-    match result {
-        Ok(_) => Ok(()),
-        Err(error) if is_constraint(&error) => Err(StoreError::Conflict(error.to_string())),
-        Err(error) => Err(StoreError::Database(error)),
-    }
+    )?;
+    Ok(())
 }
 
 fn load_sandbox(connection: &Connection, id: &str) -> Result<Option<SandboxRecord>, StoreError> {
@@ -562,8 +616,290 @@ fn validate_operation_transition(
     }
 }
 
-fn is_constraint(error: &rusqlite::Error) -> bool {
-    matches!(error, rusqlite::Error::SqliteFailure(failure, _) if failure.code == ErrorCode::ConstraintViolation)
+fn validate_terminal_actual_transition(
+    from: ActualState,
+    to: ActualState,
+    kind: OperationKind,
+    status: OperationStatus,
+) -> Result<(), StoreError> {
+    if status == OperationStatus::Completed {
+        return validate_actual_transition(from, to);
+    }
+    let rollback = matches!(
+        (kind, from, to),
+        (
+            OperationKind::Create,
+            ActualState::Creating,
+            ActualState::Absent
+        ) | (
+            OperationKind::Destroy,
+            ActualState::Destroying,
+            ActualState::Running | ActualState::Stopped
+        )
+    );
+    if rollback {
+        Ok(())
+    } else {
+        validate_actual_transition(from, to)
+    }
+}
+
+fn validate_v1_schema(connection: &Connection) -> Result<(), StoreError> {
+    validate_table_columns(
+        connection,
+        "sandboxes",
+        &[
+            ("id", "TEXT", 1, 1),
+            ("canonical_root", "TEXT", 1, 0),
+            ("desired_state", "TEXT", 1, 0),
+            ("actual_state", "TEXT", 1, 0),
+            ("setup_resolution_version", "INTEGER", 0, 0),
+            ("setup_resolution_details", "TEXT", 0, 0),
+            ("tool_resolution_version", "INTEGER", 0, 0),
+            ("tool_resolution_details", "TEXT", 0, 0),
+            ("image_resolution_version", "INTEGER", 0, 0),
+            ("image_resolution_details", "TEXT", 0, 0),
+        ],
+    )?;
+    validate_table_columns(
+        connection,
+        "operations",
+        &[
+            ("id", "INTEGER", 0, 1),
+            ("sandbox_id", "TEXT", 1, 0),
+            ("kind", "TEXT", 1, 0),
+            ("status", "TEXT", 1, 0),
+            ("error_code", "TEXT", 0, 0),
+            ("error_details", "TEXT", 0, 0),
+        ],
+    )?;
+    validate_table_columns(
+        connection,
+        "operation_events",
+        &[
+            ("sequence", "INTEGER", 0, 1),
+            ("operation_id", "INTEGER", 1, 0),
+            ("status", "TEXT", 1, 0),
+            ("details", "TEXT", 0, 0),
+        ],
+    )?;
+    validate_foreign_key(connection, "operations", "sandbox_id", "sandboxes", "id")?;
+    validate_foreign_key(
+        connection,
+        "operation_events",
+        "operation_id",
+        "operations",
+        "id",
+    )?;
+    validate_unique_index(connection, "sandboxes", &["canonical_root"], None)?;
+    validate_unique_index(
+        connection,
+        "operations",
+        &["sandbox_id"],
+        Some("one_pending_operation_per_sandbox"),
+    )?;
+    validate_trigger(connection, "operation_events_no_update", "before update")?;
+    validate_trigger(connection, "operation_events_no_delete", "before delete")?;
+    Ok(())
+}
+
+fn validate_table_columns(
+    connection: &Connection,
+    table: &str,
+    expected: &[(&str, &str, i64, i64)],
+) -> Result<(), StoreError> {
+    let mut statement = connection
+        .prepare("SELECT name, type, \"notnull\", pk FROM pragma_table_info(?1) ORDER BY cid")
+        .map_err(schema_error)?;
+    let actual = statement
+        .query_map([table], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(schema_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(schema_error)?;
+    let expected = expected
+        .iter()
+        .map(|(name, column_type, not_null, primary_key)| {
+            (
+                (*name).to_owned(),
+                (*column_type).to_owned(),
+                *not_null,
+                *primary_key,
+            )
+        })
+        .collect::<Vec<_>>();
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(StoreError::SchemaMismatch(format!(
+            "table {table} has unexpected columns"
+        )))
+    }
+}
+
+fn validate_foreign_key(
+    connection: &Connection,
+    table: &str,
+    from: &str,
+    target_table: &str,
+    target_column: &str,
+) -> Result<(), StoreError> {
+    let mut statement = connection
+        .prepare("SELECT \"table\", \"from\", \"to\" FROM pragma_foreign_key_list(?1)")
+        .map_err(schema_error)?;
+    let found = statement
+        .query_map([table], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(schema_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(schema_error)?
+        .into_iter()
+        .any(|item| {
+            item == (
+                target_table.to_owned(),
+                from.to_owned(),
+                target_column.to_owned(),
+            )
+        });
+    if found {
+        Ok(())
+    } else {
+        Err(StoreError::SchemaMismatch(format!(
+            "table {table} is missing its required foreign key"
+        )))
+    }
+}
+
+fn validate_unique_index(
+    connection: &Connection,
+    table: &str,
+    columns: &[&str],
+    required_name: Option<&str>,
+) -> Result<(), StoreError> {
+    let mut statement = connection
+        .prepare("SELECT name, \"unique\", partial FROM pragma_index_list(?1)")
+        .map_err(schema_error)?;
+    let indexes = statement
+        .query_map([table], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, bool>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
+        })
+        .map_err(schema_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(schema_error)?;
+    for (name, unique, partial) in indexes {
+        if !unique || required_name.is_some_and(|required| required != name) {
+            continue;
+        }
+        if required_name.is_some() && !partial {
+            continue;
+        }
+        let mut index_statement = connection
+            .prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")
+            .map_err(schema_error)?;
+        let actual_columns = index_statement
+            .query_map([&name], |row| row.get::<_, String>(0))
+            .map_err(schema_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(schema_error)?;
+        if actual_columns == columns {
+            if let Some(required) = required_name {
+                let definition: String = connection
+                    .query_row(
+                        "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
+                        params!["index", required],
+                        |row| row.get(0),
+                    )
+                    .map_err(schema_error)?;
+                if !normalize_sql(&definition).contains("where status = 'pending'") {
+                    continue;
+                }
+            }
+            return Ok(());
+        }
+    }
+    Err(StoreError::SchemaMismatch(format!(
+        "table {table} is missing a required unique index"
+    )))
+}
+
+fn validate_schema_version_constraint(connection: &Connection) -> Result<(), StoreError> {
+    let definition: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
+            params!["table", "schema_version"],
+            |row| row.get(0),
+        )
+        .map_err(schema_error)?;
+    if normalize_sql(&definition).contains("check (singleton = 1)") {
+        Ok(())
+    } else {
+        Err(StoreError::SchemaMismatch(
+            "schema_version must enforce its singleton row".to_owned(),
+        ))
+    }
+}
+
+fn validate_trigger(
+    connection: &Connection,
+    name: &str,
+    expected_action: &str,
+) -> Result<(), StoreError> {
+    let definition: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
+            params!["trigger", name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(schema_error)?;
+    let valid = definition.is_some_and(|sql| {
+        let sql = normalize_sql(&sql);
+        sql.contains(expected_action)
+            && sql.contains("on operation_events")
+            && sql.contains("raise(abort, 'operation events are append-only')")
+    });
+    if valid {
+        Ok(())
+    } else {
+        Err(StoreError::SchemaMismatch(format!(
+            "missing or malformed trigger {name}"
+        )))
+    }
+}
+
+fn normalize_sql(sql: &str) -> String {
+    sql.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn schema_query<T: rusqlite::types::FromSql>(
+    connection: &Connection,
+    sql: &str,
+) -> Result<T, StoreError> {
+    connection
+        .query_row(sql, [], |row| row.get(0))
+        .map_err(schema_error)
+}
+
+fn schema_error(error: rusqlite::Error) -> StoreError {
+    StoreError::SchemaMismatch(error.to_string())
 }
 fn to_sql_conversion_error(
     error: impl std::error::Error + Send + Sync + 'static,
