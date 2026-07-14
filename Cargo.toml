@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/gascan-apple", "crates/gascan-core"]
+members = ["crates/gascan-apple", "crates/gascan-core", "crates/gascand"]
 resolver = "3"
 
 [workspace.package]
@@ -17,6 +17,7 @@ tokio = { version = "1", features = ["io-util", "process", "rt", "sync"] }
 camino = { version = "1", features = ["serde1"] }
 sha2 = "0.10"
 toml = "0.8"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
