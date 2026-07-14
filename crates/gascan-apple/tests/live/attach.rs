@@ -23,9 +23,7 @@ async fn attached_process_reports_resize_signal_and_exit() -> Result<(), TestErr
         })
         .await?;
     assert!(session.read_until(b"41 113").await?.is_some());
-    session
-        .send(AttachInput::Signal(nix::libc::SIGTERM))
-        .await?;
+    session.send(AttachInput::Signal(libc::SIGTERM)).await?;
     assert_eq!(session.exit().await?, 42);
     ctx.cleanup().await
 }
@@ -73,7 +71,7 @@ async fn attached_process_forwards_sigint_and_closes_stdin() -> Result<(), TestE
             true,
         )
         .await?;
-    signal.send(AttachInput::Signal(nix::libc::SIGINT)).await?;
+    signal.send(AttachInput::Signal(libc::SIGINT)).await?;
     assert_eq!(signal.exit().await?, 42);
 
     let mut close = ctx

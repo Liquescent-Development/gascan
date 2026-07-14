@@ -184,7 +184,14 @@ impl LiveContext {
         A: AsRef<str>,
     {
         let name = self.container.lock().unwrap().clone();
-        Ok(AppleAttach::default().exec(name, argv, tty).await?)
+        let helper = std::env::var_os("GASCAN_APPLE_ATTACH_HELPER")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/gascan-apple-attach")
+            });
+        Ok(AppleAttach::new(helper.to_string_lossy())
+            .exec(name, argv, tty)
+            .await?)
     }
 
     pub async fn write_host(&self, name: &str, contents: &str) -> Result<(), TestError> {
