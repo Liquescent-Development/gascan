@@ -8,6 +8,34 @@ func diagnostic(_ message: String) {
     try? FileHandle.standardError.write(contentsOf: Data("gascan-apple-attach: \(message)\n".utf8))
 }
 
+@discardableResult
+func drainAfterWait(
+    tasks: [Task<Void, any Error>],
+    handles: [FileHandle],
+    timeout: Duration
+) async -> Bool {
+    await withTaskGroup(of: Bool.self, returning: Bool.self) { group in
+        group.addTask {
+            for task in tasks {
+                _ = try? await task.value
+            }
+            return true
+        }
+        group.addTask {
+            try? await Task.sleep(for: timeout)
+            return false
+        }
+
+        let drained = await group.next() ?? false
+        if !drained {
+            tasks.forEach { $0.cancel() }
+            handles.forEach { try? $0.close() }
+        }
+        group.cancelAll()
+        return drained
+    }
+}
+
 actor FrameEmitter {
     private var terminal = false
     private let encoder = JSONEncoder()
@@ -113,8 +141,18 @@ struct GasCanAppleAttach {
         diagnostic("guest wait returned \(code); draining output")
         inputTask.cancel()
         try? inputPipe.fileHandleForWriting.close()
-        try await stdoutTask.value
-        try await stderrTask.value
+        var drainHandles = [outputPipe.fileHandleForReading]
+        if let errorPipe {
+            drainHandles.append(errorPipe.fileHandleForReading)
+        }
+        let drained = await drainAfterWait(
+            tasks: [stdoutTask, stderrTask],
+            handles: drainHandles,
+            timeout: .seconds(3)
+        )
+        if !drained {
+            diagnostic("output drain timed out; readers cancelled and closed")
+        }
         diagnostic("output drain completed; emitting exit")
         try await emitter.emit(.exit(code))
     }

@@ -33,3 +33,38 @@ import Testing
         try validateSignal(SIGKILL)
     }
 }
+
+private actor ReceivedBytes {
+    private(set) var bytes: [UInt8] = []
+
+    func append(_ byte: UInt8) {
+        bytes.append(byte)
+    }
+}
+
+@Test func boundedDrainPreservesBytesWhenReaderNeverReachesEOF() async throws {
+    let pipe = Pipe()
+    let received = ReceivedBytes()
+    let reader = pipe.fileHandleForReading
+    let task = Task {
+        for try await byte in reader.bytes {
+            await received.append(byte)
+        }
+    }
+    try pipe.fileHandleForWriting.write(contentsOf: Data([0, 255]))
+
+    while await received.bytes.count < 2 {
+        await Task.yield()
+    }
+    let before = ContinuousClock.now
+    await drainAfterWait(
+        tasks: [task],
+        handles: [reader],
+        timeout: .milliseconds(50)
+    )
+    let elapsed = before.duration(to: .now)
+
+    #expect(await received.bytes == [0, 255])
+    #expect(elapsed < .seconds(1))
+    try? pipe.fileHandleForWriting.close()
+}
