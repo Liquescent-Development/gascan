@@ -42,8 +42,8 @@ impl HostServer {
         })
     }
 
-    pub fn guest_url(&self) -> String {
-        format!("http://host.docker.internal:{}", self.address.port())
+    pub fn url_for_host(&self, host: Ipv4Addr) -> String {
+        format!("http://{host}:{}", self.address.port())
     }
 }
 

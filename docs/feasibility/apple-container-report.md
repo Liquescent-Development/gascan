@@ -25,7 +25,7 @@ container run ... --network none ...
 
 Promotion to `Proven` is forbidden until the controller runs the ignored adversarial test and records that structured attachments are empty and all DNS, direct external IPv4, TEST-NET, and owned host-probe requests fail both before and after guest-root route/interface mutation.
 
-The test first requires a normal owned networked container to reach the same `https://example.com`, direct `http://1.1.1.1`, and temporary host-server targets. This positive control prevents host-wide outages, image tool limitations, or an incorrectly bound host listener from producing a false offline pass.
+The test first reads exactly one IPv4 gateway from `container network inspect default` at `status.ipv4Gateway`; absence, malformed output, or multiple records fails. A normal owned networked container must then reach the same `https://example.com`, direct `http://1.1.1.1`, and temporary host server through `http://<observed-gateway>:<ephemeral-port>`. The offline container reuses that identical proven URL. This avoids Docker-specific aliases and global `container system dns ... --localhost` mutation while preventing host-wide outages, image tool limitations, or an incorrectly bound host listener from producing a false offline pass.
 
 ## Controller commands required to resolve BLOCKED
 

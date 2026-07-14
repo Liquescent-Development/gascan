@@ -35,7 +35,7 @@ Record structured empty attachment evidence and the result before and after gues
 - `https://example.com` (DNS plus HTTPS);
 - `http://1.1.1.1` (direct external IPv4, independent of DNS);
 - `http://192.0.2.1` (non-routable adversarial IPv4);
-- the owned loopback host probe exposed through `host.docker.internal`.
+- the owned host probe reached through the structured default-network `status.ipv4Gateway` address.
 
 ## Cleanup
 

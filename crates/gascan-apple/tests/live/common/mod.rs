@@ -243,6 +243,11 @@ impl LiveContext {
         Ok(serde_json::from_slice(&output.stdout)?)
     }
 
+    pub async fn inspect_network(&self, name: &str) -> Result<Value, TestError> {
+        let output = self.run_ok(["network", "inspect", name]).await?;
+        Ok(serde_json::from_slice(&output.stdout)?)
+    }
+
     pub async fn logs(&self) -> Result<String, TestError> {
         let name = self.container.lock().unwrap().clone();
         let output = self.run_ok(["logs", &name]).await?;
