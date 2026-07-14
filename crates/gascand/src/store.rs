@@ -683,13 +683,30 @@ fn validate_v1_schema(connection: &Connection) -> Result<(), StoreError> {
             ("details", "TEXT", 0, 0),
         ],
     )?;
-    validate_foreign_key(connection, "operations", "sandbox_id", "sandboxes", "id")?;
-    validate_foreign_key(
+    validate_foreign_keys(connection, "sandboxes", &[])?;
+    validate_foreign_keys(
+        connection,
+        "operations",
+        &[(
+            "sandboxes",
+            "sandbox_id",
+            "id",
+            "NO ACTION",
+            "NO ACTION",
+            "NONE",
+        )],
+    )?;
+    validate_foreign_keys(
         connection,
         "operation_events",
-        "operation_id",
-        "operations",
-        "id",
+        &[(
+            "operations",
+            "operation_id",
+            "id",
+            "NO ACTION",
+            "NO ACTION",
+            "NONE",
+        )],
     )?;
     validate_unique_index(connection, "sandboxes", &["canonical_root"], None)?;
     validate_unique_index(
@@ -743,40 +760,49 @@ fn validate_table_columns(
     }
 }
 
-fn validate_foreign_key(
+fn validate_foreign_keys(
     connection: &Connection,
     table: &str,
-    from: &str,
-    target_table: &str,
-    target_column: &str,
+    expected: &[(&str, &str, &str, &str, &str, &str)],
 ) -> Result<(), StoreError> {
     let mut statement = connection
-        .prepare("SELECT \"table\", \"from\", \"to\" FROM pragma_foreign_key_list(?1)")
+        .prepare(
+            "SELECT \"table\", \"from\", \"to\", on_update, on_delete, \"match\" \
+             FROM pragma_foreign_key_list(?1) ORDER BY id, seq",
+        )
         .map_err(schema_error)?;
-    let found = statement
+    let actual = statement
         .query_map([table], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
             ))
         })
         .map_err(schema_error)?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(schema_error)?
-        .into_iter()
-        .any(|item| {
-            item == (
-                target_table.to_owned(),
-                from.to_owned(),
-                target_column.to_owned(),
+        .map_err(schema_error)?;
+    let expected = expected
+        .iter()
+        .map(|values| {
+            (
+                values.0.to_owned(),
+                values.1.to_owned(),
+                values.2.to_owned(),
+                values.3.to_owned(),
+                values.4.to_owned(),
+                values.5.to_owned(),
             )
-        });
-    if found {
+        })
+        .collect::<Vec<_>>();
+    if actual == expected {
         Ok(())
     } else {
         Err(StoreError::SchemaMismatch(format!(
-            "table {table} is missing its required foreign key"
+            "table {table} has an unexpected foreign key set"
         )))
     }
 }
@@ -805,7 +831,7 @@ fn validate_unique_index(
         if !unique || required_name.is_some_and(|required| required != name) {
             continue;
         }
-        if required_name.is_some() && !partial {
+        if required_name.is_some() != partial {
             continue;
         }
         let mut index_statement = connection
@@ -825,7 +851,9 @@ fn validate_unique_index(
                         |row| row.get(0),
                     )
                     .map_err(schema_error)?;
-                if !normalize_sql(&definition).contains("where status = 'pending'") {
+                if normalize_sql(&definition)
+                    != "create unique index one_pending_operation_per_sandbox on operations(sandbox_id) where status = 'pending'"
+                {
                     continue;
                 }
             }
@@ -845,7 +873,9 @@ fn validate_schema_version_constraint(connection: &Connection) -> Result<(), Sto
             |row| row.get(0),
         )
         .map_err(schema_error)?;
-    if normalize_sql(&definition).contains("check (singleton = 1)") {
+    if normalize_sql(&definition)
+        == "create table schema_version ( singleton integer not null primary key check (singleton = 1), version integer not null )"
+    {
         Ok(())
     } else {
         Err(StoreError::SchemaMismatch(
@@ -867,12 +897,10 @@ fn validate_trigger(
         )
         .optional()
         .map_err(schema_error)?;
-    let valid = definition.is_some_and(|sql| {
-        let sql = normalize_sql(&sql);
-        sql.contains(expected_action)
-            && sql.contains("on operation_events")
-            && sql.contains("raise(abort, 'operation events are append-only')")
-    });
+    let expected = format!(
+        "create trigger {name} {expected_action} on operation_events begin select raise(abort, 'operation events are append-only'); end"
+    );
+    let valid = definition.is_some_and(|sql| normalize_sql(&sql) == expected);
     if valid {
         Ok(())
     } else {

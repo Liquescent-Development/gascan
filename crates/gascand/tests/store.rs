@@ -376,6 +376,69 @@ fn partial_version_one_schema_is_rejected_at_open() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn superficially_similar_but_weakened_v1_schemas_are_rejected() -> TestResult {
+    const MIGRATION: &str = include_str!("../migrations/001_initial.sql");
+    let weakened = [
+        (
+            "conditional-root-unique",
+            MIGRATION.replace(
+                "canonical_root TEXT NOT NULL UNIQUE",
+                "canonical_root TEXT NOT NULL",
+            ) + "\nCREATE UNIQUE INDEX spoof_root_unique ON sandboxes(canonical_root) WHERE canonical_root <> '';",
+        ),
+        (
+            "pending-and-false",
+            MIGRATION.replace("WHERE status = 'pending'", "WHERE status = 'pending' AND 0"),
+        ),
+        (
+            "permissive-singleton",
+            MIGRATION.replace("CHECK (singleton = 1)", "CHECK (singleton = 1 OR 1 = 1)"),
+        ),
+        (
+            "update-trigger-when-false",
+            MIGRATION.replace(
+                "BEFORE UPDATE ON operation_events\nBEGIN",
+                "BEFORE UPDATE ON operation_events\nWHEN 0\nBEGIN",
+            ),
+        ),
+        (
+            "delete-trigger-when-false",
+            MIGRATION.replace(
+                "BEFORE DELETE ON operation_events\nBEGIN",
+                "BEFORE DELETE ON operation_events\nWHEN 0\nBEGIN",
+            ),
+        ),
+        (
+            "altered-foreign-key-action",
+            MIGRATION.replace(
+                "REFERENCES sandboxes(id)",
+                "REFERENCES sandboxes(id) ON DELETE CASCADE",
+            ),
+        ),
+        (
+            "extra-foreign-key",
+            MIGRATION.replace(
+                "error_code TEXT",
+                "error_code TEXT REFERENCES sandboxes(id)",
+            ),
+        ),
+    ];
+
+    for (name, schema) in weakened {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join(format!("{name}.db"));
+        let connection = rusqlite::Connection::open(&path)?;
+        connection.execute_batch(&schema)?;
+        drop(connection);
+        assert!(
+            matches!(Store::open(path), Err(StoreError::SchemaMismatch(_))),
+            "weakened schema was accepted: {name}"
+        );
+    }
+    Ok(())
+}
+
 fn run_crash_child(mode: &str, path: &std::path::Path) -> TestResult {
     let status = Command::new(std::env::current_exe()?)
         .args(["--exact", "sqlite_crash_child", "--nocapture"])

@@ -105,3 +105,14 @@ Final verification commands:
 - `cargo clippy -p gascand --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` passed.
 - The partial unique index is the durable global guard; Task 5 keyed locks can improve wait/progress behavior but must treat `PendingOperationExists` as authoritative across processes/restarts.
 - Crash simulation is test-only and contains no production failpoint or timing dependency.
+
+## Schema Spoof-Resistance Follow-up
+
+- RED: `cargo test -p gascand --test store superficially_similar_but_weakened_v1_schemas_are_rejected -- --nocapture` failed because a conditional/partial canonical-root unique index was accepted as equivalent to the required invariant.
+- GREEN: the focused malicious-schema test passed, followed by the complete 19-test store suite.
+- Canonical-root uniqueness now explicitly requires a non-partial unique index over exactly `canonical_root`.
+- The pending-operation guard requires the exact normalized schema-v1 index definition, rejecting weakened predicates such as `status = 'pending' AND 0`.
+- The singleton version table and append-only update/delete triggers require their exact normalized schema-v1 definitions, rejecting permissive checks and `WHEN 0` triggers that retain misleading substrings.
+- Foreign-key validation compares the complete ordered FK set for every v1 table, including target table, source/target columns, update/delete actions, match mode, and absence of extra keys.
+- Regression fixtures cover a conditional root index, false pending predicate, permissive singleton check, disabled update/delete triggers, altered FK action, and an extra FK.
+- Structural introspection remains parameterized; normalization is applied only to SQLite-owned `sqlite_master` definitions and compared against fixed schema-v1 constants.
