@@ -350,9 +350,11 @@ async fn run(
         match frame.frame {
             Some(v1::server_frame::Frame::Stdout(bytes)) => {
                 std::io::stdout().write_all(&bytes)?;
+                std::io::stdout().flush()?;
             }
             Some(v1::server_frame::Frame::Stderr(bytes)) => {
                 std::io::stderr().write_all(&bytes)?;
+                std::io::stderr().flush()?;
             }
             Some(v1::server_frame::Frame::Exit(exit)) => return Ok(exit.code),
             Some(v1::server_frame::Frame::Error(error)) => {

@@ -243,6 +243,44 @@ fn binary_stdin_stdout_stderr_and_environment_are_exact() -> TestResult {
 }
 
 #[test]
+fn unbounded_piped_stdin_gets_early_output_and_cancels_promptly() -> TestResult {
+    use std::io::Read as _;
+    let env = Environment::new()?;
+    assert!(env.invoke(&["up", env.root()?])?.status.success());
+    let mut producer = Command::new("yes").stdout(Stdio::piped()).spawn()?;
+    let producer_stdout = producer.stdout.take().ok_or("producer stdout missing")?;
+    let mut cli = env
+        .command(&["run", "--", "fake-ready-then-drain"])
+        .stdin(producer_stdout)
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let mut stdout = cli.stdout.take().ok_or("CLI stdout missing")?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut ready = [0_u8; 5];
+        let result = stdout.read_exact(&mut ready).map(|()| ready);
+        let _ = sender.send(result);
+    });
+    let ready = receiver.recv_timeout(std::time::Duration::from_secs(2))??;
+    assert_eq!(&ready, b"ready");
+    assert!(cli.try_wait()?.is_none());
+    cli.kill()?;
+    let _ = cli.wait()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if producer.try_wait()?.is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            producer.kill()?;
+            return Err("stdin producer did not observe cancellation".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+#[test]
 fn environment_teardown_terminates_its_exact_live_daemon() -> TestResult {
     let env = Environment::new()?;
     assert!(env.invoke(&["doctor", "--json"])?.status.success());
@@ -677,6 +715,113 @@ async fn logs_since_and_follow_emit_new_byte_exact_records_then_cancel() -> Test
 }
 
 #[tokio::test]
+async fn follow_logs_emit_exactly_one_terminal_for_shutdown_or_backend_error() -> TestResult {
+    use gascan_proto::v1;
+    for fail_backend in [false, true] {
+        let env = Environment::new()?;
+        let mut start = env.command(&["up", env.root()?]);
+        if fail_backend {
+            start.env("GASCAN_FAKE_LOGS_FAIL_AFTER_MS", "500");
+        }
+        assert!(start.output()?.status.success());
+        let mut client = api_client(env.runtime_root.clone()).await?;
+        let id = client
+            .list(v1::ListRequest {})
+            .await?
+            .into_inner()
+            .sandboxes
+            .into_iter()
+            .next()
+            .ok_or("sandbox missing")?
+            .sandbox_id;
+        let mut follow = client
+            .logs(v1::LogsRequest {
+                sandbox: Some(v1::SandboxSelector { sandbox_id: id }),
+                since: None,
+                follow: true,
+            })
+            .await?
+            .into_inner();
+        let initial = follow.message().await?.ok_or("initial logs missing")?;
+        assert_eq!(initial.sequence, 1);
+        if !fail_backend {
+            let pid = std::fs::read_to_string(env.runtime_root.join("daemon.pid"))?;
+            let pid = rustix_openpty::rustix::process::Pid::from_raw(pid.parse::<i32>()?)
+                .ok_or("invalid daemon pid")?;
+            rustix_openpty::rustix::process::kill_process(
+                pid,
+                rustix_openpty::rustix::process::Signal::TERM,
+            )?;
+        }
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let event = follow.message().await?.ok_or("terminal missing")?;
+                if event.status == v1::OperationStatus::Completed as i32
+                    || event.status == v1::OperationStatus::Failed as i32
+                {
+                    return Ok::<_, Box<dyn std::error::Error>>(event);
+                }
+            }
+        })
+        .await??;
+        assert_eq!(terminal.sequence, 2);
+        assert_eq!(
+            terminal.status,
+            if fail_backend {
+                v1::OperationStatus::Failed as i32
+            } else {
+                v1::OperationStatus::Completed as i32
+            }
+        );
+        assert!(follow.message().await?.is_none());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelling_follow_logs_releases_daemon_activity_without_terminal() -> TestResult {
+    use gascan_proto::v1;
+    let env = Environment::new()?;
+    assert!(
+        env.command(&["up", env.root()?])
+            .env("GASCAN_IDLE_TIMEOUT_MS", "300")
+            .output()?
+            .status
+            .success()
+    );
+    let mut client = api_client(env.runtime_root.clone()).await?;
+    let id = client
+        .list(v1::ListRequest {})
+        .await?
+        .into_inner()
+        .sandboxes
+        .into_iter()
+        .next()
+        .ok_or("sandbox missing")?
+        .sandbox_id;
+    let mut follow = client
+        .logs(v1::LogsRequest {
+            sandbox: Some(v1::SandboxSelector { sandbox_id: id }),
+            since: None,
+            follow: true,
+        })
+        .await?
+        .into_inner();
+    let initial = follow.message().await?.ok_or("initial logs missing")?;
+    assert_eq!(initial.status, v1::OperationStatus::Pending as i32);
+    drop(follow);
+    drop(client);
+    let socket = env.runtime_root.join("gascan/gascand.sock");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn slow_up_returns_live_operation_and_survives_disconnect() -> TestResult {
     use gascan_proto::v1;
     let env = Environment::new()?;
@@ -728,7 +873,7 @@ async fn post_begin_failure_keeps_operation_id_and_streams_failed_terminal() -> 
         .await?
         .into_inner();
     let first = events.message().await?.ok_or("pending event missing")?;
-    let operation_id = first.operation_id.clone().ok_or("operation id missing")?;
+    let operation_id = first.operation_id.ok_or("operation id missing")?;
     assert_eq!(first.status, v1::OperationStatus::Pending as i32);
     let mut failed = None;
     while let Some(event) = events.message().await? {

@@ -600,6 +600,18 @@ impl RuntimeBackend for FakeRuntime {
         let (input, mut inputs) = tokio::sync::mpsc::channel(16);
         let (outputs, output) = tokio::sync::mpsc::channel(16);
         tokio::spawn(async move {
+            let ready_then_drain = request
+                .argv
+                .first()
+                .is_some_and(|arg| arg == "fake-ready-then-drain");
+            if ready_then_drain
+                && outputs
+                    .send(Ok(ExecOutput::Stdout(b"ready".to_vec())))
+                    .await
+                    .is_err()
+            {
+                return;
+            }
             let mut stdin = request.stdin;
             let mut signal = 0;
             let mut resize = None;
@@ -611,13 +623,17 @@ impl RuntimeBackend for FakeRuntime {
                     ExecInput::Close => break,
                 }
             }
-            let (stdout, stderr, code) = interpret_fake_command(
-                &request.argv,
-                &request.environment,
-                stdin,
-                configured,
-                resize,
-            );
+            let (stdout, stderr, code) = if ready_then_drain {
+                (Vec::new(), Vec::new(), 0)
+            } else {
+                interpret_fake_command(
+                    &request.argv,
+                    &request.environment,
+                    stdin,
+                    configured,
+                    resize,
+                )
+            };
             {
                 let mut state = runtime.inner.lock().await;
                 let timestamp_millis = std::time::SystemTime::now()

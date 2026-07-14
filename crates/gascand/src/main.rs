@@ -57,6 +57,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fake_state_path,
     )
     .await?;
+    if let Some(delay) = std::env::var("GASCAN_FAKE_LOGS_FAIL_AFTER_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        let failing = runtime.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            failing
+                .inject_failure(gascan_core::fake_runtime::FailureBoundary::Logs)
+                .await;
+        });
+    }
     let service = Arc::new(SandboxService::new(
         runtime,
         store,
