@@ -66,3 +66,47 @@ The compiler uses one pinned digest-form workspace image reference because its r
 ## Concerns
 
 No Task 3 blocker remains. The pinned image constant is intentionally isolated and immutable, but its release digest must eventually be supplied by the image build/resolution track before a real runtime lifecycle is released.
+
+## Critical review follow-up: sealed create boundary
+
+Review found that `CreateRequest` still had public fields and `Deserialize`, allowing external crates to bypass `PolicyCompiler` with a struct literal or serialized input. This was a critical policy-boundary defect.
+
+Follow-up RED command:
+
+```text
+cargo test -p gascan-core --doc
+```
+
+RED result: exit 101. Both new `compile_fail` examples compiled successfully, demonstrating that an external caller could replace the image through struct update syntax and deserialize an unchecked request.
+
+Follow-up GREEN commands:
+
+```text
+cargo test -p gascan-core --test policy --test backend_contract
+cargo test -p gascan-core --doc
+```
+
+GREEN result: exit 0. The 10 policy tests and 8 backend-contract tests passed; all 4 doctests passed, including the 2 new public API compile-fail regressions.
+
+Follow-up implementation and review evidence:
+
+- All `CreateRequest` fields are now crate-private and `Deserialize` was removed while `Serialize`, `Clone`, `Eq`, and `Debug` remain.
+- Immutable getters cover ID, image, mounts, volumes, ports, environment, resources, network, user, init, and ownership. No mutable accessor or builder was added.
+- `CreateRequest::fixture` remains the only public constructor and returns one fixed known-valid shape without inputs that can alter policy fields.
+- The positive policy tests exercise every getter and serialize the approved JSON request shape.
+- Public nested request-shape types remain constructible for adapter inspection, but cannot be inserted into or used to mutate the sealed `CreateRequest`; this invariant is documented on the request type.
+- A source scan found only the `CreateRequest` declaration and its single inherent implementation; there is no `From`, `TryFrom`, alternate public constructor, or public function returning an unchecked request.
+
+Final follow-up verification:
+
+```text
+cargo fmt --all
+cargo test -p gascan-core --test policy --test backend_contract
+cargo test -p gascan-core --doc
+cargo test -p gascan-core --all-targets
+cargo clippy -p gascan-core --all-targets -- -D warnings
+cargo fmt --all -- --check
+git diff --check
+```
+
+Every command exited 0. The full core suite passed 34 integration tests, all 4 doctests passed, and strict Clippy, formatting, and diff checks were clean. No Task 4 or Apple work was performed.

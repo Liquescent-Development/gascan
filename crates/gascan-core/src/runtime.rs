@@ -49,20 +49,46 @@ pub struct OwnershipMetadata {
     pub sandbox_id: SandboxId,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// A policy-validated request accepted by [`RuntimeBackend::create`].
+///
+/// Its nested request-shape types remain public for backend inspection, but
+/// they cannot be inserted into or used to mutate this sealed request. The
+/// compiler and the fixed fixture are the only construction paths.
+///
+/// External callers cannot replace fields with an unchecked struct update.
+///
+/// ```compile_fail
+/// use gascan_core::runtime::CreateRequest;
+/// use gascan_core::sandbox::SandboxId;
+///
+/// let fixture = CreateRequest::fixture(SandboxId::test("sealed"));
+/// let _unchecked = CreateRequest {
+///     image: "mutable.example/workspace:latest".to_owned(),
+///     ..fixture
+/// };
+/// ```
+///
+/// Serialized requests are output-only and cannot bypass policy validation.
+///
+/// ```compile_fail
+/// use gascan_core::runtime::CreateRequest;
+///
+/// let _unchecked: CreateRequest = serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CreateRequest {
-    pub id: SandboxId,
-    pub image: String,
-    pub bind_mounts: Vec<RuntimeBindMount>,
-    pub volumes: Vec<RuntimeVolume>,
-    pub ports: Vec<RuntimePort>,
-    pub environment: BTreeMap<String, String>,
-    pub resources: RuntimeResourceLimits,
-    pub network: RuntimeNetwork,
-    pub user: RuntimeUser,
+    pub(crate) id: SandboxId,
+    pub(crate) image: String,
+    pub(crate) bind_mounts: Vec<RuntimeBindMount>,
+    pub(crate) volumes: Vec<RuntimeVolume>,
+    pub(crate) ports: Vec<RuntimePort>,
+    pub(crate) environment: BTreeMap<String, String>,
+    pub(crate) resources: RuntimeResourceLimits,
+    pub(crate) network: RuntimeNetwork,
+    pub(crate) user: RuntimeUser,
     /// Requires the backend to run the workspace under an init process.
-    pub init: bool,
-    pub ownership: OwnershipMetadata,
+    pub(crate) init: bool,
+    pub(crate) ownership: OwnershipMetadata,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -136,6 +162,50 @@ impl CreateRequest {
             user: RuntimeUser::Workspace,
             init: true,
         }
+    }
+
+    pub const fn id(&self) -> &SandboxId {
+        &self.id
+    }
+
+    pub fn image(&self) -> &str {
+        &self.image
+    }
+
+    pub fn bind_mounts(&self) -> &[RuntimeBindMount] {
+        &self.bind_mounts
+    }
+
+    pub fn volumes(&self) -> &[RuntimeVolume] {
+        &self.volumes
+    }
+
+    pub fn ports(&self) -> &[RuntimePort] {
+        &self.ports
+    }
+
+    pub const fn environment(&self) -> &BTreeMap<String, String> {
+        &self.environment
+    }
+
+    pub const fn resources(&self) -> &RuntimeResourceLimits {
+        &self.resources
+    }
+
+    pub const fn network(&self) -> RuntimeNetwork {
+        self.network
+    }
+
+    pub const fn user(&self) -> RuntimeUser {
+        self.user
+    }
+
+    pub const fn init(&self) -> bool {
+        self.init
+    }
+
+    pub const fn ownership(&self) -> &OwnershipMetadata {
+        &self.ownership
     }
 }
 

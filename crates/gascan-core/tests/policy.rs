@@ -119,28 +119,28 @@ fn canonical_request_has_one_root_mount_owned_volumes_loopback_ports_and_init() 
     let id = spec.id().clone();
 
     let request = PolicyCompiler::compile(spec, &capabilities()).expect("compile valid policy");
-    assert_eq!(request.id, id);
-    assert_eq!(request.bind_mounts.len(), 1);
-    assert_eq!(request.bind_mounts[0].source, root);
+    assert_eq!(request.id(), &id);
+    assert_eq!(request.bind_mounts().len(), 1);
+    assert_eq!(request.bind_mounts()[0].source, root);
     assert_eq!(
-        request.bind_mounts[0].target,
+        request.bind_mounts()[0].target,
         Utf8PathBuf::from(WORKSPACE_TARGET)
     );
-    assert!(request.bind_mounts[0].writable);
-    assert_eq!(request.network, RuntimeNetwork::Networked);
-    assert_eq!(request.user, RuntimeUser::Root);
-    assert!(request.init);
-    assert_eq!(request.ownership.managed_by, "gascan");
-    assert_eq!(request.ownership.sandbox_id, id);
-    assert_eq!(request.volumes.len(), 3);
-    assert!(request.volumes.iter().all(|volume| {
+    assert!(request.bind_mounts()[0].writable);
+    assert_eq!(request.network(), RuntimeNetwork::Networked);
+    assert_eq!(request.user(), RuntimeUser::Root);
+    assert!(request.init());
+    assert_eq!(request.ownership().managed_by, "gascan");
+    assert_eq!(request.ownership().sandbox_id, id);
+    assert_eq!(request.volumes().len(), 3);
+    assert!(request.volumes().iter().all(|volume| {
         volume.writable
             && volume.name.starts_with("gascan-")
-            && volume.ownership == request.ownership
+            && &volume.ownership == request.ownership()
             && volume.target.starts_with("/home/workspace")
     }));
-    assert_eq!(request.ports.len(), 2);
-    assert!(request.ports.iter().all(|port| {
+    assert_eq!(request.ports().len(), 2);
+    assert!(request.ports().iter().all(|port| {
         port.host_address == IpAddr::V4(Ipv4Addr::LOCALHOST) && port.host_port == port.guest_port
     }));
 }
@@ -150,12 +150,12 @@ fn image_reference_is_an_immutable_digest() {
     let (_temp, spec) = spec("version = 1\nnetwork = 'networked'\n");
     let request = PolicyCompiler::compile(spec, &capabilities()).expect("compile valid policy");
     let (_, digest) = request
-        .image
+        .image()
         .split_once("@sha256:")
         .expect("digest image reference");
     assert_eq!(digest.len(), 64);
     assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
-    assert!(!request.image.contains(":latest"));
+    assert!(!request.image().contains(":latest"));
 }
 
 #[test]
@@ -163,7 +163,8 @@ fn safe_resource_defaults_and_explicit_values_are_bounded() {
     let (_temp, default_spec) = spec("version = 1\nnetwork = 'networked'\n");
     let defaults = PolicyCompiler::compile(default_spec, &capabilities())
         .expect("compile defaults")
-        .resources;
+        .resources()
+        .to_owned();
     assert_eq!(defaults.cpus, Some(DEFAULT_CPUS));
     assert_eq!(defaults.memory_bytes, Some(DEFAULT_MEMORY_BYTES));
     assert_eq!(defaults.disk_bytes, Some(DEFAULT_DISK_BYTES));
@@ -177,7 +178,8 @@ fn safe_resource_defaults_and_explicit_values_are_bounded() {
     let (_temp_max, max_spec) = spec(&source);
     let maximum = PolicyCompiler::compile(max_spec, &capabilities())
         .expect("accept documented maxima")
-        .resources;
+        .resources()
+        .to_owned();
     assert_eq!(maximum.cpus, Some(MAX_CPUS));
     assert_eq!(maximum.memory_bytes, Some(MAX_MEMORY_BYTES));
     assert_eq!(maximum.disk_bytes, Some(MAX_DISK_BYTES));
@@ -274,5 +276,5 @@ fn approved_json_shape_exposes_no_unsafe_backend_surface() {
             "snapshot contains {forbidden}: {snapshot}"
         );
     }
-    assert_eq!(request.environment, BTreeMap::new());
+    assert_eq!(request.environment(), &BTreeMap::new());
 }
