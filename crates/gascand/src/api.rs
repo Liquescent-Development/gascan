@@ -211,19 +211,8 @@ impl Daemon {
     }
 }
 
-/// Minimal v1 endpoint preserving handshake and local-transport contracts.
-#[derive(Clone, Debug)]
-pub struct LocalApi {
-    activity: ActivityTracker,
-}
-impl LocalApi {
-    #[must_use]
-    pub fn new(activity: ActivityTracker) -> Self {
-        Self { activity }
-    }
-    fn unavailable() -> tonic::Status {
-        tonic::Status::unimplemented(error_code::BACKEND_UNAVAILABLE)
-    }
+fn unavailable() -> tonic::Status {
+    tonic::Status::unimplemented(error_code::BACKEND_UNAVAILABLE)
 }
 
 /// Tonic adapter for the durable sandbox lifecycle service.
@@ -384,119 +373,6 @@ type EventStream = tokio_stream::Empty<Result<v1::OperationEvent, tonic::Status>
 type AttachStream = tokio_stream::Empty<Result<v1::ServerFrame, tonic::Status>>;
 
 #[tonic::async_trait]
-impl GasCan for LocalApi {
-    async fn handshake(
-        &self,
-        request: tonic::Request<v1::HandshakeRequest>,
-    ) -> Result<tonic::Response<v1::HandshakeResponse>, tonic::Status> {
-        let _lease = self.activity.lease();
-        let request = request.into_inner();
-        let rejection = validate_api_major(request.api_major)
-            .err()
-            .map(|error| v1::Error {
-                code: error.code().to_owned(),
-                message: format!(
-                    "API major {} is unsupported; expected {API_MAJOR}",
-                    request.api_major
-                ),
-                details: Vec::new(),
-            });
-        Ok(tonic::Response::new(v1::HandshakeResponse {
-            api_major: API_MAJOR,
-            api_minor: API_MINOR,
-            capabilities: Vec::new(),
-            transport_security: Some(local_transport_security()),
-            rejection,
-        }))
-    }
-    async fn status(
-        &self,
-        _: tonic::Request<v1::StatusRequest>,
-    ) -> Result<tonic::Response<v1::StatusResponse>, tonic::Status> {
-        let _lease = self.activity.lease();
-        Err(Self::unavailable())
-    }
-    async fn list(
-        &self,
-        _: tonic::Request<v1::ListRequest>,
-    ) -> Result<tonic::Response<v1::ListResponse>, tonic::Status> {
-        let _lease = self.activity.lease();
-        Err(Self::unavailable())
-    }
-    async fn doctor(
-        &self,
-        _: tonic::Request<v1::DoctorRequest>,
-    ) -> Result<tonic::Response<v1::DoctorResponse>, tonic::Status> {
-        let _lease = self.activity.lease();
-        Err(Self::unavailable())
-    }
-    type UpStream = EventStream;
-    async fn up(
-        &self,
-        _: tonic::Request<v1::UpRequest>,
-    ) -> Result<tonic::Response<Self::UpStream>, tonic::Status> {
-        let _lease = self.activity.lease();
-        Err(Self::unavailable())
-    }
-    type ApplyStream = EventStream;
-    async fn apply(
-        &self,
-        _: tonic::Request<v1::ApplyRequest>,
-    ) -> Result<tonic::Response<Self::ApplyStream>, tonic::Status> {
-        let _lease = self.activity.lease();
-        Err(Self::unavailable())
-    }
-    type RunStream = EventStream;
-    async fn run(
-        &self,
-        _: tonic::Request<v1::RunRequest>,
-    ) -> Result<tonic::Response<Self::RunStream>, tonic::Status> {
-        let _lease = self.activity.lease();
-        Err(Self::unavailable())
-    }
-    type ShellStream = EventStream;
-    async fn shell(
-        &self,
-        _: tonic::Request<v1::ShellRequest>,
-    ) -> Result<tonic::Response<Self::ShellStream>, tonic::Status> {
-        let _lease = self.activity.lease();
-        Err(Self::unavailable())
-    }
-    type DownStream = EventStream;
-    async fn down(
-        &self,
-        _: tonic::Request<v1::DownRequest>,
-    ) -> Result<tonic::Response<Self::DownStream>, tonic::Status> {
-        let _lease = self.activity.lease();
-        Err(Self::unavailable())
-    }
-    type DestroyStream = EventStream;
-    async fn destroy(
-        &self,
-        _: tonic::Request<v1::DestroyRequest>,
-    ) -> Result<tonic::Response<Self::DestroyStream>, tonic::Status> {
-        let _lease = self.activity.lease();
-        Err(Self::unavailable())
-    }
-    type LogsStream = EventStream;
-    async fn logs(
-        &self,
-        _: tonic::Request<v1::LogsRequest>,
-    ) -> Result<tonic::Response<Self::LogsStream>, tonic::Status> {
-        let _lease = self.activity.lease();
-        Err(Self::unavailable())
-    }
-    type AttachStream = AttachStream;
-    async fn attach(
-        &self,
-        _: tonic::Request<tonic::Streaming<v1::ClientFrame>>,
-    ) -> Result<tonic::Response<Self::AttachStream>, tonic::Status> {
-        let _lease = self.activity.lease();
-        Err(Self::unavailable())
-    }
-}
-
-#[tonic::async_trait]
 impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
     async fn handshake(
         &self,
@@ -606,7 +482,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         _: tonic::Request<v1::RunRequest>,
     ) -> Result<tonic::Response<Self::RunStream>, tonic::Status> {
         let _lease = self.activity.lease();
-        Err(LocalApi::unavailable())
+        Err(unavailable())
     }
     type ShellStream = EventStream;
     async fn shell(
@@ -614,7 +490,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         _: tonic::Request<v1::ShellRequest>,
     ) -> Result<tonic::Response<Self::ShellStream>, tonic::Status> {
         let _lease = self.activity.lease();
-        Err(LocalApi::unavailable())
+        Err(unavailable())
     }
     type DownStream = ApiEventStream;
     async fn down(
@@ -648,7 +524,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         _: tonic::Request<v1::LogsRequest>,
     ) -> Result<tonic::Response<Self::LogsStream>, tonic::Status> {
         let _lease = self.activity.lease();
-        Err(LocalApi::unavailable())
+        Err(unavailable())
     }
     type AttachStream = AttachStream;
     async fn attach(
@@ -656,7 +532,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         _: tonic::Request<tonic::Streaming<v1::ClientFrame>>,
     ) -> Result<tonic::Response<Self::AttachStream>, tonic::Status> {
         let _lease = self.activity.lease();
-        Err(LocalApi::unavailable())
+        Err(unavailable())
     }
 }
 

@@ -48,3 +48,45 @@ The managed command sandbox denies Unix socket bind with OS `EPERM`. Re-running 
 - `cargo fmt --all -- --check` and `git diff --check` — passed.
 
 Task 7 implementation is complete and pending independent review.
+
+## Review correction
+
+The first review found that pathname checks could race directory substitution,
+the executable served a handshake-only API, and wire status/events omitted
+durable metadata. The correction replaces those boundaries rather than
+relaxing them.
+
+Socket directory traversal now starts from an open root descriptor and opens
+every component with `openat(O_DIRECTORY | O_NOFOLLOW)`. The final directory
+is created with `mkdirat`, forced to 0700 with `fchmod`, and retained as a
+capability for all stat, rename, quarantine, and unlink operations. Binding
+uses a unique staging node and accepts it only after descriptor-relative stat
+proves it landed in that retained directory; it is then atomically renamed
+without replacement. Cleanup continues to address the retained directory even
+if its pathname is swapped. Quarantine collisions select a fresh generated
+name and never overwrite an existing entry.
+
+The executable now constructs a durable Store, FakeRuntime (the configured
+non-live backend available in this plan phase), provisioner, SandboxService,
+and SandboxApi. The handshake-only LocalApi and its lifecycle stubs were
+removed. A real peer-authenticated UDS Tonic test performs Handshake and Up
+through the generated client and observes the completed durable event stream.
+Another child-process test sends SIGTERM while provisioning is active, proves
+the daemon remains alive while the durable operation drains, then proves the
+connection and owned socket close.
+
+Store schema v2 durably records event timestamps/error codes and sandbox
+updated timestamps. Migration from exact v1 is transactional. Status responses
+carry the durable last operation ID and updated timestamp; events carry their
+stored timestamp and exact stored error code. Pending-operation conflicts map
+to the public `operation_conflict` contract.
+
+Review-wave TDD evidence:
+
+- RED: intermediate symlink traversal unexpectedly succeeded and created the
+  directory through the link.
+- RED: swapping the runtime directory after bind left the daemon socket behind
+  in the displaced directory.
+- GREEN: expanded socket security passed 8/8 under the required UDS escalation.
+- GREEN: real daemon lifecycle/SIGTERM suite passed 5/5.
+- GREEN: metadata API unit tests passed 3/3 and Store passed 23/23.

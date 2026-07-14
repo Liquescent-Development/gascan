@@ -15,7 +15,7 @@ async-trait = "0.1"
 base64 = "0.22"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["fs", "process"] }
 camino = { version = "1", features = ["serde1"] }
 sha2 = "0.10"
 toml = "0.8"
@@ -23,6 +23,8 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 prost = "0.13"
 prost-types = "0.13"
 tonic = "0.12"
+tower = "0.4"
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

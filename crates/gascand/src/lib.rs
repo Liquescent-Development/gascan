@@ -8,7 +8,7 @@ mod socket;
 mod store;
 
 pub use api::{
-    ActivityLease, ActivityTracker, ApiEventStream, Daemon, DaemonConfig, LocalApi, OperationLease,
+    ActivityLease, ActivityTracker, ApiEventStream, Daemon, DaemonConfig, OperationLease,
     SandboxApi,
 };
 pub use socket::{OwnedSocket, PeerUid, PeerUidMismatch, SocketPaths, validate_peer_uid};
