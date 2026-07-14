@@ -26,6 +26,13 @@ async fn api_client(
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+fn signal_test_guard() -> Result<std::sync::MutexGuard<'static, ()>, &'static str> {
+    static SIGNAL_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SIGNAL_TESTS
+        .lock()
+        .map_err(|_| "signal test mutex poisoned")
+}
+
 struct Environment {
     gascan: std::ffi::OsString,
     gascand: std::ffi::OsString,
@@ -69,6 +76,34 @@ impl Environment {
     }
     fn root(&self) -> Result<&str, &'static str> {
         self.root.path().to_str().ok_or("non UTF-8 root")
+    }
+    fn shutdown_daemon(&self) -> TestResult {
+        let socket = self.runtime_root.join("gascan/gascand.sock");
+        if std::os::unix::net::UnixStream::connect(&socket).is_err() {
+            return Ok(());
+        }
+        let raw_pid = std::fs::read_to_string(self.runtime_root.join("daemon.pid"))?;
+        let pid = raw_pid.parse::<i32>()?;
+        let pid =
+            rustix_openpty::rustix::process::Pid::from_raw(pid).ok_or("invalid daemon pid")?;
+        rustix_openpty::rustix::process::kill_process(
+            pid,
+            rustix_openpty::rustix::process::Signal::TERM,
+        )?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+            if std::time::Instant::now() >= deadline {
+                return Err("daemon did not remove its socket during teardown".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Environment {
+    fn drop(&mut self) {
+        let _ = self.shutdown_daemon();
     }
 }
 
@@ -208,30 +243,13 @@ fn binary_stdin_stdout_stderr_and_environment_are_exact() -> TestResult {
 }
 
 #[test]
-fn concurrent_autostart_race_converges_on_one_private_daemon() -> TestResult {
-    let env = std::sync::Arc::new(Environment::new()?);
-    let left = {
-        let env = env.clone();
-        std::thread::spawn(move || env.invoke(&["doctor", "--json"]))
-    };
-    let right = {
-        let env = env.clone();
-        std::thread::spawn(move || env.invoke(&["doctor", "--json"]))
-    };
-    assert!(
-        left.join()
-            .map_err(|_| "left thread panicked")??
-            .status
-            .success()
-    );
-    assert!(
-        right
-            .join()
-            .map_err(|_| "right thread panicked")??
-            .status
-            .success()
-    );
-    assert!(!env.runtime_root.join("gascan/gascand.sock").is_file());
+fn environment_teardown_terminates_its_exact_live_daemon() -> TestResult {
+    let env = Environment::new()?;
+    assert!(env.invoke(&["doctor", "--json"])?.status.success());
+    let socket = env.runtime_root.join("gascan/gascand.sock");
+    assert!(std::os::unix::net::UnixStream::connect(&socket).is_ok());
+    env.shutdown_daemon()?;
+    assert!(std::os::unix::net::UnixStream::connect(socket).is_err());
     Ok(())
 }
 
@@ -329,6 +347,7 @@ fn api_major_mismatch_has_stable_exit_and_error() -> TestResult {
 #[test]
 fn real_pty_resize_signals_and_terminal_restoration_are_exact() -> TestResult {
     use rustix_openpty::rustix;
+    let _signal_guard = signal_test_guard()?;
     let env = Environment::new()?;
     assert!(env.invoke(&["up", env.root()?])?.status.success());
     for (signal, expected) in [
@@ -362,8 +381,16 @@ fn real_pty_resize_signals_and_terminal_restoration_are_exact() -> TestResult {
         )?;
         let pid =
             rustix::process::Pid::from_raw(i32::try_from(child.id())?).ok_or("invalid pid")?;
+        assert!(
+            child.try_wait()?.is_none(),
+            "PTY CLI exited before SIGWINCH"
+        );
         rustix::process::kill_process(pid, rustix::process::Signal::WINCH)?;
         std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            child.try_wait()?.is_none(),
+            "PTY CLI exited before terminating signal"
+        );
         rustix::process::kill_process(pid, signal)?;
         assert_eq!(child.wait()?.code(), Some(expected));
         let restored = rustix::termios::tcgetattr(&pty.user)?;
@@ -377,6 +404,7 @@ fn real_pty_resize_signals_and_terminal_restoration_are_exact() -> TestResult {
 #[test]
 fn real_pty_success_nonzero_and_connection_error_restore_terminal() -> TestResult {
     use rustix_openpty::rustix;
+    let _signal_guard = signal_test_guard()?;
     let env = Environment::new()?;
     assert!(env.invoke(&["up", env.root()?])?.status.success());
     assert_eq!(

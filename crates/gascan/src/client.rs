@@ -50,7 +50,11 @@ impl Client {
     pub async fn connect_or_start() -> Result<Self, ClientError> {
         let socket = socket_path();
         if let Ok(client) = connect(&socket).await {
-            return negotiate(client).await;
+            match negotiate(client).await {
+                Ok(client) => return Ok(client),
+                Err(error @ ClientError::Api(_)) => return Err(error),
+                Err(_) => {}
+            }
         }
         let daemon = daemon_path()?;
         let _child = tokio::process::Command::new(daemon)
@@ -60,12 +64,36 @@ impl Client {
             .spawn()?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            match connect(&socket).await {
-                Ok(client) => return negotiate(client).await,
+            let result = tokio::time::timeout(Duration::from_millis(250), async {
+                negotiate(connect(&socket).await?).await
+            })
+            .await
+            .unwrap_or_else(|_| {
+                Err(ClientError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "daemon readiness probe timed out",
+                )))
+            });
+            match result {
+                Ok(client) => return Ok(client),
+                Err(error @ ClientError::Api(_)) => return Err(error),
+                Err(error) if !startup_transient(&error) => return Err(error),
                 Err(error) if tokio::time::Instant::now() >= deadline => return Err(error),
                 Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
             }
         }
+    }
+}
+
+fn startup_transient(error: &ClientError) -> bool {
+    match error {
+        ClientError::Io(_) | ClientError::Transport(_) => true,
+        ClientError::Rpc(status) => {
+            status.code() == tonic::Code::Unavailable
+                || (status.code() == tonic::Code::Unknown
+                    && status.message().contains("transport error"))
+        }
+        ClientError::Api(_) => false,
     }
 }
 

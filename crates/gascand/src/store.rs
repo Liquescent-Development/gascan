@@ -440,17 +440,26 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), StoreError> {
             _ => Err(StoreError::UnsupportedSchemaVersion(version)),
         };
     }
-    let object_count: i64 = connection.query_row(
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let schema_appeared: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version')",
+        [],
+        |row| row.get(0),
+    )?;
+    if schema_appeared {
+        transaction.commit()?;
+        return initialize_schema(connection);
+    }
+    let object_count: i64 = transaction.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'",
         [],
         |row| row.get(0),
     )?;
     let user_version: i64 =
-        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if object_count != 0 || user_version != 0 {
         return Err(StoreError::UnknownSchema);
     }
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(INITIAL_MIGRATION)?;
     transaction.execute_batch(DURABLE_METADATA_MIGRATION)?;
     transaction.commit()?;

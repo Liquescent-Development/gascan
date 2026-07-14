@@ -212,6 +212,9 @@ impl Daemon {
         T: GasCan,
     {
         let owned = config.paths.bind()?;
+        if let Some(pid_path) = std::env::var_os("GASCAN_PID_PATH") {
+            std::fs::write(pid_path, std::process::id().to_string())?;
+        }
         owned.set_nonblocking(true)?;
         let listener = tokio::net::UnixListener::from_std(owned.try_clone()?)?;
         let expected_uid = crate::PeerUid::current();

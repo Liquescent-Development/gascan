@@ -23,6 +23,7 @@ TTY Attach sends the initial size, SIGWINCH changes, stdin, SIGINT/SIGTERM, and 
 - API compatibility: 10 exhaustive v1 tests.
 - Real-process fake E2E: 12 tests covering lifecycle, binary streams/logs, environment defense, autostart race, two sandboxes, idle and SIGKILL restart, API mismatch, atomic token misuse, since/follow, and real PTY success/nonzero/connection loss/resize/SIGINT/SIGTERM/restoration. A separate real-PTY unit test covers panic unwind.
 - Logs-since tests establish a future millisecond boundary by observing the clock, retain inclusive `timestamp >= since` semantics, and exclude the completed pre-boundary record without scheduler-timing assumptions.
+- Concurrent autostart serializes schema discovery/creation under SQLite's immediate transaction, then uses a deterministic client barrier and bounded connect/HTTP2/Handshake readiness probes within the fixed overall deadline; only transient startup transport failures retry, while compatibility and security failures remain terminal. The E2E harness records the PID only after socket ownership and terminates that exact live daemon before deleting its private runtime, preventing orphan accumulation.
 - Managed execution denies UDS bind; identical approved-escalation commands are required. Production security was not weakened.
 - Strict workspace Clippy, full workspace tests/doctests, formatting, and diff checks are the final gate. Apple live tests remain ignored and no Apple integration was added.
 

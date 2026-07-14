@@ -36,9 +36,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_or(Duration::from_secs(300), Duration::from_millis);
     let paths = SocketPaths::for_user()?;
     paths.prepare_directory()?;
-    if let Some(pid_path) = std::env::var_os("GASCAN_PID_PATH") {
-        std::fs::write(pid_path, std::process::id().to_string())?;
-    }
     let state_path = std::env::var_os("GASCAN_STATE_PATH")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| paths.directory().join("state.sqlite3"));
