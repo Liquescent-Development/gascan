@@ -14,6 +14,8 @@ The pre-release v1 command payload carries repeated `EnvironmentVariable` entrie
 
 TTY Attach sends the initial size, SIGWINCH changes, stdin, SIGINT/SIGTERM, and Close. A shared idempotent restore handle duplicates the exact terminal descriptor before any mutation and restores termios before forwarding a terminating signal; its setup guard also restores after every later setup failure. Drop restores on success, exact nonzero command exit, daemon/Attach loss, and panic unwind. Real PTY subprocess tests cover those paths, while test-only injected setup failures and `catch_unwind` prove restoration without adding a production panic path.
 
+Lifecycle RPCs publish the checked durable operation ID and live Pending stream immediately after `begin_operation`; keyed mutation and its daemon activity lease continue in a spawned task independent of client cancellation, with post-begin errors persisted and streamed as the same operation's Failed terminal. Command payload field 2 is reserved: all stdin travels only through bounded 16 KiB Attach frames with channel backpressure after token acquisition. Follow logs use Pending snapshot/appends with strictly increasing sequence and emit one Completed terminal only on graceful server shutdown (or one Failed terminal on backend error); client cancellation ends without a terminal, while non-follow remains Completed sequence 1.
+
 ## TDD and verification
 
 - Initial RED: the real-process scenario failed because the CLI binary was absent.
@@ -21,7 +23,7 @@ TTY Attach sends the initial size, SIGWINCH changes, stdin, SIGINT/SIGTERM, and 
 - Rereview RED: logs were not sandbox-scoped, direct API environment injection crossed the boundary, resize was unobservable, and abandoned registries were unbounded.
 - Backend contract: 19 tests, including live control flow, exact log isolation, and persistence reopen.
 - API compatibility: 10 exhaustive v1 tests.
-- Real-process fake E2E: 12 tests covering lifecycle, binary streams/logs, environment defense, autostart race, two sandboxes, idle and SIGKILL restart, API mismatch, atomic token misuse, since/follow, and real PTY success/nonzero/connection loss/resize/SIGINT/SIGTERM/restoration. A separate real-PTY unit test covers panic unwind.
+- Real-process fake E2E: 14 tests covering live/disconnect-independent lifecycle and post-begin failure, binary streams/logs, environment defense, two sandboxes, idle and SIGKILL restart, API mismatch, atomic token misuse, since/follow, and real PTY success/nonzero/connection loss/resize/SIGINT/SIGTERM/restoration. Autostart has a separate deterministic race test, and a real-PTY unit test covers panic unwind.
 - Logs-since tests establish a future millisecond boundary by observing the clock, retain inclusive `timestamp >= since` semantics, and exclude the completed pre-boundary record without scheduler-timing assumptions.
 - Concurrent autostart serializes schema discovery/creation under SQLite's immediate transaction, then uses a deterministic client barrier and bounded connect/HTTP2/Handshake readiness probes within the fixed overall deadline; only transient startup transport failures retry, while compatibility and security failures remain terminal. The E2E harness records the PID only after socket ownership and terminates that exact live daemon before deleting its private runtime, preventing orphan accumulation.
 - Managed execution denies UDS bind; identical approved-escalation commands are required. Production security was not weakened.

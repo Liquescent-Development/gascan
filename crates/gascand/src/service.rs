@@ -67,6 +67,24 @@ pub struct Operation {
     pub events: mpsc::Receiver<OperationEvent>,
 }
 
+type OperationStarted = tokio::sync::oneshot::Sender<Operation>;
+
+fn publish_operation(
+    started: Option<OperationStarted>,
+    id: OperationId,
+    receiver: mpsc::Receiver<OperationEvent>,
+) -> Option<mpsc::Receiver<OperationEvent>> {
+    if let Some(started) = started {
+        let _ = started.send(Operation {
+            id,
+            events: receiver,
+        });
+        None
+    } else {
+        Some(receiver)
+    }
+}
+
 pub struct SandboxService<B: RuntimeBackend> {
     runtime: B,
     store: Store,
@@ -225,6 +243,24 @@ impl<B: RuntimeBackend> SandboxService<B> {
     }
 
     pub async fn up(&self, request: UpRequest) -> Result<Operation, ServiceError> {
+        self.up_inner(request, None)
+            .await?
+            .ok_or(ServiceError::EventStreamUnavailable)
+    }
+
+    pub(crate) async fn up_started(
+        &self,
+        request: UpRequest,
+        started: OperationStarted,
+    ) -> Result<(), ServiceError> {
+        self.up_inner(request, Some(started)).await.map(drop)
+    }
+
+    async fn up_inner(
+        &self,
+        request: UpRequest,
+        started: Option<OperationStarted>,
+    ) -> Result<Option<Operation>, ServiceError> {
         let id = request.spec.id().clone();
         let lock = self.keyed_lock(&id)?;
         let _guard = lock.lock().await;
@@ -265,6 +301,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let (sender, receiver) = mpsc::channel(16);
         self.initialize_operation(operation.id, &id, record.actual_state, &sender)
             .await?;
+        let receiver = publish_operation(started, operation.id, receiver);
         if let Err(error) = self
             .emit(operation.id, json!({"phase":"validated"}), &sender)
             .await
@@ -309,10 +346,10 @@ impl<B: RuntimeBackend> SandboxService<B> {
                     .database(move |store| store.complete_operation(operation.id, actual))
                     .await?;
                 self.send_terminal(terminal.id, &sender).await?;
-                Ok(Operation {
+                Ok(receiver.map(|events| Operation {
                     id: operation.id,
-                    events: receiver,
-                })
+                    events,
+                }))
             }
             Err(error) => {
                 let actual = self.runtime.inspect(&id).await.ok().flatten().map_or(
@@ -423,8 +460,10 @@ impl<B: RuntimeBackend> SandboxService<B> {
             OperationKind::Start,
             DesiredState::Running,
             ActualState::Running,
+            None,
         )
-        .await
+        .await?
+        .ok_or(ServiceError::EventStreamUnavailable)
     }
     pub async fn stop(&self, id: &SandboxId) -> Result<Operation, ServiceError> {
         self.simple_state(
@@ -432,8 +471,26 @@ impl<B: RuntimeBackend> SandboxService<B> {
             OperationKind::Stop,
             DesiredState::Stopped,
             ActualState::Stopped,
+            None,
+        )
+        .await?
+        .ok_or(ServiceError::EventStreamUnavailable)
+    }
+
+    pub(crate) async fn stop_started(
+        &self,
+        id: &SandboxId,
+        started: OperationStarted,
+    ) -> Result<(), ServiceError> {
+        self.simple_state(
+            id,
+            OperationKind::Stop,
+            DesiredState::Stopped,
+            ActualState::Stopped,
+            Some(started),
         )
         .await
+        .map(drop)
     }
 
     async fn simple_state(
@@ -442,7 +499,8 @@ impl<B: RuntimeBackend> SandboxService<B> {
         kind: OperationKind,
         desired: DesiredState,
         target: ActualState,
-    ) -> Result<Operation, ServiceError> {
+        started: Option<OperationStarted>,
+    ) -> Result<Option<Operation>, ServiceError> {
         let lock = self.keyed_lock(id)?;
         let _guard = lock.lock().await;
         let mut record = self
@@ -462,6 +520,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let (sender, receiver) = mpsc::channel(16);
         self.initialize_operation(operation.id, id, record.actual_state, &sender)
             .await?;
+        let receiver = publish_operation(started, operation.id, receiver);
         let result = async {
             let runtime = self
                 .runtime
@@ -491,13 +550,31 @@ impl<B: RuntimeBackend> SandboxService<B> {
         self.database(move |store| store.complete_operation(operation.id, target))
             .await?;
         self.send_terminal(operation.id, &sender).await?;
-        Ok(Operation {
+        Ok(receiver.map(|events| Operation {
             id: operation.id,
-            events: receiver,
-        })
+            events,
+        }))
     }
 
     pub async fn destroy(&self, id: &SandboxId) -> Result<Operation, ServiceError> {
+        self.destroy_inner(id, None)
+            .await?
+            .ok_or(ServiceError::EventStreamUnavailable)
+    }
+
+    pub(crate) async fn destroy_started(
+        &self,
+        id: &SandboxId,
+        started: OperationStarted,
+    ) -> Result<(), ServiceError> {
+        self.destroy_inner(id, Some(started)).await.map(drop)
+    }
+
+    async fn destroy_inner(
+        &self,
+        id: &SandboxId,
+        started: Option<OperationStarted>,
+    ) -> Result<Option<Operation>, ServiceError> {
         let lock = self.keyed_lock(id)?;
         let _guard = lock.lock().await;
         let mut record = self
@@ -521,6 +598,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let (sender, receiver) = mpsc::channel(16);
         self.initialize_operation(operation.id, id, record.actual_state, &sender)
             .await?;
+        let receiver = publish_operation(started, operation.id, receiver);
         let result = async {
             if let Some(runtime) = self.runtime.inspect(id).await? {
                 if runtime.ownership.managed_by != "gascan" || runtime.ownership.sandbox_id != *id {
@@ -577,13 +655,31 @@ impl<B: RuntimeBackend> SandboxService<B> {
         self.database(move |store| store.complete_operation(operation.id, ActualState::Absent))
             .await?;
         self.send_terminal(operation.id, &sender).await?;
-        Ok(Operation {
+        Ok(receiver.map(|events| Operation {
             id: operation.id,
-            events: receiver,
-        })
+            events,
+        }))
     }
 
     pub async fn apply(&self, request: UpRequest) -> Result<Operation, ServiceError> {
+        self.apply_inner(request, None)
+            .await?
+            .ok_or(ServiceError::EventStreamUnavailable)
+    }
+
+    pub(crate) async fn apply_started(
+        &self,
+        request: UpRequest,
+        started: OperationStarted,
+    ) -> Result<(), ServiceError> {
+        self.apply_inner(request, Some(started)).await.map(drop)
+    }
+
+    async fn apply_inner(
+        &self,
+        request: UpRequest,
+        started: Option<OperationStarted>,
+    ) -> Result<Option<Operation>, ServiceError> {
         let id = request.spec.id().clone();
         let lock = self.keyed_lock(&id)?;
         let _guard = lock.lock().await;
@@ -607,6 +703,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let (sender, receiver) = mpsc::channel(16);
         self.initialize_operation(operation.id, &id, record.actual_state, &sender)
             .await?;
+        let receiver = publish_operation(started, operation.id, receiver);
         let prior_actual = record.actual_state;
         let preflight = async {
             let runtime = self
@@ -638,10 +735,10 @@ impl<B: RuntimeBackend> SandboxService<B> {
             })
             .await?;
             self.send_terminal(operation.id, &sender).await?;
-            return Ok(Operation {
+            return Ok(receiver.map(|events| Operation {
                 id: operation.id,
-                events: receiver,
-            });
+                events,
+            }));
         }
         let result = async {
             self.emit(operation.id, json!({"phase":"before_provision","desired_fingerprint":desired_fingerprint}), &sender).await?;
@@ -689,10 +786,10 @@ impl<B: RuntimeBackend> SandboxService<B> {
         self.database(move |store| store.complete_operation(operation.id, ActualState::Running))
             .await?;
         self.send_terminal(operation.id, &sender).await?;
-        Ok(Operation {
+        Ok(receiver.map(|events| Operation {
             id: operation.id,
-            events: receiver,
-        })
+            events,
+        }))
     }
 
     pub async fn reconcile(&self) -> Result<ReconcileReport, ServiceError> {
@@ -908,9 +1005,8 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let event = self
             .database(move |store| store.append_operation_event(id, details))
             .await?;
-        sender
-            .try_send(event)
-            .map_err(|_| ServiceError::EventStreamUnavailable)
+        let _ = sender.try_send(event);
+        Ok(())
     }
     async fn send_initial(
         &self,
@@ -923,9 +1019,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             .first()
             .cloned()
         {
-            sender
-                .try_send(event)
-                .map_err(|_| ServiceError::EventStreamUnavailable)?;
+            let _ = sender.try_send(event);
         }
         Ok(())
     }
@@ -940,9 +1034,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             .last()
             .cloned()
         {
-            sender
-                .try_send(event)
-                .map_err(|_| ServiceError::EventStreamUnavailable)?;
+            let _ = sender.try_send(event);
         }
         Ok(())
     }
@@ -968,7 +1060,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
 }
 
 impl ServiceError {
-    fn code(&self) -> &'static str {
+    pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::Runtime(error) => error.code(),
             Self::Create(error) => error.code(),

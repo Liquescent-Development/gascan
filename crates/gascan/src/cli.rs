@@ -2,7 +2,7 @@ use crate::client::{Client, ClientError};
 use crate::terminal::RawTerminal;
 use clap::{Parser, Subcommand};
 use gascan_proto::v1;
-use std::io::{IsTerminal, Read, Write};
+use std::io::{IsTerminal, Write};
 use std::os::fd::AsFd;
 
 const EXIT_USAGE: i32 = 64;
@@ -274,11 +274,7 @@ async fn run(
 ) -> Result<i32, CliError> {
     let selector = selector(client, explicit).await?;
     let environment = allowed_environment();
-    let mut stdin = Vec::new();
     let stdin_is_tty = std::io::stdin().is_terminal();
-    if !stdin_is_tty {
-        std::io::stdin().read_to_end(&mut stdin)?;
-    }
     let mut events = if shell {
         client
             .api
@@ -286,7 +282,6 @@ async fn run(
                 sandbox: Some(selector),
                 command: Some(v1::CommandPayload {
                     argv: argv.into_iter().map(String::into_bytes).collect(),
-                    stdin: Vec::new(),
                     environment,
                     tty: true,
                 }),
@@ -300,7 +295,6 @@ async fn run(
                 sandbox: Some(selector),
                 command: Some(v1::CommandPayload {
                     argv: argv.into_iter().map(String::into_bytes).collect(),
-                    stdin: Vec::new(),
                     environment,
                     tty: false,
                 }),
@@ -331,16 +325,13 @@ async fn run(
         tokio::spawn(async move {
             forward_terminal_input(producer, producer_token, restore).await;
         });
-    } else if !stdin.is_empty() {
-        input_sender
-            .send(v1::ClientFrame {
-                frame: Some(v1::client_frame::Frame::Stdin(stdin)),
-                session_token: token.clone(),
-            })
-            .await
-            .map_err(|_| CliError::Runtime("attach input closed".to_owned()))?;
-    }
-    if !(shell && stdin_is_tty) {
+    } else if !stdin_is_tty {
+        let producer = input_sender.clone();
+        let producer_token = token.clone();
+        tokio::spawn(async move {
+            forward_piped_input(producer, producer_token).await;
+        });
+    } else {
         input_sender
             .send(v1::ClientFrame {
                 frame: Some(v1::client_frame::Frame::Close(v1::Close {})),
@@ -376,6 +367,32 @@ async fn run(
     Err(CliError::Runtime(
         "attach ended without exit status".to_owned(),
     ))
+}
+
+async fn forward_piped_input(sender: tokio::sync::mpsc::Sender<v1::ClientFrame>, token: Vec<u8>) {
+    use tokio::io::AsyncReadExt as _;
+    let mut stdin = tokio::io::stdin();
+    let mut bytes = vec![0_u8; 16 * 1024];
+    loop {
+        let frame = match stdin.read(&mut bytes).await {
+            Ok(0) | Err(_) => v1::client_frame::Frame::Close(v1::Close {}),
+            Ok(count) => v1::client_frame::Frame::Stdin(bytes[..count].to_vec()),
+        };
+        let terminal = matches!(frame, v1::client_frame::Frame::Close(_));
+        if sender
+            .send(v1::ClientFrame {
+                frame: Some(frame),
+                session_token: token.clone(),
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if terminal {
+            return;
+        }
+    }
 }
 
 async fn forward_terminal_input(

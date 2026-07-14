@@ -300,10 +300,9 @@ fn v1_descriptor_has_exact_event_and_attach_layout() {
     assert_field(manifest, "content", 1, Bytes, None);
     assert_field(manifest, "format", 2, String, None);
     let command = message(file, "CommandPayload");
-    assert_eq!(command.field.len(), 4);
+    assert_eq!(command.field.len(), 3);
     assert_field(command, "argv", 1, Bytes, None);
     assert!(command.field[0].label() == prost_types::field_descriptor_proto::Label::Repeated);
-    assert_field(command, "stdin", 2, Bytes, None);
     assert_field(command, "environment", 3, Message, None);
     assert_field(command, "tty", 4, Bool, None);
 }
@@ -496,7 +495,6 @@ fn v1_descriptor_exactly_covers_every_exported_message_enum_and_rpc() {
             "CommandPayload",
             &[
                 f!("argv", 1, Bytes, R, None, None),
-                f!("stdin", 2, Bytes),
                 f!(
                     "environment",
                     3,
@@ -508,7 +506,7 @@ fn v1_descriptor_exactly_covers_every_exported_message_enum_and_rpc() {
                 f!("tty", 4, Bool),
             ],
             &[],
-            &[(5, 6)],
+            &[(2, 3), (5, 6)],
         ),
         (
             "UpRequest",

@@ -466,7 +466,6 @@ async fn attach_tokens_are_one_use_atomic_and_mismatch_safe() -> TestResult {
             }),
             command: Some(v1::CommandPayload {
                 argv: vec![b"true".to_vec()],
-                stdin: Vec::new(),
                 environment: vec![v1::EnvironmentVariable {
                     name: "SECRET_TOKEN".to_owned(),
                     value: "blocked".to_owned(),
@@ -485,7 +484,6 @@ async fn attach_tokens_are_one_use_atomic_and_mismatch_safe() -> TestResult {
         sandbox: Some(v1::SandboxSelector { sandbox_id: id }),
         command: Some(v1::CommandPayload {
             argv: vec![b"true".to_vec()],
-            stdin: Vec::new(),
             environment: Default::default(),
             tty: false,
         }),
@@ -654,7 +652,9 @@ async fn logs_since_and_follow_emit_new_byte_exact_records_then_cancel() -> Test
         })
         .await?
         .into_inner();
-    let _initial = follow.message().await?.ok_or("initial logs missing")?;
+    let initial = follow.message().await?.ok_or("initial logs missing")?;
+    assert_eq!(initial.sequence, 1);
+    assert_eq!(initial.status, v1::OperationStatus::Pending as i32);
     let mut command = env.command(&["run", "--", "fake-echo-stdin"]);
     let mut child = command
         .stdin(Stdio::piped())
@@ -670,6 +670,75 @@ async fn logs_since_and_follow_emit_new_byte_exact_records_then_cancel() -> Test
         .await??
         .ok_or("follow record missing")?;
     assert_eq!(appended.payload, b"follow\0record");
+    assert_eq!(appended.sequence, 2);
+    assert_eq!(appended.status, v1::OperationStatus::Pending as i32);
     drop(follow);
+    Ok(())
+}
+
+#[tokio::test]
+async fn slow_up_returns_live_operation_and_survives_disconnect() -> TestResult {
+    use gascan_proto::v1;
+    let env = Environment::new()?;
+    assert!(
+        env.command(&["doctor", "--json"])
+            .env("GASCAN_FAKE_PROVISION_DELAY_MS", "600")
+            .output()?
+            .status
+            .success()
+    );
+    let mut client = api_client(env.runtime_root.clone()).await?;
+    let response = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        client.up(v1::UpRequest {
+            project_root: env.root()?.to_owned(),
+        }),
+    )
+    .await??;
+    let mut events = response.into_inner();
+    let pending = events.message().await?.ok_or("pending event missing")?;
+    assert!(pending.operation_id.is_some());
+    assert_eq!(pending.status, v1::OperationStatus::Pending as i32);
+    drop(events);
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    let status = env.invoke(&["status", "--json"])?;
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&status.stdout)?["actual_state"],
+        "running"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn post_begin_failure_keeps_operation_id_and_streams_failed_terminal() -> TestResult {
+    use gascan_proto::v1;
+    let env = Environment::new()?;
+    assert!(
+        env.command(&["doctor", "--json"])
+            .env("GASCAN_FAKE_PROVISION_FAIL", "1")
+            .output()?
+            .status
+            .success()
+    );
+    let mut client = api_client(env.runtime_root.clone()).await?;
+    let mut events = client
+        .up(v1::UpRequest {
+            project_root: env.root()?.to_owned(),
+        })
+        .await?
+        .into_inner();
+    let first = events.message().await?.ok_or("pending event missing")?;
+    let operation_id = first.operation_id.clone().ok_or("operation id missing")?;
+    assert_eq!(first.status, v1::OperationStatus::Pending as i32);
+    let mut failed = None;
+    while let Some(event) = events.message().await? {
+        if event.status == v1::OperationStatus::Failed as i32 {
+            failed = Some(event);
+            break;
+        }
+    }
+    let failed = failed.ok_or("failed terminal missing")?;
+    assert_eq!(failed.operation_id, Some(operation_id));
+    assert!(failed.error.is_some());
     Ok(())
 }

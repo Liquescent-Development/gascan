@@ -10,6 +10,7 @@ use std::{sync::Arc, time::Duration};
 
 struct ConfiguredProvisioner {
     delay: Duration,
+    fail: bool,
 }
 #[async_trait::async_trait]
 impl Provisioner for ConfiguredProvisioner {
@@ -18,6 +19,9 @@ impl Provisioner for ConfiguredProvisioner {
         _request: ProvisionRequest<'_>,
     ) -> Result<ProvisionResolution, ServiceError> {
         tokio::time::sleep(self.delay).await;
+        if self.fail {
+            return Err(ServiceError::Provision("configured failure".to_owned()));
+        }
         Ok(ProvisionResolution::default())
     }
     async fn health_check(
@@ -44,6 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .map_or(Duration::ZERO, Duration::from_millis);
+    let provision_fail = std::env::var_os("GASCAN_FAKE_PROVISION_FAIL").is_some();
     let fake_state_path = std::env::var_os("GASCAN_FAKE_STATE_PATH")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| paths.directory().join("fake-runtime.json"));
@@ -57,6 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         store,
         Arc::new(ConfiguredProvisioner {
             delay: provision_delay,
+            fail: provision_fail,
         }),
     ));
     let config = DaemonConfig::new(paths, idle_timeout);

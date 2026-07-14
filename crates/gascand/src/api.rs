@@ -284,7 +284,6 @@ pub struct SandboxApi<B: RuntimeBackend> {
 struct PendingSession {
     id: SandboxId,
     argv: Vec<String>,
-    stdin: Vec<u8>,
     environment: std::collections::BTreeMap<String, String>,
     tty: bool,
     expires: tokio::time::Instant,
@@ -722,15 +721,21 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         &self,
         request: tonic::Request<v1::UpRequest>,
     ) -> Result<tonic::Response<Self::UpStream>, tonic::Status> {
-        let _operation = self.activity.admit_operation().map_err(admission_status)?;
+        let operation_lease = self.activity.admit_operation().map_err(admission_status)?;
         let spec = spec_for_root(request.into_inner().project_root)
             .await
             .map_err(ApiInputError::status)?;
-        let operation = self
-            .service
-            .up(ServiceUpRequest::new(spec))
+        let service = self.service.clone();
+        let (started, operation) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _operation_lease = operation_lease;
+            let _ = service
+                .up_started(ServiceUpRequest::new(spec), started)
+                .await;
+        });
+        let operation = operation
             .await
-            .map_err(service_status)?;
+            .map_err(|_| tonic::Status::internal(error_code::INTERNAL))?;
         Ok(tonic::Response::new(ApiEventStream::new(
             operation.events,
             self.activity.clone(),
@@ -741,15 +746,21 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         &self,
         request: tonic::Request<v1::ApplyRequest>,
     ) -> Result<tonic::Response<Self::ApplyStream>, tonic::Status> {
-        let _operation = self.activity.admit_operation().map_err(admission_status)?;
+        let operation_lease = self.activity.admit_operation().map_err(admission_status)?;
         let spec = spec_for_root(request.into_inner().project_root)
             .await
             .map_err(ApiInputError::status)?;
-        let operation = self
-            .service
-            .apply(ServiceUpRequest::new(spec))
+        let service = self.service.clone();
+        let (started, operation) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _operation_lease = operation_lease;
+            let _ = service
+                .apply_started(ServiceUpRequest::new(spec), started)
+                .await;
+        });
+        let operation = operation
             .await
-            .map_err(service_status)?;
+            .map_err(|_| tonic::Status::internal(error_code::INTERNAL))?;
         Ok(tonic::Response::new(ApiEventStream::new(
             operation.events,
             self.activity.clone(),
@@ -778,7 +789,6 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             PendingSession {
                 id,
                 argv: argv_from_wire(command.argv).map_err(ApiInputError::status)?,
-                stdin: command.stdin,
                 environment: validated_environment(command.environment)
                     .map_err(ApiInputError::status)?,
                 tty: command.tty,
@@ -798,7 +808,6 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         let id = selector_id(request.sandbox).map_err(ApiInputError::status)?;
         let command = request.command.unwrap_or(v1::CommandPayload {
             argv: Vec::new(),
-            stdin: Vec::new(),
             environment: Default::default(),
             tty: true,
         });
@@ -818,7 +827,6 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             PendingSession {
                 id,
                 argv,
-                stdin: command.stdin,
                 environment: validated_environment(command.environment)
                     .map_err(ApiInputError::status)?,
                 tty: true,
@@ -832,9 +840,17 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         &self,
         request: tonic::Request<v1::DownRequest>,
     ) -> Result<tonic::Response<Self::DownStream>, tonic::Status> {
-        let _operation = self.activity.admit_operation().map_err(admission_status)?;
+        let operation_lease = self.activity.admit_operation().map_err(admission_status)?;
         let id = selector_id(request.into_inner().sandbox).map_err(ApiInputError::status)?;
-        let operation = self.service.stop(&id).await.map_err(service_status)?;
+        let service = self.service.clone();
+        let (started, operation) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _operation_lease = operation_lease;
+            let _ = service.stop_started(&id, started).await;
+        });
+        let operation = operation
+            .await
+            .map_err(|_| tonic::Status::internal(error_code::INTERNAL))?;
         Ok(tonic::Response::new(ApiEventStream::new(
             operation.events,
             self.activity.clone(),
@@ -845,9 +861,17 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         &self,
         request: tonic::Request<v1::DestroyRequest>,
     ) -> Result<tonic::Response<Self::DestroyStream>, tonic::Status> {
-        let _operation = self.activity.admit_operation().map_err(admission_status)?;
+        let operation_lease = self.activity.admit_operation().map_err(admission_status)?;
         let id = selector_id(request.into_inner().sandbox).map_err(ApiInputError::status)?;
-        let operation = self.service.destroy(&id).await.map_err(service_status)?;
+        let service = self.service.clone();
+        let (started, operation) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _operation_lease = operation_lease;
+            let _ = service.destroy_started(&id, started).await;
+        });
+        let operation = operation
+            .await
+            .map_err(|_| tonic::Status::internal(error_code::INTERNAL))?;
         Ok(tonic::Response::new(ApiEventStream::new(
             operation.events,
             self.activity.clone(),
@@ -873,7 +897,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             .await
             .map_err(service_status)?;
         let baseline = bytes.clone();
-        let event = v1::OperationEvent {
+        let mut event = v1::OperationEvent {
             operation_id: None,
             timestamp: None,
             phase: "logs".to_owned(),
@@ -887,6 +911,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         if !request.follow {
             return Ok(tonic::Response::new(event_stream(event)));
         }
+        event.status = v1::OperationStatus::Pending as i32;
         let (sender, receiver) = tokio::sync::mpsc::channel(1);
         let activity = self.activity.clone();
         let service = self.service.clone();
@@ -896,15 +921,27 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
                 return;
             }
             let mut previous = baseline;
+            let mut sequence = 1_u64;
             loop {
                 tokio::select! {
-                    () = activity.inner.shutdown.notified() => break,
+                    () = activity.inner.shutdown.notified() => {
+                        sequence = sequence.saturating_add(1);
+                        let terminal = v1::OperationEvent { operation_id: None, timestamp: None, phase: "logs".to_owned(), payload: Vec::new(), error: None, sequence, status: v1::OperationStatus::Completed as i32, content_type: String::new(), session_token: Vec::new() };
+                        let _ = sender.send(Ok(terminal)).await;
+                        break;
+                    },
                     () = sender.closed() => break,
                     () = tokio::time::sleep(Duration::from_millis(50)) => {
-                        let current = match service.logs(&id, since_millis).await { Ok(bytes) => bytes, Err(error) => { let _ = sender.send(Err(service_status(error))).await; break; } };
+                        let current = match service.logs(&id, since_millis).await { Ok(bytes) => bytes, Err(error) => {
+                            sequence = sequence.saturating_add(1);
+                            let failed = v1::OperationEvent { operation_id: None, timestamp: None, phase: "logs".to_owned(), payload: Vec::new(), error: Some(v1::Error { code: error.code().to_owned(), message: error.to_string(), details: Vec::new() }), sequence, status: v1::OperationStatus::Failed as i32, content_type: String::new(), session_token: Vec::new() };
+                            let _ = sender.send(Ok(failed)).await;
+                            break;
+                        } };
                         if let Some(appended) = current.strip_prefix(previous.as_slice()) {
                             if !appended.is_empty() {
-                                let event = v1::OperationEvent { operation_id: None, timestamp: None, phase: "logs".to_owned(), payload: appended.to_vec(), error: None, sequence: 1, status: v1::OperationStatus::Pending as i32, content_type: "application/octet-stream".to_owned(), session_token: Vec::new() };
+                                sequence = sequence.saturating_add(1);
+                                let event = v1::OperationEvent { operation_id: None, timestamp: None, phase: "logs".to_owned(), payload: appended.to_vec(), error: None, sequence, status: v1::OperationStatus::Pending as i32, content_type: "application/octet-stream".to_owned(), session_token: Vec::new() };
                                 if sender.send(Ok(event)).await.is_err() { break; }
                             }
                         }
@@ -947,7 +984,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             .exec(
                 &pending.id,
                 pending.argv,
-                pending.stdin,
+                Vec::new(),
                 pending.environment,
                 pending.tty,
             )
@@ -1036,7 +1073,6 @@ mod tests {
         let pending = |expires| PendingSession {
             id: id.clone(),
             argv: vec!["true".to_owned()],
-            stdin: Vec::new(),
             environment: Default::default(),
             tty: false,
             expires,

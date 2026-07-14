@@ -92,7 +92,7 @@ message ManifestPayload { bytes content = 1; string format = 2; reserved 3; }
 message EnvironmentVariable { string name = 1; string value = 2; reserved 3; }
 message CommandPayload {
   repeated bytes argv = 1;
-  bytes stdin = 2;
+  reserved 2;
   repeated EnvironmentVariable environment = 3;
   bool tty = 4;
   reserved 5;
