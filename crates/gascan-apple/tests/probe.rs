@@ -74,7 +74,7 @@ async fn rejects_missing_duplicate_or_malformed_container_version() {
 #[tokio::test]
 async fn ignores_unknown_fields_and_extra_apps() {
     let version = probe_with_output(
-        br#"[{"appName":"helper","version":"words"},{"appName":"container","version":"1.9.3","future":true}]"#,
+        br#"[{"appName":"helper","future":true},42,{"unknown":"shape"},{"appName":"container","version":"1.9.3","future":true}]"#,
     )
     .version()
     .await

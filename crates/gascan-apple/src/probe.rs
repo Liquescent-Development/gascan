@@ -1,5 +1,5 @@
 use gascan_core::runtime::{NetworkIsolation, RuntimeCapabilities, RuntimeError, RuntimeVersion};
-use serde::Deserialize;
+use serde_json::Value;
 
 use crate::{CommandRunner, CommandSpec};
 
@@ -27,9 +27,10 @@ impl<R: CommandRunner> AppleProbe<R> {
                 ["system", "version", "--format", "json"],
             ))
             .await?;
-        let entries: Vec<VersionEntry> =
-            serde_json::from_slice(&output.stdout).map_err(invalid_output)?;
-        let mut containers = entries.iter().filter(|entry| entry.app_name == "container");
+        let entries: Vec<Value> = serde_json::from_slice(&output.stdout).map_err(invalid_output)?;
+        let mut containers = entries
+            .iter()
+            .filter(|entry| entry.get("appName").and_then(Value::as_str) == Some("container"));
         let entry = containers
             .next()
             .ok_or_else(|| RuntimeError::InvalidOutput {
@@ -43,7 +44,14 @@ impl<R: CommandRunner> AppleProbe<R> {
             });
         }
 
-        let version = parse_version(&entry.version)?;
+        let version_value = entry
+            .get("version")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RuntimeError::InvalidOutput {
+                operation: VERSION_OPERATION.to_owned(),
+                message: "container version must be a string".to_owned(),
+            })?;
+        let version = parse_version(version_value)?;
         if version.major != 1 {
             return Err(RuntimeError::UnsupportedVersion {
                 found: version,
@@ -66,13 +74,6 @@ impl<R: CommandRunner> AppleProbe<R> {
             offline: NetworkIsolation::Unverified,
         })
     }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct VersionEntry {
-    app_name: String,
-    version: String,
 }
 
 fn parse_version(value: &str) -> Result<RuntimeVersion, RuntimeError> {
