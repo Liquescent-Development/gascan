@@ -311,7 +311,7 @@ pub fn configured_resource(value: &Value, name: &str) -> Option<u64> {
 
 pub fn guest_argv(published: bool) -> Vec<String> {
     let script = if published {
-        "printf '%s\\n' '#!/bin/sh' \"printf 'HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\nConnection: close\\r\\n\\r\\nok'\" > /tmp/respond && chmod +x /tmp/respond && exec nc -l -p 8080 -e /tmp/respond"
+        "while :; do printf 'HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\nConnection: close\\r\\n\\r\\nok' | nc -l -p 8080; done"
     } else {
         "while :; do sleep 3600; done"
     };
