@@ -1,4 +1,4 @@
-use gascan_core::fake_runtime::FakeRuntime;
+use gascan_core::fake_runtime::{FailureBoundary, FakeRuntime};
 use gascan_core::runtime::{
     CreateRequest, ExecRequest, RuntimeBackend, RuntimeCall, RuntimeCapabilities, RuntimeError,
     RuntimeVersion,
@@ -72,7 +72,12 @@ async fn owned_listing_filters_unowned_resources() {
         .create(CreateRequest::fixture(owned.clone()))
         .await
         .unwrap();
-    backend.seed_unowned(SandboxId::test("foreign")).await;
+    let foreign = SandboxId::test("foreign");
+    backend.seed_unowned(foreign.clone()).await;
+
+    let foreign_runtime = backend.inspect(&foreign).await.unwrap().unwrap();
+    assert_eq!(foreign_runtime.id, foreign);
+    assert_ne!(foreign_runtime.ownership.managed_by, "gascan");
 
     let resources = backend.list_owned().await.unwrap();
     assert_eq!(resources.len(), 1);
@@ -125,7 +130,7 @@ async fn literal_requests_are_recorded_in_order() {
 
 #[tokio::test]
 async fn named_failure_is_injected_once_at_the_call_boundary() {
-    let backend = FakeRuntime::failing_once("start");
+    let backend = FakeRuntime::failing_once(FailureBoundary::Start);
     let id = SandboxId::test("failure");
     backend
         .create(CreateRequest::fixture(id.clone()))
@@ -139,42 +144,53 @@ async fn named_failure_is_injected_once_at_the_call_boundary() {
 
 #[tokio::test]
 async fn every_backend_boundary_supports_fail_once_injection() {
-    for boundary in ["capabilities", "inspect", "create"] {
+    for boundary in [
+        FailureBoundary::Capabilities,
+        FailureBoundary::Inspect,
+        FailureBoundary::Create,
+    ] {
         let backend = FakeRuntime::failing_once(boundary);
-        let id = SandboxId::test(boundary);
+        let id = SandboxId::test(boundary.as_str());
         let error = match boundary {
-            "capabilities" => backend.capabilities().await.unwrap_err(),
-            "inspect" => backend.inspect(&id).await.unwrap_err(),
-            "create" => backend
+            FailureBoundary::Capabilities => backend.capabilities().await.unwrap_err(),
+            FailureBoundary::Inspect => backend.inspect(&id).await.unwrap_err(),
+            FailureBoundary::Create => backend
                 .create(CreateRequest::fixture(id))
                 .await
                 .unwrap_err(),
-            _ => unreachable!(),
+            _ => continue,
         };
         assert_eq!(error.code(), "injected_failure");
     }
 
-    for boundary in ["start", "stop", "remove", "exec", "logs", "list_owned"] {
+    for boundary in [
+        FailureBoundary::Start,
+        FailureBoundary::Stop,
+        FailureBoundary::Remove,
+        FailureBoundary::Exec,
+        FailureBoundary::Logs,
+        FailureBoundary::ListOwned,
+    ] {
         let backend = FakeRuntime::failing_once(boundary);
-        let id = SandboxId::test(boundary);
+        let id = SandboxId::test(boundary.as_str());
         backend
             .create(CreateRequest::fixture(id.clone()))
             .await
             .unwrap();
-        if matches!(boundary, "stop" | "exec") {
+        if matches!(boundary, FailureBoundary::Stop | FailureBoundary::Exec) {
             backend.start(&id).await.unwrap();
         }
         let error = match boundary {
-            "start" => backend.start(&id).await.unwrap_err(),
-            "stop" => backend.stop(&id).await.unwrap_err(),
-            "remove" => backend.remove(&id).await.unwrap_err(),
-            "exec" => backend
+            FailureBoundary::Start => backend.start(&id).await.unwrap_err(),
+            FailureBoundary::Stop => backend.stop(&id).await.unwrap_err(),
+            FailureBoundary::Remove => backend.remove(&id).await.unwrap_err(),
+            FailureBoundary::Exec => backend
                 .exec(ExecRequest::fixture(id.clone(), ["true"]))
                 .await
                 .unwrap_err(),
-            "logs" => backend.logs(&id).await.unwrap_err(),
-            "list_owned" => backend.list_owned().await.unwrap_err(),
-            _ => unreachable!(),
+            FailureBoundary::Logs => backend.logs(&id).await.unwrap_err(),
+            FailureBoundary::ListOwned => backend.list_owned().await.unwrap_err(),
+            _ => continue,
         };
         assert_eq!(error.code(), "injected_failure");
     }
@@ -186,4 +202,10 @@ fn runtime_errors_have_stable_codes() {
         resource: "fixture".to_owned(),
     };
     assert_eq!(error.code(), "ownership_mismatch");
+
+    let error = RuntimeError::UnknownActualState {
+        resource: "fixture".to_owned(),
+        state: "paused-by-future-runtime".to_owned(),
+    };
+    assert_eq!(error.code(), "unknown_actual_state");
 }

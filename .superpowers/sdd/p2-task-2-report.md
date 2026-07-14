@@ -68,3 +68,27 @@ Dependencies were added only to the gascan-core manifest from existing workspace
 ## Concerns
 
 `ExecSession` is a completed byte-oriented result rather than a live bidirectional attachment. That matches Task 2's exact-exit contract and leaves the later attachment bridge to its dedicated plan task. No current blocker or known correctness defect remains.
+
+## Review-fix follow-up
+
+### RED
+
+After adding regression expectations, `cargo test -p gascan-core --test backend_contract` exited `101`. Compilation failed because `fake_runtime::FailureBoundary` and `RuntimeError::UnknownActualState` did not exist. The owned-filter regression also now requires the seeded foreign sandbox to be returned by `inspect`, proving it is part of the mixed runtime inventory rather than an unused side collection.
+
+### GREEN
+
+`cargo test -p gascan-core --test backend_contract` exited `0` with `8 passed; 0 failed`. The owned-filter test proves a foreign resource is inspectable from the same inventory, carries non-Gas-Can ownership metadata, and is absent from `list_owned`; the Gas Can resource in that inventory is retained. All nine failure boundaries are exercised through typed enum variants.
+
+### Fix decisions and self-review
+
+- Removed the parallel `unowned` set. `seed_unowned` now inserts a real `RuntimeSandbox` into the sole inventory with explicit foreign ownership metadata.
+- `list_owned` now filters the mixed inventory using both the `managed_by == "gascan"` ownership marker and matching metadata sandbox identity, then sorts results deterministically.
+- Added backend-neutral `RuntimeError::UnknownActualState { resource, state }` and stable code `unknown_actual_state` for structured downstream state mapping.
+- Added public `FailureBoundary`, an exhaustive enum of exactly the nine `RuntimeBackend` methods. `FakeRuntime::failing_once` accepts only that enum, preventing misspelled/impossible injection setup.
+- Rechecked that literal recording, byte semantics, object safety, and Task 1 identity boundaries are unchanged.
+
+Final verification command:
+
+`cargo fmt --all && cargo test -p gascan-core --test backend_contract && cargo test -p gascan-core && cargo doc -p gascan-core --no-deps && cargo clippy -p gascan-core --all-targets -- -D warnings && cargo fmt --all -- --check && git diff --check`
+
+Exit: `0`. Focused contract: `8 passed; 0 failed`. Full core tests and compile-fail doctests passed, documentation generated successfully, strict all-target Clippy emitted no warnings, and formatting/diff checks were clean.

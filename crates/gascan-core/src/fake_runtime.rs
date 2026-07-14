@@ -13,12 +13,40 @@ pub struct FakeRuntime {
     inner: Arc<Mutex<FakeState>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum FailureBoundary {
+    Capabilities,
+    Inspect,
+    Create,
+    Start,
+    Stop,
+    Remove,
+    Exec,
+    Logs,
+    ListOwned,
+}
+
+impl FailureBoundary {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Capabilities => "capabilities",
+            Self::Inspect => "inspect",
+            Self::Create => "create",
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Remove => "remove",
+            Self::Exec => "exec",
+            Self::Logs => "logs",
+            Self::ListOwned => "list_owned",
+        }
+    }
+}
+
 struct FakeState {
     capabilities: RuntimeCapabilities,
     sandboxes: HashMap<SandboxId, RuntimeSandbox>,
-    unowned: HashSet<SandboxId>,
     calls: Vec<RuntimeCall>,
-    failures: HashSet<String>,
+    failures: HashSet<FailureBoundary>,
     exec_result: ExecSession,
     logs: Vec<u8>,
 }
@@ -29,7 +57,6 @@ impl FakeRuntime {
             inner: Arc::new(Mutex::new(FakeState {
                 capabilities,
                 sandboxes: HashMap::new(),
-                unowned: HashSet::new(),
                 calls: Vec::new(),
                 failures: HashSet::new(),
                 exec_result: ExecSession::from_output(Vec::new(), Vec::new(), 0),
@@ -38,10 +65,10 @@ impl FakeRuntime {
         }
     }
 
-    pub fn failing_once(boundary: impl Into<String>) -> Self {
+    pub fn failing_once(boundary: FailureBoundary) -> Self {
         let runtime = Self::new(fixture_capabilities());
         if let Ok(mut state) = runtime.inner.try_lock() {
-            state.failures.insert(boundary.into());
+            state.failures.insert(boundary);
         }
         runtime
     }
@@ -51,7 +78,18 @@ impl FakeRuntime {
     }
 
     pub async fn seed_unowned(&self, id: SandboxId) {
-        self.inner.lock().await.unowned.insert(id);
+        let ownership = crate::runtime::OwnershipMetadata {
+            managed_by: "foreign-runtime-client".to_owned(),
+            sandbox_id: id.clone(),
+        };
+        self.inner.lock().await.sandboxes.insert(
+            id.clone(),
+            RuntimeSandbox {
+                id,
+                state: ContainerState::Stopped,
+                ownership,
+            },
+        );
     }
 
     pub async fn set_exec_result(&self, stdout: Vec<u8>, stderr: Vec<u8>, exit_code: i32) {
@@ -63,10 +101,10 @@ impl FakeRuntime {
     }
 }
 
-fn fail_once(state: &mut FakeState, boundary: &str) -> Result<(), RuntimeError> {
-    if state.failures.remove(boundary) {
+fn fail_once(state: &mut FakeState, boundary: FailureBoundary) -> Result<(), RuntimeError> {
+    if state.failures.remove(&boundary) {
         return Err(RuntimeError::InjectedFailure {
-            boundary: boundary.to_owned(),
+            boundary: boundary.as_str().to_owned(),
         });
     }
     Ok(())
@@ -83,21 +121,21 @@ impl RuntimeBackend for FakeRuntime {
     async fn capabilities(&self) -> Result<RuntimeCapabilities, RuntimeError> {
         let mut state = self.inner.lock().await;
         state.calls.push(RuntimeCall::Capabilities);
-        fail_once(&mut state, "capabilities")?;
+        fail_once(&mut state, FailureBoundary::Capabilities)?;
         Ok(state.capabilities.clone())
     }
 
     async fn inspect(&self, id: &SandboxId) -> Result<Option<RuntimeSandbox>, RuntimeError> {
         let mut state = self.inner.lock().await;
         state.calls.push(RuntimeCall::Inspect(id.clone()));
-        fail_once(&mut state, "inspect")?;
+        fail_once(&mut state, FailureBoundary::Inspect)?;
         Ok(state.sandboxes.get(id).cloned())
     }
 
     async fn create(&self, request: CreateRequest) -> Result<(), RuntimeError> {
         let mut state = self.inner.lock().await;
         state.calls.push(RuntimeCall::Create(request.clone()));
-        fail_once(&mut state, "create")?;
+        fail_once(&mut state, FailureBoundary::Create)?;
         if request.id != request.ownership.sandbox_id {
             return Err(RuntimeError::OwnershipMismatch {
                 resource: request.id.to_string(),
@@ -123,7 +161,7 @@ impl RuntimeBackend for FakeRuntime {
     async fn start(&self, id: &SandboxId) -> Result<(), RuntimeError> {
         let mut state = self.inner.lock().await;
         state.calls.push(RuntimeCall::Start(id.clone()));
-        fail_once(&mut state, "start")?;
+        fail_once(&mut state, FailureBoundary::Start)?;
         state
             .sandboxes
             .get_mut(id)
@@ -135,7 +173,7 @@ impl RuntimeBackend for FakeRuntime {
     async fn stop(&self, id: &SandboxId) -> Result<(), RuntimeError> {
         let mut state = self.inner.lock().await;
         state.calls.push(RuntimeCall::Stop(id.clone()));
-        fail_once(&mut state, "stop")?;
+        fail_once(&mut state, FailureBoundary::Stop)?;
         state
             .sandboxes
             .get_mut(id)
@@ -147,7 +185,7 @@ impl RuntimeBackend for FakeRuntime {
     async fn remove(&self, id: &SandboxId) -> Result<(), RuntimeError> {
         let mut state = self.inner.lock().await;
         state.calls.push(RuntimeCall::Remove(id.clone()));
-        fail_once(&mut state, "remove")?;
+        fail_once(&mut state, FailureBoundary::Remove)?;
         state.sandboxes.remove(id).ok_or_else(|| missing(id))?;
         Ok(())
     }
@@ -155,7 +193,7 @@ impl RuntimeBackend for FakeRuntime {
     async fn exec(&self, request: ExecRequest) -> Result<ExecSession, RuntimeError> {
         let mut state = self.inner.lock().await;
         state.calls.push(RuntimeCall::Exec(request.clone()));
-        fail_once(&mut state, "exec")?;
+        fail_once(&mut state, FailureBoundary::Exec)?;
         let sandbox = state
             .sandboxes
             .get(&request.id)
@@ -172,7 +210,7 @@ impl RuntimeBackend for FakeRuntime {
     async fn logs(&self, id: &SandboxId) -> Result<Vec<u8>, RuntimeError> {
         let mut state = self.inner.lock().await;
         state.calls.push(RuntimeCall::Logs(id.clone()));
-        fail_once(&mut state, "logs")?;
+        fail_once(&mut state, FailureBoundary::Logs)?;
         if !state.sandboxes.contains_key(id) {
             return Err(missing(id));
         }
@@ -182,10 +220,14 @@ impl RuntimeBackend for FakeRuntime {
     async fn list_owned(&self) -> Result<Vec<OwnedResource>, RuntimeError> {
         let mut state = self.inner.lock().await;
         state.calls.push(RuntimeCall::ListOwned);
-        fail_once(&mut state, "list_owned")?;
+        fail_once(&mut state, FailureBoundary::ListOwned)?;
         let mut resources = state
             .sandboxes
             .values()
+            .filter(|sandbox| {
+                sandbox.ownership.managed_by == "gascan"
+                    && sandbox.ownership.sandbox_id == sandbox.id
+            })
             .map(|sandbox| OwnedResource {
                 id: sandbox.id.clone(),
                 ownership: sandbox.ownership.clone(),

@@ -270,6 +270,8 @@ pub enum RuntimeError {
     NotFound { resource: String },
     #[error("invalid state for {resource}: {message}")]
     InvalidState { resource: String, message: String },
+    #[error("unknown actual state for {resource}: {state}")]
+    UnknownActualState { resource: String, state: String },
     #[error("injected failure at {boundary}")]
     InjectedFailure { boundary: String },
 }
@@ -287,6 +289,7 @@ impl RuntimeError {
             Self::Conflict { .. } => "resource_conflict",
             Self::NotFound { .. } => "not_found",
             Self::InvalidState { .. } => "invalid_state",
+            Self::UnknownActualState { .. } => "unknown_actual_state",
             Self::InjectedFailure { .. } => "injected_failure",
         }
     }
