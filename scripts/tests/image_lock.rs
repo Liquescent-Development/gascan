@@ -81,19 +81,12 @@ fn artifact_shape_requires_url_and_checksum() {
 #[test]
 fn build_script_bounds_downloads_and_validates_redirect_hosts() {
     let script = include_str!("../build-workspace-image.sh");
-    for required in [
-        "--connect-timeout 15",
-        "--max-time 120",
-        "--progress-bar",
-        "--proto-redir '=https'",
-        "validate_download_url",
-        "release-assets.githubusercontent.com",
-        "cdn.playwright.dev",
-        "validate-image-inspect",
-    ] {
+    for required in ["fetch-image-artifact", "validate-image-inspect"] {
         assert!(
             script.contains(required),
             "missing build safeguard: {required}"
         );
     }
+    assert!(!script.contains("curl --"));
+    assert!(!script.contains("--location"));
 }

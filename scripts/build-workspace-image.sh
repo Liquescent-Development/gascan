@@ -21,34 +21,9 @@ section_value() {
 }
 
 fetch_verified() {
-  local url=$1 expected=$2 destination=$3 temporary effective_file effective_url actual
-  test ${#expected} -eq 64 || { printf 'invalid SHA-256 for %s\n' "$destination" >&2; exit 1; }
-  validate_download_url "$url"
-  temporary="$destination.tmp.$$"
-  effective_file="$destination.effective.$$"
-  trap 'rm -f "$temporary" "$effective_file"' RETURN
-  printf 'Downloading verified image artifact: %s\n' "$url" >&2
-  curl --fail --show-error --progress-bar --location \
-    --connect-timeout 15 --max-time 120 \
-    --proto '=https' --proto-redir '=https' --tlsv1.2 \
-    --output "$temporary" --write-out '%{url_effective}' "$url" >"$effective_file"
-  effective_url=$(cat "$effective_file")
-  validate_download_url "$effective_url"
-  actual=$(shasum -a 256 "$temporary" | awk '{print $1}')
-  test "$actual" = "$expected" || { printf 'SHA-256 mismatch for %s\n' "$url" >&2; exit 1; }
-  mv "$temporary" "$destination"
-  trap - RETURN
-}
-
-validate_download_url() {
-  case "$1" in
-    https://github.com/* | \
-    https://objects.githubusercontent.com/* | \
-    https://release-assets.githubusercontent.com/* | \
-    https://cdn.playwright.dev/* | \
-    https://playwright.download.prss.microsoft.com/*) ;;
-    *) printf 'artifact URL host is not approved: %s\n' "$1" >&2; exit 1 ;;
-  esac
+  cargo run --quiet --locked --offline \
+    --manifest-path "$root/scripts/Cargo.toml" --bin fetch-image-artifact -- \
+    "$1" "$2" "$3"
 }
 
 base_image=$(top_value base_image)
