@@ -11,8 +11,9 @@ use serde_json::json;
 use std::error::Error;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+use std::time::{Duration, Instant};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -20,6 +21,7 @@ type TestResult = Result<(), Box<dyn Error>>;
 struct ControlledProvisioner {
     fail_provision: AtomicBool,
     fail_health: AtomicBool,
+    provisions: AtomicUsize,
 }
 
 #[async_trait]
@@ -28,6 +30,7 @@ impl Provisioner for ControlledProvisioner {
         &self,
         _request: ProvisionRequest<'_>,
     ) -> Result<ProvisionResolution, ServiceError> {
+        self.provisions.fetch_add(1, Ordering::SeqCst);
         if self.fail_provision.load(Ordering::SeqCst) {
             return Err(ServiceError::Provision(
                 "injected provision failure".to_owned(),
@@ -50,6 +53,67 @@ impl Provisioner for ControlledProvisioner {
         }
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn failed_initial_up_retry_runs_provision_and_persists_actual_resolution() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let make_spec = || SandboxSpec::from_root("retry-hooks", root, Manifest::load(root)?);
+    let runtime = FakeRuntime::default();
+    let provisioner = Arc::new(ControlledProvisioner::default());
+    provisioner.fail_provision.store(true, Ordering::SeqCst);
+    let service = SandboxService::new(
+        runtime,
+        gascand::Store::open(root.join("state.db"))?,
+        provisioner.clone(),
+    );
+    assert!(service.up(UpRequest::new(make_spec()?)).await.is_err());
+    provisioner.fail_provision.store(false, Ordering::SeqCst);
+    service.up(UpRequest::new(make_spec()?)).await?;
+    service.up(UpRequest::new(make_spec()?)).await?;
+    assert_eq!(provisioner.provisions.load(Ordering::SeqCst), 2);
+    let record = service.status(make_spec()?.id())?.ok_or("record")?;
+    assert_eq!(
+        record
+            .setup_resolution
+            .as_ref()
+            .and_then(|value| value.details.get("resolution")),
+        Some(&json!({"resolved":"prior-setup"}))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn stopped_apply_that_starts_then_fails_records_running_reality() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let make_spec = || SandboxSpec::from_root("apply-running-reality", root, Manifest::load(root)?);
+    let id = make_spec()?.id().clone();
+    let runtime = FakeRuntime::default();
+    let provisioner = Arc::new(ControlledProvisioner::default());
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        provisioner.clone(),
+    );
+    service.up(UpRequest::new(make_spec()?)).await?;
+    service.stop(&id).await?;
+    std::fs::write(
+        root.join("gascan.toml"),
+        "version = 1\n[tools]\nnode = '22'\n",
+    )?;
+    provisioner.fail_provision.store(true, Ordering::SeqCst);
+    assert!(service.apply(UpRequest::new(make_spec()?)).await.is_err());
+    assert_eq!(
+        service.latest_operation()?.ok_or("operation")?.status,
+        OperationStatus::Failed
+    );
+    assert_eq!(
+        service.status(&id)?.ok_or("record")?.actual_state,
+        gascand::ActualState::Running
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -92,6 +156,10 @@ async fn failed_apply_retains_prior_setup_and_tool_resolutions() -> TestResult {
     service.up(UpRequest::new(make_spec()?)).await?;
     let prior = service.status(&id)?.ok_or("record")?;
     provisioner.fail_provision.store(true, Ordering::SeqCst);
+    std::fs::write(
+        root.join("gascan.toml"),
+        "version = 1\n[tools]\nnode = '22'\n",
+    )?;
 
     assert!(service.apply(UpRequest::new(make_spec()?)).await.is_err());
     assert!(service.store().pending_operations()?.is_empty());
@@ -124,6 +192,10 @@ async fn synchronous_runtime_failures_after_begin_are_terminal_not_pending() -> 
     assert!(service.stop(&id).await.is_err());
     assert!(service.store().pending_operations()?.is_empty());
     runtime.inject_failure(FailureBoundary::Inspect).await;
+    std::fs::write(
+        root.join("gascan.toml"),
+        "version = 1\n[tools]\nnode = '22'\n",
+    )?;
     assert!(service.apply(UpRequest::new(make_spec()?)).await.is_err());
     assert!(service.store().pending_operations()?.is_empty());
     runtime.inject_failure(FailureBoundary::Remove).await;
@@ -274,6 +346,31 @@ async fn foreign_volume_collision_is_refused_and_preserved() -> TestResult {
 }
 
 #[tokio::test]
+async fn partial_create_collision_rolls_back_only_resources_created_by_failed_call() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let make_spec = || SandboxSpec::from_root("partial-collision", root, Manifest::load(root)?);
+    let runtime = FakeRuntime::default();
+    let names = volume_names(&runtime, make_spec()?).await?;
+    runtime
+        .seed_volume(&names[1], None, ResourceOwnership::Foreign)
+        .await?;
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    );
+    assert!(service.up(UpRequest::new(make_spec()?)).await.is_err());
+    assert!(!runtime.volume_exists(&names[0]).await);
+    assert!(runtime.volume_exists(&names[1]).await);
+    assert_eq!(
+        service.latest_operation()?.ok_or("operation")?.status,
+        OperationStatus::Failed
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn destroy_removes_exact_owned_resources_and_retains_foreign_inventory() -> TestResult {
     let root = tempfile::tempdir()?;
     let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
@@ -300,6 +397,33 @@ async fn destroy_removes_exact_owned_resources_and_retains_foreign_inventory() -
     assert_eq!(inventory.len(), 1);
     assert_eq!(inventory[0].name(), "foreign-neighbor");
     assert_eq!(inventory[0].ownership(), ResourceOwnership::Foreign);
+    Ok(())
+}
+
+#[tokio::test]
+async fn destroy_retains_extra_owned_volume_with_known_sandbox_association() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let make_spec = || SandboxSpec::from_root("destroy-extra", root, Manifest::load(root)?);
+    let id = make_spec()?.id().clone();
+    let runtime = FakeRuntime::default();
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    );
+    service.up(UpRequest::new(make_spec()?)).await?;
+    runtime
+        .seed_volume(
+            "gascan-extra-owned",
+            Some(id.clone()),
+            ResourceOwnership::GasCanOwned,
+        )
+        .await?;
+    service.destroy(&id).await?;
+    assert!(runtime.volume_exists("gascan-extra-owned").await);
+    let report = service.reconcile().await?;
+    assert!(report.findings.iter().any(|finding| matches!(finding, gascand::ReconcileFinding::UnknownOwned(resource) if resource.name() == "gascan-extra-owned")));
     Ok(())
 }
 
@@ -480,5 +604,56 @@ async fn missing_start_stop_and_apply_are_refused_without_runtime_mutation() -> 
     assert!(service.apply(UpRequest::new(spec)).await.is_err());
     assert!(service.destroy(&id).await.is_err());
     assert_eq!(runtime.created_count().await, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn keyed_lock_registry_does_not_retain_finished_sandbox_keys() -> TestResult {
+    let db = tempfile::tempdir()?;
+    let service = SandboxService::new(
+        FakeRuntime::default(),
+        gascand::Store::open(db.path().join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    );
+    for index in 0..64 {
+        let root = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+        let spec = SandboxSpec::from_root(&format!("lock-{index}"), root, Manifest::load(root)?)?;
+        service.up(UpRequest::new(spec)).await?;
+    }
+    assert_eq!(service.keyed_lock_count()?, 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn blocked_sqlite_writer_does_not_block_single_tokio_worker() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let path = root.join("state.db");
+    let store = gascand::Store::open(&path)?;
+    let blocker = rusqlite::Connection::open(&path)?;
+    blocker.execute_batch("BEGIN IMMEDIATE")?;
+    let spec = SandboxSpec::from_root("blocked-db", root, Manifest::load(root)?)?;
+    let service = Arc::new(SandboxService::new(
+        FakeRuntime::default(),
+        store,
+        Arc::new(NoopProvisioner),
+    ));
+    let operation = tokio::spawn({
+        let service = service.clone();
+        async move { service.up(UpRequest::new(spec)).await }
+    });
+    let started = Instant::now();
+    tokio::task::yield_now().await;
+    let unrelated = Arc::new(AtomicBool::new(false));
+    let marker = unrelated.clone();
+    tokio::spawn(async move {
+        marker.store(true, Ordering::SeqCst);
+    });
+    tokio::task::yield_now().await;
+    assert!(unrelated.load(Ordering::SeqCst));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    blocker.execute_batch("ROLLBACK")?;
+    operation.await??;
     Ok(())
 }

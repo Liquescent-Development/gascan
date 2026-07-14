@@ -1,9 +1,11 @@
 use camino::Utf8PathBuf;
 use gascan_core::sandbox::{SandboxId, SandboxIdError};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use serde::Serialize;
 use serde_json::Value;
+use std::fmt;
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -44,6 +46,42 @@ pub enum OperationStatus {
     Failed,
 }
 
+/// A checked durable operation identifier.
+///
+/// It cannot be forged with a tuple constructor or deserialized by clients.
+///
+/// ```compile_fail
+/// use gascand::OperationId;
+/// let _ = OperationId(1);
+/// ```
+///
+/// ```compile_fail
+/// use gascand::OperationId;
+/// let _: OperationId = serde_json::from_str("1").unwrap();
+/// ```
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct OperationId(i64);
+
+impl OperationId {
+    pub fn new(value: i64) -> Result<Self, StoreError> {
+        if value <= 0 {
+            return Err(StoreError::InvalidOperationId(value));
+        }
+        Ok(Self(value))
+    }
+
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+}
+
+impl fmt::Display for OperationId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 macro_rules! resolution_record {
     ($name:ident) => {
         #[derive(Clone, Debug, PartialEq)]
@@ -77,7 +115,7 @@ pub struct SandboxRecord {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct OperationRecord {
-    pub id: i64,
+    pub id: OperationId,
     pub sandbox_id: SandboxId,
     pub kind: OperationKind,
     pub status: OperationStatus,
@@ -88,13 +126,14 @@ pub struct OperationRecord {
 #[derive(Clone, Debug, PartialEq)]
 pub struct OperationEvent {
     pub sequence: i64,
-    pub operation_id: i64,
+    pub operation_id: OperationId,
     pub status: OperationStatus,
     pub details: Option<Value>,
 }
 
+#[derive(Clone)]
 pub struct Store {
-    connection: Mutex<Connection>,
+    connection: Arc<Mutex<Connection>>,
 }
 
 #[derive(Debug, Error)]
@@ -128,7 +167,9 @@ pub enum StoreError {
     #[error("invalid transition from {from} to {to}")]
     InvalidTransition { from: String, to: String },
     #[error("operation {0} does not exist")]
-    OperationNotFound(i64),
+    OperationNotFound(OperationId),
+    #[error("operation ID must be positive, got {0}")]
+    InvalidOperationId(i64),
     #[error("stored value is invalid: {0}")]
     CorruptData(String),
 }
@@ -141,7 +182,7 @@ impl Store {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         initialize_schema(&mut connection)?;
         Ok(Self {
-            connection: Mutex::new(connection),
+            connection: Arc::new(Mutex::new(connection)),
         })
     }
 
@@ -193,10 +234,10 @@ impl Store {
                 OperationStatus::Pending.as_db()
             ],
         )?;
-        let id = transaction.last_insert_rowid();
+        let id = OperationId::new(transaction.last_insert_rowid())?;
         transaction.execute(
             "INSERT INTO operation_events (operation_id, status) VALUES (?1, ?2)",
-            params![id, OperationStatus::Pending.as_db()],
+            params![id.get(), OperationStatus::Pending.as_db()],
         )?;
         let operation =
             load_operation(&transaction, id)?.ok_or(StoreError::OperationNotFound(id))?;
@@ -206,7 +247,7 @@ impl Store {
 
     pub fn complete_operation(
         &self,
-        id: i64,
+        id: OperationId,
         actual_state: ActualState,
     ) -> Result<OperationRecord, StoreError> {
         self.finish_operation(id, actual_state, OperationStatus::Completed, None, None)
@@ -214,7 +255,7 @@ impl Store {
 
     pub fn fail_operation(
         &self,
-        id: i64,
+        id: OperationId,
         actual_state: ActualState,
         error_code: impl Into<String>,
         error_details: Value,
@@ -236,18 +277,21 @@ impl Store {
         collect_rows(rows)
     }
 
-    pub fn operation_events(&self, operation_id: i64) -> Result<Vec<OperationEvent>, StoreError> {
+    pub fn operation_events(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Vec<OperationEvent>, StoreError> {
         let connection = self.lock()?;
         let mut statement = connection.prepare(
             "SELECT sequence, operation_id, status, details FROM operation_events WHERE operation_id = ?1 ORDER BY sequence",
         )?;
-        let rows = statement.query_map([operation_id], event_from_row)?;
+        let rows = statement.query_map([operation_id.get()], event_from_row)?;
         collect_rows(rows)
     }
 
     pub fn append_operation_event(
         &self,
-        operation_id: i64,
+        operation_id: OperationId,
         details: Value,
     ) -> Result<OperationEvent, StoreError> {
         let mut connection = self.lock()?;
@@ -263,7 +307,11 @@ impl Store {
         let encoded = serde_json::to_string(&details)?;
         transaction.execute(
             "INSERT INTO operation_events (operation_id, status, details) VALUES (?1, ?2, ?3)",
-            params![operation_id, OperationStatus::Pending.as_db(), encoded],
+            params![
+                operation_id.get(),
+                OperationStatus::Pending.as_db(),
+                encoded
+            ],
         )?;
         let sequence = transaction.last_insert_rowid();
         transaction.commit()?;
@@ -287,7 +335,7 @@ impl Store {
 
     fn finish_operation(
         &self,
-        id: i64,
+        id: OperationId,
         actual_state: ActualState,
         status: OperationStatus,
         error_code: Option<String>,
@@ -315,11 +363,11 @@ impl Store {
         )?;
         transaction.execute(
             "UPDATE operations SET status = ?1, error_code = ?2, error_details = ?3 WHERE id = ?4",
-            params![status.as_db(), error_code, details_json, id],
+            params![status.as_db(), error_code, details_json, id.get()],
         )?;
         transaction.execute(
             "INSERT INTO operation_events (operation_id, status, details) VALUES (?1, ?2, ?3)",
-            params![id, status.as_db(), details_json],
+            params![id.get(), status.as_db(), details_json],
         )?;
         let updated = load_operation(&transaction, id)?.ok_or(StoreError::OperationNotFound(id))?;
         transaction.commit()?;
@@ -432,10 +480,13 @@ fn load_sandbox(connection: &Connection, id: &str) -> Result<Option<SandboxRecor
     raw.map(SandboxRecord::try_from).transpose()
 }
 
-fn load_operation(connection: &Connection, id: i64) -> Result<Option<OperationRecord>, StoreError> {
+fn load_operation(
+    connection: &Connection,
+    id: OperationId,
+) -> Result<Option<OperationRecord>, StoreError> {
     let mut statement = connection.prepare(&format!("{OPERATION_SELECT} WHERE id = ?1"))?;
     let raw = statement
-        .query_row([id], raw_operation_from_row)
+        .query_row([id.get()], raw_operation_from_row)
         .optional()?;
     raw.map(OperationRecord::try_from).transpose()
 }
@@ -495,7 +546,7 @@ impl TryFrom<RawOperation> for OperationRecord {
     type Error = StoreError;
     fn try_from(raw: RawOperation) -> Result<Self, Self::Error> {
         Ok(Self {
-            id: raw.id,
+            id: OperationId::new(raw.id)?,
             sandbox_id: SandboxId::try_from(raw.sandbox_id)?,
             kind: OperationKind::from_db(&raw.kind)?,
             status: OperationStatus::from_db(&raw.status)?,
@@ -528,7 +579,7 @@ fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationEvent> {
     let details: Option<String> = row.get(3)?;
     Ok(OperationEvent {
         sequence: row.get(0)?,
-        operation_id: row.get(1)?,
+        operation_id: OperationId::new(row.get(1)?).map_err(to_sql_conversion_error)?,
         status: OperationStatus::from_db(&status).map_err(to_sql_conversion_error)?,
         details: details
             .map(|json| serde_json::from_str(&json))

@@ -1,19 +1,20 @@
 use crate::reconcile::{ReconcileFinding, ReconcileReport};
 use crate::{
-    ActualState, DesiredState, ImageResolution, OperationEvent, OperationKind, OperationRecord,
-    SandboxRecord, SetupResolution, Store, StoreError, ToolResolution,
+    ActualState, DesiredState, ImageResolution, OperationEvent, OperationId, OperationKind,
+    OperationRecord, SandboxRecord, SetupResolution, Store, StoreError, ToolResolution,
 };
 use async_trait::async_trait;
 use gascan_core::manifest::ManifestError;
 use gascan_core::policy::{PolicyCompiler, PolicyError};
 use gascan_core::runtime::{
-    ContainerState, CreateRequest, RemoveRequest, ResourceKind, ResourceOwnership, RuntimeBackend,
-    RuntimeError,
+    ContainerState, CreateFailure, CreateRequest, RemoveRequest, ResourceKind, ResourceOwnership,
+    RuntimeBackend, RuntimeError,
 };
 use gascan_core::sandbox::{SandboxError, SandboxId, SandboxSpec};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
@@ -62,7 +63,7 @@ impl Provisioner for NoopProvisioner {
 }
 
 pub struct Operation {
-    pub id: i64,
+    pub id: OperationId,
     pub events: mpsc::Receiver<OperationEvent>,
 }
 
@@ -70,7 +71,7 @@ pub struct SandboxService<B: RuntimeBackend> {
     runtime: B,
     store: Store,
     provisioner: Arc<dyn Provisioner>,
-    locks: Mutex<HashMap<SandboxId, Arc<AsyncMutex<()>>>>,
+    locks: Mutex<HashMap<SandboxId, Weak<AsyncMutex<()>>>>,
 }
 
 #[derive(Debug, Error)]
@@ -79,6 +80,8 @@ pub enum ServiceError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
+    #[error(transparent)]
+    Create(#[from] CreateFailure),
     #[error(transparent)]
     Policy(#[from] PolicyError),
     #[error(transparent)]
@@ -95,6 +98,12 @@ pub enum ServiceError {
     LockPoisoned,
     #[error("bounded operation event stream could not accept its durable event")]
     EventStreamUnavailable,
+    #[error("database worker task failed: {0}")]
+    DatabaseWorker(String),
+    #[error("failed to fingerprint desired setup: {0}")]
+    Fingerprint(String),
+    #[error("destroy left expected owned resources for sandbox {0}")]
+    IncompleteDestroy(SandboxId),
 }
 
 impl<B: RuntimeBackend> SandboxService<B> {
@@ -120,12 +129,34 @@ impl<B: RuntimeBackend> SandboxService<B> {
         Ok(self.store.latest_operation()?)
     }
 
+    async fn database<T, F>(&self, action: F) -> Result<T, ServiceError>
+    where
+        T: Send + 'static,
+        F: FnOnce(Store) -> Result<T, StoreError> + Send + 'static,
+    {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || action(store))
+            .await
+            .map_err(|error| ServiceError::DatabaseWorker(error.to_string()))?
+            .map_err(ServiceError::Store)
+    }
+
     fn keyed_lock(&self, id: &SandboxId) -> Result<Arc<AsyncMutex<()>>, ServiceError> {
         let mut locks = self.locks.lock().map_err(|_| ServiceError::LockPoisoned)?;
-        Ok(locks
-            .entry(id.clone())
-            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-            .clone())
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(id).and_then(Weak::upgrade) {
+            return Ok(lock);
+        }
+        let lock = Arc::new(AsyncMutex::new(()));
+        locks.insert(id.clone(), Arc::downgrade(&lock));
+        Ok(lock)
+    }
+
+    #[doc(hidden)]
+    pub fn keyed_lock_count(&self) -> Result<usize, ServiceError> {
+        let mut locks = self.locks.lock().map_err(|_| ServiceError::LockPoisoned)?;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        Ok(locks.len())
     }
 
     pub async fn up(&self, request: UpRequest) -> Result<Operation, ServiceError> {
@@ -134,8 +165,17 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let _guard = lock.lock().await;
         let capabilities = self.runtime.capabilities().await?;
         let create = PolicyCompiler::compile(request.spec.clone(), &capabilities)?;
-        let existing = self.store.sandbox(&id)?;
+        let desired_fingerprint = desired_fingerprint(&request.spec).await?;
+        let existing = self
+            .database({
+                let id = id.clone();
+                move |store| store.sandbox(&id)
+            })
+            .await?;
         let prior = existing.clone();
+        let reuse_resolution = prior
+            .as_ref()
+            .is_some_and(|record| resolution_matches(record, &desired_fingerprint));
         let mut record = existing.unwrap_or_else(|| SandboxRecord {
             id: id.clone(),
             canonical_root: request.spec.canonical_root().to_owned(),
@@ -146,10 +186,19 @@ impl<B: RuntimeBackend> SandboxService<B> {
             image_resolution: Some(ImageResolution::new(1, json!({"digest": create.image()}))),
         });
         record.desired_state = DesiredState::Running;
-        let operation = self.store.begin_operation(&record, OperationKind::Create)?;
+        if record.actual_state == ActualState::Absent {
+            record.actual_state = ActualState::Creating;
+        }
+        let operation = self
+            .database({
+                let record = record.clone();
+                move |store| store.begin_operation(&record, OperationKind::Create)
+            })
+            .await?;
         let (sender, receiver) = mpsc::channel(16);
-        self.send_initial(operation.id, &sender)?;
-        self.emit(operation.id, json!({"phase":"validated"}), &sender)?;
+        self.send_initial(operation.id, &sender).await?;
+        self.emit(operation.id, json!({"phase":"validated"}), &sender)
+            .await?;
         let result = self
             .up_runtime(
                 &request.spec,
@@ -157,20 +206,31 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 prior.as_ref(),
                 operation.id,
                 &sender,
+                &desired_fingerprint,
             )
             .await;
         match result {
             Ok((actual, resolution)) => {
-                if let Some(details) = resolution.setup {
-                    record.setup_resolution = Some(SetupResolution::new(1, details));
-                }
-                if let Some(details) = resolution.tools {
-                    record.tool_resolution = Some(ToolResolution::new(1, details));
+                if !reuse_resolution {
+                    record.setup_resolution = Some(SetupResolution::new(
+                        1,
+                        json!({"desired_fingerprint":desired_fingerprint,"resolution":resolution.setup}),
+                    ));
+                    record.tool_resolution = Some(ToolResolution::new(
+                        1,
+                        json!({"desired_fingerprint":desired_fingerprint,"resolution":resolution.tools}),
+                    ));
                 }
                 record.actual_state = actual;
-                self.store.put_sandbox(&record)?;
-                let terminal = self.store.complete_operation(operation.id, actual)?;
-                self.send_terminal(terminal.id, &sender)?;
+                self.database({
+                    let record = record.clone();
+                    move |store| store.put_sandbox(&record)
+                })
+                .await?;
+                let terminal = self
+                    .database(move |store| store.complete_operation(operation.id, actual))
+                    .await?;
+                self.send_terminal(terminal.id, &sender).await?;
                 Ok(Operation {
                     id: operation.id,
                     events: receiver,
@@ -185,13 +245,13 @@ impl<B: RuntimeBackend> SandboxService<B> {
                         ContainerState::Creating => ActualState::Creating,
                     },
                 );
-                self.store.fail_operation(
-                    operation.id,
-                    actual,
-                    error.code(),
-                    json!({"message":error.to_string()}),
-                )?;
-                self.send_terminal(operation.id, &sender)?;
+                let code = error.code();
+                let details = json!({"message":error.to_string()});
+                self.database(move |store| {
+                    store.fail_operation(operation.id, actual, code, details)
+                })
+                .await?;
+                self.send_terminal(operation.id, &sender).await?;
                 Err(error)
             }
         }
@@ -202,8 +262,9 @@ impl<B: RuntimeBackend> SandboxService<B> {
         spec: &SandboxSpec,
         create: &CreateRequest,
         prior: Option<&SandboxRecord>,
-        operation_id: i64,
+        operation_id: OperationId,
         sender: &mpsc::Sender<OperationEvent>,
+        desired_fingerprint: &str,
     ) -> Result<(ActualState, ProvisionResolution), ServiceError> {
         let id = spec.id();
         let inspected = self.runtime.inspect(id).await?;
@@ -213,8 +274,19 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 return Err(ServiceError::Ownership(id.clone()));
             }
         } else {
-            created = Some(self.runtime.create(create.clone()).await?);
-            self.emit(operation_id, json!({"phase":"created"}), sender)?;
+            match self.runtime.create(create.clone()).await {
+                Ok(outcome) => created = Some(outcome),
+                Err(failure) => {
+                    if !failure.created().is_empty() {
+                        self.runtime
+                            .remove(RemoveRequest::from_resources(failure.created().to_vec())?)
+                            .await?;
+                    }
+                    return Err(ServiceError::Create(failure));
+                }
+            }
+            self.emit(operation_id, json!({"phase":"created"}), sender)
+                .await?;
         }
         let result = async {
             let current = self
@@ -225,15 +297,23 @@ impl<B: RuntimeBackend> SandboxService<B> {
             if current.state != ContainerState::Running {
                 self.runtime.start(id).await?;
             }
-            self.emit(operation_id, json!({"phase":"started"}), sender)?;
-            let resolution = if prior.is_none() {
+            self.emit(operation_id, json!({"phase":"started"}), sender)
+                .await?;
+            let durable_match = prior.is_some_and(|record| resolution_matches(record, desired_fingerprint));
+            let resolution = if !durable_match {
+                self.emit(operation_id, json!({"phase":"before_provision","desired_fingerprint":desired_fingerprint}), sender).await?;
                 self.provisioner
                     .provision(ProvisionRequest { spec, create })
                     .await?
             } else {
                 ProvisionResolution::default()
             };
+            if !durable_match {
+                self.emit(operation_id, json!({"phase":"after_provision","resolution_version":1,"desired_fingerprint":desired_fingerprint,"setup":resolution.setup,"tools":resolution.tools}), sender).await?;
+            }
+            self.emit(operation_id, json!({"phase":"before_health"}), sender).await?;
             self.provisioner.health_check(id).await?;
+            self.emit(operation_id, json!({"phase":"after_health","desired_fingerprint":desired_fingerprint}), sender).await?;
             Ok::<_, ServiceError>(resolution)
         }
         .await;
@@ -241,9 +321,9 @@ impl<B: RuntimeBackend> SandboxService<B> {
             Ok(resolution) => Ok((ActualState::Running, resolution)),
             Err(error) if created.is_some() => {
                 if let Some(outcome) = created {
-                    if !outcome.created.is_empty() {
+                    if !outcome.created().is_empty() {
                         self.runtime
-                            .remove(RemoveRequest::from_resources(outcome.created)?)
+                            .remove(RemoveRequest::from_resources(outcome.created().to_vec())?)
                             .await?;
                     }
                 }
@@ -287,13 +367,21 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let lock = self.keyed_lock(id)?;
         let _guard = lock.lock().await;
         let mut record = self
-            .store
-            .sandbox(id)?
+            .database({
+                let id = id.clone();
+                move |store| store.sandbox(&id)
+            })
+            .await?
             .ok_or_else(|| ServiceError::Missing(id.clone()))?;
         record.desired_state = desired;
-        let operation = self.store.begin_operation(&record, kind)?;
+        let operation = self
+            .database({
+                let record = record.clone();
+                move |store| store.begin_operation(&record, kind)
+            })
+            .await?;
         let (sender, receiver) = mpsc::channel(16);
-        self.send_initial(operation.id, &sender)?;
+        self.send_initial(operation.id, &sender).await?;
         let result = async {
             let runtime = self
                 .runtime
@@ -313,17 +401,16 @@ impl<B: RuntimeBackend> SandboxService<B> {
         .await;
         if let Err(error) = result {
             let actual = self.runtime_actual(id, record.actual_state).await;
-            self.store.fail_operation(
-                operation.id,
-                actual,
-                error.code(),
-                json!({"message":error.to_string()}),
-            )?;
-            self.send_terminal(operation.id, &sender)?;
+            let code = error.code();
+            let details = json!({"message":error.to_string()});
+            self.database(move |store| store.fail_operation(operation.id, actual, code, details))
+                .await?;
+            self.send_terminal(operation.id, &sender).await?;
             return Err(error);
         }
-        self.store.complete_operation(operation.id, target)?;
-        self.send_terminal(operation.id, &sender)?;
+        self.database(move |store| store.complete_operation(operation.id, target))
+            .await?;
+        self.send_terminal(operation.id, &sender).await?;
         Ok(Operation {
             id: operation.id,
             events: receiver,
@@ -334,8 +421,11 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let lock = self.keyed_lock(id)?;
         let _guard = lock.lock().await;
         let mut record = self
-            .store
-            .sandbox(id)?
+            .database({
+                let id = id.clone();
+                move |store| store.sandbox(&id)
+            })
+            .await?
             .ok_or_else(|| ServiceError::Missing(id.clone()))?;
         let prior_actual = record.actual_state;
         record.desired_state = DesiredState::Absent;
@@ -343,10 +433,13 @@ impl<B: RuntimeBackend> SandboxService<B> {
             record.actual_state = ActualState::Destroying;
         }
         let operation = self
-            .store
-            .begin_operation(&record, OperationKind::Destroy)?;
+            .database({
+                let record = record.clone();
+                move |store| store.begin_operation(&record, OperationKind::Destroy)
+            })
+            .await?;
         let (sender, receiver) = mpsc::channel(16);
-        self.send_initial(operation.id, &sender)?;
+        self.send_initial(operation.id, &sender).await?;
         let result = async {
             if let Some(runtime) = self.runtime.inspect(id).await? {
                 if runtime.ownership.managed_by != "gascan" || runtime.ownership.sandbox_id != *id {
@@ -355,39 +448,54 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 if runtime.state == ContainerState::Running {
                     self.runtime.stop(id).await?;
                 }
-                let resources = self
-                    .runtime
-                    .list_resources()
-                    .await?
-                    .into_iter()
-                    .filter(|resource| {
-                        resource.sandbox_id() == Some(id)
-                            && resource.ownership() == ResourceOwnership::GasCanOwned
-                    })
-                    .collect::<Vec<_>>();
-                if !resources.is_empty() {
-                    self.runtime
-                        .remove(RemoveRequest::from_resources(resources)?)
-                        .await?;
-                }
+            }
+            let expected = PolicyCompiler::expected_resource_identities(id)?
+                .into_iter()
+                .collect::<HashSet<_>>();
+            let resources = self
+                .runtime
+                .list_resources()
+                .await?
+                .into_iter()
+                .filter(|resource| {
+                    expected.contains(resource.identity())
+                        && resource.sandbox_id() == Some(id)
+                        && resource.ownership() == ResourceOwnership::GasCanOwned
+                })
+                .collect::<Vec<_>>();
+            if !resources.is_empty() {
+                self.runtime
+                    .remove(RemoveRequest::from_resources(resources)?)
+                    .await?;
+            }
+            let remaining = self
+                .runtime
+                .list_resources()
+                .await?
+                .into_iter()
+                .any(|resource| {
+                    expected.contains(resource.identity())
+                        && resource.sandbox_id() == Some(id)
+                        && resource.ownership() == ResourceOwnership::GasCanOwned
+                });
+            if remaining {
+                return Err(ServiceError::IncompleteDestroy(id.clone()));
             }
             Ok::<_, ServiceError>(())
         }
         .await;
         if let Err(error) = result {
             let actual = self.runtime_actual(id, prior_actual).await;
-            self.store.fail_operation(
-                operation.id,
-                actual,
-                error.code(),
-                json!({"message":error.to_string()}),
-            )?;
-            self.send_terminal(operation.id, &sender)?;
+            let code = error.code();
+            let details = json!({"message":error.to_string()});
+            self.database(move |store| store.fail_operation(operation.id, actual, code, details))
+                .await?;
+            self.send_terminal(operation.id, &sender).await?;
             return Err(error);
         }
-        self.store
-            .complete_operation(operation.id, ActualState::Absent)?;
-        self.send_terminal(operation.id, &sender)?;
+        self.database(move |store| store.complete_operation(operation.id, ActualState::Absent))
+            .await?;
+        self.send_terminal(operation.id, &sender).await?;
         Ok(Operation {
             id: operation.id,
             events: receiver,
@@ -400,26 +508,28 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let _guard = lock.lock().await;
         let capabilities = self.runtime.capabilities().await?;
         let create = PolicyCompiler::compile(request.spec.clone(), &capabilities)?;
+        let desired_fingerprint = desired_fingerprint(&request.spec).await?;
         let mut record = self
-            .store
-            .sandbox(&id)?
+            .database({
+                let id = id.clone();
+                move |store| store.sandbox(&id)
+            })
+            .await?
             .ok_or_else(|| ServiceError::Missing(id.clone()))?;
-        let desired_setup = request
-            .spec
-            .manifest()
-            .setup()
-            .map(|path| json!({"path":path.as_str()}));
-        let desired_tools = json!(request.spec.manifest().tools());
-        let unchanged = record.setup_resolution.as_ref().map(|r| &r.details)
-            == desired_setup.as_ref()
-            && record.tool_resolution.as_ref().map(|r| &r.details) == Some(&desired_tools);
-        let operation = self.store.begin_operation(&record, OperationKind::Apply)?;
+        let unchanged = resolution_matches(&record, &desired_fingerprint);
+        let operation = self
+            .database({
+                let record = record.clone();
+                move |store| store.begin_operation(&record, OperationKind::Apply)
+            })
+            .await?;
         let (sender, receiver) = mpsc::channel(16);
-        self.send_initial(operation.id, &sender)?;
+        self.send_initial(operation.id, &sender).await?;
         if unchanged {
-            self.store
-                .complete_operation(operation.id, record.actual_state)?;
-            self.send_terminal(operation.id, &sender)?;
+            let actual = record.actual_state;
+            self.database(move |store| store.complete_operation(operation.id, actual))
+                .await?;
+            self.send_terminal(operation.id, &sender).await?;
             return Ok(Operation {
                 id: operation.id,
                 events: receiver,
@@ -438,32 +548,51 @@ impl<B: RuntimeBackend> SandboxService<B> {
             if runtime.state != ContainerState::Running {
                 self.runtime.start(&id).await?;
             }
-            self.provisioner
+            self.emit(operation.id, json!({"phase":"before_provision","desired_fingerprint":desired_fingerprint}), &sender).await?;
+            let resolution = self.provisioner
                 .provision(ProvisionRequest {
                     spec: &request.spec,
                     create: &create,
                 })
                 .await?;
-            self.provisioner.health_check(&id).await
+            self.emit(operation.id, json!({"phase":"after_provision","resolution_version":1,"desired_fingerprint":desired_fingerprint,"setup":resolution.setup,"tools":resolution.tools}), &sender).await?;
+            self.emit(operation.id, json!({"phase":"before_health"}), &sender).await?;
+            self.provisioner.health_check(&id).await?;
+            self.emit(operation.id, json!({"phase":"after_health","desired_fingerprint":desired_fingerprint}), &sender).await?;
+            Ok::<_, ServiceError>(resolution)
         }
         .await;
-        if let Err(error) = result {
-            self.store.fail_operation(
-                operation.id,
-                prior_actual,
-                error.code(),
-                json!({"message":error.to_string()}),
-            )?;
-            self.send_terminal(operation.id, &sender)?;
-            return Err(error);
-        }
-        record.setup_resolution = desired_setup.map(|details| SetupResolution::new(1, details));
-        record.tool_resolution = Some(ToolResolution::new(1, desired_tools));
+        let resolution = match result {
+            Ok(resolution) => resolution,
+            Err(error) => {
+                let actual = self.runtime_actual(&id, prior_actual).await;
+                let code = error.code();
+                let details = json!({"message":error.to_string()});
+                self.database(move |store| {
+                    store.fail_operation(operation.id, actual, code, details)
+                })
+                .await?;
+                self.send_terminal(operation.id, &sender).await?;
+                return Err(error);
+            }
+        };
+        record.setup_resolution = Some(SetupResolution::new(
+            1,
+            json!({"desired_fingerprint":desired_fingerprint,"resolution":resolution.setup}),
+        ));
+        record.tool_resolution = Some(ToolResolution::new(
+            1,
+            json!({"desired_fingerprint":desired_fingerprint,"resolution":resolution.tools}),
+        ));
         record.actual_state = ActualState::Running;
-        self.store.put_sandbox(&record)?;
-        self.store
-            .complete_operation(operation.id, ActualState::Running)?;
-        self.send_terminal(operation.id, &sender)?;
+        self.database({
+            let record = record.clone();
+            move |store| store.put_sandbox(&record)
+        })
+        .await?;
+        self.database(move |store| store.complete_operation(operation.id, ActualState::Running))
+            .await?;
+        self.send_terminal(operation.id, &sender).await?;
         Ok(Operation {
             id: operation.id,
             events: receiver,
@@ -472,10 +601,17 @@ impl<B: RuntimeBackend> SandboxService<B> {
 
     pub async fn reconcile(&self) -> Result<ReconcileReport, ServiceError> {
         self.recover_pending().await?;
-        let records = self.store.list_sandboxes()?;
+        let records = self.database(|store| store.list_sandboxes()).await?;
         let known = records
             .iter()
             .map(|record| record.id.clone())
+            .collect::<HashSet<_>>();
+        let expected = known
+            .iter()
+            .map(PolicyCompiler::expected_resource_identities)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
             .collect::<HashSet<_>>();
         let inventory = self.runtime.list_resources().await?;
         let actual_owned = inventory
@@ -490,7 +626,8 @@ impl<B: RuntimeBackend> SandboxService<B> {
             .into_iter()
             .filter_map(|resource| match resource.ownership() {
                 ResourceOwnership::GasCanOwned
-                    if resource.sandbox_id().is_none_or(|id| !known.contains(id)) =>
+                    if resource.sandbox_id().is_none_or(|id| !known.contains(id))
+                        || !expected.contains(resource.identity()) =>
                 {
                     Some(ReconcileFinding::UnknownOwned(resource))
                 }
@@ -529,22 +666,52 @@ impl<B: RuntimeBackend> SandboxService<B> {
     }
 
     async fn recover_pending(&self) -> Result<(), ServiceError> {
-        for operation in self.store.pending_operations()? {
-            let record = self
-                .store
-                .sandbox(&operation.sandbox_id)?
+        for operation in self.database(|store| store.pending_operations()).await? {
+            let events = self
+                .database({
+                    let id = operation.id;
+                    move |store| store.operation_events(id)
+                })
+                .await?;
+            let phase_fingerprint = |phase: &str| {
+                events.iter().find_map(|event| {
+                    let details = event.details.as_ref()?;
+                    (details.get("phase").and_then(Value::as_str) == Some(phase))
+                        .then(|| details.get("desired_fingerprint").and_then(Value::as_str))
+                        .flatten()
+                })
+            };
+            let provision_fingerprint = events.iter().find_map(|event| {
+                let details = event.details.as_ref()?;
+                (details.get("phase").and_then(Value::as_str) == Some("after_provision")
+                    && details.get("resolution_version").and_then(Value::as_u64) == Some(1))
+                .then(|| details.get("desired_fingerprint").and_then(Value::as_str))
+                .flatten()
+            });
+            let hook_evidence = provision_fingerprint.is_some()
+                && provision_fingerprint == phase_fingerprint("after_health");
+            let mut record = self
+                .database({
+                    let id = operation.sandbox_id.clone();
+                    move |store| store.sandbox(&id)
+                })
+                .await?
                 .ok_or_else(|| ServiceError::Missing(operation.sandbox_id.clone()))?;
             let inspected = self.runtime.inspect(&operation.sandbox_id).await?;
             if inspected.as_ref().is_some_and(|runtime| {
                 runtime.ownership.managed_by != "gascan"
                     || runtime.ownership.sandbox_id != operation.sandbox_id
             }) {
-                self.store.fail_operation(
-                    operation.id,
-                    record.actual_state,
-                    "ownership_mismatch",
-                    json!({"phase":"reconcile"}),
-                )?;
+                let actual = record.actual_state;
+                self.database(move |store| {
+                    store.fail_operation(
+                        operation.id,
+                        actual,
+                        "ownership_mismatch",
+                        json!({"phase":"reconcile"}),
+                    )
+                })
+                .await?;
                 continue;
             }
             let actual =
@@ -555,25 +722,69 @@ impl<B: RuntimeBackend> SandboxService<B> {
                         ContainerState::Running => ActualState::Running,
                         ContainerState::Stopped => ActualState::Stopped,
                     });
+            let expected_absent = if operation.kind == OperationKind::Destroy {
+                let expected = PolicyCompiler::expected_resource_identities(&operation.sandbox_id)?
+                    .into_iter()
+                    .collect::<HashSet<_>>();
+                !self.runtime.list_resources().await?.iter().any(|resource| {
+                    expected.contains(resource.identity())
+                        && resource.sandbox_id() == Some(&operation.sandbox_id)
+                        && resource.ownership() == ResourceOwnership::GasCanOwned
+                })
+            } else {
+                false
+            };
             let converged = match operation.kind {
-                OperationKind::Create => actual == ActualState::Running,
+                OperationKind::Create => actual == ActualState::Running && hook_evidence,
                 OperationKind::Start => actual == ActualState::Running,
                 OperationKind::Stop => actual == ActualState::Stopped,
-                OperationKind::Destroy => actual == ActualState::Absent,
+                OperationKind::Destroy => actual == ActualState::Absent && expected_absent,
                 OperationKind::Apply => {
-                    matches!(actual, ActualState::Running | ActualState::Stopped)
+                    hook_evidence && matches!(actual, ActualState::Running | ActualState::Stopped)
                 }
                 OperationKind::Reconcile => true,
             };
             if converged {
-                self.store.complete_operation(operation.id, actual)?;
+                if matches!(operation.kind, OperationKind::Create | OperationKind::Apply) {
+                    if let Some(details) = events
+                        .iter()
+                        .filter_map(|event| event.details.as_ref())
+                        .find(|details| {
+                            details.get("phase").and_then(Value::as_str) == Some("after_provision")
+                        })
+                    {
+                        let fingerprint = details
+                            .get("desired_fingerprint")
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        record.setup_resolution = Some(SetupResolution::new(
+                            1,
+                            json!({"desired_fingerprint":fingerprint,"resolution":details.get("setup").cloned().unwrap_or(Value::Null)}),
+                        ));
+                        record.tool_resolution = Some(ToolResolution::new(
+                            1,
+                            json!({"desired_fingerprint":fingerprint,"resolution":details.get("tools").cloned().unwrap_or(Value::Null)}),
+                        ));
+                        record.actual_state = actual;
+                        self.database({
+                            let record = record.clone();
+                            move |store| store.put_sandbox(&record)
+                        })
+                        .await?;
+                    }
+                }
+                self.database(move |store| store.complete_operation(operation.id, actual))
+                    .await?;
             } else {
-                self.store.fail_operation(
-                    operation.id,
-                    actual,
-                    "interrupted_operation",
-                    json!({"phase":"reconcile","actual":format!("{actual:?}")}),
-                )?;
+                self.database(move |store| {
+                    store.fail_operation(
+                        operation.id,
+                        actual,
+                        "interrupted_operation",
+                        json!({"phase":"reconcile","actual":format!("{actual:?}")}),
+                    )
+                })
+                .await?;
             }
         }
         Ok(())
@@ -592,35 +803,47 @@ impl<B: RuntimeBackend> SandboxService<B> {
             })
     }
 
-    fn emit(
+    async fn emit(
         &self,
-        id: i64,
+        id: OperationId,
         details: Value,
         sender: &mpsc::Sender<OperationEvent>,
     ) -> Result<(), ServiceError> {
-        let event = self.store.append_operation_event(id, details)?;
+        let event = self
+            .database(move |store| store.append_operation_event(id, details))
+            .await?;
         sender
             .try_send(event)
             .map_err(|_| ServiceError::EventStreamUnavailable)
     }
-    fn send_initial(
+    async fn send_initial(
         &self,
-        id: i64,
+        id: OperationId,
         sender: &mpsc::Sender<OperationEvent>,
     ) -> Result<(), ServiceError> {
-        if let Some(event) = self.store.operation_events(id)?.first().cloned() {
+        if let Some(event) = self
+            .database(move |store| store.operation_events(id))
+            .await?
+            .first()
+            .cloned()
+        {
             sender
                 .try_send(event)
                 .map_err(|_| ServiceError::EventStreamUnavailable)?;
         }
         Ok(())
     }
-    fn send_terminal(
+    async fn send_terminal(
         &self,
-        id: i64,
+        id: OperationId,
         sender: &mpsc::Sender<OperationEvent>,
     ) -> Result<(), ServiceError> {
-        if let Some(event) = self.store.operation_events(id)?.last().cloned() {
+        if let Some(event) = self
+            .database(move |store| store.operation_events(id))
+            .await?
+            .last()
+            .cloned()
+        {
             sender
                 .try_send(event)
                 .map_err(|_| ServiceError::EventStreamUnavailable)?;
@@ -633,6 +856,7 @@ impl ServiceError {
     fn code(&self) -> &'static str {
         match self {
             Self::Runtime(error) => error.code(),
+            Self::Create(error) => error.code(),
             Self::Policy(error) => error.code(),
             Self::Missing(_) => "not_found",
             Self::Ownership(_) => "ownership_mismatch",
@@ -642,6 +866,43 @@ impl ServiceError {
             Self::Manifest(_) => "manifest_error",
             Self::LockPoisoned => "lock_poisoned",
             Self::EventStreamUnavailable => "event_stream_unavailable",
+            Self::DatabaseWorker(_) => "database_worker_failed",
+            Self::Fingerprint(_) => "fingerprint_failed",
+            Self::IncompleteDestroy(_) => "incomplete_destroy",
         }
     }
+}
+
+fn resolution_matches(record: &SandboxRecord, fingerprint: &str) -> bool {
+    let matches = |details: &Value| {
+        details.get("desired_fingerprint").and_then(Value::as_str) == Some(fingerprint)
+    };
+    record
+        .setup_resolution
+        .as_ref()
+        .is_some_and(|value| matches(&value.details))
+        && record
+            .tool_resolution
+            .as_ref()
+            .is_some_and(|value| matches(&value.details))
+}
+
+async fn desired_fingerprint(spec: &SandboxSpec) -> Result<String, ServiceError> {
+    let root = spec.canonical_root().to_owned();
+    let setup = spec.manifest().setup().map(ToOwned::to_owned);
+    let tools = spec.manifest().tools().clone();
+    tokio::task::spawn_blocking(move || {
+        let setup_bytes = setup
+            .map(|path| std::fs::read(root.join(path)))
+            .transpose()
+            .map_err(|error| ServiceError::Fingerprint(error.to_string()))?;
+        let mut hash = Sha256::new();
+        hash.update(serde_json::to_vec(&tools).map_err(StoreError::Json)?);
+        if let Some(bytes) = setup_bytes {
+            hash.update(bytes);
+        }
+        Ok(format!("sha256:{:x}", hash.finalize()))
+    })
+    .await
+    .map_err(|error| ServiceError::DatabaseWorker(error.to_string()))?
 }

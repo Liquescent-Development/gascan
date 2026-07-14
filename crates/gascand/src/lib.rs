@@ -11,6 +11,7 @@ pub use service::{
     ServiceError, UpRequest,
 };
 pub use store::{
-    ActualState, DesiredState, ImageResolution, OperationEvent, OperationKind, OperationRecord,
-    OperationStatus, SandboxRecord, SetupResolution, Store, StoreError, ToolResolution,
+    ActualState, DesiredState, ImageResolution, OperationEvent, OperationId, OperationKind,
+    OperationRecord, OperationStatus, SandboxRecord, SetupResolution, Store, StoreError,
+    ToolResolution,
 };

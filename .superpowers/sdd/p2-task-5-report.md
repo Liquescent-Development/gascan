@@ -107,3 +107,25 @@ Operation events use a bounded channel (capacity 16). The store is written befor
 - Synchronous errors after `begin_operation` are terminalized. If a process actually disappears between durable begin and terminal persistence, the pending row intentionally remains for reopen reconciliation.
 - The bounded capacity is deliberately above the current maximum events emitted synchronously before an `Operation` is returned. Future additions that exceed it fail explicitly and keep the durable store authoritative.
 - Resource inventory is intentionally backend-neutral; Apple translation remains Plan 3 work.
+
+## Controller hardening wave
+
+Commits `0f13617` and `82be98d` seal the runtime mutation seam: inventory resources carry opaque process-local removal evidence and cannot be deserialized, `RemoveRequest` accepts owned evidence only, `CreateOutcome` validates exact request identities/associations/no duplicates, and `CreateFailure` returns a stable typed source plus every partial resource created before failure. FakeRuntime regressions cover collision at the second and third volume and injected post-mutation failure.
+
+Lifecycle changes use `PolicyCompiler::expected_resource_identities` without constructing a create request. Destroy always inventories and removes only `expected identity ∩ exact sandbox association ∩ current GasCan ownership ∩ valid inventory proof`; an extra GasCan-owned volume with the known sandbox association is retained and reported `UnknownOwned`. Partial create failures roll back only `CreateFailure::created()` and retain preexisting collision resources.
+
+Provision and health now persist ordered `before_provision`, versioned `after_provision`, `before_health`, and `after_health` events. The successful provision event contains the actual hook resolution and a SHA-256 desired fingerprint over tool declarations and setup bytes. Initial retry and apply skip hooks only when a prior successful resolution has the same fingerprint. Failed initial retry invokes hooks again; stopped apply starts first, then records actual Running if provisioning fails while retaining the prior successful resolution. Pending Create/Apply recovery without successful health evidence terminalizes Failed with `interrupted_operation`; runtime Running/Stopped alone is insufficient. Destroy recovery completes only when the container and every exact expected owned resource are absent.
+
+`OperationId` is now an immutable serialized newtype that rejects non-positive constructed or stored values. `Store` is cheaply cloneable through `Arc<Mutex<Connection>>`, and every Store call within async service methods is dispatched with `spawn_blocking`; a current-thread Tokio regression holds an SQLite write lock and proves an unrelated runtime task progresses promptly. The keyed lock registry stores `Weak` entries and prunes stale keys; a 64-sandbox regression leaves zero retained locks.
+
+Focused TDD evidence in this wave:
+
+| Area | RED | GREEN |
+|---|---|---|
+| Operation identity | unresolved `OperationId` import | constructor and corrupt-SQL tests pass |
+| Lock retention | missing registry observation API | 64 unique completed keys prune to zero |
+| Retry/apply | failed retry transitioned Absent directly and unchanged tests masked hook behavior | failed retry reruns; changed desired input invokes apply; failure records Running |
+| Recovery evidence | prior test accepted either terminal status | subprocess aborts at before/after provision and before/after health; only complete versioned provision plus health evidence asserts Completed |
+| Async database | direct Store calls could block the sole worker | blocked-writer current-thread test progresses under one second |
+
+No Task 6 API or Apple implementation was added.

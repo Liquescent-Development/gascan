@@ -241,8 +241,8 @@ git commit -m "feat: persist sandbox lifecycle state"
 
 **Interfaces:**
 - Produces: `SandboxService<B: RuntimeBackend>` methods `up`, `apply`, `start`, `stop`, `destroy`, `status`, `list`, and `reconcile`.
-- Operations return an `OperationId` and structured `OperationEvent` stream.
-- A keyed async lock serializes mutations for one sandbox while allowing unrelated sandboxes concurrently.
+- Operations return a checked positive `OperationId` and structured append-only `OperationEvent` stream.
+- Weak keyed async locks serialize mutations for one sandbox without retaining stale sandbox keys. Async methods dispatch all SQLite Store access to blocking workers.
 
 - [ ] **Step 1: Write rollback and reconciliation tests using `FakeRuntime`**
 
@@ -266,13 +266,13 @@ Expected: FAIL because `SandboxService` is undefined.
 
 - [ ] **Step 3: Implement transactional orchestration**
 
-For `up`: validate/canonicalize, persist pending, compile policy, create only absent resources, start, provision/health-check through injected hooks, persist ready, and emit events. Roll back only `CreateOutcome::created()` or `CreateFailure::created()`. Destroy derives expected identities, intersects them with current inventory, and removes only exact resources whose opaque removal proof came from that inventory/create call. Reconcile desired and actual state after restart; report unknown owned, unknown unowned, and mismatched resources but never delete unknown resources. Implement explicit `apply` change detection and non-destructive failure behavior.
+For `up`: validate/canonicalize, persist pending, compile policy, create only absent resources, start, persist explicit before/after provision and health phases, and persist actual versioned hook resolution under a desired-content fingerprint. Roll back only `CreateOutcome::created()` or `CreateFailure::created()`. Destroy always inventories, derives expected identities, intersects them with current inventory, and removes only exact associated owned resources whose opaque proof came from that inventory/create call. Reconcile reports extra owned, unknown unowned, and mismatched resources but never deletes unknown resources. Pending Create/Apply cannot complete from runtime state alone; durable successful resolution and health evidence is required. Apply skips hooks only for a matching durable fingerprint and records actual runtime state after failure.
 
 - [ ] **Step 4: Run lifecycle and reconciliation tests**
 
 Run: `cargo test -p gascand --test lifecycle --test reconcile`
 
-Expected: PASS for idempotent up/down, stopped auto-start, missing sandbox refusal, concurrent operations, every injected crash point, unknown owned/unowned resources, and setup failure.
+Expected: PASS for idempotent up/down, fingerprinted retry/apply, stopped auto-start and failed-hook reality, missing sandbox refusal, concurrent operations, deterministic hook interruption recovery, extra owned/unowned resources, partial-create rollback, nonblocking SQLite access, weak lock cleanup, and setup failure.
 
 - [ ] **Step 5: Commit orchestration**
 

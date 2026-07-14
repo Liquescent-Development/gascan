@@ -1,14 +1,37 @@
 use camino::Utf8PathBuf;
 use gascan_core::sandbox::SandboxId;
 use gascand::{
-    ActualState, DesiredState, ImageResolution, OperationKind, OperationStatus, SandboxRecord,
-    SetupResolution, Store, StoreError, ToolResolution,
+    ActualState, DesiredState, ImageResolution, OperationId, OperationKind, OperationStatus,
+    SandboxRecord, SetupResolution, Store, StoreError, ToolResolution,
 };
 use serde_json::json;
 use std::error::Error;
 use std::process::Command;
 
 type TestResult = Result<(), Box<dyn Error>>;
+
+#[test]
+fn operation_id_rejects_non_positive_database_values() {
+    assert!(OperationId::new(0).is_err());
+    assert!(OperationId::new(-1).is_err());
+    assert!(matches!(OperationId::new(7), Ok(id) if id.get() == 7));
+}
+
+#[test]
+fn non_positive_operation_id_loaded_from_sql_is_rejected() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("state.db");
+    let store = Store::open(&path)?;
+    let sandbox = fixture("/workspace/invalid-operation-id");
+    store.put_sandbox(&sandbox)?;
+    let connection = rusqlite::Connection::open(&path)?;
+    connection.execute(
+        "INSERT INTO operations (id, sandbox_id, kind, status) VALUES (0, ?1, 'create', 'completed')",
+        [sandbox.id.as_str()],
+    )?;
+    assert!(store.latest_operation().is_err());
+    Ok(())
+}
 
 fn fixture(root: &str) -> SandboxRecord {
     let canonical_root = Utf8PathBuf::from(root);
@@ -139,7 +162,7 @@ fn operations_complete_or_fail_once_and_events_are_append_only() -> TestResult {
         connection
             .execute(
                 "UPDATE operation_events SET status = ?1 WHERE operation_id = ?2",
-                rusqlite::params!["failed", completed.id],
+                rusqlite::params!["failed", completed.id.get()],
             )
             .is_err()
     );

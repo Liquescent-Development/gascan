@@ -5,7 +5,9 @@ use gascand::{
     ActualState, DesiredState, NoopProvisioner, OperationKind, OperationStatus, ReconcileFinding,
     SandboxRecord, SandboxService, Store,
 };
+use serde_json::json;
 use std::error::Error;
+use std::process::Command;
 use std::sync::Arc;
 
 #[tokio::test]
@@ -103,10 +105,141 @@ async fn reopen_reconciliation_terminalizes_every_pending_operation_kind()
         assert!(service.store().pending_operations()?.is_empty());
         let operation = service.store().latest_operation()?.ok_or("operation")?;
         assert_eq!(operation.id, pending.id);
-        assert!(matches!(
-            operation.status,
-            OperationStatus::Completed | OperationStatus::Failed
-        ));
+        let expected = match kind {
+            OperationKind::Create | OperationKind::Apply => OperationStatus::Failed,
+            OperationKind::Start | OperationKind::Stop | OperationKind::Destroy => {
+                OperationStatus::Completed
+            }
+            OperationKind::Reconcile => return Err("unexpected reconcile fixture".into()),
+        };
+        assert_eq!(operation.status, expected);
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn pending_create_completes_only_with_durable_resolution_and_health_evidence()
+-> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("state.db");
+    let id = gascan_core::sandbox::SandboxId::test("evidenced-create");
+    let record = SandboxRecord {
+        id: id.clone(),
+        canonical_root: Utf8PathBuf::from("/pending/evidenced"),
+        desired_state: DesiredState::Running,
+        actual_state: ActualState::Creating,
+        setup_resolution: None,
+        tool_resolution: None,
+        image_resolution: None,
+    };
+    let store = Store::open(&path)?;
+    let pending = store.begin_operation(&record, OperationKind::Create)?;
+    store.append_operation_event(pending.id, json!({"phase":"after_provision","resolution_version":1,"desired_fingerprint":"sha256:test","setup":null,"tools":null}))?;
+    store.append_operation_event(
+        pending.id,
+        json!({"phase":"after_health","desired_fingerprint":"sha256:test"}),
+    )?;
+    let runtime = FakeRuntime::default();
+    runtime.seed_owned(id.clone()).await;
+    runtime.start(&id).await?;
+    let service = SandboxService::new(runtime, store, Arc::new(NoopProvisioner));
+    service.reconcile().await?;
+    assert_eq!(
+        service
+            .store()
+            .latest_operation()?
+            .ok_or("operation")?
+            .status,
+        OperationStatus::Completed
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn provision_and_health_kill_point_phase_matrix_has_exact_recovery_status()
+-> Result<(), Box<dyn Error>> {
+    for (label, phases, expected) in [
+        (
+            "before-provision",
+            vec![json!({"phase":"before_provision","desired_fingerprint":"sha256:test"})],
+            OperationStatus::Failed,
+        ),
+        (
+            "after-provision",
+            vec![
+                json!({"phase":"after_provision","resolution_version":1,"desired_fingerprint":"sha256:test","setup":null,"tools":null}),
+            ],
+            OperationStatus::Failed,
+        ),
+        (
+            "before-health",
+            vec![
+                json!({"phase":"after_provision","resolution_version":1,"desired_fingerprint":"sha256:test","setup":null,"tools":null}),
+                json!({"phase":"before_health"}),
+            ],
+            OperationStatus::Failed,
+        ),
+        (
+            "after-health",
+            vec![
+                json!({"phase":"after_provision","resolution_version":1,"desired_fingerprint":"sha256:test","setup":null,"tools":null}),
+                json!({"phase":"after_health","desired_fingerprint":"sha256:test"}),
+            ],
+            OperationStatus::Completed,
+        ),
+    ] {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("state.db");
+        let id = gascan_core::sandbox::SandboxId::test(label);
+        let phase_json = serde_json::to_string(&phases)?;
+        let status = Command::new(std::env::current_exe()?)
+            .args(["--exact", "hook_phase_crash_child"])
+            .env("GASCAN_HOOK_CRASH_DB", &path)
+            .env("GASCAN_HOOK_CRASH_LABEL", label)
+            .env("GASCAN_HOOK_CRASH_PHASES", phase_json)
+            .status()?;
+        assert!(!status.success(), "child must terminate at the kill point");
+        let store = Store::open(&path)?;
+        let runtime = FakeRuntime::default();
+        runtime.seed_owned(id.clone()).await;
+        runtime.start(&id).await?;
+        let service = SandboxService::new(runtime, store, Arc::new(NoopProvisioner));
+        service.reconcile().await?;
+        assert_eq!(
+            service
+                .store()
+                .latest_operation()?
+                .ok_or("operation")?
+                .status,
+            expected,
+            "{label}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn hook_phase_crash_child() -> Result<(), Box<dyn Error>> {
+    let Ok(path) = std::env::var("GASCAN_HOOK_CRASH_DB") else {
+        return Ok(());
+    };
+    let label = std::env::var("GASCAN_HOOK_CRASH_LABEL")?;
+    let phases: Vec<serde_json::Value> =
+        serde_json::from_str(&std::env::var("GASCAN_HOOK_CRASH_PHASES")?)?;
+    let id = gascan_core::sandbox::SandboxId::test(&label);
+    let record = SandboxRecord {
+        id,
+        canonical_root: Utf8PathBuf::from(format!("/pending/{label}")),
+        desired_state: DesiredState::Running,
+        actual_state: ActualState::Creating,
+        setup_resolution: None,
+        tool_resolution: None,
+        image_resolution: None,
+    };
+    let store = Store::open(path)?;
+    let pending = store.begin_operation(&record, OperationKind::Create)?;
+    for phase in phases {
+        store.append_operation_event(pending.id, phase)?;
+    }
+    std::process::abort();
 }

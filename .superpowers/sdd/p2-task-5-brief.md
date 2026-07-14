@@ -33,13 +33,13 @@ Expected: FAIL because `SandboxService` is undefined.
 
 - [ ] **Step 3: Implement transactional orchestration**
 
-For `up`: validate/canonicalize, persist pending, compile policy, create only absent resources, start, provision/health-check through injected hooks, persist ready, and emit events. Roll back only resources structurally returned by `CreateOutcome::created()` or `CreateFailure::created()`. Destroy derives exact expected identities, intersects them with fresh inventory, and removes only resources carrying that inventory's opaque process-local removal proof. Reconcile desired and actual state after restart; report unknown owned, unknown unowned, and mismatched resources but never delete unknown resources. Implement explicit `apply` change detection and non-destructive failure behavior. This is the controller-authorized joint Task 2/Task 5 seam revision; the backend retains exactly nine methods and uses `list_resources` plus typed `RemoveRequest`.
+For `up`: validate/canonicalize, persist pending, compile policy, create only absent resources, start, durably bracket provision and health hooks with append-only phase events, and persist the actual versioned resolution with a stable desired-content fingerprint. Roll back only resources structurally returned by `CreateOutcome::created()` or `CreateFailure::created()`. Destroy always inventories, derives exact expected identities, and removes only the intersection carrying exact association, current ownership, and that inventory's opaque removal proof. Reconcile reports extra owned, unowned, and mismatched resources but never deletes unknown resources; pending Create/Apply completes only with durable successful hook evidence. Async service methods dispatch every Store call to blocking workers. Operations use checked positive `OperationId`, while keyed locks retain weak entries only. The backend retains exactly nine methods and uses `list_resources` plus typed `RemoveRequest`.
 
 - [ ] **Step 4: Run lifecycle and reconciliation tests**
 
 Run: `cargo test -p gascand --test lifecycle --test reconcile`
 
-Expected: PASS for idempotent up/down, stopped auto-start, missing sandbox refusal, concurrent operations, every injected crash point, unknown owned/unowned resources, and setup failure.
+Expected: PASS for idempotent up/down, fingerprinted retry/apply, stopped auto-start with actual failure state, missing sandbox refusal, concurrent operations, durable hook recovery phases, exact and extra-owned inventory, partial-create rollback, nonblocking SQLite access, weak lock cleanup, and setup failure.
 
 - [ ] **Step 5: Commit orchestration**
 
