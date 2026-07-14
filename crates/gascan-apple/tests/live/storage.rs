@@ -4,13 +4,17 @@ use super::common::{LiveContext, TestError, exact_workspace_bind};
 fn bind_inspect_requires_one_exact_read_write_workspace_source() {
     let source = std::path::Path::new("/tmp/gascan-feas-42-workspace");
     let exact = serde_json::json!([{"configuration":{"mounts":[{
-        "type":"bind","source":source,"destination":"/workspace","options":["rw"]
+        "type":{"virtiofs":{}},"source":source,"destination":"/workspace","options":["rw"]
     }]}}]);
     assert!(exact_workspace_bind(&exact, source).is_some());
     let broader = serde_json::json!([{"configuration":{"mounts":[{
-        "type":"bind","source":"/tmp","destination":"/workspace","options":["rw"]
+        "type":{"virtiofs":{}},"source":"/tmp","destination":"/workspace","options":["rw"]
     }]}}]);
     assert!(exact_workspace_bind(&broader, source).is_none());
+    let named_volume = serde_json::json!([{"configuration":{"mounts":[{
+        "type":{"volume":{}},"source":source,"destination":"/workspace","options":["rw"]
+    }]}}]);
+    assert!(exact_workspace_bind(&named_volume, source).is_none());
 }
 
 #[tokio::test]

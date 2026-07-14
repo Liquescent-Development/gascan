@@ -455,9 +455,14 @@ pub fn exact_workspace_bind<'a>(value: &'a Value, source: &Path) -> Option<&'a V
         .get("configuration")?
         .get("mounts")?
         .as_array()?;
-    let mut binds = mounts
-        .iter()
-        .filter(|mount| mount.get("type").and_then(Value::as_str) == Some("bind"));
+    let mut binds = mounts.iter().filter(|mount| {
+        mount
+            .get("type")
+            .and_then(Value::as_object)
+            .is_some_and(|kind| {
+                kind.len() == 1 && kind.get("virtiofs") == Some(&Value::Object(Default::default()))
+            })
+    });
     let mount = binds.next()?;
     if binds.next().is_some()
         || mount.get("source").and_then(Value::as_str) != source.to_str()
