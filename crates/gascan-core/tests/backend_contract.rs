@@ -69,6 +69,37 @@ async fn persistent_fake_runtime_reopens_runtime_truth_without_controller_state(
     assert!(!reopened.list_resources().await.unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn persistent_logs_are_isolated_by_exact_sandbox_id() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("runtime.json");
+    let backend = FakeRuntime::persistent(capabilities(), &path)
+        .await
+        .unwrap();
+    let left = create_request("logs-left");
+    let right = create_request("logs-right");
+    for (fixture, marker) in [(&left, "left-marker"), (&right, "right-marker")] {
+        let id = fixture.id().clone();
+        backend.create(fixture.request()).await.unwrap();
+        backend.start(&id).await.unwrap();
+        let mut session = backend
+            .exec(ExecRequest::fixture(id, ["fake-stdout", marker]))
+            .await
+            .unwrap();
+        session.send(ExecInput::Close).await.unwrap();
+        while session.next().await.is_some() {}
+    }
+    drop(backend);
+    let backend = FakeRuntime::persistent(capabilities(), &path)
+        .await
+        .unwrap();
+    assert_eq!(backend.logs(left.id(), None).await.unwrap(), b"left-marker");
+    assert_eq!(
+        backend.logs(right.id(), None).await.unwrap(),
+        b"right-marker"
+    );
+}
+
 pub async fn backend_contract(backend: &dyn RuntimeBackend) {
     let fixture = create_request("contract");
     let id = fixture.id().clone();

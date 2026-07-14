@@ -487,6 +487,12 @@ fn v1_descriptor_exactly_covers_every_exported_message_enum_and_rpc() {
             &[(3, 4)],
         ),
         (
+            "EnvironmentVariable",
+            &[f!("name", 1, String), f!("value", 2, String)],
+            &[],
+            &[(3, 4)],
+        ),
+        (
             "CommandPayload",
             &[
                 f!("argv", 1, Bytes, R, None, None),
@@ -497,7 +503,7 @@ fn v1_descriptor_exactly_covers_every_exported_message_enum_and_rpc() {
                     Message,
                     R,
                     None,
-                    Some(".gascan.v1.CommandPayload.EnvironmentEntry")
+                    Some(".gascan.v1.EnvironmentVariable")
                 ),
                 f!("tty", 4, Bool),
             ],

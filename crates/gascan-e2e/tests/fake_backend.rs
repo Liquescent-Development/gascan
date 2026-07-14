@@ -120,9 +120,15 @@ fn binary_stdin_stdout_stderr_and_environment_are_exact() -> TestResult {
     let term = env
         .command(&["run", "--", "fake-env", "TERM"])
         .env("TERM", "gascan-test-term")
+        .env("LC_MESSAGES", "gascan-test-messages")
         .env("SECRET_TOKEN", "must-not-cross")
         .output()?;
     assert_eq!(term.stdout, b"gascan-test-term");
+    let locale = env
+        .command(&["run", "--", "fake-env", "LC_MESSAGES"])
+        .env("LC_MESSAGES", "gascan-test-messages")
+        .output()?;
+    assert_eq!(locale.stdout, b"gascan-test-messages");
     assert!(
         env.command(&["run", "--", "fake-env", "SECRET_TOKEN"])
             .env("SECRET_TOKEN", "must-not-cross")
@@ -285,7 +291,7 @@ fn real_pty_resize_signals_and_terminal_restoration_are_exact() -> TestResult {
         let stdin = std::fs::File::from(rustix::io::dup(&pty.user)?);
         let stdout = std::fs::File::from(rustix::io::dup(&pty.user)?);
         let stderr = std::fs::File::from(rustix::io::dup(&pty.user)?);
-        let mut command = env.command(&["shell", "--", "fake-echo-stdin"]);
+        let mut command = env.command(&["shell", "--", "fake-last-resize"]);
         let mut child = command.stdin(stdin).stdout(stdout).stderr(stderr).spawn()?;
         std::thread::sleep(std::time::Duration::from_millis(150));
         rustix::termios::tcsetwinsize(
@@ -299,6 +305,8 @@ fn real_pty_resize_signals_and_terminal_restoration_are_exact() -> TestResult {
         )?;
         let pid =
             rustix::process::Pid::from_raw(i32::try_from(child.id())?).ok_or("invalid pid")?;
+        rustix::process::kill_process(pid, rustix::process::Signal::WINCH)?;
+        std::thread::sleep(std::time::Duration::from_millis(50));
         rustix::process::kill_process(pid, signal)?;
         assert_eq!(child.wait()?.code(), Some(expected));
         let restored = rustix::termios::tcgetattr(&pty.user)?;
@@ -307,6 +315,8 @@ fn real_pty_resize_signals_and_terminal_restoration_are_exact() -> TestResult {
         assert_eq!(restored.control_modes, saved.control_modes);
         assert_eq!(restored.local_modes, saved.local_modes);
     }
+    let logs = env.invoke(&["logs"])?;
+    assert!(logs.stdout.windows(6).any(|window| window == b"132x47"));
     Ok(())
 }
 
@@ -325,6 +335,28 @@ async fn attach_tokens_are_one_use_atomic_and_mismatch_safe() -> TestResult {
         .next()
         .ok_or("sandbox missing")?
         .sandbox_id;
+    let rejected = client
+        .run(v1::RunRequest {
+            sandbox: Some(v1::SandboxSelector {
+                sandbox_id: id.clone(),
+            }),
+            command: Some(v1::CommandPayload {
+                argv: vec![b"true".to_vec()],
+                stdin: Vec::new(),
+                environment: vec![v1::EnvironmentVariable {
+                    name: "SECRET_TOKEN".to_owned(),
+                    value: "blocked".to_owned(),
+                }],
+                tty: false,
+            }),
+        })
+        .await
+        .err()
+        .ok_or("direct secret environment was accepted")?;
+    assert_eq!(
+        rejected.message(),
+        gascan_proto::error_code::INVALID_REQUEST
+    );
     let allocate = |id: String| v1::RunRequest {
         sandbox: Some(v1::SandboxSelector { sandbox_id: id }),
         command: Some(v1::CommandPayload {
@@ -399,6 +431,42 @@ async fn attach_tokens_are_one_use_atomic_and_mismatch_safe() -> TestResult {
         }
     }
     assert!(saw_mismatch);
+    let sandbox_id = client
+        .list(v1::ListRequest {})
+        .await?
+        .into_inner()
+        .sandboxes
+        .into_iter()
+        .next()
+        .ok_or("sandbox missing")?
+        .sandbox_id;
+    let mut events = client.run(allocate(sandbox_id)).await?.into_inner();
+    let token = events
+        .message()
+        .await?
+        .ok_or("token missing")?
+        .session_token;
+    let frames = [
+        v1::ClientFrame {
+            frame: Some(v1::client_frame::Frame::Resize(v1::Resize {
+                columns: 80,
+                rows: 24,
+            })),
+            session_token: token,
+        },
+        close(Vec::new()),
+    ];
+    let mut empty = client
+        .attach(tokio_stream::iter(frames))
+        .await?
+        .into_inner();
+    let mut saw_empty = false;
+    while let Some(frame) = empty.message().await? {
+        if let Some(v1::server_frame::Frame::Error(error)) = frame.frame {
+            saw_empty |= error.code == gascan_proto::error_code::EMPTY_SESSION_TOKEN;
+        }
+    }
+    assert!(saw_empty);
     Ok(())
 }
 

@@ -26,6 +26,7 @@ struct FakeSnapshot {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct FakeLogRecord {
+    sandbox_id: SandboxId,
     timestamp_millis: i64,
     bytes: Vec<u8>,
 }
@@ -172,10 +173,13 @@ impl FakeRuntime {
 
     pub async fn set_logs(&self, logs: Vec<u8>) {
         let mut state = self.inner.lock().await;
-        state.logs = vec![FakeLogRecord {
-            timestamp_millis: 0,
-            bytes: logs,
-        }];
+        if let Some(id) = state.sandboxes.keys().next().cloned() {
+            state.logs = vec![FakeLogRecord {
+                sandbox_id: id,
+                timestamp_millis: 0,
+                bytes: logs,
+            }];
+        }
         let _ = persist_state(&state, self.persistence.as_deref());
     }
 
@@ -381,6 +385,7 @@ fn interpret_fake_command(
     environment: &std::collections::BTreeMap<String, String>,
     stdin: Vec<u8>,
     configured: (Vec<u8>, Vec<u8>, i32),
+    resize: Option<(u32, u32)>,
 ) -> (Vec<u8>, Vec<u8>, i32) {
     match argv.first().map(String::as_str) {
         Some("fake-echo-stdin") => (stdin, Vec::new(), 0),
@@ -407,6 +412,13 @@ fn interpret_fake_command(
             argv.get(1)
                 .and_then(|name| environment.get(name))
                 .map_or_else(Vec::new, |value| value.as_bytes().to_vec()),
+            Vec::new(),
+            0,
+        ),
+        Some("fake-last-resize") => (
+            resize.map_or_else(Vec::new, |(columns, rows)| {
+                format!("{columns}x{rows}").into_bytes()
+            }),
             Vec::new(),
             0,
         ),
@@ -590,16 +602,22 @@ impl RuntimeBackend for FakeRuntime {
         tokio::spawn(async move {
             let mut stdin = request.stdin;
             let mut signal = 0;
+            let mut resize = None;
             while let Some(frame) = inputs.recv().await {
                 match frame {
                     ExecInput::Stdin(bytes) => stdin.extend(bytes),
-                    ExecInput::Resize { .. } => {}
+                    ExecInput::Resize { columns, rows } => resize = Some((columns, rows)),
                     ExecInput::Signal(number) => signal = number,
                     ExecInput::Close => break,
                 }
             }
-            let (stdout, stderr, code) =
-                interpret_fake_command(&request.argv, &request.environment, stdin, configured);
+            let (stdout, stderr, code) = interpret_fake_command(
+                &request.argv,
+                &request.environment,
+                stdin,
+                configured,
+                resize,
+            );
             {
                 let mut state = runtime.inner.lock().await;
                 let timestamp_millis = std::time::SystemTime::now()
@@ -608,6 +626,7 @@ impl RuntimeBackend for FakeRuntime {
                     .and_then(|duration| i64::try_from(duration.as_millis()).ok())
                     .unwrap_or(i64::MAX);
                 state.logs.push(FakeLogRecord {
+                    sandbox_id: request.id.clone(),
                     timestamp_millis,
                     bytes: [stdout.as_slice(), stderr.as_slice()].concat(),
                 });
@@ -643,7 +662,10 @@ impl RuntimeBackend for FakeRuntime {
         Ok(state
             .logs
             .iter()
-            .filter(|record| since_millis.is_none_or(|since| record.timestamp_millis >= since))
+            .filter(|record| {
+                record.sandbox_id == *id
+                    && since_millis.is_none_or(|since| record.timestamp_millis >= since)
+            })
             .flat_map(|record| record.bytes.iter().copied())
             .collect())
     }

@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 clap.workspace = true
 gascan-proto = { path = "../gascan-proto" }
+gascan-core = { path = "../gascan-core" }
 hyper-util.workspace = true
 prost-types.workspace = true
 rustix = { workspace = true, features = ["termios"] }

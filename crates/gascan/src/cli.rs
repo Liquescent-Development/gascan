@@ -459,14 +459,10 @@ async fn forward_terminal_input(
     }
 }
 
-fn allowed_environment() -> std::collections::HashMap<String, String> {
-    ["TERM", "COLORTERM", "LANG", "LC_ALL", "LC_CTYPE"]
+fn allowed_environment() -> Vec<v1::EnvironmentVariable> {
+    gascan_core::policy::filtered_host_environment(std::env::vars())
         .into_iter()
-        .filter_map(|name| {
-            std::env::var(name)
-                .ok()
-                .map(|value| (name.to_owned(), value))
-        })
+        .map(|(name, value)| v1::EnvironmentVariable { name, value })
         .collect()
 }
 

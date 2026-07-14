@@ -295,7 +295,29 @@ struct SessionRegistry {
 
 impl SessionRegistry {
     fn insert(&mut self, token: Vec<u8>, session: PendingSession) {
+        self.prune();
+        while self.pending.len() >= 1024 {
+            if let Some(oldest) = self.pending.keys().next().cloned() {
+                let _ = self.pending.remove(&oldest);
+                self.remember_expired(oldest);
+            } else {
+                break;
+            }
+        }
         self.pending.insert(token, session);
+    }
+    fn prune(&mut self) {
+        let now = tokio::time::Instant::now();
+        let expired = self
+            .pending
+            .iter()
+            .filter(|(_, session)| session.expires <= now)
+            .map(|(token, _)| token.clone())
+            .collect::<Vec<_>>();
+        for token in expired {
+            let _ = self.pending.remove(&token);
+            self.remember_expired(token);
+        }
     }
     fn claim(&mut self, token: &[u8]) -> Result<PendingSession, &'static str> {
         if let Some(session) = self.pending.remove(token) {
@@ -321,10 +343,21 @@ impl SessionRegistry {
 impl<B: RuntimeBackend> SandboxApi<B> {
     #[must_use]
     pub fn new(service: Arc<SandboxService<B>>, activity: ActivityTracker) -> Self {
+        let sessions = Arc::new(tokio::sync::Mutex::new(SessionRegistry::default()));
+        let weak = Arc::downgrade(&sessions);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let Some(sessions) = weak.upgrade() else {
+                    break;
+                };
+                sessions.lock().await.prune();
+            }
+        });
         Self {
             service,
             activity,
-            sessions: Arc::new(tokio::sync::Mutex::new(SessionRegistry::default())),
+            sessions,
         }
     }
 }
@@ -547,6 +580,30 @@ fn argv_from_wire(argv: Vec<Vec<u8>>) -> Result<Vec<String>, ApiInputError> {
         .collect()
 }
 
+fn validated_environment(
+    environment: Vec<v1::EnvironmentVariable>,
+) -> Result<std::collections::BTreeMap<String, String>, ApiInputError> {
+    let mut seen = std::collections::BTreeSet::new();
+    for variable in &environment {
+        if variable.name.is_empty()
+            || variable.name.chars().any(char::is_control)
+            || variable.value.contains('\0')
+            || !seen.insert(variable.name.clone())
+        {
+            return Err(ApiInputError::Invalid);
+        }
+    }
+    let filtered = gascan_core::policy::filtered_host_environment(
+        environment
+            .into_iter()
+            .map(|variable| (variable.name, variable.value)),
+    );
+    if filtered.len() != seen.len() {
+        return Err(ApiInputError::Invalid);
+    }
+    Ok(filtered)
+}
+
 fn exec_input(frame: v1::ClientFrame) -> Result<gascan_core::runtime::ExecInput, ApiInputError> {
     match frame.frame {
         Some(v1::client_frame::Frame::Stdin(bytes)) => {
@@ -719,7 +776,8 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
                 id,
                 argv: argv_from_wire(command.argv).map_err(ApiInputError::status)?,
                 stdin: command.stdin,
-                environment: command.environment.into_iter().collect(),
+                environment: validated_environment(command.environment)
+                    .map_err(ApiInputError::status)?,
                 tty: command.tty,
                 expires: tokio::time::Instant::now() + Duration::from_secs(30),
             },
@@ -758,7 +816,8 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
                 id,
                 argv,
                 stdin: command.stdin,
-                environment: command.environment.into_iter().collect(),
+                environment: validated_environment(command.environment)
+                    .map_err(ApiInputError::status)?,
                 tty: true,
                 expires: tokio::time::Instant::now() + Duration::from_secs(30),
             },
@@ -917,7 +976,12 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
                             let input_frame = if let v1::ClientFrame { frame: Some(_), .. } = &frame {
                                 match binder.validate_frame(&frame.session_token) {
                                     Ok(()) => exec_input(frame),
-                                    Err(error) => Err(match error { gascan_proto::AttachSessionError::Empty | gascan_proto::AttachSessionError::Mismatch => ApiInputError::Invalid }),
+                                    Err(error) => {
+                                        let code = error.code();
+                                        let _ = session.send(gascan_core::runtime::ExecInput::Close).await;
+                                        let _ = sender.send(Ok(server_error(code, "attach frame rejected"))).await;
+                                        break;
+                                    },
                                 }
                             } else { Err(ApiInputError::Invalid) };
                             match input_frame {
@@ -927,7 +991,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
                                 }
                                 Err(_) => {
                                     let _ = session.send(gascan_core::runtime::ExecInput::Close).await;
-                                    let _ = sender.send(Ok(server_error(error_code::SESSION_TOKEN_MISMATCH, "attach frame rejected"))).await;
+                                    let _ = sender.send(Ok(server_error(error_code::INVALID_REQUEST, "attach frame rejected"))).await;
                                     break;
                                 }
                             }
@@ -992,6 +1056,14 @@ mod tests {
             registry.claim(b"old").err(),
             Some(gascan_proto::error_code::EXPIRED_SESSION_TOKEN)
         );
+        for index in 0..1_100_u32 {
+            registry.insert(
+                index.to_be_bytes().to_vec(),
+                pending(tokio::time::Instant::now() + std::time::Duration::from_secs(1)),
+            );
+        }
+        assert!(registry.pending.len() <= 1_024);
+        assert!(registry.expired.len() <= 1_024);
         assert_eq!(
             registry.claim(b"old").err(),
             Some(gascan_proto::error_code::EXPIRED_SESSION_TOKEN)
