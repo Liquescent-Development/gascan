@@ -25,7 +25,9 @@ container run ... --network none ...
 
 Promotion to `Proven` is forbidden until the controller runs the ignored adversarial test and records that structured attachments are empty and all DNS, direct external IPv4, TEST-NET, and owned host-probe requests fail both before and after guest-root route/interface mutation.
 
-The test first reads exactly one IPv4 gateway from `container network inspect default` at `status.ipv4Gateway`; absence, malformed output, or multiple records fails. A normal owned networked container must then reach the same `https://example.com`, direct `http://1.1.1.1`, and temporary host server through `http://<observed-gateway>:<ephemeral-port>`. The offline container reuses that identical proven URL. This avoids Docker-specific aliases and global `container system dns ... --localhost` mutation while preventing host-wide outages, image tool limitations, or an incorrectly bound host listener from producing a false offline pass.
+The test creates a cryptographically unique `gascan-<128-bit-lowercase-hex>.test` host mapping with the literal command `sudo -n container system dns create --localhost 203.0.113.113 <domain>`. This is a temporary **global host DNS/PF mutation**: Apple documents that creating a localhost domain disables iCloud Private Relay, and its PF redirect is removed on restart. Run the ignored test only on a dedicated controller where non-interactive administrative access and temporary Private Relay disruption are acceptable.
+
+Ownership is fail-closed despite Apple 1.1 listing only domain names: the harness proves the generated domain is absent before creation, rejects collisions, proves exactly one identical domain exists afterward, and re-lists it immediately before an exact-name delete. It never deletes an unfamiliar or ambiguous name. On ordinary and error-path teardown, deletion uses literal argv without a shell; a bounded drop fallback applies the same exact-domain identity check. A normal owned networked container must reach the temporary host server through this domain, and the offline container reuses the identical URL before and after guest-root mutation. Any ownership mismatch is reported and deliberately retained for manual inspection.
 
 ## Controller commands required to resolve BLOCKED
 
@@ -36,4 +38,4 @@ cargo test -p gascan-apple --test live -- --ignored --test-threads=1 offline_wor
 cargo test -p gascan-apple --test live -- --ignored --test-threads=1
 ```
 
-`container image inspect` emits Apple 1.1 JSON by default; copy the immutable digest for the resolved Alpine image into the environment section. Afterward, confirm structured lists contain no current-prefix containers, volumes, or networks. Until all commands pass and evidence is appended, Gate 2 remains **BLOCKED**.
+`container image inspect` emits Apple 1.1 JSON by default; copy the immutable digest for the resolved Alpine image into the environment section. The focused network test requires `sudo -n` permission for the exact `container system dns list/create/delete` commands. Afterward, confirm structured lists contain no current-prefix containers, volumes, networks, or `gascan-*.test` DNS mappings. Until all commands pass and evidence is appended, Gate 2 remains **BLOCKED**.

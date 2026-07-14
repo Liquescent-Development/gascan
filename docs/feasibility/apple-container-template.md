@@ -35,11 +35,11 @@ Record structured empty attachment evidence and the result before and after gues
 - `https://example.com` (DNS plus HTTPS);
 - `http://1.1.1.1` (direct external IPv4, independent of DNS);
 - `http://192.0.2.1` (non-routable adversarial IPv4);
-- the owned host probe reached through the structured default-network `status.ipv4Gateway` address.
+- the owned host probe reached through the unique temporary `gascan-<128-bit-hex>.test` mapping created by `sudo -n container system dns create --localhost 203.0.113.113 <domain>`.
 
 ## Cleanup
 
-List every owned resource prefix/token and confirm structured container, volume, and network lists contain none after cleanup.
+List every owned resource prefix/token and confirm structured container, volume, network, and `gascan-*.test` DNS lists contain none after cleanup. Record that this mapping is a global DNS/PF mutation, requires administrative access, can disable iCloud Private Relay, and has a PF redirect that Apple removes on restart.
 
 ## Decision
 

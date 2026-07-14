@@ -42,8 +42,8 @@ impl HostServer {
         })
     }
 
-    pub fn url_for_host(&self, host: Ipv4Addr) -> String {
-        format!("http://{host}:{}", self.address.port())
+    pub fn port(&self) -> u16 {
+        self.address.port()
     }
 }
 

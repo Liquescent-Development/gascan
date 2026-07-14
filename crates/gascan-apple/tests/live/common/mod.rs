@@ -243,11 +243,6 @@ impl LiveContext {
         Ok(serde_json::from_slice(&output.stdout)?)
     }
 
-    pub async fn inspect_network(&self, name: &str) -> Result<Value, TestError> {
-        let output = self.run_ok(["network", "inspect", name]).await?;
-        Ok(serde_json::from_slice(&output.stdout)?)
-    }
-
     pub async fn logs(&self) -> Result<String, TestError> {
         let name = self.container.lock().unwrap().clone();
         let output = self.run_ok(["logs", &name]).await?;
@@ -748,7 +743,7 @@ fn blocking_owned_volume(name: &str, prefix: &str, owner_token: &str) -> bool {
         .is_some_and(|record| require_owned_volume(&record, name, prefix, owner_token).is_ok())
 }
 
-fn random_owner_token() -> Result<String, TestError> {
+pub fn random_owner_token() -> Result<String, TestError> {
     let mut bytes = [0_u8; 16];
     fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
