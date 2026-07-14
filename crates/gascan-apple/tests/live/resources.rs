@@ -6,7 +6,7 @@ use std::{
 
 use serde_json::json;
 
-use super::common::{LiveContext, TestError, configured_resource, publish_args};
+use super::common::{LiveContext, TestError, configured_resource, guest_argv, publish_args};
 
 #[test]
 fn reads_requested_limits_from_the_exact_apple_configuration_path() {
@@ -28,6 +28,19 @@ fn command_construction_rejects_non_loopback_publish() {
     assert_eq!(
         publish_args(IpAddr::V4(Ipv4Addr::LOCALHOST), 18080, 8080).unwrap(),
         ["--publish", "127.0.0.1:18080:8080"]
+    );
+}
+
+#[test]
+fn published_guest_uses_deterministic_busybox_httpd_argv() {
+    assert_eq!(
+        guest_argv(true),
+        [
+            "docker.io/library/alpine:3.20",
+            "sh",
+            "-c",
+            "mkdir -p /www && printf ok > /www/index.html && exec httpd -f -p 8080 -h /www",
+        ]
     );
 }
 
@@ -77,6 +90,13 @@ async fn published_port_is_reachable_only_through_loopback_binding() -> Result<(
     let ctx = LiveContext::new_published("port", port).await?;
     let mut response = None;
     for _ in 0..50 {
+        if !ctx.is_running().await? {
+            return Err(format!(
+                "published guest exited before readiness; {}",
+                ctx.logs().await?
+            )
+            .into());
+        }
         if let Ok(mut stream) = TcpStream::connect_timeout(
             &(Ipv4Addr::LOCALHOST, port).into(),
             Duration::from_millis(200),
@@ -93,14 +113,14 @@ async fn published_port_is_reachable_only_through_loopback_binding() -> Result<(
                         Ok(0) | Err(_) => break,
                         Ok(length) => {
                             received.extend_from_slice(&bytes[..length]);
-                            if received.ends_with(b"gascan") {
+                            if received.ends_with(b"ok") {
                                 break;
                             }
                         }
                     }
                 }
                 let body = String::from_utf8_lossy(&received).into_owned();
-                if body.contains("200 OK") && body.ends_with("gascan") {
+                if body.contains("200 OK") && body.ends_with("ok") {
                     response = Some(body);
                     break;
                 }

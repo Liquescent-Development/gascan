@@ -111,17 +111,7 @@ impl LiveContext {
         if let Some((host, guest)) = self.publish {
             args.extend(publish_args(IpAddr::V4(Ipv4Addr::LOCALHOST), host, guest)?);
         }
-        args.extend([
-            IMAGE.to_owned(),
-            "sh".to_owned(),
-            "-c".to_owned(),
-            if self.publish.is_some() {
-                "mkdir -p /www; printf gascan > /www/index.html; exec httpd -f -p 8080 -h /www"
-                    .to_owned()
-            } else {
-                "while :; do sleep 3600; done".to_owned()
-            },
-        ]);
+        args.extend(guest_argv(self.publish.is_some()));
         self.run_vec(args).await?;
         Ok(())
     }
@@ -174,6 +164,16 @@ impl LiveContext {
         let name = self.container.lock().unwrap().clone();
         let output = self.run_ok(["inspect", &name]).await?;
         Ok(serde_json::from_slice(&output.stdout)?)
+    }
+
+    pub async fn logs(&self) -> Result<String, TestError> {
+        let name = self.container.lock().unwrap().clone();
+        let output = self.run_ok(["logs", &name]).await?;
+        Ok(format!(
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))
     }
 
     pub async fn stop(&self) -> Result<(), TestError> {
@@ -307,6 +307,20 @@ pub fn configured_resource(value: &Value, name: &str) -> Option<u64> {
         .get("resources")?
         .get(name)?
         .as_u64()
+}
+
+pub fn guest_argv(published: bool) -> Vec<String> {
+    let script = if published {
+        "mkdir -p /www && printf ok > /www/index.html && exec httpd -f -p 8080 -h /www"
+    } else {
+        "while :; do sleep 3600; done"
+    };
+    vec![
+        IMAGE.to_owned(),
+        "sh".to_owned(),
+        "-c".to_owned(),
+        script.to_owned(),
+    ]
 }
 
 fn cleanup_command<const N: usize>(args: [&str; N]) {
