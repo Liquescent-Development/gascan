@@ -18,51 +18,128 @@ struct HostDnsMapping {
     drop_cleanup: bool,
 }
 
+impl std::fmt::Debug for HostDnsMapping {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HostDnsMapping")
+            .field("domain", &self.domain)
+            .field("pending", &self.pending)
+            .finish_non_exhaustive()
+    }
+}
+
+struct HostDnsCreateFailure {
+    mapping: Option<HostDnsMapping>,
+    error: TestError,
+}
+
+impl std::fmt::Debug for HostDnsCreateFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HostDnsCreateFailure")
+            .field(
+                "domain",
+                &self.mapping.as_ref().map(|mapping| &mapping.domain),
+            )
+            .field("error", &self.error.to_string())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for HostDnsCreateFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for HostDnsCreateFailure {}
+
 impl HostDnsMapping {
     async fn create() -> Result<Self, TestError> {
-        Self::create_with(Arc::new(ProcessRunner), random_owner_token()?).await
+        Self::create_with(Arc::new(ProcessRunner), random_owner_token()?)
+            .await
+            .map_err(|error| Box::new(error) as TestError)
     }
 
-    async fn create_with(runner: Arc<dyn CommandRunner>, token: String) -> Result<Self, TestError> {
+    async fn create_with(
+        runner: Arc<dyn CommandRunner>,
+        token: String,
+    ) -> Result<Self, HostDnsCreateFailure> {
+        Self::create_with_timeout(runner, token, Duration::from_secs(30)).await
+    }
+
+    async fn create_with_timeout(
+        runner: Arc<dyn CommandRunner>,
+        token: String,
+        create_timeout: Duration,
+    ) -> Result<Self, HostDnsCreateFailure> {
         let domain = format!("gascan-{token}.test");
         if !owned_domain(&domain) {
-            return Err("temporary DNS owner token is not 128-bit lowercase hexadecimal".into());
+            return Err(HostDnsCreateFailure {
+                mapping: None,
+                error: "temporary DNS owner token is not 128-bit lowercase hexadecimal".into(),
+            });
         }
-        if list_domains(runner.as_ref())
-            .await?
-            .iter()
-            .any(|item| item == &domain)
-        {
-            return Err(format!("temporary DNS domain already exists: {domain}").into());
+        let existing =
+            list_domains(runner.as_ref())
+                .await
+                .map_err(|error| HostDnsCreateFailure {
+                    mapping: None,
+                    error,
+                })?;
+        if existing.iter().any(|item| item == &domain) {
+            return Err(HostDnsCreateFailure {
+                mapping: None,
+                error: format!("temporary DNS domain already exists: {domain}").into(),
+            });
         }
-        run_dns(
-            runner.as_ref(),
-            ["create", "--localhost", "203.0.113.113", &domain],
-        )
-        .await?;
-        let mapping = Self {
+        let mut mapping = Self {
             runner,
             domain,
             pending: true,
             drop_cleanup: true,
         };
-        if !mapping.is_exactly_present().await? {
-            return Err(format!(
-                "created DNS domain is absent or ambiguous: {}",
-                mapping.domain
-            )
-            .into());
+        let create_result = run_dns_with_timeout(
+            mapping.runner.as_ref(),
+            ["create", "--localhost", "203.0.113.113", &mapping.domain],
+            create_timeout,
+        )
+        .await;
+        let reconcile_result = list_domains(mapping.runner.as_ref()).await;
+        let exactly_present = reconcile_result.as_ref().is_ok_and(|domains| {
+            domains
+                .iter()
+                .filter(|item| *item == &mapping.domain)
+                .count()
+                == 1
+        });
+        if reconcile_result
+            .as_ref()
+            .is_ok_and(|domains| !domains.iter().any(|item| item == &mapping.domain))
+        {
+            mapping.pending = false;
         }
-        Ok(mapping)
+        match (create_result, reconcile_result, exactly_present) {
+            (Ok(_), Ok(_), true) => Ok(mapping),
+            (create, reconcile, _) => {
+                let detail = match (create, reconcile) {
+                    (Err(create), Err(reconcile)) => {
+                        format!("create failed: {create}; reconciliation failed: {reconcile}")
+                    }
+                    (Err(create), Ok(_)) => format!("create failed: {create}"),
+                    (Ok(_), Err(reconcile)) => format!("reconciliation failed: {reconcile}"),
+                    (Ok(_), Ok(_)) => "created DNS domain is absent or ambiguous".to_owned(),
+                };
+                Err(HostDnsCreateFailure {
+                    error: format!("{detail}: {}", mapping.domain).into(),
+                    mapping: Some(mapping),
+                })
+            }
+        }
     }
 
     fn url(&self, port: u16) -> String {
         format!("http://{}:{port}", self.domain)
-    }
-
-    async fn is_exactly_present(&self) -> Result<bool, TestError> {
-        let domains = list_domains(self.runner.as_ref()).await?;
-        Ok(domains.iter().filter(|item| *item == &self.domain).count() == 1)
     }
 
     async fn cleanup(&mut self) -> Result<(), TestError> {
@@ -79,6 +156,10 @@ impl HostDnsMapping {
             return Err(format!("DNS ownership mismatch: {}", self.domain).into());
         }
         run_dns(self.runner.as_ref(), ["delete", &self.domain]).await?;
+        let domains = list_domains(self.runner.as_ref()).await?;
+        if domains.iter().any(|item| item == &self.domain) {
+            return Err(format!("deleted DNS domain remains present: {}", self.domain).into());
+        }
         self.pending = false;
         Ok(())
     }
@@ -124,9 +205,17 @@ async fn run_dns<const N: usize>(
     runner: &dyn CommandRunner,
     args: [&str; N],
 ) -> Result<CommandOutput, TestError> {
+    run_dns_with_timeout(runner, args, Duration::from_secs(30)).await
+}
+
+async fn run_dns_with_timeout<const N: usize>(
+    runner: &dyn CommandRunner,
+    args: [&str; N],
+    timeout: Duration,
+) -> Result<CommandOutput, TestError> {
     let mut full = vec!["system", "dns"];
     full.extend(args);
-    run_sudo_container(runner, full).await
+    run_sudo_container_with_timeout(runner, full, timeout).await
 }
 
 async fn run_sudo_container<I, A>(
@@ -137,14 +226,25 @@ where
     I: IntoIterator<Item = A>,
     A: Into<String>,
 {
+    run_sudo_container_with_timeout(runner, args, Duration::from_secs(30)).await
+}
+
+async fn run_sudo_container_with_timeout<I, A>(
+    runner: &dyn CommandRunner,
+    args: I,
+    timeout: Duration,
+) -> Result<CommandOutput, TestError>
+where
+    I: IntoIterator<Item = A>,
+    A: Into<String>,
+{
     let mut argv = vec!["-n".to_owned(), "container".to_owned()];
     argv.extend(args.into_iter().map(Into::into));
-    Ok(tokio::time::timeout(
-        Duration::from_secs(30),
-        runner.run(CommandSpec::new("sudo", argv)),
+    Ok(
+        tokio::time::timeout(timeout, runner.run(CommandSpec::new("sudo", argv)))
+            .await
+            .map_err(|_| "host DNS command exceeded 30-second timeout")??,
     )
-    .await
-    .map_err(|_| "host DNS command exceeded 30-second timeout")??)
 }
 
 fn blocking_sudo_container<const N: usize>(args: [&str; N]) -> Option<Vec<u8>> {
@@ -215,6 +315,13 @@ fn network_targets(host_url: String) -> [NetworkTarget; 4] {
     ]
 }
 
+fn guest_mutation_command() -> &'static str {
+    "ip link add gascan0 type dummy 2>&1; printf 'link-add-exit=%s\\n' $?; \
+     ip route add default via 192.0.2.1 2>&1; printf 'route-add-exit=%s\\n' $?; \
+     printf '%s\\n' 'post-mutation-ip-link:'; ip link show; \
+     printf '%s\\n' 'post-mutation-ip-route:'; ip route show"
+}
+
 #[test]
 fn exact_none_form_has_empty_structured_attachments() {
     let value = serde_json::json!([{"configuration":{"networks":[]}}]);
@@ -265,7 +372,11 @@ async fn offline_workspace_cannot_reach_external_or_host_networks() -> Result<()
     }
     ctx.exec("test -d /workspace && ip link show lo >/dev/null")
         .await?;
-    ctx.exec("ip link add gascan0 type dummy 2>/dev/null || true; ip route add default via 192.0.2.1 2>/dev/null || true").await?;
+    let mutation_state = ctx.exec(guest_mutation_command()).await?;
+    eprintln!(
+        "guest-root network mutation evidence:\n{}",
+        String::from_utf8_lossy(&mutation_state.stdout)
+    );
     assert!(has_no_network_attachments(&ctx.inspect().await?));
     for target in &targets {
         assert!(
@@ -281,7 +392,13 @@ async fn offline_workspace_cannot_reach_external_or_host_networks() -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, sync::Mutex};
+    use std::{
+        collections::VecDeque,
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use async_trait::async_trait;
     use gascan_core::runtime::RuntimeError;
@@ -309,9 +426,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn guest_mutation_command_reports_attempt_results_and_final_network_state() {
+        let command = guest_mutation_command();
+        assert!(command.contains("link-add-exit=%s"));
+        assert!(command.contains("route-add-exit=%s"));
+        assert!(command.contains("ip link show"));
+        assert!(command.contains("ip route show"));
+        assert!(!command.contains("|| true"));
+    }
+
     struct ScriptedRunner {
         responses: Mutex<VecDeque<Result<CommandOutput, RuntimeError>>>,
         specs: Mutex<Vec<CommandSpec>>,
+    }
+
+    struct TimeoutThenAmbiguousRunner {
+        calls: AtomicUsize,
+        domain: String,
+    }
+
+    #[async_trait]
+    impl CommandRunner for TimeoutThenAmbiguousRunner {
+        async fn run(&self, _spec: CommandSpec) -> Result<CommandOutput, RuntimeError> {
+            match self.calls.fetch_add(1, Ordering::SeqCst) {
+                0 => output(serde_json::json!([])),
+                1 => std::future::pending().await,
+                2 => output(serde_json::json!([
+                    self.domain.clone(),
+                    self.domain.clone()
+                ])),
+                _ => panic!("unexpected DNS command"),
+            }
+        }
     }
 
     #[async_trait]
@@ -338,6 +485,14 @@ mod tests {
         Arc::new(ScriptedRunner {
             responses: Mutex::new(responses.into()),
             specs: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn command_error() -> Result<CommandOutput, RuntimeError> {
+        Err(RuntimeError::CommandFailed {
+            operation: "sudo".into(),
+            exit_code: Some(1),
+            stderr: "reported failure after mutation".into(),
         })
     }
 
@@ -375,6 +530,7 @@ mod tests {
             output(serde_json::json!([domain.clone()])),
             output(serde_json::json!([domain.clone()])),
             output(serde_json::json!(null)),
+            output(serde_json::json!([])),
         ]);
         let mut mapping = HostDnsMapping::create_with(runner.clone(), token.into())
             .await
@@ -405,6 +561,74 @@ mod tests {
                 ["-n", "container", "system", "dns", "delete", &domain]
             )
         );
+    }
+
+    #[tokio::test]
+    async fn create_error_after_side_effect_retains_pending_guard() {
+        let token = "00112233445566778899aabbccddeeff";
+        let domain = format!("gascan-{token}.test");
+        let runner = runner(vec![
+            output(serde_json::json!([])),
+            command_error(),
+            output(serde_json::json!([domain.clone()])),
+            output(serde_json::json!([domain])),
+            output(serde_json::json!(null)),
+            output(serde_json::json!([])),
+        ]);
+        let mut failure = HostDnsMapping::create_with(runner, token.into())
+            .await
+            .unwrap_err();
+        let mapping = failure
+            .mapping
+            .as_mut()
+            .expect("side effect must retain guard");
+        assert!(mapping.pending);
+        mapping.drop_cleanup = false;
+        mapping.cleanup().await.unwrap();
+        assert!(!mapping.pending);
+    }
+
+    #[tokio::test]
+    async fn create_timeout_with_ambiguous_state_retains_pending_guard() {
+        let token = "00112233445566778899aabbccddeeff";
+        let runner = Arc::new(TimeoutThenAmbiguousRunner {
+            calls: AtomicUsize::new(0),
+            domain: format!("gascan-{token}.test"),
+        });
+        let mut failure = HostDnsMapping::create_with_timeout(
+            runner.clone(),
+            token.into(),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        let mapping = failure
+            .mapping
+            .as_mut()
+            .expect("ambiguous timeout must retain guard");
+        assert!(mapping.pending);
+        mapping.drop_cleanup = false;
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn delete_success_without_structured_removal_retains_pending_guard() {
+        let token = "00112233445566778899aabbccddeeff";
+        let domain = format!("gascan-{token}.test");
+        let runner = runner(vec![
+            output(serde_json::json!([])),
+            output(serde_json::json!(null)),
+            output(serde_json::json!([domain.clone()])),
+            output(serde_json::json!([domain.clone()])),
+            output(serde_json::json!(null)),
+            output(serde_json::json!([domain])),
+        ]);
+        let mut mapping = HostDnsMapping::create_with(runner, token.into())
+            .await
+            .unwrap();
+        mapping.drop_cleanup = false;
+        assert!(mapping.cleanup().await.is_err());
+        assert!(mapping.pending);
     }
 
     #[tokio::test]
