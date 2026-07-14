@@ -46,8 +46,8 @@ private actor ReceivedBytes {
     let pipe = Pipe()
     let received = ReceivedBytes()
     let reader = pipe.fileHandleForReading
-    let task = Task {
-        for try await byte in reader.bytes {
+    let relay = OutputRelay(handle: reader) { data in
+        for byte in data {
             await received.append(byte)
         }
     }
@@ -58,13 +58,38 @@ private actor ReceivedBytes {
     }
     let before = ContinuousClock.now
     await drainAfterWait(
-        tasks: [task],
-        handles: [reader],
+        relays: [relay],
         timeout: .milliseconds(50)
     )
     let elapsed = before.duration(to: .now)
 
     #expect(await received.bytes == [0, 255])
     #expect(elapsed < .seconds(1))
+    try? pipe.fileHandleForWriting.close()
+}
+
+private actor CompletionFlag {
+    private(set) var value = false
+
+    func set() {
+        value = true
+    }
+}
+
+@Test func structuredDrainReturnsWhenReaderIgnoresCancellation() async throws {
+    let pipe = Pipe()
+    let completed = CompletionFlag()
+    let relay = OutputRelay(handle: pipe.fileHandleForReading) { _ in
+    }
+
+    let drainTask = Task {
+        await drainAfterWait(relays: [relay], timeout: .milliseconds(50))
+        await completed.set()
+    }
+    try await Task.sleep(for: .milliseconds(150))
+    let returnedWithinBound = await completed.value
+
+    await drainTask.value
+    #expect(returnedWithinBound)
     try? pipe.fileHandleForWriting.close()
 }

@@ -10,14 +10,13 @@ func diagnostic(_ message: String) {
 
 @discardableResult
 func drainAfterWait(
-    tasks: [Task<Void, any Error>],
-    handles: [FileHandle],
+    relays: [OutputRelay],
     timeout: Duration
 ) async -> Bool {
     await withTaskGroup(of: Bool.self, returning: Bool.self) { group in
         group.addTask {
-            for task in tasks {
-                _ = try? await task.value
+            for relay in relays {
+                _ = try? await relay.task.value
             }
             return true
         }
@@ -28,11 +27,73 @@ func drainAfterWait(
 
         let drained = await group.next() ?? false
         if !drained {
-            tasks.forEach { $0.cancel() }
-            handles.forEach { try? $0.close() }
+            relays.forEach { $0.cancel() }
         }
         group.cancelAll()
         return drained
+    }
+}
+
+final class RelaySource: @unchecked Sendable {
+    private let handle: FileHandle
+    private let continuation: AsyncStream<Data>.Continuation
+
+    init(handle: FileHandle, continuation: AsyncStream<Data>.Continuation) {
+        self.handle = handle
+        self.continuation = continuation
+    }
+
+    func arm() {
+        handle.readabilityHandler = { [weak self] readable in
+            guard let self else {
+                return
+            }
+            readable.readabilityHandler = nil
+            let data = readable.availableData
+            if data.isEmpty {
+                continuation.finish()
+            } else {
+                continuation.yield(data)
+            }
+        }
+    }
+
+    func stop() {
+        handle.readabilityHandler = nil
+        continuation.finish()
+        try? handle.close()
+    }
+}
+
+struct OutputRelay: Sendable {
+    let task: Task<Void, any Error>
+
+    init(
+        handle: FileHandle,
+        consume: @escaping @Sendable (Data) async throws -> Void
+    ) {
+        let (stream, continuation) = AsyncStream<Data>.makeStream(
+            bufferingPolicy: .bufferingOldest(1)
+        )
+        let source = RelaySource(handle: handle, continuation: continuation)
+        continuation.onTermination = { _ in
+            source.stop()
+        }
+        source.arm()
+        task = Task {
+            defer {
+                source.stop()
+            }
+            for await data in stream {
+                try Task.checkCancellation()
+                try await consume(data)
+                source.arm()
+            }
+        }
+    }
+
+    func cancel() {
+        task.cancel()
     }
 }
 
@@ -111,22 +172,12 @@ struct GasCanAppleAttach {
         try outputPipe.fileHandleForWriting.close()
         try errorPipe?.fileHandleForWriting.close()
 
-        let stdoutTask = Task {
-            try await forward(
-                outputPipe.fileHandleForReading,
-                frame: OutputFrame.stdout,
-                name: "stdout",
-                emitter: emitter
-            )
+        let stdoutRelay = OutputRelay(handle: outputPipe.fileHandleForReading) { data in
+            try await emitter.emit(.stdout(data))
         }
-        let stderrTask = Task {
-            if let errorPipe {
-                try await forward(
-                    errorPipe.fileHandleForReading,
-                    frame: OutputFrame.stderr,
-                    name: "stderr",
-                    emitter: emitter
-                )
+        let stderrRelay = errorPipe.map { pipe in
+            OutputRelay(handle: pipe.fileHandleForReading) { data in
+                try await emitter.emit(.stderr(data))
             }
         }
         let inputTask = Task {
@@ -141,13 +192,12 @@ struct GasCanAppleAttach {
         diagnostic("guest wait returned \(code); draining output")
         inputTask.cancel()
         try? inputPipe.fileHandleForWriting.close()
-        var drainHandles = [outputPipe.fileHandleForReading]
-        if let errorPipe {
-            drainHandles.append(errorPipe.fileHandleForReading)
+        var relays = [stdoutRelay]
+        if let stderrRelay {
+            relays.append(stderrRelay)
         }
         let drained = await drainAfterWait(
-            tasks: [stdoutTask, stderrTask],
-            handles: drainHandles,
+            relays: relays,
             timeout: .seconds(3)
         )
         if !drained {
@@ -184,18 +234,6 @@ struct GasCanAppleAttach {
         try? input.close()
     }
 
-    private static func forward(
-        _ input: FileHandle,
-        frame: @escaping @Sendable (Data) -> OutputFrame,
-        name: String,
-        emitter: FrameEmitter
-    ) async throws {
-        for try await byte in input.bytes {
-            try Task.checkCancellation()
-            try await emitter.emit(frame(Data([byte])))
-        }
-        diagnostic("\(name) reached EOF")
-    }
 }
 
 await GasCanAppleAttach.runMain()
