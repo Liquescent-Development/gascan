@@ -39,7 +39,7 @@ fn published_guest_uses_deterministic_busybox_httpd_argv() {
             "docker.io/library/alpine:3.20",
             "sh",
             "-c",
-            "mkdir -p /www && printf ok > /www/index.html && exec httpd -f -p 8080 -h /www",
+            "mkdir -p /www && printf ok > /www/index.html && exec busybox httpd -f -p 8080 -h /www",
         ]
     );
 }
