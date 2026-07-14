@@ -101,4 +101,4 @@ all exited 0
 
 ## Commit
 
-Commit SHA: recorded after commit in the handoff response.
+Commit SHA: `bc6deaa` (the final amended commit SHA is included in the handoff response).
