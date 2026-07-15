@@ -55,7 +55,7 @@ the polyglot toolchain.
 | Phase 1 Apple feasibility / Gate 2 | Passed and integrated | `6bedef8`, `docs/feasibility/apple-container-report.md` |
 | Phase 1 core control plane / Gate 3 | Passed and integrated | `7c7d083`, integration record `917dac1` |
 | Phase 2 Apple backend implementation | Implemented and reviewed on feature branch; not integrated | head `dbf4235` |
-| Phase 2 workspace image | Connected MVP Tasks 1–5 are approved; the real connected image gate and Gate 4 handoff remain | approved through `61fd8d9`; no real private image build yet |
+| Phase 2 workspace image | Connected MVP Tasks 1–5 and the Task 6 platform-neutral harness are approved; the credentialed live image gate remains | harness through `30dd514`; no approved image or live private build yet |
 | Gate 4 real lifecycle | Pending; harness approved but no complete real lifecycle evidence | harness `dbf4235` |
 | Phase 3 security, packaging, release | Not started as an integrated phase | blocked by Gate 4 |
 | Gate 5 clean-host release | Pending | no evidence |
@@ -122,6 +122,10 @@ The harness is approved; Gate 4 itself is not passed.
 - `61fd8d9`: approved connected build orchestrator, descriptor-safe wrapper,
   bounded credential-blind snapshot lifecycle, structured inspection, and
   committed receipt-pair validation. No real private image build was run.
+- `30dd514`: independently approved platform-neutral connected image gate
+  harness with transactional publication, bounded ownership-checked cleanup,
+  real-smoke fake-controller coverage, and authoritative residue inventory.
+  This is not a live image PASS.
 
 These offline commits are reviewed assets, not completed publication or live
 image evidence. `images/workspace/versions.lock` still says
@@ -146,10 +150,11 @@ Do not encode the operator DNS IP into Gas Can product policy.
 
 ## Current Unfinished Work
 
-1. Execute Task 6's platform-neutral gate harness and independent review, then
-   run the real connected image gate only with an authorized external private
-   Gascamp token. Tasks 1–5 are complete and must not be redispatched;
-   `3517415` is superseded by the approved Task 5 range through `61fd8d9`.
+1. Provide an authorized absolute `GASCAMP_READ_TOKEN_FILE` outside the
+   repository, owned by the current UID, regular and non-symlink, mode `0600`.
+   Then run Task 6's real connected image gate and independently inspect its
+   evidence, image history, and exported filesystem. The platform-neutral
+   harness is approved through `30dd514`; Task 6 itself remains incomplete.
 2. Convert the image path from mandatory offline bundles to connected locked
    acquisition while preserving all reviewed image contracts.
 3. Select and prove the private Gascamp credential boundary.
