@@ -159,7 +159,8 @@ cleanup() {
       if container_owned; then
         run_bounded "$operation_timeout" container delete "$container_name" >/dev/null 2>&1 || status=1
       else
-        status=1
+        ownership_status=$?
+        test "$ownership_status" = 2 || status=1
       fi
     else
       ownership_status=$?

@@ -282,6 +282,85 @@ esac
     assert!(fixture.path().join("deleted").exists(), "owned container survived failed create attempt");
 }
 
+fn assert_created_then_blocked_signal_cleanup(mode: &str, signal: &str) {
+    let fixture = tempfile::tempdir_in("/tmp").unwrap();
+    let bin = fixture.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let fake = bin.join("container");
+    fs::write(&fake, r#"#!/bin/sh
+set -eu
+owned_image() { printf '[{"id":"sha256:blocked","configuration":{"name":"%s"},"variants":[{"config":{"config":{"Labels":{"com.gascan.build-secret-probe":"%s"}}}}]}]' "$(cat "$TAG")" "$(cat "$MARKER")"; }
+owned_container() { printf '[{"id":"%s","configuration":{"id":"%s","labels":{"com.gascan.build-secret-probe":"%s"}}}]' "$(cat "$NAME")" "$(cat "$NAME")" "$(cat "$MARKER")"; }
+record_build() {
+  previous=""; for argument in "$@"; do
+    case "$previous" in --label) printf '%s' "${argument#*=}" >"$MARKER" ;; --tag) printf '%s' "$argument" >"$TAG" ;; esac
+    previous="$argument"
+  done
+  touch "$IMAGE_EXISTS"
+}
+block() { printf '%s' "$$" >"$CHILD_PID"; trap 'exit 143' TERM INT; while :; do sleep 1; done; }
+case "$1 $2" in
+  "build --secret") record_build "$@"; test "$MODE" != build || block ;;
+  "image inspect") test "${3:-}" = --help && exit 0; test -f "$IMAGE_EXISTS" || { echo 'image not found' >&2; exit 1; }; owned_image ;;
+  "image delete") rm -f "$IMAGE_EXISTS"; touch "$IMAGE_DELETED" ;;
+  "create --name") printf '%s' "$3" >"$NAME"; touch "$CONTAINER_EXISTS"; test "$MODE" != create || block ;;
+  "inspect "*) test -f "$CONTAINER_EXISTS" || { echo 'container not found' >&2; exit 1; }; owned_container ;;
+  "stop "*) : ;;
+  "delete "*) rm -f "$CONTAINER_EXISTS"; touch "$CONTAINER_DELETED" ;;
+esac
+"#).unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let secret = fixture.path().join("secret");
+    fs::write(&secret, format!("{SECRET}\n")).unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+    let child_pid = fixture.path().join("child-pid");
+    let mut probe = Command::new("bash")
+        .arg(repository_root().join("scripts/probe-apple-build-secret.sh"))
+        .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()))
+        .env("TMPDIR", fixture.path())
+        .env("GASCAN_TEST_SECRET_FILE", &secret)
+        .env("GASCAN_PROBE_TIMEOUT_SECONDS", "10")
+        .env("MODE", mode)
+        .env("CHILD_PID", &child_pid)
+        .env("MARKER", fixture.path().join("marker"))
+        .env("TAG", fixture.path().join("tag"))
+        .env("NAME", fixture.path().join("name"))
+        .env("IMAGE_EXISTS", fixture.path().join("image-exists"))
+        .env("CONTAINER_EXISTS", fixture.path().join("container-exists"))
+        .env("IMAGE_DELETED", fixture.path().join("image-deleted"))
+        .env("CONTAINER_DELETED", fixture.path().join("container-deleted"))
+        .spawn().unwrap();
+    for _ in 0..100 { if child_pid.exists() { break; } thread::sleep(Duration::from_millis(10)); }
+    assert!(child_pid.exists(), "{mode} fake did not block");
+    let fake_pid = fs::read_to_string(&child_pid).unwrap();
+    let started = Instant::now();
+    assert!(Command::new("kill").args([signal, &probe.id().to_string()]).status().unwrap().success());
+    let status = probe.wait().unwrap();
+    assert!(!status.success(), "{mode} {signal} returned success");
+    assert!(started.elapsed() < Duration::from_secs(4), "{mode} signal cleanup/watchdog was not bounded");
+    assert!(!Command::new("kill").args(["-0", fake_pid.trim()]).status().unwrap().success(), "{mode} child survived");
+    assert!(fixture.path().join("image-deleted").exists(), "owned image survived {mode} signal");
+    assert!(!fixture.path().join("image-exists").exists(), "image state survived cleanup");
+    if mode == "create" {
+        assert!(fixture.path().join("container-deleted").exists(), "owned container survived create signal");
+        assert!(!fixture.path().join("container-exists").exists(), "container state survived cleanup");
+    }
+    let image_delete_time = fs::metadata(fixture.path().join("image-deleted")).unwrap().modified().unwrap();
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(fs::metadata(fixture.path().join("image-deleted")).unwrap().modified().unwrap(), image_delete_time, "post-cleanup mutation occurred");
+    assert!(fs::read_dir(fixture.path()).unwrap().all(|entry| !entry.unwrap().file_name().to_string_lossy().starts_with("gascan-build-secret-probe.")), "private context survived");
+}
+
+#[test]
+fn build_created_then_blocked_term_cleans_owned_resource() {
+    assert_created_then_blocked_signal_cleanup("build", "-TERM");
+}
+
+#[test]
+fn create_created_then_blocked_int_cleans_owned_resources() {
+    assert_created_then_blocked_signal_cleanup("create", "-INT");
+}
+
 #[test]
 fn fake_container_proves_secret_stays_out_of_observable_channels() {
     let fixture = tempfile::tempdir_in("/tmp").unwrap();
@@ -332,7 +411,14 @@ case "$1" in
       previous="$argument"
     done
     ;;
-  inspect) printf '[{"id":"%s","configuration":{"id":"%s","labels":{"com.gascan.build-secret-probe":"%s"}}}]' "$(cat "$CONTAINER_NAME_PATH")" "$(cat "$CONTAINER_NAME_PATH")" "$(cat "$MARKER_PATH")" ;;
+  inspect)
+    test ! -f "$CONTAINER_REMOVED" || { printf '%s\n' 'container not found' >&2; exit 1; }
+    printf '[{"id":"%s","configuration":{"id":"%s","labels":{"com.gascan.build-secret-probe":"%s"}}}]' "$(cat "$CONTAINER_NAME_PATH")" "$(cat "$CONTAINER_NAME_PATH")" "$(cat "$MARKER_PATH")"
+    ;;
+  stop)
+    count=0; test ! -f "$STOP_COUNT" || count=$(cat "$STOP_COUNT"); count=$((count + 1)); printf '%s' "$count" >"$STOP_COUNT"
+    test "$count" -lt 2 || touch "$CONTAINER_REMOVED"
+    ;;
   export)
     test "$3" = --output
     printf '%s\n' synthetic-export-without-token >"$4"
@@ -358,6 +444,8 @@ esac
         .env("MARKER_PATH", &marker_path)
         .env("TAG_PATH", &tag_path)
         .env("CONTAINER_NAME_PATH", &container_name_path)
+        .env("STOP_COUNT", fixture.path().join("stop-count"))
+        .env("CONTAINER_REMOVED", fixture.path().join("container-removed"))
         .env("TMPDIR", format!("{}/", fixture.path().display()))
         .output()
         .unwrap();
@@ -373,7 +461,7 @@ esac
     }
     let calls = fs::read_to_string(calls).unwrap();
     assert!(calls.contains("build --secret id=gascamp_read_token,src="));
-    assert!(calls.contains("delete gascan-build-secret-probe-"));
+    assert!(calls.contains("stop gascan-build-secret-probe-"));
     assert!(calls.contains("image delete"));
     let staged = fs::read_to_string(staged_path).unwrap();
     let staged = Path::new(staged.trim());
