@@ -1,0 +1,26 @@
+[
+  {
+    "configuration": {
+      "id": "code-a1b2c3d4e5f6",
+      "labels": {
+        "dev.gascan.managed-by": "gascan",
+        "dev.gascan.sandbox-id": "code-a1b2c3d4e5f6"
+      }
+    },
+    "status": { "state": "running" }
+  },
+  {
+    "configuration": { "id": "foreign-111111111111", "labels": {} },
+    "status": { "state": "stopped" }
+  },
+  {
+    "configuration": {
+      "id": "collision-222222222222",
+      "labels": {
+        "dev.gascan.managed-by": "gascan",
+        "dev.gascan.sandbox-id": "other-333333333333"
+      }
+    },
+    "status": { "state": "stopped" }
+  }
+]
