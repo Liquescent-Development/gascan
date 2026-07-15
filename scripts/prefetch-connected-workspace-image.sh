@@ -37,7 +37,7 @@ chmod 0444 "$expected_temp"
 mv -f "$expected_temp" "$artifacts/expected-tool-versions.json"
 trap - EXIT
 
-container image pull "$base_image" >/dev/null
+container image pull --platform linux/arm64 "$base_image" >/dev/null
 inspect=$(container image inspect --format json "$base_image")
 inspected=$(printf '%s' "$inspect" | run_tool validate-image-inspect)
 test "$inspected" = "${base_image#ubuntu@}" || die "local base inspect differs from locked digest"

@@ -5,7 +5,10 @@ use std::{
     process::{Command, Output},
 };
 
+use gascan_image_tools::{ReviewedInputKind, reviewed_input_kind_allowed};
 use tempfile::TempDir;
+
+const REVIEWED_GASCAMP_REVISION: &str = "f6b248c5926240856dbea83d1d2c5c90ea1c1456";
 
 const REQUIRED: [&str; 9] = [
     "Dockerfile",
@@ -83,7 +86,7 @@ impl Fixture {
 
 fn connected_lock(mode: &str) -> String {
     format!(
-        "base_image = \"ubuntu@sha256:{}\"\nworkspace_build_mode = \"{mode}\"\n[mise]\nurl = \"https://example.invalid/mise\"\nsha256 = \"{}\"\n[playwright_chromium]\nurl = \"https://example.invalid/chromium\"\nsha256 = \"{}\"\n[workspace_bundles]\nmedia_type = \"application/vnd.gascan.workspace-bundle.v1+tar.zstd\"\nplatform = \"linux/arm64\"\npublication = \"pending\"\n",
+        "base_image = \"ubuntu@sha256:{}\"\nworkspace_build_mode = \"{mode}\"\n[mise]\nurl = \"https://example.invalid/mise\"\nsha256 = \"{}\"\n[playwright_chromium]\nurl = \"https://example.invalid/chromium\"\nsha256 = \"{}\"\n[gascamp]\nrevision = \"{REVIEWED_GASCAMP_REVISION}\"\n[workspace_bundles]\nmedia_type = \"application/vnd.gascan.workspace-bundle.v1+tar.zstd\"\nplatform = \"linux/arm64\"\npublication = \"pending\"\n",
         "a".repeat(64),
         "b".repeat(64),
         "c".repeat(64)
@@ -193,9 +196,10 @@ fn unsafe_allowlisted_inputs_fail_before_publication() {
 }
 
 #[test]
-fn connected_boundary_explicitly_rejects_sockets_and_other_special_files() {
-    let source = include_str!("../src/bin/prepare-workspace-context.rs");
-    assert!(source.contains("symlink or special file"));
+fn connected_boundary_rejects_socket_like_and_other_special_file_kinds() {
+    assert!(reviewed_input_kind_allowed(ReviewedInputKind::Directory));
+    assert!(reviewed_input_kind_allowed(ReviewedInputKind::RegularFile));
+    assert!(!reviewed_input_kind_allowed(ReviewedInputKind::Other));
 }
 
 #[test]
@@ -206,6 +210,22 @@ fn connected_mode_and_lock_must_match_exactly() {
         assert!(!fixture.run().status.success());
         assert!(!fixture.context.exists());
     }
+}
+
+#[test]
+fn connected_gascamp_revision_must_match_the_reviewed_revision() {
+    let exact = Fixture::new();
+    assert!(exact.run().status.success());
+
+    let changed = Fixture::new();
+    let lock = fs::read_to_string(&changed.lock).unwrap().replace(
+        REVIEWED_GASCAMP_REVISION,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    fs::write(&changed.lock, lock).unwrap();
+    let output = changed.run();
+    assert!(!output.status.success());
+    assert!(!changed.context.exists());
 }
 
 #[test]
@@ -241,4 +261,93 @@ fn connected_prefetch_uses_the_reviewed_public_acquisition_boundary() {
     }
     assert!(!script.contains("GASCAMP_READ_TOKEN_FILE"));
     assert!(!script.contains("curl "));
+}
+
+#[test]
+fn connected_prefetch_pulls_exact_linux_arm64_digest_then_inspects_it() {
+    let fixture = tempfile::tempdir_in("/tmp").unwrap();
+    let root = fixture.path();
+    fs::create_dir_all(root.join("scripts")).unwrap();
+    fs::create_dir_all(root.join("images/workspace/etc/mise")).unwrap();
+    fs::create_dir_all(root.join(".artifacts")).unwrap();
+    fs::write(
+        root.join("scripts/prefetch-connected-workspace-image.sh"),
+        include_str!("../prefetch-connected-workspace-image.sh"),
+    )
+    .unwrap();
+    fs::write(root.join("images/workspace/versions.lock"), "fixture\n").unwrap();
+    fs::write(
+        root.join("images/workspace/etc/mise/config.toml"),
+        "fixture\n",
+    )
+    .unwrap();
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    fs::write(
+        bin.join("cargo"),
+        format!(r#"#!/usr/bin/env bash
+set -eu
+last=''
+for arg in "$@"; do last=$arg; done
+case "$*" in
+  *'prepare-workspace-context -- --connected-lock'*)
+    printf '%s\n%s\n%s\n%s\n%s\n' 'ubuntu@sha256:{digest}' 'https://example.invalid/mise' '{mise}' 'https://example.invalid/chromium' '{chromium}' ;;
+  *'fetch-image-artifact'*) mkdir -p "$(dirname "$last")"; : >"$last" ;;
+  *'extract-reviewed-chromium'*) mkdir -p "$last/chrome-linux"; : >"$last/chrome-linux/chrome" ;;
+  *'validate-tool-versions'*) printf '{{}}\n' ;;
+  *'validate-image-inspect'*) cat >/dev/null; printf 'sha256:{digest}\n' ;;
+  *'prepare-workspace-context -- --mode connected --replace'*) printf '{manifest}\n' ;;
+  *) exit 91 ;;
+esac
+"#,
+            digest = "a".repeat(64),
+            mise = "b".repeat(64),
+            chromium = "c".repeat(64),
+            manifest = "d".repeat(64),
+        ),
+    ).unwrap();
+    fs::write(
+        bin.join("container"),
+        r#"#!/usr/bin/env bash
+set -eu
+printf '%s\n' "$*" >>"$CONTAINER_CALLS"
+case "$*" in
+  'image pull --platform linux/arm64 ubuntu@sha256:'*) exit 0 ;;
+  'image inspect --format json ubuntu@sha256:'*) printf '[{}]\n' ;;
+  *) exit 92 ;;
+esac
+"#,
+    )
+    .unwrap();
+    for executable in [bin.join("cargo"), bin.join("container")] {
+        fs::set_permissions(executable, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let calls = root.join("container-calls");
+    let output = Command::new("bash")
+        .arg(root.join("scripts/prefetch-connected-workspace-image.sh"))
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("CONTAINER_CALLS", &calls)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{}\n", "d".repeat(64))
+    );
+    let calls = fs::read_to_string(calls).unwrap();
+    assert!(calls.contains(&format!(
+        "image pull --platform linux/arm64 ubuntu@sha256:{}\n",
+        "a".repeat(64)
+    )));
+    assert!(calls.contains(&format!(
+        "image inspect --format json ubuntu@sha256:{}\n",
+        "a".repeat(64)
+    )));
 }

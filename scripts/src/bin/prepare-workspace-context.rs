@@ -14,6 +14,7 @@ use std::{
 use cap_primitives::fs::{FollowSymlinks, OpenOptions, PermissionsExt as CapPermissionsExt};
 use cap_std::{ambient_authority, fs::Dir};
 use gascan_image_tools::bundle::{PublishedBundleLocks, validate_bundle};
+use gascan_image_tools::{ReviewedInputKind, reviewed_input_kind_allowed};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -44,7 +45,13 @@ struct ConnectedLock {
     workspace_build_mode: String,
     mise: ConnectedArtifact,
     playwright_chromium: ConnectedArtifact,
+    gascamp: ConnectedGascamp,
     workspace_bundles: ConnectedBundles,
+}
+
+#[derive(Deserialize)]
+struct ConnectedGascamp {
+    revision: String,
 }
 
 #[derive(Deserialize)]
@@ -172,6 +179,9 @@ fn parse_connected_lock(contents: &str) -> Result<ConnectedLock, DynError> {
     }
     if lock.workspace_bundles.publication != "pending" {
         return Err("connected mode requires deferred workspace_bundles publication".into());
+    }
+    if lock.gascamp.revision != "f6b248c5926240856dbea83d1d2c5c90ea1c1456" {
+        return Err("Gascamp revision differs from the reviewed connected revision".into());
     }
     if !lock.base_image.starts_with("ubuntu@sha256:")
         || !lower_hex(lock.base_image.trim_start_matches("ubuntu@sha256:"), 64)
@@ -608,16 +618,24 @@ fn copy_tree_reviewed(
         let relative = source.join(&name);
         let target = destination.join(&name);
         let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            copy_tree_reviewed(source_root, &relative, &target)?;
+        let kind = if metadata.is_dir() {
+            ReviewedInputKind::Directory
         } else if metadata.is_file() {
-            copy_regular(source_root, &relative, target)?;
+            ReviewedInputKind::RegularFile
         } else {
+            ReviewedInputKind::Other
+        };
+        if !reviewed_input_kind_allowed(kind) {
             return Err(format!(
                 "reviewed input contains a symlink or special file: {}",
                 relative.display()
             )
             .into());
+        }
+        match kind {
+            ReviewedInputKind::Directory => copy_tree_reviewed(source_root, &relative, &target)?,
+            ReviewedInputKind::RegularFile => copy_regular(source_root, &relative, target)?,
+            ReviewedInputKind::Other => unreachable!(),
         }
     }
     Ok(())

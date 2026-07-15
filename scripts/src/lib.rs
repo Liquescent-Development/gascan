@@ -26,6 +26,20 @@ use sha2::{Digest, Sha256};
 pub type DynError = Box<dyn Error + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReviewedInputKind {
+    Directory,
+    RegularFile,
+    Other,
+}
+
+pub const fn reviewed_input_kind_allowed(kind: ReviewedInputKind) -> bool {
+    matches!(
+        kind,
+        ReviewedInputKind::Directory | ReviewedInputKind::RegularFile
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArtifactClass {
     Mise,
     Chromium,
