@@ -119,6 +119,13 @@ async fn raw_liveness_probe_disconnect_does_not_end_server() -> TestResult {
             .await?
             .into_inner();
         assert!(response.rejection.is_none());
+        assert_eq!(response.daemon_instance_token.len(), 64);
+        assert_eq!(
+            response.daemon_pid,
+            child.id().ok_or("daemon has no process id")?
+        );
+        assert!(!response.daemon_executable.is_empty());
+        assert!(!response.daemon_start_identity.is_empty());
         let pid =
             rustix::process::Pid::from_raw(child.id().ok_or("daemon has no process id")? as i32)
                 .ok_or("daemon process id is zero")?;

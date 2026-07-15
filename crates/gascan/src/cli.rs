@@ -21,6 +21,8 @@ struct Arguments {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(hide = true)]
+    DaemonAttest,
     Up {
         project_root: String,
         #[arg(long)]
@@ -114,8 +116,22 @@ impl From<std::io::Error> for CliError {
 
 pub async fn execute() -> Result<i32, CliError> {
     let arguments = Arguments::try_parse().map_err(|error| CliError::Usage(error.to_string()))?;
+    if matches!(arguments.command, Command::DaemonAttest) {
+        let attestation = Client::daemon_attestation().await?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "instance_token": attestation.daemon_instance_token,
+                "pid": attestation.daemon_pid,
+                "executable": attestation.daemon_executable,
+                "start_identity": attestation.daemon_start_identity,
+            })
+        );
+        return Ok(0);
+    }
     let mut client = Client::connect_or_start().await?;
     match arguments.command {
+        Command::DaemonAttest => Ok(0),
         Command::Up { project_root, json } => {
             operation(
                 client

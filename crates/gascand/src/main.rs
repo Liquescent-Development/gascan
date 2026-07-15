@@ -54,10 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fake_requested = false;
     match backend_selection(fake_requested) {
         BackendSelection::Apple => {
-            let (doctor, completer) = DoctorState::pending();
-            tokio::spawn(async move {
-                completer.complete(production_doctor_report().await);
-            });
+            let doctor = DoctorState::collect(Duration::from_secs(60), production_doctor_report());
             run_daemon(
                 AppleBackend::new(ProcessRunner),
                 store,

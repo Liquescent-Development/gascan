@@ -35,10 +35,24 @@ fn cli_lifecycle_survives_daemon_and_host_state_changes() -> TestResult {
             &[
                 "sh",
                 "-c",
-                "trap 'exit 130' INT; trap 'exit 143' TERM; while :; do sleep 1; done",
+                "trap 'printf GASCAN_INT_TRAP\\n; exit 130' INT; trap 'printf GASCAN_TERM_TRAP\\n; exit 143' TERM; printf GASCAN_SIGNAL_READY\\n; while :; do sleep 1; done",
             ],
         )?;
         assert_eq!(output.status.code(), expected);
+        let marker = if signal == rustix::process::Signal::INT {
+            b"GASCAN_INT_TRAP".as_slice()
+        } else {
+            b"GASCAN_TERM_TRAP".as_slice()
+        };
+        assert!(
+            output
+                .stdout
+                .windows(marker.len())
+                .any(|window| window == marker),
+            "guest trap marker missing: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     env.stop_owned_container()?;

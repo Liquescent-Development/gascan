@@ -138,25 +138,37 @@ impl DoctorState {
         (Self { receiver }, DoctorCompleter { sender })
     }
 
+    pub fn collect<F>(timeout: std::time::Duration, collector: F) -> Self
+    where
+        F: std::future::Future<Output = DoctorReport> + Send + 'static,
+    {
+        let (state, completer) = Self::pending();
+        tokio::spawn(async move {
+            let report = tokio::time::timeout(timeout, collector)
+                .await
+                .unwrap_or_else(|_| {
+                    DoctorFacts::unavailable(format!(
+                        "runtime evidence collector exceeded its {} second bound",
+                        timeout.as_secs()
+                    ))
+                    .into_report()
+                });
+            completer.complete(report);
+        });
+        state
+    }
+
     pub async fn report(&self) -> DoctorReport {
         let mut receiver = self.receiver.clone();
-        let collected = tokio::time::timeout(std::time::Duration::from_secs(60), async move {
-            loop {
-                if let Some(report) = receiver.borrow().clone() {
-                    return Some(report);
-                }
-                if receiver.changed().await.is_err() {
-                    return None;
-                }
+        loop {
+            if let Some(report) = receiver.borrow().clone() {
+                return report;
             }
-        })
-        .await
-        .ok()
-        .flatten();
-        collected.unwrap_or_else(|| {
-            DoctorFacts::unavailable("runtime evidence collection failed or exceeded 60 seconds")
-                .into_report()
-        })
+            if receiver.changed().await.is_err() {
+                return DoctorFacts::unavailable("runtime evidence collection was abandoned")
+                    .into_report();
+            }
+        }
     }
 }
 

@@ -3,7 +3,8 @@
 use gascan_core::sandbox::SandboxId;
 use serde_json::Value;
 use std::ffi::{OsStr, OsString};
-use std::process::{Command, Output, Stdio};
+use std::io::Read as _;
+use std::process::{Command, ExitStatus, Output, Stdio};
 
 #[derive(serde::Deserialize)]
 struct DaemonInstanceRecord {
@@ -11,6 +12,21 @@ struct DaemonInstanceRecord {
     owner_token: String,
     executable: std::path::PathBuf,
     start_identity: String,
+    instance_token: String,
+}
+
+#[derive(serde::Deserialize)]
+struct DaemonAttestation {
+    instance_token: String,
+    pid: u32,
+    executable: std::path::PathBuf,
+    start_identity: String,
+}
+
+pub struct PtySignalOutput {
+    pub status: ExitStatus,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
 }
 
 pub type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -64,6 +80,8 @@ impl AppleE2e {
                 "owner_token": owner_token,
                 "daemon_instance_path": runtime_root.join("daemon-instance.json"),
                 "daemon_executable": std::path::PathBuf::from(&gascand).canonicalize()?,
+                "daemon_cli": std::path::PathBuf::from(&gascan).canonicalize()?,
+                "runtime_root": runtime_root,
             });
             let temporary = manifest.with_extension("tmp");
             std::fs::write(&temporary, serde_json::to_vec(&record)?)?;
@@ -204,8 +222,9 @@ impl AppleE2e {
     }
 
     pub fn kill_daemon(&self) -> TestResult {
-        let pid = self.validated_daemon_pid()?;
-        let pid = rustix::process::Pid::from_raw(pid).ok_or("invalid daemon pid")?;
+        let pid = self.validated_daemon_pid()?.pid;
+        let pid =
+            rustix::process::Pid::from_raw(i32::try_from(pid)?).ok_or("invalid daemon pid")?;
         rustix::process::kill_process(pid, rustix::process::Signal::KILL)?;
         let socket = self.runtime_root.join("gascan/gascand.sock");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -218,10 +237,19 @@ impl AppleE2e {
         Ok(())
     }
 
-    fn validated_daemon_pid(&self) -> TestResult<i32> {
+    fn daemon_attestation(&self) -> TestResult<DaemonAttestation> {
+        let output = self.invoke(["daemon-attest"])?;
+        if !output.status.success() {
+            return Err("daemon attestation endpoint is unavailable".into());
+        }
+        Ok(serde_json::from_slice(&output.stdout)?)
+    }
+
+    fn validated_daemon_pid(&self) -> TestResult<DaemonInstanceRecord> {
         let record: DaemonInstanceRecord = serde_json::from_slice(&std::fs::read(
             self.runtime_root.join("daemon-instance.json"),
         )?)?;
+        let attestation = self.daemon_attestation()?;
         let expected_executable = std::path::PathBuf::from(&self.gascand).canonicalize()?;
         let observed_start = process_field(record.pid, "lstart=")?;
         let observed_command = process_field(record.pid, "command=")?;
@@ -229,18 +257,18 @@ impl AppleE2e {
             .split_whitespace()
             .next()
             .ok_or("daemon command is empty")?;
-        if record.owner_token != self.owner_token
-            || record.executable != expected_executable
-            || std::path::Path::new(observed_executable).canonicalize()? != expected_executable
-            || record.start_identity != observed_start
-            || std::os::unix::net::UnixStream::connect(
-                self.runtime_root.join("gascan/gascand.sock"),
-            )
-            .is_err()
-        {
+        let observed_executable = std::path::Path::new(observed_executable).canonicalize()?;
+        if !instance_matches(
+            &record,
+            &self.owner_token,
+            &expected_executable,
+            &observed_executable,
+            &observed_start,
+            &attestation,
+        ) {
             return Err("daemon instance ownership validation refused signal".into());
         }
-        i32::try_from(record.pid).map_err(Into::into)
+        Ok(record)
     }
 
     pub fn run_pty(&self, argv: &[&str]) -> TestResult<Output> {
@@ -264,23 +292,55 @@ impl AppleE2e {
         &self,
         signal: rustix::process::Signal,
         argv: &[&str],
-    ) -> TestResult<Output> {
+    ) -> TestResult<PtySignalOutput> {
         let pty = rustix_openpty::openpty(None, None)?;
         let stdin = std::fs::File::from(rustix::io::dup(&pty.user)?);
+        let stdout = std::fs::File::from(rustix::io::dup(&pty.user)?);
+        let mut controller = std::fs::File::from(rustix::io::dup(&pty.controller)?);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 256];
+            let mut announced = false;
+            loop {
+                match controller.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        bytes.extend_from_slice(&chunk[..count]);
+                        if !announced
+                            && bytes
+                                .windows(b"GASCAN_SIGNAL_READY".len())
+                                .any(|w| w == b"GASCAN_SIGNAL_READY")
+                        {
+                            let _ = ready_tx.send(());
+                            announced = true;
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok::<_, std::io::Error>(bytes)
+        });
         let mut args = vec!["--sandbox", self.id(), "shell", "--"];
         args.extend(argv);
         let child = self
             .command(args)
             .stdin(stdin)
-            .stdout(Stdio::piped())
+            .stdout(stdout)
             .stderr(Stdio::piped())
             .spawn()?;
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        ready_rx.recv_timeout(std::time::Duration::from_secs(5))?;
         let pid =
             rustix::process::Pid::from_raw(i32::try_from(child.id())?).ok_or("invalid CLI pid")?;
         rustix::process::kill_process(pid, signal)?;
         drop(pty.controller);
-        wait_with_output_bounded(child, std::time::Duration::from_secs(10))
+        let output = wait_with_output_bounded(child, std::time::Duration::from_secs(10))?;
+        let stdout = reader.join().map_err(|_| "PTY reader panicked")??;
+        Ok(PtySignalOutput {
+            status: output.status,
+            stdout,
+            stderr: output.stderr,
+        })
     }
 
     pub fn assert_no_owned_resources(&self) -> TestResult {
@@ -339,16 +399,81 @@ impl AppleE2e {
     }
 }
 
+fn instance_matches(
+    record: &DaemonInstanceRecord,
+    owner_token: &str,
+    expected_executable: &std::path::Path,
+    observed_executable: &std::path::Path,
+    observed_start: &str,
+    attestation: &DaemonAttestation,
+) -> bool {
+    record.pid > 0
+        && record.owner_token == owner_token
+        && record.executable == expected_executable
+        && observed_executable == expected_executable
+        && record.start_identity == observed_start
+        && record.instance_token == attestation.instance_token
+        && record.pid == attestation.pid
+        && record.executable == attestation.executable
+        && record.start_identity == attestation.start_identity
+}
+
 impl Drop for AppleE2e {
     fn drop(&mut self) {
-        if let Ok(pid) = self.validated_daemon_pid() {
-            if let Some(pid) = rustix::process::Pid::from_raw(pid) {
-                let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
-            }
-        }
+        let _ = self.terminate_daemon();
         if let Err(error) = self.cleanup() {
             eprintln!("Gate 4 Rust cleanup failed: {error}");
         }
+    }
+}
+
+impl AppleE2e {
+    fn terminate_daemon(&self) -> TestResult {
+        let record = match self.validated_daemon_pid() {
+            Ok(record) => record,
+            Err(_) => return Ok(()),
+        };
+        let pid = rustix::process::Pid::from_raw(i32::try_from(record.pid)?)
+            .ok_or("invalid daemon pid")?;
+        rustix::process::kill_process(pid, rustix::process::Signal::TERM)?;
+        if wait_for_process_identity_exit(
+            record.pid,
+            &record.start_identity,
+            std::time::Duration::from_secs(5),
+        )? {
+            return Ok(());
+        }
+        let current = self.validated_daemon_pid()?;
+        if current.instance_token != record.instance_token {
+            return Err("daemon instance changed before KILL".into());
+        }
+        rustix::process::kill_process(pid, rustix::process::Signal::KILL)?;
+        if wait_for_process_identity_exit(
+            record.pid,
+            &record.start_identity,
+            std::time::Duration::from_secs(5),
+        )? {
+            Ok(())
+        } else {
+            Err("validated daemon survived TERM and KILL".into())
+        }
+    }
+}
+
+fn wait_for_process_identity_exit(
+    pid: u32,
+    start: &str,
+    timeout: std::time::Duration,
+) -> TestResult<bool> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if process_field(pid, "lstart=").is_err() || process_field(pid, "lstart=")? != start {
+            return Ok(true);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
 }
 
@@ -463,5 +588,59 @@ mod tests {
         assert!(wait_with_output_bounded(child, std::time::Duration::from_millis(20)).is_err());
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         Ok(())
+    }
+
+    #[test]
+    fn exact_instance_validation_rejects_pid_reuse_prefix_and_socket_mismatch() {
+        let executable = std::path::PathBuf::from("/tmp/gascand");
+        let record = DaemonInstanceRecord {
+            pid: 42,
+            owner_token: "owner".into(),
+            executable: executable.clone(),
+            start_identity: "start-a".into(),
+            instance_token: "instance-a".into(),
+        };
+        let attestation = DaemonAttestation {
+            pid: 42,
+            executable: executable.clone(),
+            start_identity: "start-a".into(),
+            instance_token: "instance-a".into(),
+        };
+        assert!(instance_matches(
+            &record,
+            "owner",
+            &executable,
+            &executable,
+            "start-a",
+            &attestation
+        ));
+        assert!(!instance_matches(
+            &record,
+            "owner",
+            &executable,
+            &executable,
+            "start-b",
+            &attestation
+        ));
+        assert!(!instance_matches(
+            &record,
+            "owner",
+            &executable,
+            std::path::Path::new("/tmp/gascand-evil"),
+            "start-a",
+            &attestation
+        ));
+        let wrong_socket = DaemonAttestation {
+            instance_token: "instance-b".into(),
+            ..attestation
+        };
+        assert!(!instance_matches(
+            &record,
+            "owner",
+            &executable,
+            &executable,
+            "start-a",
+            &wrong_socket
+        ));
     }
 }

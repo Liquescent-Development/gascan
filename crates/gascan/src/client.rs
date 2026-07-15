@@ -47,6 +47,18 @@ pub struct Client {
 }
 
 impl Client {
+    pub async fn daemon_attestation() -> Result<gascan_proto::v1::HandshakeResponse, ClientError> {
+        let mut api = connect(&socket_path()).await?;
+        Ok(api
+            .handshake(gascan_proto::v1::HandshakeRequest {
+                api_major: API_MAJOR,
+                api_minor: API_MINOR,
+                requested_capabilities: Vec::new(),
+            })
+            .await?
+            .into_inner())
+    }
+
     pub async fn connect_or_start() -> Result<Self, ClientError> {
         let socket = socket_path();
         let initial = tokio::time::timeout(Duration::from_millis(250), async {

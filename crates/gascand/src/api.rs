@@ -29,9 +29,10 @@ struct DaemonInstanceRecord {
     owner_token: String,
     executable: std::path::PathBuf,
     start_identity: String,
+    instance_token: String,
 }
 
-fn write_daemon_instance_record() -> io::Result<()> {
+fn write_daemon_instance_record(identity: &DaemonIdentity) -> io::Result<()> {
     let Some(path) = std::env::var_os("GASCAN_DAEMON_INSTANCE_PATH").map(std::path::PathBuf::from)
     else {
         return Ok(());
@@ -42,19 +43,40 @@ fn write_daemon_instance_record() -> io::Result<()> {
             "daemon owner token is required",
         )
     })?;
-    let executable = std::env::current_exe()?.canonicalize()?;
-    let pid = std::process::id();
-    let start_identity = process_start_identity(pid)?;
     let record = DaemonInstanceRecord {
-        pid,
+        pid: identity.pid,
         owner_token,
-        executable,
-        start_identity,
+        executable: identity.executable.clone(),
+        start_identity: identity.start_identity.clone(),
+        instance_token: identity.instance_token.clone(),
     };
     let bytes = serde_json::to_vec(&record).map_err(io::Error::other)?;
-    let temporary = path.with_extension(format!("tmp-{pid}"));
+    let temporary = path.with_extension(format!("tmp-{}", identity.pid));
     std::fs::write(&temporary, bytes)?;
     std::fs::rename(temporary, path)
+}
+
+#[derive(Clone, Debug)]
+struct DaemonIdentity {
+    pid: u32,
+    executable: std::path::PathBuf,
+    start_identity: String,
+    instance_token: String,
+}
+
+impl DaemonIdentity {
+    fn current() -> io::Result<Self> {
+        let pid = std::process::id();
+        let mut random = [0_u8; 32];
+        getrandom::fill(&mut random).map_err(io::Error::other)?;
+        let instance_token = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        Ok(Self {
+            pid,
+            executable: std::env::current_exe()?.canonicalize()?,
+            start_identity: process_start_identity(pid)?,
+            instance_token,
+        })
+    }
 }
 
 fn process_start_identity(pid: u32) -> io::Result<String> {
@@ -81,6 +103,7 @@ pub struct ActivityTracker {
 }
 #[derive(Debug)]
 struct ActivityInner {
+    identity: DaemonIdentity,
     leases: AtomicUsize,
     operations: AtomicUsize,
     generation: AtomicUsize,
@@ -103,8 +126,13 @@ impl Default for ActivityTracker {
 impl ActivityTracker {
     #[must_use]
     pub fn new() -> Self {
+        let identity = DaemonIdentity::current().unwrap_or_else(|error| {
+            eprintln!("daemon identity creation failed: {error}");
+            std::process::abort()
+        });
         Self {
             inner: Arc::new(ActivityInner {
+                identity,
                 leases: AtomicUsize::new(0),
                 operations: AtomicUsize::new(0),
                 generation: AtomicUsize::new(0),
@@ -291,7 +319,7 @@ impl Daemon {
         if let Some(pid_path) = std::env::var_os("GASCAN_PID_PATH") {
             std::fs::write(pid_path, std::process::id().to_string())?;
         }
-        write_daemon_instance_record()?;
+        write_daemon_instance_record(&config.activity().inner.identity)?;
         owned.set_nonblocking(true)?;
         let listener = tokio::net::UnixListener::from_std(owned.try_clone()?)?;
         let expected_uid = crate::PeerUid::current();
@@ -995,6 +1023,16 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             capabilities: Vec::new(),
             transport_security: Some(local_transport_security()),
             rejection,
+            daemon_instance_token: self.activity.inner.identity.instance_token.clone(),
+            daemon_pid: self.activity.inner.identity.pid,
+            daemon_executable: self
+                .activity
+                .inner
+                .identity
+                .executable
+                .to_string_lossy()
+                .into_owned(),
+            daemon_start_identity: self.activity.inner.identity.start_identity.clone(),
         }))
     }
     async fn status(

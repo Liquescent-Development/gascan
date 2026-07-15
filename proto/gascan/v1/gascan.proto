@@ -84,7 +84,11 @@ message HandshakeResponse {
   repeated Capability capabilities = 3;
   TransportSecurity transport_security = 4;
   Error rejection = 5;
-  reserved 6;
+  string daemon_instance_token = 6;
+  uint32 daemon_pid = 7;
+  string daemon_executable = 8;
+  string daemon_start_identity = 9;
+  reserved 10;
 }
 
 message SandboxSelector { string sandbox_id = 1; reserved 2; }
