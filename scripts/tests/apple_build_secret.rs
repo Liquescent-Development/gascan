@@ -195,6 +195,94 @@ fn int_during_active_cli_is_bounded_reaped_and_non_mutating() {
 }
 
 #[test]
+fn failed_build_attempt_cleans_image_created_before_failure() {
+    let fixture = tempfile::tempdir_in("/tmp").unwrap();
+    let bin = fixture.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let fake = bin.join("container");
+    fs::write(&fake, r#"#!/bin/sh
+set -eu
+case "$1 $2" in
+  "build --secret")
+    previous=""; for argument in "$@"; do
+      case "$previous" in --label) printf '%s' "${argument#*=}" >"$MARKER" ;; --tag) printf '%s' "$argument" >"$TAG" ;; esac
+      previous="$argument"
+    done
+    exit 1
+    ;;
+  "image inspect")
+    printf '[{"id":"sha256:created-before-failure","configuration":{"name":"%s"},"variants":[{"config":{"config":{"Labels":{"com.gascan.build-secret-probe":"%s"}}}}]}]' "$(cat "$TAG")" "$(cat "$MARKER")"
+    ;;
+  "image delete") touch "$DELETED" ;;
+esac
+"#).unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let secret = fixture.path().join("secret");
+    fs::write(&secret, format!("{SECRET}\n")).unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+    let output = Command::new("bash")
+        .arg(repository_root().join("scripts/probe-apple-build-secret.sh"))
+        .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()))
+        .env("TMPDIR", fixture.path())
+        .env("GASCAN_TEST_SECRET_FILE", &secret)
+        .env("MARKER", fixture.path().join("marker"))
+        .env("TAG", fixture.path().join("tag"))
+        .env("DELETED", fixture.path().join("deleted"))
+        .output().unwrap();
+    assert!(!output.status.success());
+    assert!(fixture.path().join("deleted").exists(), "owned image survived failed build attempt");
+}
+
+#[test]
+fn failed_create_attempt_cleans_container_created_before_failure() {
+    let fixture = tempfile::tempdir_in("/tmp").unwrap();
+    let bin = fixture.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let fake = bin.join("container");
+    fs::write(&fake, r#"#!/bin/sh
+set -eu
+case "$1 $2" in
+  "build --secret")
+    previous=""; for argument in "$@"; do
+      case "$previous" in --label) printf '%s' "${argument#*=}" >"$MARKER" ;; --tag) printf '%s' "$argument" >"$TAG" ;; esac
+      previous="$argument"
+    done
+    ;;
+  "image inspect")
+    test "${3:-}" = --help && exit 0
+    printf '[{"id":"sha256:fixture","configuration":{"name":"%s"},"variants":[{"config":{"config":{"Labels":{"com.gascan.build-secret-probe":"%s"}}}}]}]' "$(cat "$TAG")" "$(cat "$MARKER")"
+    ;;
+  "image delete") : ;;
+  "create --name")
+    printf '%s' "$3" >"$NAME"
+    exit 1
+    ;;
+  "inspect "*)
+    printf '[{"id":"%s","configuration":{"id":"%s","labels":{"com.gascan.build-secret-probe":"%s"}}}]' "$(cat "$NAME")" "$(cat "$NAME")" "$(cat "$MARKER")"
+    ;;
+  "stop "*) : ;;
+  "delete "*) touch "$DELETED" ;;
+esac
+"#).unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let secret = fixture.path().join("secret");
+    fs::write(&secret, format!("{SECRET}\n")).unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+    let output = Command::new("bash")
+        .arg(repository_root().join("scripts/probe-apple-build-secret.sh"))
+        .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()))
+        .env("TMPDIR", fixture.path())
+        .env("GASCAN_TEST_SECRET_FILE", &secret)
+        .env("MARKER", fixture.path().join("marker"))
+        .env("TAG", fixture.path().join("tag"))
+        .env("NAME", fixture.path().join("name"))
+        .env("DELETED", fixture.path().join("deleted"))
+        .output().unwrap();
+    assert!(!output.status.success());
+    assert!(fixture.path().join("deleted").exists(), "owned container survived failed create attempt");
+}
+
+#[test]
 fn fake_container_proves_secret_stays_out_of_observable_channels() {
     let fixture = tempfile::tempdir_in("/tmp").unwrap();
     let bin_dir = fixture.path().join("bin");

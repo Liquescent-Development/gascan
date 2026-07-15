@@ -107,8 +107,8 @@ transmitted="$private_root/transmitted-context.tar"
 transcript="$private_root/build.transcript"
 inspect="$private_root/image-inspect.json"
 exported="$private_root/container.tar"
-built=false
-created=false
+build_attempted=false
+create_attempted=false
 image_id=''
 ownership_marker="$container_name"
 cleanup_container_inspect="$private_root/cleanup-container-inspect.json"
@@ -128,19 +128,32 @@ capture_bounded() {
 }
 
 container_owned() {
-  capture_bounded "$cleanup_container_inspect" container inspect "$container_name" &&
+  if capture_bounded "$cleanup_container_inspect" container inspect "$container_name"; then
     container_has_ownership "$cleanup_container_inspect"
+  elif grep -Eiq 'not found|no such' "$cleanup_container_inspect"; then
+    return 2
+  else
+    return 1
+  fi
 }
 
 image_owned() {
-  capture_bounded "$cleanup_image_inspect" container image inspect "$tag" &&
+  if capture_bounded "$cleanup_image_inspect" container image inspect "$tag"; then
+    if test -z "$image_id"; then
+      image_id="$(jq -er 'select(type == "array" and length == 1) | .[0].id' "$cleanup_image_inspect")" || return 1
+    fi
     image_has_ownership "$cleanup_image_inspect"
+  elif grep -Eiq 'not found|no such' "$cleanup_image_inspect"; then
+    return 2
+  else
+    return 1
+  fi
 }
 
 cleanup() {
   status=$?
   trap - EXIT INT TERM HUP
-  if test "$created" = true; then
+  if test "$create_attempted" = true; then
     if container_owned; then
       run_bounded "$operation_timeout" container stop "$container_name" >/dev/null 2>&1 || true
       if container_owned; then
@@ -149,14 +162,16 @@ cleanup() {
         status=1
       fi
     else
-      status=1
+      ownership_status=$?
+      test "$ownership_status" = 2 || status=1
     fi
   fi
-  if test "$built" = true; then
+  if test "$build_attempted" = true; then
     if image_owned; then
       run_bounded "$operation_timeout" container image delete "$tag" >/dev/null 2>&1 || status=1
     else
-      status=1
+      ownership_status=$?
+      test "$ownership_status" = 2 || status=1
     fi
   fi
   rm -f "$staged_secret"
@@ -194,6 +209,7 @@ if grep -a -F -q -f "$secret" "$transmitted"; then
 fi
 
 expected_sha256="$(shasum -a 256 "$secret" | cut -d' ' -f1)"
+build_attempted=true
 if ! capture_bounded "$transcript" container build --secret "id=gascamp_read_token,src=$staged_secret" \
   --build-arg "EXPECTED_SECRET_SHA256=$expected_sha256" \
   --label "$ownership_label=$ownership_marker" --tag "$tag" "$context"; then
@@ -204,7 +220,6 @@ if ! capture_bounded "$transcript" container build --secret "id=gascamp_read_tok
   sed "s|$secret|<secret-path>|g" "$transcript" >&2
   exit 1
 fi
-built=true
 
 inspect_help="$private_root/image-inspect-help"
 if capture_bounded "$inspect_help" container image inspect --help && grep -q -- '--format' "$inspect_help"; then
@@ -216,9 +231,9 @@ jq -e 'type == "object" or type == "array"' "$inspect" >/dev/null || die 'image 
 image_id="$(jq -er 'select(type == "array" and length == 1) | .[0].id' "$inspect")" || die 'built image ID missing'
 image_has_ownership "$inspect" || die 'built image ownership mismatch'
 
+create_attempted=true
 run_bounded "$operation_timeout" container create --name "$container_name" \
   --label "$ownership_label=$ownership_marker" "$tag" /bin/sh -c 'sleep 30' >/dev/null
-created=true
 container_owned || die 'created container ownership mismatch'
 run_bounded "$operation_timeout" container start "$container_name" >/dev/null
 container_owned || die 'container ownership mismatch before stop'
