@@ -368,6 +368,11 @@ fn scripts_separate_network_prefetch_from_cache_only_build() {
     }
     assert!(build.contains("prepare-workspace-context -- --verify"));
     assert!(build.contains("container image inspect --format json \"$base_image\""));
+    let preparer =
+        fs::read_to_string(root.join("scripts/src/bin/prepare-workspace-context.rs")).unwrap();
+    assert!(!preparer.contains("std::process::id"));
+    assert!(preparer.contains("/dev/urandom"));
+    assert!(preparer.contains("replacement receipt"));
 }
 
 #[test]

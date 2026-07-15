@@ -9,6 +9,7 @@ use gascan_image_tools::{
 };
 use reqwest::Url;
 use sha2::{Digest, Sha256};
+use std::os::unix::fs::symlink;
 
 #[test]
 fn unapproved_intermediate_redirect_is_rejected_before_contact() {
@@ -95,4 +96,16 @@ fn exact_size_and_code_owned_maximum_are_both_enforced() {
     );
     assert!(!destination.exists());
     assert!(ArtifactClass::Mise.maximum_bytes() < ArtifactClass::Chromium.maximum_bytes());
+}
+
+#[test]
+fn cached_artifact_symlink_is_rejected_without_following() {
+    let temporary = tempfile::tempdir().unwrap();
+    let target = temporary.path().join("target");
+    let cached = temporary.path().join("cached");
+    let bytes = b"valid bytes";
+    std::fs::write(&target, bytes).unwrap();
+    symlink(&target, &cached).unwrap();
+    let hash = format!("{:x}", Sha256::digest(bytes));
+    assert!(validate_cached_artifact(&cached, &hash, bytes.len() as u64).is_err());
 }

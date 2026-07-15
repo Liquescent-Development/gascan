@@ -2,9 +2,13 @@ use std::{
     collections::HashSet,
     error::Error,
     fs, io,
+    os::fd::AsFd,
+    os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
 };
 
+use cap_std::{ambient_authority, fs::Dir};
+use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 
 type DynError = Box<dyn Error + Send + Sync>;
@@ -18,7 +22,6 @@ fn main() -> Result<(), DynError> {
     }
 
     let entries = validate_archive(&archive_path)?;
-    ensure_empty_or_absent(&output_path)?;
     extract_atomically(&archive_path, &output_path, &entries)
 }
 
@@ -79,13 +82,6 @@ fn reviewed_path(name: &str) -> Result<PathBuf, DynError> {
     Ok(path)
 }
 
-fn ensure_empty_or_absent(path: &Path) -> Result<(), DynError> {
-    if path.exists() && fs::read_dir(path)?.next().is_some() {
-        return Err("Chromium extraction output must be empty".into());
-    }
-    Ok(())
-}
-
 fn extract_atomically(
     archive_path: &Path,
     output: &Path,
@@ -95,6 +91,7 @@ fn extract_atomically(
         .parent()
         .ok_or("Chromium output has no parent directory")?;
     fs::create_dir_all(parent)?;
+    recover_stale(parent);
     let staging = tempfile::Builder::new()
         .prefix(".chromium-staging-")
         .tempdir_in(parent)?;
@@ -112,16 +109,145 @@ fn extract_atomically(
         }
         let mut target = fs::File::create(&destination)?;
         io::copy(&mut entry, &mut target)?;
-        #[cfg(unix)]
         if let Some(mode) = entry.unix_mode() {
-            use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&destination, fs::Permissions::from_mode(mode & 0o777))?;
         }
     }
-    if output.exists() {
-        fs::remove_dir(output)?;
-    }
     let staging_path = staging.keep();
-    fs::rename(staging_path, output)?;
+    let staging_name = staging_path
+        .file_name()
+        .ok_or("Chromium staging path has no name")?;
+    let output_name = output.file_name().ok_or("Chromium output has no name")?;
+    let new_digest = tree_digest(&staging_path)?;
+    let old_digest = match fs::symlink_metadata(output) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            tree_digest(output)?
+        }
+        Ok(_) => return Err("Chromium output is not a real directory".into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => "-".to_owned(),
+        Err(error) => return Err(error.into()),
+    };
+    let receipt_path = parent.join(format!("{}.receipt", staging_name.to_string_lossy()));
+    let receipt = format!(
+        "chromium exchange receipt v1\t{}\t{old_digest}\t{new_digest}\n",
+        staging_name.to_string_lossy()
+    );
+    let mut receipt_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&receipt_path)?;
+    use std::io::Write as _;
+    receipt_file.write_all(receipt.as_bytes())?;
+    receipt_file.sync_all()?;
+    fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o444))?;
+    let parent_dir = Dir::open_ambient_dir(parent, ambient_authority())?;
+    match fs::symlink_metadata(output) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            rustix::fs::renameat_with(
+                parent_dir.as_fd(),
+                staging_name,
+                parent_dir.as_fd(),
+                output_name,
+                rustix::fs::RenameFlags::EXCHANGE,
+            )?;
+            if remove_safe_tree(&staging_path).is_ok() {
+                let _ignored = fs::remove_file(&receipt_path);
+            }
+        }
+        Ok(_) => return Err("Chromium output is not a real directory".into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            parent_dir.rename(staging_name, &parent_dir, output_name)?;
+            let _ignored = fs::remove_file(&receipt_path);
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn recover_stale(parent: &Path) {
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(staging_name) = name.strip_suffix(".receipt") else {
+            continue;
+        };
+        if !staging_name.starts_with(".chromium-staging-") {
+            continue;
+        }
+        let Ok(receipt) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let fields: Vec<_> = receipt.trim_end().split('\t').collect();
+        if fields.len() != 4
+            || fields[0] != "chromium exchange receipt v1"
+            || fields[1] != staging_name
+        {
+            continue;
+        }
+        let staging = parent.join(staging_name);
+        if !staging.exists() {
+            let _ignored = fs::remove_file(entry.path());
+            continue;
+        }
+        let Ok(digest) = tree_digest(&staging) else {
+            continue;
+        };
+        if digest != fields[2] && digest != fields[3] {
+            continue;
+        }
+        if remove_safe_tree(&staging).is_ok() {
+            let _ignored = fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn tree_digest(root: &Path) -> Result<String, DynError> {
+    fn visit(base: &Path, directory: &Path, rows: &mut Vec<String>) -> Result<(), DynError> {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            let relative = path
+                .strip_prefix(base)?
+                .to_str()
+                .ok_or("Chromium path is not UTF-8")?;
+            if metadata.file_type().is_symlink() || (!metadata.is_dir() && !metadata.is_file()) {
+                return Err("Chromium tree contains a link or special file".into());
+            }
+            if metadata.is_dir() {
+                rows.push(format!(
+                    "{relative}\tdirectory\t{:04o}\n",
+                    metadata.permissions().mode() & 0o7777
+                ));
+                visit(base, &path, rows)?;
+            } else {
+                let bytes = fs::read(&path)?;
+                rows.push(format!(
+                    "{relative}\tfile\t{:04o}\t{}\t{:x}\n",
+                    metadata.permissions().mode() & 0o7777,
+                    bytes.len(),
+                    Sha256::digest(bytes)
+                ));
+            }
+        }
+        Ok(())
+    }
+    let metadata = fs::symlink_metadata(root)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("Chromium tree is not a real directory".into());
+    }
+    let mut rows = Vec::new();
+    visit(root, root, &mut rows)?;
+    rows.sort();
+    Ok(format!("{:x}", Sha256::digest(rows.concat().as_bytes())))
+}
+
+fn remove_safe_tree(root: &Path) -> Result<(), DynError> {
+    tree_digest(root)?;
+    fs::remove_dir_all(root)?;
     Ok(())
 }

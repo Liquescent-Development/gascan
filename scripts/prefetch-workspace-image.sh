@@ -43,25 +43,8 @@ for record in ubuntu_packages mise_runtimes gascamp_source_vendor; do
   fetch workspace-bundle "$url" "$sha" "$artifacts/bundles/$record.tar.zst" "$size"
 done
 
-reviewed_next="$artifacts/.playwright-chromium-reviewed.$$"
-reviewed_old="$artifacts/.playwright-chromium-reviewed.old.$$"
-trap 'chmod -R u+w "$reviewed_next" "$reviewed_old" 2>/dev/null || true; rm -rf "$reviewed_next" "$reviewed_old"' EXIT
 cargo run --quiet --locked --offline --manifest-path "$root/scripts/Cargo.toml" \
-  --bin extract-reviewed-chromium -- "$artifacts/playwright-chromium-linux-arm64.zip" "$reviewed_next"
-if test -d "$artifacts/playwright-chromium-reviewed" && diff -qr "$artifacts/playwright-chromium-reviewed" "$reviewed_next" >/dev/null; then
-  chmod -R u+w "$reviewed_next"
-  rm -rf "$reviewed_next"
-else
-  if test -e "$artifacts/playwright-chromium-reviewed"; then
-    mv "$artifacts/playwright-chromium-reviewed" "$reviewed_old"
-  fi
-  if ! mv "$reviewed_next" "$artifacts/playwright-chromium-reviewed"; then
-    test ! -e "$reviewed_old" || mv "$reviewed_old" "$artifacts/playwright-chromium-reviewed"
-    die "could not publish reviewed Chromium tree"
-  fi
-  if test -e "$reviewed_old"; then chmod -R u+w "$reviewed_old"; rm -rf "$reviewed_old"; fi
-fi
-trap - EXIT
+  --bin extract-reviewed-chromium -- "$artifacts/playwright-chromium-linux-arm64.zip" "$artifacts/playwright-chromium-reviewed"
 expected_temp=$(mktemp "$artifacts/.expected-tool-versions.XXXXXX")
 trap 'rm -f "$expected_temp"' EXIT
 cargo run --quiet --locked --offline --manifest-path "$root/scripts/Cargo.toml" \

@@ -5,12 +5,17 @@ pub mod bundle;
 use std::{
     collections::BTreeSet,
     error::Error,
+    ffi::OsString,
     fs,
     io::{Read, Write},
-    path::Path,
+    path::{Component, Path},
     time::Duration,
 };
 
+use cap_primitives::fs::{
+    FollowSymlinks, MetadataExt as CapMetadataExt, OpenOptions as CapOpenOptions,
+};
+use cap_std::{ambient_authority, fs::Dir};
 use reqwest::{
     Url,
     blocking::{Client, Response},
@@ -135,7 +140,12 @@ pub fn validate_cached_artifact(
     expected_size: u64,
 ) -> Result<(), DynError> {
     validate_expectations(expected_sha256, expected_size, u64::MAX)?;
-    let mut file = fs::File::open(path)?;
+    let parent_path = path.parent().ok_or("artifact path has no parent")?;
+    let (parent, name) = open_parent(path)?;
+    let parent_identity = directory_identity(&parent)?;
+    let mut options = CapOpenOptions::new();
+    options.read(true)._cap_fs_ext_follow(FollowSymlinks::No);
+    let mut file = parent.open_with(&name, &options)?;
     if !file.metadata()?.is_file() {
         return Err("cached artifact is not a regular file".into());
     }
@@ -146,48 +156,134 @@ pub fn validate_cached_artifact(
     if sha256 != expected_sha256 {
         return Err("cached artifact SHA-256 does not match lock".into());
     }
+    let reopened = Dir::open_ambient_dir(parent_path, ambient_authority())?;
+    if directory_identity(&reopened)? != parent_identity {
+        return Err("cached artifact parent changed during validation".into());
+    }
     Ok(())
 }
 
 pub fn install_verified_artifact(
-    mut input: impl Read,
+    input: impl Read,
     destination: &Path,
     expected_sha256: &str,
     expected_size: u64,
     class: ArtifactClass,
 ) -> Result<(), DynError> {
-    validate_expectations(expected_sha256, expected_size, class.maximum_bytes())?;
-    let parent = destination
+    install_artifact(
+        input,
+        destination,
+        expected_sha256,
+        Some(expected_size),
+        class,
+    )
+}
+
+pub fn install_bounded_artifact(
+    input: impl Read,
+    destination: &Path,
+    expected_sha256: &str,
+    class: ArtifactClass,
+) -> Result<(), DynError> {
+    install_artifact(input, destination, expected_sha256, None, class)
+}
+
+fn install_artifact(
+    mut input: impl Read,
+    destination: &Path,
+    expected_sha256: &str,
+    expected_size: Option<u64>,
+    class: ArtifactClass,
+) -> Result<(), DynError> {
+    validate_expectations(
+        expected_sha256,
+        expected_size.unwrap_or(1),
+        class.maximum_bytes(),
+    )?;
+    let parent_path = destination
         .parent()
         .ok_or("artifact destination has no parent")?;
-    fs::create_dir_all(parent)?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    let mut hasher = Sha256::new();
-    let mut size = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let count = input.read(&mut buffer)?;
-        if count == 0 {
-            break;
+    fs::create_dir_all(parent_path)?;
+    let (parent, destination_name) = open_parent(destination)?;
+    let parent_identity = directory_identity(&parent)?;
+    let temporary_name = OsString::from(format!(".artifact-{}", random_hex_256()?));
+    let mut options = CapOpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        ._cap_fs_ext_follow(FollowSymlinks::No);
+    let mut temporary = parent.open_with(&temporary_name, &options)?;
+    let validation = (|| -> Result<(), DynError> {
+        let mut hasher = Sha256::new();
+        let mut size = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = input.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            size = size
+                .checked_add(count as u64)
+                .ok_or("artifact size overflow")?;
+            if size > expected_size.unwrap_or(class.maximum_bytes()) || size > class.maximum_bytes()
+            {
+                return Err("artifact exceeded its exact size limit".into());
+            }
+            temporary.write_all(&buffer[..count])?;
+            hasher.update(&buffer[..count]);
         }
-        size = size
-            .checked_add(count as u64)
-            .ok_or("artifact size overflow")?;
-        if size > expected_size || size > class.maximum_bytes() {
-            return Err("artifact exceeded its exact size limit".into());
+        if size == 0 || expected_size.is_some_and(|expected| size != expected) {
+            return Err("artifact size does not match lock".into());
         }
-        temporary.write_all(&buffer[..count])?;
-        hasher.update(&buffer[..count]);
+        if format!("{:x}", hasher.finalize()) != expected_sha256 {
+            return Err("artifact SHA-256 does not match lock".into());
+        }
+        temporary.sync_all()?;
+        Ok(())
+    })();
+    drop(temporary);
+    if let Err(error) = validation {
+        let _ignored = parent.remove_file(&temporary_name);
+        return Err(error);
     }
-    if size != expected_size {
-        return Err("artifact size does not match lock".into());
+    if let Err(error) = parent.rename(&temporary_name, &parent, &destination_name) {
+        let _ignored = parent.remove_file(&temporary_name);
+        return Err(error.into());
     }
-    if format!("{:x}", hasher.finalize()) != expected_sha256 {
-        return Err("artifact SHA-256 does not match lock".into());
+    let reopened = Dir::open_ambient_dir(parent_path, ambient_authority())?;
+    if directory_identity(&reopened)? != parent_identity {
+        return Err("artifact destination parent changed during publication".into());
     }
-    temporary.as_file_mut().sync_all()?;
-    temporary.persist(destination)?;
+    parent.into_std_file().sync_all()?;
     Ok(())
+}
+
+fn open_parent(path: &Path) -> Result<(Dir, OsString), DynError> {
+    let parent = path.parent().ok_or("artifact path has no parent")?;
+    let name = path
+        .file_name()
+        .ok_or("artifact path has no file name")?
+        .to_owned();
+    if Path::new(&name).components().count() != 1
+        || !matches!(
+            Path::new(&name).components().next(),
+            Some(Component::Normal(_))
+        )
+    {
+        return Err("artifact path does not have a safe final name".into());
+    }
+    Ok((Dir::open_ambient_dir(parent, ambient_authority())?, name))
+}
+
+fn directory_identity(directory: &Dir) -> Result<(u64, u64), DynError> {
+    let metadata = directory.dir_metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+fn random_hex_256() -> Result<String, DynError> {
+    let mut bytes = [0_u8; 32];
+    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 fn validate_expectations(

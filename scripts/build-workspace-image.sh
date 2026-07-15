@@ -16,10 +16,23 @@ top_value() {
 
 test "$(top_value base_image)" = "$base_image" || die "base image differs from the reviewed exact digest"
 tag=$(top_value workspace_tag)
-snapshot=$(top_value ubuntu_snapshot)
+ubuntu_snapshot=$(top_value ubuntu_snapshot)
 [[ "$tag" != *:latest ]] || die "latest workspace tag rejected"
 
-cargo run --quiet --locked --offline --manifest-path "$root/scripts/Cargo.toml" --bin prepare-workspace-context -- --verify "$root" "$lock" "$root/.artifacts" "$context"
+context_manifest=$(cargo run --quiet --locked --offline --manifest-path "$root/scripts/Cargo.toml" --bin prepare-workspace-context -- --verify "$root" "$lock" "$root/.artifacts" "$context")
+[[ "$context_manifest" =~ ^[0-9a-f]{64}$ ]] || die "context verifier did not emit a canonical manifest digest"
+
+snapshot_helper='/usr/local/libexec/gascan/snapshot-workspace-context'
+test -x "$snapshot_helper" || die "snapshot helper is unavailable"
+test "$(stat -f '%u:%Lp' "$snapshot_helper")" = '0:555' || die "snapshot helper is not root-owned immutable code"
+receipt=''
+cleanup_snapshot() {
+  test -z "$receipt" || sudo -n "$snapshot_helper" finish "$receipt"
+}
+trap cleanup_snapshot EXIT INT TERM
+receipt=$(sudo -n "$snapshot_helper" create "$context" "$context_manifest") || die "root snapshot creation is unavailable"
+build_context_snapshot=$(sudo -n "$snapshot_helper" path "$receipt") || die "root snapshot validation failed"
+test -d "$build_context_snapshot" || die "root snapshot path is unavailable"
 
 inspect=$(container image inspect --format json "$base_image")
 inspected=$(printf '%s' "$inspect" | cargo run --quiet --locked --offline \
@@ -29,10 +42,14 @@ test "$inspected" = "${base_image#ubuntu@}" || die "exact local linux/arm64 base
 container build \
   --arch arm64 \
   --tag "$tag" \
-  --file "$context/Dockerfile" \
+  --file "$build_context_snapshot/Dockerfile" \
   --build-arg "BASE_IMAGE=$base_image" \
-  --build-arg "UBUNTU_SNAPSHOT=$snapshot" \
-  "$context"
+  --build-arg "UBUNTU_SNAPSHOT=$ubuntu_snapshot" \
+  "$build_context_snapshot"
+
+sudo -n "$snapshot_helper" finish "$receipt"
+receipt=''
+trap - EXIT INT TERM
 
 inspect=$(container image inspect --format json "$tag")
 digest=$(printf '%s' "$inspect" | cargo run --quiet --locked --offline \

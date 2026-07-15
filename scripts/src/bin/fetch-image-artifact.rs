@@ -1,12 +1,8 @@
-use std::{
-    fs,
-    io::{Read, Write},
-    path::Path,
-};
+use std::{fs, path::Path};
 
 use gascan_image_tools::{
-    ArtifactClass, DynError, RedirectRules, install_verified_artifact, open_with_redirect_rules,
-    validate_cached_artifact,
+    ArtifactClass, DynError, RedirectRules, install_bounded_artifact, install_verified_artifact,
+    open_with_redirect_rules, validate_cached_artifact,
 };
 
 fn main() -> Result<(), DynError> {
@@ -36,7 +32,7 @@ fn main() -> Result<(), DynError> {
         }
     }
 
-    let mut response = open_with_redirect_rules(&url, redirect_rules)?;
+    let response = open_with_redirect_rules(&url, redirect_rules)?;
     if let Some(length) = response.content_length() {
         let limit = exact_size.unwrap_or(class.maximum_bytes());
         if length > limit || exact_size.is_some_and(|size| length != size) {
@@ -46,21 +42,7 @@ fn main() -> Result<(), DynError> {
     if let Some(size) = exact_size {
         return install_verified_artifact(response, destination, &expected, size, class);
     }
-    let parent = destination
-        .parent()
-        .ok_or("artifact destination has no parent")?;
-    fs::create_dir_all(parent)?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    let mut bounded = response.by_ref().take(class.maximum_bytes() + 1);
-    let copied = std::io::copy(&mut bounded, &mut temporary)?;
-    if copied == 0 || copied > class.maximum_bytes() {
-        return Err("artifact violates the code-owned size limit".into());
-    }
-    temporary.flush()?;
-    validate_cached_artifact(temporary.path(), &expected, copied)?;
-    temporary.as_file_mut().sync_all()?;
-    temporary.persist(destination)?;
-    Ok(())
+    install_bounded_artifact(response, destination, &expected, class)
 }
 
 fn artifact_class(value: &str) -> Result<ArtifactClass, DynError> {

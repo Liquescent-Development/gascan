@@ -4,7 +4,7 @@ use std::{
     error::Error,
     ffi::OsStr,
     fs,
-    io::Write,
+    io::{Read, Write},
     os::fd::AsFd,
     os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
@@ -64,6 +64,7 @@ fn run() -> Result<(), DynError> {
         if actual != expected_manifest {
             return Err("context differs from the current locked inputs".into());
         }
+        println!("{:x}", Sha256::digest(&actual));
         return Ok(());
     }
     if mode.as_deref() == Some(OsStr::new("--replace")) {
@@ -95,6 +96,11 @@ fn replace_context(
     destination: &Path,
     locks: &PublishedBundleLocks,
 ) -> Result<(), DynError> {
+    let parent_path = destination
+        .parent()
+        .ok_or("context destination has no parent")?;
+    let destination_name = single_name(destination)?;
+    recover_owned_replacements(parent_path, destination_name);
     match fs::symlink_metadata(destination) {
         Ok(metadata) if metadata.is_dir() => {}
         Ok(_) => return Err("existing context is not a real directory".into()),
@@ -103,20 +109,29 @@ fn replace_context(
         }
         Err(error) => return Err(error.into()),
     }
-    let parent_path = destination
-        .parent()
-        .ok_or("context destination has no parent")?;
-    let destination_name = single_name(destination)?;
+    let old_sha = verify_context(destination)
+        .map(|manifest| format!("{:x}", Sha256::digest(&manifest)))
+        .unwrap_or_else(|_| "-".to_owned());
+    let token = random_token()?;
     let replacement_name = format!(
         ".{}.replacement-{}",
         destination_name.to_string_lossy(),
-        std::process::id()
+        token
     );
     let replacement = parent_path.join(&replacement_name);
-    if replacement.exists() {
-        return Err("context replacement path already exists".into());
-    }
     assemble(repository, cache, &replacement, locks)?;
+    let new_manifest = verify_context(&replacement)?;
+    let new_sha = format!("{:x}", Sha256::digest(&new_manifest));
+    let receipt_name = format!("{replacement_name}.receipt");
+    let receipt_path = parent_path.join(&receipt_name);
+    let receipt = format!("replacement receipt v1\t{token}\t{old_sha}\t{new_sha}\n");
+    let mut receipt_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&receipt_path)?;
+    receipt_file.write_all(receipt.as_bytes())?;
+    receipt_file.sync_all()?;
+    fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o444))?;
     let parent = Dir::open_ambient_dir(parent_path, ambient_authority())?;
     if let Err(error) = rustix::fs::renameat_with(
         parent.as_fd(),
@@ -125,13 +140,78 @@ fn replace_context(
         destination_name,
         rustix::fs::RenameFlags::EXCHANGE,
     ) {
-        make_tree_owner_writable(&replacement)?;
-        fs::remove_dir_all(&replacement)?;
+        let _ignored = make_tree_owner_writable(&replacement)
+            .and_then(|()| fs::remove_dir_all(&replacement).map_err(Into::into));
+        let _ignored = fs::remove_file(receipt_path);
         return Err(error.into());
     }
-    make_tree_owner_writable(&replacement)?;
-    fs::remove_dir_all(replacement)?;
+    let _ignored = make_tree_owner_writable(&replacement)
+        .and_then(|()| fs::remove_dir_all(&replacement).map_err(Into::into));
+    let _ignored = fs::remove_file(receipt_path);
     Ok(())
+}
+
+fn recover_owned_replacements(parent: &Path, destination_name: &OsStr) {
+    let prefix = format!(".{}.replacement-", destination_name.to_string_lossy());
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(base) = name.strip_suffix(".receipt") else {
+            continue;
+        };
+        let Some(token) = base.strip_prefix(&prefix) else {
+            continue;
+        };
+        if !lower_hex(token, 64) {
+            continue;
+        }
+        let Ok(receipt) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let fields: Vec<_> = receipt.trim_end().split('\t').collect();
+        if fields.len() != 4
+            || fields[0] != "replacement receipt v1"
+            || fields[1] != token
+            || (fields[2] != "-" && !lower_hex(fields[2], 64))
+            || !lower_hex(fields[3], 64)
+        {
+            continue;
+        }
+        let replacement = parent.join(base);
+        if !replacement.exists() {
+            let _ignored = fs::remove_file(entry.path());
+            continue;
+        }
+        let Ok(manifest) = verify_context(&replacement) else {
+            continue;
+        };
+        let digest = format!("{:x}", Sha256::digest(&manifest));
+        if digest != fields[2] && digest != fields[3] {
+            continue;
+        }
+        if make_tree_owner_writable(&replacement)
+            .and_then(|()| fs::remove_dir_all(&replacement).map_err(Into::into))
+            .is_ok()
+        {
+            let _ignored = fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn random_token() -> Result<String, DynError> {
+    let mut bytes = [0_u8; 32];
+    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn verify_context(root: &Path) -> Result<Vec<u8>, DynError> {
