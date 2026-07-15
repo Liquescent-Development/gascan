@@ -52,6 +52,10 @@ reference_file=${GASCAN_IMAGE_REF_FILE:-"$root/.artifacts/workspace-image-ref"}
 container_bin=${CONTAINER_BIN:-container}
 test -f "$reference_file" || { printf 'missing polyglot image reference: %s\n' "$reference_file" >&2; exit 1; }
 image=$(bash "$root/scripts/validate-connected-image-receipt.sh" "$reference_file")
+[[ "$image" =~ ^[a-z0-9][a-z0-9._/-]*:[a-zA-Z0-9._-]+@sha256:[0-9a-f]{64}$ ]] || {
+  printf 'image reference is not digest-qualified\n' >&2
+  exit 1
+}
 owner_token=${GASCAN_TEST_OWNER_TOKEN:-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')}
 [[ "$owner_token" =~ ^[0-9a-f]{32}$ ]] || { printf 'invalid owner token\n' >&2; exit 1; }
 name="gascan-image-polyglot-test-$owner_token"
