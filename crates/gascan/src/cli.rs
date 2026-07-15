@@ -194,15 +194,40 @@ pub async fn execute() -> Result<i32, CliError> {
         }
         Command::Doctor { json } => {
             let doctor = client.api.doctor(v1::DoctorRequest {}).await?.into_inner();
+            let checks = doctor
+                .capabilities
+                .iter()
+                .map(|capability| {
+                    let detail: serde_json::Value = serde_json::from_str(&capability.detail)
+                        .unwrap_or_else(|_| serde_json::json!({"detail": capability.detail, "remedy": ""}));
+                    serde_json::json!({
+                        "id": capability.name,
+                        "status": if capability.available { "pass" } else { "fail" },
+                        "detail": detail.get("detail").and_then(serde_json::Value::as_str).unwrap_or(""),
+                        "remedy": detail.get("remedy").and_then(serde_json::Value::as_str).unwrap_or(""),
+                    })
+                })
+                .collect::<Vec<_>>();
             if json {
-                println!(
-                    "{}",
-                    serde_json::json!({"capabilities": doctor.capabilities.len(), "findings": doctor.findings.len()})
-                );
+                println!("{}", serde_json::json!({"checks": checks}));
             } else {
-                println!("Gas Can daemon: ready");
+                for check in &checks {
+                    println!(
+                        "{} {:<4} {}",
+                        check["id"].as_str().unwrap_or("unknown"),
+                        check["status"].as_str().unwrap_or("fail"),
+                        check["detail"].as_str().unwrap_or("")
+                    );
+                    if check["status"] == "fail" {
+                        println!("  remedy: {}", check["remedy"].as_str().unwrap_or(""));
+                    }
+                }
             }
-            Ok(0)
+            Ok(if doctor.findings.is_empty() {
+                0
+            } else {
+                EXIT_RUNTIME
+            })
         }
         Command::Run { argv } => run(&mut client, arguments.sandbox, argv, false).await,
         Command::Shell { argv } => run(&mut client, arguments.sandbox, argv, true).await,

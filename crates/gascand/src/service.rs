@@ -4,6 +4,7 @@ use crate::{
     OperationRecord, SandboxRecord, SetupResolution, Store, StoreError, ToolResolution,
 };
 use async_trait::async_trait;
+use gascan_core::doctor::DoctorReport;
 use gascan_core::manifest::ManifestError;
 use gascan_core::policy::{PolicyCompiler, PolicyError};
 use gascan_core::runtime::{
@@ -234,6 +235,26 @@ impl<B: RuntimeBackend> SandboxService<B> {
     }
     pub fn latest_operation(&self) -> Result<Option<OperationRecord>, ServiceError> {
         Ok(self.store.latest_operation()?)
+    }
+
+    pub async fn doctor_report(&self) -> Result<DoctorReport, ServiceError> {
+        Ok(DoctorReport::from_runtime(
+            &self.runtime.capabilities().await?,
+        ))
+    }
+
+    pub async fn require_runtime_ready(&self) -> Result<(), ServiceError> {
+        let report = self.doctor_report().await?;
+        if let Some(check) = report
+            .checks
+            .into_iter()
+            .find(|check| check.status == gascan_core::doctor::DoctorStatus::Fail)
+        {
+            return Err(ServiceError::Runtime(RuntimeError::UnsupportedCapability {
+                capability: format!("{}: {}; remedy: {}", check.id, check.detail, check.remedy),
+            }));
+        }
+        Ok(())
     }
 
     async fn database<T, F>(&self, action: F) -> Result<T, ServiceError>

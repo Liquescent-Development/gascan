@@ -17,6 +17,7 @@ path = "../gascand/src/main.rs"
 async-trait.workspace = true
 clap.workspace = true
 gascan-core = { path = "../gascan-core" }
+gascan-apple = { path = "../gascan-apple" }
 gascan-proto = { path = "../gascan-proto" }
 gascand = { path = "../gascand" }
 hyper-util.workspace = true

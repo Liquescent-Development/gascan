@@ -1,6 +1,22 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+pub const TEST_FAKE_BACKEND_ENV: &str = "GASCAN_TEST_FAKE_BACKEND";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendSelection {
+    Apple,
+    Fake,
+}
+
+pub const fn backend_selection(fake_requested: bool) -> BackendSelection {
+    if cfg!(debug_assertions) && fake_requested {
+        BackendSelection::Fake
+    } else {
+        BackendSelection::Apple
+    }
+}
+
 mod api;
 mod reconcile;
 mod service;

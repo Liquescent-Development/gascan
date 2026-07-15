@@ -4,6 +4,7 @@ use crate::{
     SandboxService, ServiceError, SocketPaths, UpRequest as ServiceUpRequest,
 };
 use camino::Utf8PathBuf;
+use gascan_core::doctor::DoctorStatus;
 use gascan_core::manifest::Manifest;
 use gascan_core::runtime::RuntimeBackend;
 use gascan_core::sandbox::{SandboxId, SandboxSpec};
@@ -981,9 +982,34 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
     ) -> Result<tonic::Response<v1::DoctorResponse>, tonic::Status> {
         self.activity.ensure_accepting().map_err(admission_status)?;
         let _lease = self.activity.lease();
+        let report = self.service.doctor_report().await.map_err(service_status)?;
+        let capabilities = report
+            .checks
+            .iter()
+            .map(|check| v1::Capability {
+                name: check.id.clone(),
+                available: check.status == DoctorStatus::Pass,
+                detail: serde_json::json!({
+                    "detail": check.detail,
+                    "remedy": check.remedy,
+                    "status": check.status,
+                })
+                .to_string(),
+            })
+            .collect();
+        let findings = report
+            .checks
+            .iter()
+            .filter(|check| check.status == DoctorStatus::Fail)
+            .map(|check| v1::Error {
+                code: check.id.clone(),
+                message: check.detail.clone(),
+                details: check.remedy.as_bytes().to_vec(),
+            })
+            .collect();
         Ok(tonic::Response::new(v1::DoctorResponse {
-            capabilities: Vec::new(),
-            findings: Vec::new(),
+            capabilities,
+            findings,
         }))
     }
     type UpStream = ApiEventStream;
@@ -992,6 +1018,10 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         request: tonic::Request<v1::UpRequest>,
     ) -> Result<tonic::Response<Self::UpStream>, tonic::Status> {
         let operation_lease = self.activity.admit_operation().map_err(admission_status)?;
+        self.service
+            .require_runtime_ready()
+            .await
+            .map_err(service_status)?;
         let spec = spec_for_root(request.into_inner().project_root)
             .await
             .map_err(ApiInputError::status)?;
@@ -1022,6 +1052,10 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         request: tonic::Request<v1::ApplyRequest>,
     ) -> Result<tonic::Response<Self::ApplyStream>, tonic::Status> {
         let operation_lease = self.activity.admit_operation().map_err(admission_status)?;
+        self.service
+            .require_runtime_ready()
+            .await
+            .map_err(service_status)?;
         let spec = spec_for_root(request.into_inner().project_root)
             .await
             .map_err(ApiInputError::status)?;

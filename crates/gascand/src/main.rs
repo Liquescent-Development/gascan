@@ -1,10 +1,13 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+use gascan_apple::{AppleBackend, ProcessRunner};
 use gascan_core::fake_runtime::FakeRuntime;
+use gascan_core::runtime::RuntimeBackend;
 use gascand::{
-    Daemon, DaemonConfig, ProvisionRequest, ProvisionResolution, Provisioner, SandboxApi,
-    SandboxService, ServiceError, SocketPaths, Store,
+    BackendSelection, Daemon, DaemonConfig, ProvisionRequest, ProvisionResolution, Provisioner,
+    SandboxApi, SandboxService, ServiceError, SocketPaths, Store, TEST_FAKE_BACKEND_ENV,
+    backend_selection,
 };
 use std::{sync::Arc, time::Duration};
 
@@ -44,36 +47,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| paths.directory().join("state.sqlite3"));
     let store = Store::open(state_path)?;
-    let provision_delay = std::env::var("GASCAN_FAKE_PROVISION_DELAY_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .map_or(Duration::ZERO, Duration::from_millis);
-    let provision_fail = std::env::var_os("GASCAN_FAKE_PROVISION_FAIL").is_some();
-    let fake_state_path = std::env::var_os("GASCAN_FAKE_STATE_PATH")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| paths.directory().join("fake-runtime.json"));
-    let runtime = FakeRuntime::persistent(
-        gascan_core::fake_runtime::fixture_capabilities(),
-        fake_state_path,
-    )
-    .await?;
-    if std::env::var_os("GASCAN_FAKE_CAPABILITIES_FAIL").is_some() {
-        runtime
-            .inject_failure(gascan_core::fake_runtime::FailureBoundary::Capabilities)
-            .await;
+    let fake_requested = std::env::var_os(TEST_FAKE_BACKEND_ENV).is_some();
+    match backend_selection(fake_requested) {
+        BackendSelection::Apple => {
+            run_daemon(
+                AppleBackend::new(ProcessRunner),
+                store,
+                paths,
+                idle_timeout,
+                Duration::ZERO,
+                false,
+            )
+            .await
+        }
+        BackendSelection::Fake => {
+            let provision_delay = std::env::var("GASCAN_FAKE_PROVISION_DELAY_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .map_or(Duration::ZERO, Duration::from_millis);
+            let provision_fail = std::env::var_os("GASCAN_FAKE_PROVISION_FAIL").is_some();
+            let fake_state_path = std::env::var_os("GASCAN_FAKE_STATE_PATH")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| paths.directory().join("fake-runtime.json"));
+            let runtime = FakeRuntime::persistent(
+                gascan_core::fake_runtime::fixture_capabilities(),
+                fake_state_path,
+            )
+            .await?;
+            if std::env::var_os("GASCAN_FAKE_CAPABILITIES_FAIL").is_some() {
+                runtime
+                    .inject_failure(gascan_core::fake_runtime::FailureBoundary::Capabilities)
+                    .await;
+            }
+            if let Some(delay) = std::env::var("GASCAN_FAKE_LOGS_FAIL_AFTER_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                let failing = runtime.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    failing
+                        .inject_failure(gascan_core::fake_runtime::FailureBoundary::Logs)
+                        .await;
+                });
+            }
+            run_daemon(
+                runtime,
+                store,
+                paths,
+                idle_timeout,
+                provision_delay,
+                provision_fail,
+            )
+            .await
+        }
     }
-    if let Some(delay) = std::env::var("GASCAN_FAKE_LOGS_FAIL_AFTER_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-    {
-        let failing = runtime.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(delay)).await;
-            failing
-                .inject_failure(gascan_core::fake_runtime::FailureBoundary::Logs)
-                .await;
-        });
-    }
+}
+
+async fn run_daemon<B: RuntimeBackend + 'static>(
+    runtime: B,
+    store: Store,
+    paths: SocketPaths,
+    idle_timeout: Duration,
+    provision_delay: Duration,
+    provision_fail: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let service = Arc::new(SandboxService::new(
         runtime,
         store,
