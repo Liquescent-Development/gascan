@@ -52,11 +52,12 @@ if downloads!=sorted(set(downloads)): fail("upstream provenance is not in canoni
 seen=set()
 for line in downloads:
  cols=line.split("\t")
- if len(cols)!=7: fail("invalid upstream artifact provenance")
- tool,version,backend,url,sha,size,path=cols
+ if len(cols)!=8: fail("invalid upstream artifact provenance")
+ tool,version,backend,url,sha,size,path,event_path=cols
  if expected.get(tool)!=version: fail("upstream provenance has wrong tool/version")
  if not backend or not url.startswith("https://"): fail("upstream artifact URL/backend provenance missing")
  if not path.startswith("downloads/") or PurePosixPath(path).is_absolute() or ".." in PurePosixPath(path).parts: fail("unsafe downloaded artifact path")
+ if not event_path.startswith("/opt/gascan/mise/downloads/") or ".." in PurePosixPath(event_path).parts: fail("unsafe actual download event path")
  artifact=root/path
  if not re.fullmatch("[0-9a-f]{64}",sha) or not size.isdigit() or not artifact.is_file() or artifact.stat().st_size!=int(size) or hashlib.sha256(artifact.read_bytes()).hexdigest()!=sha: fail("downloaded artifact checksum/size provenance invalid")
  seen.add(tool)
@@ -84,8 +85,22 @@ for tool,version in expected.items():
   if len(matches)!=1: fail("upstream artifacts differ from mise lock provenance")
   locked_rows.extend(matches)
 if downloads!=sorted(set(locked_rows)): fail("upstream artifacts differ from mise lock provenance")
-trace=[line for line in read(root/"download-trace.tsv").splitlines() if line]
-if trace!=downloads: fail("sanitized download trace differs from captured artifact provenance")
+event_re=re.compile(r'^DEBUG GET Downloading (https://\S+) to (/\S+?)(?: checksum=([0-9a-f]{64}) size=([0-9]+))?$')
+events=[]
+logs=root/"mise-install-logs"
+if not logs.is_dir() or sorted(p.name for p in logs.glob("*.log"))!=[tool+".log" for tool in sorted(expected)]: fail("actual mise install logs are missing or extra")
+for tool in sorted(expected):
+ for line in read(logs/(tool+".log")).splitlines():
+  match=event_re.fullmatch(line)
+  if not match: fail("invalid sanitized actual download event")
+  events.append((tool,match.group(1),match.group(2),match.group(3),match.group(4)))
+for line in downloads:
+ tool,version,backend,url,sha,size,path,event_path=line.split("\t")
+ matches=[event for event in events if event[:3]==(tool,url,event_path)]
+ if len(matches)!=1: fail("actual download event is absent or mismatched")
+ emitted_sha,emitted_size=matches[0][3:]
+ if emitted_sha is not None and (emitted_sha!=sha or emitted_size!=size): fail("actual download event checksum/size mismatch")
+if len(events)!=len(downloads): fail("actual download event has no locked retained artifact")
 manifest=[line for line in read(root/"mise-runtimes-linux-arm64.manifest.tsv").splitlines() if line]
 if manifest!=sorted(set(manifest)): fail("tree manifest is not in canonical order")
 declared={}
@@ -214,7 +229,7 @@ test "$(sha256sum "$mise" | cut -d' ' -f1)" = fba7c8a383cf3c59eb5a9995d5299fd2c7
 chmod 0555 "$mise"
 cp -- "$config" "$work/config.toml"
 touch "$work/config.lock"
-export MISE_DATA_DIR=/opt/gascan/mise MISE_CACHE_DIR="$work/cache" MISE_GLOBAL_CONFIG_FILE="$work/config.toml" MISE_CONFIG_DIR="$work/empty-config" MISE_YES=1 MISE_LOG_LEVEL=trace MISE_LOCKFILE=1 MISE_LOCKFILE_PLATFORMS=linux-arm64 MISE_ALWAYS_KEEP_DOWNLOAD=1
+export MISE_DATA_DIR=/opt/gascan/mise MISE_CACHE_DIR="$work/cache" MISE_GLOBAL_CONFIG_FILE="$work/config.toml" MISE_CONFIG_DIR="$work/empty-config" MISE_YES=1 MISE_LOG_LEVEL=trace MISE_LOCKFILE=1 MISE_LOCKFILE_PLATFORMS=linux-arm64 MISE_ALWAYS_KEEP_DOWNLOAD=1 NO_COLOR=1
 mkdir -p "$MISE_CONFIG_DIR"
 tools=(elixir go java node python ruby rust)
 for tool in "${tools[@]}"; do
@@ -226,7 +241,7 @@ done
 "$mise" current --json >"$output/mise-current.json"
 
 python3 - "$work/config.lock" "$lock" "$work/logs" /opt/gascan/mise/downloads "$output" <<'PY'
-import hashlib,re,shutil,sys,tomllib
+import hashlib,re,shutil,sys,tomllib,urllib.parse
 from pathlib import Path
 mise_lock=tomllib.loads(Path(sys.argv[1]).read_text()); versions=tomllib.loads(Path(sys.argv[2]).read_text())["tools"]; logs=Path(sys.argv[3]); downloads=Path(sys.argv[4]); output=Path(sys.argv[5]); rows=[]
 def records(value,backend=""):
@@ -244,21 +259,38 @@ for tool in sorted(versions):
   sha=checksum.removeprefix("sha256:")
   if backend and url.startswith("https://") and re.fullmatch(r"[0-9a-f]{64}",sha): normalized.add((backend,url,sha))
  if not normalized: raise SystemExit("mise runtime bundle: mise lock lacks upstream URL/checksum/backend for "+tool)
- trace=(logs/(tool+".log")).read_text(errors="strict")
+ raw_lines=(logs/(tool+".log")).read_text(errors="strict").splitlines()
+ event_re=re.compile(r'^.*DEBUG GET Downloading (?P<url>https://\S+) to (?P<path>/\S+?)(?: checksum=(?P<sha>[0-9a-f]{64}) size=(?P<size>[0-9]+))?$')
+ events=[]
+ for line in raw_lines:
+  match=event_re.fullmatch(line)
+  if match:
+   parsed=urllib.parse.urlsplit(match.group("url"))
+   if parsed.username or parsed.password or parsed.query or parsed.fragment: raise SystemExit("mise runtime bundle: unsafe credentials/query in download trace")
+   events.append((line,match.group("url"),Path(match.group("path")),match.group("sha"),match.group("size")))
+ (output/"mise-install-logs").mkdir(exist_ok=True)
+ canonical_events=[]
+ for _,event_url,event_path,event_sha,event_size in events:
+  canonical=f"DEBUG GET Downloading {event_url} to {event_path}"
+  if event_sha is not None: canonical+=f" checksum={event_sha} size={event_size}"
+  canonical_events.append(canonical)
+ (output/"mise-install-logs"/(tool+".log")).write_text("\n".join(canonical_events)+("\n" if canonical_events else ""))
  for backend,url,sha in sorted(normalized):
-  if url not in trace: raise SystemExit("mise runtime bundle: locked URL absent from backend download trace for "+tool)
-  candidates=[]
-  for path in downloads.rglob("*"):
-   if path.is_file():
-    body=path.read_bytes()
-    if hashlib.sha256(body).hexdigest()==sha: candidates.append((path,body))
-  if len(candidates)!=1: raise SystemExit("mise runtime bundle: retained download does not uniquely match locked checksum for "+tool)
-  path,body=candidates[0]; relative=Path("downloads")/(tool+"-"+sha)
+  matching=[event for event in events if event[1]==url]
+  if len(matching)!=1: raise SystemExit("mise runtime bundle: locked URL lacks one unambiguous actual download event for "+tool)
+  _,_,path,emitted_sha,emitted_size=matching[0]
+  try: path.resolve().relative_to(downloads.resolve())
+  except ValueError: raise SystemExit("mise runtime bundle: actual download path escapes retained download root")
+  if not path.is_file(): raise SystemExit("mise runtime bundle: actual downloaded path was not retained for "+tool)
+  body=path.read_bytes()
+  if hashlib.sha256(body).hexdigest()!=sha: raise SystemExit("mise runtime bundle: actual downloaded bytes differ from backend lock checksum for "+tool)
+  if emitted_sha is not None and (emitted_sha!=sha or emitted_size!=str(len(body))): raise SystemExit("mise runtime bundle: emitted download checksum/size differs from retained bytes")
+  relative=Path("downloads")/(tool+"-"+sha)
   (output/"downloads").mkdir(exist_ok=True); shutil.copyfile(path,output/relative)
-  rows.append("\t".join((tool,versions[tool],backend,url,sha,str(len(body)),relative.as_posix())))
+  rows.append("\t".join((tool,versions[tool],backend,url,sha,str(len(body)),relative.as_posix(),str(path))))
+ if len(events)!=len(normalized): raise SystemExit("mise runtime bundle: actual download event has no backend lock record for "+tool)
 canonical="\n".join(sorted(set(rows)))+"\n"
 (output/"upstream-artifacts.tsv").write_text(canonical)
-(output/"download-trace.tsv").write_text(canonical)
 PY
 cp "$work/config.lock" "$output/mise.lock"
 rm -rf -- "$work/cache" /opt/gascan/mise/downloads
