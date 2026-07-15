@@ -21,6 +21,55 @@ fn gascamp_run(dockerfile: &str) -> &str {
         .expect("Gascamp must be fetched and built in one secret-mounted RUN")
 }
 
+const REVISION: &str = "f6b248c5926240856dbea83d1d2c5c90ea1c1456";
+
+fn assert_exact_revision_pin(dockerfile: &str) {
+    let run = gascamp_run(dockerfile);
+    let pin = format!("test \"$GASCAMP_REVISION\" = {REVISION}");
+    let pin_offset = run.find(&pin).expect("missing exact Gascamp revision pin");
+    let fetch_offset = run.find("fetch --depth=1").expect("missing Gascamp fetch");
+    assert!(
+        pin_offset < fetch_offset,
+        "revision must be pinned before fetch"
+    );
+}
+
+fn assert_deferred_secret_read(dockerfile: &str) {
+    let run = gascamp_run(dockerfile);
+    assert!(
+        run.contains(
+            r#""    printf 'password=%s\\n' \"\$(cat /run/secrets/gascamp_read_token)\"""#
+        ),
+        "helper must defer the secret-file read until Git invokes it"
+    );
+    assert!(
+        !run.contains(
+            r#""    printf 'password=%s\\n' \"$(cat /run/secrets/gascamp_read_token)\"""#
+        ),
+        "secret read expanded while creating helper"
+    );
+}
+
+fn assert_only_public_outputs(dockerfile: &str) {
+    let out_operations: Vec<_> = gascamp_run(dockerfile)
+        .lines()
+        .map(|line| line.trim().trim_end_matches(" \\").trim_end_matches(';'))
+        .filter(|line| line.contains("/out"))
+        .collect();
+    assert_eq!(
+        out_operations,
+        [
+            "install -D -o root -g root -m 0555 target/release/camp /out/bin/camp",
+            "ln -s camp /out/bin/campd",
+            "printf '%s\\n' \"$GASCAMP_REVISION\" >/out/REVISION",
+            "chown -R root:root /out",
+            "chmod 0444 /out/REVISION",
+            "chmod -R a-w /out",
+        ],
+        "private builder may emit only camp, relative campd, and REVISION"
+    );
+}
+
 fn assert_secure_gascamp_builder(dockerfile: &str) {
     for forbidden in [
         "ARG GASCAMP_READ_TOKEN",
@@ -92,7 +141,50 @@ fn assert_secure_gascamp_builder(dockerfile: &str) {
 
 #[test]
 fn private_gascamp_build_has_a_single_secret_and_output_boundary() {
-    assert_secure_gascamp_builder(&dockerfile());
+    let dockerfile = dockerfile();
+    assert_secure_gascamp_builder(&dockerfile);
+    assert_exact_revision_pin(&dockerfile);
+    assert_deferred_secret_read(&dockerfile);
+    assert_only_public_outputs(&dockerfile);
+}
+
+#[test]
+fn rejects_an_alternate_well_formed_revision() {
+    let mutation = dockerfile().replace(
+        &format!("test \"$GASCAMP_REVISION\" = {REVISION}"),
+        "test \"$GASCAMP_REVISION\" = 0123456789abcdef0123456789abcdef01234567",
+    );
+    assert!(std::panic::catch_unwind(|| assert_exact_revision_pin(&mutation)).is_err());
+}
+
+#[test]
+fn rejects_an_immediate_secret_read_while_creating_the_helper() {
+    let mutation = dockerfile().replace(
+        r#"\$(cat /run/secrets/gascamp_read_token)"#,
+        "$(cat /run/secrets/gascamp_read_token)",
+    );
+    assert!(std::panic::catch_unwind(|| assert_deferred_secret_read(&mutation)).is_err());
+}
+
+#[test]
+fn rejects_secret_or_source_material_written_to_out() {
+    let base = dockerfile();
+    for mutation in [
+        base.replace(
+            "    chown -R root:root /out; \\",
+            "    cat /run/secrets/gascamp_read_token >/out/token; chown -R root:root /out; \\",
+        ),
+        base.replace(
+            "    chown -R root:root /out; \\",
+            "    cp -R /tmp/gascamp /out/source; chown -R root:root /out; \\",
+        ),
+        base.replace(
+            "    chown -R root:root /out; \\",
+            "    install -D /tmp/gascamp/Cargo.lock /out/Cargo.lock; chown -R root:root /out; \\",
+        ),
+    ] {
+        assert!(std::panic::catch_unwind(|| assert_only_public_outputs(&mutation)).is_err());
+    }
 }
 
 #[test]

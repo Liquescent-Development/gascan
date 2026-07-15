@@ -33,6 +33,7 @@ FROM workspace-base AS gascamp-builder
 ARG GASCAMP_REVISION
 RUN --mount=type=secret,id=gascamp_read_token,required=true \
     set -eu; \
+    test "$GASCAMP_REVISION" = f6b248c5926240856dbea83d1d2c5c90ea1c1456; \
     case "$GASCAMP_REVISION" in *[!0-9a-f]*|'') exit 1;; esac; \
     test "${#GASCAMP_REVISION}" -eq 40; \
     install -d -m 0700 /tmp/gascamp; \
