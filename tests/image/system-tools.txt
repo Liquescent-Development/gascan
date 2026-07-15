@@ -6,6 +6,7 @@ curl
 fonts-liberation
 gh
 git
+jq
 libasound2t64
 libatk-bridge2.0-0
 libatk1.0-0
@@ -35,7 +36,6 @@ libyaml-dev
 patch
 pkg-config
 python3
-jq
 sudo
 tini
 unzip

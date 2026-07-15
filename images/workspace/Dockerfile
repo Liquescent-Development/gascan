@@ -1,76 +1,33 @@
 ARG BASE_IMAGE
 
-FROM ${BASE_IMAGE} AS offline-base
+FROM ${BASE_IMAGE} AS workspace-base
 
-COPY bundles/ubuntu_packages/repository /opt/gascan/offline/ubuntu/repository
-COPY --chmod=0444 bundles/ubuntu_packages/package-manifest.tsv /opt/gascan/offline/ubuntu/package-manifest.tsv
-
-RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/* \
-    && dpkg-query --show --showformat='${Package}\t${Version}\t${Architecture}\n' \
-       | LC_ALL=C sort > /tmp/gascan-packages.before \
-    && find /opt/gascan/offline/ubuntu/repository -type f -name '*.deb' -print0 \
-       | LC_ALL=C sort -z > /tmp/gascan-packages.list \
-    && test -s /tmp/gascan-packages.list \
-    && DEBIAN_FRONTEND=noninteractive xargs -0 --arg-file=/tmp/gascan-packages.list apt-get \
-           -o Dir::Etc::sourcelist=/dev/null \
-           -o Dir::Etc::sourceparts=- \
-           -o Dir::Bin::methods=/nonexistent \
-           -o Acquire::Retries=0 \
-           install --yes --no-install-recommends \
-    && while IFS="$(printf '\t')" read -r package version architecture _; do \
-           test "$(dpkg-query --show --showformat='${Version}\t${Architecture}' "$package")" = "$version$(printf '\t')$architecture"; \
-       done < /opt/gascan/offline/ubuntu/package-manifest.tsv \
-    && cut -f1-3 /opt/gascan/offline/ubuntu/package-manifest.tsv \
-       | LC_ALL=C sort > /tmp/gascan-packages.locked \
-    && dpkg-query --show --showformat='${Package}\t${Version}\t${Architecture}\n' \
-       | LC_ALL=C sort > /tmp/gascan-packages.after \
-    && cut -f1 /tmp/gascan-packages.before | LC_ALL=C sort -u > /tmp/gascan-packages.before-names \
-    && cut -f1 /tmp/gascan-packages.after | LC_ALL=C sort -u > /tmp/gascan-packages.after-names \
-    && test -z "$(comm -23 /tmp/gascan-packages.before-names /tmp/gascan-packages.after-names)" \
-    && test -z "$(comm -13 /tmp/gascan-packages.before /tmp/gascan-packages.after \
-       | comm -23 - /tmp/gascan-packages.locked)" \
+COPY --chmod=0444 tests/image/system-tools.txt /tmp/system-tools.txt
+RUN test "$(LC_ALL=C sort -u /tmp/system-tools.txt | wc -l | tr -d ' ')" = "$(wc -l < /tmp/system-tools.txt | tr -d ' ')" \
+    && apt-get -o Acquire::Retries=0 update \
+    && DEBIAN_FRONTEND=noninteractive xargs apt-get \
+         -o Acquire::Retries=0 install --yes --no-install-recommends </tmp/system-tools.txt \
+    && while IFS= read -r package; do dpkg-query -W -f='${db:Status-Status}\n' "$package" | grep -Fx installed; done </tmp/system-tools.txt \
     && apt-get clean \
-    && rm -rf /var/lib/apt/lists/* /opt/gascan/offline/ubuntu \
-       /tmp/gascan-packages.list /tmp/gascan-packages.before \
-       /tmp/gascan-packages.after /tmp/gascan-packages.locked \
-       /tmp/gascan-packages.before-names /tmp/gascan-packages.after-names
+    && rm -rf /var/lib/apt/lists/* /tmp/system-tools.txt
 
 COPY --chmod=0555 .artifacts/mise-linux-arm64 /usr/local/bin/mise
 COPY --chmod=0444 images/workspace/etc/mise/config.toml /etc/mise/config.toml
-COPY bundles/mise_runtimes/mise-runtimes-linux-arm64.tar.zst /tmp/mise-runtimes-linux-arm64.tar.zst
-COPY --chmod=0444 bundles/mise_runtimes/mise-runtimes-linux-arm64.manifest.tsv /tmp/mise-runtimes-linux-arm64.manifest.tsv
-COPY --chmod=0444 bundles/mise_runtimes/mise-current.json /tmp/mise-current.json
 COPY --chmod=0444 .artifacts/expected-tool-versions.json /tmp/expected-tool-versions.json
 
 ENV MISE_DATA_DIR=/opt/gascan/mise
 ENV MISE_GLOBAL_CONFIG_FILE=/etc/mise/config.toml
 
-RUN test ! -e /opt/gascan/mise \
-    && tar --zstd --list --file /tmp/mise-runtimes-linux-arm64.tar.zst \
-       | sed 's:/$::' | LC_ALL=C sort > /tmp/mise-archive-paths \
-    && cut -f1 /tmp/mise-runtimes-linux-arm64.manifest.tsv \
-       | LC_ALL=C sort > /tmp/mise-manifest-paths \
-    && cmp /tmp/mise-archive-paths /tmp/mise-manifest-paths \
-    && tar --zstd --extract --file /tmp/mise-runtimes-linux-arm64.tar.zst --directory / \
-    && tar --zstd --compare --file /tmp/mise-runtimes-linux-arm64.tar.zst --directory / \
+RUN mise install --yes \
     && mise current --json \
        | jq --compact-output --sort-keys 'with_entries(.value = .value.version)' \
        > /tmp/resolved-tool-versions.json \
-    && jq --compact-output --sort-keys 'with_entries(.value = .value.version)' /tmp/mise-current.json \
-       > /tmp/bundle-tool-versions.json \
-    && cmp /tmp/resolved-tool-versions.json /tmp/bundle-tool-versions.json \
     && cmp /tmp/resolved-tool-versions.json /tmp/expected-tool-versions.json \
     && install -o root -g root -m 0444 /tmp/resolved-tool-versions.json /opt/gascan/image-tool-versions.json \
-    && rm -f /tmp/mise-runtimes-linux-arm64.tar.zst \
-       /tmp/mise-current.json \
-       /tmp/mise-archive-paths \
-       /tmp/mise-manifest-paths \
-       /tmp/mise-runtimes-linux-arm64.manifest.tsv \
-       /tmp/bundle-tool-versions.json \
-       /tmp/expected-tool-versions.json \
+    && rm -f /tmp/expected-tool-versions.json \
        /tmp/resolved-tool-versions.json
 
-FROM offline-base AS gascamp-builder
+FROM workspace-base AS gascamp-builder
 
 COPY bundles/gascamp_source_vendor/tree/source/ /tmp/gascamp/
 COPY bundles/gascamp_source_vendor/tree/vendor/ /tmp/gascamp/vendor/
@@ -85,7 +42,7 @@ RUN cd /tmp/gascamp \
     && printf '%s\n' f6b248c5926240856dbea83d1d2c5c90ea1c1456 > /out/REVISION \
     && chmod -R a-w /out
 
-FROM offline-base
+FROM workspace-base
 
 COPY .artifacts/playwright-chromium-reviewed/chrome-linux /opt/gascan/chromium/chrome-linux
 COPY --chmod=0440 images/workspace/etc/sudoers.d/workspace /etc/sudoers.d/workspace

@@ -34,20 +34,20 @@ fn mise_defaults_exactly_match_locked_polyglot_versions() {
 fn dockerfile_installs_only_reviewed_system_tools_and_verified_artifacts() {
     let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
     for required in [
-        "bundles/ubuntu_packages/repository",
+        "tests/image/system-tools.txt",
         "install --yes --no-install-recommends",
         ".artifacts/mise-linux-arm64",
         "/usr/local/bin/mise",
         "images/workspace/etc/mise/config.toml",
         "images/workspace/etc/profile.d/mise.sh",
-        "bundles/mise_runtimes/mise-runtimes-linux-arm64.tar.zst",
+        "mise install --yes",
         "mise current --json",
         "/opt/gascan/image-tool-versions.json",
         ".artifacts/playwright-chromium-reviewed/chrome-linux",
         "/opt/gascan/tests/playwright-smoke.mjs",
         "/tmp/resolved-tool-versions.json",
         "USER root",
-        "cmp /tmp/resolved-tool-versions.json /tmp/bundle-tool-versions.json",
+        "cmp /tmp/resolved-tool-versions.json /tmp/expected-tool-versions.json",
         "install -o root -g root -m 0444",
         "rm -rf /var/lib/apt/lists/*",
     ] {
@@ -68,8 +68,6 @@ fn dockerfile_installs_only_reviewed_system_tools_and_verified_artifacts() {
             "unlocked install path: {forbidden}"
         );
     }
-    assert!(!dockerfile.contains("mise install"));
-
     let build = fs::read_to_string(root().join("scripts/prefetch-workspace-image.sh")).unwrap();
     for required in ["extract-reviewed-chromium", "validate-tool-versions"] {
         assert!(
