@@ -182,17 +182,14 @@ fn compile_resources(
     if memory > MAX_MEMORY_BYTES {
         return Err(PolicyError::MemoryExceedsMaximum { requested: memory });
     }
-    let disk = declared
-        .disk()
-        .map_or(DEFAULT_DISK_BYTES, |value| value.bytes());
-    if disk > MAX_DISK_BYTES {
-        return Err(PolicyError::DiskExceedsMaximum { requested: disk });
+    if declared.disk().is_some() {
+        return Err(PolicyError::DiskControlUnsupported);
     }
     Ok(RuntimeResourceLimits {
         cpus: Some(cpus),
         memory_bytes: Some(memory),
-        disk_bytes: Some(disk),
-        process_count: Some(DEFAULT_PROCESS_COUNT),
+        disk_bytes: None,
+        process_count: None,
     })
 }
 
@@ -244,6 +241,8 @@ pub enum PolicyError {
     MemoryExceedsMaximum { requested: u64 },
     #[error("requested disk {requested} exceeds maximum {MAX_DISK_BYTES}")]
     DiskExceedsMaximum { requested: u64 },
+    #[error("the current macOS backend cannot enforce a sandbox disk ceiling")]
+    DiskControlUnsupported,
 }
 
 impl PolicyError {
@@ -261,6 +260,7 @@ impl PolicyError {
             Self::CpusExceedMaximum { .. } => "cpus_exceed_maximum",
             Self::MemoryExceedsMaximum { .. } => "memory_exceeds_maximum",
             Self::DiskExceedsMaximum { .. } => "disk_exceeds_maximum",
+            Self::DiskControlUnsupported => "disk_control_unsupported",
         }
     }
 }

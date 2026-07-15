@@ -1,8 +1,8 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use gascan_core::manifest::Manifest;
 use gascan_core::policy::{
-    DEFAULT_CPUS, DEFAULT_DISK_BYTES, DEFAULT_MEMORY_BYTES, DEFAULT_PROCESS_COUNT, MAX_CPUS,
-    MAX_DISK_BYTES, MAX_MEMORY_BYTES, PolicyCompiler, filtered_host_environment,
+    DEFAULT_CPUS, DEFAULT_MEMORY_BYTES, MAX_CPUS, MAX_MEMORY_BYTES, PolicyCompiler,
+    filtered_host_environment,
 };
 use gascan_core::runtime::{
     NetworkIsolation, ResourceKind, RuntimeCapabilities, RuntimeNetwork, RuntimeUser,
@@ -194,13 +194,12 @@ fn safe_resource_defaults_and_explicit_values_are_bounded() {
         .to_owned();
     assert_eq!(defaults.cpus, Some(DEFAULT_CPUS));
     assert_eq!(defaults.memory_bytes, Some(DEFAULT_MEMORY_BYTES));
-    assert_eq!(defaults.disk_bytes, Some(DEFAULT_DISK_BYTES));
-    assert_eq!(defaults.process_count, Some(DEFAULT_PROCESS_COUNT));
+    assert_eq!(defaults.disk_bytes, None);
+    assert_eq!(defaults.process_count, None);
 
     let source = format!(
-        "version = 1\nnetwork = 'networked'\n[resources]\ncpus = {MAX_CPUS}\nmemory = '{}GiB'\ndisk = '{}GiB'\n",
-        MAX_MEMORY_BYTES / 1024_u64.pow(3),
-        MAX_DISK_BYTES / 1024_u64.pow(3)
+        "version = 1\nnetwork = 'networked'\n[resources]\ncpus = {MAX_CPUS}\nmemory = '{}GiB'\n",
+        MAX_MEMORY_BYTES / 1024_u64.pow(3)
     );
     let (_temp_max, max_spec) = spec(&source);
     let maximum = PolicyCompiler::compile(max_spec, &capabilities())
@@ -209,7 +208,19 @@ fn safe_resource_defaults_and_explicit_values_are_bounded() {
         .to_owned();
     assert_eq!(maximum.cpus, Some(MAX_CPUS));
     assert_eq!(maximum.memory_bytes, Some(MAX_MEMORY_BYTES));
-    assert_eq!(maximum.disk_bytes, Some(MAX_DISK_BYTES));
+    assert_eq!(maximum.disk_bytes, None);
+    assert_eq!(maximum.process_count, None);
+}
+
+#[test]
+fn explicit_disk_control_is_rejected_as_unsupported() {
+    let (_temp, spec) = spec("version = 1\nnetwork = 'networked'\n[resources]\ndisk = '80GiB'\n");
+    assert_eq!(
+        PolicyCompiler::compile(spec, &capabilities())
+            .expect_err("unproven disk controls must fail closed")
+            .code(),
+        "disk_control_unsupported"
+    );
 }
 
 #[test]
@@ -217,7 +228,7 @@ fn resources_above_any_maximum_are_rejected() {
     for (source, code) in [
         ("[resources]\ncpus = 17\n", "cpus_exceed_maximum"),
         ("[resources]\nmemory = '65GiB'\n", "memory_exceeds_maximum"),
-        ("[resources]\ndisk = '513GiB'\n", "disk_exceeds_maximum"),
+        ("[resources]\ndisk = '513GiB'\n", "disk_control_unsupported"),
     ] {
         let manifest = format!("version = 1\nnetwork = 'networked'\n{source}");
         let (_temp, spec) = spec(&manifest);
