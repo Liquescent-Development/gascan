@@ -15,10 +15,10 @@ grep -Fq 'campd' "$dockerfile"
 grep -Fq 'select-gascamp' "$dockerfile"
 
 reference_file=${GASCAN_IMAGE_REF_FILE:-"$root/.artifacts/workspace-image-ref"}
-if [[ ! -f "$reference_file" ]]; then
-  printf 'SKIP live Gascamp image smoke: missing image reference %s\n' "$reference_file"
-  exit 0
-fi
+test -f "$reference_file" || {
+  printf 'missing Gascamp image reference: %s\n' "$reference_file" >&2
+  exit 1
+}
 
 container_bin=${CONTAINER_BIN:-container}
 image=$(cat "$reference_file")

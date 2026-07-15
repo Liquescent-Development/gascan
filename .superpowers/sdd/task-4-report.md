@@ -102,3 +102,38 @@ all exited 0
 ## Commit
 
 Commit SHA: `bc6deaa` (the final amended commit SHA is included in the handoff response).
+
+## Follow-up: fail-closed image gate
+
+The review finding was reproduced with a subprocess contract test before changing the smoke script:
+
+```text
+$ cargo test --offline --manifest-path scripts/Cargo.toml --test image_user_contract gascamp_smoke_fails_closed_without_a_built_image_reference -- --exact
+running 1 test
+test gascamp_smoke_fails_closed_without_a_built_image_reference ... FAILED
+assertion failed: !output.status.success()
+test result: FAILED. 0 passed; 1 failed
+```
+
+The missing-reference branch now emits a clear error on stderr and exits nonzero. Fresh verification:
+
+```text
+$ cargo test --offline --manifest-path scripts/Cargo.toml --test image_user_contract
+running 4 tests
+test gascamp_smoke_fails_closed_without_a_built_image_reference ... ok
+test result: ok. 4 passed; 0 failed
+
+$ cargo test --offline -p gascan-core --test gascamp_source
+running 3 tests
+test result: ok. 3 passed; 0 failed
+
+$ GASCAN_IMAGE_REF_FILE=.artifacts/definitely-missing ./tests/image/gascamp-smoke.sh
+missing Gascamp image reference: .artifacts/definitely-missing
+exit 1 (expected)
+
+$ bash -n tests/image/gascamp-smoke.sh images/workspace/bin/select-gascamp
+$ git diff --check
+both exited 0
+```
+
+Live image acceptance remains unclaimed; the required image reference is still unavailable.

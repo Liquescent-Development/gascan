@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{fs, path::Path, process::Command};
 
 fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
@@ -84,4 +84,20 @@ fn smoke_fixture_uses_built_ref_and_checks_signal_and_zombies() {
     }
     assert_eq!(smoke.matches("--mount ").count(), 1);
     assert!(!smoke.contains("container run"));
+}
+
+#[test]
+fn gascamp_smoke_fails_closed_without_a_built_image_reference() {
+    let missing = root().join(".artifacts/definitely-missing-gascamp-image-ref");
+    let output = Command::new("bash")
+        .arg(root().join("tests/image/gascamp-smoke.sh"))
+        .env("GASCAN_IMAGE_REF_FILE", &missing)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        format!("missing Gascamp image reference: {}\n", missing.display())
+    );
 }
