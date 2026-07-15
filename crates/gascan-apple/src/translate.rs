@@ -1,6 +1,12 @@
 use std::net::{IpAddr, Ipv4Addr};
 
-use gascan_core::runtime::{CreateRequest, RuntimeNetwork, RuntimeUser};
+use std::collections::BTreeMap;
+
+use camino::Utf8PathBuf;
+use gascan_core::runtime::{
+    CreateRequest, OwnershipMetadata, RuntimeNetwork, RuntimePort, RuntimeResourceLimits,
+    RuntimeUser,
+};
 use gascan_core::sandbox::SandboxId;
 use thiserror::Error;
 
@@ -8,6 +14,71 @@ use crate::CommandSpec;
 
 const MANAGED_BY: &str = "gascan";
 const WORKSPACE_TARGET: &str = "/workspace";
+
+#[derive(Clone)]
+struct CreateView {
+    id: SandboxId,
+    image: String,
+    bind_mounts: Vec<BindMountView>,
+    volumes: Vec<VolumeView>,
+    ports: Vec<RuntimePort>,
+    environment: BTreeMap<String, String>,
+    resources: RuntimeResourceLimits,
+    network: RuntimeNetwork,
+    user: RuntimeUser,
+    init: bool,
+    ownership: OwnershipMetadata,
+}
+
+#[derive(Clone)]
+struct BindMountView {
+    source: Utf8PathBuf,
+    target: Utf8PathBuf,
+    writable: bool,
+}
+
+#[derive(Clone)]
+struct VolumeView {
+    name: String,
+    target: Utf8PathBuf,
+    writable: bool,
+    ownership: OwnershipMetadata,
+}
+
+impl CreateView {
+    fn from_request(request: &CreateRequest) -> Self {
+        Self {
+            id: request.id().clone(),
+            image: request.image().to_owned(),
+            bind_mounts: request
+                .bind_mounts()
+                .iter()
+                .map(|mount| BindMountView {
+                    source: mount.source.clone(),
+                    target: mount.target.clone(),
+                    writable: mount.writable,
+                })
+                .collect(),
+            volumes: request
+                .volumes()
+                .iter()
+                .map(|volume| VolumeView {
+                    name: volume.name.clone(),
+                    target: volume.target.clone(),
+                    writable: volume.writable,
+                    ownership: volume.ownership.clone(),
+                })
+                .collect(),
+            ports: request.ports().to_vec(),
+            environment: request.environment().clone(),
+            resources: *request.resources(),
+            network: request.network(),
+            user: request.user(),
+            init: request.init(),
+            ownership: request.ownership().clone(),
+        }
+    }
+}
 
 pub struct AppleCommandBuilder;
 
@@ -22,9 +93,10 @@ impl AppleCommandBuilder {
     }
 
     pub fn create(request: &CreateRequest) -> Result<CommandSpec, TranslationError> {
-        validate_request(request)?;
+        let view = CreateView::from_request(request);
+        validate_view(&view)?;
 
-        let id = request.id().as_str();
+        let id = view.id.as_str();
         let mut args = vec![
             "run".to_owned(),
             "--name".to_owned(),
@@ -35,7 +107,7 @@ impl AppleCommandBuilder {
             format!("dev.gascan.sandbox-id={id}"),
         ];
 
-        let mount = &request.bind_mounts()[0];
+        let mount = &view.bind_mounts[0];
         args.extend([
             "--mount".to_owned(),
             format!(
@@ -43,17 +115,17 @@ impl AppleCommandBuilder {
                 mount.source
             ),
         ]);
-        for volume in request.volumes() {
+        for volume in &view.volumes {
             args.extend([
                 "--volume".to_owned(),
                 format!("{}:{}", volume.name, volume.target),
             ]);
         }
-        for (key, value) in request.environment() {
+        for (key, value) in &view.environment {
             args.extend(["--env".to_owned(), format!("{key}={value}")]);
         }
 
-        let resources = request.resources();
+        let resources = &view.resources;
         args.extend([
             "--cpus".to_owned(),
             resources
@@ -69,7 +141,7 @@ impl AppleCommandBuilder {
             "--detach".to_owned(),
         ]);
 
-        for port in request.ports() {
+        for port in &view.ports {
             args.extend([
                 "--publish".to_owned(),
                 format!(
@@ -78,23 +150,23 @@ impl AppleCommandBuilder {
                 ),
             ]);
         }
-        if request.network() == RuntimeNetwork::Offline {
+        if view.network == RuntimeNetwork::Offline {
             args.extend(["--network".to_owned(), "none".to_owned()]);
         }
-        args.push(request.image().to_owned());
+        args.push(view.image);
 
         Ok(CommandSpec::new("container", args))
     }
 }
 
-fn validate_request(request: &CreateRequest) -> Result<(), TranslationError> {
-    validate_image(request.image())?;
-    let id = request.id();
-    let ownership = request.ownership();
+fn validate_view(view: &CreateView) -> Result<(), TranslationError> {
+    validate_image(&view.image)?;
+    let id = &view.id;
+    let ownership = &view.ownership;
     if ownership.managed_by != MANAGED_BY || ownership.sandbox_id != *id {
         return Err(TranslationError::InvalidOwnership);
     }
-    let [mount] = request.bind_mounts() else {
+    let [mount] = view.bind_mounts.as_slice() else {
         return Err(TranslationError::InvalidWorkspaceMount);
     };
     let canonical_source = std::fs::canonicalize(mount.source.as_std_path()).ok();
@@ -116,11 +188,10 @@ fn validate_request(request: &CreateRequest) -> Result<(), TranslationError> {
             "/home/workspace/.config/gascan",
         ),
     ];
-    if request.volumes().len() != expected_volumes.len() {
+    if view.volumes.len() != expected_volumes.len() {
         return Err(TranslationError::InvalidOwnedVolume);
     }
-    for (volume, (expected_name, expected_target)) in request.volumes().iter().zip(expected_volumes)
-    {
+    for (volume, (expected_name, expected_target)) in view.volumes.iter().zip(expected_volumes) {
         if volume.name != expected_name
             || volume.target.as_str() != expected_target
             || !volume.writable
@@ -129,23 +200,29 @@ fn validate_request(request: &CreateRequest) -> Result<(), TranslationError> {
             return Err(TranslationError::InvalidOwnedVolume);
         }
     }
-    if request
-        .ports()
+    if view
+        .ports
         .iter()
         .any(|port| port.host_address != IpAddr::V4(Ipv4Addr::LOCALHOST))
     {
         return Err(TranslationError::NonLoopbackPort);
     }
-    if request.resources().disk_bytes.is_some() {
+    if view.resources.disk_bytes.is_some() {
         return Err(TranslationError::UnsupportedControl("disk"));
     }
-    if request.resources().process_count.is_some() {
+    if view.resources.process_count.is_some() {
         return Err(TranslationError::UnsupportedControl("process_count"));
     }
-    if request.user() != RuntimeUser::Workspace {
+    if view.resources.cpus.is_none() {
+        return Err(TranslationError::MissingControl("cpus"));
+    }
+    if view.resources.memory_bytes.is_none() {
+        return Err(TranslationError::MissingControl("memory"));
+    }
+    if view.user != RuntimeUser::Workspace {
         return Err(TranslationError::UnsupportedUser);
     }
-    if !request.init() {
+    if !view.init {
         return Err(TranslationError::InitRequired);
     }
     Ok(())
@@ -211,12 +288,11 @@ mod tests {
     use gascan_core::manifest::Manifest;
     use gascan_core::policy::PolicyCompiler;
     use gascan_core::runtime::{
-        CreateRequest, CreateRequestTestMutation, NetworkIsolation, RuntimeCapabilities,
-        RuntimeVersion,
+        CreateRequest, NetworkIsolation, RuntimeCapabilities, RuntimeVersion,
     };
     use gascan_core::sandbox::SandboxSpec;
 
-    use super::{AppleCommandBuilder, TranslationError};
+    use super::{AppleCommandBuilder, CreateView, TranslationError, validate_view};
 
     fn request() -> (tempfile::TempDir, CreateRequest) {
         let temp = tempfile::tempdir().expect("temporary translation validation root");
@@ -243,67 +319,119 @@ mod tests {
         (temp, request)
     }
 
-    fn assert_mutation_error(mutation: CreateRequestTestMutation, expected: TranslationError) {
+    fn assert_view_error(mutate: impl FnOnce(&mut CreateView), expected: TranslationError) {
         let (_root, request) = request();
-        let mutated = request.test_mutated(mutation);
-        let error = AppleCommandBuilder::create(&mutated).expect_err("mutation must fail closed");
+        let mut view = CreateView::from_request(&request);
+        mutate(&mut view);
+        let error = validate_view(&view).expect_err("mutation must fail closed");
         assert_eq!(error, expected);
         assert_eq!(error.code(), expected.code());
     }
 
     #[test]
     fn rejects_every_ownership_mount_and_volume_invariant() {
-        for mutation in [
-            CreateRequestTestMutation::OwnershipManagedByMismatch,
-            CreateRequestTestMutation::OwnershipSandboxMismatch,
-        ] {
-            assert_mutation_error(mutation, TranslationError::InvalidOwnership);
-        }
-        for mutation in [
-            CreateRequestTestMutation::MissingBind,
-            CreateRequestTestMutation::ExtraBind,
-            CreateRequestTestMutation::NoncanonicalBind,
-            CreateRequestTestMutation::NonwritableBind,
-        ] {
-            assert_mutation_error(mutation, TranslationError::InvalidWorkspaceMount);
-        }
-        for mutation in [
-            CreateRequestTestMutation::MissingVolume,
-            CreateRequestTestMutation::ExtraVolume,
-            CreateRequestTestMutation::UnownedVolume,
-            CreateRequestTestMutation::WrongVolumeTarget,
-            CreateRequestTestMutation::ReadonlyVolume,
-        ] {
-            assert_mutation_error(mutation, TranslationError::InvalidOwnedVolume);
-        }
+        assert_view_error(
+            |view| view.ownership.managed_by = "foreign".to_owned(),
+            TranslationError::InvalidOwnership,
+        );
+        assert_view_error(
+            |view| view.ownership.sandbox_id = gascan_core::sandbox::SandboxId::test("mismatch"),
+            TranslationError::InvalidOwnership,
+        );
+        assert_view_error(
+            |view| view.bind_mounts.clear(),
+            TranslationError::InvalidWorkspaceMount,
+        );
+        assert_view_error(
+            |view| view.bind_mounts.push(view.bind_mounts[0].clone()),
+            TranslationError::InvalidWorkspaceMount,
+        );
+        assert_view_error(
+            |view| view.bind_mounts[0].source.push(".."),
+            TranslationError::InvalidWorkspaceMount,
+        );
+        assert_view_error(
+            |view| view.bind_mounts[0].writable = false,
+            TranslationError::InvalidWorkspaceMount,
+        );
+        assert_view_error(
+            |view| {
+                view.volumes.pop();
+            },
+            TranslationError::InvalidOwnedVolume,
+        );
+        assert_view_error(
+            |view| view.volumes.push(view.volumes[0].clone()),
+            TranslationError::InvalidOwnedVolume,
+        );
+        assert_view_error(
+            |view| view.volumes[0].ownership.managed_by = "foreign".to_owned(),
+            TranslationError::InvalidOwnedVolume,
+        );
+        assert_view_error(
+            |view| view.volumes[0].target = "/unexpected".into(),
+            TranslationError::InvalidOwnedVolume,
+        );
+        assert_view_error(
+            |view| view.volumes[0].writable = false,
+            TranslationError::InvalidOwnedVolume,
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_bind_target_with_the_exact_typed_error() {
+        assert_view_error(
+            |view| view.bind_mounts[0].target = "/not-workspace".into(),
+            TranslationError::InvalidWorkspaceMount,
+        );
+    }
+
+    #[test]
+    fn rejects_unexpected_volume_name_without_changing_required_count() {
+        assert_view_error(
+            |view| view.volumes[0].name = "gascan-unexpected".to_owned(),
+            TranslationError::InvalidOwnedVolume,
+        );
+    }
+
+    #[test]
+    fn rejects_volume_ownership_sandbox_mismatch() {
+        assert_view_error(
+            |view| {
+                view.volumes[0].ownership.sandbox_id =
+                    gascan_core::sandbox::SandboxId::test("mismatch")
+            },
+            TranslationError::InvalidOwnedVolume,
+        );
     }
 
     #[test]
     fn rejects_every_port_resource_user_and_init_invariant() {
-        assert_mutation_error(
-            CreateRequestTestMutation::NonLoopbackPort,
+        assert_view_error(
+            |view| view.ports[0].host_address = "0.0.0.0".parse().expect("valid test IP"),
             TranslationError::NonLoopbackPort,
         );
-        for (mutation, control) in [
-            (CreateRequestTestMutation::DiskSome, "disk"),
-            (CreateRequestTestMutation::ProcessSome, "process_count"),
-        ] {
-            assert_mutation_error(mutation, TranslationError::UnsupportedControl(control));
-        }
-        for (mutation, control) in [
-            (CreateRequestTestMutation::MissingCpu, "cpus"),
-            (CreateRequestTestMutation::MissingMemory, "memory"),
-        ] {
-            assert_mutation_error(mutation, TranslationError::MissingControl(control));
-        }
-        assert_mutation_error(
-            CreateRequestTestMutation::RootUser,
+        assert_view_error(
+            |view| view.resources.disk_bytes = Some(1),
+            TranslationError::UnsupportedControl("disk"),
+        );
+        assert_view_error(
+            |view| view.resources.process_count = Some(1),
+            TranslationError::UnsupportedControl("process_count"),
+        );
+        assert_view_error(
+            |view| view.resources.cpus = None,
+            TranslationError::MissingControl("cpus"),
+        );
+        assert_view_error(
+            |view| view.resources.memory_bytes = None,
+            TranslationError::MissingControl("memory"),
+        );
+        assert_view_error(
+            |view| view.user = gascan_core::runtime::RuntimeUser::Root,
             TranslationError::UnsupportedUser,
         );
-        assert_mutation_error(
-            CreateRequestTestMutation::InitFalse,
-            TranslationError::InitRequired,
-        );
+        assert_view_error(|view| view.init = false, TranslationError::InitRequired);
     }
 
     #[test]
