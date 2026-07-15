@@ -52,12 +52,25 @@ successful build records the final `linux/arm64` image reference and digest.
 
 ## Gascamp Credential Boundary
 
-Private Gascamp access must use an Apple builder-supported secret mechanism or
-a connected CI-produced, digest-verified source artifact. A token must never be
-passed through `ARG`, copied into the build context, persisted in a layer,
-printed in logs, or included in evidence. The connected-image implementation
-plan must select and test one of these mechanisms before a live build is
-accepted.
+Private Gascamp access uses Apple BuildKit's secret mount. Apple
+Containerization 1.1.0 requires the secret source to be a descendant of the
+host context directory, so the build orchestrator copies the validated
+owner-only token into a fresh `0700` temporary context under a fixed private
+path with mode `0600`. That path is excluded by `.dockerignore` and supplied
+only through `--secret`; it is not part of the transmitted Docker build
+context.
+
+The original token remains outside the repository, and both it and the staged
+copy must be regular files owned by the current UID with mode `0600`. The
+staged token must never be referenced by `COPY`, passed through `ARG` or `ENV`,
+persisted in a layer, printed in logs, included in evidence, or left after the
+build. Tests must prove exclusion from the transmitted context and absence
+from command text, transcripts, image history, and the exported final
+filesystem. Cleanup must cover success, failure, `INT`, and `TERM`.
+
+This is the approved MVP boundary. A connected CI-produced, digest-verified
+source artifact remains a future alternative if the local builder boundary
+proves insufficient.
 
 ## Deferred Offline Build
 
@@ -90,8 +103,9 @@ The connected workspace image plan must:
 1. replace the offline-only build invocation with a connected, locked build;
 2. preserve the reviewed workspace user, guest-root sudo, tini, volumes, mise,
    Chromium, Gascamp selector, and exact inventory contracts;
-3. prove private Gascamp credentials leave no layer, context, log, or evidence
-   residue;
+3. prove private Gascamp credentials are excluded from the transmitted build
+   context and leave no temporary-file, layer, command-text, log, filesystem,
+   or evidence residue;
 4. build and smoke-test a digest-qualified `linux/arm64` image on Apple
    Containerization 1.1;
 5. hand that exact image reference to the reviewed Gate 4 lifecycle harness;

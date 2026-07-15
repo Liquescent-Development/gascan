@@ -8,7 +8,10 @@ code. Verify branch heads rather than assuming the paths below still exist.
 
 The 2026-07-15 documentation work made current state durable; it did not start
 a new implementation effort. The connected workspace image document is a
-focused continuation addendum to existing Plan 4. No addendum task has begun.
+focused continuation addendum to existing Plan 4. Addendum Task 1 began on
+2026-07-15 and exposed an Apple BuildKit 0.12.0 restriction: secret `src`
+paths must be descendants of the host context directory. No Task 1 commit or
+PASS evidence was produced from that failed attempt.
 
 ## Product Boundary
 
@@ -35,8 +38,14 @@ the polyglot toolchain.
 - The earlier builder-egress failure was caused by a local firewall. A strict
   apt-bootstrap-plus-HTTPS diagnostic build passed after correction.
 - Offline ARM64 bundles are deferred hardening and are not a Gate 4 prerequisite.
-- Private Gascamp credentials must never persist in build context, layers,
-  logs, or evidence.
+- Private Gascamp credentials must never enter the transmitted Docker build
+  context or persist in layers, logs, evidence, or temporary host files after
+  cleanup.
+- For the MVP on Apple Containerization 1.1.0, the validated external Gascamp
+  token is copied into a fresh private host context, excluded from the
+  transmitted Docker context by `.dockerignore`, mounted only as a BuildKit
+  secret, and removed through bounded cleanup. This supersedes the infeasible
+  external-`src` command shape while preserving non-retention requirements.
 
 ## Roadmap Status
 
@@ -121,10 +130,11 @@ Do not encode the operator DNS IP into Gas Can product policy.
 
 ## Current Unfinished Work
 
-1. Execute `docs/superpowers/plans/2026-07-15-connected-workspace-image.md`
-   task by task with independent review gates only after a future session
-   explicitly resumes implementation. The user has preselected subagent-driven
-   execution; begin with Task 1 and do not re-plan the program.
+1. Resume Task 1 of
+   `docs/superpowers/plans/2026-07-15-connected-workspace-image.md` using the
+   approved private-context staging boundary, then continue task by task with
+   independent review gates. The user has preselected subagent-driven
+   execution; do not re-plan the program.
 2. Convert the image path from mandatory offline bundles to connected locked
    acquisition while preserving all reviewed image contracts.
 3. Select and prove the private Gascamp credential boundary.

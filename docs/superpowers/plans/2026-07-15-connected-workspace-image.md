@@ -28,8 +28,8 @@
 - The existing offline bundle producers, validators, snapshot helper, and PENDING evidence remain truthful deferred work; do not delete their commits or claim their gate.
 - Ubuntu package metadata is authenticated by the Ubuntu archive keyring. Bootstrap may use the distribution's signed HTTP apt source; general artifact downloads use HTTPS and locked digests where the upstream publishes stable bytes.
 - Every mise tool version exactly matches `images/workspace/versions.lock` and `images/workspace/etc/mise/config.toml`; `latest`, `stable`, `lts`, and wildcard selectors are forbidden.
-- Gascamp is exactly revision `f6b248c5926240856dbea83d1d2c5c90ea1c1456`. Cargo commands use `--locked`. The private read token is supplied only from an owner-only file outside the repository through a BuildKit secret mount.
-- The token value must never appear in Dockerfile arguments, environment declarations, the build context, image history, image filesystem, build transcript, evidence, or process command text constructed by Gas Can.
+- Gascamp is exactly revision `f6b248c5926240856dbea83d1d2c5c90ea1c1456`. Cargo commands use `--locked`. The private read token originates in an owner-only file outside the repository. For Apple Containerization 1.1.0, Gas Can stages a `0600` copy beneath a fresh `0700` temporary host context and supplies that copy only through a BuildKit secret mount.
+- The staged secret path is excluded by `.dockerignore` and must not enter the transmitted Docker build context. The token value must never appear in Dockerfile arguments, environment declarations, transmitted context content, image history, image filesystem, build transcript, evidence, or process command text constructed by Gas Can.
 - The final image default is `workspace:workspace` UID/GID 1000. Guest root remains available through the reviewed passwordless sudo policy. tini, volumes, Chromium, selector, ownership, and read-only bundled-tool contracts remain unchanged.
 - Every live test creates exact token-owned names, validates ownership before mutation, handles `INT` and `TERM`, bounds waits, and proves no current-token resource remains.
 - Gate 4 remains pending until its complete real CLI lifecycle passes; a successful image gate is not Gate 4 evidence.
@@ -44,8 +44,8 @@
 - Create: `docs/evidence/apple-build-secret.md`
 
 **Interfaces:**
-- Consumes: `GASCAN_TEST_SECRET_FILE`, an absolute current-UID regular file with mode `0600` and a synthetic test value.
-- Produces: reviewed command shape `container build --secret id=gascamp_read_token,src=$canonical_secret_path` and evidence that `/run/secrets/gascamp_read_token` exists only for the mounted `RUN` instruction.
+- Consumes: `GASCAN_TEST_SECRET_FILE`, an absolute current-UID regular file outside the repository with mode `0600` and a synthetic test value.
+- Produces: a fresh `0700` host context containing a `0600` staged copy at `.build-secrets/gascamp_read_token`, a `.dockerignore` entry that excludes `.build-secrets`, reviewed command shape `container build --secret id=gascamp_read_token,src=$staged_secret`, and evidence that the value is absent from the transmitted context while `/run/secrets/gascamp_read_token` exists only for the mounted `RUN` instruction.
 
 - [ ] **Step 1: Write the failing secret-probe contract**
 
@@ -58,7 +58,8 @@ fn probe_requires_private_external_file_and_checks_non_retention() {
     for required in [
         "test \"$uid\" = \"$(stat -f %u \"$secret\")\"",
         "test \"600\" = \"$(stat -f %Lp \"$secret\")\"",
-        "--secret \"id=gascamp_read_token,src=$secret\"",
+        "printf '%s\\n' '.build-secrets' >\"$context/.dockerignore\"",
+        "--secret \"id=gascamp_read_token,src=$staged_secret\"",
         "RUN --mount=type=secret,id=gascamp_read_token,required=true",
         "test ! -e /run/secrets/gascamp_read_token",
         "container image inspect --format json",
@@ -72,7 +73,7 @@ fn probe_requires_private_external_file_and_checks_non_retention() {
 }
 ```
 
-Add a fake `container` test that records arguments, returns a structured inspect fixture, and asserts the synthetic secret value never occurs in argv, stdout, stderr, the generated Dockerfile, or the retained context.
+Add a fake `container` test that records arguments, returns a structured inspect fixture, models `.dockerignore` processing, and asserts the synthetic secret value never occurs in argv, stdout, stderr, the generated Dockerfile, or the retained transmitted-context fixture. It must also prove that the staged source is beneath the private host context and is removed by cleanup.
 
 - [ ] **Step 2: Run the focused test and verify RED**
 
@@ -91,10 +92,18 @@ The script must:
 1. canonicalize the supplied path and reject repository descendants;
 2. verify current UID ownership, `0600`, regular-file type, and one nonempty line;
 3. create a private `0700` temporary context;
-4. build a two-step synthetic Dockerfile whose first step compares a SHA-256 supplied separately from the secret and whose second step proves the mount is absent;
-5. inspect the resulting image structurally;
-6. search the context, captured transcript, image history/inspect JSON, and an exported stopped test container filesystem for the synthetic value;
-7. clean only its token-owned container, image tag, and private context through traps.
+4. copy the secret to `.build-secrets/gascamp_read_token` with mode `0600`, write an exact `.dockerignore` exclusion for `.build-secrets`, and reject a symlink or ownership/mode mismatch after staging;
+5. prove the staged secret is absent from a separately captured representation of the transmitted context before invoking the builder;
+6. build a two-step synthetic Dockerfile whose first step compares a SHA-256 supplied separately from the secret and whose second step proves the mount is absent;
+7. inspect the resulting image structurally;
+8. search the transmitted-context fixture, captured transcript, image history/inspect JSON, and an exported stopped test container filesystem for the synthetic value;
+9. clean only its token-owned container, image tag, staged secret, and private context through traps on success, failure, `INT`, and `TERM`.
+
+The host context directory itself contains the staged secret because Apple
+BuildKit 0.12.0 rejects external `src` paths. Acceptance depends on proving
+that `.dockerignore` prevents the staged path from entering the transmitted
+Docker build context; merely placing the file beneath the host context is not
+sufficient evidence.
 
 The Dockerfile fragment is:
 
@@ -418,14 +427,15 @@ git commit -m "build: compile pinned Gascamp with build secret"
 - Modify: `scripts/tests/image_lock.rs`
 
 **Interfaces:**
-- Consumes: Task 2 context, canonical context digest, exact local base inspection, and `GASCAMP_READ_TOKEN_FILE` validated by Task 1 rules.
+- Consumes: Task 2 context, canonical context digest, exact local base inspection, and `GASCAMP_READ_TOKEN_FILE` validated and privately staged by Task 1 rules.
 - Produces: atomic `.artifacts/workspace-image-ref` matching exactly `^gascan-workspace:[a-z0-9._-]+@sha256:[0-9a-f]{64}$` and `.artifacts/workspace-image-build.json` containing platform, lock digest, context digest, image digest, Apple version, and sanitized timestamps/status.
 
 - [ ] **Step 1: Write failing fake-runner tests**
 
 Cover these cases with a fake `container` executable:
 
-- missing, relative, foreign-owned, group/world-readable, symlink, empty, or repository-contained secret file fails before `container build`;
+- missing, relative, foreign-owned, group/world-readable, symlink, empty, or repository-contained source secret file fails before staging or `container build`;
+- staged-secret creation, permission, `.dockerignore`, or transmitted-context exclusion failure prevents `container build`;
 - context verification failure or changed post-build digest fails without publishing a reference;
 - build invocation has exactly one `--secret`, exact `BASE_IMAGE`, exact `GASCAMP_REVISION`, `--arch arm64`, and no token value;
 - structured inspect must report `linux/arm64` and the exact built tag;
@@ -438,7 +448,7 @@ The expected invocation slice is:
 ```rust
 let required = [
     "build", "--arch", "arm64",
-    "--secret", "id=gascamp_read_token,src=/private/token/path",
+    "--secret", "id=gascamp_read_token,src=/private/context/.build-secrets/gascamp_read_token",
     "--build-arg", "BASE_IMAGE=ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab",
     "--build-arg", "GASCAMP_REVISION=f6b248c5926240856dbea83d1d2c5c90ea1c1456",
 ];
@@ -456,7 +466,7 @@ Expected: FAIL because the connected orchestrator and validator do not exist.
 
 Make `scripts/build-workspace-image.sh` a mode dispatcher driven by the exact lock value. For `connected`, exec `build-connected-workspace-image.sh`; retain the old implementation under `scripts/build-offline-workspace-image.sh` for deferred use, but do not allow `auto` fallback between modes.
 
-The connected script must use the already-reviewed privileged snapshot helper to close context TOCTOU, pass the external secret file directly to BuildKit, reverify context after build, inspect structurally, and atomically publish both receipts. It must never capture or print the secret.
+The connected script must use the already-reviewed privileged snapshot helper to close context TOCTOU, stage the validated external secret beneath the private snapshot using the Task 1 boundary, pass only that staged path to BuildKit, reverify the public context and secret exclusion after build, inspect structurally, and atomically publish both receipts. It must never capture or print the secret.
 
 - [ ] **Step 4: Run focused and full scripts suites**
 
