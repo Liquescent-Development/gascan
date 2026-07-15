@@ -31,6 +31,7 @@ tonic.workspace = true
 tower.workspace = true
 
 [dev-dependencies]
+camino.workspace = true
 tempfile = "3"
 rustix-openpty = "0.2"
 
