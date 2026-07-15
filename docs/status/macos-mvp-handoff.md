@@ -55,7 +55,7 @@ the polyglot toolchain.
 | Phase 1 Apple feasibility / Gate 2 | Passed and integrated | `6bedef8`, `docs/feasibility/apple-container-report.md` |
 | Phase 1 core control plane / Gate 3 | Passed and integrated | `7c7d083`, integration record `917dac1` |
 | Phase 2 Apple backend implementation | Implemented and reviewed on feature branch; not integrated | head `dbf4235` |
-| Phase 2 workspace image | Offline implementation exists; connected MVP Task 1 secret isolation is approved; Tasks 2–7 remain | provisioning head includes `44bb3b2`, `docs/evidence/apple-build-secret.md`, and the connected-build addendum |
+| Phase 2 workspace image | Offline implementation exists; connected MVP Tasks 1–2 are approved; Tasks 3–7 remain | provisioning head includes `1878744`, `docs/evidence/apple-build-secret.md`, and the connected-build addendum |
 | Gate 4 real lifecycle | Pending; harness approved but no complete real lifecycle evidence | harness `dbf4235` |
 | Phase 3 security, packaging, release | Not started as an integrated phase | blocked by Gate 4 |
 | Gate 5 clean-host release | Pending | no evidence |
@@ -108,6 +108,8 @@ The harness is approved; Gate 4 itself is not passed.
 - `9025c56`: truthful PENDING offline image gate scaffold.
 - `44bb3b2`: approved Apple BuildKit staged-secret isolation probe and live
   non-retention evidence, including bounded ownership-checked cleanup.
+- `1878744`: approved connected lock, public acquisition boundary, and atomic
+  minimal context preparation with offline mode preserved.
 
 These offline commits are reviewed assets, not completed publication or live
 image evidence. `images/workspace/versions.lock` still says
@@ -132,10 +134,10 @@ Do not encode the operator DNS IP into Gas Can product policy.
 
 ## Current Unfinished Work
 
-1. Execute Task 2 of
+1. Execute Task 3 of
    `docs/superpowers/plans/2026-07-15-connected-workspace-image.md`, then
-   continue task by task with independent review gates. Task 1 is complete and
-   must not be redispatched. The user has preselected subagent-driven
+   continue task by task with independent review gates. Tasks 1–2 are complete
+   and must not be redispatched. The user has preselected subagent-driven
    execution; do not re-plan the program.
 2. Convert the image path from mandatory offline bundles to connected locked
    acquisition while preserving all reviewed image contracts.
