@@ -4,6 +4,13 @@ use serde_json::Value;
 use crate::{CommandRunner, CommandSpec};
 
 const VERSION_OPERATION: &str = "container system version";
+const STATUS_OPERATION: &str = "container system status";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppleSystemStatus {
+    pub app_root: String,
+    pub api_server_version: RuntimeVersion,
+}
 
 /// Probes the installed Apple Container runtime through its structured CLI output.
 pub struct AppleProbe<R> {
@@ -18,6 +25,70 @@ impl<R> AppleProbe<R> {
 }
 
 impl<R: CommandRunner> AppleProbe<R> {
+    pub async fn status(&self) -> Result<AppleSystemStatus, RuntimeError> {
+        let output = self
+            .runner
+            .run(CommandSpec::new(
+                "container",
+                ["system", "status", "--format", "json"],
+            ))
+            .await?;
+        let value: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+            RuntimeError::InvalidOutput {
+                operation: STATUS_OPERATION.to_owned(),
+                message: error.to_string(),
+            }
+        })?;
+        let field = |name: &str| {
+            value
+                .get(name)
+                .and_then(Value::as_str)
+                .ok_or_else(|| RuntimeError::InvalidOutput {
+                    operation: STATUS_OPERATION.to_owned(),
+                    message: format!("missing string field {name}"),
+                })
+        };
+        if field("status")? != "running" {
+            return Err(RuntimeError::InvalidState {
+                resource: "Apple container service".to_owned(),
+                message: "service is not running".to_owned(),
+            });
+        }
+        if field("apiServerAppName")? != "container-apiserver"
+            || field("apiServerBuild")? != "release"
+            || field("apiServerCommit")?.is_empty()
+        {
+            return Err(RuntimeError::InvalidOutput {
+                operation: STATUS_OPERATION.to_owned(),
+                message: "unsupported service identity schema".to_owned(),
+            });
+        }
+        let raw_version = field("apiServerVersion")?;
+        let version = raw_version
+            .strip_prefix("container-apiserver version ")
+            .and_then(|value| {
+                value
+                    .split_once(" (build: release, commit: ")
+                    .map(|(version, _)| version)
+            })
+            .ok_or_else(|| RuntimeError::InvalidOutput {
+                operation: STATUS_OPERATION.to_owned(),
+                message: "unsupported apiServerVersion schema".to_owned(),
+            })?;
+        let api_server_version = parse_version(version)?;
+        let app_root = field("appRoot")?.to_owned();
+        if !app_root.starts_with('/') || app_root.is_empty() {
+            return Err(RuntimeError::InvalidOutput {
+                operation: STATUS_OPERATION.to_owned(),
+                message: "appRoot must be absolute".to_owned(),
+            });
+        }
+        Ok(AppleSystemStatus {
+            app_root,
+            api_server_version,
+        })
+    }
+
     /// Returns the supported Apple Container application version.
     pub async fn version(&self) -> Result<RuntimeVersion, RuntimeError> {
         let output = self
@@ -51,6 +122,18 @@ impl<R: CommandRunner> AppleProbe<R> {
                 operation: VERSION_OPERATION.to_owned(),
                 message: "container version must be a string".to_owned(),
             })?;
+        if entry.get("buildType").and_then(Value::as_str) != Some("release")
+            || entry
+                .get("commit")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+        {
+            return Err(RuntimeError::InvalidOutput {
+                operation: VERSION_OPERATION.to_owned(),
+                message: "container version entry requires release buildType and non-empty commit"
+                    .to_owned(),
+            });
+        }
         let version = parse_version(version_value)?;
         if version.major != 1 {
             return Err(RuntimeError::UnsupportedVersion {
@@ -64,19 +147,20 @@ impl<R: CommandRunner> AppleProbe<R> {
     /// Returns the conservative capability baseline for a supported runtime.
     pub async fn base_capabilities(&self) -> Result<RuntimeCapabilities, RuntimeError> {
         let version = self.version().await?;
+        let supported = version == RuntimeVersion::new(1, 1, 0);
         Ok(RuntimeCapabilities {
-            offline: if version == RuntimeVersion::new(1, 1, 0) {
+            offline: if supported {
                 NetworkIsolation::Proven
             } else {
                 NetworkIsolation::Unsupported
             },
             version,
-            bind_mounts: false,
-            named_volumes: false,
-            tty: false,
-            signals: false,
-            loopback_publish: false,
-            resource_limits: false,
+            bind_mounts: supported,
+            named_volumes: supported,
+            tty: supported,
+            signals: supported,
+            loopback_publish: supported,
+            resource_limits: supported,
         })
     }
 }

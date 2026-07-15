@@ -52,7 +52,7 @@ impl CommandRunner for StatefulAppleRunner {
         let args: Vec<&str> = spec.args.iter().map(String::as_str).collect();
         let value = match args.as_slice() {
             ["system", "version", "--format", "json"] => {
-                json!([{"appName":"container","version":"1.1.0"}])
+                json!([{"appName":"container","buildType":"release","commit":"signed-off","version":"1.1.0"}])
             }
             ["image", "pull", _] => json!(null),
             ["list", "--all", "--format", "json"] => {

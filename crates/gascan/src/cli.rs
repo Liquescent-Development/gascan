@@ -202,7 +202,7 @@ pub async fn execute() -> Result<i32, CliError> {
                         .unwrap_or_else(|_| serde_json::json!({"detail": capability.detail, "remedy": ""}));
                     serde_json::json!({
                         "id": capability.name,
-                        "status": if capability.available { "pass" } else { "fail" },
+                        "status": detail.get("status").and_then(serde_json::Value::as_str).unwrap_or(if capability.available { "pass" } else { "fail" }),
                         "detail": detail.get("detail").and_then(serde_json::Value::as_str).unwrap_or(""),
                         "remedy": detail.get("remedy").and_then(serde_json::Value::as_str).unwrap_or(""),
                     })
@@ -218,7 +218,7 @@ pub async fn execute() -> Result<i32, CliError> {
                         check["status"].as_str().unwrap_or("fail"),
                         check["detail"].as_str().unwrap_or("")
                     );
-                    if check["status"] == "fail" {
+                    if check["status"] != "pass" {
                         println!("  remedy: {}", check["remedy"].as_str().unwrap_or(""));
                     }
                 }

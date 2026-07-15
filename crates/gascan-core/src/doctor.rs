@@ -1,4 +1,3 @@
-use crate::runtime::{NetworkIsolation, RuntimeCapabilities};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -6,6 +5,206 @@ use serde::{Deserialize, Serialize};
 pub enum DoctorStatus {
     Pass,
     Fail,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DoctorFact {
+    pub status: DoctorStatus,
+    pub detail: String,
+}
+
+impl DoctorFact {
+    pub fn pass(detail: impl Into<String>) -> Self {
+        Self {
+            status: DoctorStatus::Pass,
+            detail: detail.into(),
+        }
+    }
+    pub fn fail(detail: impl Into<String>) -> Self {
+        Self {
+            status: DoctorStatus::Fail,
+            detail: detail.into(),
+        }
+    }
+    pub fn unknown(detail: impl Into<String>) -> Self {
+        Self {
+            status: DoctorStatus::Unknown,
+            detail: detail.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DoctorFacts {
+    pub architecture: DoctorFact,
+    pub macos: DoctorFact,
+    pub cli: DoctorFact,
+    pub version: DoctorFact,
+    pub service: DoctorFact,
+    pub kernel: DoctorFact,
+    pub schema: DoctorFact,
+    pub state_storage: DoctorFact,
+    pub image_storage: DoctorFact,
+    pub workspace: DoctorFact,
+    pub bind_mounts: DoctorFact,
+    pub named_volumes: DoctorFact,
+    pub tty: DoctorFact,
+    pub signals: DoctorFact,
+    pub loopback_publish: DoctorFact,
+    pub resource_limits: DoctorFact,
+    pub offline: DoctorFact,
+}
+
+impl DoctorFacts {
+    pub fn unavailable(detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        let fact = || DoctorFact::unknown(detail.clone());
+        Self {
+            architecture: fact(),
+            macos: fact(),
+            cli: fact(),
+            version: fact(),
+            service: fact(),
+            kernel: fact(),
+            schema: fact(),
+            state_storage: fact(),
+            image_storage: fact(),
+            workspace: fact(),
+            bind_mounts: fact(),
+            named_volumes: fact(),
+            tty: fact(),
+            signals: fact(),
+            loopback_publish: fact(),
+            resource_limits: fact(),
+            offline: fact(),
+        }
+    }
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn all_supported_for_tests() -> Self {
+        let pass = || DoctorFact::pass("verified test evidence");
+        Self {
+            architecture: pass(),
+            macos: pass(),
+            cli: pass(),
+            version: pass(),
+            service: pass(),
+            kernel: pass(),
+            schema: pass(),
+            state_storage: pass(),
+            image_storage: pass(),
+            workspace: pass(),
+            bind_mounts: pass(),
+            named_volumes: pass(),
+            tty: pass(),
+            signals: pass(),
+            loopback_publish: pass(),
+            resource_limits: pass(),
+            offline: pass(),
+        }
+    }
+
+    pub fn into_report(self) -> DoctorReport {
+        let entries = [
+            (
+                "host.architecture",
+                self.architecture,
+                "run gascan on Apple silicon",
+            ),
+            (
+                "host.macos",
+                self.macos,
+                "upgrade this host to macOS 26 or newer",
+            ),
+            (
+                "runtime.cli",
+                self.cli,
+                "install Apple container 1.1.0 in PATH",
+            ),
+            (
+                "runtime.version",
+                self.version,
+                "install the supported Apple container 1.1.0 release",
+            ),
+            (
+                "runtime.service",
+                self.service,
+                "run `container system start` and retry",
+            ),
+            (
+                "runtime.kernel",
+                self.kernel,
+                "run `container system start`, install its recommended kernel, and retry",
+            ),
+            (
+                "runtime.schema",
+                self.schema,
+                "install matching Apple container 1.1.0 CLI and service components",
+            ),
+            (
+                "storage.state",
+                self.state_storage,
+                "free disk space in the Apple container application root",
+            ),
+            (
+                "storage.images",
+                self.image_storage,
+                "free disk space in the Apple container content store",
+            ),
+            (
+                "workspace.access",
+                self.workspace,
+                "grant gascan read/write access to the canonical workspace",
+            ),
+            (
+                "runtime.bind_mounts",
+                self.bind_mounts,
+                "install a supported Apple container release with bind-mount support",
+            ),
+            (
+                "runtime.named_volumes",
+                self.named_volumes,
+                "install a supported Apple container release with named-volume support",
+            ),
+            (
+                "runtime.tty",
+                self.tty,
+                "install a supported Apple container release with TTY support",
+            ),
+            (
+                "runtime.signals",
+                self.signals,
+                "install a supported Apple container release with signal support",
+            ),
+            (
+                "runtime.loopback_publish",
+                self.loopback_publish,
+                "install a supported Apple container release with loopback publication support",
+            ),
+            (
+                "runtime.resource_limits",
+                self.resource_limits,
+                "install a supported Apple container release with resource-limit support",
+            ),
+            (
+                "runtime.offline",
+                self.offline,
+                "install a supported Apple container release with proven offline isolation",
+            ),
+        ];
+        DoctorReport {
+            checks: entries
+                .into_iter()
+                .map(|(id, fact, remedy)| DoctorCheck {
+                    id: id.to_owned(),
+                    status: fact.status,
+                    detail: fact.detail,
+                    remedy: remedy.to_owned(),
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -22,134 +221,12 @@ pub struct DoctorReport {
 }
 
 impl DoctorReport {
-    pub fn from_runtime(capabilities: &RuntimeCapabilities) -> Self {
-        let mut checks = vec![DoctorCheck {
-            id: "runtime.version".to_owned(),
-            status: DoctorStatus::Pass,
-            detail: format!(
-                "Apple container {}.{}.{}",
-                capabilities.version.major, capabilities.version.minor, capabilities.version.patch
-            ),
-            remedy: "install a supported Apple container CLI release".to_owned(),
-        }];
-        for (id, detail, remedy) in [
-            (
-                "host.architecture",
-                "aarch64 host architecture",
-                "run gascan on Apple silicon",
-            ),
-            (
-                "host.macos",
-                "macOS 26 or newer",
-                "upgrade this host to macOS 26 or newer",
-            ),
-            (
-                "runtime.cli",
-                "structured Apple container CLI",
-                "install the supported Apple container CLI",
-            ),
-            (
-                "runtime.service",
-                "Apple container service response",
-                "start or repair the Apple container service",
-            ),
-            (
-                "runtime.kernel",
-                "Apple container kernel readiness",
-                "allow Apple container to install and start its kernel",
-            ),
-            (
-                "runtime.schema",
-                "supported structured response schema",
-                "install a supported Apple container CLI and service",
-            ),
-            (
-                "storage.state",
-                "free state storage",
-                "free disk space in the gascan state directory",
-            ),
-            (
-                "storage.images",
-                "free image storage",
-                "free disk space in Apple container image storage",
-            ),
-            (
-                "workspace.access",
-                "workspace accessibility",
-                "grant gascan access to the workspace",
-            ),
-        ] {
-            checks.push(capability_check(id, true, detail, remedy));
-        }
-        for (id, available, detail, remedy) in [
-            (
-                "runtime.bind_mounts",
-                capabilities.bind_mounts,
-                "bind mounts",
-                "use an Apple container release with bind-mount support",
-            ),
-            (
-                "runtime.named_volumes",
-                capabilities.named_volumes,
-                "named volumes",
-                "use an Apple container release with named-volume support",
-            ),
-            (
-                "runtime.tty",
-                capabilities.tty,
-                "TTY attachment",
-                "use an Apple container release with TTY support",
-            ),
-            (
-                "runtime.signals",
-                capabilities.signals,
-                "signal forwarding",
-                "use an Apple container release with signal support",
-            ),
-            (
-                "runtime.loopback_publish",
-                capabilities.loopback_publish,
-                "loopback-only port publication",
-                "use an Apple container release with loopback publication support",
-            ),
-            (
-                "runtime.resource_limits",
-                capabilities.resource_limits,
-                "resource limits",
-                "use an Apple container release with resource-limit support",
-            ),
-        ] {
-            checks.push(capability_check(id, available, detail, remedy));
-        }
-        checks.push(capability_check(
-            "runtime.offline",
-            capabilities.offline == NetworkIsolation::Proven,
-            "hard offline networking",
-            "install a supported Apple container release with proven offline isolation",
-        ));
-        Self { checks }
-    }
-
     pub fn check(&self, id: &str) -> Option<&DoctorCheck> {
         self.checks.iter().find(|check| check.id == id)
     }
-
     pub fn is_ready(&self) -> bool {
         self.checks
             .iter()
             .all(|check| check.status == DoctorStatus::Pass)
-    }
-}
-
-fn capability_check(id: &str, available: bool, detail: &str, remedy: &str) -> DoctorCheck {
-    DoctorCheck {
-        id: id.to_owned(),
-        status: if available {
-            DoctorStatus::Pass
-        } else {
-            DoctorStatus::Fail
-        },
-        detail: detail.to_owned(),
-        remedy: remedy.to_owned(),
     }
 }

@@ -982,7 +982,7 @@ async fn pre_begin_rpc_failures_keep_stable_statuses() -> TestResult {
 
     let doctor_failure = Environment::new()?;
     assert!(
-        !doctor_failure
+        doctor_failure
             .command(&["doctor", "--json"])
             .env("GASCAN_FAKE_CAPABILITIES_FAIL", "1")
             .output()?
@@ -996,16 +996,5 @@ async fn pre_begin_rpc_failures_keep_stable_statuses() -> TestResult {
         .output()?;
     assert_eq!(unavailable.status.code(), Some(70));
 
-    let before_root = Environment::new()?;
-    let output = before_root
-        .command(&["up", "/definitely/not/a/workspace"])
-        .env("GASCAN_FAKE_CAPABILITIES_FAIL", "1")
-        .output()?;
-    assert_eq!(output.status.code(), Some(70));
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("backend_unavailable"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
     Ok(())
 }

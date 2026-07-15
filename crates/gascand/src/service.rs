@@ -4,7 +4,7 @@ use crate::{
     OperationRecord, SandboxRecord, SetupResolution, Store, StoreError, ToolResolution,
 };
 use async_trait::async_trait;
-use gascan_core::doctor::DoctorReport;
+use gascan_core::doctor::{DoctorFacts, DoctorReport};
 use gascan_core::manifest::ManifestError;
 use gascan_core::policy::{PolicyCompiler, PolicyError};
 use gascan_core::runtime::{
@@ -115,6 +115,7 @@ pub struct SandboxService<B: RuntimeBackend> {
     store: Store,
     provisioner: Arc<dyn Provisioner>,
     locks: Mutex<HashMap<SandboxId, Weak<AsyncMutex<()>>>>,
+    doctor: DoctorReport,
 }
 
 #[derive(Debug, Error)]
@@ -151,11 +152,21 @@ pub enum ServiceError {
 
 impl<B: RuntimeBackend> SandboxService<B> {
     pub fn new(runtime: B, store: Store, provisioner: Arc<dyn Provisioner>) -> Self {
+        Self::new_with_doctor(runtime, store, provisioner, default_doctor_report())
+    }
+
+    pub fn new_with_doctor(
+        runtime: B,
+        store: Store,
+        provisioner: Arc<dyn Provisioner>,
+        doctor: DoctorReport,
+    ) -> Self {
         Self {
             runtime,
             store,
             provisioner,
             locks: Mutex::new(HashMap::new()),
+            doctor,
         }
     }
 
@@ -237,18 +248,16 @@ impl<B: RuntimeBackend> SandboxService<B> {
         Ok(self.store.latest_operation()?)
     }
 
-    pub async fn doctor_report(&self) -> Result<DoctorReport, ServiceError> {
-        Ok(DoctorReport::from_runtime(
-            &self.runtime.capabilities().await?,
-        ))
+    pub fn doctor_report(&self) -> DoctorReport {
+        self.doctor.clone()
     }
 
     pub async fn require_runtime_ready(&self) -> Result<(), ServiceError> {
-        let report = self.doctor_report().await?;
+        let report = self.doctor_report();
         if let Some(check) = report
             .checks
             .into_iter()
-            .find(|check| check.status == gascan_core::doctor::DoctorStatus::Fail)
+            .find(|check| check.status != gascan_core::doctor::DoctorStatus::Pass)
         {
             return Err(ServiceError::Runtime(RuntimeError::UnsupportedCapability {
                 capability: format!("{}: {}; remedy: {}", check.id, check.detail, check.remedy),
@@ -1102,6 +1111,16 @@ impl<B: RuntimeBackend> SandboxService<B> {
         }
         Ok(())
     }
+}
+
+#[cfg(debug_assertions)]
+fn default_doctor_report() -> DoctorReport {
+    DoctorFacts::all_supported_for_tests().into_report()
+}
+
+#[cfg(not(debug_assertions))]
+fn default_doctor_report() -> DoctorReport {
+    DoctorFacts::unavailable("no production doctor evidence was supplied").into_report()
 }
 
 impl ServiceError {

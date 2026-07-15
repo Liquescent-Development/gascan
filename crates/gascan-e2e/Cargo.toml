@@ -22,6 +22,7 @@ gascan-proto = { path = "../gascan-proto" }
 gascand = { path = "../gascand" }
 hyper-util.workspace = true
 prost-types.workspace = true
+plist.workspace = true
 rustix = { workspace = true, features = ["termios"] }
 serde_json.workspace = true
 tokio.workspace = true

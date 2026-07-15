@@ -982,7 +982,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
     ) -> Result<tonic::Response<v1::DoctorResponse>, tonic::Status> {
         self.activity.ensure_accepting().map_err(admission_status)?;
         let _lease = self.activity.lease();
-        let report = self.service.doctor_report().await.map_err(service_status)?;
+        let report = self.service.doctor_report();
         let capabilities = report
             .checks
             .iter()
@@ -1000,7 +1000,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         let findings = report
             .checks
             .iter()
-            .filter(|check| check.status == DoctorStatus::Fail)
+            .filter(|check| check.status != DoctorStatus::Pass)
             .map(|check| v1::Error {
                 code: check.id.clone(),
                 message: check.detail.clone(),

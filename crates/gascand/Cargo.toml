@@ -23,6 +23,7 @@ gascan-proto = { path = "../gascan-proto" }
 getrandom.workspace = true
 base64.workspace = true
 prost-types.workspace = true
+plist.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
