@@ -26,11 +26,12 @@
 - `cargo test -p gascan-e2e --test fake_backend pre_begin_rpc_failures_keep_stable_statuses -- --exact`
 - `cargo test -p gascand --test daemon_idle`
 - `cargo test --workspace`
+- `cargo build -p gascan -p gascand` followed by isolated `target/debug/gascan doctor --json`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo fmt --all -- --check`
 - `git diff --check`
 
-All completed successfully. Live `gascan doctor` was not claimed or executed: although the host is Darwin/arm64 and has a `container` executable, the repository's structured capability baseline does not establish every mandatory production capability on this host.
+All completed successfully. An isolated live production `gascan doctor --json` also completed with valid JSON and all 17 checks passing on macOS 26.5.1/arm64 with the exact Apple 1.1.0 client/API revision. Both storage checks observed 376,786,288,640 free bytes on the shared structured-status `appRoot` filesystem.
 
 ## Evidence-bearing review follow-up
 
@@ -38,8 +39,10 @@ All completed successfully. Live `gascan doctor` was not claimed or executed: al
 - Host architecture comes from the compiled process target. macOS comes from structured parsing of `/System/Library/CoreServices/SystemVersion.plist` with the `plist` crate and requires ProductVersion major 26+.
 - CLI version uses exact `container system version --format json` release/commit/version schema. Only exact 1.1.0 enables the signed-off capability matrix.
 - Service readiness uses the captured Apple 1.1 `container system status --format json` fixture and requires a running release `container-apiserver` with matching 1.1.0 schema.
-- State free space uses `statvfs` on the exact `appRoot` returned by structured status. Apple 1.1 exposes image usage but no stable public image-store path/free-space fact, so image storage is `Unknown` and preflight fails closed.
-- Apple 1.1 structured status exposes no stable kernel-readiness field, so kernel readiness is `Unknown` and preflight fails closed with a precise start/install remedy.
+- State and image free space use shared `statvfs` evidence on the exact structured-status `appRoot`, which the approved Apple 1.1 schema defines as the application/state/image filesystem; both require the documented 10 GiB threshold.
+- MVP kernel readiness is activated by the frozen Gate 2 kernel/live lifecycle proof plus the current exact running service identity on the supported host. It is not inferred from an undocumented status field.
 - Workspace accessibility canonicalizes and reads metadata for the daemon's inherited current/request context before policy compilation; request-specific canonical validation remains immediately after runtime preflight and before `PolicyCompiler`.
 - Doctor RPC returns the stored report even when collection found a missing CLI, malformed schema, unsupported version, stopped service, or unavailable fact; those conditions no longer become a Doctor RPC transport error.
 - Fake backend enum/flag are cfg-elided from release builds. `cargo test --release -p gascand --test backend_selection` proves a fake request selects Apple and the debug-only flag symbol is not referenced.
+
+The binding evidence revision is Gate 2 report commit `6bedef8`, report SHA-256 `df51167b450c3fd0eb80699db76b4decbd7c44ab7f73788eee3240eb19057ad1`, status fixture SHA-256 `00e66b6721f5b9ce185b98bef47f0699425d06bff6396b4e29e90f55e9079cf9`, and Apple client/API revision `5973b9cc626a3e7a499bb316a958237ebe14e2ed`. Production DoctorFact details record all four identifiers. Client/service/schema/host mismatch prevents activation.

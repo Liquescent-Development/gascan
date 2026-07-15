@@ -150,7 +150,7 @@ impl DoctorFacts {
             (
                 "storage.images",
                 self.image_storage,
-                "free disk space in the Apple container content store",
+                "free disk space on the Apple application/state/image filesystem",
             ),
             (
                 "workspace.access",

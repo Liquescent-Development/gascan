@@ -146,18 +146,28 @@ async fn production_doctor_report() -> DoctorReport {
         Ok(capabilities) => {
             facts.cli = DoctorFact::pass("container executable returned structured JSON");
             let exact = capabilities.version == gascan_core::runtime::RuntimeVersion::new(1, 1, 0);
-            facts.version = if exact {
-                DoctorFact::pass("Apple container CLI version is exactly 1.1.0")
+            let matrix = capabilities.bind_mounts
+                && capabilities.named_volumes
+                && capabilities.tty
+                && capabilities.signals
+                && capabilities.loopback_publish
+                && capabilities.resource_limits
+                && capabilities.offline == gascan_core::runtime::NetworkIsolation::Proven;
+            facts.version = if exact && matrix {
+                DoctorFact::pass(gate2_evidence(
+                    "exact release client 1.1.0 revision matched",
+                ))
             } else {
                 DoctorFact::fail(format!(
-                    "unsupported Apple container CLI {}.{}.{}",
+                    "unsupported Apple container CLI/revision {}.{}.{}; Gate 2 requires exact 1.1.0 at {}",
                     capabilities.version.major,
                     capabilities.version.minor,
-                    capabilities.version.patch
+                    capabilities.version.patch,
+                    gascan_apple::APPLE_1_1_COMMIT,
                 ))
             };
-            facts.schema = if exact {
-                DoctorFact::pass("Apple 1.1 version schema matched the signed-off fixture")
+            facts.schema = if exact && matrix {
+                DoctorFact::pass(gate2_evidence("client version schema matched"))
             } else {
                 DoctorFact::fail("capability schema is not signed off for this CLI version")
             };
@@ -179,8 +189,21 @@ async fn production_doctor_report() -> DoctorReport {
 
     match probe.status().await {
         Ok(status) => {
-            facts.service = DoctorFact::pass("structured system status reports running");
+            let exact_service = status.api_server_version
+                == gascan_core::runtime::RuntimeVersion::new(1, 1, 0)
+                && status.api_server_commit == gascan_apple::APPLE_1_1_COMMIT;
+            facts.service = if exact_service {
+                DoctorFact::pass(gate2_evidence(
+                    "structured system status reports the exact running API server",
+                ))
+            } else {
+                DoctorFact::fail(format!(
+                    "running API server identity/revision is not exact Gate 2 revision {}",
+                    gascan_apple::APPLE_1_1_COMMIT
+                ))
+            };
             if status.api_server_version == gascan_core::runtime::RuntimeVersion::new(1, 1, 0)
+                && exact_service
                 && facts.schema.status == gascan_core::doctor::DoctorStatus::Pass
             {
                 facts.schema =
@@ -189,13 +212,23 @@ async fn production_doctor_report() -> DoctorReport {
                 facts.schema =
                     DoctorFact::fail("API server version does not match Apple container 1.1.0");
             }
-            facts.kernel = DoctorFact::unknown(
-                "system status 1.1 has no stable public kernel-readiness field",
-            );
+            facts.kernel = if exact_service
+                && facts.architecture.status == gascan_core::doctor::DoctorStatus::Pass
+                && facts.macos.status == gascan_core::doctor::DoctorStatus::Pass
+            {
+                DoctorFact::pass(gate2_evidence(
+                    "Gate 2 kernel/live lifecycle proof plus current exact running service establishes MVP kernel readiness",
+                ))
+            } else {
+                DoctorFact::unknown(
+                    "kernel readiness requires the supported host and exact running Gate 2 API server revision",
+                )
+            };
             facts.state_storage =
                 storage_fact(std::path::Path::new(&status.app_root), "application root");
-            facts.image_storage = DoctorFact::unknown(
-                "Apple container 1.1 exposes usage but no stable public image-store path for free-space inspection",
+            facts.image_storage = storage_fact(
+                std::path::Path::new(&status.app_root),
+                "shared Apple application/state/image",
             );
         }
         Err(error) => facts.service = service_error_fact(&error),
@@ -221,12 +254,22 @@ async fn production_doctor_report() -> DoctorReport {
 
 fn capability_fact(supported: bool, name: &str) -> DoctorFact {
     if supported {
-        DoctorFact::pass(format!(
-            "Apple container 1.1 signed-off fixture proves {name}"
-        ))
+        DoctorFact::pass(gate2_evidence(&format!(
+            "signed-off live matrix proves {name}"
+        )))
     } else {
         DoctorFact::fail(format!("{name} is unsupported"))
     }
+}
+
+fn gate2_evidence(evidence: &str) -> String {
+    format!(
+        "{evidence}; Gate 2 report commit {}, report sha256 {}, status fixture sha256 {}, Apple revision {}",
+        gascan_apple::GATE2_REPORT_COMMIT,
+        gascan_apple::GATE2_REPORT_SHA256,
+        gascan_apple::STATUS_FIXTURE_SHA256,
+        gascan_apple::APPLE_1_1_COMMIT,
+    )
 }
 
 fn architecture_fact(architecture: &str) -> DoctorFact {
@@ -417,5 +460,14 @@ mod doctor_tests {
         });
         assert_eq!(fact.status, gascan_core::doctor::DoctorStatus::Fail);
         assert!(fact.detail.contains("system status"));
+    }
+
+    #[test]
+    fn gate2_fact_names_the_frozen_report_fixture_and_apple_revision() {
+        let detail = gate2_evidence("verified");
+        assert!(detail.contains(gascan_apple::GATE2_REPORT_COMMIT));
+        assert!(detail.contains(gascan_apple::GATE2_REPORT_SHA256));
+        assert!(detail.contains(gascan_apple::STATUS_FIXTURE_SHA256));
+        assert!(detail.contains(gascan_apple::APPLE_1_1_COMMIT));
     }
 }
