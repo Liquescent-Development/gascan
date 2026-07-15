@@ -25,6 +25,7 @@ test -f "$reference_file" || {
 }
 
 container_bin=${CONTAINER_BIN:-container}
+source "$root/tests/image/container-cli.sh"
 image=$(bash "$root/scripts/validate-connected-image-receipt.sh" "$reference_file")
 [[ "$image" =~ ^[a-z0-9][a-z0-9._/-]*:[a-zA-Z0-9._-]+@sha256:[0-9a-f]{64}$ ]] || {
   printf 'image reference is not digest-qualified\n' >&2
@@ -36,16 +37,16 @@ name="gascan-image-gascamp-test-$owner_token"
 cleaning=false
 owned() {
   local inspect
-  inspect=$("$container_bin" inspect "$name") || return 1
+  inspect=$(bounded_container inspect "$name") || return 1
   printf '%s' "$inspect" | cargo run --quiet --locked --offline \
     --manifest-path "$root/scripts/Cargo.toml" --bin validate-owned-container -- "$name" "$owner_token"
 }
 cleanup() {
   $cleaning && return
   cleaning=true
-  if owned; then
-    "$container_bin" stop --time 5 "$name" >/dev/null 2>&1 || true
-    owned && "$container_bin" delete "$name" >/dev/null 2>&1 || true
+  if owned && owned; then
+    bounded_container stop --time 5 "$name" >/dev/null 2>&1 || true
+    owned && owned && bounded_container delete "$name" >/dev/null 2>&1 || true
   fi
 }
 on_signal() { trap - EXIT INT TERM; cleanup; exit 130; }

@@ -75,7 +75,7 @@ fn smoke_fixture_uses_built_ref_and_checks_signal_and_zombies() {
         "\"$container_bin\" start",
         "\"$container_bin\" exec",
         "/proc/[0-9]*/status",
-        "\"$container_bin\" stop --time 5",
+        "bounded_container stop --time 5",
         "test \"$elapsed\" -le 5",
     ] {
         assert!(

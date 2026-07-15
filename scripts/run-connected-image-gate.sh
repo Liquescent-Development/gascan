@@ -11,6 +11,26 @@ evidence_file="$root/docs/evidence/connected-workspace-image.md"
 approved_file="$root/images/workspace/approved-image.txt"
 die() { printf 'connected image gate: %s\n' "$*" >&2; exit 1; }
 run_tool() { cargo run --quiet --locked --offline --manifest-path "$tool_root/scripts/Cargo.toml" --bin "$1" -- "${@:2}"; }
+cli_timeout=${GASCAN_GATE_CLI_TIMEOUT_SECONDS:-10}
+case "$cli_timeout" in ''|*[!0-9]*) die 'controller timeout must be a positive integer' ;; esac
+test "$cli_timeout" -gt 0 || die 'controller timeout must be a positive integer'
+run_bounded() {
+  local timeout_seconds=$1 command_pid result ticks
+  shift
+  set -m
+  "$@" & command_pid=$!
+  set +m
+  ticks=$((timeout_seconds * 20))
+  while kill -0 "$command_pid" 2>/dev/null && test "$ticks" -gt 0; do sleep 0.05; ticks=$((ticks - 1)); done
+  if kill -0 "$command_pid" 2>/dev/null; then
+    kill -TERM -- "-$command_pid" 2>/dev/null || true
+    sleep 0.1
+    kill -KILL -- "-$command_pid" 2>/dev/null || true
+  fi
+  if wait "$command_pid"; then result=0; else result=$?; fi
+  return "$result"
+}
+controller() { run_bounded "$cli_timeout" "$container_bin" "$@"; }
 
 # Retire prior acceptance markers before any validation or connected work.
 # Preserve the checked-in PENDING record, but never let a failed rerun retain
@@ -46,14 +66,14 @@ names=("gascan-image-user-test-$owner_token" "gascan-image-polyglot-test-$owner_
 cleaning=false
 owned() {
   local name=$1 inspect
-  inspect=$("$container_bin" inspect "$name" 2>/dev/null) || return 1
+  inspect=$(controller inspect "$name" 2>/dev/null) || return 1
   printf '%s' "$inspect" | run_tool validate-owned-container "$name" "$owner_token" >/dev/null
 }
 cleanup_name() {
   local name=$1
   if owned "$name" && owned "$name"; then
-    "$container_bin" stop --time 5 "$name" >/dev/null 2>&1 || true
-    owned "$name" && owned "$name" && "$container_bin" delete "$name" >/dev/null 2>&1 || true
+    controller stop --time 5 "$name" >/dev/null 2>&1 || true
+    owned "$name" && owned "$name" && controller delete "$name" >/dev/null 2>&1 || true
   fi
 }
 cleanup() {
@@ -64,7 +84,7 @@ cleanup() {
 }
 assert_absent() {
   local name
-  for name in "${names[@]}"; do ! "$container_bin" inspect "$name" >/dev/null 2>&1 || return 1; done
+  for name in "${names[@]}"; do ! controller inspect "$name" >/dev/null 2>&1 || return 1; done
 }
 evidence_tmp=''
 approved_tmp=''
