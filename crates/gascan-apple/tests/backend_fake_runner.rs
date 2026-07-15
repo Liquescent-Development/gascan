@@ -1,17 +1,18 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
 use camino::Utf8Path;
-use gascan_apple::{AppleBackend, CommandOutput, CommandRunner, CommandSpec};
+use gascan_apple::{AppleAttach, AppleBackend, CommandOutput, CommandRunner, CommandSpec};
 use gascan_core::{
     manifest::Manifest,
     policy::PolicyCompiler,
     runtime::{
-        ContainerState, CreateRequest, NetworkIsolation, RemoveRequest, RuntimeBackend,
-        RuntimeCapabilities, RuntimeError, RuntimeVersion,
+        ContainerState, CreateRequest, ExecInput, ExecOutput, ExecRequest, NetworkIsolation,
+        RemoveRequest, RuntimeBackend, RuntimeCapabilities, RuntimeError, RuntimeVersion,
     },
     sandbox::SandboxSpec,
 };
@@ -284,6 +285,17 @@ fn request(name: &str) -> (tempfile::TempDir, CreateRequest) {
     (root, PolicyCompiler::compile(spec, &capabilities).unwrap())
 }
 
+fn fake_attach() -> AppleAttach {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/fake-attach-helper/Cargo.toml");
+    AppleAttach::new(env!("CARGO")).with_helper_args([
+        "run".to_owned(),
+        "--quiet".to_owned(),
+        "--manifest-path".to_owned(),
+        manifest.to_string_lossy().into_owned(),
+    ])
+}
+
 fn assert_only_faulted_command(runner: &StatefulAppleRunner, expected: &[&str]) {
     let state = runner.0.lock().unwrap();
     assert_eq!(state.faulted_inventory_commands.len(), 1);
@@ -334,6 +346,74 @@ async fn apple_backend_satisfies_non_attach_runtime_contract() {
         .map(|command| command.program.as_str())
         .collect();
     assert_eq!(unique, BTreeSet::from(["container"]));
+}
+
+#[tokio::test]
+async fn exec_bridge_accepts_input_while_output_is_pending() {
+    let backend = AppleBackend::with_attach(StatefulAppleRunner::default(), fake_attach());
+    let (_root, create) = request("apple-attach-bridge");
+    let mut session = backend
+        .exec(ExecRequest {
+            id: create.id().clone(),
+            argv: vec!["guest".to_owned()],
+            stdin: Vec::new(),
+            environment: BTreeMap::new(),
+            tty: false,
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        session.send(ExecInput::Close),
+    )
+    .await
+    .expect("close must not deadlock behind a pending output read")
+    .unwrap();
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit = loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), session.next())
+            .await
+            .expect("bridge output timed out")
+        {
+            Some(Ok(ExecOutput::Stdout(bytes))) => stdout.extend(bytes),
+            Some(Ok(ExecOutput::Stderr(bytes))) => stderr.extend(bytes),
+            Some(Ok(ExecOutput::Exit { code, signal })) => break (code, signal),
+            Some(Err(error)) => panic!("bridge failed: {error}"),
+            None => panic!("bridge closed without an exit"),
+        }
+    };
+    assert!(stdout.is_empty());
+    assert_eq!(stderr, [254, 1]);
+    assert_eq!(exit, (42, 0));
+    assert!(session.next().await.is_none());
+}
+
+#[tokio::test]
+async fn exec_bridge_reports_unsupported_signal_as_terminal_error() {
+    let backend = AppleBackend::with_attach(StatefulAppleRunner::default(), fake_attach());
+    let (_root, create) = request("apple-attach-signal");
+    let mut session = backend
+        .exec(ExecRequest {
+            id: create.id().clone(),
+            argv: vec!["guest".to_owned()],
+            stdin: Vec::new(),
+            environment: BTreeMap::new(),
+            tty: false,
+        })
+        .await
+        .unwrap();
+    session.send(ExecInput::Signal(2)).await.unwrap();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(2), session.next())
+        .await
+        .expect("unsupported signal must be rejected promptly")
+        .expect("bridge closed without a typed error")
+        .expect_err("unsupported signal unexpectedly succeeded");
+    assert!(matches!(error, RuntimeError::UnsupportedCapability { .. }));
+    assert!(session.next().await.is_none());
 }
 
 #[tokio::test]

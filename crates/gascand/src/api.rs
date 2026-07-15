@@ -1052,7 +1052,8 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
                     biased;
                     output = session.next() => match output {
                         Some(Ok(output)) => {
-                            if sender.send(Ok(server_output(output))).await.is_err() { break; }
+                            let terminal = matches!(output, gascan_core::runtime::ExecOutput::Exit { .. });
+                            if sender.send(Ok(server_output(output))).await.is_err() || terminal { break; }
                         }
                         Some(Err(error)) => {
                             let _ = sender.send(Ok(server_error(error.code(), error.to_string()))).await;
@@ -1090,7 +1091,15 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
                             let _ = session.send(gascan_core::runtime::ExecInput::Close).await;
                         }
                         Err(error) => { let _ = sender.send(Err(error)).await; break; }
-                    }
+                    },
+                    () = sender.closed() => {
+                        let _ = session.send(gascan_core::runtime::ExecInput::Close).await;
+                        break;
+                    },
+                    () = activity.inner.shutdown.notified() => {
+                        let _ = session.send(gascan_core::runtime::ExecInput::Close).await;
+                        break;
+                    },
                 }
             }
         });

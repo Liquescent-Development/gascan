@@ -358,54 +358,58 @@ where
             });
         }
         let initial_stdin = request.stdin;
-        let session = self
+        let mut session = self
             .attach
             .exec(request.id.as_str(), request.argv, request.tty)
             .await?;
         let (input, mut inputs) = tokio::sync::mpsc::channel(16);
         let (outputs, output) = tokio::sync::mpsc::channel(32);
-        let session = std::sync::Arc::new(tokio::sync::Mutex::new(session));
-        let writer = session.clone();
+        let writer = session.input_handle();
         tokio::spawn(async move {
-            if !initial_stdin.is_empty()
-                && writer
-                    .lock()
-                    .await
-                    .send(AttachInput::Stdin(initial_stdin))
-                    .await
-                    .is_err()
-            {
-                return;
-            }
-            while let Some(frame) = inputs.recv().await {
-                let frame = match frame {
-                    ExecInput::Stdin(bytes) => AttachInput::Stdin(bytes),
-                    ExecInput::Resize { columns, rows } => {
-                        match (u16::try_from(columns), u16::try_from(rows)) {
-                            (Ok(cols), Ok(rows)) => AttachInput::Resize { rows, cols },
-                            _ => break,
-                        }
-                    }
-                    ExecInput::Signal(signal) => AttachInput::Signal(signal),
-                    ExecInput::Close => AttachInput::Close,
-                };
-                if writer.lock().await.send(frame).await.is_err() {
-                    break;
+            if !initial_stdin.is_empty() {
+                if let Err(error) = writer.send(AttachInput::Stdin(initial_stdin)).await {
+                    let _ = outputs.send(Err(error)).await;
+                    return;
                 }
             }
-        });
-        tokio::spawn(async move {
             loop {
-                let next = session.lock().await.recv().await;
-                let mapped = match next {
-                    Ok(Some(AttachOutput::Stdout(bytes))) => Ok(ExecOutput::Stdout(bytes)),
-                    Ok(Some(AttachOutput::Stderr(bytes))) => Ok(ExecOutput::Stderr(bytes)),
-                    Ok(Some(AttachOutput::Exit(code))) => Ok(ExecOutput::Exit { code, signal: 0 }),
-                    Ok(None) => break,
-                    Err(error) => Err(error),
-                };
-                if outputs.send(mapped).await.is_err() {
-                    break;
+                tokio::select! {
+                    frame = inputs.recv() => {
+                        let Some(frame) = frame else { break };
+                        let frame = match frame {
+                            ExecInput::Stdin(bytes) => Ok(AttachInput::Stdin(bytes)),
+                            ExecInput::Resize { columns, rows } => {
+                                match (u16::try_from(columns), u16::try_from(rows)) {
+                                    (Ok(cols), Ok(rows)) => Ok(AttachInput::Resize { rows, cols }),
+                                    _ => Err(RuntimeError::UnsupportedCapability {
+                                        capability: format!("attachment size {columns}x{rows} exceeds Apple ContainerAPIClient limits"),
+                                    }),
+                                }
+                            }
+                            ExecInput::Signal(signal) => Ok(AttachInput::Signal(signal)),
+                            ExecInput::Close => Ok(AttachInput::Close),
+                        };
+                        let result = match frame {
+                            Ok(frame) => writer.send(frame).await,
+                            Err(error) => Err(error),
+                        };
+                        if let Err(error) = result {
+                            let _ = outputs.send(Err(error)).await;
+                            break;
+                        }
+                    }
+                    next = session.recv() => {
+                        let (mapped, terminal) = match next {
+                            Ok(Some(AttachOutput::Stdout(bytes))) => (Ok(ExecOutput::Stdout(bytes)), false),
+                            Ok(Some(AttachOutput::Stderr(bytes))) => (Ok(ExecOutput::Stderr(bytes)), false),
+                            Ok(Some(AttachOutput::Exit(code))) => (Ok(ExecOutput::Exit { code, signal: 0 }), true),
+                            Ok(None) => break,
+                            Err(error) => (Err(error), true),
+                        };
+                        if outputs.send(mapped).await.is_err() || terminal {
+                            break;
+                        }
+                    }
                 }
             }
         });

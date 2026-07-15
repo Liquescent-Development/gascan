@@ -133,30 +133,14 @@ pub struct AttachSession {
 
 impl AttachSession {
     pub async fn send(&self, input: AttachInput) -> Result<(), RuntimeError> {
-        if matches!(input, AttachInput::Resize { .. }) && !self.tty {
-            return Err(RuntimeError::UnsupportedCapability {
-                capability: "resize requires a TTY attachment".to_owned(),
-            });
+        self.input_handle().send(input).await
+    }
+
+    pub(crate) fn input_handle(&self) -> AttachInputHandle {
+        AttachInputHandle {
+            input: self.input.clone(),
+            tty: self.tty,
         }
-        let input = match input {
-            AttachInput::Signal(SIGINT) if self.tty => AttachInput::Stdin(vec![0x03]),
-            AttachInput::Signal(signal) => {
-                return Err(RuntimeError::UnsupportedCapability {
-                    capability: format!(
-                        "attachment signal {signal}; Apple ContainerAPIClient 1.1.0 supports only SIGINT for TTY attachments"
-                    ),
-                });
-            }
-            input => input,
-        };
-        let (reply, response) = oneshot::channel();
-        self.input
-            .send(InputRequest { input, reply })
-            .await
-            .map_err(|_| io_error("helper input is closed"))?;
-        response
-            .await
-            .map_err(|_| io_error("helper input closed without acknowledging the frame"))?
     }
 
     pub async fn recv(&mut self) -> Result<Option<AttachOutput>, RuntimeError> {
@@ -199,6 +183,41 @@ impl AttachSession {
             }
         }
         Err(io_error("helper closed without a terminal frame"))
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct AttachInputHandle {
+    input: mpsc::Sender<InputRequest>,
+    tty: bool,
+}
+
+impl AttachInputHandle {
+    pub(crate) async fn send(&self, input: AttachInput) -> Result<(), RuntimeError> {
+        if matches!(input, AttachInput::Resize { .. }) && !self.tty {
+            return Err(RuntimeError::UnsupportedCapability {
+                capability: "resize requires a TTY attachment".to_owned(),
+            });
+        }
+        let input = match input {
+            AttachInput::Signal(SIGINT) if self.tty => AttachInput::Stdin(vec![0x03]),
+            AttachInput::Signal(signal) => {
+                return Err(RuntimeError::UnsupportedCapability {
+                    capability: format!(
+                        "attachment signal {signal}; Apple ContainerAPIClient 1.1.0 supports only SIGINT for TTY attachments"
+                    ),
+                });
+            }
+            input => input,
+        };
+        let (reply, response) = oneshot::channel();
+        self.input
+            .send(InputRequest { input, reply })
+            .await
+            .map_err(|_| io_error("helper input is closed"))?;
+        response
+            .await
+            .map_err(|_| io_error("helper input closed without acknowledging the frame"))?
     }
 }
 
