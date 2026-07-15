@@ -84,7 +84,7 @@ fn every_remote_image_input_is_immutable_and_checksummed() {
 
 #[test]
 fn published_bundle_lock_requires_all_concrete_immutable_records() {
-    use gascan_image_tools::bundle::{BundleError, PublishedBundleLocks};
+    use gascan_image_tools::bundle::{BundleError, BundlePublication, PublishedBundleLocks};
 
     let record = |suffix: &str, hash: char, size: u64| {
         format!(
@@ -114,6 +114,20 @@ publication = "published"
     assert_eq!(locks.ubuntu_packages.size, 101);
     assert_eq!(locks.mise_runtimes.size, 202);
     assert_eq!(locks.gascamp_source_vendor.size, 303);
+
+    let pending = valid.replacen(
+        "publication = \"published\"",
+        "publication = \"pending\"",
+        1,
+    );
+    assert_eq!(
+        PublishedBundleLocks::from_toml(&pending).unwrap_err(),
+        BundleError::InvalidPublicationState
+    );
+    assert!(matches!(
+        BundlePublication::from_toml(&pending).unwrap(),
+        BundlePublication::Pending(_)
+    ));
 
     assert_eq!(
         PublishedBundleLocks::from_toml(&format!(

@@ -66,12 +66,16 @@ fn manifest(files: serde_json::Value) -> Vec<u8> {
 
 fn run(entries: &[RawEntry<'_>], truncate: bool) -> Result<(), BundleError> {
     let archive = raw_tar(entries, truncate);
+    run_archive(&archive)
+}
+
+fn run_archive(archive: &[u8]) -> Result<(), BundleError> {
     let temp = tempfile::tempdir().unwrap();
     let archive_path = temp.path().join("bundle.tar.zst");
-    fs::write(&archive_path, &archive).unwrap();
+    fs::write(&archive_path, archive).unwrap();
     let lock = BundleLock {
         url: "https://example.invalid/bundle.tar.zst".to_owned(),
-        sha256: hash(&archive),
+        sha256: hash(archive),
         size: archive.len() as u64,
         media_type: MEDIA_TYPE.to_owned(),
         platform: "linux/arm64".to_owned(),
@@ -296,6 +300,37 @@ fn rejects_truncated_archives_without_publishing_destination() {
 }
 
 #[test]
+fn rejects_aligned_data_after_first_canonical_terminator() {
+    let archive = raw_tar(&[], false);
+    let mut expanded = zstd::stream::decode_all(archive.as_slice()).unwrap();
+    expanded.extend_from_slice(&[0_u8; 512]);
+    let with_trailing_block = zstd::stream::encode_all(expanded.as_slice(), 1).unwrap();
+    assert_eq!(
+        run_archive(&with_trailing_block).unwrap_err(),
+        BundleError::TrailingArchiveData
+    );
+
+    let trailing_entry = raw_tar(
+        &[RawEntry {
+            path: "late",
+            kind: b'0',
+            body: b"",
+            link: None,
+        }],
+        false,
+    );
+    let trailing_expanded = zstd::stream::decode_all(trailing_entry.as_slice()).unwrap();
+    let archive = raw_tar(&[], false);
+    let mut expanded = zstd::stream::decode_all(archive.as_slice()).unwrap();
+    expanded.extend_from_slice(&trailing_expanded);
+    let with_trailing_entry = zstd::stream::encode_all(expanded.as_slice(), 1).unwrap();
+    assert_eq!(
+        run_archive(&with_trailing_entry).unwrap_err(),
+        BundleError::TrailingArchiveData
+    );
+}
+
+#[test]
 fn rejects_extra_and_missing_manifest_entries() {
     let empty = manifest(json!([]));
     assert_rejected(
@@ -344,6 +379,38 @@ fn rejects_per_file_hash_mismatch() {
                 path: "file",
                 kind: b'0',
                 body: b"altered!",
+                link: None,
+            },
+        ],
+    );
+}
+
+#[test]
+fn rejects_symlink_entries_that_are_ancestors_of_other_entries() {
+    let body = b"must not write through link";
+    let manifest = manifest(json!([
+        {"path":"a","kind":"symlink","target":"b"},
+        {"path":"a/file","kind":"file","size":body.len(),"sha256":hash(body)}
+    ]));
+    assert_rejected(
+        BundleError::SymlinkAncestor("a".to_owned()),
+        &[
+            RawEntry {
+                path: "bundle-manifest.json",
+                kind: b'0',
+                body: &manifest,
+                link: None,
+            },
+            RawEntry {
+                path: "a",
+                kind: b'2',
+                body: b"",
+                link: Some("b"),
+            },
+            RawEntry {
+                path: "a/file",
+                kind: b'0',
+                body,
                 link: None,
             },
         ],
@@ -438,5 +505,21 @@ fn outer_lock_size_and_hash_are_exact() {
     assert_eq!(
         validate_bundle(&lock, &path, &temp.path().join("out")).unwrap_err(),
         BundleError::ArchiveHashMismatch
+    );
+}
+
+#[test]
+fn archive_input_must_be_a_regular_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let lock = BundleLock {
+        url: "https://example.invalid/archive".into(),
+        sha256: "0".repeat(64),
+        size: 1,
+        media_type: MEDIA_TYPE.into(),
+        platform: "linux/arm64".into(),
+    };
+    assert_eq!(
+        validate_bundle(&lock, temp.path(), &temp.path().join("output")).unwrap_err(),
+        BundleError::ArchiveNotRegular
     );
 }
