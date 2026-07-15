@@ -8,6 +8,8 @@
 
 **Tech Stack:** OCI/Dockerfile built with Apple `container`, Ubuntu LTS base by immutable digest, Rust 1.85+, mise, Bash smoke/security scripts, existing Gas Can daemon/CLI/API.
 
+> **Approved correction (2026-07-14):** In-build apt, mise, Git, and Cargo network access is replaced by the [Offline Workspace Image Bundles Plan](./2026-07-14-offline-workspace-image-bundles.md). Connected Linux ARM64 CI produces immutable verified inputs; the Apple build is network-independent. Where the original Tasks 1, 3, or 4 describe fetching inside the Dockerfile, the correction plan governs.
+
 ## Global Constraints
 
 - Image inputs are immutable digests or checksummed artifacts recorded in `images/workspace/versions.lock`.

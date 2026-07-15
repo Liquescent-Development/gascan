@@ -30,6 +30,7 @@
 2. [Core Control Plane Plan](./2026-07-13-core-control-plane.md) builds backend-neutral policy, metadata, daemon API, and CLI using a fake runtime.
 3. [Apple Backend and Lifecycle Plan](./2026-07-13-apple-backend-lifecycle.md) connects the control plane to the real Apple runtime and completes lifecycle behavior.
 4. [Workspace Environment and Release Plan](./2026-07-13-workspace-environment-release.md) ships the image, mise/Gascamp provisioning, security suite, packaging, and clean-host release gate.
+5. [Offline Workspace Image Bundles Plan](./2026-07-14-offline-workspace-image-bundles.md) corrects Plan 4's build boundary so connected CI produces immutable inputs and Apple performs network-independent assembly.
 
 ## Dependency Graph
 
@@ -81,6 +82,7 @@ After Gates 2 and 3:
 
 - Execute Plan 3 against the frozen core contracts and the proven Apple command forms.
 - Continue Plan 4 Tasks 4-6 in parallel: provisioning planner, `gascan apply`, setup digest behavior, and Gascamp source selection can be tested against the fake backend.
+- Execute the Offline Workspace Image Bundles Plan before accepting Plan 4 image smoke evidence; the operator network permits host prefetch but Apple build VMs have no public egress.
 - Do not begin real-runtime security acceptance tests until Plan 3 publishes a stable integration-test harness.
 
 Concurrency rule: Plan 3 owns Apple adapter and lifecycle wiring; Plan 4 owns image/provisioning modules. Changes to `RuntimeBackend` require joint review because they affect both tracks.
