@@ -14,6 +14,7 @@ use std::{
 use cap_primitives::fs::{FollowSymlinks, OpenOptions, PermissionsExt as CapPermissionsExt};
 use cap_std::{ambient_authority, fs::Dir};
 use gascan_image_tools::bundle::{PublishedBundleLocks, validate_bundle};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 type DynError = Box<dyn Error>;
@@ -31,6 +32,32 @@ const REPOSITORY_FILES: [&str; 8] = [
 const CACHE_FILES: [&str; 2] = ["mise-linux-arm64", "expected-tool-versions.json"];
 const RECORDS: [&str; 3] = ["ubuntu_packages", "mise_runtimes", "gascamp_source_vendor"];
 
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Offline,
+    Connected,
+}
+
+#[derive(Deserialize)]
+struct ConnectedLock {
+    base_image: String,
+    workspace_build_mode: String,
+    mise: ConnectedArtifact,
+    playwright_chromium: ConnectedArtifact,
+    workspace_bundles: ConnectedBundles,
+}
+
+#[derive(Deserialize)]
+struct ConnectedArtifact {
+    url: String,
+    sha256: String,
+}
+
+#[derive(Deserialize)]
+struct ConnectedBundles {
+    publication: String,
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -43,8 +70,46 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), DynError> {
     let mut arguments = env::args_os().skip(1);
-    let mode = arguments.next();
-    if mode.as_deref() == Some(OsStr::new("--verify")) {
+    let first = arguments.next();
+    if first.as_deref() == Some(OsStr::new("--connected-lock")) {
+        let lock_path = required(&mut arguments, "LOCK_FILE")?;
+        if arguments.next().is_some() {
+            return Err("usage: prepare-workspace-context --connected-lock LOCK_FILE".into());
+        }
+        let lock = parse_connected_lock(&fs::read_to_string(lock_path)?)?;
+        for value in [
+            &lock.base_image,
+            &lock.mise.url,
+            &lock.mise.sha256,
+            &lock.playwright_chromium.url,
+            &lock.playwright_chromium.sha256,
+        ] {
+            println!("{value}");
+        }
+        return Ok(());
+    }
+    if first.as_deref() == Some(OsStr::new("--mode")) {
+        let selected = required(&mut arguments, "MODE")?;
+        if selected != Path::new("connected") {
+            return Err("connected context mode must be exactly 'connected'".into());
+        }
+        if arguments.next().as_deref() != Some(OsStr::new("--replace")) {
+            return Err("usage: prepare-workspace-context --mode connected --replace REPOSITORY_ROOT LOCK_FILE CACHE_DIRECTORY CONTEXT_DIRECTORY".into());
+        }
+        let repository = required(&mut arguments, "REPOSITORY_ROOT")?;
+        let lock = required(&mut arguments, "LOCK_FILE")?;
+        let cache = required(&mut arguments, "CACHE_DIRECTORY")?;
+        let context = required(&mut arguments, "CONTEXT_DIRECTORY")?;
+        if arguments.next().is_some() {
+            return Err("usage: prepare-workspace-context --mode connected --replace REPOSITORY_ROOT LOCK_FILE CACHE_DIRECTORY CONTEXT_DIRECTORY".into());
+        }
+        validate_connected_lock(&repository, &lock)?;
+        replace_context(&repository, &cache, &context, Mode::Connected)?;
+        let manifest = verify_context(&context, Mode::Connected)?;
+        println!("{:x}", Sha256::digest(&manifest));
+        return Ok(());
+    }
+    if first.as_deref() == Some(OsStr::new("--verify")) {
         let repository = required(&mut arguments, "REPOSITORY_ROOT")?;
         let lock = required(&mut arguments, "LOCK_FILE")?;
         let cache = required(&mut arguments, "CACHE_DIRECTORY")?;
@@ -55,11 +120,11 @@ fn run() -> Result<(), DynError> {
             );
         }
         let locks = PublishedBundleLocks::from_toml(&fs::read_to_string(lock)?)?;
-        let actual = verify_context(&context)?;
+        let actual = verify_context(&context, Mode::Offline)?;
         let temporary = tempfile::tempdir()?;
         let expected = temporary.path().join("expected");
-        assemble(&repository, &cache, &expected, &locks)?;
-        let expected_manifest = verify_context(&expected)?;
+        assemble_offline(&repository, &cache, &expected, &locks)?;
+        let expected_manifest = verify_context(&expected, Mode::Offline)?;
         make_tree_owner_writable(&expected)?;
         if actual != expected_manifest {
             return Err("context differs from the current locked inputs".into());
@@ -67,7 +132,7 @@ fn run() -> Result<(), DynError> {
         println!("{:x}", Sha256::digest(&actual));
         return Ok(());
     }
-    if mode.as_deref() == Some(OsStr::new("--replace")) {
+    if first.as_deref() == Some(OsStr::new("--replace")) {
         let repository = required(&mut arguments, "REPOSITORY_ROOT")?;
         let lock = required(&mut arguments, "LOCK_FILE")?;
         let cache = required(&mut arguments, "CACHE_DIRECTORY")?;
@@ -76,7 +141,7 @@ fn run() -> Result<(), DynError> {
             return Err("usage: prepare-workspace-context --replace REPOSITORY_ROOT LOCK_FILE CACHE_DIRECTORY CONTEXT_DIRECTORY".into());
         }
         let locks = PublishedBundleLocks::from_toml(&fs::read_to_string(lock)?)?;
-        return replace_context(&repository, &cache, &context, &locks);
+        return replace_context_offline(&repository, &cache, &context, &locks);
     }
     let mut arguments = env::args_os().skip(1);
     let repository = required(&mut arguments, "REPOSITORY_ROOT")?;
@@ -87,14 +152,64 @@ fn run() -> Result<(), DynError> {
         return Err("usage: prepare-workspace-context REPOSITORY_ROOT LOCK_FILE CACHE_DIRECTORY CONTEXT_DIRECTORY".into());
     }
     let locks = PublishedBundleLocks::from_toml(&fs::read_to_string(lock_path)?)?;
-    assemble(&repository, &cache, &destination, &locks)
+    assemble_offline(&repository, &cache, &destination, &locks)
+}
+
+fn validate_connected_lock(repository: &Path, lock_path: &Path) -> Result<(), DynError> {
+    let expected_path = repository.join("images/workspace/versions.lock");
+    let contents = fs::read_to_string(lock_path)?;
+    if fs::read(&expected_path)? != contents.as_bytes() {
+        return Err("connected lock must be the repository versions.lock".into());
+    }
+    parse_connected_lock(&contents)?;
+    Ok(())
+}
+
+fn parse_connected_lock(contents: &str) -> Result<ConnectedLock, DynError> {
+    let lock: ConnectedLock = toml::from_str(contents)?;
+    if lock.workspace_build_mode != "connected" {
+        return Err("workspace_build_mode must be exactly 'connected'".into());
+    }
+    if lock.workspace_bundles.publication != "pending" {
+        return Err("connected mode requires deferred workspace_bundles publication".into());
+    }
+    if !lock.base_image.starts_with("ubuntu@sha256:")
+        || !lower_hex(lock.base_image.trim_start_matches("ubuntu@sha256:"), 64)
+    {
+        return Err("connected base image must be an immutable Ubuntu digest".into());
+    }
+    for artifact in [&lock.mise, &lock.playwright_chromium] {
+        if !artifact.url.starts_with("https://") || !lower_hex(&artifact.sha256, 64) {
+            return Err("connected artifact lock is invalid".into());
+        }
+    }
+    Ok(lock)
+}
+
+fn replace_context_offline(
+    repository: &Path,
+    cache: &Path,
+    destination: &Path,
+    locks: &PublishedBundleLocks,
+) -> Result<(), DynError> {
+    replace_context_inner(repository, cache, destination, Mode::Offline, Some(locks))
 }
 
 fn replace_context(
     repository: &Path,
     cache: &Path,
     destination: &Path,
-    locks: &PublishedBundleLocks,
+    mode: Mode,
+) -> Result<(), DynError> {
+    replace_context_inner(repository, cache, destination, mode, None)
+}
+
+fn replace_context_inner(
+    repository: &Path,
+    cache: &Path,
+    destination: &Path,
+    mode: Mode,
+    locks: Option<&PublishedBundleLocks>,
 ) -> Result<(), DynError> {
     let parent_path = destination
         .parent()
@@ -105,11 +220,11 @@ fn replace_context(
         Ok(metadata) if metadata.is_dir() => {}
         Ok(_) => return Err("existing context is not a real directory".into()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return assemble(repository, cache, destination, locks);
+            return assemble_mode(repository, cache, destination, mode, locks);
         }
         Err(error) => return Err(error.into()),
     }
-    let old_sha = verify_context(destination)
+    let old_sha = verify_context(destination, mode)
         .map(|manifest| format!("{:x}", Sha256::digest(&manifest)))
         .unwrap_or_else(|_| "-".to_owned());
     let token = random_token()?;
@@ -119,8 +234,8 @@ fn replace_context(
         token
     );
     let replacement = parent_path.join(&replacement_name);
-    assemble(repository, cache, &replacement, locks)?;
-    let new_manifest = verify_context(&replacement)?;
+    assemble_mode(repository, cache, &replacement, mode, locks)?;
+    let new_manifest = verify_context(&replacement, mode)?;
     let new_sha = format!("{:x}", Sha256::digest(&new_manifest));
     let receipt_name = format!("{replacement_name}.receipt");
     let receipt_path = parent_path.join(&receipt_name);
@@ -185,7 +300,7 @@ fn recover_owned_replacements(parent: &Path, destination_name: &OsStr) {
             let _ignored = fs::remove_file(entry.path());
             continue;
         }
-        let Ok(manifest) = verify_context(&replacement) else {
+        let Ok(manifest) = verify_context_any(&replacement) else {
             continue;
         };
         let digest = format!("{:x}", Sha256::digest(&manifest));
@@ -214,7 +329,11 @@ fn lower_hex(value: &str, length: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn verify_context(root: &Path) -> Result<Vec<u8>, DynError> {
+fn verify_context_any(root: &Path) -> Result<Vec<u8>, DynError> {
+    verify_context(root, Mode::Offline).or_else(|_| verify_context(root, Mode::Connected))
+}
+
+fn verify_context(root: &Path, mode: Mode) -> Result<Vec<u8>, DynError> {
     let root_metadata = fs::symlink_metadata(root)?;
     if !root_metadata.is_dir()
         || root_metadata.file_type().is_symlink()
@@ -222,16 +341,28 @@ fn verify_context(root: &Path) -> Result<Vec<u8>, DynError> {
     {
         return Err("context root must be a real read-only 0555 directory".into());
     }
-    let allowed: BTreeSet<&str> = [
-        ".artifacts",
-        "Dockerfile",
-        "bundles",
-        "context-manifest.tsv",
-        "images",
-        "tests",
-    ]
-    .into_iter()
-    .collect();
+    let allowed: BTreeSet<&str> = if mode == Mode::Connected {
+        [
+            ".artifacts",
+            "Dockerfile",
+            "context-manifest.tsv",
+            "images",
+            "tests",
+        ]
+        .into_iter()
+        .collect()
+    } else {
+        [
+            ".artifacts",
+            "Dockerfile",
+            "bundles",
+            "context-manifest.tsv",
+            "images",
+            "tests",
+        ]
+        .into_iter()
+        .collect()
+    };
     let mut top_level = BTreeSet::new();
     for entry in fs::read_dir(root)? {
         top_level.insert(
@@ -249,9 +380,11 @@ fn verify_context(root: &Path) -> Result<Vec<u8>, DynError> {
     {
         return Err("context top-level allowlist does not match".into());
     }
-    for record in RECORDS {
-        if !root.join("bundles").join(record).is_dir() {
-            return Err(format!("context is missing bundle {record}").into());
+    if mode == Mode::Offline {
+        for record in RECORDS {
+            if !root.join("bundles").join(record).is_dir() {
+                return Err(format!("context is missing bundle {record}").into());
+            }
         }
     }
     for required in [
@@ -308,7 +441,25 @@ fn verify_context(root: &Path) -> Result<Vec<u8>, DynError> {
     Ok(expected)
 }
 
-fn assemble(
+fn assemble_mode(
+    repository_path: &Path,
+    cache_path: &Path,
+    destination: &Path,
+    mode: Mode,
+    locks: Option<&PublishedBundleLocks>,
+) -> Result<(), DynError> {
+    match mode {
+        Mode::Offline => assemble_offline(
+            repository_path,
+            cache_path,
+            destination,
+            locks.ok_or("offline mode requires bundle locks")?,
+        ),
+        Mode::Connected => assemble_connected(repository_path, cache_path, destination),
+    }
+}
+
+fn assemble_offline(
     repository_path: &Path,
     cache_path: &Path,
     destination: &Path,
@@ -367,6 +518,108 @@ fn assemble(
     let kept = temporary.keep();
     parent.rename(&staging_name, &parent, destination_name)?;
     drop(kept);
+    Ok(())
+}
+
+fn assemble_connected(
+    repository_path: &Path,
+    cache_path: &Path,
+    destination: &Path,
+) -> Result<(), DynError> {
+    let repository = Dir::open_ambient_dir(repository_path, ambient_authority())?;
+    let cache = Dir::open_ambient_dir(cache_path, ambient_authority())?;
+    let parent_path = destination
+        .parent()
+        .ok_or("context destination has no parent")?;
+    fs::create_dir_all(parent_path)?;
+    let destination_name = single_name(destination)?;
+    let parent = Dir::open_ambient_dir(parent_path, ambient_authority())?;
+    if parent.symlink_metadata(destination_name).is_ok() {
+        return Err("context destination already exists".into());
+    }
+    let temporary = tempfile::Builder::new()
+        .prefix(".connected-workspace-context-")
+        .tempdir_in(parent_path)?;
+    let staging = temporary.path();
+    copy_regular(
+        &repository,
+        Path::new("images/workspace/Dockerfile"),
+        staging.join("Dockerfile"),
+    )?;
+    for source in [
+        "images/workspace/bin",
+        "images/workspace/etc",
+        "images/workspace/tests",
+    ] {
+        copy_tree_reviewed(&repository, Path::new(source), &staging.join(source))?;
+    }
+    for source in [
+        "images/workspace/versions.lock",
+        "tests/image/system-tools.txt",
+    ] {
+        copy_regular(&repository, Path::new(source), staging.join(source))?;
+    }
+    for source in ["mise-linux-arm64", "expected-tool-versions.json"] {
+        copy_regular(
+            &cache,
+            Path::new(source),
+            staging.join(".artifacts").join(source),
+        )?;
+    }
+    copy_tree_reviewed(
+        &cache,
+        Path::new("playwright-chromium-reviewed"),
+        &staging.join(".artifacts/playwright-chromium-reviewed"),
+    )?;
+    make_tree_read_only(staging)?;
+    write_manifest(staging)?;
+    fs::set_permissions(staging, fs::Permissions::from_mode(0o555))?;
+    let staging_name = single_name(staging)?.to_owned();
+    let kept = temporary.keep();
+    parent.rename(&staging_name, &parent, destination_name)?;
+    drop(kept);
+    Ok(())
+}
+
+fn token_like(name: &OsStr) -> bool {
+    let name = name.to_string_lossy().to_ascii_lowercase();
+    name.contains("token") || name.contains("credential") || name.contains("secret")
+}
+
+fn copy_tree_reviewed(
+    source_root: &Dir,
+    source: &Path,
+    destination: &Path,
+) -> Result<(), DynError> {
+    portable_relative(source)?;
+    let directory = source_root.open_dir(source)?;
+    fs::create_dir_all(destination)?;
+    let mut entries = directory.entries()?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let name = entry.file_name();
+        if token_like(&name) {
+            return Err(format!(
+                "reviewed input contains a token-like filename: {}",
+                source.join(&name).display()
+            )
+            .into());
+        }
+        let relative = source.join(&name);
+        let target = destination.join(&name);
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            copy_tree_reviewed(source_root, &relative, &target)?;
+        } else if metadata.is_file() {
+            copy_regular(source_root, &relative, target)?;
+        } else {
+            return Err(format!(
+                "reviewed input contains a symlink or special file: {}",
+                relative.display()
+            )
+            .into());
+        }
+    }
     Ok(())
 }
 

@@ -1,4 +1,5 @@
 base_image = "ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab"
+workspace_build_mode = "connected"
 ubuntu_snapshot = "2026-07-13T00:00:00Z"
 workspace_tag = "gascan-workspace:d4964500a3295a33"
 

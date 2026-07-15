@@ -22,6 +22,7 @@ struct Gascamp {
 
 #[derive(Deserialize)]
 struct ImageLock {
+    workspace_build_mode: String,
     base_image: String,
     ubuntu_snapshot: String,
     mise: VersionedArtifact,
@@ -51,6 +52,7 @@ fn every_remote_image_input_is_immutable_and_checksummed() {
     let lock: ImageLock =
         toml::from_str(include_str!("../../images/workspace/versions.lock")).unwrap();
     assert!(lock.base_image.starts_with("ubuntu@sha256:"));
+    assert_eq!(lock.workspace_build_mode, "connected");
     assert!(sha256_is_lower_hex(
         lock.base_image.trim_start_matches("ubuntu@sha256:")
     ));
@@ -80,6 +82,31 @@ fn every_remote_image_input_is_immutable_and_checksummed() {
     );
     assert_eq!(lock.workspace_bundles.platform, "linux/arm64");
     assert_eq!(lock.workspace_bundles.publication, "pending");
+}
+
+#[test]
+fn workspace_build_mode_accepts_only_connected_and_keeps_bundles_pending() {
+    #[derive(Deserialize)]
+    struct ModeLock {
+        workspace_build_mode: String,
+        workspace_bundles: WorkspaceBundles,
+    }
+
+    let parse = |mode: &str| {
+        toml::from_str::<ModeLock>(&format!(
+            "workspace_build_mode = {mode}\n[workspace_bundles]\nmedia_type = \"application/vnd.gascan.workspace-bundle.v1+tar.zstd\"\nplatform = \"linux/arm64\"\npublication = \"pending\"\n"
+        ))
+        .map(|lock| {
+            lock.workspace_build_mode == "connected"
+                && lock.workspace_bundles.publication == "pending"
+        })
+        .unwrap_or(false)
+    };
+
+    assert!(parse("\"connected\""));
+    for rejected in ["\"offline\"", "\"published\"", "\"CONNECTED\"", "1"] {
+        assert!(!parse(rejected), "accepted invalid mode {rejected}");
+    }
 }
 
 #[test]
