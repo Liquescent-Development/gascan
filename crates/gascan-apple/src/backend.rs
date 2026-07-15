@@ -91,14 +91,17 @@ impl<R: CommandRunner + Clone> AppleBackend<R> {
             })?;
         let mut reconciled = Vec::with_capacity(resources.len());
         for resource in resources {
-            let stable = observations
+            let stable = match observations
                 .get(resource.identity())
                 .filter(|prior| {
                     prior.sandbox_id() == resource.sandbox_id()
                         && prior.ownership() == resource.ownership()
                 })
                 .cloned()
-                .unwrap_or(resource);
+            {
+                Some(prior) => prior,
+                None => resource,
+            };
             observations.insert(stable.identity().clone(), stable.clone());
             reconciled.push(stable);
         }
@@ -117,29 +120,35 @@ impl<R: CommandRunner + Clone> AppleBackend<R> {
             .find(|item| item.identity() == identity))
     }
 
-    async fn created_since(
+    async fn reconcile_created(
         &self,
         request: &CreateRequest,
         before: &[RuntimeResource],
+        mut created: Vec<RuntimeResource>,
     ) -> Vec<RuntimeResource> {
         let Ok(current) = self.inventory().await else {
-            return Vec::new();
+            return created;
         };
-        current
-            .into_iter()
-            .filter(|resource| {
-                resource.ownership() == ResourceOwnership::GasCanOwned
-                    && resource.sandbox_id() == Some(request.id())
-                    && !before
+        for resource in current.into_iter().filter(|resource| {
+            resource.ownership() == ResourceOwnership::GasCanOwned
+                && resource.sandbox_id() == Some(request.id())
+                && !before
+                    .iter()
+                    .any(|old| old.identity() == resource.identity())
+                && (resource.name() == request.id().as_str()
+                    || request
+                        .volumes()
                         .iter()
-                        .any(|old| old.identity() == resource.identity())
-                    && (resource.name() == request.id().as_str()
-                        || request
-                            .volumes()
-                            .iter()
-                            .any(|volume| volume.name == resource.name()))
-            })
-            .collect()
+                        .any(|volume| volume.name == resource.name()))
+        }) {
+            if !created
+                .iter()
+                .any(|prior| prior.identity() == resource.identity())
+            {
+                created.push(resource);
+            }
+        }
+        created
     }
 }
 
@@ -191,8 +200,10 @@ where
                 ],
             );
             if let Err(error) = self.runner.run(spec).await {
-                created = self.created_since(&request, &before).await;
-                return Err(create_failure(&request, created, classify_command(error)));
+                if matches!(&error, RuntimeError::CommandIo { .. }) {
+                    created = self.reconcile_created(&request, &before, created).await;
+                }
+                return Err(create_failure(&request, created, error));
             }
             let identity = match ResourceIdentity::new(ResourceKind::Volume, volume.name.clone()) {
                 Ok(identity) => identity,
@@ -206,6 +217,7 @@ where
                     resource
                 }
                 Ok(_) => {
+                    created = self.reconcile_created(&request, &before, created).await;
                     return Err(create_failure(
                         &request,
                         created,
@@ -214,7 +226,10 @@ where
                         },
                     ));
                 }
-                Err(error) => return Err(create_failure(&request, created, error)),
+                Err(error) => {
+                    created = self.reconcile_created(&request, &before, created).await;
+                    return Err(create_failure(&request, created, error));
+                }
             };
             created.push(resource);
         }
@@ -223,8 +238,10 @@ where
             Err(error) => return Err(create_failure(&request, created, translation_error(error))),
         };
         if let Err(error) = self.runner.run(spec).await {
-            created = self.created_since(&request, &before).await;
-            return Err(create_failure(&request, created, classify_command(error)));
+            if matches!(&error, RuntimeError::CommandIo { .. }) {
+                created = self.reconcile_created(&request, &before, created).await;
+            }
+            return Err(create_failure(&request, created, error));
         }
         let identity =
             match ResourceIdentity::new(ResourceKind::Container, request.id().to_string()) {
@@ -239,6 +256,7 @@ where
                 resource
             }
             Ok(_) => {
+                created = self.reconcile_created(&request, &before, created).await;
                 return Err(create_failure(
                     &request,
                     created,
@@ -247,10 +265,16 @@ where
                     },
                 ));
             }
-            Err(error) => return Err(create_failure(&request, created, error)),
+            Err(error) => {
+                created = self.reconcile_created(&request, &before, created).await;
+                return Err(create_failure(&request, created, error));
+            }
         };
         created.push(resource);
-        CreateOutcome::new(&request, created).map_err(CreateFailure::from_source)
+        match CreateOutcome::new(&request, created.clone()) {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => Err(create_failure(&request, created, error)),
+        }
     }
 
     async fn start(&self, id: &SandboxId) -> Result<(), RuntimeError> {
@@ -260,8 +284,7 @@ where
                 .runner
                 .run(CommandSpec::new("container", ["start", id.as_str()]))
                 .await
-                .map(|_| ())
-                .map_err(classify_command),
+                .map(|_| ()),
             None => Err(RuntimeError::NotFound {
                 resource: id.to_string(),
             }),
@@ -278,8 +301,7 @@ where
                     ["stop", "--time", "5", id.as_str()],
                 ))
                 .await
-                .map(|_| ())
-                .map_err(classify_command),
+                .map(|_| ()),
             None => Err(RuntimeError::NotFound {
                 resource: id.to_string(),
             }),
@@ -316,7 +338,7 @@ where
                         CommandSpec::new("container", ["volume", "delete", recorded.name()])
                     }
                 };
-                self.runner.run(spec).await.map_err(classify_command)?;
+                self.runner.run(spec).await?;
                 self.observations
                     .lock()
                     .map_err(|_| RuntimeError::CommandIo {
@@ -404,7 +426,6 @@ where
             .run(CommandSpec::new("container", args))
             .await
             .map(|output| output.stdout)
-            .map_err(classify_command)
     }
 
     async fn list_resources(&self) -> Result<Vec<RuntimeResource>, RuntimeError> {
@@ -450,30 +471,10 @@ fn invalid_output(operation: &str, message: String) -> RuntimeError {
         message,
     }
 }
-fn classify_command(error: RuntimeError) -> RuntimeError {
-    match error {
-        RuntimeError::CommandFailed {
-            operation,
-            exit_code: _,
-            stderr,
-        } if stderr.to_ascii_lowercase().contains("already exists") => RuntimeError::Conflict {
-            resource: operation,
-            message: stderr,
-        },
-        RuntimeError::CommandFailed {
-            operation,
-            exit_code: _,
-            stderr,
-        } if stderr.to_ascii_lowercase().contains("not found") => RuntimeError::NotFound {
-            resource: format!("{operation}: {stderr}"),
-        },
-        error => error,
-    }
-}
 fn create_failure(
     request: &CreateRequest,
     created: Vec<RuntimeResource>,
     source: RuntimeError,
 ) -> CreateFailure {
-    CreateFailure::new(request, created, source).unwrap_or_else(CreateFailure::from_source)
+    CreateFailure::from_created_evidence(request, created, source)
 }

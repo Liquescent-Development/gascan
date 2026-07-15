@@ -482,6 +482,40 @@ impl CreateFailure {
         }
     }
 
+    /// Retains every independently valid piece of create evidence and drops any
+    /// malformed, duplicate, foreign, or request-unrelated observation.
+    pub fn from_created_evidence(
+        request: &CreateRequest,
+        created: Vec<RuntimeResource>,
+        source: RuntimeError,
+    ) -> Self {
+        let container = ResourceIdentity {
+            kind: ResourceKind::Container,
+            name: request.id.to_string(),
+        };
+        let allowed_volumes: BTreeSet<_> = request
+            .volumes()
+            .iter()
+            .map(|volume| ResourceIdentity {
+                kind: ResourceKind::Volume,
+                name: volume.name.clone(),
+            })
+            .collect();
+        let mut identities = BTreeSet::new();
+        let created = created
+            .into_iter()
+            .filter(|resource| {
+                let allowed =
+                    resource.identity == container || allowed_volumes.contains(&resource.identity);
+                allowed
+                    && resource.ownership == ResourceOwnership::GasCanOwned
+                    && resource.sandbox_id.as_ref() == Some(&request.id)
+                    && identities.insert(resource.identity.clone())
+            })
+            .collect();
+        Self { created, source }
+    }
+
     pub fn created(&self) -> &[RuntimeResource] {
         &self.created
     }
