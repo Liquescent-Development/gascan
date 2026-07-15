@@ -101,12 +101,17 @@ fn fixture() -> Fixture {
         )
         .unwrap();
     }
-    let container = temp.path().join("container");
+    let raw_container = temp.path().join("container-raw");
     executable(
-        &container,
+        &raw_container,
         &format!(
             "#!/bin/sh\nset -eu\nprintf 'container:%s\\n' \"$*\" >>\"$CALLS\"\nif [ \"$1 ${{2:-}}\" = 'image inspect' ]; then platform=${{IMAGE_PLATFORM:-arm64}}; printf '[{{\"id\":\"sha256:{DIGEST}\",\"configuration\":{{\"name\":\"gascan-workspace:test\",\"descriptor\":{{\"digest\":\"sha256:{DIGEST}\"}}}},\"variants\":[{{\"platform\":{{\"os\":\"linux\",\"architecture\":\"%s\"}}}}]}}]\\n' \"$platform\"; exit 0; fi\ncase \"$1\" in create) while [ $# -gt 0 ]; do [ \"$1\" = --name ] && {{ touch \"$STATE/$2\"; break; }}; shift; done ;; inspect) name=$2; [ \"${{RESIDUE:-}}\" = \"$name\" ] || [ -f \"$STATE/$name\" ] || exit 1; count_file=\"$STATE/.inspect-$name\"; count=0; [ ! -f \"$count_file\" ] || count=$(cat \"$count_file\"); count=$((count+1)); printf '%s' \"$count\" >\"$count_file\"; owner=$OWNER; [ \"${{FOREIGN:-}}\" = \"$name\" ] && owner=ffffffffffffffffffffffffffffffff; [ \"${{REPLACE_ON_SECOND_INSPECT:-}}\" = \"$name\" ] && [ \"$count\" -ge 2 ] && owner=ffffffffffffffffffffffffffffffff; printf '[{{\"configuration\":{{\"id\":\"%s\",\"name\":\"%s\",\"labels\":{{\"dev.gascan.test\":\"true\",\"dev.gascan.test.owner\":\"%s\"}}}}}}]\\n' \"$name\" \"$name\" \"$owner\" ;; stop) : ;; delete) name=${{@:$#}}; [ \"${{FAIL_DELETE:-}}\" != \"$name\" ] || exit 1; rm -f \"$STATE/$name\" ;; esac\n"
         ),
+    );
+    let container = temp.path().join("container");
+    executable(
+        &container,
+        "#!/bin/sh\nset -eu\nif [ \"$1\" = list ]; then first=true; printf '['; for name in gascan-image-user-test-$OWNER gascan-image-polyglot-test-$OWNER gascan-image-gascamp-test-$OWNER; do if [ \"${RESIDUE:-}\" = \"$name\" ] || [ -f \"$STATE/$name\" ]; then $first || printf ','; first=false; printf '{\"configuration\":{\"name\":\"%s\"}}' \"$name\"; fi; done; printf ']\\n'; exit 0; fi\nexec \"$RAW_CONTAINER\" \"$@\"\n",
     );
     let token_file = temp.path().join("gascamp-token");
     fs::write(&token_file, "synthetic\n").unwrap();
@@ -125,6 +130,7 @@ fn fixture() -> Fixture {
         .env("CALLS", &calls)
         .env("STATE", &state)
         .env("OWNER", TOKEN)
+        .env("RAW_CONTAINER", &raw_container)
         .env("CARGO_TARGET_DIR", repository_root().join("scripts/target"));
     Fixture {
         temp,
@@ -446,7 +452,7 @@ fn every_blocking_cleanup_cli_is_killed_reaped_and_fail_closed() {
         let wrapper = f.temp.path().join("blocking-container");
         executable(
             &wrapper,
-            "#!/bin/sh\nset -eu\nhang=false\ncase \"$HANG_COMMAND:$1\" in inspect:inspect|stop:stop|delete:delete) hang=true ;; final:inspect) [ -f \"$STATE/$2\" ] || hang=true ;; esac\nif $hang; then printf '%s\\n' $$ >>\"$BLOCKED_PIDS\"; trap '' INT TERM; while :; do sleep 1; done; fi\nexec \"$REAL_CONTAINER\" \"$@\"\n",
+            "#!/bin/sh\nset -eu\nhang=false\ncase \"$HANG_COMMAND:$1\" in inspect:inspect|stop:stop|delete:delete|final:list) hang=true ;; esac\nif $hang; then printf '%s\\n' $$ >>\"$BLOCKED_PIDS\"; trap '' INT TERM; while :; do sleep 1; done; fi\nexec \"$REAL_CONTAINER\" \"$@\"\n",
         );
         f.command
             .env("CONTAINER_BIN", &wrapper)
@@ -474,8 +480,12 @@ fn every_blocking_cleanup_cli_is_killed_reaped_and_fail_closed() {
         };
         assert!(!status.success());
         assert!(started.elapsed() < Duration::from_secs(30));
-        for pid in fs::read_to_string(&pids)
-            .unwrap_or_default()
+        let blocked_pids = fs::read_to_string(&pids).unwrap_or_default();
+        assert!(
+            !blocked_pids.is_empty(),
+            "blocking path was not exercised: {blocked}"
+        );
+        for pid in blocked_pids
             .lines()
             .map(|line| line.parse::<i32>().unwrap())
         {
@@ -554,4 +564,45 @@ fn real_smoke_cleanup_controller_hang_is_bounded_and_reaped() {
             .exists()
     );
     assert!(!f.root.join("images/workspace/approved-image.txt").exists());
+}
+
+#[test]
+fn inspect_failure_never_proves_absence_without_authoritative_inventory() {
+    for inventory in ["present", "error", "malformed", "timeout"] {
+        let mut f = fixture();
+        let wrapper = f.temp.path().join("inventory-container");
+        executable(
+            &wrapper,
+            "#!/bin/sh\nset -eu\nif [ \"$1\" = inspect ] && [ ! -f \"$STATE/$2\" ]; then exit 77; fi\nif [ \"$1\" = list ]; then case \"$INVENTORY_MODE\" in present) printf '[{\"configuration\":{\"name\":\"gascan-image-user-test-00112233445566778899aabbccddeeff\"}}]\\n' ;; error) exit 78 ;; malformed) printf '{bad\\n' ;; timeout) printf '%s\\n' $$ >>\"$BLOCKED_PIDS\"; trap '' INT TERM; while :; do sleep 1; done ;; esac; exit 0; fi\nexec \"$REAL_CONTAINER\" \"$@\"\n",
+        );
+        let pids = f.temp.path().join("blocked-pids");
+        f.command
+            .env("CONTAINER_BIN", wrapper)
+            .env("REAL_CONTAINER", f.temp.path().join("container"))
+            .env("INVENTORY_MODE", inventory)
+            .env("BLOCKED_PIDS", &pids)
+            .env("GASCAN_GATE_CLI_TIMEOUT_SECONDS", "1");
+        let status = f.command.status().unwrap();
+        assert!(!status.success(), "inventory={inventory}");
+        assert!(
+            !f.root
+                .join("docs/evidence/connected-workspace-image.md")
+                .exists()
+        );
+        assert!(!f.root.join("images/workspace/approved-image.txt").exists());
+    }
+}
+
+#[test]
+fn inspect_failure_plus_parsed_inventory_absence_is_authoritative() {
+    let mut f = fixture();
+    let wrapper = f.temp.path().join("inventory-container");
+    executable(
+        &wrapper,
+        "#!/bin/sh\nset -eu\nif [ \"$1\" = inspect ] && [ ! -f \"$STATE/$2\" ]; then exit 77; fi\nif [ \"$1\" = list ]; then printf '[]\\n'; exit 0; fi\nexec \"$REAL_CONTAINER\" \"$@\"\n",
+    );
+    f.command
+        .env("CONTAINER_BIN", wrapper)
+        .env("REAL_CONTAINER", f.temp.path().join("container"));
+    assert!(f.command.status().unwrap().success());
 }

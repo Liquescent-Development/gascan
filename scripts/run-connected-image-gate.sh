@@ -64,27 +64,43 @@ fi
 
 names=("gascan-image-user-test-$owner_token" "gascan-image-polyglot-test-$owner_token" "gascan-image-gascamp-test-$owner_token")
 cleaning=false
-owned() {
+inventory_proves_absent() {
+  local inventory
+  inventory=$(controller list --all --format json 2>/dev/null) || return 1
+  printf '%s' "$inventory" | run_tool validate-container-inventory "$@" >/dev/null
+}
+classify_name() {
   local name=$1 inspect
-  inspect=$(controller inspect "$name" 2>/dev/null) || return 1
-  printf '%s' "$inspect" | run_tool validate-owned-container "$name" "$owner_token" >/dev/null
+  if inspect=$(controller inspect "$name" 2>/dev/null); then
+    if printf '%s' "$inspect" | run_tool validate-owned-container "$name" "$owner_token" >/dev/null; then printf 'owned\n'; return 0; fi
+    printf 'foreign\n'; return 2
+  fi
+  if inventory_proves_absent "$name"; then printf 'absent\n'; return 0; fi
+  printf 'indeterminate\n'; return 3
+}
+owned() {
+  test "$(classify_name "$1")" = owned
 }
 cleanup_name() {
-  local name=$1
-  if owned "$name" && owned "$name"; then
-    controller stop --time 5 "$name" >/dev/null 2>&1 || true
-    owned "$name" && owned "$name" && controller delete "$name" >/dev/null 2>&1 || true
-  fi
+  local name=$1 state
+  state=$(classify_name "$name") || return 1
+  test "$state" = absent && return 0
+  test "$state" = owned || return 1
+  owned "$name" || return 1
+  controller stop --time 5 "$name" >/dev/null 2>&1 || true
+  owned "$name" && owned "$name" || return 1
+  controller delete "$name" >/dev/null 2>&1 || true
+  inventory_proves_absent "$name"
 }
 cleanup() {
   $cleaning && return
   cleaning=true
-  local name
-  for name in "${names[@]}"; do cleanup_name "$name"; done
+  local name result=0
+  for name in "${names[@]}"; do cleanup_name "$name" || result=1; done
+  return "$result"
 }
 assert_absent() {
-  local name
-  for name in "${names[@]}"; do ! controller inspect "$name" >/dev/null 2>&1 || return 1; done
+  inventory_proves_absent "${names[@]}"
 }
 evidence_tmp=''
 approved_tmp=''
@@ -95,7 +111,7 @@ rollback_publication() {
   test -z "$approved_tmp" || rm -f "$approved_tmp"
   if $published_evidence && ! $committed; then rm -f "$evidence_file" "$approved_file"; fi
 }
-finish() { status=$?; rollback_publication; cleanup; exit "$status"; }
+finish() { status=$?; rollback_publication; cleanup || status=1; exit "$status"; }
 on_signal() { code=$1; trap - EXIT INT TERM; rollback_publication; cleanup; assert_absent || exit 1; exit "$code"; }
 trap cleanup EXIT
 trap 'on_signal 130' INT
