@@ -6,8 +6,49 @@ die() {
   exit 1
 }
 
+run_bounded() {
+  timeout_seconds="$1"
+  shift
+  set -m
+  "$@" &
+  command_pid=$!
+  set +m
+  set -m
+  (
+    sleep "$timeout_seconds"
+    if kill -0 "$command_pid" 2>/dev/null; then
+      kill -TERM -- "-$command_pid" 2>/dev/null || true
+      sleep 1
+      kill -KILL -- "-$command_pid" 2>/dev/null || true
+    fi
+  ) &
+  watchdog_pid=$!
+  set +m
+  if wait "$command_pid"; then result=0; else result=$?; fi
+  kill -TERM -- "-$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
+  return "$result"
+}
+
+operation_timeout="${GASCAN_PROBE_TIMEOUT_SECONDS:-300}"
+case "$operation_timeout" in ''|*[!0-9]*) die 'GASCAN_PROBE_TIMEOUT_SECONDS must be a positive integer' ;; esac
+test "$operation_timeout" -gt 0 || die 'GASCAN_PROBE_TIMEOUT_SECONDS must be a positive integer'
+
+ownership_label='com.gascan.build-secret-probe'
+
+has_ownership() {
+  json_file="$1"
+  identity="$2"
+  marker="$3"
+  jq -e --arg identity "$identity" --arg label "$ownership_label" --arg marker "$marker" '
+    ([.. | scalars | select(. == $identity)] | length >= 1) and
+    ([.. | objects | (.labels? // .Labels? // empty) | objects | .[$label]? | select(. == $marker)] | length >= 1)
+  ' "$json_file" >/dev/null
+}
+
 test -n "${GASCAN_TEST_SECRET_FILE:-}" || die 'GASCAN_TEST_SECRET_FILE is required'
 case "$GASCAN_TEST_SECRET_FILE" in /*) ;; *) die 'secret path must be absolute' ;; esac
+test ! -L "$GASCAN_TEST_SECRET_FILE" || die 'secret must not be a symbolic link'
 secret="$(realpath "$GASCAN_TEST_SECRET_FILE")" || die 'cannot canonicalize secret path'
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 case "$secret" in "$repo"|"$repo"/*) die 'secret file must be outside the repository' ;; esac
@@ -37,12 +78,42 @@ inspect="$private_root/image-inspect.json"
 exported="$private_root/container.tar"
 built=false
 created=false
+ownership_marker="$container_name"
+cleanup_container_inspect="$private_root/cleanup-container-inspect.json"
+cleanup_image_inspect="$private_root/cleanup-image-inspect.json"
+
+container_owned() {
+  run_bounded "$operation_timeout" container inspect "$container_name" | cat >"$cleanup_container_inspect" &&
+    has_ownership "$cleanup_container_inspect" "$container_name" "$ownership_marker"
+}
+
+image_owned() {
+  run_bounded "$operation_timeout" container image inspect "$tag" | cat >"$cleanup_image_inspect" &&
+    has_ownership "$cleanup_image_inspect" "$tag" "$ownership_marker"
+}
 
 cleanup() {
   status=$?
   trap - EXIT INT TERM HUP
-  if test "$created" = true; then container delete "$container_name" >/dev/null 2>&1 || status=1; fi
-  if test "$built" = true; then container image delete "$tag" >/dev/null 2>&1 || status=1; fi
+  if test "$created" = true; then
+    if container_owned; then
+      run_bounded "$operation_timeout" container stop "$container_name" >/dev/null 2>&1 || true
+      if container_owned; then
+        run_bounded "$operation_timeout" container delete "$container_name" >/dev/null 2>&1 || status=1
+      else
+        status=1
+      fi
+    else
+      status=1
+    fi
+  fi
+  if test "$built" = true; then
+    if image_owned; then
+      run_bounded "$operation_timeout" container image delete "$tag" >/dev/null 2>&1 || status=1
+    else
+      status=1
+    fi
+  fi
   rm -f "$staged_secret"
   rm -rf "$private_root"
   exit "$status"
@@ -75,8 +146,9 @@ if grep -a -F -q -f "$secret" "$transmitted"; then
 fi
 
 expected_sha256="$(shasum -a 256 "$secret" | cut -d' ' -f1)"
-if ! container build --secret "id=gascamp_read_token,src=$staged_secret" \
-  --build-arg "EXPECTED_SECRET_SHA256=$expected_sha256" --tag "$tag" "$context" \
+if ! run_bounded "$operation_timeout" container build --secret "id=gascamp_read_token,src=$staged_secret" \
+  --build-arg "EXPECTED_SECRET_SHA256=$expected_sha256" \
+  --label "$ownership_label=$ownership_marker" --tag "$tag" "$context" \
   2>&1 | cat >"$transcript"; then
   if grep -a -F -q -f "$secret" "$transcript"; then
     die 'build failed; transcript withheld because it contains the synthetic secret'
@@ -87,18 +159,22 @@ if ! container build --secret "id=gascamp_read_token,src=$staged_secret" \
 fi
 built=true
 
-if container image inspect --help 2>&1 | grep -q -- '--format'; then
-  container image inspect --format json "$tag" | cat >"$inspect"
+if run_bounded "$operation_timeout" container image inspect --help 2>&1 | grep -q -- '--format'; then
+  run_bounded "$operation_timeout" container image inspect --format json "$tag" | cat >"$inspect"
 else
-  container image inspect "$tag" | cat >"$inspect"
+  run_bounded "$operation_timeout" container image inspect "$tag" | cat >"$inspect"
 fi
 jq -e 'type == "object" or type == "array"' "$inspect" >/dev/null || die 'image inspect was not structured JSON'
+has_ownership "$inspect" "$tag" "$ownership_marker" || die 'built image ownership mismatch'
 
-container create --name "$container_name" "$tag" /bin/sh -c 'sleep 30' >/dev/null
+run_bounded "$operation_timeout" container create --name "$container_name" \
+  --label "$ownership_label=$ownership_marker" "$tag" /bin/sh -c 'sleep 30' >/dev/null
 created=true
-container start "$container_name" >/dev/null
-container stop "$container_name" >/dev/null
-container export "$container_name" --output "$exported" >/dev/null
+container_owned || die 'created container ownership mismatch'
+run_bounded "$operation_timeout" container start "$container_name" >/dev/null
+container_owned || die 'container ownership mismatch before stop'
+run_bounded "$operation_timeout" container stop "$container_name" >/dev/null
+run_bounded "$operation_timeout" container export "$container_name" --output "$exported" >/dev/null
 
 for artifact in "$context/Dockerfile" "$transmitted" "$transcript" "$inspect" "$exported"; do
   if grep -a -F -q -f "$secret" "$artifact"; then

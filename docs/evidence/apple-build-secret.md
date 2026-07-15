@@ -14,4 +14,6 @@ Apple BuildKit mounted the staged file only at `/run/secrets/gascamp_read_token`
 
 The probe reported `PASS`. Its exit trap removed only its token-owned test container, image tag, staged secret, and private context. A post-run `container list --all` showed no `gascan-build-secret-probe-*` container.
 
+Follow-up hardening assigns the same unique `com.gascan.build-secret-probe` ownership marker to the image and container. Every stop or deletion is preceded by a bounded structural inspect that matches both the exact identity and marker; a mismatch fails cleanup without mutating the colliding resource. Every Apple CLI operation, including inspection and cleanup, runs under an explicit process-group deadline. The probe also rejects the supplied path itself when it is a symlink, before canonicalization.
+
 Compatibility note: this Apple CLI emits structured JSON from `container image inspect` and rejects `--format json`; the probe uses the reviewed `--format json` form when advertised by `--help`, otherwise the native structured output.
