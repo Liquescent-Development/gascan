@@ -55,7 +55,7 @@ the polyglot toolchain.
 | Phase 1 Apple feasibility / Gate 2 | Passed and integrated | `6bedef8`, `docs/feasibility/apple-container-report.md` |
 | Phase 1 core control plane / Gate 3 | Passed and integrated | `7c7d083`, integration record `917dac1` |
 | Phase 2 Apple backend implementation | Implemented and reviewed on feature branch; not integrated | head `dbf4235` |
-| Phase 2 workspace image | Offline implementation exists; connected MVP Tasks 1–2 are approved; Tasks 3–7 remain | provisioning head includes `1878744`, `docs/evidence/apple-build-secret.md`, and the connected-build addendum |
+| Phase 2 workspace image | Offline implementation exists; connected MVP Tasks 1–3 are approved; Tasks 4–7 remain | provisioning head includes `7a429cb`, `docs/evidence/apple-build-secret.md`, and the connected-build addendum |
 | Gate 4 real lifecycle | Pending; harness approved but no complete real lifecycle evidence | harness `dbf4235` |
 | Phase 3 security, packaging, release | Not started as an integrated phase | blocked by Gate 4 |
 | Gate 5 clean-host release | Pending | no evidence |
@@ -110,6 +110,8 @@ The harness is approved; Gate 4 itself is not passed.
   non-retention evidence, including bounded ownership-checked cleanup.
 - `1878744`: approved connected lock, public acquisition boundary, and atomic
   minimal context preparation with offline mode preserved.
+- `7a429cb`: approved connected Ubuntu and mise polyglot base assembly with
+  exact reviewed package input and preserved final-user contracts.
 
 These offline commits are reviewed assets, not completed publication or live
 image evidence. `images/workspace/versions.lock` still says
@@ -134,9 +136,9 @@ Do not encode the operator DNS IP into Gas Can product policy.
 
 ## Current Unfinished Work
 
-1. Execute Task 3 of
+1. Execute Task 4 of
    `docs/superpowers/plans/2026-07-15-connected-workspace-image.md`, then
-   continue task by task with independent review gates. Tasks 1–2 are complete
+   continue task by task with independent review gates. Tasks 1–3 are complete
    and must not be redispatched. The user has preselected subagent-driven
    execution; do not re-plan the program.
 2. Convert the image path from mandatory offline bundles to connected locked
