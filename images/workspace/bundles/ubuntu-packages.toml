@@ -14,4 +14,4 @@ builder_packages = [
 ]
 
 system_packages_file = "tests/image/system-tools.txt"
-system_packages_sha256 = "9f64999efc0136ccbdc9a6697f2456c453e9c1c1b68b85f547067411df4164ae"
+system_packages_sha256 = "d17faf2df1d118f9d7f741c21f77adc4b56e2b89ecabeebde17003bc470742e6"

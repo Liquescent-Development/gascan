@@ -15,6 +15,7 @@ on:
 
 jobs:
   mise-runtimes-linux-arm64:
+    needs: validate-ubuntu-packages-linux-arm64
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
@@ -22,19 +23,41 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: validated-ubuntu-packages-linux-arm64
+          path: ${{ runner.temp }}/ubuntu-package-bundle
       - name: Produce twice in the exact pinned base and require identical bytes
         run: |
           set -euo pipefail
+          ubuntu_archive="$RUNNER_TEMP/ubuntu-package-bundle/ubuntu-packages-linux-arm64.tar.zst"
+          ubuntu_sha=$(tr -d '[:space:]' <"$ubuntu_archive.sha256")
+          test "$(sha256sum "$ubuntu_archive" | cut -d' ' -f1)" = "$ubuntu_sha"
+          test "$(wc -c <"$ubuntu_archive" | tr -d ' ')" = "$(tr -d '[:space:]' <"$ubuntu_archive.size")"
+          ubuntu_evidence="$RUNNER_TEMP/ubuntu-package-evidence"
+          mkdir "$ubuntu_evidence"
+          zstd --decompress --stdout "$ubuntu_archive" | tar -xf - -C "$ubuntu_evidence"
           image=ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab
+          docker pull "$image"
+          test "$(docker image inspect --format '{{.Architecture}}/{{.Os}}' "$image")" = "arm64/linux"
+          image_id=$(docker image inspect --format '{{.Id}}' "$image")
+          [[ $image_id =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker image inspect --format '{{join .RepoDigests "\n"}}' "$image" | grep -Fx "$image"
+          attestation="$RUNNER_TEMP/base-attestation.env"
+          printf 'WORKFLOW_COMMIT=%s\nIMAGE_DIGEST=%s\nIMAGE_ID=%s\nPLATFORM=linux/arm64\nINVOCATION=docker-run-read-only-attestation-v1\nUBUNTU_BUNDLE_SHA256=%s\n' "$GITHUB_SHA" "$image" "$image_id" "$ubuntu_sha" >"$attestation"
+          chmod 0444 "$attestation"
           for suffix in a b; do
             output="$RUNNER_TEMP/mise-runtime-$suffix"
             mkdir "$output"
             docker run --rm --platform linux/arm64 \
               --mount "type=bind,source=$GITHUB_WORKSPACE,target=/src,readonly" \
               --mount "type=bind,source=$output,target=/output" \
-              "$image" bash -ceu 'apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends $(cat /src/tests/image/system-tools.txt) curl python3 tar zstd; /src/scripts/produce-mise-runtime-bundle.sh /output'
+              --mount "type=bind,source=$ubuntu_evidence,target=/ubuntu-evidence,readonly" \
+              --mount "type=bind,source=$attestation,target=/run/gascan/base-attestation.env,readonly" \
+              "$image" bash -ceu 'find /ubuntu-evidence/repository/pool -type f -name "*.deb" -print0 | xargs -0 -r dpkg --install; /src/scripts/produce-mise-runtime-bundle.sh /output'
+            cp -- "$attestation" "$output/base-attestation.env"
           done
-          for name in mise-runtimes-linux-arm64.tar.zst mise-runtimes-linux-arm64.tar.zst.sha256 mise-runtimes-linux-arm64.tar.zst.size mise-runtimes-linux-arm64.manifest.tsv mise-current.json mise.lock provenance.env upstream-artifacts.tsv; do
+          for name in base-attestation.env download-trace.tsv mise-runtimes-linux-arm64.tar.zst mise-runtimes-linux-arm64.tar.zst.sha256 mise-runtimes-linux-arm64.tar.zst.size mise-runtimes-linux-arm64.manifest.tsv mise-current.json mise.lock provenance.env upstream-artifacts.tsv; do
             cmp --silent "$RUNNER_TEMP/mise-runtime-a/$name" "$RUNNER_TEMP/mise-runtime-b/$name" || { echo "non-deterministic mise runtime output: $name" >&2; exit 1; }
           done
           scripts/produce-mise-runtime-bundle.sh --verify-evidence "$RUNNER_TEMP/mise-runtime-a"
@@ -58,11 +81,18 @@ jobs:
         with:
           name: mise-runtimes-linux-arm64
           path: ${{ runner.temp }}/mise-runtime
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: validated-ubuntu-packages-linux-arm64
+          path: ${{ runner.temp }}/ubuntu-package-bundle
       - name: Revalidate without producer privileges
         run: |
           set -euo pipefail
-          sudo apt-get update && sudo apt-get install --yes --no-install-recommends zstd
           test "$(id -u)" != 0
+          marker="$RUNNER_TEMP/mise-runtime/base-attestation.env"
+          test "$(awk -F= '$1 == \"WORKFLOW_COMMIT\" {print $2}' "$marker")" = "$GITHUB_SHA"
+          test "$(awk -F= '$1 == \"IMAGE_DIGEST\" {print $2}' "$marker")" = "ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab"
+          test "$(awk -F= '$1 == \"UBUNTU_BUNDLE_SHA256\" {print $2}' "$marker")" = "$(tr -d '[:space:]' <"$RUNNER_TEMP/ubuntu-package-bundle/ubuntu-packages-linux-arm64.tar.zst.sha256")"
           scripts/produce-mise-runtime-bundle.sh --verify-evidence "$RUNNER_TEMP/mise-runtime"
           archive="$RUNNER_TEMP/mise-runtime/mise-runtimes-linux-arm64.tar.zst"
           test "$(sha256sum "$archive" | cut -d' ' -f1)" = "$(tr -d '[:space:]' <"$archive.sha256")"

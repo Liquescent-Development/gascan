@@ -2,6 +2,7 @@ autoconf
 bison
 build-essential
 ca-certificates
+curl
 fonts-liberation
 gh
 git
@@ -33,9 +34,11 @@ libxrandr2
 libyaml-dev
 patch
 pkg-config
+python3
 jq
 sudo
 tini
 unzip
 xz-utils
 zlib1g-dev
+zstd

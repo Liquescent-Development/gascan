@@ -47,7 +47,7 @@ impl Fixture {
         .unwrap();
         fs::write(
             root.join("provenance.env"),
-            format!("SNAPSHOT=2026-07-13T00:00:00Z\nBASE_IMAGE=ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab\nSIGNING_KEY_FINGERPRINT={FINGERPRINT}\nARCHITECTURE=arm64\nINSTALL_RECOMMENDS=false\nSYSTEM_PACKAGES_PATH=tests/image/system-tools.txt\nSYSTEM_PACKAGES_SHA256=9f64999efc0136ccbdc9a6697f2456c453e9c1c1b68b85f547067411df4164ae\n"),
+            format!("SNAPSHOT=2026-07-13T00:00:00Z\nBASE_IMAGE=ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab\nSIGNING_KEY_FINGERPRINT={FINGERPRINT}\nARCHITECTURE=arm64\nINSTALL_RECOMMENDS=false\nSYSTEM_PACKAGES_PATH=tests/image/system-tools.txt\nSYSTEM_PACKAGES_SHA256=d17faf2df1d118f9d7f741c21f77adc4b56e2b89ecabeebde17003bc470742e6\n"),
         ).unwrap();
         let gpgv = root.join("gpgv");
         fs::write(&gpgv, format!("#!/bin/sh\nprintf '%s\\n' '[GNUPG:] VALIDSIG {FINGERPRINT} 20260713 0 4 0 1 10 01 {FINGERPRINT}' >&2\n")).unwrap();

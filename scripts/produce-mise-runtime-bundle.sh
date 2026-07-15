@@ -28,13 +28,18 @@ def env(path):
  return out
 expected={"elixir":"1.20.2-otp-29","go":"1.26.5","java":"25.0.2","node":"24.18.0","python":"3.14.6","ruby":"3.4.10","rust":"1.97.0"}
 p=env(root/"provenance.env")
-required={"PLATFORM","MISE_VERSION","MISE_SHA256","CONFIG_SHA256","BASE_IMAGE"}
+required={"PLATFORM","MISE_VERSION","MISE_SHA256","CONFIG_SHA256","BASE_IMAGE","BASE_ATTESTATION_SHA256"}
 if set(p)!=required: fail("provenance fields differ from exact schema")
 if p["PLATFORM"]!="linux/arm64": fail("wrong platform")
 if p["MISE_VERSION"]!="2026.5.0": fail("wrong mise version")
 if p["MISE_SHA256"]!="fba7c8a383cf3c59eb5a9995d5299fd2c78eba7eb1daace48d75fe491362f79a": fail("wrong mise digest")
 if p["CONFIG_SHA256"]!="687b22340b2f0e48d07bc5521fbaa39749f2ac1554e1bebc6848f92296ac663b": fail("wrong config digest")
 if p["BASE_IMAGE"]!="ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab": fail("wrong base image digest")
+attestation=read(root/"base-attestation.env")
+if hashlib.sha256(attestation.encode()).hexdigest()!=p["BASE_ATTESTATION_SHA256"]: fail("base attestation digest mismatch")
+base=env(root/"base-attestation.env")
+if base.get("IMAGE_DIGEST")!=p["BASE_IMAGE"] or base.get("PLATFORM")!="linux/arm64" or base.get("INVOCATION")!="docker-run-read-only-attestation-v1": fail("invalid producer-independent base attestation")
+if not re.fullmatch("[0-9a-f]{40}",base.get("WORKFLOW_COMMIT","")) or not re.fullmatch("sha256:[0-9a-f]{64}",base.get("IMAGE_ID","")) or not re.fullmatch("[0-9a-f]{64}",base.get("UBUNTU_BUNDLE_SHA256","")): fail("invalid base attestation receipt")
 try: current=json.loads(read(root/"mise-current.json"))
 except json.JSONDecodeError: fail("invalid mise current JSON")
 if set(current)!=set(expected): fail("mise current does not contain exact seven tools")
@@ -47,11 +52,13 @@ if downloads!=sorted(set(downloads)): fail("upstream provenance is not in canoni
 seen=set()
 for line in downloads:
  cols=line.split("\t")
- if len(cols)!=5: fail("invalid upstream artifact provenance")
- tool,version,backend,url,sha=cols
+ if len(cols)!=7: fail("invalid upstream artifact provenance")
+ tool,version,backend,url,sha,size,path=cols
  if expected.get(tool)!=version: fail("upstream provenance has wrong tool/version")
  if not backend or not url.startswith("https://"): fail("upstream artifact URL/backend provenance missing")
- if not re.fullmatch("[0-9a-f]{64}",sha): fail("upstream artifact checksum provenance invalid")
+ if not path.startswith("downloads/") or PurePosixPath(path).is_absolute() or ".." in PurePosixPath(path).parts: fail("unsafe downloaded artifact path")
+ artifact=root/path
+ if not re.fullmatch("[0-9a-f]{64}",sha) or not size.isdigit() or not artifact.is_file() or artifact.stat().st_size!=int(size) or hashlib.sha256(artifact.read_bytes()).hexdigest()!=sha: fail("downloaded artifact checksum/size provenance invalid")
  seen.add(tool)
 if seen!=set(expected): fail("upstream provenance missing locked runtime")
 try: mise_lock=tomllib.loads(read(root/"mise.lock"))
@@ -72,8 +79,13 @@ for tool,version in expected.items():
  if not any(isinstance(entry,dict) and entry.get("version")==version for entry in entries): fail("mise lock has wrong tool version")
  records={(backend,url,sha) for backend,url,sha in lock_records(lock_tools[tool]) if backend and url.startswith("https://") and re.fullmatch("[0-9a-f]{64}",sha)}
  if not records: fail("mise lock provenance missing for "+tool)
- for backend,url,sha in records: locked_rows.append("\t".join((tool,version,backend,url,sha)))
+ for backend,url,sha in records:
+  matches=[line for line in downloads if line.split("\t")[:5]==[tool,version,backend,url,sha]]
+  if len(matches)!=1: fail("upstream artifacts differ from mise lock provenance")
+  locked_rows.extend(matches)
 if downloads!=sorted(set(locked_rows)): fail("upstream artifacts differ from mise lock provenance")
+trace=[line for line in read(root/"download-trace.tsv").splitlines() if line]
+if trace!=downloads: fail("sanitized download trace differs from captured artifact provenance")
 manifest=[line for line in read(root/"mise-runtimes-linux-arm64.manifest.tsv").splitlines() if line]
 if manifest!=sorted(set(manifest)): fail("tree manifest is not in canonical order")
 declared={}
@@ -122,9 +134,38 @@ for tool,version in expected.items():
   if rec is None or rec[0]!="symlink": break
   path=posixpath.normpath(posixpath.join(posixpath.dirname(path),rec[6])); rec=actual.get(path)
  if rec is None or rec[0]!="file" or rec[1]!=0o755: fail("missing executable for "+tool)
+ body=tar.extractfile if False else None
+ data=None
+ # Validate native AArch64 ELF entrypoints, or a narrowly reviewed shebang.
+ with tarfile.open(fileobj=io.BytesIO(raw),mode="r:") as check_tar:
+  extracted=check_tar.extractfile(path)
+  if extracted is not None: data=extracted.read(256)
+ if data is None: fail("missing executable format for "+tool)
+ if data.startswith(b"\x7fELF"):
+  if len(data)<20 or data[4:7]!=b"\x02\x01\x01" or int.from_bytes(data[18:20],"little")!=183: fail("wrong executable format/platform for "+tool)
+ elif len(data)<128 or not any(data.startswith(line) for line in (b"#!/bin/sh\n",b"#!/usr/bin/env sh\n",b"#!/usr/bin/env bash\n")): fail("unreviewed executable format for "+tool)
 sha_file=root/"mise-runtimes-linux-arm64.tar.zst.sha256"; size_file=root/"mise-runtimes-linux-arm64.tar.zst.size"
 if read(sha_file).strip()!=hashlib.sha256(archive.read_bytes()).hexdigest(): fail("archive checksum sidecar mismatch")
 if read(size_file).strip()!=str(archive.stat().st_size): fail("archive size sidecar mismatch")
+if sys.platform.startswith("linux") and os.uname().machine=="aarch64":
+ import tempfile
+ with tempfile.TemporaryDirectory() as directory:
+  with tarfile.open(fileobj=io.BytesIO(raw),mode="r:") as run_tar: run_tar.extractall(directory,filter="data")
+  commands={"elixir":["--version"],"go":["version"],"java":["-version"],"node":["--version"],"python":["--version"],"ruby":["--version"],"rust":["--version"]}
+  for tool,version in expected.items():
+   executable=Path(directory)/f"opt/gascan/mise/installs/{tool}/{version}"/entrypoints[tool]
+   result=subprocess.run([str(executable),*commands[tool]],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,check=False,timeout=30)
+   output=result.stdout.strip()
+   valid={
+    "node":output=="v"+version,
+    "python":output=="Python "+version,
+    "go":output=="go version go"+version+" linux/arm64",
+    "rust":output.startswith("rustc "+version+" "),
+    "ruby":output.startswith("ruby "+version+" "),
+    "java":('version "'+version+'"') in output,
+    "elixir":"Elixir 1.20.2" in output and "Erlang/OTP 29" in output,
+   }[tool]
+   if result.returncode!=0 or not valid: fail("runtime version execution mismatch for "+tool)
 PY
 }
 
@@ -137,7 +178,17 @@ fi
 [[ $# == 1 ]] || die "usage: $0 OUTPUT_DIRECTORY"
 [[ $(uname -s) == Linux && $(uname -m) == aarch64 ]] || die "producer requires connected Linux ARM64"
 [[ $(id -u) == 0 ]] || die "producer must run as root; validation must run unprivileged"
-for command in curl find python3 sha256sum tar zstd; do command -v "$command" >/dev/null || die "missing command: $command"; done
+attestation=${GASCAN_BASE_ATTESTATION:-/run/gascan/base-attestation.env}
+[[ -f $attestation ]] || die "producer-independent base attestation is required"
+python3 - "$attestation" <<'PY'
+import re,sys
+p={}
+for line in open(sys.argv[1]):
+ key,value=line.rstrip("\n").split("=",1); p[key]=value
+if p.get("IMAGE_DIGEST")!="ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab" or p.get("PLATFORM")!="linux/arm64" or p.get("INVOCATION")!="docker-run-read-only-attestation-v1" or not re.fullmatch(r"[0-9a-f]{40}",p.get("WORKFLOW_COMMIT","")) or not re.fullmatch(r"sha256:[0-9a-f]{64}",p.get("IMAGE_ID","")) or not re.fullmatch(r"[0-9a-f]{64}",p.get("UBUNTU_BUNDLE_SHA256","")): raise SystemExit("mise runtime bundle: invalid producer-independent base attestation")
+PY
+awk -v target="$attestation" '$5 == target && $6 ~ /(^|,)ro(,|$)/ {found=1} END {exit !found}' /proc/self/mountinfo || die "base attestation must be a separate read-only mount"
+for command in curl find python3 sha256sum tar zstd; do command -v "$command" >/dev/null || die "exact pinned base lacks required producer command: $command"; done
 tar --help 2>&1 | grep -q -- --sort || die "GNU tar with deterministic sorting is required"
 output=$1
 mkdir -p "$output"
@@ -163,7 +214,7 @@ test "$(sha256sum "$mise" | cut -d' ' -f1)" = fba7c8a383cf3c59eb5a9995d5299fd2c7
 chmod 0555 "$mise"
 cp -- "$config" "$work/config.toml"
 touch "$work/config.lock"
-export MISE_DATA_DIR=/opt/gascan/mise MISE_CACHE_DIR="$work/cache" MISE_GLOBAL_CONFIG_FILE="$work/config.toml" MISE_CONFIG_DIR="$work/empty-config" MISE_YES=1 MISE_LOG_LEVEL=trace MISE_LOCKFILE=1 MISE_LOCKFILE_PLATFORMS=linux-arm64
+export MISE_DATA_DIR=/opt/gascan/mise MISE_CACHE_DIR="$work/cache" MISE_GLOBAL_CONFIG_FILE="$work/config.toml" MISE_CONFIG_DIR="$work/empty-config" MISE_YES=1 MISE_LOG_LEVEL=trace MISE_LOCKFILE=1 MISE_LOCKFILE_PLATFORMS=linux-arm64 MISE_ALWAYS_KEEP_DOWNLOAD=1
 mkdir -p "$MISE_CONFIG_DIR"
 tools=(elixir go java node python ruby rust)
 for tool in "${tools[@]}"; do
@@ -174,10 +225,10 @@ done
 "$mise" lock --platform linux-arm64 >/dev/null || die "mise failed to finalize upstream lock provenance"
 "$mise" current --json >"$output/mise-current.json"
 
-python3 - "$work/config.lock" "$lock" <<'PY'
-import re,sys,tomllib
+python3 - "$work/config.lock" "$lock" "$work/logs" /opt/gascan/mise/downloads "$output" <<'PY'
+import hashlib,re,shutil,sys,tomllib
 from pathlib import Path
-mise_lock=tomllib.loads(Path(sys.argv[1]).read_text()); versions=tomllib.loads(Path(sys.argv[2]).read_text())["tools"]; rows=[]
+mise_lock=tomllib.loads(Path(sys.argv[1]).read_text()); versions=tomllib.loads(Path(sys.argv[2]).read_text())["tools"]; logs=Path(sys.argv[3]); downloads=Path(sys.argv[4]); output=Path(sys.argv[5]); rows=[]
 def records(value,backend=""):
  if isinstance(value,list):
   for item in value: yield from records(item,backend)
@@ -193,10 +244,22 @@ for tool in sorted(versions):
   sha=checksum.removeprefix("sha256:")
   if backend and url.startswith("https://") and re.fullmatch(r"[0-9a-f]{64}",sha): normalized.add((backend,url,sha))
  if not normalized: raise SystemExit("mise runtime bundle: mise lock lacks upstream URL/checksum/backend for "+tool)
- for backend,url,sha in sorted(normalized): rows.append("\t".join((tool,versions[tool],backend,url,sha)))
-Path(sys.argv[1]).with_name("upstream-artifacts.tsv").write_text("\n".join(sorted(set(rows)))+"\n")
+ trace=(logs/(tool+".log")).read_text(errors="strict")
+ for backend,url,sha in sorted(normalized):
+  if url not in trace: raise SystemExit("mise runtime bundle: locked URL absent from backend download trace for "+tool)
+  candidates=[]
+  for path in downloads.rglob("*"):
+   if path.is_file():
+    body=path.read_bytes()
+    if hashlib.sha256(body).hexdigest()==sha: candidates.append((path,body))
+  if len(candidates)!=1: raise SystemExit("mise runtime bundle: retained download does not uniquely match locked checksum for "+tool)
+  path,body=candidates[0]; relative=Path("downloads")/(tool+"-"+sha)
+  (output/"downloads").mkdir(exist_ok=True); shutil.copyfile(path,output/relative)
+  rows.append("\t".join((tool,versions[tool],backend,url,sha,str(len(body)),relative.as_posix())))
+canonical="\n".join(sorted(set(rows)))+"\n"
+(output/"upstream-artifacts.tsv").write_text(canonical)
+(output/"download-trace.tsv").write_text(canonical)
 PY
-cp "$work/upstream-artifacts.tsv" "$output/upstream-artifacts.tsv"
 cp "$work/config.lock" "$output/mise.lock"
 rm -rf -- "$work/cache" /opt/gascan/mise/downloads
 find /opt/gascan/mise -exec chown -h 0:0 {} +
@@ -212,6 +275,7 @@ MISE_SHA256=fba7c8a383cf3c59eb5a9995d5299fd2c78eba7eb1daace48d75fe491362f79a
 CONFIG_SHA256=687b22340b2f0e48d07bc5521fbaa39749f2ac1554e1bebc6848f92296ac663b
 BASE_IMAGE=ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab
 EOF
+printf 'BASE_ATTESTATION_SHA256=%s\n' "$(sha256sum "$attestation" | cut -d' ' -f1)" >>"$output/provenance.env"
 python3 - / "$output/mise-runtimes-linux-arm64.manifest.tsv" <<'PY'
 import hashlib,os,stat,sys
 from pathlib import Path
@@ -233,4 +297,3 @@ tar --sort=name --format=posix --pax-option=delete=atime,delete=ctime --owner=0 
 zstd --threads=1 --no-progress -19 "$work/bundle.tar" -o "$output/$archive_name"
 sha256sum "$output/$archive_name" | cut -d' ' -f1 >"$output/$archive_name.sha256"
 wc -c <"$output/$archive_name" | tr -d ' ' >"$output/$archive_name.size"
-verify_evidence "$output"

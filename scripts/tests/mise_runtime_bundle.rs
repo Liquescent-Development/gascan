@@ -26,11 +26,16 @@ impl Fixture {
                 "tree/opt/gascan/mise/installs/{tool}/{version}/bin/{executable}"
             ));
             fs::create_dir_all(binary.parent().unwrap()).unwrap();
-            fs::write(&binary, b"#!/bin/sh\n").unwrap();
+            let mut elf = vec![0_u8; 128];
+            elf[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+            elf[16..18].copy_from_slice(&2_u16.to_le_bytes());
+            elf[18..20].copy_from_slice(&183_u16.to_le_bytes());
+            fs::write(&binary, elf).unwrap();
             fs::set_permissions(binary, fs::Permissions::from_mode(0o755)).unwrap();
         }
         fs::write(root.join("mise-current.json"), CURRENT).unwrap();
         fs::write(root.join("provenance.env"), "PLATFORM=linux/arm64\nMISE_VERSION=2026.5.0\nMISE_SHA256=fba7c8a383cf3c59eb5a9995d5299fd2c78eba7eb1daace48d75fe491362f79a\nCONFIG_SHA256=687b22340b2f0e48d07bc5521fbaa39749f2ac1554e1bebc6848f92296ac663b\nBASE_IMAGE=ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab\n").unwrap();
+        fs::create_dir_all(root.join("downloads")).unwrap();
         let downloads = [
             ("elixir", "1.20.2-otp-29"),
             ("go", "1.26.5"),
@@ -42,9 +47,12 @@ impl Fixture {
         ]
         .into_iter()
         .map(|(tool, version)| {
+            let body = format!("real-shaped-upstream-artifact:{tool}:{version}\n");
+            fs::write(root.join(format!("downloads/{tool}.artifact")), &body).unwrap();
+            use sha2::{Digest, Sha256};
             format!(
-                "{tool}\t{version}\tcore\thttps://example.invalid/{tool}\t{}",
-                "a".repeat(64)
+                "{tool}\t{version}\tcore\thttps://github.com/upstream/{tool}/releases/download/v{version}/{tool}-linux-arm64\t{:x}\t{}\tdownloads/{tool}.artifact",
+                Sha256::digest(body.as_bytes()), body.len()
             )
         })
         .collect::<Vec<_>>()
@@ -61,9 +69,28 @@ impl Fixture {
             ("ruby", "3.4.10"),
             ("rust", "1.97.0"),
         ] {
-            lock.push_str(&format!("{tool} = [{{ version = \"{version}\", backend = \"core\", platforms = {{ linux-arm64 = {{ url = \"https://example.invalid/{tool}\", checksum = \"sha256:{}\" }} }} }}]\n", "a".repeat(64)));
+            let body = fs::read(root.join(format!("downloads/{tool}.artifact"))).unwrap();
+            use sha2::{Digest, Sha256};
+            lock.push_str(&format!("{tool} = [{{ version = \"{version}\", backend = \"core\", platforms = {{ linux-arm64 = {{ url = \"https://github.com/upstream/{tool}/releases/download/v{version}/{tool}-linux-arm64\", checksum = \"sha256:{:x}\" }} }} }}]\n", Sha256::digest(body)));
         }
         fs::write(root.join("mise.lock"), lock).unwrap();
+        fs::write(
+            root.join("download-trace.tsv"),
+            fs::read_to_string(root.join("upstream-artifacts.tsv")).unwrap(),
+        )
+        .unwrap();
+        fs::write(root.join("base-attestation.env"), "WORKFLOW_COMMIT=1111111111111111111111111111111111111111\nIMAGE_DIGEST=ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab\nIMAGE_ID=sha256:2222222222222222222222222222222222222222222222222222222222222222\nPLATFORM=linux/arm64\nINVOCATION=docker-run-read-only-attestation-v1\nUBUNTU_BUNDLE_SHA256=3333333333333333333333333333333333333333333333333333333333333333\n").unwrap();
+        use sha2::{Digest, Sha256};
+        let attestation = fs::read(root.join("base-attestation.env")).unwrap();
+        let provenance = fs::read_to_string(root.join("provenance.env")).unwrap();
+        fs::write(
+            root.join("provenance.env"),
+            format!(
+                "{provenance}BASE_ATTESTATION_SHA256={:x}\n",
+                Sha256::digest(attestation)
+            ),
+        )
+        .unwrap();
         Self::refresh(root);
         Self { temp }
     }
@@ -177,10 +204,34 @@ fn rejects_provenance_not_bound_to_mise_lock() {
     let f = Fixture::new();
     f.replace(
         "mise.lock",
-        "https://example.invalid/node",
-        "https://example.invalid/forged",
+        "https://github.com/upstream/node/",
+        "https://github.com/forged/node/",
     );
     f.reject("mise lock provenance");
+}
+#[test]
+fn rejects_missing_base_attestation() {
+    let f = Fixture::new();
+    fs::remove_file(f.root().join("base-attestation.env")).unwrap();
+    f.reject("base-attestation.env");
+}
+#[test]
+fn rejects_tampered_captured_download() {
+    let f = Fixture::new();
+    fs::write(f.root().join("downloads/node.artifact"), b"forged").unwrap();
+    f.reject("downloaded artifact");
+}
+#[test]
+fn rejects_tiny_executable_stub() {
+    let f = Fixture::new();
+    fs::write(
+        f.root()
+            .join("tree/opt/gascan/mise/installs/node/24.18.0/bin/node"),
+        b"#!/bin/sh\n",
+    )
+    .unwrap();
+    Fixture::refresh(f.root());
+    f.reject("executable format");
 }
 #[test]
 fn rejects_missing_tool() {
@@ -220,8 +271,8 @@ fn rejects_writable_tree_entry() {
     let f = Fixture::new();
     f.replace(
         "mise-runtimes-linux-arm64.manifest.tsv",
-        "0755\t0\t0\t10",
-        "0777\t0\t0\t10",
+        "0755\t0\t0\t128",
+        "0777\t0\t0\t128",
     );
     f.reject("writable");
 }
@@ -230,8 +281,8 @@ fn rejects_non_root_ownership_evidence() {
     let f = Fixture::new();
     f.replace(
         "mise-runtimes-linux-arm64.manifest.tsv",
-        "0755\t0\t0\t10",
-        "0755\t1000\t0\t10",
+        "0755\t0\t0\t128",
+        "0755\t1000\t0\t128",
     );
     f.reject("ownership");
 }
@@ -279,6 +330,8 @@ fn workflow_is_connected_arm64_and_privilege_separated() {
     assert!(text.contains("cmp --silent"));
     assert!(text.contains("contents: read"));
     assert!(!text.contains("publish-mise-runtimes-linux-arm64"));
+    let mise_jobs = text.split("  ubuntu-packages-linux-arm64:").next().unwrap();
+    assert!(!mise_jobs.contains("apt-get install"));
     let producer = fs::read_to_string(script()).unwrap();
     assert!(producer.contains("MISE_DATA_DIR=/opt/gascan/mise"));
 }
