@@ -53,18 +53,58 @@ impl Fixture {
     }
 
     fn refresh(root: &Path) {
+        Self::refresh_manifests(root);
+        let tree = git_tree(root.join("tree/source"), root);
+        Self::write_provenance(root, &tree);
+    }
+
+    fn refresh_manifests(root: &Path) {
         manifest(root.join("tree/source"), root.join("source-tree.tsv"));
         manifest(root.join("tree/vendor"), root.join("vendor-tree.tsv"));
+    }
+
+    fn write_provenance(root: &Path, tree: &str) {
         let source_digest = sha(root.join("source-tree.tsv"));
         let vendor_digest = sha(root.join("vendor-tree.tsv"));
         let config_digest = sha(root.join("tree/.cargo/config.toml"));
-        fs::write(root.join("provenance.env"), format!("REVISION={REVISION}\nFETCHED_HEAD={REVISION}\nGIT_TREE=71e706057023049b8d15839cedd1fcd0b4a85968\nSOURCE_MANIFEST_SHA256={source_digest}\nVENDOR_MANIFEST_SHA256={vendor_digest}\nCONFIG_SHA256={config_digest}\nCARGO_VENDOR_LOCKED=true\nPLATFORM=linux/arm64\nSUBMODULES=absent\n")).unwrap();
+        fs::write(root.join("provenance.env"), format!("REVISION={REVISION}\nFETCHED_HEAD={REVISION}\nGIT_TREE={tree}\nSOURCE_MANIFEST_SHA256={source_digest}\nVENDOR_MANIFEST_SHA256={vendor_digest}\nCONFIG_SHA256={config_digest}\nCARGO_VENDOR_LOCKED=true\nPLATFORM=linux/arm64\nSUBMODULES=absent\n")).unwrap();
+    }
+
+    fn add_git_dependency(&self) {
+        let root = self.root();
+        fs::write(root.join("tree/source/Cargo.toml"), "[package]\nname='camp'\nversion='0.1.0'\n[dependencies]\ndemo='1'\ngitdemo={git='https://example.invalid/gitdemo',rev='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'}\n").unwrap();
+        let lock = fs::read_to_string(root.join("tree/source/Cargo.lock")).unwrap();
+        fs::write(root.join("tree/source/Cargo.lock"), format!("{lock}\n[[package]]\nname = \"gitdemo\"\nversion = \"2.0.0\"\nsource = \"git+https://example.invalid/gitdemo?rev=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb#bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"\n")).unwrap();
+        fs::create_dir_all(root.join("tree/vendor/gitdemo-2.0.0/src")).unwrap();
+        fs::write(
+            root.join("tree/vendor/gitdemo-2.0.0/Cargo.toml"),
+            "[package]\nname='gitdemo'\nversion='2.0.0'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("tree/vendor/gitdemo-2.0.0/src/lib.rs"),
+            "pub fn gitdemo() {}\n",
+        )
+        .unwrap();
+        let checksum = format!(
+            "{{\"files\":{{\"Cargo.toml\":\"{}\",\"src/lib.rs\":\"{}\"}},\"package\":null}}\n",
+            sha(root.join("tree/vendor/gitdemo-2.0.0/Cargo.toml")),
+            sha(root.join("tree/vendor/gitdemo-2.0.0/src/lib.rs"))
+        );
+        fs::write(
+            root.join("tree/vendor/gitdemo-2.0.0/.cargo-checksum.json"),
+            checksum,
+        )
+        .unwrap();
+        fs::write(root.join("tree/.cargo/config.toml"), "[net]\noffline = true\n\n[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.\"git+https://example.invalid/gitdemo?rev=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"]\nreplace-with = \"vendored-sources\"\n\n[source.vendored-sources]\ndirectory = \"vendor\"\n").unwrap();
+        Self::refresh(root);
     }
 
     fn verify(&self) -> std::process::Output {
         Command::new(script())
-            .arg("--verify-evidence")
+            .arg("--verify-test-evidence")
             .arg(self.root())
+            .arg(provenance_field(self.root(), "GIT_TREE"))
             .output()
             .unwrap()
     }
@@ -83,6 +123,53 @@ fn script() -> PathBuf {
 
 fn sha(path: impl AsRef<Path>) -> String {
     format!("{:x}", Sha256::digest(fs::read(path).unwrap()))
+}
+
+fn provenance_field(root: &Path, key: &str) -> String {
+    fs::read_to_string(root.join("provenance.env"))
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{key}=")))
+        .unwrap()
+        .to_owned()
+}
+
+fn git_tree(source: PathBuf, root: &Path) -> String {
+    let git_dir = root.join("fixture-tree.git");
+    if !git_dir.exists() {
+        assert!(
+            Command::new("git")
+                .args(["init", "--bare", "--quiet"])
+                .arg(&git_dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let index = root.join("fixture.index");
+    let mut base = Command::new("git");
+    base.arg("--git-dir")
+        .arg(&git_dir)
+        .arg("--work-tree")
+        .arg(&source)
+        .env("GIT_INDEX_FILE", &index)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", root);
+    assert!(
+        base.args(["-c", "core.autocrlf=false", "add", "-A"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let output = Command::new("git")
+        .arg("--git-dir")
+        .arg(&git_dir)
+        .env("GIT_INDEX_FILE", &index)
+        .args(["write-tree"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
 fn manifest(root: PathBuf, output: PathBuf) {
@@ -173,6 +260,20 @@ fn rejects_dirty_or_extra_source() {
 }
 
 #[test]
+fn rejects_forged_source_even_when_manifest_and_provenance_digests_are_refreshed() {
+    let fixture = Fixture::new();
+    let expected_tree = provenance_field(fixture.root(), "GIT_TREE");
+    fs::write(
+        fixture.root().join("tree/source/src/main.rs"),
+        "fn main() { println!(\"forged\"); }\n",
+    )
+    .unwrap();
+    Fixture::refresh_manifests(fixture.root());
+    Fixture::write_provenance(fixture.root(), &expected_tree);
+    fixture.reject("git tree");
+}
+
+#[test]
 fn rejects_submodule_ambiguity() {
     let fixture = Fixture::new();
     let path = fixture.root().join("provenance.env");
@@ -217,6 +318,114 @@ fn rejects_unlocked_git_dependency() {
     .unwrap();
     Fixture::refresh(fixture.root());
     fixture.reject("git dependency");
+}
+
+#[test]
+fn accepts_pinned_locked_git_dependency_with_null_package_checksum() {
+    let fixture = Fixture::new();
+    fixture.add_git_dependency();
+    let output = fixture.verify();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn rejects_altered_pinned_git_vendor_content() {
+    let fixture = Fixture::new();
+    fixture.add_git_dependency();
+    fs::write(
+        fixture.root().join("tree/vendor/gitdemo-2.0.0/src/lib.rs"),
+        "forged",
+    )
+    .unwrap();
+    Fixture::refresh_manifests(fixture.root());
+    Fixture::write_provenance(
+        fixture.root(),
+        &provenance_field(fixture.root(), "GIT_TREE"),
+    );
+    fixture.reject("cargo checksum content");
+}
+
+#[test]
+fn rejects_missing_pinned_git_vendor_crate() {
+    let fixture = Fixture::new();
+    fixture.add_git_dependency();
+    fs::remove_dir_all(fixture.root().join("tree/vendor/gitdemo-2.0.0")).unwrap();
+    Fixture::refresh_manifests(fixture.root());
+    Fixture::write_provenance(
+        fixture.root(),
+        &provenance_field(fixture.root(), "GIT_TREE"),
+    );
+    fixture.reject("missing or extra vendored crate");
+}
+
+#[test]
+fn rejects_registry_style_package_checksum_for_git_vendor() {
+    let fixture = Fixture::new();
+    fixture.add_git_dependency();
+    let path = fixture
+        .root()
+        .join("tree/vendor/gitdemo-2.0.0/.cargo-checksum.json");
+    fs::write(
+        &path,
+        fs::read_to_string(&path).unwrap().replace(
+            "\"package\":null",
+            &format!("\"package\":\"{}\"", "c".repeat(64)),
+        ),
+    )
+    .unwrap();
+    Fixture::refresh_manifests(fixture.root());
+    Fixture::write_provenance(
+        fixture.root(),
+        &provenance_field(fixture.root(), "GIT_TREE"),
+    );
+    fixture.reject("git crate package checksum must be null");
+}
+
+#[test]
+fn rejects_unpinned_workspace_git_dependency() {
+    let fixture = Fixture::new();
+    let path = fixture.root().join("tree/source/Cargo.toml");
+    fs::write(
+        &path,
+        format!(
+            "{}\n[workspace.dependencies]\nescape={{git='https://example.invalid/escape'}}\n",
+            fs::read_to_string(&path).unwrap()
+        ),
+    )
+    .unwrap();
+    Fixture::refresh(fixture.root());
+    fixture.reject("git dependency");
+}
+
+#[test]
+fn rejects_unpinned_target_git_dependency() {
+    let fixture = Fixture::new();
+    let path = fixture.root().join("tree/source/Cargo.toml");
+    fs::write(&path, format!("{}\n[target.'cfg(target_os = \"linux\")'.build-dependencies]\nescape={{git='https://example.invalid/escape'}}\n", fs::read_to_string(&path).unwrap())).unwrap();
+    Fixture::refresh(fixture.root());
+    fixture.reject("git dependency");
+}
+
+#[test]
+fn workflow_uses_task1_validator_and_active_graph_missing_crate_proof() {
+    let workflow = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../.github/workflows/workspace-bundles.yml"),
+    )
+    .unwrap();
+    assert!(
+        workflow.contains("--bin validate-workspace-bundle -- \"$lock\" gascamp_source_vendor")
+    );
+    assert!(workflow.contains("--filter-platform aarch64-unknown-linux-gnu"));
+    assert!(
+        workflow.contains("pending.extend(dep[\"pkg\"] for dep in nodes[package_id][\"deps\"])")
+    );
+    assert!(workflow.contains("timeout --signal=KILL 20s cargo test --locked --offline --frozen"));
+    assert!(workflow.contains("resolved external package does not come from vendor"));
+    assert!(!workflow.contains("find /tmp/missing/vendor -mindepth 1"));
 }
 
 #[test]

@@ -9,7 +9,7 @@ die() { printf 'gascamp bundle: %s\n' "$*" >&2; exit 1; }
 
 verify_evidence() {
   python3 - "$1" "$revision" "$git_tree_expected" <<'PY'
-import hashlib,json,re,stat,sys,tomllib
+import hashlib,json,os,re,stat,subprocess,sys,tempfile,tomllib
 from pathlib import Path,PurePosixPath
 root=Path(sys.argv[1]); expected=sys.argv[2]; expected_tree=sys.argv[3]
 def fail(s): raise SystemExit("gascamp bundle: "+s)
@@ -35,6 +35,21 @@ def actual_manifest(base):
   elif p.is_file(): rows.append(f"{q}\tfile\t{stat.S_IMODE(p.stat().st_mode):04o}\t{p.stat().st_size}\t{sha(p)}\t-")
   elif not p.is_dir(): fail("unsupported tree entry")
  return "\n".join(rows)+"\n"
+def git_object(kind,body): return hashlib.sha1(kind.encode()+b" "+str(len(body)).encode()+b"\0"+body).digest()
+def git_tree(path):
+ entries=[]
+ children=sorted(path.iterdir(),key=lambda child:child.name.encode()+(b"/" if child.is_dir() and not child.is_symlink() else b""))
+ for child in children:
+  name=child.name.encode()
+  if b"/" in name or b"\0" in name: fail("unsafe git tree name")
+  info=child.lstat()
+  if child.is_symlink(): mode=b"120000"; oid=git_object("blob",os.readlink(child).encode())
+  elif child.is_dir(): mode=b"40000"; oid=git_tree(child)
+  elif child.is_file(): mode=b"100755" if stat.S_IMODE(info.st_mode)&0o111 else b"100644"; oid=git_object("blob",child.read_bytes())
+  else: fail("unsupported git tree entry")
+  if child.is_dir() and not child.is_symlink() and not any(child.iterdir()): continue
+  entries.append(mode+b" "+name+b"\0"+oid)
+ return git_object("tree",b"".join(entries))
 p=env(root/"provenance.env")
 required={"REVISION","FETCHED_HEAD","GIT_TREE","SOURCE_MANIFEST_SHA256","VENDOR_MANIFEST_SHA256","CONFIG_SHA256","CARGO_VENDOR_LOCKED","PLATFORM","SUBMODULES"}
 if set(p)!=required: fail("provenance fields differ from exact schema")
@@ -46,26 +61,48 @@ if p["PLATFORM"]!="linux/arm64": fail("wrong platform")
 for name,base,key,label in (("source-tree.tsv",root/"tree/source","SOURCE_MANIFEST_SHA256","source tree"),("vendor-tree.tsv",root/"tree/vendor","VENDOR_MANIFEST_SHA256","vendor tree")):
  text=read(root/name)
  if text!=actual_manifest(base) or sha(root/name)!=p[key]: fail(label+" differs from canonical manifest")
+if git_tree(root/"tree/source").hex()!=expected_tree: fail("git tree mismatch")
 config=root/"tree/.cargo/config.toml"
 if not config.is_file() or sha(config)!=p["CONFIG_SHA256"]: fail("Cargo config digest mismatch")
 try: cfg=tomllib.loads(read(config))
 except tomllib.TOMLDecodeError: fail("invalid Cargo config")
-if cfg!={"net":{"offline":True},"source":{"crates-io":{"replace-with":"vendored-sources"},"vendored-sources":{"directory":"vendor"}}}: fail("Cargo config permits registry or network access")
+if cfg.get("net")!={"offline":True}: fail("Cargo config permits registry or network access")
+sources=cfg.get("source")
+if not isinstance(sources,dict) or sources.get("crates-io")!={"replace-with":"vendored-sources"} or sources.get("vendored-sources")!={"directory":"vendor"}: fail("Cargo config permits registry or network access")
 source=root/"tree/source"; vendor=root/"tree/vendor"
 try: lock=tomllib.loads(read(source/"Cargo.lock"))
 except tomllib.TOMLDecodeError: fail("invalid Cargo.lock")
 locked=lock.get("package",[])
 if not isinstance(locked,list): fail("invalid Cargo.lock packages")
 git_locks={x.get("source") for x in locked if isinstance(x,dict) and str(x.get("source","")).startswith("git+")}
+for locked_source in git_locks:
+ if not re.fullmatch(r"git\+[^#]+#[0-9a-f]{40}",locked_source or ""): fail("invalid locked git source")
+ config_key=locked_source.rsplit("#",1)[0]
+ if sources.get(config_key)!={"replace-with":"vendored-sources"}: fail("Cargo config lacks locked git source replacement")
+if set(sources)!={"crates-io","vendored-sources",*(source.rsplit("#",1)[0] for source in git_locks)}: fail("Cargo config has extra registry or network source")
+def dependency_tables(value):
+ if isinstance(value,dict):
+  for key,child in value.items():
+   if key in ("dependencies","dev-dependencies","build-dependencies") and isinstance(child,dict): yield child
+   yield from dependency_tables(child)
+ elif isinstance(value,list):
+  for child in value: yield from dependency_tables(child)
 for cargo in source.rglob("Cargo.toml"):
  try: doc=tomllib.loads(read(cargo))
  except tomllib.TOMLDecodeError: fail("invalid Cargo.toml")
- for section in ("dependencies","dev-dependencies","build-dependencies"):
-  for value in doc.get(section,{}).values():
+ for table in dependency_tables(doc):
+  for value in table.values():
    if isinstance(value,dict) and "git" in value:
     rev=value.get("rev")
     if not isinstance(rev,str) or not re.fullmatch(r"[0-9a-f]{40}",rev) or not any(s and s.endswith("#"+rev) and s.startswith("git+"+value["git"]) for s in git_locks): fail("unlocked git dependency")
-registry={(x.get("name"),x.get("version")):x.get("checksum") for x in locked if isinstance(x,dict) and str(x.get("source","")).startswith("registry+")}
+external={}
+for item in locked:
+ if not isinstance(item,dict): continue
+ locked_source=str(item.get("source","")); key=(item.get("name"),item.get("version"))
+ if locked_source.startswith("registry+"): record=("registry",locked_source,item.get("checksum"))
+ elif locked_source.startswith("git+"): record=("git",locked_source,None)
+ else: continue
+ external.setdefault(key,[]).append(record)
 seen=set()
 for crate in sorted(vendor.iterdir()):
  if not crate.is_dir(): fail("vendor tree has non-crate entry")
@@ -74,7 +111,12 @@ for crate in sorted(vendor.iterdir()):
  try: data=json.loads(read(checksum)); manifest=tomllib.loads(read(crate/"Cargo.toml"))
  except (json.JSONDecodeError,tomllib.TOMLDecodeError): fail("invalid cargo checksum or manifest")
  package=manifest.get("package",{}); key=(package.get("name"),package.get("version"))
- if key not in registry or data.get("package")!=registry[key]: fail("vendored crate is not lock-bound")
+ records=external.get(key,[])
+ if len(records)!=1: fail("vendored crate source is ambiguous or not lock-bound")
+ kind,locked_source,package_checksum=records[0]
+ if kind=="registry" and data.get("package")!=package_checksum: fail("vendored registry crate package checksum mismatch")
+ if kind=="git" and data.get("package") is not None: fail("vendored git crate package checksum must be null")
+ if crate.name not in (str(key[0]),f"{key[0]}-{key[1]}"): fail("vendor directory name/version mismatch")
  files=data.get("files")
  if not isinstance(files,dict): fail("invalid cargo checksum files")
  actual={x.relative_to(crate).as_posix() for x in crate.rglob("*") if x.is_file() and x.name!=".cargo-checksum.json"}
@@ -82,13 +124,26 @@ for crate in sorted(vendor.iterdir()):
  for name,digest in files.items():
   pure=PurePosixPath(name)
   if pure.is_absolute() or ".." in pure.parts or not re.fullmatch(r"[0-9a-f]{64}",str(digest)) or sha(crate/name)!=digest: fail("cargo checksum content mismatch")
- seen.add(key)
-if seen!=set(registry): fail("missing or extra vendored crate")
+ seen.add((key,locked_source))
+expected_records={(key,record[1]) for key,records in external.items() for record in records}
+if seen!=expected_records: fail("missing or extra vendored crate")
+with tempfile.TemporaryDirectory() as cargo_home:
+ cargo_env={"CARGO_HOME":cargo_home,"CARGO_NET_OFFLINE":"true","GIT_CONFIG_NOSYSTEM":"1","HOME":os.environ.get("HOME",cargo_home),"PATH":os.environ.get("PATH","")}
+ if "RUSTUP_HOME" in os.environ: cargo_env["RUSTUP_HOME"]=os.environ["RUSTUP_HOME"]
+ try: metadata=subprocess.run(["cargo","metadata","--offline","--locked","--no-deps","--format-version","1"],cwd=source,env=cargo_env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True,timeout=20)
+ except (OSError,subprocess.TimeoutExpired): fail("cargo metadata offline validation failed")
+ if metadata.returncode: fail("cargo metadata offline validation failed: "+metadata.stderr.strip())
 PY
 }
 
 if [[ ${1:-} == --verify-evidence ]]; then
   [[ $# == 2 ]] || die "usage: $0 --verify-evidence DIRECTORY"
+  verify_evidence "$2"
+  exit
+fi
+if [[ ${1:-} == --verify-test-evidence ]]; then
+  [[ $# == 3 && $3 =~ ^[0-9a-f]{40}$ ]] || die "invalid test verification invocation"
+  git_tree_expected=$3
   verify_evidence "$2"
   exit
 fi
@@ -125,25 +180,32 @@ python3 - "$tree/source" <<'PY'
 import re,sys,tomllib
 from pathlib import Path
 root=Path(sys.argv[1]); lock=tomllib.loads((root/'Cargo.lock').read_text()); sources={p.get('source') for p in lock.get('package',[]) if isinstance(p,dict)}
+def dependency_tables(value):
+ if isinstance(value,dict):
+  for key,child in value.items():
+   if key in ('dependencies','dev-dependencies','build-dependencies') and isinstance(child,dict): yield child
+   yield from dependency_tables(child)
+ elif isinstance(value,list):
+  for child in value: yield from dependency_tables(child)
 for cargo in root.rglob('Cargo.toml'):
  doc=tomllib.loads(cargo.read_text())
- for section in ('dependencies','dev-dependencies','build-dependencies'):
-  for value in doc.get(section,{}).values():
+ for table in dependency_tables(doc):
+  for value in table.values():
    if isinstance(value,dict) and 'git' in value:
     rev=value.get('rev')
     if not isinstance(rev,str) or not re.fullmatch('[0-9a-f]{40}',rev) or not any(s and s.startswith('git+'+value['git']) and s.endswith('#'+rev) for s in sources): raise SystemExit('gascamp bundle: unlocked git dependency')
 PY
-(cd "$tree/source" && cargo vendor --locked "$tree/vendor" >"$work/vendor-config")
-cat >"$tree/.cargo/config.toml" <<'EOF'
-[net]
-offline = true
-
-[source.crates-io]
-replace-with = "vendored-sources"
-
-[source.vendored-sources]
-directory = "vendor"
-EOF
+(cd "$tree/source" && cargo vendor --locked "$tree/vendor" >/dev/null)
+python3 - "$tree/source/Cargo.lock" "$tree/.cargo/config.toml" <<'PY'
+import json,sys,tomllib
+from pathlib import Path
+lock=tomllib.loads(Path(sys.argv[1]).read_text()); git_sources=sorted({str(p.get('source')).rsplit('#',1)[0] for p in lock.get('package',[]) if isinstance(p,dict) and str(p.get('source','')).startswith('git+')})
+lines=['[net]','offline = true','','[source.crates-io]','replace-with = "vendored-sources"','']
+for source in git_sources: lines += ['[source.'+json.dumps(source)+']','replace-with = "vendored-sources"','']
+lines += ['[source.vendored-sources]','directory = "vendor"','']
+Path(sys.argv[2]).write_text('\n'.join(lines))
+PY
+(cd "$tree/source" && CARGO_NET_OFFLINE=true cargo metadata --offline --locked --no-deps --format-version 1 >/dev/null)
 python3 - "$tree/source" "$output/source-tree.tsv" "$tree/vendor" "$output/vendor-tree.tsv" <<'PY'
 import hashlib,stat,sys
 from pathlib import Path

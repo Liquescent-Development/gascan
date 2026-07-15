@@ -8,7 +8,7 @@ Implemented the exact Gascamp source-and-Cargo-vendor producer, fail-closed evid
 
 - Added `scripts/tests/gascamp_bundle.rs` before the producer existed.
 - Confirmed RED with `cargo test --manifest-path scripts/Cargo.toml --test gascamp_bundle`: all ten tests failed because `produce-gascamp-bundle.sh` was absent.
-- Implemented the smallest validator/producer contract and reached GREEN with 10/10 focused tests.
+- Implemented the smallest validator/producer contract and reached GREEN, then applied security review findings with new RED fixtures; the final focused suite has 18/18 passing tests.
 - The tests reject revision mismatch, exact Git-tree mismatch, dirty or extra source bytes, submodule ambiguity, altered and missing vendor crates, unlocked Git dependencies, absent Cargo checksum metadata, and registry/network-enabled Cargo configuration.
 
 ## Implementation
@@ -18,20 +18,23 @@ Implemented the exact Gascamp source-and-Cargo-vendor producer, fail-closed evid
   - rejects every Git dependency unless its manifest has a full 40-character `rev` and the lockfile contains the matching URL/revision source;
   - exports source via `git archive`, runs `cargo vendor --locked`, and emits a parent `.cargo/config.toml` whose exact schema forces offline mode and replaces crates.io with the local vendor directory;
   - emits separate canonical manifests for source and vendor trees, binding modes, sizes, content SHA-256 values, and symlink targets; provenance independently binds both manifest digests, config bytes, revision, Git tree, platform, locked-vendor invocation, and submodule absence;
+  - distrusts those producer declarations during validation: it directly constructs Git blob and recursive tree objects from extracted file bytes, executable bits, names, and symlink targets and requires the independently computed tree to equal `71e706057023049b8d15839cedd1fcd0b4a85968`; this constructor was also checked against a materialized checkout of the real pinned commit;
   - independently revalidates every registry lock entry against exactly one vendored crate, its package checksum, and every file in `.cargo-checksum.json`, rejecting missing/extra/altered crates or files;
+  - supports locked Git dependencies only when every declaration (including workspace and nested target cfg dependency/dev/build tables) contains an exact full 40-hex `rev`, the lock source URL and terminal commit match it, Cargo config replaces that exact Git source, the vendor directory name/version is unambiguous, `.cargo-checksum.json` has `package: null`, and its complete file map re-hashes successfully; registry dependencies continue to require their lockfile package checksum;
+  - runs `cargo metadata --offline --locked --no-deps` in a fresh Cargo home as an additional fail-closed manifest/workspace parse after independent lock/declaration/vendor validation;
   - produces a deterministic canonical manifest-first tar+zstd archive and hash/size sidecars.
 - `.github/workflows/workspace-bundles.yml`
   - uses the exact SHA-pinned Ubuntu ARM64 base and only the already validated Task 2 package archive for OS tools; APT uses the local `file:` repository, disables HTTP/HTTPS methods and proxies, installs exact manifest versions with `--no-download`, audits dpkg, and performs no mutable runner APT install;
   - uses the already validated mise runtime artifact for the pinned Cargo toolchain;
   - builds twice and compares the complete evidence entry/type/link set plus every regular-file digest;
   - disables container networking and proves `cargo test --locked --offline --frozen` plus `cargo build --locked --offline --frozen --release --bin camp`;
-  - removes one real vendored crate and requires a prompt offline Cargo failure;
-  - revalidates as the unprivileged runner user, safely inspects/extracts the archive, binds archive contents back to the separately uploaded evidence, and emits a validation receipt;
+  - derives a known required external crate by walking the ARM64-filtered `cargo metadata` resolve graph from the unique active `camp` root, removes that exact vendor directory, and requires a specifically missing-source failure under a 20-second timeout with no download/update/network-attempt evidence; successful frozen test and release-build proofs also have explicit time bounds;
+  - revalidates as the unprivileged runner user by invoking Task 1's `validate-workspace-bundle`, which enforces the full canonical inner manifest, every kind/size/hash/symlink target, safe extraction, and canonical archive termination, and only then separately runs the Gascamp evidence verifier and emits a validation receipt;
   - uploads only short-lived CI artifacts. It does not publish or alter lock state.
 
 ## Verification
 
-The final verification gate covered the complete scripts test suite, clippy with warnings denied, rustfmt check, every shell script with `bash -n`, YAML parsing, and `git diff --check`. See the implementing commit and task handoff for the fresh command results.
+The initial implementation gate covered the complete scripts test suite, clippy with warnings denied, rustfmt check, every shell script with `bash -n`, YAML parsing, and `git diff --check`. The review-fix commit and task handoff record the same fresh full gate after the independent tree, Git vendor, recursive dependency, active-graph negative, and Task 1 validator changes.
 
 ## Remaining operational concern
 

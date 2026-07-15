@@ -93,15 +93,47 @@ jobs:
               export PATH=/opt/gascan/mise/installs/rust/1.97.0/bin:$PATH CARGO_NET_OFFLINE=true
               cp -a /evidence/tree /tmp/complete
               cd /tmp/complete/source
-              cargo test --locked --offline --frozen
-              cargo build --locked --offline --frozen --release --bin camp
+              timeout --signal=KILL 300s cargo test --locked --offline --frozen
+              timeout --signal=KILL 300s cargo build --locked --offline --frozen --release --bin camp
+              cargo metadata --locked --offline --frozen --filter-platform aarch64-unknown-linux-gnu --format-version 1 > /tmp/metadata.json
+              python3 - /tmp/metadata.json /tmp/complete <<'\''PY'\''
+              import json,sys
+              from pathlib import Path
+              metadata=json.load(open(sys.argv[1])); root=Path(sys.argv[2]).resolve(); packages={p["id"]:p for p in metadata["packages"]}; nodes={n["id"]:n for n in metadata["resolve"]["nodes"]}
+              roots=[p["id"] for p in metadata["packages"] if p["name"]=="camp" and p["source"] is None]
+              if len(roots)!=1: raise SystemExit("could not identify unique active camp root package")
+              pending=list(roots); reachable=set()
+              while pending:
+                  package_id=pending.pop()
+                  if package_id in reachable: continue
+                  reachable.add(package_id); pending.extend(dep["pkg"] for dep in nodes[package_id]["deps"])
+              candidates=[]
+              for package_id in reachable:
+                  package=packages[package_id]
+                  if package["source"] is None: continue
+                  manifest=Path(package["manifest_path"]).resolve()
+                  try: relative=manifest.relative_to(root/"vendor")
+                  except ValueError: raise SystemExit("resolved external package does not come from vendor")
+                  if len(relative.parts)!=2 or relative.name!="Cargo.toml": raise SystemExit("resolved vendor package has ambiguous directory")
+                  candidates.append((package["name"],package["version"],relative.parts[0]))
+              if not candidates: raise SystemExit("active camp graph has no required vendored crate")
+              Path("/tmp/required-crate").write_text(sorted(candidates)[0][2]+"\n")
+              PY
               cp -a /evidence/tree /tmp/missing
-              rm -rf -- "/tmp/missing/vendor/$(find /tmp/missing/vendor -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | LC_ALL=C sort | sed -n '1p')"
+              required_crate=$(tr -d '\n' </tmp/required-crate)
+              test -d "/tmp/missing/vendor/$required_crate"
+              rm -rf -- "/tmp/missing/vendor/$required_crate"
               cd /tmp/missing/source
-              if cargo test --locked --offline --frozen > /tmp/missing.log 2>&1; then
+              set +e
+              timeout --signal=KILL 20s cargo test --locked --offline --frozen > /tmp/missing.log 2>&1
+              missing_status=$?
+              set -e
+              if test "$missing_status" = 0; then
                 echo "offline build unexpectedly tolerated a missing vendored crate" >&2; exit 1
               fi
-              grep -E "(failed to read|no matching package|does not exist|checksum)" /tmp/missing.log
+              test "$missing_status" != 124 && test "$missing_status" != 137
+              grep -E "(failed to read|no matching package|does not exist|checksum|failed to load source)" /tmp/missing.log
+              if grep -E "(^| )(Updating|Downloading)|download of .* failed|network failure" /tmp/missing.log; then echo "missing-crate proof attempted network access" >&2; exit 1; fi
             '
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -133,28 +165,14 @@ jobs:
           size=$(tr -d '[:space:]' <"$archive.size")
           test "$(sha256sum "$archive" | cut -d' ' -f1)" = "$sha"
           test "$(wc -c <"$archive" | tr -d ' ')" = "$size"
-          mkdir "$RUNNER_TEMP/archive-evidence"
-          zstd --decompress --stdout "$archive" >"$RUNNER_TEMP/gascamp.tar"
-          python3 - "$RUNNER_TEMP/gascamp.tar" "$RUNNER_TEMP/archive-evidence" <<'PY'
-          import json,sys,tarfile
-          from pathlib import Path,PurePosixPath
-          archive=Path(sys.argv[1]); output=Path(sys.argv[2])
-          with tarfile.open(archive) as tar:
-              members=tar.getmembers()
-              if not members or members[0].name!="bundle-manifest.json": raise SystemExit("inner manifest is not first")
-              for member in members:
-                  path=PurePosixPath(member.name)
-                  if path.is_absolute() or ".." in path.parts or not (member.isfile() or member.isdir() or member.issym()): raise SystemExit("unsafe archive member")
-                  if member.issym() and PurePosixPath(member.linkname).is_absolute(): raise SystemExit("unsafe archive symlink")
-              manifest=json.load(tar.extractfile(members[0]))
-              if manifest.get("version")!=1 or manifest.get("platform")!="linux/arm64": raise SystemExit("invalid inner manifest contract")
-              if [entry["path"] for entry in manifest.get("files",[])]!=sorted({member.name for member in members[1:]}): raise SystemExit("inner manifest differs from archive entries")
-              tar.extractall(output,filter="data")
-          PY
-          cmp "$RUNNER_TEMP/gascamp/provenance.env" "$RUNNER_TEMP/archive-evidence/provenance.env"
-          cmp "$RUNNER_TEMP/gascamp/source-tree.tsv" "$RUNNER_TEMP/archive-evidence/source-tree.tsv"
-          cmp "$RUNNER_TEMP/gascamp/vendor-tree.tsv" "$RUNNER_TEMP/archive-evidence/vendor-tree.tsv"
-          diff --no-dereference --recursive "$RUNNER_TEMP/gascamp/tree" "$RUNNER_TEMP/archive-evidence/tree"
+          lock="$RUNNER_TEMP/gascamp-validation.lock"
+          {
+            printf '[workspace_bundles]\nmedia_type = "application/vnd.gascan.workspace-bundle.v1+tar.zstd"\nplatform = "linux/arm64"\npublication = "published"\n'
+            for record in ubuntu_packages mise_runtimes gascamp_source_vendor; do
+              printf '\n[workspace_bundles.%s]\nurl = "https://example.invalid/%s"\nsha256 = "%s"\nsize = %s\nmedia_type = "application/vnd.gascan.workspace-bundle.v1+tar.zstd"\nplatform = "linux/arm64"\n' "$record" "$record" "$sha" "$size"
+            done
+          } >"$lock"
+          cargo run --quiet --locked --manifest-path scripts/Cargo.toml --bin validate-workspace-bundle -- "$lock" gascamp_source_vendor "$archive" "$RUNNER_TEMP/archive-evidence"
           scripts/produce-gascamp-bundle.sh --verify-evidence "$RUNNER_TEMP/archive-evidence"
           printf 'archive-sha256\t%s\narchive-size\t%s\nrevision\t%s\nsource-manifest-sha256\t%s\nvendor-manifest-sha256\t%s\nworkflow-commit\t%s\n' "$sha" "$size" f6b248c5926240856dbea83d1d2c5c90ea1c1456 "$(sha256sum "$RUNNER_TEMP/gascamp/source-tree.tsv" | cut -d' ' -f1)" "$(sha256sum "$RUNNER_TEMP/gascamp/vendor-tree.tsv" | cut -d' ' -f1)" "$GITHUB_SHA" | LC_ALL=C sort >"$RUNNER_TEMP/gascamp/validation-receipt.tsv"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
