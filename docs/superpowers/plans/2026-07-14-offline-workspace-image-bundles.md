@@ -1,5 +1,14 @@
 # Offline Workspace Image Bundles Implementation Plan
 
+> **Status as of 2026-07-15:** Deferred hardening, not a macOS MVP
+> prerequisite. Tasks 1–6 and the PENDING Task 7 scaffold have reviewed
+> implementations on `feature/provisioning`; the three bundles are not
+> published and no live offline image evidence exists. The connected MVP build
+> decision is recorded in
+> `docs/superpowers/specs/2026-07-15-connected-mvp-build-design.md`. Do not
+> resume this plan or treat `9025c56` as Gate evidence without an explicit
+> roadmap decision.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Produce the locked Linux ARM64 workspace inputs in connected CI, verify them on macOS, and make Apple `container build` a network-independent assembly step.

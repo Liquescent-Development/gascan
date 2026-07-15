@@ -30,7 +30,10 @@
 2. [Core Control Plane Plan](./2026-07-13-core-control-plane.md) builds backend-neutral policy, metadata, daemon API, and CLI using a fake runtime.
 3. [Apple Backend and Lifecycle Plan](./2026-07-13-apple-backend-lifecycle.md) connects the control plane to the real Apple runtime and completes lifecycle behavior.
 4. [Workspace Environment and Release Plan](./2026-07-13-workspace-environment-release.md) ships the image, mise/Gascamp provisioning, security suite, packaging, and clean-host release gate.
-5. [Offline Workspace Image Bundles Plan](./2026-07-14-offline-workspace-image-bundles.md) corrects Plan 4's build boundary so connected CI produces immutable inputs and Apple performs network-independent assembly.
+5. [Offline Workspace Image Bundles Plan](./2026-07-14-offline-workspace-image-bundles.md) is implemented through a PENDING live gate and retained as deferred reproducibility/offline hardening. It is not on the macOS MVP critical path after the 2026-07-15 connected-builder diagnosis.
+
+Current restart state, accepted branch heads, and unfinished work are recorded
+in [`docs/status/macos-mvp-handoff.md`](../../status/macos-mvp-handoff.md).
 
 ## Dependency Graph
 
@@ -82,12 +85,27 @@ After Gates 2 and 3:
 
 - Execute Plan 3 against the frozen core contracts and the proven Apple command forms.
 - Continue Plan 4 Tasks 4-6 in parallel: provisioning planner, `gascan apply`, setup digest behavior, and Gascamp source selection can be tested against the fake backend.
-- Execute the Offline Workspace Image Bundles Plan before accepting Plan 4 image smoke evidence; the operator network permits host prefetch but Apple build VMs have no public egress.
+- Execute the connected workspace image plan before accepting Plan 4 image
+  smoke evidence. The 2026-07-15 diagnostic proved Apple build-VM public
+  connectivity after correcting a local firewall; deliberate build-VM network
+  isolation is not an MVP requirement.
 - Do not begin real-runtime security acceptance tests until Plan 3 publishes a stable integration-test harness.
 
 Concurrency rule: Plan 3 owns Apple adapter and lifecycle wiring; Plan 4 owns image/provisioning modules. Changes to `RuntimeBackend` require joint review because they affect both tracks.
 
 **Gate 4:** A supported Mac passes real `up`, `shell`, `run`, `apply`, `down`, restart, reconciliation, and `destroy`; exact exit codes, terminal resize, signals, and no orphaned owned resources are verified.
+
+### Phase 2 granular status — 2026-07-15
+
+| Workstream | Status | Accepted branch evidence | Remaining acceptance work |
+|---|---|---|---|
+| Plan 3 Apple request, inspection, lifecycle, attach, and doctor | implemented and independently reviewed | `feature/apple-backend` through `109a7a3` | integrate with the connected image and MVP branch |
+| Plan 3 Gate 4 harness | implemented and independently approved | `dbf4235` | run the complete lifecycle against the real workspace image |
+| Plan 4 image/user/mise/Gascamp contracts | partially implemented and reviewed across provisioning commits | `feature/provisioning` | convert the deferred offline-only build path to the approved connected MVP path and run live smokes |
+| Offline bundle production and validation | implementation reviewed; publication and live evidence not completed | `809796e` through `9025c56` | deferred; `publication = "pending"` remains accurate |
+| Plan 4 provisioning/apply/setup behavior | Gascamp source selection exists; the rest requires fresh reconciliation before claiming task completion | provisioning history including `c99bbaf` | inventory Tasks 4–6 against the final image, implement gaps, and prove through fake and real backend suites |
+| Cross-plan integration | not completed | integration branch remains `917dac1` | merge reviewed Apple and provisioning work with conflict review and full verification |
+| Gate 4 | pending | harness only | exact real CLI lifecycle and residue evidence |
 
 ## Phase 3: Security, Packaging, and Release
 
@@ -131,3 +149,14 @@ When each gate passes, update this section in a dedicated commit with the commit
 | 3 — Fake E2E | `docs/evidence/gate-3-fake-e2e.md` | `7c7d083` | passed |
 | 4 — Real lifecycle | Apple integration test transcript | not-run | pending |
 | 5 — Release | clean-host and security reports | not-run | pending |
+
+## MVP Status Summary — 2026-07-15
+
+- Completed and integrated: Phase 0 and Roadmap Gates 1–3.
+- Implemented but not integrated: reviewed Apple backend and safe Gate 4 harness.
+- In progress: Phase 2 workspace image and provisioning integration.
+- Deferred: publication and live proof of the three offline ARM64 bundles.
+- Not passed: Gate 4.
+- Not started as an integrated release phase: Phase 3 security, packaging, and
+  clean-host release.
+- Not passed: Gate 5. Gate 5 remains the definition of MVP completion.

@@ -7,17 +7,15 @@ The immutable workspace bundles in `images/workspace/versions.lock` currently ha
 image platform/digest, warm rebuild, corruption check, or live smoke result is
 claimed here.
 
-There is also no reviewed builder-VM network-isolation implementation. Apple
-Containerization 1.1 provides `--network none` for container run/create, but no
-equivalent supported control for the separate BuildKit builder VM. The gate
-therefore fails closed before building. A host `sandbox-exec` wrapper is not an
-acceptable substitute because it confines the CLI process, not builder-VM
-egress.
+This offline gate is deferred and is not a macOS MVP prerequisite. A
+2026-07-15 diagnostic proved that Apple builder public connectivity works after
+correcting a local firewall. The MVP uses the connected, locked build described
+in `docs/superpowers/specs/2026-07-15-connected-mvp-build-design.md`.
 
-Once all three records are published, the Gate code must first be updated and
-re-reviewed with a concrete builder-VM isolation design, pinned identity and
-installer contract, and live validation. Only after that code change may an
-operator run:
+If offline-build hardening resumes, publish all three records and update the
+gate through normal review. Deliberate builder-VM network isolation is not a
+requirement; the offline gate instead proves that a prepared local context can
+build without fetching. An operator may then run:
 
 ```sh
 sudo -v
