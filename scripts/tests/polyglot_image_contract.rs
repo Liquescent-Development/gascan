@@ -69,7 +69,7 @@ fn dockerfile_installs_only_reviewed_system_tools_and_verified_artifacts() {
     }
     assert!(!dockerfile.contains("> /opt/gascan/image-tool-versions.json"));
 
-    let build = fs::read_to_string(root().join("scripts/build-workspace-image.sh")).unwrap();
+    let build = fs::read_to_string(root().join("scripts/prefetch-workspace-image.sh")).unwrap();
     for required in ["extract-reviewed-chromium", "validate-tool-versions"] {
         assert!(
             build.contains(required),

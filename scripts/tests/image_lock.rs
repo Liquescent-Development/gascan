@@ -179,7 +179,7 @@ fn artifact_shape_requires_url_and_checksum() {
 
 #[test]
 fn build_script_bounds_downloads_and_validates_redirect_hosts() {
-    let script = include_str!("../build-workspace-image.sh");
+    let script = include_str!("../prefetch-workspace-image.sh");
     for required in ["fetch-image-artifact", "validate-image-inspect"] {
         assert!(
             script.contains(required),
@@ -188,4 +188,7 @@ fn build_script_bounds_downloads_and_validates_redirect_hosts() {
     }
     assert!(!script.contains("curl --"));
     assert!(!script.contains("--location"));
+    let build = include_str!("../build-workspace-image.sh");
+    assert!(!build.contains("fetch-image-artifact"));
+    assert!(!build.contains("container image pull"));
 }
