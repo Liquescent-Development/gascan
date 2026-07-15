@@ -58,7 +58,7 @@ where
             });
         }
         let state = map_state(&observed_id, &record.status.state)?;
-        let ownership = ownership_metadata(&observed_id, &record.configuration.labels);
+        let ownership = ownership_metadata(&observed_id, &record.configuration.labels)?;
         Ok(Some(RuntimeSandbox {
             id: observed_id,
             state,
@@ -133,17 +133,37 @@ fn classify_ownership(id: &SandboxId, labels: &BTreeMap<String, String>) -> Reso
     }
 }
 
-fn ownership_metadata(id: &SandboxId, labels: &BTreeMap<String, String>) -> OwnershipMetadata {
-    let managed_by = labels.get(MANAGED_BY_LABEL).cloned().unwrap_or_default();
-    let sandbox_id = labels
-        .get(SANDBOX_ID_LABEL)
-        .cloned()
-        .and_then(|value| SandboxId::try_from(value).ok())
-        .unwrap_or_else(|| id.clone());
-    OwnershipMetadata {
+fn ownership_metadata(
+    id: &SandboxId,
+    labels: &BTreeMap<String, String>,
+) -> Result<OwnershipMetadata, RuntimeError> {
+    let managed_by = labels.get(MANAGED_BY_LABEL).cloned().ok_or_else(|| {
+        invalid_output(
+            "container inspect",
+            format!("container {id} is missing required label {MANAGED_BY_LABEL}"),
+        )
+    })?;
+    let annotation = labels.get(SANDBOX_ID_LABEL).cloned().ok_or_else(|| {
+        invalid_output(
+            "container inspect",
+            format!("container {id} is missing required label {SANDBOX_ID_LABEL}"),
+        )
+    })?;
+    let sandbox_id = SandboxId::try_from(annotation).map_err(|error| {
+        invalid_output(
+            "container inspect",
+            format!("container {id} has invalid {SANDBOX_ID_LABEL}: {error}"),
+        )
+    })?;
+    if &sandbox_id != id {
+        return Err(RuntimeError::OwnershipMismatch {
+            resource: id.to_string(),
+        });
+    }
+    Ok(OwnershipMetadata {
         managed_by,
         sandbox_id,
-    }
+    })
 }
 
 fn invalid_output(operation: &str, message: String) -> RuntimeError {

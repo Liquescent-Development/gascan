@@ -105,6 +105,30 @@ async fn malformed_required_fields_and_unknown_states_fail_closed() {
 }
 
 #[tokio::test]
+async fn inspect_never_forges_owned_metadata_from_invalid_annotations() {
+    for (labels, expected_code) in [
+        (r#""dev.gascan.managed-by":"gascan""#, "invalid_output"),
+        (
+            r#""dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":"bad""#,
+            "invalid_output",
+        ),
+        (
+            r#""dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":"other-111111111111""#,
+            "ownership_mismatch",
+        ),
+    ] {
+        let record = format!(
+            r#"[{{"configuration":{{"id":"code-a1b2c3d4e5f6","labels":{{{labels}}}}},"status":{{"state":"running"}}}}]"#
+        );
+        let error = inspector(output(record.as_bytes()))
+            .inspect(&id())
+            .await
+            .expect_err("invalid ownership annotation must not produce a sandbox");
+        assert_eq!(error.code(), expected_code, "labels: {labels}");
+    }
+}
+
+#[tokio::test]
 async fn only_documented_cli_not_found_exit_code_is_absence() {
     let missing = RuntimeError::CommandFailed {
         operation: "container".into(),

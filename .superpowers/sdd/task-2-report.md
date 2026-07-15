@@ -44,3 +44,14 @@ After the minimal DTO/parser implementation, the same command passed 4/4.
 ## Concerns
 
 Apple's missing-container contract is represented by exit code `1` because stderr is human-facing and prohibited as a parsing boundary. Task 3 should preserve this structured exit-code handling when it composes inspection with lifecycle operations.
+
+## Review follow-up: exact inspection ownership
+
+Review identified that inspection's ownership mapper substituted the observed container ID when `dev.gascan.sandbox-id` was missing or malformed. That could promote malformed `managed-by=gascan` data into apparently exact `RuntimeSandbox` ownership.
+
+The focused regression test first failed by returning a GasCan-owned sandbox for a missing annotation. Ownership parsing is now fallible and exact: both ownership labels must be present, the sandbox annotation must parse through validated `SandboxId::try_from`, and it must equal the observed/requested identity. Missing or malformed annotations return stable `InvalidOutput`; a different valid annotation returns stable `OwnershipMismatch`. List inventory still classifies the same records as owned, foreign, or mismatched without constructing `OwnershipMetadata`.
+
+Review verification:
+
+- `cargo test -p gascan-apple --test inspect inspect_never_forges_owned_metadata_from_invalid_annotations` — RED before fix, then pass
+- `cargo test -p gascan-apple --test inspect` — pass, 5 passed
