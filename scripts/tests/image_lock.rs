@@ -219,3 +219,16 @@ fn build_script_bounds_downloads_and_validates_redirect_hosts() {
     assert!(!build.contains("fetch-image-artifact"));
     assert!(!build.contains("container image pull"));
 }
+
+#[test]
+fn build_dispatcher_has_no_mode_fallback_and_preserves_deferred_offline_entrypoint() {
+    let dispatcher = include_str!("../build-workspace-image.sh");
+    assert!(dispatcher.contains("workspace_build_mode"));
+    assert!(dispatcher.contains("build-connected-workspace-image.sh"));
+    assert!(dispatcher.contains("build-offline-workspace-image.sh"));
+    assert!(!dispatcher.contains("auto"));
+
+    let offline = include_str!("../build-offline-workspace-image.sh");
+    assert!(offline.contains("UBUNTU_SNAPSHOT"));
+    assert!(offline.contains("verify-workspace-image-inputs.sh"));
+}
