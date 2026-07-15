@@ -417,6 +417,29 @@ async fn exec_bridge_reports_unsupported_signal_as_terminal_error() {
 }
 
 #[tokio::test]
+async fn exec_bridge_turns_premature_helper_eof_into_one_terminal_error() {
+    let backend = AppleBackend::with_attach(StatefulAppleRunner::default(), fake_attach());
+    let (_root, create) = request("no-terminal");
+    let mut session = backend
+        .exec(ExecRequest {
+            id: create.id().clone(),
+            argv: vec!["guest".to_owned()],
+            stdin: Vec::new(),
+            environment: BTreeMap::new(),
+            tty: false,
+        })
+        .await
+        .unwrap();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(2), session.next())
+        .await
+        .expect("premature helper EOF must terminate promptly")
+        .expect("bridge closed without a typed terminal error")
+        .expect_err("premature helper EOF unexpectedly succeeded");
+    assert!(matches!(error, RuntimeError::InvalidOutput { .. }));
+    assert!(session.next().await.is_none());
+}
+
+#[tokio::test]
 async fn remove_refuses_identity_mismatch_after_immediate_reinventory() {
     let runner = StatefulAppleRunner::default();
     let backend = AppleBackend::new(runner.clone());
