@@ -437,7 +437,7 @@ Cover these cases with a fake `container` executable:
 - missing, relative, foreign-owned, group/world-readable, symlink, empty, or repository-contained source secret file fails before staging or `container build`;
 - staged-secret creation, permission, `.dockerignore`, or transmitted-context exclusion failure prevents `container build`;
 - the privileged helper is invoked only through `create`, `path`, and `finish`; it never receives the source or staged secret path;
-- the sealed public snapshot is copied into a separate current-UID-owned `0700` wrapper, and its public manifest must equal the Task 2 context digest before and after build;
+- the sealed public snapshot is copied into a separate current-UID-owned `0700` wrapper created by `mktemp -d "${TMPDIR:-/tmp}/gascan-connected-build.XXXXXX"`, and its public manifest must equal the Task 2 context digest before and after build;
 - source-secret validation and copying use one no-follow file descriptor so a pathname swap cannot change the validated bytes;
 - context verification failure or changed post-build digest fails without publishing a reference;
 - build invocation has exactly one `--secret`, exact `BASE_IMAGE`, exact `GASCAMP_REVISION`, `--arch arm64`, and no token value;
@@ -446,16 +446,21 @@ Cover these cases with a fake `container` executable:
 - JSON is atomically published first and the reference atomically published last as the commit marker; interruption between them must not expose an accepted new reference with stale or missing JSON;
 - stdout, stderr, argv, receipts, and retained files do not contain a synthetic token.
 
-The expected invocation slice is:
+The expected fixed invocation slice is:
 
 ```rust
 let required = [
     "build", "--arch", "arm64",
-    "--secret", "id=gascamp_read_token,src=/private/wrapper/.build-secrets/gascamp_read_token",
     "--build-arg", "BASE_IMAGE=ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab",
     "--build-arg", "GASCAMP_REVISION=f6b248c5926240856dbea83d1d2c5c90ea1c1456",
 ];
 ```
+
+The secret argument is relational rather than a fixed absolute path: tests
+must capture the canonical wrapper returned by `mktemp`, then require exactly
+`--secret id=gascamp_read_token,src=$wrapper/.build-secrets/gascamp_read_token`.
+The production path must never require `/private` or another pre-created
+privileged directory.
 
 - [ ] **Step 2: Verify RED**
 

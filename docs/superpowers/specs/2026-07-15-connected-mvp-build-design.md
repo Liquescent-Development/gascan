@@ -82,6 +82,11 @@ temporary wrapper, copies the sealed public snapshot into it through a
 descriptor-safe Rust helper, and verifies that the copied public manifest
 matches the canonical Task 2 context digest.
 
+The wrapper is created with `mktemp` beneath `${TMPDIR:-/tmp}` and then
+canonicalized; it does not depend on `/private` or any other pre-created
+privileged directory. Tests compare the secret source path relationally to
+that captured wrapper rather than requiring a fixed host pathname.
+
 That same unprivileged helper opens the original token without following
 symlinks, validates ownership and mode through the opened descriptor, and
 writes a new `0600` file at `.build-secrets/gascamp_read_token` beneath the
