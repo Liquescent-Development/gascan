@@ -16,6 +16,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 camino.workspace = true
+gascan-core = { path = "../gascan-core", features = ["test-support"] }
 libc = "0.2"
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
