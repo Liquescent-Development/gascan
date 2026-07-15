@@ -8,10 +8,10 @@ code. Verify branch heads rather than assuming the paths below still exist.
 
 The 2026-07-15 documentation work made current state durable; it did not start
 a new implementation effort. The connected workspace image document is a
-focused continuation addendum to existing Plan 4. Addendum Task 1 began on
-2026-07-15 and exposed an Apple BuildKit 0.12.0 restriction: secret `src`
-paths must be descendants of the host context directory. No Task 1 commit or
-PASS evidence was produced from that failed attempt.
+focused continuation addendum to existing Plan 4. Addendum Task 1 exposed and
+then accommodated an Apple BuildKit 0.12.0 restriction: secret `src` paths
+must be descendants of the host context directory. The revised probe passed
+and was independently approved through `44bb3b2`.
 
 ## Product Boundary
 
@@ -55,7 +55,7 @@ the polyglot toolchain.
 | Phase 1 Apple feasibility / Gate 2 | Passed and integrated | `6bedef8`, `docs/feasibility/apple-container-report.md` |
 | Phase 1 core control plane / Gate 3 | Passed and integrated | `7c7d083`, integration record `917dac1` |
 | Phase 2 Apple backend implementation | Implemented and reviewed on feature branch; not integrated | head `dbf4235` |
-| Phase 2 workspace image | Offline implementation exists; connected MVP conversion is designed and planned but not implemented | provisioning head includes `9025c56`, the connected-build design, and `docs/superpowers/plans/2026-07-15-connected-workspace-image.md` |
+| Phase 2 workspace image | Offline implementation exists; connected MVP Task 1 secret isolation is approved; Tasks 2–7 remain | provisioning head includes `44bb3b2`, `docs/evidence/apple-build-secret.md`, and the connected-build addendum |
 | Gate 4 real lifecycle | Pending; harness approved but no complete real lifecycle evidence | harness `dbf4235` |
 | Phase 3 security, packaging, release | Not started as an integrated phase | blocked by Gate 4 |
 | Gate 5 clean-host release | Pending | no evidence |
@@ -106,6 +106,8 @@ The harness is approved; Gate 4 itself is not passed.
 - `144615a`: privileged snapshot helper hardening.
 - `65e49fe`: network-independent Dockerfile assembly.
 - `9025c56`: truthful PENDING offline image gate scaffold.
+- `44bb3b2`: approved Apple BuildKit staged-secret isolation probe and live
+  non-retention evidence, including bounded ownership-checked cleanup.
 
 These offline commits are reviewed assets, not completed publication or live
 image evidence. `images/workspace/versions.lock` still says
@@ -130,10 +132,10 @@ Do not encode the operator DNS IP into Gas Can product policy.
 
 ## Current Unfinished Work
 
-1. Resume Task 1 of
-   `docs/superpowers/plans/2026-07-15-connected-workspace-image.md` using the
-   approved private-context staging boundary, then continue task by task with
-   independent review gates. The user has preselected subagent-driven
+1. Execute Task 2 of
+   `docs/superpowers/plans/2026-07-15-connected-workspace-image.md`, then
+   continue task by task with independent review gates. Task 1 is complete and
+   must not be redispatched. The user has preselected subagent-driven
    execution; do not re-plan the program.
 2. Convert the image path from mandatory offline bundles to connected locked
    acquisition while preserving all reviewed image contracts.

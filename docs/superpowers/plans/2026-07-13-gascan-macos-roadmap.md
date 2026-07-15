@@ -102,7 +102,7 @@ Concurrency rule: Plan 3 owns Apple adapter and lifecycle wiring; Plan 4 owns im
 |---|---|---|---|
 | Plan 3 Apple request, inspection, lifecycle, attach, and doctor | implemented and independently reviewed | `feature/apple-backend` through `109a7a3` | integrate with the connected image and MVP branch |
 | Plan 3 Gate 4 harness | implemented and independently approved | `dbf4235` | run the complete lifecycle against the real workspace image |
-| Plan 4 image/user/mise/Gascamp contracts | partially implemented and reviewed across provisioning commits | `feature/provisioning` | convert the deferred offline-only build path to the approved connected MVP path and run live smokes |
+| Plan 4 image/user/mise/Gascamp contracts | connected-build Task 1 secret isolation is implemented, live-proven, and independently approved; remaining conversion tasks are pending | `feature/provisioning` through `44bb3b2`, `docs/evidence/apple-build-secret.md` | execute connected-build Tasks 2–7 and run the live image smokes |
 | Offline bundle production and validation | implementation reviewed; publication and live evidence not completed | `809796e` through `9025c56` | deferred; `publication = "pending"` remains accurate |
 | Plan 4 provisioning/apply/setup behavior | Gascamp source selection exists; the rest requires fresh reconciliation before claiming task completion | provisioning history including `c99bbaf` | inventory Tasks 4–6 against the final image, implement gaps, and prove through fake and real backend suites |
 | Cross-plan integration | not completed | integration branch remains `917dac1` | merge reviewed Apple and provisioning work with conflict review and full verification |
@@ -155,7 +155,8 @@ When each gate passes, update this section in a dedicated commit with the commit
 
 - Completed and integrated: Phase 0 and Roadmap Gates 1–3.
 - Implemented but not integrated: reviewed Apple backend and safe Gate 4 harness.
-- In progress: Phase 2 workspace image and provisioning integration.
+- In progress: Phase 2 workspace image and provisioning integration;
+  connected-build Task 1 is approved through `44bb3b2`.
 - Deferred: publication and live proof of the three offline ARM64 bundles.
 - Not passed: Gate 4.
 - Not started as an integrated release phase: Phase 3 security, packaging, and
