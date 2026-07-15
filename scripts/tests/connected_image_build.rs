@@ -76,6 +76,15 @@ fn every_privileged_helper_operation_is_bounded() {
 }
 
 #[test]
+fn interrupt_and_termination_preserve_failure_status_while_running_cleanup() {
+    let script =
+        fs::read_to_string(root().join("scripts/build-connected-workspace-image.sh")).unwrap();
+    assert!(script.contains("trap cleanup EXIT"));
+    assert!(script.contains("trap 'exit 130' INT"));
+    assert!(script.contains("trap 'exit 143' TERM"));
+}
+
+#[test]
 fn hanging_snapshot_create_is_bounded_before_container_build() {
     let fixture = tempfile::tempdir_in("/tmp").unwrap();
     let repo = fixture.path().join("repo");

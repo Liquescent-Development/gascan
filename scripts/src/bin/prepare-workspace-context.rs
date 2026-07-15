@@ -116,6 +116,19 @@ fn run() -> Result<(), DynError> {
         println!("{:x}", Sha256::digest(&manifest));
         return Ok(());
     }
+    if first.as_deref() == Some(OsStr::new("--verify-connected")) {
+        let repository = required(&mut arguments, "REPOSITORY_ROOT")?;
+        let lock = required(&mut arguments, "LOCK_FILE")?;
+        let _cache = required(&mut arguments, "CACHE_DIRECTORY")?;
+        let context = required(&mut arguments, "CONTEXT_DIRECTORY")?;
+        if arguments.next().is_some() {
+            return Err("usage: prepare-workspace-context --verify-connected REPOSITORY_ROOT LOCK_FILE CACHE_DIRECTORY CONTEXT_DIRECTORY".into());
+        }
+        validate_connected_lock(&repository, &lock)?;
+        let manifest = verify_context(&context, Mode::Connected)?;
+        println!("{:x}", Sha256::digest(&manifest));
+        return Ok(());
+    }
     if first.as_deref() == Some(OsStr::new("--verify")) {
         let repository = required(&mut arguments, "REPOSITORY_ROOT")?;
         let lock = required(&mut arguments, "LOCK_FILE")?;

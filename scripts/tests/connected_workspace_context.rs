@@ -82,6 +82,17 @@ impl Fixture {
             .output()
             .unwrap()
     }
+
+    fn verify(&self) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_prepare-workspace-context"))
+            .arg("--verify-connected")
+            .arg(&self.repository)
+            .arg(&self.lock)
+            .arg(&self.cache)
+            .arg(&self.context)
+            .output()
+            .unwrap()
+    }
 }
 
 fn connected_lock(mode: &str) -> String {
@@ -166,6 +177,20 @@ fn connected_context_is_the_exact_public_allowlist_and_prints_digest() {
     }
     assert!(actual.iter().any(|path| path == "context-manifest.tsv"));
     let _keep_alive = &fixture.temporary;
+}
+
+#[test]
+fn connected_context_can_be_reverified_with_its_pending_lock() {
+    let fixture = Fixture::new();
+    let created = fixture.run();
+    assert!(created.status.success());
+    let verified = fixture.verify();
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+    assert_eq!(created.stdout, verified.stdout);
 }
 
 #[test]
