@@ -5,6 +5,14 @@ use serde_json::Value;
 use std::ffi::{OsStr, OsString};
 use std::process::{Command, Output, Stdio};
 
+#[derive(serde::Deserialize)]
+struct DaemonInstanceRecord {
+    pid: u32,
+    owner_token: String,
+    executable: std::path::PathBuf,
+    start_identity: String,
+}
+
 pub type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 pub struct AppleE2e {
@@ -15,6 +23,7 @@ pub struct AppleE2e {
     root_path: std::path::PathBuf,
     runtime_root: std::path::PathBuf,
     id: SandboxId,
+    owner_token: String,
 }
 
 impl AppleE2e {
@@ -33,6 +42,33 @@ impl AppleE2e {
         let runtime_root = runtime.path().canonicalize()?;
         let utf8_root = camino::Utf8Path::from_path(&root_path).ok_or("non-UTF-8 test root")?;
         let id = SandboxId::from_root(name, utf8_root);
+        let owner_token = format!(
+            "gate4-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        );
+        if let Some(manifest) = std::env::var_os("GASCAN_E2E_CLEANUP_MANIFEST") {
+            let manifest = std::path::PathBuf::from(manifest);
+            let record = serde_json::json!({
+                "version": 1,
+                "sandbox_id": id.as_str(),
+                "resources": [
+                    id.as_str(),
+                    format!("gascan-mise-{id}"),
+                    format!("gascan-cache-{id}"),
+                    format!("gascan-config-{id}"),
+                ],
+                "managed_by": "gascan",
+                "owner_token": owner_token,
+                "daemon_instance_path": runtime_root.join("daemon-instance.json"),
+                "daemon_executable": std::path::PathBuf::from(&gascand).canonicalize()?,
+            });
+            let temporary = manifest.with_extension("tmp");
+            std::fs::write(&temporary, serde_json::to_vec(&record)?)?;
+            std::fs::rename(temporary, manifest)?;
+        }
         Ok(Self {
             gascan,
             gascand,
@@ -41,6 +77,7 @@ impl AppleE2e {
             root_path,
             runtime_root,
             id,
+            owner_token,
         })
     }
 
@@ -56,6 +93,40 @@ impl AppleE2e {
         self.runtime_root.join("state.sqlite3")
     }
 
+    pub fn install_noop_setup(&self) -> TestResult {
+        std::fs::create_dir(self.root_path.join(".gascan"))?;
+        std::fs::write(
+            self.root_path.join("gascan.toml"),
+            "version = 1\nsetup = './.gascan/setup.sh'\n",
+        )?;
+        std::fs::write(
+            self.root_path.join(".gascan/setup.sh"),
+            "#!/bin/sh\nset -eu\n: # intentional Gate 4 no-op\n",
+        )?;
+        Ok(())
+    }
+
+    pub fn stop_owned_container(&self) -> TestResult {
+        if resource_presence(self.id(), self.id())? != ResourcePresence::Owned {
+            return Err("refusing host-state mutation without exact owned container".into());
+        }
+        let child = Command::new("container")
+            .args(["stop", "--time", "5", self.id()])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let output = wait_with_output_bounded(child, std::time::Duration::from_secs(15))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "owned host-state stop failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into())
+        }
+    }
+
     pub fn command<I, S>(&self, args: I) -> Command
     where
         I: IntoIterator<Item = S>,
@@ -67,6 +138,11 @@ impl AppleE2e {
             .env("XDG_RUNTIME_DIR", &self.runtime_root)
             .env("GASCAN_STATE_PATH", self.state_path())
             .env("GASCAN_PID_PATH", self.runtime_root.join("daemon.pid"))
+            .env(
+                "GASCAN_DAEMON_INSTANCE_PATH",
+                self.runtime_root.join("daemon-instance.json"),
+            )
+            .env("GASCAN_DAEMON_OWNER_TOKEN", &self.owner_token)
             .env(
                 "GASCAN_DAEMON_STDERR_PATH",
                 self.runtime_root.join("daemon.stderr"),
@@ -81,7 +157,12 @@ impl AppleE2e {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        Ok(self.command(args).output()?)
+        let child = self
+            .command(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        wait_with_output_bounded(child, std::time::Duration::from_secs(90))
     }
 
     pub fn success<I, S>(&self, args: I) -> TestResult<Output>
@@ -123,9 +204,7 @@ impl AppleE2e {
     }
 
     pub fn kill_daemon(&self) -> TestResult {
-        let pid = std::fs::read_to_string(self.runtime_root.join("daemon.pid"))?
-            .trim()
-            .parse::<i32>()?;
+        let pid = self.validated_daemon_pid()?;
         let pid = rustix::process::Pid::from_raw(pid).ok_or("invalid daemon pid")?;
         rustix::process::kill_process(pid, rustix::process::Signal::KILL)?;
         let socket = self.runtime_root.join("gascan/gascand.sock");
@@ -137,6 +216,31 @@ impl AppleE2e {
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
         Ok(())
+    }
+
+    fn validated_daemon_pid(&self) -> TestResult<i32> {
+        let record: DaemonInstanceRecord = serde_json::from_slice(&std::fs::read(
+            self.runtime_root.join("daemon-instance.json"),
+        )?)?;
+        let expected_executable = std::path::PathBuf::from(&self.gascand).canonicalize()?;
+        let observed_start = process_field(record.pid, "lstart=")?;
+        let observed_command = process_field(record.pid, "command=")?;
+        let observed_executable = observed_command
+            .split_whitespace()
+            .next()
+            .ok_or("daemon command is empty")?;
+        if record.owner_token != self.owner_token
+            || record.executable != expected_executable
+            || std::path::Path::new(observed_executable).canonicalize()? != expected_executable
+            || record.start_identity != observed_start
+            || std::os::unix::net::UnixStream::connect(
+                self.runtime_root.join("gascan/gascand.sock"),
+            )
+            .is_err()
+        {
+            return Err("daemon instance ownership validation refused signal".into());
+        }
+        i32::try_from(record.pid).map_err(Into::into)
     }
 
     pub fn run_pty(&self, argv: &[&str]) -> TestResult<Output> {
@@ -153,13 +257,42 @@ impl AppleE2e {
             .spawn()?;
         std::thread::sleep(std::time::Duration::from_millis(200));
         drop(pty.controller);
-        Ok(child.wait_with_output()?)
+        wait_with_output_bounded(child, std::time::Duration::from_secs(30))
+    }
+
+    pub fn run_pty_signal(
+        &self,
+        signal: rustix::process::Signal,
+        argv: &[&str],
+    ) -> TestResult<Output> {
+        let pty = rustix_openpty::openpty(None, None)?;
+        let stdin = std::fs::File::from(rustix::io::dup(&pty.user)?);
+        let mut args = vec!["--sandbox", self.id(), "shell", "--"];
+        args.extend(argv);
+        let child = self
+            .command(args)
+            .stdin(stdin)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let pid =
+            rustix::process::Pid::from_raw(i32::try_from(child.id())?).ok_or("invalid CLI pid")?;
+        rustix::process::kill_process(pid, signal)?;
+        drop(pty.controller);
+        wait_with_output_bounded(child, std::time::Duration::from_secs(10))
     }
 
     pub fn assert_no_owned_resources(&self) -> TestResult {
         for name in self.resource_names() {
-            if owned_resource(&name, self.id())? {
-                return Err(format!("owned Gate 4 resource remains: {name}").into());
+            match resource_presence(&name, self.id())? {
+                ResourcePresence::Absent => {}
+                ResourcePresence::Owned => {
+                    return Err(format!("owned Gate 4 resource remains: {name}").into());
+                }
+                ResourcePresence::Collision => {
+                    return Err(format!("exact resource name has foreign ownership: {name}").into());
+                }
             }
         }
         Ok(())
@@ -174,36 +307,96 @@ impl AppleE2e {
         ]
     }
 
-    fn cleanup(&self) {
+    fn cleanup(&self) -> TestResult {
         for (index, name) in self.resource_names().into_iter().enumerate() {
-            if owned_resource(&name, self.id()).unwrap_or(false) {
+            if resource_presence(&name, self.id())
+                .is_ok_and(|presence| presence == ResourcePresence::Owned)
+            {
+                if index == 0 {
+                    let _ = Command::new("container")
+                        .args(["stop", "--time", "5", &name])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
                 let mut command = Command::new("container");
                 if index == 0 {
                     command.args(["delete", &name]);
                 } else {
                     command.args(["volume", "delete", &name]);
                 }
-                let _ = command.stdout(Stdio::null()).stderr(Stdio::null()).status();
+                let status = command
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()?;
+                if !status.success() {
+                    return Err(format!("cleanup failed for exact resource {name}").into());
+                }
             }
         }
         let _keep_roots_alive = (&self.root, &self.runtime);
+        self.assert_no_owned_resources()
     }
 }
 
 impl Drop for AppleE2e {
     fn drop(&mut self) {
-        if let Ok(raw) = std::fs::read_to_string(self.runtime_root.join("daemon.pid")) {
-            if let Ok(pid) = raw.trim().parse::<i32>() {
-                if let Some(pid) = rustix::process::Pid::from_raw(pid) {
-                    let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
-                }
+        if let Ok(pid) = self.validated_daemon_pid() {
+            if let Some(pid) = rustix::process::Pid::from_raw(pid) {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
             }
         }
-        self.cleanup();
+        if let Err(error) = self.cleanup() {
+            eprintln!("Gate 4 Rust cleanup failed: {error}");
+        }
     }
 }
 
-fn owned_resource(name: &str, id: &str) -> TestResult<bool> {
+fn process_field(pid: u32, field: &str) -> TestResult<String> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", field])
+        .output()?;
+    if !output.status.success() {
+        return Err("daemon process identity is unavailable".into());
+    }
+    let value = String::from_utf8(output.stdout)?.trim().to_owned();
+    if value.is_empty() {
+        Err("daemon process identity is empty".into())
+    } else {
+        Ok(value)
+    }
+}
+
+fn wait_with_output_bounded(
+    mut child: std::process::Child,
+    timeout: std::time::Duration,
+) -> TestResult<Output> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(child.wait_with_output()?);
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill()?;
+            let output = child.wait_with_output()?;
+            return Err(format!(
+                "child exceeded {timeout:?} and was killed/reaped: stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResourcePresence {
+    Absent,
+    Owned,
+    Collision,
+}
+
+fn resource_presence(name: &str, id: &str) -> TestResult<ResourcePresence> {
     let output = if name == id {
         Command::new("container").args(["inspect", name]).output()?
     } else {
@@ -212,7 +405,7 @@ fn owned_resource(name: &str, id: &str) -> TestResult<bool> {
             .output()?
     };
     if !output.status.success() {
-        return Ok(false);
+        return Ok(ResourcePresence::Absent);
     }
     let value: Value = serde_json::from_slice(&output.stdout)?;
     let record = value
@@ -220,5 +413,55 @@ fn owned_resource(name: &str, id: &str) -> TestResult<bool> {
         .and_then(|items| items.first())
         .unwrap_or(&value);
     let labels = &record["configuration"]["labels"];
-    Ok(labels["dev.gascan.managed-by"] == "gascan" && labels["dev.gascan.sandbox-id"] == id)
+    Ok(
+        if labels["dev.gascan.managed-by"] == "gascan" && labels["dev.gascan.sandbox-id"] == id {
+            ResourcePresence::Owned
+        } else {
+            ResourcePresence::Collision
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corrupt_daemon_record_is_never_signalable() -> TestResult {
+        let env = AppleE2e::new("corrupt-pid")?;
+        std::fs::write(env.runtime_root.join("daemon-instance.json"), b"not-json")?;
+        assert!(env.validated_daemon_pid().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn reused_live_pid_without_owner_token_is_never_signalable() -> TestResult {
+        let env = AppleE2e::new("reused-pid")?;
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let record = serde_json::json!({
+            "pid": std::process::id(),
+            "owner_token": "somebody-else",
+            "executable": executable,
+            "start_identity": process_field(std::process::id(), "lstart=")?,
+        });
+        std::fs::write(
+            env.runtime_root.join("daemon-instance.json"),
+            serde_json::to_vec(&record)?,
+        )?;
+        assert!(env.validated_daemon_pid().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_wait_kills_and_reaps_timed_out_child() -> TestResult {
+        let child = Command::new("sh")
+            .args(["-c", "sleep 10"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let started = std::time::Instant::now();
+        assert!(wait_with_output_bounded(child, std::time::Duration::from_millis(20)).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        Ok(())
+    }
 }

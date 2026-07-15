@@ -32,6 +32,7 @@ tower.workspace = true
 
 [dev-dependencies]
 camino.workspace = true
+serde.workspace = true
 tempfile = "3"
 rustix-openpty = "0.2"
 

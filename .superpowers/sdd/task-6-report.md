@@ -35,14 +35,30 @@ The daemon now uses one shared pending `DoctorState`: handshake is independent, 
 up, and apply converge on the same bounded background result and fail closed if collection is
 abandoned. Deterministic convergence/failure tests cover the state.
 
-Review-requested structured daemon PID ownership records, durable external cleanup manifests,
-bounded child/PTY teardown, and the remaining live signal/host-mutation/no-op scenarios are not
-complete. They must be finished before Gate 4 can pass even after image access is available.
+Harness cleanup now writes a durable, exact-scope manifest before the first mutation. The runner
+traps EXIT, INT, TERM, and HUP, validates exact names and both ownership labels, stops before
+deleting, verifies absence, and reports residue. It scavenges only manifests that pass the same
+scope/label/token validation on the next run. SIGKILL cannot be trapped; next-run scavenging is
+the recovery path. A live 401 run verified that the manifest was removed and only its validated
+daemon instance was terminated.
+
+Daemon termination is fail-closed: the daemon atomically records PID, harness owner token,
+canonical executable, and process start identity. Before any signal, the harness revalidates all
+fields, the current process command/start identity, and its live socket. Corrupt and reused PID
+records are refused. CLI waits are bounded at 90 seconds, PTY/signal waits at 10–30 seconds, and
+timeout tests prove kill/reap behavior. Exact-name resources with missing or mismatched labels are
+reported as collisions and never treated as absence or deleted.
+
+The ignored lifecycle now defines SIGINT/SIGTERM forwarding, a no-op setup/apply, exact owned
+host stop followed by apply/start reconciliation, daemon kill/restart, and final absence checks.
+These assertions remain unreached solely because the exact image pull is unauthorized.
 
 ## Verification run
 
 - Baseline `cargo test -p gascan-e2e`: pass before Task 6 changes.
 - New ignored test binaries: compile successfully with `--no-run`.
+- Non-live harness safety: corrupt/reused daemon records refused; timed-out child killed/reaped;
+  cleanup manifest scope refusal and owned container stop-before-delete ordering pass.
 - Live lifecycle: plain autostart and runtime inventory reached the exact locked image pull; image
   access is blocked by GHCR authorization, so no later lifecycle assertion was reached.
 - Recovery, full runner, global fmt/clippy/test gates: not claimed as Gate 4 evidence because

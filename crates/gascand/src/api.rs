@@ -23,6 +23,58 @@ use tokio::sync::Notify;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnixListenerStream;
 
+#[derive(serde::Serialize)]
+struct DaemonInstanceRecord {
+    pid: u32,
+    owner_token: String,
+    executable: std::path::PathBuf,
+    start_identity: String,
+}
+
+fn write_daemon_instance_record() -> io::Result<()> {
+    let Some(path) = std::env::var_os("GASCAN_DAEMON_INSTANCE_PATH").map(std::path::PathBuf::from)
+    else {
+        return Ok(());
+    };
+    let owner_token = std::env::var("GASCAN_DAEMON_OWNER_TOKEN").map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "daemon owner token is required",
+        )
+    })?;
+    let executable = std::env::current_exe()?.canonicalize()?;
+    let pid = std::process::id();
+    let start_identity = process_start_identity(pid)?;
+    let record = DaemonInstanceRecord {
+        pid,
+        owner_token,
+        executable,
+        start_identity,
+    };
+    let bytes = serde_json::to_vec(&record).map_err(io::Error::other)?;
+    let temporary = path.with_extension(format!("tmp-{pid}"));
+    std::fs::write(&temporary, bytes)?;
+    std::fs::rename(temporary, path)
+}
+
+fn process_start_identity(pid: u32) -> io::Result<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(
+            "could not read daemon process start identity",
+        ));
+    }
+    let value = String::from_utf8(output.stdout).map_err(io::Error::other)?;
+    let value = value.trim().to_owned();
+    if value.is_empty() {
+        Err(io::Error::other("empty daemon process start identity"))
+    } else {
+        Ok(value)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ActivityTracker {
     inner: Arc<ActivityInner>,
@@ -239,6 +291,7 @@ impl Daemon {
         if let Some(pid_path) = std::env::var_os("GASCAN_PID_PATH") {
             std::fs::write(pid_path, std::process::id().to_string())?;
         }
+        write_daemon_instance_record()?;
         owned.set_nonblocking(true)?;
         let listener = tokio::net::UnixListener::from_std(owned.try_clone()?)?;
         let expected_uid = crate::PeerUid::current();

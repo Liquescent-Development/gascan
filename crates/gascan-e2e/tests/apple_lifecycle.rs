@@ -9,6 +9,7 @@ use apple_common::{AppleE2e, TestResult};
 #[ignore = "requires supported Apple runtime and the locked workspace image"]
 fn cli_lifecycle_survives_daemon_and_host_state_changes() -> TestResult {
     let env = AppleE2e::new("gate4-lifecycle")?;
+    env.install_noop_setup()?;
     env.success(["up", env.root().to_str().ok_or("non-UTF-8 root")?])?;
     env.success(["up", env.root().to_str().ok_or("non-UTF-8 root")?])?;
 
@@ -25,12 +26,29 @@ fn cli_lifecycle_survives_daemon_and_host_state_changes() -> TestResult {
         String::from_utf8_lossy(&tty.stderr)
     );
 
+    for (signal, expected) in [
+        (rustix::process::Signal::INT, Some(130)),
+        (rustix::process::Signal::TERM, Some(143)),
+    ] {
+        let output = env.run_pty_signal(
+            signal,
+            &[
+                "sh",
+                "-c",
+                "trap 'exit 130' INT; trap 'exit 143' TERM; while :; do sleep 1; done",
+            ],
+        )?;
+        assert_eq!(output.status.code(), expected);
+    }
+
+    env.stop_owned_container()?;
     env.success([
         "--sandbox",
         env.id(),
         "apply",
         env.root().to_str().ok_or("non-UTF-8 root")?,
     ])?;
+    assert_eq!(env.status_json()?["actual_state"], "running");
     env.success(["--sandbox", env.id(), "down"])?;
     assert_eq!(env.status_json()?["actual_state"], "stopped");
     env.success(["up", env.root().to_str().ok_or("non-UTF-8 root")?])?;
