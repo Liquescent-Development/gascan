@@ -18,6 +18,7 @@ fn dockerfile_declares_workspace_user_init_and_persistent_layout() {
         "COPY --chmod=0440 images/workspace/etc/sudoers.d/workspace /etc/sudoers.d/workspace",
         "groupadd --gid 1000 workspace",
         "useradd --uid 1000 --gid 1000",
+        "chown workspace:workspace /opt/gascan/mise",
         "/opt/gascan/mise",
         "/home/workspace/.cache",
         "/home/workspace/.config/gascan",
