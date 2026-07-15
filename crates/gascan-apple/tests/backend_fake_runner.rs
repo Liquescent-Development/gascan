@@ -440,6 +440,34 @@ async fn exec_bridge_turns_premature_helper_eof_into_one_terminal_error() {
 }
 
 #[tokio::test]
+async fn exec_session_cancel_aborts_helper_input_ack_and_coordinator() {
+    let backend = AppleBackend::with_attach(StatefulAppleRunner::default(), fake_attach());
+    let (_root, create) = request("block-input");
+    let mut session = backend
+        .exec(ExecRequest {
+            id: create.id().clone(),
+            argv: vec!["guest".to_owned()],
+            stdin: Vec::new(),
+            environment: BTreeMap::new(),
+            tty: false,
+        })
+        .await
+        .unwrap();
+    session
+        .send(ExecInput::Stdin(vec![7; 8 * 1024 * 1024]))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    session.cancel();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), session.next())
+            .await
+            .expect("cancelled Apple coordinator did not close promptly")
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn remove_refuses_identity_mismatch_after_immediate_reinventory() {
     let runner = StatefulAppleRunner::default();
     let backend = AppleBackend::new(runner.clone());

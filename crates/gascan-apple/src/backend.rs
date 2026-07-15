@@ -3,9 +3,10 @@ use std::{collections::BTreeMap, sync::Mutex};
 use async_trait::async_trait;
 use gascan_core::{
     runtime::{
-        ContainerState, CreateFailure, CreateOutcome, CreateRequest, ExecInput, ExecOutput,
-        ExecRequest, ExecSession, RemoveRequest, ResourceIdentity, ResourceKind, ResourceOwnership,
-        RuntimeBackend, RuntimeCapabilities, RuntimeError, RuntimeResource, RuntimeSandbox,
+        ContainerState, CreateFailure, CreateOutcome, CreateRequest, ExecCancellation, ExecInput,
+        ExecOutput, ExecRequest, ExecSession, RemoveRequest, ResourceIdentity, ResourceKind,
+        ResourceOwnership, RuntimeBackend, RuntimeCapabilities, RuntimeError, RuntimeResource,
+        RuntimeSandbox,
     },
     sandbox::SandboxId,
 };
@@ -364,16 +365,27 @@ where
             .await?;
         let (input, mut inputs) = tokio::sync::mpsc::channel(16);
         let (outputs, output) = tokio::sync::mpsc::channel(32);
+        let (cancellation, mut cancelled) = ExecCancellation::channel();
         let writer = session.input_handle();
         tokio::spawn(async move {
             if !initial_stdin.is_empty() {
-                if let Err(error) = writer.send(AttachInput::Stdin(initial_stdin)).await {
-                    let _ = outputs.send(Err(error)).await;
-                    return;
+                tokio::select! {
+                    result = writer.send(AttachInput::Stdin(initial_stdin)) => {
+                        if let Err(error) = result {
+                            let _ = outputs.send(Err(error)).await;
+                            return;
+                        }
+                    }
+                    result = cancelled.changed() => {
+                        if result.is_ok() && *cancelled.borrow() { return; }
+                    }
                 }
             }
             loop {
                 tokio::select! {
+                    result = cancelled.changed() => {
+                        if result.is_ok() && *cancelled.borrow() { break; }
+                    }
                     frame = inputs.recv() => {
                         let Some(frame) = frame else { break };
                         let frame = match frame {
@@ -390,7 +402,13 @@ where
                             ExecInput::Close => Ok(AttachInput::Close),
                         };
                         let result = match frame {
-                            Ok(frame) => writer.send(frame).await,
+                            Ok(frame) => tokio::select! {
+                                result = writer.send(frame) => result,
+                                result = cancelled.changed() => {
+                                    if result.is_ok() && *cancelled.borrow() { break; }
+                                    continue;
+                                }
+                            },
                             Err(error) => Err(error),
                         };
                         if let Err(error) = result {
@@ -406,14 +424,20 @@ where
                             Ok(None) => break,
                             Err(error) => (Err(error), true),
                         };
-                        if outputs.send(mapped).await.is_err() || terminal {
+                        let delivered = tokio::select! {
+                            result = outputs.send(mapped) => result.is_ok(),
+                            result = cancelled.changed() => {
+                                !(result.is_ok() && *cancelled.borrow())
+                            }
+                        };
+                        if !delivered || terminal {
                             break;
                         }
                     }
                 }
             }
         });
-        Ok(ExecSession::live(input, output))
+        Ok(ExecSession::live_cancellable(input, output, cancellation))
     }
 
     async fn logs(

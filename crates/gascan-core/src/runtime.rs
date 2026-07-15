@@ -292,6 +292,21 @@ pub enum ExecOutput {
 pub struct ExecSession {
     input: tokio::sync::mpsc::Sender<ExecInput>,
     output: tokio::sync::mpsc::Receiver<Result<ExecOutput, RuntimeError>>,
+    cancellation: Option<ExecCancellation>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExecCancellation(tokio::sync::watch::Sender<bool>);
+
+impl ExecCancellation {
+    pub fn channel() -> (Self, tokio::sync::watch::Receiver<bool>) {
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        (Self(sender), receiver)
+    }
+
+    pub fn cancel(&self) {
+        let _ = self.0.send(true);
+    }
 }
 
 impl ExecSession {
@@ -304,14 +319,34 @@ impl ExecSession {
             code: exit_code,
             signal: 0,
         }));
-        Self { input, output }
+        Self {
+            input,
+            output,
+            cancellation: None,
+        }
     }
 
     pub fn live(
         input: tokio::sync::mpsc::Sender<ExecInput>,
         output: tokio::sync::mpsc::Receiver<Result<ExecOutput, RuntimeError>>,
     ) -> Self {
-        Self { input, output }
+        Self {
+            input,
+            output,
+            cancellation: None,
+        }
+    }
+
+    pub fn live_cancellable(
+        input: tokio::sync::mpsc::Sender<ExecInput>,
+        output: tokio::sync::mpsc::Receiver<Result<ExecOutput, RuntimeError>>,
+        cancellation: ExecCancellation,
+    ) -> Self {
+        Self {
+            input,
+            output,
+            cancellation: Some(cancellation),
+        }
     }
 
     pub async fn send(&self, input: ExecInput) -> Result<(), RuntimeError> {
@@ -326,6 +361,18 @@ impl ExecSession {
 
     pub async fn next(&mut self) -> Option<Result<ExecOutput, RuntimeError>> {
         self.output.recv().await
+    }
+
+    pub fn cancel(&self) {
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.cancel();
+        }
+    }
+}
+
+impl Drop for ExecSession {
+    fn drop(&mut self) {
+        self.cancel();
     }
 }
 

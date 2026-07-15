@@ -3,11 +3,29 @@ mod common;
 use common::{capabilities, create_request};
 use gascan_core::fake_runtime::{FailureBoundary, FakeRuntime};
 use gascan_core::runtime::{
-    CreateFailure, CreateOutcome, ExecInput, ExecOutput, ExecRequest, RemoveRequest,
-    ResourceIdentity, ResourceKind, ResourceOwnership, RuntimeBackend, RuntimeCall, RuntimeError,
-    RuntimeOutcome, RuntimeResource,
+    CreateFailure, CreateOutcome, ExecCancellation, ExecInput, ExecOutput, ExecRequest,
+    ExecSession, RemoveRequest, ResourceIdentity, ResourceKind, ResourceOwnership, RuntimeBackend,
+    RuntimeCall, RuntimeError, RuntimeOutcome, RuntimeResource,
 };
 use gascan_core::sandbox::SandboxId;
+
+#[tokio::test]
+async fn cancellable_exec_session_signals_on_cancel_and_drop() {
+    let (input, _inputs) = tokio::sync::mpsc::channel(1);
+    let (_outputs, output) = tokio::sync::mpsc::channel(1);
+    let (cancellation, mut cancelled) = ExecCancellation::channel();
+    let session = ExecSession::live_cancellable(input, output, cancellation);
+    session.cancel();
+    cancelled.changed().await.unwrap();
+    assert!(*cancelled.borrow());
+
+    let (input, _inputs) = tokio::sync::mpsc::channel(1);
+    let (_outputs, output) = tokio::sync::mpsc::channel(1);
+    let (cancellation, mut cancelled) = ExecCancellation::channel();
+    drop(ExecSession::live_cancellable(input, output, cancellation));
+    cancelled.changed().await.unwrap();
+    assert!(*cancelled.borrow());
+}
 
 #[tokio::test]
 async fn exec_session_is_live_bidirectional_and_emits_one_exit() {
