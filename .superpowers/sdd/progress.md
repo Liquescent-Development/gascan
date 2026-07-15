@@ -10,3 +10,4 @@ Connected Task 1: complete (commits 54ed806..44bb3b2, review clean; live secret 
 Connected Task 2: complete (commits 75c1f2c..1878744, review clean)
 Connected Task 3: complete (commits 883f6fe..7a429cb, review clean)
 Connected Task 4: complete (commits f6f7856..b03add2, review clean; structural credential boundary only)
+Connected Task 5: complete (commits 2bd64cd..61fd8d9, review clean)

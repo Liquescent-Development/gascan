@@ -55,7 +55,7 @@ the polyglot toolchain.
 | Phase 1 Apple feasibility / Gate 2 | Passed and integrated | `6bedef8`, `docs/feasibility/apple-container-report.md` |
 | Phase 1 core control plane / Gate 3 | Passed and integrated | `7c7d083`, integration record `917dac1` |
 | Phase 2 Apple backend implementation | Implemented and reviewed on feature branch; not integrated | head `dbf4235` |
-| Phase 2 workspace image | Connected MVP Tasks 1–4 are approved; Task 5 has an unaccepted partial commit and an approved unprivileged wrapper-context revision; Tasks 6–7 remain | approved through `b03add2`; partial Task 5 at `3517415` |
+| Phase 2 workspace image | Connected MVP Tasks 1–5 are approved; the real connected image gate and Gate 4 handoff remain | approved through `61fd8d9`; no real private image build yet |
 | Gate 4 real lifecycle | Pending; harness approved but no complete real lifecycle evidence | harness `dbf4235` |
 | Phase 3 security, packaging, release | Not started as an integrated phase | blocked by Gate 4 |
 | Gate 5 clean-host release | Pending | no evidence |
@@ -119,6 +119,9 @@ The harness is approved; Gate 4 itself is not passed.
   `0555`, and cannot stage the private secret. The approved revision keeps the
   helper unchanged and copies its sealed public snapshot into a separate
   unprivileged private wrapper before descriptor-safe secret staging.
+- `61fd8d9`: approved connected build orchestrator, descriptor-safe wrapper,
+  bounded credential-blind snapshot lifecycle, structured inspection, and
+  committed receipt-pair validation. No real private image build was run.
 
 These offline commits are reviewed assets, not completed publication or live
 image evidence. `images/workspace/versions.lock` still says
@@ -143,10 +146,10 @@ Do not encode the operator DNS IP into Gas Can product policy.
 
 ## Current Unfinished Work
 
-1. Complete and independently review Task 5 using the approved unprivileged
-   wrapper-context revision. The privileged helper and sudoers contract remain
-   unchanged and credential-blind. Tasks 1–4 are complete and must not be
-   redispatched; `3517415` is not accepted by itself.
+1. Execute Task 6's platform-neutral gate harness and independent review, then
+   run the real connected image gate only with an authorized external private
+   Gascamp token. Tasks 1–5 are complete and must not be redispatched;
+   `3517415` is superseded by the approved Task 5 range through `61fd8d9`.
 2. Convert the image path from mandatory offline bundles to connected locked
    acquisition while preserving all reviewed image contracts.
 3. Select and prove the private Gascamp credential boundary.
