@@ -22,16 +22,16 @@ ubuntu_snapshot=$(top_value ubuntu_snapshot)
 context_manifest=$(cargo run --quiet --locked --offline --manifest-path "$root/scripts/Cargo.toml" --bin prepare-workspace-context -- --verify "$root" "$lock" "$root/.artifacts" "$context")
 [[ "$context_manifest" =~ ^[0-9a-f]{64}$ ]] || die "context verifier did not emit a canonical manifest digest"
 
-snapshot_helper='/usr/local/libexec/gascan/snapshot-workspace-context'
-test -x "$snapshot_helper" || die "snapshot helper is unavailable"
-test "$(stat -f '%u:%Lp' "$snapshot_helper")" = '0:555' || die "snapshot helper is not root-owned immutable code"
+snapshot_helper='/Library/PrivilegedHelperTools/dev.gascan.snapshot-workspace-context'
+helper_identity=$(cargo run --quiet --locked --offline --manifest-path "$root/scripts/Cargo.toml" --bin snapshot-helper-identity -- "$snapshot_helper") || die "snapshot helper identity is unsafe"
+IFS=$'\t' read -r helper_sha256 helper_device helper_inode <<<"$helper_identity"
 receipt=''
 cleanup_snapshot() {
-  test -z "$receipt" || sudo -n "$snapshot_helper" finish "$receipt"
+  test -z "$receipt" || sudo -n "$snapshot_helper" --self "$helper_sha256" "$helper_device" "$helper_inode" finish "$receipt"
 }
 trap cleanup_snapshot EXIT INT TERM
-receipt=$(sudo -n "$snapshot_helper" create "$context" "$context_manifest") || die "root snapshot creation is unavailable"
-build_context_snapshot=$(sudo -n "$snapshot_helper" path "$receipt") || die "root snapshot validation failed"
+receipt=$(sudo -n "$snapshot_helper" --self "$helper_sha256" "$helper_device" "$helper_inode" create "$context" "$context_manifest") || die "root snapshot creation is unavailable"
+build_context_snapshot=$(sudo -n "$snapshot_helper" --self "$helper_sha256" "$helper_device" "$helper_inode" path "$receipt") || die "root snapshot validation failed"
 test -d "$build_context_snapshot" || die "root snapshot path is unavailable"
 
 inspect=$(container image inspect --format json "$base_image")
@@ -47,7 +47,7 @@ container build \
   --build-arg "UBUNTU_SNAPSHOT=$ubuntu_snapshot" \
   "$build_context_snapshot"
 
-sudo -n "$snapshot_helper" finish "$receipt"
+sudo -n "$snapshot_helper" --self "$helper_sha256" "$helper_device" "$helper_inode" finish "$receipt"
 receipt=''
 trap - EXIT INT TERM
 

@@ -325,6 +325,7 @@ version = "0.1.0"
 dependencies = [
  "cap-primitives",
  "cap-std",
+ "libc",
  "reqwest",
  "rustix",
  "serde",
