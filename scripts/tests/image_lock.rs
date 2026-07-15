@@ -29,6 +29,14 @@ struct ImageLock {
     playwright_chromium: VersionedArtifact,
     gascamp: Gascamp,
     workspace_tag: String,
+    workspace_bundles: WorkspaceBundles,
+}
+
+#[derive(Deserialize)]
+struct WorkspaceBundles {
+    media_type: String,
+    platform: String,
+    publication: String,
 }
 
 fn sha256_is_lower_hex(value: &str) -> bool {
@@ -66,6 +74,83 @@ fn every_remote_image_input_is_immutable_and_checksummed() {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     );
     assert!(!lock.workspace_tag.ends_with(":latest"));
+    assert_eq!(
+        lock.workspace_bundles.media_type,
+        "application/vnd.gascan.workspace-bundle.v1+tar.zstd"
+    );
+    assert_eq!(lock.workspace_bundles.platform, "linux/arm64");
+    assert_eq!(lock.workspace_bundles.publication, "pending");
+}
+
+#[test]
+fn published_bundle_lock_requires_all_concrete_immutable_records() {
+    use gascan_image_tools::bundle::{BundleError, PublishedBundleLocks};
+
+    let record = |suffix: &str, hash: char, size: u64| {
+        format!(
+            r#"
+[workspace_bundles.{suffix}]
+url = "https://github.com/example/gascan/releases/download/lock/{suffix}.tar.zst"
+sha256 = "{}"
+size = {size}
+media_type = "application/vnd.gascan.workspace-bundle.v1+tar.zstd"
+platform = "linux/arm64"
+"#,
+            hash.to_string().repeat(64)
+        )
+    };
+    let valid = format!(
+        "{}{}{}{}",
+        r#"[workspace_bundles]
+media_type = "application/vnd.gascan.workspace-bundle.v1+tar.zstd"
+platform = "linux/arm64"
+publication = "published"
+"#,
+        record("ubuntu_packages", 'a', 101),
+        record("mise_runtimes", 'b', 202),
+        record("gascamp_source_vendor", 'c', 303)
+    );
+    let locks = PublishedBundleLocks::from_toml(&valid).unwrap();
+    assert_eq!(locks.ubuntu_packages.size, 101);
+    assert_eq!(locks.mise_runtimes.size, 202);
+    assert_eq!(locks.gascamp_source_vendor.size, 303);
+
+    assert_eq!(
+        PublishedBundleLocks::from_toml(&format!(
+            "{}{}",
+            r#"[workspace_bundles]
+media_type = "application/vnd.gascan.workspace-bundle.v1+tar.zstd"
+platform = "linux/arm64"
+publication = "published"
+"#,
+            record("ubuntu_packages", 'a', 101)
+        ))
+        .unwrap_err(),
+        BundleError::MissingLockRecord("mise_runtimes")
+    );
+
+    let first_record = valid.find("[workspace_bundles.ubuntu_packages]").unwrap();
+    let wrong_platform = format!(
+        "{}{}",
+        &valid[..first_record],
+        valid[first_record..].replacen("linux/arm64", "linux/amd64", 1)
+    );
+    assert_eq!(
+        PublishedBundleLocks::from_toml(&wrong_platform).unwrap_err(),
+        BundleError::InvalidLockRecord("ubuntu_packages")
+    );
+
+    let uppercase_hash = valid.replacen(&"a".repeat(64), &"A".repeat(64), 1);
+    assert_eq!(
+        PublishedBundleLocks::from_toml(&uppercase_hash).unwrap_err(),
+        BundleError::InvalidLockRecord("ubuntu_packages")
+    );
+
+    let zero_size = valid.replacen("size = 101", "size = 0", 1);
+    assert_eq!(
+        PublishedBundleLocks::from_toml(&zero_size).unwrap_err(),
+        BundleError::InvalidLockRecord("ubuntu_packages")
+    );
 }
 
 #[test]

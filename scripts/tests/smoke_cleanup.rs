@@ -68,7 +68,11 @@ fn run(mode: &str) -> (std::process::Output, String) {
 fn create_success_then_start_failure_is_owned_and_deleted() {
     let (output, calls) = run("start-fails");
     assert!(!output.status.success());
-    assert!(calls.contains("create "), "stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        calls.contains("create "),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(calls.contains("start "));
     assert!(calls.contains("delete "));
 }
@@ -77,7 +81,11 @@ fn create_success_then_start_failure_is_owned_and_deleted() {
 fn signal_after_create_side_effect_still_cleans_exact_owner() {
     let (output, calls) = run("signal");
     assert!(!output.status.success());
-    assert!(calls.contains("create "), "stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        calls.contains("create "),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(calls.contains("inspect "));
     assert!(calls.contains("delete "));
 }
@@ -86,6 +94,10 @@ fn signal_after_create_side_effect_still_cleans_exact_owner() {
 fn wrong_label_collision_is_retained_without_delete() {
     let (output, calls) = run("collision");
     assert!(!output.status.success());
-    assert!(calls.contains("create "), "stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        calls.contains("create "),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(!calls.contains("delete "));
 }

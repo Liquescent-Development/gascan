@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod bundle;
+
 use std::{collections::BTreeSet, error::Error, time::Duration};
 
 use reqwest::{
