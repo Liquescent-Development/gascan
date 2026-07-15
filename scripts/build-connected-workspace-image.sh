@@ -60,6 +60,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+started_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 tmp_base=${TMPDIR:-/tmp}
 tmp_base=${tmp_base%/}
 wrapper=$(mktemp -d "$tmp_base/gascan-connected-build.XXXXXX")
@@ -108,7 +109,6 @@ cleanup_publication() {
 }
 trap cleanup_publication EXIT
 printf '%s\n' "$reference" >"$ref_tmp"
-started_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 lock_digest=$(shasum -a 256 "$lock" | cut -d' ' -f1)
 printf '{"reference":"%s","tag":"%s","platform":"linux/arm64","lock_digest":"%s","context_digest":"%s","image_digest":"%s","apple_version":"%s","started_at":"%s","finished_at":"%s","status":"succeeded"}\n' \
   "$reference" "$tag" "$lock_digest" "$context_manifest" "$image_digest" "$(sw_vers -productVersion)" "$started_at" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >"$json_tmp"

@@ -1,4 +1,5 @@
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
+use sha2::{Digest, Sha256};
 
 const TOKEN: &str = "00112233445566778899aabbccddeeff";
 
@@ -33,11 +34,25 @@ esac
     let mut permissions = fs::metadata(&bin).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&bin, permissions).unwrap();
+    fs::create_dir_all(temp.path().join("connected-workspace-context")).unwrap();
     fs::write(
-        temp.path().join("ref"),
-        "gascan-workspace:test@sha256:abc\n",
+        temp.path().join("connected-workspace-context/context-manifest.tsv"),
+        "fixture\n",
     )
     .unwrap();
+    let image_digest = format!("sha256:{}", "a".repeat(64));
+    let reference = format!("gascan-workspace:d4964500a3295a33@{image_digest}");
+    fs::write(temp.path().join("ref"), format!("{reference}\n")).unwrap();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let lock_digest = format!(
+        "{:x}",
+        Sha256::digest(fs::read(root.join("images/workspace/versions.lock")).unwrap())
+    );
+    let context_digest = format!("{:x}", Sha256::digest(b"fixture\n"));
+    fs::write(
+        temp.path().join("workspace-image-build.json"),
+        format!("{{\"reference\":\"{reference}\",\"tag\":\"gascan-workspace:d4964500a3295a33\",\"platform\":\"linux/arm64\",\"lock_digest\":\"{lock_digest}\",\"context_digest\":\"{context_digest}\",\"image_digest\":\"{image_digest}\",\"status\":\"succeeded\"}}\n"),
+    ).unwrap();
     let _ = mode;
     (temp, bin, log)
 }
@@ -53,6 +68,7 @@ fn run(mode: &str) -> (std::process::Output, String) {
         .arg(script)
         .env("CONTAINER_BIN", &bin)
         .env("GASCAN_IMAGE_REF_FILE", temp.path().join("ref"))
+        .env("GASCAN_IMAGE_ARTIFACTS", temp.path())
         .env("GASCAN_TEST_OWNER_TOKEN", TOKEN)
         .env("MODE", mode)
         .env("CALLS", &log)

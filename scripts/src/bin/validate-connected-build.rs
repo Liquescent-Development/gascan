@@ -8,6 +8,8 @@ use std::{
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use cap_primitives::fs::{FollowSymlinks, MetadataExt as _, OpenOptions as CapOpenOptions};
+use cap_std::{ambient_authority, fs::Dir};
 
 type DynError = Box<dyn Error + Send + Sync>;
 
@@ -221,10 +223,11 @@ fn stage_secret(wrapper: &Path, secret: &Path, repository: &Path) -> Result<(), 
     if canonical_secret.starts_with(canonical_repository) {
         return Err("secret file must be outside the repository".into());
     }
+    let expected = fs::metadata(&canonical_secret)?;
     let secrets = wrapper.join(".build-secrets");
     fs::create_dir(&secrets)?;
     fs::set_permissions(&secrets, fs::Permissions::from_mode(0o700))?;
-    let bytes = read_valid_secret(secret)?;
+    let bytes = read_valid_secret_bound(secret, Some((expected.dev(), expected.ino())))?;
     let staged = secrets.join("gascamp_read_token");
     let mut output = fs::OpenOptions::new()
         .write(true)
@@ -246,11 +249,21 @@ fn stage_secret(wrapper: &Path, secret: &Path, repository: &Path) -> Result<(), 
 }
 
 fn read_valid_secret(secret: &Path) -> Result<Vec<u8>, DynError> {
+    read_valid_secret_bound(secret, None)
+}
+
+fn read_valid_secret_bound(
+    secret: &Path,
+    expected_identity: Option<(u64, u64)>,
+) -> Result<Vec<u8>, DynError> {
     let mut source = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(secret)?;
     let metadata = source.metadata()?;
+    if expected_identity.is_some_and(|identity| identity != (metadata.dev(), metadata.ino())) {
+        return Err("secret pathname changed during validation".into());
+    }
     let uid = rustix::process::getuid().as_raw();
     if !metadata.is_file() || metadata.uid() != uid || metadata.mode() & 0o7777 != 0o600 {
         return Err("secret must be a current-UID regular 0600 file".into());
@@ -314,24 +327,32 @@ fn verify_manifest(root: &Path, expected: &str) -> Result<(), DynError> {
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> Result<(), DynError> {
-    let mut entries = fs::read_dir(source)?.collect::<Result<Vec<_>, _>>()?;
+    let source = Dir::open_ambient_dir(source, ambient_authority())?;
+    copy_open_directory(&source, destination)
+}
+
+fn copy_open_directory(source: &Dir, destination: &Path) -> Result<(), DynError> {
+    let mut entries = source.entries()?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
-        let from = entry.path();
-        let to = destination.join(entry.file_name());
-        let metadata = fs::symlink_metadata(&from)?;
-        if metadata.file_type().is_symlink() {
-            return Err("public snapshot contains a symlink".into());
+    let entries = entries
+        .into_iter()
+        .map(|entry| Ok((entry.file_name(), entry.metadata()?)))
+        .collect::<Result<Vec<_>, std::io::Error>>()?;
+    for (name, expected) in entries {
+        let to = destination.join(&name);
+        let mut options = CapOpenOptions::new();
+        options.read(true)._cap_fs_ext_follow(FollowSymlinks::No);
+        let mut input = source.open_with(&name, &options)?;
+        let metadata = input.metadata()?;
+        if (metadata.dev(), metadata.ino()) != (expected.dev(), expected.ino()) {
+            return Err("public snapshot entry changed during copy".into());
         }
         if metadata.is_dir() {
             fs::create_dir(&to)?;
             fs::set_permissions(&to, fs::Permissions::from_mode(0o700))?;
-            copy_tree(&from, &to)?;
+            let directory = Dir::from_std_file(input.into_std());
+            copy_open_directory(&directory, &to)?;
         } else if metadata.is_file() {
-            let mut input = fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&from)?;
             let mut output = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)

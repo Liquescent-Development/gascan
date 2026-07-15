@@ -25,7 +25,7 @@ test -f "$reference_file" || {
 }
 
 container_bin=${CONTAINER_BIN:-container}
-image=$(cat "$reference_file")
+image=$(bash "$root/scripts/validate-connected-image-receipt.sh" "$reference_file")
 owner_token=${GASCAN_TEST_OWNER_TOKEN:-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')}
 [[ "$owner_token" =~ ^[0-9a-f]{32}$ ]] || { printf 'invalid owner token\n' >&2; exit 1; }
 name="gascan-image-gascamp-test-$owner_token"

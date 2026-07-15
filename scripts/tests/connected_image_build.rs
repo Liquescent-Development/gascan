@@ -56,14 +56,19 @@ set -eu
 printf 'cargo\t%s\n' "$*" >>"$CALLS"
 case "$*" in
   *snapshot-helper-identity*) printf 'hash\t1\t2\n' ;;
-  *'prepare-workspace-context -- --verify-connected'*) printf '%064d\n' 0 ;;
-  *'validate-image-inspect'*) cat >/dev/null; printf 'sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab\n' ;;
+  *'prepare-workspace-context -- --verify-connected'*) shasum -a 256 "$SNAPSHOT/context-manifest.tsv" | awk '{print $1}' ;;
+  *'validate-image-inspect'*) "$VALIDATE_IMAGE_INSPECT" ;;
   *'validate-connected-build -- stage-secret'*)
-    case "${FAULT:-}" in stage_create|stage_permission|exclusion) exit 81 ;; esac
+    wrapper=${@: -3:1}
+    case "${FAULT:-}" in
+      stage_create) mkdir "$wrapper/.build-secrets" ;;
+      stage_permission) chmod 755 "$wrapper" ;;
+      exclusion) printf wrong >"$wrapper/.dockerignore" ;;
+    esac
     "$VALIDATOR" stage-secret "${@: -3:1}" "${@: -2:1}" "${@: -1}" ;;
   *'validate-connected-build -- copy-public'*)
-    test "${FAULT:-}" != public_before || exit 81
-    snapshot=${@: -3:1}; wrapper=${@: -2:1}; cp -R "$snapshot"/. "$wrapper"/ ;;
+    snapshot=${@: -3:1}; test "${FAULT:-}" != public_before || printf changed >>"$snapshot/context-manifest.tsv"
+    "$VALIDATOR" copy-public "${@: -3:1}" "${@: -2:1}" "${@: -1}" ;;
   *'validate-connected-build -- prepare-wrapper'*)
     snapshot=${@: -4:1}; wrapper=${@: -3:1}; secret=${@: -2:1}
     case "${FAULT:-}" in public_before|stage_create|stage_permission|exclusion) exit 81 ;; esac
@@ -71,31 +76,25 @@ case "$*" in
     cp "$secret" "$wrapper/.build-secrets/gascamp_read_token"
     chmod 700 "$wrapper/.build-secrets"; chmod 600 "$wrapper/.build-secrets/gascamp_read_token"
     printf '.build-secrets\n' >"$wrapper/.dockerignore"; printf '%064d\n' 8 ;;
-  *'validate-connected-build -- verify-wrapper'*)
-    wrapper=${@: -3:1}
-    test "$(cat "$wrapper/context-manifest.tsv")" = fixture
-    test "$(cat "$wrapper/.dockerignore")" = .build-secrets
-    test ! -L "$wrapper/.build-secrets/gascamp_read_token"
-    test "$(stat -f %Lp "$wrapper/.build-secrets/gascamp_read_token")" = 600
-    test "$(cat "$wrapper/.build-secrets/gascamp_read_token")" = matrix-synthetic-token ;;
+  *'validate-connected-build -- verify-wrapper'*) "$VALIDATOR" verify-wrapper "${@: -3:1}" "${@: -2:1}" "${@: -1}" ;;
   *'validate-connected-build -- validate-receipt'*) "$VALIDATOR" validate-receipt "${@: -4:1}" "${@: -3:1}" "${@: -2:1}" "${@: -1}" ;;
-  *'validate-connected-build -- gascan-workspace:fixture'*)
-    cat >/dev/null
-    test "${FAULT:-}" != inspect_invalid || exit 82
-    printf 'sha256:%064d\n' 9 ;;
+  *'validate-connected-build -- gascan-workspace:fixture'*) "$VALIDATOR" gascan-workspace:fixture ;;
   *) exit 91 ;;
 esac
 "#;
         let sudo = r#"#!/usr/bin/env bash
 set -eu
 printf 'sudo\t%s\n' "$*" >>"$CALLS"
-case " $* " in *' create '*) printf 'receipt\n' ;; *' path '*) printf '%s\n' "$SNAPSHOT" ;; *' finish '*) test "${FAULT:-}" != finish_hang || sleep 30 ;; *) exit 92 ;; esac
+case " $* " in *' create '*) printf 'receipt\n' ;; *' path '*) test "${FAULT:-}" != public_symlink || ln -s /dev/null "$SNAPSHOT/swapped-link"; printf '%s\n' "$SNAPSHOT" ;; *' finish '*) test "${FAULT:-}" != finish_hang || sleep 30 ;; *) exit 92 ;; esac
 "#;
         let container = r#"#!/usr/bin/env bash
 set -eu
 printf 'container' >>"$CALLS"; printf '\t%s' "$@" >>"$CALLS"; printf '\n' >>"$CALLS"
 case "$*" in
-  'image inspect --format json '*) printf '{}\n' ;;
+  'image inspect --format json ubuntu@sha256:'*) printf '[{"configuration":{"descriptor":{"digest":"sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab"}},"variants":[{"platform":{"os":"linux","architecture":"arm64"}}]}]\n' ;;
+  'image inspect --format json gascan-workspace:fixture')
+    test "${FAULT:-}" != inspect_invalid || printf '{}\n'
+    test "${FAULT:-}" = inspect_invalid || printf '[{"id":"sha256:%064d","configuration":{"name":"gascan-workspace:fixture","descriptor":{"digest":"sha256:%064d"}},"variants":[{"platform":{"os":"linux","architecture":"arm64"}}]}]\n' 9 9 ;;
   build*)
     context=${@: -1}
     printf 'modes\t%s\t%s\t%s\n' "$(stat -f %Lp "$context")" "$(stat -f %Lp "$context/.build-secrets/gascamp_read_token")" "$(cat "$context/.dockerignore")" >>"$CALLS"
@@ -174,6 +173,7 @@ exec /bin/mv "$@"
             .env("CALLS", &self.calls)
             .env("TRANSMITTED", &self.transmitted)
             .env("VALIDATOR", env!("CARGO_BIN_EXE_validate-connected-build"))
+            .env("VALIDATE_IMAGE_INSPECT", env!("CARGO_BIN_EXE_validate-image-inspect"))
             .env(
                 "SNAPSHOT",
                 self.repository
@@ -200,6 +200,7 @@ exec /bin/mv "$@"
             .env("CALLS", &self.calls)
             .env("TRANSMITTED", &self.transmitted)
             .env("VALIDATOR", env!("CARGO_BIN_EXE_validate-connected-build"))
+            .env("VALIDATE_IMAGE_INSPECT", env!("CARGO_BIN_EXE_validate-image-inspect"))
             .env(
                 "SNAPSHOT",
                 self.repository
@@ -320,6 +321,7 @@ fn successful_fake_run_enforces_build_helper_wrapper_receipt_and_secrecy_contrac
 fn every_precommit_fault_leaves_no_receipts_and_cleans_only_owned_resources() {
     for fault in [
         "public_before",
+        "public_symlink",
         "stage_create",
         "stage_permission",
         "exclusion",
@@ -352,7 +354,7 @@ fn every_precommit_fault_leaves_no_receipts_and_cleans_only_owned_resources() {
         let calls = fs::read_to_string(&fixture.calls).unwrap();
         if matches!(
             fault,
-            "public_before" | "stage_create" | "stage_permission" | "exclusion"
+            "public_before" | "public_symlink" | "stage_create" | "stage_permission" | "exclusion"
         ) {
             assert!(!calls.contains("container\tbuild"), "build ran for {fault}");
         }
@@ -655,6 +657,15 @@ fn receipt_reference_is_the_last_atomic_commit_marker() {
 }
 
 #[test]
+fn receipt_started_at_precedes_helper_and_build_work() {
+    let script = fs::read_to_string(root().join("scripts/build-connected-workspace-image.sh")).unwrap();
+    let started = script.find("started_at=$(date").unwrap();
+    let helper = script.find(" create \"$context\"").unwrap();
+    let build = script.find("container build --arch").unwrap();
+    assert!(started < helper && started < build);
+}
+
+#[test]
 fn wrapper_helper_detects_post_stage_secret_mutation() {
     let fixture = tempfile::tempdir_in("/tmp").unwrap();
     let public = fixture.path().join("public");
@@ -779,7 +790,7 @@ fn source_path_swap_cannot_mix_validated_and_staged_secret_bytes() {
     let replacement_path = fixture.path().join("replacement-token");
     fs::write(&replacement_path, &replacement).unwrap();
     fs::set_permissions(&replacement_path, fs::Permissions::from_mode(0o600)).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_validate-connected-build"))
+    let child = Command::new(env!("CARGO_BIN_EXE_validate-connected-build"))
         .args(["stage-secret"])
         .arg(&wrapper)
         .arg(&source)
@@ -796,6 +807,113 @@ fn source_path_swap_cannot_mix_validated_and_staged_secret_bytes() {
         String::from_utf8(output.stdout).unwrap().trim(),
         format!("{:x}", Sha256::digest(&staged))
     );
+}
+
+#[test]
+fn public_copy_uses_opened_regular_file_and_directory_objects_during_swaps() {
+    for kind in ["file", "directory"] {
+        let fixture = tempfile::tempdir_in("/tmp").unwrap();
+        let public = fixture.path().join("public");
+        let wrapper = fixture.path().join("wrapper");
+        fs::create_dir(&public).unwrap();
+        fs::create_dir(&wrapper).unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(public.join("context-manifest.tsv"), "manifest\n").unwrap();
+        fs::write(public.join("aaa-delay"), vec![b'd'; 16 * 1024 * 1024]).unwrap();
+        let digest = format!("{:x}", Sha256::digest(b"manifest\n"));
+        let safe = vec![b'a'; 8 * 1024 * 1024];
+        let evil = vec![b'b'; 8 * 1024 * 1024];
+        let target = if kind == "file" {
+            public.join("payload")
+        } else {
+            fs::create_dir(public.join("payload")).unwrap();
+            public.join("payload/value")
+        };
+        fs::write(&target, &safe).unwrap();
+        let replacement = fixture.path().join("replacement");
+        if kind == "file" {
+            fs::write(&replacement, &evil).unwrap();
+        } else {
+            fs::create_dir(&replacement).unwrap();
+            fs::write(replacement.join("value"), &evil).unwrap();
+        }
+        let mut child = Command::new(env!("CARGO_BIN_EXE_validate-connected-build"))
+            .args(["copy-public"])
+            .arg(&public)
+            .arg(&wrapper)
+            .arg(&digest)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !wrapper.join("aaa-delay").exists() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(wrapper.join("aaa-delay").exists());
+        if kind == "file" {
+            fs::rename(&replacement, public.join("payload")).unwrap();
+        } else {
+            let old = fixture.path().join("old-directory");
+            fs::rename(public.join("payload"), &old).unwrap();
+            std::os::unix::fs::symlink(&replacement, public.join("payload")).unwrap();
+        }
+        let status = child.wait().unwrap();
+        if status.success() {
+            let copied = if kind == "file" {
+                fs::read(wrapper.join("payload")).unwrap()
+            } else {
+                fs::read(wrapper.join("payload/value")).unwrap()
+            };
+            assert_eq!(copied, safe, "followed swapped {kind} pathname");
+        }
+    }
+}
+
+#[test]
+fn repository_containment_remains_bound_to_opened_secret_during_replacement_race() {
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    let fixture = tempfile::tempdir_in("/tmp").unwrap();
+    let repository = fixture.path().join("repository");
+    fs::create_dir(&repository).unwrap();
+    let repository_token = repository.join("token");
+    fs::write(&repository_token, "repository-secret\n").unwrap();
+    fs::set_permissions(&repository_token, fs::Permissions::from_mode(0o600)).unwrap();
+    let source = fixture.path().join("outside-token");
+    fs::write(&source, "outside-secret\n").unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+    let running = Arc::new(AtomicBool::new(true));
+    let worker_running = Arc::clone(&running);
+    let worker_source = source.clone();
+    let worker_repository = repository_token.clone();
+    let worker = std::thread::spawn(move || {
+        while worker_running.load(Ordering::Relaxed) {
+            let _ = fs::remove_file(&worker_source);
+            let _ = std::os::unix::fs::symlink(&worker_repository, &worker_source);
+            let _ = fs::remove_file(&worker_source);
+            if fs::write(&worker_source, "outside-secret\n").is_ok() {
+                let _ = fs::set_permissions(&worker_source, fs::Permissions::from_mode(0o600));
+            }
+        }
+    });
+    for index in 0..50 {
+        let wrapper = fixture.path().join(format!("wrapper-{index}"));
+        fs::create_dir(&wrapper).unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_validate-connected-build"))
+            .args(["stage-secret"])
+            .arg(&wrapper)
+            .arg(&source)
+            .arg(&repository)
+            .output()
+            .unwrap();
+        if output.status.success() {
+            assert_eq!(
+                fs::read(wrapper.join(".build-secrets/gascamp_read_token")).unwrap(),
+                b"outside-secret\n"
+            );
+        }
+    }
+    running.store(false, Ordering::Relaxed);
+    worker.join().unwrap();
 }
 
 #[test]
@@ -887,6 +1005,81 @@ fn receipt_pair_validator_rejects_every_cross_file_identity_mismatch() {
         valid.replacen(&"c".repeat(64), &"d".repeat(64), 1),
     ] {
         assert!(!run(&invalid).success());
+    }
+}
+
+#[test]
+fn connected_smoke_entrypoints_reject_missing_json_before_container_use() {
+    let fixture = tempfile::tempdir_in("/tmp").unwrap();
+    let reference = fixture.path().join("workspace-image-ref");
+    fs::write(
+        &reference,
+        format!("gascan-workspace:locked@sha256:{}\n", "a".repeat(64)),
+    )
+    .unwrap();
+    let container = fixture.path().join("container");
+    let calls = fixture.path().join("calls");
+    fs::write(&container, "#!/bin/sh\nprintf called >>\"$CALLS\"\nexit 99\n").unwrap();
+    fs::set_permissions(&container, fs::Permissions::from_mode(0o755)).unwrap();
+    for smoke in ["user-and-volumes.sh", "polyglot-smoke.sh", "gascamp-smoke.sh"] {
+        let output = Command::new("bash")
+            .arg(root().join("tests/image").join(smoke))
+            .env("GASCAN_IMAGE_REF_FILE", &reference)
+            .env("CONTAINER_BIN", &container)
+            .env("CALLS", &calls)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{smoke} accepted missing JSON");
+        assert!(!calls.exists(), "{smoke} used container before receipt validation");
+    }
+}
+
+#[test]
+fn connected_smoke_entrypoints_reject_every_receipt_identity_mismatch() {
+    let fixture = tempfile::tempdir_in("/tmp").unwrap();
+    let artifacts = fixture.path().join("artifacts");
+    fs::create_dir_all(artifacts.join("connected-workspace-context")).unwrap();
+    let manifest = artifacts.join("connected-workspace-context/context-manifest.tsv");
+    fs::write(&manifest, "fixture-context\n").unwrap();
+    let reference = artifacts.join("workspace-image-ref");
+    let receipt = artifacts.join("workspace-image-build.json");
+    let image_digest = format!("sha256:{}", "a".repeat(64));
+    let tag = "gascan-workspace:d4964500a3295a33";
+    let exact_reference = format!("{tag}@{image_digest}");
+    fs::write(&reference, format!("{exact_reference}\n")).unwrap();
+    let lock_digest = format!(
+        "{:x}",
+        Sha256::digest(fs::read(root().join("images/workspace/versions.lock")).unwrap())
+    );
+    let context_digest = format!("{:x}", Sha256::digest(b"fixture-context\n"));
+    let valid = format!(
+        "{{\"reference\":\"{exact_reference}\",\"tag\":\"{tag}\",\"platform\":\"linux/arm64\",\"lock_digest\":\"{lock_digest}\",\"context_digest\":\"{context_digest}\",\"image_digest\":\"{image_digest}\",\"status\":\"succeeded\"}}\n"
+    );
+    let invalid = [
+        valid.replacen(tag, "gascan-workspace:wrong", 1),
+        valid.replacen(&image_digest, &format!("sha256:{}", "b".repeat(64)), 1),
+        valid.replacen(&context_digest, &"c".repeat(64), 1),
+        valid.replacen(&lock_digest, &"d".repeat(64), 1),
+    ];
+    let container = fixture.path().join("container");
+    let calls = fixture.path().join("calls");
+    fs::write(&container, "#!/bin/sh\nprintf called >>\"$CALLS\"\nexit 99\n").unwrap();
+    fs::set_permissions(&container, fs::Permissions::from_mode(0o755)).unwrap();
+    for body in invalid {
+        fs::write(&receipt, body).unwrap();
+        for smoke in ["user-and-volumes.sh", "polyglot-smoke.sh", "gascamp-smoke.sh"] {
+            let _ = fs::remove_file(&calls);
+            let output = Command::new("bash")
+                .arg(root().join("tests/image").join(smoke))
+                .env("GASCAN_IMAGE_REF_FILE", &reference)
+                .env("GASCAN_IMAGE_ARTIFACTS", &artifacts)
+                .env("CONTAINER_BIN", &container)
+                .env("CALLS", &calls)
+                .output()
+                .unwrap();
+            assert!(!output.status.success(), "{smoke} accepted mismatched receipt");
+            assert!(!calls.exists(), "{smoke} used container before validation");
+        }
     }
 }
 
