@@ -1,5 +1,11 @@
 use sha2::{Digest, Sha256};
-use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::Path,
+    process::Command,
+    time::{Duration, Instant},
+};
 
 fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
@@ -49,6 +55,75 @@ fn wrapper_is_dynamic_unprivileged_and_helper_is_credential_blind() {
             "helper received credential path: {line}"
         );
     }
+}
+
+#[test]
+fn every_privileged_helper_operation_is_bounded() {
+    let script =
+        fs::read_to_string(root().join("scripts/build-connected-workspace-image.sh")).unwrap();
+    assert!(script.contains("run_bounded"));
+    for operation in [" create ", " path ", " finish "] {
+        for line in script
+            .lines()
+            .filter(|line| line.contains("snapshot_helper") && line.contains(operation))
+        {
+            assert!(
+                line.contains("run_bounded"),
+                "unbounded helper call: {line}"
+            );
+        }
+    }
+}
+
+#[test]
+fn hanging_snapshot_create_is_bounded_before_container_build() {
+    let fixture = tempfile::tempdir_in("/tmp").unwrap();
+    let repo = fixture.path().join("repo");
+    let scripts = repo.join("scripts");
+    let bin = fixture.path().join("bin");
+    fs::create_dir_all(&scripts).unwrap();
+    fs::create_dir_all(repo.join("images/workspace")).unwrap();
+    fs::create_dir_all(repo.join(".artifacts/connected-workspace-context")).unwrap();
+    fs::write(
+        scripts.join("build-connected-workspace-image.sh"),
+        include_str!("../build-connected-workspace-image.sh"),
+    )
+    .unwrap();
+    fs::write(repo.join("images/workspace/versions.lock"), format!("base_image = \"ubuntu@sha256:{}\"\nworkspace_build_mode = \"connected\"\nworkspace_tag = \"gascan-workspace:fixture\"\n[gascamp]\nrevision = \"f6b248c5926240856dbea83d1d2c5c90ea1c1456\"\n", "7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab")).unwrap();
+    fs::create_dir(&bin).unwrap();
+    fs::write(bin.join("cargo"), "#!/bin/sh\ncase \"$*\" in *snapshot-helper-identity*) printf 'hash\\t1\\t2\\n' ;; *) printf '%064d\\n' 0 ;; esac\n").unwrap();
+    fs::write(bin.join("sudo"), "#!/bin/sh\nsleep 30\n").unwrap();
+    fs::write(bin.join("container"), "#!/bin/sh\ntouch \"$CALLED\"\n").unwrap();
+    for executable in [
+        scripts.join("build-connected-workspace-image.sh"),
+        bin.join("cargo"),
+        bin.join("sudo"),
+        bin.join("container"),
+    ] {
+        fs::set_permissions(executable, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let secret = fixture.path().join("token");
+    fs::write(&secret, "synthetic\n").unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+    let called = fixture.path().join("called");
+    let started = Instant::now();
+    let output = Command::new("bash")
+        .arg(scripts.join("build-connected-workspace-image.sh"))
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("GASCAMP_READ_TOKEN_FILE", &secret)
+        .env("GASCAN_CONNECTED_TIMEOUT_SECONDS", "1")
+        .env("CALLED", &called)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "helper timeout was unbounded"
+    );
+    assert!(!called.exists());
 }
 
 #[test]

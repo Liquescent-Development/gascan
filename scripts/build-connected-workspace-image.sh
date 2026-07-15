@@ -10,6 +10,28 @@ reviewed_revision='f6b248c5926240856dbea83d1d2c5c90ea1c1456'
 die() { printf 'connected workspace image build: %s\n' "$*" >&2; exit 1; }
 run_tool() { cargo run --quiet --locked --offline --manifest-path "$root/scripts/Cargo.toml" --bin "$1" -- "${@:2}"; }
 top_value() { awk -F ' = ' -v key="$1" '$1 == key { gsub(/^"|"$/, "", $2); print $2; exit }' "$lock"; }
+operation_timeout=${GASCAN_CONNECTED_TIMEOUT_SECONDS:-300}
+case "$operation_timeout" in ''|*[!0-9]*) die 'timeout must be a positive integer' ;; esac
+test "$operation_timeout" -gt 0 || die 'timeout must be a positive integer'
+run_bounded() {
+  timeout_seconds=$1
+  shift
+  set -m
+  "$@" & command_pid=$!
+  (
+    sleep "$timeout_seconds"
+    if kill -0 "$command_pid" 2>/dev/null; then
+      kill -TERM -- "-$command_pid" 2>/dev/null || true
+      sleep 1
+      kill -KILL -- "-$command_pid" 2>/dev/null || true
+    fi
+  ) & watchdog_pid=$!
+  set +m
+  if wait "$command_pid"; then result=0; else result=$?; fi
+  kill -TERM -- "-$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
+  return "$result"
+}
 
 test -f "$lock" || die 'missing image lock'
 test "$(top_value workspace_build_mode)" = connected || die 'connected entrypoint requires exact connected lock'
@@ -34,12 +56,12 @@ wrapper=''
 cleanup() {
   status=$?
   test -z "$wrapper" || rm -rf "$wrapper" || status=1
-  test -z "$snapshot_receipt" || sudo -n "$snapshot_helper" --self "$helper_sha256" "$helper_device" "$helper_inode" finish "$snapshot_receipt" >/dev/null || status=1
+  test -z "$snapshot_receipt" || run_bounded "$operation_timeout" sudo -n "$snapshot_helper" --self "$helper_sha256" "$helper_device" "$helper_inode" finish "$snapshot_receipt" >/dev/null || status=1
   exit "$status"
 }
 trap cleanup EXIT INT TERM
-snapshot_receipt=$(sudo -n "$snapshot_helper" --self "$helper_sha256" "$helper_device" "$helper_inode" create "$context" "$context_manifest") || die 'snapshot creation failed'
-snapshot=$(sudo -n "$snapshot_helper" --self "$helper_sha256" "$helper_device" "$helper_inode" path "$snapshot_receipt") || die 'snapshot validation failed'
+snapshot_receipt=$(run_bounded "$operation_timeout" sudo -n "$snapshot_helper" --self "$helper_sha256" "$helper_device" "$helper_inode" create "$context" "$context_manifest") || die 'snapshot creation failed'
+snapshot=$(run_bounded "$operation_timeout" sudo -n "$snapshot_helper" --self "$helper_sha256" "$helper_device" "$helper_inode" path "$snapshot_receipt") || die 'snapshot validation failed'
 test -d "$snapshot" || die 'sealed public snapshot is unavailable'
 tmp_base=${TMPDIR:-/tmp}
 tmp_base=${tmp_base%/}
