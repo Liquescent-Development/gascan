@@ -45,16 +45,14 @@ tag=$(top_value workspace_tag)
 test -n "${GASCAMP_READ_TOKEN_FILE:-}" || die 'GASCAMP_READ_TOKEN_FILE is required'
 case "$GASCAMP_READ_TOKEN_FILE" in /*) ;; *) die 'secret path must be absolute' ;; esac
 case "$GASCAMP_READ_TOKEN_FILE" in "$root"|"$root"/*) die 'secret file must be outside the repository' ;; esac
-
-context_manifest=$(run_tool prepare-workspace-context --verify-connected "$root" "$lock" "$artifacts" "$context")
-[[ "$context_manifest" =~ ^[0-9a-f]{64}$ ]] || die 'context verifier returned an invalid digest'
 snapshot_helper='/Library/PrivilegedHelperTools/dev.gascan.snapshot-workspace-context'
-helper_identity=$(run_tool snapshot-helper-identity "$snapshot_helper") || die 'snapshot helper identity is unsafe'
-IFS=$'\t' read -r helper_sha256 helper_device helper_inode <<<"$helper_identity"
 snapshot_receipt=''
 wrapper=''
+helper_sha256=''
+helper_device=''
+helper_inode=''
 cleanup() {
-  status=$?
+  status=${1:-$?}
   test -z "$wrapper" || rm -rf "$wrapper" || status=1
   test -z "$snapshot_receipt" || run_bounded "$operation_timeout" sudo -n "$snapshot_helper" --self "$helper_sha256" "$helper_device" "$helper_inode" finish "$snapshot_receipt" >/dev/null || status=1
   exit "$status"
@@ -62,16 +60,22 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-snapshot_receipt=$(run_bounded "$operation_timeout" sudo -n "$snapshot_helper" --self "$helper_sha256" "$helper_device" "$helper_inode" create "$context" "$context_manifest") || die 'snapshot creation failed'
-snapshot=$(run_bounded "$operation_timeout" sudo -n "$snapshot_helper" --self "$helper_sha256" "$helper_device" "$helper_inode" path "$snapshot_receipt") || die 'snapshot validation failed'
-test -d "$snapshot" || die 'sealed public snapshot is unavailable'
 tmp_base=${TMPDIR:-/tmp}
 tmp_base=${tmp_base%/}
 wrapper=$(mktemp -d "$tmp_base/gascan-connected-build.XXXXXX")
 wrapper=$(cd "$wrapper" && pwd -P)
 chmod 0700 "$wrapper"
-secret_identity=$(run_tool validate-connected-build prepare-wrapper "$snapshot" "$wrapper" "$GASCAMP_READ_TOKEN_FILE" "$context_manifest") || die 'private wrapper preparation failed'
+secret_identity=$(run_tool validate-connected-build stage-secret "$wrapper" "$GASCAMP_READ_TOKEN_FILE" "$root") || die 'secret source is unsafe'
 [[ "$secret_identity" =~ ^[0-9a-f]{64}$ ]] || die 'secret identity is invalid'
+
+context_manifest=$(run_tool prepare-workspace-context --verify-connected "$root" "$lock" "$artifacts" "$context")
+[[ "$context_manifest" =~ ^[0-9a-f]{64}$ ]] || die 'context verifier returned an invalid digest'
+helper_identity=$(run_tool snapshot-helper-identity "$snapshot_helper") || die 'snapshot helper identity is unsafe'
+IFS=$'\t' read -r helper_sha256 helper_device helper_inode <<<"$helper_identity"
+snapshot_receipt=$(run_bounded "$operation_timeout" sudo -n "$snapshot_helper" --self "$helper_sha256" "$helper_device" "$helper_inode" create "$context" "$context_manifest") || die 'snapshot creation failed'
+snapshot=$(run_bounded "$operation_timeout" sudo -n "$snapshot_helper" --self "$helper_sha256" "$helper_device" "$helper_inode" path "$snapshot_receipt") || die 'snapshot validation failed'
+test -d "$snapshot" || die 'sealed public snapshot is unavailable'
+run_tool validate-connected-build copy-public "$snapshot" "$wrapper" "$context_manifest" || die 'public wrapper preparation failed'
 if tar -cf - --exclude='./.build-secrets' -C "$wrapper" . | tar -tf - | grep -q '^\./\.build-secrets'; then
   die 'secret entered transmitted context'
 fi
@@ -98,14 +102,17 @@ mkdir -p "$artifacts"
 ref_tmp=$(mktemp "$artifacts/.workspace-image-ref.XXXXXX")
 json_tmp=$(mktemp "$artifacts/.workspace-image-build.XXXXXX")
 cleanup_publication() {
-  rm -f "$ref_tmp" "$json_tmp"
-  cleanup
+  status=$?
+  rm -f "$ref_tmp" "$json_tmp" || status=1
+  cleanup "$status"
 }
 trap cleanup_publication EXIT
 printf '%s\n' "$reference" >"$ref_tmp"
 started_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+lock_digest=$(shasum -a 256 "$lock" | cut -d' ' -f1)
 printf '{"reference":"%s","tag":"%s","platform":"linux/arm64","lock_digest":"%s","context_digest":"%s","image_digest":"%s","apple_version":"%s","started_at":"%s","finished_at":"%s","status":"succeeded"}\n' \
-  "$reference" "$tag" "$(shasum -a 256 "$lock" | cut -d' ' -f1)" "$context_manifest" "$image_digest" "$(sw_vers -productVersion)" "$started_at" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >"$json_tmp"
+  "$reference" "$tag" "$lock_digest" "$context_manifest" "$image_digest" "$(sw_vers -productVersion)" "$started_at" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >"$json_tmp"
+run_tool validate-connected-build validate-receipt "$ref_tmp" "$json_tmp" "$lock_digest" "$context_manifest" || die 'build receipt pair is invalid'
 mv -f "$json_tmp" "$artifacts/workspace-image-build.json"
 mv -f "$ref_tmp" "$artifacts/workspace-image-ref"
 trap cleanup EXIT
