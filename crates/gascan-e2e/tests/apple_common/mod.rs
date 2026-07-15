@@ -34,8 +34,8 @@ pub type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 pub struct AppleE2e {
     gascan: OsString,
     gascand: OsString,
-    root: tempfile::TempDir,
-    runtime: tempfile::TempDir,
+    root: Option<tempfile::TempDir>,
+    runtime: Option<tempfile::TempDir>,
     root_path: std::path::PathBuf,
     runtime_root: std::path::PathBuf,
     id: SandboxId,
@@ -44,16 +44,29 @@ pub struct AppleE2e {
 
 impl AppleE2e {
     pub fn new(name: &str) -> TestResult<Self> {
+        let manifest =
+            std::env::var_os("GASCAN_E2E_CLEANUP_MANIFEST").map(std::path::PathBuf::from);
+        let session_root = std::env::var_os("GASCAN_E2E_SESSION_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        Self::new_scoped(name, session_root, manifest)
+    }
+
+    fn new_scoped(
+        name: &str,
+        session_root: std::path::PathBuf,
+        manifest: Option<std::path::PathBuf>,
+    ) -> TestResult<Self> {
         let gascan = std::env::var_os("CARGO_BIN_EXE_gascan-e2e-cli")
             .ok_or("workspace-built gascan binary is unavailable")?;
         let gascand = std::env::var_os("CARGO_BIN_EXE_gascan-e2e-daemon")
             .ok_or("workspace-built gascand binary is unavailable")?;
         let root = tempfile::Builder::new()
             .prefix("gascan-gate4-root-")
-            .tempdir_in("/tmp")?;
+            .tempdir_in(&session_root)?;
         let runtime = tempfile::Builder::new()
             .prefix("gascan-gate4-runtime-")
-            .tempdir_in("/tmp")?;
+            .tempdir_in(&session_root)?;
         let root_path = root.path().canonicalize()?;
         let runtime_root = runtime.path().canonicalize()?;
         let utf8_root = camino::Utf8Path::from_path(&root_path).ok_or("non-UTF-8 test root")?;
@@ -65,8 +78,7 @@ impl AppleE2e {
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_nanos()
         );
-        if let Some(manifest) = std::env::var_os("GASCAN_E2E_CLEANUP_MANIFEST") {
-            let manifest = std::path::PathBuf::from(manifest);
+        if let Some(manifest) = manifest {
             let record = serde_json::json!({
                 "version": 1,
                 "sandbox_id": id.as_str(),
@@ -82,16 +94,22 @@ impl AppleE2e {
                 "daemon_executable": std::path::PathBuf::from(&gascand).canonicalize()?,
                 "daemon_cli": std::path::PathBuf::from(&gascan).canonicalize()?,
                 "runtime_root": runtime_root,
+                "project_root": root_path,
+                "session_root": session_root.canonicalize()?,
             });
             let temporary = manifest.with_extension("tmp");
             std::fs::write(&temporary, serde_json::to_vec(&record)?)?;
+            std::fs::set_permissions(
+                &temporary,
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+            )?;
             std::fs::rename(temporary, manifest)?;
         }
         Ok(Self {
             gascan,
             gascand,
-            root,
-            runtime,
+            root: Some(root),
+            runtime: Some(runtime),
             root_path,
             runtime_root,
             id,
@@ -420,9 +438,21 @@ fn instance_matches(
 
 impl Drop for AppleE2e {
     fn drop(&mut self) {
-        let _ = self.terminate_daemon();
-        if let Err(error) = self.cleanup() {
+        let termination = self.terminate_daemon();
+        let cleanup = self.cleanup();
+        if let Err(error) = &termination {
+            eprintln!("Gate 4 daemon cleanup failed: {error}");
+        }
+        if let Err(error) = &cleanup {
             eprintln!("Gate 4 Rust cleanup failed: {error}");
+        }
+        if termination.is_err() || cleanup.is_err() {
+            if let Some(runtime) = self.runtime.take() {
+                let _ = runtime.keep();
+            }
+            if let Some(root) = self.root.take() {
+                let _ = root.keep();
+            }
         }
     }
 }
@@ -431,7 +461,8 @@ impl AppleE2e {
     fn terminate_daemon(&self) -> TestResult {
         let record = match self.validated_daemon_pid() {
             Ok(record) => record,
-            Err(_) => return Ok(()),
+            Err(_) if !self.runtime_root.join("daemon-instance.json").exists() => return Ok(()),
+            Err(error) => return Err(error),
         };
         let pid = rustix::process::Pid::from_raw(i32::try_from(record.pid)?)
             .ok_or("invalid daemon pid")?;
@@ -556,6 +587,7 @@ mod tests {
         let env = AppleE2e::new("corrupt-pid")?;
         std::fs::write(env.runtime_root.join("daemon-instance.json"), b"not-json")?;
         assert!(env.validated_daemon_pid().is_err());
+        std::fs::remove_file(env.runtime_root.join("daemon-instance.json"))?;
         Ok(())
     }
 
@@ -567,13 +599,15 @@ mod tests {
             "pid": std::process::id(),
             "owner_token": "somebody-else",
             "executable": executable,
-            "start_identity": process_field(std::process::id(), "lstart=")?,
+            "start_identity": "deliberately-reused-start",
+            "instance_token": "deliberately-reused-instance",
         });
         std::fs::write(
             env.runtime_root.join("daemon-instance.json"),
             serde_json::to_vec(&record)?,
         )?;
         assert!(env.validated_daemon_pid().is_err());
+        std::fs::remove_file(env.runtime_root.join("daemon-instance.json"))?;
         Ok(())
     }
 
@@ -616,6 +650,14 @@ mod tests {
         ));
         assert!(!instance_matches(
             &record,
+            "somebody-else",
+            &executable,
+            &executable,
+            "start-a",
+            &attestation
+        ));
+        assert!(!instance_matches(
+            &record,
             "owner",
             &executable,
             &executable,
@@ -642,5 +684,28 @@ mod tests {
             "start-a",
             &wrong_socket
         ));
+    }
+
+    #[test]
+    fn failed_attestation_preserves_runtime_project_and_manifest_evidence() -> TestResult {
+        let cleanup = tempfile::tempdir()?;
+        let session = cleanup.path().join("session-persist");
+        std::fs::create_dir(&session)?;
+        std::fs::set_permissions(
+            &session,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )?;
+        let manifest = cleanup.path().join("persist.json");
+        let env = AppleE2e::new_scoped("persist", session, Some(manifest.clone()))?;
+        let runtime = env.runtime_root.clone();
+        let project = env.root_path.clone();
+        std::fs::write(runtime.join("daemon-instance.json"), b"forged")?;
+        drop(env);
+        assert!(runtime.exists());
+        assert!(project.exists());
+        assert!(manifest.exists());
+        std::fs::remove_dir_all(runtime)?;
+        std::fs::remove_dir_all(project)?;
+        Ok(())
     }
 }

@@ -98,3 +98,31 @@ retention, bounded TERM-to-KILL escalation, and manifest retention after survivi
 
 Roadmap Gate 4 remains **not passed**: the mandatory live lifecycle is still stopped at the exact
 locked-image GHCR `401 Unauthorized`, and no Gate 4 evidence file is claimed.
+
+## Final cleanup trust-boundary review
+
+Stale manifests are now data only. The runner builds and canonicalizes the current workspace CLI
+once, creates a private runner-owned Gate 4 session root, and passes both the trusted executable
+and cleanup-root authority explicitly to every normal, trapped, and stale-manifest cleanup. The
+cleanup script verifies that the manifest's recorded CLI equals that trusted path but executes
+only the runner argument. A forged manifest CLI pointing at a marker program is rejected without
+executing the marker or contacting the runtime.
+
+The manifest, session, runtime, project, and instance-record paths must be canonical and remain
+under the private runner-owned cleanup/session hierarchy with exact expected names. Session,
+runtime, project, and cleanup roots must be mode 0700 and owned by the current uid. Path escapes
+are rejected before any container, process, or attestation command. Manifests and instance records
+are atomically published as current-uid mode 0600 files and cleanup revalidates those attributes.
+Successful validated cleanup
+removes only those exact scoped directories; residue retains them and the manifest.
+
+The Rust harness stores its temporary runtime and project roots in optional guards. Any daemon
+attestation/termination failure or resource-cleanup failure consumes those guards into persistent
+directories rather than deleting evidence during `Drop`. A focused regression corrupts the
+attestation record, verifies that runtime, project, and manifest all survive teardown, and then
+removes only the test-owned fixture. The external cleanup regression proves a TERM/KILL residue
+retains its manifest and runtime, then a later safe retry reports absence and removes the exact
+scoped evidence.
+
+These changes do not alter the Gate 4 result: the live lifecycle remains blocked by the locked
+image `401 Unauthorized`, and no live release-gate pass is claimed.

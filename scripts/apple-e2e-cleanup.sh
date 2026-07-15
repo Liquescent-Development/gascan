@@ -2,7 +2,33 @@
 set -eu
 
 manifest=${1:?cleanup manifest required}
+trusted_cli=${2:?trusted cleanup CLI required}
+trusted_root=${3:?trusted cleanup root required}
 test -f "$manifest" || exit 0
+
+canonical_existing() {
+  value=$(realpath "$1" 2>/dev/null) || return 1
+  test "$value" = "$1" || return 1
+  printf '%s\n' "$value"
+}
+owned_private_directory() {
+  directory=$1
+  if metadata=$(stat -f '%Lp %u' "$directory" 2>/dev/null); then :; else metadata=$(stat -c '%a %u' "$directory"); fi
+  test "$metadata" = "700 $(id -u)"
+}
+owned_private_file() {
+  file=$1
+  if metadata=$(stat -f '%Lp %u' "$file" 2>/dev/null); then :; else metadata=$(stat -c '%a %u' "$file"); fi
+  test "$metadata" = "600 $(id -u)"
+}
+
+trusted_cli=$(canonical_existing "$trusted_cli") || { printf 'refusing untrusted cleanup CLI\n' >&2; exit 65; }
+trusted_root=$(canonical_existing "$trusted_root") || { printf 'refusing untrusted cleanup root\n' >&2; exit 65; }
+owned_private_directory "$trusted_root" || { printf 'refusing unsafe cleanup root\n' >&2; exit 65; }
+manifest=$(canonical_existing "$manifest") || { printf 'refusing noncanonical cleanup manifest\n' >&2; exit 65; }
+owned_private_file "$manifest" || { printf 'refusing unsafe cleanup manifest\n' >&2; exit 65; }
+test "$(dirname "$manifest")" = "$trusted_root" || { printf 'refusing cleanup manifest path escape\n' >&2; exit 65; }
+case $(basename "$manifest") in *.json) ;; *) printf 'refusing cleanup manifest name\n' >&2; exit 65 ;; esac
 
 version=$(jq -er '.version' "$manifest")
 id=$(jq -er '.sandbox_id' "$manifest")
@@ -12,9 +38,25 @@ instance=$(jq -er '.daemon_instance_path' "$manifest")
 daemon_executable=$(jq -er '.daemon_executable' "$manifest")
 daemon_cli=$(jq -er '.daemon_cli' "$manifest")
 runtime_root=$(jq -er '.runtime_root' "$manifest")
+project_root=$(jq -er '.project_root' "$manifest")
+session_root=$(jq -er '.session_root' "$manifest")
 
 test "$version" = 1
 test "$managed" = gascan
+test "$daemon_cli" = "$trusted_cli" || { printf 'refusing cleanup CLI mismatch\n' >&2; exit 65; }
+session_root=$(canonical_existing "$session_root") || { printf 'refusing invalid session root\n' >&2; exit 65; }
+test "$(dirname "$session_root")" = "$trusted_root" || { printf 'refusing session path escape\n' >&2; exit 65; }
+case $(basename "$session_root") in session-*) ;; *) printf 'refusing session name\n' >&2; exit 65 ;; esac
+owned_private_directory "$session_root" || { printf 'refusing unsafe session root\n' >&2; exit 65; }
+runtime_root=$(canonical_existing "$runtime_root") || { printf 'refusing runtime path escape\n' >&2; exit 65; }
+project_root=$(canonical_existing "$project_root") || { printf 'refusing project path escape\n' >&2; exit 65; }
+test "$(dirname "$runtime_root")" = "$session_root" || { printf 'refusing runtime path escape\n' >&2; exit 65; }
+test "$(dirname "$project_root")" = "$session_root" || { printf 'refusing project path escape\n' >&2; exit 65; }
+case $(basename "$runtime_root") in gascan-gate4-runtime-*) ;; *) printf 'refusing runtime name\n' >&2; exit 65 ;; esac
+case $(basename "$project_root") in gascan-gate4-root-*) ;; *) printf 'refusing project name\n' >&2; exit 65 ;; esac
+owned_private_directory "$runtime_root" || { printf 'refusing unsafe runtime root\n' >&2; exit 65; }
+owned_private_directory "$project_root" || { printf 'refusing unsafe project root\n' >&2; exit 65; }
+test "$instance" = "$runtime_root/daemon-instance.json" || { printf 'refusing instance record path escape\n' >&2; exit 65; }
 case $id in
   *-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
   *) printf 'refusing invalid sandbox id in %s\n' "$manifest" >&2; exit 65 ;;
@@ -53,6 +95,7 @@ done
 
 residue=false
 if test -f "$instance"; then
+  owned_private_file "$instance" || { printf 'refusing unsafe instance record\n' >&2; exit 65; }
   record_token=$(jq -er '.owner_token' "$instance")
   pid=$(jq -er '.pid' "$instance")
   case $pid in ''|*[!0-9]*|0) printf 'refusing invalid daemon pid\n' >&2; exit 65 ;; esac
@@ -64,7 +107,7 @@ if test -f "$instance"; then
   observed_executable=${observed_command%% *}
   if test -n "$observed_executable"; then observed_executable=$(realpath "$observed_executable" 2>/dev/null || true); fi
   if test "$observed_executable" = "$daemon_executable"; then command_matches=true; else command_matches=false; fi
-  attestation=$(XDG_RUNTIME_DIR="$runtime_root" "$daemon_cli" daemon-attest 2>/dev/null || true)
+  attestation=$(XDG_RUNTIME_DIR="$runtime_root" "$trusted_cli" daemon-attest 2>/dev/null || true)
   attested_instance=$(printf '%s' "$attestation" | jq -er '.instance_token' 2>/dev/null || true)
   attested_pid=$(printf '%s' "$attestation" | jq -er '.pid' 2>/dev/null || true)
   attested_executable=$(printf '%s' "$attestation" | jq -er '.executable' 2>/dev/null || true)
@@ -83,7 +126,7 @@ if test -f "$instance"; then
       observed_command=$(ps -p "$pid" -o command= 2>/dev/null || true)
       observed_executable=${observed_command%% *}
       if test -n "$observed_executable"; then observed_executable=$(realpath "$observed_executable" 2>/dev/null || true); fi
-      attestation=$(XDG_RUNTIME_DIR="$runtime_root" "$daemon_cli" daemon-attest 2>/dev/null || true)
+      attestation=$(XDG_RUNTIME_DIR="$runtime_root" "$trusted_cli" daemon-attest 2>/dev/null || true)
       test "$observed_executable" = "$daemon_executable" &&
         test "$(printf '%s' "$attestation" | jq -er '.instance_token' 2>/dev/null || true)" = "$record_instance" &&
         test "$(printf '%s' "$attestation" | jq -er '.pid' 2>/dev/null || true)" = "$pid" ||
@@ -117,4 +160,6 @@ if test "$residue" = true; then
   printf 'Gate 4 cleanup residue remains for exact sandbox %s\n' "$id" >&2
   exit 1
 fi
+rm -rf -- "$runtime_root" "$project_root"
+rmdir "$session_root" 2>/dev/null || true
 rm -f "$manifest"

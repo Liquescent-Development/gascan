@@ -53,6 +53,11 @@ fn write_daemon_instance_record(identity: &DaemonIdentity) -> io::Result<()> {
     let bytes = serde_json::to_vec(&record).map_err(io::Error::other)?;
     let temporary = path.with_extension(format!("tmp-{}", identity.pid));
     std::fs::write(&temporary, bytes)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        &temporary,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )?;
     std::fs::rename(temporary, path)
 }
 
