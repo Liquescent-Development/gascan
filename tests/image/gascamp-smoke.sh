@@ -7,10 +7,13 @@ selector="$root/images/workspace/bin/select-gascamp"
 dockerfile="$root/images/workspace/Dockerfile"
 
 test -x "$selector"
-grep -Fq "printf '%s\\n' $revision > /out/REVISION" "$dockerfile"
-grep -Fq 'bundles/gascamp_source_vendor/tree/source/' "$dockerfile"
-grep -Fq 'bundles/gascamp_source_vendor/tree/vendor/' "$dockerfile"
-grep -Fq '/opt/gascan/mise/installs/rust/1.97.0/bin/cargo test --locked --offline --frozen' "$dockerfile"
+grep -Fq 'RUN --mount=type=secret,id=gascamp_read_token,required=true' "$dockerfile"
+grep -Fq 'git remote add origin https://github.com/Liquescent-Development/gascamp.git' "$dockerfile"
+grep -Fq 'fetch --depth=1 origin "$GASCAMP_REVISION"' "$dockerfile"
+grep -Fq 'mise exec -- cargo test --locked' "$dockerfile"
+grep -Fq 'mise exec -- cargo build --locked --release --bin camp' "$dockerfile"
+! grep -Fq 'bundles/gascamp_source_vendor' "$dockerfile"
+! grep -Fq '@github.com' "$dockerfile"
 grep -Fq '/opt/gascan/gascamp/bin/camp' "$dockerfile"
 grep -Fq 'campd' "$dockerfile"
 grep -Fq 'select-gascamp' "$dockerfile"
@@ -51,6 +54,8 @@ owned
 "$container_bin" exec "$name" bash -ceu '
   revision=f6b248c5926240856dbea83d1d2c5c90ea1c1456
   test "$(cat /opt/gascan/gascamp/REVISION)" = "$revision"
+  test "$(stat -c %U:%G /opt/gascan/gascamp/REVISION)" = root:root
+  test "$(stat -c %a /opt/gascan/gascamp/REVISION)" = 444
   /opt/gascan/gascamp/bin/camp --version
   test -L /opt/gascan/gascamp/bin/campd
   test "$(readlink /opt/gascan/gascamp/bin/campd)" = camp

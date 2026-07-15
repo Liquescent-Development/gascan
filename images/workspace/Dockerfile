@@ -1,4 +1,5 @@
 ARG BASE_IMAGE
+ARG GASCAMP_REVISION=f6b248c5926240856dbea83d1d2c5c90ea1c1456
 
 FROM ${BASE_IMAGE} AS workspace-base
 
@@ -29,20 +30,42 @@ RUN mise install --yes \
 
 FROM workspace-base AS gascamp-builder
 
-COPY bundles/gascamp_source_vendor/tree/source/ /tmp/gascamp/
-COPY bundles/gascamp_source_vendor/tree/vendor/ /tmp/gascamp/vendor/
-COPY --chmod=0444 bundles/gascamp_source_vendor/tree/.cargo/config.toml /tmp/gascamp/.cargo/config.toml
-
-RUN cd /tmp/gascamp \
-    && /opt/gascan/mise/installs/rust/1.97.0/bin/cargo test --locked --offline --frozen \
-    && /opt/gascan/mise/installs/rust/1.97.0/bin/cargo build --locked --offline --frozen --release --bin camp \
-    && strip target/release/camp \
-    && install -D -m 0555 target/release/camp /out/bin/camp \
-    && ln -s camp /out/bin/campd \
-    && printf '%s\n' f6b248c5926240856dbea83d1d2c5c90ea1c1456 > /out/REVISION \
-    && chmod -R a-w /out
+ARG GASCAMP_REVISION
+RUN --mount=type=secret,id=gascamp_read_token,required=true \
+    set -eu; \
+    case "$GASCAMP_REVISION" in *[!0-9a-f]*|'') exit 1;; esac; \
+    test "${#GASCAMP_REVISION}" -eq 40; \
+    install -d -m 0700 /tmp/gascamp; \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      'case "${1:-get}" in' \
+      '  get)' \
+      "    printf '%s\\n' 'username=x-access-token'" \
+      "    printf 'password=%s\\n' \"\$(cat /run/secrets/gascamp_read_token)\"" \
+      '    ;;' \
+      'esac' >/tmp/gascamp-credential; \
+    chmod 0700 /tmp/gascamp-credential; \
+    cd /tmp/gascamp; \
+    git init; \
+    git remote add origin https://github.com/Liquescent-Development/gascamp.git; \
+    git -c credential.helper=/tmp/gascamp-credential -c credential.useHttpPath=true \
+         fetch --depth=1 origin "$GASCAMP_REVISION"; \
+    git checkout --detach FETCH_HEAD; \
+    test "$(git rev-parse HEAD)" = "$GASCAMP_REVISION"; \
+    rm -rf .git /tmp/gascamp-credential; \
+    mise exec -- cargo test --locked; \
+    mise exec -- cargo build --locked --release --bin camp; \
+    strip target/release/camp; \
+    install -D -o root -g root -m 0555 target/release/camp /out/bin/camp; \
+    ln -s camp /out/bin/campd; \
+    printf '%s\n' "$GASCAMP_REVISION" >/out/REVISION; \
+    chown -R root:root /out; \
+    chmod 0444 /out/REVISION; \
+    chmod -R a-w /out
 
 FROM workspace-base
+
+ARG GASCAMP_REVISION
 
 COPY .artifacts/playwright-chromium-reviewed/chrome-linux /opt/gascan/chromium/chrome-linux
 COPY --chmod=0440 images/workspace/etc/sudoers.d/workspace /etc/sudoers.d/workspace
@@ -55,7 +78,7 @@ COPY --chmod=0444 images/workspace/tests/playwright-smoke.mjs /opt/gascan/tests/
 USER root
 RUN test -x /opt/gascan/gascamp/bin/camp \
     && test -L /opt/gascan/gascamp/bin/campd \
-    && test "$(cat /opt/gascan/gascamp/REVISION)" = f6b248c5926240856dbea83d1d2c5c90ea1c1456 \
+    && test "$(cat /opt/gascan/gascamp/REVISION)" = "$GASCAMP_REVISION" \
     && groupadd --gid 1000 workspace \
     && useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash workspace \
     && chown workspace:workspace /opt/gascan/mise \

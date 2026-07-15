@@ -50,6 +50,8 @@ fn dockerfile_installs_only_reviewed_system_tools_and_verified_artifacts() {
         "cmp /tmp/resolved-tool-versions.json /tmp/expected-tool-versions.json",
         "install -o root -g root -m 0444",
         "rm -rf /var/lib/apt/lists/*",
+        "RUN --mount=type=secret,id=gascamp_read_token,required=true",
+        "COPY --from=gascamp-builder /out /opt/gascan/gascamp",
     ] {
         assert!(
             dockerfile.contains(required),
@@ -62,6 +64,9 @@ fn dockerfile_installs_only_reviewed_system_tools_and_verified_artifacts() {
         "mise use",
         "npm install",
         "apt-get upgrade",
+        "bundles/gascamp_source_vendor",
+        "ARG GASCAMP_READ_TOKEN",
+        "ENV GASCAMP_READ_TOKEN",
     ] {
         assert!(
             !dockerfile.contains(forbidden),
