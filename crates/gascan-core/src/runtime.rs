@@ -296,6 +296,10 @@ pub struct ExecSession {
 }
 
 #[derive(Clone, Debug)]
+/// Backend-neutral cancellation ownership for a live [`ExecSession`].
+///
+/// Backends must arrange for cancellation to interrupt pending input/output
+/// work and release the underlying guest process. Cancellation is idempotent.
 pub struct ExecCancellation(tokio::sync::watch::Sender<bool>);
 
 impl ExecCancellation {
@@ -337,6 +341,8 @@ impl ExecSession {
         }
     }
 
+    /// Creates a live session whose explicit cancellation or drop interrupts
+    /// backend work through `cancellation`.
     pub fn live_cancellable(
         input: tokio::sync::mpsc::Sender<ExecInput>,
         output: tokio::sync::mpsc::Receiver<Result<ExecOutput, RuntimeError>>,
@@ -363,6 +369,7 @@ impl ExecSession {
         self.output.recv().await
     }
 
+    /// Requests backend cancellation. Calling this more than once is safe.
     pub fn cancel(&self) {
         if let Some(cancellation) = &self.cancellation {
             cancellation.cancel();

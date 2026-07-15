@@ -10,15 +10,19 @@ use gascan_core::runtime::{
 use gascan_core::sandbox::SandboxId;
 
 #[tokio::test]
-async fn cancellable_exec_session_signals_on_cancel_and_drop() {
+async fn cancellable_exec_session_cancel_is_idempotent() {
     let (input, _inputs) = tokio::sync::mpsc::channel(1);
     let (_outputs, output) = tokio::sync::mpsc::channel(1);
     let (cancellation, mut cancelled) = ExecCancellation::channel();
     let session = ExecSession::live_cancellable(input, output, cancellation);
     session.cancel();
+    session.cancel();
     cancelled.changed().await.unwrap();
     assert!(*cancelled.borrow());
+}
 
+#[tokio::test]
+async fn cancellable_exec_session_drop_signals_backend() {
     let (input, _inputs) = tokio::sync::mpsc::channel(1);
     let (_outputs, output) = tokio::sync::mpsc::channel(1);
     let (cancellation, mut cancelled) = ExecCancellation::channel();
