@@ -8,6 +8,7 @@ on:
       - images/workspace/bundles/ubuntu-packages.toml
       - images/workspace/versions.lock
       - scripts/produce-ubuntu-package-bundle.sh
+      - scripts/verify-ubuntu-debian-evidence.py
       - tests/image/system-tools.txt
 
 jobs:
@@ -32,14 +33,14 @@ jobs:
           if-no-files-found: error
           retention-days: 7
   publish-ubuntu-packages-linux-arm64:
-    needs: ubuntu-packages-linux-arm64
+    needs: validate-ubuntu-packages-linux-arm64
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: ubuntu-packages-linux-arm64
+          name: validated-ubuntu-packages-linux-arm64
           path: ${{ runner.temp }}/ubuntu-package-bundle
       - name: Revalidate and publish immutable release assets
         env:
@@ -57,6 +58,13 @@ jobs:
           test "$(wc -c <"$archive" | tr -d ' ')" = "$expected_size"
           test -s "$directory/ubuntu-packages-linux-arm64.manifest.tsv"
           test -s "$directory/ubuntu-packages-linux-arm64.provenance.env"
+          receipt="$directory/validation-receipt.tsv"
+          test "$(wc -l <"$receipt" | tr -d ' ')" = 6
+          test "$(cut -f1 "$receipt" | LC_ALL=C sort | tr '\n' ' ')" = "archive-sha256 archive-size inner-manifest-sha256 package-manifest-sha256 signed-evidence-sha256 workflow-commit "
+          test "$(awk -F '\t' '$1 == "workflow-commit" {print $2}' "$receipt")" = "$GITHUB_SHA"
+          test "$(awk -F '\t' '$1 == "archive-sha256" {print $2}' "$receipt")" = "$expected_sha"
+          test "$(awk -F '\t' '$1 == "archive-size" {print $2}' "$receipt")" = "$expected_size"
+          awk -F '\t' '$1 ~ /-sha256$/ || $1 == "workflow-commit" {if ($2 !~ /^[0-9a-f]{40,64}$/) exit 1}' "$receipt"
           if ! gh release view "$tag" >/dev/null 2>&1; then
             gh release create "$tag" --title "$tag" --notes "Immutable workspace bundle inputs for versions.lock SHA-256 $input_digest"
           fi
@@ -69,3 +77,47 @@ jobs:
               gh release upload "$tag" "$asset"
             fi
           done
+
+  validate-ubuntu-packages-linux-arm64:
+    needs: ubuntu-packages-linux-arm64
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ubuntu-packages-linux-arm64
+          path: ${{ runner.temp }}/ubuntu-package-bundle
+      - name: Install validation tooling
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends python3-apt zstd
+      - name: Validate archive, signed evidence, dependencies, and offline APT
+        run: |
+          set -euo pipefail
+          directory="$RUNNER_TEMP/ubuntu-package-bundle"
+          archive="$directory/ubuntu-packages-linux-arm64.tar.zst"
+          sha=$(tr -d '[:space:]' <"$archive.sha256")
+          size=$(tr -d '[:space:]' <"$archive.size")
+          test "$(sha256sum "$archive" | cut -d' ' -f1)" = "$sha"
+          test "$(wc -c <"$archive" | tr -d ' ')" = "$size"
+          lock="$RUNNER_TEMP/validation.lock"
+          {
+            printf '[workspace_bundles]\nmedia_type = "application/vnd.gascan.workspace-bundle.v1+tar.zstd"\nplatform = "linux/arm64"\npublication = "published"\n'
+            for record in ubuntu_packages mise_runtimes gascamp_source_vendor; do
+              printf '\n[workspace_bundles.%s]\nurl = "https://example.invalid/%s"\nsha256 = "%s"\nsize = %s\nmedia_type = "application/vnd.gascan.workspace-bundle.v1+tar.zstd"\nplatform = "linux/arm64"\n' "$record" "$record" "$sha" "$size"
+            done
+          } >"$lock"
+          cargo run --quiet --manifest-path scripts/Cargo.toml --bin validate-workspace-bundle -- "$lock" ubuntu_packages "$archive" "$RUNNER_TEMP/validated-evidence"
+          scripts/produce-ubuntu-package-bundle.sh --verify-evidence "$RUNNER_TEMP/validated-evidence"
+          inner=$(zstd --decompress --stdout "$archive" | tar -xOf - bundle-manifest.json | sha256sum | cut -d' ' -f1)
+          packages=$(sha256sum "$RUNNER_TEMP/validated-evidence/package-manifest.tsv" | cut -d' ' -f1)
+          signed=$(cd "$RUNNER_TEMP/validated-evidence" && find signed-releases signed-indexes -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)
+          printf 'archive-sha256\t%s\narchive-size\t%s\ninner-manifest-sha256\t%s\npackage-manifest-sha256\t%s\nsigned-evidence-sha256\t%s\nworkflow-commit\t%s\n' "$sha" "$size" "$inner" "$packages" "$signed" "$GITHUB_SHA" | LC_ALL=C sort >"$directory/validation-receipt.tsv"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: validated-ubuntu-packages-linux-arm64
+          path: ${{ runner.temp }}/ubuntu-package-bundle/*
+          if-no-files-found: error
+          retention-days: 7

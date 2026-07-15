@@ -41,6 +41,11 @@ impl Fixture {
         fs::write(root.join("dependency-edges.tsv"), "root\t2.0\tarm64\tDepends\t0\tdep:any (>= 1.0) [arm64] | virtual-dep\tdep\t1.0\tarm64\nroot\t2.0\tarm64\tPre-Depends\t0\tdep (= 1.0)\tdep\t1.0\tarm64\n").unwrap();
         fs::write(root.join("dependency-requirements.tsv"), "root\t2.0\tarm64\tDepends\t0\tdep:any (>= 1.0) [arm64] | virtual-dep\nroot\t2.0\tarm64\tPre-Depends\t0\tdep (= 1.0)\n").unwrap();
         fs::write(
+            root.join("offline-apt-check.tsv"),
+            "apt-simulation\tpassed\nselection-sha256\tfixture\n",
+        )
+        .unwrap();
+        fs::write(
             root.join("provenance.env"),
             format!("SNAPSHOT=2026-07-13T00:00:00Z\nBASE_IMAGE=ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab\nSIGNING_KEY_FINGERPRINT={FINGERPRINT}\nARCHITECTURE=arm64\nINSTALL_RECOMMENDS=false\n"),
         ).unwrap();
@@ -49,6 +54,25 @@ impl Fixture {
         let mut mode = fs::metadata(&gpgv).unwrap().permissions();
         mode.set_mode(0o755);
         fs::set_permissions(gpgv, mode).unwrap();
+        let verifier = root.join("debian-verifier");
+        fs::write(&verifier, r#"#!/usr/bin/env python3
+import lzma,sys
+from pathlib import Path
+root=Path(sys.argv[2])
+text=lzma.decompress(next((root/'signed-indexes').rglob('Packages.xz')).read_bytes()).decode()
+required=[]
+for relation in ('Depends','Pre-Depends'):
+ marker=relation+': '
+ for line in text.splitlines():
+  if line.startswith(marker): required.append('root\t2.0\tarm64\t'+relation+'\t0\t'+line[len(marker):])
+if (root/'dependency-requirements.tsv').read_text()!='\n'.join(sorted(required))+'\n': raise SystemExit('independent requirements mismatch')
+edges=(root/'dependency-edges.tsv').read_text().splitlines()
+if sorted('\t'.join(line.split('\t')[:6]) for line in edges)!=sorted(required): raise SystemExit('independent chosen edges mismatch')
+if (root/'offline-apt-check.tsv').read_text()!='apt-simulation\tpassed\nselection-sha256\tfixture\n': raise SystemExit('independent offline APT mismatch')
+"#).unwrap();
+        let mut mode = fs::metadata(&verifier).unwrap().permissions();
+        mode.set_mode(0o755);
+        fs::set_permissions(verifier, mode).unwrap();
         Self { temp }
     }
 
@@ -61,6 +85,10 @@ impl Fixture {
             .arg("--verify-evidence")
             .arg(self.root())
             .env("GPGV", self.root().join("gpgv"))
+            .env(
+                "DEBIAN_EVIDENCE_VERIFIER",
+                self.root().join("debian-verifier"),
+            )
             .output()
             .unwrap()
     }
@@ -345,9 +373,48 @@ fn workflow_separates_read_only_production_from_revalidated_publication() {
     assert!(workflow.contains("persist-credentials: false"));
     assert!(workflow.contains("needs: ubuntu-packages-linux-arm64"));
     assert!(workflow.contains("expected_sha="));
+    assert!(workflow.contains("validate-workspace-bundle"));
+    assert!(workflow.contains("validation-receipt.tsv"));
+    assert!(workflow.contains("needs: validate-ubuntu-packages-linux-arm64"));
     assert!(!workflow.contains("actions/checkout@v"));
     assert!(!workflow.contains("actions/upload-artifact@v"));
     assert!(!workflow.contains("actions/download-artifact@v"));
+}
+
+#[test]
+fn independent_recomputation_rejects_deleted_depends_and_pre_depends_selection() {
+    let fixture = Fixture::new();
+    for name in [
+        "package-manifest.tsv",
+        "dependency-requirements.tsv",
+        "dependency-edges.tsv",
+    ] {
+        let path = fixture.root().join(name);
+        let text = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                !line.starts_with("dep\t")
+                    && !line.contains("\tDepends\t")
+                    && !line.contains("\tPre-Depends\t")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(path, text).unwrap();
+    }
+    fixture.assert_rejected("independent");
+}
+
+#[test]
+fn independent_offline_apt_result_cannot_be_altered() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root().join("offline-apt-check.tsv"),
+        "apt-simulation\tforged\n",
+    )
+    .unwrap();
+    fixture.assert_rejected("offline APT");
 }
 
 fn rewrite_packages(fixture: &Fixture, path: &Path, text: String) {

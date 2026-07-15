@@ -117,9 +117,9 @@ roots=[line for line in (root/"roots.txt").read_text().splitlines() if line]
 if roots != sorted(set(roots)): fail("roots are not in canonical order")
 root_keys={key for key in selected if key[0] in roots}
 if {key[0] for key in root_keys} != set(roots): fail("missing root package")
-edge_lines=(root/"dependency-edges.tsv").read_text().splitlines()
+edge_lines=[line for line in (root/"dependency-edges.tsv").read_text().splitlines() if line]
 if edge_lines != sorted(set(edge_lines)): fail("dependency edges are not in canonical order")
-requirement_lines=(root/"dependency-requirements.tsv").read_text().splitlines()
+requirement_lines=[line for line in (root/"dependency-requirements.tsv").read_text().splitlines() if line]
 if requirement_lines != sorted(set(requirement_lines)): fail("dependency requirements are not in canonical order")
 requirements={tuple(line.split("\t")) for line in requirement_lines}
 if any(len(item) != 6 or item[3] not in ("Depends","Pre-Depends") or not item[5] for item in requirements): fail("invalid normalized dependency requirement")
@@ -141,6 +141,8 @@ while queue:
         if target not in reached: reached.add(target); queue.append(target)
 if reached != set(selected): fail("Recommends or unrelated package is outside chosen dependency closure")
 PY
+  debian_verifier=${DEBIAN_EVIDENCE_VERIFIER:-$root/scripts/verify-ubuntu-debian-evidence.py}
+  "$debian_verifier" --verify "$evidence"
 }
 
 if [[ ${1:-} == --verify-evidence ]]; then
@@ -227,46 +229,12 @@ for deb in sorted(archives.glob('*.deb')):
 manifest=['\t'.join((*key,item['Filename'],item['SHA256'],item['Size'])) for key,item in selected.items()]
 (evidence/'package-manifest.tsv').write_text('\n'.join(sorted(manifest))+'\n')
 
-by_name={}
-providers={}
-for key,item in selected.items():
-    by_name.setdefault(key[0],[]).append(key)
-    for group in apt_pkg.parse_depends(item.get('Provides',''),False,'arm64'):
-        for provided,version,operator in group: providers.setdefault(provided.split(':',1)[0],[]).append((key,version,operator))
-requirements=[]; edges=[]
-for source,item in sorted(selected.items()):
-    for relation in ('Depends','Pre-Depends'):
-        raw=item.get(relation,'')
-        if not raw: continue
-        parsed=apt_pkg.parse_depends(raw,False,'arm64')
-        expressions=[part.strip() for part in raw.split(',')]
-        if len(expressions)!=len(parsed): raise SystemExit('APT dependency normalization mismatch')
-        for index,(expression,alternatives) in enumerate(zip(expressions,parsed)):
-            requirement=(*source,relation,str(index),expression); requirements.append('\t'.join(requirement))
-            candidates=[]
-            for position,(target,required,operator) in enumerate(alternatives):
-                base=target.split(':',1)[0]
-                for key in by_name.get(base,[]):
-                    if not operator or apt_pkg.check_dep(key[1],operator,required): candidates.append((position,key))
-                for key,provided,provided_operator in providers.get(base,[]):
-                    version=provided or key[1]
-                    if not operator or apt_pkg.check_dep(version,operator,required): candidates.append((position,key))
-            if not candidates: raise SystemExit('APT selected closure has an unsatisfied dependency: '+expression)
-            chosen=min(candidates,key=lambda value:(value[0],value[1]))[1]
-            edges.append('\t'.join((*requirement,*chosen)))
-(evidence/'dependency-requirements.tsv').write_text('\n'.join(sorted(set(requirements)))+'\n')
-(evidence/'dependency-edges.tsv').write_text('\n'.join(sorted(set(edges)))+'\n')
 local=evidence/'repository/dists/gascan/main/binary-arm64'; local.mkdir(parents=True,exist_ok=True)
 paragraphs=[]
 for key,item in sorted(selected.items()): paragraphs.append('\n'.join(f'{field}: {value}' for field,value in item.items())+'\n')
 (local/'Packages').write_text('\n'.join(paragraphs))
 PY
-mkdir -p "$work/offline/lists/partial" "$work/offline/cache/archives/partial"
-printf 'deb [trusted=yes] file:%s gascan main\n' "$work/evidence/repository" >"$work/offline.sources.list"
-offline_opts=(-o "Dir::Etc::sourcelist=$work/offline.sources.list" -o Dir::Etc::sourceparts=- -o "Dir::State::lists=$work/offline/lists" -o "Dir::Cache=$work/offline/cache" -o Dir::State::status=/dev/null -o APT::Architecture=arm64 -o APT::Install-Recommends=false -o Acquire::Retries=0 -o Dir::Bin::Methods::http=/bin/false -o Dir::Bin::Methods::https=/bin/false)
-apt-get "${offline_opts[@]}" update
-mapfile -t exact_selection < <(awk -F '\t' '{if ($3 == "all") print $1"="$2; else print $1":"$3"="$2}' "$work/evidence/package-manifest.tsv")
-apt-get "${offline_opts[@]}" --simulate --no-download --no-install-recommends install "${exact_selection[@]}" >"$work/evidence/offline-apt-check.txt"
+"$root/scripts/verify-ubuntu-debian-evidence.py" --write "$work/evidence"
 cat >"$work/evidence/provenance.env" <<EOF
 SNAPSHOT=2026-07-13T00:00:00Z
 BASE_IMAGE=ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab
