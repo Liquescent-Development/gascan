@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{collections::BTreeMap, fs, path::Path, process::Command};
 
 use serde::Deserialize;
 
@@ -105,4 +105,19 @@ fn smoke_covers_every_runtime_native_tools_and_browser() {
             "missing smoke coverage: {required}"
         );
     }
+}
+
+#[test]
+fn polyglot_smoke_fails_closed_without_exact_built_reference() {
+    let missing = root().join(".artifacts/definitely-missing-polyglot-image-ref");
+    let output = Command::new("bash")
+        .arg(root().join("tests/image/polyglot-smoke.sh"))
+        .env("GASCAN_IMAGE_REF_FILE", &missing)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        format!("missing polyglot image reference: {}\n", missing.display())
+    );
 }

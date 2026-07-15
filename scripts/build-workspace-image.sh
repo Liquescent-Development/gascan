@@ -9,6 +9,7 @@ base_image='ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5
 die() { printf 'workspace image build: %s\n' "$*" >&2; exit 1; }
 test -f "$lock" || die "missing image lock"
 test -d "$context" || die "missing verified workspace context; run scripts/prefetch-workspace-image.sh"
+"$root/scripts/verify-workspace-image-inputs.sh"
 
 top_value() {
   awk -F ' = ' -v key="$1" '$1 == key { gsub(/^"|"$/, "", $2); print $2; exit }' "$lock"
@@ -46,6 +47,9 @@ container build \
   --build-arg "BASE_IMAGE=$base_image" \
   --build-arg "UBUNTU_SNAPSHOT=$ubuntu_snapshot" \
   "$build_context_snapshot"
+
+post_context_manifest=$(cargo run --quiet --locked --offline --manifest-path "$root/scripts/Cargo.toml" --bin prepare-workspace-context -- --verify "$root" "$lock" "$root/.artifacts" "$context")
+test "$post_context_manifest" = "$context_manifest" || die "workspace context changed during Apple build"
 
 sudo -n "$snapshot_helper" --self "$helper_sha256" "$helper_device" "$helper_inode" finish "$receipt"
 receipt=''

@@ -23,7 +23,32 @@ test -f "$reference_file" || {
 
 container_bin=${CONTAINER_BIN:-container}
 image=$(cat "$reference_file")
-"$container_bin" run --rm "$image" bash -ceu '
+owner_token=${GASCAN_TEST_OWNER_TOKEN:-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')}
+[[ "$owner_token" =~ ^[0-9a-f]{32}$ ]] || { printf 'invalid owner token\n' >&2; exit 1; }
+name="gascan-image-gascamp-test-$owner_token"
+cleaning=false
+owned() {
+  local inspect
+  inspect=$("$container_bin" inspect "$name") || return 1
+  printf '%s' "$inspect" | cargo run --quiet --locked --offline \
+    --manifest-path "$root/scripts/Cargo.toml" --bin validate-owned-container -- "$name" "$owner_token"
+}
+cleanup() {
+  $cleaning && return
+  cleaning=true
+  if owned; then
+    "$container_bin" stop --time 5 "$name" >/dev/null 2>&1 || true
+    owned && "$container_bin" delete "$name" >/dev/null 2>&1 || true
+  fi
+}
+on_signal() { trap - EXIT INT TERM; cleanup; exit 130; }
+trap cleanup EXIT
+trap on_signal INT TERM
+"$container_bin" create --name "$name" --label dev.gascan.test=true \
+  --label "dev.gascan.test.owner=$owner_token" "$image" >/dev/null
+owned
+"$container_bin" start "$name" >/dev/null
+"$container_bin" exec "$name" bash -ceu '
   revision=f6b248c5926240856dbea83d1d2c5c90ea1c1456
   test "$(cat /opt/gascan/gascamp/REVISION)" = "$revision"
   /opt/gascan/gascamp/bin/camp --version
