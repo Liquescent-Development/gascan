@@ -1,0 +1,50 @@
+name: Workspace bundles
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feature/provisioning]
+    paths:
+      - images/workspace/bundles/ubuntu-packages.toml
+      - images/workspace/versions.lock
+      - scripts/produce-ubuntu-package-bundle.sh
+      - tests/image/system-tools.txt
+
+permissions:
+  contents: write
+
+jobs:
+  ubuntu-packages-linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deterministic repository tooling
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends apt-utils zstd
+      - name: Produce Ubuntu package closure
+        run: scripts/produce-ubuntu-package-bundle.sh "$RUNNER_TEMP/ubuntu-package-bundle"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ubuntu-packages-linux-arm64
+          path: ${{ runner.temp }}/ubuntu-package-bundle/*
+          if-no-files-found: error
+          retention-days: 7
+      - name: Publish immutable release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          input_digest=$(sha256sum images/workspace/versions.lock | cut -d' ' -f1)
+          tag="workspace-bundles-$input_digest"
+          directory="$RUNNER_TEMP/ubuntu-package-bundle"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "$tag" --notes "Immutable workspace bundle inputs for versions.lock SHA-256 $input_digest"
+          fi
+          for asset in "$directory"/*; do
+            name=$(basename -- "$asset")
+            existing="$RUNNER_TEMP/existing-$name"
+            if gh release download "$tag" --pattern "$name" --output "$existing" 2>/dev/null; then
+              cmp --silent "$asset" "$existing" || { echo "release asset collision with different bytes: $name" >&2; exit 1; }
+            else
+              gh release upload "$tag" "$asset"
+            fi
+          done

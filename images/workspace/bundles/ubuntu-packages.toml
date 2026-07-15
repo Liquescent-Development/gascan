@@ -1,0 +1,17 @@
+format_version = 1
+snapshot = "2026-07-13T00:00:00Z"
+base_image = "ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab"
+architecture = "arm64"
+ubuntu_archive_key_fingerprint = "F6ECB3762474EDA9D21B7022871920D1991BC93C"
+install_recommends = false
+
+builder_packages = [
+  "build-essential",
+  "ca-certificates",
+  "git",
+  "libssl-dev",
+  "pkg-config",
+]
+
+system_packages_file = "tests/image/system-tools.txt"
+system_packages_sha256 = "9f64999efc0136ccbdc9a6697f2456c453e9c1c1b68b85f547067411df4164ae"
