@@ -6,6 +6,25 @@ die() {
   exit 1
 }
 
+active_command_pid=''
+active_watchdog_pid=''
+
+handle_signal() {
+  signal_status="$1"
+  trap - INT TERM HUP
+  if test -n "$active_command_pid"; then
+    kill -TERM -- "-$active_command_pid" 2>/dev/null || true
+    sleep 1
+    kill -KILL -- "-$active_command_pid" 2>/dev/null || true
+    wait "$active_command_pid" 2>/dev/null || true
+  fi
+  if test -n "$active_watchdog_pid"; then
+    kill -TERM -- "-$active_watchdog_pid" 2>/dev/null || true
+    wait "$active_watchdog_pid" 2>/dev/null || true
+  fi
+  exit "$signal_status"
+}
+
 run_bounded() {
   timeout_seconds="$1"
   shift
@@ -23,10 +42,14 @@ run_bounded() {
     fi
   ) &
   watchdog_pid=$!
+  active_command_pid="$command_pid"
+  active_watchdog_pid="$watchdog_pid"
   set +m
   if wait "$command_pid"; then result=0; else result=$?; fi
   kill -TERM -- "-$watchdog_pid" 2>/dev/null || true
   wait "$watchdog_pid" 2>/dev/null || true
+  active_command_pid=''
+  active_watchdog_pid=''
   return "$result"
 }
 
@@ -36,13 +59,21 @@ test "$operation_timeout" -gt 0 || die 'GASCAN_PROBE_TIMEOUT_SECONDS must be a p
 
 ownership_label='com.gascan.build-secret-probe'
 
-has_ownership() {
+container_has_ownership() {
   json_file="$1"
-  identity="$2"
-  marker="$3"
-  jq -e --arg identity "$identity" --arg label "$ownership_label" --arg marker "$marker" '
-    ([.. | scalars | select(. == $identity)] | length >= 1) and
-    ([.. | objects | (.labels? // .Labels? // empty) | objects | .[$label]? | select(. == $marker)] | length >= 1)
+  jq -e --arg name "$container_name" --arg label "$ownership_label" --arg marker "$ownership_marker" '
+    type == "array" and length == 1 and
+    .[0].id == $name and .[0].configuration.id == $name and
+    .[0].configuration.labels[$label] == $marker
+  ' "$json_file" >/dev/null
+}
+
+image_has_ownership() {
+  json_file="$1"
+  jq -e --arg reference "$tag" --arg id "$image_id" --arg label "$ownership_label" --arg marker "$ownership_marker" '
+    type == "array" and length == 1 and
+    .[0].id == $id and .[0].configuration.name == $reference and
+    ([.[0].variants[].config.config.Labels[$label]?] | any(. == $marker))
   ' "$json_file" >/dev/null
 }
 
@@ -78,18 +109,32 @@ inspect="$private_root/image-inspect.json"
 exported="$private_root/container.tar"
 built=false
 created=false
+image_id=''
 ownership_marker="$container_name"
 cleanup_container_inspect="$private_root/cleanup-container-inspect.json"
 cleanup_image_inspect="$private_root/cleanup-image-inspect.json"
 
+capture_bounded() {
+  capture_file="$1"
+  shift
+  capture_pipe="$capture_file.pipe"
+  mkfifo "$capture_pipe"
+  cat "$capture_pipe" >"$capture_file" &
+  capture_pid=$!
+  if run_bounded "$operation_timeout" "$@" >"$capture_pipe" 2>&1; then capture_status=0; else capture_status=$?; fi
+  wait "$capture_pid" 2>/dev/null || capture_status=1
+  rm -f "$capture_pipe"
+  return "$capture_status"
+}
+
 container_owned() {
-  run_bounded "$operation_timeout" container inspect "$container_name" | cat >"$cleanup_container_inspect" &&
-    has_ownership "$cleanup_container_inspect" "$container_name" "$ownership_marker"
+  capture_bounded "$cleanup_container_inspect" container inspect "$container_name" &&
+    container_has_ownership "$cleanup_container_inspect"
 }
 
 image_owned() {
-  run_bounded "$operation_timeout" container image inspect "$tag" | cat >"$cleanup_image_inspect" &&
-    has_ownership "$cleanup_image_inspect" "$tag" "$ownership_marker"
+  capture_bounded "$cleanup_image_inspect" container image inspect "$tag" &&
+    image_has_ownership "$cleanup_image_inspect"
 }
 
 cleanup() {
@@ -118,7 +163,10 @@ cleanup() {
   rm -rf "$private_root"
   exit "$status"
 }
-trap cleanup EXIT INT TERM HUP
+trap cleanup EXIT
+trap 'handle_signal 130' INT
+trap 'handle_signal 143' TERM
+trap 'handle_signal 129' HUP
 
 mkdir "$context/.build-secrets"
 chmod 0700 "$context/.build-secrets"
@@ -146,10 +194,9 @@ if grep -a -F -q -f "$secret" "$transmitted"; then
 fi
 
 expected_sha256="$(shasum -a 256 "$secret" | cut -d' ' -f1)"
-if ! run_bounded "$operation_timeout" container build --secret "id=gascamp_read_token,src=$staged_secret" \
+if ! capture_bounded "$transcript" container build --secret "id=gascamp_read_token,src=$staged_secret" \
   --build-arg "EXPECTED_SECRET_SHA256=$expected_sha256" \
-  --label "$ownership_label=$ownership_marker" --tag "$tag" "$context" \
-  2>&1 | cat >"$transcript"; then
+  --label "$ownership_label=$ownership_marker" --tag "$tag" "$context"; then
   if grep -a -F -q -f "$secret" "$transcript"; then
     die 'build failed; transcript withheld because it contains the synthetic secret'
   fi
@@ -159,13 +206,15 @@ if ! run_bounded "$operation_timeout" container build --secret "id=gascamp_read_
 fi
 built=true
 
-if run_bounded "$operation_timeout" container image inspect --help 2>&1 | grep -q -- '--format'; then
-  run_bounded "$operation_timeout" container image inspect --format json "$tag" | cat >"$inspect"
+inspect_help="$private_root/image-inspect-help"
+if capture_bounded "$inspect_help" container image inspect --help && grep -q -- '--format' "$inspect_help"; then
+  capture_bounded "$inspect" container image inspect --format json "$tag"
 else
-  run_bounded "$operation_timeout" container image inspect "$tag" | cat >"$inspect"
+  capture_bounded "$inspect" container image inspect "$tag"
 fi
 jq -e 'type == "object" or type == "array"' "$inspect" >/dev/null || die 'image inspect was not structured JSON'
-has_ownership "$inspect" "$tag" "$ownership_marker" || die 'built image ownership mismatch'
+image_id="$(jq -er 'select(type == "array" and length == 1) | .[0].id' "$inspect")" || die 'built image ID missing'
+image_has_ownership "$inspect" || die 'built image ownership mismatch'
 
 run_bounded "$operation_timeout" container create --name "$container_name" \
   --label "$ownership_label=$ownership_marker" "$tag" /bin/sh -c 'sleep 30' >/dev/null

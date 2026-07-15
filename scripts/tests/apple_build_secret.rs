@@ -1,4 +1,4 @@
-use std::{fs, os::unix::fs::{symlink, PermissionsExt}, path::Path, process::Command, time::{Duration, Instant}};
+use std::{fs, os::unix::fs::{symlink, PermissionsExt}, path::Path, process::Command, thread, time::{Duration, Instant}};
 
 const SECRET: &str = "synthetic-apple-build-secret-0011223344556677";
 
@@ -87,8 +87,8 @@ case "$1 $2" in
   "image inspect")
     test "${3:-}" = --help && exit 0
     count=0; test ! -f "$INSPECT_COUNT" || count=$(cat "$INSPECT_COUNT"); count=$((count + 1)); printf '%s' "$count" >"$INSPECT_COUNT"
-    marker=$(cat "$MARKER"); test "$count" = 1 || marker=foreign
-    printf '{"id":"sha256:fixture","name":"%s","config":{"Labels":{"com.gascan.build-secret-probe":"%s"}}}\n' "$(cat "$TAG")" "$marker"
+    name=$(cat "$TAG"); test "$count" = 1 || name=foreign:image
+    printf '[{"id":"sha256:fixture","configuration":{"name":"%s"},"variants":[{"config":{"config":{"Labels":{"com.gascan.build-secret-probe":"%s"}}}}]}]\n' "$name" "$(cat "$MARKER")"
     ;;
   "image delete") touch "$IMAGE_DELETED" ;;
   "build --secret")
@@ -105,7 +105,7 @@ case "$1 $2" in
     printf '%s' "$3" >"$CONTAINER_NAME"
     ;;
   "inspect "*)
-    printf '{"id":"%s","labels":{"com.gascan.build-secret-probe":"foreign"}}\n' "$(cat "$CONTAINER_NAME")"
+    printf '[{"id":"foreign-container","configuration":{"id":"foreign-container","labels":{"com.gascan.build-secret-probe":"%s"}}}]\n' "$(cat "$MARKER")"
     ;;
   "export "*) printf '%s' clean >"$5" ;;
   "delete "*) touch "$CONTAINER_DELETED" ;;
@@ -131,6 +131,67 @@ esac
     assert!(!output.status.success(), "ownership mismatch unexpectedly passed");
     assert!(!fixture.path().join("container-deleted").exists(), "foreign container was deleted");
     assert!(!fixture.path().join("image-deleted").exists(), "cleanup continued after ownership mismatch");
+}
+
+fn assert_signal_during_active_cli_is_bounded_reaped_and_non_mutating(signal: &str) {
+    let fixture = tempfile::tempdir_in("/tmp").unwrap();
+    let bin = fixture.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let fake = bin.join("container");
+    fs::write(&fake, r#"#!/bin/sh
+set -eu
+case "$1" in
+  build)
+    printf '%s' "$$" >"$CHILD_PID"
+    trap 'exit 143' TERM INT
+    while :; do sleep 1; done
+    ;;
+  delete) touch "$MUTATED" ;;
+  image) test "$2" != delete || touch "$MUTATED" ;;
+esac
+"#).unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let secret = fixture.path().join("secret");
+    fs::write(&secret, format!("{SECRET}\n")).unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+    let child_pid = fixture.path().join("child-pid");
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut probe = Command::new("bash")
+        .arg(repository_root().join("scripts/probe-apple-build-secret.sh"))
+        .env("PATH", path)
+        .env("TMPDIR", fixture.path())
+        .env("GASCAN_TEST_SECRET_FILE", &secret)
+        .env("GASCAN_PROBE_TIMEOUT_SECONDS", "10")
+        .env("CHILD_PID", &child_pid)
+        .env("MUTATED", fixture.path().join("mutated"))
+        .spawn().unwrap();
+    for _ in 0..100 {
+        if child_pid.exists() { break; }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(child_pid.exists(), "fake CLI did not start");
+    let fake_pid: i32 = fs::read_to_string(&child_pid).unwrap().parse().unwrap();
+    let started = Instant::now();
+    assert!(Command::new("kill").args([signal, &probe.id().to_string()]).status().unwrap().success());
+    let status = probe.wait().unwrap();
+    assert!(!status.success(), "{signal} returned success");
+    assert!(started.elapsed() < Duration::from_secs(3), "{signal} cleanup was not bounded");
+    thread::sleep(Duration::from_millis(100));
+    assert!(!Command::new("kill").args(["-0", &fake_pid.to_string()]).status().unwrap().success(), "fake CLI child survived {signal}");
+    assert!(!fixture.path().join("mutated").exists(), "resource mutation occurred after {signal}");
+    assert!(fs::read_dir(fixture.path()).unwrap().all(|entry| {
+        !entry.unwrap().file_name().to_string_lossy().starts_with("gascan-build-secret-probe.")
+    }), "private context survived {signal}");
+}
+
+#[test]
+fn term_during_active_cli_is_bounded_reaped_and_non_mutating() {
+    assert_signal_during_active_cli_is_bounded_reaped_and_non_mutating("-TERM");
+}
+
+#[test]
+fn int_during_active_cli_is_bounded_reaped_and_non_mutating() {
+    assert_signal_during_active_cli_is_bounded_reaped_and_non_mutating("-INT");
 }
 
 #[test]
@@ -172,7 +233,7 @@ case "$1" in
     ;;
   image)
     case "$2" in
-      inspect) printf '{"id":"sha256:fixture","name":"%s","config":{"Labels":{"com.gascan.build-secret-probe":"%s"}},"history":[]}' "$(cat "$TAG_PATH")" "$(cat "$MARKER_PATH")" ;;
+      inspect) printf '[{"id":"sha256:fixture","configuration":{"name":"%s"},"variants":[{"config":{"config":{"Labels":{"com.gascan.build-secret-probe":"%s"}},"history":[]}}]}]' "$(cat "$TAG_PATH")" "$(cat "$MARKER_PATH")" ;;
       delete) : ;;
     esac
     ;;
@@ -183,7 +244,7 @@ case "$1" in
       previous="$argument"
     done
     ;;
-  inspect) printf '{"id":"%s","labels":{"com.gascan.build-secret-probe":"%s"}}' "$(cat "$CONTAINER_NAME_PATH")" "$(cat "$MARKER_PATH")" ;;
+  inspect) printf '[{"id":"%s","configuration":{"id":"%s","labels":{"com.gascan.build-secret-probe":"%s"}}}]' "$(cat "$CONTAINER_NAME_PATH")" "$(cat "$CONTAINER_NAME_PATH")" "$(cat "$MARKER_PATH")" ;;
   export)
     test "$3" = --output
     printf '%s\n' synthetic-export-without-token >"$4"
