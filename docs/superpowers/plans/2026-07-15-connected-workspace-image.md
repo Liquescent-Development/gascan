@@ -2,6 +2,17 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Roadmap role:** This is a focused Plan 4 continuation addendum, not a new
+> product plan, phase, or parallel roadmap. It replaces the offline-only image
+> assumption inside the already-approved Workspace Environment and Release
+> Plan after the 2026-07-15 firewall diagnosis. It must be read with that plan
+> and the coordinated roadmap.
+
+> **Execution state:** Durable planning only. No task in this document has
+> started. The user selected subagent-driven execution for the next session
+> that explicitly resumes implementation; do not infer authorization to begin
+> merely from discovering this file.
+
 **Goal:** Build and smoke-test the locked Gas Can `linux/arm64` workspace image with Apple Containerization 1.1 using connected public acquisition and a non-persistent private Gascamp build secret, then hand its exact digest-qualified reference to Roadmap Gate 4.
 
 **Architecture:** Keep the reviewed offline-bundle path as a deferred, separate entrypoint, but make the MVP entrypoint a connected build. The host verifies small immutable artifacts and the base image; the Dockerfile uses signed Ubuntu repositories, exact mise configuration, locked runtime versions, and a BuildKit secret mount for the pinned private Gascamp revision. A live image gate accepts only the reference emitted by structured image inspection and runs all existing owner-scoped smoke tests before producing evidence.

@@ -6,6 +6,10 @@ This is the canonical restart document for a fresh agent or session. Read it
 with `docs/superpowers/plans/2026-07-13-gascan-macos-roadmap.md` before changing
 code. Verify branch heads rather than assuming the paths below still exist.
 
+The 2026-07-15 documentation work made current state durable; it did not start
+a new implementation effort. The connected workspace image document is a
+focused continuation addendum to existing Plan 4. No addendum task has begun.
+
 ## Product Boundary
 
 Gas Can is a secure sandbox for agentic coding. On macOS it uses Apple's
@@ -118,7 +122,9 @@ Do not encode the operator DNS IP into Gas Can product policy.
 ## Current Unfinished Work
 
 1. Execute `docs/superpowers/plans/2026-07-15-connected-workspace-image.md`
-   task by task with independent review gates.
+   task by task with independent review gates only after a future session
+   explicitly resumes implementation. The user has preselected subagent-driven
+   execution; begin with Task 1 and do not re-plan the program.
 2. Convert the image path from mandatory offline bundles to connected locked
    acquisition while preserving all reviewed image contracts.
 3. Select and prove the private Gascamp credential boundary.
@@ -153,6 +159,11 @@ Then read, in order:
 3. `docs/superpowers/specs/2026-07-15-connected-mvp-build-design.md`;
 4. `docs/superpowers/plans/2026-07-15-connected-workspace-image.md`;
 5. the relevant task plan before modifying its branch.
+
+If the fresh session is asked to continue implementation, use
+`superpowers:subagent-driven-development` on Task 1 of the connected-build Plan
+4 addendum. If the fresh session is asked only for status, report from this
+document and do not dispatch implementation agents.
 
 Before claiming any gate, run the roadmap's program-level verification and the
 gate-specific live suite. Never infer Gate 4 from harness tests or Gate 5 from
