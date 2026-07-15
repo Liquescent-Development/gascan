@@ -87,9 +87,22 @@ async fn mixed_list_classifies_owned_foreign_and_mismatched_resources() {
 }
 
 #[tokio::test]
+async fn foreign_container_names_do_not_have_to_be_valid_sandbox_ids() {
+    let resources = inspector(output(
+        br#"[{"configuration":{"id":"bleh","labels":{}},"status":{"state":"stopped"}}]"#,
+    ))
+    .list_resources()
+    .await
+    .unwrap();
+    assert_eq!(resources.len(), 1);
+    assert_eq!(resources[0].name(), "bleh");
+    assert_eq!(resources[0].sandbox_id(), None);
+    assert_eq!(resources[0].ownership(), ResourceOwnership::Foreign);
+}
+
+#[tokio::test]
 async fn malformed_required_fields_and_unknown_states_fail_closed() {
     for bytes in [
-        br#"[{"configuration":{"id":"bad"},"status":{"state":"running"}}]"#.as_slice(),
         br#"[{"configuration":{"id":"code-a1b2c3d4e5f6"},"status":{}}]"#.as_slice(),
         br#"[{"configuration":{"id":"code-a1b2c3d4e5f6"},"status":{"state":"paused"}}]"#.as_slice(),
     ] {

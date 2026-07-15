@@ -72,11 +72,12 @@ where
         parse_records("container list", &output.stdout)?
             .into_iter()
             .map(|record| {
-                let id = parse_id("container list", record.configuration.id)?;
-                map_state(&id, &record.status.state)?;
-                let ownership = classify_ownership(&id, &record.configuration.labels);
-                let identity = ResourceIdentity::new(ResourceKind::Container, id.to_string())?;
-                Ok(RuntimeResource::discovered(identity, Some(id), ownership))
+                let name = record.configuration.id;
+                map_state(&name, &record.status.state)?;
+                let (sandbox_id, ownership) =
+                    classify_inventory_ownership(&name, &record.configuration.labels);
+                let identity = ResourceIdentity::new(ResourceKind::Container, name)?;
+                Ok(RuntimeResource::discovered(identity, sandbox_id, ownership))
             })
             .collect()
     }
@@ -108,7 +109,7 @@ fn parse_id(operation: &str, id: String) -> Result<SandboxId, RuntimeError> {
     SandboxId::try_from(id).map_err(|error| invalid_output(operation, error.to_string()))
 }
 
-fn map_state(id: &SandboxId, state: &str) -> Result<ContainerState, RuntimeError> {
+fn map_state(id: impl std::fmt::Display, state: &str) -> Result<ContainerState, RuntimeError> {
     match state {
         "creating" => Ok(ContainerState::Creating),
         "running" => Ok(ContainerState::Running),
@@ -120,16 +121,23 @@ fn map_state(id: &SandboxId, state: &str) -> Result<ContainerState, RuntimeError
     }
 }
 
-fn classify_ownership(id: &SandboxId, labels: &BTreeMap<String, String>) -> ResourceOwnership {
+fn classify_inventory_ownership(
+    name: &str,
+    labels: &BTreeMap<String, String>,
+) -> (Option<SandboxId>, ResourceOwnership) {
     let manager = labels.get(MANAGED_BY_LABEL).map(String::as_str);
     let sandbox = labels.get(SANDBOX_ID_LABEL).map(String::as_str);
     match (manager, sandbox) {
-        (Some(MANAGED_BY_GASCAN), Some(annotation)) if annotation == id.as_str() => {
-            ResourceOwnership::GasCanOwned
+        (Some(MANAGED_BY_GASCAN), Some(annotation)) => {
+            match SandboxId::try_from(annotation.to_owned()) {
+                Ok(id) if id.as_str() == name => (Some(id), ResourceOwnership::GasCanOwned),
+                Ok(id) => (Some(id), ResourceOwnership::Mismatched),
+                Err(_) => (None, ResourceOwnership::Mismatched),
+            }
         }
-        (None, None) => ResourceOwnership::Foreign,
-        (Some(manager), _) if manager != MANAGED_BY_GASCAN => ResourceOwnership::Foreign,
-        _ => ResourceOwnership::Mismatched,
+        (None, None) => (None, ResourceOwnership::Foreign),
+        (Some(manager), _) if manager != MANAGED_BY_GASCAN => (None, ResourceOwnership::Foreign),
+        _ => (None, ResourceOwnership::Mismatched),
     }
 }
 

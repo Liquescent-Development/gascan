@@ -39,8 +39,8 @@ pub use socket::{OwnedSocket, PeerUid, PeerUidMismatch, SocketPaths, validate_pe
 
 pub use reconcile::{ReconcileFinding, ReconcileReport};
 pub use service::{
-    NoopProvisioner, Operation, ProvisionRequest, ProvisionResolution, Provisioner, SandboxService,
-    ServiceError, UpRequest,
+    DoctorCompleter, DoctorState, NoopProvisioner, Operation, ProvisionRequest,
+    ProvisionResolution, Provisioner, SandboxService, ServiceError, UpRequest,
 };
 pub use store::{
     ActualState, DesiredState, ImageResolution, OperationEvent, OperationId, OperationKind,

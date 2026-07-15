@@ -25,10 +25,10 @@ impl AppleE2e {
             .ok_or("workspace-built gascand binary is unavailable")?;
         let root = tempfile::Builder::new()
             .prefix("gascan-gate4-root-")
-            .tempdir()?;
+            .tempdir_in("/tmp")?;
         let runtime = tempfile::Builder::new()
             .prefix("gascan-gate4-runtime-")
-            .tempdir()?;
+            .tempdir_in("/tmp")?;
         let root_path = root.path().canonicalize()?;
         let runtime_root = runtime.path().canonicalize()?;
         let utf8_root = camino::Utf8Path::from_path(&root_path).ok_or("non-UTF-8 test root")?;
@@ -99,13 +99,17 @@ impl AppleE2e {
                 .args(["-0", daemon_pid.trim()])
                 .status()
                 .is_ok_and(|status| status.success());
+            let socket = self.runtime_root.join("gascan/gascand.sock");
+            let raw_socket_connects = std::os::unix::net::UnixStream::connect(&socket).is_ok();
             return Err(format!(
-                "gascan failed with {:?}: stdout={} stderr={} daemon_pid={} daemon_alive={} daemon_stderr={}",
+                "gascan failed with {:?}: stdout={} stderr={} daemon_pid={} daemon_alive={} socket={} raw_socket_connects={} daemon_stderr={}",
                 output.status.code(),
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr),
                 daemon_pid.trim(),
                 daemon_alive,
+                socket.display(),
+                raw_socket_connects,
                 daemon_stderr
             )
             .into());

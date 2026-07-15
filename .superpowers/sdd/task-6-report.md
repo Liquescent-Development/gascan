@@ -13,30 +13,37 @@ exact `dev.gascan.sandbox-id` label.
 ## Live evidence (sanitized)
 
 `./scripts/run-apple-e2e.sh apple_lifecycle` passed host preflight on macOS 26 arm64 with the
-signed-off Apple Container 1.1.0 release revision, then failed on the initial exact `gascan up`:
+signed-off Apple Container 1.1.0 release revision. Initial transport failures were traced to
+the harness canonicalizing its runtime root to a pathname longer than macOS `SUN_LEN`; the
+daemon could create that path through dirfd-relative bind, but clients failed locally with
+`InvalidInput: path must be shorter than SUN_LEN`. Unique test roots now live under short
+`/tmp` paths.
+
+The next live failure exposed production inventory incorrectly parsing every foreign Apple
+container name as a Gas Can `SandboxId`. A regression now permits arbitrary foreign names while
+still classifying invalid or inconsistent Gas Can labels as mismatched.
+
+After those fixes, the initial exact `gascan up` reached the locked image pull and failed:
 
 ```text
-daemon readiness exhausted after 182 probes in 5.0s
-daemon_alive=true
-daemon_stderr=<empty>
+HTTP request to ghcr.io/.../workspace/manifests/sha256:7c45... failed: 401 Unauthorized
 ```
 
-This reproduced three times. Temporary phase diagnostics established that the daemon remains
-alive while collecting production doctor evidence before binding/serving its socket. A
-test-first bounded-timeout experiment (6-second delayed daemon) passed unit regressions at 15
-and 30 seconds, but the real host still exhausted 30 seconds. That disproved a safe timeout-only
-fix; the experiment and temporary diagnostics were reverted.
+No substitute image was used. The final live harness deliberately starts from no daemon.
 
-The required production correction is to decouple transport readiness from slow Apple doctor
-probes (serve promptly and collect/cache bounded doctor evidence asynchronously or on demand).
-The final live harness deliberately starts from no daemon and does not prestart or substitute a
-fake backend.
+The daemon now uses one shared pending `DoctorState`: handshake is independent, while Doctor,
+up, and apply converge on the same bounded background result and fail closed if collection is
+abandoned. Deterministic convergence/failure tests cover the state.
+
+Review-requested structured daemon PID ownership records, durable external cleanup manifests,
+bounded child/PTY teardown, and the remaining live signal/host-mutation/no-op scenarios are not
+complete. They must be finished before Gate 4 can pass even after image access is available.
 
 ## Verification run
 
 - Baseline `cargo test -p gascan-e2e`: pass before Task 6 changes.
 - New ignored test binaries: compile successfully with `--no-run`.
-- Live lifecycle: blocked at initial daemon autostart as above; no lifecycle assertions after
-  `up` were reached.
+- Live lifecycle: plain autostart and runtime inventory reached the exact locked image pull; image
+  access is blocked by GHCR authorization, so no later lifecycle assertion was reached.
 - Recovery, full runner, global fmt/clippy/test gates: not claimed as Gate 4 evidence because
   the first mandatory live path is blocked.

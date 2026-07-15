@@ -115,7 +115,55 @@ pub struct SandboxService<B: RuntimeBackend> {
     store: Store,
     provisioner: Arc<dyn Provisioner>,
     locks: Mutex<HashMap<SandboxId, Weak<AsyncMutex<()>>>>,
-    doctor: DoctorReport,
+    doctor: DoctorState,
+}
+
+#[derive(Clone)]
+pub struct DoctorState {
+    receiver: tokio::sync::watch::Receiver<Option<DoctorReport>>,
+}
+
+pub struct DoctorCompleter {
+    sender: tokio::sync::watch::Sender<Option<DoctorReport>>,
+}
+
+impl DoctorState {
+    pub fn ready(report: DoctorReport) -> Self {
+        let (_sender, receiver) = tokio::sync::watch::channel(Some(report));
+        Self { receiver }
+    }
+
+    pub fn pending() -> (Self, DoctorCompleter) {
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        (Self { receiver }, DoctorCompleter { sender })
+    }
+
+    pub async fn report(&self) -> DoctorReport {
+        let mut receiver = self.receiver.clone();
+        let collected = tokio::time::timeout(std::time::Duration::from_secs(60), async move {
+            loop {
+                if let Some(report) = receiver.borrow().clone() {
+                    return Some(report);
+                }
+                if receiver.changed().await.is_err() {
+                    return None;
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten();
+        collected.unwrap_or_else(|| {
+            DoctorFacts::unavailable("runtime evidence collection failed or exceeded 60 seconds")
+                .into_report()
+        })
+    }
+}
+
+impl DoctorCompleter {
+    pub fn complete(self, report: DoctorReport) {
+        self.sender.send_replace(Some(report));
+    }
 }
 
 #[derive(Debug, Error)]
@@ -160,6 +208,15 @@ impl<B: RuntimeBackend> SandboxService<B> {
         store: Store,
         provisioner: Arc<dyn Provisioner>,
         doctor: DoctorReport,
+    ) -> Self {
+        Self::new_with_doctor_state(runtime, store, provisioner, DoctorState::ready(doctor))
+    }
+
+    pub fn new_with_doctor_state(
+        runtime: B,
+        store: Store,
+        provisioner: Arc<dyn Provisioner>,
+        doctor: DoctorState,
     ) -> Self {
         Self {
             runtime,
@@ -248,12 +305,12 @@ impl<B: RuntimeBackend> SandboxService<B> {
         Ok(self.store.latest_operation()?)
     }
 
-    pub fn doctor_report(&self) -> DoctorReport {
-        self.doctor.clone()
+    pub async fn doctor_report(&self) -> DoctorReport {
+        self.doctor.report().await
     }
 
     pub async fn require_runtime_ready(&self) -> Result<(), ServiceError> {
-        let report = self.doctor_report();
+        let report = self.doctor_report().await;
         if let Some(check) = report
             .checks
             .into_iter()

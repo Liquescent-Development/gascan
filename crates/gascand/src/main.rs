@@ -7,8 +7,8 @@ use gascan_core::doctor::{DoctorFact, DoctorFacts, DoctorReport};
 use gascan_core::fake_runtime::FakeRuntime;
 use gascan_core::runtime::RuntimeBackend;
 use gascand::{
-    BackendSelection, Daemon, DaemonConfig, ProvisionRequest, ProvisionResolution, Provisioner,
-    SandboxApi, SandboxService, ServiceError, SocketPaths, Store, backend_selection,
+    BackendSelection, Daemon, DaemonConfig, DoctorState, ProvisionRequest, ProvisionResolution,
+    Provisioner, SandboxApi, SandboxService, ServiceError, SocketPaths, Store, backend_selection,
 };
 use std::{sync::Arc, time::Duration};
 
@@ -36,7 +36,7 @@ impl Provisioner for ConfiguredProvisioner {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let idle_timeout = std::env::var("GASCAN_IDLE_TIMEOUT_MS")
         .ok()
@@ -54,7 +54,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fake_requested = false;
     match backend_selection(fake_requested) {
         BackendSelection::Apple => {
-            let doctor = production_doctor_report().await;
+            let (doctor, completer) = DoctorState::pending();
+            tokio::spawn(async move {
+                completer.complete(production_doctor_report().await);
+            });
             run_daemon(
                 AppleBackend::new(ProcessRunner),
                 store,
@@ -105,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 idle_timeout,
                 provision_delay,
                 provision_fail,
-                DoctorFacts::all_supported_for_tests().into_report(),
+                DoctorState::ready(DoctorFacts::all_supported_for_tests().into_report()),
             )
             .await
         }
@@ -119,9 +122,9 @@ async fn run_daemon<B: RuntimeBackend + 'static>(
     idle_timeout: Duration,
     provision_delay: Duration,
     provision_fail: bool,
-    doctor: DoctorReport,
+    doctor: DoctorState,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let service = Arc::new(SandboxService::new_with_doctor(
+    let service = Arc::new(SandboxService::new_with_doctor_state(
         runtime,
         store,
         Arc::new(ConfiguredProvisioner {
