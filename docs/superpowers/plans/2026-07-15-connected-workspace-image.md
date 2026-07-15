@@ -427,7 +427,7 @@ git commit -m "build: compile pinned Gascamp with build secret"
 - Modify: `scripts/tests/image_lock.rs`
 
 **Interfaces:**
-- Consumes: Task 2 context, canonical context digest, exact local base inspection, and `GASCAMP_READ_TOKEN_FILE` validated and privately staged by Task 1 rules.
+- Consumes: Task 2 context and canonical context digest, the sealed public snapshot returned by the unchanged reviewed helper, exact local base inspection, and `GASCAMP_READ_TOKEN_FILE` validated and privately staged by Task 1 rules.
 - Produces: atomic `.artifacts/workspace-image-ref` matching exactly `^gascan-workspace:[a-z0-9._-]+@sha256:[0-9a-f]{64}$` and `.artifacts/workspace-image-build.json` containing platform, lock digest, context digest, image digest, Apple version, and sanitized timestamps/status.
 
 - [ ] **Step 1: Write failing fake-runner tests**
@@ -436,11 +436,14 @@ Cover these cases with a fake `container` executable:
 
 - missing, relative, foreign-owned, group/world-readable, symlink, empty, or repository-contained source secret file fails before staging or `container build`;
 - staged-secret creation, permission, `.dockerignore`, or transmitted-context exclusion failure prevents `container build`;
+- the privileged helper is invoked only through `create`, `path`, and `finish`; it never receives the source or staged secret path;
+- the sealed public snapshot is copied into a separate current-UID-owned `0700` wrapper, and its public manifest must equal the Task 2 context digest before and after build;
+- source-secret validation and copying use one no-follow file descriptor so a pathname swap cannot change the validated bytes;
 - context verification failure or changed post-build digest fails without publishing a reference;
 - build invocation has exactly one `--secret`, exact `BASE_IMAGE`, exact `GASCAMP_REVISION`, `--arch arm64`, and no token value;
 - structured inspect must report `linux/arm64` and the exact built tag;
 - malformed/mutable/mismatched image output fails;
-- reference and JSON receipt are written atomically only after all checks;
+- JSON is atomically published first and the reference atomically published last as the commit marker; interruption between them must not expose an accepted new reference with stale or missing JSON;
 - stdout, stderr, argv, receipts, and retained files do not contain a synthetic token.
 
 The expected invocation slice is:
@@ -448,7 +451,7 @@ The expected invocation slice is:
 ```rust
 let required = [
     "build", "--arch", "arm64",
-    "--secret", "id=gascamp_read_token,src=/private/context/.build-secrets/gascamp_read_token",
+    "--secret", "id=gascamp_read_token,src=/private/wrapper/.build-secrets/gascamp_read_token",
     "--build-arg", "BASE_IMAGE=ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab",
     "--build-arg", "GASCAMP_REVISION=f6b248c5926240856dbea83d1d2c5c90ea1c1456",
 ];
@@ -466,7 +469,19 @@ Expected: FAIL because the connected orchestrator and validator do not exist.
 
 Make `scripts/build-workspace-image.sh` a mode dispatcher driven by the exact lock value. For `connected`, exec `build-connected-workspace-image.sh`; retain the old implementation under `scripts/build-offline-workspace-image.sh` for deferred use, but do not allow `auto` fallback between modes.
 
-The connected script must use the already-reviewed privileged snapshot helper to close context TOCTOU, stage the validated external secret beneath the private snapshot using the Task 1 boundary, pass only that staged path to BuildKit, reverify the public context and secret exclusion after build, inspect structurally, and atomically publish both receipts. It must never capture or print the secret.
+The connected script must use the already-reviewed privileged snapshot helper
+only to create, locate, and finish a sealed public snapshot. It must create a
+separate unprivileged `0700` wrapper, copy the sealed public snapshot and stage
+the validated external secret beneath that wrapper through descriptor-safe
+Rust code, pass only the staged wrapper path to BuildKit, and reverify the
+public manifest, staged secret, and secret exclusion after build. The helper
+and sudoers contract remain unchanged and never receive a credential path.
+
+Publish the fully validated JSON receipt first and the reference file last.
+The reference is the commit marker; every consumer must reject receipt pairs
+whose tag, image digest, context digest, or lock digest disagree. The script
+must remove the wrapper and finish the privileged public snapshot through
+bounded traps. It must never capture or print the secret.
 
 - [ ] **Step 4: Run focused and full scripts suites**
 

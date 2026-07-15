@@ -55,7 +55,7 @@ the polyglot toolchain.
 | Phase 1 Apple feasibility / Gate 2 | Passed and integrated | `6bedef8`, `docs/feasibility/apple-container-report.md` |
 | Phase 1 core control plane / Gate 3 | Passed and integrated | `7c7d083`, integration record `917dac1` |
 | Phase 2 Apple backend implementation | Implemented and reviewed on feature branch; not integrated | head `dbf4235` |
-| Phase 2 workspace image | Connected MVP Tasks 1–4 are approved; Task 5 has an unaccepted partial commit blocked on the privileged snapshot/secret-staging interface; Tasks 6–7 remain | approved through `b03add2`; partial Task 5 at `3517415` |
+| Phase 2 workspace image | Connected MVP Tasks 1–4 are approved; Task 5 has an unaccepted partial commit and an approved unprivileged wrapper-context revision; Tasks 6–7 remain | approved through `b03add2`; partial Task 5 at `3517415` |
 | Gate 4 real lifecycle | Pending; harness approved but no complete real lifecycle evidence | harness `dbf4235` |
 | Phase 3 security, packaging, release | Not started as an integrated phase | blocked by Gate 4 |
 | Gate 5 clean-host release | Pending | no evidence |
@@ -116,8 +116,9 @@ The harness is approved; Gate 4 itself is not passed.
   final `/out` credential/source boundary; no real private build was run.
 - `3517415`: partial, unaccepted connected build orchestrator. The reviewed
   snapshot helper exposes only `create`, `path`, and `finish`, seals roots
-  `0555`, and cannot stage the private secret or provide the planned
-  `/private/context` path under its current sudoers contract.
+  `0555`, and cannot stage the private secret. The approved revision keeps the
+  helper unchanged and copies its sealed public snapshot into a separate
+  unprivileged private wrapper before descriptor-safe secret staging.
 
 These offline commits are reviewed assets, not completed publication or live
 image evidence. `images/workspace/versions.lock` still says
@@ -142,11 +143,10 @@ Do not encode the operator DNS IP into Gas Can product policy.
 
 ## Current Unfinished Work
 
-1. Resolve Task 5's privileged snapshot boundary: either authorize a reviewed
-   helper/sudoers extension for descriptor-safe secret staging and
-   `/private/context` exposure, or revise the mandated secret-path/overlay
-   contract. Then complete and independently review Task 5. Tasks 1–4 are
-   complete and must not be redispatched; `3517415` is not accepted.
+1. Complete and independently review Task 5 using the approved unprivileged
+   wrapper-context revision. The privileged helper and sudoers contract remain
+   unchanged and credential-blind. Tasks 1–4 are complete and must not be
+   redispatched; `3517415` is not accepted by itself.
 2. Convert the image path from mandatory offline bundles to connected locked
    acquisition while preserving all reviewed image contracts.
 3. Select and prove the private Gascamp credential boundary.

@@ -72,6 +72,36 @@ This is the approved MVP boundary. A connected CI-produced, digest-verified
 source artifact remains a future alternative if the local builder boundary
 proves insufficient.
 
+### Connected build wrapper
+
+The connected orchestrator keeps the reviewed privileged snapshot helper
+unchanged and credential-blind. The helper creates and seals only the public
+Task 2 context through its existing `create`, `path`, and `finish` interface.
+The unprivileged orchestrator then creates a separate user-owned `0700`
+temporary wrapper, copies the sealed public snapshot into it through a
+descriptor-safe Rust helper, and verifies that the copied public manifest
+matches the canonical Task 2 context digest.
+
+That same unprivileged helper opens the original token without following
+symlinks, validates ownership and mode through the opened descriptor, and
+writes a new `0600` file at `.build-secrets/gascamp_read_token` beneath the
+wrapper. The wrapper's exact `.dockerignore` excludes `.build-secrets`.
+BuildKit receives only the staged wrapper path through `--secret`; no fixed
+`/private/context` mount or new sudoers permission is required.
+
+After the build, the orchestrator revalidates the wrapper's public manifest,
+the staged secret's descriptor identity and content digest, and all receipt
+inputs before publication. Cleanup removes the user-owned wrapper and calls
+the snapshot helper's existing `finish` operation on success, failure,
+`INT`, and `TERM`. The privileged helper never reads, copies, or deletes a
+credential.
+
+The JSON receipt is published before the reference file. The reference is the
+transaction commit marker: consumers reject a missing reference or JSON whose
+image digest, tag, context digest, or lock digest does not match it. An
+interruption may leave uncommitted JSON, but cannot expose a new accepted
+reference paired with stale metadata.
+
 ## Deferred Offline Build
 
 Commits through `9025c56` implement and test much of an offline bundle path:
