@@ -25,19 +25,22 @@ struct State {
     containers: BTreeMap<String, (String, String)>,
     volumes: BTreeMap<String, (String, String)>,
     commands: Vec<CommandSpec>,
+    faulted_inventory_commands: Vec<Vec<String>>,
     fail_run_after_insert: bool,
     fail_volume_after_insert: bool,
     container_list_faults: VecDeque<InventoryFault>,
     volume_list_faults: VecDeque<InventoryFault>,
-    volume_success_fault: Option<(bool, InventoryFault)>,
-    container_success_fault: Option<InventoryFault>,
+    after_successful_volume_create_volume_list_fault: Option<InventoryFault>,
+    after_successful_container_create_container_list_fault: Option<InventoryFault>,
 }
 
 #[derive(Clone, Copy)]
 enum InventoryFault {
     InvalidJson,
+    CommandIo,
     Absent,
     Foreign,
+    Mismatched,
 }
 
 #[async_trait]
@@ -53,6 +56,7 @@ impl CommandRunner for StatefulAppleRunner {
             ["image", "pull", _] => json!(null),
             ["list", "--all", "--format", "json"] => {
                 if let Some(fault) = state.container_list_faults.pop_front() {
+                    state.faulted_inventory_commands.push(spec.args.clone());
                     return fault_output(fault, &state.containers, true);
                 }
                 json!(state.containers.iter().map(|(id, (sandbox, status))| json!({
@@ -61,6 +65,7 @@ impl CommandRunner for StatefulAppleRunner {
             }
             ["volume", "list", "--format", "json"] => {
                 if let Some(fault) = state.volume_list_faults.pop_front() {
+                    state.faulted_inventory_commands.push(spec.args.clone());
                     return fault_output(fault, &state.volumes, false);
                 }
                 json!(state.volumes.iter().map(|(name, (sandbox, manager))| json!({
@@ -100,18 +105,22 @@ impl CommandRunner for StatefulAppleRunner {
                         manager.split_once('=').unwrap().1.into(),
                     ),
                 );
-                if let Some((on_container_list, fault)) = state.volume_success_fault.take() {
-                    let repeats = if matches!(fault, InventoryFault::Foreign) {
+                if let Some(fault) = state
+                    .after_successful_volume_create_volume_list_fault
+                    .take()
+                {
+                    let repeats = if matches!(
+                        fault,
+                        InventoryFault::Absent
+                            | InventoryFault::Foreign
+                            | InventoryFault::Mismatched
+                    ) {
                         2
                     } else {
                         1
                     };
                     for _ in 0..repeats {
-                        if on_container_list {
-                            state.container_list_faults.push_back(fault);
-                        } else {
-                            state.volume_list_faults.push_back(fault);
-                        }
+                        state.volume_list_faults.push_back(fault);
                     }
                 }
                 if state.fail_volume_after_insert {
@@ -131,8 +140,23 @@ impl CommandRunner for StatefulAppleRunner {
                 state
                     .containers
                     .insert(id.into(), (id.into(), "stopped".into()));
-                if let Some(fault) = state.container_success_fault.take() {
-                    state.container_list_faults.push_back(fault);
+                if let Some(fault) = state
+                    .after_successful_container_create_container_list_fault
+                    .take()
+                {
+                    let repeats = if matches!(
+                        fault,
+                        InventoryFault::Absent
+                            | InventoryFault::Foreign
+                            | InventoryFault::Mismatched
+                    ) {
+                        2
+                    } else {
+                        1
+                    };
+                    for _ in 0..repeats {
+                        state.container_list_faults.push_back(fault);
+                    }
                 }
                 if state.fail_run_after_insert {
                     return Err(RuntimeError::CommandIo {
@@ -182,6 +206,12 @@ fn fault_output<T>(
 ) -> Result<CommandOutput, RuntimeError> {
     let stdout = match fault {
         InventoryFault::InvalidJson => b"{".to_vec(),
+        InventoryFault::CommandIo => {
+            return Err(RuntimeError::CommandIo {
+                operation: if containers { "container list" } else { "container volume list" }.into(),
+                message: "injected inventory transport failure".into(),
+            });
+        }
         InventoryFault::Absent => b"[]".to_vec(),
         InventoryFault::Foreign if containers => serde_json::to_vec(
             &resources
@@ -205,6 +235,17 @@ fn fault_output<T>(
                 .collect::<Vec<_>>(),
         )
         .unwrap(),
+        InventoryFault::Mismatched if containers => serde_json::to_vec(
+            &resources.keys().map(|id| json!({
+                "configuration":{"id":id,"labels":{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":"gascan-mismatch-000000000000"}},
+                "status":{"state":"stopped"}
+            })).collect::<Vec<_>>(),
+        ).unwrap(),
+        InventoryFault::Mismatched => serde_json::to_vec(
+            &resources.keys().map(|name| json!({
+                "id":name,"configuration":{"name":name,"labels":{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":"gascan-mismatch-000000000000"}}
+            })).collect::<Vec<_>>(),
+        ).unwrap(),
     };
     Ok(CommandOutput {
         status: 0,
@@ -241,6 +282,12 @@ fn request(name: &str) -> (tempfile::TempDir, CreateRequest) {
         offline: NetworkIsolation::Proven,
     };
     (root, PolicyCompiler::compile(spec, &capabilities).unwrap())
+}
+
+fn assert_only_faulted_command(runner: &StatefulAppleRunner, expected: &[&str]) {
+    let state = runner.0.lock().unwrap();
+    assert_eq!(state.faulted_inventory_commands.len(), 1);
+    assert_eq!(state.faulted_inventory_commands[0], expected);
 }
 
 #[tokio::test]
@@ -320,7 +367,7 @@ async fn remove_refuses_identity_mismatch_after_immediate_reinventory() {
 #[tokio::test]
 async fn remove_refuses_forged_owned_resource_without_the_opaque_observation() {
     let runner = StatefulAppleRunner::default();
-    let backend = AppleBackend::new(runner);
+    let backend = AppleBackend::new(runner.clone());
     let (_root, request) = request("apple-forged");
     let id = request.id().clone();
     backend.create(request).await.unwrap();
@@ -344,7 +391,7 @@ async fn remove_refuses_forged_owned_resource_without_the_opaque_observation() {
 async fn transient_io_after_mutation_reconciles_exact_owned_side_effect() {
     let runner = StatefulAppleRunner::default();
     runner.0.lock().unwrap().fail_run_after_insert = true;
-    let backend = AppleBackend::new(runner);
+    let backend = AppleBackend::new(runner.clone());
     let (_root, request) = request("apple-partial");
     let failure = backend.create(request).await.unwrap_err();
     assert_eq!(failure.code(), "command_io");
@@ -372,43 +419,142 @@ async fn command_failed_human_diagnostic_is_preserved_and_collision_is_not_claim
 #[tokio::test]
 async fn successful_volume_create_then_inventory_parse_failure_reconciles_created_evidence() {
     let runner = StatefulAppleRunner::default();
-    runner.0.lock().unwrap().volume_success_fault = Some((true, InventoryFault::InvalidJson));
-    let backend = AppleBackend::new(runner);
+    runner
+        .0
+        .lock()
+        .unwrap()
+        .after_successful_volume_create_volume_list_fault = Some(InventoryFault::InvalidJson);
+    let backend = AppleBackend::new(runner.clone());
     let (_root, request) = request("apple-volume-parse");
     let failure = backend.create(request).await.unwrap_err();
     assert_eq!(failure.code(), "invalid_output");
     assert_eq!(failure.created().len(), 1);
+    assert_only_faulted_command(&runner, &["volume", "list", "--format", "json"]);
 }
 
 #[tokio::test]
 async fn successful_container_create_then_inventory_parse_failure_reconciles_all_evidence() {
     let runner = StatefulAppleRunner::default();
-    runner.0.lock().unwrap().container_success_fault = Some(InventoryFault::InvalidJson);
-    let backend = AppleBackend::new(runner);
+    runner
+        .0
+        .lock()
+        .unwrap()
+        .after_successful_container_create_container_list_fault = Some(InventoryFault::InvalidJson);
+    let backend = AppleBackend::new(runner.clone());
     let (_root, request) = request("apple-container-parse");
     let failure = backend.create(request).await.unwrap_err();
     assert_eq!(failure.code(), "invalid_output");
     assert_eq!(failure.created().len(), 4);
+    assert_only_faulted_command(&runner, &["list", "--all", "--format", "json"]);
 }
 
 #[tokio::test]
-async fn successful_volume_create_then_absence_verification_reconciles_created_evidence() {
+async fn successful_volume_create_then_persistent_absence_never_claims_created_evidence() {
     let runner = StatefulAppleRunner::default();
-    runner.0.lock().unwrap().volume_success_fault = Some((false, InventoryFault::Absent));
+    runner
+        .0
+        .lock()
+        .unwrap()
+        .after_successful_volume_create_volume_list_fault = Some(InventoryFault::Absent);
     let backend = AppleBackend::new(runner);
     let (_root, request) = request("apple-volume-absent");
     let failure = backend.create(request).await.unwrap_err();
     assert_eq!(failure.code(), "ownership_mismatch");
-    assert_eq!(failure.created().len(), 1);
+    assert!(failure.created().is_empty());
 }
 
 #[tokio::test]
 async fn successful_volume_create_then_ownership_verification_never_claims_foreign_evidence() {
     let runner = StatefulAppleRunner::default();
-    runner.0.lock().unwrap().volume_success_fault = Some((false, InventoryFault::Foreign));
+    runner
+        .0
+        .lock()
+        .unwrap()
+        .after_successful_volume_create_volume_list_fault = Some(InventoryFault::Foreign);
     let backend = AppleBackend::new(runner);
     let (_root, request) = request("apple-volume-foreign");
     let failure = backend.create(request).await.unwrap_err();
     assert_eq!(failure.code(), "ownership_mismatch");
     assert!(failure.created().is_empty());
+}
+
+#[tokio::test]
+async fn successful_container_create_then_persistent_absence_retains_only_prior_volumes() {
+    let runner = StatefulAppleRunner::default();
+    runner
+        .0
+        .lock()
+        .unwrap()
+        .after_successful_container_create_container_list_fault = Some(InventoryFault::Absent);
+    let backend = AppleBackend::new(runner);
+    let (_root, request) = request("apple-container-absent");
+    let failure = backend.create(request).await.unwrap_err();
+    assert_eq!(failure.code(), "ownership_mismatch");
+    assert_eq!(failure.created().len(), 3);
+}
+
+#[tokio::test]
+async fn successful_container_create_then_foreign_observation_retains_only_prior_volumes() {
+    let runner = StatefulAppleRunner::default();
+    runner
+        .0
+        .lock()
+        .unwrap()
+        .after_successful_container_create_container_list_fault = Some(InventoryFault::Foreign);
+    let backend = AppleBackend::new(runner);
+    let (_root, request) = request("apple-container-foreign");
+    let failure = backend.create(request).await.unwrap_err();
+    assert_eq!(failure.code(), "ownership_mismatch");
+    assert_eq!(failure.created().len(), 3);
+    assert!(
+        failure
+            .created()
+            .iter()
+            .all(|resource| resource.kind() == gascan_core::runtime::ResourceKind::Volume)
+    );
+}
+
+#[tokio::test]
+async fn successful_container_create_then_mismatched_observation_retains_only_prior_volumes() {
+    let runner = StatefulAppleRunner::default();
+    runner
+        .0
+        .lock()
+        .unwrap()
+        .after_successful_container_create_container_list_fault = Some(InventoryFault::Mismatched);
+    let backend = AppleBackend::new(runner);
+    let (_root, request) = request("apple-container-mismatched");
+    let failure = backend.create(request).await.unwrap_err();
+    assert_eq!(failure.code(), "ownership_mismatch");
+    assert_eq!(failure.created().len(), 3);
+}
+
+#[tokio::test]
+async fn successful_volume_create_then_volume_list_command_error_reconciles_created_evidence() {
+    let runner = StatefulAppleRunner::default();
+    runner
+        .0
+        .lock()
+        .unwrap()
+        .after_successful_volume_create_volume_list_fault = Some(InventoryFault::CommandIo);
+    let backend = AppleBackend::new(runner);
+    let (_root, request) = request("apple-volume-list-io");
+    let failure = backend.create(request).await.unwrap_err();
+    assert_eq!(failure.code(), "command_io");
+    assert_eq!(failure.created().len(), 1);
+}
+
+#[tokio::test]
+async fn successful_container_create_then_container_list_command_error_reconciles_all_evidence() {
+    let runner = StatefulAppleRunner::default();
+    runner
+        .0
+        .lock()
+        .unwrap()
+        .after_successful_container_create_container_list_fault = Some(InventoryFault::CommandIo);
+    let backend = AppleBackend::new(runner);
+    let (_root, request) = request("apple-container-list-io");
+    let failure = backend.create(request).await.unwrap_err();
+    assert_eq!(failure.code(), "command_io");
+    assert_eq!(failure.created().len(), 4);
 }
