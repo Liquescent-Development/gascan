@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import tomllib
 from pathlib import Path
 
 import apt_pkg
@@ -73,6 +74,18 @@ def recompute(root, selected):
         for group in apt_pkg.parse_depends(item.get("Provides", ""), False, "arm64"):
             for provided, version, _operator in group:
                 providers.setdefault(provided.split(":", 1)[0], []).append((key, version))
+
+    def architecture_eligible(target, candidate, source_arch):
+        candidate_arch = candidate["Architecture"]
+        multi_arch = candidate.get("Multi-Arch", "no")
+        if ":" in target:
+            _name, qualifier = target.rsplit(":", 1)
+            if qualifier == "native":
+                return candidate_arch in ("arm64", "all")
+            if qualifier == "any":
+                return candidate_arch in ("arm64", "all") and multi_arch == "allowed"
+            return candidate_arch in (qualifier, "all")
+        return candidate_arch in (source_arch, "all") or multi_arch == "foreign"
     requirements = []
     edges = []
     for source, item in sorted(selected.items()):
@@ -92,11 +105,16 @@ def recompute(root, selected):
                     base = target.split(":", 1)[0]
                     for key in by_name.get(base, []):
                         candidate = selected[key]
-                        if not operator or apt_pkg.check_dep(key[1], operator, required):
+                        if architecture_eligible(target, candidate, source[2]) and (
+                            not operator or apt_pkg.check_dep(key[1], operator, required)
+                        ):
                             candidates.append((position, key))
                     for key, provided in providers.get(base, []):
                         candidate = selected[key]
-                        if not operator or (provided and apt_pkg.check_dep(provided, operator, required)):
+                        if architecture_eligible(target, candidate, source[2]) and (
+                            not operator
+                            or (provided and apt_pkg.check_dep(provided, operator, required))
+                        ):
                             candidates.append((position, key))
                 if not candidates:
                     fail("selected set does not satisfy " + expression)
@@ -130,9 +148,24 @@ def offline_check(root, selected):
         return ["selection-sha256\t" + hashlib.sha256("\n".join(exact).encode()).hexdigest(), "apt-simulation\tpassed"]
 
 
+def verify_roots(root, mode):
+    repository = Path(__file__).resolve().parent.parent
+    config = tomllib.loads((repository / "images/workspace/bundles/ubuntu-packages.toml").read_text())
+    tools_path = repository / config["system_packages_file"]
+    if hashlib.sha256(tools_path.read_bytes()).hexdigest() != config["system_packages_sha256"]:
+        fail("trusted system package list digest mismatch")
+    builder = ["build-essential", "ca-certificates", "git", "libssl-dev", "pkg-config"]
+    expected = "\n".join(sorted(set(builder + tools_path.read_text().splitlines()))) + "\n"
+    if mode == "--write":
+        (root / "roots.txt").write_text(expected)
+    elif (root / "roots.txt").read_text() != expected:
+        fail("roots differ from trusted builder and system package inputs")
+
+
 if len(sys.argv) != 3 or sys.argv[1] not in ("--write", "--verify"):
     fail("usage: verify-ubuntu-debian-evidence.py --write|--verify EVIDENCE")
 mode, root = sys.argv[1], Path(sys.argv[2])
+verify_roots(root, mode)
 selected = selected_packages(root)
 requirements, edges = recompute(root, selected)
 canonical(root / "dependency-requirements.tsv", requirements, mode)

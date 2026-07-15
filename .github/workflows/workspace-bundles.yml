@@ -59,8 +59,8 @@ jobs:
           test -s "$directory/ubuntu-packages-linux-arm64.manifest.tsv"
           test -s "$directory/ubuntu-packages-linux-arm64.provenance.env"
           receipt="$directory/validation-receipt.tsv"
-          test "$(wc -l <"$receipt" | tr -d ' ')" = 6
-          test "$(cut -f1 "$receipt" | LC_ALL=C sort | tr '\n' ' ')" = "archive-sha256 archive-size inner-manifest-sha256 package-manifest-sha256 signed-evidence-sha256 workflow-commit "
+          test "$(wc -l <"$receipt" | tr -d ' ')" = 7
+          test "$(cut -f1 "$receipt" | LC_ALL=C sort | tr '\n' ' ')" = "archive-sha256 archive-size inner-manifest-sha256 package-manifest-sha256 root-input-sha256 signed-evidence-sha256 workflow-commit "
           test "$(awk -F '\t' '$1 == "workflow-commit" {print $2}' "$receipt")" = "$GITHUB_SHA"
           test "$(awk -F '\t' '$1 == "archive-sha256" {print $2}' "$receipt")" = "$expected_sha"
           test "$(awk -F '\t' '$1 == "archive-size" {print $2}' "$receipt")" = "$expected_size"
@@ -114,7 +114,8 @@ jobs:
           inner=$(zstd --decompress --stdout "$archive" | tar -xOf - bundle-manifest.json | sha256sum | cut -d' ' -f1)
           packages=$(sha256sum "$RUNNER_TEMP/validated-evidence/package-manifest.tsv" | cut -d' ' -f1)
           signed=$(cd "$RUNNER_TEMP/validated-evidence" && find signed-releases signed-indexes -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)
-          printf 'archive-sha256\t%s\narchive-size\t%s\ninner-manifest-sha256\t%s\npackage-manifest-sha256\t%s\nsigned-evidence-sha256\t%s\nworkflow-commit\t%s\n' "$sha" "$size" "$inner" "$packages" "$signed" "$GITHUB_SHA" | LC_ALL=C sort >"$directory/validation-receipt.tsv"
+          root_input=$(printf 'tests/image/system-tools.txt\t%s\n' "$(sha256sum tests/image/system-tools.txt | cut -d' ' -f1)" | sha256sum | cut -d' ' -f1)
+          printf 'archive-sha256\t%s\narchive-size\t%s\ninner-manifest-sha256\t%s\npackage-manifest-sha256\t%s\nroot-input-sha256\t%s\nsigned-evidence-sha256\t%s\nworkflow-commit\t%s\n' "$sha" "$size" "$inner" "$packages" "$root_input" "$signed" "$GITHUB_SHA" | LC_ALL=C sort >"$directory/validation-receipt.tsv"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: validated-ubuntu-packages-linux-arm64

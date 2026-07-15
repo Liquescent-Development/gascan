@@ -38,7 +38,7 @@ def config_value(name):
     return match.group(1)
 
 provenance=env_file(root/"provenance.env")
-for key in ("SNAPSHOT","BASE_IMAGE","SIGNING_KEY_FINGERPRINT","ARCHITECTURE","INSTALL_RECOMMENDS"):
+for key in ("SNAPSHOT","BASE_IMAGE","SIGNING_KEY_FINGERPRINT","ARCHITECTURE","INSTALL_RECOMMENDS","SYSTEM_PACKAGES_PATH","SYSTEM_PACKAGES_SHA256"):
     if key not in provenance: fail("missing provenance " + key)
 expected_fp=config_value("ubuntu_archive_key_fingerprint")
 if provenance["SIGNING_KEY_FINGERPRINT"] != expected_fp: fail("wrong signing-key fingerprint")
@@ -46,6 +46,8 @@ if provenance["SNAPSHOT"] != config_value("snapshot"): fail("wrong snapshot")
 if provenance["BASE_IMAGE"] != config_value("base_image"): fail("wrong base image")
 if provenance["ARCHITECTURE"] != "arm64": fail("wrong architecture")
 if provenance["INSTALL_RECOMMENDS"] != "false": fail("Recommends must be disabled")
+if provenance["SYSTEM_PACKAGES_PATH"] != config_value("system_packages_file"): fail("wrong system package path")
+if provenance["SYSTEM_PACKAGES_SHA256"] != config_value("system_packages_sha256"): fail("wrong system package digest")
 signed_releases=sorted((root/"signed-releases").rglob("InRelease"))
 if not signed_releases: fail("signed InRelease evidence is missing")
 release_hashes={}
@@ -241,6 +243,8 @@ BASE_IMAGE=ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e
 SIGNING_KEY_FINGERPRINT=F6ECB3762474EDA9D21B7022871920D1991BC93C
 ARCHITECTURE=arm64
 INSTALL_RECOMMENDS=false
+SYSTEM_PACKAGES_PATH=tests/image/system-tools.txt
+SYSTEM_PACKAGES_SHA256=9f64999efc0136ccbdc9a6697f2456c453e9c1c1b68b85f547067411df4164ae
 EOF
 verify_evidence "$work/evidence" || die "producer evidence validation failed"
 mkdir -- "$output"

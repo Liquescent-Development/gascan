@@ -25,7 +25,7 @@ impl Fixture {
         let rec_hash = sha(root.join("repository/pool/recommended.deb"));
         let provider_hash = sha(root.join("repository/pool/provider.deb"));
         let packages = format!(
-            "Package: dep\nVersion: 1.0\nArchitecture: arm64\nFilename: pool/dep.deb\nSHA256: {dep_hash}\nSize: 10\nMulti-Arch: same\n\nPackage: provider\nVersion: 3.0\nArchitecture: arm64\nFilename: pool/provider.deb\nSHA256: {provider_hash}\nSize: 8\nProvides: virtual-dep (= 3.0)\n\nPackage: recommended\nVersion: 1.0\nArchitecture: arm64\nFilename: pool/recommended.deb\nSHA256: {rec_hash}\nSize: 11\n\nPackage: root\nVersion: 2.0\nArchitecture: arm64\nFilename: pool/root.deb\nSHA256: {root_hash}\nSize: 12\nDepends: dep:any (>= 1.0) [arm64] | virtual-dep\nPre-Depends: dep (= 1.0)\nRecommends: recommended\n\n"
+            "Package: dep\nVersion: 1.0\nArchitecture: arm64\nFilename: pool/dep.deb\nSHA256: {dep_hash}\nSize: 10\nMulti-Arch: same\n\nPackage: provider\nVersion: 3.0\nArchitecture: arm64\nFilename: pool/provider.deb\nSHA256: {provider_hash}\nSize: 8\nMulti-Arch: allowed\nProvides: virtual-dep (= 3.0)\n\nPackage: recommended\nVersion: 1.0\nArchitecture: arm64\nFilename: pool/recommended.deb\nSHA256: {rec_hash}\nSize: 11\n\nPackage: root\nVersion: 2.0\nArchitecture: arm64\nFilename: pool/root.deb\nSHA256: {root_hash}\nSize: 12\nDepends: dep:any (>= 1.0) [arm64] | virtual-dep\nPre-Depends: dep (= 1.0)\nRecommends: recommended\n\n"
         );
         fs::write(root.join("repository/Packages"), &packages).unwrap();
         sign_packages(root, &packages);
@@ -38,7 +38,7 @@ impl Fixture {
             ),
         )
         .unwrap();
-        fs::write(root.join("dependency-edges.tsv"), "root\t2.0\tarm64\tDepends\t0\tdep:any (>= 1.0) [arm64] | virtual-dep\tdep\t1.0\tarm64\nroot\t2.0\tarm64\tPre-Depends\t0\tdep (= 1.0)\tdep\t1.0\tarm64\n").unwrap();
+        fs::write(root.join("dependency-edges.tsv"), "root\t2.0\tarm64\tDepends\t0\tdep:any (>= 1.0) [arm64] | virtual-dep\tprovider\t3.0\tarm64\nroot\t2.0\tarm64\tPre-Depends\t0\tdep (= 1.0)\tdep\t1.0\tarm64\n").unwrap();
         fs::write(root.join("dependency-requirements.tsv"), "root\t2.0\tarm64\tDepends\t0\tdep:any (>= 1.0) [arm64] | virtual-dep\nroot\t2.0\tarm64\tPre-Depends\t0\tdep (= 1.0)\n").unwrap();
         fs::write(
             root.join("offline-apt-check.tsv"),
@@ -47,7 +47,7 @@ impl Fixture {
         .unwrap();
         fs::write(
             root.join("provenance.env"),
-            format!("SNAPSHOT=2026-07-13T00:00:00Z\nBASE_IMAGE=ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab\nSIGNING_KEY_FINGERPRINT={FINGERPRINT}\nARCHITECTURE=arm64\nINSTALL_RECOMMENDS=false\n"),
+            format!("SNAPSHOT=2026-07-13T00:00:00Z\nBASE_IMAGE=ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab\nSIGNING_KEY_FINGERPRINT={FINGERPRINT}\nARCHITECTURE=arm64\nINSTALL_RECOMMENDS=false\nSYSTEM_PACKAGES_PATH=tests/image/system-tools.txt\nSYSTEM_PACKAGES_SHA256=9f64999efc0136ccbdc9a6697f2456c453e9c1c1b68b85f547067411df4164ae\n"),
         ).unwrap();
         let gpgv = root.join("gpgv");
         fs::write(&gpgv, format!("#!/bin/sh\nprintf '%s\\n' '[GNUPG:] VALIDSIG {FINGERPRINT} 20260713 0 4 0 1 10 01 {FINGERPRINT}' >&2\n")).unwrap();
@@ -68,6 +68,10 @@ for relation in ('Depends','Pre-Depends'):
 if (root/'dependency-requirements.tsv').read_text()!='\n'.join(sorted(required))+'\n': raise SystemExit('independent requirements mismatch')
 edges=(root/'dependency-edges.tsv').read_text().splitlines()
 if sorted('\t'.join(line.split('\t')[:6]) for line in edges)!=sorted(required): raise SystemExit('independent chosen edges mismatch')
+depends=next(line for line in edges if '\tDepends\t' in line)
+pre=next(line for line in edges if '\tPre-Depends\t' in line)
+if not depends.endswith('\tprovider\t3.0\tarm64') or not pre.endswith('\tdep\t1.0\tarm64'): raise SystemExit('independent architecture eligibility mismatch')
+if (root/'roots.txt').read_text()!='provider\nroot\n': raise SystemExit('independent roots mismatch')
 if (root/'offline-apt-check.tsv').read_text()!='apt-simulation\tpassed\nselection-sha256\tfixture\n': raise SystemExit('independent offline APT mismatch')
 "#).unwrap();
         let mut mode = fs::metadata(&verifier).unwrap().permissions();
@@ -330,21 +334,16 @@ fn rejects_chosen_multi_arch_target_not_in_exact_selection() {
 }
 
 #[test]
-fn accepts_canonical_virtual_provider_as_chosen_alternative() {
+fn rejects_ineligible_first_alternative_when_later_provider_is_eligible() {
     let fixture = Fixture::new();
     let path = fixture.root().join("dependency-edges.tsv");
     let text = fs::read_to_string(&path).unwrap().replacen(
-        "\tdep\t1.0\tarm64\n",
         "\tprovider\t3.0\tarm64\n",
+        "\tdep\t1.0\tarm64\n",
         1,
     );
     fs::write(path, text).unwrap();
-    let output = fixture.verify();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    fixture.assert_rejected("architecture eligibility");
 }
 
 #[test]
@@ -415,6 +414,13 @@ fn independent_offline_apt_result_cannot_be_altered() {
     )
     .unwrap();
     fixture.assert_rejected("offline APT");
+}
+
+#[test]
+fn independent_roots_reject_deleted_reviewed_root() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root().join("roots.txt"), "root\n").unwrap();
+    fixture.assert_rejected("roots");
 }
 
 fn rewrite_packages(fixture: &Fixture, path: &Path, text: String) {
