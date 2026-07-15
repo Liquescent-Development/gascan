@@ -5,6 +5,14 @@ fn root() -> &'static Path {
 }
 
 fn assert_sole_reviewed_package_install(dockerfile: &str) -> Result<(), &'static str> {
+    if dockerfile.lines().any(|line| {
+        line.split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|tokens| tokens == ["apt", "install"])
+    }) {
+        return Err("direct apt install bypasses the reviewed package file");
+    }
     let apt_get_lines: Vec<_> = dockerfile
         .lines()
         .map(str::trim)
@@ -88,5 +96,12 @@ fn dockerfile_installs_exactly_the_sorted_unique_reviewed_package_list() {
 fn package_contract_rejects_an_inline_unreviewed_install() {
     let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
     let mutated = format!("{dockerfile}\nRUN apt-get install arbitrary-package\n");
+    assert!(assert_sole_reviewed_package_install(&mutated).is_err());
+}
+
+#[test]
+fn package_contract_rejects_an_inline_unreviewed_apt_install() {
+    let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
+    let mutated = format!("{dockerfile}\nRUN apt install arbitrary-package\n");
     assert!(assert_sole_reviewed_package_install(&mutated).is_err());
 }
