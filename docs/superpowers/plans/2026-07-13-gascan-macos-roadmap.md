@@ -31,6 +31,7 @@
 3. [Apple Backend and Lifecycle Plan](./2026-07-13-apple-backend-lifecycle.md) connects the control plane to the real Apple runtime and completes lifecycle behavior.
 4. [Workspace Environment and Release Plan](./2026-07-13-workspace-environment-release.md) ships the image, mise/Gascamp provisioning, security suite, packaging, and clean-host release gate.
 5. [Offline Workspace Image Bundles Plan](./2026-07-14-offline-workspace-image-bundles.md) is implemented through a PENDING live gate and retained as deferred reproducibility/offline hardening. It is not on the macOS MVP critical path after the 2026-07-15 connected-builder diagnosis.
+6. [Connected Workspace Image Plan](./2026-07-15-connected-workspace-image.md) is the active MVP image path and hands one live, digest-qualified ARM64 image to Gate 4.
 
 Current restart state, accepted branch heads, and unfinished work are recorded
 in [`docs/status/macos-mvp-handoff.md`](../../status/macos-mvp-handoff.md).

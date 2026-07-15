@@ -42,7 +42,7 @@ the polyglot toolchain.
 | Phase 1 Apple feasibility / Gate 2 | Passed and integrated | `6bedef8`, `docs/feasibility/apple-container-report.md` |
 | Phase 1 core control plane / Gate 3 | Passed and integrated | `7c7d083`, integration record `917dac1` |
 | Phase 2 Apple backend implementation | Implemented and reviewed on feature branch; not integrated | head `dbf4235` |
-| Phase 2 workspace image | Offline implementation exists; connected MVP conversion is designed but not yet planned or implemented | provisioning head includes `9025c56` and the connected-build design |
+| Phase 2 workspace image | Offline implementation exists; connected MVP conversion is designed and planned but not implemented | provisioning head includes `9025c56`, the connected-build design, and `docs/superpowers/plans/2026-07-15-connected-workspace-image.md` |
 | Gate 4 real lifecycle | Pending; harness approved but no complete real lifecycle evidence | harness `dbf4235` |
 | Phase 3 security, packaging, release | Not started as an integrated phase | blocked by Gate 4 |
 | Gate 5 clean-host release | Pending | no evidence |
@@ -117,8 +117,8 @@ Do not encode the operator DNS IP into Gas Can product policy.
 
 ## Current Unfinished Work
 
-1. Write and approve the connected workspace image implementation plan from
-   `docs/superpowers/specs/2026-07-15-connected-mvp-build-design.md`.
+1. Execute `docs/superpowers/plans/2026-07-15-connected-workspace-image.md`
+   task by task with independent review gates.
 2. Convert the image path from mandatory offline bundles to connected locked
    acquisition while preserving all reviewed image contracts.
 3. Select and prove the private Gascamp credential boundary.
@@ -151,7 +151,7 @@ Then read, in order:
 1. this handoff;
 2. `docs/superpowers/plans/2026-07-13-gascan-macos-roadmap.md`;
 3. `docs/superpowers/specs/2026-07-15-connected-mvp-build-design.md`;
-4. the connected workspace image plan once it is committed;
+4. `docs/superpowers/plans/2026-07-15-connected-workspace-image.md`;
 5. the relevant task plan before modifying its branch.
 
 Before claiming any gate, run the roadmap's program-level verification and the
