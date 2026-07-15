@@ -13,7 +13,7 @@ die() { printf 'ubuntu package bundle: %s\n' "$*" >&2; exit 1; }
 verify_evidence() {
   evidence=$1
   python3 - "$evidence" "$config" "$gpgv_bin" <<'PY'
-import hashlib, os, re, subprocess, sys
+import hashlib, lzma, re, subprocess, sys
 from pathlib import Path
 
 root, config, gpgv = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
@@ -46,70 +46,100 @@ if provenance["SNAPSHOT"] != config_value("snapshot"): fail("wrong snapshot")
 if provenance["BASE_IMAGE"] != config_value("base_image"): fail("wrong base image")
 if provenance["ARCHITECTURE"] != "arm64": fail("wrong architecture")
 if provenance["INSTALL_RECOMMENDS"] != "false": fail("Recommends must be disabled")
-try:
-    signed_releases=sorted((root/"signed-releases").glob("*.InRelease")) if (root/"signed-releases").is_dir() else [root/"InRelease"]
-except OSError: fail("InRelease signature verifier unavailable")
+signed_releases=sorted((root/"signed-releases").rglob("InRelease"))
 if not signed_releases: fail("signed InRelease evidence is missing")
+release_hashes={}
 for signed_release in signed_releases:
     try: result=subprocess.run([gpgv,"--status-fd","2","--keyring",str(root/"archive-keyring.gpg"),str(signed_release)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False,text=True)
     except OSError: fail("InRelease signature verifier unavailable")
     if result.returncode != 0: fail("invalid InRelease signature")
     valid=[line.split()[2] for line in result.stderr.splitlines() if line.startswith("[GNUPG:] VALIDSIG ") and len(line.split()) >= 3]
     if valid != [expected_fp]: fail("InRelease signature fingerprint is missing or ambiguous")
+    suite=signed_release.parent.name
+    hashes={}
+    in_sha=False
+    for line in signed_release.read_text(errors="strict").splitlines():
+        if line == "SHA256:": in_sha=True; continue
+        if in_sha and line.startswith(" "):
+            parts=line.split()
+            if len(parts)==3: hashes[parts[2]]=(parts[0],int(parts[1]))
+        elif in_sha and line and not line.startswith(" "): in_sha=False
+    release_hashes[suite]=hashes
 
-release=(root/"InRelease").read_text(errors="strict")
-package_path=root/"repository/Packages"
-expected_line=f" {digest(package_path)} {package_path.stat().st_size} repository/Packages"
-if expected_line not in release.splitlines(): fail("Packages index is not covered by signed InRelease SHA-256")
-
+package_text=[]
+indexes=sorted((root/"signed-indexes").rglob("Packages.xz"))
+if not indexes: fail("signed Packages indexes are missing")
+for index in indexes:
+    relative=index.relative_to(root/"signed-indexes")
+    suite=relative.parts[0]
+    release_path="/".join(relative.parts[1:])
+    expected=release_hashes.get(suite,{}).get(release_path)
+    if expected != (digest(index),index.stat().st_size): fail("compressed Packages hash/size is not covered by signed InRelease")
+    try: unpacked=lzma.decompress(index.read_bytes())
+    except lzma.LZMAError: fail("invalid compressed Packages index")
+    plain_path=release_path.removesuffix(".xz")
+    expected_plain=release_hashes[suite].get(plain_path)
+    actual_plain=(hashlib.sha256(unpacked).hexdigest(),len(unpacked))
+    if expected_plain != actual_plain: fail("uncompressed Packages hash/size is not covered by signed InRelease")
+    package_text.append(unpacked.decode("utf-8","strict"))
 stanzas=[]
-for raw in (root/"repository/Packages").read_text().strip().split("\n\n"):
+for raw in "\n".join(package_text).strip().split("\n\n"):
     fields={}
     for line in raw.splitlines():
         if line.startswith((" ","\t")) or ": " not in line: continue
         key,value=line.split(": ",1)
         if key in fields: fail("duplicate Packages field")
         fields[key]=value
-    required=("Package","Version","Architecture","Filename","SHA256")
+    required=("Package","Version","Architecture","Filename","SHA256","Size")
     if not all(key in fields for key in required): fail("incomplete Packages stanza")
     stanzas.append(fields)
 by_name={}
 for fields in stanzas: by_name.setdefault(fields["Package"],[]).append(fields)
-if any(len({item["Version"] for item in values}) != 1 for values in by_name.values()): fail("ambiguous package version")
 
 lines=(root/"package-manifest.tsv").read_text().splitlines()
 if lines != sorted(set(lines)): fail("package manifest is not in canonical order")
 selected={}
 for line in lines:
     columns=line.split("\t")
-    if len(columns) != 5: fail("invalid package manifest")
-    name,version,arch,filename,sha=columns
-    if name in selected: fail("duplicate selected package")
-    matches=[item for item in by_name.get(name,[]) if (item["Version"],item["Architecture"],item["Filename"],item["SHA256"]) == (version,arch,filename,sha)]
-    if len(matches) != 1: fail("manifest package is absent from Packages metadata")
+    if len(columns) != 6: fail("invalid package manifest")
+    name,version,arch,filename,sha,size=columns
+    key=(name,version,arch)
+    if key in selected: fail("duplicate selected package")
+    matches=[item for item in by_name.get(name,[]) if (item["Version"],item["Architecture"],item["Filename"],item["SHA256"],item["Size"]) == (version,arch,filename,sha,size)]
+    if not matches: fail("manifest package is absent from Packages metadata")
+    if len(matches) != 1: fail("manifest package has ambiguous signed metadata")
     if arch not in ("arm64","all"): fail("non-ARM64 package architecture")
     payload=root/"repository"/filename
-    if not payload.is_file() or digest(payload) != sha: fail("package payload SHA-256 mismatch")
-    selected[name]=matches[0]
+    if not payload.is_file() or digest(payload) != sha or payload.stat().st_size != int(size): fail("package payload hash/size mismatch against signed Packages")
+    selected[key]=matches[0]
 
 roots=[line for line in (root/"roots.txt").read_text().splitlines() if line]
 if roots != sorted(set(roots)): fail("roots are not in canonical order")
-needed=set(roots)
-queue=list(roots)
-dep_re=re.compile(r'^\s*([a-z0-9][a-z0-9+.-]*)(?:\s*\(([^)]+)\))?')
+root_keys={key for key in selected if key[0] in roots}
+if {key[0] for key in root_keys} != set(roots): fail("missing root package")
+edge_lines=(root/"dependency-edges.tsv").read_text().splitlines()
+if edge_lines != sorted(set(edge_lines)): fail("dependency edges are not in canonical order")
+requirement_lines=(root/"dependency-requirements.tsv").read_text().splitlines()
+if requirement_lines != sorted(set(requirement_lines)): fail("dependency requirements are not in canonical order")
+requirements={tuple(line.split("\t")) for line in requirement_lines}
+if any(len(item) != 6 or item[3] not in ("Depends","Pre-Depends") or not item[5] for item in requirements): fail("invalid normalized dependency requirement")
+incoming=set(); outgoing={key:[] for key in selected}
+chosen=set()
+for line in edge_lines:
+    columns=line.split("\t")
+    if len(columns) != 9: fail("invalid normalized dependency edge")
+    source=(columns[0],columns[1],columns[2]); relation=columns[3]; expression=columns[5]; target=(columns[6],columns[7],columns[8])
+    if source not in selected or target not in selected: fail("dependency edge names an unselected package")
+    if relation not in ("Depends","Pre-Depends") or not expression: fail("invalid normalized dependency relation")
+    chosen.add(tuple(columns[:6]))
+    outgoing[source].append(target); incoming.add(target)
+if chosen != requirements: fail("missing or extra chosen dependency edge")
+if set(selected)-root_keys-incoming: fail("selected package lacks a chosen dependency edge")
+reached=set(root_keys); queue=list(root_keys)
 while queue:
-    name=queue.pop()
-    if name not in selected: fail("missing root or dependency " + name)
-    for group in selected[name].get("Depends","").split(","):
-        if not group.strip(): continue
-        choices=[]
-        for alternative in group.split("|"):
-            match=dep_re.match(alternative)
-            if match and match.group(1) in selected: choices.append(match.group(1))
-        if len(choices) != 1: fail("missing or ambiguous dependency for " + name)
-        dependency=choices[0]
-        if dependency not in needed: needed.add(dependency); queue.append(dependency)
-if set(selected) != needed: fail("package manifest includes Recommends or unrelated packages")
+    for target in outgoing[queue.pop()]:
+        if target not in reached: reached.add(target); queue.append(target)
+if reached != set(selected): fail("Recommends or unrelated package is outside chosen dependency closure")
 PY
 }
 
@@ -121,7 +151,8 @@ fi
 
 [[ $# == 1 ]] || die "usage: $0 OUTPUT_DIRECTORY"
 [[ $(uname -s) == Linux && $(uname -m) == aarch64 ]] || die "producer requires Linux ARM64"
-for command in apt-get apt-cache apt-ftparchive gpgv python3 sha256sum tar zstd; do command -v "$command" >/dev/null || die "missing command: $command"; done
+for command in apt-get curl dpkg-deb gpgv python3 sha256sum tar zstd; do command -v "$command" >/dev/null || die "missing command: $command"; done
+python3 -c 'import apt_pkg' >/dev/null 2>&1 || die "python3-apt is required for canonical Debian dependency semantics"
 output=$1
 [[ ! -e $output ]] || die "output already exists: $output"
 
@@ -140,7 +171,7 @@ PY
 
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
-mkdir -p "$work/evidence/repository/pool" "$work/apt/lists/partial" "$work/apt/cache/archives/partial"
+mkdir -p "$work/evidence/repository" "$work/evidence/signed-releases" "$work/evidence/signed-indexes" "$work/apt/lists/partial" "$work/apt/cache/archives/partial"
 snapshot=20260713T000000Z
 keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg
 cat >"$work/sources.sources" <<EOF
@@ -156,28 +187,86 @@ apt-get "${apt_opts[@]}" update
 mapfile -t roots < <(printf '%s\n' build-essential ca-certificates git libssl-dev pkg-config; sed '/^[[:space:]]*$/d' "$tools" | LC_ALL=C sort -u)
 printf '%s\n' "${roots[@]}" | LC_ALL=C sort -u >"$work/evidence/roots.txt"
 DEBIAN_FRONTEND=noninteractive apt-get "${apt_opts[@]}" --yes --download-only --no-install-recommends install "${roots[@]}"
-cp -- "$work/apt/cache/archives/"*.deb "$work/evidence/repository/pool/"
-apt-ftparchive packages "$work/evidence/repository/pool" | sed 's#Filename: .*/pool/#Filename: pool/#' >"$work/evidence/repository/Packages"
 cp -- "$keyring" "$work/evidence/archive-keyring.gpg"
-mkdir -- "$work/evidence/signed-releases"
 release_count=0
-while IFS= read -r inrelease; do
+for suite in noble noble-updates noble-security; do
   release_count=$((release_count + 1))
-  destination="$work/evidence/signed-releases/$release_count.InRelease"
-  cp -- "$inrelease" "$destination"
+  mkdir -p "$work/evidence/signed-releases/$suite"
+  destination="$work/evidence/signed-releases/$suite/InRelease"
+  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "https://snapshot.ubuntu.com/ubuntu/$snapshot/dists/$suite/InRelease" --output "$destination"
   "$gpgv_bin" --status-fd 2 --keyring "$keyring" "$destination" 2>"$work/gpg.status" || die "invalid snapshot InRelease signature"
   grep -F "VALIDSIG F6ECB3762474EDA9D21B7022871920D1991BC93C" "$work/gpg.status" >/dev/null || die "unexpected Ubuntu signing fingerprint"
-done < <(find "$work/apt/lists" -type f -name '*_InRelease' -print | LC_ALL=C sort)
+  for component in main universe; do
+    mkdir -p "$work/evidence/signed-indexes/$suite/$component/binary-arm64"
+    curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "https://snapshot.ubuntu.com/ubuntu/$snapshot/dists/$suite/$component/binary-arm64/Packages.xz" --output "$work/evidence/signed-indexes/$suite/$component/binary-arm64/Packages.xz"
+  done
+done
 [[ $release_count == 3 ]] || die "expected signed InRelease evidence for noble, noble-updates, and noble-security"
-# The locally generated index is bound into the retained signed-evidence envelope.
-packages_sha=$(sha256sum "$work/evidence/repository/Packages" | cut -d' ' -f1)
-packages_size=$(wc -c <"$work/evidence/repository/Packages" | tr -d ' ')
-printf 'SHA256:\n %s %s repository/Packages\n' "$packages_sha" "$packages_size" >"$work/evidence/InRelease"
-while IFS= read -r deb; do
-  name=$(dpkg-deb -f "$deb" Package); version=$(dpkg-deb -f "$deb" Version); arch=$(dpkg-deb -f "$deb" Architecture)
-  file=pool/$(basename -- "$deb"); sha=$(sha256sum "$deb" | cut -d' ' -f1)
-  printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$version" "$arch" "$file" "$sha"
-done < <(find "$work/evidence/repository/pool" -type f -name '*.deb' -print | LC_ALL=C sort) | LC_ALL=C sort -u >"$work/evidence/package-manifest.tsv"
+python3 - "$work/evidence" "$work/apt/cache/archives" <<'PY'
+import apt_pkg,hashlib,lzma,shutil,subprocess,sys
+from pathlib import Path
+evidence,archives=map(Path,sys.argv[1:]); apt_pkg.init_system()
+def fields(raw):
+    out={}; current=None
+    for line in raw.splitlines():
+        if line.startswith((' ','\t')) and current: out[current]+="\n"+line
+        elif ': ' in line: current,value=line.split(': ',1); out[current]=value
+    return out
+upstream=[]
+for index in sorted((evidence/'signed-indexes').rglob('Packages.xz')):
+    upstream.extend(fields(raw) for raw in lzma.decompress(index.read_bytes()).decode().strip().split('\n\n'))
+selected={}; selected_raw={}
+for deb in sorted(archives.glob('*.deb')):
+    values=subprocess.check_output(['dpkg-deb','-f',str(deb),'Package','Version','Architecture'],text=True).splitlines()
+    if len(values)!=3: raise SystemExit('invalid downloaded deb control metadata')
+    name,version,arch=values; data=deb.read_bytes(); sha=hashlib.sha256(data).hexdigest(); size=str(len(data))
+    matches=[item for item in upstream if (item.get('Package'),item.get('Version'),item.get('Architecture'),item.get('SHA256'),item.get('Size'))==(name,version,arch,sha,size)]
+    if len(matches)!=1: raise SystemExit('downloaded deb is not uniquely bound to signed Packages metadata: '+name)
+    item=matches[0]; key=(name,version,arch); selected[key]=item
+    destination=evidence/'repository'/item['Filename']; destination.parent.mkdir(parents=True,exist_ok=True); shutil.copyfile(deb,destination)
+manifest=['\t'.join((*key,item['Filename'],item['SHA256'],item['Size'])) for key,item in selected.items()]
+(evidence/'package-manifest.tsv').write_text('\n'.join(sorted(manifest))+'\n')
+
+by_name={}
+providers={}
+for key,item in selected.items():
+    by_name.setdefault(key[0],[]).append(key)
+    for group in apt_pkg.parse_depends(item.get('Provides',''),False,'arm64'):
+        for provided,version,operator in group: providers.setdefault(provided.split(':',1)[0],[]).append((key,version,operator))
+requirements=[]; edges=[]
+for source,item in sorted(selected.items()):
+    for relation in ('Depends','Pre-Depends'):
+        raw=item.get(relation,'')
+        if not raw: continue
+        parsed=apt_pkg.parse_depends(raw,False,'arm64')
+        expressions=[part.strip() for part in raw.split(',')]
+        if len(expressions)!=len(parsed): raise SystemExit('APT dependency normalization mismatch')
+        for index,(expression,alternatives) in enumerate(zip(expressions,parsed)):
+            requirement=(*source,relation,str(index),expression); requirements.append('\t'.join(requirement))
+            candidates=[]
+            for position,(target,required,operator) in enumerate(alternatives):
+                base=target.split(':',1)[0]
+                for key in by_name.get(base,[]):
+                    if not operator or apt_pkg.check_dep(key[1],operator,required): candidates.append((position,key))
+                for key,provided,provided_operator in providers.get(base,[]):
+                    version=provided or key[1]
+                    if not operator or apt_pkg.check_dep(version,operator,required): candidates.append((position,key))
+            if not candidates: raise SystemExit('APT selected closure has an unsatisfied dependency: '+expression)
+            chosen=min(candidates,key=lambda value:(value[0],value[1]))[1]
+            edges.append('\t'.join((*requirement,*chosen)))
+(evidence/'dependency-requirements.tsv').write_text('\n'.join(sorted(set(requirements)))+'\n')
+(evidence/'dependency-edges.tsv').write_text('\n'.join(sorted(set(edges)))+'\n')
+local=evidence/'repository/dists/gascan/main/binary-arm64'; local.mkdir(parents=True,exist_ok=True)
+paragraphs=[]
+for key,item in sorted(selected.items()): paragraphs.append('\n'.join(f'{field}: {value}' for field,value in item.items())+'\n')
+(local/'Packages').write_text('\n'.join(paragraphs))
+PY
+mkdir -p "$work/offline/lists/partial" "$work/offline/cache/archives/partial"
+printf 'deb [trusted=yes] file:%s gascan main\n' "$work/evidence/repository" >"$work/offline.sources.list"
+offline_opts=(-o "Dir::Etc::sourcelist=$work/offline.sources.list" -o Dir::Etc::sourceparts=- -o "Dir::State::lists=$work/offline/lists" -o "Dir::Cache=$work/offline/cache" -o Dir::State::status=/dev/null -o APT::Architecture=arm64 -o APT::Install-Recommends=false -o Acquire::Retries=0 -o Dir::Bin::Methods::http=/bin/false -o Dir::Bin::Methods::https=/bin/false)
+apt-get "${offline_opts[@]}" update
+mapfile -t exact_selection < <(awk -F '\t' '{if ($3 == "all") print $1"="$2; else print $1":"$3"="$2}' "$work/evidence/package-manifest.tsv")
+apt-get "${offline_opts[@]}" --simulate --no-download --no-install-recommends install "${exact_selection[@]}" >"$work/evidence/offline-apt-check.txt"
 cat >"$work/evidence/provenance.env" <<EOF
 SNAPSHOT=2026-07-13T00:00:00Z
 BASE_IMAGE=ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab
