@@ -629,15 +629,21 @@ fn parse_manifest(bytes: &[u8]) -> Result<Vec<Entry>, DynError> {
 
 fn validate_caller_source(path: &Path, caller_uid: u32) -> Result<(), DynError> {
     let canonical = path.canonicalize()?;
+    let allowed_name = matches!(
+        path.file_name().and_then(|value| value.to_str()),
+        Some("workspace-context" | "connected-workspace-context")
+    );
     if canonical != path
-        || path.file_name().and_then(|v| v.to_str()) != Some("workspace-context")
+        || !allowed_name
         || path
             .parent()
             .and_then(Path::file_name)
             .and_then(|v| v.to_str())
             != Some(".artifacts")
     {
-        return Err("source must be the canonical caller .artifacts/workspace-context".into());
+        return Err(
+            "source must be a canonical caller .artifacts reviewed workspace context".into(),
+        );
     }
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() || metadata.uid() != caller_uid {
@@ -931,6 +937,57 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let uid = fs::symlink_metadata(temporary.path()).unwrap().uid();
         assert!(validate_caller_source(temporary.path(), uid).is_err());
+    }
+
+    fn caller_source_path(temporary: &tempfile::TempDir, name: &str) -> PathBuf {
+        let artifacts = temporary.path().join(".artifacts");
+        fs::create_dir_all(&artifacts).unwrap();
+        let source = artifacts.join(name);
+        fs::create_dir(&source).unwrap();
+        source.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn reviewed_workspace_context_names_are_accepted() {
+        for name in ["workspace-context", "connected-workspace-context"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let source = caller_source_path(&temporary, name);
+            let uid = fs::symlink_metadata(&source).unwrap().uid();
+            assert!(validate_caller_source(&source, uid).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    fn unreviewed_source_locations_are_rejected() {
+        let sibling_root = tempfile::tempdir().unwrap();
+        let sibling = caller_source_path(&sibling_root, "other-workspace-context");
+        let uid = fs::symlink_metadata(&sibling).unwrap().uid();
+        assert!(validate_caller_source(&sibling, uid).is_err());
+
+        let other_parent_root = tempfile::tempdir().unwrap();
+        let other_parent = other_parent_root.path().join("build");
+        fs::create_dir(&other_parent).unwrap();
+        let source = other_parent.join("connected-workspace-context");
+        fs::create_dir(&source).unwrap();
+        assert!(validate_caller_source(&source, uid).is_err());
+    }
+
+    #[test]
+    fn aliases_wrong_owner_and_non_directories_are_rejected() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = caller_source_path(&temporary, "connected-workspace-context");
+        let uid = fs::symlink_metadata(&source).unwrap().uid();
+        let alias = temporary.path().join(".artifacts/source-alias");
+        symlink(&source, &alias).unwrap();
+        assert!(validate_caller_source(&alias, uid).is_err());
+        assert!(validate_caller_source(&source, uid + 1).is_err());
+
+        let file_root = tempfile::tempdir().unwrap();
+        let artifacts = file_root.path().join(".artifacts");
+        fs::create_dir(&artifacts).unwrap();
+        let file = artifacts.join("connected-workspace-context");
+        fs::write(&file, b"not a directory").unwrap();
+        assert!(validate_caller_source(&file, uid).is_err());
     }
 
     #[test]
