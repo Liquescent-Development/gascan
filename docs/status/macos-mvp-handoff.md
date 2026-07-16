@@ -38,14 +38,13 @@ the polyglot toolchain.
 - The earlier builder-egress failure was caused by a local firewall. A strict
   apt-bootstrap-plus-HTTPS diagnostic build passed after correction.
 - Offline ARM64 bundles are deferred hardening and are not a Gate 4 prerequisite.
-- Private Gascamp credentials must never enter the transmitted Docker build
-  context or persist in layers, logs, evidence, or temporary host files after
-  cleanup.
-- For the MVP on Apple Containerization 1.1.0, the validated external Gascamp
-  token is copied into a fresh private host context, excluded from the
-  transmitted Docker context by `.dockerignore`, mounted only as a BuildKit
-  secret, and removed through bounded cleanup. This supersedes the infeasible
-  external-`src` command shape while preserving non-retention requirements.
+- Gascamp is publicly readable at
+  `https://github.com/Liquescent-Development/gascamp.git`; anonymous
+  `git ls-remote` succeeded on 2026-07-15. The MVP build uses no Gascamp
+  token, credential file, credential helper, authentication header, or
+  BuildKit secret.
+- The reviewed Apple BuildKit secret probe remains capability evidence but is
+  not an MVP image-build or Gate 4 prerequisite.
 
 ## Roadmap Status
 
@@ -55,7 +54,7 @@ the polyglot toolchain.
 | Phase 1 Apple feasibility / Gate 2 | Passed and integrated | `6bedef8`, `docs/feasibility/apple-container-report.md` |
 | Phase 1 core control plane / Gate 3 | Passed and integrated | `7c7d083`, integration record `917dac1` |
 | Phase 2 Apple backend implementation | Implemented and reviewed on feature branch; not integrated | head `dbf4235` |
-| Phase 2 workspace image | Connected MVP Tasks 1–5 and the Task 6 platform-neutral harness are approved; the credentialed live image gate remains | harness through `30dd514`; no approved image or live private build yet |
+| Phase 2 workspace image | Tasks 1–3 and the platform-neutral gate safety mechanisms are reviewed; Tasks 4–6 require removal of the mistaken private-Gascamp credential path before the live gate | correction design approved; no approved image or live build yet |
 | Gate 4 real lifecycle | Pending; harness approved but no complete real lifecycle evidence | harness `dbf4235` |
 | Phase 3 security, packaging, release | Not started as an integrated phase | blocked by Gate 4 |
 | Gate 5 clean-host release | Pending | no evidence |
@@ -112,16 +111,11 @@ The harness is approved; Gate 4 itself is not passed.
   minimal context preparation with offline mode preserved.
 - `7a429cb`: approved connected Ubuntu and mise polyglot base assembly with
   exact reviewed package input and preserved final-user contracts.
-- `b03add2`: approved structural pinned-Gascamp secret-mounted builder and
-  final `/out` credential/source boundary; no real private build was run.
-- `3517415`: partial, unaccepted connected build orchestrator. The reviewed
-  snapshot helper exposes only `create`, `path`, and `finish`, seals roots
-  `0555`, and cannot stage the private secret. The approved revision keeps the
-  helper unchanged and copies its sealed public snapshot into a separate
-  unprivileged private wrapper before descriptor-safe secret staging.
-- `61fd8d9`: approved connected build orchestrator, descriptor-safe wrapper,
-  bounded credential-blind snapshot lifecycle, structured inspection, and
-  committed receipt-pair validation. No real private image build was run.
+- `b03add2`: reviewed secret-mounted Gascamp builder from the now-corrected
+  private-repository assumption; must be simplified to anonymous public fetch.
+- `61fd8d9`: reviewed connected orchestrator and receipt validation. Its
+  secret/wrapper path is now unnecessary; retain its public snapshot,
+  structured inspection, cleanup, and receipt protections.
 - `30dd514`: independently approved platform-neutral connected image gate
   harness with transactional publication, bounded ownership-checked cleanup,
   real-smoke fake-controller coverage, and authoritative residue inventory.
@@ -149,6 +143,10 @@ image evidence. `images/workspace/versions.lock` still says
 Do not encode the operator DNS IP into Gas Can product policy.
 
 ## Current Unfinished Work
+
+Correction: Gascamp is public. Ignore the obsolete credential wording in item
+1 below; Tasks 4–6 must remove the token, secret-mount, helper, and wrapper
+paths, then run the live gate anonymously at the exact pinned revision.
 
 1. Provide an authorized absolute `GASCAMP_READ_TOKEN_FILE` outside the
    repository, owned by the current UID, regular and non-symlink, mode `0600`.

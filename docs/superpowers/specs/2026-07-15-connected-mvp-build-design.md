@@ -50,56 +50,34 @@ The build must fail if a required version, digest, platform, image-user,
 sudo/init, volume, browser, runtime, or Gascamp contract is not satisfied. A
 successful build records the final `linux/arm64` image reference and digest.
 
-## Gascamp Credential Boundary
+## Public Gascamp Source Boundary
 
-Private Gascamp access uses Apple BuildKit's secret mount. Apple
-Containerization 1.1.0 requires the secret source to be a descendant of the
-host context directory, so the build orchestrator copies the validated
-owner-only token into a fresh `0700` temporary context under a fixed private
-path with mode `0600`. That path is excluded by `.dockerignore` and supplied
-only through `--secret`; it is not part of the transmitted Docker build
-context.
+`https://github.com/Liquescent-Development/gascamp.git` is publicly readable.
+An anonymous `git ls-remote` on 2026-07-15 returned its public refs without
+authentication. The MVP therefore uses no Gascamp token, BuildKit secret,
+credential helper, or credential file.
 
-The original token remains outside the repository, and both it and the staged
-copy must be regular files owned by the current UID with mode `0600`. The
-staged token must never be referenced by `COPY`, passed through `ARG` or `ENV`,
-persisted in a layer, printed in logs, included in evidence, or left after the
-build. Tests must prove exclusion from the transmitted context and absence
-from command text, transcripts, image history, and the exported final
-filesystem. Cleanup must cover success, failure, `INT`, and `TERM`.
+The build fetches only the locked revision
+`f6b248c5926240856dbea83d1d2c5c90ea1c1456` from the clean HTTPS URL, verifies
+`git rev-parse HEAD` byte-for-byte, removes `.git`, and runs Cargo with
+`--locked`. Only the reviewed binaries, relative symlink, and revision receipt
+enter the final image. Tests reject authentication headers, credential
+helpers, token variables, URLs containing userinfo, mutable refs, unlocked
+Cargo commands, and source or Git metadata in the final stage.
 
-This is the approved MVP boundary. A connected CI-produced, digest-verified
-source artifact remains a future alternative if the local builder boundary
-proves insufficient.
+The reviewed Apple BuildKit secret probe remains useful capability evidence,
+but it is not required by the public Gascamp MVP build or Roadmap Gates 4–5.
 
-### Connected build wrapper
+### Connected build snapshot
 
-The connected orchestrator keeps the reviewed privileged snapshot helper
-unchanged and credential-blind. The helper creates and seals only the public
-Task 2 context through its existing `create`, `path`, and `finish` interface.
-The unprivileged orchestrator then creates a separate user-owned `0700`
-temporary wrapper, copies the sealed public snapshot into it through a
-descriptor-safe Rust helper, and verifies that the copied public manifest
-matches the canonical Task 2 context digest.
+The connected orchestrator uses the unchanged privileged snapshot helper's
+existing `create`, `path`, and `finish` interface to obtain a sealed public
+Task 2 context. It verifies the canonical context manifest before and after
+the build and passes that sealed snapshot directly to Apple BuildKit. No
+unprivileged secret wrapper or credential staging is needed.
 
-The wrapper is created with `mktemp` beneath `${TMPDIR:-/tmp}` and then
-canonicalized; it does not depend on `/private` or any other pre-created
-privileged directory. Tests compare the secret source path relationally to
-that captured wrapper rather than requiring a fixed host pathname.
-
-That same unprivileged helper opens the original token without following
-symlinks, validates ownership and mode through the opened descriptor, and
-writes a new `0600` file at `.build-secrets/gascamp_read_token` beneath the
-wrapper. The wrapper's exact `.dockerignore` excludes `.build-secrets`.
-BuildKit receives only the staged wrapper path through `--secret`; no fixed
-`/private/context` mount or new sudoers permission is required.
-
-After the build, the orchestrator revalidates the wrapper's public manifest,
-the staged secret's descriptor identity and content digest, and all receipt
-inputs before publication. Cleanup removes the user-owned wrapper and calls
-the snapshot helper's existing `finish` operation on success, failure,
-`INT`, and `TERM`. The privileged helper never reads, copies, or deletes a
-credential.
+Cleanup calls the snapshot helper's existing `finish` operation on success,
+failure, `INT`, and `TERM`. The helper handles public build inputs only.
 
 The JSON receipt is published before the reference file. The reference is the
 transaction commit marker: consumers reject a missing reference or JSON whose
@@ -138,9 +116,8 @@ The connected workspace image plan must:
 1. replace the offline-only build invocation with a connected, locked build;
 2. preserve the reviewed workspace user, guest-root sudo, tini, volumes, mise,
    Chromium, Gascamp selector, and exact inventory contracts;
-3. prove private Gascamp credentials are excluded from the transmitted build
-   context and leave no temporary-file, layer, command-text, log, filesystem,
-   or evidence residue;
+3. fetch the exact public Gascamp revision anonymously and prove no mutable
+   reference, source tree, or Git metadata enters the final image;
 4. build and smoke-test a digest-qualified `linux/arm64` image on Apple
    Containerization 1.1;
 5. hand that exact image reference to the reviewed Gate 4 lifecycle harness;

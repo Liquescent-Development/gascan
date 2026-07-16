@@ -13,11 +13,11 @@
 > that explicitly resumes implementation; do not infer authorization to begin
 > merely from discovering this file.
 
-**Goal:** Build and smoke-test the locked Gas Can `linux/arm64` workspace image with Apple Containerization 1.1 using connected public acquisition and a non-persistent private Gascamp build secret, then hand its exact digest-qualified reference to Roadmap Gate 4.
+**Goal:** Build and smoke-test the locked Gas Can `linux/arm64` workspace image with Apple Containerization 1.1 using connected public acquisition, including anonymous pinned Gascamp source, then hand its exact digest-qualified reference to Roadmap Gate 4.
 
-**Architecture:** Keep the reviewed offline-bundle path as a deferred, separate entrypoint, but make the MVP entrypoint a connected build. The host verifies small immutable artifacts and the base image; the Dockerfile uses signed Ubuntu repositories, exact mise configuration, locked runtime versions, and a BuildKit secret mount for the pinned private Gascamp revision. A live image gate accepts only the reference emitted by structured image inspection and runs all existing owner-scoped smoke tests before producing evidence.
+**Architecture:** Keep the reviewed offline-bundle path as a deferred, separate entrypoint, but make the MVP entrypoint a connected build. The host verifies small immutable artifacts and the base image; the Dockerfile uses signed Ubuntu repositories, exact mise configuration, locked runtime versions, and an anonymous fetch of the pinned public Gascamp revision. A live image gate accepts only the reference emitted by structured image inspection and runs all existing owner-scoped smoke tests before producing evidence.
 
-**Tech Stack:** Rust 1.95+ test utilities, Bash with `set -euo pipefail`, Apple `container` CLI 1.1.0, BuildKit Dockerfile secret mounts, Ubuntu 24.04 ARM64, mise 2026.5.0, Cargo locked builds, Git, TOML, jq.
+**Tech Stack:** Rust 1.95+ test utilities, Bash with `set -euo pipefail`, Apple `container` CLI 1.1.0, Ubuntu 24.04 ARM64, mise 2026.5.0, Cargo locked builds, Git, TOML, jq.
 
 ## Global Constraints
 
@@ -28,8 +28,7 @@
 - The existing offline bundle producers, validators, snapshot helper, and PENDING evidence remain truthful deferred work; do not delete their commits or claim their gate.
 - Ubuntu package metadata is authenticated by the Ubuntu archive keyring. Bootstrap may use the distribution's signed HTTP apt source; general artifact downloads use HTTPS and locked digests where the upstream publishes stable bytes.
 - Every mise tool version exactly matches `images/workspace/versions.lock` and `images/workspace/etc/mise/config.toml`; `latest`, `stable`, `lts`, and wildcard selectors are forbidden.
-- Gascamp is exactly revision `f6b248c5926240856dbea83d1d2c5c90ea1c1456`. Cargo commands use `--locked`. The private read token originates in an owner-only file outside the repository. For Apple Containerization 1.1.0, Gas Can stages a `0600` copy beneath a fresh `0700` temporary host context and supplies that copy only through a BuildKit secret mount.
-- The staged secret path is excluded by `.dockerignore` and must not enter the transmitted Docker build context. The token value must never appear in Dockerfile arguments, environment declarations, transmitted context content, image history, image filesystem, build transcript, evidence, or process command text constructed by Gas Can.
+- Gascamp is fetched anonymously from the public clean HTTPS URL at exactly revision `f6b248c5926240856dbea83d1d2c5c90ea1c1456`. Cargo commands use `--locked`; mutable refs, authentication headers, credential helpers, token variables, and URLs containing userinfo are forbidden.
 - The final image default is `workspace:workspace` UID/GID 1000. Guest root remains available through the reviewed passwordless sudo policy. tini, volumes, Chromium, selector, ownership, and read-only bundled-tool contracts remain unchanged.
 - Every live test creates exact token-owned names, validates ownership before mutation, handles `INT` and `TERM`, bounds waits, and proves no current-token resource remains.
 - Gate 4 remains pending until its complete real CLI lifecycle passes; a successful image gate is not Gate 4 evidence.
@@ -37,6 +36,10 @@
 ---
 
 ### Task 1: Prove Apple BuildKit secret mounts and non-retention
+
+> **Retained capability evidence:** This completed probe is preserved, but the
+> public Gascamp MVP build does not consume a secret and Tasks 4–6 must not
+> require this probe or a credential file.
 
 **Files:**
 - Create: `scripts/probe-apple-build-secret.sh`
@@ -150,7 +153,7 @@ git commit -m "test: prove Apple build secret isolation"
 
 **Interfaces:**
 - Consumes: the immutable base-image digest, mise and Chromium URL/digest records, exact tool versions, and Gascamp revision from `versions.lock`.
-- Produces: `.artifacts/connected-workspace-context` plus a canonical manifest digest; it contains reviewed public artifacts and source files but no offline bundles or private token.
+- Produces: `.artifacts/connected-workspace-context` plus a canonical manifest digest; it contains reviewed public artifacts and source files but no offline bundles or credential material.
 
 - [ ] **Step 1: Write RED lock and context tests**
 
@@ -306,25 +309,24 @@ git add images/workspace/Dockerfile scripts/tests/connected_dockerfile.rs script
 git commit -m "build: assemble connected polyglot workspace base"
 ```
 
-### Task 4: Build pinned private Gascamp without retaining credentials
+### Task 4: Build pinned public Gascamp anonymously
 
 **Files:**
 - Modify: `images/workspace/Dockerfile`
-- Create: `scripts/tests/gascamp_build_secret.rs`
+- Modify: `scripts/tests/gascamp_build_secret.rs`
 - Modify: `tests/image/gascamp-smoke.sh`
 - Modify: `scripts/tests/polyglot_image_contract.rs`
 
 **Interfaces:**
-- Consumes: BuildKit secret `gascamp_read_token` and locked 40-character `GASCAMP_REVISION` build argument containing no credential.
-- Produces: `/opt/gascan/gascamp/bin/camp`, relative `campd` symlink, and root-owned read-only `/opt/gascan/gascamp/REVISION`; no source, `.git`, Cargo cache, or secret enters the final stage.
+- Consumes: public URL `https://github.com/Liquescent-Development/gascamp.git` and locked 40-character `GASCAMP_REVISION` build argument.
+- Produces: `/opt/gascan/gascamp/bin/camp`, relative `campd` symlink, and root-owned read-only `/opt/gascan/gascamp/REVISION`; no source, `.git`, Cargo cache, authentication configuration, or credential enters the final stage.
 
-- [ ] **Step 1: Write RED credential-boundary tests**
+- [ ] **Step 1: Write RED anonymous-source boundary tests**
 
 Require the Gascamp builder to contain:
 
 ```rust
 for required in [
-    "RUN --mount=type=secret,id=gascamp_read_token,required=true",
     "https://github.com/Liquescent-Development/gascamp.git",
     "git rev-parse HEAD",
     "$GASCAMP_REVISION",
@@ -335,17 +337,20 @@ for required in [
     assert!(dockerfile.contains(required), "missing Gascamp boundary: {required}");
 }
 for forbidden in [
+    "--mount=type=secret",
+    "credential.helper",
+    "http.extraHeader",
     "ARG GASCAMP_READ_TOKEN",
     "ENV GASCAMP_READ_TOKEN",
     "COPY .git",
     "COPY --from=gascamp-builder /root",
     "bundles/gascamp_source_vendor",
 ] {
-    assert!(!dockerfile.contains(forbidden), "credential/source leak: {forbidden}");
+        assert!(!dockerfile.contains(forbidden), "authentication/source leak: {forbidden}");
 }
 ```
 
-The test must also reject a clone URL containing `@github.com` so a token cannot be interpolated into the URL. Require a Git credential helper that reads `/run/secrets/gascamp_read_token` at credential-request time and emits the fixed username `x-access-token` without placing the token in the Dockerfile or command argument.
+The test must reject URLs containing userinfo such as `@github.com`, any Git credential helper or authentication header, mutable refs, a revision other than the exact approved SHA, and any final-stage source or Git metadata.
 
 - [ ] **Step 2: Verify RED**
 
@@ -353,53 +358,29 @@ The test must also reject a clone URL containing `@github.com` so a token cannot
 cargo test --manifest-path scripts/Cargo.toml --test gascamp_build_secret
 ```
 
-Expected: FAIL on the offline bundle copy.
+Expected: FAIL because the current builder still contains the unnecessary secret mount and credential helper.
 
-- [ ] **Step 3: Implement the secret-mounted builder stage**
+- [ ] **Step 3: Implement the anonymous pinned builder stage**
 
-Within one secret-mounted `RUN` instruction:
-
-1. install a temporary credential-helper script whose source contains only the secret-file path, never its content;
-2. clone without embedding credentials in the URL;
-3. detach at the exact `GASCAMP_REVISION` and verify `git rev-parse HEAD` equals it;
-4. remove `.git` and the helper before compilation output is copied;
-5. run exact locked tests and release build using the mise-installed Cargo;
-6. strip and install only `camp`, `campd`, and `REVISION` beneath `/out`;
-7. make `/out` read-only.
-
-Use a cache directory only if it is a BuildKit cache mount and no credential can be written to it. The minimal MVP implementation should omit the cache mount.
-
-Use this credential and fetch shape; the helper source contains only the fixed
-secret mount path, and the Git command contains no token:
+Within one ordinary `RUN` instruction, fetch anonymously from the fixed public
+URL, detach at the exact revision, verify HEAD, remove `.git`, run locked tests
+and release build, and install only the reviewed output boundary:
 
 ```Dockerfile
 ARG GASCAMP_REVISION
-RUN --mount=type=secret,id=gascamp_read_token,required=true \
-    set -eu; \
+RUN set -eu; \
+    test "$GASCAMP_REVISION" = "f6b248c5926240856dbea83d1d2c5c90ea1c1456"; \
     install -d -m 0700 /tmp/gascamp; \
-    printf '%s\n' \
-      '#!/bin/sh' \
-      'case "${1:-get}" in' \
-      '  get)' \
-      "    printf '%s\\n' 'username=x-access-token'" \
-      "    printf 'password=%s\\n' \"\$(cat /run/secrets/gascamp_read_token)\"" \
-      '    ;;' \
-      'esac' >/tmp/gascamp-credential; \
-    chmod 0700 /tmp/gascamp-credential; \
     cd /tmp/gascamp; \
     git init; \
     git remote add origin https://github.com/Liquescent-Development/gascamp.git; \
-    git -c credential.helper=/tmp/gascamp-credential -c credential.useHttpPath=true \
-         fetch --depth=1 origin "$GASCAMP_REVISION"; \
+    git fetch --depth=1 origin "$GASCAMP_REVISION"; \
     git checkout --detach FETCH_HEAD; \
     test "$(git rev-parse HEAD)" = "$GASCAMP_REVISION"; \
-    rm -rf .git /tmp/gascamp-credential; \
+    rm -rf .git; \
     cargo test --locked; \
     cargo build --locked --release --bin camp
 ```
-
-A test must reject a Dockerfile where the secret-mounted instruction ends
-before `git fetch`.
 
 - [ ] **Step 4: Run structural tests**
 
@@ -414,7 +395,7 @@ Expected: PASS.
 
 ```sh
 git add images/workspace/Dockerfile scripts/tests/gascamp_build_secret.rs scripts/tests/polyglot_image_contract.rs tests/image/gascamp-smoke.sh
-git commit -m "build: compile pinned Gascamp with build secret"
+git commit -m "build: fetch pinned public Gascamp anonymously"
 ```
 
 ### Task 5: Add the connected build orchestrator and exact reference receipt
@@ -427,24 +408,22 @@ git commit -m "build: compile pinned Gascamp with build secret"
 - Modify: `scripts/tests/image_lock.rs`
 
 **Interfaces:**
-- Consumes: Task 2 context and canonical context digest, the sealed public snapshot returned by the unchanged reviewed helper, exact local base inspection, and `GASCAMP_READ_TOKEN_FILE` validated and privately staged by Task 1 rules.
+- Consumes: Task 2 context and canonical context digest, the sealed public snapshot returned by the unchanged reviewed helper, and exact local base inspection.
 - Produces: atomic `.artifacts/workspace-image-ref` matching exactly `^gascan-workspace:[a-z0-9._-]+@sha256:[0-9a-f]{64}$` and `.artifacts/workspace-image-build.json` containing platform, lock digest, context digest, image digest, Apple version, and sanitized timestamps/status.
 
 - [ ] **Step 1: Write failing fake-runner tests**
 
 Cover these cases with a fake `container` executable:
 
-- missing, relative, foreign-owned, group/world-readable, symlink, empty, or repository-contained source secret file fails before staging or `container build`;
-- staged-secret creation, permission, `.dockerignore`, or transmitted-context exclusion failure prevents `container build`;
-- the privileged helper is invoked only through `create`, `path`, and `finish`; it never receives the source or staged secret path;
-- the sealed public snapshot is copied into a separate current-UID-owned `0700` wrapper created by `mktemp -d "${TMPDIR:-/tmp}/gascan-connected-build.XXXXXX"`, and its public manifest must equal the Task 2 context digest before and after build;
-- source-secret validation and copying use one no-follow file descriptor so a pathname swap cannot change the validated bytes;
+- any credential variable, credential file, secret mount, authentication header, or wrapper path fails before `container build`;
+- the privileged helper is invoked only through `create`, `path`, and `finish` for the sealed public context;
+- the sealed public snapshot manifest must equal the Task 2 context digest before and after build;
 - context verification failure or changed post-build digest fails without publishing a reference;
-- build invocation has exactly one `--secret`, exact `BASE_IMAGE`, exact `GASCAMP_REVISION`, `--arch arm64`, and no token value;
+- build invocation has no `--secret`, exact `BASE_IMAGE`, exact `GASCAMP_REVISION`, and `--arch arm64`;
 - structured inspect must report `linux/arm64` and the exact built tag;
 - malformed/mutable/mismatched image output fails;
 - JSON is atomically published first and the reference atomically published last as the commit marker; interruption between them must not expose an accepted new reference with stale or missing JSON;
-- stdout, stderr, argv, receipts, and retained files do not contain a synthetic token.
+- stdout, stderr, argv, receipts, and retained files contain no authentication material.
 
 The expected fixed invocation slice is:
 
@@ -455,12 +434,6 @@ let required = [
     "--build-arg", "GASCAMP_REVISION=f6b248c5926240856dbea83d1d2c5c90ea1c1456",
 ];
 ```
-
-The secret argument is relational rather than a fixed absolute path: tests
-must capture the canonical wrapper returned by `mktemp`, then require exactly
-`--secret id=gascamp_read_token,src=$wrapper/.build-secrets/gascamp_read_token`.
-The production path must never require `/private` or another pre-created
-privileged directory.
 
 - [ ] **Step 2: Verify RED**
 
@@ -476,17 +449,15 @@ Make `scripts/build-workspace-image.sh` a mode dispatcher driven by the exact lo
 
 The connected script must use the already-reviewed privileged snapshot helper
 only to create, locate, and finish a sealed public snapshot. It must create a
-separate unprivileged `0700` wrapper, copy the sealed public snapshot and stage
-the validated external secret beneath that wrapper through descriptor-safe
-Rust code, pass only the staged wrapper path to BuildKit, and reverify the
-public manifest, staged secret, and secret exclusion after build. The helper
-and sudoers contract remain unchanged and never receive a credential path.
+sealed public context, pass that snapshot directly to BuildKit, and reverify
+the public manifest after build. The helper and sudoers contract remain
+unchanged. No credential input, secret mount, or wrapper context exists.
 
 Publish the fully validated JSON receipt first and the reference file last.
 The reference is the commit marker; every consumer must reject receipt pairs
 whose tag, image digest, context digest, or lock digest disagree. The script
-must remove the wrapper and finish the privileged public snapshot through
-bounded traps. It must never capture or print the secret.
+must finish the privileged public snapshot through bounded traps. It must
+reject any authentication input or secret-bearing build option.
 
 - [ ] **Step 4: Run focused and full scripts suites**
 
@@ -550,7 +521,7 @@ Expected: FAIL because the gate does not exist.
 
 The gate sequence is fixed:
 
-1. validate controller and secret-file preconditions;
+1. validate controller preconditions and reject any obsolete credential input;
 2. run connected prefetch;
 3. run connected build;
 4. validate both receipts and exact `linux/arm64` inspection;
@@ -572,22 +543,24 @@ Expected: PASS.
 
 - [ ] **Step 5: Run the real gate**
 
-Create the private token file outside the repository, mode `0600`, then run:
-
 ```sh
 sudo -v
-GASCAMP_READ_TOKEN_FILE=/absolute/private/path/gascamp-read-token \
-  ./scripts/run-connected-image-gate.sh
+./scripts/run-connected-image-gate.sh
 ```
 
-Expected: one connected ARM64 build; all three smokes PASS; evidence records a digest-qualified image and no current-token residue. If credentials, registry access, Apple runtime, or network policy fail, record the exact blocker and do not create PASS evidence.
+Expected: one anonymous connected ARM64 build; all three smokes PASS;
+evidence records a digest-qualified image and no current-token residue. If
+public source access, registry access, Apple runtime, or network policy fails,
+record the exact blocker and do not create PASS evidence.
 
 - [ ] **Step 6: Independently review evidence and commit**
 
 Review must compare the evidence image reference and
 `images/workspace/approved-image.txt` byte-for-byte to structured live
-inspection and verify the secret value is absent from the repository, build
-transcript, image history, and exported final filesystem.
+inspection and verify that no credential input, authentication header,
+credential helper, secret mount, Gascamp source tree, or `.git` metadata is
+present in the repository changes, build transcript, image history, or
+exported final filesystem.
 
 ```sh
 git add scripts/run-connected-image-gate.sh scripts/tests/connected_image_gate.rs tests/image docs/evidence/connected-workspace-image.md images/workspace/approved-image.txt
