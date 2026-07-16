@@ -10,22 +10,23 @@ reviewed_revision='f6b248c5926240856dbea83d1d2c5c90ea1c1456'
 die() { printf 'connected workspace image build: %s\n' "$*" >&2; exit 1; }
 run_tool() { cargo run --quiet --locked --offline --manifest-path "$root/scripts/Cargo.toml" --bin "$1" -- "${@:2}"; }
 top_value() { awk -F ' = ' -v key="$1" '$1 == key { gsub(/^"|"$/, "", $2); print $2; exit }' "$lock"; }
+
+for name in GASCAMP_READ_TOKEN GASCAMP_READ_TOKEN_FILE GITHUB_TOKEN GH_TOKEN HTTP_AUTHORIZATION AUTHORIZATION; do
+  test -z "${!name:-}" || die "authentication input is forbidden: $name"
+done
+for argument in "$@"; do
+  case "$argument" in --secret|--secret=*|*Authorization:*|*authorization:*) die 'secret-bearing build option is forbidden' ;; esac
+done
+test "$#" -eq 0 || die 'unexpected build argument'
+
 operation_timeout=${GASCAN_CONNECTED_TIMEOUT_SECONDS:-300}
 case "$operation_timeout" in ''|*[!0-9]*) die 'timeout must be a positive integer' ;; esac
 test "$operation_timeout" -gt 0 || die 'timeout must be a positive integer'
 run_bounded() {
-  timeout_seconds=$1
-  shift
+  timeout_seconds=$1; shift
   set -m
   "$@" & command_pid=$!
-  (
-    sleep "$timeout_seconds"
-    if kill -0 "$command_pid" 2>/dev/null; then
-      kill -TERM -- "-$command_pid" 2>/dev/null || true
-      sleep 1
-      kill -KILL -- "-$command_pid" 2>/dev/null || true
-    fi
-  ) & watchdog_pid=$!
+  ( sleep "$timeout_seconds"; if kill -0 "$command_pid" 2>/dev/null; then kill -TERM -- "-$command_pid" 2>/dev/null || true; sleep 1; kill -KILL -- "-$command_pid" 2>/dev/null || true; fi ) & watchdog_pid=$!
   set +m
   if wait "$command_pid"; then result=0; else result=$?; fi
   kill -TERM -- "-$watchdog_pid" 2>/dev/null || true
@@ -42,18 +43,11 @@ test "$gascamp_revision" = "$reviewed_revision" || die 'Gascamp revision differs
 tag=$(top_value workspace_tag)
 [[ "$tag" =~ ^gascan-workspace:[a-z0-9._-]+$ ]] || die 'workspace tag is not exact'
 
-test -n "${GASCAMP_READ_TOKEN_FILE:-}" || die 'GASCAMP_READ_TOKEN_FILE is required'
-case "$GASCAMP_READ_TOKEN_FILE" in /*) ;; *) die 'secret path must be absolute' ;; esac
-case "$GASCAMP_READ_TOKEN_FILE" in "$root"|"$root"/*) die 'secret file must be outside the repository' ;; esac
 snapshot_helper='/Library/PrivilegedHelperTools/dev.gascan.snapshot-workspace-context'
 snapshot_receipt=''
-wrapper=''
-helper_sha256=''
-helper_device=''
-helper_inode=''
+helper_sha256=''; helper_device=''; helper_inode=''
 cleanup() {
   status=${1:-$?}
-  test -z "$wrapper" || rm -rf "$wrapper" || status=1
   test -z "$snapshot_receipt" || run_bounded "$operation_timeout" sudo -n "$snapshot_helper" --self "$helper_sha256" "$helper_device" "$helper_inode" finish "$snapshot_receipt" >/dev/null || status=1
   exit "$status"
 }
@@ -61,14 +55,6 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 started_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-tmp_base=${TMPDIR:-/tmp}
-tmp_base=${tmp_base%/}
-wrapper=$(mktemp -d "$tmp_base/gascan-connected-build.XXXXXX")
-wrapper=$(cd "$wrapper" && pwd -P)
-chmod 0700 "$wrapper"
-secret_identity=$(run_tool validate-connected-build stage-secret "$wrapper" "$GASCAMP_READ_TOKEN_FILE" "$root") || die 'secret source is unsafe'
-[[ "$secret_identity" =~ ^[0-9a-f]{64}$ ]] || die 'secret identity is invalid'
-
 context_manifest=$(run_tool prepare-workspace-context --verify-connected "$root" "$lock" "$artifacts" "$context")
 [[ "$context_manifest" =~ ^[0-9a-f]{64}$ ]] || die 'context verifier returned an invalid digest'
 helper_identity=$(run_tool snapshot-helper-identity "$snapshot_helper") || die 'snapshot helper identity is unsafe'
@@ -76,24 +62,18 @@ IFS=$'\t' read -r helper_sha256 helper_device helper_inode <<<"$helper_identity"
 snapshot_receipt=$(run_bounded "$operation_timeout" sudo -n "$snapshot_helper" --self "$helper_sha256" "$helper_device" "$helper_inode" create "$context" "$context_manifest") || die 'snapshot creation failed'
 snapshot=$(run_bounded "$operation_timeout" sudo -n "$snapshot_helper" --self "$helper_sha256" "$helper_device" "$helper_inode" path "$snapshot_receipt") || die 'snapshot validation failed'
 test -d "$snapshot" || die 'sealed public snapshot is unavailable'
-run_tool validate-connected-build copy-public "$snapshot" "$wrapper" "$context_manifest" || die 'public wrapper preparation failed'
-if tar -cf - --exclude='./.build-secrets' -C "$wrapper" . | tar -tf - | grep -q '^\./\.build-secrets'; then
-  die 'secret entered transmitted context'
-fi
+snapshot_manifest=$(shasum -a 256 "$snapshot/context-manifest.tsv" | cut -d' ' -f1)
+test "$snapshot_manifest" = "$context_manifest" || die 'sealed public manifest differs before build'
 
 base_inspect=$(container image inspect --format json "$base_image")
 test "$(printf '%s' "$base_inspect" | run_tool validate-image-inspect)" = "${base_image#ubuntu@}" || die 'exact local base is unavailable'
 container build --arch arm64 \
-  --secret "id=gascamp_read_token,src=$wrapper/.build-secrets/gascamp_read_token" \
   --build-arg "BASE_IMAGE=$base_image" \
   --build-arg "GASCAMP_REVISION=$gascamp_revision" \
-  --tag "$tag" --file "$wrapper/Dockerfile" "$wrapper" >/dev/null 2>&1
+  --tag "$tag" --file "$snapshot/Dockerfile" "$snapshot" >/dev/null 2>&1
 
+test "$(shasum -a 256 "$snapshot/context-manifest.tsv" | cut -d' ' -f1)" = "$context_manifest" || die 'sealed public manifest changed during build'
 test "$(run_tool prepare-workspace-context --verify-connected "$root" "$lock" "$artifacts" "$context")" = "$context_manifest" || die 'workspace context changed during build'
-run_tool validate-connected-build verify-wrapper "$wrapper" "$context_manifest" "$secret_identity" || die 'private wrapper changed during build'
-if tar -cf - --exclude='./.build-secrets' -C "$wrapper" . | tar -tf - | grep -q '^\./\.build-secrets'; then
-  die 'secret entered post-build transmitted context'
-fi
 image_inspect=$(container image inspect --format json "$tag")
 image_digest=$(printf '%s' "$image_inspect" | run_tool validate-connected-build "$tag") || die 'built image inspect is invalid'
 reference="$tag@$image_digest"
@@ -102,11 +82,7 @@ reference="$tag@$image_digest"
 mkdir -p "$artifacts"
 ref_tmp=$(mktemp "$artifacts/.workspace-image-ref.XXXXXX")
 json_tmp=$(mktemp "$artifacts/.workspace-image-build.XXXXXX")
-cleanup_publication() {
-  status=$?
-  rm -f "$ref_tmp" "$json_tmp" || status=1
-  cleanup "$status"
-}
+cleanup_publication() { status=$?; rm -f "$ref_tmp" "$json_tmp" || status=1; cleanup "$status"; }
 trap cleanup_publication EXIT
 printf '%s\n' "$reference" >"$ref_tmp"
 lock_digest=$(shasum -a 256 "$lock" | cut -d' ' -f1)
