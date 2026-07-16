@@ -74,3 +74,11 @@ multi-source shell form, and stage copies structurally, while rejecting tabs,
 quoting/JSON, continuations, unknown flags, and malformed operands. Sealed
 source modes are derived from source executability (0444/0555), independently
 of Docker destination `--chmod`; generated artifacts remain explicitly mapped.
+
+Escape directives are now explicitly unsupported and rejected across case and
+leading-space variants, including both backtick and default backslash forms;
+an end-to-end mutation proves they cannot hide an unsealed multiline COPY.
+A fixture-local repository directory COPY now passes through real assembly and
+recursively verifies exact descendants and normalized 0444/0555 modes. Nested
+symlink, FIFO special-file, and token-like filename mutations each fail without
+publishing a context.

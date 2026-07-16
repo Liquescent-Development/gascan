@@ -390,7 +390,17 @@ pub fn parse_dockerfile_copies(text: &str) -> Result<Vec<DockerCopy>, DynError> 
     let mut copies = Vec::new();
     for raw in text.lines() {
         let line = raw.trim_start_matches(' ');
-        if line.is_empty() || line.starts_with('#') {
+        if let Some(comment) = line.strip_prefix('#') {
+            let directive = comment.trim_start();
+            if directive
+                .split_once('=')
+                .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("escape"))
+            {
+                return Err("Dockerfile escape directives are unsupported".into());
+            }
+            continue;
+        }
+        if line.is_empty() {
             continue;
         }
         let mut words = line.split_ascii_whitespace();

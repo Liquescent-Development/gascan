@@ -125,22 +125,7 @@ fn every_local_dockerfile_copy_source_is_sealed_with_exact_bytes_and_mode() {
             }
             let original = fixture.repository.join(&source);
             let sealed = fixture.context.join(&source);
-            assert_eq!(
-                fs::read(&sealed).unwrap(),
-                fs::read(&original).unwrap(),
-                "COPY source bytes differ: {source}"
-            );
-            let expected_mode =
-                if fs::metadata(&original).unwrap().permissions().mode() & 0o111 != 0 {
-                    0o555
-                } else {
-                    0o444
-                };
-            assert_eq!(
-                fs::metadata(&sealed).unwrap().permissions().mode() & 0o777,
-                expected_mode,
-                "COPY source mode differs: {source}"
-            );
+            assert_sealed_tree(&original, &sealed);
         }
     }
 }
@@ -158,8 +143,112 @@ fn docker_copy_parser_is_structural_and_fail_closed() {
         "COPY a \\",
         "COPY --unknown=x a b",
         "COPY 'a' b",
+        "# escape=`\nCOPY safe /dest",
+        "  # EsCaPe=\\\nCOPY safe /dest",
     ] {
         assert!(parse_dockerfile_copies(invalid).is_err());
+    }
+}
+
+fn assert_sealed_tree(original: &Path, sealed: &Path) {
+    let metadata = fs::symlink_metadata(original).unwrap();
+    assert!(!metadata.file_type().is_symlink());
+    if metadata.is_dir() {
+        let mut names: Vec<_> = fs::read_dir(original)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        let mut sealed_names: Vec<_> = fs::read_dir(sealed)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        sealed_names.sort();
+        assert_eq!(names, sealed_names);
+        for name in names {
+            assert_sealed_tree(&original.join(&name), &sealed.join(name));
+        }
+    } else {
+        assert!(metadata.is_file());
+        assert_eq!(fs::read(original).unwrap(), fs::read(sealed).unwrap());
+        let expected = if metadata.permissions().mode() & 0o111 != 0 {
+            0o555
+        } else {
+            0o444
+        };
+        assert_eq!(
+            fs::metadata(sealed).unwrap().permissions().mode() & 0o777,
+            expected
+        );
+    }
+}
+
+fn append_directory_copy(fixture: &Fixture) -> PathBuf {
+    let source = fixture
+        .repository
+        .join("images/workspace/tests/directory-source");
+    fs::create_dir_all(source.join("nested")).unwrap();
+    fs::write(source.join("plain"), "plain\n").unwrap();
+    fs::write(source.join("nested/executable"), "#!/bin/sh\n").unwrap();
+    fs::set_permissions(
+        source.join("nested/executable"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let dockerfile = fixture.repository.join("images/workspace/Dockerfile");
+    let mut text = fs::read_to_string(&dockerfile).unwrap();
+    text.push_str("COPY images/workspace/tests/directory-source /opt/directory-source\n");
+    fs::write(dockerfile, text).unwrap();
+    source
+}
+
+#[test]
+fn repository_directory_copy_is_recursively_sealed_and_unsafe_descendants_rejected() {
+    let fixture = Fixture::new();
+    let source = append_directory_copy(&fixture);
+    assert!(fixture.run().status.success());
+    assert_sealed_tree(
+        &source,
+        &fixture
+            .context
+            .join("images/workspace/tests/directory-source"),
+    );
+
+    for kind in ["symlink", "socket", "token"] {
+        let fixture = Fixture::new();
+        let source = append_directory_copy(&fixture);
+        match kind {
+            "symlink" => std::os::unix::fs::symlink("plain", source.join("nested/bad")).unwrap(),
+            "socket" => {
+                assert!(Command::new("mkfifo")
+                    .arg(source.join("nested/bad"))
+                    .status()
+                    .unwrap()
+                    .success());
+                assert!(!fixture.run().status.success());
+                assert!(!fixture.context.exists());
+                continue;
+            }
+            "token" => fs::write(source.join("nested/github-token"), "secret").unwrap(),
+            _ => unreachable!(),
+        }
+        assert!(!fixture.run().status.success(), "accepted {kind}");
+        assert!(!fixture.context.exists());
+    }
+}
+
+#[test]
+fn escape_directive_cannot_hide_an_unsealed_multiline_copy() {
+    for directive in ["# escape=`", "  # EsCaPe=\\"] {
+        let fixture = Fixture::new();
+        let path = fixture.repository.join("images/workspace/Dockerfile");
+        let text = format!(
+            "{directive}\nCOPY unsealed `\n /tmp/unsealed\n{}",
+            fs::read_to_string(&path).unwrap()
+        );
+        fs::write(path, text).unwrap();
+        assert!(!fixture.run().status.success());
+        assert!(!fixture.context.exists());
     }
 }
 
