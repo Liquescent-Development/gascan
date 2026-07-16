@@ -82,3 +82,9 @@ A fixture-local repository directory COPY now passes through real assembly and
 recursively verifies exact descendants and normalized 0444/0555 modes. Nested
 symlink, FIFO special-file, and token-like filename mutations each fail without
 publishing a context.
+
+The final parser edge is closed by allowing only ordinary spaces as leading
+whitespace. Tabs anywhere, and other leading ASCII whitespace such as form
+feed, are rejected before directive/comment recognition. Parser and full
+preparation mutations cover tab-prefixed backtick/backslash escape directives,
+including case variants, and prove no context publication.

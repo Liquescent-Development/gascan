@@ -389,6 +389,14 @@ pub struct DockerCopy {
 pub fn parse_dockerfile_copies(text: &str) -> Result<Vec<DockerCopy>, DynError> {
     let mut copies = Vec::new();
     for raw in text.lines() {
+        if raw.contains('\t')
+            || raw
+                .bytes()
+                .take_while(|byte| byte.is_ascii_whitespace())
+                .any(|byte| byte != b' ')
+        {
+            return Err("unsupported Dockerfile ASCII whitespace".into());
+        }
         let line = raw.trim_start_matches(' ');
         if let Some(comment) = line.strip_prefix('#') {
             let directive = comment.trim_start();

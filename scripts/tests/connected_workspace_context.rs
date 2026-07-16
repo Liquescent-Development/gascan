@@ -145,6 +145,8 @@ fn docker_copy_parser_is_structural_and_fail_closed() {
         "COPY 'a' b",
         "# escape=`\nCOPY safe /dest",
         "  # EsCaPe=\\\nCOPY safe /dest",
+        "\t# escape=`\nCOPY safe /dest",
+        "\x0c# escape=\\\nCOPY safe /dest",
     ] {
         assert!(parse_dockerfile_copies(invalid).is_err());
     }
@@ -239,7 +241,12 @@ fn repository_directory_copy_is_recursively_sealed_and_unsafe_descendants_reject
 
 #[test]
 fn escape_directive_cannot_hide_an_unsealed_multiline_copy() {
-    for directive in ["# escape=`", "  # EsCaPe=\\"] {
+    for directive in [
+        "# escape=`",
+        "  # EsCaPe=\\",
+        "\t# escape=`",
+        "\t# EsCaPe=\\",
+    ] {
         let fixture = Fixture::new();
         let path = fixture.repository.join("images/workspace/Dockerfile");
         let text = format!(
