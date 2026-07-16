@@ -71,11 +71,18 @@ fn dockerfile_assembles_the_connected_workspace_base() {
 fn dockerfile_installs_pinned_erlang_before_elixir_and_validates_otp_29() {
     let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
     let erlang = dockerfile.find("mise install --yes erlang@29.0.3").unwrap();
-    let remaining = dockerfile.find("mise install --yes \\").unwrap();
-    assert!(erlang < remaining);
-    assert!(dockerfile.contains("erl -noshell -eval"));
+    let otp = dockerfile
+        .find("mise exec erlang@29.0.3 -- erl -noshell -eval")
+        .unwrap();
+    let elixir = dockerfile
+        .find("mise exec erlang@29.0.3 -- mise install --yes elixir@1.20.2-otp-29")
+        .unwrap();
+    let remaining = dockerfile.find("mise install --yes go@1.26.5").unwrap();
+    assert!(erlang < otp && otp < elixir && elixir < remaining);
+    assert!(!dockerfile.contains("&& erl -noshell"));
     assert!(dockerfile.contains("otp_release"));
     assert!(dockerfile.contains("=:= <<\"29\">>"));
+    assert!(dockerfile.contains(r#"test "$(mise current elixir)" = "1.20.2-otp-29""#));
 }
 
 #[test]

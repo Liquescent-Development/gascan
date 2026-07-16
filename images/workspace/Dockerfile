@@ -21,8 +21,10 @@ ENV MISE_GLOBAL_CONFIG_FILE=/etc/mise/config.toml
 
 RUN mise install --yes erlang@29.0.3 \
     && test "$(mise current erlang)" = "29.0.3" \
-    && erl -noshell -eval 'true = (erlang:system_info(otp_release) =:= <<"29">>), halt().' \
-    && mise install --yes \
+    && mise exec erlang@29.0.3 -- erl -noshell -eval 'true = (erlang:system_info(otp_release) =:= <<"29">>), halt().' \
+    && mise exec erlang@29.0.3 -- mise install --yes elixir@1.20.2-otp-29 \
+    && test "$(mise current elixir)" = "1.20.2-otp-29" \
+    && mise install --yes go@1.26.5 java@25.0.2 node@24.18.0 python@3.14.6 ruby@3.4.10 rust@1.97.0 \
     && mise current --json \
        | jq --compact-output --sort-keys 'with_entries(.value = .value.version)' \
        > /tmp/resolved-tool-versions.json \

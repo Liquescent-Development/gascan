@@ -235,7 +235,8 @@ touch "$work/config.lock"
 export MISE_DATA_DIR=/opt/gascan/mise MISE_CACHE_DIR="$work/cache" MISE_GLOBAL_CONFIG_FILE="$work/config.toml" MISE_CONFIG_DIR="$work/empty-config" MISE_YES=1 MISE_LOG_LEVEL=trace MISE_LOCKFILE=1 MISE_LOCKFILE_PLATFORMS=linux-arm64 MISE_ALWAYS_KEEP_DOWNLOAD=1 NO_COLOR=1
 mkdir -p "$MISE_CONFIG_DIR"
 "$mise" install --yes erlang@29.0.3 2>"$work/logs/erlang.log" || die "mise failed to install Erlang dependency"
-tools=(elixir go java node python ruby rust)
+"$mise" exec erlang@29.0.3 -- "$mise" install --yes elixir@1.20.2-otp-29 2>"$work/logs/elixir.log" || die "mise failed to install Elixir with exact Erlang dependency"
+tools=(go java node python ruby rust)
 for tool in "${tools[@]}"; do
   rm -rf -- "$work/cache"
   mkdir -p "$work/cache"

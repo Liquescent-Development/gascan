@@ -22,9 +22,12 @@ fn production_installs_exact_erlang_before_user_facing_runtimes() {
         .find(r#""$mise" install --yes erlang@29.0.3 2>"$work/logs/erlang.log""#)
         .unwrap();
     let runtimes = producer
-        .find("tools=(elixir go java node python ruby rust)")
+        .find("tools=(go java node python ruby rust)")
         .unwrap();
-    assert!(erlang < runtimes);
+    let elixir = producer
+        .find(r#""$mise" exec erlang@29.0.3 -- "$mise" install --yes elixir@1.20.2-otp-29"#)
+        .unwrap();
+    assert!(erlang < elixir && elixir < runtimes);
 }
 
 #[test]

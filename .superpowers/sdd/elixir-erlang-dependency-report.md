@@ -51,3 +51,21 @@ The producer now installs exact `erlang@29.0.3` before the seven user-facing
 runtimes and records its trace in `erlang.log`. Native verification executes
 `erl` without a shell, requires exact OTP-major output `29`, and supplies the
 sealed runtime bin directories on `PATH` so Elixir can locate its audited VM.
+
+## Live Retry Follow-up
+
+### RED
+
+The connected build installed Erlang and resolved `mise current erlang`, then
+failed with exit 127 because the Docker `RUN` invoked bare `erl` without mise's
+runtime environment. New contracts failed until OTP verification and Elixir
+installation were both bound to exact Erlang `29.0.3`; the deferred producer
+also failed its ordering contract because Elixir remained in its implicit loop.
+
+### GREEN
+
+The Docker build now verifies OTP through `mise exec erlang@29.0.3`, installs
+exact Elixir `1.20.2-otp-29` through that same environment, validates both mise
+versions, and installs only the six remaining runtimes afterward. The deferred
+producer mirrors the explicit Erlang-bound Elixir installation and retains
+separate sanitized logs. No live gate was run while implementing this fix.
