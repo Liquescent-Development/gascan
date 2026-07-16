@@ -166,10 +166,12 @@ if sys.platform.startswith("linux") and os.uname().machine=="aarch64":
  import tempfile
  with tempfile.TemporaryDirectory() as directory:
   with tarfile.open(fileobj=io.BytesIO(raw),mode="r:") as run_tar: run_tar.extractall(directory,filter="data")
-  commands={"elixir":["--version"],"go":["version"],"java":["-version"],"node":["--version"],"python":["--version"],"ruby":["--version"],"rust":["--version"]}
+  commands={"elixir":["--version"],"erlang":["-noshell","-eval",'io:format("~s", [erlang:system_info(otp_release)]), halt().'],"go":["version"],"java":["-version"],"node":["--version"],"python":["--version"],"ruby":["--version"],"rust":["--version"]}
+  runtime_path=os.pathsep.join(str(Path(directory)/f"opt/gascan/mise/installs/{tool}/{version}/bin") for tool,version in expected.items())
+  runtime_env={**os.environ,"PATH":runtime_path+os.pathsep+os.environ.get("PATH","")}
   for tool,version in expected.items():
    executable=Path(directory)/f"opt/gascan/mise/installs/{tool}/{version}"/entrypoints[tool]
-   result=subprocess.run([str(executable),*commands[tool]],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,check=False,timeout=30)
+   result=subprocess.run([str(executable),*commands[tool]],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,check=False,timeout=30,env=runtime_env)
    output=result.stdout.strip()
    valid={
     "node":output=="v"+version,
@@ -179,6 +181,7 @@ if sys.platform.startswith("linux") and os.uname().machine=="aarch64":
     "ruby":output.startswith("ruby "+version+" "),
     "java":('version "'+version+'"') in output,
     "elixir":"Elixir 1.20.2" in output and "Erlang/OTP 29" in output,
+    "erlang":output=="29",
    }[tool]
    if result.returncode!=0 or not valid: fail("runtime version execution mismatch for "+tool)
 PY
@@ -231,6 +234,7 @@ cp -- "$config" "$work/config.toml"
 touch "$work/config.lock"
 export MISE_DATA_DIR=/opt/gascan/mise MISE_CACHE_DIR="$work/cache" MISE_GLOBAL_CONFIG_FILE="$work/config.toml" MISE_CONFIG_DIR="$work/empty-config" MISE_YES=1 MISE_LOG_LEVEL=trace MISE_LOCKFILE=1 MISE_LOCKFILE_PLATFORMS=linux-arm64 MISE_ALWAYS_KEEP_DOWNLOAD=1 NO_COLOR=1
 mkdir -p "$MISE_CONFIG_DIR"
+"$mise" install --yes erlang@29.0.3 2>"$work/logs/erlang.log" || die "mise failed to install Erlang dependency"
 tools=(elixir go java node python ruby rust)
 for tool in "${tools[@]}"; do
   rm -rf -- "$work/cache"

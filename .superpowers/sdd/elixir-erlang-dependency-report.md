@@ -36,3 +36,18 @@ the pinned prerequisite install was absent.
 
 No live image gate, privileged-helper installation, approval marker, or Gate 4/5
 claim was performed.
+
+## Independent Review Follow-up
+
+### RED
+
+Two focused producer-contract tests failed because the real production loop did
+not install Erlang or create `erlang.log`, and the native ARM64 execution maps
+had no Erlang command or validation entry.
+
+### GREEN
+
+The producer now installs exact `erlang@29.0.3` before the seven user-facing
+runtimes and records its trace in `erlang.log`. Native verification executes
+`erl` without a shell, requires exact OTP-major output `29`, and supplies the
+sealed runtime bin directories on `PATH` so Elixir can locate its audited VM.

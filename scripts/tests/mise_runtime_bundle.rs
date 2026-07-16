@@ -5,6 +5,35 @@ use std::process::Command;
 
 const CURRENT: &str = r#"{"elixir":{"version":"1.20.2-otp-29"},"erlang":{"version":"29.0.3"},"go":{"version":"1.26.5"},"java":{"version":"25.0.2"},"node":{"version":"24.18.0"},"python":{"version":"3.14.6"},"ruby":{"version":"3.4.10"},"rust":{"version":"1.97.0"}}"#;
 
+fn producer() -> String {
+    fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("scripts/produce-mise-runtime-bundle.sh"),
+    )
+    .unwrap()
+}
+
+#[test]
+fn production_installs_exact_erlang_before_user_facing_runtimes() {
+    let producer = producer();
+    let erlang = producer
+        .find(r#""$mise" install --yes erlang@29.0.3 2>"$work/logs/erlang.log""#)
+        .unwrap();
+    let runtimes = producer
+        .find("tools=(elixir go java node python ruby rust)")
+        .unwrap();
+    assert!(erlang < runtimes);
+}
+
+#[test]
+fn native_verifier_executes_erlang_and_requires_exact_otp_major() {
+    let producer = producer();
+    assert!(producer.contains(r#""erlang":["-noshell","-eval""#));
+    assert!(producer.contains(r#""erlang":output=="29""#));
+}
+
 struct Fixture {
     temp: tempfile::TempDir,
 }
