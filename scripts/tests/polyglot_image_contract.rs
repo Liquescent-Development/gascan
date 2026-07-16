@@ -50,7 +50,7 @@ fn dockerfile_installs_only_reviewed_system_tools_and_verified_artifacts() {
         "cmp /tmp/resolved-tool-versions.json /tmp/expected-tool-versions.json",
         "install -o root -g root -m 0444",
         "rm -rf /var/lib/apt/lists/*",
-        "RUN --mount=type=secret,id=gascamp_read_token,required=true",
+        "git remote add origin https://github.com/Liquescent-Development/gascamp.git",
         "COPY --from=gascamp-builder /out /opt/gascan/gascamp",
     ] {
         assert!(
@@ -67,6 +67,9 @@ fn dockerfile_installs_only_reviewed_system_tools_and_verified_artifacts() {
         "bundles/gascamp_source_vendor",
         "ARG GASCAMP_READ_TOKEN",
         "ENV GASCAMP_READ_TOKEN",
+        "--mount=type=secret",
+        "credential.helper",
+        "http.extraHeader",
     ] {
         assert!(
             !dockerfile.contains(forbidden),

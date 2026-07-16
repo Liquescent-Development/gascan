@@ -31,29 +31,18 @@ RUN mise install --yes \
 FROM workspace-base AS gascamp-builder
 
 ARG GASCAMP_REVISION
-RUN --mount=type=secret,id=gascamp_read_token,required=true \
-    set -eu; \
+RUN set -eu; \
     test "$GASCAMP_REVISION" = f6b248c5926240856dbea83d1d2c5c90ea1c1456; \
     case "$GASCAMP_REVISION" in *[!0-9a-f]*|'') exit 1;; esac; \
     test "${#GASCAMP_REVISION}" -eq 40; \
     install -d -m 0700 /tmp/gascamp; \
-    printf '%s\n' \
-      '#!/bin/sh' \
-      'case "${1:-get}" in' \
-      '  get)' \
-      "    printf '%s\\n' 'username=x-access-token'" \
-      "    printf 'password=%s\\n' \"\$(cat /run/secrets/gascamp_read_token)\"" \
-      '    ;;' \
-      'esac' >/tmp/gascamp-credential; \
-    chmod 0700 /tmp/gascamp-credential; \
     cd /tmp/gascamp; \
     git init; \
     git remote add origin https://github.com/Liquescent-Development/gascamp.git; \
-    git -c credential.helper=/tmp/gascamp-credential -c credential.useHttpPath=true \
-         fetch --depth=1 origin "$GASCAMP_REVISION"; \
+    git fetch --depth=1 origin "$GASCAMP_REVISION"; \
     git checkout --detach FETCH_HEAD; \
     test "$(git rev-parse HEAD)" = "$GASCAMP_REVISION"; \
-    rm -rf .git /tmp/gascamp-credential; \
+    rm -rf .git; \
     mise exec -- cargo test --locked; \
     mise exec -- cargo build --locked --release --bin camp; \
     strip target/release/camp; \
