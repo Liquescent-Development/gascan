@@ -87,8 +87,8 @@ case " $* " in *' create '*) printf 'receipt\n';; *' path '*) printf '%s\n' "$SN
         r#"#!/bin/bash
     { printf 'container'; printf '\t%s' "$@"; printf '\n'; } >>"$CALLS"
 case "$*" in
- 'image inspect --format json ubuntu@sha256:'*) printf '[]\n';;
- 'image inspect --format json gascan-workspace:fixture') printf '[{"id":"sha256:%064d","configuration":{"name":"gascan-workspace:fixture","descriptor":{"digest":"sha256:%064d"}},"variants":[{"platform":{"os":"linux","architecture":"arm64"}}]}]\n' 9 9;;
+ 'image inspect ubuntu@sha256:'*) printf '[]\n';;
+ 'image inspect gascan-workspace:fixture') printf '[{"id":"%064d","configuration":{"name":"gascan-workspace:fixture","descriptor":{"digest":"sha256:%064d"}},"variants":[{"platform":{"os":"linux","architecture":"arm64"},"digest":"sha256:%064d"}]}]\n' 9 9 8;;
  build*) exit 0;;
  *) exit 92;;
 esac
@@ -182,7 +182,8 @@ fn validator_rejects_malformed_mutable_wrong_platform_and_wrong_tag() {
     use std::io::Write;
     let digest = "a".repeat(64);
     let valid = format!(
-        r#"[{{"id":"sha256:{digest}","configuration":{{"name":"gascan-workspace:locked","descriptor":{{"digest":"sha256:{digest}"}}}},"variants":[{{"platform":{{"os":"linux","architecture":"arm64"}}}}]}}]"#
+        r#"[{{"id":"{digest}","configuration":{{"name":"gascan-workspace:locked","descriptor":{{"digest":"sha256:{digest}"}}}},"variants":[{{"platform":{{"os":"linux","architecture":"arm64"}},"digest":"sha256:{variant}"}}]}}]"#,
+        variant = "b".repeat(64)
     );
     let run = |input: &str, tag: &str| {
         let mut child = Command::new(env!("CARGO_BIN_EXE_validate-connected-build"))
@@ -203,6 +204,8 @@ fn validator_rejects_malformed_mutable_wrong_platform_and_wrong_tag() {
     assert!(!run(&valid, "gascan-workspace:latest").success());
     assert!(!run(&valid.replace("arm64", "amd64"), "gascan-workspace:locked").success());
     assert!(!run(&valid, "gascan-workspace:other").success());
+    assert!(!run(&valid.replace(&format!(r#""id":"{digest}""#), &format!(r#""id":"sha256:{digest}""#)), "gascan-workspace:locked").success());
+    assert!(!run(&valid.replace(&format!("sha256:{}", "b".repeat(64)), "sha256:invalid"), "gascan-workspace:locked").success());
     assert!(
         !run(
             &valid.replace("gascan-workspace:locked", "gascan-workspace:"),
@@ -368,18 +371,19 @@ case " $* " in *' create '*) test "$FAULT" != create_fail || exit 83; printf 're
                 r#"#!/bin/bash
 {{ printf 'container'; printf '\t%s' "$@"; printf '\n'; }} >>"$CALLS"
 case "$*" in
- 'image inspect --format json ubuntu@sha256:'*) printf '[]\n';;
- 'image inspect --format json gascan-workspace:fixture')
+ 'image inspect ubuntu@sha256:'*) printf '[]\n';;
+ 'image inspect gascan-workspace:fixture')
    test "$FAULT" != inspect_malformed || {{ printf '{{}}\n'; exit; }}
    digest={}; test "$FAULT" != inspect_mismatch || digest={}
-   printf '[{{"id":"sha256:%s","configuration":{{"name":"gascan-workspace:fixture","descriptor":{{"digest":"sha256:%s"}}}},"variants":[{{"platform":{{"os":"linux","architecture":"arm64"}}}}]}}]\n' "$digest" "{}";;
+   printf '[{{"id":"%s","configuration":{{"name":"gascan-workspace:fixture","descriptor":{{"digest":"sha256:%s"}}}},"variants":[{{"platform":{{"os":"linux","architecture":"arm64"}},"digest":"sha256:{}"}}]}}]\n' "$digest" "{}";;
  build*) test "$FAULT" != build_fail || exit 81; test "$FAULT" != public_after || printf changed >>"$SNAPSHOT/context-manifest.tsv";;
  *) exit 92;;
 esac
 "#,
                 "9".repeat(64),
                 "8".repeat(64),
-                "9".repeat(64)
+                "9".repeat(64),
+                "7".repeat(64)
             ),
         );
         executable(&bin.join("sw_vers"), "#!/bin/sh\nprintf '14.0\n'\n");

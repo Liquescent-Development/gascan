@@ -6,23 +6,13 @@ type DynError = Box<dyn Error + Send + Sync>;
 
 #[derive(Deserialize)]
 struct ImageRecord {
-    configuration: Configuration,
     variants: Vec<Variant>,
-}
-
-#[derive(Deserialize)]
-struct Configuration {
-    descriptor: Descriptor,
-}
-
-#[derive(Deserialize)]
-struct Descriptor {
-    digest: String,
 }
 
 #[derive(Deserialize)]
 struct Variant {
     platform: Platform,
+    digest: String,
 }
 
 #[derive(Deserialize)]
@@ -58,16 +48,16 @@ fn validated_digest(input: &str) -> Result<String, DynError> {
         )
         .into());
     }
-    let digest = record.configuration.descriptor.digest.as_str();
+    let digest = record.variants[0].digest.as_str();
     let Some(hex) = digest.strip_prefix("sha256:") else {
-        return Err("image index digest must use sha256".into());
+        return Err("image variant digest must use sha256".into());
     };
     if hex.len() != 64
         || !hex
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
-        return Err("image index digest must be 64 lowercase hexadecimal characters".into());
+        return Err("image variant digest must be 64 lowercase hexadecimal characters".into());
     }
     Ok(digest.to_owned())
 }

@@ -69,7 +69,7 @@ test -d "$snapshot" || die 'sealed public snapshot is unavailable'
 snapshot_manifest=$(shasum -a 256 "$snapshot/context-manifest.tsv" | cut -d' ' -f1)
 test "$snapshot_manifest" = "$context_manifest" || die 'sealed public manifest differs before build'
 
-base_inspect=$(container image inspect --format json "$base_image")
+base_inspect=$(container image inspect "$base_image")
 test "$(printf '%s' "$base_inspect" | run_tool validate-image-inspect)" = "${base_image#ubuntu@}" || die 'exact local base is unavailable'
 container build --arch arm64 \
   --build-arg "BASE_IMAGE=$base_image" \
@@ -78,7 +78,7 @@ container build --arch arm64 \
 
 test "$(shasum -a 256 "$snapshot/context-manifest.tsv" | cut -d' ' -f1)" = "$context_manifest" || die 'sealed public manifest changed during build'
 test "$(run_tool prepare-workspace-context --verify-connected "$root" "$lock" "$artifacts" "$context")" = "$context_manifest" || die 'workspace context changed during build'
-image_inspect=$(container image inspect --format json "$tag")
+image_inspect=$(container image inspect "$tag")
 image_digest=$(printf '%s' "$image_inspect" | run_tool validate-connected-build "$tag") || die 'built image inspect is invalid'
 reference="$tag@$image_digest"
 [[ "$reference" =~ ^gascan-workspace:[a-z0-9._-]+@sha256:[0-9a-f]{64}$ ]] || die 'final image reference is invalid'

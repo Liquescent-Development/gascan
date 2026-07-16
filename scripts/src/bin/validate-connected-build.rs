@@ -25,6 +25,7 @@ struct Descriptor {
 #[derive(Deserialize)]
 struct Variant {
     platform: Platform,
+    digest: String,
 }
 
 #[derive(Deserialize)]
@@ -83,7 +84,10 @@ fn main() -> Result<(), DynError> {
         return Err("built image must contain exactly linux/arm64".into());
     }
     let digest = &record.configuration.descriptor.digest;
-    if !valid_digest(digest) || record.id != *digest {
+    if !valid_digest(digest)
+        || record.id != digest.strip_prefix("sha256:").unwrap_or_default()
+        || !valid_digest(&record.variants[0].digest)
+    {
         return Err("image id and immutable descriptor digest must match".into());
     }
     println!("{digest}");

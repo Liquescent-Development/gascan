@@ -338,7 +338,7 @@ set -eu
 printf '%s\n' "$*" >>"$CONTAINER_CALLS"
 case "$*" in
   'image pull --platform linux/arm64 ubuntu@sha256:'*) exit 0 ;;
-  'image inspect --format json ubuntu@sha256:'*) printf '[{}]\n' ;;
+  'image inspect ubuntu@sha256:'*) printf '[{}]\n' ;;
   *) exit 92 ;;
 esac
 "#,
@@ -372,7 +372,7 @@ esac
         "a".repeat(64)
     )));
     assert!(calls.contains(&format!(
-        "image inspect --format json ubuntu@sha256:{}\n",
+        "image inspect ubuntu@sha256:{}\n",
         "a".repeat(64)
     )));
 }

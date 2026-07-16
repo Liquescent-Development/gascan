@@ -19,15 +19,16 @@ fn validate(json: &str) -> std::process::Output {
     child.wait_with_output().unwrap()
 }
 
-fn inspect(os: &str, architecture: &str, digest: &str) -> String {
+fn inspect(os: &str, architecture: &str, variant_digest: &str) -> String {
     format!(
-        r#"[{{"configuration":{{"descriptor":{{"digest":"{digest}"}}}},"variants":[{{"platform":{{"os":"{os}","architecture":"{architecture}"}},"digest":"sha256:{zeros}"}}]}}]"#,
-        zeros = "0".repeat(64)
+        r#"[{{"id":"{id}","configuration":{{"name":"docker.io/library/ubuntu@sha256:{locked}","descriptor":{{"digest":"sha256:{id}"}}}},"variants":[{{"platform":{{"os":"{os}","architecture":"{architecture}"}},"digest":"{variant_digest}"}}]}}]"#,
+        id = "b".repeat(64),
+        locked = "a".repeat(64),
     )
 }
 
 #[test]
-fn matching_linux_arm64_inspect_prints_index_digest() {
+fn matching_linux_arm64_native_inspect_prints_variant_digest() {
     let digest = format!("sha256:{}", "a".repeat(64));
     let output = validate(&inspect("linux", "arm64", &digest));
     assert!(
@@ -59,5 +60,25 @@ fn malformed_or_ambiguous_inspect_fails_closed() {
     );
     for json in ["not-json".to_owned(), "[]".to_owned(), duplicate] {
         assert!(!validate(&json).status.success());
+    }
+}
+
+#[test]
+fn obsolete_schema_without_variant_digest_fails_closed() {
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let obsolete = format!(
+        r#"[{{"id":"{digest}","configuration":{{"descriptor":{{"digest":"{digest}"}}}},"variants":[{{"platform":{{"os":"linux","architecture":"arm64"}}}}]}}]"#
+    );
+    assert!(!validate(&obsolete).status.success());
+}
+
+#[test]
+fn invalid_variant_digest_fails_closed() {
+    for digest in [
+        format!("sha512:{}", "a".repeat(64)),
+        format!("sha256:{}", "A".repeat(64)),
+        format!("sha256:{}", "a".repeat(63)),
+    ] {
+        assert!(!validate(&inspect("linux", "arm64", &digest)).status.success());
     }
 }
