@@ -49,9 +49,13 @@ tag=$(top_value workspace_tag)
 
 snapshot_helper='/Library/PrivilegedHelperTools/dev.gascan.snapshot-workspace-context'
 snapshot_receipt=''
+build_diagnostic=''
+diagnostic_sensitive=''
 helper_sha256=''; helper_device=''; helper_inode=''
 cleanup() {
   status=${1:-$?}
+  test -z "$build_diagnostic" || rm -f "$build_diagnostic" || status=1
+  test -z "$diagnostic_sensitive" || rm -f "$diagnostic_sensitive" || status=1
   test -z "$snapshot_receipt" || run_bounded "$operation_timeout" sudo -n "$snapshot_helper" --self "$helper_sha256" "$helper_device" "$helper_inode" finish "$snapshot_receipt" >/dev/null || status=1
   exit "$status"
 }
@@ -71,10 +75,37 @@ test "$snapshot_manifest" = "$context_manifest" || die 'sealed public manifest d
 
 base_inspect=$(container image inspect "$base_image")
 test "$(printf '%s' "$base_inspect" | run_tool validate-image-inspect)" = "${base_image#ubuntu@}" || die 'exact local base is unavailable'
+umask 077
+build_diagnostic=$(mktemp "$artifacts/.connected-build-diagnostic.XXXXXX") || die 'cannot create private build diagnostic'
+diagnostic_sensitive=$(mktemp "$artifacts/.connected-build-sensitive.XXXXXX") || die 'cannot create private diagnostic marker'
+chmod 0600 "$build_diagnostic" || die 'cannot protect build diagnostic'
+chmod 0600 "$diagnostic_sensitive" || die 'cannot protect diagnostic marker'
+diagnostic_limit=131072
+set +e
 container build --arch arm64 \
   --build-arg "BASE_IMAGE=$base_image" \
   --build-arg "GASCAMP_REVISION=$gascamp_revision" \
-  --tag "$tag" --file "$snapshot/Dockerfile" "$snapshot" >/dev/null 2>&1
+  --tag "$tag" --file "$snapshot/Dockerfile" "$snapshot" 2>&1 \
+  | LC_ALL=C awk -v limit="$((diagnostic_limit + 1))" -v marker="$diagnostic_sensitive" '
+      BEGIN { pattern = "(^|[^[:alnum:]_])(authorization|bearer|token|secret|password|credential)([^[:alnum:]_]|$)" }
+      { if (tolower($0) ~ pattern) print "sensitive" >marker; chunk = $0 ORS; remaining = limit - written; if (remaining > 0) { printf "%s", substr(chunk, 1, remaining); written += length(chunk) } }
+    ' >"$build_diagnostic"
+build_status=${PIPESTATUS[0]}
+set -e
+if test "$build_status" -ne 0; then
+  if test -s "$diagnostic_sensitive"; then
+    printf 'connected workspace image build: diagnostic rejected as potentially sensitive\n' >&2
+  else
+    printf 'connected workspace image build: container build failed (status %s); bounded diagnostic follows:\n' "$build_status" >&2
+    head -c "$diagnostic_limit" "$build_diagnostic" >&2
+    test "$(wc -c <"$build_diagnostic" | tr -d ' ')" -le "$diagnostic_limit" || printf '\nconnected workspace image build: diagnostic truncated\n' >&2
+  fi
+  exit "$build_status"
+fi
+rm -f "$build_diagnostic"
+build_diagnostic=''
+rm -f "$diagnostic_sensitive"
+diagnostic_sensitive=''
 
 test "$(shasum -a 256 "$snapshot/context-manifest.tsv" | cut -d' ' -f1)" = "$context_manifest" || die 'sealed public manifest changed during build'
 test "$(run_tool prepare-workspace-context --verify-connected "$root" "$lock" "$artifacts" "$context")" = "$context_manifest" || die 'workspace context changed during build'

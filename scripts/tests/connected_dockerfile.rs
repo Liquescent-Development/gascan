@@ -68,6 +68,15 @@ fn dockerfile_assembles_the_connected_workspace_base() {
 }
 
 #[test]
+fn dockerfile_prints_safe_mise_version_metadata_only_when_the_lock_comparison_fails() {
+    let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
+    assert!(dockerfile.contains("mise version metadata mismatch"));
+    assert!(dockerfile.contains("actual resolved versions:"));
+    assert!(dockerfile.contains("expected resolved versions:"));
+    assert!(dockerfile.contains("if ! cmp"));
+}
+
+#[test]
 fn dockerfile_installs_exactly_the_sorted_unique_reviewed_package_list() {
     let package_text = fs::read_to_string(root().join("tests/image/system-tools.txt")).unwrap();
     assert!(package_text.ends_with('\n'));

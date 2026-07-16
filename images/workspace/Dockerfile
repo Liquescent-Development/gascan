@@ -23,7 +23,12 @@ RUN mise install --yes \
     && mise current --json \
        | jq --compact-output --sort-keys 'with_entries(.value = .value.version)' \
        > /tmp/resolved-tool-versions.json \
-    && cmp /tmp/resolved-tool-versions.json /tmp/expected-tool-versions.json \
+    && if ! cmp /tmp/resolved-tool-versions.json /tmp/expected-tool-versions.json; then \
+         printf '%s\n' 'mise version metadata mismatch' \
+           'actual resolved versions:'; cat /tmp/resolved-tool-versions.json; \
+         printf '%s\n' 'expected resolved versions:'; cat /tmp/expected-tool-versions.json; \
+         exit 1; \
+       fi \
     && install -o root -g root -m 0444 /tmp/resolved-tool-versions.json /opt/gascan/image-tool-versions.json \
     && rm -f /tmp/expected-tool-versions.json \
        /tmp/resolved-tool-versions.json

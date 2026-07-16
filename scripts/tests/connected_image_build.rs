@@ -314,6 +314,9 @@ fn fake_runner_failure_matrix_cleans_snapshot_and_never_commits_an_invalid_pair(
         "public_after",
         "context_after",
         "build_fail",
+        "build_fail_output",
+        "build_fail_secret",
+        "build_fail_large",
         "inspect_malformed",
         "inspect_mismatch",
         "receipt_invalid",
@@ -376,7 +379,14 @@ case "$*" in
    test "$FAULT" != inspect_malformed || {{ printf '{{}}\n'; exit; }}
    digest={}; test "$FAULT" != inspect_mismatch || digest={}
    printf '[{{"id":"%s","configuration":{{"name":"gascan-workspace:fixture","descriptor":{{"digest":"sha256:%s"}}}},"variants":[{{"platform":{{"os":"linux","architecture":"arm64"}},"digest":"sha256:{}"}}]}}]\n' "$digest" "{}";;
- build*) test "$FAULT" != build_fail || exit 81; test "$FAULT" != public_after || printf changed >>"$SNAPSHOT/context-manifest.tsv";;
+ build*)
+   case "$FAULT" in
+     build_fail) exit 81;;
+     build_fail_output) printf 'mise resolution mismatch: safe diagnostic\n' >&2; exit 81;;
+     build_fail_secret) i=0; while test "$i" -lt 10000; do printf 'safe-prefix-%05d\n' "$i" >&2; i=$((i+1)); done; printf 'Authorization: Bearer should-never-escape\n' >&2; exit 82;;
+     build_fail_large) i=0; while test "$i" -lt 20000; do printf 'bounded-safe-diagnostic-%05d\n' "$i" >&2; i=$((i+1)); done; exit 83;;
+   esac
+   test "$FAULT" != public_after || printf changed >>"$SNAPSHOT/context-manifest.tsv";;
  *) exit 92;;
 esac
 "#,
@@ -436,6 +446,25 @@ destination=${@: -1}; case "$FAULT:$destination" in fail_json:*/workspace-image-
             .output()
             .unwrap();
         assert!(!output.status.success(), "{fault} unexpectedly succeeded");
+        match fault {
+            "build_fail_output" => {
+                assert_eq!(output.status.code(), Some(81));
+                assert!(String::from_utf8_lossy(&output.stderr)
+                    .contains("mise resolution mismatch: safe diagnostic"));
+            }
+            "build_fail_secret" => {
+                assert_eq!(output.status.code(), Some(82));
+                assert!(!String::from_utf8_lossy(&output.stderr).contains("should-never-escape"));
+                assert!(String::from_utf8_lossy(&output.stderr)
+                    .contains("diagnostic rejected as potentially sensitive"));
+            }
+            "build_fail_large" => {
+                assert_eq!(output.status.code(), Some(83));
+                assert!(output.stderr.len() <= 140_000, "diagnostic was not bounded");
+                assert!(String::from_utf8_lossy(&output.stderr).contains("diagnostic truncated"));
+            }
+            _ => {}
+        }
         let log = fs::read_to_string(&calls).unwrap();
         let expected_finish = usize::from(fault != "create_fail");
         assert_eq!(
@@ -480,6 +509,7 @@ destination=${@: -1}; case "$FAULT:$destination" in fail_json:*/workspace-image-
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join("\n");
+        assert!(!retained.contains("connected-build-diagnostic"));
         for material in ["Authorization", "Bearer ", "--secret", ".build-secrets"] {
             assert!(!String::from_utf8_lossy(&output.stdout).contains(material));
             assert!(!String::from_utf8_lossy(&output.stderr).contains(material));
