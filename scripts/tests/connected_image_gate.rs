@@ -145,6 +145,70 @@ fn fixture() -> Fixture {
     }
 }
 
+fn assert_live_root_alias_rejects_test_helper_hooks(alias_kind: &str) {
+    let temp = tempfile::tempdir().unwrap();
+    let live = temp.path().join("live");
+    fs::create_dir_all(live.join("scripts")).unwrap();
+    fs::create_dir_all(live.join("docs/evidence")).unwrap();
+    fs::create_dir_all(live.join("images/workspace")).unwrap();
+    fs::copy(
+        repository_root().join("scripts/run-connected-image-gate.sh"),
+        live.join("scripts/run-connected-image-gate.sh"),
+    )
+    .unwrap();
+    let alias = if alias_kind == "dot" {
+        live.join(".")
+    } else {
+        let alias = temp.path().join("live-alias");
+        std::os::unix::fs::symlink(&live, &alias).unwrap();
+        alias
+    };
+    let bin = temp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let calls = temp.path().join("calls");
+    executable(&bin.join("container"), "#!/bin/sh\nprintf 'container:%s\\n' \"$*\" >>\"$CALLS\"\nexit 91\n");
+    executable(
+        &bin.join("cargo"),
+        "#!/bin/sh\nprintf 'cargo:%s\\n' \"$*\" >>\"$CALLS\"\nexit 92\n",
+    );
+    let hook = temp.path().join("test-identity-hook");
+    executable(&hook, "#!/bin/sh\nprintf 'test-hook\\n' >>\"$CALLS\"\nexit 0\n");
+    let helper = temp.path().join("test-helper");
+    executable(&helper, "#!/bin/sh\nexit 0\n");
+    let output = Command::new("bash")
+        .arg(live.join("scripts/run-connected-image-gate.sh"))
+        .env("GASCAN_GATE_TEST_ROOT", &alias)
+        .env("GASCAN_GATE_TEST_SNAPSHOT_HELPER", &helper)
+        .env("GASCAN_GATE_TEST_HELPER_IDENTITY_BIN", &hook)
+        .env("CONTAINER_BIN", bin.join("container"))
+        .env("CALLS", &calls)
+        .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let calls = fs::read_to_string(calls).unwrap_or_default();
+    assert!(!calls.contains("test-hook"));
+    assert!(!calls.contains("container:"));
+    assert!(!calls.contains("prefetch"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("/Library/PrivilegedHelperTools/dev.gascan.snapshot-workspace-context")
+            || (calls.contains("snapshot-helper-identity")
+                && calls.contains("/Library/PrivilegedHelperTools/dev.gascan.snapshot-workspace-context")),
+        "fixed live helper identity boundary was not reached: {calls}; stderr={stderr}"
+    );
+}
+
+#[test]
+fn dot_alias_of_live_root_cannot_activate_test_helper_hooks() {
+    assert_live_root_alias_rejects_test_helper_hooks("dot");
+}
+
+#[test]
+fn symlink_alias_of_live_root_cannot_activate_test_helper_hooks() {
+    assert_live_root_alias_rejects_test_helper_hooks("symlink");
+}
+
 #[test]
 fn missing_or_unsafe_snapshot_helper_fails_before_prefetch_or_container_activity() {
     for mode in ["missing", "unsafe"] {
@@ -586,7 +650,7 @@ fn inspect_failure_never_proves_absence_without_authoritative_inventory() {
         let wrapper = f.temp.path().join("inventory-container");
         executable(
             &wrapper,
-            "#!/bin/sh\nset -eu\nif [ \"$1\" = inspect ] && [ ! -f \"$STATE/$2\" ]; then exit 77; fi\nif [ \"$1\" = list ]; then case \"$INVENTORY_MODE\" in present) printf '[{\"configuration\":{\"name\":\"gascan-image-user-test-00112233445566778899aabbccddeeff\"}}]\\n' ;; error) exit 78 ;; malformed) printf '{bad\\n' ;; timeout) printf '%s\\n' $$ >>\"$BLOCKED_PIDS\"; trap '' INT TERM; while :; do sleep 1; done ;; esac; exit 0; fi\nexec \"$REAL_CONTAINER\" \"$@\"\n",
+            "#!/bin/sh\nset -eu\nif [ \"$1\" = inspect ] && [ ! -f \"$STATE/$2\" ]; then exit 77; fi\nif [ \"$1\" = list ]; then case \"$INVENTORY_MODE\" in present) name=gascan-image-user-test-00112233445566778899aabbccddeeff; printf '[{\"id\":\"%s\",\"configuration\":{\"id\":\"%s\",\"labels\":{}}}]\\n' \"$name\" \"$name\" ;; error) exit 78 ;; malformed) printf '{bad\\n' ;; timeout) printf '%s\\n' $$ >>\"$BLOCKED_PIDS\"; trap '' INT TERM; while :; do sleep 1; done ;; esac; exit 0; fi\nexec \"$REAL_CONTAINER\" \"$@\"\n",
         );
         let pids = f.temp.path().join("blocked-pids");
         f.command
@@ -595,8 +659,16 @@ fn inspect_failure_never_proves_absence_without_authoritative_inventory() {
             .env("INVENTORY_MODE", inventory)
             .env("BLOCKED_PIDS", &pids)
             .env("GASCAN_GATE_CLI_TIMEOUT_SECONDS", "1");
-        let status = f.command.status().unwrap();
-        assert!(!status.success(), "inventory={inventory}");
+        let output = f.command.output().unwrap();
+        assert!(!output.status.success(), "inventory={inventory}");
+        if inventory == "present" {
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("exact container remains in inventory"),
+                "native presence failed for the wrong reason: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         assert!(!f
             .root
             .join("docs/evidence/connected-workspace-image.md")
