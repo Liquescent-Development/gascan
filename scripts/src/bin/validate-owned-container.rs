@@ -6,13 +6,13 @@ type DynError = Box<dyn Error + Send + Sync>;
 
 #[derive(Deserialize)]
 struct ContainerRecord {
+    id: String,
     configuration: Configuration,
 }
 
 #[derive(Deserialize)]
 struct Configuration {
     id: String,
-    name: String,
     labels: BTreeMap<String, String>,
 }
 
@@ -32,8 +32,9 @@ fn main() -> Result<(), DynError> {
     if records.len() != 1 {
         return Err("inspect must contain exactly one container record".into());
     }
-    let configuration = &records[0].configuration;
-    if configuration.id != name || configuration.name != name {
+    let record = &records[0];
+    let configuration = &record.configuration;
+    if record.id != name || configuration.id != name {
         return Err("container identity does not match the expected name".into());
     }
     if configuration

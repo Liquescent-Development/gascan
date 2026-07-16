@@ -79,6 +79,13 @@ fn fixture() -> Fixture {
         &root.join("scripts/prefetch-connected-workspace-image.sh"),
         "#!/bin/sh\nset -eu\nprintf 'prefetch\\n' >>\"$CALLS\"\n",
     );
+    let helper = temp.path().join("snapshot-helper");
+    executable(&helper, "#!/bin/sh\nexit 0\n");
+    let helper_identity = temp.path().join("snapshot-helper-identity");
+    executable(
+        &helper_identity,
+        "#!/bin/sh\nset -eu\nprintf 'helper-identity\\n' >>\"$CALLS\"\n[ \"${HELPER_IDENTITY_UNSAFE:-}\" != 1 ]\nprintf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\t1\\t2\\n'\n",
+    );
     executable(
         &root.join("scripts/build-connected-workspace-image.sh"),
         &format!(
@@ -105,13 +112,13 @@ fn fixture() -> Fixture {
     executable(
         &raw_container,
         &format!(
-            "#!/bin/sh\nset -eu\nprintf 'container:%s\\n' \"$*\" >>\"$CALLS\"\nif [ \"$1 ${{2:-}}\" = 'image inspect' ]; then [ $# -eq 3 ] || exit 93; platform=${{IMAGE_PLATFORM:-arm64}}; printf '[{{\"id\":\"{DIGEST}\",\"configuration\":{{\"name\":\"gascan-workspace:test\",\"descriptor\":{{\"digest\":\"sha256:{DIGEST}\"}}}},\"variants\":[{{\"platform\":{{\"os\":\"linux\",\"architecture\":\"%s\"}},\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}]}}]\\n' \"$platform\"; exit 0; fi\ncase \"$1\" in create) while [ $# -gt 0 ]; do [ \"$1\" = --name ] && {{ touch \"$STATE/$2\"; break; }}; shift; done ;; inspect) name=$2; [ \"${{RESIDUE:-}}\" = \"$name\" ] || [ -f \"$STATE/$name\" ] || exit 1; count_file=\"$STATE/.inspect-$name\"; count=0; [ ! -f \"$count_file\" ] || count=$(cat \"$count_file\"); count=$((count+1)); printf '%s' \"$count\" >\"$count_file\"; owner=$OWNER; [ \"${{FOREIGN:-}}\" = \"$name\" ] && owner=ffffffffffffffffffffffffffffffff; [ \"${{REPLACE_ON_SECOND_INSPECT:-}}\" = \"$name\" ] && [ \"$count\" -ge 2 ] && owner=ffffffffffffffffffffffffffffffff; printf '[{{\"configuration\":{{\"id\":\"%s\",\"name\":\"%s\",\"labels\":{{\"dev.gascan.test\":\"true\",\"dev.gascan.test.owner\":\"%s\"}}}}}}]\\n' \"$name\" \"$name\" \"$owner\" ;; stop) : ;; delete) name=${{@:$#}}; [ \"${{FAIL_DELETE:-}}\" != \"$name\" ] || exit 1; rm -f \"$STATE/$name\" ;; esac\n"
+            "#!/bin/sh\nset -eu\nprintf 'container:%s\\n' \"$*\" >>\"$CALLS\"\nif [ \"$1 ${{2:-}}\" = 'image inspect' ]; then [ $# -eq 3 ] || exit 93; platform=${{IMAGE_PLATFORM:-arm64}}; printf '[{{\"id\":\"{DIGEST}\",\"configuration\":{{\"name\":\"gascan-workspace:test\",\"descriptor\":{{\"digest\":\"sha256:{DIGEST}\"}}}},\"variants\":[{{\"platform\":{{\"os\":\"linux\",\"architecture\":\"%s\"}},\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}]}}]\\n' \"$platform\"; exit 0; fi\ncase \"$1\" in create) while [ $# -gt 0 ]; do [ \"$1\" = --name ] && {{ touch \"$STATE/$2\"; break; }}; shift; done ;; inspect) name=$2; [ \"${{RESIDUE:-}}\" = \"$name\" ] || [ -f \"$STATE/$name\" ] || exit 1; count_file=\"$STATE/.inspect-$name\"; count=0; [ ! -f \"$count_file\" ] || count=$(cat \"$count_file\"); count=$((count+1)); printf '%s' \"$count\" >\"$count_file\"; owner=$OWNER; [ \"${{FOREIGN:-}}\" = \"$name\" ] && owner=ffffffffffffffffffffffffffffffff; [ \"${{REPLACE_ON_SECOND_INSPECT:-}}\" = \"$name\" ] && [ \"$count\" -ge 2 ] && owner=ffffffffffffffffffffffffffffffff; printf '[{{\"id\":\"%s\",\"configuration\":{{\"id\":\"%s\",\"labels\":{{\"dev.gascan.test\":\"true\",\"dev.gascan.test.owner\":\"%s\"}}}}}}]\\n' \"$name\" \"$name\" \"$owner\" ;; stop) : ;; delete) name=${{@:$#}}; [ \"${{FAIL_DELETE:-}}\" != \"$name\" ] || exit 1; rm -f \"$STATE/$name\" ;; esac\n"
         ),
     );
     let container = temp.path().join("container");
     executable(
         &container,
-        "#!/bin/sh\nset -eu\nif [ \"$1\" = list ]; then first=true; printf '['; for name in gascan-image-user-test-$OWNER gascan-image-polyglot-test-$OWNER gascan-image-gascamp-test-$OWNER; do if [ \"${RESIDUE:-}\" = \"$name\" ] || [ -f \"$STATE/$name\" ]; then $first || printf ','; first=false; printf '{\"configuration\":{\"name\":\"%s\"}}' \"$name\"; fi; done; printf ']\\n'; exit 0; fi\nexec \"$RAW_CONTAINER\" \"$@\"\n",
+        "#!/bin/sh\nset -eu\nif [ \"$1\" = list ]; then first=true; printf '['; for name in gascan-image-user-test-$OWNER gascan-image-polyglot-test-$OWNER gascan-image-gascamp-test-$OWNER; do if [ \"${RESIDUE:-}\" = \"$name\" ] || [ -f \"$STATE/$name\" ]; then $first || printf ','; first=false; printf '{\"id\":\"%s\",\"configuration\":{\"id\":\"%s\",\"labels\":{}}}' \"$name\" \"$name\"; fi; done; printf ']\\n'; exit 0; fi\nexec \"$RAW_CONTAINER\" \"$@\"\n",
     );
     let state = temp.path().join("state");
     fs::create_dir(&state).unwrap();
@@ -127,12 +134,38 @@ fn fixture() -> Fixture {
         .env("STATE", &state)
         .env("OWNER", TOKEN)
         .env("RAW_CONTAINER", &raw_container)
+        .env("GASCAN_GATE_TEST_SNAPSHOT_HELPER", &helper)
+        .env("GASCAN_GATE_TEST_HELPER_IDENTITY_BIN", &helper_identity)
         .env("CARGO_TARGET_DIR", repository_root().join("scripts/target"));
     Fixture {
         temp,
         root,
         calls,
         command,
+    }
+}
+
+#[test]
+fn missing_or_unsafe_snapshot_helper_fails_before_prefetch_or_container_activity() {
+    for mode in ["missing", "unsafe"] {
+        let mut f = fixture();
+        if mode == "missing" {
+            fs::remove_file(f.temp.path().join("snapshot-helper")).unwrap();
+        } else {
+            f.command.env("HELPER_IDENTITY_UNSAFE", "1");
+        }
+        assert!(!f.command.status().unwrap().success(), "{mode}");
+        let calls = fs::read_to_string(&f.calls).unwrap_or_default();
+        if mode == "missing" {
+            assert!(calls.is_empty());
+        } else {
+            assert_eq!(calls, "helper-identity\n");
+        }
+        assert!(!f
+            .root
+            .join("docs/evidence/connected-workspace-image.md")
+            .exists());
+        assert!(!f.root.join("images/workspace/approved-image.txt").exists());
     }
 }
 
@@ -237,11 +270,10 @@ fn every_failure_prevents_both_publications() {
             _ => unreachable!(),
         };
         assert!(!f.command.status().unwrap().success(), "{failure}");
-        assert!(
-            !f.root
-                .join("docs/evidence/connected-workspace-image.md")
-                .exists()
-        );
+        assert!(!f
+            .root
+            .join("docs/evidence/connected-workspace-image.md")
+            .exists());
         assert!(!f.root.join("images/workspace/approved-image.txt").exists());
     }
 }
@@ -257,11 +289,10 @@ fn stale_pass_pair_is_retired_before_work_and_owner_token_is_never_evidence() {
     fs::write(f.root.join("images/workspace/approved-image.txt"), "stale").unwrap();
     f.command.env("GASCAN_GATE_TEST_BUILD_FAILURE", "1");
     assert!(!f.command.status().unwrap().success());
-    assert!(
-        !f.root
-            .join("docs/evidence/connected-workspace-image.md")
-            .exists()
-    );
+    assert!(!f
+        .root
+        .join("docs/evidence/connected-workspace-image.md")
+        .exists());
     assert!(!f.root.join("images/workspace/approved-image.txt").exists());
 
     let mut f = fixture();
@@ -281,13 +312,13 @@ fn stale_pass_pair_is_retired_when_obsolete_credential_input_is_rejected() {
     )
     .unwrap();
     fs::write(f.root.join("images/workspace/approved-image.txt"), "stale").unwrap();
-    f.command.env("GASCAMP_READ_TOKEN_FILE", "/tmp/obsolete-token");
+    f.command
+        .env("GASCAMP_READ_TOKEN_FILE", "/tmp/obsolete-token");
     assert!(!f.command.status().unwrap().success());
-    assert!(
-        !f.root
-            .join("docs/evidence/connected-workspace-image.md")
-            .exists()
-    );
+    assert!(!f
+        .root
+        .join("docs/evidence/connected-workspace-image.md")
+        .exists());
     assert!(!f.root.join("images/workspace/approved-image.txt").exists());
     assert!(!f.calls.exists());
 }
@@ -308,25 +339,22 @@ fn every_publication_boundary_rolls_back_the_pair() {
             if action == "TERM" {
                 assert_eq!(status.code(), Some(143));
             }
-            assert!(
-                !f.root
-                    .join("docs/evidence/connected-workspace-image.md")
-                    .exists()
-            );
+            assert!(!f
+                .root
+                .join("docs/evidence/connected-workspace-image.md")
+                .exists());
             assert!(!f.root.join("images/workspace/approved-image.txt").exists());
             assert_eq!(
                 fs::read_dir(f.root.join("docs/evidence")).unwrap().count(),
                 0
             );
-            assert!(
-                !fs::read_dir(f.root.join("images/workspace"))
+            assert!(!fs::read_dir(f.root.join("images/workspace"))
+                .unwrap()
+                .any(|entry| entry
                     .unwrap()
-                    .any(|entry| entry
-                        .unwrap()
-                        .file_name()
-                        .to_string_lossy()
-                        .starts_with(".approved-image."))
-            );
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".approved-image.")));
         }
     }
 }
@@ -358,11 +386,10 @@ fn malformed_missing_mismatched_mutable_and_wrong_platform_are_fail_closed() {
         let mut f = fixture();
         f.command.env(variable, value);
         assert!(!f.command.status().unwrap().success(), "{variable}={value}");
-        assert!(
-            !f.root
-                .join("docs/evidence/connected-workspace-image.md")
-                .exists()
-        );
+        assert!(!f
+            .root
+            .join("docs/evidence/connected-workspace-image.md")
+            .exists());
         assert!(!f.root.join("images/workspace/approved-image.txt").exists());
     }
 }
@@ -407,19 +434,17 @@ fn int_and_term_exit_nonzero_after_bounded_cleanup() {
         let calls = fs::read_to_string(&f.calls).unwrap();
         assert!(calls.contains("stop --time 5"));
         assert!(calls.contains("delete gascan-image-user-test-"));
-        assert!(
-            !f.root
-                .join("docs/evidence/connected-workspace-image.md")
-                .exists()
-        );
+        assert!(!f
+            .root
+            .join("docs/evidence/connected-workspace-image.md")
+            .exists());
         assert!(!f.root.join("images/workspace/approved-image.txt").exists());
-        assert!(
-            !f.temp
-                .path()
-                .join("state")
-                .join(format!("gascan-image-user-test-{TOKEN}"))
-                .exists()
-        );
+        assert!(!f
+            .temp
+            .path()
+            .join("state")
+            .join(format!("gascan-image-user-test-{TOKEN}"))
+            .exists());
     }
 }
 
@@ -431,11 +456,10 @@ fn cleanup_failure_is_nonzero_and_never_publishes() {
         .env("FAIL_DELETE", format!("gascan-image-user-test-{TOKEN}"));
     let status = f.command.status().unwrap();
     assert_eq!(status.code(), Some(1));
-    assert!(
-        !f.root
-            .join("docs/evidence/connected-workspace-image.md")
-            .exists()
-    );
+    assert!(!f
+        .root
+        .join("docs/evidence/connected-workspace-image.md")
+        .exists());
     assert!(!f.root.join("images/workspace/approved-image.txt").exists());
 }
 
@@ -493,21 +517,18 @@ fn every_blocking_cleanup_cli_is_killed_reaped_and_fail_closed() {
                 "blocked child survived: {pid}"
             );
         }
-        assert!(
-            !f.root
-                .join("docs/evidence/connected-workspace-image.md")
-                .exists()
-        );
+        assert!(!f
+            .root
+            .join("docs/evidence/connected-workspace-image.md")
+            .exists());
         assert!(!f.root.join("images/workspace/approved-image.txt").exists());
-        assert!(
-            !fs::read_dir(f.root.join("docs/evidence"))
+        assert!(!fs::read_dir(f.root.join("docs/evidence"))
+            .unwrap()
+            .any(|entry| entry
                 .unwrap()
-                .any(|entry| entry
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".connected-workspace-image."))
-        );
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".connected-workspace-image.")));
     }
 }
 
@@ -545,19 +566,16 @@ fn real_smoke_cleanup_controller_hang_is_bounded_and_reaped() {
     };
     assert!(!status.success());
     for pid in fs::read_to_string(&pids).unwrap().lines() {
-        assert!(
-            !Command::new("kill")
-                .args(["-0", pid])
-                .status()
-                .unwrap()
-                .success()
-        );
+        assert!(!Command::new("kill")
+            .args(["-0", pid])
+            .status()
+            .unwrap()
+            .success());
     }
-    assert!(
-        !f.root
-            .join("docs/evidence/connected-workspace-image.md")
-            .exists()
-    );
+    assert!(!f
+        .root
+        .join("docs/evidence/connected-workspace-image.md")
+        .exists());
     assert!(!f.root.join("images/workspace/approved-image.txt").exists());
 }
 
@@ -579,11 +597,10 @@ fn inspect_failure_never_proves_absence_without_authoritative_inventory() {
             .env("GASCAN_GATE_CLI_TIMEOUT_SECONDS", "1");
         let status = f.command.status().unwrap();
         assert!(!status.success(), "inventory={inventory}");
-        assert!(
-            !f.root
-                .join("docs/evidence/connected-workspace-image.md")
-                .exists()
-        );
+        assert!(!f
+            .root
+            .join("docs/evidence/connected-workspace-image.md")
+            .exists());
         assert!(!f.root.join("images/workspace/approved-image.txt").exists());
     }
 }

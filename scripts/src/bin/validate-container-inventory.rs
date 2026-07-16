@@ -6,12 +6,7 @@ type DynError = Box<dyn Error + Send + Sync>;
 
 #[derive(Deserialize)]
 struct ContainerRecord {
-    configuration: Configuration,
-}
-
-#[derive(Deserialize)]
-struct Configuration {
-    name: String,
+    id: String,
 }
 
 fn main() -> Result<(), DynError> {
@@ -24,7 +19,7 @@ fn main() -> Result<(), DynError> {
     let records: Vec<ContainerRecord> = serde_json::from_str(&input)?;
     if let Some(name) = records
         .iter()
-        .map(|record| &record.configuration.name)
+        .map(|record| &record.id)
         .find(|name| expected.contains(name))
     {
         return Err(format!("exact container remains in inventory: {name}").into());

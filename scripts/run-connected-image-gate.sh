@@ -61,6 +61,17 @@ else
 fi
 [[ "$owner_token" =~ ^[0-9a-f]{32}$ ]] || die 'invalid cleanup ownership token'
 
+snapshot_helper='/Library/PrivilegedHelperTools/dev.gascan.snapshot-workspace-context'
+if test "$root" = "$tool_root"; then
+  test -f "$snapshot_helper" || die 'snapshot helper is unavailable'
+  run_tool snapshot-helper-identity "$snapshot_helper" >/dev/null || die 'snapshot helper identity is unsafe'
+else
+  snapshot_helper=${GASCAN_GATE_TEST_SNAPSHOT_HELPER:?missing test snapshot helper}
+  helper_identity_bin=${GASCAN_GATE_TEST_HELPER_IDENTITY_BIN:?missing test snapshot helper identity boundary}
+  test -f "$snapshot_helper" || die 'snapshot helper is unavailable'
+  "$helper_identity_bin" "$snapshot_helper" >/dev/null || die 'snapshot helper identity is unsafe'
+fi
+
 names=("gascan-image-user-test-$owner_token" "gascan-image-polyglot-test-$owner_token" "gascan-image-gascamp-test-$owner_token")
 cleaning=false
 inventory_proves_absent() {
