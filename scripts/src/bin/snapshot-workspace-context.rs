@@ -629,12 +629,14 @@ fn parse_manifest(bytes: &[u8]) -> Result<Vec<Entry>, DynError> {
 
 fn validate_caller_source(path: &Path, caller_uid: u32) -> Result<(), DynError> {
     let canonical = path.canonicalize()?;
+    if canonical != path {
+        return Err("source path must be canonical and must not be a symlink".into());
+    }
     let allowed_name = matches!(
         path.file_name().and_then(|value| value.to_str()),
         Some("workspace-context" | "connected-workspace-context")
     );
-    if canonical != path
-        || !allowed_name
+    if !allowed_name
         || path
             .parent()
             .and_then(Path::file_name)
@@ -975,11 +977,23 @@ mod tests {
     #[test]
     fn aliases_wrong_owner_and_non_directories_are_rejected() {
         let temporary = tempfile::tempdir().unwrap();
-        let source = caller_source_path(&temporary, "connected-workspace-context");
-        let uid = fs::symlink_metadata(&source).unwrap().uid();
-        let alias = temporary.path().join(".artifacts/source-alias");
-        symlink(&source, &alias).unwrap();
-        assert!(validate_caller_source(&alias, uid).is_err());
+        let artifacts = temporary.path().join(".artifacts");
+        fs::create_dir(&artifacts).unwrap();
+        let target = temporary.path().join("actual-context");
+        fs::create_dir(&target).unwrap();
+        let alias = artifacts.join("connected-workspace-context");
+        symlink(&target, &alias).unwrap();
+        let uid = fs::symlink_metadata(&target).unwrap().uid();
+        assert_eq!(alias.file_name().unwrap(), "connected-workspace-context");
+        assert_eq!(alias.parent().unwrap().file_name().unwrap(), ".artifacts");
+        assert_ne!(alias.canonicalize().unwrap(), alias);
+        assert!(fs::symlink_metadata(&alias).unwrap().file_type().is_symlink());
+        assert_eq!(
+            validate_caller_source(&alias, uid).unwrap_err().to_string(),
+            "source path must be canonical and must not be a symlink"
+        );
+
+        let source = caller_source_path(&temporary, "workspace-context");
         assert!(validate_caller_source(&source, uid + 1).is_err());
 
         let file_root = tempfile::tempdir().unwrap();

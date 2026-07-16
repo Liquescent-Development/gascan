@@ -41,7 +41,19 @@ Verification:
 - `rtk git diff --check` — passed.
 
 The full-suite failure is outside this helper-path change and reproduces when its test
-is run alone. The standalone `workspace_snapshot` integration target also contains an unrelated
-stale contract for `scripts/build-workspace-image.sh`, a path not changed by this fix;
-when invoked alone, that pre-existing assertion fails. No helper was installed and no
-live gate or evidence publication was attempted.
+is run alone. The standalone `workspace_snapshot` integration target also contains an
+unrelated stale assertion: it expects the privileged snapshot contract directly in
+`scripts/build-workspace-image.sh`, while that dispatcher does not contain the asserted
+implementation. When invoked alone, that pre-existing assertion fails. No helper was
+installed and no live gate or evidence publication was attempted.
+
+## Review correction
+
+The first alias test used the disallowed basename `source-alias`, so the allowlist alone
+could reject it without exercising canonical-path protection. The corrected RED test
+creates `.artifacts/connected-workspace-context` as a symlink, proves its basename and
+parent satisfy the explicit contract, proves canonicalization resolves elsewhere, and
+expects the canonical/symlink-specific rejection. The test failed against the first
+implementation because it returned the combined allowlist error. GREEN separates that
+diagnostic without weakening any check; the valid-name alias is now rejected explicitly
+because its canonical path differs.
