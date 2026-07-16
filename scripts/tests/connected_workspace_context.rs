@@ -5,17 +5,18 @@ use std::{
     process::{Command, Output},
 };
 
-use gascan_image_tools::{ReviewedInputKind, reviewed_input_kind_allowed};
+use gascan_image_tools::{reviewed_input_kind_allowed, ReviewedInputKind};
 use tempfile::TempDir;
 
 const REVIEWED_GASCAMP_REVISION: &str = "f6b248c5926240856dbea83d1d2c5c90ea1c1456";
 
-const REQUIRED: [&str; 9] = [
+const REQUIRED: [&str; 10] = [
     "Dockerfile",
     ".artifacts/mise-linux-arm64",
     ".artifacts/playwright-chromium-reviewed",
     ".artifacts/expected-tool-versions.json",
     "images/workspace/bin",
+    "images/workspace/libexec",
     "images/workspace/etc",
     "images/workspace/tests",
     "images/workspace/versions.lock",
@@ -37,20 +38,29 @@ impl Fixture {
         let cache = temporary.path().join("cache");
         fs::create_dir_all(repository.join("images/workspace/bin")).unwrap();
         fs::create_dir_all(repository.join("images/workspace/etc")).unwrap();
+        fs::create_dir_all(repository.join("images/workspace/libexec")).unwrap();
         fs::create_dir_all(repository.join("images/workspace/tests")).unwrap();
         fs::create_dir_all(repository.join("tests/image")).unwrap();
         fs::create_dir_all(cache.join("playwright-chromium-reviewed/chrome-linux")).unwrap();
         for path in [
             "images/workspace/bin/entrypoint",
+            "images/workspace/bin/migrate-workspace-identity",
+            "images/workspace/libexec/migrate-workspace-identity-core",
             "images/workspace/etc/config",
             "images/workspace/tests/smoke",
             "tests/image/system-tools.txt",
         ] {
             fs::write(repository.join(path), format!("{path}\n")).unwrap();
         }
+        for path in [
+            "images/workspace/bin/migrate-workspace-identity",
+            "images/workspace/libexec/migrate-workspace-identity-core",
+        ] {
+            fs::set_permissions(repository.join(path), fs::Permissions::from_mode(0o755)).unwrap();
+        }
         fs::write(
             repository.join("images/workspace/Dockerfile"),
-            "FROM locked\n",
+            "FROM locked\nCOPY --chmod=0555 images/workspace/bin/migrate-workspace-identity /usr/local/bin/migrate-workspace-identity\nCOPY --chmod=0555 images/workspace/libexec/migrate-workspace-identity-core /usr/local/libexec/gascan/migrate-workspace-identity-core\n",
         )
         .unwrap();
         fs::write(cache.join("mise-linux-arm64"), "mise\n").unwrap();
@@ -92,6 +102,36 @@ impl Fixture {
             .arg(&self.context)
             .output()
             .unwrap()
+    }
+}
+
+#[test]
+fn every_local_dockerfile_copy_source_is_sealed_with_exact_bytes_and_mode() {
+    let fixture = Fixture::new();
+    assert!(fixture.run().status.success());
+    let dockerfile =
+        fs::read_to_string(fixture.repository.join("images/workspace/Dockerfile")).unwrap();
+    for line in dockerfile
+        .lines()
+        .filter(|line| line.starts_with("COPY ") && !line.contains("--from="))
+    {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        let source = fields[fields.len() - 2];
+        if source.starts_with(".artifacts/") {
+            continue;
+        }
+        let original = fixture.repository.join(source);
+        let sealed = fixture.context.join(source);
+        assert_eq!(
+            fs::read(&sealed).unwrap(),
+            fs::read(&original).unwrap(),
+            "COPY source bytes differ: {source}"
+        );
+        assert_eq!(
+            fs::metadata(&sealed).unwrap().permissions().mode() & 0o777,
+            0o555,
+            "COPY source mode differs: {source}"
+        );
     }
 }
 
@@ -147,12 +187,10 @@ fn connected_context_is_the_exact_public_allowlist_and_prints_digest() {
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert_eq!(stdout.trim().len(), 64);
-    assert!(
-        stdout
-            .trim()
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    );
+    assert!(stdout
+        .trim()
+        .bytes()
+        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
     let actual = paths(&fixture.context);
     for required in REQUIRED {
         assert!(
@@ -371,8 +409,5 @@ esac
         "image pull --platform linux/arm64 ubuntu@sha256:{}\n",
         "a".repeat(64)
     )));
-    assert!(calls.contains(&format!(
-        "image inspect ubuntu@sha256:{}\n",
-        "a".repeat(64)
-    )));
+    assert!(calls.contains(&format!("image inspect ubuntu@sha256:{}\n", "a".repeat(64))));
 }

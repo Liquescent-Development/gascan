@@ -13,17 +13,19 @@ use std::{
 
 use cap_primitives::fs::{FollowSymlinks, OpenOptions, PermissionsExt as CapPermissionsExt};
 use cap_std::{ambient_authority, fs::Dir};
-use gascan_image_tools::bundle::{PublishedBundleLocks, validate_bundle};
-use gascan_image_tools::{ReviewedInputKind, reviewed_input_kind_allowed};
+use gascan_image_tools::bundle::{validate_bundle, PublishedBundleLocks};
+use gascan_image_tools::{reviewed_input_kind_allowed, ReviewedInputKind};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 type DynError = Box<dyn Error>;
 
-const REPOSITORY_FILES: [&str; 8] = [
+const REPOSITORY_FILES: [&str; 10] = [
     "images/workspace/Dockerfile",
     "images/workspace/bin/gascan-entrypoint",
     "images/workspace/bin/select-gascamp",
+    "images/workspace/bin/migrate-workspace-identity",
+    "images/workspace/libexec/migrate-workspace-identity-core",
     "images/workspace/etc/mise/config.toml",
     "images/workspace/etc/profile.d/mise.sh",
     "images/workspace/etc/sudoers.d/workspace",
@@ -572,6 +574,7 @@ fn assemble_connected(
     for source in [
         "images/workspace/bin",
         "images/workspace/etc",
+        "images/workspace/libexec",
         "images/workspace/tests",
     ] {
         copy_tree_reviewed(&repository, Path::new(source), &staging.join(source))?;

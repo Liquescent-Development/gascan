@@ -45,3 +45,16 @@ approval-marker mutation was performed by this task.
   links, non-directories, wrong ownership, and any existing or dangling-link
   destination before either mutation command can run. The resulting home is
   revalidated with the same exact type and numeric ownership contract.
+
+## Connected context follow-up
+
+- Live RED: the sealed connected context omitted the newly introduced
+  `images/workspace/libexec/migrate-workspace-identity-core`, so BuildKit could
+  not satisfy its Dockerfile `COPY`.
+- Test RED reproduced the omission by deriving local, non-stage Dockerfile
+  `COPY` sources and requiring exact sealed bytes and executable modes.
+- GREEN: connected assembly now reviews and seals the `libexec` tree alongside
+  the existing `bin`, `etc`, and `tests` trees; the explicit repository file
+  contract also includes both migration files.
+- No live build, helper operation, evidence publication, or approval mutation
+  was performed for this correction.
