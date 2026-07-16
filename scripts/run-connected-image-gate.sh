@@ -38,14 +38,13 @@ controller() { run_bounded "$cli_timeout" "$container_bin" "$@"; }
 rm -f "$approved_file"
 if test -f "$evidence_file" && grep -Fq 'status: `PASS`' "$evidence_file"; then rm -f "$evidence_file"; fi
 
-test -n "${GASCAMP_READ_TOKEN_FILE:-}" || die 'GASCAMP_READ_TOKEN_FILE is required'
-case "$GASCAMP_READ_TOKEN_FILE" in /*) ;; *) die 'secret path must be absolute' ;; esac
-test -f "$GASCAMP_READ_TOKEN_FILE" && test ! -L "$GASCAMP_READ_TOKEN_FILE" || die 'secret file must be a regular non-symlink'
-test "$(stat -f %Lp "$GASCAMP_READ_TOKEN_FILE" 2>/dev/null || stat -c %a "$GASCAMP_READ_TOKEN_FILE")" = 600 || die 'secret file mode must be 0600'
-test "$(stat -f %u "$GASCAMP_READ_TOKEN_FILE" 2>/dev/null || stat -c %u "$GASCAMP_READ_TOKEN_FILE")" = "$(id -u)" || die 'secret file must be owned by the current user'
-canonical_root=$(cd "$root" && pwd -P)
-canonical_secret=$(cd "$(dirname "$GASCAMP_READ_TOKEN_FILE")" && printf '%s/%s\n' "$(pwd -P)" "$(basename "$GASCAMP_READ_TOKEN_FILE")")
-case "$canonical_secret" in "$canonical_root"|"$canonical_root"/*) die 'secret file must be outside the repository' ;; esac
+for name in $(compgen -e); do
+  case "$name" in
+    GASCAMP_*TOKEN*|GITHUB_TOKEN|GH_TOKEN|GITLAB_TOKEN|DOCKER_AUTH_CONFIG|HTTP_AUTHORIZATION|AUTHORIZATION|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|BUILD_TOKEN|BUILD_*_TOKEN|*_BUILD_TOKEN|*_BUILD_*_TOKEN|BUILD_CREDENTIAL|BUILD_*_CREDENTIAL|*_BUILD_CREDENTIAL|*_BUILD_*_CREDENTIAL|BUILD_PASSWORD|BUILD_*_PASSWORD|*_BUILD_PASSWORD|*_BUILD_*_PASSWORD|BUILD_SECRET|BUILD_*_SECRET|*_BUILD_SECRET|*_BUILD_*_SECRET)
+      test -z "${!name:-}" || die "authentication input is forbidden: $name"
+      ;;
+  esac
+done
 command -v "$container_bin" >/dev/null || die 'container controller is unavailable'
 if test "$root" = "$tool_root"; then
   test "$(uname -s)" = Darwin || die 'the live connected gate requires macOS'
@@ -123,7 +122,7 @@ if test -n "${GASCAN_GATE_TEST_SIGNAL:-}"; then
 fi
 
 GASCAN_GATE_ARTIFACTS="$artifacts" "$root/scripts/prefetch-connected-workspace-image.sh"
-build_output=$(GASCAN_GATE_ARTIFACTS="$artifacts" GASCAMP_READ_TOKEN_FILE="$GASCAMP_READ_TOKEN_FILE" "$root/scripts/build-connected-workspace-image.sh")
+build_output=$(GASCAN_GATE_ARTIFACTS="$artifacts" "$root/scripts/build-connected-workspace-image.sh")
 image=$(GASCAN_IMAGE_ARTIFACTS="$artifacts" "$root/scripts/validate-connected-image-receipt.sh" "$reference_file" "$receipt_file") || die 'build receipt pair is invalid'
 [[ "$image" =~ ^[a-z0-9][a-z0-9._/-]*:[a-zA-Z0-9._-]+@sha256:[0-9a-f]{64}$ ]] || die 'receipt reference is not digest-qualified'
 test "$(printf '%s\n' "$build_output" | tail -n 1)" = "$image" || die 'build output and receipt reference differ'

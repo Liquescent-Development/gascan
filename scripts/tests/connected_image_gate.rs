@@ -82,7 +82,7 @@ fn fixture() -> Fixture {
     executable(
         &root.join("scripts/build-connected-workspace-image.sh"),
         &format!(
-            "#!/bin/sh\nset -eu\nprintf 'build:%s\\n' \"$GASCAMP_READ_TOKEN_FILE\" >>\"$CALLS\"\n[ \"${{GASCAN_GATE_TEST_BUILD_FAILURE:-}}\" != 1 ]\nmkdir -p \"$GASCAN_GATE_ARTIFACTS\"\nref='gascan-workspace:test@sha256:{DIGEST}'\n[ \"${{REFERENCE_KIND:-}}\" != mutable ] || ref=gascan-workspace:test\nprintf '%s\\n' \"$ref\" >\"$GASCAN_GATE_ARTIFACTS/workspace-image-ref\"\nprintf '{{\"reference\":\"%s\",\"tag\":\"gascan-workspace:test\",\"platform\":\"linux/arm64\",\"image_digest\":\"sha256:{DIGEST}\",\"status\":\"succeeded\"}}\\n' \"$ref\" >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\"\ncase \"${{RECEIPT_KIND:-}}\" in missing) rm -f \"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; malformed) printf '{{bad\\n' >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; mismatched) printf '{{\"reference\":\"wrong\"}}\\n' >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; esac\nprintf '%s\\n' \"$ref\"\n"
+            "#!/bin/sh\nset -eu\nprintf 'build\\n' >>\"$CALLS\"\n[ \"${{GASCAN_GATE_TEST_BUILD_FAILURE:-}}\" != 1 ]\nmkdir -p \"$GASCAN_GATE_ARTIFACTS\"\nref='gascan-workspace:test@sha256:{DIGEST}'\n[ \"${{REFERENCE_KIND:-}}\" != mutable ] || ref=gascan-workspace:test\nprintf '%s\\n' \"$ref\" >\"$GASCAN_GATE_ARTIFACTS/workspace-image-ref\"\nprintf '{{\"reference\":\"%s\",\"tag\":\"gascan-workspace:test\",\"platform\":\"linux/arm64\",\"image_digest\":\"sha256:{DIGEST}\",\"status\":\"succeeded\"}}\\n' \"$ref\" >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\"\ncase \"${{RECEIPT_KIND:-}}\" in missing) rm -f \"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; malformed) printf '{{bad\\n' >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; mismatched) printf '{{\"reference\":\"wrong\"}}\\n' >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; esac\nprintf '%s\\n' \"$ref\"\n"
         ),
     );
     executable(
@@ -113,9 +113,6 @@ fn fixture() -> Fixture {
         &container,
         "#!/bin/sh\nset -eu\nif [ \"$1\" = list ]; then first=true; printf '['; for name in gascan-image-user-test-$OWNER gascan-image-polyglot-test-$OWNER gascan-image-gascamp-test-$OWNER; do if [ \"${RESIDUE:-}\" = \"$name\" ] || [ -f \"$STATE/$name\" ]; then $first || printf ','; first=false; printf '{\"configuration\":{\"name\":\"%s\"}}' \"$name\"; fi; done; printf ']\\n'; exit 0; fi\nexec \"$RAW_CONTAINER\" \"$@\"\n",
     );
-    let token_file = temp.path().join("gascamp-token");
-    fs::write(&token_file, "synthetic\n").unwrap();
-    fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600)).unwrap();
     let state = temp.path().join("state");
     fs::create_dir(&state).unwrap();
     fs::write(state.join("unrelated-resource"), "foreign").unwrap();
@@ -124,7 +121,6 @@ fn fixture() -> Fixture {
         .arg(repository_root().join("scripts/run-connected-image-gate.sh"))
         .env("GASCAN_GATE_TEST_ROOT", &root)
         .env("GASCAN_GATE_ARTIFACTS", root.join(".artifacts"))
-        .env("GASCAMP_READ_TOKEN_FILE", &token_file)
         .env("GASCAN_TEST_OWNER_TOKEN", TOKEN)
         .env("CONTAINER_BIN", &container)
         .env("CALLS", &calls)
@@ -150,7 +146,7 @@ fn successful_gate_uses_one_reference_and_token_then_publishes_atomically() {
         String::from_utf8_lossy(&output.stderr)
     );
     let calls = fs::read_to_string(&f.calls).unwrap();
-    assert!(calls.find("prefetch").unwrap() < calls.find("build:").unwrap());
+    assert!(calls.find("prefetch").unwrap() < calls.find("build").unwrap());
     for prefix in ["user", "polyglot", "gascamp"] {
         assert!(calls.contains(&format!("inspect gascan-image-{prefix}-test-{TOKEN}")));
     }
@@ -277,7 +273,7 @@ fn stale_pass_pair_is_retired_before_work_and_owner_token_is_never_evidence() {
 }
 
 #[test]
-fn stale_pass_pair_is_retired_even_when_secret_precondition_fails() {
+fn stale_pass_pair_is_retired_when_obsolete_credential_input_is_rejected() {
     let mut f = fixture();
     fs::write(
         f.root.join("docs/evidence/connected-workspace-image.md"),
@@ -285,7 +281,7 @@ fn stale_pass_pair_is_retired_even_when_secret_precondition_fails() {
     )
     .unwrap();
     fs::write(f.root.join("images/workspace/approved-image.txt"), "stale").unwrap();
-    f.command.env("GASCAMP_READ_TOKEN_FILE", "relative");
+    f.command.env("GASCAMP_READ_TOKEN_FILE", "/tmp/obsolete-token");
     assert!(!f.command.status().unwrap().success());
     assert!(
         !f.root
@@ -336,19 +332,18 @@ fn every_publication_boundary_rolls_back_the_pair() {
 }
 
 #[test]
-fn canonical_repository_descendant_secret_is_rejected_before_work() {
-    let mut f = fixture();
-    let outside_parent = f.temp.path().join("outside-parent");
-    std::os::unix::fs::symlink(&f.root, &outside_parent).unwrap();
-    let secret = outside_parent.join("images/workspace/versions.lock");
-    fs::set_permissions(
-        f.root.join("images/workspace/versions.lock"),
-        fs::Permissions::from_mode(0o600),
-    )
-    .unwrap();
-    f.command.env("GASCAMP_READ_TOKEN_FILE", secret);
-    assert!(!f.command.status().unwrap().success());
-    assert!(!f.calls.exists());
+fn gate_rejects_obsolete_credential_input_before_work() {
+    for (name, value) in [
+        ("GASCAMP_READ_TOKEN_FILE", "/tmp/obsolete-token"),
+        ("GITHUB_TOKEN", "obsolete-token"),
+        ("DOCKER_AUTH_CONFIG", "{}"),
+        ("CUSTOM_BUILD_CREDENTIAL", "obsolete-credential"),
+    ] {
+        let mut f = fixture();
+        f.command.env(name, value);
+        assert!(!f.command.status().unwrap().success(), "{name}");
+        assert!(!f.calls.exists(), "{name} reached connected work");
+    }
 }
 
 #[test]
