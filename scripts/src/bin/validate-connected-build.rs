@@ -142,9 +142,12 @@ fn valid_digest(value: &str) -> bool {
 }
 
 fn valid_tag(value: &str) -> bool {
-    value.starts_with("gascan-workspace:")
+    let Some(suffix) = value.strip_prefix("gascan-workspace:") else {
+        return false;
+    };
+    !suffix.is_empty()
         && !value.ends_with(":latest")
-        && value["gascan-workspace:".len()..].bytes().all(|byte| {
+        && suffix.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
         })
 }

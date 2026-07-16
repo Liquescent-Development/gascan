@@ -11,8 +11,12 @@ die() { printf 'connected workspace image build: %s\n' "$*" >&2; exit 1; }
 run_tool() { cargo run --quiet --locked --offline --manifest-path "$root/scripts/Cargo.toml" --bin "$1" -- "${@:2}"; }
 top_value() { awk -F ' = ' -v key="$1" '$1 == key { gsub(/^"|"$/, "", $2); print $2; exit }' "$lock"; }
 
-for name in GASCAMP_READ_TOKEN GASCAMP_READ_TOKEN_FILE GITHUB_TOKEN GH_TOKEN HTTP_AUTHORIZATION AUTHORIZATION; do
-  test -z "${!name:-}" || die "authentication input is forbidden: $name"
+for name in $(compgen -e); do
+  case "$name" in
+    GASCAMP_*TOKEN*|GITHUB_TOKEN|GH_TOKEN|GITLAB_TOKEN|DOCKER_AUTH_CONFIG|HTTP_AUTHORIZATION|AUTHORIZATION|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|*BUILD*TOKEN*|*BUILD*CREDENTIAL*|*BUILD*PASSWORD*|*BUILD*SECRET*)
+      test -z "${!name:-}" || die "authentication input is forbidden: $name"
+      ;;
+  esac
 done
 for argument in "$@"; do
   case "$argument" in --secret|--secret=*|*Authorization:*|*authorization:*) die 'secret-bearing build option is forbidden' ;; esac
