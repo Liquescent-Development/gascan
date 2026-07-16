@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{collections::BTreeSet, fs, path::Path, process::Command};
 
 fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
@@ -46,7 +46,7 @@ fn dockerfile_assembles_the_connected_workspace_base() {
         "COPY --chmod=0555 .artifacts/mise-linux-arm64 /usr/local/bin/mise",
         "mise install --yes",
         "mise current --json",
-        "cmp /tmp/resolved-tool-versions.json /tmp/expected-tool-versions.json",
+        "cmp --silent /tmp/resolved-tool-versions.json /tmp/expected-tool-versions.json",
     ] {
         assert!(
             dockerfile.contains(required),
@@ -70,10 +70,46 @@ fn dockerfile_assembles_the_connected_workspace_base() {
 #[test]
 fn dockerfile_prints_safe_mise_version_metadata_only_when_the_lock_comparison_fails() {
     let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
-    assert!(dockerfile.contains("mise version metadata mismatch"));
-    assert!(dockerfile.contains("actual resolved versions:"));
-    assert!(dockerfile.contains("expected resolved versions:"));
-    assert!(dockerfile.contains("if ! cmp"));
+    assert!(dockerfile.contains("if ! cmp --silent"));
+    assert!(!dockerfile.contains("mise version metadata mismatch"));
+    assert!(!dockerfile.contains("actual resolved versions:"));
+    assert!(!dockerfile.contains("expected resolved versions:"));
+}
+
+#[test]
+fn mise_comparison_is_quiet_on_match_and_emits_only_both_json_documents_on_mismatch() {
+    let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
+    let block = dockerfile
+        .split("if ! cmp --silent")
+        .nth(1)
+        .unwrap()
+        .split("       fi \\")
+        .next()
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let actual = temp.path().join("actual.json");
+    let expected = temp.path().join("expected.json");
+    let script = format!(
+        "if ! cmp --silent{} fi",
+        block
+            .replace("/tmp/resolved-tool-versions.json", actual.to_str().unwrap())
+            .replace(
+                "/tmp/expected-tool-versions.json",
+                expected.to_str().unwrap()
+            )
+            .replace("\\\n", "\n")
+    );
+    fs::write(&actual, "{\"node\":\"20\"}\n").unwrap();
+    fs::write(&expected, "{\"node\":\"20\"}\n").unwrap();
+    let equal = Command::new("bash").args(["-c", &script]).output().unwrap();
+    assert!(equal.status.success());
+    assert!(equal.stdout.is_empty());
+    assert!(equal.stderr.is_empty());
+    fs::write(&expected, "{\"node\":\"22\"}\n").unwrap();
+    let mismatch = Command::new("bash").args(["-c", &script]).output().unwrap();
+    assert!(!mismatch.status.success());
+    assert_eq!(mismatch.stdout, b"{\"node\":\"20\"}\n{\"node\":\"22\"}\n");
+    assert!(mismatch.stderr.is_empty());
 }
 
 #[test]

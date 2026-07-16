@@ -66,6 +66,7 @@ fn fake_runner_builds_the_exact_public_snapshot_and_publishes_reference_last() {
 printf 'cargo\t%s\n' "$*" >>"$CALLS"
 case "$*" in
  *snapshot-helper-identity*) printf 'hash\t1\t2\n' ;;
+ *sanitize-build-output*) "$SANITIZER" "${{@: -2:1}}" "${{@: -1}}" ;;
  *prepare-workspace-context*) printf '{manifest}\n' ;;
  *validate-image-inspect*) printf 'sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab\n' ;;
  *'validate-connected-build -- validate-receipt '*) "$VALIDATOR" validate-receipt "${{@: -4:1}}" "${{@: -3:1}}" "${{@: -2:1}}" "${{@: -1}}" ;;
@@ -79,7 +80,7 @@ esac
         &bin.join("sudo"),
         r#"#!/bin/bash
 printf 'sudo\t%s\n' "$*" >>"$CALLS"
-case " $* " in *' create '*) printf 'receipt\n';; *' path '*) printf '%s\n' "$SNAPSHOT";; *' finish '*) exit 0;; *) exit 91;; esac
+case " $* " in *' create '*) printf 'receipt\n';; *' path '*) printf '%s\n' "$SNAPSHOT";; *' finish '*) compgen -G "$ARTIFACTS/.connected-build-diagnostic.*" >/dev/null && exit 75; exit 0;; *) exit 91;; esac
 "#,
     );
     executable(
@@ -104,7 +105,9 @@ esac
         )
         .env("CALLS", &calls)
         .env("SNAPSHOT", &context)
+        .env("ARTIFACTS", repo.join(".artifacts"))
         .env("VALIDATOR", env!("CARGO_BIN_EXE_validate-connected-build"))
+        .env("SANITIZER", env!("CARGO_BIN_EXE_sanitize-build-output"))
         .env("BENIGN_BUILD_LABEL", "public-build")
         .env("BUILD_PASSWORD_POLICY", "minimum-length-20")
         .env("BUILD_SECRETARY", "release-coordinator")
@@ -317,6 +320,8 @@ fn fake_runner_failure_matrix_cleans_snapshot_and_never_commits_an_invalid_pair(
         "build_fail_output",
         "build_fail_secret",
         "build_fail_large",
+        "scanner_fail",
+        "build_signal",
         "inspect_malformed",
         "inspect_mismatch",
         "receipt_invalid",
@@ -352,6 +357,7 @@ fn fake_runner_failure_matrix_cleans_snapshot_and_never_commits_an_invalid_pair(
 printf 'cargo\t%s\n' "$*" >>"$CALLS"
 case "$*" in
  *snapshot-helper-identity*) printf 'hash\t1\t2\n' ;;
+ *sanitize-build-output*) test "$FAULT" != scanner_fail || exit 70; "$SANITIZER" "${{@: -2:1}}" "${{@: -1}}" ;;
  *prepare-workspace-context*) test "$FAULT" != context_after || count=$(($(cat "$COUNT" 2>/dev/null || printf 0)+1)); test "$FAULT" != context_after || printf '%s' "$count" >"$COUNT"; test "$FAULT:$count" != context_after:2 || {{ printf '%064d\n' 7; exit; }}; printf '{manifest}\n' ;;
  *validate-image-inspect*) test "$FAULT" != base_invalid || exit 85; printf 'sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab\n' ;;
  *'validate-connected-build -- validate-receipt '*) test "$FAULT" != receipt_invalid || printf changed >>"${{@: -4:1}}"; "$VALIDATOR" validate-receipt "${{@: -4:1}}" "${{@: -3:1}}" "${{@: -2:1}}" "${{@: -1}}" ;;
@@ -365,7 +371,7 @@ esac
             &bin.join("sudo"),
             r#"#!/bin/bash
 printf 'sudo\t%s\n' "$*" >>"$CALLS"
-case " $* " in *' create '*) test "$FAULT" != create_fail || exit 83; printf 'receipt\n';; *' path '*) test "$FAULT" != path_fail || exit 84; test "$FAULT" != public_before || printf changed >>"$SNAPSHOT/context-manifest.tsv"; printf '%s\n' "$SNAPSHOT";; *' finish '*) exit 0;; *) exit 91;; esac
+case " $* " in *' create '*) test "$FAULT" != create_fail || exit 83; printf 'receipt\n';; *' path '*) test "$FAULT" != path_fail || exit 84; test "$FAULT" != public_before || printf changed >>"$SNAPSHOT/context-manifest.tsv"; printf '%s\n' "$SNAPSHOT";; *' finish '*) compgen -G "$ARTIFACTS/.connected-build-diagnostic.*" >/dev/null && exit 75; exit 0;; *) exit 91;; esac
 "#,
         );
         executable(
@@ -385,6 +391,7 @@ case "$*" in
      build_fail_output) printf 'mise resolution mismatch: safe diagnostic\n' >&2; exit 81;;
      build_fail_secret) i=0; while test "$i" -lt 10000; do printf 'safe-prefix-%05d\n' "$i" >&2; i=$((i+1)); done; printf 'Authorization: Bearer should-never-escape\n' >&2; exit 82;;
      build_fail_large) i=0; while test "$i" -lt 20000; do printf 'bounded-safe-diagnostic-%05d\n' "$i" >&2; i=$((i+1)); done; exit 83;;
+     build_signal) kill -TERM "$PPID"; sleep 1; exit 84;;
    esac
    test "$FAULT" != public_after || printf changed >>"$SNAPSHOT/context-manifest.tsv";;
  *) exit 92;;
@@ -442,7 +449,9 @@ destination=${@: -1}; case "$FAULT:$destination" in fail_json:*/workspace-image-
             .env("COUNT", &count)
             .env("FAULT", fault)
             .env("SNAPSHOT", &snapshot)
+            .env("ARTIFACTS", repo.join(".artifacts"))
             .env("VALIDATOR", validator)
+            .env("SANITIZER", env!("CARGO_BIN_EXE_sanitize-build-output"))
             .output()
             .unwrap();
         assert!(!output.status.success(), "{fault} unexpectedly succeeded");
@@ -453,16 +462,22 @@ destination=${@: -1}; case "$FAULT:$destination" in fail_json:*/workspace-image-
                     .contains("mise resolution mismatch: safe diagnostic"));
             }
             "build_fail_secret" => {
-                assert_eq!(output.status.code(), Some(82));
+                assert_eq!(output.status.code(), Some(1));
                 assert!(!String::from_utf8_lossy(&output.stderr).contains("should-never-escape"));
                 assert!(String::from_utf8_lossy(&output.stderr)
-                    .contains("diagnostic rejected as potentially sensitive"));
+                    .contains("diagnostic rejected or sanitizer failed"));
             }
             "build_fail_large" => {
                 assert_eq!(output.status.code(), Some(83));
                 assert!(output.stderr.len() <= 140_000, "diagnostic was not bounded");
                 assert!(String::from_utf8_lossy(&output.stderr).contains("diagnostic truncated"));
             }
+            "scanner_fail" => {
+                assert_eq!(output.status.code(), Some(1));
+                assert!(String::from_utf8_lossy(&output.stderr)
+                    .contains("diagnostic rejected or sanitizer failed"));
+            }
+            "build_signal" => assert_eq!(output.status.code(), Some(143)),
             _ => {}
         }
         let log = fs::read_to_string(&calls).unwrap();
