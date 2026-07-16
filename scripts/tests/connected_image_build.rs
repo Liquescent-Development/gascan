@@ -106,6 +106,8 @@ esac
         .env("SNAPSHOT", &context)
         .env("VALIDATOR", env!("CARGO_BIN_EXE_validate-connected-build"))
         .env("BENIGN_BUILD_LABEL", "public-build")
+        .env("BUILD_PASSWORD_POLICY", "minimum-length-20")
+        .env("BUILD_SECRETARY", "release-coordinator")
         .output()
         .unwrap();
     assert!(
@@ -141,6 +143,8 @@ fn authentication_inputs_fail_before_container_use() {
         ("GASCAMP_READ_TOKEN_FILE", "/tmp/token"),
         ("DOCKER_AUTH_CONFIG", "{}"),
         ("GITLAB_TOKEN", "token"),
+        ("GITHUB_TOKEN", "token"),
+        ("GH_TOKEN", "token"),
         ("AWS_ACCESS_KEY_ID", "key"),
         ("AWS_SECRET_ACCESS_KEY", "secret"),
         ("AWS_SESSION_TOKEN", "session"),
@@ -237,6 +241,67 @@ fn receipt_pair_validator_rejects_cross_file_identity_mismatch() {
 }
 
 #[test]
+fn every_image_consumer_rejects_each_receipt_identity_mismatch_before_container_use() {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let artifacts = temp.path().join("artifacts");
+    fs::create_dir_all(artifacts.join("connected-workspace-context")).unwrap();
+    fs::write(
+        artifacts.join("connected-workspace-context/context-manifest.tsv"),
+        "consumer-fixture\n",
+    )
+    .unwrap();
+    let reference_file = artifacts.join("workspace-image-ref");
+    let receipt_file = artifacts.join("workspace-image-build.json");
+    let tag = "gascan-workspace:consumer";
+    let image = format!("sha256:{}", "a".repeat(64));
+    let reference = format!("{tag}@{image}");
+    fs::write(&reference_file, format!("{reference}\n")).unwrap();
+    let lock_digest = format!(
+        "{:x}",
+        Sha256::digest(fs::read(root().join("images/workspace/versions.lock")).unwrap())
+    );
+    let context_digest = format!("{:x}", Sha256::digest(b"consumer-fixture\n"));
+    let valid = format!(
+        r#"{{"reference":"{reference}","tag":"{tag}","platform":"linux/arm64","lock_digest":"{lock_digest}","context_digest":"{context_digest}","image_digest":"{image}","status":"succeeded"}}"#
+    );
+    let mismatches = [
+        valid.replacen(tag, "gascan-workspace:wrong", 1),
+        valid.replacen(&image, &format!("sha256:{}", "b".repeat(64)), 1),
+        valid.replacen(&context_digest, &"c".repeat(64), 1),
+        valid.replacen(&lock_digest, &"d".repeat(64), 1),
+    ];
+    let container = temp.path().join("container");
+    let called = temp.path().join("called");
+    executable(&container, "#!/bin/sh\ntouch \"$CALLED\"\nexit 99\n");
+    for mismatch in mismatches {
+        fs::write(&receipt_file, mismatch).unwrap();
+        for consumer in [
+            "user-and-volumes.sh",
+            "polyglot-smoke.sh",
+            "gascamp-smoke.sh",
+        ] {
+            let _ = fs::remove_file(&called);
+            let output = Command::new("bash")
+                .arg(root().join("tests/image").join(consumer))
+                .env("GASCAN_IMAGE_REF_FILE", &reference_file)
+                .env("GASCAN_IMAGE_ARTIFACTS", &artifacts)
+                .env("CONTAINER_BIN", &container)
+                .env("CALLED", &called)
+                .output()
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "{consumer} accepted mismatched receipt"
+            );
+            assert!(
+                !called.exists(),
+                "{consumer} used container before rejecting receipt"
+            );
+        }
+    }
+}
+
+#[test]
 fn fake_runner_failure_matrix_cleans_snapshot_and_never_commits_an_invalid_pair() {
     for fault in [
         "create_fail",
@@ -327,6 +392,31 @@ destination=${@: -1}; case "$FAULT:$destination" in fail_json:*/workspace-image-
         let calls = temp.path().join("calls");
         let count = temp.path().join("count");
         let validator = env!("CARGO_BIN_EXE_validate-connected-build");
+        let lock_digest = format!(
+            "{:x}",
+            Sha256::digest(fs::read(repo.join("images/workspace/versions.lock")).unwrap())
+        );
+        if fault == "fail_ref" {
+            let old_image = format!("sha256:{}", "a".repeat(64));
+            let old_reference = format!("gascan-workspace:fixture@{old_image}");
+            fs::write(
+                repo.join(".artifacts/workspace-image-ref"),
+                format!("{old_reference}\n"),
+            )
+            .unwrap();
+            fs::write(repo.join(".artifacts/workspace-image-build.json"), format!(r#"{{"reference":"{old_reference}","tag":"gascan-workspace:fixture","platform":"linux/arm64","lock_digest":"{lock_digest}","context_digest":"{manifest}","image_digest":"{old_image}","status":"succeeded"}}"#)).unwrap();
+            assert!(
+                Command::new(validator)
+                    .arg("validate-receipt")
+                    .arg(repo.join(".artifacts/workspace-image-ref"))
+                    .arg(repo.join(".artifacts/workspace-image-build.json"))
+                    .arg(&lock_digest)
+                    .arg(&manifest)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
         let output = Command::new("bash")
             .arg(repo.join("scripts/build-connected-workspace-image.sh"))
             .env(
@@ -348,10 +438,25 @@ destination=${@: -1}; case "$FAULT:$destination" in fail_json:*/workspace-image-
             expected_finish,
             "{fault} cleanup count differs: {log}"
         );
-        assert!(
-            !repo.join(".artifacts/workspace-image-ref").exists(),
-            "{fault} published reference"
-        );
+        if fault == "fail_ref" {
+            assert!(
+                !Command::new(validator)
+                    .arg("validate-receipt")
+                    .arg(repo.join(".artifacts/workspace-image-ref"))
+                    .arg(repo.join(".artifacts/workspace-image-build.json"))
+                    .arg(&lock_digest)
+                    .arg(&manifest)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "interrupted old-reference/new-JSON pair was accepted"
+            );
+        } else {
+            assert!(
+                !repo.join(".artifacts/workspace-image-ref").exists(),
+                "{fault} published reference"
+            );
+        }
         let retained = fs::read_dir(repo.join(".artifacts"))
             .unwrap()
             .filter_map(Result::ok)
