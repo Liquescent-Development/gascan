@@ -1,0 +1,35 @@
+# Workspace identity collision correction
+
+## Root cause
+
+The exact pinned Ubuntu base already owns UID and GID 1000 as the canonical
+`ubuntu` account and group. Creating a second `workspace` identity at those
+IDs therefore fails before the final image can be assembled.
+
+## TDD record
+
+- RED: `image_user_contract` failed because the migration helper and its
+  Dockerfile invocation did not exist.
+- GREEN: the final stage now invokes a narrow helper which accepts only the
+  exact pinned Ubuntu UID/GID 1000 identity, rejects aliases and pre-existing
+  workspace identities, renames/moves it with `usermod` and `groupmod`, and
+  verifies the exact resulting passwd/group records and home layout.
+- The helper forbids non-unique IDs and does not delete/recreate identities.
+
+## Verification
+
+- `cargo test --manifest-path scripts/Cargo.toml --test image_user_contract`
+- `cargo test --manifest-path scripts/Cargo.toml --test connected_dockerfile`
+- `cargo test --manifest-path scripts/Cargo.toml --test polyglot_image_contract`
+- `cargo test --manifest-path scripts/Cargo.toml -- --test-threads=1`
+- `cargo clippy --manifest-path scripts/Cargo.toml --test image_user_contract -- -D warnings`
+- `shellcheck images/workspace/bin/migrate-workspace-identity`
+- `bash -n images/workspace/bin/migrate-workspace-identity`
+- `git diff --check`
+
+The repository-wide `cargo fmt --check` remains blocked by pre-existing
+formatting drift in unrelated test files. The changed Rust test was formatted
+and checked independently.
+
+No live image gate, privileged helper operation, evidence publication, or
+approval-marker mutation was performed by this task.

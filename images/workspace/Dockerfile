@@ -70,6 +70,7 @@ COPY .artifacts/playwright-chromium-reviewed/chrome-linux /opt/gascan/chromium/c
 COPY --chmod=0440 images/workspace/etc/sudoers.d/workspace /etc/sudoers.d/workspace
 COPY --chmod=0555 images/workspace/bin/gascan-entrypoint /usr/local/bin/gascan-entrypoint
 COPY --chmod=0555 images/workspace/bin/select-gascamp /usr/local/bin/select-gascamp
+COPY --chmod=0555 images/workspace/bin/migrate-workspace-identity /usr/local/bin/migrate-workspace-identity
 COPY --from=gascamp-builder /out /opt/gascan/gascamp
 COPY --chmod=0444 images/workspace/etc/profile.d/mise.sh /etc/profile.d/mise.sh
 COPY --chmod=0444 images/workspace/tests/playwright-smoke.mjs /opt/gascan/tests/playwright-smoke.mjs
@@ -78,8 +79,7 @@ USER root
 RUN test -x /opt/gascan/gascamp/bin/camp \
     && test -L /opt/gascan/gascamp/bin/campd \
     && test "$(cat /opt/gascan/gascamp/REVISION)" = "$GASCAMP_REVISION" \
-    && groupadd --gid 1000 workspace \
-    && useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash workspace \
+    && /usr/local/bin/migrate-workspace-identity \
     && chown workspace:workspace /opt/gascan/mise \
     && install -d -o workspace -g workspace \
        /workspace \

@@ -16,8 +16,8 @@ fn dockerfile_declares_workspace_user_init_and_persistent_layout() {
     }
     for required in [
         "COPY --chmod=0440 images/workspace/etc/sudoers.d/workspace /etc/sudoers.d/workspace",
-        "groupadd --gid 1000 workspace",
-        "useradd --uid 1000 --gid 1000",
+        "COPY --chmod=0555 images/workspace/bin/migrate-workspace-identity /usr/local/bin/migrate-workspace-identity",
+        "/usr/local/bin/migrate-workspace-identity",
         "chown workspace:workspace /opt/gascan/mise",
         "/opt/gascan/mise",
         "/home/workspace/.cache",
@@ -31,6 +31,33 @@ fn dockerfile_declares_workspace_user_init_and_persistent_layout() {
         assert!(
             dockerfile.contains(required),
             "missing image contract: {required}"
+        );
+    }
+}
+
+#[test]
+fn identity_migration_is_exact_and_fail_closed() {
+    let migration =
+        fs::read_to_string(root().join("images/workspace/bin/migrate-workspace-identity")).unwrap();
+
+    for required in [
+        "ubuntu:x:1000:1000:Ubuntu:/home/ubuntu:/bin/bash",
+        "ubuntu:x:1000:",
+        "usermod --login workspace --home /home/workspace --move-home ubuntu",
+        "groupmod --new-name workspace ubuntu",
+        "workspace:x:1000:1000:Ubuntu:/home/workspace:/bin/bash",
+        "workspace:x:1000:",
+        "test ! -e /home/ubuntu",
+    ] {
+        assert!(
+            migration.contains(required),
+            "missing exact identity contract: {required}"
+        );
+    }
+    for forbidden in ["--non-unique", "userdel", "groupdel", "useradd", "groupadd"] {
+        assert!(
+            !migration.contains(forbidden),
+            "unsafe identity migration: {forbidden}"
         );
     }
 }

@@ -1,0 +1,28 @@
+#!/bin/sh
+set -eu
+
+expected_user='ubuntu:x:1000:1000:Ubuntu:/home/ubuntu:/bin/bash'
+expected_group='ubuntu:x:1000:'
+expected_workspace_user='workspace:x:1000:1000:Ubuntu:/home/workspace:/bin/bash'
+expected_workspace_group='workspace:x:1000:'
+
+test "$(awk -F: '$3 == 1000 { print }' /etc/passwd)" = "$expected_user"
+test "$(awk -F: '$3 == 1000 { print }' /etc/group)" = "$expected_group"
+test "$(getent passwd ubuntu)" = "$expected_user"
+test "$(getent group ubuntu)" = "$expected_group"
+if getent passwd workspace >/dev/null; then exit 1; fi
+if getent group workspace >/dev/null; then exit 1; fi
+test -d /home/ubuntu
+test ! -e /home/workspace
+
+usermod --login workspace --home /home/workspace --move-home ubuntu
+groupmod --new-name workspace ubuntu
+
+test "$(getent passwd workspace)" = "$expected_workspace_user"
+test "$(getent group workspace)" = "$expected_workspace_group"
+test "$(awk -F: '$3 == 1000 { print }' /etc/passwd)" = "$expected_workspace_user"
+test "$(awk -F: '$3 == 1000 { print }' /etc/group)" = "$expected_workspace_group"
+if getent passwd ubuntu >/dev/null; then exit 1; fi
+if getent group ubuntu >/dev/null; then exit 1; fi
+test ! -e /home/ubuntu
+test -d /home/workspace
