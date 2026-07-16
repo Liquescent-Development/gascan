@@ -67,3 +67,10 @@ sources and `--chmod` modes from each non-stage `COPY`, and compares sealed
 bytes and modes. Connected assembly independently parses the sealed Dockerfile
 and rejects unsafe syntax or any source absent from the staged context. A
 hypothetical unsealed local `COPY` proves this fails before publication.
+
+The follow-up now uses one shared production COPY parser in both preparation
+and tests. It handles case-insensitive instructions, leading spaces, flags,
+multi-source shell form, and stage copies structurally, while rejecting tabs,
+quoting/JSON, continuations, unknown flags, and malformed operands. Sealed
+source modes are derived from source executability (0444/0555), independently
+of Docker destination `--chmod`; generated artifacts remain explicitly mapped.

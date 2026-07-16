@@ -17,9 +17,9 @@ use cap_primitives::fs::{
 };
 use cap_std::{ambient_authority, fs::Dir};
 use reqwest::{
-    Url,
     blocking::{Client, Response},
     redirect::{Action, Attempt, Policy},
+    Url,
 };
 use sha2::{Digest, Sha256};
 
@@ -377,4 +377,63 @@ pub fn walk_redirects_with(
         redirects += 1;
         current = next;
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct DockerCopy {
+    pub sources: Vec<String>,
+    pub from_stage: bool,
+    pub chmod: Option<u32>,
+}
+
+pub fn parse_dockerfile_copies(text: &str) -> Result<Vec<DockerCopy>, DynError> {
+    let mut copies = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim_start_matches(' ');
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut words = line.split_ascii_whitespace();
+        let Some(instruction) = words.next() else {
+            continue;
+        };
+        if !instruction.eq_ignore_ascii_case("COPY") {
+            continue;
+        }
+        if line.contains('\t') || line.ends_with('\\') {
+            return Err("unsupported Dockerfile whitespace or continuation".into());
+        }
+        if line.contains('[') || line.contains('"') || line.contains('\'') {
+            return Err("unsupported Dockerfile COPY quoting or JSON form".into());
+        }
+        let mut from_stage = false;
+        let mut chmod = None;
+        let mut operands = Vec::new();
+        for word in words {
+            if operands.is_empty() && word.starts_with("--") {
+                if let Some(value) = word.strip_prefix("--from=") {
+                    if value.is_empty() {
+                        return Err("empty COPY --from".into());
+                    }
+                    from_stage = true;
+                } else if let Some(value) = word.strip_prefix("--chmod=") {
+                    chmod = Some(u32::from_str_radix(value, 8)?);
+                } else {
+                    return Err("unsupported Dockerfile COPY flag".into());
+                }
+            } else {
+                operands.push(word.to_owned());
+            }
+        }
+        if operands.len() < 2 {
+            return Err("COPY requires source and destination".into());
+        }
+        operands.pop();
+        copies.push(DockerCopy {
+            sources: operands,
+            from_stage,
+            chmod,
+        });
+    }
+    Ok(copies)
 }

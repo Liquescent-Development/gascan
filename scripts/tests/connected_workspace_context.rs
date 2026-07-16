@@ -5,7 +5,7 @@ use std::{
     process::{Command, Output},
 };
 
-use gascan_image_tools::{reviewed_input_kind_allowed, ReviewedInputKind};
+use gascan_image_tools::{parse_dockerfile_copies, reviewed_input_kind_allowed, ReviewedInputKind};
 use tempfile::TempDir;
 
 const REVIEWED_GASCAMP_REVISION: &str = "f6b248c5926240856dbea83d1d2c5c90ea1c1456";
@@ -45,18 +45,19 @@ impl Fixture {
         let real_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let dockerfile = fs::read_to_string(real_root.join("images/workspace/Dockerfile")).unwrap();
         fs::write(repository.join("images/workspace/Dockerfile"), &dockerfile).unwrap();
-        for line in dockerfile
-            .lines()
-            .filter(|line| line.starts_with("COPY ") && !line.contains("--from="))
+        for copy in parse_dockerfile_copies(&dockerfile)
+            .unwrap()
+            .into_iter()
+            .filter(|copy| !copy.from_stage)
         {
-            let fields: Vec<_> = line.split_whitespace().collect();
-            let source = fields[fields.len() - 2];
-            if source.starts_with(".artifacts/") {
-                continue;
+            for source in copy.sources {
+                if source.starts_with(".artifacts/") {
+                    continue;
+                }
+                let target = repository.join(&source);
+                fs::create_dir_all(target.parent().unwrap()).unwrap();
+                fs::copy(real_root.join(&source), target).unwrap();
             }
-            let target = repository.join(source);
-            fs::create_dir_all(target.parent().unwrap()).unwrap();
-            fs::copy(real_root.join(source), target).unwrap();
         }
         fs::write(cache.join("mise-linux-arm64"), "mise\n").unwrap();
         fs::write(cache.join("expected-tool-versions.json"), "{}\n").unwrap();
@@ -106,39 +107,59 @@ fn every_local_dockerfile_copy_source_is_sealed_with_exact_bytes_and_mode() {
     assert!(fixture.run().status.success());
     let dockerfile =
         fs::read_to_string(fixture.repository.join("images/workspace/Dockerfile")).unwrap();
-    for line in dockerfile
-        .lines()
-        .filter(|line| line.starts_with("COPY ") && !line.contains("--from="))
+    for copy in parse_dockerfile_copies(&dockerfile)
+        .unwrap()
+        .into_iter()
+        .filter(|copy| !copy.from_stage)
     {
-        let fields: Vec<_> = line.split_whitespace().collect();
-        let source = fields[fields.len() - 2];
-        if source.starts_with(".artifacts/") {
-            assert!(matches!(
-                source,
-                ".artifacts/mise-linux-arm64"
-                    | ".artifacts/expected-tool-versions.json"
-                    | ".artifacts/playwright-chromium-reviewed/chrome-linux"
-            ));
-            assert!(fixture.context.join(source).exists());
-            continue;
+        for source in copy.sources {
+            if source.starts_with(".artifacts/") {
+                assert!(matches!(
+                    source.as_str(),
+                    ".artifacts/mise-linux-arm64"
+                        | ".artifacts/expected-tool-versions.json"
+                        | ".artifacts/playwright-chromium-reviewed/chrome-linux"
+                ));
+                assert!(fixture.context.join(source).exists());
+                continue;
+            }
+            let original = fixture.repository.join(&source);
+            let sealed = fixture.context.join(&source);
+            assert_eq!(
+                fs::read(&sealed).unwrap(),
+                fs::read(&original).unwrap(),
+                "COPY source bytes differ: {source}"
+            );
+            let expected_mode =
+                if fs::metadata(&original).unwrap().permissions().mode() & 0o111 != 0 {
+                    0o555
+                } else {
+                    0o444
+                };
+            assert_eq!(
+                fs::metadata(&sealed).unwrap().permissions().mode() & 0o777,
+                expected_mode,
+                "COPY source mode differs: {source}"
+            );
         }
-        let original = fixture.repository.join(source);
-        let sealed = fixture.context.join(source);
-        assert_eq!(
-            fs::read(&sealed).unwrap(),
-            fs::read(&original).unwrap(),
-            "COPY source bytes differ: {source}"
-        );
-        let expected_mode = fields
-            .iter()
-            .find_map(|field| field.strip_prefix("--chmod="))
-            .map(|mode| u32::from_str_radix(mode, 8).unwrap())
-            .unwrap_or(0o444);
-        assert_eq!(
-            fs::metadata(&sealed).unwrap().permissions().mode() & 0o777,
-            expected_mode,
-            "COPY source mode differs: {source}"
-        );
+    }
+}
+
+#[test]
+fn docker_copy_parser_is_structural_and_fail_closed() {
+    let parsed = parse_dockerfile_copies("  copy --chmod=0555 a b /dest\nCOPY --from=builder /out /dest\nCOPY name--from=value /dest\n").unwrap();
+    assert_eq!(parsed[0].sources, ["a", "b"]);
+    assert_eq!(parsed[0].chmod, Some(0o555));
+    assert!(parsed[1].from_stage);
+    assert_eq!(parsed[2].sources, ["name--from=value"]);
+    for invalid in [
+        "\tCOPY a b",
+        "COPY [\"a\",\"b\"]",
+        "COPY a \\",
+        "COPY --unknown=x a b",
+        "COPY 'a' b",
+    ] {
+        assert!(parse_dockerfile_copies(invalid).is_err());
     }
 }
 
@@ -256,11 +277,17 @@ fn unsafe_allowlisted_inputs_fail_before_publication() {
         let fixture = Fixture::new();
         match kind {
             "symlink" => {
-                fs::remove_file(fixture.repository.join("images/workspace/bin/entrypoint"))
-                    .unwrap();
+                fs::remove_file(
+                    fixture
+                        .repository
+                        .join("images/workspace/bin/gascan-entrypoint"),
+                )
+                .unwrap();
                 std::os::unix::fs::symlink(
                     &fixture.lock,
-                    fixture.repository.join("images/workspace/bin/entrypoint"),
+                    fixture
+                        .repository
+                        .join("images/workspace/bin/gascan-entrypoint"),
                 )
                 .unwrap();
             }

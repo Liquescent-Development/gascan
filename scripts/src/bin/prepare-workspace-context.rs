@@ -14,7 +14,7 @@ use std::{
 use cap_primitives::fs::{FollowSymlinks, OpenOptions, PermissionsExt as CapPermissionsExt};
 use cap_std::{ambient_authority, fs::Dir};
 use gascan_image_tools::bundle::{validate_bundle, PublishedBundleLocks};
-use gascan_image_tools::{reviewed_input_kind_allowed, ReviewedInputKind};
+use gascan_image_tools::{parse_dockerfile_copies, reviewed_input_kind_allowed, ReviewedInputKind};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -610,28 +610,26 @@ fn assemble_connected(
 
 fn validate_dockerfile_copy_sources(staging: &Path) -> Result<(), DynError> {
     let dockerfile = fs::read_to_string(staging.join("Dockerfile"))?;
-    for line in dockerfile
-        .lines()
-        .filter(|line| line.starts_with("COPY ") && !line.contains("--from="))
-    {
-        let fields: Vec<_> = line.split_whitespace().collect();
-        if fields.len() < 3 {
-            return Err("unsupported Dockerfile COPY syntax".into());
+    for copy in parse_dockerfile_copies(&dockerfile).map_err(|error| error.to_string())? {
+        if copy.from_stage {
+            continue;
         }
-        let source = Path::new(fields[fields.len() - 2]);
-        if source.is_absolute()
-            || source
-                .components()
-                .any(|part| !matches!(part, Component::Normal(_)))
-        {
-            return Err("unsafe Dockerfile COPY source".into());
-        }
-        if fs::symlink_metadata(staging.join(source)).is_err() {
-            return Err(format!(
-                "Dockerfile COPY source was not sealed: {}",
-                source.display()
-            )
-            .into());
+        for source_text in copy.sources {
+            let source = Path::new(&source_text);
+            if source.is_absolute()
+                || source
+                    .components()
+                    .any(|part| !matches!(part, Component::Normal(_)))
+            {
+                return Err("unsafe Dockerfile COPY source".into());
+            }
+            if fs::symlink_metadata(staging.join(source)).is_err() {
+                return Err(format!(
+                    "Dockerfile COPY source was not sealed: {}",
+                    source.display()
+                )
+                .into());
+            }
         }
     }
     Ok(())
