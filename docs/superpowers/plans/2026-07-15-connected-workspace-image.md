@@ -248,7 +248,7 @@ for required in [
     "rm -rf /var/lib/apt/lists/*",
     "COPY --chmod=0555 .artifacts/mise-linux-arm64 /usr/local/bin/mise",
     "mise install --yes",
-    "mise current --json",
+    "mise ls --current --installed --json",
     "cmp /tmp/resolved-tool-versions.json /tmp/expected-tool-versions.json",
 ] {
     assert!(dockerfile.contains(required), "missing connected contract: {required}");
@@ -276,7 +276,7 @@ Expected: FAIL on the existing offline stages.
 
 - [ ] **Step 3: Implement `workspace-base`**
 
-Use the immutable `BASE_IMAGE`. Copy `system-tools.txt`, run signed apt update/install with retries zero, verify every requested package is installed, then remove apt lists. Copy the digest-verified mise binary and exact config, run `mise install --yes`, record `mise current --json`, normalize it through jq, compare it to `.artifacts/expected-tool-versions.json`, and store the root-owned `0444` evidence file.
+Use the immutable `BASE_IMAGE`. Copy `system-tools.txt`, run signed apt update/install with retries zero, verify every requested package is installed, then remove apt lists. Copy the digest-verified mise binary and exact config, install the exact tools, record `mise ls --current --installed --json`, require exactly one active installed record per tool while normalizing it through jq, compare it to `.artifacts/expected-tool-versions.json`, and store the root-owned `0444` evidence file.
 
 Use this package-install shape so the reviewed file is the sole package list:
 

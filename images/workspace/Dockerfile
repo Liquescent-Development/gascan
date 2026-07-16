@@ -25,8 +25,8 @@ RUN mise install --yes erlang@29.0.3 \
     && mise exec erlang@29.0.3 -- mise install --yes elixir@1.20.2-otp-29 \
     && test "$(mise current elixir)" = "1.20.2-otp-29" \
     && mise install --yes go@1.26.5 java@25.0.2 node@24.18.0 python@3.14.6 ruby@3.4.10 rust@1.97.0 \
-    && mise current --json \
-       | jq --compact-output --sort-keys 'with_entries(.value = .value.version)' \
+    && mise ls --current --installed --json \
+       | jq --exit-status --compact-output --sort-keys 'if ((keys|sort) != ["elixir","erlang","go","java","node","python","ruby","rust"]) then error("unexpected mise tool set") else to_entries | map(if ((.value|type)!="array") or ((.value|length)!=1) or (.value[0].installed != true) or (.value[0].active != true) or ((.value[0].version|type)!="string") or (.value[0].version=="") then error("invalid mise ls record") else {key:.key,value:.value[0].version} end) | from_entries end' \
        > /tmp/resolved-tool-versions.json \
     && if ! cmp --silent /tmp/resolved-tool-versions.json /tmp/expected-tool-versions.json; then \
          cat /tmp/resolved-tool-versions.json; \

@@ -1,5 +1,7 @@
 use std::{collections::BTreeSet, fs, path::Path, process::Command};
 
+const MISE_LS_FILTER: &str = r#"if ((keys|sort) != ["elixir","erlang","go","java","node","python","ruby","rust"]) then error("unexpected mise tool set") else to_entries | map(if ((.value|type)!="array") or ((.value|length)!=1) or (.value[0].installed != true) or (.value[0].active != true) or ((.value[0].version|type)!="string") or (.value[0].version=="") then error("invalid mise ls record") else {key:.key,value:.value[0].version} end) | from_entries end"#;
+
 fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
 }
@@ -56,7 +58,7 @@ fn dockerfile_assembles_the_connected_workspace_base() {
         "rm -rf /var/lib/apt/lists/*",
         "COPY --chmod=0555 .artifacts/mise-linux-arm64 /usr/local/bin/mise",
         "mise install --yes",
-        "mise current --json",
+        "mise ls --current --installed --json",
         "cmp --silent /tmp/resolved-tool-versions.json /tmp/expected-tool-versions.json",
     ] {
         assert!(
@@ -76,6 +78,78 @@ fn dockerfile_assembles_the_connected_workspace_base() {
             "deferred/unlocked path: {forbidden}"
         );
     }
+}
+
+fn normalize_mise_ls(input: &str) -> std::process::Output {
+    Command::new("jq")
+        .args([
+            "--exit-status",
+            "--compact-output",
+            "--sort-keys",
+            MISE_LS_FILTER,
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(input.as_bytes())?;
+            child.wait_with_output()
+        })
+        .unwrap()
+}
+
+#[test]
+fn mise_ls_schema_requires_one_active_installed_record_per_preserved_key() {
+    let record =
+        |version: &str| format!(r#"[{{"version":"{version}","installed":true,"active":true}}]"#);
+    let valid = format!(
+        r#"{{"elixir":{},"erlang":{},"go":{},"java":{},"node":{},"python":{},"ruby":{},"rust":{}}}"#,
+        record("1.20.2-otp-29"),
+        record("29.0.3"),
+        record("1.26.5"),
+        record("25.0.2"),
+        record("24.18.0"),
+        record("3.14.6"),
+        record("3.4.10"),
+        record("1.97.0")
+    );
+    let output = normalize_mise_ls(&valid);
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), r#"{"elixir":"1.20.2-otp-29","erlang":"29.0.3","go":"1.26.5","java":"25.0.2","node":"24.18.0","python":"3.14.6","ruby":"3.4.10","rust":"1.97.0"}"#.to_owned() + "\n");
+    for invalid in [
+        valid.replace(&record("29.0.3"), "[]"),
+        valid.replace(
+            &record("29.0.3"),
+            &format!(
+                "[{},{}]",
+                &record("29.0.3")[1..record("29.0.3").len() - 1],
+                &record("29.0.3")[1..record("29.0.3").len() - 1]
+            ),
+        ),
+        valid.replace(r#""installed":true"#, r#""installed":false"#),
+        valid.replace(r#""active":true"#, r#""active":false"#),
+    ] {
+        assert!(
+            !normalize_mise_ls(&invalid).status.success(),
+            "accepted {invalid}"
+        );
+    }
+    let extra = valid.replacen(
+        '{',
+        r#"{"unexpected":[{"version":"1","installed":true,"active":true}],"#,
+        1,
+    );
+    assert!(!normalize_mise_ls(&extra).status.success());
+}
+
+#[test]
+fn dockerfile_uses_supported_mise_ls_schema_and_exact_filter() {
+    let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
+    assert!(dockerfile.contains("mise ls --current --installed --json"));
+    assert!(!dockerfile.contains("mise current --json"));
+    assert!(dockerfile.contains(MISE_LS_FILTER));
 }
 
 #[test]

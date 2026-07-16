@@ -206,7 +206,7 @@ for line in open(sys.argv[1]):
 if p.get("IMAGE_DIGEST")!="ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab" or p.get("PLATFORM")!="linux/arm64" or p.get("INVOCATION")!="docker-run-read-only-attestation-v1" or not re.fullmatch(r"[0-9a-f]{40}",p.get("WORKFLOW_COMMIT","")) or not re.fullmatch(r"sha256:[0-9a-f]{64}",p.get("IMAGE_ID","")) or not re.fullmatch(r"[0-9a-f]{64}",p.get("UBUNTU_BUNDLE_SHA256","")): raise SystemExit("mise runtime bundle: invalid producer-independent base attestation")
 PY
 awk -v target="$attestation" '$5 == target && $6 ~ /(^|,)ro(,|$)/ {found=1} END {exit !found}' /proc/self/mountinfo || die "base attestation must be a separate read-only mount"
-for command in curl find python3 sha256sum tar zstd; do command -v "$command" >/dev/null || die "exact pinned base lacks required producer command: $command"; done
+for command in curl find jq python3 sha256sum tar zstd; do command -v "$command" >/dev/null || die "exact pinned base lacks required producer command: $command"; done
 tar --help 2>&1 | grep -q -- --sort || die "GNU tar with deterministic sorting is required"
 output=$1
 mkdir -p "$output"
@@ -243,7 +243,9 @@ for tool in "${tools[@]}"; do
   "$mise" install --yes "$tool" 2>"$work/logs/$tool.log" || die "mise failed to install $tool"
 done
 "$mise" lock --platform linux-arm64 >/dev/null || die "mise failed to finalize upstream lock provenance"
-"$mise" current --json >"$output/mise-current.json"
+"$mise" ls --current --installed --json \
+  | jq --exit-status --compact-output --sort-keys 'if ((keys|sort) != ["elixir","erlang","go","java","node","python","ruby","rust"]) then error("unexpected mise tool set") else to_entries | map(if ((.value|type)!="array") or ((.value|length)!=1) or (.value[0].installed != true) or (.value[0].active != true) or ((.value[0].version|type)!="string") or (.value[0].version=="") then error("invalid mise ls record") else {key:.key,value:.value[0].version} end) | from_entries end' \
+  >"$output/mise-current.json" || die "mise ls normalization failed"
 
 python3 - "$work/config.lock" "$lock" "$work/logs" /opt/gascan/mise/downloads "$output" <<'PY'
 import hashlib,re,shutil,sys,tomllib,urllib.parse

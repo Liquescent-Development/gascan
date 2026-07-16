@@ -41,7 +41,7 @@ fn dockerfile_installs_only_reviewed_system_tools_and_verified_artifacts() {
         "images/workspace/etc/mise/config.toml",
         "images/workspace/etc/profile.d/mise.sh",
         "mise install --yes",
-        "mise current --json",
+        "mise ls --current --installed --json",
         "/opt/gascan/image-tool-versions.json",
         ".artifacts/playwright-chromium-reviewed/chrome-linux",
         "/opt/gascan/tests/playwright-smoke.mjs",

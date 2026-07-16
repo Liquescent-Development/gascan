@@ -86,3 +86,21 @@ Docker and image smoke use strict equality with the correct Erlang list value.
 The deferred producer already formats that list as text and requires exact
 output `29`, so all three validators now share the same OTP-major semantics.
 No live gate was run while implementing this correction.
+
+## mise Listing Schema Follow-up
+
+### RED
+
+The next live retry showed pinned mise `2026.5.0` does not support
+`mise current --json`. Focused contracts failed while the Docker and deferred
+producer still used that obsolete interface.
+
+### GREEN
+
+Both paths now invoke `mise ls --current --installed --json`. Their identical
+normalizer requires the exact eight audited keys, exactly one record per key,
+`installed` and `active` both true, and a nonempty string version before
+constructing the sorted exact-version map. Behavioral fixtures reject missing,
+extra, zero-record, multiple-record, inactive, and uninstalled inputs. The
+connected plan now documents the supported command and schema. No live gate was
+run while implementing this correction.

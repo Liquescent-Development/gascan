@@ -3,7 +3,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const CURRENT: &str = r#"{"elixir":{"version":"1.20.2-otp-29"},"erlang":{"version":"29.0.3"},"go":{"version":"1.26.5"},"java":{"version":"25.0.2"},"node":{"version":"24.18.0"},"python":{"version":"3.14.6"},"ruby":{"version":"3.4.10"},"rust":{"version":"1.97.0"}}"#;
+const CURRENT: &str = r#"{"elixir":"1.20.2-otp-29","erlang":"29.0.3","go":"1.26.5","java":"25.0.2","node":"24.18.0","python":"3.14.6","ruby":"3.4.10","rust":"1.97.0"}"#;
 
 fn producer() -> String {
     fs::read_to_string(
@@ -35,6 +35,17 @@ fn native_verifier_executes_erlang_and_requires_exact_otp_major() {
     let producer = producer();
     assert!(producer.contains(r#""erlang":["-noshell","-eval""#));
     assert!(producer.contains(r#""erlang":output=="29""#));
+}
+
+#[test]
+fn producer_uses_supported_mise_ls_and_strict_normalization() {
+    let producer = producer();
+    assert!(producer.contains("ls --current --installed --json"));
+    assert!(!producer.contains("current --json"));
+    assert!(producer.contains("invalid mise ls record"));
+    assert!(producer.contains(".value|length)!=1"));
+    assert!(producer.contains(".value[0].installed != true"));
+    assert!(producer.contains(".value[0].active != true"));
 }
 
 struct Fixture {
@@ -305,7 +316,7 @@ fn rejects_tiny_executable_stub() {
 #[test]
 fn rejects_missing_tool() {
     let f = Fixture::new();
-    f.replace("mise-current.json", r#","rust":{"version":"1.97.0"}"#, "");
+    f.replace("mise-current.json", r#","rust":"1.97.0""#, "");
     f.reject("exact seven runtimes and Erlang dependency");
 }
 #[test]
@@ -313,8 +324,8 @@ fn rejects_extra_tool() {
     let f = Fixture::new();
     f.replace(
         "mise-current.json",
-        r#""rust":{"version":"1.97.0"}}"#,
-        r#""rust":{"version":"1.97.0"},"zig":{"version":"1.0"}}"#,
+        r#""rust":"1.97.0"}"#,
+        r#""rust":"1.97.0","zig":"1.0"}"#,
     );
     f.reject("exact seven runtimes and Erlang dependency");
 }
