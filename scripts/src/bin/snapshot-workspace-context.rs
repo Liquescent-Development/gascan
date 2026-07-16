@@ -987,7 +987,12 @@ mod tests {
         assert_eq!(alias.file_name().unwrap(), "connected-workspace-context");
         assert_eq!(alias.parent().unwrap().file_name().unwrap(), ".artifacts");
         assert_ne!(alias.canonicalize().unwrap(), alias);
-        assert!(fs::symlink_metadata(&alias).unwrap().file_type().is_symlink());
+        assert!(
+            fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(
             validate_caller_source(&alias, uid).unwrap_err().to_string(),
             "source path must be canonical and must not be a symlink"

@@ -34,7 +34,8 @@ non-`.artifacts` parent, a symlink alias, a mismatched caller UID, and a regular
 Verification:
 
 - `rtk cargo test --manifest-path scripts/Cargo.toml --bin snapshot-workspace-context` — 12 passed.
-- `rtk rustfmt --edition 2024 --check scripts/src/bin/snapshot-workspace-context.rs` — passed.
+- `rtk rustfmt --edition 2024 --check scripts/src/bin/snapshot-workspace-context.rs` —
+  passed after the final mechanical formatting correction.
 - `rtk cargo test --manifest-path scripts/Cargo.toml` — helper and relevant contracts
   passed, but the pre-existing `connected_image_build` interruption assertion failed:
   `interrupted old-reference/new-JSON pair was accepted`.
@@ -57,3 +58,12 @@ expects the canonical/symlink-specific rejection. The test failed against the fi
 implementation because it returned the combined allowlist error. GREEN separates that
 diagnostic without weakening any check; the valid-name alias is now rejected explicitly
 because its canonical path differs.
+
+## Final formatting verification
+
+Rustfmt expanded the symlink metadata assertion mechanically; no behavior changed.
+Fresh evidence after that edit:
+
+- `rtk rustfmt --edition 2024 --check scripts/src/bin/snapshot-workspace-context.rs` — passed.
+- `rtk cargo test --manifest-path scripts/Cargo.toml --bin snapshot-workspace-context` — 12 passed.
+- `rtk git diff --check` — passed.
