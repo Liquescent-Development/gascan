@@ -35,6 +35,17 @@ fn assert_sole_reviewed_package_install(dockerfile: &str) -> Result<(), &'static
     Ok(())
 }
 
+fn assert_correct_otp_release_term_check(script: &str) -> Result<(), &'static str> {
+    let exact = r#"erlang:system_info(otp_release) =:= "29""#;
+    if !script.contains(exact) {
+        return Err("OTP release must use strict equality with Erlang's string/list result");
+    }
+    if script.contains(r#"otp_release) =:= <<"29">>"#) {
+        return Err("OTP release list must not be compared with an Erlang binary");
+    }
+    Ok(())
+}
+
 #[test]
 fn dockerfile_assembles_the_connected_workspace_base() {
     let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
@@ -81,8 +92,18 @@ fn dockerfile_installs_pinned_erlang_before_elixir_and_validates_otp_29() {
     assert!(erlang < otp && otp < elixir && elixir < remaining);
     assert!(!dockerfile.contains("&& erl -noshell"));
     assert!(dockerfile.contains("otp_release"));
-    assert!(dockerfile.contains("=:= <<\"29\">>"));
+    assert_correct_otp_release_term_check(&dockerfile).unwrap();
     assert!(dockerfile.contains(r#"test "$(mise current elixir)" = "1.20.2-otp-29""#));
+}
+
+#[test]
+fn otp_release_contract_rejects_binary_type_and_wrong_major() {
+    let valid = r#"true = (erlang:system_info(otp_release) =:= "29"), halt()."#;
+    assert!(assert_correct_otp_release_term_check(valid).is_ok());
+    assert!(
+        assert_correct_otp_release_term_check(&valid.replace(r#""29""#, r#"<<"29">>"#)).is_err()
+    );
+    assert!(assert_correct_otp_release_term_check(&valid.replace("29", "28")).is_err());
 }
 
 #[test]

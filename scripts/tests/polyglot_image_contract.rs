@@ -113,6 +113,8 @@ fn smoke_covers_every_runtime_native_tools_and_browser() {
             "missing smoke coverage: {required}"
         );
     }
+    assert!(smoke.contains(r#"erlang:system_info(otp_release) =:= "29""#));
+    assert!(!smoke.contains(r#"otp_release) =:= <<"29">>"#));
 }
 
 #[test]

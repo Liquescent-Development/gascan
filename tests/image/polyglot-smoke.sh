@@ -19,7 +19,7 @@ javac /tmp/Main.java
 java -cp /tmp Main
 ruby -e 'puts "ruby-ok"'
 elixir -e 'IO.puts("elixir-ok")'
-erl -noshell -eval 'true = (erlang:system_info(otp_release) =:= <<"29">>), halt().'
+erl -noshell -eval 'true = (erlang:system_info(otp_release) =:= "29"), halt().'
 
 resolved=/tmp/gascan-resolved-tool-versions.json
 trap 'rm -f "$resolved"' EXIT

@@ -69,3 +69,20 @@ exact Elixir `1.20.2-otp-29` through that same environment, validates both mise
 versions, and installs only the six remaining runtimes afterward. The deferred
 producer mirrors the explicit Erlang-bound Elixir installation and retains
 separate sanitized logs. No live gate was run while implementing this fix.
+
+## OTP Term-Type Follow-up
+
+### RED
+
+The next live retry reached OTP verification but failed because
+`erlang:system_info(otp_release)` returns the Erlang string/list `"29"`, while
+the Docker and smoke checks used strict equality against binary `<<"29">>`.
+Behavioral contracts now accept only the list comparison and reject both the
+binary term and an incorrect major.
+
+### GREEN
+
+Docker and image smoke use strict equality with the correct Erlang list value.
+The deferred producer already formats that list as text and requires exact
+output `29`, so all three validators now share the same OTP-major semantics.
+No live gate was run while implementing this correction.
