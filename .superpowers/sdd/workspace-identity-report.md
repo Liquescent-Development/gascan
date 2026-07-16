@@ -58,3 +58,12 @@ approval-marker mutation was performed by this task.
   contract also includes both migration files.
 - No live build, helper operation, evidence publication, or approval mutation
   was performed for this correction.
+
+### Cross-contract review correction
+
+The contract test now copies and parses the actual repository Dockerfile. It
+classifies the three generated artifact sources explicitly, derives repository
+sources and `--chmod` modes from each non-stage `COPY`, and compares sealed
+bytes and modes. Connected assembly independently parses the sealed Dockerfile
+and rejects unsafe syntax or any source absent from the staged context. A
+hypothetical unsealed local `COPY` proves this fails before publication.
