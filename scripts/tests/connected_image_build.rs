@@ -382,14 +382,15 @@ esac
 "#,
                 "9".repeat(64),
                 "8".repeat(64),
-                "9".repeat(64),
-                "7".repeat(64)
+                "7".repeat(64),
+                "9".repeat(64)
             ),
         );
         executable(&bin.join("sw_vers"), "#!/bin/sh\nprintf '14.0\n'\n");
         executable(
             &bin.join("mv"),
             r#"#!/bin/bash
+{ printf 'mv'; printf '\t%s' "$@"; printf '\n'; } >>"$CALLS"
 destination=${@: -1}; case "$FAULT:$destination" in fail_json:*/workspace-image-build.json) exit 81;; fail_ref:*/workspace-image-ref) exit 82;; esac; exec /bin/mv "$@"
 "#,
         );
@@ -443,6 +444,18 @@ destination=${@: -1}; case "$FAULT:$destination" in fail_json:*/workspace-image-
             "{fault} cleanup count differs: {log}"
         );
         if fault == "fail_ref" {
+            let retained_reference =
+                fs::read_to_string(repo.join(".artifacts/workspace-image-ref")).unwrap();
+            let retained_receipt =
+                fs::read_to_string(repo.join(".artifacts/workspace-image-build.json")).unwrap();
+            assert!(
+                log.lines().any(|line| {
+                    line.starts_with("mv\t-f\t") && line.ends_with("/workspace-image-ref")
+                }),
+                "fail_ref did not reach reference publication: {log}"
+            );
+            assert!(retained_reference.contains(&"a".repeat(64)));
+            assert!(retained_receipt.contains(&"9".repeat(64)));
             assert!(
                 !Command::new(validator)
                     .arg("validate-receipt")
