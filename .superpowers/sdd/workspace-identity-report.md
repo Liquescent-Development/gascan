@@ -33,3 +33,15 @@ and checked independently.
 
 No live image gate, privileged helper operation, evidence publication, or
 approval-marker mutation was performed by this task.
+
+## Review correction
+
+- RED: the behavioral fixture failed before the isolated migration core
+  existed.
+- GREEN: production uses a fixed-argument wrapper while tests invoke the core
+  with explicit fixture files and command paths. Exact success, command order,
+  post-state rejection, and twelve prevalidation failures are executed.
+- Home validation uses Linux `stat -c '%F:%u:%g'` and rejects missing paths,
+  links, non-directories, wrong ownership, and any existing or dangling-link
+  destination before either mutation command can run. The resulting home is
+  revalidated with the same exact type and numeric ownership contract.
