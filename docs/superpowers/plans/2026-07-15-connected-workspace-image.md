@@ -232,7 +232,9 @@ git commit -m "build: prepare locked connected image context"
 
 **Interfaces:**
 - Consumes: the Task 2 minimal connected context.
-- Produces: a `workspace-base` stage with exact system tools, mise, seven exact runtimes, Chromium inputs, sudo/tini, and no Gascamp credential handling.
+- Produces: a `workspace-base` stage with exact system tools, mise, seven exact
+  user-facing runtimes, the pinned Erlang/OTP implementation dependency required
+  by Elixir, Chromium inputs, sudo/tini, and no Gascamp credential handling.
 
 - [ ] **Step 1: Write the failing connected Dockerfile contract**
 

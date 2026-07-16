@@ -10,7 +10,11 @@ use serde::Deserialize;
 
 type DynError = Box<dyn Error + Send + Sync>;
 
-const TOOLS: [&str; 7] = ["elixir", "go", "java", "node", "python", "ruby", "rust"];
+// Erlang is Elixir's audited implementation dependency, not an eighth
+// user-facing runtime.
+const TOOLS: [&str; 8] = [
+    "elixir", "erlang", "go", "java", "node", "python", "ruby", "rust",
+];
 
 #[derive(Deserialize)]
 struct ToolFile {
@@ -57,7 +61,10 @@ fn require_exact_keys(tools: &BTreeMap<String, String>) -> Result<(), DynError> 
     let expected: BTreeSet<&str> = TOOLS.into_iter().collect();
     let actual: BTreeSet<&str> = tools.keys().map(String::as_str).collect();
     if actual != expected || tools.values().any(String::is_empty) {
-        return Err("tool map must contain exactly seven nonempty supported versions".into());
+        return Err(
+            "tool map must contain exactly seven supported runtimes and the Erlang dependency"
+                .into(),
+        );
     }
     Ok(())
 }

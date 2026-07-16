@@ -19,7 +19,10 @@ COPY --chmod=0444 .artifacts/expected-tool-versions.json /tmp/expected-tool-vers
 ENV MISE_DATA_DIR=/opt/gascan/mise
 ENV MISE_GLOBAL_CONFIG_FILE=/etc/mise/config.toml
 
-RUN mise install --yes \
+RUN mise install --yes erlang@29.0.3 \
+    && test "$(mise current erlang)" = "29.0.3" \
+    && erl -noshell -eval 'true = (erlang:system_info(otp_release) =:= <<"29">>), halt().' \
+    && mise install --yes \
     && mise current --json \
        | jq --compact-output --sort-keys 'with_entries(.value = .value.version)' \
        > /tmp/resolved-tool-versions.json \

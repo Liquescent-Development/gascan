@@ -26,14 +26,14 @@ def env(path):
   if key in out: fail("duplicate provenance field")
   out[key]=value
  return out
-expected={"elixir":"1.20.2-otp-29","go":"1.26.5","java":"25.0.2","node":"24.18.0","python":"3.14.6","ruby":"3.4.10","rust":"1.97.0"}
+expected={"elixir":"1.20.2-otp-29","erlang":"29.0.3","go":"1.26.5","java":"25.0.2","node":"24.18.0","python":"3.14.6","ruby":"3.4.10","rust":"1.97.0"}
 p=env(root/"provenance.env")
 required={"PLATFORM","MISE_VERSION","MISE_SHA256","CONFIG_SHA256","BASE_IMAGE","BASE_ATTESTATION_SHA256"}
 if set(p)!=required: fail("provenance fields differ from exact schema")
 if p["PLATFORM"]!="linux/arm64": fail("wrong platform")
 if p["MISE_VERSION"]!="2026.5.0": fail("wrong mise version")
 if p["MISE_SHA256"]!="fba7c8a383cf3c59eb5a9995d5299fd2c78eba7eb1daace48d75fe491362f79a": fail("wrong mise digest")
-if p["CONFIG_SHA256"]!="687b22340b2f0e48d07bc5521fbaa39749f2ac1554e1bebc6848f92296ac663b": fail("wrong config digest")
+if p["CONFIG_SHA256"]!="b72f66102d09e065b3778c0d6dd52c77a3ef404c2687d910c943d5682cb3063f": fail("wrong config digest")
 if p["BASE_IMAGE"]!="ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab": fail("wrong base image digest")
 attestation=read(root/"base-attestation.env")
 if hashlib.sha256(attestation.encode()).hexdigest()!=p["BASE_ATTESTATION_SHA256"]: fail("base attestation digest mismatch")
@@ -42,7 +42,7 @@ if base.get("IMAGE_DIGEST")!=p["BASE_IMAGE"] or base.get("PLATFORM")!="linux/arm
 if not re.fullmatch("[0-9a-f]{40}",base.get("WORKFLOW_COMMIT","")) or not re.fullmatch("sha256:[0-9a-f]{64}",base.get("IMAGE_ID","")) or not re.fullmatch("[0-9a-f]{64}",base.get("UBUNTU_BUNDLE_SHA256","")): fail("invalid base attestation receipt")
 try: current=json.loads(read(root/"mise-current.json"))
 except json.JSONDecodeError: fail("invalid mise current JSON")
-if set(current)!=set(expected): fail("mise current does not contain exact seven tools")
+if set(current)!=set(expected): fail("mise current does not contain the exact seven runtimes and Erlang dependency")
 for tool,version in expected.items():
  value=current[tool]
  actual=value.get("version") if isinstance(value,dict) else value
@@ -74,7 +74,7 @@ def lock_records(value,backend=""):
   for child in value.values(): yield from lock_records(child,backend)
 locked_rows=[]
 lock_tools=mise_lock.get("tools",{})
-if not isinstance(lock_tools,dict) or set(lock_tools)!=set(expected): fail("mise lock does not contain exact seven tools")
+if not isinstance(lock_tools,dict) or set(lock_tools)!=set(expected): fail("mise lock does not contain the exact seven runtimes and Erlang dependency")
 for tool,version in expected.items():
  entries=lock_tools[tool] if isinstance(lock_tools[tool],list) else [lock_tools[tool]]
  if not any(isinstance(entry,dict) and entry.get("version")==version for entry in entries): fail("mise lock has wrong tool version")
@@ -141,7 +141,7 @@ try:
    actual[name]=record
 except (tarfile.TarError,OSError): fail("invalid runtime archive")
 if actual!=declared: fail("archive tree differs from canonical manifest")
-entrypoints={"elixir":"bin/elixir","go":"bin/go","java":"bin/java","node":"bin/node","python":"bin/python","ruby":"bin/ruby","rust":"bin/rustc"}
+entrypoints={"elixir":"bin/elixir","erlang":"bin/erl","go":"bin/go","java":"bin/java","node":"bin/node","python":"bin/python","ruby":"bin/ruby","rust":"bin/rustc"}
 for tool,version in expected.items():
  path=f"opt/gascan/mise/installs/{tool}/{version}/{entrypoints[tool]}"
  rec=actual.get(path)
@@ -216,10 +216,10 @@ mkdir -p /opt/gascan/mise "$work/cache" "$work/logs"
 python3 - "$lock" "$config" <<'PY'
 import hashlib,sys,tomllib
 lock=tomllib.loads(open(sys.argv[1],"rb").read().decode()); config=tomllib.loads(open(sys.argv[2],"rb").read().decode())
-expected={"elixir":"1.20.2-otp-29","go":"1.26.5","java":"25.0.2","node":"24.18.0","python":"3.14.6","ruby":"3.4.10","rust":"1.97.0"}
+expected={"elixir":"1.20.2-otp-29","erlang":"29.0.3","go":"1.26.5","java":"25.0.2","node":"24.18.0","python":"3.14.6","ruby":"3.4.10","rust":"1.97.0"}
 assert lock["mise"]=={"version":"2026.5.0","url":"https://github.com/jdx/mise/releases/download/v2026.5.0/mise-v2026.5.0-linux-arm64","sha256":"fba7c8a383cf3c59eb5a9995d5299fd2c78eba7eb1daace48d75fe491362f79a"}
 assert lock["tools"]==expected and config["tools"]==expected
-assert hashlib.sha256(open(sys.argv[2],"rb").read()).hexdigest()=="687b22340b2f0e48d07bc5521fbaa39749f2ac1554e1bebc6848f92296ac663b"
+assert hashlib.sha256(open(sys.argv[2],"rb").read()).hexdigest()=="b72f66102d09e065b3778c0d6dd52c77a3ef404c2687d910c943d5682cb3063f"
 assert lock["base_image"]=="ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab"
 PY
 
@@ -304,7 +304,7 @@ cat >"$output/provenance.env" <<'EOF'
 PLATFORM=linux/arm64
 MISE_VERSION=2026.5.0
 MISE_SHA256=fba7c8a383cf3c59eb5a9995d5299fd2c78eba7eb1daace48d75fe491362f79a
-CONFIG_SHA256=687b22340b2f0e48d07bc5521fbaa39749f2ac1554e1bebc6848f92296ac663b
+CONFIG_SHA256=b72f66102d09e065b3778c0d6dd52c77a3ef404c2687d910c943d5682cb3063f
 BASE_IMAGE=ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab
 EOF
 printf 'BASE_ATTESTATION_SHA256=%s\n' "$(sha256sum "$attestation" | cut -d' ' -f1)" >>"$output/provenance.env"

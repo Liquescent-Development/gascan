@@ -68,6 +68,17 @@ fn dockerfile_assembles_the_connected_workspace_base() {
 }
 
 #[test]
+fn dockerfile_installs_pinned_erlang_before_elixir_and_validates_otp_29() {
+    let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
+    let erlang = dockerfile.find("mise install --yes erlang@29.0.3").unwrap();
+    let remaining = dockerfile.find("mise install --yes \\").unwrap();
+    assert!(erlang < remaining);
+    assert!(dockerfile.contains("erl -noshell -eval"));
+    assert!(dockerfile.contains("otp_release"));
+    assert!(dockerfile.contains("=:= <<\"29\">>"));
+}
+
+#[test]
 fn dockerfile_prints_safe_mise_version_metadata_only_when_the_lock_comparison_fails() {
     let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
     assert!(dockerfile.contains("if ! cmp --silent"));

@@ -3,7 +3,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const CURRENT: &str = r#"{"elixir":{"version":"1.20.2-otp-29"},"go":{"version":"1.26.5"},"java":{"version":"25.0.2"},"node":{"version":"24.18.0"},"python":{"version":"3.14.6"},"ruby":{"version":"3.4.10"},"rust":{"version":"1.97.0"}}"#;
+const CURRENT: &str = r#"{"elixir":{"version":"1.20.2-otp-29"},"erlang":{"version":"29.0.3"},"go":{"version":"1.26.5"},"java":{"version":"25.0.2"},"node":{"version":"24.18.0"},"python":{"version":"3.14.6"},"ruby":{"version":"3.4.10"},"rust":{"version":"1.97.0"}}"#;
 
 struct Fixture {
     temp: tempfile::TempDir,
@@ -15,6 +15,7 @@ impl Fixture {
         let root = temp.path();
         for (tool, version, executable) in [
             ("elixir", "1.20.2-otp-29", "elixir"),
+            ("erlang", "29.0.3", "erl"),
             ("go", "1.26.5", "go"),
             ("java", "25.0.2", "java"),
             ("node", "24.18.0", "node"),
@@ -34,10 +35,11 @@ impl Fixture {
             fs::set_permissions(binary, fs::Permissions::from_mode(0o755)).unwrap();
         }
         fs::write(root.join("mise-current.json"), CURRENT).unwrap();
-        fs::write(root.join("provenance.env"), "PLATFORM=linux/arm64\nMISE_VERSION=2026.5.0\nMISE_SHA256=fba7c8a383cf3c59eb5a9995d5299fd2c78eba7eb1daace48d75fe491362f79a\nCONFIG_SHA256=687b22340b2f0e48d07bc5521fbaa39749f2ac1554e1bebc6848f92296ac663b\nBASE_IMAGE=ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab\n").unwrap();
+        fs::write(root.join("provenance.env"), "PLATFORM=linux/arm64\nMISE_VERSION=2026.5.0\nMISE_SHA256=fba7c8a383cf3c59eb5a9995d5299fd2c78eba7eb1daace48d75fe491362f79a\nCONFIG_SHA256=b72f66102d09e065b3778c0d6dd52c77a3ef404c2687d910c943d5682cb3063f\nBASE_IMAGE=ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab\n").unwrap();
         fs::create_dir_all(root.join("downloads")).unwrap();
         let downloads = [
             ("elixir", "1.20.2-otp-29"),
+            ("erlang", "29.0.3"),
             ("go", "1.26.5"),
             ("java", "25.0.2"),
             ("node", "24.18.0"),
@@ -62,6 +64,7 @@ impl Fixture {
         let mut lock = String::from("[tools]\n");
         for (tool, version) in [
             ("elixir", "1.20.2-otp-29"),
+            ("erlang", "29.0.3"),
             ("go", "1.26.5"),
             ("java", "25.0.2"),
             ("node", "24.18.0"),
@@ -77,6 +80,7 @@ impl Fixture {
         fs::create_dir_all(root.join("mise-install-logs")).unwrap();
         for (tool, version) in [
             ("elixir", "1.20.2-otp-29"),
+            ("erlang", "29.0.3"),
             ("go", "1.26.5"),
             ("java", "25.0.2"),
             ("node", "24.18.0"),
@@ -185,7 +189,7 @@ fn rejects_wrong_config_digest() {
     let f = Fixture::new();
     f.replace(
         "provenance.env",
-        "687b22340b2f0e48d07bc5521fbaa39749f2ac1554e1bebc6848f92296ac663b",
+        "b72f66102d09e065b3778c0d6dd52c77a3ef404c2687d910c943d5682cb3063f",
         &"0".repeat(64),
     );
     f.reject("config digest");
@@ -270,7 +274,7 @@ fn rejects_tiny_executable_stub() {
 fn rejects_missing_tool() {
     let f = Fixture::new();
     f.replace("mise-current.json", r#","rust":{"version":"1.97.0"}"#, "");
-    f.reject("exact seven");
+    f.reject("exact seven runtimes and Erlang dependency");
 }
 #[test]
 fn rejects_extra_tool() {
@@ -280,7 +284,7 @@ fn rejects_extra_tool() {
         r#""rust":{"version":"1.97.0"}}"#,
         r#""rust":{"version":"1.97.0"},"zig":{"version":"1.0"}}"#,
     );
-    f.reject("exact seven");
+    f.reject("exact seven runtimes and Erlang dependency");
 }
 #[test]
 fn rejects_wrong_tool_version() {
