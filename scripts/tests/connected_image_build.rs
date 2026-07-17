@@ -11,7 +11,7 @@ fn executable(path: &Path, body: &str) {
 }
 
 #[test]
-fn connected_build_uses_the_sealed_public_snapshot_without_authentication_material() {
+fn connected_build_uses_the_verified_caller_owned_context_without_privileged_helper() {
     let script =
         fs::read_to_string(root().join("scripts/build-connected-workspace-image.sh")).unwrap();
     for forbidden in [
@@ -25,10 +25,19 @@ fn connected_build_uses_the_sealed_public_snapshot_without_authentication_materi
             "retained forbidden authentication path: {forbidden}"
         );
     }
-    assert!(script.contains("create \"$context\" \"$context_manifest\""));
-    assert!(script.contains("path \"$snapshot_receipt\""));
-    assert!(script.contains("finish \"$snapshot_receipt\""));
-    assert!(script.contains("--file \"$snapshot/Dockerfile\" \"$snapshot\""));
+    for forbidden in [
+        "snapshot-helper-identity",
+        "snapshot_receipt",
+        "sudo -n",
+        "snapshot_helper",
+    ] {
+        assert!(
+            !script.contains(forbidden),
+            "retained privileged snapshot dependency: {forbidden}"
+        );
+    }
+    assert!(script.contains("prepare-workspace-context --verify-connected"));
+    assert!(script.contains("--file \"$context/Dockerfile\" \"$context\""));
     let build = script
         .split("container build")
         .nth(1)
@@ -51,11 +60,14 @@ fn connected_evidence_build_bypasses_stale_apple_builder_cache() {
         .next()
         .unwrap();
 
-    assert!(build.contains("--no-cache"), "connected build may reuse stale layers");
+    assert!(
+        build.contains("--no-cache"),
+        "connected build may reuse stale layers"
+    );
 }
 
 #[test]
-fn fake_runner_builds_the_exact_public_snapshot_and_publishes_reference_last() {
+fn fake_runner_builds_the_exact_verified_context_and_publishes_reference_last() {
     let temp = tempfile::tempdir_in("/tmp").unwrap();
     let repo = temp.path().join("repo");
     let bin = temp.path().join("bin");
@@ -80,7 +92,6 @@ fn fake_runner_builds_the_exact_public_snapshot_and_publishes_reference_last() {
             r#"#!/bin/bash
 printf 'cargo\t%s\n' "$*" >>"$CALLS"
 case "$*" in
- *snapshot-helper-identity*) printf 'hash\t1\t2\n' ;;
  *sanitize-build-output*) "$SANITIZER" "${{@: -2:1}}" "${{@: -1}}" ;;
  *prepare-workspace-context*) printf '{manifest}\n' ;;
  *validate-image-inspect*) printf 'sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab\n' ;;
@@ -90,13 +101,6 @@ case "$*" in
 esac
 "#
         ),
-    );
-    executable(
-        &bin.join("sudo"),
-        r#"#!/bin/bash
-printf 'sudo\t%s\n' "$*" >>"$CALLS"
-case " $* " in *' create '*) printf 'receipt\n';; *' path '*) printf '%s\n' "$SNAPSHOT";; *' finish '*) compgen -G "$ARTIFACTS/.connected-build-diagnostic.*" >/dev/null && exit 75; exit 0;; *) exit 91;; esac
-"#,
     );
     executable(
         &bin.join("container"),
@@ -119,7 +123,6 @@ esac
             format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
         )
         .env("CALLS", &calls)
-        .env("SNAPSHOT", &context)
         .env("ARTIFACTS", repo.join(".artifacts"))
         .env("VALIDATOR", env!("CARGO_BIN_EXE_validate-connected-build"))
         .env("SANITIZER", env!("CARGO_BIN_EXE_sanitize-build-output"))
@@ -139,9 +142,7 @@ esac
     );
     assert!(log.contains(&required), "{log}");
     assert!(!log.contains("--secret"));
-    assert_eq!(log.matches(" create ").count(), 1);
-    assert_eq!(log.matches(" path ").count(), 1);
-    assert_eq!(log.matches(" finish ").count(), 1);
+    assert!(!log.contains("sudo\t"));
     let reference = fs::read_to_string(repo.join(".artifacts/workspace-image-ref")).unwrap();
     assert_eq!(
         reference,
@@ -222,15 +223,24 @@ fn validator_rejects_malformed_mutable_wrong_platform_and_wrong_tag() {
     assert!(!run(&valid, "gascan-workspace:latest").success());
     assert!(!run(&valid.replace("arm64", "amd64"), "gascan-workspace:locked").success());
     assert!(!run(&valid, "gascan-workspace:other").success());
-    assert!(!run(&valid.replace(&format!(r#""id":"{digest}""#), &format!(r#""id":"sha256:{digest}""#)), "gascan-workspace:locked").success());
-    assert!(!run(&valid.replace(&format!("sha256:{}", "b".repeat(64)), "sha256:invalid"), "gascan-workspace:locked").success());
-    assert!(
-        !run(
-            &valid.replace("gascan-workspace:locked", "gascan-workspace:"),
-            "gascan-workspace:"
-        )
-        .success()
-    );
+    assert!(!run(
+        &valid.replace(
+            &format!(r#""id":"{digest}""#),
+            &format!(r#""id":"sha256:{digest}""#)
+        ),
+        "gascan-workspace:locked"
+    )
+    .success());
+    assert!(!run(
+        &valid.replace(&format!("sha256:{}", "b".repeat(64)), "sha256:invalid"),
+        "gascan-workspace:locked"
+    )
+    .success());
+    assert!(!run(
+        &valid.replace("gascan-workspace:locked", "gascan-workspace:"),
+        "gascan-workspace:"
+    )
+    .success());
 }
 
 #[test]
@@ -323,13 +333,9 @@ fn every_image_consumer_rejects_each_receipt_identity_mismatch_before_container_
 }
 
 #[test]
-fn fake_runner_failure_matrix_cleans_snapshot_and_never_commits_an_invalid_pair() {
+fn fake_runner_failure_matrix_detects_context_mutation_and_never_commits_an_invalid_pair() {
     for fault in [
-        "create_fail",
-        "path_fail",
-        "public_before",
         "base_invalid",
-        "public_after",
         "context_after",
         "build_fail",
         "build_fail_output",
@@ -347,11 +353,9 @@ fn fake_runner_failure_matrix_cleans_snapshot_and_never_commits_an_invalid_pair(
         let repo = temp.path().join("repo");
         let bin = temp.path().join("bin");
         let context = repo.join(".artifacts/connected-workspace-context");
-        let snapshot = temp.path().join("sealed-public-snapshot");
         fs::create_dir_all(repo.join("scripts")).unwrap();
         fs::create_dir_all(repo.join("images/workspace")).unwrap();
         fs::create_dir_all(&context).unwrap();
-        fs::create_dir_all(&snapshot).unwrap();
         fs::create_dir(&bin).unwrap();
         fs::copy(
             root().join("scripts/build-connected-workspace-image.sh"),
@@ -360,10 +364,8 @@ fn fake_runner_failure_matrix_cleans_snapshot_and_never_commits_an_invalid_pair(
         .unwrap();
         let base = "ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab";
         fs::write(repo.join("images/workspace/versions.lock"), format!("workspace_build_mode = \"connected\"\nbase_image = \"{base}\"\nworkspace_tag = \"gascan-workspace:fixture\"\n[gascamp]\nrevision = \"f6b248c5926240856dbea83d1d2c5c90ea1c1456\"\n")).unwrap();
-        for directory in [&context, &snapshot] {
-            fs::write(directory.join("Dockerfile"), "FROM scratch\n").unwrap();
-            fs::write(directory.join("context-manifest.tsv"), "fixture\n").unwrap();
-        }
+        fs::write(context.join("Dockerfile"), "FROM scratch\n").unwrap();
+        fs::write(context.join("context-manifest.tsv"), "fixture\n").unwrap();
         let manifest = format!("{:x}", Sha256::digest(b"fixture\n"));
         executable(
             &bin.join("cargo"),
@@ -371,7 +373,6 @@ fn fake_runner_failure_matrix_cleans_snapshot_and_never_commits_an_invalid_pair(
                 r#"#!/bin/bash
 printf 'cargo\t%s\n' "$*" >>"$CALLS"
 case "$*" in
- *snapshot-helper-identity*) printf 'hash\t1\t2\n' ;;
  *sanitize-build-output*) test "$FAULT" != scanner_fail || exit 70; "$SANITIZER" "${{@: -2:1}}" "${{@: -1}}" ;;
  *prepare-workspace-context*) test "$FAULT" != context_after || count=$(($(cat "$COUNT" 2>/dev/null || printf 0)+1)); test "$FAULT" != context_after || printf '%s' "$count" >"$COUNT"; test "$FAULT:$count" != context_after:2 || {{ printf '%064d\n' 7; exit; }}; printf '{manifest}\n' ;;
  *validate-image-inspect*) test "$FAULT" != base_invalid || exit 85; printf 'sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab\n' ;;
@@ -381,13 +382,6 @@ case "$*" in
 esac
 "#
             ),
-        );
-        executable(
-            &bin.join("sudo"),
-            r#"#!/bin/bash
-printf 'sudo\t%s\n' "$*" >>"$CALLS"
-case " $* " in *' create '*) test "$FAULT" != create_fail || exit 83; printf 'receipt\n';; *' path '*) test "$FAULT" != path_fail || exit 84; test "$FAULT" != public_before || printf changed >>"$SNAPSHOT/context-manifest.tsv"; printf '%s\n' "$SNAPSHOT";; *' finish '*) compgen -G "$ARTIFACTS/.connected-build-diagnostic.*" >/dev/null && exit 75; exit 0;; *) exit 91;; esac
-"#,
         );
         executable(
             &bin.join("container"),
@@ -408,7 +402,7 @@ case "$*" in
      build_fail_large) i=0; while test "$i" -lt 20000; do printf 'bounded-safe-diagnostic-%05d\n' "$i" >&2; i=$((i+1)); done; printf 'terminal container failure: layer command exited 83\n' >&2; exit 83;;
      build_signal) kill -TERM "$PPID"; sleep 1; exit 84;;
    esac
-   test "$FAULT" != public_after || printf changed >>"$SNAPSHOT/context-manifest.tsv";;
+   ;;
  *) exit 92;;
 esac
 "#,
@@ -442,17 +436,15 @@ destination=${@: -1}; case "$FAULT:$destination" in fail_json:*/workspace-image-
             )
             .unwrap();
             fs::write(repo.join(".artifacts/workspace-image-build.json"), format!(r#"{{"reference":"{old_reference}","tag":"gascan-workspace:fixture","platform":"linux/arm64","lock_digest":"{lock_digest}","context_digest":"{manifest}","image_digest":"{old_image}","status":"succeeded"}}"#)).unwrap();
-            assert!(
-                Command::new(validator)
-                    .arg("validate-receipt")
-                    .arg(repo.join(".artifacts/workspace-image-ref"))
-                    .arg(repo.join(".artifacts/workspace-image-build.json"))
-                    .arg(&lock_digest)
-                    .arg(&manifest)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
+            assert!(Command::new(validator)
+                .arg("validate-receipt")
+                .arg(repo.join(".artifacts/workspace-image-ref"))
+                .arg(repo.join(".artifacts/workspace-image-build.json"))
+                .arg(&lock_digest)
+                .arg(&manifest)
+                .status()
+                .unwrap()
+                .success());
         }
         let output = Command::new("bash")
             .arg(repo.join("scripts/build-connected-workspace-image.sh"))
@@ -463,7 +455,6 @@ destination=${@: -1}; case "$FAULT:$destination" in fail_json:*/workspace-image-
             .env("CALLS", &calls)
             .env("COUNT", &count)
             .env("FAULT", fault)
-            .env("SNAPSHOT", &snapshot)
             .env("ARTIFACTS", repo.join(".artifacts"))
             .env("VALIDATOR", validator)
             .env("SANITIZER", env!("CARGO_BIN_EXE_sanitize-build-output"))
@@ -499,11 +490,9 @@ destination=${@: -1}; case "$FAULT:$destination" in fail_json:*/workspace-image-
             _ => {}
         }
         let log = fs::read_to_string(&calls).unwrap();
-        let expected_finish = usize::from(fault != "create_fail");
-        assert_eq!(
-            log.matches(" finish ").count(),
-            expected_finish,
-            "{fault} cleanup count differs: {log}"
+        assert!(
+            !log.contains("sudo\t"),
+            "{fault} invoked privileged helper: {log}"
         );
         if fault == "fail_ref" {
             let retained_reference =

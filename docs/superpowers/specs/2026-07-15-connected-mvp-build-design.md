@@ -68,16 +68,22 @@ Cargo commands, and source or Git metadata in the final stage.
 The reviewed Apple BuildKit secret probe remains useful capability evidence,
 but it is not required by the public Gascamp MVP build or Roadmap Gates 4–5.
 
-### Connected build snapshot
+### Connected build context
 
-The connected orchestrator uses the unchanged privileged snapshot helper's
-existing `create`, `path`, and `finish` interface to obtain a sealed public
-Task 2 context. It verifies the canonical context manifest before and after
-the build and passes that sealed snapshot directly to Apple BuildKit. No
+The connected orchestrator verifies the caller-owned Task 2 context's
+canonical manifest immediately before and after the build, then passes that
+verified context directly to Apple BuildKit. Apple Containerization omits the
+root-owned payload of the privileged snapshot from the transmitted build
+context, despite that payload being present and manifest-valid on the host;
+the direct verified context is therefore the MVP-compatible boundary. No
 unprivileged secret wrapper or credential staging is needed.
 
-Cleanup calls the snapshot helper's existing `finish` operation on success,
-failure, `INT`, and `TERM`. The helper handles public build inputs only.
+This accepts a trusted-local-caller assumption for the interval between the
+two manifest verifications: a malicious local caller could alter and restore
+an input during the build. The before/after verification detects persistent
+mutation, while a sealed root-owned build context remains deferred hardening
+until Apple BuildKit supports transferring that context correctly. The existing
+snapshot helper and offline path remain unchanged.
 
 The JSON receipt is published before the reference file. The reference is the
 transaction commit marker: consumers reject a missing reference or JSON whose

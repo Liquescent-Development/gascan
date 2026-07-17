@@ -410,7 +410,7 @@ git commit -m "build: fetch pinned public Gascamp anonymously"
 - Modify: `scripts/tests/image_lock.rs`
 
 **Interfaces:**
-- Consumes: Task 2 context and canonical context digest, the sealed public snapshot returned by the unchanged reviewed helper, and exact local base inspection.
+- Consumes: caller-owned Task 2 context and canonical context digest, plus exact local base inspection.
 - Produces: atomic `.artifacts/workspace-image-ref` matching exactly `^gascan-workspace:[a-z0-9._-]+@sha256:[0-9a-f]{64}$` and `.artifacts/workspace-image-build.json` containing platform, lock digest, context digest, image digest, Apple version, and sanitized timestamps/status.
 
 - [ ] **Step 1: Write failing fake-runner tests**
@@ -418,8 +418,8 @@ git commit -m "build: fetch pinned public Gascamp anonymously"
 Cover these cases with a fake `container` executable:
 
 - any credential variable, credential file, secret mount, authentication header, or wrapper path fails before `container build`;
-- the privileged helper is invoked only through `create`, `path`, and `finish` for the sealed public context;
-- the sealed public snapshot manifest must equal the Task 2 context digest before and after build;
+- the connected build invokes no privileged helper or `sudo` snapshot operation;
+- the caller-owned Task 2 context must verify to the same canonical digest before and after build;
 - context verification failure or changed post-build digest fails without publishing a reference;
 - build invocation has no `--secret`, exact `BASE_IMAGE`, exact `GASCAMP_REVISION`, and `--arch arm64`;
 - structured inspect must report `linux/arm64` and the exact built tag;
@@ -449,16 +449,18 @@ Expected: FAIL because the connected orchestrator and validator do not exist.
 
 Make `scripts/build-workspace-image.sh` a mode dispatcher driven by the exact lock value. For `connected`, exec `build-connected-workspace-image.sh`; retain the old implementation under `scripts/build-offline-workspace-image.sh` for deferred use, but do not allow `auto` fallback between modes.
 
-The connected script must use the already-reviewed privileged snapshot helper
-only to create, locate, and finish a sealed public snapshot. It must create a
-sealed public context, pass that snapshot directly to BuildKit, and reverify
-the public manifest after build. The helper and sudoers contract remain
-unchanged. No credential input, secret mount, or wrapper context exists.
+The connected script must pass the caller-owned, manifest-verified Task 2
+context directly to BuildKit and reverify its canonical manifest after build.
+Apple BuildKit omits the root-owned payload of the privileged snapshot during
+context transfer, so the helper is not part of the connected MVP path. This
+uses a trusted-local-caller assumption: before/after verification detects
+persistent mutation but not an alteration restored during the build. Retain
+the helper, sudoers contract, and offline path unchanged as deferred hardening.
+No credential input, secret mount, or wrapper context exists.
 
 Publish the fully validated JSON receipt first and the reference file last.
 The reference is the commit marker; every consumer must reject receipt pairs
-whose tag, image digest, context digest, or lock digest disagree. The script
-must finish the privileged public snapshot through bounded traps. It must
+whose tag, image digest, context digest, or lock digest disagree. It must
 reject any authentication input or secret-bearing build option.
 
 - [ ] **Step 4: Run focused and full scripts suites**

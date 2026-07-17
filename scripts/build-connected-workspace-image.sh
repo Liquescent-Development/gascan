@@ -47,16 +47,12 @@ test "$gascamp_revision" = "$reviewed_revision" || die 'Gascamp revision differs
 tag=$(top_value workspace_tag)
 [[ "$tag" =~ ^gascan-workspace:[a-z0-9._-]+$ ]] || die 'workspace tag is not exact'
 
-snapshot_helper='/Library/PrivilegedHelperTools/dev.gascan.snapshot-workspace-context'
-snapshot_receipt=''
 build_diagnostic=''
 diagnostic_dir=''
-helper_sha256=''; helper_device=''; helper_inode=''
 cleanup() {
   status=${1:-$?}
   test -z "$build_diagnostic" || rm -f "$build_diagnostic" || status=1
   test -z "$diagnostic_dir" || rmdir "$diagnostic_dir" || status=1
-  test -z "$snapshot_receipt" || run_bounded "$operation_timeout" sudo -n "$snapshot_helper" --self "$helper_sha256" "$helper_device" "$helper_inode" finish "$snapshot_receipt" >/dev/null || status=1
   exit "$status"
 }
 trap cleanup EXIT
@@ -65,13 +61,6 @@ trap 'exit 143' TERM
 started_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 context_manifest=$(run_tool prepare-workspace-context --verify-connected "$root" "$lock" "$artifacts" "$context")
 [[ "$context_manifest" =~ ^[0-9a-f]{64}$ ]] || die 'context verifier returned an invalid digest'
-helper_identity=$(run_tool snapshot-helper-identity "$snapshot_helper") || die 'snapshot helper identity is unsafe'
-IFS=$'\t' read -r helper_sha256 helper_device helper_inode <<<"$helper_identity"
-snapshot_receipt=$(run_bounded "$operation_timeout" sudo -n "$snapshot_helper" --self "$helper_sha256" "$helper_device" "$helper_inode" create "$context" "$context_manifest") || die 'snapshot creation failed'
-snapshot=$(run_bounded "$operation_timeout" sudo -n "$snapshot_helper" --self "$helper_sha256" "$helper_device" "$helper_inode" path "$snapshot_receipt") || die 'snapshot validation failed'
-test -d "$snapshot" || die 'sealed public snapshot is unavailable'
-snapshot_manifest=$(shasum -a 256 "$snapshot/context-manifest.tsv" | cut -d' ' -f1)
-test "$snapshot_manifest" = "$context_manifest" || die 'sealed public manifest differs before build'
 
 base_inspect=$(container image inspect "$base_image")
 test "$(printf '%s' "$base_inspect" | run_tool validate-image-inspect)" = "${base_image#ubuntu@}" || die 'exact local base is unavailable'
@@ -84,7 +73,7 @@ set +e
 container build --no-cache --arch arm64 \
   --build-arg "BASE_IMAGE=$base_image" \
   --build-arg "GASCAMP_REVISION=$gascamp_revision" \
-  --tag "$tag" --file "$snapshot/Dockerfile" "$snapshot" 2>&1 \
+  --tag "$tag" --file "$context/Dockerfile" "$context" 2>&1 \
   | run_tool sanitize-build-output "$build_diagnostic" "$diagnostic_limit"
 pipeline_status=("${PIPESTATUS[@]}")
 build_status=${pipeline_status[0]}
@@ -105,7 +94,6 @@ build_diagnostic=''
 rmdir "$diagnostic_dir"
 diagnostic_dir=''
 
-test "$(shasum -a 256 "$snapshot/context-manifest.tsv" | cut -d' ' -f1)" = "$context_manifest" || die 'sealed public manifest changed during build'
 test "$(run_tool prepare-workspace-context --verify-connected "$root" "$lock" "$artifacts" "$context")" = "$context_manifest" || die 'workspace context changed during build'
 image_inspect=$(container image inspect "$tag")
 image_digest=$(printf '%s' "$image_inspect" | run_tool validate-connected-build "$tag") || die 'built image inspect is invalid'

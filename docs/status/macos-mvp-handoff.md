@@ -45,6 +45,13 @@ the polyglot toolchain.
   BuildKit secret.
 - The reviewed Apple BuildKit secret probe remains capability evidence but is
   not an MVP image-build or Gate 4 prerequisite.
+- Apple BuildKit does not transfer the root-owned privileged snapshot payload
+  into its build context, even when its host manifest is valid. The connected
+  MVP therefore builds directly from the caller-owned Task 2 context after
+  canonical manifest verification before and after the build. This accepts a
+  trusted-local-caller assumption for transient in-build mutation; a
+  transferable sealed context remains deferred hardening. The helper and
+  offline path are retained unchanged.
 
 ## Roadmap Status
 
@@ -144,29 +151,25 @@ Do not encode the operator DNS IP into Gas Can product policy.
 
 ## Current Unfinished Work
 
-Correction: Gascamp is public. Ignore the obsolete credential wording in item
-1 below; Tasks 4–6 must remove the token, secret-mount, helper, and wrapper
-paths, then run the live gate anonymously at the exact pinned revision.
+Correction: Gascamp is public. Tasks 4–6 must use anonymous public source at
+the exact pinned revision. The connected build uses the caller-owned verified
+context directly because Apple BuildKit omits the root-owned snapshot payload;
+the helper remains only deferred/offline hardening.
 
-1. Provide an authorized absolute `GASCAMP_READ_TOKEN_FILE` outside the
-   repository, owned by the current UID, regular and non-symlink, mode `0600`.
-   Then run Task 6's real connected image gate and independently inspect its
-   evidence, image history, and exported filesystem. The platform-neutral
-   harness is approved through `30dd514`; Task 6 itself remains incomplete.
-2. Convert the image path from mandatory offline bundles to connected locked
-   acquisition while preserving all reviewed image contracts.
-3. Select and prove the private Gascamp credential boundary.
-4. Build the real ARM64 workspace image and record its exact digest.
-5. Integrate the Apple backend and connected image work into
+1. Build the real ARM64 workspace image anonymously from the verified direct
+   context and record its exact digest. Independently inspect the evidence,
+   image history, and exported filesystem. The platform-neutral harness is
+   approved through `30dd514`; Task 6 itself remains incomplete.
+2. Integrate the Apple backend and connected image work into
    `feature/macos-mvp` with conflict review and full verification.
-6. Inventory Plan 4 Tasks 4–6 against their plan; do not infer their completion
+3. Inventory Plan 4 Tasks 4–6 against their plan; do not infer their completion
    from the Gascamp selector commit alone.
-7. Run the complete Gate 4 real lifecycle: `up`, `shell`, `run`, `apply`,
+4. Run the complete Gate 4 real lifecycle: `up`, `shell`, `run`, `apply`,
    `down`, restart, reconciliation, and `destroy`, including PTY, signals,
    exact exits, and residue checks.
-8. Complete Plan 4 security acceptance, packaging, installation, and clean-host
+5. Complete Plan 4 security acceptance, packaging, installation, and clean-host
    release work.
-9. Run and record Gate 5.
+6. Run and record Gate 5.
 
 ## Fresh-Session Restart Procedure
 
