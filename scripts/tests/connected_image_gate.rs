@@ -79,13 +79,6 @@ fn fixture() -> Fixture {
         &root.join("scripts/prefetch-connected-workspace-image.sh"),
         "#!/bin/sh\nset -eu\nprintf 'prefetch\\n' >>\"$CALLS\"\n",
     );
-    let helper = temp.path().join("snapshot-helper");
-    executable(&helper, "#!/bin/sh\nexit 0\n");
-    let helper_identity = temp.path().join("snapshot-helper-identity");
-    executable(
-        &helper_identity,
-        "#!/bin/sh\nset -eu\nprintf 'helper-identity\\n' >>\"$CALLS\"\n[ \"${HELPER_IDENTITY_UNSAFE:-}\" != 1 ]\nprintf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\t1\\t2\\n'\n",
-    );
     executable(
         &root.join("scripts/build-connected-workspace-image.sh"),
         &format!(
@@ -134,8 +127,6 @@ fn fixture() -> Fixture {
         .env("STATE", &state)
         .env("OWNER", TOKEN)
         .env("RAW_CONTAINER", &raw_container)
-        .env("GASCAN_GATE_TEST_SNAPSHOT_HELPER", &helper)
-        .env("GASCAN_GATE_TEST_HELPER_IDENTITY_BIN", &helper_identity)
         .env("CARGO_TARGET_DIR", repository_root().join("scripts/target"));
     Fixture {
         temp,
@@ -145,91 +136,21 @@ fn fixture() -> Fixture {
     }
 }
 
-fn assert_live_root_alias_rejects_test_helper_hooks(alias_kind: &str) {
-    let temp = tempfile::tempdir().unwrap();
-    let live = temp.path().join("live");
-    fs::create_dir_all(live.join("scripts")).unwrap();
-    fs::create_dir_all(live.join("docs/evidence")).unwrap();
-    fs::create_dir_all(live.join("images/workspace")).unwrap();
-    fs::copy(
-        repository_root().join("scripts/run-connected-image-gate.sh"),
-        live.join("scripts/run-connected-image-gate.sh"),
-    )
-    .unwrap();
-    let alias = if alias_kind == "dot" {
-        live.join(".")
-    } else {
-        let alias = temp.path().join("live-alias");
-        std::os::unix::fs::symlink(&live, &alias).unwrap();
-        alias
-    };
-    let bin = temp.path().join("bin");
-    fs::create_dir(&bin).unwrap();
-    let calls = temp.path().join("calls");
-    executable(&bin.join("container"), "#!/bin/sh\nprintf 'container:%s\\n' \"$*\" >>\"$CALLS\"\nexit 91\n");
-    executable(
-        &bin.join("cargo"),
-        "#!/bin/sh\nprintf 'cargo:%s\\n' \"$*\" >>\"$CALLS\"\nexit 92\n",
-    );
-    let hook = temp.path().join("test-identity-hook");
-    executable(&hook, "#!/bin/sh\nprintf 'test-hook\\n' >>\"$CALLS\"\nexit 0\n");
-    let helper = temp.path().join("test-helper");
-    executable(&helper, "#!/bin/sh\nexit 0\n");
-    let output = Command::new("bash")
-        .arg(live.join("scripts/run-connected-image-gate.sh"))
-        .env("GASCAN_GATE_TEST_ROOT", &alias)
-        .env("GASCAN_GATE_TEST_SNAPSHOT_HELPER", &helper)
-        .env("GASCAN_GATE_TEST_HELPER_IDENTITY_BIN", &hook)
-        .env("CONTAINER_BIN", bin.join("container"))
-        .env("CALLS", &calls)
-        .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()))
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    let calls = fs::read_to_string(calls).unwrap_or_default();
-    assert!(!calls.contains("test-hook"));
-    assert!(!calls.contains("container:"));
-    assert!(!calls.contains("prefetch"));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("/Library/PrivilegedHelperTools/dev.gascan.snapshot-workspace-context")
-            || (calls.contains("snapshot-helper-identity")
-                && calls.contains("/Library/PrivilegedHelperTools/dev.gascan.snapshot-workspace-context")),
-        "fixed live helper identity boundary was not reached: {calls}; stderr={stderr}"
-    );
-}
-
 #[test]
-fn dot_alias_of_live_root_cannot_activate_test_helper_hooks() {
-    assert_live_root_alias_rejects_test_helper_hooks("dot");
-}
-
-#[test]
-fn symlink_alias_of_live_root_cannot_activate_test_helper_hooks() {
-    assert_live_root_alias_rejects_test_helper_hooks("symlink");
-}
-
-#[test]
-fn missing_or_unsafe_snapshot_helper_fails_before_prefetch_or_container_activity() {
-    for mode in ["missing", "unsafe"] {
-        let mut f = fixture();
-        if mode == "missing" {
-            fs::remove_file(f.temp.path().join("snapshot-helper")).unwrap();
-        } else {
-            f.command.env("HELPER_IDENTITY_UNSAFE", "1");
-        }
-        assert!(!f.command.status().unwrap().success(), "{mode}");
-        let calls = fs::read_to_string(&f.calls).unwrap_or_default();
-        if mode == "missing" {
-            assert!(calls.is_empty());
-        } else {
-            assert_eq!(calls, "helper-identity\n");
-        }
-        assert!(!f
-            .root
-            .join("docs/evidence/connected-workspace-image.md")
-            .exists());
-        assert!(!f.root.join("images/workspace/approved-image.txt").exists());
+fn connected_gate_has_no_privileged_snapshot_or_sudo_precondition() {
+    let gate =
+        fs::read_to_string(repository_root().join("scripts/run-connected-image-gate.sh")).unwrap();
+    for obsolete in [
+        "snapshot-helper-identity",
+        "/Library/PrivilegedHelperTools/dev.gascan.snapshot-workspace-context",
+        "GASCAN_GATE_TEST_SNAPSHOT_HELPER",
+        "GASCAN_GATE_TEST_HELPER_IDENTITY_BIN",
+        "sudo -n",
+    ] {
+        assert!(
+            !gate.contains(obsolete),
+            "connected gate retained obsolete privileged precondition: {obsolete}"
+        );
     }
 }
 

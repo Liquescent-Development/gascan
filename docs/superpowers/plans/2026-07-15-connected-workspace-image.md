@@ -548,7 +548,6 @@ Expected: PASS.
 - [ ] **Step 5: Run the real gate**
 
 ```sh
-sudo -v
 ./scripts/run-connected-image-gate.sh
 ```
 
@@ -556,6 +555,10 @@ Expected: one anonymous connected ARM64 build; all three smokes PASS;
 evidence records a digest-qualified image and no current-token residue. If
 public source access, registry access, Apple runtime, or network policy fails,
 record the exact blocker and do not create PASS evidence.
+
+The connected MVP gate uses the caller-owned, manifest-verified context from
+Task 5 and therefore requires neither the privileged snapshot helper nor sudo
+authorization. Those boundaries remain retained for the deferred offline path.
 
 - [ ] **Step 6: Independently review evidence and commit**
 

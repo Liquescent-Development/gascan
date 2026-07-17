@@ -5,8 +5,9 @@ fn root() -> &'static Path {
 }
 
 #[test]
-fn build_uses_only_a_privileged_verified_snapshot() {
-    let build = fs::read_to_string(root().join("scripts/build-workspace-image.sh")).unwrap();
+fn offline_build_uses_only_a_privileged_verified_snapshot() {
+    let build =
+        fs::read_to_string(root().join("scripts/build-offline-workspace-image.sh")).unwrap();
     for required in [
         "snapshot_helper='/Library/PrivilegedHelperTools/dev.gascan.snapshot-workspace-context'",
         "snapshot-helper-identity",

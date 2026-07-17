@@ -47,19 +47,8 @@ for name in $(compgen -e); do
   esac
 done
 command -v "$container_bin" >/dev/null || die 'container controller is unavailable'
-snapshot_helper='/Library/PrivilegedHelperTools/dev.gascan.snapshot-workspace-context'
-if test "$root" = "$tool_root"; then
-  test -f "$snapshot_helper" || die "snapshot helper is unavailable: $snapshot_helper"
-  run_tool snapshot-helper-identity "$snapshot_helper" >/dev/null || die 'snapshot helper identity is unsafe'
-else
-  snapshot_helper=${GASCAN_GATE_TEST_SNAPSHOT_HELPER:?missing test snapshot helper}
-  helper_identity_bin=${GASCAN_GATE_TEST_HELPER_IDENTITY_BIN:?missing test snapshot helper identity boundary}
-  test -f "$snapshot_helper" || die 'snapshot helper is unavailable'
-  "$helper_identity_bin" "$snapshot_helper" >/dev/null || die 'snapshot helper identity is unsafe'
-fi
 if test "$root" = "$tool_root"; then
   test "$(uname -s)" = Darwin || die 'the live connected gate requires macOS'
-  sudo -n true >/dev/null 2>&1 || die 'sudo authorization is required'
   owner_token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
 else
   if test -n "${GASCAN_TEST_OWNER_TOKEN:-}"; then
