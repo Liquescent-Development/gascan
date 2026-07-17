@@ -81,7 +81,7 @@ chmod 0700 "$diagnostic_dir" || die 'cannot protect diagnostic directory'
 build_diagnostic="$diagnostic_dir/transcript"
 diagnostic_limit=131072
 set +e
-container build --arch arm64 \
+container build --no-cache --arch arm64 \
   --build-arg "BASE_IMAGE=$base_image" \
   --build-arg "GASCAMP_REVISION=$gascamp_revision" \
   --tag "$tag" --file "$snapshot/Dockerfile" "$snapshot" 2>&1 \

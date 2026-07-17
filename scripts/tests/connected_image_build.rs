@@ -40,6 +40,21 @@ fn connected_build_uses_the_sealed_public_snapshot_without_authentication_materi
 }
 
 #[test]
+fn connected_evidence_build_bypasses_stale_apple_builder_cache() {
+    let script =
+        fs::read_to_string(root().join("scripts/build-connected-workspace-image.sh")).unwrap();
+    let build = script
+        .split("container build")
+        .nth(1)
+        .unwrap()
+        .split("\n\n")
+        .next()
+        .unwrap();
+
+    assert!(build.contains("--no-cache"), "connected build may reuse stale layers");
+}
+
+#[test]
 fn fake_runner_builds_the_exact_public_snapshot_and_publishes_reference_last() {
     let temp = tempfile::tempdir_in("/tmp").unwrap();
     let repo = temp.path().join("repo");
