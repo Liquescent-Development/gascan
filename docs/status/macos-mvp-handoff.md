@@ -139,9 +139,7 @@ These offline commits are reviewed assets, not completed publication or live
 image evidence. `images/workspace/versions.lock` still says
 `publication = "pending"`.
 
-## Prebuilt MVP Image Input
-
-The successful connected build produced
+**Prebuilt MVP image input.** The successful connected build produced
 `gascan-workspace:d4964500a3295a33@sha256:c2ae1199881200f76200dff81656c45d996aa32674221dcdc2d2d2bbb3251237`
 for `linux/arm64`. Its variant manifest digest is
 `sha256:6108dc58d560e43dce9261f8768ff4c66fb4ac75685bc5aaf55527922a1fc4ac`,
