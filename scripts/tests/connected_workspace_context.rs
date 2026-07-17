@@ -118,7 +118,7 @@ fn every_local_dockerfile_copy_source_is_sealed_with_exact_bytes_and_mode() {
                     source.as_str(),
                     ".artifacts/mise-linux-arm64"
                         | ".artifacts/expected-tool-versions.json"
-                        | ".artifacts/playwright-chromium-reviewed/chrome-linux"
+                        | ".artifacts/playwright-chromium-reviewed"
                 ));
                 assert!(fixture.context.join(source).exists());
                 continue;

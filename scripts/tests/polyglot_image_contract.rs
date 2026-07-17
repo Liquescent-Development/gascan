@@ -43,7 +43,7 @@ fn dockerfile_installs_only_reviewed_system_tools_and_verified_artifacts() {
         "mise install --yes",
         "mise ls --current --installed --json",
         "/opt/gascan/image-tool-versions.json",
-        ".artifacts/playwright-chromium-reviewed/chrome-linux",
+        ".artifacts/playwright-chromium-reviewed",
         "/opt/gascan/tests/playwright-smoke.mjs",
         "/tmp/resolved-tool-versions.json",
         "USER root",
@@ -88,6 +88,15 @@ fn dockerfile_installs_only_reviewed_system_tools_and_verified_artifacts() {
 #[test]
 fn dockerfile_restores_only_reviewed_chromium_executable_modes() {
     let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
+    assert!(
+        dockerfile.contains(
+            "COPY .artifacts/playwright-chromium-reviewed /opt/gascan/chromium"
+        ),
+        "Chromium parent directory must be copied so chrome-linux nesting is retained"
+    );
+    assert!(!dockerfile.contains(
+        "COPY .artifacts/playwright-chromium-reviewed/chrome-linux /opt/gascan/chromium/chrome-linux"
+    ));
     for executable in [
         "chrome",
         "chrome-wrapper",

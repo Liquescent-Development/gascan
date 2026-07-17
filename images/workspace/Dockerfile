@@ -66,7 +66,7 @@ FROM workspace-base
 
 ARG GASCAMP_REVISION
 
-COPY .artifacts/playwright-chromium-reviewed/chrome-linux /opt/gascan/chromium/chrome-linux
+COPY .artifacts/playwright-chromium-reviewed /opt/gascan/chromium
 COPY --chmod=0440 images/workspace/etc/sudoers.d/workspace /etc/sudoers.d/workspace
 COPY --chmod=0555 images/workspace/bin/gascan-entrypoint /usr/local/bin/gascan-entrypoint
 COPY --chmod=0555 images/workspace/bin/select-gascamp /usr/local/bin/select-gascamp
