@@ -105,7 +105,7 @@ fn fixture() -> Fixture {
     executable(
         &raw_container,
         &format!(
-            "#!/bin/sh\nset -eu\nprintf 'container:%s\\n' \"$*\" >>\"$CALLS\"\nif [ \"$1 ${{2:-}}\" = 'image inspect' ]; then [ $# -eq 3 ] || exit 93; [ \"$3\" = gascan-workspace:test ] || {{ printf 'image not found\\n' >&2; exit 94; }}; platform=${{IMAGE_PLATFORM:-arm64}}; printf '[{{\"id\":\"{DIGEST}\",\"configuration\":{{\"name\":\"gascan-workspace:test\",\"descriptor\":{{\"digest\":\"sha256:{DIGEST}\"}}}},\"variants\":[{{\"platform\":{{\"os\":\"linux\",\"architecture\":\"%s\"}},\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}]}}]\\n' \"$platform\"; exit 0; fi\ncase \"$1\" in create) while [ $# -gt 0 ]; do [ \"$1\" = --name ] && {{ touch \"$STATE/$2\"; break; }}; shift; done ;; inspect) name=$2; [ \"${{RESIDUE:-}}\" = \"$name\" ] || [ -f \"$STATE/$name\" ] || exit 1; count_file=\"$STATE/.inspect-$name\"; count=0; [ ! -f \"$count_file\" ] || count=$(cat \"$count_file\"); count=$((count+1)); printf '%s' \"$count\" >\"$count_file\"; owner=$OWNER; [ \"${{FOREIGN:-}}\" = \"$name\" ] && owner=ffffffffffffffffffffffffffffffff; [ \"${{REPLACE_ON_SECOND_INSPECT:-}}\" = \"$name\" ] && [ \"$count\" -ge 2 ] && owner=ffffffffffffffffffffffffffffffff; printf '[{{\"id\":\"%s\",\"configuration\":{{\"id\":\"%s\",\"labels\":{{\"dev.gascan.test\":\"true\",\"dev.gascan.test.owner\":\"%s\"}}}}}}]\\n' \"$name\" \"$name\" \"$owner\" ;; stop) : ;; delete) name=${{@:$#}}; [ \"${{FAIL_DELETE:-}}\" != \"$name\" ] || exit 1; rm -f \"$STATE/$name\" ;; esac\n"
+            "#!/bin/sh\nset -eu\nprintf 'container:%s\\n' \"$*\" >>\"$CALLS\"\nif [ \"$1 ${{2:-}}\" = 'image inspect' ]; then [ $# -eq 3 ] || exit 93; [ \"$3\" = gascan-workspace:test ] || {{ printf 'image not found\\n' >&2; exit 94; }}; [ \"${{IMAGE_AVAILABLE:-1}}\" = 1 ] || exit 94; platform=${{IMAGE_PLATFORM:-arm64}}; image_digest=${{IMAGE_DIGEST:-sha256:{DIGEST}}}; image_id=${{image_digest#sha256:}}; printf '[{{\"id\":\"%s\",\"configuration\":{{\"name\":\"gascan-workspace:test\",\"descriptor\":{{\"digest\":\"%s\"}}}},\"variants\":[{{\"platform\":{{\"os\":\"linux\",\"architecture\":\"%s\"}},\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}]}}]\\n' \"$image_id\" \"$image_digest\" \"$platform\"; exit 0; fi\ncase \"$1\" in create) while [ $# -gt 0 ]; do [ \"$1\" = --name ] && {{ touch \"$STATE/$2\"; break; }}; shift; done ;; inspect) name=$2; [ \"${{RESIDUE:-}}\" = \"$name\" ] || [ -f \"$STATE/$name\" ] || exit 1; count_file=\"$STATE/.inspect-$name\"; count=0; [ ! -f \"$count_file\" ] || count=$(cat \"$count_file\"); count=$((count+1)); printf '%s' \"$count\" >\"$count_file\"; owner=$OWNER; [ \"${{FOREIGN:-}}\" = \"$name\" ] && owner=ffffffffffffffffffffffffffffffff; [ \"${{REPLACE_ON_SECOND_INSPECT:-}}\" = \"$name\" ] && [ \"$count\" -ge 2 ] && owner=ffffffffffffffffffffffffffffffff; printf '[{{\"id\":\"%s\",\"configuration\":{{\"id\":\"%s\",\"labels\":{{\"dev.gascan.test\":\"true\",\"dev.gascan.test.owner\":\"%s\"}}}}}}]\\n' \"$name\" \"$name\" \"$owner\" ;; stop) : ;; delete) name=${{@:$#}}; [ \"${{FAIL_DELETE:-}}\" != \"$name\" ] || exit 1; rm -f \"$STATE/$name\" ;; esac\n"
         ),
     );
     let container = temp.path().join("container");
@@ -134,6 +134,32 @@ fn fixture() -> Fixture {
         calls,
         command,
     }
+}
+
+fn seed_valid_receipt(f: &Fixture) {
+    let artifacts = f.root.join(".artifacts");
+    fs::create_dir_all(&artifacts).unwrap();
+    let reference = format!("gascan-workspace:test@sha256:{DIGEST}");
+    fs::write(
+        artifacts.join("workspace-image-ref"),
+        format!("{reference}\n"),
+    )
+    .unwrap();
+    fs::write(
+        artifacts.join("workspace-image-build.json"),
+        format!(
+            "{{\"reference\":\"{reference}\",\"tag\":\"gascan-workspace:test\",\"platform\":\"linux/arm64\",\"image_digest\":\"sha256:{DIGEST}\",\"status\":\"succeeded\"}}\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn assert_no_publications(f: &Fixture) {
+    assert!(!f
+        .root
+        .join("docs/evidence/connected-workspace-image.md")
+        .exists());
+    assert!(!f.root.join("images/workspace/approved-image.txt").exists());
 }
 
 #[test]
@@ -217,6 +243,109 @@ fn successful_gate_uses_one_reference_and_token_then_publishes_atomically() {
         fs::read(f.temp.path().join("state/unrelated-resource")).unwrap(),
         b"foreign"
     );
+}
+
+#[test]
+fn successful_prebuilt_gate_skips_build_work_and_publishes_exact_receipt_reference() {
+    let mut f = fixture();
+    seed_valid_receipt(&f);
+    let output = f.command.arg("--prebuilt").output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = fs::read_to_string(&f.calls).unwrap();
+    assert!(!calls.lines().any(|line| line == "prefetch" || line == "build"));
+    assert!(calls.contains("container:image inspect gascan-workspace:test"));
+    for prefix in ["user", "polyglot", "gascamp"] {
+        let name = format!("gascan-image-{prefix}-test-{TOKEN}");
+        assert!(calls.contains(&format!("create --name {name} ")));
+        assert!(calls.contains(&format!("delete {name}")));
+        assert!(!f.temp.path().join("state").join(name).exists());
+    }
+    let reference = format!("gascan-workspace:test@sha256:{DIGEST}");
+    assert_eq!(
+        fs::read(f.root.join("images/workspace/approved-image.txt")).unwrap(),
+        reference.as_bytes()
+    );
+    assert!(fs::read_to_string(f.root.join("docs/evidence/connected-workspace-image.md"))
+        .unwrap()
+        .contains(&reference));
+}
+
+#[test]
+fn invalid_arguments_skip_work_and_retire_stale_pass_publications() {
+    for arguments in [["--unknown"].as_slice(), ["--prebuilt", "extra"].as_slice()] {
+        let mut f = fixture();
+        fs::write(
+            f.root.join("docs/evidence/connected-workspace-image.md"),
+            "status: `PASS`\n",
+        )
+        .unwrap();
+        fs::write(f.root.join("images/workspace/approved-image.txt"), "stale").unwrap();
+        let output = f.command.args(arguments).output().unwrap();
+        assert!(!output.status.success(), "arguments={arguments:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("usage:"));
+        assert!(!f.calls.exists(), "arguments={arguments:?} reached work");
+        assert_no_publications(&f);
+    }
+}
+
+#[test]
+fn invalid_prebuilt_receipt_or_inspection_never_rebuilds_smokes_or_publishes() {
+    for failure in [
+        "missing",
+        "malformed",
+        "mismatched",
+        "mutable",
+        "wrong-platform",
+        "unavailable-image",
+        "digest-mismatch",
+    ] {
+        let mut f = fixture();
+        seed_valid_receipt(&f);
+        fs::write(
+            f.root.join("docs/evidence/connected-workspace-image.md"),
+            "status: `PASS`\n",
+        )
+        .unwrap();
+        fs::write(f.root.join("images/workspace/approved-image.txt"), "stale").unwrap();
+        let artifacts = f.root.join(".artifacts");
+        match failure {
+            "missing" => fs::remove_file(artifacts.join("workspace-image-build.json")).unwrap(),
+            "malformed" => {
+                fs::write(artifacts.join("workspace-image-build.json"), "{bad\n").unwrap()
+            }
+            "mismatched" => fs::write(
+                artifacts.join("workspace-image-build.json"),
+                "{\"reference\":\"gascan-workspace:other@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}\n",
+            )
+            .unwrap(),
+            "mutable" => {
+                fs::write(artifacts.join("workspace-image-ref"), "gascan-workspace:test\n").unwrap()
+            }
+            "wrong-platform" => {
+                f.command.env("IMAGE_PLATFORM", "amd64");
+            }
+            "unavailable-image" => {
+                f.command.env("IMAGE_AVAILABLE", "0");
+            }
+            "digest-mismatch" => {
+                f.command.env(
+                    "IMAGE_DIGEST",
+                    "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                );
+            }
+            _ => unreachable!(),
+        }
+        let output = f.command.arg("--prebuilt").output().unwrap();
+        assert!(!output.status.success(), "failure={failure}");
+        let calls = fs::read_to_string(&f.calls).unwrap_or_default();
+        assert!(!calls.lines().any(|line| line == "prefetch" || line == "build"));
+        assert!(!calls.contains("container:create"), "failure={failure} reached smoke");
+        assert_no_publications(&f);
+    }
 }
 
 #[test]

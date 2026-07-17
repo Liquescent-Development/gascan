@@ -39,6 +39,13 @@ controller() { run_bounded "$cli_timeout" "$container_bin" "$@"; }
 rm -f "$approved_file"
 if test -f "$evidence_file" && grep -Fq 'status: `PASS`' "$evidence_file"; then rm -f "$evidence_file"; fi
 
+prebuilt=false
+case $# in
+  0) ;;
+  1) test "$1" = --prebuilt || die 'usage: run-connected-image-gate.sh [--prebuilt]'; prebuilt=true ;;
+  *) die 'usage: run-connected-image-gate.sh [--prebuilt]' ;;
+esac
+
 for name in $(compgen -e); do
   case "$name" in
     GASCAMP_*TOKEN*|GITHUB_TOKEN|GH_TOKEN|GITLAB_TOKEN|DOCKER_AUTH_CONFIG|HTTP_AUTHORIZATION|AUTHORIZATION|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|BUILD_TOKEN|BUILD_*_TOKEN|*_BUILD_TOKEN|*_BUILD_*_TOKEN|BUILD_CREDENTIAL|BUILD_*_CREDENTIAL|*_BUILD_CREDENTIAL|*_BUILD_*_CREDENTIAL|BUILD_PASSWORD|BUILD_*_PASSWORD|*_BUILD_PASSWORD|*_BUILD_*_PASSWORD|BUILD_SECRET|BUILD_*_SECRET|*_BUILD_SECRET|*_BUILD_*_SECRET)
@@ -121,11 +128,16 @@ if test -n "${GASCAN_GATE_TEST_SIGNAL:-}"; then
   kill -"$GASCAN_GATE_TEST_SIGNAL" $$
 fi
 
-GASCAN_GATE_ARTIFACTS="$artifacts" "$root/scripts/prefetch-connected-workspace-image.sh"
-build_output=$(GASCAN_GATE_ARTIFACTS="$artifacts" "$root/scripts/build-connected-workspace-image.sh")
+build_output=''
+if ! $prebuilt; then
+  GASCAN_GATE_ARTIFACTS="$artifacts" "$root/scripts/prefetch-connected-workspace-image.sh"
+  build_output=$(GASCAN_GATE_ARTIFACTS="$artifacts" "$root/scripts/build-connected-workspace-image.sh")
+fi
 image=$(GASCAN_IMAGE_ARTIFACTS="$artifacts" "$root/scripts/validate-connected-image-receipt.sh" "$reference_file" "$receipt_file") || die 'build receipt pair is invalid'
 [[ "$image" =~ ^[a-z0-9][a-z0-9._/-]*:[a-zA-Z0-9._-]+@sha256:[0-9a-f]{64}$ ]] || die 'receipt reference is not digest-qualified'
-test "$(printf '%s\n' "$build_output" | tail -n 1)" = "$image" || die 'build output and receipt reference differ'
+if ! $prebuilt; then
+  test "$(printf '%s\n' "$build_output" | tail -n 1)" = "$image" || die 'build output and receipt reference differ'
+fi
 inspect=$("$container_bin" image inspect "${image%%@*}") || die 'built image is unavailable'
 inspected_digest=$(printf '%s' "$inspect" | run_tool validate-connected-build "${image%%@*}") || die 'structured image inspection is invalid'
 test "$inspected_digest" = "${image##*@}" || die 'inspection digest differs from receipt'
