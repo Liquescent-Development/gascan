@@ -9,6 +9,7 @@ use std::{
 };
 
 const SENSITIVE: u8 = 42;
+const OMITTED: &[u8] = b"\n[... middle diagnostic output omitted ...]\n";
 
 fn credential_name(name: &str) -> bool {
     matches!(
@@ -39,6 +40,12 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 fn run(output: &Path, limit: usize) -> io::Result<bool> {
+    if limit < OMITTED.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "diagnostic limit cannot represent truncation",
+        ));
+    }
     let mut needles: Vec<Vec<u8>> = [
         "authorization",
         "bearer",
@@ -101,19 +108,13 @@ fn run(output: &Path, limit: usize) -> io::Result<bool> {
     }
 
     if total > limit {
-        const OMITTED: &[u8] = b"\n[... middle diagnostic output omitted ...]\n";
         let tail = captured_tail.make_contiguous();
-        if limit < OMITTED.len() {
-            captured.clear();
-            captured.extend_from_slice(&tail[tail.len().saturating_sub(limit)..]);
-        } else {
-            let available = limit - OMITTED.len();
-            let prefix_len = available / 4;
-            let tail_len = available - prefix_len;
-            captured.truncate(prefix_len);
-            captured.extend_from_slice(OMITTED);
-            captured.extend_from_slice(&tail[tail.len().saturating_sub(tail_len)..]);
-        }
+        let available = limit - OMITTED.len();
+        let prefix_len = available / 4;
+        let tail_len = available - prefix_len;
+        captured.truncate(prefix_len);
+        captured.extend_from_slice(OMITTED);
+        captured.extend_from_slice(&tail[tail.len().saturating_sub(tail_len)..]);
     }
 
     let mut file = OpenOptions::new()
