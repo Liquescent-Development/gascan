@@ -152,6 +152,109 @@ esac
 }
 
 #[test]
+fn persistent_direct_context_mutation_during_build_blocks_receipt_publication() {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let repo = temp.path().join("repo");
+    let bin = temp.path().join("bin");
+    let artifacts = repo.join(".artifacts");
+    let context = artifacts.join("connected-workspace-context");
+    fs::create_dir_all(repo.join("scripts")).unwrap();
+    fs::create_dir_all(repo.join("images/workspace")).unwrap();
+    fs::create_dir_all(&artifacts).unwrap();
+    fs::create_dir(&bin).unwrap();
+    fs::copy(
+        root().join("scripts/build-connected-workspace-image.sh"),
+        repo.join("scripts/build-connected-workspace-image.sh"),
+    )
+    .unwrap();
+    fs::copy(
+        root().join("images/workspace/versions.lock"),
+        repo.join("images/workspace/versions.lock"),
+    )
+    .unwrap();
+    let prepared = Command::new(env!("CARGO_BIN_EXE_prepare-workspace-context"))
+        .args(["--mode", "connected", "--replace"])
+        .arg(root())
+        .arg(root().join("images/workspace/versions.lock"))
+        .arg(root().join(".artifacts"))
+        .arg(&context)
+        .output()
+        .unwrap();
+    assert!(
+        prepared.status.success(),
+        "{}",
+        String::from_utf8_lossy(&prepared.stderr)
+    );
+    let tag = fs::read_to_string(repo.join("images/workspace/versions.lock"))
+        .unwrap()
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("workspace_tag = \"")
+                .and_then(|tag| tag.strip_suffix('"'))
+        })
+        .unwrap()
+        .to_owned();
+    executable(
+        &bin.join("cargo"),
+        r#"#!/bin/bash
+printf 'cargo\t%s\n' "$*" >>"$CALLS"
+case "$*" in
+ *sanitize-build-output*) "$SANITIZER" "${@: -2:1}" "${@: -1}" ;;
+ *prepare-workspace-context*) printf 'prepare\t%s\n' "${@: -5}" >>"$CALLS"; "$PREPARE" "${@: -5}" ;;
+ *validate-image-inspect*) printf 'sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab\n' ;;
+ *'validate-connected-build -- validate-receipt '*) "$VALIDATOR" validate-receipt "${@: -4:1}" "${@: -3:1}" "${@: -2:1}" "${@: -1}" ;;
+ *'validate-connected-build -- gascan-workspace:'*) "$VALIDATOR" "${@: -1}" ;;
+ *) exit 90 ;;
+esac
+"#,
+    );
+    executable(
+        &bin.join("container"),
+        r#"#!/bin/bash
+printf 'container\t%s\n' "$*" >>"$CALLS"
+case "$*" in
+ 'image inspect ubuntu@sha256:'*) printf '[]\n' ;;
+ 'image inspect gascan-workspace:'*) printf '[{"id":"%064d","configuration":{"name":"%s","descriptor":{"digest":"sha256:%064d"}},"variants":[{"platform":{"os":"linux","architecture":"arm64"},"digest":"sha256:%064d"}]}]\n' 9 "$TAG" 9 8 ;;
+ build*) chmod u+w "$MUTATION_TARGET"; printf '\n# persistent direct-context mutation\n' >>"$MUTATION_TARGET" ;;
+ *) exit 91 ;;
+esac
+"#,
+    );
+    executable(&bin.join("sw_vers"), "#!/bin/sh\nprintf '14.0\n'\n");
+    let calls = temp.path().join("calls");
+    let output = Command::new("bash")
+        .arg(repo.join("scripts/build-connected-workspace-image.sh"))
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("CALLS", &calls)
+        .env("PREPARE", env!("CARGO_BIN_EXE_prepare-workspace-context"))
+        .env("TAG", &tag)
+        .env("MUTATION_TARGET", context.join("Dockerfile"))
+        .env("VALIDATOR", env!("CARGO_BIN_EXE_validate-connected-build"))
+        .env("SANITIZER", env!("CARGO_BIN_EXE_sanitize-build-output"))
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "mutated direct context published a receipt: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fs::read_to_string(context.join("Dockerfile"))
+        .unwrap()
+        .contains("persistent direct-context mutation"));
+    assert!(!artifacts.join("workspace-image-ref").exists());
+    assert!(!artifacts.join("workspace-image-build.json").exists());
+    let calls = fs::read_to_string(calls).unwrap();
+    assert_eq!(
+        calls.matches("prepare\t--verify-connected").count(),
+        2,
+        "both direct-context verifications must use the real verifier: {calls}"
+    );
+}
+
+#[test]
 fn authentication_inputs_fail_before_container_use() {
     let script = root().join("scripts/build-connected-workspace-image.sh");
     let temp = tempfile::tempdir_in("/tmp").unwrap();

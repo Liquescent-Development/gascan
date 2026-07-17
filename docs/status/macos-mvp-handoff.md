@@ -121,8 +121,9 @@ The harness is approved; Gate 4 itself is not passed.
 - `b03add2`: reviewed secret-mounted Gascamp builder from the now-corrected
   private-repository assumption; must be simplified to anonymous public fetch.
 - `61fd8d9`: reviewed connected orchestrator and receipt validation. Its
-  secret/wrapper path is now unnecessary; retain its public snapshot,
-  structured inspection, cleanup, and receipt protections.
+  secret/wrapper path is now unnecessary; retain its structured inspection,
+  cleanup, and receipt protections. The helper and offline snapshot remain
+  deferred hardening rather than part of the connected MVP path.
 - `30dd514`: independently approved platform-neutral connected image gate
   harness with transactional publication, bounded ownership-checked cleanup,
   real-smoke fake-controller coverage, and authoritative residue inventory.

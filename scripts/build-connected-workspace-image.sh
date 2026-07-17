@@ -23,21 +23,6 @@ for argument in "$@"; do
 done
 test "$#" -eq 0 || die 'unexpected build argument'
 
-operation_timeout=${GASCAN_CONNECTED_TIMEOUT_SECONDS:-300}
-case "$operation_timeout" in ''|*[!0-9]*) die 'timeout must be a positive integer' ;; esac
-test "$operation_timeout" -gt 0 || die 'timeout must be a positive integer'
-run_bounded() {
-  timeout_seconds=$1; shift
-  set -m
-  "$@" & command_pid=$!
-  ( sleep "$timeout_seconds"; if kill -0 "$command_pid" 2>/dev/null; then kill -TERM -- "-$command_pid" 2>/dev/null || true; sleep 1; kill -KILL -- "-$command_pid" 2>/dev/null || true; fi ) & watchdog_pid=$!
-  set +m
-  if wait "$command_pid"; then result=0; else result=$?; fi
-  kill -TERM -- "-$watchdog_pid" 2>/dev/null || true
-  wait "$watchdog_pid" 2>/dev/null || true
-  return "$result"
-}
-
 test -f "$lock" || die 'missing image lock'
 test "$(top_value workspace_build_mode)" = connected || die 'connected entrypoint requires exact connected lock'
 test -d "$context" || die 'missing connected workspace context'
