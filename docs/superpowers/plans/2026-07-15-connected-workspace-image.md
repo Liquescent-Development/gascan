@@ -8,10 +8,15 @@
 > Plan after the 2026-07-15 firewall diagnosis. It must be read with that plan
 > and the coordinated roadmap.
 
-> **Execution state:** Durable planning only. No task in this document has
-> started. The user selected subagent-driven execution for the next session
-> that explicitly resumes implementation; do not infer authorization to begin
-> merely from discovering this file.
+> **Execution state (2026-07-17):** The connected `linux/arm64` image built
+> successfully, its receipt was revalidated, and the user approved its exact
+> digest-qualified reference as the prebuilt MVP input while Apple builder
+> reliability is repaired separately under
+> [`Liquescent-Development/gascan#1`](https://github.com/Liquescent-Development/gascan/issues/1).
+> This is not a full image-gate PASS: later attempts failed before image
+> smokes, exact live acceptance remains pending, and
+> `images/workspace/approved-image.txt` must remain absent. Gates 4 and 5 are
+> still pending.
 
 **Goal:** Build and smoke-test the locked Gas Can `linux/arm64` workspace image with Apple Containerization 1.1 using connected public acquisition, including anonymous pinned Gascamp source, then hand its exact digest-qualified reference to Roadmap Gate 4.
 

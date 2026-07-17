@@ -1,6 +1,6 @@
 # Gas Can macOS MVP Handoff
 
-Last reconciled: 2026-07-15
+Last reconciled: 2026-07-17
 
 This is the canonical restart document for a fresh agent or session. Read it
 with `docs/superpowers/plans/2026-07-13-gascan-macos-roadmap.md` before changing
@@ -35,6 +35,12 @@ the polyglot toolchain.
   proven in Gate 2. This is separate from image-builder networking.
 - The MVP workspace image is a connected, locked build. Deliberate builder-VM
   network isolation is not required.
+- Image construction is development and release work. End-user distribution
+  consumes a prebuilt image; the actual distribution packaging remains Gate 5
+  work.
+- The user approved the successfully built connected workspace image recorded
+  below as the prebuilt MVP image input while Apple builder reliability is
+  repaired separately.
 - The earlier builder-egress failure was caused by a local firewall. A strict
   apt-bootstrap-plus-HTTPS diagnostic build passed after correction.
 - Offline ARM64 bundles are deferred hardening and are not a Gate 4 prerequisite.
@@ -61,7 +67,7 @@ the polyglot toolchain.
 | Phase 1 Apple feasibility / Gate 2 | Passed and integrated | `6bedef8`, `docs/feasibility/apple-container-report.md` |
 | Phase 1 core control plane / Gate 3 | Passed and integrated | `7c7d083`, integration record `917dac1` |
 | Phase 2 Apple backend implementation | Implemented and reviewed on feature branch; not integrated | head `dbf4235` |
-| Phase 2 workspace image | Tasks 1–3 and the platform-neutral gate safety mechanisms are reviewed; Tasks 4–6 require removal of the mistaken private-Gascamp credential path before the live gate | correction design approved; no approved image or live build yet |
+| Phase 2 workspace image | Connected ARM64 image built and approved as the prebuilt MVP input; exact live acceptance remains pending | revalidated local receipt and OCI archive recorded below; full image gate did not pass |
 | Gate 4 real lifecycle | Pending; harness approved but no complete real lifecycle evidence | harness `dbf4235` |
 | Phase 3 security, packaging, release | Not started as an integrated phase | blocked by Gate 4 |
 | Gate 5 clean-host release | Pending | no evidence |
@@ -133,6 +139,38 @@ These offline commits are reviewed assets, not completed publication or live
 image evidence. `images/workspace/versions.lock` still says
 `publication = "pending"`.
 
+## Prebuilt MVP Image Input
+
+The successful connected build produced
+`gascan-workspace:d4964500a3295a33@sha256:c2ae1199881200f76200dff81656c45d996aa32674221dcdc2d2d2bbb3251237`
+for `linux/arm64`. Its variant manifest digest is
+`sha256:6108dc58d560e43dce9261f8768ff4c66fb4ac75685bc5aaf55527922a1fc4ac`,
+and its build context digest is
+`853a67501a280753d8d69f188d0f8be3b63a87b5bb1527b5f101a299745b9272`.
+The successful receipt in `.artifacts/workspace-image-build.json` was
+revalidated against the local tag and descriptor.
+
+The ignored local export is
+`.artifacts/gascan-workspace-d4964500a3295a33-linux-arm64.oci.tar`, size
+`1297365504` bytes, SHA-256
+`4e3bb11a4f454001d8966757a20207707c69cef45181edf335b3076c0d775a65`.
+It is an OCI layout version 1.0.0 archive whose index references the exact
+successful tag and digest; that image index resolves to the expected
+`linux/arm64` variant manifest. The archive is local and ignored: it is not
+committed, uploaded, published, or a final distribution artifact.
+
+Apple builder reliability is deferred to
+[`Liquescent-Development/gascan#1`](https://github.com/Liquescent-Development/gascan/issues/1).
+The issue records the default 2 GiB builder SIGKILL, success with 4 CPUs and
+4 GiB, and the reused-builder `demux channel full` / invalid tar header
+failure, plus Docker/OCI-import investigation.
+
+This prebuilt input is not a connected-image gate PASS. Subsequent full-gate
+attempts failed before image smokes, so exact live acceptance remains pending
+and `images/workspace/approved-image.txt` must remain absent until it
+completes. Gates 4 and 5 remain pending; this status does not claim either gate
+or MVP completion.
+
 ## Verified Environmental Facts
 
 - Controller: Apple silicon macOS 26.5.1, Apple `container` CLI 1.1.0 during
@@ -152,19 +190,19 @@ Do not encode the operator DNS IP into Gas Can product policy.
 
 ## Current Unfinished Work
 
-Correction: Gascamp is public. Tasks 4–6 must use anonymous public source at
-the exact pinned revision. The connected build uses the caller-owned verified
-context directly because Apple BuildKit omits the root-owned snapshot payload;
-the helper remains only deferred/offline hardening.
+The connected image was built from the anonymous public Gascamp source at the
+exact pinned revision and approved as the prebuilt MVP input. The build uses
+the caller-owned verified context directly because Apple BuildKit omits the
+root-owned snapshot payload; the helper remains only deferred/offline
+hardening.
 
-1. Build the real ARM64 workspace image anonymously from the verified direct
-   context and record its exact digest. Independently inspect the evidence,
-   image history, and exported filesystem. The platform-neutral harness is
-   approved through `30dd514`; Task 6 itself remains incomplete.
-2. Integrate the Apple backend and connected image work into
+1. Complete exact live image acceptance against the approved prebuilt input;
+   only then may `images/workspace/approved-image.txt` be created. The prior
+   full-gate attempts failed before image smokes and are not a PASS.
+2. Integrate the Apple backend and prebuilt connected image work into
    `feature/macos-mvp` with conflict review and full verification.
-3. Inventory Plan 4 Tasks 4–6 against their plan; do not infer their completion
-   from the Gascamp selector commit alone.
+3. Repair and investigate Apple builder reliability separately under issue #1;
+   do not make end-user distribution rebuild the image.
 4. Run the complete Gate 4 real lifecycle: `up`, `shell`, `run`, `apply`,
    `down`, restart, reconciliation, and `destroy`, including PTY, signals,
    exact exits, and residue checks.
