@@ -126,7 +126,7 @@ build_output=$(GASCAN_GATE_ARTIFACTS="$artifacts" "$root/scripts/build-connected
 image=$(GASCAN_IMAGE_ARTIFACTS="$artifacts" "$root/scripts/validate-connected-image-receipt.sh" "$reference_file" "$receipt_file") || die 'build receipt pair is invalid'
 [[ "$image" =~ ^[a-z0-9][a-z0-9._/-]*:[a-zA-Z0-9._-]+@sha256:[0-9a-f]{64}$ ]] || die 'receipt reference is not digest-qualified'
 test "$(printf '%s\n' "$build_output" | tail -n 1)" = "$image" || die 'build output and receipt reference differ'
-inspect=$("$container_bin" image inspect "$image") || die 'built image is unavailable'
+inspect=$("$container_bin" image inspect "${image%%@*}") || die 'built image is unavailable'
 inspected_digest=$(printf '%s' "$inspect" | run_tool validate-connected-build "${image%%@*}") || die 'structured image inspection is invalid'
 test "$inspected_digest" = "${image##*@}" || die 'inspection digest differs from receipt'
 
