@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     env,
     fs::{self, OpenOptions},
     io::{self, Read, Write},
@@ -61,7 +62,9 @@ fn run(output: &Path, limit: usize) -> io::Result<bool> {
         .unwrap_or(1)
         .saturating_sub(1);
     let mut captured = Vec::with_capacity(limit.min(131_073));
-    let mut tail = Vec::new();
+    let mut captured_tail = VecDeque::with_capacity(limit.min(131_073));
+    let mut scan_tail = Vec::new();
+    let mut total = 0_usize;
     let mut sensitive = false;
     let mut chunk = [0_u8; 8192];
     loop {
@@ -69,10 +72,15 @@ fn run(output: &Path, limit: usize) -> io::Result<bool> {
         if count == 0 {
             break;
         }
+        total = total.saturating_add(count);
         if captured.len() < limit {
             captured.extend_from_slice(&chunk[..count.min(limit - captured.len())]);
         }
-        let mut scan = tail;
+        captured_tail.extend(&chunk[..count]);
+        while captured_tail.len() > limit {
+            captured_tail.pop_front();
+        }
+        let mut scan = scan_tail;
         scan.extend_from_slice(&chunk[..count]);
         let lower = scan.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
         sensitive |= needles.iter().any(|needle| {
@@ -85,11 +93,27 @@ fn run(output: &Path, limit: usize) -> io::Result<bool> {
                         .collect::<Vec<_>>(),
                 )
         });
-        tail = scan[scan.len().saturating_sub(overlap)..].to_vec();
+        scan_tail = scan[scan.len().saturating_sub(overlap)..].to_vec();
     }
 
     if sensitive {
         return Ok(false);
+    }
+
+    if total > limit {
+        const OMITTED: &[u8] = b"\n[... middle diagnostic output omitted ...]\n";
+        let tail = captured_tail.make_contiguous();
+        if limit < OMITTED.len() {
+            captured.clear();
+            captured.extend_from_slice(&tail[tail.len().saturating_sub(limit)..]);
+        } else {
+            let available = limit - OMITTED.len();
+            let prefix_len = available / 4;
+            let tail_len = available - prefix_len;
+            captured.truncate(prefix_len);
+            captured.extend_from_slice(OMITTED);
+            captured.extend_from_slice(&tail[tail.len().saturating_sub(tail_len)..]);
+        }
     }
 
     let mut file = OpenOptions::new()

@@ -31,6 +31,26 @@ fn writes_only_bounded_safe_output_to_a_private_new_file() {
 }
 
 #[test]
+fn oversized_safe_output_preserves_the_terminal_failure_with_an_omission_marker() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("diagnostic");
+    let terminal = b"terminal build failure: executable was not found\n";
+    let input = [vec![b'x'; 400_000], terminal.to_vec()].concat();
+
+    let result = run(&input, &path, None);
+
+    assert!(result.status.success(), "{:?}", result);
+    let diagnostic = fs::read(&path).unwrap();
+    assert!(diagnostic.len() <= 131_073);
+    assert!(diagnostic
+        .windows(terminal.len())
+        .any(|window| window == terminal));
+    assert!(
+        String::from_utf8_lossy(&diagnostic).contains("[... middle diagnostic output omitted ...]")
+    );
+}
+
+#[test]
 fn refuses_existing_files_and_symlinks_without_modifying_them() {
     let temp = tempfile::tempdir().unwrap();
     let target = temp.path().join("target");

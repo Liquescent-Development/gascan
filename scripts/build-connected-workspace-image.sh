@@ -85,7 +85,7 @@ container build --no-cache --arch arm64 \
   --build-arg "BASE_IMAGE=$base_image" \
   --build-arg "GASCAMP_REVISION=$gascamp_revision" \
   --tag "$tag" --file "$snapshot/Dockerfile" "$snapshot" 2>&1 \
-  | run_tool sanitize-build-output "$build_diagnostic" "$((diagnostic_limit + 1))"
+  | run_tool sanitize-build-output "$build_diagnostic" "$diagnostic_limit"
 pipeline_status=("${PIPESTATUS[@]}")
 build_status=${pipeline_status[0]}
 diagnostic_status=${pipeline_status[1]}
@@ -97,8 +97,7 @@ if test "$diagnostic_status" -ne 0; then
 fi
 if test "$build_status" -ne 0; then
   printf 'connected workspace image build: container build failed (status %s); bounded diagnostic follows:\n' "$build_status" >&2
-  head -c "$diagnostic_limit" "$build_diagnostic" >&2
-  test "$(wc -c <"$build_diagnostic" | tr -d ' ')" -le "$diagnostic_limit" || printf '\nconnected workspace image build: diagnostic truncated\n' >&2
+  command cat "$build_diagnostic" >&2
   exit "$build_status"
 fi
 rm -f "$build_diagnostic"

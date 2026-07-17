@@ -405,7 +405,7 @@ case "$*" in
      build_fail) exit 81;;
      build_fail_output) printf 'mise resolution mismatch: safe diagnostic\n' >&2; exit 81;;
      build_fail_secret) i=0; while test "$i" -lt 10000; do printf 'safe-prefix-%05d\n' "$i" >&2; i=$((i+1)); done; printf 'Authorization: Bearer should-never-escape\n' >&2; exit 82;;
-     build_fail_large) i=0; while test "$i" -lt 20000; do printf 'bounded-safe-diagnostic-%05d\n' "$i" >&2; i=$((i+1)); done; exit 83;;
+     build_fail_large) i=0; while test "$i" -lt 20000; do printf 'bounded-safe-diagnostic-%05d\n' "$i" >&2; i=$((i+1)); done; printf 'terminal container failure: layer command exited 83\n' >&2; exit 83;;
      build_signal) kill -TERM "$PPID"; sleep 1; exit 84;;
    esac
    test "$FAULT" != public_after || printf changed >>"$SNAPSHOT/context-manifest.tsv";;
@@ -485,7 +485,10 @@ destination=${@: -1}; case "$FAULT:$destination" in fail_json:*/workspace-image-
             "build_fail_large" => {
                 assert_eq!(output.status.code(), Some(83));
                 assert!(output.stderr.len() <= 140_000, "diagnostic was not bounded");
-                assert!(String::from_utf8_lossy(&output.stderr).contains("diagnostic truncated"));
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(stderr.contains("[... middle diagnostic output omitted ...]"));
+                assert!(stderr.contains("terminal container failure: layer command exited 83"));
+                assert!(!stderr.contains("diagnostic truncated"));
             }
             "scanner_fail" => {
                 assert_eq!(output.status.code(), Some(1));
