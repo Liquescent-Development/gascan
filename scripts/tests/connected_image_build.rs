@@ -135,7 +135,7 @@ esac
     );
     let log = fs::read_to_string(calls).unwrap();
     let required = format!(
-        "build\t--arch\tarm64\t--build-arg\tBASE_IMAGE={base}\t--build-arg\tGASCAMP_REVISION=f6b248c5926240856dbea83d1d2c5c90ea1c1456"
+        "build\t--no-cache\t--arch\tarm64\t--build-arg\tBASE_IMAGE={base}\t--build-arg\tGASCAMP_REVISION=f6b248c5926240856dbea83d1d2c5c90ea1c1456"
     );
     assert!(log.contains(&required), "{log}");
     assert!(!log.contains("--secret"));
