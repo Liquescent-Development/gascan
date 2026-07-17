@@ -81,13 +81,13 @@ fn sanitizer_is_prepared_before_build_and_consumes_the_pipeline_directly() {
         script.contains("cargo build --quiet --locked --offline --manifest-path \"$root/scripts/Cargo.toml\" --bin sanitize-build-output"),
         "sanitizer preparation must use the exact locked offline tools manifest"
     );
+    assert!(script.contains("--message-format=json-render-diagnostics"));
+    assert!(script.contains(".package_id == $package"));
+    assert!(script.contains(".target.name == $target"));
+    assert!(script.contains(".target.kind == [\"bin\"]"));
     assert!(
-        script.contains("cargo metadata --quiet --locked --offline --no-deps --format-version 1"),
-        "the sanitizer path must come from Cargo metadata"
-    );
-    assert!(
-        script.contains("test ! -L \"$build_output_sanitizer\""),
-        "the prepared executable must not be replaceable by a symlink"
+        script.contains("test ! -L \"$sanitizer_artifact\""),
+        "the reported compiler artifact must reject symlink substitution"
     );
     let pipeline = script[build..]
         .lines()
@@ -103,6 +103,123 @@ fn sanitizer_is_prepared_before_build_and_consumes_the_pipeline_directly() {
             && !pipeline.contains("cargo run"),
         "cargo must not be in the pipeline consumer path: {pipeline}"
     );
+}
+
+#[test]
+fn cargo_reported_target_triple_artifact_wins_over_stale_host_binary() {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let repo = temp.path().join("repo");
+    let bin = temp.path().join("bin");
+    let cargo_target = temp.path().join("cargo-target");
+    let reported = cargo_target.join("aarch64-apple-darwin/debug/sanitize-build-output");
+    let stale = cargo_target.join("debug/sanitize-build-output");
+    let marker = temp.path().join("stale-executed");
+    let context = repo.join(".artifacts/connected-workspace-context");
+    fs::create_dir_all(repo.join("scripts")).unwrap();
+    fs::create_dir_all(repo.join("images/workspace")).unwrap();
+    fs::create_dir_all(&context).unwrap();
+    fs::create_dir_all(stale.parent().unwrap()).unwrap();
+    fs::create_dir(&bin).unwrap();
+    fs::copy(
+        root().join("scripts/build-connected-workspace-image.sh"),
+        repo.join("scripts/build-connected-workspace-image.sh"),
+    )
+    .unwrap();
+    let base = "ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab";
+    fs::write(repo.join("images/workspace/versions.lock"), format!("workspace_build_mode = \"connected\"\nbase_image = \"{base}\"\nworkspace_tag = \"gascan-workspace:fixture\"\n[gascamp]\nrevision = \"f6b248c5926240856dbea83d1d2c5c90ea1c1456\"\n")).unwrap();
+    fs::write(context.join("Dockerfile"), "FROM scratch\n").unwrap();
+    fs::write(context.join("context-manifest.tsv"), "fixture\n").unwrap();
+    let manifest = format!("{:x}", Sha256::digest(b"fixture\n"));
+    executable(&stale, "#!/bin/sh\ntouch \"$STALE_MARKER\"\nexit 74\n");
+    executable(
+        &bin.join("cargo"),
+        &format!(
+            r#"#!/bin/bash
+case "$1" in
+ pkgid) printf 'path+file:///fixture/scripts#gascan-image-tools@0.1.0\n' ;;
+ build)
+   mkdir -p "$(dirname "$REPORTED_SANITIZER")"
+   cp "$SANITIZER" "$REPORTED_SANITIZER"
+   chmod 0755 "$REPORTED_SANITIZER"
+   printf '{{"reason":"compiler-artifact","package_id":"path+file:///fixture/scripts#gascan-image-tools@0.1.0","target":{{"kind":["bin"],"crate_types":["bin"],"name":"sanitize-build-output"}},"executable":"%s"}}\n' "$REPORTED_SANITIZER"
+   ;;
+ metadata) printf '{{"target_directory":"%s"}}\n' "$CARGO_TARGET_DIR" ;;
+ run)
+   case "$*" in
+     *prepare-workspace-context*) printf '{manifest}\n' ;;
+     *validate-image-inspect*) printf 'sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab\n' ;;
+     *) exit 90 ;;
+   esac
+   ;;
+ *) exit 91 ;;
+esac
+"#
+        ),
+    );
+    executable(
+        &bin.join("container"),
+        "#!/bin/sh\ncase \"$*\" in\n 'image inspect ubuntu@sha256:'*) printf '[]\\n' ;;\n build*) printf 'expected build stop\\n' >&2; exit 73 ;;\n *) exit 92 ;;\nesac\n",
+    );
+    let output = Command::new("bash")
+        .arg(repo.join("scripts/build-connected-workspace-image.sh"))
+        .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()))
+        .env("CARGO_TARGET_DIR", &cargo_target)
+        .env("CARGO_BUILD_TARGET", "aarch64-apple-darwin")
+        .env("REPORTED_SANITIZER", &reported)
+        .env("SANITIZER", env!("CARGO_BIN_EXE_sanitize-build-output"))
+        .env("STALE_MARKER", &marker)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(73), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(!marker.exists(), "stale host/debug sanitizer executed");
+}
+
+#[test]
+fn replacing_shared_artifact_after_private_staging_cannot_replace_consumer() {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let repo = temp.path().join("repo");
+    let bin = temp.path().join("bin");
+    let cargo_target = temp.path().join("cargo-target");
+    let reported = cargo_target.join("debug/sanitize-build-output");
+    let marker = temp.path().join("replacement-executed");
+    let context = repo.join(".artifacts/connected-workspace-context");
+    fs::create_dir_all(repo.join("scripts")).unwrap();
+    fs::create_dir_all(repo.join("images/workspace")).unwrap();
+    fs::create_dir_all(&context).unwrap();
+    fs::create_dir(&bin).unwrap();
+    fs::copy(root().join("scripts/build-connected-workspace-image.sh"), repo.join("scripts/build-connected-workspace-image.sh")).unwrap();
+    let base = "ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab";
+    fs::write(repo.join("images/workspace/versions.lock"), format!("workspace_build_mode = \"connected\"\nbase_image = \"{base}\"\nworkspace_tag = \"gascan-workspace:fixture\"\n[gascamp]\nrevision = \"f6b248c5926240856dbea83d1d2c5c90ea1c1456\"\n")).unwrap();
+    fs::write(context.join("Dockerfile"), "FROM scratch\n").unwrap();
+    fs::write(context.join("context-manifest.tsv"), "fixture\n").unwrap();
+    let manifest = format!("{:x}", Sha256::digest(b"fixture\n"));
+    executable(
+        &bin.join("cargo"),
+        &format!(r#"#!/bin/bash
+case "$1" in
+ pkgid) printf 'path+file:///fixture/scripts#gascan-image-tools@0.1.0\n' ;;
+ build) mkdir -p "$(dirname "$REPORTED_SANITIZER")"; cp "$SANITIZER" "$REPORTED_SANITIZER"; chmod 0755 "$REPORTED_SANITIZER"; printf '{{"reason":"compiler-artifact","package_id":"path+file:///fixture/scripts#gascan-image-tools@0.1.0","target":{{"kind":["bin"],"crate_types":["bin"],"name":"sanitize-build-output"}},"executable":"%s"}}\n' "$REPORTED_SANITIZER" ;;
+ metadata) printf '{{"target_directory":"%s"}}\n' "$CARGO_TARGET_DIR" ;;
+ run) case "$*" in *prepare-workspace-context*) printf '{manifest}\n' ;; *validate-image-inspect*) printf 'sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab\n' ;; *) exit 90 ;; esac ;;
+ *) exit 91 ;;
+esac
+"#),
+    );
+    executable(
+        &bin.join("container"),
+        "#!/bin/bash\ncase \"$*\" in\n 'image inspect ubuntu@sha256:'*) printf '#!/bin/sh\\ntouch \\\"$REPLACEMENT_MARKER\\\"\\nexit 75\\n' >\"$REPORTED_SANITIZER\"; chmod 0755 \"$REPORTED_SANITIZER\"; printf '[]\\n' ;;\n build*) printf 'expected build stop\\n' >&2; exit 73 ;;\n *) exit 92 ;;\nesac\n",
+    );
+    let output = Command::new("bash")
+        .arg(repo.join("scripts/build-connected-workspace-image.sh"))
+        .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()))
+        .env("CARGO_TARGET_DIR", &cargo_target)
+        .env("REPORTED_SANITIZER", &reported)
+        .env("SANITIZER", env!("CARGO_BIN_EXE_sanitize-build-output"))
+        .env("REPLACEMENT_MARKER", &marker)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(73), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(!marker.exists(), "replacement shared sanitizer executed");
 }
 
 #[test]
@@ -132,6 +249,7 @@ fn fake_runner_cannot_start_container_build_until_sanitizer_is_ready() {
             r#"#!/bin/bash
 printf 'cargo\t%s\n' "$*" >>"$CALLS"
 case "$1" in
+ pkgid) printf 'path+file:///fixture/scripts#gascan-image-tools@0.1.0\n' ;;
  build)
    test ! -e "$SANITIZER_READY" || exit 71
    mkdir -p "$CARGO_TARGET_DIR/debug"
@@ -139,6 +257,7 @@ case "$1" in
    chmod 0755 "$CARGO_TARGET_DIR/debug/sanitize-build-output"
    sleep 1
    printf ready >"$SANITIZER_READY"
+   printf '{{"reason":"compiler-artifact","package_id":"path+file:///fixture/scripts#gascan-image-tools@0.1.0","target":{{"kind":["bin"],"crate_types":["bin"],"name":"sanitize-build-output"}},"executable":"%s"}}\n' "$CARGO_TARGET_DIR/debug/sanitize-build-output"
    ;;
  metadata)
    printf '{{"target_directory":"%s"}}\n' "$CARGO_TARGET_DIR"
@@ -183,7 +302,12 @@ esac
     assert_eq!(output.status.code(), Some(73), "{}", String::from_utf8_lossy(&output.stderr));
     let log = fs::read_to_string(calls).unwrap();
     assert!(log.contains("cargo\tbuild"), "{log}");
-    assert!(!log.contains("sanitize-build-output --"), "sanitizer ran through cargo: {log}");
+    assert!(
+        !log.lines().any(|line| {
+            line.starts_with("cargo\trun") && line.contains("--bin sanitize-build-output")
+        }),
+        "sanitizer ran through cargo: {log}"
+    );
 }
 
 #[test]
@@ -212,7 +336,8 @@ fn fake_runner_builds_the_exact_verified_context_and_publishes_reference_last() 
             r#"#!/bin/bash
 printf 'cargo\t%s\n' "$*" >>"$CALLS"
 case "$1" in
- build) mkdir -p "$CARGO_TARGET_DIR/debug"; cp "$SANITIZER" "$CARGO_TARGET_DIR/debug/sanitize-build-output"; chmod 0755 "$CARGO_TARGET_DIR/debug/sanitize-build-output"; exit ;;
+ pkgid) printf 'path+file:///fixture/scripts#gascan-image-tools@0.1.0\n'; exit ;;
+ build) mkdir -p "$CARGO_TARGET_DIR/debug"; cp "$SANITIZER" "$CARGO_TARGET_DIR/debug/sanitize-build-output"; chmod 0755 "$CARGO_TARGET_DIR/debug/sanitize-build-output"; printf '{{"reason":"compiler-artifact","package_id":"path+file:///fixture/scripts#gascan-image-tools@0.1.0","target":{{"kind":["bin"],"crate_types":["bin"],"name":"sanitize-build-output"}},"executable":"%s"}}\n' "$CARGO_TARGET_DIR/debug/sanitize-build-output"; exit ;;
  metadata) printf '{{"target_directory":"%s"}}\n' "$CARGO_TARGET_DIR"; exit ;;
 esac
 case "$*" in
@@ -324,7 +449,8 @@ fn persistent_direct_context_mutation_during_build_blocks_receipt_publication() 
         r#"#!/bin/bash
 printf 'cargo\t%s\n' "$*" >>"$CALLS"
 case "$1" in
- build) mkdir -p "$CARGO_TARGET_DIR/debug"; cp "$SANITIZER" "$CARGO_TARGET_DIR/debug/sanitize-build-output"; chmod 0755 "$CARGO_TARGET_DIR/debug/sanitize-build-output"; exit ;;
+ pkgid) printf 'path+file:///fixture/scripts#gascan-image-tools@0.1.0\n'; exit ;;
+ build) mkdir -p "$CARGO_TARGET_DIR/debug"; cp "$SANITIZER" "$CARGO_TARGET_DIR/debug/sanitize-build-output"; chmod 0755 "$CARGO_TARGET_DIR/debug/sanitize-build-output"; printf '{"reason":"compiler-artifact","package_id":"path+file:///fixture/scripts#gascan-image-tools@0.1.0","target":{"kind":["bin"],"crate_types":["bin"],"name":"sanitize-build-output"},"executable":"%s"}\n' "$CARGO_TARGET_DIR/debug/sanitize-build-output"; exit ;;
  metadata) printf '{"target_directory":"%s"}\n' "$CARGO_TARGET_DIR"; exit ;;
 esac
 case "$*" in
@@ -606,10 +732,12 @@ fn fake_runner_failure_matrix_detects_context_mutation_and_never_commits_an_inva
                 r#"#!/bin/bash
 printf 'cargo\t%s\n' "$*" >>"$CALLS"
 case "$1" in
+ pkgid) printf 'path+file:///fixture/scripts#gascan-image-tools@0.1.0\n'; exit ;;
  build)
    mkdir -p "$CARGO_TARGET_DIR/debug"
    if test "$FAULT" = scanner_fail; then printf '#!/bin/sh\nexit 70\n' >"$CARGO_TARGET_DIR/debug/sanitize-build-output"; else cp "$SANITIZER" "$CARGO_TARGET_DIR/debug/sanitize-build-output"; fi
    chmod 0755 "$CARGO_TARGET_DIR/debug/sanitize-build-output"
+   printf '{{"reason":"compiler-artifact","package_id":"path+file:///fixture/scripts#gascan-image-tools@0.1.0","target":{{"kind":["bin"],"crate_types":["bin"],"name":"sanitize-build-output"}},"executable":"%s"}}\n' "$CARGO_TARGET_DIR/debug/sanitize-build-output"
    exit
    ;;
  metadata) printf '{{"target_directory":"%s"}}\n' "$CARGO_TARGET_DIR"; exit ;;

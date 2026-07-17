@@ -34,9 +34,13 @@ tag=$(top_value workspace_tag)
 
 build_diagnostic=''
 diagnostic_dir=''
+cargo_messages=''
+build_output_sanitizer=''
 cleanup() {
   status=${1:-$?}
   test -z "$build_diagnostic" || rm -f "$build_diagnostic" || status=1
+  test -z "$build_output_sanitizer" || rm -f "$build_output_sanitizer" || status=1
+  test -z "$cargo_messages" || rm -f "$cargo_messages" || status=1
   test -z "$diagnostic_dir" || rmdir "$diagnostic_dir" || status=1
   exit "$status"
 }
@@ -47,19 +51,46 @@ started_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 context_manifest=$(run_tool prepare-workspace-context --verify-connected "$root" "$lock" "$artifacts" "$context")
 [[ "$context_manifest" =~ ^[0-9a-f]{64}$ ]] || die 'context verifier returned an invalid digest'
 
-cargo build --quiet --locked --offline --manifest-path "$root/scripts/Cargo.toml" --bin sanitize-build-output
-cargo_target_dir=$(cargo metadata --quiet --locked --offline --no-deps --format-version 1 --manifest-path "$root/scripts/Cargo.toml" \
-  | jq -er '.target_directory | select(type == "string" and length > 0)') || die 'cannot resolve sanitizer target directory'
-[[ "$cargo_target_dir" = /* ]] || die 'sanitizer target directory is not absolute'
-build_output_sanitizer="$cargo_target_dir/debug/sanitize-build-output"
-test -f "$build_output_sanitizer" && test -x "$build_output_sanitizer" && test ! -L "$build_output_sanitizer" \
-  || die 'prepared build output sanitizer is unavailable'
-
-base_inspect=$(container image inspect "$base_image")
-test "$(printf '%s' "$base_inspect" | run_tool validate-image-inspect)" = "${base_image#ubuntu@}" || die 'exact local base is unavailable'
 umask 077
 diagnostic_dir=$(mktemp -d "$artifacts/.connected-build-diagnostic.XXXXXX") || die 'cannot create private diagnostic directory'
 chmod 0700 "$diagnostic_dir" || die 'cannot protect diagnostic directory'
+cargo_messages="$diagnostic_dir/cargo-build.jsonl"
+(set -o noclobber; : >"$cargo_messages") || die 'cannot create private Cargo transcript'
+sanitizer_package=$(cargo pkgid --quiet --locked --offline --manifest-path "$root/scripts/Cargo.toml") \
+  || die 'cannot resolve sanitizer package identity'
+cargo build --quiet --locked --offline --manifest-path "$root/scripts/Cargo.toml" --bin sanitize-build-output \
+  --message-format=json-render-diagnostics >"$cargo_messages" \
+  || die 'cannot prepare build output sanitizer'
+sanitizer_artifact=$(jq -ser --arg package "$sanitizer_package" --arg target sanitize-build-output '
+  [.[] | select(.reason == "compiler-artifact"
+    and .package_id == $package
+    and .target.name == $target
+    and .target.kind == ["bin"]
+    and .target.crate_types == ["bin"]
+    and (.executable | type == "string")
+    and (.executable | length > 0))] as $artifacts
+  | if ($artifacts | length) == 1 then $artifacts[0].executable
+    else error("expected one exact sanitizer compiler artifact") end
+' "$cargo_messages") || die 'cannot select exact sanitizer compiler artifact'
+[[ "$sanitizer_artifact" = /* ]] || die 'sanitizer compiler artifact is not absolute'
+exec 9<"$sanitizer_artifact" || die 'cannot open sanitizer compiler artifact'
+test -f /dev/fd/9 && test ! -L "$sanitizer_artifact" || die 'sanitizer compiler artifact is unsafe'
+test "$(stat -L -f '%i:%z' /dev/fd/9)" = "$(stat -L -f '%i:%z' "$sanitizer_artifact")" \
+  || die 'sanitizer compiler artifact changed before staging'
+build_output_sanitizer="$diagnostic_dir/sanitize-build-output"
+(set -o noclobber; : >"$build_output_sanitizer") || die 'cannot create private build output sanitizer'
+staged_digest=$(command cat <&9 | tee "$build_output_sanitizer" | shasum -a 256 | cut -d' ' -f1) \
+  || die 'cannot stage private build output sanitizer'
+exec 9<&-
+test -s "$build_output_sanitizer" || die 'private build output sanitizer is empty'
+test "$staged_digest" = "$(shasum -a 256 "$build_output_sanitizer" | cut -d' ' -f1)" \
+  || die 'private build output sanitizer digest differs from staged bytes'
+chmod 0500 "$build_output_sanitizer" || die 'cannot protect private build output sanitizer'
+rm -f "$cargo_messages"
+cargo_messages=''
+
+base_inspect=$(container image inspect "$base_image")
+test "$(printf '%s' "$base_inspect" | run_tool validate-image-inspect)" = "${base_image#ubuntu@}" || die 'exact local base is unavailable'
 build_diagnostic="$diagnostic_dir/transcript"
 diagnostic_limit=131072
 set +e
@@ -84,6 +115,8 @@ if test "$build_status" -ne 0; then
 fi
 rm -f "$build_diagnostic"
 build_diagnostic=''
+rm -f "$build_output_sanitizer"
+build_output_sanitizer=''
 rmdir "$diagnostic_dir"
 diagnostic_dir=''
 
