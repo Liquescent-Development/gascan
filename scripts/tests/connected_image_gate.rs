@@ -155,6 +155,20 @@ fn connected_gate_has_no_privileged_snapshot_or_sudo_precondition() {
 }
 
 #[test]
+fn repository_receipt_validator_is_executable() {
+    let permissions = fs::metadata(
+        repository_root().join("scripts/validate-connected-image-receipt.sh"),
+    )
+    .unwrap()
+    .permissions();
+    assert_ne!(
+        permissions.mode() & 0o111,
+        0,
+        "connected receipt validator must be executable in a checkout"
+    );
+}
+
+#[test]
 fn successful_gate_uses_one_reference_and_token_then_publishes_atomically() {
     let mut f = fixture();
     let output = f.command.output().unwrap();
