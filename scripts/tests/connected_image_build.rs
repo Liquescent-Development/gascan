@@ -67,6 +67,126 @@ fn connected_evidence_build_bypasses_stale_apple_builder_cache() {
 }
 
 #[test]
+fn sanitizer_is_prepared_before_build_and_consumes_the_pipeline_directly() {
+    let script =
+        fs::read_to_string(root().join("scripts/build-connected-workspace-image.sh")).unwrap();
+    let prepare = script
+        .find("cargo build")
+        .expect("connected build must prepare the sanitizer with cargo build");
+    let build = script
+        .find("container build")
+        .expect("connected build must invoke container build");
+    assert!(prepare < build, "sanitizer preparation must precede container build");
+    assert!(
+        script.contains("cargo build --quiet --locked --offline --manifest-path \"$root/scripts/Cargo.toml\" --bin sanitize-build-output"),
+        "sanitizer preparation must use the exact locked offline tools manifest"
+    );
+    assert!(
+        script.contains("cargo metadata --quiet --locked --offline --no-deps --format-version 1"),
+        "the sanitizer path must come from Cargo metadata"
+    );
+    assert!(
+        script.contains("test ! -L \"$build_output_sanitizer\""),
+        "the prepared executable must not be replaceable by a symlink"
+    );
+    let pipeline = script[build..]
+        .lines()
+        .take(7)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        pipeline.contains("| \"$build_output_sanitizer\""),
+        "container output must be consumed by the prepared executable: {pipeline}"
+    );
+    assert!(
+        !pipeline.contains("run_tool sanitize-build-output")
+            && !pipeline.contains("cargo run"),
+        "cargo must not be in the pipeline consumer path: {pipeline}"
+    );
+}
+
+#[test]
+fn fake_runner_cannot_start_container_build_until_sanitizer_is_ready() {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let repo = temp.path().join("repo");
+    let bin = temp.path().join("bin");
+    let cargo_target = temp.path().join("cargo-target");
+    let context = repo.join(".artifacts/connected-workspace-context");
+    fs::create_dir_all(repo.join("scripts")).unwrap();
+    fs::create_dir_all(repo.join("images/workspace")).unwrap();
+    fs::create_dir_all(&context).unwrap();
+    fs::create_dir(&bin).unwrap();
+    fs::copy(
+        root().join("scripts/build-connected-workspace-image.sh"),
+        repo.join("scripts/build-connected-workspace-image.sh"),
+    )
+    .unwrap();
+    let base = "ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab";
+    fs::write(repo.join("images/workspace/versions.lock"), format!("workspace_build_mode = \"connected\"\nbase_image = \"{base}\"\nworkspace_tag = \"gascan-workspace:fixture\"\n[gascamp]\nrevision = \"f6b248c5926240856dbea83d1d2c5c90ea1c1456\"\n")).unwrap();
+    fs::write(context.join("Dockerfile"), "FROM scratch\n").unwrap();
+    fs::write(context.join("context-manifest.tsv"), "fixture\n").unwrap();
+    let manifest = format!("{:x}", Sha256::digest(b"fixture\n"));
+    executable(
+        &bin.join("cargo"),
+        &format!(
+            r#"#!/bin/bash
+printf 'cargo\t%s\n' "$*" >>"$CALLS"
+case "$1" in
+ build)
+   test ! -e "$SANITIZER_READY" || exit 71
+   mkdir -p "$CARGO_TARGET_DIR/debug"
+   cp "$SANITIZER" "$CARGO_TARGET_DIR/debug/sanitize-build-output"
+   chmod 0755 "$CARGO_TARGET_DIR/debug/sanitize-build-output"
+   sleep 1
+   printf ready >"$SANITIZER_READY"
+   ;;
+ metadata)
+   printf '{{"target_directory":"%s"}}\n' "$CARGO_TARGET_DIR"
+   ;;
+ run)
+   case "$*" in
+     *prepare-workspace-context*) printf '{manifest}\n' ;;
+     *validate-image-inspect*) printf 'sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab\n' ;;
+     *) exit 90 ;;
+   esac
+   ;;
+ *) exit 91 ;;
+esac
+"#
+        ),
+    );
+    executable(
+        &bin.join("container"),
+        r#"#!/bin/bash
+printf 'container\t%s\n' "$*" >>"$CALLS"
+case "$*" in
+ 'image inspect ubuntu@sha256:'*) printf '[]\n' ;;
+ build*) test -f "$SANITIZER_READY" || { printf 'container started before sanitizer was ready\n' >&2; exit 72; }; printf 'expected build stop\n' >&2; exit 73 ;;
+ *) exit 92 ;;
+esac
+"#,
+    );
+    let calls = temp.path().join("calls");
+    let ready = temp.path().join("sanitizer-ready");
+    let output = Command::new("bash")
+        .arg(repo.join("scripts/build-connected-workspace-image.sh"))
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("CALLS", &calls)
+        .env("CARGO_TARGET_DIR", &cargo_target)
+        .env("SANITIZER", env!("CARGO_BIN_EXE_sanitize-build-output"))
+        .env("SANITIZER_READY", &ready)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(73), "{}", String::from_utf8_lossy(&output.stderr));
+    let log = fs::read_to_string(calls).unwrap();
+    assert!(log.contains("cargo\tbuild"), "{log}");
+    assert!(!log.contains("sanitize-build-output --"), "sanitizer ran through cargo: {log}");
+}
+
+#[test]
 fn fake_runner_builds_the_exact_verified_context_and_publishes_reference_last() {
     let temp = tempfile::tempdir_in("/tmp").unwrap();
     let repo = temp.path().join("repo");
@@ -91,8 +211,11 @@ fn fake_runner_builds_the_exact_verified_context_and_publishes_reference_last() 
         &format!(
             r#"#!/bin/bash
 printf 'cargo\t%s\n' "$*" >>"$CALLS"
+case "$1" in
+ build) mkdir -p "$CARGO_TARGET_DIR/debug"; cp "$SANITIZER" "$CARGO_TARGET_DIR/debug/sanitize-build-output"; chmod 0755 "$CARGO_TARGET_DIR/debug/sanitize-build-output"; exit ;;
+ metadata) printf '{{"target_directory":"%s"}}\n' "$CARGO_TARGET_DIR"; exit ;;
+esac
 case "$*" in
- *sanitize-build-output*) "$SANITIZER" "${{@: -2:1}}" "${{@: -1}}" ;;
  *prepare-workspace-context*) printf '{manifest}\n' ;;
  *validate-image-inspect*) printf 'sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab\n' ;;
  *'validate-connected-build -- validate-receipt '*) "$VALIDATOR" validate-receipt "${{@: -4:1}}" "${{@: -3:1}}" "${{@: -2:1}}" "${{@: -1}}" ;;
@@ -116,6 +239,7 @@ esac
     );
     executable(&bin.join("sw_vers"), "#!/bin/sh\nprintf '14.0\n'\n");
     let calls = temp.path().join("calls");
+    let cargo_target = temp.path().join("cargo-target");
     let output = Command::new("bash")
         .arg(repo.join("scripts/build-connected-workspace-image.sh"))
         .env(
@@ -123,6 +247,7 @@ esac
             format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
         )
         .env("CALLS", &calls)
+        .env("CARGO_TARGET_DIR", &cargo_target)
         .env("ARTIFACTS", repo.join(".artifacts"))
         .env("VALIDATOR", env!("CARGO_BIN_EXE_validate-connected-build"))
         .env("SANITIZER", env!("CARGO_BIN_EXE_sanitize-build-output"))
@@ -198,8 +323,11 @@ fn persistent_direct_context_mutation_during_build_blocks_receipt_publication() 
         &bin.join("cargo"),
         r#"#!/bin/bash
 printf 'cargo\t%s\n' "$*" >>"$CALLS"
+case "$1" in
+ build) mkdir -p "$CARGO_TARGET_DIR/debug"; cp "$SANITIZER" "$CARGO_TARGET_DIR/debug/sanitize-build-output"; chmod 0755 "$CARGO_TARGET_DIR/debug/sanitize-build-output"; exit ;;
+ metadata) printf '{"target_directory":"%s"}\n' "$CARGO_TARGET_DIR"; exit ;;
+esac
 case "$*" in
- *sanitize-build-output*) "$SANITIZER" "${@: -2:1}" "${@: -1}" ;;
  *prepare-workspace-context*) printf 'prepare\t%s\n' "${@: -5}" >>"$CALLS"; "$PREPARE" "${@: -5}" ;;
  *validate-image-inspect*) printf 'sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab\n' ;;
  *'validate-connected-build -- validate-receipt '*) "$VALIDATOR" validate-receipt "${@: -4:1}" "${@: -3:1}" "${@: -2:1}" "${@: -1}" ;;
@@ -222,6 +350,7 @@ esac
     );
     executable(&bin.join("sw_vers"), "#!/bin/sh\nprintf '14.0\n'\n");
     let calls = temp.path().join("calls");
+    let cargo_target = temp.path().join("cargo-target");
     let output = Command::new("bash")
         .arg(repo.join("scripts/build-connected-workspace-image.sh"))
         .env(
@@ -229,6 +358,7 @@ esac
             format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
         )
         .env("CALLS", &calls)
+        .env("CARGO_TARGET_DIR", &cargo_target)
         .env("PREPARE", env!("CARGO_BIN_EXE_prepare-workspace-context"))
         .env("TAG", &tag)
         .env("MUTATION_TARGET", context.join("Dockerfile"))
@@ -475,8 +605,16 @@ fn fake_runner_failure_matrix_detects_context_mutation_and_never_commits_an_inva
             &format!(
                 r#"#!/bin/bash
 printf 'cargo\t%s\n' "$*" >>"$CALLS"
+case "$1" in
+ build)
+   mkdir -p "$CARGO_TARGET_DIR/debug"
+   if test "$FAULT" = scanner_fail; then printf '#!/bin/sh\nexit 70\n' >"$CARGO_TARGET_DIR/debug/sanitize-build-output"; else cp "$SANITIZER" "$CARGO_TARGET_DIR/debug/sanitize-build-output"; fi
+   chmod 0755 "$CARGO_TARGET_DIR/debug/sanitize-build-output"
+   exit
+   ;;
+ metadata) printf '{{"target_directory":"%s"}}\n' "$CARGO_TARGET_DIR"; exit ;;
+esac
 case "$*" in
- *sanitize-build-output*) test "$FAULT" != scanner_fail || exit 70; "$SANITIZER" "${{@: -2:1}}" "${{@: -1}}" ;;
  *prepare-workspace-context*) test "$FAULT" != context_after || count=$(($(cat "$COUNT" 2>/dev/null || printf 0)+1)); test "$FAULT" != context_after || printf '%s' "$count" >"$COUNT"; test "$FAULT:$count" != context_after:2 || {{ printf '%064d\n' 7; exit; }}; printf '{manifest}\n' ;;
  *validate-image-inspect*) test "$FAULT" != base_invalid || exit 85; printf 'sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab\n' ;;
  *'validate-connected-build -- validate-receipt '*) test "$FAULT" != receipt_invalid || printf changed >>"${{@: -4:1}}"; "$VALIDATOR" validate-receipt "${{@: -4:1}}" "${{@: -3:1}}" "${{@: -2:1}}" "${{@: -1}}" ;;
@@ -525,6 +663,7 @@ destination=${@: -1}; case "$FAULT:$destination" in fail_json:*/workspace-image-
         );
         let calls = temp.path().join("calls");
         let count = temp.path().join("count");
+        let cargo_target = temp.path().join("cargo-target");
         let validator = env!("CARGO_BIN_EXE_validate-connected-build");
         let lock_digest = format!(
             "{:x}",
@@ -557,6 +696,7 @@ destination=${@: -1}; case "$FAULT:$destination" in fail_json:*/workspace-image-
             )
             .env("CALLS", &calls)
             .env("COUNT", &count)
+            .env("CARGO_TARGET_DIR", &cargo_target)
             .env("FAULT", fault)
             .env("ARTIFACTS", repo.join(".artifacts"))
             .env("VALIDATOR", validator)

@@ -47,6 +47,14 @@ started_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 context_manifest=$(run_tool prepare-workspace-context --verify-connected "$root" "$lock" "$artifacts" "$context")
 [[ "$context_manifest" =~ ^[0-9a-f]{64}$ ]] || die 'context verifier returned an invalid digest'
 
+cargo build --quiet --locked --offline --manifest-path "$root/scripts/Cargo.toml" --bin sanitize-build-output
+cargo_target_dir=$(cargo metadata --quiet --locked --offline --no-deps --format-version 1 --manifest-path "$root/scripts/Cargo.toml" \
+  | jq -er '.target_directory | select(type == "string" and length > 0)') || die 'cannot resolve sanitizer target directory'
+[[ "$cargo_target_dir" = /* ]] || die 'sanitizer target directory is not absolute'
+build_output_sanitizer="$cargo_target_dir/debug/sanitize-build-output"
+test -f "$build_output_sanitizer" && test -x "$build_output_sanitizer" && test ! -L "$build_output_sanitizer" \
+  || die 'prepared build output sanitizer is unavailable'
+
 base_inspect=$(container image inspect "$base_image")
 test "$(printf '%s' "$base_inspect" | run_tool validate-image-inspect)" = "${base_image#ubuntu@}" || die 'exact local base is unavailable'
 umask 077
@@ -59,7 +67,7 @@ container build --no-cache --arch arm64 \
   --build-arg "BASE_IMAGE=$base_image" \
   --build-arg "GASCAMP_REVISION=$gascamp_revision" \
   --tag "$tag" --file "$context/Dockerfile" "$context" 2>&1 \
-  | run_tool sanitize-build-output "$build_diagnostic" "$diagnostic_limit"
+  | "$build_output_sanitizer" "$build_diagnostic" "$diagnostic_limit"
 pipeline_status=("${PIPESTATUS[@]}")
 build_status=${pipeline_status[0]}
 diagnostic_status=${pipeline_status[1]}
