@@ -86,6 +86,39 @@ fn dockerfile_installs_only_reviewed_system_tools_and_verified_artifacts() {
 }
 
 #[test]
+fn dockerfile_restores_only_reviewed_chromium_executable_modes() {
+    let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
+    for executable in [
+        "chrome",
+        "chrome-wrapper",
+        "chrome_crashpad_handler",
+        "chrome_sandbox",
+        "libEGL.so",
+        "libGLESv2.so",
+        "libvulkan.so.1",
+        "libvk_swiftshader.so",
+    ] {
+        assert!(
+            dockerfile.contains(&format!(
+                "chmod 0555 /opt/gascan/chromium/chrome-linux/{executable}"
+            )),
+            "missing reviewed Chromium executable mode: {executable}"
+        );
+    }
+    for forbidden in [
+        "chmod -R a+x",
+        "chmod -R 0555",
+        "COPY --chmod=0555 .artifacts/playwright-chromium-reviewed",
+    ] {
+        assert!(
+            !dockerfile.contains(forbidden),
+            "Chromium data files must not be made executable: {forbidden}"
+        );
+    }
+    assert!(dockerfile.contains("chmod -R a-w /opt/gascan/chromium"));
+}
+
+#[test]
 fn smoke_covers_every_runtime_native_tools_and_browser() {
     let smoke = fs::read_to_string(root().join("tests/image/polyglot-smoke.sh")).unwrap();
     for required in [

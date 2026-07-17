@@ -88,6 +88,14 @@ RUN test -x /opt/gascan/gascamp/bin/camp \
        /home/workspace/.config/gascan \
     && chmod 0440 /etc/sudoers.d/workspace \
     && visudo -cf /etc/sudoers.d/workspace \
+    && chmod 0555 /opt/gascan/chromium/chrome-linux/chrome \
+    && chmod 0555 /opt/gascan/chromium/chrome-linux/chrome-wrapper \
+    && chmod 0555 /opt/gascan/chromium/chrome-linux/chrome_crashpad_handler \
+    && chmod 0555 /opt/gascan/chromium/chrome-linux/chrome_sandbox \
+    && chmod 0555 /opt/gascan/chromium/chrome-linux/libEGL.so \
+    && chmod 0555 /opt/gascan/chromium/chrome-linux/libGLESv2.so \
+    && chmod 0555 /opt/gascan/chromium/chrome-linux/libvulkan.so.1 \
+    && chmod 0555 /opt/gascan/chromium/chrome-linux/libvk_swiftshader.so \
     && test -x /opt/gascan/chromium/chrome-linux/chrome \
     && chmod -R a-w /opt/gascan/chromium
 
