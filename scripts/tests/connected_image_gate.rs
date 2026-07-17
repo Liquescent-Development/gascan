@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
@@ -20,6 +21,10 @@ fn executable(path: &Path, body: &str) {
     let mut permissions = fs::metadata(path).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(path, permissions).unwrap();
+}
+
+fn file_digest(path: &Path) -> String {
+    format!("{:x}", Sha256::digest(fs::read(path).unwrap()))
 }
 
 struct Fixture {
@@ -51,6 +56,10 @@ fn fixture() -> Fixture {
         "context\n",
     )
     .unwrap();
+    let lock_digest = file_digest(&root.join("images/workspace/versions.lock"));
+    let context_digest = file_digest(
+        &root.join(".artifacts/connected-workspace-context/context-manifest.tsv"),
+    );
     for cargo_file in ["Cargo.toml", "Cargo.lock"] {
         std::os::unix::fs::symlink(
             repository_root().join("scripts").join(cargo_file),
@@ -82,12 +91,17 @@ fn fixture() -> Fixture {
     executable(
         &root.join("scripts/build-connected-workspace-image.sh"),
         &format!(
-            "#!/bin/sh\nset -eu\nprintf 'build\\n' >>\"$CALLS\"\n[ \"${{GASCAN_GATE_TEST_BUILD_FAILURE:-}}\" != 1 ]\nmkdir -p \"$GASCAN_GATE_ARTIFACTS\"\nref='gascan-workspace:test@sha256:{DIGEST}'\n[ \"${{REFERENCE_KIND:-}}\" != mutable ] || ref=gascan-workspace:test\nprintf '%s\\n' \"$ref\" >\"$GASCAN_GATE_ARTIFACTS/workspace-image-ref\"\nprintf '{{\"reference\":\"%s\",\"tag\":\"gascan-workspace:test\",\"platform\":\"linux/arm64\",\"image_digest\":\"sha256:{DIGEST}\",\"status\":\"succeeded\"}}\\n' \"$ref\" >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\"\ncase \"${{RECEIPT_KIND:-}}\" in missing) rm -f \"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; malformed) printf '{{bad\\n' >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; mismatched) printf '{{\"reference\":\"wrong\"}}\\n' >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; esac\nprintf '%s\\n' \"$ref\"\n"
+            "#!/bin/sh\nset -eu\nprintf 'build\\n' >>\"$CALLS\"\n[ \"${{GASCAN_GATE_TEST_BUILD_FAILURE:-}}\" != 1 ]\nmkdir -p \"$GASCAN_GATE_ARTIFACTS\"\nref='gascan-workspace:test@sha256:{DIGEST}'\n[ \"${{REFERENCE_KIND:-}}\" != mutable ] || ref=gascan-workspace:test\nprintf '%s\\n' \"$ref\" >\"$GASCAN_GATE_ARTIFACTS/workspace-image-ref\"\nprintf '{{\"reference\":\"%s\",\"tag\":\"gascan-workspace:test\",\"platform\":\"linux/arm64\",\"lock_digest\":\"{lock_digest}\",\"context_digest\":\"{context_digest}\",\"image_digest\":\"sha256:{DIGEST}\",\"status\":\"succeeded\"}}\\n' \"$ref\" >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\"\ncase \"${{RECEIPT_KIND:-}}\" in missing) rm -f \"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; malformed) printf '{{bad\\n' >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; mismatched) printf '{{\"reference\":\"wrong\"}}\\n' >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; esac\nprintf '%s\\n' \"$ref\"\n"
         ),
     );
+    fs::copy(
+        repository_root().join("scripts/validate-connected-image-receipt.sh"),
+        root.join("scripts/validate-connected-image-receipt-real.sh"),
+    )
+    .unwrap();
     executable(
         &root.join("scripts/validate-connected-image-receipt.sh"),
-        "#!/bin/sh\nset -eu\n[ \"${GASCAN_GATE_TEST_RECEIPT_FAILURE:-}\" != 1 ]\nref=$(cat \"$1\")\nreceipt=${2:-$(dirname \"$1\")/workspace-image-build.json}\n[ -f \"$receipt\" ]\ncase \"$ref\" in gascan-workspace:test@sha256:????????????????????????????????????????????????????????????????) ;; *) exit 1;; esac\ngrep -Fq \"\\\"reference\\\":\\\"$ref\\\"\" \"$receipt\"\nprintf '%s\\n' \"$ref\"\n",
+        "#!/bin/sh\nset -eu\n[ \"${GASCAN_GATE_TEST_RECEIPT_FAILURE:-}\" != 1 ]\nexec \"$(dirname \"$0\")/validate-connected-image-receipt-real.sh\" \"$@\"\n",
     );
     for smoke in [
         "user-and-volumes.sh",
@@ -140,6 +154,10 @@ fn seed_valid_receipt(f: &Fixture) {
     let artifacts = f.root.join(".artifacts");
     fs::create_dir_all(&artifacts).unwrap();
     let reference = format!("gascan-workspace:test@sha256:{DIGEST}");
+    let lock_digest = file_digest(&f.root.join("images/workspace/versions.lock"));
+    let context_digest = file_digest(
+        &artifacts.join("connected-workspace-context/context-manifest.tsv"),
+    );
     fs::write(
         artifacts.join("workspace-image-ref"),
         format!("{reference}\n"),
@@ -148,7 +166,7 @@ fn seed_valid_receipt(f: &Fixture) {
     fs::write(
         artifacts.join("workspace-image-build.json"),
         format!(
-            "{{\"reference\":\"{reference}\",\"tag\":\"gascan-workspace:test\",\"platform\":\"linux/arm64\",\"image_digest\":\"sha256:{DIGEST}\",\"status\":\"succeeded\"}}\n"
+            "{{\"reference\":\"{reference}\",\"tag\":\"gascan-workspace:test\",\"platform\":\"linux/arm64\",\"lock_digest\":\"{lock_digest}\",\"context_digest\":\"{context_digest}\",\"image_digest\":\"sha256:{DIGEST}\",\"status\":\"succeeded\"}}\n"
         ),
     )
     .unwrap();
@@ -295,7 +313,8 @@ fn invalid_arguments_skip_work_and_retire_stale_pass_publications() {
 #[test]
 fn invalid_prebuilt_receipt_or_inspection_never_rebuilds_smokes_or_publishes() {
     for failure in [
-        "missing",
+        "missing-reference",
+        "missing-receipt",
         "malformed",
         "mismatched",
         "mutable",
@@ -313,7 +332,12 @@ fn invalid_prebuilt_receipt_or_inspection_never_rebuilds_smokes_or_publishes() {
         fs::write(f.root.join("images/workspace/approved-image.txt"), "stale").unwrap();
         let artifacts = f.root.join(".artifacts");
         match failure {
-            "missing" => fs::remove_file(artifacts.join("workspace-image-build.json")).unwrap(),
+            "missing-reference" => {
+                fs::remove_file(artifacts.join("workspace-image-ref")).unwrap()
+            }
+            "missing-receipt" => {
+                fs::remove_file(artifacts.join("workspace-image-build.json")).unwrap()
+            }
             "malformed" => {
                 fs::write(artifacts.join("workspace-image-build.json"), "{bad\n").unwrap()
             }
