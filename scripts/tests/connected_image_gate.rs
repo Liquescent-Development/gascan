@@ -161,10 +161,10 @@ fn repository_receipt_validator_is_executable() {
     )
     .unwrap()
     .permissions();
-    assert_ne!(
-        permissions.mode() & 0o111,
-        0,
-        "connected receipt validator must be executable in a checkout"
+    assert_eq!(
+        permissions.mode() & 0o100,
+        0o100,
+        "connected receipt validator must set the owner-execute bit in a checkout"
     );
 }
 
