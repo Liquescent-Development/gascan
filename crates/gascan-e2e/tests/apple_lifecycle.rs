@@ -30,7 +30,7 @@ fn cli_lifecycle_survives_daemon_and_host_state_changes() -> TestResult {
         &[
             "sh",
             "-c",
-            "trap 'size=$(stty size); printf \"%s\\n\" \"$size\"; test \"$size\" = \"47 132\" && exit 0' WINCH; printf GASCAN_RESIZE_READY; while :; do sleep 1; done",
+            "initial=$(stty size); printf '%s\\n' \"$initial\"; test \"$initial\" = '24 80' || exit 1; trap 'size=$(stty size); printf \"%s\\n\" \"$size\"; test \"$size\" = \"47 132\" && exit 0' WINCH; printf GASCAN_RESIZE_READY; while :; do sleep 1; done",
         ],
         47,
         132,
@@ -38,6 +38,15 @@ fn cli_lifecycle_survives_daemon_and_host_state_changes() -> TestResult {
     assert!(
         resized.status.success(),
         "resized TTY shell failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&resized.stdout),
+        String::from_utf8_lossy(&resized.stderr)
+    );
+    assert!(
+        resized
+            .stdout
+            .windows(b"24 80".len())
+            .any(|window| window == b"24 80"),
+        "guest did not start at exact 24x80 size: stdout={} stderr={}",
         String::from_utf8_lossy(&resized.stdout),
         String::from_utf8_lossy(&resized.stderr)
     );
