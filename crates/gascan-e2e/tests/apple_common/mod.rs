@@ -536,17 +536,34 @@ fn process_field(pid: u32, field: &str) -> TestResult<String> {
 }
 
 fn wait_with_output_bounded(
+    child: std::process::Child,
+    timeout: std::time::Duration,
+) -> TestResult<Output> {
+    wait_with_output_bounded_after_poll(child, timeout, |child| Ok(child.try_wait()?))
+}
+
+fn wait_with_output_bounded_after_poll(
     mut child: std::process::Child,
     timeout: std::time::Duration,
+    mut poll: impl FnMut(&mut std::process::Child) -> TestResult<Option<ExitStatus>>,
 ) -> TestResult<Output> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if child.try_wait()?.is_some() {
-            return Ok(child.wait_with_output()?);
+        match poll(&mut child) {
+            Ok(Some(status)) => return collect_reaped_child_output(&mut child, status),
+            Ok(None) => {}
+            Err(error) => return return_after_child_cleanup(&mut child, error),
         }
         if std::time::Instant::now() >= deadline {
-            child.kill()?;
-            let output = child.wait_with_output()?;
+            if let Err(error) = child.kill() {
+                let error = format!("child exceeded {timeout:?}; kill failed: {error}").into();
+                return return_after_child_cleanup(&mut child, error);
+            }
+            let status = match child.wait() {
+                Ok(status) => status,
+                Err(error) => return return_after_child_cleanup(&mut child, error.into()),
+            };
+            let output = collect_reaped_child_output(&mut child, status)?;
             return Err(format!(
                 "child exceeded {timeout:?} and was killed/reaped: stderr={}",
                 String::from_utf8_lossy(&output.stderr)
@@ -555,6 +572,25 @@ fn wait_with_output_bounded(
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+}
+
+fn collect_reaped_child_output(
+    child: &mut std::process::Child,
+    status: ExitStatus,
+) -> TestResult<Output> {
+    let mut stdout = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        pipe.read_to_end(&mut stdout)?;
+    }
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_end(&mut stderr)?;
+    }
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn run_pty_resize_command(
@@ -647,12 +683,18 @@ fn return_after_child_cleanup<T>(
     child: &mut std::process::Child,
     original: Box<dyn std::error::Error>,
 ) -> TestResult<T> {
-    match kill_and_reap_child(child) {
+    return_after_cleanup(original, kill_and_reap_child(child))
+}
+
+fn return_after_cleanup<T>(
+    original: Box<dyn std::error::Error>,
+    cleanup: TestResult,
+) -> TestResult<T> {
+    match cleanup {
         Ok(()) => Err(original),
-        Err(cleanup) => Err(format!(
-            "{original}; additionally failed to kill and reap PTY child: {cleanup}"
-        )
-        .into()),
+        Err(cleanup) => {
+            Err(format!("{original}; additionally failed to kill and reap child: {cleanup}").into())
+        }
     }
 }
 
@@ -765,6 +807,45 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(wait_with_output_bounded(child, std::time::Duration::from_millis(20)).is_err());
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_wait_reaps_child_after_poll_failure() -> TestResult {
+        let child = Command::new("sh")
+            .args(["-c", "exec sleep 30"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let pid = child.id();
+
+        let result =
+            wait_with_output_bounded_after_poll(child, std::time::Duration::from_secs(1), |_| {
+                Err("forced bounded poll failure".into())
+            });
+        let error = match result {
+            Ok(_) => return Err("forced bounded poll failure was not returned".into()),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("forced bounded poll failure"));
+        assert!(process_field(pid, "stat=").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn child_cleanup_failure_preserves_original_error_context() -> TestResult {
+        let result: TestResult = return_after_cleanup(
+            "forced original failure".into(),
+            Err("forced cleanup failure".into()),
+        );
+        let error = match result {
+            Ok(()) => return Err("combined cleanup failure was not returned".into()),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("forced original failure"));
+        assert!(error.to_string().contains("forced cleanup failure"));
         Ok(())
     }
 
