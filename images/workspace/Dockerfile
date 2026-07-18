@@ -13,6 +13,7 @@ RUN test "$(LC_ALL=C sort -u /tmp/system-tools.txt | wc -l | tr -d ' ')" = "$(wc
     && rm -rf /var/lib/apt/lists/* /tmp/system-tools.txt
 
 COPY --chmod=0555 .artifacts/mise-linux-arm64 /usr/local/bin/mise
+RUN install -d -o root -g root -m 0555 /etc/mise
 COPY --chmod=0444 images/workspace/etc/mise/config.toml /etc/mise/config.toml
 COPY --chmod=0444 .artifacts/expected-tool-versions.json /tmp/expected-tool-versions.json
 

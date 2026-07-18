@@ -80,6 +80,21 @@ fn dockerfile_assembles_the_connected_workspace_base() {
     }
 }
 
+#[test]
+fn dockerfile_creates_traversable_mise_config_directory_before_copying_config() {
+    let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
+    let directory = dockerfile
+        .find("RUN install -d -o root -g root -m 0555 /etc/mise")
+        .expect("missing explicit root-owned mode 0555 /etc/mise creation");
+    let config = dockerfile
+        .find("COPY --chmod=0444 images/workspace/etc/mise/config.toml /etc/mise/config.toml")
+        .unwrap();
+    assert!(
+        directory < config,
+        "/etc/mise must be created before config.toml is copied"
+    );
+}
+
 fn normalize_mise_ls(input: &str) -> std::process::Output {
     Command::new("jq")
         .args([
