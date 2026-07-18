@@ -60,34 +60,58 @@ fn cli_lifecycle_survives_daemon_and_host_state_changes() -> TestResult {
         String::from_utf8_lossy(&resized.stderr)
     );
 
-    for (signal, expected) in [
-        (rustix::process::Signal::INT, Some(130)),
-        (rustix::process::Signal::TERM, Some(143)),
-    ] {
-        let output = env.run_pty_signal(
-            signal,
-            &[
-                "sh",
-                "-c",
-                "trap 'printf GASCAN_INT_TRAP\\n; exit 130' INT; trap 'printf GASCAN_TERM_TRAP\\n; exit 143' TERM; printf GASCAN_SIGNAL_READY\\n; while :; do sleep 1; done",
-            ],
-        )?;
-        assert_eq!(output.status.code(), expected);
-        let marker = if signal == rustix::process::Signal::INT {
-            b"GASCAN_INT_TRAP".as_slice()
-        } else {
-            b"GASCAN_TERM_TRAP".as_slice()
-        };
-        assert!(
-            output
-                .stdout
-                .windows(marker.len())
-                .any(|window| window == marker),
-            "guest trap marker missing: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    let interrupt = env.run_pty_signal(
+        rustix::process::Signal::INT,
+        &[
+            "sh",
+            "-c",
+            "trap 'printf GASCAN_INT_TRAP\\n; exit 130' INT; printf GASCAN_SIGNAL_READY\\n; while :; do sleep 1; done",
+        ],
+    )?;
+    assert_eq!(interrupt.status.code(), Some(130));
+    assert!(
+        interrupt
+            .stdout
+            .windows(b"GASCAN_INT_TRAP".len())
+            .any(|window| window == b"GASCAN_INT_TRAP"),
+        "guest SIGINT trap marker missing: stdout={} stderr={}",
+        String::from_utf8_lossy(&interrupt.stdout),
+        String::from_utf8_lossy(&interrupt.stderr)
+    );
+
+    let term_started = std::time::Instant::now();
+    let unsupported_term = env.run_pty_signal(
+        rustix::process::Signal::TERM,
+        &[
+            "sh",
+            "-c",
+            "trap 'printf GASCAN_TERM_TRAP\\n; exit 143' TERM; printf GASCAN_SIGNAL_READY\\n; while :; do sleep 1; done",
+        ],
+    )?;
+    assert_eq!(unsupported_term.status.code(), Some(70));
+    assert!(
+        term_started.elapsed() < std::time::Duration::from_secs(2),
+        "unsupported TTY SIGTERM was not rejected promptly: {:?}",
+        term_started.elapsed()
+    );
+    assert!(
+        unsupported_term
+            .stdout
+            .windows(b"unsupported_capability".len())
+            .any(|window| window == b"unsupported_capability"),
+        "typed unsupported-capability error missing: stdout={} stderr={}",
+        String::from_utf8_lossy(&unsupported_term.stdout),
+        String::from_utf8_lossy(&unsupported_term.stderr)
+    );
+    assert!(
+        !unsupported_term
+            .stdout
+            .windows(b"GASCAN_TERM_TRAP".len())
+            .any(|window| window == b"GASCAN_TERM_TRAP"),
+        "unsupported TTY SIGTERM unexpectedly reached the guest: stdout={} stderr={}",
+        String::from_utf8_lossy(&unsupported_term.stdout),
+        String::from_utf8_lossy(&unsupported_term.stderr)
+    );
 
     env.stop_owned_container()?;
     env.success([

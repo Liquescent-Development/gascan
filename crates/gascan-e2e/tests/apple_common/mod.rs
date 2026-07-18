@@ -323,54 +323,9 @@ impl AppleE2e {
         signal: rustix::process::Signal,
         argv: &[&str],
     ) -> TestResult<PtySignalOutput> {
-        let pty = rustix_openpty::openpty(None, None)?;
-        let stdin = std::fs::File::from(rustix::io::dup(&pty.user)?);
-        let stdout = std::fs::File::from(rustix::io::dup(&pty.user)?);
-        let mut controller = std::fs::File::from(rustix::io::dup(&pty.controller)?);
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-        let reader = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let mut chunk = [0_u8; 256];
-            let mut announced = false;
-            loop {
-                match controller.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(count) => {
-                        bytes.extend_from_slice(&chunk[..count]);
-                        if !announced
-                            && bytes
-                                .windows(b"GASCAN_SIGNAL_READY".len())
-                                .any(|w| w == b"GASCAN_SIGNAL_READY")
-                        {
-                            let _ = ready_tx.send(());
-                            announced = true;
-                        }
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            Ok::<_, std::io::Error>(bytes)
-        });
         let mut args = vec!["--sandbox", self.id(), "shell", "--"];
         args.extend(argv);
-        let child = self
-            .command(args)
-            .stdin(stdin)
-            .stdout(stdout)
-            .stderr(Stdio::piped())
-            .spawn()?;
-        ready_rx.recv_timeout(std::time::Duration::from_secs(5))?;
-        let pid =
-            rustix::process::Pid::from_raw(i32::try_from(child.id())?).ok_or("invalid CLI pid")?;
-        rustix::process::kill_process(pid, signal)?;
-        drop(pty.controller);
-        let output = wait_with_output_bounded(child, std::time::Duration::from_secs(10))?;
-        let stdout = reader.join().map_err(|_| "PTY reader panicked")??;
-        Ok(PtySignalOutput {
-            status: output.status,
-            stdout,
-            stderr: output.stderr,
-        })
+        run_pty_signal_command(self.command(args), b"GASCAN_SIGNAL_READY", signal)
     }
 
     pub fn assert_no_owned_resources(&self) -> TestResult {
@@ -554,6 +509,110 @@ fn wait_with_output_bounded(
             .into());
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn run_pty_signal_command(
+    command: Command,
+    ready_marker: &[u8],
+    signal: rustix_openpty::rustix::process::Signal,
+) -> TestResult<PtySignalOutput> {
+    run_pty_signal_command_after_spawn(command, ready_marker, signal, |_| Ok(()))
+}
+
+fn run_pty_signal_command_after_spawn(
+    command: Command,
+    ready_marker: &[u8],
+    signal: rustix_openpty::rustix::process::Signal,
+    after_spawn: impl FnOnce(u32) -> TestResult,
+) -> TestResult<PtySignalOutput> {
+    run_pty_signal_command_with_actions(
+        command,
+        ready_marker,
+        signal,
+        after_spawn,
+        |child| Ok(child.try_wait()?),
+        std::process::Child::kill,
+    )
+}
+
+fn run_pty_signal_command_with_actions(
+    mut command: Command,
+    ready_marker: &[u8],
+    signal: rustix_openpty::rustix::process::Signal,
+    after_spawn: impl FnOnce(u32) -> TestResult,
+    mut poll: impl FnMut(&mut std::process::Child) -> TestResult<Option<ExitStatus>>,
+    mut kill: impl FnMut(&mut std::process::Child) -> std::io::Result<()>,
+) -> TestResult<PtySignalOutput> {
+    let pty = rustix_openpty::openpty(None, None)?;
+    let stdin = std::fs::File::from(rustix_openpty::rustix::io::dup(&pty.user)?);
+    let stdout = std::fs::File::from(rustix_openpty::rustix::io::dup(&pty.user)?);
+    let stderr = std::fs::File::from(rustix_openpty::rustix::io::dup(&pty.user)?);
+    let mut controller = std::fs::File::from(rustix_openpty::rustix::io::dup(&pty.controller)?);
+    let flags = rustix_openpty::rustix::fs::fcntl_getfl(&controller)?;
+    rustix_openpty::rustix::fs::fcntl_setfl(
+        &controller,
+        flags | rustix_openpty::rustix::fs::OFlags::NONBLOCK,
+    )?;
+    let mut captured = Vec::new();
+    let mut child = command.stdin(stdin).stdout(stdout).stderr(stderr).spawn()?;
+    drop(pty.user);
+    drop(pty.controller);
+
+    let result = (|| -> TestResult<PtySignalOutput> {
+        after_spawn(child.id())?;
+        let started = std::time::Instant::now();
+        let readiness_deadline = started + std::time::Duration::from_secs(5);
+        let execution_deadline = started + std::time::Duration::from_secs(10);
+        let mut signaled = false;
+        let status = loop {
+            let read_bytes = read_available_pty_batch(&mut controller, &mut captured, false)?;
+
+            if let Some(status) = poll(&mut child)? {
+                if !signaled {
+                    return Err("PTY child exited before signal readiness".into());
+                }
+                break status;
+            }
+
+            if !signaled
+                && captured
+                    .windows(ready_marker.len())
+                    .any(|window| window == ready_marker)
+            {
+                let pid =
+                    rustix_openpty::rustix::process::Pid::from_raw(i32::try_from(child.id())?)
+                        .ok_or("invalid CLI pid")?;
+                rustix_openpty::rustix::process::kill_process(pid, signal)?;
+                signaled = true;
+            }
+
+            let now = std::time::Instant::now();
+            if !signaled && now >= readiness_deadline {
+                return Err("PTY child did not report signal readiness".into());
+            }
+            if now >= execution_deadline {
+                return Err("PTY child did not exit after signal".into());
+            }
+            if read_bytes == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+
+        drain_pty_after_exit(&mut controller, &mut captured)?;
+        Ok(PtySignalOutput {
+            status,
+            stdout: captured,
+            stderr: Vec::new(),
+        })
+    })();
+
+    match result {
+        Ok(output) => Ok(output),
+        Err(error) => return_after_cleanup(
+            error,
+            kill_and_reap_pty_child(&mut child, &mut poll, &mut kill),
+        ),
     }
 }
 
@@ -1181,6 +1240,107 @@ mod tests {
 
         assert!(error.to_string().contains("forced PTY poll failure"));
         let pid = spawned_pid.get().ok_or("post-spawn hook did not run")?;
+        assert!(process_field(pid, "stat=").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn pty_signal_driver_does_not_wait_for_inherited_slave_descriptor() -> TestResult {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "trap 'exit 130' INT; sleep 0.5 & descendant=$!; printf 'GASCAN_DESCENDANT_PID=%s\n' \"$descendant\"; printf GASCAN_SIGNAL_READY; while :; do :; done",
+        ]);
+
+        let started = std::time::Instant::now();
+        let output = run_pty_signal_command(
+            command,
+            b"GASCAN_SIGNAL_READY",
+            rustix_openpty::rustix::process::Signal::INT,
+        )?;
+        let descendant_pid = marker_pid(&output.stdout, b"GASCAN_DESCENDANT_PID=")?;
+
+        assert_eq!(output.status.code(), Some(130));
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "signal helper waited {:?} for an inherited PTY slave descriptor",
+            started.elapsed()
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while process_field(descendant_pid, "stat=").is_ok() {
+            if std::time::Instant::now() >= deadline {
+                return Err("bounded inherited-descriptor fixture did not exit".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(process_field(descendant_pid, "stat=").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn pty_signal_driver_reaps_child_after_post_spawn_failure() -> TestResult {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 30"]);
+        let spawned_pid = std::cell::Cell::new(None);
+
+        let result = run_pty_signal_command_after_spawn(
+            command,
+            b"GASCAN_SIGNAL_READY",
+            rustix_openpty::rustix::process::Signal::INT,
+            |pid| {
+                spawned_pid.set(Some(pid));
+                Err("forced signal post-spawn failure".into())
+            },
+        );
+        let error = match result {
+            Ok(_) => return Err("forced signal post-spawn failure was not returned".into()),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("forced signal post-spawn failure")
+        );
+        let pid = spawned_pid.get().ok_or("post-spawn hook did not run")?;
+        assert!(process_field(pid, "stat=").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn pty_signal_cleanup_kill_failure_is_bounded_and_preserves_context() -> TestResult {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 30"]);
+        let spawned_pid = std::cell::Cell::new(None);
+
+        let started = std::time::Instant::now();
+        let result = run_pty_signal_command_with_actions(
+            command,
+            b"GASCAN_SIGNAL_READY",
+            rustix_openpty::rustix::process::Signal::INT,
+            |pid| {
+                spawned_pid.set(Some(pid));
+                Err("forced signal original failure".into())
+            },
+            |child| Ok(child.try_wait()?),
+            |_| Err(std::io::Error::other("forced signal kill failure")),
+        );
+        let elapsed = started.elapsed();
+        let pid = spawned_pid.get().ok_or("post-spawn hook did not run")?;
+        let mut fixture = OwnedChildFixture::new(pid)?;
+        fixture.assert_owned_and_running()?;
+        let error = match result {
+            Ok(_) => return Err("forced signal cleanup failure was not returned".into()),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("forced signal original failure"));
+        assert!(error.to_string().contains("forced signal kill failure"));
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "signal cleanup blocked for {elapsed:?}"
+        );
+        fixture.kill_and_reap()?;
         assert!(process_field(pid, "stat=").is_err());
         Ok(())
     }
