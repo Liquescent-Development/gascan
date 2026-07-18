@@ -1,6 +1,6 @@
 # Gas Can macOS MVP Handoff
 
-Last reconciled: 2026-07-17
+Last reconciled: 2026-07-18
 
 This is the canonical restart document for a fresh agent or session. Read it
 with `docs/superpowers/plans/2026-07-13-gascan-macos-roadmap.md` before changing
@@ -67,7 +67,7 @@ the polyglot toolchain.
 | Phase 1 Apple feasibility / Gate 2 | Passed and integrated | `6bedef8`, `docs/feasibility/apple-container-report.md` |
 | Phase 1 core control plane / Gate 3 | Passed and integrated | `7c7d083`, integration record `917dac1` |
 | Phase 2 Apple backend implementation | Implemented and reviewed on feature branch; not integrated | head `dbf4235` |
-| Phase 2 workspace image | Connected ARM64 image built and approved as the prebuilt MVP input; exact live acceptance remains pending | revalidated local receipt and OCI archive recorded below; full image gate did not pass |
+| Phase 2 workspace image | Connected ARM64 prebuilt image accepted by the live image gate on 2026-07-18 | authoritative tracked evidence and approval marker recorded below |
 | Gate 4 real lifecycle | Pending; harness approved but no complete real lifecycle evidence | harness `dbf4235` |
 | Phase 3 security, packaging, release | Not started as an integrated phase | blocked by Gate 4 |
 | Gate 5 clean-host release | Pending | no evidence |
@@ -82,7 +82,7 @@ The recorded locations and accepted heads are:
 |---|---|---|---|
 | `.worktrees/macos-mvp` | `feature/macos-mvp` | `917dac1` | integration branch through Gate 3 |
 | `.worktrees/apple-backend` | `feature/apple-backend` | `dbf4235` | reviewed Plan 3 implementation and Gate 4 harness |
-| `.worktrees/provisioning` | `feature/provisioning` | `9025c56` before this documentation change | image, Gascamp, offline bundles, and image gates |
+| `.worktrees/provisioning` | `feature/provisioning` | `131a01a` before this evidence commit; this final evidence commit becomes the new accepted head | image, Gascamp, offline bundles, and image gates |
 
 Do not merge feature branches wholesale without reviewing their merge base and
 overlap. The provisioning branch contains a deliberately deferred offline
@@ -139,35 +139,26 @@ These offline commits are reviewed assets, not completed publication or live
 image evidence. `images/workspace/versions.lock` still says
 `publication = "pending"`.
 
-**Prebuilt MVP image input.** The successful connected build produced
-`gascan-workspace:d4964500a3295a33@sha256:c2ae1199881200f76200dff81656c45d996aa32674221dcdc2d2d2bbb3251237`
-for `linux/arm64`. Its variant manifest digest is
-`sha256:6108dc58d560e43dce9261f8768ff4c66fb4ac75685bc5aaf55527922a1fc4ac`,
-and its build context digest is
-`853a67501a280753d8d69f188d0f8be3b63a87b5bb1527b5f101a299745b9272`.
-The successful receipt in `.artifacts/workspace-image-build.json` was
-revalidated against the local tag and descriptor.
+**Accepted prebuilt MVP image input.** On 2026-07-18 the connected workspace
+image gate passed on Apple Container 26.5.1 using the exact public GHCR index
+`ghcr.io/liquescent-development/gascan/workspace:d4964500a3295a33@sha256:49ba6a63ce745b7f2238e609b556776b7aab12ac0eb5f741fc47ca164dc8aeac`.
+Anonymous public registry inspection and pull, all three image smokes, and
+current-run cleanup passed. The authoritative tracked records are
+`docs/evidence/connected-workspace-image.md` and
+`images/workspace/approved-image.txt`.
 
-The ignored local export is
-`.artifacts/gascan-workspace-d4964500a3295a33-linux-arm64.oci.tar`, size
-`1297365504` bytes, SHA-256
-`4e3bb11a4f454001d8966757a20207707c69cef45181edf335b3076c0d775a65`.
-It is an OCI layout version 1.0.0 archive whose index references the exact
-successful tag and digest; that image index resolves to the expected
-`linux/arm64` variant manifest. The archive is local and ignored: it is not
-committed, uploaded, published, or a final distribution artifact.
-
-Apple builder reliability is deferred to
-[`Liquescent-Development/gascan#1`](https://github.com/Liquescent-Development/gascan/issues/1).
-The issue records the default 2 GiB builder SIGKILL, success with 4 CPUs and
-4 GiB, and the reused-builder `demux channel full` / invalid tar header
-failure, plus Docker/OCI-import investigation.
-
-This prebuilt input is not a connected-image gate PASS. Subsequent full-gate
-attempts failed before image smokes, so exact live acceptance remains pending
-and `images/workspace/approved-image.txt` must remain absent until it
-completes. Gates 4 and 5 remain pending; this status does not claim either gate
-or MVP completion.
+Apple builder context-streaming reliability remains separately tracked by
+[`Liquescent-Development/gascan#1`](https://github.com/Liquescent-Development/gascan/issues/1)
+and does not invalidate the accepted prebuilt image. The issue records the
+default 2 GiB builder SIGKILL, success with 4 CPUs and 4 GiB, the reused-builder
+`demux channel full` / invalid tar header failure, and Docker/OCI-import
+investigation. Offline bundle publication and builder-VM network isolation
+remain deferred and are not MVP blockers.
+Roadmap Gate 4 remains pending because the reviewed Apple backend and Gate 4
+harness at `dbf4235` are not integrated and the full real CLI lifecycle has not
+run. Roadmap Gate 5 also remains pending and remains the definition of MVP
+completion. This evidence does not claim Phase 3, either gate, or MVP
+completion.
 
 ## Verified Environmental Facts
 
@@ -194,19 +185,19 @@ the caller-owned verified context directly because Apple BuildKit omits the
 root-owned snapshot payload; the helper remains only deferred/offline
 hardening.
 
-1. Complete exact live image acceptance against the approved prebuilt input;
-   only then may `images/workspace/approved-image.txt` be created. The prior
-   full-gate attempts failed before image smokes and are not a PASS.
-2. Integrate the Apple backend and prebuilt connected image work into
-   `feature/macos-mvp` with conflict review and full verification.
-3. Repair and investigate Apple builder reliability separately under issue #1;
-   do not make end-user distribution rebuild the image.
-4. Run the complete Gate 4 real lifecycle: `up`, `shell`, `run`, `apply`,
+1. Execute continuation addendum Task 7: create and review the integration
+   worktree from `917dac1`; integrate the reviewed Apple and connected-image
+   histories with conflict and interface review, without assuming a wholesale
+   merge; freeze the approved image into policy; and run platform-neutral
+   verification.
+2. Then run the exact Gate 4 real lifecycle serially: `up`, `shell`, `run`, `apply`,
    `down`, restart, reconciliation, and `destroy`, including PTY, signals,
    exact exits, and residue checks.
-5. Complete Plan 4 security acceptance, packaging, installation, and clean-host
+3. Continue investigating Apple builder reliability separately under issue #1;
+   do not make end-user distribution rebuild the image.
+4. Complete Plan 4 security acceptance, packaging, installation, and clean-host
    release work.
-6. Run and record Gate 5.
+5. Run and record Gate 5.
 
 ## Fresh-Session Restart Procedure
 
@@ -228,10 +219,10 @@ Then read, in order:
 4. `docs/superpowers/plans/2026-07-15-connected-workspace-image.md`;
 5. the relevant task plan before modifying its branch.
 
-If the fresh session is asked to continue implementation, use
-`superpowers:subagent-driven-development` on Task 1 of the connected-build Plan
-4 addendum. If the fresh session is asked only for status, report from this
-document and do not dispatch implementation agents.
+If the fresh session is asked to continue implementation, begin continuation
+addendum Task 7 with the integration worktree and review sequence recorded
+above. If the fresh session is asked only for status, report from this document
+and do not dispatch implementation agents.
 
 Before claiming any gate, run the roadmap's program-level verification and the
 gate-specific live suite. Never infer Gate 4 from harness tests or Gate 5 from

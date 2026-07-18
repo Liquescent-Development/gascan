@@ -31,7 +31,7 @@
 3. [Apple Backend and Lifecycle Plan](./2026-07-13-apple-backend-lifecycle.md) connects the control plane to the real Apple runtime and completes lifecycle behavior.
 4. [Workspace Environment and Release Plan](./2026-07-13-workspace-environment-release.md) ships the image, mise/Gascamp provisioning, security suite, packaging, and clean-host release gate.
 5. [Offline Workspace Image Bundles Plan](./2026-07-14-offline-workspace-image-bundles.md) is implemented through a PENDING live gate and retained as deferred reproducibility/offline hardening. It is not on the macOS MVP critical path after the 2026-07-15 connected-builder diagnosis.
-6. [Plan 4 connected-build continuation addendum](./2026-07-15-connected-workspace-image.md) replaces Plan 4's offline-only image assumption for the MVP. It is subordinate to Plan 4, not a new phase or product plan. Its successfully built, digest-qualified ARM64 image is the approved prebuilt MVP input; exact live acceptance before Gate 4 remains pending.
+6. [Plan 4 connected-build continuation addendum](./2026-07-15-connected-workspace-image.md) replaces Plan 4's offline-only image assumption for the MVP. It is subordinate to Plan 4, not a new phase or product plan. Its exact public, digest-qualified ARM64 image passed the connected workspace image gate on 2026-07-18 and is the approved prebuilt MVP input.
 
 Current restart state, accepted branch heads, and unfinished work are recorded
 in [`docs/status/macos-mvp-handoff.md`](../../status/macos-mvp-handoff.md).
@@ -96,16 +96,16 @@ Concurrency rule: Plan 3 owns Apple adapter and lifecycle wiring; Plan 4 owns im
 
 **Gate 4:** A supported Mac passes real `up`, `shell`, `run`, `apply`, `down`, restart, reconciliation, and `destroy`; exact exit codes, terminal resize, signals, and no orphaned owned resources are verified.
 
-### Phase 2 granular status — 2026-07-17
+### Phase 2 granular status — 2026-07-18
 
 | Workstream | Status | Accepted branch evidence | Remaining acceptance work |
 |---|---|---|---|
 | Plan 3 Apple request, inspection, lifecycle, attach, and doctor | implemented and independently reviewed | `feature/apple-backend` through `109a7a3` | integrate with the connected image and MVP branch |
 | Plan 3 Gate 4 harness | implemented and independently approved | `dbf4235` | run the complete lifecycle against the real workspace image |
-| Plan 4 image/user/mise/Gascamp contracts | connected `linux/arm64` image built successfully and approved as the prebuilt MVP input; receipt revalidated against the local tag and descriptor | exact local reference and ignored OCI archive recorded in the canonical handoff | complete exact live acceptance; prior full-gate attempts failed before image smokes |
+| Plan 4 image/user/mise/Gascamp contracts | connected image gate passed on Apple Container 26.5.1 using the exact public GHCR `linux/arm64` index; anonymous registry access, all three image smokes, and current-run cleanup passed | `docs/evidence/connected-workspace-image.md` and `images/workspace/approved-image.txt` are authoritative | freeze the approved image into policy during Task 7 integration |
 | Offline bundle production and validation | implementation reviewed; publication and live evidence not completed | `809796e` through `9025c56` | deferred; `publication = "pending"` remains accurate |
 | Plan 4 provisioning/apply/setup behavior | Gascamp source selection exists; the rest requires fresh reconciliation before claiming task completion | provisioning history including `c99bbaf` | inventory Tasks 4–6 against the final image, implement gaps, and prove through fake and real backend suites |
-| Cross-plan integration | not completed | integration branch remains `917dac1` | merge reviewed Apple and provisioning work with conflict review and full verification |
+| Cross-plan integration | not completed | integration branch remains `917dac1`; accepted provisioning head was `131a01a` before the final evidence commit | continuation addendum Task 7: create/review the integration worktree from `917dac1`, integrate reviewed Apple and connected-image histories with conflict/interface review and no wholesale merge assumption, freeze the approved image into policy, and run platform-neutral verification |
 | Gate 4 | pending | harness only | exact real CLI lifecycle and residue evidence |
 
 ## Phase 3: Security, Packaging, and Release
@@ -151,19 +151,25 @@ When each gate passes, update this section in a dedicated commit with the commit
 | 4 — Real lifecycle | Apple integration test transcript | not-run | pending |
 | 5 — Release | clean-host and security reports | not-run | pending |
 
-## MVP Status Summary — 2026-07-17
+## MVP Status Summary — 2026-07-18
 
 - Completed and integrated: Phase 0 and Roadmap Gates 1–3.
 - Implemented but not integrated: reviewed Apple backend and safe Gate 4 harness.
 - In progress: Phase 2 workspace image and provisioning integration. The
-  successful connected build is the approved prebuilt MVP input while Apple
-  builder reliability is tracked separately in
+  exact public GHCR image passed the connected workspace image gate on Apple
+  Container 26.5.1. Anonymous public registry access, all three image smokes,
+  and current-run cleanup passed. The authoritative tracked records are
+  `docs/evidence/connected-workspace-image.md` and
+  `images/workspace/approved-image.txt`. Apple builder context-streaming
+  reliability is tracked separately in
   [`Liquescent-Development/gascan#1`](https://github.com/Liquescent-Development/gascan/issues/1).
-  Exact live image acceptance is still pending; full-gate attempts failed
-  before image smokes, and `images/workspace/approved-image.txt` remains
-  absent.
-- Deferred: publication and live proof of the three offline ARM64 bundles.
-- Not passed: Gate 4.
+  It does not invalidate the accepted prebuilt image.
+- Deferred and not MVP blockers: offline bundle publication and builder-VM
+  network isolation.
+- Not passed: Gate 4. The reviewed Apple backend and Gate 4 harness at
+  `dbf4235` are not integrated, and the full real CLI lifecycle has not run.
+  Next is continuation addendum Task 7 from `917dac1`, followed by the exact
+  live Gate 4 lifecycle run serially.
 - Not started as an integrated release phase: Phase 3 security, packaging, and
   clean-host release. End-user distribution must consume a prebuilt image;
   actual distribution packaging remains Gate 5 work.
