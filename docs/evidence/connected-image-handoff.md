@@ -76,8 +76,11 @@ On this integration worktree:
 - `cargo fmt --all -- --check`: PASS.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`: PASS.
 - The final main `cargo test --workspace` rerun passed 312 tests with 12
-  ignored. One earlier attempt hit a fake-runner race; it did not reproduce in
-  the complete rerun. This is not recorded as a product or live-runtime PASS.
+  ignored. One earlier attempt failed the fake-runner test
+  `exec_bridge_accepts_input_while_output_is_pending` with the error
+  `session input is closed`. The test then passed three isolated runs and the
+  complete rerun. The failure's cause was not established, and none of this is
+  recorded as a product or live-runtime PASS.
 - The final independent-review `gascan-e2e` run passed 58 platform-neutral
   tests with 2 live tests ignored. Focused `apple_lifecycle` and
   `apple_recovery` coverage each passed 14 platform-neutral tests with its
@@ -92,9 +95,10 @@ On this integration worktree:
   transcript without the former artificial throttle or data loss.
 - The final integration review initially found an unbounded signal PTY
   lifecycle and a signal-contract mismatch. The accepted fix bounds the
-  signal child lifecycle, propagates `SIGINT` through a real TTY, and includes
-  a prompt-level regression proving that typed `SIGTERM` text is rejected as
-  a substitute for delivering a signal.
+  signal child lifecycle and propagates supported `SIGINT` through a real TTY.
+  For the unsupported case, it sends a real OS `SIGTERM` to the TTY-attached
+  CLI and proves prompt return of the typed `unsupported_capability` error
+  without delivering `SIGTERM` to the guest.
 - `cargo test --manifest-path scripts/Cargo.toml`: PASS, 250 passed across 39
   suites, after reconciling merged test fixtures with the final validators and
   making their readiness and cache setup self-contained.

@@ -127,8 +127,10 @@ The harness is approved; Gate 4 itself is not passed.
   a 262,163-byte chatty-child transcript.
 - `306e0b6`: resolves the final integration review's signal-path findings with
   a bounded PTY lifecycle. The reviewed harness now exercises
-  contract-correct `SIGINT` propagation through a real TTY and rejects typed
-  `SIGTERM` text at the shell prompt as a signal substitute.
+  contract-correct `SIGINT` propagation through a real TTY. It also sends a
+  real OS `SIGTERM` to the TTY-attached CLI and proves that the CLI promptly
+  returns its typed `unsupported_capability` error without delivering the
+  unsupported signal to the guest.
 
 Task 7 is accepted at `306e0b6`. Its platform-neutral harness evidence does
 not pass Gate 4.

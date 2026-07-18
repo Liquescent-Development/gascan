@@ -108,7 +108,7 @@ Concurrency rule: Plan 3 owns Apple adapter and lifecycle wiring; Plan 4 owns im
 | Offline bundle production and validation | implementation reviewed; publication and live evidence not completed | `809796e` through `9025c56` | deferred; `publication = "pending"` remains accurate |
 | Plan 4 provisioning/apply/setup behavior | Gascamp source selection exists; the rest requires fresh reconciliation before claiming task completion | provisioning history including `c99bbaf` | inventory Tasks 4–6 against the final image, implement gaps, and prove through fake and real backend suites |
 | Cross-plan integration | Task 7 completed and independently reviewed on `feature/gate4-integration` | accepted head `306e0b6`; frozen base `917dac1`; Apple merge `d06d619`; connected-image merge `229c33a`; `docs/evidence/connected-image-handoff.md` | run the exact Gate 4 lifecycle serially |
-| Gate 4 | pending | the bounded PTY harness includes the exact 47x132 terminal-resize assertion, cleanup and output regressions, and contract-correct real-TTY `SIGINT` propagation with typed `SIGTERM` rejection, but has not run live | exact real CLI lifecycle, terminal-resize, signal, and residue evidence |
+| Gate 4 | pending | the bounded PTY harness includes the exact 47x132 terminal-resize assertion, cleanup and output regressions, supported real-TTY `SIGINT` propagation, and prompt `unsupported_capability` rejection of a real OS TTY `SIGTERM` without guest delivery, but has not run live | exact real CLI lifecycle, terminal-resize, signal, and residue evidence |
 
 ## Phase 3: Security, Packaging, and Release
 
@@ -174,8 +174,10 @@ When each gate passes, update this section in a dedicated commit with the commit
   completed its independently reviewed integration at `306e0b6`. Its bounded
   PTY state machine asserts the exact 47-row by 132-column resize and has
   cleanup and bounded output-drain regressions. Its reviewed signal path uses
-  a bounded PTY lifecycle, propagates `SIGINT` through a real TTY, and rejects
-  typed `SIGTERM` text as a signal substitute, as recorded in
+  a bounded PTY lifecycle and propagates supported `SIGINT` through a real
+  TTY. It sends a real OS `SIGTERM` to the TTY-attached CLI, promptly returns
+  the typed `unsupported_capability` error, and proves that the unsupported
+  signal does not reach the guest, as recorded in
   `docs/evidence/connected-image-handoff.md`. These are platform-neutral
   harness checks; the full real CLI lifecycle has not run. Next is the exact
   live Gate 4 lifecycle run serially.
