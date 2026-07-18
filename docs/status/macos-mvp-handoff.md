@@ -66,9 +66,9 @@ the polyglot toolchain.
 | Phase 0 / Gate 1 | Passed and integrated | `48a7a18` |
 | Phase 1 Apple feasibility / Gate 2 | Passed and integrated | `6bedef8`, `docs/feasibility/apple-container-report.md` |
 | Phase 1 core control plane / Gate 3 | Passed and integrated | `7c7d083`, integration record `917dac1` |
-| Phase 2 Apple backend implementation | Implemented and reviewed on feature branch; not integrated | head `dbf4235` |
-| Phase 2 workspace image | Connected ARM64 prebuilt image accepted by the live image gate on 2026-07-18 | authoritative tracked evidence and approval marker recorded below |
-| Gate 4 real lifecycle | Pending; harness approved but no complete real lifecycle evidence | harness `dbf4235` |
+| Phase 2 Apple backend implementation | Implemented, reviewed, and integrated for Gate 4 handoff | head `dbf4235`, merge `d06d619` |
+| Phase 2 workspace image | Connected ARM64 prebuilt image accepted and frozen into integrated policy | image head `f6ed3a5`, merge `229c33a`, `docs/evidence/connected-image-handoff.md` |
+| Gate 4 real lifecycle | Pending; integrated harness has no complete real lifecycle evidence | `docs/evidence/connected-image-handoff.md` |
 | Phase 3 security, packaging, release | Not started as an integrated phase | blocked by Gate 4 |
 | Gate 5 clean-host release | Pending | no evidence |
 
@@ -82,11 +82,12 @@ The recorded locations and accepted heads are:
 |---|---|---|---|
 | `.worktrees/macos-mvp` | `feature/macos-mvp` | `917dac1` | integration branch through Gate 3 |
 | `.worktrees/apple-backend` | `feature/apple-backend` | `dbf4235` | reviewed Plan 3 implementation and Gate 4 harness |
-| `.worktrees/provisioning` | `feature/provisioning` | `131a01a` before this evidence commit; this final evidence commit becomes the new accepted head | image, Gascamp, offline bundles, and image gates |
+| `.worktrees/provisioning` | `feature/provisioning` | `f6ed3a5` | accepted connected image, Gascamp, offline bundles, and image gates |
+| `.worktrees/gate4-integration` | `feature/gate4-integration` | reviewed-history head `229c33a`; policy/evidence reconciliation is the containing Task 7 commit | Gate 4 integration handoff from frozen base `917dac1` |
 
-Do not merge feature branches wholesale without reviewing their merge base and
-overlap. The provisioning branch contains a deliberately deferred offline
-Dockerfile path that must be converted for the connected MVP before Gate 4.
+The Task 7 feature merges were reviewed from their shared frozen base rather
+than accepted wholesale. The deliberately deferred offline path remains
+separate from the connected MVP input and is not a Gate 4 prerequisite.
 
 ## Accepted Implementation Milestones
 
@@ -107,6 +108,16 @@ Dockerfile path that must be converted for the connected MVP before Gate 4.
 - `dbf4235`: approved Gate 4 harness cleanup and teardown safety.
 
 The harness is approved; Gate 4 itself is not passed.
+
+### Task 7 integration
+
+- `d06d619`: explicit non-squashed merge of reviewed Apple head `dbf4235`.
+- `229c33a`: explicit non-squashed merge of accepted connected-image head
+  `f6ed3a5`, with the progress-ledger conflict resolved by preserving both
+  current histories.
+- The containing Task 7 reconciliation commit freezes
+  `images/workspace/approved-image.txt` into policy and records the reviewed
+  handoff in `docs/evidence/connected-image-handoff.md`.
 
 ### Provisioning and offline branch
 
@@ -154,11 +165,10 @@ default 2 GiB builder SIGKILL, success with 4 CPUs and 4 GiB, the reused-builder
 `demux channel full` / invalid tar header failure, and Docker/OCI-import
 investigation. Offline bundle publication and builder-VM network isolation
 remain deferred and are not MVP blockers.
-Roadmap Gate 4 remains pending because the reviewed Apple backend and Gate 4
-harness at `dbf4235` are not integrated and the full real CLI lifecycle has not
-run. Roadmap Gate 5 also remains pending and remains the definition of MVP
-completion. This evidence does not claim Phase 3, either gate, or MVP
-completion.
+Roadmap Gate 4 remains pending because the integrated Apple backend and Gate 4
+harness have no full real CLI lifecycle evidence. Roadmap Gate 5 also remains
+pending and remains the definition of MVP completion. This evidence does not
+claim Phase 3, either gate, or MVP completion.
 
 ## Verified Environmental Facts
 
@@ -185,19 +195,16 @@ the caller-owned verified context directly because Apple BuildKit omits the
 root-owned snapshot payload; the helper remains only deferred/offline
 hardening.
 
-1. Execute continuation addendum Task 7: create and review the integration
-   worktree from `917dac1`; integrate the reviewed Apple and connected-image
-   histories with conflict and interface review, without assuming a wholesale
-   merge; freeze the approved image into policy; and run platform-neutral
-   verification.
-2. Then run the exact Gate 4 real lifecycle serially: `up`, `shell`, `run`, `apply`,
+1. Run the exact Gate 4 real lifecycle serially from
+   `feature/gate4-integration` as recorded in
+   `docs/evidence/connected-image-handoff.md`: `up`, `shell`, `run`, `apply`,
    `down`, restart, reconciliation, and `destroy`, including PTY, signals,
    exact exits, and residue checks.
-3. Continue investigating Apple builder reliability separately under issue #1;
+2. Continue investigating Apple builder reliability separately under issue #1;
    do not make end-user distribution rebuild the image.
-4. Complete Plan 4 security acceptance, packaging, installation, and clean-host
+3. Complete Plan 4 security acceptance, packaging, installation, and clean-host
    release work.
-5. Run and record Gate 5.
+4. Run and record Gate 5.
 
 ## Fresh-Session Restart Procedure
 
@@ -209,6 +216,7 @@ git worktree list
 git -C .worktrees/macos-mvp log -1 --oneline
 git -C .worktrees/apple-backend log -1 --oneline
 git -C .worktrees/provisioning log -1 --oneline
+git -C .worktrees/gate4-integration log -1 --oneline
 ```
 
 Then read, in order:
@@ -219,10 +227,10 @@ Then read, in order:
 4. `docs/superpowers/plans/2026-07-15-connected-workspace-image.md`;
 5. the relevant task plan before modifying its branch.
 
-If the fresh session is asked to continue implementation, begin continuation
-addendum Task 7 with the integration worktree and review sequence recorded
-above. If the fresh session is asked only for status, report from this document
-and do not dispatch implementation agents.
+If the fresh session is asked to continue implementation, use the completed
+Task 7 handoff and run Gate 4 serially only when explicitly authorized. If the
+fresh session is asked only for status, report from this document and do not
+run live gates.
 
 Before claiming any gate, run the roadmap's program-level verification and the
 gate-specific live suite. Never infer Gate 4 from harness tests or Gate 5 from

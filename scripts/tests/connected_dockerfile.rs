@@ -55,7 +55,7 @@ fn effective_env_value<'a>(dockerfile: &'a str, variable: &str) -> Option<&'a st
         .flat_map(str::split_whitespace)
         .filter_map(|assignment| assignment.split_once('='))
         .filter_map(|(name, value)| (name == variable).then_some(value))
-        .last()
+        .next_back()
 }
 
 fn assert_persistent_rustup_homes(dockerfile: &str) -> Result<(), &'static str> {

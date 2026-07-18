@@ -165,8 +165,8 @@ esac
         .env("CHILD_PID", &child_pid)
         .env("MUTATED", fixture.path().join("mutated"))
         .spawn().unwrap();
-    for _ in 0..100 {
-        if child_pid.exists() { break; }
+    let readiness_deadline = Instant::now() + Duration::from_secs(5);
+    while !child_pid.exists() && Instant::now() < readiness_deadline {
         thread::sleep(Duration::from_millis(10));
     }
     assert!(child_pid.exists(), "fake CLI did not start");
@@ -330,7 +330,10 @@ esac
         .env("IMAGE_DELETED", fixture.path().join("image-deleted"))
         .env("CONTAINER_DELETED", fixture.path().join("container-deleted"))
         .spawn().unwrap();
-    for _ in 0..100 { if child_pid.exists() { break; } thread::sleep(Duration::from_millis(10)); }
+    let readiness_deadline = Instant::now() + Duration::from_secs(5);
+    while !child_pid.exists() && Instant::now() < readiness_deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
     assert!(child_pid.exists(), "{mode} fake did not block");
     let fake_pid = fs::read_to_string(&child_pid).unwrap();
     let started = Instant::now();

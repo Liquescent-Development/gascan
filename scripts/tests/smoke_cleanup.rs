@@ -19,7 +19,7 @@ case "$1" in
     ;;
   inspect)
     if [ "$MODE" = collision ]; then owner=ffeeddccbbaa99887766554433221100; else owner="$OWNER"; fi
-    printf '[{"configuration":{"id":"%s","name":"%s","labels":{"dev.gascan.test":"true","dev.gascan.test.owner":"%s"}}}]\n' "$NAME" "$NAME" "$owner"
+    printf '[{"id":"%s","configuration":{"id":"%s","name":"%s","labels":{"dev.gascan.test":"true","dev.gascan.test.owner":"%s"}}}]\n' "$NAME" "$NAME" "$NAME" "$owner"
     ;;
   start)
     [ "$MODE" != start-fails ]

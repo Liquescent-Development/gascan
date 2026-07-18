@@ -408,10 +408,24 @@ fn persistent_direct_context_mutation_during_build_blocks_receipt_publication() 
     let bin = temp.path().join("bin");
     let artifacts = repo.join(".artifacts");
     let context = artifacts.join("connected-workspace-context");
+    let source_artifacts = temp.path().join("source-artifacts");
     fs::create_dir_all(repo.join("scripts")).unwrap();
     fs::create_dir_all(repo.join("images/workspace")).unwrap();
     fs::create_dir_all(&artifacts).unwrap();
     fs::create_dir(&bin).unwrap();
+    fs::create_dir_all(source_artifacts.join("playwright-chromium-reviewed/chrome-linux"))
+        .unwrap();
+    fs::write(source_artifacts.join("mise-linux-arm64"), "mise fixture\n").unwrap();
+    fs::write(
+        source_artifacts.join("expected-tool-versions.json"),
+        "{}\n",
+    )
+    .unwrap();
+    fs::write(
+        source_artifacts.join("playwright-chromium-reviewed/chrome-linux/chrome"),
+        "chromium fixture\n",
+    )
+    .unwrap();
     fs::copy(
         root().join("scripts/build-connected-workspace-image.sh"),
         repo.join("scripts/build-connected-workspace-image.sh"),
@@ -426,7 +440,7 @@ fn persistent_direct_context_mutation_during_build_blocks_receipt_publication() 
         .args(["--mode", "connected", "--replace"])
         .arg(root())
         .arg(root().join("images/workspace/versions.lock"))
-        .arg(root().join(".artifacts"))
+        .arg(&source_artifacts)
         .arg(&context)
         .output()
         .unwrap();

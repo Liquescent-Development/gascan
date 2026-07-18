@@ -102,12 +102,12 @@ Concurrency rule: Plan 3 owns Apple adapter and lifecycle wiring; Plan 4 owns im
 
 | Workstream | Status | Accepted branch evidence | Remaining acceptance work |
 |---|---|---|---|
-| Plan 3 Apple request, inspection, lifecycle, attach, and doctor | implemented and independently reviewed | `feature/apple-backend` through `109a7a3` | integrate with the connected image and MVP branch |
-| Plan 3 Gate 4 harness | implemented and independently approved | `dbf4235` | run the complete lifecycle against the real workspace image |
-| Plan 4 image/user/mise/Gascamp contracts | connected image gate passed on Apple Container 26.5.1 using the exact public GHCR `linux/arm64` index; anonymous registry access, all three image smokes, and current-run cleanup passed | `docs/evidence/connected-workspace-image.md` and `images/workspace/approved-image.txt` are authoritative | freeze the approved image into policy during Task 7 integration |
+| Plan 3 Apple request, inspection, lifecycle, attach, and doctor | implemented, independently reviewed, and integrated | Apple head `dbf4235`, merge `d06d619` on `feature/gate4-integration` | run the serial Gate 4 lifecycle |
+| Plan 3 Gate 4 harness | implemented, independently approved, and integrated | `dbf4235`, merge `d06d619` | run the complete lifecycle against the real workspace image |
+| Plan 4 image/user/mise/Gascamp contracts | connected image gate passed on Apple Container 26.5.1 using the exact public GHCR `linux/arm64` index; approved marker is frozen into policy | connected head `f6ed3a5`, merge `229c33a`; `docs/evidence/connected-workspace-image.md` and `images/workspace/approved-image.txt` are authoritative | consume the frozen image in the serial Gate 4 run |
 | Offline bundle production and validation | implementation reviewed; publication and live evidence not completed | `809796e` through `9025c56` | deferred; `publication = "pending"` remains accurate |
 | Plan 4 provisioning/apply/setup behavior | Gascamp source selection exists; the rest requires fresh reconciliation before claiming task completion | provisioning history including `c99bbaf` | inventory Tasks 4–6 against the final image, implement gaps, and prove through fake and real backend suites |
-| Cross-plan integration | not completed | integration branch remains `917dac1`; accepted provisioning head was `131a01a` before the final evidence commit | continuation addendum Task 7: create/review the integration worktree from `917dac1`, integrate reviewed Apple and connected-image histories with conflict/interface review and no wholesale merge assumption, freeze the approved image into policy, and run platform-neutral verification |
+| Cross-plan integration | Task 7 completed on `feature/gate4-integration` | frozen base `917dac1`; Apple merge `d06d619`; connected-image merge `229c33a`; `docs/evidence/connected-image-handoff.md` | run the exact Gate 4 lifecycle serially |
 | Gate 4 | pending | harness only | exact real CLI lifecycle and residue evidence |
 
 ## Phase 3: Security, Packaging, and Release
@@ -156,8 +156,10 @@ When each gate passes, update this section in a dedicated commit with the commit
 ## MVP Status Summary — 2026-07-18
 
 - Completed and integrated: Phase 0 and Roadmap Gates 1–3.
-- Implemented but not integrated: reviewed Apple backend and safe Gate 4 harness.
-- In progress: Phase 2 workspace image and provisioning integration. The
+- Integrated for Gate 4 handoff: the reviewed Apple backend and safe Gate 4
+  harness at `dbf4235` via merge `d06d619`, plus the accepted connected-image
+  history at `f6ed3a5` via merge `229c33a`.
+- In progress: Phase 2 real lifecycle and provisioning acceptance. The
   exact public GHCR image passed the connected workspace image gate on Apple
   Container 26.5.1. Anonymous public registry access, all three image smokes,
   and current-run cleanup passed. The authoritative tracked records are
@@ -168,10 +170,10 @@ When each gate passes, update this section in a dedicated commit with the commit
   It does not invalidate the accepted prebuilt image.
 - Deferred and not MVP blockers: offline bundle publication and builder-VM
   network isolation.
-- Not passed: Gate 4. The reviewed Apple backend and Gate 4 harness at
-  `dbf4235` are not integrated, and the full real CLI lifecycle has not run.
-  Next is continuation addendum Task 7 from `917dac1`, followed by the exact
-  live Gate 4 lifecycle run serially.
+- Not passed: Gate 4. Task 7 froze the exact approved marker into policy and
+  recorded platform-neutral verification in
+  `docs/evidence/connected-image-handoff.md`, but the full real CLI lifecycle
+  has not run. Next is the exact live Gate 4 lifecycle run serially.
 - Not started as an integrated release phase: Phase 3 security, packaging, and
   clean-host release. End-user distribution must consume a prebuilt image;
   actual distribution packaging remains Gate 5 work.

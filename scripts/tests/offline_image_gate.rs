@@ -86,13 +86,13 @@ set -eu
 printf 'container:%s\n' "$*" >>"$CALLS"
 if [ "$1 $2" = "image inspect" ]; then
   [ -f "$GASCAN_GATE_ARTIFACTS/.base-present" ] || exit 1
-  printf '[{"configuration":{"descriptor":{"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"variants":[{"platform":{"os":"linux","architecture":"arm64"},"digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}]}]\n'
+  printf '[{"configuration":{"descriptor":{"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"variants":[{"platform":{"os":"linux","architecture":"arm64"},"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}]\n'
   exit 0
 fi
 case "$1" in
   create) touch "$CREATED"; rm -f "$DELETED" ;;
   list) printf '[]\n' ;;
-  inspect) [ -f "$CREATED" ] && [ ! -f "$DELETED" ] || exit 1; printf '[{"configuration":{"id":"%s","name":"%s","labels":{"dev.gascan.test":"true","dev.gascan.test.owner":"%s"}}}]\n' "$NAME" "$NAME" "$OWNER" ;;
+  inspect) [ -f "$CREATED" ] && [ ! -f "$DELETED" ] || exit 1; printf '[{"id":"%s","configuration":{"id":"%s","name":"%s","labels":{"dev.gascan.test":"true","dev.gascan.test.owner":"%s"}}}]\n' "$NAME" "$NAME" "$NAME" "$OWNER" ;;
   delete) touch "$DELETED"; rm -f "$CREATED" ;;
 esac
 "#,

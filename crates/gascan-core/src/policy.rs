@@ -19,7 +19,7 @@ pub const MAX_DISK_BYTES: u64 = 512 * 1024_u64.pow(3);
 pub const DEFAULT_PROCESS_COUNT: u32 = 1_024;
 
 const MANAGED_BY: &str = "gascan";
-const WORKSPACE_IMAGE: &str = "ghcr.io/gascan/workspace@sha256:7c45e19c71c72fdacf28ef794c6f4eaf3d14fc5216e82c5a7230030996b8d59b";
+const WORKSPACE_IMAGE: &str = include_str!("../../../images/workspace/approved-image.txt");
 
 pub struct PolicyCompiler;
 

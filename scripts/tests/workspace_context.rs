@@ -345,7 +345,7 @@ fn symlink_in_reviewed_input_is_rejected() {
 fn scripts_separate_network_prefetch_from_cache_only_build() {
     let root = repository_root();
     let prefetch = fs::read_to_string(root.join("scripts/prefetch-workspace-image.sh")).unwrap();
-    let build = fs::read_to_string(root.join("scripts/build-workspace-image.sh")).unwrap();
+    let build = fs::read_to_string(root.join("scripts/build-offline-workspace-image.sh")).unwrap();
     for required in [
         "fetch-image-artifact",
         "container image pull \"$base_image\"",

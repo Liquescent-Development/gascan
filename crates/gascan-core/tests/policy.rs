@@ -35,6 +35,11 @@ fn spec(source: &str) -> (tempfile::TempDir, SandboxSpec) {
     (temp, spec)
 }
 
+fn compile_workspace_request() -> gascan_core::runtime::CreateRequest {
+    let (_temp, spec) = spec("version = 1\nnetwork = 'networked'\n");
+    PolicyCompiler::compile(spec, &capabilities()).expect("compile workspace request")
+}
+
 #[test]
 fn offline_requires_proven_isolation_before_compilation() {
     let (_temp, spec) = spec("version = 1\nnetwork = 'offline'\n");
@@ -183,6 +188,16 @@ fn image_reference_is_an_immutable_digest() {
     assert_eq!(digest.len(), 64);
     assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
     assert!(!request.image().contains(":latest"));
+}
+
+#[test]
+fn image_reference_is_the_gate_approved_connected_image() {
+    let request = compile_workspace_request();
+    let approved = include_str!("../../../images/workspace/approved-image.txt");
+    assert_eq!(request.image(), approved);
+    assert!(request.image().contains("@sha256:"));
+    assert_eq!(request.image().matches('@').count(), 1);
+    assert!(!request.image().chars().any(|ch| ch.is_ascii_whitespace()));
 }
 
 #[test]
