@@ -48,6 +48,38 @@ fn assert_correct_otp_release_term_check(script: &str) -> Result<(), &'static st
     Ok(())
 }
 
+fn effective_env_value<'a>(dockerfile: &'a str, variable: &str) -> Option<&'a str> {
+    dockerfile
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("ENV "))
+        .flat_map(str::split_whitespace)
+        .filter_map(|assignment| assignment.split_once('='))
+        .filter_map(|(name, value)| (name == variable).then_some(value))
+        .last()
+}
+
+fn assert_persistent_rustup_homes(dockerfile: &str) -> Result<(), &'static str> {
+    let first_install = dockerfile
+        .find("mise install --yes")
+        .ok_or("missing mise install")?;
+    for (variable, value) in [
+        ("CARGO_HOME", "/opt/gascan/mise/cargo"),
+        ("RUSTUP_HOME", "/opt/gascan/mise/rustup"),
+    ] {
+        let declaration = format!("ENV {variable}={value}");
+        let position = dockerfile
+            .find(&declaration)
+            .ok_or("missing persistent Rustup home")?;
+        if position >= first_install {
+            return Err("Rustup homes must be set before mise installs tools");
+        }
+        if effective_env_value(dockerfile, variable) != Some(value) {
+            return Err("effective Rustup homes must remain persistent");
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn dockerfile_assembles_the_connected_workspace_base() {
     let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
@@ -98,14 +130,19 @@ fn dockerfile_creates_traversable_mise_config_directory_before_copying_config() 
 #[test]
 fn dockerfile_sets_persistent_rustup_homes_before_mise_installs_tools() {
     let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
-    let cargo_home = dockerfile
-        .find("ENV CARGO_HOME=/opt/gascan/mise/cargo")
-        .expect("missing persistent CARGO_HOME");
-    let rustup_home = dockerfile
-        .find("ENV RUSTUP_HOME=/opt/gascan/mise/rustup")
-        .expect("missing persistent RUSTUP_HOME");
-    let first_install = dockerfile.find("mise install --yes").unwrap();
-    assert!(cargo_home < first_install && rustup_home < first_install);
+    assert_persistent_rustup_homes(&dockerfile).unwrap();
+}
+
+#[test]
+fn rustup_home_contract_rejects_later_overrides() {
+    let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
+    for later_override in ["ENV CARGO_HOME=/tmp/cargo", "ENV RUSTUP_HOME=/tmp/rustup"] {
+        let mutated = format!("{dockerfile}\n{later_override}\n");
+        assert!(
+            assert_persistent_rustup_homes(&mutated).is_err(),
+            "accepted later override: {later_override}"
+        );
+    }
 }
 
 fn normalize_mise_ls(input: &str) -> std::process::Output {
