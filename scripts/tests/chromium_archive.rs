@@ -70,3 +70,41 @@ fn traversal_absolute_symlink_duplicate_and_wrong_layout_are_rejected() {
         assert!(fs::read_dir(directory.path()).unwrap().next().is_none());
     }
 }
+
+#[test]
+fn refresh_atomically_replaces_valid_tree_and_preserves_it_on_failure() {
+    let output = tempfile::tempdir().unwrap();
+    let (first_temp, first) = archive(&[("chrome-linux/chrome", Entry::File(b"first"))]);
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_extract-reviewed-chromium"))
+            .args([first.as_os_str(), output.path().as_os_str()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (second_temp, second) = archive(&[("chrome-linux/chrome", Entry::File(b"second"))]);
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_extract-reviewed-chromium"))
+            .args([second.as_os_str(), output.path().as_os_str()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        fs::read(output.path().join("chrome-linux/chrome")).unwrap(),
+        b"second"
+    );
+    let (bad_temp, bad) = archive(&[("../escape", Entry::File(b"bad"))]);
+    assert!(
+        !Command::new(env!("CARGO_BIN_EXE_extract-reviewed-chromium"))
+            .args([bad.as_os_str(), output.path().as_os_str()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        fs::read(output.path().join("chrome-linux/chrome")).unwrap(),
+        b"second"
+    );
+    drop((first_temp, second_temp, bad_temp));
+}

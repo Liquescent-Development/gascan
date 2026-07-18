@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+exec /usr/local/libexec/gascan/migrate-workspace-identity-core \
+    /etc/passwd /etc/group /home \
+    /usr/sbin/usermod /usr/sbin/groupmod /usr/bin/stat

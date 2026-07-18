@@ -6,6 +6,7 @@ gascamp_revision = "f6b248c5926240856dbea83d1d2c5c90ea1c1456"
 
 [tools]
 elixir = "latest"
+erlang = "29.0.3"
 go = "1"
 java = "lts"
 node = "lts"

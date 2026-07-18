@@ -1,6 +1,13 @@
 base_image = "ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab"
+workspace_build_mode = "connected"
 ubuntu_snapshot = "2026-07-13T00:00:00Z"
 workspace_tag = "gascan-workspace:d4964500a3295a33"
+
+[workspace_bundles]
+media_type = "application/vnd.gascan.workspace-bundle.v1+tar.zstd"
+platform = "linux/arm64"
+# Task 1 defines validation before Tasks 2-4 publish immutable release assets.
+publication = "pending"
 
 [mise]
 version = "2026.5.0"
@@ -17,6 +24,7 @@ revision = "f6b248c5926240856dbea83d1d2c5c90ea1c1456"
 
 [tools]
 elixir = "1.20.2-otp-29"
+erlang = "29.0.3"
 go = "1.26.5"
 java = "25.0.2"
 node = "24.18.0"

@@ -3,6 +3,7 @@
 
 pub mod doctor;
 pub mod fake_runtime;
+pub mod gascamp;
 pub mod manifest;
 pub mod policy;
 pub mod runtime;

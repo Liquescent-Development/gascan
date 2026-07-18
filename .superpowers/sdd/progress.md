@@ -4,3 +4,8 @@ Task 3: complete (commits e3a2291..ce6b5b0, review clean)
 Task 4: complete (commits ce6b5b0..745c516, review approved; minor: unrelated follow-logs channel capacity 1->2 for final review)
 Task 5: complete (commits 745c516..109a7a3, review clean; live production doctor 17/17)
 Task 6: implementation and safety review fixes complete; Gate 4 remains blocked by locked-image GHCR 401
+Connected Task 1: complete (commits 54ed806..44bb3b2, review clean; live secret isolation probe passed)
+Connected Task 2: complete (commits 75c1f2c..1878744, review clean)
+Connected Task 3: complete (commits 883f6fe..7a429cb, review clean)
+Connected Task 4: complete (commits f6f7856..b03add2, review clean; structural credential boundary only)
+Connected Task 5: complete (commits 2bd64cd..61fd8d9, review clean)

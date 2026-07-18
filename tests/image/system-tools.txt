@@ -2,9 +2,11 @@ autoconf
 bison
 build-essential
 ca-certificates
+curl
 fonts-liberation
 gh
 git
+jq
 libasound2t64
 libatk-bridge2.0-0
 libatk1.0-0
@@ -33,9 +35,10 @@ libxrandr2
 libyaml-dev
 patch
 pkg-config
-jq
+python3
 sudo
 tini
 unzip
 xz-utils
 zlib1g-dev
+zstd

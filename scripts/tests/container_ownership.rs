@@ -25,7 +25,7 @@ fn exact_name_and_owner_label_are_required() {
     let name = "gascan-image-user-test-owner";
     let token = "00112233445566778899aabbccddeeff";
     let exact = format!(
-        r#"[{{"configuration":{{"id":"{name}","name":"{name}","labels":{{"dev.gascan.test":"true","dev.gascan.test.owner":"{token}"}}}}}}]"#
+        r#"[{{"id":"{name}","configuration":{{"id":"{name}","labels":{{"dev.gascan.test":"true","dev.gascan.test.owner":"{token}"}}}}}}]"#
     );
     assert!(validate(&exact, name, token).status.success());
 
@@ -37,4 +37,39 @@ fn exact_name_and_owner_label_are_required() {
     ] {
         assert!(!validate(&malformed, name, token).status.success());
     }
+}
+
+#[test]
+fn native_apple_identity_shape_is_accepted_without_configuration_name() {
+    let name = "gascan-image-user-test-owner";
+    let token = "00112233445566778899aabbccddeeff";
+    let native = format!(
+        r#"[{{"id":"{name}","configuration":{{"id":"{name}","labels":{{"dev.gascan.test":"true","dev.gascan.test.owner":"{token}"}}}}}}]"#
+    );
+    assert!(validate(&native, name, token).status.success());
+    assert!(!validate(
+        &native.replacen(
+            &format!(r#""id":"{name}""#),
+            r#""id":"somebody-elses-container""#,
+            1,
+        ),
+        name,
+        token
+    )
+    .status
+    .success());
+    let configuration_only_mismatch = native
+        .replacen(
+            &format!(r#""id":"{name}""#),
+            r#""id":"somebody-elses-container""#,
+            2,
+        )
+        .replacen(
+            r#""id":"somebody-elses-container""#,
+            &format!(r#""id":"{name}""#),
+            1,
+        );
+    assert!(!validate(&configuration_only_mismatch, name, token)
+        .status
+        .success());
 }
