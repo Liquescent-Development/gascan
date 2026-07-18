@@ -145,12 +145,16 @@ not pass Gate 4.
   minimal context preparation with offline mode preserved.
 - `7a429cb`: approved connected Ubuntu and mise polyglot base assembly with
   exact reviewed package input and preserved final-user contracts.
-- `b03add2`: reviewed secret-mounted Gascamp builder from the now-corrected
-  private-repository assumption; must be simplified to anonymous public fetch.
-- `61fd8d9`: reviewed connected orchestrator and receipt validation. Its
-  secret/wrapper path is now unnecessary; retain its structured inspection,
-  cleanup, and receipt protections. The helper and offline snapshot remain
-  deferred hardening rather than part of the connected MVP path.
+- `b03add2` and `61fd8d9`: historical reviewed implementations based on the
+  since-corrected private-repository assumption. Their Gascamp secret and
+  wrapper paths are superseded; `61fd8d9`'s structured inspection, cleanup,
+  and receipt protections remain in the accepted implementation. The helper
+  and offline snapshot remain deferred hardening rather than part of the
+  connected MVP path.
+- `5ae9567`: records the corrected public Gascamp source boundary.
+- `321f87f`: completes the accepted simplification to an anonymous fetch of
+  the exact pinned public Gascamp revision, without a token, credential file,
+  credential helper, authentication header, or BuildKit secret.
 - `30dd514`: independently approved platform-neutral connected image gate
   harness with transactional publication, bounded ownership-checked cleanup,
   real-smoke fake-controller coverage, and authoritative residue inventory.
