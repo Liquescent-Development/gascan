@@ -558,10 +558,20 @@ fn wait_with_output_bounded(
 }
 
 fn run_pty_resize_command(
+    command: Command,
+    ready_marker: &[u8],
+    rows: u16,
+    cols: u16,
+) -> TestResult<PtySignalOutput> {
+    run_pty_resize_command_after_spawn(command, ready_marker, rows, cols, |_| Ok(()))
+}
+
+fn run_pty_resize_command_after_spawn(
     mut command: Command,
     ready_marker: &[u8],
     rows: u16,
     cols: u16,
+    after_spawn: impl FnOnce(u32) -> TestResult,
 ) -> TestResult<PtySignalOutput> {
     let pty = rustix_openpty::openpty(
         None,
@@ -586,38 +596,43 @@ fn run_pty_resize_command(
         .stdout(stdout)
         .stderr(Stdio::piped())
         .spawn()?;
-    drop(pty.user);
-    let readiness_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !captured
-        .windows(ready_marker.len())
-        .any(|window| window == ready_marker)
-    {
-        read_available_pty(&mut controller, &mut captured)?;
-        if child.try_wait()?.is_some() {
-            return Err("PTY child exited before resize readiness".into());
+    let resize_result = (|| -> TestResult {
+        after_spawn(child.id())?;
+        drop(pty.user);
+        let readiness_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !captured
+            .windows(ready_marker.len())
+            .any(|window| window == ready_marker)
+        {
+            read_available_pty(&mut controller, &mut captured)?;
+            if child.try_wait()?.is_some() {
+                return Err("PTY child exited before resize readiness".into());
+            }
+            if std::time::Instant::now() >= readiness_deadline {
+                return Err("PTY child did not report resize readiness".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        if std::time::Instant::now() >= readiness_deadline {
-            child.kill()?;
-            let _ = child.wait();
-            return Err("PTY child did not report resize readiness".into());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        rustix_openpty::rustix::termios::tcsetwinsize(
+            &controller,
+            rustix_openpty::rustix::termios::Winsize {
+                ws_row: rows,
+                ws_col: cols,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            },
+        )?;
+        let pid = rustix_openpty::rustix::process::Pid::from_raw(i32::try_from(child.id())?)
+            .ok_or("invalid CLI pid")?;
+        rustix_openpty::rustix::process::kill_process(
+            pid,
+            rustix_openpty::rustix::process::Signal::WINCH,
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = resize_result {
+        return return_after_child_cleanup(&mut child, error);
     }
-    rustix_openpty::rustix::termios::tcsetwinsize(
-        &controller,
-        rustix_openpty::rustix::termios::Winsize {
-            ws_row: rows,
-            ws_col: cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        },
-    )?;
-    let pid = rustix_openpty::rustix::process::Pid::from_raw(i32::try_from(child.id())?)
-        .ok_or("invalid CLI pid")?;
-    rustix_openpty::rustix::process::kill_process(
-        pid,
-        rustix_openpty::rustix::process::Signal::WINCH,
-    )?;
     drop(pty.controller);
     let output = wait_with_output_bounded(child, std::time::Duration::from_secs(10))?;
     while read_available_pty(&mut controller, &mut captured)? {}
@@ -626,6 +641,35 @@ fn run_pty_resize_command(
         stdout: captured,
         stderr: output.stderr,
     })
+}
+
+fn return_after_child_cleanup<T>(
+    child: &mut std::process::Child,
+    original: Box<dyn std::error::Error>,
+) -> TestResult<T> {
+    match kill_and_reap_child(child) {
+        Ok(()) => Err(original),
+        Err(cleanup) => Err(format!(
+            "{original}; additionally failed to kill and reap PTY child: {cleanup}"
+        )
+        .into()),
+    }
+}
+
+fn kill_and_reap_child(child: &mut std::process::Child) -> TestResult {
+    if let Ok(Some(_)) = child.try_wait() {
+        return Ok(());
+    }
+    let kill_error = child.kill().err();
+    match child.wait() {
+        Ok(_) => Ok(()),
+        Err(wait_error) => {
+            let kill_context = kill_error
+                .map(|error| format!("kill failed: {error}; "))
+                .unwrap_or_default();
+            Err(format!("{kill_context}wait failed: {wait_error}").into())
+        }
+    }
 }
 
 fn read_available_pty(
@@ -741,6 +785,28 @@ mod tests {
                 .windows(b"47 132".len())
                 .any(|window| window == b"47 132")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn pty_resize_driver_reaps_child_after_post_spawn_failure() -> TestResult {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 30"]);
+        let spawned_pid = std::cell::Cell::new(None);
+
+        let result =
+            run_pty_resize_command_after_spawn(command, b"GASCAN_RESIZE_READY", 47, 132, |pid| {
+                spawned_pid.set(Some(pid));
+                Err("forced post-spawn failure".into())
+            });
+        let error = match result {
+            Ok(_) => return Err("forced post-spawn failure was not returned".into()),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("forced post-spawn failure"));
+        let pid = spawned_pid.get().ok_or("post-spawn hook did not run")?;
+        assert!(process_field(pid, "stat=").is_err());
         Ok(())
     }
 
