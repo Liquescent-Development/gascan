@@ -621,7 +621,7 @@ fn run_pty_resize_command_with_actions(
         let execution_deadline = started + std::time::Duration::from_secs(15);
         let mut resized = false;
         let status = loop {
-            read_available_pty(&mut controller, &mut captured)?;
+            let read_bytes = read_available_pty_batch(&mut controller, &mut captured, false)?;
 
             if let Some(status) = poll(&mut child)? {
                 if !resized {
@@ -661,7 +661,9 @@ fn run_pty_resize_command_with_actions(
             if now >= execution_deadline {
                 return Err("PTY child did not exit after resize".into());
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            if read_bytes == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
         };
 
         drain_pty_after_exit(&mut controller, &mut captured)?;
@@ -738,7 +740,7 @@ fn drain_pty_after_exit(
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
     let mut quiet_deadline = std::time::Instant::now() + std::time::Duration::from_millis(30);
     loop {
-        let read_any = read_available_pty(controller, captured)?;
+        let read_any = read_available_pty_batch(controller, captured, true)? > 0;
         let now = std::time::Instant::now();
         if read_any {
             quiet_deadline = now + std::time::Duration::from_millis(30);
@@ -746,25 +748,44 @@ fn drain_pty_after_exit(
         if now >= deadline || now >= quiet_deadline {
             return Ok(());
         }
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        if !read_any {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 }
 
-fn read_available_pty(
+fn read_available_pty_batch(
     controller: &mut std::fs::File,
     captured: &mut Vec<u8>,
-) -> std::io::Result<bool> {
-    let mut chunk = [0_u8; 256];
-    match controller.read(&mut chunk) {
-        Ok(0) => Ok(false),
-        Ok(count) => {
-            captured.extend_from_slice(&chunk[..count]);
-            Ok(true)
+    discard_overflow: bool,
+) -> std::io::Result<usize> {
+    const READ_BUFFER_BYTES: usize = 16 * 1024;
+    const READ_BUDGET_BYTES: usize = 256 * 1024;
+    const CAPTURE_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+
+    let mut chunk = [0_u8; READ_BUFFER_BYTES];
+    let mut batch_bytes = 0;
+    while batch_bytes < READ_BUDGET_BYTES {
+        let capture_remaining = CAPTURE_LIMIT_BYTES.saturating_sub(captured.len());
+        if capture_remaining == 0 && !discard_overflow {
+            return Err(std::io::Error::other(format!(
+                "PTY output exceeded {CAPTURE_LIMIT_BYTES} byte capture limit"
+            )));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
-        Err(error) if error.raw_os_error() == Some(5) => Ok(false),
-        Err(error) => Err(error),
+        let read_limit = chunk.len().min(READ_BUDGET_BYTES - batch_bytes);
+        match controller.read(&mut chunk[..read_limit]) {
+            Ok(0) => break,
+            Ok(count) => {
+                let captured_count = count.min(capture_remaining);
+                captured.extend_from_slice(&chunk[..captured_count]);
+                batch_bytes += count;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) if error.raw_os_error() == Some(5) => break,
+            Err(error) => return Err(error),
+        }
     }
+    Ok(batch_bytes)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -803,6 +824,143 @@ fn resource_presence(name: &str, id: &str) -> TestResult<ResourcePresence> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct OwnedChildFixture {
+        pid: rustix_openpty::rustix::process::Pid,
+        cleaned: bool,
+    }
+
+    impl OwnedChildFixture {
+        fn new(raw_pid: u32) -> TestResult<Self> {
+            let pid = rustix_openpty::rustix::process::Pid::from_raw(i32::try_from(raw_pid)?)
+                .ok_or("invalid fixture pid")?;
+            Ok(Self {
+                pid,
+                cleaned: false,
+            })
+        }
+
+        fn assert_owned_and_running(&self) -> TestResult {
+            match rustix_openpty::rustix::process::waitpid(
+                Some(self.pid),
+                rustix_openpty::rustix::process::WaitOptions::NOHANG,
+            )? {
+                None => Ok(()),
+                Some(_) => Err("fixture child exited before explicit cleanup".into()),
+            }
+        }
+
+        fn kill_and_reap(&mut self) -> TestResult {
+            if self.cleaned {
+                return Ok(());
+            }
+            self.assert_owned_and_running()?;
+            rustix_openpty::rustix::process::kill_process(
+                self.pid,
+                rustix_openpty::rustix::process::Signal::KILL,
+            )?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            loop {
+                if rustix_openpty::rustix::process::waitpid(
+                    Some(self.pid),
+                    rustix_openpty::rustix::process::WaitOptions::NOHANG,
+                )?
+                .is_some()
+                {
+                    self.cleaned = true;
+                    return Ok(());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err("fixture child was not reaped before cleanup deadline".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for OwnedChildFixture {
+        fn drop(&mut self) {
+            let _ = self.kill_and_reap();
+        }
+    }
+
+    struct IdentifiedProcessFixture {
+        pid: rustix_openpty::rustix::process::Pid,
+        identity: String,
+        cleaned: bool,
+    }
+
+    impl IdentifiedProcessFixture {
+        fn new(raw_pid: u32, identity: String) -> TestResult<Self> {
+            let pid = rustix_openpty::rustix::process::Pid::from_raw(i32::try_from(raw_pid)?)
+                .ok_or("invalid descendant fixture pid")?;
+            let fixture = Self {
+                pid,
+                identity,
+                cleaned: false,
+            };
+            fixture.assert_identity()?;
+            Ok(fixture)
+        }
+
+        fn assert_identity(&self) -> TestResult {
+            let command = process_field(self.pid.as_raw_nonzero().get().try_into()?, "command=")?;
+            if command.contains(&self.identity) {
+                Ok(())
+            } else {
+                Err(format!("descendant fixture identity mismatch: {command}").into())
+            }
+        }
+
+        fn kill_and_confirm_absent(&mut self) -> TestResult {
+            if self.cleaned {
+                return Ok(());
+            }
+            self.assert_identity()?;
+            rustix_openpty::rustix::process::kill_process(
+                self.pid,
+                rustix_openpty::rustix::process::Signal::KILL,
+            )?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            loop {
+                let raw_pid: u32 = self.pid.as_raw_nonzero().get().try_into()?;
+                match process_field(raw_pid, "command=") {
+                    Err(_) => {
+                        self.cleaned = true;
+                        return Ok(());
+                    }
+                    Ok(command) if !command.contains(&self.identity) => {
+                        return Err("descendant fixture PID was unexpectedly reused".into());
+                    }
+                    Ok(_) => {}
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err("descendant fixture survived explicit cleanup".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for IdentifiedProcessFixture {
+        fn drop(&mut self) {
+            let _ = self.kill_and_confirm_absent();
+        }
+    }
+
+    fn marker_pid(output: &[u8], marker: &[u8]) -> TestResult<u32> {
+        let start = output
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .map(|index| index + marker.len())
+            .ok_or("descendant PID marker was absent")?;
+        let digits = output[start..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .copied()
+            .collect::<Vec<_>>();
+        Ok(std::str::from_utf8(&digits)?.parse()?)
+    }
 
     #[test]
     fn corrupt_daemon_record_is_never_signalable() -> TestResult {
@@ -873,15 +1031,50 @@ mod tests {
     }
 
     #[test]
-    fn pty_resize_driver_does_not_wait_for_descendant_pty_eof() -> TestResult {
+    fn pty_resize_driver_drains_chatty_child_without_backpressure_timeout() -> TestResult {
         let mut command = Command::new("sh");
         command.args([
             "-c",
-            "sleep 2 & trap 'exit 0' WINCH; printf GASCAN_RESIZE_READY; while :; do :; done",
+            "trap 'exit 0' WINCH; dd if=/dev/zero bs=4096 count=64 2>/dev/null; printf GASCAN_RESIZE_READY; while :; do :; done",
         ]);
 
         let started = std::time::Instant::now();
         let output = run_pty_resize_command(command, b"GASCAN_RESIZE_READY", 47, 132)?;
+
+        assert!(output.status.success());
+        assert_eq!(
+            output.stdout.len(),
+            64 * 4096 + b"GASCAN_RESIZE_READY".len()
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "chatty resize child was throttled for {:?}",
+            started.elapsed()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pty_resize_driver_does_not_wait_for_descendant_pty_eof() -> TestResult {
+        let identity = format!(
+            "gascan-descendant-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        );
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            &format!(
+                "trap 'exit 0' WINCH; sh -c 'while :; do :; done' {identity} & descendant=$!; printf 'GASCAN_DESCENDANT_PID=%s\\n' \"$descendant\"; printf GASCAN_RESIZE_READY; while :; do :; done"
+            ),
+        ]);
+
+        let started = std::time::Instant::now();
+        let output = run_pty_resize_command(command, b"GASCAN_RESIZE_READY", 47, 132)?;
+        let descendant_pid = marker_pid(&output.stdout, b"GASCAN_DESCENDANT_PID=")?;
+        let mut descendant = IdentifiedProcessFixture::new(descendant_pid, identity)?;
 
         assert!(output.status.success());
         assert!(
@@ -889,13 +1082,15 @@ mod tests {
             "resize helper waited {:?} for descendant-owned PTY descriptors",
             started.elapsed()
         );
+        descendant.kill_and_confirm_absent()?;
+        assert!(process_field(descendant_pid, "stat=").is_err());
         Ok(())
     }
 
     #[test]
     fn pty_resize_cleanup_kill_failure_is_bounded_and_preserves_context() -> TestResult {
         let mut command = Command::new("sh");
-        command.args(["-c", "exec sleep 2"]);
+        command.args(["-c", "exec sleep 30"]);
         let spawned_pid = std::cell::Cell::new(None);
 
         let started = std::time::Instant::now();
@@ -913,16 +1108,8 @@ mod tests {
         );
         let elapsed = started.elapsed();
         let pid = spawned_pid.get().ok_or("post-spawn hook did not run")?;
-        if let Some(pid) = rustix_openpty::rustix::process::Pid::from_raw(i32::try_from(pid)?) {
-            let _ = rustix_openpty::rustix::process::kill_process(
-                pid,
-                rustix_openpty::rustix::process::Signal::KILL,
-            );
-            let _ = rustix_openpty::rustix::process::waitpid(
-                Some(pid),
-                rustix_openpty::rustix::process::WaitOptions::empty(),
-            );
-        }
+        let mut fixture = OwnedChildFixture::new(pid)?;
+        fixture.assert_owned_and_running()?;
         let error = match result {
             Ok(_) => return Err("forced cleanup failure was not returned".into()),
             Err(error) => error,
@@ -934,6 +1121,8 @@ mod tests {
             elapsed < std::time::Duration::from_secs(1),
             "resize cleanup blocked for {elapsed:?}"
         );
+        fixture.kill_and_reap()?;
+        assert!(process_field(pid, "stat=").is_err());
         Ok(())
     }
 
