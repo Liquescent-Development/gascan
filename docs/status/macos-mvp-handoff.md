@@ -199,7 +199,8 @@ hardening.
    `feature/gate4-integration` as recorded in
    `docs/evidence/connected-image-handoff.md`: `up`, `shell`, `run`, `apply`,
    `down`, restart, reconciliation, and `destroy`, including PTY, signals,
-   exact exits, and residue checks.
+   exact 47-row by 132-column terminal resize propagation, exact exits, and
+   residue checks.
 2. Continue investigating Apple builder reliability separately under issue #1;
    do not make end-user distribution rebuild the image.
 3. Complete Plan 4 security acceptance, packaging, installation, and clean-host

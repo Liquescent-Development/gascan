@@ -26,6 +26,31 @@ fn cli_lifecycle_survives_daemon_and_host_state_changes() -> TestResult {
         String::from_utf8_lossy(&tty.stderr)
     );
 
+    let resized = env.run_pty_resize(
+        &[
+            "sh",
+            "-c",
+            "trap 'size=$(stty size); printf \"%s\\n\" \"$size\"; test \"$size\" = \"47 132\" && exit 0' WINCH; printf GASCAN_RESIZE_READY; while :; do sleep 1; done",
+        ],
+        47,
+        132,
+    )?;
+    assert!(
+        resized.status.success(),
+        "resized TTY shell failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&resized.stdout),
+        String::from_utf8_lossy(&resized.stderr)
+    );
+    assert!(
+        resized
+            .stdout
+            .windows(b"47 132".len())
+            .any(|window| window == b"47 132"),
+        "guest did not observe exact 47x132 resize: stdout={} stderr={}",
+        String::from_utf8_lossy(&resized.stdout),
+        String::from_utf8_lossy(&resized.stderr)
+    );
+
     for (signal, expected) in [
         (rustix::process::Signal::INT, Some(130)),
         (rustix::process::Signal::TERM, Some(143)),

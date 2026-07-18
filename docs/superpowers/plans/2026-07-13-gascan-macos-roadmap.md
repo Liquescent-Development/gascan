@@ -108,7 +108,7 @@ Concurrency rule: Plan 3 owns Apple adapter and lifecycle wiring; Plan 4 owns im
 | Offline bundle production and validation | implementation reviewed; publication and live evidence not completed | `809796e` through `9025c56` | deferred; `publication = "pending"` remains accurate |
 | Plan 4 provisioning/apply/setup behavior | Gascamp source selection exists; the rest requires fresh reconciliation before claiming task completion | provisioning history including `c99bbaf` | inventory Tasks 4–6 against the final image, implement gaps, and prove through fake and real backend suites |
 | Cross-plan integration | Task 7 completed on `feature/gate4-integration` | frozen base `917dac1`; Apple merge `d06d619`; connected-image merge `229c33a`; `docs/evidence/connected-image-handoff.md` | run the exact Gate 4 lifecycle serially |
-| Gate 4 | pending | harness only | exact real CLI lifecycle and residue evidence |
+| Gate 4 | pending | harness includes exact 47x132 terminal-resize assertion but has not run live | exact real CLI lifecycle, terminal-resize, and residue evidence |
 
 ## Phase 3: Security, Packaging, and Release
 

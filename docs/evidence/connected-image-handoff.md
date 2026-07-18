@@ -75,6 +75,10 @@ On this integration worktree:
 - `cargo fmt --all -- --check`: PASS.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`: PASS.
 - `cargo test --workspace`: PASS, 294 passed and 12 ignored across 43 suites.
+- `cargo test -p gascan-e2e --test apple_lifecycle`: PASS, 6 platform-neutral
+  helper tests passed and the live lifecycle remained ignored. The added PTY
+  helper regression changed a real local terminal to 47 rows by 132 columns,
+  delivered `SIGWINCH`, and observed exact `stty size` output.
 - `cargo test --manifest-path scripts/Cargo.toml`: PASS, 250 passed across 39
   suites, after reconciling merged test fixtures with the final validators and
   making their readiness and cache setup self-contained.
@@ -95,6 +99,11 @@ bash ./scripts/run-apple-e2e.sh apple_recovery
 ```
 
 Run them in that order without concurrency. Preserve the harness cleanup
-manifest and transcript if either command fails. Roadmap Gate 4 remains pending
-until the complete real CLI lifecycle and residue checks pass. Roadmap Gate 5
-and MVP completion remain pending; Gate 5 defines MVP completion.
+manifest and transcript if either command fails. The `apple_lifecycle` command
+opens the CLI on a 24-by-80 PTY, changes it to exactly 47 rows by 132 columns,
+sends `SIGWINCH` to the CLI, and requires the guest's `stty size` to report
+exactly `47 132`. This is executable harness coverage, not live evidence until
+the command above passes on the supported Apple host. Roadmap Gate 4 remains
+pending until the complete real CLI lifecycle, terminal resize, and residue
+checks pass. Roadmap Gate 5 and MVP completion remain pending; Gate 5 defines
+MVP completion.

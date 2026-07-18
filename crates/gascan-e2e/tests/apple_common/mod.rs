@@ -306,6 +306,18 @@ impl AppleE2e {
         wait_with_output_bounded(child, std::time::Duration::from_secs(30))
     }
 
+    pub fn run_pty_resize(
+        &self,
+        argv: &[&str],
+        rows: u16,
+        cols: u16,
+    ) -> TestResult<PtySignalOutput> {
+        let mut args = vec!["--sandbox", self.id(), "shell", "--"];
+        args.extend(argv);
+        let command = self.command(args);
+        run_pty_resize_command(command, b"GASCAN_RESIZE_READY", rows, cols)
+    }
+
     pub fn run_pty_signal(
         &self,
         signal: rustix::process::Signal,
@@ -545,6 +557,94 @@ fn wait_with_output_bounded(
     }
 }
 
+fn run_pty_resize_command(
+    mut command: Command,
+    ready_marker: &[u8],
+    rows: u16,
+    cols: u16,
+) -> TestResult<PtySignalOutput> {
+    let pty = rustix_openpty::openpty(
+        None,
+        Some(&rustix_openpty::rustix::termios::Winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        }),
+    )?;
+    let stdin = std::fs::File::from(rustix_openpty::rustix::io::dup(&pty.user)?);
+    let stdout = std::fs::File::from(rustix_openpty::rustix::io::dup(&pty.user)?);
+    let mut controller = std::fs::File::from(rustix_openpty::rustix::io::dup(&pty.controller)?);
+    let flags = rustix_openpty::rustix::fs::fcntl_getfl(&controller)?;
+    rustix_openpty::rustix::fs::fcntl_setfl(
+        &controller,
+        flags | rustix_openpty::rustix::fs::OFlags::NONBLOCK,
+    )?;
+    let mut captured = Vec::new();
+    let mut child = command
+        .stdin(stdin)
+        .stdout(stdout)
+        .stderr(Stdio::piped())
+        .spawn()?;
+    drop(pty.user);
+    let readiness_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !captured
+        .windows(ready_marker.len())
+        .any(|window| window == ready_marker)
+    {
+        read_available_pty(&mut controller, &mut captured)?;
+        if child.try_wait()?.is_some() {
+            return Err("PTY child exited before resize readiness".into());
+        }
+        if std::time::Instant::now() >= readiness_deadline {
+            child.kill()?;
+            let _ = child.wait();
+            return Err("PTY child did not report resize readiness".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    rustix_openpty::rustix::termios::tcsetwinsize(
+        &controller,
+        rustix_openpty::rustix::termios::Winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        },
+    )?;
+    let pid = rustix_openpty::rustix::process::Pid::from_raw(i32::try_from(child.id())?)
+        .ok_or("invalid CLI pid")?;
+    rustix_openpty::rustix::process::kill_process(
+        pid,
+        rustix_openpty::rustix::process::Signal::WINCH,
+    )?;
+    drop(pty.controller);
+    let output = wait_with_output_bounded(child, std::time::Duration::from_secs(10))?;
+    while read_available_pty(&mut controller, &mut captured)? {}
+    Ok(PtySignalOutput {
+        status: output.status,
+        stdout: captured,
+        stderr: output.stderr,
+    })
+}
+
+fn read_available_pty(
+    controller: &mut std::fs::File,
+    captured: &mut Vec<u8>,
+) -> std::io::Result<bool> {
+    let mut chunk = [0_u8; 256];
+    match controller.read(&mut chunk) {
+        Ok(0) => Ok(false),
+        Ok(count) => {
+            captured.extend_from_slice(&chunk[..count]);
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+        Err(error) if error.raw_os_error() == Some(5) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResourcePresence {
     Absent,
@@ -621,6 +721,26 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(wait_with_output_bounded(child, std::time::Duration::from_millis(20)).is_err());
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        Ok(())
+    }
+
+    #[test]
+    fn pty_resize_driver_delivers_exact_dimensions_to_child() -> TestResult {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "trap 'size=$(stty size); printf \"%s\\n\" \"$size\"; test \"$size\" = \"47 132\" && exit 0' WINCH; printf GASCAN_RESIZE_READY; while :; do sleep 1; done",
+        ]);
+
+        let output = run_pty_resize_command(command, b"GASCAN_RESIZE_READY", 47, 132)?;
+
+        assert!(output.status.success());
+        assert!(
+            output
+                .stdout
+                .windows(b"47 132".len())
+                .any(|window| window == b"47 132")
+        );
         Ok(())
     }
 
