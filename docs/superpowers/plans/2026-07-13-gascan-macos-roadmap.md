@@ -107,8 +107,8 @@ Concurrency rule: Plan 3 owns Apple adapter and lifecycle wiring; Plan 4 owns im
 | Plan 4 image/user/mise/Gascamp contracts | connected image gate passed on Apple Container 26.5.1 using the exact public GHCR `linux/arm64` index; approved marker is frozen into policy | connected head `f6ed3a5`, merge `229c33a`; `docs/evidence/connected-workspace-image.md` and `images/workspace/approved-image.txt` are authoritative | consume the frozen image in the serial Gate 4 run |
 | Offline bundle production and validation | implementation reviewed; publication and live evidence not completed | `809796e` through `9025c56` | deferred; `publication = "pending"` remains accurate |
 | Plan 4 provisioning/apply/setup behavior | Gascamp source selection exists; the rest requires fresh reconciliation before claiming task completion | provisioning history including `c99bbaf` | inventory Tasks 4–6 against the final image, implement gaps, and prove through fake and real backend suites |
-| Cross-plan integration | Task 7 completed on `feature/gate4-integration` | frozen base `917dac1`; Apple merge `d06d619`; connected-image merge `229c33a`; `docs/evidence/connected-image-handoff.md` | run the exact Gate 4 lifecycle serially |
-| Gate 4 | pending | harness includes exact 47x132 terminal-resize assertion but has not run live | exact real CLI lifecycle, terminal-resize, and residue evidence |
+| Cross-plan integration | Task 7 completed and independently reviewed on `feature/gate4-integration` | accepted head `271db68`; frozen base `917dac1`; Apple merge `d06d619`; connected-image merge `229c33a`; `docs/evidence/connected-image-handoff.md` | run the exact Gate 4 lifecycle serially |
+| Gate 4 | pending | the bounded PTY harness includes the exact 47x132 terminal-resize assertion plus cleanup, descendant-descriptor, forced-kill-failure, and chatty-output regressions, but has not run live | exact real CLI lifecycle, terminal-resize, and residue evidence |
 
 ## Phase 3: Security, Packaging, and Release
 
@@ -171,9 +171,12 @@ When each gate passes, update this section in a dedicated commit with the commit
 - Deferred and not MVP blockers: offline bundle publication and builder-VM
   network isolation.
 - Not passed: Gate 4. Task 7 froze the exact approved marker into policy and
-  recorded platform-neutral verification in
-  `docs/evidence/connected-image-handoff.md`, but the full real CLI lifecycle
-  has not run. Next is the exact live Gate 4 lifecycle run serially.
+  completed its independently reviewed integration at `271db68`. Its bounded
+  PTY state machine asserts the exact 47-row by 132-column resize and has
+  cleanup and bounded output-drain regressions, as recorded in
+  `docs/evidence/connected-image-handoff.md`. These are platform-neutral
+  harness checks; the full real CLI lifecycle has not run. Next is the exact
+  live Gate 4 lifecycle run serially.
 - Not started as an integrated release phase: Phase 3 security, packaging, and
   clean-host release. End-user distribution must consume a prebuilt image;
   actual distribution packaging remains Gate 5 work.

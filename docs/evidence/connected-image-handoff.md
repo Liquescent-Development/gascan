@@ -15,8 +15,9 @@ pass Gate 4, Gate 5, or the MVP.
   `f6ed3a5dff638174083edd15e0a8ef1b628aca8b`
 - connected-image merge commit:
   `229c33ade5abfe9b327e0a9fc9f22e9e834e5e1d`
-- integration branch: `feature/gate4-integration`; the reviewed-history head
-  before this reconciliation commit is `229c33a`.
+- integration branch: `feature/gate4-integration`
+- accepted Task 7 integration head:
+  `271db68df4e6d387eda51ec2cc419fabb704fcf5`
 
 Both histories were merged with explicit non-squashed merge commits, Apple
 first and connected image second.
@@ -75,10 +76,18 @@ On this integration worktree:
 - `cargo fmt --all -- --check`: PASS.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`: PASS.
 - `cargo test --workspace`: PASS, 294 passed and 12 ignored across 43 suites.
-- `cargo test -p gascan-e2e --test apple_lifecycle`: PASS, 6 platform-neutral
-  helper tests passed and the live lifecycle remained ignored. The added PTY
-  helper regression changed a real local terminal to 47 rows by 132 columns,
-  delivered `SIGWINCH`, and observed exact `stty size` output.
+- The final external `gascan-e2e` run passed 52 platform-neutral tests with 2
+  live tests ignored. Focused `apple_common` coverage passed 11 of 11; focused
+  `apple_lifecycle` coverage passed 11 platform-neutral tests with its live
+  lifecycle test ignored.
+- The reviewed PTY state machine owns the child through bounded readiness,
+  execution, post-exit drain, and cleanup. It changes a real local terminal
+  from 24 by 80 to exactly 47 rows by 132 columns, delivers `SIGWINCH`, and
+  observes exact `stty size` output `47 132`. Regressions also prove that it
+  does not wait for a descendant-owned PTY descriptor, returns promptly while
+  preserving both errors after an injected kill failure, reaps owned children
+  after other failure paths, and drains an exact 262,163-byte chatty-child
+  transcript without the former artificial throttle or data loss.
 - `cargo test --manifest-path scripts/Cargo.toml`: PASS, 250 passed across 39
   suites, after reconciling merged test fixtures with the final validators and
   making their readiness and cache setup self-contained.
@@ -88,6 +97,10 @@ On this integration worktree:
 
 These are platform-neutral checks only. They are not real lifecycle,
 credential-isolation, signing, notarization, or clean-host evidence.
+
+The accepted Task 7 integration head is `271db68`. Its independent review
+reported no Critical, Important, or Minor findings. Roadmap Gate 4, Roadmap
+Gate 5, and MVP completion remain pending.
 
 ## Later serial Gate 4 run
 

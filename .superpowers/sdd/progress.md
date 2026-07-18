@@ -3,9 +3,11 @@ Task 2: complete (commits b2b98ac..e3a2291, review clean)
 Task 3: complete (commits e3a2291..ce6b5b0, review clean)
 Task 4: complete (commits ce6b5b0..745c516, review approved; minor: unrelated follow-logs channel capacity 1->2 for final review)
 Task 5: complete (commits 745c516..109a7a3, review clean; live production doctor 17/17)
-Task 6: implementation and safety review fixes complete; Gate 4 remains blocked by locked-image GHCR 401
+Task 6: implementation and safety review fixes complete; connected prebuilt image accepted; Gate 4 remains pending
 Connected Task 1: complete (commits 54ed806..44bb3b2, review clean; live secret isolation probe passed)
 Connected Task 2: complete (commits 75c1f2c..1878744, review clean)
 Connected Task 3: complete (commits 883f6fe..7a429cb, review clean)
 Connected Task 4: complete (commits f6f7856..b03add2, review clean; structural credential boundary only)
 Connected Task 5: complete (commits 2bd64cd..61fd8d9, review clean)
+Connected image gate: complete (head f6ed3a5; exact public digest accepted; Gate 4 not implied)
+Task 7 integration: complete (head 271db68; independent review clean; bounded PTY resize asserts exact 47x132 and covers cleanup, descendant-held descriptors, forced kill failure, and bounded chatty-output drain; Gate 4, Gate 5, and MVP remain pending)

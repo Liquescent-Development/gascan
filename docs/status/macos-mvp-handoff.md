@@ -83,7 +83,7 @@ The recorded locations and accepted heads are:
 | `.worktrees/macos-mvp` | `feature/macos-mvp` | `917dac1` | integration branch through Gate 3 |
 | `.worktrees/apple-backend` | `feature/apple-backend` | `dbf4235` | reviewed Plan 3 implementation and Gate 4 harness |
 | `.worktrees/provisioning` | `feature/provisioning` | `f6ed3a5` | accepted connected image, Gascamp, offline bundles, and image gates |
-| `.worktrees/gate4-integration` | `feature/gate4-integration` | reviewed-history head `229c33a`; policy/evidence reconciliation is the containing Task 7 commit | Gate 4 integration handoff from frozen base `917dac1` |
+| `.worktrees/gate4-integration` | `feature/gate4-integration` | accepted Task 7 head `271db68` | Gate 4 integration handoff from frozen base `917dac1` |
 
 The Task 7 feature merges were reviewed from their shared frozen base rather
 than accepted wholesale. The deliberately deferred offline path remains
@@ -115,9 +115,19 @@ The harness is approved; Gate 4 itself is not passed.
 - `229c33a`: explicit non-squashed merge of accepted connected-image head
   `f6ed3a5`, with the progress-ledger conflict resolved by preserving both
   current histories.
-- The containing Task 7 reconciliation commit freezes
+- `6a81545`: freezes
   `images/workspace/approved-image.txt` into policy and records the reviewed
   handoff in `docs/evidence/connected-image-handoff.md`.
+- `b09f573` through `271db68`: add and harden the real CLI PTY-resize path.
+  The accepted bounded state machine owns the child throughout execution,
+  changes the PTY from 24 by 80 to exactly 47 rows by 132 columns, sends
+  `SIGWINCH`, and requires the guest to report `47 132`. Reviewed regressions
+  cover bounded cleanup after failures, a descendant retaining PTY
+  descriptors, a forced kill failure, and lossless bounded-batch draining of
+  a 262,163-byte chatty-child transcript.
+
+Task 7 is accepted at `271db68`. Its platform-neutral harness evidence does
+not pass Gate 4.
 
 ### Provisioning and offline branch
 
