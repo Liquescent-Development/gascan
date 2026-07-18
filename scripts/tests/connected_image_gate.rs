@@ -119,7 +119,7 @@ fn fixture() -> Fixture {
     executable(
         &raw_container,
         &format!(
-            "#!/bin/sh\nset -eu\nprintf 'container:%s\\n' \"$*\" >>\"$CALLS\"\nif [ \"$1 ${{2:-}}\" = 'image inspect' ]; then [ $# -eq 3 ] || exit 93; [ \"$3\" = gascan-workspace:test ] || {{ printf 'image not found\\n' >&2; exit 94; }}; [ \"${{IMAGE_AVAILABLE:-1}}\" = 1 ] || exit 94; platform=${{IMAGE_PLATFORM:-arm64}}; image_digest=${{IMAGE_DIGEST:-sha256:{DIGEST}}}; image_id=${{image_digest#sha256:}}; printf '[{{\"id\":\"%s\",\"configuration\":{{\"name\":\"gascan-workspace:test\",\"descriptor\":{{\"digest\":\"%s\"}}}},\"variants\":[{{\"platform\":{{\"os\":\"linux\",\"architecture\":\"%s\"}},\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}]}}]\\n' \"$image_id\" \"$image_digest\" \"$platform\"; exit 0; fi\ncase \"$1\" in create) while [ $# -gt 0 ]; do [ \"$1\" = --name ] && {{ touch \"$STATE/$2\"; break; }}; shift; done ;; inspect) name=$2; [ \"${{RESIDUE:-}}\" = \"$name\" ] || [ -f \"$STATE/$name\" ] || exit 1; count_file=\"$STATE/.inspect-$name\"; count=0; [ ! -f \"$count_file\" ] || count=$(cat \"$count_file\"); count=$((count+1)); printf '%s' \"$count\" >\"$count_file\"; owner=$OWNER; [ \"${{FOREIGN:-}}\" = \"$name\" ] && owner=ffffffffffffffffffffffffffffffff; [ \"${{REPLACE_ON_SECOND_INSPECT:-}}\" = \"$name\" ] && [ \"$count\" -ge 2 ] && owner=ffffffffffffffffffffffffffffffff; printf '[{{\"id\":\"%s\",\"configuration\":{{\"id\":\"%s\",\"labels\":{{\"dev.gascan.test\":\"true\",\"dev.gascan.test.owner\":\"%s\"}}}}}}]\\n' \"$name\" \"$name\" \"$owner\" ;; stop) : ;; delete) name=${{@:$#}}; [ \"${{FAIL_DELETE:-}}\" != \"$name\" ] || exit 1; rm -f \"$STATE/$name\" ;; esac\n"
+            "#!/bin/sh\nset -eu\nprintf 'container:%s\\n' \"$*\" >>\"$CALLS\"\nif [ \"$1 ${{2:-}}\" = 'image inspect' ]; then [ $# -eq 3 ] || exit 93; expected=${{INSPECT_REFERENCE:-gascan-workspace:test}}; [ \"$3\" = \"$expected\" ] || {{ printf 'image not found\\n' >&2; exit 94; }}; [ \"${{IMAGE_AVAILABLE:-1}}\" = 1 ] || exit 94; platform=${{IMAGE_PLATFORM:-arm64}}; image_digest=${{IMAGE_DIGEST:-sha256:{DIGEST}}}; image_id=${{image_digest#sha256:}}; printf '[{{\"id\":\"%s\",\"configuration\":{{\"name\":\"%s\",\"descriptor\":{{\"digest\":\"%s\"}}}},\"variants\":[{{\"platform\":{{\"os\":\"linux\",\"architecture\":\"%s\"}},\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}]}}]\\n' \"$image_id\" \"$expected\" \"$image_digest\" \"$platform\"; exit 0; fi\ncase \"$1\" in create) while [ $# -gt 0 ]; do [ \"$1\" = --name ] && {{ touch \"$STATE/$2\"; break; }}; shift; done ;; inspect) name=$2; [ \"${{RESIDUE:-}}\" = \"$name\" ] || [ -f \"$STATE/$name\" ] || exit 1; count_file=\"$STATE/.inspect-$name\"; count=0; [ ! -f \"$count_file\" ] || count=$(cat \"$count_file\"); count=$((count+1)); printf '%s' \"$count\" >\"$count_file\"; owner=$OWNER; [ \"${{FOREIGN:-}}\" = \"$name\" ] && owner=ffffffffffffffffffffffffffffffff; [ \"${{REPLACE_ON_SECOND_INSPECT:-}}\" = \"$name\" ] && [ \"$count\" -ge 2 ] && owner=ffffffffffffffffffffffffffffffff; printf '[{{\"id\":\"%s\",\"configuration\":{{\"id\":\"%s\",\"labels\":{{\"dev.gascan.test\":\"true\",\"dev.gascan.test.owner\":\"%s\"}}}}}}]\\n' \"$name\" \"$name\" \"$owner\" ;; stop) : ;; delete) name=${{@:$#}}; [ \"${{FAIL_DELETE:-}}\" != \"$name\" ] || exit 1; rm -f \"$STATE/$name\" ;; esac\n"
         ),
     );
     let container = temp.path().join("container");
@@ -155,9 +155,8 @@ fn seed_valid_receipt(f: &Fixture) {
     fs::create_dir_all(&artifacts).unwrap();
     let reference = format!("gascan-workspace:test@sha256:{DIGEST}");
     let lock_digest = file_digest(&f.root.join("images/workspace/versions.lock"));
-    let context_digest = file_digest(
-        &artifacts.join("connected-workspace-context/context-manifest.tsv"),
-    );
+    let context_digest =
+        file_digest(&artifacts.join("connected-workspace-context/context-manifest.tsv"));
     fs::write(
         artifacts.join("workspace-image-ref"),
         format!("{reference}\n"),
@@ -170,6 +169,30 @@ fn seed_valid_receipt(f: &Fixture) {
         ),
     )
     .unwrap();
+}
+
+fn seed_valid_ghcr_receipt(f: &Fixture) -> String {
+    let artifacts = f.root.join(".artifacts");
+    fs::create_dir_all(&artifacts).unwrap();
+    let tag = "ghcr.io/liquescent-development/gascan/workspace:d4964500a3295a33";
+    let reference = format!("{tag}@sha256:{DIGEST}");
+    let lock_digest = file_digest(&f.root.join("images/workspace/versions.lock"));
+    let context_digest = file_digest(
+        &artifacts.join("connected-workspace-context/context-manifest.tsv"),
+    );
+    fs::write(
+        artifacts.join("workspace-image-ref"),
+        format!("{reference}\n"),
+    )
+    .unwrap();
+    fs::write(
+        artifacts.join("workspace-image-build.json"),
+        format!(
+            "{{\"reference\":\"{reference}\",\"tag\":\"{tag}\",\"platform\":\"linux/arm64\",\"lock_digest\":\"{lock_digest}\",\"context_digest\":\"{context_digest}\",\"image_digest\":\"sha256:{DIGEST}\",\"status\":\"succeeded\"}}\n"
+        ),
+    )
+    .unwrap();
+    reference
 }
 
 fn assert_no_publications(f: &Fixture) {
@@ -290,6 +313,33 @@ fn successful_prebuilt_gate_skips_build_work_and_publishes_exact_receipt_referen
     assert!(fs::read_to_string(f.root.join("docs/evidence/connected-workspace-image.md"))
         .unwrap()
         .contains(&reference));
+}
+
+#[test]
+fn ghcr_prebuilt_gate_inspects_canonical_name_and_smokes_original_reference() {
+    let mut f = fixture();
+    let reference = seed_valid_ghcr_receipt(&f);
+    let canonical = format!("ghcr.io/liquescent-development/gascan/workspace@sha256:{DIGEST}");
+    f.command.env("INSPECT_REFERENCE", &canonical);
+    let output = f.command.arg("--prebuilt").output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = fs::read_to_string(&f.calls).unwrap();
+    assert!(calls.contains(&format!("container:image inspect {canonical}")));
+    for prefix in ["user", "polyglot", "gascamp"] {
+        assert!(calls.lines().any(|line| {
+            line.contains(&format!(
+                "create --name gascan-image-{prefix}-test-{TOKEN} "
+            )) && line.ends_with(&reference)
+        }));
+    }
+    assert_eq!(
+        fs::read(f.root.join("images/workspace/approved-image.txt")).unwrap(),
+        reference.as_bytes()
+    );
 }
 
 #[test]

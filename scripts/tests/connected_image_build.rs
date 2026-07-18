@@ -631,6 +631,113 @@ fn receipt_pair_validator_rejects_cross_file_identity_mismatch() {
 }
 
 #[test]
+fn receipt_pair_validator_accepts_only_the_approved_ghcr_namespace() {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let reference_file = temp.path().join("ref");
+    let receipt_file = temp.path().join("receipt");
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let lock_digest = "b".repeat(64);
+    let context_digest = "c".repeat(64);
+    let run = |tag: &str, image_digest: &str| {
+        let reference = format!("{tag}@{image_digest}");
+        fs::write(&reference_file, format!("{reference}\n")).unwrap();
+        fs::write(
+            &receipt_file,
+            format!(
+                r#"{{"reference":"{reference}","tag":"{tag}","platform":"linux/arm64","lock_digest":"{lock_digest}","context_digest":"{context_digest}","image_digest":"{image_digest}","status":"succeeded"}}"#
+            ),
+        )
+        .unwrap();
+        Command::new(env!("CARGO_BIN_EXE_validate-connected-build"))
+            .arg("validate-receipt")
+            .arg(&reference_file)
+            .arg(&receipt_file)
+            .arg(&lock_digest)
+            .arg(&context_digest)
+            .status()
+            .unwrap()
+    };
+
+    assert!(run(
+        "ghcr.io/liquescent-development/gascan/workspace:d4964500a3295a33",
+        &digest
+    )
+    .success());
+    assert!(run("gascan-workspace:d4964500a3295a33", &digest).success());
+
+    for rejected_tag in [
+        "registry.example/liquescent-development/gascan/workspace:d4964500a3295a33",
+        "ghcr.io/wrong/gascan/workspace:d4964500a3295a33",
+        "ghcr.io/liquescent-development/wrong/workspace:d4964500a3295a33",
+        "ghcr.io/liquescent-development/gascan/wrong:d4964500a3295a33",
+        "ghcr.io/liquescent-development/gascan/workspace:latest",
+        "ghcr.io/liquescent-development/gascan/workspace:",
+    ] {
+        assert!(
+            !run(rejected_tag, &digest).success(),
+            "accepted {rejected_tag}"
+        );
+    }
+    assert!(!run(
+        "ghcr.io/liquescent-development/gascan/workspace:d4964500a3295a33",
+        &format!("sha256:{}", "A".repeat(64))
+    )
+    .success());
+
+    let name_only = "ghcr.io/liquescent-development/gascan/workspace:d4964500a3295a33";
+    fs::write(&reference_file, format!("{name_only}\n")).unwrap();
+    assert!(
+        !Command::new(env!("CARGO_BIN_EXE_validate-connected-build"))
+            .arg("validate-receipt")
+            .arg(&reference_file)
+            .arg(&receipt_file)
+            .arg(&lock_digest)
+            .arg(&context_digest)
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+#[test]
+fn validator_accepts_canonical_ghcr_named_digest_inspection() {
+    use std::io::Write;
+    let digest = "a".repeat(64);
+    let canonical = format!("ghcr.io/liquescent-development/gascan/workspace@sha256:{digest}");
+    let input = format!(
+        r#"[{{"id":"{digest}","configuration":{{"name":"{canonical}","descriptor":{{"digest":"sha256:{digest}"}}}},"variants":[{{"platform":{{"os":"linux","architecture":"arm64"}},"digest":"sha256:{variant}"}}]}}]"#,
+        variant = "b".repeat(64)
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_validate-connected-build"))
+        .arg(&canonical)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+
+    let tagged = "ghcr.io/liquescent-development/gascan/workspace:d4964500a3295a33";
+    let tagged_input = input.replace(&canonical, tagged);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_validate-connected-build"))
+        .arg(tagged)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(tagged_input.as_bytes())
+        .unwrap();
+    assert!(!child.wait().unwrap().success());
+}
+
+#[test]
 fn every_image_consumer_rejects_each_receipt_identity_mismatch_before_container_use() {
     let temp = tempfile::tempdir_in("/tmp").unwrap();
     let artifacts = temp.path().join("artifacts");

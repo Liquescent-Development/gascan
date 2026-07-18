@@ -138,8 +138,12 @@ image=$(GASCAN_IMAGE_ARTIFACTS="$artifacts" "$root/scripts/validate-connected-im
 if ! $prebuilt; then
   test "$(printf '%s\n' "$build_output" | tail -n 1)" = "$image" || die 'build output and receipt reference differ'
 fi
-inspect=$("$container_bin" image inspect "${image%%@*}") || die 'built image is unavailable'
-inspected_digest=$(printf '%s' "$inspect" | run_tool validate-connected-build "${image%%@*}") || die 'structured image inspection is invalid'
+inspection_image=${image%%@*}
+case "$inspection_image" in
+  ghcr.io/liquescent-development/gascan/workspace:*) inspection_image="ghcr.io/liquescent-development/gascan/workspace@${image##*@}" ;;
+esac
+inspect=$("$container_bin" image inspect "$inspection_image") || die 'built image is unavailable'
+inspected_digest=$(printf '%s' "$inspect" | run_tool validate-connected-build "$inspection_image") || die 'structured image inspection is invalid'
 test "$inspected_digest" = "${image##*@}" || die 'inspection digest differs from receipt'
 
 for smoke in user-and-volumes.sh polyglot-smoke.sh gascamp-smoke.sh; do

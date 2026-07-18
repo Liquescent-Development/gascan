@@ -64,7 +64,7 @@ fn main() -> Result<(), DynError> {
         );
     }
     let expected_tag = first;
-    if !valid_tag(&expected_tag) {
+    if !valid_inspection_name(&expected_tag) {
         return Err("expected image tag is not an exact immutable build tag".into());
     }
     let mut input = String::new();
@@ -146,12 +146,28 @@ fn valid_digest(value: &str) -> bool {
 }
 
 fn valid_tag(value: &str) -> bool {
-    let Some(suffix) = value.strip_prefix("gascan-workspace:") else {
+    let suffix = value
+        .strip_prefix("gascan-workspace:")
+        .or_else(|| value.strip_prefix("ghcr.io/liquescent-development/gascan/workspace:"));
+    let Some(suffix) = suffix else {
         return false;
     };
+    valid_tag_suffix(suffix)
+}
+
+fn valid_tag_suffix(suffix: &str) -> bool {
     !suffix.is_empty()
-        && !value.ends_with(":latest")
+        && suffix != "latest"
         && suffix.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
         })
+}
+
+fn valid_inspection_name(value: &str) -> bool {
+    value
+        .strip_prefix("gascan-workspace:")
+        .is_some_and(valid_tag_suffix)
+        || value
+            .strip_prefix("ghcr.io/liquescent-development/gascan/workspace@")
+            .is_some_and(valid_digest)
 }
