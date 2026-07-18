@@ -83,7 +83,7 @@ The recorded locations and accepted heads are:
 | `.worktrees/macos-mvp` | `feature/macos-mvp` | `917dac1` | integration branch through Gate 3 |
 | `.worktrees/apple-backend` | `feature/apple-backend` | `dbf4235` | reviewed Plan 3 implementation and Gate 4 harness |
 | `.worktrees/provisioning` | `feature/provisioning` | `f6ed3a5` | accepted connected image, Gascamp, offline bundles, and image gates |
-| `.worktrees/gate4-integration` | `feature/gate4-integration` | accepted Task 7 head `271db68` | Gate 4 integration handoff from frozen base `917dac1` |
+| `.worktrees/gate4-integration` | `feature/gate4-integration` | accepted Task 7 head `306e0b6` | Gate 4 integration handoff from frozen base `917dac1` |
 
 The Task 7 feature merges were reviewed from their shared frozen base rather
 than accepted wholesale. The deliberately deferred offline path remains
@@ -125,8 +125,12 @@ The harness is approved; Gate 4 itself is not passed.
   cover bounded cleanup after failures, a descendant retaining PTY
   descriptors, a forced kill failure, and lossless bounded-batch draining of
   a 262,163-byte chatty-child transcript.
+- `306e0b6`: resolves the final integration review's signal-path findings with
+  a bounded PTY lifecycle. The reviewed harness now exercises
+  contract-correct `SIGINT` propagation through a real TTY and rejects typed
+  `SIGTERM` text at the shell prompt as a signal substitute.
 
-Task 7 is accepted at `271db68`. Its platform-neutral harness evidence does
+Task 7 is accepted at `306e0b6`. Its platform-neutral harness evidence does
 not pass Gate 4.
 
 ### Provisioning and offline branch
