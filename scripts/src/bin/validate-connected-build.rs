@@ -77,16 +77,28 @@ fn main() -> Result<(), DynError> {
     if record.configuration.name != expected_tag {
         return Err("inspect name differs from the exact built tag".into());
     }
-    if record.variants.len() != 1
-        || record.variants[0].platform.os != "linux"
-        || record.variants[0].platform.architecture != "arm64"
+    let runnable_variants = record
+        .variants
+        .iter()
+        .filter(|variant| {
+            variant.platform.os == "linux" && variant.platform.architecture == "arm64"
+        })
+        .count();
+    if runnable_variants != 1
+        || record.variants.iter().any(|variant| {
+            !((variant.platform.os == "linux" && variant.platform.architecture == "arm64")
+                || (variant.platform.os == "unknown" && variant.platform.architecture == "unknown"))
+        })
     {
         return Err("built image must contain exactly linux/arm64".into());
     }
     let digest = &record.configuration.descriptor.digest;
     if !valid_digest(digest)
         || record.id != digest.strip_prefix("sha256:").unwrap_or_default()
-        || !valid_digest(&record.variants[0].digest)
+        || record
+            .variants
+            .iter()
+            .any(|variant| !valid_digest(&variant.digest))
     {
         return Err("image id and immutable descriptor digest must match".into());
     }

@@ -603,6 +603,81 @@ fn validator_rejects_malformed_mutable_wrong_platform_and_wrong_tag() {
 }
 
 #[test]
+fn validator_accepts_only_one_linux_arm64_variant_with_unknown_auxiliaries() {
+    use std::io::Write;
+    let digest = "a".repeat(64);
+    let tag = "gascan-workspace:locked";
+    let variant = |os: &str, architecture: &str, digest: &str| {
+        format!(
+            r#"{{"platform":{{"os":"{os}","architecture":"{architecture}"}},"digest":"{digest}"}}"#
+        )
+    };
+    let inspect = |variants: &[String]| {
+        format!(
+            r#"[{{"id":"{digest}","configuration":{{"name":"{tag}","descriptor":{{"digest":"sha256:{digest}"}}}},"variants":[{}]}}]"#,
+            variants.join(",")
+        )
+    };
+    let run = |input: String| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_validate-connected-build"))
+            .arg(tag)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let runnable = variant("linux", "arm64", &format!("sha256:{}", "b".repeat(64)));
+    let auxiliary = variant("unknown", "unknown", &format!("sha256:{}", "c".repeat(64)));
+    let second_auxiliary =
+        variant("unknown", "unknown", &format!("sha256:{}", "d".repeat(64)));
+
+    let accepted = run(inspect(&[
+        auxiliary.clone(),
+        runnable.clone(),
+        second_auxiliary,
+    ]));
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(accepted.stdout).unwrap(),
+        format!("sha256:{digest}\n")
+    );
+
+    for rejected in [
+        inspect(&[]),
+        inspect(&[runnable.clone(), runnable.clone()]),
+        inspect(&[
+            runnable.clone(),
+            variant("linux", "amd64", &format!("sha256:{}", "e".repeat(64))),
+        ]),
+        inspect(&[
+            runnable.clone(),
+            variant("linux", "unknown", &format!("sha256:{}", "e".repeat(64))),
+        ]),
+        inspect(&[
+            runnable.clone(),
+            variant("unknown", "arm64", &format!("sha256:{}", "e".repeat(64))),
+        ]),
+        inspect(&[
+            runnable.clone(),
+            variant("unknown", "unknown", "sha256:invalid"),
+        ]),
+    ] {
+        assert!(!run(rejected).status.success());
+    }
+}
+
+#[test]
 fn receipt_pair_validator_rejects_cross_file_identity_mismatch() {
     let temp = tempfile::tempdir_in("/tmp").unwrap();
     let reference = temp.path().join("ref");
