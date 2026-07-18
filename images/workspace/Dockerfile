@@ -18,6 +18,8 @@ COPY --chmod=0444 images/workspace/etc/mise/config.toml /etc/mise/config.toml
 COPY --chmod=0444 .artifacts/expected-tool-versions.json /tmp/expected-tool-versions.json
 
 ENV MISE_DATA_DIR=/opt/gascan/mise
+ENV CARGO_HOME=/opt/gascan/mise/cargo
+ENV RUSTUP_HOME=/opt/gascan/mise/rustup
 ENV MISE_GLOBAL_CONFIG_FILE=/etc/mise/config.toml
 
 RUN mise install --yes erlang@29.0.3 \

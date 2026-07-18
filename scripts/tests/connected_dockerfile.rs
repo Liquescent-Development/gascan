@@ -95,6 +95,19 @@ fn dockerfile_creates_traversable_mise_config_directory_before_copying_config() 
     );
 }
 
+#[test]
+fn dockerfile_sets_persistent_rustup_homes_before_mise_installs_tools() {
+    let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
+    let cargo_home = dockerfile
+        .find("ENV CARGO_HOME=/opt/gascan/mise/cargo")
+        .expect("missing persistent CARGO_HOME");
+    let rustup_home = dockerfile
+        .find("ENV RUSTUP_HOME=/opt/gascan/mise/rustup")
+        .expect("missing persistent RUSTUP_HOME");
+    let first_install = dockerfile.find("mise install --yes").unwrap();
+    assert!(cargo_home < first_install && rustup_home < first_install);
+}
+
 fn normalize_mise_ls(input: &str) -> std::process::Output {
     Command::new("jq")
         .args([
