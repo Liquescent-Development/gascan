@@ -292,6 +292,25 @@ pub enum ExecOutput {
 pub struct ExecSession {
     input: tokio::sync::mpsc::Sender<ExecInput>,
     output: tokio::sync::mpsc::Receiver<Result<ExecOutput, RuntimeError>>,
+    cancellation: Option<ExecCancellation>,
+}
+
+#[derive(Clone, Debug)]
+/// Backend-neutral cancellation ownership for a live [`ExecSession`].
+///
+/// Backends must arrange for cancellation to interrupt pending input/output
+/// work and release the underlying guest process. Cancellation is idempotent.
+pub struct ExecCancellation(tokio::sync::watch::Sender<bool>);
+
+impl ExecCancellation {
+    pub fn channel() -> (Self, tokio::sync::watch::Receiver<bool>) {
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        (Self(sender), receiver)
+    }
+
+    pub fn cancel(&self) {
+        let _ = self.0.send(true);
+    }
 }
 
 impl ExecSession {
@@ -304,14 +323,36 @@ impl ExecSession {
             code: exit_code,
             signal: 0,
         }));
-        Self { input, output }
+        Self {
+            input,
+            output,
+            cancellation: None,
+        }
     }
 
     pub fn live(
         input: tokio::sync::mpsc::Sender<ExecInput>,
         output: tokio::sync::mpsc::Receiver<Result<ExecOutput, RuntimeError>>,
     ) -> Self {
-        Self { input, output }
+        Self {
+            input,
+            output,
+            cancellation: None,
+        }
+    }
+
+    /// Creates a live session whose explicit cancellation or drop interrupts
+    /// backend work through `cancellation`.
+    pub fn live_cancellable(
+        input: tokio::sync::mpsc::Sender<ExecInput>,
+        output: tokio::sync::mpsc::Receiver<Result<ExecOutput, RuntimeError>>,
+        cancellation: ExecCancellation,
+    ) -> Self {
+        Self {
+            input,
+            output,
+            cancellation: Some(cancellation),
+        }
     }
 
     pub async fn send(&self, input: ExecInput) -> Result<(), RuntimeError> {
@@ -326,6 +367,19 @@ impl ExecSession {
 
     pub async fn next(&mut self) -> Option<Result<ExecOutput, RuntimeError>> {
         self.output.recv().await
+    }
+
+    /// Requests backend cancellation. Calling this more than once is safe.
+    pub fn cancel(&self) {
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.cancel();
+        }
+    }
+}
+
+impl Drop for ExecSession {
+    fn drop(&mut self) {
+        self.cancel();
     }
 }
 
@@ -480,6 +534,40 @@ impl CreateFailure {
             created: Vec::new(),
             source,
         }
+    }
+
+    /// Retains every independently valid piece of create evidence and drops any
+    /// malformed, duplicate, foreign, or request-unrelated observation.
+    pub fn from_created_evidence(
+        request: &CreateRequest,
+        created: Vec<RuntimeResource>,
+        source: RuntimeError,
+    ) -> Self {
+        let container = ResourceIdentity {
+            kind: ResourceKind::Container,
+            name: request.id.to_string(),
+        };
+        let allowed_volumes: BTreeSet<_> = request
+            .volumes()
+            .iter()
+            .map(|volume| ResourceIdentity {
+                kind: ResourceKind::Volume,
+                name: volume.name.clone(),
+            })
+            .collect();
+        let mut identities = BTreeSet::new();
+        let created = created
+            .into_iter()
+            .filter(|resource| {
+                let allowed =
+                    resource.identity == container || allowed_volumes.contains(&resource.identity);
+                allowed
+                    && resource.ownership == ResourceOwnership::GasCanOwned
+                    && resource.sandbox_id.as_ref() == Some(&request.id)
+                    && identities.insert(resource.identity.clone())
+            })
+            .collect();
+        Self { created, source }
     }
 
     pub fn created(&self) -> &[RuntimeResource] {

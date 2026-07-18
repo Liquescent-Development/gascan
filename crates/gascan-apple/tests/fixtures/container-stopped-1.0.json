@@ -1,0 +1,12 @@
+[
+  {
+    "configuration": {
+      "id": "code-a1b2c3d4e5f6",
+      "labels": {
+        "dev.gascan.managed-by": "gascan",
+        "dev.gascan.sandbox-id": "code-a1b2c3d4e5f6"
+      }
+    },
+    "status": { "state": "stopped" }
+  }
+]

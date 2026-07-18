@@ -17,6 +17,10 @@ fn main() -> io::Result<()> {
         output(r#"{"version":1,"type":"error","code":"apple_api","message":"failed to find target executable"}"#)?;
         return Ok(());
     }
+    if start.contains("block-input") {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        return Ok(());
+    }
 
     for line in lines {
         let line = line?;

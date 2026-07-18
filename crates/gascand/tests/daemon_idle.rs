@@ -55,6 +55,7 @@ async fn sigterm_stops_daemon_and_removes_owned_socket() -> TestResult {
         let runtime_root = temp.path().canonicalize()?;
         let expected = runtime_root.join("gascan/gascand.sock");
         let mut child = Command::new(env!("CARGO_BIN_EXE_gascand"))
+            .env("GASCAN_TEST_FAKE_BACKEND", "1")
             .env("XDG_RUNTIME_DIR", &runtime_root)
             .env("GASCAN_STATE_PATH", runtime_root.join("state.sqlite3"))
             .env("GASCAN_IDLE_TIMEOUT_MS", "30000")
@@ -83,6 +84,7 @@ async fn raw_liveness_probe_disconnect_does_not_end_server() -> TestResult {
         let runtime_root = temp.path().canonicalize()?;
         let socket = runtime_root.join("gascan/gascand.sock");
         let mut child = Command::new(env!("CARGO_BIN_EXE_gascand"))
+            .env("GASCAN_TEST_FAKE_BACKEND", "1")
             .env("XDG_RUNTIME_DIR", &runtime_root)
             .env("GASCAN_STATE_PATH", runtime_root.join("state.sqlite3"))
             .env("GASCAN_IDLE_TIMEOUT_MS", "30000")
@@ -117,6 +119,13 @@ async fn raw_liveness_probe_disconnect_does_not_end_server() -> TestResult {
             .await?
             .into_inner();
         assert!(response.rejection.is_none());
+        assert_eq!(response.daemon_instance_token.len(), 64);
+        assert_eq!(
+            response.daemon_pid,
+            child.id().ok_or("daemon has no process id")?
+        );
+        assert!(!response.daemon_executable.is_empty());
+        assert!(!response.daemon_start_identity.is_empty());
         let pid =
             rustix::process::Pid::from_raw(child.id().ok_or("daemon has no process id")? as i32)
                 .ok_or("daemon process id is zero")?;
@@ -139,6 +148,7 @@ async fn real_uds_tonic_lifecycle_request_reaches_sandbox_service() -> TestResul
     std::fs::create_dir(&project)?;
     let socket = runtime_root.join("gascan/gascand.sock");
     let mut child = Command::new(env!("CARGO_BIN_EXE_gascand"))
+        .env("GASCAN_TEST_FAKE_BACKEND", "1")
         .env("XDG_RUNTIME_DIR", &runtime_root)
         .env("GASCAN_STATE_PATH", runtime_root.join("state.sqlite3"))
         .env("GASCAN_IDLE_TIMEOUT_MS", "30000")
@@ -207,6 +217,7 @@ async fn sigterm_waits_for_active_durable_operation_then_closes_connection() -> 
     std::fs::create_dir(&project)?;
     let socket = runtime_root.join("gascan/gascand.sock");
     let mut child = Command::new(env!("CARGO_BIN_EXE_gascand"))
+        .env("GASCAN_TEST_FAKE_BACKEND", "1")
         .env("XDG_RUNTIME_DIR", &runtime_root)
         .env("GASCAN_STATE_PATH", runtime_root.join("state.sqlite3"))
         .env("GASCAN_IDLE_TIMEOUT_MS", "30000")

@@ -21,6 +21,8 @@ struct Arguments {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(hide = true)]
+    DaemonAttest,
     Up {
         project_root: String,
         #[arg(long)]
@@ -114,8 +116,22 @@ impl From<std::io::Error> for CliError {
 
 pub async fn execute() -> Result<i32, CliError> {
     let arguments = Arguments::try_parse().map_err(|error| CliError::Usage(error.to_string()))?;
+    if matches!(arguments.command, Command::DaemonAttest) {
+        let attestation = Client::daemon_attestation().await?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "instance_token": attestation.daemon_instance_token,
+                "pid": attestation.daemon_pid,
+                "executable": attestation.daemon_executable,
+                "start_identity": attestation.daemon_start_identity,
+            })
+        );
+        return Ok(0);
+    }
     let mut client = Client::connect_or_start().await?;
     match arguments.command {
+        Command::DaemonAttest => Ok(0),
         Command::Up { project_root, json } => {
             operation(
                 client
@@ -194,15 +210,40 @@ pub async fn execute() -> Result<i32, CliError> {
         }
         Command::Doctor { json } => {
             let doctor = client.api.doctor(v1::DoctorRequest {}).await?.into_inner();
+            let checks = doctor
+                .capabilities
+                .iter()
+                .map(|capability| {
+                    let detail: serde_json::Value = serde_json::from_str(&capability.detail)
+                        .unwrap_or_else(|_| serde_json::json!({"detail": capability.detail, "remedy": ""}));
+                    serde_json::json!({
+                        "id": capability.name,
+                        "status": detail.get("status").and_then(serde_json::Value::as_str).unwrap_or(if capability.available { "pass" } else { "fail" }),
+                        "detail": detail.get("detail").and_then(serde_json::Value::as_str).unwrap_or(""),
+                        "remedy": detail.get("remedy").and_then(serde_json::Value::as_str).unwrap_or(""),
+                    })
+                })
+                .collect::<Vec<_>>();
             if json {
-                println!(
-                    "{}",
-                    serde_json::json!({"capabilities": doctor.capabilities.len(), "findings": doctor.findings.len()})
-                );
+                println!("{}", serde_json::json!({"checks": checks}));
             } else {
-                println!("Gas Can daemon: ready");
+                for check in &checks {
+                    println!(
+                        "{} {:<4} {}",
+                        check["id"].as_str().unwrap_or("unknown"),
+                        check["status"].as_str().unwrap_or("fail"),
+                        check["detail"].as_str().unwrap_or("")
+                    );
+                    if check["status"] != "pass" {
+                        println!("  remedy: {}", check["remedy"].as_str().unwrap_or(""));
+                    }
+                }
             }
-            Ok(0)
+            Ok(if doctor.findings.is_empty() {
+                0
+            } else {
+                EXIT_RUNTIME
+            })
         }
         Command::Run { argv } => run(&mut client, arguments.sandbox, argv, false).await,
         Command::Shell { argv } => run(&mut client, arguments.sandbox, argv, true).await,

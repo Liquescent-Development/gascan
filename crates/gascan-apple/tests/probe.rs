@@ -23,6 +23,61 @@ fn probe_with_output(output: &'static [u8]) -> AppleProbe<FixtureRunner> {
     AppleProbe::new(FixtureRunner(output))
 }
 
+struct StatusRunner(&'static [u8]);
+
+#[async_trait]
+impl CommandRunner for StatusRunner {
+    async fn run(&self, spec: CommandSpec) -> Result<CommandOutput, RuntimeError> {
+        assert_eq!(
+            spec,
+            CommandSpec::new("container", ["system", "status", "--format", "json"])
+        );
+        Ok(CommandOutput {
+            status: 0,
+            stdout: self.0.to_vec(),
+            stderr: Vec::new(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn structured_status_is_exact_and_proves_service_readiness() {
+    let status = AppleProbe::new(StatusRunner(include_bytes!(
+        "fixtures/system-status-1.1.0.json"
+    )))
+    .status()
+    .await
+    .unwrap();
+    assert_eq!(
+        status.app_root,
+        "/Users/test/Library/Application Support/com.apple.container/"
+    );
+    assert_eq!(status.api_server_version, RuntimeVersion::new(1, 1, 0));
+}
+
+#[tokio::test]
+async fn malformed_or_nonrunning_status_fails_closed() {
+    for output in [br#"{}"#.as_slice(), br#"{"status":"stopped"}"#.as_slice()] {
+        assert!(
+            AppleProbe::new(StatusRunner(output))
+                .status()
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn status_rejects_trailing_version_garbage_and_commit_mismatch() {
+    for output in [
+        br#"{"apiServerAppName":"container-apiserver","apiServerBuild":"release","apiServerCommit":"5973b9cc626a3e7a499bb316a958237ebe14e2ed","apiServerVersion":"container-apiserver version 1.1.0 (build: release, commit: 5973b9c) trailing","appRoot":"/tmp/","installRoot":"/usr/local/","status":"running"}"#.as_slice(),
+        br#"{"apiServerAppName":"container-apiserver","apiServerBuild":"release","apiServerCommit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","apiServerVersion":"container-apiserver version 1.1.0 (build: release, commit: 5973b9c)","appRoot":"/tmp/","installRoot":"/usr/local/","status":"running"}"#.as_slice(),
+        br#"{"apiServerAppName":"container-apiserver","apiServerBuild":"release","apiServerCommit":"5973b9cc626a3e7a499bb316a958237ebe14e2ed","apiServerVersion":"container-apiserver version 1.1.0 (build: release, commit: 5973B9C)","appRoot":"/tmp/","installRoot":"/usr/local/","status":"running"}"#.as_slice(),
+    ] {
+        assert!(AppleProbe::new(StatusRunner(output)).status().await.is_err());
+    }
+}
+
 #[tokio::test]
 async fn accepts_supported_major_and_rejects_future_major() {
     let supported = probe_with_output(include_bytes!("fixtures/system-version-1.0.0.json"))
@@ -55,8 +110,8 @@ async fn promotes_only_the_live_verified_apple_1_1_0_offline_mechanism() {
     assert_eq!(capabilities.offline, NetworkIsolation::Unsupported);
 
     for output in [
-        br#"[{"appName":"container","version":"1.1.0"}]"#.as_slice(),
-        br#"[{"appName":"helper","version":"9.0.0"},{"appName":"container","version":"1.1.0","future":true}]"#.as_slice(),
+        br#"[{"appName":"container","buildType":"release","commit":"5973b9cc626a3e7a499bb316a958237ebe14e2ed","version":"1.1.0"}]"#.as_slice(),
+        br#"[{"appName":"helper","version":"9.0.0"},{"appName":"container","buildType":"release","commit":"5973b9cc626a3e7a499bb316a958237ebe14e2ed","version":"1.1.0","future":true}]"#.as_slice(),
     ] {
         assert_eq!(
             probe_with_output(output)
@@ -69,8 +124,10 @@ async fn promotes_only_the_live_verified_apple_1_1_0_offline_mechanism() {
     }
 
     for output in [
-        br#"[{"appName":"container","version":"1.1.1"}]"#.as_slice(),
-        br#"[{"appName":"container","version":"1.9.3"}]"#.as_slice(),
+        br#"[{"appName":"container","buildType":"release","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","version":"1.1.1"}]"#
+            .as_slice(),
+        br#"[{"appName":"container","buildType":"release","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","version":"1.9.3"}]"#
+            .as_slice(),
     ] {
         assert_eq!(
             probe_with_output(output)
@@ -85,11 +142,13 @@ async fn promotes_only_the_live_verified_apple_1_1_0_offline_mechanism() {
 
 #[tokio::test]
 async fn offline_request_is_rejected_before_mount_construction_without_proof() {
-    let capability = probe_with_output(br#"[{"appName":"container","version":"1.1.1"}]"#)
-        .base_capabilities()
-        .await
-        .unwrap()
-        .offline;
+    let capability = probe_with_output(
+        br#"[{"appName":"container","buildType":"release","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","version":"1.1.1"}]"#,
+    )
+    .base_capabilities()
+    .await
+    .unwrap()
+    .offline;
     let mut mount_constructed = false;
     let result = gascan_apple::offline_network_args(capability, || {
         mount_constructed = true;
@@ -131,7 +190,7 @@ async fn rejects_missing_duplicate_or_malformed_container_version() {
 #[tokio::test]
 async fn ignores_unknown_fields_and_extra_apps() {
     let version = probe_with_output(
-        br#"[{"appName":"helper","future":true},42,{"unknown":"shape"},{"appName":"container","version":"1.9.3","future":true}]"#,
+        br#"[{"appName":"helper","future":true},42,{"unknown":"shape"},{"appName":"container","buildType":"release","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","version":"1.9.3","future":true}]"#,
     )
     .version()
     .await

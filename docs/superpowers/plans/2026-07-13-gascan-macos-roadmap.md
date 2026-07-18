@@ -73,6 +73,8 @@ Concurrency rule: Track A owns `crates/gascan-apple/**` and runtime fixtures; Tr
 
 **Gate 2:** Plan 1's signed-off report proves or rejects every required Apple capability. Offline networking, canonical bind mounts, TTY/signal behavior, and owned cleanup are mandatory. A failed mandatory capability stops Plans 3 and 4 integration and returns the design to review.
 
+Binding Task 5 interpretation: the frozen Gate 2 report at commit `6bedef8` (SHA-256 `df51167b450c3fd0eb80699db76b4decbd7c44ab7f73788eee3240eb19057ad1`) is capability and MVP-kernel evidence only when the current host is supported and both the exact release 1.1.0 client and exact running 1.1.0 API server match Apple revision `5973b9cc626a3e7a499bb316a958237ebe14e2ed` and the approved structured status schema. The status fixture SHA-256 is `00e66b6721f5b9ce185b98bef47f0699425d06bff6396b4e29e90f55e9079cf9`. Any mismatch fails closed.
+
 **Gate 3:** Plan 2 passes unit, contract, daemon crash-recovery, and CLI end-to-end tests entirely against the fake backend.
 
 ## Phase 2: Real Backend and Provisioning Integration

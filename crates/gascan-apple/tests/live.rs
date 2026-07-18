@@ -1,5 +1,7 @@
 #[path = "live/attach.rs"]
 mod attach;
+#[path = "live/backend_contract.rs"]
+mod backend_contract;
 #[path = "live/common/mod.rs"]
 mod common;
 #[path = "live/lifecycle.rs"]

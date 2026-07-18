@@ -4,6 +4,7 @@ use crate::{
     OperationRecord, SandboxRecord, SetupResolution, Store, StoreError, ToolResolution,
 };
 use async_trait::async_trait;
+use gascan_core::doctor::{DoctorFacts, DoctorReport};
 use gascan_core::manifest::ManifestError;
 use gascan_core::policy::{PolicyCompiler, PolicyError};
 use gascan_core::runtime::{
@@ -114,6 +115,67 @@ pub struct SandboxService<B: RuntimeBackend> {
     store: Store,
     provisioner: Arc<dyn Provisioner>,
     locks: Mutex<HashMap<SandboxId, Weak<AsyncMutex<()>>>>,
+    doctor: DoctorState,
+}
+
+#[derive(Clone)]
+pub struct DoctorState {
+    receiver: tokio::sync::watch::Receiver<Option<DoctorReport>>,
+}
+
+pub struct DoctorCompleter {
+    sender: tokio::sync::watch::Sender<Option<DoctorReport>>,
+}
+
+impl DoctorState {
+    pub fn ready(report: DoctorReport) -> Self {
+        let (_sender, receiver) = tokio::sync::watch::channel(Some(report));
+        Self { receiver }
+    }
+
+    pub fn pending() -> (Self, DoctorCompleter) {
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        (Self { receiver }, DoctorCompleter { sender })
+    }
+
+    pub fn collect<F>(timeout: std::time::Duration, collector: F) -> Self
+    where
+        F: std::future::Future<Output = DoctorReport> + Send + 'static,
+    {
+        let (state, completer) = Self::pending();
+        tokio::spawn(async move {
+            let report = tokio::time::timeout(timeout, collector)
+                .await
+                .unwrap_or_else(|_| {
+                    DoctorFacts::unavailable(format!(
+                        "runtime evidence collector exceeded its {} second bound",
+                        timeout.as_secs()
+                    ))
+                    .into_report()
+                });
+            completer.complete(report);
+        });
+        state
+    }
+
+    pub async fn report(&self) -> DoctorReport {
+        let mut receiver = self.receiver.clone();
+        loop {
+            if let Some(report) = receiver.borrow().clone() {
+                return report;
+            }
+            if receiver.changed().await.is_err() {
+                return DoctorFacts::unavailable("runtime evidence collection was abandoned")
+                    .into_report();
+            }
+        }
+    }
+}
+
+impl DoctorCompleter {
+    pub fn complete(self, report: DoctorReport) {
+        self.sender.send_replace(Some(report));
+    }
 }
 
 #[derive(Debug, Error)]
@@ -150,11 +212,30 @@ pub enum ServiceError {
 
 impl<B: RuntimeBackend> SandboxService<B> {
     pub fn new(runtime: B, store: Store, provisioner: Arc<dyn Provisioner>) -> Self {
+        Self::new_with_doctor(runtime, store, provisioner, default_doctor_report())
+    }
+
+    pub fn new_with_doctor(
+        runtime: B,
+        store: Store,
+        provisioner: Arc<dyn Provisioner>,
+        doctor: DoctorReport,
+    ) -> Self {
+        Self::new_with_doctor_state(runtime, store, provisioner, DoctorState::ready(doctor))
+    }
+
+    pub fn new_with_doctor_state(
+        runtime: B,
+        store: Store,
+        provisioner: Arc<dyn Provisioner>,
+        doctor: DoctorState,
+    ) -> Self {
         Self {
             runtime,
             store,
             provisioner,
             locks: Mutex::new(HashMap::new()),
+            doctor,
         }
     }
 
@@ -234,6 +315,24 @@ impl<B: RuntimeBackend> SandboxService<B> {
     }
     pub fn latest_operation(&self) -> Result<Option<OperationRecord>, ServiceError> {
         Ok(self.store.latest_operation()?)
+    }
+
+    pub async fn doctor_report(&self) -> DoctorReport {
+        self.doctor.report().await
+    }
+
+    pub async fn require_runtime_ready(&self) -> Result<(), ServiceError> {
+        let report = self.doctor_report().await;
+        if let Some(check) = report
+            .checks
+            .into_iter()
+            .find(|check| check.status != gascan_core::doctor::DoctorStatus::Pass)
+        {
+            return Err(ServiceError::Runtime(RuntimeError::UnsupportedCapability {
+                capability: format!("{}: {}; remedy: {}", check.id, check.detail, check.remedy),
+            }));
+        }
+        Ok(())
     }
 
     async fn database<T, F>(&self, action: F) -> Result<T, ServiceError>
@@ -1081,6 +1180,16 @@ impl<B: RuntimeBackend> SandboxService<B> {
         }
         Ok(())
     }
+}
+
+#[cfg(debug_assertions)]
+fn default_doctor_report() -> DoctorReport {
+    DoctorFacts::all_supported_for_tests().into_report()
+}
+
+#[cfg(not(debug_assertions))]
+fn default_doctor_report() -> DoctorReport {
+    DoctorFacts::unavailable("no production doctor evidence was supplied").into_report()
 }
 
 impl ServiceError {

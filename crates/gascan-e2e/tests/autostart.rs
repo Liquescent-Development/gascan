@@ -43,6 +43,7 @@ impl Environment {
                 self.runtime_root.join("daemon.stderr"),
             )
             .env("GASCAN_DAEMON", &self.gascand);
+        command.env("GASCAN_TEST_FAKE_BACKEND", "1");
         command
     }
 

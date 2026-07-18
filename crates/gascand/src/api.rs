@@ -4,6 +4,7 @@ use crate::{
     SandboxService, ServiceError, SocketPaths, UpRequest as ServiceUpRequest,
 };
 use camino::Utf8PathBuf;
+use gascan_core::doctor::DoctorStatus;
 use gascan_core::manifest::Manifest;
 use gascan_core::runtime::RuntimeBackend;
 use gascan_core::sandbox::{SandboxId, SandboxSpec};
@@ -22,12 +23,92 @@ use tokio::sync::Notify;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnixListenerStream;
 
+#[derive(serde::Serialize)]
+struct DaemonInstanceRecord {
+    pid: u32,
+    owner_token: String,
+    executable: std::path::PathBuf,
+    start_identity: String,
+    instance_token: String,
+}
+
+fn write_daemon_instance_record(identity: &DaemonIdentity) -> io::Result<()> {
+    let Some(path) = std::env::var_os("GASCAN_DAEMON_INSTANCE_PATH").map(std::path::PathBuf::from)
+    else {
+        return Ok(());
+    };
+    let owner_token = std::env::var("GASCAN_DAEMON_OWNER_TOKEN").map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "daemon owner token is required",
+        )
+    })?;
+    let record = DaemonInstanceRecord {
+        pid: identity.pid,
+        owner_token,
+        executable: identity.executable.clone(),
+        start_identity: identity.start_identity.clone(),
+        instance_token: identity.instance_token.clone(),
+    };
+    let bytes = serde_json::to_vec(&record).map_err(io::Error::other)?;
+    let temporary = path.with_extension(format!("tmp-{}", identity.pid));
+    std::fs::write(&temporary, bytes)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        &temporary,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )?;
+    std::fs::rename(temporary, path)
+}
+
+#[derive(Clone, Debug)]
+struct DaemonIdentity {
+    pid: u32,
+    executable: std::path::PathBuf,
+    start_identity: String,
+    instance_token: String,
+}
+
+impl DaemonIdentity {
+    fn current() -> io::Result<Self> {
+        let pid = std::process::id();
+        let mut random = [0_u8; 32];
+        getrandom::fill(&mut random).map_err(io::Error::other)?;
+        let instance_token = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        Ok(Self {
+            pid,
+            executable: std::env::current_exe()?.canonicalize()?,
+            start_identity: process_start_identity(pid)?,
+            instance_token,
+        })
+    }
+}
+
+fn process_start_identity(pid: u32) -> io::Result<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(
+            "could not read daemon process start identity",
+        ));
+    }
+    let value = String::from_utf8(output.stdout).map_err(io::Error::other)?;
+    let value = value.trim().to_owned();
+    if value.is_empty() {
+        Err(io::Error::other("empty daemon process start identity"))
+    } else {
+        Ok(value)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ActivityTracker {
     inner: Arc<ActivityInner>,
 }
 #[derive(Debug)]
 struct ActivityInner {
+    identity: DaemonIdentity,
     leases: AtomicUsize,
     operations: AtomicUsize,
     generation: AtomicUsize,
@@ -50,8 +131,13 @@ impl Default for ActivityTracker {
 impl ActivityTracker {
     #[must_use]
     pub fn new() -> Self {
+        let identity = DaemonIdentity::current().unwrap_or_else(|error| {
+            eprintln!("daemon identity creation failed: {error}");
+            std::process::abort()
+        });
         Self {
             inner: Arc::new(ActivityInner {
+                identity,
                 leases: AtomicUsize::new(0),
                 operations: AtomicUsize::new(0),
                 generation: AtomicUsize::new(0),
@@ -238,6 +324,7 @@ impl Daemon {
         if let Some(pid_path) = std::env::var_os("GASCAN_PID_PATH") {
             std::fs::write(pid_path, std::process::id().to_string())?;
         }
+        write_daemon_instance_record(&config.activity().inner.identity)?;
         owned.set_nonblocking(true)?;
         let listener = tokio::net::UnixListener::from_std(owned.try_clone()?)?;
         let expected_uid = crate::PeerUid::current();
@@ -582,7 +669,48 @@ async fn spec_for_root(project_root: String) -> Result<SandboxSpec, ApiInputErro
 
 type EventStream =
     tokio_stream::wrappers::ReceiverStream<Result<v1::OperationEvent, tonic::Status>>;
-type AttachStream = tokio_stream::wrappers::ReceiverStream<Result<v1::ServerFrame, tonic::Status>>;
+pub struct AttachStream {
+    data: tokio::sync::mpsc::Receiver<Result<v1::ServerFrame, tonic::Status>>,
+    terminal: tokio::sync::oneshot::Receiver<AttachTerminal>,
+    pending_terminal: Option<AttachTerminal>,
+    ended: bool,
+}
+
+struct AttachTerminal {
+    frame: Result<v1::ServerFrame, tonic::Status>,
+}
+
+impl tokio_stream::Stream for AttachStream {
+    type Item = Result<v1::ServerFrame, tonic::Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.ended {
+            return Poll::Ready(None);
+        }
+        if self.pending_terminal.is_none() {
+            match Pin::new(&mut self.terminal).poll(context) {
+                Poll::Ready(Ok(terminal)) => self.pending_terminal = Some(terminal),
+                Poll::Ready(Err(_)) => {
+                    self.ended = true;
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => {}
+            }
+        }
+        match Pin::new(&mut self.data).poll_recv(context) {
+            Poll::Ready(None) => {
+                self.ended = true;
+                let terminal = self.pending_terminal.take();
+                Poll::Ready(match terminal {
+                    Some(terminal) => Some(terminal.frame),
+                    None => None,
+                })
+            }
+            other => other,
+        }
+    }
+}
+const ATTACH_CANCEL_GRACE: Duration = Duration::from_millis(250);
 
 fn session_event(token: Vec<u8>) -> v1::OperationEvent {
     v1::OperationEvent {
@@ -677,6 +805,204 @@ fn server_error(code: impl Into<String>, message: impl Into<String>) -> v1::Serv
     }
 }
 
+fn attach_runtime_error(message: impl Into<String>) -> gascan_core::runtime::RuntimeError {
+    gascan_core::runtime::RuntimeError::CommandIo {
+        operation: "attach_bridge".to_owned(),
+        message: message.into(),
+    }
+}
+
+async fn attach_shutdown_requested_with(activity: &ActivityTracker, registered: impl FnOnce()) {
+    let notified = activity.inner.shutdown.notified();
+    tokio::pin!(notified);
+    registered();
+    if !activity.inner.shutting_down.load(Ordering::Acquire) {
+        notified.await;
+    }
+}
+
+async fn attach_shutdown_requested(activity: &ActivityTracker) {
+    attach_shutdown_requested_with(activity, || {}).await;
+}
+
+enum AttachDataSend {
+    Sent,
+    Disconnected,
+    Shutdown,
+}
+
+async fn send_attach_frame(
+    sender: &tokio::sync::mpsc::Sender<Result<v1::ServerFrame, tonic::Status>>,
+    frame: v1::ServerFrame,
+    activity: &ActivityTracker,
+) -> AttachDataSend {
+    tokio::select! {
+        result = sender.send(Ok(frame)) => if result.is_ok() { AttachDataSend::Sent } else { AttachDataSend::Disconnected },
+        () = sender.closed() => AttachDataSend::Disconnected,
+        () = attach_shutdown_requested(activity) => AttachDataSend::Shutdown,
+    }
+}
+
+async fn finish_attach_session(
+    session: &mut gascan_core::runtime::ExecSession,
+    data: &tokio::sync::mpsc::Sender<Result<v1::ServerFrame, tonic::Status>>,
+    terminal: &mut Option<tokio::sync::oneshot::Sender<AttachTerminal>>,
+    forward_terminal: bool,
+) {
+    let graceful = async {
+        session.send(gascan_core::runtime::ExecInput::Close).await?;
+        loop {
+            match session.next().await {
+                Some(Ok(output @ gascan_core::runtime::ExecOutput::Exit { .. })) => {
+                    return Ok(server_output(output));
+                }
+                Some(Err(error)) => return Ok(server_error(error.code(), error.to_string())),
+                Some(Ok(output)) => data
+                    .send(Ok(server_output(output)))
+                    .await
+                    .map_err(|_| attach_runtime_error("attach response data stream closed"))?,
+                None => {
+                    return Err(attach_runtime_error(
+                        "runtime session closed without a terminal output",
+                    ));
+                }
+            }
+        }
+    };
+    let terminal_frame = match tokio::time::timeout(ATTACH_CANCEL_GRACE, graceful).await {
+        Ok(Ok(frame)) => frame,
+        Ok(Err(error)) => server_error(error.code(), error.to_string()),
+        Err(_) => {
+            session.cancel();
+            let error = attach_runtime_error(
+                "runtime session required forced termination after attach cancellation grace expired",
+            );
+            server_error(error.code(), error.to_string())
+        }
+    };
+    if forward_terminal {
+        if let Some(sender) = terminal.take() {
+            let _ = sender.send(AttachTerminal {
+                frame: Ok(terminal_frame),
+            });
+        }
+    }
+}
+
+fn send_terminal(
+    terminal: &mut Option<tokio::sync::oneshot::Sender<AttachTerminal>>,
+    frame: Result<v1::ServerFrame, tonic::Status>,
+) {
+    if let Some(sender) = terminal.take() {
+        let _ = sender.send(AttachTerminal { frame });
+    }
+}
+
+async fn run_attach_bridge<S>(
+    mut session: gascan_core::runtime::ExecSession,
+    mut input: S,
+    first_input: gascan_core::runtime::ExecInput,
+    mut binder: gascan_proto::AttachSessionBinder,
+    sender: tokio::sync::mpsc::Sender<Result<v1::ServerFrame, tonic::Status>>,
+    mut terminal: Option<tokio::sync::oneshot::Sender<AttachTerminal>>,
+    activity: ActivityTracker,
+) where
+    S: tokio_stream::Stream<Item = Result<v1::ClientFrame, tonic::Status>> + Unpin,
+{
+    let _lease = activity.lease();
+    let mut input_closed = matches!(first_input, gascan_core::runtime::ExecInput::Close);
+    tokio::select! {
+        result = session.send(first_input) => {
+            if let Err(error) = result {
+                send_terminal(&mut terminal, Ok(server_error(error.code(), error.to_string())));
+                return;
+            }
+        }
+        () = sender.closed() => {
+            finish_attach_session(&mut session, &sender, &mut terminal, false).await;
+            return;
+        }
+        () = attach_shutdown_requested(&activity) => {
+            finish_attach_session(&mut session, &sender, &mut terminal, !sender.is_closed()).await;
+            return;
+        }
+    }
+    loop {
+        tokio::select! {
+            output = session.next() => match output {
+                Some(Ok(output)) => {
+                    if matches!(output, gascan_core::runtime::ExecOutput::Exit { .. }) {
+                        send_terminal(&mut terminal, Ok(server_output(output)));
+                        break;
+                    }
+                    match send_attach_frame(&sender, server_output(output), &activity).await {
+                        AttachDataSend::Sent => {}
+                        AttachDataSend::Disconnected => {
+                            finish_attach_session(&mut session, &sender, &mut terminal, false).await;
+                            break;
+                        }
+                        AttachDataSend::Shutdown => {
+                            finish_attach_session(&mut session, &sender, &mut terminal, !sender.is_closed()).await;
+                            break;
+                        }
+                    }
+                }
+                Some(Err(error)) => {
+                    send_terminal(&mut terminal, Ok(server_error(error.code(), error.to_string())));
+                    break;
+                }
+                None => {
+                    let error = attach_runtime_error("runtime session closed without a terminal output");
+                    send_terminal(&mut terminal, Ok(server_error(error.code(), error.to_string())));
+                    break;
+                }
+            },
+            frame = input.next(), if !input_closed => match frame {
+                Some(Ok(frame)) => {
+                    let input_frame = if let v1::ClientFrame { frame: Some(_), .. } = &frame {
+                        match binder.validate_frame(&frame.session_token) {
+                            Ok(()) => exec_input(frame),
+                            Err(error) => {
+                                let code = error.code();
+                                finish_attach_session(&mut session, &sender, &mut terminal, false).await;
+                                send_terminal(&mut terminal, Ok(server_error(code, "attach frame rejected")));
+                                break;
+                            },
+                        }
+                    } else { Err(ApiInputError::Invalid) };
+                    match input_frame {
+                        Ok(frame) => {
+                            input_closed = matches!(frame, gascan_core::runtime::ExecInput::Close);
+                            if let Err(error) = session.send(frame).await {
+                                send_terminal(&mut terminal, Ok(server_error(error.code(), error.to_string())));
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            finish_attach_session(&mut session, &sender, &mut terminal, false).await;
+                            send_terminal(&mut terminal, Ok(server_error(error_code::INVALID_REQUEST, "attach frame rejected")));
+                            break;
+                        }
+                    }
+                }
+                Some(Err(error)) => { send_terminal(&mut terminal, Err(error)); break; }
+                None => {
+                    finish_attach_session(&mut session, &sender, &mut terminal, !sender.is_closed()).await;
+                    break;
+                }
+            },
+            () = sender.closed() => {
+                finish_attach_session(&mut session, &sender, &mut terminal, false).await;
+                break;
+            },
+            () = attach_shutdown_requested(&activity) => {
+                finish_attach_session(&mut session, &sender, &mut terminal, !sender.is_closed()).await;
+                break;
+            },
+        }
+    }
+}
+
 #[tonic::async_trait]
 impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
     async fn handshake(
@@ -702,6 +1028,16 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             capabilities: Vec::new(),
             transport_security: Some(local_transport_security()),
             rejection,
+            daemon_instance_token: self.activity.inner.identity.instance_token.clone(),
+            daemon_pid: self.activity.inner.identity.pid,
+            daemon_executable: self
+                .activity
+                .inner
+                .identity
+                .executable
+                .to_string_lossy()
+                .into_owned(),
+            daemon_start_identity: self.activity.inner.identity.start_identity.clone(),
         }))
     }
     async fn status(
@@ -742,9 +1078,34 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
     ) -> Result<tonic::Response<v1::DoctorResponse>, tonic::Status> {
         self.activity.ensure_accepting().map_err(admission_status)?;
         let _lease = self.activity.lease();
+        let report = self.service.doctor_report().await;
+        let capabilities = report
+            .checks
+            .iter()
+            .map(|check| v1::Capability {
+                name: check.id.clone(),
+                available: check.status == DoctorStatus::Pass,
+                detail: serde_json::json!({
+                    "detail": check.detail,
+                    "remedy": check.remedy,
+                    "status": check.status,
+                })
+                .to_string(),
+            })
+            .collect();
+        let findings = report
+            .checks
+            .iter()
+            .filter(|check| check.status != DoctorStatus::Pass)
+            .map(|check| v1::Error {
+                code: check.id.clone(),
+                message: check.detail.clone(),
+                details: check.remedy.as_bytes().to_vec(),
+            })
+            .collect();
         Ok(tonic::Response::new(v1::DoctorResponse {
-            capabilities: Vec::new(),
-            findings: Vec::new(),
+            capabilities,
+            findings,
         }))
     }
     type UpStream = ApiEventStream;
@@ -753,6 +1114,10 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         request: tonic::Request<v1::UpRequest>,
     ) -> Result<tonic::Response<Self::UpStream>, tonic::Status> {
         let operation_lease = self.activity.admit_operation().map_err(admission_status)?;
+        self.service
+            .require_runtime_ready()
+            .await
+            .map_err(service_status)?;
         let spec = spec_for_root(request.into_inner().project_root)
             .await
             .map_err(ApiInputError::status)?;
@@ -783,6 +1148,10 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         request: tonic::Request<v1::ApplyRequest>,
     ) -> Result<tonic::Response<Self::ApplyStream>, tonic::Status> {
         let operation_lease = self.activity.admit_operation().map_err(admission_status)?;
+        self.service
+            .require_runtime_ready()
+            .await
+            .map_err(service_status)?;
         let spec = spec_for_root(request.into_inner().project_root)
             .await
             .map_err(ApiInputError::status)?;
@@ -961,7 +1330,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             return Ok(tonic::Response::new(event_stream(event)));
         }
         event.status = v1::OperationStatus::Pending as i32;
-        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
         let activity = self.activity.clone();
         let service = self.service.clone();
         tokio::spawn(async move {
@@ -1028,7 +1397,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
                 tonic::Status::not_found(code)
             }
         })?;
-        let mut session = self
+        let session = self
             .service
             .exec(
                 &pending.id,
@@ -1040,81 +1409,465 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             .await
             .map_err(service_status)?;
         let (sender, receiver) = tokio::sync::mpsc::channel(16);
+        let (terminal_sender, terminal) = tokio::sync::oneshot::channel();
         let activity = self.activity.clone();
         tokio::spawn(async move {
-            let _lease = activity.lease();
-            let mut input_closed = matches!(first_input, gascan_core::runtime::ExecInput::Close);
-            if session.send(first_input).await.is_err() {
-                return;
-            }
-            loop {
-                tokio::select! {
-                    biased;
-                    output = session.next() => match output {
-                        Some(Ok(output)) => {
-                            if sender.send(Ok(server_output(output))).await.is_err() { break; }
-                        }
-                        Some(Err(error)) => {
-                            let _ = sender.send(Ok(server_error(error.code(), error.to_string()))).await;
-                            break;
-                        }
-                        None => break,
-                    },
-                    frame = input.message(), if !input_closed => match frame {
-                        Ok(Some(frame)) => {
-                            let input_frame = if let v1::ClientFrame { frame: Some(_), .. } = &frame {
-                                match binder.validate_frame(&frame.session_token) {
-                                    Ok(()) => exec_input(frame),
-                                    Err(error) => {
-                                        let code = error.code();
-                                        let _ = session.send(gascan_core::runtime::ExecInput::Close).await;
-                                        let _ = sender.send(Ok(server_error(code, "attach frame rejected"))).await;
-                                        break;
-                                    },
-                                }
-                            } else { Err(ApiInputError::Invalid) };
-                            match input_frame {
-                                Ok(frame) => {
-                                    input_closed = matches!(frame, gascan_core::runtime::ExecInput::Close);
-                                    if session.send(frame).await.is_err() { break; }
-                                }
-                                Err(_) => {
-                                    let _ = session.send(gascan_core::runtime::ExecInput::Close).await;
-                                    let _ = sender.send(Ok(server_error(error_code::INVALID_REQUEST, "attach frame rejected"))).await;
-                                    break;
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            input_closed = true;
-                            let _ = session.send(gascan_core::runtime::ExecInput::Close).await;
-                        }
-                        Err(error) => { let _ = sender.send(Err(error)).await; break; }
-                    }
-                }
-            }
+            run_attach_bridge(
+                session,
+                input,
+                first_input,
+                binder,
+                sender,
+                Some(terminal_sender),
+                activity,
+            )
+            .await;
         });
-        Ok(tonic::Response::new(
-            tokio_stream::wrappers::ReceiverStream::new(receiver),
-        ))
+        Ok(tonic::Response::new(AttachStream {
+            data: receiver,
+            terminal,
+            pending_terminal: None,
+            ended: false,
+        }))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivityTracker, ApiEventStream, ApiInputError, PendingSession, SessionRegistry,
-        service_status, spec_for_root, wire_event, wire_status,
+        ActivityTracker, ApiEventStream, ApiInputError, AttachStream, AttachTerminal,
+        PendingSession, SessionRegistry, attach_shutdown_requested_with,
+        run_attach_bridge as run_attach_bridge_impl, service_status, spec_for_root, wire_event,
+        wire_status,
     };
     use crate::{
         ActualState, DesiredState, OperationEvent, OperationId, OperationStatus, SandboxRecord,
         ServiceError, StoreError,
     };
     use camino::Utf8PathBuf;
-    use gascan_core::sandbox::SandboxId;
-    use gascan_proto::error_code;
+    use gascan_core::{
+        runtime::{ExecInput, ExecOutput, ExecSession},
+        sandbox::SandboxId,
+    };
+    use gascan_proto::{error_code, v1};
     use serde_json::json;
     use tokio_stream::StreamExt;
+
+    async fn run_attach_bridge<S>(
+        session: ExecSession,
+        input: S,
+        first_input: ExecInput,
+        binder: gascan_proto::AttachSessionBinder,
+        sender: tokio::sync::mpsc::Sender<Result<v1::ServerFrame, tonic::Status>>,
+        activity: ActivityTracker,
+    ) where
+        S: tokio_stream::Stream<Item = Result<v1::ClientFrame, tonic::Status>> + Unpin,
+    {
+        let (terminal_sender, terminal) = tokio::sync::oneshot::channel::<AttachTerminal>();
+        let terminal_output = sender.clone();
+        let forward = tokio::spawn(async move {
+            if let Ok(terminal) = terminal.await {
+                let _ = terminal_output.send(terminal.frame).await;
+            }
+        });
+        run_attach_bridge_impl(
+            session,
+            input,
+            first_input,
+            binder,
+            sender,
+            Some(terminal_sender),
+            activity,
+        )
+        .await;
+        let _ = forward.await;
+    }
+
+    fn bound_binder(token: &[u8]) -> gascan_proto::AttachSessionBinder {
+        let mut binder = gascan_proto::AttachSessionBinder::new();
+        assert!(binder.validate_frame(token).is_ok());
+        binder
+    }
+
+    #[tokio::test]
+    async fn attach_eof_emits_one_stable_terminal_error() {
+        let (input, _inputs) = tokio::sync::mpsc::channel(1);
+        let (outputs, output) = tokio::sync::mpsc::channel(1);
+        drop(outputs);
+        let session = ExecSession::live(input, output);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        run_attach_bridge(
+            session,
+            tokio_stream::empty(),
+            ExecInput::Close,
+            bound_binder(b"eof"),
+            sender,
+            ActivityTracker::new(),
+        )
+        .await;
+        let frame = receiver
+            .recv()
+            .await
+            .and_then(Result::ok)
+            .and_then(|frame| frame.frame);
+        assert!(
+            matches!(frame, Some(v1::server_frame::Frame::Error(error)) if error.code == "command_io")
+        );
+        assert!(receiver.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn attach_first_send_failure_emits_one_terminal_error() {
+        let (input, inputs) = tokio::sync::mpsc::channel(1);
+        drop(inputs);
+        let (_outputs, output) = tokio::sync::mpsc::channel(1);
+        let session = ExecSession::live(input, output);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        run_attach_bridge(
+            session,
+            tokio_stream::empty(),
+            ExecInput::Close,
+            bound_binder(b"first-send"),
+            sender,
+            ActivityTracker::new(),
+        )
+        .await;
+        assert!(matches!(
+            receiver
+                .recv()
+                .await
+                .and_then(Result::ok)
+                .and_then(|frame| frame.frame),
+            Some(v1::server_frame::Frame::Error(_))
+        ));
+        assert!(receiver.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn attach_shutdown_forced_timeout_is_bounded_and_typed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let activity = ActivityTracker::new();
+        let (input, _inputs) = tokio::sync::mpsc::channel(1);
+        let (_outputs, output) = tokio::sync::mpsc::channel(1);
+        let session = ExecSession::live(input, output);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let bridge = tokio::spawn(run_attach_bridge(
+            session,
+            tokio_stream::pending(),
+            ExecInput::Stdin(Vec::new()),
+            bound_binder(b"shutdown"),
+            sender,
+            activity.clone(),
+        ));
+        tokio::task::yield_now().await;
+        activity.cancel_streams();
+        tokio::time::timeout(std::time::Duration::from_secs(1), bridge).await??;
+        let frame = receiver
+            .recv()
+            .await
+            .and_then(Result::ok)
+            .and_then(|frame| frame.frame);
+        assert!(
+            matches!(frame, Some(v1::server_frame::Frame::Error(error)) if error.code == "command_io")
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            activity.wait_for_idle(std::time::Duration::from_millis(1)),
+        )
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forced_terminal_error_follows_full_data_queue()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let activity = ActivityTracker::new();
+        let (input, _inputs) = tokio::sync::mpsc::channel(1);
+        let (_outputs, output) = tokio::sync::mpsc::channel(1);
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        sender
+            .send(Ok(v1::ServerFrame {
+                frame: Some(v1::server_frame::Frame::Stdout(vec![1])),
+            }))
+            .await?;
+        sender
+            .send(Ok(v1::ServerFrame {
+                frame: Some(v1::server_frame::Frame::Stderr(vec![2])),
+            }))
+            .await?;
+        let (terminal_sender, terminal) = tokio::sync::oneshot::channel();
+        let bridge = tokio::spawn(run_attach_bridge_impl(
+            ExecSession::live(input, output),
+            tokio_stream::pending(),
+            ExecInput::Stdin(Vec::new()),
+            bound_binder(b"full-terminal"),
+            sender,
+            Some(terminal_sender),
+            activity.clone(),
+        ));
+        activity.cancel_streams();
+        tokio::time::timeout(std::time::Duration::from_secs(1), bridge).await??;
+        let mut stream = AttachStream {
+            data: receiver,
+            terminal,
+            pending_terminal: None,
+            ended: false,
+        };
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+                .await?
+                .and_then(Result::ok)
+                .and_then(|frame| frame.frame),
+            Some(v1::server_frame::Frame::Stdout(vec![1]))
+        );
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+                .await?
+                .and_then(Result::ok)
+                .and_then(|frame| frame.frame),
+            Some(v1::server_frame::Frame::Stderr(vec![2]))
+        );
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+                .await?
+                .and_then(Result::ok)
+                .and_then(|frame| frame.frame),
+            Some(v1::server_frame::Frame::Error(error)) if error.code == "command_io"
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+                .await?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_notification_between_registration_and_atomic_check_is_observed() {
+        let activity = ActivityTracker::new();
+        attach_shutdown_requested_with(&activity, || activity.cancel_streams()).await;
+    }
+
+    #[tokio::test]
+    async fn attach_shutdown_gracefully_closes_before_timeout()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let activity = ActivityTracker::new();
+        let (input, mut inputs) = tokio::sync::mpsc::channel(2);
+        let (outputs, output) = tokio::sync::mpsc::channel(1);
+        let session = ExecSession::live(input, output);
+        let runtime = tokio::spawn(async move {
+            assert!(matches!(inputs.recv().await, Some(ExecInput::Stdin(_))));
+            assert_eq!(inputs.recv().await, Some(ExecInput::Close));
+            let _ = outputs.send(Ok(ExecOutput::Stdout(vec![0, 255]))).await;
+            let _ = outputs.send(Ok(ExecOutput::Stderr(vec![254, 1]))).await;
+            let _ = outputs
+                .send(Ok(ExecOutput::Exit { code: 0, signal: 0 }))
+                .await;
+        });
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let bridge = tokio::spawn(run_attach_bridge(
+            session,
+            tokio_stream::pending(),
+            ExecInput::Stdin(Vec::new()),
+            bound_binder(b"graceful-shutdown"),
+            sender,
+            activity.clone(),
+        ));
+        tokio::task::yield_now().await;
+        activity.cancel_streams();
+        tokio::time::timeout(std::time::Duration::from_secs(1), bridge).await??;
+        runtime.await?;
+        assert_eq!(
+            receiver
+                .recv()
+                .await
+                .and_then(Result::ok)
+                .and_then(|frame| frame.frame),
+            Some(v1::server_frame::Frame::Stdout(vec![0, 255]))
+        );
+        assert_eq!(
+            receiver
+                .recv()
+                .await
+                .and_then(Result::ok)
+                .and_then(|frame| frame.frame),
+            Some(v1::server_frame::Frame::Stderr(vec![254, 1]))
+        );
+        assert!(matches!(
+            receiver
+                .recv()
+                .await
+                .and_then(Result::ok)
+                .and_then(|frame| frame.frame),
+            Some(v1::server_frame::Frame::Exit(v1::Exit {
+                code: 0,
+                signal: 0
+            }))
+        ));
+        assert!(receiver.recv().await.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attach_client_half_close_forwards_actual_exit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (input, mut inputs) = tokio::sync::mpsc::channel(2);
+        let (outputs, output) = tokio::sync::mpsc::channel(1);
+        let runtime = tokio::spawn(async move {
+            assert!(matches!(inputs.recv().await, Some(ExecInput::Stdin(_))));
+            assert_eq!(inputs.recv().await, Some(ExecInput::Close));
+            let _ = outputs.send(Ok(ExecOutput::Stdout(vec![0, 255]))).await;
+            let _ = outputs.send(Ok(ExecOutput::Stderr(vec![254, 1]))).await;
+            let _ = outputs
+                .send(Ok(ExecOutput::Exit {
+                    code: 42,
+                    signal: 0,
+                }))
+                .await;
+        });
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        run_attach_bridge(
+            ExecSession::live(input, output),
+            tokio_stream::empty(),
+            ExecInput::Stdin(Vec::new()),
+            bound_binder(b"half-close"),
+            sender,
+            ActivityTracker::new(),
+        )
+        .await;
+        runtime.await?;
+        assert_eq!(
+            receiver
+                .recv()
+                .await
+                .and_then(Result::ok)
+                .and_then(|frame| frame.frame),
+            Some(v1::server_frame::Frame::Stdout(vec![0, 255]))
+        );
+        assert_eq!(
+            receiver
+                .recv()
+                .await
+                .and_then(Result::ok)
+                .and_then(|frame| frame.frame),
+            Some(v1::server_frame::Frame::Stderr(vec![254, 1]))
+        );
+        assert!(matches!(
+            receiver
+                .recv()
+                .await
+                .and_then(Result::ok)
+                .and_then(|frame| frame.frame),
+            Some(v1::server_frame::Frame::Exit(v1::Exit {
+                code: 42,
+                signal: 0
+            }))
+        ));
+        assert!(receiver.recv().await.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attach_client_disconnect_cancellation_releases_activity_lease()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let activity = ActivityTracker::new();
+        let (input, _inputs) = tokio::sync::mpsc::channel(1);
+        let (_outputs, output) = tokio::sync::mpsc::channel(1);
+        let session = ExecSession::live(input, output);
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let bridge = tokio::spawn(run_attach_bridge(
+            session,
+            tokio_stream::pending(),
+            ExecInput::Stdin(Vec::new()),
+            bound_binder(b"disconnect"),
+            sender,
+            activity.clone(),
+        ));
+        drop(receiver);
+        tokio::time::timeout(std::time::Duration::from_secs(1), bridge).await??;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            activity.wait_for_idle(std::time::Duration::from_millis(1)),
+        )
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn continuous_output_does_not_starve_resize_input()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let token = b"fair";
+        let (input, mut inputs) = tokio::sync::mpsc::channel(4);
+        let (outputs, output) = tokio::sync::mpsc::channel(4);
+        let session = ExecSession::live(input, output);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let output_task = tokio::spawn(async move {
+            while outputs.send(Ok(ExecOutput::Stdout(vec![1]))).await.is_ok() {}
+        });
+        let resize = v1::ClientFrame {
+            frame: Some(v1::client_frame::Frame::Resize(v1::Resize {
+                columns: 80,
+                rows: 24,
+            })),
+            session_token: token.to_vec(),
+        };
+        let bridge = tokio::spawn(run_attach_bridge(
+            session,
+            tokio_stream::iter([Ok(resize)]).chain(tokio_stream::pending()),
+            ExecInput::Stdin(Vec::new()),
+            bound_binder(token),
+            sender,
+            ActivityTracker::new(),
+        ));
+        let drain = tokio::spawn(async move { while receiver.recv().await.is_some() {} });
+        assert_eq!(inputs.recv().await, Some(ExecInput::Stdin(Vec::new())));
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), inputs.recv()).await?,
+            Some(ExecInput::Resize {
+                columns: 80,
+                rows: 24
+            })
+        );
+        bridge.abort();
+        output_task.abort();
+        drain.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attach_output_backpressure_is_bounded_and_disconnect_cancels_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let activity = ActivityTracker::new();
+        let (input, _inputs) = tokio::sync::mpsc::channel(1);
+        let (outputs, output) = tokio::sync::mpsc::channel(2);
+        let session = ExecSession::live(input, output);
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let bridge = tokio::spawn(run_attach_bridge(
+            session,
+            tokio_stream::pending(),
+            ExecInput::Stdin(Vec::new()),
+            bound_binder(b"backpressure"),
+            sender,
+            activity.clone(),
+        ));
+        let producer = tokio::spawn(async move {
+            for _ in 0..64 {
+                if outputs
+                    .send(Ok(ExecOutput::Stdout(vec![7; 1024])))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!producer.is_finished());
+        drop(receiver);
+        tokio::time::timeout(std::time::Duration::from_secs(1), bridge).await??;
+        tokio::time::timeout(std::time::Duration::from_secs(1), producer).await??;
+        Ok(())
+    }
 
     #[test]
     fn session_claim_is_atomic_and_distinguishes_expired_from_unknown() {

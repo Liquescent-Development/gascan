@@ -69,6 +69,7 @@ impl Environment {
             )
             .env("GASCAN_PID_PATH", self.runtime_root.join("daemon.pid"))
             .env("GASCAN_DAEMON", &self.gascand);
+        command.env("GASCAN_TEST_FAKE_BACKEND", "1");
         command
     }
     fn invoke(&self, arguments: &[&str]) -> Result<std::process::Output, std::io::Error> {
@@ -979,24 +980,21 @@ async fn pre_begin_rpc_failures_keep_stable_statuses() -> TestResult {
         gascan_proto::error_code::OPERATION_CONFLICT
     );
 
-    let failing = Environment::new()?;
+    let doctor_failure = Environment::new()?;
     assert!(
-        failing
+        doctor_failure
             .command(&["doctor", "--json"])
             .env("GASCAN_FAKE_CAPABILITIES_FAIL", "1")
             .output()?
             .status
             .success()
     );
-    let mut failing_client = api_client(failing.runtime_root.clone()).await?;
-    let unavailable = failing_client
-        .up(v1::UpRequest {
-            project_root: failing.root()?.to_owned(),
-        })
-        .await
-        .err()
-        .ok_or("capabilities failure unexpectedly succeeded")?;
-    assert_eq!(unavailable.code(), tonic::Code::Unavailable);
-    assert_ne!(unavailable.code(), tonic::Code::Internal);
+    let failing = Environment::new()?;
+    let unavailable = failing
+        .command(&["up", failing.root()?])
+        .env("GASCAN_FAKE_CAPABILITIES_FAIL", "1")
+        .output()?;
+    assert_eq!(unavailable.status.code(), Some(70));
+
     Ok(())
 }

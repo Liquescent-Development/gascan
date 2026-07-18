@@ -3,11 +3,33 @@ mod common;
 use common::{capabilities, create_request};
 use gascan_core::fake_runtime::{FailureBoundary, FakeRuntime};
 use gascan_core::runtime::{
-    CreateOutcome, ExecInput, ExecOutput, ExecRequest, RemoveRequest, ResourceIdentity,
-    ResourceKind, ResourceOwnership, RuntimeBackend, RuntimeCall, RuntimeError, RuntimeOutcome,
-    RuntimeResource,
+    CreateFailure, CreateOutcome, ExecCancellation, ExecInput, ExecOutput, ExecRequest,
+    ExecSession, RemoveRequest, ResourceIdentity, ResourceKind, ResourceOwnership, RuntimeBackend,
+    RuntimeCall, RuntimeError, RuntimeOutcome, RuntimeResource,
 };
 use gascan_core::sandbox::SandboxId;
+
+#[tokio::test]
+async fn cancellable_exec_session_cancel_is_idempotent() {
+    let (input, _inputs) = tokio::sync::mpsc::channel(1);
+    let (_outputs, output) = tokio::sync::mpsc::channel(1);
+    let (cancellation, mut cancelled) = ExecCancellation::channel();
+    let session = ExecSession::live_cancellable(input, output, cancellation);
+    session.cancel();
+    session.cancel();
+    cancelled.changed().await.unwrap();
+    assert!(*cancelled.borrow());
+}
+
+#[tokio::test]
+async fn cancellable_exec_session_drop_signals_backend() {
+    let (input, _inputs) = tokio::sync::mpsc::channel(1);
+    let (_outputs, output) = tokio::sync::mpsc::channel(1);
+    let (cancellation, mut cancelled) = ExecCancellation::channel();
+    drop(ExecSession::live_cancellable(input, output, cancellation));
+    cancelled.changed().await.unwrap();
+    assert!(*cancelled.borrow());
+}
 
 #[tokio::test]
 async fn exec_session_is_live_bidirectional_and_emits_one_exit() {
@@ -220,6 +242,23 @@ fn create_outcome_rejects_duplicate_resource_identities() {
     let error =
         CreateOutcome::new(&fixture.request(), vec![container.clone(), container]).unwrap_err();
     assert_eq!(error.code(), "ownership_mismatch");
+}
+
+#[test]
+fn outcome_validation_failure_retains_every_independently_valid_created_resource() {
+    let fixture = create_request("outcome-failure-evidence");
+    let volume = RuntimeResource::discovered(
+        ResourceIdentity::new(ResourceKind::Volume, fixture.volumes()[0].name.clone()).unwrap(),
+        Some(fixture.id().clone()),
+        ResourceOwnership::GasCanOwned,
+    );
+    let source = CreateOutcome::new(&fixture.request(), vec![volume.clone()]).unwrap_err();
+
+    let failure = CreateFailure::from_created_evidence(&fixture.request(), vec![volume], source);
+
+    assert_eq!(failure.code(), "invalid_state");
+    assert_eq!(failure.created().len(), 1);
+    assert_eq!(failure.created()[0].name(), fixture.volumes()[0].name);
 }
 
 #[tokio::test]

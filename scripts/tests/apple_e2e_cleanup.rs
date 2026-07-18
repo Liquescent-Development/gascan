@@ -1,0 +1,279 @@
+use std::{fs, os::unix::fs::PermissionsExt as _, path::PathBuf, process::Command};
+
+fn script() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("apple-e2e-cleanup.sh")
+}
+
+fn fake_container(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+    let bin = temp.path().join("container");
+    let calls = temp.path().join("calls");
+    fs::write(
+        &bin,
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >>"$CALLS"
+case "$*" in
+  inspect*|"volume inspect"*)
+    printf '[{"configuration":{"labels":{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":"%s"}}}]\n' "$LABEL_ID"
+    ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    (bin, calls)
+}
+
+fn manifest(temp: &tempfile::TempDir, resources: serde_json::Value) -> PathBuf {
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let session = temp.path().join("session-test");
+    let runtime = session.join("gascan-gate4-runtime-test");
+    let project = session.join("gascan-gate4-root-test");
+    fs::create_dir_all(&runtime).unwrap();
+    fs::create_dir_all(&project).unwrap();
+    fs::set_permissions(&session, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&project, fs::Permissions::from_mode(0o700)).unwrap();
+    let trusted_cli = temp.path().join("trusted-gascan");
+    if !trusted_cli.exists() {
+        fs::write(&trusted_cli, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&trusted_cli, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = temp.path().join("cleanup.json");
+    fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "sandbox_id": "gate4-test-123456789abc",
+            "resources": resources,
+            "managed_by": "gascan",
+            "owner_token": "test-owner",
+            "daemon_instance_path": fs::canonicalize(&runtime).unwrap().join("daemon-instance.json"),
+            "daemon_executable": "/missing/gascand",
+            "daemon_cli": fs::canonicalize(&trusted_cli).unwrap(),
+            "runtime_root": fs::canonicalize(&runtime).unwrap(),
+            "project_root": fs::canonicalize(&project).unwrap(),
+            "session_root": fs::canonicalize(&session).unwrap(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::canonicalize(path).unwrap()
+}
+
+fn run(temp: &tempfile::TempDir, path: &PathBuf, calls: &PathBuf) -> std::process::Output {
+    let inherited = std::env::var("PATH").unwrap_or_default();
+    Command::new(script())
+        .arg(path)
+        .arg(fs::canonicalize(temp.path().join("trusted-gascan")).unwrap())
+        .arg(fs::canonicalize(temp.path()).unwrap())
+        .env("PATH", format!("{}:{inherited}", temp.path().display()))
+        .env("CALLS", calls)
+        .env("ID", "gate4-test-123456789abc")
+        .env("LABEL_ID", "gate4-test-123456789abc")
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn exact_name_collision_is_retained_and_never_deleted() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_bin, calls) = fake_container(&temp);
+    let id = "gate4-test-123456789abc";
+    let path = manifest(
+        &temp,
+        serde_json::json!([id, format!("gascan-mise-{id}"), format!("gascan-cache-{id}"), format!("gascan-config-{id}")]),
+    );
+    let inherited = std::env::var("PATH").unwrap_or_default();
+    let output = Command::new(script())
+        .arg(&path)
+        .arg(fs::canonicalize(temp.path().join("trusted-gascan")).unwrap())
+        .arg(fs::canonicalize(temp.path()).unwrap())
+        .env("PATH", format!("{}:{inherited}", temp.path().display()))
+        .env("CALLS", &calls)
+        .env("ID", id)
+        .env("LABEL_ID", "somebody-else-123456789abc")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(path.exists());
+    let calls = fs::read_to_string(calls).unwrap();
+    assert!(!calls.lines().any(|line| line.starts_with("delete ") || line.starts_with("volume delete ")));
+}
+
+#[test]
+fn invalid_daemon_pid_is_refused_without_signalling() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_bin, calls) = fake_container(&temp);
+    let id = "gate4-test-123456789abc";
+    let path = manifest(
+        &temp,
+        serde_json::json!([id, format!("gascan-mise-{id}"), format!("gascan-cache-{id}"), format!("gascan-config-{id}")]),
+    );
+    let instance = temp.path().join("session-test/gascan-gate4-runtime-test/daemon-instance.json");
+    fs::write(&instance, r#"{"owner_token":"test-owner","pid":"-1","executable":"/missing/gascand","start_identity":"start","instance_token":"instance"}"#).unwrap();
+    fs::set_permissions(&instance, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value["daemon_instance_path"] = serde_json::json!(fs::canonicalize(instance).unwrap());
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let output = run(&temp, &path, &calls);
+    assert_eq!(output.status.code(), Some(65));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid daemon pid"));
+    assert!(path.exists());
+}
+
+fn daemon_cleanup_fixture(temp: &tempfile::TempDir, stuck_term: bool, unkillable: bool) -> (PathBuf, PathBuf) {
+    let id = "gate4-test-123456789abc";
+    let path = manifest(temp, serde_json::json!([id, format!("gascan-mise-{id}"), format!("gascan-cache-{id}"), format!("gascan-config-{id}")]));
+    let daemon = temp.path().join("gascand");
+    fs::write(&daemon, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
+    let daemon = fs::canonicalize(daemon).unwrap();
+    let instance = temp.path().join("session-test/gascan-gate4-runtime-test/daemon-instance.json");
+    fs::write(&instance, serde_json::to_vec(&serde_json::json!({
+        "owner_token":"test-owner", "pid":4242, "executable":daemon,
+        "start_identity":"START", "instance_token":"INSTANCE"
+    })).unwrap()).unwrap();
+    fs::set_permissions(&instance, fs::Permissions::from_mode(0o600)).unwrap();
+    let gascan = temp.path().join("trusted-gascan");
+    fs::write(&gascan, format!("#!/bin/sh\nprintf '%s\\n' '{{\"instance_token\":\"INSTANCE\",\"pid\":4242,\"executable\":\"{}\",\"start_identity\":\"START\"}}'\n", daemon.display())).unwrap();
+    fs::set_permissions(&gascan, fs::Permissions::from_mode(0o755)).unwrap();
+    let gascan = fs::canonicalize(gascan).unwrap();
+    let ps = temp.path().join("ps");
+    fs::write(&ps, format!(r#"#!/bin/sh
+test ! -f "$STATE" || exit 1
+case "$*" in *command=*) printf '%s\n' '{}' ;; *) printf '%s\n' START ;; esac
+"#, daemon.display())).unwrap();
+    fs::set_permissions(&ps, fs::Permissions::from_mode(0o755)).unwrap();
+    let kill = temp.path().join("kill");
+    fs::write(&kill, format!(r#"#!/bin/sh
+printf '%s\n' "$*" >>"$KILL_CALLS"
+case "$1" in
+  -TERM) test {} = true || : >"$STATE" ;;
+  -KILL) test {} = true || : >"$STATE" ;;
+esac
+"#, stuck_term, unkillable)).unwrap();
+    fs::set_permissions(&kill, fs::Permissions::from_mode(0o755)).unwrap();
+    let sleep = temp.path().join("sleep");
+    fs::write(&sleep, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&sleep, fs::Permissions::from_mode(0o755)).unwrap();
+    let container = temp.path().join("container");
+    fs::write(&container, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&container, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value["daemon_instance_path"] = serde_json::json!(fs::canonicalize(instance).unwrap());
+    value["daemon_executable"] = serde_json::json!(daemon);
+    value["daemon_cli"] = serde_json::json!(gascan);
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    (path, temp.path().join("kill-calls"))
+}
+
+fn run_daemon_cleanup(temp: &tempfile::TempDir, path: &PathBuf, calls: &PathBuf) -> std::process::Output {
+    let inherited = std::env::var("PATH").unwrap_or_default();
+    Command::new(script()).arg(path)
+        .arg(fs::canonicalize(temp.path().join("trusted-gascan")).unwrap())
+        .arg(fs::canonicalize(temp.path()).unwrap())
+        .env("PATH", format!("{}:{inherited}", temp.path().display()))
+        .env("STATE", temp.path().join("dead"))
+        .env("KILL_CALLS", calls)
+        .output().unwrap()
+}
+
+#[test]
+fn validated_daemon_gets_bounded_term_then_revalidated_kill() {
+    let temp = tempfile::tempdir().unwrap();
+    let (path, calls) = daemon_cleanup_fixture(&temp, true, false);
+    let output = run_daemon_cleanup(&temp, &path, &calls);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(fs::read_to_string(&calls).unwrap(), "-TERM 4242\n-KILL 4242\n");
+    assert!(!path.exists());
+}
+
+#[test]
+fn daemon_residue_retains_manifest_after_term_and_kill() {
+    let temp = tempfile::tempdir().unwrap();
+    let (path, calls) = daemon_cleanup_fixture(&temp, true, true);
+    let output = run_daemon_cleanup(&temp, &path, &calls);
+    assert!(!output.status.success());
+    assert_eq!(fs::read_to_string(&calls).unwrap(), "-TERM 4242\n-KILL 4242\n");
+    assert!(path.exists());
+    fs::write(temp.path().join("dead"), b"").unwrap();
+    let retry = run_daemon_cleanup(&temp, &path, &calls);
+    assert!(retry.status.success(), "{}", String::from_utf8_lossy(&retry.stderr));
+    assert!(!path.exists());
+    assert!(!temp.path().join("session-test/gascan-gate4-runtime-test").exists());
+}
+
+#[test]
+fn out_of_scope_manifest_is_refused_before_runtime_commands() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_bin, calls) = fake_container(&temp);
+    let path = manifest(&temp, serde_json::json!(["somebody-elses-resource"]));
+    let output = run(&temp, &path, &calls);
+    assert!(!output.status.success());
+    assert!(!calls.exists());
+}
+
+#[test]
+fn forged_manifest_cli_is_never_executed() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_bin, calls) = fake_container(&temp);
+    let id = "gate4-test-123456789abc";
+    let path = manifest(
+        &temp,
+        serde_json::json!([id, format!("gascan-mise-{id}"), format!("gascan-cache-{id}"), format!("gascan-config-{id}")]),
+    );
+    let marker = temp.path().join("forged-cli-ran");
+    let forged = temp.path().join("forged-gascan");
+    fs::write(&forged, format!("#!/bin/sh\n: >'{}'\n", marker.display())).unwrap();
+    fs::set_permissions(&forged, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value["daemon_cli"] = serde_json::json!(fs::canonicalize(forged).unwrap());
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let output = run(&temp, &path, &calls);
+    assert_eq!(output.status.code(), Some(65));
+    assert!(!marker.exists());
+    assert!(!calls.exists());
+}
+
+#[test]
+fn runtime_path_escape_is_refused_before_commands() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_bin, calls) = fake_container(&temp);
+    let id = "gate4-test-123456789abc";
+    let path = manifest(
+        &temp,
+        serde_json::json!([id, format!("gascan-mise-{id}"), format!("gascan-cache-{id}"), format!("gascan-config-{id}")]),
+    );
+    let escaped = tempfile::tempdir().unwrap();
+    fs::set_permissions(escaped.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value["runtime_root"] = serde_json::json!(fs::canonicalize(escaped.path()).unwrap());
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let output = run(&temp, &path, &calls);
+    assert_eq!(output.status.code(), Some(65));
+    assert!(!calls.exists());
+}
+
+#[test]
+fn owned_running_container_is_stopped_before_exact_delete() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_bin, calls) = fake_container(&temp);
+    let id = "gate4-test-123456789abc";
+    let path = manifest(
+        &temp,
+        serde_json::json!([
+            id,
+            format!("gascan-mise-{id}"),
+            format!("gascan-cache-{id}"),
+            format!("gascan-config-{id}"),
+        ]),
+    );
+    let output = run(&temp, &path, &calls);
+    assert!(calls.exists(), "{}", String::from_utf8_lossy(&output.stderr));
+    let calls = fs::read_to_string(calls).unwrap();
+    let stop = calls.find(&format!("stop --time 5 {id}")).unwrap();
+    let delete = calls.find(&format!("delete {id}")).unwrap();
+    assert!(stop < delete);
+}
