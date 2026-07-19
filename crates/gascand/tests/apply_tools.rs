@@ -1,7 +1,9 @@
 use camino::Utf8Path;
 use gascan_core::fake_runtime::FakeRuntime;
 use gascan_core::manifest::Manifest;
-use gascan_core::runtime::RuntimeCall;
+use gascan_core::runtime::{
+    RemoveRequest, ResourceKind, RuntimeBackend, RuntimeCall, RuntimeError,
+};
 use gascan_core::sandbox::SandboxSpec;
 use gascand::{NoopProvisioner, OperationStatus, SandboxService, UpRequest};
 use serde_json::{Value, json};
@@ -89,6 +91,8 @@ async fn apply_uses_literal_mise_argv_streams_steps_and_persists_exact_versions(
         .queue_exec_results([
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (
                 br#"{"node":[{"version":"24.18.0","installed":true,"active":true}],"python":[{"version":"3.14.6","installed":true,"active":true}]}"#.to_vec(),
                 Vec::new(),
@@ -118,28 +122,67 @@ async fn apply_uses_literal_mise_argv_streams_steps_and_persists_exact_versions(
             .collect::<Vec<_>>(),
         vec![
             [
-                "install",
+                "/usr/bin/rm",
+                "--recursive",
+                "--force",
+                "--",
+                "/home/workspace/.config/gascan/mise-workdir",
+            ]
+            .as_slice(),
+            [
+                "/usr/bin/install",
+                "-d",
+                "-m",
+                "0700",
+                "/home/workspace/.config/gascan/mise-workdir",
+            ]
+            .as_slice(),
+            [
+                "/usr/bin/install",
                 "-m",
                 "0600",
                 "/dev/stdin",
                 "/home/workspace/.config/gascan/mise.toml"
             ]
             .as_slice(),
-            ["mise", "install", "--yes"].as_slice(),
-            ["mise", "ls", "--current", "--installed", "--json"].as_slice(),
-            ["select-gascamp", "bundled"].as_slice(),
+            [
+                "/usr/bin/env",
+                "HOME=/home/workspace",
+                "MISE_CACHE_DIR=/home/workspace/.cache/mise",
+                "MISE_DATA_DIR=/home/workspace/.local/share/mise",
+                "MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
+                "PATH=/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "/usr/local/bin/mise",
+                "--cd",
+                "/home/workspace/.config/gascan/mise-workdir",
+                "--no-env",
+                "--no-hooks",
+                "install",
+                "--yes",
+            ]
+            .as_slice(),
+            [
+                "/usr/bin/env",
+                "HOME=/home/workspace",
+                "MISE_CACHE_DIR=/home/workspace/.cache/mise",
+                "MISE_DATA_DIR=/home/workspace/.local/share/mise",
+                "MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
+                "PATH=/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "/usr/local/bin/mise",
+                "--cd",
+                "/home/workspace/.config/gascan/mise-workdir",
+                "--no-env",
+                "--no-hooks",
+                "ls",
+                "--current",
+                "--installed",
+                "--json",
+            ]
+            .as_slice(),
+            ["/usr/local/bin/select-gascamp", "bundled"].as_slice(),
         ]
     );
-    for request in execs
-        .iter()
-        .filter(|request| request.argv.first().map(String::as_str) == Some("mise"))
-    {
-        assert_eq!(
-            request.environment.get("MISE_GLOBAL_CONFIG_FILE"),
-            Some(&"/home/workspace/.config/gascan/mise.toml".to_owned())
-        );
-        assert!(!request.environment.contains_key("MISE_CONFIG_FILE"));
-    }
+    assert!(execs.iter().all(|request| request.environment.is_empty()));
     assert!(
         details.iter().any(
             |event| event.get("step").and_then(Value::as_str) == Some("write_safe_mise_config")
@@ -192,6 +235,8 @@ async fn failed_install_retains_applied_state_and_retry_can_succeed() -> TestRes
     runtime
         .queue_exec_results([
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), b"install failed".to_vec(), 23),
         ])
         .await;
@@ -209,6 +254,8 @@ async fn failed_install_retains_applied_state_and_retry_can_succeed() -> TestRes
 
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (
@@ -282,6 +329,8 @@ async fn duplicate_mise_tool_keys_are_rejected_without_advancing_state() -> Test
         .queue_exec_results([
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (
                 br#"{"node":[{"version":"24.18.0","installed":true,"active":true}],"node":[{"version":"attacker","installed":true,"active":true}]}"#.to_vec(),
                 Vec::new(),
@@ -317,6 +366,8 @@ async fn legacy_matching_fingerprint_without_tool_hash_requires_one_explicit_app
         .queue_exec_results([
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (
                 br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
                 Vec::new(),
@@ -346,6 +397,8 @@ async fn legacy_matching_fingerprint_without_tool_hash_requires_one_explicit_app
         .queue_exec_results([
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (
                 br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
                 Vec::new(),
@@ -358,7 +411,7 @@ async fn legacy_matching_fingerprint_without_tool_hash_requires_one_explicit_app
     service.apply(UpRequest::new(make_spec()?)).await?;
 
     assert!(runtime.calls().await[before..].iter().any(|call| {
-        matches!(call, RuntimeCall::Exec(request) if request.argv == ["mise", "install", "--yes"])
+        matches!(call, RuntimeCall::Exec(request) if request.argv.last().map(String::as_str) == Some("--yes"))
     }));
     assert!(
         service
@@ -378,6 +431,8 @@ async fn removing_last_tool_writes_empty_config_and_persists_empty_resolution() 
     let runtime = FakeRuntime::default();
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (
@@ -401,6 +456,8 @@ async fn removing_last_tool_writes_empty_config_and_persists_empty_resolution() 
         .queue_exec_results([
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (b"{}".to_vec(), Vec::new(), 0),
             (br#"{"source":"bundled"}"#.to_vec(), Vec::new(), 0),
         ])
@@ -412,9 +469,7 @@ async fn removing_last_tool_writes_empty_config_and_persists_empty_resolution() 
     let write = calls[before..]
         .iter()
         .find_map(|call| match call {
-            RuntimeCall::Exec(request)
-                if request.argv.first().map(String::as_str) == Some("install") =>
-            {
+            RuntimeCall::Exec(request) if request.argv.iter().any(|arg| arg == "/dev/stdin") => {
                 Some(request)
             }
             _ => None,
@@ -429,5 +484,111 @@ async fn removing_last_tool_writes_empty_config_and_persists_empty_resolution() 
             .and_then(|resolution| resolution.details.get("resolution").cloned()),
         Some(json!({}))
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn missing_container_forces_tool_install_even_when_durable_hash_matches() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    write_manifest(root, &[("node", "lts")])?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (
+                br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
+                Vec::new(),
+                0,
+            ),
+            (br#"{"source":"bundled"}"#.to_vec(), Vec::new(), 0),
+        ])
+        .await;
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    );
+    let make_spec = || spec(root, "recreated-tools");
+    service.up(UpRequest::new(make_spec()?)).await?;
+    let container = runtime
+        .list_resources()
+        .await?
+        .into_iter()
+        .find(|resource| resource.kind() == ResourceKind::Container)
+        .ok_or("container resource")?;
+    runtime
+        .remove(RemoveRequest::from_resources(vec![container])?)
+        .await?;
+    let before = runtime.calls().await.len();
+    runtime
+        .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (
+                br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
+                Vec::new(),
+                0,
+            ),
+            (br#"{"source":"bundled"}"#.to_vec(), Vec::new(), 0),
+        ])
+        .await;
+
+    service.up(UpRequest::new(make_spec()?)).await?;
+
+    assert!(runtime.calls().await[before..].iter().any(|call| {
+        matches!(call, RuntimeCall::Exec(request) if request.argv.last().map(String::as_str) == Some("--yes"))
+    }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn provisioning_transport_failures_never_leak_runtime_or_helper_content() -> TestResult {
+    const SECRET: &str = "sentinel-provisioning-secret";
+    for boundary in ["spawn", "input", "stream"] {
+        let root = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+        write_manifest(root, &[])?;
+        let runtime = FakeRuntime::default();
+        let injected = RuntimeError::HelperError {
+            operation: format!("operation-{SECRET}"),
+            code: format!("code-{SECRET}"),
+            message: format!("message-{SECRET}"),
+        };
+        match boundary {
+            "spawn" => runtime.queue_exec_error(injected).await,
+            "input" => runtime.queue_exec_input_failure().await,
+            "stream" => runtime.queue_exec_stream_error(injected).await,
+            _ => return Err("unknown boundary".into()),
+        }
+        let service = SandboxService::new(
+            runtime,
+            gascand::Store::open(root.join("state.db"))?,
+            Arc::new(NoopProvisioner),
+        );
+
+        let error = match service
+            .up(UpRequest::new(spec(root, &format!("sanitize-{boundary}"))?))
+            .await
+        {
+            Ok(_) => return Err("provisioning transport unexpectedly succeeded".into()),
+            Err(error) => error,
+        };
+        let public = error.to_string();
+        let durable = format!(
+            "{:?}",
+            service
+                .store()
+                .operation_events(service.latest_operation()?.ok_or("operation")?.id,)?
+        );
+        assert!(public.contains("guest provisioning transport failed"));
+        assert!(!public.contains(SECRET));
+        assert!(!durable.contains(SECRET));
+    }
     Ok(())
 }

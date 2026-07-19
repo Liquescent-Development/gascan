@@ -139,8 +139,8 @@ message OperationEvent {
   string content_type = 8;
   // Opaque attachment token emitted by Run/Shell; empty for unrelated operations.
   bytes session_token = 9;
-  ProvisionStep provision_step = 10;
-  reserved 11;
+  reserved 10;
+  ProvisionStep provision_step = 11;
 }
 
 message StatusRequest { SandboxSelector sandbox = 1; reserved 2; }

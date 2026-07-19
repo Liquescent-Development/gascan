@@ -255,7 +255,7 @@ fn v1_descriptor_has_exact_event_and_attach_layout() {
     assert_field(event, "status", 7, Enum, None);
     assert_field(event, "content_type", 8, String, None);
     assert_field(event, "session_token", 9, Bytes, None);
-    assert_field(event, "provision_step", 10, Enum, None);
+    assert_field(event, "provision_step", 11, Enum, None);
     assert_type_name(event, "operation_id", ".gascan.v1.OperationId");
     assert_type_name(event, "timestamp", ".google.protobuf.Timestamp");
     assert_type_name(event, "error", ".gascan.v1.Error");
@@ -265,7 +265,7 @@ fn v1_descriptor_has_exact_event_and_attach_layout() {
         event
             .reserved_range
             .iter()
-            .any(|range| range.start == Some(11) && range.end == Some(12))
+            .any(|range| range.start == Some(10) && range.end == Some(11))
     );
 
     let client = message(file, "ClientFrame");
@@ -661,7 +661,7 @@ fn v1_descriptor_exactly_covers_every_exported_message_enum_and_rpc() {
                 f!("session_token", 9, Bytes),
                 f!(
                     "provision_step",
-                    10,
+                    11,
                     Enum,
                     O,
                     None,
@@ -669,7 +669,7 @@ fn v1_descriptor_exactly_covers_every_exported_message_enum_and_rpc() {
                 ),
             ],
             &[],
-            &[(11, 12)],
+            &[(10, 11)],
         ),
         (
             "StatusRequest",

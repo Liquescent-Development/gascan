@@ -6,7 +6,10 @@ use crate::{
 use async_trait::async_trait;
 use gascan_core::doctor::{DoctorFacts, DoctorReport};
 use gascan_core::manifest::ManifestError;
-use gascan_core::policy::{PolicyCompiler, PolicyError};
+use gascan_core::policy::{
+    CONTAINER_PATH, MISE_CACHE_DIR, MISE_DATA_DIR, MISE_GLOBAL_CONFIG_FILE, PolicyCompiler,
+    PolicyError, WORKSPACE_HOME,
+};
 use gascan_core::provision::{AppliedState, ProvisionPlan, ProvisionStep, ProvisioningPlanner};
 use gascan_core::runtime::{
     ContainerState, CreateFailure, CreateRequest, ExecInput, ExecOutput, ExecRequest,
@@ -22,7 +25,7 @@ use std::sync::{Arc, Mutex, Weak};
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
-const SAFE_MISE_CONFIG: &str = "/home/workspace/.config/gascan/mise.toml";
+const SAFE_MISE_WORKDIR: &str = "/home/workspace/.config/gascan/mise-workdir";
 const MAX_PROVISION_OUTPUT_BYTES: usize = 1024 * 1024;
 
 pub struct UpRequest {
@@ -608,8 +611,15 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 None
             } else if !durable_match {
                 self.emit(operation_id, json!({"phase":"before_provision","desired_fingerprint":desired_fingerprint}), sender).await?;
+                let prior_for_provision = if inspected.is_none() { None } else { prior };
                 let provisioned = self
-                    .provision_explicit(spec, create, prior, operation_id, sender)
+                    .provision_explicit(
+                        spec,
+                        create,
+                        prior_for_provision,
+                        operation_id,
+                        sender,
+                    )
                     .await?;
                 self.emit(operation_id, json!({"phase":"after_provision","resolution_version":1,"desired_fingerprint":desired_fingerprint,"setup":provisioned.resolution.setup,"tools":provisioned.resolution.tools,"tool_hash":provisioned.tool_hash}), sender).await?;
                 Some(provisioned)
@@ -693,6 +703,24 @@ impl<B: RuntimeBackend> SandboxService<B> {
     ) -> Result<Value, ServiceError> {
         self.emit_provision_step(operation_id, ProvisionStep::WriteSafeMiseConfig, sender)
             .await?;
+        self.exec_guest(
+            spec.id(),
+            [
+                "/usr/bin/rm",
+                "--recursive",
+                "--force",
+                "--",
+                SAFE_MISE_WORKDIR,
+            ],
+            Vec::new(),
+        )
+        .await?;
+        self.exec_guest(
+            spec.id(),
+            ["/usr/bin/install", "-d", "-m", "0700", SAFE_MISE_WORKDIR],
+            Vec::new(),
+        )
+        .await?;
         let config = plan
             .safe_mise_toml()
             .map_err(|_| {
@@ -703,31 +731,26 @@ impl<B: RuntimeBackend> SandboxService<B> {
             })?;
         self.exec_guest(
             spec.id(),
-            ["install", "-m", "0600", "/dev/stdin", SAFE_MISE_CONFIG],
+            [
+                "/usr/bin/install",
+                "-m",
+                "0600",
+                "/dev/stdin",
+                MISE_GLOBAL_CONFIG_FILE,
+            ],
             config.into_bytes(),
-            BTreeMap::new(),
         )
         .await?;
 
         self.emit_provision_step(operation_id, ProvisionStep::InstallTools, sender)
             .await?;
-        let environment = BTreeMap::from([(
-            "MISE_GLOBAL_CONFIG_FILE".to_owned(),
-            SAFE_MISE_CONFIG.to_owned(),
-        )]);
-        self.exec_guest(
-            spec.id(),
-            ["mise", "install", "--yes"],
-            Vec::new(),
-            environment.clone(),
-        )
-        .await?;
+        self.exec_guest(spec.id(), mise_command(&["install", "--yes"]), Vec::new())
+            .await?;
         let output = self
             .exec_guest(
                 spec.id(),
-                ["mise", "ls", "--current", "--installed", "--json"],
+                mise_command(&["ls", "--current", "--installed", "--json"]),
                 Vec::new(),
-                environment,
             )
             .await?;
         let resolved = parse_mise_versions(&output, spec.manifest().tools())?;
@@ -744,9 +767,8 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let output = self
             .exec_guest(
                 spec.id(),
-                ["select-gascamp".to_owned(), requested],
+                ["/usr/local/bin/select-gascamp".to_owned(), requested],
                 Vec::new(),
-                BTreeMap::new(),
             )
             .await?;
         let value: Value = serde_json::from_slice(&output).map_err(|_| {
@@ -765,7 +787,6 @@ impl<B: RuntimeBackend> SandboxService<B> {
         id: &SandboxId,
         argv: I,
         stdin: Vec<u8>,
-        environment: BTreeMap<String, String>,
     ) -> Result<Vec<u8>, ServiceError>
     where
         I: IntoIterator<Item = S>,
@@ -777,15 +798,19 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 id: id.clone(),
                 argv: argv.into_iter().map(Into::into).collect(),
                 stdin,
-                environment,
+                environment: BTreeMap::new(),
                 tty: false,
             })
-            .await?;
-        session.send(ExecInput::Close).await?;
+            .await
+            .map_err(|_| provisioning_transport_error())?;
+        session
+            .send(ExecInput::Close)
+            .await
+            .map_err(|_| provisioning_transport_error())?;
         let mut stdout = Vec::new();
         let mut output_bytes = 0_usize;
         while let Some(output) = session.next().await {
-            match output? {
+            match output.map_err(|_| provisioning_transport_error())? {
                 ExecOutput::Stdout(bytes) => {
                     output_bytes = output_bytes.saturating_add(bytes.len());
                     if output_bytes > MAX_PROVISION_OUTPUT_BYTES {
@@ -1470,6 +1495,28 @@ fn applied_tool_state(record: Option<&SandboxRecord>) -> AppliedState {
         .and_then(|resolution| resolution.details.get("tool_hash"))
         .and_then(Value::as_str)
         .map_or_else(AppliedState::empty, AppliedState::with_tool_hash)
+}
+
+fn provisioning_transport_error() -> ServiceError {
+    ServiceError::Provision("guest provisioning transport failed".to_owned())
+}
+
+fn mise_command(args: &[&str]) -> Vec<String> {
+    let mut argv = vec![
+        "/usr/bin/env".to_owned(),
+        format!("HOME={WORKSPACE_HOME}"),
+        format!("MISE_CACHE_DIR={MISE_CACHE_DIR}"),
+        format!("MISE_DATA_DIR={MISE_DATA_DIR}"),
+        format!("MISE_GLOBAL_CONFIG_FILE={MISE_GLOBAL_CONFIG_FILE}"),
+        format!("PATH={CONTAINER_PATH}"),
+        "/usr/local/bin/mise".to_owned(),
+        "--cd".to_owned(),
+        SAFE_MISE_WORKDIR.to_owned(),
+        "--no-env".to_owned(),
+        "--no-hooks".to_owned(),
+    ];
+    argv.extend(args.iter().map(|arg| (*arg).to_owned()));
+    argv
 }
 
 fn stored_tool_resolution(record: &SandboxRecord) -> Option<Value> {

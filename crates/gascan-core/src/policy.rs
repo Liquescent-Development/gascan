@@ -20,6 +20,11 @@ pub const DEFAULT_PROCESS_COUNT: u32 = 1_024;
 
 const MANAGED_BY: &str = "gascan";
 const WORKSPACE_IMAGE: &str = include_str!("../../../images/workspace/approved-image.txt");
+pub const WORKSPACE_HOME: &str = "/home/workspace";
+pub const MISE_DATA_DIR: &str = "/home/workspace/.local/share/mise";
+pub const MISE_CACHE_DIR: &str = "/home/workspace/.cache/mise";
+pub const MISE_GLOBAL_CONFIG_FILE: &str = "/home/workspace/.config/gascan/mise.toml";
+pub const CONTAINER_PATH: &str = "/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 pub struct PolicyCompiler;
 
@@ -76,7 +81,16 @@ impl PolicyCompiler {
             bind_mounts,
             volumes,
             ports,
-            environment: BTreeMap::new(),
+            environment: BTreeMap::from([
+                ("HOME".to_owned(), WORKSPACE_HOME.to_owned()),
+                ("MISE_CACHE_DIR".to_owned(), MISE_CACHE_DIR.to_owned()),
+                ("MISE_DATA_DIR".to_owned(), MISE_DATA_DIR.to_owned()),
+                (
+                    "MISE_GLOBAL_CONFIG_FILE".to_owned(),
+                    MISE_GLOBAL_CONFIG_FILE.to_owned(),
+                ),
+                ("PATH".to_owned(), CONTAINER_PATH.to_owned()),
+            ]),
             resources,
             network,
             user,

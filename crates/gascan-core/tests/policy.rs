@@ -139,12 +139,45 @@ fn canonical_request_has_one_root_mount_owned_volumes_loopback_ports_and_init() 
     assert_eq!(request.ownership().managed_by, "gascan");
     assert_eq!(request.ownership().sandbox_id, id);
     assert_eq!(request.volumes().len(), 3);
+    assert_eq!(
+        request
+            .volumes()
+            .iter()
+            .map(|volume| volume.target.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "/home/workspace/.local/share/mise",
+            "/home/workspace/.cache",
+            "/home/workspace/.config/gascan",
+        ]
+    );
     assert!(request.volumes().iter().all(|volume| {
         volume.writable
             && volume.name.starts_with("gascan-")
             && &volume.ownership == request.ownership()
-            && volume.target.starts_with("/home/workspace")
     }));
+    assert_eq!(
+        request.environment(),
+        &BTreeMap::from([
+            ("HOME".to_owned(), "/home/workspace".to_owned()),
+            (
+                "MISE_CACHE_DIR".to_owned(),
+                "/home/workspace/.cache/mise".to_owned(),
+            ),
+            (
+                "MISE_DATA_DIR".to_owned(),
+                "/home/workspace/.local/share/mise".to_owned(),
+            ),
+            (
+                "MISE_GLOBAL_CONFIG_FILE".to_owned(),
+                "/home/workspace/.config/gascan/mise.toml".to_owned(),
+            ),
+            (
+                "PATH".to_owned(),
+                "/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned(),
+            ),
+        ])
+    );
     assert_eq!(request.ports().len(), 2);
     assert!(request.ports().iter().all(|port| {
         port.host_address == IpAddr::V4(Ipv4Addr::LOCALHOST) && port.host_port == port.guest_port
@@ -329,5 +362,16 @@ fn approved_json_shape_exposes_no_unsafe_backend_surface() {
             "snapshot contains {forbidden}: {snapshot}"
         );
     }
-    assert_eq!(request.environment(), &BTreeMap::new());
+    assert_eq!(request.environment().len(), 5);
+    assert_eq!(
+        request
+            .environment()
+            .get("MISE_DATA_DIR")
+            .map(String::as_str),
+        Some("/home/workspace/.local/share/mise")
+    );
+    assert!(request.environment().get("PATH").is_some_and(|path| {
+        path.starts_with("/home/workspace/.local/share/mise/shims:")
+            && path.contains(":/opt/gascan/mise/shims:")
+    }));
 }

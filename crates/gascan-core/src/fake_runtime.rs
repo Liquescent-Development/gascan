@@ -80,6 +80,9 @@ struct FakeState {
     create_failure_after_mutations: Option<usize>,
     exec_result: (Vec<u8>, Vec<u8>, i32),
     exec_results: VecDeque<(Vec<u8>, Vec<u8>, i32)>,
+    exec_errors: VecDeque<RuntimeError>,
+    exec_input_failures: usize,
+    exec_stream_errors: VecDeque<RuntimeError>,
     logs: Vec<FakeLogRecord>,
 }
 
@@ -97,6 +100,9 @@ impl FakeRuntime {
                 create_failure_after_mutations: None,
                 exec_result: (Vec::new(), Vec::new(), 0),
                 exec_results: VecDeque::new(),
+                exec_errors: VecDeque::new(),
+                exec_input_failures: 0,
+                exec_stream_errors: VecDeque::new(),
                 logs: Vec::new(),
             })),
             persistence: Arc::new(None),
@@ -179,6 +185,18 @@ impl FakeRuntime {
         I: IntoIterator<Item = (Vec<u8>, Vec<u8>, i32)>,
     {
         self.inner.lock().await.exec_results.extend(results);
+    }
+
+    pub async fn queue_exec_error(&self, error: RuntimeError) {
+        self.inner.lock().await.exec_errors.push_back(error);
+    }
+
+    pub async fn queue_exec_input_failure(&self) {
+        self.inner.lock().await.exec_input_failures += 1;
+    }
+
+    pub async fn queue_exec_stream_error(&self, error: RuntimeError) {
+        self.inner.lock().await.exec_stream_errors.push_back(error);
     }
 
     pub async fn set_logs(&self, logs: Vec<u8>) {
@@ -350,6 +368,9 @@ fn load_state(capabilities: RuntimeCapabilities, path: &Path) -> Result<FakeStat
         create_failure_after_mutations: None,
         exec_result: (Vec::new(), Vec::new(), 0),
         exec_results: VecDeque::new(),
+        exec_errors: VecDeque::new(),
+        exec_input_failures: 0,
+        exec_stream_errors: VecDeque::new(),
         logs: snapshot.logs,
     })
 }
@@ -433,7 +454,9 @@ fn interpret_fake_command(
             Vec::new(),
             0,
         ),
-        Some("select-gascamp") => (br#"{"source":"bundled"}"#.to_vec(), Vec::new(), 0),
+        Some("select-gascamp") | Some("/usr/local/bin/select-gascamp") => {
+            (br#"{"source":"bundled"}"#.to_vec(), Vec::new(), 0)
+        }
         Some("true") | Some("sh") => (Vec::new(), Vec::new(), 0),
         _ => configured,
     }
@@ -596,6 +619,9 @@ impl RuntimeBackend for FakeRuntime {
     async fn exec(&self, request: ExecRequest) -> Result<ExecSession, RuntimeError> {
         let mut state = self.inner.lock().await;
         state.calls.push(RuntimeCall::Exec(request.clone()));
+        if let Some(error) = state.exec_errors.pop_front() {
+            return Err(error);
+        }
         fail_once(&mut state, FailureBoundary::Exec)?;
         let sandbox = state
             .sandboxes
@@ -606,6 +632,22 @@ impl RuntimeBackend for FakeRuntime {
                 resource: request.id.to_string(),
                 message: "exec requires a running sandbox".to_owned(),
             });
+        }
+        if state.exec_input_failures > 0 {
+            state.exec_input_failures -= 1;
+            let (input, inputs) = tokio::sync::mpsc::channel(1);
+            drop(inputs);
+            let (_outputs, output) = tokio::sync::mpsc::channel(1);
+            return Ok(ExecSession::live(input, output));
+        }
+        if let Some(error) = state.exec_stream_errors.pop_front() {
+            let (input, mut inputs) = tokio::sync::mpsc::channel(1);
+            tokio::spawn(async move {
+                let _ = inputs.recv().await;
+            });
+            let (outputs, output) = tokio::sync::mpsc::channel(1);
+            let _ = outputs.try_send(Err(error));
+            return Ok(ExecSession::live(input, output));
         }
         let configured = state
             .exec_results

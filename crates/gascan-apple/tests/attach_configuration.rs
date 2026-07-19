@@ -19,7 +19,12 @@ fn executable(path: &Path) {
 #[tokio::test]
 async fn exec_rejects_unapproved_or_malformed_environment_before_spawn() {
     let attach = AppleAttach::new("/definitely/missing/gascan-apple-attach");
-    for (name, value) in [("PATH", "/host/bin"), ("LC_", "C"), ("LANG", "C\0UTF-8")] {
+    for (name, value) in [
+        ("PATH", "/host/bin"),
+        ("MISE_GLOBAL_CONFIG_FILE", "/config/mise.toml"),
+        ("LC_", "C"),
+        ("LANG", "C\0UTF-8"),
+    ] {
         let result = attach
             .exec_with_environment(
                 "container-id",
