@@ -629,36 +629,79 @@ fn service_status(error: ServiceError) -> tonic::Status {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ErrorDiagnostics {
     enabled: bool,
+    #[cfg(test)]
+    captured: Option<Arc<std::sync::Mutex<Vec<String>>>>,
 }
 
 impl ErrorDiagnostics {
     #[must_use]
     pub const fn disabled() -> Self {
-        Self { enabled: false }
+        Self {
+            enabled: false,
+            #[cfg(test)]
+            captured: None,
+        }
     }
 
     #[must_use]
     pub const fn enabled_for_tests() -> Self {
-        Self { enabled: true }
-    }
-
-    fn emit(self, context: &'static str, error: &ServiceError) {
-        if let Some(line) = self.line(context, error) {
-            eprintln!("{line}");
+        Self {
+            enabled: true,
+            #[cfg(test)]
+            captured: None,
         }
     }
 
-    fn line(self, context: &'static str, error: &ServiceError) -> Option<String> {
+    #[cfg(test)]
+    fn capturing_for_tests() -> (Self, Arc<std::sync::Mutex<Vec<String>>>) {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            Self {
+                enabled: true,
+                captured: Some(captured.clone()),
+            },
+            captured,
+        )
+    }
+
+    fn emit(&self, context: &'static str, error: &ServiceError) {
+        if let Some(line) = self.line(context, error) {
+            self.write(line);
+        }
+    }
+
+    fn emit_runtime(&self, context: &'static str, error: &gascan_core::runtime::RuntimeError) {
+        if let Some(line) = self.line_with_detail(context, runtime_error_diagnostic(error)) {
+            self.write(line);
+        }
+    }
+
+    fn write(&self, line: String) {
+        #[cfg(test)]
+        if let Some(captured) = &self.captured {
+            if let Ok(mut captured) = captured.lock() {
+                captured.push(line);
+            }
+            return;
+        }
+        eprintln!("{line}");
+    }
+
+    fn line(&self, context: &'static str, error: &ServiceError) -> Option<String> {
+        self.line_with_detail(context, service_error_diagnostic(error))
+    }
+
+    fn line_with_detail(&self, context: &'static str, detail: String) -> Option<String> {
         if !self.enabled {
             return None;
         }
         let mut line = format!(
             "gascan internal diagnostic: operation={} {}",
             sanitize_diagnostic(context, 64),
-            service_error_diagnostic(error)
+            detail
         );
         if line.len() > 2_048 {
             let mut boundary = 2_048;
@@ -674,7 +717,7 @@ impl ErrorDiagnostics {
 fn service_status_with_diagnostics(
     error: ServiceError,
     context: &'static str,
-    diagnostics: ErrorDiagnostics,
+    diagnostics: &ErrorDiagnostics,
 ) -> tonic::Status {
     diagnostics.emit(context, &error);
     service_status(error)
@@ -1046,22 +1089,33 @@ fn send_terminal(
     }
 }
 
+struct AttachBridgeControl {
+    terminal: Option<tokio::sync::oneshot::Sender<AttachTerminal>>,
+    activity: ActivityTracker,
+    diagnostics: ErrorDiagnostics,
+}
+
 async fn run_attach_bridge<S>(
     mut session: gascan_core::runtime::ExecSession,
     mut input: S,
     first_input: gascan_core::runtime::ExecInput,
     mut binder: gascan_proto::AttachSessionBinder,
     sender: tokio::sync::mpsc::Sender<Result<v1::ServerFrame, tonic::Status>>,
-    mut terminal: Option<tokio::sync::oneshot::Sender<AttachTerminal>>,
-    activity: ActivityTracker,
+    control: AttachBridgeControl,
 ) where
     S: tokio_stream::Stream<Item = Result<v1::ClientFrame, tonic::Status>> + Unpin,
 {
+    let AttachBridgeControl {
+        mut terminal,
+        activity,
+        diagnostics,
+    } = control;
     let _lease = activity.lease();
     let mut input_closed = matches!(first_input, gascan_core::runtime::ExecInput::Close);
     tokio::select! {
         result = session.send(first_input) => {
             if let Err(error) = result {
+                diagnostics.emit_runtime("attach.bridge.first_input", &error);
                 send_terminal(&mut terminal, Ok(server_error(error.code(), error.to_string())));
                 return;
             }
@@ -1096,11 +1150,13 @@ async fn run_attach_bridge<S>(
                     }
                 }
                 Some(Err(error)) => {
+                    diagnostics.emit_runtime("attach.bridge.output", &error);
                     send_terminal(&mut terminal, Ok(server_error(error.code(), error.to_string())));
                     break;
                 }
                 None => {
                     let error = attach_runtime_error("runtime session closed without a terminal output");
+                    diagnostics.emit_runtime("attach.bridge.output", &error);
                     send_terminal(&mut terminal, Ok(server_error(error.code(), error.to_string())));
                     break;
                 }
@@ -1122,6 +1178,7 @@ async fn run_attach_bridge<S>(
                         Ok(frame) => {
                             input_closed = matches!(frame, gascan_core::runtime::ExecInput::Close);
                             if let Err(error) = session.send(frame).await {
+                                diagnostics.emit_runtime("attach.bridge.input", &error);
                                 send_terminal(&mut terminal, Ok(server_error(error.code(), error.to_string())));
                                 break;
                             }
@@ -1337,7 +1394,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             .command
             .ok_or_else(|| tonic::Status::invalid_argument(error_code::INVALID_REQUEST))?;
         self.service.validate_exec(&id).await.map_err(|error| {
-            service_status_with_diagnostics(error, "run.validate_exec", self.error_diagnostics)
+            service_status_with_diagnostics(error, "run.validate_exec", &self.error_diagnostics)
         })?;
         let mut token = vec![0_u8; 24];
         getrandom::fill(&mut token).map_err(|_| tonic::Status::internal(error_code::INTERNAL))?;
@@ -1374,7 +1431,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             argv_from_wire(command.argv).map_err(ApiInputError::status)?
         };
         self.service.validate_exec(&id).await.map_err(|error| {
-            service_status_with_diagnostics(error, "shell.validate_exec", self.error_diagnostics)
+            service_status_with_diagnostics(error, "shell.validate_exec", &self.error_diagnostics)
         })?;
         let mut token = vec![0_u8; 24];
         getrandom::fill(&mut token).map_err(|_| tonic::Status::internal(error_code::INTERNAL))?;
@@ -1553,10 +1610,13 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
                 pending.tty,
             )
             .await
-            .map_err(service_status)?;
+            .map_err(|error| {
+                service_status_with_diagnostics(error, "attach.exec", &self.error_diagnostics)
+            })?;
         let (sender, receiver) = tokio::sync::mpsc::channel(16);
         let (terminal_sender, terminal) = tokio::sync::oneshot::channel();
         let activity = self.activity.clone();
+        let diagnostics = self.error_diagnostics.clone();
         tokio::spawn(async move {
             run_attach_bridge(
                 session,
@@ -1564,8 +1624,11 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
                 first_input,
                 binder,
                 sender,
-                Some(terminal_sender),
-                activity,
+                AttachBridgeControl {
+                    terminal: Some(terminal_sender),
+                    activity,
+                    diagnostics,
+                },
             )
             .await;
         });
@@ -1581,10 +1644,10 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivityTracker, ApiEventStream, ApiInputError, AttachStream, AttachTerminal,
-        ErrorDiagnostics, PendingSession, SessionRegistry, attach_shutdown_requested_with,
-        run_attach_bridge as run_attach_bridge_impl, service_status, spec_for_root, wire_event,
-        wire_status,
+        ActivityTracker, ApiEventStream, ApiInputError, AttachBridgeControl, AttachStream,
+        AttachTerminal, ErrorDiagnostics, PendingSession, SessionRegistry,
+        attach_shutdown_requested_with, run_attach_bridge as run_attach_bridge_impl,
+        service_status, service_status_with_diagnostics, spec_for_root, wire_event, wire_status,
     };
     use crate::{
         ActualState, DesiredState, OperationEvent, OperationId, OperationStatus, SandboxRecord,
@@ -1609,6 +1672,29 @@ mod tests {
     ) where
         S: tokio_stream::Stream<Item = Result<v1::ClientFrame, tonic::Status>> + Unpin,
     {
+        run_attach_bridge_with_diagnostics(
+            session,
+            input,
+            first_input,
+            binder,
+            sender,
+            activity,
+            ErrorDiagnostics::disabled(),
+        )
+        .await;
+    }
+
+    async fn run_attach_bridge_with_diagnostics<S>(
+        session: ExecSession,
+        input: S,
+        first_input: ExecInput,
+        binder: gascan_proto::AttachSessionBinder,
+        sender: tokio::sync::mpsc::Sender<Result<v1::ServerFrame, tonic::Status>>,
+        activity: ActivityTracker,
+        diagnostics: ErrorDiagnostics,
+    ) where
+        S: tokio_stream::Stream<Item = Result<v1::ClientFrame, tonic::Status>> + Unpin,
+    {
         let (terminal_sender, terminal) = tokio::sync::oneshot::channel::<AttachTerminal>();
         let terminal_output = sender.clone();
         let forward = tokio::spawn(async move {
@@ -1622,8 +1708,11 @@ mod tests {
             first_input,
             binder,
             sender,
-            Some(terminal_sender),
-            activity,
+            AttachBridgeControl {
+                terminal: Some(terminal_sender),
+                activity,
+                diagnostics,
+            },
         )
         .await;
         let _ = forward.await;
@@ -1690,6 +1779,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attach_bridge_diagnostic_identifies_first_input_without_raw_session_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (diagnostics, captured) = ErrorDiagnostics::capturing_for_tests();
+        let (input, inputs) = tokio::sync::mpsc::channel(1);
+        drop(inputs);
+        let (_outputs, output) = tokio::sync::mpsc::channel(1);
+        let session = ExecSession::live(input, output);
+        let (sender, _receiver) = tokio::sync::mpsc::channel(4);
+
+        run_attach_bridge_with_diagnostics(
+            session,
+            tokio_stream::empty(),
+            ExecInput::Close,
+            bound_binder(b"diagnostic-first-send"),
+            sender,
+            ActivityTracker::new(),
+            diagnostics,
+        )
+        .await;
+
+        let lines = captured.lock().map_err(|_| "diagnostic capture poisoned")?;
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("operation=attach.bridge.first_input"));
+        assert!(lines[0].contains("runtime_code=command_io"));
+        assert!(lines[0].contains("runtime_operation=exec_input"));
+        assert!(!lines[0].contains("closed"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attach_bridge_diagnostic_distinguishes_output_error_and_omits_helper_content()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let secret = "opaque-session-helper-content";
+        let (diagnostics, captured) = ErrorDiagnostics::capturing_for_tests();
+        let (input, mut inputs) = tokio::sync::mpsc::channel(1);
+        let (outputs, output) = tokio::sync::mpsc::channel(1);
+        let runtime = tokio::spawn(async move {
+            let _ = inputs.recv().await;
+            let _ = outputs
+                .send(Err(gascan_core::runtime::RuntimeError::HelperError {
+                    operation: "gascan-apple-attach".to_owned(),
+                    code: format!("helper-{secret}"),
+                    message: format!("raw helper output {secret}"),
+                }))
+                .await;
+        });
+        let (sender, _receiver) = tokio::sync::mpsc::channel(4);
+
+        run_attach_bridge_with_diagnostics(
+            ExecSession::live(input, output),
+            tokio_stream::pending(),
+            ExecInput::Stdin(Vec::new()),
+            bound_binder(b"diagnostic-output"),
+            sender,
+            ActivityTracker::new(),
+            diagnostics,
+        )
+        .await;
+        runtime.await?;
+
+        let lines = captured.lock().map_err(|_| "diagnostic capture poisoned")?;
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("operation=attach.bridge.output"));
+        assert!(lines[0].contains("runtime_code=helper_error"));
+        assert!(lines[0].contains("runtime_operation=apple_attach_helper"));
+        assert!(!lines[0].contains(secret));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attach_bridge_diagnostic_distinguishes_missing_terminal_output()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (diagnostics, captured) = ErrorDiagnostics::capturing_for_tests();
+        let (input, mut inputs) = tokio::sync::mpsc::channel(1);
+        let (outputs, output) = tokio::sync::mpsc::channel(1);
+        let runtime = tokio::spawn(async move {
+            let _ = inputs.recv().await;
+            drop(outputs);
+        });
+        let (sender, _receiver) = tokio::sync::mpsc::channel(4);
+
+        run_attach_bridge_with_diagnostics(
+            ExecSession::live(input, output),
+            tokio_stream::pending(),
+            ExecInput::Stdin(Vec::new()),
+            bound_binder(b"diagnostic-eof"),
+            sender,
+            ActivityTracker::new(),
+            diagnostics,
+        )
+        .await;
+        runtime.await?;
+
+        let lines = captured.lock().map_err(|_| "diagnostic capture poisoned")?;
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("operation=attach.bridge.output"));
+        assert!(lines[0].contains("runtime_code=command_io"));
+        assert!(lines[0].contains("runtime_operation=attach_bridge"));
+        assert!(!lines[0].contains("closed without a terminal output"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attach_bridge_diagnostic_distinguishes_later_input_send_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let token = b"diagnostic-input";
+        let (diagnostics, captured) = ErrorDiagnostics::capturing_for_tests();
+        let (input, mut inputs) = tokio::sync::mpsc::channel(1);
+        let (_outputs, output) = tokio::sync::mpsc::channel(1);
+        let (input_closed, closed) = tokio::sync::oneshot::channel();
+        let runtime = tokio::spawn(async move {
+            let _ = inputs.recv().await;
+            drop(inputs);
+            let _ = input_closed.send(());
+        });
+        let (sender, _receiver) = tokio::sync::mpsc::channel(4);
+        let (frames, frame_input) = tokio::sync::mpsc::channel(1);
+        let frame = v1::ClientFrame {
+            frame: Some(v1::client_frame::Frame::Stdin(vec![7])),
+            session_token: token.to_vec(),
+        };
+        let producer = tokio::spawn(async move {
+            let _ = closed.await;
+            let _ = frames.send(Ok(frame)).await;
+        });
+
+        run_attach_bridge_with_diagnostics(
+            ExecSession::live(input, output),
+            tokio_stream::wrappers::ReceiverStream::new(frame_input),
+            ExecInput::Stdin(Vec::new()),
+            bound_binder(token),
+            sender,
+            ActivityTracker::new(),
+            diagnostics,
+        )
+        .await;
+        runtime.await?;
+        producer.await?;
+
+        let lines = captured.lock().map_err(|_| "diagnostic capture poisoned")?;
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("operation=attach.bridge.input"));
+        assert!(lines[0].contains("runtime_code=command_io"));
+        assert!(lines[0].contains("runtime_operation=exec_input"));
+        assert!(!lines[0].contains("closed"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn attach_shutdown_forced_timeout_is_bounded_and_typed()
     -> Result<(), Box<dyn std::error::Error>> {
         let activity = ActivityTracker::new();
@@ -1748,8 +1986,11 @@ mod tests {
             ExecInput::Stdin(Vec::new()),
             bound_binder(b"full-terminal"),
             sender,
-            Some(terminal_sender),
-            activity.clone(),
+            AttachBridgeControl {
+                terminal: Some(terminal_sender),
+                activity: activity.clone(),
+                diagnostics: ErrorDiagnostics::disabled(),
+            },
         ));
         activity.cancel_streams();
         tokio::time::timeout(std::time::Duration::from_secs(1), bridge).await??;
@@ -2251,6 +2492,29 @@ mod tests {
             .ok_or("enabled diagnostics did not produce a line")?;
         assert!(line.contains("runtime_operation=container_system_version"));
         assert!(!line.contains(secret));
+        Ok(())
+    }
+
+    #[test]
+    fn attach_exec_diagnostic_is_distinct_and_preserves_public_status()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let secret = "opaque-attach-exec-backend-content";
+        let error = ServiceError::Runtime(gascan_core::runtime::RuntimeError::InvalidOutput {
+            operation: "container inspect".to_owned(),
+            message: format!("raw JSON {secret}"),
+        });
+        let (diagnostics, captured) = ErrorDiagnostics::capturing_for_tests();
+
+        let status = service_status_with_diagnostics(error, "attach.exec", &diagnostics);
+
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(status.message(), error_code::BACKEND_UNAVAILABLE);
+        let lines = captured.lock().map_err(|_| "diagnostic capture poisoned")?;
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("operation=attach.exec"));
+        assert!(lines[0].contains("runtime_code=invalid_output"));
+        assert!(lines[0].contains("runtime_operation=container_inspect"));
+        assert!(!lines[0].contains(secret));
         Ok(())
     }
 }
