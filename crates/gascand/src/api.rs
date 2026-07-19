@@ -741,7 +741,7 @@ fn runtime_operation_label(operation: &str) -> &'static str {
         "container list" => "container_list",
         "container volume list" => "container_volume_list",
         "container system status" => "container_system_status",
-        "version" => "container_version",
+        "container system version" => "container_system_version",
         "gascan-apple-attach" | "GASCAN_APPLE_ATTACH_HELPER" => "apple_attach_helper",
         "inventory proof cache" => "inventory_proof_cache",
         "attach_bridge" => "attach_bridge",
@@ -2240,6 +2240,17 @@ mod tests {
         assert!(line.contains("runtime_operation=apple_attach_helper"));
         assert!(!line.contains(secret));
         assert!(!line.contains("helper raw output"));
+
+        let system_version =
+            ServiceError::Runtime(gascan_core::runtime::RuntimeError::InvalidOutput {
+                operation: "container system version".to_owned(),
+                message: format!("raw version response {secret}"),
+            });
+        let line = ErrorDiagnostics::enabled_for_tests()
+            .line("run.validate_exec", &system_version)
+            .ok_or("enabled diagnostics did not produce a line")?;
+        assert!(line.contains("runtime_operation=container_system_version"));
+        assert!(!line.contains(secret));
         Ok(())
     }
 }
