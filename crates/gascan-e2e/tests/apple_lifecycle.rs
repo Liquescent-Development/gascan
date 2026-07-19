@@ -17,7 +17,7 @@ fn cli_lifecycle_survives_daemon_and_host_state_changes() -> TestResult {
     env.assert_exit_code(&exit, 42)?;
 
     let shell = env.success(["--sandbox", env.id(), "shell", "--", "sh", "-c", "id -u"])?;
-    assert_eq!(shell.stdout, b"1000\n");
+    assert_eq!(shell.stdout, b"1000\r\n");
 
     let tty = env.run_pty(&["sh", "-c", "test -t 0 && test -t 1"])?;
     assert!(
