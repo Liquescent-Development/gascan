@@ -792,7 +792,11 @@ fn run_pty_resize_command_with_actions(
 
             if let Some(status) = poll(&mut child)? {
                 if !resized {
-                    return Err("PTY child exited before resize readiness".into());
+                    return Err(format!(
+                        "PTY child exited before resize readiness ({status}); captured PTY output: {}",
+                        bounded_escaped_pty_output(&captured)
+                    )
+                    .into());
                 }
                 break status;
             }
@@ -823,7 +827,11 @@ fn run_pty_resize_command_with_actions(
 
             let now = std::time::Instant::now();
             if !resized && now >= readiness_deadline {
-                return Err("PTY child did not report resize readiness".into());
+                return Err(format!(
+                    "PTY child did not report resize readiness; captured PTY output: {}",
+                    bounded_escaped_pty_output(&captured)
+                )
+                .into());
             }
             if now >= execution_deadline {
                 return Err("PTY child did not exit after resize".into());
@@ -847,6 +855,20 @@ fn run_pty_resize_command_with_actions(
             error,
             kill_and_reap_pty_child(&mut child, &mut poll, &mut kill),
         ),
+    }
+}
+
+fn bounded_escaped_pty_output(captured: &[u8]) -> String {
+    const MAXIMUM_BYTES: usize = 4 * 1024;
+
+    let omitted = captured.len().saturating_sub(MAXIMUM_BYTES);
+    let rendered = String::from_utf8_lossy(&captured[omitted..])
+        .escape_debug()
+        .to_string();
+    if omitted > 0 {
+        format!("<{omitted} bytes omitted>{rendered}")
+    } else {
+        rendered
     }
 }
 
@@ -1540,6 +1562,55 @@ mod tests {
         descendant.kill_and_confirm_absent()?;
         assert!(process_field(descendant_pid, "stat=").is_err());
         Ok(())
+    }
+
+    #[test]
+    fn pty_resize_early_exit_reports_status_and_bounded_escaped_output() -> TestResult {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf 'resize failed: \\377\\n'; exit 23"]);
+
+        let result = run_pty_resize_command(command, b"GASCAN_RESIZE_READY", 47, 132);
+        let error = match result {
+            Ok(_) => return Err("early PTY exit was not returned".into()),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("exit status: 23"), "error={error}");
+        assert!(error.contains("resize failed: �\\r\\n"), "error={error}");
+        Ok(())
+    }
+
+    #[test]
+    fn pty_resize_readiness_timeout_reports_bounded_escaped_output() -> TestResult {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf 'still waiting: \\377\\n'; exec sleep 30"]);
+
+        let result = run_pty_resize_command(command, b"GASCAN_RESIZE_READY", 47, 132);
+        let error = match result {
+            Ok(_) => return Err("PTY readiness timeout was not returned".into()),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(
+            error.contains("PTY child did not report resize readiness"),
+            "error={error}"
+        );
+        assert!(error.contains("still waiting: �\\r\\n"), "error={error}");
+        Ok(())
+    }
+
+    #[test]
+    fn pty_resize_diagnostic_output_keeps_only_escaped_four_kibibyte_tail() {
+        let mut captured = b"discard".to_vec();
+        captured.extend(std::iter::repeat_n(b'x', 4095));
+        captured.push(b'\n');
+
+        let rendered = bounded_escaped_pty_output(&captured);
+
+        assert!(rendered.starts_with("<7 bytes omitted>"));
+        assert!(!rendered.contains("discard"));
+        assert!(rendered.ends_with("xxx\\n"));
+        assert!(rendered.len() < 4200);
     }
 
     #[test]
