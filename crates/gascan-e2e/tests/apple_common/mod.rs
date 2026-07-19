@@ -101,6 +101,8 @@ impl AppleE2e {
             .ok_or("Gate 4 manifest must have an explicit name")?
             .to_owned();
         let id = SandboxId::from_root(&manifest_name, utf8_root);
+        let cleanup_resources =
+            gascan_core::policy::PolicyCompiler::expected_resource_identities(&id)?;
         let owner_token = format!(
             "gate4-{}-{}",
             std::process::id(),
@@ -112,12 +114,10 @@ impl AppleE2e {
             let record = serde_json::json!({
                 "version": 1,
                 "sandbox_id": id.as_str(),
-                "resources": [
-                    id.as_str(),
-                    format!("gascan-mise-{id}"),
-                    format!("gascan-cache-{id}"),
-                    format!("gascan-config-{id}"),
-                ],
+                "resources": cleanup_resources
+                    .iter()
+                    .map(gascan_core::runtime::ResourceIdentity::name)
+                    .collect::<Vec<_>>(),
                 "managed_by": "gascan",
                 "owner_token": owner_token,
                 "daemon_instance_path": runtime_root.join("daemon-instance.json"),
@@ -367,8 +367,9 @@ impl AppleE2e {
     }
 
     pub fn assert_no_owned_resources(&self) -> TestResult {
-        for name in self.resource_names() {
-            match resource_presence(&name, self.id())? {
+        for identity in self.resource_identities()? {
+            let name = identity.name();
+            match resource_presence(name, self.id())? {
                 ResourcePresence::Absent => {}
                 ResourcePresence::Owned => {
                     return Err(format!("owned Gate 4 resource remains: {name}").into());
@@ -381,32 +382,28 @@ impl AppleE2e {
         Ok(())
     }
 
-    fn resource_names(&self) -> [String; 4] {
-        [
-            self.id().to_owned(),
-            format!("gascan-mise-{}", self.id()),
-            format!("gascan-cache-{}", self.id()),
-            format!("gascan-config-{}", self.id()),
-        ]
+    fn resource_identities(&self) -> TestResult<Vec<gascan_core::runtime::ResourceIdentity>> {
+        Ok(gascan_core::policy::PolicyCompiler::expected_resource_identities(&self.id)?)
     }
 
     fn cleanup(&self) -> TestResult {
-        for (index, name) in self.resource_names().into_iter().enumerate() {
-            if resource_presence(&name, self.id())
+        for identity in self.resource_identities()? {
+            let name = identity.name();
+            if resource_presence(name, self.id())
                 .is_ok_and(|presence| presence == ResourcePresence::Owned)
             {
-                if index == 0 {
+                if identity.kind() == gascan_core::runtime::ResourceKind::Container {
                     let _ = Command::new("container")
-                        .args(["stop", "--time", "5", &name])
+                        .args(["stop", "--time", "5", name])
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
                         .status();
                 }
                 let mut command = Command::new("container");
-                if index == 0 {
-                    command.args(["delete", &name]);
+                if identity.kind() == gascan_core::runtime::ResourceKind::Container {
+                    command.args(["delete", name]);
                 } else {
-                    command.args(["volume", "delete", &name]);
+                    command.args(["volume", "delete", name]);
                 }
                 let status = command
                     .stdout(Stdio::null())
@@ -465,7 +462,7 @@ impl Drop for AppleE2e {
 impl AppleE2e {
     fn terminate_daemon(&self) -> TestResult {
         let instance_path = self.runtime_root.join("daemon-instance.json");
-        if !instance_path.exists() {
+        if !instance_path.try_exists()? {
             return Ok(());
         }
         let recorded = self.daemon_instance_record()?;
@@ -511,13 +508,40 @@ fn wait_for_process_identity_exit(
 ) -> TestResult<bool> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if process_field(pid, "lstart=").is_err() || process_field(pid, "lstart=")? != start {
+        if process_identity_has_exited_with(
+            start,
+            || process_field(pid, "lstart="),
+            || {
+                let raw_pid = i32::try_from(pid).map_err(|_| rustix::io::Errno::INVAL)?;
+                let pid =
+                    rustix::process::Pid::from_raw(raw_pid).ok_or(rustix::io::Errno::INVAL)?;
+                rustix::process::test_kill_process(pid)
+            },
+        )? {
             return Ok(true);
         }
         if std::time::Instant::now() >= deadline {
             return Ok(false);
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+fn process_identity_has_exited_with(
+    expected_start: &str,
+    inspect: impl FnOnce() -> TestResult<String>,
+    probe: impl FnOnce() -> Result<(), rustix::io::Errno>,
+) -> TestResult<bool> {
+    match inspect() {
+        Ok(observed_start) => Ok(observed_start != expected_start),
+        Err(inspect_error) => match probe() {
+            Err(rustix::io::Errno::SRCH) => Ok(true),
+            Ok(()) => Err(inspect_error),
+            Err(probe_error) => Err(format!(
+                "process identity inspection failed: {inspect_error}; process existence probe failed: {probe_error}"
+            )
+            .into()),
+        },
     }
 }
 
@@ -927,6 +951,30 @@ fn resource_presence(name: &str, id: &str) -> TestResult<ResourcePresence> {
 }
 
 #[cfg(test)]
+fn cleanup_resource_identities(
+    cleanup: &Value,
+) -> TestResult<Vec<gascan_core::runtime::ResourceIdentity>> {
+    let resources = cleanup["resources"]
+        .as_array()
+        .ok_or("cleanup resources must be an array")?;
+    resources
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let name = value
+                .as_str()
+                .ok_or("cleanup resource name must be a string")?;
+            let kind = if index == 0 {
+                gascan_core::runtime::ResourceKind::Container
+            } else {
+                gascan_core::runtime::ResourceKind::Volume
+            };
+            Ok(gascan_core::runtime::ResourceIdentity::new(kind, name)?)
+        })
+        .collect()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1096,22 +1144,71 @@ mod tests {
             let spec =
                 gascan_core::sandbox::SandboxSpec::from_root(&production_name, root, manifest)?;
             let cleanup: Value = serde_json::from_slice(&std::fs::read(cleanup_manifest)?)?;
+            let expected =
+                gascan_core::policy::PolicyCompiler::expected_resource_identities(spec.id())?;
+            let actual = cleanup_resource_identities(&cleanup)?;
+            let capabilities = gascan_core::runtime::RuntimeCapabilities {
+                version: gascan_core::runtime::RuntimeVersion::new(1, 1, 0),
+                bind_mounts: true,
+                named_volumes: true,
+                tty: true,
+                signals: true,
+                loopback_publish: true,
+                resource_limits: true,
+                offline: gascan_core::runtime::NetworkIsolation::Proven,
+            };
+            let request =
+                gascan_core::policy::PolicyCompiler::compile(spec.clone(), &capabilities)?;
 
             assert_eq!(env.id(), spec.id().as_str());
             assert_eq!(cleanup["sandbox_id"], spec.id().as_str());
-            assert_eq!(cleanup["resources"][0], spec.id().as_str());
+            assert_eq!(actual, expected);
+            assert_eq!(env.resource_identities()?, expected);
             assert_eq!(
-                cleanup["resources"][1],
-                format!("gascan-mise-{}", spec.id())
+                expected[0].kind(),
+                gascan_core::runtime::ResourceKind::Container
+            );
+            assert_eq!(expected[0].name(), spec.id().as_str());
+            assert!(
+                expected
+                    .iter()
+                    .skip(1)
+                    .all(|identity| identity.kind() == gascan_core::runtime::ResourceKind::Volume)
+            );
+            assert_eq!(request.id(), spec.id());
+            assert_eq!(
+                request.image(),
+                include_str!("../../../../images/workspace/approved-image.txt")
+            );
+            assert_eq!(request.image().matches('@').count(), 1);
+            assert!(!request.image().chars().any(char::is_whitespace));
+            assert_eq!(
+                request
+                    .volumes()
+                    .iter()
+                    .map(|volume| volume.name.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .skip(1)
+                    .map(|identity| identity.name())
+                    .collect::<Vec<_>>()
             );
             assert_eq!(
-                cleanup["resources"][2],
-                format!("gascan-cache-{}", spec.id())
+                request
+                    .volumes()
+                    .iter()
+                    .map(|volume| volume.target.as_str())
+                    .collect::<Vec<_>>(),
+                vec![
+                    "/home/workspace/.local/share/mise",
+                    "/home/workspace/.cache",
+                    "/home/workspace/.config/gascan",
+                ]
             );
-            assert_eq!(
-                cleanup["resources"][3],
-                format!("gascan-config-{}", spec.id())
-            );
+            assert!(request.volumes().iter().all(|volume| {
+                volume.ownership.sandbox_id == *spec.id() && volume.ownership.managed_by == "gascan"
+            }));
         }
         Ok(())
     }
@@ -1153,6 +1250,61 @@ mod tests {
 
         env.terminate_daemon()?;
         std::fs::remove_file(env.runtime_root.join("daemon-instance.json"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_propagates_instance_record_metadata_errors() -> TestResult {
+        use std::os::unix::fs::symlink;
+
+        let session = tempfile::tempdir()?;
+        let env = AppleE2e::new_scoped("instance-metadata-error", session.path().to_owned(), None)?;
+        let instance = env.runtime_root.join("daemon-instance.json");
+        symlink("daemon-instance.json", &instance)?;
+
+        let result = env.terminate_daemon();
+        std::fs::remove_file(instance)?;
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn process_identity_inspection_failure_requires_esrch_to_count_as_exit() -> TestResult {
+        let live_error = process_identity_has_exited_with(
+            "recorded-start",
+            || Err("forced identity inspection failure".into()),
+            || Ok(()),
+        );
+        let live_error = match live_error {
+            Ok(_) => return Err("live process inspection failure counted as exit".into()),
+            Err(error) => error,
+        };
+        assert!(
+            live_error
+                .to_string()
+                .contains("forced identity inspection failure")
+        );
+
+        assert!(process_identity_has_exited_with(
+            "recorded-start",
+            || Err("process disappeared during inspection".into()),
+            || Err(rustix::io::Errno::SRCH),
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn changed_start_identity_counts_as_exit_without_probing_reused_pid() -> TestResult {
+        let probed = std::cell::Cell::new(false);
+        assert!(process_identity_has_exited_with(
+            "recorded-start",
+            || Ok("reused-process-start".to_owned()),
+            || {
+                probed.set(true);
+                Ok(())
+            },
+        )?);
+        assert!(!probed.get());
         Ok(())
     }
 
