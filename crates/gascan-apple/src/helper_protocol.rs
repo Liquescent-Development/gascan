@@ -1,10 +1,18 @@
+use std::collections::BTreeMap;
+
 use base64::{Engine, engine::general_purpose::STANDARD};
 use gascan_core::runtime::RuntimeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use crate::{AttachInput, AttachOutput};
 
-pub const HELPER_PROTOCOL_VERSION: u32 = 1;
+pub const HELPER_PROTOCOL_VERSION: u32 = 2;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EnvironmentVariable {
+    name: String,
+    value: String,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -14,6 +22,7 @@ pub enum HelperInput {
         container: String,
         argv: Vec<String>,
         tty: bool,
+        environment: Vec<EnvironmentVariable>,
     },
     Stdin {
         version: u32,
@@ -35,12 +44,21 @@ pub enum HelperInput {
 }
 
 impl HelperInput {
-    pub fn start(container: String, argv: Vec<String>, tty: bool) -> Self {
+    pub fn start(
+        container: String,
+        argv: Vec<String>,
+        tty: bool,
+        environment: BTreeMap<String, String>,
+    ) -> Self {
         Self::Start {
             version: HELPER_PROTOCOL_VERSION,
             container,
             argv,
             tty,
+            environment: environment
+                .into_iter()
+                .map(|(name, value)| EnvironmentVariable { name, value })
+                .collect(),
         }
     }
 }

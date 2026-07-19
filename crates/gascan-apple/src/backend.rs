@@ -353,15 +353,15 @@ where
     }
 
     async fn exec(&self, request: ExecRequest) -> Result<ExecSession, RuntimeError> {
-        if !request.environment.is_empty() {
-            return Err(RuntimeError::UnsupportedCapability {
-                capability: "per-exec environment".into(),
-            });
-        }
         let initial_stdin = request.stdin;
         let mut session = self
             .attach
-            .exec(request.id.as_str(), request.argv, request.tty)
+            .exec_with_environment(
+                request.id.as_str(),
+                request.argv,
+                request.tty,
+                request.environment,
+            )
             .await?;
         let (input, mut inputs) = tokio::sync::mpsc::channel(16);
         let (outputs, output) = tokio::sync::mpsc::channel(32);

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     process::Stdio,
@@ -109,6 +110,21 @@ impl AppleAttach {
         I: IntoIterator<Item = A>,
         A: AsRef<str>,
     {
+        self.exec_with_environment(container, argv, tty, BTreeMap::new())
+            .await
+    }
+
+    pub async fn exec_with_environment<I, A>(
+        &self,
+        container: impl AsRef<str>,
+        argv: I,
+        tty: bool,
+        environment: BTreeMap<String, String>,
+    ) -> Result<AttachSession, RuntimeError>
+    where
+        I: IntoIterator<Item = A>,
+        A: AsRef<str>,
+    {
         let argv: Vec<String> = argv
             .into_iter()
             .map(|value| value.as_ref().to_owned())
@@ -116,6 +132,7 @@ impl AppleAttach {
         if argv.is_empty() {
             return Err(io_error("guest argv must not be empty"));
         }
+        validate_environment(&environment)?;
 
         let mut command = Command::new(&self.helper);
         command
@@ -134,7 +151,7 @@ impl AppleAttach {
 
         write_frame(
             &mut stdin,
-            &HelperInput::start(container.as_ref().to_owned(), argv, tty),
+            &HelperInput::start(container.as_ref().to_owned(), argv, tty, environment),
         )
         .await?;
 
@@ -389,6 +406,25 @@ fn io_error(message: impl Into<String>) -> RuntimeError {
         operation: OPERATION.to_owned(),
         message: message.into(),
     }
+}
+
+fn validate_environment(environment: &BTreeMap<String, String>) -> Result<(), RuntimeError> {
+    if environment.iter().any(|(name, value)| {
+        !is_allowed_environment_name(name)
+            || name.chars().any(char::is_control)
+            || name.contains('=')
+            || value.contains('\0')
+    }) {
+        return Err(io_error("invalid environment variable"));
+    }
+    Ok(())
+}
+
+fn is_allowed_environment_name(name: &str) -> bool {
+    matches!(name, "TERM" | "COLORTERM" | "LANG")
+        || name
+            .strip_prefix("LC_")
+            .is_some_and(|suffix| !suffix.is_empty())
 }
 
 fn missing_pipe(stream: &str) -> RuntimeError {

@@ -393,6 +393,33 @@ async fn exec_bridge_accepts_input_while_output_is_pending() {
 }
 
 #[tokio::test]
+async fn exec_bridge_forwards_allowed_environment_in_start_frame() {
+    let backend = AppleBackend::with_attach(StatefulAppleRunner::default(), fake_attach());
+    let (_root, create) = request("apple-attach-environment");
+    let mut session = backend
+        .exec(ExecRequest {
+            id: create.id().clone(),
+            argv: vec!["guest".to_owned()],
+            stdin: Vec::new(),
+            environment: BTreeMap::from([
+                ("LANG".to_owned(), "C.UTF-8".to_owned()),
+                ("TERM".to_owned(), "xterm-256color".to_owned()),
+            ]),
+            tty: false,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        session.next().await.unwrap().unwrap(),
+        ExecOutput::Exit {
+            code: 42,
+            signal: 0
+        }
+    );
+}
+
+#[tokio::test]
 async fn exec_bridge_reports_unsupported_signal_as_terminal_error() {
     let backend = AppleBackend::with_attach(StatefulAppleRunner::default(), fake_attach());
     let (_root, create) = request("apple-attach-signal");

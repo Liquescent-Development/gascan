@@ -179,7 +179,7 @@ struct GasCanAppleAttach {
         let first = try JSONDecoder().decode(InputFrame.self, from: Data(firstLine.utf8))
         try validateVersion(first)
         diagnostic("validated start frame")
-        guard case .start(_, let containerID, let argv, let tty) = first else {
+        guard case .start(_, let containerID, let argv, let tty, let environment) = first else {
             throw ProtocolFailure.expectedStart
         }
         guard let executable = argv.first else {
@@ -196,6 +196,10 @@ struct GasCanAppleAttach {
         configuration.executable = executable
         configuration.arguments = Array(argv.dropFirst())
         configuration.terminal = tty
+        configuration.environment = try overlayEnvironment(
+            configuration.environment,
+            with: environment
+        )
 
         let process = try await client.createProcess(
             containerId: container.id,

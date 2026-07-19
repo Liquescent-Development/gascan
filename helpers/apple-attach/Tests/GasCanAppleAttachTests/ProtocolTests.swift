@@ -1,18 +1,80 @@
 import Foundation
 import Testing
+
 @testable import GasCanAppleAttach
 
 @Test func protocolDecodesBase64WithoutLosingBytes() throws {
     let frame = try JSONDecoder().decode(
         InputFrame.self,
-        from: Data(#"{"version":1,"type":"stdin","data":"AP8="}"#.utf8)
+        from: Data(#"{"version":2,"type":"stdin","data":"AP8="}"#.utf8)
     )
-    #expect(frame == .stdin(version: 1, data: Data([0, 255])))
+    #expect(frame == .stdin(version: 2, data: Data([0, 255])))
+}
+
+@Test func startProtocolCarriesEnvironmentAtVersionTwo() throws {
+    let encoded = Data(
+        #"{"version":2,"type":"start","container":"container-id","argv":["env"],"tty":false,"environment":[{"name":"LANG","value":"C.UTF-8"}]}"#
+            .utf8
+    )
+    let frame = try JSONDecoder().decode(InputFrame.self, from: encoded)
+    try validateVersion(frame)
+    let roundTrip = try JSONSerialization.jsonObject(with: JSONEncoder().encode(frame))
+    let values = try #require(roundTrip as? [String: Any])
+    #expect(values["version"] as? Int == 2)
+    #expect(
+        (values["environment"] as? [[String: String]]) == [["name": "LANG", "value": "C.UTF-8"]])
+}
+
+@Test func malformedStartEnvironmentIsRejected() throws {
+    let invalidFrames = [
+        #"{"version":2,"type":"start","container":"id","argv":["true"],"tty":false,"environment":[{"name":"PATH","value":"/host/bin"}]}"#,
+        #"{"version":2,"type":"start","container":"id","argv":["true"],"tty":false,"environment":[{"name":"LC_","value":"C"}]}"#,
+        #"{"version":2,"type":"start","container":"id","argv":["true"],"tty":false,"environment":[{"name":"LC_\u0080","value":"C"}]}"#,
+        #"{"version":2,"type":"start","container":"id","argv":["true"],"tty":false,"environment":[{"name":"LANG","value":"C\u0000UTF-8"}]}"#,
+        #"{"version":2,"type":"start","container":"id","argv":["true"],"tty":false,"environment":[{"name":"TERM","value":"xterm"},{"name":"TERM","value":"vt100"}]}"#,
+    ]
+    for encoded in invalidFrames {
+        #expect(throws: ProtocolFailure.self) {
+            _ = try JSONDecoder().decode(InputFrame.self, from: Data(encoded.utf8))
+        }
+    }
+}
+
+@Test func versionOneStartWithoutEnvironmentIsRejectedAsProtocolFailure() throws {
+    let encoded = Data(
+        #"{"version":1,"type":"start","container":"id","argv":["true"],"tty":false}"#.utf8
+    )
+    #expect(throws: ProtocolFailure.self) {
+        let frame = try JSONDecoder().decode(InputFrame.self, from: encoded)
+        try validateVersion(frame)
+    }
+}
+
+@Test func environmentOverlayPreservesGuestDefaultsAndReplacesOnlyRequestedKeys() throws {
+    let guest = [
+        "PATH=/usr/local/bin:/usr/bin",
+        "HOME=/root",
+        "LANG=C",
+        "TOOL_CONFIG=a=b",
+    ]
+    let requested = [
+        EnvironmentVariable(name: "LANG", value: "C.UTF-8"),
+        EnvironmentVariable(name: "TERM", value: "xterm-256color"),
+    ]
+
+    #expect(
+        try overlayEnvironment(guest, with: requested) == [
+            "PATH=/usr/local/bin:/usr/bin",
+            "HOME=/root",
+            "TOOL_CONFIG=a=b",
+            "LANG=C.UTF-8",
+            "TERM=xterm-256color",
+        ])
 }
 
 @Test func protocolEncodesTypedTerminalFrames() throws {
     let exit = try JSONSerialization.jsonObject(with: JSONEncoder().encode(OutputFrame.exit(42)))
-    #expect((exit as? [String: Any])?["version"] as? Int == 1)
+    #expect((exit as? [String: Any])?["version"] as? Int == 2)
     #expect((exit as? [String: Any])?["type"] as? String == "exit")
     #expect((exit as? [String: Any])?["code"] as? Int == 42)
 
@@ -25,7 +87,7 @@ import Testing
 
 @Test func versionAndSignalRejectionAreStrict() throws {
     #expect(throws: ProtocolFailure.self) {
-        try validateVersion(.close(version: 2))
+        try validateVersion(.close(version: 3))
     }
     #expect(throws: ProtocolFailure.self) {
         try validateSignal(SIGINT)

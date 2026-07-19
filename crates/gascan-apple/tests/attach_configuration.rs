@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     ffi::OsString,
     fs,
     os::unix::fs::PermissionsExt as _,
@@ -13,6 +14,31 @@ fn executable(path: &Path) {
     let mut permissions = fs::metadata(path).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(path, permissions).unwrap();
+}
+
+#[tokio::test]
+async fn exec_rejects_unapproved_or_malformed_environment_before_spawn() {
+    let attach = AppleAttach::new("/definitely/missing/gascan-apple-attach");
+    for (name, value) in [("PATH", "/host/bin"), ("LC_", "C"), ("LANG", "C\0UTF-8")] {
+        let result = attach
+            .exec_with_environment(
+                "container-id",
+                ["true"],
+                false,
+                BTreeMap::from([(name.to_owned(), value.to_owned())]),
+            )
+            .await;
+        let error = match result {
+            Ok(_) => panic!("invalid environment unexpectedly reached the helper"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            RuntimeError::CommandIo { operation, message }
+                if operation == "gascan-apple-attach"
+                    && message.contains("invalid environment variable")
+        ));
+    }
 }
 
 fn set_mode(path: &Path, mode: u32) {

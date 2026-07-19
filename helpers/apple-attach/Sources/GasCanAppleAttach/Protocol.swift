@@ -1,9 +1,20 @@
 import Foundation
 
-let protocolVersion: UInt32 = 1
+let protocolVersion: UInt32 = 2
+
+struct EnvironmentVariable: Codable, Equatable {
+    let name: String
+    let value: String
+}
 
 enum InputFrame: Equatable {
-    case start(version: UInt32, container: String, argv: [String], tty: Bool)
+    case start(
+        version: UInt32,
+        container: String,
+        argv: [String],
+        tty: Bool,
+        environment: [EnvironmentVariable]
+    )
     case stdin(version: UInt32, data: Data)
     case resize(version: UInt32, rows: UInt16, cols: UInt16)
     case signal(version: UInt32, signal: Int32)
@@ -11,8 +22,8 @@ enum InputFrame: Equatable {
 
     var version: UInt32 {
         switch self {
-        case .start(let version, _, _, _), .stdin(let version, _),
-             .resize(let version, _, _), .signal(let version, _), .close(let version):
+        case .start(let version, _, _, _, _), .stdin(let version, _),
+            .resize(let version, _, _), .signal(let version, _), .close(let version):
             version
         }
     }
@@ -20,7 +31,7 @@ enum InputFrame: Equatable {
 
 extension InputFrame: Codable {
     private enum Keys: String, CodingKey {
-        case version, type, container, argv, tty, data, rows, cols, signal
+        case version, type, container, argv, tty, environment, data, rows, cols, signal
     }
 
     init(from decoder: Decoder) throws {
@@ -28,11 +39,18 @@ extension InputFrame: Codable {
         let version = try values.decode(UInt32.self, forKey: .version)
         switch try values.decode(String.self, forKey: .type) {
         case "start":
+            let environment =
+                try values.decodeIfPresent(
+                    [EnvironmentVariable].self,
+                    forKey: .environment
+                ) ?? []
+            try validateEnvironment(environment)
             self = .start(
                 version: version,
                 container: try values.decode(String.self, forKey: .container),
                 argv: try values.decode([String].self, forKey: .argv),
-                tty: try values.decode(Bool.self, forKey: .tty)
+                tty: try values.decode(Bool.self, forKey: .tty),
+                environment: environment
             )
         case "stdin":
             self = .stdin(version: version, data: try values.decode(Data.self, forKey: .data))
@@ -59,11 +77,12 @@ extension InputFrame: Codable {
         var values = encoder.container(keyedBy: Keys.self)
         try values.encode(version, forKey: .version)
         switch self {
-        case .start(_, let container, let argv, let tty):
+        case .start(_, let container, let argv, let tty, let environment):
             try values.encode("start", forKey: .type)
             try values.encode(container, forKey: .container)
             try values.encode(argv, forKey: .argv)
             try values.encode(tty, forKey: .tty)
+            try values.encode(environment, forKey: .environment)
         case .stdin(_, let data):
             try values.encode("stdin", forKey: .type)
             try values.encode(data, forKey: .data)
@@ -117,6 +136,7 @@ enum ProtocolFailure: Error {
     case duplicateStart
     case emptyArgv
     case invalidSignal(Int32)
+    case invalidEnvironment
 }
 
 func validateVersion(_ frame: InputFrame) throws {
@@ -127,4 +147,38 @@ func validateVersion(_ frame: InputFrame) throws {
 
 func validateSignal(_ signal: Int32) throws {
     throw ProtocolFailure.invalidSignal(signal)
+}
+
+func validateEnvironment(_ environment: [EnvironmentVariable]) throws {
+    var names = Set<String>()
+    for variable in environment {
+        let name = variable.name
+        let allowed =
+            name == "TERM" || name == "COLORTERM" || name == "LANG"
+            || (name.hasPrefix("LC_") && name.count > 3)
+        guard allowed,
+            !name.contains("="),
+            !name.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+            !variable.value.contains("\0"),
+            names.insert(name).inserted
+        else {
+            throw ProtocolFailure.invalidEnvironment
+        }
+    }
+}
+
+func overlayEnvironment(
+    _ guest: [String],
+    with requested: [EnvironmentVariable]
+) throws -> [String] {
+    try validateEnvironment(requested)
+    let replaced = Set(requested.map(\.name))
+    var environment = guest.filter { entry in
+        let name =
+            entry.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false).first
+            .map(String.init) ?? ""
+        return !replaced.contains(name)
+    }
+    environment.append(contentsOf: requested.map { "\($0.name)=\($0.value)" })
+    return environment
 }
