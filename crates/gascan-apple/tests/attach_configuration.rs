@@ -15,6 +15,12 @@ fn executable(path: &Path) {
     fs::set_permissions(path, permissions).unwrap();
 }
 
+fn set_mode(path: &Path, mode: u32) {
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(mode);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
 #[test]
 fn absent_override_keeps_packaged_helper_contract() {
     let attach = AppleAttach::configured(None).unwrap();
@@ -29,6 +35,23 @@ fn executable_override_is_canonicalized_exactly() {
 
     let attach = AppleAttach::configured(Some(helper.clone().into_os_string())).unwrap();
     assert_eq!(attach.helper_path(), fs::canonicalize(helper).unwrap());
+}
+
+#[test]
+fn relative_executable_override_is_canonicalized_exactly() {
+    let current = std::env::current_dir().unwrap();
+    let helper = tempfile::Builder::new()
+        .prefix("gascan-attach-config-")
+        .tempfile_in(&current)
+        .unwrap();
+    set_mode(helper.path(), 0o755);
+    let relative = helper.path().strip_prefix(&current).unwrap().to_path_buf();
+
+    let attach = AppleAttach::configured(Some(relative.into_os_string())).unwrap();
+    assert_eq!(
+        attach.helper_path(),
+        fs::canonicalize(helper.path()).unwrap()
+    );
 }
 
 #[test]
@@ -62,6 +85,22 @@ fn missing_or_non_executable_override_is_rejected() {
         RuntimeError::CommandIo { operation, message }
             if operation == "GASCAN_APPLE_ATTACH_HELPER"
                 && message.contains("is not executable")
+    ));
+}
+
+#[test]
+fn other_only_execute_bit_is_not_executable_by_its_current_owner() {
+    let directory = tempfile::tempdir().unwrap();
+    let helper = directory.path().join("other-only");
+    fs::write(&helper, "fixture").unwrap();
+    set_mode(&helper, 0o001);
+
+    let error = AppleAttach::configured(Some(helper.into_os_string())).unwrap_err();
+    assert!(matches!(
+        error,
+        RuntimeError::CommandIo { operation, message }
+            if operation == "GASCAN_APPLE_ATTACH_HELPER"
+                && message.contains("is not executable by the effective user")
     ));
 }
 

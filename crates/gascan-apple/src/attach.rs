@@ -1,11 +1,11 @@
 use std::{
     ffi::{OsStr, OsString},
-    os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
     process::Stdio,
 };
 
 use gascan_core::runtime::RuntimeError;
+use rustix::fs::{Access, AtFlags, CWD, accessat};
 use serde::Serialize;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -73,12 +73,12 @@ impl AppleAttach {
                 canonical.display()
             )));
         }
-        if metadata.permissions().mode() & 0o111 == 0 {
-            return Err(configuration_error(format!(
-                "{} is not executable",
+        accessat(CWD, &canonical, Access::EXEC_OK, AtFlags::EACCESS).map_err(|error| {
+            configuration_error(format!(
+                "{} is not executable by the effective user: {error}",
                 canonical.display()
-            )));
-        }
+            ))
+        })?;
         Ok(Self::new(canonical))
     }
 
