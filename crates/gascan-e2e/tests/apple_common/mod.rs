@@ -3,7 +3,7 @@
 use gascan_core::sandbox::SandboxId;
 use serde_json::Value;
 use std::ffi::{OsStr, OsString};
-use std::io::Read as _;
+use std::io::{Read as _, Seek as _};
 use std::process::{Command, ExitStatus, Output, Stdio};
 
 #[derive(serde::Deserialize)]
@@ -31,20 +31,6 @@ pub struct PtySignalOutput {
 
 pub type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-pub fn assert_exit_code(output: &Output, expected: i32) -> TestResult {
-    if output.status.code() == Some(expected) {
-        Ok(())
-    } else {
-        Err(format!(
-            "expected {expected} exit code, got {:?}: stdout={} stderr={}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into())
-    }
-}
-
 pub struct AppleE2e {
     gascan: OsString,
     gascand: OsString,
@@ -55,6 +41,7 @@ pub struct AppleE2e {
     id: SandboxId,
     manifest_name: String,
     owner_token: String,
+    error_diagnostics: bool,
 }
 
 impl AppleE2e {
@@ -64,13 +51,23 @@ impl AppleE2e {
         let session_root = std::env::var_os("GASCAN_E2E_SESSION_ROOT")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
-        Self::new_scoped(name, session_root, manifest)
+        let error_diagnostics = std::env::var_os("GASCAN_GATE4_DIAGNOSTICS").is_some();
+        Self::new_scoped_with_diagnostics(name, session_root, manifest, error_diagnostics)
     }
 
     fn new_scoped(
         name: &str,
         session_root: std::path::PathBuf,
         manifest: Option<std::path::PathBuf>,
+    ) -> TestResult<Self> {
+        Self::new_scoped_with_diagnostics(name, session_root, manifest, false)
+    }
+
+    fn new_scoped_with_diagnostics(
+        name: &str,
+        session_root: std::path::PathBuf,
+        manifest: Option<std::path::PathBuf>,
+        error_diagnostics: bool,
     ) -> TestResult<Self> {
         let gascan = std::env::var_os("CARGO_BIN_EXE_gascan-e2e-cli")
             .ok_or("workspace-built gascan binary is unavailable")?;
@@ -145,6 +142,7 @@ impl AppleE2e {
             id,
             manifest_name,
             owner_token,
+            error_diagnostics,
         })
     }
 
@@ -219,6 +217,11 @@ impl AppleE2e {
             )
             .env("GASCAN_DAEMON", &self.gascand)
             .env_remove("GASCAN_TEST_FAKE_BACKEND");
+        if self.error_diagnostics {
+            command.env(gascand::TEST_ERROR_DIAGNOSTICS_ENV, "1");
+        } else {
+            command.env_remove(gascand::TEST_ERROR_DIAGNOSTICS_ENV);
+        }
         command
     }
 
@@ -242,8 +245,7 @@ impl AppleE2e {
     {
         let output = self.invoke(args)?;
         if !output.status.success() {
-            let daemon_stderr = std::fs::read_to_string(self.runtime_root.join("daemon.stderr"))
-                .unwrap_or_else(|error| format!("<unavailable: {error}>"));
+            let daemon_stderr = self.bounded_daemon_stderr();
             let daemon_pid = std::fs::read_to_string(self.runtime_root.join("daemon.pid"))
                 .unwrap_or_else(|error| format!("<unavailable: {error}>"));
             let daemon_alive = Command::new("kill")
@@ -266,6 +268,42 @@ impl AppleE2e {
             .into());
         }
         Ok(output)
+    }
+
+    pub fn assert_exit_code(&self, output: &Output, expected: i32) -> TestResult {
+        if output.status.code() == Some(expected) {
+            return Ok(());
+        }
+        Err(format!(
+            "expected {expected} exit code, got {:?}: stdout={} stderr={} daemon_stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            self.bounded_daemon_stderr()
+        )
+        .into())
+    }
+
+    fn bounded_daemon_stderr(&self) -> String {
+        const MAXIMUM: u64 = 16 * 1_024;
+        let path = self.runtime_root.join("daemon.stderr");
+        let result = (|| -> std::io::Result<String> {
+            let mut file = std::fs::File::open(path)?;
+            let length = file.metadata()?.len();
+            let omitted = length.saturating_sub(MAXIMUM);
+            if omitted > 0 {
+                file.seek(std::io::SeekFrom::Start(omitted))?;
+            }
+            let mut bytes = Vec::with_capacity(usize::try_from(length.min(MAXIMUM)).unwrap_or(0));
+            file.take(MAXIMUM).read_to_end(&mut bytes)?;
+            let tail = String::from_utf8_lossy(&bytes);
+            if omitted > 0 {
+                Ok(format!("<{omitted} bytes omitted>\n{tail}"))
+            } else {
+                Ok(tail.into_owned())
+            }
+        })();
+        result.unwrap_or_else(|error| format!("<unavailable: {error}>"))
     }
 
     pub fn status_json(&self) -> TestResult<Value> {
@@ -1349,7 +1387,12 @@ mod tests {
             stdout: b"sandbox-not-found".to_vec(),
             stderr: b"lookup failed".to_vec(),
         };
-        let error = match assert_exit_code(&output, 42) {
+        let env = AppleE2e::new("exit-diagnostic")?;
+        std::fs::write(
+            env.runtime_root.join("daemon.stderr"),
+            [vec![b'x'; 32_000], b"daemon-tail-cause".to_vec()].concat(),
+        )?;
+        let error = match env.assert_exit_code(&output, 42) {
             Ok(()) => return Err("wrong exit code was accepted".into()),
             Err(error) => error,
         };
@@ -1357,6 +1400,29 @@ mod tests {
         assert!(message.contains("expected 42"));
         assert!(message.contains("sandbox-not-found"));
         assert!(message.contains("lookup failed"));
+        assert!(message.contains("daemon-tail-cause"));
+        assert!(message.contains("omitted"));
+        assert!(message.len() < 20_000);
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostic_opt_in_is_forwarded_to_the_autostarted_daemon() -> TestResult {
+        let session = tempfile::tempdir()?;
+        let env = AppleE2e::new_scoped_with_diagnostics(
+            "diagnostic-env",
+            session.path().to_path_buf(),
+            None,
+            true,
+        )?;
+        let command = env.command(["status"]);
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(name, _)| *name == OsStr::new(gascand::TEST_ERROR_DIAGNOSTICS_ENV))
+                .and_then(|(_, value)| value),
+            Some(OsStr::new("1"))
+        );
         Ok(())
     }
 

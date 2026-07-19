@@ -13,6 +13,7 @@ use gascan_proto::v1::gas_can_server::{GasCan, GasCanServer};
 use gascan_proto::{
     API_MAJOR, API_MINOR, error_code, local_transport_security, validate_api_major,
 };
+use std::fmt::Write as _;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -386,6 +387,7 @@ pub struct SandboxApi<B: RuntimeBackend> {
     service: Arc<SandboxService<B>>,
     activity: ActivityTracker,
     sessions: Arc<tokio::sync::Mutex<SessionRegistry>>,
+    error_diagnostics: ErrorDiagnostics,
 }
 
 #[derive(Debug)]
@@ -453,6 +455,15 @@ impl SessionRegistry {
 impl<B: RuntimeBackend> SandboxApi<B> {
     #[must_use]
     pub fn new(service: Arc<SandboxService<B>>, activity: ActivityTracker) -> Self {
+        Self::new_with_error_diagnostics(service, activity, ErrorDiagnostics::disabled())
+    }
+
+    #[must_use]
+    pub fn new_with_error_diagnostics(
+        service: Arc<SandboxService<B>>,
+        activity: ActivityTracker,
+        error_diagnostics: ErrorDiagnostics,
+    ) -> Self {
         let sessions = Arc::new(tokio::sync::Mutex::new(SessionRegistry::default()));
         let weak = Arc::downgrade(&sessions);
         tokio::spawn(async move {
@@ -468,6 +479,7 @@ impl<B: RuntimeBackend> SandboxApi<B> {
             service,
             activity,
             sessions,
+            error_diagnostics,
         }
     }
 }
@@ -616,6 +628,149 @@ fn service_status(error: ServiceError) -> tonic::Status {
         }
         _ => tonic::Status::internal(error_code::INTERNAL),
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ErrorDiagnostics {
+    enabled: bool,
+}
+
+impl ErrorDiagnostics {
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self { enabled: false }
+    }
+
+    #[must_use]
+    pub const fn enabled_for_tests() -> Self {
+        Self { enabled: true }
+    }
+
+    fn emit(self, context: &'static str, error: &ServiceError) {
+        if let Some(line) = self.line(context, error) {
+            eprintln!("{line}");
+        }
+    }
+
+    fn line(self, context: &'static str, error: &ServiceError) -> Option<String> {
+        if !self.enabled {
+            return None;
+        }
+        let mut line = format!(
+            "gascan internal diagnostic: operation={} {}",
+            sanitize_diagnostic(context, 64),
+            service_error_diagnostic(error)
+        );
+        if line.len() > 2_048 {
+            let mut boundary = 2_048;
+            while !line.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            line.truncate(boundary);
+        }
+        Some(line)
+    }
+}
+
+fn service_status_with_diagnostics(
+    error: ServiceError,
+    context: &'static str,
+    diagnostics: ErrorDiagnostics,
+) -> tonic::Status {
+    diagnostics.emit(context, &error);
+    service_status(error)
+}
+
+fn service_error_diagnostic(error: &ServiceError) -> String {
+    match error {
+        ServiceError::Runtime(error) => runtime_error_diagnostic(error),
+        ServiceError::Store(_) => "service_kind=store".to_owned(),
+        ServiceError::Create(_) => "service_kind=create".to_owned(),
+        ServiceError::Policy(_) => "service_kind=policy".to_owned(),
+        ServiceError::Sandbox(_) => "service_kind=sandbox".to_owned(),
+        ServiceError::Manifest(_) => "service_kind=manifest".to_owned(),
+        ServiceError::Missing(_) => "service_kind=missing".to_owned(),
+        ServiceError::Ownership(_) => "service_kind=ownership".to_owned(),
+        ServiceError::Provision(_) => "service_kind=provision".to_owned(),
+        ServiceError::LockPoisoned => "service_kind=lock_poisoned".to_owned(),
+        ServiceError::EventStreamUnavailable => "service_kind=event_stream_unavailable".to_owned(),
+        ServiceError::DatabaseWorker(_) => "service_kind=database_worker".to_owned(),
+        ServiceError::Fingerprint(_) => "service_kind=fingerprint".to_owned(),
+        ServiceError::IncompleteDestroy(_) => "service_kind=incomplete_destroy".to_owned(),
+    }
+}
+
+fn runtime_error_diagnostic(error: &gascan_core::runtime::RuntimeError) -> String {
+    use gascan_core::runtime::RuntimeError;
+
+    let mut detail = format!("service_kind=runtime runtime_code={}", error.code());
+    match error {
+        RuntimeError::CommandIo { operation, message }
+        | RuntimeError::InvalidOutput { operation, message } => {
+            let _ = write!(
+                detail,
+                " runtime_operation={} detail={}",
+                sanitize_diagnostic(operation, 128),
+                sanitize_diagnostic(message, 1_024)
+            );
+        }
+        RuntimeError::CommandFailed {
+            operation,
+            exit_code,
+            ..
+        } => {
+            let _ = write!(
+                detail,
+                " runtime_operation={} exit_code={} stderr=omitted",
+                sanitize_diagnostic(operation, 128),
+                exit_code.map_or_else(|| "none".to_owned(), |code| code.to_string())
+            );
+        }
+        RuntimeError::HelperError {
+            operation, code, ..
+        } => {
+            let _ = write!(
+                detail,
+                " runtime_operation={} helper_code={} helper_message=omitted",
+                sanitize_diagnostic(operation, 128),
+                sanitize_diagnostic(code, 128)
+            );
+        }
+        RuntimeError::UnsupportedVersion { found, .. } => {
+            let _ = write!(detail, " found={found:?}");
+        }
+        RuntimeError::UnsupportedCapability { capability } => {
+            let _ = write!(
+                detail,
+                " capability={}",
+                sanitize_diagnostic(capability, 256)
+            );
+        }
+        RuntimeError::OwnershipMismatch { .. }
+        | RuntimeError::ForeignResourceRefused { .. }
+        | RuntimeError::InvalidResourceIdentity { .. }
+        | RuntimeError::Conflict { .. }
+        | RuntimeError::NotFound { .. }
+        | RuntimeError::InvalidState { .. }
+        | RuntimeError::UnknownActualState { .. }
+        | RuntimeError::InjectedFailure { .. } => {}
+        _ => {}
+    }
+    detail
+}
+
+fn sanitize_diagnostic(value: &str, maximum: usize) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(maximum)
+        .collect()
 }
 
 fn pre_begin_status(error: PreBeginFailure) -> tonic::Status {
@@ -1188,10 +1343,9 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         let command = request
             .command
             .ok_or_else(|| tonic::Status::invalid_argument(error_code::INVALID_REQUEST))?;
-        self.service
-            .validate_exec(&id)
-            .await
-            .map_err(service_status)?;
+        self.service.validate_exec(&id).await.map_err(|error| {
+            service_status_with_diagnostics(error, "run.validate_exec", self.error_diagnostics)
+        })?;
         let mut token = vec![0_u8; 24];
         getrandom::fill(&mut token).map_err(|_| tonic::Status::internal(error_code::INTERNAL))?;
         self.sessions.lock().await.insert(
@@ -1226,10 +1380,9 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         } else {
             argv_from_wire(command.argv).map_err(ApiInputError::status)?
         };
-        self.service
-            .validate_exec(&id)
-            .await
-            .map_err(service_status)?;
+        self.service.validate_exec(&id).await.map_err(|error| {
+            service_status_with_diagnostics(error, "shell.validate_exec", self.error_diagnostics)
+        })?;
         let mut token = vec![0_u8; 24];
         getrandom::fill(&mut token).map_err(|_| tonic::Status::internal(error_code::INTERNAL))?;
         self.sessions.lock().await.insert(
@@ -1436,7 +1589,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
 mod tests {
     use super::{
         ActivityTracker, ApiEventStream, ApiInputError, AttachStream, AttachTerminal,
-        PendingSession, SessionRegistry, attach_shutdown_requested_with,
+        ErrorDiagnostics, PendingSession, SessionRegistry, attach_shutdown_requested_with,
         run_attach_bridge as run_attach_bridge_impl, service_status, spec_for_root, wire_event,
         wire_status,
     };
@@ -2022,5 +2175,30 @@ mod tests {
         }));
         assert_eq!(status.code(), tonic::Code::AlreadyExists);
         assert_eq!(status.message(), error_code::OPERATION_CONFLICT);
+    }
+
+    #[test]
+    fn internal_error_diagnostics_are_explicit_bounded_and_sanitized() {
+        let secret = "opaque-container-stderr-should-not-escape";
+        let error = ServiceError::Runtime(gascan_core::runtime::RuntimeError::CommandFailed {
+            operation: "container inspect".to_owned(),
+            exit_code: Some(1),
+            stderr: secret.repeat(200),
+        });
+
+        assert_eq!(
+            ErrorDiagnostics::disabled().line("run.validate_exec", &error),
+            None
+        );
+        let line = ErrorDiagnostics::enabled_for_tests()
+            .line("run.validate_exec", &error)
+            .ok_or("enabled diagnostics did not produce a line")
+            .unwrap_or_default();
+        assert!(line.contains("operation=run.validate_exec"));
+        assert!(line.contains("runtime_code=command_failed"));
+        assert!(line.contains("runtime_operation=container inspect"));
+        assert!(line.contains("exit_code=1"));
+        assert!(!line.contains(secret));
+        assert!(line.len() <= 2_048);
     }
 }

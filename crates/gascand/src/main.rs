@@ -7,8 +7,9 @@ use gascan_core::doctor::{DoctorFact, DoctorFacts, DoctorReport};
 use gascan_core::fake_runtime::FakeRuntime;
 use gascan_core::runtime::RuntimeBackend;
 use gascand::{
-    BackendSelection, Daemon, DaemonConfig, DoctorState, ProvisionRequest, ProvisionResolution,
-    Provisioner, SandboxApi, SandboxService, ServiceError, SocketPaths, Store, backend_selection,
+    BackendSelection, Daemon, DaemonConfig, DoctorState, ErrorDiagnostics, ProvisionRequest,
+    ProvisionResolution, Provisioner, SandboxApi, SandboxService, ServiceError, SocketPaths, Store,
+    backend_selection,
 };
 use std::{sync::Arc, time::Duration};
 
@@ -132,7 +133,12 @@ async fn run_daemon<B: RuntimeBackend + 'static>(
         doctor,
     ));
     let config = DaemonConfig::new(paths, idle_timeout);
-    let api = SandboxApi::new(service, config.activity());
+    let error_diagnostics = if std::env::var_os(gascand::TEST_ERROR_DIAGNOSTICS_ENV).is_some() {
+        ErrorDiagnostics::enabled_for_tests()
+    } else {
+        ErrorDiagnostics::disabled()
+    };
+    let api = SandboxApi::new_with_error_diagnostics(service, config.activity(), error_diagnostics);
     Daemon::serve(config, api).await?;
     Ok(())
 }

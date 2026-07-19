@@ -3,6 +3,7 @@
 
 #[cfg(debug_assertions)]
 pub const TEST_FAKE_BACKEND_ENV: &str = "GASCAN_TEST_FAKE_BACKEND";
+pub const TEST_ERROR_DIAGNOSTICS_ENV: &str = "GASCAN_TEST_ERROR_DIAGNOSTICS";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendSelection {
@@ -32,8 +33,8 @@ mod socket;
 mod store;
 
 pub use api::{
-    ActivityLease, ActivityTracker, ApiEventStream, Daemon, DaemonConfig, OperationLease,
-    SandboxApi,
+    ActivityLease, ActivityTracker, ApiEventStream, Daemon, DaemonConfig, ErrorDiagnostics,
+    OperationLease, SandboxApi,
 };
 pub use socket::{OwnedSocket, PeerUid, PeerUidMismatch, SocketPaths, validate_peer_uid};
 
