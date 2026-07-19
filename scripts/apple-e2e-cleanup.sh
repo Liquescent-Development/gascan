@@ -75,30 +75,27 @@ expected=$(printf '%s\n%s\n%s\n%s\n' "$id" "gascan-mise-$id" "gascan-cache-$id" 
 actual=$(jq -er '.resources[]' "$manifest")
 test "$actual" = "$expected" || { printf 'refusing out-of-scope cleanup manifest\n' >&2; exit 65; }
 
-owned_container=false
-if inspected=$(container inspect "$id" 2>/dev/null); then
-  labels=$(printf '%s' "$inspected" | jq -er 'if type == "array" then .[0].configuration.labels else .configuration.labels end')
-  if test "$(printf '%s' "$labels" | jq -er '."dev.gascan.managed-by"')" = gascan &&
-     test "$(printf '%s' "$labels" | jq -er '."dev.gascan.sandbox-id"')" = "$id"; then
-    owned_container=true
-  else
-    printf 'collision: refusing container %s with mismatched labels\n' "$id" >&2
-  fi
-fi
-if test "$owned_container" = true; then
+container_inventory=$(container list --all --format json) || { printf 'unable to inventory containers; retaining cleanup manifest\n' >&2; exit 1; }
+printf '%s' "$container_inventory" | jq -e 'type == "array" and all(.[]; type == "object" and ((.id | type) == "string"))' >/dev/null || { printf 'invalid container inventory; retaining cleanup manifest\n' >&2; exit 1; }
+volume_inventory=$(container volume list --format json) || { printf 'unable to inventory volumes; retaining cleanup manifest\n' >&2; exit 1; }
+printf '%s' "$volume_inventory" | jq -e 'type == "array" and all(.[]; type == "object" and ((.id | type) == "string"))' >/dev/null || { printf 'invalid volume inventory; retaining cleanup manifest\n' >&2; exit 1; }
+
+container_record=$(printf '%s' "$container_inventory" | jq -cr --arg id "$id" '[.[] | select(.id == $id)] | if length == 0 then null elif length == 1 then .[0] else error("duplicate container id") end') || { printf 'ambiguous container inventory; retaining cleanup manifest\n' >&2; exit 1; }
+if test "$container_record" != null; then
+  test "$(printf '%s' "$container_record" | jq -er '.configuration.labels."dev.gascan.managed-by"')" = gascan &&
+    test "$(printf '%s' "$container_record" | jq -er '.configuration.labels."dev.gascan.sandbox-id"')" = "$id" ||
+    { printf 'collision: refusing container %s with mismatched labels\n' "$id" >&2; exit 1; }
   container stop --time 5 "$id" >/dev/null 2>&1 || true
   container delete "$id"
 fi
 
 for name in "gascan-mise-$id" "gascan-cache-$id" "gascan-config-$id"; do
-  if inspected=$(container volume inspect "$name" 2>/dev/null); then
-    labels=$(printf '%s' "$inspected" | jq -er 'if type == "array" then .[0].configuration.labels else .configuration.labels end')
-    if test "$(printf '%s' "$labels" | jq -er '."dev.gascan.managed-by"')" = gascan &&
-       test "$(printf '%s' "$labels" | jq -er '."dev.gascan.sandbox-id"')" = "$id"; then
-      container volume delete "$name"
-    else
-      printf 'collision: refusing volume %s with mismatched labels\n' "$name" >&2
-    fi
+  volume_record=$(printf '%s' "$volume_inventory" | jq -cr --arg id "$name" '[.[] | select(.id == $id)] | if length == 0 then null elif length == 1 then .[0] else error("duplicate volume id") end') || { printf 'ambiguous volume inventory; retaining cleanup manifest\n' >&2; exit 1; }
+  if test "$volume_record" != null; then
+    test "$(printf '%s' "$volume_record" | jq -er '.configuration.labels."dev.gascan.managed-by"')" = gascan &&
+      test "$(printf '%s' "$volume_record" | jq -er '.configuration.labels."dev.gascan.sandbox-id"')" = "$id" ||
+      { printf 'collision: refusing volume %s with mismatched labels\n' "$name" >&2; exit 1; }
+    container volume delete "$name"
   fi
 done
 
@@ -161,14 +158,21 @@ if test -f "$instance"; then
   fi
 fi
 
-container inspect "$id" >/dev/null 2>&1 && residue=true || true
+container_inventory=$(container list --all --format json) || { printf 'unable to verify container cleanup; retaining cleanup manifest\n' >&2; exit 1; }
+printf '%s' "$container_inventory" | jq -e 'type == "array" and all(.[]; type == "object" and ((.id | type) == "string"))' >/dev/null || { printf 'invalid container cleanup inventory; retaining cleanup manifest\n' >&2; exit 1; }
+volume_inventory=$(container volume list --format json) || { printf 'unable to verify volume cleanup; retaining cleanup manifest\n' >&2; exit 1; }
+printf '%s' "$volume_inventory" | jq -e 'type == "array" and all(.[]; type == "object" and ((.id | type) == "string"))' >/dev/null || { printf 'invalid volume cleanup inventory; retaining cleanup manifest\n' >&2; exit 1; }
+printf '%s' "$container_inventory" | jq -e --arg id "$id" 'any(.[]; .id == $id)' >/dev/null && residue=true || true
 for name in "gascan-mise-$id" "gascan-cache-$id" "gascan-config-$id"; do
-  container volume inspect "$name" >/dev/null 2>&1 && residue=true || true
+  printf '%s' "$volume_inventory" | jq -e --arg id "$name" 'any(.[]; .id == $id)' >/dev/null && residue=true || true
 done
 if test "$residue" = true; then
   printf 'Gate 4 cleanup residue remains for exact sandbox %s\n' "$id" >&2
   exit 1
 fi
 rm -rf -- "$runtime_root" "$project_root"
-rmdir "$session_root" 2>/dev/null || true
+if { test -e "$session_root" || test -L "$session_root"; } && ! rmdir "$session_root" 2>/dev/null; then
+  printf 'Gate 4 cleanup session residue remains at %s\n' "$session_root" >&2
+  exit 1
+fi
 rm -f "$manifest"

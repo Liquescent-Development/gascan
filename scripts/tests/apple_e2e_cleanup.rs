@@ -13,8 +13,28 @@ fn fake_container(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
 set -eu
 printf '%s\n' "$*" >>"$CALLS"
 case "$*" in
-  inspect*|"volume inspect"*)
-    printf '[{"configuration":{"labels":{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":"%s"}}}]\n' "$LABEL_ID"
+  "list --all --format json")
+    if test -f "$CALLS.container-deleted"; then
+      printf '[]\n'
+    else
+      printf '[{"id":"%s","configuration":{"labels":{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":"%s"}}}]\n' "$ID" "$LABEL_ID"
+    fi
+    ;;
+  "volume list --format json")
+    records=
+    for name in "gascan-mise-$ID" "gascan-cache-$ID" "gascan-config-$ID"; do
+      if ! test -f "$CALLS.volume-deleted" || ! grep -Fxq "$name" "$CALLS.volume-deleted"; then
+        record=$(printf '{"id":"%s","configuration":{"labels":{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":"%s"}}}' "$name" "$LABEL_ID")
+        if test -n "$records"; then records="$records,$record"; else records=$record; fi
+      fi
+    done
+    printf '[%s]\n' "$records"
+    ;;
+  "delete $ID")
+    : >"$CALLS.container-deleted"
+    ;;
+  "volume delete "*)
+    printf '%s\n' "$3" >>"$CALLS.volume-deleted"
     ;;
 esac
 "#,
@@ -76,6 +96,25 @@ fn run(temp: &tempfile::TempDir, path: &PathBuf, calls: &PathBuf) -> std::proces
         .unwrap()
 }
 
+fn install_container_script(temp: &tempfile::TempDir, body: &str) -> PathBuf {
+    let container = temp.path().join("container");
+    fs::write(&container, body).unwrap();
+    fs::set_permissions(&container, fs::Permissions::from_mode(0o755)).unwrap();
+    container
+}
+
+fn install_absent_container(temp: &tempfile::TempDir) -> PathBuf {
+    install_container_script(
+        temp,
+        r#"#!/bin/sh
+case "$*" in
+  "list --all --format json"|"volume list --format json") printf '[]\n' ;;
+  *) exit 42 ;;
+esac
+"#,
+    )
+}
+
 #[test]
 fn absent_recorded_children_are_an_idempotent_success() {
     let temp = tempfile::tempdir().unwrap();
@@ -91,9 +130,7 @@ fn absent_recorded_children_are_an_idempotent_success() {
     );
     let session = temp.path().join("session-test");
     fs::remove_dir_all(&session).unwrap();
-    let container = temp.path().join("container");
-    fs::write(&container, "#!/bin/sh\nexit 1\n").unwrap();
-    fs::set_permissions(&container, fs::Permissions::from_mode(0o755)).unwrap();
+    install_absent_container(&temp);
     let calls = temp.path().join("calls");
 
     let output = run(&temp, &path, &calls);
@@ -105,6 +142,157 @@ fn absent_recorded_children_are_an_idempotent_success() {
     );
     assert!(!path.exists());
     assert!(!session.exists());
+}
+
+#[test]
+fn successful_json_inventories_prove_real_absence() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = "gate4-test-123456789abc";
+    let path = manifest(
+        &temp,
+        serde_json::json!([
+            id,
+            format!("gascan-mise-{id}"),
+            format!("gascan-cache-{id}"),
+            format!("gascan-config-{id}")
+        ]),
+    );
+    let session = temp.path().join("session-test");
+    fs::remove_dir_all(&session).unwrap();
+    install_container_script(
+        &temp,
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >>"$CALLS"
+case "$*" in
+  "list --all --format json"|"volume list --format json") printf '[]\n' ;;
+  *) exit 42 ;;
+esac
+"#,
+    );
+    let calls = temp.path().join("calls");
+
+    let output = run(&temp, &path, &calls);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!path.exists());
+    let calls = fs::read_to_string(calls).unwrap();
+    assert!(calls.contains("list --all --format json"));
+    assert!(calls.contains("volume list --format json"));
+}
+
+#[test]
+fn inventory_runtime_failure_retains_manifest_without_deletes() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = "gate4-test-123456789abc";
+    let path = manifest(
+        &temp,
+        serde_json::json!([
+            id,
+            format!("gascan-mise-{id}"),
+            format!("gascan-cache-{id}"),
+            format!("gascan-config-{id}")
+        ]),
+    );
+    install_container_script(
+        &temp,
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" >>\"$CALLS\"\nprintf 'runtime unavailable\\n' >&2\nexit 42\n",
+    );
+    let calls = temp.path().join("calls");
+
+    let output = run(&temp, &path, &calls);
+
+    assert!(!output.status.success());
+    assert!(path.exists());
+    let calls = fs::read_to_string(calls).unwrap();
+    assert!(!calls
+        .lines()
+        .any(|line| line.starts_with("delete ") || line.starts_with("volume delete ")));
+}
+
+#[test]
+fn verification_inventory_failure_retains_manifest() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = "gate4-test-123456789abc";
+    let path = manifest(
+        &temp,
+        serde_json::json!([
+            id,
+            format!("gascan-mise-{id}"),
+            format!("gascan-cache-{id}"),
+            format!("gascan-config-{id}")
+        ]),
+    );
+    install_container_script(
+        &temp,
+        r#"#!/bin/sh
+set -eu
+case "$*" in
+  "list --all --format json")
+    count=0
+    test ! -f "$COUNT" || count=$(cat "$COUNT")
+    count=$((count + 1))
+    printf '%s' "$count" >"$COUNT"
+    test "$count" -eq 1 || exit 42
+    printf '[]\n'
+    ;;
+  "volume list --format json") printf '[]\n' ;;
+  *) exit 42 ;;
+esac
+"#,
+    );
+    let calls = temp.path().join("calls");
+    let inherited = std::env::var("PATH").unwrap_or_default();
+    let output = Command::new(script())
+        .arg(&path)
+        .arg(fs::canonicalize(temp.path().join("trusted-gascan")).unwrap())
+        .arg(fs::canonicalize(temp.path()).unwrap())
+        .env("PATH", format!("{}:{inherited}", temp.path().display()))
+        .env("COUNT", temp.path().join("count"))
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(path.exists());
+    assert_eq!(fs::read_to_string(temp.path().join("count")).unwrap(), "2");
+    assert!(!calls.exists());
+}
+
+#[test]
+fn unexpected_session_entry_is_residue_and_retains_manifest() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = "gate4-test-123456789abc";
+    let path = manifest(
+        &temp,
+        serde_json::json!([
+            id,
+            format!("gascan-mise-{id}"),
+            format!("gascan-cache-{id}"),
+            format!("gascan-config-{id}")
+        ]),
+    );
+    let session = temp.path().join("session-test");
+    fs::write(session.join("unexpected"), "retain me").unwrap();
+    install_container_script(
+        &temp,
+        r#"#!/bin/sh
+case "$*" in
+  "list --all --format json"|"volume list --format json") printf '[]\n' ;;
+  *) exit 42 ;;
+esac
+"#,
+    );
+    let calls = temp.path().join("calls");
+
+    let output = run(&temp, &path, &calls);
+
+    assert!(!output.status.success());
+    assert!(path.exists());
+    assert!(session.join("unexpected").exists());
 }
 
 #[test]
@@ -215,9 +403,7 @@ esac
     let sleep = temp.path().join("sleep");
     fs::write(&sleep, "#!/bin/sh\nexit 0\n").unwrap();
     fs::set_permissions(&sleep, fs::Permissions::from_mode(0o755)).unwrap();
-    let container = temp.path().join("container");
-    fs::write(&container, "#!/bin/sh\nexit 1\n").unwrap();
-    fs::set_permissions(&container, fs::Permissions::from_mode(0o755)).unwrap();
+    install_absent_container(temp);
     let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     value["daemon_instance_path"] = serde_json::json!(fs::canonicalize(instance).unwrap());
     value["daemon_executable"] = serde_json::json!(daemon);
