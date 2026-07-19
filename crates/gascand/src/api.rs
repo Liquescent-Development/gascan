@@ -742,7 +742,9 @@ fn service_error_diagnostic(error: &ServiceError) -> String {
         ServiceError::Manifest(_) => "service_kind=manifest".to_owned(),
         ServiceError::Missing(_) => "service_kind=missing".to_owned(),
         ServiceError::Ownership(_) => "service_kind=ownership".to_owned(),
-        ServiceError::Provision(_) => "service_kind=provision".to_owned(),
+        ServiceError::Provision(_) | ServiceError::SetupChanged | ServiceError::SetupExit(_) => {
+            "service_kind=provision".to_owned()
+        }
         ServiceError::LockPoisoned => "service_kind=lock_poisoned".to_owned(),
         ServiceError::EventStreamUnavailable => "service_kind=event_stream_unavailable".to_owned(),
         ServiceError::DatabaseWorker(_) => "service_kind=database_worker".to_owned(),

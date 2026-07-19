@@ -10,7 +10,9 @@ use gascan_core::policy::{
     CONTAINER_PATH, MISE_CACHE_DIR, MISE_DATA_DIR, MISE_GLOBAL_CONFIG_FILE, MISE_SYSTEM_DATA_DIR,
     PolicyCompiler, PolicyError, WORKSPACE_HOME,
 };
-use gascan_core::provision::{AppliedState, ProvisionPlan, ProvisionStep, ProvisioningPlanner};
+use gascan_core::provision::{
+    AppliedState, ProvisionPlan, ProvisionStep, ProvisioningPlanner, SetupScript,
+};
 use gascan_core::runtime::{
     ContainerState, CreateFailure, CreateRequest, ExecInput, ExecOutput, ExecRequest,
     RemoveRequest, ResourceKind, ResourceOwnership, RuntimeBackend, RuntimeError,
@@ -255,6 +257,10 @@ pub enum ServiceError {
     Ownership(SandboxId),
     #[error("provisioning failed: {0}")]
     Provision(String),
+    #[error("mounted setup script changed before execution")]
+    SetupChanged,
+    #[error("setup script failed with exit code {0}")]
+    SetupExit(i32),
     #[error("keyed lock registry was poisoned")]
     LockPoisoned,
     #[error("bounded operation event stream could not accept its durable event")]
@@ -594,15 +600,21 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 .await?;
             let durable_match = if let Some(record) = prior.filter(|_| inspected.is_some()) {
                 resolution_matches(record, desired_fingerprint)
-                    && tool_state_matches(record, spec.manifest())?
+                    && tool_state_matches(record, spec.canonical_root(), spec.manifest())?
             } else {
                 false
             };
             let provisioned = if inspected.is_some() && !durable_match {
-                let applied = applied_tool_state(prior);
-                let plan = ProvisioningPlanner::plan(spec.manifest(), &applied)
+                let applied = applied_state(prior);
+                let plan = ProvisioningPlanner::plan_for_root(
+                    spec.canonical_root(),
+                    spec.manifest(),
+                    &applied,
+                )
                     .map_err(|_| ServiceError::Provision("could not plan provisioning".to_owned()))?;
-                let reason = if plan.tools_changed() {
+                let reason = if plan.setup_changed() {
+                    "setup_changed"
+                } else if plan.tools_changed() {
                     "tools_changed"
                 } else {
                     "desired_content_changed"
@@ -634,6 +646,12 @@ impl<B: RuntimeBackend> SandboxService<B> {
         .await;
         match result {
             Ok(provisioned) => Ok((ActualState::Running, provisioned)),
+            Err(error) if error.is_setup_failure() => {
+                if self.runtime.inspect(id).await?.is_some() {
+                    let _ = self.runtime.stop(id).await;
+                }
+                Err(error)
+            }
             Err(error) if created.is_some() => {
                 if let Some(outcome) = created {
                     if !outcome.created().is_empty() {
@@ -661,9 +679,10 @@ impl<B: RuntimeBackend> SandboxService<B> {
         operation_id: OperationId,
         sender: &mpsc::Sender<OperationEvent>,
     ) -> Result<ProvisionedResolution, ServiceError> {
-        let applied = applied_tool_state(prior);
-        let plan = ProvisioningPlanner::plan(spec.manifest(), &applied)
-            .map_err(|_| ServiceError::Provision("could not plan provisioning".to_owned()))?;
+        let applied = applied_state(prior);
+        let plan =
+            ProvisioningPlanner::plan_for_root(spec.canonical_root(), spec.manifest(), &applied)
+                .map_err(|_| ServiceError::Provision("could not plan provisioning".to_owned()))?;
         let resolved_tools = if plan.tools_changed() {
             Some(
                 self.install_tools(spec, &plan, operation_id, sender)
@@ -672,14 +691,27 @@ impl<B: RuntimeBackend> SandboxService<B> {
         } else {
             prior.and_then(stored_tool_resolution)
         };
-        if plan.steps().contains(&ProvisionStep::RunSetup) {
+        let resolved_setup = if plan.steps().contains(&ProvisionStep::RunSetup) {
             self.emit_provision_step(operation_id, ProvisionStep::RunSetup, sender)
                 .await?;
-        }
+            let setup = plan.setup_script().ok_or_else(|| {
+                ServiceError::Provision("setup execution was not planned".to_owned())
+            })?;
+            self.run_setup(spec.id(), setup).await?;
+            Some(json!({
+                "canonical_relative_path": setup.canonical_relative_path(),
+                "sha256": setup.sha256(),
+            }))
+        } else {
+            prior.and_then(stored_setup_resolution)
+        };
         let mut resolution = self
             .provisioner
             .provision(ProvisionRequest { spec, create })
             .await?;
+        if plan.setup_script().is_some() {
+            resolution.setup = resolved_setup;
+        }
         if let Some(tools) = resolved_tools {
             resolution.tools = Some(tools);
         }
@@ -692,6 +724,38 @@ impl<B: RuntimeBackend> SandboxService<B> {
             resolution,
             tool_hash: plan.desired_tool_hash().to_owned(),
         })
+    }
+
+    async fn run_setup(&self, id: &SandboxId, setup: &SetupScript) -> Result<(), ServiceError> {
+        let guest_path = format!("/workspace/{}", setup.canonical_relative_path());
+        let (digest_output, digest_code, digest_signal) = self
+            .exec_guest_raw(
+                id,
+                ["/usr/bin/sha256sum".to_owned(), guest_path.clone()],
+                Vec::new(),
+            )
+            .await?;
+        if digest_code != 0 || digest_signal != 0 {
+            return Err(ServiceError::SetupChanged);
+        }
+        let digest = std::str::from_utf8(&digest_output)
+            .ok()
+            .and_then(|output| output.split_ascii_whitespace().next())
+            .filter(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            .ok_or(ServiceError::SetupChanged)?;
+        if setup.sha256().strip_prefix("sha256:") != Some(digest) {
+            return Err(ServiceError::SetupChanged);
+        }
+        let (_, code, signal) = self
+            .exec_guest_raw(id, ["/bin/bash".to_owned(), guest_path], Vec::new())
+            .await?;
+        if code == 0 && signal == 0 {
+            Ok(())
+        } else {
+            Err(ServiceError::SetupExit(code))
+        }
     }
 
     async fn install_tools(
@@ -792,6 +856,26 @@ impl<B: RuntimeBackend> SandboxService<B> {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        let (stdout, code, signal) = self.exec_guest_raw(id, argv, stdin).await?;
+        if code == 0 && signal == 0 {
+            Ok(stdout)
+        } else {
+            Err(ServiceError::Provision(
+                "guest provisioning command failed".to_owned(),
+            ))
+        }
+    }
+
+    async fn exec_guest_raw<I, S>(
+        &self,
+        id: &SandboxId,
+        argv: I,
+        stdin: Vec<u8>,
+    ) -> Result<(Vec<u8>, i32, i32), ServiceError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
         let mut session = self
             .runtime
             .exec(ExecRequest {
@@ -828,12 +912,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
                         ));
                     }
                 }
-                ExecOutput::Exit { code: 0, signal: 0 } => return Ok(stdout),
-                ExecOutput::Exit { .. } => {
-                    return Err(ServiceError::Provision(
-                        "guest provisioning command failed".to_owned(),
-                    ));
-                }
+                ExecOutput::Exit { code, signal } => return Ok((stdout, code, signal)),
             }
         }
         Err(ServiceError::Provision(
@@ -1095,7 +1174,11 @@ impl<B: RuntimeBackend> SandboxService<B> {
             .await?
             .ok_or_else(|| ServiceError::Missing(id.clone()))?;
         let unchanged = resolution_matches(&record, &desired_fingerprint)
-            && tool_state_matches(&record, request.spec.manifest())?;
+            && tool_state_matches(
+                &record,
+                request.spec.canonical_root(),
+                request.spec.manifest(),
+            )?;
         let operation = self
             .database({
                 let record = record.clone();
@@ -1157,6 +1240,9 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let provisioned = match result {
             Ok(provisioned) => provisioned,
             Err(error) => {
+                if error.is_setup_failure() {
+                    let _ = self.runtime.stop(&id).await;
+                }
                 let actual = self.runtime_actual(&id, prior_actual).await;
                 let code = error.code();
                 let details = json!({"message":error.to_string()});
@@ -1476,7 +1562,7 @@ impl ServiceError {
             Self::Policy(error) => error.code(),
             Self::Missing(_) => "not_found",
             Self::Ownership(_) => "ownership_mismatch",
-            Self::Provision(_) => "provision_failed",
+            Self::Provision(_) | Self::SetupChanged | Self::SetupExit(_) => "provision_failed",
             Self::Store(_) => "store_error",
             Self::Sandbox(_) => "sandbox_error",
             Self::Manifest(_) => "manifest_error",
@@ -1487,14 +1573,25 @@ impl ServiceError {
             Self::IncompleteDestroy(_) => "incomplete_destroy",
         }
     }
+
+    const fn is_setup_failure(&self) -> bool {
+        matches!(self, Self::SetupChanged | Self::SetupExit(_))
+    }
 }
 
-fn applied_tool_state(record: Option<&SandboxRecord>) -> AppliedState {
-    record
+fn applied_state(record: Option<&SandboxRecord>) -> AppliedState {
+    let tool_hash = record
         .and_then(|record| record.tool_resolution.as_ref())
         .and_then(|resolution| resolution.details.get("tool_hash"))
         .and_then(Value::as_str)
-        .map_or_else(AppliedState::empty, AppliedState::with_tool_hash)
+        .map(ToOwned::to_owned);
+    let setup_sha256 = record
+        .and_then(|record| record.setup_resolution.as_ref())
+        .and_then(|resolution| resolution.details.get("resolution"))
+        .and_then(|resolution| resolution.get("sha256"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    AppliedState::with_hashes(tool_hash, setup_sha256)
 }
 
 fn provisioning_transport_error() -> ServiceError {
@@ -1530,11 +1627,20 @@ fn stored_tool_resolution(record: &SandboxRecord) -> Option<Value> {
         .cloned()
 }
 
+fn stored_setup_resolution(record: &SandboxRecord) -> Option<Value> {
+    record
+        .setup_resolution
+        .as_ref()
+        .and_then(|resolution| resolution.details.get("resolution"))
+        .cloned()
+}
+
 fn tool_state_matches(
     record: &SandboxRecord,
+    canonical_root: &camino::Utf8Path,
     manifest: &gascan_core::manifest::Manifest,
 ) -> Result<bool, ServiceError> {
-    ProvisioningPlanner::plan(manifest, &applied_tool_state(Some(record)))
+    ProvisioningPlanner::plan_for_root(canonical_root, manifest, &applied_state(Some(record)))
         .map(|plan| !plan.tools_changed())
         .map_err(|_| ServiceError::Provision("could not plan provisioning".to_owned()))
 }
@@ -1630,17 +1736,17 @@ fn ordered_hook_evidence(events: &[OperationEvent], record: &SandboxRecord) -> b
 
 async fn desired_fingerprint(spec: &SandboxSpec) -> Result<String, ServiceError> {
     let root = spec.canonical_root().to_owned();
-    let setup = spec.manifest().setup().map(ToOwned::to_owned);
-    let tools = spec.manifest().tools().clone();
+    let manifest = spec.manifest().clone();
     tokio::task::spawn_blocking(move || {
-        let setup_bytes = setup
-            .map(|path| std::fs::read(root.join(path)))
-            .transpose()
-            .map_err(|error| ServiceError::Fingerprint(error.to_string()))?;
+        let plan = ProvisioningPlanner::plan_for_root(&root, &manifest, &AppliedState::empty())
+            .map_err(|_| {
+                ServiceError::Fingerprint("workspace setup could not be read safely".to_owned())
+            })?;
         let mut hash = Sha256::new();
-        hash.update(serde_json::to_vec(&tools).map_err(StoreError::Json)?);
-        if let Some(bytes) = setup_bytes {
-            hash.update(bytes);
+        hash.update(plan.desired_tool_hash().as_bytes());
+        if let Some(setup) = plan.setup_script() {
+            hash.update(setup.canonical_relative_path().as_str().as_bytes());
+            hash.update(setup.sha256().as_bytes());
         }
         Ok(format!("sha256:{:x}", hash.finalize()))
     })
