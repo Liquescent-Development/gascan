@@ -1,6 +1,6 @@
 # Gas Can macOS MVP Handoff
 
-Last reconciled: 2026-07-18
+Last reconciled: 2026-07-19
 
 This is the canonical restart document for a fresh agent or session. Read it
 with `docs/superpowers/plans/2026-07-13-gascan-macos-roadmap.md` before changing
@@ -66,13 +66,14 @@ the polyglot toolchain.
 | Phase 0 / Gate 1 | Passed and integrated | `48a7a18` |
 | Phase 1 Apple feasibility / Gate 2 | Passed and integrated | `6bedef8`, `docs/feasibility/apple-container-report.md` |
 | Phase 1 core control plane / Gate 3 | Passed and integrated | `7c7d083`, integration record `917dac1` |
-| Phase 2 Apple backend implementation | Implemented, reviewed, and integrated for Gate 4 handoff | head `dbf4235`, merge `d06d619` |
+| Phase 2 Apple backend implementation | Implemented, reviewed, integrated, and accepted through Gate 4 | accepted integration head `a475f8c` |
 | Phase 2 workspace image | Connected ARM64 prebuilt image accepted and frozen into integrated policy | image head `f6ed3a5`, merge `229c33a`, `docs/evidence/connected-image-handoff.md` |
-| Gate 4 real lifecycle | Pending; integrated harness has no complete real lifecycle evidence | `docs/evidence/connected-image-handoff.md` |
-| Phase 3 security, packaging, release | Not started as an integrated phase | blocked by Gate 4 |
+| Gate 4 real lifecycle | Passed on the supported live Apple platform | accepted implementation head `a475f8c`; exact serial evidence below |
+| Phase 3 security, packaging, release | Not started as an integrated phase | Gate 4 prerequisite satisfied; Gate 5 work remains |
 | Gate 5 clean-host release | Pending | no evidence |
 
-Only Gates 1, 2, and 3 have passed. Gate 5 is the definition of MVP completion.
+Gates 1 through 4 have passed. Gate 5 remains pending and is the definition of
+MVP completion; the MVP is not complete.
 
 ## Branch and Worktree Inventory
 
@@ -83,7 +84,7 @@ The recorded locations and accepted heads are:
 | `.worktrees/macos-mvp` | `feature/macos-mvp` | `917dac1` | integration branch through Gate 3 |
 | `.worktrees/apple-backend` | `feature/apple-backend` | `dbf4235` | reviewed Plan 3 implementation and Gate 4 harness |
 | `.worktrees/provisioning` | `feature/provisioning` | `f6ed3a5` | accepted connected image, Gascamp, offline bundles, and image gates |
-| `.worktrees/gate4-integration` | `feature/gate4-integration` | accepted Task 7 head `306e0b6` | Gate 4 integration handoff from frozen base `917dac1` |
+| `.worktrees/gate4-integration` | `feature/gate4-integration` | accepted Gate 4 implementation head `a475f8c` | Gate 4 integration and accepted live lifecycle evidence from frozen base `917dac1` |
 
 The Task 7 feature merges were reviewed from their shared frozen base rather
 than accepted wholesale. The deliberately deferred offline path remains
@@ -107,7 +108,7 @@ separate from the connected MVP input and is not a Gate 4 prerequisite.
 - `109a7a3`: production backend selection and evidence-bearing doctor.
 - `dbf4235`: approved Gate 4 harness cleanup and teardown safety.
 
-The harness is approved; Gate 4 itself is not passed.
+This branch head is historical input to the accepted Gate 4 integration.
 
 ### Task 7 integration
 
@@ -132,8 +133,40 @@ The harness is approved; Gate 4 itself is not passed.
   returns its typed `unsupported_capability` error without delivering the
   unsupported signal to the guest.
 
-Task 7 is accepted at `306e0b6`. Its platform-neutral harness evidence does
-not pass Gate 4.
+Task 7 is accepted at `306e0b6`. Its platform-neutral harness evidence did not
+by itself pass Gate 4; the later serial live runs recorded below did.
+
+### Gate 4 acceptance
+
+Gate 4 passed on 2026-07-19 at accepted implementation head
+`a475f8c7e1e1c955ea28279c5f711ee2b8c8f2ac`. The exact required commands ran
+serially on the same live platform:
+
+1. `bash ./scripts/run-apple-e2e.sh apple_lifecycle` exited 0.
+   `cli_lifecycle_survives_daemon_and_host_state_changes ... ok`; 1 passed,
+   0 failed, 0 ignored, 26 filtered out; 6.77 seconds.
+2. Only after lifecycle passed,
+   `bash ./scripts/run-apple-e2e.sh apple_recovery` exited 0.
+   `cli_recovers_from_stale_daemon_metadata_and_runtime_truth ... ok`;
+   1 passed, 0 failed, 0 ignored, 26 filtered out; 6.53 seconds.
+
+Both runs reported macOS 26.5.1 on arm64, Apple `container` 1.1.0 release at
+commit `5973b9cc626a3e7a499bb316a958237ebe14e2ed`, and
+`container-apiserver` 1.1.0 at the same commit. After both passed, read-only
+inventory checks found no IDs or names containing `gate4` in
+`container list --all --format json` or `container volume list --format json`;
+`/private/tmp/gascan-gate4-501` was absent or empty. Unrelated pre-existing
+Apple resources were preserved.
+
+The accepted implementation includes these independently clean-reviewed
+corrections after the previously recorded Task 7 head:
+
+- `8cc59c3`: safe protocol-v2 per-exec terminal/locale environment overlay.
+- `a686344`: exact raw Apple guest PTY CRLF harness expectation.
+- `a475f8c`: bounded PTY resize readiness diagnostics.
+
+This is Gate 4 evidence only. It does not claim distribution,
+signing/notarization, clean-host installation, Gate 5, or MVP completion.
 
 ### Provisioning and offline branch
 
@@ -185,10 +218,11 @@ default 2 GiB builder SIGKILL, success with 4 CPUs and 4 GiB, the reused-builder
 `demux channel full` / invalid tar header failure, and Docker/OCI-import
 investigation. Offline bundle publication and builder-VM network isolation
 remain deferred and are not MVP blockers.
-Roadmap Gate 4 remains pending because the integrated Apple backend and Gate 4
-harness have no full real CLI lifecycle evidence. Roadmap Gate 5 also remains
-pending and remains the definition of MVP completion. This evidence does not
-claim Phase 3, either gate, or MVP completion.
+Roadmap Gate 4 passed with the exact serial live lifecycle and recovery
+evidence recorded above. Roadmap Gate 5 remains pending and remains the
+definition of MVP completion. This evidence does not claim Phase 3 completion,
+distribution, signing/notarization, clean-host installation, Gate 5, or MVP
+completion.
 
 ## Verified Environmental Facts
 
@@ -215,17 +249,11 @@ the caller-owned verified context directly because Apple BuildKit omits the
 root-owned snapshot payload; the helper remains only deferred/offline
 hardening.
 
-1. Run the exact Gate 4 real lifecycle serially from
-   `feature/gate4-integration` as recorded in
-   `docs/evidence/connected-image-handoff.md`: `up`, `shell`, `run`, `apply`,
-   `down`, restart, reconciliation, and `destroy`, including PTY, signals,
-   exact 47-row by 132-column terminal resize propagation, exact exits, and
-   residue checks.
-2. Continue investigating Apple builder reliability separately under issue #1;
+1. Continue investigating Apple builder reliability separately under issue #1;
    do not make end-user distribution rebuild the image.
-3. Complete Plan 4 security acceptance, packaging, installation, and clean-host
+2. Complete Plan 4 security acceptance, packaging, installation, and clean-host
    release work.
-4. Run and record Gate 5.
+3. Run and record Gate 5. Until it passes, the MVP is not complete.
 
 ## Fresh-Session Restart Procedure
 
@@ -248,10 +276,10 @@ Then read, in order:
 4. `docs/superpowers/plans/2026-07-15-connected-workspace-image.md`;
 5. the relevant task plan before modifying its branch.
 
-If the fresh session is asked to continue implementation, use the completed
-Task 7 handoff and run Gate 4 serially only when explicitly authorized. If the
-fresh session is asked only for status, report from this document and do not
-run live gates.
+If the fresh session is asked to continue implementation, start from accepted
+Gate 4 head `a475f8c` and proceed only with explicitly authorized Phase 3 or
+Gate 5 work. If the fresh session is asked only for status, report from this
+document and do not run live gates.
 
 Before claiming any gate, run the roadmap's program-level verification and the
 gate-specific live suite. Never infer Gate 4 from harness tests or Gate 5 from

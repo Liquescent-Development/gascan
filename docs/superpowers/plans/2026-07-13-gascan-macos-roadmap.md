@@ -98,17 +98,45 @@ Concurrency rule: Plan 3 owns Apple adapter and lifecycle wiring; Plan 4 owns im
 
 **Gate 4:** A supported Mac passes real `up`, `shell`, `run`, `apply`, `down`, restart, reconciliation, and `destroy`; exact exit codes, terminal resize, signals, and no orphaned owned resources are verified.
 
-### Phase 2 granular status — 2026-07-18
+### Phase 2 granular status — 2026-07-19
 
 | Workstream | Status | Accepted branch evidence | Remaining acceptance work |
 |---|---|---|---|
-| Plan 3 Apple request, inspection, lifecycle, attach, and doctor | implemented, independently reviewed, and integrated | Apple head `dbf4235`, merge `d06d619` on `feature/gate4-integration` | run the serial Gate 4 lifecycle |
-| Plan 3 Gate 4 harness | implemented, independently approved, and integrated | `dbf4235`, merge `d06d619` | run the complete lifecycle against the real workspace image |
-| Plan 4 image/user/mise/Gascamp contracts | connected image gate passed on Apple Container 26.5.1 using the exact public GHCR `linux/arm64` index; approved marker is frozen into policy | connected head `f6ed3a5`, merge `229c33a`; `docs/evidence/connected-workspace-image.md` and `images/workspace/approved-image.txt` are authoritative | consume the frozen image in the serial Gate 4 run |
+| Plan 3 Apple request, inspection, lifecycle, attach, and doctor | implemented, independently reviewed, integrated, and accepted through Gate 4 | accepted integration head `a475f8c` on `feature/gate4-integration` | none for Gate 4; Phase 3 remains |
+| Plan 3 Gate 4 harness | implemented, independently approved, integrated, and passed live | accepted integration head `a475f8c` | none for Gate 4 |
+| Plan 4 image/user/mise/Gascamp contracts | connected image gate passed on Apple Container 26.5.1 using the exact public GHCR `linux/arm64` index; approved marker is frozen into policy and was consumed by the accepted Gate 4 integration | connected head `f6ed3a5`, merge `229c33a`; `docs/evidence/connected-workspace-image.md` and `images/workspace/approved-image.txt` are authoritative | none for Gate 4; Phase 3 remains |
 | Offline bundle production and validation | implementation reviewed; publication and live evidence not completed | `809796e` through `9025c56` | deferred; `publication = "pending"` remains accurate |
 | Plan 4 provisioning/apply/setup behavior | Gascamp source selection exists; the rest requires fresh reconciliation before claiming task completion | provisioning history including `c99bbaf` | inventory Tasks 4–6 against the final image, implement gaps, and prove through fake and real backend suites |
-| Cross-plan integration | Task 7 completed and independently reviewed on `feature/gate4-integration` | accepted head `306e0b6`; frozen base `917dac1`; Apple merge `d06d619`; connected-image merge `229c33a`; `docs/evidence/connected-image-handoff.md` | run the exact Gate 4 lifecycle serially |
-| Gate 4 | pending | the bounded PTY harness includes the exact 47x132 terminal-resize assertion, cleanup and output regressions, supported real-TTY `SIGINT` propagation, and prompt `unsupported_capability` rejection of a real OS TTY `SIGTERM` without guest delivery, but has not run live | exact real CLI lifecycle, terminal-resize, signal, and residue evidence |
+| Cross-plan integration | Task 7 and its Gate 4 corrections completed and independently reviewed on `feature/gate4-integration` | accepted head `a475f8c`; frozen base `917dac1`; Apple merge `d06d619`; connected-image merge `229c33a`; `docs/evidence/connected-image-handoff.md` | none for Gate 4; Phase 3 remains |
+| Gate 4 | passed | accepted implementation head `a475f8c`; exact serial lifecycle and recovery evidence below | none; Gate 5 remains pending |
+
+Gate 4 passed on 2026-07-19 at accepted implementation head
+`a475f8c7e1e1c955ea28279c5f711ee2b8c8f2ac`. The exact required commands ran
+serially:
+
+1. `bash ./scripts/run-apple-e2e.sh apple_lifecycle` exited 0.
+   `cli_lifecycle_survives_daemon_and_host_state_changes ... ok`; 1 passed,
+   0 failed, 0 ignored, 26 filtered out; 6.77 seconds.
+2. Only after lifecycle passed,
+   `bash ./scripts/run-apple-e2e.sh apple_recovery` exited 0.
+   `cli_recovers_from_stale_daemon_metadata_and_runtime_truth ... ok`;
+   1 passed, 0 failed, 0 ignored, 26 filtered out; 6.53 seconds.
+
+Both runs reported macOS 26.5.1 on arm64, Apple `container` 1.1.0 release at
+commit `5973b9cc626a3e7a499bb316a958237ebe14e2ed`, and
+`container-apiserver` 1.1.0 at the same commit. After both passed, read-only
+inventory checks found no IDs or names containing `gate4` in
+`container list --all --format json` or `container volume list --format json`;
+`/private/tmp/gascan-gate4-501` was absent or empty. Unrelated pre-existing
+Apple resources were preserved.
+
+The accepted implementation also includes independently clean-reviewed
+corrections `8cc59c3` (safe protocol-v2 per-exec terminal/locale environment
+overlay), `a686344` (exact raw Apple guest PTY CRLF harness expectation), and
+`a475f8c` (bounded PTY resize readiness diagnostics).
+
+This passes Gate 4 only. It does not claim distribution, signing/notarization,
+clean-host installation, Gate 5, or MVP completion.
 
 ## Phase 3: Security, Packaging, and Release
 
@@ -150,16 +178,19 @@ When each gate passes, update this section in a dedicated commit with the commit
 | 1 — Probe seam freeze | workspace tests and reviewed probe contracts | `48a7a18` | passed |
 | 2 — Apple feasibility | `docs/feasibility/apple-container-report.md` | `6bedef8` | passed |
 | 3 — Fake E2E | `docs/evidence/gate-3-fake-e2e.md` | `7c7d083` | passed |
-| 4 — Real lifecycle | Apple integration test transcript | not-run | pending |
+| 4 — Real lifecycle | exact serial Apple lifecycle and recovery results recorded above | `a475f8c` | passed |
 | 5 — Release | clean-host and security reports | not-run | pending |
 
-## MVP Status Summary — 2026-07-18
+## MVP Status Summary — 2026-07-19
 
-- Completed and integrated: Phase 0 and Roadmap Gates 1–3.
-- Integrated for Gate 4 handoff: the reviewed Apple backend and safe Gate 4
-  harness at `dbf4235` via merge `d06d619`, plus the accepted connected-image
-  history at `f6ed3a5` via merge `229c33a`.
-- In progress: Phase 2 real lifecycle and provisioning acceptance. The
+- Completed and integrated: Phase 0 and Roadmap Gates 1–4. Gate 4 passed at
+  accepted implementation head `a475f8c` with the exact serial live lifecycle,
+  recovery, and residue evidence recorded above.
+- The accepted Gate 4 implementation includes the reviewed Apple backend and
+  harness at `dbf4235` via merge `d06d619`, the accepted connected-image
+  history at `f6ed3a5` via merge `229c33a`, and the independently clean-reviewed
+  corrections `8cc59c3`, `a686344`, and `a475f8c`.
+- Accepted image input: the
   exact public GHCR image passed the connected workspace image gate on Apple
   Container 26.5.1. Anonymous public registry access, all three image smokes,
   and current-run cleanup passed. The authoritative tracked records are
@@ -170,18 +201,9 @@ When each gate passes, update this section in a dedicated commit with the commit
   It does not invalidate the accepted prebuilt image.
 - Deferred and not MVP blockers: offline bundle publication and builder-VM
   network isolation.
-- Not passed: Gate 4. Task 7 froze the exact approved marker into policy and
-  completed its independently reviewed integration at `306e0b6`. Its bounded
-  PTY state machine asserts the exact 47-row by 132-column resize and has
-  cleanup and bounded output-drain regressions. Its reviewed signal path uses
-  a bounded PTY lifecycle and propagates supported `SIGINT` through a real
-  TTY. It sends a real OS `SIGTERM` to the TTY-attached CLI, promptly returns
-  the typed `unsupported_capability` error, and proves that the unsupported
-  signal does not reach the guest, as recorded in
-  `docs/evidence/connected-image-handoff.md`. These are platform-neutral
-  harness checks; the full real CLI lifecycle has not run. Next is the exact
-  live Gate 4 lifecycle run serially.
 - Not started as an integrated release phase: Phase 3 security, packaging, and
   clean-host release. End-user distribution must consume a prebuilt image;
   actual distribution packaging remains Gate 5 work.
-- Not passed: Gate 5. Gate 5 remains the definition of MVP completion.
+- Not passed: Gate 5. Gate 5 remains the definition of MVP completion, so the
+  MVP is not complete. No distribution, signing/notarization, or clean-host
+  installation evidence is claimed.
