@@ -13,7 +13,6 @@ use gascan_proto::v1::gas_can_server::{GasCan, GasCanServer};
 use gascan_proto::{
     API_MAJOR, API_MINOR, error_code, local_transport_security, validate_api_major,
 };
-use std::fmt::Write as _;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -705,48 +704,24 @@ fn runtime_error_diagnostic(error: &gascan_core::runtime::RuntimeError) -> Strin
 
     let mut detail = format!("service_kind=runtime runtime_code={}", error.code());
     match error {
-        RuntimeError::CommandIo { operation, message }
-        | RuntimeError::InvalidOutput { operation, message } => {
-            let _ = write!(
-                detail,
-                " runtime_operation={} detail={}",
-                sanitize_diagnostic(operation, 128),
-                sanitize_diagnostic(message, 1_024)
-            );
-        }
+        RuntimeError::CommandIo { operation, .. }
+        | RuntimeError::InvalidOutput { operation, .. }
+        | RuntimeError::HelperError { operation, .. } => detail.push_str(&format!(
+            " runtime_operation={}",
+            runtime_operation_label(operation)
+        )),
         RuntimeError::CommandFailed {
             operation,
             exit_code,
             ..
-        } => {
-            let _ = write!(
-                detail,
-                " runtime_operation={} exit_code={} stderr=omitted",
-                sanitize_diagnostic(operation, 128),
-                exit_code.map_or_else(|| "none".to_owned(), |code| code.to_string())
-            );
-        }
-        RuntimeError::HelperError {
-            operation, code, ..
-        } => {
-            let _ = write!(
-                detail,
-                " runtime_operation={} helper_code={} helper_message=omitted",
-                sanitize_diagnostic(operation, 128),
-                sanitize_diagnostic(code, 128)
-            );
-        }
-        RuntimeError::UnsupportedVersion { found, .. } => {
-            let _ = write!(detail, " found={found:?}");
-        }
-        RuntimeError::UnsupportedCapability { capability } => {
-            let _ = write!(
-                detail,
-                " capability={}",
-                sanitize_diagnostic(capability, 256)
-            );
-        }
-        RuntimeError::OwnershipMismatch { .. }
+        } => detail.push_str(&format!(
+            " runtime_operation={} exit_code={}",
+            runtime_operation_label(operation),
+            exit_code.map_or_else(|| "none".to_owned(), |code| code.to_string())
+        )),
+        RuntimeError::UnsupportedVersion { .. }
+        | RuntimeError::UnsupportedCapability { .. }
+        | RuntimeError::OwnershipMismatch { .. }
         | RuntimeError::ForeignResourceRefused { .. }
         | RuntimeError::InvalidResourceIdentity { .. }
         | RuntimeError::Conflict { .. }
@@ -757,6 +732,24 @@ fn runtime_error_diagnostic(error: &gascan_core::runtime::RuntimeError) -> Strin
         _ => {}
     }
     detail
+}
+
+fn runtime_operation_label(operation: &str) -> &'static str {
+    match operation {
+        "container" => "container",
+        "container inspect" => "container_inspect",
+        "container list" => "container_list",
+        "container volume list" => "container_volume_list",
+        "container system status" => "container_system_status",
+        "version" => "container_version",
+        "gascan-apple-attach" | "GASCAN_APPLE_ATTACH_HELPER" => "apple_attach_helper",
+        "inventory proof cache" => "inventory_proof_cache",
+        "attach_bridge" => "attach_bridge",
+        "exec_input" => "exec_input",
+        "fake_runtime_load" => "fake_runtime_load",
+        "fake_runtime_save" => "fake_runtime_save",
+        _ => "unrecognized",
+    }
 }
 
 fn sanitize_diagnostic(value: &str, maximum: usize) -> String {
@@ -2196,9 +2189,57 @@ mod tests {
             .unwrap_or_default();
         assert!(line.contains("operation=run.validate_exec"));
         assert!(line.contains("runtime_code=command_failed"));
-        assert!(line.contains("runtime_operation=container inspect"));
+        assert!(line.contains("runtime_operation=container_inspect"));
         assert!(line.contains("exit_code=1"));
         assert!(!line.contains(secret));
         assert!(line.len() <= 2_048);
+    }
+
+    #[test]
+    fn internal_error_diagnostics_never_include_backend_content()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let secret = "opaque-runtime-secret-7391";
+        let backend_content =
+            format!("invalid JSON: {{\"credential\":\"{secret}\"}}\nraw backend output\u{1b}[31m");
+        let error = ServiceError::Runtime(gascan_core::runtime::RuntimeError::InvalidOutput {
+            operation: "container inspect".to_owned(),
+            message: backend_content.clone(),
+        });
+
+        let line = ErrorDiagnostics::enabled_for_tests()
+            .line("run.validate_exec", &error)
+            .ok_or("enabled diagnostics did not produce a line")?;
+        assert!(line.contains("runtime_code=invalid_output"));
+        assert!(line.contains("runtime_operation=container_inspect"));
+        assert!(!line.contains(secret));
+        assert!(!line.contains("credential"));
+        assert!(!line.contains("raw backend output"));
+        assert!(!line.contains('\u{1b}'));
+
+        let arbitrary_operation = format!("container --token={secret}");
+        let arbitrary = ServiceError::Runtime(gascan_core::runtime::RuntimeError::CommandIo {
+            operation: arbitrary_operation,
+            message: backend_content,
+        });
+        let line = ErrorDiagnostics::enabled_for_tests()
+            .line("run.validate_exec", &arbitrary)
+            .ok_or("enabled diagnostics did not produce a line")?;
+        assert!(line.contains("runtime_code=command_io"));
+        assert!(line.contains("runtime_operation=unrecognized"));
+        assert!(!line.contains(secret));
+
+        let helper = ServiceError::Runtime(gascan_core::runtime::RuntimeError::HelperError {
+            operation: "gascan-apple-attach".to_owned(),
+            code: format!("backend-{secret}"),
+            message: format!("helper raw output {secret}"),
+        });
+        let line = ErrorDiagnostics::enabled_for_tests()
+            .line("run.validate_exec", &helper)
+            .ok_or("enabled diagnostics did not produce a line")?;
+        assert!(line.contains("runtime_code=helper_error"));
+        assert!(line.contains("runtime_operation=apple_attach_helper"));
+        assert!(!line.contains(secret));
+        assert!(!line.contains("helper raw output"));
+        Ok(())
     }
 }
