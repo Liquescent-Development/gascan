@@ -31,6 +31,20 @@ pub struct PtySignalOutput {
 
 pub type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+pub fn assert_exit_code(output: &Output, expected: i32) -> TestResult {
+    if output.status.code() == Some(expected) {
+        Ok(())
+    } else {
+        Err(format!(
+            "expected {expected} exit code, got {:?}: stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into())
+    }
+}
+
 pub struct AppleE2e {
     gascan: OsString,
     gascand: OsString,
@@ -39,6 +53,7 @@ pub struct AppleE2e {
     root_path: std::path::PathBuf,
     runtime_root: std::path::PathBuf,
     id: SandboxId,
+    manifest_name: String,
     owner_token: String,
 }
 
@@ -67,10 +82,25 @@ impl AppleE2e {
         let runtime = tempfile::Builder::new()
             .prefix("gascan-gate4-runtime-")
             .tempdir_in(&session_root)?;
+        for path in [root.path(), runtime.path()] {
+            std::fs::set_permissions(
+                path,
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+            )?;
+        }
         let root_path = root.path().canonicalize()?;
         let runtime_root = runtime.path().canonicalize()?;
         let utf8_root = camino::Utf8Path::from_path(&root_path).ok_or("non-UTF-8 test root")?;
-        let id = SandboxId::from_root(name, utf8_root);
+        std::fs::write(
+            root_path.join("gascan.toml"),
+            format!("version = 1\nname = {}\n", serde_json::to_string(name)?),
+        )?;
+        let loaded_manifest = gascan_core::manifest::Manifest::load(utf8_root)?;
+        let manifest_name = loaded_manifest
+            .name()
+            .ok_or("Gate 4 manifest must have an explicit name")?
+            .to_owned();
+        let id = SandboxId::from_root(&manifest_name, utf8_root);
         let owner_token = format!(
             "gate4-{}-{}",
             std::process::id(),
@@ -113,6 +143,7 @@ impl AppleE2e {
             root_path,
             runtime_root,
             id,
+            manifest_name,
             owner_token,
         })
     }
@@ -133,7 +164,10 @@ impl AppleE2e {
         std::fs::create_dir(self.root_path.join(".gascan"))?;
         std::fs::write(
             self.root_path.join("gascan.toml"),
-            "version = 1\nsetup = './.gascan/setup.sh'\n",
+            format!(
+                "version = 1\nname = {}\nsetup = './.gascan/setup.sh'\n",
+                serde_json::to_string(&self.manifest_name)?
+            ),
         )?;
         std::fs::write(
             self.root_path.join(".gascan/setup.sh"),
@@ -264,9 +298,7 @@ impl AppleE2e {
     }
 
     fn validated_daemon_pid(&self) -> TestResult<DaemonInstanceRecord> {
-        let record: DaemonInstanceRecord = serde_json::from_slice(&std::fs::read(
-            self.runtime_root.join("daemon-instance.json"),
-        )?)?;
+        let record = self.daemon_instance_record()?;
         let attestation = self.daemon_attestation()?;
         let expected_executable = std::path::PathBuf::from(&self.gascand).canonicalize()?;
         let observed_start = process_field(record.pid, "lstart=")?;
@@ -287,6 +319,12 @@ impl AppleE2e {
             return Err("daemon instance ownership validation refused signal".into());
         }
         Ok(record)
+    }
+
+    fn daemon_instance_record(&self) -> TestResult<DaemonInstanceRecord> {
+        Ok(serde_json::from_slice(&std::fs::read(
+            self.runtime_root.join("daemon-instance.json"),
+        )?)?)
     }
 
     pub fn run_pty(&self, argv: &[&str]) -> TestResult<Output> {
@@ -426,11 +464,19 @@ impl Drop for AppleE2e {
 
 impl AppleE2e {
     fn terminate_daemon(&self) -> TestResult {
-        let record = match self.validated_daemon_pid() {
-            Ok(record) => record,
-            Err(_) if !self.runtime_root.join("daemon-instance.json").exists() => return Ok(()),
-            Err(error) => return Err(error),
-        };
+        let instance_path = self.runtime_root.join("daemon-instance.json");
+        if !instance_path.exists() {
+            return Ok(());
+        }
+        let recorded = self.daemon_instance_record()?;
+        let recorded_pid = rustix::process::Pid::from_raw(i32::try_from(recorded.pid)?)
+            .ok_or("invalid daemon pid")?;
+        match rustix::process::test_kill_process(recorded_pid) {
+            Ok(()) => {}
+            Err(rustix::io::Errno::SRCH) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        let record = self.validated_daemon_pid()?;
         let pid = rustix::process::Pid::from_raw(i32::try_from(record.pid)?)
             .ok_or("invalid daemon pid")?;
         rustix::process::kill_process(pid, rustix::process::Signal::TERM)?;
@@ -1027,6 +1073,133 @@ mod tests {
         std::fs::write(env.runtime_root.join("daemon-instance.json"), b"not-json")?;
         assert!(env.validated_daemon_pid().is_err());
         std::fs::remove_file(env.runtime_root.join("daemon-instance.json"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_and_recovery_resources_match_production_up_identity() -> TestResult {
+        for name in ["gate4-lifecycle", "gate4-recovery"] {
+            let session = tempfile::tempdir()?;
+            let cleanup_manifest = session.path().join(format!("{name}.json"));
+            let env = AppleE2e::new_scoped(
+                name,
+                session.path().to_owned(),
+                Some(cleanup_manifest.clone()),
+            )?;
+            let root = camino::Utf8Path::from_path(&env.root_path).ok_or("non-UTF-8 root")?;
+            let manifest = gascan_core::manifest::Manifest::load(root)?;
+            let production_name = manifest
+                .name()
+                .map(ToOwned::to_owned)
+                .or_else(|| root.file_name().map(ToOwned::to_owned))
+                .ok_or("production sandbox name is unavailable")?;
+            let spec =
+                gascan_core::sandbox::SandboxSpec::from_root(&production_name, root, manifest)?;
+            let cleanup: Value = serde_json::from_slice(&std::fs::read(cleanup_manifest)?)?;
+
+            assert_eq!(env.id(), spec.id().as_str());
+            assert_eq!(cleanup["sandbox_id"], spec.id().as_str());
+            assert_eq!(cleanup["resources"][0], spec.id().as_str());
+            assert_eq!(
+                cleanup["resources"][1],
+                format!("gascan-mise-{}", spec.id())
+            );
+            assert_eq!(
+                cleanup["resources"][2],
+                format!("gascan-cache-{}", spec.id())
+            );
+            assert_eq!(
+                cleanup["resources"][3],
+                format!("gascan-config-{}", spec.id())
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gate4_project_and_runtime_roots_are_owner_only() -> TestResult {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let session = tempfile::tempdir()?;
+        let env = AppleE2e::new_scoped("secure-roots", session.path().to_owned(), None)?;
+
+        assert_eq!(
+            std::fs::metadata(&env.root_path)?.permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&env.runtime_root)?.permissions().mode() & 0o777,
+            0o700
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_accepts_an_already_exited_recorded_daemon() -> TestResult {
+        let session = tempfile::tempdir()?;
+        let env = AppleE2e::new_scoped("exited-daemon", session.path().to_owned(), None)?;
+        let executable = std::path::PathBuf::from(&env.gascand).canonicalize()?;
+        let record = serde_json::json!({
+            "pid": 2_147_483_647_u32,
+            "owner_token": env.owner_token,
+            "executable": executable,
+            "start_identity": "already-exited",
+            "instance_token": "already-exited",
+        });
+        std::fs::write(
+            env.runtime_root.join("daemon-instance.json"),
+            serde_json::to_vec(&record)?,
+        )?;
+
+        env.terminate_daemon()?;
+        std::fs::remove_file(env.runtime_root.join("daemon-instance.json"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_refuses_a_reused_live_pid_without_signaling_it() -> TestResult {
+        let session = tempfile::tempdir()?;
+        let env = AppleE2e::new_scoped("reused-live-daemon", session.path().to_owned(), None)?;
+        let child = Command::new("sleep").arg("30").spawn()?;
+        let mut fixture = OwnedChildFixture::new(child.id())?;
+        drop(child);
+        let executable = std::path::PathBuf::from(&env.gascand).canonicalize()?;
+        let record = serde_json::json!({
+            "pid": fixture.pid.as_raw_nonzero().get(),
+            "owner_token": env.owner_token,
+            "executable": executable,
+            "start_identity": "not-the-live-process-start",
+            "instance_token": "not-the-live-process-instance",
+        });
+        std::fs::write(
+            env.runtime_root.join("daemon-instance.json"),
+            serde_json::to_vec(&record)?,
+        )?;
+
+        assert!(env.terminate_daemon().is_err());
+        fixture.assert_owned_and_running()?;
+        fixture.kill_and_reap()?;
+        std::fs::remove_file(env.runtime_root.join("daemon-instance.json"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn exact_exit_failure_includes_stdout_and_stderr() -> TestResult {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let output = Output {
+            status: ExitStatus::from_raw(70 << 8),
+            stdout: b"sandbox-not-found".to_vec(),
+            stderr: b"lookup failed".to_vec(),
+        };
+        let error = match assert_exit_code(&output, 42) {
+            Ok(()) => return Err("wrong exit code was accepted".into()),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("expected 42"));
+        assert!(message.contains("sandbox-not-found"));
+        assert!(message.contains("lookup failed"));
         Ok(())
     }
 

@@ -3,7 +3,7 @@
 
 mod apple_common;
 
-use apple_common::{AppleE2e, TestResult};
+use apple_common::{AppleE2e, TestResult, assert_exit_code};
 
 #[test]
 #[ignore = "requires supported Apple runtime and the locked workspace image"]
@@ -14,7 +14,7 @@ fn cli_lifecycle_survives_daemon_and_host_state_changes() -> TestResult {
     env.success(["up", env.root().to_str().ok_or("non-UTF-8 root")?])?;
 
     let exit = env.invoke(["--sandbox", env.id(), "run", "--", "sh", "-c", "exit 42"])?;
-    assert_eq!(exit.status.code(), Some(42));
+    assert_exit_code(&exit, 42)?;
 
     let shell = env.success(["--sandbox", env.id(), "shell", "--", "sh", "-c", "id -u"])?;
     assert_eq!(shell.stdout, b"1000\n");
