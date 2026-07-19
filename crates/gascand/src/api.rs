@@ -557,6 +557,14 @@ fn wire_event(event: StoredEvent) -> v1::OperationEvent {
             .to_owned(),
         details: payload.clone(),
     });
+    let provision_step = match details.get("step").and_then(serde_json::Value::as_str) {
+        Some("write_safe_mise_config") => v1::ProvisionStep::WriteSafeMiseConfig,
+        Some("install_tools") => v1::ProvisionStep::InstallTools,
+        Some("run_setup") => v1::ProvisionStep::RunSetup,
+        Some("verify_gascamp") => v1::ProvisionStep::VerifyGascamp,
+        Some("health_check") => v1::ProvisionStep::HealthCheck,
+        _ => v1::ProvisionStep::Unspecified,
+    } as i32;
     v1::OperationEvent {
         operation_id: Some(v1::OperationId {
             value: event.operation_id.get() as u64,
@@ -569,6 +577,7 @@ fn wire_event(event: StoredEvent) -> v1::OperationEvent {
         status,
         content_type: "application/json".to_owned(),
         session_token: Vec::new(),
+        provision_step,
     }
 }
 
@@ -914,6 +923,7 @@ fn session_event(token: Vec<u8>) -> v1::OperationEvent {
         status: v1::OperationStatus::Completed as i32,
         content_type: String::new(),
         session_token: token,
+        provision_step: v1::ProvisionStep::Unspecified as i32,
     }
 }
 
@@ -1528,6 +1538,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             status: v1::OperationStatus::Completed as i32,
             content_type: "application/octet-stream".to_owned(),
             session_token: Vec::new(),
+            provision_step: v1::ProvisionStep::Unspecified as i32,
         };
         if !request.follow {
             return Ok(tonic::Response::new(event_stream(event)));
@@ -1547,7 +1558,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
                 tokio::select! {
                     () = activity.inner.shutdown.notified() => {
                         sequence = sequence.saturating_add(1);
-                        let terminal = v1::OperationEvent { operation_id: None, timestamp: None, phase: "logs".to_owned(), payload: Vec::new(), error: None, sequence, status: v1::OperationStatus::Completed as i32, content_type: String::new(), session_token: Vec::new() };
+                        let terminal = v1::OperationEvent { operation_id: None, timestamp: None, phase: "logs".to_owned(), payload: Vec::new(), error: None, sequence, status: v1::OperationStatus::Completed as i32, content_type: String::new(), session_token: Vec::new(), provision_step: v1::ProvisionStep::Unspecified as i32 };
                         let _ = sender.send(Ok(terminal)).await;
                         break;
                     },
@@ -1555,14 +1566,14 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
                     () = tokio::time::sleep(Duration::from_millis(50)) => {
                         let current = match service.logs(&id, since_millis).await { Ok(bytes) => bytes, Err(error) => {
                             sequence = sequence.saturating_add(1);
-                            let failed = v1::OperationEvent { operation_id: None, timestamp: None, phase: "logs".to_owned(), payload: Vec::new(), error: Some(v1::Error { code: error.code().to_owned(), message: error.to_string(), details: Vec::new() }), sequence, status: v1::OperationStatus::Failed as i32, content_type: String::new(), session_token: Vec::new() };
+                            let failed = v1::OperationEvent { operation_id: None, timestamp: None, phase: "logs".to_owned(), payload: Vec::new(), error: Some(v1::Error { code: error.code().to_owned(), message: error.to_string(), details: Vec::new() }), sequence, status: v1::OperationStatus::Failed as i32, content_type: String::new(), session_token: Vec::new(), provision_step: v1::ProvisionStep::Unspecified as i32 };
                             let _ = sender.send(Ok(failed)).await;
                             break;
                         } };
                         if let Some(appended) = current.strip_prefix(previous.as_slice()) {
                             if !appended.is_empty() {
                                 sequence = sequence.saturating_add(1);
-                                let event = v1::OperationEvent { operation_id: None, timestamp: None, phase: "logs".to_owned(), payload: appended.to_vec(), error: None, sequence, status: v1::OperationStatus::Pending as i32, content_type: "application/octet-stream".to_owned(), session_token: Vec::new() };
+                                let event = v1::OperationEvent { operation_id: None, timestamp: None, phase: "logs".to_owned(), payload: appended.to_vec(), error: None, sequence, status: v1::OperationStatus::Pending as i32, content_type: "application/octet-stream".to_owned(), session_token: Vec::new(), provision_step: v1::ProvisionStep::Unspecified as i32 };
                                 if sender.send(Ok(event)).await.is_err() { break; }
                             }
                         }
@@ -2363,7 +2374,7 @@ mod tests {
             sequence: 2,
             operation_id,
             status: OperationStatus::Failed,
-            details: Some(json!({"message":"broken"})),
+            details: Some(json!({"message":"broken","step":"install_tools"})),
             error_code: Some("backend_unavailable".to_owned()),
             timestamp_millis: 1_725_000_000_123,
         });
@@ -2371,6 +2382,7 @@ mod tests {
             event.error.map(|error| error.code),
             Some("backend_unavailable".to_owned())
         );
+        assert_eq!(event.provision_step, v1::ProvisionStep::InstallTools as i32);
         assert_eq!(
             event
                 .timestamp

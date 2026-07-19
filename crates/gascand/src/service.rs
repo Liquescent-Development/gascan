@@ -7,17 +7,23 @@ use async_trait::async_trait;
 use gascan_core::doctor::{DoctorFacts, DoctorReport};
 use gascan_core::manifest::ManifestError;
 use gascan_core::policy::{PolicyCompiler, PolicyError};
+use gascan_core::provision::{AppliedState, ProvisionPlan, ProvisionStep, ProvisioningPlanner};
 use gascan_core::runtime::{
-    ContainerState, CreateFailure, CreateRequest, RemoveRequest, ResourceKind, ResourceOwnership,
-    RuntimeBackend, RuntimeError,
+    ContainerState, CreateFailure, CreateRequest, ExecInput, ExecOutput, ExecRequest,
+    RemoveRequest, ResourceKind, ResourceOwnership, RuntimeBackend, RuntimeError,
 };
 use gascan_core::sandbox::{SandboxError, SandboxId, SandboxSpec};
+use serde::de::{Error as _, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
+
+const SAFE_MISE_CONFIG: &str = "/home/workspace/.config/gascan/mise.toml";
+const MAX_PROVISION_OUTPUT_BYTES: usize = 1024 * 1024;
 
 pub struct UpRequest {
     spec: SandboxSpec,
@@ -38,6 +44,54 @@ pub struct ProvisionRequest<'a> {
 pub struct ProvisionResolution {
     pub setup: Option<Value>,
     pub tools: Option<Value>,
+}
+
+struct ProvisionedResolution {
+    resolution: ProvisionResolution,
+    tool_hash: String,
+}
+
+#[derive(Deserialize)]
+struct MiseToolRecord {
+    version: String,
+    installed: bool,
+    active: bool,
+}
+
+struct MiseInventory(BTreeMap<String, Vec<MiseToolRecord>>);
+
+impl<'de> Deserialize<'de> for MiseInventory {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct InventoryVisitor;
+
+        impl<'de> Visitor<'de> for InventoryVisitor {
+            type Value = MiseInventory;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a mise tool inventory object with unique tool keys")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut records = BTreeMap::new();
+                while let Some((tool, versions)) =
+                    map.next_entry::<String, Vec<MiseToolRecord>>()?
+                {
+                    if records.insert(tool, versions).is_some() {
+                        return Err(A::Error::custom("duplicate mise tool key"));
+                    }
+                }
+                Ok(MiseInventory(records))
+            }
+        }
+
+        deserializer.deserialize_map(InventoryVisitor)
+    }
 }
 
 #[async_trait]
@@ -397,9 +451,6 @@ impl<B: RuntimeBackend> SandboxService<B> {
             })
             .await?;
         let prior = existing.clone();
-        let reuse_resolution = prior
-            .as_ref()
-            .is_some_and(|record| resolution_matches(record, &desired_fingerprint));
         let mut record = existing.unwrap_or_else(|| SandboxRecord {
             id: id.clone(),
             canonical_root: request.spec.canonical_root().to_owned(),
@@ -448,15 +499,16 @@ impl<B: RuntimeBackend> SandboxService<B> {
             )
             .await;
         match result {
-            Ok((actual, resolution)) => {
-                if !reuse_resolution {
+            Ok((actual, provisioned)) => {
+                if let Some(provisioned) = provisioned {
+                    let resolution = provisioned.resolution;
                     record.setup_resolution = Some(SetupResolution::new(
                         1,
                         json!({"desired_fingerprint":desired_fingerprint,"resolution":resolution.setup}),
                     ));
                     record.tool_resolution = Some(ToolResolution::new(
                         1,
-                        json!({"desired_fingerprint":desired_fingerprint,"resolution":resolution.tools}),
+                        json!({"desired_fingerprint":desired_fingerprint,"tool_hash":provisioned.tool_hash,"resolution":resolution.tools}),
                     ));
                 }
                 record.actual_state = actual;
@@ -503,7 +555,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
         operation_id: OperationId,
         sender: &mpsc::Sender<OperationEvent>,
         desired_fingerprint: &str,
-    ) -> Result<(ActualState, ProvisionResolution), ServiceError> {
+    ) -> Result<(ActualState, Option<ProvisionedResolution>), ServiceError> {
         let id = spec.id();
         let inspected = self.runtime.inspect(id).await?;
         let mut created = None;
@@ -537,27 +589,41 @@ impl<B: RuntimeBackend> SandboxService<B> {
             }
             self.emit(operation_id, json!({"phase":"started"}), sender)
                 .await?;
-            let durable_match = inspected.is_some()
-                && prior.is_some_and(|record| resolution_matches(record, desired_fingerprint));
-            let resolution = if !durable_match {
-                self.emit(operation_id, json!({"phase":"before_provision","desired_fingerprint":desired_fingerprint}), sender).await?;
-                self.provisioner
-                    .provision(ProvisionRequest { spec, create })
-                    .await?
+            let durable_match = if let Some(record) = prior.filter(|_| inspected.is_some()) {
+                resolution_matches(record, desired_fingerprint)
+                    && tool_state_matches(record, spec.manifest())?
             } else {
-                ProvisionResolution::default()
+                false
             };
-            if !durable_match {
-                self.emit(operation_id, json!({"phase":"after_provision","resolution_version":1,"desired_fingerprint":desired_fingerprint,"setup":resolution.setup,"tools":resolution.tools}), sender).await?;
-            }
-            self.emit(operation_id, json!({"phase":"before_health"}), sender).await?;
+            let provisioned = if inspected.is_some() && !durable_match {
+                let applied = applied_tool_state(prior);
+                let plan = ProvisioningPlanner::plan(spec.manifest(), &applied)
+                    .map_err(|_| ServiceError::Provision("could not plan provisioning".to_owned()))?;
+                let reason = if plan.tools_changed() {
+                    "tools_changed"
+                } else {
+                    "desired_content_changed"
+                };
+                self.emit(operation_id, json!({"phase":"apply_required","reason":reason,"desired_fingerprint":desired_fingerprint}), sender).await?;
+                None
+            } else if !durable_match {
+                self.emit(operation_id, json!({"phase":"before_provision","desired_fingerprint":desired_fingerprint}), sender).await?;
+                let provisioned = self
+                    .provision_explicit(spec, create, prior, operation_id, sender)
+                    .await?;
+                self.emit(operation_id, json!({"phase":"after_provision","resolution_version":1,"desired_fingerprint":desired_fingerprint,"setup":provisioned.resolution.setup,"tools":provisioned.resolution.tools,"tool_hash":provisioned.tool_hash}), sender).await?;
+                Some(provisioned)
+            } else {
+                None
+            };
+            self.emit(operation_id, json!({"phase":"before_health","step":ProvisionStep::HealthCheck.as_str()}), sender).await?;
             self.provisioner.health_check(id).await?;
             self.emit(operation_id, json!({"phase":"after_health","desired_fingerprint":desired_fingerprint}), sender).await?;
-            Ok::<_, ServiceError>(resolution)
+            Ok::<_, ServiceError>(provisioned)
         }
         .await;
         match result {
-            Ok(resolution) => Ok((ActualState::Running, resolution)),
+            Ok(provisioned) => Ok((ActualState::Running, provisioned)),
             Err(error) if created.is_some() => {
                 if let Some(outcome) = created {
                     if !outcome.created().is_empty() {
@@ -575,6 +641,193 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 Err(error)
             }
         }
+    }
+
+    async fn provision_explicit(
+        &self,
+        spec: &SandboxSpec,
+        create: &CreateRequest,
+        prior: Option<&SandboxRecord>,
+        operation_id: OperationId,
+        sender: &mpsc::Sender<OperationEvent>,
+    ) -> Result<ProvisionedResolution, ServiceError> {
+        let applied = applied_tool_state(prior);
+        let plan = ProvisioningPlanner::plan(spec.manifest(), &applied)
+            .map_err(|_| ServiceError::Provision("could not plan provisioning".to_owned()))?;
+        let resolved_tools = if plan.tools_changed() {
+            Some(
+                self.install_tools(spec, &plan, operation_id, sender)
+                    .await?,
+            )
+        } else {
+            prior.and_then(stored_tool_resolution)
+        };
+        if plan.steps().contains(&ProvisionStep::RunSetup) {
+            self.emit_provision_step(operation_id, ProvisionStep::RunSetup, sender)
+                .await?;
+        }
+        let mut resolution = self
+            .provisioner
+            .provision(ProvisionRequest { spec, create })
+            .await?;
+        if let Some(tools) = resolved_tools {
+            resolution.tools = Some(tools);
+        }
+        if plan.steps().contains(&ProvisionStep::VerifyGascamp) {
+            self.emit_provision_step(operation_id, ProvisionStep::VerifyGascamp, sender)
+                .await?;
+            self.verify_gascamp(spec).await?;
+        }
+        Ok(ProvisionedResolution {
+            resolution,
+            tool_hash: plan.desired_tool_hash().to_owned(),
+        })
+    }
+
+    async fn install_tools(
+        &self,
+        spec: &SandboxSpec,
+        plan: &ProvisionPlan,
+        operation_id: OperationId,
+        sender: &mpsc::Sender<OperationEvent>,
+    ) -> Result<Value, ServiceError> {
+        self.emit_provision_step(operation_id, ProvisionStep::WriteSafeMiseConfig, sender)
+            .await?;
+        let config = plan
+            .safe_mise_toml()
+            .map_err(|_| {
+                ServiceError::Provision("could not serialize safe mise config".to_owned())
+            })?
+            .ok_or_else(|| {
+                ServiceError::Provision("safe mise config was not planned".to_owned())
+            })?;
+        self.exec_guest(
+            spec.id(),
+            ["install", "-m", "0600", "/dev/stdin", SAFE_MISE_CONFIG],
+            config.into_bytes(),
+            BTreeMap::new(),
+        )
+        .await?;
+
+        self.emit_provision_step(operation_id, ProvisionStep::InstallTools, sender)
+            .await?;
+        let environment = BTreeMap::from([(
+            "MISE_GLOBAL_CONFIG_FILE".to_owned(),
+            SAFE_MISE_CONFIG.to_owned(),
+        )]);
+        self.exec_guest(
+            spec.id(),
+            ["mise", "install", "--yes"],
+            Vec::new(),
+            environment.clone(),
+        )
+        .await?;
+        let output = self
+            .exec_guest(
+                spec.id(),
+                ["mise", "ls", "--current", "--installed", "--json"],
+                Vec::new(),
+                environment,
+            )
+            .await?;
+        let resolved = parse_mise_versions(&output, spec.manifest().tools())?;
+        serde_json::to_value(resolved)
+            .map_err(|_| ServiceError::Provision("could not encode resolved tools".to_owned()))
+    }
+
+    async fn verify_gascamp(&self, spec: &SandboxSpec) -> Result<(), ServiceError> {
+        let requested = spec
+            .manifest()
+            .gascamp()
+            .workspace_path()
+            .map_or_else(|| "bundled".to_owned(), ToString::to_string);
+        let output = self
+            .exec_guest(
+                spec.id(),
+                ["select-gascamp".to_owned(), requested],
+                Vec::new(),
+                BTreeMap::new(),
+            )
+            .await?;
+        let value: Value = serde_json::from_slice(&output).map_err(|_| {
+            ServiceError::Provision("invalid Gascamp verification output".to_owned())
+        })?;
+        if !value.is_object() {
+            return Err(ServiceError::Provision(
+                "invalid Gascamp verification output".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn exec_guest<I, S>(
+        &self,
+        id: &SandboxId,
+        argv: I,
+        stdin: Vec<u8>,
+        environment: BTreeMap<String, String>,
+    ) -> Result<Vec<u8>, ServiceError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut session = self
+            .runtime
+            .exec(ExecRequest {
+                id: id.clone(),
+                argv: argv.into_iter().map(Into::into).collect(),
+                stdin,
+                environment,
+                tty: false,
+            })
+            .await?;
+        session.send(ExecInput::Close).await?;
+        let mut stdout = Vec::new();
+        let mut output_bytes = 0_usize;
+        while let Some(output) = session.next().await {
+            match output? {
+                ExecOutput::Stdout(bytes) => {
+                    output_bytes = output_bytes.saturating_add(bytes.len());
+                    if output_bytes > MAX_PROVISION_OUTPUT_BYTES {
+                        return Err(ServiceError::Provision(
+                            "guest provisioning output exceeded its limit".to_owned(),
+                        ));
+                    }
+                    stdout.extend(bytes);
+                }
+                ExecOutput::Stderr(bytes) => {
+                    output_bytes = output_bytes.saturating_add(bytes.len());
+                    if output_bytes > MAX_PROVISION_OUTPUT_BYTES {
+                        return Err(ServiceError::Provision(
+                            "guest provisioning output exceeded its limit".to_owned(),
+                        ));
+                    }
+                }
+                ExecOutput::Exit { code: 0, signal: 0 } => return Ok(stdout),
+                ExecOutput::Exit { .. } => {
+                    return Err(ServiceError::Provision(
+                        "guest provisioning command failed".to_owned(),
+                    ));
+                }
+            }
+        }
+        Err(ServiceError::Provision(
+            "guest provisioning command ended without status".to_owned(),
+        ))
+    }
+
+    async fn emit_provision_step(
+        &self,
+        operation_id: OperationId,
+        step: ProvisionStep,
+        sender: &mpsc::Sender<OperationEvent>,
+    ) -> Result<(), ServiceError> {
+        self.emit(
+            operation_id,
+            json!({"phase":"provision_step","step":step.as_str()}),
+            sender,
+        )
+        .await
     }
 
     pub async fn start(&self, id: &SandboxId) -> Result<Operation, ServiceError> {
@@ -816,7 +1069,8 @@ impl<B: RuntimeBackend> SandboxService<B> {
             })
             .await?
             .ok_or_else(|| ServiceError::Missing(id.clone()))?;
-        let unchanged = resolution_matches(&record, &desired_fingerprint);
+        let unchanged = resolution_matches(&record, &desired_fingerprint)
+            && tool_state_matches(&record, request.spec.manifest())?;
         let operation = self
             .database({
                 let record = record.clone();
@@ -865,21 +1119,18 @@ impl<B: RuntimeBackend> SandboxService<B> {
         }
         let result = async {
             self.emit(operation.id, json!({"phase":"before_provision","desired_fingerprint":desired_fingerprint}), &sender).await?;
-            let resolution = self.provisioner
-                .provision(ProvisionRequest {
-                    spec: &request.spec,
-                    create: &create,
-                })
+            let provisioned = self
+                .provision_explicit(&request.spec, &create, Some(&record), operation.id, &sender)
                 .await?;
-            self.emit(operation.id, json!({"phase":"after_provision","resolution_version":1,"desired_fingerprint":desired_fingerprint,"setup":resolution.setup,"tools":resolution.tools}), &sender).await?;
-            self.emit(operation.id, json!({"phase":"before_health"}), &sender).await?;
+            self.emit(operation.id, json!({"phase":"after_provision","resolution_version":1,"desired_fingerprint":desired_fingerprint,"setup":provisioned.resolution.setup,"tools":provisioned.resolution.tools,"tool_hash":provisioned.tool_hash}), &sender).await?;
+            self.emit(operation.id, json!({"phase":"before_health","step":ProvisionStep::HealthCheck.as_str()}), &sender).await?;
             self.provisioner.health_check(&id).await?;
             self.emit(operation.id, json!({"phase":"after_health","desired_fingerprint":desired_fingerprint}), &sender).await?;
-            Ok::<_, ServiceError>(resolution)
+            Ok::<_, ServiceError>(provisioned)
         }
         .await;
-        let resolution = match result {
-            Ok(resolution) => resolution,
+        let provisioned = match result {
+            Ok(provisioned) => provisioned,
             Err(error) => {
                 let actual = self.runtime_actual(&id, prior_actual).await;
                 let code = error.code();
@@ -894,11 +1145,11 @@ impl<B: RuntimeBackend> SandboxService<B> {
         };
         record.setup_resolution = Some(SetupResolution::new(
             1,
-            json!({"desired_fingerprint":desired_fingerprint,"resolution":resolution.setup}),
+            json!({"desired_fingerprint":desired_fingerprint,"resolution":provisioned.resolution.setup}),
         ));
         record.tool_resolution = Some(ToolResolution::new(
             1,
-            json!({"desired_fingerprint":desired_fingerprint,"resolution":resolution.tools}),
+            json!({"desired_fingerprint":desired_fingerprint,"tool_hash":provisioned.tool_hash,"resolution":provisioned.resolution.tools}),
         ));
         record.actual_state = ActualState::Running;
         self.database({
@@ -1079,7 +1330,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
                         ));
                         record.tool_resolution = Some(ToolResolution::new(
                             1,
-                            json!({"desired_fingerprint":fingerprint,"resolution":details.get("tools").cloned().unwrap_or(Value::Null)}),
+                            json!({"desired_fingerprint":fingerprint,"tool_hash":details.get("tool_hash").cloned().unwrap_or(Value::Null),"resolution":details.get("tools").cloned().unwrap_or(Value::Null)}),
                         ));
                         record.actual_state = actual;
                         self.database({
@@ -1211,6 +1462,64 @@ impl ServiceError {
             Self::IncompleteDestroy(_) => "incomplete_destroy",
         }
     }
+}
+
+fn applied_tool_state(record: Option<&SandboxRecord>) -> AppliedState {
+    record
+        .and_then(|record| record.tool_resolution.as_ref())
+        .and_then(|resolution| resolution.details.get("tool_hash"))
+        .and_then(Value::as_str)
+        .map_or_else(AppliedState::empty, AppliedState::with_tool_hash)
+}
+
+fn stored_tool_resolution(record: &SandboxRecord) -> Option<Value> {
+    record
+        .tool_resolution
+        .as_ref()
+        .and_then(|resolution| resolution.details.get("resolution"))
+        .cloned()
+}
+
+fn tool_state_matches(
+    record: &SandboxRecord,
+    manifest: &gascan_core::manifest::Manifest,
+) -> Result<bool, ServiceError> {
+    ProvisioningPlanner::plan(manifest, &applied_tool_state(Some(record)))
+        .map(|plan| !plan.tools_changed())
+        .map_err(|_| ServiceError::Provision("could not plan provisioning".to_owned()))
+}
+
+fn parse_mise_versions(
+    output: &[u8],
+    desired: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, ServiceError> {
+    let MiseInventory(records) = serde_json::from_slice(output)
+        .map_err(|_| ServiceError::Provision("invalid mise tool inventory".to_owned()))?;
+    if !records.keys().eq(desired.keys()) {
+        return Err(ServiceError::Provision(
+            "mise returned an unexpected tool set".to_owned(),
+        ));
+    }
+    records
+        .into_iter()
+        .map(|(tool, records)| {
+            let [record] = records.as_slice() else {
+                return Err(ServiceError::Provision(
+                    "mise returned an invalid tool record".to_owned(),
+                ));
+            };
+            if !record.installed
+                || !record.active
+                || record.version.trim().is_empty()
+                || record.version.chars().any(char::is_control)
+            {
+                return Err(ServiceError::Provision(
+                    "mise returned an invalid tool record".to_owned(),
+                ));
+            }
+            Ok((tool, record.version.clone()))
+        })
+        .collect()
 }
 
 fn resolution_matches(record: &SandboxRecord, fingerprint: &str) -> bool {

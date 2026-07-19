@@ -6,6 +6,7 @@ use crate::runtime::{
 };
 use crate::sandbox::SandboxId;
 use async_trait::async_trait;
+use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -78,6 +79,7 @@ struct FakeState {
     failures: HashSet<FailureBoundary>,
     create_failure_after_mutations: Option<usize>,
     exec_result: (Vec<u8>, Vec<u8>, i32),
+    exec_results: VecDeque<(Vec<u8>, Vec<u8>, i32)>,
     logs: Vec<FakeLogRecord>,
 }
 
@@ -94,6 +96,7 @@ impl FakeRuntime {
                 failures: HashSet::new(),
                 create_failure_after_mutations: None,
                 exec_result: (Vec::new(), Vec::new(), 0),
+                exec_results: VecDeque::new(),
                 logs: Vec::new(),
             })),
             persistence: Arc::new(None),
@@ -169,6 +172,13 @@ impl FakeRuntime {
 
     pub async fn set_exec_result(&self, stdout: Vec<u8>, stderr: Vec<u8>, exit_code: i32) {
         self.inner.lock().await.exec_result = (stdout, stderr, exit_code);
+    }
+
+    pub async fn queue_exec_results<I>(&self, results: I)
+    where
+        I: IntoIterator<Item = (Vec<u8>, Vec<u8>, i32)>,
+    {
+        self.inner.lock().await.exec_results.extend(results);
     }
 
     pub async fn set_logs(&self, logs: Vec<u8>) {
@@ -339,6 +349,7 @@ fn load_state(capabilities: RuntimeCapabilities, path: &Path) -> Result<FakeStat
         failures: HashSet::new(),
         create_failure_after_mutations: None,
         exec_result: (Vec::new(), Vec::new(), 0),
+        exec_results: VecDeque::new(),
         logs: snapshot.logs,
     })
 }
@@ -422,6 +433,7 @@ fn interpret_fake_command(
             Vec::new(),
             0,
         ),
+        Some("select-gascamp") => (br#"{"source":"bundled"}"#.to_vec(), Vec::new(), 0),
         Some("true") | Some("sh") => (Vec::new(), Vec::new(), 0),
         _ => configured,
     }
@@ -595,7 +607,10 @@ impl RuntimeBackend for FakeRuntime {
                 message: "exec requires a running sandbox".to_owned(),
             });
         }
-        let configured = state.exec_result.clone();
+        let configured = state
+            .exec_results
+            .pop_front()
+            .unwrap_or_else(|| state.exec_result.clone());
         let runtime = self.clone();
         let (input, mut inputs) = tokio::sync::mpsc::channel(16);
         let (outputs, output) = tokio::sync::mpsc::channel(16);

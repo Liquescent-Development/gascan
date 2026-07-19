@@ -273,7 +273,7 @@ Expected: FAIL because provisioning types are absent.
 
 - [ ] **Step 3: Implement deterministic planning and apply execution**
 
-Sort tools, escape TOML through serialization rather than string interpolation, write config under Gas Can's persistent config volume, run `mise install --yes` and `mise current --json` through literal argv, and persist exact resolved versions. `up` on an existing sandbox compares desired/applied hashes and emits `apply_required` without executing changes.
+Sort tools, escape TOML through serialization rather than string interpolation, write config under Gas Can's persistent config volume, run `mise install --yes` and `mise ls --current --installed --json` through literal argv, validate the structured inventory, and persist exact active installed versions. `up` on an existing sandbox compares desired/applied hashes and emits `apply_required` without executing changes.
 
 - [ ] **Step 4: Run fake-backend provisioning tests**
 

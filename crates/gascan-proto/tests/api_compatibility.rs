@@ -245,7 +245,7 @@ fn v1_descriptor_has_exact_event_and_attach_layout() {
     let file = api_file(&descriptor);
 
     let event = message(file, "OperationEvent");
-    assert_eq!(event.field.len(), 9);
+    assert_eq!(event.field.len(), 10);
     assert_field(event, "operation_id", 1, Message, None);
     assert_field(event, "timestamp", 2, Message, None);
     assert_field(event, "phase", 3, String, None);
@@ -255,15 +255,17 @@ fn v1_descriptor_has_exact_event_and_attach_layout() {
     assert_field(event, "status", 7, Enum, None);
     assert_field(event, "content_type", 8, String, None);
     assert_field(event, "session_token", 9, Bytes, None);
+    assert_field(event, "provision_step", 10, Enum, None);
     assert_type_name(event, "operation_id", ".gascan.v1.OperationId");
     assert_type_name(event, "timestamp", ".google.protobuf.Timestamp");
     assert_type_name(event, "error", ".gascan.v1.Error");
     assert_type_name(event, "status", ".gascan.v1.OperationStatus");
+    assert_type_name(event, "provision_step", ".gascan.v1.ProvisionStep");
     assert!(
         event
             .reserved_range
             .iter()
-            .any(|range| range.start == Some(10) && range.end == Some(11))
+            .any(|range| range.start == Some(11) && range.end == Some(12))
     );
 
     let client = message(file, "ClientFrame");
@@ -657,9 +659,17 @@ fn v1_descriptor_exactly_covers_every_exported_message_enum_and_rpc() {
                 ),
                 f!("content_type", 8, String),
                 f!("session_token", 9, Bytes),
+                f!(
+                    "provision_step",
+                    10,
+                    Enum,
+                    O,
+                    None,
+                    Some(".gascan.v1.ProvisionStep")
+                ),
             ],
             &[],
-            &[(10, 11)],
+            &[(11, 12)],
         ),
         (
             "StatusRequest",
@@ -838,6 +848,17 @@ fn v1_descriptor_exactly_covers_every_exported_message_enum_and_rpc() {
                 ("OPERATION_STATUS_PENDING", 1),
                 ("OPERATION_STATUS_COMPLETED", 2),
                 ("OPERATION_STATUS_FAILED", 3),
+            ],
+        ),
+        (
+            "ProvisionStep",
+            &[
+                ("PROVISION_STEP_UNSPECIFIED", 0),
+                ("PROVISION_STEP_WRITE_SAFE_MISE_CONFIG", 1),
+                ("PROVISION_STEP_INSTALL_TOOLS", 2),
+                ("PROVISION_STEP_RUN_SETUP", 3),
+                ("PROVISION_STEP_VERIFY_GASCAMP", 4),
+                ("PROVISION_STEP_HEALTH_CHECK", 5),
             ],
         ),
     ];

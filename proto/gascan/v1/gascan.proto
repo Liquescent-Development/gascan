@@ -46,6 +46,17 @@ enum OperationStatus {
   OPERATION_STATUS_FAILED = 3;
 }
 
+// Typed provisioning progress. Unspecified is used for non-provisioning events.
+enum ProvisionStep {
+  PROVISION_STEP_UNSPECIFIED = 0;
+  PROVISION_STEP_WRITE_SAFE_MISE_CONFIG = 1;
+  PROVISION_STEP_INSTALL_TOOLS = 2;
+  // Reserved execution boundary for setup digest policy in a later API minor.
+  PROVISION_STEP_RUN_SETUP = 3;
+  PROVISION_STEP_VERIFY_GASCAMP = 4;
+  PROVISION_STEP_HEALTH_CHECK = 5;
+}
+
 message Capability {
   string name = 1;
   bool available = 2;
@@ -128,7 +139,8 @@ message OperationEvent {
   string content_type = 8;
   // Opaque attachment token emitted by Run/Shell; empty for unrelated operations.
   bytes session_token = 9;
-  reserved 10;
+  ProvisionStep provision_step = 10;
+  reserved 11;
 }
 
 message StatusRequest { SandboxSelector sandbox = 1; reserved 2; }
