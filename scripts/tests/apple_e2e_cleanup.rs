@@ -17,14 +17,14 @@ case "$*" in
     if test -f "$CALLS.container-deleted"; then
       printf '[]\n'
     else
-      printf '[{"id":"%s","configuration":{"labels":{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":"%s"}}}]\n' "$ID" "$LABEL_ID"
+      printf '[{"configuration":{"id":"%s","labels":{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":"%s"}}}]\n' "$ID" "$LABEL_ID"
     fi
     ;;
   "volume list --format json")
     records=
     for name in "gascan-mise-$ID" "gascan-cache-$ID" "gascan-config-$ID"; do
       if ! test -f "$CALLS.volume-deleted" || ! grep -Fxq "$name" "$CALLS.volume-deleted"; then
-        record=$(printf '{"id":"%s","configuration":{"labels":{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":"%s"}}}' "$name" "$LABEL_ID")
+        record=$(printf '{"id":"%s","configuration":{"name":"%s","labels":{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":"%s"}}}' "$name" "$name" "$LABEL_ID")
         if test -n "$records"; then records="$records,$record"; else records=$record; fi
       fi
     done
@@ -260,6 +260,80 @@ esac
     assert!(path.exists());
     assert_eq!(fs::read_to_string(temp.path().join("count")).unwrap(), "2");
     assert!(!calls.exists());
+}
+
+#[test]
+fn top_level_only_container_identity_is_rejected_without_deletion() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = "gate4-test-123456789abc";
+    let path = manifest(
+        &temp,
+        serde_json::json!([id, format!("gascan-mise-{id}"), format!("gascan-cache-{id}"), format!("gascan-config-{id}")]),
+    );
+    install_container_script(
+        &temp,
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >>"$CALLS"
+case "$*" in
+  "list --all --format json")
+    printf '[{"id":"%s","configuration":{"labels":{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":"%s"}}}]\n' "$ID" "$ID"
+    ;;
+  "volume list --format json") printf '[]\n' ;;
+  *) exit 42 ;;
+esac
+"#,
+    );
+    let calls = temp.path().join("calls");
+
+    let output = run(&temp, &path, &calls);
+
+    assert!(!output.status.success());
+    assert!(path.exists());
+    let calls = fs::read_to_string(calls).unwrap();
+    assert!(!calls.lines().any(|line| line.starts_with("delete ")));
+}
+
+#[test]
+fn mismatched_ambiguous_volume_identity_is_rejected_without_deletion() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = "gate4-test-123456789abc";
+    let volume = format!("gascan-mise-{id}");
+    let path = manifest(
+        &temp,
+        serde_json::json!([id, volume, format!("gascan-cache-{id}"), format!("gascan-config-{id}")]),
+    );
+    install_container_script(
+        &temp,
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >>"$CALLS"
+case "$*" in
+  "list --all --format json") printf '[]\n' ;;
+  "volume list --format json")
+    printf '[{"id":"%s","configuration":{"name":"%s","labels":{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":"%s"}}},{"id":"some-other-volume","configuration":{"name":"%s","labels":{}}}]\n' "$VOLUME" "$VOLUME" "$ID" "$VOLUME"
+    ;;
+  *) exit 42 ;;
+esac
+"#,
+    );
+    let calls = temp.path().join("calls");
+    let inherited = std::env::var("PATH").unwrap_or_default();
+    let output = Command::new(script())
+        .arg(&path)
+        .arg(fs::canonicalize(temp.path().join("trusted-gascan")).unwrap())
+        .arg(fs::canonicalize(temp.path()).unwrap())
+        .env("PATH", format!("{}:{inherited}", temp.path().display()))
+        .env("CALLS", &calls)
+        .env("ID", id)
+        .env("VOLUME", format!("gascan-mise-{id}"))
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(path.exists());
+    let calls = fs::read_to_string(calls).unwrap();
+    assert!(!calls.lines().any(|line| line.starts_with("volume delete ")));
 }
 
 #[test]
