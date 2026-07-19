@@ -1206,9 +1206,14 @@ mod tests {
                     "/home/workspace/.config/gascan",
                 ]
             );
-            assert!(request.volumes().iter().all(|volume| {
-                volume.ownership.sandbox_id == *spec.id() && volume.ownership.managed_by == "gascan"
-            }));
+            assert_eq!(request.ownership().managed_by, "gascan");
+            assert_eq!(&request.ownership().sandbox_id, spec.id());
+            assert!(
+                request
+                    .volumes()
+                    .iter()
+                    .all(|volume| &volume.ownership == request.ownership())
+            );
         }
         Ok(())
     }
