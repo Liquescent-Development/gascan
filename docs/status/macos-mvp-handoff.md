@@ -281,9 +281,10 @@ Gate 4 head `a475f8c` and proceed only with explicitly authorized Phase 3 or
 Gate 5 work. If the fresh session is asked only for status, report from this
 document and do not run live gates.
 
-Before claiming any gate, run the roadmap's program-level verification and the
-gate-specific live suite. Never infer Gate 4 from harness tests or Gate 5 from
-unit tests.
+Before claiming any gate, obtain and record that gate's required evidence.
+Before claiming Gate 5 or MVP completion, additionally complete the roadmap's
+full Program-level Verification. Never infer Gate 4 from harness tests or
+Gate 5 from unit tests.
 
 ## Deferred Work
 
