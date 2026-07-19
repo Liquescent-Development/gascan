@@ -261,6 +261,10 @@ pub enum ServiceError {
     SetupChanged,
     #[error("setup script failed with exit code {0}")]
     SetupExit(i32),
+    #[error("mounted setup script changed before execution; stopped state could not be confirmed")]
+    SetupChangedStopUnconfirmed,
+    #[error("setup script failed with exit code {exit_code}; stopped state could not be confirmed")]
+    SetupExitStopUnconfirmed { exit_code: i32 },
     #[error("keyed lock registry was poisoned")]
     LockPoisoned,
     #[error("bounded operation event stream could not accept its durable event")]
@@ -536,16 +540,13 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 }))
             }
             Err(error) => {
-                let actual = self.runtime.inspect(&id).await.ok().flatten().map_or(
-                    ActualState::Absent,
-                    |sandbox| match sandbox.state {
-                        ContainerState::Running => ActualState::Running,
-                        ContainerState::Stopped => ActualState::Stopped,
-                        ContainerState::Creating => ActualState::Creating,
-                    },
-                );
+                let actual = if error.setup_stop_confirmed() {
+                    ActualState::Stopped
+                } else {
+                    self.runtime_actual(&id, ActualState::Absent).await
+                };
                 let code = error.code();
-                let details = json!({"message":error.to_string()});
+                let details = failure_details(&error);
                 self.database(move |store| {
                     store.fail_operation(operation.id, actual, code, details)
                 })
@@ -646,12 +647,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
         .await;
         match result {
             Ok(provisioned) => Ok((ActualState::Running, provisioned)),
-            Err(error) if error.is_setup_failure() => {
-                if self.runtime.inspect(id).await?.is_some() {
-                    let _ = self.runtime.stop(id).await;
-                }
-                Err(error)
-            }
+            Err(error) if error.is_setup_failure() => Err(error),
             Err(error) if created.is_some() => {
                 if let Some(outcome) = created {
                     if !outcome.created().is_empty() {
@@ -691,20 +687,22 @@ impl<B: RuntimeBackend> SandboxService<B> {
         } else {
             prior.and_then(stored_tool_resolution)
         };
-        let resolved_setup = if plan.steps().contains(&ProvisionStep::RunSetup) {
+        if plan.steps().contains(&ProvisionStep::RunSetup) {
             self.emit_provision_step(operation_id, ProvisionStep::RunSetup, sender)
                 .await?;
             let setup = plan.setup_script().ok_or_else(|| {
                 ServiceError::Provision("setup execution was not planned".to_owned())
             })?;
-            self.run_setup(spec.id(), setup).await?;
-            Some(json!({
+            if let Err(error) = self.run_setup(spec.id(), setup).await {
+                return Err(self.finalize_setup_failure(spec.id(), error).await);
+            }
+        }
+        let resolved_setup = plan.setup_script().map(|setup| {
+            json!({
                 "canonical_relative_path": setup.canonical_relative_path(),
                 "sha256": setup.sha256(),
-            }))
-        } else {
-            prior.and_then(stored_setup_resolution)
-        };
+            })
+        });
         let mut resolution = self
             .provisioner
             .provision(ProvisionRequest { spec, create })
@@ -755,6 +753,19 @@ impl<B: RuntimeBackend> SandboxService<B> {
             Ok(())
         } else {
             Err(ServiceError::SetupExit(code))
+        }
+    }
+
+    async fn finalize_setup_failure(&self, id: &SandboxId, error: ServiceError) -> ServiceError {
+        let stop_succeeded = self.runtime.stop(id).await.is_ok();
+        let stopped = matches!(
+            self.runtime.inspect(id).await,
+            Ok(Some(runtime)) if runtime.state == ContainerState::Stopped
+        );
+        if stop_succeeded && stopped {
+            error
+        } else {
+            error.with_unconfirmed_setup_stop()
         }
     }
 
@@ -1173,12 +1184,16 @@ impl<B: RuntimeBackend> SandboxService<B> {
             })
             .await?
             .ok_or_else(|| ServiceError::Missing(id.clone()))?;
+        let desired_plan = ProvisioningPlanner::plan_for_root(
+            request.spec.canonical_root(),
+            request.spec.manifest(),
+            &applied_state(Some(&record)),
+        )
+        .map_err(|_| ServiceError::Provision("could not plan provisioning".to_owned()))?;
+        let setup_changed = desired_plan.setup_changed();
         let unchanged = resolution_matches(&record, &desired_fingerprint)
-            && tool_state_matches(
-                &record,
-                request.spec.canonical_root(),
-                request.spec.manifest(),
-            )?;
+            && !desired_plan.tools_changed()
+            && !setup_changed;
         let operation = self
             .database({
                 let record = record.clone();
@@ -1199,7 +1214,10 @@ impl<B: RuntimeBackend> SandboxService<B> {
             if runtime.ownership.managed_by != "gascan" || runtime.ownership.sandbox_id != id {
                 return Err(ServiceError::Ownership(id.clone()));
             }
-            if runtime.state != ContainerState::Running {
+            if runtime.state == ContainerState::Running && setup_changed {
+                self.runtime.stop(&id).await?;
+                self.runtime.start(&id).await?;
+            } else if runtime.state != ContainerState::Running {
                 self.runtime.start(&id).await?;
             }
             Ok::<_, ServiceError>(())
@@ -1240,12 +1258,13 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let provisioned = match result {
             Ok(provisioned) => provisioned,
             Err(error) => {
-                if error.is_setup_failure() {
-                    let _ = self.runtime.stop(&id).await;
-                }
-                let actual = self.runtime_actual(&id, prior_actual).await;
+                let actual = if error.setup_stop_confirmed() {
+                    ActualState::Stopped
+                } else {
+                    self.runtime_actual(&id, prior_actual).await
+                };
                 let code = error.code();
-                let details = json!({"message":error.to_string()});
+                let details = failure_details(&error);
                 self.database(move |store| {
                     store.fail_operation(operation.id, actual, code, details)
                 })
@@ -1562,7 +1581,11 @@ impl ServiceError {
             Self::Policy(error) => error.code(),
             Self::Missing(_) => "not_found",
             Self::Ownership(_) => "ownership_mismatch",
-            Self::Provision(_) | Self::SetupChanged | Self::SetupExit(_) => "provision_failed",
+            Self::Provision(_)
+            | Self::SetupChanged
+            | Self::SetupExit(_)
+            | Self::SetupChangedStopUnconfirmed
+            | Self::SetupExitStopUnconfirmed { .. } => "provision_failed",
             Self::Store(_) => "store_error",
             Self::Sandbox(_) => "sandbox_error",
             Self::Manifest(_) => "manifest_error",
@@ -1575,7 +1598,54 @@ impl ServiceError {
     }
 
     const fn is_setup_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::SetupChanged
+                | Self::SetupExit(_)
+                | Self::SetupChangedStopUnconfirmed
+                | Self::SetupExitStopUnconfirmed { .. }
+        )
+    }
+
+    const fn setup_stop_confirmed(&self) -> bool {
         matches!(self, Self::SetupChanged | Self::SetupExit(_))
+    }
+
+    const fn setup_exit_code(&self) -> Option<i32> {
+        match self {
+            Self::SetupExit(code) => Some(*code),
+            Self::SetupExitStopUnconfirmed { exit_code } => Some(*exit_code),
+            _ => None,
+        }
+    }
+
+    fn with_unconfirmed_setup_stop(self) -> Self {
+        match self {
+            Self::SetupChanged | Self::SetupChangedStopUnconfirmed => {
+                Self::SetupChangedStopUnconfirmed
+            }
+            Self::SetupExit(exit_code) | Self::SetupExitStopUnconfirmed { exit_code } => {
+                Self::SetupExitStopUnconfirmed { exit_code }
+            }
+            other => other,
+        }
+    }
+}
+
+fn failure_details(error: &ServiceError) -> Value {
+    if error.is_setup_failure() {
+        let mut details = json!({
+            "message": error.to_string(),
+            "phase": "setup",
+            "retryable": true,
+            "stopped": error.setup_stop_confirmed(),
+        });
+        if let Some(exit_code) = error.setup_exit_code() {
+            details["exit_code"] = Value::from(exit_code);
+        }
+        details
+    } else {
+        json!({"message":error.to_string()})
     }
 }
 
@@ -1622,14 +1692,6 @@ fn mise_command(args: &[&str]) -> Vec<String> {
 fn stored_tool_resolution(record: &SandboxRecord) -> Option<Value> {
     record
         .tool_resolution
-        .as_ref()
-        .and_then(|resolution| resolution.details.get("resolution"))
-        .cloned()
-}
-
-fn stored_setup_resolution(record: &SandboxRecord) -> Option<Value> {
-    record
-        .setup_resolution
         .as_ref()
         .and_then(|resolution| resolution.details.get("resolution"))
         .cloned()

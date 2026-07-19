@@ -49,11 +49,11 @@ case ${1-} in
   "")
     tests="apple_lifecycle apple_recovery"
     ;;
-  apple_lifecycle|apple_recovery)
+  apple_lifecycle|apple_recovery|apple_apply)
     tests=$1
     ;;
   *)
-    printf 'usage: %s [apple_lifecycle|apple_recovery]\n' "$0" >&2
+    printf 'usage: %s [apple_lifecycle|apple_recovery|apple_apply]\n' "$0" >&2
     exit 64
     ;;
 esac

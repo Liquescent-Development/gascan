@@ -78,6 +78,50 @@ fn setup_rejects_symlinks_even_when_they_resolve_inside_the_root() -> TestResult
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn setup_rejects_an_intermediate_symlink_inside_the_root() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = canonical_root(&temp)?;
+    std::fs::create_dir(root.join("real"))?;
+    std::fs::write(root.join("real/setup.sh"), b"true\n")?;
+    std::os::unix::fs::symlink("real", root.join("linked"))?;
+    setup_manifest(&root, "linked/setup.sh")?;
+    let manifest = Manifest::load(&root)?;
+
+    let error = ProvisioningPlanner::plan_for_root(&root, &manifest, &AppliedState::empty())
+        .expect_err("intermediate setup symlink must be rejected");
+    assert_eq!(
+        error.to_string(),
+        "setup script path contains a symbolic link"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_rejects_a_symlink_passed_as_the_canonical_root() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let parent = canonical_root(&temp)?;
+    std::fs::create_dir(parent.join("real"))?;
+    std::fs::write(parent.join("real/setup.sh"), b"true\n")?;
+    setup_manifest(&parent.join("real"), "setup.sh")?;
+    std::os::unix::fs::symlink("real", parent.join("linked"))?;
+    let manifest = Manifest::load(&parent.join("linked"))?;
+
+    let error = ProvisioningPlanner::plan_for_root(
+        &parent.join("linked"),
+        &manifest,
+        &AppliedState::empty(),
+    )
+    .expect_err("setup root symlink must be rejected");
+    assert_eq!(
+        error.to_string(),
+        "setup script path contains a symbolic link"
+    );
+    Ok(())
+}
+
 #[test]
 fn setup_rejects_non_regular_inputs() -> TestResult {
     let temp = tempfile::tempdir()?;

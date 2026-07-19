@@ -63,7 +63,10 @@ fn runner_builds_and_exports_canonical_attach_helper_before_preflight_and_live_t
         .arg("apple_lifecycle")
         .env("RUNNER_FIXTURE_ROOT", root)
         .env("RUNNER_FIXTURE_LOG", &log)
-        .env("PATH", format!("{}:/usr/bin:/bin", root.join("bin").display()))
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", root.join("bin").display()),
+        )
         .output()
         .unwrap();
     assert!(
@@ -75,7 +78,10 @@ fn runner_builds_and_exports_canonical_attach_helper_before_preflight_and_live_t
     let helper = fs::canonicalize(root.join("target/gascan-apple-attach")).unwrap();
     let records = fs::read_to_string(log).unwrap();
     let lines: Vec<_> = records.lines().collect();
-    assert_eq!(lines[0], "cargo:build -p gascan-e2e --bin gascan-e2e-cli:unset");
+    assert_eq!(
+        lines[0],
+        "cargo:build -p gascan-e2e --bin gascan-e2e-cli:unset"
+    );
     assert_eq!(lines[1], "helper-build");
     assert_eq!(lines[2], format!("preflight:{}", helper.display()));
     assert_eq!(
@@ -85,6 +91,59 @@ fn runner_builds_and_exports_canonical_attach_helper_before_preflight_and_live_t
             helper.display()
         )
     );
+}
+
+#[test]
+fn runner_accepts_apple_apply_as_an_explicit_single_target() {
+    let fixture = runner_fixture(
+        "#!/bin/sh\nset -eu\nmkdir -p \"$RUNNER_FIXTURE_ROOT/target\"\nprintf '#!/bin/sh\\n' >\"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\nchmod 755 \"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\n",
+    );
+    let root = fixture.path();
+    let log = root.join("runner.log");
+    let output = Command::new(root.join("scripts/run-apple-e2e.sh"))
+        .arg("apple_apply")
+        .env("RUNNER_FIXTURE_ROOT", root)
+        .env("RUNNER_FIXTURE_LOG", &log)
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", root.join("bin").display()),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let records = fs::read_to_string(log).unwrap();
+    assert!(records.lines().any(|line| line.contains(
+        "cargo:test -p gascan-e2e --test apple_apply -- --ignored --test-threads=1 --nocapture:"
+    )));
+    assert!(!records.contains("--test apple_lifecycle"));
+    assert!(!records.contains("--test apple_recovery"));
+}
+
+#[test]
+fn runner_default_targets_remain_lifecycle_and_recovery_only() {
+    let fixture = runner_fixture(
+        "#!/bin/sh\nset -eu\nmkdir -p \"$RUNNER_FIXTURE_ROOT/target\"\nprintf '#!/bin/sh\\n' >\"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\nchmod 755 \"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\n",
+    );
+    let root = fixture.path();
+    let log = root.join("runner.log");
+    let output = Command::new(root.join("scripts/run-apple-e2e.sh"))
+        .env("RUNNER_FIXTURE_ROOT", root)
+        .env("RUNNER_FIXTURE_LOG", &log)
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", root.join("bin").display()),
+        )
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let records = fs::read_to_string(log).unwrap();
+    assert!(records.contains("--test apple_lifecycle"));
+    assert!(records.contains("--test apple_recovery"));
+    assert!(!records.contains("--test apple_apply"));
 }
 
 #[test]
@@ -98,14 +157,20 @@ fn unusable_attach_helper_stops_before_preflight_and_live_test() {
         .arg("apple_lifecycle")
         .env("RUNNER_FIXTURE_ROOT", root)
         .env("RUNNER_FIXTURE_LOG", &log)
-        .env("PATH", format!("{}:/usr/bin:/bin", root.join("bin").display()))
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", root.join("bin").display()),
+        )
         .output()
         .unwrap();
     assert!(!output.status.success());
     let records = fs::read_to_string(log).unwrap();
     assert_eq!(
         records.lines().collect::<Vec<_>>(),
-        ["cargo:build -p gascan-e2e --bin gascan-e2e-cli:unset", "helper-build"]
+        [
+            "cargo:build -p gascan-e2e --bin gascan-e2e-cli:unset",
+            "helper-build"
+        ]
     );
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("attach helper is not executable"),

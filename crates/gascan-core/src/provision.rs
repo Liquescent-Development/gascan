@@ -1,5 +1,7 @@
 use crate::manifest::Manifest;
 use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
+use rustix::fd::OwnedFd;
+use rustix::fs::{FileType, Mode, OFlags};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -192,37 +194,44 @@ fn resolve_setup(
     canonical_root: &Utf8Path,
     relative_path: &Utf8Path,
 ) -> Result<SetupScript, ProvisionError> {
-    let mut candidate = canonical_root.to_owned();
-    for component in relative_path.components() {
+    let mut directory = open_root_no_follow(canonical_root)?;
+    let mut components = relative_path.components().peekable();
+    let mut canonical_relative_path = Utf8PathBuf::new();
+    let mut file = None;
+    while let Some(component) = components.next() {
         match component {
             Utf8Component::CurDir => continue,
-            Utf8Component::Normal(component) => candidate.push(component),
+            Utf8Component::Normal(component) => {
+                canonical_relative_path.push(component);
+                let final_component = components.peek().is_none();
+                let flags = OFlags::RDONLY
+                    | OFlags::NOFOLLOW
+                    | OFlags::CLOEXEC
+                    | OFlags::NONBLOCK
+                    | if final_component {
+                        OFlags::empty()
+                    } else {
+                        OFlags::DIRECTORY
+                    };
+                let opened = rustix::fs::openat(&directory, component, flags, Mode::empty())
+                    .map_err(map_setup_open_error)?;
+                if final_component {
+                    file = Some(opened);
+                } else {
+                    directory = opened;
+                }
+            }
             Utf8Component::ParentDir | Utf8Component::RootDir | Utf8Component::Prefix(_) => {
                 return Err(ProvisionError::SetupOutsideRoot);
             }
         }
-        let metadata =
-            std::fs::symlink_metadata(&candidate).map_err(|_| ProvisionError::SetupUnreadable)?;
-        if metadata.file_type().is_symlink() {
-            return Err(ProvisionError::SetupSymlink);
-        }
     }
-    let canonical =
-        std::fs::canonicalize(&candidate).map_err(|_| ProvisionError::SetupUnreadable)?;
-    let canonical =
-        Utf8PathBuf::from_path_buf(canonical).map_err(|_| ProvisionError::SetupUnreadable)?;
-    let canonical_relative_path = canonical
-        .strip_prefix(canonical_root)
-        .map_err(|_| ProvisionError::SetupOutsideRoot)?
-        .to_owned();
-    let mut file = std::fs::File::open(&canonical).map_err(|_| ProvisionError::SetupUnreadable)?;
-    if !file
-        .metadata()
-        .map_err(|_| ProvisionError::SetupUnreadable)?
-        .is_file()
-    {
+    let file = file.ok_or(ProvisionError::SetupNotRegular)?;
+    let stat = rustix::fs::fstat(&file).map_err(|_| ProvisionError::SetupUnreadable)?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
         return Err(ProvisionError::SetupNotRegular);
     }
+    let mut file = std::fs::File::from(file);
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
         .map_err(|_| ProvisionError::SetupUnreadable)?;
@@ -230,6 +239,40 @@ fn resolve_setup(
         canonical_relative_path,
         sha256: format!("sha256:{:x}", Sha256::digest(bytes)),
     })
+}
+
+fn open_root_no_follow(path: &Utf8Path) -> Result<OwnedFd, ProvisionError> {
+    let mut components = path.components();
+    if components.next() != Some(Utf8Component::RootDir) {
+        return Err(ProvisionError::SetupOutsideRoot);
+    }
+    let mut directory = rustix::fs::open(
+        "/",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(map_setup_open_error)?;
+    for component in components {
+        let Utf8Component::Normal(component) = component else {
+            return Err(ProvisionError::SetupOutsideRoot);
+        };
+        directory = rustix::fs::openat(
+            &directory,
+            component,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(map_setup_open_error)?;
+    }
+    Ok(directory)
+}
+
+fn map_setup_open_error(error: rustix::io::Errno) -> ProvisionError {
+    if matches!(error, rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) {
+        ProvisionError::SetupSymlink
+    } else {
+        ProvisionError::SetupUnreadable
+    }
 }
 
 #[derive(Debug, Error)]
