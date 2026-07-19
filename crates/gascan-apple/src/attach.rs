@@ -1,4 +1,9 @@
-use std::process::Stdio;
+use std::{
+    ffi::{OsStr, OsString},
+    os::unix::fs::PermissionsExt as _,
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
 use gascan_core::runtime::RuntimeError;
 use serde::Serialize;
@@ -30,7 +35,7 @@ pub enum AttachOutput {
 
 #[derive(Clone, Debug)]
 pub struct AppleAttach {
-    helper: String,
+    helper: PathBuf,
     helper_args: Vec<String>,
 }
 
@@ -41,11 +46,48 @@ impl Default for AppleAttach {
 }
 
 impl AppleAttach {
-    pub fn new(helper: impl Into<String>) -> Self {
+    pub fn new(helper: impl AsRef<OsStr>) -> Self {
         Self {
-            helper: helper.into(),
+            helper: PathBuf::from(helper.as_ref()),
             helper_args: Vec::new(),
         }
+    }
+
+    pub fn configured(helper_override: Option<OsString>) -> Result<Self, RuntimeError> {
+        let Some(helper) = helper_override else {
+            return Ok(Self::default());
+        };
+        if helper.is_empty() {
+            return Err(configuration_error("must not be empty"));
+        }
+        let requested = PathBuf::from(helper);
+        let canonical = requested.canonicalize().map_err(|error| {
+            configuration_error(format!("cannot resolve {}: {error}", requested.display()))
+        })?;
+        let metadata = canonical.metadata().map_err(|error| {
+            configuration_error(format!("cannot inspect {}: {error}", canonical.display()))
+        })?;
+        if !metadata.is_file() {
+            return Err(configuration_error(format!(
+                "{} is not a regular file",
+                canonical.display()
+            )));
+        }
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(configuration_error(format!(
+                "{} is not executable",
+                canonical.display()
+            )));
+        }
+        Ok(Self::new(canonical))
+    }
+
+    pub fn configured_from_environment() -> Result<Self, RuntimeError> {
+        Self::configured(std::env::var_os("GASCAN_APPLE_ATTACH_HELPER"))
+    }
+
+    pub fn helper_path(&self) -> &Path {
+        &self.helper
     }
 
     pub fn with_helper_args<I, A>(mut self, args: I) -> Self
@@ -325,6 +367,13 @@ fn command_error(error: std::io::Error) -> RuntimeError {
     RuntimeError::CommandIo {
         operation: OPERATION.to_owned(),
         message: error.to_string(),
+    }
+}
+
+fn configuration_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::CommandIo {
+        operation: "GASCAN_APPLE_ATTACH_HELPER".to_owned(),
+        message: message.into(),
     }
 }
 

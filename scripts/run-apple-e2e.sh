@@ -7,6 +7,22 @@ cd "$root"
 cleanup_root=$("$root/scripts/apple-e2e-session-root.sh")
 cargo build -p gascan-e2e --bin gascan-e2e-cli
 trusted_cli=$(realpath "$root/target/debug/gascan-e2e-cli")
+"$root/scripts/build-apple-attach-helper.sh"
+helper_candidate="$root/target/gascan-apple-attach"
+if ! test -f "$helper_candidate"; then
+  printf 'apple e2e preflight: attach helper is not a regular file: %s\n' "$helper_candidate" >&2
+  exit 1
+fi
+if ! test -x "$helper_candidate"; then
+  printf 'apple e2e preflight: attach helper is not executable: %s\n' "$helper_candidate" >&2
+  exit 1
+fi
+trusted_helper=$(realpath "$helper_candidate")
+if ! test -f "$trusted_helper" || ! test -x "$trusted_helper"; then
+  printf 'apple e2e preflight: canonical attach helper is not usable: %s\n' "$trusted_helper" >&2
+  exit 1
+fi
+export GASCAN_APPLE_ATTACH_HELPER=$trusted_helper
 session_root=$(mktemp -d "$cleanup_root/session-XXXXXXXXXXXX")
 chmod 700 "$session_root"
 export GASCAN_E2E_SESSION_ROOT=$session_root

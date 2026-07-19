@@ -202,9 +202,7 @@ impl LiveContext {
             .unwrap_or_else(|| {
                 Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/gascan-apple-attach")
             });
-        Ok(AppleAttach::new(helper.to_string_lossy())
-            .exec(name, argv, tty)
-            .await?)
+        Ok(AppleAttach::new(helper).exec(name, argv, tty).await?)
     }
 
     pub async fn write_host(&self, name: &str, contents: &str) -> Result<(), TestError> {

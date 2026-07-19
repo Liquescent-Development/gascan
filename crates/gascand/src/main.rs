@@ -55,8 +55,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match backend_selection(fake_requested) {
         BackendSelection::Apple => {
             let doctor = DoctorState::collect(Duration::from_secs(60), production_doctor_report());
+            let attach = gascan_apple::AppleAttach::configured_from_environment()?;
             run_daemon(
-                AppleBackend::new(ProcessRunner),
+                AppleBackend::with_attach(ProcessRunner, attach),
                 store,
                 paths,
                 idle_timeout,
