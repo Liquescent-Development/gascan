@@ -4,10 +4,7 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 
-cleanup_root=${TMPDIR:-/tmp}/gascan-gate4-cleanup
-mkdir -p "$cleanup_root"
-chmod 700 "$cleanup_root"
-cleanup_root=$(realpath "$cleanup_root")
+cleanup_root=$("$root/scripts/apple-e2e-session-root.sh")
 cargo build -p gascan-e2e --bin gascan-e2e-cli
 trusted_cli=$(realpath "$root/target/debug/gascan-e2e-cli")
 session_root=$(mktemp -d "$cleanup_root/session-XXXXXXXXXXXX")

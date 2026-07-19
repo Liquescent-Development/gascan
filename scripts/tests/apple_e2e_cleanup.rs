@@ -77,6 +77,63 @@ fn run(temp: &tempfile::TempDir, path: &PathBuf, calls: &PathBuf) -> std::proces
 }
 
 #[test]
+fn absent_recorded_children_are_an_idempotent_success() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = "gate4-test-123456789abc";
+    let path = manifest(
+        &temp,
+        serde_json::json!([
+            id,
+            format!("gascan-mise-{id}"),
+            format!("gascan-cache-{id}"),
+            format!("gascan-config-{id}")
+        ]),
+    );
+    let session = temp.path().join("session-test");
+    fs::remove_dir_all(&session).unwrap();
+    let container = temp.path().join("container");
+    fs::write(&container, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&container, fs::Permissions::from_mode(0o755)).unwrap();
+    let calls = temp.path().join("calls");
+
+    let output = run(&temp, &path, &calls);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!path.exists());
+    assert!(!session.exists());
+}
+
+#[test]
+fn absent_child_spelled_with_traversal_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_bin, calls) = fake_container(&temp);
+    let id = "gate4-test-123456789abc";
+    let path = manifest(
+        &temp,
+        serde_json::json!([
+            id,
+            format!("gascan-mise-{id}"),
+            format!("gascan-cache-{id}"),
+            format!("gascan-config-{id}")
+        ]),
+    );
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let session = temp.path().join("session-test");
+    value["runtime_root"] = serde_json::json!(session.join("missing/../gascan-gate4-runtime-test"));
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+    let output = run(&temp, &path, &calls);
+
+    assert_eq!(output.status.code(), Some(65));
+    assert!(!calls.exists());
+    assert!(path.exists());
+}
+
+#[test]
 fn exact_name_collision_is_retained_and_never_deleted() {
     let temp = tempfile::tempdir().unwrap();
     let (_bin, calls) = fake_container(&temp);

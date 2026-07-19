@@ -13,6 +13,7 @@ canonical_existing() {
 }
 owned_private_directory() {
   directory=$1
+  test -d "$directory" && test ! -L "$directory" || return 1
   if metadata=$(stat -f '%Lp %u' "$directory" 2>/dev/null); then :; else metadata=$(stat -c '%a %u' "$directory"); fi
   test "$metadata" = "700 $(id -u)"
 }
@@ -20,6 +21,20 @@ owned_private_file() {
   file=$1
   if metadata=$(stat -f '%Lp %u' "$file" 2>/dev/null); then :; else metadata=$(stat -c '%a %u' "$file"); fi
   test "$metadata" = "600 $(id -u)"
+}
+recorded_child_directory() {
+  child=$1
+  parent=$2
+  description=$3
+  base=$(basename "$child")
+  test "$child" = "$parent/$base" || { printf 'refusing %s path escape\n' "$description" >&2; return 1; }
+  test ! -L "$child" || { printf 'refusing %s path escape\n' "$description" >&2; return 1; }
+  if test -e "$child"; then
+    canonical=$(canonical_existing "$child") || { printf 'refusing %s path escape\n' "$description" >&2; return 1; }
+    test "$canonical" = "$child" || { printf 'refusing %s path escape\n' "$description" >&2; return 1; }
+    owned_private_directory "$child" || { printf 'refusing unsafe %s root\n' "$description" >&2; return 1; }
+  fi
+  printf '%s\n' "$child"
 }
 
 trusted_cli=$(canonical_existing "$trusted_cli") || { printf 'refusing untrusted cleanup CLI\n' >&2; exit 65; }
@@ -44,18 +59,12 @@ session_root=$(jq -er '.session_root' "$manifest")
 test "$version" = 1
 test "$managed" = gascan
 test "$daemon_cli" = "$trusted_cli" || { printf 'refusing cleanup CLI mismatch\n' >&2; exit 65; }
-session_root=$(canonical_existing "$session_root") || { printf 'refusing invalid session root\n' >&2; exit 65; }
-test "$(dirname "$session_root")" = "$trusted_root" || { printf 'refusing session path escape\n' >&2; exit 65; }
 case $(basename "$session_root") in session-*) ;; *) printf 'refusing session name\n' >&2; exit 65 ;; esac
-owned_private_directory "$session_root" || { printf 'refusing unsafe session root\n' >&2; exit 65; }
-runtime_root=$(canonical_existing "$runtime_root") || { printf 'refusing runtime path escape\n' >&2; exit 65; }
-project_root=$(canonical_existing "$project_root") || { printf 'refusing project path escape\n' >&2; exit 65; }
-test "$(dirname "$runtime_root")" = "$session_root" || { printf 'refusing runtime path escape\n' >&2; exit 65; }
-test "$(dirname "$project_root")" = "$session_root" || { printf 'refusing project path escape\n' >&2; exit 65; }
+session_root=$(recorded_child_directory "$session_root" "$trusted_root" session) || exit 65
 case $(basename "$runtime_root") in gascan-gate4-runtime-*) ;; *) printf 'refusing runtime name\n' >&2; exit 65 ;; esac
 case $(basename "$project_root") in gascan-gate4-root-*) ;; *) printf 'refusing project name\n' >&2; exit 65 ;; esac
-owned_private_directory "$runtime_root" || { printf 'refusing unsafe runtime root\n' >&2; exit 65; }
-owned_private_directory "$project_root" || { printf 'refusing unsafe project root\n' >&2; exit 65; }
+runtime_root=$(recorded_child_directory "$runtime_root" "$session_root" runtime) || exit 65
+project_root=$(recorded_child_directory "$project_root" "$session_root" project) || exit 65
 test "$instance" = "$runtime_root/daemon-instance.json" || { printf 'refusing instance record path escape\n' >&2; exit 65; }
 case $id in
   *-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
