@@ -149,8 +149,11 @@ async fn apply_uses_literal_mise_argv_streams_steps_and_persists_exact_versions(
                 "/usr/bin/env",
                 "HOME=/home/workspace",
                 "MISE_CACHE_DIR=/home/workspace/.cache/mise",
+                "MISE_CEILING_PATHS=/home/workspace/.config/gascan/mise-workdir",
                 "MISE_DATA_DIR=/home/workspace/.local/share/mise",
                 "MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
+                "MISE_SYSTEM_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
+                "MISE_SYSTEM_DATA_DIR=/opt/gascan/mise",
                 "PATH=/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                 "/usr/local/bin/mise",
                 "--cd",
@@ -165,8 +168,11 @@ async fn apply_uses_literal_mise_argv_streams_steps_and_persists_exact_versions(
                 "/usr/bin/env",
                 "HOME=/home/workspace",
                 "MISE_CACHE_DIR=/home/workspace/.cache/mise",
+                "MISE_CEILING_PATHS=/home/workspace/.config/gascan/mise-workdir",
                 "MISE_DATA_DIR=/home/workspace/.local/share/mise",
                 "MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
+                "MISE_SYSTEM_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
+                "MISE_SYSTEM_DATA_DIR=/opt/gascan/mise",
                 "PATH=/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                 "/usr/local/bin/mise",
                 "--cd",
@@ -476,6 +482,46 @@ async fn removing_last_tool_writes_empty_config_and_persists_empty_resolution() 
         })
         .ok_or("config write")?;
     assert_eq!(std::str::from_utf8(&write.stdin)?, "[tools]\n");
+    let inventory = calls[before..]
+        .iter()
+        .find_map(|call| match call {
+            RuntimeCall::Exec(request)
+                if request.argv.ends_with(&[
+                    "ls".to_owned(),
+                    "--current".to_owned(),
+                    "--installed".to_owned(),
+                    "--json".to_owned(),
+                ]) =>
+            {
+                Some(request)
+            }
+            _ => None,
+        })
+        .ok_or("empty inventory")?;
+    assert_eq!(
+        inventory.argv,
+        [
+            "/usr/bin/env",
+            "HOME=/home/workspace",
+            "MISE_CACHE_DIR=/home/workspace/.cache/mise",
+            "MISE_CEILING_PATHS=/home/workspace/.config/gascan/mise-workdir",
+            "MISE_DATA_DIR=/home/workspace/.local/share/mise",
+            "MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
+            "MISE_SYSTEM_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
+            "MISE_SYSTEM_DATA_DIR=/opt/gascan/mise",
+            "PATH=/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "/usr/local/bin/mise",
+            "--cd",
+            "/home/workspace/.config/gascan/mise-workdir",
+            "--no-env",
+            "--no-hooks",
+            "ls",
+            "--current",
+            "--installed",
+            "--json",
+        ]
+    );
+    assert!(inventory.environment.is_empty());
     let id = make_spec()?.id().clone();
     assert_eq!(
         service

@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use gascan_core::doctor::{DoctorFacts, DoctorReport};
 use gascan_core::manifest::ManifestError;
 use gascan_core::policy::{
-    CONTAINER_PATH, MISE_CACHE_DIR, MISE_DATA_DIR, MISE_GLOBAL_CONFIG_FILE, PolicyCompiler,
-    PolicyError, WORKSPACE_HOME,
+    CONTAINER_PATH, MISE_CACHE_DIR, MISE_DATA_DIR, MISE_GLOBAL_CONFIG_FILE, MISE_SYSTEM_DATA_DIR,
+    PolicyCompiler, PolicyError, WORKSPACE_HOME,
 };
 use gascan_core::provision::{AppliedState, ProvisionPlan, ProvisionStep, ProvisioningPlanner};
 use gascan_core::runtime::{
@@ -1506,8 +1506,11 @@ fn mise_command(args: &[&str]) -> Vec<String> {
         "/usr/bin/env".to_owned(),
         format!("HOME={WORKSPACE_HOME}"),
         format!("MISE_CACHE_DIR={MISE_CACHE_DIR}"),
+        format!("MISE_CEILING_PATHS={SAFE_MISE_WORKDIR}"),
         format!("MISE_DATA_DIR={MISE_DATA_DIR}"),
         format!("MISE_GLOBAL_CONFIG_FILE={MISE_GLOBAL_CONFIG_FILE}"),
+        format!("MISE_SYSTEM_CONFIG_FILE={MISE_GLOBAL_CONFIG_FILE}"),
+        format!("MISE_SYSTEM_DATA_DIR={MISE_SYSTEM_DATA_DIR}"),
         format!("PATH={CONTAINER_PATH}"),
         "/usr/local/bin/mise".to_owned(),
         "--cd".to_owned(),

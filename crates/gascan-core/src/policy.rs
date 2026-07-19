@@ -24,6 +24,7 @@ pub const WORKSPACE_HOME: &str = "/home/workspace";
 pub const MISE_DATA_DIR: &str = "/home/workspace/.local/share/mise";
 pub const MISE_CACHE_DIR: &str = "/home/workspace/.cache/mise";
 pub const MISE_GLOBAL_CONFIG_FILE: &str = "/home/workspace/.config/gascan/mise.toml";
+pub const MISE_SYSTEM_DATA_DIR: &str = "/opt/gascan/mise";
 pub const CONTAINER_PATH: &str = "/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 pub struct PolicyCompiler;
@@ -88,6 +89,10 @@ impl PolicyCompiler {
                 (
                     "MISE_GLOBAL_CONFIG_FILE".to_owned(),
                     MISE_GLOBAL_CONFIG_FILE.to_owned(),
+                ),
+                (
+                    "MISE_SYSTEM_DATA_DIR".to_owned(),
+                    MISE_SYSTEM_DATA_DIR.to_owned(),
                 ),
                 ("PATH".to_owned(), CONTAINER_PATH.to_owned()),
             ]),

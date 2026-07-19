@@ -173,6 +173,10 @@ fn canonical_request_has_one_root_mount_owned_volumes_loopback_ports_and_init() 
                 "/home/workspace/.config/gascan/mise.toml".to_owned(),
             ),
             (
+                "MISE_SYSTEM_DATA_DIR".to_owned(),
+                "/opt/gascan/mise".to_owned(),
+            ),
+            (
                 "PATH".to_owned(),
                 "/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned(),
             ),
@@ -362,13 +366,20 @@ fn approved_json_shape_exposes_no_unsafe_backend_surface() {
             "snapshot contains {forbidden}: {snapshot}"
         );
     }
-    assert_eq!(request.environment().len(), 5);
+    assert_eq!(request.environment().len(), 6);
     assert_eq!(
         request
             .environment()
             .get("MISE_DATA_DIR")
             .map(String::as_str),
         Some("/home/workspace/.local/share/mise")
+    );
+    assert_eq!(
+        request
+            .environment()
+            .get("MISE_SYSTEM_DATA_DIR")
+            .map(String::as_str),
+        Some("/opt/gascan/mise")
     );
     assert!(request.environment().get("PATH").is_some_and(|path| {
         path.starts_with("/home/workspace/.local/share/mise/shims:")
