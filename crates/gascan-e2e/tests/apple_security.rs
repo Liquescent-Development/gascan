@@ -248,6 +248,11 @@ fn real_macos_security_acceptance() -> TestResult {
     env.success(["--sandbox", env.id(), "destroy", "--yes"])?;
     let host = LoopbackServer::start()?;
     let mut route = OwnedDnsRoute::create(&env)?;
+    if std::env::var_os("GASCAN_SECURITY_ABORT_AFTER_DNS_CREATE")
+        .is_some_and(|value| value == std::ffi::OsStr::new("1"))
+    {
+        std::process::abort();
+    }
     let host_url = route.url(host.port);
     let route_result = (|| -> TestResult {
         write_manifest(root, "networked", "workspace", None, false, false)?;

@@ -196,6 +196,12 @@ fn security_mutation_arms_cleanup_and_bounded_probes_require_discriminating_cont
         create.find("record_dns_domain").unwrap() < create.find("Command::new(\"sudo\")").unwrap()
     );
     assert!(source.contains("combine_test_and_cleanup(\"test-owned DNS route\""));
+    let created = source.find("OwnedDnsRoute::create(&env)").unwrap();
+    let abort = source
+        .find("GASCAN_SECURITY_ABORT_AFTER_DNS_CREATE")
+        .unwrap();
+    let ordinary_cleanup = source.find("let route_cleanup = route.cleanup()").unwrap();
+    assert!(created < abort && abort < ordinary_cleanup);
 
     let ports = fs::read_to_string(root.join("tests/security/ports.sh")).unwrap();
     assert!(ports.contains("curl --silent --fail --max-time 1"));
