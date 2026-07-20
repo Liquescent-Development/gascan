@@ -86,14 +86,16 @@ status=0
 if [[ $status -eq 0 ]]; then
   "$release_smoke" || status=$?
 fi
+uninstall_status=0
 if "$uninstaller" --remove-data; then
   :
 else
-  status=$?
+  uninstall_status=$?
+  status=$uninstall_status
 fi
 
 if gascan_audit_clean_host final "$runtime_root" "$install_root"; then
-  [[ $status -eq 0 ]] && live_started=false
+  [[ $uninstall_status -eq 0 ]] && live_started=false
 else
   status=1
 fi

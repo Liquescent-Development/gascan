@@ -24,7 +24,11 @@ write_fake package 'printf "%s\n" "$FIXTURE_PACKAGE"'
 write_fake verify 'exit 0'
 write_fake install 'printf "install\n" >>"$FIXTURE_LOG"; exit "${FIXTURE_INSTALL_STATUS:-0}"'
 write_fake smoke 'printf "smoke:%s\n" "${FIXTURE_SMOKE_PHASE:-ok}" >>"$FIXTURE_LOG"; exit "${FIXTURE_SMOKE_STATUS:-0}"'
-write_fake uninstall 'printf "uninstall\n" >>"$FIXTURE_LOG"; exit "${FIXTURE_UNINSTALL_STATUS:-0}"'
+write_fake uninstall '
+printf "uninstall\n" >>"$FIXTURE_LOG"
+count=$(grep -c "^uninstall$" "$FIXTURE_LOG")
+if [[ ${FIXTURE_UNINSTALL_NONIDEMPOTENT:-0} == 1 && $count -gt 1 ]]; then exit 44; fi
+exit "${FIXTURE_UNINSTALL_STATUS:-0}"'
 write_fake gascan '[[ $* == "doctor --json" ]] || exit 64; printf "%s\n" "{\"checks\":[]}"'
 
 export PATH="$fixture/bin:/usr/bin:/bin:/usr/sbin:/sbin" FIXTURE_LOG=$log FIXTURE_PACKAGE=$fixture/test.pkg
@@ -55,11 +59,13 @@ assert_failure post-install 41
 
 export FIXTURE_INSTALL_STATUS=0 FIXTURE_UNINSTALL_STATUS=0
 for phase in create apply destroy; do
-  export FIXTURE_SMOKE_PHASE=$phase FIXTURE_SMOKE_STATUS=42
+  export FIXTURE_SMOKE_PHASE=$phase FIXTURE_SMOKE_STATUS=42 FIXTURE_UNINSTALL_NONIDEMPOTENT=1
   assert_failure "smoke-$phase" 42
+  [[ $(grep -c '^uninstall$' "$log") -eq 1 ]] || { printf 'clean smoke failure retried successful uninstall: %s\n' "$phase" >&2; exit 1; }
+  [[ $LAST_OUTPUT != *'clean-host cleanup left recorded resources'* ]] || { printf 'clean smoke failure reported false cleanup residue: %s\n' "$phase" >&2; exit 1; }
 done
 
-export FIXTURE_SMOKE_STATUS=0 FIXTURE_UNINSTALL_STATUS=43
+export FIXTURE_SMOKE_STATUS=0 FIXTURE_UNINSTALL_STATUS=43 FIXTURE_UNINSTALL_NONIDEMPOTENT=0
 assert_failure uninstall 43
 [[ $(grep -c '^uninstall$' "$log") -ge 2 ]] || { printf 'uninstall failure did not trigger cleanup retry\n' >&2; exit 1; }
 [[ $LAST_OUTPUT == *'clean-host cleanup left recorded resources'* ]] || { printf 'uninstall cleanup failure lacked residue diagnostic\n' >&2; exit 1; }
