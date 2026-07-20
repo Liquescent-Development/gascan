@@ -76,13 +76,14 @@ for condition in package-id package-version scripts checksum architecture; do
 done
 export FIXTURE_PACKAGE_ID=dev.gascan.pkg FIXTURE_VERSION=0.1.0 FIXTURE_SCRIPTS=0 FIXTURE_MANIFEST_HASH=$hash FIXTURE_ARCHS=arm64
 good_version=$FIXTURE_VERSION_JSON; good_status=$FIXTURE_STATUS_JSON
-for condition in stopped-service wrong-commit duplicate-client malformed-version; do
+for condition in stopped-service wrong-commit duplicate-client malformed-version trailing-version; do
   export FIXTURE_VERSION_JSON=$good_version FIXTURE_STATUS_JSON=$good_status
   case $condition in
     stopped-service) export FIXTURE_STATUS_JSON=${good_status/running/stopped};;
     wrong-commit) export FIXTURE_VERSION_JSON=${good_version/5973b9cc626a3e7a499bb316a958237ebe14e2ed/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa};;
     duplicate-client) FIXTURE_VERSION_JSON=$(jq -c '.[0] as $client | . + [$client]' <<<"$good_version"); export FIXTURE_VERSION_JSON;;
     malformed-version) export FIXTURE_VERSION_JSON='{}';;
+    trailing-version) export FIXTURE_VERSION_JSON=${good_version/container-apiserver version 1.1.0 (build: release, commit: 5973b9c)/container-apiserver version 1.1.0 (build: release, commit: 5973b9c) trailing};;
   esac
   "$repo_root/packaging/macos/install.sh" "$fixture/test.pkg" >/dev/null 2>&1 && { echo "$condition accepted" >&2; exit 1; }
   ! grep -q '^sudo:' "$log"

@@ -40,6 +40,11 @@ bridge, strips the three executables, and records their SHA-256 values and the
 full source revision in `build-manifest.json`. It emits only the final package
 path on stdout. The builder requires a signed, frozen Git HEAD and rejects
 tracked or untracked release-input changes before and after the build. The
+frozen set includes the Rust toolchain selector, protobuf sources, approved
+workspace-image reference, and workspace version lock as well as Rust, Swift,
+packaging, helper-build, license, and Cargo inputs. Ignored build caches are
+excluded explicitly; ignored files with release-source extensions are rejected.
+The
 package verifier requires an exact script-free payload, exact identifier,
 version and install root, checksum equality, and exactly one `arm64` slice per
 executable. On macOS 26, `pkgbuild` serializes the protected
@@ -114,7 +119,10 @@ guest root. Structured inspection must also show no network attachment. It
 destroys exact sandboxes, uninstalls with explicit test-data removal, and
 requires the receipt, installed paths, controller/socket root, DNS route, and
 Gas Can-owned Apple container/volume inventories to return to empty. Its
-required final line is `PASS: Gas Can macOS MVP release gate`.
+required final line is `PASS: Gas Can macOS MVP release gate`. INT or TERM
+preserves a nonzero signal status, performs recorded cleanup, and can never
+produce that PASS line; phase failures likewise preserve the original error
+while still retrying cleanup.
 
 Do not claim Gate 5 from `--package-only`, unit tests, a dirty development
 host, or partial output.

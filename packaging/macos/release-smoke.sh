@@ -15,8 +15,7 @@ server_pid=
 server_start=
 
 cleanup() {
-  local original=$? cleanup_status=0 observed_start
-  trap - EXIT INT TERM
+  local cleanup_status=0 observed_start
   if [[ -n $sandbox_id ]]; then
     "$gascan_bin" --sandbox "$sandbox_id" destroy --yes >/dev/null 2>&1 || cleanup_status=1
   fi
@@ -38,16 +37,18 @@ cleanup() {
   if [[ $cleanup_status -ne 0 ]]; then
     printf 'release smoke cleanup left recorded resources\n' >&2
   fi
+  return "$cleanup_status"
+}
+on_exit() {
+  local original=$? cleanup_status=0
+  trap - EXIT INT TERM
+  cleanup || cleanup_status=$?
   if [[ $original -ne 0 ]]; then exit "$original"; fi
   exit "$cleanup_status"
 }
-on_signal() {
-  trap - EXIT INT TERM
-  cleanup
-  exit 130
-}
-trap cleanup EXIT
-trap on_signal INT TERM
+trap on_exit EXIT
+trap 'exit 130' INT TERM
+gascan_release_test_signal
 
 mkdir -p "$root/.gascan"
 cat >"$root/.gascan/setup.sh" <<'SETUP'
@@ -186,6 +187,10 @@ if "$gascan_bin" --sandbox "$sandbox_id" run -- getent hosts example.com; then
 fi
 if "$gascan_bin" --sandbox "$sandbox_id" run -- sudo -n curl --fail --silent --show-error --max-time 3 "$host_url"; then
   printf 'offline guest root reached the test-owned endpoint\n' >&2
+  exit 1
+fi
+if "$gascan_bin" --sandbox "$sandbox_id" run -- sudo -n curl --fail --silent --show-error --max-time 3 http://1.1.1.1; then
+  printf 'offline guest root reached a public IP\n' >&2
   exit 1
 fi
 if "$gascan_bin" --sandbox "$sandbox_id" run -- sudo -n getent hosts example.com; then

@@ -1,5 +1,45 @@
 #!/usr/bin/env bash
 
+gascan_assert_release_inputs_clean() {
+  local repo=$1 label=$2 path ignored_source
+  local -a inputs=(
+    Cargo.toml Cargo.lock rust-toolchain.toml crates helpers proto
+    scripts/build-apple-attach-helper.sh packaging/macos LICENSE
+    images/workspace/approved-image.txt images/workspace/versions.lock
+  )
+  if [[ -n $(git -C "$repo" status --porcelain --untracked-files=all -- "${inputs[@]}") ]]; then
+    printf 'release source inputs are not clean (%s)\n' "$label" >&2
+    return 65
+  fi
+  for path in Cargo.toml Cargo.lock rust-toolchain.toml scripts/build-apple-attach-helper.sh LICENSE \
+    images/workspace/approved-image.txt images/workspace/versions.lock; do
+    git -C "$repo" ls-files --error-unmatch -- "$path" >/dev/null 2>&1 || {
+      printf 'release source input is not tracked (%s): %s\n' "$label" "$path" >&2
+      return 65
+    }
+  done
+  ignored_source=$(
+    git -C "$repo" ls-files --others --ignored --exclude-standard -- \
+      crates helpers proto packaging/macos scripts/build-apple-attach-helper.sh \
+      ':(exclude)helpers/apple-attach/.build/**' |
+      awk '/\.(rs|swift|toml|proto|sh)$/ || /(^|\/)Package\.swift$/ { print; exit }'
+  )
+  if [[ -n $ignored_source ]]; then
+    printf 'ignored release source input exists (%s): %s\n' "$label" "$ignored_source" >&2
+    return 65
+  fi
+}
+
+gascan_release_test_signal() {
+  [[ ${GASCAN_RELEASE_TESTING:-} == YES ]] || return 0
+  case ${GASCAN_RELEASE_TEST_SIGNAL_AFTER_TRAPS:-} in
+    INT) kill -INT "$$";;
+    TERM) kill -TERM "$$";;
+    '') ;;
+    *) printf 'invalid release-test signal\n' >&2; return 64;;
+  esac
+}
+
 gascan_lock_section_json() {
   local lock=$1 section=$2
   awk -v section="[$section]" '
@@ -22,8 +62,8 @@ gascan_exact_apple_prerequisites() {
     all(.[] | select(.appName == "container" or .appName == "container-apiserver");
       .buildType == "release" and .commit == $commit) and
     ([.[] | select(.appName == "container")][0].version == "1.1.0") and
-    ([.[] | select(.appName == "container-apiserver")][0].version |
-      startswith("container-apiserver version 1.1.0 (build: release, commit: 5973b9c)"))
+    ([.[] | select(.appName == "container-apiserver")][0].version ==
+      "container-apiserver version 1.1.0 (build: release, commit: 5973b9c)")
   ' <<<"$version" >/dev/null || return 1
   jq -e --arg commit "$commit" '
     type == "object" and .status == "running" and

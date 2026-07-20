@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "$0")/../.." && pwd -P)
 cd "$repo_root"
+source "$repo_root/packaging/macos/release-common.sh"
 
 if [[ $(uname -s) != Darwin || $(uname -m) != arm64 ]]; then
   printf 'Gas Can macOS packages must be built natively on Apple silicon\n' >&2
@@ -32,8 +33,7 @@ git verify-commit "$revision" >/dev/null 2>&1 || {
   printf 'release source HEAD does not have a trusted Git signature\n' >&2
   exit 65
 }
-release_inputs=(Cargo.toml Cargo.lock crates helpers scripts/build-apple-attach-helper.sh packaging/macos LICENSE)
-if [[ -n $(git status --porcelain --untracked-files=all -- "${release_inputs[@]}") ]]; then
+if ! gascan_assert_release_inputs_clean "$repo_root" "$revision"; then
   printf 'release source inputs are not clean at %s\n' "$revision" >&2
   exit 65
 fi
@@ -105,7 +105,7 @@ pkgbuild "${pkgbuild_args[@]}" "$package" >&2
   printf 'source HEAD changed during package build\n' >&2
   exit 65
 }
-if [[ -n $(git status --porcelain --untracked-files=all -- "${release_inputs[@]}") ]]; then
+if ! gascan_assert_release_inputs_clean "$repo_root" "post-build $revision"; then
   printf 'release source inputs changed during package build\n' >&2
   exit 65
 fi
