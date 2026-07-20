@@ -28,11 +28,12 @@ esac'
 write_fake pkgutil '
 case "$1" in
   --expand) mkdir -p "$3"; : >"$3/Payload"; [[ ${FIXTURE_SCRIPTS:-0} == 0 ]] || mkdir "$3/Scripts"; printf "<pkg-info identifier=\\\"%s\\\" version=\\\"%s\\\" install-location=\\\"/\\\"/>\\n" "${FIXTURE_PACKAGE_ID}" "${FIXTURE_VERSION}" >"$3/PackageInfo";;
-  --payload-files) printf "%s\\n" . ./usr ./usr/local ./usr/local/bin ./usr/local/bin/gascan ./usr/local/bin/gascan-apple-attach ./usr/local/bin/gascand ./usr/local/share ./usr/local/share/gascan ./usr/local/share/gascan/LICENSE ./usr/local/share/gascan/build-manifest.json ./usr/local/share/gascan/default-gascan.toml; [[ ${FIXTURE_EXTRA_PAYLOAD:-0} == 0 ]] || echo ./evil;;
+  --payload-files) printf "%s\\n" . ./._usr ./usr ./usr/._local ./usr/local ./usr/local/._bin ./usr/local/._share ./usr/local/bin ./usr/local/bin/._gascan ./usr/local/bin/._gascan-apple-attach ./usr/local/bin/._gascand ./usr/local/bin/gascan ./usr/local/bin/gascan-apple-attach ./usr/local/bin/gascand ./usr/local/share ./usr/local/share/._gascan ./usr/local/share/gascan ./usr/local/share/gascan/._LICENSE ./usr/local/share/gascan/._build-manifest.json ./usr/local/share/gascan/._default-gascan.toml ./usr/local/share/gascan/LICENSE ./usr/local/share/gascan/build-manifest.json ./usr/local/share/gascan/default-gascan.toml; [[ ${FIXTURE_EXTRA_PAYLOAD:-0} == 0 ]] || echo ./evil;;
   --pkg-info) exit 1;;
   *) exit 64;;
 esac'
 write_fake gzip 'exit 0'
+write_fake xattr 'printf "%s\\n" com.apple.provenance'
 write_fake cpio '
 mkdir -p usr/local/bin usr/local/share/gascan
 : >usr/local/bin/gascan; : >usr/local/bin/gascan-apple-attach; : >usr/local/bin/gascand
