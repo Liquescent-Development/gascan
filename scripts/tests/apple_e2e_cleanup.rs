@@ -75,6 +75,7 @@ fn manifest(temp: &tempfile::TempDir, resources: serde_json::Value) -> PathBuf {
             "project_root": fs::canonicalize(&project).unwrap(),
             "session_root": fs::canonicalize(&session).unwrap(),
             "abort_evidence_path": fs::canonicalize(&runtime).unwrap().join("abort-probe-reached.json"),
+            "outside_sentinel_path": null,
         }))
         .unwrap(),
     )
@@ -340,6 +341,152 @@ fn absent_recorded_children_are_an_idempotent_success() {
     );
     assert!(!path.exists());
     assert!(!session.exists());
+}
+
+#[test]
+fn legacy_owned_outside_sentinel_is_removed_before_session_rmdir() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = "gate4-test-123456789abc";
+    let path = manifest(
+        &temp,
+        serde_json::json!([
+            id,
+            format!("gascan-mise-{id}"),
+            format!("gascan-cache-{id}"),
+            format!("gascan-config-{id}")
+        ]),
+    );
+    let session = temp.path().join("session-test");
+    let sentinel = session.join("synthetic-outside-00112233445566778899aabbccddeeff");
+    fs::write(&sentinel, "synthetic-outside-only").unwrap();
+    install_absent_container(&temp);
+    let calls = temp.path().join("calls");
+
+    let output = run(&temp, &path, &calls);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!sentinel.exists());
+    assert!(!session.exists());
+    assert!(!path.exists());
+}
+
+#[test]
+fn recorded_private_runtime_sentinel_is_identity_checked_and_removed() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = "gate4-test-123456789abc";
+    let path = manifest(
+        &temp,
+        serde_json::json!([
+            id,
+            format!("gascan-mise-{id}"),
+            format!("gascan-cache-{id}"),
+            format!("gascan-config-{id}")
+        ]),
+    );
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let runtime = PathBuf::from(record["runtime_root"].as_str().unwrap());
+    let sentinel = runtime.join("synthetic-outside-00112233445566778899aabbccddeeff");
+    fs::write(&sentinel, "synthetic-outside-only").unwrap();
+    fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o600)).unwrap();
+    record["outside_sentinel_path"] =
+        serde_json::Value::String(sentinel.to_string_lossy().into_owned());
+    fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    install_absent_container(&temp);
+    let calls = temp.path().join("calls");
+
+    let output = run(&temp, &path, &calls);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!sentinel.exists());
+    assert!(!path.exists());
+}
+
+#[test]
+fn recorded_outside_sentinel_path_escape_is_refused_before_inventory() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = "gate4-test-123456789abc";
+    let path = manifest(
+        &temp,
+        serde_json::json!([
+            id,
+            format!("gascan-mise-{id}"),
+            format!("gascan-cache-{id}"),
+            format!("gascan-config-{id}")
+        ]),
+    );
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let escaped = temp
+        .path()
+        .join("synthetic-outside-00112233445566778899aabbccddeeff");
+    fs::write(&escaped, "foreign").unwrap();
+    record["outside_sentinel_path"] =
+        serde_json::Value::String(escaped.to_string_lossy().into_owned());
+    fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    install_absent_container(&temp);
+    let calls = temp.path().join("calls");
+
+    let output = run(&temp, &path, &calls);
+
+    assert!(!output.status.success());
+    assert!(path.exists());
+    assert!(escaped.exists());
+    assert!(!calls.exists());
+}
+
+#[test]
+fn ambiguous_legacy_outside_sentinels_are_refused_without_removal() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = "gate4-test-123456789abc";
+    let path = manifest(
+        &temp,
+        serde_json::json!([
+            id,
+            format!("gascan-mise-{id}"),
+            format!("gascan-cache-{id}"),
+            format!("gascan-config-{id}")
+        ]),
+    );
+    let session = temp.path().join("session-test");
+    for token in [
+        "00112233445566778899aabbccddeeff",
+        "ffeeddccbbaa99887766554433221100",
+    ] {
+        fs::write(
+            session.join(format!("synthetic-outside-{token}")),
+            "synthetic-outside-only",
+        )
+        .unwrap();
+    }
+    install_absent_container(&temp);
+    let calls = temp.path().join("calls");
+
+    let output = run(&temp, &path, &calls);
+
+    assert!(!output.status.success());
+    assert!(path.exists());
+    assert_eq!(
+        fs::read_dir(session)
+            .unwrap()
+            .filter(|entry| entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("synthetic-outside-"))
+            .count(),
+        2
+    );
+    assert!(!calls.exists());
 }
 
 #[test]

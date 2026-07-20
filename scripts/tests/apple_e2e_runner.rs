@@ -181,6 +181,9 @@ fn security_mutation_arms_cleanup_and_bounded_probes_require_discriminating_cont
     let source =
         fs::read_to_string(root.join("crates/gascan-e2e/tests/apple_security.rs")).unwrap();
     let create = source
+        .split("impl<'a> OwnedDnsRoute")
+        .nth(1)
+        .unwrap()
         .split("fn create(")
         .nth(1)
         .unwrap()
@@ -196,6 +199,9 @@ fn security_mutation_arms_cleanup_and_bounded_probes_require_discriminating_cont
         create.find("record_dns_domain").unwrap() < create.find("Command::new(\"sudo\")").unwrap()
     );
     assert!(source.contains("combine_test_and_cleanup(\"test-owned DNS route\""));
+    let compact: String = source.split_whitespace().collect();
+    assert!(compact.contains("env.runtime_root().join(format!(\"synthetic-outside-{}\""));
+    assert!(!source.contains(".parent().ok_or(\"security root has no session parent\")?"));
     let created = source.find("OwnedDnsRoute::create(&env)").unwrap();
     let abort = source
         .find("GASCAN_SECURITY_ABORT_AFTER_DNS_CREATE")

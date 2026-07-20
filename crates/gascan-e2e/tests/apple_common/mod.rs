@@ -127,6 +127,7 @@ impl AppleE2e {
                 "session_root": session_root.canonicalize()?,
                 "dns_domain": null,
                 "abort_evidence_path": runtime_root.join("abort-probe-reached.json"),
+                "outside_sentinel_path": null,
             });
             let temporary = manifest.with_extension("tmp");
             std::fs::write(&temporary, serde_json::to_vec(&record)?)?;
@@ -168,6 +169,48 @@ impl AppleE2e {
     }
 
     pub fn record_dns_domain(&self, domain: Option<&str>) -> TestResult {
+        self.update_cleanup_manifest(
+            "dns_domain",
+            domain.map_or(serde_json::Value::Null, |value| {
+                serde_json::Value::String(value.to_owned())
+            }),
+            "cleanup-manifest.dns.tmp",
+        )
+    }
+
+    pub fn record_outside_sentinel(&self, path: Option<&std::path::Path>) -> TestResult {
+        if let Some(path) = path {
+            let name = path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .ok_or("outside sentinel name is not UTF-8")?;
+            let token = name
+                .strip_prefix("synthetic-outside-")
+                .ok_or("outside sentinel has invalid prefix")?;
+            if path.parent() != Some(self.runtime_root.as_path())
+                || token.len() != 32
+                || !token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err("outside sentinel is not an exact owned runtime child".into());
+            }
+        }
+        self.update_cleanup_manifest(
+            "outside_sentinel_path",
+            path.map_or(serde_json::Value::Null, |value| {
+                serde_json::Value::String(value.to_string_lossy().into_owned())
+            }),
+            "cleanup-manifest.outside.tmp",
+        )
+    }
+
+    fn update_cleanup_manifest(
+        &self,
+        key: &str,
+        value: serde_json::Value,
+        temporary_name: &str,
+    ) -> TestResult {
         let manifest = self
             .cleanup_manifest
             .as_ref()
@@ -180,10 +223,8 @@ impl AppleE2e {
             return Err("refusing unsafe cleanup manifest update".into());
         }
         let mut record: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest)?)?;
-        record["dns_domain"] = domain.map_or(serde_json::Value::Null, |value| {
-            serde_json::Value::String(value.to_owned())
-        });
-        let temporary = self.runtime_root.join("cleanup-manifest.dns.tmp");
+        record[key] = value;
+        let temporary = self.runtime_root.join(temporary_name);
         let mut output = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1402,6 +1443,15 @@ mod tests {
         assert_eq!(marker["kind"], "gascan-security-abort-reached");
         assert_eq!(marker["sandbox_id"], env.id());
         assert_eq!(marker["owner_token"], env.owner_token);
+        let outside = env
+            .runtime_root
+            .join("synthetic-outside-00112233445566778899aabbccddeeff");
+        env.record_outside_sentinel(Some(&outside))?;
+        let record: Value = serde_json::from_slice(&std::fs::read(&cleanup_manifest)?)?;
+        assert_eq!(record["outside_sentinel_path"].as_str(), outside.to_str());
+        env.record_outside_sentinel(None)?;
+        let record: Value = serde_json::from_slice(&std::fs::read(&cleanup_manifest)?)?;
+        assert!(record["outside_sentinel_path"].is_null());
         Ok(())
     }
 

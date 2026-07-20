@@ -8,7 +8,7 @@ use std::{
     fs,
     io::{Read as _, Write as _},
     net::{Ipv4Addr, TcpListener, TcpStream},
-    os::unix::fs::{MetadataExt as _, PermissionsExt as _},
+    os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::{
@@ -34,11 +34,59 @@ struct LoopbackServer {
     thread: Option<thread::JoinHandle<()>>,
 }
 
-struct CleanupFile(PathBuf);
+struct OwnedOutsideSentinel<'a> {
+    path: PathBuf,
+    env: &'a AppleE2e,
+    pending: bool,
+}
 
-impl Drop for CleanupFile {
+impl<'a> OwnedOutsideSentinel<'a> {
+    fn create(env: &'a AppleE2e) -> TestResult<Self> {
+        let path = env
+            .runtime_root()
+            .join(format!("synthetic-outside-{}", owner_token()?));
+        env.record_outside_sentinel(Some(&path))?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        file.write_all(b"synthetic-outside-only")?;
+        file.sync_all()?;
+        drop(file);
+        fs::File::open(env.runtime_root())?.sync_all()?;
+        Ok(Self {
+            path,
+            env,
+            pending: true,
+        })
+    }
+
+    fn cleanup(&mut self) -> TestResult {
+        if !self.pending {
+            return Ok(());
+        }
+        let metadata = fs::symlink_metadata(&self.path)?;
+        if !metadata.file_type().is_file()
+            || metadata.mode() & 0o777 != 0o600
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+        {
+            return Err("refusing unsafe outside sentinel cleanup".into());
+        }
+        fs::remove_file(&self.path)?;
+        if self.path.exists() || self.path.is_symlink() {
+            return Err("outside sentinel cleanup did not prove absence".into());
+        }
+        fs::File::open(self.env.runtime_root())?.sync_all()?;
+        self.env.record_outside_sentinel(None)?;
+        self.pending = false;
+        Ok(())
+    }
+}
+
+impl Drop for OwnedOutsideSentinel<'_> {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        let _ = self.cleanup();
     }
 }
 
@@ -202,12 +250,7 @@ fn real_macos_security_acceptance() -> TestResult {
     let env = AppleE2e::new("gate4-security")?;
     install_security_fixture(&env)?;
     let root = Path::new(env.root());
-    let outside = root
-        .parent()
-        .ok_or("security root has no session parent")?
-        .join(format!("synthetic-outside-{}", owner_token()?));
-    fs::write(&outside, "synthetic-outside-only")?;
-    let outside_cleanup = CleanupFile(outside.clone());
+    let mut outside = OwnedOutsideSentinel::create(&env)?;
 
     write_manifest(root, "offline", "root", None, false, false)?;
     let root_request = env.invoke(["up", root.to_str().ok_or("non-UTF-8 root")?, "--json"])?;
@@ -224,7 +267,7 @@ fn real_macos_security_acceptance() -> TestResult {
             "--",
             "bash",
             "/workspace/.gascan/security/host-boundary.sh",
-            outside.to_str().ok_or("non-UTF-8 sentinel path")?,
+            outside.path.to_str().ok_or("non-UTF-8 sentinel path")?,
             &std::env::var("USER")?,
         ],
         "GASCAN_SECURITY_SENTINEL",
@@ -340,7 +383,7 @@ fn real_macos_security_acceptance() -> TestResult {
     let process = env.invoke(["up", root.to_str().ok_or("non-UTF-8 root")?, "--json"])?;
     require_failure_code("process request", &process, "invalid_request")?;
     env.assert_no_owned_resources()?;
-    drop(outside_cleanup);
+    outside.cleanup()?;
     Ok(())
 }
 

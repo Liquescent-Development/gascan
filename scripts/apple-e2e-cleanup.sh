@@ -36,6 +36,26 @@ recorded_child_directory() {
   fi
   printf '%s\n' "$child"
 }
+remove_outside_sentinel() {
+  sentinel=$1
+  parent=$2
+  require_private_mode=$3
+  base=$(basename "$sentinel")
+  test "$sentinel" = "$parent/$base" || { printf 'refusing outside sentinel path escape\n' >&2; return 1; }
+  printf '%s' "$base" | jq -R -e 'test("^synthetic-outside-[0-9a-f]{32}$")' >/dev/null || { printf 'refusing invalid outside sentinel identity\n' >&2; return 1; }
+  if test -e "$sentinel" || test -L "$sentinel"; then
+    test -f "$sentinel" && test ! -L "$sentinel" || { printf 'refusing unsafe outside sentinel\n' >&2; return 1; }
+    if metadata=$(stat -f '%Lp %u' "$sentinel" 2>/dev/null); then :; else metadata=$(stat -c '%a %u' "$sentinel"); fi
+    owner=${metadata#* }
+    mode=${metadata% *}
+    test "$owner" = "$(id -u)" || { printf 'refusing foreign outside sentinel\n' >&2; return 1; }
+    if test "$require_private_mode" = true; then
+      test "$mode" = 600 || { printf 'refusing nonprivate outside sentinel\n' >&2; return 1; }
+    fi
+    rm -f -- "$sentinel"
+    test ! -e "$sentinel" && test ! -L "$sentinel" || { printf 'outside sentinel removal failed\n' >&2; return 1; }
+  fi
+}
 
 trusted_cli=$(canonical_existing "$trusted_cli") || { printf 'refusing untrusted cleanup CLI\n' >&2; exit 65; }
 trusted_root=$(canonical_existing "$trusted_root") || { printf 'refusing untrusted cleanup root\n' >&2; exit 65; }
@@ -66,6 +86,18 @@ case $(basename "$project_root") in gascan-gate4-root-*) ;; *) printf 'refusing 
 runtime_root=$(recorded_child_directory "$runtime_root" "$session_root" runtime) || exit 65
 project_root=$(recorded_child_directory "$project_root" "$session_root" project) || exit 65
 test "$instance" = "$runtime_root/daemon-instance.json" || { printf 'refusing instance record path escape\n' >&2; exit 65; }
+case $id in
+  *-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+  *) printf 'refusing invalid sandbox id in %s\n' "$manifest" >&2; exit 65 ;;
+esac
+expected=$(printf '%s\n%s\n%s\n%s\n' "$id" "gascan-mise-$id" "gascan-cache-$id" "gascan-config-$id")
+actual=$(jq -er '.resources[]' "$manifest")
+test "$actual" = "$expected" || { printf 'refusing out-of-scope cleanup manifest\n' >&2; exit 65; }
+jq -e '.dns_domain == null or (.dns_domain | type == "string")' "$manifest" >/dev/null || { printf 'refusing invalid DNS cleanup record\n' >&2; exit 65; }
+dns_domain=$(jq -r '.dns_domain // ""' "$manifest")
+if test -n "$dns_domain"; then
+  printf '%s' "$dns_domain" | jq -R -e 'test("^gascan-[0-9a-f]{32}\\.test$")' >/dev/null || { printf 'refusing foreign DNS cleanup identity\n' >&2; exit 65; }
+fi
 abort_evidence=$(jq -r '.abort_evidence_path // ""' "$manifest")
 expected_abort_evidence="$runtime_root/abort-probe-reached.json"
 if test -n "$abort_evidence" && test "$abort_evidence" != "$expected_abort_evidence"; then
@@ -85,19 +117,24 @@ if test -e "$abort_evidence" || test -L "$abort_evidence"; then
   ' "$abort_evidence" >/dev/null || { printf 'refusing mismatched abort evidence\n' >&2; exit 65; }
   abort_reached=true
 fi
-case $id in
-  *-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
-  *) printf 'refusing invalid sandbox id in %s\n' "$manifest" >&2; exit 65 ;;
-esac
+outside_sentinel=$(jq -r '.outside_sentinel_path // ""' "$manifest")
+legacy_sentinel=
+legacy_count=0
+for candidate in "$session_root"/synthetic-outside-*; do
+  if test -e "$candidate" || test -L "$candidate"; then
+    legacy_count=$((legacy_count + 1))
+    legacy_sentinel=$candidate
+  fi
+done
+test "$legacy_count" -le 1 || { printf 'refusing ambiguous legacy outside sentinel cleanup\n' >&2; exit 65; }
+if test -n "$outside_sentinel"; then
+  test "$legacy_count" -eq 0 || { printf 'refusing mixed outside sentinel cleanup records\n' >&2; exit 65; }
+  remove_outside_sentinel "$outside_sentinel" "$runtime_root" true || exit 65
+elif test -n "$legacy_sentinel"; then
+  remove_outside_sentinel "$legacy_sentinel" "$session_root" false || exit 65
+fi
 
-expected=$(printf '%s\n%s\n%s\n%s\n' "$id" "gascan-mise-$id" "gascan-cache-$id" "gascan-config-$id")
-actual=$(jq -er '.resources[]' "$manifest")
-test "$actual" = "$expected" || { printf 'refusing out-of-scope cleanup manifest\n' >&2; exit 65; }
-
-jq -e '.dns_domain == null or (.dns_domain | type == "string")' "$manifest" >/dev/null || { printf 'refusing invalid DNS cleanup record\n' >&2; exit 65; }
-dns_domain=$(jq -r '.dns_domain // ""' "$manifest")
 if test -n "$dns_domain"; then
-  printf '%s' "$dns_domain" | jq -R -e 'test("^gascan-[0-9a-f]{32}\\.test$")' >/dev/null || { printf 'refusing foreign DNS cleanup identity\n' >&2; exit 65; }
   dns_inventory=$(container system dns list --format json) || { printf 'unable to inventory DNS routes; retaining cleanup manifest\n' >&2; exit 1; }
   printf '%s' "$dns_inventory" | jq -e 'type == "array" and all(.[]; type == "string")' >/dev/null || { printf 'invalid DNS route inventory; retaining cleanup manifest\n' >&2; exit 1; }
   dns_count=$(printf '%s' "$dns_inventory" | jq -r --arg domain "$dns_domain" '[.[] | select(. == $domain)] | length')
