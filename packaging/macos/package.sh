@@ -8,7 +8,7 @@ if [[ $(uname -s) != Darwin || $(uname -m) != arm64 ]]; then
   printf 'Gas Can macOS packages must be built natively on Apple silicon\n' >&2
   exit 69
 fi
-for command in cargo file jq pkgbuild shasum strip swift xcrun; do
+for command in cargo jq lipo pkgbuild shasum strip swift xattr xcrun; do
   command -v "$command" >/dev/null || {
     printf 'required packaging command is unavailable: %s\n' "$command" >&2
     exit 69
@@ -28,6 +28,15 @@ revision=$(git rev-parse --verify HEAD)
   printf 'source revision is not a full Git object ID\n' >&2
   exit 1
 }
+git verify-commit "$revision" >/dev/null 2>&1 || {
+  printf 'release source HEAD does not have a trusted Git signature\n' >&2
+  exit 65
+}
+release_inputs=(Cargo.toml Cargo.lock crates helpers scripts/build-apple-attach-helper.sh packaging/macos LICENSE)
+if [[ -n $(git status --porcelain --untracked-files=all -- "${release_inputs[@]}") ]]; then
+  printf 'release source inputs are not clean at %s\n' "$revision" >&2
+  exit 65
+fi
 
 artifact_root=${GASCAN_RELEASE_ARTIFACT_DIR:-$repo_root/.artifacts/release}
 mkdir -p "$artifact_root"
@@ -44,7 +53,7 @@ for binary in gascan gascand gascan-apple-attach; do
   if [[ $binary == gascan-apple-attach ]]; then
     source_path="$repo_root/target/gascan-apple-attach"
   fi
-  file "$source_path" | grep -Eq 'Mach-O 64-bit executable arm64|Mach-O universal binary.*arm64' || {
+  [[ $(lipo -archs "$source_path") == arm64 ]] || {
     printf 'release binary is not native arm64 Mach-O: %s\n' "$source_path" >&2
     exit 1
   }
@@ -80,6 +89,7 @@ jq -nS \
 chmod 0644 "$root/usr/local/share/gascan/build-manifest.json"
 
 package="$artifact_root/gascan-$version-macos-arm64.pkg"
+xattr -cr "$root"
 pkgbuild_args=(
   --root "$root"
   --identifier dev.gascan.pkg
@@ -90,7 +100,17 @@ pkgbuild_args=(
 if [[ -n ${GASCAN_INSTALLER_SIGNING_IDENTITY:-} ]]; then
   pkgbuild_args+=(--sign "$GASCAN_INSTALLER_SIGNING_IDENTITY")
 fi
-pkgbuild "${pkgbuild_args[@]}" "$package" >&2
+COPYFILE_DISABLE=1 pkgbuild "${pkgbuild_args[@]}" "$package" >&2
+
+[[ $(git rev-parse --verify HEAD) == "$revision" ]] || {
+  printf 'source HEAD changed during package build\n' >&2
+  exit 65
+}
+if [[ -n $(git status --porcelain --untracked-files=all -- "${release_inputs[@]}") ]]; then
+  printf 'release source inputs changed during package build\n' >&2
+  exit 65
+fi
+"$repo_root/packaging/macos/verify-package.sh" "$package" "$revision" "$version"
 
 if [[ -n ${GASCAN_NOTARYTOOL_PROFILE:-} ]]; then
   xcrun notarytool submit "$package" \

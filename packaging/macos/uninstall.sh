@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+repo_root=$(cd "$(dirname "$0")/../.." && pwd -P)
+source "$repo_root/packaging/macos/release-common.sh"
+
 remove_data=false
 case ${1:-} in
   '') ;;
@@ -9,36 +12,6 @@ case ${1:-} in
 esac
 [[ $# -le 1 ]] || { printf 'usage: %s [--remove-data]\n' "$0" >&2; exit 64; }
 
-stop_owned_daemon() {
-  command -v gascan >/dev/null || return 0
-  local attestation pid executable
-  if ! attestation=$(gascan daemon-attest 2>/dev/null); then
-    return 0
-  fi
-  pid=$(jq -er '.pid | select(type == "number" and . > 1 and . < 4294967296)' <<<"$attestation") || {
-    printf 'refusing to stop daemon with invalid attestation pid\n' >&2
-    return 1
-  }
-  executable=$(jq -er '.executable | select(type == "string")' <<<"$attestation") || {
-    printf 'refusing to stop daemon with invalid executable attestation\n' >&2
-    return 1
-  }
-  [[ $executable == /usr/local/bin/gascand ]] || {
-    printf 'refusing to stop unexpected daemon executable: %s\n' "$executable" >&2
-    return 1
-  }
-  kill -TERM "$pid"
-  for _ in {1..100}; do
-    kill -0 "$pid" 2>/dev/null || break
-    sleep 0.05
-  done
-  if kill -0 "$pid" 2>/dev/null; then
-    printf 'installed Gas Can daemon did not stop promptly\n' >&2
-    return 1
-  fi
-  wait "$pid" 2>/dev/null || true
-}
-
 if [[ $remove_data == false ]]; then
   printf 'Preserving all sandboxes, volumes, caches, and user state.\n'
 else
@@ -46,14 +19,39 @@ else
     printf 'gascan is required to remove owned data safely\n' >&2
     exit 69
   }
-  sandbox_ids=$(gascan list --json | jq -er '[.[]?.sandbox_id] | .[]')
+  sandbox_json=$(gascan list --json)
+  jq -e '
+    type == "array" and
+    all(.[]; type == "object" and (.sandbox_id | type == "string" and length > 0)) and
+    ([.[].sandbox_id] | length == (unique | length))
+  ' <<<"$sandbox_json" >/dev/null || {
+    printf 'sandbox inventory is malformed or ambiguous\n' >&2
+    exit 65
+  }
+  sandbox_ids=$(jq -r '.[].sandbox_id' <<<"$sandbox_json")
   while IFS= read -r sandbox_id; do
     [[ -n $sandbox_id ]] || continue
     gascan --sandbox "$sandbox_id" destroy --yes
   done <<<"$sandbox_ids"
 fi
 
-stop_owned_daemon
+gascan_stop_attested_daemon gascan /usr/local/bin/gascand
+if [[ $remove_data == true ]]; then
+  runtime_root=${XDG_RUNTIME_DIR:-/tmp/gascan-$(id -u)}/gascan
+  if [[ -e $runtime_root || -L $runtime_root ]]; then
+    [[ -d $runtime_root && ! -L $runtime_root ]] || {
+      printf 'refusing unsafe controller-state path: %s\n' "$runtime_root" >&2
+      exit 65
+    }
+    owner=$(stat -f '%u' "$runtime_root")
+    mode=$(stat -f '%Lp' "$runtime_root")
+    [[ $owner == "$(id -u)" && $mode == 700 ]] || {
+      printf 'refusing controller-state directory with unsafe ownership or mode\n' >&2
+      exit 65
+    }
+    rm -rf "$runtime_root"
+  fi
+fi
 sudo rm -f \
   /usr/local/bin/gascan \
   /usr/local/bin/gascand \

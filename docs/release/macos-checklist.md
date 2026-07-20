@@ -38,7 +38,12 @@ From a signed source revision on an Apple-silicon Mac:
 The package builder uses `cargo build --locked`, builds the native Swift attach
 bridge, strips the three executables, and records their SHA-256 values and the
 full source revision in `build-manifest.json`. It emits only the final package
-path on stdout.
+path on stdout. The builder requires a signed, frozen Git HEAD and rejects
+tracked or untracked release-input changes before and after the build. The
+package verifier requires an exact script-free payload, exact identifier,
+version and install root, checksum equality, and exactly one `arm64` slice per
+executable. The clean-host gate requires the embedded revision to equal that
+signed HEAD.
 
 Release credentials are optional inputs and are never stored in the repository
 or package:
@@ -52,13 +57,17 @@ or package:
 
 CI must inject those values from its secret store. Do not pass private keys,
 passwords, API keys, or notarization credentials as command-line values.
+An artifact built without these inputs is an unsigned development artifact and
+is not signing, notarization, or distribution evidence.
 
 ## Install and verify
 
 Install Apple `container` 1.1.0, start its service, then run:
 
 ```sh
-./packaging/macos/install.sh .artifacts/release/gascan-0.1.0-macos-arm64.pkg
+GASCAN_EXPECTED_SOURCE_REVISION=<signed-release-commit> \
+GASCAN_EXPECTED_VERSION=0.1.0 \
+  ./packaging/macos/install.sh .artifacts/release/gascan-0.1.0-macos-arm64.pkg
 gascan doctor --json | jq
 ```
 
@@ -92,12 +101,18 @@ sudo -v
 GASCAN_RELEASE_CLEAN_HOST_CONFIRM=YES ./tests/release/clean-host.sh
 ```
 
-The gate builds and inspects the package, installs it, requires `doctor` to
+Before mutation, the gate rejects an existing receipt, installed path,
+controller/socket root, Gas Can-owned Apple resource, or test DNS route. It
+builds and inspects the package, installs it, requires `doctor` to
 pass, checks every pinned language and both Gascamp sources, confirms setup
-apply semantics, restarts the workspace and on-demand daemon, proves offline
-DNS/public-IP denial, destroys its exact sandboxes, uninstalls, and requires
-empty test-owned Apple container/volume inventories. Its required final line
-is `PASS: Gas Can macOS MVP release gate`.
+apply semantics, restarts the workspace and identity-bound on-demand daemon,
+then proves an owned endpoint works in networked mode and that the same
+endpoint, public DNS, and literal IP fail in offline mode as workspace and
+guest root. Structured inspection must also show no network attachment. It
+destroys exact sandboxes, uninstalls with explicit test-data removal, and
+requires the receipt, installed paths, controller/socket root, DNS route, and
+Gas Can-owned Apple container/volume inventories to return to empty. Its
+required final line is `PASS: Gas Can macOS MVP release gate`.
 
 Do not claim Gate 5 from `--package-only`, unit tests, a dirty development
 host, or partial output.
@@ -118,5 +133,6 @@ and controller-state file.
 
 The explicit flag first asks the installed CLI for its owned sandbox IDs and
 destroys each through the authenticated daemon API before removing package
-files. It never selects resources by a broad substring and never removes
-foreign Apple resources.
+files and its private controller/socket directory. Zero sandboxes is valid;
+malformed or duplicate controller inventory fails closed. It never selects
+resources by a broad substring and never removes foreign Apple resources.

@@ -10,7 +10,9 @@ the current package with:
 
 ```sh
 package=$(./packaging/macos/package.sh)
-./packaging/macos/install.sh "$package"
+GASCAN_EXPECTED_SOURCE_REVISION=$(git rev-parse HEAD) \
+GASCAN_EXPECTED_VERSION=0.1.0 \
+  ./packaging/macos/install.sh "$package"
 gascan doctor --json | jq
 ```
 

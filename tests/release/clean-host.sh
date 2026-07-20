@@ -2,6 +2,7 @@
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "$0")/../.." && pwd -P)
+source "$repo_root/packaging/macos/release-common.sh"
 mode=${1:-live}
 
 case "$mode" in
@@ -12,28 +13,26 @@ case "$mode" in
     ;;
 esac
 
+expected_revision=$(git -C "$repo_root" rev-parse --verify HEAD)
+expected_version=$(cargo metadata --locked --no-deps --format-version 1 --manifest-path "$repo_root/Cargo.toml" | jq -er '.packages[] | select(.name == "gascan") | .version')
 package=$("$repo_root/packaging/macos/package.sh")
 test -f "$package"
+"$repo_root/packaging/macos/verify-package.sh" "$package" "$expected_revision" "$expected_version"
 
-payload=$(pkgutil --payload-files "$package")
-grep -qx './usr/local/bin/gascan' <<<"$payload"
-grep -qx './usr/local/bin/gascand' <<<"$payload"
-grep -qx './usr/local/bin/gascan-apple-attach' <<<"$payload"
-grep -qx './usr/local/share/gascan/LICENSE' <<<"$payload"
-grep -qx './usr/local/share/gascan/default-gascan.toml' <<<"$payload"
-grep -qx './usr/local/share/gascan/build-manifest.json' <<<"$payload"
-if grep -Eq '/(container|container-apiserver)$' <<<"$payload"; then
-  printf 'package must not contain the Apple container runtime\n' >&2
-  exit 1
-fi
+manifest=$(mktemp -d "${TMPDIR:-/tmp}/gascan-release-ledger.XXXXXX")
+live_started=false
+runtime_root=${XDG_RUNTIME_DIR:-/tmp/gascan-$(id -u)}/gascan
 
-manifest=$(mktemp -d "${TMPDIR:-/tmp}/gascan-release-manifest.XXXXXX")
-installed=false
 cleanup() {
-  if [[ $installed == true ]]; then
-    "$repo_root/packaging/macos/uninstall.sh" >/dev/null 2>&1 || true
+  local original=$? cleanup_status=0
+  trap - EXIT INT TERM
+  if [[ $live_started == true ]]; then
+    "$repo_root/packaging/macos/uninstall.sh" --remove-data >/dev/null 2>&1 || cleanup_status=1
+    gascan_audit_clean_host cleanup "$runtime_root" / || cleanup_status=1
   fi
   rm -rf "$manifest"
+  if [[ $original -ne 0 ]]; then exit "$original"; fi
+  exit "$cleanup_status"
 }
 on_signal() {
   trap - EXIT INT TERM
@@ -42,21 +41,6 @@ on_signal() {
 }
 trap cleanup EXIT
 trap on_signal INT TERM
-pkgutil --expand "$package" "$manifest/pkg"
-payload_root="$manifest/payload"
-mkdir -p "$payload_root"
-(cd "$payload_root" && gzip -dc "$manifest/pkg/Payload" | cpio -idm --quiet)
-jq -e '
-  .schema == 1 and
-  .architecture == "arm64" and
-  (.source_revision | test("^[0-9a-f]{40}$")) and
-  (.files | length == 3) and
-  ([.files[].path] | sort == ["usr/local/bin/gascan", "usr/local/bin/gascan-apple-attach", "usr/local/bin/gascand"])
-' "$payload_root/usr/local/share/gascan/build-manifest.json" >/dev/null
-while IFS=$'\t' read -r relative expected; do
-  actual=$(shasum -a 256 "$payload_root/$relative" | awk '{print $1}')
-  test "$actual" = "$expected"
-done < <(jq -r '.files[] | [.path, .sha256] | @tsv' "$payload_root/usr/local/share/gascan/build-manifest.json")
 
 if [[ $mode == --package-only ]]; then
   printf 'PASS: Gas Can macOS package contract\n'
@@ -68,8 +52,12 @@ if [[ ${GASCAN_RELEASE_CLEAN_HOST_CONFIRM:-} != YES ]]; then
   exit 64
 fi
 
-"$repo_root/packaging/macos/install.sh" "$package"
-installed=true
+gascan_exact_apple_prerequisites
+gascan_audit_clean_host baseline "$runtime_root" /
+live_started=true
+
+GASCAN_EXPECTED_SOURCE_REVISION=$expected_revision GASCAN_EXPECTED_VERSION=$expected_version \
+  "$repo_root/packaging/macos/install.sh" "$package"
 
 status=0
 /usr/local/bin/gascan doctor --json |
@@ -77,25 +65,14 @@ status=0
 if [[ $status -eq 0 ]]; then
   "$repo_root/packaging/macos/release-smoke.sh" || status=$?
 fi
-if "$repo_root/packaging/macos/uninstall.sh"; then
-  installed=false
+if "$repo_root/packaging/macos/uninstall.sh" --remove-data; then
+  :
 else
   status=$?
 fi
 
-for binary in gascan gascand gascan-apple-attach; do
-  test ! -e "/usr/local/bin/$binary"
-done
-if container list --all --format json | jq -e \
-  '.[] | select(.configuration.id | startswith("gate5-release-"))' >/dev/null; then
-  printf 'release gate left a test-owned Apple container behind\n' >&2
-  status=1
-fi
-if container volume list --format json | jq -e \
-  '.[] | select(.configuration.name | contains("gate5-release-"))' >/dev/null; then
-  printf 'release gate left a test-owned Apple volume behind\n' >&2
-  status=1
-fi
+gascan_audit_clean_host final "$runtime_root" / || status=1
+live_started=false
 
 if [[ $status -ne 0 ]]; then
   printf 'FAIL: Gas Can macOS MVP release gate (status %s)\n' "$status" >&2
