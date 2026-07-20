@@ -131,20 +131,21 @@ fn startup_transient(error: &ClientError) -> bool {
 }
 
 fn socket_path() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| default_runtime_base(rustix::process::geteuid().as_raw()))
-        .join("gascan/gascand.sock")
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return PathBuf::from(runtime).join("gascan/gascand.sock");
+    }
+    let uid = rustix::process::geteuid().as_raw();
+    default_runtime_base().join(format!("gascan-{uid}/gascand.sock"))
 }
 
 #[cfg(target_os = "macos")]
-fn default_runtime_base(uid: u32) -> PathBuf {
-    PathBuf::from(format!("/private/tmp/gascan-{uid}"))
+fn default_runtime_base() -> PathBuf {
+    PathBuf::from("/private/tmp")
 }
 
 #[cfg(not(target_os = "macos"))]
-fn default_runtime_base(uid: u32) -> PathBuf {
-    PathBuf::from(format!("/tmp/gascan-{uid}"))
+fn default_runtime_base() -> PathBuf {
+    PathBuf::from("/tmp")
 }
 
 fn daemon_path() -> Result<PathBuf, ClientError> {
@@ -204,8 +205,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn default_runtime_base_avoids_the_tmp_symlink() {
         assert_eq!(
-            super::default_runtime_base(501),
-            std::path::PathBuf::from("/private/tmp/gascan-501")
+            super::default_runtime_base(),
+            std::path::PathBuf::from("/private/tmp")
         );
     }
 }

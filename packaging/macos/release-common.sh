@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 gascan_user_runtime_root() {
-  printf '/private/tmp/gascan-%s/gascan\n' "$(id -u)"
+  printf '/private/tmp/gascan-%s\n' "$(id -u)"
 }
 
 gascan_assert_release_inputs_clean() {

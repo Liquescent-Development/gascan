@@ -24,6 +24,11 @@ chmod 0755 "$fixture/bin/pkgutil" "$fixture/bin/container"
 export PATH="$fixture/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 source "$repo_root/packaging/macos/release-common.sh"
 
+[[ $(gascan_user_runtime_root) == "/private/tmp/gascan-$(id -u)" ]] || {
+  printf 'default macOS runtime root is not a single canonical private directory\n' >&2
+  exit 1
+}
+
 assert_dirty() {
   if gascan_audit_clean_host fixture "$fixture/runtime" "$fixture/root" >/dev/null 2>&1; then
     printf 'dirty-host fixture passed: %s\n' "$1" >&2

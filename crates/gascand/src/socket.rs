@@ -31,10 +31,11 @@ impl SocketPaths {
         uid: u32,
         runtime: Option<&OsStr>,
     ) -> io::Result<Self> {
-        let root = runtime
-            .map(PathBuf::from)
-            .unwrap_or_else(|| default_runtime_base(uid));
-        Ok(Self::from_runtime_root(root.join("gascan")))
+        let directory = runtime.map_or_else(
+            || default_runtime_base().join(format!("gascan-{uid}")),
+            |root| PathBuf::from(root).join("gascan"),
+        );
+        Ok(Self::from_runtime_root(directory))
     }
     #[must_use]
     pub fn from_runtime_root(directory: PathBuf) -> Self {
@@ -87,13 +88,13 @@ impl SocketPaths {
 }
 
 #[cfg(target_os = "macos")]
-fn default_runtime_base(uid: u32) -> PathBuf {
-    PathBuf::from(format!("/private/tmp/gascan-{uid}"))
+fn default_runtime_base() -> PathBuf {
+    PathBuf::from("/private/tmp")
 }
 
 #[cfg(not(target_os = "macos"))]
-fn default_runtime_base(uid: u32) -> PathBuf {
-    PathBuf::from(format!("/tmp/gascan-{uid}"))
+fn default_runtime_base() -> PathBuf {
+    PathBuf::from("/tmp")
 }
 
 struct StagingGuard<'a> {
