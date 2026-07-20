@@ -19,14 +19,25 @@ attribute() { xmllint --xpath "string(/pkg-info/@$1)" "$package_info"; }
 
 cat >"$work/expected-payload" <<'EOF_PAYLOAD'
 .
+./._usr
 ./usr
+./usr/._local
 ./usr/local
+./usr/local/._bin
+./usr/local/._share
 ./usr/local/bin
+./usr/local/bin/._gascan
+./usr/local/bin/._gascan-apple-attach
+./usr/local/bin/._gascand
 ./usr/local/bin/gascan
 ./usr/local/bin/gascan-apple-attach
 ./usr/local/bin/gascand
 ./usr/local/share
+./usr/local/share/._gascan
 ./usr/local/share/gascan
+./usr/local/share/gascan/._LICENSE
+./usr/local/share/gascan/._build-manifest.json
+./usr/local/share/gascan/._default-gascan.toml
 ./usr/local/share/gascan/LICENSE
 ./usr/local/share/gascan/build-manifest.json
 ./usr/local/share/gascan/default-gascan.toml
@@ -41,6 +52,28 @@ cmp -s "$work/actual-payload" "$work/expected-payload" || {
 
 mkdir "$work/root"
 (cd "$work/root" && gzip -dc "$work/pkg/Payload" | cpio -idm --quiet)
+# macOS 26's pkgbuild serializes its protected com.apple.provenance xattr as
+# paired AppleDouble payload records. They are not installed as `._*` files.
+# Require that exact representation and reject every other xattr.
+while IFS= read -r path; do
+  [[ $(xattr "$work/root/$path") == com.apple.provenance ]] || {
+    printf 'payload xattr set is not the canonical macOS provenance record: %s\n' "$path" >&2
+    exit 65
+  }
+done <<'EOF_XATTR_PATHS'
+.
+usr
+usr/local
+usr/local/bin
+usr/local/bin/gascan
+usr/local/bin/gascan-apple-attach
+usr/local/bin/gascand
+usr/local/share
+usr/local/share/gascan
+usr/local/share/gascan/LICENSE
+usr/local/share/gascan/build-manifest.json
+usr/local/share/gascan/default-gascan.toml
+EOF_XATTR_PATHS
 manifest=$work/root/usr/local/share/gascan/build-manifest.json
 jq -e --arg revision "$expected_revision" --arg version "$expected_version" '
   . == {

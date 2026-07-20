@@ -8,7 +8,7 @@ if [[ $(uname -s) != Darwin || $(uname -m) != arm64 ]]; then
   printf 'Gas Can macOS packages must be built natively on Apple silicon\n' >&2
   exit 69
 fi
-for command in cargo jq lipo pkgbuild shasum strip swift xattr xcrun; do
+for command in cargo jq lipo pkgbuild shasum strip swift xcrun; do
   command -v "$command" >/dev/null || {
     printf 'required packaging command is unavailable: %s\n' "$command" >&2
     exit 69
@@ -89,7 +89,6 @@ jq -nS \
 chmod 0644 "$root/usr/local/share/gascan/build-manifest.json"
 
 package="$artifact_root/gascan-$version-macos-arm64.pkg"
-xattr -cr "$root"
 pkgbuild_args=(
   --root "$root"
   --identifier dev.gascan.pkg
@@ -100,7 +99,7 @@ pkgbuild_args=(
 if [[ -n ${GASCAN_INSTALLER_SIGNING_IDENTITY:-} ]]; then
   pkgbuild_args+=(--sign "$GASCAN_INSTALLER_SIGNING_IDENTITY")
 fi
-COPYFILE_DISABLE=1 pkgbuild "${pkgbuild_args[@]}" "$package" >&2
+pkgbuild "${pkgbuild_args[@]}" "$package" >&2
 
 [[ $(git rev-parse --verify HEAD) == "$revision" ]] || {
   printf 'source HEAD changed during package build\n' >&2

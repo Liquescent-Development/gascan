@@ -42,8 +42,10 @@ path on stdout. The builder requires a signed, frozen Git HEAD and rejects
 tracked or untracked release-input changes before and after the build. The
 package verifier requires an exact script-free payload, exact identifier,
 version and install root, checksum equality, and exactly one `arm64` slice per
-executable. The clean-host gate requires the embedded revision to equal that
-signed HEAD.
+executable. On macOS 26, `pkgbuild` serializes the protected
+`com.apple.provenance` xattr as paired AppleDouble records; the verifier allows
+only that exact pairing and rejects any other payload path or extracted xattr.
+The clean-host gate requires the embedded revision to equal that signed HEAD.
 
 Release credentials are optional inputs and are never stored in the repository
 or package:
