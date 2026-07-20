@@ -55,6 +55,16 @@ gascan_lock_section_json() {
   '
 }
 
+gascan_assert_destroyed_controller_record() {
+  local inventory=$1 expected_id=$2
+  [[ -n $expected_id ]] || return 1
+  jq -e --arg id "$expected_id" '
+    type == "array" and
+    ([.[] | select(type == "object" and .sandbox_id == $id)] |
+      length == 1 and .[0].actual_state == "absent")
+  ' <<<"$inventory" >/dev/null
+}
+
 gascan_exact_apple_prerequisites() {
   local version status commit=5973b9cc626a3e7a499bb316a958237ebe14e2ed
   version=$(container system version --format json) || return 1

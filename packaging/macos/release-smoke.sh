@@ -10,6 +10,7 @@ gascan_bin=${GASCAN_RELEASE_GASCAN:-/usr/local/bin/gascan}
 root=$(mktemp -d "${TMPDIR:-/tmp}/gascan-release-root.XXXXXX")
 name="gate5-release-$PPID-$$"
 sandbox_id=
+destroyed_sandbox_id=
 dns_domain=
 server_pid=
 server_start=
@@ -197,7 +198,8 @@ if "$gascan_bin" --sandbox "$sandbox_id" run -- sudo -n getent hosts example.com
   printf 'offline guest root resolved public DNS\n' >&2
   exit 1
 fi
-"$gascan_bin" --sandbox "$sandbox_id" destroy --yes
+destroyed_sandbox_id=$sandbox_id
+"$gascan_bin" --sandbox "$destroyed_sandbox_id" destroy --yes
 sandbox_id=
 sudo -n container system dns delete "$dns_domain"
 dns_inventory=$(container system dns list --format json)
@@ -208,8 +210,9 @@ kill "$server_pid"
 server_pid=
 server_start=
 
-if "$gascan_bin" list --json | jq -e --arg prefix "$name" '.[] | select(.sandbox_id | startswith($prefix + "-"))' >/dev/null; then
-  printf 'release smoke left controller state behind\n' >&2
+controller_inventory=$("$gascan_bin" list --json)
+if ! gascan_assert_destroyed_controller_record "$controller_inventory" "$destroyed_sandbox_id"; then
+  printf 'release smoke did not retain the exact destroyed controller record\n' >&2
   exit 1
 fi
 

@@ -8,6 +8,29 @@ mkdir -p "$fixture/bin" "$fixture/root" "$fixture/tmp"
 log=$fixture/sudo.log
 dns_state=$fixture/dns
 
+# shellcheck source=../../packaging/macos/release-common.sh
+source "$repo_root/packaging/macos/release-common.sh"
+
+destroyed_id=gate5-release-123-456-0123456789ab
+destroyed='[{"actual_state":"absent","sandbox_id":"gate5-release-123-456-0123456789ab"}]'
+gascan_assert_destroyed_controller_record "$destroyed" "$destroyed_id"
+
+assert_destroyed_record_rejected() {
+  local inventory=$1 label=$2
+  if gascan_assert_destroyed_controller_record "$inventory" "$destroyed_id" >/dev/null 2>&1; then
+    printf 'invalid destroyed controller record passed: %s\n' "$label" >&2
+    exit 1
+  fi
+}
+assert_destroyed_record_rejected '[]' missing
+assert_destroyed_record_rejected '[{"actual_state":"running","sandbox_id":"gate5-release-123-456-0123456789ab"}]' running
+assert_destroyed_record_rejected '[{"actual_state":"absent","sandbox_id":"gate5-release-123-456-0123456789ab"},{"actual_state":"absent","sandbox_id":"gate5-release-123-456-0123456789ab"}]' duplicate
+assert_destroyed_record_rejected '[{"actual_state":"absent","sandbox_id":"another-sandbox-0123456789ab"}]' wrong-id
+assert_destroyed_record_rejected '{}' malformed
+gascan_assert_destroyed_controller_record \
+  '[{"actual_state":"running","sandbox_id":"unrelated-sandbox-0123456789ab"},{"actual_state":"absent","sandbox_id":"gate5-release-123-456-0123456789ab"}]' \
+  "$destroyed_id"
+
 [[ $(grep -F 'name = "$name"' "$repo_root/packaging/macos/release-smoke.sh" | wc -l | tr -d ' ') -eq 2 ]] || {
   printf 'release smoke must preserve one sandbox identity across network modes\n' >&2
   exit 1
