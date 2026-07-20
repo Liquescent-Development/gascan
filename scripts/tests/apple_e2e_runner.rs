@@ -181,7 +181,7 @@ fn security_mutation_arms_cleanup_and_bounded_probes_require_discriminating_cont
     let source =
         fs::read_to_string(root.join("crates/gascan-e2e/tests/apple_security.rs")).unwrap();
     let create = source
-        .split("fn create()")
+        .split("fn create(")
         .nth(1)
         .unwrap()
         .split("fn url(")
@@ -192,6 +192,10 @@ fn security_mutation_arms_cleanup_and_bounded_probes_require_discriminating_cont
             < create.find("Command::new(\"sudo\")").unwrap()
     );
     assert!(create.contains("route.cleanup()"));
+    assert!(
+        create.find("record_dns_domain").unwrap() < create.find("Command::new(\"sudo\")").unwrap()
+    );
+    assert!(source.contains("combine_test_and_cleanup(\"test-owned DNS route\""));
 
     let ports = fs::read_to_string(root.join("tests/security/ports.sh")).unwrap();
     assert!(ports.contains("curl --silent --fail --max-time 1"));
@@ -199,6 +203,72 @@ fn security_mutation_arms_cleanup_and_bounded_probes_require_discriminating_cont
 
     let resources = fs::read_to_string(root.join("tests/security/resources.sh")).unwrap();
     assert!(resources.contains("test \"$memory_status\" -ne 124"));
+}
+
+#[test]
+fn failed_live_test_runs_cleanup_and_cleanup_failure_is_nonzero() {
+    let fixture = runner_fixture(
+        "#!/bin/sh\nset -eu\nmkdir -p \"$RUNNER_FIXTURE_ROOT/target\"\nprintf '#!/bin/sh\\n' >\"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\nchmod 755 \"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\n",
+    );
+    let root = fixture.path();
+    let log = root.join("runner.log");
+    write_executable(
+        &root.join("bin/cargo"),
+        "#!/bin/sh\nset -eu\nprintf 'cargo:%s\\n' \"$*\" >>\"$RUNNER_FIXTURE_LOG\"\ncase \" $* \" in\n *' build '*) mkdir -p \"$RUNNER_FIXTURE_ROOT/target/debug\"; printf '#!/bin/sh\\n' >\"$RUNNER_FIXTURE_ROOT/target/debug/gascan-e2e-cli\"; chmod 755 \"$RUNNER_FIXTURE_ROOT/target/debug/gascan-e2e-cli\";;\n *' test '*) printf '{\"dns_domain\":\"gascan-00112233445566778899aabbccddeeff.test\"}\\n' >\"$GASCAN_E2E_CLEANUP_MANIFEST\"; chmod 600 \"$GASCAN_E2E_CLEANUP_MANIFEST\"; exit 23;;\nesac\n",
+    );
+    write_executable(
+        &root.join("scripts/apple-e2e-cleanup.sh"),
+        "#!/bin/sh\nset -eu\nprintf 'cleanup:%s\\n' \"$1\" >>\"$RUNNER_FIXTURE_LOG\"\nexit 29\n",
+    );
+
+    let output = Command::new(root.join("scripts/run-apple-e2e.sh"))
+        .arg("apple_security")
+        .env("RUNNER_FIXTURE_ROOT", root)
+        .env("RUNNER_FIXTURE_LOG", &log)
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", root.join("bin").display()),
+        )
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let records = fs::read_to_string(log).unwrap();
+    assert!(records.contains("cleanup:"));
+    assert!(root.join("cleanup").read_dir().unwrap().any(|entry| entry
+        .unwrap()
+        .path()
+        .extension()
+        .is_some_and(|extension| extension == "json")));
+}
+
+#[test]
+fn stale_cleanup_record_is_reconciled_before_preflight() {
+    let fixture = runner_fixture(
+        "#!/bin/sh\nset -eu\nprintf 'helper-build\\n' >>\"$RUNNER_FIXTURE_LOG\"\nmkdir -p \"$RUNNER_FIXTURE_ROOT/target\"\nprintf '#!/bin/sh\\n' >\"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\nchmod 755 \"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\n",
+    );
+    let root = fixture.path();
+    let log = root.join("runner.log");
+    fs::write(root.join("cleanup/stale.json"), "{}\n").unwrap();
+
+    let output = Command::new(root.join("scripts/run-apple-e2e.sh"))
+        .arg("apple_security")
+        .env("RUNNER_FIXTURE_ROOT", root)
+        .env("RUNNER_FIXTURE_LOG", &log)
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", root.join("bin").display()),
+        )
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let records = fs::read_to_string(log).unwrap();
+    assert!(records.find("cleanup").unwrap() < records.find("preflight:").unwrap());
 }
 
 #[test]

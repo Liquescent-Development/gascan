@@ -20,7 +20,8 @@ use std::{
 };
 
 const SECRET: &str = "gascan-security-synthetic-secret-7f29b364";
-const SECURITY_SCRIPTS: [&str; 4] = [
+const SECURITY_SCRIPTS: [&str; 5] = [
+    "assert-unreachable.sh",
     "host-boundary.sh",
     "offline-network.sh",
     "ports.sh",
@@ -81,13 +82,14 @@ impl Drop for LoopbackServer {
     }
 }
 
-struct OwnedDnsRoute {
+struct OwnedDnsRoute<'a> {
     domain: String,
     pending: bool,
+    env: &'a AppleE2e,
 }
 
-impl OwnedDnsRoute {
-    fn create() -> TestResult<Self> {
+impl<'a> OwnedDnsRoute<'a> {
+    fn create(env: &'a AppleE2e) -> TestResult<Self> {
         let domain = format!("gascan-{}.test", owner_token()?);
         let before = dns_domains()?;
         if before.iter().any(|item| item == &domain) {
@@ -96,7 +98,9 @@ impl OwnedDnsRoute {
         let mut route = Self {
             domain,
             pending: true,
+            env,
         };
+        route.env.record_dns_domain(Some(&route.domain))?;
         let create = bounded_output(
             Command::new("sudo")
                 .args([
@@ -119,6 +123,7 @@ impl OwnedDnsRoute {
         });
         if count == 0 {
             route.pending = false;
+            route.env.record_dns_domain(None)?;
         }
         if create.as_ref().is_ok_and(|output| output.status.success()) && count == 1 {
             return Ok(route);
@@ -154,6 +159,7 @@ impl OwnedDnsRoute {
 
     fn cleanup(&mut self) -> TestResult {
         if !self.pending {
+            self.env.record_dns_domain(None)?;
             return Ok(());
         }
         let count = dns_domains()?
@@ -162,6 +168,7 @@ impl OwnedDnsRoute {
             .count();
         if count == 0 {
             self.pending = false;
+            self.env.record_dns_domain(None)?;
             return Ok(());
         }
         if count != 1 || !owned_domain(&self.domain) {
@@ -178,11 +185,12 @@ impl OwnedDnsRoute {
             return Err("test-owned DNS route cleanup failed".into());
         }
         self.pending = false;
+        self.env.record_dns_domain(None)?;
         Ok(())
     }
 }
 
-impl Drop for OwnedDnsRoute {
+impl Drop for OwnedDnsRoute<'_> {
     fn drop(&mut self) {
         let _ = self.cleanup();
     }
@@ -239,46 +247,50 @@ fn real_macos_security_acceptance() -> TestResult {
 
     env.success(["--sandbox", env.id(), "destroy", "--yes"])?;
     let host = LoopbackServer::start()?;
-    let mut route = OwnedDnsRoute::create()?;
+    let mut route = OwnedDnsRoute::create(&env)?;
     let host_url = route.url(host.port);
-    write_manifest(root, "networked", "workspace", None, false, false)?;
-    env.success(["up", root.to_str().ok_or("non-UTF-8 root")?])?;
-    env.success([
-        "--sandbox",
-        env.id(),
-        "run",
-        "--",
-        "curl",
-        "--silent",
-        "--show-error",
-        "--fail",
-        "--max-time",
-        "4",
-        &host_url,
-    ])?;
+    let route_result = (|| -> TestResult {
+        write_manifest(root, "networked", "workspace", None, false, false)?;
+        env.success(["up", root.to_str().ok_or("non-UTF-8 root")?])?;
+        env.success([
+            "--sandbox",
+            env.id(),
+            "run",
+            "--",
+            "curl",
+            "--silent",
+            "--show-error",
+            "--fail",
+            "--max-time",
+            "4",
+            &host_url,
+        ])?;
 
-    env.success(["--sandbox", env.id(), "destroy", "--yes"])?;
-    write_manifest(root, "offline", "workspace", None, false, false)?;
-    env.success(["up", root.to_str().ok_or("non-UTF-8 root")?])?;
-    assert_runtime_policy(&env, true, None)?;
-    run_offline_probe(&env, &host_url)?;
-    let root_id = env.success(["--sandbox", env.id(), "run", "--", "sudo", "-n", "id", "-u"])?;
-    if root_id.stdout != b"0\r\n" && root_id.stdout != b"0\n" {
-        return Err(format!("root guest reported unexpected uid: {:?}", root_id.stdout).into());
-    }
-    let root_offline = env.invoke([
-        "--sandbox",
-        env.id(),
-        "run",
-        "--",
-        "sudo",
-        "-n",
-        "bash",
-        "/workspace/.gascan/security/offline-network.sh",
-        &host_url,
-    ])?;
-    require_success("offline-network-as-root", &root_offline)?;
-    route.cleanup()?;
+        env.success(["--sandbox", env.id(), "destroy", "--yes"])?;
+        write_manifest(root, "offline", "workspace", None, false, false)?;
+        env.success(["up", root.to_str().ok_or("non-UTF-8 root")?])?;
+        assert_runtime_policy(&env, true, None)?;
+        run_offline_probe(&env, &host_url)?;
+        let root_id =
+            env.success(["--sandbox", env.id(), "run", "--", "sudo", "-n", "id", "-u"])?;
+        if root_id.stdout != b"0\r\n" && root_id.stdout != b"0\n" {
+            return Err(format!("root guest reported unexpected uid: {:?}", root_id.stdout).into());
+        }
+        let root_offline = env.invoke([
+            "--sandbox",
+            env.id(),
+            "run",
+            "--",
+            "sudo",
+            "-n",
+            "bash",
+            "/workspace/.gascan/security/offline-network.sh",
+            &host_url,
+        ])?;
+        require_success("offline-network-as-root", &root_offline)
+    })();
+    let route_cleanup = route.cleanup();
+    combine_test_and_cleanup("test-owned DNS route", route_result, route_cleanup)?;
 
     env.success(["--sandbox", env.id(), "destroy", "--yes"])?;
     let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
@@ -445,14 +457,42 @@ fn assert_runtime_policy(env: &AppleE2e, offline: bool, port: Option<u16>) -> Te
     if offline != networks.is_empty() {
         return Err("structured network attachments contradict manifest policy".into());
     }
-    let encoded = serde_json::to_string(configuration)?;
     if let Some(port) = port {
-        if !encoded.contains("127.0.0.1") || !encoded.contains(&port.to_string()) {
-            return Err("declared port lacks structured loopback-only evidence".into());
-        }
-        if encoded.contains(&format!("0.0.0.0:{port}")) {
-            return Err("declared port is exposed on a wildcard host address".into());
-        }
+        exact_published_port(configuration, port)?;
+    } else if !configuration
+        .get("publishedPorts")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(Vec::is_empty)
+    {
+        return Err("runtime configuration has undeclared or malformed published ports".into());
+    }
+    Ok(())
+}
+
+fn exact_published_port(
+    configuration: &serde_json::Map<String, serde_json::Value>,
+    port: u16,
+) -> TestResult {
+    let published = configuration
+        .get("publishedPorts")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("runtime configuration lacks structured publishedPorts")?;
+    let [mapping] = published.as_slice() else {
+        return Err("runtime configuration does not contain exactly one published port".into());
+    };
+    let exact = mapping
+        .get("hostAddress")
+        .and_then(serde_json::Value::as_str)
+        == Some("127.0.0.1")
+        && mapping.get("hostPort").and_then(serde_json::Value::as_u64) == Some(u64::from(port))
+        && mapping
+            .get("containerPort")
+            .and_then(serde_json::Value::as_u64)
+            == Some(u64::from(port))
+        && mapping.get("proto").and_then(serde_json::Value::as_str) == Some("tcp")
+        && mapping.get("count").and_then(serde_json::Value::as_u64) == Some(1);
+    if !exact {
+        return Err("published port is not the exact loopback TCP one-to-one mapping".into());
     }
     Ok(())
 }
@@ -525,19 +565,59 @@ fn require_success(name: &str, output: &Output) -> TestResult {
     }
 }
 
+fn combine_test_and_cleanup(resource: &str, test: TestResult, cleanup: TestResult) -> TestResult {
+    match (test, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(test), Ok(())) => Err(test),
+        (Ok(()), Err(cleanup)) => Err(format!("{resource} cleanup failed: {cleanup}").into()),
+        (Err(test), Err(cleanup)) => Err(format!(
+            "security assertion failed: {test}; {resource} cleanup also failed: {cleanup}"
+        )
+        .into()),
+    }
+}
+
 fn require_failure_code(name: &str, output: &Output, code: &str) -> TestResult {
     if output.status.success() {
         return Err(format!("{name} unexpectedly succeeded").into());
     }
-    let combined = [output.stdout.as_slice(), output.stderr.as_slice()].concat();
-    if !String::from_utf8_lossy(&combined).contains(code) {
+    let observed = structured_error_code(&output.stdout).map_err(|error| {
+        format!(
+            "{name} lacked a valid structured error: {error}; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })?;
+    if observed != code {
         return Err(format!(
-            "{name} lacked {code}: {}",
-            String::from_utf8_lossy(&combined)
+            "{name} returned structured error {observed}, expected {code}; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
         )
         .into());
     }
     Ok(())
+}
+
+fn structured_error_code(stdout: &[u8]) -> TestResult<String> {
+    let source = std::str::from_utf8(stdout)?;
+    let mut codes = Vec::new();
+    for line in source.lines().filter(|line| !line.trim().is_empty()) {
+        let record: serde_json::Value = serde_json::from_str(line)?;
+        match record.get("error") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(error) => {
+                let code = error
+                    .get("code")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("structured error lacks a string code")?;
+                codes.push(code.to_owned());
+            }
+        }
+    }
+    match codes.as_slice() {
+        [code] => Ok(code.clone()),
+        [] => Err("structured output lacks an error code".into()),
+        _ => Err("structured output contains multiple error codes".into()),
+    }
 }
 
 fn dns_domains() -> TestResult<Vec<String>> {
@@ -593,5 +673,95 @@ fn bounded_output(command: &mut Command, timeout: Duration) -> TestResult<Output
             .into());
         }
         thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(test)]
+mod security_regressions {
+    use super::{
+        TestResult, combine_test_and_cleanup, exact_published_port, structured_error_code,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn published_port_requires_one_exact_loopback_tcp_mapping() -> TestResult {
+        let exact = json!({
+            "publishedPorts": [{
+                "hostAddress": "127.0.0.1",
+                "hostPort": 18080,
+                "containerPort": 18080,
+                "proto": "tcp",
+                "count": 1
+            }]
+        });
+        assert!(
+            exact_published_port(
+                exact.as_object().ok_or("exact fixture is not an object")?,
+                18080
+            )
+            .is_ok()
+        );
+
+        for mutation in [
+            json!({"publishedPorts": [], "note": "127.0.0.1:18080"}),
+            json!({"publishedPorts": [{"hostAddress":"0.0.0.0","hostPort":18080,"containerPort":18080,"proto":"tcp","count":1}]}),
+            json!({"publishedPorts": [{"hostAddress":"::","hostPort":18080,"containerPort":18080,"proto":"tcp","count":1}]}),
+            json!({"publishedPorts": [{"hostAddress":"127.0.0.1","hostPort":18080,"containerPort":18081,"proto":"tcp","count":1}]}),
+            json!({"publishedPorts": [{"hostAddress":"127.0.0.1","hostPort":18080,"containerPort":18080,"proto":"udp","count":1}]}),
+            json!({"publishedPorts": [{"hostAddress":"127.0.0.1","hostPort":18080,"containerPort":18080,"proto":"tcp","count":2}]}),
+            json!({"publishedPorts": [
+                {"hostAddress":"127.0.0.1","hostPort":18080,"containerPort":18080,"proto":"tcp","count":1},
+                {"hostAddress":"127.0.0.1","hostPort":18081,"containerPort":18081,"proto":"tcp","count":1}
+            ]}),
+        ] {
+            assert!(
+                exact_published_port(
+                    mutation
+                        .as_object()
+                        .ok_or("mutation fixture is not an object")?,
+                    18080
+                )
+                .is_err()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn structured_error_code_uses_only_exact_json_error_field() -> TestResult {
+        let output = br#"{"phase":"create","error":null}
+{"phase":"create","status":3,"error":{"code":"disk_control_unsupported","message":"denied"}}
+"#;
+        assert_eq!(structured_error_code(output)?, "disk_control_unsupported");
+        assert!(structured_error_code(b"not json disk_control_unsupported\n").is_err());
+        assert!(
+            structured_error_code(
+                br#"{"message":"disk_control_unsupported","error":{"code":"invalid_request"}}
+"#
+            )
+            .is_ok_and(|code| code != "disk_control_unsupported")
+        );
+        assert!(
+            structured_error_code(
+                br#"{"error":{"code":"invalid_request"}}
+{"error":{"code":"disk_control_unsupported"}}
+"#
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn assertion_and_cleanup_failures_are_both_returned() -> TestResult {
+        let test: TestResult = Err("synthetic assertion failure".into());
+        let cleanup: TestResult = Err("synthetic cleanup failure".into());
+        let Err(error) = combine_test_and_cleanup("synthetic route", test, cleanup) else {
+            return Err("combined failure unexpectedly succeeded".into());
+        };
+        let message = error.to_string();
+        assert!(message.contains("synthetic assertion failure"));
+        assert!(message.contains("synthetic cleanup failure"));
+        Ok(())
     }
 }

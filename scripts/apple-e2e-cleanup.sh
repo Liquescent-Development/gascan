@@ -75,6 +75,28 @@ expected=$(printf '%s\n%s\n%s\n%s\n' "$id" "gascan-mise-$id" "gascan-cache-$id" 
 actual=$(jq -er '.resources[]' "$manifest")
 test "$actual" = "$expected" || { printf 'refusing out-of-scope cleanup manifest\n' >&2; exit 65; }
 
+jq -e '.dns_domain == null or (.dns_domain | type == "string")' "$manifest" >/dev/null || { printf 'refusing invalid DNS cleanup record\n' >&2; exit 65; }
+dns_domain=$(jq -r '.dns_domain // ""' "$manifest")
+if test -n "$dns_domain"; then
+  printf '%s' "$dns_domain" | jq -R -e 'test("^gascan-[0-9a-f]{32}\\.test$")' >/dev/null || { printf 'refusing foreign DNS cleanup identity\n' >&2; exit 65; }
+  dns_inventory=$(container system dns list --format json) || { printf 'unable to inventory DNS routes; retaining cleanup manifest\n' >&2; exit 1; }
+  printf '%s' "$dns_inventory" | jq -e 'type == "array" and all(.[]; type == "string")' >/dev/null || { printf 'invalid DNS route inventory; retaining cleanup manifest\n' >&2; exit 1; }
+  dns_count=$(printf '%s' "$dns_inventory" | jq -r --arg domain "$dns_domain" '[.[] | select(. == $domain)] | length')
+  case $dns_count in
+    0) ;;
+    1)
+      sudo -n container system dns delete "$dns_domain" || { printf 'unable to delete exact test-owned DNS route; retaining cleanup manifest\n' >&2; exit 1; }
+      ;;
+    *) printf 'ambiguous DNS route inventory; retaining cleanup manifest\n' >&2; exit 1 ;;
+  esac
+  dns_inventory=$(container system dns list --format json) || { printf 'unable to verify DNS route cleanup; retaining cleanup manifest\n' >&2; exit 1; }
+  printf '%s' "$dns_inventory" | jq -e 'type == "array" and all(.[]; type == "string")' >/dev/null || { printf 'invalid DNS cleanup inventory; retaining cleanup manifest\n' >&2; exit 1; }
+  if printf '%s' "$dns_inventory" | jq -e --arg domain "$dns_domain" 'any(.[]; . == $domain)' >/dev/null; then
+    printf 'test-owned DNS route residue remains; retaining cleanup manifest\n' >&2
+    exit 1
+  fi
+fi
+
 container_inventory=$(container list --all --format json) || { printf 'unable to inventory containers; retaining cleanup manifest\n' >&2; exit 1; }
 printf '%s' "$container_inventory" | jq -e 'type == "array" and all(.[]; type == "object" and ((.configuration.id | type) == "string"))' >/dev/null || { printf 'invalid container inventory; retaining cleanup manifest\n' >&2; exit 1; }
 volume_inventory=$(container volume list --format json) || { printf 'unable to inventory volumes; retaining cleanup manifest\n' >&2; exit 1; }

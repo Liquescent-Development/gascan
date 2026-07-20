@@ -4,6 +4,7 @@ use gascan_core::sandbox::SandboxId;
 use serde_json::Value;
 use std::ffi::{OsStr, OsString};
 use std::io::{Read as _, Seek as _};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::process::{Command, ExitStatus, Output, Stdio};
 
 #[derive(serde::Deserialize)]
@@ -42,6 +43,7 @@ pub struct AppleE2e {
     manifest_name: String,
     owner_token: String,
     error_diagnostics: bool,
+    cleanup_manifest: Option<std::path::PathBuf>,
 }
 
 impl AppleE2e {
@@ -107,7 +109,7 @@ impl AppleE2e {
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_nanos()
         );
-        if let Some(manifest) = manifest {
+        if let Some(manifest) = manifest.as_ref() {
             let record = serde_json::json!({
                 "version": 1,
                 "sandbox_id": id.as_str(),
@@ -123,6 +125,7 @@ impl AppleE2e {
                 "runtime_root": runtime_root,
                 "project_root": root_path,
                 "session_root": session_root.canonicalize()?,
+                "dns_domain": null,
             });
             let temporary = manifest.with_extension("tmp");
             std::fs::write(&temporary, serde_json::to_vec(&record)?)?;
@@ -143,6 +146,7 @@ impl AppleE2e {
             manifest_name,
             owner_token,
             error_diagnostics,
+            cleanup_manifest: manifest,
         })
     }
 
@@ -160,6 +164,41 @@ impl AppleE2e {
 
     pub fn runtime_root(&self) -> &std::path::Path {
         &self.runtime_root
+    }
+
+    pub fn record_dns_domain(&self, domain: Option<&str>) -> TestResult {
+        let manifest = self
+            .cleanup_manifest
+            .as_ref()
+            .ok_or("trusted cleanup manifest is unavailable")?;
+        let metadata = std::fs::symlink_metadata(manifest)?;
+        if !metadata.file_type().is_file()
+            || metadata.mode() & 0o777 != 0o600
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+        {
+            return Err("refusing unsafe cleanup manifest update".into());
+        }
+        let mut record: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest)?)?;
+        record["dns_domain"] = domain.map_or(serde_json::Value::Null, |value| {
+            serde_json::Value::String(value.to_owned())
+        });
+        let temporary = self.runtime_root.join("cleanup-manifest.dns.tmp");
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        std::io::Write::write_all(&mut output, &serde_json::to_vec(&record)?)?;
+        output.sync_all()?;
+        drop(output);
+        std::fs::rename(&temporary, manifest)?;
+        std::fs::File::open(
+            manifest
+                .parent()
+                .ok_or("cleanup manifest has no parent directory")?,
+        )?
+        .sync_all()?;
+        Ok(())
     }
 
     pub fn install_noop_setup(&self) -> TestResult {
@@ -1293,6 +1332,32 @@ mod tests {
                     .all(|volume| &volume.ownership == request.ownership())
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_manifest_dns_identity_is_atomic_private_and_clearable() -> TestResult {
+        let session = tempfile::tempdir()?;
+        let cleanup_manifest = session.path().join("dns-record.json");
+        let env = AppleE2e::new_scoped(
+            "dns-record",
+            session.path().to_owned(),
+            Some(cleanup_manifest.clone()),
+        )?;
+        let domain = "gascan-00112233445566778899aabbccddeeff.test";
+
+        env.record_dns_domain(Some(domain))?;
+        let metadata = std::fs::symlink_metadata(&cleanup_manifest)?;
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
+        let record: Value = serde_json::from_slice(&std::fs::read(&cleanup_manifest)?)?;
+        assert_eq!(record["dns_domain"], domain);
+        assert!(!env.runtime_root.join("cleanup-manifest.dns.tmp").exists());
+
+        env.record_dns_domain(None)?;
+        let record: Value = serde_json::from_slice(&std::fs::read(&cleanup_manifest)?)?;
+        assert!(record["dns_domain"].is_null());
         Ok(())
     }
 
