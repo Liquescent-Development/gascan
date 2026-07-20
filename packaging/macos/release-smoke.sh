@@ -91,8 +91,8 @@ domain_token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
 candidate_domain="gascan-$domain_token.test"
 dns_inventory=$(container system dns list --format json)
 jq -e --arg domain "$candidate_domain" 'type == "array" and all(.[]; . != $domain)' <<<"$dns_inventory" >/dev/null
-sudo -n container system dns create --localhost "$candidate_domain" >/dev/null
 dns_domain=$candidate_domain
+sudo -n container system dns create --localhost 203.0.113.113 "$dns_domain" >/dev/null
 dns_inventory=$(container system dns list --format json)
 jq -e --arg domain "$dns_domain" 'type == "array" and ([.[] | select(. == $domain)] | length) == 1' \
   <<<"$dns_inventory" >/dev/null
