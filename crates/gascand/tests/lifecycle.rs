@@ -3,7 +3,7 @@ use camino::Utf8Path;
 use gascan_core::fake_runtime::{FailureBoundary, FakeRuntime};
 use gascan_core::manifest::Manifest;
 use gascan_core::policy::PolicyCompiler;
-use gascan_core::runtime::{ResourceKind, ResourceOwnership, RuntimeBackend};
+use gascan_core::runtime::{ResourceKind, ResourceOwnership, RuntimeBackend, RuntimeCall};
 use gascan_core::sandbox::SandboxSpec;
 use gascand::{NoopProvisioner, OperationStatus, SandboxService, UpRequest};
 use gascand::{ProvisionRequest, ProvisionResolution, Provisioner, ServiceError};
@@ -180,7 +180,78 @@ async fn provision_and_health_failures_roll_back_new_resources() -> TestResult {
         assert!(runtime.inspect(&id).await?.is_none());
         assert!(runtime.list_resources().await?.is_empty());
         assert!(service.store().pending_operations()?.is_empty());
+        let calls = runtime.calls().await;
+        let started = calls
+            .iter()
+            .position(|call| matches!(call, RuntimeCall::Start(call_id) if call_id == &id))
+            .ok_or("start call")?;
+        let stopped = calls
+            .iter()
+            .position(|call| matches!(call, RuntimeCall::Stop(call_id) if call_id == &id))
+            .ok_or("rollback stop call")?;
+        let removed = calls
+            .iter()
+            .position(|call| matches!(call, RuntimeCall::Remove(_)))
+            .ok_or("rollback remove call")?;
+        assert!(started < stopped && stopped < removed);
+        assert!(matches!(
+            &calls[stopped - 1],
+            RuntimeCall::Inspect(call_id) if call_id == &id
+        ));
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn rollback_failure_preserves_provision_error_and_stops_before_remove() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let spec = SandboxSpec::from_root("rollback-diagnostic", root, Manifest::load(root)?)?;
+    let id = spec.id().clone();
+    let runtime = FakeRuntime::failing_once(FailureBoundary::Remove);
+    let provisioner = Arc::new(ControlledProvisioner::default());
+    provisioner.fail_provision.store(true, Ordering::SeqCst);
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        provisioner,
+    );
+
+    let error = match service.up(UpRequest::new(spec)).await {
+        Ok(_) => return Err("provisioning unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.to_string(),
+        "provisioning failed: injected provision failure; rollback failed: injected failure at remove"
+    );
+    let calls = runtime.calls().await;
+    let stopped = calls
+        .iter()
+        .position(|call| matches!(call, RuntimeCall::Stop(call_id) if call_id == &id))
+        .ok_or("rollback stop call")?;
+    let removed = calls
+        .iter()
+        .position(|call| matches!(call, RuntimeCall::Remove(_)))
+        .ok_or("rollback remove call")?;
+    assert!(stopped < removed);
+    assert!(matches!(
+        &calls[stopped - 1],
+        RuntimeCall::Inspect(call_id) if call_id == &id
+    ));
+    assert_eq!(
+        runtime.inspect(&id).await?.ok_or("retained runtime")?.state,
+        gascan_core::runtime::ContainerState::Stopped
+    );
+    let operation = service.latest_operation()?.ok_or("operation")?;
+    assert_eq!(operation.error_code.as_deref(), Some("provision_failed"));
+    assert_eq!(
+        operation
+            .error_details
+            .as_ref()
+            .ok_or("operation error details")?["message"],
+        "provisioning failed: injected provision failure; rollback failed: injected failure at remove"
+    );
     Ok(())
 }
 

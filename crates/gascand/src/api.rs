@@ -755,6 +755,11 @@ fn service_error_diagnostic(error: &ServiceError) -> String {
         ServiceError::DatabaseWorker(_) => "service_kind=database_worker".to_owned(),
         ServiceError::Fingerprint(_) => "service_kind=fingerprint".to_owned(),
         ServiceError::IncompleteDestroy(_) => "service_kind=incomplete_destroy".to_owned(),
+        ServiceError::Rollback { original, rollback } => format!(
+            "service_kind=rollback original_code={} rollback_code={}",
+            original.code(),
+            rollback.code()
+        ),
     }
 }
 
@@ -2530,6 +2535,24 @@ mod tests {
             .line("run.validate_exec", &system_version)
             .ok_or("enabled diagnostics did not produce a line")?;
         assert!(line.contains("runtime_operation=container_system_version"));
+        assert!(!line.contains(secret));
+
+        let rollback = ServiceError::Rollback {
+            original: Box::new(ServiceError::Provision(format!(
+                "provision content {secret}"
+            ))),
+            rollback: gascan_core::runtime::RuntimeError::CommandFailed {
+                operation: "container delete".to_owned(),
+                exit_code: Some(1),
+                stderr: format!("rollback content {secret}"),
+            },
+        };
+        let line = ErrorDiagnostics::enabled_for_tests()
+            .line("up.rollback", &rollback)
+            .ok_or("enabled rollback diagnostics did not produce a line")?;
+        assert!(line.contains("service_kind=rollback"));
+        assert!(line.contains("original_code=provision_failed"));
+        assert!(line.contains("rollback_code=command_failed"));
         assert!(!line.contains(secret));
         Ok(())
     }

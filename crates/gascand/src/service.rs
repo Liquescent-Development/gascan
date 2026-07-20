@@ -279,6 +279,11 @@ pub enum ServiceError {
     Fingerprint(String),
     #[error("destroy left expected owned resources for sandbox {0}")]
     IncompleteDestroy(SandboxId),
+    #[error("{original}; rollback failed: {rollback}")]
+    Rollback {
+        original: Box<ServiceError>,
+        rollback: RuntimeError,
+    },
 }
 
 impl<B: RuntimeBackend> SandboxService<B> {
@@ -654,10 +659,32 @@ impl<B: RuntimeBackend> SandboxService<B> {
             Err(error) if error.is_setup_failure() => Err(error),
             Err(error) if created.is_some() => {
                 if let Some(outcome) = created {
-                    if !outcome.created().is_empty() {
+                    let rollback = async {
+                        let current = self.runtime.inspect(id).await?.ok_or_else(|| {
+                            RuntimeError::NotFound {
+                                resource: id.to_string(),
+                            }
+                        })?;
+                        if current.ownership.managed_by != "gascan"
+                            || current.ownership.sandbox_id != *id
+                        {
+                            return Err(RuntimeError::OwnershipMismatch {
+                                resource: id.to_string(),
+                            });
+                        }
+                        if current.state == ContainerState::Running {
+                            self.runtime.stop(id).await?;
+                        }
                         self.runtime
                             .remove(RemoveRequest::from_resources(outcome.created().to_vec())?)
-                            .await?;
+                            .await
+                    }
+                    .await;
+                    if let Err(rollback) = rollback {
+                        return Err(ServiceError::Rollback {
+                            original: Box::new(error),
+                            rollback,
+                        });
                     }
                 }
                 Err(error)
@@ -1598,6 +1625,7 @@ impl ServiceError {
             Self::DatabaseWorker(_) => "database_worker_failed",
             Self::Fingerprint(_) => "fingerprint_failed",
             Self::IncompleteDestroy(_) => "incomplete_destroy",
+            Self::Rollback { original, .. } => original.code(),
         }
     }
 
