@@ -631,6 +631,9 @@ fn service_status(error: ServiceError) -> tonic::Status {
         }
         ServiceError::Missing(_) => tonic::Status::not_found(error_code::SANDBOX_NOT_FOUND),
         ServiceError::Runtime(_) => tonic::Status::unavailable(error_code::BACKEND_UNAVAILABLE),
+        ServiceError::Policy(gascan_core::policy::PolicyError::DiskControlUnsupported) => {
+            tonic::Status::invalid_argument(error_code::DISK_CONTROL_UNSUPPORTED)
+        }
         ServiceError::Policy(_) | ServiceError::Sandbox(_) | ServiceError::Manifest(_) => {
             tonic::Status::invalid_argument(error_code::INVALID_REQUEST)
         }
@@ -827,6 +830,9 @@ fn pre_begin_status(error: PreBeginFailure) -> tonic::Status {
         PreBeginFailure::Conflict => tonic::Status::already_exists(error_code::OPERATION_CONFLICT),
         PreBeginFailure::Missing => tonic::Status::not_found(error_code::SANDBOX_NOT_FOUND),
         PreBeginFailure::Runtime => tonic::Status::unavailable(error_code::BACKEND_UNAVAILABLE),
+        PreBeginFailure::DiskControlUnsupported => {
+            tonic::Status::invalid_argument(error_code::DISK_CONTROL_UNSUPPORTED)
+        }
         PreBeginFailure::Invalid => tonic::Status::invalid_argument(error_code::INVALID_REQUEST),
         PreBeginFailure::Internal => tonic::Status::internal(error_code::INTERNAL),
     }
@@ -1661,8 +1667,9 @@ mod tests {
     use super::{
         ActivityTracker, ApiEventStream, ApiInputError, AttachBridgeControl, AttachStream,
         AttachTerminal, ErrorDiagnostics, PendingSession, SessionRegistry,
-        attach_shutdown_requested_with, run_attach_bridge as run_attach_bridge_impl,
-        service_status, service_status_with_diagnostics, spec_for_root, wire_event, wire_status,
+        attach_shutdown_requested_with, pre_begin_status,
+        run_attach_bridge as run_attach_bridge_impl, service_status,
+        service_status_with_diagnostics, spec_for_root, wire_event, wire_status,
     };
     use crate::{
         ActualState, DesiredState, OperationEvent, OperationId, OperationStatus, SandboxRecord,
@@ -1670,6 +1677,7 @@ mod tests {
     };
     use camino::Utf8PathBuf;
     use gascan_core::{
+        policy::PolicyError,
         runtime::{ExecInput, ExecOutput, ExecSession},
         sandbox::SandboxId,
     };
@@ -2425,6 +2433,21 @@ mod tests {
         }));
         assert_eq!(status.code(), tonic::Code::AlreadyExists);
         assert_eq!(status.message(), error_code::OPERATION_CONFLICT);
+    }
+
+    #[test]
+    fn disk_control_policy_rejection_preserves_its_stable_public_code() {
+        let error = ServiceError::Policy(PolicyError::DiskControlUnsupported);
+        let direct = service_status(ServiceError::Policy(PolicyError::DiskControlUnsupported));
+        assert_eq!(direct.code(), tonic::Code::InvalidArgument);
+        assert_eq!(direct.message(), error_code::DISK_CONTROL_UNSUPPORTED);
+
+        let before_operation = pre_begin_status((&error).into());
+        assert_eq!(before_operation.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            before_operation.message(),
+            error_code::DISK_CONTROL_UNSUPPORTED
+        );
     }
 
     #[test]

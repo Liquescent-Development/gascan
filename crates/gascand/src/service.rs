@@ -132,6 +132,7 @@ pub(crate) enum PreBeginFailure {
     Conflict,
     Missing,
     Runtime,
+    DiskControlUnsupported,
     Invalid,
     Internal,
 }
@@ -142,6 +143,9 @@ impl From<&ServiceError> for PreBeginFailure {
             ServiceError::Store(StoreError::PendingOperationExists { .. }) => Self::Conflict,
             ServiceError::Missing(_) => Self::Missing,
             ServiceError::Runtime(_) => Self::Runtime,
+            ServiceError::Policy(PolicyError::DiskControlUnsupported) => {
+                Self::DiskControlUnsupported
+            }
             ServiceError::Policy(_) | ServiceError::Sandbox(_) | ServiceError::Manifest(_) => {
                 Self::Invalid
             }

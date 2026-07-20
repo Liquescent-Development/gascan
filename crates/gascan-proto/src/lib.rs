@@ -19,6 +19,8 @@ pub mod error_code {
     pub const INCOMPATIBLE_API_MAJOR: &str = "incompatible_api_major";
     /// A request failed validation.
     pub const INVALID_REQUEST: &str = "invalid_request";
+    /// The selected runtime cannot enforce a requested disk ceiling.
+    pub const DISK_CONTROL_UNSUPPORTED: &str = "disk_control_unsupported";
     /// The selected sandbox does not exist.
     pub const SANDBOX_NOT_FOUND: &str = "sandbox_not_found";
     /// Another operation prevents this request from running.
@@ -40,6 +42,7 @@ pub mod error_code {
     pub const ALL: &[&str] = &[
         INCOMPATIBLE_API_MAJOR,
         INVALID_REQUEST,
+        DISK_CONTROL_UNSUPPORTED,
         SANDBOX_NOT_FOUND,
         OPERATION_CONFLICT,
         BACKEND_UNAVAILABLE,

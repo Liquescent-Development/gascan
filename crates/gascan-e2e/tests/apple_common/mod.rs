@@ -158,6 +158,10 @@ impl AppleE2e {
         self.runtime_root.join("state.sqlite3")
     }
 
+    pub fn runtime_root(&self) -> &std::path::Path {
+        &self.runtime_root
+    }
+
     pub fn install_noop_setup(&self) -> TestResult {
         std::fs::create_dir(self.root_path.join(".gascan"))?;
         std::fs::write(
@@ -238,6 +242,20 @@ impl AppleE2e {
         wait_with_output_bounded(child, std::time::Duration::from_secs(90))
     }
 
+    pub fn invoke_with_env<I, S>(&self, args: I, key: &str, value: &str) -> TestResult<Output>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let child = self
+            .command(args)
+            .env(key, value)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        wait_with_output_bounded(child, std::time::Duration::from_secs(90))
+    }
+
     pub fn success<I, S>(&self, args: I) -> TestResult<Output>
     where
         I: IntoIterator<Item = S>,
@@ -284,7 +302,7 @@ impl AppleE2e {
         .into())
     }
 
-    fn bounded_daemon_stderr(&self) -> String {
+    pub fn bounded_daemon_stderr(&self) -> String {
         const MAXIMUM: u64 = 16 * 1_024;
         let path = self.runtime_root.join("daemon.stderr");
         let result = (|| -> std::io::Result<String> {

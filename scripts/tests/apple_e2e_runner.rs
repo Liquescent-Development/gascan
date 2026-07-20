@@ -124,6 +124,128 @@ fn runner_accepts_apple_apply_as_an_explicit_single_target() {
 }
 
 #[test]
+fn runner_accepts_apple_security_as_an_explicit_single_target() {
+    let fixture = runner_fixture(
+        "#!/bin/sh\nset -eu\nmkdir -p \"$RUNNER_FIXTURE_ROOT/target\"\nprintf '#!/bin/sh\\n' >\"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\nchmod 755 \"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\n",
+    );
+    let root = fixture.path();
+    let log = root.join("runner.log");
+    let output = Command::new(root.join("scripts/run-apple-e2e.sh"))
+        .arg("apple_security")
+        .env("RUNNER_FIXTURE_ROOT", root)
+        .env("RUNNER_FIXTURE_LOG", &log)
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", root.join("bin").display()),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let records = fs::read_to_string(log).unwrap();
+    assert!(records.lines().any(|line| line.contains(
+        "cargo:test -p gascan-e2e --test apple_security -- --ignored --test-threads=1 --nocapture:"
+    )));
+    assert!(!records.contains("--test apple_lifecycle"));
+    assert!(!records.contains("--test apple_recovery"));
+    assert!(!records.contains("--test apple_apply"));
+}
+
+#[test]
+fn security_dns_inventory_uses_literal_normal_user_apple_command() {
+    let source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../crates/gascan-e2e/tests/apple_security.rs"),
+    )
+    .unwrap();
+    let compact: String = source.split_whitespace().collect();
+    assert!(compact.contains(
+        "Command::new(\"container\").args([\"system\",\"dns\",\"list\",\"--format\",\"json\"])"
+    ));
+    assert!(!compact
+        .contains("Command::new(\"sudo\").args([\"-n\",\"container\",\"system\",\"dns\",\"list\""));
+    assert!(compact.contains(
+        "Command::new(\"sudo\").args([\"-n\",\"container\",\"system\",\"dns\",\"create\""
+    ));
+    assert!(compact.contains(
+        "Command::new(\"sudo\").args([\"-n\",\"container\",\"system\",\"dns\",\"delete\""
+    ));
+}
+
+#[test]
+fn security_mutation_arms_cleanup_and_bounded_probes_require_discriminating_controls() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let source =
+        fs::read_to_string(root.join("crates/gascan-e2e/tests/apple_security.rs")).unwrap();
+    let create = source
+        .split("fn create()")
+        .nth(1)
+        .unwrap()
+        .split("fn url(")
+        .next()
+        .unwrap();
+    assert!(
+        create.find("let mut route = Self").unwrap()
+            < create.find("Command::new(\"sudo\")").unwrap()
+    );
+    assert!(create.contains("route.cleanup()"));
+
+    let ports = fs::read_to_string(root.join("tests/security/ports.sh")).unwrap();
+    assert!(ports.contains("curl --silent --fail --max-time 1"));
+    assert!(ports.contains("guest listener did not become reachable"));
+
+    let resources = fs::read_to_string(root.join("tests/security/resources.sh")).unwrap();
+    assert!(resources.contains("test \"$memory_status\" -ne 124"));
+}
+
+#[test]
+fn security_root_probe_uses_guest_sudo_without_requesting_unsupported_runtime_user() {
+    let source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../crates/gascan-e2e/tests/apple_security.rs"),
+    )
+    .unwrap();
+    let compact: String = source.split_whitespace().collect();
+    assert_eq!(
+        compact
+            .match_indices("write_manifest(root,\"offline\",\"root\"")
+            .count(),
+        1
+    );
+    assert!(compact
+        .contains("require_failure_code(\"rootuserrequest\",&root_request,\"unsupported_user\")"));
+    assert!(compact.contains("env.assert_no_owned_resources()?"));
+    assert!(compact.contains(
+        "\"run\",\"--\",\"sudo\",\"-n\",\"bash\",\"/workspace/.gascan/security/offline-network.sh\""
+    ));
+}
+
+#[test]
+fn security_process_non_claim_uses_the_stable_manifest_wire_rejection() {
+    let source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../crates/gascan-e2e/tests/apple_security.rs"),
+    )
+    .unwrap();
+    let compact: String = source.split_whitespace().collect();
+    assert!(
+        compact.contains("require_failure_code(\"processrequest\",&process,\"invalid_request\")")
+    );
+    assert!(
+        !compact.contains("require_failure_code(\"processrequest\",&process,\"invalid_manifest\")")
+    );
+    let process_rejection = compact
+        .split("require_failure_code(\"processrequest\"")
+        .nth(1)
+        .unwrap();
+    assert!(process_rejection
+        .starts_with(",&process,\"invalid_request\")?;env.assert_no_owned_resources()?"));
+}
+
+#[test]
 fn runner_default_targets_remain_lifecycle_and_recovery_only() {
     let fixture = runner_fixture(
         "#!/bin/sh\nset -eu\nmkdir -p \"$RUNNER_FIXTURE_ROOT/target\"\nprintf '#!/bin/sh\\n' >\"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\nchmod 755 \"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\n",

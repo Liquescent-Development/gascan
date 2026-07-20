@@ -229,6 +229,7 @@ fn public_error_codes_are_stable_and_unique() {
     let codes = gascan_proto::error_code::ALL;
     assert!(codes.contains(&"incompatible_api_major"));
     assert!(codes.contains(&"invalid_request"));
+    assert!(codes.contains(&"disk_control_unsupported"));
     assert!(codes.contains(&"sandbox_not_found"));
     assert!(codes.contains(&"operation_conflict"));
     assert_eq!(
