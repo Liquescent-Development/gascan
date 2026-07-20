@@ -93,6 +93,7 @@ async fn apply_uses_literal_mise_argv_streams_steps_and_persists_exact_versions(
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (
                 br#"{"node":[{"version":"24.18.0","installed":true,"active":true}],"python":[{"version":"3.14.6","installed":true,"active":true}]}"#.to_vec(),
                 Vec::new(),
@@ -121,6 +122,22 @@ async fn apply_uses_literal_mise_argv_streams_steps_and_persists_exact_versions(
             .map(|request| request.argv.as_slice())
             .collect::<Vec<_>>(),
         vec![
+            [
+                "/usr/bin/sudo",
+                "-n",
+                "/usr/bin/install",
+                "-d",
+                "-o",
+                "workspace",
+                "-g",
+                "workspace",
+                "-m",
+                "0700",
+                "/home/workspace/.local/share/mise",
+                "/home/workspace/.cache",
+                "/home/workspace/.config/gascan",
+            ]
+            .as_slice(),
             [
                 "/usr/bin/rm",
                 "--recursive",
@@ -243,6 +260,7 @@ async fn failed_install_retains_applied_state_and_retry_can_succeed() -> TestRes
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), b"install failed".to_vec(), 23),
         ])
         .await;
@@ -260,6 +278,7 @@ async fn failed_install_retains_applied_state_and_retry_can_succeed() -> TestRes
 
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
@@ -283,6 +302,54 @@ async fn failed_install_retains_applied_state_and_retry_can_succeed() -> TestRes
             .and_then(|resolution| resolution.details.get("resolution").cloned()),
         Some(json!({"node":"24.18.0"}))
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_safe_config_commands_record_fixed_boundary_without_guest_content() -> TestResult {
+    const SECRET: &str = "guest-stderr-must-not-escape";
+    let cases = [
+        (0, "initialize_managed_volume_roots"),
+        (1, "reset_safe_mise_workdir"),
+        (2, "create_safe_mise_workdir"),
+        (3, "write_safe_mise_config"),
+    ];
+    for (failure_index, action) in cases {
+        let root = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+        write_manifest(root, &[("node", "lts")])?;
+        let runtime = FakeRuntime::default();
+        let mut results = vec![(Vec::new(), Vec::new(), 0); failure_index];
+        results.push((Vec::new(), SECRET.as_bytes().to_vec(), 23));
+        runtime.queue_exec_results(results).await;
+        let service = SandboxService::new(
+            runtime,
+            gascand::Store::open(root.join("state.db"))?,
+            Arc::new(NoopProvisioner),
+        );
+
+        let error = match service
+            .up(UpRequest::new(spec(
+                root,
+                &format!("safe-config-{failure_index}"),
+            )?))
+            .await
+        {
+            Ok(_) => return Err("safe config command unexpectedly succeeded".into()),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "provisioning failed: guest provisioning command failed"
+        );
+        let operation = service.latest_operation()?.ok_or("operation")?;
+        let details = operation.error_details.ok_or("error details")?;
+        assert_eq!(details["step"], "write_safe_mise_config");
+        assert_eq!(details["action"], action);
+        assert_eq!(details["exit_code"], 23);
+        assert_eq!(details["signal"], 0);
+        assert!(!format!("{details:?}").contains(SECRET));
+    }
     Ok(())
 }
 
@@ -337,6 +404,7 @@ async fn duplicate_mise_tool_keys_are_rejected_without_advancing_state() -> Test
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (
                 br#"{"node":[{"version":"24.18.0","installed":true,"active":true}],"node":[{"version":"attacker","installed":true,"active":true}]}"#.to_vec(),
                 Vec::new(),
@@ -374,6 +442,7 @@ async fn legacy_matching_fingerprint_without_tool_hash_requires_one_explicit_app
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (
                 br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
                 Vec::new(),
@@ -401,6 +470,7 @@ async fn legacy_matching_fingerprint_without_tool_hash_requires_one_explicit_app
     let before = runtime.calls().await.len();
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
@@ -441,6 +511,7 @@ async fn removing_last_tool_writes_empty_config_and_persists_empty_resolution() 
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (
                 br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
                 Vec::new(),
@@ -460,6 +531,7 @@ async fn removing_last_tool_writes_empty_config_and_persists_empty_resolution() 
     let before = runtime.calls().await.len();
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
@@ -545,6 +617,7 @@ async fn missing_container_forces_tool_install_even_when_durable_hash_matches() 
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (
                 br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
                 Vec::new(),
@@ -572,6 +645,7 @@ async fn missing_container_forces_tool_install_even_when_durable_hash_matches() 
     let before = runtime.calls().await.len();
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),

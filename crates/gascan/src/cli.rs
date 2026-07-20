@@ -283,6 +283,24 @@ async fn selector(
     }
 }
 
+fn event_phase_label(event: &v1::OperationEvent) -> Option<String> {
+    if event.phase.is_empty() {
+        return None;
+    }
+    if event.phase != "provision_step" {
+        return Some(event.phase.clone());
+    }
+    let step = match v1::ProvisionStep::try_from(event.provision_step).ok()? {
+        v1::ProvisionStep::WriteSafeMiseConfig => "write_safe_mise_config",
+        v1::ProvisionStep::InstallTools => "install_tools",
+        v1::ProvisionStep::RunSetup => "run_setup",
+        v1::ProvisionStep::VerifyGascamp => "verify_gascamp",
+        v1::ProvisionStep::HealthCheck => "health_check",
+        v1::ProvisionStep::Unspecified => return Some(event.phase.clone()),
+    };
+    Some(format!("{}: {step}", event.phase))
+}
+
 async fn operation(
     mut stream: tonic::Streaming<v1::OperationEvent>,
     json: bool,
@@ -300,11 +318,38 @@ async fn operation(
                 error.code, error.message
             )));
         }
-        if !json && !event.phase.is_empty() {
-            eprintln!("{}", event.phase);
+        if !json {
+            if let Some(label) = event_phase_label(&event) {
+                eprintln!("{label}");
+            }
         }
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provisioning_phase_renders_only_the_stable_step_identifier() {
+        let event = v1::OperationEvent {
+            phase: "provision_step".to_owned(),
+            provision_step: v1::ProvisionStep::WriteSafeMiseConfig as i32,
+            payload: br#"{"step":"write_safe_mise_config","secret":"must-not-render"}"#.to_vec(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            event_phase_label(&event).as_deref(),
+            Some("provision_step: write_safe_mise_config")
+        );
+        assert!(
+            !event_phase_label(&event)
+                .unwrap_or_default()
+                .contains("secret")
+        );
+    }
 }
 
 async fn run(

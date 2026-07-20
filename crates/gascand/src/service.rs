@@ -261,6 +261,13 @@ pub enum ServiceError {
     Ownership(SandboxId),
     #[error("provisioning failed: {0}")]
     Provision(String),
+    #[error("provisioning failed: guest provisioning command failed")]
+    ProvisionCommandFailed {
+        step: ProvisionStep,
+        action: &'static str,
+        exit_code: i32,
+        signal: i32,
+    },
     #[error("mounted setup script changed before execution")]
     SetupChanged,
     #[error("setup script failed with exit code {0}")]
@@ -811,6 +818,30 @@ impl<B: RuntimeBackend> SandboxService<B> {
             .await?;
         self.exec_guest(
             spec.id(),
+            ProvisionStep::WriteSafeMiseConfig,
+            "initialize_managed_volume_roots",
+            [
+                "/usr/bin/sudo",
+                "-n",
+                "/usr/bin/install",
+                "-d",
+                "-o",
+                "workspace",
+                "-g",
+                "workspace",
+                "-m",
+                "0700",
+                MISE_DATA_DIR,
+                "/home/workspace/.cache",
+                "/home/workspace/.config/gascan",
+            ],
+            Vec::new(),
+        )
+        .await?;
+        self.exec_guest(
+            spec.id(),
+            ProvisionStep::WriteSafeMiseConfig,
+            "reset_safe_mise_workdir",
             [
                 "/usr/bin/rm",
                 "--recursive",
@@ -823,6 +854,8 @@ impl<B: RuntimeBackend> SandboxService<B> {
         .await?;
         self.exec_guest(
             spec.id(),
+            ProvisionStep::WriteSafeMiseConfig,
+            "create_safe_mise_workdir",
             ["/usr/bin/install", "-d", "-m", "0700", SAFE_MISE_WORKDIR],
             Vec::new(),
         )
@@ -837,6 +870,8 @@ impl<B: RuntimeBackend> SandboxService<B> {
             })?;
         self.exec_guest(
             spec.id(),
+            ProvisionStep::WriteSafeMiseConfig,
+            "write_safe_mise_config",
             [
                 "/usr/bin/install",
                 "-m",
@@ -850,11 +885,19 @@ impl<B: RuntimeBackend> SandboxService<B> {
 
         self.emit_provision_step(operation_id, ProvisionStep::InstallTools, sender)
             .await?;
-        self.exec_guest(spec.id(), mise_command(&["install", "--yes"]), Vec::new())
-            .await?;
+        self.exec_guest(
+            spec.id(),
+            ProvisionStep::InstallTools,
+            "install_tools",
+            mise_command(&["install", "--yes"]),
+            Vec::new(),
+        )
+        .await?;
         let output = self
             .exec_guest(
                 spec.id(),
+                ProvisionStep::InstallTools,
+                "list_installed_tools",
                 mise_command(&["ls", "--current", "--installed", "--json"]),
                 Vec::new(),
             )
@@ -873,6 +916,8 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let output = self
             .exec_guest(
                 spec.id(),
+                ProvisionStep::VerifyGascamp,
+                "verify_gascamp",
                 ["/usr/local/bin/select-gascamp".to_owned(), requested],
                 Vec::new(),
             )
@@ -891,6 +936,8 @@ impl<B: RuntimeBackend> SandboxService<B> {
     async fn exec_guest<I, S>(
         &self,
         id: &SandboxId,
+        step: ProvisionStep,
+        action: &'static str,
         argv: I,
         stdin: Vec<u8>,
     ) -> Result<Vec<u8>, ServiceError>
@@ -902,9 +949,12 @@ impl<B: RuntimeBackend> SandboxService<B> {
         if code == 0 && signal == 0 {
             Ok(stdout)
         } else {
-            Err(ServiceError::Provision(
-                "guest provisioning command failed".to_owned(),
-            ))
+            Err(ServiceError::ProvisionCommandFailed {
+                step,
+                action,
+                exit_code: code,
+                signal,
+            })
         }
     }
 
@@ -1613,6 +1663,7 @@ impl ServiceError {
             Self::Missing(_) => "not_found",
             Self::Ownership(_) => "ownership_mismatch",
             Self::Provision(_)
+            | Self::ProvisionCommandFailed { .. }
             | Self::SetupChanged
             | Self::SetupExit(_)
             | Self::SetupChangedStopUnconfirmed
@@ -1665,7 +1716,21 @@ impl ServiceError {
 }
 
 fn failure_details(error: &ServiceError) -> Value {
-    if error.is_setup_failure() {
+    if let ServiceError::ProvisionCommandFailed {
+        step,
+        action,
+        exit_code,
+        signal,
+    } = error
+    {
+        json!({
+            "message": error.to_string(),
+            "step": step.as_str(),
+            "action": action,
+            "exit_code": exit_code,
+            "signal": signal,
+        })
+    } else if error.is_setup_failure() {
         let mut details = json!({
             "message": error.to_string(),
             "phase": "setup",

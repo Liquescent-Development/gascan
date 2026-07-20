@@ -746,6 +746,7 @@ fn service_error_diagnostic(error: &ServiceError) -> String {
         ServiceError::Missing(_) => "service_kind=missing".to_owned(),
         ServiceError::Ownership(_) => "service_kind=ownership".to_owned(),
         ServiceError::Provision(_)
+        | ServiceError::ProvisionCommandFailed { .. }
         | ServiceError::SetupChanged
         | ServiceError::SetupExit(_)
         | ServiceError::SetupChangedStopUnconfirmed
