@@ -376,12 +376,12 @@ fn real_macos_security_acceptance() -> TestResult {
     env.success(["--sandbox", env.id(), "destroy", "--yes"])?;
     write_manifest(root, "offline", "workspace", None, true, false)?;
     let disk = env.invoke(["up", root.to_str().ok_or("non-UTF-8 root")?, "--json"])?;
-    require_failure_code("disk request", &disk, "disk_control_unsupported")?;
+    require_pre_begin_failure_code("disk request", &disk, "disk_control_unsupported")?;
     env.assert_no_owned_resources()?;
 
     write_manifest(root, "offline", "workspace", None, false, true)?;
     let process = env.invoke(["up", root.to_str().ok_or("non-UTF-8 root")?, "--json"])?;
-    require_failure_code("process request", &process, "invalid_request")?;
+    require_pre_begin_failure_code("process request", &process, "invalid_request")?;
     env.assert_no_owned_resources()?;
     outside.cleanup()?;
     Ok(())
@@ -646,6 +646,28 @@ fn require_failure_code(name: &str, output: &Output, code: &str) -> TestResult {
     Ok(())
 }
 
+fn require_pre_begin_failure_code(name: &str, output: &Output, code: &str) -> TestResult {
+    if output.status.success() {
+        return Err(format!("{name} unexpectedly succeeded").into());
+    }
+    if !output.stdout.is_empty() {
+        return Err(format!(
+            "{name} unexpectedly emitted stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+        .into());
+    }
+    let expected = format!("daemon error: {code}\n");
+    if output.stderr != expected.as_bytes() {
+        return Err(format!(
+            "{name} returned unexpected stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn structured_error_code(stdout: &[u8]) -> TestResult<String> {
     let source = std::str::from_utf8(stdout)?;
     let mut codes = Vec::new();
@@ -728,9 +750,11 @@ fn bounded_output(command: &mut Command, timeout: Duration) -> TestResult<Output
 #[cfg(test)]
 mod security_regressions {
     use super::{
-        TestResult, combine_test_and_cleanup, exact_published_port, structured_error_code,
+        TestResult, combine_test_and_cleanup, exact_published_port, require_pre_begin_failure_code,
+        structured_error_code,
     };
     use serde_json::json;
+    use std::process::Output;
 
     #[test]
     fn published_port_requires_one_exact_loopback_tcp_mapping() -> TestResult {
@@ -799,6 +823,35 @@ mod security_regressions {
             .is_err()
         );
         Ok(())
+    }
+
+    #[test]
+    fn pre_begin_failure_requires_exact_public_stderr_and_empty_stdout() -> TestResult {
+        let exact = fixture_output(false, b"", b"daemon error: disk_control_unsupported\n");
+        require_pre_begin_failure_code("disk request", &exact, "disk_control_unsupported")?;
+
+        for output in [
+            fixture_output(false, b"{}\n", b"daemon error: disk_control_unsupported\n"),
+            fixture_output(false, b"", b"prefix disk_control_unsupported suffix\n"),
+            fixture_output(false, b"", b"daemon error: invalid_request\n"),
+            fixture_output(true, b"", b"daemon error: disk_control_unsupported\n"),
+        ] {
+            assert!(
+                require_pre_begin_failure_code("disk request", &output, "disk_control_unsupported")
+                    .is_err()
+            );
+        }
+        Ok(())
+    }
+
+    fn fixture_output(success: bool, stdout: &[u8], stderr: &[u8]) -> Output {
+        use std::os::unix::process::ExitStatusExt;
+
+        Output {
+            status: std::process::ExitStatus::from_raw(if success { 0 } else { 1 << 8 }),
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        }
     }
 
     #[test]

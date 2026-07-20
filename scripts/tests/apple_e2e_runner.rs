@@ -165,8 +165,11 @@ fn security_dns_inventory_uses_literal_normal_user_apple_command() {
     assert!(compact.contains(
         "Command::new(\"container\").args([\"system\",\"dns\",\"list\",\"--format\",\"json\"])"
     ));
-    assert!(!compact
-        .contains("Command::new(\"sudo\").args([\"-n\",\"container\",\"system\",\"dns\",\"list\""));
+    assert!(
+        !compact.contains(
+            "Command::new(\"sudo\").args([\"-n\",\"container\",\"system\",\"dns\",\"list\""
+        )
+    );
     assert!(compact.contains(
         "Command::new(\"sudo\").args([\"-n\",\"container\",\"system\",\"dns\",\"create\""
     ));
@@ -250,11 +253,13 @@ fn failed_live_test_runs_cleanup_and_cleanup_failure_is_nonzero() {
     assert!(!output.status.success());
     let records = fs::read_to_string(log).unwrap();
     assert!(records.contains("cleanup:"));
-    assert!(root.join("cleanup").read_dir().unwrap().any(|entry| entry
-        .unwrap()
-        .path()
-        .extension()
-        .is_some_and(|extension| extension == "json")));
+    assert!(root.join("cleanup").read_dir().unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .path()
+            .extension()
+            .is_some_and(|extension| extension == "json")
+    }));
 }
 
 #[test]
@@ -303,8 +308,11 @@ fn security_root_probe_uses_guest_sudo_without_requesting_unsupported_runtime_us
     assert!(compact.contains(
         "require_failure_code(\"rootuserrequest\",&root_request,\"unsupported_capability\")"
     ));
-    assert!(!compact
-        .contains("require_failure_code(\"rootuserrequest\",&root_request,\"unsupported_user\")"));
+    assert!(
+        !compact.contains(
+            "require_failure_code(\"rootuserrequest\",&root_request,\"unsupported_user\")"
+        )
+    );
     assert!(compact.contains("env.assert_no_owned_resources()?"));
     assert!(compact.contains(
         "\"run\",\"--\",\"sudo\",\"-n\",\"bash\",\"/workspace/.gascan/security/offline-network.sh\""
@@ -319,18 +327,39 @@ fn security_process_non_claim_uses_the_stable_manifest_wire_rejection() {
     )
     .unwrap();
     let compact: String = source.split_whitespace().collect();
-    assert!(
-        compact.contains("require_failure_code(\"processrequest\",&process,\"invalid_request\")")
-    );
-    assert!(
-        !compact.contains("require_failure_code(\"processrequest\",&process,\"invalid_manifest\")")
-    );
+    assert!(compact.contains(
+        "require_pre_begin_failure_code(\"processrequest\",&process,\"invalid_request\")"
+    ));
+    assert!(!compact.contains(
+        "require_pre_begin_failure_code(\"processrequest\",&process,\"invalid_manifest\")"
+    ));
     let process_rejection = compact
-        .split("require_failure_code(\"processrequest\"")
+        .split("require_pre_begin_failure_code(\"processrequest\"")
         .nth(1)
         .unwrap();
-    assert!(process_rejection
-        .starts_with(",&process,\"invalid_request\")?;env.assert_no_owned_resources()?"));
+    assert!(
+        process_rejection
+            .starts_with(",&process,\"invalid_request\")?;env.assert_no_owned_resources()?")
+    );
+}
+
+#[test]
+fn security_pre_begin_rejections_use_exact_stderr_contract() {
+    let source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../crates/gascan-e2e/tests/apple_security.rs"),
+    )
+    .unwrap();
+    let compact: String = source.split_whitespace().collect();
+    assert!(compact.contains(
+        "require_pre_begin_failure_code(\"diskrequest\",&disk,\"disk_control_unsupported\")"
+    ));
+    assert!(compact.contains(
+        "require_pre_begin_failure_code(\"processrequest\",&process,\"invalid_request\")"
+    ));
+    assert!(compact.contains(
+        "require_failure_code(\"rootuserrequest\",&root_request,\"unsupported_capability\")"
+    ));
 }
 
 #[test]
