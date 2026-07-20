@@ -74,6 +74,7 @@ fn manifest(temp: &tempfile::TempDir, resources: serde_json::Value) -> PathBuf {
             "runtime_root": fs::canonicalize(&runtime).unwrap(),
             "project_root": fs::canonicalize(&project).unwrap(),
             "session_root": fs::canonicalize(&session).unwrap(),
+            "abort_evidence_path": fs::canonicalize(&runtime).unwrap().join("abort-probe-reached.json"),
         }))
         .unwrap(),
     )
@@ -98,6 +99,23 @@ fn manifest_with_dns(temp: &tempfile::TempDir, domain: &str) -> PathBuf {
     fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     path
+}
+
+fn mark_abort_probe_reached(path: &PathBuf) {
+    let record: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    let evidence = PathBuf::from(record["abort_evidence_path"].as_str().unwrap());
+    fs::write(
+        &evidence,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "kind": "gascan-security-abort-reached",
+            "sandbox_id": record["sandbox_id"],
+            "owner_token": record["owner_token"],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(evidence, fs::Permissions::from_mode(0o600)).unwrap();
 }
 
 fn install_dns_cleanup_commands(temp: &tempfile::TempDir, inventory: &str, delete_exit: i32) {
@@ -144,6 +162,7 @@ fn stale_owned_dns_route_is_reconciled_and_record_cleared() {
     let temp = tempfile::tempdir().unwrap();
     let domain = "gascan-00112233445566778899aabbccddeeff.test";
     let path = manifest_with_dns(&temp, domain);
+    mark_abort_probe_reached(&path);
     let calls = temp.path().join("calls");
     install_dns_cleanup_commands(&temp, &format!(r#"["{domain}"]"#), 0);
     let sudo = temp.path().join("sudo");
@@ -162,9 +181,55 @@ fn stale_owned_dns_route_is_reconciled_and_record_cleared() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!path.exists());
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains("Gate 4 abort recovery reconciled exact recorded resources"));
     assert!(fs::read_to_string(calls)
         .unwrap()
         .contains(&format!("container system dns delete {domain}")));
+}
+
+#[test]
+fn mismatched_abort_marker_is_refused_before_inventory_or_proof() {
+    let temp = tempfile::tempdir().unwrap();
+    let domain = "gascan-00112233445566778899aabbccddeeff.test";
+    let path = manifest_with_dns(&temp, domain);
+    mark_abort_probe_reached(&path);
+    let record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let evidence = PathBuf::from(record["abort_evidence_path"].as_str().unwrap());
+    let mut marker: serde_json::Value =
+        serde_json::from_slice(&fs::read(&evidence).unwrap()).unwrap();
+    marker["owner_token"] = serde_json::Value::String("foreign-owner".to_owned());
+    fs::write(&evidence, serde_json::to_vec(&marker).unwrap()).unwrap();
+    fs::set_permissions(&evidence, fs::Permissions::from_mode(0o600)).unwrap();
+    let calls = temp.path().join("calls");
+    install_dns_cleanup_commands(&temp, &format!(r#"["{domain}"]"#), 0);
+
+    let output = run(&temp, &path, &calls);
+
+    assert!(!output.status.success());
+    assert!(path.exists());
+    assert!(evidence.exists());
+    assert!(!calls.exists());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("abort recovery reconciled"));
+}
+
+#[test]
+fn abort_marker_path_escape_is_refused_before_inventory() {
+    let temp = tempfile::tempdir().unwrap();
+    let domain = "gascan-00112233445566778899aabbccddeeff.test";
+    let path = manifest_with_dns(&temp, domain);
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    record["abort_evidence_path"] = serde_json::Value::String("/tmp/foreign-marker".to_owned());
+    fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let calls = temp.path().join("calls");
+    install_dns_cleanup_commands(&temp, &format!(r#"["{domain}"]"#), 0);
+
+    let output = run(&temp, &path, &calls);
+
+    assert!(!output.status.success());
+    assert!(path.exists());
+    assert!(!calls.exists());
 }
 
 #[test]
@@ -201,6 +266,7 @@ fn dns_delete_failure_is_surfaced_and_manifest_retained() {
     let temp = tempfile::tempdir().unwrap();
     let domain = "gascan-00112233445566778899aabbccddeeff.test";
     let path = manifest_with_dns(&temp, domain);
+    mark_abort_probe_reached(&path);
     let calls = temp.path().join("calls");
     install_dns_cleanup_commands(&temp, &format!(r#"["{domain}"]"#), 29);
 
@@ -208,6 +274,7 @@ fn dns_delete_failure_is_surfaced_and_manifest_retained() {
 
     assert!(!output.status.success());
     assert!(path.exists());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("abort recovery reconciled"));
     assert!(fs::read_to_string(calls)
         .unwrap()
         .contains(&format!("container system dns delete {domain}")));

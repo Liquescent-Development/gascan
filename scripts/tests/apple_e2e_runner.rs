@@ -200,8 +200,11 @@ fn security_mutation_arms_cleanup_and_bounded_probes_require_discriminating_cont
     let abort = source
         .find("GASCAN_SECURITY_ABORT_AFTER_DNS_CREATE")
         .unwrap();
+    let durable_abort_marker = source.find("record_abort_probe_reached").unwrap();
+    let process_abort = source.find("std::process::abort()").unwrap();
     let ordinary_cleanup = source.find("let route_cleanup = route.cleanup()").unwrap();
     assert!(created < abort && abort < ordinary_cleanup);
+    assert!(abort < durable_abort_marker && durable_abort_marker < process_abort);
 
     let ports = fs::read_to_string(root.join("tests/security/ports.sh")).unwrap();
     assert!(ports.contains("curl --silent --fail --max-time 1"));
@@ -291,7 +294,10 @@ fn security_root_probe_uses_guest_sudo_without_requesting_unsupported_runtime_us
             .count(),
         1
     );
-    assert!(compact
+    assert!(compact.contains(
+        "require_failure_code(\"rootuserrequest\",&root_request,\"unsupported_capability\")"
+    ));
+    assert!(!compact
         .contains("require_failure_code(\"rootuserrequest\",&root_request,\"unsupported_user\")"));
     assert!(compact.contains("env.assert_no_owned_resources()?"));
     assert!(compact.contains(

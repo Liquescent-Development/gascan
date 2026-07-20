@@ -211,7 +211,7 @@ fn real_macos_security_acceptance() -> TestResult {
 
     write_manifest(root, "offline", "root", None, false, false)?;
     let root_request = env.invoke(["up", root.to_str().ok_or("non-UTF-8 root")?, "--json"])?;
-    require_failure_code("root user request", &root_request, "unsupported_user")?;
+    require_failure_code("root user request", &root_request, "unsupported_capability")?;
     env.assert_no_owned_resources()?;
 
     write_manifest(root, "offline", "workspace", None, false, false)?;
@@ -251,6 +251,7 @@ fn real_macos_security_acceptance() -> TestResult {
     if std::env::var_os("GASCAN_SECURITY_ABORT_AFTER_DNS_CREATE")
         .is_some_and(|value| value == std::ffi::OsStr::new("1"))
     {
+        env.record_abort_probe_reached()?;
         std::process::abort();
     }
     let host_url = route.url(host.port);

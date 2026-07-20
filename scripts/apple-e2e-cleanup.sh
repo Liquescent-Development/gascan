@@ -66,6 +66,25 @@ case $(basename "$project_root") in gascan-gate4-root-*) ;; *) printf 'refusing 
 runtime_root=$(recorded_child_directory "$runtime_root" "$session_root" runtime) || exit 65
 project_root=$(recorded_child_directory "$project_root" "$session_root" project) || exit 65
 test "$instance" = "$runtime_root/daemon-instance.json" || { printf 'refusing instance record path escape\n' >&2; exit 65; }
+abort_evidence=$(jq -r '.abort_evidence_path // ""' "$manifest")
+expected_abort_evidence="$runtime_root/abort-probe-reached.json"
+if test -n "$abort_evidence" && test "$abort_evidence" != "$expected_abort_evidence"; then
+  printf 'refusing abort evidence path escape\n' >&2
+  exit 65
+fi
+abort_evidence=$expected_abort_evidence
+abort_reached=false
+if test -e "$abort_evidence" || test -L "$abort_evidence"; then
+  test -f "$abort_evidence" && test ! -L "$abort_evidence" || { printf 'refusing unsafe abort evidence\n' >&2; exit 65; }
+  owned_private_file "$abort_evidence" || { printf 'refusing unsafe abort evidence metadata\n' >&2; exit 65; }
+  jq -e --arg id "$id" --arg token "$token" '
+    .version == 1 and
+    .kind == "gascan-security-abort-reached" and
+    .sandbox_id == $id and
+    .owner_token == $token
+  ' "$abort_evidence" >/dev/null || { printf 'refusing mismatched abort evidence\n' >&2; exit 65; }
+  abort_reached=true
+fi
 case $id in
   *-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
   *) printf 'refusing invalid sandbox id in %s\n' "$manifest" >&2; exit 65 ;;
@@ -192,9 +211,16 @@ if test "$residue" = true; then
   printf 'Gate 4 cleanup residue remains for exact sandbox %s\n' "$id" >&2
   exit 1
 fi
+if test "$abort_reached" = true; then
+  rm -f "$abort_evidence"
+  test ! -e "$abort_evidence" && test ! -L "$abort_evidence" || { printf 'abort evidence removal failed\n' >&2; exit 1; }
+fi
 rm -rf -- "$runtime_root" "$project_root"
 if { test -e "$session_root" || test -L "$session_root"; } && ! rmdir "$session_root" 2>/dev/null; then
   printf 'Gate 4 cleanup session residue remains at %s\n' "$session_root" >&2
   exit 1
 fi
 rm -f "$manifest"
+if test "$abort_reached" = true; then
+  printf 'Gate 4 abort recovery reconciled exact recorded resources\n'
+fi

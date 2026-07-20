@@ -126,6 +126,7 @@ impl AppleE2e {
                 "project_root": root_path,
                 "session_root": session_root.canonicalize()?,
                 "dns_domain": null,
+                "abort_evidence_path": runtime_root.join("abort-probe-reached.json"),
             });
             let temporary = manifest.with_extension("tmp");
             std::fs::write(&temporary, serde_json::to_vec(&record)?)?;
@@ -198,6 +199,38 @@ impl AppleE2e {
                 .ok_or("cleanup manifest has no parent directory")?,
         )?
         .sync_all()?;
+        Ok(())
+    }
+
+    pub fn record_abort_probe_reached(&self) -> TestResult {
+        let manifest = self
+            .cleanup_manifest
+            .as_ref()
+            .ok_or("trusted cleanup manifest is unavailable")?;
+        let record: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest)?)?;
+        let evidence = self.runtime_root.join("abort-probe-reached.json");
+        if record
+            .get("abort_evidence_path")
+            .and_then(serde_json::Value::as_str)
+            != evidence.to_str()
+        {
+            return Err("cleanup manifest abort evidence path mismatch".into());
+        }
+        let marker = serde_json::json!({
+            "version": 1,
+            "kind": "gascan-security-abort-reached",
+            "sandbox_id": self.id.as_str(),
+            "owner_token": self.owner_token,
+        });
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&evidence)?;
+        std::io::Write::write_all(&mut output, &serde_json::to_vec(&marker)?)?;
+        output.sync_all()?;
+        drop(output);
+        std::fs::File::open(&self.runtime_root)?.sync_all()?;
         Ok(())
     }
 
@@ -1358,6 +1391,17 @@ mod tests {
         env.record_dns_domain(None)?;
         let record: Value = serde_json::from_slice(&std::fs::read(&cleanup_manifest)?)?;
         assert!(record["dns_domain"].is_null());
+        env.record_abort_probe_reached()?;
+        let evidence = env.runtime_root.join("abort-probe-reached.json");
+        let metadata = std::fs::symlink_metadata(&evidence)?;
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
+        let marker: Value = serde_json::from_slice(&std::fs::read(evidence)?)?;
+        assert_eq!(marker["version"], 1);
+        assert_eq!(marker["kind"], "gascan-security-abort-reached");
+        assert_eq!(marker["sandbox_id"], env.id());
+        assert_eq!(marker["owner_token"], env.owner_token);
         Ok(())
     }
 
