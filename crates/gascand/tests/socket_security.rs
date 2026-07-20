@@ -6,6 +6,18 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+#[test]
+#[cfg(target_os = "macos")]
+fn default_runtime_directory_avoids_the_tmp_symlink() -> TestResult {
+    let paths = SocketPaths::for_user_with_uid_and_environment(501, None)?;
+    assert_eq!(
+        paths.directory(),
+        std::path::Path::new("/private/tmp/gascan-501/gascan")
+    );
+    Ok(())
+}
+
 fn root(temp: &TempDir) -> Result<PathBuf, std::io::Error> {
     temp.path().canonicalize()
 }

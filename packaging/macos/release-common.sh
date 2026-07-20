@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+gascan_user_runtime_root() {
+  printf '/private/tmp/gascan-%s/gascan\n' "$(id -u)"
+}
+
 gascan_assert_release_inputs_clean() {
   local repo=$1 label=$2 path ignored_source
   local -a inputs=(

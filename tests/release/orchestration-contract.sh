@@ -25,11 +25,11 @@ write_fake verify 'exit 0'
 write_fake install 'printf "install\n" >>"$FIXTURE_LOG"; exit "${FIXTURE_INSTALL_STATUS:-0}"'
 write_fake smoke 'printf "smoke:%s\n" "${FIXTURE_SMOKE_PHASE:-ok}" >>"$FIXTURE_LOG"; exit "${FIXTURE_SMOKE_STATUS:-0}"'
 write_fake uninstall '
-printf "uninstall\n" >>"$FIXTURE_LOG"
-count=$(grep -c "^uninstall$" "$FIXTURE_LOG")
+printf "uninstall:%s\n" "$*" >>"$FIXTURE_LOG"
+count=$(grep -c "^uninstall:" "$FIXTURE_LOG")
 if [[ ${FIXTURE_UNINSTALL_NONIDEMPOTENT:-0} == 1 && $count -gt 1 ]]; then exit 44; fi
 exit "${FIXTURE_UNINSTALL_STATUS:-0}"'
-write_fake gascan '[[ $* == "doctor --json" ]] || exit 64; printf "%s\n" "{\"checks\":[]}"'
+write_fake gascan '[[ $* == "doctor --json" ]] || exit 64; [[ ${FIXTURE_DOCTOR_STATUS:-0} == 0 ]] || exit "$FIXTURE_DOCTOR_STATUS"; printf "%s\n" "{\"checks\":[]}"'
 
 export PATH="$fixture/bin:/usr/bin:/bin:/usr/sbin:/sbin" FIXTURE_LOG=$log FIXTURE_PACKAGE=$fixture/test.pkg
 export GASCAN_RELEASE_TESTING=YES GASCAN_RELEASE_CLEAN_HOST_CONFIRM=YES
@@ -51,23 +51,30 @@ assert_failure() {
   [[ $output != *'PASS: Gas Can macOS MVP release gate'* ]] || { printf '%s printed PASS\n' "$label" >&2; exit 1; }
   LAST_OUTPUT=$output
   grep -qx install "$log"
-  grep -q '^uninstall$' "$log"
+  grep -q '^uninstall:' "$log"
 }
 
 export FIXTURE_INSTALL_STATUS=41 FIXTURE_SMOKE_STATUS=0 FIXTURE_UNINSTALL_STATUS=0
 assert_failure post-install 41
 
 export FIXTURE_INSTALL_STATUS=0 FIXTURE_UNINSTALL_STATUS=0
+export FIXTURE_DOCTOR_STATUS=45 FIXTURE_SMOKE_STATUS=0 FIXTURE_UNINSTALL_NONIDEMPOTENT=1
+assert_failure doctor 45
+[[ $(grep -c '^uninstall:' "$log") -eq 1 ]] || { printf 'doctor failure retried successful uninstall\n' >&2; exit 1; }
+grep -qx 'uninstall:' "$log" || { printf 'doctor failure requested data removal\n' >&2; exit 1; }
+
+export FIXTURE_DOCTOR_STATUS=0
 for phase in create apply destroy; do
   export FIXTURE_SMOKE_PHASE=$phase FIXTURE_SMOKE_STATUS=42 FIXTURE_UNINSTALL_NONIDEMPOTENT=1
   assert_failure "smoke-$phase" 42
-  [[ $(grep -c '^uninstall$' "$log") -eq 1 ]] || { printf 'clean smoke failure retried successful uninstall: %s\n' "$phase" >&2; exit 1; }
+  [[ $(grep -c '^uninstall:' "$log") -eq 1 ]] || { printf 'clean smoke failure retried successful uninstall: %s\n' "$phase" >&2; exit 1; }
+  grep -qx 'uninstall:--remove-data' "$log" || { printf 'smoke failure did not request data removal: %s\n' "$phase" >&2; exit 1; }
   [[ $LAST_OUTPUT != *'clean-host cleanup left recorded resources'* ]] || { printf 'clean smoke failure reported false cleanup residue: %s\n' "$phase" >&2; exit 1; }
 done
 
 export FIXTURE_SMOKE_STATUS=0 FIXTURE_UNINSTALL_STATUS=43 FIXTURE_UNINSTALL_NONIDEMPOTENT=0
 assert_failure uninstall 43
-[[ $(grep -c '^uninstall$' "$log") -ge 2 ]] || { printf 'uninstall failure did not trigger cleanup retry\n' >&2; exit 1; }
+[[ $(grep -c '^uninstall:' "$log") -ge 2 ]] || { printf 'uninstall failure did not trigger cleanup retry\n' >&2; exit 1; }
 [[ $LAST_OUTPUT == *'clean-host cleanup left recorded resources'* ]] || { printf 'uninstall cleanup failure lacked residue diagnostic\n' >&2; exit 1; }
 
 printf 'PASS: Gas Can release failure orchestration contract\n'

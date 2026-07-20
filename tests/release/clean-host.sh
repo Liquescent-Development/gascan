@@ -32,12 +32,18 @@ esac
 
 manifest=$(mktemp -d "${TMPDIR:-/tmp}/gascan-release-ledger.XXXXXX")
 live_started=false
-runtime_root=${GASCAN_RELEASE_TEST_RUNTIME_ROOT:-${XDG_RUNTIME_DIR:-/tmp/gascan-$(id -u)}/gascan}
+data_may_exist=false
+runtime_root=${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/gascan}
+runtime_root=${GASCAN_RELEASE_TEST_RUNTIME_ROOT:-${runtime_root:-$(gascan_user_runtime_root)}}
 
 cleanup() {
   local cleanup_status=0
   if [[ $live_started == true ]]; then
-    "$uninstaller" --remove-data >/dev/null 2>&1 || cleanup_status=1
+    if [[ $data_may_exist == true ]]; then
+      "$uninstaller" --remove-data >/dev/null 2>&1 || cleanup_status=1
+    else
+      "$uninstaller" >/dev/null 2>&1 || cleanup_status=1
+    fi
     gascan_audit_clean_host cleanup "$runtime_root" "$install_root" || cleanup_status=1
   fi
   rm -rf "$manifest"
@@ -81,16 +87,23 @@ GASCAN_EXPECTED_SOURCE_REVISION=$expected_revision GASCAN_EXPECTED_VERSION=$expe
   "$installer" "$package"
 
 status=0
-"$installed_gascan" doctor --json |
-  jq -e '([.checks[] | select(.status != "pass")] | length) == 0' >/dev/null || status=$?
+doctor_json=$("$installed_gascan" doctor --json) || status=$?
 if [[ $status -eq 0 ]]; then
+  jq -e '([.checks[] | select(.status != "pass")] | length) == 0' <<<"$doctor_json" >/dev/null || status=$?
+fi
+if [[ $status -eq 0 ]]; then
+  data_may_exist=true
   "$release_smoke" || status=$?
 fi
 uninstall_status=0
-if "$uninstaller" --remove-data; then
+if [[ $data_may_exist == true ]]; then
+  "$uninstaller" --remove-data || uninstall_status=$?
+else
+  "$uninstaller" || uninstall_status=$?
+fi
+if [[ $uninstall_status -eq 0 ]]; then
   :
 else
-  uninstall_status=$?
   status=$uninstall_status
 fi
 

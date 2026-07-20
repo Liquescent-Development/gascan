@@ -37,7 +37,8 @@ fi
 
 gascan_stop_attested_daemon gascan /usr/local/bin/gascand
 if [[ $remove_data == true ]]; then
-  runtime_root=${XDG_RUNTIME_DIR:-/tmp/gascan-$(id -u)}/gascan
+  runtime_root=${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/gascan}
+  runtime_root=${runtime_root:-$(gascan_user_runtime_root)}
   if [[ -e $runtime_root || -L $runtime_root ]]; then
     [[ -d $runtime_root && ! -L $runtime_root ]] || {
       printf 'refusing unsafe controller-state path: %s\n' "$runtime_root" >&2

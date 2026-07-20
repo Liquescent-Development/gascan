@@ -2,6 +2,7 @@ use base64::Engine as _;
 use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::process::geteuid;
+use std::ffi::OsStr;
 use std::io;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
@@ -23,9 +24,16 @@ pub struct SocketPaths {
 
 impl SocketPaths {
     pub fn for_user() -> io::Result<Self> {
-        let root = std::env::var_os("XDG_RUNTIME_DIR")
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR");
+        Self::for_user_with_uid_and_environment(geteuid().as_raw(), runtime.as_deref())
+    }
+    pub fn for_user_with_uid_and_environment(
+        uid: u32,
+        runtime: Option<&OsStr>,
+    ) -> io::Result<Self> {
+        let root = runtime
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(format!("/tmp/gascan-{}", geteuid().as_raw())));
+            .unwrap_or_else(|| default_runtime_base(uid));
         Ok(Self::from_runtime_root(root.join("gascan")))
     }
     #[must_use]
@@ -76,6 +84,16 @@ impl SocketPaths {
     pub fn prepare_directory(&self) -> io::Result<()> {
         open_private_directory(&self.directory).map(drop)
     }
+}
+
+#[cfg(target_os = "macos")]
+fn default_runtime_base(uid: u32) -> PathBuf {
+    PathBuf::from(format!("/private/tmp/gascan-{uid}"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn default_runtime_base(uid: u32) -> PathBuf {
+    PathBuf::from(format!("/tmp/gascan-{uid}"))
 }
 
 struct StagingGuard<'a> {

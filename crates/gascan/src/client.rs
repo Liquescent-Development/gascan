@@ -133,13 +133,18 @@ fn startup_transient(error: &ClientError) -> bool {
 fn socket_path() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(format!(
-                "/tmp/gascan-{}",
-                rustix::process::geteuid().as_raw()
-            ))
-        })
+        .unwrap_or_else(|| default_runtime_base(rustix::process::geteuid().as_raw()))
         .join("gascan/gascand.sock")
+}
+
+#[cfg(target_os = "macos")]
+fn default_runtime_base(uid: u32) -> PathBuf {
+    PathBuf::from(format!("/private/tmp/gascan-{uid}"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn default_runtime_base(uid: u32) -> PathBuf {
+    PathBuf::from(format!("/tmp/gascan-{uid}"))
 }
 
 fn daemon_path() -> Result<PathBuf, ClientError> {
@@ -191,4 +196,16 @@ async fn negotiate(mut api: GasCanClient<Channel>) -> Result<Client, ClientError
     validate_transport_security(&security)
         .map_err(|_| ClientError::Api("unsafe_transport_security".to_owned()))?;
     Ok(Client { api })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn default_runtime_base_avoids_the_tmp_symlink() {
+        assert_eq!(
+            super::default_runtime_base(501),
+            std::path::PathBuf::from("/private/tmp/gascan-501")
+        );
+    }
 }

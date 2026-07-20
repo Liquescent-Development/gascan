@@ -94,7 +94,9 @@ only on initial creation or explicit `apply`.
 
 Host controller state and the on-demand socket live under
 `${XDG_RUNTIME_DIR}/gascan` when `XDG_RUNTIME_DIR` is set, otherwise under
-`/tmp/gascan-UID/gascan`. Persistent tool, cache, and Gas Can configuration
+`/private/tmp/gascan-UID/gascan` on macOS. The canonical path avoids the `/tmp`
+symlink because the daemon deliberately rejects symlinked runtime-directory
+components. Persistent tool, cache, and Gas Can configuration
 live in Apple named volumes; the canonical project remains at its selected host
 path. Apple owns its runtime/image storage locations.
 
