@@ -51,6 +51,7 @@ fn digest_stdout(bytes: &[u8], relative: &str) -> Vec<u8> {
 async fn queue_successful_setup(runtime: &FakeRuntime, bytes: &[u8], relative: &str) {
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
             (digest_stdout(bytes, relative), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
@@ -84,17 +85,17 @@ async fn setup_uses_literal_guest_argv_empty_environments_and_refreshes_moved_pa
         })
         .collect::<Vec<_>>();
     assert_eq!(
-        execs[0].argv,
+        execs[1].argv,
         ["/usr/bin/sha256sum", "/workspace/.gascan/first.sh"]
     );
-    assert_eq!(execs[1].argv, ["/bin/bash", "/workspace/.gascan/first.sh"]);
-    assert!(execs[0].environment.is_empty());
+    assert_eq!(execs[2].argv, ["/bin/bash", "/workspace/.gascan/first.sh"]);
     assert!(execs[1].environment.is_empty());
+    assert!(execs[2].environment.is_empty());
 
     let before_apply = calls.len();
     write_setup(root, ".gascan/moved.sh", bytes)?;
     runtime
-        .queue_exec_results([(Vec::new(), Vec::new(), 0)])
+        .queue_exec_results([(Vec::new(), Vec::new(), 0), (Vec::new(), Vec::new(), 0)])
         .await;
     service
         .apply(UpRequest::new(spec(root, "setup-argv")?))
@@ -137,7 +138,10 @@ async fn digest_mismatch_stops_retains_digest_and_retry_succeeds() -> TestResult
     let prior = service.status(&id)?.ok_or("prior")?.setup_resolution;
     write_setup(root, "setup.sh", second)?;
     runtime
-        .queue_exec_results([(b"0000000000000000000000000000000000000000000000000000000000000000  /workspace/setup.sh\n".to_vec(), Vec::new(), 0)])
+        .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (b"0000000000000000000000000000000000000000000000000000000000000000  /workspace/setup.sh\n".to_vec(), Vec::new(), 0),
+        ])
         .await;
 
     let error = match service.apply(UpRequest::new(make_spec()?)).await {
@@ -226,6 +230,7 @@ async fn nonzero_setup_exit_is_structured_sanitized_stopped_and_retryable() -> T
     let runtime = FakeRuntime::default();
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
             (digest_stdout(bytes, "setup.sh"), Vec::new(), 0),
             (Vec::new(), SECRET.as_bytes().to_vec(), 23),
         ])
@@ -265,6 +270,7 @@ async fn stop_failure_preserves_setup_failure_and_reports_unconfirmed_state() ->
     let runtime = FakeRuntime::default();
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
             (digest_stdout(bytes, "setup.sh"), Vec::new(), 0),
             (Vec::new(), Vec::new(), 29),
         ])
@@ -348,6 +354,7 @@ async fn later_provision_failure_does_not_advance_setup_digest() -> TestResult {
     write_setup(root, "setup.sh", second)?;
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
             (digest_stdout(second, "setup.sh"), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
         ])

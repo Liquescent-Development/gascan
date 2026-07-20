@@ -105,7 +105,7 @@ sandbox_id=$("$gascan_bin" list --json | jq -er --arg name "$name" \
 "$gascan_bin" --sandbox "$sandbox_id" run -- bash -lc '
   test "$(id -u)" = 1000
   test "$(sudo -n id -u)" = 0
-  mise --version
+  MISE_OFFLINE=true mise --version
   node -e "console.log(\"node-ok\")"
   python -c "print(\"python-ok\")"
   go version
@@ -159,12 +159,12 @@ sandbox_id=
 
 cat >"$root/gascan.toml" <<EOF_OFFLINE
 version = 1
-name = "$name-offline"
+name = "$name"
 network = "offline"
 user = "workspace"
 EOF_OFFLINE
 "$gascan_bin" up "$root"
-sandbox_id=$("$gascan_bin" list --json | jq -er --arg name "$name-offline" \
+sandbox_id=$("$gascan_bin" list --json | jq -er --arg name "$name" \
   '[.[] | select(.sandbox_id | startswith($name + "-"))] | if length == 1 then .[0].sandbox_id else error("offline sandbox identity is ambiguous") end')
 inspect=$(container inspect "$sandbox_id")
 jq -e --arg id "$sandbox_id" '

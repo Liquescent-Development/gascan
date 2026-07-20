@@ -23,6 +23,8 @@
   "--env",
   "MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
   "--env",
+  "MISE_STATE_DIR=/home/workspace/.config/gascan/mise-state",
+  "--env",
   "MISE_SYSTEM_DATA_DIR=/opt/gascan/mise",
   "--env",
   "PATH=/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",

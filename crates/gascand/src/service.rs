@@ -717,6 +717,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let plan =
             ProvisioningPlanner::plan_for_root(spec.canonical_root(), spec.manifest(), &applied)
                 .map_err(|_| ServiceError::Provision("could not plan provisioning".to_owned()))?;
+        self.initialize_managed_volume_roots(spec).await?;
         let resolved_tools = if plan.tools_changed() {
             Some(
                 self.install_tools(spec, &plan, operation_id, sender)
@@ -819,28 +820,6 @@ impl<B: RuntimeBackend> SandboxService<B> {
         self.exec_guest(
             spec.id(),
             ProvisionStep::WriteSafeMiseConfig,
-            "initialize_managed_volume_roots",
-            [
-                "/usr/bin/sudo",
-                "-n",
-                "/usr/bin/install",
-                "-d",
-                "-o",
-                "workspace",
-                "-g",
-                "workspace",
-                "-m",
-                "0700",
-                MISE_DATA_DIR,
-                "/home/workspace/.cache",
-                "/home/workspace/.config/gascan",
-            ],
-            Vec::new(),
-        )
-        .await?;
-        self.exec_guest(
-            spec.id(),
-            ProvisionStep::WriteSafeMiseConfig,
             "reset_safe_mise_workdir",
             [
                 "/usr/bin/rm",
@@ -905,6 +884,35 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let resolved = parse_mise_versions(&output, spec.manifest().tools())?;
         serde_json::to_value(resolved)
             .map_err(|_| ServiceError::Provision("could not encode resolved tools".to_owned()))
+    }
+
+    async fn initialize_managed_volume_roots(
+        &self,
+        spec: &SandboxSpec,
+    ) -> Result<(), ServiceError> {
+        self.exec_guest(
+            spec.id(),
+            ProvisionStep::WriteSafeMiseConfig,
+            "initialize_managed_volume_roots",
+            [
+                "/usr/bin/sudo",
+                "-n",
+                "/usr/bin/install",
+                "-d",
+                "-o",
+                "workspace",
+                "-g",
+                "workspace",
+                "-m",
+                "0700",
+                MISE_DATA_DIR,
+                "/home/workspace/.cache",
+                "/home/workspace/.config/gascan",
+            ],
+            Vec::new(),
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn verify_gascamp(&self, spec: &SandboxSpec) -> Result<(), ServiceError> {

@@ -8,6 +8,19 @@ mkdir -p "$fixture/bin" "$fixture/root" "$fixture/tmp"
 log=$fixture/sudo.log
 dns_state=$fixture/dns
 
+[[ $(grep -F 'name = "$name"' "$repo_root/packaging/macos/release-smoke.sh" | wc -l | tr -d ' ') -eq 2 ]] || {
+  printf 'release smoke must preserve one sandbox identity across network modes\n' >&2
+  exit 1
+}
+! grep -F 'name = "$name-offline"' "$repo_root/packaging/macos/release-smoke.sh" >/dev/null || {
+  printf 'release smoke changes identity at one canonical root\n' >&2
+  exit 1
+}
+grep -F 'MISE_OFFLINE=true mise --version' "$repo_root/packaging/macos/release-smoke.sh" >/dev/null || {
+  printf 'release smoke mise version check is not command-scoped offline\n' >&2
+  exit 1
+}
+
 write_fake() {
   local name=$1 body=$2
   printf '#!/usr/bin/env bash\nset -euo pipefail\n%s\n' "$body" >"$fixture/bin/$name"

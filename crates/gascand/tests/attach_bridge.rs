@@ -19,6 +19,12 @@ async fn bridge_preserves_binary_streams_and_exact_exit() -> TestResult {
     runtime
         .set_exec_result(vec![0, 255], vec![254, 1], 42)
         .await;
+    runtime
+        .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (br#"{"source":"bundled"}"#.to_vec(), Vec::new(), 0),
+        ])
+        .await;
     let service = Arc::new(SandboxService::new(
         runtime,
         Store::open(root_path.join("state.db"))?,

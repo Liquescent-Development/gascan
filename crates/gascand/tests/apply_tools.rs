@@ -367,6 +367,31 @@ async fn empty_noop_apply_executes_no_guest_commands() -> TestResult {
     service
         .up(UpRequest::new(spec(root, "noop-tools")?))
         .await?;
+    let initial_calls = runtime.calls().await;
+    let initial_exec = initial_calls.iter().find_map(|call| match call {
+        RuntimeCall::Exec(request) => {
+            Some(request.argv.iter().map(String::as_str).collect::<Vec<_>>())
+        }
+        _ => None,
+    });
+    assert_eq!(
+        initial_exec,
+        Some(vec![
+            "/usr/bin/sudo",
+            "-n",
+            "/usr/bin/install",
+            "-d",
+            "-o",
+            "workspace",
+            "-g",
+            "workspace",
+            "-m",
+            "0700",
+            "/home/workspace/.local/share/mise",
+            "/home/workspace/.cache",
+            "/home/workspace/.config/gascan",
+        ])
+    );
     let before = runtime.calls().await.len();
 
     service
