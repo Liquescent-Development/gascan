@@ -1,12 +1,11 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
 use camino::Utf8Path;
-use gascan_apple::{AppleAttach, AppleBackend, CommandOutput, CommandRunner, CommandSpec};
+use gascan_apple::{AppleBackend, CommandOutput, CommandRunner, CommandSpec};
 use gascan_core::{
     manifest::Manifest,
     policy::PolicyCompiler,
@@ -17,6 +16,8 @@ use gascan_core::{
     sandbox::SandboxSpec,
 };
 use serde_json::json;
+
+mod support;
 
 #[derive(Clone, Default)]
 struct StatefulAppleRunner(Arc<Mutex<State>>);
@@ -285,16 +286,7 @@ fn request(name: &str) -> (tempfile::TempDir, CreateRequest) {
     (root, PolicyCompiler::compile(spec, &capabilities).unwrap())
 }
 
-fn fake_attach() -> AppleAttach {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/fake-attach-helper/Cargo.toml");
-    AppleAttach::new(env!("CARGO")).with_helper_args([
-        "run".to_owned(),
-        "--quiet".to_owned(),
-        "--manifest-path".to_owned(),
-        manifest.to_string_lossy().into_owned(),
-    ])
-}
+use support::fake_helper as fake_attach;
 
 fn assert_only_faulted_command(runner: &StatefulAppleRunner, expected: &[&str]) {
     let state = runner.0.lock().unwrap();
