@@ -8,6 +8,9 @@ The macOS MVP requires macOS 26 or newer and Apple `container` 1.1.0. Install
 and start Apple's runtime first; Gas Can does not bundle it. Build and install
 the current package with:
 
+The checkout must be a trusted signed commit or the exact signed release tag
+(`v0.1.0` for this version); packaging rejects unsigned source revisions.
+
 ```sh
 package=$(./packaging/macos/package.sh)
 GASCAN_EXPECTED_SOURCE_REVISION=$(git rev-parse HEAD) \
