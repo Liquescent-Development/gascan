@@ -28,18 +28,23 @@ they do not build it during installation.
 
 ## Build and credentials
 
-From a signed source revision on an Apple-silicon Mac:
+From an accepted release source on an Apple-silicon Mac:
 
 ```sh
 ./packaging/macos/package.sh
 ./tests/release/clean-host.sh --package-only
 ```
 
+Packaging accepts a trusted signed `HEAD` or a trusted annotated `v<version>`
+tag pointing exactly to `HEAD`. It rejects lightweight tags, arbitrary tags,
+signed ancestors, and matching trees.
+
 The package builder uses `cargo build --locked`, builds the native Swift attach
 bridge, strips the three executables, and records their SHA-256 values and the
 full source revision in `build-manifest.json`. It emits only the final package
-path on stdout. The builder requires a signed, frozen Git HEAD and rejects
-tracked or untracked release-input changes before and after the build. The
+path on stdout. The builder requires an accepted release source and a frozen
+Git HEAD, and rejects tracked or untracked release-input changes before and
+after the build. The
 frozen set includes the Rust toolchain selector, protobuf sources, approved
 workspace-image reference, and workspace version lock as well as Rust, Swift,
 packaging, helper-build, license, and Cargo inputs. Ignored build caches are
@@ -50,7 +55,7 @@ version and install root, checksum equality, and exactly one `arm64` slice per
 executable. On macOS 26, `pkgbuild` serializes the protected
 `com.apple.provenance` xattr as paired AppleDouble records; the verifier allows
 only that exact pairing and rejects any other payload path or extracted xattr.
-The clean-host gate requires the embedded revision to equal that signed HEAD.
+The clean-host gate requires the embedded revision to equal that frozen HEAD.
 
 Release credentials are optional inputs and are never stored in the repository
 or package:

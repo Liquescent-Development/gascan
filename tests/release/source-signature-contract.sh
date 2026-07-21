@@ -52,4 +52,7 @@ git -C "$fixture" tag -d v0.1.0 >/dev/null
 git -C "$fixture" tag -s v0.1.0 -m release "$unsigned"
 gascan_verify_release_source "$fixture" "$unsigned" 0.1.0
 
+grep -Fq 'trusted signed commit or the exact signed release tag' "$repo_root/README.md"
+grep -Fq 'v<version>' "$repo_root/docs/release/macos-checklist.md"
+
 printf 'PASS: Gas Can release source-signature contract\n'
