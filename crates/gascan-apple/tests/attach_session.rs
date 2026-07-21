@@ -1,20 +1,11 @@
-use std::path::PathBuf;
-
-use gascan_apple::{AppleAttach, AttachInput, AttachOutput};
+use gascan_apple::{AttachInput, AttachOutput};
 use gascan_core::runtime::RuntimeError;
 
-type TestError = Box<dyn std::error::Error + Send + Sync>;
+mod support;
 
-fn fake_helper() -> AppleAttach {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/fake-attach-helper/Cargo.toml");
-    AppleAttach::new(env!("CARGO")).with_helper_args([
-        "run".to_owned(),
-        "--quiet".to_owned(),
-        "--manifest-path".to_owned(),
-        manifest.to_string_lossy().into_owned(),
-    ])
-}
+use support::fake_helper;
+
+type TestError = Box<dyn std::error::Error + Send + Sync>;
 
 #[tokio::test]
 async fn fake_helper_proves_binary_streams_control_and_exact_exit() -> Result<(), TestError> {
