@@ -89,8 +89,7 @@ gh release create "$tag" --draft --title "Gas Can $version" --notes-file "$work/
 gh release upload "$tag" \
   "$package" "$work/$base.sha256" "$work/build-manifest.json"
 assets=$(gh release view "$tag" --json assets --jq '[.assets[].name] | sort | join(",")')
-expected=$(jq -n --arg a "$base" --arg b "$base.sha256" --arg c "build-manifest.json" \
-  '[$a, $b, $c] | sort | join(",")')
+expected=$(gascan_expected_release_assets "$base")
 [[ $assets == "$expected" ]] || {
   printf 'release assets are incomplete: %s\n' "$assets" >&2
   exit 65

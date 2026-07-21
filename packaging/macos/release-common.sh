@@ -153,6 +153,23 @@ gascan_audit_clean_host() {
 # shellcheck disable=SC2034 # consumed by publish.sh, which sources this file
 GASCAN_RELEASE_TEAM=Z548WR4TF8
 
+# The exact asset set a published release must carry, as a sorted,
+# comma-joined list. Both this and the observed value from
+# `gh release view --json assets --jq` are built with the same
+# `sort | join(",")` pipeline so neither side depends on a hand-written
+# ordering: codepoint sort puts build-manifest.json first, ahead of the
+# package.
+#
+# Raw output is part of the contract. `gh --jq` prints raw text, so encoding
+# this side as JSON would wrap it in quotes and the two could never compare
+# equal -- the check would reject every release rather than the incomplete ones
+# it exists to catch.
+gascan_expected_release_assets() {
+  local base=$1
+  jq -rn --arg a "$base" --arg b "$base.sha256" --arg c build-manifest.json \
+    '[$a, $b, $c] | sort | join(",")'
+}
+
 # Every path pkgutil reports for a Gas Can package payload. macOS 26's pkgbuild
 # serializes its protected com.apple.provenance xattr as paired AppleDouble
 # records, so those are part of the expected set. This is the single definition

@@ -292,10 +292,29 @@ grep -Fq '.sha256' "$publish"
 # same `sort | join(",")` jq pipeline as the actual `gh release view` value,
 # never a hand-ordered string — otherwise codepoint sort places
 # build-manifest.json first and the two sides can never be equal.
-pipeline_count=$(grep -o 'sort | join(",")' "$publish" | wc -l | tr -d ' ')
+grep -Fq 'gascan_expected_release_assets "$base"' "$publish" || {
+  printf 'publish.sh does not derive expected assets from the shared helper\n' >&2
+  exit 1
+}
+pipeline_count=$(grep -hv '^[[:space:]]*#' "$publish" "$repo_root/packaging/macos/release-common.sh" |
+  grep -o 'sort | join(",")' | wc -l | tr -d ' ')
 [[ $pipeline_count -eq 2 ]] || {
   printf 'expected two sort | join(",") pipelines guarding release assets, found %s\n' \
     "$pipeline_count" >&2
+  exit 1
+}
+
+# C2: execute that helper rather than pattern-matching it. The happy path
+# cannot run offline, so this is the only place the comparison's actual output
+# is observed. It must be raw text in codepoint order: emitting a JSON-encoded
+# string wraps it in quotes, which compares unequal to the raw value `gh --jq`
+# returns and would reject every release, complete or not.
+source "$repo_root/packaging/macos/release-common.sh"
+observed_assets=$(gascan_expected_release_assets gascan-9.9.9-macos-arm64.pkg)
+want_assets='build-manifest.json,gascan-9.9.9-macos-arm64.pkg,gascan-9.9.9-macos-arm64.pkg.sha256'
+[[ $observed_assets == "$want_assets" ]] || {
+  printf 'expected asset list is not raw sorted text\n  want: %s\n  got:  %s\n' \
+    "$want_assets" "$observed_assets" >&2
   exit 1
 }
 
