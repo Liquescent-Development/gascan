@@ -154,7 +154,7 @@ gascan_audit_clean_host() {
 GASCAN_RELEASE_TEAM=Z548WR4TF8
 
 gascan_assert_distributable_package() {
-  local package=$1 team=$2 signature work relative
+  local package=$1 team=$2 signature work
   [[ $team =~ ^[A-Z0-9]{10}$ ]] || {
     printf 'team identifier must be ten uppercase alphanumeric characters\n' >&2
     return 64
@@ -195,14 +195,47 @@ gascan_assert_distributable_package() {
     printf 'package payload could not be extracted\n' >&2
     return 65
   fi
-  for relative in usr/local/bin/gascan usr/local/bin/gascand \
-    usr/local/bin/gascan-apple-attach; do
-    if ! codesign --verify --strict \
-      -R "=anchor apple generic and certificate leaf[subject.OU] = $team" \
-      "$work/root/$relative" >/dev/null 2>&1; then
+  if [[ -e $work/pkg/Scripts ]]; then
+    rm -rf "$work"
+    printf 'package carries installer scripts\n' >&2
+    return 65
+  fi
+  local -a executables=(gascan gascan-apple-attach gascand)
+  local requirement found entry
+  found=$(cd "$work/root/usr/local/bin" 2>/dev/null && find . -type f -print) || {
+    rm -rf "$work"
+    printf 'package payload has no usr/local/bin directory\n' >&2
+    return 65
+  }
+  found=$(sed 's|^\./||' <<<"$found" | LC_ALL=C sort)
+  while IFS= read -r entry; do
+    [[ -n $entry ]] || continue
+    case " ${executables[*]} " in
+      *" $entry "*) ;;
+      *)
+        rm -rf "$work"
+        printf 'package payload holds an unexpected file: usr/local/bin/%s\n' "$entry" >&2
+        return 65
+        ;;
+    esac
+  done <<<"$found"
+  # Apple's canonical Developer ID requirement: the team owns the leaf, the
+  # intermediate carries the Developer ID marker, and the leaf carries the
+  # Developer ID Application marker.
+  requirement="=anchor apple generic and certificate leaf[subject.OU] = $team"
+  requirement+=" and certificate 1[field.1.2.840.113635.100.6.2.6] exists"
+  requirement+=" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
+  for entry in "${executables[@]}"; do
+    if [[ ! -f $work/root/usr/local/bin/$entry ]]; then
+      rm -rf "$work"
+      printf 'package payload is missing an executable: usr/local/bin/%s\n' "$entry" >&2
+      return 65
+    fi
+    if ! codesign --verify --strict -R "$requirement" \
+      "$work/root/usr/local/bin/$entry" >/dev/null 2>&1; then
       rm -rf "$work"
       printf 'executable is not Developer ID signed by team %s: %s\n' \
-        "$team" "$relative" >&2
+        "$team" "usr/local/bin/$entry" >&2
       return 65
     fi
   done

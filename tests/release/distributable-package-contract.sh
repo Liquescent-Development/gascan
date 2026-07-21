@@ -8,26 +8,41 @@ trap 'rm -rf "$fixture"' EXIT
 
 team=Z548WR4TF8
 
+# The exit code is part of the published interface: publish.sh branches on it.
+# Every rejection asserts the exact status, never merely "nonzero".
+assert_status() {
+  local label=$1 expected=$2 rc=0
+  shift 2
+  ( "$@" ) 2>/dev/null || rc=$?
+  [[ $rc -eq $expected ]] || {
+    printf '%s: expected exit %s, got %s\n' "$label" "$expected" "$rc" >&2
+    exit 1
+  }
+}
+
+# Run the helper with stub overrides exported into the subshell assert_status
+# already provides.
+run_helper() {
+  local package=$1 team_argument=$2
+  shift 2
+  if [[ $# -gt 0 ]]; then
+    # shellcheck disable=SC2163 # positional parameters are NAME=VALUE pairs
+    export "$@"
+  fi
+  gascan_assert_distributable_package "$package" "$team_argument"
+}
+
 # A real, genuinely unsigned package. pkgbuild over an empty root is instant.
 mkdir "$fixture/empty-root"
 pkgbuild --quiet --root "$fixture/empty-root" \
   --identifier dev.gascan.test --version 1 "$fixture/unsigned.pkg"
 
 # Real tools must reject the real unsigned package.
-if gascan_assert_distributable_package "$fixture/unsigned.pkg" "$team"; then
-  printf 'unsigned package accepted\n' >&2
-  exit 1
-fi
+assert_status 'real unsigned package' 65 \
+  gascan_assert_distributable_package "$fixture/unsigned.pkg" "$team"
 
-# Malformed inputs.
-if gascan_assert_distributable_package "$fixture/unsigned.pkg" not-a-team; then
-  printf 'malformed team identifier accepted\n' >&2
-  exit 1
-fi
-if gascan_assert_distributable_package "$fixture/missing.pkg" "$team"; then
-  printf 'missing package accepted\n' >&2
-  exit 1
-fi
+assert_status 'missing package' 66 \
+  gascan_assert_distributable_package "$fixture/missing.pkg" "$team"
 
 # Stub the signing tools to isolate each individual gate. Each stub forwards
 # every subcommand it does not simulate to the real tool.
@@ -40,18 +55,25 @@ set -euo pipefail
 if [[ ${1:-} != --check-signature ]]; then
   exec /usr/sbin/pkgutil "$@"
 fi
+# Each case trips exactly one gate: the certificate lines below satisfy every
+# gate except the one the case is named for.
 case ${GASCAN_STUB_PKGUTIL:-ok} in
-  unsigned)
-    printf 'Package "x":\n   Status: no signature\n'; exit 1 ;;
+  untrusted)
+    printf 'Package "x":\n   Status: signed by an untrusted certificate\n'
+    printf '   1. Developer ID Installer: Liquescent Development LLC (Z548WR4TF8)\n'
+    exit 1 ;;
   other-cert)
     printf 'Package "x":\n   Status: signed by a certificate trusted by macOS\n'
-    printf '   1. Some Other Certificate\n'; exit 0 ;;
+    printf '   1. Apple Development: Liquescent Development LLC (Z548WR4TF8)\n'; exit 0 ;;
   other-team)
     printf 'Package "x":\n   Status: signed by a Developer ID Installer certificate\n'
     printf '   1. Developer ID Installer: Other LLC (AAAAAAAAAA)\n'; exit 0 ;;
   ok)
     printf 'Package "x":\n   Status: signed by a Developer ID Installer certificate\n'
     printf '   1. Developer ID Installer: Liquescent Development LLC (Z548WR4TF8)\n'; exit 0 ;;
+  *)
+    printf 'pkgutil stub: unknown scenario: %s\n' "${GASCAN_STUB_PKGUTIL:-}" >&2
+    exit 70 ;;
 esac
 STUB
 
@@ -72,9 +94,37 @@ fi
 exit 0
 STUB
 
+# The requirement string is the substance of the strongest gate, so the stub
+# validates what it was handed before it consults the scenario variable.
 cat >"$stub_bin/codesign" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
+strict=false
+requirement=
+while (($#)); do
+  case $1 in
+    --strict) strict=true ;;
+    -R) requirement=${2:-}; shift ;;
+  esac
+  shift
+done
+[[ $strict == true ]] || {
+  printf 'codesign stub: --strict is missing\n' >&2; exit 90
+}
+[[ $requirement == *'subject.OU] = Z548WR4TF8'* ]] || {
+  printf 'codesign stub: requirement does not pin the team: %s\n' "$requirement" >&2
+  exit 91
+}
+[[ $requirement == *'certificate 1[field.1.2.840.113635.100.6.2.6] exists'* ]] || {
+  printf 'codesign stub: requirement lacks the Developer ID intermediate OID: %s\n' \
+    "$requirement" >&2
+  exit 92
+}
+[[ $requirement == *'certificate leaf[field.1.2.840.113635.100.6.1.13] exists'* ]] || {
+  printf 'codesign stub: requirement lacks the Developer ID leaf OID: %s\n' \
+    "$requirement" >&2
+  exit 93
+}
 [[ ${GASCAN_STUB_CODESIGN:-ok} == ok ]] || exit 3
 exit 0
 STUB
@@ -82,8 +132,8 @@ STUB
 chmod +x "$stub_bin"/*
 PATH=$stub_bin:$PATH
 
-# Build a package whose payload holds the three expected executables so the
-# per-executable requirement check has something to walk.
+# Build a package whose payload holds exactly the three expected executables so
+# the per-executable requirement check has something to walk.
 mkdir -p "$fixture/root/usr/local/bin"
 for binary in gascan gascand gascan-apple-attach; do
   printf '#!/bin/sh\n' >"$fixture/root/usr/local/bin/$binary"
@@ -91,30 +141,52 @@ done
 pkgbuild --quiet --root "$fixture/root" \
   --identifier dev.gascan.pkg --version 1 "$fixture/payload.pkg"
 
+# Payloads that differ from the allowlist, and a payload carrying scripts.
+cp -R "$fixture/root" "$fixture/extra-root"
+printf '#!/bin/sh\n' >"$fixture/extra-root/usr/local/bin/EXTRA-UNSIGNED-BINARY"
+pkgbuild --quiet --root "$fixture/extra-root" \
+  --identifier dev.gascan.pkg --version 1 "$fixture/extra.pkg"
+
+cp -R "$fixture/root" "$fixture/incomplete-root"
+rm "$fixture/incomplete-root/usr/local/bin/gascand"
+pkgbuild --quiet --root "$fixture/incomplete-root" \
+  --identifier dev.gascan.pkg --version 1 "$fixture/incomplete.pkg"
+
+mkdir "$fixture/scripts"
+printf '#!/bin/sh\nexit 0\n' >"$fixture/scripts/postinstall"
+chmod +x "$fixture/scripts/postinstall"
+pkgbuild --quiet --root "$fixture/root" --scripts "$fixture/scripts" \
+  --identifier dev.gascan.pkg --version 1 "$fixture/scripted.pkg"
+
 # With every stub healthy the helper must accept.
 gascan_assert_distributable_package "$fixture/payload.pkg" "$team"
 
-# Each gate must fail on its own. The helper is a shell function, so the
-# override runs in a subshell rather than through `env`.
-assert_rejects() {
-  local label=$1
-  shift
-  if (
-    # shellcheck disable=SC2163 # positional parameters are NAME=VALUE pairs
-    export "$@"
-    gascan_assert_distributable_package "$fixture/payload.pkg" "$team"
-  ) 2>/dev/null; then
-    printf '%s accepted\n' "$label" >&2
-    exit 1
-  fi
-}
+# The malformed-team gate is asserted against the package that otherwise
+# passes, so the team gate is the only possible reason for the rejection.
+assert_status 'malformed team identifier' 64 \
+  run_helper "$fixture/payload.pkg" not-a-team
 
-assert_rejects 'unsigned package' GASCAN_STUB_PKGUTIL=unsigned
-assert_rejects 'non-Developer-ID certificate' GASCAN_STUB_PKGUTIL=other-cert
-assert_rejects 'foreign team signature' GASCAN_STUB_PKGUTIL=other-team
-assert_rejects 'Gatekeeper rejection' GASCAN_STUB_SPCTL=reject
-assert_rejects 'missing notarization ticket' GASCAN_STUB_STAPLER=reject
-assert_rejects 'unsigned executable' GASCAN_STUB_CODESIGN=reject
+# Each gate must fail on its own, with the trust-failure status.
+assert_status 'untrusted package signature' 65 \
+  run_helper "$fixture/payload.pkg" "$team" GASCAN_STUB_PKGUTIL=untrusted
+assert_status 'non-Developer-ID certificate' 65 \
+  run_helper "$fixture/payload.pkg" "$team" GASCAN_STUB_PKGUTIL=other-cert
+assert_status 'foreign team signature' 65 \
+  run_helper "$fixture/payload.pkg" "$team" GASCAN_STUB_PKGUTIL=other-team
+assert_status 'Gatekeeper rejection' 65 \
+  run_helper "$fixture/payload.pkg" "$team" GASCAN_STUB_SPCTL=reject
+assert_status 'missing notarization ticket' 65 \
+  run_helper "$fixture/payload.pkg" "$team" GASCAN_STUB_STAPLER=reject
+assert_status 'unsigned executable' 65 \
+  run_helper "$fixture/payload.pkg" "$team" GASCAN_STUB_CODESIGN=reject
+
+# The whole payload is gated, not three names.
+assert_status 'payload with an extra executable' 65 \
+  gascan_assert_distributable_package "$fixture/extra.pkg" "$team"
+assert_status 'payload missing an executable' 65 \
+  gascan_assert_distributable_package "$fixture/incomplete.pkg" "$team"
+assert_status 'payload carrying installer scripts' 65 \
+  gascan_assert_distributable_package "$fixture/scripted.pkg" "$team"
 
 # The pinned team identifier must appear in release-common.sh.
 grep -Fq 'Z548WR4TF8' "$repo_root/packaging/macos/release-common.sh"
