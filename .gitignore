@@ -2,3 +2,13 @@
 .worktrees/
 .artifacts/
 .tokensave/
+
+# Cargo build output. Previously ignored only via a personal global gitignore,
+# so on any other machine it dirtied the release-input cleanliness check.
+target/
+
+# Generated when the workspace test suite builds this test fixture crate.
+# Untracked and unignored, it made gascan_assert_release_inputs_clean fail,
+# so running the tests made packaging refuse to build a release.
+# Scoped deliberately: the workspace Cargo.lock is a tracked release input.
+crates/gascan-apple/tests/fixtures/fake-attach-helper/Cargo.lock

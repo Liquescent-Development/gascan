@@ -72,6 +72,57 @@ passwords, API keys, or notarization credentials as command-line values.
 An artifact built without these inputs is an unsigned development artifact and
 is not signing, notarization, or distribution evidence.
 
+## Publish
+
+Notarization requires a stored credential profile once per machine:
+
+```sh
+xcrun notarytool store-credentials gascan-notary \
+  --key <AuthKey_XXXXXXXXXX.p8> --key-id <KEY_ID> --issuer <ISSUER_UUID>
+```
+
+From the signed release tag, push it, build, and publish:
+
+```sh
+git checkout v<version>
+git push origin v<version>
+export GASCAN_CODESIGN_IDENTITY="Developer ID Application: Liquescent Development LLC (Z548WR4TF8)"
+export GASCAN_INSTALLER_SIGNING_IDENTITY="Developer ID Installer: Liquescent Development LLC (Z548WR4TF8)"
+export GASCAN_NOTARYTOOL_PROFILE=gascan-notary
+package=$(./packaging/macos/package.sh)
+./packaging/macos/publish.sh "$package"
+```
+
+The tag must be pushed before publishing: `publish.sh` binds the GitHub release
+to the signed tag with `--verify-tag --target`, and `--verify-tag` aborts if
+that tag does not already exist on the remote. Without the push, `gh` would
+otherwise create its own lightweight, unsigned tag at the default branch's
+head once the draft cleared, breaking the release's traceability to the signed
+commit.
+
+`publish.sh` refuses any package that is not Developer ID signed, notarized,
+stapled, and bound to the exact signed tag. It creates the release as a draft,
+uploads the package, its checksum, and `build-manifest.json`, and clears the
+draft flag only after all three assets are present. It prints the asset URL and
+the SHA-256.
+
+Render the cask with that checksum and commit it to the tap:
+
+```sh
+./packaging/macos/render-cask.sh <version> <sha256> >Casks/gascan.rb
+```
+
+A published release is never overwritten and `publish.sh` never passes a
+clobber flag. A draft, however, still satisfies `gh release view`, so a
+publish that fails or is interrupted after `gh release create` leaves a
+stranded draft that blocks re-publishing the same version with
+`release v<version> already exists`. Delete the stranded draft before
+retrying:
+
+```sh
+gh release delete v<version> --cleanup-tag --yes
+```
+
 ## Install and verify
 
 Install Apple `container` 1.1.0, start its service, then run:
