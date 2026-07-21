@@ -55,5 +55,5 @@ prove the existing signed-commit path, the new signed-version-tag path, and all
 four rejection cases above. The test must fail against the current commit-only
 implementation before production code changes. Afterward, the focused release
 contracts, shell lint, formatting, strict Clippy, and workspace tests run again.
-Finally, the real signed `v0.1.0` tag and README package command are verified on
-the supported Mac before the correction is merged.
+Finally, the correction is merged, then the real signed `v0.1.0` tag and README
+package command are verified on the supported Mac.

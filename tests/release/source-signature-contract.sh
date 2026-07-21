@@ -49,6 +49,16 @@ if gascan_verify_release_source "$fixture" "$unsigned" 0.1.0; then
 fi
 git -C "$fixture" tag -d v0.1.0 >/dev/null
 
+alternate=$(printf 'same-tree alternate commit\n' | git -C "$fixture" commit-tree "$unsigned^{tree}" -p "$signed")
+[[ $alternate != "$unsigned" ]]
+[[ $(git -C "$fixture" rev-parse "$alternate^{tree}") == $(git -C "$fixture" rev-parse "$unsigned^{tree}") ]]
+git -C "$fixture" tag -s v0.1.0 -m same-tree-wrong-target "$alternate"
+if gascan_verify_release_source "$fixture" "$unsigned" 0.1.0; then
+  printf 'signed release tag for tree-equivalent commit accepted\n' >&2
+  exit 1
+fi
+git -C "$fixture" tag -d v0.1.0 >/dev/null
+
 git -C "$fixture" tag -s v0.1.0 -m release "$unsigned"
 gascan_verify_release_source "$fixture" "$unsigned" 0.1.0
 
