@@ -121,14 +121,33 @@ version=$(cd "$repo_root" && cargo metadata --locked --no-deps --format-version 
 tag="v$version"
 team=$(bash -c "source '$repo_root/packaging/macos/release-common.sh'; printf '%s' \"\$GASCAN_RELEASE_TEAM\"")
 
-# Case A: the release tag exists (this repository ships an annotated, signed
-# v0.1.1 tag) but does not peel to HEAD on this branch. Available with no
-# setup. This is a behavioral replacement for the old source-text greps for
-# 'refs/tags/' and 'verify-tag', which a mutation (replacing the whole tag
-# gate with `true`) sailed straight through.
+# Case A: an annotated, genuinely signed v<version> release tag that does not
+# peel to HEAD. Built in its own disposable clone with an ephemeral ed25519
+# signing key and allowed-signers file (same technique as
+# source-signature-contract.sh), so the property holds for whatever the
+# workspace version happens to be, before or after any real release is cut —
+# unlike depending on this repository's actual v0.1.1 tag, which is only ever
+# true of one snapshot in time. This is a behavioral replacement for the old
+# source-text greps for 'refs/tags/' and 'verify-tag', which a mutation
+# (replacing the whole tag gate with `true`) sailed straight through.
+clone_a=$fixture/clone-a
+git clone --quiet "$repo_root" "$clone_a"
+ssh-keygen -q -t ed25519 -N '' -C release@example.invalid -f "$fixture/case-a-key"
+printf 'release@example.invalid %s\n' "$(cat "$fixture/case-a-key.pub")" \
+  >"$fixture/case-a-allowed-signers"
+git -C "$clone_a" config user.name release
+git -C "$clone_a" config user.email release@example.invalid
+git -C "$clone_a" config gpg.format ssh
+git -C "$clone_a" config user.signingKey "$fixture/case-a-key"
+git -C "$clone_a" config gpg.ssh.allowedSignersFile "$fixture/case-a-allowed-signers"
+not_head=$(git -C "$clone_a" rev-parse HEAD~1)
+git -C "$clone_a" tag -d "$tag" >/dev/null 2>&1 || true
+git -C "$clone_a" tag -s "$tag" -m "publish-contract test fixture: not HEAD" "$not_head"
+git -C "$clone_a" verify-tag "$tag" >/dev/null 2>&1
+
 : >"$GASCAN_STUB_GH_LOG"
 set +e
-case_a_err=$(PATH=$stub_bin:$PATH "$publish" "$fixture/unsigned.pkg" 2>&1 >/dev/null)
+case_a_err=$(PATH=$stub_bin:$PATH "$clone_a/packaging/macos/publish.sh" "$fixture/unsigned.pkg" 2>&1 >/dev/null)
 case_a_status=$?
 set -e
 if [[ $case_a_status -eq 0 ]]; then
