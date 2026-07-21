@@ -4,6 +4,18 @@ gascan_user_runtime_root() {
   printf '/private/tmp/gascan-%s\n' "$(id -u)"
 }
 
+gascan_verify_release_source() {
+  local repo=$1 revision=$2 version=$3 tag object_type target
+  git -C "$repo" verify-commit "$revision" >/dev/null 2>&1 && return 0
+  [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  tag="v$version"
+  object_type=$(git -C "$repo" cat-file -t "refs/tags/$tag" 2>/dev/null) || return 1
+  [[ $object_type == tag ]] || return 1
+  git -C "$repo" verify-tag "refs/tags/$tag" >/dev/null 2>&1 || return 1
+  target=$(git -C "$repo" rev-parse --verify "refs/tags/$tag^{}") || return 1
+  [[ $target == "$revision" ]]
+}
+
 gascan_assert_release_inputs_clean() {
   local repo=$1 label=$2 path ignored_source
   local -a inputs=(

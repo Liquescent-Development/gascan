@@ -29,8 +29,8 @@ revision=$(git rev-parse --verify HEAD)
   printf 'source revision is not a full Git object ID\n' >&2
   exit 1
 }
-git verify-commit "$revision" >/dev/null 2>&1 || {
-  printf 'release source HEAD does not have a trusted Git signature\n' >&2
+gascan_verify_release_source "$repo_root" "$revision" "$version" || {
+  printf 'release source HEAD needs a trusted commit signature or exact signed v%s tag\n' "$version" >&2
   exit 65
 }
 if ! gascan_assert_release_inputs_clean "$repo_root" "$revision"; then
