@@ -88,7 +88,13 @@ The recorded locations and accepted heads are:
 | `.worktrees/macos-mvp` | `feature/macos-mvp` | `917dac1` | integration branch through Gate 3 |
 | `.worktrees/apple-backend` | `feature/apple-backend` | `dbf4235` | reviewed Plan 3 implementation and Gate 4 harness |
 | `.worktrees/provisioning` | `feature/provisioning` | `f6ed3a5` | accepted connected image, Gascamp, offline bundles, and image gates |
-| `.worktrees/gate4-integration` | `feature/gate4-integration` | final reviewed status head `280f835`; live Gate 5 artifact head `4a6d4ee` | Gate 4 integration, Plan 4 Tasks 5–8, and accepted live Gate 4/Gate 5 evidence from frozen base `917dac1` |
+| `.worktrees/gate4-integration` | `feature/gate4-integration` | canonical completion documentation baseline `4097bb5` or a signed descendant containing this handoff; final verified implementation head `280f835`; live Gate 5 artifact head `4a6d4ee` | Gate 4 integration, Plan 4 Tasks 5–8, and accepted live Gate 4/Gate 5 evidence from frozen base `917dac1` |
+
+`4097bb5` is the first signed commit that durably records Gate 5 and macOS MVP
+completion. This correction and any later signed documentation descendants
+supersede it as the current branch head. `280f835` remains the final verified
+implementation/test-only successor, not the canonical documentation restart
+point; `4a6d4ee` remains the live release-semantics and artifact head.
 
 The Task 7 feature merges were reviewed from their shared frozen base rather
 than accepted wholesale. The deliberately deferred offline path remains
@@ -321,10 +327,14 @@ Then read, in order:
 4. `docs/superpowers/plans/2026-07-15-connected-workspace-image.md`;
 5. the relevant task plan before modifying its branch.
 
-If a fresh session is asked for current status, start from final reviewed head
-`280f835` and report from this document. Do not rerun live gates unless fresh
-verification is explicitly requested. Further implementation is deferred work
-and requires explicit authorization.
+If a fresh session is asked for current status, start from the current signed
+`feature/gate4-integration` head that contains this canonical handoff. It must
+include completion-documentation baseline `4097bb5`; a signed descendant is
+expected after documentation corrections. Do not reset or anchor the session
+at implementation evidence head `280f835`, because that commit predates the
+completion documentation. Report from this document and do not rerun live
+gates unless fresh verification is explicitly requested. Further
+implementation is deferred work and requires explicit authorization.
 
 Before claiming any gate, obtain and record that gate's required evidence.
 Future gate claims still require their exact evidence. Gate 4 was not inferred
