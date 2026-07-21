@@ -148,3 +148,62 @@ gascan_audit_clean_host() {
   jq -e 'type == "array" and ([.[] | select(test("^gascan-[0-9a-f]{32}\\.test$"))] | length) == 0' <<<"$dns" >/dev/null || { printf '%s: Gas Can test DNS route remains\n' "$label" >&2; failed=true; }
   [[ $failed == false ]]
 }
+
+# The exact Apple Developer team that signs Gas Can releases.
+GASCAN_RELEASE_TEAM=Z548WR4TF8
+
+gascan_assert_distributable_package() {
+  local package=$1 team=$2 signature work relative
+  [[ $team =~ ^[A-Z0-9]{10}$ ]] || {
+    printf 'team identifier must be ten uppercase alphanumeric characters\n' >&2
+    return 64
+  }
+  [[ -f $package ]] || {
+    printf 'package does not exist: %s\n' "$package" >&2
+    return 66
+  }
+  signature=$(pkgutil --check-signature "$package" 2>&1) || {
+    printf 'package is not signed\n' >&2
+    return 65
+  }
+  grep -Fq 'Developer ID Installer' <<<"$signature" || {
+    printf 'package is not signed by a Developer ID Installer certificate\n' >&2
+    return 65
+  }
+  grep -Fq "($team)" <<<"$signature" || {
+    printf 'package signature does not belong to team %s\n' "$team" >&2
+    return 65
+  }
+  spctl --assess --type install "$package" >/dev/null 2>&1 || {
+    printf 'Gatekeeper rejects the package as an install candidate\n' >&2
+    return 65
+  }
+  xcrun stapler validate "$package" >/dev/null 2>&1 || {
+    printf 'package has no stapled notarization ticket\n' >&2
+    return 65
+  }
+  work=$(mktemp -d "${TMPDIR:-/tmp}/gascan-distributable.XXXXXX") || return 70
+  if ! pkgutil --expand "$package" "$work/pkg" >/dev/null 2>&1; then
+    rm -rf "$work"
+    printf 'package could not be expanded\n' >&2
+    return 65
+  fi
+  mkdir "$work/root"
+  if ! (cd "$work/root" && gzip -dc "$work/pkg/Payload" | cpio -idm --quiet); then
+    rm -rf "$work"
+    printf 'package payload could not be extracted\n' >&2
+    return 65
+  fi
+  for relative in usr/local/bin/gascan usr/local/bin/gascand \
+    usr/local/bin/gascan-apple-attach; do
+    if ! codesign --verify --strict \
+      -R "=anchor apple generic and certificate leaf[subject.OU] = $team" \
+      "$work/root/$relative" >/dev/null 2>&1; then
+      rm -rf "$work"
+      printf 'executable is not Developer ID signed by team %s: %s\n' \
+        "$team" "$relative" >&2
+      return 65
+    fi
+  done
+  rm -rf "$work"
+}
