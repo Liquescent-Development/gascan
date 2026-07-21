@@ -22,7 +22,7 @@ cask "gascan" do
   desc "Secure local sandbox for agentic coding"
   homepage "https://github.com/Liquescent-Development/gascan"
 
-  depends_on macos: ">= :tahoe"
+  depends_on macos: :tahoe
   depends_on arch: :arm64
 
   pkg "gascan-#{version}-macos-arm64.pkg"

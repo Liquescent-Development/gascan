@@ -23,9 +23,11 @@ fi
 grep -Fq "version \"$version\"" "$fixture/gascan.rb"
 grep -Fq "sha256 \"$checksum\"" "$fixture/gascan.rb"
 grep -Fq 'depends_on arch: :arm64' "$fixture/gascan.rb"
-grep -Fq 'depends_on macos: ">= :tahoe"' "$fixture/gascan.rb"
+grep -Fq 'depends_on macos: :tahoe' "$fixture/gascan.rb"
 grep -Fq 'pkgutil: "dev.gascan.pkg"' "$fixture/gascan.rb"
 grep -Fq 'container 1.1.0' "$fixture/gascan.rb"
+grep -Fq 'url "https://github.com/Liquescent-Development/gascan/releases/download/v#{version}/gascan-#{version}-macos-arm64.pkg"' "$fixture/gascan.rb"
+grep -Fq 'pkg "gascan-#{version}-macos-arm64.pkg"' "$fixture/gascan.rb"
 
 # Rendering must be deterministic.
 "$render" "$version" "$checksum" >"$fixture/again.rb"
