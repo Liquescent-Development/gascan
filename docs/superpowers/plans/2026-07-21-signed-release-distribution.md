@@ -531,6 +531,15 @@ git commit -m "feat: gate release publication on a distributable package"
 
 ### Task 3: Cask rendering
 
+> **Amended after review.** The cask code below uses
+> `depends_on macos: ">= :tahoe"`. That string-comparison form is deprecated in
+> Homebrew and raises `MethodDeprecatedError` under `HOMEBREW_DEVELOPER=1`,
+> which `brew style` and `brew audit` enable automatically. The shipped
+> renderer uses the canonical symbol form `depends_on macos: :tahoe`. The
+> contract was also extended to assert the `url` and `pkg` stanzas, which the
+> draft below leaves unverified — mutating either to break every install passed
+> the draft test. Read `packaging/macos/render-cask.sh` as built.
+
 **Files:**
 - Create: `packaging/macos/render-cask.sh`
 - Test: `tests/release/cask-contract.sh`
