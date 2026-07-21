@@ -46,13 +46,23 @@ pub struct AppleE2e {
     cleanup_manifest: Option<std::path::PathBuf>,
 }
 
+#[cfg(target_os = "macos")]
+fn default_session_root() -> std::path::PathBuf {
+    std::path::PathBuf::from("/private/tmp")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn default_session_root() -> std::path::PathBuf {
+    std::env::temp_dir()
+}
+
 impl AppleE2e {
     pub fn new(name: &str) -> TestResult<Self> {
         let manifest =
             std::env::var_os("GASCAN_E2E_CLEANUP_MANIFEST").map(std::path::PathBuf::from);
         let session_root = std::env::var_os("GASCAN_E2E_SESSION_ROOT")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
+            .unwrap_or_else(default_session_root);
         let error_diagnostics = std::env::var_os("GASCAN_GATE4_DIAGNOSTICS").is_some();
         Self::new_scoped_with_diagnostics(name, session_root, manifest, error_diagnostics)
     }
@@ -1469,6 +1479,22 @@ mod tests {
         assert_eq!(
             std::fs::metadata(&env.runtime_root)?.permissions().mode() & 0o777,
             0o700
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn default_gate4_runtime_socket_fits_the_macos_unix_path_limit() -> TestResult {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let env = AppleE2e::new("socket-path-bound")?;
+        let socket = env.runtime_root.join("gascan/gascand.sock");
+        assert!(env.runtime_root.starts_with("/private/tmp"));
+        assert!(
+            socket.as_os_str().as_bytes().len() < 104,
+            "Gate 4 runtime socket exceeds macOS sockaddr_un.sun_path: {}",
+            socket.display()
         );
         Ok(())
     }
