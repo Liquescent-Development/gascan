@@ -7,7 +7,6 @@ fixture=$(mktemp -d "${TMPDIR:-/tmp}/gascan-distributable-contract.XXXXXX")
 trap 'rm -rf "$fixture"' EXIT
 
 team=Z548WR4TF8
-other=AAAAAAAAAA
 
 # A real, genuinely unsigned package. pkgbuild over an empty root is instant.
 mkdir "$fixture/empty-root"
@@ -100,8 +99,11 @@ gascan_assert_distributable_package "$fixture/payload.pkg" "$team"
 assert_rejects() {
   local label=$1
   shift
-  if ( export "$@"
-       gascan_assert_distributable_package "$fixture/payload.pkg" "$team" ) 2>/dev/null; then
+  if (
+    # shellcheck disable=SC2163 # positional parameters are NAME=VALUE pairs
+    export "$@"
+    gascan_assert_distributable_package "$fixture/payload.pkg" "$team"
+  ) 2>/dev/null; then
     printf '%s accepted\n' "$label" >&2
     exit 1
   fi

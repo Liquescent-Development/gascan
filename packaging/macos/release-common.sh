@@ -150,6 +150,7 @@ gascan_audit_clean_host() {
 }
 
 # The exact Apple Developer team that signs Gas Can releases.
+# shellcheck disable=SC2034 # consumed by publish.sh, which sources this file
 GASCAN_RELEASE_TEAM=Z548WR4TF8
 
 gascan_assert_distributable_package() {
