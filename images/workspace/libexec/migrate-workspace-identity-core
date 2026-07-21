@@ -1,0 +1,44 @@
+#!/bin/sh
+set -eu
+
+test "$#" -eq 6
+passwd_file=$1
+group_file=$2
+home_root=$3
+usermod_bin=$4
+groupmod_bin=$5
+stat_bin=$6
+
+old_home=$home_root/ubuntu
+new_home=$home_root/workspace
+expected_user="ubuntu:x:1000:1000:Ubuntu:$old_home:/bin/bash"
+expected_group='ubuntu:x:1000:'
+expected_workspace_user="workspace:x:1000:1000:Ubuntu:$new_home:/bin/bash"
+expected_workspace_group='workspace:x:1000:'
+
+test "$(awk -F: '$3 == 1000 { print }' "$passwd_file")" = "$expected_user"
+test "$(awk -F: '$3 == 1000 { print }' "$group_file")" = "$expected_group"
+test "$(awk -F: '$1 == "ubuntu" { print }' "$passwd_file")" = "$expected_user"
+test "$(awk -F: '$1 == "ubuntu" { print }' "$group_file")" = "$expected_group"
+test -z "$(awk -F: '$1 == "workspace" { print }' "$passwd_file")"
+test -z "$(awk -F: '$1 == "workspace" { print }' "$group_file")"
+test -d "$old_home"
+test ! -L "$old_home"
+test "$("$stat_bin" -c '%F:%u:%g' -- "$old_home")" = 'directory:1000:1000'
+test ! -e "$new_home"
+test ! -L "$new_home"
+
+"$usermod_bin" --login workspace --home "$new_home" --move-home ubuntu
+"$groupmod_bin" --new-name workspace ubuntu
+
+test "$(awk -F: '$3 == 1000 { print }' "$passwd_file")" = "$expected_workspace_user"
+test "$(awk -F: '$3 == 1000 { print }' "$group_file")" = "$expected_workspace_group"
+test "$(awk -F: '$1 == "workspace" { print }' "$passwd_file")" = "$expected_workspace_user"
+test "$(awk -F: '$1 == "workspace" { print }' "$group_file")" = "$expected_workspace_group"
+test -z "$(awk -F: '$1 == "ubuntu" { print }' "$passwd_file")"
+test -z "$(awk -F: '$1 == "ubuntu" { print }' "$group_file")"
+test ! -e "$old_home"
+test ! -L "$old_home"
+test -d "$new_home"
+test ! -L "$new_home"
+test "$("$stat_bin" -c '%F:%u:%g' -- "$new_home")" = 'directory:1000:1000'

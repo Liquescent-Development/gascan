@@ -1,0 +1,410 @@
+name: Workspace bundles
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feature/provisioning]
+    paths:
+      - images/workspace/bundles/ubuntu-packages.toml
+      - images/workspace/versions.lock
+      - scripts/produce-ubuntu-package-bundle.sh
+      - scripts/verify-ubuntu-debian-evidence.py
+      - tests/image/system-tools.txt
+      - images/workspace/etc/mise/config.toml
+      - scripts/produce-mise-runtime-bundle.sh
+      - scripts/produce-gascamp-bundle.sh
+
+jobs:
+  gascamp-source-vendor-linux-arm64:
+    needs: [validate-ubuntu-packages-linux-arm64, validate-mise-runtimes-linux-arm64]
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: validated-ubuntu-packages-linux-arm64
+          path: ${{ runner.temp }}/ubuntu-package-bundle
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: validated-mise-runtimes-linux-arm64
+          path: ${{ runner.temp }}/mise-runtime-bundle
+      - name: Produce exact source and Cargo vendor closure twice
+        env:
+          GASCAMP_READ_TOKEN: ${{ secrets.GASCAMP_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          ubuntu_archive="$RUNNER_TEMP/ubuntu-package-bundle/ubuntu-packages-linux-arm64.tar.zst"
+          ubuntu_sha=$(tr -d '[:space:]' <"$ubuntu_archive.sha256")
+          test "$(sha256sum "$ubuntu_archive" | cut -d' ' -f1)" = "$ubuntu_sha"
+          mkdir "$RUNNER_TEMP/ubuntu-evidence" "$RUNNER_TEMP/mise-evidence"
+          zstd --decompress --stdout "$ubuntu_archive" | tar -xf - -C "$RUNNER_TEMP/ubuntu-evidence"
+          mise_archive="$RUNNER_TEMP/mise-runtime-bundle/mise-runtimes-linux-arm64.tar.zst"
+          test "$(sha256sum "$mise_archive" | cut -d' ' -f1)" = "$(tr -d '[:space:]' <"$mise_archive.sha256")"
+          zstd --decompress --stdout "$mise_archive" | tar -xf - -C "$RUNNER_TEMP/mise-evidence"
+          image=ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab
+          docker pull "$image"
+          test "$(docker image inspect --format '{{.Architecture}}/{{.Os}}' "$image")" = arm64/linux
+          docker image inspect --format '{{join .RepoDigests "\n"}}' "$image" | grep -Fx "$image"
+          for suffix in a b; do
+            output="$RUNNER_TEMP/gascamp-$suffix"
+            mkdir "$output"
+            docker run --rm --platform linux/arm64 \
+              -e GASCAMP_READ_TOKEN \
+              --mount "type=bind,source=$GITHUB_WORKSPACE,target=/src,readonly" \
+              --mount "type=bind,source=$output,target=/output" \
+              --mount "type=bind,source=$RUNNER_TEMP/ubuntu-evidence,target=/ubuntu-evidence,readonly" \
+              --mount "type=bind,source=$RUNNER_TEMP/mise-evidence/opt,target=/opt,readonly" \
+              "$image" bash -ceu '
+                printf "deb [trusted=yes] file:/ubuntu-evidence/repository gascan main\n" >/tmp/gascan-local.list
+                apt_options=(-o Dir::Etc::sourcelist=/tmp/gascan-local.list -o Dir::Etc::sourceparts=- -o APT::Architecture=arm64 -o APT::Install-Recommends=false -o Acquire::Retries=0 -o Acquire::http::Proxy=false -o Acquire::https::Proxy=false -o Dir::Bin::Methods::http=/bin/false -o Dir::Bin::Methods::https=/bin/false)
+                apt-get "${apt_options[@]}" update
+                mapfile -t exact < <(awk -F "\t" '\''{print $3 == "all" ? $1 "=" $2 : $1 ":" $3 "=" $2}'\'' /ubuntu-evidence/package-manifest.tsv)
+                apt-get "${apt_options[@]}" --no-download --no-install-recommends install "${exact[@]}"
+                dpkg --audit
+                export PATH=/opt/gascan/mise/installs/rust/1.97.0/bin:$PATH
+                /src/scripts/produce-gascamp-bundle.sh /output
+              '
+          done
+          for suffix in a b; do
+            (cd "$RUNNER_TEMP/gascamp-$suffix" && find . -mindepth 1 -printf '%y\t%p\t%l\n' | LC_ALL=C sort) >"$RUNNER_TEMP/gascamp-$suffix.tree"
+            (cd "$RUNNER_TEMP/gascamp-$suffix" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum) >"$RUNNER_TEMP/gascamp-$suffix.files"
+          done
+          cmp --silent "$RUNNER_TEMP/gascamp-a.tree" "$RUNNER_TEMP/gascamp-b.tree"
+          cmp --silent "$RUNNER_TEMP/gascamp-a.files" "$RUNNER_TEMP/gascamp-b.files"
+      - name: Prove frozen offline test, release build, and missing-crate failure
+        run: |
+          set -euo pipefail
+          image=ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab
+          docker run --rm --network none --platform linux/arm64 \
+            --mount "type=bind,source=$RUNNER_TEMP/gascamp-a,target=/evidence,readonly" \
+            --mount "type=bind,source=$RUNNER_TEMP/ubuntu-evidence,target=/ubuntu-evidence,readonly" \
+            --mount "type=bind,source=$RUNNER_TEMP/mise-evidence/opt,target=/opt,readonly" \
+            "$image" bash -ceu '
+              printf "deb [trusted=yes] file:/ubuntu-evidence/repository gascan main\n" >/tmp/gascan-local.list
+              apt_options=(-o Dir::Etc::sourcelist=/tmp/gascan-local.list -o Dir::Etc::sourceparts=- -o APT::Architecture=arm64 -o APT::Install-Recommends=false -o Acquire::Retries=0 -o Acquire::http::Proxy=false -o Acquire::https::Proxy=false -o Dir::Bin::Methods::http=/bin/false -o Dir::Bin::Methods::https=/bin/false)
+              apt-get "${apt_options[@]}" update
+              mapfile -t exact < <(awk -F "\t" '\''{print $3 == "all" ? $1 "=" $2 : $1 ":" $3 "=" $2}'\'' /ubuntu-evidence/package-manifest.tsv)
+              apt-get "${apt_options[@]}" --no-download --no-install-recommends install "${exact[@]}"
+              dpkg --audit
+              export PATH=/opt/gascan/mise/installs/rust/1.97.0/bin:$PATH CARGO_NET_OFFLINE=true
+              cp -a /evidence/tree /tmp/complete
+              cd /tmp/complete/source
+              timeout --signal=KILL 300s cargo test --locked --offline --frozen
+              timeout --signal=KILL 300s cargo build --locked --offline --frozen --release --bin camp
+              cargo metadata --locked --offline --frozen --filter-platform aarch64-unknown-linux-gnu --format-version 1 > /tmp/metadata.json
+              python3 - /tmp/metadata.json /tmp/complete <<'\''PY'\''
+              import json,sys
+              from pathlib import Path
+              metadata=json.load(open(sys.argv[1])); root=Path(sys.argv[2]).resolve(); packages={p["id"]:p for p in metadata["packages"]}; nodes={n["id"]:n for n in metadata["resolve"]["nodes"]}
+              roots=[p["id"] for p in metadata["packages"] if p["name"]=="camp" and p["source"] is None]
+              if len(roots)!=1: raise SystemExit("could not identify unique active camp root package")
+              pending=list(roots); reachable=set()
+              while pending:
+                  package_id=pending.pop()
+                  if package_id in reachable: continue
+                  reachable.add(package_id); pending.extend(dep["pkg"] for dep in nodes[package_id]["deps"])
+              candidates=[]
+              for package_id in reachable:
+                  package=packages[package_id]
+                  if package["source"] is None: continue
+                  manifest=Path(package["manifest_path"]).resolve()
+                  try: relative=manifest.relative_to(root/"vendor")
+                  except ValueError: raise SystemExit("resolved external package does not come from vendor")
+                  if len(relative.parts)!=2 or relative.name!="Cargo.toml": raise SystemExit("resolved vendor package has ambiguous directory")
+                  candidates.append((package["name"],package["version"],relative.parts[0]))
+              if not candidates: raise SystemExit("active camp graph has no required vendored crate")
+              Path("/tmp/required-crate").write_text(sorted(candidates)[0][2]+"\n")
+              PY
+              cp -a /evidence/tree /tmp/missing
+              required_crate=$(tr -d '\n' </tmp/required-crate)
+              test -d "/tmp/missing/vendor/$required_crate"
+              rm -rf -- "/tmp/missing/vendor/$required_crate"
+              cd /tmp/missing/source
+              set +e
+              timeout --signal=KILL 20s cargo test --locked --offline --frozen > /tmp/missing.log 2>&1
+              missing_status=$?
+              set -e
+              if test "$missing_status" = 0; then
+                echo "offline build unexpectedly tolerated a missing vendored crate" >&2; exit 1
+              fi
+              test "$missing_status" != 124 && test "$missing_status" != 137
+              grep -E "(failed to read|no matching package|does not exist|checksum|failed to load source)" /tmp/missing.log
+              if grep -E "(^| )(Updating|Downloading)|download of .* failed|network failure" /tmp/missing.log; then echo "missing-crate proof attempted network access" >&2; exit 1; fi
+            '
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: gascamp-source-vendor-linux-arm64
+          path: ${{ runner.temp }}/gascamp-a/*
+          if-no-files-found: error
+          retention-days: 7
+
+  validate-gascamp-source-vendor-linux-arm64:
+    needs: gascamp-source-vendor-linux-arm64
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: gascamp-source-vendor-linux-arm64
+          path: ${{ runner.temp }}/gascamp
+      - name: Revalidate exact source and vendor bytes without producer privileges
+        run: |
+          set -euo pipefail
+          test "$(id -u)" != 0
+          scripts/produce-gascamp-bundle.sh --verify-evidence "$RUNNER_TEMP/gascamp"
+          archive="$RUNNER_TEMP/gascamp/gascamp-source-vendor-linux-arm64.tar.zst"
+          sha=$(tr -d '[:space:]' <"$archive.sha256")
+          size=$(tr -d '[:space:]' <"$archive.size")
+          test "$(sha256sum "$archive" | cut -d' ' -f1)" = "$sha"
+          test "$(wc -c <"$archive" | tr -d ' ')" = "$size"
+          lock="$RUNNER_TEMP/gascamp-validation.lock"
+          {
+            printf '[workspace_bundles]\nmedia_type = "application/vnd.gascan.workspace-bundle.v1+tar.zstd"\nplatform = "linux/arm64"\npublication = "published"\n'
+            for record in ubuntu_packages mise_runtimes gascamp_source_vendor; do
+              printf '\n[workspace_bundles.%s]\nurl = "https://example.invalid/%s"\nsha256 = "%s"\nsize = %s\nmedia_type = "application/vnd.gascan.workspace-bundle.v1+tar.zstd"\nplatform = "linux/arm64"\n' "$record" "$record" "$sha" "$size"
+            done
+          } >"$lock"
+          cargo run --quiet --locked --manifest-path scripts/Cargo.toml --bin validate-workspace-bundle -- "$lock" gascamp_source_vendor "$archive" "$RUNNER_TEMP/archive-evidence"
+          scripts/produce-gascamp-bundle.sh --verify-evidence "$RUNNER_TEMP/archive-evidence"
+          printf 'archive-sha256\t%s\narchive-size\t%s\nrevision\t%s\nsource-manifest-sha256\t%s\nvendor-manifest-sha256\t%s\nworkflow-commit\t%s\n' "$sha" "$size" f6b248c5926240856dbea83d1d2c5c90ea1c1456 "$(sha256sum "$RUNNER_TEMP/gascamp/source-tree.tsv" | cut -d' ' -f1)" "$(sha256sum "$RUNNER_TEMP/gascamp/vendor-tree.tsv" | cut -d' ' -f1)" "$GITHUB_SHA" | LC_ALL=C sort >"$RUNNER_TEMP/gascamp/validation-receipt.tsv"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: validated-gascamp-source-vendor-linux-arm64
+          path: ${{ runner.temp }}/gascamp/*
+          if-no-files-found: error
+          retention-days: 7
+
+  mise-runtimes-linux-arm64:
+    needs: validate-ubuntu-packages-linux-arm64
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: validated-ubuntu-packages-linux-arm64
+          path: ${{ runner.temp }}/ubuntu-package-bundle
+      - name: Produce twice in the exact pinned base and require identical bytes
+        run: |
+          set -euo pipefail
+          ubuntu_archive="$RUNNER_TEMP/ubuntu-package-bundle/ubuntu-packages-linux-arm64.tar.zst"
+          ubuntu_sha=$(tr -d '[:space:]' <"$ubuntu_archive.sha256")
+          test "$(sha256sum "$ubuntu_archive" | cut -d' ' -f1)" = "$ubuntu_sha"
+          test "$(wc -c <"$ubuntu_archive" | tr -d ' ')" = "$(tr -d '[:space:]' <"$ubuntu_archive.size")"
+          ubuntu_evidence="$RUNNER_TEMP/ubuntu-package-evidence"
+          mkdir "$ubuntu_evidence"
+          zstd --decompress --stdout "$ubuntu_archive" | tar -xf - -C "$ubuntu_evidence"
+          image=ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab
+          docker pull "$image"
+          test "$(docker image inspect --format '{{.Architecture}}/{{.Os}}' "$image")" = "arm64/linux"
+          image_id=$(docker image inspect --format '{{.Id}}' "$image")
+          [[ $image_id =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker image inspect --format '{{join .RepoDigests "\n"}}' "$image" | grep -Fx "$image"
+          attestation="$RUNNER_TEMP/base-attestation.env"
+          printf 'WORKFLOW_COMMIT=%s\nIMAGE_DIGEST=%s\nIMAGE_ID=%s\nPLATFORM=linux/arm64\nINVOCATION=docker-run-read-only-attestation-v1\nUBUNTU_BUNDLE_SHA256=%s\n' "$GITHUB_SHA" "$image" "$image_id" "$ubuntu_sha" >"$attestation"
+          chmod 0444 "$attestation"
+          for suffix in a b; do
+            output="$RUNNER_TEMP/mise-runtime-$suffix"
+            mkdir "$output"
+            docker run --rm --platform linux/arm64 \
+              --mount "type=bind,source=$GITHUB_WORKSPACE,target=/src,readonly" \
+              --mount "type=bind,source=$output,target=/output" \
+              --mount "type=bind,source=$ubuntu_evidence,target=/ubuntu-evidence,readonly" \
+              --mount "type=bind,source=$attestation,target=/run/gascan/base-attestation.env,readonly" \
+              "$image" bash -ceu '
+                printf "deb [trusted=yes] file:/ubuntu-evidence/repository gascan main\n" >/tmp/gascan-local.list
+                apt_options=(
+                  -o Dir::Etc::sourcelist=/tmp/gascan-local.list
+                  -o Dir::Etc::sourceparts=-
+                  -o APT::Architecture=arm64
+                  -o APT::Install-Recommends=false
+                  -o Acquire::Retries=0
+                  -o Acquire::http::Proxy=false
+                  -o Acquire::https::Proxy=false
+                  -o Dir::Bin::Methods::http=/bin/false
+                  -o Dir::Bin::Methods::https=/bin/false
+                )
+                apt-get "${apt_options[@]}" update
+                mapfile -t exact < <(awk -F "\t" '\''{print $3 == "all" ? $1 "=" $2 : $1 ":" $3 "=" $2}'\'' /ubuntu-evidence/package-manifest.tsv)
+                apt-get "${apt_options[@]}" --no-download --no-install-recommends install "${exact[@]}"
+                dpkg --audit
+                while IFS=$'\''\t'\'' read -r package version architecture _; do
+                  test "$(dpkg-query -W -f='\''${Version}\t${Architecture}'\'' "$package")" = "$version	$architecture"
+                done </ubuntu-evidence/package-manifest.tsv
+                /src/scripts/produce-mise-runtime-bundle.sh /output
+              '
+            cp -- "$attestation" "$output/base-attestation.env"
+          done
+          for suffix in a b; do
+            directory="$RUNNER_TEMP/mise-runtime-$suffix"
+            (cd "$directory" && find . -mindepth 1 -printf '%y\t%p\t%l\n' | LC_ALL=C sort) >"$RUNNER_TEMP/mise-runtime-$suffix.tree"
+            (cd "$directory" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum) >"$RUNNER_TEMP/mise-runtime-$suffix.files.sha256"
+          done
+          cmp --silent "$RUNNER_TEMP/mise-runtime-a.tree" "$RUNNER_TEMP/mise-runtime-b.tree" || { echo "non-deterministic mise runtime evidence entry set/types or extra/missing output" >&2; exit 1; }
+          cmp --silent "$RUNNER_TEMP/mise-runtime-a.files.sha256" "$RUNNER_TEMP/mise-runtime-b.files.sha256" || { echo "non-deterministic mise runtime evidence tree or extra/missing output" >&2; exit 1; }
+          scripts/produce-mise-runtime-bundle.sh --verify-evidence "$RUNNER_TEMP/mise-runtime-a"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mise-runtimes-linux-arm64
+          path: ${{ runner.temp }}/mise-runtime-a/*
+          if-no-files-found: error
+          retention-days: 7
+
+  validate-mise-runtimes-linux-arm64:
+    needs: mise-runtimes-linux-arm64
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: mise-runtimes-linux-arm64
+          path: ${{ runner.temp }}/mise-runtime
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: validated-ubuntu-packages-linux-arm64
+          path: ${{ runner.temp }}/ubuntu-package-bundle
+      - name: Revalidate without producer privileges
+        run: |
+          set -euo pipefail
+          test "$(id -u)" != 0
+          marker="$RUNNER_TEMP/mise-runtime/base-attestation.env"
+          test "$(awk -F= '$1 == \"WORKFLOW_COMMIT\" {print $2}' "$marker")" = "$GITHUB_SHA"
+          test "$(awk -F= '$1 == \"IMAGE_DIGEST\" {print $2}' "$marker")" = "ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab"
+          test "$(awk -F= '$1 == \"UBUNTU_BUNDLE_SHA256\" {print $2}' "$marker")" = "$(tr -d '[:space:]' <"$RUNNER_TEMP/ubuntu-package-bundle/ubuntu-packages-linux-arm64.tar.zst.sha256")"
+          scripts/produce-mise-runtime-bundle.sh --verify-evidence "$RUNNER_TEMP/mise-runtime"
+          archive="$RUNNER_TEMP/mise-runtime/mise-runtimes-linux-arm64.tar.zst"
+          test "$(sha256sum "$archive" | cut -d' ' -f1)" = "$(tr -d '[:space:]' <"$archive.sha256")"
+          test "$(wc -c <"$archive" | tr -d ' ')" = "$(tr -d '[:space:]' <"$archive.size")"
+          printf 'archive-sha256\t%s\narchive-size\t%s\nconfig-sha256\t%s\nmanifest-sha256\t%s\nworkflow-commit\t%s\n' "$(tr -d '[:space:]' <"$archive.sha256")" "$(tr -d '[:space:]' <"$archive.size")" "$(sha256sum images/workspace/etc/mise/config.toml | cut -d' ' -f1)" "$(sha256sum "$RUNNER_TEMP/mise-runtime/mise-runtimes-linux-arm64.manifest.tsv" | cut -d' ' -f1)" "$GITHUB_SHA" | LC_ALL=C sort >"$RUNNER_TEMP/mise-runtime/validation-receipt.tsv"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: validated-mise-runtimes-linux-arm64
+          path: ${{ runner.temp }}/mise-runtime/*
+          if-no-files-found: error
+          retention-days: 7
+
+  ubuntu-packages-linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install deterministic repository tooling
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends python3-apt xz-utils zstd
+      - name: Produce Ubuntu package closure
+        run: |
+          scripts/produce-ubuntu-package-bundle.sh "$RUNNER_TEMP/ubuntu-package-bundle"
+          sha256sum images/workspace/versions.lock | cut -d' ' -f1 >"$RUNNER_TEMP/ubuntu-package-bundle/versions.lock.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ubuntu-packages-linux-arm64
+          path: ${{ runner.temp }}/ubuntu-package-bundle/*
+          if-no-files-found: error
+          retention-days: 7
+  publish-ubuntu-packages-linux-arm64:
+    needs: validate-ubuntu-packages-linux-arm64
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: validated-ubuntu-packages-linux-arm64
+          path: ${{ runner.temp }}/ubuntu-package-bundle
+      - name: Revalidate and publish immutable release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          input_digest=$(tr -d '[:space:]' <"$RUNNER_TEMP/ubuntu-package-bundle/versions.lock.sha256")
+          [[ $input_digest =~ ^[0-9a-f]{64}$ ]]
+          tag="workspace-bundles-$input_digest"
+          directory="$RUNNER_TEMP/ubuntu-package-bundle"
+          archive="$directory/ubuntu-packages-linux-arm64.tar.zst"
+          expected_sha=$(tr -d '[:space:]' <"$archive.sha256")
+          expected_size=$(tr -d '[:space:]' <"$archive.size")
+          test "$(sha256sum "$archive" | cut -d' ' -f1)" = "$expected_sha"
+          test "$(wc -c <"$archive" | tr -d ' ')" = "$expected_size"
+          test -s "$directory/ubuntu-packages-linux-arm64.manifest.tsv"
+          test -s "$directory/ubuntu-packages-linux-arm64.provenance.env"
+          receipt="$directory/validation-receipt.tsv"
+          test "$(wc -l <"$receipt" | tr -d ' ')" = 7
+          test "$(cut -f1 "$receipt" | LC_ALL=C sort | tr '\n' ' ')" = "archive-sha256 archive-size inner-manifest-sha256 package-manifest-sha256 root-input-sha256 signed-evidence-sha256 workflow-commit "
+          test "$(awk -F '\t' '$1 == "workflow-commit" {print $2}' "$receipt")" = "$GITHUB_SHA"
+          test "$(awk -F '\t' '$1 == "archive-sha256" {print $2}' "$receipt")" = "$expected_sha"
+          test "$(awk -F '\t' '$1 == "archive-size" {print $2}' "$receipt")" = "$expected_size"
+          awk -F '\t' '$1 ~ /-sha256$/ || $1 == "workflow-commit" {if ($2 !~ /^[0-9a-f]{40,64}$/) exit 1}' "$receipt"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "$tag" --notes "Immutable workspace bundle inputs for versions.lock SHA-256 $input_digest"
+          fi
+          for asset in "$directory"/*; do
+            name=$(basename -- "$asset")
+            existing="$RUNNER_TEMP/existing-$name"
+            if gh release download "$tag" --pattern "$name" --output "$existing" 2>/dev/null; then
+              cmp --silent "$asset" "$existing" || { echo "release asset collision with different bytes: $name" >&2; exit 1; }
+            else
+              gh release upload "$tag" "$asset"
+            fi
+          done
+
+  validate-ubuntu-packages-linux-arm64:
+    needs: ubuntu-packages-linux-arm64
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ubuntu-packages-linux-arm64
+          path: ${{ runner.temp }}/ubuntu-package-bundle
+      - name: Install validation tooling
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends python3-apt zstd
+      - name: Validate archive, signed evidence, dependencies, and offline APT
+        run: |
+          set -euo pipefail
+          directory="$RUNNER_TEMP/ubuntu-package-bundle"
+          archive="$directory/ubuntu-packages-linux-arm64.tar.zst"
+          sha=$(tr -d '[:space:]' <"$archive.sha256")
+          size=$(tr -d '[:space:]' <"$archive.size")
+          test "$(sha256sum "$archive" | cut -d' ' -f1)" = "$sha"
+          test "$(wc -c <"$archive" | tr -d ' ')" = "$size"
+          lock="$RUNNER_TEMP/validation.lock"
+          {
+            printf '[workspace_bundles]\nmedia_type = "application/vnd.gascan.workspace-bundle.v1+tar.zstd"\nplatform = "linux/arm64"\npublication = "published"\n'
+            for record in ubuntu_packages mise_runtimes gascamp_source_vendor; do
+              printf '\n[workspace_bundles.%s]\nurl = "https://example.invalid/%s"\nsha256 = "%s"\nsize = %s\nmedia_type = "application/vnd.gascan.workspace-bundle.v1+tar.zstd"\nplatform = "linux/arm64"\n' "$record" "$record" "$sha" "$size"
+            done
+          } >"$lock"
+          cargo run --quiet --manifest-path scripts/Cargo.toml --bin validate-workspace-bundle -- "$lock" ubuntu_packages "$archive" "$RUNNER_TEMP/validated-evidence"
+          scripts/produce-ubuntu-package-bundle.sh --verify-evidence "$RUNNER_TEMP/validated-evidence"
+          inner=$(zstd --decompress --stdout "$archive" | tar -xOf - bundle-manifest.json | sha256sum | cut -d' ' -f1)
+          packages=$(sha256sum "$RUNNER_TEMP/validated-evidence/package-manifest.tsv" | cut -d' ' -f1)
+          signed=$(cd "$RUNNER_TEMP/validated-evidence" && find signed-releases signed-indexes -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)
+          root_input=$(printf 'tests/image/system-tools.txt\t%s\n' "$(sha256sum tests/image/system-tools.txt | cut -d' ' -f1)" | sha256sum | cut -d' ' -f1)
+          printf 'archive-sha256\t%s\narchive-size\t%s\ninner-manifest-sha256\t%s\npackage-manifest-sha256\t%s\nroot-input-sha256\t%s\nsigned-evidence-sha256\t%s\nworkflow-commit\t%s\n' "$sha" "$size" "$inner" "$packages" "$root_input" "$signed" "$GITHUB_SHA" | LC_ALL=C sort >"$directory/validation-receipt.tsv"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: validated-ubuntu-packages-linux-arm64
+          path: ${{ runner.temp }}/ubuntu-package-bundle/*
+          if-no-files-found: error
+          retention-days: 7

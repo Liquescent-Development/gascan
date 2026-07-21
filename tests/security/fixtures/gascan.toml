@@ -1,0 +1,8 @@
+version = 1
+name = "security-acceptance"
+network = "offline"
+user = "workspace"
+
+[resources]
+cpus = 1
+memory = "256MiB"
