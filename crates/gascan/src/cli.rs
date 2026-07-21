@@ -327,31 +327,6 @@ async fn operation(
     Ok(0)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provisioning_phase_renders_only_the_stable_step_identifier() {
-        let event = v1::OperationEvent {
-            phase: "provision_step".to_owned(),
-            provision_step: v1::ProvisionStep::WriteSafeMiseConfig as i32,
-            payload: br#"{"step":"write_safe_mise_config","secret":"must-not-render"}"#.to_vec(),
-            ..Default::default()
-        };
-
-        assert_eq!(
-            event_phase_label(&event).as_deref(),
-            Some("provision_step: write_safe_mise_config")
-        );
-        assert!(
-            !event_phase_label(&event)
-                .unwrap_or_default()
-                .contains("secret")
-        );
-    }
-}
-
 async fn run(
     client: &mut Client,
     explicit: Option<String>,
@@ -649,5 +624,30 @@ fn confirm_destroy() -> Result<(), CliError> {
         Ok(())
     } else {
         Err(CliError::Usage("destroy cancelled".to_owned()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provisioning_phase_renders_only_the_stable_step_identifier() {
+        let event = v1::OperationEvent {
+            phase: "provision_step".to_owned(),
+            provision_step: v1::ProvisionStep::WriteSafeMiseConfig as i32,
+            payload: br#"{"step":"write_safe_mise_config","secret":"must-not-render"}"#.to_vec(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            event_phase_label(&event).as_deref(),
+            Some("provision_step: write_safe_mise_config")
+        );
+        assert!(
+            !event_phase_label(&event)
+                .unwrap_or_default()
+                .contains("secret")
+        );
     }
 }
