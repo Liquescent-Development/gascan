@@ -21,7 +21,18 @@ Homebrew:
 
 ```sh
 brew tap liquescent-development/tap
+brew trust liquescent-development/tap
 brew install --cask gascan
+```
+
+Homebrew 6 refuses to load casks from a third-party tap until you trust it, so
+the `brew trust` step is required, not advisory. Without it `brew install`
+stops with `Refusing to load cask ... from untrusted tap`. Trust is recorded
+per user in `~/.config/homebrew/trust.json`; nothing the tap publishes can
+waive it. To trust only this cask rather than the whole tap:
+
+```sh
+brew trust --cask liquescent-development/tap/gascan
 ```
 
 Or download `gascan-<version>-macos-arm64.pkg` from the
