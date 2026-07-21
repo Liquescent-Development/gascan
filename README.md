@@ -16,14 +16,48 @@ sandbox is fail-closed offline unless the project opts into networking.
 
 ## Install
 
-The checkout must be a trusted signed commit or the exact signed release tag
-(`v0.1.0` for this version); packaging rejects unsigned source revisions.
+Packaging refuses to build from an untrusted source revision. The checkout must
+be either a trusted signed commit or the exact signed release tag — `v0.1.0` for
+this version. `main` moves ahead of the release tag between releases, so build
+from the tag, not from a fresh clone's default branch:
 
 ```sh
+git checkout v0.1.0
 package=$(./packaging/macos/package.sh)
 GASCAN_EXPECTED_SOURCE_REVISION=$(git rev-parse HEAD) \
 GASCAN_EXPECTED_VERSION=0.1.0 \
   ./packaging/macos/install.sh "$package"
+```
+
+Skipping the checkout leaves `HEAD` on a commit the release tag does not
+attest, and `package.sh` exits 65 with `release source HEAD needs a trusted
+commit signature or exact signed v0.1.0 tag`.
+
+### Trusting the release signature
+
+Verification runs through Git's own trust policy, so the tag's signing key must
+be one you have chosen to trust. Releases are signed with this SSH key:
+
+```
+richard@liquescent.dev ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHyTKmfAwcJcdfKXmj2h3mwfgPaelE6gSMrquAcPmW09
+```
+
+Its fingerprint is `SHA256:3NWoJ1nmsLHxd8hAG/BnyriJJpIFXHaW3RtuPYANKc4`. Add it
+to a Git allowed-signers file and point Git at it:
+
+```sh
+mkdir -p ~/.config/git
+printf 'richard@liquescent.dev ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHyTKmfAwcJcdfKXmj2h3mwfgPaelE6gSMrquAcPmW09\n' \
+  >> ~/.config/git/allowed_signers
+git config --global gpg.ssh.allowedSignersFile ~/.config/git/allowed_signers
+```
+
+Confirm the tag before building. Compare the fingerprint in the output against
+the one above; a valid signature from an untrusted key reports `No principal
+matched` and packaging will refuse it:
+
+```sh
+git verify-tag v0.1.0
 ```
 
 Confirm the host and runtime satisfy the security contract before using a
