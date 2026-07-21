@@ -96,34 +96,50 @@ STUB
 
 # The requirement string is the substance of the strongest gate, so the stub
 # validates what it was handed before it consults the scenario variable.
+#
+# Substrings are not enough: the `=` prefix carries no substring of its own, and
+# it is what tells codesign the argument is literal requirement text rather than
+# a file path. Without it codesign fails to open the "file" and rejects every
+# legitimately signed executable. So the stub compares the complete argument,
+# character for character, against the value built here from the very function
+# the helper calls -- sourced, not transcribed, so the two cannot drift.
+GASCAN_EXPECTED_REQUIREMENT="=$(gascan_developer_id_requirement "$team")"
+export GASCAN_EXPECTED_REQUIREMENT
+
 cat >"$stub_bin/codesign" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
 strict=false
 requirement=
+saw_requirement=false
 while (($#)); do
   case $1 in
     --strict) strict=true ;;
-    -R) requirement=${2:-}; shift ;;
+    -R)
+      (($# >= 2)) || {
+        printf 'codesign stub: -R was given no value\n' >&2; exit 94
+      }
+      requirement=$2
+      saw_requirement=true
+      shift ;;
   esac
   shift
 done
 [[ $strict == true ]] || {
   printf 'codesign stub: --strict is missing\n' >&2; exit 90
 }
-[[ $requirement == *'subject.OU] = Z548WR4TF8'* ]] || {
-  printf 'codesign stub: requirement does not pin the team: %s\n' "$requirement" >&2
+[[ $saw_requirement == true ]] || {
+  printf 'codesign stub: -R is missing\n' >&2; exit 94
+}
+[[ -n ${GASCAN_EXPECTED_REQUIREMENT:-} ]] || {
+  printf 'codesign stub: GASCAN_EXPECTED_REQUIREMENT was not exported\n' >&2
+  exit 95
+}
+[[ $requirement == "$GASCAN_EXPECTED_REQUIREMENT" ]] || {
+  printf 'codesign stub: -R value is not the expected requirement\n' >&2
+  printf '  expected: %s\n' "$GASCAN_EXPECTED_REQUIREMENT" >&2
+  printf '  actual:   %s\n' "$requirement" >&2
   exit 91
-}
-[[ $requirement == *'certificate 1[field.1.2.840.113635.100.6.2.6] exists'* ]] || {
-  printf 'codesign stub: requirement lacks the Developer ID intermediate OID: %s\n' \
-    "$requirement" >&2
-  exit 92
-}
-[[ $requirement == *'certificate leaf[field.1.2.840.113635.100.6.1.13] exists'* ]] || {
-  printf 'codesign stub: requirement lacks the Developer ID leaf OID: %s\n' \
-    "$requirement" >&2
-  exit 93
 }
 [[ ${GASCAN_STUB_CODESIGN:-ok} == ok ]] || exit 3
 exit 0
