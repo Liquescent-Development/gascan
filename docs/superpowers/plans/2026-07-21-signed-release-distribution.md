@@ -66,6 +66,18 @@ two review gates.
   a malformed team identifier, 66 for a missing package, and 65 for every
   trust failure.
 
+> **Amended after review.** The code below was implemented and then corrected:
+> a reviewer proved by mutation that the helper accepted a payload carrying an
+> extra unsigned binary and installer `Scripts`, that the codesign requirement
+> admitted any Apple-issued certificate for the team rather than Developer ID
+> specifically, and that the tests asserted no exit codes, did not isolate each
+> gate, and never validated the requirement string. The shipped implementation
+> checks the whole payload, uses Apple's Developer ID marker OIDs, and asserts
+> exact exit codes. Read `packaging/macos/release-common.sh` and
+> `tests/release/distributable-package-contract.sh` as built, and
+> `.superpowers/sdd/task-1-review-result.md` for the evidence — not the code
+> blocks below, which are the superseded first draft.
+
 - [ ] **Step 1: Write the failing test**
 
 Create `tests/release/distributable-package-contract.sh`:
