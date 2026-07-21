@@ -98,17 +98,18 @@ Concurrency rule: Plan 3 owns Apple adapter and lifecycle wiring; Plan 4 owns im
 
 **Gate 4:** A supported Mac passes real `up`, `shell`, `run`, `apply`, `down`, restart, reconciliation, and `destroy`; exact exit codes, terminal resize, signals, and no orphaned owned resources are verified.
 
-### Phase 2 granular status — 2026-07-19
+### Phase 2 granular status — 2026-07-20
 
 | Workstream | Status | Accepted branch evidence | Remaining acceptance work |
 |---|---|---|---|
-| Plan 3 Apple request, inspection, lifecycle, attach, and doctor | implemented, independently reviewed, integrated, and accepted through Gate 4 | accepted integration head `a475f8c` on `feature/gate4-integration` | none for Gate 4; Phase 3 remains |
+| Plan 3 Apple request, inspection, lifecycle, attach, and doctor | implemented, independently reviewed, integrated, and accepted through Gate 4 | accepted integration head `a475f8c` on `feature/gate4-integration` | none for the macOS MVP |
 | Plan 3 Gate 4 harness | implemented, independently approved, integrated, and passed live | accepted integration head `a475f8c` | none for Gate 4 |
-| Plan 4 image/user/mise/Gascamp contracts | connected image gate passed on Apple Container 26.5.1 using the exact public GHCR `linux/arm64` index; approved marker is frozen into policy and was consumed by the accepted Gate 4 integration | connected head `f6ed3a5`, merge `229c33a`; `docs/evidence/connected-workspace-image.md` and `images/workspace/approved-image.txt` are authoritative | none for Gate 4; Phase 3 remains |
+| Plan 4 image/user/mise/Gascamp contracts | connected image gate passed on Apple Container 26.5.1 using the exact public GHCR `linux/arm64` index; approved marker is frozen into policy and was consumed by Gate 4 and Gate 5 | connected head `f6ed3a5`, merge `229c33a`; `docs/evidence/connected-workspace-image.md` and `images/workspace/approved-image.txt` are authoritative | none for the macOS MVP |
 | Offline bundle production and validation | implementation reviewed; publication and live evidence not completed | `809796e` through `9025c56` | deferred; `publication = "pending"` remains accurate |
-| Plan 4 provisioning/apply/setup behavior | Gascamp source selection exists; the rest requires fresh reconciliation before claiming task completion | provisioning history including `c99bbaf` | inventory Tasks 4–6 against the final image, implement gaps, and prove through fake and real backend suites |
-| Cross-plan integration | Task 7 and its Gate 4 corrections completed and independently reviewed on `feature/gate4-integration` | accepted head `a475f8c`; frozen base `917dac1`; Apple merge `d06d619`; connected-image merge `229c33a`; `docs/evidence/connected-image-handoff.md` | none for Gate 4; Phase 3 remains |
-| Gate 4 | passed | accepted implementation head `a475f8c`; exact serial lifecycle and recovery evidence below | none; Gate 5 remains pending |
+| Plan 4 provisioning/apply/setup behavior | complete and independently reviewed; trusted live apply passed | Task 5 head `1d42522`; Task 6 head `3de3c82` | none for the macOS MVP |
+| Cross-plan integration | Tasks 7–8, Gate 4 corrections, and final program verification completed and independently reviewed on `feature/gate4-integration` | live release semantics `4a6d4ee`; final reviewed status `280f835`; frozen base `917dac1`; Apple merge `d06d619`; connected-image merge `229c33a` | none for the macOS MVP |
+| Gate 4 | passed | accepted implementation head `a475f8c`; exact serial lifecycle and recovery evidence below | none |
+| Gate 5 | passed | clean-host wrapper exit 0 at `4a6d4ee`; global verification and empty final audit at `280f835` | none for the defined macOS MVP |
 
 Gate 4 passed on 2026-07-19 at accepted implementation head
 `a475f8c7e1e1c955ea28279c5f711ee2b8c8f2ac`. The exact required commands ran
@@ -135,8 +136,8 @@ corrections `8cc59c3` (safe protocol-v2 per-exec terminal/locale environment
 overlay), `a686344` (exact raw Apple guest PTY CRLF harness expectation), and
 `a475f8c` (bounded PTY resize readiness diagnostics).
 
-This passes Gate 4 only. It does not claim distribution, signing/notarization,
-clean-host installation, Gate 5, or MVP completion.
+This section records Gate 4 evidence only. Gate 5 and MVP completion are based
+on the later Phase 3 evidence below, not inferred from this section.
 
 ## Phase 3: Security, Packaging, and Release
 
@@ -150,6 +151,29 @@ After Gate 4, finish Plan 4:
 
 **Gate 5:** Every release check passes on a clean Apple-silicon macOS 26+ host, including offline isolation and cleanup. This gate is the definition of MVP completion.
 
+### Phase 3 completion — 2026-07-20
+
+Plan 4 Tasks 5–8 are complete and independently reviewed. The Gate 5
+clean-host wrapper exited 0 at signed release-semantics head `4a6d4ee`, printed
+`PASS: Gas Can macOS MVP release gate`, and left an empty authoritative host
+audit. Signed successors `695e56f` and `280f835` are test-only structural and
+macOS E2E socket-path corrections; independent review found no release
+semantics change.
+
+At final reviewed status head `280f835`, formatting and exact workspace Clippy
+passed; the normal workspace suite passed 451 tests with 14 ignored across 50
+suites. Safe ignored coverage passed `gascan-apple` 10/10 and
+`apple_apply`, `apple_lifecycle`, and `apple_recovery` 1/1 each. Raw security
+correctly refused without its trusted manifest; the official security runner
+then passed 1/1 with TAP `ok 1` / `1..1` on macOS 26.5.1 arm64 and Apple
+client/server 1.1.0 at exact commit
+`5973b9cc626a3e7a499bb316a958237ebe14e2ed`. The independent
+`final_mvp_verification` audit exited 0 with no output.
+
+This passes Gate 5 and therefore completes the roadmap-defined macOS MVP. It
+does not claim a signed or notarized artifact, public distribution, or any
+deferred offline/builder-isolation, Linux/Firecracker, or GUI deliverable.
+
 ## Cross-plan Integration Rules
 
 - Each plan works in its own git worktree created at execution time.
@@ -162,12 +186,12 @@ After Gate 4, finish Plan 4:
 
 ## Program-level Verification
 
-- [ ] Run `cargo fmt --all -- --check`; expect exit 0.
-- [ ] Run `cargo clippy --workspace --all-targets --all-features -- -D warnings`; expect exit 0.
-- [ ] Run `cargo test --workspace`; expect all platform-neutral tests pass.
-- [ ] Run `cargo test --workspace -- --ignored`; on a supported Mac, expect all Apple integration tests pass serially.
-- [ ] Run `./tests/security/run.sh`; expect every forbidden host/network probe denied.
-- [ ] Run `./tests/release/clean-host.sh`; expect `PASS: Gas Can macOS MVP release gate` and no owned resources from the test remain.
+- [x] Run `cargo fmt --all -- --check`; exited 0 at `280f835`.
+- [x] Run `cargo clippy --workspace --all-targets --all-features -- -D warnings`; exited 0 at `280f835`.
+- [x] Run `cargo test --workspace`; 451 passed, 14 ignored across 50 suites at `280f835`.
+- [x] Run supported-Mac ignored coverage serially. All non-security ignored tests passed through raw Cargo; safety-gated security intentionally required the trusted official runner and passed below.
+- [x] Run `./tests/security/run.sh`; exact trusted-manifest security acceptance passed 1/1 with TAP `ok 1` / `1..1`.
+- [x] Run `./tests/release/clean-host.sh`; Gate 5 wrapper exited 0 at `4a6d4ee`, printed `PASS: Gas Can macOS MVP release gate`, and the final audit was empty.
 
 ## Roadmap Completion Record
 
@@ -179,11 +203,11 @@ When each gate passes, update this section in a dedicated commit with the commit
 | 2 — Apple feasibility | `docs/feasibility/apple-container-report.md` | `6bedef8` | passed |
 | 3 — Fake E2E | `docs/evidence/gate-3-fake-e2e.md` | `7c7d083` | passed |
 | 4 — Real lifecycle | exact serial Apple lifecycle and recovery results recorded above | `a475f8c` | passed |
-| 5 — Release | clean-host and security reports | not-run | pending |
+| 5 — Release | clean-host wrapper PASS, trusted security PASS, and empty final host audit recorded above | `4a6d4ee` (release semantics), `280f835` (final reviewed status) | passed |
 
-## MVP Status Summary — 2026-07-19
+## MVP Status Summary — 2026-07-20
 
-- Completed and integrated: Phase 0 and Roadmap Gates 1–4. Gate 4 passed at
+- Completed and integrated: Phases 0–3 and Roadmap Gates 1–5. Gate 4 passed at
   accepted implementation head `a475f8c` with the exact serial live lifecycle,
   recovery, and residue evidence recorded above.
 - The accepted Gate 4 implementation includes the reviewed Apple backend and
@@ -199,11 +223,10 @@ When each gate passes, update this section in a dedicated commit with the commit
   reliability is tracked separately in
   [`Liquescent-Development/gascan#1`](https://github.com/Liquescent-Development/gascan/issues/1).
   It does not invalidate the accepted prebuilt image.
-- Deferred and not MVP blockers: offline bundle publication and builder-VM
-  network isolation.
-- Not started as an integrated release phase: Phase 3 security, packaging, and
-  clean-host release. End-user distribution must consume a prebuilt image;
-  actual distribution packaging remains Gate 5 work.
-- Not passed: Gate 5. Gate 5 remains the definition of MVP completion, so the
-  MVP is not complete. No distribution, signing/notarization, or clean-host
-  installation evidence is claimed.
+- Gate 5 passed at release-semantics head `4a6d4ee`; final reviewed test-only
+  successors culminate at `280f835`. Under this roadmap's definition, the
+  macOS MVP is complete on the supported platform.
+- Deferred and not MVP blockers: offline bundle publication, builder-VM
+  network isolation, Linux/Firecracker, and the GUI.
+- The accepted package is an unsigned development artifact. No public
+  distribution, signing, or notarization evidence is claimed.

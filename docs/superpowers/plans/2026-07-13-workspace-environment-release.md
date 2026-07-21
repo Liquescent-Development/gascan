@@ -393,6 +393,14 @@ git commit -m "test: enforce Gas Can host security boundary"
 
 ### Task 8: Package binaries and execute the clean-host release gate
 
+> **Completion status (2026-07-20):** Complete and independently reviewed.
+> The clean-host wrapper exited 0 at signed release-semantics head `4a6d4ee`
+> and printed `PASS: Gas Can macOS MVP release gate`. Final program-level
+> verification is recorded at reviewed test-only successor `280f835`; see the
+> coordinated roadmap for the exact safe ignored/security split and empty
+> final audit. This does not claim signing, notarization, or public
+> distribution.
+
 **Files:**
 - Create: `packaging/macos/package.sh`
 - Create: `packaging/macos/install.sh`
@@ -406,7 +414,7 @@ git commit -m "test: enforce Gas Can host security boundary"
 - Installer checks prerequisites, installs binaries, and leaves daemon startup on-demand.
 - Uninstaller never removes sandboxes/volumes without an explicit data-removal flag.
 
-- [ ] **Step 1: Write package-content and clean-host tests**
+- [x] **Step 1: Write package-content and clean-host tests**
 
 ```bash
 #!/usr/bin/env bash
@@ -419,23 +427,23 @@ pkgutil --payload-files "$package" | grep -qx './usr/local/bin/gascand'
 gascan doctor --json | jq -e '.ok == true'
 ```
 
-- [ ] **Step 2: Run packaging test before scripts exist**
+- [x] **Step 2: Run packaging test before scripts exist**
 
 Run: `./tests/release/clean-host.sh`
 
 Expected: FAIL because packaging is absent.
 
-- [ ] **Step 3: Implement package, install, uninstall, and release workflow**
+- [x] **Step 3: Implement package, install, uninstall, and release workflow**
 
 Build locked release binaries, strip them, record SHA-256 and source revision, use `pkgbuild`, and leave signing/notarization identities configurable through CI secrets without embedding them. Document Apple `container` installation/service prerequisite, exact security promise, commands, manifest, root model, network modes, data locations, and uninstall semantics.
 
-- [ ] **Step 4: Run the complete release gate on a clean supported Mac**
+- [x] **Step 4: Run the complete release gate on a clean supported Mac**
 
 Run: `./tests/release/clean-host.sh`
 
 Expected final line: `PASS: Gas Can macOS MVP release gate`. The script installs, runs doctor, creates a multi-language sandbox, verifies mise and bundled/local Gascamp, proves offline isolation, restarts daemon/workspace, applies setup, destroys the sandbox, uninstalls binaries, and confirms no test-owned Apple resources remain.
 
-- [ ] **Step 5: Run global verification and commit Roadmap Gate 5**
+- [x] **Step 5: Run global verification and commit Roadmap Gate 5**
 
 Run: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace && ./tests/security/run.sh && ./tests/release/clean-host.sh`
 
