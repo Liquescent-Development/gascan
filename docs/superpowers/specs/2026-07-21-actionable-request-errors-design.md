@@ -86,7 +86,11 @@ Instead the change is strictly additive:
   uniqueness, not an exact set, so both still hold.
 - `API_MINOR` moves 0 -> 1, the honest signal for an additive change. No test
   pins it.
-- `ApiInputError` gains a variant carrying the human message.
+- A dedicated `RequestError { grpc, code, cause }` carries the code and cause
+  for `spec_for_root`. `ApiInputError` is left alone: it is `Copy`, and three
+  unrelated callers (`selector_id`, `timestamp_millis`, `argv_from_wire`) rely
+  on that, so adding a `String` variant would force churn well outside this
+  scope for no benefit.
 - Each failure in `spec_for_root` maps to exactly one code:
 
   | Failure | Code |
