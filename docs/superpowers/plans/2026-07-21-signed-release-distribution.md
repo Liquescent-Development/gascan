@@ -716,8 +716,9 @@ gascan doctor --json | jq
 ### Building from source
 
 Building is for contributors; installing a release does not require it.
-Packaging refuses to build from an untrusted source revision, so build from the
-signed release tag rather than from `main`, which moves ahead between releases:
+Packaging refuses to build from an untrusted source revision: the checkout must
+be either a trusted signed commit or the exact signed release tag. Build from
+the tag rather than from `main`, which moves ahead between releases:
 
 ```sh
 git checkout v0.1.1
