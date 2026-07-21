@@ -37,7 +37,6 @@ pub enum AttachOutput {
 #[derive(Clone, Debug)]
 pub struct AppleAttach {
     helper: PathBuf,
-    helper_args: Vec<String>,
 }
 
 impl Default for AppleAttach {
@@ -50,7 +49,6 @@ impl AppleAttach {
     pub fn new(helper: impl AsRef<OsStr>) -> Self {
         Self {
             helper: PathBuf::from(helper.as_ref()),
-            helper_args: Vec::new(),
         }
     }
 
@@ -91,15 +89,6 @@ impl AppleAttach {
         &self.helper
     }
 
-    pub fn with_helper_args<I, A>(mut self, args: I) -> Self
-    where
-        I: IntoIterator<Item = A>,
-        A: Into<String>,
-    {
-        self.helper_args = args.into_iter().map(Into::into).collect();
-        self
-    }
-
     pub async fn exec<I, A>(
         &self,
         container: impl AsRef<str>,
@@ -136,7 +125,6 @@ impl AppleAttach {
 
         let mut command = Command::new(&self.helper);
         command
-            .args(&self.helper_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(if std::env::var_os("GASCAN_ATTACH_DIAGNOSTICS").is_some() {
