@@ -17,21 +17,21 @@ sandbox is fail-closed offline unless the project opts into networking.
 ## Install
 
 Packaging refuses to build from an untrusted source revision. The checkout must
-be either a trusted signed commit or the exact signed release tag — `v0.1.0` for
+be either a trusted signed commit or the exact signed release tag — `v0.1.1` for
 this version. `main` moves ahead of the release tag between releases, so build
 from the tag, not from a fresh clone's default branch:
 
 ```sh
-git checkout v0.1.0
+git checkout v0.1.1
 package=$(./packaging/macos/package.sh)
 GASCAN_EXPECTED_SOURCE_REVISION=$(git rev-parse HEAD) \
-GASCAN_EXPECTED_VERSION=0.1.0 \
+GASCAN_EXPECTED_VERSION=0.1.1 \
   ./packaging/macos/install.sh "$package"
 ```
 
 Skipping the checkout leaves `HEAD` on a commit the release tag does not
 attest, and `package.sh` exits 65 with `release source HEAD needs a trusted
-commit signature or exact signed v0.1.0 tag`.
+commit signature or exact signed v0.1.1 tag`.
 
 ### Trusting the release signature
 
@@ -57,7 +57,7 @@ the one above; a valid signature from an untrusted key reports `No principal
 matched` and packaging will refuse it:
 
 ```sh
-git verify-tag v0.1.0
+git verify-tag v0.1.1
 ```
 
 Confirm the host and runtime satisfy the security contract before using a
