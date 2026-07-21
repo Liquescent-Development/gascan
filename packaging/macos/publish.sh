@@ -72,6 +72,7 @@ Gas Can $version for Apple silicon, macOS 26 or newer.
 Install with Homebrew:
 
     brew tap liquescent-development/tap
+    brew trust liquescent-development/tap
     brew install --cask gascan
 
 Or download \`$base\` and open it.
