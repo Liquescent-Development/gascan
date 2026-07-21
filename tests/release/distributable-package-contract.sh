@@ -132,11 +132,15 @@ STUB
 chmod +x "$stub_bin"/*
 PATH=$stub_bin:$PATH
 
-# Build a package whose payload holds exactly the three expected executables so
-# the per-executable requirement check has something to walk.
-mkdir -p "$fixture/root/usr/local/bin"
+# Build a package whose payload is exactly what a real Gas Can package ships,
+# so it satisfies the shared allowlist and the per-executable requirement check
+# has something to walk.
+mkdir -p "$fixture/root/usr/local/bin" "$fixture/root/usr/local/share/gascan"
 for binary in gascan gascand gascan-apple-attach; do
   printf '#!/bin/sh\n' >"$fixture/root/usr/local/bin/$binary"
+done
+for payload_file in LICENSE build-manifest.json default-gascan.toml; do
+  printf 'fixture\n' >"$fixture/root/usr/local/share/gascan/$payload_file"
 done
 pkgbuild --quiet --root "$fixture/root" \
   --identifier dev.gascan.pkg --version 1 "$fixture/payload.pkg"
@@ -146,6 +150,19 @@ cp -R "$fixture/root" "$fixture/extra-root"
 printf '#!/bin/sh\n' >"$fixture/extra-root/usr/local/bin/EXTRA-UNSIGNED-BINARY"
 pkgbuild --quiet --root "$fixture/extra-root" \
   --identifier dev.gascan.pkg --version 1 "$fixture/extra.pkg"
+
+# An unsigned binary outside usr/local/bin: the directory the old walk never read.
+cp -R "$fixture/root" "$fixture/outside-root"
+mkdir "$fixture/outside-root/usr/local/libexec"
+printf '#!/bin/sh\n' >"$fixture/outside-root/usr/local/libexec/EVIL-UNSIGNED-BINARY"
+pkgbuild --quiet --root "$fixture/outside-root" \
+  --identifier dev.gascan.pkg --version 1 "$fixture/outside.pkg"
+
+# A symlink among the executables: invisible to a `find -type f` walk.
+cp -R "$fixture/root" "$fixture/symlink-root"
+ln -s /bin/sh "$fixture/symlink-root/usr/local/bin/EVIL-SYMLINK"
+pkgbuild --quiet --root "$fixture/symlink-root" \
+  --identifier dev.gascan.pkg --version 1 "$fixture/symlink.pkg"
 
 cp -R "$fixture/root" "$fixture/incomplete-root"
 rm "$fixture/incomplete-root/usr/local/bin/gascand"
@@ -183,10 +200,35 @@ assert_status 'unsigned executable' 65 \
 # The whole payload is gated, not three names.
 assert_status 'payload with an extra executable' 65 \
   gascan_assert_distributable_package "$fixture/extra.pkg" "$team"
+assert_status 'payload with a binary outside usr/local/bin' 65 \
+  gascan_assert_distributable_package "$fixture/outside.pkg" "$team"
+assert_status 'payload with a symlink among the executables' 65 \
+  gascan_assert_distributable_package "$fixture/symlink.pkg" "$team"
 assert_status 'payload missing an executable' 65 \
   gascan_assert_distributable_package "$fixture/incomplete.pkg" "$team"
 assert_status 'payload carrying installer scripts' 65 \
   gascan_assert_distributable_package "$fixture/scripted.pkg" "$team"
+
+# The requirement the helper hands codesign must be one macOS can actually
+# parse. A stub can only compare text; csreq is the real parser, and it needs no
+# signing identity. Without this, a requirement macOS rejects as malformed --
+# which would reject every legitimately signed package -- would ship green.
+requirement=$(gascan_developer_id_requirement "$team")
+csreq -r- -b /dev/null <<<"$requirement" || {
+  printf 'the Developer ID requirement does not compile: %s\n' "$requirement" >&2
+  exit 1
+}
+[[ $requirement == *"subject.OU] = $team"* ]] || {
+  printf 'the Developer ID requirement does not pin the team it was given: %s\n' \
+    "$requirement" >&2
+  exit 1
+}
+# Proof that the compile check discriminates: the same string plus an unbalanced
+# group keeps every substring the codesign stub inspects, and must not compile.
+if csreq -r- -b /dev/null <<<"$requirement and (((" 2>/dev/null; then
+  printf 'csreq accepted an unparseable requirement; the compile check is vacuous\n' >&2
+  exit 1
+fi
 
 # The pinned team identifier must appear in release-common.sh.
 grep -Fq 'Z548WR4TF8' "$repo_root/packaging/macos/release-common.sh"

@@ -153,6 +153,73 @@ gascan_audit_clean_host() {
 # shellcheck disable=SC2034 # consumed by publish.sh, which sources this file
 GASCAN_RELEASE_TEAM=Z548WR4TF8
 
+# Every path pkgutil reports for a Gas Can package payload. macOS 26's pkgbuild
+# serializes its protected com.apple.provenance xattr as paired AppleDouble
+# records, so those are part of the expected set. This is the single definition
+# of "the payload is exactly what we ship": both the build-time verifier and the
+# release gate compare against it.
+gascan_expected_payload_files() {
+  cat <<'EOF_PAYLOAD'
+.
+./._usr
+./usr
+./usr/._local
+./usr/local
+./usr/local/._bin
+./usr/local/._share
+./usr/local/bin
+./usr/local/bin/._gascan
+./usr/local/bin/._gascan-apple-attach
+./usr/local/bin/._gascand
+./usr/local/bin/gascan
+./usr/local/bin/gascan-apple-attach
+./usr/local/bin/gascand
+./usr/local/share
+./usr/local/share/._gascan
+./usr/local/share/gascan
+./usr/local/share/gascan/._LICENSE
+./usr/local/share/gascan/._build-manifest.json
+./usr/local/share/gascan/._default-gascan.toml
+./usr/local/share/gascan/LICENSE
+./usr/local/share/gascan/build-manifest.json
+./usr/local/share/gascan/default-gascan.toml
+EOF_PAYLOAD
+}
+
+# Compare the package's entire payload listing against that allowlist. Listing
+# rather than walking an extracted root is what makes symlinks, AppleDouble
+# records, nested directories and hostile filenames all visible.
+gascan_assert_exact_payload() {
+  local package=$1 work
+  work=$(mktemp -d "${TMPDIR:-/tmp}/gascan-payload.XXXXXX") || return 70
+  if ! pkgutil --payload-files "$package" >"$work/listing"; then
+    rm -rf "$work"
+    printf 'package payload could not be listed\n' >&2
+    return 65
+  fi
+  LC_ALL=C sort -o "$work/actual-payload" "$work/listing"
+  gascan_expected_payload_files | LC_ALL=C sort >"$work/expected-payload"
+  if ! cmp -s "$work/actual-payload" "$work/expected-payload"; then
+    printf 'package payload differs from the exact allowlist\n' >&2
+    diff -u "$work/expected-payload" "$work/actual-payload" >&2 || true
+    rm -rf "$work"
+    return 65
+  fi
+  rm -rf "$work"
+}
+
+# Apple's canonical Developer ID requirement: the team owns the leaf, the
+# intermediate carries the Developer ID marker, and the leaf carries the
+# Developer ID Application marker. This is requirement-language text, which is
+# what `csreq` compiles; `codesign -R` needs a leading `=` to read it as literal
+# text rather than a file path, so that prefix belongs at the call site.
+gascan_developer_id_requirement() {
+  local team=$1
+  printf 'anchor apple generic and certificate leaf[subject.OU] = %s' "$team"
+  printf ' and certificate 1[field.1.2.840.113635.100.6.2.6] exists'
+  printf ' and certificate leaf[field.1.2.840.113635.100.6.1.13] exists\n'
+}
+
 gascan_assert_distributable_package() {
   local package=$1 team=$2 signature work
   [[ $team =~ ^[A-Z0-9]{10}$ ]] || {
@@ -183,6 +250,7 @@ gascan_assert_distributable_package() {
     printf 'package has no stapled notarization ticket\n' >&2
     return 65
   }
+  gascan_assert_exact_payload "$package" || return $?
   work=$(mktemp -d "${TMPDIR:-/tmp}/gascan-distributable.XXXXXX") || return 70
   if ! pkgutil --expand "$package" "$work/pkg" >/dev/null 2>&1; then
     rm -rf "$work"
@@ -201,30 +269,8 @@ gascan_assert_distributable_package() {
     return 65
   fi
   local -a executables=(gascan gascan-apple-attach gascand)
-  local requirement found entry
-  found=$(cd "$work/root/usr/local/bin" 2>/dev/null && find . -type f -print) || {
-    rm -rf "$work"
-    printf 'package payload has no usr/local/bin directory\n' >&2
-    return 65
-  }
-  found=$(sed 's|^\./||' <<<"$found" | LC_ALL=C sort)
-  while IFS= read -r entry; do
-    [[ -n $entry ]] || continue
-    case " ${executables[*]} " in
-      *" $entry "*) ;;
-      *)
-        rm -rf "$work"
-        printf 'package payload holds an unexpected file: usr/local/bin/%s\n' "$entry" >&2
-        return 65
-        ;;
-    esac
-  done <<<"$found"
-  # Apple's canonical Developer ID requirement: the team owns the leaf, the
-  # intermediate carries the Developer ID marker, and the leaf carries the
-  # Developer ID Application marker.
-  requirement="=anchor apple generic and certificate leaf[subject.OU] = $team"
-  requirement+=" and certificate 1[field.1.2.840.113635.100.6.2.6] exists"
-  requirement+=" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
+  local requirement entry
+  requirement="=$(gascan_developer_id_requirement "$team")"
   for entry in "${executables[@]}"; do
     if [[ ! -f $work/root/usr/local/bin/$entry ]]; then
       rm -rf "$work"
