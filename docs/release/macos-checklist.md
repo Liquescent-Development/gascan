@@ -72,6 +72,41 @@ passwords, API keys, or notarization credentials as command-line values.
 An artifact built without these inputs is an unsigned development artifact and
 is not signing, notarization, or distribution evidence.
 
+## Publish
+
+Notarization requires a stored credential profile once per machine:
+
+```sh
+xcrun notarytool store-credentials gascan-notary \
+  --key <AuthKey_XXXXXXXXXX.p8> --key-id <KEY_ID> --issuer <ISSUER_UUID>
+```
+
+From the signed release tag, build and publish:
+
+```sh
+git checkout v<version>
+export GASCAN_CODESIGN_IDENTITY="Developer ID Application: Liquescent Development LLC (Z548WR4TF8)"
+export GASCAN_INSTALLER_SIGNING_IDENTITY="Developer ID Installer: Liquescent Development LLC (Z548WR4TF8)"
+export GASCAN_NOTARYTOOL_PROFILE=gascan-notary
+package=$(./packaging/macos/package.sh)
+./packaging/macos/publish.sh "$package"
+```
+
+`publish.sh` refuses any package that is not Developer ID signed, notarized,
+stapled, and bound to the exact signed tag. It creates the release as a draft,
+uploads the package, its checksum, and `build-manifest.json`, and clears the
+draft flag only after all three assets are present. It prints the asset URL and
+the SHA-256.
+
+Render the cask with that checksum and commit it to the tap:
+
+```sh
+./packaging/macos/render-cask.sh <version> <sha256> >Casks/gascan.rb
+```
+
+An existing release is never overwritten. A botched release is corrected by
+publishing a new version.
+
 ## Install and verify
 
 Install Apple `container` 1.1.0, start its service, then run:

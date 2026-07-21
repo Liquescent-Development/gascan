@@ -16,10 +16,35 @@ sandbox is fail-closed offline unless the project opts into networking.
 
 ## Install
 
-Packaging refuses to build from an untrusted source revision. The checkout must
-be either a trusted signed commit or the exact signed release tag — `v0.1.1` for
-this version. `main` moves ahead of the release tag between releases, so build
-from the tag, not from a fresh clone's default branch:
+Gas Can is distributed as a signed, notarized macOS package. Install it with
+Homebrew:
+
+```sh
+brew tap liquescent-development/tap
+brew install --cask gascan
+```
+
+Or download `gascan-<version>-macos-arm64.pkg` from the
+[latest release](https://github.com/Liquescent-Development/gascan/releases/latest)
+and open it. Each release also publishes a `.sha256` checksum and the
+`build-manifest.json`, which records the source revision and a SHA-256 for
+every installed executable.
+
+Then confirm the host and runtime satisfy the security contract. `doctor`
+reports one fact per capability — architecture, macOS version, runtime service,
+storage, bind mounts, named volumes, TTY, signals, loopback publishing,
+resource limits, and offline isolation:
+
+```sh
+gascan doctor --json | jq
+```
+
+### Building from source
+
+Building is for contributors; installing a release does not require it.
+Packaging refuses to build from an untrusted source revision: the checkout must
+be either a trusted signed commit or the exact signed release tag. Build from
+the tag rather than from `main`, which moves ahead between releases:
 
 ```sh
 git checkout v0.1.1
@@ -32,8 +57,6 @@ GASCAN_EXPECTED_VERSION=0.1.1 \
 Skipping the checkout leaves `HEAD` on a commit the release tag does not
 attest, and `package.sh` exits 65 with `release source HEAD needs a trusted
 commit signature or exact signed v0.1.1 tag`.
-
-### Trusting the release signature
 
 Verification runs through Git's own trust policy, so the tag's signing key must
 be one you have chosen to trust. Releases are signed with this SSH key:
@@ -50,23 +73,7 @@ mkdir -p ~/.config/git
 printf 'richard@liquescent.dev ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHyTKmfAwcJcdfKXmj2h3mwfgPaelE6gSMrquAcPmW09\n' \
   >> ~/.config/git/allowed_signers
 git config --global gpg.ssh.allowedSignersFile ~/.config/git/allowed_signers
-```
-
-Confirm the tag before building. Compare the fingerprint in the output against
-the one above; a valid signature from an untrusted key reports `No principal
-matched` and packaging will refuse it:
-
-```sh
 git verify-tag v0.1.1
-```
-
-Confirm the host and runtime satisfy the security contract before using a
-sandbox. `doctor` reports one fact per capability — architecture, macOS
-version, runtime service, storage, bind mounts, named volumes, TTY, signals,
-loopback publishing, resource limits, and offline isolation:
-
-```sh
-gascan doctor --json | jq
 ```
 
 ## Quickstart
