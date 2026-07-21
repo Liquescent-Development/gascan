@@ -32,10 +32,10 @@ cask "gascan" do
               "/usr/local/bin/gascan",
               "/usr/local/bin/gascan-apple-attach",
               "/usr/local/bin/gascand",
-              "/usr/local/share/gascan/LICENSE",
+              "/usr/local/share/gascan",
               "/usr/local/share/gascan/build-manifest.json",
               "/usr/local/share/gascan/default-gascan.toml",
-              "/usr/local/share/gascan",
+              "/usr/local/share/gascan/LICENSE",
             ]
 
   caveats <<~EOS

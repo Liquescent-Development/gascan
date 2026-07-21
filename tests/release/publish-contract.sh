@@ -288,4 +288,15 @@ undraft_line=$(grep -n -- '--draft=false' "$publish" | head -1 | cut -d: -f1)
 grep -Fq 'build-manifest.json' "$publish"
 grep -Fq '.sha256' "$publish"
 
+# C1: the asset-completeness check must derive its expected value through the
+# same `sort | join(",")` jq pipeline as the actual `gh release view` value,
+# never a hand-ordered string — otherwise codepoint sort places
+# build-manifest.json first and the two sides can never be equal.
+pipeline_count=$(grep -o 'sort | join(",")' "$publish" | wc -l | tr -d ' ')
+[[ $pipeline_count -eq 2 ]] || {
+  printf 'expected two sort | join(",") pipelines guarding release assets, found %s\n' \
+    "$pipeline_count" >&2
+  exit 1
+}
+
 printf 'PASS: Gas Can publish contract\n'
