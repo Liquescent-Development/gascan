@@ -1391,6 +1391,206 @@ is what an operator needs when a gate fails."
 
 ---
 
+### Task 6: Final-review merge blockers
+
+The whole-branch review returned 0 Critical and 9 Important. These four fire on
+the side of the run where mistakes are already public, or waste a full
+notarization round trip. Land them first.
+
+**Files:**
+- Modify: `docs/release/macos-checklist.md`
+- Modify: `packaging/macos/release.sh`
+- Modify: `packaging/macos/release-gates.sh`
+- Modify: `packaging/macos/publish.sh`
+- Modify: `tests/release/publish-contract.sh`
+- Modify: `tests/release/release-script-contract.sh`
+
+- [ ] **Step 1: I9 — the checklist recommends the command the gate warns against**
+
+`docs/release/macos-checklist.md:154` says:
+
+```sh
+gh release delete v<version> --cleanup-tag --yes
+```
+
+`gascan_gate_no_release` prints, forty lines above it, "do not add
+--cleanup-tag: it deletes the signed tag from the remote" — and the section
+Task 5 added blesses the manual steps as correct. An operator who hits the gate,
+reads the warning, and follows the doc it points them at finds the flag they
+were just told not to use; `gascan_gate_tag` then refuses the next run because
+the tag is gone from the remote.
+
+Replace that code block with:
+
+```sh
+gh release delete v<version> --yes
+```
+
+and add underneath it:
+
+```markdown
+Do not add `--cleanup-tag`: it deletes the signed tag from the remote, and the
+release gate then refuses every later run because the tag it verifies is gone.
+Recreating it produces a different tag object.
+```
+
+In the `### One command` section, change
+
+```markdown
+correct and are what the script runs — read them when a gate fails.
+```
+
+to
+
+```markdown
+correct and are what the script runs — read them when a gate fails. Where a
+gate's message and a manual step disagree, the gate is right: it was written
+against the current tooling.
+```
+
+- [ ] **Step 2: I1 — a gh that cannot answer reads as "no release exists"**
+
+`packaging/macos/release-gates.sh:58` is `gh release view "$tag" >/dev/null 2>&1
+|| return 0`. Every gh failure — unauthenticated, expired token, rate limited,
+network down — is indistinguishable from "no release exists". Reproduced: with a
+stub `gh` that prints an auth error and exits 4, `gascan_gate_no_release 0.1.4`
+passes.
+
+GitHub's is also the one credential no gate checks, while the notary profile,
+the keychain, and the tap's write credential all have one. A missing token costs
+a full build plus an Apple notarization round trip before `gh release create`
+fails.
+
+Add a gate, and make the existing one discriminate:
+
+```bash
+gascan_gate_github() {
+  gh auth status >/dev/null 2>&1 || {
+    printf 'GitHub CLI is not authenticated for this repository\n' >&2
+    printf 'run: gh auth login\n' >&2
+    return 65
+  }
+}
+
+gascan_gate_no_release() {
+  local version=$1 tag="v$1" draft view_code=0
+  gh release view "$tag" >/dev/null 2>&1 || view_code=$?
+  # 1 is "not found" and is the only acceptable failure. Anything else means gh
+  # could not answer, and that must never read as "no release exists".
+  [[ $view_code -eq 1 ]] && return 0
+  [[ $view_code -eq 0 ]] || {
+    printf 'could not ask GitHub whether %s already exists (gh exited %s)\n' \
+      "$tag" "$view_code" >&2
+    return 65
+  }
+  draft=$(gh release view "$tag" --json isDraft --jq '.isDraft' 2>/dev/null) || draft=unknown
+  printf 'a release for %s already exists (draft: %s)\n' "$tag" "$draft" >&2
+  printf 'a published release is never overwritten; delete a stranded draft with:\n' >&2
+  printf '  gh release delete %s --yes\n' "$tag" >&2
+  printf 'do not add --cleanup-tag: it deletes the signed tag from the remote\n' >&2
+  return 65
+}
+```
+
+In `packaging/macos/release.sh`, call the new gate immediately before
+`gascan_gate_no_release`:
+
+```bash
+gascan_gate_github
+gascan_gate_no_release "$version"
+```
+
+- [ ] **Step 3: I2 — an interrupt inside publish silences the live-release warning**
+
+`release_is_live=true` is set only on publish's successful return. A SIGINT
+during publish reaches the whole foreground process group, so `release.sh`'s
+`trap 'exit 130' INT TERM` fires with the flag still false and the recovery says
+nothing — even if the signal landed after `gh release edit --draft=false`, when
+the release is public. The same hole covers any future failure added after that
+line.
+
+Record the attempt rather than the outcome, and ask GitHub when the outcome is
+unknown. In `packaging/macos/release.sh`, add beside the other recovery state:
+
+```bash
+publish_attempted=false
+```
+
+set it immediately before the call:
+
+```bash
+publish_attempted=true
+published=$("$repo_root/packaging/macos/publish.sh" "$package")
+release_is_live=true
+```
+
+and widen the guard in `report_live_release`:
+
+```bash
+report_live_release() {
+  if [[ $release_is_live != true && $publish_attempted == true ]]; then
+    # publish died without saying how far it got. Ask GitHub rather than
+    # assume: a draft is recoverable, a published release is not.
+    [[ $(gh release view "v$version" --json isDraft --jq '.isDraft' 2>/dev/null) == false ]] &&
+      release_is_live=true
+  fi
+  [[ $release_is_live == true ]] || return 0
+  gascan_report_live_release "$version" "$tap_path" "$repo_root" "$tap_stage" \
+    "$asset_url" "$checksum" "$published" >&2
+}
+```
+
+- [ ] **Step 4: I3 — the one unredirected stdout writer under a two-line contract**
+
+`release.sh` asserts publish's stdout is exactly the asset URL then the SHA-256,
+and exits 65 after the release is public if it is not. `publish.sh` lines 89 and
+98 redirect `gh` to `/dev/null`; line 90 does not. gh's success message is
+believed to be TTY-gated, but that cannot be proved without performing a real
+release, and "probably gated" is not the standard for a line that runs once per
+release with the release already live.
+
+In `packaging/macos/publish.sh`:
+
+```bash
+gh release upload "$tag" \
+  "$package" "$work/$base.sha256" "$work/build-manifest.json" >/dev/null
+```
+
+Nothing tests the producing side of that contract: every `publish.sh` invocation
+in `tests/release/publish-contract.sh` is a failing case captured as
+`2>&1 >/dev/null`. Add a success-path assertion there, reusing that file's
+existing stub `gh` and fixture package, asserting stdout is exactly two lines,
+that the first matches the asset-URL shape and the second is 64 hex characters.
+Follow the conventions already in that file rather than inventing new ones.
+
+- [ ] **Step 5: Verify**
+
+```bash
+bash tests/release/release-script-contract.sh; echo "exit: $?"
+bash tests/release/publish-contract.sh; echo "exit: $?"
+shellcheck packaging/macos/release.sh packaging/macos/release-gates.sh \
+  packaging/macos/release-config.sh packaging/macos/release-recovery.sh \
+  packaging/macos/publish.sh tests/release/release-script-contract.sh \
+  tests/release/publish-contract.sh
+for c in tests/release/*-contract.sh; do bash "$c" >/dev/null 2>&1 || echo "FAIL $c"; done; echo done
+```
+
+Then prove I1 is closed, with the same stub that demonstrated it:
+
+```bash
+mkdir -p /tmp/ghstub && printf '#!/usr/bin/env bash\nprintf "auth error\\n" >&2\nexit 4\n' \
+  > /tmp/ghstub/gh && chmod +x /tmp/ghstub/gh
+bash -c 'source packaging/macos/release-common.sh
+source packaging/macos/release-gates.sh
+PATH=/tmp/ghstub:$PATH
+if gascan_gate_no_release 0.1.4; then echo "STILL BROKEN: passed with a broken gh"
+else echo "closed: rejected"; fi'
+```
+
+And the `--check` invariance block.
+
+---
+
 ## Manual verification
 
 The happy path cannot run offline: it needs a real signed tag, live Apple
