@@ -315,6 +315,14 @@ case_d_sum=$(sed -n '2p' <<<"$case_d_out")
   printf 'Case D: second line is not 64 hex characters: %s\n' "$case_d_sum" >&2
   exit 1
 }
+# A successful publish records the instant the release becomes public, beside
+# the package: local, immediate, and interrupt-proof, which release.sh reads
+# from its EXIT trap instead of asking GitHub there.
+published_marker="$fixture/$tag.published"
+[[ -f $published_marker ]] || {
+  printf 'Case D: publish left no %s beside the package\n' "$tag.published" >&2
+  exit 1
+}
 
 # It must never clobber.
 if grep -q -- '--clobber' "$publish"; then
@@ -344,6 +352,7 @@ grep -Fq '.sha256' "$publish"
 # same `sort | join(",")` jq pipeline as the actual `gh release view` value,
 # never a hand-ordered string — otherwise codepoint sort places
 # build-manifest.json first and the two sides can never be equal.
+# shellcheck disable=SC2016 # single quotes are deliberate: asserting literal source text, not expanding it
 grep -Fq 'gascan_expected_release_assets "$base"' "$publish" || {
   printf 'publish.sh does not derive expected assets from the shared helper\n' >&2
   exit 1

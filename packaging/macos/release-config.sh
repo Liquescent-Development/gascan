@@ -21,6 +21,13 @@ gascan_release_config_flag() {
 }
 
 # Value is everything after the first '=', preserved verbatim.
+#
+# A trailing \r from a CRLF file, a leading space before NAME=, and an
+# `export ` prefix are all silently missed, and the first of a duplicate key
+# wins. This is a deliberate decision, not an oversight: failing fast on a
+# name that does not match `NAME=` exactly, naming that exact form, is the
+# right behavior for a file meant to carry nothing but plain `NAME=value`
+# lines.
 gascan_release_config_file_value() {
   local file=$1 key=$2 line
   [[ -r $file ]] || return 1

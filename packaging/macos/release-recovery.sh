@@ -26,8 +26,12 @@ gascan_report_live_release() {
     "$version"
   if [[ -n $url && -n $sum ]]; then
     gascan_print_release_values "$url" "$sum"
-  else
+  elif [[ -n $raw ]]; then
     printf 'publish.sh printed:\n%s\n' "$raw"
+  else
+    printf 'publish.sh printed nothing before it stopped.\n'
+    printf 'the checksum is the release'"'"'s uploaded .sha256 asset, or:\n'
+    printf '  shasum -a 256 <the .pkg in .artifacts/release>\n'
   fi
   printf 'finish the cask by hand:\n'
   if [[ $stage == none ]]; then
@@ -40,7 +44,7 @@ gascan_report_live_release() {
     # the placeholder rather than emitting a command that pastes and fails.
     printf '  mkdir -p %s/Casks\n' "$tap"
     printf '  %s/packaging/macos/render-cask.sh %s %s > %s/Casks/gascan.rb\n' \
-      "$repo" "$version" "${sum:-<sha256-printed-above>}" "$tap"
+      "$repo" "$version" "${sum:-<sha256>}" "$tap"
   fi
   if [[ $stage == rendered ]]; then
     printf '  # %s/Casks/gascan.rb is already rendered; check it before staging\n' \

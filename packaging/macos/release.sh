@@ -12,7 +12,10 @@ source "$repo_root/packaging/macos/release-gates.sh"
 source "$repo_root/packaging/macos/release-recovery.sh"
 
 usage() {
-  cat >&2 <<'EOF_USAGE'
+  # Unquoted so $config_file resolves to the path actually read, rather than
+  # printing the literal ${XDG_CONFIG_HOME:-$HOME/.config} expansion an
+  # operator cannot act on. config_file is assigned before every call site.
+  cat >&2 <<EOF_USAGE
 usage: release.sh VERSION [--check]
                   [--codesign-identity NAME] [--installer-identity NAME]
                   [--notary-profile NAME] [--tap PATH] [--config FILE]
@@ -23,8 +26,7 @@ notarizes, publishes, and updates the Homebrew cask.
   --check   run every gate and exit without building or publishing
 
 Configuration resolves by flag, then environment, then the config file
-(default: ${XDG_CONFIG_HOME:-$HOME/.config}/gascan/release.env). Nothing is
-defaulted.
+(default: $config_file). Nothing is defaulted.
 
 This never creates, moves, or deletes a tag. Create and push the signed tag
 first:
@@ -97,7 +99,7 @@ gascan_gate_github
 gascan_gate_no_release "$version"
 gascan_gate_identities "$application_identity" "$installer_identity"
 gascan_gate_notary "$notary_profile"
-gascan_gate_tap "$tap_path"
+gascan_gate_tap "$tap_path" "$repo_root"
 printf 'all release preconditions pass for %s\n' "$version" >&2
 
 if [[ $check_only == true ]]; then
@@ -135,10 +137,11 @@ tap_stage=none
 
 report_live_release() {
   if [[ $release_is_live != true && $publish_attempted == true ]]; then
-    # publish died without saying how far it got. Ask GitHub rather than
-    # assume: a draft is recoverable, a published release is not.
-    [[ $(gh release view "v$version" --json isDraft --jq '.isDraft' 2>/dev/null) == false ]] &&
-      release_is_live=true
+    # publish died without saying how far it got. The marker is written the
+    # instant the release becomes public, local and immediate -- asking
+    # GitHub instead would be an unbounded network call from inside the EXIT
+    # trap, at the one moment an interrupted run most needs to let go.
+    [[ -f $published_marker ]] && release_is_live=true
   fi
   [[ $release_is_live == true ]] || return 0
   gascan_report_live_release "$version" "$tap_path" "$repo_root" "$tap_stage" \
@@ -194,6 +197,8 @@ fi
 # branch above still calls it, because there it is the reuse predicate rather
 # than a repeat.
 
+published_marker="$(dirname "$package")/v$version.published"
+rm -f "$published_marker"
 publish_attempted=true
 published=$("$repo_root/packaging/macos/publish.sh" "$package")
 release_is_live=true

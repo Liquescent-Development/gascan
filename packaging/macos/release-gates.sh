@@ -8,7 +8,8 @@
 
 gascan_gate_tools() {
   local command
-  for command in gh jq cargo pkgutil shasum ruby brew git codesign spctl xcrun; do
+  for command in gh jq cargo pkgutil shasum ruby brew git codesign spctl xcrun \
+    security cpio gzip; do
     command -v "$command" >/dev/null || {
       printf 'required release command is unavailable: %s\n' "$command" >&2
       return 69
@@ -46,9 +47,22 @@ gascan_gate_tag() {
       "$tag" "${target:0:9}" "${head:0:9}" >&2
     return 65
   }
-  [[ -n $(git -C "$repo" ls-remote --tags origin "$tag" 2>/dev/null) ]] || {
+  local remote_tag local_tag ls_remote_output
+  ls_remote_output=$(git -C "$repo" ls-remote --tags origin "refs/tags/$tag") || {
+    printf 'could not reach the remote to check for tag %s\n' "$tag" >&2
+    return 65
+  }
+  remote_tag=$(awk 'NR==1{print $1}' <<<"$ls_remote_output")
+  [[ -n $remote_tag ]] || {
     printf 'release tag %s is not on the remote\n' "$tag" >&2
     printf 'push it with: git push origin %s\n' "$tag" >&2
+    return 65
+  }
+  local_tag=$(git -C "$repo" rev-parse --verify "refs/tags/$tag") || return 65
+  [[ $remote_tag == "$local_tag" ]] || {
+    printf 'remote tag %s is a different object than the local one (%s vs %s)\n' \
+      "$tag" "${remote_tag:0:9}" "${local_tag:0:9}" >&2
+    printf 'reconcile the tag by hand before releasing\n' >&2
     return 65
   }
 }
@@ -62,16 +76,17 @@ gascan_gate_github() {
 }
 
 gascan_gate_no_release() {
-  local version=$1 tag="v$1" draft view_code=0
-  gh release view "$tag" >/dev/null 2>&1 || view_code=$?
-  # 1 is "not found" and is the only acceptable failure. Anything else means gh
-  # could not answer, and that must never read as "no release exists".
-  [[ $view_code -eq 1 ]] && return 0
-  [[ $view_code -eq 0 ]] || {
-    printf 'could not ask GitHub whether %s already exists (gh exited %s)\n' \
-      "$tag" "$view_code" >&2
+  local version=$1 tag="v$1" draft view_code=0 view_err
+  view_err=$(gh release view "$tag" 2>&1 >/dev/null) || view_code=$?
+  # gh exits 1 for "release not found", for HTTP 401, and for an unreachable
+  # host alike, so the exit code alone cannot tell absence from inability.
+  # Only the not-found message means "no release exists".
+  if [[ $view_code -ne 0 ]]; then
+    [[ $view_code -eq 1 && $view_err == *'release not found'* ]] && return 0
+    printf 'could not ask GitHub whether %s already exists (gh exited %s): %s\n' \
+      "$tag" "$view_code" "$view_err" >&2
     return 65
-  }
+  fi
   draft=$(gh release view "$tag" --json isDraft --jq '.isDraft' 2>/dev/null) || draft=unknown
   printf 'a release for %s already exists (draft: %s)\n' "$tag" "$draft" >&2
   printf 'a published release is never overwritten; delete a stranded draft with:\n' >&2
@@ -86,12 +101,15 @@ gascan_gate_identities() {
     printf 'could not list keychain identities\n' >&2
     return 65
   }
-  grep -Fq "$application" <<<"$identities" || {
+  # `security find-identity -v` quotes each identity -- `  1) <hash>
+  # "<identity>"` -- so match the quoted form: a bare substring match would let
+  # a truncated identity string pass here and fail later inside codesign.
+  grep -Fq "\"$application\"" <<<"$identities" || {
     printf 'Developer ID Application identity is not in the keychain: %s\n' \
       "$application" >&2
     return 65
   }
-  grep -Fq "$installer" <<<"$identities" || {
+  grep -Fq "\"$installer\"" <<<"$identities" || {
     printf 'Developer ID Installer identity is not in the keychain: %s\n' \
       "$installer" >&2
     return 65
@@ -114,9 +132,14 @@ gascan_gate_notary() {
 }
 
 gascan_gate_tap() {
-  local tap=$1 branch local_head remote_head
+  local tap=$1 repo=$2 branch local_head remote_head origin_url
   [[ -d $tap ]] || {
     printf 'tap path does not exist: %s\n' "$tap" >&2
+    return 65
+  }
+  [[ $(cd "$tap" && pwd -P) != "$repo" ]] || {
+    printf 'tap path is the gascan repository itself: %s\n' "$tap" >&2
+    printf 'point --tap or GASCAN_TAP_PATH at the Homebrew tap checkout\n' >&2
     return 65
   }
   git -C "$tap" rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
@@ -132,6 +155,15 @@ gascan_gate_tap() {
     printf 'tap is on %s, not main: %s\n' "${branch:-a detached HEAD}" "$tap" >&2
     return 65
   }
+  origin_url=$(git -C "$tap" remote get-url origin 2>/dev/null) || origin_url=
+  case $origin_url in
+    *homebrew-*|*/tap|*/tap.git) ;;
+    *)
+      printf 'tap origin does not look like a Homebrew tap: %s\n' \
+        "${origin_url:-none}" >&2
+      printf 'a tap repository is conventionally named homebrew-<name>\n' >&2
+      return 65 ;;
+  esac
   git -C "$tap" fetch --quiet origin main || {
     printf 'could not fetch origin/main in the tap: %s\n' "$tap" >&2
     return 65
