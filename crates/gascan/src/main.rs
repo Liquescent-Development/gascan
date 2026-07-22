@@ -3,6 +3,7 @@
 
 mod cli;
 mod client;
+mod presentation;
 mod terminal;
 
 #[tokio::main(flavor = "current_thread")]
