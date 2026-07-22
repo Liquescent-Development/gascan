@@ -1,9 +1,10 @@
 // Task 1 establishes the presentation API; command integration follows in later tasks.
 #![allow(dead_code)]
 
-use console::Term;
+use console::{Style, Term};
 use gascan_proto::v1;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use std::fmt::Write as _;
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,6 +53,161 @@ impl OutputCapabilities {
             color: false,
             unicode: false,
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DoctorCheck {
+    pub(crate) id: String,
+    pub(crate) status: String,
+    pub(crate) detail: String,
+    pub(crate) remedy: String,
+}
+
+pub(crate) fn render_doctor(checks: &[DoctorCheck], capabilities: OutputCapabilities) -> String {
+    struct Group<'a> {
+        id: &'a str,
+        checks: Vec<&'a DoctorCheck>,
+    }
+
+    let mut groups: Vec<Group<'_>> = Vec::new();
+    for check in checks {
+        let group_id = check
+            .id
+            .split_once('.')
+            .map_or(check.id.as_str(), |(id, _)| id);
+        if let Some(group) = groups.iter_mut().find(|group| group.id == group_id) {
+            group.checks.push(check);
+        } else {
+            groups.push(Group {
+                id: group_id,
+                checks: vec![check],
+            });
+        }
+    }
+
+    let ready = checks.iter().all(|check| check.status == "pass");
+    let heading = if ready {
+        styled_heading("Gascan is ready", "✓", true, capabilities)
+    } else {
+        styled_heading("Gascan needs attention", "✗", false, capabilities)
+    };
+    let group_width = groups
+        .iter()
+        .map(|group| humanize(group.id).len())
+        .max()
+        .unwrap_or(0)
+        .max("Workspace".len());
+    let mut output = format!("{heading}\n");
+    for group in groups {
+        let title = humanize(group.id);
+        let passing = group
+            .checks
+            .iter()
+            .filter(|check| check.status == "pass")
+            .count();
+        let total = group.checks.len();
+        let noun = if total == 1 { "check" } else { "checks" };
+        let _ = writeln!(
+            output,
+            "  {title:<group_width$}  {passing}/{total} {noun} passed"
+        );
+        for check in group
+            .checks
+            .into_iter()
+            .filter(|check| check.status != "pass")
+        {
+            let check_id = check
+                .id
+                .split_once('.')
+                .map_or(check.id.as_str(), |(_, id)| id);
+            let check_heading = styled_heading(&humanize(check_id), "✗", false, capabilities);
+            let _ = writeln!(output, "    {check_heading}");
+            if !check.detail.is_empty() {
+                let _ = writeln!(output, "      {}", check.detail);
+            }
+            if !check.remedy.is_empty() {
+                let _ = writeln!(output, "      Fix: {}", check.remedy);
+            }
+        }
+    }
+    output
+}
+
+pub(crate) fn render_status(
+    status: &v1::SandboxStatus,
+    _capabilities: OutputCapabilities,
+) -> String {
+    format!(
+        "Sandbox: {}\nState:   {}\n",
+        status.sandbox_id,
+        human_state(status.actual_state)
+    )
+}
+
+pub(crate) fn render_list(
+    sandboxes: &[v1::SandboxStatus],
+    _capabilities: OutputCapabilities,
+) -> String {
+    if sandboxes.is_empty() {
+        return "No sandboxes found.\n".to_owned();
+    }
+    let sandbox_width = sandboxes
+        .iter()
+        .map(|sandbox| sandbox.sandbox_id.len())
+        .max()
+        .unwrap_or(0)
+        .max("SANDBOX".len());
+    let mut output = format!("{:<sandbox_width$}  STATE\n", "SANDBOX");
+    for sandbox in sandboxes {
+        let _ = writeln!(
+            output,
+            "{:<sandbox_width$}  {}",
+            sandbox.sandbox_id,
+            human_state(sandbox.actual_state)
+        );
+    }
+    output
+}
+
+fn styled_heading(
+    heading: &str,
+    symbol: &str,
+    success: bool,
+    capabilities: OutputCapabilities,
+) -> String {
+    let heading = if capabilities.unicode {
+        format!("{symbol} {heading}")
+    } else {
+        heading.to_owned()
+    };
+    if !capabilities.color {
+        return heading;
+    }
+    let style = if success {
+        Style::new().green()
+    } else {
+        Style::new().red()
+    };
+    style.apply_to(heading).to_string()
+}
+
+fn humanize(identifier: &str) -> String {
+    let mut value = identifier.replace('_', " ");
+    if let Some(first) = value.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    value
+}
+
+fn human_state(value: i32) -> &'static str {
+    match v1::ActualState::try_from(value).unwrap_or(v1::ActualState::Unknown) {
+        v1::ActualState::Pending => "Pending",
+        v1::ActualState::Running => "Running",
+        v1::ActualState::Stopped => "Stopped",
+        v1::ActualState::Absent => "Absent",
+        v1::ActualState::Failed => "Failed",
+        _ => "Unknown",
     }
 }
 
@@ -220,6 +376,114 @@ mod tests {
     use gascan_proto::v1;
     use indicatif::{InMemoryTerm, ProgressDrawTarget};
     use std::process::Command;
+
+    fn check(id: &str, status: &str, detail: &str, remedy: &str) -> DoctorCheck {
+        DoctorCheck {
+            id: id.to_owned(),
+            status: status.to_owned(),
+            detail: detail.to_owned(),
+            remedy: remedy.to_owned(),
+        }
+    }
+
+    fn passing_checks() -> Vec<DoctorCheck> {
+        vec![
+            check("host.release", "pass", "report sha256: abc", ""),
+            check("host.fixture", "pass", "fixture sha256: def", ""),
+            check(
+                "runtime.offline",
+                "pass",
+                "network isolation is available",
+                "",
+            ),
+        ]
+    }
+
+    fn status(id: &str, state: v1::ActualState) -> v1::SandboxStatus {
+        v1::SandboxStatus {
+            sandbox_id: id.to_owned(),
+            actual_state: state as i32,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn passing_doctor_report_is_compact_and_uses_one_many_grammar() {
+        assert_eq!(
+            render_doctor(&passing_checks(), OutputCapabilities::plain()),
+            "Gascan is ready\n  Host       2/2 checks passed\n  Runtime    1/1 check passed\n"
+        );
+    }
+
+    #[test]
+    fn mixed_doctor_report_expands_only_failed_checks() {
+        let checks = vec![
+            check("host.release", "pass", "passing release detail", ""),
+            check("runtime.version", "pass", "passing version detail", ""),
+            check(
+                "runtime.offline",
+                "fail",
+                "network isolation is unavailable",
+                "install a supported runtime",
+            ),
+        ];
+
+        let output = render_doctor(&checks, OutputCapabilities::plain());
+
+        assert!(output.contains("Gascan needs attention"));
+        assert!(output.contains("Offline"));
+        assert!(output.contains("network isolation is unavailable"));
+        assert!(output.contains("Fix: install a supported runtime"));
+        assert!(!output.contains("passing release detail"));
+        assert!(!output.contains("passing version detail"));
+    }
+
+    #[test]
+    fn doctor_humanizes_unknown_groups_and_checks() {
+        let checks = vec![check(
+            "future_runtime.secret_probe",
+            "fail",
+            "probe failed",
+            "retry the probe",
+        )];
+
+        let output = render_doctor(&checks, OutputCapabilities::plain());
+
+        assert!(output.contains("  Future runtime  0/1 check passed"));
+        assert!(output.contains("    Secret probe"));
+    }
+
+    #[test]
+    fn status_is_a_labeled_human_summary() {
+        assert_eq!(
+            render_status(
+                &status("code-123", v1::ActualState::Running),
+                OutputCapabilities::plain()
+            ),
+            "Sandbox: code-123\nState:   Running\n"
+        );
+    }
+
+    #[test]
+    fn list_is_an_aligned_two_column_table() {
+        let sandboxes = vec![
+            status("code-1", v1::ActualState::Running),
+            status("code-longer", v1::ActualState::Stopped),
+        ];
+
+        assert_eq!(
+            render_list(&sandboxes, OutputCapabilities::plain()),
+            "SANDBOX      STATE\ncode-1       Running\ncode-longer  Stopped\n"
+        );
+    }
+
+    #[test]
+    fn empty_list_is_explicit() {
+        assert_eq!(
+            render_list(&[], OutputCapabilities::plain()),
+            "No sandboxes found.\n"
+        );
+    }
 
     fn event(phase: &str) -> v1::OperationEvent {
         v1::OperationEvent {

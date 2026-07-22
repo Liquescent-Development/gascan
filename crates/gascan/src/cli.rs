@@ -1,5 +1,9 @@
 use crate::client::{Client, ClientError};
-use crate::presentation::{OperationKind, OperationProgress, OutputCapabilities};
+use crate::presentation::{
+    DoctorCheck, OperationKind, OperationProgress, OutputCapabilities,
+    render_doctor as render_human_doctor, render_list as render_human_list,
+    render_status as render_human_status,
+};
 use crate::terminal::RawTerminal;
 use clap::{Parser, Subcommand};
 use gascan_proto::v1;
@@ -260,29 +264,47 @@ pub async fn execute() -> Result<i32, CliError> {
                 .iter()
                 .map(|capability| {
                     let detail: serde_json::Value = serde_json::from_str(&capability.detail)
-                        .unwrap_or_else(|_| serde_json::json!({"detail": capability.detail, "remedy": ""}));
-                    serde_json::json!({
-                        "id": capability.name,
-                        "status": detail.get("status").and_then(serde_json::Value::as_str).unwrap_or(if capability.available { "pass" } else { "fail" }),
-                        "detail": detail.get("detail").and_then(serde_json::Value::as_str).unwrap_or(""),
-                        "remedy": detail.get("remedy").and_then(serde_json::Value::as_str).unwrap_or(""),
-                    })
+                        .unwrap_or_else(
+                            |_| serde_json::json!({"detail": capability.detail, "remedy": ""}),
+                        );
+                    DoctorCheck {
+                        id: capability.name.clone(),
+                        status: detail
+                            .get("status")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(if capability.available { "pass" } else { "fail" })
+                            .to_owned(),
+                        detail: detail
+                            .get("detail")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                            .to_owned(),
+                        remedy: detail
+                            .get("remedy")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                            .to_owned(),
+                    }
                 })
                 .collect::<Vec<_>>();
             if json {
+                let checks = checks
+                    .iter()
+                    .map(|check| {
+                        serde_json::json!({
+                            "id": check.id,
+                            "status": check.status,
+                            "detail": check.detail,
+                            "remedy": check.remedy,
+                        })
+                    })
+                    .collect::<Vec<_>>();
                 println!("{}", serde_json::json!({"checks": checks}));
             } else {
-                for check in &checks {
-                    println!(
-                        "{} {:<4} {}",
-                        check["id"].as_str().unwrap_or("unknown"),
-                        check["status"].as_str().unwrap_or("fail"),
-                        check["detail"].as_str().unwrap_or("")
-                    );
-                    if check["status"] != "pass" {
-                        println!("  remedy: {}", check["remedy"].as_str().unwrap_or(""));
-                    }
-                }
+                print!(
+                    "{}",
+                    render_human_doctor(&checks, OutputCapabilities::for_stdout())
+                );
             }
             Ok(if doctor.findings.is_empty() {
                 0
@@ -631,7 +653,10 @@ fn render_status(status: &v1::SandboxStatus, json: bool) -> Result<(), CliError>
             serde_json::json!({"sandbox_id":status.sandbox_id,"actual_state":actual_name(status.actual_state)})
         );
     } else {
-        println!("{} {}", status.sandbox_id, actual_name(status.actual_state));
+        print!(
+            "{}",
+            render_human_status(status, OutputCapabilities::for_stdout())
+        );
     }
     Ok(())
 }
@@ -643,13 +668,10 @@ fn render_list(sandboxes: &[v1::SandboxStatus], json: bool) -> Result<(), CliErr
             serde_json::to_string(&values).map_err(|e| CliError::Runtime(e.to_string()))?
         );
     } else {
-        for sandbox in sandboxes {
-            println!(
-                "{} {}",
-                sandbox.sandbox_id,
-                actual_name(sandbox.actual_state)
-            );
-        }
+        print!(
+            "{}",
+            render_human_list(sandboxes, OutputCapabilities::for_stdout())
+        );
     }
     Ok(())
 }

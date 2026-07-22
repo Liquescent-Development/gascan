@@ -47,7 +47,12 @@ fn doctor_human_output_names_each_check() -> TestResult {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout)?;
-    assert!(stdout.contains("runtime.version"));
-    assert!(stdout.contains("runtime.offline"));
+    assert!(stdout.contains("Gascan is ready"));
+    assert!(stdout.contains("Host"));
+    assert!(stdout.contains("Runtime"));
+    assert!(stdout.contains("checks passed"));
+    assert!(!stdout.contains("report sha256"));
+    assert!(!stdout.contains("fixture sha256"));
+    assert!(!stdout.contains("runtime.offline"));
     Ok(())
 }

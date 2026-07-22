@@ -493,6 +493,20 @@ fn inspection_confirmation_and_remaining_commands_are_stable() -> TestResult {
     assert!(env.invoke(&["shell", "--", "sh"])?.status.success());
     assert!(env.invoke(&["logs"])?.status.success());
     assert!(env.invoke(&["doctor", "--json"])?.status.success());
+    let status = String::from_utf8(env.invoke(&["status"])?.stdout)?;
+    let sandbox_id = status
+        .strip_prefix("Sandbox: ")
+        .and_then(|status| status.strip_suffix("\nState:   Running\n"))
+        .ok_or("unexpected human status output")?;
+    let list = String::from_utf8(env.invoke(&["list"])?.stdout)?;
+    let width = sandbox_id.len().max("SANDBOX".len());
+    assert_eq!(
+        list,
+        format!(
+            "{:<width$}  STATE\n{sandbox_id:<width$}  Running\n",
+            "SANDBOX"
+        )
+    );
     assert_eq!(env.invoke(&["destroy"])?.status.code(), Some(64));
     assert_eq!(
         serde_json::from_slice::<Vec<serde_json::Value>>(&env.invoke(&["list", "--json"])?.stdout)?
