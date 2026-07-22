@@ -298,6 +298,14 @@ fn interactive_lifecycle_progress_updates_in_place_and_finishes_cleanly() -> Tes
         let (status, output) = invoke_with_stderr_pty(&env, &["up", env.root()?], no_color)?;
         assert!(status.success());
         let stderr = String::from_utf8(output)?;
+        let completion_offset = stderr
+            .find("✓ Sandbox is running")
+            .ok_or("completion line missing from PTY transcript")?;
+        assert!(
+            stderr[..completion_offset].contains("\r\u{1b}[2K"),
+            "in-place redraw missing before completion: {}",
+            stderr.escape_debug()
+        );
         assert!(
             stderr
                 .chars()
@@ -306,7 +314,6 @@ fn interactive_lifecycle_progress_updates_in_place_and_finishes_cleanly() -> Tes
         assert!(stderr.contains("Preparing sandbox"));
         assert!(stderr.contains("Validating configuration"));
         assert!(stderr.contains("Starting sandbox"));
-        assert!(stderr.contains('\r') || stderr.contains("\u{1b}["));
         assert!(
             console::strip_ansi_codes(&stderr).ends_with("✓ Sandbox is running\r\n"),
             "unexpected PTY transcript: {}",
