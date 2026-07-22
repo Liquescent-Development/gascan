@@ -299,31 +299,34 @@ git -C "$clone" config user.email release@example.invalid
 git -C "$clone" config gpg.format ssh
 git -C "$clone" config user.signingKey "$fixture/key"
 git -C "$clone" config gpg.ssh.allowedSignersFile "$fixture/allowed-signers"
-tag=v$workspace_version
+# Use a version no real tag carries. The clone's origin IS this repository, so
+# a real released version would already be present on the remote and the
+# unpushed case could never be exercised.
+probe_version=99.99.99
+tag=v$probe_version
 
 # absent tag
-git -C "$clone" tag -d "$tag" >/dev/null 2>&1 || true
-if gascan_gate_tag "$clone" "$workspace_version" >/dev/null 2>&1; then
+if gascan_gate_tag "$clone" "$probe_version" >/dev/null 2>&1; then
   printf 'an absent tag was accepted\n' >&2; exit 1
 fi
 
 # lightweight tag
 git -C "$clone" tag "$tag"
-if gascan_gate_tag "$clone" "$workspace_version" >/dev/null 2>&1; then
+if gascan_gate_tag "$clone" "$probe_version" >/dev/null 2>&1; then
   printf 'a lightweight tag was accepted\n' >&2; exit 1
 fi
 git -C "$clone" tag -d "$tag" >/dev/null
 
 # annotated but unsigned
 git -C "$clone" tag -a "$tag" -m unsigned
-if gascan_gate_tag "$clone" "$workspace_version" >/dev/null 2>&1; then
+if gascan_gate_tag "$clone" "$probe_version" >/dev/null 2>&1; then
   printf 'an unsigned annotated tag was accepted\n' >&2; exit 1
 fi
 git -C "$clone" tag -d "$tag" >/dev/null
 
 # signed but not pointing at HEAD
 git -C "$clone" tag -s "$tag" -m 'not head' "$(git -C "$clone" rev-parse HEAD~1)"
-if gascan_gate_tag "$clone" "$workspace_version" >/dev/null 2>&1; then
+if gascan_gate_tag "$clone" "$probe_version" >/dev/null 2>&1; then
   printf 'a tag that does not peel to HEAD was accepted\n' >&2; exit 1
 fi
 git -C "$clone" tag -d "$tag" >/dev/null
@@ -331,7 +334,7 @@ git -C "$clone" tag -d "$tag" >/dev/null
 # signed, at HEAD, but absent from the remote
 git -C "$clone" tag -s "$tag" -m 'at head'
 set +e
-unpushed=$(gascan_gate_tag "$clone" "$workspace_version" 2>&1 >/dev/null)
+unpushed=$(gascan_gate_tag "$clone" "$probe_version" 2>&1 >/dev/null)
 unpushed_code=$?
 set -e
 [[ $unpushed_code -ne 0 ]] || {
