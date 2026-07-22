@@ -5,7 +5,7 @@ use crate::presentation::{
     render_list as render_human_list, render_status as render_human_status,
 };
 use crate::terminal::RawTerminal;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, error::ErrorKind};
 use gascan_proto::v1;
 use std::io::{IsTerminal, Write};
 use std::os::fd::AsFd;
@@ -16,7 +16,7 @@ const EXIT_RUNTIME: i32 = 70;
 const EXIT_API: i32 = 76;
 
 #[derive(Parser)]
-#[command(name = "gascan", disable_help_subcommand = true)]
+#[command(name = "gascan", version, disable_help_subcommand = true)]
 struct Arguments {
     #[arg(long, global = true)]
     sandbox: Option<String>,
@@ -230,10 +230,19 @@ fn resolve_project_root(project_root: &str) -> Result<String, CliError> {
 }
 
 pub async fn execute() -> Result<i32, CliError> {
-    let arguments = Arguments::try_parse().map_err(|error| CliError::Usage {
-        kind: UsageKind::Other,
-        message: error.to_string(),
-    })?;
+    let arguments = match Arguments::try_parse() {
+        Ok(arguments) => arguments,
+        Err(error) if error.kind() == ErrorKind::DisplayVersion => {
+            print!("{error}");
+            return Ok(0);
+        }
+        Err(error) => {
+            return Err(CliError::Usage {
+                kind: UsageKind::Other,
+                message: error.to_string(),
+            });
+        }
+    };
     if matches!(arguments.command, Command::DaemonAttest) {
         let attestation = Client::daemon_attestation().await?;
         println!(
@@ -782,6 +791,29 @@ fn confirm_destroy() -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory as _;
+
+    #[test]
+    fn root_help_advertises_the_standard_version_flags() {
+        let help = Arguments::command().render_help().to_string();
+        assert!(
+            help.contains("-V, --version"),
+            "version option missing: {help}"
+        );
+    }
+
+    #[test]
+    fn clap_formats_the_package_version() -> Result<(), Box<dyn std::error::Error>> {
+        let error = Arguments::try_parse_from(["gascan", "--version"])
+            .err()
+            .ok_or("version did not produce an early display result")?;
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(
+            error.to_string(),
+            format!("gascan {}\n", env!("CARGO_PKG_VERSION"))
+        );
+        Ok(())
+    }
 
     #[test]
     fn selector_usage_errors_choose_suggestions_structurally() {
