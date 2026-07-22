@@ -561,18 +561,54 @@ set -e
 grep -Fq 'missing required release configuration' <<<"$unconfigured" || {
   printf 'no missing-configuration message: %s\n' "$unconfigured" >&2; exit 1; }
 
-# Source contract: no tag mutation, no release deletion, no hardcoded identity.
-if grep -Fq -- '--cleanup-tag' "$release"; then
-  printf 'release.sh references --cleanup-tag\n' >&2; exit 1
-fi
-if grep -Eq '^[^#]*gh release delete' "$release"; then
-  printf 'release.sh deletes releases\n' >&2; exit 1
-fi
-if grep -Eq '^[^#]*git (tag|push)' "$release"; then
-  printf 'release.sh creates or pushes tags\n' >&2; exit 1
-fi
+# Mutation is asserted behaviorally, not by source grep. Remediation text
+# legitimately contains `git tag -s` and `gh release delete`, so grepping the
+# source cannot distinguish a printed suggestion from an executed command.
+# Stub git and gh, run --check, and require the log shows no mutation.
+stub_bin=$fixture/bin
+mkdir -p "$stub_bin"
+export GASCAN_STUB_LOG=$fixture/commands.log
+: >"$GASCAN_STUB_LOG"
+cat >"$stub_bin/gh" <<'STUB_GH'
+#!/usr/bin/env bash
+printf 'gh %s\n' "$*" >>"${GASCAN_STUB_LOG:?}"
+case "${1:-} ${2:-}" in
+  'release view') exit 1 ;;
+esac
+exit 0
+STUB_GH
+cat >"$stub_bin/git" <<'STUB_GIT'
+#!/usr/bin/env bash
+printf 'git %s\n' "$*" >>"${GASCAN_STUB_LOG:?}"
+exec /usr/bin/git "$@"
+STUB_GIT
+chmod +x "$stub_bin/gh" "$stub_bin/git"
+
+set +e
+PATH=$stub_bin:$PATH GASCAN_CODESIGN_IDENTITY=x GASCAN_INSTALLER_SIGNING_IDENTITY=x \
+  GASCAN_NOTARYTOOL_PROFILE=x GASCAN_TAP_PATH="$fixture" \
+  "$release" "$workspace_version" --check >/dev/null 2>&1
+set -e
+
+while IFS= read -r logged; do
+  case $logged in
+    'git tag'*|'git push'*|*'--cleanup-tag'*|'gh release delete'*)
+      printf 'check mode attempted a mutation: %s\n' "$logged" >&2
+      exit 1 ;;
+  esac
+done <"$GASCAN_STUB_LOG"
+
+# `--cleanup-tag` is never legitimate, even as printed text: it deletes the
+# signed tag from the remote.
+for f in "$release" "$gates"; do
+  if grep -Fq -- '--cleanup-tag' "$f"; then
+    printf '%s references --cleanup-tag\n' "$f" >&2; exit 1
+  fi
+done
+
+# No hardcoded identity, team identifier, or profile.
 for f in "$release" "$gates" "$config"; do
-  if grep -Eq 'Developer ID (Application|Installer): |\([A-Z0-9]{10}\)' "$f"; then
+  if grep -Eq 'Developer ID (Application|Installer): [A-Za-z]|\([A-Z0-9]{10}\)' "$f"; then
     printf 'hardcoded signing identity or team identifier in %s\n' "$f" >&2
     exit 1
   fi
@@ -722,12 +758,13 @@ done
 grep -Eq 'trap .*EXIT' "$release" || {
   printf 'release.sh does not restore the original ref on exit\n' >&2; exit 1; }
 # `status` is read-only in zsh and has previously made a successful release
-# look like a failure.
-grep -Eq '^[[:space:]]*status=' "$release" && {
-  printf 'release.sh assigns a variable named status\n' >&2; exit 1; }
+# look like a failure. Written as an `if` so an absent pattern -- the passing
+# case -- does not trip `set -e`.
+if grep -Eq '^[[:space:]]*status=' "$release"; then
+  printf 'release.sh assigns a variable named status\n' >&2
+  exit 1
+fi
 ```
-
-Write that last check as an `if` so a missing pattern does not trip `set -e`.
 
 - [ ] **Step 2: Run to verify it fails**
 
@@ -809,10 +846,10 @@ printf '  cask:   %s\n' "$(git -C "$tap_path" rev-parse --short HEAD)"
 printf '  verify: brew update && brew upgrade --cask gascan\n'
 ```
 
-Note: the tap `git push` is in `$tap_path`, a different repository, so the
-contract's `git (tag|push)` source check must be written to allow
-`git -C "$tap_path" push` while still rejecting tag creation in this repo. Adjust
-that assertion to target tag mutation specifically.
+The tap `git push` targets `$tap_path`, a different repository. Task 3's
+mutation assertion is behavioral and runs only under `--check`, which exits
+before this code, so it stays correct without modification: `--check` must
+mutate nothing, while a real run legitimately pushes the tap.
 
 - [ ] **Step 4: Run to verify it passes**
 
