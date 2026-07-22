@@ -41,7 +41,7 @@ impl OutputCapabilities {
         let interactive = term.is_term();
         Self {
             interactive,
-            color,
+            color: interactive && color,
             unicode: term.features().wants_emoji(),
         }
     }
@@ -664,6 +664,42 @@ mod tests {
             .status()?;
 
         assert!(status.success());
+        Ok(())
+    }
+
+    #[test]
+    fn redirected_streams_ignore_clicolor_force() -> Result<(), Box<dyn std::error::Error>> {
+        const CHILD_MARKER: &str = "GASCAN_TEST_REDIRECTED_COLOR";
+
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let stdout = OutputCapabilities::for_stdout();
+            let stderr = OutputCapabilities::for_stderr();
+            assert!(!stdout.interactive);
+            assert!(!stdout.color);
+            assert!(!stderr.interactive);
+            assert!(!stderr.color);
+            return Ok(());
+        }
+
+        let output = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "presentation::tests::redirected_streams_ignore_clicolor_force",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .env_remove("NO_COLOR")
+            .env("CLICOLOR_FORCE", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()?;
+
+        assert!(
+            output.status.success(),
+            "child failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         Ok(())
     }
 }
