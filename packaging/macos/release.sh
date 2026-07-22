@@ -111,11 +111,50 @@ restore_ref() {
   printf 'could not return to %s; you are on a detached HEAD\n' "$original_ref" >&2
   printf 'run: git checkout %s\n' "$original_ref" >&2
 }
-trap restore_ref EXIT
 
-git checkout --quiet "v$version"
+# Once publish.sh returns, the GitHub release is public and cannot be undone
+# safely -- the documented recovery deletes a release, and an operator reaching
+# for it lands one flag away from deleting the signed tag too. So every failure
+# after that point has to say the release is already live and hand over the two
+# values needed to finish the cask by hand, which the success path would
+# otherwise be the only place to print.
+release_is_live=false
+asset_url=
+checksum=
+report_live_release() {
+  [[ $release_is_live == true ]] || return 0
+  printf '\nthe GitHub release for v%s is already published; do not delete it\n' \
+    "$version" >&2
+  printf '  asset:  %s\n' "${asset_url:-unknown}" >&2
+  printf '  sha256: %s\n' "${checksum:-unknown}" >&2
+  printf 'finish the cask by hand:\n' >&2
+  printf '  %s/packaging/macos/render-cask.sh %s %s > %s/Casks/gascan.rb\n' \
+    "$repo_root" "$version" "${checksum:-SHA256}" "$tap_path" >&2
+  printf '  git -C %s add Casks/gascan.rb\n' "$tap_path" >&2
+  printf "  git -C %s commit -m 'gascan %s'\n" "$tap_path" "$version" >&2
+  printf '  git -C %s push\n' "$tap_path" >&2
+}
+
+on_exit() {
+  local exit_code=$?
+  restore_ref
+  [[ $exit_code -eq 0 ]] || report_live_release
+  return $exit_code
+}
+trap on_exit EXIT
+# Notarization runs for minutes with the operator parked on a detached HEAD.
+# Matching release-smoke.sh, name the interrupted exit status rather than
+# leaving it to differ between INT and TERM.
+trap 'exit 130' INT TERM
+
+# `--detach refs/tags/` names exactly the tag: a branch called v1.2.3 would
+# otherwise win, and the release would be built from the wrong commit.
+git checkout --quiet --detach "refs/tags/v$version"
 revision=$(git rev-parse --verify HEAD)
-package="$repo_root/.artifacts/release/gascan-$version-macos-arm64.pkg"
+# package.sh honors GASCAN_RELEASE_ARTIFACT_DIR. Looking somewhere else means
+# reuse silently never triggers and every retry pays another notarization round
+# trip -- the exact cost this path exists to avoid.
+package="${GASCAN_RELEASE_ARTIFACT_DIR:-$repo_root/.artifacts/release}/gascan-$version-macos-arm64.pkg"
 
 reusable=false
 if [[ -f $package ]] &&
@@ -136,20 +175,14 @@ else
   )
 fi
 
-pkgutil --check-signature "$package" >/dev/null || {
-  printf 'package is not signed by a Developer ID Installer certificate\n' >&2
-  exit 65
-}
-spctl --assess --type install "$package" >/dev/null 2>&1 || {
-  printf 'Gatekeeper rejects the package as an install candidate\n' >&2
-  exit 65
-}
-xcrun stapler validate "$package" >/dev/null || {
-  printf 'package has no stapled notarization ticket\n' >&2
-  exit 65
-}
+# One call, not a hand-rolled trio. `pkgutil --check-signature` alone exits 0
+# for a package signed by any certificate at all, so the trio's own error text
+# claimed more than it proved; the helper also pins the Developer ID Installer
+# certificate and the team, and asserts the exact payload.
+gascan_assert_distributable_package "$package" "$GASCAN_RELEASE_TEAM" || exit 65
 
 published=$("$repo_root/packaging/macos/publish.sh" "$package")
+release_is_live=true
 # publish.sh's stdout is a two-line contract: asset URL, then SHA-256. Assert
 # the shape rather than trusting positions. `gh release upload` inside it does
 # not redirect its own stdout, so a future gh that chatters there would shift
@@ -176,19 +209,29 @@ mkdir -p "$tap_path/Casks"
 "$repo_root/packaging/macos/render-cask.sh" "$version" "$checksum" \
   >"$tap_path/Casks/gascan.rb"
 ruby -c "$tap_path/Casks/gascan.rb" >/dev/null || {
-  printf 'rendered cask is not valid Ruby\n' >&2
+  printf 'rendered cask is not valid Ruby: %s\n' "$tap_path/Casks/gascan.rb" >&2
   exit 65
 }
-brew style "$tap_path/Casks/gascan.rb" >/dev/null || {
-  printf 'rendered cask fails brew style\n' >&2
+# Let brew name the offenses. Discarding them tells the operator only that
+# something is wrong, at the one point where the release is already public.
+brew style "$tap_path/Casks/gascan.rb" || {
+  printf 'rendered cask fails brew style: %s\n' "$tap_path/Casks/gascan.rb" >&2
   exit 65
 }
 # `add` explicitly, not `commit -a`: the first release into a fresh tap writes
 # Casks/gascan.rb as a new file, which `-a` never stages, so the commit would
 # fail with "nothing to commit" after the release was already published.
 git -C "$tap_path" add Casks/gascan.rb
-git -C "$tap_path" commit --quiet -m "gascan $version"
-git -C "$tap_path" push --quiet
+# An identical cask is not a failure. It happens when an operator wrote the
+# cask by hand while recovering and then re-ran, and `git commit` with nothing
+# staged would abort the run under `set -e` with only git's own wording.
+if git -C "$tap_path" diff --cached --quiet; then
+  printf 'the cask already carries %s and this checksum; nothing to commit\n' \
+    "$version" >&2
+else
+  git -C "$tap_path" commit --quiet -m "gascan $version"
+  git -C "$tap_path" push --quiet
+fi
 
 printf '\nreleased %s\n' "$version"
 printf '  asset:  %s\n' "$asset_url"

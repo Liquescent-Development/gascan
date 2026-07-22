@@ -127,4 +127,13 @@ gascan_gate_tap() {
     printf 'run: git -C %s pull --ff-only\n' "$tap" >&2
     return 65
   }
+  # Fetching proves read access; the release needs write access. Without this,
+  # a missing or expired push credential surfaces only after the GitHub release
+  # is already public -- exactly the late, expensive failure these gates exist
+  # to move forward. A dry run authenticates and negotiates refs, then stops.
+  git -C "$tap" push --dry-run --quiet origin main || {
+    printf 'cannot push to origin/main in the tap: %s\n' "$tap" >&2
+    printf 'check the credential for that remote before releasing\n' >&2
+    return 65
+  }
 }

@@ -245,14 +245,17 @@ printf 'git %s\n' "$*" >>"${GASCAN_STUB_LOG:?}"
 # remote, so an unconditional exec would let a regression create or push a tag
 # for real and only fail the assertion afterwards -- the log scan below runs
 # after the whole run finishes. Read-only subcommands still reach real git,
-# because the gates need its actual output.
-for word in "$@"; do
-  case $word in
-    tag|push|--cleanup-tag)
-      printf 'stub git refused a mutating subcommand: %s\n' "$*" >&2
-      exit 70 ;;
-  esac
-done
+# because the gates need its actual output, and `--dry-run` is read-only: the
+# tap gate uses `push --dry-run` to prove the push credential works.
+if [[ " $* " != *' --dry-run '* ]]; then
+  for word in "$@"; do
+    case $word in
+      tag|push|--cleanup-tag)
+        printf 'stub git refused a mutating subcommand: %s\n' "$*" >&2
+        exit 70 ;;
+    esac
+  done
+fi
 exec /usr/bin/git "$@"
 STUB_GIT
 chmod +x "$stub_bin/gh" "$stub_bin/git"
@@ -274,9 +277,20 @@ set -e
 # this codebase is `git -C REPO ...`, so a prefix pattern like `git tag`* could
 # never match the very mutation it exists to catch.
 while IFS= read -r logged; do
+  # A dry run is read-only; the tap gate uses one to prove push access.
+  case " $logged " in
+    *' --dry-run '*) continue ;;
+  esac
   case " $logged " in
     *' tag '*|*' push '*|*'--cleanup-tag'*|*' release delete '*)
       printf 'check mode attempted a mutation: %s\n' "$logged" >&2
+      exit 1 ;;
+  esac
+  # --check must never leave the operator's ref. The checkout belongs to the
+  # release path, which runs only after --check has already exited.
+  case " $logged " in
+    *' checkout '*)
+      printf 'check mode moved the working tree: %s\n' "$logged" >&2
       exit 1 ;;
   esac
 done <"$GASCAN_STUB_LOG"
@@ -299,17 +313,28 @@ for f in "$release" "$gates" "$config"; do
   fi
 done
 
+# `macos/package.sh`, not `package.sh`: the bare form is a substring of
+# `verify-package.sh`, so the needle would be satisfied by a different line and
+# could never fail.
 for needle in verify-package.sh gascan_assert_distributable_package \
-  render-cask.sh publish.sh package.sh; do
+  render-cask.sh publish.sh macos/package.sh; do
   grep -Fq "$needle" "$release" || {
     printf 'release.sh never references %s\n' "$needle" >&2; exit 1; }
 done
 grep -Eq 'trap .*EXIT' "$release" || {
   printf 'release.sh does not restore the original ref on exit\n' >&2; exit 1; }
+grep -Eq 'trap .*INT TERM' "$release" || {
+  printf 'release.sh does not name its interrupted exit status\n' >&2; exit 1; }
+# A failure after publish must say the release is already live, because the
+# recovery an operator reaches for otherwise deletes a published release.
+grep -Fq 'already published' "$release" || {
+  printf 'release.sh never warns that the release is already published\n' >&2
+  exit 1; }
 # `status` is read-only in zsh and has previously made a successful release
-# look like a failure. Written as an `if` so an absent pattern -- the passing
-# case -- does not trip `set -e`.
-if grep -Eq '^[[:space:]]*status=' "$release"; then
+# look like a failure. `local status=` is how it would most likely reappear.
+# Written as an `if` so an absent pattern -- the passing case -- does not trip
+# `set -e`.
+if grep -Eq '^[[:space:]]*(local[[:space:]]+)?status=' "$release"; then
   printf 'release.sh assigns a variable named status\n' >&2
   exit 1
 fi
