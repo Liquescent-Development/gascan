@@ -389,7 +389,7 @@ ahead_code=$?
 set -e
 [[ $ahead_code -ne 0 ]] || {
   printf 'a tap ahead of origin/main was accepted\n' >&2; exit 1; }
-grep -Fq "git -C $tap push" <<<"$ahead" || {
+grep -Fq "git -C $tap push origin main" <<<"$ahead" || {
   printf 'an ahead tap was not told to push: %s\n' "$ahead" >&2; exit 1; }
 ```
 
@@ -533,7 +533,7 @@ gascan_gate_tap() {
     # would contradict the recovery the driver itself prints.
     if git -C "$tap" merge-base --is-ancestor "$remote_head" "$local_head"; then
       printf 'tap has a commit that is not on origin/main: %s\n' "$tap" >&2
-      printf 'run: git -C %s push\n' "$tap" >&2
+      printf 'run: git -C %s push origin main\n' "$tap" >&2
     elif git -C "$tap" merge-base --is-ancestor "$local_head" "$remote_head"; then
       printf 'tap is behind origin/main: %s\n' "$tap" >&2
       printf 'run: git -C %s pull --ff-only origin main\n' "$tap" >&2
@@ -1006,7 +1006,7 @@ report_live_release() {
   if [[ $tap_stage != committed ]]; then
     printf "  git -C %s commit -m 'gascan %s'\n" "$tap_path" "$version" >&2
   fi
-  printf '  git -C %s push\n' "$tap_path" >&2
+  printf '  git -C %s push origin main\n' "$tap_path" >&2
 }
 
 on_exit() {
@@ -1111,12 +1111,18 @@ tap_stage=staged
 if git -C "$tap_path" diff --cached --quiet; then
   printf 'the cask already carries %s and this checksum; nothing to commit\n' \
     "$version" >&2
-  tap_stage=committed
 else
   git -C "$tap_path" commit --quiet -m "gascan $version"
-  tap_stage=committed
-  git -C "$tap_path" push --quiet
 fi
+tap_stage=committed
+# `origin main`, never a bare push, for the same reason the pull above names
+# them: a hand-assembled tap has no upstream tracking, and git's default
+# push.autoSetupRemote is false, so a bare push exits 128 with "no upstream
+# branch" -- after the release is public, on the last mutation of the run.
+# Unconditional, because with nothing committed this is a no-op that says
+# "Everything up-to-date" rather than a step whose safety rests on an
+# invariant established two hundred lines earlier.
+git -C "$tap_path" push --quiet origin main
 
 printf '\nreleased %s\n' "$version"
 print_release_values
