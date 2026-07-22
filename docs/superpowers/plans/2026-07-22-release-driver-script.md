@@ -45,6 +45,7 @@ Design: `docs/superpowers/specs/2026-07-22-release-driver-script-design.md`
 | --- | --- |
 | `packaging/macos/release-config.sh` | Resolve one config value by precedence; parse the config file as data |
 | `packaging/macos/release-gates.sh` | Every pre-flight assertion, one function each |
+| `packaging/macos/release-recovery.sh` | What to tell an operator when a step fails after the release is public |
 | `packaging/macos/release.sh` | Argument parsing, gate sequencing, execution |
 | `tests/release/release-script-contract.sh` | Behavioral + source contract |
 | `docs/release/macos-checklist.md` | Document the one-command path |
@@ -900,12 +901,21 @@ the repository, with nothing defaulted."
 ### Task 4: Build, publish, and tap execution
 
 **Files:**
+- Create: `packaging/macos/release-recovery.sh`
 - Modify: `packaging/macos/release.sh`
 - Modify: `tests/release/release-script-contract.sh`
 
 **Interfaces:**
 - Consumes: Task 3.
-- Produces: the full release path after gates pass.
+- Produces: the full release path after gates pass, plus
+  `gascan_print_release_values ASSET_URL CHECKSUM` and
+  `gascan_report_live_release VERSION TAP_PATH REPO_ROOT STAGE ASSET_URL
+  CHECKSUM PUBLISHED`, both writing to stdout so a caller chooses the stream.
+
+The recovery narrator lives in its own file for one reason: it runs only when
+a release is already public, so a driver-embedded version can be exercised by
+nothing short of a live release. As a function taking its inputs, every stage
+and the malformed-value case are assertable in milliseconds.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -937,6 +947,60 @@ if grep -Eq '(^|[[:space:]])(local|declare|readonly|typeset)?[[:space:]]*status=
   printf 'release.sh assigns a variable named status\n' >&2
   exit 1
 fi
+
+# The recovery narrator, exercised directly. It runs only when a release is
+# already public, so without this it would be covered by a single grep -- and
+# the defects found in it so far were exactly the kind a grep cannot see.
+recovery=$repo_root/packaging/macos/release-recovery.sh
+[[ -r $recovery ]] || { printf 'release-recovery.sh is not readable\n' >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$recovery"
+
+good_url=https://github.com/example/gascan/releases/download/v1.2.3/gascan.pkg
+good_sum=$(printf 'x' | shasum -a 256 | awk '{print $1}')
+
+# Every stage names the commands that remain and none that are already done.
+for stage in none rendered staged committed; do
+  advice=$(gascan_report_live_release 1.2.3 /tmp/tap /tmp/repo "$stage" \
+    "$good_url" "$good_sum" "$good_url"$'\n'"$good_sum")
+  grep -Fq 'already published' <<<"$advice" || {
+    printf 'stage %s does not say the release is published\n' "$stage" >&2; exit 1; }
+  grep -Fq "$good_sum" <<<"$advice" || {
+    printf 'stage %s omits the checksum\n' "$stage" >&2; exit 1; }
+  grep -Fq 'git -C /tmp/tap push origin main' <<<"$advice" || {
+    printf 'stage %s omits the explicit push\n' "$stage" >&2; exit 1; }
+  case $stage in
+    none)
+      grep -Fq 'render-cask.sh' <<<"$advice" || {
+        printf 'stage none omits the render step\n' >&2; exit 1; } ;;
+    rendered|staged|committed)
+      if grep -Fq 'render-cask.sh' <<<"$advice"; then
+        printf 'stage %s tells the operator to re-render an existing cask\n' \
+          "$stage" >&2
+        exit 1
+      fi ;;
+  esac
+  if [[ $stage == committed ]] && grep -Fq 'commit -m' <<<"$advice"; then
+    printf 'stage committed tells the operator to commit again\n' >&2
+    exit 1
+  fi
+done
+
+# A value that failed validation must never be presented as authoritative, and
+# must never be pasted into a render-cask.sh command that render-cask.sh
+# rejects. Empty values are how the driver signals exactly that.
+rejected=$(gascan_report_live_release 1.2.3 /tmp/tap /tmp/repo none '' '' \
+  "chatter"$'\n'"$good_url")
+grep -Fq 'chatter' <<<"$rejected" || {
+  printf 'rejected publish output was not shown raw: %s\n' "$rejected" >&2; exit 1; }
+if grep -Eq '^[[:space:]]*sha256:[[:space:]]*http' <<<"$rejected"; then
+  printf 'a rejected value was labelled as the sha256: %s\n' "$rejected" >&2
+  exit 1
+fi
+if grep -Eq 'render-cask\.sh [0-9.]+ http' <<<"$rejected"; then
+  printf 'a rejected value was pasted into the render command: %s\n' "$rejected" >&2
+  exit 1
+fi
 ```
 
 - [ ] **Step 2: Run to verify it fails**
@@ -945,6 +1009,75 @@ Run: `bash tests/release/release-script-contract.sh; echo "exit: $?"`
 Expected: exit 1, `release.sh never references verify-package.sh`.
 
 - [ ] **Step 3: Implement**
+
+Create `packaging/macos/release-recovery.sh`:
+
+```bash
+#!/usr/bin/env bash
+# What to tell an operator when a release step fails after publish.sh has
+# already flipped the release out of draft.
+#
+# This lives outside release.sh so it can be tested. It runs only when a
+# release is public, which no test can arrange, and the defects found in it so
+# far -- a recipe wrong for two of its three states, rejected values presented
+# as authoritative -- are not the kind a source grep can see.
+#
+# Both functions write to stdout. The caller redirects.
+
+gascan_print_release_values() {
+  printf '  asset:  %s\n' "$1"
+  printf '  sha256: %s\n' "$2"
+}
+
+# gascan_report_live_release VERSION TAP_PATH REPO_ROOT STAGE ASSET_URL
+#                           CHECKSUM PUBLISHED
+#
+# ASSET_URL and CHECKSUM are empty when publish.sh's output did not validate.
+# PUBLISHED is that raw output, shown instead so the operator sees what
+# actually came back rather than a value already rejected.
+gascan_report_live_release() {
+  local version=$1 tap=$2 repo=$3 stage=$4 url=$5 sum=$6 raw=$7
+  printf '\nthe GitHub release for v%s is already published; do not delete it\n' \
+    "$version"
+  if [[ -n $url && -n $sum ]]; then
+    gascan_print_release_values "$url" "$sum"
+  else
+    printf 'publish.sh printed:\n%s\n' "$raw"
+  fi
+  printf 'finish the cask by hand:\n'
+  if [[ $stage == none ]]; then
+    # `none` also covers a failed `pull --ff-only`, which means origin/main
+    # moved under the tap. Committing on the stale base would only get the
+    # push rejected, so name the reconcile step before the rest.
+    printf '  # if the tap could not fast-forward, reconcile it first:\n'
+    printf '  #   git -C %s pull --ff-only origin main\n' "$tap"
+    # render-cask.sh rejects a checksum that is not 64 hex characters, so name
+    # the placeholder rather than emitting a command that pastes and fails.
+    printf '  %s/packaging/macos/render-cask.sh %s %s > %s/Casks/gascan.rb\n' \
+      "$repo" "$version" "${sum:-<sha256-printed-above>}" "$tap"
+  fi
+  if [[ $stage == rendered ]]; then
+    printf '  # %s/Casks/gascan.rb is already rendered; check it before staging\n' \
+      "$tap"
+  fi
+  if [[ $stage == none || $stage == rendered ]]; then
+    printf '  git -C %s add Casks/gascan.rb\n' "$tap"
+  fi
+  if [[ $stage != committed ]]; then
+    printf "  git -C %s commit -m 'gascan %s'\n" "$tap" "$version"
+  fi
+  # Always last, and always explicit: a tap without upstream tracking rejects
+  # a bare push, which is the failure this recovery most often follows.
+  printf '  git -C %s push origin main\n' "$tap"
+}
+```
+
+Add its source line to `packaging/macos/release.sh`, beside the others:
+
+```bash
+# shellcheck source=release-recovery.sh
+source "$repo_root/packaging/macos/release-recovery.sh"
+```
 
 Append to `packaging/macos/release.sh`:
 
@@ -975,43 +1108,10 @@ checksum=
 # after the commit succeeded dead-ends in git's own "nothing to commit".
 tap_stage=none
 
-print_release_values() {
-  printf '  asset:  %s\n' "$asset_url"
-  printf '  sha256: %s\n' "$checksum"
-}
-
 report_live_release() {
   [[ $release_is_live == true ]] || return 0
-  printf '\nthe GitHub release for v%s is already published; do not delete it\n' \
-    "$version" >&2
-  if [[ -n $asset_url && -n $checksum ]]; then
-    print_release_values >&2
-  else
-    printf 'publish.sh printed:\n%s\n' "$published" >&2
-  fi
-  printf 'finish the cask by hand:\n' >&2
-  if [[ $tap_stage == none ]]; then
-    # `none` also covers a failed `pull --ff-only`, which means origin/main
-    # moved under the tap. Committing on the stale base would only get the
-    # push rejected, so name the reconcile step before the rest.
-    printf '  # if the tap could not fast-forward, reconcile it first:\n' >&2
-    printf '  #   git -C %s pull --ff-only origin main\n' "$tap_path" >&2
-    # render-cask.sh rejects a checksum that is not 64 hex characters, so name
-    # the placeholder rather than emitting a command that pastes and fails.
-    printf '  %s/packaging/macos/render-cask.sh %s %s > %s/Casks/gascan.rb\n' \
-      "$repo_root" "$version" "${checksum:-<sha256-printed-above>}" "$tap_path" >&2
-  fi
-  if [[ $tap_stage == rendered ]]; then
-    printf '  # %s/Casks/gascan.rb was rendered and then rejected; correct it first\n' \
-      "$tap_path" >&2
-  fi
-  if [[ $tap_stage == none || $tap_stage == rendered ]]; then
-    printf '  git -C %s add Casks/gascan.rb\n' "$tap_path" >&2
-  fi
-  if [[ $tap_stage != committed ]]; then
-    printf "  git -C %s commit -m 'gascan %s'\n" "$tap_path" "$version" >&2
-  fi
-  printf '  git -C %s push origin main\n' "$tap_path" >&2
+  gascan_report_live_release "$version" "$tap_path" "$repo_root" "$tap_stage" \
+    "$asset_url" "$checksum" "$published" >&2
 }
 
 # The exit status reports the release, not the ref: a successful release whose
@@ -1078,16 +1178,22 @@ published_lines=$(grep -c '' <<<"$published")
     "$published_lines" "$published" >&2
   exit 65
 }
-asset_url=$(sed -n '1p' <<<"$published")
-checksum=$(sed -n '2p' <<<"$published")
-[[ $asset_url == https://github.com/*/releases/download/*/* ]] || {
+# Validate before assigning. `asset_url` and `checksum` are what the recovery
+# hands the operator to finish the cask with, so a rejected value must never
+# reach them: it would be printed as authoritative and pasted into a
+# render-cask.sh command that render-cask.sh then rejects.
+candidate_url=$(sed -n '1p' <<<"$published")
+candidate_sum=$(sed -n '2p' <<<"$published")
+[[ $candidate_url == https://github.com/*/releases/download/*/* ]] || {
   printf 'publish did not report an asset URL:\n%s\n' "$published" >&2
   exit 65
 }
-[[ $checksum =~ ^[0-9a-f]{64}$ ]] || {
+[[ $candidate_sum =~ ^[0-9a-f]{64}$ ]] || {
   printf 'publish did not report a SHA-256:\n%s\n' "$published" >&2
   exit 65
 }
+asset_url=$candidate_url
+checksum=$candidate_sum
 
 # Name the remote and branch. A hand-assembled tap has no upstream tracking,
 # and a bare `pull --ff-only` fails there with "no tracking information" -- at
@@ -1117,12 +1223,21 @@ tap_stage=staged
 # An identical cask is not a failure. It happens when an operator wrote the
 # cask by hand while recovering and then re-ran, and `git commit` with nothing
 # staged would abort the run under `set -e` with only git's own wording.
-if git -C "$tap_path" diff --cached --quiet; then
-  printf 'the cask already carries %s and this checksum; nothing to commit\n' \
-    "$version" >&2
-else
-  git -C "$tap_path" commit --quiet -m "gascan $version"
-fi
+# `diff --cached --quiet` exits 1 for differences and above 1 for a real
+# error, so treating every non-zero as "there are changes" would commit on a
+# failed inspection.
+staged=0
+git -C "$tap_path" diff --cached --quiet || staged=$?
+case $staged in
+  0)
+    printf 'the cask already carries %s and this checksum; nothing to commit\n' \
+      "$version" >&2 ;;
+  1) git -C "$tap_path" commit --quiet -m "gascan $version" ;;
+  *)
+    printf 'could not inspect the staged cask in %s (git exited %s)\n' \
+      "$tap_path" "$staged" >&2
+    exit 65 ;;
+esac
 tap_stage=committed
 # `origin main`, never a bare push, for the same reason the pull above names
 # them: a hand-assembled tap has no upstream tracking, and git's default
@@ -1134,7 +1249,7 @@ tap_stage=committed
 git -C "$tap_path" push --quiet origin main
 
 printf '\nreleased %s\n' "$version"
-print_release_values
+gascan_print_release_values "$asset_url" "$checksum"
 printf '  cask:   %s\n' "$(git -C "$tap_path" rev-parse --short HEAD)"
 printf '  verify: brew update && brew upgrade --cask gascan\n'
 ```
@@ -1176,7 +1291,8 @@ stopped at.
 
 ```bash
 shellcheck packaging/macos/release.sh packaging/macos/release-gates.sh \
-  packaging/macos/release-config.sh tests/release/release-script-contract.sh
+  packaging/macos/release-config.sh packaging/macos/release-recovery.sh \
+  tests/release/release-script-contract.sh
 for c in tests/release/*-contract.sh; do bash "$c" >/dev/null 2>&1 || echo "FAIL $c"; done
 echo done
 ```
@@ -1186,7 +1302,8 @@ Expected: shellcheck exit 0, no `FAIL` lines, 11 contracts.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add packaging/macos/release.sh tests/release/release-script-contract.sh
+git add packaging/macos/release.sh packaging/macos/release-recovery.sh \
+  packaging/macos/release-gates.sh tests/release/release-script-contract.sh
 git commit -m "feat: build, publish, and update the cask in one command
 
 Compose package.sh, verify-package.sh, publish.sh and render-cask.sh rather
