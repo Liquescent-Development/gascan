@@ -2010,6 +2010,146 @@ the contract catching it.
 
 ---
 
+### Task 8: Bind the marker contract, and finish the gate assertions
+
+The Task 7 review found two Important items and six Minor. None is a live
+defect today; the first is a cross-file contract with nothing holding its two
+halves together, and the second is an assertion the previous brief asked for
+and did not get.
+
+**Files:**
+- Modify: `packaging/macos/release-common.sh`
+- Modify: `packaging/macos/publish.sh`
+- Modify: `packaging/macos/release.sh`
+- Modify: `packaging/macos/release-gates.sh`
+- Modify: `tests/release/release-script-contract.sh`
+- Modify: `tests/release/publish-contract.sh`
+
+- [ ] **Step 1: the published marker is derived twice, in two files**
+
+`publish.sh` writes `"$(dirname "$package")/$tag.published"`; `release.sh`
+independently rebuilds `"$(dirname "$package")/v$version.published"`. They agree
+only because `$tag` happens to equal `v$version` and both scripts `cd` to the
+repository root first. Nothing tests the coupling: the publish contract asserts
+publish.sh writes a marker, and nothing asserts release.sh reads *that* marker.
+
+If either derivation drifts — publish.sh using `$artifact_dir`, which it already
+computes and which differs from `dirname` across a symlink, or release.sh's
+`GASCAN_RELEASE_ARTIFACT_DIR` handling changing — the suite stays green while
+`report_live_release` silently never fires. The failure appears only on the path
+where publish died after the release went public: no "already published; do not
+delete it", so the operator reaches for the documented `gh release delete` and
+is one flag from destroying the signed tag. That is the exact post-release cost
+this branch exists to remove, and it is a regression against the network call
+the marker replaced, which could not drift.
+
+This repository already solved this once: `gascan_expected_release_assets` is a
+shared helper, and `publish-contract.sh` counts its call sites on both sides to
+prove neither end hand-rolls it.
+
+Add to `packaging/macos/release-common.sh`:
+
+```bash
+# The marker publish.sh writes the instant a release becomes public, and the
+# one release.sh reads from its EXIT trap. One derivation, because two would
+# agree until one of them moved and then fail silently on the one path where
+# the release is already public.
+gascan_published_marker() {
+  local package=$1 version=$2
+  printf '%s/v%s.published' "$(dirname "$package")" "$version"
+}
+```
+
+Call it from both sides — `publish.sh` in place of its inline path, `release.sh`
+in place of `published_marker=...` — and assert in
+`tests/release/publish-contract.sh` that both files reference the helper and
+neither still builds the path inline, following the pattern that file already
+uses for the asset pipeline.
+
+- [ ] **Step 2: the `draft:` field is untested**
+
+`gascan_gate_no_release` prints `a release for %s already exists (draft: %s)`.
+That field is the only thing distinguishing a stranded draft, which is safe to
+delete, from a published release, which must never be deleted — and it comes
+from a second `gh` call whose every failure is swallowed by `|| draft=unknown`.
+Break that line and the gate still refuses correctly, so every current assertion
+still passes, while the operator reads `draft: unknown` above a
+`gh release delete` recipe.
+
+The previous task's brief asked for both existing-release cases and got one, and
+the omission was not disclosed. Add to the existing exit-0 block:
+
+```bash
+grep -Fq 'draft: true' <<<"$existing" || {
+  printf 'the existing-draft message does not report the draft state: %s\n' \
+    "$existing" >&2
+  exit 1; }
+```
+
+and a second case with `GASCAN_STUB_GH_DRAFT=false` asserting the gate still
+fails and reports `draft: false`.
+
+- [ ] **Step 3: the marker write must announce its own failure**
+
+If the redirection fails — full disk, read-only artifact directory — `set -e`
+aborts `publish.sh` after the release is already public, and release.sh's trap
+then finds no marker and says nothing. The line the operator most needs is lost
+to a redirect error.
+
+```bash
+: >"$marker" || printf 'the release is public but the marker could not be written: %s\n' \
+  "$marker" >&2
+```
+
+- [ ] **Step 4: the tools test proves one command of fourteen**
+
+`gascan_gate_tools` gained `security`, `cpio`, and `gzip`, but the test proves
+only that `jq` is required — `jq` is second in the gate's loop and the fixture
+omits exactly it. Delete `security` from the gate and the test stays green. The
+test also re-lists the gate's commands verbatim, so the two lists can drift.
+
+Loop the assertion instead: for each command the gate requires, build a `PATH`
+missing exactly that one and assert the gate exits 69 naming it. Derive the list
+from the gate's own source rather than restating it, so a command added to the
+gate is covered without editing the test.
+
+- [ ] **Step 5: the remaining Minor findings**
+
+- The same-repo tap assertion's boolean half cannot fail: deleting the check
+  from the gate still returns non-zero, via the uncommitted-changes or
+  origin-name rule. The message grep is the real assertion — say so in the
+  comment, and drop the redundant boolean block.
+- `release-common.sh:83` assigns `status` inside
+  `gascan_exact_apple_prerequisites`. It is `local`-declared and not on the
+  release path, but `release.sh` sources this file into its own shell and the
+  rule exists because `status` is read-only in zsh. Rename it `system_status`
+  and add `release-common.sh` to the contract's `status=` scan, so the rule
+  covers every file the driver pulls in.
+- The quoted-identity match is exercised for the application identity only.
+  Reverting the installer arm to a bare substring match leaves the suite green.
+  Add the mirrored truncated-installer case.
+- `gascan_gate_no_release` declares `local version=$1` and never reads it; only
+  `tag` is used. Drop it.
+
+- [ ] **Step 6: Verify**
+
+```bash
+bash tests/release/release-script-contract.sh; echo "exit: $?"
+bash tests/release/publish-contract.sh; echo "exit: $?"
+shellcheck packaging/macos/release.sh packaging/macos/release-gates.sh \
+  packaging/macos/release-config.sh packaging/macos/release-recovery.sh \
+  packaging/macos/release-common.sh packaging/macos/publish.sh \
+  tests/release/release-script-contract.sh tests/release/publish-contract.sh
+echo "exit: $?"
+for c in tests/release/*-contract.sh; do bash "$c" >/dev/null 2>&1 || echo "FAIL $c"; done; echo done
+```
+
+There are 11 `tests/release/*-contract.sh`. Every new assertion must be shown to
+fail when the production line it covers is reverted — demonstrate that for the
+marker helper, the `draft: true` case, and one command from the tools loop.
+
+---
+
 ## Manual verification
 
 The happy path cannot run offline: it needs a real signed tag, live Apple
