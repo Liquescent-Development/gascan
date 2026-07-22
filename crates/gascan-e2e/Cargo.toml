@@ -16,11 +16,13 @@ path = "../gascand/src/main.rs"
 [dependencies]
 async-trait.workspace = true
 clap.workspace = true
+console.workspace = true
 gascan-core = { path = "../gascan-core" }
 gascan-apple = { path = "../gascan-apple" }
 gascan-proto = { path = "../gascan-proto" }
 gascand = { path = "../gascand" }
 hyper-util.workspace = true
+indicatif.workspace = true
 prost-types.workspace = true
 plist.workspace = true
 rustix = { workspace = true, features = ["termios"] }

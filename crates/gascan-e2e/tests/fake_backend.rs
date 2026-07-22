@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
 async fn api_client(
@@ -165,10 +165,96 @@ fn run_pty_to_eof(env: &Environment, arguments: &[&str]) -> TestResult<std::proc
     Ok(output)
 }
 
+fn invoke_with_stderr_pty(
+    env: &Environment,
+    arguments: &[&str],
+    no_color: bool,
+) -> TestResult<(std::process::ExitStatus, Vec<u8>)> {
+    let pty = rustix_openpty::openpty(None, None)?;
+    let stderr = std::fs::File::from(rustix_openpty::rustix::io::dup(&pty.user)?);
+    let mut command = env.command(arguments);
+    command.stdout(Stdio::piped()).stderr(stderr);
+    if no_color {
+        command.env("NO_COLOR", "1");
+    }
+    let mut child = command.spawn()?;
+    drop(command);
+    drop(pty.user);
+    let mut controller = std::fs::File::from(pty.controller);
+    let reader = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+        let mut output = Vec::new();
+        match controller.read_to_end(&mut output) {
+            Ok(_) => {}
+            Err(error) if error.raw_os_error() == Some(5) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(output)
+    });
+    let status = child.wait()?;
+    let output = reader.join().map_err(|_| "PTY reader panicked")??;
+    Ok((status, output))
+}
+
+fn assert_no_sgr(output: &[u8]) {
+    let mut index = 0;
+    while index + 1 < output.len() {
+        if output[index] != b'\x1b' || output[index + 1] != b'[' {
+            index += 1;
+            continue;
+        }
+        let Some(final_offset) = output[index + 2..]
+            .iter()
+            .position(|byte| (0x40..=0x7e).contains(byte))
+        else {
+            break;
+        };
+        let final_byte = output[index + 2 + final_offset];
+        assert_ne!(final_byte, b'm', "ANSI SGR color sequence leaked");
+        index += final_offset + 3;
+    }
+}
+
+fn assert_static_lifecycle_output(stderr: &str, initial: &str, completion: &str) {
+    assert!(stderr.contains(&format!("{initial}\n")));
+    assert!(stderr.contains(&format!("{completion}\n")));
+    for raw in [
+        "operation",
+        "before_provision",
+        "after_provision",
+        "provision_step",
+    ] {
+        assert!(!stderr.contains(raw), "raw phase leaked: {raw}");
+    }
+    assert!(!stderr.contains('\u{1b}'));
+}
+
 #[test]
 fn complete_cli_lifecycle_uses_daemon_api() -> TestResult {
     let env = Environment::new()?;
-    assert!(env.invoke(&["up", env.root()?])?.status.success());
+    let up = env.invoke(&["up", env.root()?])?;
+    assert!(
+        up.status.success(),
+        "up failed: {}",
+        String::from_utf8_lossy(&up.stderr)
+    );
+    let stderr = String::from_utf8(up.stderr)?;
+    assert!(stderr.contains("Preparing sandbox\n"));
+    assert!(stderr.contains("Validating configuration\n"));
+    assert!(stderr.contains("Sandbox is running\n"));
+    for raw in [
+        "operation",
+        "before_provision",
+        "after_provision",
+        "provision_step",
+    ] {
+        assert!(!stderr.contains(raw), "raw phase leaked: {raw}");
+    }
+    assert!(!stderr.contains('\u{1b}'));
+    let running = env.invoke(&["status", "--json"])?;
+    let sandbox_id = serde_json::from_slice::<serde_json::Value>(&running.stdout)?["sandbox_id"]
+        .as_str()
+        .ok_or("sandbox id missing")?
+        .to_owned();
     assert_eq!(
         env.invoke(&["run", "--", "fake-exit", "42"])?.status.code(),
         Some(42)
@@ -182,13 +268,105 @@ fn complete_cli_lifecycle_uses_daemon_api() -> TestResult {
             .filter(|line| !line.is_empty())
             .all(|line| serde_json::from_slice::<serde_json::Value>(line).is_ok())
     );
-    assert!(env.invoke(&["down"])?.status.success());
+    let down = env.invoke(&["down"])?;
+    assert!(down.status.success());
+    assert_static_lifecycle_output(
+        &String::from_utf8(down.stderr)?,
+        "Stopping sandbox",
+        &format!("Sandbox {sandbox_id} is stopped"),
+    );
     let status = env.invoke(&["status", "--json"])?;
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&status.stdout)?["actual_state"],
         "stopped"
     );
-    assert!(env.invoke(&["destroy", "--yes"])?.status.success());
+    let destroy = env.invoke(&["destroy", "--yes"])?;
+    assert!(destroy.status.success());
+    assert_static_lifecycle_output(
+        &String::from_utf8(destroy.stderr)?,
+        "Destroying sandbox",
+        &format!("Sandbox {sandbox_id} is destroyed"),
+    );
+    Ok(())
+}
+
+#[test]
+fn interactive_lifecycle_progress_updates_in_place_and_finishes_cleanly() -> TestResult {
+    let env = Environment::new()?;
+    assert!(env.invoke(&["doctor", "--json"])?.status.success());
+    for no_color in [false, true] {
+        let (status, output) = invoke_with_stderr_pty(&env, &["up", env.root()?], no_color)?;
+        assert!(status.success());
+        let stderr = String::from_utf8(output)?;
+        let completion_offset = stderr
+            .find("✓ Sandbox is running")
+            .ok_or("completion line missing from PTY transcript")?;
+        assert!(
+            stderr[..completion_offset].contains("\r\u{1b}[2K"),
+            "in-place redraw missing before completion: {}",
+            stderr.escape_debug()
+        );
+        assert!(
+            stderr
+                .chars()
+                .any(|character| { "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(character) })
+        );
+        assert!(stderr.contains("Preparing sandbox"));
+        assert!(stderr.contains("Validating configuration"));
+        assert!(stderr.contains("Starting sandbox"));
+        assert!(
+            console::strip_ansi_codes(&stderr).ends_with("✓ Sandbox is running\r\n"),
+            "unexpected PTY transcript: {}",
+            stderr.escape_debug()
+        );
+        if no_color {
+            assert_no_sgr(stderr.as_bytes());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn interactive_streamed_operation_failure_clears_spinner_before_error() -> TestResult {
+    let env = Environment::new()?;
+    assert!(
+        env.command(&["doctor", "--json"])
+            .env("GASCAN_FAKE_PROVISION_FAIL", "1")
+            .output()?
+            .status
+            .success()
+    );
+    let (status, output) = invoke_with_stderr_pty(&env, &["up", env.root()?], false)?;
+
+    let stderr = String::from_utf8(output)?;
+    assert_eq!(
+        status.code(),
+        Some(70),
+        "unexpected failure status; transcript: {}",
+        stderr.escape_debug()
+    );
+    let error_offset = stderr
+        .rfind("Error: ")
+        .ok_or("error line missing from PTY transcript")?;
+    assert!(
+        stderr[..error_offset].ends_with("\r\u{1b}[2K"),
+        "spinner was not cleared immediately before error: {}",
+        stderr.escape_debug()
+    );
+    let after_clear = &stderr[error_offset..];
+    assert!(
+        after_clear.starts_with("Error: ") && after_clear.ends_with("\r\n"),
+        "error is not a clean newline-terminated line: {}",
+        after_clear.escape_debug()
+    );
+    assert_eq!(after_clear.lines().count(), 1);
+    assert!(!after_clear.contains("Preparing sandbox"));
+    assert!(!after_clear.contains("Running project setup"));
+    assert!(
+        !after_clear
+            .chars()
+            .any(|character| { "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(character) })
+    );
     Ok(())
 }
 
@@ -359,6 +537,20 @@ fn inspection_confirmation_and_remaining_commands_are_stable() -> TestResult {
     assert!(env.invoke(&["shell", "--", "sh"])?.status.success());
     assert!(env.invoke(&["logs"])?.status.success());
     assert!(env.invoke(&["doctor", "--json"])?.status.success());
+    let status = String::from_utf8(env.invoke(&["status"])?.stdout)?;
+    let sandbox_id = status
+        .strip_prefix("Sandbox: ")
+        .and_then(|status| status.strip_suffix("\nState:   Running\n"))
+        .ok_or("unexpected human status output")?;
+    let list = String::from_utf8(env.invoke(&["list"])?.stdout)?;
+    let width = sandbox_id.len().max("SANDBOX".len());
+    assert_eq!(
+        list,
+        format!(
+            "{:<width$}  STATE\n{sandbox_id:<width$}  Running\n",
+            "SANDBOX"
+        )
+    );
     assert_eq!(env.invoke(&["destroy"])?.status.code(), Some(64));
     assert_eq!(
         serde_json::from_slice::<Vec<serde_json::Value>>(&env.invoke(&["list", "--json"])?.stdout)?
@@ -380,6 +572,17 @@ fn api_major_mismatch_has_stable_exit_and_error() -> TestResult {
         .output()?;
     assert_eq!(output.status.code(), Some(76));
     assert!(String::from_utf8_lossy(&output.stderr).contains("incompatible_api_major"));
+    Ok(())
+}
+
+#[test]
+fn no_sandbox_status_error_is_actionable_and_keeps_usage_exit() -> TestResult {
+    let env = Environment::new()?;
+    let output = env.invoke(&["status"])?;
+    assert_eq!(output.status.code(), Some(64));
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.starts_with("Error: no sandbox is available\n"));
+    assert!(stderr.contains("Try: gascan up <project-root>\n"));
     Ok(())
 }
 

@@ -1,4 +1,9 @@
 use crate::client::{Client, ClientError};
+use crate::presentation::{
+    DoctorCheck, OperationKind, OperationProgress, OutputCapabilities,
+    render_doctor as render_human_doctor, render_error as render_human_error,
+    render_list as render_human_list, render_status as render_human_status,
+};
 use crate::terminal::RawTerminal;
 use clap::{Parser, Subcommand};
 use gascan_proto::v1;
@@ -72,30 +77,94 @@ enum Command {
 }
 
 #[derive(Debug)]
+pub(crate) enum UsageKind {
+    NoSandbox,
+    MultipleSandboxes,
+    Other,
+}
+
+#[derive(Debug)]
 pub enum CliError {
     Client(ClientError),
-    Usage(String),
+    Usage { kind: UsageKind, message: String },
+    Operation { code: String, message: String },
     Runtime(String),
     Io(std::io::Error),
 }
 impl CliError {
     pub const fn exit_code(&self) -> i32 {
         match self {
-            Self::Usage(_) => EXIT_USAGE,
+            Self::Usage { .. } => EXIT_USAGE,
             Self::Client(ClientError::Api(_)) => EXIT_API,
             Self::Client(ClientError::Rpc(_)) => EXIT_RUNTIME,
             Self::Client(_) => EXIT_DAEMON,
-            Self::Runtime(_) | Self::Io(_) => EXIT_RUNTIME,
+            Self::Operation { .. } | Self::Runtime(_) | Self::Io(_) => EXIT_RUNTIME,
+        }
+    }
+
+    pub fn stable_code(&self) -> Option<&str> {
+        match self {
+            Self::Client(error) => error.stable_code(),
+            Self::Operation { code, .. } => Some(code),
+            Self::Usage { .. } | Self::Runtime(_) | Self::Io(_) => None,
+        }
+    }
+
+    pub fn message(&self) -> String {
+        let stable_code = self.stable_code();
+        if stable_code == Some(gascan_proto::error_code::SANDBOX_NOT_FOUND) {
+            return "sandbox not found".to_owned();
+        }
+        let message = match self {
+            Self::Client(error) => error.cause().unwrap_or_else(|| {
+                stable_code.map_or_else(|| error.to_string(), ToOwned::to_owned)
+            }),
+            Self::Usage { message, .. }
+            | Self::Operation { message, .. }
+            | Self::Runtime(message) => message.clone(),
+            Self::Io(error) => error.to_string(),
+        };
+        if message.trim().is_empty() {
+            return stable_code.unwrap_or_default().to_owned();
+        }
+        if stable_code == Some("resource_conflict") {
+            return format!("a managed runtime resource already exists: {message}");
+        }
+        message
+    }
+
+    pub fn suggestion(&self) -> Option<&'static str> {
+        match self {
+            Self::Usage {
+                kind: UsageKind::NoSandbox,
+                ..
+            } => Some("gascan up <project-root>"),
+            Self::Usage {
+                kind: UsageKind::MultipleSandboxes,
+                ..
+            } => Some("run `gascan list`, then pass `--sandbox <sandbox-id>`"),
+            Self::Client(_) | Self::Operation { .. }
+                if matches!(
+                    self.stable_code(),
+                    Some(gascan_proto::error_code::SANDBOX_NOT_FOUND)
+                ) =>
+            {
+                Some("run `gascan list` and use the sandbox ID shown there")
+            }
+            Self::Client(_)
+            | Self::Usage {
+                kind: UsageKind::Other,
+                ..
+            }
+            | Self::Operation { .. }
+            | Self::Runtime(_)
+            | Self::Io(_) => None,
         }
     }
 }
 impl std::fmt::Display for CliError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Client(e) => e.fmt(formatter),
-            Self::Usage(e) | Self::Runtime(e) => formatter.write_str(e),
-            Self::Io(e) => e.fmt(formatter),
-        }
+        formatter.write_str(&self.message())
     }
 }
 impl std::error::Error for CliError {}
@@ -115,6 +184,14 @@ impl From<std::io::Error> for CliError {
     }
 }
 
+pub fn render_error(error: &CliError) -> String {
+    render_human_error(
+        &error.message(),
+        error.suggestion(),
+        OutputCapabilities::for_stderr(),
+    )
+}
+
 /// Resolve a project root to the absolute path the daemon requires.
 ///
 /// A relative path names a directory relative to *this* process. The daemon
@@ -124,31 +201,39 @@ impl From<std::io::Error> for CliError {
 /// fallback for this function.
 fn resolve_project_root(project_root: &str) -> Result<String, CliError> {
     if project_root.is_empty() {
-        return Err(CliError::Usage("project root must not be empty".to_owned()));
+        return Err(CliError::Usage {
+            kind: UsageKind::Other,
+            message: "project root must not be empty".to_owned(),
+        });
     }
-    let resolved = std::fs::canonicalize(project_root).map_err(|error| {
-        CliError::Usage(format!(
-            "cannot use `{project_root}` as a project root: {error}"
-        ))
+    let resolved = std::fs::canonicalize(project_root).map_err(|error| CliError::Usage {
+        kind: UsageKind::Other,
+        message: format!("cannot use `{project_root}` as a project root: {error}"),
     })?;
-    let metadata = resolved.metadata().map_err(|error| {
-        CliError::Usage(format!(
-            "cannot use `{project_root}` as a project root: {error}"
-        ))
+    let metadata = resolved.metadata().map_err(|error| CliError::Usage {
+        kind: UsageKind::Other,
+        message: format!("cannot use `{project_root}` as a project root: {error}"),
     })?;
     if !metadata.is_dir() {
-        return Err(CliError::Usage(format!(
-            "cannot use `{project_root}` as a project root: not a directory"
-        )));
+        return Err(CliError::Usage {
+            kind: UsageKind::Other,
+            message: format!("cannot use `{project_root}` as a project root: not a directory"),
+        });
     }
     resolved
         .to_str()
         .map(ToOwned::to_owned)
-        .ok_or_else(|| CliError::Usage(format!("project root `{project_root}` is not valid UTF-8")))
+        .ok_or_else(|| CliError::Usage {
+            kind: UsageKind::Other,
+            message: format!("project root `{project_root}` is not valid UTF-8"),
+        })
 }
 
 pub async fn execute() -> Result<i32, CliError> {
-    let arguments = Arguments::try_parse().map_err(|error| CliError::Usage(error.to_string()))?;
+    let arguments = Arguments::try_parse().map_err(|error| CliError::Usage {
+        kind: UsageKind::Other,
+        message: error.to_string(),
+    })?;
     if matches!(arguments.command, Command::DaemonAttest) {
         let attestation = Client::daemon_attestation().await?;
         println!(
@@ -174,6 +259,8 @@ pub async fn execute() -> Result<i32, CliError> {
                     .await?
                     .into_inner(),
                 json,
+                OperationKind::Up,
+                None,
             )
             .await
         }
@@ -189,11 +276,14 @@ pub async fn execute() -> Result<i32, CliError> {
                     .await?
                     .into_inner(),
                 json,
+                OperationKind::Apply,
+                None,
             )
             .await
         }
         Command::Down { json } => {
             let selector = selector(&mut client, arguments.sandbox).await?;
+            let sandbox_id = Some(selector.sandbox_id.clone());
             operation(
                 client
                     .api
@@ -203,6 +293,8 @@ pub async fn execute() -> Result<i32, CliError> {
                     .await?
                     .into_inner(),
                 json,
+                OperationKind::Down,
+                sandbox_id,
             )
             .await
         }
@@ -211,6 +303,7 @@ pub async fn execute() -> Result<i32, CliError> {
                 confirm_destroy()?;
             }
             let selector = selector(&mut client, arguments.sandbox).await?;
+            let sandbox_id = Some(selector.sandbox_id.clone());
             operation(
                 client
                     .api
@@ -220,6 +313,8 @@ pub async fn execute() -> Result<i32, CliError> {
                     .await?
                     .into_inner(),
                 json,
+                OperationKind::Destroy,
+                sandbox_id,
             )
             .await
         }
@@ -249,29 +344,47 @@ pub async fn execute() -> Result<i32, CliError> {
                 .iter()
                 .map(|capability| {
                     let detail: serde_json::Value = serde_json::from_str(&capability.detail)
-                        .unwrap_or_else(|_| serde_json::json!({"detail": capability.detail, "remedy": ""}));
-                    serde_json::json!({
-                        "id": capability.name,
-                        "status": detail.get("status").and_then(serde_json::Value::as_str).unwrap_or(if capability.available { "pass" } else { "fail" }),
-                        "detail": detail.get("detail").and_then(serde_json::Value::as_str).unwrap_or(""),
-                        "remedy": detail.get("remedy").and_then(serde_json::Value::as_str).unwrap_or(""),
-                    })
+                        .unwrap_or_else(
+                            |_| serde_json::json!({"detail": capability.detail, "remedy": ""}),
+                        );
+                    DoctorCheck {
+                        id: capability.name.clone(),
+                        status: detail
+                            .get("status")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(if capability.available { "pass" } else { "fail" })
+                            .to_owned(),
+                        detail: detail
+                            .get("detail")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                            .to_owned(),
+                        remedy: detail
+                            .get("remedy")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                            .to_owned(),
+                    }
                 })
                 .collect::<Vec<_>>();
             if json {
+                let checks = checks
+                    .iter()
+                    .map(|check| {
+                        serde_json::json!({
+                            "id": check.id,
+                            "status": check.status,
+                            "detail": check.detail,
+                            "remedy": check.remedy,
+                        })
+                    })
+                    .collect::<Vec<_>>();
                 println!("{}", serde_json::json!({"checks": checks}));
             } else {
-                for check in &checks {
-                    println!(
-                        "{} {:<4} {}",
-                        check["id"].as_str().unwrap_or("unknown"),
-                        check["status"].as_str().unwrap_or("fail"),
-                        check["detail"].as_str().unwrap_or("")
-                    );
-                    if check["status"] != "pass" {
-                        println!("  remedy: {}", check["remedy"].as_str().unwrap_or(""));
-                    }
-                }
+                print!(
+                    "{}",
+                    render_human_doctor(&checks, OutputCapabilities::for_stdout())
+                );
             }
             Ok(if doctor.findings.is_empty() {
                 0
@@ -308,55 +421,55 @@ async fn selector(
         [sandbox] => Ok(v1::SandboxSelector {
             sandbox_id: sandbox.sandbox_id.clone(),
         }),
-        [] => Err(CliError::Usage(
-            "no sandbox is available; run `gascan up` first".to_owned(),
-        )),
-        _ => Err(CliError::Usage(
-            "multiple sandboxes exist; pass --sandbox".to_owned(),
-        )),
+        [] => Err(CliError::Usage {
+            kind: UsageKind::NoSandbox,
+            message: "no sandbox is available".to_owned(),
+        }),
+        _ => Err(CliError::Usage {
+            kind: UsageKind::MultipleSandboxes,
+            message: "multiple sandboxes are available".to_owned(),
+        }),
     }
-}
-
-fn event_phase_label(event: &v1::OperationEvent) -> Option<String> {
-    if event.phase.is_empty() {
-        return None;
-    }
-    if event.phase != "provision_step" {
-        return Some(event.phase.clone());
-    }
-    let step = match v1::ProvisionStep::try_from(event.provision_step).ok()? {
-        v1::ProvisionStep::WriteSafeMiseConfig => "write_safe_mise_config",
-        v1::ProvisionStep::InstallTools => "install_tools",
-        v1::ProvisionStep::RunSetup => "run_setup",
-        v1::ProvisionStep::VerifyGascamp => "verify_gascamp",
-        v1::ProvisionStep::HealthCheck => "health_check",
-        v1::ProvisionStep::Unspecified => return Some(event.phase.clone()),
-    };
-    Some(format!("{}: {step}", event.phase))
 }
 
 async fn operation(
     mut stream: tonic::Streaming<v1::OperationEvent>,
     json: bool,
+    kind: OperationKind,
+    sandbox_id: Option<String>,
 ) -> Result<i32, CliError> {
-    while let Some(event) = stream.message().await? {
-        if json {
+    if json {
+        while let Some(event) = stream.message().await? {
             println!(
                 "{}",
                 serde_json::json!({"operation_id":event.operation_id.map(|id|id.value),"sequence":event.sequence,"phase":event.phase,"status":event.status,"error":event.error.as_ref().map(|error|serde_json::json!({"code":error.code,"message":error.message}))})
             );
-        }
-        if let Some(error) = event.error {
-            return Err(CliError::Runtime(format!(
-                "{}: {}",
-                error.code, error.message
-            )));
-        }
-        if !json {
-            if let Some(label) = event_phase_label(&event) {
-                eprintln!("{label}");
+            if event.error.is_some() {
+                return Ok(EXIT_RUNTIME);
             }
         }
+        return Ok(0);
+    }
+
+    let (mut progress, initial) =
+        OperationProgress::new(kind, sandbox_id, OutputCapabilities::for_stderr());
+    if let Some(line) = initial {
+        writeln!(std::io::stderr(), "{line}")?;
+    }
+    while let Some(event) = stream.message().await? {
+        if let Some(error) = event.error {
+            progress.clear();
+            return Err(CliError::Operation {
+                code: error.code,
+                message: error.message,
+            });
+        }
+        if let Some(line) = progress.update(&event) {
+            writeln!(std::io::stderr(), "{line}")?;
+        }
+    }
+    if let Some(line) = progress.finish_success() {
+        writeln!(std::io::stderr(), "{line}")?;
     }
     Ok(0)
 }
@@ -453,10 +566,7 @@ async fn run(
             }
             Some(v1::server_frame::Frame::Exit(exit)) => return Ok(exit.code),
             Some(v1::server_frame::Frame::Error(error)) => {
-                return Err(CliError::Runtime(format!(
-                    "{}: {}",
-                    error.code, error.message
-                )));
+                return Err(attach_frame_error(error));
             }
             None => {}
         }
@@ -464,6 +574,10 @@ async fn run(
     Err(CliError::Runtime(
         "attach ended without exit status".to_owned(),
     ))
+}
+
+fn attach_frame_error(error: v1::Error) -> CliError {
+    CliError::Runtime(format!("{}: {}", error.code, error.message))
 }
 
 async fn forward_piped_input(sender: tokio::sync::mpsc::Sender<v1::ClientFrame>, token: Vec<u8>) {
@@ -622,7 +736,10 @@ fn render_status(status: &v1::SandboxStatus, json: bool) -> Result<(), CliError>
             serde_json::json!({"sandbox_id":status.sandbox_id,"actual_state":actual_name(status.actual_state)})
         );
     } else {
-        println!("{} {}", status.sandbox_id, actual_name(status.actual_state));
+        print!(
+            "{}",
+            render_human_status(status, OutputCapabilities::for_stdout())
+        );
     }
     Ok(())
 }
@@ -634,21 +751,19 @@ fn render_list(sandboxes: &[v1::SandboxStatus], json: bool) -> Result<(), CliErr
             serde_json::to_string(&values).map_err(|e| CliError::Runtime(e.to_string()))?
         );
     } else {
-        for sandbox in sandboxes {
-            println!(
-                "{} {}",
-                sandbox.sandbox_id,
-                actual_name(sandbox.actual_state)
-            );
-        }
+        print!(
+            "{}",
+            render_human_list(sandboxes, OutputCapabilities::for_stdout())
+        );
     }
     Ok(())
 }
 fn confirm_destroy() -> Result<(), CliError> {
     if !std::io::stdin().is_terminal() {
-        return Err(CliError::Usage(
-            "destroy requires --yes when stdin is not a TTY".to_owned(),
-        ));
+        return Err(CliError::Usage {
+            kind: UsageKind::Other,
+            message: "destroy requires --yes when stdin is not a TTY".to_owned(),
+        });
     }
     eprint!("Destroy sandbox? [y/N] ");
     std::io::stderr().flush()?;
@@ -657,7 +772,10 @@ fn confirm_destroy() -> Result<(), CliError> {
     if answer.trim().eq_ignore_ascii_case("y") {
         Ok(())
     } else {
-        Err(CliError::Usage("destroy cancelled".to_owned()))
+        Err(CliError::Usage {
+            kind: UsageKind::Other,
+            message: "destroy cancelled".to_owned(),
+        })
     }
 }
 
@@ -666,22 +784,88 @@ mod tests {
     use super::*;
 
     #[test]
-    fn provisioning_phase_renders_only_the_stable_step_identifier() {
-        let event = v1::OperationEvent {
-            phase: "provision_step".to_owned(),
-            provision_step: v1::ProvisionStep::WriteSafeMiseConfig as i32,
-            payload: br#"{"step":"write_safe_mise_config","secret":"must-not-render"}"#.to_vec(),
-            ..Default::default()
+    fn selector_usage_errors_choose_suggestions_structurally() {
+        let no_sandbox = CliError::Usage {
+            kind: UsageKind::NoSandbox,
+            message: "no sandbox is available".to_owned(),
+        };
+        assert_eq!(no_sandbox.message(), "no sandbox is available");
+        assert_eq!(no_sandbox.suggestion(), Some("gascan up <project-root>"));
+
+        let multiple = CliError::Usage {
+            kind: UsageKind::MultipleSandboxes,
+            message: "multiple sandboxes are available".to_owned(),
+        };
+        assert_eq!(multiple.message(), "multiple sandboxes are available");
+        assert_eq!(
+            multiple.suggestion(),
+            Some("run `gascan list`, then pass `--sandbox <sandbox-id>`")
+        );
+    }
+
+    #[test]
+    fn sandbox_not_found_uses_its_stable_code_for_the_suggestion() {
+        let error = CliError::Client(ClientError::Rpc(Box::new(tonic::Status::not_found(
+            gascan_proto::error_code::SANDBOX_NOT_FOUND,
+        ))));
+        assert_eq!(error.stable_code(), Some("sandbox_not_found"));
+        assert_eq!(error.message(), "sandbox not found");
+        assert_eq!(
+            error.suggestion(),
+            Some("run `gascan list` and use the sandbox ID shown there")
+        );
+    }
+
+    #[test]
+    fn empty_operation_message_falls_back_to_its_stable_code() {
+        for message in ["", "  \n\t"] {
+            let error = CliError::Operation {
+                code: "injected_failure".to_owned(),
+                message: message.to_owned(),
+            };
+
+            assert_eq!(error.message(), "injected_failure");
+        }
+    }
+
+    #[test]
+    fn resource_conflict_explains_managed_resource_and_keeps_daemon_cause() {
+        let error = CliError::Operation {
+            code: "resource_conflict".to_owned(),
+            message: "resource conflict for port 3000: already reserved".to_owned(),
+        };
+        assert_eq!(error.stable_code(), Some("resource_conflict"));
+        assert_eq!(
+            error.message(),
+            concat!(
+                "a managed runtime resource already exists: ",
+                "resource conflict for port 3000: already reserved",
+            )
+        );
+    }
+
+    #[test]
+    fn empty_resource_conflict_cause_falls_back_to_stable_code() {
+        let error = CliError::Operation {
+            code: "resource_conflict".to_owned(),
+            message: " \n".to_owned(),
         };
 
+        assert_eq!(error.message(), "resource_conflict");
+    }
+
+    #[test]
+    fn attach_frame_error_retains_code_and_message_on_runtime_path() {
+        let error = attach_frame_error(v1::Error {
+            code: "process_failed".to_owned(),
+            message: "command exited before setup completed".to_owned(),
+            ..Default::default()
+        });
+
+        assert!(matches!(error, CliError::Runtime(_)));
         assert_eq!(
-            event_phase_label(&event).as_deref(),
-            Some("provision_step: write_safe_mise_config")
-        );
-        assert!(
-            !event_phase_label(&event)
-                .unwrap_or_default()
-                .contains("secret")
+            error.message(),
+            "process_failed: command exited before setup completed"
         );
     }
 

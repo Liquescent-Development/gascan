@@ -15,12 +15,29 @@ pub enum ClientError {
     Api(String),
 }
 
+impl ClientError {
+    pub fn stable_code(&self) -> Option<&str> {
+        match self {
+            Self::Rpc(status) => Some(status.message()),
+            Self::Api(message) => Some(message),
+            Self::Io(_) | Self::Transport(_) => None,
+        }
+    }
+
+    pub fn cause(&self) -> Option<String> {
+        match self {
+            Self::Rpc(status) => gascan_proto::error_detail::decode_message(status.details()),
+            Self::Io(_) | Self::Transport(_) | Self::Api(_) => None,
+        }
+    }
+}
+
 impl std::fmt::Display for ClientError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "daemon I/O error: {error}"),
             Self::Transport(error) => write!(formatter, "daemon transport error: {error}"),
-            Self::Rpc(error) => match gascan_proto::error_detail::decode_message(error.details()) {
+            Self::Rpc(error) => match self.cause() {
                 Some(cause) => write!(formatter, "error: {cause}"),
                 None => write!(formatter, "daemon error: {}", error.message()),
             },
@@ -228,6 +245,24 @@ mod tests {
         assert!(
             rendered.contains("unknown variant `kiener`"),
             "the cause must reach the operator: {rendered}"
+        );
+    }
+
+    #[test]
+    fn rpc_errors_expose_the_stable_code_and_daemon_cause_separately() {
+        let details = gascan_proto::error_detail::encode(
+            "resource_conflict",
+            "resource conflict for port 3000: already reserved",
+        );
+        let error = super::ClientError::Rpc(Box::new(tonic::Status::with_details(
+            tonic::Code::AlreadyExists,
+            "resource_conflict",
+            tonic::codegen::Bytes::from(details),
+        )));
+        assert_eq!(error.stable_code(), Some("resource_conflict"));
+        assert_eq!(
+            error.cause().as_deref(),
+            Some("resource conflict for port 3000: already reserved")
         );
     }
 

@@ -3,13 +3,18 @@
 
 mod cli;
 mod client;
+mod presentation;
 mod terminal;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let code = cli::execute().await.unwrap_or_else(|error| {
-        eprintln!("{error}");
-        error.exit_code()
-    });
+    let code = match cli::execute().await {
+        Ok(code) => code,
+        Err(error) => {
+            let code = error.exit_code();
+            eprint!("{}", cli::render_error(&error));
+            code
+        }
+    };
     std::process::exit(code);
 }

@@ -119,6 +119,12 @@ gascan down                    # stop the sandbox, keep its state
 gascan destroy --yes           # remove the sandbox and its managed volumes
 ```
 
+Gascan shows live, in-place progress when stderr is an interactive terminal.
+When output is redirected, the same meaningful milestones are printed as
+stable plain text without animation or color. Set `NO_COLOR=1` to disable color
+while keeping interactive progress. Use `--json` on supported commands for
+machine-readable output.
+
 Commands other than `up` resolve the sandbox implicitly when exactly one
 exists. With more than one, pass `--sandbox <id>`; `gascan list` prints the
 ids. A sandbox id is the slugified `name` plus a short digest of the canonical
