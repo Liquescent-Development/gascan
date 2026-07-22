@@ -373,7 +373,10 @@ git -C "$tap" remote set-url origin "$tap_origin"
 
 # `pushurl` is what makes this a *push* failure: fetch still resolves, so the
 # gate reaches the dry run instead of stopping at the earlier fetch check.
-git -C "$tap" config remote.origin.pushurl "$fixture/absent-remote.git"
+# Named like a tap: the origin-name rule now reads the push URL (gascan_gate_tap
+# uses `git remote get-url --push`), so a name this rule would reject stops the
+# gate there instead of at the push this case exists to test.
+git -C "$tap" config remote.origin.pushurl "$fixture/homebrew-absent-remote.git"
 set +e
 unpushable=$(gascan_gate_tap "$tap" "$repo_root" 2>&1 >/dev/null)
 unpushable_code=$?
@@ -436,6 +439,15 @@ grep -Fq "git -C $tap pull --ff-only origin main" <<<"$behind" || {
   required_tools=($tools_words)
   [[ ${#required_tools[@]} -gt 0 ]] || {
     printf 'could not derive the required-tools list from gascan_gate_tools\n' >&2
+    exit 1; }
+
+  # Equality, not membership: deriving the list from the gate proves every
+  # listed command is required but cannot notice the list shrinking. Pinning
+  # it here makes a command added to or removed from the gate fail loudly and
+  # be updated deliberately, instead of dropping out of coverage in silence.
+  want_tools='gh jq cargo pkgutil shasum ruby brew git codesign spctl xcrun security cpio gzip'
+  [[ ${required_tools[*]} == "$want_tools" ]] || {
+    printf 'the required-command list changed: %s\n' "${required_tools[*]}" >&2
     exit 1; }
 
   for missing in "${required_tools[@]}"; do
@@ -573,6 +585,15 @@ release=$repo_root/packaging/macos/release.sh
 [[ -x $release ]] || { printf 'release.sh is not executable\n' >&2; exit 1; }
 recovery=$repo_root/packaging/macos/release-recovery.sh
 
+# --check exits before bash ever parses the release path, so no invocation in
+# this file reaches it. Parse every sourced file explicitly, or a syntax error
+# in the half of release.sh that performs the release ships with the suite
+# green.
+for f in "$release" "$gates" "$config" "$recovery" "$common" \
+  "$repo_root/packaging/macos/publish.sh"; do
+  bash -n "$f" || { printf '%s is not syntactically valid\n' "$f" >&2; exit 1; }
+done
+
 if "$release" >/dev/null 2>&1; then
   printf 'missing version accepted\n' >&2; exit 1
 fi
@@ -637,6 +658,11 @@ for missing_name in GASCAN_CODESIGN_IDENTITY GASCAN_INSTALLER_SIGNING_IDENTITY \
     "$release" "$workspace_version" --check --config "$fixture/absent.env" 2>&1 >/dev/null)
   unset_code=$?
   set -e
+  # A bare exit-code assertion cannot fail here: any machine running this
+  # suite stops at a later gate (no signing identity, no notary profile, no
+  # tap) once configuration resolves, so a missing name that was silently
+  # defaulted would still exit non-zero downstream. The message grep below is
+  # the assertion that actually pins the missing-configuration behavior down.
   [[ $unset_code -ne 0 ]] || {
     printf '%s was defaulted\n' "$missing_name" >&2; exit 1; }
   grep -Fq "missing required release configuration: $missing_name" <<<"$unset_out" || {
@@ -763,8 +789,11 @@ assert_no_logged_mutation "$GASCAN_STUB_LOG" || exit 1
 # `--cleanup-tag` must never be part of an executed deletion: it removes the
 # signed tag from the remote. The gates deliberately *warn* about the flag in
 # prose, which is the line that stops an operator destroying their own tag, so
-# assert the dangerous construction rather than the string.
-for f in "$release" "$gates" "$recovery"; do
+# assert the dangerous construction rather than the string. The checklist doc
+# carries the same warning as prose on its own line -- the pattern requires
+# both tokens on one line, so it still distinguishes the executed form from
+# the doc's warning rather than tripping on it.
+for f in "$release" "$gates" "$recovery" "$repo_root/docs/release/macos-checklist.md"; do
   if grep -Eq 'gh release delete.*--cleanup-tag' "$f"; then
     printf '%s would delete a tag via --cleanup-tag\n' "$f" >&2; exit 1
   fi
@@ -782,10 +811,22 @@ done
 # `verify-package.sh`, so the needle would be satisfied by a different line and
 # could never fail.
 for needle in verify-package.sh gascan_assert_distributable_package \
-  render-cask.sh publish.sh macos/package.sh gascan_gate_github; do
+  render-cask.sh publish.sh macos/package.sh gascan_gate_github \
+  gascan_release_is_live; do
   grep -Fq "$needle" "$release" || {
     printf 'release.sh never references %s\n' "$needle" >&2; exit 1; }
 done
+
+# The stale marker from an earlier attempt must be cleared before this run
+# calls publish.sh, or a retry could inherit a marker written by a previous
+# release and report this run's release live before publish.sh ever ran.
+# shellcheck disable=SC2016 # single quotes are deliberate: asserting literal source text, not expanding it
+clear_marker_line=$(grep -Fn 'rm -f "$published_marker"' "$release" | head -1 | cut -d: -f1)
+# shellcheck disable=SC2016 # single quotes are deliberate: asserting literal source text, not expanding it
+publish_call_line=$(grep -Fn 'packaging/macos/publish.sh" "$package"' "$release" | head -1 | cut -d: -f1)
+[[ -n $clear_marker_line && -n $publish_call_line && $clear_marker_line -lt $publish_call_line ]] || {
+  printf 'release.sh does not clear the stale published marker before publishing\n' >&2
+  exit 1; }
 
 # gascan_gate_github is tested as a function above, but nothing yet proves
 # release.sh actually calls it as a step of the run: the source-grep just
@@ -841,6 +882,110 @@ grep -Fq 'gh auth login' <<<"$authcheck_out" || {
   printf 'release.sh --check did not name gh auth login when unauthenticated: %s\n' \
     "$authcheck_out" >&2
   exit 1; }
+
+# `--check` renders the cask with a placeholder digest and runs `ruby -c` and
+# `brew style` on it after every gate passes, so a broken template or a
+# changed brew rule is found before the irreversible act rather than after it.
+# Real Apple signing and notarization cannot run offline, so every gate up to
+# gascan_gate_tap is stubbed exactly as the fixtures above already do; ruby
+# and brew are left real, wrapped only to observe that they were invoked on
+# the probe file -- faking them would prove nothing about the actual template
+# or the actual brew rules, which is the entire point of this step.
+probecheck_origin=$fixture/probecheck-origin.git
+probecheck_clone=$fixture/probecheck-clone
+git init --quiet --bare --initial-branch=main "$probecheck_origin"
+git clone --quiet "$repo_root" "$probecheck_clone"
+git -C "$probecheck_clone" remote set-url origin "$probecheck_origin"
+ssh-keygen -q -t ed25519 -N '' -C release@example.invalid -f "$fixture/probecheck-key"
+printf 'release@example.invalid %s\n' "$(cat "$fixture/probecheck-key.pub")" \
+  >"$fixture/probecheck-allowed-signers"
+git -C "$probecheck_clone" config user.name release
+git -C "$probecheck_clone" config user.email release@example.invalid
+git -C "$probecheck_clone" config gpg.format ssh
+git -C "$probecheck_clone" config user.signingKey "$fixture/probecheck-key"
+git -C "$probecheck_clone" config gpg.ssh.allowedSignersFile "$fixture/probecheck-allowed-signers"
+git -C "$probecheck_clone" tag -d "v$workspace_version" >/dev/null 2>&1 || true
+git -C "$probecheck_clone" tag -s "v$workspace_version" -m 'cask-probe fixture'
+git -C "$probecheck_clone" push --quiet origin "refs/tags/v$workspace_version"
+
+probecheck_bin=$fixture/probecheck-bin
+mkdir -p "$probecheck_bin"
+cat >"$probecheck_bin/gh" <<'STUB_GH_PROBECHECK'
+#!/usr/bin/env bash
+case "${1:-} ${2:-}" in
+  'auth status') exit 0 ;;
+  'release view')
+    printf 'release not found\n' >&2
+    exit 1 ;;
+esac
+exit 0
+STUB_GH_PROBECHECK
+chmod +x "$probecheck_bin/gh"
+
+cat >"$probecheck_bin/security" <<'STUB_SECURITY_PROBECHECK'
+#!/usr/bin/env bash
+cat <<'IDENTITIES'
+  1) AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA "Developer ID Application: Example LLC (TEAMID1234)"
+  2) BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB "Developer ID Installer: Example LLC (TEAMID1234)"
+     2 valid identities found
+IDENTITIES
+STUB_SECURITY_PROBECHECK
+chmod +x "$probecheck_bin/security"
+
+cat >"$probecheck_bin/xcrun" <<'STUB_XCRUN_PROBECHECK'
+#!/usr/bin/env bash
+printf 'Successfully received submission history\n'
+exit 0
+STUB_XCRUN_PROBECHECK
+chmod +x "$probecheck_bin/xcrun"
+
+real_ruby=$(command -v ruby)
+real_brew=$(command -v brew)
+probecheck_log=$fixture/probecheck-commands.log
+: >"$probecheck_log"
+cat >"$probecheck_bin/ruby" <<STUB_RUBY_PROBECHECK
+#!/usr/bin/env bash
+printf 'ruby %s\n' "\$*" >>'$probecheck_log'
+exec '$real_ruby' "\$@"
+STUB_RUBY_PROBECHECK
+chmod +x "$probecheck_bin/ruby"
+cat >"$probecheck_bin/brew" <<STUB_BREW_PROBECHECK
+#!/usr/bin/env bash
+printf 'brew %s\n' "\$*" >>'$probecheck_log'
+exec '$real_brew' "\$@"
+STUB_BREW_PROBECHECK
+chmod +x "$probecheck_bin/brew"
+
+# $tap was left synced with origin/main by the gate scan above; re-sync
+# defensively so a reordering of the tests above this one cannot leave it
+# stopping at the tap gate instead of reaching the probe.
+git -C "$tap" fetch --quiet origin main
+git -C "$tap" reset --quiet --hard origin/main
+
+set +e
+# shellcheck disable=SC2031 # this PATH override is its own command prefix, independent of the earlier subshell's
+probecheck_out=$(PATH=$probecheck_bin:$PATH \
+  GASCAN_CODESIGN_IDENTITY='Developer ID Application: Example LLC (TEAMID1234)' \
+  GASCAN_INSTALLER_SIGNING_IDENTITY='Developer ID Installer: Example LLC (TEAMID1234)' \
+  GASCAN_NOTARYTOOL_PROFILE=probe-profile \
+  GASCAN_TAP_PATH="$tap" \
+  "$probecheck_clone/packaging/macos/release.sh" "$workspace_version" --check 2>&1 >/dev/null)
+probecheck_code=$?
+set -e
+[[ $probecheck_code -eq 0 ]] || {
+  printf -- '--check with every gate satisfied still failed:\n%s\n' "$probecheck_out" >&2
+  exit 1; }
+grep -Fq 'gascan-cask-probe' "$probecheck_log" || {
+  printf -- '--check never exercised the cask probe through ruby and brew: %s\n' \
+    "$(cat "$probecheck_log")" >&2
+  exit 1; }
+probecheck_ruby_calls=$(grep -c '^ruby ' "$probecheck_log")
+probecheck_brew_calls=$(grep -c '^brew style' "$probecheck_log")
+[[ $probecheck_ruby_calls -eq 1 && $probecheck_brew_calls -eq 1 ]] || {
+  printf 'expected exactly one ruby -c and one brew style call, got %s and %s\n' \
+    "$probecheck_ruby_calls" "$probecheck_brew_calls" >&2
+  exit 1; }
+
 grep -Eq 'trap .*EXIT' "$release" || {
   printf 'release.sh does not restore the original ref on exit\n' >&2; exit 1; }
 grep -Eq 'trap .*INT TERM' "$release" || {
@@ -879,6 +1024,28 @@ grep -Fq 'already published' "$recovery" || {
   exit 1; }
 # shellcheck source=/dev/null
 source "$recovery"
+
+# gascan_release_is_live is the whole of the decision report_live_release
+# used to make inline: replacing that inline decision with `:` left the
+# suite green, because nothing asked the function itself whether the release
+# is live in each of its four reachable states.
+present_marker=$fixture/live-marker.published
+: >"$present_marker"
+absent_marker=$fixture/no-such-marker.published
+
+gascan_release_is_live true false "$absent_marker" || {
+  printf 'gascan_release_is_live: returned=true was not live\n' >&2; exit 1; }
+gascan_release_is_live false true "$present_marker" || {
+  printf 'gascan_release_is_live: attempted with the marker present was not live\n' >&2
+  exit 1; }
+if gascan_release_is_live false true "$absent_marker"; then
+  printf 'gascan_release_is_live: attempted with the marker absent was reported live\n' >&2
+  exit 1
+fi
+if gascan_release_is_live false false "$present_marker"; then
+  printf 'gascan_release_is_live: not attempted was reported live\n' >&2
+  exit 1
+fi
 
 good_url=https://github.com/example/gascan/releases/download/v1.2.3/gascan.pkg
 good_sum=$(printf 'x' | shasum -a 256 | awk '{print $1}')

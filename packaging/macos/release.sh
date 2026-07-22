@@ -103,6 +103,18 @@ gascan_gate_tap "$tap_path" "$repo_root"
 printf 'all release preconditions pass for %s\n' "$version" >&2
 
 if [[ $check_only == true ]]; then
+  # 64 zeros is valid hex, so render-cask.sh accepts it: this proves the
+  # template and brew's current rules, not the digest.
+  probe_cask=$(mktemp "${TMPDIR:-/tmp}/gascan-cask-probe.XXXXXX")
+  "$repo_root/packaging/macos/render-cask.sh" "$version" \
+    0000000000000000000000000000000000000000000000000000000000000000 >"$probe_cask"
+  ruby -c "$probe_cask" >/dev/null || {
+    printf 'render-cask.sh does not produce valid Ruby\n' >&2
+    rm -f "$probe_cask"; exit 65; }
+  brew style "$probe_cask" >&2 || {
+    printf 'the rendered cask fails brew style\n' >&2
+    rm -f "$probe_cask"; exit 65; }
+  rm -f "$probe_cask"
   printf 'check only: nothing was built, published, or changed\n' >&2
   exit 0
 fi
@@ -126,6 +138,7 @@ restore_ref() {
 # was published; render-cask.sh derives its own URL from the version.
 release_is_live=false
 publish_attempted=false
+published_marker=
 published=
 asset_url=
 checksum=
@@ -136,14 +149,8 @@ checksum=
 tap_stage=none
 
 report_live_release() {
-  if [[ $release_is_live != true && $publish_attempted == true ]]; then
-    # publish died without saying how far it got. The marker is written the
-    # instant the release becomes public, local and immediate -- asking
-    # GitHub instead would be an unbounded network call from inside the EXIT
-    # trap, at the one moment an interrupted run most needs to let go.
-    [[ -f $published_marker ]] && release_is_live=true
-  fi
-  [[ $release_is_live == true ]] || return 0
+  gascan_release_is_live "$release_is_live" "$publish_attempted" \
+    "$published_marker" || return 0
   gascan_report_live_release "$version" "$tap_path" "$repo_root" "$tap_stage" \
     "$asset_url" "$checksum" "$published" >&2
 }

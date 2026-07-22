@@ -155,7 +155,7 @@ gascan_gate_tap() {
     printf 'tap is on %s, not main: %s\n' "${branch:-a detached HEAD}" "$tap" >&2
     return 65
   }
-  origin_url=$(git -C "$tap" remote get-url origin 2>/dev/null) || origin_url=
+  origin_url=$(git -C "$tap" remote get-url --push origin 2>/dev/null) || origin_url=
   case $origin_url in
     *homebrew-*|*/tap|*/tap.git) ;;
     *)

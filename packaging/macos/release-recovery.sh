@@ -14,6 +14,15 @@ gascan_print_release_values() {
   printf '  sha256: %s\n' "$2"
 }
 
+# Whether the release is public, decided from local state only: asking GitHub
+# from inside the EXIT trap would be an unbounded network call at the one
+# moment an interrupted run needs to let go.
+gascan_release_is_live() {
+  local returned=$1 attempted=$2 marker=$3
+  [[ $returned == true ]] && return 0
+  [[ $attempted == true && -f $marker ]]
+}
+
 # gascan_report_live_release VERSION TAP_PATH REPO_ROOT STAGE ASSET_URL
 #                           CHECKSUM PUBLISHED
 #
