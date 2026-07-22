@@ -64,6 +64,31 @@ pub(crate) struct DoctorCheck {
     pub(crate) remedy: String,
 }
 
+pub(crate) fn render_error(
+    message: &str,
+    suggestion: Option<&str>,
+    capabilities: OutputCapabilities,
+) -> String {
+    let message = message
+        .strip_prefix("error:")
+        .map_or(message, str::trim_start);
+    let error_label = if capabilities.color {
+        Style::new().red().apply_to("Error:").to_string()
+    } else {
+        "Error:".to_owned()
+    };
+    let mut output = format!("{error_label} {message}\n");
+    if let Some(suggestion) = suggestion {
+        let try_label = if capabilities.color {
+            Style::new().yellow().apply_to("Try:").to_string()
+        } else {
+            "Try:".to_owned()
+        };
+        let _ = writeln!(output, "{try_label} {suggestion}");
+    }
+    output
+}
+
 pub(crate) fn render_doctor(checks: &[DoctorCheck], capabilities: OutputCapabilities) -> String {
     struct Group<'a> {
         id: &'a str,
@@ -373,6 +398,56 @@ impl Drop for OperationProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_without_a_sandbox_is_actionable_in_plain_mode() {
+        assert_eq!(
+            render_error(
+                "no sandbox is available",
+                Some("gascan up <project-root>"),
+                OutputCapabilities::plain(),
+            ),
+            "Error: no sandbox is available\nTry: gascan up <project-root>\n"
+        );
+    }
+
+    #[test]
+    fn error_with_multiple_sandboxes_is_actionable_in_plain_mode() {
+        assert_eq!(
+            render_error(
+                "multiple sandboxes are available",
+                Some("run `gascan list`, then pass `--sandbox <sandbox-id>`"),
+                OutputCapabilities::plain(),
+            ),
+            concat!(
+                "Error: multiple sandboxes are available\n",
+                "Try: run `gascan list`, then pass `--sandbox <sandbox-id>`\n",
+            )
+        );
+    }
+
+    #[test]
+    fn sandbox_not_found_error_is_actionable_in_plain_mode() {
+        assert_eq!(
+            render_error(
+                "sandbox not found",
+                Some("run `gascan list` and use the sandbox ID shown there"),
+                OutputCapabilities::plain(),
+            ),
+            concat!(
+                "Error: sandbox not found\n",
+                "Try: run `gascan list` and use the sandbox ID shown there\n",
+            )
+        );
+    }
+
+    #[test]
+    fn error_renderer_does_not_duplicate_a_lowercase_prefix() {
+        assert_eq!(
+            render_error("error: concrete failure", None, OutputCapabilities::plain()),
+            "Error: concrete failure\n"
+        );
+    }
     use gascan_proto::v1;
     use indicatif::{InMemoryTerm, ProgressDrawTarget};
     use std::process::Command;

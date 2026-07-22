@@ -532,6 +532,17 @@ fn api_major_mismatch_has_stable_exit_and_error() -> TestResult {
 }
 
 #[test]
+fn no_sandbox_status_error_is_actionable_and_keeps_usage_exit() -> TestResult {
+    let env = Environment::new()?;
+    let output = env.invoke(&["status"])?;
+    assert_eq!(output.status.code(), Some(64));
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.starts_with("Error: no sandbox is available\n"));
+    assert!(stderr.contains("Try: gascan up <project-root>\n"));
+    Ok(())
+}
+
+#[test]
 fn real_pty_resize_signals_and_terminal_restoration_are_exact() -> TestResult {
     use rustix_openpty::rustix;
     let _signal_guard = signal_test_guard()?;

@@ -1,8 +1,8 @@
 use crate::client::{Client, ClientError};
 use crate::presentation::{
     DoctorCheck, OperationKind, OperationProgress, OutputCapabilities,
-    render_doctor as render_human_doctor, render_list as render_human_list,
-    render_status as render_human_status,
+    render_doctor as render_human_doctor, render_error as render_human_error,
+    render_list as render_human_list, render_status as render_human_status,
 };
 use crate::terminal::RawTerminal;
 use clap::{Parser, Subcommand};
@@ -77,30 +77,84 @@ enum Command {
 }
 
 #[derive(Debug)]
+pub(crate) enum UsageKind {
+    NoSandbox,
+    MultipleSandboxes,
+    Other,
+}
+
+#[derive(Debug)]
 pub enum CliError {
     Client(ClientError),
-    Usage(String),
+    Usage { kind: UsageKind, message: String },
+    Operation { code: String, message: String },
     Runtime(String),
     Io(std::io::Error),
 }
 impl CliError {
     pub const fn exit_code(&self) -> i32 {
         match self {
-            Self::Usage(_) => EXIT_USAGE,
+            Self::Usage { .. } => EXIT_USAGE,
             Self::Client(ClientError::Api(_)) => EXIT_API,
             Self::Client(ClientError::Rpc(_)) => EXIT_RUNTIME,
             Self::Client(_) => EXIT_DAEMON,
-            Self::Runtime(_) | Self::Io(_) => EXIT_RUNTIME,
+            Self::Operation { .. } | Self::Runtime(_) | Self::Io(_) => EXIT_RUNTIME,
+        }
+    }
+
+    pub fn stable_code(&self) -> Option<&str> {
+        match self {
+            Self::Client(error) => error.stable_code(),
+            Self::Operation { code, .. } => Some(code),
+            Self::Usage { .. } | Self::Runtime(_) | Self::Io(_) => None,
+        }
+    }
+
+    pub fn message(&self) -> String {
+        if self.stable_code() == Some(gascan_proto::error_code::SANDBOX_NOT_FOUND) {
+            return "sandbox not found".to_owned();
+        }
+        match self {
+            Self::Client(error) => error.cause().unwrap_or_else(|| error.to_string()),
+            Self::Usage { message, .. }
+            | Self::Operation { message, .. }
+            | Self::Runtime(message) => message.clone(),
+            Self::Io(error) => error.to_string(),
+        }
+    }
+
+    pub fn suggestion(&self) -> Option<&'static str> {
+        match self {
+            Self::Usage {
+                kind: UsageKind::NoSandbox,
+                ..
+            } => Some("gascan up <project-root>"),
+            Self::Usage {
+                kind: UsageKind::MultipleSandboxes,
+                ..
+            } => Some("run `gascan list`, then pass `--sandbox <sandbox-id>`"),
+            Self::Client(_) | Self::Operation { .. }
+                if matches!(
+                    self.stable_code(),
+                    Some(gascan_proto::error_code::SANDBOX_NOT_FOUND)
+                ) =>
+            {
+                Some("run `gascan list` and use the sandbox ID shown there")
+            }
+            Self::Client(_)
+            | Self::Usage {
+                kind: UsageKind::Other,
+                ..
+            }
+            | Self::Operation { .. }
+            | Self::Runtime(_)
+            | Self::Io(_) => None,
         }
     }
 }
 impl std::fmt::Display for CliError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Client(e) => e.fmt(formatter),
-            Self::Usage(e) | Self::Runtime(e) => formatter.write_str(e),
-            Self::Io(e) => e.fmt(formatter),
-        }
+        formatter.write_str(&self.message())
     }
 }
 impl std::error::Error for CliError {}
@@ -120,6 +174,14 @@ impl From<std::io::Error> for CliError {
     }
 }
 
+pub fn render_error(error: &CliError) -> String {
+    render_human_error(
+        &error.message(),
+        error.suggestion(),
+        OutputCapabilities::for_stderr(),
+    )
+}
+
 /// Resolve a project root to the absolute path the daemon requires.
 ///
 /// A relative path names a directory relative to *this* process. The daemon
@@ -129,31 +191,39 @@ impl From<std::io::Error> for CliError {
 /// fallback for this function.
 fn resolve_project_root(project_root: &str) -> Result<String, CliError> {
     if project_root.is_empty() {
-        return Err(CliError::Usage("project root must not be empty".to_owned()));
+        return Err(CliError::Usage {
+            kind: UsageKind::Other,
+            message: "project root must not be empty".to_owned(),
+        });
     }
-    let resolved = std::fs::canonicalize(project_root).map_err(|error| {
-        CliError::Usage(format!(
-            "cannot use `{project_root}` as a project root: {error}"
-        ))
+    let resolved = std::fs::canonicalize(project_root).map_err(|error| CliError::Usage {
+        kind: UsageKind::Other,
+        message: format!("cannot use `{project_root}` as a project root: {error}"),
     })?;
-    let metadata = resolved.metadata().map_err(|error| {
-        CliError::Usage(format!(
-            "cannot use `{project_root}` as a project root: {error}"
-        ))
+    let metadata = resolved.metadata().map_err(|error| CliError::Usage {
+        kind: UsageKind::Other,
+        message: format!("cannot use `{project_root}` as a project root: {error}"),
     })?;
     if !metadata.is_dir() {
-        return Err(CliError::Usage(format!(
-            "cannot use `{project_root}` as a project root: not a directory"
-        )));
+        return Err(CliError::Usage {
+            kind: UsageKind::Other,
+            message: format!("cannot use `{project_root}` as a project root: not a directory"),
+        });
     }
     resolved
         .to_str()
         .map(ToOwned::to_owned)
-        .ok_or_else(|| CliError::Usage(format!("project root `{project_root}` is not valid UTF-8")))
+        .ok_or_else(|| CliError::Usage {
+            kind: UsageKind::Other,
+            message: format!("project root `{project_root}` is not valid UTF-8"),
+        })
 }
 
 pub async fn execute() -> Result<i32, CliError> {
-    let arguments = Arguments::try_parse().map_err(|error| CliError::Usage(error.to_string()))?;
+    let arguments = Arguments::try_parse().map_err(|error| CliError::Usage {
+        kind: UsageKind::Other,
+        message: error.to_string(),
+    })?;
     if matches!(arguments.command, Command::DaemonAttest) {
         let attestation = Client::daemon_attestation().await?;
         println!(
@@ -341,12 +411,14 @@ async fn selector(
         [sandbox] => Ok(v1::SandboxSelector {
             sandbox_id: sandbox.sandbox_id.clone(),
         }),
-        [] => Err(CliError::Usage(
-            "no sandbox is available; run `gascan up` first".to_owned(),
-        )),
-        _ => Err(CliError::Usage(
-            "multiple sandboxes exist; pass --sandbox".to_owned(),
-        )),
+        [] => Err(CliError::Usage {
+            kind: UsageKind::NoSandbox,
+            message: "no sandbox is available".to_owned(),
+        }),
+        _ => Err(CliError::Usage {
+            kind: UsageKind::MultipleSandboxes,
+            message: "multiple sandboxes are available".to_owned(),
+        }),
     }
 }
 
@@ -377,10 +449,10 @@ async fn operation(
     while let Some(event) = stream.message().await? {
         if let Some(error) = event.error {
             progress.clear();
-            return Err(CliError::Runtime(format!(
-                "{}: {}",
-                error.code, error.message
-            )));
+            return Err(CliError::Operation {
+                code: error.code,
+                message: error.message,
+            });
         }
         if let Some(line) = progress.update(&event) {
             writeln!(std::io::stderr(), "{line}")?;
@@ -484,10 +556,10 @@ async fn run(
             }
             Some(v1::server_frame::Frame::Exit(exit)) => return Ok(exit.code),
             Some(v1::server_frame::Frame::Error(error)) => {
-                return Err(CliError::Runtime(format!(
-                    "{}: {}",
-                    error.code, error.message
-                )));
+                return Err(CliError::Operation {
+                    code: error.code,
+                    message: error.message,
+                });
             }
             None => {}
         }
@@ -677,9 +749,10 @@ fn render_list(sandboxes: &[v1::SandboxStatus], json: bool) -> Result<(), CliErr
 }
 fn confirm_destroy() -> Result<(), CliError> {
     if !std::io::stdin().is_terminal() {
-        return Err(CliError::Usage(
-            "destroy requires --yes when stdin is not a TTY".to_owned(),
-        ));
+        return Err(CliError::Usage {
+            kind: UsageKind::Other,
+            message: "destroy requires --yes when stdin is not a TTY".to_owned(),
+        });
     }
     eprint!("Destroy sandbox? [y/N] ");
     std::io::stderr().flush()?;
@@ -688,13 +761,63 @@ fn confirm_destroy() -> Result<(), CliError> {
     if answer.trim().eq_ignore_ascii_case("y") {
         Ok(())
     } else {
-        Err(CliError::Usage("destroy cancelled".to_owned()))
+        Err(CliError::Usage {
+            kind: UsageKind::Other,
+            message: "destroy cancelled".to_owned(),
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selector_usage_errors_choose_suggestions_structurally() {
+        let no_sandbox = CliError::Usage {
+            kind: UsageKind::NoSandbox,
+            message: "no sandbox is available".to_owned(),
+        };
+        assert_eq!(no_sandbox.message(), "no sandbox is available");
+        assert_eq!(no_sandbox.suggestion(), Some("gascan up <project-root>"));
+
+        let multiple = CliError::Usage {
+            kind: UsageKind::MultipleSandboxes,
+            message: "multiple sandboxes are available".to_owned(),
+        };
+        assert_eq!(multiple.message(), "multiple sandboxes are available");
+        assert_eq!(
+            multiple.suggestion(),
+            Some("run `gascan list`, then pass `--sandbox <sandbox-id>`")
+        );
+    }
+
+    #[test]
+    fn sandbox_not_found_uses_its_stable_code_for_the_suggestion() {
+        let error = CliError::Client(ClientError::Rpc(Box::new(tonic::Status::not_found(
+            gascan_proto::error_code::SANDBOX_NOT_FOUND,
+        ))));
+        assert_eq!(error.stable_code(), Some("sandbox_not_found"));
+        assert_eq!(error.message(), "sandbox not found");
+        assert_eq!(
+            error.suggestion(),
+            Some("run `gascan list` and use the sandbox ID shown there")
+        );
+    }
+
+    #[test]
+    fn resource_conflict_keeps_the_daemon_cause() {
+        let error = CliError::Operation {
+            code: "resource_conflict".to_owned(),
+            message: "resource conflict for port 3000: already reserved".to_owned(),
+        };
+        assert_eq!(error.stable_code(), Some("resource_conflict"));
+        assert_eq!(
+            error.message(),
+            "resource conflict for port 3000: already reserved"
+        );
+        assert_ne!(error.message(), "resource_conflict");
+    }
 
     #[test]
     fn relative_roots_resolve_against_this_process() -> Result<(), Box<dyn std::error::Error>> {
