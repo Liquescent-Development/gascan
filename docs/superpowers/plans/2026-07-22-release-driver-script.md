@@ -20,14 +20,22 @@ Design: `docs/superpowers/specs/2026-07-22-release-driver-script-design.md`
 ## Global Constraints
 
 - Bash with `set -euo pipefail`, matching the existing `packaging/macos/*.sh`.
-- **No hardcoded signing identity, team identifier, or notary profile string.**
-  Contract-tested.
+- **No hardcoded per-operator signing identity or notary profile string.** The
+  Developer ID *team* identifier is a repository constant
+  (`release-common.sh`), because it is the assertion target of
+  `gascan_assert_distributable_package` — making it configurable would let a
+  wrong value accept a package signed by another team. The four operator values
+  are contract-tested behaviorally, one name at a time; the source-pattern scan
+  covers the identity forms only.
 - No key, password, or API credential accepted as flag, environment value, or
   config entry. Names only.
 - The config file is parsed as data, never `source`d or `eval`ed.
 - The script never creates, moves, or deletes a git tag; never passes
   `--cleanup-tag`; never deletes a GitHub release.
-- `--check` performs no mutation.
+- `--check` performs no mutation of the release or of either repository's
+  committed state. It does write to the tap's `.git` — `gascan_gate_tap` runs
+  `git fetch` and `push --dry-run`, which is how it proves read and write access
+  — so do not "fix" those away.
 - Reuse a package only when `verify-package.sh` passes for that tag's revision
   and version *and* `gascan_assert_distributable_package` passes.
 - Restore the operator's original git ref on every exit path.
@@ -2147,6 +2155,186 @@ for c in tests/release/*-contract.sh; do bash "$c" >/dev/null 2>&1 || echo "FAIL
 There are 11 `tests/release/*-contract.sh`. Every new assertion must be shown to
 fail when the production line it covers is reverted — demonstrate that for the
 marker helper, the `draft: true` case, and one command from the tools loop.
+
+---
+
+### Task 9: Make the release path testable, and close the last assertions
+
+The closing review confirmed all nine whole-branch findings closed in the
+shipping code, and proved it by breaking thirteen of fifteen production
+properties. What remains is on the test side. Two items matter: the line that
+*is* the I2 remediation can be deleted with the suite green, and no test parses
+the half of `release.sh` that performs the release.
+
+**Files:**
+- Modify: `packaging/macos/release-recovery.sh`
+- Modify: `packaging/macos/release.sh`
+- Modify: `packaging/macos/release-gates.sh`
+- Modify: `packaging/macos/publish.sh`
+- Modify: `tests/release/release-script-contract.sh`
+- Modify: `tests/release/publish-contract.sh`
+
+- [ ] **Step 1: the consuming half of the marker contract**
+
+`release.sh` reads the marker in one line:
+
+```bash
+[[ -f $published_marker ]] && release_is_live=true
+```
+
+Replace it with `:` and both contracts stay green; delete
+`rm -f "$published_marker"` and they stay green too. That line is the whole of
+the I2 remediation, and its failure mode is silence on the one path where the
+release is already public — the operator gets no "do not delete it", reaches for
+the documented `gh release delete`, and is one flag from the signed tag.
+
+Make the decision a pure function, the way the narrator already is, and assert
+it. In `packaging/macos/release-recovery.sh`:
+
+```bash
+# Whether the release is public, decided from local state only: asking GitHub
+# from inside the EXIT trap would be an unbounded network call at the one
+# moment an interrupted run needs to let go.
+gascan_release_is_live() {
+  local returned=$1 attempted=$2 marker=$3
+  [[ $returned == true ]] && return 0
+  [[ $attempted == true && -f $marker ]]
+}
+```
+
+In `packaging/macos/release.sh`:
+
+```bash
+report_live_release() {
+  gascan_release_is_live "$release_is_live" "$publish_attempted" \
+    "$published_marker" || return 0
+  gascan_report_live_release "$version" "$tap_path" "$repo_root" "$tap_stage" \
+    "$asset_url" "$checksum" "$published" >&2
+}
+```
+
+Assert all four combinations in the contract — returned → live; attempted with
+the marker present → live; attempted with it absent → not live; not attempted →
+not live — and add `gascan_release_is_live` to the needle loop so the wiring
+cannot be deleted either. Add one assertion that the stale marker is cleared
+before publishing.
+
+- [ ] **Step 2: nothing parses the release path**
+
+Every invocation of `release.sh` in the suite is an argument error or `--check`,
+and `--check` exits before bash parses anything below it. An unterminated `if`
+inserted into the release path leaves `bash -n` at exit 2 and all eleven
+contracts passing — verified. That is the bound on what this suite says about
+the ~180 lines that perform the release: the checkout, the reuse predicate, the
+publish call, the stdout validation, the tap staging, and the recovery.
+
+```bash
+# --check exits before bash ever parses the release path, so no invocation in
+# this file reaches it. Parse every sourced file explicitly, or a syntax error
+# in the half of release.sh that performs the release ships with the suite
+# green.
+for f in "$release" "$gates" "$config" "$recovery" "$common" \
+  "$repo_root/packaging/macos/publish.sh"; do
+  bash -n "$f" || { printf '%s is not syntactically valid\n' "$f" >&2; exit 1; }
+done
+```
+
+- [ ] **Step 3: the tools list can still shrink silently**
+
+The loop proves every command the gate lists is required, but deriving the list
+from the gate means it cannot notice the list shrinking — delete `security` from
+the gate and the suite stays green, which is the mutation the previous step was
+written to close. Membership is covered; equality is not.
+
+```bash
+# Equality, not membership: deriving the list from the gate proves every listed
+# command is required but cannot notice the list shrinking. Pinning it here
+# makes a command added to or removed from the gate fail loudly and be updated
+# deliberately, instead of dropping out of coverage in silence.
+want_tools='gh jq cargo pkgutil shasum ruby brew git codesign spctl xcrun security cpio gzip'
+[[ ${required_tools[*]} == "$want_tools" ]] || {
+  printf 'the required-command list changed: %s\n' "${required_tools[*]}" >&2
+  exit 1; }
+```
+
+- [ ] **Step 4: the smaller gaps**
+
+- The `--cleanup-tag` scan covers the shell files but not
+  `docs/release/macos-checklist.md`, which is the file the finding was actually
+  about. Add it to that loop; the pattern already distinguishes the executed
+  command from the prose warning.
+- Add a publish-contract case with the artifact directory at mode 500, so the
+  marker-write failure announcement is covered. It passes today and fails if the
+  `||` is dropped.
+- The config-loop's exit-code half cannot fail — any machine stops at a later
+  gate once configuration resolves. The message grep is the assertion; say so in
+  the comment, as the tap case already does.
+- Drop the redundant `grep -F '.published"'` in the publish contract: it catches
+  only the double-quoted inline form, is subsumed by the helper assertion above
+  it, and without `-q` prints its matches into the contract's stdout.
+- The publish contract's behavioral cases run `publish.sh` from a `git clone` at
+  HEAD while its source greps read the working tree, so an uncommitted edit is
+  source-checked but not behavior-checked. Add a comment saying so, so the next
+  person doing a revert-and-prove demonstration is not misled by a green run.
+- `gascan_gate_tap`'s origin-name rule reads the fetch URL, but the push goes to
+  `remote.origin.pushurl` when one is set. Use `git remote get-url --push origin`.
+  The contract's unpushable fixture points `pushurl` at
+  `$fixture/absent-remote.git`; rename it to a tap-shaped path or that case will
+  stop at the name rule instead of at the push, which is not what it asserts.
+- Write a `.pending` marker before the draft flip and remove it after, so a
+  SIGINT landing while `gh release edit --draft=false` is in flight is reported
+  as "publish was interrupted during the draft flip — check GitHub before
+  deleting anything" rather than silently. No network call in the trap.
+
+- [ ] **Step 5: validate the cask before the point of no return**
+
+`render-cask.sh`, `ruby -c` and `brew style` run for the first time after
+publish has returned, so a broken renderer or a changed `brew style` rule is
+discovered with the release already public. That is the one step still on the
+wrong side of the irreversible act, and moving late failures forward is this
+script's whole thesis.
+
+In `--check`, after the gates pass, render with a placeholder digest into a temp
+file and run both validators:
+
+```bash
+# 64 zeros is valid hex, so render-cask.sh accepts it: this proves the template
+# and brew's current rules, not the digest.
+probe_cask=$(mktemp "${TMPDIR:-/tmp}/gascan-cask-probe.XXXXXX")
+"$repo_root/packaging/macos/render-cask.sh" "$version" \
+  0000000000000000000000000000000000000000000000000000000000000000 >"$probe_cask"
+ruby -c "$probe_cask" >/dev/null || {
+  printf 'render-cask.sh does not produce valid Ruby\n' >&2
+  rm -f "$probe_cask"; exit 65; }
+brew style "$probe_cask" >&2 || {
+  printf 'the rendered cask fails brew style\n' >&2
+  rm -f "$probe_cask"; exit 65; }
+rm -f "$probe_cask"
+```
+
+Assert in the contract that `--check` exercises the renderer, and keep the
+mutation scan passing — this writes only to a temp file.
+
+- [ ] **Step 6: Verify**
+
+```bash
+bash tests/release/release-script-contract.sh; echo "exit: $?"
+bash tests/release/publish-contract.sh; echo "exit: $?"
+shellcheck packaging/macos/release.sh packaging/macos/release-gates.sh \
+  packaging/macos/release-config.sh packaging/macos/release-recovery.sh \
+  packaging/macos/release-common.sh packaging/macos/publish.sh \
+  tests/release/release-script-contract.sh tests/release/publish-contract.sh
+echo "exit: $?"
+for c in tests/release/*-contract.sh; do bash "$c" >/dev/null 2>&1 || echo "FAIL $c"; done; echo done
+```
+
+Then demonstrate, with the file mode preserved — use `sed -i ''` or an editor,
+never `awk > tmp && mv`, which silently drops the executable bit and produces a
+failure that looks like the one you are testing for:
+
+- replacing the marker read with `:` now fails the suite
+- an unterminated `if` in the release path now fails the suite
+- deleting `security` from the gate's list now fails the suite
 
 ---
 
