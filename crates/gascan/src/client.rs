@@ -20,7 +20,10 @@ impl std::fmt::Display for ClientError {
         match self {
             Self::Io(error) => write!(formatter, "daemon I/O error: {error}"),
             Self::Transport(error) => write!(formatter, "daemon transport error: {error}"),
-            Self::Rpc(error) => write!(formatter, "daemon error: {}", error.message()),
+            Self::Rpc(error) => match gascan_proto::error_detail::decode_message(error.details()) {
+                Some(cause) => write!(formatter, "error: {cause}"),
+                None => write!(formatter, "daemon error: {}", error.message()),
+            },
             Self::Api(message) => write!(formatter, "API mismatch: {message}"),
         }
     }
@@ -208,5 +211,41 @@ mod tests {
             super::default_runtime_base(),
             std::path::PathBuf::from("/private/tmp")
         );
+    }
+
+    #[test]
+    fn rpc_errors_show_the_cause_when_the_daemon_sends_one() {
+        let details = gascan_proto::error_detail::encode(
+            gascan_proto::error_code::INVALID_MANIFEST,
+            "unknown variant `kiener`, expected `workspace` or `root`",
+        );
+        let status = tonic::Status::with_details(
+            tonic::Code::InvalidArgument,
+            gascan_proto::error_code::INVALID_MANIFEST,
+            tonic::codegen::Bytes::from(details),
+        );
+        let rendered = format!("{}", super::ClientError::Rpc(Box::new(status)));
+        assert!(
+            rendered.contains("unknown variant `kiener`"),
+            "the cause must reach the operator: {rendered}"
+        );
+    }
+
+    #[test]
+    fn rpc_errors_fall_back_to_the_code_without_details() {
+        let status = tonic::Status::invalid_argument(gascan_proto::error_code::INVALID_REQUEST);
+        let rendered = format!("{}", super::ClientError::Rpc(Box::new(status)));
+        assert_eq!(rendered, "daemon error: invalid_request");
+    }
+
+    #[test]
+    fn malformed_details_never_panic_and_fall_back() {
+        let status = tonic::Status::with_details(
+            tonic::Code::InvalidArgument,
+            gascan_proto::error_code::INVALID_REQUEST,
+            tonic::codegen::Bytes::from_static(&[0x0a, 0x05]),
+        );
+        let rendered = format!("{}", super::ClientError::Rpc(Box::new(status)));
+        assert_eq!(rendered, "daemon error: invalid_request");
     }
 }
