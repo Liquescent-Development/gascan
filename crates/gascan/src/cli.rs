@@ -98,6 +98,7 @@ impl std::fmt::Display for CliError {
         }
     }
 }
+impl std::error::Error for CliError {}
 impl From<ClientError> for CliError {
     fn from(value: ClientError) -> Self {
         Self::Client(value)
@@ -112,6 +113,28 @@ impl From<std::io::Error> for CliError {
     fn from(value: std::io::Error) -> Self {
         Self::Io(value)
     }
+}
+
+/// Resolve a project root to the absolute path the daemon requires.
+///
+/// A relative path names a directory relative to *this* process. The daemon
+/// runs with a different working directory, so resolving there would mount the
+/// wrong directory; resolution has to happen on this side. The daemon still
+/// rejects a relative root, and that check stays: it is the boundary, not a
+/// fallback for this function.
+fn resolve_project_root(project_root: &str) -> Result<String, CliError> {
+    if project_root.is_empty() {
+        return Err(CliError::Usage("project root must not be empty".to_owned()));
+    }
+    let resolved = std::fs::canonicalize(project_root).map_err(|error| {
+        CliError::Usage(format!(
+            "cannot use `{project_root}` as a project root: {error}"
+        ))
+    })?;
+    resolved
+        .to_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| CliError::Usage(format!("project root `{project_root}` is not valid UTF-8")))
 }
 
 pub async fn execute() -> Result<i32, CliError> {
@@ -133,6 +156,7 @@ pub async fn execute() -> Result<i32, CliError> {
     match arguments.command {
         Command::DaemonAttest => Ok(0),
         Command::Up { project_root, json } => {
+            let project_root = resolve_project_root(&project_root)?;
             operation(
                 client
                     .api
@@ -145,8 +169,8 @@ pub async fn execute() -> Result<i32, CliError> {
         }
         Command::Apply { project_root, json } => {
             let root = match project_root {
-                Some(root) => root,
-                None => std::env::current_dir()?.to_string_lossy().into_owned(),
+                Some(root) => resolve_project_root(&root)?,
+                None => resolve_project_root(".")?,
             };
             operation(
                 client
@@ -649,5 +673,106 @@ mod tests {
                 .unwrap_or_default()
                 .contains("secret")
         );
+    }
+
+    #[test]
+    fn relative_roots_resolve_against_this_process() -> Result<(), Box<dyn std::error::Error>> {
+        let resolved = resolve_project_root(".")?;
+        assert_eq!(
+            std::path::Path::new(&resolved),
+            std::env::current_dir()?.canonicalize()?
+        );
+        assert!(std::path::Path::new(&resolved).is_absolute());
+        Ok(())
+    }
+
+    #[test]
+    fn absolute_roots_survive_resolution() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let canonical = directory.path().canonicalize()?;
+        let resolved = resolve_project_root(canonical.to_str().ok_or("non-UTF-8 fixture")?)?;
+        assert_eq!(std::path::Path::new(&resolved), canonical);
+        Ok(())
+    }
+
+    #[test]
+    fn dot_segments_and_trailing_slashes_normalize() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let canonical = directory.path().canonicalize()?;
+        let base = canonical.to_str().ok_or("non-UTF-8 fixture")?;
+        for variant in [
+            format!("{base}/"),
+            format!("{base}/."),
+            format!("{base}/./"),
+        ] {
+            assert_eq!(
+                std::path::Path::new(&resolve_project_root(&variant)?),
+                canonical,
+                "variant {variant} must normalize"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parent_and_nested_segments_resolve() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let canonical = directory.path().canonicalize()?;
+        std::fs::create_dir(canonical.join("nested"))?;
+        let base = canonical.to_str().ok_or("non-UTF-8 fixture")?;
+
+        // A nested relative segment.
+        assert_eq!(
+            std::path::Path::new(&resolve_project_root(&format!("{base}/nested"))?),
+            canonical.join("nested")
+        );
+        // A parent segment that climbs back out of it.
+        assert_eq!(
+            std::path::Path::new(&resolve_project_root(&format!("{base}/nested/.."))?),
+            canonical
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_symlinked_root_resolves_to_its_target() -> Result<(), Box<dyn std::error::Error>> {
+        // The daemon canonicalizes too, so the client must agree with it about
+        // which directory a symlink names; otherwise the same project could
+        // produce two sandbox identities.
+        let directory = tempfile::tempdir()?;
+        let canonical = directory.path().canonicalize()?;
+        let target = canonical.join("project");
+        std::fs::create_dir(&target)?;
+        let link = canonical.join("link");
+        std::os::unix::fs::symlink(&target, &link)?;
+
+        let resolved = resolve_project_root(link.to_str().ok_or("non-UTF-8 fixture")?)?;
+        assert_eq!(std::path::Path::new(&resolved), target);
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::expect_used,
+        reason = "asserting on the Err variant is the test"
+    )]
+    fn a_missing_root_fails_here_rather_than_at_the_daemon() {
+        let error = resolve_project_root("/definitely/not/a/real/project/root")
+            .expect_err("a missing root must be rejected");
+        assert_eq!(error.exit_code(), super::EXIT_USAGE);
+        assert!(
+            format!("{error}").contains("/definitely/not/a/real/project/root"),
+            "the message must name the offending path"
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::expect_used,
+        reason = "asserting on the Err variant is the test"
+    )]
+    fn an_empty_root_is_rejected() {
+        let error = resolve_project_root("").expect_err("an empty root must be rejected");
+        assert_eq!(error.exit_code(), super::EXIT_USAGE);
     }
 }

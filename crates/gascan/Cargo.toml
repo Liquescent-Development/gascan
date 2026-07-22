@@ -23,3 +23,4 @@ workspace = true
 
 [dev-dependencies]
 rustix-openpty = "0.2"
+tempfile = "3"

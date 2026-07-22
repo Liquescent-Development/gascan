@@ -416,6 +416,7 @@ dependencies = [
  "rustix",
  "rustix-openpty",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",
