@@ -492,7 +492,7 @@ ApiInputError is untouched and stays Copy for its other three callers."
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `crates/gascan/src/cli.rs`:
+Add to the existing `#[cfg(test)] mod tests` block already present near the end of `crates/gascan/src/cli.rs` (merge, do not create a second module):
 
 ```rust
 #[cfg(test)]
@@ -593,12 +593,14 @@ mod tests {
 
 - [ ] **Step 2: Add `tempfile` as a dev-dependency of the CLI crate**
 
-`crates/gascan/Cargo.toml` has no `[dev-dependencies]` section. Add one after
-`[dependencies]`. `tempfile` is *not* a workspace dependency — `gascand`
-declares it directly — so match that exactly:
+`crates/gascan/Cargo.toml` already has a `[dev-dependencies]` section below
+`[lints]`, containing `rustix-openpty`. Add `tempfile` to that existing section
+— do not add a second one, which is a TOML error. `tempfile` is *not* a
+workspace dependency; `gascand` declares it directly, so match that form:
 
 ```toml
 [dev-dependencies]
+rustix-openpty = "0.2"
 tempfile = "3"
 ```
 
