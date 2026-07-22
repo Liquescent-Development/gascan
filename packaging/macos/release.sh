@@ -103,18 +103,26 @@ gascan_gate_tap "$tap_path" "$repo_root"
 printf 'all release preconditions pass for %s\n' "$version" >&2
 
 if [[ $check_only == true ]]; then
+  # brew decides which cops apply from the path. A file under a Casks/
+  # directory gets the cask rules the real cask will face; a bare temp file
+  # gets formula rules and reports offences that are not real; and a file with
+  # no .rb suffix is not inspected at all, so the check passes having asserted
+  # nothing. Hence a throwaway tap layout, which touches the operator's tap not
+  # at all.
+  probe_dir=$(mktemp -d "${TMPDIR:-/tmp}/gascan-cask-probe.XXXXXX")
+  mkdir -p "$probe_dir/Casks"
+  probe_cask=$probe_dir/Casks/gascan.rb
   # 64 zeros is valid hex, so render-cask.sh accepts it: this proves the
   # template and brew's current rules, not the digest.
-  probe_cask=$(mktemp "${TMPDIR:-/tmp}/gascan-cask-probe.XXXXXX")
   "$repo_root/packaging/macos/render-cask.sh" "$version" \
     0000000000000000000000000000000000000000000000000000000000000000 >"$probe_cask"
   ruby -c "$probe_cask" >/dev/null || {
     printf 'render-cask.sh does not produce valid Ruby\n' >&2
-    rm -f "$probe_cask"; exit 65; }
+    rm -rf "$probe_dir"; exit 65; }
   brew style "$probe_cask" >&2 || {
     printf 'the rendered cask fails brew style\n' >&2
-    rm -f "$probe_cask"; exit 65; }
-  rm -f "$probe_cask"
+    rm -rf "$probe_dir"; exit 65; }
+  rm -rf "$probe_dir"
   printf 'check only: nothing was built, published, or changed\n' >&2
   exit 0
 fi
