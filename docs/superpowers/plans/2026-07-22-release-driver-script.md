@@ -347,6 +347,50 @@ grep -Fq 'git push origin' <<<"$unpushed" || {
 if gascan_gate_tap "$fixture" >/dev/null 2>&1; then
   printf 'a non-repository tap path was accepted\n' >&2; exit 1
 fi
+
+# The push check, exercised against a local remote so the dry run has a real
+# remote to authenticate and negotiate with. Without this the gate's central
+# claim -- that it proves push access -- is asserted by nothing.
+tap_origin=$fixture/tap-origin.git
+tap=$fixture/tap
+git init --quiet --bare --initial-branch=main "$tap_origin"
+git init --quiet --initial-branch=main "$tap"
+git -C "$tap" config user.name release
+git -C "$tap" config user.email release@example.invalid
+mkdir -p "$tap/Casks"
+printf 'seed\n' >"$tap/README.md"
+git -C "$tap" add README.md
+git -C "$tap" commit --quiet -m seed
+git -C "$tap" remote add origin "$tap_origin"
+git -C "$tap" push --quiet origin main
+gascan_gate_tap "$tap" >/dev/null || {
+  printf 'a clean, pushable tap on main was rejected\n' >&2; exit 1; }
+
+# `pushurl` is what makes this a *push* failure: fetch still resolves, so the
+# gate reaches the dry run instead of stopping at the earlier fetch check.
+git -C "$tap" config remote.origin.pushurl "$fixture/absent-remote.git"
+set +e
+unpushable=$(gascan_gate_tap "$tap" 2>&1 >/dev/null)
+unpushable_code=$?
+set -e
+[[ $unpushable_code -ne 0 ]] || {
+  printf 'a tap that cannot be pushed was accepted\n' >&2; exit 1; }
+grep -Fq 'cannot push to origin/main' <<<"$unpushable" || {
+  printf 'unpushable tap message is not about pushing: %s\n' "$unpushable" >&2
+  exit 1; }
+git -C "$tap" config --unset remote.origin.pushurl
+
+# A tap holding a commit the remote does not have must not be told to pull.
+printf 'ahead\n' >>"$tap/README.md"
+git -C "$tap" commit --quiet -am ahead
+set +e
+ahead=$(gascan_gate_tap "$tap" 2>&1 >/dev/null)
+ahead_code=$?
+set -e
+[[ $ahead_code -ne 0 ]] || {
+  printf 'a tap ahead of origin/main was accepted\n' >&2; exit 1; }
+grep -Fq "git -C $tap push" <<<"$ahead" || {
+  printf 'an ahead tap was not told to push: %s\n' "$ahead" >&2; exit 1; }
 ```
 
 - [ ] **Step 2: Run to verify it fails**
@@ -483,11 +527,19 @@ gascan_gate_tap() {
   }
   local_head=$(git -C "$tap" rev-parse HEAD) || return 65
   remote_head=$(git -C "$tap" rev-parse origin/main) || return 65
-  [[ $local_head == "$remote_head" ]] || {
-    printf 'tap is not up to date with origin/main: %s\n' "$tap" >&2
-    printf 'run: git -C %s pull --ff-only\n' "$tap" >&2
+  if [[ $local_head != "$remote_head" ]]; then
+    # A tap that is *ahead* is what a failed push after a successful commit
+    # leaves behind, and `pull --ff-only` does not resolve that. Advising it
+    # would contradict the recovery the driver itself prints.
+    if git -C "$tap" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'tap has a commit that is not on origin/main: %s\n' "$tap" >&2
+      printf 'run: git -C %s push\n' "$tap" >&2
+    else
+      printf 'tap is not up to date with origin/main: %s\n' "$tap" >&2
+      printf 'run: git -C %s pull --ff-only\n' "$tap" >&2
+    fi
     return 65
-  }
+  fi
   # Fetching proves read access; the release needs write access. Without this,
   # a missing or expired push credential surfaces only after the GitHub release
   # is already public -- exactly the late, expensive failure these gates exist
@@ -633,7 +685,7 @@ printf 'git %s\n' "$*" >>"${GASCAN_STUB_LOG:?}"
 # after the whole run finishes. Read-only subcommands still reach real git,
 # because the gates need its actual output, and `--dry-run` is read-only: the
 # tap gate uses `push --dry-run` to prove the push credential works.
-if [[ " $* " != *' --dry-run '* ]]; then
+if [[ " $* " != *' push --dry-run '* ]]; then
   for word in "$@"; do
     case $word in
       tag|push|--cleanup-tag)
@@ -663,9 +715,10 @@ set -e
 # this codebase is `git -C REPO ...`, so a prefix pattern like `git tag`* could
 # never match the very mutation it exists to catch.
 while IFS= read -r logged; do
-  # A dry run is read-only; the tap gate uses one to prove push access.
+  # A dry-run push is read-only; the tap gate uses one to prove push access.
+  # Scoped to that exact pair so `--dry-run` cannot excuse anything else.
   case " $logged " in
-    *' --dry-run '*) continue ;;
+    *' push --dry-run '*) continue ;;
   esac
   case " $logged " in
     *' tag '*|*' push '*|*'--cleanup-tag'*|*' release delete '*)
@@ -875,7 +928,7 @@ grep -Fq 'already published' "$release" || {
 # look like a failure. `local status=` is how it would most likely reappear.
 # Written as an `if` so an absent pattern -- the passing case -- does not trip
 # `set -e`.
-if grep -Eq '^[[:space:]]*(local[[:space:]]+)?status=' "$release"; then
+if grep -Eq '(^|[[:space:]])(local|declare|readonly|typeset)?[[:space:]]*status=' "$release"; then
   printf 'release.sh assigns a variable named status\n' >&2
   exit 1
 fi
@@ -908,19 +961,44 @@ restore_ref() {
 # values needed to finish the cask by hand, which the success path would
 # otherwise be the only place to print.
 release_is_live=false
+published=
 asset_url=
 checksum=
+# How far the tap work got. A single fixed recipe would be wrong for most of
+# these: telling an operator to re-render after `brew style` rejected the cask
+# reproduces the file that was just rejected, and telling them to commit again
+# after the commit succeeded dead-ends in git's own "nothing to commit".
+tap_stage=none
+
+print_release_values() {
+  printf '  asset:  %s\n' "$asset_url"
+  printf '  sha256: %s\n' "$checksum"
+}
+
 report_live_release() {
   [[ $release_is_live == true ]] || return 0
   printf '\nthe GitHub release for v%s is already published; do not delete it\n' \
     "$version" >&2
-  printf '  asset:  %s\n' "${asset_url:-unknown}" >&2
-  printf '  sha256: %s\n' "${checksum:-unknown}" >&2
+  if [[ -n $asset_url && -n $checksum ]]; then
+    print_release_values >&2
+  else
+    printf 'publish.sh printed:\n%s\n' "$published" >&2
+  fi
   printf 'finish the cask by hand:\n' >&2
-  printf '  %s/packaging/macos/render-cask.sh %s %s > %s/Casks/gascan.rb\n' \
-    "$repo_root" "$version" "${checksum:-SHA256}" "$tap_path" >&2
-  printf '  git -C %s add Casks/gascan.rb\n' "$tap_path" >&2
-  printf "  git -C %s commit -m 'gascan %s'\n" "$tap_path" "$version" >&2
+  if [[ $tap_stage == none ]]; then
+    printf '  %s/packaging/macos/render-cask.sh %s %s > %s/Casks/gascan.rb\n' \
+      "$repo_root" "$version" "${checksum:-SHA256}" "$tap_path" >&2
+  fi
+  if [[ $tap_stage == rendered ]]; then
+    printf '  # %s/Casks/gascan.rb was rendered and then rejected; correct it first\n' \
+      "$tap_path" >&2
+  fi
+  if [[ $tap_stage == none || $tap_stage == rendered ]]; then
+    printf '  git -C %s add Casks/gascan.rb\n' "$tap_path" >&2
+  fi
+  if [[ $tap_stage != committed ]]; then
+    printf "  git -C %s commit -m 'gascan %s'\n" "$tap_path" "$version" >&2
+  fi
   printf '  git -C %s push\n' "$tap_path" >&2
 }
 
@@ -997,6 +1075,7 @@ git -C "$tap_path" pull --ff-only --quiet
 mkdir -p "$tap_path/Casks"
 "$repo_root/packaging/macos/render-cask.sh" "$version" "$checksum" \
   >"$tap_path/Casks/gascan.rb"
+tap_stage=rendered
 ruby -c "$tap_path/Casks/gascan.rb" >/dev/null || {
   printf 'rendered cask is not valid Ruby: %s\n' "$tap_path/Casks/gascan.rb" >&2
   exit 65
@@ -1011,20 +1090,22 @@ brew style "$tap_path/Casks/gascan.rb" || {
 # Casks/gascan.rb as a new file, which `-a` never stages, so the commit would
 # fail with "nothing to commit" after the release was already published.
 git -C "$tap_path" add Casks/gascan.rb
+tap_stage=staged
 # An identical cask is not a failure. It happens when an operator wrote the
 # cask by hand while recovering and then re-ran, and `git commit` with nothing
 # staged would abort the run under `set -e` with only git's own wording.
 if git -C "$tap_path" diff --cached --quiet; then
   printf 'the cask already carries %s and this checksum; nothing to commit\n' \
     "$version" >&2
+  tap_stage=committed
 else
   git -C "$tap_path" commit --quiet -m "gascan $version"
+  tap_stage=committed
   git -C "$tap_path" push --quiet
 fi
 
 printf '\nreleased %s\n' "$version"
-printf '  asset:  %s\n' "$asset_url"
-printf '  sha256: %s\n' "$checksum"
+print_release_values
 printf '  cask:   %s\n' "$(git -C "$tap_path" rev-parse --short HEAD)"
 printf '  verify: brew update && brew upgrade --cask gascan\n'
 ```
