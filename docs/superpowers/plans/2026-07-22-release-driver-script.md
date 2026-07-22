@@ -1352,8 +1352,8 @@ notarizes, publishes, and updates the cask:
 ./packaging/macos/release.sh <version>           # do it
 ```
 
-Four values resolve by precedence — flag, environment, then
-`~/.config/gascan/release.env` — and none is defaulted:
+Four values resolve by precedence — flag, environment, then a config file — and
+none is defaulted:
 
 | Value | Flag | Environment |
 | --- | --- | --- |
@@ -1361,6 +1361,13 @@ Four values resolve by precedence — flag, environment, then
 | Developer ID Installer identity | `--installer-identity` | `GASCAN_INSTALLER_SIGNING_IDENTITY` |
 | Notarization keychain profile name | `--notary-profile` | `GASCAN_NOTARYTOOL_PROFILE` |
 | Homebrew tap checkout | `--tap` | `GASCAN_TAP_PATH` |
+
+The config file defaults to `${XDG_CONFIG_HOME:-$HOME/.config}/gascan/release.env`
+and `--config FILE` names another. It holds `NAME=value` lines and is read as
+data, never sourced, so it takes names — never a key, password, or token.
+
+The tap must be a clean checkout on `main`, level with `origin/main`, that you
+can push to; `--check` proves all four before anything is built.
 
 `release.sh` never creates, moves, or deletes a tag, and never deletes a
 release. Create and push the signed tag first. The manual steps below remain
