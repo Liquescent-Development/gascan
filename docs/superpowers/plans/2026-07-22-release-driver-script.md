@@ -744,14 +744,14 @@ done <"$GASCAN_STUB_LOG"
 # signed tag from the remote. The gates deliberately *warn* about the flag in
 # prose, which is the line that stops an operator destroying their own tag, so
 # assert the dangerous construction rather than the string.
-for f in "$release" "$gates"; do
+for f in "$release" "$gates" "$recovery"; do
   if grep -Eq 'gh release delete.*--cleanup-tag' "$f"; then
     printf '%s would delete a tag via --cleanup-tag\n' "$f" >&2; exit 1
   fi
 done
 
 # No hardcoded identity, team identifier, or profile.
-for f in "$release" "$gates" "$config"; do
+for f in "$release" "$gates" "$config" "$recovery"; do
   if grep -Eq 'Developer ID (Application|Installer): [A-Za-z]|\([A-Z0-9]{10}\)' "$f"; then
     printf 'hardcoded signing identity or team identifier in %s\n' "$f" >&2
     exit 1
@@ -948,10 +948,12 @@ grep -Fq 'gascan_report_live_release' "$release" || {
 # look like a failure. `local status=` is how it would most likely reappear.
 # Written as an `if` so an absent pattern -- the passing case -- does not trip
 # `set -e`.
-if grep -Eq '(^|[[:space:]])(local|declare|readonly|typeset)?[[:space:]]*status=' "$release"; then
-  printf 'release.sh assigns a variable named status\n' >&2
-  exit 1
-fi
+for f in "$release" "$recovery"; do
+  if grep -Eq '(^|[[:space:]])(local|declare|readonly|typeset)?[[:space:]]*status=' "$f"; then
+    printf '%s assigns a variable named status\n' "$f" >&2
+    exit 1
+  fi
+done
 
 # The recovery narrator, exercised directly. It runs only when a release is
 # already public, so without this it would be covered by a single grep -- and
@@ -1061,6 +1063,7 @@ gascan_report_live_release() {
     printf '  #   git -C %s pull --ff-only origin main\n' "$tap"
     # render-cask.sh rejects a checksum that is not 64 hex characters, so name
     # the placeholder rather than emitting a command that pastes and fails.
+    printf '  mkdir -p %s/Casks\n' "$tap"
     printf '  %s/packaging/macos/render-cask.sh %s %s > %s/Casks/gascan.rb\n' \
       "$repo" "$version" "${sum:-<sha256-printed-above>}" "$tap"
   fi
@@ -1103,9 +1106,10 @@ restore_ref() {
 # Once publish.sh returns, the GitHub release is public and cannot be undone
 # safely -- the documented recovery deletes a release, and an operator reaching
 # for it lands one flag away from deleting the signed tag too. So every failure
-# after that point has to say the release is already live and hand over the two
-# values needed to finish the cask by hand, which the success path would
-# otherwise be the only place to print.
+# after that point has to say the release is already live and hand over the
+# checksum the cask is built from, which the success path would otherwise be
+# the only place to print. The asset URL goes with it as confirmation of what
+# was published; render-cask.sh derives its own URL from the version.
 release_is_live=false
 published=
 asset_url=
@@ -1163,23 +1167,22 @@ else
     GASCAN_NOTARYTOOL_PROFILE="$notary_profile" \
       "$repo_root/packaging/macos/package.sh"
   )
-  # One call, not a hand-rolled trio. `pkgutil --check-signature` alone exits 0
-  # for a package signed by any certificate at all, so a trio built from it
-  # would claim more than it proves; this pins the Developer ID Installer
-  # certificate and the team, and asserts the exact payload. The reuse branch
-  # does not repeat it -- reuse is conditional on this same call having just
-  # passed for this same file, and it expands the package and verifies three
-  # signatures each time it runs.
-  gascan_assert_distributable_package "$package" "$GASCAN_RELEASE_TEAM" || exit 65
 fi
+# No distributability check here. publish.sh runs
+# `gascan_assert_distributable_package` as its first action, before it touches
+# gh at all, so a second call buys no earlier failure and pays another package
+# expansion and three signature verifications on every release. The reuse
+# branch above still calls it, because there it is the reuse predicate rather
+# than a repeat.
 
 published=$("$repo_root/packaging/macos/publish.sh" "$package")
 release_is_live=true
 # publish.sh's stdout is a two-line contract: asset URL, then SHA-256. Assert
 # the shape rather than trusting positions. `gh release upload` inside it does
 # not redirect its own stdout, so a future gh that chatters there would shift
-# both lines, and a shifted URL ships a cask that breaks every install while
-# the release itself looks fine.
+# both lines, putting the URL where the checksum belongs. The checksum is what
+# the cask is built from -- render-cask.sh derives the URL itself -- so the
+# shape check is what stands between chatter and a wrong digest.
 published_lines=$(grep -c '' <<<"$published")
 [[ $published_lines -eq 2 ]] || {
   printf 'publish.sh printed %s lines, expected the asset URL then the SHA-256:\n%s\n' \
@@ -1258,7 +1261,8 @@ git -C "$tap_path" push --quiet origin main
 
 printf '\nreleased %s\n' "$version"
 gascan_print_release_values "$asset_url" "$checksum"
-printf '  cask:   %s\n' "$(git -C "$tap_path" rev-parse --short HEAD)"
+cask_revision=$(git -C "$tap_path" rev-parse --short HEAD)
+printf '  cask:   %s\n' "$cask_revision"
 printf '  verify: brew update && brew upgrade --cask gascan\n'
 ```
 
