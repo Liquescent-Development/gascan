@@ -43,7 +43,7 @@ impl Manifest {
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
                 Ok(Self::defaults_for_root(canonical))
             }
-            Err(source) => Err(ManifestError::Io { path, source }),
+            Err(source) => Err(ManifestError::ManifestUnreadable { path, source }),
         }
     }
 
@@ -285,6 +285,33 @@ pub enum ManifestError {
         #[source]
         source: std::io::Error,
     },
+    #[error("could not read {path}: {source}")]
+    ManifestUnreadable {
+        path: Utf8PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+impl ManifestError {
+    /// Whether this failure is about the project root itself (missing, not a
+    /// directory, unreadable) rather than the manifest's content.
+    ///
+    /// `ManifestError` is `#[non_exhaustive]`, so callers outside this crate
+    /// cannot match its variants exhaustively. This match lives here, inside
+    /// the defining crate, so adding a variant without classifying it here
+    /// fails to compile instead of silently reaching a default.
+    pub fn is_project_root_error(&self) -> bool {
+        match self {
+            Self::Io { .. } | Self::RootNotDirectory(_) | Self::NonUtf8Path(_) => true,
+            Self::Parse(_)
+            | Self::UnsupportedVersion { .. }
+            | Self::Invalid(_)
+            | Self::SetupOutsideRoot { .. }
+            | Self::RootMismatch { .. }
+            | Self::ManifestUnreadable { .. } => false,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -423,5 +450,66 @@ fn validate_setup_containment(
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_project_root_error_classifies_every_variant() -> Result<(), Box<dyn std::error::Error>> {
+        let path = Utf8PathBuf::from("/root");
+        let parse_error = match toml::from_str::<RawManifest>("version = \"not-a-number\"\n") {
+            Ok(_) => return Err("a non-numeric version must fail to parse".into()),
+            Err(error) => error,
+        };
+        let cases: Vec<(ManifestError, bool)> = vec![
+            (ManifestError::Parse(parse_error), false),
+            (ManifestError::UnsupportedVersion { found: 2 }, false),
+            (ManifestError::Invalid("bad".to_owned()), false),
+            (ManifestError::RootNotDirectory(path.clone()), true),
+            (
+                ManifestError::SetupOutsideRoot {
+                    setup: path.clone(),
+                    root: path.clone(),
+                },
+                false,
+            ),
+            (
+                ManifestError::RootMismatch {
+                    loaded: path.clone(),
+                    requested: path.clone(),
+                },
+                false,
+            ),
+            (
+                ManifestError::NonUtf8Path(std::path::PathBuf::from("/root")),
+                true,
+            ),
+            (
+                ManifestError::Io {
+                    path: path.clone(),
+                    source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                },
+                true,
+            ),
+            (
+                ManifestError::ManifestUnreadable {
+                    path,
+                    source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                },
+                false,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(
+                error.is_project_root_error(),
+                expected,
+                "wrong classification for {error:?}"
+            );
+        }
+        Ok(())
     }
 }

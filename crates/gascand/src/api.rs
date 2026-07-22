@@ -7,7 +7,7 @@ use camino::Utf8PathBuf;
 use gascan_core::doctor::DoctorStatus;
 use gascan_core::manifest::Manifest;
 use gascan_core::runtime::RuntimeBackend;
-use gascan_core::sandbox::{SandboxId, SandboxSpec};
+use gascan_core::sandbox::{SandboxError, SandboxId, SandboxSpec};
 use gascan_proto::v1;
 use gascan_proto::v1::gas_can_server::{GasCan, GasCanServer};
 use gascan_proto::{
@@ -608,14 +608,53 @@ fn wire_status(record: crate::SandboxRecord) -> v1::SandboxStatus {
 #[derive(Clone, Copy)]
 enum ApiInputError {
     Invalid,
-    Internal,
 }
 impl ApiInputError {
     fn status(self) -> tonic::Status {
         match self {
             Self::Invalid => tonic::Status::invalid_argument(error_code::INVALID_REQUEST),
-            Self::Internal => tonic::Status::internal(error_code::INTERNAL),
         }
+    }
+}
+
+/// A rejected request: a stable code plus the cause to show the operator.
+///
+/// The code stays in the gRPC status message, where clients already read it,
+/// and the cause travels in the status details. Splitting them this way is what
+/// lets the daemon explain a failure without changing the wire contract an
+/// existing client depends on.
+struct RequestError {
+    grpc: tonic::Code,
+    code: &'static str,
+    cause: Option<String>,
+}
+
+impl RequestError {
+    fn invalid(code: &'static str, cause: impl Into<String>) -> Self {
+        Self {
+            grpc: tonic::Code::InvalidArgument,
+            code,
+            cause: Some(cause.into()),
+        }
+    }
+
+    fn internal() -> Self {
+        Self {
+            grpc: tonic::Code::Internal,
+            code: error_code::INTERNAL,
+            cause: None,
+        }
+    }
+
+    fn status(self) -> tonic::Status {
+        let Some(cause) = self.cause else {
+            return tonic::Status::new(self.grpc, self.code);
+        };
+        tonic::Status::with_details(
+            self.grpc,
+            self.code,
+            tonic::codegen::Bytes::from(gascan_proto::error_detail::encode(self.code, &cause)),
+        )
     }
 }
 
@@ -862,25 +901,62 @@ fn timestamp_millis(timestamp: prost_types::Timestamp) -> Result<i64, ApiInputEr
         .ok_or(ApiInputError::Invalid)
 }
 
-async fn spec_for_root(project_root: String) -> Result<SandboxSpec, ApiInputError> {
+async fn spec_for_root(project_root: String) -> Result<SandboxSpec, RequestError> {
     if project_root.is_empty() {
-        return Err(ApiInputError::Invalid);
+        return Err(RequestError::invalid(
+            error_code::INVALID_PROJECT_ROOT,
+            "project root must not be empty",
+        ));
     }
     let root = Utf8PathBuf::from(project_root);
     if !root.is_absolute() {
-        return Err(ApiInputError::Invalid);
+        // Relative roots are resolved by the client, which knows its own
+        // working directory. The daemon's does not match, so it refuses rather
+        // than guessing.
+        return Err(RequestError::invalid(
+            error_code::INVALID_PROJECT_ROOT,
+            format!("project root must be an absolute path, but `{root}` is relative"),
+        ));
     }
     tokio::task::spawn_blocking(move || {
-        let manifest = Manifest::load(&root).map_err(|_| ApiInputError::Invalid)?;
+        let manifest = Manifest::load(&root).map_err(|error| {
+            if error.is_project_root_error() {
+                RequestError::invalid(
+                    error_code::INVALID_PROJECT_ROOT,
+                    format!("cannot use `{root}` as a project root: {error}"),
+                )
+            } else {
+                RequestError::invalid(
+                    error_code::INVALID_MANIFEST,
+                    format!("cannot use `{}`: {error}", root.join("gascan.toml")),
+                )
+            }
+        })?;
         let name = manifest
             .name()
             .map(ToOwned::to_owned)
             .or_else(|| root.file_name().map(ToOwned::to_owned))
-            .ok_or(ApiInputError::Invalid)?;
-        SandboxSpec::from_root(&name, &root, manifest).map_err(|_| ApiInputError::Invalid)
+            .ok_or_else(|| {
+                RequestError::invalid(
+                    error_code::INVALID_PROJECT_ROOT,
+                    format!(
+                        "cannot derive a sandbox name from `{root}`; set `name` in gascan.toml"
+                    ),
+                )
+            })?;
+        SandboxSpec::from_root(&name, &root, manifest).map_err(|error| match error {
+            SandboxError::InvalidManifest(inner) => RequestError::invalid(
+                error_code::INVALID_MANIFEST,
+                format!("manifest is not valid for `{root}`: {inner}"),
+            ),
+            other => RequestError::invalid(
+                error_code::INVALID_PROJECT_ROOT,
+                format!("cannot use `{root}` as a project root: {other}"),
+            ),
+        })
     })
     .await
-    .map_err(|_| ApiInputError::Internal)?
+    .map_err(|_| RequestError::internal())?
 }
 
 type EventStream =
@@ -1351,7 +1427,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             .map_err(service_status)?;
         let spec = spec_for_root(request.into_inner().project_root)
             .await
-            .map_err(ApiInputError::status)?;
+            .map_err(RequestError::status)?;
         let service = self.service.clone();
         let (started, mut operation) = tokio::sync::mpsc::channel(1);
         tokio::spawn(async move {
@@ -1385,7 +1461,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             .map_err(service_status)?;
         let spec = spec_for_root(request.into_inner().project_root)
             .await
-            .map_err(ApiInputError::status)?;
+            .map_err(RequestError::status)?;
         let service = self.service.clone();
         let (started, mut operation) = tokio::sync::mpsc::channel(1);
         tokio::spawn(async move {
@@ -1671,10 +1747,9 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivityTracker, ApiEventStream, ApiInputError, AttachBridgeControl, AttachStream,
-        AttachTerminal, ErrorDiagnostics, PendingSession, SessionRegistry,
-        attach_shutdown_requested_with, pre_begin_status,
-        run_attach_bridge as run_attach_bridge_impl, service_status,
+        ActivityTracker, ApiEventStream, AttachBridgeControl, AttachStream, AttachTerminal,
+        ErrorDiagnostics, PendingSession, SessionRegistry, attach_shutdown_requested_with,
+        pre_begin_status, run_attach_bridge as run_attach_bridge_impl, service_status,
         service_status_with_diagnostics, spec_for_root, wire_event, wire_status,
     };
     use crate::{
@@ -2328,16 +2403,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_manifest_reports_its_cause() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(
+            directory.path().join("gascan.toml"),
+            "version = 1\nuser = \"kiener\"\n",
+        )?;
+        let root = directory
+            .path()
+            .to_str()
+            .ok_or("non-UTF-8 fixture")?
+            .to_owned();
+        let status = spec_for_root(root)
+            .await
+            .err()
+            .ok_or("an unknown user mode must be rejected")?
+            .status();
+        assert_eq!(status.message(), error_code::INVALID_MANIFEST);
+        let cause = gascan_proto::error_detail::decode_message(status.details())
+            .ok_or("the status must carry a human cause")?;
+        assert!(
+            cause.contains("kiener"),
+            "the cause must quote the rejected value: {cause}"
+        );
+        assert!(
+            cause.contains("workspace") && cause.contains("root"),
+            "the cause must name the accepted values: {cause}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_root_rejections_report_their_cause() -> Result<(), Box<dyn std::error::Error>>
+    {
+        for root in ["", "relative"] {
+            let status = spec_for_root(root.to_owned())
+                .await
+                .err()
+                .ok_or("a non-absolute project root must be rejected")?
+                .status();
+            assert_eq!(status.message(), error_code::INVALID_PROJECT_ROOT);
+            assert!(
+                gascan_proto::error_detail::decode_message(status.details()).is_some(),
+                "a rejected project root must explain itself"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_root_that_is_not_a_directory_is_rejected_as_invalid_project_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let file = tempfile::NamedTempFile::new()?;
+        let root = file.path().to_str().ok_or("non-UTF-8 fixture")?.to_owned();
+        let status = spec_for_root(root)
+            .await
+            .err()
+            .ok_or("a non-directory root must be rejected")?
+            .status();
+        assert_eq!(status.message(), error_code::INVALID_PROJECT_ROOT);
+        let cause = gascan_proto::error_detail::decode_message(status.details())
+            .ok_or("the status must carry a human cause")?;
+        assert!(
+            !cause.contains("gascan.toml"),
+            "a non-directory root must not be blamed on the manifest: {cause}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_missing_root_is_rejected_as_invalid_project_root_not_invalid_manifest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let missing = directory.path().join("does-not-exist");
+        let root = missing.to_str().ok_or("non-UTF-8 fixture")?.to_owned();
+        let status = spec_for_root(root)
+            .await
+            .err()
+            .ok_or("a missing root must be rejected")?
+            .status();
+        assert_eq!(status.message(), error_code::INVALID_PROJECT_ROOT);
+        let cause = gascan_proto::error_detail::decode_message(status.details())
+            .ok_or("the status must carry a human cause")?;
+        assert!(
+            !cause.contains("gascan.toml"),
+            "a missing root must not be blamed on a gascan.toml that does not exist: {cause}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_manifest_is_rejected_as_invalid_manifest_not_invalid_project_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir()?;
+        let manifest_path = directory.path().join("gascan.toml");
+        std::fs::write(&manifest_path, "version = 1\n")?;
+        std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o000))?;
+        let root = directory
+            .path()
+            .to_str()
+            .ok_or("non-UTF-8 fixture")?
+            .to_owned();
+
+        let result = spec_for_root(root).await;
+        std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o644))?;
+        let status = result
+            .err()
+            .ok_or("an unreadable manifest must be rejected")?
+            .status();
+        assert_eq!(status.message(), error_code::INVALID_MANIFEST);
+        let cause = gascan_proto::error_detail::decode_message(status.details())
+            .ok_or("the status must carry a human cause")?;
+        assert!(
+            !cause.contains("as a project root"),
+            "an unreadable manifest must not be blamed on the project root: {cause}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolving_a_root_does_not_change_sandbox_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let root = directory
+            .path()
+            .to_str()
+            .ok_or("non-UTF-8 fixture")?
+            .to_owned();
+        let plain = spec_for_root(root.clone())
+            .await
+            .map_err(|_| std::io::Error::other("default manifest rejected"))?;
+        let dotted = spec_for_root(format!("{root}/."))
+            .await
+            .map_err(|_| std::io::Error::other("default manifest rejected"))?;
+        assert_eq!(plain.id(), dotted.id());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn project_roots_are_absolute_and_manifest_bound()
     -> Result<(), Box<dyn std::error::Error>> {
-        assert!(matches!(
-            spec_for_root(String::new()).await,
-            Err(ApiInputError::Invalid)
-        ));
-        assert!(matches!(
-            spec_for_root("relative".to_owned()).await,
-            Err(ApiInputError::Invalid)
-        ));
+        assert_eq!(
+            spec_for_root(String::new())
+                .await
+                .err()
+                .ok_or("an empty project root must be rejected")?
+                .status()
+                .message(),
+            error_code::INVALID_PROJECT_ROOT
+        );
+        assert_eq!(
+            spec_for_root("relative".to_owned())
+                .await
+                .err()
+                .ok_or("a relative project root must be rejected")?
+                .status()
+                .message(),
+            error_code::INVALID_PROJECT_ROOT
+        );
         let directory = tempfile::tempdir()?;
         let root = directory
             .path()
