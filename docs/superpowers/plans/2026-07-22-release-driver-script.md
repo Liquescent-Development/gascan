@@ -488,6 +488,15 @@ gascan_gate_tap() {
     printf 'run: git -C %s pull --ff-only\n' "$tap" >&2
     return 65
   }
+  # Fetching proves read access; the release needs write access. Without this,
+  # a missing or expired push credential surfaces only after the GitHub release
+  # is already public -- exactly the late, expensive failure these gates exist
+  # to move forward. A dry run authenticates and negotiates refs, then stops.
+  git -C "$tap" push --dry-run --quiet origin main || {
+    printf 'cannot push to origin/main in the tap: %s\n' "$tap" >&2
+    printf 'check the credential for that remote before releasing\n' >&2
+    return 65
+  }
 }
 ```
 
@@ -622,14 +631,17 @@ printf 'git %s\n' "$*" >>"${GASCAN_STUB_LOG:?}"
 # remote, so an unconditional exec would let a regression create or push a tag
 # for real and only fail the assertion afterwards -- the log scan below runs
 # after the whole run finishes. Read-only subcommands still reach real git,
-# because the gates need its actual output.
-for word in "$@"; do
-  case $word in
-    tag|push|--cleanup-tag)
-      printf 'stub git refused a mutating subcommand: %s\n' "$*" >&2
-      exit 70 ;;
-  esac
-done
+# because the gates need its actual output, and `--dry-run` is read-only: the
+# tap gate uses `push --dry-run` to prove the push credential works.
+if [[ " $* " != *' --dry-run '* ]]; then
+  for word in "$@"; do
+    case $word in
+      tag|push|--cleanup-tag)
+        printf 'stub git refused a mutating subcommand: %s\n' "$*" >&2
+        exit 70 ;;
+    esac
+  done
+fi
 exec /usr/bin/git "$@"
 STUB_GIT
 chmod +x "$stub_bin/gh" "$stub_bin/git"
@@ -651,9 +663,20 @@ set -e
 # this codebase is `git -C REPO ...`, so a prefix pattern like `git tag`* could
 # never match the very mutation it exists to catch.
 while IFS= read -r logged; do
+  # A dry run is read-only; the tap gate uses one to prove push access.
+  case " $logged " in
+    *' --dry-run '*) continue ;;
+  esac
   case " $logged " in
     *' tag '*|*' push '*|*'--cleanup-tag'*|*' release delete '*)
       printf 'check mode attempted a mutation: %s\n' "$logged" >&2
+      exit 1 ;;
+  esac
+  # --check must never leave the operator's ref. The checkout belongs to the
+  # release path, which runs only after --check has already exited.
+  case " $logged " in
+    *' checkout '*)
+      printf 'check mode moved the working tree: %s\n' "$logged" >&2
       exit 1 ;;
   esac
 done <"$GASCAN_STUB_LOG"
@@ -831,17 +854,28 @@ the repository, with nothing defaulted."
 Insert before the final `printf 'PASS: ...'`:
 
 ```bash
+# `macos/package.sh`, not `package.sh`: the bare form is a substring of
+# `verify-package.sh`, so the needle would be satisfied by a different line and
+# could never fail.
 for needle in verify-package.sh gascan_assert_distributable_package \
-  render-cask.sh publish.sh package.sh; do
+  render-cask.sh publish.sh macos/package.sh; do
   grep -Fq "$needle" "$release" || {
     printf 'release.sh never references %s\n' "$needle" >&2; exit 1; }
 done
 grep -Eq 'trap .*EXIT' "$release" || {
   printf 'release.sh does not restore the original ref on exit\n' >&2; exit 1; }
+grep -Eq 'trap .*INT TERM' "$release" || {
+  printf 'release.sh does not name its interrupted exit status\n' >&2; exit 1; }
+# A failure after publish must say the release is already live, because the
+# recovery an operator reaches for otherwise deletes a published release.
+grep -Fq 'already published' "$release" || {
+  printf 'release.sh never warns that the release is already published\n' >&2
+  exit 1; }
 # `status` is read-only in zsh and has previously made a successful release
-# look like a failure. Written as an `if` so an absent pattern -- the passing
-# case -- does not trip `set -e`.
-if grep -Eq '^[[:space:]]*status=' "$release"; then
+# look like a failure. `local status=` is how it would most likely reappear.
+# Written as an `if` so an absent pattern -- the passing case -- does not trip
+# `set -e`.
+if grep -Eq '^[[:space:]]*(local[[:space:]]+)?status=' "$release"; then
   printf 'release.sh assigns a variable named status\n' >&2
   exit 1
 fi
@@ -866,11 +900,50 @@ restore_ref() {
   printf 'could not return to %s; you are on a detached HEAD\n' "$original_ref" >&2
   printf 'run: git checkout %s\n' "$original_ref" >&2
 }
-trap restore_ref EXIT
 
-git checkout --quiet "v$version"
+# Once publish.sh returns, the GitHub release is public and cannot be undone
+# safely -- the documented recovery deletes a release, and an operator reaching
+# for it lands one flag away from deleting the signed tag too. So every failure
+# after that point has to say the release is already live and hand over the two
+# values needed to finish the cask by hand, which the success path would
+# otherwise be the only place to print.
+release_is_live=false
+asset_url=
+checksum=
+report_live_release() {
+  [[ $release_is_live == true ]] || return 0
+  printf '\nthe GitHub release for v%s is already published; do not delete it\n' \
+    "$version" >&2
+  printf '  asset:  %s\n' "${asset_url:-unknown}" >&2
+  printf '  sha256: %s\n' "${checksum:-unknown}" >&2
+  printf 'finish the cask by hand:\n' >&2
+  printf '  %s/packaging/macos/render-cask.sh %s %s > %s/Casks/gascan.rb\n' \
+    "$repo_root" "$version" "${checksum:-SHA256}" "$tap_path" >&2
+  printf '  git -C %s add Casks/gascan.rb\n' "$tap_path" >&2
+  printf "  git -C %s commit -m 'gascan %s'\n" "$tap_path" "$version" >&2
+  printf '  git -C %s push\n' "$tap_path" >&2
+}
+
+on_exit() {
+  local exit_code=$?
+  restore_ref
+  [[ $exit_code -eq 0 ]] || report_live_release
+  return $exit_code
+}
+trap on_exit EXIT
+# Notarization runs for minutes with the operator parked on a detached HEAD.
+# Matching release-smoke.sh, name the interrupted exit status rather than
+# leaving it to differ between INT and TERM.
+trap 'exit 130' INT TERM
+
+# `--detach refs/tags/` names exactly the tag: a branch called v1.2.3 would
+# otherwise win, and the release would be built from the wrong commit.
+git checkout --quiet --detach "refs/tags/v$version"
 revision=$(git rev-parse --verify HEAD)
-package="$repo_root/.artifacts/release/gascan-$version-macos-arm64.pkg"
+# package.sh honors GASCAN_RELEASE_ARTIFACT_DIR. Looking somewhere else means
+# reuse silently never triggers and every retry pays another notarization round
+# trip -- the exact cost this path exists to avoid.
+package="${GASCAN_RELEASE_ARTIFACT_DIR:-$repo_root/.artifacts/release}/gascan-$version-macos-arm64.pkg"
 
 reusable=false
 if [[ -f $package ]] &&
@@ -891,20 +964,14 @@ else
   )
 fi
 
-pkgutil --check-signature "$package" >/dev/null || {
-  printf 'package is not signed by a Developer ID Installer certificate\n' >&2
-  exit 65
-}
-spctl --assess --type install "$package" >/dev/null 2>&1 || {
-  printf 'Gatekeeper rejects the package as an install candidate\n' >&2
-  exit 65
-}
-xcrun stapler validate "$package" >/dev/null || {
-  printf 'package has no stapled notarization ticket\n' >&2
-  exit 65
-}
+# One call, not a hand-rolled trio. `pkgutil --check-signature` alone exits 0
+# for a package signed by any certificate at all, so the trio's own error text
+# claimed more than it proved; the helper also pins the Developer ID Installer
+# certificate and the team, and asserts the exact payload.
+gascan_assert_distributable_package "$package" "$GASCAN_RELEASE_TEAM" || exit 65
 
 published=$("$repo_root/packaging/macos/publish.sh" "$package")
+release_is_live=true
 # publish.sh's stdout is a two-line contract: asset URL, then SHA-256. Assert
 # the shape rather than trusting positions. `gh release upload` inside it does
 # not redirect its own stdout, so a future gh that chatters there would shift
@@ -931,19 +998,29 @@ mkdir -p "$tap_path/Casks"
 "$repo_root/packaging/macos/render-cask.sh" "$version" "$checksum" \
   >"$tap_path/Casks/gascan.rb"
 ruby -c "$tap_path/Casks/gascan.rb" >/dev/null || {
-  printf 'rendered cask is not valid Ruby\n' >&2
+  printf 'rendered cask is not valid Ruby: %s\n' "$tap_path/Casks/gascan.rb" >&2
   exit 65
 }
-brew style "$tap_path/Casks/gascan.rb" >/dev/null || {
-  printf 'rendered cask fails brew style\n' >&2
+# Let brew name the offenses. Discarding them tells the operator only that
+# something is wrong, at the one point where the release is already public.
+brew style "$tap_path/Casks/gascan.rb" || {
+  printf 'rendered cask fails brew style: %s\n' "$tap_path/Casks/gascan.rb" >&2
   exit 65
 }
 # `add` explicitly, not `commit -a`: the first release into a fresh tap writes
 # Casks/gascan.rb as a new file, which `-a` never stages, so the commit would
 # fail with "nothing to commit" after the release was already published.
 git -C "$tap_path" add Casks/gascan.rb
-git -C "$tap_path" commit --quiet -m "gascan $version"
-git -C "$tap_path" push --quiet
+# An identical cask is not a failure. It happens when an operator wrote the
+# cask by hand while recovering and then re-ran, and `git commit` with nothing
+# staged would abort the run under `set -e` with only git's own wording.
+if git -C "$tap_path" diff --cached --quiet; then
+  printf 'the cask already carries %s and this checksum; nothing to commit\n' \
+    "$version" >&2
+else
+  git -C "$tap_path" commit --quiet -m "gascan $version"
+  git -C "$tap_path" push --quiet
+fi
 
 printf '\nreleased %s\n' "$version"
 printf '  asset:  %s\n' "$asset_url"
