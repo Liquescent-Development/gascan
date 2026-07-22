@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
 async fn api_client(
@@ -165,10 +165,96 @@ fn run_pty_to_eof(env: &Environment, arguments: &[&str]) -> TestResult<std::proc
     Ok(output)
 }
 
+fn invoke_with_stderr_pty(
+    env: &Environment,
+    arguments: &[&str],
+    no_color: bool,
+) -> TestResult<(std::process::ExitStatus, Vec<u8>)> {
+    let pty = rustix_openpty::openpty(None, None)?;
+    let stderr = std::fs::File::from(rustix_openpty::rustix::io::dup(&pty.user)?);
+    let mut command = env.command(arguments);
+    command.stdout(Stdio::piped()).stderr(stderr);
+    if no_color {
+        command.env("NO_COLOR", "1");
+    }
+    let mut child = command.spawn()?;
+    drop(command);
+    drop(pty.user);
+    let mut controller = std::fs::File::from(pty.controller);
+    let reader = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+        let mut output = Vec::new();
+        match controller.read_to_end(&mut output) {
+            Ok(_) => {}
+            Err(error) if error.raw_os_error() == Some(5) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(output)
+    });
+    let status = child.wait()?;
+    let output = reader.join().map_err(|_| "PTY reader panicked")??;
+    Ok((status, output))
+}
+
+fn assert_no_sgr(output: &[u8]) {
+    let mut index = 0;
+    while index + 1 < output.len() {
+        if output[index] != b'\x1b' || output[index + 1] != b'[' {
+            index += 1;
+            continue;
+        }
+        let Some(final_offset) = output[index + 2..]
+            .iter()
+            .position(|byte| (0x40..=0x7e).contains(byte))
+        else {
+            break;
+        };
+        let final_byte = output[index + 2 + final_offset];
+        assert_ne!(final_byte, b'm', "ANSI SGR color sequence leaked");
+        index += final_offset + 3;
+    }
+}
+
+fn assert_static_lifecycle_output(stderr: &str, initial: &str, completion: &str) {
+    assert!(stderr.contains(&format!("{initial}\n")));
+    assert!(stderr.contains(&format!("{completion}\n")));
+    for raw in [
+        "operation",
+        "before_provision",
+        "after_provision",
+        "provision_step",
+    ] {
+        assert!(!stderr.contains(raw), "raw phase leaked: {raw}");
+    }
+    assert!(!stderr.contains('\u{1b}'));
+}
+
 #[test]
 fn complete_cli_lifecycle_uses_daemon_api() -> TestResult {
     let env = Environment::new()?;
-    assert!(env.invoke(&["up", env.root()?])?.status.success());
+    let up = env.invoke(&["up", env.root()?])?;
+    assert!(
+        up.status.success(),
+        "up failed: {}",
+        String::from_utf8_lossy(&up.stderr)
+    );
+    let stderr = String::from_utf8(up.stderr)?;
+    assert!(stderr.contains("Preparing sandbox\n"));
+    assert!(stderr.contains("Validating configuration\n"));
+    assert!(stderr.contains("Sandbox is running\n"));
+    for raw in [
+        "operation",
+        "before_provision",
+        "after_provision",
+        "provision_step",
+    ] {
+        assert!(!stderr.contains(raw), "raw phase leaked: {raw}");
+    }
+    assert!(!stderr.contains('\u{1b}'));
+    let running = env.invoke(&["status", "--json"])?;
+    let sandbox_id = serde_json::from_slice::<serde_json::Value>(&running.stdout)?["sandbox_id"]
+        .as_str()
+        .ok_or("sandbox id missing")?
+        .to_owned();
     assert_eq!(
         env.invoke(&["run", "--", "fake-exit", "42"])?.status.code(),
         Some(42)
@@ -182,13 +268,54 @@ fn complete_cli_lifecycle_uses_daemon_api() -> TestResult {
             .filter(|line| !line.is_empty())
             .all(|line| serde_json::from_slice::<serde_json::Value>(line).is_ok())
     );
-    assert!(env.invoke(&["down"])?.status.success());
+    let down = env.invoke(&["down"])?;
+    assert!(down.status.success());
+    assert_static_lifecycle_output(
+        &String::from_utf8(down.stderr)?,
+        "Stopping sandbox",
+        &format!("Sandbox {sandbox_id} is stopped"),
+    );
     let status = env.invoke(&["status", "--json"])?;
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&status.stdout)?["actual_state"],
         "stopped"
     );
-    assert!(env.invoke(&["destroy", "--yes"])?.status.success());
+    let destroy = env.invoke(&["destroy", "--yes"])?;
+    assert!(destroy.status.success());
+    assert_static_lifecycle_output(
+        &String::from_utf8(destroy.stderr)?,
+        "Destroying sandbox",
+        &format!("Sandbox {sandbox_id} is destroyed"),
+    );
+    Ok(())
+}
+
+#[test]
+fn interactive_lifecycle_progress_updates_in_place_and_finishes_cleanly() -> TestResult {
+    let env = Environment::new()?;
+    assert!(env.invoke(&["doctor", "--json"])?.status.success());
+    for no_color in [false, true] {
+        let (status, output) = invoke_with_stderr_pty(&env, &["up", env.root()?], no_color)?;
+        assert!(status.success());
+        let stderr = String::from_utf8(output)?;
+        assert!(
+            stderr
+                .chars()
+                .any(|character| { "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(character) })
+        );
+        assert!(stderr.contains("Preparing sandbox"));
+        assert!(stderr.contains("Validating configuration"));
+        assert!(stderr.contains("Starting sandbox"));
+        assert!(stderr.contains('\r') || stderr.contains("\u{1b}["));
+        assert!(
+            console::strip_ansi_codes(&stderr).ends_with("✓ Sandbox is running\r\n"),
+            "unexpected PTY transcript: {}",
+            stderr.escape_debug()
+        );
+        if no_color {
+            assert_no_sgr(stderr.as_bytes());
+        }
+    }
     Ok(())
 }
 

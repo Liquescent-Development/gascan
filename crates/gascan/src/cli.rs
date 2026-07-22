@@ -1,4 +1,5 @@
 use crate::client::{Client, ClientError};
+use crate::presentation::{OperationKind, OperationProgress, OutputCapabilities};
 use crate::terminal::RawTerminal;
 use clap::{Parser, Subcommand};
 use gascan_proto::v1;
@@ -174,6 +175,8 @@ pub async fn execute() -> Result<i32, CliError> {
                     .await?
                     .into_inner(),
                 json,
+                OperationKind::Up,
+                None,
             )
             .await
         }
@@ -189,11 +192,14 @@ pub async fn execute() -> Result<i32, CliError> {
                     .await?
                     .into_inner(),
                 json,
+                OperationKind::Apply,
+                None,
             )
             .await
         }
         Command::Down { json } => {
             let selector = selector(&mut client, arguments.sandbox).await?;
+            let sandbox_id = Some(selector.sandbox_id.clone());
             operation(
                 client
                     .api
@@ -203,6 +209,8 @@ pub async fn execute() -> Result<i32, CliError> {
                     .await?
                     .into_inner(),
                 json,
+                OperationKind::Down,
+                sandbox_id,
             )
             .await
         }
@@ -211,6 +219,7 @@ pub async fn execute() -> Result<i32, CliError> {
                 confirm_destroy()?;
             }
             let selector = selector(&mut client, arguments.sandbox).await?;
+            let sandbox_id = Some(selector.sandbox_id.clone());
             operation(
                 client
                     .api
@@ -220,6 +229,8 @@ pub async fn execute() -> Result<i32, CliError> {
                     .await?
                     .into_inner(),
                 json,
+                OperationKind::Destroy,
+                sandbox_id,
             )
             .await
         }
@@ -317,46 +328,44 @@ async fn selector(
     }
 }
 
-fn event_phase_label(event: &v1::OperationEvent) -> Option<String> {
-    if event.phase.is_empty() {
-        return None;
-    }
-    if event.phase != "provision_step" {
-        return Some(event.phase.clone());
-    }
-    let step = match v1::ProvisionStep::try_from(event.provision_step).ok()? {
-        v1::ProvisionStep::WriteSafeMiseConfig => "write_safe_mise_config",
-        v1::ProvisionStep::InstallTools => "install_tools",
-        v1::ProvisionStep::RunSetup => "run_setup",
-        v1::ProvisionStep::VerifyGascamp => "verify_gascamp",
-        v1::ProvisionStep::HealthCheck => "health_check",
-        v1::ProvisionStep::Unspecified => return Some(event.phase.clone()),
-    };
-    Some(format!("{}: {step}", event.phase))
-}
-
 async fn operation(
     mut stream: tonic::Streaming<v1::OperationEvent>,
     json: bool,
+    kind: OperationKind,
+    sandbox_id: Option<String>,
 ) -> Result<i32, CliError> {
-    while let Some(event) = stream.message().await? {
-        if json {
+    if json {
+        while let Some(event) = stream.message().await? {
             println!(
                 "{}",
                 serde_json::json!({"operation_id":event.operation_id.map(|id|id.value),"sequence":event.sequence,"phase":event.phase,"status":event.status,"error":event.error.as_ref().map(|error|serde_json::json!({"code":error.code,"message":error.message}))})
             );
+            if event.error.is_some() {
+                return Ok(EXIT_RUNTIME);
+            }
         }
+        return Ok(0);
+    }
+
+    let (mut progress, initial) =
+        OperationProgress::new(kind, sandbox_id, OutputCapabilities::for_stderr());
+    if let Some(line) = initial {
+        writeln!(std::io::stderr(), "{line}")?;
+    }
+    while let Some(event) = stream.message().await? {
         if let Some(error) = event.error {
+            progress.clear();
             return Err(CliError::Runtime(format!(
                 "{}: {}",
                 error.code, error.message
             )));
         }
-        if !json {
-            if let Some(label) = event_phase_label(&event) {
-                eprintln!("{label}");
-            }
+        if let Some(line) = progress.update(&event) {
+            writeln!(std::io::stderr(), "{line}")?;
         }
+    }
+    if let Some(line) = progress.finish_success() {
+        writeln!(std::io::stderr(), "{line}")?;
     }
     Ok(0)
 }
@@ -664,26 +673,6 @@ fn confirm_destroy() -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn provisioning_phase_renders_only_the_stable_step_identifier() {
-        let event = v1::OperationEvent {
-            phase: "provision_step".to_owned(),
-            provision_step: v1::ProvisionStep::WriteSafeMiseConfig as i32,
-            payload: br#"{"step":"write_safe_mise_config","secret":"must-not-render"}"#.to_vec(),
-            ..Default::default()
-        };
-
-        assert_eq!(
-            event_phase_label(&event).as_deref(),
-            Some("provision_step: write_safe_mise_config")
-        );
-        assert!(
-            !event_phase_label(&event)
-                .unwrap_or_default()
-                .contains("secret")
-        );
-    }
 
     #[test]
     fn relative_roots_resolve_against_this_process() -> Result<(), Box<dyn std::error::Error>> {

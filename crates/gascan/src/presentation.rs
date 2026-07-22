@@ -3,7 +3,7 @@
 
 use console::Term;
 use gascan_proto::v1;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,6 +58,8 @@ impl OutputCapabilities {
 pub(crate) struct OperationProgress {
     kind: OperationKind,
     sandbox_id: Option<String>,
+    color: bool,
+    return_interactive_completion: bool,
     progress_bar: Option<ProgressBar>,
     last_message: Option<&'static str>,
 }
@@ -68,14 +70,37 @@ impl OperationProgress {
         sandbox_id: Option<String>,
         capabilities: OutputCapabilities,
     ) -> (Self, Option<String>) {
+        let draw_target = capabilities
+            .interactive
+            .then(|| ProgressDrawTarget::term_like_with_hz(Box::new(console::Term::stderr()), 12));
+        Self::create(kind, sandbox_id, capabilities, draw_target, true)
+    }
+
+    pub(crate) fn with_draw_target(
+        kind: OperationKind,
+        sandbox_id: Option<String>,
+        capabilities: OutputCapabilities,
+        draw_target: ProgressDrawTarget,
+    ) -> (Self, Option<String>) {
+        let draw_target = capabilities.interactive.then_some(draw_target);
+        Self::create(kind, sandbox_id, capabilities, draw_target, false)
+    }
+
+    fn create(
+        kind: OperationKind,
+        sandbox_id: Option<String>,
+        capabilities: OutputCapabilities,
+        draw_target: Option<ProgressDrawTarget>,
+        return_interactive_completion: bool,
+    ) -> (Self, Option<String>) {
         let initial = match kind {
             OperationKind::Up => "Preparing sandbox",
             OperationKind::Apply => "Applying configuration",
             OperationKind::Down => "Stopping sandbox",
             OperationKind::Destroy => "Destroying sandbox",
         };
-        let progress_bar = capabilities.interactive.then(|| {
-            let progress_bar = ProgressBar::new_spinner();
+        let progress_bar = draw_target.map(|draw_target| {
+            let progress_bar = ProgressBar::with_draw_target(None, draw_target);
             let template = if capabilities.color {
                 "{spinner:.cyan} {msg}"
             } else {
@@ -98,6 +123,8 @@ impl OperationProgress {
             Self {
                 kind,
                 sandbox_id,
+                color: capabilities.color,
+                return_interactive_completion,
                 progress_bar,
                 last_message: Some(initial),
             },
@@ -156,8 +183,19 @@ impl OperationProgress {
         };
 
         if let Some(progress_bar) = self.progress_bar.take() {
-            progress_bar.finish_with_message(completion);
-            None
+            let check = if self.color {
+                "\u{1b}[32m✓\u{1b}[0m"
+            } else {
+                "✓"
+            };
+            progress_bar.finish_and_clear();
+            let completion = format!("{check} {completion}");
+            if self.return_interactive_completion {
+                Some(completion)
+            } else {
+                progress_bar.println(completion);
+                None
+            }
         } else {
             Some(completion)
         }
@@ -170,10 +208,17 @@ impl OperationProgress {
     }
 }
 
+impl Drop for OperationProgress {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use gascan_proto::v1;
+    use indicatif::{InMemoryTerm, ProgressDrawTarget};
     use std::process::Command;
 
     fn event(phase: &str) -> v1::OperationEvent {
@@ -272,6 +317,65 @@ mod tests {
             progress.finish_success().as_deref(),
             Some("Sandbox code-123 is stopped")
         );
+    }
+
+    #[test]
+    fn interactive_progress_replaces_message_and_finishes_with_checkmark() {
+        let terminal = InMemoryTerm::new(4, 80);
+        let capabilities = OutputCapabilities {
+            interactive: true,
+            color: false,
+            unicode: true,
+        };
+        let (mut progress, initial) = OperationProgress::with_draw_target(
+            OperationKind::Up,
+            None,
+            capabilities,
+            ProgressDrawTarget::term_like_with_hz(Box::new(terminal.clone()), 12),
+        );
+        assert_eq!(initial, None);
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(terminal.contents().contains("Preparing sandbox"));
+        assert!(
+            terminal
+                .contents()
+                .chars()
+                .any(|character| { "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(character) })
+        );
+
+        assert_eq!(progress.update(&event("validated")), None);
+        std::thread::sleep(Duration::from_millis(100));
+        let updated = terminal.contents();
+        assert!(updated.contains("Validating configuration"));
+        assert!(!updated.contains("Preparing sandbox"));
+        assert_eq!(updated.lines().count(), 1);
+
+        assert_eq!(progress.finish_success(), None);
+        assert_eq!(terminal.contents(), "✓ Sandbox is running");
+    }
+
+    #[test]
+    fn interactive_progress_clears_on_drop_without_completion() {
+        let terminal = InMemoryTerm::new(4, 80);
+        let capabilities = OutputCapabilities {
+            interactive: true,
+            color: false,
+            unicode: true,
+        };
+        let (progress, initial) = OperationProgress::with_draw_target(
+            OperationKind::Destroy,
+            Some("code-123".to_owned()),
+            capabilities,
+            ProgressDrawTarget::term_like_with_hz(Box::new(terminal.clone()), 12),
+        );
+        assert_eq!(initial, None);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!terminal.contents().is_empty());
+
+        drop(progress);
+
+        assert_eq!(terminal.contents(), "");
     }
 
     #[test]
