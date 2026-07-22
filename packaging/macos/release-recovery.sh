@@ -38,6 +38,7 @@ gascan_report_live_release() {
     printf '  #   git -C %s pull --ff-only origin main\n' "$tap"
     # render-cask.sh rejects a checksum that is not 64 hex characters, so name
     # the placeholder rather than emitting a command that pastes and fails.
+    printf '  mkdir -p %s/Casks\n' "$tap"
     printf '  %s/packaging/macos/render-cask.sh %s %s > %s/Casks/gascan.rb\n' \
       "$repo" "$version" "${sum:-<sha256-printed-above>}" "$tap"
   fi

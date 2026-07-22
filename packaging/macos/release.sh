@@ -117,9 +117,10 @@ restore_ref() {
 # Once publish.sh returns, the GitHub release is public and cannot be undone
 # safely -- the documented recovery deletes a release, and an operator reaching
 # for it lands one flag away from deleting the signed tag too. So every failure
-# after that point has to say the release is already live and hand over the two
-# values needed to finish the cask by hand, which the success path would
-# otherwise be the only place to print.
+# after that point has to say the release is already live and hand over the
+# checksum the cask is built from, which the success path would otherwise be
+# the only place to print. The asset URL goes with it as confirmation of what
+# was published; render-cask.sh derives its own URL from the version.
 release_is_live=false
 published=
 asset_url=
@@ -177,23 +178,22 @@ else
     GASCAN_NOTARYTOOL_PROFILE="$notary_profile" \
       "$repo_root/packaging/macos/package.sh"
   )
-  # One call, not a hand-rolled trio. `pkgutil --check-signature` alone exits 0
-  # for a package signed by any certificate at all, so a trio built from it
-  # would claim more than it proves; this pins the Developer ID Installer
-  # certificate and the team, and asserts the exact payload. The reuse branch
-  # does not repeat it -- reuse is conditional on this same call having just
-  # passed for this same file, and it expands the package and verifies three
-  # signatures each time it runs.
-  gascan_assert_distributable_package "$package" "$GASCAN_RELEASE_TEAM" || exit 65
 fi
+# No distributability check here. publish.sh runs
+# `gascan_assert_distributable_package` as its first action, before it touches
+# gh at all, so a second call buys no earlier failure and pays another package
+# expansion and three signature verifications on every release. The reuse
+# branch above still calls it, because there it is the reuse predicate rather
+# than a repeat.
 
 published=$("$repo_root/packaging/macos/publish.sh" "$package")
 release_is_live=true
 # publish.sh's stdout is a two-line contract: asset URL, then SHA-256. Assert
 # the shape rather than trusting positions. `gh release upload` inside it does
 # not redirect its own stdout, so a future gh that chatters there would shift
-# both lines, and a shifted URL ships a cask that breaks every install while
-# the release itself looks fine.
+# both lines, putting the URL where the checksum belongs. The checksum is what
+# the cask is built from -- render-cask.sh derives the URL itself -- so the
+# shape check is what stands between chatter and a wrong digest.
 published_lines=$(grep -c '' <<<"$published")
 [[ $published_lines -eq 2 ]] || {
   printf 'publish.sh printed %s lines, expected the asset URL then the SHA-256:\n%s\n' \
@@ -272,5 +272,6 @@ git -C "$tap_path" push --quiet origin main
 
 printf '\nreleased %s\n' "$version"
 gascan_print_release_values "$asset_url" "$checksum"
-printf '  cask:   %s\n' "$(git -C "$tap_path" rev-parse --short HEAD)"
+cask_revision=$(git -C "$tap_path" rev-parse --short HEAD)
+printf '  cask:   %s\n' "$cask_revision"
 printf '  verify: brew update && brew upgrade --cask gascan\n'

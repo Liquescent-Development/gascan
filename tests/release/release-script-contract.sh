@@ -217,6 +217,7 @@ grep -Fq "git -C $tap pull --ff-only origin main" <<<"$behind" || {
 
 release=$repo_root/packaging/macos/release.sh
 [[ -x $release ]] || { printf 'release.sh is not executable\n' >&2; exit 1; }
+recovery=$repo_root/packaging/macos/release-recovery.sh
 
 if "$release" >/dev/null 2>&1; then
   printf 'missing version accepted\n' >&2; exit 1
@@ -357,14 +358,14 @@ done <"$GASCAN_STUB_LOG"
 # signed tag from the remote. The gates deliberately *warn* about the flag in
 # prose, which is the line that stops an operator destroying their own tag, so
 # assert the dangerous construction rather than the string.
-for f in "$release" "$gates"; do
+for f in "$release" "$gates" "$recovery"; do
   if grep -Eq 'gh release delete.*--cleanup-tag' "$f"; then
     printf '%s would delete a tag via --cleanup-tag\n' "$f" >&2; exit 1
   fi
 done
 
 # No hardcoded identity, team identifier, or profile.
-for f in "$release" "$gates" "$config"; do
+for f in "$release" "$gates" "$config" "$recovery"; do
   if grep -Eq 'Developer ID (Application|Installer): [A-Za-z]|\([A-Z0-9]{10}\)' "$f"; then
     printf 'hardcoded signing identity or team identifier in %s\n' "$f" >&2
     exit 1
@@ -397,15 +398,16 @@ grep -Fq 'gascan_report_live_release' "$release" || {
 # look like a failure. `local status=` is how it would most likely reappear.
 # Written as an `if` so an absent pattern -- the passing case -- does not trip
 # `set -e`.
-if grep -Eq '(^|[[:space:]])(local|declare|readonly|typeset)?[[:space:]]*status=' "$release"; then
-  printf 'release.sh assigns a variable named status\n' >&2
-  exit 1
-fi
+for f in "$release" "$recovery"; do
+  if grep -Eq '(^|[[:space:]])(local|declare|readonly|typeset)?[[:space:]]*status=' "$f"; then
+    printf '%s assigns a variable named status\n' "$f" >&2
+    exit 1
+  fi
+done
 
 # The recovery narrator, exercised directly. It runs only when a release is
 # already public, so without this it would be covered by a single grep -- and
 # the defects found in it so far were exactly the kind a grep cannot see.
-recovery=$repo_root/packaging/macos/release-recovery.sh
 [[ -r $recovery ]] || { printf 'release-recovery.sh is not readable\n' >&2; exit 1; }
 grep -Fq 'already published' "$recovery" || {
   printf 'the recovery never warns that the release is already published\n' >&2
