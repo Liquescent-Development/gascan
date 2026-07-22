@@ -58,7 +58,20 @@ base=$(basename "$package")
 }
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/gascan-publish.XXXXXX")
-trap 'rm -rf "$work"' EXIT
+# Written immediately before the draft flip and removed immediately after, so
+# an interruption in between -- SIGINT included -- leaves it behind. The EXIT
+# trap checks for it with a file test only: asking GitHub from inside a trap
+# would be an unbounded network call at the moment an interrupted publish
+# most needs to exit.
+pending_marker="$work/.pending"
+on_publish_exit() {
+  local exit_code=$?
+  [[ -f $pending_marker ]] && printf \
+    'publish was interrupted during the draft flip -- check GitHub before deleting anything\n' >&2
+  rm -rf "$work"
+  return $exit_code
+}
+trap on_publish_exit EXIT
 pkgutil --expand "$package" "$work/pkg"
 mkdir "$work/root"
 (cd "$work/root" && gzip -dc "$work/pkg/Payload" | cpio -idm --quiet)
@@ -88,14 +101,22 @@ EOF_NOTES
 gh release create "$tag" --draft --title "Gas Can $version" --notes-file "$work/notes.md" \
   --verify-tag --target "$revision" >/dev/null
 gh release upload "$tag" \
-  "$package" "$work/$base.sha256" "$work/build-manifest.json"
+  "$package" "$work/$base.sha256" "$work/build-manifest.json" >/dev/null
 assets=$(gh release view "$tag" --json assets --jq '[.assets[].name] | sort | join(",")')
 expected=$(gascan_expected_release_assets "$base")
 [[ $assets == "$expected" ]] || {
   printf 'release assets are incomplete: %s\n' "$assets" >&2
   exit 65
 }
+: >"$pending_marker"
 gh release edit "$tag" --draft=false >/dev/null
+rm -f "$pending_marker"
+# Record that the release is public the instant it becomes public. release.sh
+# reads this from its EXIT trap, where asking GitHub would mean an unbounded
+# network call at the moment an interrupted run most needs to exit.
+marker=$(gascan_published_marker "$package" "$version")
+: >"$marker" || printf 'the release is public but the marker could not be written: %s\n' \
+  "$marker" >&2
 
 printf 'https://github.com/Liquescent-Development/gascan/releases/download/%s/%s\n' "$tag" "$base"
 printf '%s\n' "$checksum"

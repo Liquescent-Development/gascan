@@ -12,3 +12,11 @@ target/
 # so running the tests made packaging refuse to build a release.
 # Scoped deliberately: the workspace Cargo.lock is a tracked release input.
 crates/gascan-apple/tests/fixtures/fake-attach-helper/Cargo.lock
+
+# A global gitignore may carry a Visual Studio build-output pattern such as
+# [Rr]elease/, which would silently ignore new files in these tracked
+# directories. A new release contract test would then fail to commit and never
+# run in the gate. Repository rules override the global file, so re-include
+# them explicitly.
+!docs/release/
+!tests/release/

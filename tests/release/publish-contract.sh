@@ -8,6 +8,15 @@ trap 'rm -rf "$fixture"' EXIT
 publish=$repo_root/packaging/macos/publish.sh
 [[ -x $publish ]] || { printf 'publish.sh is not executable\n' >&2; exit 1; }
 
+# The behavioral cases below run publish.sh from a `git clone` at HEAD -- the
+# gate that needs a real signed tag pointing at HEAD requires it -- while the
+# source-text assertions in this file (`grep` against `$publish`) read the
+# working tree directly. The two can diverge: an uncommitted edit to
+# publish.sh is checked by the source greps but not exercised by any
+# behavioral case here until it is committed. A revert-and-prove demonstration
+# against an uncommitted change should not trust a green run of this file
+# alone for that reason.
+
 # usage
 if "$publish" 2>/dev/null; then
   printf 'missing argument accepted\n' >&2
@@ -38,8 +47,19 @@ set -euo pipefail
 printf '%s\n' "$*" >>"${GASCAN_STUB_GH_LOG:?}"
 case "${1:-} ${2:-}" in
   'release view')
+    if [[ " $* " == *' --json '* ]]; then
+      printf '%s\n' "${GASCAN_STUB_GH_ASSETS:?}"
+      exit 0
+    fi
     [[ ${GASCAN_STUB_GH_EXISTING:-no} == yes ]] && exit 0
     exit 1 ;;
+  'release upload')
+    # Real gh is suspected to gate this on a TTY, but that cannot be proven
+    # without a live release. Chatter here regardless, so the assertion below
+    # verifies publish.sh's own redirect, not gh's behavior.
+    printf 'Uploading gascan.pkg 100%%\n' ;;
+  'release edit')
+    [[ ${GASCAN_STUB_GH_FAIL_EDIT:-no} == yes ]] && exit 1 ;;
 esac
 exit 0
 STUB
@@ -264,6 +284,144 @@ if [[ "$(cat "$GASCAN_STUB_GH_LOG")" != "release view $tag" ]]; then
   exit 1
 fi
 
+# Case D: the full happy path, distributable gate bypassed exactly as Case C
+# and no existing release, so publish.sh runs all the way through. The stub
+# gh chatters on `release upload`'s stdout, the same way the real CLI's
+# progress message is suspected to -- unprovable without a live release --
+# so this is what proves publish.sh's own stdout stays exactly the asset URL
+# then the SHA-256 regardless. This is the producing side of that two-line
+# contract release.sh asserts; every other publish.sh invocation in this file
+# is a failing case captured with `2>&1 >/dev/null`, so nothing tested it
+# before.
+: >"$GASCAN_STUB_GH_LOG"
+export GASCAN_STUB_TRUST_BYPASS=yes
+export GASCAN_STUB_FIXTURE_PKG=$fixture_pkg
+export GASCAN_STUB_TEAM=$team
+export GASCAN_STUB_GH_EXISTING=no
+base_name=$(basename "$fixture_pkg")
+export GASCAN_STUB_GH_ASSETS="build-manifest.json,$base_name,$base_name.sha256"
+set +e
+case_d_out=$(PATH=$stub_bin:$PATH "$clone/packaging/macos/publish.sh" "$fixture_pkg")
+case_d_status=$?
+set -e
+unset GASCAN_STUB_TRUST_BYPASS GASCAN_STUB_FIXTURE_PKG GASCAN_STUB_TEAM \
+  GASCAN_STUB_GH_EXISTING GASCAN_STUB_GH_ASSETS
+if [[ $case_d_status -ne 0 ]]; then
+  printf 'Case D: publish failed on the happy path:\n%s\n' "$case_d_out" >&2
+  exit 1
+fi
+case_d_lines=$(grep -c '' <<<"$case_d_out")
+[[ $case_d_lines -eq 2 ]] || {
+  printf 'Case D: expected exactly two stdout lines, got %s:\n%s\n' \
+    "$case_d_lines" "$case_d_out" >&2
+  exit 1
+}
+case_d_url=$(sed -n '1p' <<<"$case_d_out")
+case_d_sum=$(sed -n '2p' <<<"$case_d_out")
+[[ $case_d_url == https://github.com/*/releases/download/*/* ]] || {
+  printf 'Case D: first line is not an asset-URL shape: %s\n' "$case_d_url" >&2
+  exit 1
+}
+[[ $case_d_sum =~ ^[0-9a-f]{64}$ ]] || {
+  printf 'Case D: second line is not 64 hex characters: %s\n' "$case_d_sum" >&2
+  exit 1
+}
+# A successful publish records the instant the release becomes public, beside
+# the package: local, immediate, and interrupt-proof, which release.sh reads
+# from its EXIT trap instead of asking GitHub there.
+published_marker="$fixture/$tag.published"
+[[ -f $published_marker ]] || {
+  printf 'Case D: publish left no %s beside the package\n' "$tag.published" >&2
+  exit 1
+}
+
+# Case E: the artifact directory cannot be written, so the marker-write
+# announcement fires but publish.sh still succeeds and the two-line stdout
+# contract survives. Covers the `||` after `: >"$marker"`: dropped, this
+# would abort under `set -e` instead of continuing to print the release.
+readonly_dir=$fixture/readonly-artifacts
+mkdir -p "$readonly_dir"
+cp "$fixture_pkg" "$readonly_dir/"
+readonly_pkg=$readonly_dir/$base_name
+chmod 500 "$readonly_dir"
+: >"$GASCAN_STUB_GH_LOG"
+export GASCAN_STUB_TRUST_BYPASS=yes
+export GASCAN_STUB_FIXTURE_PKG=$readonly_pkg
+export GASCAN_STUB_TEAM=$team
+export GASCAN_STUB_GH_EXISTING=no
+export GASCAN_STUB_GH_ASSETS="build-manifest.json,$base_name,$base_name.sha256"
+set +e
+case_e_out=$(PATH=$stub_bin:$PATH "$clone/packaging/macos/publish.sh" "$readonly_pkg" 2>&1)
+case_e_status=$?
+set -e
+chmod 700 "$readonly_dir"
+unset GASCAN_STUB_TRUST_BYPASS GASCAN_STUB_FIXTURE_PKG GASCAN_STUB_TEAM \
+  GASCAN_STUB_GH_EXISTING GASCAN_STUB_GH_ASSETS
+[[ $case_e_status -eq 0 ]] || {
+  printf 'Case E: publish failed when the marker directory was unwritable:\n%s\n' \
+    "$case_e_out" >&2
+  exit 1
+}
+grep -Fq 'the marker could not be written' <<<"$case_e_out" || {
+  printf 'Case E: no announcement when the marker write failed: %s\n' "$case_e_out" >&2
+  exit 1
+}
+
+# Case F: the draft flip itself fails. The `.pending` marker is written just
+# before `gh release edit --draft=false` and removed just after, so its mere
+# presence when the EXIT trap runs means the flip's outcome is unknown --
+# exactly the ambiguity a SIGINT landing at that instant would also leave.
+# Forcing the edit call to fail exercises the same trap path deterministically,
+# without racing a real signal against it.
+: >"$GASCAN_STUB_GH_LOG"
+export GASCAN_STUB_TRUST_BYPASS=yes
+export GASCAN_STUB_FIXTURE_PKG=$fixture_pkg
+export GASCAN_STUB_TEAM=$team
+export GASCAN_STUB_GH_EXISTING=no
+export GASCAN_STUB_GH_ASSETS="build-manifest.json,$base_name,$base_name.sha256"
+export GASCAN_STUB_GH_FAIL_EDIT=yes
+set +e
+case_f_out=$(PATH=$stub_bin:$PATH "$clone/packaging/macos/publish.sh" "$fixture_pkg" 2>&1 >/dev/null)
+case_f_status=$?
+set -e
+unset GASCAN_STUB_TRUST_BYPASS GASCAN_STUB_FIXTURE_PKG GASCAN_STUB_TEAM \
+  GASCAN_STUB_GH_EXISTING GASCAN_STUB_GH_ASSETS GASCAN_STUB_GH_FAIL_EDIT
+[[ $case_f_status -ne 0 ]] || {
+  printf 'Case F: publish succeeded although the draft flip failed\n' >&2
+  exit 1
+}
+grep -Fq 'publish was interrupted during the draft flip -- check GitHub before deleting anything' \
+  <<<"$case_f_out" || {
+  printf 'Case F: no interrupted-flip announcement when the edit call failed: %s\n' \
+    "$case_f_out" >&2
+  exit 1
+}
+# On the successful run captured for Case D, the marker must already be gone
+# by the time the trap runs, or a completed publish would print this same
+# announcement on every success. Case D's own stderr was discarded; recheck
+# with a fresh run, captured this time.
+: >"$GASCAN_STUB_GH_LOG"
+export GASCAN_STUB_TRUST_BYPASS=yes
+export GASCAN_STUB_FIXTURE_PKG=$fixture_pkg
+export GASCAN_STUB_TEAM=$team
+export GASCAN_STUB_GH_EXISTING=no
+export GASCAN_STUB_GH_ASSETS="build-manifest.json,$base_name,$base_name.sha256"
+set +e
+case_g_out=$(PATH=$stub_bin:$PATH "$clone/packaging/macos/publish.sh" "$fixture_pkg" 2>&1 >/dev/null)
+case_g_status=$?
+set -e
+unset GASCAN_STUB_TRUST_BYPASS GASCAN_STUB_FIXTURE_PKG GASCAN_STUB_TEAM \
+  GASCAN_STUB_GH_EXISTING GASCAN_STUB_GH_ASSETS
+[[ $case_g_status -eq 0 ]] || {
+  printf 'Case G: a successful publish unexpectedly failed:\n%s\n' "$case_g_out" >&2
+  exit 1
+}
+if grep -Fq 'publish was interrupted during the draft flip' <<<"$case_g_out"; then
+  printf 'Case G: a successful publish reported an interrupted draft flip: %s\n' \
+    "$case_g_out" >&2
+  exit 1
+fi
+
 # It must never clobber.
 if grep -q -- '--clobber' "$publish"; then
   printf 'publish uses a clobber flag\n' >&2
@@ -292,6 +450,7 @@ grep -Fq '.sha256' "$publish"
 # same `sort | join(",")` jq pipeline as the actual `gh release view` value,
 # never a hand-ordered string — otherwise codepoint sort places
 # build-manifest.json first and the two sides can never be equal.
+# shellcheck disable=SC2016 # single quotes are deliberate: asserting literal source text, not expanding it
 grep -Fq 'gascan_expected_release_assets "$base"' "$publish" || {
   printf 'publish.sh does not derive expected assets from the shared helper\n' >&2
   exit 1
@@ -315,6 +474,28 @@ want_assets='build-manifest.json,gascan-9.9.9-macos-arm64.pkg,gascan-9.9.9-macos
 [[ $observed_assets == "$want_assets" ]] || {
   printf 'expected asset list is not raw sorted text\n  want: %s\n  got:  %s\n' \
     "$want_assets" "$observed_assets" >&2
+  exit 1
+}
+
+# C3: the published marker is derived once, in release-common.sh, and both
+# publish.sh and release.sh call it rather than rebuilding the path inline --
+# the same coupling C1 proves for the expected-asset list. Without this,
+# either side can drift and the suite stays green while release.sh's live-
+# release warning silently never fires.
+release_script=$repo_root/packaging/macos/release.sh
+for f in "$publish" "$release_script"; do
+  # shellcheck disable=SC2016 # single quotes are deliberate: asserting literal source text, not expanding it
+  grep -Fq 'gascan_published_marker "$package" "$version"' "$f" || {
+    printf '%s does not derive the published marker from the shared helper\n' "$f" >&2
+    exit 1
+  }
+done
+# C4: execute the helper directly, the same as C2 does for the asset
+# pipeline -- the only place its actual output is observed.
+observed_marker=$(gascan_published_marker /artifacts/gascan-9.9.9-macos-arm64.pkg 9.9.9)
+[[ $observed_marker == /artifacts/v9.9.9.published ]] || {
+  printf 'published marker path is wrong\n  want: /artifacts/v9.9.9.published\n  got:  %s\n' \
+    "$observed_marker" >&2
   exit 1
 }
 
