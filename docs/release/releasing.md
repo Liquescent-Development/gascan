@@ -179,10 +179,4 @@ gh release view v<version> --json isDraft --jq '.isDraft'
 
 ## Known gaps
 
-- The `--check` cask probe runs `brew style` on a temp file with no `.rb`
-  extension, so brew inspects zero files and the check passes vacuously.
-  Adding the extension does not fix it: outside a tap, brew lints the file as a
-  formula rather than a cask and reports false offences. The `ruby -c` half of
-  the probe is genuine, and the real cask is correctly style-checked inside the
-  tap during the release itself.
 - Nothing in CI runs `tests/release/*` or `shellcheck`. Both are hand-run.

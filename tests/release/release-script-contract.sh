@@ -1010,6 +1010,14 @@ probecheck_brew_calls=$(grep -c '^brew style' "$probecheck_log") || true
   printf 'expected exactly one ruby -c and one brew style call, got %s and %s\n' \
     "$probecheck_ruby_calls" "$probecheck_brew_calls" >&2
   exit 1; }
+# Counting the call is not enough: brew picks its cops from the path. Given a
+# bare temp file it inspects nothing and exits 0, so the probe would pass having
+# asserted nothing at all -- which is exactly what it did before this check
+# existed. Require the path brew actually received to be cask-shaped.
+grep -Eq '^brew style .*/Casks/gascan\.rb$' "$probecheck_log" || {
+  printf 'brew style got a path it will not inspect as a cask: %s\n' \
+    "$(grep '^brew style' "$probecheck_log")" >&2
+  exit 1; }
 
 grep -Eq 'trap .*EXIT' "$release" || {
   printf 'release.sh does not restore the original ref on exit\n' >&2; exit 1; }
