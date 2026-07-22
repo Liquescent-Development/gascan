@@ -175,6 +175,31 @@ if "$release" 1.2.3 --nonsense >/dev/null 2>&1; then
   printf 'unknown flag accepted\n' >&2; exit 1
 fi
 
+# A value-taking flag without a value must say so. Left to `shift 2`, the
+# script aborts under `set -e` with exit 1 and no output at all, which tells an
+# operator who mistyped a flag nothing.
+for incomplete in --codesign-identity --installer-identity --notary-profile \
+  --tap --config; do
+  set +e
+  refused=$("$release" 1.2.3 "$incomplete" 2>&1 >/dev/null)
+  refused_code=$?
+  set -e
+  [[ $refused_code -eq 64 ]] || {
+    printf '%s without a value exited %s, not 64\n' "$incomplete" "$refused_code" >&2
+    exit 1; }
+  grep -Fq 'requires a value' <<<"$refused" || {
+    printf '%s without a value said nothing useful: %s\n' "$incomplete" "$refused" >&2
+    exit 1; }
+  # An empty value is the same mistake wearing a disguise.
+  set +e
+  "$release" 1.2.3 "$incomplete" '' >/dev/null 2>&1
+  empty_code=$?
+  set -e
+  [[ $empty_code -eq 64 ]] || {
+    printf '%s with an empty value exited %s, not 64\n' "$incomplete" "$empty_code" >&2
+    exit 1; }
+done
+
 # A missing required config value stops the run.
 set +e
 unconfigured=$(env -u GASCAN_CODESIGN_IDENTITY -u GASCAN_INSTALLER_SIGNING_IDENTITY \
@@ -206,6 +231,18 @@ STUB_GH
 cat >"$stub_bin/git" <<'STUB_GIT'
 #!/usr/bin/env bash
 printf 'git %s\n' "$*" >>"${GASCAN_STUB_LOG:?}"
+# Refuse the mutation instead of passing it through. `origin` here is a live
+# remote, so an unconditional exec would let a regression create or push a tag
+# for real and only fail the assertion afterwards -- the log scan below runs
+# after the whole run finishes. Read-only subcommands still reach real git,
+# because the gates need its actual output.
+for word in "$@"; do
+  case $word in
+    tag|push|--cleanup-tag)
+      printf 'stub git refused a mutating subcommand: %s\n' "$*" >&2
+      exit 70 ;;
+  esac
+done
 exec /usr/bin/git "$@"
 STUB_GIT
 chmod +x "$stub_bin/gh" "$stub_bin/git"

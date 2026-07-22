@@ -38,14 +38,25 @@ flag_profile=
 flag_tap=
 config_file="${XDG_CONFIG_HOME:-$HOME/.config}/gascan/release.env"
 
+# Called as `require_value "$@"`, so $1 is the flag and $2 its value. Without
+# this, a flag given as the last token leaves `shift 2` nothing to shift, and
+# `set -e` aborts the script with exit 1 and not one word of explanation.
+require_value() {
+  [[ $# -ge 2 && -n $2 ]] || {
+    printf '%s requires a value\n' "$1" >&2
+    usage
+    exit 64
+  }
+}
+
 while [[ $# -gt 0 ]]; do
   case $1 in
     --check) check_only=true; shift;;
-    --codesign-identity) flag_application=${2-}; shift 2;;
-    --installer-identity) flag_installer=${2-}; shift 2;;
-    --notary-profile) flag_profile=${2-}; shift 2;;
-    --tap) flag_tap=${2-}; shift 2;;
-    --config) config_file=${2-}; shift 2;;
+    --codesign-identity) require_value "$@"; flag_application=$2; shift 2;;
+    --installer-identity) require_value "$@"; flag_installer=$2; shift 2;;
+    --notary-profile) require_value "$@"; flag_profile=$2; shift 2;;
+    --tap) require_value "$@"; flag_tap=$2; shift 2;;
+    --config) require_value "$@"; config_file=$2; shift 2;;
     -h|--help) usage; exit 0;;
     -*) printf 'unknown flag: %s\n' "$1" >&2; usage; exit 64;;
     *)
