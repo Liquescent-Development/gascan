@@ -131,6 +131,16 @@ cask template as a probe. Each failure prints the command that fixes it.
 
 Fix and re-run until it prints `all release preconditions pass`.
 
+`release source inputs are not clean` is the one gate whose message does not
+name a fix, because the fix depends on what you changed. It freezes
+`Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `crates`, `helpers`, `proto`,
+`scripts/build-apple-attach-helper.sh`, `packaging/macos`, `LICENSE`, and the
+two `images/workspace` pins — and it counts untracked files, not just modified
+ones, so a stray scratch file under any of those stops the release. Commit,
+stash, or remove it. This is why a change to the release tooling itself cannot
+be made while a release is in flight: the edit dirties an input the release is
+verifying.
+
 ### 4. Release
 
 ```sh
