@@ -210,6 +210,79 @@ async fn real_uds_tonic_lifecycle_request_reaches_sandbox_service() -> TestResul
 }
 
 #[tokio::test]
+async fn rejected_request_details_survive_the_real_transport() -> TestResult {
+    let temp = TempDir::new()?;
+    let runtime_root = temp.path().canonicalize()?;
+    let socket = runtime_root.join("gascan/gascand.sock");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_gascand"))
+        .env("GASCAN_TEST_FAKE_BACKEND", "1")
+        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .env("GASCAN_STATE_PATH", runtime_root.join("state.sqlite3"))
+        .env("GASCAN_IDLE_TIMEOUT_MS", "30000")
+        .spawn()?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !socket.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    let endpoint = tonic::transport::Endpoint::try_from("http://[::]:50051")?;
+    let connect_path = socket.clone();
+    let channel = endpoint
+        .connect_with_connector(service_fn(move |_| {
+            let path = connect_path.clone();
+            async move {
+                tokio::net::UnixStream::connect(path)
+                    .await
+                    .map(hyper_util::rt::TokioIo::new)
+            }
+        }))
+        .await?;
+    let mut client = GasCanClient::new(channel);
+    let handshake = client
+        .handshake(HandshakeRequest {
+            api_major: 1,
+            api_minor: 0,
+            requested_capabilities: Vec::new(),
+        })
+        .await?
+        .into_inner();
+    assert!(handshake.rejection.is_none());
+    let missing = runtime_root.join("no-such-project");
+    let root = missing
+        .to_str()
+        .ok_or("project path is not UTF-8")?
+        .to_owned();
+    let status = client
+        .up(UpRequest {
+            project_root: root.clone(),
+        })
+        .await
+        .err()
+        .ok_or("a missing project root must be rejected before the operation starts")?;
+    assert_eq!(
+        status.message(),
+        gascan_proto::error_code::INVALID_PROJECT_ROOT
+    );
+    let cause = gascan_proto::error_detail::decode_message(status.details())
+        .ok_or("the status details must survive the real transport")?;
+    assert!(
+        cause.contains(&root),
+        "the cause must name the rejected root: {cause}"
+    );
+    let pid = rustix::process::Pid::from_raw(child.id().ok_or("daemon has no process id")? as i32)
+        .ok_or("daemon process id is zero")?;
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM)?;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await??
+            .success()
+    );
+    assert!(!socket.exists());
+    Ok(())
+}
+
+#[tokio::test]
 async fn sigterm_waits_for_active_durable_operation_then_closes_connection() -> TestResult {
     let temp = TempDir::new()?;
     let runtime_root = temp.path().canonicalize()?;

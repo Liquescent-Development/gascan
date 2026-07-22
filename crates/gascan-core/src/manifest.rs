@@ -287,6 +287,26 @@ pub enum ManifestError {
     },
 }
 
+impl ManifestError {
+    /// Whether this failure is about the project root itself (missing, not a
+    /// directory, unreadable) rather than the manifest's content.
+    ///
+    /// `ManifestError` is `#[non_exhaustive]`, so callers outside this crate
+    /// cannot match its variants exhaustively. This match lives here, inside
+    /// the defining crate, so adding a variant without classifying it here
+    /// fails to compile instead of silently reaching a default.
+    pub fn is_project_root_error(&self) -> bool {
+        match self {
+            Self::Io { .. } | Self::RootNotDirectory(_) | Self::NonUtf8Path(_) => true,
+            Self::Parse(_)
+            | Self::UnsupportedVersion { .. }
+            | Self::Invalid(_)
+            | Self::SetupOutsideRoot { .. }
+            | Self::RootMismatch { .. } => false,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawManifest {

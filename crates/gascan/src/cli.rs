@@ -131,6 +131,11 @@ fn resolve_project_root(project_root: &str) -> Result<String, CliError> {
             "cannot use `{project_root}` as a project root: {error}"
         ))
     })?;
+    if !resolved.is_dir() {
+        return Err(CliError::Usage(format!(
+            "cannot use `{project_root}` as a project root: not a directory"
+        )));
+    }
     resolved
         .to_str()
         .map(ToOwned::to_owned)
@@ -774,5 +779,22 @@ mod tests {
     fn an_empty_root_is_rejected() {
         let error = resolve_project_root("").expect_err("an empty root must be rejected");
         assert_eq!(error.exit_code(), super::EXIT_USAGE);
+    }
+
+    #[test]
+    #[allow(
+        clippy::expect_used,
+        reason = "asserting on the Err variant is the test"
+    )]
+    fn a_file_root_is_rejected_locally() -> Result<(), Box<dyn std::error::Error>> {
+        let file = tempfile::NamedTempFile::new()?;
+        let path = file.path().to_str().ok_or("non-UTF-8 fixture")?;
+        let error = resolve_project_root(path).expect_err("a file root must be rejected");
+        assert_eq!(error.exit_code(), super::EXIT_USAGE);
+        assert!(
+            format!("{error}").contains(path),
+            "the message must name the offending path"
+        );
+        Ok(())
     }
 }

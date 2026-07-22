@@ -920,10 +920,17 @@ async fn spec_for_root(project_root: String) -> Result<SandboxSpec, RequestError
     }
     tokio::task::spawn_blocking(move || {
         let manifest = Manifest::load(&root).map_err(|error| {
-            RequestError::invalid(
-                error_code::INVALID_MANIFEST,
-                format!("cannot use {}: {error}", root.join("gascan.toml")),
-            )
+            if error.is_project_root_error() {
+                RequestError::invalid(
+                    error_code::INVALID_PROJECT_ROOT,
+                    format!("cannot use `{root}` as a project root: {error}"),
+                )
+            } else {
+                RequestError::invalid(
+                    error_code::INVALID_MANIFEST,
+                    format!("cannot use `{}`: {error}", root.join("gascan.toml")),
+                )
+            }
         })?;
         let name = manifest
             .name()
@@ -2441,6 +2448,47 @@ mod tests {
                 "a rejected project root must explain itself"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_root_that_is_not_a_directory_is_rejected_as_invalid_project_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let file = tempfile::NamedTempFile::new()?;
+        let root = file.path().to_str().ok_or("non-UTF-8 fixture")?.to_owned();
+        let status = spec_for_root(root)
+            .await
+            .err()
+            .ok_or("a non-directory root must be rejected")?
+            .status();
+        assert_eq!(status.message(), error_code::INVALID_PROJECT_ROOT);
+        let cause = gascan_proto::error_detail::decode_message(status.details())
+            .ok_or("the status must carry a human cause")?;
+        assert!(
+            !cause.contains("gascan.toml"),
+            "a non-directory root must not be blamed on the manifest: {cause}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_missing_root_is_rejected_as_invalid_project_root_not_invalid_manifest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let missing = directory.path().join("does-not-exist");
+        let root = missing.to_str().ok_or("non-UTF-8 fixture")?.to_owned();
+        let status = spec_for_root(root)
+            .await
+            .err()
+            .ok_or("a missing root must be rejected")?
+            .status();
+        assert_eq!(status.message(), error_code::INVALID_PROJECT_ROOT);
+        let cause = gascan_proto::error_detail::decode_message(status.details())
+            .ok_or("the status must carry a human cause")?;
+        assert!(
+            !cause.contains("gascan.toml"),
+            "a missing root must not be blamed on a gascan.toml that does not exist: {cause}"
+        );
         Ok(())
     }
 
