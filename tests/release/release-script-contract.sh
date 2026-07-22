@@ -384,10 +384,15 @@ grep -Eq 'trap .*EXIT' "$release" || {
 grep -Eq 'trap .*INT TERM' "$release" || {
   printf 'release.sh does not name its interrupted exit status\n' >&2; exit 1; }
 # A failure after publish must say the release is already live, because the
-# recovery an operator reaches for otherwise deletes a published release.
-grep -Fq 'already published' "$release" || {
-  printf 'release.sh never warns that the release is already published\n' >&2
-  exit 1; }
+# recovery an operator reaches for otherwise deletes a published release. The
+# warning lives in release-recovery.sh, so assert it there and assert
+# release.sh actually reaches it: a warning nothing calls is no warning, and
+# grepping release.sh for the phrase would be satisfied by any comment that
+# happens to contain it.
+grep -Fq 'release-recovery.sh' "$release" || {
+  printf 'release.sh does not source the recovery\n' >&2; exit 1; }
+grep -Fq 'gascan_report_live_release' "$release" || {
+  printf 'release.sh never calls the recovery\n' >&2; exit 1; }
 # `status` is read-only in zsh and has previously made a successful release
 # look like a failure. `local status=` is how it would most likely reappear.
 # Written as an `if` so an absent pattern -- the passing case -- does not trip
@@ -402,6 +407,9 @@ fi
 # the defects found in it so far were exactly the kind a grep cannot see.
 recovery=$repo_root/packaging/macos/release-recovery.sh
 [[ -r $recovery ]] || { printf 'release-recovery.sh is not readable\n' >&2; exit 1; }
+grep -Fq 'already published' "$recovery" || {
+  printf 'the recovery never warns that the release is already published\n' >&2
+  exit 1; }
 # shellcheck source=/dev/null
 source "$recovery"
 
