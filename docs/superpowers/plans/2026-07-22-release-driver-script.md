@@ -575,6 +575,16 @@ for incomplete in --codesign-identity --installer-identity --notary-profile \
   [[ $empty_code -eq 64 ]] || {
     printf '%s with an empty value exited %s, not 64\n' "$incomplete" "$empty_code" >&2
     exit 1; }
+  # Nor may a flag swallow the flag that follows it. `--config --check` taking
+  # `--check` as a path drops the flag that makes the run read-only.
+  set +e
+  "$release" 1.2.3 "$incomplete" --check >/dev/null 2>&1
+  swallow_code=$?
+  set -e
+  [[ $swallow_code -eq 64 ]] || {
+    printf '%s swallowed the following flag, exiting %s not 64\n' \
+      "$incomplete" "$swallow_code" >&2
+    exit 1; }
 done
 
 # A missing required config value stops the run.
@@ -723,6 +733,14 @@ config_file="${XDG_CONFIG_HOME:-$HOME/.config}/gascan/release.env"
 require_value() {
   [[ $# -ge 2 && -n $2 ]] || {
     printf '%s requires a value\n' "$1" >&2
+    usage
+    exit 64
+  }
+  # A following flag is not a value. `--config --check` would otherwise take
+  # `--check` as the config path and silently drop the flag that makes this run
+  # read-only, turning a rehearsal into a real release.
+  [[ $2 != -* ]] || {
+    printf '%s requires a value, but the next argument is a flag: %s\n' "$1" "$2" >&2
     usage
     exit 64
   }
