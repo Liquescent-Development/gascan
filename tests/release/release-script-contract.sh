@@ -388,6 +388,21 @@ grep -Fq 'cannot push to origin/main' <<<"$unpushable" || {
   exit 1; }
 git -C "$tap" config --unset remote.origin.pushurl
 
+# The name rule must read the *push* URL. A tap-shaped fetch URL with a pushurl
+# pointing elsewhere is the misconfiguration that sends the cask to the wrong
+# repository, and the same-repo check above compares filesystem paths, not URLs,
+# so this rule is the only thing standing in front of it.
+git -C "$tap" config remote.origin.pushurl "$fixture/not-a-tap.git"
+set +e
+badpush=$(gascan_gate_tap "$tap" "$repo_root" 2>&1 >/dev/null)
+badpush_code=$?
+set -e
+[[ $badpush_code -ne 0 ]] || {
+  printf 'a tap whose push URL is not tap-shaped was accepted\n' >&2; exit 1; }
+grep -Fq 'does not look like a Homebrew tap' <<<"$badpush" || {
+  printf 'the name rule did not read the push URL: %s\n' "$badpush" >&2; exit 1; }
+git -C "$tap" config --unset remote.origin.pushurl
+
 # A tap holding a commit the remote does not have must not be told to pull.
 printf 'ahead\n' >>"$tap/README.md"
 git -C "$tap" commit --quiet -am ahead
@@ -820,10 +835,18 @@ done
 # The stale marker from an earlier attempt must be cleared before this run
 # calls publish.sh, or a retry could inherit a marker written by a previous
 # release and report this run's release live before publish.sh ever ran.
+#
+# Asserted by source order, not by behavior: the release path cannot be executed
+# offline, so this pins two literal strings. Renaming the variable or wrapping
+# the publish invocation breaks it with no behavior change -- update it
+# deliberately when that happens.
+#
+# `|| true` on each: an unmatched grep would otherwise abort the script here,
+# under set -e and pipefail, before the diagnostic below could name what failed.
 # shellcheck disable=SC2016 # single quotes are deliberate: asserting literal source text, not expanding it
-clear_marker_line=$(grep -Fn 'rm -f "$published_marker"' "$release" | head -1 | cut -d: -f1)
+clear_marker_line=$(grep -Fn 'rm -f "$published_marker"' "$release" | head -1 | cut -d: -f1) || true
 # shellcheck disable=SC2016 # single quotes are deliberate: asserting literal source text, not expanding it
-publish_call_line=$(grep -Fn 'packaging/macos/publish.sh" "$package"' "$release" | head -1 | cut -d: -f1)
+publish_call_line=$(grep -Fn 'packaging/macos/publish.sh" "$package"' "$release" | head -1 | cut -d: -f1) || true
 [[ -n $clear_marker_line && -n $publish_call_line && $clear_marker_line -lt $publish_call_line ]] || {
   printf 'release.sh does not clear the stale published marker before publishing\n' >&2
   exit 1; }
@@ -979,8 +1002,10 @@ grep -Fq 'gascan-cask-probe' "$probecheck_log" || {
   printf -- '--check never exercised the cask probe through ruby and brew: %s\n' \
     "$(cat "$probecheck_log")" >&2
   exit 1; }
-probecheck_ruby_calls=$(grep -c '^ruby ' "$probecheck_log")
-probecheck_brew_calls=$(grep -c '^brew style' "$probecheck_log")
+# `|| true`: grep -c exits 1 on a zero count, which would abort the script
+# before the diagnostic below could report which call was missing.
+probecheck_ruby_calls=$(grep -c '^ruby ' "$probecheck_log") || true
+probecheck_brew_calls=$(grep -c '^brew style' "$probecheck_log") || true
 [[ $probecheck_ruby_calls -eq 1 && $probecheck_brew_calls -eq 1 ]] || {
   printf 'expected exactly one ruby -c and one brew style call, got %s and %s\n' \
     "$probecheck_ruby_calls" "$probecheck_brew_calls" >&2
