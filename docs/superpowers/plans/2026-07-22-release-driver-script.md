@@ -1591,6 +1591,425 @@ And the `--check` invariance block.
 
 ---
 
+### Task 7: Gate correctness and gate coverage
+
+The remaining five Important findings from the whole-branch review, plus the
+Minor findings that live in the same functions. None blocks a correct release
+the way Task 6's four did; together they are the difference between gates that
+look right and gates that are proven right. Four of the eight gates have no test
+at all, and that is how the Task 6 defect survived controller verification.
+
+**Files:**
+- Modify: `packaging/macos/release-gates.sh`
+- Modify: `packaging/macos/release.sh`
+- Modify: `packaging/macos/release-config.sh`
+- Modify: `packaging/macos/release-recovery.sh`
+- Modify: `packaging/macos/publish.sh`
+- Modify: `tests/release/release-script-contract.sh`
+- Modify: `tests/release/publish-contract.sh`
+
+- [ ] **Step 0a: the Task 6 review's Critical — the discrimination does not discriminate**
+
+Task 6 made `gascan_gate_no_release` branch on `gh release view`'s exit code,
+treating 1 as "not found" and anything else as "could not answer". Measured
+against the installed gh, that does not hold:
+
+```
+$ gh release view v99.99.99                      -> exit 1, "release not found"
+$ GH_TOKEN=<invalid> gh release view v99.99.99    -> exit 1, "non-200 OK status code: 401 Unauthorized ... Bad credentials"
+$ GH_HOST=<unreachable> gh release view v99.99.99 -> exit 1, a remote-mismatch message
+```
+
+All three exit 1, so an expired token and an unreachable host still take the
+`return 0` branch and still read as "no release exists" — the exact sentence
+the new comment says must never happen. Exit 4 (no credentials at all) is the
+only code reaching the new branch, and `gascan_gate_github` already rejects
+that one line earlier, so the branch is unreachable in practice.
+
+The gap that survives both gates: a valid token against a repository it cannot
+see — renamed, transferred, or missing `repo` scope on a private repo.
+`auth status` returns 0, `release view` returns 1, and the run proceeds to
+notarize.
+
+Discriminate on the message, since the exit code cannot:
+
+```bash
+gascan_gate_no_release() {
+  local version=$1 tag="v$1" draft view_code=0 view_err
+  view_err=$(gh release view "$tag" 2>&1 >/dev/null) || view_code=$?
+  # gh exits 1 for "release not found", for HTTP 401, and for an unreachable
+  # host alike, so the exit code alone cannot tell absence from inability.
+  # Only the not-found message means "no release exists".
+  if [[ $view_code -ne 0 ]]; then
+    [[ $view_code -eq 1 && $view_err == *'release not found'* ]] && return 0
+    printf 'could not ask GitHub whether %s already exists (gh exited %s): %s\n' \
+      "$tag" "$view_code" "$view_err" >&2
+    return 65
+  fi
+  draft=$(gh release view "$tag" --json isDraft --jq '.isDraft' 2>/dev/null) || draft=unknown
+  printf 'a release for %s already exists (draft: %s)\n' "$tag" "$draft" >&2
+  printf 'a published release is never overwritten; delete a stranded draft with:\n' >&2
+  printf '  gh release delete %s --yes\n' "$tag" >&2
+  printf 'do not add --cleanup-tag: it deletes the signed tag from the remote\n' >&2
+  return 65
+}
+```
+
+- [ ] **Step 0b: the regression test must model what gh actually emits**
+
+Task 6's stub keys only on an exit code, with `4` as the rejected case and `1`
+as accepted — so it declares acceptable exactly the 401 and network cases that
+are the live bug, and asserts a code real gh does not produce at this gate. The
+assertion can pass forever while the property it names is violated.
+
+Give the stub stderr as well as an exit code, and cover four cases:
+
+- exit 1 with `release not found` — gate **passes**
+- exit 1 with `non-200 OK status code: 401 Unauthorized` — gate **fails**
+  (this one fails before Step 0a and passes after, which is what makes it worth
+  writing)
+- exit 4 with any text — gate **fails**
+- exit 0 — gate **fails**, and the output carries both `gh release delete` and
+  `do not add --cleanup-tag`. That branch prints the warning this whole branch
+  treats as a must-survive invariant and no test has ever covered it.
+
+- [ ] **Step 0c: no unbounded network call inside the EXIT trap**
+
+Task 6's I2 fix asks GitHub, from inside the trap handler, whether the release
+is a draft — with no timeout, at the one moment the operator most wants the
+script to let go. Interactively a second Ctrl-C kills the `gh` child; under
+`kill -TERM` from CI or a wrapper, nothing does and the run hangs. Do not reach
+for `timeout(1)` to bound it: that is GNU coreutils and is absent from a stock
+macOS, so it would be a dependency that silently does nothing here.
+
+Replace the question with a fact publish.sh records. In
+`packaging/macos/publish.sh`, immediately after the draft flip:
+
+```bash
+gh release edit "$tag" --draft=false >/dev/null
+# Record that the release is public the instant it becomes public. release.sh
+# reads this from its EXIT trap, where asking GitHub would mean an unbounded
+# network call at the moment an interrupted run most needs to exit.
+: >"$(dirname "$package")/$tag.published"
+```
+
+In `packaging/macos/release.sh`, derive the same path, clear any stale marker
+before publishing, and test the file rather than calling `gh`:
+
+```bash
+published_marker="$(dirname "$package")/v$version.published"
+rm -f "$published_marker"
+publish_attempted=true
+published=$("$repo_root/packaging/macos/publish.sh" "$package")
+release_is_live=true
+```
+
+```bash
+report_live_release() {
+  if [[ $release_is_live != true && $publish_attempted == true ]]; then
+    [[ -f $published_marker ]] && release_is_live=true
+  fi
+  [[ $release_is_live == true ]] || return 0
+  gascan_report_live_release "$version" "$tap_path" "$repo_root" "$tap_stage" \
+    "$asset_url" "$checksum" "$published" >&2
+}
+```
+
+Local, instant, interrupt-proof — and testable, which the network version was
+not. Assert in `tests/release/publish-contract.sh` that a successful publish
+leaves the marker beside the package.
+
+- [ ] **Step 0d: the recovery must not point at a value that does not exist**
+
+In the case Step 0c exists for — interrupted inside publish — `published`,
+`asset_url` and `checksum` are all empty, so the operator gets
+`publish.sh printed:` followed by a blank line and a render command containing
+`<sha256-printed-above>` when nothing was printed above. The warning itself is
+right and is the main win; the recipe points nowhere.
+
+In `packaging/macos/release-recovery.sh`, when `raw` is empty, say where the
+checksum actually is instead of referring to output that was never produced:
+
+```bash
+  if [[ -n $url && -n $sum ]]; then
+    gascan_print_release_values "$url" "$sum"
+  elif [[ -n $raw ]]; then
+    printf 'publish.sh printed:\n%s\n' "$raw"
+  else
+    printf 'publish.sh printed nothing before it stopped.\n'
+    printf 'the checksum is the release'"'"'s uploaded .sha256 asset, or:\n'
+    printf '  shasum -a 256 <the .pkg in .artifacts/release>\n'
+  fi
+```
+
+and use a placeholder that reads correctly in that case — `<sha256>` rather
+than `<sha256-printed-above>`. Add the empty-`raw` case to the contract's stage
+loop, which today covers only `raw="chatter"`.
+
+- [ ] **Step 0e: assert the new gate is actually called**
+
+`gascan_gate_github` is tested as a function but not as a step of the run:
+deleting its call from `release.sh` breaks no test, because the mutation-scan
+stub `gh` exits 0 for everything. This file already holds the opposite standard
+three lines away — "a warning nothing calls is no warning".
+
+Add `gascan_gate_github` to the contract's needle loop, and have the stubbed
+`--check` run assert it refuses when `gh auth status` fails: make the stub `gh`
+exit non-zero for `auth status` behind an environment flag, run `--check` with
+it set, and require the run to fail naming `gh auth login`.
+
+- [ ] **Step 1: I4 — the tap gate cannot tell a tap from the product repository**
+
+`gascan_gate_tap` requires a directory, a git work tree, clean, on `main`, level
+with `origin/main`, pushable. During a real release the gascan repository itself
+satisfies every one of those — you have just tagged and pushed from `main`. So a
+`GASCAN_TAP_PATH` that is stale, mistyped, or left as `$PWD` passes all eight
+gates, and the release path then writes `Casks/gascan.rb` into the product
+repository, commits it, and pushes it to `origin/main`, after the release is
+public, as the last mutation of the run. An unreviewed push to the product
+repository's default branch from one wrong environment variable.
+
+Give the gate the repository root and refuse it:
+
+```bash
+gascan_gate_tap() {
+  local tap=$1 repo=$2 branch local_head remote_head origin_url
+  [[ -d $tap ]] || {
+    printf 'tap path does not exist: %s\n' "$tap" >&2
+    return 65
+  }
+  [[ $(cd "$tap" && pwd -P) != "$repo" ]] || {
+    printf 'tap path is the gascan repository itself: %s\n' "$tap" >&2
+    printf 'point --tap or GASCAN_TAP_PATH at the Homebrew tap checkout\n' >&2
+    return 65
+  }
+```
+
+and, after the work-tree check, require the remote to name a tap:
+
+```bash
+  origin_url=$(git -C "$tap" remote get-url origin 2>/dev/null) || origin_url=
+  case $origin_url in
+    *homebrew-*|*/tap|*/tap.git) ;;
+    *)
+      printf 'tap origin does not look like a Homebrew tap: %s\n' \
+        "${origin_url:-none}" >&2
+      printf 'a tap repository is conventionally named homebrew-<name>\n' >&2
+      return 65 ;;
+  esac
+```
+
+Update the call in `packaging/macos/release.sh` to
+`gascan_gate_tap "$tap_path" "$repo_root"`, and update the existing tap cases in
+the contract, whose fixture remotes must now be named to match.
+
+- [ ] **Step 2: I5 — the remote-tag check proves a name, not an object**
+
+`gascan_gate_tag` ends with an emptiness test:
+
+```bash
+[[ -n $(git -C "$repo" ls-remote --tags origin "$tag" 2>/dev/null) ]] || { ... }
+```
+
+A remote `v0.1.4` pointing at a different object satisfies it, and
+`gh release create --verify-tag --target "$revision"` then binds the release to
+the *existing remote tag* — `--target` applies only when the tag does not
+already exist. The result is a public release whose tag points at a commit the
+package was not built from, with no error anywhere. Everything else on this
+branch is provenance machinery; this is the one link checked by an emptiness
+test.
+
+Suppressing stderr also turns a network failure into "the tag is not on the
+remote", advising a `git push` that will fail too.
+
+```bash
+  local remote_tag local_tag ls_remote_output
+  ls_remote_output=$(git -C "$repo" ls-remote --tags origin "refs/tags/$tag") || {
+    printf 'could not reach the remote to check for tag %s\n' "$tag" >&2
+    return 65
+  }
+  remote_tag=$(awk 'NR==1{print $1}' <<<"$ls_remote_output")
+  [[ -n $remote_tag ]] || {
+    printf 'release tag %s is not on the remote\n' "$tag" >&2
+    printf 'push it with: git push origin %s\n' "$tag" >&2
+    return 65
+  }
+  local_tag=$(git -C "$repo" rev-parse --verify "refs/tags/$tag") || return 65
+  [[ $remote_tag == "$local_tag" ]] || {
+    printf 'remote tag %s is a different object than the local one (%s vs %s)\n' \
+      "$tag" "${remote_tag:0:9}" "${local_tag:0:9}" >&2
+    printf 'reconcile the tag by hand before releasing\n' >&2
+    return 65
+  }
+```
+
+Comparing tag-object ids rather than peeled commits is the stronger check:
+identical object means identical target *and* identical signature.
+
+- [ ] **Step 3: I8 — four of the eight gates have no test**
+
+The contract exercises `gascan_gate_version`, `gascan_gate_tag`, and
+`gascan_gate_tap`. It never calls `gascan_gate_tools`, `gascan_gate_github`,
+`gascan_gate_no_release`, `gascan_gate_identities`, or `gascan_gate_notary` —
+and the Task 6 defect lived in one of them.
+
+Add behavioral cases, using stub binaries on `PATH` in a subshell so the stubs
+cannot leak into later assertions:
+
+- `gascan_gate_tools` — a `PATH` missing one required command; assert exit 69
+  and that the message names that command.
+- `gascan_gate_github` — a stub `gh` whose `auth status` fails; assert the gate
+  fails and names `gh auth login`.
+- `gascan_gate_no_release` — a stub `gh` for each of: not found (exit 1, gate
+  passes), an existing draft (fails, message says `draft: true`), an existing
+  published release (fails), and a gh that cannot answer (exit 4 — the gate must
+  **fail**, which is the Task 6 regression this locks down). Also assert the
+  `--cleanup-tag` warning appears and that the printed `gh release delete`
+  command does not carry that flag.
+- `gascan_gate_identities` — a stub `security` printing the real
+  `  1) <hash> "<identity>"` shape; assert both identities present passes, and
+  that a missing installer identity fails naming it.
+- `gascan_gate_notary` — a stub `xcrun`: the success marker passes; a non-zero
+  exit fails; and a zero exit whose text lacks
+  `Successfully received submission history` **fails**, which is the gate's real
+  assertion and the reason it does not simply trust the exit code.
+
+- [ ] **Step 4: I6 — the mutation scan reaches four of eight gates**
+
+The stubbed `--check` run stops at `gascan_gate_tag` ("release tag v… does not
+point at HEAD"), so `gascan_gate_no_release`, `gascan_gate_identities`,
+`gascan_gate_notary` and `gascan_gate_tap` are never entered, the `gh` stub is
+never invoked once, and the `push --dry-run` exemptions are dead code. The
+`[[ -s $GASCAN_STUB_LOG ]]` guard written to catch exactly this cannot: gates 2
+and 3 shell out to git, so the log is non-empty. Worse, coverage depends on the
+operator's checkout — on a machine where the tag *is* at HEAD the run proceeds
+further and the test exercises different code. A test whose coverage varies by
+machine is not a contract.
+
+Keep the `release.sh --check` run for the `checkout` assertion, and add a second
+scan that drives the gate functions directly under the stub `PATH`, where every
+one is reachable:
+
+```bash
+: >"$GASCAN_STUB_LOG"
+(
+  PATH=$stub_bin:$PATH
+  gascan_gate_tools >/dev/null 2>&1 || true
+  gascan_gate_version "$repo_root" 99.99.99 >/dev/null 2>&1 || true
+  gascan_gate_tag "$clone" "$probe_version" >/dev/null 2>&1 || true
+  gascan_gate_github >/dev/null 2>&1 || true
+  gascan_gate_no_release 99.99.99 >/dev/null 2>&1 || true
+  gascan_gate_identities x x >/dev/null 2>&1 || true
+  gascan_gate_notary x >/dev/null 2>&1 || true
+  gascan_gate_tap "$tap" "$repo_root" >/dev/null 2>&1 || true
+)
+```
+
+Then replace the emptiness guard with one that names what must appear, so the
+scan can no longer pass by not getting there:
+
+```bash
+grep -Fq 'push --dry-run' "$GASCAN_STUB_LOG" || {
+  printf 'the gate scan never reached the tap gate; it proves nothing\n' >&2
+  exit 1; }
+grep -Fq 'gh release view' "$GASCAN_STUB_LOG" || {
+  printf 'the gate scan never reached the release gate; it proves nothing\n' >&2
+  exit 1; }
+```
+
+and run the existing mutation patterns over this log too.
+
+- [ ] **Step 5: I7 — "nothing is defaulted" is proven for one value of four**
+
+The unconfigured run unsets all four names and asserts the run fails, but
+`release.sh` resolves them in order and aborts on the first miss, so the
+assertion is satisfied entirely by `GASCAN_CODESIGN_IDENTITY`. A default
+silently added to any of the other three would not fail this test.
+
+Assert each independently, which covers the notary profile behaviorally rather
+than by pattern:
+
+```bash
+for missing_name in GASCAN_CODESIGN_IDENTITY GASCAN_INSTALLER_SIGNING_IDENTITY \
+  GASCAN_NOTARYTOOL_PROFILE GASCAN_TAP_PATH; do
+  set +e
+  unset_out=$(env GASCAN_CODESIGN_IDENTITY=x GASCAN_INSTALLER_SIGNING_IDENTITY=x \
+    GASCAN_NOTARYTOOL_PROFILE=x GASCAN_TAP_PATH=x \
+    env -u "$missing_name" \
+    "$release" "$workspace_version" --check --config "$fixture/absent.env" 2>&1 >/dev/null)
+  unset_code=$?
+  set -e
+  [[ $unset_code -ne 0 ]] || {
+    printf '%s was defaulted\n' "$missing_name" >&2; exit 1; }
+  grep -Fq "missing required release configuration: $missing_name" <<<"$unset_out" || {
+    printf '%s was not the value reported missing: %s\n' "$missing_name" "$unset_out" >&2
+    exit 1; }
+done
+```
+
+- [ ] **Step 6: the Minor findings in these same functions**
+
+- `gascan_gate_tools` omits `security`, which `gascan_gate_identities` calls, and
+  `cpio` and `gzip`, which `gascan_assert_distributable_package` and `publish.sh`
+  call. A missing `security` currently reports "could not list keychain
+  identities" rather than naming the absent command. Add all three.
+- `gascan_gate_identities` matches with `grep -Fq "$application"`, a substring
+  test, so a truncated identity string passes and fails later inside `codesign`.
+  `security find-identity -v` prints each identity quoted — `  1) <hash>
+  "<identity>"` — so match the quoted form: `grep -Fq "\"$application\""`. Do
+  **not** switch to `-p codesigning`: that policy filter excludes Developer ID
+  Installer certificates, which are used by `productsign` rather than `codesign`,
+  and would break the installer check.
+- The `status=` scan in the contract covers `release.sh` and
+  `release-recovery.sh` but not `release-gates.sh` or `release-config.sh`, which
+  `release.sh` also sources into the same shell. Add both.
+- The recovery stage loop asserts `rendered`/`staged`/`committed` omit
+  `render-cask.sh` and that `committed` omits `commit -m`, but never asserts
+  `staged` and `committed` omit `git add`. The implementation is right; the
+  assertion does not cover it. Add it.
+- The hostile-config probe writes and tests `/tmp/gascan-config-executed`,
+  outside the fixture, so two concurrent runs race and a stale file from a killed
+  run makes the next run report a false positive. Move it under `$fixture` using
+  an unquoted heredoc so the path interpolates.
+- `packaging/macos/release-config.sh`'s line parser silently misses a `\r` from
+  a CRLF file, a leading space, and an `export ` prefix, and the first duplicate
+  key wins. Failing fast is the right behavior — the error names the exact
+  `NAME=` form — but record it in one comment so the next reader knows it is a
+  decision rather than an oversight.
+- `tests/release/publish-contract.sh` reports SC2016 on two lines that grep for
+  literal source text containing `$base`. The single quotes are correct and
+  required — double-quoting would expand the variable and break the assertion.
+  Add a scoped `# shellcheck disable=SC2016` immediately above each, with a
+  comment saying the string is asserted source text. Do not change the quoting.
+- `tests/release/release-script-contract.sh` is committed `100644` while all
+  eleven siblings are `100755`, and the checklist invokes them as
+  `./tests/release/…`. Fix with
+  `git update-index --chmod=+x tests/release/release-script-contract.sh`.
+- `release.sh`'s usage text prints the literal
+  `${XDG_CONFIG_HOME:-$HOME/.config}/gascan/release.env`, so an operator cannot
+  see which path is actually read. `config_file` is assigned before every
+  `usage` call site — print the resolved value.
+
+- [ ] **Step 7: Verify**
+
+```bash
+bash tests/release/release-script-contract.sh; echo "exit: $?"
+bash tests/release/publish-contract.sh; echo "exit: $?"
+shellcheck packaging/macos/release.sh packaging/macos/release-gates.sh \
+  packaging/macos/release-config.sh packaging/macos/release-recovery.sh \
+  packaging/macos/publish.sh tests/release/release-script-contract.sh \
+  tests/release/publish-contract.sh; echo "exit: $?"
+for c in tests/release/*-contract.sh; do bash "$c" >/dev/null 2>&1 || echo "FAIL $c"; done; echo done
+git ls-files -s tests/release/release-script-contract.sh
+```
+
+Then the `--check` invariance block, and a demonstration that each new gate test
+can fail: pick `gascan_gate_no_release`'s gh-cannot-answer case and
+`gascan_gate_tap`'s is-the-product-repo case, break each gate in turn, and show
+the contract catching it.
+
+---
+
 ## Manual verification
 
 The happy path cannot run offline: it needs a real signed tag, live Apple
