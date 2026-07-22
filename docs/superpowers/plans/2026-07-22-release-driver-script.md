@@ -1,0 +1,945 @@
+# Release Driver Script Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** One command, `./packaging/macos/release.sh <version>`, that drives an
+already-tagged macOS release from build through published Homebrew cask, plus a
+`--check` mode that verifies readiness without touching anything.
+
+**Architecture:** A bash driver composing the existing `package.sh`,
+`verify-package.sh`, `publish.sh`, and `render-cask.sh` rather than
+reimplementing any of them. Four required configuration values resolve by
+precedence (flag, environment, `~/.config/gascan/release.env`) with nothing
+defaulted. Every gate runs before anything is built.
+
+**Tech Stack:** bash, git, gh, jq, cargo, pkgutil, codesign, spctl, xcrun,
+ruby, brew.
+
+Design: `docs/superpowers/specs/2026-07-22-release-driver-script-design.md`
+
+## Global Constraints
+
+- Bash with `set -euo pipefail`, matching the existing `packaging/macos/*.sh`.
+- **No hardcoded signing identity, team identifier, or notary profile string.**
+  Contract-tested.
+- No key, password, or API credential accepted as flag, environment value, or
+  config entry. Names only.
+- The config file is parsed as data, never `source`d or `eval`ed.
+- The script never creates, moves, or deletes a git tag; never passes
+  `--cleanup-tag`; never deletes a GitHub release.
+- `--check` performs no mutation.
+- Reuse a package only when `verify-package.sh` passes for that tag's revision
+  and version *and* `gascan_assert_distributable_package` passes.
+- Restore the operator's original git ref on every exit path.
+- Never name a shell variable `status` — it is read-only in zsh and has
+  previously made a successful release look like a failure.
+- `shellcheck` clean on every shell file added or edited.
+- `packaging/macos/` is a release input: this cannot drive the release that
+  introduces it.
+
+---
+
+## File Structure
+
+| File | Responsibility |
+| --- | --- |
+| `packaging/macos/release-config.sh` | Resolve one config value by precedence; parse the config file as data |
+| `packaging/macos/release-gates.sh` | Every pre-flight assertion, one function each |
+| `packaging/macos/release.sh` | Argument parsing, gate sequencing, execution |
+| `tests/release/release-script-contract.sh` | Behavioral + source contract |
+| `docs/release/macos-checklist.md` | Document the one-command path |
+
+Gates live in their own file so each is independently testable and `release.sh`
+stays a readable sequence.
+
+---
+
+### Task 1: Configuration resolution
+
+**Files:**
+- Create: `packaging/macos/release-config.sh`
+- Create: `tests/release/release-script-contract.sh`
+
+**Interfaces:**
+- Produces: `gascan_release_config NAME FLAG_VALUE CONFIG_FILE` — echoes the
+  resolved value, or returns 65 after naming the missing value and all three
+  supply routes.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `tests/release/release-script-contract.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "$0")/../.." && pwd -P)
+fixture=$(mktemp -d "${TMPDIR:-/tmp}/gascan-release-contract.XXXXXX")
+trap 'rm -rf "$fixture"' EXIT
+
+config=$repo_root/packaging/macos/release-config.sh
+[[ -r $config ]] || { printf 'release-config.sh is not readable\n' >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$config"
+
+cat >"$fixture/release.env" <<'EOF_CONFIG'
+GASCAN_NOTARYTOOL_PROFILE=from-file
+GASCAN_TAP_PATH=/tmp/tap-from-file
+EOF_CONFIG
+
+observed=$(GASCAN_NOTARYTOOL_PROFILE= gascan_release_config \
+  GASCAN_NOTARYTOOL_PROFILE '' "$fixture/release.env")
+[[ $observed == from-file ]] || {
+  printf 'config file value not used: %s\n' "$observed" >&2; exit 1; }
+
+observed=$(GASCAN_NOTARYTOOL_PROFILE=from-env gascan_release_config \
+  GASCAN_NOTARYTOOL_PROFILE '' "$fixture/release.env")
+[[ $observed == from-env ]] || {
+  printf 'environment did not beat config file: %s\n' "$observed" >&2; exit 1; }
+
+observed=$(GASCAN_NOTARYTOOL_PROFILE=from-env gascan_release_config \
+  GASCAN_NOTARYTOOL_PROFILE from-flag "$fixture/release.env")
+[[ $observed == from-flag ]] || {
+  printf 'flag did not beat environment: %s\n' "$observed" >&2; exit 1; }
+
+set +e
+missing=$(GASCAN_CODESIGN_IDENTITY= gascan_release_config \
+  GASCAN_CODESIGN_IDENTITY '' "$fixture/release.env" 2>&1 >/dev/null)
+missing_code=$?
+set -e
+[[ $missing_code -ne 0 ]] || {
+  printf 'a missing required value was accepted\n' >&2; exit 1; }
+for needle in GASCAN_CODESIGN_IDENTITY --codesign-identity release.env; do
+  grep -Fq -- "$needle" <<<"$missing" || {
+    printf 'missing-value message omits %s: %s\n' "$needle" "$missing" >&2
+    exit 1; }
+done
+
+cat >"$fixture/spaces.env" <<'EOF_SPACES'
+GASCAN_CODESIGN_IDENTITY=Developer ID Application: Example LLC (TEAMID1234)
+EOF_SPACES
+observed=$(GASCAN_CODESIGN_IDENTITY= gascan_release_config \
+  GASCAN_CODESIGN_IDENTITY '' "$fixture/spaces.env")
+[[ $observed == 'Developer ID Application: Example LLC (TEAMID1234)' ]] || {
+  printf 'value with spaces was mangled: %s\n' "$observed" >&2; exit 1; }
+
+cat >"$fixture/hostile.env" <<'EOF_HOSTILE'
+GASCAN_TAP_PATH=$(touch /tmp/gascan-config-executed)
+EOF_HOSTILE
+rm -f /tmp/gascan-config-executed
+observed=$(GASCAN_TAP_PATH= gascan_release_config \
+  GASCAN_TAP_PATH '' "$fixture/hostile.env")
+if [[ -e /tmp/gascan-config-executed ]]; then
+  rm -f /tmp/gascan-config-executed
+  printf 'config file contents were executed\n' >&2
+  exit 1
+fi
+[[ $observed == '$(touch /tmp/gascan-config-executed)' ]] || {
+  printf 'hostile value not preserved literally: %s\n' "$observed" >&2; exit 1; }
+
+observed=$(GASCAN_TAP_PATH=from-env gascan_release_config \
+  GASCAN_TAP_PATH '' "$fixture/absent.env")
+[[ $observed == from-env ]] || {
+  printf 'absent config file broke resolution: %s\n' "$observed" >&2; exit 1; }
+
+printf 'PASS: Gas Can release script contract\n'
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `bash tests/release/release-script-contract.sh; echo "exit: $?"`
+Expected: exit 1, `release-config.sh is not readable`.
+
+- [ ] **Step 3: Implement**
+
+Create `packaging/macos/release-config.sh`:
+
+```bash
+#!/usr/bin/env bash
+# Resolve one required release configuration value.
+#
+# Nothing is defaulted. Signing identities and a keychain profile name are
+# organization- and machine-specific, so a repository script that carries one
+# operator's setup breaks silently for everyone else.
+#
+# Precedence, first match wins: flag, environment, config file.
+#
+# The config file is read as data. It is never sourced and never evaluated, so
+# shell syntax inside it is a value rather than a command.
+
+gascan_release_config_flag() {
+  case $1 in
+    GASCAN_CODESIGN_IDENTITY) printf -- '--codesign-identity';;
+    GASCAN_INSTALLER_SIGNING_IDENTITY) printf -- '--installer-identity';;
+    GASCAN_NOTARYTOOL_PROFILE) printf -- '--notary-profile';;
+    GASCAN_TAP_PATH) printf -- '--tap';;
+    *) return 1;;
+  esac
+}
+
+# Value is everything after the first '=', preserved verbatim.
+gascan_release_config_file_value() {
+  local file=$1 key=$2 line
+  [[ -r $file ]] || return 1
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line == "$key="* ]] || continue
+    printf '%s' "${line#"$key="}"
+    return 0
+  done <"$file"
+  return 1
+}
+
+gascan_release_config() {
+  local name=$1 flag_value=$2 file=$3 value flag
+  if [[ -n $flag_value ]]; then
+    printf '%s' "$flag_value"
+    return 0
+  fi
+  value=${!name-}
+  if [[ -n $value ]]; then
+    printf '%s' "$value"
+    return 0
+  fi
+  if value=$(gascan_release_config_file_value "$file" "$name") && [[ -n $value ]]; then
+    printf '%s' "$value"
+    return 0
+  fi
+  flag=$(gascan_release_config_flag "$name") || flag='(no flag)'
+  printf 'missing required release configuration: %s\n' "$name" >&2
+  printf 'supply it with %s, the %s environment variable, or a %s= line in %s\n' \
+    "$flag" "$name" "$name" "$file" >&2
+  return 65
+}
+```
+
+- [ ] **Step 4: Run to verify it passes**
+
+Run: `bash tests/release/release-script-contract.sh; echo "exit: $?"`
+Expected: `PASS: Gas Can release script contract`, exit 0.
+
+- [ ] **Step 5: shellcheck**
+
+Run: `shellcheck packaging/macos/release-config.sh tests/release/release-script-contract.sh; echo "exit: $?"`
+Expected: exit 0. If `shellcheck` is unavailable, report that rather than
+skipping silently.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add packaging/macos/release-config.sh tests/release/release-script-contract.sh
+git commit -m "feat: resolve release configuration without defaults
+
+Signing identities and a keychain profile name are organization- and
+machine-specific, so a repository script that defaults them carries one
+operator's setup and breaks silently for anyone else. Resolve each value by
+flag, then environment, then a config file outside the repository, and fail
+naming the value and all three routes when it is absent from all of them.
+
+The config file is read line by line as data rather than sourced, so shell
+syntax inside it is preserved as a value instead of executed."
+```
+
+---
+
+### Task 2: Pre-flight gate functions
+
+**Files:**
+- Create: `packaging/macos/release-gates.sh`
+- Modify: `tests/release/release-script-contract.sh`
+
+**Interfaces:**
+- Consumes: `gascan_assert_release_inputs_clean` from `release-common.sh`.
+- Produces, each returning 0 on success and non-zero after printing a specific
+  remediation:
+  - `gascan_gate_tools`
+  - `gascan_gate_version REPO VERSION`
+  - `gascan_gate_tag REPO VERSION`
+  - `gascan_gate_no_release VERSION`
+  - `gascan_gate_identities APP_IDENTITY INSTALLER_IDENTITY`
+  - `gascan_gate_notary PROFILE`
+  - `gascan_gate_tap TAP_PATH`
+
+- [ ] **Step 1: Write the failing tests**
+
+Insert into `tests/release/release-script-contract.sh` immediately before the
+final `printf 'PASS: ...'` line:
+
+```bash
+gates=$repo_root/packaging/macos/release-gates.sh
+[[ -r $gates ]] || { printf 'release-gates.sh is not readable\n' >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$repo_root/packaging/macos/release-common.sh"
+# shellcheck source=/dev/null
+source "$gates"
+
+# Version disagreement is rejected and the message names the workspace version.
+workspace_version=$(cd "$repo_root" && cargo metadata --locked --no-deps \
+  --format-version 1 | jq -er '.packages[] | select(.name == "gascan") | .version')
+set +e
+mismatch=$(gascan_gate_version "$repo_root" 99.99.99 2>&1 >/dev/null)
+mismatch_code=$?
+set -e
+[[ $mismatch_code -ne 0 ]] || {
+  printf 'version disagreement accepted\n' >&2; exit 1; }
+grep -Fq "$workspace_version" <<<"$mismatch" || {
+  printf 'mismatch message omits workspace version: %s\n' "$mismatch" >&2; exit 1; }
+gascan_gate_version "$repo_root" "$workspace_version" >/dev/null || {
+  printf 'the workspace version was rejected\n' >&2; exit 1; }
+
+# Tag gates, exercised behaviorally in a disposable clone with an ephemeral
+# signing key -- the technique publish-contract.sh uses, so the property holds
+# for whatever version the workspace carries.
+clone=$fixture/clone
+git clone --quiet "$repo_root" "$clone"
+ssh-keygen -q -t ed25519 -N '' -C release@example.invalid -f "$fixture/key"
+printf 'release@example.invalid %s\n' "$(cat "$fixture/key.pub")" \
+  >"$fixture/allowed-signers"
+git -C "$clone" config user.name release
+git -C "$clone" config user.email release@example.invalid
+git -C "$clone" config gpg.format ssh
+git -C "$clone" config user.signingKey "$fixture/key"
+git -C "$clone" config gpg.ssh.allowedSignersFile "$fixture/allowed-signers"
+tag=v$workspace_version
+
+# absent tag
+git -C "$clone" tag -d "$tag" >/dev/null 2>&1 || true
+if gascan_gate_tag "$clone" "$workspace_version" >/dev/null 2>&1; then
+  printf 'an absent tag was accepted\n' >&2; exit 1
+fi
+
+# lightweight tag
+git -C "$clone" tag "$tag"
+if gascan_gate_tag "$clone" "$workspace_version" >/dev/null 2>&1; then
+  printf 'a lightweight tag was accepted\n' >&2; exit 1
+fi
+git -C "$clone" tag -d "$tag" >/dev/null
+
+# annotated but unsigned
+git -C "$clone" tag -a "$tag" -m unsigned
+if gascan_gate_tag "$clone" "$workspace_version" >/dev/null 2>&1; then
+  printf 'an unsigned annotated tag was accepted\n' >&2; exit 1
+fi
+git -C "$clone" tag -d "$tag" >/dev/null
+
+# signed but not pointing at HEAD
+git -C "$clone" tag -s "$tag" -m 'not head' "$(git -C "$clone" rev-parse HEAD~1)"
+if gascan_gate_tag "$clone" "$workspace_version" >/dev/null 2>&1; then
+  printf 'a tag that does not peel to HEAD was accepted\n' >&2; exit 1
+fi
+git -C "$clone" tag -d "$tag" >/dev/null
+
+# signed, at HEAD, but absent from the remote
+git -C "$clone" tag -s "$tag" -m 'at head'
+set +e
+unpushed=$(gascan_gate_tag "$clone" "$workspace_version" 2>&1 >/dev/null)
+unpushed_code=$?
+set -e
+[[ $unpushed_code -ne 0 ]] || {
+  printf 'an unpushed tag was accepted\n' >&2; exit 1; }
+grep -Fq 'git push origin' <<<"$unpushed" || {
+  printf 'unpushed-tag message omits the push command: %s\n' "$unpushed" >&2
+  exit 1; }
+
+# Tap gate rejects a path that is not a git work tree.
+if gascan_gate_tap "$fixture" >/dev/null 2>&1; then
+  printf 'a non-repository tap path was accepted\n' >&2; exit 1
+fi
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `bash tests/release/release-script-contract.sh; echo "exit: $?"`
+Expected: exit 1, `release-gates.sh is not readable`.
+
+- [ ] **Step 3: Implement**
+
+Create `packaging/macos/release-gates.sh`:
+
+```bash
+#!/usr/bin/env bash
+# Pre-flight assertions for a macOS release.
+#
+# Each gate returns non-zero after printing the specific command that fixes it.
+# They run before anything is built, because the expensive failures surface late
+# otherwise: a lapsed Apple agreement returns 403 only at notarization, and an
+# unpushed tag aborts publish after the build.
+
+gascan_gate_tools() {
+  local command
+  for command in gh jq cargo pkgutil shasum ruby brew git codesign spctl xcrun; do
+    command -v "$command" >/dev/null || {
+      printf 'required release command is unavailable: %s\n' "$command" >&2
+      return 69
+    }
+  done
+}
+
+gascan_gate_version() {
+  local repo=$1 version=$2 workspace
+  workspace=$(cd "$repo" && cargo metadata --locked --no-deps --format-version 1 |
+    jq -er '.packages[] | select(.name == "gascan") | .version') || return 65
+  [[ $workspace == "$version" ]] || {
+    printf 'workspace version is %s, not %s; bump the crates first\n' \
+      "$workspace" "$version" >&2
+    return 65
+  }
+}
+
+gascan_gate_tag() {
+  local repo=$1 version=$2 tag="v$2" object_type target head
+  object_type=$(git -C "$repo" cat-file -t "refs/tags/$tag" 2>/dev/null) || object_type=
+  [[ $object_type == tag ]] || {
+    printf 'release tag %s is missing or not an annotated tag\n' "$tag" >&2
+    printf "create it with: git tag -s %s -m 'Gas Can %s'\n" "$tag" "$version" >&2
+    return 65
+  }
+  git -C "$repo" verify-tag "refs/tags/$tag" >/dev/null 2>&1 || {
+    printf 'release tag %s does not carry a trusted signature\n' "$tag" >&2
+    return 65
+  }
+  target=$(git -C "$repo" rev-parse --verify "refs/tags/$tag^{}") || return 65
+  head=$(git -C "$repo" rev-parse --verify HEAD) || return 65
+  [[ $target == "$head" ]] || {
+    printf 'release tag %s does not point at HEAD (%s vs %s)\n' \
+      "$tag" "${target:0:9}" "${head:0:9}" >&2
+    return 65
+  }
+  [[ -n $(git -C "$repo" ls-remote --tags origin "$tag" 2>/dev/null) ]] || {
+    printf 'release tag %s is not on the remote\n' "$tag" >&2
+    printf 'push it with: git push origin %s\n' "$tag" >&2
+    return 65
+  }
+}
+
+gascan_gate_no_release() {
+  local version=$1 tag="v$1" draft
+  gh release view "$tag" >/dev/null 2>&1 || return 0
+  draft=$(gh release view "$tag" --json isDraft --jq '.isDraft' 2>/dev/null) || draft=unknown
+  printf 'a release for %s already exists (draft: %s)\n' "$tag" "$draft" >&2
+  printf 'a published release is never overwritten; delete a stranded draft with:\n' >&2
+  printf '  gh release delete %s --yes\n' "$tag" >&2
+  printf 'do not add --cleanup-tag: it deletes the signed tag from the remote\n' >&2
+  return 65
+}
+
+gascan_gate_identities() {
+  local application=$1 installer=$2 identities
+  identities=$(security find-identity -v 2>/dev/null) || {
+    printf 'could not list keychain identities\n' >&2
+    return 65
+  }
+  grep -Fq "$application" <<<"$identities" || {
+    printf 'Developer ID Application identity is not in the keychain: %s\n' \
+      "$application" >&2
+    return 65
+  }
+  grep -Fq "$installer" <<<"$identities" || {
+    printf 'Developer ID Installer identity is not in the keychain: %s\n' \
+      "$installer" >&2
+    return 65
+  }
+}
+
+gascan_gate_notary() {
+  local profile=$1 output
+  # This gate exists so a lapsed Apple agreement costs two seconds rather than a
+  # full build: notarization is the last step and the first to reject the account.
+  output=$(xcrun notarytool history --keychain-profile "$profile" 2>&1) || {
+    printf 'notarization profile %s cannot be used:\n%s\n' "$profile" "$output" >&2
+    printf 'store one with: xcrun notarytool store-credentials %s ...\n' "$profile" >&2
+    return 65
+  }
+  grep -Fq 'Successfully received submission history' <<<"$output" || {
+    printf 'notarization profile %s did not authenticate:\n%s\n' "$profile" "$output" >&2
+    return 65
+  }
+}
+
+gascan_gate_tap() {
+  local tap=$1 branch local_head remote_head
+  [[ -d $tap ]] || {
+    printf 'tap path does not exist: %s\n' "$tap" >&2
+    return 65
+  }
+  git -C "$tap" rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
+    printf 'tap path is not a git work tree: %s\n' "$tap" >&2
+    return 65
+  }
+  [[ -z $(git -C "$tap" status --porcelain) ]] || {
+    printf 'tap has uncommitted changes: %s\n' "$tap" >&2
+    return 65
+  }
+  branch=$(git -C "$tap" symbolic-ref --quiet --short HEAD) || branch=
+  [[ $branch == main ]] || {
+    printf 'tap is on %s, not main: %s\n' "${branch:-a detached HEAD}" "$tap" >&2
+    return 65
+  }
+  git -C "$tap" fetch --quiet origin main || {
+    printf 'could not fetch origin/main in the tap: %s\n' "$tap" >&2
+    return 65
+  }
+  local_head=$(git -C "$tap" rev-parse HEAD) || return 65
+  remote_head=$(git -C "$tap" rev-parse origin/main) || return 65
+  [[ $local_head == "$remote_head" ]] || {
+    printf 'tap is not up to date with origin/main: %s\n' "$tap" >&2
+    printf 'run: git -C %s pull --ff-only\n' "$tap" >&2
+    return 65
+  }
+}
+```
+
+- [ ] **Step 4: Run to verify it passes**
+
+Run: `bash tests/release/release-script-contract.sh; echo "exit: $?"`
+Expected: `PASS`, exit 0.
+
+- [ ] **Step 5: shellcheck**
+
+Run: `shellcheck packaging/macos/release-gates.sh; echo "exit: $?"`
+Expected: exit 0.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add packaging/macos/release-gates.sh tests/release/release-script-contract.sh
+git commit -m "feat: assert every release precondition before building
+
+Releases fail late and expensively: a lapsed Apple agreement returns 403 only
+at notarization, an unpushed tag aborts publish after the build, and a stranded
+draft blocks the version with a documented recovery that deletes the signed tag
+if used carelessly.
+
+Each gate returns the command that fixes it. The stranded-draft gate prints a
+recovery deliberately without --cleanup-tag, and the notarization gate turns the
+403 into a two-second check."
+```
+
+---
+
+### Task 3: Driver, argument parsing, and `--check`
+
+**Files:**
+- Create: `packaging/macos/release.sh` (`chmod +x`)
+- Modify: `tests/release/release-script-contract.sh`
+
+**Interfaces:**
+- Consumes: Tasks 1 and 2.
+- Produces: `release.sh VERSION [--check] [--codesign-identity V]
+  [--installer-identity V] [--notary-profile V] [--tap PATH] [--config FILE]`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Insert before the final `printf 'PASS: ...'`:
+
+```bash
+release=$repo_root/packaging/macos/release.sh
+[[ -x $release ]] || { printf 'release.sh is not executable\n' >&2; exit 1; }
+
+if "$release" >/dev/null 2>&1; then
+  printf 'missing version accepted\n' >&2; exit 1
+fi
+[[ $("$release" 2>&1 >/dev/null | head -1) == usage:* ]] || {
+  printf 'no usage line on a missing version\n' >&2; exit 1; }
+
+if "$release" 1.2 --check >/dev/null 2>&1; then
+  printf 'malformed version accepted\n' >&2; exit 1
+fi
+
+if "$release" 1.2.3 --nonsense >/dev/null 2>&1; then
+  printf 'unknown flag accepted\n' >&2; exit 1
+fi
+
+# A missing required config value stops the run.
+set +e
+unconfigured=$(env -u GASCAN_CODESIGN_IDENTITY -u GASCAN_INSTALLER_SIGNING_IDENTITY \
+  -u GASCAN_NOTARYTOOL_PROFILE -u GASCAN_TAP_PATH \
+  "$release" "$workspace_version" --check --config "$fixture/absent.env" 2>&1 >/dev/null)
+unconfigured_code=$?
+set -e
+[[ $unconfigured_code -ne 0 ]] || {
+  printf 'a run with no configuration was accepted\n' >&2; exit 1; }
+grep -Fq 'missing required release configuration' <<<"$unconfigured" || {
+  printf 'no missing-configuration message: %s\n' "$unconfigured" >&2; exit 1; }
+
+# Source contract: no tag mutation, no release deletion, no hardcoded identity.
+if grep -Fq -- '--cleanup-tag' "$release"; then
+  printf 'release.sh references --cleanup-tag\n' >&2; exit 1
+fi
+if grep -Eq '^[^#]*gh release delete' "$release"; then
+  printf 'release.sh deletes releases\n' >&2; exit 1
+fi
+if grep -Eq '^[^#]*git (tag|push)' "$release"; then
+  printf 'release.sh creates or pushes tags\n' >&2; exit 1
+fi
+for f in "$release" "$gates" "$config"; do
+  if grep -Eq 'Developer ID (Application|Installer): |\([A-Z0-9]{10}\)' "$f"; then
+    printf 'hardcoded signing identity or team identifier in %s\n' "$f" >&2
+    exit 1
+  fi
+done
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `bash tests/release/release-script-contract.sh; echo "exit: $?"`
+Expected: exit 1, `release.sh is not executable`.
+
+- [ ] **Step 3: Implement**
+
+Create `packaging/macos/release.sh` and `chmod +x` it:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "$0")/../.." && pwd -P)
+# shellcheck source=release-common.sh
+source "$repo_root/packaging/macos/release-common.sh"
+# shellcheck source=release-config.sh
+source "$repo_root/packaging/macos/release-config.sh"
+# shellcheck source=release-gates.sh
+source "$repo_root/packaging/macos/release-gates.sh"
+
+usage() {
+  cat >&2 <<'EOF_USAGE'
+usage: release.sh VERSION [--check]
+                  [--codesign-identity NAME] [--installer-identity NAME]
+                  [--notary-profile NAME] [--tap PATH] [--config FILE]
+
+Drives an already-tagged release: verifies every gate, then builds, signs,
+notarizes, publishes, and updates the Homebrew cask.
+
+  --check   run every gate and exit without building or publishing
+
+Configuration resolves by flag, then environment, then the config file
+(default: ${XDG_CONFIG_HOME:-$HOME/.config}/gascan/release.env). Nothing is
+defaulted.
+
+This never creates, moves, or deletes a tag. Create and push the signed tag
+first:
+    git tag -s vVERSION -m 'Gas Can VERSION' && git push origin vVERSION
+EOF_USAGE
+}
+
+version=
+check_only=false
+flag_application=
+flag_installer=
+flag_profile=
+flag_tap=
+config_file="${XDG_CONFIG_HOME:-$HOME/.config}/gascan/release.env"
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --check) check_only=true; shift;;
+    --codesign-identity) flag_application=${2-}; shift 2;;
+    --installer-identity) flag_installer=${2-}; shift 2;;
+    --notary-profile) flag_profile=${2-}; shift 2;;
+    --tap) flag_tap=${2-}; shift 2;;
+    --config) config_file=${2-}; shift 2;;
+    -h|--help) usage; exit 0;;
+    -*) printf 'unknown flag: %s\n' "$1" >&2; usage; exit 64;;
+    *)
+      [[ -z $version ]] || { printf 'unexpected argument: %s\n' "$1" >&2; usage; exit 64; }
+      version=$1; shift;;
+  esac
+done
+
+[[ -n $version ]] || { usage; exit 64; }
+[[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+  printf 'version must be MAJOR.MINOR.PATCH, got: %s\n' "$version" >&2
+  usage
+  exit 64
+}
+
+application_identity=$(gascan_release_config GASCAN_CODESIGN_IDENTITY "$flag_application" "$config_file")
+installer_identity=$(gascan_release_config GASCAN_INSTALLER_SIGNING_IDENTITY "$flag_installer" "$config_file")
+notary_profile=$(gascan_release_config GASCAN_NOTARYTOOL_PROFILE "$flag_profile" "$config_file")
+tap_path=$(gascan_release_config GASCAN_TAP_PATH "$flag_tap" "$config_file")
+
+cd "$repo_root"
+printf 'checking release preconditions for %s\n' "$version" >&2
+gascan_gate_tools
+gascan_gate_version "$repo_root" "$version"
+gascan_assert_release_inputs_clean "$repo_root" "release $version"
+gascan_gate_tag "$repo_root" "$version"
+gascan_gate_no_release "$version"
+gascan_gate_identities "$application_identity" "$installer_identity"
+gascan_gate_notary "$notary_profile"
+gascan_gate_tap "$tap_path"
+printf 'all release preconditions pass for %s\n' "$version" >&2
+
+if [[ $check_only == true ]]; then
+  printf 'check only: nothing was built, published, or changed\n' >&2
+  exit 0
+fi
+```
+
+- [ ] **Step 4: Run to verify it passes**
+
+Run: `bash tests/release/release-script-contract.sh; echo "exit: $?"`
+Expected: `PASS`, exit 0.
+
+- [ ] **Step 5: shellcheck**
+
+Run: `shellcheck packaging/macos/release.sh; echo "exit: $?"`
+Expected: exit 0.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add packaging/macos/release.sh tests/release/release-script-contract.sh
+git commit -m "feat: add a gated release driver with a read-only check mode
+
+One command replaces a dozen across two repositories. --check runs every gate
+and exits, so readiness is verifiable in seconds instead of after a ten-minute
+build. Configuration resolves by flag, environment, then a config file outside
+the repository, with nothing defaulted."
+```
+
+---
+
+### Task 4: Build, publish, and tap execution
+
+**Files:**
+- Modify: `packaging/macos/release.sh`
+- Modify: `tests/release/release-script-contract.sh`
+
+**Interfaces:**
+- Consumes: Task 3.
+- Produces: the full release path after gates pass.
+
+- [ ] **Step 1: Write the failing tests**
+
+Insert before the final `printf 'PASS: ...'`:
+
+```bash
+for needle in verify-package.sh gascan_assert_distributable_package \
+  render-cask.sh publish.sh package.sh; do
+  grep -Fq "$needle" "$release" || {
+    printf 'release.sh never references %s\n' "$needle" >&2; exit 1; }
+done
+grep -Eq 'trap .*EXIT' "$release" || {
+  printf 'release.sh does not restore the original ref on exit\n' >&2; exit 1; }
+# `status` is read-only in zsh and has previously made a successful release
+# look like a failure.
+grep -Eq '^[[:space:]]*status=' "$release" && {
+  printf 'release.sh assigns a variable named status\n' >&2; exit 1; }
+```
+
+Write that last check as an `if` so a missing pattern does not trip `set -e`.
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `bash tests/release/release-script-contract.sh; echo "exit: $?"`
+Expected: exit 1, `release.sh never references verify-package.sh`.
+
+- [ ] **Step 3: Implement**
+
+Append to `packaging/macos/release.sh`:
+
+```bash
+original_ref=$(git symbolic-ref --quiet --short HEAD || git rev-parse HEAD)
+restore_ref() { git checkout --quiet "$original_ref" 2>/dev/null || true; }
+trap restore_ref EXIT
+
+git checkout --quiet "v$version"
+revision=$(git rev-parse --verify HEAD)
+package="$repo_root/.artifacts/release/gascan-$version-macos-arm64.pkg"
+
+reusable=false
+if [[ -f $package ]] &&
+  "$repo_root/packaging/macos/verify-package.sh" "$package" "$revision" "$version" >/dev/null 2>&1 &&
+  gascan_assert_distributable_package "$package" "$GASCAN_RELEASE_TEAM" >/dev/null 2>&1; then
+  reusable=true
+fi
+
+if [[ $reusable == true ]]; then
+  printf 'reusing the already notarized package for %s\n' "$revision" >&2
+else
+  printf 'building, signing, and notarizing; Apple notarization takes minutes\n' >&2
+  package=$(
+    GASCAN_CODESIGN_IDENTITY="$application_identity" \
+    GASCAN_INSTALLER_SIGNING_IDENTITY="$installer_identity" \
+    GASCAN_NOTARYTOOL_PROFILE="$notary_profile" \
+      "$repo_root/packaging/macos/package.sh"
+  )
+fi
+
+pkgutil --check-signature "$package" >/dev/null || {
+  printf 'package is not signed by a Developer ID Installer certificate\n' >&2
+  exit 65
+}
+spctl --assess --type install "$package" >/dev/null 2>&1 || {
+  printf 'Gatekeeper rejects the package as an install candidate\n' >&2
+  exit 65
+}
+xcrun stapler validate "$package" >/dev/null || {
+  printf 'package has no stapled notarization ticket\n' >&2
+  exit 65
+}
+
+published=$("$repo_root/packaging/macos/publish.sh" "$package")
+asset_url=$(sed -n '1p' <<<"$published")
+checksum=$(sed -n '2p' <<<"$published")
+[[ $checksum =~ ^[0-9a-f]{64}$ ]] || {
+  printf 'publish did not report a SHA-256:\n%s\n' "$published" >&2
+  exit 65
+}
+
+git -C "$tap_path" pull --ff-only --quiet
+mkdir -p "$tap_path/Casks"
+"$repo_root/packaging/macos/render-cask.sh" "$version" "$checksum" \
+  >"$tap_path/Casks/gascan.rb"
+ruby -c "$tap_path/Casks/gascan.rb" >/dev/null || {
+  printf 'rendered cask is not valid Ruby\n' >&2
+  exit 65
+}
+brew style "$tap_path/Casks/gascan.rb" >/dev/null || {
+  printf 'rendered cask fails brew style\n' >&2
+  exit 65
+}
+git -C "$tap_path" commit --quiet -am "gascan $version"
+git -C "$tap_path" push --quiet
+
+printf '\nreleased %s\n' "$version"
+printf '  asset:  %s\n' "$asset_url"
+printf '  sha256: %s\n' "$checksum"
+printf '  cask:   %s\n' "$(git -C "$tap_path" rev-parse --short HEAD)"
+printf '  verify: brew update && brew upgrade --cask gascan\n'
+```
+
+Note: the tap `git push` is in `$tap_path`, a different repository, so the
+contract's `git (tag|push)` source check must be written to allow
+`git -C "$tap_path" push` while still rejecting tag creation in this repo. Adjust
+that assertion to target tag mutation specifically.
+
+- [ ] **Step 4: Run to verify it passes**
+
+Run: `bash tests/release/release-script-contract.sh; echo "exit: $?"`
+Expected: `PASS`, exit 0.
+
+- [ ] **Step 5: Verify `--check` mutates nothing**
+
+Run:
+
+```bash
+git rev-parse HEAD >/tmp/before-head
+git status --porcelain >/tmp/before-status
+set +e
+GASCAN_CODESIGN_IDENTITY=x GASCAN_INSTALLER_SIGNING_IDENTITY=x \
+GASCAN_NOTARYTOOL_PROFILE=x GASCAN_TAP_PATH=/tmp \
+  ./packaging/macos/release.sh \
+  "$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "gascan") | .version')" --check
+set -e
+git rev-parse HEAD >/tmp/after-head
+git status --porcelain >/tmp/after-status
+diff /tmp/before-head /tmp/after-head && diff /tmp/before-status /tmp/after-status \
+  && echo "check mutated nothing"
+```
+
+Expected: the run stops at a gate (during normal development there is no signed
+tag at `HEAD`), and both diffs are empty. Record in your report which gate it
+stopped at.
+
+- [ ] **Step 6: All contracts and shellcheck**
+
+```bash
+shellcheck packaging/macos/release.sh packaging/macos/release-gates.sh \
+  packaging/macos/release-config.sh tests/release/release-script-contract.sh
+for c in tests/release/*-contract.sh; do bash "$c" >/dev/null 2>&1 || echo "FAIL $c"; done
+echo done
+```
+
+Expected: shellcheck exit 0, no `FAIL` lines, 11 contracts.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add packaging/macos/release.sh tests/release/release-script-contract.sh
+git commit -m "feat: build, publish, and update the cask in one command
+
+Compose package.sh, verify-package.sh, publish.sh and render-cask.sh rather
+than reimplementing them. An already-notarized package is reused only when it
+verifies against this tag's revision and version and is still distributable, so
+a retry after a late failure costs seconds instead of another notarization
+round trip.
+
+The cask checksum comes from publish.sh's own output rather than being retyped:
+a wrong sha256 breaks every user's install while the release itself looks
+correct. An EXIT trap restores the operator's original ref."
+```
+
+---
+
+### Task 5: Document the one-command path
+
+**Files:**
+- Modify: `docs/release/macos-checklist.md`
+
+- [ ] **Step 1: Add the section**
+
+In `docs/release/macos-checklist.md`, directly after the `## Publish` heading's
+credential paragraph, insert:
+
+```markdown
+### One command
+
+Once the signed tag is pushed, `release.sh` runs every gate, then builds, signs,
+notarizes, publishes, and updates the cask:
+
+```sh
+./packaging/macos/release.sh <version> --check   # verify readiness, change nothing
+./packaging/macos/release.sh <version>           # do it
+```
+
+Four values resolve by precedence — flag, environment, then
+`~/.config/gascan/release.env` — and none is defaulted:
+
+| Value | Flag | Environment |
+| --- | --- | --- |
+| Developer ID Application identity | `--codesign-identity` | `GASCAN_CODESIGN_IDENTITY` |
+| Developer ID Installer identity | `--installer-identity` | `GASCAN_INSTALLER_SIGNING_IDENTITY` |
+| Notarization keychain profile name | `--notary-profile` | `GASCAN_NOTARYTOOL_PROFILE` |
+| Homebrew tap checkout | `--tap` | `GASCAN_TAP_PATH` |
+
+`release.sh` never creates, moves, or deletes a tag, and never deletes a
+release. Create and push the signed tag first. The manual steps below remain
+correct and are what the script runs — read them when a gate fails.
+```
+
+- [ ] **Step 2: Verify contracts still pass**
+
+Run: `for c in tests/release/*-contract.sh; do bash "$c" >/dev/null 2>&1 || echo "FAIL $c"; done; echo done`
+Expected: no `FAIL` lines.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add docs/release/macos-checklist.md
+git commit -m "docs: document the one-command release path
+
+The manual sequence stays as the reference for what the script does, since that
+is what an operator needs when a gate fails."
+```
+
+---
+
+## Manual verification
+
+The happy path cannot run offline: it needs a real signed tag, live Apple
+notarization, and two remotes. Confirm the read-only path instead:
+
+```bash
+./packaging/macos/release.sh "$(cargo metadata --locked --no-deps --format-version 1 \
+  | jq -er '.packages[] | select(.name == "gascan") | .version')" --check
+```
+
+Expect it to stop at the tag gate during normal development, print the
+`git tag -s` remediation, and leave `git status --porcelain` unchanged.
+
+## Release note
+
+`packaging/macos/` is a release input, so this changes the source revision. The
+script cannot drive the release that introduces it; the first release it can
+drive is the next one.
