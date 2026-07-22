@@ -197,7 +197,7 @@ fi
 # branch above still calls it, because there it is the reuse predicate rather
 # than a repeat.
 
-published_marker="$(dirname "$package")/v$version.published"
+published_marker=$(gascan_published_marker "$package" "$version")
 rm -f "$published_marker"
 publish_attempted=true
 published=$("$repo_root/packaging/macos/publish.sh" "$package")

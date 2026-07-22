@@ -379,4 +379,31 @@ want_assets='build-manifest.json,gascan-9.9.9-macos-arm64.pkg,gascan-9.9.9-macos
   exit 1
 }
 
+# C3: the published marker is derived once, in release-common.sh, and both
+# publish.sh and release.sh call it rather than rebuilding the path inline --
+# the same coupling C1 proves for the expected-asset list. Without this,
+# either side can drift and the suite stays green while release.sh's live-
+# release warning silently never fires.
+release_script=$repo_root/packaging/macos/release.sh
+for f in "$publish" "$release_script"; do
+  # shellcheck disable=SC2016 # single quotes are deliberate: asserting literal source text, not expanding it
+  grep -Fq 'gascan_published_marker "$package" "$version"' "$f" || {
+    printf '%s does not derive the published marker from the shared helper\n' "$f" >&2
+    exit 1
+  }
+done
+if grep -F '.published"' "$publish" "$release_script"; then
+  printf 'the published marker path is still built inline\n' >&2
+  exit 1
+fi
+
+# C4: execute the helper directly, the same as C2 does for the asset
+# pipeline -- the only place its actual output is observed.
+observed_marker=$(gascan_published_marker /artifacts/gascan-9.9.9-macos-arm64.pkg 9.9.9)
+[[ $observed_marker == /artifacts/v9.9.9.published ]] || {
+  printf 'published marker path is wrong\n  want: /artifacts/v9.9.9.published\n  got:  %s\n' \
+    "$observed_marker" >&2
+  exit 1
+}
+
 printf 'PASS: Gas Can publish contract\n'

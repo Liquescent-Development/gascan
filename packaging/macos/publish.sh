@@ -99,7 +99,9 @@ gh release edit "$tag" --draft=false >/dev/null
 # Record that the release is public the instant it becomes public. release.sh
 # reads this from its EXIT trap, where asking GitHub would mean an unbounded
 # network call at the moment an interrupted run most needs to exit.
-: >"$(dirname "$package")/$tag.published"
+marker=$(gascan_published_marker "$package" "$version")
+: >"$marker" || printf 'the release is public but the marker could not be written: %s\n' \
+  "$marker" >&2
 
 printf 'https://github.com/Liquescent-Development/gascan/releases/download/%s/%s\n' "$tag" "$base"
 printf '%s\n' "$checksum"

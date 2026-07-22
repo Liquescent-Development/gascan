@@ -81,8 +81,10 @@ observed=$(GASCAN_TAP_PATH=from-env gascan_release_config \
 
 gates=$repo_root/packaging/macos/release-gates.sh
 [[ -r $gates ]] || { printf 'release-gates.sh is not readable\n' >&2; exit 1; }
+common=$repo_root/packaging/macos/release-common.sh
+[[ -r $common ]] || { printf 'release-common.sh is not readable\n' >&2; exit 1; }
 # shellcheck source=/dev/null
-source "$repo_root/packaging/macos/release-common.sh"
+source "$common"
 # shellcheck source=/dev/null
 source "$gates"
 
@@ -193,6 +195,26 @@ if grep -F 'gh release delete' <<<"$existing" | grep -Fq -- '--cleanup-tag'; the
   printf 'the printed delete command carries --cleanup-tag: %s\n' "$existing" >&2
   exit 1
 fi
+grep -Fq 'draft: true' <<<"$existing" || {
+  printf 'the existing-draft message does not report the draft state: %s\n' \
+    "$existing" >&2
+  exit 1; }
+
+# A published (non-draft) release must refuse identically, and the message
+# must report draft: false -- that field is the only thing distinguishing a
+# stranded draft, safe to delete, from a published release, which must never
+# be deleted.
+set +e
+existing_published=$(PATH=$github_stub:$PATH GASCAN_STUB_GH_VIEW_CODE=0 GASCAN_STUB_GH_DRAFT=false \
+  gascan_gate_no_release 0.1.4 2>&1)
+existing_published_code=$?
+set -e
+[[ $existing_published_code -ne 0 ]] || {
+  printf 'gascan_gate_no_release accepted an existing published release\n' >&2; exit 1; }
+grep -Fq 'draft: false' <<<"$existing_published" || {
+  printf 'the existing-published message does not report the draft state: %s\n' \
+    "$existing_published" >&2
+  exit 1; }
 
 # Tag gates, exercised behaviorally in a disposable clone with an ephemeral
 # signing key -- the technique publish-contract.sh uses, so the property holds
@@ -303,12 +325,16 @@ fi
 # on main, level with origin/main, pushable -- so a stale or mistyped
 # GASCAN_TAP_PATH would otherwise pass all eight gates and the release path
 # would then push a cask commit to the product repository's default branch.
-if gascan_gate_tap "$repo_root" "$repo_root" >/dev/null 2>&1; then
-  printf 'the product repository itself was accepted as the tap\n' >&2; exit 1
-fi
+# A bare exit-code assertion cannot fail here: deleting the same-repo check
+# from the gate still returns non-zero, via the uncommitted-changes or
+# origin-name rule the gascan repository also trips. The message grep below is
+# the assertion that actually pins the same-repo rule down.
 set +e
 same_repo=$(gascan_gate_tap "$repo_root" "$repo_root" 2>&1 >/dev/null)
+same_repo_code=$?
 set -e
+[[ $same_repo_code -ne 0 ]] || {
+  printf 'the product repository itself was accepted as the tap\n' >&2; exit 1; }
 grep -Fq 'tap path is the gascan repository itself' <<<"$same_repo" || {
   printf 'the same-repository message is missing: %s\n' "$same_repo" >&2; exit 1; }
 
@@ -389,27 +415,57 @@ grep -Fq "git -C $tap pull --ff-only origin main" <<<"$behind" || {
 # this file never exercised. Each runs under a stub PATH inside its own
 # subshell, so the stub cannot leak into any assertion outside it.
 
-# A PATH missing one required command.
+# A PATH missing exactly one required command, for every command the gate
+# requires. The list is parsed out of gascan_gate_tools's own `for command in
+# ...` line via `declare -f`, rather than restated here -- a command added to
+# the gate is covered without editing this test. Parsing the source, rather
+# than executing the gate and recording what it happens to look up, also
+# catches a command whose `command -v` check the loop body skips (e.g. a
+# stray `continue`): the word would still be parsed out of the `for` line, so
+# a PATH missing that tool would still be tried, and the gate silently
+# passing it would still be caught.
 (
-  toolsdir=$fixture/tools-bin
-  mkdir -p "$toolsdir"
-  for command in gh jq cargo pkgutil shasum ruby brew git codesign spctl xcrun \
-    security cpio gzip; do
-    [[ $command == jq ]] && continue
-    tool_path=$(command -v "$command" 2>/dev/null) || continue
-    ln -s "$tool_path" "$toolsdir/$command"
+  tools_source=$(declare -f gascan_gate_tools)
+  tools_line=$(grep -m1 'for command in' <<<"$tools_source")
+  [[ -n $tools_line ]] || {
+    printf 'could not find the required-tools for-loop in gascan_gate_tools\n' >&2
+    exit 1; }
+  tools_words=${tools_line#*for command in }
+  tools_words=${tools_words%;*}
+  # shellcheck disable=SC2206 # word splitting is the point: turning the parsed list into an array
+  required_tools=($tools_words)
+  [[ ${#required_tools[@]} -gt 0 ]] || {
+    printf 'could not derive the required-tools list from gascan_gate_tools\n' >&2
+    exit 1; }
+
+  for missing in "${required_tools[@]}"; do
+    trial_dir=$fixture/tools-bin-$missing
+    mkdir -p "$trial_dir"
+    for present in "${required_tools[@]}"; do
+      [[ $present == "$missing" ]] && continue
+      tool_path=$(builtin command -v "$present" 2>/dev/null) || continue
+      ln -sf "$tool_path" "$trial_dir/$present"
+    done
+    # bash caches a command's resolved path the first time it is looked up,
+    # and trusts that cache over a later, narrower PATH as long as the cached
+    # file still exists -- true here, since the trial PATH omits $missing
+    # but the real binary is still on disk. Without `hash -r`, `command -v`
+    # would report a tool "found" from an earlier hash-table entry rather
+    # than actually searching $trial_dir, and the gate would wrongly pass.
+    hash -r
+    set +e
+    missing_tool=$(PATH=$trial_dir gascan_gate_tools 2>&1)
+    missing_tool_code=$?
+    set -e
+    [[ $missing_tool_code -eq 69 ]] || {
+      printf 'gascan_gate_tools with %s missing exited %s, not 69: %s\n' \
+        "$missing" "$missing_tool_code" "$missing_tool" >&2
+      exit 1; }
+    grep -Fq "$missing" <<<"$missing_tool" || {
+      printf 'gascan_gate_tools message omits the missing command %s: %s\n' \
+        "$missing" "$missing_tool" >&2
+      exit 1; }
   done
-  set +e
-  missing_tool=$(PATH=$toolsdir gascan_gate_tools 2>&1)
-  missing_tool_code=$?
-  set -e
-  [[ $missing_tool_code -eq 69 ]] || {
-    printf 'gascan_gate_tools with jq missing exited %s, not 69: %s\n' \
-      "$missing_tool_code" "$missing_tool" >&2
-    exit 1; }
-  grep -Fq 'jq' <<<"$missing_tool" || {
-    printf 'gascan_gate_tools message omits the missing command: %s\n' "$missing_tool" >&2
-    exit 1; }
 )
 
 # A stub `security` printing the real `  1) <hash> "<identity>"` shape.
@@ -455,6 +511,19 @@ STUB_SECURITY
   set -e
   [[ $truncated_code -ne 0 ]] || {
     printf 'gascan_gate_identities accepted a truncated identity string\n' >&2; exit 1; }
+
+  # The mirrored case: a full application identity alongside a truncated
+  # installer identity. The application arm alone cannot prove the installer
+  # arm also matches quoted rather than as a bare substring.
+  set +e
+  PATH=$sec_bin:$PATH gascan_gate_identities \
+    'Developer ID Application: Example LLC (TEAMID1234)' \
+    'Developer ID Installer: Example LLC' >/dev/null 2>&1
+  truncated_installer_code=$?
+  set -e
+  [[ $truncated_installer_code -ne 0 ]] || {
+    printf 'gascan_gate_identities accepted a truncated installer identity string\n' >&2
+    exit 1; }
 )
 
 # A stub `xcrun`: the success marker passes; a non-zero exit fails; a zero
@@ -788,9 +857,13 @@ grep -Fq 'gascan_report_live_release' "$release" || {
   printf 'release.sh never calls the recovery\n' >&2; exit 1; }
 # `status` is read-only in zsh and has previously made a successful release
 # look like a failure. `local status=` is how it would most likely reappear.
+# release.sh sources all four of these into its own shell, so the rule has to
+# cover every one of them, not just the ones on the release path -- release-
+# common.sh's gascan_exact_apple_prerequisites is on the Apple-container
+# prerequisite path instead, but it still runs in the same shell.
 # Written as an `if` so an absent pattern -- the passing case -- does not trip
 # `set -e`.
-for f in "$release" "$recovery" "$gates" "$config"; do
+for f in "$release" "$recovery" "$gates" "$config" "$common"; do
   if grep -Eq '(^|[[:space:]])(local|declare|readonly|typeset)?[[:space:]]*status=' "$f"; then
     printf '%s assigns a variable named status\n' "$f" >&2
     exit 1

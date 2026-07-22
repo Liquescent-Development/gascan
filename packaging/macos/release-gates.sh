@@ -76,7 +76,7 @@ gascan_gate_github() {
 }
 
 gascan_gate_no_release() {
-  local version=$1 tag="v$1" draft view_code=0 view_err
+  local tag="v$1" draft view_code=0 view_err
   view_err=$(gh release view "$tag" 2>&1 >/dev/null) || view_code=$?
   # gh exits 1 for "release not found", for HTTP 401, and for an unreachable
   # host alike, so the exit code alone cannot tell absence from inability.

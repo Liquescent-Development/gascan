@@ -78,9 +78,9 @@ gascan_assert_destroyed_controller_record() {
 }
 
 gascan_exact_apple_prerequisites() {
-  local version status commit=5973b9cc626a3e7a499bb316a958237ebe14e2ed
+  local version system_status commit=5973b9cc626a3e7a499bb316a958237ebe14e2ed
   version=$(container system version --format json) || return 1
-  status=$(container system status --format json) || return 1
+  system_status=$(container system status --format json) || return 1
   jq -e --arg commit "$commit" '
     type == "array" and
     ([.[] | select(.appName == "container")] | length) == 1 and
@@ -96,7 +96,7 @@ gascan_exact_apple_prerequisites() {
     .apiServerAppName == "container-apiserver" and
     .apiServerBuild == "release" and .apiServerCommit == $commit and
     .apiServerVersion == "container-apiserver version 1.1.0 (build: release, commit: 5973b9c)"
-  ' <<<"$status" >/dev/null
+  ' <<<"$system_status" >/dev/null
 }
 
 gascan_stop_attested_daemon() {
@@ -152,6 +152,15 @@ gascan_audit_clean_host() {
 # The exact Apple Developer team that signs Gas Can releases.
 # shellcheck disable=SC2034 # consumed by publish.sh, which sources this file
 GASCAN_RELEASE_TEAM=Z548WR4TF8
+
+# The marker publish.sh writes the instant a release becomes public, and the
+# one release.sh reads from its EXIT trap. One derivation, because two would
+# agree until one of them moved and then fail silently on the one path where
+# the release is already public.
+gascan_published_marker() {
+  local package=$1 version=$2
+  printf '%s/v%s.published' "$(dirname "$package")" "$version"
+}
 
 # The exact asset set a published release must carry, as a sorted,
 # comma-joined list. Both this and the observed value from
