@@ -593,9 +593,19 @@ PATH=$stub_bin:$PATH GASCAN_CODESIGN_IDENTITY=x GASCAN_INSTALLER_SIGNING_IDENTIT
   "$release" "$workspace_version" --check >/dev/null 2>&1
 set -e
 
+# The log must not be empty: every gate that runs shells out to git or gh, so
+# an empty log means the script died before reaching them and the scan below
+# would pass without inspecting anything.
+[[ -s $GASCAN_STUB_LOG ]] || {
+  printf 'check mode ran no git or gh commands; the mutation scan proved nothing\n' >&2
+  exit 1; }
+
+# Match the subcommand anywhere in the line, not at the start: every call in
+# this codebase is `git -C REPO ...`, so a prefix pattern like `git tag`* could
+# never match the very mutation it exists to catch.
 while IFS= read -r logged; do
-  case $logged in
-    'git tag'*|'git push'*|*'--cleanup-tag'*|'gh release delete'*)
+  case " $logged " in
+    *' tag '*|*' push '*|*'--cleanup-tag'*|*' release delete '*)
       printf 'check mode attempted a mutation: %s\n' "$logged" >&2
       exit 1 ;;
   esac
