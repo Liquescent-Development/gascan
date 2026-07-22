@@ -101,3 +101,97 @@ if [[ $check_only == true ]]; then
   printf 'check only: nothing was built, published, or changed\n' >&2
   exit 0
 fi
+
+original_ref=$(git symbolic-ref --quiet --short HEAD || git rev-parse HEAD)
+# A failed restore leaves the operator on a detached HEAD at the tag. Say so:
+# silently swallowing it means the next command they run happens somewhere
+# they did not expect to be.
+restore_ref() {
+  git checkout --quiet "$original_ref" && return 0
+  printf 'could not return to %s; you are on a detached HEAD\n' "$original_ref" >&2
+  printf 'run: git checkout %s\n' "$original_ref" >&2
+}
+trap restore_ref EXIT
+
+git checkout --quiet "v$version"
+revision=$(git rev-parse --verify HEAD)
+package="$repo_root/.artifacts/release/gascan-$version-macos-arm64.pkg"
+
+reusable=false
+if [[ -f $package ]] &&
+  "$repo_root/packaging/macos/verify-package.sh" "$package" "$revision" "$version" >/dev/null 2>&1 &&
+  gascan_assert_distributable_package "$package" "$GASCAN_RELEASE_TEAM" >/dev/null 2>&1; then
+  reusable=true
+fi
+
+if [[ $reusable == true ]]; then
+  printf 'reusing the already notarized package for %s\n' "$revision" >&2
+else
+  printf 'building, signing, and notarizing; Apple notarization takes minutes\n' >&2
+  package=$(
+    GASCAN_CODESIGN_IDENTITY="$application_identity" \
+    GASCAN_INSTALLER_SIGNING_IDENTITY="$installer_identity" \
+    GASCAN_NOTARYTOOL_PROFILE="$notary_profile" \
+      "$repo_root/packaging/macos/package.sh"
+  )
+fi
+
+pkgutil --check-signature "$package" >/dev/null || {
+  printf 'package is not signed by a Developer ID Installer certificate\n' >&2
+  exit 65
+}
+spctl --assess --type install "$package" >/dev/null 2>&1 || {
+  printf 'Gatekeeper rejects the package as an install candidate\n' >&2
+  exit 65
+}
+xcrun stapler validate "$package" >/dev/null || {
+  printf 'package has no stapled notarization ticket\n' >&2
+  exit 65
+}
+
+published=$("$repo_root/packaging/macos/publish.sh" "$package")
+# publish.sh's stdout is a two-line contract: asset URL, then SHA-256. Assert
+# the shape rather than trusting positions. `gh release upload` inside it does
+# not redirect its own stdout, so a future gh that chatters there would shift
+# both lines, and a shifted URL ships a cask that breaks every install while
+# the release itself looks fine.
+[[ $(grep -c '' <<<"$published") -eq 2 ]] || {
+  printf 'publish.sh printed %s lines, expected the asset URL then the SHA-256:\n%s\n' \
+    "$(grep -c '' <<<"$published")" "$published" >&2
+  exit 65
+}
+asset_url=$(sed -n '1p' <<<"$published")
+checksum=$(sed -n '2p' <<<"$published")
+[[ $asset_url == https://github.com/*/releases/download/*/* ]] || {
+  printf 'publish did not report an asset URL:\n%s\n' "$published" >&2
+  exit 65
+}
+[[ $checksum =~ ^[0-9a-f]{64}$ ]] || {
+  printf 'publish did not report a SHA-256:\n%s\n' "$published" >&2
+  exit 65
+}
+
+git -C "$tap_path" pull --ff-only --quiet
+mkdir -p "$tap_path/Casks"
+"$repo_root/packaging/macos/render-cask.sh" "$version" "$checksum" \
+  >"$tap_path/Casks/gascan.rb"
+ruby -c "$tap_path/Casks/gascan.rb" >/dev/null || {
+  printf 'rendered cask is not valid Ruby\n' >&2
+  exit 65
+}
+brew style "$tap_path/Casks/gascan.rb" >/dev/null || {
+  printf 'rendered cask fails brew style\n' >&2
+  exit 65
+}
+# `add` explicitly, not `commit -a`: the first release into a fresh tap writes
+# Casks/gascan.rb as a new file, which `-a` never stages, so the commit would
+# fail with "nothing to commit" after the release was already published.
+git -C "$tap_path" add Casks/gascan.rb
+git -C "$tap_path" commit --quiet -m "gascan $version"
+git -C "$tap_path" push --quiet
+
+printf '\nreleased %s\n' "$version"
+printf '  asset:  %s\n' "$asset_url"
+printf '  sha256: %s\n' "$checksum"
+printf '  cask:   %s\n' "$(git -C "$tap_path" rev-parse --short HEAD)"
+printf '  verify: brew update && brew upgrade --cask gascan\n'

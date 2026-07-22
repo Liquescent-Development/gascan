@@ -299,4 +299,19 @@ for f in "$release" "$gates" "$config"; do
   fi
 done
 
+for needle in verify-package.sh gascan_assert_distributable_package \
+  render-cask.sh publish.sh package.sh; do
+  grep -Fq "$needle" "$release" || {
+    printf 'release.sh never references %s\n' "$needle" >&2; exit 1; }
+done
+grep -Eq 'trap .*EXIT' "$release" || {
+  printf 'release.sh does not restore the original ref on exit\n' >&2; exit 1; }
+# `status` is read-only in zsh and has previously made a successful release
+# look like a failure. Written as an `if` so an absent pattern -- the passing
+# case -- does not trip `set -e`.
+if grep -Eq '^[[:space:]]*status=' "$release"; then
+  printf 'release.sh assigns a variable named status\n' >&2
+  exit 1
+fi
+
 printf 'PASS: Gas Can release script contract\n'
