@@ -122,11 +122,19 @@ gascan_gate_tap() {
   }
   local_head=$(git -C "$tap" rev-parse HEAD) || return 65
   remote_head=$(git -C "$tap" rev-parse origin/main) || return 65
-  [[ $local_head == "$remote_head" ]] || {
-    printf 'tap is not up to date with origin/main: %s\n' "$tap" >&2
-    printf 'run: git -C %s pull --ff-only\n' "$tap" >&2
+  if [[ $local_head != "$remote_head" ]]; then
+    # A tap that is *ahead* is what a failed push after a successful commit
+    # leaves behind, and `pull --ff-only` does not resolve that. Advising it
+    # would contradict the recovery the driver itself prints.
+    if git -C "$tap" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'tap has a commit that is not on origin/main: %s\n' "$tap" >&2
+      printf 'run: git -C %s push\n' "$tap" >&2
+    else
+      printf 'tap is not up to date with origin/main: %s\n' "$tap" >&2
+      printf 'run: git -C %s pull --ff-only\n' "$tap" >&2
+    fi
     return 65
-  }
+  fi
   # Fetching proves read access; the release needs write access. Without this,
   # a missing or expired push credential surfaces only after the GitHub release
   # is already public -- exactly the late, expensive failure these gates exist

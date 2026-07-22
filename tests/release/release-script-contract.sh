@@ -158,6 +158,50 @@ if gascan_gate_tap "$fixture" >/dev/null 2>&1; then
   printf 'a non-repository tap path was accepted\n' >&2; exit 1
 fi
 
+# The push check, exercised against a local remote so the dry run has a real
+# remote to authenticate and negotiate with. Without this the gate's central
+# claim -- that it proves push access -- is asserted by nothing.
+tap_origin=$fixture/tap-origin.git
+tap=$fixture/tap
+git init --quiet --bare --initial-branch=main "$tap_origin"
+git init --quiet --initial-branch=main "$tap"
+git -C "$tap" config user.name release
+git -C "$tap" config user.email release@example.invalid
+mkdir -p "$tap/Casks"
+printf 'seed\n' >"$tap/README.md"
+git -C "$tap" add README.md
+git -C "$tap" commit --quiet -m seed
+git -C "$tap" remote add origin "$tap_origin"
+git -C "$tap" push --quiet origin main
+gascan_gate_tap "$tap" >/dev/null || {
+  printf 'a clean, pushable tap on main was rejected\n' >&2; exit 1; }
+
+# `pushurl` is what makes this a *push* failure: fetch still resolves, so the
+# gate reaches the dry run instead of stopping at the earlier fetch check.
+git -C "$tap" config remote.origin.pushurl "$fixture/absent-remote.git"
+set +e
+unpushable=$(gascan_gate_tap "$tap" 2>&1 >/dev/null)
+unpushable_code=$?
+set -e
+[[ $unpushable_code -ne 0 ]] || {
+  printf 'a tap that cannot be pushed was accepted\n' >&2; exit 1; }
+grep -Fq 'cannot push to origin/main' <<<"$unpushable" || {
+  printf 'unpushable tap message is not about pushing: %s\n' "$unpushable" >&2
+  exit 1; }
+git -C "$tap" config --unset remote.origin.pushurl
+
+# A tap holding a commit the remote does not have must not be told to pull.
+printf 'ahead\n' >>"$tap/README.md"
+git -C "$tap" commit --quiet -am ahead
+set +e
+ahead=$(gascan_gate_tap "$tap" 2>&1 >/dev/null)
+ahead_code=$?
+set -e
+[[ $ahead_code -ne 0 ]] || {
+  printf 'a tap ahead of origin/main was accepted\n' >&2; exit 1; }
+grep -Fq "git -C $tap push" <<<"$ahead" || {
+  printf 'an ahead tap was not told to push: %s\n' "$ahead" >&2; exit 1; }
+
 release=$repo_root/packaging/macos/release.sh
 [[ -x $release ]] || { printf 'release.sh is not executable\n' >&2; exit 1; }
 
@@ -247,7 +291,7 @@ printf 'git %s\n' "$*" >>"${GASCAN_STUB_LOG:?}"
 # after the whole run finishes. Read-only subcommands still reach real git,
 # because the gates need its actual output, and `--dry-run` is read-only: the
 # tap gate uses `push --dry-run` to prove the push credential works.
-if [[ " $* " != *' --dry-run '* ]]; then
+if [[ " $* " != *' push --dry-run '* ]]; then
   for word in "$@"; do
     case $word in
       tag|push|--cleanup-tag)
@@ -277,9 +321,10 @@ set -e
 # this codebase is `git -C REPO ...`, so a prefix pattern like `git tag`* could
 # never match the very mutation it exists to catch.
 while IFS= read -r logged; do
-  # A dry run is read-only; the tap gate uses one to prove push access.
+  # A dry-run push is read-only; the tap gate uses one to prove push access.
+  # Scoped to that exact pair so `--dry-run` cannot excuse anything else.
   case " $logged " in
-    *' --dry-run '*) continue ;;
+    *' push --dry-run '*) continue ;;
   esac
   case " $logged " in
     *' tag '*|*' push '*|*'--cleanup-tag'*|*' release delete '*)
@@ -334,7 +379,7 @@ grep -Fq 'already published' "$release" || {
 # look like a failure. `local status=` is how it would most likely reappear.
 # Written as an `if` so an absent pattern -- the passing case -- does not trip
 # `set -e`.
-if grep -Eq '^[[:space:]]*(local[[:space:]]+)?status=' "$release"; then
+if grep -Eq '(^|[[:space:]])(local|declare|readonly|typeset)?[[:space:]]*status=' "$release"; then
   printf 'release.sh assigns a variable named status\n' >&2
   exit 1
 fi

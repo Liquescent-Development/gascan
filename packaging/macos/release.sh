@@ -119,19 +119,44 @@ restore_ref() {
 # values needed to finish the cask by hand, which the success path would
 # otherwise be the only place to print.
 release_is_live=false
+published=
 asset_url=
 checksum=
+# How far the tap work got. A single fixed recipe would be wrong for most of
+# these: telling an operator to re-render after `brew style` rejected the cask
+# reproduces the file that was just rejected, and telling them to commit again
+# after the commit succeeded dead-ends in git's own "nothing to commit".
+tap_stage=none
+
+print_release_values() {
+  printf '  asset:  %s\n' "$asset_url"
+  printf '  sha256: %s\n' "$checksum"
+}
+
 report_live_release() {
   [[ $release_is_live == true ]] || return 0
   printf '\nthe GitHub release for v%s is already published; do not delete it\n' \
     "$version" >&2
-  printf '  asset:  %s\n' "${asset_url:-unknown}" >&2
-  printf '  sha256: %s\n' "${checksum:-unknown}" >&2
+  if [[ -n $asset_url && -n $checksum ]]; then
+    print_release_values >&2
+  else
+    printf 'publish.sh printed:\n%s\n' "$published" >&2
+  fi
   printf 'finish the cask by hand:\n' >&2
-  printf '  %s/packaging/macos/render-cask.sh %s %s > %s/Casks/gascan.rb\n' \
-    "$repo_root" "$version" "${checksum:-SHA256}" "$tap_path" >&2
-  printf '  git -C %s add Casks/gascan.rb\n' "$tap_path" >&2
-  printf "  git -C %s commit -m 'gascan %s'\n" "$tap_path" "$version" >&2
+  if [[ $tap_stage == none ]]; then
+    printf '  %s/packaging/macos/render-cask.sh %s %s > %s/Casks/gascan.rb\n' \
+      "$repo_root" "$version" "${checksum:-SHA256}" "$tap_path" >&2
+  fi
+  if [[ $tap_stage == rendered ]]; then
+    printf '  # %s/Casks/gascan.rb was rendered and then rejected; correct it first\n' \
+      "$tap_path" >&2
+  fi
+  if [[ $tap_stage == none || $tap_stage == rendered ]]; then
+    printf '  git -C %s add Casks/gascan.rb\n' "$tap_path" >&2
+  fi
+  if [[ $tap_stage != committed ]]; then
+    printf "  git -C %s commit -m 'gascan %s'\n" "$tap_path" "$version" >&2
+  fi
   printf '  git -C %s push\n' "$tap_path" >&2
 }
 
@@ -208,6 +233,7 @@ git -C "$tap_path" pull --ff-only --quiet
 mkdir -p "$tap_path/Casks"
 "$repo_root/packaging/macos/render-cask.sh" "$version" "$checksum" \
   >"$tap_path/Casks/gascan.rb"
+tap_stage=rendered
 ruby -c "$tap_path/Casks/gascan.rb" >/dev/null || {
   printf 'rendered cask is not valid Ruby: %s\n' "$tap_path/Casks/gascan.rb" >&2
   exit 65
@@ -222,19 +248,21 @@ brew style "$tap_path/Casks/gascan.rb" || {
 # Casks/gascan.rb as a new file, which `-a` never stages, so the commit would
 # fail with "nothing to commit" after the release was already published.
 git -C "$tap_path" add Casks/gascan.rb
+tap_stage=staged
 # An identical cask is not a failure. It happens when an operator wrote the
 # cask by hand while recovering and then re-ran, and `git commit` with nothing
 # staged would abort the run under `set -e` with only git's own wording.
 if git -C "$tap_path" diff --cached --quiet; then
   printf 'the cask already carries %s and this checksum; nothing to commit\n' \
     "$version" >&2
+  tap_stage=committed
 else
   git -C "$tap_path" commit --quiet -m "gascan $version"
+  tap_stage=committed
   git -C "$tap_path" push --quiet
 fi
 
 printf '\nreleased %s\n' "$version"
-printf '  asset:  %s\n' "$asset_url"
-printf '  sha256: %s\n' "$checksum"
+print_release_values
 printf '  cask:   %s\n' "$(git -C "$tap_path" rev-parse --short HEAD)"
 printf '  verify: brew update && brew upgrade --cask gascan\n'
