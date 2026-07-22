@@ -202,6 +202,19 @@ set -e
 grep -Fq "git -C $tap push" <<<"$ahead" || {
   printf 'an ahead tap was not told to push: %s\n' "$ahead" >&2; exit 1; }
 
+# A tap missing a commit that origin/main carries must be told to pull, not
+# reconcile by hand or push.
+git -C "$tap" push --quiet origin main
+git -C "$tap" reset --quiet --hard HEAD~1
+set +e
+behind=$(gascan_gate_tap "$tap" 2>&1 >/dev/null)
+behind_code=$?
+set -e
+[[ $behind_code -ne 0 ]] || {
+  printf 'a tap behind origin/main was accepted\n' >&2; exit 1; }
+grep -Fq "git -C $tap pull --ff-only origin main" <<<"$behind" || {
+  printf 'a behind tap was not told to pull: %s\n' "$behind" >&2; exit 1; }
+
 release=$repo_root/packaging/macos/release.sh
 [[ -x $release ]] || { printf 'release.sh is not executable\n' >&2; exit 1; }
 

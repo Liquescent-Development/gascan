@@ -129,9 +129,14 @@ gascan_gate_tap() {
     if git -C "$tap" merge-base --is-ancestor "$remote_head" "$local_head"; then
       printf 'tap has a commit that is not on origin/main: %s\n' "$tap" >&2
       printf 'run: git -C %s push\n' "$tap" >&2
+    elif git -C "$tap" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      printf 'tap is behind origin/main: %s\n' "$tap" >&2
+      printf 'run: git -C %s pull --ff-only origin main\n' "$tap" >&2
     else
-      printf 'tap is not up to date with origin/main: %s\n' "$tap" >&2
-      printf 'run: git -C %s pull --ff-only\n' "$tap" >&2
+      # Neither is an ancestor of the other, so a fast-forward cannot resolve
+      # it and advising one would send the operator in a circle.
+      printf 'tap has diverged from origin/main: %s\n' "$tap" >&2
+      printf 'reconcile it by hand before releasing\n' >&2
     fi
     return 65
   fi
