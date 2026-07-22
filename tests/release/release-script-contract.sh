@@ -199,7 +199,7 @@ ahead_code=$?
 set -e
 [[ $ahead_code -ne 0 ]] || {
   printf 'a tap ahead of origin/main was accepted\n' >&2; exit 1; }
-grep -Fq "git -C $tap push" <<<"$ahead" || {
+grep -Fq "git -C $tap push origin main" <<<"$ahead" || {
   printf 'an ahead tap was not told to push: %s\n' "$ahead" >&2; exit 1; }
 
 # A tap missing a commit that origin/main carries must be told to pull, not

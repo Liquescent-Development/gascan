@@ -144,6 +144,11 @@ report_live_release() {
   fi
   printf 'finish the cask by hand:\n' >&2
   if [[ $tap_stage == none ]]; then
+    # `none` also covers a failed `pull --ff-only`, which means origin/main
+    # moved under the tap. Committing on the stale base would only get the
+    # push rejected, so name the reconcile step before the rest.
+    printf '  # if the tap could not fast-forward, reconcile it first:\n' >&2
+    printf '  #   git -C %s pull --ff-only origin main\n' "$tap_path" >&2
     # render-cask.sh rejects a checksum that is not 64 hex characters, so name
     # the placeholder rather than emitting a command that pastes and fails.
     printf '  %s/packaging/macos/render-cask.sh %s %s > %s/Casks/gascan.rb\n' \
@@ -159,9 +164,12 @@ report_live_release() {
   if [[ $tap_stage != committed ]]; then
     printf "  git -C %s commit -m 'gascan %s'\n" "$tap_path" "$version" >&2
   fi
-  printf '  git -C %s push\n' "$tap_path" >&2
+  printf '  git -C %s push origin main\n' "$tap_path" >&2
 }
 
+# The exit status reports the release, not the ref: a successful release whose
+# ref restore failed still exits 0, because the release did happen and
+# restore_ref has already printed the one command that fixes the checkout.
 on_exit() {
   local exit_code=$?
   restore_ref
@@ -217,9 +225,10 @@ release_is_live=true
 # not redirect its own stdout, so a future gh that chatters there would shift
 # both lines, and a shifted URL ships a cask that breaks every install while
 # the release itself looks fine.
-[[ $(grep -c '' <<<"$published") -eq 2 ]] || {
+published_lines=$(grep -c '' <<<"$published")
+[[ $published_lines -eq 2 ]] || {
   printf 'publish.sh printed %s lines, expected the asset URL then the SHA-256:\n%s\n' \
-    "$(grep -c '' <<<"$published")" "$published" >&2
+    "$published_lines" "$published" >&2
   exit 65
 }
 asset_url=$(sed -n '1p' <<<"$published")
@@ -264,12 +273,18 @@ tap_stage=staged
 if git -C "$tap_path" diff --cached --quiet; then
   printf 'the cask already carries %s and this checksum; nothing to commit\n' \
     "$version" >&2
-  tap_stage=committed
 else
   git -C "$tap_path" commit --quiet -m "gascan $version"
-  tap_stage=committed
-  git -C "$tap_path" push --quiet
 fi
+tap_stage=committed
+# `origin main`, never a bare push, for the same reason the pull above names
+# them: a hand-assembled tap has no upstream tracking, and git's default
+# push.autoSetupRemote is false, so a bare push exits 128 with "no upstream
+# branch" -- after the release is public, on the last mutation of the run.
+# Unconditional, because with nothing committed this is a no-op that says
+# "Everything up-to-date" rather than a step whose safety rests on an
+# invariant established two hundred lines earlier.
+git -C "$tap_path" push --quiet origin main
 
 printf '\nreleased %s\n' "$version"
 print_release_values

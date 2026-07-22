@@ -128,7 +128,7 @@ gascan_gate_tap() {
     # would contradict the recovery the driver itself prints.
     if git -C "$tap" merge-base --is-ancestor "$remote_head" "$local_head"; then
       printf 'tap has a commit that is not on origin/main: %s\n' "$tap" >&2
-      printf 'run: git -C %s push\n' "$tap" >&2
+      printf 'run: git -C %s push origin main\n' "$tap" >&2
     elif git -C "$tap" merge-base --is-ancestor "$local_head" "$remote_head"; then
       printf 'tap is behind origin/main: %s\n' "$tap" >&2
       printf 'run: git -C %s pull --ff-only origin main\n' "$tap" >&2
