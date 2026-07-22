@@ -534,9 +534,14 @@ gascan_gate_tap() {
     if git -C "$tap" merge-base --is-ancestor "$remote_head" "$local_head"; then
       printf 'tap has a commit that is not on origin/main: %s\n' "$tap" >&2
       printf 'run: git -C %s push\n' "$tap" >&2
+    elif git -C "$tap" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      printf 'tap is behind origin/main: %s\n' "$tap" >&2
+      printf 'run: git -C %s pull --ff-only origin main\n' "$tap" >&2
     else
-      printf 'tap is not up to date with origin/main: %s\n' "$tap" >&2
-      printf 'run: git -C %s pull --ff-only\n' "$tap" >&2
+      # Neither is an ancestor of the other, so a fast-forward cannot resolve
+      # it and advising one would send the operator in a circle.
+      printf 'tap has diverged from origin/main: %s\n' "$tap" >&2
+      printf 'reconcile it by hand before releasing\n' >&2
     fi
     return 65
   fi
@@ -986,8 +991,10 @@ report_live_release() {
   fi
   printf 'finish the cask by hand:\n' >&2
   if [[ $tap_stage == none ]]; then
+    # render-cask.sh rejects a checksum that is not 64 hex characters, so name
+    # the placeholder rather than emitting a command that pastes and fails.
     printf '  %s/packaging/macos/render-cask.sh %s %s > %s/Casks/gascan.rb\n' \
-      "$repo_root" "$version" "${checksum:-SHA256}" "$tap_path" >&2
+      "$repo_root" "$version" "${checksum:-<sha256-printed-above>}" "$tap_path" >&2
   fi
   if [[ $tap_stage == rendered ]]; then
     printf '  # %s/Casks/gascan.rb was rendered and then rejected; correct it first\n' \
@@ -1040,13 +1047,15 @@ else
     GASCAN_NOTARYTOOL_PROFILE="$notary_profile" \
       "$repo_root/packaging/macos/package.sh"
   )
+  # One call, not a hand-rolled trio. `pkgutil --check-signature` alone exits 0
+  # for a package signed by any certificate at all, so a trio built from it
+  # would claim more than it proves; this pins the Developer ID Installer
+  # certificate and the team, and asserts the exact payload. The reuse branch
+  # does not repeat it -- reuse is conditional on this same call having just
+  # passed for this same file, and it expands the package and verifies three
+  # signatures each time it runs.
+  gascan_assert_distributable_package "$package" "$GASCAN_RELEASE_TEAM" || exit 65
 fi
-
-# One call, not a hand-rolled trio. `pkgutil --check-signature` alone exits 0
-# for a package signed by any certificate at all, so the trio's own error text
-# claimed more than it proved; the helper also pins the Developer ID Installer
-# certificate and the team, and asserts the exact payload.
-gascan_assert_distributable_package "$package" "$GASCAN_RELEASE_TEAM" || exit 65
 
 published=$("$repo_root/packaging/macos/publish.sh" "$package")
 release_is_live=true
@@ -1071,7 +1080,11 @@ checksum=$(sed -n '2p' <<<"$published")
   exit 65
 }
 
-git -C "$tap_path" pull --ff-only --quiet
+# Name the remote and branch. A hand-assembled tap has no upstream tracking,
+# and a bare `pull --ff-only` fails there with "no tracking information" -- at
+# this point, minutes after the release went public. `gascan_gate_tap` proves
+# the explicit form works, not this one.
+git -C "$tap_path" pull --ff-only --quiet origin main
 mkdir -p "$tap_path/Casks"
 "$repo_root/packaging/macos/render-cask.sh" "$version" "$checksum" \
   >"$tap_path/Casks/gascan.rb"
@@ -1080,9 +1093,10 @@ ruby -c "$tap_path/Casks/gascan.rb" >/dev/null || {
   printf 'rendered cask is not valid Ruby: %s\n' "$tap_path/Casks/gascan.rb" >&2
   exit 65
 }
-# Let brew name the offenses. Discarding them tells the operator only that
+# Let brew name the offenses, on stderr with every other diagnostic so the
+# release summary owns stdout. Discarding them tells the operator only that
 # something is wrong, at the one point where the release is already public.
-brew style "$tap_path/Casks/gascan.rb" || {
+brew style "$tap_path/Casks/gascan.rb" >&2 || {
   printf 'rendered cask fails brew style: %s\n' "$tap_path/Casks/gascan.rb" >&2
   exit 65
 }
