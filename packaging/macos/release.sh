@@ -8,6 +8,8 @@ source "$repo_root/packaging/macos/release-common.sh"
 source "$repo_root/packaging/macos/release-config.sh"
 # shellcheck source=release-gates.sh
 source "$repo_root/packaging/macos/release-gates.sh"
+# shellcheck source=release-recovery.sh
+source "$repo_root/packaging/macos/release-recovery.sh"
 
 usage() {
   cat >&2 <<'EOF_USAGE'
@@ -128,43 +130,10 @@ checksum=
 # after the commit succeeded dead-ends in git's own "nothing to commit".
 tap_stage=none
 
-print_release_values() {
-  printf '  asset:  %s\n' "$asset_url"
-  printf '  sha256: %s\n' "$checksum"
-}
-
 report_live_release() {
   [[ $release_is_live == true ]] || return 0
-  printf '\nthe GitHub release for v%s is already published; do not delete it\n' \
-    "$version" >&2
-  if [[ -n $asset_url && -n $checksum ]]; then
-    print_release_values >&2
-  else
-    printf 'publish.sh printed:\n%s\n' "$published" >&2
-  fi
-  printf 'finish the cask by hand:\n' >&2
-  if [[ $tap_stage == none ]]; then
-    # `none` also covers a failed `pull --ff-only`, which means origin/main
-    # moved under the tap. Committing on the stale base would only get the
-    # push rejected, so name the reconcile step before the rest.
-    printf '  # if the tap could not fast-forward, reconcile it first:\n' >&2
-    printf '  #   git -C %s pull --ff-only origin main\n' "$tap_path" >&2
-    # render-cask.sh rejects a checksum that is not 64 hex characters, so name
-    # the placeholder rather than emitting a command that pastes and fails.
-    printf '  %s/packaging/macos/render-cask.sh %s %s > %s/Casks/gascan.rb\n' \
-      "$repo_root" "$version" "${checksum:-<sha256-printed-above>}" "$tap_path" >&2
-  fi
-  if [[ $tap_stage == rendered ]]; then
-    printf '  # %s/Casks/gascan.rb was rendered and then rejected; correct it first\n' \
-      "$tap_path" >&2
-  fi
-  if [[ $tap_stage == none || $tap_stage == rendered ]]; then
-    printf '  git -C %s add Casks/gascan.rb\n' "$tap_path" >&2
-  fi
-  if [[ $tap_stage != committed ]]; then
-    printf "  git -C %s commit -m 'gascan %s'\n" "$tap_path" "$version" >&2
-  fi
-  printf '  git -C %s push origin main\n' "$tap_path" >&2
+  gascan_report_live_release "$version" "$tap_path" "$repo_root" "$tap_stage" \
+    "$asset_url" "$checksum" "$published" >&2
 }
 
 # The exit status reports the release, not the ref: a successful release whose
@@ -231,16 +200,22 @@ published_lines=$(grep -c '' <<<"$published")
     "$published_lines" "$published" >&2
   exit 65
 }
-asset_url=$(sed -n '1p' <<<"$published")
-checksum=$(sed -n '2p' <<<"$published")
-[[ $asset_url == https://github.com/*/releases/download/*/* ]] || {
+# Validate before assigning. `asset_url` and `checksum` are what the recovery
+# hands the operator to finish the cask with, so a rejected value must never
+# reach them: it would be printed as authoritative and pasted into a
+# render-cask.sh command that render-cask.sh then rejects.
+candidate_url=$(sed -n '1p' <<<"$published")
+candidate_sum=$(sed -n '2p' <<<"$published")
+[[ $candidate_url == https://github.com/*/releases/download/*/* ]] || {
   printf 'publish did not report an asset URL:\n%s\n' "$published" >&2
   exit 65
 }
-[[ $checksum =~ ^[0-9a-f]{64}$ ]] || {
+[[ $candidate_sum =~ ^[0-9a-f]{64}$ ]] || {
   printf 'publish did not report a SHA-256:\n%s\n' "$published" >&2
   exit 65
 }
+asset_url=$candidate_url
+checksum=$candidate_sum
 
 # Name the remote and branch. A hand-assembled tap has no upstream tracking,
 # and a bare `pull --ff-only` fails there with "no tracking information" -- at
@@ -270,12 +245,21 @@ tap_stage=staged
 # An identical cask is not a failure. It happens when an operator wrote the
 # cask by hand while recovering and then re-ran, and `git commit` with nothing
 # staged would abort the run under `set -e` with only git's own wording.
-if git -C "$tap_path" diff --cached --quiet; then
-  printf 'the cask already carries %s and this checksum; nothing to commit\n' \
-    "$version" >&2
-else
-  git -C "$tap_path" commit --quiet -m "gascan $version"
-fi
+# `diff --cached --quiet` exits 1 for differences and above 1 for a real
+# error, so treating every non-zero as "there are changes" would commit on a
+# failed inspection.
+staged=0
+git -C "$tap_path" diff --cached --quiet || staged=$?
+case $staged in
+  0)
+    printf 'the cask already carries %s and this checksum; nothing to commit\n' \
+      "$version" >&2 ;;
+  1) git -C "$tap_path" commit --quiet -m "gascan $version" ;;
+  *)
+    printf 'could not inspect the staged cask in %s (git exited %s)\n' \
+      "$tap_path" "$staged" >&2
+    exit 65 ;;
+esac
 tap_stage=committed
 # `origin main`, never a bare push, for the same reason the pull above names
 # them: a hand-assembled tap has no upstream tracking, and git's default
@@ -287,6 +271,6 @@ tap_stage=committed
 git -C "$tap_path" push --quiet origin main
 
 printf '\nreleased %s\n' "$version"
-print_release_values
+gascan_print_release_values "$asset_url" "$checksum"
 printf '  cask:   %s\n' "$(git -C "$tap_path" rev-parse --short HEAD)"
 printf '  verify: brew update && brew upgrade --cask gascan\n'

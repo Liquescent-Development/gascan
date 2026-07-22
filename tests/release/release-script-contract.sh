@@ -397,4 +397,58 @@ if grep -Eq '(^|[[:space:]])(local|declare|readonly|typeset)?[[:space:]]*status=
   exit 1
 fi
 
+# The recovery narrator, exercised directly. It runs only when a release is
+# already public, so without this it would be covered by a single grep -- and
+# the defects found in it so far were exactly the kind a grep cannot see.
+recovery=$repo_root/packaging/macos/release-recovery.sh
+[[ -r $recovery ]] || { printf 'release-recovery.sh is not readable\n' >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$recovery"
+
+good_url=https://github.com/example/gascan/releases/download/v1.2.3/gascan.pkg
+good_sum=$(printf 'x' | shasum -a 256 | awk '{print $1}')
+
+# Every stage names the commands that remain and none that are already done.
+for stage in none rendered staged committed; do
+  advice=$(gascan_report_live_release 1.2.3 /tmp/tap /tmp/repo "$stage" \
+    "$good_url" "$good_sum" "$good_url"$'\n'"$good_sum")
+  grep -Fq 'already published' <<<"$advice" || {
+    printf 'stage %s does not say the release is published\n' "$stage" >&2; exit 1; }
+  grep -Fq "$good_sum" <<<"$advice" || {
+    printf 'stage %s omits the checksum\n' "$stage" >&2; exit 1; }
+  grep -Fq 'git -C /tmp/tap push origin main' <<<"$advice" || {
+    printf 'stage %s omits the explicit push\n' "$stage" >&2; exit 1; }
+  case $stage in
+    none)
+      grep -Fq 'render-cask.sh' <<<"$advice" || {
+        printf 'stage none omits the render step\n' >&2; exit 1; } ;;
+    rendered|staged|committed)
+      if grep -Fq 'render-cask.sh' <<<"$advice"; then
+        printf 'stage %s tells the operator to re-render an existing cask\n' \
+          "$stage" >&2
+        exit 1
+      fi ;;
+  esac
+  if [[ $stage == committed ]] && grep -Fq 'commit -m' <<<"$advice"; then
+    printf 'stage committed tells the operator to commit again\n' >&2
+    exit 1
+  fi
+done
+
+# A value that failed validation must never be presented as authoritative, and
+# must never be pasted into a render-cask.sh command that render-cask.sh
+# rejects. Empty values are how the driver signals exactly that.
+rejected=$(gascan_report_live_release 1.2.3 /tmp/tap /tmp/repo none '' '' \
+  "chatter"$'\n'"$good_url")
+grep -Fq 'chatter' <<<"$rejected" || {
+  printf 'rejected publish output was not shown raw: %s\n' "$rejected" >&2; exit 1; }
+if grep -Eq '^[[:space:]]*sha256:[[:space:]]*http' <<<"$rejected"; then
+  printf 'a rejected value was labelled as the sha256: %s\n' "$rejected" >&2
+  exit 1
+fi
+if grep -Eq 'render-cask\.sh [0-9.]+ http' <<<"$rejected"; then
+  printf 'a rejected value was pasted into the render command: %s\n' "$rejected" >&2
+  exit 1
+fi
+
 printf 'PASS: Gas Can release script contract\n'
