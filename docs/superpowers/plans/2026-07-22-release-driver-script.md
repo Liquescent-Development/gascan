@@ -601,11 +601,13 @@ while IFS= read -r logged; do
   esac
 done <"$GASCAN_STUB_LOG"
 
-# `--cleanup-tag` is never legitimate, even as printed text: it deletes the
-# signed tag from the remote.
+# `--cleanup-tag` must never be part of an executed deletion: it removes the
+# signed tag from the remote. The gates deliberately *warn* about the flag in
+# prose, which is the line that stops an operator destroying their own tag, so
+# assert the dangerous construction rather than the string.
 for f in "$release" "$gates"; do
-  if grep -Fq -- '--cleanup-tag' "$f"; then
-    printf '%s references --cleanup-tag\n' "$f" >&2; exit 1
+  if grep -Eq 'gh release delete.*--cleanup-tag' "$f"; then
+    printf '%s would delete a tag via --cleanup-tag\n' "$f" >&2; exit 1
   fi
 done
 
