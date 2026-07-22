@@ -552,6 +552,31 @@ if "$release" 1.2.3 --nonsense >/dev/null 2>&1; then
   printf 'unknown flag accepted\n' >&2; exit 1
 fi
 
+# A value-taking flag without a value must say so. Left to `shift 2`, the
+# script aborts under `set -e` with exit 1 and no output at all, which tells an
+# operator who mistyped a flag nothing.
+for incomplete in --codesign-identity --installer-identity --notary-profile \
+  --tap --config; do
+  set +e
+  refused=$("$release" 1.2.3 "$incomplete" 2>&1 >/dev/null)
+  refused_code=$?
+  set -e
+  [[ $refused_code -eq 64 ]] || {
+    printf '%s without a value exited %s, not 64\n' "$incomplete" "$refused_code" >&2
+    exit 1; }
+  grep -Fq 'requires a value' <<<"$refused" || {
+    printf '%s without a value said nothing useful: %s\n' "$incomplete" "$refused" >&2
+    exit 1; }
+  # An empty value is the same mistake wearing a disguise.
+  set +e
+  "$release" 1.2.3 "$incomplete" '' >/dev/null 2>&1
+  empty_code=$?
+  set -e
+  [[ $empty_code -eq 64 ]] || {
+    printf '%s with an empty value exited %s, not 64\n' "$incomplete" "$empty_code" >&2
+    exit 1; }
+done
+
 # A missing required config value stops the run.
 set +e
 unconfigured=$(env -u GASCAN_CODESIGN_IDENTITY -u GASCAN_INSTALLER_SIGNING_IDENTITY \
@@ -583,6 +608,18 @@ STUB_GH
 cat >"$stub_bin/git" <<'STUB_GIT'
 #!/usr/bin/env bash
 printf 'git %s\n' "$*" >>"${GASCAN_STUB_LOG:?}"
+# Refuse the mutation instead of passing it through. `origin` here is a live
+# remote, so an unconditional exec would let a regression create or push a tag
+# for real and only fail the assertion afterwards -- the log scan below runs
+# after the whole run finishes. Read-only subcommands still reach real git,
+# because the gates need its actual output.
+for word in "$@"; do
+  case $word in
+    tag|push|--cleanup-tag)
+      printf 'stub git refused a mutating subcommand: %s\n' "$*" >&2
+      exit 70 ;;
+  esac
+done
 exec /usr/bin/git "$@"
 STUB_GIT
 chmod +x "$stub_bin/gh" "$stub_bin/git"
@@ -680,14 +717,25 @@ flag_profile=
 flag_tap=
 config_file="${XDG_CONFIG_HOME:-$HOME/.config}/gascan/release.env"
 
+# Called as `require_value "$@"`, so $1 is the flag and $2 its value. Without
+# this, a flag given as the last token leaves `shift 2` nothing to shift, and
+# `set -e` aborts the script with exit 1 and not one word of explanation.
+require_value() {
+  [[ $# -ge 2 && -n $2 ]] || {
+    printf '%s requires a value\n' "$1" >&2
+    usage
+    exit 64
+  }
+}
+
 while [[ $# -gt 0 ]]; do
   case $1 in
     --check) check_only=true; shift;;
-    --codesign-identity) flag_application=${2-}; shift 2;;
-    --installer-identity) flag_installer=${2-}; shift 2;;
-    --notary-profile) flag_profile=${2-}; shift 2;;
-    --tap) flag_tap=${2-}; shift 2;;
-    --config) config_file=${2-}; shift 2;;
+    --codesign-identity) require_value "$@"; flag_application=$2; shift 2;;
+    --installer-identity) require_value "$@"; flag_installer=$2; shift 2;;
+    --notary-profile) require_value "$@"; flag_profile=$2; shift 2;;
+    --tap) require_value "$@"; flag_tap=$2; shift 2;;
+    --config) require_value "$@"; config_file=$2; shift 2;;
     -h|--help) usage; exit 0;;
     -*) printf 'unknown flag: %s\n' "$1" >&2; usage; exit 64;;
     *)
