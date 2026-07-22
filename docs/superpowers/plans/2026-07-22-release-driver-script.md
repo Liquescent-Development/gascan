@@ -991,6 +991,11 @@ report_live_release() {
   fi
   printf 'finish the cask by hand:\n' >&2
   if [[ $tap_stage == none ]]; then
+    # `none` also covers a failed `pull --ff-only`, which means origin/main
+    # moved under the tap. Committing on the stale base would only get the
+    # push rejected, so name the reconcile step before the rest.
+    printf '  # if the tap could not fast-forward, reconcile it first:\n' >&2
+    printf '  #   git -C %s pull --ff-only origin main\n' "$tap_path" >&2
     # render-cask.sh rejects a checksum that is not 64 hex characters, so name
     # the placeholder rather than emitting a command that pastes and fails.
     printf '  %s/packaging/macos/render-cask.sh %s %s > %s/Casks/gascan.rb\n' \
@@ -1009,6 +1014,9 @@ report_live_release() {
   printf '  git -C %s push origin main\n' "$tap_path" >&2
 }
 
+# The exit status reports the release, not the ref: a successful release whose
+# ref restore failed still exits 0, because the release did happen and
+# restore_ref has already printed the one command that fixes the checkout.
 on_exit() {
   local exit_code=$?
   restore_ref
@@ -1064,9 +1072,10 @@ release_is_live=true
 # not redirect its own stdout, so a future gh that chatters there would shift
 # both lines, and a shifted URL ships a cask that breaks every install while
 # the release itself looks fine.
-[[ $(grep -c '' <<<"$published") -eq 2 ]] || {
+published_lines=$(grep -c '' <<<"$published")
+[[ $published_lines -eq 2 ]] || {
   printf 'publish.sh printed %s lines, expected the asset URL then the SHA-256:\n%s\n' \
-    "$(grep -c '' <<<"$published")" "$published" >&2
+    "$published_lines" "$published" >&2
   exit 65
 }
 asset_url=$(sed -n '1p' <<<"$published")
