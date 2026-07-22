@@ -327,6 +327,50 @@ fn interactive_lifecycle_progress_updates_in_place_and_finishes_cleanly() -> Tes
 }
 
 #[test]
+fn interactive_streamed_operation_failure_clears_spinner_before_error() -> TestResult {
+    let env = Environment::new()?;
+    assert!(
+        env.command(&["doctor", "--json"])
+            .env("GASCAN_FAKE_PROVISION_FAIL", "1")
+            .output()?
+            .status
+            .success()
+    );
+    let (status, output) = invoke_with_stderr_pty(&env, &["up", env.root()?], false)?;
+
+    let stderr = String::from_utf8(output)?;
+    assert_eq!(
+        status.code(),
+        Some(70),
+        "unexpected failure status; transcript: {}",
+        stderr.escape_debug()
+    );
+    let error_offset = stderr
+        .rfind("Error: ")
+        .ok_or("error line missing from PTY transcript")?;
+    assert!(
+        stderr[..error_offset].ends_with("\r\u{1b}[2K"),
+        "spinner was not cleared immediately before error: {}",
+        stderr.escape_debug()
+    );
+    let after_clear = &stderr[error_offset..];
+    assert!(
+        after_clear.starts_with("Error: ") && after_clear.ends_with("\r\n"),
+        "error is not a clean newline-terminated line: {}",
+        after_clear.escape_debug()
+    );
+    assert_eq!(after_clear.lines().count(), 1);
+    assert!(!after_clear.contains("Preparing sandbox"));
+    assert!(!after_clear.contains("Running project setup"));
+    assert!(
+        !after_clear
+            .chars()
+            .any(|character| { "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(character) })
+    );
+    Ok(())
+}
+
+#[test]
 fn binary_stdin_stdout_stderr_and_environment_are_exact() -> TestResult {
     let env = Environment::new()?;
     assert!(env.invoke(&["up", env.root()?])?.status.success());

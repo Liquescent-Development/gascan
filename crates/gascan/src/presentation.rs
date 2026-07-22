@@ -1,6 +1,3 @@
-// Task 1 establishes the presentation API; command integration follows in later tasks.
-#![allow(dead_code)]
-
 use console::{Style, Term};
 use gascan_proto::v1;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -257,7 +254,8 @@ impl OperationProgress {
         Self::create(kind, sandbox_id, capabilities, draw_target, true)
     }
 
-    pub(crate) fn with_draw_target(
+    #[cfg(test)]
+    fn with_draw_target(
         kind: OperationKind,
         sandbox_id: Option<String>,
         capabilities: OutputCapabilities,

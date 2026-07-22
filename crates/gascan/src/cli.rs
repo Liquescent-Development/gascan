@@ -111,16 +111,26 @@ impl CliError {
     }
 
     pub fn message(&self) -> String {
-        if self.stable_code() == Some(gascan_proto::error_code::SANDBOX_NOT_FOUND) {
+        let stable_code = self.stable_code();
+        if stable_code == Some(gascan_proto::error_code::SANDBOX_NOT_FOUND) {
             return "sandbox not found".to_owned();
         }
-        match self {
-            Self::Client(error) => error.cause().unwrap_or_else(|| error.to_string()),
+        let message = match self {
+            Self::Client(error) => error.cause().unwrap_or_else(|| {
+                stable_code.map_or_else(|| error.to_string(), ToOwned::to_owned)
+            }),
             Self::Usage { message, .. }
             | Self::Operation { message, .. }
             | Self::Runtime(message) => message.clone(),
             Self::Io(error) => error.to_string(),
+        };
+        if message.trim().is_empty() {
+            return stable_code.unwrap_or_default().to_owned();
         }
+        if stable_code == Some("resource_conflict") {
+            return format!("a managed runtime resource already exists: {message}");
+        }
+        message
     }
 
     pub fn suggestion(&self) -> Option<&'static str> {
@@ -556,10 +566,7 @@ async fn run(
             }
             Some(v1::server_frame::Frame::Exit(exit)) => return Ok(exit.code),
             Some(v1::server_frame::Frame::Error(error)) => {
-                return Err(CliError::Operation {
-                    code: error.code,
-                    message: error.message,
-                });
+                return Err(attach_frame_error(error));
             }
             None => {}
         }
@@ -567,6 +574,10 @@ async fn run(
     Err(CliError::Runtime(
         "attach ended without exit status".to_owned(),
     ))
+}
+
+fn attach_frame_error(error: v1::Error) -> CliError {
+    CliError::Runtime(format!("{}: {}", error.code, error.message))
 }
 
 async fn forward_piped_input(sender: tokio::sync::mpsc::Sender<v1::ClientFrame>, token: Vec<u8>) {
@@ -806,7 +817,19 @@ mod tests {
     }
 
     #[test]
-    fn resource_conflict_keeps_the_daemon_cause() {
+    fn empty_operation_message_falls_back_to_its_stable_code() {
+        for message in ["", "  \n\t"] {
+            let error = CliError::Operation {
+                code: "injected_failure".to_owned(),
+                message: message.to_owned(),
+            };
+
+            assert_eq!(error.message(), "injected_failure");
+        }
+    }
+
+    #[test]
+    fn resource_conflict_explains_managed_resource_and_keeps_daemon_cause() {
         let error = CliError::Operation {
             code: "resource_conflict".to_owned(),
             message: "resource conflict for port 3000: already reserved".to_owned(),
@@ -814,9 +837,36 @@ mod tests {
         assert_eq!(error.stable_code(), Some("resource_conflict"));
         assert_eq!(
             error.message(),
-            "resource conflict for port 3000: already reserved"
+            concat!(
+                "a managed runtime resource already exists: ",
+                "resource conflict for port 3000: already reserved",
+            )
         );
-        assert_ne!(error.message(), "resource_conflict");
+    }
+
+    #[test]
+    fn empty_resource_conflict_cause_falls_back_to_stable_code() {
+        let error = CliError::Operation {
+            code: "resource_conflict".to_owned(),
+            message: " \n".to_owned(),
+        };
+
+        assert_eq!(error.message(), "resource_conflict");
+    }
+
+    #[test]
+    fn attach_frame_error_retains_code_and_message_on_runtime_path() {
+        let error = attach_frame_error(v1::Error {
+            code: "process_failed".to_owned(),
+            message: "command exited before setup completed".to_owned(),
+            ..Default::default()
+        });
+
+        assert!(matches!(error, CliError::Runtime(_)));
+        assert_eq!(
+            error.message(),
+            "process_failed: command exited before setup completed"
+        );
     }
 
     #[test]
