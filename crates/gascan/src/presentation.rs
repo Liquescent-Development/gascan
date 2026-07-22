@@ -23,11 +23,17 @@ pub(crate) struct OutputCapabilities {
 
 impl OutputCapabilities {
     pub(crate) fn for_stdout() -> Self {
-        Self::for_term(Term::stdout(), console::colors_enabled())
+        Self::for_term(
+            Term::stdout(),
+            std::env::var_os("NO_COLOR").is_none() && console::colors_enabled(),
+        )
     }
 
     pub(crate) fn for_stderr() -> Self {
-        Self::for_term(Term::stderr(), console::colors_enabled_stderr())
+        Self::for_term(
+            Term::stderr(),
+            std::env::var_os("NO_COLOR").is_none() && console::colors_enabled_stderr(),
+        )
     }
 
     fn for_term(term: Term, color: bool) -> Self {
@@ -168,6 +174,7 @@ impl OperationProgress {
 mod tests {
     use super::*;
     use gascan_proto::v1;
+    use std::process::Command;
 
     fn event(phase: &str) -> v1::OperationEvent {
         v1::OperationEvent {
@@ -265,5 +272,30 @@ mod tests {
             progress.finish_success().as_deref(),
             Some("Sandbox code-123 is stopped")
         );
+    }
+
+    #[test]
+    fn no_color_takes_precedence_over_clicolor_force() -> Result<(), Box<dyn std::error::Error>> {
+        const CHILD_MARKER: &str = "GASCAN_TEST_NO_COLOR_PRECEDENCE";
+
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            assert!(!OutputCapabilities::for_stdout().color);
+            assert!(!OutputCapabilities::for_stderr().color);
+            return Ok(());
+        }
+
+        let status = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "presentation::tests::no_color_takes_precedence_over_clicolor_force",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .env("NO_COLOR", "1")
+            .env("CLICOLOR_FORCE", "1")
+            .status()?;
+
+        assert!(status.success());
+        Ok(())
     }
 }
