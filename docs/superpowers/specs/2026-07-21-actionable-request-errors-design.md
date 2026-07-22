@@ -113,18 +113,33 @@ Instead the change is strictly additive:
 tonic 0.12.3 serializes details to the `grpc-status-details-bin` header and
 parses them back, so this survives the local socket transport.
 
-The daemon composes the full human text, including the remedy, so the CLI stays
-a renderer and the remedy lives beside the code that knows what failed.
+The daemon composes the human text, so the CLI stays a renderer and the wording
+lives beside the code that knows what failed. Where a remedy is not already
+implicit in the underlying error, the daemon states one — for example, a root
+whose name cannot be derived is told to set `name` in `gascan.toml`.
 
 ### Resulting output
 
-Replacing `daemon error: invalid_request`:
+Replacing `daemon error: invalid_request`, as verified end to end against the
+built binaries:
 
 ```
-error: invalid manifest at /Users/kiener/code/gascan.toml
-  unknown variant `kiener`, expected `workspace` or `root`
-  remedy: set user to "workspace" or "root"
+error: cannot use `/private/tmp/proj/gascan.toml`: invalid gascan.toml: TOML parse error at line 4, column 8
+  |
+4 | user = "kiener"
+  |        ^^^^^^^^
+unknown variant `kiener`, expected `workspace` or `root`
 ```
+
+The remedy here is carried by `toml`'s own diagnostic, which names the field,
+the rejected value, the accepted set, and the offending line — richer than a
+separate `remedy:` line would be. A bad project root is reported separately:
+
+```
+cannot use `/definitely/not/real` as a project root: No such file or directory (os error 2)
+```
+
+which the CLI rejects locally with exit code 64, without a daemon round trip.
 
 ### Version skew
 
