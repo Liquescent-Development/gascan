@@ -198,6 +198,16 @@ for incomplete in --codesign-identity --installer-identity --notary-profile \
   [[ $empty_code -eq 64 ]] || {
     printf '%s with an empty value exited %s, not 64\n' "$incomplete" "$empty_code" >&2
     exit 1; }
+  # Nor may a flag swallow the flag that follows it. `--config --check` taking
+  # `--check` as a path drops the flag that makes the run read-only.
+  set +e
+  "$release" 1.2.3 "$incomplete" --check >/dev/null 2>&1
+  swallow_code=$?
+  set -e
+  [[ $swallow_code -eq 64 ]] || {
+    printf '%s swallowed the following flag, exiting %s not 64\n' \
+      "$incomplete" "$swallow_code" >&2
+    exit 1; }
 done
 
 # A missing required config value stops the run.

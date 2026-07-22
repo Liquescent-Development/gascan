@@ -47,6 +47,14 @@ require_value() {
     usage
     exit 64
   }
+  # A following flag is not a value. `--config --check` would otherwise take
+  # `--check` as the config path and silently drop the flag that makes this run
+  # read-only, turning a rehearsal into a real release.
+  [[ $2 != -* ]] || {
+    printf '%s requires a value, but the next argument is a flag: %s\n' "$1" "$2" >&2
+    usage
+    exit 64
+  }
 }
 
 while [[ $# -gt 0 ]]; do
