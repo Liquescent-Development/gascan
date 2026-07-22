@@ -158,4 +158,98 @@ if gascan_gate_tap "$fixture" >/dev/null 2>&1; then
   printf 'a non-repository tap path was accepted\n' >&2; exit 1
 fi
 
+release=$repo_root/packaging/macos/release.sh
+[[ -x $release ]] || { printf 'release.sh is not executable\n' >&2; exit 1; }
+
+if "$release" >/dev/null 2>&1; then
+  printf 'missing version accepted\n' >&2; exit 1
+fi
+[[ $("$release" 2>&1 >/dev/null | head -1) == usage:* ]] || {
+  printf 'no usage line on a missing version\n' >&2; exit 1; }
+
+if "$release" 1.2 --check >/dev/null 2>&1; then
+  printf 'malformed version accepted\n' >&2; exit 1
+fi
+
+if "$release" 1.2.3 --nonsense >/dev/null 2>&1; then
+  printf 'unknown flag accepted\n' >&2; exit 1
+fi
+
+# A missing required config value stops the run.
+set +e
+unconfigured=$(env -u GASCAN_CODESIGN_IDENTITY -u GASCAN_INSTALLER_SIGNING_IDENTITY \
+  -u GASCAN_NOTARYTOOL_PROFILE -u GASCAN_TAP_PATH \
+  "$release" "$workspace_version" --check --config "$fixture/absent.env" 2>&1 >/dev/null)
+unconfigured_code=$?
+set -e
+[[ $unconfigured_code -ne 0 ]] || {
+  printf 'a run with no configuration was accepted\n' >&2; exit 1; }
+grep -Fq 'missing required release configuration' <<<"$unconfigured" || {
+  printf 'no missing-configuration message: %s\n' "$unconfigured" >&2; exit 1; }
+
+# Mutation is asserted behaviorally, not by source grep. Remediation text
+# legitimately contains `git tag -s` and `gh release delete`, so grepping the
+# source cannot distinguish a printed suggestion from an executed command.
+# Stub git and gh, run --check, and require the log shows no mutation.
+stub_bin=$fixture/bin
+mkdir -p "$stub_bin"
+export GASCAN_STUB_LOG=$fixture/commands.log
+: >"$GASCAN_STUB_LOG"
+cat >"$stub_bin/gh" <<'STUB_GH'
+#!/usr/bin/env bash
+printf 'gh %s\n' "$*" >>"${GASCAN_STUB_LOG:?}"
+case "${1:-} ${2:-}" in
+  'release view') exit 1 ;;
+esac
+exit 0
+STUB_GH
+cat >"$stub_bin/git" <<'STUB_GIT'
+#!/usr/bin/env bash
+printf 'git %s\n' "$*" >>"${GASCAN_STUB_LOG:?}"
+exec /usr/bin/git "$@"
+STUB_GIT
+chmod +x "$stub_bin/gh" "$stub_bin/git"
+
+set +e
+PATH=$stub_bin:$PATH GASCAN_CODESIGN_IDENTITY=x GASCAN_INSTALLER_SIGNING_IDENTITY=x \
+  GASCAN_NOTARYTOOL_PROFILE=x GASCAN_TAP_PATH="$fixture" \
+  "$release" "$workspace_version" --check >/dev/null 2>&1
+set -e
+
+# The log must not be empty: every gate that runs shells out to git or gh, so
+# an empty log means the script died before reaching them and the scan below
+# would pass without inspecting anything.
+[[ -s $GASCAN_STUB_LOG ]] || {
+  printf 'check mode ran no git or gh commands; the mutation scan proved nothing\n' >&2
+  exit 1; }
+
+# Match the subcommand anywhere in the line, not at the start: every call in
+# this codebase is `git -C REPO ...`, so a prefix pattern like `git tag`* could
+# never match the very mutation it exists to catch.
+while IFS= read -r logged; do
+  case " $logged " in
+    *' tag '*|*' push '*|*'--cleanup-tag'*|*' release delete '*)
+      printf 'check mode attempted a mutation: %s\n' "$logged" >&2
+      exit 1 ;;
+  esac
+done <"$GASCAN_STUB_LOG"
+
+# `--cleanup-tag` must never be part of an executed deletion: it removes the
+# signed tag from the remote. The gates deliberately *warn* about the flag in
+# prose, which is the line that stops an operator destroying their own tag, so
+# assert the dangerous construction rather than the string.
+for f in "$release" "$gates"; do
+  if grep -Eq 'gh release delete.*--cleanup-tag' "$f"; then
+    printf '%s would delete a tag via --cleanup-tag\n' "$f" >&2; exit 1
+  fi
+done
+
+# No hardcoded identity, team identifier, or profile.
+for f in "$release" "$gates" "$config"; do
+  if grep -Eq 'Developer ID (Application|Installer): [A-Za-z]|\([A-Z0-9]{10}\)' "$f"; then
+    printf 'hardcoded signing identity or team identifier in %s\n' "$f" >&2
+    exit 1
+  fi
+done
+
 printf 'PASS: Gas Can release script contract\n'
