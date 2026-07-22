@@ -96,6 +96,50 @@ grep -Fq "$workspace_version" <<<"$mismatch" || {
 gascan_gate_version "$repo_root" "$workspace_version" >/dev/null || {
   printf 'the workspace version was rejected\n' >&2; exit 1; }
 
+# gascan_gate_github and the discrimination gascan_gate_no_release now does:
+# a gh that cannot answer -- auth failure, rate limit, network outage -- must
+# never be read as "no release exists". Exercised with a stub gh rather than a
+# source grep, because the I1 bug this closes was exactly a source line that a
+# keyword grep would have kept matching.
+github_stub=$fixture/github-stub
+mkdir -p "$github_stub"
+cat >"$github_stub/gh" <<'STUB_GH_AUTH'
+#!/usr/bin/env bash
+case "${1:-} ${2:-}" in
+  'auth status') exit "${GASCAN_STUB_GH_AUTH_CODE:-0}" ;;
+  'release view') exit "${GASCAN_STUB_GH_VIEW_CODE:-1}" ;;
+esac
+exit 0
+STUB_GH_AUTH
+chmod +x "$github_stub/gh"
+
+set +e
+unauth=$(PATH=$github_stub:$PATH GASCAN_STUB_GH_AUTH_CODE=1 gascan_gate_github 2>&1)
+unauth_code=$?
+set -e
+[[ $unauth_code -ne 0 ]] || {
+  printf 'an unauthenticated gh was accepted\n' >&2; exit 1; }
+grep -Fq 'gh auth login' <<<"$unauth" || {
+  printf 'unauthenticated message omits the remediation: %s\n' "$unauth" >&2; exit 1; }
+
+PATH=$github_stub:$PATH GASCAN_STUB_GH_AUTH_CODE=0 gascan_gate_github >/dev/null || {
+  printf 'an authenticated gh was rejected\n' >&2; exit 1; }
+
+# I1, reproduced directly: a gh that cannot answer must never pass as "no
+# release exists".
+set +e
+noanswer=$(PATH=$github_stub:$PATH GASCAN_STUB_GH_VIEW_CODE=4 gascan_gate_no_release 0.1.4 2>&1)
+noanswer_code=$?
+set -e
+[[ $noanswer_code -ne 0 ]] || {
+  printf 'gascan_gate_no_release passed although gh could not answer\n' >&2; exit 1; }
+grep -Fq 'could not ask GitHub' <<<"$noanswer" || {
+  printf 'the could-not-answer message is missing: %s\n' "$noanswer" >&2; exit 1; }
+
+# "not found" (exit 1) remains the one acceptable "no release" answer.
+PATH=$github_stub:$PATH GASCAN_STUB_GH_VIEW_CODE=1 gascan_gate_no_release 0.1.4 >/dev/null || {
+  printf 'gascan_gate_no_release rejected a genuine not-found answer\n' >&2; exit 1; }
+
 # Tag gates, exercised behaviorally in a disposable clone with an ephemeral
 # signing key -- the technique publish-contract.sh uses, so the property holds
 # for whatever version the workspace carries.

@@ -93,6 +93,7 @@ gascan_gate_tools
 gascan_gate_version "$repo_root" "$version"
 gascan_assert_release_inputs_clean "$repo_root" "release $version"
 gascan_gate_tag "$repo_root" "$version"
+gascan_gate_github
 gascan_gate_no_release "$version"
 gascan_gate_identities "$application_identity" "$installer_identity"
 gascan_gate_notary "$notary_profile"
@@ -122,6 +123,7 @@ restore_ref() {
 # the only place to print. The asset URL goes with it as confirmation of what
 # was published; render-cask.sh derives its own URL from the version.
 release_is_live=false
+publish_attempted=false
 published=
 asset_url=
 checksum=
@@ -132,6 +134,12 @@ checksum=
 tap_stage=none
 
 report_live_release() {
+  if [[ $release_is_live != true && $publish_attempted == true ]]; then
+    # publish died without saying how far it got. Ask GitHub rather than
+    # assume: a draft is recoverable, a published release is not.
+    [[ $(gh release view "v$version" --json isDraft --jq '.isDraft' 2>/dev/null) == false ]] &&
+      release_is_live=true
+  fi
   [[ $release_is_live == true ]] || return 0
   gascan_report_live_release "$version" "$tap_path" "$repo_root" "$tap_stage" \
     "$asset_url" "$checksum" "$published" >&2
@@ -186,6 +194,7 @@ fi
 # branch above still calls it, because there it is the reuse predicate rather
 # than a repeat.
 
+publish_attempted=true
 published=$("$repo_root/packaging/macos/publish.sh" "$package")
 release_is_live=true
 # publish.sh's stdout is a two-line contract: asset URL, then SHA-256. Assert

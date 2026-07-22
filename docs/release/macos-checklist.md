@@ -110,7 +110,9 @@ can push to; `--check` proves all four before anything is built.
 
 `release.sh` never creates, moves, or deletes a tag, and never deletes a
 release. Create and push the signed tag first. The manual steps below remain
-correct and are what the script runs — read them when a gate fails.
+correct and are what the script runs — read them when a gate fails. Where a
+gate's message and a manual step disagree, the gate is right: it was written
+against the current tooling.
 
 From the signed release tag, push it, build, and publish:
 
@@ -151,8 +153,12 @@ stranded draft that blocks re-publishing the same version with
 retrying:
 
 ```sh
-gh release delete v<version> --cleanup-tag --yes
+gh release delete v<version> --yes
 ```
+
+Do not add `--cleanup-tag`: it deletes the signed tag from the remote, and the
+release gate then refuses every later run because the tag it verifies is gone.
+Recreating it produces a different tag object.
 
 ## Install and verify
 

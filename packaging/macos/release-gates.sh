@@ -53,9 +53,25 @@ gascan_gate_tag() {
   }
 }
 
+gascan_gate_github() {
+  gh auth status >/dev/null 2>&1 || {
+    printf 'GitHub CLI is not authenticated for this repository\n' >&2
+    printf 'run: gh auth login\n' >&2
+    return 65
+  }
+}
+
 gascan_gate_no_release() {
-  local version=$1 tag="v$1" draft
-  gh release view "$tag" >/dev/null 2>&1 || return 0
+  local version=$1 tag="v$1" draft view_code=0
+  gh release view "$tag" >/dev/null 2>&1 || view_code=$?
+  # 1 is "not found" and is the only acceptable failure. Anything else means gh
+  # could not answer, and that must never read as "no release exists".
+  [[ $view_code -eq 1 ]] && return 0
+  [[ $view_code -eq 0 ]] || {
+    printf 'could not ask GitHub whether %s already exists (gh exited %s)\n' \
+      "$tag" "$view_code" >&2
+    return 65
+  }
   draft=$(gh release view "$tag" --json isDraft --jq '.isDraft' 2>/dev/null) || draft=unknown
   printf 'a release for %s already exists (draft: %s)\n' "$tag" "$draft" >&2
   printf 'a published release is never overwritten; delete a stranded draft with:\n' >&2

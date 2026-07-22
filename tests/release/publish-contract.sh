@@ -38,8 +38,17 @@ set -euo pipefail
 printf '%s\n' "$*" >>"${GASCAN_STUB_GH_LOG:?}"
 case "${1:-} ${2:-}" in
   'release view')
+    if [[ " $* " == *' --json '* ]]; then
+      printf '%s\n' "${GASCAN_STUB_GH_ASSETS:?}"
+      exit 0
+    fi
     [[ ${GASCAN_STUB_GH_EXISTING:-no} == yes ]] && exit 0
     exit 1 ;;
+  'release upload')
+    # Real gh is suspected to gate this on a TTY, but that cannot be proven
+    # without a live release. Chatter here regardless, so the assertion below
+    # verifies publish.sh's own redirect, not gh's behavior.
+    printf 'Uploading gascan.pkg 100%%\n' ;;
 esac
 exit 0
 STUB
@@ -263,6 +272,49 @@ if [[ "$(cat "$GASCAN_STUB_GH_LOG")" != "release view $tag" ]]; then
   printf 'Case C: gh was not called exactly once with release view: %s\n' "$(cat "$GASCAN_STUB_GH_LOG")" >&2
   exit 1
 fi
+
+# Case D: the full happy path, distributable gate bypassed exactly as Case C
+# and no existing release, so publish.sh runs all the way through. The stub
+# gh chatters on `release upload`'s stdout, the same way the real CLI's
+# progress message is suspected to -- unprovable without a live release --
+# so this is what proves publish.sh's own stdout stays exactly the asset URL
+# then the SHA-256 regardless. This is the producing side of that two-line
+# contract release.sh asserts; every other publish.sh invocation in this file
+# is a failing case captured with `2>&1 >/dev/null`, so nothing tested it
+# before.
+: >"$GASCAN_STUB_GH_LOG"
+export GASCAN_STUB_TRUST_BYPASS=yes
+export GASCAN_STUB_FIXTURE_PKG=$fixture_pkg
+export GASCAN_STUB_TEAM=$team
+export GASCAN_STUB_GH_EXISTING=no
+base_name=$(basename "$fixture_pkg")
+export GASCAN_STUB_GH_ASSETS="build-manifest.json,$base_name,$base_name.sha256"
+set +e
+case_d_out=$(PATH=$stub_bin:$PATH "$clone/packaging/macos/publish.sh" "$fixture_pkg")
+case_d_status=$?
+set -e
+unset GASCAN_STUB_TRUST_BYPASS GASCAN_STUB_FIXTURE_PKG GASCAN_STUB_TEAM \
+  GASCAN_STUB_GH_EXISTING GASCAN_STUB_GH_ASSETS
+if [[ $case_d_status -ne 0 ]]; then
+  printf 'Case D: publish failed on the happy path:\n%s\n' "$case_d_out" >&2
+  exit 1
+fi
+case_d_lines=$(grep -c '' <<<"$case_d_out")
+[[ $case_d_lines -eq 2 ]] || {
+  printf 'Case D: expected exactly two stdout lines, got %s:\n%s\n' \
+    "$case_d_lines" "$case_d_out" >&2
+  exit 1
+}
+case_d_url=$(sed -n '1p' <<<"$case_d_out")
+case_d_sum=$(sed -n '2p' <<<"$case_d_out")
+[[ $case_d_url == https://github.com/*/releases/download/*/* ]] || {
+  printf 'Case D: first line is not an asset-URL shape: %s\n' "$case_d_url" >&2
+  exit 1
+}
+[[ $case_d_sum =~ ^[0-9a-f]{64}$ ]] || {
+  printf 'Case D: second line is not 64 hex characters: %s\n' "$case_d_sum" >&2
+  exit 1
+}
 
 # It must never clobber.
 if grep -q -- '--clobber' "$publish"; then

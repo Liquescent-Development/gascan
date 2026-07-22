@@ -88,7 +88,7 @@ EOF_NOTES
 gh release create "$tag" --draft --title "Gas Can $version" --notes-file "$work/notes.md" \
   --verify-tag --target "$revision" >/dev/null
 gh release upload "$tag" \
-  "$package" "$work/$base.sha256" "$work/build-manifest.json"
+  "$package" "$work/$base.sha256" "$work/build-manifest.json" >/dev/null
 assets=$(gh release view "$tag" --json assets --jq '[.assets[].name] | sort | join(",")')
 expected=$(gascan_expected_release_assets "$base")
 [[ $assets == "$expected" ]] || {
