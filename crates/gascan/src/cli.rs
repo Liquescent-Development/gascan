@@ -131,7 +131,12 @@ fn resolve_project_root(project_root: &str) -> Result<String, CliError> {
             "cannot use `{project_root}` as a project root: {error}"
         ))
     })?;
-    if !resolved.is_dir() {
+    let metadata = resolved.metadata().map_err(|error| {
+        CliError::Usage(format!(
+            "cannot use `{project_root}` as a project root: {error}"
+        ))
+    })?;
+    if !metadata.is_dir() {
         return Err(CliError::Usage(format!(
             "cannot use `{project_root}` as a project root: not a directory"
         )));

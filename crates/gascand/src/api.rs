@@ -2492,6 +2492,38 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_manifest_is_rejected_as_invalid_manifest_not_invalid_project_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir()?;
+        let manifest_path = directory.path().join("gascan.toml");
+        std::fs::write(&manifest_path, "version = 1\n")?;
+        std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o000))?;
+        let root = directory
+            .path()
+            .to_str()
+            .ok_or("non-UTF-8 fixture")?
+            .to_owned();
+
+        let result = spec_for_root(root).await;
+        std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o644))?;
+        let status = result
+            .err()
+            .ok_or("an unreadable manifest must be rejected")?
+            .status();
+        assert_eq!(status.message(), error_code::INVALID_MANIFEST);
+        let cause = gascan_proto::error_detail::decode_message(status.details())
+            .ok_or("the status must carry a human cause")?;
+        assert!(
+            !cause.contains("as a project root"),
+            "an unreadable manifest must not be blamed on the project root: {cause}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn resolving_a_root_does_not_change_sandbox_identity()
     -> Result<(), Box<dyn std::error::Error>> {

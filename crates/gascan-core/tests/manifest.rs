@@ -127,6 +127,29 @@ fn load_rejects_setup_symlink_that_escapes_the_canonical_root() {
     assert!(error.to_string().contains("outside the workspace root"));
 }
 
+#[cfg(unix)]
+#[test]
+fn load_classifies_an_unreadable_manifest_as_a_manifest_error()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).expect("UTF-8 temporary path");
+    let manifest_path = root.join("gascan.toml");
+    std::fs::write(&manifest_path, "version = 1\n")?;
+    std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o000))?;
+
+    let result = Manifest::load(root);
+    std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o644))?;
+    let error = result.expect_err("an unreadable manifest must fail to load");
+
+    assert!(
+        !error.is_project_root_error(),
+        "an unreadable manifest is a manifest-content failure, not a project-root failure: {error}"
+    );
+    Ok(())
+}
+
 #[test]
 fn load_allows_a_not_yet_created_setup_path_beneath_root() {
     let temp = tempfile::tempdir().expect("temporary root");
