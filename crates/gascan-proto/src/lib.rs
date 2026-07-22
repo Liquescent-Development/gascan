@@ -5,7 +5,7 @@
 /// Supported API major version.
 pub const API_MAJOR: u32 = 1;
 /// Current backwards-compatible API minor version.
-pub const API_MINOR: u32 = 0;
+pub const API_MINOR: u32 = 1;
 /// Required POSIX permission bits for the local socket directory (`0700`).
 pub const SOCKET_DIRECTORY_MODE: u32 = 0o700;
 /// Required POSIX permission bits for the local socket (`0600`).
@@ -19,6 +19,10 @@ pub mod error_code {
     pub const INCOMPATIBLE_API_MAJOR: &str = "incompatible_api_major";
     /// A request failed validation.
     pub const INVALID_REQUEST: &str = "invalid_request";
+    /// A manifest could not be parsed or is not valid for its project root.
+    pub const INVALID_MANIFEST: &str = "invalid_manifest";
+    /// A project root is empty, relative, missing, or not a directory.
+    pub const INVALID_PROJECT_ROOT: &str = "invalid_project_root";
     /// The selected runtime cannot enforce a requested disk ceiling.
     pub const DISK_CONTROL_UNSUPPORTED: &str = "disk_control_unsupported";
     /// The selected sandbox does not exist.
@@ -42,6 +46,8 @@ pub mod error_code {
     pub const ALL: &[&str] = &[
         INCOMPATIBLE_API_MAJOR,
         INVALID_REQUEST,
+        INVALID_MANIFEST,
+        INVALID_PROJECT_ROOT,
         DISK_CONTROL_UNSUPPORTED,
         SANDBOX_NOT_FOUND,
         OPERATION_CONFLICT,
@@ -52,6 +58,41 @@ pub mod error_code {
         EXPIRED_SESSION_TOKEN,
         SESSION_TOKEN_MISMATCH,
     ];
+}
+
+/// Encoding for the human-readable cause that travels beside a stable code.
+///
+/// The stable code stays in the gRPC status message, where every existing
+/// client already reads it. The cause travels in the status details, so adding
+/// one cannot change what an older client sees, and a client that does not
+/// understand details keeps working unchanged.
+pub mod error_detail {
+    use prost::Message as _;
+
+    /// Encode a code and human cause for `tonic::Status::with_details`.
+    #[must_use]
+    pub fn encode(code: &str, message: &str) -> Vec<u8> {
+        super::v1::Error {
+            code: code.to_owned(),
+            message: message.to_owned(),
+            details: Vec::new(),
+        }
+        .encode_to_vec()
+    }
+
+    /// Recover the human cause produced by [`encode`].
+    ///
+    /// Returns `None` for absent, malformed, or empty details so a caller can
+    /// fall back to the stable code. A malformed detail must never be worse
+    /// than no detail at all.
+    #[must_use]
+    pub fn decode_message(details: &[u8]) -> Option<String> {
+        if details.is_empty() {
+            return None;
+        }
+        let error = super::v1::Error::decode(details).ok()?;
+        (!error.message.is_empty()).then_some(error.message)
+    }
 }
 
 /// Reason an opaque Run/Shell attachment token is invalid.

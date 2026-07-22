@@ -996,3 +996,41 @@ fn handshake_rejects_a_different_api_major_with_a_stable_code() {
         "incompatible_api_major"
     );
 }
+
+#[test]
+fn request_validation_codes_are_public_and_unique() {
+    let codes = gascan_proto::error_code::ALL;
+    assert!(codes.contains(&"invalid_manifest"));
+    assert!(codes.contains(&"invalid_project_root"));
+    assert_eq!(
+        codes.len(),
+        codes.iter().copied().collect::<HashSet<_>>().len()
+    );
+}
+
+#[test]
+fn error_detail_round_trips_the_human_cause() {
+    let encoded = gascan_proto::error_detail::encode(
+        gascan_proto::error_code::INVALID_MANIFEST,
+        "unknown variant `kiener`, expected `workspace` or `root`",
+    );
+    assert_eq!(
+        gascan_proto::error_detail::decode_message(&encoded).as_deref(),
+        Some("unknown variant `kiener`, expected `workspace` or `root`")
+    );
+}
+
+#[test]
+fn error_detail_degrades_instead_of_failing() {
+    // Absent details: an older daemon sends none, and the caller must fall back
+    // to the stable code rather than error.
+    assert_eq!(gascan_proto::error_detail::decode_message(&[]), None);
+    // Truncated: field 1 is a length-5 string with no bytes following.
+    assert_eq!(
+        gascan_proto::error_detail::decode_message(&[0x0a, 0x05]),
+        None
+    );
+    // Well-formed but empty message: nothing useful to show.
+    let empty = gascan_proto::error_detail::encode("invalid_manifest", "");
+    assert_eq!(gascan_proto::error_detail::decode_message(&empty), None);
+}
