@@ -43,17 +43,46 @@ version. Both remain deliberate human acts.
 writing anything. It requires the same configuration as a real run, including
 the tap path, because verifying tap readiness is one of the gates.
 
-Configuration, all overridable by environment, none of it secret:
+### Configuration
 
-| Variable | Default |
-| --- | --- |
-| `GASCAN_CODESIGN_IDENTITY` | `Developer ID Application: Liquescent Development LLC (Z548WR4TF8)` |
-| `GASCAN_INSTALLER_SIGNING_IDENTITY` | `Developer ID Installer: Liquescent Development LLC (Z548WR4TF8)` |
-| `GASCAN_NOTARYTOOL_PROFILE` | `AC_PASSWORD` |
-| `GASCAN_TAP_PATH` | none; required unless `--tap` is given |
+Four values are required. **None is defaulted in the script.** Signing
+identities and a keychain profile name are organization- and machine-specific;
+baking them into a repository script makes the repo carry one operator's setup
+and quietly breaks for anyone else.
+
+| Value | Flag | Environment |
+| --- | --- | --- |
+| Developer ID Application identity | `--codesign-identity` | `GASCAN_CODESIGN_IDENTITY` |
+| Developer ID Installer identity | `--installer-identity` | `GASCAN_INSTALLER_SIGNING_IDENTITY` |
+| Notarization keychain profile name | `--notary-profile` | `GASCAN_NOTARYTOOL_PROFILE` |
+| Tap checkout path | `--tap` | `GASCAN_TAP_PATH` |
+
+Resolved by precedence, first match wins:
+
+1. an explicit flag
+2. the environment
+3. `~/.config/gascan/release.env`
+
+The config file lives outside the repository, so nothing organization-specific
+is ever committed. It is a plain `KEY=value` file, one per line, read as data --
+never sourced or executed, so a stray command in it cannot run:
+
+```
+GASCAN_CODESIGN_IDENTITY=Developer ID Application: Example LLC (TEAMID1234)
+GASCAN_INSTALLER_SIGNING_IDENTITY=Developer ID Installer: Example LLC (TEAMID1234)
+GASCAN_NOTARYTOOL_PROFILE=my-notary-profile
+GASCAN_TAP_PATH=/path/to/homebrew-tap
+```
+
+Written once, `./packaging/macos/release.sh 0.1.5` is then a complete command.
+
+If a value is missing from all three layers the run stops before doing anything,
+naming the missing value and all three ways to supply it.
 
 The notarization profile is referenced by **name** only. No key, password, or
-API credential is ever accepted as an argument or environment value.
+API credential is ever accepted as a flag, an environment value, or a config
+entry. The environment variable names match those `package.sh` already consumes,
+so an operator who exports them today keeps working unchanged.
 
 ### Tag ownership
 
@@ -133,8 +162,15 @@ contracts:
   property holds for whatever version the workspace carries
 - refuses on dirty release inputs
 - `--check` mutates nothing: no commit, no tag, no artifact, no network write
-- source assertions: the script never passes `--cleanup-tag`, and never accepts
-  a key, password, or API credential as an argument or environment value
+- refuses when a required configuration value is absent from flags, environment,
+  and config file, naming the missing value
+- flag beats environment, and environment beats config file
+- source assertions: the script never passes `--cleanup-tag`; never accepts a
+  key, password, or API credential as a flag, environment value, or config
+  entry; and contains **no hardcoded signing identity, team identifier, or
+  notary profile string**, so a convenience default cannot creep back in
+- the config file is parsed as data: a config line containing shell syntax is
+  treated as a value, not executed
 
 The full happy path cannot run offline -- it requires a real signed tag, live
 Apple notarization, and two remotes -- so it is asserted structurally, the same
