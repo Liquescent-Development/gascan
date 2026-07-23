@@ -1731,7 +1731,7 @@ mod tests {
                 Ok(())
             },
         )?;
-        let error = mutate_if_freshly_owned(
+        let Err(error) = mutate_if_freshly_owned(
             &network,
             id.as_str(),
             |_, _| {
@@ -1745,8 +1745,9 @@ mod tests {
                 deleted.borrow_mut().push(identity.name().to_owned());
                 Ok(())
             },
-        )
-        .unwrap_err();
+        ) else {
+            return Err("freshly foreign network was unexpectedly mutated".into());
+        };
 
         assert!(error.to_string().contains("mismatched ownership"));
         assert_eq!(deleted.into_inner(), vec![volume.name()]);

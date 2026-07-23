@@ -104,3 +104,28 @@ The complete inventories contained no Gate 4 lifecycle container, managed volume
 ## Concerns
 
 None. The PTY lifecycle suite requires host permission in this environment; with that permission it passed completely.
+
+## Follow-up: Clippy-clean Result assertion
+
+Controller RED:
+
+- `rtk cargo clippy --workspace --all-targets -- -D warnings`
+  - Failed at `crates/gascan-e2e/tests/apple_common/mod.rs:1734` because the new regression used `.unwrap_err()` while all four Apple E2E targets deny `clippy::unwrap_used`.
+
+Narrow fix:
+
+- Replaced `.unwrap_err()` with `let Err(error) = ... else { return Err(...) };`.
+- The test still requires the fresh foreign-network observation to return an error; an unexpected successful mutation now fails through `TestResult`.
+
+Fresh GREEN verification:
+
+- `rtk cargo test -p gascan-e2e --test apple_lifecycle`
+  - 38 passed, 1 ignored (host PTY permission granted).
+- `rtk cargo clippy --workspace --all-targets -- -D warnings`
+  - `cargo clippy: No issues found`.
+- `rtk cargo fmt --all -- --check`
+  - Passed with exit code 0 and no output.
+- `rtk git diff --check`
+  - Passed with exit code 0 and no output.
+- `rtk git diff --check main...HEAD`
+  - Passed with exit code 0 and no output.
