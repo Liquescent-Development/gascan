@@ -8,9 +8,40 @@ use apple_common::{AppleE2e, TestResult};
 #[test]
 #[ignore = "requires supported Apple runtime and the locked workspace image"]
 fn cli_lifecycle_survives_daemon_and_host_state_changes() -> TestResult {
-    let env = AppleE2e::new("gate4-lifecycle")?;
+    let env = AppleE2e::new_networked("gate4-lifecycle")?;
     env.install_noop_setup()?;
     env.success(["up", env.root().to_str().ok_or("non-UTF-8 root")?])?;
+    env.assert_managed_network_attachment()?;
+
+    let dns = env.success([
+        "--sandbox",
+        env.id(),
+        "run",
+        "--",
+        "getent",
+        "ahosts",
+        "github.com",
+    ])?;
+    if dns.stdout.is_empty() {
+        return Err("managed network DNS lookup returned no addresses".into());
+    }
+
+    env.success([
+        "--sandbox",
+        env.id(),
+        "run",
+        "--",
+        "curl",
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--max-time",
+        "20",
+        "--output",
+        "/dev/null",
+        "https://github.com/",
+    ])?;
+
     env.success(["up", env.root().to_str().ok_or("non-UTF-8 root")?])?;
 
     let exit = env.invoke(["--sandbox", env.id(), "run", "--", "sh", "-c", "exit 42"])?;
@@ -30,7 +61,7 @@ fn cli_lifecycle_survives_daemon_and_host_state_changes() -> TestResult {
         &[
             "sh",
             "-c",
-            "initial=$(stty size); printf '%s\\n' \"$initial\"; test \"$initial\" = '24 80' || exit 1; trap 'size=$(stty size); printf \"%s\\n\" \"$size\"; test \"$size\" = \"47 132\" && exit 0' WINCH; printf GASCAN_RESIZE_READY; while :; do sleep 1; done",
+            "attempts=40; initial=$(stty size); while test \"$initial\" != '24 80' && test \"$attempts\" -gt 0; do sleep 0.05; attempts=$((attempts - 1)); initial=$(stty size); done; printf '%s\\n' \"$initial\"; test \"$initial\" = '24 80' || exit 1; trap 'size=$(stty size); printf \"%s\\n\" \"$size\"; test \"$size\" = \"47 132\" && exit 0' WINCH; printf GASCAN_RESIZE_READY; while :; do sleep 1; done",
         ],
         47,
         132,
@@ -46,7 +77,7 @@ fn cli_lifecycle_survives_daemon_and_host_state_changes() -> TestResult {
             .stdout
             .windows(b"24 80".len())
             .any(|window| window == b"24 80"),
-        "guest did not start at exact 24x80 size: stdout={} stderr={}",
+        "guest did not receive the initial exact 24x80 size: stdout={} stderr={}",
         String::from_utf8_lossy(&resized.stdout),
         String::from_utf8_lossy(&resized.stderr)
     );

@@ -43,6 +43,7 @@ pub struct AppleE2e {
     manifest_name: String,
     owner_token: String,
     error_diagnostics: bool,
+    network_mode: Option<String>,
     cleanup_manifest: Option<std::path::PathBuf>,
 }
 
@@ -64,7 +65,22 @@ impl AppleE2e {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(default_session_root);
         let error_diagnostics = std::env::var_os("GASCAN_GATE4_DIAGNOSTICS").is_some();
-        Self::new_scoped_with_diagnostics(name, session_root, manifest, error_diagnostics)
+        Self::new_scoped_with_diagnostics(name, session_root, manifest, error_diagnostics, None)
+    }
+
+    pub fn new_networked(name: &str) -> TestResult<Self> {
+        let manifest =
+            std::env::var_os("GASCAN_E2E_CLEANUP_MANIFEST").map(std::path::PathBuf::from);
+        let session_root = std::env::var_os("GASCAN_E2E_SESSION_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(default_session_root);
+        Self::new_scoped_with_diagnostics(
+            name,
+            session_root,
+            manifest,
+            std::env::var_os("GASCAN_GATE4_DIAGNOSTICS").is_some(),
+            Some("networked"),
+        )
     }
 
     fn new_scoped(
@@ -72,7 +88,7 @@ impl AppleE2e {
         session_root: std::path::PathBuf,
         manifest: Option<std::path::PathBuf>,
     ) -> TestResult<Self> {
-        Self::new_scoped_with_diagnostics(name, session_root, manifest, false)
+        Self::new_scoped_with_diagnostics(name, session_root, manifest, false, None)
     }
 
     fn new_scoped_with_diagnostics(
@@ -80,6 +96,7 @@ impl AppleE2e {
         session_root: std::path::PathBuf,
         manifest: Option<std::path::PathBuf>,
         error_diagnostics: bool,
+        network_mode: Option<&str>,
     ) -> TestResult<Self> {
         let gascan = std::env::var_os("CARGO_BIN_EXE_gascan-e2e-cli")
             .ok_or("workspace-built gascan binary is unavailable")?;
@@ -100,9 +117,16 @@ impl AppleE2e {
         let root_path = root.path().canonicalize()?;
         let runtime_root = runtime.path().canonicalize()?;
         let utf8_root = camino::Utf8Path::from_path(&root_path).ok_or("non-UTF-8 test root")?;
+        let network_line = match network_mode {
+            Some(mode) => format!("network = {}\n", serde_json::to_string(mode)?),
+            None => String::new(),
+        };
         std::fs::write(
             root_path.join("gascan.toml"),
-            format!("version = 1\nname = {}\n", serde_json::to_string(name)?),
+            format!(
+                "version = 1\nname = {}\n{network_line}",
+                serde_json::to_string(name)?
+            ),
         )?;
         let loaded_manifest = gascan_core::manifest::Manifest::load(utf8_root)?;
         let manifest_name = loaded_manifest
@@ -158,6 +182,7 @@ impl AppleE2e {
             manifest_name,
             owner_token,
             error_diagnostics,
+            network_mode: network_mode.map(str::to_owned),
             cleanup_manifest: manifest,
         })
     }
@@ -287,10 +312,14 @@ impl AppleE2e {
 
     pub fn install_noop_setup(&self) -> TestResult {
         std::fs::create_dir(self.root_path.join(".gascan"))?;
+        let network_line = match self.network_mode.as_deref() {
+            Some(mode) => format!("network = {}\n", serde_json::to_string(mode)?),
+            None => String::new(),
+        };
         std::fs::write(
             self.root_path.join("gascan.toml"),
             format!(
-                "version = 1\nname = {}\nsetup = './.gascan/setup.sh'\n",
+                "version = 1\nname = {}\n{network_line}setup = './.gascan/setup.sh'\n",
                 serde_json::to_string(&self.manifest_name)?
             ),
         )?;
@@ -456,6 +485,33 @@ impl AppleE2e {
         Ok(serde_json::from_slice(&output.stdout)?)
     }
 
+    pub fn assert_managed_network_attachment(&self) -> TestResult {
+        let inspect_output = Command::new("container")
+            .args(["inspect", self.id()])
+            .output()?;
+        if !inspect_output.status.success() {
+            return Err(format!(
+                "container inspect failed: {}",
+                String::from_utf8_lossy(&inspect_output.stderr)
+            )
+            .into());
+        }
+        let inspect: Value = serde_json::from_slice(&inspect_output.stdout)?;
+
+        let inventory_output = Command::new("container")
+            .args(["network", "list", "--format", "json"])
+            .output()?;
+        if !inventory_output.status.success() {
+            return Err(format!(
+                "container network inventory failed: {}",
+                String::from_utf8_lossy(&inventory_output.stderr)
+            )
+            .into());
+        }
+        let inventory: Value = serde_json::from_slice(&inventory_output.stdout)?;
+        validate_managed_network_attachment(&inspect, &inventory, self.id())
+    }
+
     pub fn kill_daemon(&self) -> TestResult {
         let pid = self.validated_daemon_pid()?.pid;
         let pid =
@@ -619,6 +675,43 @@ impl AppleE2e {
         let _keep_roots_alive = (&self.root, &self.runtime);
         self.assert_no_owned_resources()
     }
+}
+
+fn validate_managed_network_attachment(inspect: &Value, inventory: &Value, id: &str) -> TestResult {
+    let expected = format!("gascan-network-{id}");
+    let record = inspect
+        .as_array()
+        .and_then(|records| (records.len() == 1).then(|| &records[0]))
+        .ok_or("container inspect is absent or ambiguous")?;
+    let networks = record["configuration"]["networks"]
+        .as_array()
+        .ok_or("container inspect lacks network attachments")?;
+    if networks.len() != 1 || networks[0]["network"].as_str() != Some(expected.as_str()) {
+        return Err(format!("unexpected network attachments: {networks:?}").into());
+    }
+
+    let records = inventory
+        .as_array()
+        .ok_or("network inventory must be an array")?;
+    let exact = records
+        .iter()
+        .filter(|record| {
+            record["id"].as_str() == Some(expected.as_str())
+                && record["configuration"]["name"].as_str() == Some(expected.as_str())
+        })
+        .collect::<Vec<_>>();
+    let [network] = exact.as_slice() else {
+        return Err(
+            format!("expected exactly one managed network inventory record: {exact:?}").into(),
+        );
+    };
+    let labels = &network["configuration"]["labels"];
+    if labels["dev.gascan.managed-by"].as_str() != Some("gascan")
+        || labels["dev.gascan.sandbox-id"].as_str() != Some(id)
+    {
+        return Err(format!("managed network ownership labels mismatch: {labels:?}").into());
+    }
+    Ok(())
 }
 
 fn instance_matches(
@@ -1540,19 +1633,19 @@ mod tests {
         Ok(())
     }
 
-    fn network_output(status: i32, stdout: Value) -> Output {
+    fn network_output(status: i32, stdout: Value) -> TestResult<Output> {
         use std::os::unix::process::ExitStatusExt as _;
 
-        Output {
+        Ok(Output {
             status: ExitStatus::from_raw(status),
-            stdout: serde_json::to_vec(&stdout).expect("network fixture JSON"),
+            stdout: serde_json::to_vec(&stdout)?,
             stderr: Vec::new(),
-        }
+        })
     }
 
     #[test]
-    fn failed_network_list_cannot_prove_absence() {
-        let output = network_output(1 << 8, serde_json::json!([]));
+    fn failed_network_list_cannot_prove_absence() -> TestResult {
+        let output = network_output(1 << 8, serde_json::json!([]))?;
 
         assert!(
             network_presence_from_output(
@@ -1562,10 +1655,11 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
     }
 
     #[test]
-    fn exact_network_id_with_mismatched_name_fails_closed() {
+    fn exact_network_id_with_mismatched_name_fails_closed() -> TestResult {
         let name = "gascan-network-cleanup-123456789abc";
         let output = network_output(
             0,
@@ -1576,13 +1670,14 @@ mod tests {
                     "labels": {}
                 }
             }]),
-        );
+        )?;
 
         assert!(network_presence_from_output(&output, name, "cleanup-123456789abc").is_err());
+        Ok(())
     }
 
     #[test]
-    fn exact_network_name_with_mismatched_id_fails_closed() {
+    fn exact_network_name_with_mismatched_id_fails_closed() -> TestResult {
         let name = "gascan-network-cleanup-123456789abc";
         let output = network_output(
             0,
@@ -1593,9 +1688,10 @@ mod tests {
                     "labels": {}
                 }
             }]),
-        );
+        )?;
 
         assert!(network_presence_from_output(&output, name, "cleanup-123456789abc").is_err());
+        Ok(())
     }
 
     #[test]
@@ -1818,6 +1914,7 @@ mod tests {
             session.path().to_path_buf(),
             None,
             true,
+            None,
         )?;
         let command = env.command(["status"]);
         assert_eq!(
@@ -1828,6 +1925,131 @@ mod tests {
             Some(OsStr::new("1"))
         );
         Ok(())
+    }
+
+    #[test]
+    fn scoped_constructor_writes_requested_network_mode() -> TestResult {
+        let session = tempfile::tempdir()?;
+        let env = AppleE2e::new_scoped_with_diagnostics(
+            "networked-manifest",
+            session.path().to_path_buf(),
+            None,
+            false,
+            Some("networked"),
+        )?;
+
+        let manifest = std::fs::read_to_string(env.root_path.join("gascan.toml"))?;
+        assert_eq!(
+            manifest,
+            "version = 1\nname = \"networked-manifest\"\nnetwork = \"networked\"\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn noop_setup_preserves_requested_network_mode() -> TestResult {
+        let session = tempfile::tempdir()?;
+        let env = AppleE2e::new_scoped_with_diagnostics(
+            "networked-setup",
+            session.path().to_path_buf(),
+            None,
+            false,
+            Some("networked"),
+        )?;
+
+        env.install_noop_setup()?;
+
+        let manifest = std::fs::read_to_string(env.root_path.join("gascan.toml"))?;
+        assert!(manifest.contains("network = \"networked\"\n"));
+        assert!(manifest.contains("setup = './.gascan/setup.sh'\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn managed_network_attachment_accepts_exact_owned_network() -> TestResult {
+        let id = "network-proof-000000000000";
+        let expected = format!("gascan-network-{id}");
+        let inspect = serde_json::json!([{
+            "configuration": {
+                "networks": [{"network": expected}]
+            }
+        }]);
+        let inventory = serde_json::json!([{
+            "id": expected,
+            "configuration": {
+                "name": expected,
+                "labels": {
+                    "dev.gascan.managed-by": "gascan",
+                    "dev.gascan.sandbox-id": id
+                }
+            }
+        }]);
+
+        validate_managed_network_attachment(&inspect, &inventory, id)
+    }
+
+    #[test]
+    fn managed_network_attachment_rejects_default_or_extra_networks() {
+        let id = "network-proof-000000000000";
+        let expected = format!("gascan-network-{id}");
+        let inventory = serde_json::json!([{
+            "id": expected,
+            "configuration": {
+                "name": expected,
+                "labels": {
+                    "dev.gascan.managed-by": "gascan",
+                    "dev.gascan.sandbox-id": id
+                }
+            }
+        }]);
+        for networks in [
+            serde_json::json!([{"network": "default"}]),
+            serde_json::json!([{"network": expected}, {"network": "default"}]),
+        ] {
+            let inspect = serde_json::json!([{"configuration": {"networks": networks}}]);
+            assert!(validate_managed_network_attachment(&inspect, &inventory, id).is_err());
+        }
+    }
+
+    #[test]
+    fn managed_network_attachment_rejects_ambiguous_or_foreign_inventory() {
+        let id = "network-proof-000000000000";
+        let expected = format!("gascan-network-{id}");
+        let inspect = serde_json::json!([{
+            "configuration": {
+                "networks": [{"network": expected}]
+            }
+        }]);
+        let exact = serde_json::json!({
+            "id": expected,
+            "configuration": {
+                "name": expected,
+                "labels": {
+                    "dev.gascan.managed-by": "gascan",
+                    "dev.gascan.sandbox-id": id
+                }
+            }
+        });
+        let foreign = serde_json::json!([{
+            "id": expected,
+            "configuration": {
+                "name": expected,
+                "labels": {
+                    "dev.gascan.managed-by": "other",
+                    "dev.gascan.sandbox-id": id
+                }
+            }
+        }]);
+
+        assert!(validate_managed_network_attachment(&inspect, &foreign, id).is_err());
+        assert!(
+            validate_managed_network_attachment(
+                &inspect,
+                &serde_json::json!([exact.clone(), exact]),
+                id,
+            )
+            .is_err()
+        );
     }
 
     #[test]
