@@ -2643,6 +2643,7 @@ mod tests {
             setup_resolution: None,
             tool_resolution: None,
             image_resolution: None,
+            storage_resolution: None,
             last_operation_id: Some(operation_id),
             updated_at_millis: 1_725_000_001_456,
         });

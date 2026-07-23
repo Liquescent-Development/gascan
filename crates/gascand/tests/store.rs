@@ -2,7 +2,7 @@ use camino::Utf8PathBuf;
 use gascan_core::sandbox::SandboxId;
 use gascand::{
     ActualState, DesiredState, ImageResolution, OperationId, OperationKind, OperationStatus,
-    SandboxRecord, SetupResolution, Store, StoreError, ToolResolution,
+    SandboxRecord, SetupResolution, StorageResolution, Store, StoreError, ToolResolution,
 };
 use serde_json::json;
 use std::error::Error;
@@ -46,6 +46,14 @@ fn fixture(root: &str) -> SandboxRecord {
         )),
         tool_resolution: Some(ToolResolution::new(1, json!({"node":"22.1.0"}))),
         image_resolution: Some(ImageResolution::new(1, json!({"digest":"sha256:abc"}))),
+        storage_resolution: Some(StorageResolution::new(
+            1,
+            json!({
+                "tools_bytes": 10 * 1024_u64.pow(3),
+                "cache_bytes": 10 * 1024_u64.pow(3),
+                "config_bytes": 1024_u64.pow(3),
+            }),
+        )),
         last_operation_id: None,
         updated_at_millis: 0,
     }
@@ -333,11 +341,11 @@ fn newer_and_unknown_schema_versions_are_rejected() -> TestResult {
     let path = temp.path().join("state.db");
     drop(Store::open(&path)?);
     let connection = rusqlite::Connection::open(&path)?;
-    connection.execute("UPDATE schema_version SET version = ?1", [3])?;
+    connection.execute("UPDATE schema_version SET version = ?1", [4])?;
     drop(connection);
     assert!(matches!(
         Store::open(&path),
-        Err(StoreError::UnsupportedSchemaVersion(3))
+        Err(StoreError::UnsupportedSchemaVersion(4))
     ));
 
     let empty = temp.path().join("unknown.db");
@@ -345,6 +353,40 @@ fn newer_and_unknown_schema_versions_are_rejected() -> TestResult {
     connection.execute("PRAGMA user_version = 9", [])?;
     drop(connection);
     assert!(matches!(Store::open(empty), Err(StoreError::UnknownSchema)));
+    Ok(())
+}
+
+#[test]
+fn version_two_database_migrates_storage_resolution_as_absent() -> TestResult {
+    const INITIAL_MIGRATION: &str = include_str!("../migrations/001_initial.sql");
+    const DURABLE_METADATA_MIGRATION: &str = include_str!("../migrations/002_durable_metadata.sql");
+
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("version-two.db");
+    let connection = rusqlite::Connection::open(&path)?;
+    connection.execute_batch(INITIAL_MIGRATION)?;
+    connection.execute_batch(DURABLE_METADATA_MIGRATION)?;
+    let sandbox = fixture("/workspace/legacy");
+    connection.execute(
+        "INSERT INTO sandboxes (id, canonical_root, desired_state, actual_state) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            sandbox.id.as_str(),
+            sandbox.canonical_root.as_str(),
+            "running",
+            "creating"
+        ],
+    )?;
+    drop(connection);
+
+    let store = Store::open(&path)?;
+    let loaded = store.sandbox(&sandbox.id)?.ok_or("sandbox missing")?;
+    assert_eq!(loaded.storage_resolution, None);
+    let connection = rusqlite::Connection::open(path)?;
+    assert_eq!(
+        connection.query_row("SELECT version FROM schema_version", [], |row| row
+            .get::<_, i64>(0))?,
+        3
+    );
     Ok(())
 }
 
@@ -631,5 +673,6 @@ fn versioned_resolution_records_round_trip() -> TestResult {
     assert_eq!(loaded.setup_resolution, sandbox.setup_resolution);
     assert_eq!(loaded.tool_resolution, sandbox.tool_resolution);
     assert_eq!(loaded.image_resolution, sandbox.image_resolution);
+    assert_eq!(loaded.storage_resolution, sandbox.storage_resolution);
     Ok(())
 }
