@@ -30,7 +30,55 @@ use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
 const SAFE_MISE_WORKDIR: &str = "/home/workspace/.config/gascan/mise-workdir";
-const MAX_PROVISION_OUTPUT_BYTES: usize = 1024 * 1024;
+const MAX_PROVISION_STDOUT_BYTES: usize = 1024 * 1024;
+const MAX_PROVISION_STDERR_TAIL_BYTES: usize = 64 * 1024;
+
+struct GuestExecOutcome {
+    stdout: Vec<u8>,
+    stderr_tail: Vec<u8>,
+    code: i32,
+    signal: i32,
+}
+
+struct BoundedTail {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedTail {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
+    }
+
+    fn extend(&mut self, bytes: &[u8]) {
+        if self.limit == 0 {
+            self.bytes.clear();
+            return;
+        }
+        if bytes.len() >= self.limit {
+            self.bytes.clear();
+            self.bytes
+                .extend_from_slice(&bytes[bytes.len() - self.limit..]);
+            return;
+        }
+        let overflow = self
+            .bytes
+            .len()
+            .saturating_add(bytes.len())
+            .saturating_sub(self.limit);
+        if overflow > 0 {
+            self.bytes.drain(..overflow);
+        }
+        self.bytes.extend_from_slice(bytes);
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
 
 pub struct UpRequest {
     spec: SandboxSpec,
@@ -248,12 +296,15 @@ pub enum ServiceError {
     StorageInvariant(&'static str),
     #[error("provisioning failed: {0}")]
     Provision(String),
-    #[error("provisioning failed: guest provisioning command failed")]
+    #[error(
+        "provisioning failed: guest provisioning command failed (exit code {exit_code}, signal {signal}): {stderr_tail}"
+    )]
     ProvisionCommandFailed {
         step: ProvisionStep,
         action: &'static str,
         exit_code: i32,
         signal: i32,
+        stderr_tail: String,
     },
     #[error("mounted setup script changed before execution")]
     SetupChanged,
@@ -769,17 +820,17 @@ impl<B: RuntimeBackend> SandboxService<B> {
 
     async fn run_setup(&self, id: &SandboxId, setup: &SetupScript) -> Result<(), ServiceError> {
         let guest_path = format!("/workspace/{}", setup.canonical_relative_path());
-        let (digest_output, digest_code, digest_signal) = self
+        let digest_outcome = self
             .exec_guest_raw(
                 id,
                 ["/usr/bin/sha256sum".to_owned(), guest_path.clone()],
                 Vec::new(),
             )
             .await?;
-        if digest_code != 0 || digest_signal != 0 {
+        if digest_outcome.code != 0 || digest_outcome.signal != 0 {
             return Err(ServiceError::SetupChanged);
         }
-        let digest = std::str::from_utf8(&digest_output)
+        let digest = std::str::from_utf8(&digest_outcome.stdout)
             .ok()
             .and_then(|output| output.split_ascii_whitespace().next())
             .filter(|digest| {
@@ -789,13 +840,13 @@ impl<B: RuntimeBackend> SandboxService<B> {
         if setup.sha256().strip_prefix("sha256:") != Some(digest) {
             return Err(ServiceError::SetupChanged);
         }
-        let (_, code, signal) = self
+        let outcome = self
             .exec_guest_raw(id, ["/bin/bash".to_owned(), guest_path], Vec::new())
             .await?;
-        if code == 0 && signal == 0 {
+        if outcome.code == 0 && outcome.signal == 0 {
             Ok(())
         } else {
-            Err(ServiceError::SetupExit(code))
+            Err(ServiceError::SetupExit(outcome.code))
         }
     }
 
@@ -957,15 +1008,16 @@ impl<B: RuntimeBackend> SandboxService<B> {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let (stdout, code, signal) = self.exec_guest_raw(id, argv, stdin).await?;
-        if code == 0 && signal == 0 {
-            Ok(stdout)
+        let outcome = self.exec_guest_raw(id, argv, stdin).await?;
+        if outcome.code == 0 && outcome.signal == 0 {
+            Ok(outcome.stdout)
         } else {
             Err(ServiceError::ProvisionCommandFailed {
                 step,
                 action,
-                exit_code: code,
-                signal,
+                exit_code: outcome.code,
+                signal: outcome.signal,
+                stderr_tail: sanitize_provision_stderr(&outcome.stderr_tail),
             })
         }
     }
@@ -975,7 +1027,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
         id: &SandboxId,
         argv: I,
         stdin: Vec<u8>,
-    ) -> Result<(Vec<u8>, i32, i32), ServiceError>
+    ) -> Result<GuestExecOutcome, ServiceError>
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -996,27 +1048,28 @@ impl<B: RuntimeBackend> SandboxService<B> {
             .await
             .map_err(|_| provisioning_transport_error())?;
         let mut stdout = Vec::new();
-        let mut output_bytes = 0_usize;
+        let mut stderr_tail = BoundedTail::new(MAX_PROVISION_STDERR_TAIL_BYTES);
         while let Some(output) = session.next().await {
             match output.map_err(|_| provisioning_transport_error())? {
                 ExecOutput::Stdout(bytes) => {
-                    output_bytes = output_bytes.saturating_add(bytes.len());
-                    if output_bytes > MAX_PROVISION_OUTPUT_BYTES {
+                    if stdout.len().saturating_add(bytes.len()) > MAX_PROVISION_STDOUT_BYTES {
+                        session.cancel();
+                        while session.next().await.is_some() {}
                         return Err(ServiceError::Provision(
-                            "guest provisioning output exceeded its limit".to_owned(),
+                            "guest provisioning stdout exceeded its limit".to_owned(),
                         ));
                     }
                     stdout.extend(bytes);
                 }
-                ExecOutput::Stderr(bytes) => {
-                    output_bytes = output_bytes.saturating_add(bytes.len());
-                    if output_bytes > MAX_PROVISION_OUTPUT_BYTES {
-                        return Err(ServiceError::Provision(
-                            "guest provisioning output exceeded its limit".to_owned(),
-                        ));
-                    }
+                ExecOutput::Stderr(bytes) => stderr_tail.extend(&bytes),
+                ExecOutput::Exit { code, signal } => {
+                    return Ok(GuestExecOutcome {
+                        stdout,
+                        stderr_tail: stderr_tail.into_bytes(),
+                        code,
+                        signal,
+                    });
                 }
-                ExecOutput::Exit { code, signal } => return Ok((stdout, code, signal)),
             }
         }
         Err(ServiceError::Provision(
@@ -1746,6 +1799,7 @@ pub(crate) fn failure_details(error: &ServiceError) -> Value {
         action,
         exit_code,
         signal,
+        stderr_tail,
     } = error
     {
         json!({
@@ -1754,6 +1808,7 @@ pub(crate) fn failure_details(error: &ServiceError) -> Value {
             "action": action,
             "exit_code": exit_code,
             "signal": signal,
+            "stderr_tail": stderr_tail,
         })
     } else if error.is_setup_failure() {
         let mut details = json!({
@@ -1898,6 +1953,19 @@ fn applied_state(record: Option<&SandboxRecord>) -> AppliedState {
 
 fn provisioning_transport_error() -> ServiceError {
     ServiceError::Provision("guest provisioning transport failed".to_owned())
+}
+
+fn sanitize_provision_stderr(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .map(|character| {
+            if character.is_ascii_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 fn mise_command(args: &[&str]) -> Vec<String> {
@@ -2050,7 +2118,22 @@ async fn desired_fingerprint(spec: &SandboxSpec) -> Result<String, ServiceError>
 
 #[cfg(test)]
 mod storage_tests {
-    use super::{ServiceError, requested_storage_from_volumes};
+    use super::{BoundedTail, ServiceError, requested_storage_from_volumes};
+
+    #[test]
+    fn bounded_tail_keeps_exact_suffix_across_chunks() {
+        let mut tail = BoundedTail::new(5);
+        tail.extend(b"\xffab");
+        tail.extend(b"cdef");
+        assert_eq!(tail.into_bytes(), b"bcdef");
+    }
+
+    #[test]
+    fn zero_length_bounded_tail_discards_input() {
+        let mut tail = BoundedTail::new(0);
+        tail.extend(b"ignored");
+        assert!(tail.into_bytes().is_empty());
+    }
 
     #[test]
     fn missing_compiled_managed_volume_is_an_internal_invariant_error() {

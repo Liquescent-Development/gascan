@@ -32,6 +32,30 @@ async fn cancellable_exec_session_drop_signals_backend() {
 }
 
 #[tokio::test]
+async fn fake_runtime_records_cancelled_exec_before_terminal_status() {
+    let backend = FakeRuntime::new(capabilities());
+    let fixture = create_request("cancelled-fake-exec");
+    let id = fixture.id().clone();
+    backend.create(fixture.request()).await.unwrap();
+    backend.start(&id).await.unwrap();
+    backend
+        .set_exec_result(vec![b'x'; 2 * 1024 * 1024], Vec::new(), 0)
+        .await;
+    let mut session = backend
+        .exec(ExecRequest::fixture(id, ["oversized-output"]))
+        .await
+        .unwrap();
+    session.send(ExecInput::Close).await.unwrap();
+    assert!(matches!(
+        session.next().await,
+        Some(Ok(ExecOutput::Stdout(_)))
+    ));
+    session.cancel();
+    while session.next().await.is_some() {}
+    assert_eq!(backend.exec_cancellations().await, 1);
+}
+
+#[tokio::test]
 async fn exec_session_is_live_bidirectional_and_emits_one_exit() {
     let backend = FakeRuntime::new(capabilities());
     let fixture = create_request("live-exec");
