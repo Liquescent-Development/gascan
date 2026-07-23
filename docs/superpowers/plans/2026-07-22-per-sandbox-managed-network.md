@@ -404,6 +404,11 @@ git commit -m "feat: attach sandboxes to managed networks"
 
 ### Task 3: Inventory Apple Networks with Fail-Closed Ownership
 
+**Execution note:** Tasks 3 and 4 are one implementation and review unit.
+Complete the inventory work, continue directly through Task 4, and commit and
+review only after the full Apple backend suite is green. Do not create the
+intermediate intentionally-red commit described below.
+
 **Files:**
 - Modify: `crates/gascan-apple/src/backend.rs`
 - Modify: `crates/gascan-apple/tests/backend_fake_runner.rs`
@@ -529,12 +534,8 @@ Expected: all network-inventory tests pass. The pre-existing successful-create
 contract remains intentionally red until Task 4 creates the now-required
 managed network; do not weaken the core outcome requirement to make it pass.
 
-Commit:
-
-```bash
-git add crates/gascan-apple/src/backend.rs crates/gascan-apple/tests/backend_fake_runner.rs
-git commit -m "feat: inventory Apple sandbox networks"
-```
+Do not commit at this intermediate point. Continue directly to Task 4 so the
+backend's now-required managed network is implemented before review.
 
 ---
 
@@ -1069,8 +1070,9 @@ passing based only on a filtered run.
 
 - [ ] **Step 5: Run the serial real Apple lifecycle**
 
-Before running, destroy the user's pre-feature sandbox as authorized by the
-user, or confirm it is already absent. Then run:
+Before running, confirm the user's pre-feature sandbox is already absent. Do
+not destroy it. If it is still present, stop and ask the user to remove it.
+Then run:
 
 ```bash
 bash ./scripts/run-apple-e2e.sh apple_lifecycle
