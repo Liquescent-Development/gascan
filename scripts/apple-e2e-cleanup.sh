@@ -90,14 +90,21 @@ case $id in
   *-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
   *) printf 'refusing invalid sandbox id in %s\n' "$manifest" >&2; exit 65 ;;
 esac
-expected=$(printf '%s\n%s\n%s\n%s\n%s\n' \
-  "$id" \
-  "gascan-mise-$id" \
-  "gascan-cache-$id" \
-  "gascan-config-$id" \
-  "gascan-network-$id")
-actual=$(jq -er '.resources[]' "$manifest")
-test "$actual" = "$expected" || { printf 'refusing out-of-scope cleanup manifest\n' >&2; exit 65; }
+jq -e \
+  --arg container "$id" \
+  --arg mise "gascan-mise-$id" \
+  --arg cache "gascan-cache-$id" \
+  --arg config "gascan-config-$id" \
+  --arg network "gascan-network-$id" '
+    (.resources | type) == "array" and
+    (.resources | length) == 5 and
+    all(.resources[]; type == "string") and
+    .resources[0] == $container and
+    .resources[1] == $mise and
+    .resources[2] == $cache and
+    .resources[3] == $config and
+    .resources[4] == $network
+  ' "$manifest" >/dev/null || { printf 'refusing out-of-scope cleanup manifest\n' >&2; exit 65; }
 jq -e '.dns_domain == null or (.dns_domain | type == "string")' "$manifest" >/dev/null || { printf 'refusing invalid DNS cleanup record\n' >&2; exit 65; }
 dns_domain=$(jq -r '.dns_domain // ""' "$manifest")
 if test -n "$dns_domain"; then

@@ -1164,30 +1164,65 @@ fn resource_presence(
             .args(["network", "list", "--format", "json"])
             .output()?,
     };
+    if identity.kind() == gascan_core::runtime::ResourceKind::Network {
+        return network_presence_from_output(&output, name, id);
+    }
     if !output.status.success() {
         return Ok(ResourcePresence::Absent);
     }
     let value: Value = serde_json::from_slice(&output.stdout)?;
-    let record = if identity.kind() == gascan_core::runtime::ResourceKind::Network {
-        let records = value
-            .as_array()
-            .ok_or("network inventory must be an array")?
-            .iter()
-            .filter(|record| {
-                record["id"].as_str() == Some(name)
-                    && record["configuration"]["name"].as_str() == Some(name)
-            })
-            .collect::<Vec<_>>();
-        match records.as_slice() {
-            [] => return Ok(ResourcePresence::Absent),
-            [record] => *record,
-            _ => return Err(format!("ambiguous exact network inventory for {name}").into()),
+    let record = value
+        .as_array()
+        .and_then(|items| items.first())
+        .unwrap_or(&value);
+    let labels = &record["configuration"]["labels"];
+    Ok(
+        if labels["dev.gascan.managed-by"] == "gascan" && labels["dev.gascan.sandbox-id"] == id {
+            ResourcePresence::Owned
+        } else {
+            ResourcePresence::Collision
+        },
+    )
+}
+
+fn network_presence_from_output(
+    output: &Output,
+    name: &str,
+    id: &str,
+) -> TestResult<ResourcePresence> {
+    if !output.status.success() {
+        return Err(format!(
+            "unable to inventory networks: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let value: Value = serde_json::from_slice(&output.stdout)?;
+    let records = value
+        .as_array()
+        .ok_or("network inventory must be an array")?;
+    let mut exact = Vec::new();
+    for record in records {
+        let record_id = record["id"]
+            .as_str()
+            .ok_or("network inventory id must be a string")?;
+        let record_name = record["configuration"]["name"]
+            .as_str()
+            .ok_or("network inventory configuration name must be a string")?;
+        if record_id != record_name {
+            return Err(format!(
+                "network inventory id/name mismatch: {record_id} != {record_name}"
+            )
+            .into());
         }
-    } else {
-        value
-            .as_array()
-            .and_then(|items| items.first())
-            .unwrap_or(&value)
+        if record_id == name {
+            exact.push(record);
+        }
+    }
+    let record = match exact.as_slice() {
+        [] => return Ok(ResourcePresence::Absent),
+        [record] => *record,
+        _ => return Err(format!("ambiguous exact network inventory for {name}").into()),
     };
     let labels = &record["configuration"]["labels"];
     Ok(
@@ -1503,6 +1538,64 @@ mod tests {
 
         assert!(cleanup_resource_identities(&cleanup).is_err());
         Ok(())
+    }
+
+    fn network_output(status: i32, stdout: Value) -> Output {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        Output {
+            status: ExitStatus::from_raw(status),
+            stdout: serde_json::to_vec(&stdout).expect("network fixture JSON"),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn failed_network_list_cannot_prove_absence() {
+        let output = network_output(1 << 8, serde_json::json!([]));
+
+        assert!(
+            network_presence_from_output(
+                &output,
+                "gascan-network-cleanup-123456789abc",
+                "cleanup-123456789abc",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn exact_network_id_with_mismatched_name_fails_closed() {
+        let name = "gascan-network-cleanup-123456789abc";
+        let output = network_output(
+            0,
+            serde_json::json!([{
+                "id": name,
+                "configuration": {
+                    "name": "some-other-network",
+                    "labels": {}
+                }
+            }]),
+        );
+
+        assert!(network_presence_from_output(&output, name, "cleanup-123456789abc").is_err());
+    }
+
+    #[test]
+    fn exact_network_name_with_mismatched_id_fails_closed() {
+        let name = "gascan-network-cleanup-123456789abc";
+        let output = network_output(
+            0,
+            serde_json::json!([{
+                "id": "some-other-network",
+                "configuration": {
+                    "name": name,
+                    "labels": {}
+                }
+            }]),
+        );
+
+        assert!(network_presence_from_output(&output, name, "cleanup-123456789abc").is_err());
     }
 
     #[test]

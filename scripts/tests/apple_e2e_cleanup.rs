@@ -957,6 +957,51 @@ fn out_of_scope_manifest_is_refused_before_runtime_commands() {
 }
 
 #[test]
+fn embedded_newline_resource_cannot_spoof_the_exact_manifest_sequence() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_bin, calls) = fake_container(&temp);
+    let id = "gate4-test-123456789abc";
+    let path = manifest(
+        &temp,
+        serde_json::json!([
+            format!("{id}\ngascan-mise-{id}"),
+            format!("gascan-cache-{id}"),
+            format!("gascan-config-{id}"),
+            format!("gascan-network-{id}"),
+        ]),
+    );
+
+    let output = run(&temp, &path, &calls);
+
+    assert_eq!(output.status.code(), Some(65));
+    assert!(path.exists());
+    assert!(!calls.exists());
+}
+
+#[test]
+fn object_resources_cannot_spoof_the_exact_manifest_sequence() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_bin, calls) = fake_container(&temp);
+    let id = "gate4-test-123456789abc";
+    let path = manifest(
+        &temp,
+        serde_json::json!({
+            "0": id,
+            "1": format!("gascan-mise-{id}"),
+            "2": format!("gascan-cache-{id}"),
+            "3": format!("gascan-config-{id}"),
+            "4": format!("gascan-network-{id}"),
+        }),
+    );
+
+    let output = run(&temp, &path, &calls);
+
+    assert_eq!(output.status.code(), Some(65));
+    assert!(path.exists());
+    assert!(!calls.exists());
+}
+
+#[test]
 fn forged_manifest_cli_is_never_executed() {
     let temp = tempfile::tempdir().unwrap();
     let (_bin, calls) = fake_container(&temp);
