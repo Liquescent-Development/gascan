@@ -1,4 +1,21 @@
+use std::collections::BTreeMap;
+
+use camino::Utf8Path;
+use gascan_apple::{AppleBackend, CommandRunner, CommandSpec, ProcessRunner};
+use gascan_core::{
+    manifest::Manifest,
+    policy::PolicyCompiler,
+    runtime::{
+        NetworkIsolation, RemoveRequest, RuntimeBackend, RuntimeCapabilities, RuntimeVersion,
+    },
+    sandbox::SandboxSpec,
+};
+use serde_json::Value;
+
 use super::common::{LiveContext, TestError, exact_workspace_bind};
+
+const GIB: u64 = 1024_u64.pow(3);
+const CAPACITY_ROUNDING_BYTES: u64 = 64 * 1024_u64.pow(2);
 
 #[test]
 fn bind_inspect_requires_one_exact_read_write_workspace_source() {
@@ -47,4 +64,256 @@ async fn bind_mount_is_exact_and_named_volume_persists() -> Result<(), TestError
     ctx.recreate_container().await?;
     assert_eq!(ctx.read_cache("sentinel").await?, "persisted");
     ctx.cleanup().await
+}
+
+#[test]
+fn validates_exact_managed_volume_labels_mounts_and_capacity_bounds() {
+    let id = "live-storage-000000000000";
+    let inventory = serde_json::json!([
+        {"id":format!("gascan-mise-{id}"),"configuration":{"name":format!("gascan-mise-{id}"),"labels":{
+            "dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":id}}},
+        {"id":format!("gascan-cache-{id}"),"configuration":{"name":format!("gascan-cache-{id}"),"labels":{
+            "dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":id}}},
+        {"id":format!("gascan-config-{id}"),"configuration":{"name":format!("gascan-config-{id}"),"labels":{
+            "dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":id}}}
+    ]);
+    let inspect = serde_json::json!([{"configuration":{"mounts":[
+        {"type":{"volume":{"name":format!("gascan-mise-{id}")}},"source":"/host/volume.img","destination":"/home/workspace/.local/share/mise","options":[]},
+        {"type":{"volume":{"name":format!("gascan-cache-{id}")}},"source":"/host/volume.img","destination":"/home/workspace/.cache","options":[]},
+        {"type":{"volume":{"name":format!("gascan-config-{id}")}},"source":"/host/volume.img","destination":"/home/workspace/.config/gascan","options":[]}
+    ]}}]);
+    let capacities = BTreeMap::from([
+        ("/home/workspace/.cache".to_owned(), 12 * GIB),
+        (
+            "/home/workspace/.config/gascan".to_owned(),
+            2 * GIB + CAPACITY_ROUNDING_BYTES,
+        ),
+        ("/home/workspace/.local/share/mise".to_owned(), 11 * GIB),
+    ]);
+
+    assert_managed_storage(
+        &inventory,
+        &inspect,
+        id,
+        &[
+            ("mise", "/home/workspace/.local/share/mise", 11 * GIB),
+            ("cache", "/home/workspace/.cache", 12 * GIB),
+            ("config", "/home/workspace/.config/gascan", 2 * GIB),
+        ],
+        &capacities,
+    )
+    .unwrap();
+
+    let too_large = BTreeMap::from([
+        ("/home/workspace/.cache".to_owned(), 12 * GIB),
+        (
+            "/home/workspace/.config/gascan".to_owned(),
+            2 * GIB + CAPACITY_ROUNDING_BYTES + 1,
+        ),
+        ("/home/workspace/.local/share/mise".to_owned(), 11 * GIB),
+    ]);
+    assert!(
+        assert_managed_storage(
+            &inventory,
+            &inspect,
+            id,
+            &[
+                ("mise", "/home/workspace/.local/share/mise", 11 * GIB),
+                ("cache", "/home/workspace/.cache", 12 * GIB),
+                ("config", "/home/workspace/.config/gascan", 2 * GIB),
+            ],
+            &too_large,
+        )
+        .is_err()
+    );
+}
+
+fn parse_guest_block_capacities(output: &[u8]) -> Result<BTreeMap<String, u64>, TestError> {
+    String::from_utf8(output.to_vec())?
+        .lines()
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            let capacity = fields
+                .next()
+                .ok_or("guest block-capacity row is missing its size")?
+                .parse::<u64>()?;
+            let target = fields
+                .next()
+                .ok_or("guest block-capacity row is missing its mount target")?;
+            if fields.next().is_some() {
+                return Err("guest block-capacity row has unexpected fields".into());
+            }
+            Ok((target.to_owned(), capacity))
+        })
+        .collect()
+}
+
+fn assert_managed_storage(
+    inventory: &Value,
+    inspect: &Value,
+    id: &str,
+    expected: &[(&str, &str, u64)],
+    capacities: &BTreeMap<String, u64>,
+) -> Result<(), TestError> {
+    let volume_records = inventory
+        .as_array()
+        .ok_or("volume inventory must be an array")?;
+    let container = inspect
+        .as_array()
+        .and_then(|records| (records.len() == 1).then(|| &records[0]))
+        .ok_or("container inspect must contain exactly one record")?;
+    let mounts = container["configuration"]["mounts"]
+        .as_array()
+        .ok_or("container inspect has no mount array")?;
+    let volume_mount_count = mounts
+        .iter()
+        .filter(|mount| mount["type"]["volume"].is_object())
+        .count();
+    if volume_mount_count != expected.len() {
+        return Err(format!(
+            "expected {} managed volume mounts, found {volume_mount_count}",
+            expected.len()
+        )
+        .into());
+    }
+
+    if capacities.len() != expected.len() {
+        return Err(format!("unexpected capacity targets: {capacities:?}").into());
+    }
+    for (kind, target, requested) in expected {
+        let name = format!("gascan-{kind}-{id}");
+        let matching_records = volume_records
+            .iter()
+            .filter(|record| {
+                record["id"].as_str() == Some(name.as_str())
+                    && record["configuration"]["name"].as_str() == Some(name.as_str())
+            })
+            .collect::<Vec<_>>();
+        let [record] = matching_records.as_slice() else {
+            return Err(format!("expected one exact volume inventory record for {name}").into());
+        };
+        let labels = &record["configuration"]["labels"];
+        if labels["dev.gascan.managed-by"].as_str() != Some("gascan")
+            || labels["dev.gascan.sandbox-id"].as_str() != Some(id)
+        {
+            return Err(format!("ownership labels mismatch for {name}: {labels:?}").into());
+        }
+
+        let matching_mounts = mounts
+            .iter()
+            .filter(|mount| {
+                mount["type"]["volume"].is_object()
+                    && mount["type"]["volume"]["name"].as_str() == Some(name.as_str())
+                    && mount["destination"].as_str() == Some(*target)
+            })
+            .count();
+        if matching_mounts != 1 {
+            return Err(format!(
+                "expected one exact {name} mount at {target}, found {matching_mounts}: {mounts:?}"
+            )
+            .into());
+        }
+
+        let observed = capacities
+            .get(*target)
+            .ok_or_else(|| format!("df omitted managed mount target {target}"))?;
+        let maximum = requested
+            .checked_add(CAPACITY_ROUNDING_BYTES)
+            .ok_or("capacity assertion overflow")?;
+        if !(*requested..=maximum).contains(observed) {
+            return Err(format!(
+                "{target} capacity {observed} is outside requested range {requested}..={maximum}"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires Apple silicon macOS 26+ with container service and locked workspace image"]
+async fn independently_sized_managed_volumes_are_exact_and_cleanup() -> Result<(), TestError> {
+    let root = tempfile::tempdir()?;
+    let path = Utf8Path::from_path(root.path()).ok_or("non-UTF-8 live test root")?;
+    std::fs::write(
+        path.join("gascan.toml"),
+        "version = 1\nnetwork = 'offline'\n\
+         [storage]\ntools = '11GiB'\ncache = '12GiB'\nconfig = '2GiB'\n",
+    )?;
+    let spec = SandboxSpec::from_root("live-storage-capacity", path, Manifest::load(path)?)?;
+    let request = PolicyCompiler::compile(
+        spec,
+        &RuntimeCapabilities {
+            version: RuntimeVersion::new(1, 1, 0),
+            bind_mounts: true,
+            named_volumes: true,
+            tty: true,
+            signals: true,
+            loopback_publish: true,
+            resource_limits: true,
+            offline: NetworkIsolation::Proven,
+        },
+    )?;
+    let id = request.id().clone();
+    let runner = ProcessRunner;
+    let backend = AppleBackend::new(runner);
+    let created = backend.create(request).await?;
+
+    let result = async {
+        backend.start(&id).await?;
+        let inventory = runner
+            .run(CommandSpec::new(
+                "container",
+                ["volume", "list", "--format", "json"],
+            ))
+            .await?;
+        let inspect = runner
+            .run(CommandSpec::new("container", ["inspect", id.as_str()]))
+            .await?;
+        let df = runner
+            .run(CommandSpec::new(
+                "container",
+                [
+                    "exec",
+                    id.as_str(),
+                    "sh",
+                    "-c",
+                    "set -eu; for target in /home/workspace/.local/share/mise /home/workspace/.cache /home/workspace/.config/gascan; do source=$(df --output=source \"$target\" | tail -n 1 | tr -d ' '); device=${source##*/}; sectors=$(cat \"/sys/class/block/$device/size\"); printf '%s %s\\n' \"$((sectors * 512))\" \"$target\"; done",
+                ],
+            ))
+            .await?;
+        let capacities = parse_guest_block_capacities(&df.stdout)?;
+        assert_managed_storage(
+            &serde_json::from_slice(&inventory.stdout)?,
+            &serde_json::from_slice(&inspect.stdout)?,
+            id.as_str(),
+            &[
+                ("mise", "/home/workspace/.local/share/mise", 11 * GIB),
+                ("cache", "/home/workspace/.cache", 12 * GIB),
+                ("config", "/home/workspace/.config/gascan", 2 * GIB),
+            ],
+            &capacities,
+        )
+    }
+    .await;
+
+    let stop = backend.stop(&id).await;
+    let remove = backend
+        .remove(RemoveRequest::from_resources(created.created().to_vec())?)
+        .await;
+    if let Err(error) = stop {
+        return Err(
+            format!("live assertion result: {result:?}; cleanup stop failed: {error}").into(),
+        );
+    }
+    remove?;
+    assert!(
+        !backend
+            .list_resources()
+            .await?
+            .iter()
+            .any(|resource| resource.sandbox_id() == Some(&id)),
+        "live test-owned resources remain after cleanup"
+    );
+    result
 }

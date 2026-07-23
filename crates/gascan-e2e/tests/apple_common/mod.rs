@@ -330,6 +330,16 @@ impl AppleE2e {
         Ok(())
     }
 
+    pub fn write_manifest(&self, contents: &str) -> TestResult {
+        std::fs::write(self.root_path.join("gascan.toml"), contents)?;
+        let root = camino::Utf8Path::from_path(&self.root_path).ok_or("non-UTF-8 test root")?;
+        let manifest = gascan_core::manifest::Manifest::load(root)?;
+        if manifest.name() != Some(self.manifest_name.as_str()) {
+            return Err("replacement manifest changed the deterministic sandbox name".into());
+        }
+        Ok(())
+    }
+
     pub fn stop_owned_container(&self) -> TestResult {
         let identity = gascan_core::runtime::ResourceIdentity::new(
             gascan_core::runtime::ResourceKind::Container,
@@ -398,6 +408,23 @@ impl AppleE2e {
         wait_with_output_bounded(child, std::time::Duration::from_secs(90))
     }
 
+    pub fn invoke_with_timeout<I, S>(
+        &self,
+        args: I,
+        timeout: std::time::Duration,
+    ) -> TestResult<Output>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let child = self
+            .command(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        wait_with_output_bounded(child, timeout)
+    }
+
     pub fn invoke_with_env<I, S>(&self, args: I, key: &str, value: &str) -> TestResult<Output>
     where
         I: IntoIterator<Item = S>,
@@ -438,6 +465,29 @@ impl AppleE2e {
                 socket.display(),
                 raw_socket_connects,
                 daemon_stderr
+            )
+            .into());
+        }
+        Ok(output)
+    }
+
+    pub fn success_with_timeout<I, S>(
+        &self,
+        args: I,
+        timeout: std::time::Duration,
+    ) -> TestResult<Output>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let output = self.invoke_with_timeout(args, timeout)?;
+        if !output.status.success() {
+            return Err(format!(
+                "gascan failed with {:?}: stdout={} stderr={} daemon_stderr={}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+                self.bounded_daemon_stderr()
             )
             .into());
         }

@@ -172,6 +172,11 @@ setup = ".gascan/setup.sh"      # optional; path relative to the project root
 cpus = 6                        # optional; default 4, maximum 16
 memory = "12GiB"                # optional; default 8GiB, maximum 64GiB
 
+[storage]                       # optional; managed-volume capacities
+tools = "10GiB"
+cache = "10GiB"
+config = "1GiB"
+
 [tools]                         # mise tool name = version
 node = "lts"
 python = "3.13"
@@ -239,11 +244,41 @@ mid-operation fails rather than running.
 | --- | --- | --- | --- |
 | `cpus` | 4 | 16 | Integer; must be greater than zero. |
 | `memory` | `8GiB` | `64GiB` | String with binary units. |
-| `disk` | — | — | Parsed, but **rejected** on the supported Apple runtime, which cannot enforce a sandbox disk ceiling. |
+| `disk` | — | — | Parsed, but **rejected**: Apple cannot enforce a container root-filesystem ceiling. It does not size managed volumes. |
 
 Sizes must be a positive integer plus one of `KiB`, `MiB`, `GiB`, or `TiB`.
 Decimal units (`GB`), bare numbers, and zero are all rejected. Unknown
 process-limit requests are rejected as well.
+
+### `[storage]`
+
+Each setting controls one independently sized, writable, Gas Can-managed
+volume:
+
+| Key | Default | Guest mount |
+| --- | --- | --- |
+| `tools` | `10GiB` | `/home/workspace/.local/share/mise` |
+| `cache` | `10GiB` | `/home/workspace/.cache` |
+| `config` | `1GiB` | `/home/workspace/.config/gascan` |
+
+Storage sizes use the same binary units as memory: a positive integer followed
+by `KiB`, `MiB`, `GiB`, or `TiB`. Each volume has a maximum requested capacity
+of `512GiB`; decimal units, bare numbers, zero, and larger values are rejected.
+Omitted keys retain their defaults independently.
+
+Apple volumes cannot be resized in place. If any effective `[storage]` value
+changes after a sandbox has been created, `gascan up` and `gascan apply` refuse
+the change without modifying the existing volumes. Recreate explicitly:
+
+```sh
+gascan destroy --yes
+gascan up /path/to/project
+```
+
+Destroying removes the sandbox and all three managed volumes, including their
+contents. Back up anything you need before recreating. `[resources].disk` is
+not an alternative capacity control; it remains rejected because the Apple
+runtime cannot enforce a ceiling on the container root filesystem.
 
 ### `[tools]`
 
