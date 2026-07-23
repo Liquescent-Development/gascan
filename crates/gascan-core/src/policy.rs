@@ -31,6 +31,10 @@ pub const CONTAINER_PATH: &str = "/home/workspace/.local/share/mise/shims:/opt/g
 pub struct PolicyCompiler;
 
 impl PolicyCompiler {
+    pub fn managed_network_name(id: &crate::sandbox::SandboxId) -> String {
+        format!("gascan-network-{id}")
+    }
+
     pub fn expected_resource_identities(
         id: &crate::sandbox::SandboxId,
     ) -> Result<Vec<ResourceIdentity>, RuntimeError> {
@@ -41,6 +45,10 @@ impl PolicyCompiler {
         for name in managed_volume_names(id.as_str()) {
             identities.push(ResourceIdentity::new(ResourceKind::Volume, name)?);
         }
+        identities.push(ResourceIdentity::new(
+            ResourceKind::Network,
+            Self::managed_network_name(id),
+        )?);
         Ok(identities)
     }
 
@@ -69,7 +77,9 @@ impl PolicyCompiler {
             .collect();
         let volumes = managed_volumes(spec.id().as_str(), &ownership);
         let network = match manifest.network() {
-            NetworkMode::Networked => RuntimeNetwork::Networked,
+            NetworkMode::Networked => RuntimeNetwork::Networked {
+                name: Self::managed_network_name(spec.id()),
+            },
             NetworkMode::Offline => RuntimeNetwork::Offline,
         };
         let user = match manifest.user() {

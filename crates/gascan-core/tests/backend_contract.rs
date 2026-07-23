@@ -1,6 +1,6 @@
 mod common;
 
-use common::{capabilities, create_request};
+use common::{capabilities, create_request, create_request_with_network};
 use gascan_core::fake_runtime::{FailureBoundary, FakeRuntime};
 use gascan_core::runtime::{
     CreateFailure, CreateOutcome, ExecCancellation, ExecInput, ExecOutput, ExecRequest,
@@ -259,6 +259,122 @@ fn outcome_validation_failure_retains_every_independently_valid_created_resource
     assert_eq!(failure.code(), "invalid_state");
     assert_eq!(failure.created().len(), 1);
     assert_eq!(failure.created()[0].name(), fixture.volumes()[0].name);
+}
+
+#[test]
+fn network_create_evidence_is_authorized_only_for_networked_requests() {
+    let networked = create_request_with_network("network-evidence", "networked");
+    let name = networked.network().managed_name().unwrap().to_owned();
+    let resource = RuntimeResource::discovered(
+        ResourceIdentity::new(ResourceKind::Network, name).unwrap(),
+        Some(networked.id().clone()),
+        ResourceOwnership::GasCanOwned,
+    );
+    let container = RuntimeResource::discovered(
+        ResourceIdentity::new(ResourceKind::Container, networked.id().to_string()).unwrap(),
+        Some(networked.id().clone()),
+        ResourceOwnership::GasCanOwned,
+    );
+    assert!(CreateOutcome::new(&networked.request(), vec![resource.clone(), container]).is_ok());
+
+    let offline = create_request_with_network("offline-evidence", "offline");
+    let error = CreateFailure::from_created_evidence(
+        &offline.request(),
+        vec![RuntimeResource::discovered(
+            ResourceIdentity::new(ResourceKind::Network, resource.name()).unwrap(),
+            Some(offline.id().clone()),
+            ResourceOwnership::GasCanOwned,
+        )],
+        RuntimeError::InjectedFailure {
+            boundary: "test".into(),
+        },
+    );
+    assert!(error.created().is_empty());
+}
+
+#[test]
+fn networked_create_outcome_requires_the_managed_network() {
+    let fixture = create_request_with_network("missing-network", "networked");
+    let container = RuntimeResource::discovered(
+        ResourceIdentity::new(ResourceKind::Container, fixture.id().to_string()).unwrap(),
+        Some(fixture.id().clone()),
+        ResourceOwnership::GasCanOwned,
+    );
+
+    let error = CreateOutcome::new(&fixture.request(), vec![container]).unwrap_err();
+
+    assert_eq!(error.code(), "invalid_state");
+}
+
+#[tokio::test]
+async fn networked_fake_create_reports_network_then_volumes_then_container() {
+    let backend = FakeRuntime::new(capabilities());
+    let fixture = create_request_with_network("networked-order", "networked");
+    let expected_network = fixture.network().managed_name().unwrap();
+
+    let outcome = backend.create(fixture.request()).await.unwrap();
+
+    assert_eq!(outcome.created().len(), 5);
+    assert_eq!(outcome.created()[0].kind(), ResourceKind::Network);
+    assert_eq!(outcome.created()[0].name(), expected_network);
+    assert!(
+        outcome.created()[1..4]
+            .iter()
+            .all(|resource| resource.kind() == ResourceKind::Volume)
+    );
+    assert_eq!(outcome.created()[4].kind(), ResourceKind::Container);
+}
+
+#[tokio::test]
+async fn offline_fake_create_has_no_managed_network() {
+    let backend = FakeRuntime::new(capabilities());
+    let fixture = create_request("offline-create");
+
+    let outcome = backend.create(fixture.request()).await.unwrap();
+
+    assert!(
+        outcome
+            .created()
+            .iter()
+            .all(|resource| resource.kind() != ResourceKind::Network)
+    );
+}
+
+#[tokio::test]
+async fn same_name_seeded_network_conflicts_without_adoption() {
+    let backend = FakeRuntime::new(capabilities());
+    let fixture = create_request_with_network("network-conflict", "networked");
+    let name = fixture.network().managed_name().unwrap();
+    backend
+        .seed_network(
+            name,
+            Some(SandboxId::test("foreign-network-owner")),
+            ResourceOwnership::Foreign,
+        )
+        .await
+        .unwrap();
+
+    let failure = backend.create(fixture.request()).await.unwrap_err();
+
+    assert_eq!(failure.code(), "resource_conflict");
+    assert!(failure.created().is_empty());
+    assert!(backend.network_exists(name).await);
+}
+
+#[tokio::test]
+async fn removal_deletes_the_exact_fake_network() {
+    let backend = FakeRuntime::new(capabilities());
+    let fixture = create_request_with_network("network-remove", "networked");
+    let name = fixture.network().managed_name().unwrap().to_owned();
+    let outcome = backend.create(fixture.request()).await.unwrap();
+    assert!(backend.network_exists(&name).await);
+
+    backend
+        .remove(RemoveRequest::from_resources(outcome.created().to_vec()).unwrap())
+        .await
+        .unwrap();
+
+    assert!(!backend.network_exists(&name).await);
 }
 
 #[tokio::test]
