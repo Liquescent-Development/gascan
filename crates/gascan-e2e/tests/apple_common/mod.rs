@@ -302,7 +302,11 @@ impl AppleE2e {
     }
 
     pub fn stop_owned_container(&self) -> TestResult {
-        if resource_presence(self.id(), self.id())? != ResourcePresence::Owned {
+        let identity = gascan_core::runtime::ResourceIdentity::new(
+            gascan_core::runtime::ResourceKind::Container,
+            self.id(),
+        )?;
+        if resource_presence(&identity, self.id())? != ResourcePresence::Owned {
             return Err("refusing host-state mutation without exact owned container".into());
         }
         let child = Command::new("container")
@@ -548,7 +552,7 @@ impl AppleE2e {
     pub fn assert_no_owned_resources(&self) -> TestResult {
         for identity in self.resource_identities()? {
             let name = identity.name();
-            match resource_presence(name, self.id())? {
+            match resource_presence(&identity, self.id())? {
                 ResourcePresence::Absent => {}
                 ResourcePresence::Owned => {
                     return Err(format!("owned Gate 4 resource remains: {name}").into());
@@ -566,11 +570,23 @@ impl AppleE2e {
     }
 
     fn cleanup(&self) -> TestResult {
-        for identity in self.resource_identities()? {
+        let identities = self.resource_identities()?;
+        let presences = identities
+            .iter()
+            .map(|identity| resource_presence(identity, self.id()))
+            .collect::<TestResult<Vec<_>>>()?;
+        for (identity, presence) in identities.iter().zip(&presences) {
+            if *presence == ResourcePresence::Collision {
+                return Err(format!(
+                    "refusing cleanup for exact resource {} with mismatched ownership",
+                    identity.name()
+                )
+                .into());
+            }
+        }
+        for (identity, presence) in identities.into_iter().zip(presences) {
             let name = identity.name();
-            if resource_presence(name, self.id())
-                .is_ok_and(|presence| presence == ResourcePresence::Owned)
-            {
+            if presence == ResourcePresence::Owned {
                 if identity.kind() == gascan_core::runtime::ResourceKind::Container {
                     let _ = Command::new("container")
                         .args(["stop", "--time", "5", name])
@@ -578,16 +594,23 @@ impl AppleE2e {
                         .stderr(Stdio::null())
                         .status();
                 }
-                let mut command = Command::new("container");
-                if identity.kind() == gascan_core::runtime::ResourceKind::Container {
-                    command.args(["delete", name]);
-                } else {
-                    command.args(["volume", "delete", name]);
-                }
-                let status = command
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()?;
+                let status = match identity.kind() {
+                    gascan_core::runtime::ResourceKind::Container => Command::new("container")
+                        .args(["delete", name])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()?,
+                    gascan_core::runtime::ResourceKind::Volume => Command::new("container")
+                        .args(["volume", "delete", name])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()?,
+                    gascan_core::runtime::ResourceKind::Network => Command::new("container")
+                        .args(["network", "delete", name])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()?,
+                };
                 if !status.success() {
                     return Err(format!("cleanup failed for exact resource {name}").into());
                 }
@@ -1125,22 +1148,47 @@ enum ResourcePresence {
     Collision,
 }
 
-fn resource_presence(name: &str, id: &str) -> TestResult<ResourcePresence> {
-    let output = if name == id {
-        Command::new("container").args(["inspect", name]).output()?
-    } else {
-        Command::new("container")
+fn resource_presence(
+    identity: &gascan_core::runtime::ResourceIdentity,
+    id: &str,
+) -> TestResult<ResourcePresence> {
+    let name = identity.name();
+    let output = match identity.kind() {
+        gascan_core::runtime::ResourceKind::Container => {
+            Command::new("container").args(["inspect", name]).output()?
+        }
+        gascan_core::runtime::ResourceKind::Volume => Command::new("container")
             .args(["volume", "inspect", name])
-            .output()?
+            .output()?,
+        gascan_core::runtime::ResourceKind::Network => Command::new("container")
+            .args(["network", "list", "--format", "json"])
+            .output()?,
     };
     if !output.status.success() {
         return Ok(ResourcePresence::Absent);
     }
     let value: Value = serde_json::from_slice(&output.stdout)?;
-    let record = value
-        .as_array()
-        .and_then(|items| items.first())
-        .unwrap_or(&value);
+    let record = if identity.kind() == gascan_core::runtime::ResourceKind::Network {
+        let records = value
+            .as_array()
+            .ok_or("network inventory must be an array")?
+            .iter()
+            .filter(|record| {
+                record["id"].as_str() == Some(name)
+                    && record["configuration"]["name"].as_str() == Some(name)
+            })
+            .collect::<Vec<_>>();
+        match records.as_slice() {
+            [] => return Ok(ResourcePresence::Absent),
+            [record] => *record,
+            _ => return Err(format!("ambiguous exact network inventory for {name}").into()),
+        }
+    } else {
+        value
+            .as_array()
+            .and_then(|items| items.first())
+            .unwrap_or(&value)
+    };
     let labels = &record["configuration"]["labels"];
     Ok(
         if labels["dev.gascan.managed-by"] == "gascan" && labels["dev.gascan.sandbox-id"] == id {
@@ -1158,6 +1206,21 @@ fn cleanup_resource_identities(
     let resources = cleanup["resources"]
         .as_array()
         .ok_or("cleanup resources must be an array")?;
+    if resources.len() != 5 {
+        return Err("cleanup resources must contain exactly five entries".into());
+    }
+    let sandbox_id = cleanup["sandbox_id"]
+        .as_str()
+        .ok_or("cleanup sandbox id must be a string")?;
+    let sandbox_id = SandboxId::try_from(sandbox_id.to_owned())?;
+    let expected = gascan_core::policy::PolicyCompiler::expected_resource_identities(&sandbox_id)?;
+    if !resources
+        .iter()
+        .zip(&expected)
+        .all(|(value, identity)| value.as_str().is_some_and(|name| name == identity.name()))
+    {
+        return Err("cleanup resources must match the exact expected order".into());
+    }
     resources
         .iter()
         .enumerate()
@@ -1165,10 +1228,11 @@ fn cleanup_resource_identities(
             let name = value
                 .as_str()
                 .ok_or("cleanup resource name must be a string")?;
-            let kind = if index == 0 {
-                gascan_core::runtime::ResourceKind::Container
-            } else {
-                gascan_core::runtime::ResourceKind::Volume
+            let kind = match index {
+                0 => gascan_core::runtime::ResourceKind::Container,
+                1..=3 => gascan_core::runtime::ResourceKind::Volume,
+                4 => gascan_core::runtime::ResourceKind::Network,
+                _ => return Err("cleanup resource order is invalid".into()),
             };
             Ok(gascan_core::runtime::ResourceIdentity::new(kind, name)?)
         })
@@ -1371,10 +1435,13 @@ mod tests {
             );
             assert_eq!(expected[0].name(), spec.id().as_str());
             assert!(
-                expected
+                expected[1..4]
                     .iter()
-                    .skip(1)
                     .all(|identity| identity.kind() == gascan_core::runtime::ResourceKind::Volume)
+            );
+            assert_eq!(
+                expected[4].kind(),
+                gascan_core::runtime::ResourceKind::Network
             );
             assert_eq!(request.id(), spec.id());
             assert_eq!(
@@ -1392,6 +1459,7 @@ mod tests {
                 expected
                     .iter()
                     .skip(1)
+                    .take(3)
                     .map(|identity| identity.name())
                     .collect::<Vec<_>>()
             );
@@ -1416,6 +1484,24 @@ mod tests {
                     .all(|volume| &volume.ownership == request.ownership())
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_resource_identities_rejects_wrong_order() -> TestResult {
+        let id = SandboxId::test("cleanup-order");
+        let expected = gascan_core::policy::PolicyCompiler::expected_resource_identities(&id)?;
+        let mut resources = expected
+            .iter()
+            .map(gascan_core::runtime::ResourceIdentity::name)
+            .collect::<Vec<_>>();
+        resources.swap(1, 4);
+        let cleanup = serde_json::json!({
+            "sandbox_id": id.as_str(),
+            "resources": resources,
+        });
+
+        assert!(cleanup_resource_identities(&cleanup).is_err());
         Ok(())
     }
 

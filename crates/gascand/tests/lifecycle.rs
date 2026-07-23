@@ -17,6 +17,14 @@ use std::time::{Duration, Instant};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
+fn networked_spec(name: &str, root: &Utf8Path) -> Result<SandboxSpec, Box<dyn Error>> {
+    std::fs::write(
+        root.join("gascan.toml"),
+        "version = 1\nnetwork = 'networked'\n",
+    )?;
+    Ok(SandboxSpec::from_root(name, root, Manifest::load(root)?)?)
+}
+
 #[derive(Default)]
 struct ControlledProvisioner {
     fail_provision: AtomicBool,
@@ -428,6 +436,45 @@ async fn failed_create_preserves_preexisting_volume_and_removes_only_new_resourc
             .iter()
             .all(|resource| resource.kind() == ResourceKind::Volume && resource.name() == names[0])
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_networked_up_rolls_back_the_managed_network() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let spec = networked_spec("network-rollback", root)?;
+    let network = PolicyCompiler::managed_network_name(spec.id());
+    let runtime = FakeRuntime::failing_once(FailureBoundary::Start);
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    );
+
+    assert!(service.up(UpRequest::new(spec)).await.is_err());
+    assert!(!runtime.network_exists(&network).await);
+    Ok(())
+}
+
+#[tokio::test]
+async fn destroy_removes_the_managed_network_after_successful_networked_up() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let spec = networked_spec("network-destroy", root)?;
+    let id = spec.id().clone();
+    let network = PolicyCompiler::managed_network_name(&id);
+    let runtime = FakeRuntime::default();
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    );
+
+    service.up(UpRequest::new(spec)).await?;
+    assert!(runtime.network_exists(&network).await);
+    service.destroy(&id).await?;
+    assert!(!runtime.network_exists(&network).await);
     Ok(())
 }
 
