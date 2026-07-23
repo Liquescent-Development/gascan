@@ -650,7 +650,13 @@ impl RuntimeBackend for FakeRuntime {
                 });
             }
         }
-        for expected in request.resources() {
+        let mut removal = request.resources().to_vec();
+        removal.sort_by_key(|resource| match resource.kind() {
+            ResourceKind::Container => 0,
+            ResourceKind::Volume => 1,
+            ResourceKind::Network => 2,
+        });
+        for expected in &removal {
             state.resources.remove(expected.identity());
             if expected.kind() == ResourceKind::Container {
                 if let Some(id) = expected.sandbox_id() {
@@ -658,7 +664,11 @@ impl RuntimeBackend for FakeRuntime {
                 }
             }
         }
-        state.outcomes.push(RuntimeOutcome::Removed(request));
+        state
+            .outcomes
+            .push(RuntimeOutcome::Removed(RemoveRequest::from_resources(
+                removal,
+            )?));
         persist_state(&state, self.persistence.as_deref())?;
         Ok(())
     }

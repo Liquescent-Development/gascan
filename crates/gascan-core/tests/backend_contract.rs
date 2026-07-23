@@ -362,7 +362,7 @@ async fn same_name_seeded_network_conflicts_without_adoption() {
 }
 
 #[tokio::test]
-async fn removal_deletes_the_exact_fake_network() {
+async fn removal_mutates_in_container_volume_network_order() {
     let backend = FakeRuntime::new(capabilities());
     let fixture = create_request_with_network("network-remove", "networked");
     let name = fixture.network().managed_name().unwrap().to_owned();
@@ -374,6 +374,24 @@ async fn removal_deletes_the_exact_fake_network() {
         .await
         .unwrap();
 
+    let outcomes = backend.outcomes().await;
+    let RuntimeOutcome::Removed(removal) = outcomes.last().unwrap() else {
+        panic!("recorded removal outcome");
+    };
+    assert_eq!(
+        removal
+            .resources()
+            .iter()
+            .map(RuntimeResource::kind)
+            .collect::<Vec<_>>(),
+        [
+            ResourceKind::Container,
+            ResourceKind::Volume,
+            ResourceKind::Volume,
+            ResourceKind::Volume,
+            ResourceKind::Network,
+        ]
+    );
     assert!(!backend.network_exists(&name).await);
 }
 
