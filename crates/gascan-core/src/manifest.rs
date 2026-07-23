@@ -6,6 +6,11 @@ use thiserror::Error;
 
 const MANIFEST_FILE: &str = "gascan.toml";
 
+pub const DEFAULT_TOOLS_STORAGE_BYTES: u64 = 10 * 1024_u64.pow(3);
+pub const DEFAULT_CACHE_STORAGE_BYTES: u64 = 10 * 1024_u64.pow(3);
+pub const DEFAULT_CONFIG_STORAGE_BYTES: u64 = 1024_u64.pow(3);
+pub const MAX_MANAGED_VOLUME_BYTES: u64 = 512 * 1024_u64.pow(3);
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Manifest {
     version: u32,
@@ -15,6 +20,7 @@ pub struct Manifest {
     gascamp: GascampSource,
     setup: Option<Utf8PathBuf>,
     resources: Resources,
+    storage: Storage,
     tools: BTreeMap<String, String>,
     ports: BTreeMap<String, u16>,
     #[serde(skip)]
@@ -56,6 +62,7 @@ impl Manifest {
             gascamp: GascampSource::bundled(),
             setup: None,
             resources: Resources::empty(),
+            storage: Storage::defaults(),
             tools: BTreeMap::new(),
             ports: BTreeMap::new(),
             canonical_root,
@@ -101,6 +108,10 @@ impl Manifest {
 
     pub const fn resources(&self) -> &Resources {
         &self.resources
+    }
+
+    pub const fn storage(&self) -> &Storage {
+        &self.storage
     }
 
     pub const fn tools(&self) -> &BTreeMap<String, String> {
@@ -209,6 +220,43 @@ impl Resources {
 
     pub const fn disk(&self) -> Option<ResourceSize> {
         self.disk
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct Storage {
+    tools: ResourceSize,
+    cache: ResourceSize,
+    config: ResourceSize,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawStorage {
+    tools: Option<ResourceSize>,
+    cache: Option<ResourceSize>,
+    config: Option<ResourceSize>,
+}
+
+impl Storage {
+    const fn defaults() -> Self {
+        Self {
+            tools: ResourceSize(DEFAULT_TOOLS_STORAGE_BYTES),
+            cache: ResourceSize(DEFAULT_CACHE_STORAGE_BYTES),
+            config: ResourceSize(DEFAULT_CONFIG_STORAGE_BYTES),
+        }
+    }
+
+    pub const fn tools(&self) -> ResourceSize {
+        self.tools
+    }
+
+    pub const fn cache(&self) -> ResourceSize {
+        self.cache
+    }
+
+    pub const fn config(&self) -> ResourceSize {
+        self.config
     }
 }
 
@@ -328,6 +376,8 @@ struct RawManifest {
     #[serde(default)]
     resources: RawResources,
     #[serde(default)]
+    storage: RawStorage,
+    #[serde(default)]
     tools: BTreeMap<String, String>,
     #[serde(default)]
     ports: BTreeMap<String, u16>,
@@ -350,6 +400,23 @@ impl RawManifest {
             memory: self.resources.memory,
             disk: self.resources.disk,
         };
+        let defaults = Storage::defaults();
+        let storage = Storage {
+            tools: self.storage.tools.unwrap_or(defaults.tools),
+            cache: self.storage.cache.unwrap_or(defaults.cache),
+            config: self.storage.config.unwrap_or(defaults.config),
+        };
+        for (field, size) in [
+            ("tools", storage.tools),
+            ("cache", storage.cache),
+            ("config", storage.config),
+        ] {
+            if size.bytes() > MAX_MANAGED_VOLUME_BYTES {
+                return Err(ManifestError::Invalid(format!(
+                    "storage.{field} must not exceed 512GiB"
+                )));
+            }
+        }
         if let Some(setup) = self.setup.as_deref() {
             validate_workspace_relative_path("setup", setup)?;
             validate_setup_containment(canonical_root, setup)?;
@@ -379,6 +446,7 @@ impl RawManifest {
             gascamp,
             setup: self.setup,
             resources,
+            storage,
             tools: self.tools,
             ports: self.ports,
             canonical_root: canonical_root.to_owned(),
