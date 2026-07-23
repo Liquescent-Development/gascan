@@ -261,34 +261,28 @@ pub async fn execute() -> Result<i32, CliError> {
         Command::DaemonAttest => Ok(0),
         Command::Up { project_root, json } => {
             let project_root = resolve_project_root(&project_root)?;
-            operation(
-                client
-                    .api
-                    .up(v1::UpRequest { project_root })
-                    .await?
-                    .into_inner(),
-                json,
-                OperationKind::Up,
-                None,
-            )
-            .await
+            match client.api.up(v1::UpRequest { project_root }).await {
+                Ok(response) => {
+                    operation(response.into_inner(), json, OperationKind::Up, None).await
+                }
+                Err(status) => pre_stream_operation_failure(status.into(), json),
+            }
         }
         Command::Apply { project_root, json } => {
             let root = match project_root {
                 Some(root) => resolve_project_root(&root)?,
                 None => resolve_project_root(".")?,
             };
-            operation(
-                client
-                    .api
-                    .apply(v1::ApplyRequest { project_root: root })
-                    .await?
-                    .into_inner(),
-                json,
-                OperationKind::Apply,
-                None,
-            )
-            .await
+            match client
+                .api
+                .apply(v1::ApplyRequest { project_root: root })
+                .await
+            {
+                Ok(response) => {
+                    operation(response.into_inner(), json, OperationKind::Apply, None).await
+                }
+                Err(status) => pre_stream_operation_failure(status.into(), json),
+            }
         }
         Command::Down { json } => {
             let selector = selector(&mut client, arguments.sandbox).await?;
@@ -451,7 +445,7 @@ async fn operation(
         while let Some(event) = stream.message().await? {
             println!(
                 "{}",
-                serde_json::json!({"operation_id":event.operation_id.map(|id|id.value),"sequence":event.sequence,"phase":event.phase,"status":event.status,"error":event.error.as_ref().map(|error|serde_json::json!({"code":error.code,"message":error.message}))})
+                serde_json::json!({"operation_id":event.operation_id.map(|id|id.value),"sequence":event.sequence,"phase":event.phase,"status":event.status,"error":event.error.as_ref().map(json_operation_error)})
             );
             if event.error.is_some() {
                 return Ok(EXIT_RUNTIME);
@@ -481,6 +475,39 @@ async fn operation(
         writeln!(std::io::stderr(), "{line}")?;
     }
     Ok(0)
+}
+
+fn pre_stream_operation_failure(error: ClientError, json: bool) -> Result<i32, CliError> {
+    let rendered = render_pre_stream_client_error(error, json)?;
+    println!("{rendered}");
+    Ok(EXIT_RUNTIME)
+}
+
+fn render_pre_stream_client_error(error: ClientError, json: bool) -> Result<String, CliError> {
+    if !json {
+        return Err(CliError::Client(error));
+    }
+    let code = error.stable_code().unwrap_or("unknown_error");
+    let message = error.cause().unwrap_or_else(|| code.to_owned());
+    let details = error.failure_details().unwrap_or(serde_json::Value::Null);
+    Ok(serde_json::json!({
+        "error": {
+            "code": code,
+            "message": message,
+            "details": details,
+        }
+    })
+    .to_string())
+}
+
+fn json_operation_error(error: &v1::Error) -> serde_json::Value {
+    let details = serde_json::from_slice::<serde_json::Value>(&error.details)
+        .unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "code": error.code,
+        "message": error.message,
+        "details": details,
+    })
 }
 
 async fn run(
@@ -899,6 +926,92 @@ mod tests {
             error.message(),
             "process_failed: command exited before setup completed"
         );
+    }
+
+    #[test]
+    fn json_operation_error_retains_storage_change_details()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let error = v1::Error {
+            code: gascan_proto::error_code::STORAGE_CHANGE_REQUIRES_RECREATE.to_owned(),
+            message: "storage settings changed".to_owned(),
+            details: serde_json::to_vec(&serde_json::json!({"changes":[{
+                "volume":"tools",
+                "recorded_bytes":10 * 1024_u64.pow(3),
+                "requested_bytes":20 * 1024_u64.pow(3),
+            }]}))?,
+        };
+        assert_eq!(
+            super::json_operation_error(&error),
+            serde_json::json!({
+                "code":"storage_change_requires_recreate",
+                "message":"storage settings changed",
+                "details":{"changes":[{
+                    "volume":"tools",
+                    "recorded_bytes":10 * 1024_u64.pow(3),
+                    "requested_bytes":20 * 1024_u64.pow(3),
+                }]}
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn storage_change_human_error_is_actionable() {
+        let message = "storage settings changed for tools (10GiB → 20GiB); run `gascan destroy --yes` and `gascan up` to recreate the sandbox";
+        let error = CliError::Operation {
+            code: gascan_proto::error_code::STORAGE_CHANGE_REQUIRES_RECREATE.to_owned(),
+            message: message.to_owned(),
+        };
+        assert_eq!(error.message(), message);
+        assert!(render_error(&error).contains(message));
+    }
+
+    #[test]
+    fn pre_stream_client_error_renders_structured_json_when_requested()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let message = "storage settings changed for tools (10GiB → 20GiB); run `gascan destroy --yes` and `gascan up` to recreate the sandbox";
+        let changes = serde_json::json!({"changes":[{
+            "volume":"tools",
+            "recorded_bytes":10 * 1024_u64.pow(3),
+            "requested_bytes":20 * 1024_u64.pow(3),
+        }]});
+        let details = gascan_proto::error_detail::encode_with_details(
+            gascan_proto::error_code::STORAGE_CHANGE_REQUIRES_RECREATE,
+            message,
+            &serde_json::to_vec(&changes)?,
+        );
+        let error = ClientError::from(tonic::Status::with_details(
+            tonic::Code::FailedPrecondition,
+            gascan_proto::error_code::STORAGE_CHANGE_REQUIRES_RECREATE,
+            tonic::codegen::Bytes::from(details),
+        ));
+
+        let rendered = super::render_pre_stream_client_error(error, true)?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&rendered)?,
+            serde_json::json!({"error":{
+                "code":"storage_change_requires_recreate",
+                "message":message,
+                "details":changes,
+            }})
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pre_stream_client_error_keeps_human_mode_unchanged() {
+        let status = tonic::Status::failed_precondition(
+            gascan_proto::error_code::STORAGE_CHANGE_REQUIRES_RECREATE,
+        );
+        let error = super::render_pre_stream_client_error(ClientError::from(status), false)
+            .err()
+            .ok_or("human mode unexpectedly rendered JSON");
+        assert!(matches!(
+            error,
+            Ok(CliError::Client(ClientError::Rpc(status)))
+                if status.message()
+                    == gascan_proto::error_code::STORAGE_CHANGE_REQUIRES_RECREATE
+        ));
     }
 
     #[test]

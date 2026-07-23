@@ -154,6 +154,7 @@ pub struct RuntimeVolume {
     pub name: String,
     pub target: Utf8PathBuf,
     pub writable: bool,
+    pub capacity_bytes: u64,
     pub ownership: OwnershipMetadata,
 }
 

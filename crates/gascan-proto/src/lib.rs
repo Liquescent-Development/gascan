@@ -25,6 +25,8 @@ pub mod error_code {
     pub const INVALID_PROJECT_ROOT: &str = "invalid_project_root";
     /// The selected runtime cannot enforce a requested disk ceiling.
     pub const DISK_CONTROL_UNSUPPORTED: &str = "disk_control_unsupported";
+    /// Existing managed storage differs from the requested immutable capacity.
+    pub const STORAGE_CHANGE_REQUIRES_RECREATE: &str = "storage_change_requires_recreate";
     /// The selected sandbox does not exist.
     pub const SANDBOX_NOT_FOUND: &str = "sandbox_not_found";
     /// Another operation prevents this request from running.
@@ -49,6 +51,7 @@ pub mod error_code {
         INVALID_MANIFEST,
         INVALID_PROJECT_ROOT,
         DISK_CONTROL_UNSUPPORTED,
+        STORAGE_CHANGE_REQUIRES_RECREATE,
         SANDBOX_NOT_FOUND,
         OPERATION_CONFLICT,
         BACKEND_UNAVAILABLE,
@@ -72,10 +75,16 @@ pub mod error_detail {
     /// Encode a code and human cause for `tonic::Status::with_details`.
     #[must_use]
     pub fn encode(code: &str, message: &str) -> Vec<u8> {
+        encode_with_details(code, message, &[])
+    }
+
+    /// Encode a code, human cause, and opaque structured failure details.
+    #[must_use]
+    pub fn encode_with_details(code: &str, message: &str, details: &[u8]) -> Vec<u8> {
         super::v1::Error {
             code: code.to_owned(),
             message: message.to_owned(),
-            details: Vec::new(),
+            details: details.to_vec(),
         }
         .encode_to_vec()
     }
@@ -87,11 +96,20 @@ pub mod error_detail {
     /// than no detail at all.
     #[must_use]
     pub fn decode_message(details: &[u8]) -> Option<String> {
+        decode(details).and_then(|error| (!error.message.is_empty()).then_some(error.message))
+    }
+
+    /// Recover the opaque structured details produced by [`encode_with_details`].
+    #[must_use]
+    pub fn decode_details(details: &[u8]) -> Option<Vec<u8>> {
+        decode(details).and_then(|error| (!error.details.is_empty()).then_some(error.details))
+    }
+
+    fn decode(details: &[u8]) -> Option<super::v1::Error> {
         if details.is_empty() {
             return None;
         }
-        let error = super::v1::Error::decode(details).ok()?;
-        (!error.message.is_empty()).then_some(error.message)
+        super::v1::Error::decode(details).ok()
     }
 }
 

@@ -1,5 +1,8 @@
 use camino::Utf8Path;
-use gascan_core::manifest::{Manifest, NetworkMode, UserMode};
+use gascan_core::manifest::{
+    DEFAULT_CACHE_STORAGE_BYTES, DEFAULT_CONFIG_STORAGE_BYTES, DEFAULT_TOOLS_STORAGE_BYTES,
+    Manifest, NetworkMode, UserMode,
+};
 use std::collections::BTreeMap;
 
 fn load(source: &str) -> Result<Manifest, gascan_core::manifest::ManifestError> {
@@ -28,6 +31,71 @@ fn omitted_policy_uses_security_defaults() {
     assert_eq!(manifest.setup(), None);
     assert_eq!(manifest.tools(), &BTreeMap::new());
     assert_eq!(manifest.ports(), &BTreeMap::new());
+}
+
+#[test]
+fn storage_defaults_and_partial_overrides_are_independent() {
+    let defaults = load("version = 1\n").unwrap();
+    assert_eq!(
+        defaults.storage().tools().bytes(),
+        DEFAULT_TOOLS_STORAGE_BYTES
+    );
+    assert_eq!(
+        defaults.storage().cache().bytes(),
+        DEFAULT_CACHE_STORAGE_BYTES
+    );
+    assert_eq!(
+        defaults.storage().config().bytes(),
+        DEFAULT_CONFIG_STORAGE_BYTES
+    );
+
+    let partial = load("version = 1\n[storage]\ntools = '30GiB'\n").unwrap();
+    assert_eq!(partial.storage().tools().bytes(), 30 * 1024_u64.pow(3));
+    assert_eq!(
+        partial.storage().cache().bytes(),
+        DEFAULT_CACHE_STORAGE_BYTES
+    );
+    assert_eq!(
+        partial.storage().config().bytes(),
+        DEFAULT_CONFIG_STORAGE_BYTES
+    );
+}
+
+#[test]
+fn storage_invalid_boundaries_are_rejected_and_maximum_is_accepted() {
+    for source in [
+        "version = 1\n[storage]\ntools = '0GiB'\n",
+        "version = 1\n[storage]\ncache = '10GB'\n",
+        "version = 1\n[storage]\nconfig = '513GiB'\n",
+        "version = 1\n[storage]\nunknown = '1GiB'\n",
+    ] {
+        assert!(
+            load(source).is_err(),
+            "accepted invalid storage policy: {source}"
+        );
+    }
+
+    for field in ["tools", "cache", "config"] {
+        let source = format!("version = 1\n[storage]\n{field} = '512GiB'\n");
+        assert!(
+            load(&source).is_ok(),
+            "rejected maximum storage policy: {source}"
+        );
+    }
+}
+
+#[test]
+fn storage_values_above_maximum_report_the_field() {
+    for field in ["tools", "cache", "config"] {
+        let source = format!("version = 1\n[storage]\n{field} = '513GiB'\n");
+        let error = load(&source).expect_err("oversized managed volume must be rejected");
+        match error {
+            gascan_core::manifest::ManifestError::Invalid(message) => {
+                assert_eq!(message, format!("storage.{field} must not exceed 512GiB"));
+            }
+            other => panic!("expected field-specific invalid error, got {other}"),
+        }
+    }
 }
 
 #[test]

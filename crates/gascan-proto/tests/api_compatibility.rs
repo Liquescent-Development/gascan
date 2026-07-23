@@ -1002,6 +1002,11 @@ fn request_validation_codes_are_public_and_unique() {
     let codes = gascan_proto::error_code::ALL;
     assert!(codes.contains(&"invalid_manifest"));
     assert!(codes.contains(&"invalid_project_root"));
+    assert!(codes.contains(&"storage_change_requires_recreate"));
+    assert_eq!(
+        gascan_proto::error_code::STORAGE_CHANGE_REQUIRES_RECREATE,
+        "storage_change_requires_recreate"
+    );
     assert_eq!(
         codes.len(),
         codes.iter().copied().collect::<HashSet<_>>().len()
@@ -1017,6 +1022,20 @@ fn error_detail_round_trips_the_human_cause() {
     assert_eq!(
         gascan_proto::error_detail::decode_message(&encoded).as_deref(),
         Some("unknown variant `kiener`, expected `workspace` or `root`")
+    );
+}
+
+#[test]
+fn error_detail_round_trips_structured_failure_details() {
+    let details = br#"{"changes":[{"volume":"tools","recorded_bytes":10737418240,"requested_bytes":21474836480}]}"#;
+    let encoded = gascan_proto::error_detail::encode_with_details(
+        gascan_proto::error_code::STORAGE_CHANGE_REQUIRES_RECREATE,
+        "storage settings changed",
+        details,
+    );
+    assert_eq!(
+        gascan_proto::error_detail::decode_details(&encoded).as_deref(),
+        Some(details.as_slice())
     );
 }
 

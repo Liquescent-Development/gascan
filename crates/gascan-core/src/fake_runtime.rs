@@ -1,8 +1,8 @@
 use crate::runtime::{
-    ContainerState, CreateFailure, CreateOutcome, CreateRequest, ExecInput, ExecOutput,
-    ExecRequest, ExecSession, RemoveRequest, ResourceIdentity, ResourceKind, ResourceOwnership,
-    RuntimeBackend, RuntimeCall, RuntimeCapabilities, RuntimeError, RuntimeOutcome,
-    RuntimeResource, RuntimeSandbox,
+    ContainerState, CreateFailure, CreateOutcome, CreateRequest, ExecCancellation, ExecInput,
+    ExecOutput, ExecRequest, ExecSession, RemoveRequest, ResourceIdentity, ResourceKind,
+    ResourceOwnership, RuntimeBackend, RuntimeCall, RuntimeCapabilities, RuntimeError,
+    RuntimeOutcome, RuntimeResource, RuntimeSandbox,
 };
 use crate::sandbox::SandboxId;
 use async_trait::async_trait;
@@ -78,11 +78,12 @@ struct FakeState {
     outcomes: Vec<RuntimeOutcome>,
     failures: HashSet<FailureBoundary>,
     create_failure_after_mutations: Option<usize>,
-    exec_result: (Vec<u8>, Vec<u8>, i32),
-    exec_results: VecDeque<(Vec<u8>, Vec<u8>, i32)>,
+    exec_result: (Vec<u8>, Vec<u8>, i32, i32),
+    exec_results: VecDeque<(Vec<u8>, Vec<u8>, i32, i32)>,
     exec_errors: VecDeque<RuntimeError>,
     exec_input_failures: usize,
     exec_stream_errors: VecDeque<RuntimeError>,
+    exec_cancellations: usize,
     logs: Vec<FakeLogRecord>,
 }
 
@@ -98,11 +99,12 @@ impl FakeRuntime {
                 outcomes: Vec::new(),
                 failures: HashSet::new(),
                 create_failure_after_mutations: None,
-                exec_result: (Vec::new(), Vec::new(), 0),
+                exec_result: (Vec::new(), Vec::new(), 0, 0),
                 exec_results: VecDeque::new(),
                 exec_errors: VecDeque::new(),
                 exec_input_failures: 0,
                 exec_stream_errors: VecDeque::new(),
+                exec_cancellations: 0,
                 logs: Vec::new(),
             })),
             persistence: Arc::new(None),
@@ -177,12 +179,23 @@ impl FakeRuntime {
     }
 
     pub async fn set_exec_result(&self, stdout: Vec<u8>, stderr: Vec<u8>, exit_code: i32) {
-        self.inner.lock().await.exec_result = (stdout, stderr, exit_code);
+        self.inner.lock().await.exec_result = (stdout, stderr, exit_code, 0);
     }
 
     pub async fn queue_exec_results<I>(&self, results: I)
     where
         I: IntoIterator<Item = (Vec<u8>, Vec<u8>, i32)>,
+    {
+        self.inner.lock().await.exec_results.extend(
+            results
+                .into_iter()
+                .map(|(stdout, stderr, code)| (stdout, stderr, code, 0)),
+        );
+    }
+
+    pub async fn queue_exec_results_with_signals<I>(&self, results: I)
+    where
+        I: IntoIterator<Item = (Vec<u8>, Vec<u8>, i32, i32)>,
     {
         self.inner.lock().await.exec_results.extend(results);
     }
@@ -197,6 +210,10 @@ impl FakeRuntime {
 
     pub async fn queue_exec_stream_error(&self, error: RuntimeError) {
         self.inner.lock().await.exec_stream_errors.push_back(error);
+    }
+
+    pub async fn exec_cancellations(&self) -> usize {
+        self.inner.lock().await.exec_cancellations
     }
 
     pub async fn set_logs(&self, logs: Vec<u8>) {
@@ -389,11 +406,12 @@ fn load_state(capabilities: RuntimeCapabilities, path: &Path) -> Result<FakeStat
         outcomes: Vec::new(),
         failures: HashSet::new(),
         create_failure_after_mutations: None,
-        exec_result: (Vec::new(), Vec::new(), 0),
+        exec_result: (Vec::new(), Vec::new(), 0, 0),
         exec_results: VecDeque::new(),
         exec_errors: VecDeque::new(),
         exec_input_failures: 0,
         exec_stream_errors: VecDeque::new(),
+        exec_cancellations: 0,
         logs: snapshot.logs,
     })
 }
@@ -712,7 +730,8 @@ impl RuntimeBackend for FakeRuntime {
             .unwrap_or_else(|| state.exec_result.clone());
         let runtime = self.clone();
         let (input, mut inputs) = tokio::sync::mpsc::channel(16);
-        let (outputs, output) = tokio::sync::mpsc::channel(16);
+        let (outputs, output) = tokio::sync::mpsc::channel(1);
+        let (cancellation, mut cancelled) = ExecCancellation::channel();
         tokio::spawn(async move {
             let ready_then_drain = request
                 .argv
@@ -727,7 +746,7 @@ impl RuntimeBackend for FakeRuntime {
                 return;
             }
             let mut stdin = request.stdin;
-            let mut signal = 0;
+            let mut signal = configured.3;
             let mut resize = None;
             while let Some(frame) = inputs.recv().await {
                 match frame {
@@ -744,7 +763,7 @@ impl RuntimeBackend for FakeRuntime {
                     &request.argv,
                     &request.environment,
                     stdin,
-                    configured,
+                    (configured.0, configured.1, configured.2),
                     resize,
                 )
             };
@@ -762,10 +781,18 @@ impl RuntimeBackend for FakeRuntime {
                 });
                 let _ = persist_state(&state, runtime.persistence.as_deref());
             }
-            if !stdout.is_empty() && outputs.send(Ok(ExecOutput::Stdout(stdout))).await.is_err() {
+            if !stdout.is_empty()
+                && !send_fake_exec_output(&outputs, &mut cancelled, ExecOutput::Stdout(stdout))
+                    .await
+            {
+                record_fake_exec_cancellation(&runtime, &cancelled).await;
                 return;
             }
-            if !stderr.is_empty() && outputs.send(Ok(ExecOutput::Stderr(stderr))).await.is_err() {
+            if !stderr.is_empty()
+                && !send_fake_exec_output(&outputs, &mut cancelled, ExecOutput::Stderr(stderr))
+                    .await
+            {
+                record_fake_exec_cancellation(&runtime, &cancelled).await;
                 return;
             }
             let code = if signal == 0 {
@@ -773,9 +800,13 @@ impl RuntimeBackend for FakeRuntime {
             } else {
                 128_i32.saturating_add(signal)
             };
-            let _ = outputs.send(Ok(ExecOutput::Exit { code, signal })).await;
+            if !send_fake_exec_output(&outputs, &mut cancelled, ExecOutput::Exit { code, signal })
+                .await
+            {
+                record_fake_exec_cancellation(&runtime, &cancelled).await;
+            }
         });
-        Ok(ExecSession::live(input, output))
+        Ok(ExecSession::live_cancellable(input, output, cancellation))
     }
 
     async fn logs(
@@ -807,6 +838,27 @@ impl RuntimeBackend for FakeRuntime {
         let mut resources = state.resources.values().cloned().collect::<Vec<_>>();
         resources.sort_by(|left, right| left.identity().cmp(right.identity()));
         Ok(resources)
+    }
+}
+
+async fn send_fake_exec_output(
+    outputs: &tokio::sync::mpsc::Sender<Result<ExecOutput, RuntimeError>>,
+    cancelled: &mut tokio::sync::watch::Receiver<bool>,
+    output: ExecOutput,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = cancelled.changed() => false,
+        result = outputs.send(Ok(output)) => result.is_ok(),
+    }
+}
+
+async fn record_fake_exec_cancellation(
+    runtime: &FakeRuntime,
+    cancelled: &tokio::sync::watch::Receiver<bool>,
+) {
+    if *cancelled.borrow() {
+        runtime.inner.lock().await.exec_cancellations += 1;
     }
 }
 

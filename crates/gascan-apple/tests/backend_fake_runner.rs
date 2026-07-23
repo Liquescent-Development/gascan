@@ -27,6 +27,7 @@ struct StatefulAppleRunner(Arc<Mutex<State>>);
 struct State {
     containers: BTreeMap<String, (String, String)>,
     volumes: BTreeMap<String, (String, String)>,
+    volume_sizes: BTreeMap<String, u64>,
     networks: BTreeMap<String, (String, String)>,
     commands: Vec<CommandSpec>,
     faulted_inventory_commands: Vec<Vec<String>>,
@@ -179,12 +180,15 @@ impl CommandRunner for StatefulAppleRunner {
                 "--label",
                 sandbox,
                 "-s",
-                "104857600",
+                size,
                 name,
             ] => {
                 if state.volumes.contains_key(*name) {
                     return conflict(name);
                 }
+                state
+                    .volume_sizes
+                    .insert((*name).into(), size.parse::<u64>().unwrap());
                 state.volumes.insert(
                     (*name).into(),
                     (
@@ -267,6 +271,7 @@ impl CommandRunner for StatefulAppleRunner {
             }
             ["volume", "delete", name] => {
                 state.volumes.remove(*name);
+                state.volume_sizes.remove(*name);
                 json!(null)
             }
             ["network", "delete", name] => {
@@ -359,13 +364,13 @@ fn conflict(resource: &str) -> Result<CommandOutput, RuntimeError> {
 }
 
 fn request(name: &str) -> (tempfile::TempDir, CreateRequest) {
+    request_with_manifest(name, "version = 1\nnetwork = 'networked'\n")
+}
+
+fn request_with_manifest(name: &str, manifest: &str) -> (tempfile::TempDir, CreateRequest) {
     let root = tempfile::tempdir().unwrap();
     let path = Utf8Path::from_path(root.path()).unwrap();
-    std::fs::write(
-        path.join("gascan.toml"),
-        "version = 1\nnetwork = 'networked'\n",
-    )
-    .unwrap();
+    std::fs::write(path.join("gascan.toml"), manifest).unwrap();
     let spec = SandboxSpec::from_root(name, path, Manifest::load(path).unwrap()).unwrap();
     let capabilities = RuntimeCapabilities {
         version: RuntimeVersion::new(1, 1, 0),
@@ -590,6 +595,28 @@ async fn networked_create_labels_network_before_volumes_and_attaches_container()
         run_args
             .windows(2)
             .any(|args| args == ["--network", network_name.as_str()])
+    );
+}
+
+#[tokio::test]
+async fn create_sizes_each_managed_volume_from_the_policy_request() {
+    let runner = StatefulAppleRunner::default();
+    let backend = AppleBackend::new(runner.clone());
+    let (_root, request) = request_with_manifest(
+        "apple-volume-sizes",
+        "version = 1\nnetwork = 'networked'\n[storage]\ntools = '11GiB'\ncache = '12GiB'\nconfig = '2GiB'\n",
+    );
+    let id = request.id().to_string();
+
+    backend.create(request).await.unwrap();
+
+    assert_eq!(
+        runner.0.lock().unwrap().volume_sizes,
+        BTreeMap::from([
+            (format!("gascan-mise-{id}"), 11 * 1024_u64.pow(3)),
+            (format!("gascan-cache-{id}"), 12 * 1024_u64.pow(3)),
+            (format!("gascan-config-{id}"), 2 * 1024_u64.pow(3)),
+        ])
     );
 }
 

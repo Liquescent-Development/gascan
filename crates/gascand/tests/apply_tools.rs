@@ -306,8 +306,144 @@ async fn failed_install_retains_applied_state_and_retry_can_succeed() -> TestRes
 }
 
 #[tokio::test]
-async fn failed_safe_config_commands_record_fixed_boundary_without_guest_content() -> TestResult {
-    const SECRET: &str = "guest-stderr-must-not-escape";
+async fn verbose_stderr_does_not_fail_successful_tool_install() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    write_manifest(root, &[])?;
+    let runtime = FakeRuntime::default();
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    );
+    service
+        .up(UpRequest::new(spec(root, "verbose-stderr")?))
+        .await?;
+    write_manifest(root, &[("node", "lts")])?;
+    runtime
+        .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), vec![b'x'; 2 * 1024 * 1024], 0),
+            (
+                br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
+                Vec::new(),
+                0,
+            ),
+            (br#"{"source":"bundled"}"#.to_vec(), Vec::new(), 0),
+        ])
+        .await;
+
+    service
+        .apply(UpRequest::new(spec(root, "verbose-stderr")?))
+        .await?;
+
+    assert_eq!(
+        service.latest_operation()?.ok_or("operation")?.status,
+        OperationStatus::Completed
+    );
+    assert_eq!(runtime.exec_cancellations().await, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_stderr_is_retained_in_command_failure() -> TestResult {
+    const TERMINAL: &str = "ENOSPC: no space left on device";
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    write_manifest(root, &[])?;
+    let runtime = FakeRuntime::default();
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    );
+    service
+        .up(UpRequest::new(spec(root, "terminal-stderr")?))
+        .await?;
+    write_manifest(root, &[("node", "lts")])?;
+    let mut stderr = vec![b'x'; 2 * 1024 * 1024];
+    stderr.extend_from_slice(TERMINAL.as_bytes());
+    runtime
+        .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), stderr, 23),
+        ])
+        .await;
+
+    let error = match service
+        .apply(UpRequest::new(spec(root, "terminal-stderr")?))
+        .await
+    {
+        Ok(_) => return Err("install unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("exit code 23"));
+    assert!(error.to_string().contains(TERMINAL));
+    let details = service
+        .latest_operation()?
+        .ok_or("operation")?
+        .error_details
+        .ok_or("failure details")?;
+    assert!(
+        details["stderr_tail"]
+            .as_str()
+            .is_some_and(|tail| tail.ends_with(TERMINAL))
+    );
+    assert_eq!(runtime.exec_cancellations().await, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn oversized_stdout_cancels_guest_exec_session() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    write_manifest(root, &[])?;
+    let runtime = FakeRuntime::default();
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    );
+    service
+        .up(UpRequest::new(spec(root, "oversized-stdout")?))
+        .await?;
+    write_manifest(root, &[("node", "lts")])?;
+    runtime
+        .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (vec![b'x'; 2 * 1024 * 1024], Vec::new(), 0),
+        ])
+        .await;
+
+    let error = match service
+        .apply(UpRequest::new(spec(root, "oversized-stdout")?))
+        .await
+    {
+        Ok(_) => return Err("oversized stdout unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("guest provisioning stdout exceeded its limit")
+    );
+    assert_eq!(runtime.exec_cancellations().await, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_safe_config_commands_record_fixed_boundary_and_guest_stderr() -> TestResult {
+    const DIAGNOSTIC: &str = "guest command diagnostic";
     let cases = [
         (0, "initialize_managed_volume_roots"),
         (1, "reset_safe_mise_workdir"),
@@ -320,10 +456,10 @@ async fn failed_safe_config_commands_record_fixed_boundary_without_guest_content
         write_manifest(root, &[("node", "lts")])?;
         let runtime = FakeRuntime::default();
         let mut results = vec![(Vec::new(), Vec::new(), 0); failure_index];
-        results.push((Vec::new(), SECRET.as_bytes().to_vec(), 23));
+        results.push((Vec::new(), DIAGNOSTIC.as_bytes().to_vec(), 23));
         runtime.queue_exec_results(results).await;
         let service = SandboxService::new(
-            runtime,
+            runtime.clone(),
             gascand::Store::open(root.join("state.db"))?,
             Arc::new(NoopProvisioner),
         );
@@ -338,17 +474,15 @@ async fn failed_safe_config_commands_record_fixed_boundary_without_guest_content
             Ok(_) => return Err("safe config command unexpectedly succeeded".into()),
             Err(error) => error,
         };
-        assert_eq!(
-            error.to_string(),
-            "provisioning failed: guest provisioning command failed"
-        );
+        assert!(error.to_string().contains(DIAGNOSTIC));
         let operation = service.latest_operation()?.ok_or("operation")?;
         let details = operation.error_details.ok_or("error details")?;
         assert_eq!(details["step"], "write_safe_mise_config");
         assert_eq!(details["action"], action);
         assert_eq!(details["exit_code"], 23);
         assert_eq!(details["signal"], 0);
-        assert!(!format!("{details:?}").contains(SECRET));
+        assert_eq!(details["stderr_tail"], DIAGNOSTIC);
+        assert_eq!(runtime.exec_cancellations().await, 0);
     }
     Ok(())
 }

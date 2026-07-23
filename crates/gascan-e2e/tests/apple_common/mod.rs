@@ -2,6 +2,7 @@
 
 use gascan_core::sandbox::SandboxId;
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::io::{Read as _, Seek as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
@@ -330,6 +331,16 @@ impl AppleE2e {
         Ok(())
     }
 
+    pub fn write_manifest(&self, contents: &str) -> TestResult {
+        std::fs::write(self.root_path.join("gascan.toml"), contents)?;
+        let root = camino::Utf8Path::from_path(&self.root_path).ok_or("non-UTF-8 test root")?;
+        let manifest = gascan_core::manifest::Manifest::load(root)?;
+        if manifest.name() != Some(self.manifest_name.as_str()) {
+            return Err("replacement manifest changed the deterministic sandbox name".into());
+        }
+        Ok(())
+    }
+
     pub fn stop_owned_container(&self) -> TestResult {
         let identity = gascan_core::runtime::ResourceIdentity::new(
             gascan_core::runtime::ResourceKind::Container,
@@ -398,6 +409,23 @@ impl AppleE2e {
         wait_with_output_bounded(child, std::time::Duration::from_secs(90))
     }
 
+    pub fn invoke_with_timeout<I, S>(
+        &self,
+        args: I,
+        timeout: std::time::Duration,
+    ) -> TestResult<Output>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let child = self
+            .command(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        wait_with_output_bounded(child, timeout)
+    }
+
     pub fn invoke_with_env<I, S>(&self, args: I, key: &str, value: &str) -> TestResult<Output>
     where
         I: IntoIterator<Item = S>,
@@ -438,6 +466,29 @@ impl AppleE2e {
                 socket.display(),
                 raw_socket_connects,
                 daemon_stderr
+            )
+            .into());
+        }
+        Ok(output)
+    }
+
+    pub fn success_with_timeout<I, S>(
+        &self,
+        args: I,
+        timeout: std::time::Duration,
+    ) -> TestResult<Output>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let output = self.invoke_with_timeout(args, timeout)?;
+        if !output.status.success() {
+            return Err(format!(
+                "gascan failed with {:?}: stdout={} stderr={} daemon_stderr={}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+                self.bounded_daemon_stderr()
             )
             .into());
         }
@@ -856,25 +907,144 @@ fn process_field(pid: u32, field: &str) -> TestResult<String> {
     }
 }
 
+const MAX_CAPTURED_PIPE_BYTES: usize = 64 * 1024;
+
 fn wait_with_output_bounded(
     mut child: std::process::Child,
     timeout: std::time::Duration,
 ) -> TestResult<Output> {
+    let mut stdout = child.stdout.take().ok_or("child stdout is not piped")?;
+    let mut stderr = child.stderr.take().ok_or("child stderr is not piped")?;
+    for pipe in [&stdout as &dyn std::os::fd::AsFd, &stderr] {
+        let flags = rustix::fs::fcntl_getfl(pipe.as_fd())?;
+        rustix::fs::fcntl_setfl(pipe.as_fd(), flags | rustix::fs::OFlags::NONBLOCK)?;
+    }
+
+    let mut captured_stdout = VecDeque::new();
+    let mut captured_stderr = VecDeque::new();
     let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if child.try_wait()?.is_some() {
-            return Ok(child.wait_with_output()?);
+    let status = loop {
+        if let Err(error) = drain_child_pipes(
+            &mut stdout,
+            &mut stderr,
+            &mut captured_stdout,
+            &mut captured_stderr,
+        ) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error.into());
+        }
+        if let Some(status) = child.try_wait()? {
+            break Ok(status);
         }
         if std::time::Instant::now() >= deadline {
             child.kill()?;
-            let output = child.wait_with_output()?;
-            return Err(format!(
-                "child exceeded {timeout:?} and was killed/reaped: stderr={}",
-                String::from_utf8_lossy(&output.stderr)
-            )
-            .into());
+            break Err(child.wait()?);
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+
+    drain_child_pipes_after_exit(
+        &mut stdout,
+        &mut stderr,
+        &mut captured_stdout,
+        &mut captured_stderr,
+    )?;
+    let stdout = captured_stdout.into_iter().collect::<Vec<_>>();
+    let stderr = captured_stderr.into_iter().collect::<Vec<_>>();
+    match status {
+        Ok(status) => Ok(Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        Err(_status) => Err(format!(
+            "child exceeded {timeout:?} and was killed/reaped: stderr={}",
+            String::from_utf8_lossy(&stderr)
+        )
+        .into()),
+    }
+}
+
+fn drain_child_pipes(
+    stdout: &mut std::process::ChildStdout,
+    stderr: &mut std::process::ChildStderr,
+    captured_stdout: &mut VecDeque<u8>,
+    captured_stderr: &mut VecDeque<u8>,
+) -> std::io::Result<(usize, bool, bool)> {
+    let (stdout_bytes, stdout_eof) = drain_pipe_batch(stdout, captured_stdout)?;
+    let (stderr_bytes, stderr_eof) = drain_pipe_batch(stderr, captured_stderr)?;
+    Ok((
+        stdout_bytes.saturating_add(stderr_bytes),
+        stdout_eof,
+        stderr_eof,
+    ))
+}
+
+fn drain_pipe_batch(
+    pipe: &mut impl std::io::Read,
+    captured: &mut VecDeque<u8>,
+) -> std::io::Result<(usize, bool)> {
+    const BUFFER_BYTES: usize = 16 * 1024;
+    const BATCH_BYTES: usize = 256 * 1024;
+
+    let mut buffer = [0_u8; BUFFER_BYTES];
+    let mut total = 0;
+    while total < BATCH_BYTES {
+        match pipe.read(&mut buffer[..BUFFER_BYTES.min(BATCH_BYTES - total)]) {
+            Ok(0) => return Ok((total, true)),
+            Ok(count) => {
+                append_bounded_tail(captured, &buffer[..count]);
+                total += count;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Ok((total, false));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok((total, false))
+}
+
+fn append_bounded_tail(captured: &mut VecDeque<u8>, bytes: &[u8]) {
+    if bytes.len() >= MAX_CAPTURED_PIPE_BYTES {
+        captured.clear();
+        captured.extend(&bytes[bytes.len() - MAX_CAPTURED_PIPE_BYTES..]);
+        return;
+    }
+    let overflow = captured
+        .len()
+        .saturating_add(bytes.len())
+        .saturating_sub(MAX_CAPTURED_PIPE_BYTES);
+    captured.drain(..overflow);
+    captured.extend(bytes);
+}
+
+fn drain_child_pipes_after_exit(
+    stdout: &mut std::process::ChildStdout,
+    stderr: &mut std::process::ChildStderr,
+    captured_stdout: &mut VecDeque<u8>,
+    captured_stderr: &mut VecDeque<u8>,
+) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    let mut quiet_deadline = std::time::Instant::now() + std::time::Duration::from_millis(30);
+    loop {
+        let (bytes, stdout_eof, stderr_eof) =
+            drain_child_pipes(stdout, stderr, captured_stdout, captured_stderr)?;
+        if stdout_eof && stderr_eof {
+            return Ok(());
+        }
+        let now = std::time::Instant::now();
+        if bytes > 0 {
+            quiet_deadline = now + std::time::Duration::from_millis(30);
+        }
+        if now >= deadline || now >= quiet_deadline {
+            return Ok(());
+        }
+        if bytes == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 }
 
@@ -2142,6 +2312,53 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(wait_with_output_bounded(child, std::time::Duration::from_millis(20)).is_err());
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_wait_drains_chatty_stdout_and_stderr_without_unbounded_capture() -> TestResult {
+        let child = Command::new("sh")
+            .args([
+                "-c",
+                "(head -c 2097152 /dev/zero | tr '\\0' o; printf stdout-tail) & \
+                 (head -c 2097152 /dev/zero | tr '\\0' e; printf stderr-tail) >&2 & \
+                 wait",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        let output = wait_with_output_bounded(child, std::time::Duration::from_secs(5))?;
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), MAX_CAPTURED_PIPE_BYTES);
+        assert_eq!(output.stderr.len(), MAX_CAPTURED_PIPE_BYTES);
+        assert!(output.stdout.ends_with(b"stdout-tail"));
+        assert!(output.stderr.ends_with(b"stderr-tail"));
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_wait_times_out_chatty_child_with_bounded_diagnostic_tail() -> TestResult {
+        let child = Command::new("sh")
+            .args([
+                "-c",
+                "while :; do printf stdout-noise; printf stderr-noise >&2; done",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        let started = std::time::Instant::now();
+        let error = match wait_with_output_bounded(child, std::time::Duration::from_millis(50)) {
+            Ok(_) => return Err("chatty child did not reach the timeout".into()),
+            Err(error) => error,
+        };
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        let message = error.to_string();
+        assert!(message.contains("was killed/reaped"));
+        assert!(message.len() <= MAX_CAPTURED_PIPE_BYTES + 256);
         Ok(())
     }
 

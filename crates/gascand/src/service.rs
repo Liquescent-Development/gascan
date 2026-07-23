@@ -1,7 +1,8 @@
 use crate::reconcile::{ReconcileFinding, ReconcileReport};
 use crate::{
     ActualState, DesiredState, ImageResolution, OperationEvent, OperationId, OperationKind,
-    OperationRecord, SandboxRecord, SetupResolution, Store, StoreError, ToolResolution,
+    OperationRecord, SandboxRecord, SetupResolution, StorageResolution, Store, StoreError,
+    ToolResolution,
 };
 use async_trait::async_trait;
 use gascan_core::doctor::{DoctorFacts, DoctorReport};
@@ -14,8 +15,9 @@ use gascan_core::provision::{
     AppliedState, ProvisionPlan, ProvisionStep, ProvisioningPlanner, SetupScript,
 };
 use gascan_core::runtime::{
-    ContainerState, CreateFailure, CreateRequest, ExecInput, ExecOutput, ExecRequest,
-    RemoveRequest, ResourceKind, ResourceOwnership, RuntimeBackend, RuntimeError,
+    ContainerState, CreateFailure, CreateOutcome, CreateRequest, ExecInput, ExecOutput,
+    ExecRequest, RemoveRequest, ResourceKind, ResourceOwnership, RuntimeBackend,
+    RuntimeCapabilities, RuntimeError,
 };
 use gascan_core::sandbox::{SandboxError, SandboxId, SandboxSpec};
 use serde::de::{Error as _, MapAccess, Visitor};
@@ -28,7 +30,61 @@ use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
 const SAFE_MISE_WORKDIR: &str = "/home/workspace/.config/gascan/mise-workdir";
-const MAX_PROVISION_OUTPUT_BYTES: usize = 1024 * 1024;
+const MAX_PROVISION_STDOUT_BYTES: usize = 1024 * 1024;
+const MAX_PROVISION_STDERR_TAIL_BYTES: usize = 64 * 1024;
+
+struct GuestExecOutcome {
+    stdout: Vec<u8>,
+    stderr_tail: Vec<u8>,
+    code: i32,
+    signal: i32,
+}
+
+struct UpRuntimeContext<'a> {
+    operation_id: OperationId,
+    sender: &'a mpsc::Sender<OperationEvent>,
+    desired_fingerprint: &'a str,
+}
+
+struct BoundedTail {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedTail {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
+    }
+
+    fn extend(&mut self, bytes: &[u8]) {
+        if self.limit == 0 {
+            self.bytes.clear();
+            return;
+        }
+        if bytes.len() >= self.limit {
+            self.bytes.clear();
+            self.bytes
+                .extend_from_slice(&bytes[bytes.len() - self.limit..]);
+            return;
+        }
+        let overflow = self
+            .bytes
+            .len()
+            .saturating_add(bytes.len())
+            .saturating_sub(self.limit);
+        if overflow > 0 {
+            self.bytes.drain(..overflow);
+        }
+        self.bytes.extend_from_slice(bytes);
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
 
 pub struct UpRequest {
     spec: SandboxSpec,
@@ -49,6 +105,13 @@ pub struct ProvisionRequest<'a> {
 pub struct ProvisionResolution {
     pub setup: Option<Value>,
     pub tools: Option<Value>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageCapacityChange {
+    pub volume: &'static str,
+    pub recorded_bytes: Option<u64>,
+    pub requested_bytes: u64,
 }
 
 struct ProvisionedResolution {
@@ -127,34 +190,7 @@ pub struct Operation {
     pub events: mpsc::Receiver<OperationEvent>,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum PreBeginFailure {
-    Conflict,
-    Missing,
-    Runtime,
-    DiskControlUnsupported,
-    Invalid,
-    Internal,
-}
-
-impl From<&ServiceError> for PreBeginFailure {
-    fn from(error: &ServiceError) -> Self {
-        match error {
-            ServiceError::Store(StoreError::PendingOperationExists { .. }) => Self::Conflict,
-            ServiceError::Missing(_) => Self::Missing,
-            ServiceError::Runtime(_) => Self::Runtime,
-            ServiceError::Policy(PolicyError::DiskControlUnsupported) => {
-                Self::DiskControlUnsupported
-            }
-            ServiceError::Policy(_) | ServiceError::Sandbox(_) | ServiceError::Manifest(_) => {
-                Self::Invalid
-            }
-            _ => Self::Internal,
-        }
-    }
-}
-
-pub(crate) type OperationStart = Result<Operation, PreBeginFailure>;
+pub(crate) type OperationStart = Result<Operation, ServiceError>;
 type OperationStarted = mpsc::Sender<OperationStart>;
 
 fn publish_operation(
@@ -179,6 +215,7 @@ pub struct SandboxService<B: RuntimeBackend> {
     provisioner: Arc<dyn Provisioner>,
     locks: Mutex<HashMap<SandboxId, Weak<AsyncMutex<()>>>>,
     doctor: DoctorState,
+    capabilities: tokio::sync::OnceCell<RuntimeCapabilities>,
 }
 
 #[derive(Clone)]
@@ -259,23 +296,44 @@ pub enum ServiceError {
     Missing(SandboxId),
     #[error("sandbox {0} is not owned by gascan")]
     Ownership(SandboxId),
+    #[error("{}", format_storage_change_message(changes))]
+    StorageChangeRequiresRecreate { changes: Vec<StorageCapacityChange> },
+    #[error("compiled storage invariant failed: {0}")]
+    StorageInvariant(&'static str),
     #[error("provisioning failed: {0}")]
     Provision(String),
-    #[error("provisioning failed: guest provisioning command failed")]
+    #[error(
+        "provisioning failed: guest provisioning command failed (exit code {exit_code}, signal {signal}): {stderr_tail}"
+    )]
     ProvisionCommandFailed {
         step: ProvisionStep,
         action: &'static str,
         exit_code: i32,
         signal: i32,
+        stderr_tail: String,
     },
     #[error("mounted setup script changed before execution")]
     SetupChanged,
-    #[error("setup script failed with exit code {0}")]
-    SetupExit(i32),
+    #[error(
+        "setup action {action} failed with exit code {exit_code}, signal {signal}: {stderr_tail}"
+    )]
+    SetupCommandFailed {
+        action: &'static str,
+        exit_code: i32,
+        signal: i32,
+        stderr_tail: String,
+    },
     #[error("mounted setup script changed before execution; stopped state could not be confirmed")]
     SetupChangedStopUnconfirmed,
-    #[error("setup script failed with exit code {exit_code}; stopped state could not be confirmed")]
-    SetupExitStopUnconfirmed { exit_code: i32 },
+    #[error(
+        "setup action {action} failed with exit code {exit_code}, signal {signal}: {stderr_tail}; stopped state could not be confirmed"
+    )]
+    SetupCommandFailedStopUnconfirmed {
+        action: &'static str,
+        exit_code: i32,
+        signal: i32,
+        stderr_tail: String,
+    },
     #[error("keyed lock registry was poisoned")]
     LockPoisoned,
     #[error("bounded operation event stream could not accept its durable event")]
@@ -319,6 +377,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             provisioner,
             locks: Mutex::new(HashMap::new()),
             doctor,
+            capabilities: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -430,6 +489,13 @@ impl<B: RuntimeBackend> SandboxService<B> {
             .map_err(ServiceError::Store)
     }
 
+    async fn runtime_capabilities(&self) -> Result<&RuntimeCapabilities, ServiceError> {
+        self.capabilities
+            .get_or_try_init(|| async { self.runtime.capabilities().await })
+            .await
+            .map_err(ServiceError::Runtime)
+    }
+
     fn keyed_lock(&self, id: &SandboxId) -> Result<Arc<AsyncMutex<()>>, ServiceError> {
         let mut locks = self.locks.lock().map_err(|_| ServiceError::LockPoisoned)?;
         locks.retain(|_, lock| lock.strong_count() > 0);
@@ -470,15 +536,22 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let id = request.spec.id().clone();
         let lock = self.keyed_lock(&id)?;
         let _guard = lock.lock().await;
-        let capabilities = self.runtime.capabilities().await?;
-        let create = PolicyCompiler::compile(request.spec.clone(), &capabilities)?;
-        let desired_fingerprint = desired_fingerprint(&request.spec).await?;
+        let capabilities = self.runtime_capabilities().await?;
+        let create = PolicyCompiler::compile(request.spec.clone(), capabilities)?;
+        let requested_storage = requested_storage(&create)?;
         let existing = self
             .database({
                 let id = id.clone();
                 move |store| store.sandbox(&id)
             })
             .await?;
+        if let Some(prior) = existing
+            .as_ref()
+            .filter(|record| record.actual_state != ActualState::Absent)
+        {
+            validate_storage_capacities(prior, requested_storage)?;
+        }
+        let desired_fingerprint = desired_fingerprint(&request.spec).await?;
         let prior = existing.clone();
         let mut record = existing.unwrap_or_else(|| SandboxRecord {
             id: id.clone(),
@@ -488,6 +561,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             setup_resolution: None,
             tool_resolution: None,
             image_resolution: Some(ImageResolution::new(1, json!({"digest": create.image()}))),
+            storage_resolution: None,
             last_operation_id: None,
             updated_at_millis: 0,
         });
@@ -522,9 +596,12 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 &request.spec,
                 &create,
                 prior.as_ref(),
-                operation.id,
-                &sender,
-                &desired_fingerprint,
+                requested_storage,
+                UpRuntimeContext {
+                    operation_id: operation.id,
+                    sender: &sender,
+                    desired_fingerprint: &desired_fingerprint,
+                },
             )
             .await;
         match result {
@@ -540,6 +617,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
                         json!({"desired_fingerprint":desired_fingerprint,"tool_hash":provisioned.tool_hash,"resolution":resolution.tools}),
                     ));
                 }
+                record.storage_resolution = Some(storage_resolution(requested_storage));
                 record.actual_state = actual;
                 self.database({
                     let record = record.clone();
@@ -578,10 +656,14 @@ impl<B: RuntimeBackend> SandboxService<B> {
         spec: &SandboxSpec,
         create: &CreateRequest,
         prior: Option<&SandboxRecord>,
-        operation_id: OperationId,
-        sender: &mpsc::Sender<OperationEvent>,
-        desired_fingerprint: &str,
+        requested_storage: StorageCapacities,
+        context: UpRuntimeContext<'_>,
     ) -> Result<(ActualState, Option<ProvisionedResolution>), ServiceError> {
+        let UpRuntimeContext {
+            operation_id,
+            sender,
+            desired_fingerprint,
+        } = context;
         let id = spec.id();
         let inspected = self.runtime.inspect(id).await?;
         let mut created = None;
@@ -591,7 +673,12 @@ impl<B: RuntimeBackend> SandboxService<B> {
             }
         } else {
             match self.runtime.create(create.clone()).await {
-                Ok(outcome) => created = Some(outcome),
+                Ok(outcome) => {
+                    if let Err(error) = self.persist_created_storage(id, requested_storage).await {
+                        return Err(self.rollback_created(id, outcome, error).await);
+                    }
+                    created = Some(outcome);
+                }
                 Err(failure) => {
                     if !failure.created().is_empty() {
                         self.runtime
@@ -621,7 +708,13 @@ impl<B: RuntimeBackend> SandboxService<B> {
             } else {
                 false
             };
-            let provisioned = if inspected.is_some() && !durable_match {
+            let has_complete_durable_resolution = prior.is_some_and(|record| {
+                record.setup_resolution.is_some() && record.tool_resolution.is_some()
+            });
+            let provisioned = if inspected.is_some()
+                && !durable_match
+                && has_complete_durable_resolution
+            {
                 let applied = applied_state(prior);
                 let plan = ProvisioningPlanner::plan_for_root(
                     spec.canonical_root(),
@@ -666,33 +759,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             Err(error) if error.is_setup_failure() => Err(error),
             Err(error) if created.is_some() => {
                 if let Some(outcome) = created {
-                    let rollback = async {
-                        let current = self.runtime.inspect(id).await?.ok_or_else(|| {
-                            RuntimeError::NotFound {
-                                resource: id.to_string(),
-                            }
-                        })?;
-                        if current.ownership.managed_by != "gascan"
-                            || current.ownership.sandbox_id != *id
-                        {
-                            return Err(RuntimeError::OwnershipMismatch {
-                                resource: id.to_string(),
-                            });
-                        }
-                        if current.state == ContainerState::Running {
-                            self.runtime.stop(id).await?;
-                        }
-                        self.runtime
-                            .remove(RemoveRequest::from_resources(outcome.created().to_vec())?)
-                            .await
-                    }
-                    .await;
-                    if let Err(rollback) = rollback {
-                        return Err(ServiceError::Rollback {
-                            original: Box::new(error),
-                            rollback,
-                        });
-                    }
+                    return Err(self.rollback_created(id, outcome, error).await);
                 }
                 Err(error)
             }
@@ -763,19 +830,71 @@ impl<B: RuntimeBackend> SandboxService<B> {
         })
     }
 
+    async fn persist_created_storage(
+        &self,
+        id: &SandboxId,
+        requested_storage: StorageCapacities,
+    ) -> Result<(), ServiceError> {
+        let mut record = self
+            .database({
+                let id = id.clone();
+                move |store| store.sandbox(&id)
+            })
+            .await?
+            .ok_or_else(|| ServiceError::Missing(id.clone()))?;
+        record.storage_resolution = Some(storage_resolution(requested_storage));
+        self.database(move |store| store.put_sandbox(&record)).await
+    }
+
+    async fn rollback_created(
+        &self,
+        id: &SandboxId,
+        outcome: CreateOutcome,
+        original: ServiceError,
+    ) -> ServiceError {
+        let rollback = async {
+            let current =
+                self.runtime
+                    .inspect(id)
+                    .await?
+                    .ok_or_else(|| RuntimeError::NotFound {
+                        resource: id.to_string(),
+                    })?;
+            if current.ownership.managed_by != "gascan" || current.ownership.sandbox_id != *id {
+                return Err(RuntimeError::OwnershipMismatch {
+                    resource: id.to_string(),
+                });
+            }
+            if current.state == ContainerState::Running {
+                self.runtime.stop(id).await?;
+            }
+            self.runtime
+                .remove(RemoveRequest::from_resources(outcome.created().to_vec())?)
+                .await
+        }
+        .await;
+        match rollback {
+            Ok(()) => original,
+            Err(rollback) => ServiceError::Rollback {
+                original: Box::new(original),
+                rollback,
+            },
+        }
+    }
+
     async fn run_setup(&self, id: &SandboxId, setup: &SetupScript) -> Result<(), ServiceError> {
         let guest_path = format!("/workspace/{}", setup.canonical_relative_path());
-        let (digest_output, digest_code, digest_signal) = self
+        let digest_outcome = self
             .exec_guest_raw(
                 id,
                 ["/usr/bin/sha256sum".to_owned(), guest_path.clone()],
                 Vec::new(),
             )
             .await?;
-        if digest_code != 0 || digest_signal != 0 {
-            return Err(ServiceError::SetupChanged);
+        if digest_outcome.code != 0 || digest_outcome.signal != 0 {
+            return Err(setup_command_failure("verify_setup_digest", digest_outcome));
         }
-        let digest = std::str::from_utf8(&digest_output)
+        let digest = std::str::from_utf8(&digest_outcome.stdout)
             .ok()
             .and_then(|output| output.split_ascii_whitespace().next())
             .filter(|digest| {
@@ -785,13 +904,13 @@ impl<B: RuntimeBackend> SandboxService<B> {
         if setup.sha256().strip_prefix("sha256:") != Some(digest) {
             return Err(ServiceError::SetupChanged);
         }
-        let (_, code, signal) = self
+        let outcome = self
             .exec_guest_raw(id, ["/bin/bash".to_owned(), guest_path], Vec::new())
             .await?;
-        if code == 0 && signal == 0 {
+        if outcome.code == 0 && outcome.signal == 0 {
             Ok(())
         } else {
-            Err(ServiceError::SetupExit(code))
+            Err(setup_command_failure("run_setup", outcome))
         }
     }
 
@@ -953,15 +1072,16 @@ impl<B: RuntimeBackend> SandboxService<B> {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let (stdout, code, signal) = self.exec_guest_raw(id, argv, stdin).await?;
-        if code == 0 && signal == 0 {
-            Ok(stdout)
+        let outcome = self.exec_guest_raw(id, argv, stdin).await?;
+        if outcome.code == 0 && outcome.signal == 0 {
+            Ok(outcome.stdout)
         } else {
             Err(ServiceError::ProvisionCommandFailed {
                 step,
                 action,
-                exit_code: code,
-                signal,
+                exit_code: outcome.code,
+                signal: outcome.signal,
+                stderr_tail: sanitize_provision_stderr(&outcome.stderr_tail),
             })
         }
     }
@@ -971,7 +1091,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
         id: &SandboxId,
         argv: I,
         stdin: Vec<u8>,
-    ) -> Result<(Vec<u8>, i32, i32), ServiceError>
+    ) -> Result<GuestExecOutcome, ServiceError>
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -992,27 +1112,28 @@ impl<B: RuntimeBackend> SandboxService<B> {
             .await
             .map_err(|_| provisioning_transport_error())?;
         let mut stdout = Vec::new();
-        let mut output_bytes = 0_usize;
+        let mut stderr_tail = BoundedTail::new(MAX_PROVISION_STDERR_TAIL_BYTES);
         while let Some(output) = session.next().await {
             match output.map_err(|_| provisioning_transport_error())? {
                 ExecOutput::Stdout(bytes) => {
-                    output_bytes = output_bytes.saturating_add(bytes.len());
-                    if output_bytes > MAX_PROVISION_OUTPUT_BYTES {
+                    if stdout.len().saturating_add(bytes.len()) > MAX_PROVISION_STDOUT_BYTES {
+                        session.cancel();
+                        while session.next().await.is_some() {}
                         return Err(ServiceError::Provision(
-                            "guest provisioning output exceeded its limit".to_owned(),
+                            "guest provisioning stdout exceeded its limit".to_owned(),
                         ));
                     }
                     stdout.extend(bytes);
                 }
-                ExecOutput::Stderr(bytes) => {
-                    output_bytes = output_bytes.saturating_add(bytes.len());
-                    if output_bytes > MAX_PROVISION_OUTPUT_BYTES {
-                        return Err(ServiceError::Provision(
-                            "guest provisioning output exceeded its limit".to_owned(),
-                        ));
-                    }
+                ExecOutput::Stderr(bytes) => stderr_tail.extend(&bytes),
+                ExecOutput::Exit { code, signal } => {
+                    return Ok(GuestExecOutcome {
+                        stdout,
+                        stderr_tail: stderr_tail.into_bytes(),
+                        code,
+                        signal,
+                    });
                 }
-                ExecOutput::Exit { code, signal } => return Ok((stdout, code, signal)),
             }
         }
         Err(ServiceError::Provision(
@@ -1263,9 +1384,9 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let id = request.spec.id().clone();
         let lock = self.keyed_lock(&id)?;
         let _guard = lock.lock().await;
-        let capabilities = self.runtime.capabilities().await?;
-        let create = PolicyCompiler::compile(request.spec.clone(), &capabilities)?;
-        let desired_fingerprint = desired_fingerprint(&request.spec).await?;
+        let capabilities = self.runtime_capabilities().await?;
+        let create = PolicyCompiler::compile(request.spec.clone(), capabilities)?;
+        let requested_storage = requested_storage(&create)?;
         let mut record = self
             .database({
                 let id = id.clone();
@@ -1273,6 +1394,8 @@ impl<B: RuntimeBackend> SandboxService<B> {
             })
             .await?
             .ok_or_else(|| ServiceError::Missing(id.clone()))?;
+        validate_storage_capacities(&record, requested_storage)?;
+        let desired_fingerprint = desired_fingerprint(&request.spec).await?;
         let desired_plan = ProvisioningPlanner::plan_for_root(
             request.spec.canonical_root(),
             request.spec.manifest(),
@@ -1663,19 +1786,21 @@ fn default_doctor_report() -> DoctorReport {
 }
 
 impl ServiceError {
-    pub(crate) fn code(&self) -> &'static str {
+    pub fn code(&self) -> &'static str {
         match self {
             Self::Runtime(error) => error.code(),
             Self::Create(error) => error.code(),
             Self::Policy(error) => error.code(),
             Self::Missing(_) => "not_found",
             Self::Ownership(_) => "ownership_mismatch",
+            Self::StorageChangeRequiresRecreate { .. } => "storage_change_requires_recreate",
+            Self::StorageInvariant(_) => "storage_invariant_failed",
             Self::Provision(_)
             | Self::ProvisionCommandFailed { .. }
             | Self::SetupChanged
-            | Self::SetupExit(_)
+            | Self::SetupCommandFailed { .. }
             | Self::SetupChangedStopUnconfirmed
-            | Self::SetupExitStopUnconfirmed { .. } => "provision_failed",
+            | Self::SetupCommandFailedStopUnconfirmed { .. } => "provision_failed",
             Self::Store(_) => "store_error",
             Self::Sandbox(_) => "sandbox_error",
             Self::Manifest(_) => "manifest_error",
@@ -1692,20 +1817,20 @@ impl ServiceError {
         matches!(
             self,
             Self::SetupChanged
-                | Self::SetupExit(_)
+                | Self::SetupCommandFailed { .. }
                 | Self::SetupChangedStopUnconfirmed
-                | Self::SetupExitStopUnconfirmed { .. }
+                | Self::SetupCommandFailedStopUnconfirmed { .. }
         )
     }
 
     const fn setup_stop_confirmed(&self) -> bool {
-        matches!(self, Self::SetupChanged | Self::SetupExit(_))
+        matches!(self, Self::SetupChanged | Self::SetupCommandFailed { .. })
     }
 
     const fn setup_exit_code(&self) -> Option<i32> {
         match self {
-            Self::SetupExit(code) => Some(*code),
-            Self::SetupExitStopUnconfirmed { exit_code } => Some(*exit_code),
+            Self::SetupCommandFailed { exit_code, .. }
+            | Self::SetupCommandFailedStopUnconfirmed { exit_code, .. } => Some(*exit_code),
             _ => None,
         }
     }
@@ -1715,20 +1840,44 @@ impl ServiceError {
             Self::SetupChanged | Self::SetupChangedStopUnconfirmed => {
                 Self::SetupChangedStopUnconfirmed
             }
-            Self::SetupExit(exit_code) | Self::SetupExitStopUnconfirmed { exit_code } => {
-                Self::SetupExitStopUnconfirmed { exit_code }
+            Self::SetupCommandFailed {
+                action,
+                exit_code,
+                signal,
+                stderr_tail,
             }
+            | Self::SetupCommandFailedStopUnconfirmed {
+                action,
+                exit_code,
+                signal,
+                stderr_tail,
+            } => Self::SetupCommandFailedStopUnconfirmed {
+                action,
+                exit_code,
+                signal,
+                stderr_tail,
+            },
             other => other,
         }
     }
 }
 
-fn failure_details(error: &ServiceError) -> Value {
-    if let ServiceError::ProvisionCommandFailed {
+pub(crate) fn failure_details(error: &ServiceError) -> Value {
+    if let ServiceError::StorageChangeRequiresRecreate { changes } = error {
+        json!({
+            "message": error.to_string(),
+            "changes": changes.iter().map(|change| json!({
+                "volume": change.volume,
+                "recorded_bytes": change.recorded_bytes,
+                "requested_bytes": change.requested_bytes,
+            })).collect::<Vec<_>>(),
+        })
+    } else if let ServiceError::ProvisionCommandFailed {
         step,
         action,
         exit_code,
         signal,
+        stderr_tail,
     } = error
     {
         json!({
@@ -1737,6 +1886,7 @@ fn failure_details(error: &ServiceError) -> Value {
             "action": action,
             "exit_code": exit_code,
             "signal": signal,
+            "stderr_tail": stderr_tail,
         })
     } else if error.is_setup_failure() {
         let mut details = json!({
@@ -1748,10 +1898,137 @@ fn failure_details(error: &ServiceError) -> Value {
         if let Some(exit_code) = error.setup_exit_code() {
             details["exit_code"] = Value::from(exit_code);
         }
+        if let ServiceError::SetupCommandFailed {
+            action,
+            signal,
+            stderr_tail,
+            ..
+        }
+        | ServiceError::SetupCommandFailedStopUnconfirmed {
+            action,
+            signal,
+            stderr_tail,
+            ..
+        } = error
+        {
+            details["action"] = Value::from(*action);
+            details["signal"] = Value::from(*signal);
+            details["stderr_tail"] = Value::from(stderr_tail.clone());
+        }
         details
     } else {
         json!({"message":error.to_string()})
     }
+}
+
+type StorageCapacities = [(&'static str, u64); 3];
+
+fn storage_resolution(requested: StorageCapacities) -> StorageResolution {
+    StorageResolution::new(
+        1,
+        json!({
+            "tools_bytes": requested[0].1,
+            "cache_bytes": requested[1].1,
+            "config_bytes": requested[2].1,
+        }),
+    )
+}
+
+fn validate_storage_capacities(
+    record: &SandboxRecord,
+    requested: StorageCapacities,
+) -> Result<(), ServiceError> {
+    let recorded = record
+        .storage_resolution
+        .as_ref()
+        .filter(|resolution| resolution.version == 1);
+    let changes = requested
+        .into_iter()
+        .filter_map(|(volume, requested_bytes)| {
+            let recorded_bytes = recorded
+                .and_then(|resolution| resolution.details.get(format!("{volume}_bytes")))
+                .and_then(Value::as_u64);
+            (recorded_bytes != Some(requested_bytes)).then_some(StorageCapacityChange {
+                volume,
+                recorded_bytes,
+                requested_bytes,
+            })
+        })
+        .collect::<Vec<_>>();
+    if changes.is_empty() {
+        Ok(())
+    } else {
+        Err(ServiceError::StorageChangeRequiresRecreate { changes })
+    }
+}
+
+fn requested_storage(create: &CreateRequest) -> Result<StorageCapacities, ServiceError> {
+    requested_storage_from_volumes(create.volumes())
+}
+
+fn requested_storage_from_volumes(
+    volumes: &[gascan_core::runtime::RuntimeVolume],
+) -> Result<StorageCapacities, ServiceError> {
+    [
+        ("tools", "/home/workspace/.local/share/mise"),
+        ("cache", "/home/workspace/.cache"),
+        ("config", "/home/workspace/.config/gascan"),
+    ]
+    .into_iter()
+    .map(|(volume, target)| {
+        let mut matching = volumes
+            .iter()
+            .filter(|candidate| candidate.target.as_str() == target);
+        let capacity = matching
+            .next()
+            .ok_or(ServiceError::StorageInvariant(
+                "managed volume is missing from compiled create request",
+            ))?
+            .capacity_bytes;
+        if matching.next().is_some() {
+            return Err(ServiceError::StorageInvariant(
+                "managed volume is duplicated in compiled create request",
+            ));
+        }
+        Ok((volume, capacity))
+    })
+    .collect::<Result<Vec<_>, _>>()?
+    .try_into()
+    .map_err(|_| ServiceError::StorageInvariant("managed volume count is not three"))
+}
+
+fn format_storage_change_message(changes: &[StorageCapacityChange]) -> String {
+    let changes = changes
+        .iter()
+        .map(|change| {
+            let recorded = change
+                .recorded_bytes
+                .map_or_else(|| "unknown".to_owned(), format_binary_size);
+            format!(
+                "{} ({recorded} → {})",
+                change.volume,
+                format_binary_size(change.requested_bytes)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "storage settings changed for {changes}; run `gascan destroy --yes` and `gascan up` to recreate the sandbox"
+    )
+}
+
+fn format_binary_size(bytes: u64) -> String {
+    for (suffix, divisor) in [
+        ("TiB", 1024_u64.pow(4)),
+        ("GiB", 1024_u64.pow(3)),
+        ("MiB", 1024_u64.pow(2)),
+        ("KiB", 1024_u64),
+    ] {
+        if bytes % divisor == 0 {
+            return format!("{}{suffix}", bytes / divisor);
+        }
+    }
+    format!("{bytes} bytes")
 }
 
 fn applied_state(record: Option<&SandboxRecord>) -> AppliedState {
@@ -1771,6 +2048,28 @@ fn applied_state(record: Option<&SandboxRecord>) -> AppliedState {
 
 fn provisioning_transport_error() -> ServiceError {
     ServiceError::Provision("guest provisioning transport failed".to_owned())
+}
+
+fn setup_command_failure(action: &'static str, outcome: GuestExecOutcome) -> ServiceError {
+    ServiceError::SetupCommandFailed {
+        action,
+        exit_code: outcome.code,
+        signal: outcome.signal,
+        stderr_tail: sanitize_provision_stderr(&outcome.stderr_tail),
+    }
+}
+
+fn sanitize_provision_stderr(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .map(|character| {
+            if character.is_ascii_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 fn mise_command(args: &[&str]) -> Vec<String> {
@@ -1919,4 +2218,98 @@ async fn desired_fingerprint(spec: &SandboxSpec) -> Result<String, ServiceError>
     })
     .await
     .map_err(|error| ServiceError::DatabaseWorker(error.to_string()))?
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::{
+        BoundedTail, NoopProvisioner, SandboxService, ServiceError, Store,
+        requested_storage_from_volumes,
+    };
+    use camino::Utf8Path;
+    use gascan_core::fake_runtime::FakeRuntime;
+    use gascan_core::manifest::Manifest;
+    use gascan_core::policy::PolicyCompiler;
+    use gascan_core::runtime::{RuntimeBackend, RuntimeCall};
+    use gascan_core::sandbox::SandboxSpec;
+    use std::sync::Arc;
+
+    #[test]
+    fn bounded_tail_keeps_exact_suffix_across_chunks() {
+        let mut tail = BoundedTail::new(5);
+        tail.extend(b"\xffab");
+        tail.extend(b"cdef");
+        assert_eq!(tail.into_bytes(), b"bcdef");
+    }
+
+    #[test]
+    fn zero_length_bounded_tail_discards_input() {
+        let mut tail = BoundedTail::new(0);
+        tail.extend(b"ignored");
+        assert!(tail.into_bytes().is_empty());
+    }
+
+    #[test]
+    fn missing_compiled_managed_volume_is_an_internal_invariant_error() {
+        assert!(matches!(
+            requested_storage_from_volumes(&[]),
+            Err(ServiceError::StorageInvariant(
+                "managed volume is missing from compiled create request"
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn created_rollback_stops_running_runtime_before_exact_remove()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+        let spec = SandboxSpec::from_root("persist-created-rollback", root, Manifest::load(root)?)?;
+        let id = spec.id().clone();
+        let runtime = FakeRuntime::default();
+        let create = PolicyCompiler::compile(spec, &runtime.capabilities().await?)?;
+        let outcome = runtime.create(create).await?;
+        let exact_created = outcome.created().to_vec();
+        runtime.start(&id).await?;
+        let service = SandboxService::new(
+            runtime.clone(),
+            Store::open(root.join("state.db"))?,
+            Arc::new(NoopProvisioner),
+        );
+
+        let error = service
+            .rollback_created(
+                &id,
+                outcome,
+                ServiceError::Provision("injected persistence failure".to_owned()),
+            )
+            .await;
+
+        assert_eq!(
+            error.to_string(),
+            "provisioning failed: injected persistence failure"
+        );
+        assert!(runtime.inspect(&id).await?.is_none());
+        assert!(runtime.list_resources().await?.is_empty());
+        let calls = runtime.calls().await;
+        let stopped = calls
+            .iter()
+            .position(|call| matches!(call, RuntimeCall::Stop(call_id) if call_id == &id))
+            .ok_or("stop")?;
+        let (removed, removed_resources) = calls
+            .iter()
+            .enumerate()
+            .find_map(|(index, call)| match call {
+                RuntimeCall::Remove(request) => Some((index, request.resources())),
+                _ => None,
+            })
+            .ok_or("remove")?;
+        assert!(matches!(
+            &calls[stopped - 1],
+            RuntimeCall::Inspect(call_id) if call_id == &id
+        ));
+        assert!(stopped < removed);
+        assert_eq!(removed_resources, exact_created);
+        Ok(())
+    }
 }

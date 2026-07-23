@@ -1,4 +1,3 @@
-use crate::service::PreBeginFailure;
 use crate::{
     ActualState, DesiredState, OperationEvent as StoredEvent, OperationStatus as StoredStatus,
     SandboxService, ServiceError, SocketPaths, UpRequest as ServiceUpRequest,
@@ -676,6 +675,19 @@ fn service_status(error: ServiceError) -> tonic::Status {
         ServiceError::Policy(_) | ServiceError::Sandbox(_) | ServiceError::Manifest(_) => {
             tonic::Status::invalid_argument(error_code::INVALID_REQUEST)
         }
+        error @ ServiceError::StorageChangeRequiresRecreate { .. } => {
+            let code = gascan_proto::error_code::STORAGE_CHANGE_REQUIRES_RECREATE;
+            let message = error.to_string();
+            let details =
+                serde_json::to_vec(&crate::service::failure_details(&error)).unwrap_or_default();
+            tonic::Status::with_details(
+                tonic::Code::FailedPrecondition,
+                code,
+                tonic::codegen::Bytes::from(gascan_proto::error_detail::encode_with_details(
+                    code, &message, &details,
+                )),
+            )
+        }
         _ => tonic::Status::internal(error_code::INTERNAL),
     }
 }
@@ -784,12 +796,18 @@ fn service_error_diagnostic(error: &ServiceError) -> String {
         ServiceError::Manifest(_) => "service_kind=manifest".to_owned(),
         ServiceError::Missing(_) => "service_kind=missing".to_owned(),
         ServiceError::Ownership(_) => "service_kind=ownership".to_owned(),
+        ServiceError::StorageChangeRequiresRecreate { .. } => {
+            "service_kind=storage_change_requires_recreate".to_owned()
+        }
+        ServiceError::StorageInvariant(_) => "service_kind=storage_invariant".to_owned(),
         ServiceError::Provision(_)
         | ServiceError::ProvisionCommandFailed { .. }
         | ServiceError::SetupChanged
-        | ServiceError::SetupExit(_)
+        | ServiceError::SetupCommandFailed { .. }
         | ServiceError::SetupChangedStopUnconfirmed
-        | ServiceError::SetupExitStopUnconfirmed { .. } => "service_kind=provision".to_owned(),
+        | ServiceError::SetupCommandFailedStopUnconfirmed { .. } => {
+            "service_kind=provision".to_owned()
+        }
         ServiceError::LockPoisoned => "service_kind=lock_poisoned".to_owned(),
         ServiceError::EventStreamUnavailable => "service_kind=event_stream_unavailable".to_owned(),
         ServiceError::DatabaseWorker(_) => "service_kind=database_worker".to_owned(),
@@ -868,19 +886,6 @@ fn sanitize_diagnostic(value: &str, maximum: usize) -> String {
         })
         .take(maximum)
         .collect()
-}
-
-fn pre_begin_status(error: PreBeginFailure) -> tonic::Status {
-    match error {
-        PreBeginFailure::Conflict => tonic::Status::already_exists(error_code::OPERATION_CONFLICT),
-        PreBeginFailure::Missing => tonic::Status::not_found(error_code::SANDBOX_NOT_FOUND),
-        PreBeginFailure::Runtime => tonic::Status::unavailable(error_code::BACKEND_UNAVAILABLE),
-        PreBeginFailure::DiskControlUnsupported => {
-            tonic::Status::invalid_argument(error_code::DISK_CONTROL_UNSUPPORTED)
-        }
-        PreBeginFailure::Invalid => tonic::Status::invalid_argument(error_code::INVALID_REQUEST),
-        PreBeginFailure::Internal => tonic::Status::internal(error_code::INTERNAL),
-    }
 }
 
 fn timestamp_from_millis(millis: i64) -> prost_types::Timestamp {
@@ -1436,14 +1441,14 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
                 .up_started(ServiceUpRequest::new(spec), started.clone())
                 .await
             {
-                let _ = started.send(Err((&error).into())).await;
+                let _ = started.send(Err(error)).await;
             }
         });
         let operation = operation
             .recv()
             .await
             .ok_or_else(|| tonic::Status::internal(error_code::INTERNAL))?
-            .map_err(pre_begin_status)?;
+            .map_err(service_status)?;
         Ok(tonic::Response::new(ApiEventStream::new(
             operation.events,
             self.activity.clone(),
@@ -1470,14 +1475,14 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
                 .apply_started(ServiceUpRequest::new(spec), started.clone())
                 .await
             {
-                let _ = started.send(Err((&error).into())).await;
+                let _ = started.send(Err(error)).await;
             }
         });
         let operation = operation
             .recv()
             .await
             .ok_or_else(|| tonic::Status::internal(error_code::INTERNAL))?
-            .map_err(pre_begin_status)?;
+            .map_err(service_status)?;
         Ok(tonic::Response::new(ApiEventStream::new(
             operation.events,
             self.activity.clone(),
@@ -1562,14 +1567,14 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         tokio::spawn(async move {
             let _operation_lease = operation_lease;
             if let Err(error) = service.stop_started(&id, started.clone()).await {
-                let _ = started.send(Err((&error).into())).await;
+                let _ = started.send(Err(error)).await;
             }
         });
         let operation = operation
             .recv()
             .await
             .ok_or_else(|| tonic::Status::internal(error_code::INTERNAL))?
-            .map_err(pre_begin_status)?;
+            .map_err(service_status)?;
         Ok(tonic::Response::new(ApiEventStream::new(
             operation.events,
             self.activity.clone(),
@@ -1587,14 +1592,14 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         tokio::spawn(async move {
             let _operation_lease = operation_lease;
             if let Err(error) = service.destroy_started(&id, started.clone()).await {
-                let _ = started.send(Err((&error).into())).await;
+                let _ = started.send(Err(error)).await;
             }
         });
         let operation = operation
             .recv()
             .await
             .ok_or_else(|| tonic::Status::internal(error_code::INTERNAL))?
-            .map_err(pre_begin_status)?;
+            .map_err(service_status)?;
         Ok(tonic::Response::new(ApiEventStream::new(
             operation.events,
             self.activity.clone(),
@@ -1749,7 +1754,7 @@ mod tests {
     use super::{
         ActivityTracker, ApiEventStream, AttachBridgeControl, AttachStream, AttachTerminal,
         ErrorDiagnostics, PendingSession, SessionRegistry, attach_shutdown_requested_with,
-        pre_begin_status, run_attach_bridge as run_attach_bridge_impl, service_status,
+        run_attach_bridge as run_attach_bridge_impl, service_status,
         service_status_with_diagnostics, spec_for_root, wire_event, wire_status,
     };
     use crate::{
@@ -2643,6 +2648,7 @@ mod tests {
             setup_resolution: None,
             tool_resolution: None,
             image_resolution: None,
+            storage_resolution: None,
             last_operation_id: Some(operation_id),
             updated_at_millis: 1_725_000_001_456,
         });
@@ -2669,17 +2675,9 @@ mod tests {
 
     #[test]
     fn disk_control_policy_rejection_preserves_its_stable_public_code() {
-        let error = ServiceError::Policy(PolicyError::DiskControlUnsupported);
         let direct = service_status(ServiceError::Policy(PolicyError::DiskControlUnsupported));
         assert_eq!(direct.code(), tonic::Code::InvalidArgument);
         assert_eq!(direct.message(), error_code::DISK_CONTROL_UNSUPPORTED);
-
-        let before_operation = pre_begin_status((&error).into());
-        assert_eq!(before_operation.code(), tonic::Code::InvalidArgument);
-        assert_eq!(
-            before_operation.message(),
-            error_code::DISK_CONTROL_UNSUPPORTED
-        );
     }
 
     #[test]
