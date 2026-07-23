@@ -1,4 +1,4 @@
-use crate::manifest::{NetworkMode, UserMode};
+use crate::manifest::{NetworkMode, Storage, UserMode};
 use crate::runtime::{
     CreateRequest, NetworkIsolation, OwnershipMetadata, ResourceIdentity, ResourceKind,
     RuntimeBindMount, RuntimeCapabilities, RuntimeError, RuntimeNetwork, RuntimePort,
@@ -75,7 +75,7 @@ impl PolicyCompiler {
                 writable: mount.is_writable(),
             })
             .collect();
-        let volumes = managed_volumes(spec.id().as_str(), &ownership);
+        let volumes = managed_volumes(spec.id().as_str(), manifest.storage(), &ownership);
         let network = match manifest.network() {
             NetworkMode::Networked => RuntimeNetwork::Networked {
                 name: Self::managed_network_name(spec.id()),
@@ -224,18 +224,23 @@ fn compile_resources(
     })
 }
 
-fn managed_volumes(sandbox_id: &str, ownership: &OwnershipMetadata) -> Vec<RuntimeVolume> {
+fn managed_volumes(
+    sandbox_id: &str,
+    storage: &Storage,
+    ownership: &OwnershipMetadata,
+) -> Vec<RuntimeVolume> {
     managed_volume_names(sandbox_id)
         .into_iter()
         .zip([
-            "/home/workspace/.local/share/mise",
-            "/home/workspace/.cache",
-            "/home/workspace/.config/gascan",
+            ("/home/workspace/.local/share/mise", storage.tools().bytes()),
+            ("/home/workspace/.cache", storage.cache().bytes()),
+            ("/home/workspace/.config/gascan", storage.config().bytes()),
         ])
-        .map(|(name, target)| RuntimeVolume {
+        .map(|(name, (target, capacity_bytes))| RuntimeVolume {
             name,
             target: Utf8PathBuf::from(target),
             writable: true,
+            capacity_bytes,
             ownership: ownership.clone(),
         })
         .collect()

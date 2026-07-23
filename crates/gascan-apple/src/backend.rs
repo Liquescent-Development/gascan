@@ -20,7 +20,6 @@ use crate::{
 const MANAGED_BY: &str = "gascan";
 const MANAGED_BY_LABEL: &str = "dev.gascan.managed-by";
 const SANDBOX_ID_LABEL: &str = "dev.gascan.sandbox-id";
-const MANAGED_VOLUME_SIZE_BYTES: &str = "104857600";
 
 pub struct AppleBackend<R> {
     runner: R,
@@ -258,6 +257,7 @@ where
         for volume in request.volumes() {
             let manager = format!("{MANAGED_BY_LABEL}={MANAGED_BY}");
             let sandbox = format!("{SANDBOX_ID_LABEL}={}", request.id());
+            let capacity = volume.capacity_bytes.to_string();
             let spec = CommandSpec::new(
                 "container",
                 [
@@ -268,7 +268,7 @@ where
                     "--label",
                     &sandbox,
                     "-s",
-                    MANAGED_VOLUME_SIZE_BYTES,
+                    &capacity,
                     &volume.name,
                 ],
             );

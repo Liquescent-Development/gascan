@@ -119,7 +119,7 @@ fn host_environment_has_a_fixed_allowlist() {
 #[test]
 fn canonical_request_has_one_root_mount_owned_volumes_loopback_ports_and_init() {
     let (_temp, spec) = spec(
-        "version = 1\nnetwork = 'networked'\nuser = 'root'\n[ports]\napi = 8080\nweb = 3000\n",
+        "version = 1\nnetwork = 'networked'\nuser = 'root'\n[storage]\ntools = '11GiB'\ncache = '12GiB'\nconfig = '2GiB'\n[ports]\napi = 8080\nweb = 3000\n",
     );
     let root = spec.canonical_root().to_owned();
     let id = spec.id().clone();
@@ -159,6 +159,20 @@ fn canonical_request_has_one_root_mount_owned_volumes_loopback_ports_and_init() 
             && volume.name.starts_with("gascan-")
             && &volume.ownership == request.ownership()
     }));
+    let capacities = request
+        .volumes()
+        .iter()
+        .map(|volume| (volume.target.as_str(), volume.capacity_bytes))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        capacities["/home/workspace/.local/share/mise"],
+        11 * 1024_u64.pow(3)
+    );
+    assert_eq!(capacities["/home/workspace/.cache"], 12 * 1024_u64.pow(3));
+    assert_eq!(
+        capacities["/home/workspace/.config/gascan"],
+        2 * 1024_u64.pow(3)
+    );
     assert_eq!(
         request.environment(),
         &BTreeMap::from([
