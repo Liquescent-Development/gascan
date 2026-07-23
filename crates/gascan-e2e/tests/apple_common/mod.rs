@@ -2320,8 +2320,9 @@ mod tests {
         let child = Command::new("sh")
             .args([
                 "-c",
-                "head -c 2097152 /dev/zero | tr '\\0' o; printf stdout-tail; \
-                 head -c 2097152 /dev/zero | tr '\\0' e >&2; printf stderr-tail >&2",
+                "(head -c 2097152 /dev/zero | tr '\\0' o; printf stdout-tail) & \
+                 (head -c 2097152 /dev/zero | tr '\\0' e; printf stderr-tail) >&2 & \
+                 wait",
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

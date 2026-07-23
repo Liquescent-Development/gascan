@@ -47,14 +47,7 @@ fn apply_installs_large_npm_tool_and_neovim_with_storage_override() -> TestResul
         "--installed",
         "--json",
     ])?;
-    assert_exact_active_tools(
-        &inventory.stdout,
-        [
-            ("neovim", "0.11.3"),
-            ("node", "24.18.0"),
-            ("npm:@openai/codex", "0.10.0"),
-        ],
-    )?;
+    assert_exact_active_tools(&inventory.stdout, EXPECTED_TOOLS)?;
 
     env.success(["--sandbox", env.id(), "destroy", "--yes"])?;
     env.assert_no_owned_resources()
@@ -103,7 +96,6 @@ fn changed_setup_is_reported_but_not_run_by_up_or_shell() -> TestResult {
 }
 
 #[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 struct MiseToolRecord {
     version: String,
     installed: bool,
@@ -176,56 +168,90 @@ fn assert_exact_active_tools<const N: usize>(
     Ok(())
 }
 
+const EXPECTED_TOOLS: [(&str, &str); 3] = [
+    ("neovim", "0.11.3"),
+    ("node", "24.18.0"),
+    ("npm:@openai/codex", "0.10.0"),
+];
+
 #[test]
-fn exact_active_tools_rejects_extra_or_inactive_records() {
+fn exact_active_tools_accepts_exact_minimal_inventory() {
     let exact = br#"{
         "neovim":[{"installed":true,"active":true,"version":"0.11.3"}],
         "node":[{"installed":true,"active":true,"version":"24.18.0"}],
         "npm:@openai/codex":[{"installed":true,"active":true,"version":"0.10.0"}]
     }"#;
-    let expected = [
-        ("neovim", "0.11.3"),
-        ("node", "24.18.0"),
-        ("npm:@openai/codex", "0.10.0"),
-    ];
-    assert!(assert_exact_active_tools(exact, expected).is_ok());
+    assert!(assert_exact_active_tools(exact, EXPECTED_TOOLS).is_ok());
+}
 
+#[test]
+fn exact_active_tools_rejects_tool_set_flags_and_version_mismatches() {
     let extra = br#"{
         "go":[{"installed":true,"active":true,"version":"1.26.5"}],
         "neovim":[{"installed":true,"active":true,"version":"0.11.3"}],
         "node":[{"installed":true,"active":true,"version":"24.18.0"}],
         "npm:@openai/codex":[{"installed":true,"active":true,"version":"0.10.0"}]
     }"#;
-    assert!(assert_exact_active_tools(extra, expected).is_err());
+    assert!(assert_exact_active_tools(extra, EXPECTED_TOOLS).is_err());
 
     let inactive = br#"{
         "neovim":[{"installed":true,"active":false,"version":"0.11.3"}],
         "node":[{"installed":true,"active":true,"version":"24.18.0"}],
         "npm:@openai/codex":[{"installed":true,"active":true,"version":"0.10.0"}]
     }"#;
-    assert!(assert_exact_active_tools(inactive, expected).is_err());
+    assert!(assert_exact_active_tools(inactive, EXPECTED_TOOLS).is_err());
 
     let wrong_version = br#"{
         "neovim":[{"installed":true,"active":true,"version":"0.11.4"}],
         "node":[{"installed":true,"active":true,"version":"24.18.0"}],
         "npm:@openai/codex":[{"installed":true,"active":true,"version":"0.10.0"}]
     }"#;
-    assert!(assert_exact_active_tools(wrong_version, expected).is_err());
+    assert!(assert_exact_active_tools(wrong_version, EXPECTED_TOOLS).is_err());
+}
 
-    let unknown_field = br#"{
-        "neovim":[{"installed":true,"active":true,"version":"0.11.3","source":"unexpected"}],
-        "node":[{"installed":true,"active":true,"version":"24.18.0"}],
-        "npm:@openai/codex":[{"installed":true,"active":true,"version":"0.10.0"}]
+#[test]
+fn exact_active_tools_accepts_realistic_mise_metadata() {
+    let realistic_metadata = br#"{
+        "neovim":[{
+            "installed":true,
+            "active":true,
+            "version":"0.11.3",
+            "source":{"type":"global","path":"/home/workspace/.config/gascan/mise.toml"},
+            "requested_version":"0.11.3",
+            "install_path":"/home/workspace/.local/share/mise/installs/neovim/0.11.3",
+            "symlinked_to":null
+        }],
+        "node":[{
+            "installed":true,
+            "active":true,
+            "version":"24.18.0",
+            "source":{"type":"global","path":"/home/workspace/.config/gascan/mise.toml"},
+            "requested_version":"24.18.0",
+            "install_path":"/opt/gascan/mise/installs/node/24.18.0",
+            "symlinked_to":null
+        }],
+        "npm:@openai/codex":[{
+            "installed":true,
+            "active":true,
+            "version":"0.10.0",
+            "source":{"type":"global","path":"/home/workspace/.config/gascan/mise.toml"},
+            "requested_version":"0.10.0",
+            "install_path":"/home/workspace/.local/share/mise/installs/npm-openai-codex/0.10.0",
+            "symlinked_to":null
+        }]
     }"#;
-    assert!(assert_exact_active_tools(unknown_field, expected).is_err());
+    assert!(assert_exact_active_tools(realistic_metadata, EXPECTED_TOOLS).is_ok());
+}
 
+#[test]
+fn exact_active_tools_rejects_duplicate_tools_and_multiple_records() {
     let duplicate_tool = br#"{
         "neovim":[{"installed":true,"active":true,"version":"0.11.3"}],
         "node":[{"installed":true,"active":true,"version":"24.18.0"}],
         "node":[{"installed":true,"active":true,"version":"24.18.0"}],
         "npm:@openai/codex":[{"installed":true,"active":true,"version":"0.10.0"}]
     }"#;
-    assert!(assert_exact_active_tools(duplicate_tool, expected).is_err());
+    assert!(assert_exact_active_tools(duplicate_tool, EXPECTED_TOOLS).is_err());
 
     let multiple_records = br#"{
         "neovim":[{"installed":true,"active":true,"version":"0.11.3"}],
@@ -235,5 +261,5 @@ fn exact_active_tools_rejects_extra_or_inactive_records() {
         ],
         "npm:@openai/codex":[{"installed":true,"active":true,"version":"0.10.0"}]
     }"#;
-    assert!(assert_exact_active_tools(multiple_records, expected).is_err());
+    assert!(assert_exact_active_tools(multiple_records, EXPECTED_TOOLS).is_err());
 }
