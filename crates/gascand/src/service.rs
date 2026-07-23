@@ -15,9 +15,9 @@ use gascan_core::provision::{
     AppliedState, ProvisionPlan, ProvisionStep, ProvisioningPlanner, SetupScript,
 };
 use gascan_core::runtime::{
-    ContainerState, CreateFailure, CreateRequest, ExecInput, ExecOutput, ExecRequest,
-    RemoveRequest, ResourceKind, ResourceOwnership, RuntimeBackend, RuntimeCapabilities,
-    RuntimeError,
+    ContainerState, CreateFailure, CreateOutcome, CreateRequest, ExecInput, ExecOutput,
+    ExecRequest, RemoveRequest, ResourceKind, ResourceOwnership, RuntimeBackend,
+    RuntimeCapabilities, RuntimeError,
 };
 use gascan_core::sandbox::{SandboxError, SandboxId, SandboxSpec};
 use serde::de::{Error as _, MapAccess, Visitor};
@@ -675,18 +675,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             match self.runtime.create(create.clone()).await {
                 Ok(outcome) => {
                     if let Err(error) = self.persist_created_storage(id, requested_storage).await {
-                        let rollback =
-                            match RemoveRequest::from_resources(outcome.created().to_vec()) {
-                                Ok(request) => self.runtime.remove(request).await,
-                                Err(error) => Err(error),
-                            };
-                        return match rollback {
-                            Ok(()) => Err(error),
-                            Err(rollback) => Err(ServiceError::Rollback {
-                                original: Box::new(error),
-                                rollback,
-                            }),
-                        };
+                        return Err(self.rollback_created(id, outcome, error).await);
                     }
                     created = Some(outcome);
                 }
@@ -770,33 +759,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             Err(error) if error.is_setup_failure() => Err(error),
             Err(error) if created.is_some() => {
                 if let Some(outcome) = created {
-                    let rollback = async {
-                        let current = self.runtime.inspect(id).await?.ok_or_else(|| {
-                            RuntimeError::NotFound {
-                                resource: id.to_string(),
-                            }
-                        })?;
-                        if current.ownership.managed_by != "gascan"
-                            || current.ownership.sandbox_id != *id
-                        {
-                            return Err(RuntimeError::OwnershipMismatch {
-                                resource: id.to_string(),
-                            });
-                        }
-                        if current.state == ContainerState::Running {
-                            self.runtime.stop(id).await?;
-                        }
-                        self.runtime
-                            .remove(RemoveRequest::from_resources(outcome.created().to_vec())?)
-                            .await
-                    }
-                    .await;
-                    if let Err(rollback) = rollback {
-                        return Err(ServiceError::Rollback {
-                            original: Box::new(error),
-                            rollback,
-                        });
-                    }
+                    return Err(self.rollback_created(id, outcome, error).await);
                 }
                 Err(error)
             }
@@ -881,6 +844,42 @@ impl<B: RuntimeBackend> SandboxService<B> {
             .ok_or_else(|| ServiceError::Missing(id.clone()))?;
         record.storage_resolution = Some(storage_resolution(requested_storage));
         self.database(move |store| store.put_sandbox(&record)).await
+    }
+
+    async fn rollback_created(
+        &self,
+        id: &SandboxId,
+        outcome: CreateOutcome,
+        original: ServiceError,
+    ) -> ServiceError {
+        let rollback = async {
+            let current =
+                self.runtime
+                    .inspect(id)
+                    .await?
+                    .ok_or_else(|| RuntimeError::NotFound {
+                        resource: id.to_string(),
+                    })?;
+            if current.ownership.managed_by != "gascan" || current.ownership.sandbox_id != *id {
+                return Err(RuntimeError::OwnershipMismatch {
+                    resource: id.to_string(),
+                });
+            }
+            if current.state == ContainerState::Running {
+                self.runtime.stop(id).await?;
+            }
+            self.runtime
+                .remove(RemoveRequest::from_resources(outcome.created().to_vec())?)
+                .await
+        }
+        .await;
+        match rollback {
+            Ok(()) => original,
+            Err(rollback) => ServiceError::Rollback {
+                original: Box::new(original),
+                rollback,
+            },
+        }
     }
 
     async fn run_setup(&self, id: &SandboxId, setup: &SetupScript) -> Result<(), ServiceError> {
@@ -2223,7 +2222,17 @@ async fn desired_fingerprint(spec: &SandboxSpec) -> Result<String, ServiceError>
 
 #[cfg(test)]
 mod storage_tests {
-    use super::{BoundedTail, ServiceError, requested_storage_from_volumes};
+    use super::{
+        BoundedTail, NoopProvisioner, SandboxService, ServiceError, Store,
+        requested_storage_from_volumes,
+    };
+    use camino::Utf8Path;
+    use gascan_core::fake_runtime::FakeRuntime;
+    use gascan_core::manifest::Manifest;
+    use gascan_core::policy::PolicyCompiler;
+    use gascan_core::runtime::{RuntimeBackend, RuntimeCall};
+    use gascan_core::sandbox::SandboxSpec;
+    use std::sync::Arc;
 
     #[test]
     fn bounded_tail_keeps_exact_suffix_across_chunks() {
@@ -2248,5 +2257,59 @@ mod storage_tests {
                 "managed volume is missing from compiled create request"
             ))
         ));
+    }
+
+    #[tokio::test]
+    async fn created_rollback_stops_running_runtime_before_exact_remove()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+        let spec = SandboxSpec::from_root("persist-created-rollback", root, Manifest::load(root)?)?;
+        let id = spec.id().clone();
+        let runtime = FakeRuntime::default();
+        let create = PolicyCompiler::compile(spec, &runtime.capabilities().await?)?;
+        let outcome = runtime.create(create).await?;
+        let exact_created = outcome.created().to_vec();
+        runtime.start(&id).await?;
+        let service = SandboxService::new(
+            runtime.clone(),
+            Store::open(root.join("state.db"))?,
+            Arc::new(NoopProvisioner),
+        );
+
+        let error = service
+            .rollback_created(
+                &id,
+                outcome,
+                ServiceError::Provision("injected persistence failure".to_owned()),
+            )
+            .await;
+
+        assert_eq!(
+            error.to_string(),
+            "provisioning failed: injected persistence failure"
+        );
+        assert!(runtime.inspect(&id).await?.is_none());
+        assert!(runtime.list_resources().await?.is_empty());
+        let calls = runtime.calls().await;
+        let stopped = calls
+            .iter()
+            .position(|call| matches!(call, RuntimeCall::Stop(call_id) if call_id == &id))
+            .ok_or("stop")?;
+        let (removed, removed_resources) = calls
+            .iter()
+            .enumerate()
+            .find_map(|(index, call)| match call {
+                RuntimeCall::Remove(request) => Some((index, request.resources())),
+                _ => None,
+            })
+            .ok_or("remove")?;
+        assert!(matches!(
+            &calls[stopped - 1],
+            RuntimeCall::Inspect(call_id) if call_id == &id
+        ));
+        assert!(stopped < removed);
+        assert_eq!(removed_resources, exact_created);
+        Ok(())
     }
 }
