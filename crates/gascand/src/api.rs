@@ -676,6 +676,19 @@ fn service_status(error: ServiceError) -> tonic::Status {
         ServiceError::Policy(_) | ServiceError::Sandbox(_) | ServiceError::Manifest(_) => {
             tonic::Status::invalid_argument(error_code::INVALID_REQUEST)
         }
+        error @ ServiceError::StorageChangeRequiresRecreate { .. } => {
+            let code = gascan_proto::error_code::STORAGE_CHANGE_REQUIRES_RECREATE;
+            let message = error.to_string();
+            let details =
+                serde_json::to_vec(&crate::service::failure_details(&error)).unwrap_or_default();
+            tonic::Status::with_details(
+                tonic::Code::FailedPrecondition,
+                code,
+                tonic::codegen::Bytes::from(gascan_proto::error_detail::encode_with_details(
+                    code, &message, &details,
+                )),
+            )
+        }
         _ => tonic::Status::internal(error_code::INTERNAL),
     }
 }
@@ -784,6 +797,9 @@ fn service_error_diagnostic(error: &ServiceError) -> String {
         ServiceError::Manifest(_) => "service_kind=manifest".to_owned(),
         ServiceError::Missing(_) => "service_kind=missing".to_owned(),
         ServiceError::Ownership(_) => "service_kind=ownership".to_owned(),
+        ServiceError::StorageChangeRequiresRecreate { .. } => {
+            "service_kind=storage_change_requires_recreate".to_owned()
+        }
         ServiceError::Provision(_)
         | ServiceError::ProvisionCommandFailed { .. }
         | ServiceError::SetupChanged
@@ -2680,6 +2696,28 @@ mod tests {
         assert_eq!(
             before_operation.message(),
             error_code::DISK_CONTROL_UNSUPPORTED
+        );
+    }
+
+    #[test]
+    fn storage_change_maps_to_failed_precondition_with_actionable_cause() {
+        let status = service_status(ServiceError::StorageChangeRequiresRecreate {
+            changes: vec![crate::StorageCapacityChange {
+                volume: "tools",
+                recorded_bytes: Some(10 * 1024_u64.pow(3)),
+                requested_bytes: 20 * 1024_u64.pow(3),
+            }],
+        });
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            status.message(),
+            error_code::STORAGE_CHANGE_REQUIRES_RECREATE
+        );
+        assert_eq!(
+            gascan_proto::error_detail::decode_message(status.details()).as_deref(),
+            Some(
+                "storage settings changed for tools (10GiB → 20GiB); run `gascan destroy --yes` and `gascan up` to recreate the sandbox"
+            )
         );
     }
 

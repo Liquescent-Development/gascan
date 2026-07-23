@@ -41,7 +41,8 @@ pub use socket::{OwnedSocket, PeerUid, PeerUidMismatch, SocketPaths, validate_pe
 pub use reconcile::{ReconcileFinding, ReconcileReport};
 pub use service::{
     DoctorCompleter, DoctorState, NoopProvisioner, Operation, ProvisionRequest,
-    ProvisionResolution, Provisioner, SandboxService, ServiceError, UpRequest,
+    ProvisionResolution, Provisioner, SandboxService, ServiceError, StorageCapacityChange,
+    UpRequest,
 };
 pub use store::{
     ActualState, DesiredState, ImageResolution, OperationEvent, OperationId, OperationKind,

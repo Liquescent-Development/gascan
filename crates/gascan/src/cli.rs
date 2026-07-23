@@ -451,7 +451,7 @@ async fn operation(
         while let Some(event) = stream.message().await? {
             println!(
                 "{}",
-                serde_json::json!({"operation_id":event.operation_id.map(|id|id.value),"sequence":event.sequence,"phase":event.phase,"status":event.status,"error":event.error.as_ref().map(|error|serde_json::json!({"code":error.code,"message":error.message}))})
+                serde_json::json!({"operation_id":event.operation_id.map(|id|id.value),"sequence":event.sequence,"phase":event.phase,"status":event.status,"error":event.error.as_ref().map(json_operation_error)})
             );
             if event.error.is_some() {
                 return Ok(EXIT_RUNTIME);
@@ -481,6 +481,16 @@ async fn operation(
         writeln!(std::io::stderr(), "{line}")?;
     }
     Ok(0)
+}
+
+fn json_operation_error(error: &v1::Error) -> serde_json::Value {
+    let details = serde_json::from_slice::<serde_json::Value>(&error.details)
+        .unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "code": error.code,
+        "message": error.message,
+        "details": details,
+    })
 }
 
 async fn run(
@@ -899,6 +909,44 @@ mod tests {
             error.message(),
             "process_failed: command exited before setup completed"
         );
+    }
+
+    #[test]
+    fn json_operation_error_retains_storage_change_details()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let error = v1::Error {
+            code: gascan_proto::error_code::STORAGE_CHANGE_REQUIRES_RECREATE.to_owned(),
+            message: "storage settings changed".to_owned(),
+            details: serde_json::to_vec(&serde_json::json!({"changes":[{
+                "volume":"tools",
+                "recorded_bytes":10 * 1024_u64.pow(3),
+                "requested_bytes":20 * 1024_u64.pow(3),
+            }]}))?,
+        };
+        assert_eq!(
+            super::json_operation_error(&error),
+            serde_json::json!({
+                "code":"storage_change_requires_recreate",
+                "message":"storage settings changed",
+                "details":{"changes":[{
+                    "volume":"tools",
+                    "recorded_bytes":10 * 1024_u64.pow(3),
+                    "requested_bytes":20 * 1024_u64.pow(3),
+                }]}
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn storage_change_human_error_is_actionable() {
+        let message = "storage settings changed for tools (10GiB → 20GiB); run `gascan destroy --yes` and `gascan up` to recreate the sandbox";
+        let error = CliError::Operation {
+            code: gascan_proto::error_code::STORAGE_CHANGE_REQUIRES_RECREATE.to_owned(),
+            message: message.to_owned(),
+        };
+        assert_eq!(error.message(), message);
+        assert!(render_error(&error).contains(message));
     }
 
     #[test]

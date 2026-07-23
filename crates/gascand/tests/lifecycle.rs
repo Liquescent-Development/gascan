@@ -25,6 +25,72 @@ fn networked_spec(name: &str, root: &Utf8Path) -> Result<SandboxSpec, Box<dyn Er
     Ok(SandboxSpec::from_root(name, root, Manifest::load(root)?)?)
 }
 
+fn spec(name: &str, root: &Utf8Path) -> Result<SandboxSpec, Box<dyn Error>> {
+    Ok(SandboxSpec::from_root(name, root, Manifest::load(root)?)?)
+}
+
+#[tokio::test]
+async fn apply_rejects_changed_storage_without_runtime_calls() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let runtime = FakeRuntime::default();
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    );
+    service
+        .up(UpRequest::new(spec("storage-change", root)?))
+        .await?;
+
+    std::fs::write(
+        root.join("gascan.toml"),
+        "version = 1\n[storage]\ntools = \"20GiB\"\n",
+    )?;
+    let before = runtime.calls().await.len();
+    let error = match service
+        .apply(UpRequest::new(spec("storage-change", root)?))
+        .await
+    {
+        Ok(_) => return Err("storage change unexpectedly applied".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "storage_change_requires_recreate");
+    assert!(error.to_string().contains("tools"));
+    assert!(error.to_string().contains("10GiB"));
+    assert!(error.to_string().contains("20GiB"));
+    assert_eq!(runtime.calls().await.len(), before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn apply_rejects_legacy_storage_resolution_without_runtime_calls() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let runtime = FakeRuntime::default();
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    );
+    let desired = spec("legacy-storage", root)?;
+    service.up(UpRequest::new(desired.clone())).await?;
+    let mut record = service.status(desired.id())?.ok_or("sandbox record")?;
+    record.storage_resolution = None;
+    service.store().put_sandbox(&record)?;
+
+    let before = runtime.calls().await.len();
+    let error = match service.apply(UpRequest::new(desired)).await {
+        Ok(_) => return Err("legacy storage resolution unexpectedly applied".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "storage_change_requires_recreate");
+    assert_eq!(runtime.calls().await.len(), before);
+    Ok(())
+}
+
 #[derive(Default)]
 struct ControlledProvisioner {
     fail_provision: AtomicBool,

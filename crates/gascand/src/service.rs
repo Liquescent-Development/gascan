@@ -1,7 +1,8 @@
 use crate::reconcile::{ReconcileFinding, ReconcileReport};
 use crate::{
     ActualState, DesiredState, ImageResolution, OperationEvent, OperationId, OperationKind,
-    OperationRecord, SandboxRecord, SetupResolution, Store, StoreError, ToolResolution,
+    OperationRecord, SandboxRecord, SetupResolution, StorageResolution, Store, StoreError,
+    ToolResolution,
 };
 use async_trait::async_trait;
 use gascan_core::doctor::{DoctorFacts, DoctorReport};
@@ -49,6 +50,13 @@ pub struct ProvisionRequest<'a> {
 pub struct ProvisionResolution {
     pub setup: Option<Value>,
     pub tools: Option<Value>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageCapacityChange {
+    pub volume: &'static str,
+    pub recorded_bytes: Option<u64>,
+    pub requested_bytes: u64,
 }
 
 struct ProvisionedResolution {
@@ -259,6 +267,8 @@ pub enum ServiceError {
     Missing(SandboxId),
     #[error("sandbox {0} is not owned by gascan")]
     Ownership(SandboxId),
+    #[error("{}", format_storage_change_message(changes))]
+    StorageChangeRequiresRecreate { changes: Vec<StorageCapacityChange> },
     #[error("provisioning failed: {0}")]
     Provision(String),
     #[error("provisioning failed: guest provisioning command failed")]
@@ -470,15 +480,46 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let id = request.spec.id().clone();
         let lock = self.keyed_lock(&id)?;
         let _guard = lock.lock().await;
-        let capabilities = self.runtime.capabilities().await?;
-        let create = PolicyCompiler::compile(request.spec.clone(), &capabilities)?;
-        let desired_fingerprint = desired_fingerprint(&request.spec).await?;
         let existing = self
             .database({
                 let id = id.clone();
                 move |store| store.sandbox(&id)
             })
             .await?;
+        if let Some(prior) = existing
+            .as_ref()
+            .filter(|record| record.actual_state != ActualState::Absent)
+        {
+            if let Err(error) =
+                validate_storage_capacities(prior, requested_manifest_storage(&request.spec))
+            {
+                let operation = self
+                    .database({
+                        let prior = prior.clone();
+                        move |store| store.begin_operation(&prior, OperationKind::Create)
+                    })
+                    .await?;
+                let (sender, receiver) = mpsc::channel(16);
+                self.initialize_operation(operation.id, &id, prior.actual_state, &sender)
+                    .await?;
+                let receiver = publish_operation(started, operation.id, receiver);
+                let code = error.code();
+                let details = failure_details(&error);
+                let prior_actual = prior.actual_state;
+                self.database(move |store| {
+                    store.fail_operation(operation.id, prior_actual, code, details)
+                })
+                .await?;
+                self.send_terminal(operation.id, &sender).await?;
+                return match receiver {
+                    Some(_) => Err(error),
+                    None => Ok(None),
+                };
+            }
+        }
+        let capabilities = self.runtime.capabilities().await?;
+        let create = PolicyCompiler::compile(request.spec.clone(), &capabilities)?;
+        let desired_fingerprint = desired_fingerprint(&request.spec).await?;
         let prior = existing.clone();
         let mut record = existing.unwrap_or_else(|| SandboxRecord {
             id: id.clone(),
@@ -541,6 +582,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
                         json!({"desired_fingerprint":desired_fingerprint,"tool_hash":provisioned.tool_hash,"resolution":resolution.tools}),
                     ));
                 }
+                record.storage_resolution = Some(storage_resolution(&create));
                 record.actual_state = actual;
                 self.database({
                     let record = record.clone();
@@ -1264,9 +1306,6 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let id = request.spec.id().clone();
         let lock = self.keyed_lock(&id)?;
         let _guard = lock.lock().await;
-        let capabilities = self.runtime.capabilities().await?;
-        let create = PolicyCompiler::compile(request.spec.clone(), &capabilities)?;
-        let desired_fingerprint = desired_fingerprint(&request.spec).await?;
         let mut record = self
             .database({
                 let id = id.clone();
@@ -1274,6 +1313,39 @@ impl<B: RuntimeBackend> SandboxService<B> {
             })
             .await?
             .ok_or_else(|| ServiceError::Missing(id.clone()))?;
+        if let Err(error) =
+            validate_storage_capacities(&record, requested_manifest_storage(&request.spec))
+        {
+            let operation = self
+                .database({
+                    let record = record.clone();
+                    move |store| store.begin_operation(&record, OperationKind::Apply)
+                })
+                .await?;
+            let (sender, receiver) = mpsc::channel(16);
+            self.initialize_operation(operation.id, &id, record.actual_state, &sender)
+                .await?;
+            let receiver = publish_operation(started, operation.id, receiver);
+            let code = error.code();
+            let details = failure_details(&error);
+            let prior_actual = record.actual_state;
+            self.database(move |store| {
+                store.fail_operation(operation.id, prior_actual, code, details)
+            })
+            .await?;
+            self.send_terminal(operation.id, &sender).await?;
+            return match receiver {
+                Some(_) => Err(error),
+                None => Ok(None),
+            };
+        }
+        let capabilities = self.runtime.capabilities().await?;
+        let create = PolicyCompiler::compile(request.spec.clone(), &capabilities)?;
+        debug_assert_eq!(
+            requested_storage(&create),
+            requested_manifest_storage(&request.spec)
+        );
+        let desired_fingerprint = desired_fingerprint(&request.spec).await?;
         let desired_plan = ProvisioningPlanner::plan_for_root(
             request.spec.canonical_root(),
             request.spec.manifest(),
@@ -1664,13 +1736,14 @@ fn default_doctor_report() -> DoctorReport {
 }
 
 impl ServiceError {
-    pub(crate) fn code(&self) -> &'static str {
+    pub fn code(&self) -> &'static str {
         match self {
             Self::Runtime(error) => error.code(),
             Self::Create(error) => error.code(),
             Self::Policy(error) => error.code(),
             Self::Missing(_) => "not_found",
             Self::Ownership(_) => "ownership_mismatch",
+            Self::StorageChangeRequiresRecreate { .. } => "storage_change_requires_recreate",
             Self::Provision(_)
             | Self::ProvisionCommandFailed { .. }
             | Self::SetupChanged
@@ -1724,8 +1797,17 @@ impl ServiceError {
     }
 }
 
-fn failure_details(error: &ServiceError) -> Value {
-    if let ServiceError::ProvisionCommandFailed {
+pub(crate) fn failure_details(error: &ServiceError) -> Value {
+    if let ServiceError::StorageChangeRequiresRecreate { changes } = error {
+        json!({
+            "message": error.to_string(),
+            "changes": changes.iter().map(|change| json!({
+                "volume": change.volume,
+                "recorded_bytes": change.recorded_bytes,
+                "requested_bytes": change.requested_bytes,
+            })).collect::<Vec<_>>(),
+        })
+    } else if let ServiceError::ProvisionCommandFailed {
         step,
         action,
         exit_code,
@@ -1753,6 +1835,105 @@ fn failure_details(error: &ServiceError) -> Value {
     } else {
         json!({"message":error.to_string()})
     }
+}
+
+fn storage_resolution(create: &CreateRequest) -> StorageResolution {
+    let requested = requested_storage(create);
+    StorageResolution::new(
+        1,
+        json!({
+            "tools_bytes": requested[0].1,
+            "cache_bytes": requested[1].1,
+            "config_bytes": requested[2].1,
+        }),
+    )
+}
+
+fn validate_storage_capacities(
+    record: &SandboxRecord,
+    requested: [(&'static str, u64); 3],
+) -> Result<(), ServiceError> {
+    let recorded = record
+        .storage_resolution
+        .as_ref()
+        .filter(|resolution| resolution.version == 1);
+    let changes = requested
+        .into_iter()
+        .filter_map(|(volume, requested_bytes)| {
+            let recorded_bytes = recorded
+                .and_then(|resolution| resolution.details.get(format!("{volume}_bytes")))
+                .and_then(Value::as_u64);
+            (recorded_bytes != Some(requested_bytes)).then_some(StorageCapacityChange {
+                volume,
+                recorded_bytes,
+                requested_bytes,
+            })
+        })
+        .collect::<Vec<_>>();
+    if changes.is_empty() {
+        Ok(())
+    } else {
+        Err(ServiceError::StorageChangeRequiresRecreate { changes })
+    }
+}
+
+fn requested_manifest_storage(spec: &SandboxSpec) -> [(&'static str, u64); 3] {
+    let storage = spec.manifest().storage();
+    [
+        ("tools", storage.tools().bytes()),
+        ("cache", storage.cache().bytes()),
+        ("config", storage.config().bytes()),
+    ]
+}
+
+fn requested_storage(create: &CreateRequest) -> [(&'static str, u64); 3] {
+    [
+        ("tools", "/home/workspace/.local/share/mise"),
+        ("cache", "/home/workspace/.cache"),
+        ("config", "/home/workspace/.config/gascan"),
+    ]
+    .map(|(volume, target)| {
+        let capacity = create
+            .volumes()
+            .iter()
+            .find(|candidate| candidate.target.as_str() == target)
+            .map_or(0, |candidate| candidate.capacity_bytes);
+        (volume, capacity)
+    })
+}
+
+fn format_storage_change_message(changes: &[StorageCapacityChange]) -> String {
+    let changes = changes
+        .iter()
+        .map(|change| {
+            let recorded = change
+                .recorded_bytes
+                .map_or_else(|| "unknown".to_owned(), format_binary_size);
+            format!(
+                "{} ({recorded} → {})",
+                change.volume,
+                format_binary_size(change.requested_bytes)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "storage settings changed for {changes}; run `gascan destroy --yes` and `gascan up` to recreate the sandbox"
+    )
+}
+
+fn format_binary_size(bytes: u64) -> String {
+    for (suffix, divisor) in [
+        ("TiB", 1024_u64.pow(4)),
+        ("GiB", 1024_u64.pow(3)),
+        ("MiB", 1024_u64.pow(2)),
+        ("KiB", 1024_u64),
+    ] {
+        if bytes % divisor == 0 {
+            return format!("{}{suffix}", bytes / divisor);
+        }
+    }
+    format!("{bytes} bytes")
 }
 
 fn applied_state(record: Option<&SandboxRecord>) -> AppliedState {

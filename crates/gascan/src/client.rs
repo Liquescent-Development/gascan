@@ -30,6 +30,14 @@ impl ClientError {
             Self::Io(_) | Self::Transport(_) | Self::Api(_) => None,
         }
     }
+
+    pub fn failure_details(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::Rpc(status) => gascan_proto::error_detail::decode_details(status.details())
+                .and_then(|details| serde_json::from_slice(&details).ok()),
+            Self::Io(_) | Self::Transport(_) | Self::Api(_) => None,
+        }
+    }
 }
 
 impl std::fmt::Display for ClientError {
@@ -264,6 +272,30 @@ mod tests {
             error.cause().as_deref(),
             Some("resource conflict for port 3000: already reserved")
         );
+    }
+
+    #[test]
+    fn rpc_errors_expose_structured_storage_change_details()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let message = "storage settings changed for tools (10GiB → 20GiB); run `gascan destroy --yes` and `gascan up` to recreate the sandbox";
+        let changes = serde_json::json!({"changes":[{
+            "volume":"tools",
+            "recorded_bytes":10 * 1024_u64.pow(3),
+            "requested_bytes":20 * 1024_u64.pow(3),
+        }]});
+        let encoded = gascan_proto::error_detail::encode_with_details(
+            gascan_proto::error_code::STORAGE_CHANGE_REQUIRES_RECREATE,
+            message,
+            serde_json::to_vec(&changes)?.as_slice(),
+        );
+        let error = super::ClientError::Rpc(Box::new(tonic::Status::with_details(
+            tonic::Code::FailedPrecondition,
+            gascan_proto::error_code::STORAGE_CHANGE_REQUIRES_RECREATE,
+            tonic::codegen::Bytes::from(encoded),
+        )));
+        assert_eq!(error.failure_details(), Some(changes));
+        assert_eq!(error.to_string(), format!("error: {message}"));
+        Ok(())
     }
 
     #[test]
