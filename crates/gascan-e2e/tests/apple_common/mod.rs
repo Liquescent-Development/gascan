@@ -627,12 +627,8 @@ impl AppleE2e {
 
     fn cleanup(&self) -> TestResult {
         let identities = self.resource_identities()?;
-        let presences = identities
-            .iter()
-            .map(|identity| resource_presence(identity, self.id()))
-            .collect::<TestResult<Vec<_>>>()?;
-        for (identity, presence) in identities.iter().zip(&presences) {
-            if *presence == ResourcePresence::Collision {
+        for identity in &identities {
+            if resource_presence(identity, self.id())? == ResourcePresence::Collision {
                 return Err(format!(
                     "refusing cleanup for exact resource {} with mismatched ownership",
                     identity.name()
@@ -640,16 +636,19 @@ impl AppleE2e {
                 .into());
             }
         }
-        for (identity, presence) in identities.into_iter().zip(presences) {
-            let name = identity.name();
-            if presence == ResourcePresence::Owned {
-                if identity.kind() == gascan_core::runtime::ResourceKind::Container {
+        for identity in identities {
+            if identity.kind() == gascan_core::runtime::ResourceKind::Container {
+                mutate_if_freshly_owned(&identity, self.id(), resource_presence, |identity| {
                     let _ = Command::new("container")
-                        .args(["stop", "--time", "5", name])
+                        .args(["stop", "--time", "5", identity.name()])
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
                         .status();
-                }
+                    Ok(())
+                })?;
+            }
+            mutate_if_freshly_owned(&identity, self.id(), resource_presence, |identity| {
+                let name = identity.name();
                 let status = match identity.kind() {
                     gascan_core::runtime::ResourceKind::Container => Command::new("container")
                         .args(["delete", name])
@@ -667,10 +666,12 @@ impl AppleE2e {
                         .stderr(Stdio::null())
                         .status()?,
                 };
-                if !status.success() {
-                    return Err(format!("cleanup failed for exact resource {name}").into());
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(format!("cleanup failed for exact resource {name}").into())
                 }
-            }
+            })?;
         }
         let _keep_roots_alive = (&self.root, &self.runtime);
         self.assert_no_owned_resources()
@@ -1241,6 +1242,23 @@ enum ResourcePresence {
     Collision,
 }
 
+fn mutate_if_freshly_owned(
+    identity: &gascan_core::runtime::ResourceIdentity,
+    id: &str,
+    observe: impl FnOnce(&gascan_core::runtime::ResourceIdentity, &str) -> TestResult<ResourcePresence>,
+    mutate: impl FnOnce(&gascan_core::runtime::ResourceIdentity) -> TestResult,
+) -> TestResult {
+    match observe(identity, id)? {
+        ResourcePresence::Absent => Ok(()),
+        ResourcePresence::Owned => mutate(identity),
+        ResourcePresence::Collision => Err(format!(
+            "refusing cleanup for exact resource {} with mismatched ownership",
+            identity.name()
+        )
+        .into()),
+    }
+}
+
 fn resource_presence(
     identity: &gascan_core::runtime::ResourceIdentity,
     id: &str,
@@ -1691,6 +1709,47 @@ mod tests {
         )?;
 
         assert!(network_presence_from_output(&output, name, "cleanup-123456789abc").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_revalidates_each_resource_immediately_before_mutation() -> TestResult {
+        let id = SandboxId::test("fresh-cleanup");
+        let identities = gascan_core::policy::PolicyCompiler::expected_resource_identities(&id)?;
+        let volume = identities[3].clone();
+        let network = identities[4].clone();
+        let network_foreign = std::cell::Cell::new(false);
+        let deleted = std::cell::RefCell::new(Vec::new());
+
+        mutate_if_freshly_owned(
+            &volume,
+            id.as_str(),
+            |_, _| Ok(ResourcePresence::Owned),
+            |identity| {
+                deleted.borrow_mut().push(identity.name().to_owned());
+                network_foreign.set(true);
+                Ok(())
+            },
+        )?;
+        let error = mutate_if_freshly_owned(
+            &network,
+            id.as_str(),
+            |_, _| {
+                Ok(if network_foreign.get() {
+                    ResourcePresence::Collision
+                } else {
+                    ResourcePresence::Owned
+                })
+            },
+            |identity| {
+                deleted.borrow_mut().push(identity.name().to_owned());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("mismatched ownership"));
+        assert_eq!(deleted.into_inner(), vec![volume.name()]);
         Ok(())
     }
 

@@ -51,6 +51,14 @@ case "$*" in
         foreign)
           printf '[{"id":"gascan-network-%s","configuration":{"name":"gascan-network-%s","labels":{}}}]\n' "$ID" "$ID"
           ;;
+        foreign_after_volume)
+          if test -f "$CALLS.volume-deleted" &&
+             test "$(wc -l <"$CALLS.volume-deleted" | tr -d ' ')" -eq 3; then
+            printf '[{"id":"gascan-network-%s","configuration":{"name":"gascan-network-%s","labels":{}}}]\n' "$ID" "$ID"
+          else
+            printf '[{"id":"gascan-network-%s","configuration":{"name":"gascan-network-%s","labels":{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":"%s"}}}]\n' "$ID" "$ID" "$LABEL_ID"
+          fi
+          ;;
         ambiguous)
           printf '[{"id":"gascan-network-%s","configuration":{"name":"gascan-network-%s","labels":{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":"%s"}}},{"id":"gascan-network-%s","configuration":{"name":"gascan-network-%s","labels":{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":"%s"}}}]\n' "$ID" "$ID" "$LABEL_ID" "$ID" "$ID" "$LABEL_ID"
           ;;
@@ -554,7 +562,7 @@ fn exact_owned_network_is_deleted_after_all_three_volumes_and_verified_absent() 
             .lines()
             .filter(|call| *call == "network list --format json")
             .count(),
-        2
+        3
     );
 }
 
@@ -571,6 +579,28 @@ fn foreign_same_name_network_is_retained_with_the_manifest() {
     assert!(path.exists());
     assert!(!temp.path().join("calls.network-deleted").exists());
     assert_no_resource_deletes(&calls);
+}
+
+#[test]
+fn network_changed_to_foreign_after_volume_deletion_is_retained_with_manifest() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_bin, calls) = fake_container(&temp);
+    let id = "gate4-test-123456789abc";
+    let path = manifest(&temp, managed_resources(id));
+
+    let output = run_with_network_mode(&temp, &path, &calls, "foreign_after_volume");
+
+    assert!(!output.status.success());
+    assert!(path.exists());
+    assert!(!temp.path().join("calls.network-deleted").exists());
+    let calls = fs::read_to_string(calls).unwrap();
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|call| *call == "network list --format json")
+            .count(),
+        2
+    );
 }
 
 #[test]

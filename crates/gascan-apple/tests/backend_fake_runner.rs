@@ -594,6 +594,57 @@ async fn networked_create_labels_network_before_volumes_and_attaches_container()
 }
 
 #[tokio::test]
+async fn exact_name_networks_always_conflict_before_any_create_mutation() {
+    for (case, sandbox_label, manager_label) in [
+        ("owned", None, "gascan"),
+        ("foreign", None, "foreign"),
+        (
+            "mismatched",
+            Some("some-other-sandbox-000000000000"),
+            "gascan",
+        ),
+    ] {
+        let runner = StatefulAppleRunner::default();
+        let backend = AppleBackend::new(runner.clone());
+        let (_root, request) = request(&format!("apple-network-collision-{case}"));
+        let sandbox_id = request.id().to_string();
+        let network_name = request.network().managed_name().unwrap().to_owned();
+        let seeded = (
+            sandbox_label.unwrap_or(&sandbox_id).to_owned(),
+            manager_label.to_owned(),
+        );
+        runner
+            .0
+            .lock()
+            .unwrap()
+            .networks
+            .insert(network_name.clone(), seeded.clone());
+
+        let failure = backend.create(request).await.unwrap_err();
+
+        assert_eq!(failure.code(), "resource_conflict", "{case}");
+        let state = runner.0.lock().unwrap();
+        assert_eq!(state.networks.get(&network_name), Some(&seeded), "{case}");
+        assert!(state.volumes.is_empty(), "{case}");
+        assert!(state.containers.is_empty(), "{case}");
+        assert!(
+            !state.commands.iter().any(|command| {
+                matches!(
+                    command.args.as_slice(),
+                    [resource, operation, ..]
+                        if (resource == "network" || resource == "volume")
+                            && operation == "create"
+                ) || command
+                    .args
+                    .first()
+                    .is_some_and(|argument| argument == "run")
+            }),
+            "{case}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn transient_network_create_io_reconciles_exact_owned_side_effect() {
     let runner = StatefulAppleRunner::default();
     runner.0.lock().unwrap().fail_network_after_insert = true;
@@ -990,7 +1041,7 @@ async fn successful_volume_create_then_ownership_verification_never_claims_forei
 }
 
 #[tokio::test]
-async fn successful_container_create_then_persistent_absence_retains_only_prior_volumes() {
+async fn successful_container_create_then_persistent_absence_retains_prior_managed_resources() {
     let runner = StatefulAppleRunner::default();
     runner
         .0
@@ -1005,7 +1056,7 @@ async fn successful_container_create_then_persistent_absence_retains_only_prior_
 }
 
 #[tokio::test]
-async fn successful_container_create_then_foreign_observation_retains_only_prior_volumes() {
+async fn successful_container_create_then_foreign_observation_retains_network_and_prior_volumes() {
     let runner = StatefulAppleRunner::default();
     runner
         .0
@@ -1028,7 +1079,8 @@ async fn successful_container_create_then_foreign_observation_retains_only_prior
 }
 
 #[tokio::test]
-async fn successful_container_create_then_mismatched_observation_retains_only_prior_volumes() {
+async fn successful_container_create_then_mismatched_observation_retains_network_and_prior_volumes()
+{
     let runner = StatefulAppleRunner::default();
     runner
         .0
