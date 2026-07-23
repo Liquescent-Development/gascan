@@ -4,6 +4,8 @@
 mod apple_common;
 
 use apple_common::{AppleE2e, TestResult};
+use serde::de::{Error as _, MapAccess, Visitor};
+use std::collections::BTreeMap;
 
 #[test]
 #[ignore = "requires supported Apple runtime, locked workspace image, and network access"]
@@ -45,7 +47,14 @@ fn apply_installs_large_npm_tool_and_neovim_with_storage_override() -> TestResul
         "--installed",
         "--json",
     ])?;
-    assert_exact_active_tools(&inventory.stdout, ["neovim", "node", "npm:@openai/codex"])?;
+    assert_exact_active_tools(
+        &inventory.stdout,
+        [
+            ("neovim", "0.11.3"),
+            ("node", "24.18.0"),
+            ("npm:@openai/codex", "0.10.0"),
+        ],
+    )?;
 
     env.success(["--sandbox", env.id(), "destroy", "--yes"])?;
     env.assert_no_owned_resources()
@@ -93,29 +102,75 @@ fn changed_setup_is_reported_but_not_run_by_up_or_shell() -> TestResult {
     env.assert_no_owned_resources()
 }
 
-fn assert_exact_active_tools<const N: usize>(output: &[u8], expected: [&str; N]) -> TestResult {
-    let inventory: serde_json::Value = serde_json::from_slice(output)?;
-    let records = inventory
-        .as_object()
-        .ok_or("mise inventory must be a JSON object")?;
-    let observed = records.keys().map(String::as_str).collect::<Vec<_>>();
-    if observed != expected {
-        return Err(format!("unexpected active tool set: {observed:?}").into());
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MiseToolRecord {
+    version: String,
+    installed: bool,
+    active: bool,
+}
+
+struct MiseInventory(BTreeMap<String, Vec<MiseToolRecord>>);
+
+impl<'de> serde::Deserialize<'de> for MiseInventory {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct InventoryVisitor;
+
+        impl<'de> Visitor<'de> for InventoryVisitor {
+            type Value = MiseInventory;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a mise tool inventory object with unique tool keys")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut records = BTreeMap::new();
+                while let Some((tool, versions)) =
+                    map.next_entry::<String, Vec<MiseToolRecord>>()?
+                {
+                    if records.insert(tool, versions).is_some() {
+                        return Err(A::Error::custom("duplicate mise tool key"));
+                    }
+                }
+                Ok(MiseInventory(records))
+            }
+        }
+
+        deserializer.deserialize_map(InventoryVisitor)
     }
-    for tool in expected {
-        let entries = records[tool]
-            .as_array()
-            .ok_or("mise tool records must be an array")?;
+}
+
+fn assert_exact_active_tools<const N: usize>(
+    output: &[u8],
+    expected: [(&str, &str); N],
+) -> TestResult {
+    let MiseInventory(records) = serde_json::from_slice(output)?;
+    let expected =
+        BTreeMap::from(expected.map(|(tool, version)| (tool.to_owned(), version.to_owned())));
+    if !records.keys().eq(expected.keys()) {
+        return Err(format!(
+            "unexpected active tool set: {:?}",
+            records.keys().collect::<Vec<_>>()
+        )
+        .into());
+    }
+    for (tool, expected_version) in expected {
+        let entries = &records[&tool];
         let [entry] = entries.as_slice() else {
             return Err(format!("mise returned multiple records for {tool}").into());
         };
-        if entry["installed"].as_bool() != Some(true)
-            || entry["active"].as_bool() != Some(true)
-            || entry["version"]
-                .as_str()
-                .is_none_or(|version| version.trim().is_empty())
-        {
-            return Err(format!("mise returned an inactive or invalid record for {tool}").into());
+        if !entry.installed || !entry.active || entry.version != expected_version {
+            return Err(format!(
+                "mise returned an inactive or unexpected version for {tool}: {}",
+                entry.version
+            )
+            .into());
         }
     }
     Ok(())
@@ -125,20 +180,60 @@ fn assert_exact_active_tools<const N: usize>(output: &[u8], expected: [&str; N])
 fn exact_active_tools_rejects_extra_or_inactive_records() {
     let exact = br#"{
         "neovim":[{"installed":true,"active":true,"version":"0.11.3"}],
+        "node":[{"installed":true,"active":true,"version":"24.18.0"}],
         "npm:@openai/codex":[{"installed":true,"active":true,"version":"0.10.0"}]
     }"#;
-    assert!(assert_exact_active_tools(exact, ["neovim", "npm:@openai/codex"]).is_ok());
+    let expected = [
+        ("neovim", "0.11.3"),
+        ("node", "24.18.0"),
+        ("npm:@openai/codex", "0.10.0"),
+    ];
+    assert!(assert_exact_active_tools(exact, expected).is_ok());
 
     let extra = br#"{
-        "node":[{"installed":true,"active":true,"version":"24.0.0"}],
+        "go":[{"installed":true,"active":true,"version":"1.26.5"}],
         "neovim":[{"installed":true,"active":true,"version":"0.11.3"}],
+        "node":[{"installed":true,"active":true,"version":"24.18.0"}],
         "npm:@openai/codex":[{"installed":true,"active":true,"version":"0.10.0"}]
     }"#;
-    assert!(assert_exact_active_tools(extra, ["neovim", "npm:@openai/codex"]).is_err());
+    assert!(assert_exact_active_tools(extra, expected).is_err());
 
     let inactive = br#"{
         "neovim":[{"installed":true,"active":false,"version":"0.11.3"}],
+        "node":[{"installed":true,"active":true,"version":"24.18.0"}],
         "npm:@openai/codex":[{"installed":true,"active":true,"version":"0.10.0"}]
     }"#;
-    assert!(assert_exact_active_tools(inactive, ["neovim", "npm:@openai/codex"]).is_err());
+    assert!(assert_exact_active_tools(inactive, expected).is_err());
+
+    let wrong_version = br#"{
+        "neovim":[{"installed":true,"active":true,"version":"0.11.4"}],
+        "node":[{"installed":true,"active":true,"version":"24.18.0"}],
+        "npm:@openai/codex":[{"installed":true,"active":true,"version":"0.10.0"}]
+    }"#;
+    assert!(assert_exact_active_tools(wrong_version, expected).is_err());
+
+    let unknown_field = br#"{
+        "neovim":[{"installed":true,"active":true,"version":"0.11.3","source":"unexpected"}],
+        "node":[{"installed":true,"active":true,"version":"24.18.0"}],
+        "npm:@openai/codex":[{"installed":true,"active":true,"version":"0.10.0"}]
+    }"#;
+    assert!(assert_exact_active_tools(unknown_field, expected).is_err());
+
+    let duplicate_tool = br#"{
+        "neovim":[{"installed":true,"active":true,"version":"0.11.3"}],
+        "node":[{"installed":true,"active":true,"version":"24.18.0"}],
+        "node":[{"installed":true,"active":true,"version":"24.18.0"}],
+        "npm:@openai/codex":[{"installed":true,"active":true,"version":"0.10.0"}]
+    }"#;
+    assert!(assert_exact_active_tools(duplicate_tool, expected).is_err());
+
+    let multiple_records = br#"{
+        "neovim":[{"installed":true,"active":true,"version":"0.11.3"}],
+        "node":[
+            {"installed":true,"active":true,"version":"24.18.0"},
+            {"installed":true,"active":true,"version":"24.18.0"}
+        ],
+        "npm:@openai/codex":[{"installed":true,"active":true,"version":"0.10.0"}]
+    }"#;
+    assert!(assert_exact_active_tools(multiple_records, expected).is_err());
 }
