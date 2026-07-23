@@ -78,8 +78,8 @@ struct FakeState {
     outcomes: Vec<RuntimeOutcome>,
     failures: HashSet<FailureBoundary>,
     create_failure_after_mutations: Option<usize>,
-    exec_result: (Vec<u8>, Vec<u8>, i32),
-    exec_results: VecDeque<(Vec<u8>, Vec<u8>, i32)>,
+    exec_result: (Vec<u8>, Vec<u8>, i32, i32),
+    exec_results: VecDeque<(Vec<u8>, Vec<u8>, i32, i32)>,
     exec_errors: VecDeque<RuntimeError>,
     exec_input_failures: usize,
     exec_stream_errors: VecDeque<RuntimeError>,
@@ -99,7 +99,7 @@ impl FakeRuntime {
                 outcomes: Vec::new(),
                 failures: HashSet::new(),
                 create_failure_after_mutations: None,
-                exec_result: (Vec::new(), Vec::new(), 0),
+                exec_result: (Vec::new(), Vec::new(), 0, 0),
                 exec_results: VecDeque::new(),
                 exec_errors: VecDeque::new(),
                 exec_input_failures: 0,
@@ -179,12 +179,23 @@ impl FakeRuntime {
     }
 
     pub async fn set_exec_result(&self, stdout: Vec<u8>, stderr: Vec<u8>, exit_code: i32) {
-        self.inner.lock().await.exec_result = (stdout, stderr, exit_code);
+        self.inner.lock().await.exec_result = (stdout, stderr, exit_code, 0);
     }
 
     pub async fn queue_exec_results<I>(&self, results: I)
     where
         I: IntoIterator<Item = (Vec<u8>, Vec<u8>, i32)>,
+    {
+        self.inner.lock().await.exec_results.extend(
+            results
+                .into_iter()
+                .map(|(stdout, stderr, code)| (stdout, stderr, code, 0)),
+        );
+    }
+
+    pub async fn queue_exec_results_with_signals<I>(&self, results: I)
+    where
+        I: IntoIterator<Item = (Vec<u8>, Vec<u8>, i32, i32)>,
     {
         self.inner.lock().await.exec_results.extend(results);
     }
@@ -395,7 +406,7 @@ fn load_state(capabilities: RuntimeCapabilities, path: &Path) -> Result<FakeStat
         outcomes: Vec::new(),
         failures: HashSet::new(),
         create_failure_after_mutations: None,
-        exec_result: (Vec::new(), Vec::new(), 0),
+        exec_result: (Vec::new(), Vec::new(), 0, 0),
         exec_results: VecDeque::new(),
         exec_errors: VecDeque::new(),
         exec_input_failures: 0,
@@ -735,7 +746,7 @@ impl RuntimeBackend for FakeRuntime {
                 return;
             }
             let mut stdin = request.stdin;
-            let mut signal = 0;
+            let mut signal = configured.3;
             let mut resize = None;
             while let Some(frame) = inputs.recv().await {
                 match frame {
@@ -752,7 +763,7 @@ impl RuntimeBackend for FakeRuntime {
                     &request.argv,
                     &request.environment,
                     stdin,
-                    configured,
+                    (configured.0, configured.1, configured.2),
                     resize,
                 )
             };

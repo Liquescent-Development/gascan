@@ -803,9 +803,11 @@ fn service_error_diagnostic(error: &ServiceError) -> String {
         ServiceError::Provision(_)
         | ServiceError::ProvisionCommandFailed { .. }
         | ServiceError::SetupChanged
-        | ServiceError::SetupExit(_)
+        | ServiceError::SetupCommandFailed { .. }
         | ServiceError::SetupChangedStopUnconfirmed
-        | ServiceError::SetupExitStopUnconfirmed { .. } => "service_kind=provision".to_owned(),
+        | ServiceError::SetupCommandFailedStopUnconfirmed { .. } => {
+            "service_kind=provision".to_owned()
+        }
         ServiceError::LockPoisoned => "service_kind=lock_poisoned".to_owned(),
         ServiceError::EventStreamUnavailable => "service_kind=event_stream_unavailable".to_owned(),
         ServiceError::DatabaseWorker(_) => "service_kind=database_worker".to_owned(),

@@ -308,12 +308,26 @@ pub enum ServiceError {
     },
     #[error("mounted setup script changed before execution")]
     SetupChanged,
-    #[error("setup script failed with exit code {0}")]
-    SetupExit(i32),
+    #[error(
+        "setup action {action} failed with exit code {exit_code}, signal {signal}: {stderr_tail}"
+    )]
+    SetupCommandFailed {
+        action: &'static str,
+        exit_code: i32,
+        signal: i32,
+        stderr_tail: String,
+    },
     #[error("mounted setup script changed before execution; stopped state could not be confirmed")]
     SetupChangedStopUnconfirmed,
-    #[error("setup script failed with exit code {exit_code}; stopped state could not be confirmed")]
-    SetupExitStopUnconfirmed { exit_code: i32 },
+    #[error(
+        "setup action {action} failed with exit code {exit_code}, signal {signal}: {stderr_tail}; stopped state could not be confirmed"
+    )]
+    SetupCommandFailedStopUnconfirmed {
+        action: &'static str,
+        exit_code: i32,
+        signal: i32,
+        stderr_tail: String,
+    },
     #[error("keyed lock registry was poisoned")]
     LockPoisoned,
     #[error("bounded operation event stream could not accept its durable event")]
@@ -576,6 +590,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 &request.spec,
                 &create,
                 prior.as_ref(),
+                requested_storage,
                 operation.id,
                 &sender,
                 &desired_fingerprint,
@@ -633,6 +648,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
         spec: &SandboxSpec,
         create: &CreateRequest,
         prior: Option<&SandboxRecord>,
+        requested_storage: StorageCapacities,
         operation_id: OperationId,
         sender: &mpsc::Sender<OperationEvent>,
         desired_fingerprint: &str,
@@ -660,6 +676,9 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 .await?;
         }
         let result = async {
+            if created.is_some() {
+                self.persist_created_storage(id, requested_storage).await?;
+            }
             let current = self
                 .runtime
                 .inspect(id)
@@ -676,7 +695,13 @@ impl<B: RuntimeBackend> SandboxService<B> {
             } else {
                 false
             };
-            let provisioned = if inspected.is_some() && !durable_match {
+            let has_complete_durable_resolution = prior.is_some_and(|record| {
+                record.setup_resolution.is_some() && record.tool_resolution.is_some()
+            });
+            let provisioned = if inspected.is_some()
+                && !durable_match
+                && has_complete_durable_resolution
+            {
                 let applied = applied_state(prior);
                 let plan = ProvisioningPlanner::plan_for_root(
                     spec.canonical_root(),
@@ -818,6 +843,22 @@ impl<B: RuntimeBackend> SandboxService<B> {
         })
     }
 
+    async fn persist_created_storage(
+        &self,
+        id: &SandboxId,
+        requested_storage: StorageCapacities,
+    ) -> Result<(), ServiceError> {
+        let mut record = self
+            .database({
+                let id = id.clone();
+                move |store| store.sandbox(&id)
+            })
+            .await?
+            .ok_or_else(|| ServiceError::Missing(id.clone()))?;
+        record.storage_resolution = Some(storage_resolution(requested_storage));
+        self.database(move |store| store.put_sandbox(&record)).await
+    }
+
     async fn run_setup(&self, id: &SandboxId, setup: &SetupScript) -> Result<(), ServiceError> {
         let guest_path = format!("/workspace/{}", setup.canonical_relative_path());
         let digest_outcome = self
@@ -828,7 +869,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             )
             .await?;
         if digest_outcome.code != 0 || digest_outcome.signal != 0 {
-            return Err(ServiceError::SetupChanged);
+            return Err(setup_command_failure("verify_setup_digest", digest_outcome));
         }
         let digest = std::str::from_utf8(&digest_outcome.stdout)
             .ok()
@@ -846,7 +887,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
         if outcome.code == 0 && outcome.signal == 0 {
             Ok(())
         } else {
-            Err(ServiceError::SetupExit(outcome.code))
+            Err(setup_command_failure("run_setup", outcome))
         }
     }
 
@@ -1734,9 +1775,9 @@ impl ServiceError {
             Self::Provision(_)
             | Self::ProvisionCommandFailed { .. }
             | Self::SetupChanged
-            | Self::SetupExit(_)
+            | Self::SetupCommandFailed { .. }
             | Self::SetupChangedStopUnconfirmed
-            | Self::SetupExitStopUnconfirmed { .. } => "provision_failed",
+            | Self::SetupCommandFailedStopUnconfirmed { .. } => "provision_failed",
             Self::Store(_) => "store_error",
             Self::Sandbox(_) => "sandbox_error",
             Self::Manifest(_) => "manifest_error",
@@ -1753,20 +1794,20 @@ impl ServiceError {
         matches!(
             self,
             Self::SetupChanged
-                | Self::SetupExit(_)
+                | Self::SetupCommandFailed { .. }
                 | Self::SetupChangedStopUnconfirmed
-                | Self::SetupExitStopUnconfirmed { .. }
+                | Self::SetupCommandFailedStopUnconfirmed { .. }
         )
     }
 
     const fn setup_stop_confirmed(&self) -> bool {
-        matches!(self, Self::SetupChanged | Self::SetupExit(_))
+        matches!(self, Self::SetupChanged | Self::SetupCommandFailed { .. })
     }
 
     const fn setup_exit_code(&self) -> Option<i32> {
         match self {
-            Self::SetupExit(code) => Some(*code),
-            Self::SetupExitStopUnconfirmed { exit_code } => Some(*exit_code),
+            Self::SetupCommandFailed { exit_code, .. }
+            | Self::SetupCommandFailedStopUnconfirmed { exit_code, .. } => Some(*exit_code),
             _ => None,
         }
     }
@@ -1776,9 +1817,23 @@ impl ServiceError {
             Self::SetupChanged | Self::SetupChangedStopUnconfirmed => {
                 Self::SetupChangedStopUnconfirmed
             }
-            Self::SetupExit(exit_code) | Self::SetupExitStopUnconfirmed { exit_code } => {
-                Self::SetupExitStopUnconfirmed { exit_code }
+            Self::SetupCommandFailed {
+                action,
+                exit_code,
+                signal,
+                stderr_tail,
             }
+            | Self::SetupCommandFailedStopUnconfirmed {
+                action,
+                exit_code,
+                signal,
+                stderr_tail,
+            } => Self::SetupCommandFailedStopUnconfirmed {
+                action,
+                exit_code,
+                signal,
+                stderr_tail,
+            },
             other => other,
         }
     }
@@ -1819,6 +1874,23 @@ pub(crate) fn failure_details(error: &ServiceError) -> Value {
         });
         if let Some(exit_code) = error.setup_exit_code() {
             details["exit_code"] = Value::from(exit_code);
+        }
+        if let ServiceError::SetupCommandFailed {
+            action,
+            signal,
+            stderr_tail,
+            ..
+        }
+        | ServiceError::SetupCommandFailedStopUnconfirmed {
+            action,
+            signal,
+            stderr_tail,
+            ..
+        } = error
+        {
+            details["action"] = Value::from(*action);
+            details["signal"] = Value::from(*signal);
+            details["stderr_tail"] = Value::from(stderr_tail.clone());
         }
         details
     } else {
@@ -1953,6 +2025,15 @@ fn applied_state(record: Option<&SandboxRecord>) -> AppliedState {
 
 fn provisioning_transport_error() -> ServiceError {
     ServiceError::Provision("guest provisioning transport failed".to_owned())
+}
+
+fn setup_command_failure(action: &'static str, outcome: GuestExecOutcome) -> ServiceError {
+    ServiceError::SetupCommandFailed {
+        action,
+        exit_code: outcome.code,
+        signal: outcome.signal,
+        stderr_tail: sanitize_provision_stderr(&outcome.stderr_tail),
+    }
 }
 
 fn sanitize_provision_stderr(bytes: &[u8]) -> String {

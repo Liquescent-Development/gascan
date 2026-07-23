@@ -222,7 +222,7 @@ async fn changed_setup_apply_restarts_running_container_before_guest_digest() ->
 
 #[tokio::test]
 async fn nonzero_setup_exit_is_structured_sanitized_stopped_and_retryable() -> TestResult {
-    const SECRET: &str = "guest-secret-must-not-leak";
+    const DIAGNOSTIC: &str = "write failed: No space left on device";
     let temp = tempfile::tempdir()?;
     let root = Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
     let bytes = b"exit 23\n";
@@ -232,7 +232,15 @@ async fn nonzero_setup_exit_is_structured_sanitized_stopped_and_retryable() -> T
         .queue_exec_results([
             (Vec::new(), Vec::new(), 0),
             (digest_stdout(bytes, "setup.sh"), Vec::new(), 0),
-            (Vec::new(), SECRET.as_bytes().to_vec(), 23),
+            (
+                Vec::new(),
+                [
+                    vec![b'x'; 70 * 1024],
+                    b"\nwrite failed: No space left on device\x1b".to_vec(),
+                ]
+                .concat(),
+                23,
+            ),
         ])
         .await;
     let service = SandboxService::new(
@@ -246,18 +254,63 @@ async fn nonzero_setup_exit_is_structured_sanitized_stopped_and_retryable() -> T
         Err(error) => error,
     };
     assert!(error.to_string().contains("exit code 23"));
-    assert!(!error.to_string().contains(SECRET));
+    assert!(error.to_string().contains(DIAGNOSTIC));
+    assert!(!error.to_string().contains('\u{1b}'));
     let id = spec(root, "setup-exit")?.id().clone();
     assert_eq!(
         runtime.inspect(&id).await?.ok_or("runtime")?.state,
         ContainerState::Stopped
     );
     let operation = service.latest_operation()?.ok_or("operation")?;
-    let durable = format!("{:?}", service.store().operation_events(operation.id)?);
-    assert!(durable.contains("\"phase\": String(\"setup\")"));
-    assert!(durable.contains("\"retryable\": Bool(true)"));
-    assert!(durable.contains("\"exit_code\": Number(23)"));
-    assert!(!durable.contains(SECRET));
+    let details = operation.error_details.ok_or("error details")?;
+    assert_eq!(details["phase"], "setup");
+    assert_eq!(details["retryable"], true);
+    assert_eq!(details["action"], "run_setup");
+    assert_eq!(details["exit_code"], 23);
+    assert_eq!(details["signal"], 0);
+    assert!(details["stderr_tail"].as_str().is_some_and(|tail| {
+        tail.as_bytes().len() <= 64 * 1024 && tail.contains(DIAGNOSTIC) && !tail.contains('\u{1b}')
+    }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn signaled_setup_preserves_signal_and_sanitized_stderr() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    let bytes = b"kill -TERM $$\n";
+    write_setup(root, "setup.sh", bytes)?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .queue_exec_results_with_signals([
+            (Vec::new(), Vec::new(), 0, 0),
+            (digest_stdout(bytes, "setup.sh"), Vec::new(), 0, 0),
+            (Vec::new(), b"terminated\x00\n".to_vec(), 143, 15),
+        ])
+        .await;
+    let service = SandboxService::new(
+        runtime,
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    );
+
+    let error = match service
+        .up(UpRequest::new(spec(root, "setup-signal")?))
+        .await
+    {
+        Ok(_) => return Err("signaled setup unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("signal 15"));
+    let details = service
+        .latest_operation()?
+        .ok_or("operation")?
+        .error_details
+        .ok_or("error details")?;
+    assert_eq!(details["action"], "run_setup");
+    assert_eq!(details["exit_code"], 143);
+    assert_eq!(details["signal"], 15);
+    assert_eq!(details["stderr_tail"], "terminated  ");
     Ok(())
 }
 

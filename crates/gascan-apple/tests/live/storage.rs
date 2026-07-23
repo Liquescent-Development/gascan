@@ -3,10 +3,12 @@ use std::collections::BTreeMap;
 use camino::Utf8Path;
 use gascan_apple::{AppleBackend, CommandRunner, CommandSpec, ProcessRunner};
 use gascan_core::{
+    fake_runtime::FakeRuntime,
     manifest::Manifest,
     policy::PolicyCompiler,
     runtime::{
-        NetworkIsolation, RemoveRequest, RuntimeBackend, RuntimeCapabilities, RuntimeVersion,
+        CreateOutcome, CreateRequest, NetworkIsolation, RemoveRequest, RuntimeBackend,
+        RuntimeCapabilities, RuntimeVersion,
     },
     sandbox::SandboxSpec,
 };
@@ -16,6 +18,89 @@ use super::common::{LiveContext, TestError, exact_workspace_bind};
 
 const GIB: u64 = 1024_u64.pow(3);
 const CAPACITY_ROUNDING_BYTES: u64 = 64 * 1024_u64.pow(2);
+
+async fn create_with_partial_cleanup<B: RuntimeBackend>(
+    backend: &B,
+    request: CreateRequest,
+) -> Result<CreateOutcome, TestError> {
+    match backend.create(request).await {
+        Ok(created) => Ok(created),
+        Err(failure) => {
+            if !failure.created().is_empty() {
+                backend
+                    .remove(RemoveRequest::from_resources(failure.created().to_vec())?)
+                    .await?;
+            }
+            Err(failure.into())
+        }
+    }
+}
+
+#[tokio::test]
+async fn create_failure_cleanup_removes_exact_partial_resources() -> Result<(), TestError> {
+    let root = tempfile::tempdir()?;
+    let path = Utf8Path::from_path(root.path()).ok_or("non-UTF-8 test root")?;
+    std::fs::write(
+        path.join("gascan.toml"),
+        "version = 1\nnetwork = 'networked'\n",
+    )?;
+    let spec = SandboxSpec::from_root("storage-partial-cleanup", path, Manifest::load(path)?)?;
+    let request = PolicyCompiler::compile(
+        spec,
+        &RuntimeCapabilities {
+            version: RuntimeVersion::new(1, 1, 0),
+            bind_mounts: true,
+            named_volumes: true,
+            tty: true,
+            signals: true,
+            loopback_publish: true,
+            resource_limits: true,
+            offline: NetworkIsolation::Proven,
+        },
+    )?;
+    let id = request.id().clone();
+    let expected_names = [
+        request.network().managed_name().ok_or("managed network")?,
+        request.volumes()[0].name.as_str(),
+        request.volumes()[1].name.as_str(),
+        request.volumes()[2].name.as_str(),
+        request.id().as_str(),
+    ];
+    for mutations in 1..=expected_names.len() {
+        let runtime = FakeRuntime::default();
+        runtime.fail_create_after_mutations(mutations).await;
+
+        assert!(
+            create_with_partial_cleanup(&runtime, request.clone())
+                .await
+                .is_err()
+        );
+        assert!(runtime.list_resources().await?.is_empty());
+        let remove = runtime
+            .calls()
+            .await
+            .into_iter()
+            .find_map(|call| match call {
+                gascan_core::runtime::RuntimeCall::Remove(request) => Some(request),
+                _ => None,
+            })
+            .ok_or("remove call")?;
+        assert_eq!(remove.resources().len(), mutations);
+        assert_eq!(
+            remove
+                .resources()
+                .iter()
+                .map(|resource| resource.name())
+                .collect::<Vec<_>>(),
+            expected_names[..mutations]
+        );
+        assert!(remove.resources().iter().all(|resource| {
+            resource.ownership() == gascan_core::runtime::ResourceOwnership::GasCanOwned
+                && resource.sandbox_id() == Some(&id)
+        }));
+    }
+    Ok(())
+}
 
 #[test]
 fn bind_inspect_requires_one_exact_read_write_workspace_source() {
@@ -257,7 +342,7 @@ async fn independently_sized_managed_volumes_are_exact_and_cleanup() -> Result<(
     let id = request.id().clone();
     let runner = ProcessRunner;
     let backend = AppleBackend::new(runner);
-    let created = backend.create(request).await?;
+    let created = create_with_partial_cleanup(&backend, request).await?;
 
     let result = async {
         backend.start(&id).await?;

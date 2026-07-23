@@ -8,6 +8,7 @@ use gascan_core::sandbox::SandboxSpec;
 use gascand::{NoopProvisioner, OperationStatus, SandboxService, UpRequest};
 use gascand::{ProvisionRequest, ProvisionResolution, Provisioner, ServiceError};
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 use std::error::Error;
 use std::sync::{
     Arc,
@@ -154,6 +155,101 @@ async fn failed_initial_up_retry_runs_provision_and_persists_actual_resolution()
             .as_ref()
             .and_then(|value| value.details.get("resolution")),
         Some(&json!({"resolved":"prior-setup"}))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn retained_setup_failure_persists_storage_and_up_retries_setup() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let setup = b"exit 28\n";
+    std::fs::write(root.join("setup.sh"), setup)?;
+    std::fs::write(
+        root.join("gascan.toml"),
+        "version = 1\nsetup = 'setup.sh'\n[storage]\ntools = '11GiB'\n",
+    )?;
+    let make_spec = || SandboxSpec::from_root("retry-retained-setup", root, Manifest::load(root)?);
+    let runtime = FakeRuntime::default();
+    let digest = format!("{:x}  /workspace/setup.sh\n", Sha256::digest(setup)).into_bytes();
+    runtime
+        .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (digest.clone(), Vec::new(), 0),
+            (Vec::new(), b"No space left on device".to_vec(), 28),
+        ])
+        .await;
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    );
+
+    assert!(service.up(UpRequest::new(make_spec()?)).await.is_err());
+    let id = make_spec()?.id().clone();
+    let failed = service.status(&id)?.ok_or("failed record")?;
+    assert_eq!(
+        failed
+            .storage_resolution
+            .as_ref()
+            .and_then(|resolution| resolution.details["tools_bytes"].as_u64()),
+        Some(11 * 1024_u64.pow(3))
+    );
+
+    runtime
+        .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (digest, Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+        ])
+        .await;
+    service.up(UpRequest::new(make_spec()?)).await?;
+    let setup_runs = runtime
+        .calls()
+        .await
+        .into_iter()
+        .filter(|call| {
+            matches!(
+                call,
+                RuntimeCall::Exec(request)
+                    if request.argv.first().map(String::as_str) == Some("/bin/bash")
+            )
+        })
+        .count();
+    assert_eq!(setup_runs, 2);
+    assert!(
+        service
+            .status(&id)?
+            .ok_or("retried record")?
+            .setup_resolution
+            .is_some()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_failure_before_resources_does_not_persist_storage_resolution() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    std::fs::write(
+        root.join("gascan.toml"),
+        "version = 1\n[storage]\ntools = '11GiB'\n",
+    )?;
+    let desired = spec("create-no-storage-resolution", root)?;
+    let runtime = FakeRuntime::failing_once(FailureBoundary::Create);
+    let service = SandboxService::new(
+        runtime,
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    );
+
+    assert!(service.up(UpRequest::new(desired.clone())).await.is_err());
+    assert!(
+        service
+            .status(desired.id())?
+            .ok_or("failed record")?
+            .storage_resolution
+            .is_none()
     );
     Ok(())
 }
