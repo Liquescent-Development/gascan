@@ -349,6 +349,7 @@ git init --quiet --bare --initial-branch=main "$tap_origin"
 git init --quiet --initial-branch=main "$tap"
 git -C "$tap" config user.name release
 git -C "$tap" config user.email release@example.invalid
+git -C "$tap" config commit.gpgSign false
 mkdir -p "$tap/Casks"
 printf 'seed\n' >"$tap/README.md"
 git -C "$tap" add README.md

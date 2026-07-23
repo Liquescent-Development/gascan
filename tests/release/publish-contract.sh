@@ -227,6 +227,11 @@ pkgbuild --quiet --identifier dev.gascan.pkg --version "$version" --install-loca
 # that found this gap did it: a real `git clone`, never the working repo.
 clone=$fixture/clone
 git clone --quiet "$repo_root" "$clone"
+git -C "$clone" config user.name release
+git -C "$clone" config user.email release@example.invalid
+git -C "$clone" config gpg.format ssh
+git -C "$clone" config user.signingKey "$fixture/case-a-key"
+git -C "$clone" config gpg.ssh.allowedSignersFile "$fixture/case-a-allowed-signers"
 git -C "$clone" tag -d "$tag" >/dev/null 2>&1 || true
 git -C "$clone" tag -s "$tag" -m "publish-contract test fixture" HEAD
 git -C "$clone" verify-tag "$tag" >/dev/null 2>&1
