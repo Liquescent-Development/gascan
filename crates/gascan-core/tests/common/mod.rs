@@ -38,11 +38,16 @@ pub fn capabilities() -> RuntimeCapabilities {
 }
 
 pub fn create_request(name: &str) -> CreateRequestFixture {
+    create_request_with_network(name, "offline")
+}
+
+pub fn create_request_with_network(name: &str, network: &str) -> CreateRequestFixture {
+    assert!(matches!(network, "offline" | "networked"));
     let temp = tempfile::tempdir().expect("temporary backend-contract root");
     let root = Utf8Path::from_path(temp.path()).expect("UTF-8 temporary path");
     std::fs::write(
         root.join("gascan.toml"),
-        "version = 1\nnetwork = 'offline'\n",
+        format!("version = 1\nnetwork = '{network}'\n"),
     )
     .expect("write backend-contract manifest");
     let manifest = Manifest::load(root).expect("load backend-contract manifest");

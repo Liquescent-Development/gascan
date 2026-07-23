@@ -2,7 +2,8 @@ use async_trait::async_trait;
 use camino::Utf8PathBuf;
 use gascan_core::fake_runtime::FakeRuntime;
 use gascan_core::manifest::Manifest;
-use gascan_core::runtime::{ResourceOwnership, RuntimeBackend};
+use gascan_core::policy::PolicyCompiler;
+use gascan_core::runtime::{ResourceKind, ResourceOwnership, RuntimeBackend};
 use gascan_core::sandbox::SandboxSpec;
 use gascand::{
     ActualState, DesiredState, NoopProvisioner, OperationKind, OperationStatus, ProvisionRequest,
@@ -23,6 +24,14 @@ async fn reconcile_reports_unknown_owned_resources_without_deleting() -> Result<
     let runtime = FakeRuntime::default();
     let unknown = gascan_core::sandbox::SandboxId::test("unknown");
     runtime.seed_owned(unknown.clone()).await;
+    let network = PolicyCompiler::managed_network_name(&unknown);
+    runtime
+        .seed_network(
+            &network,
+            Some(unknown.clone()),
+            ResourceOwnership::GasCanOwned,
+        )
+        .await?;
     let service = SandboxService::new(
         runtime.clone(),
         Store::open(temp.path().join("state.db"))?,
@@ -36,6 +45,48 @@ async fn reconcile_reports_unknown_owned_resources_without_deleting() -> Result<
             .any(|finding| matches!(finding, ReconcileFinding::UnknownOwned(resource) if resource.sandbox_id() == Some(&unknown)))
     );
     assert!(runtime.inspect(&unknown).await?.is_some());
+    assert!(report.findings.iter().any(|finding| matches!(
+        finding,
+        ReconcileFinding::UnknownOwned(resource)
+            if resource.kind() == ResourceKind::Network
+                && resource.name() == network
+                && resource.sandbox_id() == Some(&unknown)
+    )));
+    assert!(runtime.network_exists(&network).await);
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconcile_does_not_report_a_known_sandbox_network_as_unknown() -> Result<(), Box<dyn Error>>
+{
+    let temp = tempfile::tempdir()?;
+    let root = Utf8PathBuf::from_path_buf(temp.path().join("project")).map_err(|_| "utf8 root")?;
+    std::fs::create_dir(&root)?;
+    std::fs::write(
+        root.join("gascan.toml"),
+        "version = 1\nnetwork = 'networked'\n",
+    )?;
+    let spec = SandboxSpec::from_root("known-network", &root, Manifest::load(&root)?)?;
+    let id = spec.id().clone();
+    let network = PolicyCompiler::managed_network_name(&id);
+    let runtime = FakeRuntime::default();
+    let service = SandboxService::new(
+        runtime.clone(),
+        Store::open(temp.path().join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    );
+    service.up(UpRequest::new(spec)).await?;
+
+    let report = service.reconcile().await?;
+
+    assert!(runtime.network_exists(&network).await);
+    assert!(!report.findings.iter().any(|finding| matches!(
+        finding,
+        ReconcileFinding::UnknownOwned(resource)
+            | ReconcileFinding::UnknownUnowned(resource)
+            | ReconcileFinding::OwnershipMismatch(resource)
+            if resource.kind() == ResourceKind::Network && resource.name() == network
+    )));
     Ok(())
 }
 

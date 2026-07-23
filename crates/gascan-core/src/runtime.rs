@@ -172,11 +172,20 @@ pub struct RuntimeResourceLimits {
     pub process_count: Option<u32>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeNetwork {
-    Networked,
+    Networked { name: String },
     Offline,
+}
+
+impl RuntimeNetwork {
+    pub fn managed_name(&self) -> Option<&str> {
+        match self {
+            Self::Networked { name } => Some(name),
+            Self::Offline => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -215,8 +224,8 @@ impl CreateRequest {
         &self.resources
     }
 
-    pub const fn network(&self) -> RuntimeNetwork {
-        self.network
+    pub const fn network(&self) -> &RuntimeNetwork {
+        &self.network
     }
 
     pub const fn user(&self) -> RuntimeUser {
@@ -388,6 +397,7 @@ impl Drop for ExecSession {
 pub enum ResourceKind {
     Container,
     Volume,
+    Network,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -555,12 +565,14 @@ impl CreateFailure {
                 name: volume.name.clone(),
             })
             .collect();
+        let allowed_network = allowed_network(request);
         let mut identities = BTreeSet::new();
         let created = created
             .into_iter()
             .filter(|resource| {
-                let allowed =
-                    resource.identity == container || allowed_volumes.contains(&resource.identity);
+                let allowed = resource.identity == container
+                    || allowed_volumes.contains(&resource.identity)
+                    || allowed_network.as_ref() == Some(&resource.identity);
                 allowed
                     && resource.ownership == ResourceOwnership::GasCanOwned
                     && resource.sandbox_id.as_ref() == Some(&request.id)
@@ -595,6 +607,16 @@ impl std::error::Error for CreateFailure {
     }
 }
 
+fn allowed_network(request: &CreateRequest) -> Option<ResourceIdentity> {
+    request
+        .network()
+        .managed_name()
+        .map(|name| ResourceIdentity {
+            kind: ResourceKind::Network,
+            name: name.to_owned(),
+        })
+}
+
 fn validate_created_resources(
     request: &CreateRequest,
     created: &[RuntimeResource],
@@ -606,10 +628,12 @@ fn validate_created_resources(
         .iter()
         .map(|volume| ResourceIdentity::new(ResourceKind::Volume, volume.name.clone()))
         .collect::<Result<BTreeSet<_>, _>>()?;
+    let allowed_network = allowed_network(request);
     let mut identities = BTreeSet::new();
     for resource in created {
-        let allowed =
-            resource.identity == container || allowed_volumes.contains(&resource.identity);
+        let allowed = resource.identity == container
+            || allowed_volumes.contains(&resource.identity)
+            || allowed_network.as_ref() == Some(&resource.identity);
         if !allowed
             || resource.ownership != ResourceOwnership::GasCanOwned
             || resource.sandbox_id.as_ref() != Some(&request.id)
@@ -624,6 +648,16 @@ fn validate_created_resources(
         return Err(RuntimeError::InvalidState {
             resource: request.id.to_string(),
             message: "create outcome does not contain the requested container".to_owned(),
+        });
+    }
+    if require_container
+        && allowed_network
+            .as_ref()
+            .is_some_and(|network| !identities.contains(network))
+    {
+        return Err(RuntimeError::InvalidState {
+            resource: request.id.to_string(),
+            message: "create outcome does not contain the requested managed network".to_owned(),
         });
     }
     Ok(())

@@ -66,18 +66,30 @@ fn create_uses_one_workspace_mount_offline_mode_and_owned_volumes() {
 }
 
 #[test]
-fn networked_create_publishes_only_ipv4_loopback() {
+fn networked_create_uses_the_managed_network_and_loopback_publish() {
     let (_root, request) = request(
         "web",
         "version = 1\nnetwork = 'networked'\n[ports]\nweb = 3000\n",
     );
-    let spec = AppleCommandBuilder::create(&request).expect("translate networked request");
+    let expected_network = request.network().managed_name().unwrap();
+    let spec = AppleCommandBuilder::create(&request).unwrap();
+
     assert!(
         spec.args
             .windows(2)
             .any(|pair| pair == ["--publish", "127.0.0.1:3000:3000"])
     );
-    assert!(!spec.args.iter().any(|arg| arg == "--network"));
+    assert!(
+        spec.args
+            .windows(2)
+            .any(|pair| pair[0] == "--network" && pair[1] == expected_network)
+    );
+    assert!(
+        !spec
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--network", "default"])
+    );
 }
 
 #[test]

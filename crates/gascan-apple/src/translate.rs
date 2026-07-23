@@ -72,7 +72,7 @@ impl CreateView {
             ports: request.ports().to_vec(),
             environment: request.environment().clone(),
             resources: *request.resources(),
-            network: request.network(),
+            network: request.network().clone(),
             user: request.user(),
             init: request.init(),
             ownership: request.ownership().clone(),
@@ -150,8 +150,13 @@ impl AppleCommandBuilder {
                 ),
             ]);
         }
-        if view.network == RuntimeNetwork::Offline {
-            args.extend(["--network".to_owned(), "none".to_owned()]);
+        match &view.network {
+            RuntimeNetwork::Networked { name } => {
+                args.extend(["--network".to_owned(), name.clone()]);
+            }
+            RuntimeNetwork::Offline => {
+                args.extend(["--network".to_owned(), "none".to_owned()]);
+            }
         }
         args.push(view.image);
 

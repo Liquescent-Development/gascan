@@ -83,6 +83,33 @@ impl<R: CommandRunner + Clone> AppleBackend<R> {
             let identity = ResourceIdentity::new(ResourceKind::Volume, record.id)?;
             resources.push(RuntimeResource::discovered(identity, sandbox_id, ownership));
         }
+        let output = self
+            .runner
+            .run(CommandSpec::new(
+                "container",
+                ["network", "list", "--format", "json"],
+            ))
+            .await?;
+        let records: Vec<NetworkRecord> = serde_json::from_slice(&output.stdout)
+            .map_err(|error| invalid_output("container network list", error.to_string()))?;
+        for record in records {
+            if record.id != record.configuration.name {
+                return Err(invalid_output(
+                    "container network list",
+                    "network id and name differ".into(),
+                ));
+            }
+            let sandbox_id = record
+                .configuration
+                .labels
+                .get(SANDBOX_ID_LABEL)
+                .map(|value| SandboxId::try_from(value.clone()))
+                .transpose()
+                .map_err(|error| invalid_output("container network list", error.to_string()))?;
+            let ownership = classify(sandbox_id.as_ref(), &record.configuration.labels);
+            let identity = ResourceIdentity::new(ResourceKind::Network, record.id)?;
+            resources.push(RuntimeResource::discovered(identity, sandbox_id, ownership));
+        }
         let mut observations = self
             .observations
             .lock()
@@ -140,7 +167,8 @@ impl<R: CommandRunner + Clone> AppleBackend<R> {
                     || request
                         .volumes()
                         .iter()
-                        .any(|volume| volume.name == resource.name()))
+                        .any(|volume| volume.name == resource.name())
+                    || request.network().managed_name() == Some(resource.name()))
         }) {
             if !created
                 .iter()
@@ -176,6 +204,7 @@ where
                     .volumes()
                     .iter()
                     .any(|volume| volume.name == resource.name())
+                || request.network().managed_name() == Some(resource.name())
         }) {
             return Err(CreateFailure::from_source(RuntimeError::Conflict {
                 resource: resource.name().to_owned(),
@@ -183,6 +212,49 @@ where
             }));
         }
         let mut created = Vec::new();
+        if let Some(name) = request.network().managed_name() {
+            let manager = format!("{MANAGED_BY_LABEL}={MANAGED_BY}");
+            let sandbox = format!("{SANDBOX_ID_LABEL}={}", request.id());
+            let spec = CommandSpec::new(
+                "container",
+                [
+                    "network", "create", "--label", &manager, "--label", &sandbox, name,
+                ],
+            );
+            if let Err(error) = self.runner.run(spec).await {
+                if matches!(&error, RuntimeError::CommandIo { .. }) {
+                    created = self.reconcile_created(&request, &before, created).await;
+                }
+                return Err(create_failure(&request, created, error));
+            }
+            let identity = match ResourceIdentity::new(ResourceKind::Network, name) {
+                Ok(identity) => identity,
+                Err(error) => return Err(create_failure(&request, created, error)),
+            };
+            let resource = match self.current_for(&identity).await {
+                Ok(Some(resource))
+                    if resource.ownership() == ResourceOwnership::GasCanOwned
+                        && resource.sandbox_id() == Some(request.id()) =>
+                {
+                    resource
+                }
+                Ok(_) => {
+                    created = self.reconcile_created(&request, &before, created).await;
+                    return Err(create_failure(
+                        &request,
+                        created,
+                        RuntimeError::OwnershipMismatch {
+                            resource: name.to_owned(),
+                        },
+                    ));
+                }
+                Err(error) => {
+                    created = self.reconcile_created(&request, &before, created).await;
+                    return Err(create_failure(&request, created, error));
+                }
+            };
+            created.push(resource);
+        }
         for volume in request.volumes() {
             let manager = format!("{MANAGED_BY_LABEL}={MANAGED_BY}");
             let sandbox = format!("{SANDBOX_ID_LABEL}={}", request.id());
@@ -310,7 +382,11 @@ where
     }
 
     async fn remove(&self, request: RemoveRequest) -> Result<(), RuntimeError> {
-        let ordered = [ResourceKind::Container, ResourceKind::Volume];
+        let ordered = [
+            ResourceKind::Container,
+            ResourceKind::Volume,
+            ResourceKind::Network,
+        ];
         for kind in ordered {
             for recorded in request
                 .resources()
@@ -337,6 +413,9 @@ where
                     }
                     ResourceKind::Volume => {
                         CommandSpec::new("container", ["volume", "delete", recorded.name()])
+                    }
+                    ResourceKind::Network => {
+                        CommandSpec::new("container", ["network", "delete", recorded.name()])
                     }
                 };
                 self.runner.run(spec).await?;
@@ -468,6 +547,18 @@ struct VolumeRecord {
 }
 #[derive(Deserialize)]
 struct VolumeConfiguration {
+    name: String,
+    #[serde(default)]
+    labels: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct NetworkRecord {
+    id: String,
+    configuration: NetworkConfiguration,
+}
+#[derive(Deserialize)]
+struct NetworkConfiguration {
     name: String,
     #[serde(default)]
     labels: BTreeMap<String, String>,

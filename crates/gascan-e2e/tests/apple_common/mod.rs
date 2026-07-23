@@ -43,6 +43,7 @@ pub struct AppleE2e {
     manifest_name: String,
     owner_token: String,
     error_diagnostics: bool,
+    network_mode: Option<String>,
     cleanup_manifest: Option<std::path::PathBuf>,
 }
 
@@ -64,7 +65,22 @@ impl AppleE2e {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(default_session_root);
         let error_diagnostics = std::env::var_os("GASCAN_GATE4_DIAGNOSTICS").is_some();
-        Self::new_scoped_with_diagnostics(name, session_root, manifest, error_diagnostics)
+        Self::new_scoped_with_diagnostics(name, session_root, manifest, error_diagnostics, None)
+    }
+
+    pub fn new_networked(name: &str) -> TestResult<Self> {
+        let manifest =
+            std::env::var_os("GASCAN_E2E_CLEANUP_MANIFEST").map(std::path::PathBuf::from);
+        let session_root = std::env::var_os("GASCAN_E2E_SESSION_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(default_session_root);
+        Self::new_scoped_with_diagnostics(
+            name,
+            session_root,
+            manifest,
+            std::env::var_os("GASCAN_GATE4_DIAGNOSTICS").is_some(),
+            Some("networked"),
+        )
     }
 
     fn new_scoped(
@@ -72,7 +88,7 @@ impl AppleE2e {
         session_root: std::path::PathBuf,
         manifest: Option<std::path::PathBuf>,
     ) -> TestResult<Self> {
-        Self::new_scoped_with_diagnostics(name, session_root, manifest, false)
+        Self::new_scoped_with_diagnostics(name, session_root, manifest, false, None)
     }
 
     fn new_scoped_with_diagnostics(
@@ -80,6 +96,7 @@ impl AppleE2e {
         session_root: std::path::PathBuf,
         manifest: Option<std::path::PathBuf>,
         error_diagnostics: bool,
+        network_mode: Option<&str>,
     ) -> TestResult<Self> {
         let gascan = std::env::var_os("CARGO_BIN_EXE_gascan-e2e-cli")
             .ok_or("workspace-built gascan binary is unavailable")?;
@@ -100,9 +117,16 @@ impl AppleE2e {
         let root_path = root.path().canonicalize()?;
         let runtime_root = runtime.path().canonicalize()?;
         let utf8_root = camino::Utf8Path::from_path(&root_path).ok_or("non-UTF-8 test root")?;
+        let network_line = match network_mode {
+            Some(mode) => format!("network = {}\n", serde_json::to_string(mode)?),
+            None => String::new(),
+        };
         std::fs::write(
             root_path.join("gascan.toml"),
-            format!("version = 1\nname = {}\n", serde_json::to_string(name)?),
+            format!(
+                "version = 1\nname = {}\n{network_line}",
+                serde_json::to_string(name)?
+            ),
         )?;
         let loaded_manifest = gascan_core::manifest::Manifest::load(utf8_root)?;
         let manifest_name = loaded_manifest
@@ -158,6 +182,7 @@ impl AppleE2e {
             manifest_name,
             owner_token,
             error_diagnostics,
+            network_mode: network_mode.map(str::to_owned),
             cleanup_manifest: manifest,
         })
     }
@@ -287,10 +312,14 @@ impl AppleE2e {
 
     pub fn install_noop_setup(&self) -> TestResult {
         std::fs::create_dir(self.root_path.join(".gascan"))?;
+        let network_line = match self.network_mode.as_deref() {
+            Some(mode) => format!("network = {}\n", serde_json::to_string(mode)?),
+            None => String::new(),
+        };
         std::fs::write(
             self.root_path.join("gascan.toml"),
             format!(
-                "version = 1\nname = {}\nsetup = './.gascan/setup.sh'\n",
+                "version = 1\nname = {}\n{network_line}setup = './.gascan/setup.sh'\n",
                 serde_json::to_string(&self.manifest_name)?
             ),
         )?;
@@ -302,7 +331,11 @@ impl AppleE2e {
     }
 
     pub fn stop_owned_container(&self) -> TestResult {
-        if resource_presence(self.id(), self.id())? != ResourcePresence::Owned {
+        let identity = gascan_core::runtime::ResourceIdentity::new(
+            gascan_core::runtime::ResourceKind::Container,
+            self.id(),
+        )?;
+        if resource_presence(&identity, self.id())? != ResourcePresence::Owned {
             return Err("refusing host-state mutation without exact owned container".into());
         }
         let child = Command::new("container")
@@ -452,6 +485,33 @@ impl AppleE2e {
         Ok(serde_json::from_slice(&output.stdout)?)
     }
 
+    pub fn assert_managed_network_attachment(&self) -> TestResult {
+        let inspect_output = Command::new("container")
+            .args(["inspect", self.id()])
+            .output()?;
+        if !inspect_output.status.success() {
+            return Err(format!(
+                "container inspect failed: {}",
+                String::from_utf8_lossy(&inspect_output.stderr)
+            )
+            .into());
+        }
+        let inspect: Value = serde_json::from_slice(&inspect_output.stdout)?;
+
+        let inventory_output = Command::new("container")
+            .args(["network", "list", "--format", "json"])
+            .output()?;
+        if !inventory_output.status.success() {
+            return Err(format!(
+                "container network inventory failed: {}",
+                String::from_utf8_lossy(&inventory_output.stderr)
+            )
+            .into());
+        }
+        let inventory: Value = serde_json::from_slice(&inventory_output.stdout)?;
+        validate_managed_network_attachment(&inspect, &inventory, self.id())
+    }
+
     pub fn kill_daemon(&self) -> TestResult {
         let pid = self.validated_daemon_pid()?.pid;
         let pid =
@@ -548,7 +608,7 @@ impl AppleE2e {
     pub fn assert_no_owned_resources(&self) -> TestResult {
         for identity in self.resource_identities()? {
             let name = identity.name();
-            match resource_presence(name, self.id())? {
+            match resource_presence(&identity, self.id())? {
                 ResourcePresence::Absent => {}
                 ResourcePresence::Owned => {
                     return Err(format!("owned Gate 4 resource remains: {name}").into());
@@ -566,36 +626,93 @@ impl AppleE2e {
     }
 
     fn cleanup(&self) -> TestResult {
-        for identity in self.resource_identities()? {
-            let name = identity.name();
-            if resource_presence(name, self.id())
-                .is_ok_and(|presence| presence == ResourcePresence::Owned)
-            {
-                if identity.kind() == gascan_core::runtime::ResourceKind::Container {
+        let identities = self.resource_identities()?;
+        for identity in &identities {
+            if resource_presence(identity, self.id())? == ResourcePresence::Collision {
+                return Err(format!(
+                    "refusing cleanup for exact resource {} with mismatched ownership",
+                    identity.name()
+                )
+                .into());
+            }
+        }
+        for identity in identities {
+            if identity.kind() == gascan_core::runtime::ResourceKind::Container {
+                mutate_if_freshly_owned(&identity, self.id(), resource_presence, |identity| {
                     let _ = Command::new("container")
-                        .args(["stop", "--time", "5", name])
+                        .args(["stop", "--time", "5", identity.name()])
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
                         .status();
-                }
-                let mut command = Command::new("container");
-                if identity.kind() == gascan_core::runtime::ResourceKind::Container {
-                    command.args(["delete", name]);
-                } else {
-                    command.args(["volume", "delete", name]);
-                }
-                let status = command
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()?;
-                if !status.success() {
-                    return Err(format!("cleanup failed for exact resource {name}").into());
-                }
+                    Ok(())
+                })?;
             }
+            mutate_if_freshly_owned(&identity, self.id(), resource_presence, |identity| {
+                let name = identity.name();
+                let status = match identity.kind() {
+                    gascan_core::runtime::ResourceKind::Container => Command::new("container")
+                        .args(["delete", name])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()?,
+                    gascan_core::runtime::ResourceKind::Volume => Command::new("container")
+                        .args(["volume", "delete", name])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()?,
+                    gascan_core::runtime::ResourceKind::Network => Command::new("container")
+                        .args(["network", "delete", name])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()?,
+                };
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(format!("cleanup failed for exact resource {name}").into())
+                }
+            })?;
         }
         let _keep_roots_alive = (&self.root, &self.runtime);
         self.assert_no_owned_resources()
     }
+}
+
+fn validate_managed_network_attachment(inspect: &Value, inventory: &Value, id: &str) -> TestResult {
+    let expected = format!("gascan-network-{id}");
+    let record = inspect
+        .as_array()
+        .and_then(|records| (records.len() == 1).then(|| &records[0]))
+        .ok_or("container inspect is absent or ambiguous")?;
+    let networks = record["configuration"]["networks"]
+        .as_array()
+        .ok_or("container inspect lacks network attachments")?;
+    if networks.len() != 1 || networks[0]["network"].as_str() != Some(expected.as_str()) {
+        return Err(format!("unexpected network attachments: {networks:?}").into());
+    }
+
+    let records = inventory
+        .as_array()
+        .ok_or("network inventory must be an array")?;
+    let exact = records
+        .iter()
+        .filter(|record| {
+            record["id"].as_str() == Some(expected.as_str())
+                && record["configuration"]["name"].as_str() == Some(expected.as_str())
+        })
+        .collect::<Vec<_>>();
+    let [network] = exact.as_slice() else {
+        return Err(
+            format!("expected exactly one managed network inventory record: {exact:?}").into(),
+        );
+    };
+    let labels = &network["configuration"]["labels"];
+    if labels["dev.gascan.managed-by"].as_str() != Some("gascan")
+        || labels["dev.gascan.sandbox-id"].as_str() != Some(id)
+    {
+        return Err(format!("managed network ownership labels mismatch: {labels:?}").into());
+    }
+    Ok(())
 }
 
 fn instance_matches(
@@ -1125,14 +1242,42 @@ enum ResourcePresence {
     Collision,
 }
 
-fn resource_presence(name: &str, id: &str) -> TestResult<ResourcePresence> {
-    let output = if name == id {
-        Command::new("container").args(["inspect", name]).output()?
-    } else {
-        Command::new("container")
+fn mutate_if_freshly_owned(
+    identity: &gascan_core::runtime::ResourceIdentity,
+    id: &str,
+    observe: impl FnOnce(&gascan_core::runtime::ResourceIdentity, &str) -> TestResult<ResourcePresence>,
+    mutate: impl FnOnce(&gascan_core::runtime::ResourceIdentity) -> TestResult,
+) -> TestResult {
+    match observe(identity, id)? {
+        ResourcePresence::Absent => Ok(()),
+        ResourcePresence::Owned => mutate(identity),
+        ResourcePresence::Collision => Err(format!(
+            "refusing cleanup for exact resource {} with mismatched ownership",
+            identity.name()
+        )
+        .into()),
+    }
+}
+
+fn resource_presence(
+    identity: &gascan_core::runtime::ResourceIdentity,
+    id: &str,
+) -> TestResult<ResourcePresence> {
+    let name = identity.name();
+    let output = match identity.kind() {
+        gascan_core::runtime::ResourceKind::Container => {
+            Command::new("container").args(["inspect", name]).output()?
+        }
+        gascan_core::runtime::ResourceKind::Volume => Command::new("container")
             .args(["volume", "inspect", name])
-            .output()?
+            .output()?,
+        gascan_core::runtime::ResourceKind::Network => Command::new("container")
+            .args(["network", "list", "--format", "json"])
+            .output()?,
     };
+    if identity.kind() == gascan_core::runtime::ResourceKind::Network {
+        return network_presence_from_output(&output, name, id);
+    }
     if !output.status.success() {
         return Ok(ResourcePresence::Absent);
     }
@@ -1151,6 +1296,55 @@ fn resource_presence(name: &str, id: &str) -> TestResult<ResourcePresence> {
     )
 }
 
+fn network_presence_from_output(
+    output: &Output,
+    name: &str,
+    id: &str,
+) -> TestResult<ResourcePresence> {
+    if !output.status.success() {
+        return Err(format!(
+            "unable to inventory networks: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let value: Value = serde_json::from_slice(&output.stdout)?;
+    let records = value
+        .as_array()
+        .ok_or("network inventory must be an array")?;
+    let mut exact = Vec::new();
+    for record in records {
+        let record_id = record["id"]
+            .as_str()
+            .ok_or("network inventory id must be a string")?;
+        let record_name = record["configuration"]["name"]
+            .as_str()
+            .ok_or("network inventory configuration name must be a string")?;
+        if record_id != record_name {
+            return Err(format!(
+                "network inventory id/name mismatch: {record_id} != {record_name}"
+            )
+            .into());
+        }
+        if record_id == name {
+            exact.push(record);
+        }
+    }
+    let record = match exact.as_slice() {
+        [] => return Ok(ResourcePresence::Absent),
+        [record] => *record,
+        _ => return Err(format!("ambiguous exact network inventory for {name}").into()),
+    };
+    let labels = &record["configuration"]["labels"];
+    Ok(
+        if labels["dev.gascan.managed-by"] == "gascan" && labels["dev.gascan.sandbox-id"] == id {
+            ResourcePresence::Owned
+        } else {
+            ResourcePresence::Collision
+        },
+    )
+}
+
 #[cfg(test)]
 fn cleanup_resource_identities(
     cleanup: &Value,
@@ -1158,6 +1352,21 @@ fn cleanup_resource_identities(
     let resources = cleanup["resources"]
         .as_array()
         .ok_or("cleanup resources must be an array")?;
+    if resources.len() != 5 {
+        return Err("cleanup resources must contain exactly five entries".into());
+    }
+    let sandbox_id = cleanup["sandbox_id"]
+        .as_str()
+        .ok_or("cleanup sandbox id must be a string")?;
+    let sandbox_id = SandboxId::try_from(sandbox_id.to_owned())?;
+    let expected = gascan_core::policy::PolicyCompiler::expected_resource_identities(&sandbox_id)?;
+    if !resources
+        .iter()
+        .zip(&expected)
+        .all(|(value, identity)| value.as_str().is_some_and(|name| name == identity.name()))
+    {
+        return Err("cleanup resources must match the exact expected order".into());
+    }
     resources
         .iter()
         .enumerate()
@@ -1165,10 +1374,11 @@ fn cleanup_resource_identities(
             let name = value
                 .as_str()
                 .ok_or("cleanup resource name must be a string")?;
-            let kind = if index == 0 {
-                gascan_core::runtime::ResourceKind::Container
-            } else {
-                gascan_core::runtime::ResourceKind::Volume
+            let kind = match index {
+                0 => gascan_core::runtime::ResourceKind::Container,
+                1..=3 => gascan_core::runtime::ResourceKind::Volume,
+                4 => gascan_core::runtime::ResourceKind::Network,
+                _ => return Err("cleanup resource order is invalid".into()),
             };
             Ok(gascan_core::runtime::ResourceIdentity::new(kind, name)?)
         })
@@ -1371,10 +1581,13 @@ mod tests {
             );
             assert_eq!(expected[0].name(), spec.id().as_str());
             assert!(
-                expected
+                expected[1..4]
                     .iter()
-                    .skip(1)
                     .all(|identity| identity.kind() == gascan_core::runtime::ResourceKind::Volume)
+            );
+            assert_eq!(
+                expected[4].kind(),
+                gascan_core::runtime::ResourceKind::Network
             );
             assert_eq!(request.id(), spec.id());
             assert_eq!(
@@ -1392,6 +1605,7 @@ mod tests {
                 expected
                     .iter()
                     .skip(1)
+                    .take(3)
                     .map(|identity| identity.name())
                     .collect::<Vec<_>>()
             );
@@ -1416,6 +1630,127 @@ mod tests {
                     .all(|volume| &volume.ownership == request.ownership())
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_resource_identities_rejects_wrong_order() -> TestResult {
+        let id = SandboxId::test("cleanup-order");
+        let expected = gascan_core::policy::PolicyCompiler::expected_resource_identities(&id)?;
+        let mut resources = expected
+            .iter()
+            .map(gascan_core::runtime::ResourceIdentity::name)
+            .collect::<Vec<_>>();
+        resources.swap(1, 4);
+        let cleanup = serde_json::json!({
+            "sandbox_id": id.as_str(),
+            "resources": resources,
+        });
+
+        assert!(cleanup_resource_identities(&cleanup).is_err());
+        Ok(())
+    }
+
+    fn network_output(status: i32, stdout: Value) -> TestResult<Output> {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        Ok(Output {
+            status: ExitStatus::from_raw(status),
+            stdout: serde_json::to_vec(&stdout)?,
+            stderr: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn failed_network_list_cannot_prove_absence() -> TestResult {
+        let output = network_output(1 << 8, serde_json::json!([]))?;
+
+        assert!(
+            network_presence_from_output(
+                &output,
+                "gascan-network-cleanup-123456789abc",
+                "cleanup-123456789abc",
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_network_id_with_mismatched_name_fails_closed() -> TestResult {
+        let name = "gascan-network-cleanup-123456789abc";
+        let output = network_output(
+            0,
+            serde_json::json!([{
+                "id": name,
+                "configuration": {
+                    "name": "some-other-network",
+                    "labels": {}
+                }
+            }]),
+        )?;
+
+        assert!(network_presence_from_output(&output, name, "cleanup-123456789abc").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn exact_network_name_with_mismatched_id_fails_closed() -> TestResult {
+        let name = "gascan-network-cleanup-123456789abc";
+        let output = network_output(
+            0,
+            serde_json::json!([{
+                "id": "some-other-network",
+                "configuration": {
+                    "name": name,
+                    "labels": {}
+                }
+            }]),
+        )?;
+
+        assert!(network_presence_from_output(&output, name, "cleanup-123456789abc").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_revalidates_each_resource_immediately_before_mutation() -> TestResult {
+        let id = SandboxId::test("fresh-cleanup");
+        let identities = gascan_core::policy::PolicyCompiler::expected_resource_identities(&id)?;
+        let volume = identities[3].clone();
+        let network = identities[4].clone();
+        let network_foreign = std::cell::Cell::new(false);
+        let deleted = std::cell::RefCell::new(Vec::new());
+
+        mutate_if_freshly_owned(
+            &volume,
+            id.as_str(),
+            |_, _| Ok(ResourcePresence::Owned),
+            |identity| {
+                deleted.borrow_mut().push(identity.name().to_owned());
+                network_foreign.set(true);
+                Ok(())
+            },
+        )?;
+        let Err(error) = mutate_if_freshly_owned(
+            &network,
+            id.as_str(),
+            |_, _| {
+                Ok(if network_foreign.get() {
+                    ResourcePresence::Collision
+                } else {
+                    ResourcePresence::Owned
+                })
+            },
+            |identity| {
+                deleted.borrow_mut().push(identity.name().to_owned());
+                Ok(())
+            },
+        ) else {
+            return Err("freshly foreign network was unexpectedly mutated".into());
+        };
+
+        assert!(error.to_string().contains("mismatched ownership"));
+        assert_eq!(deleted.into_inner(), vec![volume.name()]);
         Ok(())
     }
 
@@ -1639,6 +1974,7 @@ mod tests {
             session.path().to_path_buf(),
             None,
             true,
+            None,
         )?;
         let command = env.command(["status"]);
         assert_eq!(
@@ -1649,6 +1985,131 @@ mod tests {
             Some(OsStr::new("1"))
         );
         Ok(())
+    }
+
+    #[test]
+    fn scoped_constructor_writes_requested_network_mode() -> TestResult {
+        let session = tempfile::tempdir()?;
+        let env = AppleE2e::new_scoped_with_diagnostics(
+            "networked-manifest",
+            session.path().to_path_buf(),
+            None,
+            false,
+            Some("networked"),
+        )?;
+
+        let manifest = std::fs::read_to_string(env.root_path.join("gascan.toml"))?;
+        assert_eq!(
+            manifest,
+            "version = 1\nname = \"networked-manifest\"\nnetwork = \"networked\"\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn noop_setup_preserves_requested_network_mode() -> TestResult {
+        let session = tempfile::tempdir()?;
+        let env = AppleE2e::new_scoped_with_diagnostics(
+            "networked-setup",
+            session.path().to_path_buf(),
+            None,
+            false,
+            Some("networked"),
+        )?;
+
+        env.install_noop_setup()?;
+
+        let manifest = std::fs::read_to_string(env.root_path.join("gascan.toml"))?;
+        assert!(manifest.contains("network = \"networked\"\n"));
+        assert!(manifest.contains("setup = './.gascan/setup.sh'\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn managed_network_attachment_accepts_exact_owned_network() -> TestResult {
+        let id = "network-proof-000000000000";
+        let expected = format!("gascan-network-{id}");
+        let inspect = serde_json::json!([{
+            "configuration": {
+                "networks": [{"network": expected}]
+            }
+        }]);
+        let inventory = serde_json::json!([{
+            "id": expected,
+            "configuration": {
+                "name": expected,
+                "labels": {
+                    "dev.gascan.managed-by": "gascan",
+                    "dev.gascan.sandbox-id": id
+                }
+            }
+        }]);
+
+        validate_managed_network_attachment(&inspect, &inventory, id)
+    }
+
+    #[test]
+    fn managed_network_attachment_rejects_default_or_extra_networks() {
+        let id = "network-proof-000000000000";
+        let expected = format!("gascan-network-{id}");
+        let inventory = serde_json::json!([{
+            "id": expected,
+            "configuration": {
+                "name": expected,
+                "labels": {
+                    "dev.gascan.managed-by": "gascan",
+                    "dev.gascan.sandbox-id": id
+                }
+            }
+        }]);
+        for networks in [
+            serde_json::json!([{"network": "default"}]),
+            serde_json::json!([{"network": expected}, {"network": "default"}]),
+        ] {
+            let inspect = serde_json::json!([{"configuration": {"networks": networks}}]);
+            assert!(validate_managed_network_attachment(&inspect, &inventory, id).is_err());
+        }
+    }
+
+    #[test]
+    fn managed_network_attachment_rejects_ambiguous_or_foreign_inventory() {
+        let id = "network-proof-000000000000";
+        let expected = format!("gascan-network-{id}");
+        let inspect = serde_json::json!([{
+            "configuration": {
+                "networks": [{"network": expected}]
+            }
+        }]);
+        let exact = serde_json::json!({
+            "id": expected,
+            "configuration": {
+                "name": expected,
+                "labels": {
+                    "dev.gascan.managed-by": "gascan",
+                    "dev.gascan.sandbox-id": id
+                }
+            }
+        });
+        let foreign = serde_json::json!([{
+            "id": expected,
+            "configuration": {
+                "name": expected,
+                "labels": {
+                    "dev.gascan.managed-by": "other",
+                    "dev.gascan.sandbox-id": id
+                }
+            }
+        }]);
+
+        assert!(validate_managed_network_attachment(&inspect, &foreign, id).is_err());
+        assert!(
+            validate_managed_network_attachment(
+                &inspect,
+                &serde_json::json!([exact.clone(), exact]),
+                id,
+            )
+            .is_err()
+        );
     }
 
     #[test]

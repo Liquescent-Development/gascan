@@ -133,7 +133,10 @@ fn canonical_request_has_one_root_mount_owned_volumes_loopback_ports_and_init() 
         Utf8PathBuf::from(WORKSPACE_TARGET)
     );
     assert!(request.bind_mounts()[0].writable);
-    assert_eq!(request.network(), RuntimeNetwork::Networked);
+    assert!(matches!(
+        request.network(),
+        RuntimeNetwork::Networked { .. }
+    ));
     assert_eq!(request.user(), RuntimeUser::Root);
     assert!(request.init());
     assert_eq!(request.ownership().managed_by, "gascan");
@@ -198,7 +201,7 @@ fn expected_resource_identities_are_derived_from_the_sealed_sandbox_id() {
 
     let identities = PolicyCompiler::expected_resource_identities(&id).unwrap();
 
-    assert_eq!(identities.len(), 4);
+    assert_eq!(identities.len(), 5);
     assert_eq!(identities[0].kind(), ResourceKind::Container);
     assert_eq!(identities[0].name(), id.as_str());
     assert_eq!(
@@ -211,11 +214,40 @@ fn expected_resource_identities_are_derived_from_the_sealed_sandbox_id() {
             (ResourceKind::Volume, format!("gascan-mise-{id}")),
             (ResourceKind::Volume, format!("gascan-cache-{id}")),
             (ResourceKind::Volume, format!("gascan-config-{id}")),
+            (ResourceKind::Network, format!("gascan-network-{id}")),
         ]
         .iter()
         .map(|(kind, name)| (*kind, name.as_str()))
         .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn expected_resource_identities_include_the_managed_network() {
+    let id = gascan_core::sandbox::SandboxId::test("expected-network");
+    let identities = PolicyCompiler::expected_resource_identities(&id).unwrap();
+    let network = identities
+        .iter()
+        .find(|identity| identity.kind() == ResourceKind::Network)
+        .expect("managed network identity");
+
+    assert_eq!(network.name(), PolicyCompiler::managed_network_name(&id));
+    assert_eq!(network.name(), format!("gascan-network-{id}"));
+}
+
+#[test]
+fn networked_policy_seals_the_exact_managed_network_name() {
+    let (_temp, spec) = spec("version = 1\nnetwork = 'networked'\n");
+    let request = PolicyCompiler::compile(spec, &capabilities()).unwrap();
+    let expected = PolicyCompiler::managed_network_name(request.id());
+    assert_eq!(request.network().managed_name(), Some(expected.as_str()));
+}
+
+#[test]
+fn offline_policy_has_no_managed_network_name() {
+    let (_temp, spec) = spec("version = 1\nnetwork = 'offline'\n");
+    let request = PolicyCompiler::compile(spec, &capabilities()).unwrap();
+    assert_eq!(request.network().managed_name(), None);
 }
 
 #[test]

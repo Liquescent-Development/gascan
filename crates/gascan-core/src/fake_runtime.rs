@@ -259,6 +259,20 @@ impl FakeRuntime {
         Ok(())
     }
 
+    pub async fn seed_network(
+        &self,
+        name: &str,
+        sandbox_id: Option<SandboxId>,
+        ownership: ResourceOwnership,
+    ) -> Result<(), RuntimeError> {
+        let identity = ResourceIdentity::new(ResourceKind::Network, name)?;
+        self.inner.lock().await.resources.insert(
+            identity.clone(),
+            RuntimeResource::discovered(identity, sandbox_id, ownership),
+        );
+        Ok(())
+    }
+
     pub async fn volume_exists(&self, name: &str) -> bool {
         self.inner
             .lock()
@@ -266,6 +280,15 @@ impl FakeRuntime {
             .resources
             .values()
             .any(|resource| resource.kind() == ResourceKind::Volume && resource.name() == name)
+    }
+
+    pub async fn network_exists(&self, name: &str) -> bool {
+        self.inner
+            .lock()
+            .await
+            .resources
+            .values()
+            .any(|resource| resource.kind() == ResourceKind::Network && resource.name() == name)
     }
 
     pub async fn created_count(&self) -> usize {
@@ -496,6 +519,30 @@ impl RuntimeBackend for FakeRuntime {
             }));
         }
         let mut created = Vec::new();
+        if let Some(name) = request.network().managed_name() {
+            let identity = match ResourceIdentity::new(ResourceKind::Network, name) {
+                Ok(identity) => identity,
+                Err(error) => return Err(create_failure(&request, created, error)),
+            };
+            if state.resources.contains_key(&identity) {
+                return Err(create_failure(
+                    &request,
+                    created,
+                    RuntimeError::Conflict {
+                        resource: name.to_owned(),
+                        message: "network already exists".to_owned(),
+                    },
+                ));
+            }
+            let resource = RuntimeResource::discovered(
+                identity.clone(),
+                Some(request.id().clone()),
+                ResourceOwnership::GasCanOwned,
+            );
+            state.resources.insert(identity, resource.clone());
+            created.push(resource);
+            fail_after_create_mutation(&mut state, &request, &created)?;
+        }
         for volume in request.volumes() {
             let identity = ResourceIdentity::new(ResourceKind::Volume, volume.name.clone())
                 .map_err(CreateFailure::from_source)?;
@@ -603,7 +650,13 @@ impl RuntimeBackend for FakeRuntime {
                 });
             }
         }
-        for expected in request.resources() {
+        let mut removal = request.resources().to_vec();
+        removal.sort_by_key(|resource| match resource.kind() {
+            ResourceKind::Container => 0,
+            ResourceKind::Volume => 1,
+            ResourceKind::Network => 2,
+        });
+        for expected in &removal {
             state.resources.remove(expected.identity());
             if expected.kind() == ResourceKind::Container {
                 if let Some(id) = expected.sandbox_id() {
@@ -611,7 +664,11 @@ impl RuntimeBackend for FakeRuntime {
                 }
             }
         }
-        state.outcomes.push(RuntimeOutcome::Removed(request));
+        state
+            .outcomes
+            .push(RuntimeOutcome::Removed(RemoveRequest::from_resources(
+                removal,
+            )?));
         persist_state(&state, self.persistence.as_deref())?;
         Ok(())
     }

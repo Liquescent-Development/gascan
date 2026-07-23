@@ -4,6 +4,16 @@ fn script() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("apple-e2e-cleanup.sh")
 }
 
+fn managed_resources(id: &str) -> serde_json::Value {
+    serde_json::json!([
+        id,
+        format!("gascan-mise-{id}"),
+        format!("gascan-cache-{id}"),
+        format!("gascan-config-{id}"),
+        format!("gascan-network-{id}"),
+    ])
+}
+
 fn fake_container(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
     let bin = temp.path().join("container");
     let calls = temp.path().join("calls");
@@ -30,11 +40,40 @@ case "$*" in
     done
     printf '[%s]\n' "$records"
     ;;
+  "network list --format json")
+    if test -f "$CALLS.network-deleted"; then
+      printf '[]\n'
+    else
+      case ${NETWORK_MODE:-owned} in
+        owned)
+          printf '[{"id":"gascan-network-%s","configuration":{"name":"gascan-network-%s","labels":{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":"%s"}}}]\n' "$ID" "$ID" "$LABEL_ID"
+          ;;
+        foreign)
+          printf '[{"id":"gascan-network-%s","configuration":{"name":"gascan-network-%s","labels":{}}}]\n' "$ID" "$ID"
+          ;;
+        foreign_after_volume)
+          if test -f "$CALLS.volume-deleted" &&
+             test "$(wc -l <"$CALLS.volume-deleted" | tr -d ' ')" -eq 3; then
+            printf '[{"id":"gascan-network-%s","configuration":{"name":"gascan-network-%s","labels":{}}}]\n' "$ID" "$ID"
+          else
+            printf '[{"id":"gascan-network-%s","configuration":{"name":"gascan-network-%s","labels":{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":"%s"}}}]\n' "$ID" "$ID" "$LABEL_ID"
+          fi
+          ;;
+        ambiguous)
+          printf '[{"id":"gascan-network-%s","configuration":{"name":"gascan-network-%s","labels":{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":"%s"}}},{"id":"gascan-network-%s","configuration":{"name":"gascan-network-%s","labels":{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":"%s"}}}]\n' "$ID" "$ID" "$LABEL_ID" "$ID" "$ID" "$LABEL_ID"
+          ;;
+        malformed) printf '{"not":"an-array"}\n' ;;
+      esac
+    fi
+    ;;
   "delete $ID")
     : >"$CALLS.container-deleted"
     ;;
   "volume delete "*)
     printf '%s\n' "$3" >>"$CALLS.volume-deleted"
+    ;;
+  "network delete gascan-network-$ID")
+    : >"$CALLS.network-deleted"
     ;;
 esac
 "#,
@@ -86,15 +125,7 @@ fn manifest(temp: &tempfile::TempDir, resources: serde_json::Value) -> PathBuf {
 
 fn manifest_with_dns(temp: &tempfile::TempDir, domain: &str) -> PathBuf {
     let id = "gate4-test-123456789abc";
-    let path = manifest(
-        temp,
-        serde_json::json!([
-            id,
-            format!("gascan-mise-{id}"),
-            format!("gascan-cache-{id}"),
-            format!("gascan-config-{id}")
-        ]),
-    );
+    let path = manifest(temp, managed_resources(id));
     let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     record["dns_domain"] = serde_json::Value::String(domain.to_owned());
     fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
@@ -148,7 +179,7 @@ case "$*" in
   "system dns list --format json")
     if test -f "$CALLS.dns-deleted"; then printf '[]\n'; else printf '%s\n' '{inventory}'; fi
     ;;
-  "list --all --format json"|"volume list --format json") printf '[]\n' ;;
+  "list --all --format json"|"volume list --format json"|"network list --format json") printf '[]\n' ;;
   *) exit 42 ;;
 esac
 "#
@@ -282,6 +313,15 @@ fn dns_delete_failure_is_surfaced_and_manifest_retained() {
 }
 
 fn run(temp: &tempfile::TempDir, path: &PathBuf, calls: &PathBuf) -> std::process::Output {
+    run_with_network_mode(temp, path, calls, "owned")
+}
+
+fn run_with_network_mode(
+    temp: &tempfile::TempDir,
+    path: &PathBuf,
+    calls: &PathBuf,
+    network_mode: &str,
+) -> std::process::Output {
     let inherited = std::env::var("PATH").unwrap_or_default();
     Command::new(script())
         .arg(path)
@@ -291,8 +331,17 @@ fn run(temp: &tempfile::TempDir, path: &PathBuf, calls: &PathBuf) -> std::proces
         .env("CALLS", calls)
         .env("ID", "gate4-test-123456789abc")
         .env("LABEL_ID", "gate4-test-123456789abc")
+        .env("NETWORK_MODE", network_mode)
         .output()
         .unwrap()
+}
+
+fn assert_no_resource_deletes(calls: &PathBuf) {
+    assert!(!fs::read_to_string(calls).unwrap().lines().any(|call| {
+        call.starts_with("delete ")
+            || call.starts_with("volume delete ")
+            || call.starts_with("network delete ")
+    }));
 }
 
 fn install_container_script(temp: &tempfile::TempDir, body: &str) -> PathBuf {
@@ -307,7 +356,7 @@ fn install_absent_container(temp: &tempfile::TempDir) -> PathBuf {
         temp,
         r#"#!/bin/sh
 case "$*" in
-  "list --all --format json"|"volume list --format json") printf '[]\n' ;;
+  "list --all --format json"|"volume list --format json"|"network list --format json") printf '[]\n' ;;
   *) exit 42 ;;
 esac
 "#,
@@ -318,15 +367,7 @@ esac
 fn absent_recorded_children_are_an_idempotent_success() {
     let temp = tempfile::tempdir().unwrap();
     let id = "gate4-test-123456789abc";
-    let path = manifest(
-        &temp,
-        serde_json::json!([
-            id,
-            format!("gascan-mise-{id}"),
-            format!("gascan-cache-{id}"),
-            format!("gascan-config-{id}")
-        ]),
-    );
+    let path = manifest(&temp, managed_resources(id));
     let session = temp.path().join("session-test");
     fs::remove_dir_all(&session).unwrap();
     install_absent_container(&temp);
@@ -347,15 +388,7 @@ fn absent_recorded_children_are_an_idempotent_success() {
 fn legacy_owned_outside_sentinel_is_removed_before_session_rmdir() {
     let temp = tempfile::tempdir().unwrap();
     let id = "gate4-test-123456789abc";
-    let path = manifest(
-        &temp,
-        serde_json::json!([
-            id,
-            format!("gascan-mise-{id}"),
-            format!("gascan-cache-{id}"),
-            format!("gascan-config-{id}")
-        ]),
-    );
+    let path = manifest(&temp, managed_resources(id));
     let session = temp.path().join("session-test");
     let sentinel = session.join("synthetic-outside-00112233445566778899aabbccddeeff");
     fs::write(&sentinel, "synthetic-outside-only").unwrap();
@@ -378,15 +411,7 @@ fn legacy_owned_outside_sentinel_is_removed_before_session_rmdir() {
 fn recorded_private_runtime_sentinel_is_identity_checked_and_removed() {
     let temp = tempfile::tempdir().unwrap();
     let id = "gate4-test-123456789abc";
-    let path = manifest(
-        &temp,
-        serde_json::json!([
-            id,
-            format!("gascan-mise-{id}"),
-            format!("gascan-cache-{id}"),
-            format!("gascan-config-{id}")
-        ]),
-    );
+    let path = manifest(&temp, managed_resources(id));
     let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     let runtime = PathBuf::from(record["runtime_root"].as_str().unwrap());
     let sentinel = runtime.join("synthetic-outside-00112233445566778899aabbccddeeff");
@@ -414,15 +439,7 @@ fn recorded_private_runtime_sentinel_is_identity_checked_and_removed() {
 fn recorded_outside_sentinel_path_escape_is_refused_before_inventory() {
     let temp = tempfile::tempdir().unwrap();
     let id = "gate4-test-123456789abc";
-    let path = manifest(
-        &temp,
-        serde_json::json!([
-            id,
-            format!("gascan-mise-{id}"),
-            format!("gascan-cache-{id}"),
-            format!("gascan-config-{id}")
-        ]),
-    );
+    let path = manifest(&temp, managed_resources(id));
     let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     let escaped = temp
         .path()
@@ -447,15 +464,7 @@ fn recorded_outside_sentinel_path_escape_is_refused_before_inventory() {
 fn ambiguous_legacy_outside_sentinels_are_refused_without_removal() {
     let temp = tempfile::tempdir().unwrap();
     let id = "gate4-test-123456789abc";
-    let path = manifest(
-        &temp,
-        serde_json::json!([
-            id,
-            format!("gascan-mise-{id}"),
-            format!("gascan-cache-{id}"),
-            format!("gascan-config-{id}")
-        ]),
-    );
+    let path = manifest(&temp, managed_resources(id));
     let session = temp.path().join("session-test");
     for token in [
         "00112233445566778899aabbccddeeff",
@@ -493,15 +502,7 @@ fn ambiguous_legacy_outside_sentinels_are_refused_without_removal() {
 fn successful_json_inventories_prove_real_absence() {
     let temp = tempfile::tempdir().unwrap();
     let id = "gate4-test-123456789abc";
-    let path = manifest(
-        &temp,
-        serde_json::json!([
-            id,
-            format!("gascan-mise-{id}"),
-            format!("gascan-cache-{id}"),
-            format!("gascan-config-{id}")
-        ]),
-    );
+    let path = manifest(&temp, managed_resources(id));
     let session = temp.path().join("session-test");
     fs::remove_dir_all(&session).unwrap();
     install_container_script(
@@ -510,7 +511,7 @@ fn successful_json_inventories_prove_real_absence() {
 set -eu
 printf '%s\n' "$*" >>"$CALLS"
 case "$*" in
-  "list --all --format json"|"volume list --format json") printf '[]\n' ;;
+  "list --all --format json"|"volume list --format json"|"network list --format json") printf '[]\n' ;;
   *) exit 42 ;;
 esac
 "#,
@@ -528,21 +529,113 @@ esac
     let calls = fs::read_to_string(calls).unwrap();
     assert!(calls.contains("list --all --format json"));
     assert!(calls.contains("volume list --format json"));
+    assert!(calls.contains("network list --format json"));
+}
+
+#[test]
+fn exact_owned_network_is_deleted_after_all_three_volumes_and_verified_absent() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_bin, calls) = fake_container(&temp);
+    let id = "gate4-test-123456789abc";
+    let path = manifest(&temp, managed_resources(id));
+
+    let output = run(&temp, &path, &calls);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!path.exists());
+    let calls = fs::read_to_string(calls).unwrap();
+    let network_delete = calls
+        .find(&format!("network delete gascan-network-{id}"))
+        .unwrap();
+    for name in ["mise", "cache", "config"] {
+        let volume_delete = calls
+            .find(&format!("volume delete gascan-{name}-{id}"))
+            .unwrap();
+        assert!(volume_delete < network_delete);
+    }
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|call| *call == "network list --format json")
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn foreign_same_name_network_is_retained_with_the_manifest() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_bin, calls) = fake_container(&temp);
+    let id = "gate4-test-123456789abc";
+    let path = manifest(&temp, managed_resources(id));
+
+    let output = run_with_network_mode(&temp, &path, &calls, "foreign");
+
+    assert!(!output.status.success());
+    assert!(path.exists());
+    assert!(!temp.path().join("calls.network-deleted").exists());
+    assert_no_resource_deletes(&calls);
+}
+
+#[test]
+fn network_changed_to_foreign_after_volume_deletion_is_retained_with_manifest() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_bin, calls) = fake_container(&temp);
+    let id = "gate4-test-123456789abc";
+    let path = manifest(&temp, managed_resources(id));
+
+    let output = run_with_network_mode(&temp, &path, &calls, "foreign_after_volume");
+
+    assert!(!output.status.success());
+    assert!(path.exists());
+    assert!(!temp.path().join("calls.network-deleted").exists());
+    let calls = fs::read_to_string(calls).unwrap();
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|call| *call == "network list --format json")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn duplicate_exact_network_records_abort_cleanup() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_bin, calls) = fake_container(&temp);
+    let id = "gate4-test-123456789abc";
+    let path = manifest(&temp, managed_resources(id));
+
+    let output = run_with_network_mode(&temp, &path, &calls, "ambiguous");
+
+    assert!(!output.status.success());
+    assert!(path.exists());
+    assert_no_resource_deletes(&calls);
+}
+
+#[test]
+fn malformed_network_inventory_aborts_cleanup() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_bin, calls) = fake_container(&temp);
+    let id = "gate4-test-123456789abc";
+    let path = manifest(&temp, managed_resources(id));
+
+    let output = run_with_network_mode(&temp, &path, &calls, "malformed");
+
+    assert!(!output.status.success());
+    assert!(path.exists());
+    assert_no_resource_deletes(&calls);
 }
 
 #[test]
 fn inventory_runtime_failure_retains_manifest_without_deletes() {
     let temp = tempfile::tempdir().unwrap();
     let id = "gate4-test-123456789abc";
-    let path = manifest(
-        &temp,
-        serde_json::json!([
-            id,
-            format!("gascan-mise-{id}"),
-            format!("gascan-cache-{id}"),
-            format!("gascan-config-{id}")
-        ]),
-    );
+    let path = manifest(&temp, managed_resources(id));
     install_container_script(
         &temp,
         "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" >>\"$CALLS\"\nprintf 'runtime unavailable\\n' >&2\nexit 42\n",
@@ -563,15 +656,7 @@ fn inventory_runtime_failure_retains_manifest_without_deletes() {
 fn verification_inventory_failure_retains_manifest() {
     let temp = tempfile::tempdir().unwrap();
     let id = "gate4-test-123456789abc";
-    let path = manifest(
-        &temp,
-        serde_json::json!([
-            id,
-            format!("gascan-mise-{id}"),
-            format!("gascan-cache-{id}"),
-            format!("gascan-config-{id}")
-        ]),
-    );
+    let path = manifest(&temp, managed_resources(id));
     install_container_script(
         &temp,
         r#"#!/bin/sh
@@ -585,7 +670,7 @@ case "$*" in
     test "$count" -eq 1 || exit 42
     printf '[]\n'
     ;;
-  "volume list --format json") printf '[]\n' ;;
+  "volume list --format json"|"network list --format json") printf '[]\n' ;;
   *) exit 42 ;;
 esac
 "#,
@@ -611,15 +696,7 @@ esac
 fn top_level_only_container_identity_is_rejected_without_deletion() {
     let temp = tempfile::tempdir().unwrap();
     let id = "gate4-test-123456789abc";
-    let path = manifest(
-        &temp,
-        serde_json::json!([
-            id,
-            format!("gascan-mise-{id}"),
-            format!("gascan-cache-{id}"),
-            format!("gascan-config-{id}")
-        ]),
-    );
+    let path = manifest(&temp, managed_resources(id));
     install_container_script(
         &temp,
         r#"#!/bin/sh
@@ -629,7 +706,7 @@ case "$*" in
   "list --all --format json")
     printf '[{"id":"%s","configuration":{"labels":{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":"%s"}}}]\n' "$ID" "$ID"
     ;;
-  "volume list --format json") printf '[]\n' ;;
+  "volume list --format json"|"network list --format json") printf '[]\n' ;;
   *) exit 42 ;;
 esac
 "#,
@@ -649,15 +726,7 @@ fn mismatched_ambiguous_volume_identity_is_rejected_without_deletion() {
     let temp = tempfile::tempdir().unwrap();
     let id = "gate4-test-123456789abc";
     let volume = format!("gascan-mise-{id}");
-    let path = manifest(
-        &temp,
-        serde_json::json!([
-            id,
-            volume,
-            format!("gascan-cache-{id}"),
-            format!("gascan-config-{id}")
-        ]),
-    );
+    let path = manifest(&temp, managed_resources(id));
     install_container_script(
         &temp,
         r#"#!/bin/sh
@@ -695,22 +764,14 @@ esac
 fn unexpected_session_entry_is_residue_and_retains_manifest() {
     let temp = tempfile::tempdir().unwrap();
     let id = "gate4-test-123456789abc";
-    let path = manifest(
-        &temp,
-        serde_json::json!([
-            id,
-            format!("gascan-mise-{id}"),
-            format!("gascan-cache-{id}"),
-            format!("gascan-config-{id}")
-        ]),
-    );
+    let path = manifest(&temp, managed_resources(id));
     let session = temp.path().join("session-test");
     fs::write(session.join("unexpected"), "retain me").unwrap();
     install_container_script(
         &temp,
         r#"#!/bin/sh
 case "$*" in
-  "list --all --format json"|"volume list --format json") printf '[]\n' ;;
+  "list --all --format json"|"volume list --format json"|"network list --format json") printf '[]\n' ;;
   *) exit 42 ;;
 esac
 "#,
@@ -729,15 +790,7 @@ fn absent_child_spelled_with_traversal_is_refused() {
     let temp = tempfile::tempdir().unwrap();
     let (_bin, calls) = fake_container(&temp);
     let id = "gate4-test-123456789abc";
-    let path = manifest(
-        &temp,
-        serde_json::json!([
-            id,
-            format!("gascan-mise-{id}"),
-            format!("gascan-cache-{id}"),
-            format!("gascan-config-{id}")
-        ]),
-    );
+    let path = manifest(&temp, managed_resources(id));
     let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     let session = temp.path().join("session-test");
     value["runtime_root"] = serde_json::json!(session.join("missing/../gascan-gate4-runtime-test"));
@@ -755,15 +808,7 @@ fn exact_name_collision_is_retained_and_never_deleted() {
     let temp = tempfile::tempdir().unwrap();
     let (_bin, calls) = fake_container(&temp);
     let id = "gate4-test-123456789abc";
-    let path = manifest(
-        &temp,
-        serde_json::json!([
-            id,
-            format!("gascan-mise-{id}"),
-            format!("gascan-cache-{id}"),
-            format!("gascan-config-{id}")
-        ]),
-    );
+    let path = manifest(&temp, managed_resources(id));
     let inherited = std::env::var("PATH").unwrap_or_default();
     let output = Command::new(script())
         .arg(&path)
@@ -788,15 +833,7 @@ fn invalid_daemon_pid_is_refused_without_signalling() {
     let temp = tempfile::tempdir().unwrap();
     let (_bin, calls) = fake_container(&temp);
     let id = "gate4-test-123456789abc";
-    let path = manifest(
-        &temp,
-        serde_json::json!([
-            id,
-            format!("gascan-mise-{id}"),
-            format!("gascan-cache-{id}"),
-            format!("gascan-config-{id}")
-        ]),
-    );
+    let path = manifest(&temp, managed_resources(id));
     let instance = temp
         .path()
         .join("session-test/gascan-gate4-runtime-test/daemon-instance.json");
@@ -817,15 +854,7 @@ fn daemon_cleanup_fixture(
     unkillable: bool,
 ) -> (PathBuf, PathBuf) {
     let id = "gate4-test-123456789abc";
-    let path = manifest(
-        temp,
-        serde_json::json!([
-            id,
-            format!("gascan-mise-{id}"),
-            format!("gascan-cache-{id}"),
-            format!("gascan-config-{id}")
-        ]),
-    );
+    let path = manifest(temp, managed_resources(id));
     let daemon = temp.path().join("gascand");
     fs::write(&daemon, "#!/bin/sh\nexit 0\n").unwrap();
     fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
@@ -958,19 +987,56 @@ fn out_of_scope_manifest_is_refused_before_runtime_commands() {
 }
 
 #[test]
-fn forged_manifest_cli_is_never_executed() {
+fn embedded_newline_resource_cannot_spoof_the_exact_manifest_sequence() {
     let temp = tempfile::tempdir().unwrap();
     let (_bin, calls) = fake_container(&temp);
     let id = "gate4-test-123456789abc";
     let path = manifest(
         &temp,
         serde_json::json!([
-            id,
-            format!("gascan-mise-{id}"),
+            format!("{id}\ngascan-mise-{id}"),
             format!("gascan-cache-{id}"),
-            format!("gascan-config-{id}")
+            format!("gascan-config-{id}"),
+            format!("gascan-network-{id}"),
         ]),
     );
+
+    let output = run(&temp, &path, &calls);
+
+    assert_eq!(output.status.code(), Some(65));
+    assert!(path.exists());
+    assert!(!calls.exists());
+}
+
+#[test]
+fn object_resources_cannot_spoof_the_exact_manifest_sequence() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_bin, calls) = fake_container(&temp);
+    let id = "gate4-test-123456789abc";
+    let path = manifest(
+        &temp,
+        serde_json::json!({
+            "0": id,
+            "1": format!("gascan-mise-{id}"),
+            "2": format!("gascan-cache-{id}"),
+            "3": format!("gascan-config-{id}"),
+            "4": format!("gascan-network-{id}"),
+        }),
+    );
+
+    let output = run(&temp, &path, &calls);
+
+    assert_eq!(output.status.code(), Some(65));
+    assert!(path.exists());
+    assert!(!calls.exists());
+}
+
+#[test]
+fn forged_manifest_cli_is_never_executed() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_bin, calls) = fake_container(&temp);
+    let id = "gate4-test-123456789abc";
+    let path = manifest(&temp, managed_resources(id));
     let marker = temp.path().join("forged-cli-ran");
     let forged = temp.path().join("forged-gascan");
     fs::write(&forged, format!("#!/bin/sh\n: >'{}'\n", marker.display())).unwrap();
@@ -989,15 +1055,7 @@ fn runtime_path_escape_is_refused_before_commands() {
     let temp = tempfile::tempdir().unwrap();
     let (_bin, calls) = fake_container(&temp);
     let id = "gate4-test-123456789abc";
-    let path = manifest(
-        &temp,
-        serde_json::json!([
-            id,
-            format!("gascan-mise-{id}"),
-            format!("gascan-cache-{id}"),
-            format!("gascan-config-{id}")
-        ]),
-    );
+    let path = manifest(&temp, managed_resources(id));
     let escaped = tempfile::tempdir().unwrap();
     fs::set_permissions(escaped.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -1013,15 +1071,7 @@ fn owned_running_container_is_stopped_before_exact_delete() {
     let temp = tempfile::tempdir().unwrap();
     let (_bin, calls) = fake_container(&temp);
     let id = "gate4-test-123456789abc";
-    let path = manifest(
-        &temp,
-        serde_json::json!([
-            id,
-            format!("gascan-mise-{id}"),
-            format!("gascan-cache-{id}"),
-            format!("gascan-config-{id}"),
-        ]),
-    );
+    let path = manifest(&temp, managed_resources(id));
     let output = run(&temp, &path, &calls);
     assert!(
         calls.exists(),

@@ -11,7 +11,8 @@ use gascan_core::{
     policy::PolicyCompiler,
     runtime::{
         ContainerState, CreateRequest, ExecInput, ExecOutput, ExecRequest, NetworkIsolation,
-        RemoveRequest, RuntimeBackend, RuntimeCapabilities, RuntimeError, RuntimeVersion,
+        RemoveRequest, ResourceKind, ResourceOwnership, RuntimeBackend, RuntimeCapabilities,
+        RuntimeError, RuntimeVersion,
     },
     sandbox::SandboxSpec,
 };
@@ -26,12 +27,17 @@ struct StatefulAppleRunner(Arc<Mutex<State>>);
 struct State {
     containers: BTreeMap<String, (String, String)>,
     volumes: BTreeMap<String, (String, String)>,
+    networks: BTreeMap<String, (String, String)>,
     commands: Vec<CommandSpec>,
     faulted_inventory_commands: Vec<Vec<String>>,
     fail_run_after_insert: bool,
     fail_volume_after_insert: bool,
+    fail_network_after_insert: bool,
     container_list_faults: VecDeque<InventoryFault>,
     volume_list_faults: VecDeque<InventoryFault>,
+    network_list_faults: VecDeque<InventoryFault>,
+    raw_network_list_record: Option<serde_json::Value>,
+    after_successful_network_create_network_list_fault: Option<InventoryFault>,
     after_successful_volume_create_volume_list_fault: Option<InventoryFault>,
     after_successful_container_create_container_list_fault: Option<InventoryFault>,
 }
@@ -43,6 +49,13 @@ enum InventoryFault {
     Absent,
     Foreign,
     Mismatched,
+}
+
+#[derive(Clone, Copy)]
+enum InventoryTarget {
+    Container,
+    Volume,
+    Network,
 }
 
 #[async_trait]
@@ -59,7 +72,7 @@ impl CommandRunner for StatefulAppleRunner {
             ["list", "--all", "--format", "json"] => {
                 if let Some(fault) = state.container_list_faults.pop_front() {
                     state.faulted_inventory_commands.push(spec.args.clone());
-                    return fault_output(fault, &state.containers, true);
+                    return fault_output(fault, &state.containers, InventoryTarget::Container);
                 }
                 json!(state.containers.iter().map(|(id, (sandbox, status))| json!({
                 "configuration":{"id":id,"labels":{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":sandbox}},"status":{"state":status}
@@ -68,11 +81,38 @@ impl CommandRunner for StatefulAppleRunner {
             ["volume", "list", "--format", "json"] => {
                 if let Some(fault) = state.volume_list_faults.pop_front() {
                     state.faulted_inventory_commands.push(spec.args.clone());
-                    return fault_output(fault, &state.volumes, false);
+                    return fault_output(fault, &state.volumes, InventoryTarget::Volume);
                 }
                 json!(state.volumes.iter().map(|(name, (sandbox, manager))| json!({
                 "id":name,"configuration":{"name":name,"labels":{"dev.gascan.managed-by":manager,"dev.gascan.sandbox-id":sandbox}}
             })).collect::<Vec<_>>())
+            }
+            ["network", "list", "--format", "json"] => {
+                if let Some(fault) = state.network_list_faults.pop_front() {
+                    state.faulted_inventory_commands.push(spec.args.clone());
+                    return fault_output(fault, &state.networks, InventoryTarget::Network);
+                }
+                let mut records = state
+                    .networks
+                    .iter()
+                    .map(|(name, (sandbox, manager))| {
+                        json!({
+                            "id":name,
+                            "configuration":{
+                                "name":name,
+                                "labels":{
+                                    "dev.gascan.managed-by":manager,
+                                    "dev.gascan.sandbox-id":sandbox
+                                }
+                            },
+                            "status":{}
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(record) = state.raw_network_list_record.clone() {
+                    records.push(record);
+                }
+                json!(records)
             }
             ["inspect", id] => match state.containers.get(*id) {
                 Some((sandbox, status)) => {
@@ -86,6 +126,51 @@ impl CommandRunner for StatefulAppleRunner {
                     });
                 }
             },
+            [
+                "network",
+                "create",
+                "--label",
+                manager,
+                "--label",
+                sandbox,
+                name,
+            ] => {
+                if state.networks.contains_key(*name) {
+                    return conflict(name);
+                }
+                state.networks.insert(
+                    (*name).into(),
+                    (
+                        sandbox.split_once('=').unwrap().1.into(),
+                        manager.split_once('=').unwrap().1.into(),
+                    ),
+                );
+                if let Some(fault) = state
+                    .after_successful_network_create_network_list_fault
+                    .take()
+                {
+                    let repeats = if matches!(
+                        fault,
+                        InventoryFault::Absent
+                            | InventoryFault::Foreign
+                            | InventoryFault::Mismatched
+                    ) {
+                        2
+                    } else {
+                        1
+                    };
+                    for _ in 0..repeats {
+                        state.network_list_faults.push_back(fault);
+                    }
+                }
+                if state.fail_network_after_insert {
+                    return Err(RuntimeError::CommandIo {
+                        operation: "container".into(),
+                        message: "daemon disconnected".into(),
+                    });
+                }
+                json!(null)
+            }
             [
                 "volume",
                 "create",
@@ -184,6 +269,10 @@ impl CommandRunner for StatefulAppleRunner {
                 state.volumes.remove(*name);
                 json!(null)
             }
+            ["network", "delete", name] => {
+                state.networks.remove(*name);
+                json!(null)
+            }
             ["logs", id] => json!(format!("log:{id}")),
             ["logs", "--since", _, id] => json!(format!("log:{id}")),
             other => panic!("unexpected command: {other:?}"),
@@ -204,18 +293,23 @@ impl CommandRunner for StatefulAppleRunner {
 fn fault_output<T>(
     fault: InventoryFault,
     resources: &BTreeMap<String, T>,
-    containers: bool,
+    target: InventoryTarget,
 ) -> Result<CommandOutput, RuntimeError> {
     let stdout = match fault {
         InventoryFault::InvalidJson => b"{".to_vec(),
         InventoryFault::CommandIo => {
             return Err(RuntimeError::CommandIo {
-                operation: if containers { "container list" } else { "container volume list" }.into(),
+                operation: match target {
+                    InventoryTarget::Container => "container list",
+                    InventoryTarget::Volume => "container volume list",
+                    InventoryTarget::Network => "container network list",
+                }
+                .into(),
                 message: "injected inventory transport failure".into(),
             });
         }
         InventoryFault::Absent => b"[]".to_vec(),
-        InventoryFault::Foreign if containers => serde_json::to_vec(
+        InventoryFault::Foreign if matches!(target, InventoryTarget::Container) => serde_json::to_vec(
             &resources
                 .keys()
                 .map(|id| {
@@ -237,7 +331,7 @@ fn fault_output<T>(
                 .collect::<Vec<_>>(),
         )
         .unwrap(),
-        InventoryFault::Mismatched if containers => serde_json::to_vec(
+        InventoryFault::Mismatched if matches!(target, InventoryTarget::Container) => serde_json::to_vec(
             &resources.keys().map(|id| json!({
                 "configuration":{"id":id,"labels":{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":"gascan-mismatch-000000000000"}},
                 "status":{"state":"stopped"}
@@ -245,7 +339,7 @@ fn fault_output<T>(
         ).unwrap(),
         InventoryFault::Mismatched => serde_json::to_vec(
             &resources.keys().map(|name| json!({
-                "id":name,"configuration":{"name":name,"labels":{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":"gascan-mismatch-000000000000"}}
+                "id":name,"configuration":{"name":name,"labels":{"dev.gascan.sandbox-id":"gascan-mismatch-000000000000"}}
             })).collect::<Vec<_>>(),
         ).unwrap(),
     };
@@ -307,7 +401,7 @@ async fn apple_backend_satisfies_non_attach_runtime_contract() {
         RuntimeVersion::new(1, 1, 0)
     );
     let created = backend.create(request).await.unwrap();
-    assert_eq!(created.created().len(), 4);
+    assert_eq!(created.created().len(), 5);
     assert_eq!(
         backend.inspect(&id).await.unwrap().unwrap().state,
         ContainerState::Stopped
@@ -325,7 +419,7 @@ async fn apple_backend_satisfies_non_attach_runtime_contract() {
     backend.stop(&id).await.unwrap();
     backend.stop(&id).await.unwrap();
     let listed = backend.list_resources().await.unwrap();
-    assert_eq!(listed.len(), 4);
+    assert_eq!(listed.len(), 5);
     backend
         .remove(RemoveRequest::from_resources(created.created().to_vec()).unwrap())
         .await
@@ -338,6 +432,321 @@ async fn apple_backend_satisfies_non_attach_runtime_contract() {
         .map(|command| command.program.as_str())
         .collect();
     assert_eq!(unique, BTreeSet::from(["container"]));
+}
+
+#[tokio::test]
+async fn inventory_reports_owned_foreign_and_mismatched_networks() {
+    let runner = StatefulAppleRunner::default();
+    {
+        let mut state = runner.0.lock().unwrap();
+        state.networks.insert(
+            "gascan-network-owned".into(),
+            ("gascan-network-owned-000000000000".into(), "gascan".into()),
+        );
+        state.networks.insert(
+            "foreign-network".into(),
+            ("gascan-network-foreign-000000000000".into(), "other".into()),
+        );
+        state.raw_network_list_record = Some(json!({
+            "id":"gascan-network-mismatched",
+            "configuration":{
+                "name":"gascan-network-mismatched",
+                "labels":{"dev.gascan.sandbox-id":"gascan-network-mismatched-000000000000"}
+            }
+        }));
+    }
+    let resources = AppleBackend::new(runner).list_resources().await.unwrap();
+    let ownership = |name: &str| {
+        resources
+            .iter()
+            .find(|resource| resource.kind() == ResourceKind::Network && resource.name() == name)
+            .unwrap()
+            .ownership()
+    };
+    assert_eq!(
+        ownership("gascan-network-owned"),
+        ResourceOwnership::GasCanOwned
+    );
+    assert_eq!(ownership("foreign-network"), ResourceOwnership::Foreign);
+    assert_eq!(
+        ownership("gascan-network-mismatched"),
+        ResourceOwnership::Mismatched
+    );
+}
+
+#[tokio::test]
+async fn inventory_rejects_network_id_and_name_disagreement() {
+    let runner = StatefulAppleRunner::default();
+    runner.0.lock().unwrap().raw_network_list_record = Some(json!({
+        "id":"gascan-network-a",
+        "configuration":{"name":"gascan-network-b","labels":{}}
+    }));
+    let error = AppleBackend::new(runner)
+        .list_resources()
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "invalid_output");
+}
+
+#[tokio::test]
+async fn network_inventory_mismatched_fault_reports_mismatched_ownership() {
+    let runner = StatefulAppleRunner::default();
+    {
+        let mut state = runner.0.lock().unwrap();
+        state.networks.insert(
+            "gascan-network-mismatched-fault".into(),
+            (
+                "gascan-network-mismatched-fault-000000000000".into(),
+                "gascan".into(),
+            ),
+        );
+        state
+            .network_list_faults
+            .push_back(InventoryFault::Mismatched);
+    }
+
+    let resources = AppleBackend::new(runner).list_resources().await.unwrap();
+    let network = resources
+        .iter()
+        .find(|resource| resource.kind() == ResourceKind::Network)
+        .unwrap();
+    assert_eq!(network.ownership(), ResourceOwnership::Mismatched);
+}
+
+#[tokio::test]
+async fn network_inventory_command_io_names_network_list_operation() {
+    let runner = StatefulAppleRunner::default();
+    runner
+        .0
+        .lock()
+        .unwrap()
+        .network_list_faults
+        .push_back(InventoryFault::CommandIo);
+
+    let error = AppleBackend::new(runner)
+        .list_resources()
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        RuntimeError::CommandIo { operation, .. } if operation == "container network list"
+    ));
+}
+
+#[tokio::test]
+async fn networked_create_labels_network_before_volumes_and_attaches_container() {
+    let runner = StatefulAppleRunner::default();
+    let backend = AppleBackend::new(runner.clone());
+    let (_root, request) = request("apple-network-order");
+    let network_name = request.network().managed_name().unwrap().to_owned();
+    let sandbox_id = request.id().to_string();
+
+    let outcome = backend.create(request).await.unwrap();
+
+    assert_eq!(outcome.created().len(), 5);
+    assert_eq!(outcome.created()[0].kind(), ResourceKind::Network);
+    assert_eq!(outcome.created()[0].name(), network_name);
+    assert!(
+        outcome.created()[1..4]
+            .iter()
+            .all(|resource| resource.kind() == ResourceKind::Volume)
+    );
+    assert_eq!(outcome.created()[4].kind(), ResourceKind::Container);
+
+    let state = runner.0.lock().unwrap();
+    let network_index = state
+        .commands
+        .iter()
+        .position(|command| {
+            command.args.first().map(String::as_str) == Some("network")
+                && command.args.get(1).map(String::as_str) == Some("create")
+        })
+        .unwrap();
+    let volume_index = state
+        .commands
+        .iter()
+        .position(|command| {
+            command.args.first().map(String::as_str) == Some("volume")
+                && command.args.get(1).map(String::as_str) == Some("create")
+        })
+        .unwrap();
+    let run_index = state
+        .commands
+        .iter()
+        .position(|command| command.args.first().map(String::as_str) == Some("run"))
+        .unwrap();
+    assert!(network_index < volume_index && volume_index < run_index);
+    let network_args = &state.commands[network_index].args;
+    assert!(
+        network_args
+            .windows(2)
+            .any(|args| args == ["--label", "dev.gascan.managed-by=gascan"])
+    );
+    assert!(network_args.windows(2).any(|args| {
+        args[0] == "--label" && args[1] == format!("dev.gascan.sandbox-id={sandbox_id}")
+    }));
+    let run_args = &state.commands[run_index].args;
+    assert!(
+        run_args
+            .windows(2)
+            .any(|args| args == ["--network", network_name.as_str()])
+    );
+}
+
+#[tokio::test]
+async fn exact_name_networks_always_conflict_before_any_create_mutation() {
+    for (case, sandbox_label, manager_label) in [
+        ("owned", None, "gascan"),
+        ("foreign", None, "foreign"),
+        (
+            "mismatched",
+            Some("some-other-sandbox-000000000000"),
+            "gascan",
+        ),
+    ] {
+        let runner = StatefulAppleRunner::default();
+        let backend = AppleBackend::new(runner.clone());
+        let (_root, request) = request(&format!("apple-network-collision-{case}"));
+        let sandbox_id = request.id().to_string();
+        let network_name = request.network().managed_name().unwrap().to_owned();
+        let seeded = (
+            sandbox_label.unwrap_or(&sandbox_id).to_owned(),
+            manager_label.to_owned(),
+        );
+        runner
+            .0
+            .lock()
+            .unwrap()
+            .networks
+            .insert(network_name.clone(), seeded.clone());
+
+        let failure = backend.create(request).await.unwrap_err();
+
+        assert_eq!(failure.code(), "resource_conflict", "{case}");
+        let state = runner.0.lock().unwrap();
+        assert_eq!(state.networks.get(&network_name), Some(&seeded), "{case}");
+        assert!(state.volumes.is_empty(), "{case}");
+        assert!(state.containers.is_empty(), "{case}");
+        assert!(
+            !state.commands.iter().any(|command| {
+                matches!(
+                    command.args.as_slice(),
+                    [resource, operation, ..]
+                        if (resource == "network" || resource == "volume")
+                            && operation == "create"
+                ) || command
+                    .args
+                    .first()
+                    .is_some_and(|argument| argument == "run")
+            }),
+            "{case}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn transient_network_create_io_reconciles_exact_owned_side_effect() {
+    let runner = StatefulAppleRunner::default();
+    runner.0.lock().unwrap().fail_network_after_insert = true;
+    let backend = AppleBackend::new(runner);
+    let (_root, request) = request("apple-network-io");
+    let failure = backend.create(request).await.unwrap_err();
+    assert_eq!(failure.code(), "command_io");
+    assert_eq!(failure.created().len(), 1);
+    assert_eq!(failure.created()[0].kind(), ResourceKind::Network);
+}
+
+#[tokio::test]
+async fn foreign_network_observation_is_never_returned_as_create_evidence() {
+    let runner = StatefulAppleRunner::default();
+    runner
+        .0
+        .lock()
+        .unwrap()
+        .after_successful_network_create_network_list_fault = Some(InventoryFault::Foreign);
+    let backend = AppleBackend::new(runner);
+    let (_root, request) = request("apple-network-foreign");
+    let failure = backend.create(request).await.unwrap_err();
+    assert_eq!(failure.code(), "ownership_mismatch");
+    assert!(failure.created().is_empty());
+}
+
+#[tokio::test]
+async fn remove_deletes_container_then_volumes_then_network() {
+    let runner = StatefulAppleRunner::default();
+    let backend = AppleBackend::new(runner.clone());
+    let (_root, request) = request("apple-network-remove");
+    let outcome = backend.create(request).await.unwrap();
+    backend
+        .remove(RemoveRequest::from_resources(outcome.created().to_vec()).unwrap())
+        .await
+        .unwrap();
+
+    let state = runner.0.lock().unwrap();
+    let deletion_kinds = state
+        .commands
+        .iter()
+        .filter_map(|command| match command.args.as_slice() {
+            [operation, _] if operation == "delete" => Some(ResourceKind::Container),
+            [resource, operation, _] if resource == "volume" && operation == "delete" => {
+                Some(ResourceKind::Volume)
+            }
+            [resource, operation, _] if resource == "network" && operation == "delete" => {
+                Some(ResourceKind::Network)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        deletion_kinds,
+        [
+            ResourceKind::Container,
+            ResourceKind::Volume,
+            ResourceKind::Volume,
+            ResourceKind::Volume,
+            ResourceKind::Network
+        ]
+    );
+    assert!(state.containers.is_empty());
+    assert!(state.volumes.is_empty());
+    assert!(state.networks.is_empty());
+}
+
+#[tokio::test]
+async fn remove_refuses_a_network_changed_after_observation() {
+    let runner = StatefulAppleRunner::default();
+    let backend = AppleBackend::new(runner.clone());
+    let (_root, request) = request("apple-network-changed");
+    let outcome = backend.create(request).await.unwrap();
+    let network = outcome
+        .created()
+        .iter()
+        .find(|resource| resource.kind() == ResourceKind::Network)
+        .unwrap()
+        .clone();
+    runner
+        .0
+        .lock()
+        .unwrap()
+        .networks
+        .get_mut(network.name())
+        .unwrap()
+        .1 = "foreign".into();
+
+    let error = backend
+        .remove(RemoveRequest::from_resources(vec![network.clone()]).unwrap())
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), "ownership_mismatch");
+    let state = runner.0.lock().unwrap();
+    assert!(state.networks.contains_key(network.name()));
+    assert!(
+        !state
+            .commands
+            .iter()
+            .any(|command| { command.args.as_slice() == ["network", "delete", network.name()] })
+    );
 }
 
 #[tokio::test]
@@ -545,7 +954,7 @@ async fn transient_io_after_mutation_reconciles_exact_owned_side_effect() {
     let (_root, request) = request("apple-partial");
     let failure = backend.create(request).await.unwrap_err();
     assert_eq!(failure.code(), "command_io");
-    assert_eq!(failure.created().len(), 4);
+    assert_eq!(failure.created().len(), 5);
 }
 
 #[tokio::test]
@@ -556,7 +965,8 @@ async fn command_failed_human_diagnostic_is_preserved_and_collision_is_not_claim
     let (_root, request) = request("apple-command-failed");
     let failure = backend.create(request).await.unwrap_err();
     assert_eq!(failure.code(), "command_failed");
-    assert!(failure.created().is_empty());
+    assert_eq!(failure.created().len(), 1);
+    assert_eq!(failure.created()[0].kind(), ResourceKind::Network);
     assert!(matches!(
         failure.source(),
         RuntimeError::CommandFailed {
@@ -578,7 +988,7 @@ async fn successful_volume_create_then_inventory_parse_failure_reconciles_create
     let (_root, request) = request("apple-volume-parse");
     let failure = backend.create(request).await.unwrap_err();
     assert_eq!(failure.code(), "invalid_output");
-    assert_eq!(failure.created().len(), 1);
+    assert_eq!(failure.created().len(), 2);
     assert_only_faulted_command(&runner, &["volume", "list", "--format", "json"]);
 }
 
@@ -594,7 +1004,7 @@ async fn successful_container_create_then_inventory_parse_failure_reconciles_all
     let (_root, request) = request("apple-container-parse");
     let failure = backend.create(request).await.unwrap_err();
     assert_eq!(failure.code(), "invalid_output");
-    assert_eq!(failure.created().len(), 4);
+    assert_eq!(failure.created().len(), 5);
     assert_only_faulted_command(&runner, &["list", "--all", "--format", "json"]);
 }
 
@@ -610,7 +1020,8 @@ async fn successful_volume_create_then_persistent_absence_never_claims_created_e
     let (_root, request) = request("apple-volume-absent");
     let failure = backend.create(request).await.unwrap_err();
     assert_eq!(failure.code(), "ownership_mismatch");
-    assert!(failure.created().is_empty());
+    assert_eq!(failure.created().len(), 1);
+    assert_eq!(failure.created()[0].kind(), ResourceKind::Network);
 }
 
 #[tokio::test]
@@ -625,11 +1036,12 @@ async fn successful_volume_create_then_ownership_verification_never_claims_forei
     let (_root, request) = request("apple-volume-foreign");
     let failure = backend.create(request).await.unwrap_err();
     assert_eq!(failure.code(), "ownership_mismatch");
-    assert!(failure.created().is_empty());
+    assert_eq!(failure.created().len(), 1);
+    assert_eq!(failure.created()[0].kind(), ResourceKind::Network);
 }
 
 #[tokio::test]
-async fn successful_container_create_then_persistent_absence_retains_only_prior_volumes() {
+async fn successful_container_create_then_persistent_absence_retains_prior_managed_resources() {
     let runner = StatefulAppleRunner::default();
     runner
         .0
@@ -640,11 +1052,11 @@ async fn successful_container_create_then_persistent_absence_retains_only_prior_
     let (_root, request) = request("apple-container-absent");
     let failure = backend.create(request).await.unwrap_err();
     assert_eq!(failure.code(), "ownership_mismatch");
-    assert_eq!(failure.created().len(), 3);
+    assert_eq!(failure.created().len(), 4);
 }
 
 #[tokio::test]
-async fn successful_container_create_then_foreign_observation_retains_only_prior_volumes() {
+async fn successful_container_create_then_foreign_observation_retains_network_and_prior_volumes() {
     let runner = StatefulAppleRunner::default();
     runner
         .0
@@ -655,17 +1067,20 @@ async fn successful_container_create_then_foreign_observation_retains_only_prior
     let (_root, request) = request("apple-container-foreign");
     let failure = backend.create(request).await.unwrap_err();
     assert_eq!(failure.code(), "ownership_mismatch");
-    assert_eq!(failure.created().len(), 3);
+    assert_eq!(failure.created().len(), 4);
     assert!(
         failure
             .created()
             .iter()
-            .all(|resource| resource.kind() == gascan_core::runtime::ResourceKind::Volume)
+            .filter(|resource| resource.kind() == ResourceKind::Volume)
+            .count()
+            == 3
     );
 }
 
 #[tokio::test]
-async fn successful_container_create_then_mismatched_observation_retains_only_prior_volumes() {
+async fn successful_container_create_then_mismatched_observation_retains_network_and_prior_volumes()
+{
     let runner = StatefulAppleRunner::default();
     runner
         .0
@@ -676,7 +1091,7 @@ async fn successful_container_create_then_mismatched_observation_retains_only_pr
     let (_root, request) = request("apple-container-mismatched");
     let failure = backend.create(request).await.unwrap_err();
     assert_eq!(failure.code(), "ownership_mismatch");
-    assert_eq!(failure.created().len(), 3);
+    assert_eq!(failure.created().len(), 4);
 }
 
 #[tokio::test]
@@ -691,7 +1106,7 @@ async fn successful_volume_create_then_volume_list_command_error_reconciles_crea
     let (_root, request) = request("apple-volume-list-io");
     let failure = backend.create(request).await.unwrap_err();
     assert_eq!(failure.code(), "command_io");
-    assert_eq!(failure.created().len(), 1);
+    assert_eq!(failure.created().len(), 2);
 }
 
 #[tokio::test]
@@ -706,5 +1121,5 @@ async fn successful_container_create_then_container_list_command_error_reconcile
     let (_root, request) = request("apple-container-list-io");
     let failure = backend.create(request).await.unwrap_err();
     assert_eq!(failure.code(), "command_io");
-    assert_eq!(failure.created().len(), 4);
+    assert_eq!(failure.created().len(), 5);
 }

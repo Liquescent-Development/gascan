@@ -90,9 +90,21 @@ case $id in
   *-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
   *) printf 'refusing invalid sandbox id in %s\n' "$manifest" >&2; exit 65 ;;
 esac
-expected=$(printf '%s\n%s\n%s\n%s\n' "$id" "gascan-mise-$id" "gascan-cache-$id" "gascan-config-$id")
-actual=$(jq -er '.resources[]' "$manifest")
-test "$actual" = "$expected" || { printf 'refusing out-of-scope cleanup manifest\n' >&2; exit 65; }
+jq -e \
+  --arg container "$id" \
+  --arg mise "gascan-mise-$id" \
+  --arg cache "gascan-cache-$id" \
+  --arg config "gascan-config-$id" \
+  --arg network "gascan-network-$id" '
+    (.resources | type) == "array" and
+    (.resources | length) == 5 and
+    all(.resources[]; type == "string") and
+    .resources[0] == $container and
+    .resources[1] == $mise and
+    .resources[2] == $cache and
+    .resources[3] == $config and
+    .resources[4] == $network
+  ' "$manifest" >/dev/null || { printf 'refusing out-of-scope cleanup manifest\n' >&2; exit 65; }
 jq -e '.dns_domain == null or (.dns_domain | type == "string")' "$manifest" >/dev/null || { printf 'refusing invalid DNS cleanup record\n' >&2; exit 65; }
 dns_domain=$(jq -r '.dns_domain // ""' "$manifest")
 if test -n "$dns_domain"; then
@@ -153,29 +165,106 @@ if test -n "$dns_domain"; then
   fi
 fi
 
+fresh_container_record() {
+  fresh_inventory=$(container list --all --format json) ||
+    { printf 'unable to freshly inventory containers; retaining cleanup manifest\n' >&2; return 1; }
+  printf '%s' "$fresh_inventory" |
+    jq -e 'type == "array" and all(.[]; type == "object" and ((.configuration.id | type) == "string"))' >/dev/null ||
+    { printf 'invalid fresh container inventory; retaining cleanup manifest\n' >&2; return 1; }
+  fresh_record=$(printf '%s' "$fresh_inventory" |
+    jq -cr --arg id "$id" '[.[] | select(.configuration.id == $id)] | if length == 0 then null elif length == 1 then .[0] else error("duplicate container id") end') ||
+    { printf 'ambiguous fresh container inventory; retaining cleanup manifest\n' >&2; return 1; }
+  if test "$fresh_record" != null; then
+    test "$(printf '%s' "$fresh_record" | jq -er '.configuration.labels."dev.gascan.managed-by"')" = gascan &&
+      test "$(printf '%s' "$fresh_record" | jq -er '.configuration.labels."dev.gascan.sandbox-id"')" = "$id" ||
+      { printf 'collision: refusing freshly changed container %s\n' "$id" >&2; return 1; }
+  fi
+  printf '%s\n' "$fresh_record"
+}
+
+fresh_volume_record() {
+  fresh_name=$1
+  fresh_inventory=$(container volume list --format json) ||
+    { printf 'unable to freshly inventory volumes; retaining cleanup manifest\n' >&2; return 1; }
+  printf '%s' "$fresh_inventory" |
+    jq -e 'type == "array" and all(.[]; type == "object" and ((.id | type) == "string") and ((.configuration.name | type) == "string") and (.id == .configuration.name))' >/dev/null ||
+    { printf 'invalid fresh volume inventory; retaining cleanup manifest\n' >&2; return 1; }
+  fresh_record=$(printf '%s' "$fresh_inventory" |
+    jq -cr --arg id "$fresh_name" '[.[] | select(.id == $id and .configuration.name == $id)] | if length == 0 then null elif length == 1 then .[0] else error("duplicate volume id") end') ||
+    { printf 'ambiguous fresh volume inventory; retaining cleanup manifest\n' >&2; return 1; }
+  if test "$fresh_record" != null; then
+    test "$(printf '%s' "$fresh_record" | jq -er '.configuration.labels."dev.gascan.managed-by"')" = gascan &&
+      test "$(printf '%s' "$fresh_record" | jq -er '.configuration.labels."dev.gascan.sandbox-id"')" = "$id" ||
+      { printf 'collision: refusing freshly changed volume %s\n' "$fresh_name" >&2; return 1; }
+  fi
+  printf '%s\n' "$fresh_record"
+}
+
+fresh_network_record() {
+  fresh_inventory=$(container network list --format json) ||
+    { printf 'unable to freshly inventory networks; retaining cleanup manifest\n' >&2; return 1; }
+  printf '%s' "$fresh_inventory" |
+    jq -e 'type == "array" and all(.[]; type == "object" and ((.id | type) == "string") and ((.configuration.name | type) == "string") and (.id == .configuration.name))' >/dev/null ||
+    { printf 'invalid fresh network inventory; retaining cleanup manifest\n' >&2; return 1; }
+  fresh_record=$(printf '%s' "$fresh_inventory" |
+    jq -cr --arg id "$network_name" '[.[] | select(.id == $id and .configuration.name == $id)] | if length == 0 then null elif length == 1 then .[0] else error("duplicate network id") end') ||
+    { printf 'ambiguous fresh network inventory; retaining cleanup manifest\n' >&2; return 1; }
+  if test "$fresh_record" != null; then
+    test "$(printf '%s' "$fresh_record" | jq -er '.configuration.labels."dev.gascan.managed-by"')" = gascan &&
+      test "$(printf '%s' "$fresh_record" | jq -er '.configuration.labels."dev.gascan.sandbox-id"')" = "$id" ||
+      { printf 'collision: refusing freshly changed network %s\n' "$network_name" >&2; return 1; }
+  fi
+  printf '%s\n' "$fresh_record"
+}
+
 container_inventory=$(container list --all --format json) || { printf 'unable to inventory containers; retaining cleanup manifest\n' >&2; exit 1; }
 printf '%s' "$container_inventory" | jq -e 'type == "array" and all(.[]; type == "object" and ((.configuration.id | type) == "string"))' >/dev/null || { printf 'invalid container inventory; retaining cleanup manifest\n' >&2; exit 1; }
 volume_inventory=$(container volume list --format json) || { printf 'unable to inventory volumes; retaining cleanup manifest\n' >&2; exit 1; }
 printf '%s' "$volume_inventory" | jq -e 'type == "array" and all(.[]; type == "object" and ((.id | type) == "string") and ((.configuration.name | type) == "string") and (.id == .configuration.name))' >/dev/null || { printf 'invalid volume inventory; retaining cleanup manifest\n' >&2; exit 1; }
+network_inventory=$(container network list --format json) || { printf 'unable to inventory networks; retaining cleanup manifest\n' >&2; exit 1; }
+printf '%s' "$network_inventory" | jq -e 'type == "array" and all(.[]; type == "object" and ((.id | type) == "string") and ((.configuration.name | type) == "string") and (.id == .configuration.name))' >/dev/null || { printf 'invalid network inventory; retaining cleanup manifest\n' >&2; exit 1; }
 
 container_record=$(printf '%s' "$container_inventory" | jq -cr --arg id "$id" '[.[] | select(.configuration.id == $id)] | if length == 0 then null elif length == 1 then .[0] else error("duplicate container id") end') || { printf 'ambiguous container inventory; retaining cleanup manifest\n' >&2; exit 1; }
-if test "$container_record" != null; then
-  test "$(printf '%s' "$container_record" | jq -er '.configuration.labels."dev.gascan.managed-by"')" = gascan &&
-    test "$(printf '%s' "$container_record" | jq -er '.configuration.labels."dev.gascan.sandbox-id"')" = "$id" ||
-    { printf 'collision: refusing container %s with mismatched labels\n' "$id" >&2; exit 1; }
-  container stop --time 5 "$id" >/dev/null 2>&1 || true
-  container delete "$id"
+network_name="gascan-network-$id"
+network_record=$(printf '%s' "$network_inventory" | jq -cr --arg id "$network_name" '[.[] | select(.id == $id and .configuration.name == $id)] | if length == 0 then null elif length == 1 then .[0] else error("duplicate network id") end') || { printf 'ambiguous network inventory; retaining cleanup manifest\n' >&2; exit 1; }
+if test "$network_record" != null; then
+  test "$(printf '%s' "$network_record" | jq -er '.configuration.labels."dev.gascan.managed-by"')" = gascan &&
+    test "$(printf '%s' "$network_record" | jq -er '.configuration.labels."dev.gascan.sandbox-id"')" = "$id" ||
+    { printf 'collision: refusing network %s with mismatched labels\n' "$network_name" >&2; exit 1; }
 fi
-
 for name in "gascan-mise-$id" "gascan-cache-$id" "gascan-config-$id"; do
   volume_record=$(printf '%s' "$volume_inventory" | jq -cr --arg id "$name" '[.[] | select(.configuration.name == $id)] | if length == 0 then null elif length == 1 then .[0] else error("duplicate volume id") end') || { printf 'ambiguous volume inventory; retaining cleanup manifest\n' >&2; exit 1; }
   if test "$volume_record" != null; then
     test "$(printf '%s' "$volume_record" | jq -er '.configuration.labels."dev.gascan.managed-by"')" = gascan &&
       test "$(printf '%s' "$volume_record" | jq -er '.configuration.labels."dev.gascan.sandbox-id"')" = "$id" ||
       { printf 'collision: refusing volume %s with mismatched labels\n' "$name" >&2; exit 1; }
+  fi
+done
+if test "$container_record" != null; then
+  test "$(printf '%s' "$container_record" | jq -er '.configuration.labels."dev.gascan.managed-by"')" = gascan &&
+    test "$(printf '%s' "$container_record" | jq -er '.configuration.labels."dev.gascan.sandbox-id"')" = "$id" ||
+    { printf 'collision: refusing container %s with mismatched labels\n' "$id" >&2; exit 1; }
+  fresh_record=$(fresh_container_record) || exit 1
+  if test "$fresh_record" != null; then
+    container stop --time 5 "$id" >/dev/null 2>&1 || true
+    fresh_record=$(fresh_container_record) || exit 1
+    if test "$fresh_record" != null; then
+      container delete "$id"
+    fi
+  fi
+fi
+
+for name in "gascan-mise-$id" "gascan-cache-$id" "gascan-config-$id"; do
+  fresh_record=$(fresh_volume_record "$name") || exit 1
+  if test "$fresh_record" != null; then
     container volume delete "$name"
   fi
 done
+
+fresh_record=$(fresh_network_record) || exit 1
+if test "$fresh_record" != null; then
+  container network delete "$network_name"
+fi
 
 residue=false
 if test -f "$instance"; then
@@ -240,10 +329,13 @@ container_inventory=$(container list --all --format json) || { printf 'unable to
 printf '%s' "$container_inventory" | jq -e 'type == "array" and all(.[]; type == "object" and ((.configuration.id | type) == "string"))' >/dev/null || { printf 'invalid container cleanup inventory; retaining cleanup manifest\n' >&2; exit 1; }
 volume_inventory=$(container volume list --format json) || { printf 'unable to verify volume cleanup; retaining cleanup manifest\n' >&2; exit 1; }
 printf '%s' "$volume_inventory" | jq -e 'type == "array" and all(.[]; type == "object" and ((.id | type) == "string") and ((.configuration.name | type) == "string") and (.id == .configuration.name))' >/dev/null || { printf 'invalid volume cleanup inventory; retaining cleanup manifest\n' >&2; exit 1; }
+network_inventory=$(container network list --format json) || { printf 'unable to verify network cleanup; retaining cleanup manifest\n' >&2; exit 1; }
+printf '%s' "$network_inventory" | jq -e 'type == "array" and all(.[]; type == "object" and ((.id | type) == "string") and ((.configuration.name | type) == "string") and (.id == .configuration.name))' >/dev/null || { printf 'invalid network cleanup inventory; retaining cleanup manifest\n' >&2; exit 1; }
 printf '%s' "$container_inventory" | jq -e --arg id "$id" 'any(.[]; .configuration.id == $id)' >/dev/null && residue=true || true
 for name in "gascan-mise-$id" "gascan-cache-$id" "gascan-config-$id"; do
   printf '%s' "$volume_inventory" | jq -e --arg id "$name" 'any(.[]; .configuration.name == $id)' >/dev/null && residue=true || true
 done
+printf '%s' "$network_inventory" | jq -e --arg id "$network_name" 'any(.[]; .id == $id and .configuration.name == $id)' >/dev/null && residue=true || true
 if test "$residue" = true; then
   printf 'Gate 4 cleanup residue remains for exact sandbox %s\n' "$id" >&2
   exit 1
