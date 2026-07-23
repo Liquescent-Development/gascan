@@ -40,6 +40,12 @@ struct GuestExecOutcome {
     signal: i32,
 }
 
+struct UpRuntimeContext<'a> {
+    operation_id: OperationId,
+    sender: &'a mpsc::Sender<OperationEvent>,
+    desired_fingerprint: &'a str,
+}
+
 struct BoundedTail {
     bytes: Vec<u8>,
     limit: usize,
@@ -591,9 +597,11 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 &create,
                 prior.as_ref(),
                 requested_storage,
-                operation.id,
-                &sender,
-                &desired_fingerprint,
+                UpRuntimeContext {
+                    operation_id: operation.id,
+                    sender: &sender,
+                    desired_fingerprint: &desired_fingerprint,
+                },
             )
             .await;
         match result {
@@ -649,10 +657,13 @@ impl<B: RuntimeBackend> SandboxService<B> {
         create: &CreateRequest,
         prior: Option<&SandboxRecord>,
         requested_storage: StorageCapacities,
-        operation_id: OperationId,
-        sender: &mpsc::Sender<OperationEvent>,
-        desired_fingerprint: &str,
+        context: UpRuntimeContext<'_>,
     ) -> Result<(ActualState, Option<ProvisionedResolution>), ServiceError> {
+        let UpRuntimeContext {
+            operation_id,
+            sender,
+            desired_fingerprint,
+        } = context;
         let id = spec.id();
         let inspected = self.runtime.inspect(id).await?;
         let mut created = None;
@@ -662,7 +673,23 @@ impl<B: RuntimeBackend> SandboxService<B> {
             }
         } else {
             match self.runtime.create(create.clone()).await {
-                Ok(outcome) => created = Some(outcome),
+                Ok(outcome) => {
+                    if let Err(error) = self.persist_created_storage(id, requested_storage).await {
+                        let rollback =
+                            match RemoveRequest::from_resources(outcome.created().to_vec()) {
+                                Ok(request) => self.runtime.remove(request).await,
+                                Err(error) => Err(error),
+                            };
+                        return match rollback {
+                            Ok(()) => Err(error),
+                            Err(rollback) => Err(ServiceError::Rollback {
+                                original: Box::new(error),
+                                rollback,
+                            }),
+                        };
+                    }
+                    created = Some(outcome);
+                }
                 Err(failure) => {
                     if !failure.created().is_empty() {
                         self.runtime
@@ -676,9 +703,6 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 .await?;
         }
         let result = async {
-            if created.is_some() {
-                self.persist_created_storage(id, requested_storage).await?;
-            }
             let current = self
                 .runtime
                 .inspect(id)

@@ -269,7 +269,7 @@ async fn nonzero_setup_exit_is_structured_sanitized_stopped_and_retryable() -> T
     assert_eq!(details["exit_code"], 23);
     assert_eq!(details["signal"], 0);
     assert!(details["stderr_tail"].as_str().is_some_and(|tail| {
-        tail.as_bytes().len() <= 64 * 1024 && tail.contains(DIAGNOSTIC) && !tail.contains('\u{1b}')
+        tail.len() <= 64 * 1024 && tail.contains(DIAGNOSTIC) && !tail.contains('\u{1b}')
     }));
     Ok(())
 }
