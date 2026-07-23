@@ -21,9 +21,10 @@ Each prints exactly one newline-terminated line to stdout:
 gascan <package-version>
 ```
 
-For the current release, that is `gascan 0.1.5`. Both forms exit with status 0
-and leave stderr empty. The standard `-V, --version` option also appears in
-`gascan --help`.
+The `<package-version>` placeholder is the exact Cargo package version embedded
+at compile time; it is not literal output. Both forms exit with status 0 and
+leave stderr empty. The standard `-V, --version` option also appears in `gascan
+--help`.
 
 This feature does not add a `gascan version` subcommand, a JSON form, build
 revision metadata, daemon version output, or runtime compatibility output.
