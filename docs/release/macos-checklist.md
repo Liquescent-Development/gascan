@@ -166,8 +166,8 @@ Install Apple `container` 1.1.0, start its service, then run:
 
 ```sh
 GASCAN_EXPECTED_SOURCE_REVISION=<signed-release-commit> \
-GASCAN_EXPECTED_VERSION=0.1.6 \
-  ./packaging/macos/install.sh .artifacts/release/gascan-0.1.6-macos-arm64.pkg
+GASCAN_EXPECTED_VERSION=0.1.7 \
+  ./packaging/macos/install.sh .artifacts/release/gascan-0.1.7-macos-arm64.pkg
 gascan doctor --json | jq
 ```
 
