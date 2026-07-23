@@ -38,46 +38,6 @@ async fn event_details(
 }
 
 #[tokio::test]
-async fn storage_recreation_failure_persists_structured_capacity_changes() -> TestResult {
-    let root = tempfile::tempdir()?;
-    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
-    let runtime = FakeRuntime::default();
-    let service = SandboxService::new(
-        runtime.clone(),
-        gascand::Store::open(root.join("state.db"))?,
-        Arc::new(NoopProvisioner),
-    );
-    service
-        .up(UpRequest::new(spec(root, "storage-details")?))
-        .await?;
-    std::fs::write(
-        root.join("gascan.toml"),
-        "version = 1\n[storage]\ntools = \"20GiB\"\n",
-    )?;
-
-    assert!(
-        service
-            .apply(UpRequest::new(spec(root, "storage-details")?))
-            .await
-            .is_err()
-    );
-    let operation = service.latest_operation()?.ok_or("failed operation")?;
-    assert_eq!(
-        operation.error_code.as_deref(),
-        Some("storage_change_requires_recreate")
-    );
-    assert_eq!(
-        operation.error_details.ok_or("failure details")?["changes"],
-        json!([{
-            "volume": "tools",
-            "recorded_bytes": 10 * 1024_u64.pow(3),
-            "requested_bytes": 20 * 1024_u64.pow(3),
-        }])
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn existing_up_reports_apply_required_without_executing_tool_changes() -> TestResult {
     let root = tempfile::tempdir()?;
     let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
