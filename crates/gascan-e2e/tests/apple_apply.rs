@@ -8,6 +8,192 @@ use serde::de::{Error as _, MapAccess, Visitor};
 use std::collections::BTreeMap;
 
 #[test]
+#[ignore = "requires supported Apple runtime, two compatible digest-qualified workspace images, and network access"]
+fn image_replace_preserves_durable_resources_and_rolls_back_failure() -> TestResult {
+    let predecessor = std::env::var("GASCAN_E2E_PREDECESSOR_IMAGE")
+        .map_err(|_| "GASCAN_E2E_PREDECESSOR_IMAGE must name the compatible predecessor fixture")?;
+    let approved = apple_common::approved_workspace_image()?;
+    apple_common::validate_distinct_image_fixtures(&predecessor, approved)?;
+
+    let env = AppleE2e::new_networked("image-replace")?;
+    let root = std::path::Path::new(env.root());
+    std::fs::create_dir(root.join(".gascan"))?;
+    std::fs::write(
+        root.join("gascan.toml"),
+        "version = 1\nname = 'image-replace'\nnetwork = 'networked'\n\
+         setup = './.gascan/setup.sh'\n",
+    )?;
+    std::fs::write(
+        root.join(".gascan/setup.sh"),
+        "#!/bin/sh\nset -eu\n\
+         count=0\n\
+         test ! -f /workspace/setup-count || read -r count </workspace/setup-count\n\
+         count=$((count + 1))\n\
+         printf '%s\\n' \"$count\" >/workspace/setup-count\n",
+    )?;
+    env.success_with_timeout(
+        ["up", root.to_str().ok_or("non-UTF-8 root")?],
+        std::time::Duration::from_secs(10 * 60),
+    )?;
+    assert_eq!(std::fs::read_to_string(root.join("setup-count"))?, "1\n");
+
+    for path in [
+        "/home/workspace/.local/share/mise/image-replace-sentinel",
+        "/home/workspace/.cache/mise/image-replace-sentinel",
+        "/home/workspace/.config/gascan/image-replace-sentinel",
+    ] {
+        env.success([
+            "--sandbox",
+            env.id(),
+            "run",
+            "--",
+            "sh",
+            "-c",
+            &format!("printf durable >{}", shell_quote(path)),
+        ])?;
+    }
+
+    env.replace_owned_container_image(&predecessor, std::time::Duration::from_secs(10 * 60))?;
+    assert_compatible_fixture(&env)?;
+    let predecessor_snapshot = env.owned_runtime_snapshot()?;
+    assert_eq!(predecessor_snapshot.container_image(), predecessor);
+
+    let status = env.status_json()?;
+    assert_image_changed(&status, &predecessor, approved)?;
+
+    let up = env.success(["up", root.to_str().ok_or("non-UTF-8 root")?, "--json"])?;
+    assert_json_phase(&up.stdout, "apply_required")?;
+    assert_eq!(env.owned_runtime_snapshot()?, predecessor_snapshot);
+    assert_eq!(std::fs::read_to_string(root.join("setup-count"))?, "1\n");
+
+    let apply = env.success_with_timeout(
+        [
+            "--sandbox",
+            env.id(),
+            "apply",
+            root.to_str().ok_or("non-UTF-8 root")?,
+            "--json",
+        ],
+        std::time::Duration::from_secs(10 * 60),
+    )?;
+    for phase in [
+        "before_provision",
+        "after_provision",
+        "before_health",
+        "after_health",
+        "image_replaced",
+    ] {
+        assert_json_phase(&apply.stdout, phase)?;
+    }
+    assert_eq!(std::fs::read_to_string(root.join("setup-count"))?, "2\n");
+    let approved_snapshot = env.owned_runtime_snapshot()?;
+    assert_eq!(approved_snapshot.container_image(), approved);
+    predecessor_snapshot.assert_retained_identities_equal(&approved_snapshot)?;
+    assert_compatible_fixture(&env)?;
+
+    env.replace_owned_container_image(&predecessor, std::time::Duration::from_secs(10 * 60))?;
+    std::fs::write(
+        root.join(".gascan/setup.sh"),
+        "#!/bin/sh\nset -eu\n\
+         printf attempted >/workspace/setup-failure-ran\n\
+         exit 42\n",
+    )?;
+    let failed = env.invoke_with_timeout(
+        [
+            "--sandbox",
+            env.id(),
+            "apply",
+            root.to_str().ok_or("non-UTF-8 root")?,
+            "--json",
+        ],
+        std::time::Duration::from_secs(10 * 60),
+    )?;
+    env.assert_exit_code(&failed, 70)?;
+    assert_json_phase(&failed.stdout, "image_rollback")?;
+    assert_json_error(&failed.stdout)?;
+    assert_eq!(
+        std::fs::read_to_string(root.join("setup-failure-ran"))?,
+        "attempted"
+    );
+    let rolled_back = env.owned_runtime_snapshot()?;
+    assert_eq!(rolled_back.container_image(), predecessor);
+    predecessor_snapshot.assert_retained_identities_equal(&rolled_back)?;
+    assert_compatible_fixture(&env)?;
+
+    env.success(["--sandbox", env.id(), "destroy", "--yes"])?;
+    env.assert_no_owned_resources()
+}
+
+fn assert_compatible_fixture(env: &AppleE2e) -> TestResult {
+    let output = env.success([
+        "--sandbox",
+        env.id(),
+        "run",
+        "--",
+        "sh",
+        "-c",
+        "test \"$(id -un)\" = workspace && \
+         test \"$(cat /home/workspace/.local/share/mise/image-replace-sentinel)\" = durable && \
+         test \"$(cat /home/workspace/.cache/mise/image-replace-sentinel)\" = durable && \
+         test \"$(cat /home/workspace/.config/gascan/image-replace-sentinel)\" = durable",
+    ])?;
+    if output.stdout.is_empty() {
+        Ok(())
+    } else {
+        Err("fixture compatibility probe produced unexpected output".into())
+    }
+}
+
+fn assert_image_changed(status: &serde_json::Value, current: &str, requested: &str) -> TestResult {
+    let requirements = status["apply_requirements"]
+        .as_array()
+        .ok_or("status apply_requirements must be an array")?;
+    let exact = requirements
+        .iter()
+        .filter(|requirement| requirement["reason"] == "image_changed")
+        .collect::<Vec<_>>();
+    let [requirement] = exact.as_slice() else {
+        return Err(format!("expected one image_changed requirement: {requirements:?}").into());
+    };
+    if requirement["current"] != current || requirement["requested"] != requested {
+        return Err(format!("unexpected image replacement requirement: {requirement:?}").into());
+    }
+    Ok(())
+}
+
+fn assert_json_phase(output: &[u8], expected: &str) -> TestResult {
+    let found = std::str::from_utf8(output)?
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .any(|event| event["phase"] == expected);
+    if found {
+        Ok(())
+    } else {
+        Err(format!("operation stream omitted phase {expected}").into())
+    }
+}
+
+fn assert_json_error(output: &[u8]) -> TestResult {
+    let found = std::str::from_utf8(output)?
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .any(|event| event["error"].is_object());
+    if found {
+        Ok(())
+    } else {
+        Err("failed replacement stream omitted its primary error".into())
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[test]
 #[ignore = "requires supported Apple runtime, locked workspace image, and network access"]
 fn apply_installs_large_npm_tool_and_neovim_with_storage_override() -> TestResult {
     let env = AppleE2e::new_networked("storage-tools")?;

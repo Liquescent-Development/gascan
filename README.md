@@ -125,6 +125,18 @@ stable plain text without animation or color. Set `NO_COLOR=1` to disable color
 while keeping interactive progress. Use `--json` on supported commands for
 machine-readable output.
 
+Workspace image updates are reported by `gascan status`. Run `gascan apply` to
+replace only the container while preserving the workspace and managed tools,
+cache, and configuration volumes. Changes made directly to the container root
+filesystem are not durable.
+
+If replacement fails, Gascan reports the primary failure and restores the
+previous workspace image. Fix the primary error and run `gascan apply` again.
+If rollback also fails, preserve the reported primary and rollback diagnostics,
+avoid changing or deleting the managed volumes, and retry `gascan apply` after
+restoring access to both digest-qualified images. Use `gascan destroy --yes`
+only when you intend to delete the sandbox and all of its managed volumes.
+
 Commands other than `up` resolve the sandbox implicitly when exactly one
 exists. With more than one, pass `--sandbox <id>`; `gascan list` prints the
 ids. A sandbox id is the slugified `name` plus a short digest of the canonical

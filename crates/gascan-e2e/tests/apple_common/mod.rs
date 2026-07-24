@@ -2,7 +2,7 @@
 
 use gascan_core::sandbox::SandboxId;
 use serde_json::Value;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::io::{Read as _, Seek as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
@@ -32,6 +32,65 @@ pub struct PtySignalOutput {
 }
 
 pub type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnedRuntimeSnapshot {
+    container_id: String,
+    container_image: String,
+    volumes: BTreeSet<(String, String)>,
+    networks: BTreeSet<(String, String)>,
+}
+
+impl OwnedRuntimeSnapshot {
+    pub fn container_image(&self) -> &str {
+        &self.container_image
+    }
+
+    pub fn assert_retained_identities_equal(&self, other: &Self) -> TestResult {
+        if self.container_id != other.container_id {
+            return Err(format!(
+                "container identity changed from {} to {}",
+                self.container_id, other.container_id
+            )
+            .into());
+        }
+        if self.volumes != other.volumes {
+            return Err(format!(
+                "managed volume identities changed: {:?} != {:?}",
+                self.volumes, other.volumes
+            )
+            .into());
+        }
+        if self.networks != other.networks {
+            return Err(format!(
+                "managed network identities changed: {:?} != {:?}",
+                self.networks, other.networks
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
+pub fn approved_workspace_image() -> TestResult<&'static str> {
+    let image = include_str!("../../../../images/workspace/approved-image.txt").trim();
+    if !gascan_core::runtime::immutable_image_reference(image) {
+        return Err("approved workspace image is not digest-qualified".into());
+    }
+    Ok(image)
+}
+
+pub fn validate_distinct_image_fixtures(predecessor: &str, approved: &str) -> TestResult {
+    for (role, image) in [("predecessor", predecessor), ("approved", approved)] {
+        if image.trim() != image || !gascan_core::runtime::immutable_image_reference(image) {
+            return Err(format!("{role} workspace image is not digest-qualified").into());
+        }
+    }
+    if predecessor == approved {
+        return Err("predecessor and approved workspace image fixtures must be distinct".into());
+    }
+    Ok(())
+}
 
 pub struct AppleE2e {
     gascan: OsString,
@@ -364,6 +423,113 @@ impl AppleE2e {
             )
             .into())
         }
+    }
+
+    pub fn replace_owned_container_image(
+        &self,
+        image: &str,
+        timeout: std::time::Duration,
+    ) -> TestResult {
+        validate_distinct_image_fixtures(image, approved_workspace_image()?)?;
+        let root = camino::Utf8Path::from_path(&self.root_path).ok_or("non-UTF-8 project root")?;
+        let manifest = gascan_core::manifest::Manifest::load(root)?;
+        let spec =
+            gascan_core::sandbox::SandboxSpec::from_root(&self.manifest_name, root, manifest)?;
+        if spec.id() != &self.id {
+            return Err("replacement fixture resolved a different sandbox identity".into());
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let result: Result<TestResult, tokio::time::error::Elapsed> = runtime.block_on(
+            tokio::time::timeout(timeout, recreate_owned_container(spec, image)),
+        );
+        match result {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "timed out after {}s replacing the owned fixture container",
+                timeout.as_secs()
+            )
+            .into()),
+        }
+    }
+
+    pub fn owned_runtime_snapshot(&self) -> TestResult<OwnedRuntimeSnapshot> {
+        let inspect = self.container_json(["inspect", self.id()])?;
+        let record = inspect
+            .as_array()
+            .and_then(|records| (records.len() == 1).then(|| &records[0]))
+            .ok_or("owned container inspect is absent or ambiguous")?;
+        let configuration = record["configuration"]
+            .as_object()
+            .ok_or("owned container inspect lacks configuration")?;
+        let container_id = configuration
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or("owned container inspect lacks id")?;
+        let container_image = configuration
+            .get("image")
+            .and_then(Value::as_str)
+            .ok_or("owned container inspect lacks image")?;
+        if container_id != self.id()
+            || configuration["labels"]["dev.gascan.managed-by"] != "gascan"
+            || configuration["labels"]["dev.gascan.sandbox-id"] != self.id()
+        {
+            return Err("owned container identity or labels mismatch".into());
+        }
+
+        let volumes = owned_inventory_identities(
+            &self.container_json(["volume", "list", "--format", "json"])?,
+            self.id(),
+        )?;
+        let networks = owned_inventory_identities(
+            &self.container_json(["network", "list", "--format", "json"])?,
+            self.id(),
+        )?;
+        let expected = self.resource_identities()?;
+        let expected_volumes = expected
+            .iter()
+            .filter(|identity| identity.kind() == gascan_core::runtime::ResourceKind::Volume)
+            .map(|identity| (identity.name().to_owned(), identity.name().to_owned()))
+            .collect::<BTreeSet<_>>();
+        let expected_networks = expected
+            .iter()
+            .filter(|identity| identity.kind() == gascan_core::runtime::ResourceKind::Network)
+            .map(|identity| (identity.name().to_owned(), identity.name().to_owned()))
+            .collect::<BTreeSet<_>>();
+        if volumes != expected_volumes || networks != expected_networks {
+            return Err(format!(
+                "owned retained inventory mismatch: volumes={volumes:?} networks={networks:?}"
+            )
+            .into());
+        }
+        Ok(OwnedRuntimeSnapshot {
+            container_id: container_id.to_owned(),
+            container_image: container_image.to_owned(),
+            volumes,
+            networks,
+        })
+    }
+
+    fn container_json<I, S>(&self, args: I) -> TestResult<Value>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let child = Command::new("container")
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let output = wait_with_output_bounded(child, std::time::Duration::from_secs(90))?;
+        if !output.status.success() {
+            return Err(format!(
+                "container inventory failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        Ok(serde_json::from_slice(&output.stdout)?)
     }
 
     pub fn command<I, S>(&self, args: I) -> Command
@@ -729,6 +895,88 @@ impl AppleE2e {
     }
 }
 
+async fn recreate_owned_container(
+    spec: gascan_core::sandbox::SandboxSpec,
+    image: &str,
+) -> TestResult {
+    use gascan_core::runtime::RuntimeBackend as _;
+
+    let backend = gascan_apple::AppleBackend::new(gascan_apple::ProcessRunner);
+    backend.prepare_image(image).await?;
+    let capabilities = backend.capabilities().await?;
+    let create = gascan_core::policy::PolicyCompiler::compile(spec, &capabilities)?;
+    let expected = gascan_core::policy::PolicyCompiler::expected_resource_identities(create.id())?;
+    let resources = backend
+        .list_resources()
+        .await?
+        .into_iter()
+        .filter(|resource| resource.sandbox_id() == Some(create.id()))
+        .collect::<Vec<_>>();
+    let observed = resources
+        .iter()
+        .map(|resource| resource.identity().clone())
+        .collect::<BTreeSet<_>>();
+    let expected = expected.into_iter().collect::<BTreeSet<_>>();
+    if observed != expected {
+        return Err(gascan_core::runtime::RuntimeError::InvalidState {
+            resource: create.id().to_string(),
+            message: format!(
+                "replacement fixture inventory mismatch: {observed:?} != {expected:?}"
+            ),
+        }
+        .into());
+    }
+    if resources.iter().any(|resource| {
+        resource.ownership() != gascan_core::runtime::ResourceOwnership::GasCanOwned
+    }) {
+        return Err(gascan_core::runtime::RuntimeError::OwnershipMismatch {
+            resource: create.id().to_string(),
+        }
+        .into());
+    }
+    let container = resources
+        .iter()
+        .find(|resource| resource.kind() == gascan_core::runtime::ResourceKind::Container)
+        .cloned()
+        .ok_or_else(|| gascan_core::runtime::RuntimeError::NotFound {
+            resource: create.id().to_string(),
+        })?;
+    let retained = resources
+        .into_iter()
+        .filter(|resource| resource.kind() != gascan_core::runtime::ResourceKind::Container)
+        .collect();
+    let retained = gascan_core::runtime::RetainedResources::new(&create, retained)?;
+    let recreate = gascan_core::runtime::RecreateRequest::for_image(
+        create.clone(),
+        image.to_owned(),
+        retained,
+    )?;
+    backend.stop(create.id()).await?;
+    backend
+        .remove(gascan_core::runtime::RemoveRequest::from_resources(vec![
+            container,
+        ])?)
+        .await?;
+    backend.create_container(recreate).await?;
+    backend.start(create.id()).await?;
+    let actual = backend.inspect(create.id()).await?.ok_or_else(|| {
+        gascan_core::runtime::RuntimeError::NotFound {
+            resource: create.id().to_string(),
+        }
+    })?;
+    if actual.image != image {
+        return Err(gascan_core::runtime::RuntimeError::InvalidState {
+            resource: create.id().to_string(),
+            message: format!(
+                "replacement fixture image mismatch: {} != {image}",
+                actual.image
+            ),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 fn validate_managed_network_attachment(inspect: &Value, inventory: &Value, id: &str) -> TestResult {
     let expected = format!("gascan-network-{id}");
     let record = inspect
@@ -764,6 +1012,35 @@ fn validate_managed_network_attachment(inspect: &Value, inventory: &Value, id: &
         return Err(format!("managed network ownership labels mismatch: {labels:?}").into());
     }
     Ok(())
+}
+
+fn owned_inventory_identities(
+    inventory: &Value,
+    sandbox_id: &str,
+) -> TestResult<BTreeSet<(String, String)>> {
+    let records = inventory
+        .as_array()
+        .ok_or("container inventory must be an array")?;
+    let mut exact = BTreeSet::new();
+    for record in records {
+        let labels = &record["configuration"]["labels"];
+        if labels["dev.gascan.sandbox-id"].as_str() != Some(sandbox_id) {
+            continue;
+        }
+        if labels["dev.gascan.managed-by"].as_str() != Some("gascan") {
+            return Err("sandbox-labeled retained resource lacks exact Gascan ownership".into());
+        }
+        let id = record["id"]
+            .as_str()
+            .ok_or("owned inventory record lacks id")?;
+        let name = record["configuration"]["name"]
+            .as_str()
+            .ok_or("owned inventory record lacks name")?;
+        if !exact.insert((id.to_owned(), name.to_owned())) {
+            return Err(format!("duplicate owned inventory identity: {id}/{name}").into());
+        }
+    }
+    Ok(exact)
 }
 
 fn instance_matches(
@@ -1558,6 +1835,56 @@ fn cleanup_resource_identities(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_replacement_fixtures_must_be_distinct_immutable_digests() -> TestResult {
+        let first = format!("registry.example/workspace:first@sha256:{}", "a".repeat(64));
+        let second = format!(
+            "registry.example/workspace:second@sha256:{}",
+            "b".repeat(64)
+        );
+        assert!(validate_distinct_image_fixtures(&first, &second).is_ok());
+        assert!(validate_distinct_image_fixtures(&first, &first).is_err());
+        assert!(
+            validate_distinct_image_fixtures("registry.example/workspace:first", &second).is_err()
+        );
+        assert!(validate_distinct_image_fixtures(&format!(" {first}"), &second).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn owned_inventory_requires_exact_labels_and_unique_identities() -> TestResult {
+        let exact = serde_json::json!([{
+            "id": "gascan-volume-fixture-tools",
+            "configuration": {
+                "name": "gascan-volume-fixture-tools",
+                "labels": {
+                    "dev.gascan.managed-by": "gascan",
+                    "dev.gascan.sandbox-id": "fixture"
+                }
+            }
+        }]);
+        assert_eq!(
+            owned_inventory_identities(&exact, "fixture")?,
+            BTreeSet::from([(
+                "gascan-volume-fixture-tools".to_owned(),
+                "gascan-volume-fixture-tools".to_owned()
+            )])
+        );
+
+        let wrong_owner = serde_json::json!([{
+            "id": "gascan-volume-fixture-tools",
+            "configuration": {
+                "name": "gascan-volume-fixture-tools",
+                "labels": {
+                    "dev.gascan.managed-by": "foreign",
+                    "dev.gascan.sandbox-id": "fixture"
+                }
+            }
+        }]);
+        assert!(owned_inventory_identities(&wrong_owner, "fixture").is_err());
+        Ok(())
+    }
 
     struct OwnedChildFixture {
         pid: rustix_openpty::rustix::process::Pid,
