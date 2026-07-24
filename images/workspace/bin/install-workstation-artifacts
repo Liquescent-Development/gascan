@@ -115,7 +115,7 @@ def checked_link(link, target):
     link.symlink_to(target)
 
 
-def exact_version(command, identity, version):
+def exact_version(command, tool, version):
     result = subprocess.run(
         [str(command), "--version"],
         stdin=subprocess.DEVNULL,
@@ -126,13 +126,17 @@ def exact_version(command, identity, version):
         env={"HOME": "/tmp", "PATH": os.environ["PATH"], "NO_COLOR": "1"},
     )
     output = result.stdout.strip()
-    identity_match = re.search(
-        rf"(?<![a-z0-9]){re.escape(identity)}(?![a-z0-9])", output.lower()
-    )
-    version_match = re.search(
-        rf"(?<![0-9.]){re.escape(version)}(?![0-9.])", output
-    )
-    if result.returncode != 0 or not version_match or not identity_match:
+    lines = output.splitlines()
+    valid = {
+        "claude": output == f"{version} (Claude Code)",
+        "codex": output == f"codex-cli {version}",
+        "pi": output == version,
+        "herdr": output == f"herdr {version}",
+        "glab": re.fullmatch(rf"glab {re.escape(version)} \([^()\n]*\)", output)
+        is not None,
+        "nvim": bool(lines) and lines[0] == f"NVIM v{version}",
+    }.get(tool)
+    if result.returncode != 0 or valid is not True:
         die(f"unexpected {command.name} version output: {output!r}")
 
 
@@ -165,9 +169,21 @@ def immutable_tree(root):
             die(f"mutable immutable-tool path: {path}")
 
 
-def npm_ci(source, npm_root):
+def npm_ci(source, npm_root, expected_version):
     if npm_root.exists() or npm_root.is_symlink():
         die(f"npm destination already exists: {npm_root}")
+    version_result = subprocess.run(
+        ["npm", "--version"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=30,
+        env=os.environ.copy(),
+    )
+    actual_version = version_result.stdout.strip()
+    if version_result.returncode != 0 or actual_version != expected_version:
+        die(f"unexpected npm version output: {actual_version!r}")
     npm_root.mkdir(mode=0o700)
     shutil.copyfile(source / "package.json", npm_root / "package.json")
     shutil.copyfile(source / "package-lock.json", npm_root / "package-lock.json")
@@ -213,8 +229,8 @@ if len(sys.argv) == 6 and sys.argv[1] == "validate-file":
     elif sys.argv[5] != "regular":
         die("unknown file validation kind")
     raise SystemExit(0)
-if len(sys.argv) == 4 and sys.argv[1] == "npm-ci":
-    npm_ci(Path(sys.argv[2]), Path(sys.argv[3]))
+if len(sys.argv) == 5 and sys.argv[1] == "npm-ci":
+    npm_ci(Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4])
     raise SystemExit(0)
 if len(sys.argv) == 5 and sys.argv[1] == "verify-version":
     exact_version(Path(sys.argv[2]), sys.argv[3], sys.argv[4])
@@ -264,7 +280,7 @@ prefix.parent.mkdir(parents=True, exist_ok=True)
 staging = Path(tempfile.mkdtemp(prefix=".workstation-", dir=prefix.parent))
 try:
     npm_root = staging / "npm"
-    npm_ci(source, npm_root)
+    npm_ci(source, npm_root, npm_lock["npm_version"])
 
     bin_dir = staging / "bin"
     bin_dir.mkdir(mode=0o700)
@@ -304,17 +320,17 @@ try:
         checked_link(bin_dir / name, Path("..") / "npm" / "node_modules" / ".bin" / name)
 
     expected = {
-        "claude": ("claude", artifacts["claude"]["version"]),
-        "codex": ("codex", artifacts["codex"]["version"]),
-        "pi": ("pi", artifacts["pi"]["version"]),
-        "herdr": ("herdr", artifacts["herdr"]["version"]),
-        "glab": ("glab", artifacts["glab"]["version"]),
-        "nvim": ("nvim", artifacts["neovim"]["version"]),
+        "claude": artifacts["claude"]["version"],
+        "codex": artifacts["codex"]["version"],
+        "pi": artifacts["pi"]["version"],
+        "herdr": artifacts["herdr"]["version"],
+        "glab": artifacts["glab"]["version"],
+        "nvim": artifacts["neovim"]["version"],
     }
-    for name, (identity, version) in expected.items():
-        exact_version(bin_dir / name, identity, version)
+    for name, version in expected.items():
+        exact_version(bin_dir / name, name, version)
     (staging / "versions.json").write_text(
-        json.dumps({name: value[1] for name, value in expected.items()}, sort_keys=True) + "\n"
+        json.dumps(expected, sort_keys=True) + "\n"
     )
 
     immutable_tree(staging)

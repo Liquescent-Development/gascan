@@ -125,6 +125,7 @@ ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/opt/gascan/chromium/chrome-linux/chrome
 ENV CLAUDE_CONFIG_DIR=/home/workspace/.config/gascan/agents/claude
 ENV CODEX_HOME=/home/workspace/.config/gascan/agents/codex
 ENV PI_CODING_AGENT_DIR=/home/workspace/.config/gascan/agents/pi
+ENV PI_CODING_AGENT_SESSION_DIR=/home/workspace/.cache/pi
 ENV HERDR_CONFIG_PATH=/home/workspace/.config/gascan/herdr/config.toml
 ENV GH_CONFIG_DIR=/home/workspace/.config/gascan/gh
 ENV GLAB_CONFIG_DIR=/home/workspace/.config/gascan/glab

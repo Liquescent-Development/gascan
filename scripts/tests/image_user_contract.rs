@@ -1,4 +1,9 @@
-use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
+use std::{
+    fs,
+    os::unix::fs::{PermissionsExt, symlink},
+    path::Path,
+    process::Command,
+};
 
 fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
@@ -26,6 +31,15 @@ fn workstation_home_configuration_is_idempotent_and_refuses_unmanaged_paths() {
             Path::new(".config/gascan/agents").join(agent)
         );
         assert!(home.join(".config/gascan/agents").join(agent).is_dir());
+        assert_eq!(
+            fs::read_to_string(
+                home.join(".config/gascan/agents")
+                    .join(agent)
+                    .join(".gascan-managed")
+            )
+            .unwrap(),
+            "gascan-workstation-home-v1\n"
+        );
     }
     for tool in ["claude", "codex", "pi", "herdr", "gh", "glab"] {
         assert!(home.join(".cache").join(tool).is_dir());
@@ -62,6 +76,45 @@ fn workstation_home_configuration_is_idempotent_and_refuses_unmanaged_paths() {
         !blocked_herdr_home.join(".config/gascan/agents").exists(),
         "Herdr refusal must occur before managed targets are created"
     );
+
+    for case in ["later-agent", "config", "cache", "cache-file", "cache-link"] {
+        let adversarial_home = temp.path().join(case);
+        fs::create_dir(&adversarial_home).unwrap();
+        match case {
+            "later-agent" => {
+                let agents = adversarial_home.join(".config/gascan/agents");
+                fs::create_dir_all(agents.join("codex")).unwrap();
+                fs::write(
+                    agents.join(".gascan-managed"),
+                    "gascan-workstation-home-v1\n",
+                )
+                .unwrap();
+            }
+            "config" => {
+                fs::create_dir_all(adversarial_home.join(".config/gascan/glab")).unwrap()
+            }
+            "cache" => fs::create_dir_all(adversarial_home.join(".cache/glab")).unwrap(),
+            "cache-file" => {
+                fs::create_dir_all(adversarial_home.join(".cache")).unwrap();
+                fs::write(adversarial_home.join(".cache/pi"), "unmanaged").unwrap();
+            }
+            "cache-link" => {
+                fs::create_dir_all(adversarial_home.join(".cache")).unwrap();
+                symlink(temp.path(), adversarial_home.join(".cache/gh")).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let rejected = Command::new(&script)
+            .env("HOME", &adversarial_home)
+            .status()
+            .unwrap();
+        assert!(!rejected.success(), "accepted unmanaged {case} destination");
+        assert!(
+            !adversarial_home.join(".claude").exists()
+                && !adversarial_home.join(".config/gascan/agents/claude").exists(),
+            "preflight rejection for {case} left partial Claude state"
+        );
+    }
 }
 
 #[test]

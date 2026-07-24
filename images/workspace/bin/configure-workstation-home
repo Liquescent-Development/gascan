@@ -3,39 +3,74 @@ set -eu
 
 : "${HOME:?HOME must be set}"
 
+marker_name=.gascan-managed
+marker_value=gascan-workstation-home-v1
 agents_root=$HOME/.config/gascan/agents
-for agent in claude codex pi; do
-    link=$HOME/.$agent
-    expected=.config/gascan/agents/$agent
-    if [ -L "$link" ]; then
-        test "$(readlink "$link")" = "$expected" ||
-            { printf '%s\n' "refusing unmanaged link: $link" >&2; exit 1; }
-    elif [ -e "$link" ]; then
-        printf '%s\n' "refusing unmanaged path: $link" >&2
-        exit 1
-    fi
-done
 herdr_link=$HOME/.config/herdr
 herdr_expected=../.cache/herdr
-if [ -L "$herdr_link" ]; then
-    test "$(readlink "$herdr_link")" = "$herdr_expected" ||
-        { printf '%s\n' "refusing unmanaged link: $herdr_link" >&2; exit 1; }
-elif [ -e "$herdr_link" ]; then
-    printf '%s\n' "refusing unmanaged path: $herdr_link" >&2
+
+refuse()
+{
+    printf '%s\n' "refusing unmanaged path: $1" >&2
     exit 1
-fi
+}
 
-install -d -m 0700 "$agents_root"
-for agent in claude codex pi; do
-    target=$agents_root/$agent
-    link=$HOME/.$agent
-    install -d -m 0700 "$target"
-    if [ ! -L "$link" ]; then
-        ln -s ".config/gascan/agents/$agent" "$link"
+preflight_parent()
+{
+    path=$1
+    if [ -L "$path" ] || { [ -e "$path" ] && [ ! -d "$path" ]; }; then
+        refuse "$path"
     fi
-done
+}
 
+preflight_link()
+{
+    link=$1
+    expected=$2
+    if [ -L "$link" ]; then
+        test "$(readlink "$link")" = "$expected" || refuse "$link"
+    elif [ -e "$link" ]; then
+        refuse "$link"
+    fi
+}
+
+preflight_managed_dir()
+{
+    directory=$1
+    if [ -L "$directory" ] || { [ -e "$directory" ] && [ ! -d "$directory" ]; }; then
+        refuse "$directory"
+    fi
+    if [ -d "$directory" ]; then
+        marker=$directory/$marker_name
+        test ! -L "$marker" || refuse "$directory"
+        test -f "$marker" || refuse "$directory"
+        test "$(cat "$marker")" = "$marker_value" || refuse "$directory"
+    fi
+}
+
+ensure_managed_dir()
+{
+    directory=$1
+    install -d -m 0700 "$directory"
+    printf '%s\n' "$marker_value" >"$directory/$marker_name"
+    chmod 0600 "$directory/$marker_name"
+}
+
+# Complete preflight: no mkdir, marker, or link mutation may precede this list.
+preflight_parent "$HOME"
+preflight_parent "$HOME/.config"
+preflight_parent "$HOME/.config/gascan"
+preflight_parent "$HOME/.cache"
+for agent in claude codex pi; do
+    preflight_link "$HOME/.$agent" ".config/gascan/agents/$agent"
+done
+preflight_link "$herdr_link" "$herdr_expected"
+
+preflight_managed_dir "$agents_root"
 for directory in \
+    "$agents_root/claude" \
+    "$agents_root/codex" \
+    "$agents_root/pi" \
     "$HOME/.config/gascan/herdr" \
     "$HOME/.config/gascan/gh" \
     "$HOME/.config/gascan/glab" \
@@ -46,7 +81,32 @@ for directory in \
     "$HOME/.cache/gh" \
     "$HOME/.cache/glab"
 do
-    install -d -m 0700 "$directory"
+    preflight_managed_dir "$directory"
+done
+
+ensure_managed_dir "$agents_root"
+for directory in \
+    "$agents_root/claude" \
+    "$agents_root/codex" \
+    "$agents_root/pi" \
+    "$HOME/.config/gascan/herdr" \
+    "$HOME/.config/gascan/gh" \
+    "$HOME/.config/gascan/glab" \
+    "$HOME/.cache/claude" \
+    "$HOME/.cache/codex" \
+    "$HOME/.cache/pi" \
+    "$HOME/.cache/herdr" \
+    "$HOME/.cache/gh" \
+    "$HOME/.cache/glab"
+do
+    ensure_managed_dir "$directory"
+done
+
+for agent in claude codex pi; do
+    link=$HOME/.$agent
+    if [ ! -L "$link" ]; then
+        ln -s ".config/gascan/agents/$agent" "$link"
+    fi
 done
 if [ ! -L "$herdr_link" ]; then
     ln -s "$herdr_expected" "$herdr_link"

@@ -235,7 +235,7 @@ fn workstation_installer_enforces_file_npm_version_and_mode_boundaries_behaviora
     let fake_npm = fake_bin.join("npm");
     fs::write(
         &fake_npm,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" >\"$NPM_ARGS\"\nmkdir -p node_modules\n",
+        "#!/bin/sh\nprintf '%s\\n' CALL \"$@\" >>\"$NPM_ARGS\"\nif [ \"$1\" = --version ]; then printf '%s\\n' \"$FAKE_NPM_VERSION\"; exit 0; fi\nmkdir -p node_modules\n",
     )
     .unwrap();
     fs::set_permissions(&fake_npm, fs::Permissions::from_mode(0o755)).unwrap();
@@ -244,6 +244,7 @@ fn workstation_installer_enforces_file_npm_version_and_mode_boundaries_behaviora
             "npm-ci",
             source.to_str().unwrap(),
             destination.to_str().unwrap(),
+            "11.12.1",
         ])
         .env(
             "PATH",
@@ -254,58 +255,92 @@ fn workstation_installer_enforces_file_npm_version_and_mode_boundaries_behaviora
             ),
         )
         .env("NPM_ARGS", &args_file)
+        .env("FAKE_NPM_VERSION", "11.12.1")
         .status()
         .unwrap();
     assert!(status.success());
     assert_eq!(
-        fs::read_to_string(args_file).unwrap(),
+        fs::read_to_string(&args_file).unwrap(),
         format!(
-            "ci\n--offline\n--ignore-scripts\n--cache\n{}\n",
+            "CALL\n--version\nCALL\nci\n--offline\n--ignore-scripts\n--cache\n{}\n",
             source.join("npm-cache").display()
         )
     );
+    fs::write(&args_file, "").unwrap();
+    let mismatch_destination = temp.path().join("npm-mismatch");
+    let mismatch = Command::new(&installer)
+        .args([
+            "npm-ci",
+            source.to_str().unwrap(),
+            mismatch_destination.to_str().unwrap(),
+            "11.12.1",
+        ])
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                fake_bin.display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("NPM_ARGS", &args_file)
+        .env("FAKE_NPM_VERSION", "11.12.2")
+        .status()
+        .unwrap();
+    assert!(!mismatch.success(), "accepted the wrong npm version");
+    assert!(!mismatch_destination.exists());
+    assert_eq!(fs::read_to_string(&args_file).unwrap(), "CALL\n--version\n");
 
     let version = temp.path().join("version-tool");
-    fs::write(&version, "#!/bin/sh\nprintf '%s\\n' 'codex-cli 0.145.0'\n").unwrap();
+    fs::write(&version, "#!/bin/sh\nexit 99\n").unwrap();
     fs::set_permissions(&version, fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(
+    let version_status = |tool: &str, expected: &str, output: &str| {
+        fs::write(
+            &version,
+            format!("#!/bin/sh\nprintf '%s' '{}'\n", output.replace('\'', "'\\''")),
+        )
+        .unwrap();
         Command::new(&installer)
             .args([
                 "verify-version",
                 version.to_str().unwrap(),
-                "codex",
-                "0.145.0",
+                tool,
+                expected,
             ])
             .status()
             .unwrap()
-            .success()
-    );
-    assert!(
-        !Command::new(&installer)
-            .args([
-                "verify-version",
-                version.to_str().unwrap(),
-                "codex",
-                "0.146.0",
-            ])
-            .status()
-            .unwrap()
-            .success()
-    );
-    fs::write(&version, "#!/bin/sh\nprintf '%s\\n' 'compile 0.81.1'\n").unwrap();
-    assert!(
-        !Command::new(&installer)
-            .args([
-                "verify-version",
-                version.to_str().unwrap(),
-                "pi",
-                "0.81.1",
-            ])
-            .status()
-            .unwrap()
-            .success(),
-        "version identity matched inside an unrelated word"
-    );
+    };
+    for (tool, expected, output) in [
+        ("claude", "2.1.218", "2.1.218 (Claude Code)\n"),
+        ("codex", "0.145.0", "codex-cli 0.145.0\n"),
+        ("pi", "0.81.1", "0.81.1\n"),
+        ("herdr", "0.7.5", "herdr 0.7.5\n"),
+        ("glab", "1.109.0", "glab 1.109.0 (abcdef)\n"),
+        (
+            "nvim",
+            "0.11.7",
+            "NVIM v0.11.7\nBuild type: Release\nLuaJIT 2.1\n",
+        ),
+    ] {
+        assert!(
+            version_status(tool, expected, output).success(),
+            "real-shaped {tool} output was rejected"
+        );
+    }
+    for (tool, expected, output) in [
+        ("pi", "0.81.1", "pi 0.81.1\n"),
+        ("pi", "0.81.1", "0.81.1beta\n"),
+        ("codex", "0.145.0", "codex-cli 0.145.0-rc1\n"),
+        ("claude", "2.1.218", "2.1.218+other (Claude Code)\n"),
+        ("herdr", "0.7.5", "other 0.7.5\n"),
+        ("glab", "1.109.0", "glab 1.109.0beta (abcdef)\n"),
+        ("nvim", "0.11.7", "NVIM v0.11.70\n"),
+    ] {
+        assert!(
+            !version_status(tool, expected, output).success(),
+            "spoofed/suffixed {tool} output was accepted: {output:?}"
+        );
+    }
 
     let tree = temp.path().join("tree");
     fs::create_dir(&tree).unwrap();
