@@ -13,3 +13,11 @@ node = "lts"
 python = "3"
 ruby = "3"
 rust = "stable"
+
+[workstation]
+claude = "latest"
+codex = "latest"
+pi = "latest"
+herdr = "latest"
+glab = "latest"
+neovim = "0.11"

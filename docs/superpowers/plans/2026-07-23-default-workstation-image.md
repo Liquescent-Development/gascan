@@ -68,7 +68,7 @@ For every record assert:
 - HTTPS URL on the tool's official registry/release host.
 - 64-character lowercase SHA-256.
 - Platform is `linux-arm64`.
-- Kind is one of `npm_tgz`, `tar_zst`, or `tar_gz`.
+- Kind is one of `npm_tgz`, `tar_gz`, or the Herdr-only `raw_binary`.
 
 Mutation tests must reject an unknown host, redirect outside the allowlist,
 missing digest, duplicate tool, wrong architecture, and mutable release URL.
@@ -133,10 +133,24 @@ GitLab, and their documented asset CDN hosts.
 
 For the three npm tools, write a generated package manifest containing exact
 versions and an npm lockfile containing the complete transitive dependency
-closure and integrity values. Reject lifecycle scripts in every resolved
-package unless a package-specific, reviewed exception and sandboxed build step
-is added. The lock updater must prove the three top-level versions agree with
-the workstation artifact records.
+closure and integrity values. Lifecycle execution remains globally disabled.
+The lock updater records and fail-closed validates these exact no-execution
+exceptions:
+
+- `@google/genai@1.52.0`: inline `echo 'preinstall: no-op'`, keyed by package
+  integrity and declaring-manifest SHA-256.
+- `protobufjs@7.6.4`: `node scripts/postinstall`, keyed by package integrity,
+  declaring-manifest SHA-256, and script SHA-256; inspection proves it only
+  reads metadata and optionally warns.
+- `@anthropic-ai/claude-code@2.1.218`: do not execute `node install.cjs`.
+  Instead, independently lock the exact official
+  `@anthropic-ai/claude-code-linux-arm64@2.1.218` optional-package tarball,
+  extracted binary size, and binary SHA-256. The offline installer performs
+  the reviewed link/copy result itself after ELF Linux AArch64 validation.
+
+Reject every other lifecycle script and any version, command, integrity,
+manifest, script, native-package, size, or digest change. The lock updater must
+prove the three top-level versions agree with the workstation artifact records.
 
 - [ ] **Step 5: Generate and validate the real lock**
 
@@ -295,7 +309,7 @@ rtk git commit -m "build: add workstation system packages"
 Assert the connected context contains the three native archives:
 
 ```text
-workstation/herdr.tar.zst
+workstation/herdr
 workstation/glab.tar.gz
 workstation/neovim.tar.gz
 ```
@@ -386,7 +400,11 @@ Assert:
 - npm packages are installed from the complete locked local cache with
   `npm ci --offline --ignore-scripts`; no dependency may be resolved or
   downloaded during the Docker build.
-- Herdr, Glab, Neovim archives are extracted only after path/type validation.
+- Claude's verified native optional-package ELF is materialized by the
+  image-owned installer; publisher lifecycle code is never executed.
+- The Herdr raw binary is installed only after digest, size, regular-file, and
+  ELF ARM64 validation; Glab and Neovim archives are extracted only after
+  path/type validation.
 - Installed files are root-owned, non-writable, and beneath `/opt/gascan` or
   `/usr/local/bin`.
 - `fd` resolves to reviewed `fdfind`.

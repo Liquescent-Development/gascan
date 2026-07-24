@@ -11,6 +11,8 @@ publish = false
 libc = "0.2"
 cap-std = "4"
 cap-primitives = "4"
+base64 = "0.22"
+flate2 = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rustix = { version = "1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }

@@ -1,26 +1,20 @@
 base_image = "ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab"
-workspace_build_mode = "connected"
 ubuntu_snapshot = "2026-07-13T00:00:00Z"
-workspace_tag = "gascan-workspace:d4964500a3295a33"
-
-[workspace_bundles]
-media_type = "application/vnd.gascan.workspace-bundle.v1+tar.zstd"
-platform = "linux/arm64"
-# Task 1 defines validation before Tasks 2-4 publish immutable release assets.
-publication = "pending"
-
-[mise]
-version = "2026.5.0"
-url = "https://github.com/jdx/mise/releases/download/v2026.5.0/mise-v2026.5.0-linux-arm64"
-sha256 = "fba7c8a383cf3c59eb5a9995d5299fd2c78eba7eb1daace48d75fe491362f79a"
-
-[playwright_chromium]
-version = "149.0.7827.55+1228"
-url = "https://cdn.playwright.dev/dbazure/download/playwright/builds/chromium/1228/chromium-linux-arm64.zip"
-sha256 = "ec044b50ed065adeb4c5ffdb42d1529901cbaf897cdf542bfef8af01d6e0cc79"
+workspace_build_mode = "connected"
+workspace_tag = "gascan-workspace:0cda90a4b7ac4969"
 
 [gascamp]
 revision = "f6b248c5926240856dbea83d1d2c5c90ea1c1456"
+
+[mise]
+sha256 = "fba7c8a383cf3c59eb5a9995d5299fd2c78eba7eb1daace48d75fe491362f79a"
+url = "https://github.com/jdx/mise/releases/download/v2026.5.0/mise-v2026.5.0-linux-arm64"
+version = "2026.5.0"
+
+[playwright_chromium]
+sha256 = "ec044b50ed065adeb4c5ffdb42d1529901cbaf897cdf542bfef8af01d6e0cc79"
+url = "https://cdn.playwright.dev/dbazure/download/playwright/builds/chromium/1228/chromium-linux-arm64.zip"
+version = "149.0.7827.55+1228"
 
 [tools]
 elixir = "1.20.2-otp-29"
@@ -31,3 +25,99 @@ node = "24.18.0"
 python = "3.14.6"
 ruby = "3.4.10"
 rust = "1.97.0"
+
+[workspace_bundles]
+media_type = "application/vnd.gascan.workspace-bundle.v1+tar.zstd"
+platform = "linux/arm64"
+publication = "pending"
+
+[workstation_artifacts.claude]
+kind = "npm_tgz"
+platform = "linux-arm64"
+sha256 = "3a434c8bcb493e9ca87315d9aa6064835c5987e8fbc85c181bb76157dd5c45d8"
+size = 22971
+url = "https://registry.npmjs.org/@anthropic-ai/claude-code/-/claude-code-2.1.218.tgz"
+version = "2.1.218"
+
+[workstation_artifacts.codex]
+kind = "npm_tgz"
+platform = "linux-arm64"
+sha256 = "416399796cac371d1a033b17f34b08ba9b25c8f298a5b9d00e10f72c3b128c8d"
+size = 4311
+url = "https://registry.npmjs.org/@openai/codex/-/codex-0.145.0.tgz"
+version = "0.145.0"
+
+[workstation_artifacts.glab]
+kind = "tar_gz"
+platform = "linux-arm64"
+sha256 = "288155229b7a0824aaca5fbdc36000d0c41fe5d8b4a4c3cbe9908e75f4e4ec2e"
+size = 16674157
+url = "https://gitlab.com/gitlab-org/cli/-/releases/v1.109.0/downloads/glab_1.109.0_linux_arm64.tar.gz"
+version = "1.109.0"
+
+[workstation_artifacts.herdr]
+kind = "raw_binary"
+platform = "linux-arm64"
+sha256 = "32e763a1499a6b694b1d708e4f062b743be1da9f34fcfa4d212d6db6fe09a8b9"
+size = 19426064
+url = "https://github.com/ogulcancelik/herdr/releases/download/v0.7.5/herdr-linux-aarch64"
+version = "0.7.5"
+
+[workstation_artifacts.neovim]
+kind = "tar_gz"
+platform = "linux-arm64"
+sha256 = "99bb3c53604e83ce18fc0b459e34cf1a5e212f4e5fbe2eb136b3c18092ae9905"
+size = 10920686
+url = "https://github.com/neovim/neovim/releases/download/v0.11.7/nvim-linux-arm64.tar.gz"
+version = "0.11.7"
+
+[workstation_artifacts.pi]
+kind = "npm_tgz"
+platform = "linux-arm64"
+sha256 = "420113c0282160e6181656fd16cf18742f76bf9040ee3dfb9cb67e3e6ad5641c"
+size = 4967228
+url = "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.81.1.tgz"
+version = "0.81.1"
+
+[workstation_npm]
+npm_version = "11.12.1"
+package_lock_sha256 = "22521261a3bee269f2b992011e417eb4c47a94bcde34c92f29b4504f77454d5c"
+package_manifest_sha256 = "5942f8228c2e250dddea8688fc8fea2776042baafd40da0d2ac70920a1e165bb"
+scripts = "disabled"
+
+[workstation_npm.claude_native]
+binary_path = "package/claude"
+binary_sha256 = "295fd30481bd03b38450fdec2a6e25bb6472c2074f04b0c4a566cd5988f230bf"
+binary_size = 269990816
+integrity = "sha512-CcbVQCzXd9EnlktCEPrkElhdBZuqIWhkeinRGxUuZa6aal4h6J+8Dbo+OnfchBEzd1mahRDQK8BckGBAYozv2g=="
+package = "@anthropic-ai/claude-code-linux-arm64"
+platform = "linux-arm64"
+sha256 = "1d3cb5e12f0b653929e34ba046a7ba0a4f5c01eb25ea57b478dbac27e4af9619"
+size = 84159749
+url = "https://registry.npmjs.org/@anthropic-ai/claude-code-linux-arm64/-/claude-code-linux-arm64-2.1.218.tgz"
+version = "2.1.218"
+
+[workstation_npm.lifecycle_exceptions.claude]
+command = "node install.cjs"
+integrity = "sha512-BHV951ruIa6QXaZFDF1wRhwxAOkAiafB2AOWG6wGRUJ4apaJ9mlzp1BFLAhGfG0SknwAyqBenqeT6nit6at4uQ=="
+manifest_sha256 = "e3ea99daaf9c111af49f7ceb367f0274745565c44762befb03656adbd62b19b0"
+package = "@anthropic-ai/claude-code"
+script_path = "package/install.cjs"
+script_sha256 = "5cbab1670597f492cd4eeb946f3c344ebcb1fbd43c623ba192c9b33744461b85"
+version = "2.1.218"
+
+[workstation_npm.lifecycle_exceptions.google_genai]
+command = "echo 'preinstall: no-op'"
+integrity = "sha512-gwSvbpiN/17O9TbsqSsE/OzZcpv5Fo4RQjdngGgogtuB9RsyJ8ZHhX5KjHj1bp5N9snN2eK8LDGXSaWW2hof8Q=="
+manifest_sha256 = "ec761756421ea5502c23dbebfb4bc2b74c3ff842597199f2f330afc49cbdedc7"
+package = "@google/genai"
+version = "1.52.0"
+
+[workstation_npm.lifecycle_exceptions.protobufjs]
+command = "node scripts/postinstall"
+integrity = "sha512-RJJPTTpvFfHcWLkIa2JFWK4XvtSzS0yEWDmunqHXli1h3JlkbcQZXDZdcWxv+JK3Xsl5/UFDPZ0iGm7DAengYw=="
+manifest_sha256 = "f904144a0cf7ac4a5728abaeaf10413dd86ca282dcd387d8008bd9563740e5b1"
+package = "protobufjs"
+script_path = "package/scripts/postinstall.js"
+script_sha256 = "5af8463b97ee8e309b4a2111f9479bacdf0c180de0ca0155527679b1fc6d9e6c"
+version = "7.6.4"

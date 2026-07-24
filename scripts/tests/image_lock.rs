@@ -31,7 +31,57 @@ struct ImageLock {
     gascamp: Gascamp,
     workspace_tag: String,
     workspace_bundles: WorkspaceBundles,
+    workstation_artifacts: BTreeMap<String, WorkstationArtifact>,
+    workstation_npm: WorkstationNpm,
 }
+
+#[derive(Clone, Deserialize)]
+struct WorkstationArtifact {
+    version: String,
+    url: String,
+    sha256: String,
+    platform: String,
+    kind: String,
+    size: u64,
+}
+
+#[derive(Deserialize)]
+struct WorkstationNpm {
+    scripts: String,
+    npm_version: String,
+    package_manifest_sha256: String,
+    package_lock_sha256: String,
+    lifecycle_exceptions: BTreeMap<String, NpmLifecycleException>,
+    claude_native: ClaudeNative,
+}
+
+#[derive(Deserialize)]
+struct NpmLifecycleException {
+    package: String,
+    version: String,
+    command: String,
+    integrity: String,
+    manifest_sha256: String,
+    script_path: Option<String>,
+    script_sha256: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ClaudeNative {
+    package: String,
+    version: String,
+    url: String,
+    integrity: String,
+    sha256: String,
+    size: u64,
+    binary_path: String,
+    binary_sha256: String,
+    binary_size: u64,
+    platform: String,
+}
+
+const REQUIRED_WORKSTATION_ARTIFACTS: &[&str] =
+    &["claude", "codex", "pi", "herdr", "glab", "neovim"];
 
 #[derive(Deserialize)]
 struct WorkspaceBundles {
@@ -82,6 +132,71 @@ fn every_remote_image_input_is_immutable_and_checksummed() {
     );
     assert_eq!(lock.workspace_bundles.platform, "linux/arm64");
     assert_eq!(lock.workspace_bundles.publication, "pending");
+    assert_eq!(
+        lock.workstation_artifacts.len(),
+        REQUIRED_WORKSTATION_ARTIFACTS.len()
+    );
+    assert!(
+        REQUIRED_WORKSTATION_ARTIFACTS
+            .iter()
+            .all(|name| lock.workstation_artifacts.contains_key(*name))
+    );
+    for (name, artifact) in lock.workstation_artifacts {
+        assert!(
+            !artifact.version.is_empty()
+                && !matches!(artifact.version.as_str(), "latest" | "stable" | "lts")
+                && !artifact.version.contains('*')
+        );
+        assert!(artifact.url.starts_with("https://"), "{name}");
+        assert!(sha256_is_lower_hex(&artifact.sha256), "{name}");
+        assert_eq!(artifact.platform, "linux-arm64", "{name}");
+        assert!(artifact.size > 0, "{name}");
+        if name == "herdr" {
+            assert_eq!(artifact.kind, "raw_binary");
+            assert!(artifact.size <= 64 * 1024 * 1024);
+            assert!(artifact.url.ends_with("/herdr-linux-aarch64"));
+        } else {
+            assert!(
+                matches!(artifact.kind.as_str(), "npm_tgz" | "tar_gz"),
+                "{name}"
+            );
+        }
+    }
+    assert_eq!(lock.workstation_npm.scripts, "disabled");
+    assert_eq!(lock.workstation_npm.npm_version, "11.12.1");
+    assert!(sha256_is_lower_hex(
+        &lock.workstation_npm.package_manifest_sha256
+    ));
+    assert!(sha256_is_lower_hex(
+        &lock.workstation_npm.package_lock_sha256
+    ));
+    assert_eq!(lock.workstation_npm.lifecycle_exceptions.len(), 3);
+    for (name, evidence) in lock.workstation_npm.lifecycle_exceptions {
+        assert!(!evidence.package.is_empty(), "{name}");
+        assert!(!evidence.version.is_empty(), "{name}");
+        assert!(!evidence.command.is_empty(), "{name}");
+        assert!(evidence.integrity.starts_with("sha512-"), "{name}");
+        assert!(sha256_is_lower_hex(&evidence.manifest_sha256), "{name}");
+        assert_eq!(
+            evidence.script_path.is_some(),
+            evidence.script_sha256.is_some(),
+            "{name}"
+        );
+        if let Some(digest) = evidence.script_sha256 {
+            assert!(sha256_is_lower_hex(&digest), "{name}");
+        }
+    }
+    let native = lock.workstation_npm.claude_native;
+    assert_eq!(native.package, "@anthropic-ai/claude-code-linux-arm64");
+    assert_eq!(native.version, "2.1.218");
+    assert!(native.url.starts_with("https://registry.npmjs.org/"));
+    assert!(native.integrity.starts_with("sha512-"));
+    assert!(sha256_is_lower_hex(&native.sha256));
+    assert_eq!(native.size, 84_159_749);
+    assert_eq!(native.binary_path, "package/claude");
+    assert!(sha256_is_lower_hex(&native.binary_sha256));
+    assert_eq!(native.binary_size, 269_990_816);
+    assert_eq!(native.platform, "linux-arm64");
 }
 
 #[test]

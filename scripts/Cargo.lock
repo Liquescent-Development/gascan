@@ -323,8 +323,10 @@ dependencies = [
 name = "gascan-image-tools"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "cap-primitives",
  "cap-std",
+ "flate2",
  "libc",
  "reqwest",
  "rustix",

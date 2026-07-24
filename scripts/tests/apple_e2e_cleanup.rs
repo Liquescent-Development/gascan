@@ -725,7 +725,7 @@ esac
 fn mismatched_ambiguous_volume_identity_is_rejected_without_deletion() {
     let temp = tempfile::tempdir().unwrap();
     let id = "gate4-test-123456789abc";
-    let volume = format!("gascan-mise-{id}");
+    let _volume = format!("gascan-mise-{id}");
     let path = manifest(&temp, managed_resources(id));
     install_container_script(
         &temp,
