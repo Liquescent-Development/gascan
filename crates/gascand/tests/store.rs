@@ -45,7 +45,13 @@ fn fixture(root: &str) -> SandboxRecord {
             json!({"path":"setup.sh","digest":"abc"}),
         )),
         tool_resolution: Some(ToolResolution::new(1, json!({"node":"22.1.0"}))),
-        image_resolution: Some(ImageResolution::new(1, json!({"digest":"sha256:abc"}))),
+        image_resolution: Some(ImageResolution::new(
+            1,
+            json!({
+                "digest": "ghcr.io/liquescent-development/gascan/workspace:fixture@sha256:\
+                           aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }),
+        )),
         storage_resolution: Some(StorageResolution::new(
             1,
             json!({

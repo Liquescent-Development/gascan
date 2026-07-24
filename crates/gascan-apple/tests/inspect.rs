@@ -49,6 +49,11 @@ async fn inspect_maps_running_and_stopped_fixtures() {
             .unwrap()
             .unwrap();
         assert_eq!(actual.id, id());
+        assert_eq!(
+            actual.image,
+            "ghcr.io/liquescent-development/gascan/workspace:fixture@sha256:\
+             aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
         assert_eq!(actual.state, expected);
         assert_eq!(actual.ownership.managed_by, "gascan");
         assert_eq!(actual.ownership.sandbox_id, id());
@@ -138,6 +143,26 @@ async fn inspect_never_forges_owned_metadata_from_invalid_annotations() {
             .await
             .expect_err("invalid ownership annotation must not produce a sandbox");
         assert_eq!(error.code(), expected_code, "labels: {labels}");
+    }
+}
+
+#[tokio::test]
+async fn inspect_rejects_missing_or_mutable_image_references() {
+    for image in [
+        String::new(),
+        r#","image":"""#.to_owned(),
+        r#","image":"ghcr.io/liquescent-development/gascan/workspace:latest""#.to_owned(),
+        r#","image":"ghcr.io/liquescent-development/gascan/workspace:fixture@sha256:short""#
+            .to_owned(),
+    ] {
+        let record = format!(
+            r#"[{{"configuration":{{"id":"code-a1b2c3d4e5f6"{image},"labels":{{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":"code-a1b2c3d4e5f6"}}}},"status":{{"state":"running"}}}}]"#
+        );
+        let error = inspector(output(record.as_bytes()))
+            .inspect(&id())
+            .await
+            .expect_err("unresolved image must not produce a sandbox");
+        assert_eq!(error.code(), "invalid_output", "image field: {image}");
     }
 }
 

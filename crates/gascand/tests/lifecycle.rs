@@ -312,6 +312,59 @@ async fn unchanged_apply_inspects_and_starts_stopped_runtime_without_rerunning_h
 }
 
 #[tokio::test]
+async fn image_resolution_only_proves_the_approved_image_when_valid_and_matching() -> TestResult {
+    let old_digest = "ghcr.io/liquescent-development/gascan/workspace:old@sha256:\
+                      bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    for (recorded, change_required) in [
+        (None, true),
+        (Some(json!({"digest": "RUNNING"})), false),
+        (Some(json!({"digest": old_digest})), true),
+        (Some(json!({"digest": 7})), true),
+    ] {
+        let root = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+        let make_spec = || SandboxSpec::from_root("image-state", root, Manifest::load(root)?);
+        let id = make_spec()?.id().clone();
+        let runtime = FakeRuntime::default();
+        let service = SandboxService::new(
+            runtime.clone(),
+            gascand::Store::open(root.join("state.db"))?,
+            Arc::new(NoopProvisioner),
+        );
+        service.up(UpRequest::new(make_spec()?)).await?;
+        let running_digest = runtime.inspect(&id).await?.ok_or("running sandbox")?.image;
+        let mut record = service.status(&id)?.ok_or("sandbox record")?;
+        record.image_resolution = recorded.map(|details| {
+            let details = if details["digest"] == "RUNNING" {
+                json!({"digest": running_digest})
+            } else {
+                details
+            };
+            gascand::ImageResolution::new(1, details)
+        });
+        service.store().put_sandbox(&record)?;
+
+        let operation = service.up(UpRequest::new(make_spec()?)).await?;
+        let events = service.store().operation_events(operation.id)?;
+        assert_eq!(
+            events.iter().any(|event| {
+                event
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("phase"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("apply_required")
+            }),
+            change_required,
+            "recorded image: {:?}, running image: {running_digest}",
+            record.image_resolution
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn up_after_destroy_reprovisions_the_fresh_runtime() -> TestResult {
     let root = tempfile::tempdir()?;
     let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;

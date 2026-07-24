@@ -117,7 +117,11 @@ impl CommandRunner for StatefulAppleRunner {
             }
             ["inspect", id] => match state.containers.get(*id) {
                 Some((sandbox, status)) => {
-                    json!([{"configuration":{"id":id,"labels":{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":sandbox}},"status":{"state":status}}])
+                    json!([{"configuration":{
+                        "id":id,
+                        "image":"ghcr.io/liquescent-development/gascan/workspace:fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "labels":{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":sandbox}
+                    },"status":{"state":status}}])
                 }
                 None => {
                     return Err(RuntimeError::CommandFailed {

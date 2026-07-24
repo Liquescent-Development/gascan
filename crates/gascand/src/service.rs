@@ -46,6 +46,19 @@ struct UpRuntimeContext<'a> {
     desired_fingerprint: &'a str,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ImageState {
+    recorded: Option<String>,
+    running: String,
+    approved: String,
+}
+
+impl ImageState {
+    fn change_required(&self) -> bool {
+        self.recorded.as_deref() != Some(self.approved.as_str()) || self.running != self.approved
+    }
+}
+
 struct BoundedTail {
     bytes: Vec<u8>,
     limit: usize,
@@ -702,9 +715,11 @@ impl<B: RuntimeBackend> SandboxService<B> {
             }
             self.emit(operation_id, json!({"phase":"started"}), sender)
                 .await?;
+            let image_state = image_state(prior, &current.image, create.image())?;
             let durable_match = if let Some(record) = prior.filter(|_| inspected.is_some()) {
                 resolution_matches(record, desired_fingerprint)
                     && tool_state_matches(record, spec.canonical_root(), spec.manifest())?
+                    && !image_state.change_required()
             } else {
                 false
             };
@@ -2044,6 +2059,54 @@ fn applied_state(record: Option<&SandboxRecord>) -> AppliedState {
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
     AppliedState::with_hashes(tool_hash, setup_sha256)
+}
+
+fn image_state(
+    record: Option<&SandboxRecord>,
+    running: &str,
+    approved: &str,
+) -> Result<ImageState, RuntimeError> {
+    if !immutable_workspace_image(running) {
+        return Err(RuntimeError::InvalidOutput {
+            operation: "runtime image inspection".to_owned(),
+            message: "running workspace image is not digest-qualified".to_owned(),
+        });
+    }
+    if !immutable_workspace_image(approved) {
+        return Err(RuntimeError::InvalidOutput {
+            operation: "workspace image policy".to_owned(),
+            message: "approved workspace image is not digest-qualified".to_owned(),
+        });
+    }
+    Ok(ImageState {
+        recorded: record.and_then(stored_image),
+        running: running.to_owned(),
+        approved: approved.to_owned(),
+    })
+}
+
+fn stored_image(record: &SandboxRecord) -> Option<String> {
+    let resolution = record.image_resolution.as_ref()?;
+    if resolution.version != 1 {
+        return None;
+    }
+    resolution
+        .details
+        .get("digest")?
+        .as_str()
+        .filter(|value| immutable_workspace_image(value))
+        .map(ToOwned::to_owned)
+}
+
+fn immutable_workspace_image(value: &str) -> bool {
+    let Some((name, digest)) = value.split_once("@sha256:") else {
+        return false;
+    };
+    !name.is_empty()
+        && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn provisioning_transport_error() -> ServiceError {

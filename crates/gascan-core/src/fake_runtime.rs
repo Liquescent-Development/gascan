@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 
+const FAKE_WORKSPACE_IMAGE: &str = "ghcr.io/liquescent-development/gascan/workspace:fake@sha256:\
+     aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
 #[derive(Clone)]
 pub struct FakeRuntime {
     inner: Arc<Mutex<FakeState>>,
@@ -171,6 +174,7 @@ impl FakeRuntime {
             id.clone(),
             RuntimeSandbox {
                 id: id.clone(),
+                image: FAKE_WORKSPACE_IMAGE.to_owned(),
                 state: ContainerState::Stopped,
                 ownership,
             },
@@ -238,6 +242,7 @@ impl FakeRuntime {
             id.clone(),
             RuntimeSandbox {
                 id: id.clone(),
+                image: FAKE_WORKSPACE_IMAGE.to_owned(),
                 state: ContainerState::Stopped,
                 ownership,
             },
@@ -255,6 +260,7 @@ impl FakeRuntime {
             id.clone(),
             RuntimeSandbox {
                 id: id.clone(),
+                image: FAKE_WORKSPACE_IMAGE.to_owned(),
                 state: ContainerState::Stopped,
                 ownership,
             },
@@ -592,6 +598,7 @@ impl RuntimeBackend for FakeRuntime {
             request.id.clone(),
             RuntimeSandbox {
                 id: request.id.clone(),
+                image: request.image.clone(),
                 state: ContainerState::Stopped,
                 ownership: request.ownership.clone(),
             },

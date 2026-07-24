@@ -253,6 +253,7 @@ pub enum ContainerState {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeSandbox {
     pub id: SandboxId,
+    pub image: String,
     pub state: ContainerState,
     pub ownership: OwnershipMetadata,
 }

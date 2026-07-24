@@ -59,8 +59,10 @@ where
         }
         let state = map_state(&observed_id, &record.status.state)?;
         let ownership = ownership_metadata(&observed_id, &record.configuration.labels)?;
+        let image = parse_image(record.configuration.image)?;
         Ok(Some(RuntimeSandbox {
             id: observed_id,
+            image,
             state,
             ownership,
         }))
@@ -93,6 +95,8 @@ struct ContainerRecord {
 struct ContainerConfiguration {
     id: String,
     #[serde(default)]
+    image: Option<String>,
+    #[serde(default)]
     labels: BTreeMap<String, String>,
 }
 
@@ -107,6 +111,33 @@ fn parse_records(operation: &str, bytes: &[u8]) -> Result<Vec<ContainerRecord>, 
 
 fn parse_id(operation: &str, id: String) -> Result<SandboxId, RuntimeError> {
     SandboxId::try_from(id).map_err(|error| invalid_output(operation, error.to_string()))
+}
+
+fn parse_image(image: Option<String>) -> Result<String, RuntimeError> {
+    let image = image.ok_or_else(|| {
+        invalid_output(
+            "container inspect",
+            "missing inspected container image".to_owned(),
+        )
+    })?;
+    let Some((name, digest)) = image.split_once("@sha256:") else {
+        return Err(invalid_output(
+            "container inspect",
+            "container image is not digest-qualified".to_owned(),
+        ));
+    };
+    if name.is_empty()
+        || digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(invalid_output(
+            "container inspect",
+            "container image is not digest-qualified".to_owned(),
+        ));
+    }
+    Ok(image)
 }
 
 fn map_state(id: impl std::fmt::Display, state: &str) -> Result<ContainerState, RuntimeError> {
