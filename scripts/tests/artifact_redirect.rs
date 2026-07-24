@@ -3,13 +3,14 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use gascan_image_tools::{
-    ArtifactClass, RedirectRules, install_verified_artifact, validate_cached_artifact,
-    walk_redirects_with,
+    ArtifactClass, RedirectRules, install_sri_artifact, install_verified_artifact,
+    validate_cached_artifact, validate_cached_sri_artifact, walk_redirects_with,
 };
 use reqwest::Url;
-use sha2::{Digest, Sha256};
-use std::os::unix::fs::symlink;
+use sha2::{Digest, Sha256, Sha512};
+use std::os::unix::fs::{PermissionsExt, symlink};
 
 #[test]
 fn unapproved_intermediate_redirect_is_rejected_before_contact() {
@@ -108,4 +109,29 @@ fn cached_artifact_symlink_is_rejected_without_following() {
     symlink(&target, &cached).unwrap();
     let hash = format!("{:x}", Sha256::digest(bytes));
     assert!(validate_cached_artifact(&cached, &hash, bytes.len() as u64).is_err());
+}
+
+#[test]
+fn npm_sri_publication_is_read_only_and_cache_links_or_mutations_are_rejected() {
+    let temporary = tempfile::tempdir().unwrap();
+    let destination = temporary.path().join("npm.tgz");
+    let bytes = b"locked npm tarball";
+    let integrity = format!("sha512-{}", BASE64.encode(Sha512::digest(bytes)));
+    install_sri_artifact(bytes.as_slice(), &destination, &integrity, 1024).unwrap();
+    assert_eq!(
+        std::fs::metadata(&destination)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o444
+    );
+    validate_cached_sri_artifact(&destination, &integrity, 1024).unwrap();
+
+    let peer = temporary.path().join("peer");
+    std::fs::hard_link(&destination, peer).unwrap();
+    assert!(validate_cached_sri_artifact(&destination, &integrity, 1024).is_err());
+    std::fs::remove_file(&destination).unwrap();
+    std::fs::write(&destination, b"mutated").unwrap();
+    assert!(validate_cached_sri_artifact(&destination, &integrity, 1024).is_err());
 }

@@ -1,8 +1,9 @@
 use std::{fs, path::Path};
 
 use gascan_image_tools::{
-    ArtifactClass, DynError, RedirectRules, install_bounded_artifact, install_verified_artifact,
-    open_with_redirect_rules, validate_cached_artifact,
+    ArtifactClass, DynError, RedirectRules, install_bounded_artifact, install_sri_artifact,
+    install_verified_artifact, open_with_redirect_rules, validate_cached_artifact,
+    validate_cached_sri_artifact,
 };
 
 fn main() -> Result<(), DynError> {
@@ -18,11 +19,34 @@ fn main() -> Result<(), DynError> {
     let destination = Path::new(&destination);
     let redirect_rules = RedirectRules::for_artifact(class);
     redirect_rules.require_initial_url(&url)?;
+    if class == ArtifactClass::WorkstationNpm {
+        let maximum = exact_size.ok_or("npm artifact requires an explicit size bound")?;
+        if validate_cached_sri_artifact(destination, &expected, maximum).is_ok() {
+            fs::set_permissions(
+                destination,
+                <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o444),
+            )?;
+            eprintln!("Revalidated cached npm artifact: {}", destination.display());
+            return Ok(());
+        }
+        let response = open_with_redirect_rules(&url, redirect_rules)?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > maximum)
+        {
+            return Err("npm artifact HTTP content length violates the size limit".into());
+        }
+        return install_sri_artifact(response, destination, &expected, maximum);
+    }
 
     if let Ok(metadata) = fs::symlink_metadata(destination) {
         if metadata.file_type().is_file() && metadata.len() <= class.maximum_bytes() {
             let expected_size = exact_size.unwrap_or(metadata.len());
             if validate_cached_artifact(destination, &expected, expected_size).is_ok() {
+                fs::set_permissions(
+                    destination,
+                    <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o444),
+                )?;
                 eprintln!(
                     "Revalidated cached image artifact: {}",
                     destination.display()
@@ -50,6 +74,10 @@ fn artifact_class(value: &str) -> Result<ArtifactClass, DynError> {
         "mise" => Ok(ArtifactClass::Mise),
         "chromium" => Ok(ArtifactClass::Chromium),
         "workspace-bundle" => Ok(ArtifactClass::WorkspaceBundle),
+        "workstation-github" => Ok(ArtifactClass::WorkstationGithub),
+        "workstation-gitlab" => Ok(ArtifactClass::WorkstationGitlab),
+        "workstation-npm" => Ok(ArtifactClass::WorkstationNpm),
+        "workstation-npm-native" => Ok(ArtifactClass::WorkstationNpmNative),
         _ => Err(format!("unknown artifact class: {value}").into()),
     }
 }

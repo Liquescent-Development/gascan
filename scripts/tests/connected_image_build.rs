@@ -1,5 +1,11 @@
-use sha2::{Digest, Sha256};
-use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use sha2::{Digest, Sha256, Sha512};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
@@ -8,6 +14,127 @@ fn root() -> &'static Path {
 fn executable(path: &Path, body: &str) {
     fs::write(path, body).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn copy_tree(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).unwrap();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let target = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+fn npm_cache_path(root: &Path, integrity: &str) -> PathBuf {
+    let digest = BASE64
+        .decode(integrity.strip_prefix("sha512-").unwrap())
+        .unwrap();
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    root.join("_cacache/content-v2/sha512")
+        .join(&hex[..2])
+        .join(&hex[2..4])
+        .join(&hex[4..])
+}
+
+fn populate_minimal_workstation(repository: &Path, cache: &Path) {
+    for directory in ["bin", "etc", "libexec", "tests"] {
+        copy_tree(
+            &root().join("images/workspace").join(directory),
+            &repository.join("images/workspace").join(directory),
+        );
+    }
+    fs::create_dir_all(repository.join("tests/image")).unwrap();
+    fs::copy(
+        root().join("images/workspace/Dockerfile"),
+        repository.join("images/workspace/Dockerfile"),
+    )
+    .unwrap();
+    fs::copy(
+        root().join("tests/image/system-tools.txt"),
+        repository.join("tests/image/system-tools.txt"),
+    )
+    .unwrap();
+    let package = b"{\"name\":\"fixture\",\"private\":true,\"version\":\"0.0.0\"}\n";
+    let npm_fixtures: [(&str, &[u8]); 4] = [
+        ("claude", b"claude npm\n"),
+        ("codex", b"codex npm\n"),
+        ("pi", b"pi npm\n"),
+        ("native", b"native\n"),
+    ];
+    let mut package_records = "\"\":{\"name\":\"fixture\",\"version\":\"0.0.0\"}".to_owned();
+    for (name, bytes) in npm_fixtures {
+        let integrity = format!("sha512-{}", BASE64.encode(Sha512::digest(bytes)));
+        package_records.push_str(&format!(
+            ",\"node_modules/{name}\":{{\"integrity\":\"{integrity}\",\"resolved\":\"https://registry.npmjs.org/fixture/{name}\",\"version\":\"1.0.0\"}}"
+        ));
+        let npm_path = npm_cache_path(&cache.join("workstation/npm-cache"), &integrity);
+        fs::create_dir_all(npm_path.parent().unwrap()).unwrap();
+        fs::write(npm_path, bytes).unwrap();
+    }
+    let package_lock = format!(
+        "{{\"lockfileVersion\":3,\"name\":\"fixture\",\"packages\":{{{package_records}}}}}\n"
+    );
+    fs::write(
+        repository.join("images/workspace/workstation-package.json"),
+        package,
+    )
+    .unwrap();
+    fs::write(
+        repository.join("images/workspace/workstation-package-lock.json"),
+        &package_lock,
+    )
+    .unwrap();
+    let native = b"native\n";
+    fs::create_dir_all(cache.join("workstation")).unwrap();
+    for name in ["claude-native.tgz", "glab.tar.gz", "herdr", "neovim.tar.gz"] {
+        fs::write(cache.join("workstation").join(name), native).unwrap();
+    }
+    let mut artifacts = String::new();
+    for (name, kind, host) in [
+        ("claude", "npm_tgz", "registry.npmjs.org"),
+        ("codex", "npm_tgz", "registry.npmjs.org"),
+        ("glab", "tar_gz", "gitlab.com"),
+        ("herdr", "raw_binary", "github.com"),
+        ("neovim", "tar_gz", "github.com"),
+        ("pi", "npm_tgz", "registry.npmjs.org"),
+    ] {
+        let bytes: &[u8] = if matches!(name, "glab" | "herdr" | "neovim") {
+            native
+        } else {
+            npm_fixtures
+                .iter()
+                .find_map(|(candidate, bytes)| (*candidate == name).then_some(*bytes))
+                .unwrap()
+        };
+        artifacts.push_str(&format!(
+            "\n[workstation_artifacts.{name}]\nversion = \"1.0.0\"\nurl = \"https://{host}/fixture/{name}\"\nsha256 = \"{:x}\"\nsize = {}\nplatform = \"linux-arm64\"\nkind = \"{kind}\"\n",
+            Sha256::digest(bytes),
+            bytes.len(),
+        ));
+    }
+    let native_integrity = format!("sha512-{}", BASE64.encode(Sha512::digest(native)));
+    let lock = format!(
+        "base_image = \"ubuntu@sha256:{}\"\nworkspace_build_mode = \"connected\"\nworkspace_tag = \"gascan-workspace:fixture\"\n[mise]\nurl = \"https://example.invalid/mise\"\nsha256 = \"{}\"\n[playwright_chromium]\nurl = \"https://example.invalid/chromium\"\nsha256 = \"{}\"\n[gascamp]\nrevision = \"f6b248c5926240856dbea83d1d2c5c90ea1c1456\"\n[workspace_bundles]\npublication = \"pending\"\n{artifacts}\n[workstation_npm]\nscripts = \"disabled\"\nnpm_version = \"11.12.1\"\npackage_manifest_sha256 = \"{:x}\"\npackage_lock_sha256 = \"{:x}\"\n[workstation_npm.claude_native]\npackage = \"fixture\"\nversion = \"1.0.0\"\nurl = \"https://registry.npmjs.org/fixture/native\"\nintegrity = \"{}\"\nsha256 = \"{:x}\"\nsize = {}\nbinary_path = \"package/claude\"\nbinary_sha256 = \"{}\"\nbinary_size = 1\nplatform = \"linux-arm64\"\n",
+        "7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab",
+        "b".repeat(64),
+        "c".repeat(64),
+        Sha256::digest(package),
+        Sha256::digest(package_lock.as_bytes()),
+        native_integrity,
+        Sha256::digest(native),
+        native.len(),
+        "d".repeat(64),
+    );
+    fs::write(repository.join("images/workspace/versions.lock"), &lock).unwrap();
+    fs::write(
+        cache.join("workstation/prefetch-lock.sha256"),
+        format!("{:x}\n", Sha256::digest(lock.as_bytes())),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -76,7 +203,10 @@ fn sanitizer_is_prepared_before_build_and_consumes_the_pipeline_directly() {
     let build = script
         .find("container build")
         .expect("connected build must invoke container build");
-    assert!(prepare < build, "sanitizer preparation must precede container build");
+    assert!(
+        prepare < build,
+        "sanitizer preparation must precede container build"
+    );
     assert!(
         script.contains("cargo build --quiet --locked --offline --manifest-path \"$root/scripts/Cargo.toml\" --bin sanitize-build-output"),
         "sanitizer preparation must use the exact locked offline tools manifest"
@@ -99,8 +229,7 @@ fn sanitizer_is_prepared_before_build_and_consumes_the_pipeline_directly() {
         "container output must be consumed by the prepared executable: {pipeline}"
     );
     assert!(
-        !pipeline.contains("run_tool sanitize-build-output")
-            && !pipeline.contains("cargo run"),
+        !pipeline.contains("run_tool sanitize-build-output") && !pipeline.contains("cargo run"),
         "cargo must not be in the pipeline consumer path: {pipeline}"
     );
 }
@@ -162,7 +291,10 @@ esac
     );
     let output = Command::new("bash")
         .arg(repo.join("scripts/build-connected-workspace-image.sh"))
-        .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()))
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
         .env("CARGO_TARGET_DIR", &cargo_target)
         .env("CARGO_BUILD_TARGET", "aarch64-apple-darwin")
         .env("REPORTED_SANITIZER", &reported)
@@ -170,7 +302,12 @@ esac
         .env("STALE_MARKER", &marker)
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(73), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        output.status.code(),
+        Some(73),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(!marker.exists(), "stale host/debug sanitizer executed");
 }
 
@@ -187,7 +324,11 @@ fn replacing_shared_artifact_after_private_staging_cannot_replace_consumer() {
     fs::create_dir_all(repo.join("images/workspace")).unwrap();
     fs::create_dir_all(&context).unwrap();
     fs::create_dir(&bin).unwrap();
-    fs::copy(root().join("scripts/build-connected-workspace-image.sh"), repo.join("scripts/build-connected-workspace-image.sh")).unwrap();
+    fs::copy(
+        root().join("scripts/build-connected-workspace-image.sh"),
+        repo.join("scripts/build-connected-workspace-image.sh"),
+    )
+    .unwrap();
     let base = "ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab";
     fs::write(repo.join("images/workspace/versions.lock"), format!("workspace_build_mode = \"connected\"\nbase_image = \"{base}\"\nworkspace_tag = \"gascan-workspace:fixture\"\n[gascamp]\nrevision = \"f6b248c5926240856dbea83d1d2c5c90ea1c1456\"\n")).unwrap();
     fs::write(context.join("Dockerfile"), "FROM scratch\n").unwrap();
@@ -195,7 +336,8 @@ fn replacing_shared_artifact_after_private_staging_cannot_replace_consumer() {
     let manifest = format!("{:x}", Sha256::digest(b"fixture\n"));
     executable(
         &bin.join("cargo"),
-        &format!(r#"#!/bin/bash
+        &format!(
+            r#"#!/bin/bash
 case "$1" in
  pkgid) printf 'path+file:///fixture/scripts#gascan-image-tools@0.1.0\n' ;;
  build) mkdir -p "$(dirname "$REPORTED_SANITIZER")"; cp "$SANITIZER" "$REPORTED_SANITIZER"; chmod 0755 "$REPORTED_SANITIZER"; printf '{{"reason":"compiler-artifact","package_id":"path+file:///fixture/scripts#gascan-image-tools@0.1.0","target":{{"kind":["bin"],"crate_types":["bin"],"name":"sanitize-build-output"}},"executable":"%s"}}\n' "$REPORTED_SANITIZER" ;;
@@ -203,7 +345,8 @@ case "$1" in
  run) case "$*" in *prepare-workspace-context*) printf '{manifest}\n' ;; *validate-image-inspect*) printf 'sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab\n' ;; *) exit 90 ;; esac ;;
  *) exit 91 ;;
 esac
-"#),
+"#
+        ),
     );
     executable(
         &bin.join("container"),
@@ -211,14 +354,22 @@ esac
     );
     let output = Command::new("bash")
         .arg(repo.join("scripts/build-connected-workspace-image.sh"))
-        .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()))
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
         .env("CARGO_TARGET_DIR", &cargo_target)
         .env("REPORTED_SANITIZER", &reported)
         .env("SANITIZER", env!("CARGO_BIN_EXE_sanitize-build-output"))
         .env("REPLACEMENT_MARKER", &marker)
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(73), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        output.status.code(),
+        Some(73),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(!marker.exists(), "replacement shared sanitizer executed");
 }
 
@@ -299,7 +450,12 @@ esac
         .env("SANITIZER_READY", &ready)
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(73), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        output.status.code(),
+        Some(73),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let log = fs::read_to_string(calls).unwrap();
     assert!(log.contains("cargo\tbuild"), "{log}");
     assert!(
@@ -413,33 +569,24 @@ fn persistent_direct_context_mutation_during_build_blocks_receipt_publication() 
     fs::create_dir_all(repo.join("images/workspace")).unwrap();
     fs::create_dir_all(&artifacts).unwrap();
     fs::create_dir(&bin).unwrap();
-    fs::create_dir_all(source_artifacts.join("playwright-chromium-reviewed/chrome-linux"))
-        .unwrap();
+    fs::create_dir_all(source_artifacts.join("playwright-chromium-reviewed/chrome-linux")).unwrap();
     fs::write(source_artifacts.join("mise-linux-arm64"), "mise fixture\n").unwrap();
-    fs::write(
-        source_artifacts.join("expected-tool-versions.json"),
-        "{}\n",
-    )
-    .unwrap();
+    fs::write(source_artifacts.join("expected-tool-versions.json"), "{}\n").unwrap();
     fs::write(
         source_artifacts.join("playwright-chromium-reviewed/chrome-linux/chrome"),
         "chromium fixture\n",
     )
     .unwrap();
+    populate_minimal_workstation(&repo, &source_artifacts);
     fs::copy(
         root().join("scripts/build-connected-workspace-image.sh"),
         repo.join("scripts/build-connected-workspace-image.sh"),
     )
     .unwrap();
-    fs::copy(
-        root().join("images/workspace/versions.lock"),
-        repo.join("images/workspace/versions.lock"),
-    )
-    .unwrap();
     let prepared = Command::new(env!("CARGO_BIN_EXE_prepare-workspace-context"))
         .args(["--mode", "connected", "--replace"])
-        .arg(root())
-        .arg(root().join("images/workspace/versions.lock"))
+        .arg(&repo)
+        .arg(repo.join("images/workspace/versions.lock"))
         .arg(&source_artifacts)
         .arg(&context)
         .output()
@@ -511,9 +658,11 @@ esac
         "mutated direct context published a receipt: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(fs::read_to_string(context.join("Dockerfile"))
-        .unwrap()
-        .contains("persistent direct-context mutation"));
+    assert!(
+        fs::read_to_string(context.join("Dockerfile"))
+            .unwrap()
+            .contains("persistent direct-context mutation")
+    );
     assert!(!artifacts.join("workspace-image-ref").exists());
     assert!(!artifacts.join("workspace-image-build.json").exists());
     let calls = fs::read_to_string(calls).unwrap();
@@ -596,24 +745,30 @@ fn validator_rejects_malformed_mutable_wrong_platform_and_wrong_tag() {
     assert!(!run(&valid, "gascan-workspace:latest").success());
     assert!(!run(&valid.replace("arm64", "amd64"), "gascan-workspace:locked").success());
     assert!(!run(&valid, "gascan-workspace:other").success());
-    assert!(!run(
-        &valid.replace(
-            &format!(r#""id":"{digest}""#),
-            &format!(r#""id":"sha256:{digest}""#)
-        ),
-        "gascan-workspace:locked"
-    )
-    .success());
-    assert!(!run(
-        &valid.replace(&format!("sha256:{}", "b".repeat(64)), "sha256:invalid"),
-        "gascan-workspace:locked"
-    )
-    .success());
-    assert!(!run(
-        &valid.replace("gascan-workspace:locked", "gascan-workspace:"),
-        "gascan-workspace:"
-    )
-    .success());
+    assert!(
+        !run(
+            &valid.replace(
+                &format!(r#""id":"{digest}""#),
+                &format!(r#""id":"sha256:{digest}""#)
+            ),
+            "gascan-workspace:locked"
+        )
+        .success()
+    );
+    assert!(
+        !run(
+            &valid.replace(&format!("sha256:{}", "b".repeat(64)), "sha256:invalid"),
+            "gascan-workspace:locked"
+        )
+        .success()
+    );
+    assert!(
+        !run(
+            &valid.replace("gascan-workspace:locked", "gascan-workspace:"),
+            "gascan-workspace:"
+        )
+        .success()
+    );
 }
 
 #[test]
@@ -649,8 +804,7 @@ fn validator_accepts_only_one_linux_arm64_variant_with_unknown_auxiliaries() {
     };
     let runnable = variant("linux", "arm64", &format!("sha256:{}", "b".repeat(64)));
     let auxiliary = variant("unknown", "unknown", &format!("sha256:{}", "c".repeat(64)));
-    let second_auxiliary =
-        variant("unknown", "unknown", &format!("sha256:{}", "d".repeat(64)));
+    let second_auxiliary = variant("unknown", "unknown", &format!("sha256:{}", "d".repeat(64)));
 
     let accepted = run(inspect(&[
         auxiliary.clone(),
@@ -747,11 +901,13 @@ fn receipt_pair_validator_accepts_only_the_approved_ghcr_namespace() {
             .unwrap()
     };
 
-    assert!(run(
-        "ghcr.io/liquescent-development/gascan/workspace:d4964500a3295a33",
-        &digest
-    )
-    .success());
+    assert!(
+        run(
+            "ghcr.io/liquescent-development/gascan/workspace:d4964500a3295a33",
+            &digest
+        )
+        .success()
+    );
     assert!(run("gascan-workspace:d4964500a3295a33", &digest).success());
 
     for rejected_tag in [
@@ -767,11 +923,13 @@ fn receipt_pair_validator_accepts_only_the_approved_ghcr_namespace() {
             "accepted {rejected_tag}"
         );
     }
-    assert!(!run(
-        "ghcr.io/liquescent-development/gascan/workspace:d4964500a3295a33",
-        &format!("sha256:{}", "A".repeat(64))
-    )
-    .success());
+    assert!(
+        !run(
+            "ghcr.io/liquescent-development/gascan/workspace:d4964500a3295a33",
+            &format!("sha256:{}", "A".repeat(64))
+        )
+        .success()
+    );
 
     let name_only = "ghcr.io/liquescent-development/gascan/workspace:d4964500a3295a33";
     fs::write(&reference_file, format!("{name_only}\n")).unwrap();
@@ -1002,15 +1160,17 @@ destination=${@: -1}; case "$FAULT:$destination" in fail_json:*/workspace-image-
             )
             .unwrap();
             fs::write(repo.join(".artifacts/workspace-image-build.json"), format!(r#"{{"reference":"{old_reference}","tag":"gascan-workspace:fixture","platform":"linux/arm64","lock_digest":"{lock_digest}","context_digest":"{manifest}","image_digest":"{old_image}","status":"succeeded"}}"#)).unwrap();
-            assert!(Command::new(validator)
-                .arg("validate-receipt")
-                .arg(repo.join(".artifacts/workspace-image-ref"))
-                .arg(repo.join(".artifacts/workspace-image-build.json"))
-                .arg(&lock_digest)
-                .arg(&manifest)
-                .status()
-                .unwrap()
-                .success());
+            assert!(
+                Command::new(validator)
+                    .arg("validate-receipt")
+                    .arg(repo.join(".artifacts/workspace-image-ref"))
+                    .arg(repo.join(".artifacts/workspace-image-build.json"))
+                    .arg(&lock_digest)
+                    .arg(&manifest)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
         }
         let output = Command::new("bash")
             .arg(repo.join("scripts/build-connected-workspace-image.sh"))
@@ -1031,14 +1191,18 @@ destination=${@: -1}; case "$FAULT:$destination" in fail_json:*/workspace-image-
         match fault {
             "build_fail_output" => {
                 assert_eq!(output.status.code(), Some(81));
-                assert!(String::from_utf8_lossy(&output.stderr)
-                    .contains("mise resolution mismatch: safe diagnostic"));
+                assert!(
+                    String::from_utf8_lossy(&output.stderr)
+                        .contains("mise resolution mismatch: safe diagnostic")
+                );
             }
             "build_fail_secret" => {
                 assert_eq!(output.status.code(), Some(1));
                 assert!(!String::from_utf8_lossy(&output.stderr).contains("should-never-escape"));
-                assert!(String::from_utf8_lossy(&output.stderr)
-                    .contains("diagnostic rejected or sanitizer failed"));
+                assert!(
+                    String::from_utf8_lossy(&output.stderr)
+                        .contains("diagnostic rejected or sanitizer failed")
+                );
             }
             "build_fail_large" => {
                 assert_eq!(output.status.code(), Some(83));
@@ -1050,8 +1214,10 @@ destination=${@: -1}; case "$FAULT:$destination" in fail_json:*/workspace-image-
             }
             "scanner_fail" => {
                 assert_eq!(output.status.code(), Some(1));
-                assert!(String::from_utf8_lossy(&output.stderr)
-                    .contains("diagnostic rejected or sanitizer failed"));
+                assert!(
+                    String::from_utf8_lossy(&output.stderr)
+                        .contains("diagnostic rejected or sanitizer failed")
+                );
             }
             "build_signal" => assert_eq!(output.status.code(), Some(143)),
             _ => {}

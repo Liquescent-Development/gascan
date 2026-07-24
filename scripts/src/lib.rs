@@ -8,20 +8,23 @@ use std::{
     ffi::OsString,
     fs,
     io::{Read, Write},
+    os::unix::fs::PermissionsExt as StdPermissionsExt,
     path::{Component, Path},
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use cap_primitives::fs::{
     FollowSymlinks, MetadataExt as CapMetadataExt, OpenOptions as CapOpenOptions,
+    PermissionsExt as CapPermissionsExt,
 };
 use cap_std::{ambient_authority, fs::Dir};
 use reqwest::{
+    Url,
     blocking::{Client, Response},
     redirect::{Action, Attempt, Policy},
-    Url,
 };
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 
 pub type DynError = Box<dyn Error + Send + Sync>;
 
@@ -44,6 +47,10 @@ pub enum ArtifactClass {
     Mise,
     Chromium,
     WorkspaceBundle,
+    WorkstationGithub,
+    WorkstationGitlab,
+    WorkstationNpm,
+    WorkstationNpmNative,
 }
 
 impl ArtifactClass {
@@ -52,6 +59,10 @@ impl ArtifactClass {
             Self::Mise => 128 * 1024 * 1024,
             Self::Chromium => 1024 * 1024 * 1024,
             Self::WorkspaceBundle => 16 * 1024 * 1024 * 1024,
+            Self::WorkstationGithub
+            | Self::WorkstationGitlab
+            | Self::WorkstationNpm
+            | Self::WorkstationNpmNative => 200 * 1024 * 1024,
         }
     }
 }
@@ -97,6 +108,15 @@ impl RedirectRules {
                 "objects.githubusercontent.com",
                 "release-assets.githubusercontent.com",
             ],
+            ArtifactClass::WorkstationGithub => &[
+                "github.com",
+                "objects.githubusercontent.com",
+                "release-assets.githubusercontent.com",
+            ],
+            ArtifactClass::WorkstationGitlab => &["gitlab.com"],
+            ArtifactClass::WorkstationNpm | ArtifactClass::WorkstationNpmNative => {
+                &["registry.npmjs.org"]
+            }
         };
         Self {
             allowed: hosts.iter().map(|host| (*host).to_owned()).collect(),
@@ -202,6 +222,111 @@ pub fn install_bounded_artifact(
     install_artifact(input, destination, expected_sha256, None, class)
 }
 
+pub fn validate_cached_sri_artifact(
+    path: &Path,
+    integrity: &str,
+    maximum_bytes: u64,
+) -> Result<(), DynError> {
+    let expected = parse_sha512_sri(integrity)?;
+    if maximum_bytes == 0 || maximum_bytes > ArtifactClass::WorkstationNpm.maximum_bytes() {
+        return Err("npm artifact size bound is outside the code-owned limit".into());
+    }
+    let (parent, name) = open_parent(path)?;
+    let mut options = CapOpenOptions::new();
+    options.read(true)._cap_fs_ext_follow(FollowSymlinks::No);
+    let mut file = parent.open_with(&name, &options)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err("cached npm artifact is not a regular file".into());
+    }
+    let mut hasher = Sha512::new();
+    let size = std::io::copy(
+        &mut std::io::Read::by_ref(&mut file).take(maximum_bytes + 1),
+        &mut hasher,
+    )?;
+    if size == 0 || size > maximum_bytes {
+        return Err("cached npm artifact violates its size bound".into());
+    }
+    if hasher.finalize().as_slice() != expected {
+        return Err("cached npm artifact integrity does not match lock".into());
+    }
+    Ok(())
+}
+
+pub fn install_sri_artifact(
+    mut input: impl Read,
+    destination: &Path,
+    integrity: &str,
+    maximum_bytes: u64,
+) -> Result<(), DynError> {
+    let expected = parse_sha512_sri(integrity)?;
+    if maximum_bytes == 0 || maximum_bytes > ArtifactClass::WorkstationNpm.maximum_bytes() {
+        return Err("npm artifact size bound is outside the code-owned limit".into());
+    }
+    let parent_path = destination
+        .parent()
+        .ok_or("artifact destination has no parent")?;
+    fs::create_dir_all(parent_path)?;
+    let (parent, destination_name) = open_parent(destination)?;
+    let temporary_name = OsString::from(format!(".artifact-{}", random_hex_256()?));
+    let mut options = CapOpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        ._cap_fs_ext_follow(FollowSymlinks::No);
+    let mut temporary = parent.open_with(&temporary_name, &options)?;
+    temporary.set_permissions(cap_std::fs::Permissions::from_mode(0o600))?;
+    let validation = (|| -> Result<(), DynError> {
+        let mut hasher = Sha512::new();
+        let mut size = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = input.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            size = size
+                .checked_add(count as u64)
+                .ok_or("npm artifact size overflow")?;
+            if size > maximum_bytes {
+                return Err("npm artifact exceeded its size bound".into());
+            }
+            temporary.write_all(&buffer[..count])?;
+            hasher.update(&buffer[..count]);
+        }
+        if size == 0 || hasher.finalize().as_slice() != expected {
+            return Err("npm artifact integrity does not match lock".into());
+        }
+        temporary.sync_all()?;
+        Ok(())
+    })();
+    drop(temporary);
+    if let Err(error) = validation {
+        let _ignored = parent.remove_file(&temporary_name);
+        return Err(error);
+    }
+    if let Err(error) = parent.rename(&temporary_name, &parent, &destination_name) {
+        let _ignored = parent.remove_file(&temporary_name);
+        return Err(error.into());
+    }
+    fs::set_permissions(destination, fs::Permissions::from_mode(0o444))?;
+    parent.into_std_file().sync_all()?;
+    Ok(())
+}
+
+fn parse_sha512_sri(integrity: &str) -> Result<Vec<u8>, DynError> {
+    let encoded = integrity
+        .strip_prefix("sha512-")
+        .ok_or("npm integrity must use sha512")?;
+    let decoded = BASE64
+        .decode(encoded)
+        .map_err(|_| "npm integrity is not valid base64")?;
+    if decoded.len() != 64 || BASE64.encode(&decoded) != encoded {
+        return Err("npm integrity is not canonical SHA-512".into());
+    }
+    Ok(decoded)
+}
+
 fn install_artifact(
     mut input: impl Read,
     destination: &Path,
@@ -227,6 +352,7 @@ fn install_artifact(
         .create_new(true)
         ._cap_fs_ext_follow(FollowSymlinks::No);
     let mut temporary = parent.open_with(&temporary_name, &options)?;
+    temporary.set_permissions(cap_std::fs::Permissions::from_mode(0o600))?;
     let validation = (|| -> Result<(), DynError> {
         let mut hasher = Sha256::new();
         let mut size = 0_u64;
@@ -264,6 +390,7 @@ fn install_artifact(
         let _ignored = parent.remove_file(&temporary_name);
         return Err(error.into());
     }
+    fs::set_permissions(destination, fs::Permissions::from_mode(0o444))?;
     let reopened = Dir::open_ambient_dir(parent_path, ambient_authority())?;
     if directory_identity(&reopened)? != parent_identity {
         return Err("artifact destination parent changed during publication".into());
