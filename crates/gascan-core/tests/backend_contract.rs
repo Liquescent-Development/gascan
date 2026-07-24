@@ -441,6 +441,45 @@ fn retained_resources_reject_wrong_network_topology() {
     assert!(RetainedResources::new(&networked.request(), resources).is_err());
 }
 
+#[test]
+fn rollback_recreate_accepts_only_immutable_images_and_preserves_topology() {
+    let fixture = create_request_with_network("rollback-image", "networked");
+    let create = fixture.request();
+    let retained = RetainedResources::new(&create, expected_retained(&fixture)).unwrap();
+    let rollback_image = "registry.example/workspace:old@sha256:\
+                          bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let recreate =
+        RecreateRequest::for_image(create.clone(), rollback_image.to_owned(), retained.clone())
+            .unwrap();
+
+    assert_eq!(recreate.create().image(), rollback_image);
+    assert_eq!(recreate.create().id(), create.id());
+    assert_eq!(recreate.create().bind_mounts(), create.bind_mounts());
+    assert_eq!(recreate.create().volumes(), create.volumes());
+    assert_eq!(recreate.create().ports(), create.ports());
+    assert_eq!(recreate.create().environment(), create.environment());
+    assert_eq!(recreate.create().resources(), create.resources());
+    assert_eq!(recreate.create().network(), create.network());
+    assert_eq!(recreate.create().user(), create.user());
+    assert_eq!(recreate.create().init(), create.init());
+    assert_eq!(recreate.create().ownership(), create.ownership());
+    assert_eq!(recreate.retained(), &retained);
+
+    for invalid in [
+        "registry.example/workspace:latest",
+        "registry.example/workspace@sha256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+        "registry.example/workspace@sha256:bbbb",
+        "@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    ] {
+        assert!(
+            RecreateRequest::for_image(create.clone(), invalid.to_owned(), retained.clone(),)
+                .is_err(),
+            "accepted invalid rollback image {invalid}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn fake_recreate_records_prepare_then_container_create() {
     let backend = FakeRuntime::new(capabilities());

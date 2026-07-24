@@ -72,6 +72,89 @@ async fn existing_up_reports_apply_required_without_executing_tool_changes() -> 
 }
 
 #[tokio::test]
+async fn image_replace_reuses_unchanged_persistent_tools_without_reinstalling() -> TestResult {
+    let old_image = "ghcr.io/liquescent-development/gascan/workspace:old@sha256:\
+                     bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    write_manifest(root, &[("node", "lts")])?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (
+                br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
+                Vec::new(),
+                0,
+            ),
+            (
+                br#"{"source":"bundled","revision":"initial"}"#.to_vec(),
+                Vec::new(),
+                0,
+            ),
+        ])
+        .await;
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    );
+    let desired = spec(root, "image-replace-tools")?;
+    service.up(UpRequest::new(desired.clone())).await?;
+    let mut record = service.status(desired.id())?.ok_or("record")?;
+    let prior_tools = record.tool_resolution.clone();
+    record.image_resolution = Some(gascand::ImageResolution::new(
+        1,
+        json!({"digest":old_image}),
+    ));
+    service.store().put_sandbox(&record)?;
+    runtime
+        .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (
+                br#"{"source":"bundled","revision":"replacement"}"#.to_vec(),
+                Vec::new(),
+                0,
+            ),
+        ])
+        .await;
+    let installs_before = runtime
+        .calls()
+        .await
+        .iter()
+        .filter(|call| {
+            matches!(call, RuntimeCall::Exec(request)
+                if request.argv.iter().any(|arg| arg == "install"))
+        })
+        .count();
+
+    service.apply(UpRequest::new(desired.clone())).await?;
+
+    let installs_after = runtime
+        .calls()
+        .await
+        .iter()
+        .filter(|call| {
+            matches!(call, RuntimeCall::Exec(request)
+                if request.argv.iter().any(|arg| arg == "install"))
+        })
+        .count();
+    assert_eq!(installs_after, installs_before);
+    assert_eq!(
+        service
+            .status(desired.id())?
+            .ok_or("replacement record")?
+            .tool_resolution,
+        prior_tools
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn apply_uses_literal_mise_argv_streams_steps_and_persists_exact_versions() -> TestResult {
     let root = tempfile::tempdir()?;
     let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;

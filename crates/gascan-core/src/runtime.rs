@@ -575,6 +575,21 @@ impl RecreateRequest {
         Ok(Self { create, retained })
     }
 
+    pub fn for_image(
+        mut create: CreateRequest,
+        image: String,
+        retained: RetainedResources,
+    ) -> Result<Self, RuntimeError> {
+        if !immutable_image_reference(&image) {
+            return Err(RuntimeError::InvalidState {
+                resource: "recreate image".to_owned(),
+                message: "image must be a nonempty named sha256 digest reference".to_owned(),
+            });
+        }
+        create.image = image;
+        Self::new(create, retained)
+    }
+
     pub const fn create(&self) -> &CreateRequest {
         &self.create
     }
@@ -582,6 +597,17 @@ impl RecreateRequest {
     pub const fn retained(&self) -> &RetainedResources {
         &self.retained
     }
+}
+
+fn immutable_image_reference(image: &str) -> bool {
+    let Some((name, digest)) = image.split_once("@sha256:") else {
+        return false;
+    };
+    !name.is_empty()
+        && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

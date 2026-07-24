@@ -60,6 +60,55 @@ async fn queue_successful_setup(runtime: &FakeRuntime, bytes: &[u8], relative: &
 }
 
 #[tokio::test]
+async fn image_replace_forces_unchanged_setup_on_new_container() -> TestResult {
+    let old_image = "ghcr.io/liquescent-development/gascan/workspace:old@sha256:\
+                     bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    let bytes = b"printf replacement\n";
+    write_setup(root, "setup.sh", bytes)?;
+    let runtime = FakeRuntime::default();
+    queue_successful_setup(&runtime, bytes, "setup.sh").await;
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    );
+    let desired = spec(root, "image-replace-setup")?;
+    service.up(UpRequest::new(desired.clone())).await?;
+    let mut record = service.status(desired.id())?.ok_or("record")?;
+    record.image_resolution = Some(gascand::ImageResolution::new(
+        1,
+        serde_json::json!({"digest":old_image}),
+    ));
+    service.store().put_sandbox(&record)?;
+    queue_successful_setup(&runtime, bytes, "setup.sh").await;
+    let setup_runs_before = runtime
+        .calls()
+        .await
+        .iter()
+        .filter(|call| {
+            matches!(call, RuntimeCall::Exec(request)
+                if request.argv.first().map(String::as_str) == Some("/bin/bash"))
+        })
+        .count();
+
+    service.apply(UpRequest::new(desired)).await?;
+
+    let setup_runs_after = runtime
+        .calls()
+        .await
+        .iter()
+        .filter(|call| {
+            matches!(call, RuntimeCall::Exec(request)
+                if request.argv.first().map(String::as_str) == Some("/bin/bash"))
+        })
+        .count();
+    assert_eq!(setup_runs_after, setup_runs_before + 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn setup_uses_literal_guest_argv_empty_environments_and_refreshes_moved_path() -> TestResult {
     let temp = tempfile::tempdir()?;
     let root = Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;

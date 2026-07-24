@@ -15,6 +15,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -28,6 +29,17 @@ fn networked_spec(name: &str, root: &Utf8Path) -> Result<SandboxSpec, Box<dyn Er
 
 fn spec(name: &str, root: &Utf8Path) -> Result<SandboxSpec, Box<dyn Error>> {
     Ok(SandboxSpec::from_root(name, root, Manifest::load(root)?)?)
+}
+
+fn rewrite_runtime_image(path: &Utf8Path, image: &str) -> TestResult {
+    let mut snapshot: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    let sandboxes = snapshot["sandboxes"]
+        .as_array_mut()
+        .ok_or("runtime sandboxes")?;
+    let sandbox = sandboxes.first_mut().ok_or("runtime sandbox")?;
+    sandbox["image"] = json!(image);
+    std::fs::write(path, serde_json::to_vec(&snapshot)?)?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -126,6 +138,58 @@ impl Provisioner for ControlledProvisioner {
                 "injected health failure".to_owned(),
             ));
         }
+        Ok(())
+    }
+}
+
+struct RollbackFailingProvisioner {
+    runtime: FakeRuntime,
+}
+
+struct CommitRaceProvisioner {
+    entered: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+#[async_trait]
+impl Provisioner for CommitRaceProvisioner {
+    async fn provision(
+        &self,
+        _request: ProvisionRequest<'_>,
+    ) -> Result<ProvisionResolution, ServiceError> {
+        self.entered.add_permits(1);
+        self.release
+            .acquire()
+            .await
+            .map_err(|_| ServiceError::Provision("commit race gate closed".to_owned()))?
+            .forget();
+        Ok(ProvisionResolution::default())
+    }
+
+    async fn health_check(
+        &self,
+        _id: &gascan_core::sandbox::SandboxId,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Provisioner for RollbackFailingProvisioner {
+    async fn provision(
+        &self,
+        _request: ProvisionRequest<'_>,
+    ) -> Result<ProvisionResolution, ServiceError> {
+        self.runtime.inject_failure(FailureBoundary::Remove).await;
+        Err(ServiceError::Provision(
+            "injected replacement provision failure".to_owned(),
+        ))
+    }
+
+    async fn health_check(
+        &self,
+        _id: &gascan_core::sandbox::SandboxId,
+    ) -> Result<(), ServiceError> {
         Ok(())
     }
 }
@@ -361,6 +425,375 @@ async fn image_resolution_only_proves_the_approved_image_when_valid_and_matching
             record.image_resolution
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_replace_apply_preserves_resources_and_commits_new_image() -> TestResult {
+    let old_image = "ghcr.io/liquescent-development/gascan/workspace:old@sha256:\
+                     bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let runtime_path = root.join("runtime.json");
+    let state_path = root.join("state.db");
+    let capabilities = FakeRuntime::default().capabilities().await?;
+    let initial_runtime = FakeRuntime::persistent(capabilities.clone(), &runtime_path).await?;
+    let desired = networked_spec("image-replace-success", root)?;
+    let initial_service = SandboxService::new(
+        initial_runtime.clone(),
+        gascand::Store::open(&state_path)?,
+        Arc::new(NoopProvisioner),
+    );
+    initial_service.up(UpRequest::new(desired.clone())).await?;
+    let mut record = initial_service
+        .status(desired.id())?
+        .ok_or("sandbox record")?;
+    record.image_resolution = Some(gascand::ImageResolution::new(
+        1,
+        json!({"digest": old_image}),
+    ));
+    initial_service.store().put_sandbox(&record)?;
+    let before_resources = initial_runtime
+        .list_resources()
+        .await?
+        .into_iter()
+        .map(|resource| (resource.kind(), resource.name().to_owned()))
+        .collect::<Vec<_>>();
+    drop(initial_service);
+    drop(initial_runtime);
+    rewrite_runtime_image(&runtime_path, old_image)?;
+
+    let runtime = FakeRuntime::persistent(capabilities, &runtime_path).await?;
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(&state_path)?,
+        Arc::new(NoopProvisioner),
+    );
+    let approved_image = PolicyCompiler::compile(desired.clone(), &runtime.capabilities().await?)?
+        .image()
+        .to_owned();
+
+    service.apply(UpRequest::new(desired.clone())).await?;
+
+    let calls = runtime.calls().await;
+    let prepare = calls
+        .iter()
+        .position(
+            |call| matches!(call, RuntimeCall::PrepareImage(image) if image == &approved_image),
+        )
+        .ok_or("prepare image")?;
+    let list = calls
+        .iter()
+        .position(|call| matches!(call, RuntimeCall::ListResources))
+        .ok_or("list resources")?;
+    let stop = calls
+        .iter()
+        .position(|call| matches!(call, RuntimeCall::Stop(id) if id == desired.id()))
+        .ok_or("stop old container")?;
+    let remove = calls
+        .iter()
+        .position(|call| {
+            matches!(call, RuntimeCall::Remove(request)
+                if request.resources().len() == 1
+                    && request.resources()[0].kind() == ResourceKind::Container)
+        })
+        .ok_or("remove old container")?;
+    let create = calls
+        .iter()
+        .position(|call| matches!(call, RuntimeCall::CreateContainer(_)))
+        .ok_or("create replacement container")?;
+    assert!(prepare < list && list < stop && stop < remove && remove < create);
+    let after_resources = runtime
+        .list_resources()
+        .await?
+        .into_iter()
+        .map(|resource| (resource.kind(), resource.name().to_owned()))
+        .collect::<Vec<_>>();
+    assert_eq!(after_resources, before_resources);
+    assert_eq!(
+        runtime
+            .inspect(desired.id())
+            .await?
+            .ok_or("replacement runtime")?
+            .image,
+        approved_image
+    );
+    assert_eq!(
+        service
+            .status(desired.id())?
+            .ok_or("replacement record")?
+            .image_resolution
+            .and_then(|resolution| resolution.details["digest"].as_str().map(ToOwned::to_owned)),
+        Some(approved_image)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_replace_up_reports_apply_required_without_runtime_mutation() -> TestResult {
+    let old_image = "ghcr.io/liquescent-development/gascan/workspace:old@sha256:\
+                     bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let desired = spec("image-replace-up", root)?;
+    let runtime = FakeRuntime::default();
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    );
+    service.up(UpRequest::new(desired.clone())).await?;
+    let mut record = service.status(desired.id())?.ok_or("sandbox record")?;
+    record.image_resolution = Some(gascand::ImageResolution::new(
+        1,
+        json!({"digest": old_image}),
+    ));
+    service.store().put_sandbox(&record)?;
+
+    let before = runtime.calls().await.len();
+    let operation = service.up(UpRequest::new(desired)).await?;
+    let events = service.store().operation_events(operation.id)?;
+
+    assert_eq!(runtime.calls().await.len(), before);
+    assert!(events.iter().any(|event| {
+        event.details.as_ref().is_some_and(|details| {
+            details["phase"] == "apply_required"
+                && details["reason"] == "image_changed"
+                && details["recorded_image"] == old_image
+                && details["running_image"] == old_image
+        })
+    }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_replace_failures_restore_previous_image_and_resources() -> TestResult {
+    let old_image = "ghcr.io/liquescent-development/gascan/workspace:old@sha256:\
+                     bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    for (boundary, fail_provision, fail_health) in [
+        (Some(FailureBoundary::Stop), false, false),
+        (Some(FailureBoundary::Remove), false, false),
+        (Some(FailureBoundary::CreateContainer), false, false),
+        (Some(FailureBoundary::Start), false, false),
+        (None, true, false),
+        (None, false, true),
+    ] {
+        let root = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+        let runtime_path = root.join("runtime.json");
+        let state_path = root.join("state.db");
+        let capabilities = FakeRuntime::default().capabilities().await?;
+        let initial_runtime = FakeRuntime::persistent(capabilities.clone(), &runtime_path).await?;
+        let desired = networked_spec("image-replace-rollback", root)?;
+        let provisioner = Arc::new(ControlledProvisioner::default());
+        let initial_service = SandboxService::new(
+            initial_runtime.clone(),
+            gascand::Store::open(&state_path)?,
+            provisioner.clone(),
+        );
+        initial_service.up(UpRequest::new(desired.clone())).await?;
+        let mut record = initial_service
+            .status(desired.id())?
+            .ok_or("sandbox record")?;
+        record.image_resolution = Some(gascand::ImageResolution::new(
+            1,
+            json!({"digest": old_image}),
+        ));
+        initial_service.store().put_sandbox(&record)?;
+        let before_resources = initial_runtime
+            .list_resources()
+            .await?
+            .into_iter()
+            .map(|resource| (resource.kind(), resource.name().to_owned()))
+            .collect::<Vec<_>>();
+        drop(initial_service);
+        drop(initial_runtime);
+        rewrite_runtime_image(&runtime_path, old_image)?;
+
+        let runtime = FakeRuntime::persistent(capabilities, &runtime_path).await?;
+        if let Some(boundary) = boundary {
+            runtime.inject_failure(boundary).await;
+        }
+        provisioner
+            .fail_provision
+            .store(fail_provision, Ordering::SeqCst);
+        provisioner.fail_health.store(fail_health, Ordering::SeqCst);
+        let service = SandboxService::new(
+            runtime.clone(),
+            gascand::Store::open(&state_path)?,
+            provisioner,
+        );
+
+        assert!(
+            service
+                .apply(UpRequest::new(desired.clone()))
+                .await
+                .is_err()
+        );
+
+        assert_eq!(
+            runtime
+                .inspect(desired.id())
+                .await?
+                .ok_or("rolled back runtime")?
+                .image,
+            old_image,
+            "boundary {boundary:?}, provision={fail_provision}, health={fail_health}"
+        );
+        assert_eq!(
+            service
+                .status(desired.id())?
+                .ok_or("rolled back record")?
+                .image_resolution
+                .and_then(|resolution| resolution.details["digest"]
+                    .as_str()
+                    .map(ToOwned::to_owned)),
+            Some(old_image.to_owned())
+        );
+        let after_resources = runtime
+            .list_resources()
+            .await?
+            .into_iter()
+            .map(|resource| (resource.kind(), resource.name().to_owned()))
+            .collect::<Vec<_>>();
+        assert_eq!(after_resources, before_resources);
+        assert!(runtime.calls().await.iter().all(|call| {
+            !matches!(call, RuntimeCall::Remove(request)
+            if request.resources().iter().any(|resource| {
+                matches!(resource.kind(), ResourceKind::Volume | ResourceKind::Network)
+            }))
+        }));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_replace_preserves_primary_and_rollback_errors() -> TestResult {
+    let old_image = "ghcr.io/liquescent-development/gascan/workspace:old@sha256:\
+                     bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let runtime_path = root.join("runtime.json");
+    let state_path = root.join("state.db");
+    let capabilities = FakeRuntime::default().capabilities().await?;
+    let initial_runtime = FakeRuntime::persistent(capabilities.clone(), &runtime_path).await?;
+    let desired = spec("image-replace-double-failure", root)?;
+    let initial_service = SandboxService::new(
+        initial_runtime.clone(),
+        gascand::Store::open(&state_path)?,
+        Arc::new(NoopProvisioner),
+    );
+    initial_service.up(UpRequest::new(desired.clone())).await?;
+    let mut record = initial_service
+        .status(desired.id())?
+        .ok_or("sandbox record")?;
+    record.image_resolution = Some(gascand::ImageResolution::new(
+        1,
+        json!({"digest": old_image}),
+    ));
+    initial_service.store().put_sandbox(&record)?;
+    drop(initial_service);
+    drop(initial_runtime);
+    rewrite_runtime_image(&runtime_path, old_image)?;
+
+    let runtime = FakeRuntime::persistent(capabilities, &runtime_path).await?;
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(&state_path)?,
+        Arc::new(RollbackFailingProvisioner {
+            runtime: runtime.clone(),
+        }),
+    );
+
+    let error = match service.apply(UpRequest::new(desired)).await {
+        Ok(_) => return Err("replacement unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+
+    assert!(
+        error
+            .to_string()
+            .contains("injected replacement provision failure")
+    );
+    assert!(error.to_string().contains("rollback failed"));
+    assert!(error.to_string().contains("injected failure at remove"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_replace_database_commit_failure_restores_runtime_and_resolution() -> TestResult {
+    let old_image = "ghcr.io/liquescent-development/gascan/workspace:old@sha256:\
+                     bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let runtime_path = root.join("runtime.json");
+    let state_path = root.join("state.db");
+    let capabilities = FakeRuntime::default().capabilities().await?;
+    let initial_runtime = FakeRuntime::persistent(capabilities.clone(), &runtime_path).await?;
+    let desired = spec("image-replace-database-failure", root)?;
+    let id = desired.id().clone();
+    let initial_service = SandboxService::new(
+        initial_runtime.clone(),
+        gascand::Store::open(&state_path)?,
+        Arc::new(NoopProvisioner),
+    );
+    initial_service.up(UpRequest::new(desired.clone())).await?;
+    let mut record = initial_service
+        .status(desired.id())?
+        .ok_or("sandbox record")?;
+    record.image_resolution = Some(gascand::ImageResolution::new(
+        1,
+        json!({"digest": old_image}),
+    ));
+    initial_service.store().put_sandbox(&record)?;
+    drop(initial_service);
+    drop(initial_runtime);
+    rewrite_runtime_image(&runtime_path, old_image)?;
+
+    let runtime = FakeRuntime::persistent(capabilities, &runtime_path).await?;
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let store = gascand::Store::open(&state_path)?;
+    let service = Arc::new(SandboxService::new(
+        runtime.clone(),
+        store.clone(),
+        Arc::new(CommitRaceProvisioner {
+            entered: entered.clone(),
+            release: release.clone(),
+        }),
+    ));
+    let apply_service = service.clone();
+    let task = tokio::spawn(async move { apply_service.apply(UpRequest::new(desired)).await });
+    entered.acquire().await?.forget();
+    let operation = store.latest_operation()?.ok_or("pending operation")?;
+    store.complete_operation(operation.id, gascand::ActualState::Running)?;
+    release.add_permits(1);
+
+    let error = match task.await? {
+        Ok(_) => return Err("database race unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("recording operation failure failed")
+    );
+    assert_eq!(
+        runtime
+            .inspect(&id)
+            .await?
+            .ok_or("rolled back runtime")?
+            .image,
+        old_image
+    );
+    assert_eq!(
+        service
+            .status(&id)?
+            .ok_or("rolled back record")?
+            .image_resolution
+            .and_then(|resolution| resolution.details["digest"].as_str().map(ToOwned::to_owned)),
+        Some(old_image.to_owned())
+    );
     Ok(())
 }
 

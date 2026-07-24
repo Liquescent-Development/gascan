@@ -16,8 +16,8 @@ use gascan_core::provision::{
 };
 use gascan_core::runtime::{
     ContainerState, CreateFailure, CreateOutcome, CreateRequest, ExecInput, ExecOutput,
-    ExecRequest, RemoveRequest, ResourceKind, ResourceOwnership, RuntimeBackend,
-    RuntimeCapabilities, RuntimeError,
+    ExecRequest, RecreateRequest, RemoveRequest, ResourceKind, ResourceOwnership,
+    RetainedResources, RuntimeBackend, RuntimeCapabilities, RuntimeError, RuntimeResource,
 };
 use gascan_core::sandbox::{SandboxError, SandboxId, SandboxSpec};
 use serde::de::{Error as _, MapAccess, Visitor};
@@ -362,6 +362,16 @@ pub enum ServiceError {
         original: Box<ServiceError>,
         rollback: RuntimeError,
     },
+    #[error("{original}; rollback failed: {rollback}")]
+    ImageRollback {
+        original: Box<ServiceError>,
+        rollback: Box<ServiceError>,
+    },
+    #[error("{original}; recording operation failure failed: {reporting}")]
+    FailureReporting {
+        original: Box<ServiceError>,
+        reporting: Box<ServiceError>,
+    },
 }
 
 impl<B: RuntimeBackend> SandboxService<B> {
@@ -604,6 +614,32 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 .await;
             return Err(error);
         }
+        if let Some(recorded_image) = prior
+            .as_ref()
+            .and_then(stored_image)
+            .filter(|recorded| recorded != create.image())
+        {
+            self.emit(
+                operation.id,
+                json!({
+                    "phase": "apply_required",
+                    "reason": "image_changed",
+                    "recorded_image": recorded_image,
+                    "running_image": recorded_image,
+                    "approved_image": create.image(),
+                }),
+                &sender,
+            )
+            .await?;
+            let actual = record.actual_state;
+            self.database(move |store| store.complete_operation(operation.id, actual))
+                .await?;
+            self.send_terminal(operation.id, &sender).await?;
+            return Ok(receiver.map(|events| Operation {
+                id: operation.id,
+                events,
+            }));
+        }
         let result = self
             .up_runtime(
                 &request.spec,
@@ -796,6 +832,19 @@ impl<B: RuntimeBackend> SandboxService<B> {
         sender: &mpsc::Sender<OperationEvent>,
     ) -> Result<ProvisionedResolution, ServiceError> {
         let applied = applied_state(prior);
+        self.provision_with_applied(spec, create, prior, applied, operation_id, sender)
+            .await
+    }
+
+    async fn provision_with_applied(
+        &self,
+        spec: &SandboxSpec,
+        create: &CreateRequest,
+        prior: Option<&SandboxRecord>,
+        applied: AppliedState,
+        operation_id: OperationId,
+        sender: &mpsc::Sender<OperationEvent>,
+    ) -> Result<ProvisionedResolution, ServiceError> {
         let plan =
             ProvisioningPlanner::plan_for_root(spec.canonical_root(), spec.manifest(), &applied)
                 .map_err(|_| ServiceError::Provision("could not plan provisioning".to_owned()))?;
@@ -843,6 +892,210 @@ impl<B: RuntimeBackend> SandboxService<B> {
             resolution,
             tool_hash: plan.desired_tool_hash().to_owned(),
         })
+    }
+
+    async fn retained_resources(
+        &self,
+        create: &CreateRequest,
+    ) -> Result<(RuntimeResource, RetainedResources), ServiceError> {
+        let resources = self.runtime.list_resources().await?;
+        let mut owned = resources
+            .into_iter()
+            .filter(|resource| {
+                resource.ownership() == ResourceOwnership::GasCanOwned
+                    && resource.sandbox_id() == Some(create.id())
+            })
+            .collect::<Vec<_>>();
+        let container_index = owned
+            .iter()
+            .position(|resource| resource.kind() == ResourceKind::Container)
+            .ok_or_else(|| ServiceError::Missing(create.id().clone()))?;
+        let container = owned.remove(container_index);
+        let retained = owned
+            .into_iter()
+            .filter(|resource| resource.kind() != ResourceKind::Container)
+            .collect();
+        Ok((
+            container,
+            RetainedResources::new(create, retained).map_err(ServiceError::Runtime)?,
+        ))
+    }
+
+    async fn remove_exact_container(
+        &self,
+        create: &CreateRequest,
+        container: RuntimeResource,
+    ) -> Result<(), ServiceError> {
+        if let Some(runtime) = self.runtime.inspect(create.id()).await? {
+            if runtime.ownership.managed_by != "gascan"
+                || runtime.ownership.sandbox_id != *create.id()
+            {
+                return Err(ServiceError::Ownership(create.id().clone()));
+            }
+            if runtime.state == ContainerState::Running {
+                self.runtime.stop(create.id()).await?;
+            }
+        }
+        self.runtime
+            .remove(RemoveRequest::from_resources(vec![container])?)
+            .await?;
+        Ok(())
+    }
+
+    async fn rollback_image(
+        &self,
+        create: &CreateRequest,
+        previous_image: &str,
+        retained: RetainedResources,
+        operation_id: OperationId,
+        sender: &mpsc::Sender<OperationEvent>,
+    ) -> Result<(), ServiceError> {
+        let container = self
+            .runtime
+            .list_resources()
+            .await?
+            .into_iter()
+            .find(|resource| {
+                resource.kind() == ResourceKind::Container
+                    && resource.ownership() == ResourceOwnership::GasCanOwned
+                    && resource.sandbox_id() == Some(create.id())
+            });
+        if let Some(container) = container {
+            self.remove_exact_container(create, container).await?;
+        }
+        let rollback =
+            RecreateRequest::for_image(create.clone(), previous_image.to_owned(), retained)?;
+        self.runtime
+            .create_container(rollback)
+            .await
+            .map_err(ServiceError::Create)?;
+        self.runtime.start(create.id()).await?;
+        self.emit(
+            operation_id,
+            json!({"phase":"image_rollback","image":previous_image}),
+            sender,
+        )
+        .await
+    }
+
+    async fn replace_image(
+        &self,
+        spec: &SandboxSpec,
+        create: &CreateRequest,
+        previous_image: &str,
+        operation_id: OperationId,
+        sender: &mpsc::Sender<OperationEvent>,
+    ) -> Result<ProvisionedResolution, ServiceError> {
+        self.emit(
+            operation_id,
+            json!({"phase":"before_image_replace","previous_image":previous_image,"approved_image":create.image()}),
+            sender,
+        )
+        .await?;
+        self.runtime.prepare_image(create.image()).await?;
+        let runtime = self
+            .runtime
+            .inspect(create.id())
+            .await?
+            .ok_or_else(|| ServiceError::Missing(create.id().clone()))?;
+        if runtime.ownership.managed_by != "gascan" || runtime.ownership.sandbox_id != *create.id()
+        {
+            return Err(ServiceError::Ownership(create.id().clone()));
+        }
+        let (container, retained) = self.retained_resources(create).await?;
+        let rollback_retained = retained.clone();
+        let mut mutation_started = false;
+        let result = async {
+            mutation_started = true;
+            if runtime.state == ContainerState::Running {
+                self.runtime.stop(create.id()).await?;
+            }
+            self.runtime
+                .remove(RemoveRequest::from_resources(vec![container])?)
+                .await?;
+            let recreate = RecreateRequest::new(create.clone(), retained)?;
+            self.runtime
+                .create_container(recreate)
+                .await
+                .map_err(ServiceError::Create)?;
+            self.runtime.start(create.id()).await?;
+            let prior = self
+                .database({
+                    let id = create.id().clone();
+                    move |store| store.sandbox(&id)
+                })
+                .await?
+                .ok_or_else(|| ServiceError::Missing(create.id().clone()))?;
+            self.emit(operation_id, json!({"phase":"before_provision"}), sender)
+                .await?;
+            let provisioned = self
+                .provision_with_applied(
+                    spec,
+                    create,
+                    Some(&prior),
+                    replacement_applied_state(&prior),
+                    operation_id,
+                    sender,
+                )
+                .await?;
+            self.emit(
+                operation_id,
+                json!({
+                    "phase":"after_provision",
+                    "resolution_version":1,
+                    "setup":provisioned.resolution.setup,
+                    "tools":provisioned.resolution.tools,
+                    "tool_hash":provisioned.tool_hash,
+                }),
+                sender,
+            )
+            .await?;
+            self.emit(
+                operation_id,
+                json!({"phase":"before_health","step":ProvisionStep::HealthCheck.as_str()}),
+                sender,
+            )
+            .await?;
+            self.provisioner.health_check(create.id()).await?;
+            self.emit(operation_id, json!({"phase":"after_health"}), sender)
+                .await?;
+            self.emit(
+                operation_id,
+                json!({"phase":"image_replaced","image":create.image()}),
+                sender,
+            )
+            .await?;
+            self.emit(
+                operation_id,
+                json!({"phase":"after_image_replace","image":create.image()}),
+                sender,
+            )
+            .await?;
+            Ok::<_, ServiceError>(provisioned)
+        }
+        .await;
+        match result {
+            Ok(provisioned) => Ok(provisioned),
+            Err(original) if mutation_started => {
+                match self
+                    .rollback_image(
+                        create,
+                        previous_image,
+                        rollback_retained,
+                        operation_id,
+                        sender,
+                    )
+                    .await
+                {
+                    Ok(()) => Err(original),
+                    Err(rollback) => Err(ServiceError::ImageRollback {
+                        original: Box::new(original),
+                        rollback: Box::new(rollback),
+                    }),
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn persist_created_storage(
@@ -1441,23 +1694,122 @@ impl<B: RuntimeBackend> SandboxService<B> {
             if runtime.ownership.managed_by != "gascan" || runtime.ownership.sandbox_id != id {
                 return Err(ServiceError::Ownership(id.clone()));
             }
+            let image = image_state(Some(&record), &runtime.image, create.image())?;
+            if image.change_required() {
+                return Ok::<_, ServiceError>((runtime, image));
+            }
             if runtime.state == ContainerState::Running && setup_changed {
                 self.runtime.stop(&id).await?;
                 self.runtime.start(&id).await?;
             } else if runtime.state != ContainerState::Running {
                 self.runtime.start(&id).await?;
             }
-            Ok::<_, ServiceError>(())
+            Ok::<_, ServiceError>((runtime, image))
         }
         .await;
-        if let Err(error) = preflight {
-            let actual = self.runtime_actual(&id, prior_actual).await;
-            let code = error.code();
-            let details = json!({"message":error.to_string()});
-            self.database(move |store| store.fail_operation(operation.id, actual, code, details))
+        let (runtime, image) = match preflight {
+            Ok(value) => value,
+            Err(error) => {
+                let actual = self.runtime_actual(&id, prior_actual).await;
+                let code = error.code();
+                let details = json!({"message":error.to_string()});
+                self.database(move |store| {
+                    store.fail_operation(operation.id, actual, code, details)
+                })
                 .await?;
-            self.send_terminal(operation.id, &sender).await?;
-            return Err(error);
+                self.send_terminal(operation.id, &sender).await?;
+                return Err(error);
+            }
+        };
+        if image.change_required() {
+            let previous_record = record.clone();
+            let provisioned = match self
+                .replace_image(
+                    &request.spec,
+                    &create,
+                    &runtime.image,
+                    operation.id,
+                    &sender,
+                )
+                .await
+            {
+                Ok(provisioned) => provisioned,
+                Err(error) => {
+                    let actual = self.runtime_actual(&id, prior_actual).await;
+                    let code = error.code();
+                    let details = failure_details(&error);
+                    if let Err(reporting) = self
+                        .database(move |store| {
+                            store.fail_operation(operation.id, actual, code, details)
+                        })
+                        .await
+                    {
+                        return Err(ServiceError::FailureReporting {
+                            original: Box::new(error),
+                            reporting: Box::new(reporting),
+                        });
+                    }
+                    if let Err(reporting) = self.send_terminal(operation.id, &sender).await {
+                        return Err(ServiceError::FailureReporting {
+                            original: Box::new(error),
+                            reporting: Box::new(reporting),
+                        });
+                    }
+                    return Err(error);
+                }
+            };
+            record.setup_resolution = Some(SetupResolution::new(
+                1,
+                json!({"desired_fingerprint":desired_fingerprint,"resolution":provisioned.resolution.setup}),
+            ));
+            record.tool_resolution = Some(ToolResolution::new(
+                1,
+                json!({"desired_fingerprint":desired_fingerprint,"tool_hash":provisioned.tool_hash,"resolution":provisioned.resolution.tools}),
+            ));
+            record.image_resolution =
+                Some(ImageResolution::new(1, json!({"digest": create.image()})));
+            record.actual_state = ActualState::Running;
+            let commit = async {
+                self.database({
+                    let record = record.clone();
+                    move |store| store.put_sandbox(&record)
+                })
+                .await?;
+                self.database(move |store| {
+                    store.complete_operation(operation.id, ActualState::Running)
+                })
+                .await?;
+                self.send_terminal(operation.id, &sender).await
+            }
+            .await;
+            if let Err(original) = commit {
+                let runtime_rollback = async {
+                    let (_, retained) = self.retained_resources(&create).await?;
+                    self.rollback_image(&create, &runtime.image, retained, operation.id, &sender)
+                        .await
+                }
+                .await;
+                let record_rollback = self
+                    .database(move |store| store.put_sandbox(&previous_record))
+                    .await;
+                let rollback = match (runtime_rollback, record_rollback) {
+                    (Ok(()), Ok(())) => return Err(original),
+                    (Err(runtime), Ok(())) => runtime,
+                    (Ok(()), Err(store)) => store,
+                    (Err(runtime), Err(store)) => ServiceError::ImageRollback {
+                        original: Box::new(runtime),
+                        rollback: Box::new(store),
+                    },
+                };
+                return Err(ServiceError::ImageRollback {
+                    original: Box::new(original),
+                    rollback: Box::new(rollback),
+                });
+            }
+            return Ok(receiver.map(|events| Operation {
+                id: operation.id,
+                events,
+            }));
         }
         if unchanged {
             self.database(move |store| {
@@ -1824,7 +2176,9 @@ impl ServiceError {
             Self::DatabaseWorker(_) => "database_worker_failed",
             Self::Fingerprint(_) => "fingerprint_failed",
             Self::IncompleteDestroy(_) => "incomplete_destroy",
-            Self::Rollback { original, .. } => original.code(),
+            Self::Rollback { original, .. }
+            | Self::ImageRollback { original, .. }
+            | Self::FailureReporting { original, .. } => original.code(),
         }
     }
 
@@ -2059,6 +2413,16 @@ fn applied_state(record: Option<&SandboxRecord>) -> AppliedState {
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
     AppliedState::with_hashes(tool_hash, setup_sha256)
+}
+
+fn replacement_applied_state(record: &SandboxRecord) -> AppliedState {
+    let tool_hash = record
+        .tool_resolution
+        .as_ref()
+        .and_then(|resolution| resolution.details.get("tool_hash"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    AppliedState::with_hashes(tool_hash, None)
 }
 
 fn image_state(

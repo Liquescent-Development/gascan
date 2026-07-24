@@ -818,6 +818,19 @@ fn service_error_diagnostic(error: &ServiceError) -> String {
             original.code(),
             rollback.code()
         ),
+        ServiceError::ImageRollback { original, rollback } => format!(
+            "service_kind=image_rollback original_code={} rollback_code={}",
+            original.code(),
+            rollback.code()
+        ),
+        ServiceError::FailureReporting {
+            original,
+            reporting,
+        } => format!(
+            "service_kind=failure_reporting original_code={} reporting_code={}",
+            original.code(),
+            reporting.code()
+        ),
     }
 }
 
