@@ -11,8 +11,8 @@ use gascan_core::{
     policy::PolicyCompiler,
     runtime::{
         ContainerState, CreateRequest, ExecInput, ExecOutput, ExecRequest, NetworkIsolation,
-        RemoveRequest, ResourceKind, ResourceOwnership, RuntimeBackend, RuntimeCapabilities,
-        RuntimeError, RuntimeVersion,
+        RecreateRequest, RemoveRequest, ResourceKind, ResourceOwnership, RetainedResources,
+        RuntimeBackend, RuntimeCapabilities, RuntimeError, RuntimeVersion,
     },
     sandbox::SandboxSpec,
 };
@@ -622,6 +622,119 @@ async fn create_sizes_each_managed_volume_from_the_policy_request() {
             (format!("gascan-config-{id}"), 2 * 1024_u64.pow(3)),
         ])
     );
+}
+
+async fn retained_request(
+    backend: &AppleBackend<StatefulAppleRunner>,
+    runner: &StatefulAppleRunner,
+    create: CreateRequest,
+) -> RecreateRequest {
+    let id = create.id().to_string();
+    {
+        let mut state = runner.0.lock().unwrap();
+        for volume in create.volumes() {
+            state
+                .volumes
+                .insert(volume.name.clone(), (id.clone(), "gascan".into()));
+        }
+        if let Some(network) = create.network().managed_name() {
+            state
+                .networks
+                .insert(network.to_owned(), (id, "gascan".into()));
+        }
+    }
+    let resources = backend.list_resources().await.unwrap();
+    let retained = RetainedResources::new(&create, resources).unwrap();
+    RecreateRequest::new(create, retained).unwrap()
+}
+
+#[tokio::test]
+async fn prepare_image_pulls_the_exact_immutable_reference() {
+    let runner = StatefulAppleRunner::default();
+    let backend = AppleBackend::new(runner.clone());
+    let image = "ghcr.io/gascan/workspace@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    backend.prepare_image(image).await.unwrap();
+
+    assert_eq!(
+        runner.0.lock().unwrap().commands,
+        [CommandSpec::new("container", ["image", "pull", image])]
+    );
+}
+
+#[tokio::test]
+async fn retained_create_revalidates_inventory_and_runs_only_the_container() {
+    let runner = StatefulAppleRunner::default();
+    let backend = AppleBackend::new(runner.clone());
+    let (_root, create) = request("apple-retained-create");
+    let recreate = retained_request(&backend, &runner, create).await;
+    runner.0.lock().unwrap().commands.clear();
+
+    let outcome = backend.create_container(recreate).await.unwrap();
+
+    assert_eq!(outcome.created().len(), 1);
+    assert_eq!(outcome.created()[0].kind(), ResourceKind::Container);
+    let commands = &runner.0.lock().unwrap().commands;
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| command.args.first().is_some_and(|arg| arg == "run"))
+            .count(),
+        1
+    );
+    assert!(!commands.iter().any(|command| {
+        matches!(
+            command.args.as_slice(),
+            [kind, operation, ..]
+                if (kind == "network" || kind == "volume") && operation == "create"
+        )
+    }));
+}
+
+#[tokio::test]
+async fn retained_create_refuses_changed_inventory_before_run() {
+    let runner = StatefulAppleRunner::default();
+    let backend = AppleBackend::new(runner.clone());
+    let (_root, create) = request("apple-retained-changed");
+    let recreate = retained_request(&backend, &runner, create).await;
+    runner
+        .0
+        .lock()
+        .unwrap()
+        .volumes
+        .values_mut()
+        .next()
+        .unwrap()
+        .1 = "foreign".into();
+    runner.0.lock().unwrap().commands.clear();
+
+    let failure = backend.create_container(recreate).await.unwrap_err();
+
+    assert_eq!(failure.code(), "ownership_mismatch");
+    assert!(
+        !runner
+            .0
+            .lock()
+            .unwrap()
+            .commands
+            .iter()
+            .any(|command| command.args.first().is_some_and(|arg| arg == "run"))
+    );
+}
+
+#[tokio::test]
+async fn ambiguous_retained_run_reports_only_the_created_container() {
+    let runner = StatefulAppleRunner::default();
+    let backend = AppleBackend::new(runner.clone());
+    let (_root, create) = request("apple-retained-run-io");
+    let recreate = retained_request(&backend, &runner, create).await;
+    runner.0.lock().unwrap().fail_run_after_insert = true;
+
+    let failure = backend.create_container(recreate).await.unwrap_err();
+
+    assert_eq!(failure.code(), "command_io");
+    assert_eq!(failure.created().len(), 1);
+    assert_eq!(failure.created()[0].kind(), ResourceKind::Container);
 }
 
 #[tokio::test]

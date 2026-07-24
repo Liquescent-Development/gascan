@@ -506,6 +506,84 @@ impl RuntimeResource {
     }
 }
 
+/// Exact retained runtime observations authorized by a validated create request.
+///
+/// Callers cannot forge retained evidence with a struct literal.
+///
+/// ```compile_fail
+/// use gascan_core::runtime::RetainedResources;
+///
+/// let _forged = RetainedResources { resources: Vec::new() };
+/// ```
+///
+/// Serialized diagnostics cannot be deserialized into retained evidence.
+///
+/// ```compile_fail
+/// use gascan_core::runtime::RetainedResources;
+///
+/// let _forged: RetainedResources = serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RetainedResources {
+    resources: Vec<RuntimeResource>,
+}
+
+impl RetainedResources {
+    pub fn new(
+        request: &CreateRequest,
+        resources: Vec<RuntimeResource>,
+    ) -> Result<Self, RuntimeError> {
+        validate_retained_resources(request, &resources)?;
+        Ok(Self { resources })
+    }
+
+    pub fn resources(&self) -> &[RuntimeResource] {
+        &self.resources
+    }
+}
+
+/// A validated desired topology paired with exact retained runtime evidence.
+///
+/// Callers cannot forge recreation requests with a struct literal.
+///
+/// ```compile_fail
+/// use gascan_core::runtime::{CreateRequest, RecreateRequest, RetainedResources};
+///
+/// fn parts() -> (CreateRequest, RetainedResources) {
+///     todo!()
+/// }
+/// let (create, retained) = parts();
+/// let _forged = RecreateRequest { create, retained };
+/// ```
+///
+/// Serialized diagnostics cannot be deserialized into recreation authority.
+///
+/// ```compile_fail
+/// use gascan_core::runtime::RecreateRequest;
+///
+/// let _forged: RecreateRequest = serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RecreateRequest {
+    create: CreateRequest,
+    retained: RetainedResources,
+}
+
+impl RecreateRequest {
+    pub fn new(create: CreateRequest, retained: RetainedResources) -> Result<Self, RuntimeError> {
+        validate_retained_resources(&create, retained.resources())?;
+        Ok(Self { create, retained })
+    }
+
+    pub const fn create(&self) -> &CreateRequest {
+        &self.create
+    }
+
+    pub const fn retained(&self) -> &RetainedResources {
+        &self.retained
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateOutcome {
     created: Vec<RuntimeResource>,
@@ -522,6 +600,14 @@ impl CreateOutcome {
 
     pub fn created(&self) -> &[RuntimeResource] {
         &self.created
+    }
+
+    pub fn for_recreate(
+        request: &RecreateRequest,
+        created: Vec<RuntimeResource>,
+    ) -> Result<Self, RuntimeError> {
+        validate_recreated_container(request.create(), &created)?;
+        Ok(Self { created })
     }
 }
 
@@ -619,6 +705,62 @@ fn allowed_network(request: &CreateRequest) -> Option<ResourceIdentity> {
         })
 }
 
+fn validate_retained_resources(
+    request: &CreateRequest,
+    resources: &[RuntimeResource],
+) -> Result<(), RuntimeError> {
+    let expected_volumes = request
+        .volumes()
+        .iter()
+        .map(|volume| ResourceIdentity::new(ResourceKind::Volume, volume.name.clone()))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let expected_network = allowed_network(request);
+    let mut identities = BTreeSet::new();
+    for resource in resources {
+        let expected = expected_volumes.contains(resource.identity())
+            || expected_network.as_ref() == Some(resource.identity());
+        if !expected
+            || resource.ownership() != ResourceOwnership::GasCanOwned
+            || resource.sandbox_id() != Some(request.id())
+            || !identities.insert(resource.identity().clone())
+        {
+            return Err(RuntimeError::OwnershipMismatch {
+                resource: resource.name().to_owned(),
+            });
+        }
+    }
+    let expected_count = expected_volumes.len() + usize::from(expected_network.is_some());
+    if identities.len() != expected_count {
+        return Err(RuntimeError::InvalidState {
+            resource: request.id().to_string(),
+            message: "retained resources do not exactly match the requested topology".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_recreated_container(
+    request: &CreateRequest,
+    created: &[RuntimeResource],
+) -> Result<(), RuntimeError> {
+    let expected = ResourceIdentity::new(ResourceKind::Container, request.id().to_string())?;
+    let [container] = created else {
+        return Err(RuntimeError::InvalidState {
+            resource: request.id().to_string(),
+            message: "recreate outcome must contain exactly the requested container".to_owned(),
+        });
+    };
+    if container.identity() != &expected
+        || container.ownership() != ResourceOwnership::GasCanOwned
+        || container.sandbox_id() != Some(request.id())
+    {
+        return Err(RuntimeError::OwnershipMismatch {
+            resource: container.name().to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_created_resources(
     request: &CreateRequest,
     created: &[RuntimeResource],
@@ -699,6 +841,8 @@ pub enum RuntimeCall {
     Capabilities,
     Inspect(SandboxId),
     Create(CreateRequest),
+    PrepareImage(String),
+    CreateContainer(RecreateRequest),
     Start(SandboxId),
     Stop(SandboxId),
     Remove(RemoveRequest),
@@ -719,6 +863,11 @@ pub trait RuntimeBackend: Send + Sync {
     async fn capabilities(&self) -> Result<RuntimeCapabilities, RuntimeError>;
     async fn inspect(&self, id: &SandboxId) -> Result<Option<RuntimeSandbox>, RuntimeError>;
     async fn create(&self, request: CreateRequest) -> Result<CreateOutcome, CreateFailure>;
+    async fn prepare_image(&self, image: &str) -> Result<(), RuntimeError>;
+    async fn create_container(
+        &self,
+        request: RecreateRequest,
+    ) -> Result<CreateOutcome, CreateFailure>;
     async fn start(&self, id: &SandboxId) -> Result<(), RuntimeError>;
     async fn stop(&self, id: &SandboxId) -> Result<(), RuntimeError>;
     async fn remove(&self, request: RemoveRequest) -> Result<(), RuntimeError>;

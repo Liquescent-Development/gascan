@@ -2,7 +2,10 @@ use camino::Utf8Path;
 use gascan_apple::AppleCommandBuilder;
 use gascan_core::manifest::Manifest;
 use gascan_core::policy::PolicyCompiler;
-use gascan_core::runtime::{NetworkIsolation, RuntimeCapabilities, RuntimeVersion};
+use gascan_core::runtime::{
+    NetworkIsolation, RecreateRequest, ResourceIdentity, ResourceKind, ResourceOwnership,
+    RetainedResources, RuntimeCapabilities, RuntimeResource, RuntimeVersion,
+};
 use gascan_core::sandbox::{SandboxId, SandboxSpec};
 
 fn capabilities() -> RuntimeCapabilities {
@@ -89,6 +92,38 @@ fn networked_create_uses_the_managed_network_and_loopback_publish() {
             .args
             .windows(2)
             .any(|pair| pair == ["--network", "default"])
+    );
+}
+
+#[test]
+fn retained_create_uses_the_validated_topology_without_resource_create_commands() {
+    let (_root, create) = request("retained-create", "version = 1\nnetwork = 'networked'\n");
+    let mut resources = create
+        .volumes()
+        .iter()
+        .map(|volume| {
+            RuntimeResource::discovered(
+                ResourceIdentity::new(ResourceKind::Volume, volume.name.clone()).unwrap(),
+                Some(create.id().clone()),
+                ResourceOwnership::GasCanOwned,
+            )
+        })
+        .collect::<Vec<_>>();
+    resources.push(RuntimeResource::discovered(
+        ResourceIdentity::new(
+            ResourceKind::Network,
+            create.network().managed_name().unwrap(),
+        )
+        .unwrap(),
+        Some(create.id().clone()),
+        ResourceOwnership::GasCanOwned,
+    ));
+    let retained = RetainedResources::new(&create, resources).unwrap();
+    let recreate = RecreateRequest::new(create.clone(), retained).unwrap();
+
+    assert_eq!(
+        AppleCommandBuilder::create_with_retained(&recreate).unwrap(),
+        AppleCommandBuilder::create(&create).unwrap()
     );
 }
 

@@ -1,8 +1,8 @@
 use crate::runtime::{
     ContainerState, CreateFailure, CreateOutcome, CreateRequest, ExecCancellation, ExecInput,
-    ExecOutput, ExecRequest, ExecSession, RemoveRequest, ResourceIdentity, ResourceKind,
-    ResourceOwnership, RuntimeBackend, RuntimeCall, RuntimeCapabilities, RuntimeError,
-    RuntimeOutcome, RuntimeResource, RuntimeSandbox,
+    ExecOutput, ExecRequest, ExecSession, RecreateRequest, RemoveRequest, ResourceIdentity,
+    ResourceKind, ResourceOwnership, RuntimeBackend, RuntimeCall, RuntimeCapabilities,
+    RuntimeError, RuntimeOutcome, RuntimeResource, RuntimeSandbox,
 };
 use crate::sandbox::SandboxId;
 use async_trait::async_trait;
@@ -48,6 +48,8 @@ pub enum FailureBoundary {
     Capabilities,
     Inspect,
     Create,
+    PrepareImage,
+    CreateContainer,
     Start,
     Stop,
     Remove,
@@ -62,6 +64,8 @@ impl FailureBoundary {
             Self::Capabilities => "capabilities",
             Self::Inspect => "inspect",
             Self::Create => "create",
+            Self::PrepareImage => "prepare_image",
+            Self::CreateContainer => "create_container",
             Self::Start => "start",
             Self::Stop => "stop",
             Self::Remove => "remove",
@@ -614,6 +618,66 @@ impl RuntimeBackend for FakeRuntime {
         created.push(resource);
         fail_after_create_mutation(&mut state, &request, &created)?;
         let outcome = CreateOutcome::new(&request, created).map_err(CreateFailure::from_source)?;
+        state
+            .outcomes
+            .push(RuntimeOutcome::Created(outcome.clone()));
+        persist_state(&state, self.persistence.as_deref()).map_err(CreateFailure::from_source)?;
+        Ok(outcome)
+    }
+
+    async fn prepare_image(&self, image: &str) -> Result<(), RuntimeError> {
+        let mut state = self.inner.lock().await;
+        state
+            .calls
+            .push(RuntimeCall::PrepareImage(image.to_owned()));
+        fail_once(&mut state, FailureBoundary::PrepareImage)
+    }
+
+    async fn create_container(
+        &self,
+        request: RecreateRequest,
+    ) -> Result<CreateOutcome, CreateFailure> {
+        let mut state = self.inner.lock().await;
+        state
+            .calls
+            .push(RuntimeCall::CreateContainer(request.clone()));
+        fail_once(&mut state, FailureBoundary::CreateContainer)
+            .map_err(CreateFailure::from_source)?;
+        let create = request.create();
+        if state.sandboxes.contains_key(create.id()) {
+            return Err(CreateFailure::from_source(RuntimeError::Conflict {
+                resource: create.id().to_string(),
+                message: "sandbox already exists".to_owned(),
+            }));
+        }
+        for retained in request.retained().resources() {
+            if state.resources.get(retained.identity()) != Some(retained) {
+                return Err(CreateFailure::from_source(
+                    RuntimeError::OwnershipMismatch {
+                        resource: retained.name().to_owned(),
+                    },
+                ));
+            }
+        }
+        state.sandboxes.insert(
+            create.id().clone(),
+            RuntimeSandbox {
+                id: create.id().clone(),
+                image: create.image().to_owned(),
+                state: ContainerState::Stopped,
+                ownership: create.ownership().clone(),
+            },
+        );
+        let identity = ResourceIdentity::new(ResourceKind::Container, create.id().to_string())
+            .map_err(CreateFailure::from_source)?;
+        let container = RuntimeResource::discovered(
+            identity.clone(),
+            Some(create.id().clone()),
+            ResourceOwnership::GasCanOwned,
+        );
+        state.resources.insert(identity, container.clone());
+        let outcome = CreateOutcome::for_recreate(&request, vec![container])
+            .map_err(CreateFailure::from_source)?;
         state
             .outcomes
             .push(RuntimeOutcome::Created(outcome.clone()));
