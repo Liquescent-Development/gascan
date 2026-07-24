@@ -418,6 +418,217 @@ async fn storage_mismatch_is_failed_precondition_across_real_up_and_apply_client
 }
 
 #[tokio::test]
+async fn image_upgrade_errors_are_structured_across_real_transport() -> TestResult {
+    let temp = TempDir::new()?;
+    let runtime_root = temp.path().canonicalize()?;
+    let project = runtime_root.join("project");
+    std::fs::create_dir(&project)?;
+    let socket = runtime_root.join("gascan/gascand.sock");
+    let state_path = runtime_root.join("state.sqlite3");
+    let fake_path = runtime_root.join("fake-runtime.json");
+    let old_image = "registry.example/workspace:old@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_gascand"))
+        .env("GASCAN_TEST_FAKE_BACKEND", "1")
+        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .env("GASCAN_STATE_PATH", &state_path)
+        .env("GASCAN_FAKE_STATE_PATH", &fake_path)
+        .env("GASCAN_IDLE_TIMEOUT_MS", "30000")
+        .spawn()?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !socket.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    let endpoint = tonic::transport::Endpoint::try_from("http://[::]:50051")?;
+    let connect_path = socket.clone();
+    let channel = endpoint
+        .connect_with_connector(service_fn(move |_| {
+            let path = connect_path.clone();
+            async move {
+                tokio::net::UnixStream::connect(path)
+                    .await
+                    .map(hyper_util::rt::TokioIo::new)
+            }
+        }))
+        .await?;
+    let mut client = GasCanClient::new(channel);
+    let root = project
+        .to_str()
+        .ok_or("project path is not UTF-8")?
+        .to_owned();
+    let mut initial = client
+        .up(UpRequest {
+            project_root: root.clone(),
+        })
+        .await?
+        .into_inner();
+    while initial.message().await?.is_some() {}
+    let sandbox_id = client
+        .list(ListRequest {})
+        .await?
+        .into_inner()
+        .sandboxes
+        .into_iter()
+        .next()
+        .ok_or("created sandbox missing")?
+        .sandbox_id;
+    let pid = rustix::process::Pid::from_raw(child.id().ok_or("daemon pid")? as i32)
+        .ok_or("zero daemon pid")?;
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM)?;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await??
+            .success()
+    );
+
+    let connection = rusqlite::Connection::open(&state_path)?;
+    connection.execute(
+        "UPDATE sandboxes SET image_resolution_version = 1, image_resolution_details = ?1",
+        [serde_json::json!({"digest": old_image}).to_string()],
+    )?;
+    drop(connection);
+    let mut snapshot: serde_json::Value = serde_json::from_slice(&std::fs::read(&fake_path)?)?;
+    snapshot["sandboxes"][0]["image"] = serde_json::Value::String(old_image.to_owned());
+    let resources = snapshot["resources"]
+        .as_array_mut()
+        .ok_or("fake resources missing")?;
+    let mut duplicate = resources
+        .iter()
+        .find(|resource| resource["name"] == sandbox_id)
+        .cloned()
+        .ok_or("container resource missing")?;
+    duplicate["name"] = serde_json::Value::String("unexpected-container".to_owned());
+    resources.push(duplicate);
+    std::fs::write(&fake_path, serde_json::to_vec(&snapshot)?)?;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_gascand"))
+        .env("GASCAN_TEST_FAKE_BACKEND", "1")
+        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .env("GASCAN_STATE_PATH", &state_path)
+        .env("GASCAN_FAKE_STATE_PATH", &fake_path)
+        .env("GASCAN_IDLE_TIMEOUT_MS", "30000")
+        .spawn()?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !socket.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    let endpoint = tonic::transport::Endpoint::try_from("http://[::]:50051")?;
+    let connect_path = socket.clone();
+    let channel = endpoint
+        .connect_with_connector(service_fn(move |_| {
+            let path = connect_path.clone();
+            async move {
+                tokio::net::UnixStream::connect(path)
+                    .await
+                    .map(hyper_util::rt::TokioIo::new)
+            }
+        }))
+        .await?;
+    let status = GasCanClient::new(channel)
+        .apply(ApplyRequest {
+            project_root: root.clone(),
+        })
+        .await
+        .err()
+        .ok_or("unsafe replacement unexpectedly started")?;
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        status.message(),
+        gascan_proto::error_code::IMAGE_UPGRADE_REQUIRED
+    );
+    let details = gascan_proto::error_detail::decode_details(status.details())
+        .ok_or("missing image precondition details")?;
+    let details: serde_json::Value = serde_json::from_slice(&details)?;
+    assert_eq!(details["reason"], "image_changed");
+    assert_eq!(details["current"], old_image);
+    assert_eq!(
+        details["requested"],
+        include_str!("../../../images/workspace/approved-image.txt")
+    );
+    assert_eq!(details["recovery"], "run `gascan apply` again");
+
+    let pid = rustix::process::Pid::from_raw(child.id().ok_or("daemon pid")? as i32)
+        .ok_or("zero daemon pid")?;
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM)?;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await??
+            .success()
+    );
+
+    let mut snapshot: serde_json::Value = serde_json::from_slice(&std::fs::read(&fake_path)?)?;
+    snapshot["resources"]
+        .as_array_mut()
+        .ok_or("fake resources missing")?
+        .retain(|resource| resource["name"] != "unexpected-container");
+    std::fs::write(&fake_path, serde_json::to_vec(&snapshot)?)?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_gascand"))
+        .env("GASCAN_TEST_FAKE_BACKEND", "1")
+        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .env("GASCAN_STATE_PATH", &state_path)
+        .env("GASCAN_FAKE_STATE_PATH", &fake_path)
+        .env("GASCAN_FAKE_PROVISION_FAIL", "1")
+        .env("GASCAN_FAKE_ROLLBACK_REMOVE_FAIL", "1")
+        .env("GASCAN_IDLE_TIMEOUT_MS", "30000")
+        .spawn()?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !socket.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    let endpoint = tonic::transport::Endpoint::try_from("http://[::]:50051")?;
+    let connect_path = socket.clone();
+    let channel = endpoint
+        .connect_with_connector(service_fn(move |_| {
+            let path = connect_path.clone();
+            async move {
+                tokio::net::UnixStream::connect(path)
+                    .await
+                    .map(hyper_util::rt::TokioIo::new)
+            }
+        }))
+        .await?;
+    let mut events = GasCanClient::new(channel)
+        .apply(ApplyRequest { project_root: root })
+        .await?
+        .into_inner();
+    let mut terminal = None;
+    while let Some(event) = events.message().await? {
+        terminal = Some(event);
+    }
+    let terminal = terminal.ok_or("replacement stream missing terminal event")?;
+    assert_eq!(
+        terminal.status,
+        gascan_proto::v1::OperationStatus::Failed as i32
+    );
+    let error = terminal.error.ok_or("replacement failure missing error")?;
+    assert_eq!(
+        error.code,
+        gascan_proto::error_code::IMAGE_REPLACEMENT_FAILED
+    );
+    let details: serde_json::Value = serde_json::from_slice(&error.details)?;
+    assert!(details["primary"].is_object());
+    assert_eq!(details["primary"]["code"], "provision_failed");
+    assert!(details["rollback"].is_object());
+    assert_eq!(details["rollback"]["code"], "injected_failure");
+
+    let pid = rustix::process::Pid::from_raw(child.id().ok_or("daemon pid")? as i32)
+        .ok_or("zero daemon pid")?;
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM)?;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await??
+            .success()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn sigterm_waits_for_active_durable_operation_then_closes_connection() -> TestResult {
     let temp = TempDir::new()?;
     let runtime_root = temp.path().canonicalize()?;

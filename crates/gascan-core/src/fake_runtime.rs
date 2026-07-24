@@ -87,6 +87,7 @@ struct FakeState {
     outcomes: Vec<RuntimeOutcome>,
     failures: HashSet<FailureBoundary>,
     create_failure_after_mutations: Option<usize>,
+    image_change_on_prepare: Option<String>,
     exec_result: (Vec<u8>, Vec<u8>, i32, i32),
     exec_results: VecDeque<(Vec<u8>, Vec<u8>, i32, i32)>,
     exec_errors: VecDeque<RuntimeError>,
@@ -108,6 +109,7 @@ impl FakeRuntime {
                 outcomes: Vec::new(),
                 failures: HashSet::new(),
                 create_failure_after_mutations: None,
+                image_change_on_prepare: None,
                 exec_result: (Vec::new(), Vec::new(), 0, 0),
                 exec_results: VecDeque::new(),
                 exec_errors: VecDeque::new(),
@@ -168,6 +170,10 @@ impl FakeRuntime {
 
     pub async fn fail_create_after_mutations(&self, mutations: usize) {
         self.inner.lock().await.create_failure_after_mutations = Some(mutations);
+    }
+
+    pub async fn change_image_on_prepare(&self, image: String) {
+        self.inner.lock().await.image_change_on_prepare = Some(image);
     }
 
     pub async fn seed_unowned(&self, id: SandboxId) {
@@ -436,6 +442,7 @@ fn load_state(capabilities: RuntimeCapabilities, path: &Path) -> Result<FakeStat
         outcomes: Vec::new(),
         failures: HashSet::new(),
         create_failure_after_mutations: None,
+        image_change_on_prepare: None,
         exec_result: (Vec::new(), Vec::new(), 0, 0),
         exec_results: VecDeque::new(),
         exec_errors: VecDeque::new(),
@@ -650,7 +657,21 @@ impl RuntimeBackend for FakeRuntime {
         state
             .calls
             .push(RuntimeCall::PrepareImage(image.to_owned()));
-        fail_once(&mut state, FailureBoundary::PrepareImage)
+        fail_once(&mut state, FailureBoundary::PrepareImage)?;
+        if let Some(changed) = state.image_change_on_prepare.take() {
+            let sandbox =
+                state
+                    .sandboxes
+                    .values_mut()
+                    .next()
+                    .ok_or_else(|| RuntimeError::InvalidState {
+                        resource: "fake runtime".to_owned(),
+                        message: "no sandbox exists for configured image change".to_owned(),
+                    })?;
+            sandbox.image = changed;
+            persist_state(&state, self.persistence.as_deref())?;
+        }
+        Ok(())
     }
 
     async fn create_container(

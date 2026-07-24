@@ -3,7 +3,6 @@
 
 use gascan_apple::{AppleBackend, AppleProbe, ProcessRunner};
 use gascan_core::doctor::{DoctorFact, DoctorFacts, DoctorReport};
-#[cfg(debug_assertions)]
 use gascan_core::fake_runtime::FakeRuntime;
 use gascan_core::runtime::RuntimeBackend;
 use gascand::{
@@ -16,6 +15,7 @@ use std::{sync::Arc, time::Duration};
 struct ConfiguredProvisioner {
     delay: Duration,
     fail: bool,
+    rollback_failure_runtime: Option<FakeRuntime>,
 }
 #[async_trait::async_trait]
 impl Provisioner for ConfiguredProvisioner {
@@ -25,6 +25,11 @@ impl Provisioner for ConfiguredProvisioner {
     ) -> Result<ProvisionResolution, ServiceError> {
         tokio::time::sleep(self.delay).await;
         if self.fail {
+            if let Some(runtime) = &self.rollback_failure_runtime {
+                runtime
+                    .inject_failure(gascan_core::fake_runtime::FailureBoundary::Remove)
+                    .await;
+            }
             return Err(ServiceError::Provision("configured failure".to_owned()));
         }
         Ok(ProvisionResolution::default())
@@ -62,8 +67,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 store,
                 paths,
                 idle_timeout,
-                Duration::ZERO,
-                false,
+                ConfiguredProvisioner {
+                    delay: Duration::ZERO,
+                    fail: false,
+                    rollback_failure_runtime: None,
+                },
                 doctor,
             )
             .await
@@ -101,12 +109,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
             run_daemon(
-                runtime,
+                runtime.clone(),
                 store,
                 paths,
                 idle_timeout,
-                provision_delay,
-                provision_fail,
+                ConfiguredProvisioner {
+                    delay: provision_delay,
+                    fail: provision_fail,
+                    rollback_failure_runtime: std::env::var_os("GASCAN_FAKE_ROLLBACK_REMOVE_FAIL")
+                        .is_some()
+                        .then_some(runtime),
+                },
                 DoctorState::ready(DoctorFacts::all_supported_for_tests().into_report()),
             )
             .await
@@ -119,17 +132,13 @@ async fn run_daemon<B: RuntimeBackend + 'static>(
     store: Store,
     paths: SocketPaths,
     idle_timeout: Duration,
-    provision_delay: Duration,
-    provision_fail: bool,
+    provisioner: ConfiguredProvisioner,
     doctor: DoctorState,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let service = Arc::new(SandboxService::new_with_doctor_state(
         runtime,
         store,
-        Arc::new(ConfiguredProvisioner {
-            delay: provision_delay,
-            fail: provision_fail,
-        }),
+        Arc::new(provisioner),
         doctor,
     ));
     let config = DaemonConfig::new(paths, idle_timeout);

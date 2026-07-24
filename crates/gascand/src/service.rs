@@ -312,6 +312,14 @@ pub enum ServiceError {
     Ownership(SandboxId),
     #[error("{}", format_storage_change_message(changes))]
     StorageChangeRequiresRecreate { changes: Vec<StorageCapacityChange> },
+    #[error(
+        "workspace image replacement cannot safely continue: {cause}; current image {current}; requested image {requested}; run `gascan apply` again"
+    )]
+    ImageUpgradeRequired {
+        current: String,
+        requested: String,
+        cause: String,
+    },
     #[error("compiled storage invariant failed: {0}")]
     StorageInvariant(&'static str),
     #[error("provisioning failed: {0}")]
@@ -984,11 +992,9 @@ impl<B: RuntimeBackend> SandboxService<B> {
             .inspect(create.id())
             .await?
             .ok_or_else(|| ServiceError::Missing(create.id().clone()))?;
-        if runtime.ownership.managed_by != "gascan" || runtime.ownership.sandbox_id != *create.id()
-        {
-            return Err(ServiceError::Ownership(create.id().clone()));
-        }
-        let (container, retained) = self.retained_resources(create).await?;
+        let (container, retained) = self
+            .replacement_evidence(create, &runtime, previous_image)
+            .await?;
         let rollback_retained = retained.clone();
         self.emit(
             operation_id,
@@ -1121,6 +1127,33 @@ impl<B: RuntimeBackend> SandboxService<B> {
             }
             Err(error) => Err(error),
         }
+    }
+
+    async fn replacement_evidence(
+        &self,
+        create: &CreateRequest,
+        runtime: &gascan_core::runtime::RuntimeSandbox,
+        expected_previous: &str,
+    ) -> Result<(RuntimeResource, RetainedResources), ServiceError> {
+        let precondition = |cause: String| ServiceError::ImageUpgradeRequired {
+            current: runtime.image.clone(),
+            requested: create.image().to_owned(),
+            cause,
+        };
+        if runtime.image != expected_previous {
+            return Err(precondition(format!(
+                "runtime image changed after preflight from {expected_previous}"
+            )));
+        }
+        if runtime.ownership.managed_by != "gascan" || runtime.ownership.sandbox_id != *create.id()
+        {
+            return Err(precondition(
+                "sandbox ownership changed after preflight".to_owned(),
+            ));
+        }
+        self.retained_resources(create)
+            .await
+            .map_err(|error| precondition(error.to_string()))
     }
 
     async fn persist_created_storage(
@@ -1708,7 +1741,6 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let (sender, receiver) = mpsc::channel(16);
         self.initialize_operation(operation.id, &id, record.actual_state, &sender)
             .await?;
-        let receiver = publish_operation(started, operation.id, receiver);
         let prior_actual = record.actual_state;
         let preflight = async {
             let runtime = self
@@ -1747,6 +1779,23 @@ impl<B: RuntimeBackend> SandboxService<B> {
             }
         };
         if image.change_required() {
+            if let Err(error) = self
+                .replacement_evidence(&create, &runtime, &runtime.image)
+                .await
+            {
+                let actual = self.runtime_actual(&id, prior_actual).await;
+                let code = error.code();
+                let details = failure_details(&error);
+                self.database(move |store| {
+                    store.fail_operation(operation.id, actual, code, details)
+                })
+                .await?;
+                self.send_terminal(operation.id, &sender).await?;
+                return Err(error);
+            }
+        }
+        let receiver = publish_operation(started, operation.id, receiver);
+        if image.change_required() {
             let previous_record = record.clone();
             let provisioned = match self
                 .replace_image(
@@ -1761,8 +1810,15 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 Ok(provisioned) => provisioned,
                 Err(error) => {
                     let actual = self.runtime_actual(&id, prior_actual).await;
-                    let code = gascan_proto::error_code::IMAGE_REPLACEMENT_FAILED;
-                    let details = image_replacement_failure_details(&error);
+                    let (code, details) =
+                        if matches!(error, ServiceError::ImageUpgradeRequired { .. }) {
+                            (error.code(), failure_details(&error))
+                        } else {
+                            (
+                                gascan_proto::error_code::IMAGE_REPLACEMENT_FAILED,
+                                image_replacement_failure_details(&error),
+                            )
+                        };
                     if let Err(reporting) = self
                         .database(move |store| {
                             store.fail_operation(operation.id, actual, code, details)
@@ -2215,6 +2271,7 @@ impl ServiceError {
             Self::Missing(_) => "not_found",
             Self::Ownership(_) => "ownership_mismatch",
             Self::StorageChangeRequiresRecreate { .. } => "storage_change_requires_recreate",
+            Self::ImageUpgradeRequired { .. } => gascan_proto::error_code::IMAGE_UPGRADE_REQUIRED,
             Self::StorageInvariant(_) => "storage_invariant_failed",
             Self::Provision(_)
             | Self::ProvisionCommandFailed { .. }
@@ -2294,6 +2351,20 @@ pub(crate) fn failure_details(error: &ServiceError) -> Value {
                 "recorded_bytes": change.recorded_bytes,
                 "requested_bytes": change.requested_bytes,
             })).collect::<Vec<_>>(),
+        })
+    } else if let ServiceError::ImageUpgradeRequired {
+        current,
+        requested,
+        cause,
+    } = error
+    {
+        json!({
+            "message": error.to_string(),
+            "reason": "image_changed",
+            "current": current,
+            "requested": requested,
+            "cause": cause,
+            "recovery": "run `gascan apply` again",
         })
     } else if let ServiceError::ProvisionCommandFailed {
         step,

@@ -709,6 +709,19 @@ fn service_status(error: ServiceError) -> tonic::Status {
                 )),
             )
         }
+        error @ ServiceError::ImageUpgradeRequired { .. } => {
+            let code = error_code::IMAGE_UPGRADE_REQUIRED;
+            let message = error.to_string();
+            let details =
+                serde_json::to_vec(&crate::service::failure_details(&error)).unwrap_or_default();
+            tonic::Status::with_details(
+                tonic::Code::FailedPrecondition,
+                code,
+                tonic::codegen::Bytes::from(gascan_proto::error_detail::encode_with_details(
+                    code, &message, &details,
+                )),
+            )
+        }
         _ => tonic::Status::internal(error_code::INTERNAL),
     }
 }
@@ -819,6 +832,9 @@ fn service_error_diagnostic(error: &ServiceError) -> String {
         ServiceError::Ownership(_) => "service_kind=ownership".to_owned(),
         ServiceError::StorageChangeRequiresRecreate { .. } => {
             "service_kind=storage_change_requires_recreate".to_owned()
+        }
+        ServiceError::ImageUpgradeRequired { .. } => {
+            "service_kind=image_upgrade_required".to_owned()
         }
         ServiceError::StorageInvariant(_) => "service_kind=storage_invariant".to_owned(),
         ServiceError::Provision(_)

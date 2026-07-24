@@ -510,7 +510,9 @@ async fn image_replace_apply_preserves_resources_and_commits_new_image() -> Test
         .ok_or("prepare image")?;
     let list = calls
         .iter()
-        .position(|call| matches!(call, RuntimeCall::ListResources))
+        .enumerate()
+        .skip(prepare + 1)
+        .find_map(|(index, call)| matches!(call, RuntimeCall::ListResources).then_some(index))
         .ok_or("list resources")?;
     let stop = calls
         .iter()
@@ -628,6 +630,82 @@ async fn image_replace_up_reports_apply_required_without_runtime_mutation() -> T
             })
         }));
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_replace_rejects_runtime_image_change_after_preflight() -> TestResult {
+    let old_image = "ghcr.io/liquescent-development/gascan/workspace:old@sha256:\
+                     bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let changed_image = "ghcr.io/liquescent-development/gascan/workspace:changed@sha256:\
+                         cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let runtime_path = root.join("runtime.json");
+    let state_path = root.join("state.db");
+    let capabilities = FakeRuntime::default().capabilities().await?;
+    let initial_runtime = FakeRuntime::persistent(capabilities.clone(), &runtime_path).await?;
+    let desired = spec("image-change-after-preflight", root)?;
+    let initial_service = SandboxService::new(
+        initial_runtime.clone(),
+        gascand::Store::open(&state_path)?,
+        Arc::new(NoopProvisioner),
+    );
+    initial_service.up(UpRequest::new(desired.clone())).await?;
+    let mut record = initial_service
+        .status(desired.id())?
+        .ok_or("sandbox record")?;
+    record.image_resolution = Some(gascand::ImageResolution::new(
+        1,
+        json!({"digest": old_image}),
+    ));
+    initial_service.store().put_sandbox(&record)?;
+    drop(initial_service);
+    drop(initial_runtime);
+    rewrite_runtime_image(&runtime_path, old_image)?;
+
+    let runtime = FakeRuntime::persistent(capabilities, &runtime_path).await?;
+    runtime
+        .change_image_on_prepare(changed_image.to_owned())
+        .await;
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(&state_path)?,
+        Arc::new(NoopProvisioner),
+    );
+
+    let error = match service.apply(UpRequest::new(desired)).await {
+        Ok(_) => return Err("changed predecessor image unexpectedly applied".into()),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        ServiceError::ImageUpgradeRequired {
+            ref current,
+            ref requested,
+            ..
+        } if current == changed_image
+            && requested == include_str!("../../../images/workspace/approved-image.txt")
+    ));
+    let operation = service.latest_operation()?.ok_or("failed operation")?;
+    assert_eq!(
+        operation.error_code.as_deref(),
+        Some(gascan_proto::error_code::IMAGE_UPGRADE_REQUIRED)
+    );
+    assert_eq!(
+        operation
+            .error_details
+            .as_ref()
+            .and_then(|details| details.get("current"))
+            .and_then(serde_json::Value::as_str),
+        Some(changed_image)
+    );
+    assert!(runtime.calls().await.iter().all(|call| {
+        !matches!(
+            call,
+            RuntimeCall::Stop(_) | RuntimeCall::Remove(_) | RuntimeCall::CreateContainer(_)
+        )
+    }));
     Ok(())
 }
 

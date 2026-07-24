@@ -186,13 +186,15 @@ pub(crate) fn render_status(
 }
 
 fn short_image_reference(reference: &str) -> String {
-    let leaf = reference.rsplit('/').next().unwrap_or(reference);
-    let compact = leaf.split_once(':').map_or(leaf, |(_, tagged)| tagged);
-    let Some((name, digest)) = compact.split_once("@sha256:") else {
-        return compact.to_owned();
+    let Some((name, digest)) = reference.rsplit_once("@sha256:") else {
+        return reference.to_owned();
     };
-    let digest = digest.chars().take(12).collect::<String>();
-    format!("{name}@sha256:{digest}…")
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return reference.to_owned();
+    }
+    let leaf = name.rsplit('/').next().unwrap_or(name);
+    let digest = &digest[..12];
+    format!("{leaf}@sha256:{digest}…")
 }
 
 pub(crate) fn render_list(
@@ -579,7 +581,28 @@ mod tests {
 
         assert_eq!(
             render_status(&status, OutputCapabilities::plain()),
-            "Sandbox: code-123\nState:   Running\n\nUpdate available\n  Workspace image  old@sha256:aaaaaaaaaaaa… → new@sha256:bbbbbbbbbbbb…\n  Run gascan apply\n"
+            "Sandbox: code-123\nState:   Running\n\nUpdate available\n  Workspace image  workspace:old@sha256:aaaaaaaaaaaa… → workspace:new@sha256:bbbbbbbbbbbb…\n  Run gascan apply\n"
+        );
+    }
+
+    #[test]
+    fn image_reference_summary_handles_tagged_untagged_ports_and_malformed_values() {
+        let digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert_eq!(
+            short_image_reference(&format!("registry.example/team/repo:old@sha256:{digest}")),
+            "repo:old@sha256:aaaaaaaaaaaa…"
+        );
+        assert_eq!(
+            short_image_reference(&format!("registry.example/team/repo@sha256:{digest}")),
+            "repo@sha256:aaaaaaaaaaaa…"
+        );
+        assert_eq!(
+            short_image_reference(&format!("localhost:5000/team/repo:old@sha256:{digest}")),
+            "repo:old@sha256:aaaaaaaaaaaa…"
+        );
+        assert_eq!(
+            short_image_reference("registry.example/team/repo:old"),
+            "registry.example/team/repo:old"
         );
     }
 
