@@ -80,7 +80,7 @@ impl Fixture {
             .filter(|copy| !copy.from_stage)
         {
             for source in copy.sources {
-                if source.starts_with(".artifacts/") {
+                if source.starts_with(".artifacts/") || source == "workstation" {
                     continue;
                 }
                 let target = repository.join(&source);
@@ -227,6 +227,10 @@ fn every_local_dockerfile_copy_source_is_sealed_with_exact_bytes_and_mode() {
                         | ".artifacts/playwright-chromium-reviewed"
                 ));
                 assert!(fixture.context.join(source).exists());
+                continue;
+            }
+            if source == "workstation" {
+                assert!(fixture.context.join(source).is_dir());
                 continue;
             }
             let original = fixture.repository.join(&source);

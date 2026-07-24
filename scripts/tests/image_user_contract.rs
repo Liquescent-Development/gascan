@@ -5,6 +5,78 @@ fn root() -> &'static Path {
 }
 
 #[test]
+fn workstation_home_configuration_is_idempotent_and_refuses_unmanaged_paths() {
+    let script = root().join("images/workspace/bin/configure-workstation-home");
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let run = || {
+        Command::new(&script)
+            .env("HOME", &home)
+            .status()
+            .unwrap()
+    };
+    assert!(run().success());
+    assert!(run().success());
+    for agent in ["claude", "codex", "pi"] {
+        let link = home.join(format!(".{agent}"));
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(
+            fs::read_link(link).unwrap(),
+            Path::new(".config/gascan/agents").join(agent)
+        );
+        assert!(home.join(".config/gascan/agents").join(agent).is_dir());
+    }
+    for tool in ["claude", "codex", "pi", "herdr", "gh", "glab"] {
+        assert!(home.join(".cache").join(tool).is_dir());
+    }
+    let herdr = home.join(".config/herdr");
+    assert!(herdr.symlink_metadata().unwrap().file_type().is_symlink());
+    assert_eq!(fs::read_link(herdr).unwrap(), Path::new("../.cache/herdr"));
+
+    let blocked_home = temp.path().join("blocked");
+    fs::create_dir(&blocked_home).unwrap();
+    fs::write(blocked_home.join(".claude"), "user data").unwrap();
+    let blocked = Command::new(&script)
+        .env("HOME", &blocked_home)
+        .status()
+        .unwrap();
+    assert!(!blocked.success());
+    assert_eq!(
+        fs::read_to_string(blocked_home.join(".claude")).unwrap(),
+        "user data"
+    );
+    assert!(
+        !blocked_home.join(".config/gascan/agents/claude").exists(),
+        "refusal must occur before managed targets are created"
+    );
+
+    let blocked_herdr_home = temp.path().join("blocked-herdr");
+    fs::create_dir_all(blocked_herdr_home.join(".config/herdr")).unwrap();
+    let blocked_herdr = Command::new(&script)
+        .env("HOME", &blocked_herdr_home)
+        .status()
+        .unwrap();
+    assert!(!blocked_herdr.success());
+    assert!(
+        !blocked_herdr_home.join(".config/gascan/agents").exists(),
+        "Herdr refusal must occur before managed targets are created"
+    );
+}
+
+#[test]
+fn workstation_home_configuration_contains_no_credentials() {
+    let script =
+        fs::read_to_string(root().join("images/workspace/bin/configure-workstation-home")).unwrap();
+    for forbidden in ["token=", "TOKEN=", "api_key", "API_KEY", "credential"] {
+        assert!(
+            !script.contains(forbidden),
+            "home setup must not materialize credentials: {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn reviewed_workstation_packages_require_no_extra_privileges() {
     let system_tools = fs::read_to_string(root().join("tests/image/system-tools.txt")).unwrap();
     let packages = system_tools

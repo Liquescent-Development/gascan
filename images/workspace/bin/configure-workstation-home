@@ -1,0 +1,53 @@
+#!/bin/sh
+set -eu
+
+: "${HOME:?HOME must be set}"
+
+agents_root=$HOME/.config/gascan/agents
+for agent in claude codex pi; do
+    link=$HOME/.$agent
+    expected=.config/gascan/agents/$agent
+    if [ -L "$link" ]; then
+        test "$(readlink "$link")" = "$expected" ||
+            { printf '%s\n' "refusing unmanaged link: $link" >&2; exit 1; }
+    elif [ -e "$link" ]; then
+        printf '%s\n' "refusing unmanaged path: $link" >&2
+        exit 1
+    fi
+done
+herdr_link=$HOME/.config/herdr
+herdr_expected=../.cache/herdr
+if [ -L "$herdr_link" ]; then
+    test "$(readlink "$herdr_link")" = "$herdr_expected" ||
+        { printf '%s\n' "refusing unmanaged link: $herdr_link" >&2; exit 1; }
+elif [ -e "$herdr_link" ]; then
+    printf '%s\n' "refusing unmanaged path: $herdr_link" >&2
+    exit 1
+fi
+
+install -d -m 0700 "$agents_root"
+for agent in claude codex pi; do
+    target=$agents_root/$agent
+    link=$HOME/.$agent
+    install -d -m 0700 "$target"
+    if [ ! -L "$link" ]; then
+        ln -s ".config/gascan/agents/$agent" "$link"
+    fi
+done
+
+for directory in \
+    "$HOME/.config/gascan/herdr" \
+    "$HOME/.config/gascan/gh" \
+    "$HOME/.config/gascan/glab" \
+    "$HOME/.cache/claude" \
+    "$HOME/.cache/codex" \
+    "$HOME/.cache/pi" \
+    "$HOME/.cache/herdr" \
+    "$HOME/.cache/gh" \
+    "$HOME/.cache/glab"
+do
+    install -d -m 0700 "$directory"
+done
+if [ ! -L "$herdr_link" ]; then
+    ln -s "$herdr_expected" "$herdr_link"
+fi

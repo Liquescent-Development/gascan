@@ -17,6 +17,36 @@ fn root() -> &'static Path {
 }
 
 #[test]
+fn workstation_commands_and_mutable_shims_have_reviewed_path_precedence() {
+    let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
+    let profile =
+        fs::read_to_string(root().join("images/workspace/etc/profile.d/mise.sh")).unwrap();
+    let expected =
+        "/opt/gascan/mise/shims:/usr/local/bin:/opt/gascan/workstation/bin:${PATH}";
+    assert!(
+        dockerfile.contains(&format!("ENV PATH={expected}")),
+        "image PATH must preserve mutable mise shims before immutable workstation tools"
+    );
+    assert!(
+        profile.contains("export PATH=\"$MISE_DATA_DIR/shims:/usr/local/bin:/opt/gascan/workstation/bin:$PATH\""),
+        "interactive PATH must preserve the same precedence"
+    );
+    for required in [
+        "ENV CLAUDE_CONFIG_DIR=/home/workspace/.config/gascan/agents/claude",
+        "ENV CODEX_HOME=/home/workspace/.config/gascan/agents/codex",
+        "ENV PI_CODING_AGENT_DIR=/home/workspace/.config/gascan/agents/pi",
+        "ENV HERDR_CONFIG_PATH=/home/workspace/.config/gascan/herdr/config.toml",
+        "ENV GH_CONFIG_DIR=/home/workspace/.config/gascan/gh",
+        "ENV GLAB_CONFIG_DIR=/home/workspace/.config/gascan/glab",
+    ] {
+        assert!(
+            dockerfile.contains(required),
+            "missing persistent workstation environment: {required}"
+        );
+    }
+}
+
+#[test]
 fn mise_defaults_exactly_match_locked_polyglot_versions() {
     let lock: Lock =
         toml::from_str(&fs::read_to_string(root().join("images/workspace/versions.lock")).unwrap())

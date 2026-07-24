@@ -1,4 +1,13 @@
-use std::{collections::BTreeSet, fs, path::Path, process::Command};
+use std::{
+    collections::BTreeSet,
+    fs,
+    os::unix::fs::PermissionsExt,
+    os::unix::fs::symlink,
+    path::Path,
+    process::Command,
+};
+
+use sha2::{Digest, Sha256};
 
 const MISE_LS_FILTER: &str = r#"if ((keys|sort) != ["elixir","erlang","go","java","node","python","ruby","rust"]) then error("unexpected mise tool set") else to_entries | map(if ((.value|type)!="array") or ((.value|length)!=1) or (.value[0].installed != true) or (.value[0].active != true) or ((.value[0].version|type)!="string") or (.value[0].version=="") then error("invalid mise ls record") else {key:.key,value:.value[0].version} end) | from_entries end"#;
 const EXPECTED_SYSTEM_TOOLS: &str = "\
@@ -72,6 +81,274 @@ zstd
 
 fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
+}
+
+#[test]
+fn dockerfile_assembles_workstation_only_from_the_verified_context() {
+    let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
+    let installer = fs::read_to_string(
+        root().join("images/workspace/bin/install-workstation-artifacts"),
+    )
+    .unwrap();
+    for required in [
+        "COPY --chmod=0555 images/workspace/bin/install-workstation-artifacts /usr/local/bin/install-workstation-artifacts",
+        "COPY workstation /tmp/workstation",
+        "/usr/local/bin/install-workstation-artifacts",
+        "/opt/gascan/workstation",
+        "chown -R root:root /opt/gascan/workstation",
+        "find /opt/gascan/workstation -perm /022 -print -quit",
+        "find /opt/gascan/workstation \\( ! -user root -o ! -group root \\) -print -quit",
+    ] {
+        assert!(
+            dockerfile.contains(required),
+            "missing offline workstation assembly contract: {required}"
+        );
+    }
+    for required in [
+        "\"ci\"",
+        "\"--offline\"",
+        "\"--ignore-scripts\"",
+        "checked_link(command_dir / \"fd\", Path(\"/usr/bin/fdfind\"))",
+        "checked_link(command_dir / \"pico\", Path(\"/usr/bin/nano\"))",
+    ] {
+        assert!(
+            installer.contains(required),
+            "installer omits required npm argument: {required}"
+        );
+    }
+    let workstation_assembly = dockerfile
+        .split_once("COPY workstation /tmp/workstation")
+        .unwrap()
+        .1;
+    for forbidden in [
+        "curl https://",
+        "wget https://",
+        "npm install",
+        "npm view",
+        "registry.npmjs",
+        "github.com/",
+        "gitlab.com/",
+    ] {
+        assert!(
+            !workstation_assembly.contains(forbidden) && !installer.contains(forbidden),
+            "network-capable workstation assembly path: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn workstation_installer_rejects_unsafe_archives_behaviorally() {
+    let installer = root().join("images/workspace/bin/install-workstation-artifacts");
+    let temp = tempfile::tempdir().unwrap();
+    let make_archive = |name: &str, python_body: &str| {
+        let archive = temp.path().join(name);
+        let status = Command::new("python3")
+            .args(["-c", python_body])
+            .arg(&archive)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        archive
+    };
+
+    let safe = make_archive(
+        "safe.tar.gz",
+        "import io,sys,tarfile\np=sys.argv[1]\nwith tarfile.open(p,'w:gz') as t:\n i=tarfile.TarInfo('tree/bin/tool'); i.mode=0o755; d=b'ok'; i.size=len(d); t.addfile(i,io.BytesIO(d))",
+    );
+    assert!(
+        Command::new(&installer)
+            .args(["validate-tar", safe.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    for (name, body) in [
+        (
+            "traversal.tar.gz",
+            "import io,sys,tarfile\nwith tarfile.open(sys.argv[1],'w:gz') as t:\n i=tarfile.TarInfo('../escape'); d=b'x'; i.size=1; t.addfile(i,io.BytesIO(d))",
+        ),
+        (
+            "absolute.tar.gz",
+            "import io,sys,tarfile\nwith tarfile.open(sys.argv[1],'w:gz') as t:\n i=tarfile.TarInfo('/escape'); d=b'x'; i.size=1; t.addfile(i,io.BytesIO(d))",
+        ),
+        (
+            "device.tar.gz",
+            "import sys,tarfile\nwith tarfile.open(sys.argv[1],'w:gz') as t:\n i=tarfile.TarInfo('dev'); i.type=tarfile.CHRTYPE; t.addfile(i)",
+        ),
+        (
+            "escaping-link.tar.gz",
+            "import sys,tarfile\nwith tarfile.open(sys.argv[1],'w:gz') as t:\n i=tarfile.TarInfo('tree/link'); i.type=tarfile.SYMTYPE; i.linkname='../../escape'; t.addfile(i)",
+        ),
+    ] {
+        let archive = make_archive(name, body);
+        assert!(
+            !Command::new(&installer)
+                .args(["validate-tar", archive.to_str().unwrap()])
+                .status()
+                .unwrap()
+                .success(),
+            "unsafe archive passed: {name}"
+        );
+    }
+}
+
+#[test]
+fn workstation_installer_enforces_file_npm_version_and_mode_boundaries_behaviorally() {
+    let installer = root().join("images/workspace/bin/install-workstation-artifacts");
+    let temp = tempfile::tempdir().unwrap();
+
+    let elf = temp.path().join("tool");
+    let mut elf_bytes = vec![0_u8; 20];
+    elf_bytes[..6].copy_from_slice(b"\x7fELF\x02\x01");
+    elf_bytes[18..20].copy_from_slice(&183_u16.to_le_bytes());
+    fs::write(&elf, &elf_bytes).unwrap();
+    let sha = format!("{:x}", Sha256::digest(&elf_bytes));
+    let validate = |size: &str, digest: &str, path: &Path| {
+        Command::new(&installer)
+            .args([
+                "validate-file",
+                path.to_str().unwrap(),
+                size,
+                digest,
+                "arm64-elf",
+            ])
+            .status()
+            .unwrap()
+    };
+    assert!(validate("20", &sha, &elf).success());
+    assert!(!validate("19", &sha, &elf).success());
+    assert!(!validate("20", &"0".repeat(64), &elf).success());
+    fs::write(&elf, vec![0_u8; 20]).unwrap();
+    let non_elf_sha = format!("{:x}", Sha256::digest(vec![0_u8; 20]));
+    assert!(!validate("20", &non_elf_sha, &elf).success());
+
+    let source = temp.path().join("npm-source");
+    let destination = temp.path().join("npm-destination");
+    let fake_bin = temp.path().join("fake-bin");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(source.join("npm-cache")).unwrap();
+    fs::create_dir(&fake_bin).unwrap();
+    fs::write(source.join("package.json"), "{}\n").unwrap();
+    fs::write(source.join("package-lock.json"), "{}\n").unwrap();
+    let args_file = temp.path().join("npm-args");
+    let fake_npm = fake_bin.join("npm");
+    fs::write(
+        &fake_npm,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" >\"$NPM_ARGS\"\nmkdir -p node_modules\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_npm, fs::Permissions::from_mode(0o755)).unwrap();
+    let status = Command::new(&installer)
+        .args([
+            "npm-ci",
+            source.to_str().unwrap(),
+            destination.to_str().unwrap(),
+        ])
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                fake_bin.display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("NPM_ARGS", &args_file)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert_eq!(
+        fs::read_to_string(args_file).unwrap(),
+        format!(
+            "ci\n--offline\n--ignore-scripts\n--cache\n{}\n",
+            source.join("npm-cache").display()
+        )
+    );
+
+    let version = temp.path().join("version-tool");
+    fs::write(&version, "#!/bin/sh\nprintf '%s\\n' 'codex-cli 0.145.0'\n").unwrap();
+    fs::set_permissions(&version, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        Command::new(&installer)
+            .args([
+                "verify-version",
+                version.to_str().unwrap(),
+                "codex",
+                "0.145.0",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        !Command::new(&installer)
+            .args([
+                "verify-version",
+                version.to_str().unwrap(),
+                "codex",
+                "0.146.0",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::write(&version, "#!/bin/sh\nprintf '%s\\n' 'compile 0.81.1'\n").unwrap();
+    assert!(
+        !Command::new(&installer)
+            .args([
+                "verify-version",
+                version.to_str().unwrap(),
+                "pi",
+                "0.81.1",
+            ])
+            .status()
+            .unwrap()
+            .success(),
+        "version identity matched inside an unrelated word"
+    );
+
+    let tree = temp.path().join("tree");
+    fs::create_dir(&tree).unwrap();
+    fs::write(tree.join("metadata"), "locked").unwrap();
+    fs::write(tree.join("executable"), "#!/bin/sh\n").unwrap();
+    fs::set_permissions(tree.join("metadata"), fs::Permissions::from_mode(0o666)).unwrap();
+    fs::set_permissions(tree.join("executable"), fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(
+        Command::new(&installer)
+            .args(["seal-tree", tree.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(fs::metadata(&tree).unwrap().permissions().mode() & 0o777, 0o555);
+    assert_eq!(
+        fs::metadata(tree.join("metadata"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o444
+    );
+    assert_eq!(
+        fs::metadata(tree.join("executable"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o555
+    );
+
+    let escaping_tree = temp.path().join("escaping-tree");
+    fs::create_dir(&escaping_tree).unwrap();
+    symlink(temp.path(), escaping_tree.join("escape")).unwrap();
+    assert!(
+        !Command::new(&installer)
+            .args(["seal-tree", escaping_tree.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success(),
+        "immutable tree accepted an escaping symlink"
+    );
 }
 
 fn assert_exact_system_tools(package_text: &str) -> Result<(), &'static str> {
