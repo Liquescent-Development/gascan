@@ -16,8 +16,9 @@ use gascan_core::provision::{
 };
 use gascan_core::runtime::{
     ContainerState, CreateFailure, CreateOutcome, CreateRequest, ExecInput, ExecOutput,
-    ExecRequest, RecreateRequest, RemoveRequest, ResourceKind, ResourceOwnership,
+    ExecRequest, RecreateRequest, RemoveRequest, ResourceIdentity, ResourceKind, ResourceOwnership,
     RetainedResources, RuntimeBackend, RuntimeCapabilities, RuntimeError, RuntimeResource,
+    immutable_image_reference,
 };
 use gascan_core::sandbox::{SandboxError, SandboxId, SandboxSpec};
 use serde::de::{Error as _, MapAccess, Visitor};
@@ -614,32 +615,6 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 .await;
             return Err(error);
         }
-        if let Some(recorded_image) = prior
-            .as_ref()
-            .and_then(stored_image)
-            .filter(|recorded| recorded != create.image())
-        {
-            self.emit(
-                operation.id,
-                json!({
-                    "phase": "apply_required",
-                    "reason": "image_changed",
-                    "recorded_image": recorded_image,
-                    "running_image": recorded_image,
-                    "approved_image": create.image(),
-                }),
-                &sender,
-            )
-            .await?;
-            let actual = record.actual_state;
-            self.database(move |store| store.complete_operation(operation.id, actual))
-                .await?;
-            self.send_terminal(operation.id, &sender).await?;
-            return Ok(receiver.map(|events| Operation {
-                id: operation.id,
-                events,
-            }));
-        }
         let result = self
             .up_runtime(
                 &request.spec,
@@ -719,6 +694,27 @@ impl<B: RuntimeBackend> SandboxService<B> {
         if let Some(runtime) = &inspected {
             if runtime.ownership.managed_by != "gascan" || runtime.ownership.sandbox_id != *id {
                 return Err(ServiceError::Ownership(id.clone()));
+            }
+            let state = image_state(prior, &runtime.image, create.image())?;
+            if state.change_required() {
+                self.emit(
+                    operation_id,
+                    json!({
+                        "phase": "apply_required",
+                        "reason": "image_changed",
+                        "recorded_image": state.recorded,
+                        "running_image": state.running,
+                        "approved_image": state.approved,
+                    }),
+                    sender,
+                )
+                .await?;
+                let actual = match runtime.state {
+                    ContainerState::Creating => ActualState::Creating,
+                    ContainerState::Running => ActualState::Running,
+                    ContainerState::Stopped => ActualState::Stopped,
+                };
+                return Ok((actual, None));
             }
         } else {
             match self.runtime.create(create.clone()).await {
@@ -899,21 +895,19 @@ impl<B: RuntimeBackend> SandboxService<B> {
         create: &CreateRequest,
     ) -> Result<(RuntimeResource, RetainedResources), ServiceError> {
         let resources = self.runtime.list_resources().await?;
-        let mut owned = resources
+        let container = exact_owned_container(create, &resources)?.ok_or_else(|| {
+            ServiceError::Runtime(RuntimeError::InvalidState {
+                resource: create.id().to_string(),
+                message: "expected exactly one owned container resource".to_owned(),
+            })
+        })?;
+        let retained = resources
             .into_iter()
             .filter(|resource| {
                 resource.ownership() == ResourceOwnership::GasCanOwned
                     && resource.sandbox_id() == Some(create.id())
+                    && resource.kind() != ResourceKind::Container
             })
-            .collect::<Vec<_>>();
-        let container_index = owned
-            .iter()
-            .position(|resource| resource.kind() == ResourceKind::Container)
-            .ok_or_else(|| ServiceError::Missing(create.id().clone()))?;
-        let container = owned.remove(container_index);
-        let retained = owned
-            .into_iter()
-            .filter(|resource| resource.kind() != ResourceKind::Container)
             .collect();
         Ok((
             container,
@@ -950,16 +944,8 @@ impl<B: RuntimeBackend> SandboxService<B> {
         operation_id: OperationId,
         sender: &mpsc::Sender<OperationEvent>,
     ) -> Result<(), ServiceError> {
-        let container = self
-            .runtime
-            .list_resources()
-            .await?
-            .into_iter()
-            .find(|resource| {
-                resource.kind() == ResourceKind::Container
-                    && resource.ownership() == ResourceOwnership::GasCanOwned
-                    && resource.sandbox_id() == Some(create.id())
-            });
+        let resources = self.runtime.list_resources().await?;
+        let container = exact_owned_container(create, &resources)?;
         if let Some(container) = container {
             self.remove_exact_container(create, container).await?;
         }
@@ -1014,10 +1000,43 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 .remove(RemoveRequest::from_resources(vec![container])?)
                 .await?;
             let recreate = RecreateRequest::new(create.clone(), retained)?;
-            self.runtime
-                .create_container(recreate)
-                .await
-                .map_err(ServiceError::Create)?;
+            if let Err(failure) = self.runtime.create_container(recreate).await {
+                let partial = failure.created().to_vec();
+                let original = ServiceError::Create(failure);
+                if !partial.is_empty() {
+                    let [container] = partial.as_slice() else {
+                        return Err(ServiceError::ImageRollback {
+                            original: Box::new(original),
+                            rollback: Box::new(ServiceError::Runtime(RuntimeError::InvalidState {
+                                resource: create.id().to_string(),
+                                message: "replacement failure returned non-container evidence"
+                                    .to_owned(),
+                            })),
+                        });
+                    };
+                    let expected =
+                        ResourceIdentity::new(ResourceKind::Container, create.id().to_string())?;
+                    if container.identity() != &expected {
+                        return Err(ServiceError::ImageRollback {
+                            original: Box::new(original),
+                            rollback: Box::new(ServiceError::Runtime(
+                                RuntimeError::OwnershipMismatch {
+                                    resource: container.name().to_owned(),
+                                },
+                            )),
+                        });
+                    }
+                    if let Err(rollback) =
+                        self.remove_exact_container(create, container.clone()).await
+                    {
+                        return Err(ServiceError::ImageRollback {
+                            original: Box::new(original),
+                            rollback: Box::new(rollback),
+                        });
+                    }
+                }
+                return Err(original);
+            }
             self.runtime.start(create.id()).await?;
             let prior = self
                 .database({
@@ -1775,11 +1794,15 @@ impl<B: RuntimeBackend> SandboxService<B> {
                     move |store| store.put_sandbox(&record)
                 })
                 .await?;
-                self.database(move |store| {
-                    store.complete_operation(operation.id, ActualState::Running)
-                })
-                .await?;
-                self.send_terminal(operation.id, &sender).await
+                self.database(move |store| store.operation_events(operation.id))
+                    .await?;
+                let (_, terminal) = self
+                    .database(move |store| {
+                        store.complete_operation_with_event(operation.id, ActualState::Running)
+                    })
+                    .await?;
+                let _ = sender.try_send(terminal);
+                Ok::<_, ServiceError>(())
             }
             .await;
             if let Err(original) = commit {
@@ -1792,19 +1815,44 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 let record_rollback = self
                     .database(move |store| store.put_sandbox(&previous_record))
                     .await;
-                let rollback = match (runtime_rollback, record_rollback) {
-                    (Ok(()), Ok(())) => return Err(original),
-                    (Err(runtime), Ok(())) => runtime,
-                    (Ok(()), Err(store)) => store,
-                    (Err(runtime), Err(store)) => ServiceError::ImageRollback {
-                        original: Box::new(runtime),
+                let failure = match (runtime_rollback, record_rollback) {
+                    (Ok(()), Ok(())) => original,
+                    (Err(runtime), Ok(())) => ServiceError::ImageRollback {
+                        original: Box::new(original),
+                        rollback: Box::new(runtime),
+                    },
+                    (Ok(()), Err(store)) => ServiceError::ImageRollback {
+                        original: Box::new(original),
                         rollback: Box::new(store),
                     },
+                    (Err(runtime), Err(store)) => ServiceError::ImageRollback {
+                        original: Box::new(original),
+                        rollback: Box::new(ServiceError::ImageRollback {
+                            original: Box::new(runtime),
+                            rollback: Box::new(store),
+                        }),
+                    },
                 };
-                return Err(ServiceError::ImageRollback {
-                    original: Box::new(original),
-                    rollback: Box::new(rollback),
-                });
+                let actual = self.runtime_actual(&id, prior_actual).await;
+                let code = failure.code();
+                let details = failure_details(&failure);
+                let terminal = self
+                    .database(move |store| {
+                        store.fail_operation_with_event(operation.id, actual, code, details)
+                    })
+                    .await;
+                match terminal {
+                    Ok((_, event)) => {
+                        let _ = sender.try_send(event);
+                        return Err(failure);
+                    }
+                    Err(reporting) => {
+                        return Err(ServiceError::FailureReporting {
+                            original: Box::new(failure),
+                            reporting: Box::new(reporting),
+                        });
+                    }
+                }
             }
             return Ok(receiver.map(|events| Operation {
                 id: operation.id,
@@ -2425,18 +2473,45 @@ fn replacement_applied_state(record: &SandboxRecord) -> AppliedState {
     AppliedState::with_hashes(tool_hash, None)
 }
 
+fn exact_owned_container(
+    create: &CreateRequest,
+    resources: &[RuntimeResource],
+) -> Result<Option<RuntimeResource>, ServiceError> {
+    let mut containers = resources.iter().filter(|resource| {
+        resource.kind() == ResourceKind::Container
+            && resource.ownership() == ResourceOwnership::GasCanOwned
+            && resource.sandbox_id() == Some(create.id())
+    });
+    let Some(container) = containers.next() else {
+        return Ok(None);
+    };
+    if containers.next().is_some() {
+        return Err(ServiceError::Runtime(RuntimeError::InvalidState {
+            resource: create.id().to_string(),
+            message: "expected at most one owned container resource".to_owned(),
+        }));
+    }
+    let expected = ResourceIdentity::new(ResourceKind::Container, create.id().to_string())?;
+    if container.identity() != &expected {
+        return Err(ServiceError::Runtime(RuntimeError::OwnershipMismatch {
+            resource: container.name().to_owned(),
+        }));
+    }
+    Ok(Some(container.clone()))
+}
+
 fn image_state(
     record: Option<&SandboxRecord>,
     running: &str,
     approved: &str,
 ) -> Result<ImageState, RuntimeError> {
-    if !immutable_workspace_image(running) {
+    if !immutable_image_reference(running) {
         return Err(RuntimeError::InvalidOutput {
             operation: "runtime image inspection".to_owned(),
             message: "running workspace image is not digest-qualified".to_owned(),
         });
     }
-    if !immutable_workspace_image(approved) {
+    if !immutable_image_reference(approved) {
         return Err(RuntimeError::InvalidOutput {
             operation: "workspace image policy".to_owned(),
             message: "approved workspace image is not digest-qualified".to_owned(),
@@ -2458,19 +2533,8 @@ fn stored_image(record: &SandboxRecord) -> Option<String> {
         .details
         .get("digest")?
         .as_str()
-        .filter(|value| immutable_workspace_image(value))
+        .filter(|value| immutable_image_reference(value))
         .map(ToOwned::to_owned)
-}
-
-fn immutable_workspace_image(value: &str) -> bool {
-    let Some((name, digest)) = value.split_once("@sha256:") else {
-        return false;
-    };
-    !name.is_empty()
-        && digest.len() == 64
-        && digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn provisioning_transport_error() -> ServiceError {

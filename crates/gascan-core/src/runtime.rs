@@ -599,15 +599,70 @@ impl RecreateRequest {
     }
 }
 
-fn immutable_image_reference(image: &str) -> bool {
+pub fn immutable_image_reference(image: &str) -> bool {
     let Some((name, digest)) = image.split_once("@sha256:") else {
         return false;
     };
-    !name.is_empty()
+    valid_image_name(name)
         && digest.len() == 64
         && digest
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_image_name(name: &str) -> bool {
+    if name.is_empty() || !name.is_ascii() || name.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return false;
+    }
+    let last_slash = name.rfind('/');
+    let tag_separator = name
+        .rfind(':')
+        .filter(|separator| last_slash.is_none_or(|slash| *separator > slash));
+    let (repository, tag) = tag_separator.map_or((name, None), |separator| {
+        (&name[..separator], Some(&name[separator + 1..]))
+    });
+    if tag.is_some_and(|tag| {
+        tag.is_empty()
+            || tag.len() > 128
+            || !tag
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            || !tag
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    }) {
+        return false;
+    }
+    repository
+        .split('/')
+        .enumerate()
+        .all(|(index, component)| valid_repository_component(component, index == 0))
+}
+
+fn valid_repository_component(component: &str, allow_port: bool) -> bool {
+    let (component, port) = if allow_port {
+        component
+            .split_once(':')
+            .map_or((component, None), |(host, port)| (host, Some(port)))
+    } else {
+        (component, None)
+    };
+    if port.is_some_and(|port| port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit())) {
+        return false;
+    }
+    !component.is_empty()
+        && component
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && component
+            .bytes()
+            .last()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && component.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

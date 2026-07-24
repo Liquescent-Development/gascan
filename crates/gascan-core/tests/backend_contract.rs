@@ -471,6 +471,11 @@ fn rollback_recreate_accepts_only_immutable_images_and_preserves_topology() {
         "registry.example/workspace@sha256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
         "registry.example/workspace@sha256:bbbb",
         "@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        " registry.example/workspace@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "registry.example//workspace@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "registry.example/Workspace@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "registry.example/-workspace@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "registry.example/workspace:@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     ] {
         assert!(
             RecreateRequest::for_image(create.clone(), invalid.to_owned(), retained.clone(),)
@@ -786,6 +791,9 @@ async fn every_backend_boundary_supports_fail_once_injection() {
         FailureBoundary::Capabilities,
         FailureBoundary::Inspect,
         FailureBoundary::Create,
+        FailureBoundary::PrepareImage,
+        FailureBoundary::CreateContainer,
+        FailureBoundary::CreateContainerAfterMutation,
     ] {
         let backend = FakeRuntime::failing_once(boundary);
         let id = SandboxId::test(boundary.as_str());
@@ -796,6 +804,46 @@ async fn every_backend_boundary_supports_fail_once_injection() {
                 let fixture = create_request(boundary.as_str());
                 let error = backend.create(fixture.request()).await.unwrap_err();
                 assert_eq!(error.code(), "injected_failure");
+                continue;
+            }
+            FailureBoundary::PrepareImage => {
+                backend.prepare_image("fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                    .await
+                    .unwrap_err()
+            }
+            FailureBoundary::CreateContainer
+            | FailureBoundary::CreateContainerAfterMutation => {
+                let fixture = create_request(boundary.as_str());
+                let created = backend.create(fixture.request()).await.unwrap();
+                backend
+                    .remove(
+                        RemoveRequest::from_resources(
+                            created
+                                .created()
+                                .iter()
+                                .filter(|resource| resource.kind() == ResourceKind::Container)
+                                .cloned()
+                                .collect(),
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let retained = RetainedResources::new(
+                    &fixture.request(),
+                    backend.list_resources().await.unwrap(),
+                )
+                .unwrap();
+                let failure = backend
+                    .create_container(
+                        RecreateRequest::new(fixture.request(), retained).unwrap(),
+                    )
+                    .await
+                    .unwrap_err();
+                if boundary == FailureBoundary::CreateContainerAfterMutation {
+                    assert_eq!(failure.created().len(), 1);
+                }
+                assert_eq!(failure.code(), "injected_failure");
                 continue;
             }
             _ => continue,

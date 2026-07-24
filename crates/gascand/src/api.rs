@@ -664,6 +664,9 @@ fn selector_id(selector: Option<v1::SandboxSelector>) -> Result<SandboxId, ApiIn
 
 fn service_status(error: ServiceError) -> tonic::Status {
     match error {
+        ServiceError::Rollback { original, .. }
+        | ServiceError::ImageRollback { original, .. }
+        | ServiceError::FailureReporting { original, .. } => service_status(*original),
         ServiceError::Store(crate::StoreError::PendingOperationExists { .. }) => {
             tonic::Status::already_exists(error_code::OPERATION_CONFLICT)
         }
@@ -2691,6 +2694,43 @@ mod tests {
         let direct = service_status(ServiceError::Policy(PolicyError::DiskControlUnsupported));
         assert_eq!(direct.code(), tonic::Code::InvalidArgument);
         assert_eq!(direct.message(), error_code::DISK_CONTROL_UNSUPPORTED);
+    }
+
+    #[test]
+    fn replacement_error_wrappers_preserve_primary_public_status() {
+        let unavailable = service_status(ServiceError::ImageRollback {
+            original: Box::new(ServiceError::Runtime(
+                gascan_core::runtime::RuntimeError::NotFound {
+                    resource: "replacement".to_owned(),
+                },
+            )),
+            rollback: Box::new(ServiceError::Store(StoreError::InvalidTransition {
+                from: "pending".to_owned(),
+                to: "failed".to_owned(),
+            })),
+        });
+        assert_eq!(unavailable.code(), tonic::Code::Unavailable);
+        assert_eq!(unavailable.message(), error_code::BACKEND_UNAVAILABLE);
+
+        let precondition = service_status(ServiceError::FailureReporting {
+            original: Box::new(ServiceError::StorageChangeRequiresRecreate {
+                changes: vec![crate::service::StorageCapacityChange {
+                    volume: "tools",
+                    recorded_bytes: Some(1),
+                    requested_bytes: 2,
+                }],
+            }),
+            reporting: Box::new(ServiceError::Runtime(
+                gascan_core::runtime::RuntimeError::NotFound {
+                    resource: "terminal event".to_owned(),
+                },
+            )),
+        });
+        assert_eq!(precondition.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            precondition.message(),
+            gascan_proto::error_code::STORAGE_CHANGE_REQUIRES_RECREATE
+        );
     }
 
     #[test]

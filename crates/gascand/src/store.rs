@@ -5,6 +5,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::fmt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -142,6 +143,7 @@ pub struct OperationEvent {
 #[derive(Clone)]
 pub struct Store {
     connection: Arc<Mutex<Connection>>,
+    fail_operation_event_read: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Error)]
@@ -182,6 +184,8 @@ pub enum StoreError {
     CorruptData(String),
     #[error("system clock cannot be represented as a Unix timestamp")]
     InvalidSystemTime,
+    #[error("injected operation event read failure")]
+    InjectedOperationEventRead,
 }
 
 impl Store {
@@ -193,7 +197,13 @@ impl Store {
         initialize_schema(&mut connection)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
+            fail_operation_event_read: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    #[doc(hidden)]
+    pub fn fail_next_operation_event_read(&self) {
+        self.fail_operation_event_read.store(true, Ordering::SeqCst);
     }
 
     pub fn put_sandbox(&self, sandbox: &SandboxRecord) -> Result<(), StoreError> {
@@ -261,6 +271,15 @@ impl Store {
         actual_state: ActualState,
     ) -> Result<OperationRecord, StoreError> {
         self.finish_operation(id, actual_state, OperationStatus::Completed, None, None)
+            .map(|(operation, _)| operation)
+    }
+
+    pub(crate) fn complete_operation_with_event(
+        &self,
+        id: OperationId,
+        actual_state: ActualState,
+    ) -> Result<(OperationRecord, OperationEvent), StoreError> {
+        self.finish_operation(id, actual_state, OperationStatus::Completed, None, None)
     }
 
     pub fn fail_operation(
@@ -270,6 +289,17 @@ impl Store {
         error_code: impl Into<String>,
         error_details: Value,
     ) -> Result<OperationRecord, StoreError> {
+        self.fail_operation_with_event(id, actual_state, error_code, error_details)
+            .map(|(operation, _)| operation)
+    }
+
+    pub(crate) fn fail_operation_with_event(
+        &self,
+        id: OperationId,
+        actual_state: ActualState,
+        error_code: impl Into<String>,
+        error_details: Value,
+    ) -> Result<(OperationRecord, OperationEvent), StoreError> {
         self.finish_operation(
             id,
             actual_state,
@@ -291,6 +321,9 @@ impl Store {
         &self,
         operation_id: OperationId,
     ) -> Result<Vec<OperationEvent>, StoreError> {
+        if self.fail_operation_event_read.swap(false, Ordering::SeqCst) {
+            return Err(StoreError::InjectedOperationEventRead);
+        }
         let connection = self.lock()?;
         let mut statement = connection.prepare(
             "SELECT sequence, operation_id, status, details, error_code, timestamp_millis FROM operation_events WHERE operation_id = ?1 ORDER BY sequence",
@@ -358,7 +391,7 @@ impl Store {
         status: OperationStatus,
         error_code: Option<String>,
         error_details: Option<Value>,
-    ) -> Result<OperationRecord, StoreError> {
+    ) -> Result<(OperationRecord, OperationEvent), StoreError> {
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let operation =
@@ -391,9 +424,15 @@ impl Store {
             "INSERT INTO operation_events (operation_id, status, details, error_code, timestamp_millis) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![id.get(), status.as_db(), details_json, error_code, current_time_millis()?],
         )?;
+        let sequence = transaction.last_insert_rowid();
+        let terminal = transaction.query_row(
+            "SELECT sequence, operation_id, status, details, error_code, timestamp_millis FROM operation_events WHERE sequence = ?1",
+            [sequence],
+            event_from_row,
+        )?;
         let updated = load_operation(&transaction, id)?.ok_or(StoreError::OperationNotFound(id))?;
         transaction.commit()?;
-        Ok(updated)
+        Ok((updated, terminal))
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {

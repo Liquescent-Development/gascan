@@ -3,7 +3,9 @@ use camino::Utf8Path;
 use gascan_core::fake_runtime::{FailureBoundary, FakeRuntime};
 use gascan_core::manifest::Manifest;
 use gascan_core::policy::PolicyCompiler;
-use gascan_core::runtime::{ResourceKind, ResourceOwnership, RuntimeBackend, RuntimeCall};
+use gascan_core::runtime::{
+    ResourceIdentity, ResourceKind, ResourceOwnership, RuntimeBackend, RuntimeCall,
+};
 use gascan_core::sandbox::SandboxSpec;
 use gascand::{NoopProvisioner, OperationStatus, SandboxService, UpRequest};
 use gascand::{ProvisionRequest, ProvisionResolution, Provisioner, ServiceError};
@@ -15,7 +17,6 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -146,23 +147,47 @@ struct RollbackFailingProvisioner {
     runtime: FakeRuntime,
 }
 
-struct CommitRaceProvisioner {
-    entered: Arc<Semaphore>,
-    release: Arc<Semaphore>,
+struct ExtraContainerProvisioner {
+    runtime: FakeRuntime,
+    id: gascan_core::sandbox::SandboxId,
 }
 
 #[async_trait]
-impl Provisioner for CommitRaceProvisioner {
+impl Provisioner for ExtraContainerProvisioner {
     async fn provision(
         &self,
         _request: ProvisionRequest<'_>,
     ) -> Result<ProvisionResolution, ServiceError> {
-        self.entered.add_permits(1);
-        self.release
-            .acquire()
-            .await
-            .map_err(|_| ServiceError::Provision("commit race gate closed".to_owned()))?
-            .forget();
+        self.runtime
+            .seed_container_resource(
+                "extra-rollback-container",
+                self.id.clone(),
+                ResourceOwnership::GasCanOwned,
+            )
+            .await?;
+        Err(ServiceError::Provision(
+            "injected provision failure with extra container".to_owned(),
+        ))
+    }
+
+    async fn health_check(
+        &self,
+        _id: &gascan_core::sandbox::SandboxId,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+}
+
+struct TerminalReadFailingProvisioner {
+    store: gascand::Store,
+}
+
+#[async_trait]
+impl Provisioner for TerminalReadFailingProvisioner {
+    async fn provision(
+        &self,
+        _request: ProvisionRequest<'_>,
+    ) -> Result<ProvisionResolution, ServiceError> {
         Ok(ProvisionResolution::default())
     }
 
@@ -170,6 +195,7 @@ impl Provisioner for CommitRaceProvisioner {
         &self,
         _id: &gascan_core::sandbox::SandboxId,
     ) -> Result<(), ServiceError> {
+        self.store.fail_next_operation_event_read();
         Ok(())
     }
 }
@@ -526,6 +552,13 @@ async fn image_replace_apply_preserves_resources_and_commits_new_image() -> Test
             .and_then(|resolution| resolution.details["digest"].as_str().map(ToOwned::to_owned)),
         Some(approved_image)
     );
+    assert_eq!(
+        service
+            .latest_operation()?
+            .ok_or("completed operation")?
+            .status,
+        OperationStatus::Completed
+    );
     Ok(())
 }
 
@@ -533,36 +566,68 @@ async fn image_replace_apply_preserves_resources_and_commits_new_image() -> Test
 async fn image_replace_up_reports_apply_required_without_runtime_mutation() -> TestResult {
     let old_image = "ghcr.io/liquescent-development/gascan/workspace:old@sha256:\
                      bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    let root = tempfile::tempdir()?;
-    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
-    let desired = spec("image-replace-up", root)?;
-    let runtime = FakeRuntime::default();
-    let service = SandboxService::new(
-        runtime.clone(),
-        gascand::Store::open(root.join("state.db"))?,
-        Arc::new(NoopProvisioner),
-    );
-    service.up(UpRequest::new(desired.clone())).await?;
-    let mut record = service.status(desired.id())?.ok_or("sandbox record")?;
-    record.image_resolution = Some(gascand::ImageResolution::new(
-        1,
-        json!({"digest": old_image}),
-    ));
-    service.store().put_sandbox(&record)?;
+    for recorded in ["approved", "invalid"] {
+        let root = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+        let runtime_path = root.join("runtime.json");
+        let state_path = root.join("state.db");
+        let capabilities = FakeRuntime::default().capabilities().await?;
+        let initial_runtime = FakeRuntime::persistent(capabilities.clone(), &runtime_path).await?;
+        let desired = spec("image-replace-up", root)?;
+        let initial_service = SandboxService::new(
+            initial_runtime.clone(),
+            gascand::Store::open(&state_path)?,
+            Arc::new(NoopProvisioner),
+        );
+        initial_service.up(UpRequest::new(desired.clone())).await?;
+        let approved_image = initial_runtime
+            .inspect(desired.id())
+            .await?
+            .ok_or("initial runtime")?
+            .image;
+        let mut record = initial_service
+            .status(desired.id())?
+            .ok_or("sandbox record")?;
+        if recorded == "invalid" {
+            record.image_resolution = Some(gascand::ImageResolution::new(
+                1,
+                json!({"digest":"workspace:latest"}),
+            ));
+            initial_service.store().put_sandbox(&record)?;
+        }
+        drop(initial_service);
+        drop(initial_runtime);
+        rewrite_runtime_image(&runtime_path, old_image)?;
 
-    let before = runtime.calls().await.len();
-    let operation = service.up(UpRequest::new(desired)).await?;
-    let events = service.store().operation_events(operation.id)?;
+        let runtime = FakeRuntime::persistent(capabilities, &runtime_path).await?;
+        let service = SandboxService::new(
+            runtime.clone(),
+            gascand::Store::open(&state_path)?,
+            Arc::new(NoopProvisioner),
+        );
+        let operation = service.up(UpRequest::new(desired)).await?;
+        let events = service.store().operation_events(operation.id)?;
 
-    assert_eq!(runtime.calls().await.len(), before);
-    assert!(events.iter().any(|event| {
-        event.details.as_ref().is_some_and(|details| {
-            details["phase"] == "apply_required"
-                && details["reason"] == "image_changed"
-                && details["recorded_image"] == old_image
-                && details["running_image"] == old_image
-        })
-    }));
+        assert!(runtime.calls().await.iter().all(|call| {
+            matches!(
+                call,
+                RuntimeCall::Capabilities | RuntimeCall::Inspect(_) | RuntimeCall::ListResources
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            event.details.as_ref().is_some_and(|details| {
+                details["phase"] == "apply_required"
+                    && details["reason"] == "image_changed"
+                    && details["running_image"] == old_image
+                    && details["approved_image"] == approved_image
+                    && if recorded == "invalid" {
+                        details["recorded_image"].is_null()
+                    } else {
+                        details["recorded_image"] == approved_image
+                    }
+            })
+        }));
+    }
     Ok(())
 }
 
@@ -574,6 +639,11 @@ async fn image_replace_failures_restore_previous_image_and_resources() -> TestRe
         (Some(FailureBoundary::Stop), false, false),
         (Some(FailureBoundary::Remove), false, false),
         (Some(FailureBoundary::CreateContainer), false, false),
+        (
+            Some(FailureBoundary::CreateContainerAfterMutation),
+            false,
+            false,
+        ),
         (Some(FailureBoundary::Start), false, false),
         (None, true, false),
         (None, false, true),
@@ -650,6 +720,13 @@ async fn image_replace_failures_restore_previous_image_and_resources() -> TestRe
                     .map(ToOwned::to_owned)),
             Some(old_image.to_owned())
         );
+        assert_eq!(
+            service
+                .latest_operation()?
+                .ok_or("failed operation")?
+                .status,
+            OperationStatus::Failed
+        );
         let after_resources = runtime
             .list_resources()
             .await?
@@ -663,7 +740,129 @@ async fn image_replace_failures_restore_previous_image_and_resources() -> TestRe
                 matches!(resource.kind(), ResourceKind::Volume | ResourceKind::Network)
             }))
         }));
+        if boundary == Some(FailureBoundary::CreateContainerAfterMutation) {
+            let calls = runtime.calls().await;
+            let failed_create = calls
+                .iter()
+                .position(|call| matches!(call, RuntimeCall::CreateContainer(_)))
+                .ok_or("failed replacement create")?;
+            let partial_remove = calls[failed_create + 1..]
+                .iter()
+                .position(|call| matches!(call, RuntimeCall::Remove(_)))
+                .map(|offset| failed_create + 1 + offset)
+                .ok_or("partial replacement remove")?;
+            assert!(
+                calls[failed_create + 1..partial_remove]
+                    .iter()
+                    .all(|call| !matches!(call, RuntimeCall::ListResources)),
+                "partial cleanup rediscovered evidence instead of using CreateFailure"
+            );
+            assert!(matches!(
+                &calls[partial_remove],
+                RuntimeCall::Remove(request)
+                    if request.resources().len() == 1
+                        && request.resources()[0].kind() == ResourceKind::Container
+            ));
+        }
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_replace_rejects_missing_or_extra_owned_container_evidence() -> TestResult {
+    let old_image = "ghcr.io/liquescent-development/gascan/workspace:old@sha256:\
+                     bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    for extra in [false, true] {
+        let root = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+        let desired = spec("image-replace-container-evidence", root)?;
+        let runtime = FakeRuntime::default();
+        let service = SandboxService::new(
+            runtime.clone(),
+            gascand::Store::open(root.join("state.db"))?,
+            Arc::new(NoopProvisioner),
+        );
+        service.up(UpRequest::new(desired.clone())).await?;
+        let mut record = service.status(desired.id())?.ok_or("record")?;
+        record.image_resolution = Some(gascand::ImageResolution::new(
+            1,
+            json!({"digest":old_image}),
+        ));
+        service.store().put_sandbox(&record)?;
+        if extra {
+            runtime
+                .seed_container_resource(
+                    "extra-owned-container",
+                    desired.id().clone(),
+                    ResourceOwnership::GasCanOwned,
+                )
+                .await?;
+        } else {
+            runtime
+                .forget_resource(&ResourceIdentity::new(
+                    ResourceKind::Container,
+                    desired.id().to_string(),
+                )?)
+                .await;
+        }
+        let before = runtime.calls().await.len();
+
+        assert!(service.apply(UpRequest::new(desired)).await.is_err());
+
+        assert!(runtime.calls().await[before..].iter().all(|call| {
+            !matches!(
+                call,
+                RuntimeCall::Stop(_)
+                    | RuntimeCall::Remove(_)
+                    | RuntimeCall::CreateContainer(_)
+                    | RuntimeCall::Start(_)
+                    | RuntimeCall::Exec(_)
+            )
+        }));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_replace_rollback_rejects_extra_owned_container_evidence_before_cleanup() -> TestResult
+{
+    let old_image = "ghcr.io/liquescent-development/gascan/workspace:old@sha256:\
+                     bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let desired = spec("image-replace-rollback-container-evidence", root)?;
+    let runtime = FakeRuntime::default();
+    let initial_service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    );
+    initial_service.up(UpRequest::new(desired.clone())).await?;
+    let mut record = initial_service.status(desired.id())?.ok_or("record")?;
+    record.image_resolution = Some(gascand::ImageResolution::new(
+        1,
+        json!({"digest":old_image}),
+    ));
+    initial_service.store().put_sandbox(&record)?;
+    drop(initial_service);
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(ExtraContainerProvisioner {
+            runtime: runtime.clone(),
+            id: desired.id().clone(),
+        }),
+    );
+
+    assert!(service.apply(UpRequest::new(desired)).await.is_err());
+
+    let removes = runtime
+        .calls()
+        .await
+        .into_iter()
+        .filter(|call| matches!(call, RuntimeCall::Remove(_)))
+        .count();
+    assert_eq!(removes, 1, "rollback mutated ambiguous container evidence");
     Ok(())
 }
 
@@ -717,6 +916,13 @@ async fn image_replace_preserves_primary_and_rollback_errors() -> TestResult {
     );
     assert!(error.to_string().contains("rollback failed"));
     assert!(error.to_string().contains("injected failure at remove"));
+    assert_eq!(
+        service
+            .latest_operation()?
+            .ok_or("failed operation")?
+            .status,
+        OperationStatus::Failed
+    );
     Ok(())
 }
 
@@ -751,32 +957,23 @@ async fn image_replace_database_commit_failure_restores_runtime_and_resolution()
     rewrite_runtime_image(&runtime_path, old_image)?;
 
     let runtime = FakeRuntime::persistent(capabilities, &runtime_path).await?;
-    let entered = Arc::new(Semaphore::new(0));
-    let release = Arc::new(Semaphore::new(0));
     let store = gascand::Store::open(&state_path)?;
-    let service = Arc::new(SandboxService::new(
+    let service = SandboxService::new(
         runtime.clone(),
         store.clone(),
-        Arc::new(CommitRaceProvisioner {
-            entered: entered.clone(),
-            release: release.clone(),
+        Arc::new(TerminalReadFailingProvisioner {
+            store: store.clone(),
         }),
-    ));
-    let apply_service = service.clone();
-    let task = tokio::spawn(async move { apply_service.apply(UpRequest::new(desired)).await });
-    entered.acquire().await?.forget();
-    let operation = store.latest_operation()?.ok_or("pending operation")?;
-    store.complete_operation(operation.id, gascand::ActualState::Running)?;
-    release.add_permits(1);
+    );
 
-    let error = match task.await? {
+    let error = match service.apply(UpRequest::new(desired)).await {
         Ok(_) => return Err("database race unexpectedly succeeded".into()),
         Err(error) => error,
     };
     assert!(
         error
             .to_string()
-            .contains("recording operation failure failed")
+            .contains("injected operation event read failure")
     );
     assert_eq!(
         runtime
@@ -793,6 +990,13 @@ async fn image_replace_database_commit_failure_restores_runtime_and_resolution()
             .image_resolution
             .and_then(|resolution| resolution.details["digest"].as_str().map(ToOwned::to_owned)),
         Some(old_image.to_owned())
+    );
+    assert_eq!(
+        service
+            .latest_operation()?
+            .ok_or("terminal operation")?
+            .status,
+        OperationStatus::Failed
     );
     Ok(())
 }

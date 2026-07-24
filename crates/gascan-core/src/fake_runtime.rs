@@ -50,6 +50,7 @@ pub enum FailureBoundary {
     Create,
     PrepareImage,
     CreateContainer,
+    CreateContainerAfterMutation,
     Start,
     Stop,
     Remove,
@@ -66,6 +67,7 @@ impl FailureBoundary {
             Self::Create => "create",
             Self::PrepareImage => "prepare_image",
             Self::CreateContainer => "create_container",
+            Self::CreateContainerAfterMutation => "create_container_after_mutation",
             Self::Start => "start",
             Self::Stop => "stop",
             Self::Remove => "remove",
@@ -298,6 +300,24 @@ impl FakeRuntime {
             RuntimeResource::discovered(identity, sandbox_id, ownership),
         );
         Ok(())
+    }
+
+    pub async fn seed_container_resource(
+        &self,
+        name: &str,
+        sandbox_id: SandboxId,
+        ownership: ResourceOwnership,
+    ) -> Result<(), RuntimeError> {
+        let identity = ResourceIdentity::new(ResourceKind::Container, name)?;
+        self.inner.lock().await.resources.insert(
+            identity.clone(),
+            RuntimeResource::discovered(identity, Some(sandbox_id), ownership),
+        );
+        Ok(())
+    }
+
+    pub async fn forget_resource(&self, identity: &ResourceIdentity) {
+        self.inner.lock().await.resources.remove(identity);
     }
 
     pub async fn volume_exists(&self, name: &str) -> bool {
@@ -676,6 +696,13 @@ impl RuntimeBackend for FakeRuntime {
             ResourceOwnership::GasCanOwned,
         );
         state.resources.insert(identity, container.clone());
+        if let Err(source) = fail_once(&mut state, FailureBoundary::CreateContainerAfterMutation) {
+            return Err(CreateFailure::from_created_evidence(
+                create,
+                vec![container],
+                source,
+            ));
+        }
         let outcome = CreateOutcome::for_recreate(&request, vec![container])
             .map_err(CreateFailure::from_source)?;
         state
