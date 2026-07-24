@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use std::{fs, process::Command};
 
 fn root() -> &'static std::path::Path {
@@ -17,11 +18,34 @@ fn validate(contents: &str) -> std::process::Output {
 }
 
 fn validate_npm_lock_bytes(contents: &[u8]) -> std::process::Output {
+    validate_npm_lock_bytes_with_primary(contents, false)
+}
+
+fn validate_npm_lock_bytes_with_primary(
+    contents: &[u8],
+    refresh_aggregate_hashes: bool,
+) -> std::process::Output {
     let temporary = tempfile::tempdir().unwrap();
     let npm_lock_path = temporary.path().join("package-lock.json");
-    let npm_manifest_path = root().join("images/workspace/workstation-package.json");
-    let image_lock_path = root().join("images/workspace/versions.lock");
+    let npm_manifest_path = temporary.path().join("package.json");
+    let image_lock_path = temporary.path().join("versions.lock");
+    let manifest = fs::read(root().join("images/workspace/workstation-package.json")).unwrap();
+    let mut image_lock: toml::Value =
+        toml::from_str(&fs::read_to_string(root().join("images/workspace/versions.lock")).unwrap())
+            .unwrap();
+    if refresh_aggregate_hashes {
+        image_lock["workstation_npm"]["package_manifest_sha256"] =
+            toml::Value::String(format!("{:x}", Sha256::digest(&manifest)));
+        image_lock["workstation_npm"]["package_lock_sha256"] =
+            toml::Value::String(format!("{:x}", Sha256::digest(contents)));
+    }
+    fs::write(&npm_manifest_path, manifest).unwrap();
     fs::write(&npm_lock_path, contents).unwrap();
+    fs::write(
+        &image_lock_path,
+        toml::to_string_pretty(&image_lock).unwrap(),
+    )
+    .unwrap();
     Command::new(env!("CARGO_BIN_EXE_update-image-lock"))
         .args([
             "--validate-workstation-package-lock",
@@ -34,7 +58,7 @@ fn validate_npm_lock_bytes(contents: &[u8]) -> std::process::Output {
 }
 
 fn validate_npm_lock(contents: &serde_json::Value) -> std::process::Output {
-    validate_npm_lock_bytes(&serde_json::to_vec_pretty(contents).unwrap())
+    validate_npm_lock_bytes_with_primary(&serde_json::to_vec_pretty(contents).unwrap(), true)
 }
 
 fn replace_in_table(lock: &str, table: &str, from: &str, to: &str) -> String {
@@ -334,41 +358,100 @@ fn workstation_npm_manifest_and_lock_are_exact_and_agree() {
 }
 
 #[test]
-fn npm_lock_mutation_rejects_an_unknown_lifecycle_script() {
+fn npm_lock_semantic_mutations_reach_their_intended_validation_gates() {
     let exact = fs::read(root().join("images/workspace/workstation-package-lock.json")).unwrap();
     let npm_lock: serde_json::Value = serde_json::from_slice(&exact).unwrap();
     assert!(validate_npm_lock_bytes(&exact).status.success());
+    let semver = "node_modules/@earendil-works/pi-coding-agent/node_modules/semver";
     let mut mutations = Vec::new();
 
     let mut unknown_script = npm_lock.clone();
-    unknown_script["packages"]["node_modules/semver"]["hasInstallScript"] = true.into();
-    mutations.push(unknown_script);
+    unknown_script["packages"][semver]["hasInstallScript"] = true.into();
+    mutations.push((
+        "unknown lifecycle",
+        unknown_script,
+        "npm lifecycle package set differs from reviewed evidence",
+    ));
 
     let mut extra_root = npm_lock.clone();
     extra_root["packages"][""]["dependencies"]["unexpected"] = "1.0.0".into();
-    mutations.push(extra_root);
+    mutations.push((
+        "extra root",
+        extra_root,
+        "must contain exactly three top-level packages",
+    ));
 
     let mut off_host = npm_lock.clone();
-    off_host["packages"]["node_modules/semver"]["resolved"] =
+    off_host["packages"][semver]["resolved"] =
         "https://packages.example.invalid/semver-7.8.0.tgz".into();
-    mutations.push(off_host);
+    mutations.push(("off-host URL", off_host, "unapproved npm tarball URL"));
 
     let mut malformed_integrity = npm_lock.clone();
-    malformed_integrity["packages"]["node_modules/semver"]["integrity"] =
-        "sha512-not-base64".into();
-    mutations.push(malformed_integrity);
+    malformed_integrity["packages"][semver]["integrity"] = "sha512-not-base64".into();
+    mutations.push((
+        "malformed SRI",
+        malformed_integrity,
+        "npm integrity is malformed",
+    ));
 
     let mut changed_version = npm_lock.clone();
-    changed_version["packages"]["node_modules/semver"]["version"] = "7.8.1".into();
-    mutations.push(changed_version);
+    changed_version["packages"][semver]["version"] = "7.8.1".into();
+    mutations.push((
+        "version/canonical identity",
+        changed_version,
+        "unapproved npm tarball URL",
+    ));
 
-    let mut replaced_lifecycle = npm_lock;
+    let mut changed_identity = npm_lock.clone();
+    changed_identity["packages"][semver]["resolved"] =
+        "https://registry.npmjs.org/semver/-/different-7.8.0.tgz".into();
+    mutations.push((
+        "canonical tarball identity",
+        changed_identity,
+        "unapproved npm tarball URL",
+    ));
+
+    let mut replaced_lifecycle = npm_lock.clone();
     replaced_lifecycle["packages"]["node_modules/@anthropic-ai/claude-code"]["hasInstallScript"] =
         false.into();
-    replaced_lifecycle["packages"]["node_modules/semver"]["hasInstallScript"] = true.into();
-    mutations.push(replaced_lifecycle);
+    replaced_lifecycle["packages"][semver]["hasInstallScript"] = true.into();
+    mutations.push((
+        "lifecycle bijection",
+        replaced_lifecycle,
+        "npm lifecycle package set differs from reviewed evidence",
+    ));
 
-    for mutated in mutations {
-        assert!(!validate_npm_lock(&mutated).status.success());
+    let mut missing_closure = npm_lock;
+    missing_closure["packages"]
+        .as_object_mut()
+        .unwrap()
+        .remove(semver);
+    mutations.push((
+        "missing dependency closure",
+        missing_closure,
+        "dependency closure omitted semver",
+    ));
+
+    for (name, mutated, expected) in mutations {
+        let output = validate_npm_lock(&mutated);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{name} unexpectedly passed");
+        assert!(stderr.contains(expected), "{name}: {stderr}");
     }
+}
+
+#[test]
+fn npm_lock_stale_aggregate_hash_is_a_distinct_early_rejection() {
+    let exact = fs::read(root().join("images/workspace/workstation-package-lock.json")).unwrap();
+    let mut npm_lock: serde_json::Value = serde_json::from_slice(&exact).unwrap();
+    npm_lock["packages"]["node_modules/@anthropic-ai/claude-code"]["hasInstallScript"] =
+        false.into();
+    let mutated = serde_json::to_vec_pretty(&npm_lock).unwrap();
+    let output = validate_npm_lock_bytes_with_primary(&mutated, false);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("generated input hash differs from image lock"),
+        "{stderr}"
+    );
 }

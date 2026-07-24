@@ -22,6 +22,9 @@ use sha2::{Digest, Sha256, Sha512};
 
 type DynError = Box<dyn Error + Send + Sync>;
 
+const NPM_TARBALL_MAX_BYTES: usize = 200 * 1024 * 1024;
+const NPM_CLOSURE_MAX_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
 #[derive(Deserialize)]
 struct Inputs {
     ubuntu: String,
@@ -124,7 +127,7 @@ struct VersionedArtifact {
     sha256: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct WorkstationArtifact {
     version: String,
     url: String,
@@ -218,6 +221,16 @@ struct ImageLock {
 
 fn main() -> Result<(), DynError> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if let [mode] = arguments.as_slice()
+        && mode == "--verify-existing-workstation-lock"
+    {
+        let root = repository_root()?;
+        return verify_existing_workstation_lock_files(
+            &root.join("images/workspace/workstation-package.json"),
+            &root.join("images/workspace/workstation-package-lock.json"),
+            &root.join("images/workspace/versions.lock"),
+        );
+    }
     if let [mode, path] = arguments.as_slice() {
         if mode == "--validate-workstation-lock" {
             return validate_workstation_lock_file(Path::new(path));
@@ -233,7 +246,7 @@ fn main() -> Result<(), DynError> {
         }
     }
     if !arguments.is_empty() {
-        return Err("usage: update-image-lock [--validate-workstation-lock PATH | --validate-workstation-package-lock NPM_MANIFEST NPM_LOCK IMAGE_LOCK]".into());
+        return Err("usage: update-image-lock [--verify-existing-workstation-lock | --validate-workstation-lock PATH | --validate-workstation-package-lock NPM_MANIFEST NPM_LOCK IMAGE_LOCK]".into());
     }
 
     let root = repository_root()?;
@@ -304,16 +317,19 @@ fn main() -> Result<(), DynError> {
             "workspace_tag".to_owned(),
             toml::Value::String(workspace_tag),
         );
+    let manifest_path = root.join("images/workspace/workstation-package.json");
+    let npm_lock_path = root.join("images/workspace/workstation-package-lock.json");
+    let primary_lock = toml::to_string_pretty(&output)?.into_bytes();
     eprintln!("image-lock: writing {}", lock_path.display());
-    write_atomic(
-        &root.join("images/workspace/workstation-package.json"),
-        &workstation_manifest,
+    publish_generated_bundle_with(
+        &[
+            (manifest_path.as_path(), workstation_manifest.as_slice()),
+            (npm_lock_path.as_path(), workstation_npm_lock.as_slice()),
+            (lock_path.as_path(), primary_lock.as_slice()),
+        ],
+        |staged| validate_workstation_package_lock_files(&staged[0], &staged[1], &staged[2]),
+        |_| Ok(()),
     )?;
-    write_atomic(
-        &root.join("images/workspace/workstation-package-lock.json"),
-        &workstation_npm_lock,
-    )?;
-    write_atomic(&lock_path, toml::to_string_pretty(&output)?.as_bytes())?;
     eprintln!("image-lock: wrote {}", lock_path.display());
     Ok(())
 }
@@ -681,12 +697,7 @@ fn resolve_npm_artifact(
     if alias != "latest" {
         return Err(format!("unsupported npm resolver intent for {package}: {alias}").into());
     }
-    let encoded = package.replace('@', "%40").replace('/', "%2F");
-    let metadata: NpmPackage = get(
-        client,
-        &format!("https://registry.npmjs.org/{encoded}/latest"),
-    )?
-    .json()?;
+    let metadata: NpmPackage = get(client, &npm_metadata_url(package, alias)?)?.json()?;
     let bytes = get_bounded(client, &metadata.dist.tarball, 64 * 1024 * 1024)?;
     let size = u64::try_from(bytes.len())?;
     Ok(WorkstationArtifact {
@@ -697,6 +708,14 @@ fn resolve_npm_artifact(
         kind: "npm_tgz".to_owned(),
         size,
     })
+}
+
+fn npm_metadata_url(package: &str, selector: &str) -> Result<String, DynError> {
+    if selector.is_empty() || selector.contains('/') {
+        return Err("npm metadata selector is malformed".into());
+    }
+    let encoded = package.replace('@', "%40").replace('/', "%2F");
+    Ok(format!("https://registry.npmjs.org/{encoded}/{selector}"))
 }
 
 fn resolve_github_artifact(
@@ -875,6 +894,11 @@ fn generate_workstation_npm_lock(
         &fs::read(temporary.path().join("package-lock.json"))?,
     )?;
     validate_npm_lock(&lock_bytes, artifacts)?;
+    let lock: serde_json::Value = serde_json::from_slice(&lock_bytes)?;
+    let packages = lock["packages"]
+        .as_object()
+        .ok_or("workstation npm lock omitted packages")?;
+    verify_npm_closure_tarballs(client, packages)?;
     Ok((manifest_bytes, lock_bytes))
 }
 
@@ -1015,7 +1039,136 @@ fn validate_npm_lock(
             );
         }
     }
+    validate_npm_dependency_closure(packages)?;
     Ok(())
+}
+
+fn validate_npm_dependency_closure(
+    packages: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), DynError> {
+    for (path, package) in packages {
+        for field in ["dependencies", "optionalDependencies"] {
+            let Some(dependencies) = package.get(field).and_then(serde_json::Value::as_object)
+            else {
+                continue;
+            };
+            for dependency in dependencies.keys() {
+                if resolve_npm_dependency_path(packages, path, dependency).is_none() {
+                    let owner = if path.is_empty() { "<root>" } else { path };
+                    return Err(format!(
+                        "npm dependency closure omitted {dependency} required by {owner}"
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_npm_dependency_path<'a>(
+    packages: &'a serde_json::Map<String, serde_json::Value>,
+    owner_path: &str,
+    dependency: &str,
+) -> Option<&'a str> {
+    let mut base = owner_path;
+    loop {
+        let candidate = if base.is_empty() {
+            format!("node_modules/{dependency}")
+        } else {
+            format!("{base}/node_modules/{dependency}")
+        };
+        if let Some((path, _)) = packages.get_key_value(&candidate) {
+            return Some(path);
+        }
+        if base.is_empty() {
+            return None;
+        }
+        base = base
+            .rsplit_once("/node_modules/")
+            .map_or("", |(parent, _)| parent);
+    }
+}
+
+fn verify_npm_closure_tarballs(
+    client: &Client,
+    packages: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), DynError> {
+    let (verified, bytes) = verify_npm_closure_tarballs_with(packages, |url, maximum| {
+        get_bounded(client, url, maximum)
+    })?;
+    eprintln!(
+        "image-lock: verified {verified} npm closure tarballs ({bytes} bytes; sequential concurrency 1)"
+    );
+    Ok(())
+}
+
+fn verify_npm_closure_tarballs_with(
+    packages: &serde_json::Map<String, serde_json::Value>,
+    fetch: impl FnMut(&str, usize) -> Result<Vec<u8>, DynError>,
+) -> Result<(usize, usize), DynError> {
+    verify_npm_closure_tarballs_with_limits(
+        packages,
+        NPM_TARBALL_MAX_BYTES,
+        NPM_CLOSURE_MAX_BYTES,
+        fetch,
+    )
+}
+
+fn verify_npm_closure_tarballs_with_limits(
+    packages: &serde_json::Map<String, serde_json::Value>,
+    per_tarball_maximum: usize,
+    closure_maximum: usize,
+    mut fetch: impl FnMut(&str, usize) -> Result<Vec<u8>, DynError>,
+) -> Result<(usize, usize), DynError> {
+    let mut verified = 0_usize;
+    let mut total_bytes = 0_usize;
+    for (path, package) in packages
+        .iter()
+        .filter(|(path, package)| !path.is_empty() && package.get("resolved").is_some())
+    {
+        let path_name = path
+            .rsplit("node_modules/")
+            .next()
+            .ok_or("npm lock path omitted package name")?;
+        let name = package["name"].as_str().unwrap_or(path_name);
+        let version = package["version"]
+            .as_str()
+            .ok_or_else(|| format!("{path} omitted exact version"))?;
+        let url = package["resolved"]
+            .as_str()
+            .ok_or_else(|| format!("{path} omitted resolved URL"))?;
+        let integrity = package["integrity"]
+            .as_str()
+            .ok_or_else(|| format!("{path} omitted integrity"))?;
+        validate_npm_tarball_url(name, version, url)?;
+        validate_sha512_sri(integrity, name)?;
+        let maximum = next_npm_download_limit(total_bytes, per_tarball_maximum, closure_maximum)?;
+        let bytes = fetch(url, maximum)?;
+        if bytes.len() > maximum {
+            return Err(format!("{name} npm tarball exceeded download bound").into());
+        }
+        verify_npm_integrity(&bytes, integrity, name)?;
+        total_bytes = total_bytes
+            .checked_add(bytes.len())
+            .ok_or("npm closure byte count overflowed")?;
+        verified += 1;
+    }
+    Ok((verified, total_bytes))
+}
+
+fn next_npm_download_limit(
+    downloaded: usize,
+    per_tarball_maximum: usize,
+    closure_maximum: usize,
+) -> Result<usize, DynError> {
+    let remaining = closure_maximum
+        .checked_sub(downloaded)
+        .ok_or("npm closure exceeded aggregate download bound")?;
+    if remaining == 0 {
+        return Err("npm closure exceeded aggregate download bound".into());
+    }
+    Ok(remaining.min(per_tarball_maximum))
 }
 
 fn validate_sha512_sri(integrity: &str, package: &str) -> Result<(), DynError> {
@@ -1186,13 +1339,7 @@ fn resolve_claude_native(
     verify_npm_integrity(&bytes, &metadata.dist.integrity, package)?;
     let binary_path = "package/claude";
     let binary = tgz_regular_file(&bytes, binary_path, 512 * 1024 * 1024)?;
-    if binary.get(..4) != Some(b"\x7fELF")
-        || binary.get(4) != Some(&2)
-        || binary.get(5) != Some(&1)
-        || binary.get(18..20) != Some(&[0xb7, 0x00])
-    {
-        return Err("Claude native binary is not ELF64 little-endian AArch64".into());
-    }
+    validate_claude_elf(&binary)?;
     Ok(ClaudeNative {
         package: package.to_owned(),
         version: version.to_owned(),
@@ -1205,6 +1352,98 @@ fn resolve_claude_native(
         binary_size: u64::try_from(binary.len())?,
         platform: "linux-arm64".to_owned(),
     })
+}
+
+fn validate_claude_elf(binary: &[u8]) -> Result<(), DynError> {
+    const ELF64_HEADER_SIZE: usize = 64;
+    const ELF64_PROGRAM_HEADER_SIZE: usize = 56;
+    const REVIEWED_INTERPRETER: &[u8] = b"/lib/ld-linux-aarch64.so.1\0";
+    if binary.len() < ELF64_HEADER_SIZE {
+        return Err("Claude native ELF64 header is truncated".into());
+    }
+    if &binary[..4] != b"\x7fELF" || binary[4] != 2 || binary[5] != 1 {
+        return Err("Claude native binary is not ELF64 little-endian".into());
+    }
+    if binary[6] != 1 || read_u32_le(binary, 20)? != 1 {
+        return Err("Claude native ELF version is not current".into());
+    }
+    if binary[7] != 0 || binary[8] != 0 {
+        return Err("Claude native ELF does not use the reviewed System V ABI".into());
+    }
+    if !matches!(read_u16_le(binary, 16)?, 2 | 3) {
+        return Err("Claude native ELF type is not executable or reviewed PIE".into());
+    }
+    if read_u16_le(binary, 18)? != 183 {
+        return Err("Claude native ELF machine is not AArch64".into());
+    }
+    if usize::from(read_u16_le(binary, 52)?) != ELF64_HEADER_SIZE {
+        return Err("Claude native ELF header size is invalid".into());
+    }
+    let program_header_offset = usize::try_from(read_u64_le(binary, 32)?)?;
+    let program_header_size = usize::from(read_u16_le(binary, 54)?);
+    let program_header_count = usize::from(read_u16_le(binary, 56)?);
+    if program_header_count == 0 || program_header_size != ELF64_PROGRAM_HEADER_SIZE {
+        return Err("Claude native ELF program header layout is invalid".into());
+    }
+    let program_headers_end = program_header_offset
+        .checked_add(
+            program_header_size
+                .checked_mul(program_header_count)
+                .ok_or("Claude native ELF program header size overflowed")?,
+        )
+        .ok_or("Claude native ELF program header bounds overflowed")?;
+    if program_header_offset < ELF64_HEADER_SIZE || program_headers_end > binary.len() {
+        return Err("Claude native ELF program headers are out of bounds".into());
+    }
+    let mut interpreter = None;
+    for index in 0..program_header_count {
+        let start = program_header_offset + index * program_header_size;
+        if read_u32_le(binary, start)? != 3 {
+            continue;
+        }
+        if interpreter.is_some() {
+            return Err("Claude native ELF has duplicate interpreters".into());
+        }
+        let offset = usize::try_from(read_u64_le(binary, start + 8)?)?;
+        let size = usize::try_from(read_u64_le(binary, start + 32)?)?;
+        let end = offset
+            .checked_add(size)
+            .ok_or("Claude native ELF interpreter bounds overflowed")?;
+        let value = binary
+            .get(offset..end)
+            .ok_or("Claude native ELF interpreter is out of bounds")?;
+        interpreter = Some(value);
+    }
+    if let Some(interpreter) = interpreter
+        && interpreter != REVIEWED_INTERPRETER
+    {
+        return Err("Claude native ELF interpreter differs from reviewed path".into());
+    }
+    Ok(())
+}
+
+fn read_u16_le(bytes: &[u8], offset: usize) -> Result<u16, DynError> {
+    let value: [u8; 2] = bytes
+        .get(offset..offset + 2)
+        .ok_or("ELF field is out of bounds")?
+        .try_into()?;
+    Ok(u16::from_le_bytes(value))
+}
+
+fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32, DynError> {
+    let value: [u8; 4] = bytes
+        .get(offset..offset + 4)
+        .ok_or("ELF field is out of bounds")?
+        .try_into()?;
+    Ok(u32::from_le_bytes(value))
+}
+
+fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64, DynError> {
+    let value: [u8; 8] = bytes
+        .get(offset..offset + 8)
+        .ok_or("ELF field is out of bounds")?
+        .try_into()?;
+    Ok(u64::from_le_bytes(value))
 }
 
 fn validate_npm_tarball_url(package: &str, version: &str, value: &str) -> Result<(), DynError> {
@@ -1366,7 +1605,6 @@ fn validate_workstation_package_lock_files(
         return Err("workstation npm generated input hash differs from image lock".into());
     }
     validate_npm_lock(&npm_lock_bytes, &image_lock.workstation_artifacts)?;
-    validate_workstation_npm(&image_lock.workstation_npm)?;
     let npm_lock: serde_json::Value = serde_json::from_slice(&npm_lock_bytes)?;
     let packages = npm_lock["packages"]
         .as_object()
@@ -1411,6 +1649,81 @@ fn validate_workstation_package_lock_files(
                 evidence.package
             )
             .into());
+        }
+    }
+    validate_workstation_npm(&image_lock.workstation_npm)
+}
+
+fn verify_existing_workstation_lock_files(
+    npm_manifest_path: &Path,
+    npm_lock_path: &Path,
+    image_lock_path: &Path,
+) -> Result<(), DynError> {
+    read_existing_bundle_without_writes(
+        [npm_manifest_path, npm_lock_path, image_lock_path],
+        |[manifest_bytes, npm_lock_bytes, image_lock_bytes]| {
+            let image_lock: WorkstationValidationLock =
+                toml::from_str(std::str::from_utf8(image_lock_bytes)?)?;
+            if sha256(manifest_bytes) != image_lock.workstation_npm.package_manifest_sha256
+                || sha256(npm_lock_bytes) != image_lock.workstation_npm.package_lock_sha256
+            {
+                return Err("workstation npm generated input hash differs from image lock".into());
+            }
+            validate_workstation_artifacts(&image_lock.workstation_artifacts)?;
+            validate_npm_lock(npm_lock_bytes, &image_lock.workstation_artifacts)?;
+            validate_workstation_npm(&image_lock.workstation_npm)?;
+
+            let client = http_client()?;
+            verify_existing_workstation_artifacts(&client, &image_lock.workstation_artifacts)?;
+            let npm_lock: serde_json::Value = serde_json::from_slice(npm_lock_bytes)?;
+            let packages = npm_lock["packages"]
+                .as_object()
+                .ok_or("workstation npm lock omitted packages")?;
+            verify_npm_closure_tarballs(&client, packages)?;
+            let resolved = resolve_workstation_npm(
+                &client,
+                manifest_bytes,
+                npm_lock_bytes,
+                &image_lock.workstation_artifacts,
+            )?;
+            if resolved != image_lock.workstation_npm {
+                return Err("verified workstation npm evidence differs from image lock".into());
+            }
+            eprintln!(
+                "image-lock: verified existing reviewed workstation lock without rewriting outputs"
+            );
+            Ok(())
+        },
+    )
+}
+
+fn read_existing_bundle_without_writes(
+    paths: [&Path; 3],
+    verify: impl FnOnce([&[u8]; 3]) -> Result<(), DynError>,
+) -> Result<(), DynError> {
+    let contents = [
+        fs::read(paths[0])?,
+        fs::read(paths[1])?,
+        fs::read(paths[2])?,
+    ];
+    verify([&contents[0], &contents[1], &contents[2]])
+}
+
+fn verify_existing_workstation_artifacts(
+    client: &Client,
+    artifacts: &BTreeMap<String, WorkstationArtifact>,
+) -> Result<(), DynError> {
+    for (name, artifact) in artifacts {
+        let maximum = match name.as_str() {
+            "claude" | "codex" | "pi" | "herdr" => 64 * 1024 * 1024,
+            "glab" | "neovim" => 128 * 1024 * 1024,
+            _ => return Err(format!("unsupported workstation artifact {name}").into()),
+        };
+        let bytes = get_bounded(client, &artifact.url, maximum)?;
+        if u64::try_from(bytes.len())? != artifact.size || sha256(&bytes) != artifact.sha256 {
+            return Err(
+                format!("{name} workstation artifact bytes differ from reviewed lock").into(),
+            );
         }
     }
     Ok(())
@@ -1589,22 +1902,146 @@ fn lower_hex(value: &str, length: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), DynError> {
-    let parent = path.parent().ok_or("lock path has no parent")?;
-    fs::create_dir_all(parent)?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    temporary.write_all(bytes)?;
-    temporary.as_file_mut().sync_all()?;
-    temporary.persist(path)?;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicationBoundary {
+    StageCreate(usize),
+    StageWrite(usize),
+    StageFlush(usize),
+    StageSync(usize),
+    ValidateStaged,
+    BackupCreate(usize),
+    BackupWrite(usize),
+    BackupSync(usize),
+    BackupDirectorySync,
+    PublishRename(usize),
+    DirectorySync,
+}
+
+fn publish_generated_bundle_with(
+    outputs: &[(&Path, &[u8])],
+    validate: impl FnOnce(&[PathBuf]) -> Result<(), DynError>,
+    mut before: impl FnMut(PublicationBoundary) -> std::io::Result<()>,
+) -> Result<(), DynError> {
+    if outputs.len() != 3 {
+        return Err("generated bundle must contain manifest, npm lock, and primary lock".into());
+    }
+    let parent = outputs[0]
+        .0
+        .parent()
+        .ok_or("generated output path has no parent")?;
+    if outputs
+        .iter()
+        .any(|(path, _)| path.parent() != Some(parent))
+    {
+        return Err("generated outputs must share one publication directory".into());
+    }
+
+    let mut staged = Vec::with_capacity(outputs.len());
+    for (index, (_, bytes)) in outputs.iter().enumerate() {
+        before(PublicationBoundary::StageCreate(index))?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        before(PublicationBoundary::StageWrite(index))?;
+        temporary.write_all(bytes)?;
+        before(PublicationBoundary::StageFlush(index))?;
+        temporary.flush()?;
+        before(PublicationBoundary::StageSync(index))?;
+        temporary.as_file_mut().sync_all()?;
+        staged.push(Some(temporary));
+    }
+    before(PublicationBoundary::ValidateStaged)?;
+    validate(
+        &staged
+            .iter()
+            .map(|temporary| temporary.as_ref().unwrap().path().to_path_buf())
+            .collect::<Vec<_>>(),
+    )?;
+
+    let mut backups = Vec::with_capacity(outputs.len());
+    for (index, (path, _)) in outputs.iter().enumerate() {
+        let old = fs::read(path)?;
+        before(PublicationBoundary::BackupCreate(index))?;
+        let mut backup = tempfile::NamedTempFile::new_in(parent)?;
+        before(PublicationBoundary::BackupWrite(index))?;
+        backup.write_all(&old)?;
+        backup.flush()?;
+        before(PublicationBoundary::BackupSync(index))?;
+        backup.as_file_mut().sync_all()?;
+        backups.push(backup);
+    }
+    before(PublicationBoundary::BackupDirectorySync)?;
+    fs::File::open(parent)?.sync_all()?;
+
+    let publication = (|| -> Result<(), DynError> {
+        for (index, (path, _)) in outputs.iter().enumerate() {
+            before(PublicationBoundary::PublishRename(index))?;
+            staged[index]
+                .take()
+                .ok_or("generated output stage disappeared")?
+                .persist(path)?;
+        }
+        before(PublicationBoundary::DirectorySync)?;
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if let Err(publication_error) = publication {
+        restore_generated_bundle(outputs, &backups)?;
+        return Err(publication_error);
+    }
+    Ok(())
+}
+
+fn restore_generated_bundle(
+    outputs: &[(&Path, &[u8])],
+    backups: &[tempfile::NamedTempFile],
+) -> Result<(), DynError> {
+    let parent = outputs[0]
+        .0
+        .parent()
+        .ok_or("generated output path has no parent")?;
+    for ((path, _), backup) in outputs.iter().zip(backups) {
+        let mut restored = tempfile::NamedTempFile::new_in(parent)?;
+        std::io::copy(&mut fs::File::open(backup.path())?, restored.as_file_mut())?;
+        restored.as_file_mut().sync_all()?;
+        restored.persist(path)?;
+    }
+    fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BrowserManifest, checksum_for, chromium_from_manifest, configured_npm_command,
-        merge_workstation_sections, rust_version_from_channel,
+        BrowserManifest, NPM_CLOSURE_MAX_BYTES, NPM_TARBALL_MAX_BYTES, PublicationBoundary,
+        checksum_for, chromium_from_manifest, configured_npm_command, merge_workstation_sections,
+        next_npm_download_limit, npm_metadata_url, publish_generated_bundle_with,
+        read_existing_bundle_without_writes, rust_version_from_channel, validate_claude_elf,
+        verify_npm_closure_tarballs_with, verify_npm_closure_tarballs_with_limits,
     };
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use sha2::{Digest, Sha512};
+    use std::{
+        io::{Read as _, Write as _},
+        net::TcpListener,
+        thread,
+    };
+
+    fn serve_once(body: Vec<u8>) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+        });
+        (format!("http://{address}/package.tgz"), handle)
+    }
 
     #[test]
     fn checksum_parser_accepts_release_dot_slash_names() {
@@ -1694,5 +2131,313 @@ scripts = "old"
             String::from_utf8(output.stdout).unwrap().trim(),
             expected.to_string_lossy()
         );
+    }
+
+    #[test]
+    fn npm_closure_verification_fetches_bytes_and_rejects_valid_but_incorrect_sri() {
+        let served = b"actual tarball bytes".to_vec();
+        let wrong = BASE64.encode(Sha512::digest(b"different tarball bytes"));
+        let packages = serde_json::json!({
+            "node_modules/example": {
+                "version": "1.2.3",
+                "resolved": "https://registry.npmjs.org/example/-/example-1.2.3.tgz",
+                "integrity": format!("sha512-{wrong}")
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let (server_url, server) = serve_once(served);
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let error = verify_npm_closure_tarballs_with(&packages, |_, maximum| {
+            let bytes = client.get(&server_url).send()?.bytes()?.to_vec();
+            assert!(bytes.len() <= maximum);
+            Ok(bytes)
+        })
+        .unwrap_err();
+        server.join().unwrap();
+        assert!(
+            error.to_string().contains("npm integrity mismatch"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn npm_closure_verification_accepts_every_matching_tarball() {
+        let served = b"exact tarball bytes".to_vec();
+        let integrity = BASE64.encode(Sha512::digest(&served));
+        let packages = serde_json::json!({
+            "node_modules/example": {
+                "version": "1.2.3",
+                "resolved": "https://registry.npmjs.org/example/-/example-1.2.3.tgz",
+                "integrity": format!("sha512-{integrity}")
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let (server_url, server) = serve_once(served);
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let mut fetched = Vec::new();
+        verify_npm_closure_tarballs_with(&packages, |url, maximum| {
+            fetched.push(url.to_owned());
+            let bytes = client.get(&server_url).send()?.bytes()?.to_vec();
+            assert!(bytes.len() <= maximum);
+            Ok(bytes)
+        })
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            fetched,
+            ["https://registry.npmjs.org/example/-/example-1.2.3.tgz"]
+        );
+    }
+
+    #[test]
+    fn npm_closure_verification_enforces_per_tarball_and_aggregate_bounds() {
+        let integrity = BASE64.encode(Sha512::digest(b"sixsix"));
+        let packages = serde_json::json!({
+            "node_modules/first": {
+                "version": "1.0.0",
+                "resolved": "https://registry.npmjs.org/first/-/first-1.0.0.tgz",
+                "integrity": format!("sha512-{integrity}")
+            },
+            "node_modules/second": {
+                "version": "1.0.0",
+                "resolved": "https://registry.npmjs.org/second/-/second-1.0.0.tgz",
+                "integrity": format!("sha512-{integrity}")
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let per_artifact =
+            verify_npm_closure_tarballs_with_limits(
+                &packages,
+                5,
+                20,
+                |_, _| Ok(b"sixsix".to_vec()),
+            )
+            .unwrap_err();
+        assert!(per_artifact.to_string().contains("download bound"));
+
+        let aggregate = verify_npm_closure_tarballs_with_limits(&packages, 10, 10, |_, _| {
+            Ok(b"sixsix".to_vec())
+        })
+        .unwrap_err();
+        assert!(aggregate.to_string().contains("download bound"));
+    }
+
+    #[test]
+    fn npm_closure_tarball_bound_covers_the_reviewed_claude_native_artifact() {
+        assert!(std::hint::black_box(NPM_TARBALL_MAX_BYTES) >= 84_159_749);
+    }
+
+    #[test]
+    fn npm_closure_aggregate_bound_rejects_downloads_beyond_two_gibibytes() {
+        assert_eq!(NPM_CLOSURE_MAX_BYTES, 2 * 1024 * 1024 * 1024);
+        assert_eq!(
+            next_npm_download_limit(
+                NPM_CLOSURE_MAX_BYTES - 1,
+                NPM_TARBALL_MAX_BYTES,
+                NPM_CLOSURE_MAX_BYTES,
+            )
+            .unwrap(),
+            1
+        );
+        assert!(
+            next_npm_download_limit(
+                NPM_CLOSURE_MAX_BYTES,
+                NPM_TARBALL_MAX_BYTES,
+                NPM_CLOSURE_MAX_BYTES,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn normal_npm_resolution_uses_the_requested_mutable_alias_metadata() {
+        assert_eq!(
+            npm_metadata_url("@earendil-works/pi-coding-agent", "latest").unwrap(),
+            "https://registry.npmjs.org/%40earendil-works%2Fpi-coding-agent/latest"
+        );
+    }
+
+    #[test]
+    fn existing_lock_verification_reads_but_never_rewrites_generated_outputs() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = ["manifest.json", "package-lock.json", "versions.lock"]
+            .map(|name| temporary.path().join(name));
+        let exact = [b"manifest".as_slice(), b"npm lock", b"primary lock"];
+        for (path, bytes) in paths.iter().zip(exact) {
+            std::fs::write(path, bytes).unwrap();
+        }
+        read_existing_bundle_without_writes([&paths[0], &paths[1], &paths[2]], |contents| {
+            assert_eq!(contents, exact);
+            Ok(())
+        })
+        .unwrap();
+        for (path, bytes) in paths.iter().zip(exact) {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn generated_bundle_publication_rolls_back_every_injected_failure_boundary() {
+        let boundaries = (0..3)
+            .flat_map(|index| {
+                [
+                    PublicationBoundary::StageCreate(index),
+                    PublicationBoundary::StageWrite(index),
+                    PublicationBoundary::StageFlush(index),
+                    PublicationBoundary::StageSync(index),
+                    PublicationBoundary::BackupCreate(index),
+                    PublicationBoundary::BackupWrite(index),
+                    PublicationBoundary::BackupSync(index),
+                    PublicationBoundary::PublishRename(index),
+                ]
+            })
+            .chain([
+                PublicationBoundary::ValidateStaged,
+                PublicationBoundary::BackupDirectorySync,
+                PublicationBoundary::DirectorySync,
+            ])
+            .collect::<Vec<_>>();
+
+        for failure in boundaries {
+            let temporary = tempfile::tempdir().unwrap();
+            let paths = ["manifest.json", "package-lock.json", "versions.lock"]
+                .map(|name| temporary.path().join(name));
+            let old = [b"old manifest".as_slice(), b"old npm lock", b"old primary"];
+            let new = [b"new manifest".as_slice(), b"new npm lock", b"new primary"];
+            for (path, bytes) in paths.iter().zip(old) {
+                std::fs::write(path, bytes).unwrap();
+            }
+            let outputs = [
+                (paths[0].as_path(), new[0]),
+                (paths[1].as_path(), new[1]),
+                (paths[2].as_path(), new[2]),
+            ];
+            let error = publish_generated_bundle_with(
+                &outputs,
+                |_| Ok(()),
+                |boundary| {
+                    if boundary == failure {
+                        Err(std::io::Error::other(format!("injected {failure:?}")))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("injected"),
+                "{failure:?}: {error}"
+            );
+            for ((path, expected), index) in paths.iter().zip(old).zip(0..) {
+                assert_eq!(
+                    std::fs::read(path).unwrap(),
+                    expected,
+                    "{failure:?} changed output {index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generated_bundle_publication_commits_exact_bytes_with_primary_last() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = ["manifest.json", "package-lock.json", "versions.lock"]
+            .map(|name| temporary.path().join(name));
+        let new = [b"new manifest".as_slice(), b"new npm lock", b"new primary"];
+        for path in &paths {
+            std::fs::write(path, b"old").unwrap();
+        }
+        let outputs = [
+            (paths[0].as_path(), new[0]),
+            (paths[1].as_path(), new[1]),
+            (paths[2].as_path(), new[2]),
+        ];
+        let mut renames = Vec::new();
+        publish_generated_bundle_with(
+            &outputs,
+            |_| Ok(()),
+            |boundary| {
+                if let PublicationBoundary::PublishRename(index) = boundary {
+                    renames.push(index);
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(renames, [0, 1, 2]);
+        for (path, expected) in paths.iter().zip(new) {
+            assert_eq!(std::fs::read(path).unwrap(), expected);
+        }
+    }
+
+    fn reviewed_elf_fixture() -> Vec<u8> {
+        let interpreter = b"/lib/ld-linux-aarch64.so.1\0";
+        let mut elf = vec![0_u8; 120 + interpreter.len()];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[6] = 1;
+        elf[16..18].copy_from_slice(&3_u16.to_le_bytes());
+        elf[18..20].copy_from_slice(&183_u16.to_le_bytes());
+        elf[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        elf[32..40].copy_from_slice(&64_u64.to_le_bytes());
+        elf[52..54].copy_from_slice(&64_u16.to_le_bytes());
+        elf[54..56].copy_from_slice(&56_u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&1_u16.to_le_bytes());
+        elf[64..68].copy_from_slice(&3_u32.to_le_bytes());
+        elf[72..80].copy_from_slice(&120_u64.to_le_bytes());
+        elf[96..104].copy_from_slice(&(interpreter.len() as u64).to_le_bytes());
+        elf[104..112].copy_from_slice(&(interpreter.len() as u64).to_le_bytes());
+        elf[120..].copy_from_slice(interpreter);
+        elf
+    }
+
+    #[test]
+    fn claude_elf_validation_rejects_malformed_reviewed_header_and_interpreter() {
+        let valid = reviewed_elf_fixture();
+        validate_claude_elf(&valid).unwrap();
+        let mut cases = Vec::new();
+        cases.push(("truncation", valid[..63].to_vec()));
+        for (name, offset, replacement) in [
+            ("EI_VERSION", 6, 2_u8),
+            ("OS ABI", 7, 3),
+            ("ABI version", 8, 1),
+        ] {
+            let mut mutated = valid.clone();
+            mutated[offset] = replacement;
+            cases.push((name, mutated));
+        }
+        for (name, range, replacement) in [
+            ("ELF version", 20..24, 2_u32.to_le_bytes().to_vec()),
+            ("ELF type", 16..18, 1_u16.to_le_bytes().to_vec()),
+            ("header size", 52..54, 63_u16.to_le_bytes().to_vec()),
+            ("program header size", 54..56, 55_u16.to_le_bytes().to_vec()),
+        ] {
+            let mut mutated = valid.clone();
+            mutated[range].copy_from_slice(&replacement);
+            cases.push((name, mutated));
+        }
+        let mut bad_interpreter = valid;
+        bad_interpreter[120..].copy_from_slice(b"/tmp/ld-linux-aarch64.so.1\0");
+        cases.push(("interpreter", bad_interpreter));
+
+        for (name, mutated) in cases {
+            assert!(
+                validate_claude_elf(&mutated).is_err(),
+                "{name} mutation passed"
+            );
+        }
     }
 }
