@@ -57,6 +57,8 @@ fn image_replace_preserves_durable_resources_and_rolls_back_failure() -> TestRes
     assert_compatible_fixture(&env)?;
     let predecessor_snapshot = env.owned_runtime_snapshot()?;
     assert_eq!(predecessor_snapshot.container_image(), predecessor);
+    env.write_image_replace_root_sentinel()?;
+    env.assert_image_replace_root_sentinel(true)?;
 
     let status = env.status_json()?;
     assert_image_changed(&status, &predecessor, approved)?;
@@ -65,6 +67,7 @@ fn image_replace_preserves_durable_resources_and_rolls_back_failure() -> TestRes
     assert_json_phase(&up.stdout, "apply_required")?;
     assert_eq!(env.owned_runtime_snapshot()?, predecessor_snapshot);
     assert_eq!(std::fs::read_to_string(root.join("setup-count"))?, "1\n");
+    env.assert_image_replace_root_sentinel(true)?;
 
     let apply = env.success_with_timeout(
         [
@@ -90,8 +93,10 @@ fn image_replace_preserves_durable_resources_and_rolls_back_failure() -> TestRes
     assert_eq!(approved_snapshot.container_image(), approved);
     predecessor_snapshot.assert_retained_identities_equal(&approved_snapshot)?;
     assert_compatible_fixture(&env)?;
+    env.assert_image_replace_root_sentinel(false)?;
 
     env.replace_owned_container_image(&predecessor, std::time::Duration::from_secs(10 * 60))?;
+    env.write_image_replace_root_sentinel()?;
     std::fs::write(
         root.join(".gascan/setup.sh"),
         "#!/bin/sh\nset -eu\n\
@@ -119,6 +124,7 @@ fn image_replace_preserves_durable_resources_and_rolls_back_failure() -> TestRes
     assert_eq!(rolled_back.container_image(), predecessor);
     predecessor_snapshot.assert_retained_identities_equal(&rolled_back)?;
     assert_compatible_fixture(&env)?;
+    env.assert_image_replace_root_sentinel(false)?;
 
     env.success(["--sandbox", env.id(), "destroy", "--yes"])?;
     env.assert_no_owned_resources()

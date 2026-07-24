@@ -33,9 +33,11 @@ pub struct PtySignalOutput {
 
 pub type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+const IMAGE_REPLACE_ROOT_SENTINEL_PREFIX: &str =
+    "/home/workspace/.gascan-image-replace-root-sentinel-";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnedRuntimeSnapshot {
-    container_id: String,
     container_image: String,
     volumes: BTreeSet<(String, String)>,
     networks: BTreeSet<(String, String)>,
@@ -47,13 +49,6 @@ impl OwnedRuntimeSnapshot {
     }
 
     pub fn assert_retained_identities_equal(&self, other: &Self) -> TestResult {
-        if self.container_id != other.container_id {
-            return Err(format!(
-                "container identity changed from {} to {}",
-                self.container_id, other.container_id
-            )
-            .into());
-        }
         if self.volumes != other.volumes {
             return Err(format!(
                 "managed volume identities changed: {:?} != {:?}",
@@ -86,8 +81,18 @@ pub fn validate_distinct_image_fixtures(predecessor: &str, approved: &str) -> Te
             return Err(format!("{role} workspace image is not digest-qualified").into());
         }
     }
-    if predecessor == approved {
-        return Err("predecessor and approved workspace image fixtures must be distinct".into());
+    let predecessor_digest = predecessor
+        .rsplit_once("@sha256:")
+        .map(|(_, digest)| digest)
+        .ok_or("predecessor workspace image digest is unavailable")?;
+    let approved_digest = approved
+        .rsplit_once("@sha256:")
+        .map(|(_, digest)| digest)
+        .ok_or("approved workspace image digest is unavailable")?;
+    if predecessor_digest == approved_digest {
+        return Err(
+            "predecessor and approved workspace image fixture digests must be distinct".into(),
+        );
     }
     Ok(())
 }
@@ -454,6 +459,35 @@ impl AppleE2e {
         }
     }
 
+    pub fn write_image_replace_root_sentinel(&self) -> TestResult {
+        let sentinel = format!("{IMAGE_REPLACE_ROOT_SENTINEL_PREFIX}{}", self.id());
+        self.success([
+            "--sandbox",
+            self.id(),
+            "run",
+            "--",
+            "sh",
+            "-c",
+            &format!("printf root-only >{sentinel}"),
+        ])?;
+        Ok(())
+    }
+
+    pub fn assert_image_replace_root_sentinel(&self, expected: bool) -> TestResult {
+        let predicate = if expected { "-f" } else { "! -e" };
+        let sentinel = format!("{IMAGE_REPLACE_ROOT_SENTINEL_PREFIX}{}", self.id());
+        self.success([
+            "--sandbox",
+            self.id(),
+            "run",
+            "--",
+            "sh",
+            "-c",
+            &format!("test {predicate} {sentinel}"),
+        ])?;
+        Ok(())
+    }
+
     pub fn owned_runtime_snapshot(&self) -> TestResult<OwnedRuntimeSnapshot> {
         let inspect = self.container_json(["inspect", self.id()])?;
         let record = inspect
@@ -504,7 +538,6 @@ impl AppleE2e {
             .into());
         }
         Ok(OwnedRuntimeSnapshot {
-            container_id: container_id.to_owned(),
             container_image: container_image.to_owned(),
             volumes,
             networks,
@@ -516,12 +549,7 @@ impl AppleE2e {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let child = Command::new("container")
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let output = wait_with_output_bounded(child, std::time::Duration::from_secs(90))?;
+        let output = container_command_bounded(args, std::time::Duration::from_secs(90))?;
         if !output.status.success() {
             return Err(format!(
                 "container inventory failed: {}",
@@ -823,6 +851,9 @@ impl AppleE2e {
     }
 
     pub fn assert_no_owned_resources(&self) -> TestResult {
+        assert_all_owned_inventory_empty_with(self.id(), |target| {
+            container_command_bounded(target.arguments(), std::time::Duration::from_secs(15))
+        })?;
         for identity in self.resource_identities()? {
             let name = identity.name();
             match resource_presence(&identity, self.id())? {
@@ -856,38 +887,21 @@ impl AppleE2e {
         for identity in identities {
             if identity.kind() == gascan_core::runtime::ResourceKind::Container {
                 mutate_if_freshly_owned(&identity, self.id(), resource_presence, |identity| {
-                    let _ = Command::new("container")
-                        .args(["stop", "--time", "5", identity.name()])
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status();
-                    Ok(())
+                    cleanup_mutation(["stop", "--time", "5", identity.name()])
                 })?;
             }
             mutate_if_freshly_owned(&identity, self.id(), resource_presence, |identity| {
                 let name = identity.name();
-                let status = match identity.kind() {
-                    gascan_core::runtime::ResourceKind::Container => Command::new("container")
-                        .args(["delete", name])
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status()?,
-                    gascan_core::runtime::ResourceKind::Volume => Command::new("container")
-                        .args(["volume", "delete", name])
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status()?,
-                    gascan_core::runtime::ResourceKind::Network => Command::new("container")
-                        .args(["network", "delete", name])
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status()?,
+                let args = match identity.kind() {
+                    gascan_core::runtime::ResourceKind::Container => vec!["delete", name],
+                    gascan_core::runtime::ResourceKind::Volume => {
+                        vec!["volume", "delete", name]
+                    }
+                    gascan_core::runtime::ResourceKind::Network => {
+                        vec!["network", "delete", name]
+                    }
                 };
-                if status.success() {
-                    Ok(())
-                } else {
-                    Err(format!("cleanup failed for exact resource {name}").into())
-                }
+                cleanup_mutation(args)
             })?;
         }
         let _keep_roots_alive = (&self.root, &self.runtime);
@@ -1689,6 +1703,174 @@ enum ResourcePresence {
     Collision,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InventoryTarget {
+    Container,
+    Volume,
+    Network,
+}
+
+impl InventoryTarget {
+    const ALL: [Self; 3] = [Self::Container, Self::Volume, Self::Network];
+
+    fn arguments(self) -> &'static [&'static str] {
+        match self {
+            Self::Container => &["list", "--all", "--format", "json"],
+            Self::Volume => &["volume", "list", "--format", "json"],
+            Self::Network => &["network", "list", "--format", "json"],
+        }
+    }
+
+    const fn kind(self) -> gascan_core::runtime::ResourceKind {
+        match self {
+            Self::Container => gascan_core::runtime::ResourceKind::Container,
+            Self::Volume => gascan_core::runtime::ResourceKind::Volume,
+            Self::Network => gascan_core::runtime::ResourceKind::Network,
+        }
+    }
+
+    const fn operation(self) -> &'static str {
+        match self {
+            Self::Container => "container inventory",
+            Self::Volume => "volume inventory",
+            Self::Network => "network inventory",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct InventoryObservation {
+    identity: gascan_core::runtime::ResourceIdentity,
+    managed_by: Option<String>,
+    sandbox_id: Option<String>,
+}
+
+fn inventory_observations(
+    target: InventoryTarget,
+    output: &Output,
+) -> TestResult<Vec<InventoryObservation>> {
+    if !output.status.success() {
+        return Err(format!(
+            "{} failed with {:?}: {}",
+            target.operation(),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let value: Value = serde_json::from_slice(&output.stdout)?;
+    let records = value
+        .as_array()
+        .ok_or_else(|| format!("{} must be a JSON array", target.operation()))?;
+    let mut observations = Vec::with_capacity(records.len());
+    let mut identities = BTreeSet::new();
+    for record in records {
+        let configuration = record["configuration"]
+            .as_object()
+            .ok_or_else(|| format!("{} record lacks configuration", target.operation()))?;
+        let name = match target {
+            InventoryTarget::Container => configuration
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or("container inventory record lacks configuration id")?,
+            InventoryTarget::Volume | InventoryTarget::Network => {
+                let id = record["id"]
+                    .as_str()
+                    .ok_or_else(|| format!("{} record lacks id", target.operation()))?;
+                let name = configuration
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        format!("{} record lacks configuration name", target.operation())
+                    })?;
+                if id != name {
+                    return Err(
+                        format!("{} id/name mismatch: {id} != {name}", target.operation()).into(),
+                    );
+                }
+                id
+            }
+        };
+        let identity = gascan_core::runtime::ResourceIdentity::new(target.kind(), name)?;
+        if !identities.insert(identity.clone()) {
+            return Err(format!("duplicate {} identity: {name}", target.operation()).into());
+        }
+        let labels = match configuration.get("labels") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(labels)) => Some(labels),
+            Some(_) => {
+                return Err(
+                    format!("{} record labels are not an object", target.operation()).into(),
+                );
+            }
+        };
+        observations.push(InventoryObservation {
+            identity,
+            managed_by: labels
+                .and_then(|labels| labels.get("dev.gascan.managed-by"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            sandbox_id: labels
+                .and_then(|labels| labels.get("dev.gascan.sandbox-id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        });
+    }
+    Ok(observations)
+}
+
+fn assert_all_owned_inventory_empty_with(
+    id: &str,
+    mut run: impl FnMut(InventoryTarget) -> TestResult<Output>,
+) -> TestResult {
+    let mut owned = BTreeSet::new();
+    for target in InventoryTarget::ALL {
+        for observation in inventory_observations(target, &run(target)?)? {
+            if observation.managed_by.as_deref() == Some("gascan")
+                && observation.sandbox_id.as_deref() == Some(id)
+            {
+                owned.insert(observation.identity);
+            }
+        }
+    }
+    if owned.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("test-owned inventory remains for {id}: {owned:?}").into())
+    }
+}
+
+fn container_command_bounded<I, S>(args: I, timeout: std::time::Duration) -> TestResult<Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let child = Command::new("container")
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    wait_with_output_bounded(child, timeout)
+}
+
+fn cleanup_mutation<I, S>(args: I) -> TestResult
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let output = container_command_bounded(args, std::time::Duration::from_secs(15))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "bounded cleanup mutation failed with {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into())
+    }
+}
+
 fn mutate_if_freshly_owned(
     identity: &gascan_core::runtime::ResourceIdentity,
     id: &str,
@@ -1710,32 +1892,26 @@ fn resource_presence(
     identity: &gascan_core::runtime::ResourceIdentity,
     id: &str,
 ) -> TestResult<ResourcePresence> {
-    let name = identity.name();
-    let output = match identity.kind() {
-        gascan_core::runtime::ResourceKind::Container => {
-            Command::new("container").args(["inspect", name]).output()?
-        }
-        gascan_core::runtime::ResourceKind::Volume => Command::new("container")
-            .args(["volume", "inspect", name])
-            .output()?,
-        gascan_core::runtime::ResourceKind::Network => Command::new("container")
-            .args(["network", "list", "--format", "json"])
-            .output()?,
+    let target = match identity.kind() {
+        gascan_core::runtime::ResourceKind::Container => InventoryTarget::Container,
+        gascan_core::runtime::ResourceKind::Volume => InventoryTarget::Volume,
+        gascan_core::runtime::ResourceKind::Network => InventoryTarget::Network,
     };
-    if identity.kind() == gascan_core::runtime::ResourceKind::Network {
-        return network_presence_from_output(&output, name, id);
-    }
-    if !output.status.success() {
-        return Ok(ResourcePresence::Absent);
-    }
-    let value: Value = serde_json::from_slice(&output.stdout)?;
-    let record = value
-        .as_array()
-        .and_then(|items| items.first())
-        .unwrap_or(&value);
-    let labels = &record["configuration"]["labels"];
+    let output = container_command_bounded(target.arguments(), std::time::Duration::from_secs(15))?;
+    let observations = inventory_observations(target, &output)?;
+    let exact = observations
+        .iter()
+        .filter(|observation| &observation.identity == identity)
+        .collect::<Vec<_>>();
+    let observation = match exact.as_slice() {
+        [] => return Ok(ResourcePresence::Absent),
+        [observation] => *observation,
+        _ => return Err(format!("ambiguous inventory identity: {}", identity.name()).into()),
+    };
     Ok(
-        if labels["dev.gascan.managed-by"] == "gascan" && labels["dev.gascan.sandbox-id"] == id {
+        if observation.managed_by.as_deref() == Some("gascan")
+            && observation.sandbox_id.as_deref() == Some(id)
+        {
             ResourcePresence::Owned
         } else {
             ResourcePresence::Collision
@@ -1839,12 +2015,14 @@ mod tests {
     #[test]
     fn image_replacement_fixtures_must_be_distinct_immutable_digests() -> TestResult {
         let first = format!("registry.example/workspace:first@sha256:{}", "a".repeat(64));
+        let first_alias = format!("registry.example/alias:other-tag@sha256:{}", "a".repeat(64));
         let second = format!(
             "registry.example/workspace:second@sha256:{}",
             "b".repeat(64)
         );
         assert!(validate_distinct_image_fixtures(&first, &second).is_ok());
         assert!(validate_distinct_image_fixtures(&first, &first).is_err());
+        assert!(validate_distinct_image_fixtures(&first, &first_alias).is_err());
         assert!(
             validate_distinct_image_fixtures("registry.example/workspace:first", &second).is_err()
         );
@@ -1884,6 +2062,65 @@ mod tests {
         }]);
         assert!(owned_inventory_identities(&wrong_owner, "fixture").is_err());
         Ok(())
+    }
+
+    #[test]
+    fn all_inventory_proof_rejects_unexpected_extra_owned_resource() -> TestResult {
+        let extra = network_output(
+            0,
+            serde_json::json!([{
+                "configuration": {
+                    "id": "unexpected-owned-container",
+                    "labels": {
+                        "dev.gascan.managed-by": "gascan",
+                        "dev.gascan.sandbox-id": "fixture"
+                    }
+                }
+            }]),
+        )?;
+        let empty = network_output(0, serde_json::json!([]))?;
+        let error = assert_all_owned_inventory_empty_with("fixture", |target| {
+            Ok(if target == InventoryTarget::Container {
+                clone_output(&extra)
+            } else {
+                clone_output(&empty)
+            })
+        })
+        .err()
+        .ok_or("unexpected owned resource was accepted as empty")?;
+        assert!(error.to_string().contains("unexpected-owned-container"));
+        Ok(())
+    }
+
+    #[test]
+    fn all_inventory_proof_propagates_command_failure() -> TestResult {
+        let failed = network_output(1 << 8, serde_json::json!([]))?;
+        let result =
+            assert_all_owned_inventory_empty_with("fixture", |_| Ok(clone_output(&failed)));
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn all_inventory_proof_propagates_timeout() {
+        let result = assert_all_owned_inventory_empty_with("fixture", |_| {
+            Err("inventory command timed out and was killed/reaped".into())
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn all_inventory_proof_accepts_clean_empty_inventory() -> TestResult {
+        let empty = network_output(0, serde_json::json!([]))?;
+        assert_all_owned_inventory_empty_with("fixture", |_| Ok(clone_output(&empty)))
+    }
+
+    fn clone_output(output: &Output) -> Output {
+        Output {
+            status: output.status,
+            stdout: output.stdout.clone(),
+            stderr: output.stderr.clone(),
+        }
     }
 
     struct OwnedChildFixture {
