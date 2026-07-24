@@ -5,36 +5,11 @@ fn root() -> &'static Path {
 }
 
 #[test]
-fn reviewed_workstation_packages_supply_expected_commands_without_extra_privileges() {
+fn reviewed_workstation_packages_require_no_extra_privileges() {
     let system_tools = fs::read_to_string(root().join("tests/image/system-tools.txt")).unwrap();
     let packages = system_tools
         .lines()
         .collect::<std::collections::BTreeSet<_>>();
-    let command_mappings: [(&str, &[&str]); 7] = [
-        ("bind9-dnsutils", &["dig", "nslookup"]),
-        ("iproute2", &["ip", "ss"]),
-        ("iputils-ping", &["ping"]),
-        ("net-tools", &["ifconfig", "netstat"]),
-        ("procps", &["ps", "top"]),
-        ("psmisc", &["pstree"]),
-        ("nano", &["nano", "pico"]),
-    ];
-    for (package, commands) in command_mappings {
-        assert!(
-            packages.contains(package),
-            "missing package for command mapping: {package}"
-        );
-        assert!(!commands.is_empty(), "empty command mapping: {package}");
-        for command in commands {
-            assert!(
-                command
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
-                "invalid mapped command: {command}"
-            );
-        }
-    }
-
     for forbidden_package in [
         "libcap2-bin",
         "nmap",

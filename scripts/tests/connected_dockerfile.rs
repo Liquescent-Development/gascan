@@ -1,9 +1,84 @@
 use std::{collections::BTreeSet, fs, path::Path, process::Command};
 
 const MISE_LS_FILTER: &str = r#"if ((keys|sort) != ["elixir","erlang","go","java","node","python","ruby","rust"]) then error("unexpected mise tool set") else to_entries | map(if ((.value|type)!="array") or ((.value|length)!=1) or (.value[0].installed != true) or (.value[0].active != true) or ((.value[0].version|type)!="string") or (.value[0].version=="") then error("invalid mise ls record") else {key:.key,value:.value[0].version} end) | from_entries end"#;
+const EXPECTED_SYSTEM_TOOLS: &str = "\
+autoconf
+bind9-dnsutils
+bison
+build-essential
+ca-certificates
+curl
+emacs-nox
+fd-find
+fonts-liberation
+fzf
+gh
+git
+iproute2
+iputils-ping
+jq
+less
+libasound2t64
+libatk-bridge2.0-0
+libatk1.0-0
+libcups2
+libdbus-1-3
+libdrm2
+libffi-dev
+libgbm1
+libgdbm-dev
+libglib2.0-0t64
+libgtk-3-0t64
+libncurses-dev
+libnspr4
+libnss3
+libpango-1.0-0
+libreadline-dev
+libssl-dev
+libx11-6
+libxcb1
+libxcomposite1
+libxdamage1
+libxext6
+libxfixes3
+libxkbcommon0
+libxrandr2
+libyaml-dev
+lsof
+nano
+net-tools
+netcat-openbsd
+openssh-client
+openssh-server
+patch
+pkg-config
+procps
+psmisc
+python3
+ripgrep
+rsync
+sudo
+tini
+tmux
+traceroute
+tree
+unzip
+vim
+wget
+xz-utils
+zlib1g-dev
+zstd
+";
 
 fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
+}
+
+fn assert_exact_system_tools(package_text: &str) -> Result<(), &'static str> {
+    if package_text != EXPECTED_SYSTEM_TOOLS {
+        return Err("reviewed Ubuntu root package set changed");
+    }
+    Ok(())
 }
 
 fn assert_sole_reviewed_package_install(dockerfile: &str) -> Result<(), &'static str> {
@@ -293,46 +368,12 @@ fn mise_comparison_is_quiet_on_match_and_emits_only_both_json_documents_on_misma
 #[test]
 fn dockerfile_installs_exactly_the_sorted_unique_reviewed_package_list() {
     let package_text = fs::read_to_string(root().join("tests/image/system-tools.txt")).unwrap();
+    assert_exact_system_tools(&package_text).unwrap();
     assert!(package_text.ends_with('\n'));
     assert!(package_text.lines().all(|line| !line.is_empty()));
     let packages: Vec<_> = package_text.lines().collect();
     let sorted_unique: BTreeSet<_> = packages.iter().copied().collect();
     assert_eq!(packages, sorted_unique.into_iter().collect::<Vec<_>>());
-    for required in [
-        "bind9-dnsutils",
-        "emacs-nox",
-        "fd-find",
-        "fzf",
-        "iproute2",
-        "iputils-ping",
-        "less",
-        "lsof",
-        "nano",
-        "net-tools",
-        "netcat-openbsd",
-        "openssh-client",
-        "openssh-server",
-        "procps",
-        "psmisc",
-        "ripgrep",
-        "rsync",
-        "tmux",
-        "traceroute",
-        "tree",
-        "vim",
-        "wget",
-    ] {
-        assert!(
-            packages.contains(&required),
-            "missing reviewed workstation package: {required}"
-        );
-    }
-    for external in ["claude", "codex", "glab", "herdr", "neovim", "pi"] {
-        assert!(
-            !packages.contains(&external),
-            "external artifact accepted as an Ubuntu package: {external}"
-        );
-    }
 
     let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
     for required in [
@@ -348,6 +389,14 @@ fn dockerfile_installs_exactly_the_sorted_unique_reviewed_package_list() {
         );
     }
     assert_sole_reviewed_package_install(&dockerfile).unwrap();
+}
+
+#[test]
+fn exact_system_tool_contract_rejects_addition_removal_and_substitution() {
+    let exact = fs::read_to_string(root().join("tests/image/system-tools.txt")).unwrap();
+    assert_exact_system_tools(&(exact.clone() + "unreviewed-extra\n")).unwrap_err();
+    assert_exact_system_tools(&exact.replacen("bind9-dnsutils\n", "", 1)).unwrap_err();
+    assert_exact_system_tools(&exact.replacen("nano\n", "nano-tiny\n", 1)).unwrap_err();
 }
 
 #[test]

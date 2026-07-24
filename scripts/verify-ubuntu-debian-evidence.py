@@ -29,9 +29,17 @@ def fields(raw):
     for line in raw.splitlines():
         if line.startswith((" ", "\t")) and current:
             result[current] += "\n" + line
-        elif ": " in line:
-            current, value = line.split(": ", 1)
+        elif ":" in line:
+            current, value = line.split(":", 1)
+            if value.startswith(" "):
+                value = value[1:]
+            elif value:
+                fail("invalid signed Packages field")
+            if current in result:
+                fail("duplicate signed Packages field")
             result[current] = value
+        else:
+            fail("invalid signed Packages field")
     return result
 
 
@@ -44,42 +52,44 @@ def canonical(path, lines, mode):
 
 
 def selected_packages(root):
-    upstream_by_identity = {}
+    upstream_by_group = {}
+    same_index_conflicts = set()
+    cross_index_conflicts = set()
     for index in sorted((root / "signed-indexes").rglob("Packages.xz")):
-        source_items = [
-            fields(raw)
-            for raw in lzma.decompress(index.read_bytes()).decode().strip().split("\n\n")
-        ]
-        source_identities = set()
-        for item in source_items:
+        source_groups = set()
+        for raw in lzma.decompress(index.read_bytes()).decode().strip().split("\n\n"):
+            item = fields(raw)
             required = ("Package", "Version", "Architecture", "Filename", "SHA256", "Size")
             if not all(key in item for key in required):
                 fail("incomplete signed Packages stanza")
-            identity = tuple(item[key] for key in required)
-            if identity in source_identities:
-                fail("ambiguous signed Packages metadata in one index")
-            source_identities.add(identity)
-            upstream_by_identity.setdefault(identity, item)
-    upstream = list(upstream_by_identity.values())
+            group = tuple(item[key] for key in ("Package", "Version", "Architecture"))
+            if group in source_groups:
+                same_index_conflicts.add(group)
+                continue
+            source_groups.add(group)
+            if group in upstream_by_group:
+                if upstream_by_group[group][0] != raw:
+                    cross_index_conflicts.add(group)
+            else:
+                upstream_by_group[group] = (raw, item)
     result = {}
     for line in (root / "package-manifest.tsv").read_text().splitlines():
         name, version, arch, filename, sha, size = line.split("\t")
-        matches = [
-            item
-            for item in upstream
-            if (
-                item.get("Package"),
-                item.get("Version"),
-                item.get("Architecture"),
-                item.get("Filename"),
-                item.get("SHA256"),
-                item.get("Size"),
-            )
-            == (name, version, arch, filename, sha, size)
-        ]
-        if len(matches) != 1:
+        group = (name, version, arch)
+        if group in same_index_conflicts:
+            fail("duplicate package group in same signed index")
+        if group in cross_index_conflicts:
+            fail("conflicting signed package metadata across indexes")
+        if group not in upstream_by_group:
             fail("selection is not uniquely present in signed Packages")
-        result[(name, version, arch)] = matches[0]
+        item = upstream_by_group[group][1]
+        if (
+            item.get("Filename"),
+            item.get("SHA256"),
+            item.get("Size"),
+        ) != (filename, sha, size):
+            fail("selection is not uniquely present in signed Packages")
+        result[group] = item
     return result
 
 
@@ -208,8 +218,8 @@ def verify_roots(root, mode):
 if len(sys.argv) != 3 or sys.argv[1] not in ("--write", "--verify"):
     fail("usage: verify-ubuntu-debian-evidence.py --write|--verify EVIDENCE")
 mode, root = sys.argv[1], Path(sys.argv[2])
-verify_roots(root, mode)
 selected = selected_packages(root)
+verify_roots(root, mode)
 bind_roots(root, selected, mode)
 requirements, edges = recompute(root, selected)
 canonical(root / "dependency-requirements.tsv", requirements, mode)
