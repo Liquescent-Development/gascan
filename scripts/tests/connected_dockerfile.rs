@@ -298,6 +298,41 @@ fn dockerfile_installs_exactly_the_sorted_unique_reviewed_package_list() {
     let packages: Vec<_> = package_text.lines().collect();
     let sorted_unique: BTreeSet<_> = packages.iter().copied().collect();
     assert_eq!(packages, sorted_unique.into_iter().collect::<Vec<_>>());
+    for required in [
+        "bind9-dnsutils",
+        "emacs-nox",
+        "fd-find",
+        "fzf",
+        "iproute2",
+        "iputils-ping",
+        "less",
+        "lsof",
+        "nano",
+        "net-tools",
+        "netcat-openbsd",
+        "openssh-client",
+        "openssh-server",
+        "procps",
+        "psmisc",
+        "ripgrep",
+        "rsync",
+        "tmux",
+        "traceroute",
+        "tree",
+        "vim",
+        "wget",
+    ] {
+        assert!(
+            packages.contains(&required),
+            "missing reviewed workstation package: {required}"
+        );
+    }
+    for external in ["claude", "codex", "glab", "herdr", "neovim", "pi"] {
+        assert!(
+            !packages.contains(&external),
+            "external artifact accepted as an Ubuntu package: {external}"
+        );
+    }
 
     let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
     for required in [

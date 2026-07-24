@@ -5,6 +5,67 @@ fn root() -> &'static Path {
 }
 
 #[test]
+fn reviewed_workstation_packages_supply_expected_commands_without_extra_privileges() {
+    let system_tools = fs::read_to_string(root().join("tests/image/system-tools.txt")).unwrap();
+    let packages = system_tools
+        .lines()
+        .collect::<std::collections::BTreeSet<_>>();
+    let command_mappings: [(&str, &[&str]); 7] = [
+        ("bind9-dnsutils", &["dig", "nslookup"]),
+        ("iproute2", &["ip", "ss"]),
+        ("iputils-ping", &["ping"]),
+        ("net-tools", &["ifconfig", "netstat"]),
+        ("procps", &["ps", "top"]),
+        ("psmisc", &["pstree"]),
+        ("nano", &["nano", "pico"]),
+    ];
+    for (package, commands) in command_mappings {
+        assert!(
+            packages.contains(package),
+            "missing package for command mapping: {package}"
+        );
+        assert!(!commands.is_empty(), "empty command mapping: {package}");
+        for command in commands {
+            assert!(
+                command
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
+                "invalid mapped command: {command}"
+            );
+        }
+    }
+
+    for forbidden_package in [
+        "libcap2-bin",
+        "nmap",
+        "tcpdump",
+        "tshark",
+        "wireshark",
+        "wireshark-common",
+    ] {
+        assert!(
+            !packages.contains(forbidden_package),
+            "unreviewed capability or packet-capture package: {forbidden_package}"
+        );
+    }
+
+    let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
+    for forbidden in [
+        "CAP_NET_ADMIN",
+        "CAP_NET_RAW",
+        "--cap-add",
+        "--device",
+        "--privileged",
+        "/dev/net/tun",
+    ] {
+        assert!(
+            !dockerfile.contains(forbidden),
+            "Dockerfile adds forbidden privilege or device access: {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn dockerfile_declares_workspace_user_init_and_persistent_layout() {
     let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
     let system_tools = fs::read_to_string(root().join("tests/image/system-tools.txt")).unwrap();

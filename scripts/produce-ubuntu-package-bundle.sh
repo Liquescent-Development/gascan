@@ -10,9 +10,15 @@ gpgv_bin=${GPGV:-gpgv}
 
 die() { printf 'ubuntu package bundle: %s\n' "$*" >&2; exit 1; }
 
+fetch_signed_snapshot() {
+  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    --retry 4 --retry-delay 2 --retry-max-time 60 --connect-timeout 20 \
+    "$1" --output "$2"
+}
+
 verify_evidence() {
   evidence=$1
-  python3 - "$evidence" "$config" "$gpgv_bin" <<'PY'
+  python3 - "$evidence" "$config" "$gpgv_bin" <<'PY' || return 1
 import hashlib, lzma, re, subprocess, sys
 from pathlib import Path
 
@@ -68,7 +74,7 @@ for signed_release in signed_releases:
         elif in_sha and line and not line.startswith(" "): in_sha=False
     release_hashes[suite]=hashes
 
-package_text=[]
+package_indexes=[]
 indexes=sorted((root/"signed-indexes").rglob("Packages.xz"))
 if not indexes: fail("signed Packages indexes are missing")
 for index in indexes:
@@ -83,18 +89,24 @@ for index in indexes:
     expected_plain=release_hashes[suite].get(plain_path)
     actual_plain=(hashlib.sha256(unpacked).hexdigest(),len(unpacked))
     if expected_plain != actual_plain: fail("uncompressed Packages hash/size is not covered by signed InRelease")
-    package_text.append(unpacked.decode("utf-8","strict"))
-stanzas=[]
-for raw in "\n".join(package_text).strip().split("\n\n"):
-    fields={}
-    for line in raw.splitlines():
-        if line.startswith((" ","\t")) or ": " not in line: continue
-        key,value=line.split(": ",1)
-        if key in fields: fail("duplicate Packages field")
-        fields[key]=value
-    required=("Package","Version","Architecture","Filename","SHA256","Size")
-    if not all(key in fields for key in required): fail("incomplete Packages stanza")
-    stanzas.append(fields)
+    package_indexes.append((str(relative),unpacked.decode("utf-8","strict")))
+stanzas_by_identity={}
+for source,text in package_indexes:
+    source_identities=set()
+    for raw in text.strip().split("\n\n"):
+        fields={}
+        for line in raw.splitlines():
+            if line.startswith((" ","\t")) or ": " not in line: continue
+            key,value=line.split(": ",1)
+            if key in fields: fail("duplicate Packages field")
+            fields[key]=value
+        required=("Package","Version","Architecture","Filename","SHA256","Size")
+        if not all(key in fields for key in required): fail("incomplete Packages stanza")
+        identity=tuple(fields[key] for key in required)
+        if identity in source_identities: fail("manifest package has ambiguous signed metadata")
+        source_identities.add(identity)
+        stanzas_by_identity.setdefault(identity,fields)
+stanzas=list(stanzas_by_identity.values())
 by_name={}
 for fields in stanzas: by_name.setdefault(fields["Package"],[]).append(fields)
 
@@ -117,8 +129,22 @@ for line in lines:
 
 roots=[line for line in (root/"roots.txt").read_text().splitlines() if line]
 if roots != sorted(set(roots)): fail("roots are not in canonical order")
-root_keys={key for key in selected if key[0] in roots}
-if {key[0] for key in root_keys} != set(roots): fail("missing root package")
+reviewed_providers={"libatk-bridge2.0-0":"libatk-bridge2.0-0t64","libatk1.0-0":"libatk1.0-0t64","libcups2":"libcups2t64"}
+binding_lines=(root/"root-bindings.tsv").read_text().splitlines()
+if binding_lines != sorted(set(binding_lines)): fail("root bindings are not in canonical order")
+bound_roots=set(); root_keys=set()
+for line in binding_lines:
+    columns=line.split("\t")
+    if len(columns) != 4: fail("invalid requested root binding against roots")
+    requested,name,version,arch=columns; key=(name,version,arch)
+    if requested not in roots or requested in bound_roots or key not in selected: fail("invalid requested root binding against roots")
+    if name != requested:
+        if reviewed_providers.get(requested) != name: fail("invalid requested root provider")
+        provided=selected[key].get("Provides","").split(",")
+        exact=f"{requested} (= {version})"
+        if exact not in [item.strip() for item in provided]: fail("invalid requested root provider")
+    bound_roots.add(requested); root_keys.add(key)
+if bound_roots != set(roots): fail("missing root package")
 edge_lines=[line for line in (root/"dependency-edges.tsv").read_text().splitlines() if line]
 if edge_lines != sorted(set(edge_lines)): fail("dependency edges are not in canonical order")
 requirement_lines=[line for line in (root/"dependency-requirements.tsv").read_text().splitlines() if line]
@@ -144,7 +170,7 @@ while queue:
 if reached != set(selected): fail("Recommends or unrelated package is outside chosen dependency closure")
 PY
   debian_verifier=${DEBIAN_EVIDENCE_VERIFIER:-$root/scripts/verify-ubuntu-debian-evidence.py}
-  "$debian_verifier" --verify "$evidence"
+  "$debian_verifier" --verify "$evidence" || return 1
 }
 
 if [[ ${1:-} == --verify-evidence ]]; then
@@ -177,6 +203,16 @@ work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 mkdir -p "$work/evidence/repository" "$work/evidence/signed-releases" "$work/evidence/signed-indexes" "$work/apt/lists/partial" "$work/apt/cache/archives/partial"
 snapshot=20260713T000000Z
+system_packages_sha256=$(sha256sum "$tools" | cut -d' ' -f1)
+package_cache_root=${UBUNTU_PACKAGE_CACHE:-}
+package_cache=
+if [[ -n $package_cache_root ]]; then
+  package_cache="$package_cache_root/$snapshot-arm64-$system_packages_sha256"
+  mkdir -p -- "$package_cache"
+  if compgen -G "$package_cache/*.deb" >/dev/null; then
+    cp -- "$package_cache"/*.deb "$work/apt/cache/archives/"
+  fi
+fi
 keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg
 cat >"$work/sources.sources" <<EOF
 Types: deb
@@ -191,18 +227,21 @@ apt-get "${apt_opts[@]}" update
 mapfile -t roots < <(printf '%s\n' build-essential ca-certificates git libssl-dev pkg-config; sed '/^[[:space:]]*$/d' "$tools" | LC_ALL=C sort -u)
 printf '%s\n' "${roots[@]}" | LC_ALL=C sort -u >"$work/evidence/roots.txt"
 DEBIAN_FRONTEND=noninteractive apt-get "${apt_opts[@]}" --yes --download-only --no-install-recommends install "${roots[@]}"
+if [[ -n $package_cache ]]; then
+  cp -- "$work/apt/cache/archives"/*.deb "$package_cache/"
+fi
 cp -- "$keyring" "$work/evidence/archive-keyring.gpg"
 release_count=0
 for suite in noble noble-updates noble-security; do
   release_count=$((release_count + 1))
   mkdir -p "$work/evidence/signed-releases/$suite"
   destination="$work/evidence/signed-releases/$suite/InRelease"
-  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "https://snapshot.ubuntu.com/ubuntu/$snapshot/dists/$suite/InRelease" --output "$destination"
+  fetch_signed_snapshot "https://snapshot.ubuntu.com/ubuntu/$snapshot/dists/$suite/InRelease" "$destination"
   "$gpgv_bin" --status-fd 2 --keyring "$keyring" "$destination" 2>"$work/gpg.status" || die "invalid snapshot InRelease signature"
   grep -F "VALIDSIG F6ECB3762474EDA9D21B7022871920D1991BC93C" "$work/gpg.status" >/dev/null || die "unexpected Ubuntu signing fingerprint"
   for component in main universe; do
     mkdir -p "$work/evidence/signed-indexes/$suite/$component/binary-arm64"
-    curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "https://snapshot.ubuntu.com/ubuntu/$snapshot/dists/$suite/$component/binary-arm64/Packages.xz" --output "$work/evidence/signed-indexes/$suite/$component/binary-arm64/Packages.xz"
+    fetch_signed_snapshot "https://snapshot.ubuntu.com/ubuntu/$snapshot/dists/$suite/$component/binary-arm64/Packages.xz" "$work/evidence/signed-indexes/$suite/$component/binary-arm64/Packages.xz"
   done
 done
 [[ $release_count == 3 ]] || die "expected signed InRelease evidence for noble, noble-updates, and noble-security"
@@ -216,14 +255,25 @@ def fields(raw):
         if line.startswith((' ','\t')) and current: out[current]+="\n"+line
         elif ': ' in line: current,value=line.split(': ',1); out[current]=value
     return out
-upstream=[]
+upstream_by_identity={}
 for index in sorted((evidence/'signed-indexes').rglob('Packages.xz')):
-    upstream.extend(fields(raw) for raw in lzma.decompress(index.read_bytes()).decode().strip().split('\n\n'))
+    source_items=[fields(raw) for raw in lzma.decompress(index.read_bytes()).decode().strip().split('\n\n')]
+    source_identities=set()
+    for item in source_items:
+        required=('Package','Version','Architecture','Filename','SHA256','Size')
+        if not all(key in item for key in required): raise SystemExit('incomplete signed Packages stanza')
+        identity=tuple(item[key] for key in required)
+        if identity in source_identities: raise SystemExit('ambiguous signed Packages metadata in one index')
+        source_identities.add(identity)
+        upstream_by_identity.setdefault(identity,item)
+upstream=list(upstream_by_identity.values())
 selected={}; selected_raw={}
 for deb in sorted(archives.glob('*.deb')):
-    values=subprocess.check_output(['dpkg-deb','-f',str(deb),'Package','Version','Architecture'],text=True).splitlines()
-    if len(values)!=3: raise SystemExit('invalid downloaded deb control metadata')
-    name,version,arch=values; data=deb.read_bytes(); sha=hashlib.sha256(data).hexdigest(); size=str(len(data))
+    raw=subprocess.check_output(['dpkg-deb','--show','--showformat=${Package}\t${Version}\t${Architecture}\n',str(deb)],text=True)
+    if raw.count('\n') != 1: raise SystemExit('invalid downloaded deb control metadata')
+    columns=raw.removesuffix('\n').split('\t')
+    if len(columns) != 3 or not all(columns) or any(ord(character) < 32 or ord(character) == 127 for column in columns for character in column): raise SystemExit('invalid downloaded deb control metadata')
+    name,version,arch=columns; data=deb.read_bytes(); sha=hashlib.sha256(data).hexdigest(); size=str(len(data))
     matches=[item for item in upstream if (item.get('Package'),item.get('Version'),item.get('Architecture'),item.get('SHA256'),item.get('Size'))==(name,version,arch,sha,size)]
     if len(matches)!=1: raise SystemExit('downloaded deb is not uniquely bound to signed Packages metadata: '+name)
     item=matches[0]; key=(name,version,arch); selected[key]=item
@@ -244,7 +294,7 @@ SIGNING_KEY_FINGERPRINT=F6ECB3762474EDA9D21B7022871920D1991BC93C
 ARCHITECTURE=arm64
 INSTALL_RECOMMENDS=false
 SYSTEM_PACKAGES_PATH=tests/image/system-tools.txt
-SYSTEM_PACKAGES_SHA256=d17faf2df1d118f9d7f741c21f77adc4b56e2b89ecabeebde17003bc470742e6
+SYSTEM_PACKAGES_SHA256=b68046c4450d7ec11362905551a793d0e4884e20b63f82b26335d2e7610acce8
 EOF
 verify_evidence "$work/evidence" || die "producer evidence validation failed"
 mkdir -- "$output"

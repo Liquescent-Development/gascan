@@ -32,6 +32,11 @@ impl Fixture {
         fs::write(root.join("archive-keyring.gpg"), b"fixture keyring").unwrap();
         fs::write(root.join("roots.txt"), "provider\nroot\n").unwrap();
         fs::write(
+            root.join("root-bindings.tsv"),
+            "provider\tprovider\t3.0\tarm64\nroot\troot\t2.0\tarm64\n",
+        )
+        .unwrap();
+        fs::write(
             root.join("package-manifest.tsv"),
             format!(
                 "dep\t1.0\tarm64\tpool/dep.deb\t{dep_hash}\t10\nprovider\t3.0\tarm64\tpool/provider.deb\t{provider_hash}\t8\nroot\t2.0\tarm64\tpool/root.deb\t{root_hash}\t12\n"
@@ -47,7 +52,7 @@ impl Fixture {
         .unwrap();
         fs::write(
             root.join("provenance.env"),
-            format!("SNAPSHOT=2026-07-13T00:00:00Z\nBASE_IMAGE=ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab\nSIGNING_KEY_FINGERPRINT={FINGERPRINT}\nARCHITECTURE=arm64\nINSTALL_RECOMMENDS=false\nSYSTEM_PACKAGES_PATH=tests/image/system-tools.txt\nSYSTEM_PACKAGES_SHA256=d17faf2df1d118f9d7f741c21f77adc4b56e2b89ecabeebde17003bc470742e6\n"),
+            format!("SNAPSHOT=2026-07-13T00:00:00Z\nBASE_IMAGE=ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab\nSIGNING_KEY_FINGERPRINT={FINGERPRINT}\nARCHITECTURE=arm64\nINSTALL_RECOMMENDS=false\nSYSTEM_PACKAGES_PATH=tests/image/system-tools.txt\nSYSTEM_PACKAGES_SHA256=b68046c4450d7ec11362905551a793d0e4884e20b63f82b26335d2e7610acce8\n"),
         ).unwrap();
         let gpgv = root.join("gpgv");
         fs::write(&gpgv, format!("#!/bin/sh\nprintf '%s\\n' '[GNUPG:] VALIDSIG {FINGERPRINT} 20260713 0 4 0 1 10 01 {FINGERPRINT}' >&2\n")).unwrap();
@@ -121,6 +126,154 @@ fn sha(path: impl AsRef<Path>) -> String {
         .next()
         .unwrap()
         .to_owned()
+}
+
+#[test]
+fn package_input_digest_is_locked_in_config_image_lock_and_producer_provenance() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let digest = sha(root.join("tests/image/system-tools.txt"));
+    let config =
+        fs::read_to_string(root.join("images/workspace/bundles/ubuntu-packages.toml")).unwrap();
+    let lock = fs::read_to_string(root.join("images/workspace/versions.lock")).unwrap();
+    let producer =
+        fs::read_to_string(root.join("scripts/produce-ubuntu-package-bundle.sh")).unwrap();
+
+    let assignment = format!("system_packages_sha256 = \"{digest}\"");
+    assert!(
+        config.contains(&assignment),
+        "package bundle config does not lock the package input digest"
+    );
+    assert!(
+        lock.contains(&assignment),
+        "image lock does not lock the package input digest"
+    );
+    assert!(
+        producer.contains(&format!("SYSTEM_PACKAGES_SHA256={digest}")),
+        "producer provenance does not bind the package input digest"
+    );
+    assert!(producer.contains("--download-only --no-install-recommends install"));
+    assert!(producer.contains("APT::Install-Recommends=false"));
+}
+
+#[test]
+fn signed_snapshot_fetches_retry_only_bounded_transient_failures() {
+    let producer = fs::read_to_string(script()).unwrap();
+    for required in [
+        "fetch_signed_snapshot",
+        "--retry 4",
+        "--retry-delay 2",
+        "--retry-max-time 60",
+        "--connect-timeout 20",
+    ] {
+        assert!(
+            producer.contains(required),
+            "missing bounded signed-snapshot retry contract: {required}"
+        );
+    }
+    assert!(
+        !producer.contains("--retry-all-errors"),
+        "permanent HTTP errors must not be retried"
+    );
+    assert!(
+        producer.contains("\"$gpgv_bin\" --status-fd 2"),
+        "successful retries must still require signature verification"
+    );
+}
+
+#[test]
+fn downloaded_deb_identity_is_one_unlabeled_nonempty_tuple() {
+    let producer = fs::read_to_string(script()).unwrap();
+    assert!(producer.contains(r#"'--showformat=${Package}\t${Version}\t${Architecture}\n'"#));
+    assert!(!producer.contains(r#"['dpkg-deb','-f',str(deb),'Package','Version','Architecture']"#));
+    for rejection in [
+        r#"raw.count('\n') != 1"#,
+        r#"columns=raw.removesuffix('\n').split('\t')"#,
+        "len(columns) != 3",
+        "not all(columns)",
+        "ord(character) < 32 or ord(character) == 127",
+    ] {
+        assert!(
+            producer.contains(rejection),
+            "missing malformed dpkg-deb output rejection: {rejection}"
+        );
+    }
+}
+
+#[test]
+fn package_cache_is_scoped_to_snapshot_architecture_and_reviewed_input() {
+    let producer = fs::read_to_string(script()).unwrap();
+    for required in [
+        "UBUNTU_PACKAGE_CACHE",
+        "$snapshot-arm64-$system_packages_sha256",
+        "cp -- \"$package_cache\"/*.deb",
+        "cp -- \"$work/apt/cache/archives\"/*.deb",
+        "downloaded deb is not uniquely bound to signed Packages metadata",
+        "payload hash/size mismatch against signed Packages",
+    ] {
+        assert!(
+            producer.contains(required),
+            "missing safe package cache contract: {required}"
+        );
+    }
+}
+
+#[test]
+fn independent_solver_resolves_all_arch_sources_against_native_arm64_dependencies() {
+    let verifier = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("scripts/verify-ubuntu-debian-evidence.py"),
+    )
+    .unwrap();
+    assert!(verifier
+        .contains(r#"return candidate_arch in ("arm64", "all") or multi_arch == "foreign""#));
+    assert!(!verifier
+        .contains(r#"return candidate_arch in (source_arch, "all") or multi_arch == "foreign""#));
+}
+
+#[test]
+fn producer_verification_is_explicitly_fail_closed_and_binds_virtual_roots() {
+    let producer = fs::read_to_string(script()).unwrap();
+    assert!(producer.contains("<<'PY' || return 1"));
+    assert!(producer.contains("\"$debian_verifier\" --verify \"$evidence\" || return 1"));
+    for required in [
+        "root-bindings.tsv",
+        "invalid requested root provider",
+        "missing root package",
+    ] {
+        assert!(
+            producer.contains(required),
+            "missing fail-closed root binding contract: {required}"
+        );
+    }
+    let verify = producer.find("verify_evidence \"$work/evidence\"").unwrap();
+    let output = producer[verify..].find("mkdir -- \"$output\"").unwrap();
+    assert!(output > 0, "output must be created only after verification");
+}
+
+#[test]
+fn independent_verifier_records_exact_t64_root_provider_bindings() {
+    let verifier = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("scripts/verify-ubuntu-debian-evidence.py"),
+    )
+    .unwrap();
+    for required in [
+        "root-bindings.tsv",
+        "ambiguous requested root binding",
+        "provided_version",
+        "libatk-bridge2.0-0",
+        "libatk1.0-0",
+        "libcups2",
+    ] {
+        assert!(
+            verifier.contains(required),
+            "missing independent root binding contract: {required}"
+        );
+    }
 }
 
 #[test]
@@ -207,6 +360,34 @@ fn rejects_version_ambiguity() {
     text.push_str("\n\n");
     rewrite_packages(&fixture, &path, text);
     fixture.assert_rejected("ambiguous");
+}
+
+#[test]
+fn accepts_identical_package_metadata_republished_in_another_signed_index() {
+    let fixture = Fixture::new();
+    let root = fixture.root();
+    let packages = fs::read(root.join("repository/Packages")).unwrap();
+    let source = root.join("signed-indexes/fixture/main/binary-arm64/Packages.xz");
+    let destination = root.join("signed-indexes/fixture/universe/binary-arm64/Packages.xz");
+    fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    fs::copy(&source, &destination).unwrap();
+    let inrelease = root.join("signed-releases/fixture/InRelease");
+    let mut release = fs::read_to_string(&inrelease).unwrap();
+    release.push_str(&format!(
+        " {} {} universe/binary-arm64/Packages\n {} {} universe/binary-arm64/Packages.xz\n",
+        sha_bytes(&packages),
+        packages.len(),
+        sha(&destination),
+        fs::metadata(&destination).unwrap().len()
+    ));
+    fs::write(inrelease, release).unwrap();
+
+    let output = fixture.verify();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

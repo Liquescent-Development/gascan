@@ -12,6 +12,12 @@ import apt_pkg
 
 apt_pkg.init_system()
 
+REVIEWED_ROOT_PROVIDERS = {
+    "libatk-bridge2.0-0": "libatk-bridge2.0-0t64",
+    "libatk1.0-0": "libatk1.0-0t64",
+    "libcups2": "libcups2t64",
+}
+
 
 def fail(message):
     raise SystemExit("ubuntu Debian evidence: " + message)
@@ -38,12 +44,23 @@ def canonical(path, lines, mode):
 
 
 def selected_packages(root):
-    upstream = []
+    upstream_by_identity = {}
     for index in sorted((root / "signed-indexes").rglob("Packages.xz")):
-        upstream.extend(
+        source_items = [
             fields(raw)
             for raw in lzma.decompress(index.read_bytes()).decode().strip().split("\n\n")
-        )
+        ]
+        source_identities = set()
+        for item in source_items:
+            required = ("Package", "Version", "Architecture", "Filename", "SHA256", "Size")
+            if not all(key in item for key in required):
+                fail("incomplete signed Packages stanza")
+            identity = tuple(item[key] for key in required)
+            if identity in source_identities:
+                fail("ambiguous signed Packages metadata in one index")
+            source_identities.add(identity)
+            upstream_by_identity.setdefault(identity, item)
+    upstream = list(upstream_by_identity.values())
     result = {}
     for line in (root / "package-manifest.tsv").read_text().splitlines():
         name, version, arch, filename, sha, size = line.split("\t")
@@ -85,7 +102,7 @@ def recompute(root, selected):
             if qualifier == "any":
                 return candidate_arch in ("arm64", "all") and multi_arch == "allowed"
             return candidate_arch in (qualifier, "all")
-        return candidate_arch in (source_arch, "all") or multi_arch == "foreign"
+        return candidate_arch in ("arm64", "all") or multi_arch == "foreign"
     requirements = []
     edges = []
     for source, item in sorted(selected.items()):
@@ -121,6 +138,32 @@ def recompute(root, selected):
                 chosen = min(candidates, key=lambda value: (value[0], value[1]))[1]
                 edges.append("\t".join((*requirement, *chosen)))
     return requirements, edges
+
+
+def bind_roots(root, selected, mode):
+    lines = []
+    for requested in (root / "roots.txt").read_text().splitlines():
+        direct = [(key, item) for key, item in selected.items() if key[0] == requested]
+        candidates = direct
+        if not candidates and requested in REVIEWED_ROOT_PROVIDERS:
+            expected = REVIEWED_ROOT_PROVIDERS[requested]
+            candidates = []
+            for key, item in selected.items():
+                if key[0] != expected:
+                    continue
+                for group in apt_pkg.parse_depends(item.get("Provides", ""), False, "arm64"):
+                    for provided, provided_version, operator in group:
+                        if (
+                            provided.split(":", 1)[0] == requested
+                            and operator == "="
+                            and provided_version == key[1]
+                        ):
+                            candidates.append((key, item))
+        if len(candidates) != 1:
+            fail("ambiguous requested root binding" if candidates else "missing root package")
+        key, _item = candidates[0]
+        lines.append("\t".join((requested, *key)))
+    canonical(root / "root-bindings.tsv", lines, mode)
 
 
 def offline_check(root, selected):
@@ -167,6 +210,7 @@ if len(sys.argv) != 3 or sys.argv[1] not in ("--write", "--verify"):
 mode, root = sys.argv[1], Path(sys.argv[2])
 verify_roots(root, mode)
 selected = selected_packages(root)
+bind_roots(root, selected, mode)
 requirements, edges = recompute(root, selected)
 canonical(root / "dependency-requirements.tsv", requirements, mode)
 canonical(root / "dependency-edges.tsv", edges, mode)
