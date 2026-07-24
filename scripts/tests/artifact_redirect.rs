@@ -10,7 +10,10 @@ use gascan_image_tools::{
 };
 use reqwest::Url;
 use sha2::{Digest, Sha256, Sha512};
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::{
+    os::unix::fs::{PermissionsExt, symlink},
+    process::Command,
+};
 
 #[test]
 fn unapproved_intermediate_redirect_is_rejected_before_contact() {
@@ -134,4 +137,33 @@ fn npm_sri_publication_is_read_only_and_cache_links_or_mutations_are_rejected() 
     std::fs::remove_file(&destination).unwrap();
     std::fs::write(&destination, b"mutated").unwrap();
     assert!(validate_cached_sri_artifact(&destination, &integrity, 1024).is_err());
+}
+
+#[test]
+fn native_warm_cache_hard_link_is_rejected_before_binary_chmod_or_reuse() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cached = temporary.path().join("native");
+    let peer = temporary.path().join("peer");
+    let bytes = b"locked native";
+    std::fs::write(&cached, bytes).unwrap();
+    std::fs::hard_link(&cached, &peer).unwrap();
+    std::fs::set_permissions(&cached, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_fetch-image-artifact"))
+        .args([
+            "workstation-github",
+            "https://github.com/example/unreachable",
+            &format!("{:x}", Sha256::digest(bytes)),
+        ])
+        .arg(&cached)
+        .arg(bytes.len().to_string())
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("NO_PROXY", "")
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "hard-linked cache was reused");
+    assert_eq!(
+        std::fs::metadata(peer).unwrap().permissions().mode() & 0o777,
+        0o644,
+        "downloader chmod mutated the peer hard link"
+    );
 }

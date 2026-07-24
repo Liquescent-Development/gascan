@@ -180,7 +180,8 @@ pub fn validate_cached_artifact(
     let mut options = CapOpenOptions::new();
     options.read(true)._cap_fs_ext_follow(FollowSymlinks::No);
     let mut file = parent.open_with(&name, &options)?;
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
         return Err("cached artifact is not a regular file".into());
     }
     let (size, sha256) = hash_reader(&mut file, expected_size)?;

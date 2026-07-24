@@ -3,6 +3,8 @@ use std::{
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command, Output},
+    thread,
+    time::{Duration, Instant},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -145,14 +147,18 @@ impl Fixture {
     }
 
     fn run(&self) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_prepare-workspace-context"))
+        self.command().output().unwrap()
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_prepare-workspace-context"));
+        command
             .args(["--mode", "connected", "--replace"])
             .arg(&self.repository)
             .arg(&self.lock)
             .arg(&self.cache)
-            .arg(&self.context)
-            .output()
-            .unwrap()
+            .arg(&self.context);
+        command
     }
 
     fn verify(&self) -> Output {
@@ -611,6 +617,58 @@ fn workstation_lock_change_after_prefetch_and_traversal_are_rejected() {
 }
 
 #[test]
+fn repository_npm_bytes_changed_after_validation_cannot_be_published() {
+    let fixture = Fixture::new();
+    let validated = fs::read(
+        fixture
+            .repository
+            .join("images/workspace/workstation-package.json"),
+    )
+    .unwrap();
+    let mut child = fixture.command().spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let staging_exists = fs::read_dir(fixture.context.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".connected-workspace-context-")
+            });
+        if staging_exists {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "context staging was never created"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "assembler exited before race"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    fs::write(
+        fixture
+            .repository
+            .join("images/workspace/workstation-package.json"),
+        b"{\"name\":\"mutated-after-validation\"}\n",
+    )
+    .unwrap();
+    let status = child.wait().unwrap();
+    assert!(
+        status.success(),
+        "assembler did not preserve validated bytes"
+    );
+    assert_eq!(
+        fs::read(fixture.context.join("workstation/package.json")).unwrap(),
+        validated
+    );
+}
+
+#[test]
 fn workstation_cache_publication_preserves_old_on_failure_and_exchanges_valid_tree() {
     let invalid = Fixture::new();
     let staging = invalid.temporary.path().join("invalid-staging");
@@ -645,6 +703,23 @@ fn workstation_cache_publication_preserves_old_on_failure_and_exchanges_valid_tr
         fs::read(destination.join("herdr")).unwrap(),
         b"herdr fixture\n"
     );
+}
+
+#[test]
+fn workstation_cache_exchange_uses_the_instrumented_dual_parent_durability_sequence() {
+    let source = include_str!("../src/bin/prepare-workspace-context.rs");
+    for required in [
+        "PublicationAction::Exchange",
+        "PublicationAction::SyncSourceParent",
+        "PublicationAction::SyncDestinationParent",
+        "PublicationAction::RemoveOld",
+        "run_publication_actions",
+    ] {
+        assert!(
+            source.contains(required),
+            "missing durability action {required}"
+        );
+    }
 }
 
 #[test]

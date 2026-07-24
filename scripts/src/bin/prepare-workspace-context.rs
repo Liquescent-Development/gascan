@@ -893,12 +893,13 @@ fn assemble_connected(
     cache_path: &Path,
     destination: &Path,
 ) -> Result<(), DynError> {
-    let lock_contents = fs::read_to_string(repository_path.join("images/workspace/versions.lock"))?;
-    let inputs = workstation_inputs(
-        &lock_contents,
-        &fs::read(repository_path.join("images/workspace/workstation-package.json"))?,
-        &fs::read(repository_path.join("images/workspace/workstation-package-lock.json"))?,
-    )?;
+    let lock_bytes = fs::read(repository_path.join("images/workspace/versions.lock"))?;
+    let lock_contents = std::str::from_utf8(&lock_bytes)?;
+    let package_manifest =
+        fs::read(repository_path.join("images/workspace/workstation-package.json"))?;
+    let package_lock =
+        fs::read(repository_path.join("images/workspace/workstation-package-lock.json"))?;
+    let inputs = workstation_inputs(lock_contents, &package_manifest, &package_lock)?;
     validate_workstation_cache(cache_path, &inputs)?;
     let repository = Dir::open_ambient_dir(repository_path, ambient_authority())?;
     let cache = Dir::open_ambient_dir(cache_path, ambient_authority())?;
@@ -928,12 +929,12 @@ fn assemble_connected(
     ] {
         copy_tree_reviewed(&repository, Path::new(source), &staging.join(source))?;
     }
-    for source in [
-        "images/workspace/versions.lock",
-        "tests/image/system-tools.txt",
-    ] {
-        copy_regular(&repository, Path::new(source), staging.join(source))?;
-    }
+    write_validated_bytes(&staging.join("images/workspace/versions.lock"), &lock_bytes)?;
+    copy_regular(
+        &repository,
+        Path::new("tests/image/system-tools.txt"),
+        staging.join("tests/image/system-tools.txt"),
+    )?;
     for source in ["mise-linux-arm64", "expected-tool-versions.json"] {
         copy_regular(
             &cache,
@@ -962,15 +963,10 @@ fn assemble_connected(
         Path::new("workstation/npm-cache"),
         &staging.join("workstation/npm-cache"),
     )?;
-    copy_regular(
-        &repository,
-        Path::new("images/workspace/workstation-package.json"),
-        staging.join("workstation/package.json"),
-    )?;
-    copy_regular(
-        &repository,
-        Path::new("images/workspace/workstation-package-lock.json"),
-        staging.join("workstation/package-lock.json"),
+    write_validated_bytes(&staging.join("workstation/package.json"), &package_manifest)?;
+    write_validated_bytes(
+        &staging.join("workstation/package-lock.json"),
+        &package_lock,
     )?;
     validate_dockerfile_copy_sources(staging)?;
     make_tree_read_only(staging)?;
@@ -980,6 +976,20 @@ fn assemble_connected(
     let kept = temporary.keep();
     parent.rename(&staging_name, &parent, destination_name)?;
     drop(kept);
+    Ok(())
+}
+
+fn write_validated_bytes(destination: &Path, bytes: &[u8]) -> Result<(), DynError> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    output.write_all(bytes)?;
+    output.sync_all()?;
+    fs::set_permissions(destination, fs::Permissions::from_mode(0o444))?;
     Ok(())
 }
 
@@ -1018,47 +1028,73 @@ fn validate_workstation_cache(
     validate_workstation_payload(&root, inputs)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicationAction {
+    Rename,
+    Exchange,
+    SyncSourceParent,
+    SyncDestinationParent,
+    RemoveOld,
+}
+
+fn run_publication_actions(
+    destination_exists: bool,
+    mut perform: impl FnMut(PublicationAction) -> Result<(), DynError>,
+) -> Result<(), DynError> {
+    if destination_exists {
+        perform(PublicationAction::Exchange)?;
+    } else {
+        perform(PublicationAction::Rename)?;
+    }
+    perform(PublicationAction::SyncSourceParent)?;
+    perform(PublicationAction::SyncDestinationParent)?;
+    if destination_exists {
+        perform(PublicationAction::RemoveOld)?;
+        perform(PublicationAction::SyncSourceParent)?;
+    }
+    Ok(())
+}
+
 fn publish_workstation_cache(source: &Path, destination: &Path) -> Result<(), DynError> {
     let source_metadata = fs::symlink_metadata(source)?;
     if !source_metadata.is_dir() || source_metadata.file_type().is_symlink() {
         return Err("staged workstation cache is not a real directory".into());
     }
-    match fs::symlink_metadata(destination) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::rename(source, destination)?;
-            Dir::open_ambient_dir(
-                destination
-                    .parent()
-                    .ok_or("cache destination has no parent")?,
-                ambient_authority(),
-            )?
-            .into_std_file()
-            .sync_all()?;
-        }
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-            let source_parent_path = source.parent().ok_or("staged cache has no parent")?;
-            let destination_parent_path = destination
-                .parent()
-                .ok_or("cache destination has no parent")?;
-            let source_parent = Dir::open_ambient_dir(source_parent_path, ambient_authority())?;
-            let destination_parent =
-                Dir::open_ambient_dir(destination_parent_path, ambient_authority())?;
-            rustix::fs::renameat_with(
-                source_parent.as_fd(),
-                single_name(source)?,
-                destination_parent.as_fd(),
-                single_name(destination)?,
-                rustix::fs::RenameFlags::EXCHANGE,
-            )?;
-            destination_parent.into_std_file().sync_all()?;
-            if make_tree_owner_writable(source).is_ok() {
-                let _ignored = fs::remove_dir_all(source);
-            }
-        }
+    let destination_exists = match fs::symlink_metadata(destination) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => true,
         Ok(_) => return Err("workstation cache destination is not a real directory".into()),
         Err(error) => return Err(error.into()),
-    }
-    Ok(())
+    };
+    let source_parent_path = source.parent().ok_or("staged cache has no parent")?;
+    let destination_parent_path = destination
+        .parent()
+        .ok_or("cache destination has no parent")?;
+    let source_parent = Dir::open_ambient_dir(source_parent_path, ambient_authority())?;
+    let destination_parent = Dir::open_ambient_dir(destination_parent_path, ambient_authority())?;
+    let source_name = single_name(source)?;
+    let destination_name = single_name(destination)?;
+    run_publication_actions(destination_exists, |action| {
+        match action {
+            PublicationAction::Rename => {
+                source_parent.rename(source_name, &destination_parent, destination_name)?;
+            }
+            PublicationAction::Exchange => rustix::fs::renameat_with(
+                source_parent.as_fd(),
+                source_name,
+                destination_parent.as_fd(),
+                destination_name,
+                rustix::fs::RenameFlags::EXCHANGE,
+            )?,
+            PublicationAction::SyncSourceParent => rustix::fs::fsync(&source_parent)?,
+            PublicationAction::SyncDestinationParent => rustix::fs::fsync(&destination_parent)?,
+            PublicationAction::RemoveOld => {
+                make_tree_owner_writable(source)?;
+                fs::remove_dir_all(source)?;
+            }
+        }
+        Ok(())
+    })
 }
 
 fn validate_connected_context_inputs(
@@ -1450,4 +1486,44 @@ fn required(
         .next()
         .map(PathBuf::from)
         .ok_or_else(|| format!("missing {name}").into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PublicationAction, run_publication_actions};
+
+    #[test]
+    fn publication_action_sequence_syncs_every_changed_parent_before_and_after_cleanup() {
+        let mut absent = Vec::new();
+        run_publication_actions(false, |action| {
+            absent.push(action);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            absent,
+            [
+                PublicationAction::Rename,
+                PublicationAction::SyncSourceParent,
+                PublicationAction::SyncDestinationParent,
+            ]
+        );
+
+        let mut exchange = Vec::new();
+        run_publication_actions(true, |action| {
+            exchange.push(action);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            exchange,
+            [
+                PublicationAction::Exchange,
+                PublicationAction::SyncSourceParent,
+                PublicationAction::SyncDestinationParent,
+                PublicationAction::RemoveOld,
+                PublicationAction::SyncSourceParent,
+            ]
+        );
+    }
 }
