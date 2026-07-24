@@ -765,12 +765,22 @@ fn actual_name(value: i32) -> &'static str {
         _ => "unknown",
     }
 }
+fn status_json(status: &v1::SandboxStatus) -> serde_json::Value {
+    serde_json::json!({
+        "sandbox_id": status.sandbox_id,
+        "actual_state": actual_name(status.actual_state),
+        "apply_requirements": status.apply_requirements.iter().map(|requirement| {
+            serde_json::json!({
+                "reason": requirement.reason,
+                "current": requirement.current,
+                "requested": requirement.requested,
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
 fn render_status(status: &v1::SandboxStatus, json: bool) -> Result<(), CliError> {
     if json {
-        println!(
-            "{}",
-            serde_json::json!({"sandbox_id":status.sandbox_id,"actual_state":actual_name(status.actual_state)})
-        );
+        println!("{}", status_json(status));
     } else {
         print!(
             "{}",
@@ -781,7 +791,7 @@ fn render_status(status: &v1::SandboxStatus, json: bool) -> Result<(), CliError>
 }
 fn render_list(sandboxes: &[v1::SandboxStatus], json: bool) -> Result<(), CliError> {
     if json {
-        let values = sandboxes.iter().map(|s| serde_json::json!({"sandbox_id":s.sandbox_id,"actual_state":actual_name(s.actual_state)})).collect::<Vec<_>>();
+        let values = sandboxes.iter().map(status_json).collect::<Vec<_>>();
         println!(
             "{}",
             serde_json::to_string(&values).map_err(|e| CliError::Runtime(e.to_string()))?
@@ -826,6 +836,35 @@ mod tests {
         assert!(
             help.contains("-V, --version"),
             "version option missing: {help}"
+        );
+    }
+
+    #[test]
+    fn status_json_preserves_exact_image_references() {
+        let current = "registry.example/workspace:old@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let requested = "registry.example/workspace:new@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let status = v1::SandboxStatus {
+            sandbox_id: "code-123".to_owned(),
+            actual_state: v1::ActualState::Running as i32,
+            apply_requirements: vec![v1::ApplyRequirement {
+                reason: "image_changed".to_owned(),
+                current: current.to_owned(),
+                requested: requested.to_owned(),
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            status_json(&status),
+            serde_json::json!({
+                "sandbox_id": "code-123",
+                "actual_state": "running",
+                "apply_requirements": [{
+                    "reason": "image_changed",
+                    "current": current,
+                    "requested": requested,
+                }],
+            })
         );
     }
 

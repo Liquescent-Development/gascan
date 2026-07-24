@@ -1,7 +1,7 @@
 use gascan_proto::{
-    API_MAJOR, AttachSessionBinder, AttachSessionError, CheckedEventSequence, CheckedOperationId,
-    EventSequenceError, FILE_DESCRIPTOR_SET, HandshakeRejection, OperationIdError,
-    SESSION_TOKEN_EMPTY, SOCKET_DIRECTORY_MODE, SOCKET_MODE, SessionTokenError,
+    API_MAJOR, API_MINOR, AttachSessionBinder, AttachSessionError, CheckedEventSequence,
+    CheckedOperationId, EventSequenceError, FILE_DESCRIPTOR_SET, HandshakeRejection,
+    OperationIdError, SESSION_TOKEN_EMPTY, SOCKET_DIRECTORY_MODE, SOCKET_MODE, SessionTokenError,
     TransportSecurityError, local_transport_security, validate_api_major, validate_session_token,
     validate_transport_security,
 };
@@ -232,10 +232,111 @@ fn public_error_codes_are_stable_and_unique() {
     assert!(codes.contains(&"disk_control_unsupported"));
     assert!(codes.contains(&"sandbox_not_found"));
     assert!(codes.contains(&"operation_conflict"));
+    assert!(codes.contains(&"image_upgrade_required"));
+    assert!(codes.contains(&"image_replacement_failed"));
     assert_eq!(
         codes.len(),
         codes.iter().copied().collect::<HashSet<_>>().len()
     );
+}
+
+#[test]
+fn image_upgrade_is_an_additive_api_minor_change() {
+    assert_eq!(API_MAJOR, 1);
+    assert_eq!(API_MINOR, 2);
+
+    let descriptor =
+        FileDescriptorSet::decode(FILE_DESCRIPTOR_SET).expect("descriptor must decode");
+    let file = api_file(&descriptor);
+    assert_message_exact(
+        file,
+        "ApplyRequirement",
+        &[
+            (
+                "reason",
+                1,
+                field_descriptor_proto::Type::String,
+                field_descriptor_proto::Label::Optional,
+                None,
+                None,
+            ),
+            (
+                "current",
+                2,
+                field_descriptor_proto::Type::String,
+                field_descriptor_proto::Label::Optional,
+                None,
+                None,
+            ),
+            (
+                "requested",
+                3,
+                field_descriptor_proto::Type::String,
+                field_descriptor_proto::Label::Optional,
+                None,
+                None,
+            ),
+        ],
+        &[],
+        &[(4, 5)],
+    );
+
+    let sandbox = message(file, "SandboxStatus");
+    assert_field(
+        sandbox,
+        "sandbox_id",
+        1,
+        field_descriptor_proto::Type::String,
+        None,
+    );
+    assert_field(
+        sandbox,
+        "capabilities",
+        6,
+        field_descriptor_proto::Type::Message,
+        None,
+    );
+    assert_field(
+        sandbox,
+        "apply_requirements",
+        8,
+        field_descriptor_proto::Type::Message,
+        None,
+    );
+    assert_type_name(sandbox, "apply_requirements", ".gascan.v1.ApplyRequirement");
+    assert_eq!(
+        sandbox
+            .reserved_range
+            .iter()
+            .map(|range| (range.start, range.end))
+            .collect::<Vec<_>>(),
+        vec![(Some(7), Some(8))]
+    );
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct OldSandboxStatus {
+    #[prost(string, tag = "1")]
+    sandbox_id: String,
+}
+
+#[test]
+fn old_clients_ignore_apply_requirements() {
+    let current = "old@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let requested = "new@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let encoded = gascan_proto::v1::SandboxStatus {
+        sandbox_id: "code-123".to_owned(),
+        apply_requirements: vec![gascan_proto::v1::ApplyRequirement {
+            reason: "future_reason".to_owned(),
+            current: current.to_owned(),
+            requested: requested.to_owned(),
+        }],
+        ..Default::default()
+    }
+    .encode_to_vec();
+
+    let old = OldSandboxStatus::decode(encoded.as_slice()).expect("old status must decode");
+    assert_eq!(old.sandbox_id, "code-123");
 }
 
 #[test]
@@ -686,6 +787,16 @@ fn v1_descriptor_exactly_covers_every_exported_message_enum_and_rpc() {
             &[(2, 3)],
         ),
         (
+            "ApplyRequirement",
+            &[
+                f!("reason", 1, String),
+                f!("current", 2, String),
+                f!("requested", 3, String),
+            ],
+            &[],
+            &[(4, 5)],
+        ),
+        (
             "SandboxStatus",
             &[
                 f!("sandbox_id", 1, String),
@@ -728,6 +839,14 @@ fn v1_descriptor_exactly_covers_every_exported_message_enum_and_rpc() {
                     R,
                     None,
                     Some(".gascan.v1.Capability")
+                ),
+                f!(
+                    "apply_requirements",
+                    8,
+                    Message,
+                    R,
+                    None,
+                    Some(".gascan.v1.ApplyRequirement")
                 ),
             ],
             &[],

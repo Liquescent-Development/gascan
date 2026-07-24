@@ -5,7 +5,7 @@ use crate::{
 use camino::Utf8PathBuf;
 use gascan_core::doctor::DoctorStatus;
 use gascan_core::manifest::Manifest;
-use gascan_core::runtime::RuntimeBackend;
+use gascan_core::runtime::{RuntimeBackend, immutable_image_reference};
 use gascan_core::sandbox::{SandboxError, SandboxId, SandboxSpec};
 use gascan_proto::v1;
 use gascan_proto::v1::gas_can_server::{GasCan, GasCanServer};
@@ -581,6 +581,7 @@ fn wire_event(event: StoredEvent) -> v1::OperationEvent {
 }
 
 fn wire_status(record: crate::SandboxRecord) -> v1::SandboxStatus {
+    const APPROVED_IMAGE: &str = include_str!("../../../images/workspace/approved-image.txt");
     let desired_state = match record.desired_state {
         DesiredState::Running => v1::DesiredState::Running,
         DesiredState::Stopped => v1::DesiredState::Stopped,
@@ -592,6 +593,22 @@ fn wire_status(record: crate::SandboxRecord) -> v1::SandboxStatus {
         ActualState::Stopped => v1::ActualState::Stopped,
         ActualState::Absent => v1::ActualState::Absent,
     } as i32;
+    let apply_requirements = record
+        .image_resolution
+        .as_ref()
+        .filter(|resolution| resolution.version == 1)
+        .and_then(|resolution| resolution.details.get("digest"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|current| immutable_image_reference(current))
+        .filter(|current| *current != APPROVED_IMAGE)
+        .map(|current| {
+            vec![v1::ApplyRequirement {
+                reason: "image_changed".to_owned(),
+                current: current.to_owned(),
+                requested: APPROVED_IMAGE.to_owned(),
+            }]
+        })
+        .unwrap_or_default();
     v1::SandboxStatus {
         sandbox_id: record.id.to_string(),
         desired_state,
@@ -601,6 +618,7 @@ fn wire_status(record: crate::SandboxRecord) -> v1::SandboxStatus {
         }),
         updated_at: Some(timestamp_from_millis(record.updated_at_millis)),
         capabilities: Vec::new(),
+        apply_requirements,
     }
 }
 
@@ -2676,6 +2694,36 @@ mod tests {
             Some((1_725_000_001, 456_000_000))
         );
         Ok(())
+    }
+
+    #[test]
+    fn wire_status_exposes_durable_image_upgrade_requirement() {
+        let root = Utf8PathBuf::from("/workspace/image-upgrade");
+        let current = "registry.example/workspace:old@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let status = wire_status(SandboxRecord {
+            id: SandboxId::from_root("image-upgrade", &root),
+            canonical_root: root,
+            desired_state: DesiredState::Running,
+            actual_state: ActualState::Running,
+            setup_resolution: None,
+            tool_resolution: None,
+            image_resolution: Some(crate::ImageResolution::new(
+                1,
+                serde_json::json!({"digest": current}),
+            )),
+            storage_resolution: None,
+            last_operation_id: None,
+            updated_at_millis: 1,
+        });
+
+        assert_eq!(
+            status.apply_requirements,
+            vec![v1::ApplyRequirement {
+                reason: "image_changed".to_owned(),
+                current: current.to_owned(),
+                requested: include_str!("../../../images/workspace/approved-image.txt").to_owned(),
+            }]
+        );
     }
 
     #[test]

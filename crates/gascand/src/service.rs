@@ -990,6 +990,12 @@ impl<B: RuntimeBackend> SandboxService<B> {
         }
         let (container, retained) = self.retained_resources(create).await?;
         let rollback_retained = retained.clone();
+        self.emit(
+            operation_id,
+            json!({"phase":"image_replacing","image":create.image()}),
+            sender,
+        )
+        .await?;
         let mut mutation_started = false;
         let result = async {
             mutation_started = true;
@@ -1755,8 +1761,8 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 Ok(provisioned) => provisioned,
                 Err(error) => {
                     let actual = self.runtime_actual(&id, prior_actual).await;
-                    let code = error.code();
-                    let details = failure_details(&error);
+                    let code = gascan_proto::error_code::IMAGE_REPLACEMENT_FAILED;
+                    let details = image_replacement_failure_details(&error);
                     if let Err(reporting) = self
                         .database(move |store| {
                             store.fail_operation(operation.id, actual, code, details)
@@ -1834,8 +1840,8 @@ impl<B: RuntimeBackend> SandboxService<B> {
                     },
                 };
                 let actual = self.runtime_actual(&id, prior_actual).await;
-                let code = failure.code();
-                let details = failure_details(&failure);
+                let code = gascan_proto::error_code::IMAGE_REPLACEMENT_FAILED;
+                let details = image_replacement_failure_details(&failure);
                 let terminal = self
                     .database(move |store| {
                         store.fail_operation_with_event(operation.id, actual, code, details)
@@ -2338,6 +2344,26 @@ pub(crate) fn failure_details(error: &ServiceError) -> Value {
     }
 }
 
+fn image_replacement_failure_details(error: &ServiceError) -> Value {
+    let (primary, rollback) = match error {
+        ServiceError::ImageRollback { original, rollback } => {
+            (original.as_ref(), Some(rollback.as_ref()))
+        }
+        other => (other, None),
+    };
+    json!({
+        "message": error.to_string(),
+        "primary": {
+            "code": primary.code(),
+            "message": primary.to_string(),
+        },
+        "rollback": rollback.map(|rollback| json!({
+            "code": rollback.code(),
+            "message": rollback.to_string(),
+        })),
+    })
+}
+
 type StorageCapacities = [(&'static str, u64); 3];
 
 fn storage_resolution(requested: StorageCapacities) -> StorageResolution {
@@ -2715,7 +2741,7 @@ async fn desired_fingerprint(spec: &SandboxSpec) -> Result<String, ServiceError>
 mod storage_tests {
     use super::{
         BoundedTail, NoopProvisioner, SandboxService, ServiceError, Store,
-        requested_storage_from_volumes,
+        image_replacement_failure_details, requested_storage_from_volumes,
     };
     use camino::Utf8Path;
     use gascan_core::fake_runtime::FakeRuntime;
@@ -2748,6 +2774,29 @@ mod storage_tests {
                 "managed volume is missing from compiled create request"
             ))
         ));
+    }
+
+    #[test]
+    fn image_replacement_failure_details_preserve_primary_and_rollback() {
+        let error = ServiceError::ImageRollback {
+            original: Box::new(ServiceError::Provision("primary failure".to_owned())),
+            rollback: Box::new(ServiceError::Provision("rollback failure".to_owned())),
+        };
+
+        assert_eq!(
+            image_replacement_failure_details(&error),
+            serde_json::json!({
+                "message": error.to_string(),
+                "primary": {
+                    "code": "provision_failed",
+                    "message": "provisioning failed: primary failure",
+                },
+                "rollback": {
+                    "code": "provision_failed",
+                    "message": "provisioning failed: rollback failure",
+                },
+            })
+        );
     }
 
     #[tokio::test]

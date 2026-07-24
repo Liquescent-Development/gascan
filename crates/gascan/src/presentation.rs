@@ -160,11 +160,39 @@ pub(crate) fn render_status(
     status: &v1::SandboxStatus,
     _capabilities: OutputCapabilities,
 ) -> String {
-    format!(
+    let mut output = format!(
         "Sandbox: {}\nState:   {}\n",
         status.sandbox_id,
         human_state(status.actual_state)
-    )
+    );
+    let image_changes = status
+        .apply_requirements
+        .iter()
+        .filter(|requirement| requirement.reason == "image_changed")
+        .collect::<Vec<_>>();
+    if !image_changes.is_empty() {
+        output.push_str("\nUpdate available\n");
+        for requirement in image_changes {
+            let _ = writeln!(
+                output,
+                "  Workspace image  {} → {}",
+                short_image_reference(&requirement.current),
+                short_image_reference(&requirement.requested)
+            );
+        }
+        output.push_str("  Run gascan apply\n");
+    }
+    output
+}
+
+fn short_image_reference(reference: &str) -> String {
+    let leaf = reference.rsplit('/').next().unwrap_or(reference);
+    let compact = leaf.split_once(':').map_or(leaf, |(_, tagged)| tagged);
+    let Some((name, digest)) = compact.split_once("@sha256:") else {
+        return compact.to_owned();
+    };
+    let digest = digest.chars().take(12).collect::<String>();
+    format!("{name}@sha256:{digest}…")
 }
 
 pub(crate) fn render_list(
@@ -320,6 +348,9 @@ impl OperationProgress {
             ("created", _) => Some("Creating sandbox"),
             ("started", _) => Some("Starting sandbox"),
             ("apply_required", _) => Some("Preparing configuration changes"),
+            ("before_image_replace", _) => Some("Preparing workspace image"),
+            ("image_replacing", _) => Some("Replacing sandbox container"),
+            ("image_rollback", _) => Some("Restoring previous workspace image"),
             ("before_health", _) => Some("Checking sandbox health"),
             ("provision_step", Some(v1::ProvisionStep::WriteSafeMiseConfig)) => {
                 Some("Writing safe mise configuration")
@@ -538,6 +569,36 @@ mod tests {
     }
 
     #[test]
+    fn status_reports_image_update_with_truncated_digests() {
+        let mut status = status("code-123", v1::ActualState::Running);
+        status.apply_requirements.push(v1::ApplyRequirement {
+            reason: "image_changed".to_owned(),
+            current: "registry.example/workspace:old@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            requested: "registry.example/workspace:new@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+        });
+
+        assert_eq!(
+            render_status(&status, OutputCapabilities::plain()),
+            "Sandbox: code-123\nState:   Running\n\nUpdate available\n  Workspace image  old@sha256:aaaaaaaaaaaa… → new@sha256:bbbbbbbbbbbb…\n  Run gascan apply\n"
+        );
+    }
+
+    #[test]
+    fn unknown_apply_requirements_do_not_reach_human_output() {
+        let mut status = status("code-123", v1::ActualState::Running);
+        status.apply_requirements.push(v1::ApplyRequirement {
+            reason: "future_reason".to_owned(),
+            current: "private-current".to_owned(),
+            requested: "private-requested".to_owned(),
+        });
+
+        assert_eq!(
+            render_status(&status, OutputCapabilities::plain()),
+            "Sandbox: code-123\nState:   Running\n"
+        );
+    }
+
+    #[test]
     fn list_is_an_aligned_two_column_table() {
         let sandboxes = vec![
             status("code-1", v1::ActualState::Running),
@@ -641,6 +702,24 @@ mod tests {
         let mut unknown = event("private_internal_phase");
         unknown.payload = b"secret-material".to_vec();
         assert_eq!(progress.update(&unknown), None);
+    }
+
+    #[test]
+    fn image_replacement_phases_use_professional_progress_copy() {
+        let (mut progress, _) =
+            OperationProgress::new(OperationKind::Apply, None, OutputCapabilities::plain());
+        assert_eq!(
+            progress.update(&event("before_image_replace")).as_deref(),
+            Some("Preparing workspace image")
+        );
+        assert_eq!(
+            progress.update(&event("image_replacing")).as_deref(),
+            Some("Replacing sandbox container")
+        );
+        assert_eq!(
+            progress.update(&event("image_rollback")).as_deref(),
+            Some("Restoring previous workspace image")
+        );
     }
 
     #[test]

@@ -1,4 +1,7 @@
-use gascan_proto::v1::{ApplyRequest, HandshakeRequest, UpRequest, gas_can_client::GasCanClient};
+use gascan_proto::v1::{
+    ApplyRequest, HandshakeRequest, ListRequest, SandboxSelector, StatusRequest, UpRequest,
+    gas_can_client::GasCanClient,
+};
 use gascand::{ActivityTracker, Daemon, DaemonConfig, SocketPaths};
 use std::time::Duration;
 use tempfile::TempDir;
@@ -119,6 +122,8 @@ async fn raw_liveness_probe_disconnect_does_not_end_server() -> TestResult {
             .await?
             .into_inner();
         assert!(response.rejection.is_none());
+        assert_eq!(response.api_major, 1);
+        assert_eq!(response.api_minor, 2);
         assert_eq!(response.daemon_instance_token.len(), 64);
         assert_eq!(
             response.daemon_pid,
@@ -196,6 +201,37 @@ async fn real_uds_tonic_lifecycle_request_reaches_sandbox_service() -> TestResul
     assert_eq!(
         terminal,
         Some(gascan_proto::v1::OperationStatus::Completed as i32)
+    );
+    let sandbox_id = client
+        .list(ListRequest {})
+        .await?
+        .into_inner()
+        .sandboxes
+        .into_iter()
+        .next()
+        .ok_or("created sandbox missing from list")?
+        .sandbox_id;
+    let current = "registry.example/workspace:old@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let connection = rusqlite::Connection::open(runtime_root.join("state.sqlite3"))?;
+    connection.execute(
+        "UPDATE sandboxes SET image_resolution_version = 1, image_resolution_details = ?1",
+        [serde_json::json!({"digest": current}).to_string()],
+    )?;
+    drop(connection);
+    let status = client
+        .status(StatusRequest {
+            sandbox: Some(SandboxSelector { sandbox_id }),
+        })
+        .await?
+        .into_inner()
+        .sandbox
+        .ok_or("status response missing sandbox")?;
+    assert_eq!(status.apply_requirements.len(), 1);
+    assert_eq!(status.apply_requirements[0].reason, "image_changed");
+    assert_eq!(status.apply_requirements[0].current, current);
+    assert_eq!(
+        status.apply_requirements[0].requested,
+        include_str!("../../../images/workspace/approved-image.txt")
     );
     let pid = rustix::process::Pid::from_raw(child.id().ok_or("daemon has no process id")? as i32)
         .ok_or("daemon process id is zero")?;

@@ -5,7 +5,7 @@
 /// Supported API major version.
 pub const API_MAJOR: u32 = 1;
 /// Current backwards-compatible API minor version.
-pub const API_MINOR: u32 = 1;
+pub const API_MINOR: u32 = 2;
 /// Required POSIX permission bits for the local socket directory (`0700`).
 pub const SOCKET_DIRECTORY_MODE: u32 = 0o700;
 /// Required POSIX permission bits for the local socket (`0600`).
@@ -27,6 +27,10 @@ pub mod error_code {
     pub const DISK_CONTROL_UNSUPPORTED: &str = "disk_control_unsupported";
     /// Existing managed storage differs from the requested immutable capacity.
     pub const STORAGE_CHANGE_REQUIRES_RECREATE: &str = "storage_change_requires_recreate";
+    /// The workspace image differs and must be applied before continuing.
+    pub const IMAGE_UPGRADE_REQUIRED: &str = "image_upgrade_required";
+    /// Replacing the workspace image failed.
+    pub const IMAGE_REPLACEMENT_FAILED: &str = "image_replacement_failed";
     /// The selected sandbox does not exist.
     pub const SANDBOX_NOT_FOUND: &str = "sandbox_not_found";
     /// Another operation prevents this request from running.
@@ -52,6 +56,8 @@ pub mod error_code {
         INVALID_PROJECT_ROOT,
         DISK_CONTROL_UNSUPPORTED,
         STORAGE_CHANGE_REQUIRES_RECREATE,
+        IMAGE_UPGRADE_REQUIRED,
+        IMAGE_REPLACEMENT_FAILED,
         SANDBOX_NOT_FOUND,
         OPERATION_CONFLICT,
         BACKEND_UNAVAILABLE,
