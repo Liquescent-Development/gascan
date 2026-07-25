@@ -769,6 +769,26 @@ fn stored_ssh_transport_policy(
     )?)
 }
 
+fn make_ssh_transport_unknown_and_provisioning_incomplete(
+    state_path: &Utf8Path,
+    id: &gascan_core::sandbox::SandboxId,
+) -> TestResult {
+    let connection = rusqlite::Connection::open(state_path)?;
+    let updated = connection.execute(
+        "UPDATE sandboxes
+         SET setup_resolution_version = NULL,
+             setup_resolution_details = NULL,
+             tool_resolution_version = NULL,
+             tool_resolution_details = NULL,
+             ssh_transport_enabled = NULL,
+             ssh_transport_host_port = NULL
+         WHERE id = ?1",
+        [id.as_str()],
+    )?;
+    assert_eq!(updated, 1);
+    Ok(())
+}
+
 async fn assert_up_apply_preserves_prior_ssh_transport(
     name: &str,
     transition: UpApplySshTransition,
@@ -972,6 +992,288 @@ async fn transport_change_up_returns_apply_required_without_preparing_desired_ss
             == Some("apply_required")
     }));
     assert_eq!(std::fs::read_to_string(victim)?, "not a managed public key");
+    Ok(())
+}
+
+#[tokio::test]
+async fn unknown_incomplete_observed_ssh_disabled_up_is_non_mutating_apply_required() -> TestResult
+{
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    let state_path = root.join("state.db");
+    write_ssh_manifest(root, true, Some(24_307))?;
+    let initial = spec(root, "ssh-unknown-incomplete-disable-up")?;
+    let paths = ssh_paths(root, "ssh-unknown-incomplete-disable-client")?;
+    let host_paths = ssh_paths(root, "ssh-unknown-incomplete-disable-host")?;
+    let host_public_key = ensure_host_identity(&host_paths)
+        .await?
+        .public_key()
+        .to_owned();
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let service = SandboxService::new_with_ssh_for_tests(
+        runtime.clone(),
+        gascand::Store::open(&state_path)?,
+        Arc::new(NoopProvisioner),
+        paths.clone(),
+        Utf8PathBuf::from("/usr/bin/true"),
+    );
+    service.up(UpRequest::new(initial.clone())).await?;
+    make_ssh_transport_unknown_and_provisioning_incomplete(&state_path, initial.id())?;
+    let prior = service.status(initial.id())?.ok_or("prior record")?;
+    assert!(prior.setup_resolution.is_none());
+    assert!(prior.tool_resolution.is_none());
+    let prior_ssh_resolution = prior.ssh_resolution.ok_or("prior SSH resolution")?;
+    assert_eq!(
+        stored_ssh_transport_policy(&state_path, initial.id())?,
+        (None, None)
+    );
+    let prior_config = std::fs::read(paths.config())?;
+    let prior_runtime = runtime
+        .inspect(initial.id())
+        .await?
+        .ok_or("prior runtime")?;
+    assert_eq!(
+        prior_runtime
+            .ports()
+            .iter()
+            .filter(|mapping| mapping.guest_port == 22)
+            .map(|mapping| mapping.host_port)
+            .collect::<Vec<_>>(),
+        vec![24_307]
+    );
+    let creates_before = runtime
+        .calls()
+        .await
+        .iter()
+        .filter(|call| matches!(call, RuntimeCall::CreateContainer(_)))
+        .count();
+
+    write_ssh_manifest(root, false, None)?;
+    let desired = spec(root, "ssh-unknown-incomplete-disable-up")?;
+    let operation = service.up(UpRequest::new(desired.clone())).await?;
+    let events = service.store().operation_events(operation.id)?;
+
+    assert!(events.iter().any(|event| {
+        event.details.as_ref().is_some_and(|details| {
+            details["phase"] == "apply_required" && details["reason"] == "ssh_transport_changed"
+        })
+    }));
+    assert_eq!(
+        runtime
+            .calls()
+            .await
+            .iter()
+            .filter(|call| matches!(call, RuntimeCall::CreateContainer(_)))
+            .count(),
+        creates_before
+    );
+    assert_eq!(
+        runtime
+            .inspect(desired.id())
+            .await?
+            .ok_or("runtime after up")?
+            .ports(),
+        prior_runtime.ports()
+    );
+    assert_eq!(std::fs::read(paths.config())?, prior_config);
+    let after = service.status(desired.id())?.ok_or("record after up")?;
+    assert!(after.setup_resolution.is_none());
+    assert!(after.tool_resolution.is_none());
+    assert_eq!(after.ssh_resolution, Some(prior_ssh_resolution));
+    assert_eq!(
+        stored_ssh_transport_policy(&state_path, desired.id())?,
+        (None, None)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn complete_unknown_policy_matching_observed_ssh_up_establishes_policy() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    let state_path = root.join("state.db");
+    write_ssh_manifest(root, true, Some(24_309))?;
+    let desired = spec(root, "ssh-complete-unknown-matching-up")?;
+    let paths = ssh_paths(root, "ssh-complete-unknown-matching-client")?;
+    let host_paths = ssh_paths(root, "ssh-complete-unknown-matching-host")?;
+    let host_public_key = ensure_host_identity(&host_paths)
+        .await?
+        .public_key()
+        .to_owned();
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let service = SandboxService::new_with_ssh_for_tests(
+        runtime.clone(),
+        gascand::Store::open(&state_path)?,
+        Arc::new(NoopProvisioner),
+        paths,
+        Utf8PathBuf::from("/usr/bin/true"),
+    );
+    service.up(UpRequest::new(desired.clone())).await?;
+    let complete = service.status(desired.id())?.ok_or("complete record")?;
+    assert!(complete.setup_resolution.is_some());
+    assert!(complete.tool_resolution.is_some());
+    let connection = rusqlite::Connection::open(&state_path)?;
+    connection.execute(
+        "UPDATE sandboxes
+         SET ssh_transport_enabled = NULL, ssh_transport_host_port = NULL
+         WHERE id = ?1",
+        [desired.id().as_str()],
+    )?;
+    assert_eq!(
+        stored_ssh_transport_policy(&state_path, desired.id())?,
+        (None, None)
+    );
+    let creates_before = runtime
+        .calls()
+        .await
+        .iter()
+        .filter(|call| matches!(call, RuntimeCall::CreateContainer(_)))
+        .count();
+
+    let operation = service.up(UpRequest::new(desired.clone())).await?;
+    let events = service.store().operation_events(operation.id)?;
+
+    assert!(events.iter().all(|event| {
+        event
+            .details
+            .as_ref()
+            .and_then(|details| details["phase"].as_str())
+            != Some("apply_required")
+    }));
+    assert_eq!(
+        runtime
+            .calls()
+            .await
+            .iter()
+            .filter(|call| matches!(call, RuntimeCall::CreateContainer(_)))
+            .count(),
+        creates_before
+    );
+    assert_eq!(
+        runtime
+            .inspect(desired.id())
+            .await?
+            .ok_or("runtime after up")?
+            .ports()
+            .iter()
+            .filter(|mapping| mapping.guest_port == 22)
+            .map(|mapping| mapping.host_port)
+            .collect::<Vec<_>>(),
+        vec![24_309]
+    );
+    assert_eq!(
+        stored_ssh_transport_policy(&state_path, desired.id())?,
+        (Some(1), Some(24_309))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_disabled_durability_cannot_hide_observed_ssh_from_apply() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    let state_path = root.join("state.db");
+    write_ssh_manifest(root, true, Some(24_308))?;
+    let initial = spec(root, "ssh-stale-disabled-observed-apply")?;
+    let paths = ssh_paths(root, "ssh-stale-disabled-observed-client")?;
+    let host_paths = ssh_paths(root, "ssh-stale-disabled-observed-host")?;
+    let host_public_key = ensure_host_identity(&host_paths)
+        .await?
+        .public_key()
+        .to_owned();
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let service = SandboxService::new_with_ssh_for_tests(
+        runtime.clone(),
+        gascand::Store::open(&state_path)?,
+        Arc::new(NoopProvisioner),
+        paths.clone(),
+        Utf8PathBuf::from("/usr/bin/true"),
+    );
+    service.up(UpRequest::new(initial.clone())).await?;
+    service.store().update_ssh_resolution(
+        initial.id(),
+        gascand::SshResolution::new(
+            1,
+            serde_json::json!({
+                "enabled": false,
+                "host_key_fingerprint": "",
+                "client_key_fingerprint": "",
+            }),
+        ),
+    )?;
+    let connection = rusqlite::Connection::open(&state_path)?;
+    connection.execute(
+        "UPDATE sandboxes
+         SET ssh_transport_enabled = 0, ssh_transport_host_port = NULL
+         WHERE id = ?1",
+        [initial.id().as_str()],
+    )?;
+    assert_eq!(
+        stored_ssh_transport_policy(&state_path, initial.id())?,
+        (Some(0), None)
+    );
+    assert_eq!(
+        runtime
+            .inspect(initial.id())
+            .await?
+            .ok_or("observed runtime")?
+            .ports()
+            .iter()
+            .filter(|mapping| mapping.guest_port == 22)
+            .map(|mapping| mapping.host_port)
+            .collect::<Vec<_>>(),
+        vec![24_308]
+    );
+    let creates_before = runtime
+        .calls()
+        .await
+        .iter()
+        .filter(|call| matches!(call, RuntimeCall::CreateContainer(_)))
+        .count();
+
+    write_ssh_manifest(root, false, None)?;
+    let desired = spec(root, "ssh-stale-disabled-observed-apply")?;
+    service.apply(UpRequest::new(desired.clone())).await?;
+
+    assert_eq!(
+        runtime
+            .calls()
+            .await
+            .iter()
+            .filter(|call| matches!(call, RuntimeCall::CreateContainer(_)))
+            .count(),
+        creates_before + 1
+    );
+    assert!(
+        runtime
+            .inspect(desired.id())
+            .await?
+            .ok_or("applied runtime")?
+            .ports()
+            .iter()
+            .all(|mapping| mapping.guest_port != 22)
+    );
+    let applied = service.status(desired.id())?.ok_or("applied record")?;
+    assert_eq!(
+        applied
+            .ssh_resolution
+            .as_ref()
+            .and_then(|resolution| resolution.details["enabled"].as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        stored_ssh_transport_policy(&state_path, desired.id())?,
+        (Some(0), None)
+    );
     Ok(())
 }
 

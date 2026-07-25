@@ -156,6 +156,28 @@ fn rewrite_runtime_image(path: &Utf8Path, image: &str) -> TestResult {
     Ok(())
 }
 
+fn clear_stored_ssh_transport_policy(
+    state_path: &Utf8Path,
+    id: &gascan_core::sandbox::SandboxId,
+) -> TestResult {
+    let connection = rusqlite::Connection::open(state_path)?;
+    let updated = connection.execute(
+        "UPDATE sandboxes
+         SET ssh_transport_enabled = NULL, ssh_transport_host_port = NULL
+         WHERE id = ?1",
+        [id.as_str()],
+    )?;
+    assert_eq!(updated, 1);
+    let policy: (Option<i64>, Option<i64>) = connection.query_row(
+        "SELECT ssh_transport_enabled, ssh_transport_host_port
+         FROM sandboxes WHERE id = ?1",
+        [id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(policy, (None, None));
+    Ok(())
+}
+
 fn loopback_port_collision(port: u16) -> RuntimeError {
     RuntimeError::CommandFailed {
         operation: "container".to_owned(),
@@ -1028,6 +1050,7 @@ async fn failed_initial_up_retry_runs_provision_and_persists_actual_resolution()
 async fn retained_setup_failure_persists_storage_and_up_retries_setup() -> TestResult {
     let root = tempfile::tempdir()?;
     let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let state_path = root.join("state.db");
     let setup = b"exit 28\n";
     std::fs::write(root.join("setup.sh"), setup)?;
     std::fs::write(
@@ -1048,12 +1071,13 @@ async fn retained_setup_failure_persists_storage_and_up_retries_setup() -> TestR
         .await;
     let service = SandboxService::new(
         runtime.clone(),
-        gascand::Store::open(root.join("state.db"))?,
+        gascand::Store::open(&state_path)?,
         Arc::new(NoopProvisioner),
     );
 
     assert!(service.up(UpRequest::new(make_spec()?)).await.is_err());
     let id = make_spec()?.id().clone();
+    clear_stored_ssh_transport_policy(&state_path, &id)?;
     let failed = service.status(&id)?.ok_or("failed record")?;
     assert_eq!(
         failed
@@ -1165,6 +1189,7 @@ async fn retained_setup_failure_preserves_created_ssh_policy_for_changed_up() ->
 async fn retained_setup_failure_with_unchanged_ssh_retries_setup() -> TestResult {
     let root = tempfile::tempdir()?;
     let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let state_path = root.join("state.db");
     let setup = b"exit 28\n";
     std::fs::write(root.join("setup.sh"), setup)?;
     std::fs::write(
@@ -1191,6 +1216,8 @@ async fn retained_setup_failure_with_unchanged_ssh_retries_setup() -> TestResult
     )?;
 
     assert!(service.up(UpRequest::new(make_spec()?)).await.is_err());
+    let id = make_spec()?.id().clone();
+    clear_stored_ssh_transport_policy(&state_path, &id)?;
     let host_public_key = generated_public_key(root, "host-retry-retained-same").await?;
     runtime
         .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)

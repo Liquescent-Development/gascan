@@ -1052,35 +1052,37 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 let ssh_resolution = prior.and_then(|record| record.ssh_resolution.clone());
                 return Ok((actual, None, ssh_resolution, false));
             }
-            if let Some(prior) = prior {
-                let has_complete_resolution =
-                    prior.setup_resolution.is_some() && prior.tool_resolution.is_some();
-                let ssh_transport_changed = (prior_ssh_transport.is_some()
-                    || has_complete_resolution)
-                    && ssh_transport_policy_changed(
-                        prior,
-                        runtime,
-                        spec,
-                        prior_ssh_transport.as_ref(),
-                        has_complete_resolution,
-                    );
-                if ssh_transport_changed {
-                    self.emit(
-                        operation_id,
-                        json!({
-                            "phase": "apply_required",
-                            "reason": "ssh_transport_changed",
-                        }),
-                        sender,
-                    )
-                    .await?;
-                    let actual = match runtime.state {
-                        ContainerState::Creating => ActualState::Creating,
-                        ContainerState::Running => ActualState::Running,
-                        ContainerState::Stopped => ActualState::Stopped,
-                    };
-                    return Ok((actual, None, prior.ssh_resolution.clone(), false));
-                }
+            let has_complete_resolution = prior.is_some_and(|record| {
+                record.setup_resolution.is_some() && record.tool_resolution.is_some()
+            });
+            let ssh_transport_changed = match prior {
+                Some(prior) => ssh_transport_policy_changed(
+                    prior,
+                    runtime,
+                    spec,
+                    prior_ssh_transport.as_ref(),
+                    has_complete_resolution,
+                    false,
+                ),
+                _ => runtime_ssh_transport_changed(runtime, spec),
+            };
+            if ssh_transport_changed {
+                self.emit(
+                    operation_id,
+                    json!({
+                        "phase": "apply_required",
+                        "reason": "ssh_transport_changed",
+                    }),
+                    sender,
+                )
+                .await?;
+                let actual = match runtime.state {
+                    ContainerState::Creating => ActualState::Creating,
+                    ContainerState::Running => ActualState::Running,
+                    ContainerState::Stopped => ActualState::Stopped,
+                };
+                let ssh_resolution = prior.and_then(|record| record.ssh_resolution.clone());
+                return Ok((actual, None, ssh_resolution, false));
             }
         }
         let mut prepared_ssh = self.prepare_ssh_create(spec).await?;
@@ -2310,6 +2312,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 &request.spec,
                 prior_ssh_transport.as_ref(),
                 true,
+                true,
             );
             if image.change_required() {
                 return Ok::<_, ServiceError>((runtime, image, ssh_policy_changed));
@@ -3379,15 +3382,42 @@ fn create_request_ssh_enabled(request: &CreateRequest) -> bool {
         .is_some_and(|enabled| enabled == "1")
 }
 
+fn runtime_ssh_transport_changed(
+    runtime: &gascan_core::runtime::RuntimeSandbox,
+    spec: &SandboxSpec,
+) -> bool {
+    let desired_enabled = spec.manifest().ssh().enabled();
+    let mut mappings = runtime
+        .ports()
+        .iter()
+        .filter(|mapping| mapping.guest_port == 22);
+    let Some(mapping) = mappings.next() else {
+        return desired_enabled;
+    };
+    if !desired_enabled || mappings.next().is_some() {
+        return true;
+    }
+    spec.manifest()
+        .ssh()
+        .host_port()
+        .is_some_and(|port| mapping.host_port != port)
+}
+
 fn ssh_transport_policy_changed(
     record: &SandboxRecord,
     runtime: &gascan_core::runtime::RuntimeSandbox,
     spec: &SandboxSpec,
     recorded_policy: Option<&SshTransportPolicy>,
     require_ssh_resolution: bool,
+    require_recorded_policy: bool,
 ) -> bool {
+    if runtime_ssh_transport_changed(runtime, spec) {
+        return true;
+    }
     let desired_policy = requested_ssh_transport(spec);
-    if recorded_policy != Some(&desired_policy) {
+    if recorded_policy.is_some_and(|policy| policy != &desired_policy)
+        || (require_recorded_policy && recorded_policy.is_none())
+    {
         return true;
     }
     let desired_enabled = spec.manifest().ssh().enabled();
@@ -3395,23 +3425,7 @@ fn ssh_transport_policy_changed(
     if require_ssh_resolution && desired_enabled != recorded_enabled {
         return true;
     }
-    if !desired_enabled {
-        return false;
-    }
-    let mut mappings = runtime
-        .ports()
-        .iter()
-        .filter(|mapping| mapping.guest_port == 22);
-    let Some(mapping) = mappings.next() else {
-        return true;
-    };
-    if mappings.next().is_some() {
-        return true;
-    }
-    spec.manifest()
-        .ssh()
-        .host_port()
-        .is_some_and(|port| mapping.host_port != port)
+    false
 }
 
 fn requested_ssh_transport(spec: &SandboxSpec) -> SshTransportPolicy {
