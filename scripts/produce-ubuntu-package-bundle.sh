@@ -221,7 +221,7 @@ for line in lines:
     if not payload.is_file() or digest(payload) != sha or payload.stat().st_size != int(size): fail("package payload hash/size mismatch against signed Packages")
     selected[key]=item
 
-expected_commands={"dig":"bind9-dnsutils","ifconfig":"net-tools","ip":"iproute2","nano":"nano","netstat":"net-tools","nslookup":"bind9-dnsutils","pico":"nano","ping":"iputils-ping","ps":"procps","pstree":"psmisc","ss":"iproute2","top":"procps"}
+expected_commands={"dig":"bind9-dnsutils","file":"file","ifconfig":"net-tools","ip":"iproute2","nano":"nano","netstat":"net-tools","nslookup":"bind9-dnsutils","pico":"nano","ping":"iputils-ping","ps":"procps","pstree":"psmisc","ss":"iproute2","top":"procps"}
 command_lines=(root/"command-providers.tsv").read_text().splitlines()
 if command_lines != sorted(set(command_lines)): fail("command provider evidence is not in canonical order")
 seen_commands=set()
@@ -434,7 +434,7 @@ SIGNING_KEY_FINGERPRINT=F6ECB3762474EDA9D21B7022871920D1991BC93C
 ARCHITECTURE=arm64
 INSTALL_RECOMMENDS=false
 SYSTEM_PACKAGES_PATH=tests/image/system-tools.txt
-SYSTEM_PACKAGES_SHA256=b68046c4450d7ec11362905551a793d0e4884e20b63f82b26335d2e7610acce8
+SYSTEM_PACKAGES_SHA256=a17fcdf2d9a54e9287711cca394a37b82d742aae570b5c51da9fa110ba925624
 EOF
 verify_evidence_structure "$work/evidence" || die "producer evidence validation failed"
 mkdir -- "$output"

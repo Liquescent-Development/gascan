@@ -1,6 +1,6 @@
 base_image = "ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab"
 ubuntu_snapshot = "2026-07-13T00:00:00Z"
-system_packages_sha256 = "b68046c4450d7ec11362905551a793d0e4884e20b63f82b26335d2e7610acce8"
+system_packages_sha256 = "a17fcdf2d9a54e9287711cca394a37b82d742aae570b5c51da9fa110ba925624"
 workspace_build_mode = "connected"
 workspace_tag = "gascan-workspace:0cda90a4b7ac4969"
 

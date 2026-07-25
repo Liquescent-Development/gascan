@@ -25,6 +25,7 @@ impl RuntimeCommandFixture {
         fs::create_dir(&bin).unwrap();
         let mappings = [
             ("dig", "bind9-dnsutils"),
+            ("file", "file"),
             ("ifconfig", "net-tools"),
             ("ip", "iproute2"),
             ("nano", "nano"),
@@ -82,6 +83,7 @@ case "$1" in
   fi
   case "$(basename "$2")" in
    dig|nslookup) package=bind9-dnsutils ;;
+   file) package=file ;;
    ip|ss) package=iproute2 ;;
    ping) package=iputils-ping ;;
    ifconfig|netstat) package=net-tools ;;
@@ -178,7 +180,7 @@ impl Fixture {
         .unwrap();
         fs::write(
             root.join("command-providers.tsv"),
-            "dig\tbind9-dnsutils\t/usr/bin/dig\nifconfig\tnet-tools\t/usr/sbin/ifconfig\nip\tiproute2\t/usr/sbin/ip\nnano\tnano\t/usr/bin/nano\nnetstat\tnet-tools\t/usr/bin/netstat\nnslookup\tbind9-dnsutils\t/usr/bin/nslookup\npico\tnano\t/usr/bin/pico\nping\tiputils-ping\t/usr/bin/ping\nps\tprocps\t/usr/bin/ps\npstree\tpsmisc\t/usr/bin/pstree\nss\tiproute2\t/usr/bin/ss\ntop\tprocps\t/usr/bin/top\n",
+            "dig\tbind9-dnsutils\t/usr/bin/dig\nfile\tfile\t/usr/bin/file\nifconfig\tnet-tools\t/usr/sbin/ifconfig\nip\tiproute2\t/usr/sbin/ip\nnano\tnano\t/usr/bin/nano\nnetstat\tnet-tools\t/usr/bin/netstat\nnslookup\tbind9-dnsutils\t/usr/bin/nslookup\npico\tnano\t/usr/bin/pico\nping\tiputils-ping\t/usr/bin/ping\nps\tprocps\t/usr/bin/ps\npstree\tpsmisc\t/usr/bin/pstree\nss\tiproute2\t/usr/bin/ss\ntop\tprocps\t/usr/bin/top\n",
         )
         .unwrap();
         fs::write(root.join("dependency-edges.tsv"), "root\t2.0\tarm64\tDepends\t0\tdep:any (>= 1.0) [arm64] | virtual-dep\tprovider\t3.0\tarm64\nroot\t2.0\tarm64\tPre-Depends\t0\tdep (= 1.0)\tdep\t1.0\tarm64\n").unwrap();
@@ -190,7 +192,7 @@ impl Fixture {
         .unwrap();
         fs::write(
             root.join("provenance.env"),
-            format!("SNAPSHOT=2026-07-13T00:00:00Z\nBASE_IMAGE=ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab\nSIGNING_KEY_FINGERPRINT={FINGERPRINT}\nARCHITECTURE=arm64\nINSTALL_RECOMMENDS=false\nSYSTEM_PACKAGES_PATH=tests/image/system-tools.txt\nSYSTEM_PACKAGES_SHA256=b68046c4450d7ec11362905551a793d0e4884e20b63f82b26335d2e7610acce8\n"),
+            format!("SNAPSHOT=2026-07-13T00:00:00Z\nBASE_IMAGE=ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab\nSIGNING_KEY_FINGERPRINT={FINGERPRINT}\nARCHITECTURE=arm64\nINSTALL_RECOMMENDS=false\nSYSTEM_PACKAGES_PATH=tests/image/system-tools.txt\nSYSTEM_PACKAGES_SHA256=a17fcdf2d9a54e9287711cca394a37b82d742aae570b5c51da9fa110ba925624\n"),
         ).unwrap();
         let gpgv = root.join("gpgv");
         fs::write(&gpgv, format!("#!/bin/sh\nprintf '%s\\n' '[GNUPG:] VALIDSIG {FINGERPRINT} 20260713 0 4 0 1 10 01 {FINGERPRINT}' >&2\n")).unwrap();
@@ -318,6 +320,47 @@ fn package_input_digest_is_locked_in_config_image_lock_and_producer_provenance()
     );
     assert!(producer.contains("--download-only --no-install-recommends install"));
     assert!(producer.contains("APT::Install-Recommends=false"));
+}
+
+#[test]
+fn advertised_file_command_is_an_explicit_locked_ubuntu_root() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let roots = fs::read_to_string(root.join("tests/image/system-tools.txt")).unwrap();
+    let exact = roots.lines().filter(|package| *package == "file").count();
+    assert_eq!(exact, 1, "the file provider must be one exact package root");
+}
+
+#[test]
+fn runtime_command_evidence_binds_file_to_its_exact_package_provider() {
+    let runtime = RuntimeCommandFixture::new();
+    let output = runtime.write();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let evidence = fs::read_to_string(runtime.evidence.join("command-providers.tsv")).unwrap();
+    assert!(
+        evidence
+            .lines()
+            .any(|line| line == format!("file\tfile\t{}", runtime.bin.join("file").display())),
+        "file command provider evidence is absent: {evidence}"
+    );
+    let verified = runtime.verify();
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+}
+
+#[test]
+fn structural_bundle_validator_binds_file_to_its_exact_package_provider() {
+    let producer = fs::read_to_string(script()).unwrap();
+    assert!(
+        producer.contains(r#""file":"file""#),
+        "the sealed bundle validator must require file's exact provider"
+    );
 }
 
 #[test]

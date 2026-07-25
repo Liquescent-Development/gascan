@@ -251,6 +251,48 @@ fn workstation_smoke_initializes_the_mounted_home_before_contract_checks() {
 }
 
 #[test]
+fn successful_candidate_validation_preserves_tracked_approval_and_stages_only_candidate() {
+    let mut f = fixture();
+    let existing_approval = "ghcr.io/liquescent-development/gascan/workspace:approved@sha256:\
+         bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let existing_evidence = "# Connected workspace image evidence\n\n- status: `PASS`\n\
+                             - image: `existing-approved-image`\n";
+    fs::write(
+        f.root.join("images/workspace/approved-image.txt"),
+        existing_approval,
+    )
+    .unwrap();
+    fs::write(
+        f.root.join("docs/evidence/connected-workspace-image.md"),
+        existing_evidence,
+    )
+    .unwrap();
+
+    let output = f.command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join("images/workspace/approved-image.txt")).unwrap(),
+        existing_approval
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join("docs/evidence/connected-workspace-image.md")).unwrap(),
+        existing_evidence
+    );
+    assert_eq!(
+        fs::read_to_string(
+            f.root
+                .join(".artifacts/connected-workspace-image-candidate.txt")
+        )
+        .unwrap(),
+        format!("gascan-workspace:d4964500a3295a33@sha256:{DIGEST}\n")
+    );
+}
+
+#[test]
 fn successful_gate_uses_one_reference_and_token_then_publishes_atomically() {
     let mut f = fixture();
     let output = f.command.output().unwrap();
@@ -287,16 +329,15 @@ fn successful_gate_uses_one_reference_and_token_then_publishes_atomically() {
             "mutation lacked immediately preceding structural inspect: {line}"
         );
     }
-    let evidence =
-        fs::read_to_string(f.root.join("docs/evidence/connected-workspace-image.md")).unwrap();
-    assert!(evidence.contains(&format!(
-        "gascan-workspace:d4964500a3295a33@sha256:{DIGEST}"
-    )));
-    assert!(evidence.contains("platform: `linux/arm64`"));
     assert_eq!(
-        fs::read(f.root.join("images/workspace/approved-image.txt")).unwrap(),
-        format!("gascan-workspace:d4964500a3295a33@sha256:{DIGEST}").as_bytes()
+        fs::read_to_string(
+            f.root
+                .join(".artifacts/connected-workspace-image-candidate.txt")
+        )
+        .unwrap(),
+        format!("gascan-workspace:d4964500a3295a33@sha256:{DIGEST}\n")
     );
+    assert_no_publications(&f);
     assert_eq!(
         fs::read(f.temp.path().join("state/unrelated-resource")).unwrap(),
         b"foreign"
@@ -304,7 +345,7 @@ fn successful_gate_uses_one_reference_and_token_then_publishes_atomically() {
 }
 
 #[test]
-fn successful_prebuilt_gate_skips_build_work_and_publishes_exact_receipt_reference() {
+fn successful_prebuilt_gate_skips_build_work_and_stages_exact_candidate_reference() {
     let mut f = fixture();
     seed_valid_receipt(&f);
     let output = f.command.arg("--prebuilt").output().unwrap();
@@ -341,14 +382,15 @@ fn successful_prebuilt_gate_skips_build_work_and_publishes_exact_receipt_referen
     }
     let reference = format!("gascan-workspace:d4964500a3295a33@sha256:{DIGEST}");
     assert_eq!(
-        fs::read(f.root.join("images/workspace/approved-image.txt")).unwrap(),
-        reference.as_bytes()
+        fs::read_to_string(
+            f.root
+                .join(".artifacts/connected-workspace-image-candidate.txt")
+        )
+        .unwrap()
+        .trim(),
+        reference
     );
-    assert!(
-        fs::read_to_string(f.root.join("docs/evidence/connected-workspace-image.md"))
-            .unwrap()
-            .contains(&reference)
-    );
+    assert_no_publications(&f);
 }
 
 #[test]
@@ -422,6 +464,25 @@ fn workstation_contract_is_wired_into_the_release_blocking_gate() {
             "guest contract omitted guaranteed command: {command}"
         );
     }
+    for diagnostic in [
+        "nslookup -version",
+        "curl --fail --silent file:///etc/os-release",
+        "wget --version",
+        "rsync --version",
+        "lsof -v",
+        "file /bin/sh",
+        "jq -e",
+        "ps -o comm=",
+        "top -b -n 1",
+        "pstree -p",
+        "tree --version",
+        "less -F -X",
+    ] {
+        assert!(
+            smoke.contains(diagnostic),
+            "host-side workstation smoke omitted advertised diagnostic: {diagnostic}"
+        );
+    }
     for boundary in [
         "--network none",
         "/home/workspace/.local/share/mise",
@@ -485,13 +546,18 @@ fn ghcr_prebuilt_gate_inspects_canonical_name_and_smokes_original_reference() {
         }));
     }
     assert_eq!(
-        fs::read(f.root.join("images/workspace/approved-image.txt")).unwrap(),
-        reference.as_bytes()
+        fs::read_to_string(
+            f.root
+                .join(".artifacts/connected-workspace-image-candidate.txt")
+        )
+        .unwrap(),
+        format!("{reference}\n")
     );
+    assert_no_publications(&f);
 }
 
 #[test]
-fn invalid_arguments_skip_work_and_retire_stale_pass_publications() {
+fn invalid_arguments_skip_work_and_preserve_existing_approval() {
     for arguments in [["--unknown"].as_slice(), ["--prebuilt", "extra"].as_slice()] {
         let mut f = fixture();
         fs::write(
@@ -504,7 +570,14 @@ fn invalid_arguments_skip_work_and_retire_stale_pass_publications() {
         assert!(!output.status.success(), "arguments={arguments:?}");
         assert!(String::from_utf8_lossy(&output.stderr).contains("usage:"));
         assert!(!f.calls.exists(), "arguments={arguments:?} reached work");
-        assert_no_publications(&f);
+        assert_eq!(
+            fs::read_to_string(f.root.join("docs/evidence/connected-workspace-image.md")).unwrap(),
+            "status: `PASS`\n"
+        );
+        assert_eq!(
+            fs::read_to_string(f.root.join("images/workspace/approved-image.txt")).unwrap(),
+            "stale"
+        );
     }
 }
 
@@ -577,7 +650,19 @@ fn invalid_prebuilt_receipt_or_inspection_never_rebuilds_smokes_or_publishes() {
             !calls.contains("container:create"),
             "failure={failure} reached smoke"
         );
-        assert_no_publications(&f);
+        assert_eq!(
+            fs::read_to_string(f.root.join("docs/evidence/connected-workspace-image.md")).unwrap(),
+            "status: `PASS`\n"
+        );
+        assert_eq!(
+            fs::read_to_string(f.root.join("images/workspace/approved-image.txt")).unwrap(),
+            "stale"
+        );
+        assert!(
+            !f.root
+                .join(".artifacts/connected-workspace-image-candidate.txt")
+                .exists()
+        );
     }
 }
 
@@ -604,7 +689,7 @@ fn injected_random_source_proves_fresh_live_tokens_across_runs() {
 }
 
 #[test]
-fn every_failure_prevents_both_publications() {
+fn every_failure_prevents_candidate_publication() {
     for failure in ["build", "receipt", "smoke", "residue"] {
         let mut f = fixture();
         match failure {
@@ -637,11 +722,16 @@ fn every_failure_prevents_both_publications() {
                 .exists()
         );
         assert!(!f.root.join("images/workspace/approved-image.txt").exists());
+        assert!(
+            !f.root
+                .join(".artifacts/connected-workspace-image-candidate.txt")
+                .exists()
+        );
     }
 }
 
 #[test]
-fn stale_pass_pair_is_retired_before_work_and_owner_token_is_never_evidence() {
+fn existing_approval_is_preserved_on_failure_and_owner_token_is_never_candidate_evidence() {
     let mut f = fixture();
     fs::write(
         f.root.join("docs/evidence/connected-workspace-image.md"),
@@ -651,23 +741,27 @@ fn stale_pass_pair_is_retired_before_work_and_owner_token_is_never_evidence() {
     fs::write(f.root.join("images/workspace/approved-image.txt"), "stale").unwrap();
     f.command.env("GASCAN_GATE_TEST_BUILD_FAILURE", "1");
     assert!(!f.command.status().unwrap().success());
-    assert!(
-        !f.root
-            .join("docs/evidence/connected-workspace-image.md")
-            .exists()
+    assert_eq!(
+        fs::read_to_string(f.root.join("docs/evidence/connected-workspace-image.md")).unwrap(),
+        "status: `PASS`\n"
     );
-    assert!(!f.root.join("images/workspace/approved-image.txt").exists());
+    assert_eq!(
+        fs::read_to_string(f.root.join("images/workspace/approved-image.txt")).unwrap(),
+        "stale"
+    );
 
     let mut f = fixture();
     assert!(f.command.status().unwrap().success());
-    let evidence =
-        fs::read_to_string(f.root.join("docs/evidence/connected-workspace-image.md")).unwrap();
-    assert!(!evidence.contains(TOKEN));
-    assert!(!evidence.to_ascii_lowercase().contains("owner token"));
+    let candidate = fs::read_to_string(
+        f.root
+            .join(".artifacts/connected-workspace-image-candidate.txt"),
+    )
+    .unwrap();
+    assert!(!candidate.contains(TOKEN));
 }
 
 #[test]
-fn stale_pass_pair_is_retired_when_obsolete_credential_input_is_rejected() {
+fn existing_approval_is_preserved_when_obsolete_credential_input_is_rejected() {
     let mut f = fixture();
     fs::write(
         f.root.join("docs/evidence/connected-workspace-image.md"),
@@ -678,51 +772,47 @@ fn stale_pass_pair_is_retired_when_obsolete_credential_input_is_rejected() {
     f.command
         .env("GASCAMP_READ_TOKEN_FILE", "/tmp/obsolete-token");
     assert!(!f.command.status().unwrap().success());
-    assert!(
-        !f.root
-            .join("docs/evidence/connected-workspace-image.md")
-            .exists()
+    assert_eq!(
+        fs::read_to_string(f.root.join("docs/evidence/connected-workspace-image.md")).unwrap(),
+        "status: `PASS`\n"
     );
-    assert!(!f.root.join("images/workspace/approved-image.txt").exists());
+    assert_eq!(
+        fs::read_to_string(f.root.join("images/workspace/approved-image.txt")).unwrap(),
+        "stale"
+    );
     assert!(!f.calls.exists());
 }
 
 #[test]
-fn every_publication_boundary_rolls_back_the_pair() {
-    for boundary in ["after-stage", "after-evidence"] {
-        for action in ["FAIL", "INT", "TERM"] {
-            let mut f = fixture();
-            f.command
-                .env("GASCAN_GATE_TEST_PUBLICATION_BOUNDARY", boundary)
-                .env("GASCAN_GATE_TEST_PUBLICATION_ACTION", action);
-            let status = f.command.status().unwrap();
-            assert!(!status.success(), "{boundary}/{action}");
-            if action == "INT" {
-                assert_eq!(status.code(), Some(130));
-            }
-            if action == "TERM" {
-                assert_eq!(status.code(), Some(143));
-            }
-            assert!(
-                !f.root
-                    .join("docs/evidence/connected-workspace-image.md")
-                    .exists()
-            );
-            assert!(!f.root.join("images/workspace/approved-image.txt").exists());
-            assert_eq!(
-                fs::read_dir(f.root.join("docs/evidence")).unwrap().count(),
-                0
-            );
-            assert!(
-                !fs::read_dir(f.root.join("images/workspace"))
-                    .unwrap()
-                    .any(|entry| entry
-                        .unwrap()
-                        .file_name()
-                        .to_string_lossy()
-                        .starts_with(".approved-image."))
-            );
+fn every_candidate_staging_boundary_removes_temporary_evidence() {
+    for action in ["FAIL", "INT", "TERM"] {
+        let mut f = fixture();
+        f.command
+            .env("GASCAN_GATE_TEST_CANDIDATE_BOUNDARY", "after-stage")
+            .env("GASCAN_GATE_TEST_CANDIDATE_ACTION", action);
+        let status = f.command.status().unwrap();
+        assert!(!status.success(), "{action}");
+        if action == "INT" {
+            assert_eq!(status.code(), Some(130));
         }
+        if action == "TERM" {
+            assert_eq!(status.code(), Some(143));
+        }
+        assert_no_publications(&f);
+        assert!(
+            !f.root
+                .join(".artifacts/connected-workspace-image-candidate.txt")
+                .exists()
+        );
+        assert!(
+            !fs::read_dir(f.root.join(".artifacts"))
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".connected-workspace-image-candidate."))
+        );
     }
 }
 

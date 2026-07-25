@@ -67,9 +67,13 @@ impl OwnedRuntimeSnapshot {
     }
 }
 
-pub fn approved_workspace_image() -> TestResult<&'static str> {
-    let image = include_str!("../../../../images/workspace/approved-image.txt").trim();
-    if !gascan_core::runtime::immutable_image_reference(image) {
+pub fn approved_workspace_image() -> TestResult<String> {
+    let image = std::env::var("GASCAN_E2E_CANDIDATE_IMAGE").unwrap_or_else(|_| {
+        include_str!("../../../../images/workspace/approved-image.txt")
+            .trim()
+            .to_owned()
+    });
+    if image.trim() != image || !gascan_core::runtime::immutable_image_reference(&image) {
         return Err("approved workspace image is not digest-qualified".into());
     }
     Ok(image)
@@ -441,7 +445,7 @@ impl AppleE2e {
         image: &str,
         timeout: std::time::Duration,
     ) -> TestResult {
-        validate_distinct_image_fixtures(image, approved_workspace_image()?)?;
+        validate_distinct_image_fixtures(image, &approved_workspace_image()?)?;
         let root = camino::Utf8Path::from_path(&self.root_path).ok_or("non-UTF-8 project root")?;
         let manifest = gascan_core::manifest::Manifest::load(root)?;
         let spec =
@@ -620,6 +624,9 @@ impl AppleE2e {
             )
             .env("GASCAN_DAEMON", &self.gascand)
             .env_remove("GASCAN_TEST_FAKE_BACKEND");
+        if let Some(candidate) = std::env::var_os("GASCAN_E2E_CANDIDATE_IMAGE") {
+            command.env("GASCAN_E2E_CANDIDATE_IMAGE", candidate);
+        }
         if self.error_diagnostics {
             command.env(gascand::TEST_ERROR_DIAGNOSTICS_ENV, "1");
         } else {

@@ -231,6 +231,7 @@ pub struct SandboxService<B: RuntimeBackend> {
     runtime: B,
     store: Store,
     provisioner: Arc<dyn Provisioner>,
+    workspace_image: Option<String>,
     locks: Mutex<HashMap<SandboxId, Weak<AsyncMutex<()>>>>,
     doctor: DoctorState,
     capabilities: tokio::sync::OnceCell<RuntimeCapabilities>,
@@ -411,9 +412,47 @@ impl<B: RuntimeBackend> SandboxService<B> {
             runtime,
             store,
             provisioner,
+            workspace_image: None,
             locks: Mutex::new(HashMap::new()),
             doctor,
             capabilities: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    pub fn new_with_doctor_state_for_image(
+        runtime: B,
+        store: Store,
+        provisioner: Arc<dyn Provisioner>,
+        doctor: DoctorState,
+        workspace_image: String,
+    ) -> Result<Self, PolicyError> {
+        if !immutable_image_reference(&workspace_image) {
+            return Err(PolicyError::InvalidWorkspaceImage);
+        }
+        Ok(Self {
+            runtime,
+            store,
+            provisioner,
+            workspace_image: Some(workspace_image),
+            locks: Mutex::new(HashMap::new()),
+            doctor,
+            capabilities: tokio::sync::OnceCell::new(),
+        })
+    }
+
+    fn compile_policy(
+        &self,
+        spec: SandboxSpec,
+        capabilities: &RuntimeCapabilities,
+    ) -> Result<CreateRequest, PolicyError> {
+        PolicyCompiler::compile_for_image(spec, capabilities, self.workspace_image())
+    }
+
+    #[must_use]
+    pub fn workspace_image(&self) -> &str {
+        match &self.workspace_image {
+            Some(image) => image,
+            None => PolicyCompiler::workspace_image(),
         }
     }
 
@@ -573,7 +612,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let lock = self.keyed_lock(&id)?;
         let _guard = lock.lock().await;
         let capabilities = self.runtime_capabilities().await?;
-        let create = PolicyCompiler::compile(request.spec.clone(), capabilities)?;
+        let create = self.compile_policy(request.spec.clone(), capabilities)?;
         let requested_storage = requested_storage(&create)?;
         let existing = self
             .database({
@@ -1727,7 +1766,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let lock = self.keyed_lock(&id)?;
         let _guard = lock.lock().await;
         let capabilities = self.runtime_capabilities().await?;
-        let create = PolicyCompiler::compile(request.spec.clone(), capabilities)?;
+        let create = self.compile_policy(request.spec.clone(), capabilities)?;
         let requested_storage = requested_storage(&create)?;
         let mut record = self
             .database({

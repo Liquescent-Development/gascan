@@ -135,12 +135,24 @@ async fn run_daemon<B: RuntimeBackend + 'static>(
     provisioner: ConfiguredProvisioner,
     doctor: DoctorState,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let service = Arc::new(SandboxService::new_with_doctor_state(
-        runtime,
-        store,
-        Arc::new(provisioner),
-        doctor,
-    ));
+    let candidate_image = if option_env!("CARGO_BIN_NAME") == Some("gascan-e2e-daemon") {
+        std::env::var("GASCAN_E2E_CANDIDATE_IMAGE").ok()
+    } else {
+        None
+    };
+    let service = match candidate_image {
+        Some(image) => SandboxService::new_with_doctor_state_for_image(
+            runtime,
+            store,
+            Arc::new(provisioner),
+            doctor,
+            image,
+        )?,
+        None => {
+            SandboxService::new_with_doctor_state(runtime, store, Arc::new(provisioner), doctor)
+        }
+    };
+    let service = Arc::new(service);
     let config = DaemonConfig::new(paths, idle_timeout);
     let error_diagnostics = if std::env::var_os(gascand::TEST_ERROR_DIAGNOSTICS_ENV).is_some() {
         ErrorDiagnostics::enabled_for_tests()

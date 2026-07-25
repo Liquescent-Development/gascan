@@ -288,6 +288,20 @@ fn image_reference_is_the_gate_approved_connected_image() {
 }
 
 #[test]
+fn explicit_immutable_candidate_can_be_compiled_without_changing_approved_policy() {
+    let candidate = "ghcr.io/liquescent-development/gascan/workspace:candidate@sha256:\
+                     aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let (_temp, spec) = spec("version = 1\nnetwork = 'networked'\n");
+    let request = PolicyCompiler::compile_for_image(spec, &capabilities(), candidate)
+        .expect("compile explicit immutable candidate");
+    assert_eq!(request.image(), candidate);
+    assert_eq!(
+        compile_workspace_request().image(),
+        include_str!("../../../images/workspace/approved-image.txt")
+    );
+}
+
+#[test]
 fn safe_resource_defaults_and_explicit_values_are_bounded() {
     let (_temp, default_spec) = spec("version = 1\nnetwork = 'networked'\n");
     let defaults = PolicyCompiler::compile(default_spec, &capabilities())

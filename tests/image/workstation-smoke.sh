@@ -98,5 +98,20 @@ owned_image
 "$container_bin" exec "$name" env HOME=/home/workspace \
   /usr/local/bin/configure-workstation-home
 "$container_bin" exec "$name" /opt/gascan/tests/workstation-contract.sh
+"$container_bin" exec "$name" sh -c '
+  set -eu
+  nslookup -version 2>&1 | grep -Eq "^nslookup 9[.]"
+  curl --fail --silent file:///etc/os-release | grep -Fq "ID=ubuntu"
+  wget --version | sed -n "1p" | grep -Fq "GNU Wget"
+  rsync --version | sed -n "1p" | grep -Fq "rsync  version"
+  lsof -v 2>&1 | grep -Fq "revision:"
+  file /bin/sh | grep -Fq "symbolic link to dash"
+  printf "{\"ready\":true}\n" | jq -e ".ready == true" >/dev/null
+  ps -o comm= -p $$ | grep -Eq "^[[:space:]]*sh$"
+  top -b -n 1 | grep -Fq "PID"
+  pstree -p $$ | grep -Fq "sh("
+  tree --version | sed -n "1p" | grep -Eq "^tree v[0-9]"
+  test "$(printf gascan-less | less -F -X)" = gascan-less
+'
 cleanup
 volume_inventory_proves_absent

@@ -35,6 +35,35 @@ Two alternatives were rejected:
 - First-run developer-profile installation makes initial use slow and
   registry-dependent and cannot satisfy the offline-ready contract.
 
+### Formal workstation review resolution (2026-07-25)
+
+The following decisions are binding for the workstation-image phase:
+
+- Preserve the reviewed Pi/protobuf lock. The no-argument updater remains
+  mutable discovery and must fail closed when upstream resolution drifts.
+  Release acceptance uses `--verify-existing-workstation-lock`; it does not
+  acquire or review newly drifted bytes.
+- Preserve connected acquisition for legacy workspace-image layers. Converting
+  every legacy layer to a complete offline bundle is a separate project. The
+  workstation layer itself remains sealed, digest-verified, and installed
+  offline from the prepared context.
+- Connected build and smoke validation produce a candidate, never approval.
+  The candidate image may be selected by the Apple E2E test-support boundary
+  without editing `approved-image.txt`. Only a separate explicit approval step
+  may atomically publish `approved-image.txt` and final evidence, and only
+  after consuming a successful Apple-live receipt for the same immutable
+  candidate.
+- A mutable `[tools]` override must leave every regular file under
+  `/opt/gascan` unchanged. No subtree is exempt unless a concrete runtime
+  mutation is first demonstrated and precisely justified.
+- Credential-free agent and forge probes use real safe commands and writes
+  where those tools support them. Synthetic sentinels are retained only for a
+  tool with no safe unauthenticated write command, with the limitation called
+  out in evidence.
+- The host-side workstation smoke invokes every guaranteed diagnostic command
+  with deterministic offline-safe assertions. These probes remain outside the
+  sealed image context and therefore do not change reviewed image bytes.
+
 ## Goals
 
 - Make a new sandbox immediately usable from a terminal or VS Code Remote SSH.

@@ -8,8 +8,7 @@ artifacts=${GASCAN_GATE_ARTIFACTS:-"$root/.artifacts"}
 container_bin=${CONTAINER_BIN:-container}
 reference_file="$artifacts/workspace-image-ref"
 receipt_file="$artifacts/workspace-image-build.json"
-evidence_file="$root/docs/evidence/connected-workspace-image.md"
-approved_file="$root/images/workspace/approved-image.txt"
+candidate_file="$artifacts/connected-workspace-image-candidate.txt"
 die() { printf 'connected image gate: %s\n' "$*" >&2; exit 1; }
 run_tool() { cargo run --quiet --locked --offline --manifest-path "$tool_root/scripts/Cargo.toml" --bin "$1" -- "${@:2}"; }
 cli_timeout=${GASCAN_GATE_CLI_TIMEOUT_SECONDS:-10}
@@ -33,18 +32,13 @@ run_bounded() {
 }
 controller() { run_bounded "$cli_timeout" "$container_bin" "$@"; }
 
-# Retire prior acceptance markers before any validation or connected work.
-# Preserve the checked-in PENDING record, but never let a failed rerun retain
-# an earlier PASS marker.
-rm -f "$approved_file"
-if test -f "$evidence_file" && grep -Fq 'status: `PASS`' "$evidence_file"; then rm -f "$evidence_file"; fi
-
 prebuilt=false
 case $# in
   0) ;;
   1) test "$1" = --prebuilt || die 'usage: run-connected-image-gate.sh [--prebuilt]'; prebuilt=true ;;
   *) die 'usage: run-connected-image-gate.sh [--prebuilt]' ;;
 esac
+rm -f "$candidate_file"
 
 for name in $(compgen -e); do
   case "$name" in
@@ -108,17 +102,12 @@ cleanup() {
 assert_absent() {
   inventory_proves_absent "${names[@]}"
 }
-evidence_tmp=''
-approved_tmp=''
-published_evidence=false
-committed=false
-rollback_publication() {
-  test -z "$evidence_tmp" || rm -f "$evidence_tmp"
-  test -z "$approved_tmp" || rm -f "$approved_tmp"
-  if $published_evidence && ! $committed; then rm -f "$evidence_file" "$approved_file"; fi
+candidate_tmp=''
+rollback_candidate() {
+  test -z "$candidate_tmp" || rm -f "$candidate_tmp"
 }
-finish() { status=$?; rollback_publication; cleanup || status=1; exit "$status"; }
-on_signal() { code=$1; trap - EXIT INT TERM; rollback_publication; cleanup; assert_absent || exit 1; exit "$code"; }
+finish() { status=$?; rollback_candidate; cleanup || status=1; exit "$status"; }
+on_signal() { code=$1; trap - EXIT INT TERM; rollback_candidate; cleanup; assert_absent || exit 1; exit "$code"; }
 trap cleanup EXIT
 trap 'on_signal 130' INT
 trap 'on_signal 143' TERM
@@ -153,26 +142,19 @@ done
 cleanup
 assert_absent || die 'current-run container residue remains'
 
-mkdir -p "$(dirname "$evidence_file")" "$(dirname "$approved_file")"
-evidence_tmp=$(mktemp "$(dirname "$evidence_file")/.connected-workspace-image.XXXXXX")
-approved_tmp=$(mktemp "$(dirname "$approved_file")/.approved-image.XXXXXX")
+mkdir -p "$(dirname "$candidate_file")"
+candidate_tmp=$(mktemp "$(dirname "$candidate_file")/.connected-workspace-image-candidate.XXXXXX")
 trap finish EXIT
-lock_digest=$(shasum -a 256 "$root/images/workspace/versions.lock" | awk '{print $1}')
-receipt_digest=$(shasum -a 256 "$receipt_file" | awk '{print $1}')
-printf '# Connected workspace image evidence\n\n- status: `PASS`\n- platform: `linux/arm64`\n- image: `%s`\n- versions lock SHA-256: `%s`\n- build receipt SHA-256: `%s`\n- final current-token residue: `absent`\n' "$image" "$lock_digest" "$receipt_digest" >"$evidence_tmp"
-printf '%s' "$image" >"$approved_tmp"
+printf '%s\n' "$image" >"$candidate_tmp"
 assert_absent || die 'current-run container residue appeared before publication'
-if test "${GASCAN_GATE_TEST_PUBLICATION_BOUNDARY:-}" = after-stage; then
-  case "${GASCAN_GATE_TEST_PUBLICATION_ACTION:-}" in FAIL) false ;; INT) kill -INT $$ ;; TERM) kill -TERM $$ ;; esac
+if test "${GASCAN_GATE_TEST_CANDIDATE_BOUNDARY:-}" = after-stage; then
+  case "${GASCAN_GATE_TEST_CANDIDATE_ACTION:-}" in
+    FAIL) false ;;
+    INT) kill -INT $$ ;;
+    TERM) kill -TERM $$ ;;
+  esac
 fi
-mv -f "$evidence_tmp" "$evidence_file"
-evidence_tmp=''
-published_evidence=true
-if test "${GASCAN_GATE_TEST_PUBLICATION_BOUNDARY:-}" = after-evidence; then
-  case "${GASCAN_GATE_TEST_PUBLICATION_ACTION:-}" in FAIL) false ;; INT) kill -INT $$ ;; TERM) kill -TERM $$ ;; esac
-fi
-mv -f "$approved_tmp" "$approved_file"
-approved_tmp=''
-committed=true
+mv -f "$candidate_tmp" "$candidate_file"
+candidate_tmp=''
 trap - EXIT INT TERM
 printf '%s\n' "$image"

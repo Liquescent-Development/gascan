@@ -2,7 +2,7 @@ use crate::manifest::{NetworkMode, Storage, UserMode};
 use crate::runtime::{
     CreateRequest, NetworkIsolation, OwnershipMetadata, ResourceIdentity, ResourceKind,
     RuntimeBindMount, RuntimeCapabilities, RuntimeError, RuntimeNetwork, RuntimePort,
-    RuntimeResourceLimits, RuntimeUser, RuntimeVolume,
+    RuntimeResourceLimits, RuntimeUser, RuntimeVolume, immutable_image_reference,
 };
 use crate::sandbox::{SandboxSpec, WORKSPACE_TARGET};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -31,6 +31,11 @@ pub const CONTAINER_PATH: &str = "/home/workspace/.local/share/mise/shims:/opt/g
 pub struct PolicyCompiler;
 
 impl PolicyCompiler {
+    #[must_use]
+    pub const fn workspace_image() -> &'static str {
+        WORKSPACE_IMAGE
+    }
+
     pub fn managed_network_name(id: &crate::sandbox::SandboxId) -> String {
         format!("gascan-network-{id}")
     }
@@ -56,6 +61,17 @@ impl PolicyCompiler {
         spec: SandboxSpec,
         capabilities: &RuntimeCapabilities,
     ) -> Result<CreateRequest, PolicyError> {
+        Self::compile_for_image(spec, capabilities, Self::workspace_image())
+    }
+
+    pub fn compile_for_image(
+        spec: SandboxSpec,
+        capabilities: &RuntimeCapabilities,
+        workspace_image: &str,
+    ) -> Result<CreateRequest, PolicyError> {
+        if !immutable_image_reference(workspace_image) {
+            return Err(PolicyError::InvalidWorkspaceImage);
+        }
         validate_spec(&spec)?;
         validate_capabilities(&spec, capabilities)?;
 
@@ -89,7 +105,7 @@ impl PolicyCompiler {
 
         Ok(CreateRequest {
             id: spec.id().clone(),
-            image: WORKSPACE_IMAGE.to_owned(),
+            image: workspace_image.to_owned(),
             bind_mounts,
             volumes,
             ports,
@@ -253,6 +269,8 @@ fn managed_volume_names(sandbox_id: &str) -> [String; 3] {
 #[derive(Debug, Error, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum PolicyError {
+    #[error("workspace image must be an immutable digest-qualified reference")]
+    InvalidWorkspaceImage,
     #[error("sandbox must contain exactly the canonical writable /workspace mount")]
     InvalidMount,
     #[error("runtime cannot provide bind mounts")]
@@ -284,6 +302,7 @@ pub enum PolicyError {
 impl PolicyError {
     pub const fn code(&self) -> &'static str {
         match self {
+            Self::InvalidWorkspaceImage => "invalid_workspace_image",
             Self::InvalidMount => "invalid_mount",
             Self::BindMountsUnavailable => "bind_mounts_unavailable",
             Self::NamedVolumesUnavailable => "named_volumes_unavailable",

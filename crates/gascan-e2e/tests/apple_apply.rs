@@ -7,22 +7,10 @@ use apple_common::{AppleE2e, TestResult};
 use serde::de::{Error as _, MapAccess, Visitor};
 use std::collections::BTreeMap;
 
-const PERSISTENT_WORKSTATION_SENTINELS: [&str; 15] = [
+const PERSISTENT_WORKSTATION_SENTINELS: [&str; 3] = [
     "/home/workspace/.local/share/mise/image-replace-sentinel",
     "/home/workspace/.cache/mise/image-replace-sentinel",
     "/home/workspace/.config/gascan/image-replace-sentinel",
-    "/home/workspace/.config/gascan/agents/claude/image-replace-sentinel",
-    "/home/workspace/.config/gascan/agents/codex/image-replace-sentinel",
-    "/home/workspace/.config/gascan/agents/pi/image-replace-sentinel",
-    "/home/workspace/.config/gascan/herdr/image-replace-sentinel",
-    "/home/workspace/.config/gascan/gh/image-replace-sentinel",
-    "/home/workspace/.config/gascan/glab/image-replace-sentinel",
-    "/home/workspace/.cache/claude/image-replace-sentinel",
-    "/home/workspace/.cache/codex/image-replace-sentinel",
-    "/home/workspace/.cache/pi/image-replace-sentinel",
-    "/home/workspace/.cache/herdr/image-replace-sentinel",
-    "/home/workspace/.cache/gh/image-replace-sentinel",
-    "/home/workspace/.cache/glab/image-replace-sentinel",
 ];
 
 #[test]
@@ -31,7 +19,7 @@ fn image_replace_preserves_durable_resources_and_rolls_back_failure() -> TestRes
     let predecessor = std::env::var("GASCAN_E2E_PREDECESSOR_IMAGE")
         .map_err(|_| "GASCAN_E2E_PREDECESSOR_IMAGE must name the compatible predecessor fixture")?;
     let approved = apple_common::approved_workspace_image()?;
-    apple_common::validate_distinct_image_fixtures(&predecessor, approved)?;
+    apple_common::validate_distinct_image_fixtures(&predecessor, &approved)?;
 
     let env = AppleE2e::new_networked("image-replace")?;
     let root = std::path::Path::new(env.root());
@@ -49,12 +37,35 @@ fn image_replace_preserves_durable_resources_and_rolls_back_failure() -> TestRes
          count=$((count + 1))\n\
          printf '%s\\n' \"$count\" >/workspace/setup-count\n",
     )?;
+    std::fs::write(
+        root.join(".gascan/workstation-state-persistence.sh"),
+        include_str!("../../../tests/image/workstation-state-persistence.sh"),
+    )?;
+    std::fs::set_permissions(
+        root.join(".gascan/workstation-state-persistence.sh"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )?;
+    std::fs::write(
+        root.join(".gascan/gascan-pi-extension.js"),
+        "export default function gascanPersistenceFixture() {}\n",
+    )?;
     env.success_with_timeout(
         ["up", root.to_str().ok_or("non-UTF-8 root")?],
         std::time::Duration::from_secs(10 * 60),
     )?;
     assert_eq!(std::fs::read_to_string(root.join("setup-count"))?, "1\n");
 
+    env.success_with_timeout(
+        [
+            "--sandbox",
+            env.id(),
+            "run",
+            "--",
+            "/workspace/.gascan/workstation-state-persistence.sh",
+            "seed",
+        ],
+        std::time::Duration::from_secs(2 * 60),
+    )?;
     for path in PERSISTENT_WORKSTATION_SENTINELS {
         env.success([
             "--sandbox",
@@ -71,11 +82,11 @@ fn image_replace_preserves_durable_resources_and_rolls_back_failure() -> TestRes
     env.success(["up", root.to_str().ok_or("non-UTF-8 root")?])?;
     env.assert_owned_container_running()?;
     env.success(["--sandbox", env.id(), "run", "--", "true"])?;
-    assert_compatible_fixture(&env)?;
+    assert_compatible_fixture(&env, true)?;
 
     env.replace_owned_container_image(&predecessor, std::time::Duration::from_secs(10 * 60))?;
     env.seed_stored_image_resolution(&predecessor)?;
-    assert_compatible_fixture(&env)?;
+    assert_compatible_fixture(&env, false)?;
     let predecessor_snapshot = env.owned_runtime_snapshot()?;
     assert!(gascan_core::runtime::same_immutable_image(
         predecessor_snapshot.container_image(),
@@ -85,7 +96,7 @@ fn image_replace_preserves_durable_resources_and_rolls_back_failure() -> TestRes
     env.assert_image_replace_root_sentinel(true)?;
 
     let status = env.status_json()?;
-    assert_image_changed(&status, &predecessor, approved)?;
+    assert_image_changed(&status, &predecessor, &approved)?;
 
     let up = env.success(["up", root.to_str().ok_or("non-UTF-8 root")?, "--json"])?;
     assert_json_phase(&up.stdout, "apply_required")?;
@@ -116,10 +127,10 @@ fn image_replace_preserves_durable_resources_and_rolls_back_failure() -> TestRes
     let approved_snapshot = env.owned_runtime_snapshot()?;
     assert!(gascan_core::runtime::same_immutable_image(
         approved_snapshot.container_image(),
-        approved
+        &approved
     ));
     predecessor_snapshot.assert_retained_identities_equal(&approved_snapshot)?;
-    assert_compatible_fixture(&env)?;
+    assert_compatible_fixture(&env, true)?;
     env.assert_image_replace_root_sentinel(false)?;
 
     env.replace_owned_container_image(&predecessor, std::time::Duration::from_secs(10 * 60))?;
@@ -154,19 +165,20 @@ fn image_replace_preserves_durable_resources_and_rolls_back_failure() -> TestRes
         &predecessor
     ));
     predecessor_snapshot.assert_retained_identities_equal(&rolled_back)?;
-    assert_compatible_fixture(&env)?;
+    assert_compatible_fixture(&env, false)?;
     env.assert_image_replace_root_sentinel(false)?;
 
     env.success(["--sandbox", env.id(), "destroy", "--yes"])?;
     env.assert_no_owned_resources()
 }
 
-fn assert_compatible_fixture(env: &AppleE2e) -> TestResult {
+fn assert_compatible_fixture(env: &AppleE2e, commands_available: bool) -> TestResult {
     let probes = PERSISTENT_WORKSTATION_SENTINELS
         .iter()
         .map(|path| format!("test \"$(cat {})\" = durable", shell_quote(path)))
         .collect::<Vec<_>>()
         .join("; ");
+    let persistence_mode = if commands_available { "probe" } else { "files" };
     let output = env.success([
         "--sandbox",
         env.id(),
@@ -174,7 +186,10 @@ fn assert_compatible_fixture(env: &AppleE2e) -> TestResult {
         "--",
         "sh",
         "-c",
-        &format!("set -eu; test \"$(id -un)\" = workspace; {probes}"),
+        &format!(
+            "set -eu; test \"$(id -un)\" = workspace; {probes}; \
+             /workspace/.gascan/workstation-state-persistence.sh {persistence_mode} >/dev/null"
+        ),
     ])?;
     if output.stdout.is_empty() {
         Ok(())
@@ -184,26 +199,15 @@ fn assert_compatible_fixture(env: &AppleE2e) -> TestResult {
 }
 
 #[test]
-fn persistent_workstation_sentinels_cover_every_managed_agent_and_forge_path() {
-    for required in [
-        "/home/workspace/.config/gascan/agents/claude/image-replace-sentinel",
-        "/home/workspace/.config/gascan/agents/codex/image-replace-sentinel",
-        "/home/workspace/.config/gascan/agents/pi/image-replace-sentinel",
-        "/home/workspace/.config/gascan/herdr/image-replace-sentinel",
-        "/home/workspace/.config/gascan/gh/image-replace-sentinel",
-        "/home/workspace/.config/gascan/glab/image-replace-sentinel",
-        "/home/workspace/.cache/claude/image-replace-sentinel",
-        "/home/workspace/.cache/codex/image-replace-sentinel",
-        "/home/workspace/.cache/pi/image-replace-sentinel",
-        "/home/workspace/.cache/herdr/image-replace-sentinel",
-        "/home/workspace/.cache/gh/image-replace-sentinel",
-        "/home/workspace/.cache/glab/image-replace-sentinel",
-    ] {
-        assert!(
-            PERSISTENT_WORKSTATION_SENTINELS.contains(&required),
-            "missing persistence sentinel: {required}"
-        );
-    }
+fn explicit_sentinels_are_limited_to_non_tool_managed_volume_roots() {
+    assert_eq!(
+        PERSISTENT_WORKSTATION_SENTINELS,
+        [
+            "/home/workspace/.local/share/mise/image-replace-sentinel",
+            "/home/workspace/.cache/mise/image-replace-sentinel",
+            "/home/workspace/.config/gascan/image-replace-sentinel",
+        ]
+    );
 }
 
 fn assert_image_changed(status: &serde_json::Value, current: &str, requested: &str) -> TestResult {
@@ -299,6 +303,20 @@ fn workstation_tools_override_wins_without_mutating_immutable_defaults() -> Test
     const OVERRIDE: &str = "1.26.4";
     let env = AppleE2e::new_networked("workstation-override")?;
     let root = std::path::Path::new(env.root());
+    let snapshot = root.join(".gascan/immutable-tree-snapshot.sh");
+    std::fs::create_dir_all(
+        snapshot
+            .parent()
+            .ok_or("snapshot helper parent is absent")?,
+    )?;
+    std::fs::write(
+        &snapshot,
+        include_str!("../../../tests/image/immutable-tree-snapshot.sh"),
+    )?;
+    std::fs::set_permissions(
+        &snapshot,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )?;
     env.success_with_timeout(
         ["up", root.to_str().ok_or("non-UTF-8 root")?],
         std::time::Duration::from_secs(10 * 60),
@@ -308,9 +326,8 @@ fn workstation_tools_override_wins_without_mutating_immutable_defaults() -> Test
         env.id(),
         "run",
         "--",
-        "sh",
-        "-c",
-        "find /opt/gascan/workstation -type f -exec sha256sum {} + | LC_ALL=C sort | sha256sum",
+        "/workspace/.gascan/immutable-tree-snapshot.sh",
+        "/opt/gascan",
     ])?;
 
     env.write_manifest(&format!(
@@ -334,7 +351,7 @@ fn workstation_tools_override_wins_without_mutating_immutable_defaults() -> Test
         "sh",
         "-c",
         "set -eu; test \"$(command -v go)\" = /home/workspace/.local/share/mise/shims/go; go version; \
-         find /opt/gascan/workstation -type f -exec sha256sum {} + | LC_ALL=C sort | sha256sum",
+         /workspace/.gascan/immutable-tree-snapshot.sh /opt/gascan",
     ])?;
     let text = std::str::from_utf8(&proof.stdout)?;
     let mut lines = text.lines();
@@ -343,9 +360,9 @@ fn workstation_tools_override_wins_without_mutating_immutable_defaults() -> Test
     }
     let after = lines
         .next()
-        .ok_or("immutable workstation digest is absent")?;
+        .ok_or("immutable /opt/gascan digest is absent")?;
     if lines.next().is_some() || before.stdout != format!("{after}\n").as_bytes() {
-        return Err("immutable /opt/gascan/workstation content changed during override".into());
+        return Err("immutable /opt/gascan content changed during override".into());
     }
 
     env.success(["--sandbox", env.id(), "destroy", "--yes"])?;

@@ -55,6 +55,7 @@ while IFS=$'\t' read -r command package; do
   printf '%s\t%s\t%s\n' "$command" "$package" "$path"
 done <<'EOF' | LC_ALL=C sort -u >"$temporary"
 dig	bind9-dnsutils
+file	file
 ifconfig	net-tools
 ip	iproute2
 nano	nano

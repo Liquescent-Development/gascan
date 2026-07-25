@@ -580,8 +580,7 @@ fn wire_event(event: StoredEvent) -> v1::OperationEvent {
     }
 }
 
-fn wire_status(record: crate::SandboxRecord) -> v1::SandboxStatus {
-    const APPROVED_IMAGE: &str = include_str!("../../../images/workspace/approved-image.txt");
+fn wire_status(record: crate::SandboxRecord, policy_image: &str) -> v1::SandboxStatus {
     let desired_state = match record.desired_state {
         DesiredState::Running => v1::DesiredState::Running,
         DesiredState::Stopped => v1::DesiredState::Stopped,
@@ -600,12 +599,12 @@ fn wire_status(record: crate::SandboxRecord) -> v1::SandboxStatus {
         .and_then(|resolution| resolution.details.get("digest"))
         .and_then(serde_json::Value::as_str)
         .filter(|current| immutable_image_reference(current))
-        .filter(|current| *current != APPROVED_IMAGE)
+        .filter(|current| *current != policy_image)
         .map(|current| {
             vec![v1::ApplyRequirement {
                 reason: "image_changed".to_owned(),
                 current: current.to_owned(),
-                requested: APPROVED_IMAGE.to_owned(),
+                requested: policy_image.to_owned(),
             }]
         })
         .unwrap_or_default();
@@ -1416,7 +1415,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             .map_err(|_| tonic::Status::internal(error_code::INTERNAL))?
             .ok_or_else(|| tonic::Status::not_found(error_code::SANDBOX_NOT_FOUND))?;
         Ok(tonic::Response::new(v1::StatusResponse {
-            sandbox: Some(wire_status(record)),
+            sandbox: Some(wire_status(record, self.service.workspace_image())),
         }))
     }
     async fn list(
@@ -1431,7 +1430,10 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             .map_err(|_| tonic::Status::internal(error_code::INTERNAL))?
             .map_err(|_| tonic::Status::internal(error_code::INTERNAL))?;
         Ok(tonic::Response::new(v1::ListResponse {
-            sandboxes: records.into_iter().map(wire_status).collect(),
+            sandboxes: records
+                .into_iter()
+                .map(|record| wire_status(record, self.service.workspace_image()))
+                .collect(),
         }))
     }
     async fn doctor(
@@ -2690,18 +2692,21 @@ mod tests {
         );
 
         let root = Utf8PathBuf::from("/workspace/api-metadata");
-        let status = wire_status(SandboxRecord {
-            id: SandboxId::from_root("metadata", &root),
-            canonical_root: root,
-            desired_state: DesiredState::Running,
-            actual_state: ActualState::Running,
-            setup_resolution: None,
-            tool_resolution: None,
-            image_resolution: None,
-            storage_resolution: None,
-            last_operation_id: Some(operation_id),
-            updated_at_millis: 1_725_000_001_456,
-        });
+        let status = wire_status(
+            SandboxRecord {
+                id: SandboxId::from_root("metadata", &root),
+                canonical_root: root,
+                desired_state: DesiredState::Running,
+                actual_state: ActualState::Running,
+                setup_resolution: None,
+                tool_resolution: None,
+                image_resolution: None,
+                storage_resolution: None,
+                last_operation_id: Some(operation_id),
+                updated_at_millis: 1_725_000_001_456,
+            },
+            gascan_core::policy::PolicyCompiler::workspace_image(),
+        );
         assert_eq!(status.last_operation_id.map(|id| id.value), Some(17));
         assert_eq!(
             status
@@ -2716,21 +2721,24 @@ mod tests {
     fn wire_status_exposes_durable_image_upgrade_requirement() {
         let root = Utf8PathBuf::from("/workspace/image-upgrade");
         let current = "registry.example/workspace:old@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let status = wire_status(SandboxRecord {
-            id: SandboxId::from_root("image-upgrade", &root),
-            canonical_root: root,
-            desired_state: DesiredState::Running,
-            actual_state: ActualState::Running,
-            setup_resolution: None,
-            tool_resolution: None,
-            image_resolution: Some(crate::ImageResolution::new(
-                1,
-                serde_json::json!({"digest": current}),
-            )),
-            storage_resolution: None,
-            last_operation_id: None,
-            updated_at_millis: 1,
-        });
+        let status = wire_status(
+            SandboxRecord {
+                id: SandboxId::from_root("image-upgrade", &root),
+                canonical_root: root,
+                desired_state: DesiredState::Running,
+                actual_state: ActualState::Running,
+                setup_resolution: None,
+                tool_resolution: None,
+                image_resolution: Some(crate::ImageResolution::new(
+                    1,
+                    serde_json::json!({"digest": current}),
+                )),
+                storage_resolution: None,
+                last_operation_id: None,
+                updated_at_millis: 1,
+            },
+            gascan_core::policy::PolicyCompiler::workspace_image(),
+        );
 
         assert_eq!(
             status.apply_requirements,
@@ -2738,6 +2746,40 @@ mod tests {
                 reason: "image_changed".to_owned(),
                 current: current.to_owned(),
                 requested: include_str!("../../../images/workspace/approved-image.txt").to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn wire_status_uses_the_service_policy_image_for_upgrade_requirements() {
+        let root = Utf8PathBuf::from("/workspace/candidate-image-upgrade");
+        let current = "registry.example/workspace:old@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let candidate = "registry.example/workspace:candidate@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let status = wire_status(
+            SandboxRecord {
+                id: SandboxId::from_root("candidate-image-upgrade", &root),
+                canonical_root: root,
+                desired_state: DesiredState::Running,
+                actual_state: ActualState::Running,
+                setup_resolution: None,
+                tool_resolution: None,
+                image_resolution: Some(crate::ImageResolution::new(
+                    1,
+                    serde_json::json!({"digest": current}),
+                )),
+                storage_resolution: None,
+                last_operation_id: None,
+                updated_at_millis: 1,
+            },
+            candidate,
+        );
+
+        assert_eq!(
+            status.apply_requirements,
+            vec![v1::ApplyRequirement {
+                reason: "image_changed".to_owned(),
+                current: current.to_owned(),
+                requested: candidate.to_owned(),
             }]
         );
     }

@@ -15,6 +15,7 @@ ca-certificates
 curl
 emacs-nox
 fd-find
+file
 fonts-liberation
 fzf
 gh
