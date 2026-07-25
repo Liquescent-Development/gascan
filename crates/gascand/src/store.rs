@@ -231,8 +231,18 @@ impl Store {
         id: &SandboxId,
         resolution: SshResolution,
     ) -> Result<(), StoreError> {
-        validate_ssh_resolution(&resolution)?;
-        let (version, details) = encode_resolution(Some(&resolution))?;
+        self.set_ssh_resolution(id, Some(resolution))
+    }
+
+    pub(crate) fn set_ssh_resolution(
+        &self,
+        id: &SandboxId,
+        resolution: Option<SshResolution>,
+    ) -> Result<(), StoreError> {
+        if let Some(resolution) = resolution.as_ref() {
+            validate_ssh_resolution(resolution)?;
+        }
+        let (version, details) = encode_resolution(resolution.as_ref())?;
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let updated = transaction.execute(

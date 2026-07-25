@@ -7,6 +7,10 @@ pub enum ReconcileFinding {
     UnknownUnowned(RuntimeResource),
     MissingOwned(SandboxId),
     OwnershipMismatch(RuntimeResource),
+    SshUnavailable {
+        sandbox_id: SandboxId,
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

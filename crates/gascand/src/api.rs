@@ -849,6 +849,13 @@ fn service_error_diagnostic(error: &ServiceError) -> String {
         ServiceError::DatabaseWorker(_) => "service_kind=database_worker".to_owned(),
         ServiceError::Fingerprint(_) => "service_kind=fingerprint".to_owned(),
         ServiceError::IncompleteDestroy(_) => "service_kind=incomplete_destroy".to_owned(),
+        ServiceError::SshPortUnavailable(_)
+        | ServiceError::SshHostKeyMismatch(_)
+        | ServiceError::SshNotReady(_)
+        | ServiceError::SshConfigUnsafe(_)
+        | ServiceError::SshConfigUpdateFailed(_) => {
+            format!("service_kind=ssh service_code={}", error.code())
+        }
         ServiceError::Rollback { original, rollback } => format!(
             "service_kind=rollback original_code={} rollback_code={}",
             original.code(),

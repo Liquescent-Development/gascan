@@ -153,6 +153,7 @@ async fn run_daemon<B: RuntimeBackend + 'static>(
         }
     };
     let service = Arc::new(service);
+    let _ = service.reconcile().await?;
     let config = DaemonConfig::new(paths, idle_timeout);
     let error_diagnostics = if std::env::var_os(gascand::TEST_ERROR_DIAGNOSTICS_ENV).is_some() {
         ErrorDiagnostics::enabled_for_tests()

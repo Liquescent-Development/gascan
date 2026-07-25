@@ -1,5 +1,7 @@
 mod config;
 mod identity;
+pub(crate) mod manager;
+pub(crate) mod port;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use rustix::fd::OwnedFd;
@@ -18,6 +20,8 @@ pub use config::{
     readiness_ssh_args,
 };
 pub use identity::{HostIdentity, ensure_host_identity};
+pub use manager::{PreparedSshCreate, SshManager};
+pub use port::PortReservation;
 
 const DIRECTORY_MODE: u16 = 0o700;
 pub(crate) const PRIVATE_MODE: u16 = 0o600;

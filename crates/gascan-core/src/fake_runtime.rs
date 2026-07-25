@@ -91,6 +91,8 @@ struct FakeState {
     exec_result: (Vec<u8>, Vec<u8>, i32, i32),
     exec_results: VecDeque<(Vec<u8>, Vec<u8>, i32, i32)>,
     exec_errors: VecDeque<RuntimeError>,
+    create_errors: VecDeque<RuntimeError>,
+    created_ssh_host_ports: VecDeque<u16>,
     exec_input_failures: usize,
     exec_stream_errors: VecDeque<RuntimeError>,
     exec_cancellations: usize,
@@ -113,6 +115,8 @@ impl FakeRuntime {
                 exec_result: (Vec::new(), Vec::new(), 0, 0),
                 exec_results: VecDeque::new(),
                 exec_errors: VecDeque::new(),
+                create_errors: VecDeque::new(),
+                created_ssh_host_ports: VecDeque::new(),
                 exec_input_failures: 0,
                 exec_stream_errors: VecDeque::new(),
                 exec_cancellations: 0,
@@ -219,6 +223,46 @@ impl FakeRuntime {
 
     pub async fn queue_exec_error(&self, error: RuntimeError) {
         self.inner.lock().await.exec_errors.push_back(error);
+    }
+
+    pub async fn queue_create_error(&self, error: RuntimeError) {
+        self.inner.lock().await.create_errors.push_back(error);
+    }
+
+    pub async fn queue_created_ssh_host_port(&self, port: u16) {
+        self.inner
+            .lock()
+            .await
+            .created_ssh_host_ports
+            .push_back(port);
+    }
+
+    pub async fn set_sandbox_ports(
+        &self,
+        id: &SandboxId,
+        ports: Vec<crate::runtime::RuntimePort>,
+    ) -> Result<(), RuntimeError> {
+        let mut state = self.inner.lock().await;
+        state
+            .sandboxes
+            .get_mut(id)
+            .ok_or_else(|| missing(id))?
+            .ports = ports;
+        persist_state(&state, self.persistence.as_deref())
+    }
+
+    pub async fn set_sandbox_image(
+        &self,
+        id: &SandboxId,
+        image: String,
+    ) -> Result<(), RuntimeError> {
+        let mut state = self.inner.lock().await;
+        state
+            .sandboxes
+            .get_mut(id)
+            .ok_or_else(|| missing(id))?
+            .image = image;
+        persist_state(&state, self.persistence.as_deref())
     }
 
     pub async fn queue_exec_input_failure(&self) {
@@ -449,6 +493,8 @@ fn load_state(capabilities: RuntimeCapabilities, path: &Path) -> Result<FakeStat
         exec_result: (Vec::new(), Vec::new(), 0, 0),
         exec_results: VecDeque::new(),
         exec_errors: VecDeque::new(),
+        create_errors: VecDeque::new(),
+        created_ssh_host_ports: VecDeque::new(),
         exec_input_failures: 0,
         exec_stream_errors: VecDeque::new(),
         exec_cancellations: 0,
@@ -562,6 +608,13 @@ impl RuntimeBackend for FakeRuntime {
     async fn create(&self, request: CreateRequest) -> Result<CreateOutcome, CreateFailure> {
         let mut state = self.inner.lock().await;
         state.calls.push(RuntimeCall::Create(request.clone()));
+        if let Some(error) = state.create_errors.pop_front() {
+            state.outcomes.push(RuntimeOutcome::Failure {
+                boundary: "create".to_owned(),
+                code: error.code().to_owned(),
+            });
+            return Err(CreateFailure::from_source(error));
+        }
         fail_once(&mut state, FailureBoundary::Create).map_err(CreateFailure::from_source)?;
         if request.id != request.ownership.sandbox_id {
             return Err(CreateFailure::from_source(
@@ -628,6 +681,7 @@ impl RuntimeBackend for FakeRuntime {
                 fail_after_create_mutation(&mut state, &request, &created)?;
             }
         }
+        let ports = observed_created_ports(&request, &mut state);
         state.sandboxes.insert(
             request.id.clone(),
             RuntimeSandbox {
@@ -635,7 +689,7 @@ impl RuntimeBackend for FakeRuntime {
                 image: request.image.clone(),
                 state: ContainerState::Stopped,
                 ownership: request.ownership.clone(),
-                ports: request.ports.clone(),
+                ports,
             },
         );
         let identity = ResourceIdentity::new(ResourceKind::Container, request.id.to_string())
@@ -686,6 +740,13 @@ impl RuntimeBackend for FakeRuntime {
         state
             .calls
             .push(RuntimeCall::CreateContainer(request.clone()));
+        if let Some(error) = state.create_errors.pop_front() {
+            state.outcomes.push(RuntimeOutcome::Failure {
+                boundary: "create_container".to_owned(),
+                code: error.code().to_owned(),
+            });
+            return Err(CreateFailure::from_source(error));
+        }
         fail_once(&mut state, FailureBoundary::CreateContainer)
             .map_err(CreateFailure::from_source)?;
         let create = request.create();
@@ -704,6 +765,7 @@ impl RuntimeBackend for FakeRuntime {
                 ));
             }
         }
+        let ports = observed_created_ports(create, &mut state);
         state.sandboxes.insert(
             create.id().clone(),
             RuntimeSandbox {
@@ -711,7 +773,7 @@ impl RuntimeBackend for FakeRuntime {
                 image: create.image().to_owned(),
                 state: ContainerState::Stopped,
                 ownership: create.ownership().clone(),
-                ports: create.ports().to_vec(),
+                ports,
             },
         );
         let identity = ResourceIdentity::new(ResourceKind::Container, create.id().to_string())
@@ -992,6 +1054,19 @@ fn create_failure(
     source: RuntimeError,
 ) -> CreateFailure {
     CreateFailure::new(request, created, source).unwrap_or_else(CreateFailure::from_source)
+}
+
+fn observed_created_ports(
+    request: &CreateRequest,
+    state: &mut FakeState,
+) -> Vec<crate::runtime::RuntimePort> {
+    let mut ports = request.ports().to_vec();
+    if let Some(host_port) = state.created_ssh_host_ports.pop_front()
+        && let Some(mapping) = ports.iter_mut().find(|mapping| mapping.guest_port == 22)
+    {
+        mapping.host_port = host_port;
+    }
+    ports
 }
 
 fn fail_after_create_mutation(

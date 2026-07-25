@@ -32,6 +32,10 @@ impl PreparedSshFiles {
     pub fn known_hosts(&self) -> &Utf8Path {
         &self.known_hosts
     }
+
+    pub(crate) fn config_bytes(&self) -> &[u8] {
+        &self.config
+    }
 }
 
 pub fn publish_openssh_files(

@@ -1,12 +1,12 @@
 use async_trait::async_trait;
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use gascan_core::fake_runtime::{FailureBoundary, FakeRuntime};
 use gascan_core::manifest::Manifest;
 use gascan_core::runtime::{ContainerState, RuntimeBackend, RuntimeCall};
 use gascan_core::sandbox::SandboxSpec;
 use gascand::{
     ActualState, NoopProvisioner, ProvisionRequest, ProvisionResolution, Provisioner,
-    SandboxService, ServiceError, UpRequest,
+    SandboxService, ServiceError, SshPaths, UpRequest, ensure_host_identity,
 };
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
@@ -15,6 +15,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+fn ssh_paths(root: &Utf8Path, name: &str) -> TestResult<SshPaths> {
+    let config_home = root.join(name);
+    std::fs::create_dir(&config_home)?;
+    let config_home = std::fs::canonicalize(config_home)?;
+    Ok(SshPaths::for_environment(
+        Some(config_home.as_os_str()),
+        None,
+    )?)
+}
 
 fn digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
@@ -492,5 +502,71 @@ async fn later_provision_failure_does_not_advance_setup_digest() -> TestResult {
         service.status(&id)?.ok_or("failed")?.setup_resolution,
         prior
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ssh_image_apply_preserves_fingerprints_while_accepting_new_inspected_automatic_port()
+-> TestResult {
+    let old_image = "ghcr.io/liquescent-development/gascan/workspace:old@sha256:\
+                     bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    std::fs::write(
+        root.join("gascan.toml"),
+        "version = 1\nnetwork = 'networked'\n",
+    )?;
+    let desired = spec(root, "ssh-image-apply")?;
+    let paths = ssh_paths(root, "ssh-client")?;
+    let host_paths = ssh_paths(root, "ssh-host")?;
+    let host_public_key = ensure_host_identity(&host_paths)
+        .await?
+        .public_key()
+        .to_owned();
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    runtime.queue_created_ssh_host_port(24_001).await;
+    let service = SandboxService::new_with_ssh_for_tests(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+        paths.clone(),
+        Utf8PathBuf::from("/usr/bin/true"),
+    );
+    service.up(UpRequest::new(desired.clone())).await?;
+    let prior = service
+        .status(desired.id())?
+        .ok_or("prior record")?
+        .ssh_resolution
+        .ok_or("prior SSH resolution")?;
+    runtime
+        .set_sandbox_image(desired.id(), old_image.to_owned())
+        .await?;
+    let mut record = service.status(desired.id())?.ok_or("record")?;
+    record.image_resolution = Some(gascand::ImageResolution::new(
+        1,
+        serde_json::json!({"digest":old_image}),
+    ));
+    service.store().put_sandbox(&record)?;
+    runtime.queue_created_ssh_host_port(24_002).await;
+
+    service.apply(UpRequest::new(desired.clone())).await?;
+
+    let applied = service.status(desired.id())?.ok_or("applied record")?;
+    assert_eq!(applied.ssh_resolution, Some(prior));
+    assert_eq!(
+        runtime
+            .inspect(desired.id())
+            .await?
+            .ok_or("replacement runtime")?
+            .ports()[0]
+            .host_port,
+        24_002
+    );
+    let config = std::fs::read_to_string(paths.config())?;
+    assert!(config.contains(&format!("Host gascan-{}", desired.id())));
+    assert!(config.contains("    Port 24002\n"));
     Ok(())
 }

@@ -1,21 +1,71 @@
 use async_trait::async_trait;
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use gascan_core::fake_runtime::FakeRuntime;
 use gascan_core::manifest::Manifest;
 use gascan_core::policy::PolicyCompiler;
-use gascan_core::runtime::{ResourceKind, ResourceOwnership, RuntimeBackend};
+use gascan_core::runtime::{ResourceKind, ResourceOwnership, RuntimeBackend, RuntimePort};
 use gascan_core::sandbox::SandboxSpec;
 use gascand::{
     ActualState, DesiredState, NoopProvisioner, OperationKind, OperationStatus, ProvisionRequest,
     ProvisionResolution, Provisioner, ReconcileFinding, SandboxRecord, SandboxService,
-    ServiceError, Store, UpRequest,
+    ServiceError, SshPaths, SshResolution, Store, UpRequest, ensure_host_identity,
 };
 use serde_json::json;
 use std::error::Error;
+use std::net::{IpAddr, Ipv4Addr};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
+
+type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+fn ssh_paths(root: &Utf8Path, name: &str) -> TestResult<SshPaths> {
+    let config_home = root.join(name);
+    std::fs::create_dir(&config_home)?;
+    let config_home = std::fs::canonicalize(config_home)?;
+    Ok(SshPaths::for_environment(
+        Some(config_home.as_os_str()),
+        None,
+    )?)
+}
+
+fn readiness_program(root: &Utf8Path, failing_port: Option<u16>) -> TestResult<Utf8PathBuf> {
+    let path = root.join(format!(
+        "readiness-{}",
+        failing_port.map_or_else(|| "ok".to_owned(), |port| port.to_string())
+    ));
+    let failure = failing_port.map_or_else(String::new, |port| {
+        format!("for arg do [ \"$arg\" = \"Port={port}\" ] && exit 19; done\n")
+    });
+    std::fs::write(&path, format!("#!/bin/sh\nset -eu\n{failure}exit 0\n"))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    Ok(path)
+}
+
+fn ssh_service(
+    runtime: FakeRuntime,
+    store: Store,
+    paths: SshPaths,
+    readiness: Utf8PathBuf,
+) -> SandboxService<FakeRuntime> {
+    SandboxService::new_with_ssh_for_tests(
+        runtime,
+        store,
+        Arc::new(NoopProvisioner),
+        paths,
+        readiness,
+    )
+}
+
+fn ssh_mapping(port: u16) -> RuntimePort {
+    RuntimePort {
+        host_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        host_port: port,
+        guest_port: 22,
+    }
+}
 
 #[tokio::test]
 async fn reconcile_reports_unknown_owned_resources_without_deleting() -> Result<(), Box<dyn Error>>
@@ -64,7 +114,7 @@ async fn reconcile_does_not_report_a_known_sandbox_network_as_unknown() -> Resul
     std::fs::create_dir(&root)?;
     std::fs::write(
         root.join("gascan.toml"),
-        "version = 1\nnetwork = 'networked'\n",
+        "version = 1\nnetwork = 'networked'\n[ssh]\nenabled = false\n",
     )?;
     let spec = SandboxSpec::from_root("known-network", &root, Manifest::load(&root)?)?;
     let id = spec.id().clone();
@@ -404,4 +454,201 @@ impl Provisioner for SlowProvisioner {
         std::thread::sleep(Duration::from_millis(150));
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn ssh_reconcile_reconstructs_owned_running_verified_alias_from_inspected_mapping()
+-> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    std::fs::write(
+        root.join("gascan.toml"),
+        "version = 1\nnetwork = 'networked'\n",
+    )?;
+    let spec = SandboxSpec::from_root("ssh-restart", root, Manifest::load(root)?)?;
+    let state_path = root.join("state.db");
+    let paths = ssh_paths(root, "ssh-client")?;
+    let host_paths = ssh_paths(root, "ssh-host")?;
+    let host_public_key = ensure_host_identity(&host_paths)
+        .await?
+        .public_key()
+        .to_owned();
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    runtime.queue_created_ssh_host_port(25_001).await;
+    let first = ssh_service(
+        runtime.clone(),
+        Store::open(&state_path)?,
+        paths.clone(),
+        readiness_program(root, None)?,
+    );
+    first.up(UpRequest::new(spec.clone())).await?;
+    std::fs::remove_file(paths.config())?;
+    drop(first);
+
+    let restarted = ssh_service(
+        runtime,
+        Store::open(&state_path)?,
+        paths.clone(),
+        readiness_program(root, None)?,
+    );
+    let report = restarted.reconcile().await?;
+
+    assert!(!report.findings.iter().any(
+        |finding| matches!(finding, ReconcileFinding::SshUnavailable { sandbox_id, .. } if sandbox_id == spec.id())
+    ));
+    let config = std::fs::read_to_string(paths.config())?;
+    assert!(config.contains(&format!("Host gascan-{}", spec.id())));
+    assert!(config.contains("    Port 25001\n"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn ssh_reconcile_publishes_one_complete_generation_and_isolates_broken_records() -> TestResult
+{
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    std::fs::write(
+        root.join("gascan.toml"),
+        "version = 1\nnetwork = 'networked'\n",
+    )?;
+    let valid_spec = SandboxSpec::from_root("ssh-valid", root, Manifest::load(root)?)?;
+    let state_path = root.join("state.db");
+    let paths = ssh_paths(root, "ssh-matrix-client")?;
+    let host_paths = ssh_paths(root, "ssh-matrix-host")?;
+    let host_public_key = ensure_host_identity(&host_paths)
+        .await?
+        .public_key()
+        .to_owned();
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    runtime.queue_created_ssh_host_port(25_001).await;
+    let first = ssh_service(
+        runtime.clone(),
+        Store::open(&state_path)?,
+        paths.clone(),
+        readiness_program(root, None)?,
+    );
+    first.up(UpRequest::new(valid_spec.clone())).await?;
+    let valid_record = first.status(valid_spec.id())?.ok_or("valid record")?;
+    let verified = valid_record
+        .ssh_resolution
+        .clone()
+        .ok_or("verified SSH resolution")?;
+    std::fs::remove_file(paths.config())?;
+    drop(first);
+
+    let store = Store::open(&state_path)?;
+    for (name, actual, resolution, ports, running) in [
+        (
+            "ssh-broken",
+            ActualState::Running,
+            verified.clone(),
+            vec![ssh_mapping(25_005)],
+            true,
+        ),
+        (
+            "ssh-disabled",
+            ActualState::Running,
+            SshResolution::new(
+                1,
+                json!({
+                    "enabled": false,
+                    "host_key_fingerprint": "",
+                    "client_key_fingerprint": "",
+                }),
+            ),
+            vec![ssh_mapping(25_006)],
+            true,
+        ),
+        (
+            "ssh-malformed",
+            ActualState::Running,
+            verified.clone(),
+            vec![ssh_mapping(25_007), ssh_mapping(25_008)],
+            true,
+        ),
+        (
+            "ssh-offline",
+            ActualState::Running,
+            SshResolution::new(
+                1,
+                json!({
+                    "enabled": false,
+                    "host_key_fingerprint": "",
+                    "client_key_fingerprint": "",
+                }),
+            ),
+            Vec::new(),
+            true,
+        ),
+        (
+            "ssh-stopped",
+            ActualState::Stopped,
+            verified.clone(),
+            vec![ssh_mapping(25_009)],
+            false,
+        ),
+    ] {
+        let id = gascan_core::sandbox::SandboxId::test(name);
+        store.put_sandbox(&SandboxRecord {
+            id: id.clone(),
+            canonical_root: Utf8PathBuf::from(format!("/fixtures/{name}")),
+            desired_state: DesiredState::Running,
+            actual_state: actual,
+            setup_resolution: None,
+            tool_resolution: None,
+            image_resolution: valid_record.image_resolution.clone(),
+            storage_resolution: valid_record.storage_resolution.clone(),
+            ssh_resolution: Some(resolution),
+            last_operation_id: None,
+            updated_at_millis: 0,
+        })?;
+        runtime.seed_owned(id.clone()).await;
+        runtime.set_sandbox_ports(&id, ports).await?;
+        if running {
+            runtime.start(&id).await?;
+        }
+    }
+    runtime
+        .queue_exec_results([
+            (format!("{host_public_key}\n").into_bytes(), Vec::new(), 0),
+            (format!("{host_public_key}\n").into_bytes(), Vec::new(), 0),
+        ])
+        .await;
+    let restarted = ssh_service(
+        runtime,
+        store,
+        paths.clone(),
+        readiness_program(root, Some(25_005))?,
+    );
+
+    let report = restarted.reconcile().await?;
+
+    assert!(report.findings.iter().any(
+        |finding| matches!(finding, ReconcileFinding::SshUnavailable { sandbox_id, .. } if sandbox_id.as_str().starts_with("ssh-broken-"))
+    ));
+    assert!(report.findings.iter().any(
+        |finding| matches!(finding, ReconcileFinding::SshUnavailable { sandbox_id, .. } if sandbox_id.as_str().starts_with("ssh-malformed-"))
+    ));
+    let config = std::fs::read_to_string(paths.config())?;
+    assert!(config.contains("Host gascan-ssh-valid"));
+    for unpublished in [
+        "ssh-broken",
+        "ssh-disabled",
+        "ssh-malformed",
+        "ssh-offline",
+        "ssh-stopped",
+    ] {
+        assert!(
+            !config.contains(&format!("Host gascan-{unpublished}")),
+            "{unpublished} was unexpectedly published:\n{config}"
+        );
+    }
+    assert_eq!(config.matches("\nHost ").count(), 1);
+    Ok(())
 }
