@@ -5,7 +5,7 @@
 /// Supported API major version.
 pub const API_MAJOR: u32 = 1;
 /// Current backwards-compatible API minor version.
-pub const API_MINOR: u32 = 2;
+pub const API_MINOR: u32 = 3;
 /// Required POSIX permission bits for the local socket directory (`0700`).
 pub const SOCKET_DIRECTORY_MODE: u32 = 0o700;
 /// Required POSIX permission bits for the local socket (`0600`).
@@ -47,6 +47,22 @@ pub mod error_code {
     pub const EXPIRED_SESSION_TOKEN: &str = "expired_session_token";
     /// A later frame tried to change the session bound by the first frame.
     pub const SESSION_TOKEN_MISMATCH: &str = "session_token_mismatch";
+    /// SSH requires a networked sandbox.
+    pub const SSH_REQUIRES_NETWORK: &str = "ssh_requires_network";
+    /// SSH is disabled for the selected sandbox.
+    pub const SSH_DISABLED: &str = "ssh_disabled";
+    /// SSH has not published a verified active alias.
+    pub const SSH_NOT_READY: &str = "ssh_not_ready";
+    /// The requested loopback SSH host port is unavailable.
+    pub const SSH_PORT_UNAVAILABLE: &str = "ssh_port_unavailable";
+    /// The verified SSH host identity changed.
+    pub const SSH_HOST_KEY_MISMATCH: &str = "ssh_host_key_mismatch";
+    /// Managed SSH configuration is unsafe.
+    pub const SSH_CONFIG_UNSAFE: &str = "ssh_config_unsafe";
+    /// Managed SSH configuration could not be updated atomically.
+    pub const SSH_CONFIG_UPDATE_FAILED: &str = "ssh_config_update_failed";
+    /// The system OpenSSH client is unavailable.
+    pub const SSH_CLIENT_UNAVAILABLE: &str = "ssh_client_unavailable";
 
     /// All codes defined by API v1.
     pub const ALL: &[&str] = &[
@@ -66,6 +82,14 @@ pub mod error_code {
         UNKNOWN_SESSION_TOKEN,
         EXPIRED_SESSION_TOKEN,
         SESSION_TOKEN_MISMATCH,
+        SSH_REQUIRES_NETWORK,
+        SSH_DISABLED,
+        SSH_NOT_READY,
+        SSH_PORT_UNAVAILABLE,
+        SSH_HOST_KEY_MISMATCH,
+        SSH_CONFIG_UNSAFE,
+        SSH_CONFIG_UPDATE_FAILED,
+        SSH_CLIENT_UNAVAILABLE,
     ];
 }
 

@@ -4,11 +4,16 @@ use crate::presentation::{
     render_doctor as render_human_doctor, render_error as render_human_error,
     render_list as render_human_list, render_status as render_human_status,
 };
+use crate::ssh_config::{
+    IncludeChange, OfferAnswer, SshConfig, answer_first_use_offer, first_use_offer,
+};
 use crate::terminal::RawTerminal;
-use clap::{Parser, Subcommand, error::ErrorKind};
+use clap::{CommandFactory as _, Parser, Subcommand, error::ErrorKind};
 use gascan_proto::v1;
+use std::ffi::{OsStr, OsString};
 use std::io::{IsTerminal, Write};
 use std::os::fd::AsFd;
+use std::path::{Path, PathBuf};
 
 const EXIT_USAGE: i32 = 64;
 const EXIT_DAEMON: i32 = 69;
@@ -74,10 +79,37 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    Ssh {
+        #[arg(last = true)]
+        argv: Vec<OsString>,
+    },
+    SshConfig {
+        #[command(subcommand)]
+        command: SshConfigCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum SshConfigCommand {
+    Install,
+    Remove,
+    Path,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SshInvocation {
+    pub program: PathBuf,
+    pub arguments: Vec<OsString>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedSshArguments {
+    pub sandbox: Option<String>,
+    pub remote: Vec<OsString>,
 }
 
 #[derive(Debug)]
-pub(crate) enum UsageKind {
+pub enum UsageKind {
     NoSandbox,
     MultipleSandboxes,
     Other,
@@ -256,15 +288,23 @@ pub async fn execute() -> Result<i32, CliError> {
         );
         return Ok(0);
     }
+    if let Command::SshConfig { command } = arguments.command {
+        return execute_ssh_config(command);
+    }
     let mut client = Client::connect_or_start().await?;
     match arguments.command {
         Command::DaemonAttest => Ok(0),
         Command::Up { project_root, json } => {
             let project_root = resolve_project_root(&project_root)?;
             match client.api.up(v1::UpRequest { project_root }).await {
-                Ok(response) => {
-                    operation(response.into_inner(), json, OperationKind::Up, None).await
-                }
+                Ok(response) => operation(response.into_inner(), json, OperationKind::Up, None)
+                    .await
+                    .and_then(|code| {
+                        if code == 0 && !json {
+                            offer_ssh_config_include()?;
+                        }
+                        Ok(code)
+                    }),
                 Err(status) => pre_stream_operation_failure(status.into(), json),
             }
         }
@@ -401,6 +441,186 @@ pub async fn execute() -> Result<i32, CliError> {
             follow,
             since_millis,
         } => logs(&mut client, arguments.sandbox, follow, since_millis).await,
+        Command::Ssh { argv } => ssh(&mut client, arguments.sandbox, argv).await,
+        Command::SshConfig { .. } => Ok(0),
+    }
+}
+
+async fn ssh(
+    client: &mut Client,
+    explicit: Option<String>,
+    remote: Vec<OsString>,
+) -> Result<i32, CliError> {
+    let selector = selector(client, explicit).await?;
+    let status = client
+        .api
+        .status(v1::StatusRequest {
+            sandbox: Some(selector),
+        })
+        .await?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| CliError::Runtime("daemon returned no sandbox status".to_owned()))?;
+    let config = SshConfig::for_user().map_err(ssh_config_error)?;
+    let invocation = ssh_invocation(&status, config.managed_config_path(), remote)?;
+    wait_for_ssh(
+        &invocation.program,
+        &invocation.arguments,
+        std::iter::empty::<(OsString, OsString)>(),
+    )
+    .map_err(|_| CliError::Operation {
+        code: gascan_proto::error_code::SSH_CLIENT_UNAVAILABLE.to_owned(),
+        message: "the system OpenSSH client could not be started".to_owned(),
+    })
+}
+
+fn execute_ssh_config(command: SshConfigCommand) -> Result<i32, CliError> {
+    let config = SshConfig::for_user().map_err(ssh_config_error)?;
+    match command {
+        SshConfigCommand::Install => match config.install().map_err(ssh_config_error)? {
+            IncludeChange::Changed => println!("Installed the Gas Can SSH include."),
+            IncludeChange::Unchanged => println!("The Gas Can SSH include is already installed."),
+        },
+        SshConfigCommand::Remove => match config.remove().map_err(ssh_config_error)? {
+            IncludeChange::Changed => println!("Removed the Gas Can SSH include."),
+            IncludeChange::Unchanged => println!("The Gas Can SSH include is not installed."),
+        },
+        SshConfigCommand::Path => println!("{}", config.managed_config_path().display()),
+    }
+    Ok(0)
+}
+
+fn ssh_config_error(error: crate::ssh_config::SshConfigError) -> CliError {
+    CliError::Operation {
+        code: gascan_proto::error_code::SSH_CONFIG_UNSAFE.to_owned(),
+        message: format!("SSH configuration is unsafe: {error}"),
+    }
+}
+
+fn offer_ssh_config_include() -> Result<(), CliError> {
+    if !std::io::stdin().is_terminal()
+        || !std::io::stderr().is_terminal()
+        || continuous_integration()
+    {
+        return Ok(());
+    }
+    let config = SshConfig::for_user().map_err(ssh_config_error)?;
+    if !first_use_offer(&config, true, true).map_err(ssh_config_error)? {
+        return Ok(());
+    }
+    eprint!("Add Gas Can's generated SSH hosts to ~/.ssh/config? [Y/n] ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if answer_first_use_offer(&config, &answer).map_err(ssh_config_error)? == OfferAnswer::Declined
+    {
+        eprintln!("Run `gascan ssh-config install` to add it later.");
+    }
+    Ok(())
+}
+
+fn continuous_integration() -> bool {
+    ["CI", "GITHUB_ACTIONS", "BUILD_BUILDID"]
+        .into_iter()
+        .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+}
+
+pub fn ssh_invocation<I>(
+    status: &v1::SandboxStatus,
+    managed_config: &Path,
+    remote: I,
+) -> Result<SshInvocation, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let Some(ssh) = status.ssh.as_ref() else {
+        return Err(CliError::Operation {
+            code: gascan_proto::error_code::SSH_NOT_READY.to_owned(),
+            message: "SSH status is unavailable; restart Gas Can and run `gascan up`".to_owned(),
+        });
+    };
+    if !ssh.enabled {
+        return Err(CliError::Operation {
+            code: gascan_proto::error_code::SSH_DISABLED.to_owned(),
+            message: "SSH requires a networked sandbox with SSH enabled".to_owned(),
+        });
+    }
+    if !ssh.active {
+        return Err(CliError::Operation {
+            code: gascan_proto::error_code::SSH_NOT_READY.to_owned(),
+            message: "SSH is not ready; run `gascan up <project-root>`".to_owned(),
+        });
+    }
+    let alias = ssh.alias.as_deref();
+    let expected_alias = format!("gascan-{}", status.sandbox_id);
+    let valid = ssh.host.as_deref() == Some("127.0.0.1")
+        && ssh
+            .port
+            .is_some_and(|port| (1024..=u32::from(u16::MAX)).contains(&port))
+        && alias == Some(expected_alias.as_str())
+        && ssh
+            .host_key_fingerprint
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        && ssh
+            .client_key_fingerprint
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        && managed_config.is_absolute();
+    if !valid {
+        return Err(CliError::Operation {
+            code: gascan_proto::error_code::SSH_NOT_READY.to_owned(),
+            message: "SSH status is incomplete or unsafe; run `gascan up` again".to_owned(),
+        });
+    }
+    let mut arguments = vec![
+        OsString::from("-F"),
+        managed_config.as_os_str().to_owned(),
+        OsString::from(expected_alias),
+    ];
+    arguments.extend(remote);
+    Ok(SshInvocation {
+        program: PathBuf::from("/usr/bin/ssh"),
+        arguments,
+    })
+}
+
+pub fn wait_for_ssh<I, K, V>(
+    program: &Path,
+    arguments: &[OsString],
+    environment: I,
+) -> Result<i32, std::io::Error>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
+    let status = std::process::Command::new(program)
+        .args(arguments)
+        .envs(environment)
+        .status()?;
+    if let Some(code) = status.code() {
+        return Ok(code);
+    }
+    use std::os::unix::process::ExitStatusExt as _;
+    Ok(status.signal().map_or(EXIT_RUNTIME, |signal| 128 + signal))
+}
+
+pub fn ssh_arguments_from<I, T>(arguments: I) -> Result<ParsedSshArguments, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let parsed = Arguments::try_parse_from(arguments)?;
+    match parsed.command {
+        Command::Ssh { argv } => Ok(ParsedSshArguments {
+            sandbox: parsed.sandbox,
+            remote: argv,
+        }),
+        _ => {
+            Err(Arguments::command()
+                .error(ErrorKind::InvalidSubcommand, "expected the ssh command"))
+        }
     }
 }
 
@@ -766,6 +986,14 @@ fn actual_name(value: i32) -> &'static str {
     }
 }
 fn status_json(status: &v1::SandboxStatus) -> serde_json::Value {
+    let ssh = status.ssh.as_ref();
+    let ssh_state = match ssh {
+        Some(ssh) if !ssh.enabled => "disabled",
+        Some(ssh) if ssh.active => "ready",
+        Some(_) if status.actual_state == v1::ActualState::Pending as i32 => "starting",
+        Some(_) if status.actual_state == v1::ActualState::Failed as i32 => "unhealthy",
+        Some(_) | None => "unavailable",
+    };
     serde_json::json!({
         "sandbox_id": status.sandbox_id,
         "actual_state": actual_name(status.actual_state),
@@ -776,6 +1004,16 @@ fn status_json(status: &v1::SandboxStatus) -> serde_json::Value {
                 "requested": requirement.requested,
             })
         }).collect::<Vec<_>>(),
+        "ssh": {
+            "enabled": ssh.is_some_and(|ssh| ssh.enabled),
+            "active": ssh.is_some_and(|ssh| ssh.active),
+            "state": ssh_state,
+            "host": ssh.and_then(|ssh| ssh.host.as_deref()),
+            "port": ssh.and_then(|ssh| ssh.port),
+            "alias": ssh.and_then(|ssh| ssh.alias.as_deref()),
+            "host_key_fingerprint": ssh.and_then(|ssh| ssh.host_key_fingerprint.as_deref()),
+            "client_key_fingerprint": ssh.and_then(|ssh| ssh.client_key_fingerprint.as_deref()),
+        },
     })
 }
 fn render_status(status: &v1::SandboxStatus, json: bool) -> Result<(), CliError> {
@@ -828,7 +1066,6 @@ fn confirm_destroy() -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory as _;
 
     #[test]
     fn root_help_advertises_the_standard_version_flags() {
@@ -864,6 +1101,48 @@ mod tests {
                     "current": current,
                     "requested": requested,
                 }],
+                "ssh": {
+                    "enabled": false,
+                    "active": false,
+                    "state": "unavailable",
+                    "host": null,
+                    "port": null,
+                    "alias": null,
+                    "host_key_fingerprint": null,
+                    "client_key_fingerprint": null,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn status_json_exposes_active_ssh_as_separate_structured_fields() {
+        let status = v1::SandboxStatus {
+            sandbox_id: "code-123".to_owned(),
+            actual_state: v1::ActualState::Running as i32,
+            ssh: Some(v1::SshStatus {
+                enabled: true,
+                active: true,
+                host: Some("127.0.0.1".to_owned()),
+                port: Some(22222),
+                alias: Some("gascan-code-123".to_owned()),
+                host_key_fingerprint: Some("SHA256:host".to_owned()),
+                client_key_fingerprint: Some("SHA256:client".to_owned()),
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            status_json(&status)["ssh"],
+            serde_json::json!({
+                "enabled": true,
+                "active": true,
+                "state": "ready",
+                "host": "127.0.0.1",
+                "port": 22222,
+                "alias": "gascan-code-123",
+                "host_key_fingerprint": "SHA256:host",
+                "client_key_fingerprint": "SHA256:client",
             })
         );
     }

@@ -1,6 +1,7 @@
+use gascan_core::sandbox::SandboxId;
 use gascand::{
-    ActiveSsh, ManagedSshHost, SshPaths, ensure_host_identity, prepare_openssh_files,
-    publish_openssh_files, readiness_ssh_args,
+    ActiveSsh, ManagedSshHost, SshManager, SshPaths, SshResolution, ensure_host_identity,
+    prepare_openssh_files, publish_openssh_files, readiness_ssh_args,
 };
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
@@ -704,6 +705,38 @@ async fn publication_reloads_and_revalidates_the_managed_identity_pair() -> Test
 
     assert!(publish_openssh_files(&managed_paths, &stale_identity, &[stale_host]).is_err());
     assert!(!managed_paths.config().exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn published_status_reads_only_the_matching_committed_alias() -> TestResult {
+    let temp = TempDir::new()?;
+    let paths = paths(&temp)?;
+    let identity = ensure_host_identity(&paths).await?;
+    let id = SandboxId::try_from("code-123456789abc".to_owned())?;
+    let managed = host("gascan-code-123456789abc", 22222, &identity);
+    let expected = SshResolution::new(
+        1,
+        serde_json::json!({
+            "enabled": true,
+            "host_key_fingerprint": managed.active.host_key_fingerprint.clone(),
+            "client_key_fingerprint": managed.active.client_key_fingerprint.clone(),
+        }),
+    );
+
+    assert_eq!(
+        SshManager
+            .published_for_paths(&id, Some(&expected), &paths)
+            .await?,
+        None
+    );
+    publish_openssh_files(&paths, &identity, std::slice::from_ref(&managed))?;
+    assert_eq!(
+        SshManager
+            .published_for_paths(&id, Some(&expected), &paths)
+            .await?,
+        Some(managed.active)
+    );
     Ok(())
 }
 

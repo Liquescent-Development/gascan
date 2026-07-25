@@ -540,8 +540,8 @@ fn inspection_confirmation_and_remaining_commands_are_stable() -> TestResult {
     let status = String::from_utf8(env.invoke(&["status"])?.stdout)?;
     let sandbox_id = status
         .strip_prefix("Sandbox: ")
-        .and_then(|status| status.strip_suffix("\nState:   Running\n"))
-        .ok_or("unexpected human status output")?;
+        .and_then(|status| status.strip_suffix("\nState:   Running\nSSH     Disabled\n"))
+        .ok_or_else(|| format!("unexpected human status output: {status:?}"))?;
     let list = String::from_utf8(env.invoke(&["list"])?.stdout)?;
     let width = sandbox_id.len().max("SANDBOX".len());
     assert_eq!(

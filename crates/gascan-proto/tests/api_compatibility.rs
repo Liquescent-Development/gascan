@@ -241,13 +241,83 @@ fn public_error_codes_are_stable_and_unique() {
 }
 
 #[test]
-fn image_upgrade_is_an_additive_api_minor_change() {
+fn ssh_status_is_an_additive_api_minor_change() {
     assert_eq!(API_MAJOR, 1);
-    assert_eq!(API_MINOR, 2);
+    assert_eq!(API_MINOR, 3);
 
     let descriptor =
         FileDescriptorSet::decode(FILE_DESCRIPTOR_SET).expect("descriptor must decode");
     let file = api_file(&descriptor);
+    assert_message_exact(
+        file,
+        "SshStatus",
+        &[
+            (
+                "enabled",
+                1,
+                field_descriptor_proto::Type::Bool,
+                field_descriptor_proto::Label::Optional,
+                None,
+                None,
+            ),
+            (
+                "active",
+                2,
+                field_descriptor_proto::Type::Bool,
+                field_descriptor_proto::Label::Optional,
+                None,
+                None,
+            ),
+            (
+                "host",
+                3,
+                field_descriptor_proto::Type::String,
+                field_descriptor_proto::Label::Optional,
+                Some(0),
+                None,
+            ),
+            (
+                "port",
+                4,
+                field_descriptor_proto::Type::Uint32,
+                field_descriptor_proto::Label::Optional,
+                Some(1),
+                None,
+            ),
+            (
+                "alias",
+                5,
+                field_descriptor_proto::Type::String,
+                field_descriptor_proto::Label::Optional,
+                Some(2),
+                None,
+            ),
+            (
+                "host_key_fingerprint",
+                6,
+                field_descriptor_proto::Type::String,
+                field_descriptor_proto::Label::Optional,
+                Some(3),
+                None,
+            ),
+            (
+                "client_key_fingerprint",
+                7,
+                field_descriptor_proto::Type::String,
+                field_descriptor_proto::Label::Optional,
+                Some(4),
+                None,
+            ),
+        ],
+        &[
+            "_host",
+            "_port",
+            "_alias",
+            "_host_key_fingerprint",
+            "_client_key_fingerprint",
+        ],
+        &[],
+    );
     assert_message_exact(
         file,
         "ApplyRequirement",
@@ -303,7 +373,15 @@ fn image_upgrade_is_an_additive_api_minor_change() {
         field_descriptor_proto::Type::Message,
         None,
     );
+    assert_field(
+        sandbox,
+        "ssh",
+        9,
+        field_descriptor_proto::Type::Message,
+        None,
+    );
     assert_type_name(sandbox, "apply_requirements", ".gascan.v1.ApplyRequirement");
+    assert_type_name(sandbox, "ssh", ".gascan.v1.SshStatus");
     assert_eq!(
         sandbox
             .reserved_range
@@ -797,6 +875,26 @@ fn v1_descriptor_exactly_covers_every_exported_message_enum_and_rpc() {
             &[(4, 5)],
         ),
         (
+            "SshStatus",
+            &[
+                f!("enabled", 1, Bool),
+                f!("active", 2, Bool),
+                f!("host", 3, String, O, Some(0), None),
+                f!("port", 4, Uint32, O, Some(1), None),
+                f!("alias", 5, String, O, Some(2), None),
+                f!("host_key_fingerprint", 6, String, O, Some(3), None),
+                f!("client_key_fingerprint", 7, String, O, Some(4), None),
+            ],
+            &[
+                "_host",
+                "_port",
+                "_alias",
+                "_host_key_fingerprint",
+                "_client_key_fingerprint",
+            ],
+            &[],
+        ),
+        (
             "SandboxStatus",
             &[
                 f!("sandbox_id", 1, String),
@@ -848,6 +946,7 @@ fn v1_descriptor_exactly_covers_every_exported_message_enum_and_rpc() {
                     None,
                     Some(".gascan.v1.ApplyRequirement")
                 ),
+                f!("ssh", 9, Message, O, None, Some(".gascan.v1.SshStatus")),
             ],
             &[],
             &[(7, 8)],

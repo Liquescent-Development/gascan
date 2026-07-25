@@ -1,7 +1,7 @@
 use super::config::{
     PreparedSshFiles, commit_openssh_files, prepare_openssh_files, readiness_ssh_args,
 };
-use super::identity::parse_public_key;
+use super::identity::{load_host_identity, parse_public_key};
 use super::port::PortReservation;
 use super::{
     ActiveSsh, HostIdentity, ManagedSshHost, PUBLIC_MODE, SshPaths, StateDirectory,
@@ -229,6 +229,46 @@ impl SshManager {
         let prepared = prepare_openssh_files(paths, &identity, hosts)
             .map_err(ServiceError::SshConfigUnsafe)?;
         commit_openssh_files(paths, prepared).map_err(ServiceError::SshConfigUpdateFailed)
+    }
+
+    #[doc(hidden)]
+    pub async fn published_for_paths(
+        &self,
+        id: &SandboxId,
+        expected: Option<&SshResolution>,
+        paths: &SshPaths,
+    ) -> Result<Option<ActiveSsh>, ServiceError> {
+        let Some(expected) = expected.filter(|resolution| resolution_enabled(resolution)) else {
+            return Ok(None);
+        };
+        let identity = load_host_identity(paths)
+            .await
+            .map_err(ServiceError::SshConfigUnsafe)?;
+        let Some((expected_host, expected_client)) = expected_fingerprints(Some(expected))? else {
+            return Ok(None);
+        };
+        if identity.fingerprint() != expected_client {
+            return Err(ServiceError::SshHostKeyMismatch(
+                "stored client identity fingerprint changed",
+            ));
+        }
+        let alias = alias(id);
+        let active = load_active_hosts(paths, &identity)?
+            .into_iter()
+            .find(|host| host.active.alias == alias)
+            .map(|host| host.active);
+        match active {
+            Some(active)
+                if active.host_key_fingerprint == expected_host
+                    && active.client_key_fingerprint == expected_client =>
+            {
+                Ok(Some(active))
+            }
+            Some(_) => Err(ServiceError::SshHostKeyMismatch(
+                "published SSH fingerprints changed",
+            )),
+            None => Ok(None),
+        }
     }
 
     pub(crate) async fn deactivate_for_paths(

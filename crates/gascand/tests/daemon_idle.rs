@@ -123,7 +123,7 @@ async fn raw_liveness_probe_disconnect_does_not_end_server() -> TestResult {
             .into_inner();
         assert!(response.rejection.is_none());
         assert_eq!(response.api_major, 1);
-        assert_eq!(response.api_minor, 2);
+        assert_eq!(response.api_minor, 3);
         assert_eq!(response.daemon_instance_token.len(), 64);
         assert_eq!(
             response.daemon_pid,

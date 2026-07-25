@@ -165,6 +165,31 @@ pub(crate) fn render_status(
         status.sandbox_id,
         human_state(status.actual_state)
     );
+    match status.ssh.as_ref() {
+        Some(ssh)
+            if ssh.active
+                && ssh.host.as_deref() == Some("127.0.0.1")
+                && ssh.port.is_some()
+                && ssh.alias.is_some() =>
+        {
+            let _ = writeln!(
+                output,
+                "SSH     {} ({}:{})",
+                ssh.alias.as_deref().unwrap_or_default(),
+                ssh.host.as_deref().unwrap_or_default(),
+                ssh.port.unwrap_or_default()
+            );
+        }
+        Some(ssh) if !ssh.enabled => output.push_str("SSH     Disabled\n"),
+        Some(_) if status.actual_state == v1::ActualState::Pending as i32 => {
+            output.push_str("SSH     Starting\n");
+        }
+        Some(_) if status.actual_state == v1::ActualState::Failed as i32 => {
+            output.push_str("SSH     Unhealthy\n");
+        }
+        Some(_) => output.push_str("SSH     Unavailable\n"),
+        None => {}
+    }
     let image_changes = status
         .apply_requirements
         .iter()
@@ -582,6 +607,25 @@ mod tests {
         assert_eq!(
             render_status(&status, OutputCapabilities::plain()),
             "Sandbox: code-123\nState:   Running\n\nUpdate available\n  Workspace image  workspace:old@sha256:aaaaaaaaaaaa… → workspace:new@sha256:bbbbbbbbbbbb…\n  Run gascan apply\n"
+        );
+    }
+
+    #[test]
+    fn status_reports_the_active_native_ssh_alias_and_endpoint() {
+        let mut status = status("code-123", v1::ActualState::Running);
+        status.ssh = Some(v1::SshStatus {
+            enabled: true,
+            active: true,
+            host: Some("127.0.0.1".to_owned()),
+            port: Some(22222),
+            alias: Some("gascan-code-123".to_owned()),
+            host_key_fingerprint: Some("SHA256:host".to_owned()),
+            client_key_fingerprint: Some("SHA256:client".to_owned()),
+        });
+
+        assert_eq!(
+            render_status(&status, OutputCapabilities::plain()),
+            "Sandbox: code-123\nState:   Running\nSSH     gascan-code-123 (127.0.0.1:22222)\n"
         );
     }
 

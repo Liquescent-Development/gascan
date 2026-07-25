@@ -786,6 +786,19 @@ impl<B: RuntimeBackend> SandboxService<B> {
     pub fn status(&self, id: &SandboxId) -> Result<Option<SandboxRecord>, ServiceError> {
         Ok(self.store.sandbox(id)?)
     }
+
+    pub(crate) async fn published_ssh(
+        &self,
+        record: &SandboxRecord,
+    ) -> Result<Option<crate::ActiveSsh>, ServiceError> {
+        if record.actual_state != ActualState::Running {
+            return Ok(None);
+        }
+        let paths = self.ssh_paths()?;
+        SshManager
+            .published_for_paths(&record.id, record.ssh_resolution.as_ref(), &paths)
+            .await
+    }
     pub fn latest_operation(&self) -> Result<Option<OperationRecord>, ServiceError> {
         Ok(self.store.latest_operation()?)
     }
