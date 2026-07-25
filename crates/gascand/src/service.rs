@@ -1396,6 +1396,25 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 "0700",
                 MISE_DATA_DIR,
                 "/home/workspace/.cache",
+            ],
+            Vec::new(),
+        )
+        .await?;
+        self.exec_guest(
+            spec.id(),
+            ProvisionStep::WriteSafeMiseConfig,
+            "secure_managed_config_root",
+            [
+                "/usr/bin/sudo",
+                "-n",
+                "/usr/bin/install",
+                "-d",
+                "-o",
+                "root",
+                "-g",
+                "workspace",
+                "-m",
+                "1770",
                 "/home/workspace/.config/gascan",
             ],
             Vec::new(),

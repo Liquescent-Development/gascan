@@ -266,6 +266,7 @@ async fn retained_setup_failure_persists_storage_and_up_retries_setup() -> TestR
         .queue_exec_results([
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (digest.clone(), Vec::new(), 0),
             (Vec::new(), b"No space left on device".to_vec(), 28),
         ])
@@ -289,6 +290,7 @@ async fn retained_setup_failure_persists_storage_and_up_retries_setup() -> TestR
 
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (digest, Vec::new(), 0),

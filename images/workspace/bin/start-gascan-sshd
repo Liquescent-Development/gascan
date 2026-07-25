@@ -48,7 +48,7 @@ path_exists()
 metadata()
 {
     if test -n "$test_root"; then
-        stat -f '%HT:%u:%g:%Lp:%l' "$1"
+        stat -f '%HT:%u:%g:%p:%l' "$1"
     else
         stat -c '%F:%u:%g:%a:%h' "$1"
     fi
@@ -57,7 +57,13 @@ metadata()
 directory_metadata()
 {
     if test -n "$test_root"; then
-        printf 'Directory:%s:%s:%s:' "$1" "$2" "$3"
+        case "$3" in
+            700) file_mode=40700 ;;
+            755) file_mode=40755 ;;
+            1770) file_mode=41770 ;;
+            *) die "unsupported contract-test directory mode: $3" ;;
+        esac
+        printf 'Directory:%s:%s:%s:' "$1" "$2" "$file_mode"
     else
         printf 'directory:%s:%s:%s:' "$1" "$2" "$3"
     fi
@@ -66,7 +72,12 @@ directory_metadata()
 regular_metadata()
 {
     if test -n "$test_root"; then
-        printf 'Regular File:%s:%s:%s:1' "$1" "$2" "$3"
+        case "$3" in
+            600) file_mode=100600 ;;
+            644) file_mode=100644 ;;
+            *) die "unsupported contract-test regular mode: $3" ;;
+        esac
+        printf 'Regular File:%s:%s:%s:1' "$1" "$2" "$file_mode"
     else
         printf 'regular file:%s:%s:%s:1' "$1" "$2" "$3"
     fi
@@ -171,22 +182,33 @@ test ! -L "$test_root/home/workspace/.config" &&
     die 'workspace config parent is unsafe'
 test ! -L "$config_root" && test -d "$config_root" ||
     die 'Gas Can config root is unsafe'
+if test -z "$test_root"; then
+    config_mount=$(findmnt -n -o TARGET -T "$config_root") ||
+        die 'Gas Can config volume is unavailable'
+    test "$config_mount" = "$config_root" ||
+        die 'Gas Can config root is not its own mount'
+fi
 
 config_metadata=$(metadata "$config_root")
 workspace_config_metadata=$(directory_metadata "$workspace_uid" "$workspace_gid" 700)
+managed_config_metadata=$(directory_metadata "$owner_uid" "$workspace_gid" 1770)
 root_config_metadata_755=$(directory_metadata 0 0 755)
 root_config_metadata_700=$(directory_metadata 0 0 700)
 case "$config_metadata" in
-    "$workspace_config_metadata"*) ;;
+    "$managed_config_metadata"*) ;;
+    "$workspace_config_metadata"*)
+        chown "$owner_uid:$workspace_gid" "$config_root"
+        chmod 1770 "$config_root"
+        ;;
     "$root_config_metadata_755"*|"$root_config_metadata_700"*)
         test -z "$(find "$config_root" -mindepth 1 -print -quit)" ||
             die 'root-owned Gas Can config root is not empty'
-        chown "$workspace_uid:$workspace_gid" "$config_root"
-        chmod 0700 "$config_root"
+        chown "$owner_uid:$workspace_gid" "$config_root"
+        chmod 1770 "$config_root"
         ;;
     *) die 'Gas Can config root metadata changed' ;;
 esac
-validate_directory "$config_root" "$workspace_uid" "$workspace_gid" 700
+validate_directory "$config_root" "$owner_uid" "$workspace_gid" 1770
 
 ensure_directory "$ssh_root" "$owner_uid" "$owner_gid" 700
 ensure_directory "$host_root" "$owner_uid" "$owner_gid" 700
@@ -199,6 +221,8 @@ if path_exists "$host_key"; then
     chmod 0644 "$public_tmp"
     chown "$owner_uid:$owner_gid" "$public_tmp"
     ssh-keygen -y -P '' -f "$host_key" >"$public_tmp"
+    awk 'NR == 1 && NF == 2 && $1 == "ssh-ed25519" { valid = 1 } END { exit !(valid && NR == 1) }' \
+        "$public_tmp" || die 'existing SSH host private key is not Ed25519'
     if path_exists "$host_public_key"; then
         validate_regular "$host_public_key" "$owner_uid" "$owner_gid" 644
         cmp -s "$public_tmp" "$host_public_key" ||

@@ -8,6 +8,28 @@ sshd_config="$managed_root/sshd_config"
 
 if test "${1:-}" = --inside; then
   test $# -eq 1
+  config_root=/home/workspace/.config/gascan
+  test "$(stat -c %U:%G "$config_root")" = root:workspace
+  test "$(stat -c %a "$config_root")" = 1770
+  replacement="$config_root/workspace-non-ssh-state"
+  mkdir "$replacement"
+  printf 'workspace-write-ok\n' >"$replacement/config"
+  test "$(cat "$replacement/config")" = workspace-write-ok
+  if mv "$managed_root" "$managed_root.moved" 2>/dev/null; then
+    printf 'ssh contract: workspace renamed managed SSH state\n' >&2
+    exit 1
+  fi
+  if rm -rf "$managed_root" 2>/dev/null; then
+    printf 'ssh contract: workspace removed managed SSH state\n' >&2
+    exit 1
+  fi
+  test -d "$managed_root" && test ! -L "$managed_root"
+  if ln -s "$replacement" "$managed_root" 2>/dev/null; then
+    printf 'ssh contract: workspace replaced managed SSH state\n' >&2
+    exit 1
+  fi
+  rm -rf "$replacement"
+
   for specification in \
     "$managed_root:root:root:700:directory" \
     "$managed_root/host:root:root:700:directory" \

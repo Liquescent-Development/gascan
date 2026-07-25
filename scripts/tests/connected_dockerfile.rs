@@ -154,6 +154,7 @@ fn ssh_guest_layer_is_offline_fixed_and_loopback_only() {
         "X11Forwarding no",
         "StrictModes yes",
         "Subsystem sftp internal-sftp",
+        "findmnt -n -o TARGET -T \"$config_root\"",
         "/home/workspace/.config/gascan/ssh/host/ssh_host_ed25519_key",
         "/home/workspace/.config/gascan/ssh/authorized_keys",
         "/home/workspace/.config/gascan/ssh/sshd_config",
@@ -232,6 +233,14 @@ fn ssh_guest_initialization_is_behavioral_atomic_and_idempotent() {
         fs::read_to_string(&authorized_keys).unwrap(),
         format!("{key_two}\n")
     );
+    assert_eq!(
+        fs::symlink_metadata(&config_root).unwrap().mode() & 0o7777,
+        0o1770,
+        "config root must be sticky and root-controlled while remaining group-writable"
+    );
+    let non_ssh_state = config_root.join("agent-state");
+    fs::create_dir(&non_ssh_state).unwrap();
+    fs::write(non_ssh_state.join("config"), "workspace-writable\n").unwrap();
 
     for (path, mode) in [
         (&ssh_root, 0o700),
@@ -297,6 +306,63 @@ fn ssh_guest_initialization_is_behavioral_atomic_and_idempotent() {
             "invalid key was accepted: {invalid:?}"
         );
         assert!(!invalid_config.join("ssh").exists());
+    }
+
+    let rsa_root = temporary.path().join("rsa-root");
+    let rsa_config = rsa_root.join("home/workspace/.config/gascan");
+    let rsa_host = rsa_config.join("ssh/host");
+    fs::create_dir_all(&rsa_host).unwrap();
+    fs::create_dir_all(rsa_root.join("run")).unwrap();
+    fs::set_permissions(&rsa_config, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(rsa_config.join("ssh"), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&rsa_host, fs::Permissions::from_mode(0o700)).unwrap();
+    let rsa_private = rsa_host.join("ssh_host_ed25519_key");
+    let rsa_status = Command::new("ssh-keygen")
+        .args(["-q", "-t", "rsa", "-N", "", "-f"])
+        .arg(&rsa_private)
+        .status()
+        .unwrap();
+    assert!(rsa_status.success());
+    let derived_rsa = Command::new("ssh-keygen")
+        .args(["-y", "-P", "", "-f"])
+        .arg(&rsa_private)
+        .output()
+        .unwrap();
+    assert!(derived_rsa.status.success());
+    fs::write(rsa_private.with_extension("pub"), &derived_rsa.stdout).unwrap();
+    fs::set_permissions(&rsa_private, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(
+        rsa_private.with_extension("pub"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    let rsa_private_before = fs::read(&rsa_private).unwrap();
+    let rsa_public_before = fs::read(rsa_private.with_extension("pub")).unwrap();
+    let rsa_result = prepare_guest_ssh(&rsa_root, &key_one);
+    assert!(
+        !rsa_result.status.success(),
+        "existing non-Ed25519 host key was accepted"
+    );
+    assert_eq!(fs::read(&rsa_private).unwrap(), rsa_private_before);
+    assert_eq!(
+        fs::read(rsa_private.with_extension("pub")).unwrap(),
+        rsa_public_before
+    );
+}
+
+#[test]
+fn ssh_live_contract_blocks_workspace_replacement_but_allows_non_ssh_state() {
+    let contract =
+        fs::read_to_string(root().join("images/workspace/tests/ssh-contract.sh")).unwrap();
+    for behavioral_check in [
+        "if mv \"$managed_root\"",
+        "if rm -rf \"$managed_root\"",
+        "workspace-non-ssh-state",
+    ] {
+        assert!(
+            contract.contains(behavioral_check),
+            "live SSH contract omits workspace filesystem behavior: {behavioral_check}"
+        );
     }
 }
 

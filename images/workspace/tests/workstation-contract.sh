@@ -123,8 +123,19 @@ for volume in /home/workspace/.local/share/mise /home/workspace/.cache /home/wor
 do
     target=$(findmnt -n -o TARGET -T "$volume") || die "volume is not mounted: $volume"
     test "$target" = "$volume" || die "persistent path is not its own mount: $volume ($target)"
-    test "$(stat -c %U:%G "$volume")" = workspace:workspace ||
-        die "persistent path owner changed: $volume"
+    if test "$volume" = /home/workspace/.config/gascan; then
+        case "$(stat -c %U:%G:%a "$volume")" in
+            workspace:workspace:700|root:workspace:1770) ;;
+            *) die "persistent config root metadata changed: $volume" ;;
+        esac
+        probe="$volume/.workstation-write-probe"
+        printf 'write-ok\n' >"$probe"
+        test "$(cat "$probe")" = write-ok || die 'persistent config root is not writable'
+        rm -f "$probe"
+    else
+        test "$(stat -c %U:%G "$volume")" = workspace:workspace ||
+            die "persistent path owner changed: $volume"
+    fi
 done
 
 test "$(id -u)" = 1000 || die 'workstation contract is not running as workspace'
