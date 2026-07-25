@@ -17,6 +17,20 @@ fn paths(temp: &TempDir) -> Result<SshPaths, Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn rejects_openssh_expansion_in_xdg_or_home_paths() -> TestResult {
+    let temp = TempDir::new()?;
+    let base = root(&temp)?;
+    let xdg = base.join("xdg$attacker");
+    let home = base.join("home$attacker");
+
+    assert!(SshPaths::for_environment(Some(xdg.as_os_str()), None).is_err());
+    assert!(SshPaths::for_environment(None, Some(home.as_os_str())).is_err());
+    assert!(!xdg.exists());
+    assert!(!home.join(".config").exists());
+    Ok(())
+}
+
+#[test]
 fn resolves_xdg_config_home_before_home_fallback() -> TestResult {
     let temp = TempDir::new()?;
     let base = root(&temp)?;
@@ -44,13 +58,16 @@ async fn generates_one_valid_ed25519_identity_with_exact_metadata() -> TestResul
     let paths = paths(&temp)?;
 
     let first = ensure_host_identity(&paths).await?;
-    let private_before = fs::read(first.private_key.as_std_path())?;
+    let private_before = fs::read(first.private_key().as_std_path())?;
     let second = ensure_host_identity(&paths).await?;
 
     assert_eq!(first, second);
-    assert_eq!(fs::read(second.private_key.as_std_path())?, private_before);
-    assert!(first.public_key.starts_with("ssh-ed25519 "));
-    assert!(first.fingerprint.starts_with("SHA256:"));
+    assert_eq!(
+        fs::read(second.private_key().as_std_path())?,
+        private_before
+    );
+    assert!(first.public_key().starts_with("ssh-ed25519 "));
+    assert!(first.fingerprint().starts_with("SHA256:"));
 
     for directory in [
         paths.gascan_directory().as_std_path(),
@@ -96,7 +113,7 @@ async fn rejects_symlink_ancestors_and_managed_key_paths() -> TestResult {
     std::os::unix::fs::symlink(&victim, public_key)?;
     assert!(ensure_host_identity(&paths).await.is_err());
     assert_eq!(fs::read(victim)?, b"retain");
-    assert!(!identity.public_key.is_empty());
+    assert!(!identity.public_key().is_empty());
     Ok(())
 }
 

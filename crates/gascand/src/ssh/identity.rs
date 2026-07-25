@@ -3,9 +3,12 @@ use super::{
     maximum_managed_file_bytes, random_staging_name,
 };
 use base64::Engine as _;
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
+use rustix::fd::OwnedFd;
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
+use std::fs::File;
+use std::os::fd::AsRawFd;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -17,11 +20,42 @@ const SSH_KEYGEN: &str = "/usr/bin/ssh-keygen";
 const KEYGEN_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_SUBPROCESS_OUTPUT: usize = 16 * 1024;
 
+/// A validated managed SSH identity.
+///
+/// Its metadata can only be constructed by validating the managed on-disk
+/// identity pair.
+///
+/// ```compile_fail
+/// use gascand::HostIdentity;
+///
+/// let _forged = HostIdentity {
+///     private_key: Default::default(),
+///     public_key: String::from("ssh-ed25519 forged"),
+///     fingerprint: String::from("SHA256:forged"),
+/// };
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostIdentity {
-    pub private_key: Utf8PathBuf,
-    pub public_key: String,
-    pub fingerprint: String,
+    private_key: Utf8PathBuf,
+    public_key: String,
+    fingerprint: String,
+}
+
+impl HostIdentity {
+    #[must_use]
+    pub fn private_key(&self) -> &Utf8Path {
+        &self.private_key
+    }
+
+    #[must_use]
+    pub fn public_key(&self) -> &str {
+        &self.public_key
+    }
+
+    #[must_use]
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
 }
 
 pub async fn ensure_host_identity(paths: &SshPaths) -> Result<HostIdentity, SshError> {
@@ -36,6 +70,42 @@ pub async fn ensure_host_identity(paths: &SshPaths) -> Result<HostIdentity, SshE
         }
         _ => Err(SshError::InvalidState("managed SSH identity is incomplete")),
     }
+}
+
+pub(crate) fn open_revalidated_identity(
+    paths: &SshPaths,
+    identity: &HostIdentity,
+) -> Result<StateDirectory, SshError> {
+    if identity.private_key != paths.private_key {
+        return Err(SshError::InvalidState(
+            "SSH config identity is outside managed state",
+        ));
+    }
+    let validated = std::thread::scope(|scope| {
+        scope
+            .spawn(|| -> Result<(StateDirectory, ParsedPublicKey), SshError> {
+                let directory = StateDirectory::open(paths)?;
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| SshError::io("start SSH identity validation worker", error))?;
+                let parsed = runtime.block_on(validate_pair(
+                    &directory,
+                    PRIVATE_KEY_NAME,
+                    PUBLIC_KEY_NAME,
+                ))?;
+                Ok((directory, parsed))
+            })
+            .join()
+    })
+    .map_err(|_| SshError::InvalidState("managed SSH identity validation worker failed"))??;
+    let (directory, parsed) = validated;
+    if parsed.normalized != identity.public_key || parsed.fingerprint != identity.fingerprint {
+        return Err(SshError::InvalidState(
+            "managed SSH identity changed after validation",
+        ));
+    }
+    Ok(directory)
 }
 
 async fn generate(directory: &StateDirectory) -> Result<(), SshError> {
@@ -95,6 +165,18 @@ async fn validate_pair(
     private_name: &str,
     public_name: &str,
 ) -> Result<ParsedPublicKey, SshError> {
+    validate_pair_with(directory, private_name, public_name, || Ok(())).await
+}
+
+async fn validate_pair_with<F>(
+    directory: &StateDirectory,
+    private_name: &str,
+    public_name: &str,
+    after_open: F,
+) -> Result<ParsedPublicKey, SshError>
+where
+    F: FnOnce() -> Result<(), SshError>,
+{
     let (private_file, private_identity) = directory.open_file(private_name, PRIVATE_MODE)?;
     let (public_bytes, public_identity) = directory.read_file(
         public_name,
@@ -103,13 +185,8 @@ async fn validate_pair(
     )?;
     let stored_public = parse_public_key(&public_bytes)?;
 
-    let private_path = directory.resolved_open_file(&private_file)?;
-    let derived = run_ssh_keygen(vec![
-        OsString::from("-y"),
-        OsString::from("-f"),
-        private_path.into_os_string(),
-    ])
-    .await?;
+    after_open()?;
+    let derived = derive_public_key(&private_file).await?;
     let derived_public = parse_public_key(&derived)?;
     if stored_public.normalized != derived_public.normalized {
         return Err(SshError::InvalidState(
@@ -119,6 +196,26 @@ async fn validate_pair(
     require_unchanged(directory, private_name, PRIVATE_MODE, private_identity)?;
     require_unchanged(directory, public_name, PUBLIC_MODE, public_identity)?;
     Ok(stored_public)
+}
+
+async fn derive_public_key(private_file: &File) -> Result<Vec<u8>, SshError> {
+    let inherited = rustix::io::dup(private_file)
+        .map_err(|error| SshError::io("duplicate managed SSH private descriptor", error))?;
+    let mut flags = rustix::io::fcntl_getfd(&inherited)
+        .map_err(|error| SshError::io("inspect managed SSH private descriptor flags", error))?;
+    flags.remove(rustix::io::FdFlags::CLOEXEC);
+    rustix::io::fcntl_setfd(&inherited, flags)
+        .map_err(|error| SshError::io("make SSH private descriptor inheritable", error))?;
+    let descriptor_path = format!("/dev/fd/{}", inherited.as_raw_fd());
+    run_ssh_keygen_with_inherited_fd(
+        vec![
+            OsString::from("-y"),
+            OsString::from("-f"),
+            OsString::from(descriptor_path),
+        ],
+        Some(inherited),
+    )
+    .await
 }
 
 fn require_unchanged(
@@ -194,6 +291,13 @@ fn validate_ed25519_blob(blob: &[u8]) -> Result<(), SshError> {
 }
 
 async fn run_ssh_keygen(args: Vec<OsString>) -> Result<Vec<u8>, SshError> {
+    run_ssh_keygen_with_inherited_fd(args, None).await
+}
+
+async fn run_ssh_keygen_with_inherited_fd(
+    args: Vec<OsString>,
+    inherited_fd: Option<OwnedFd>,
+) -> Result<Vec<u8>, SshError> {
     let mut child = Command::new(SSH_KEYGEN);
     child
         .args(args)
@@ -205,6 +309,7 @@ async fn run_ssh_keygen(args: Vec<OsString>) -> Result<Vec<u8>, SshError> {
     let mut child = child
         .spawn()
         .map_err(|error| SshError::io("start bounded ssh-keygen", error))?;
+    drop(inherited_fd);
     let stdout = child.stdout.take().ok_or(SshError::KeygenOutput)?;
     let stderr = child.stderr.take().ok_or(SshError::KeygenOutput)?;
     let completed = tokio::time::timeout(KEYGEN_TIMEOUT, async {
@@ -267,5 +372,65 @@ impl Drop for StagingGuard<'_> {
                 self.directory.remove(name);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        PRIVATE_KEY_NAME, PUBLIC_KEY_NAME, SshError, ensure_host_identity, validate_pair_with,
+    };
+    use crate::ssh::SshPaths;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn private_key_validation_uses_the_descriptor_opened_before_path_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let managed = tempfile::tempdir()?;
+        let managed_home = managed.path().canonicalize()?.join("xdg");
+        let paths = SshPaths::for_environment(Some(managed_home.as_os_str()), None)?;
+        ensure_host_identity(&paths).await?;
+
+        let replacement = tempfile::tempdir()?;
+        let replacement_home = replacement.path().canonicalize()?.join("xdg");
+        let replacement_paths =
+            SshPaths::for_environment(Some(replacement_home.as_os_str()), None)?;
+        ensure_host_identity(&replacement_paths).await?;
+        let replacement_private = fs::read(replacement_paths.private_key().as_std_path())?;
+
+        let directory = crate::ssh::StateDirectory::open(&paths)?;
+        let displaced = paths.directory().join("identity_ed25519.displaced");
+        let result = validate_pair_with(
+            &directory,
+            PRIVATE_KEY_NAME,
+            PUBLIC_KEY_NAME,
+            || -> Result<(), SshError> {
+                fs::rename(paths.private_key().as_std_path(), displaced.as_std_path())
+                    .map_err(|error| SshError::io("replace managed private key pathname", error))?;
+                fs::write(paths.private_key().as_std_path(), &replacement_private)
+                    .map_err(|error| SshError::io("write replacement private key", error))?;
+                fs::set_permissions(
+                    paths.private_key().as_std_path(),
+                    fs::Permissions::from_mode(0o600),
+                )
+                .map_err(|error| SshError::io("secure replacement private key", error))
+            },
+        )
+        .await;
+        let error = match result {
+            Ok(_) => {
+                return Err(
+                    "pathname replacement unexpectedly passed descriptor validation".into(),
+                );
+            }
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            SshError::InvalidState("managed SSH file changed during validation")
+        ));
+        Ok(())
     }
 }

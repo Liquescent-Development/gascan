@@ -1,7 +1,8 @@
 use gascand::{
-    ActiveSsh, ManagedSshHost, SshPaths, ensure_host_identity, publish_openssh_files,
-    readiness_ssh_args,
+    ActiveSsh, ManagedSshHost, SshPaths, ensure_host_identity, prepare_openssh_files,
+    publish_openssh_files, readiness_ssh_args,
 };
+use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
@@ -26,11 +27,18 @@ fn host(alias: &str, port: u16, identity: &gascand::HostIdentity) -> ManagedSshH
             host: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port,
             alias: alias.to_owned(),
-            host_key_fingerprint: identity.fingerprint.clone(),
-            client_key_fingerprint: identity.fingerprint.clone(),
+            host_key_fingerprint: identity.fingerprint().to_owned(),
+            client_key_fingerprint: identity.fingerprint().to_owned(),
         },
-        host_public_key: identity.public_key.clone(),
+        host_public_key: identity.public_key().to_owned(),
     }
+}
+
+fn configured_known_hosts(config: &str) -> Result<&str, Box<dyn std::error::Error>> {
+    config
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("UserKnownHostsFile "))
+        .ok_or_else(|| "generated config does not name known-hosts".into())
 }
 
 #[tokio::test]
@@ -45,16 +53,23 @@ async fn publishes_stable_sorted_strict_openssh_files() -> TestResult {
 
     publish_openssh_files(&paths, &identity, &hosts)?;
     let config_before = fs::read_to_string(paths.config().as_std_path())?;
-    let known_hosts_before = fs::read_to_string(paths.known_hosts().as_std_path())?;
+    let known_hosts_path = configured_known_hosts(&config_before)?;
+    let known_hosts_before = fs::read_to_string(known_hosts_path)?;
     publish_openssh_files(&paths, &identity, &hosts)?;
     assert_eq!(
         fs::read_to_string(paths.config().as_std_path())?,
         config_before
     );
-    assert_eq!(
-        fs::read_to_string(paths.known_hosts().as_std_path())?,
-        known_hosts_before
-    );
+    assert_eq!(fs::read_to_string(known_hosts_path)?, known_hosts_before);
+    let generation = std::path::Path::new(known_hosts_path)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or("known-hosts generation is not UTF-8")?;
+    let expected_generation = Sha256::digest(known_hosts_before.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert_eq!(generation, format!("known_hosts.{expected_generation}"));
 
     assert!(config_before.find("Host gascan-alpha") < config_before.find("Host gascan-zeta"));
     for required in [
@@ -65,7 +80,7 @@ async fn publishes_stable_sorted_strict_openssh_files() -> TestResult {
         "ForwardAgent no",
         "HostKeyAlias gascan-alpha",
         &format!("IdentityFile {}", paths.private_key()),
-        &format!("UserKnownHostsFile {}", paths.known_hosts()),
+        &format!("UserKnownHostsFile {known_hosts_path}"),
     ] {
         assert!(
             config_before.contains(required),
@@ -78,7 +93,7 @@ async fn publishes_stable_sorted_strict_openssh_files() -> TestResult {
         format!(
             "gascan-alpha,[127.0.0.1]:2201 {}",
             identity
-                .public_key
+                .public_key()
                 .split_whitespace()
                 .take(2)
                 .collect::<Vec<_>>()
@@ -87,7 +102,7 @@ async fn publishes_stable_sorted_strict_openssh_files() -> TestResult {
         format!(
             "gascan-zeta,[127.0.0.1]:2222 {}",
             identity
-                .public_key
+                .public_key()
                 .split_whitespace()
                 .take(2)
                 .collect::<Vec<_>>()
@@ -104,7 +119,7 @@ async fn publishes_stable_sorted_strict_openssh_files() -> TestResult {
     );
     for file in [
         paths.config().as_std_path(),
-        paths.known_hosts().as_std_path(),
+        std::path::Path::new(known_hosts_path),
     ] {
         let metadata = fs::symlink_metadata(file)?;
         assert!(metadata.is_file());
@@ -120,22 +135,46 @@ async fn readiness_args_are_discrete_and_do_not_weaken_reusable_config() -> Test
     let temp = TempDir::new()?;
     let paths = paths(&temp)?;
     let identity = ensure_host_identity(&paths).await?;
-    publish_openssh_files(&paths, &identity, &[host("gascan-ready", 2222, &identity)])?;
+    let ready = host("gascan-ready", 2222, &identity);
+    let prepared = prepare_openssh_files(&paths, &identity, std::slice::from_ref(&ready))?;
+    let generation_known_hosts = prepared.known_hosts().to_owned();
+    assert_eq!(
+        generation_known_hosts.file_name(),
+        Some(prepared.generation())
+    );
+    assert!(generation_known_hosts.exists());
+    assert!(!paths.config().exists());
 
     assert_eq!(
-        readiness_ssh_args(&paths, "gascan-ready")?,
+        readiness_ssh_args(&paths, &identity, &ready, &generation_known_hosts)?,
         vec![
-            OsString::from("-F"),
-            paths.config().as_std_path().as_os_str().to_owned(),
+            OsString::from("-o"),
+            OsString::from("HostName=127.0.0.1"),
+            OsString::from("-o"),
+            OsString::from("Port=2222"),
+            OsString::from("-o"),
+            OsString::from("User=workspace"),
+            OsString::from("-o"),
+            OsString::from(format!("IdentityFile={}", paths.private_key())),
+            OsString::from("-o"),
+            OsString::from("HostKeyAlias=gascan-ready"),
+            OsString::from("-o"),
+            OsString::from(format!("UserKnownHostsFile={generation_known_hosts}")),
+            OsString::from("-o"),
+            OsString::from("StrictHostKeyChecking=yes"),
+            OsString::from("-o"),
+            OsString::from("IdentitiesOnly=yes"),
             OsString::from("-o"),
             OsString::from("BatchMode=yes"),
             OsString::from("-o"),
+            OsString::from("ForwardAgent=no"),
+            OsString::from("-o"),
             OsString::from("ClearAllForwardings=yes"),
-            OsString::from("gascan-ready"),
+            OsString::from("127.0.0.1"),
             OsString::from("/usr/bin/true"),
         ]
     );
-    assert!(!fs::read_to_string(paths.config().as_std_path())?.contains("ClearAllForwardings"));
+    assert!(!paths.config().exists());
     Ok(())
 }
 
@@ -146,7 +185,9 @@ async fn rejects_invalid_or_inconsistent_active_hosts_before_replacement() -> Te
     let identity = ensure_host_identity(&paths).await?;
     publish_openssh_files(&paths, &identity, &[host("gascan-valid", 2222, &identity)])?;
     let config_before = fs::read(paths.config().as_std_path())?;
-    let known_hosts_before = fs::read(paths.known_hosts().as_std_path())?;
+    let config_text = std::str::from_utf8(&config_before)?;
+    let known_hosts_path = configured_known_hosts(config_text)?;
+    let known_hosts_before = fs::read(known_hosts_path)?;
 
     let mut attacks = Vec::new();
     let mut non_loopback = host("gascan-other", 2223, &identity);
@@ -164,13 +205,67 @@ async fn rejects_invalid_or_inconsistent_active_hosts_before_replacement() -> Te
     for attack in attacks {
         assert!(publish_openssh_files(&paths, &identity, &[attack]).is_err());
         assert_eq!(fs::read(paths.config().as_std_path())?, config_before);
-        assert_eq!(
-            fs::read(paths.known_hosts().as_std_path())?,
-            known_hosts_before
-        );
+        assert_eq!(fs::read(known_hosts_path)?, known_hosts_before);
     }
     let duplicate = host("gascan-duplicate", 2224, &identity);
     assert!(publish_openssh_files(&paths, &identity, &[duplicate.clone(), duplicate]).is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejected_config_target_cannot_change_the_active_trust_generation() -> TestResult {
+    let temp = TempDir::new()?;
+    let paths = paths(&temp)?;
+    let identity = ensure_host_identity(&paths).await?;
+    publish_openssh_files(&paths, &identity, &[host("gascan-before", 2222, &identity)])?;
+    let config_before = fs::read_to_string(paths.config().as_std_path())?;
+    let known_hosts_path = configured_known_hosts(&config_before)?.to_owned();
+    let known_hosts_before = fs::read(&known_hosts_path)?;
+    fs::hard_link(
+        paths.config().as_std_path(),
+        paths.directory().join("config-link").as_std_path(),
+    )?;
+
+    assert!(
+        publish_openssh_files(&paths, &identity, &[host("gascan-after", 2223, &identity)]).is_err()
+    );
+    assert_eq!(
+        fs::read_to_string(paths.config().as_std_path())?,
+        config_before
+    );
+    assert_eq!(fs::read(known_hosts_path)?, known_hosts_before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn publication_reloads_and_revalidates_the_managed_identity_pair() -> TestResult {
+    let managed_temp = TempDir::new()?;
+    let managed_paths = paths(&managed_temp)?;
+    let stale_identity = ensure_host_identity(&managed_paths).await?;
+    let stale_host = host("gascan-stale", 2222, &stale_identity);
+
+    let replacement_temp = TempDir::new()?;
+    let replacement_paths = paths(&replacement_temp)?;
+    ensure_host_identity(&replacement_paths).await?;
+    fs::copy(
+        replacement_paths.private_key().as_std_path(),
+        managed_paths.private_key().as_std_path(),
+    )?;
+    fs::set_permissions(
+        managed_paths.private_key().as_std_path(),
+        fs::Permissions::from_mode(0o600),
+    )?;
+    fs::copy(
+        replacement_paths.public_key().as_std_path(),
+        managed_paths.public_key().as_std_path(),
+    )?;
+    fs::set_permissions(
+        managed_paths.public_key().as_std_path(),
+        fs::Permissions::from_mode(0o644),
+    )?;
+
+    assert!(publish_openssh_files(&managed_paths, &stale_identity, &[stale_host]).is_err());
+    assert!(!managed_paths.config().exists());
     Ok(())
 }
 
@@ -206,7 +301,8 @@ async fn rejects_symlink_hard_link_fifo_and_unsafe_generated_targets() -> TestRe
         &hard_link_identity,
         &[host("gascan-hard", 2222, &hard_link_identity)],
     )?;
-    let known_hosts = hard_link_paths.known_hosts().as_std_path();
+    let config = fs::read_to_string(hard_link_paths.config().as_std_path())?;
+    let known_hosts = std::path::Path::new(configured_known_hosts(&config)?);
     let backing = root(&hard_link_temp)?.join("backing");
     fs::rename(known_hosts, &backing)?;
     fs::hard_link(&backing, known_hosts)?;
@@ -250,10 +346,9 @@ async fn rejects_symlink_hard_link_fifo_and_unsafe_generated_targets() -> TestRe
         &mode_identity,
         &[host("gascan-mode", 2222, &mode_identity)],
     )?;
-    fs::set_permissions(
-        mode_paths.known_hosts().as_std_path(),
-        fs::Permissions::from_mode(0o666),
-    )?;
+    let config = fs::read_to_string(mode_paths.config().as_std_path())?;
+    let known_hosts = std::path::Path::new(configured_known_hosts(&config)?);
+    fs::set_permissions(known_hosts, fs::Permissions::from_mode(0o666))?;
     assert!(
         publish_openssh_files(
             &mode_paths,

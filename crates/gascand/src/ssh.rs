@@ -13,7 +13,10 @@ use std::net::IpAddr;
 use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 
-pub use config::{publish_openssh_files, readiness_ssh_args};
+pub use config::{
+    PreparedSshFiles, commit_openssh_files, prepare_openssh_files, publish_openssh_files,
+    readiness_ssh_args,
+};
 pub use identity::{HostIdentity, ensure_host_identity};
 
 const DIRECTORY_MODE: u16 = 0o700;
@@ -81,6 +84,11 @@ impl SshPaths {
             ));
         }
         let config_home = utf8_path(config_home)?;
+        if config_home.as_str().contains('$') {
+            return Err(SshError::InvalidState(
+                "SSH configuration path contains OpenSSH expansion",
+            ));
+        }
         let gascan_directory = config_home.join("gascan");
         let directory = gascan_directory.join("ssh");
         Ok(Self {
@@ -308,25 +316,6 @@ impl StateDirectory {
                     SshError::InvalidState("managed SSH directory path is not UTF-8")
                 })?);
             Ok(path.join(name))
-        }
-    }
-
-    pub(crate) fn resolved_open_file(&self, file: &File) -> Result<PathBuf, SshError> {
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::fd::AsRawFd as _;
-            Ok(PathBuf::from("/proc")
-                .join(std::process::id().to_string())
-                .join("fd")
-                .join(file.as_raw_fd().to_string()))
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let path = rustix::fs::getpath(file)
-                .map_err(|error| SshError::io("resolve managed SSH file", error))?;
-            Ok(PathBuf::from(path.into_string().map_err(|_| {
-                SshError::InvalidState("managed SSH file path is not UTF-8")
-            })?))
         }
     }
 }
