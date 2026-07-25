@@ -4,7 +4,7 @@ use std::{
     fs,
     io::{Cursor, Read, Write},
     os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
@@ -24,6 +24,39 @@ type DynError = Box<dyn Error + Send + Sync>;
 
 const NPM_TARBALL_MAX_BYTES: usize = 200 * 1024 * 1024;
 const NPM_CLOSURE_MAX_BYTES: usize = 2 * 1024 * 1024 * 1024;
+const REVIEWED_WORKSTATION_PACKAGE_LOCK_SHA256: &str =
+    "22521261a3bee269f2b992011e417eb4c47a94bcde34c92f29b4504f77454d5c";
+const REVIEWED_NPM_TARGET_RECORDS: usize = 144;
+const REVIEWED_NPM_TARGET_BYTES: usize = 240_013_303;
+const REVIEWED_NPM_EXCLUDED_BYTES: usize = 1_255_140_640;
+const REVIEWED_NPM_CLOSURE_RECORDS: usize = 156;
+const REVIEWED_NPM_CLOSURE_BYTES: usize = 1_495_153_943;
+const REVIEWED_EXCLUDED_NPM_PATHS: [&str; 12] = [
+    "node_modules/@anthropic-ai/claude-code-darwin-arm64",
+    "node_modules/@anthropic-ai/claude-code-darwin-x64",
+    "node_modules/@anthropic-ai/claude-code-linux-arm64-musl",
+    "node_modules/@anthropic-ai/claude-code-linux-x64",
+    "node_modules/@anthropic-ai/claude-code-linux-x64-musl",
+    "node_modules/@anthropic-ai/claude-code-win32-arm64",
+    "node_modules/@anthropic-ai/claude-code-win32-x64",
+    "node_modules/@openai/codex-darwin-arm64",
+    "node_modules/@openai/codex-darwin-x64",
+    "node_modules/@openai/codex-linux-x64",
+    "node_modules/@openai/codex-win32-arm64",
+    "node_modules/@openai/codex-win32-x64",
+];
+const REVIEWED_CLIPBOARD_NPM_PATHS: [&str; 10] = [
+    "node_modules/@earendil-works/pi-coding-agent/node_modules/@mariozechner/clipboard-darwin-arm64",
+    "node_modules/@earendil-works/pi-coding-agent/node_modules/@mariozechner/clipboard-darwin-universal",
+    "node_modules/@earendil-works/pi-coding-agent/node_modules/@mariozechner/clipboard-darwin-x64",
+    "node_modules/@earendil-works/pi-coding-agent/node_modules/@mariozechner/clipboard-linux-arm64-gnu",
+    "node_modules/@earendil-works/pi-coding-agent/node_modules/@mariozechner/clipboard-linux-arm64-musl",
+    "node_modules/@earendil-works/pi-coding-agent/node_modules/@mariozechner/clipboard-linux-riscv64-gnu",
+    "node_modules/@earendil-works/pi-coding-agent/node_modules/@mariozechner/clipboard-linux-x64-gnu",
+    "node_modules/@earendil-works/pi-coding-agent/node_modules/@mariozechner/clipboard-linux-x64-musl",
+    "node_modules/@earendil-works/pi-coding-agent/node_modules/@mariozechner/clipboard-win32-arm64-msvc",
+    "node_modules/@earendil-works/pi-coding-agent/node_modules/@mariozechner/clipboard-win32-x64-msvc",
+];
 
 #[derive(Deserialize)]
 struct Inputs {
@@ -80,6 +113,7 @@ struct GithubAsset {
 
 #[derive(Deserialize)]
 struct NpmPackage {
+    name: String,
     version: String,
     dist: NpmDist,
 }
@@ -165,11 +199,41 @@ struct ClaudeNative {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct NpmBootstrap {
+    package: String,
+    version: String,
+    url: String,
+    integrity: String,
+    sha256: String,
+    size: u64,
+    kind: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkstationTargetLock {
+    schema_version: u64,
+    npm_version: String,
+    package_lock_sha256: String,
+    os: String,
+    cpu: String,
+    libc: String,
+    record_count: u64,
+    compressed_bytes: u64,
+    closure_sha256: String,
+    excluded_record_count: u64,
+    excluded_compressed_bytes: u64,
+    excluded_closure_sha256: String,
+    excluded_paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct WorkstationNpm {
     scripts: String,
     npm_version: String,
     package_manifest_sha256: String,
     package_lock_sha256: String,
+    bootstrap: NpmBootstrap,
     lifecycle_exceptions: BTreeMap<String, NpmLifecycleException>,
     claude_native: ClaudeNative,
 }
@@ -229,6 +293,7 @@ fn main() -> Result<(), DynError> {
             &root.join("images/workspace/workstation-package.json"),
             &root.join("images/workspace/workstation-package-lock.json"),
             &root.join("images/workspace/versions.lock"),
+            &root.join("images/workspace/workstation-target-lock.toml"),
         );
     }
     if let [mode, path] = arguments.as_slice() {
@@ -245,8 +310,13 @@ fn main() -> Result<(), DynError> {
             );
         }
     }
+    if let [mode, npm_lock, target_lock] = arguments.as_slice()
+        && mode == "--validate-workstation-target-lock"
+    {
+        return validate_workstation_target_lock_files(Path::new(npm_lock), Path::new(target_lock));
+    }
     if !arguments.is_empty() {
-        return Err("usage: update-image-lock [--verify-existing-workstation-lock | --validate-workstation-lock PATH | --validate-workstation-package-lock NPM_MANIFEST NPM_LOCK IMAGE_LOCK]".into());
+        return Err("usage: update-image-lock [--verify-existing-workstation-lock | --validate-workstation-lock PATH | --validate-workstation-package-lock NPM_MANIFEST NPM_LOCK IMAGE_LOCK | --validate-workstation-target-lock NPM_LOCK TARGET_LOCK]".into());
     }
 
     let root = repository_root()?;
@@ -319,6 +389,7 @@ fn main() -> Result<(), DynError> {
         );
     let manifest_path = root.join("images/workspace/workstation-package.json");
     let npm_lock_path = root.join("images/workspace/workstation-package-lock.json");
+    let target_lock_bytes = fs::read(root.join("images/workspace/workstation-target-lock.toml"))?;
     let primary_lock = toml::to_string_pretty(&output)?.into_bytes();
     eprintln!("image-lock: writing {}", lock_path.display());
     publish_generated_bundle_with(
@@ -327,7 +398,11 @@ fn main() -> Result<(), DynError> {
             (npm_lock_path.as_path(), workstation_npm_lock.as_slice()),
             (lock_path.as_path(), primary_lock.as_slice()),
         ],
-        |staged| validate_workstation_package_lock_files(&staged[0], &staged[1], &staged[2]),
+        |staged| {
+            validate_workstation_package_lock_files(&staged[0], &staged[1], &staged[2])?;
+            validate_workstation_target_lock_bytes(&fs::read(&staged[1])?, &target_lock_bytes)
+                .map(|_| ())
+        },
         |_| Ok(()),
     )?;
     eprintln!("image-lock: wrote {}", lock_path.display());
@@ -1093,14 +1168,14 @@ fn resolve_npm_dependency_path<'a>(
 fn verify_npm_closure_tarballs(
     client: &Client,
     packages: &serde_json::Map<String, serde_json::Value>,
-) -> Result<(), DynError> {
+) -> Result<(usize, usize), DynError> {
     let (verified, bytes) = verify_npm_closure_tarballs_with(packages, |url, maximum| {
         get_bounded(client, url, maximum)
     })?;
     eprintln!(
         "image-lock: verified {verified} npm closure tarballs ({bytes} bytes; sequential concurrency 1)"
     );
-    Ok(())
+    Ok((verified, bytes))
 }
 
 fn verify_npm_closure_tarballs_with(
@@ -1246,11 +1321,13 @@ fn resolve_workstation_npm(
         return Err("Claude native package version differs from wrapper version".into());
     }
     let claude_native = resolve_claude_native(client, native_package, native_version)?;
+    let bootstrap = resolve_npm_bootstrap(client, "11.12.1")?;
     let workstation_npm = WorkstationNpm {
         scripts: "disabled".to_owned(),
         npm_version: "11.12.1".to_owned(),
         package_manifest_sha256: sha256(manifest_bytes),
         package_lock_sha256: sha256(lock_bytes),
+        bootstrap,
         lifecycle_exceptions: BTreeMap::from([
             ("claude".to_owned(), claude),
             ("google_genai".to_owned(), google_genai),
@@ -1260,6 +1337,78 @@ fn resolve_workstation_npm(
     };
     validate_workstation_npm(&workstation_npm)?;
     Ok(workstation_npm)
+}
+
+fn resolve_npm_bootstrap(client: &Client, version: &str) -> Result<NpmBootstrap, DynError> {
+    let package = "npm";
+    let metadata: NpmPackage = get(client, &npm_metadata_url(package, version)?)?.json()?;
+    if metadata.name != package || metadata.version != version {
+        return Err("npm bootstrap registry identity differs from review".into());
+    }
+    validate_npm_tarball_url(package, version, &metadata.dist.tarball)?;
+    let bytes = get_bounded(client, &metadata.dist.tarball, 16 * 1024 * 1024)?;
+    verify_npm_integrity(&bytes, &metadata.dist.integrity, package)?;
+    let (manifest_bytes, cli) = npm_bootstrap_files(&bytes)?;
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)?;
+    if manifest["name"].as_str() != Some(package)
+        || manifest["version"].as_str() != Some(version)
+        || manifest["bin"]["npm"].as_str() != Some("bin/npm-cli.js")
+    {
+        return Err("npm bootstrap tarball identity differs from registry metadata".into());
+    }
+    if cli.is_empty() {
+        return Err("npm bootstrap CLI is empty".into());
+    }
+    Ok(NpmBootstrap {
+        package: package.to_owned(),
+        version: version.to_owned(),
+        url: metadata.dist.tarball,
+        integrity: metadata.dist.integrity,
+        sha256: sha256(&bytes),
+        size: u64::try_from(bytes.len())?,
+        kind: "npm_tgz".to_owned(),
+    })
+}
+
+fn npm_bootstrap_files(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), DynError> {
+    let decoder = GzDecoder::new(Cursor::new(bytes));
+    let mut archive = tar::Archive::new(decoder);
+    let mut names = BTreeSet::new();
+    let mut manifest = None;
+    let mut cli = None;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        if !entry.header().entry_type().is_file()
+            || path.is_absolute()
+            || !path
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+            || path.components().next() != Some(Component::Normal("package".as_ref()))
+        {
+            return Err("npm bootstrap archive has an unreviewed member".into());
+        }
+        if !names.insert(path.clone()) {
+            return Err("npm bootstrap archive has a duplicate member".into());
+        }
+        let selected = if path == Path::new("package/package.json") {
+            &mut manifest
+        } else if path == Path::new("package/bin/npm-cli.js") {
+            &mut cli
+        } else {
+            continue;
+        };
+        if entry.size() > 1024 * 1024 {
+            return Err("npm bootstrap identity file exceeds its bound".into());
+        }
+        let mut contents = Vec::with_capacity(usize::try_from(entry.size())?);
+        entry.read_to_end(&mut contents)?;
+        *selected = Some(contents);
+    }
+    Ok((
+        manifest.ok_or("npm bootstrap archive omitted package.json")?,
+        cli.ok_or("npm bootstrap archive omitted npm-cli.js")?,
+    ))
 }
 
 fn resolve_lifecycle_exception(
@@ -1524,6 +1673,16 @@ fn reviewed_workstation_npm() -> WorkstationNpm {
             "5942f8228c2e250dddea8688fc8fea2776042baafd40da0d2ac70920a1e165bb".to_owned(),
         package_lock_sha256:
             "22521261a3bee269f2b992011e417eb4c47a94bcde34c92f29b4504f77454d5c".to_owned(),
+        bootstrap: NpmBootstrap {
+            package: "npm".to_owned(),
+            version: "11.12.1".to_owned(),
+            url: "https://registry.npmjs.org/npm/-/npm-11.12.1.tgz".to_owned(),
+            integrity: "sha512-zcoUuF1kezGSAo0CqtvoLXX3mkRqzuqYdL6Y5tdo8g69NVV3CkjQ6ZBhBgB4d7vGkPcV6TcvLi3GRKPDFX+xTA==".to_owned(),
+            sha256: "e679850e663b16f5f146ee425d0eb0e3442c1d2bda3d513bbfd7c81f5ee5db38"
+                .to_owned(),
+            size: 2_833_345,
+            kind: "npm_tgz".to_owned(),
+        },
         lifecycle_exceptions: BTreeMap::from([
             (
                 "claude".to_owned(),
@@ -1654,14 +1813,144 @@ fn validate_workstation_package_lock_files(
     validate_workstation_npm(&image_lock.workstation_npm)
 }
 
+fn validate_workstation_target_lock_files(
+    npm_lock_path: &Path,
+    target_lock_path: &Path,
+) -> Result<(), DynError> {
+    validate_workstation_target_lock_bytes(&fs::read(npm_lock_path)?, &fs::read(target_lock_path)?)
+        .map(|_| ())
+}
+
+fn validate_workstation_target_lock_bytes(
+    npm_lock_bytes: &[u8],
+    target_lock_bytes: &[u8],
+) -> Result<WorkstationTargetLock, DynError> {
+    let target: WorkstationTargetLock = toml::from_str(std::str::from_utf8(target_lock_bytes)?)?;
+    let package_lock_sha256 = sha256(npm_lock_bytes);
+    let excluded_paths: BTreeSet<&str> = target.excluded_paths.iter().map(String::as_str).collect();
+    let reviewed_excluded: BTreeSet<&str> = REVIEWED_EXCLUDED_NPM_PATHS.into_iter().collect();
+    if target.schema_version != 1
+        || target.npm_version != "11.12.1"
+        || package_lock_sha256 != REVIEWED_WORKSTATION_PACKAGE_LOCK_SHA256
+        || target.package_lock_sha256 != package_lock_sha256
+        || target.os != "linux"
+        || target.cpu != "arm64"
+        || target.libc != "glibc"
+        || target.record_count != REVIEWED_NPM_TARGET_RECORDS as u64
+        || target.compressed_bytes != REVIEWED_NPM_TARGET_BYTES as u64
+        || target.closure_sha256
+            != "a82521814dc27a9a460700ee49ffceebf719bbb5a32f62e8b6540dd8e13c21b5"
+        || target.excluded_record_count != REVIEWED_EXCLUDED_NPM_PATHS.len() as u64
+        || target.excluded_compressed_bytes != REVIEWED_NPM_EXCLUDED_BYTES as u64
+        || target.excluded_closure_sha256
+            != "b0f4e28bfd87590a7c6189454fa302c98b14d56efcb2fd8c9574e3bfa6295063"
+        || excluded_paths.len() != target.excluded_paths.len()
+        || excluded_paths != reviewed_excluded
+    {
+        return Err(
+            "workstation npm target lock differs from reviewed npm 11.12.1 linux/arm64/glibc evidence"
+                .into(),
+        );
+    }
+
+    let npm_lock: serde_json::Value = serde_json::from_slice(npm_lock_bytes)?;
+    let packages = npm_lock["packages"]
+        .as_object()
+        .ok_or("workstation npm target package lock omitted packages")?;
+    let mut included = Vec::new();
+    let mut excluded = Vec::new();
+    let mut all_paths = BTreeSet::new();
+    for (path, package) in packages {
+        if path.is_empty() {
+            continue;
+        }
+        if path.contains(['\0', '\n', '\r', '\t'])
+            || !path.starts_with("node_modules/")
+            || !all_paths.insert(path.as_str())
+        {
+            return Err("workstation npm target package path is invalid".into());
+        }
+        let url = package["resolved"]
+            .as_str()
+            .ok_or("workstation npm target package omitted resolved URL")?;
+        let integrity = package["integrity"]
+            .as_str()
+            .ok_or("workstation npm target package omitted integrity")?;
+        validate_sha512_sri(integrity, path)?;
+        if url.contains(['\0', '\n', '\r', '\t']) {
+            return Err("workstation npm target URL contains a separator".into());
+        }
+        let record = (path.as_str(), url, integrity);
+        if excluded_paths.contains(path.as_str()) {
+            excluded.push(record);
+        } else {
+            included.push(record);
+        }
+    }
+    if included.len() != REVIEWED_NPM_TARGET_RECORDS
+        || excluded.len() != REVIEWED_EXCLUDED_NPM_PATHS.len()
+        || included.len() + excluded.len() != REVIEWED_NPM_CLOSURE_RECORDS
+    {
+        return Err("workstation npm target closure membership count differs from review".into());
+    }
+    let included_paths: BTreeSet<&str> = included.iter().map(|record| record.0).collect();
+    if REVIEWED_CLIPBOARD_NPM_PATHS
+        .iter()
+        .any(|path| !included_paths.contains(path))
+    {
+        return Err("workstation npm target closure omitted reviewed Pi clipboard behavior".into());
+    }
+    if canonical_target_closure_sha256("target", &included)? != target.closure_sha256
+        || canonical_target_closure_sha256("excluded", &excluded)? != target.excluded_closure_sha256
+    {
+        return Err("workstation npm target closure identity differs from review".into());
+    }
+    Ok(target)
+}
+
+fn canonical_target_closure_sha256(
+    class: &str,
+    records: &[(&str, &str, &str)],
+) -> Result<String, DynError> {
+    let mut records = records.to_vec();
+    records.sort_by_key(|record| record.0);
+    let mut hasher = Sha256::new();
+    hasher.update(format!("gascan-workstation-npm-{class}-closure-v1\n"));
+    for (path, url, integrity) in records {
+        for value in [path, url, integrity] {
+            if value.contains(['\0', '\n', '\r', '\t']) {
+                return Err("workstation npm target closure identity contains a separator".into());
+            }
+        }
+        hasher.update(path.as_bytes());
+        hasher.update(b"\t");
+        hasher.update(url.as_bytes());
+        hasher.update(b"\t");
+        hasher.update(integrity.as_bytes());
+        hasher.update(b"\n");
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 fn verify_existing_workstation_lock_files(
     npm_manifest_path: &Path,
     npm_lock_path: &Path,
     image_lock_path: &Path,
+    target_lock_path: &Path,
 ) -> Result<(), DynError> {
     read_existing_bundle_without_writes(
-        [npm_manifest_path, npm_lock_path, image_lock_path],
-        |[manifest_bytes, npm_lock_bytes, image_lock_bytes]| {
+        [
+            npm_manifest_path,
+            npm_lock_path,
+            image_lock_path,
+            target_lock_path,
+        ],
+        |[
+            manifest_bytes,
+            npm_lock_bytes,
+            image_lock_bytes,
+            target_lock_bytes,
+        ]| {
             let image_lock: WorkstationValidationLock =
                 toml::from_str(std::str::from_utf8(image_lock_bytes)?)?;
             if sha256(manifest_bytes) != image_lock.workstation_npm.package_manifest_sha256
@@ -1672,6 +1961,7 @@ fn verify_existing_workstation_lock_files(
             validate_workstation_artifacts(&image_lock.workstation_artifacts)?;
             validate_npm_lock(npm_lock_bytes, &image_lock.workstation_artifacts)?;
             validate_workstation_npm(&image_lock.workstation_npm)?;
+            let target = validate_workstation_target_lock_bytes(npm_lock_bytes, target_lock_bytes)?;
 
             let client = http_client()?;
             verify_existing_workstation_artifacts(&client, &image_lock.workstation_artifacts)?;
@@ -1679,7 +1969,17 @@ fn verify_existing_workstation_lock_files(
             let packages = npm_lock["packages"]
                 .as_object()
                 .ok_or("workstation npm lock omitted packages")?;
-            verify_npm_closure_tarballs(&client, packages)?;
+            let (verified, bytes) = verify_npm_closure_tarballs(&client, packages)?;
+            if verified != REVIEWED_NPM_CLOSURE_RECORDS
+                || bytes != REVIEWED_NPM_CLOSURE_BYTES
+                || verified != usize::try_from(target.record_count + target.excluded_record_count)?
+                || bytes
+                    != usize::try_from(target.compressed_bytes + target.excluded_compressed_bytes)?
+            {
+                return Err(
+                    "downloaded npm closure totals differ from reviewed target partition".into(),
+                );
+            }
             let resolved = resolve_workstation_npm(
                 &client,
                 manifest_bytes,
@@ -1698,15 +1998,16 @@ fn verify_existing_workstation_lock_files(
 }
 
 fn read_existing_bundle_without_writes(
-    paths: [&Path; 3],
-    verify: impl FnOnce([&[u8]; 3]) -> Result<(), DynError>,
+    paths: [&Path; 4],
+    verify: impl FnOnce([&[u8]; 4]) -> Result<(), DynError>,
 ) -> Result<(), DynError> {
     let contents = [
         fs::read(paths[0])?,
         fs::read(paths[1])?,
         fs::read(paths[2])?,
+        fs::read(paths[3])?,
     ];
-    verify([&contents[0], &contents[1], &contents[2]])
+    verify([&contents[0], &contents[1], &contents[2], &contents[3]])
 }
 
 fn verify_existing_workstation_artifacts(
@@ -2272,16 +2573,29 @@ scripts = "old"
     #[test]
     fn existing_lock_verification_reads_but_never_rewrites_generated_outputs() {
         let temporary = tempfile::tempdir().unwrap();
-        let paths = ["manifest.json", "package-lock.json", "versions.lock"]
-            .map(|name| temporary.path().join(name));
-        let exact = [b"manifest".as_slice(), b"npm lock", b"primary lock"];
+        let paths = [
+            "manifest.json",
+            "package-lock.json",
+            "versions.lock",
+            "target.lock",
+        ]
+        .map(|name| temporary.path().join(name));
+        let exact = [
+            b"manifest".as_slice(),
+            b"npm lock",
+            b"primary lock",
+            b"target lock",
+        ];
         for (path, bytes) in paths.iter().zip(exact) {
             std::fs::write(path, bytes).unwrap();
         }
-        read_existing_bundle_without_writes([&paths[0], &paths[1], &paths[2]], |contents| {
-            assert_eq!(contents, exact);
-            Ok(())
-        })
+        read_existing_bundle_without_writes(
+            [&paths[0], &paths[1], &paths[2], &paths[3]],
+            |contents| {
+                assert_eq!(contents, exact);
+                Ok(())
+            },
+        )
         .unwrap();
         for (path, bytes) in paths.iter().zip(exact) {
             assert_eq!(std::fs::read(path).unwrap(), bytes);

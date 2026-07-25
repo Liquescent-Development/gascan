@@ -511,10 +511,15 @@ fn independent_solver_resolves_all_arch_sources_against_native_arm64_dependencie
             .join("scripts/verify-ubuntu-debian-evidence.py"),
     )
     .unwrap();
-    assert!(verifier
-        .contains(r#"return candidate_arch in ("arm64", "all") or multi_arch == "foreign""#));
-    assert!(!verifier
-        .contains(r#"return candidate_arch in (source_arch, "all") or multi_arch == "foreign""#));
+    assert!(
+        verifier
+            .contains(r#"return candidate_arch in ("arm64", "all") or multi_arch == "foreign""#)
+    );
+    assert!(
+        !verifier.contains(
+            r#"return candidate_arch in (source_arch, "all") or multi_arch == "foreign""#
+        )
+    );
 }
 
 #[test]

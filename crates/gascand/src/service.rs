@@ -18,7 +18,7 @@ use gascan_core::runtime::{
     ContainerState, CreateFailure, CreateOutcome, CreateRequest, ExecInput, ExecOutput,
     ExecRequest, RecreateRequest, RemoveRequest, ResourceIdentity, ResourceKind, ResourceOwnership,
     RetainedResources, RuntimeBackend, RuntimeCapabilities, RuntimeError, RuntimeResource,
-    immutable_image_reference,
+    immutable_image_reference, same_immutable_image,
 };
 use gascan_core::sandbox::{SandboxError, SandboxId, SandboxSpec};
 use serde::de::{Error as _, MapAccess, Visitor};
@@ -56,7 +56,11 @@ struct ImageState {
 
 impl ImageState {
     fn change_required(&self) -> bool {
-        self.recorded.as_deref() != Some(self.approved.as_str()) || self.running != self.approved
+        !self
+            .recorded
+            .as_deref()
+            .is_some_and(|recorded| same_immutable_image(recorded, &self.approved))
+            || !same_immutable_image(&self.running, &self.approved)
     }
 }
 
@@ -1353,6 +1357,18 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 MISE_DATA_DIR,
                 "/home/workspace/.cache",
                 "/home/workspace/.config/gascan",
+            ],
+            Vec::new(),
+        )
+        .await?;
+        self.exec_guest(
+            spec.id(),
+            ProvisionStep::WriteSafeMiseConfig,
+            "initialize_workstation_home",
+            [
+                "/usr/bin/env",
+                "HOME=/home/workspace",
+                "/usr/local/bin/configure-workstation-home",
             ],
             Vec::new(),
         )

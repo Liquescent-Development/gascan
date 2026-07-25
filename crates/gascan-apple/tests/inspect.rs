@@ -106,6 +106,52 @@ async fn foreign_container_names_do_not_have_to_be_valid_sandbox_ids() {
 }
 
 #[tokio::test]
+async fn current_apple_image_object_is_accepted_without_weakening_inventory_classification() {
+    let resources = inspector(output(
+        br#"[{"configuration":{"id":"bleh","image":{"descriptor":{"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"reference":"docker.io/library/alpine:latest"},"labels":{}},"status":{"state":"stopped"}}]"#,
+    ))
+    .list_resources()
+    .await
+    .unwrap();
+    assert_eq!(resources.len(), 1);
+    assert_eq!(resources[0].name(), "bleh");
+    assert_eq!(resources[0].ownership(), ResourceOwnership::Foreign);
+}
+
+#[tokio::test]
+async fn current_apple_image_object_preserves_exact_digest_qualified_inspection() {
+    let response = br#"[{"configuration":{"id":"code-a1b2c3d4e5f6","image":{"descriptor":{"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"reference":"ghcr.io/liquescent-development/gascan/workspace:fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"labels":{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":"code-a1b2c3d4e5f6"}},"status":{"state":"running"}}]"#;
+    let actual = inspector(output(response))
+        .inspect(&id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        actual.image,
+        "ghcr.io/liquescent-development/gascan/workspace:fixture@sha256:\
+         aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+}
+
+#[tokio::test]
+async fn structured_image_requires_matching_reference_and_descriptor_digests() {
+    for image in [
+        r#"{"reference":"ghcr.io/liquescent-development/gascan/workspace:fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+        r#"{"descriptor":{},"reference":"ghcr.io/liquescent-development/gascan/workspace:fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+        r#"{"descriptor":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"reference":"ghcr.io/liquescent-development/gascan/workspace:fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+    ] {
+        let response = format!(
+            r#"[{{"configuration":{{"id":"code-a1b2c3d4e5f6","image":{image},"labels":{{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":"code-a1b2c3d4e5f6"}}}},"status":{{"state":"running"}}}}]"#
+        );
+        let error = inspector(output(response.as_bytes()))
+            .inspect(&id())
+            .await
+            .expect_err("incomplete or mismatched structured image must fail closed");
+        assert_eq!(error.code(), "invalid_output", "image: {image}");
+    }
+}
+
+#[tokio::test]
 async fn malformed_required_fields_and_unknown_states_fail_closed() {
     for bytes in [
         br#"[{"configuration":{"id":"code-a1b2c3d4e5f6"},"status":{}}]"#.as_slice(),

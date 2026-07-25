@@ -32,6 +32,27 @@ media_type = "application/vnd.gascan.workspace-bundle.v1+tar.zstd"
 platform = "linux/arm64"
 publication = "pending"
 
+[workstation_commands]
+cargo = "cargo 1.97.0"
+dig = "DiG 9.18.39-0ubuntu0.24.04.5-Ubuntu"
+emacs = "GNU Emacs 29.3"
+fd = "fdfind 9.0.0"
+fzf = "0.44.1 (debian)"
+gh = "gh version 2.45.0"
+git = "git version 2.43.0"
+ifconfig = "net-tools 2.10"
+ip = "ip utility, iproute2-6.1.0"
+nc = "OpenBSD netcat (Debian patchlevel 1.226-1ubuntu2)"
+netstat = "net-tools 2.10"
+pico = "GNU nano, version 7.2"
+ping = "ping from iputils 20240117"
+rg = "ripgrep 14.1.0"
+rustc = "rustc 1.97.0"
+ss = "ss utility, iproute2-6.1.0"
+tmux = "tmux 3.4"
+traceroute = "Modern traceroute for Linux, version 2.1.5"
+vim = "VIM - Vi IMproved 9.1"
+
 [workstation_artifacts.claude]
 kind = "npm_tgz"
 platform = "linux-arm64"
@@ -85,6 +106,15 @@ npm_version = "11.12.1"
 package_lock_sha256 = "22521261a3bee269f2b992011e417eb4c47a94bcde34c92f29b4504f77454d5c"
 package_manifest_sha256 = "5942f8228c2e250dddea8688fc8fea2776042baafd40da0d2ac70920a1e165bb"
 scripts = "disabled"
+
+[workstation_npm.bootstrap]
+integrity = "sha512-zcoUuF1kezGSAo0CqtvoLXX3mkRqzuqYdL6Y5tdo8g69NVV3CkjQ6ZBhBgB4d7vGkPcV6TcvLi3GRKPDFX+xTA=="
+kind = "npm_tgz"
+package = "npm"
+sha256 = "e679850e663b16f5f146ee425d0eb0e3442c1d2bda3d513bbfd7c81f5ee5db38"
+size = 2833345
+url = "https://registry.npmjs.org/npm/-/npm-11.12.1.tgz"
+version = "11.12.1"
 
 [workstation_npm.claude_native]
 binary_path = "package/claude"

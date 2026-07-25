@@ -265,6 +265,7 @@ async fn retained_setup_failure_persists_storage_and_up_retries_setup() -> TestR
     runtime
         .queue_exec_results([
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (digest.clone(), Vec::new(), 0),
             (Vec::new(), b"No space left on device".to_vec(), 28),
         ])
@@ -288,6 +289,7 @@ async fn retained_setup_failure_persists_storage_and_up_retries_setup() -> TestR
 
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (digest, Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
@@ -843,6 +845,69 @@ async fn image_replace_failures_restore_previous_image_and_resources() -> TestRe
             ));
         }
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_runtime_image_identity_starts_without_apply_required() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let runtime_path = root.join("runtime.json");
+    let state_path = root.join("state.db");
+    let desired = spec("canonical-runtime-image", root)?;
+    let capabilities = FakeRuntime::default().capabilities().await?;
+    let approved = PolicyCompiler::compile(desired.clone(), &capabilities)?
+        .image()
+        .to_owned();
+    let (tagged_name, digest) = approved
+        .rsplit_once('@')
+        .ok_or("approved image lacks digest")?;
+    let tag_separator = tagged_name.rfind(':').ok_or("approved image lacks a tag")?;
+    let canonical = format!("{}@{digest}", &tagged_name[..tag_separator]);
+
+    let initial_runtime = FakeRuntime::persistent(capabilities.clone(), &runtime_path).await?;
+    let initial_service = SandboxService::new(
+        initial_runtime.clone(),
+        gascand::Store::open(&state_path)?,
+        Arc::new(NoopProvisioner),
+    );
+    initial_service.up(UpRequest::new(desired.clone())).await?;
+    initial_runtime.stop(desired.id()).await?;
+    drop(initial_service);
+    drop(initial_runtime);
+    rewrite_runtime_image(&runtime_path, &canonical)?;
+
+    let runtime = FakeRuntime::persistent(capabilities, &runtime_path).await?;
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(&state_path)?,
+        Arc::new(NoopProvisioner),
+    );
+    let operation = service.up(UpRequest::new(desired.clone())).await?;
+    let events = service.store().operation_events(operation.id)?;
+
+    assert!(events.iter().all(|event| {
+        event
+            .details
+            .as_ref()
+            .and_then(|details| details["phase"].as_str())
+            != Some("apply_required")
+    }));
+    assert!(
+        runtime
+            .calls()
+            .await
+            .iter()
+            .any(|call| matches!(call, RuntimeCall::Start(id) if id == desired.id()))
+    );
+    assert_eq!(
+        runtime
+            .inspect(desired.id())
+            .await?
+            .ok_or("runtime sandbox")?
+            .state,
+        gascan_core::runtime::ContainerState::Running
+    );
     Ok(())
 }
 

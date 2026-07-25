@@ -1,0 +1,26 @@
+schema_version = 1
+npm_version = "11.12.1"
+package_lock_sha256 = "22521261a3bee269f2b992011e417eb4c47a94bcde34c92f29b4504f77454d5c"
+os = "linux"
+cpu = "arm64"
+libc = "glibc"
+record_count = 144
+compressed_bytes = 240013303
+closure_sha256 = "a82521814dc27a9a460700ee49ffceebf719bbb5a32f62e8b6540dd8e13c21b5"
+excluded_record_count = 12
+excluded_compressed_bytes = 1255140640
+excluded_closure_sha256 = "b0f4e28bfd87590a7c6189454fa302c98b14d56efcb2fd8c9574e3bfa6295063"
+excluded_paths = [
+  "node_modules/@anthropic-ai/claude-code-darwin-arm64",
+  "node_modules/@anthropic-ai/claude-code-darwin-x64",
+  "node_modules/@anthropic-ai/claude-code-linux-arm64-musl",
+  "node_modules/@anthropic-ai/claude-code-linux-x64",
+  "node_modules/@anthropic-ai/claude-code-linux-x64-musl",
+  "node_modules/@anthropic-ai/claude-code-win32-arm64",
+  "node_modules/@anthropic-ai/claude-code-win32-x64",
+  "node_modules/@openai/codex-darwin-arm64",
+  "node_modules/@openai/codex-darwin-x64",
+  "node_modules/@openai/codex-linux-x64",
+  "node_modules/@openai/codex-win32-arm64",
+  "node_modules/@openai/codex-win32-x64",
+]

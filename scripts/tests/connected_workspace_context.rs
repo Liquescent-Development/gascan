@@ -9,12 +9,13 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use gascan_image_tools::{ReviewedInputKind, parse_dockerfile_copies, reviewed_input_kind_allowed};
+use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
 use tempfile::TempDir;
 
 const REVIEWED_GASCAMP_REVISION: &str = "f6b248c5926240856dbea83d1d2c5c90ea1c1456";
 
-const REQUIRED: [&str; 17] = [
+const REQUIRED: [&str; 19] = [
     "Dockerfile",
     ".artifacts/mise-linux-arm64",
     ".artifacts/playwright-chromium-reviewed",
@@ -28,9 +29,11 @@ const REQUIRED: [&str; 17] = [
     "workstation/glab.tar.gz",
     "workstation/herdr",
     "workstation/neovim.tar.gz",
+    "workstation/npm-cli.tgz",
     "workstation/npm-cache",
     "workstation/package-lock.json",
     "workstation/package.json",
+    "workstation/target-lock.toml",
     "tests/image/system-tools.txt",
 ];
 
@@ -45,12 +48,14 @@ const NATIVE_FIXTURES: [(&str, &[u8], &str, &str); 4] = [
     ("herdr", b"herdr fixture\n", "raw_binary", "github.com"),
     ("neovim.tar.gz", b"neovim fixture\n", "tar_gz", "github.com"),
 ];
-const NPM_FIXTURES: [(&str, &[u8]); 4] = [
+const NPM_FIXTURES: [(&str, &[u8]); 5] = [
     ("claude", b"claude npm fixture\n"),
     ("codex", b"codex npm fixture\n"),
+    ("excluded", b"excluded npm fixture\n"),
     ("pi", b"pi npm fixture\n"),
     ("claude-native", b"claude native fixture\n"),
 ];
+const NPM_BOOTSTRAP_FIXTURE: &[u8] = b"npm bootstrap fixture\n";
 
 struct Fixture {
     temporary: TempDir,
@@ -99,6 +104,7 @@ impl Fixture {
         for (name, bytes, _, _) in NATIVE_FIXTURES {
             fs::write(cache.join("workstation").join(name), bytes).unwrap();
         }
+        fs::write(cache.join("workstation/npm-cli.tgz"), NPM_BOOTSTRAP_FIXTURE).unwrap();
         let package = b"{\"name\":\"fixture\",\"private\":true,\"version\":\"0.0.0\"}\n";
         let mut package_records = "\"\":{\"name\":\"fixture\",\"version\":\"0.0.0\"}".to_owned();
         for (name, bytes) in NPM_FIXTURES {
@@ -128,14 +134,45 @@ impl Fixture {
             package_lock.as_bytes(),
         )
         .unwrap();
+        let target_lock = fixture_target_lock(
+            package_lock.as_bytes(),
+            &cache.join("workstation/npm-cache"),
+        );
+        fs::write(
+            repository.join("images/workspace/workstation-target-lock.toml"),
+            &target_lock,
+        )
+        .unwrap();
         let lock = repository.join("images/workspace/versions.lock");
         let lock_bytes = connected_lock("connected", package, package_lock.as_bytes());
         fs::write(&lock, &lock_bytes).unwrap();
         fs::write(
             cache.join("workstation/prefetch-lock.sha256"),
-            format!("{:x}\n", Sha256::digest(lock_bytes.as_bytes())),
+            format!(
+                "{}\n",
+                fixture_prefetch_receipt(lock_bytes.as_bytes(), target_lock.as_bytes())
+            ),
         )
         .unwrap();
+        let staging = temporary.path().join("fixture-prefetch");
+        fs::create_dir(&staging).unwrap();
+        fs::rename(cache.join("workstation"), staging.join("workstation")).unwrap();
+        let indexed = Command::new(env!("CARGO_BIN_EXE_prepare-workspace-context"))
+            .arg("--publish-workstation-cache")
+            .arg(&lock)
+            .arg(repository.join("images/workspace/workstation-package.json"))
+            .arg(repository.join("images/workspace/workstation-package-lock.json"))
+            .arg(repository.join("images/workspace/workstation-target-lock.toml"))
+            .arg(&staging)
+            .arg(cache.join("workstation"))
+            .output()
+            .unwrap();
+        assert!(
+            indexed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&indexed.stderr)
+        );
+        make_tree_writable(&cache.join("workstation"));
         let context = temporary.path().join("connected-workspace-context");
         Self {
             temporary,
@@ -181,9 +218,17 @@ impl Fixture {
     }
 
     fn refresh_lock_receipt(&self) {
+        let target_lock = fs::read(
+            self.repository
+                .join("images/workspace/workstation-target-lock.toml"),
+        )
+        .unwrap();
         fs::write(
             self.cache.join("workstation/prefetch-lock.sha256"),
-            format!("{:x}\n", Sha256::digest(fs::read(&self.lock).unwrap())),
+            format!(
+                "{}\n",
+                fixture_prefetch_receipt(&fs::read(&self.lock).unwrap(), &target_lock)
+            ),
         )
         .unwrap();
     }
@@ -200,8 +245,55 @@ impl Fixture {
                 self.repository
                     .join("images/workspace/workstation-package-lock.json"),
             )
+            .arg(
+                self.repository
+                    .join("images/workspace/workstation-target-lock.toml"),
+            )
             .arg(staging)
             .arg(destination)
+            .output()
+            .unwrap()
+    }
+
+    fn verify_full_workstation_cache(&self) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_prepare-workspace-context"))
+            .arg("--verify-full-workstation-cache")
+            .arg(&self.lock)
+            .arg(
+                self.repository
+                    .join("images/workspace/workstation-package.json"),
+            )
+            .arg(
+                self.repository
+                    .join("images/workspace/workstation-package-lock.json"),
+            )
+            .arg(
+                self.repository
+                    .join("images/workspace/workstation-target-lock.toml"),
+            )
+            .arg(self.cache.join("workstation"))
+            .output()
+            .unwrap()
+    }
+
+    fn publish_target_from_full_workstation_cache(&self) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_prepare-workspace-context"))
+            .arg("--publish-target-workstation-cache-from-full")
+            .arg(&self.lock)
+            .arg(
+                self.repository
+                    .join("images/workspace/workstation-package.json"),
+            )
+            .arg(
+                self.repository
+                    .join("images/workspace/workstation-package-lock.json"),
+            )
+            .arg(
+                self.repository
+                    .join("images/workspace/workstation-target-lock.toml"),
+            )
+            .arg(self.cache.join("workstation"))
+            .arg(self.cache.join("workstation"))
             .output()
             .unwrap()
     }
@@ -416,13 +508,84 @@ fn connected_lock(mode: &str, package: &[u8], package_lock: &[u8]) -> String {
         ));
     }
     format!(
-        "base_image = \"ubuntu@sha256:{}\"\nworkspace_build_mode = \"{mode}\"\n[mise]\nurl = \"https://example.invalid/mise\"\nsha256 = \"{}\"\n[playwright_chromium]\nurl = \"https://example.invalid/chromium\"\nsha256 = \"{}\"\n[gascamp]\nrevision = \"{REVIEWED_GASCAMP_REVISION}\"\n[workspace_bundles]\nmedia_type = \"application/vnd.gascan.workspace-bundle.v1+tar.zstd\"\nplatform = \"linux/arm64\"\npublication = \"pending\"\n{records}\n[workstation_npm]\nscripts = \"disabled\"\nnpm_version = \"11.12.1\"\npackage_manifest_sha256 = \"{:x}\"\npackage_lock_sha256 = \"{:x}\"\n",
+        "base_image = \"ubuntu@sha256:{}\"\nworkspace_build_mode = \"{mode}\"\n[mise]\nurl = \"https://example.invalid/mise\"\nsha256 = \"{}\"\n[playwright_chromium]\nurl = \"https://example.invalid/chromium\"\nsha256 = \"{}\"\n[gascamp]\nrevision = \"{REVIEWED_GASCAMP_REVISION}\"\n[workspace_bundles]\nmedia_type = \"application/vnd.gascan.workspace-bundle.v1+tar.zstd\"\nplatform = \"linux/arm64\"\npublication = \"pending\"\n{records}\n[workstation_npm]\nscripts = \"disabled\"\nnpm_version = \"11.12.1\"\npackage_manifest_sha256 = \"{:x}\"\npackage_lock_sha256 = \"{:x}\"\n\n[workstation_npm.bootstrap]\npackage = \"npm\"\nversion = \"11.12.1\"\nurl = \"https://registry.npmjs.org/npm/-/npm-11.12.1.tgz\"\nintegrity = \"sha512-{}\"\nsha256 = \"{:x}\"\nsize = {}\nkind = \"npm_tgz\"\n",
         "a".repeat(64),
         "b".repeat(64),
         "c".repeat(64),
         Sha256::digest(package),
         Sha256::digest(package_lock),
+        BASE64.encode(Sha512::digest(NPM_BOOTSTRAP_FIXTURE)),
+        Sha256::digest(NPM_BOOTSTRAP_FIXTURE),
+        NPM_BOOTSTRAP_FIXTURE.len(),
     )
+}
+
+fn fixture_target_lock(package_lock: &[u8], npm_cache: &Path) -> String {
+    let package_lock_sha256 = format!("{:x}", Sha256::digest(package_lock));
+    let parsed: serde_json::Value = serde_json::from_slice(package_lock).unwrap();
+    let packages = parsed["packages"].as_object().unwrap();
+    let mut identities = Vec::new();
+    let mut excluded_identities = Vec::new();
+    let mut compressed_bytes = 0_u64;
+    let mut excluded_compressed_bytes = 0_u64;
+    for (path, record) in packages {
+        if path.is_empty() {
+            continue;
+        }
+        let url = record["resolved"].as_str().unwrap();
+        let integrity = record["integrity"].as_str().unwrap();
+        let identity = format!("{path}\t{url}\t{integrity}\n");
+        let size = fs::metadata(npm_cache_path(npm_cache, integrity))
+            .unwrap()
+            .len();
+        if path == "node_modules/excluded" {
+            excluded_identities.push(identity);
+            excluded_compressed_bytes += size;
+        } else {
+            identities.push(identity);
+            compressed_bytes += size;
+        }
+    }
+    identities.sort();
+    excluded_identities.sort();
+    let mut target = Sha256::new();
+    target.update(b"gascan-workstation-npm-target-closure-v1\n");
+    for identity in &identities {
+        target.update(identity.as_bytes());
+    }
+    let mut excluded = Sha256::new();
+    excluded.update(b"gascan-workstation-npm-excluded-closure-v1\n");
+    for identity in &excluded_identities {
+        excluded.update(identity.as_bytes());
+    }
+    format!(
+        "schema_version = 1\n\
+         npm_version = \"11.12.1\"\n\
+         package_lock_sha256 = \"{package_lock_sha256}\"\n\
+         os = \"linux\"\n\
+         cpu = \"arm64\"\n\
+         libc = \"glibc\"\n\
+         record_count = {}\n\
+         compressed_bytes = {compressed_bytes}\n\
+         closure_sha256 = \"{:x}\"\n\
+         excluded_record_count = {}\n\
+         excluded_compressed_bytes = {excluded_compressed_bytes}\n\
+         excluded_closure_sha256 = \"{:x}\"\n\
+         excluded_paths = [\"node_modules/excluded\"]\n",
+        identities.len(),
+        target.finalize(),
+        excluded_identities.len(),
+        excluded.finalize(),
+    )
+}
+
+fn fixture_prefetch_receipt(lock: &[u8], target_lock: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"gascan-workstation-prefetch-lock-v2\0");
+    hasher.update(lock);
+    hasher.update(b"\0");
+    hasher.update(target_lock);
+    format!("{:x}", hasher.finalize())
 }
 
 fn npm_cache_path(root: &Path, integrity: &str) -> PathBuf {
@@ -434,6 +597,34 @@ fn npm_cache_path(root: &Path, integrity: &str) -> PathBuf {
         .join(&hex[..2])
         .join(&hex[2..4])
         .join(&hex[4..])
+}
+
+fn npm_index_path(root: &Path, url: &str) -> PathBuf {
+    let key = format!("make-fetch-happen:request-cache:{url}");
+    let digest = format!("{:x}", Sha256::digest(key.as_bytes()));
+    root.join("_cacache/index-v5")
+        .join(&digest[..2])
+        .join(&digest[2..4])
+        .join(&digest[4..])
+}
+
+fn npm_index_bytes(url: &str, integrity: &str, size: usize) -> Vec<u8> {
+    let key = format!("make-fetch-happen:request-cache:{url}");
+    let entry = serde_json::json!({
+        "key": key,
+        "integrity": integrity,
+        "time": 1,
+        "size": size,
+        "metadata": {
+            "time": 1,
+            "url": url,
+            "reqHeaders": {},
+            "resHeaders": {},
+            "options": {"compress": true}
+        }
+    });
+    let json = serde_json::to_string(&entry).unwrap();
+    format!("\n{:x}\t{json}", Sha1::digest(json.as_bytes())).into_bytes()
 }
 
 fn paths(root: &Path) -> Vec<String> {
@@ -455,6 +646,18 @@ fn paths(root: &Path) -> Vec<String> {
     visit(root, root, &mut found);
     found.sort();
     found
+}
+
+fn make_tree_writable(root: &Path) {
+    for entry in fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            make_tree_writable(&path);
+        } else {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+    }
+    fs::set_permissions(root, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 #[test]
@@ -528,6 +731,15 @@ fn connected_context_can_be_reverified_with_its_pending_lock() {
 #[test]
 fn workstation_cache_rejects_missing_extra_linked_or_corrupt_content() {
     for mutation in [
+        "missing-index",
+        "extra-index",
+        "symlink-index",
+        "hardlink-index",
+        "corrupt-index",
+        "missing-bootstrap",
+        "symlink-bootstrap",
+        "hardlink-bootstrap",
+        "corrupt-bootstrap",
         "missing-native",
         "extra-native",
         "symlink-native",
@@ -538,11 +750,44 @@ fn workstation_cache_rejects_missing_extra_linked_or_corrupt_content() {
         "symlink-npm",
         "hardlink-npm",
         "corrupt-npm",
+        "excluded-record",
     ] {
         let fixture = Fixture::new();
+        let index_root = fixture
+            .cache
+            .join("workstation/npm-cache/_cacache/index-v5");
+        let index = paths(&index_root)
+            .into_iter()
+            .map(|path| index_root.join(path))
+            .find(|path| path.is_file())
+            .unwrap();
+        let bootstrap = fixture.cache.join("workstation/npm-cli.tgz");
         let native = fixture.cache.join("workstation/herdr");
         let npm = fixture.npm_tarball();
         match mutation {
+            "missing-index" => fs::remove_file(index).unwrap(),
+            "extra-index" => fs::write(index_root.join("unlocked"), b"extra").unwrap(),
+            "symlink-index" => {
+                fs::remove_file(&index).unwrap();
+                std::os::unix::fs::symlink(&fixture.lock, index).unwrap();
+            }
+            "hardlink-index" => {
+                let peer = fixture.cache.join("index-hardlink-peer");
+                fs::hard_link(&index, peer).unwrap();
+                assert_eq!(fs::metadata(index).unwrap().nlink(), 2);
+            }
+            "corrupt-index" => fs::write(index, b"wrong").unwrap(),
+            "missing-bootstrap" => fs::remove_file(bootstrap).unwrap(),
+            "symlink-bootstrap" => {
+                fs::remove_file(&bootstrap).unwrap();
+                std::os::unix::fs::symlink(&fixture.lock, bootstrap).unwrap();
+            }
+            "hardlink-bootstrap" => {
+                let peer = fixture.cache.join("bootstrap-hardlink-peer");
+                fs::hard_link(&bootstrap, peer).unwrap();
+                assert_eq!(fs::metadata(bootstrap).unwrap().nlink(), 2);
+            }
+            "corrupt-bootstrap" => fs::write(bootstrap, b"wrong").unwrap(),
             "missing-native" => fs::remove_file(native).unwrap(),
             "extra-native" => fs::write(fixture.cache.join("workstation/extra"), b"extra").unwrap(),
             "symlink-native" => {
@@ -571,6 +816,18 @@ fn workstation_cache_rejects_missing_extra_linked_or_corrupt_content() {
                 assert_eq!(fs::metadata(npm).unwrap().nlink(), 2);
             }
             "corrupt-npm" => fs::write(npm, b"wrong").unwrap(),
+            "excluded-record" => {
+                let bytes = b"excluded npm fixture\n";
+                let integrity = format!("sha512-{}", BASE64.encode(Sha512::digest(bytes)));
+                let url = "https://registry.npmjs.org/excluded/-/excluded-1.0.0.tgz";
+                let content =
+                    npm_cache_path(&fixture.cache.join("workstation/npm-cache"), &integrity);
+                fs::create_dir_all(content.parent().unwrap()).unwrap();
+                fs::write(content, bytes).unwrap();
+                let index = npm_index_path(&fixture.cache.join("workstation/npm-cache"), url);
+                fs::create_dir_all(index.parent().unwrap()).unwrap();
+                fs::write(index, npm_index_bytes(url, &integrity, bytes.len())).unwrap();
+            }
             _ => unreachable!(),
         }
         let output = fixture.run();
@@ -710,6 +967,182 @@ fn workstation_cache_publication_preserves_old_on_failure_and_exchanges_valid_tr
 }
 
 #[test]
+fn workstation_cache_publication_synthesizes_the_exact_locked_npm_url_index() {
+    let fixture = Fixture::new();
+    fs::remove_dir_all(
+        fixture
+            .cache
+            .join("workstation/npm-cache/_cacache/index-v5"),
+    )
+    .unwrap();
+    let staging = fixture.temporary.path().join("index-staging");
+    fs::create_dir(&staging).unwrap();
+    fs::rename(
+        fixture.cache.join("workstation"),
+        staging.join("workstation"),
+    )
+    .unwrap();
+    let destination = fixture.temporary.path().join("indexed-workstation");
+    let output = fixture.publish(&staging, &destination);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let index = destination.join("npm-cache/_cacache/index-v5");
+    assert!(index.is_dir(), "publisher omitted npm's URL index");
+    let entries = paths(&index)
+        .into_iter()
+        .map(|relative| index.join(relative))
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
+    assert_eq!(entries.len(), NPM_FIXTURES.len() - 1);
+    let contents = entries
+        .iter()
+        .map(|path| fs::read_to_string(path).unwrap())
+        .collect::<String>();
+    for (name, bytes) in NPM_FIXTURES {
+        let url = if name == "claude-native" {
+            "https://registry.npmjs.org/fixture/claude-native.tgz".to_owned()
+        } else {
+            format!("https://registry.npmjs.org/{name}/-/{name}-1.0.0.tgz")
+        };
+        let integrity = format!("sha512-{}", BASE64.encode(Sha512::digest(bytes)));
+        if name == "excluded" {
+            assert!(!contents.contains(&url));
+            assert!(!contents.contains(&integrity));
+            continue;
+        }
+        assert!(contents.contains(&format!(
+            "\"key\":\"make-fetch-happen:request-cache:{url}\""
+        )));
+        assert!(contents.contains(&format!("\"integrity\":\"{integrity}\"")));
+    }
+    for path in entries {
+        let metadata = fs::metadata(path).unwrap();
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.permissions().mode() & 0o222, 0);
+    }
+}
+
+#[test]
+fn full_cache_read_only_verifier_accepts_exact_evidence_and_rejects_mutations() {
+    fn restore_excluded(fixture: &Fixture) {
+        let bytes = b"excluded npm fixture\n";
+        let integrity = format!("sha512-{}", BASE64.encode(Sha512::digest(bytes)));
+        let url = "https://registry.npmjs.org/excluded/-/excluded-1.0.0.tgz";
+        let npm_cache = fixture.cache.join("workstation/npm-cache");
+        let content = npm_cache_path(&npm_cache, &integrity);
+        fs::create_dir_all(content.parent().unwrap()).unwrap();
+        fs::write(content, bytes).unwrap();
+        let index = npm_index_path(&npm_cache, url);
+        fs::create_dir_all(index.parent().unwrap()).unwrap();
+        fs::write(index, npm_index_bytes(url, &integrity, bytes.len())).unwrap();
+        fs::create_dir_all(npm_cache.join("_cacache/tmp")).unwrap();
+    }
+
+    let exact = Fixture::new();
+    restore_excluded(&exact);
+    let output = exact.verify_full_workstation_cache();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    for mutation in [
+        "missing",
+        "corrupt",
+        "extra",
+        "rebound-index",
+        "missing-tmp",
+        "nonempty-tmp",
+        "symlink-tmp",
+        "hardlinked-tmp-entry",
+        "alternate-tmp",
+    ] {
+        let fixture = Fixture::new();
+        restore_excluded(&fixture);
+        let npm_cache = fixture.cache.join("workstation/npm-cache");
+        let bytes = b"excluded npm fixture\n";
+        let integrity = format!("sha512-{}", BASE64.encode(Sha512::digest(bytes)));
+        let url = "https://registry.npmjs.org/excluded/-/excluded-1.0.0.tgz";
+        match mutation {
+            "missing" => fs::remove_file(npm_cache_path(&npm_cache, &integrity)).unwrap(),
+            "corrupt" => fs::write(npm_cache_path(&npm_cache, &integrity), b"wrong").unwrap(),
+            "extra" => fs::write(npm_cache.join("unreviewed"), b"extra").unwrap(),
+            "rebound-index" => {
+                fs::write(
+                    npm_index_path(&npm_cache, url),
+                    npm_index_bytes(
+                        "https://registry.npmjs.org/rebound/-/rebound-1.0.0.tgz",
+                        &integrity,
+                        bytes.len(),
+                    ),
+                )
+                .unwrap();
+            }
+            "missing-tmp" => {
+                fs::remove_dir(npm_cache.join("_cacache/tmp")).unwrap();
+            }
+            "nonempty-tmp" => {
+                fs::write(npm_cache.join("_cacache/tmp/unreviewed"), b"extra").unwrap();
+            }
+            "symlink-tmp" => {
+                fs::remove_dir(npm_cache.join("_cacache/tmp")).unwrap();
+                std::os::unix::fs::symlink(&fixture.lock, npm_cache.join("_cacache/tmp")).unwrap();
+            }
+            "hardlinked-tmp-entry" => {
+                let entry = npm_cache.join("_cacache/tmp/linked");
+                fs::write(&entry, b"extra").unwrap();
+                fs::hard_link(&entry, npm_cache.join("_cacache/tmp/peer")).unwrap();
+            }
+            "alternate-tmp" => {
+                fs::create_dir(npm_cache.join("_cacache/temp")).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            !fixture.verify_full_workstation_cache().status.success(),
+            "accepted full-cache mutation {mutation}"
+        );
+    }
+}
+
+#[test]
+fn exact_full_cache_can_atomically_publish_the_reviewed_target_cache() {
+    let fixture = Fixture::new();
+    let bytes = b"excluded npm fixture\n";
+    let integrity = format!("sha512-{}", BASE64.encode(Sha512::digest(bytes)));
+    let url = "https://registry.npmjs.org/excluded/-/excluded-1.0.0.tgz";
+    let npm_cache = fixture.cache.join("workstation/npm-cache");
+    let content = npm_cache_path(&npm_cache, &integrity);
+    fs::create_dir_all(content.parent().unwrap()).unwrap();
+    fs::write(&content, bytes).unwrap();
+    let index = npm_index_path(&npm_cache, url);
+    fs::create_dir_all(index.parent().unwrap()).unwrap();
+    fs::write(&index, npm_index_bytes(url, &integrity, bytes.len())).unwrap();
+    fs::create_dir_all(npm_cache.join("_cacache/tmp")).unwrap();
+
+    let output = fixture.publish_target_from_full_workstation_cache();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!content.exists(), "published excluded content");
+    assert!(!index.exists(), "published excluded URL binding");
+    assert!(
+        !fixture
+            .cache
+            .join("workstation/npm-cache/_cacache/tmp")
+            .exists(),
+        "published npm temporary directory"
+    );
+    assert!(fixture.run().status.success());
+}
+
+#[test]
 fn workstation_cache_exchange_uses_the_instrumented_dual_parent_durability_sequence() {
     let source = include_str!("../src/bin/prepare-workspace-context.rs");
     for required in [
@@ -824,6 +1257,7 @@ fn connected_prefetch_uses_the_reviewed_public_acquisition_boundary() {
         "workstation-github",
         "workstation-gitlab",
         "workstation-npm",
+        "workstation-npm-native",
         "prefetch-lock.sha256",
         "extract-reviewed-chromium",
         "validate-tool-versions",
@@ -841,6 +1275,116 @@ fn connected_prefetch_uses_the_reviewed_public_acquisition_boundary() {
         !script.contains("rm -rf \"$workstation\""),
         "failed refresh must preserve the previously published cache"
     );
+}
+
+#[test]
+fn workstation_lock_places_every_npm_tarball_under_the_cache_directory() {
+    let fixture = Fixture::new();
+    let output = Command::new(env!("CARGO_BIN_EXE_prepare-workspace-context"))
+        .arg("--workstation-lock")
+        .arg(&fixture.lock)
+        .arg(
+            fixture
+                .repository
+                .join("images/workspace/workstation-package.json"),
+        )
+        .arg(
+            fixture
+                .repository
+                .join("images/workspace/workstation-package-lock.json"),
+        )
+        .arg(
+            fixture
+                .repository
+                .join("images/workspace/workstation-target-lock.toml"),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let records = std::str::from_utf8(&output.stdout).unwrap();
+    let bootstrap = records
+        .lines()
+        .find(|line| line.starts_with("native\tnpm-cli.tgz\t"))
+        .expect("bootstrap record");
+    assert!(
+        bootstrap.starts_with(
+            "native\tnpm-cli.tgz\tworkstation-npm-native\thttps://registry.npmjs.org/npm/-/npm-11.12.1.tgz\t"
+        ),
+        "{bootstrap}"
+    );
+    let npm = records
+        .lines()
+        .filter(|line| line.starts_with("npm\t"))
+        .collect::<Vec<_>>();
+    assert!(!npm.is_empty(), "fixture must exercise npm cache records");
+    assert!(
+        npm.iter()
+            .all(|line| line.starts_with("npm\tnpm-cache/_cacache/")),
+        "npm records escaped the workstation npm-cache directory: {npm:?}"
+    );
+}
+
+#[test]
+fn reviewed_target_closure_mutations_fail_closed() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let original =
+        fs::read_to_string(root.join("images/workspace/workstation-target-lock.toml")).unwrap();
+    let temporary = tempfile::tempdir_in("/tmp").unwrap();
+    let candidate = temporary.path().join("target-lock.toml");
+    let validate = |contents: &str| {
+        fs::write(&candidate, contents).unwrap();
+        Command::new(env!("CARGO_BIN_EXE_prepare-workspace-context"))
+            .arg("--workstation-lock")
+            .arg(root.join("images/workspace/versions.lock"))
+            .arg(root.join("images/workspace/workstation-package.json"))
+            .arg(root.join("images/workspace/workstation-package-lock.json"))
+            .arg(&candidate)
+            .output()
+            .unwrap()
+    };
+    for (name, changed) in [
+        ("platform", original.replace("os = \"linux\"", "os = \"darwin\"")),
+        (
+            "record count",
+            original.replace("record_count = 144", "record_count = 143"),
+        ),
+        (
+            "byte count",
+            original.replace("compressed_bytes = 240013303", "compressed_bytes = 240013304"),
+        ),
+        (
+            "closure digest",
+            original.replace("closure_sha256 = \"a825", "closure_sha256 = \"b825"),
+        ),
+        (
+            "included excluded record",
+            original.replace("  \"node_modules/@openai/codex-win32-x64\",\n", ""),
+        ),
+        (
+            "excluded included record",
+            original.replace(
+                "node_modules/@openai/codex-win32-x64",
+                "node_modules/@openai/codex-linux-arm64",
+            ),
+        ),
+        (
+            "clipboard exception drift",
+            original.replace(
+                "node_modules/@openai/codex-win32-x64",
+                "node_modules/@earendil-works/pi-coding-agent/node_modules/@mariozechner/clipboard-linux-arm64-gnu",
+            ),
+        ),
+    ] {
+        let output = validate(&changed);
+        assert!(
+            !output.status.success(),
+            "accepted target closure mutation: {name}"
+        );
+    }
 }
 
 #[test]
@@ -877,7 +1421,7 @@ case "$*" in
     printf '%s\n%s\n%s\n' \
       'receipt	prefetch-lock.sha256	{receipt}' \
       'native	herdr	workstation-github	https://github.com/example/herdr	{native}	1' \
-      'npm	_cacache/content-v2/sha512/aa/bb/cc	workstation-npm	https://registry.npmjs.org/example/-/example.tgz	sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==	209715200' ;;
+      'npm	npm-cache/_cacache/content-v2/sha512/aa/bb/cc	workstation-npm	https://registry.npmjs.org/example/-/example.tgz	sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==	209715200' ;;
   *'prepare-workspace-context -- --publish-workstation-cache'*)
     mv "$previous/workstation" "$last" ;;
   *'fetch-image-artifact'*)

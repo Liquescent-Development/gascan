@@ -74,6 +74,7 @@ for directory in \
     "$HOME/.config/gascan/herdr" \
     "$HOME/.config/gascan/gh" \
     "$HOME/.config/gascan/glab" \
+    "$HOME/.cache/mise" \
     "$HOME/.cache/claude" \
     "$HOME/.cache/codex" \
     "$HOME/.cache/pi" \
@@ -92,6 +93,7 @@ for directory in \
     "$HOME/.config/gascan/herdr" \
     "$HOME/.config/gascan/gh" \
     "$HOME/.config/gascan/glab" \
+    "$HOME/.cache/mise" \
     "$HOME/.cache/claude" \
     "$HOME/.cache/codex" \
     "$HOME/.cache/pi" \

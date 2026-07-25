@@ -97,6 +97,12 @@ pub fn validate_distinct_image_fixtures(predecessor: &str, approved: &str) -> Te
     Ok(())
 }
 
+fn image_reference(value: &Value) -> Option<&str> {
+    value
+        .as_str()
+        .or_else(|| value.as_object()?.get("reference")?.as_str())
+}
+
 pub struct AppleE2e {
     gascan: OsString,
     gascand: OsString,
@@ -446,9 +452,8 @@ impl AppleE2e {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        let result: Result<TestResult, tokio::time::error::Elapsed> = runtime.block_on(
-            tokio::time::timeout(timeout, recreate_owned_container(spec, image)),
-        );
+        let result =
+            block_on_with_timeout(&runtime, timeout, recreate_owned_container(spec, image));
         match result {
             Ok(result) => result,
             Err(_) => Err(format!(
@@ -457,6 +462,23 @@ impl AppleE2e {
             )
             .into()),
         }
+    }
+
+    pub fn seed_stored_image_resolution(&self, image: &str) -> TestResult {
+        if !gascan_core::runtime::immutable_image_reference(image) {
+            return Err("refusing to seed a mutable or malformed image resolution".into());
+        }
+        let id = gascan_core::sandbox::SandboxId::try_from(self.id().to_owned())?;
+        let store = gascand::Store::open(self.state_path())?;
+        let mut record = store
+            .sandbox(&id)?
+            .ok_or("sandbox record is absent while seeding image resolution")?;
+        record.image_resolution = Some(gascand::ImageResolution::new(
+            1,
+            serde_json::json!({"digest": image}),
+        ));
+        store.put_sandbox(&record)?;
+        Ok(())
     }
 
     pub fn write_image_replace_root_sentinel(&self) -> TestResult {
@@ -503,7 +525,7 @@ impl AppleE2e {
             .ok_or("owned container inspect lacks id")?;
         let container_image = configuration
             .get("image")
-            .and_then(Value::as_str)
+            .and_then(image_reference)
             .ok_or("owned container inspect lacks image")?;
         if container_id != self.id()
             || configuration["labels"]["dev.gascan.managed-by"] != "gascan"
@@ -542,6 +564,22 @@ impl AppleE2e {
             volumes,
             networks,
         })
+    }
+
+    pub fn assert_owned_container_running(&self) -> TestResult {
+        let inspect = self.container_json(["inspect", self.id()])?;
+        let record = inspect
+            .as_array()
+            .and_then(|records| (records.len() == 1).then(|| &records[0]))
+            .ok_or("owned container inspect is absent or ambiguous")?;
+        if record["configuration"]["id"] != self.id()
+            || record["configuration"]["labels"]["dev.gascan.managed-by"] != "gascan"
+            || record["configuration"]["labels"]["dev.gascan.sandbox-id"] != self.id()
+            || record["status"]["state"] != "running"
+        {
+            return Err(format!("owned container is not raw-runtime Running: {record:?}").into());
+        }
+        Ok(())
     }
 
     fn container_json<I, S>(&self, args: I) -> TestResult<Value>
@@ -909,6 +947,17 @@ impl AppleE2e {
     }
 }
 
+fn block_on_with_timeout<F>(
+    runtime: &tokio::runtime::Runtime,
+    timeout: std::time::Duration,
+    future: F,
+) -> Result<F::Output, tokio::time::error::Elapsed>
+where
+    F: std::future::Future,
+{
+    runtime.block_on(async { tokio::time::timeout(timeout, future).await })
+}
+
 async fn recreate_owned_container(
     spec: gascan_core::sandbox::SandboxSpec,
     image: &str,
@@ -978,7 +1027,7 @@ async fn recreate_owned_container(
             resource: create.id().to_string(),
         }
     })?;
-    if actual.image != image {
+    if !gascan_core::runtime::same_immutable_image(&actual.image, image) {
         return Err(gascan_core::runtime::RuntimeError::InvalidState {
             resource: create.id().to_string(),
             message: format!(
@@ -2013,6 +2062,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn current_thread_timeout_is_constructed_inside_its_runtime() -> TestResult {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let value = block_on_with_timeout(
+            &runtime,
+            std::time::Duration::from_secs(1),
+            std::future::ready(42),
+        )?;
+        assert_eq!(value, 42);
+        Ok(())
+    }
+
+    #[test]
     fn image_replacement_fixtures_must_be_distinct_immutable_digests() -> TestResult {
         let first = format!("registry.example/workspace:first@sha256:{}", "a".repeat(64));
         let first_alias = format!("registry.example/alias:other-tag@sha256:{}", "a".repeat(64));
@@ -2028,6 +2091,32 @@ mod tests {
         );
         assert!(validate_distinct_image_fixtures(&format!(" {first}"), &second).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn apple_image_object_and_canonical_ghcr_reference_preserve_exact_digest_identity() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let tagged = format!("ghcr.io/liquescent-development/gascan/workspace:v1.2.3@{digest}");
+        let canonical = format!("ghcr.io/liquescent-development/gascan/workspace@{digest}");
+        let object = serde_json::json!({
+            "descriptor": {"digest": digest},
+            "reference": canonical
+        });
+        assert_eq!(image_reference(&object), Some(canonical.as_str()));
+        assert!(gascan_core::runtime::same_immutable_image(
+            &canonical, &tagged
+        ));
+        assert!(!gascan_core::runtime::same_immutable_image(
+            &format!(
+                "ghcr.io/liquescent-development/gascan/workspace@sha256:{}",
+                "b".repeat(64)
+            ),
+            &tagged
+        ));
+        assert!(!gascan_core::runtime::same_immutable_image(
+            &format!("ghcr.io/other/workspace@{digest}"),
+            &tagged
+        ));
     }
 
     #[test]

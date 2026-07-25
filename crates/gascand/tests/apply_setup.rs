@@ -52,6 +52,7 @@ async fn queue_successful_setup(runtime: &FakeRuntime, bytes: &[u8], relative: &
     runtime
         .queue_exec_results([
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (digest_stdout(bytes, relative), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
@@ -135,11 +136,19 @@ async fn setup_uses_literal_guest_argv_empty_environments_and_refreshes_moved_pa
         .collect::<Vec<_>>();
     assert_eq!(
         execs[1].argv,
+        [
+            "/usr/bin/env",
+            "HOME=/home/workspace",
+            "/usr/local/bin/configure-workstation-home",
+        ]
+    );
+    assert_eq!(
+        execs[2].argv,
         ["/usr/bin/sha256sum", "/workspace/.gascan/first.sh"]
     );
-    assert_eq!(execs[2].argv, ["/bin/bash", "/workspace/.gascan/first.sh"]);
-    assert!(execs[1].environment.is_empty());
+    assert_eq!(execs[3].argv, ["/bin/bash", "/workspace/.gascan/first.sh"]);
     assert!(execs[2].environment.is_empty());
+    assert!(execs[3].environment.is_empty());
 
     let before_apply = calls.len();
     write_setup(root, ".gascan/moved.sh", bytes)?;
@@ -188,6 +197,7 @@ async fn digest_mismatch_stops_retains_digest_and_retry_succeeds() -> TestResult
     write_setup(root, "setup.sh", second)?;
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (b"0000000000000000000000000000000000000000000000000000000000000000  /workspace/setup.sh\n".to_vec(), Vec::new(), 0),
         ])
@@ -280,6 +290,7 @@ async fn nonzero_setup_exit_is_structured_sanitized_stopped_and_retryable() -> T
     runtime
         .queue_exec_results([
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (digest_stdout(bytes, "setup.sh"), Vec::new(), 0),
             (
                 Vec::new(),
@@ -333,6 +344,7 @@ async fn signaled_setup_preserves_signal_and_sanitized_stderr() -> TestResult {
     runtime
         .queue_exec_results_with_signals([
             (Vec::new(), Vec::new(), 0, 0),
+            (Vec::new(), Vec::new(), 0, 0),
             (digest_stdout(bytes, "setup.sh"), Vec::new(), 0, 0),
             (Vec::new(), b"terminated\x00\n".to_vec(), 143, 15),
         ])
@@ -372,6 +384,7 @@ async fn stop_failure_preserves_setup_failure_and_reports_unconfirmed_state() ->
     let runtime = FakeRuntime::default();
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (digest_stdout(bytes, "setup.sh"), Vec::new(), 0),
             (Vec::new(), Vec::new(), 29),
@@ -456,6 +469,7 @@ async fn later_provision_failure_does_not_advance_setup_digest() -> TestResult {
     write_setup(root, "setup.sh", second)?;
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (digest_stdout(second, "setup.sh"), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),

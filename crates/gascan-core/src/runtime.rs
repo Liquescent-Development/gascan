@@ -610,6 +610,29 @@ pub fn immutable_image_reference(image: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+pub fn same_immutable_image(left: &str, right: &str) -> bool {
+    let Some(left) = immutable_image_identity(left) else {
+        return false;
+    };
+    let Some(right) = immutable_image_identity(right) else {
+        return false;
+    };
+    left == right
+}
+
+fn immutable_image_identity(image: &str) -> Option<(&str, &str)> {
+    if !immutable_image_reference(image) {
+        return None;
+    }
+    let (name, digest) = image.split_once("@sha256:")?;
+    let last_slash = name.rfind('/');
+    let tag_separator = name
+        .rfind(':')
+        .filter(|separator| last_slash.is_none_or(|slash| *separator > slash));
+    let repository = tag_separator.map_or(name, |separator| &name[..separator]);
+    Some((repository, digest))
+}
+
 fn valid_image_name(name: &str) -> bool {
     if name.is_empty() || !name.is_ascii() || name.bytes().any(|byte| byte.is_ascii_whitespace()) {
         return false;

@@ -7,6 +7,7 @@ artifacts="$root/.artifacts"
 context="$artifacts/connected-workspace-context"
 package_manifest="$root/images/workspace/workstation-package.json"
 package_lock="$root/images/workspace/workstation-package-lock.json"
+target_lock="$root/images/workspace/workstation-target-lock.toml"
 
 die() { printf 'connected workspace prefetch: %s\n' "$*" >&2; exit 1; }
 test -f "$lock" || die "missing image lock"
@@ -39,7 +40,7 @@ workstation_staging=$(mktemp -d "$artifacts/.workstation-prefetch.XXXXXX")
 workstation="$workstation_staging/workstation"
 trap 'rm -f "$workstation_records" "$workstation_records_after"; rm -rf "$workstation_staging"' EXIT
 run_tool prepare-workspace-context --workstation-lock \
-  "$lock" "$package_manifest" "$package_lock" >"$workstation_records"
+  "$lock" "$package_manifest" "$package_lock" "$target_lock" >"$workstation_records"
 mkdir -m 0700 "$workstation"
 while IFS=$'\t' read -r kind relative class url digest bound; do
   case "$kind" in
@@ -64,11 +65,11 @@ while IFS=$'\t' read -r kind relative class url digest bound; do
   esac
 done <"$workstation_records"
 run_tool prepare-workspace-context --workstation-lock \
-  "$lock" "$package_manifest" "$package_lock" >"$workstation_records_after"
+  "$lock" "$package_manifest" "$package_lock" "$target_lock" >"$workstation_records_after"
 cmp -s "$workstation_records" "$workstation_records_after" ||
   die "workstation lock changed during prefetch"
 run_tool prepare-workspace-context --publish-workstation-cache \
-  "$lock" "$package_manifest" "$package_lock" \
+  "$lock" "$package_manifest" "$package_lock" "$target_lock" \
   "$workstation_staging" "$artifacts/workstation"
 rm -f "$workstation_records" "$workstation_records_after"
 rm -rf "$workstation_staging"

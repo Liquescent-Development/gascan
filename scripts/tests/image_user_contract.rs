@@ -10,17 +10,60 @@ fn root() -> &'static Path {
 }
 
 #[test]
+fn workstation_contract_uses_exact_locked_command_versions() {
+    let contract =
+        fs::read_to_string(root().join("images/workspace/tests/workstation-contract.sh")).unwrap();
+    assert!(
+        !contract.contains("expect_pattern"),
+        "guaranteed commands must not pass through broad version regexes"
+    );
+    assert!(
+        contract.contains("first_line ip -Version | cut -d, -f1,2"),
+        "ip normalization must retain the utility and iproute2 version fields"
+    );
+
+    let lock: toml::Value =
+        toml::from_str(&fs::read_to_string(root().join("images/workspace/versions.lock")).unwrap())
+            .unwrap();
+    let commands = lock["workstation_commands"].as_table().unwrap();
+    let expected = [
+        ("cargo", "cargo 1.97.0"),
+        ("rustc", "rustc 1.97.0"),
+        ("vim", "VIM - Vi IMproved 9.1"),
+        ("emacs", "GNU Emacs 29.3"),
+        ("pico", "GNU nano, version 7.2"),
+        ("gh", "gh version 2.45.0"),
+        ("git", "git version 2.43.0"),
+        ("ip", "ip utility, iproute2-6.1.0"),
+        ("ss", "ss utility, iproute2-6.1.0"),
+        ("ping", "ping from iputils 20240117"),
+        ("ifconfig", "net-tools 2.10"),
+        ("netstat", "net-tools 2.10"),
+        ("dig", "DiG 9.18.39-0ubuntu0.24.04.5-Ubuntu"),
+        ("traceroute", "Modern traceroute for Linux, version 2.1.5"),
+        ("nc", "OpenBSD netcat (Debian patchlevel 1.226-1ubuntu2)"),
+        ("rg", "ripgrep 14.1.0"),
+        ("fd", "fdfind 9.0.0"),
+        ("fzf", "0.44.1 (debian)"),
+        ("tmux", "tmux 3.4"),
+    ];
+    assert_eq!(commands.len(), expected.len());
+    for (name, version) in expected {
+        assert_eq!(commands[name].as_str(), Some(version), "{name}");
+        assert!(
+            contract.contains(&format!("locked_version {name}")),
+            "{name} is not checked against locked workstation evidence"
+        );
+    }
+}
+
+#[test]
 fn workstation_home_configuration_is_idempotent_and_refuses_unmanaged_paths() {
     let script = root().join("images/workspace/bin/configure-workstation-home");
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     fs::create_dir(&home).unwrap();
-    let run = || {
-        Command::new(&script)
-            .env("HOME", &home)
-            .status()
-            .unwrap()
-    };
+    let run = || Command::new(&script).env("HOME", &home).status().unwrap();
     assert!(run().success());
     assert!(run().success());
     for agent in ["claude", "codex", "pi"] {
@@ -41,7 +84,7 @@ fn workstation_home_configuration_is_idempotent_and_refuses_unmanaged_paths() {
             "gascan-workstation-home-v1\n"
         );
     }
-    for tool in ["claude", "codex", "pi", "herdr", "gh", "glab"] {
+    for tool in ["mise", "claude", "codex", "pi", "herdr", "gh", "glab"] {
         assert!(home.join(".cache").join(tool).is_dir());
     }
     let herdr = home.join(".config/herdr");
@@ -77,7 +120,14 @@ fn workstation_home_configuration_is_idempotent_and_refuses_unmanaged_paths() {
         "Herdr refusal must occur before managed targets are created"
     );
 
-    for case in ["later-agent", "config", "cache", "cache-file", "cache-link"] {
+    for case in [
+        "later-agent",
+        "config",
+        "cache",
+        "cache-mise",
+        "cache-file",
+        "cache-link",
+    ] {
         let adversarial_home = temp.path().join(case);
         fs::create_dir(&adversarial_home).unwrap();
         match case {
@@ -90,10 +140,9 @@ fn workstation_home_configuration_is_idempotent_and_refuses_unmanaged_paths() {
                 )
                 .unwrap();
             }
-            "config" => {
-                fs::create_dir_all(adversarial_home.join(".config/gascan/glab")).unwrap()
-            }
+            "config" => fs::create_dir_all(adversarial_home.join(".config/gascan/glab")).unwrap(),
             "cache" => fs::create_dir_all(adversarial_home.join(".cache/glab")).unwrap(),
+            "cache-mise" => fs::create_dir_all(adversarial_home.join(".cache/mise")).unwrap(),
             "cache-file" => {
                 fs::create_dir_all(adversarial_home.join(".cache")).unwrap();
                 fs::write(adversarial_home.join(".cache/pi"), "unmanaged").unwrap();
@@ -111,7 +160,9 @@ fn workstation_home_configuration_is_idempotent_and_refuses_unmanaged_paths() {
         assert!(!rejected.success(), "accepted unmanaged {case} destination");
         assert!(
             !adversarial_home.join(".claude").exists()
-                && !adversarial_home.join(".config/gascan/agents/claude").exists(),
+                && !adversarial_home
+                    .join(".config/gascan/agents/claude")
+                    .exists(),
             "preflight rejection for {case} left partial Claude state"
         );
     }
@@ -183,18 +234,25 @@ fn dockerfile_declares_workspace_user_init_and_persistent_layout() {
         "chown workspace:workspace /opt/gascan/mise",
         "/opt/gascan/mise",
         "/home/workspace/.cache",
+        "/home/workspace/.local/state",
         "/home/workspace/.config/gascan",
         "visudo -cf /etc/sudoers.d/workspace",
         "USER workspace:workspace",
         "WORKDIR /workspace",
-        "ENTRYPOINT [\"/usr/bin/tini\", \"--\", \"/usr/local/bin/gascan-entrypoint\"]",
-        "VOLUME [\"/opt/gascan/mise\", \"/home/workspace/.cache\", \"/home/workspace/.config/gascan\"]",
+        "ENTRYPOINT [\"/usr/local/bin/gascan-entrypoint\"]",
+        "VOLUME [\"/home/workspace/.local/share/mise\", \"/home/workspace/.cache\", \"/home/workspace/.config/gascan\"]",
     ] {
         assert!(
             dockerfile.contains(required),
             "missing image contract: {required}"
         );
     }
+    assert!(
+        !dockerfile.contains(
+            "ENTRYPOINT [\"/usr/bin/tini\", \"--\", \"/usr/local/bin/gascan-entrypoint\"]"
+        ),
+        "Apple --init must be the sole init boundary"
+    );
 }
 
 #[test]
@@ -255,8 +313,14 @@ fn identity_migration_executes_exact_transition_and_rejects_before_mutation() {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     };
     fake("stat", "#!/bin/sh\nprintf 'directory:1000:1000\n'\n");
-    fake("usermod", "#!/bin/sh\nprintf 'usermod\n' >>\"$CALLS\"\ntest \"${BAD_POST:-0}\" = 0 || exit 0\nsed 's/^ubuntu:/workspace:/; s#/ubuntu:/bin/bash#/workspace:/bin/bash#' \"$PASSWD\" >\"$PASSWD.new\"\nmv \"$PASSWD.new\" \"$PASSWD\"\nmv \"$HOME_ROOT/ubuntu\" \"$HOME_ROOT/workspace\"\n");
-    fake("groupmod", "#!/bin/sh\nprintf 'groupmod\n' >>\"$CALLS\"\ntest \"${BAD_POST:-0}\" = 0 || exit 0\nsed 's/^ubuntu:/workspace:/' \"$GROUP\" >\"$GROUP.new\"\nmv \"$GROUP.new\" \"$GROUP\"\n");
+    fake(
+        "usermod",
+        "#!/bin/sh\nprintf 'usermod\n' >>\"$CALLS\"\ntest \"${BAD_POST:-0}\" = 0 || exit 0\nsed 's/^ubuntu:/workspace:/; s#/ubuntu:/bin/bash#/workspace:/bin/bash#' \"$PASSWD\" >\"$PASSWD.new\"\nmv \"$PASSWD.new\" \"$PASSWD\"\nmv \"$HOME_ROOT/ubuntu\" \"$HOME_ROOT/workspace\"\n",
+    );
+    fake(
+        "groupmod",
+        "#!/bin/sh\nprintf 'groupmod\n' >>\"$CALLS\"\ntest \"${BAD_POST:-0}\" = 0 || exit 0\nsed 's/^ubuntu:/workspace:/' \"$GROUP\" >\"$GROUP.new\"\nmv \"$GROUP.new\" \"$GROUP\"\n",
+    );
 
     let run = || {
         Command::new("bash")
@@ -430,6 +494,7 @@ fn smoke_fixture_uses_built_ref_and_checks_signal_and_zombies() {
     for required in [
         ".artifacts/workspace-image-ref",
         "\"$container_bin\" create",
+        "--init",
         "--label dev.gascan.test=true",
         "dev.gascan.test.owner=$owner_token",
         "--mount \"type=bind,source=$root,target=/workspace\"",
@@ -447,6 +512,41 @@ fn smoke_fixture_uses_built_ref_and_checks_signal_and_zombies() {
     }
     assert_eq!(smoke.matches("--mount ").count(), 1);
     assert!(!smoke.contains("container run"));
+}
+
+#[test]
+fn smoke_fixture_restarts_and_rechecks_the_process_contract_after_stop() {
+    let smoke = fs::read_to_string(root().join("tests/image/user-and-volumes.sh")).unwrap();
+    assert_eq!(
+        smoke.matches("\"$container_bin\" start \"$name\"").count(),
+        2,
+        "live smoke must exercise initial start and restart"
+    );
+    assert_eq!(
+        smoke
+            .matches(
+                "\"$container_bin\" exec \"$name\" bash /workspace/tests/image/user-and-volumes.sh --inside",
+            )
+            .count(),
+        2,
+        "live smoke must recheck identity, signal, and zombie contracts after restart"
+    );
+}
+
+#[test]
+fn every_live_image_smoke_models_the_runtime_init_boundary() {
+    for fixture in [
+        "user-and-volumes.sh",
+        "polyglot-smoke.sh",
+        "gascamp-smoke.sh",
+        "workstation-smoke.sh",
+    ] {
+        let smoke = fs::read_to_string(root().join("tests/image").join(fixture)).unwrap();
+        assert!(
+            smoke.contains("--init"),
+            "{fixture} does not model the production Apple runtime init boundary"
+        );
+    }
 }
 
 #[test]

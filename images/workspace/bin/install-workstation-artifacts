@@ -5,6 +5,7 @@ exec python3 - "$@" <<'PY'
 import hashlib
 import json
 import os
+import base64
 from pathlib import Path, PurePosixPath
 import re
 import shutil
@@ -85,6 +86,14 @@ def validate_file(path, expected_size, expected_digest):
         die(f"artifact digest mismatch: {path}")
 
 
+def validate_integrity(path, expected):
+    if not expected.startswith("sha512-"):
+        die(f"artifact integrity is not SHA-512: {path}")
+    actual = base64.b64encode(hashlib.sha512(path.read_bytes()).digest()).decode()
+    if actual != expected.removeprefix("sha512-"):
+        die(f"artifact integrity mismatch: {path}")
+
+
 def validate_arm64_elf(path):
     with path.open("rb") as source:
         header = source.read(20)
@@ -116,15 +125,22 @@ def checked_link(link, target):
 
 
 def exact_version(command, tool, version):
-    result = subprocess.run(
-        [str(command), "--version"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        timeout=30,
-        env={"HOME": "/tmp", "PATH": os.environ["PATH"], "NO_COLOR": "1"},
-    )
+    with tempfile.TemporaryDirectory(
+        prefix=".version-home-", dir=command.parent
+    ) as version_home:
+        result = subprocess.run(
+            [str(command), "--version"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=30,
+            env={
+                "HOME": version_home,
+                "PATH": os.environ["PATH"],
+                "NO_COLOR": "1",
+            },
+        )
     output = result.stdout.strip()
     lines = output.splitlines()
     valid = {
@@ -169,11 +185,49 @@ def immutable_tree(root):
             die(f"mutable immutable-tool path: {path}")
 
 
-def npm_ci(source, npm_root, expected_version):
+def extract_npm_bootstrap(path, destination, expected_version):
+    members = archive_members(path)
+    if not members:
+        die("npm bootstrap archive is empty")
+    for member in members:
+        parts = PurePosixPath(member.name).parts
+        if not member.isreg() or not parts or parts[0] != "package":
+            die(f"unexpected npm bootstrap archive member: {member.name}")
+    extract_reviewed(path, destination)
+    package_root = destination / "package"
+    manifest_path = package_root / "package.json"
+    cli = package_root / "bin" / "npm-cli.js"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        die("npm bootstrap manifest is not one regular file")
+    if cli.is_symlink() or not cli.is_file():
+        die("npm bootstrap CLI is not one regular file")
+    manifest = json.loads(manifest_path.read_text())
+    if (
+        manifest.get("name") != "npm"
+        or manifest.get("version") != expected_version
+        or manifest.get("bin") != {
+            "npm": "bin/npm-cli.js",
+            "npx": "bin/npx-cli.js",
+        }
+    ):
+        die("npm bootstrap package identity differs from lock")
+    return cli
+
+
+def npm_ci(
+    source,
+    npm_root,
+    bootstrap_archive,
+    expected_version,
+    expected_node_version,
+):
     if npm_root.exists() or npm_root.is_symlink():
         die(f"npm destination already exists: {npm_root}")
-    version_result = subprocess.run(
-        ["npm", "--version"],
+    node = shutil.which("node")
+    if node is None:
+        die("locked Node command is unavailable")
+    node_version = subprocess.run(
+        [node, "--version"],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -181,37 +235,145 @@ def npm_ci(source, npm_root, expected_version):
         timeout=30,
         env=os.environ.copy(),
     )
-    actual_version = version_result.stdout.strip()
-    if version_result.returncode != 0 or actual_version != expected_version:
-        die(f"unexpected npm version output: {actual_version!r}")
-    npm_root.mkdir(mode=0o700)
-    shutil.copyfile(source / "package.json", npm_root / "package.json")
-    shutil.copyfile(source / "package-lock.json", npm_root / "package-lock.json")
-    npm_env = os.environ.copy()
-    npm_env.update(
-        {
-            "HOME": str(npm_root / ".home"),
-            "npm_config_audit": "false",
-            "npm_config_fund": "false",
-            "npm_config_update_notifier": "false",
+    if (
+        node_version.returncode != 0
+        or node_version.stdout.strip() != f"v{expected_node_version}"
+    ):
+        die(f"unexpected Node version output: {node_version.stdout.strip()!r}")
+    with tempfile.TemporaryDirectory(prefix="gascan-npm-bootstrap-") as temporary:
+        cli = extract_npm_bootstrap(
+            bootstrap_archive,
+            Path(temporary) / "npm-cli",
+            expected_version,
+        )
+        version_result = subprocess.run(
+            [node, str(cli), "--version"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=30,
+            env=os.environ.copy(),
+        )
+        actual_version = version_result.stdout.strip()
+        if version_result.returncode != 0 or actual_version != expected_version:
+            die(f"unexpected npm version output: {actual_version!r}")
+        npm_root.mkdir(mode=0o700)
+        shutil.copyfile(source / "package.json", npm_root / "package.json")
+        shutil.copyfile(source / "package-lock.json", npm_root / "package-lock.json")
+        npm_env = {
+            name: value
+            for name, value in os.environ.items()
+            if not name.lower().startswith("npm_config_")
+            and name not in {"NODE_OPTIONS", "NPM_TOKEN", "NODE_AUTH_TOKEN"}
         }
-    )
-    subprocess.run(
-        [
-            "npm",
-            "ci",
-            "--offline",
-            "--ignore-scripts",
-            "--cache",
-            str(source / "npm-cache"),
-        ],
-        cwd=npm_root,
-        env=npm_env,
-        stdin=subprocess.DEVNULL,
-        timeout=300,
-        check=True,
-    )
+        npm_env.update(
+            {
+                "HOME": str(npm_root / ".home"),
+                "npm_config_audit": "false",
+                "npm_config_fund": "false",
+                "npm_config_logs_dir": str(npm_root / ".home" / "logs"),
+                "npm_config_update_notifier": "false",
+            }
+        )
+        subprocess.run(
+            [
+                node,
+                str(cli),
+                "ci",
+                "--offline",
+                "--ignore-scripts",
+                "--cache",
+                str(source / "npm-cache"),
+            ],
+            cwd=npm_root,
+            env=npm_env,
+            stdin=subprocess.DEVNULL,
+            timeout=300,
+            check=True,
+        )
     shutil.rmtree(npm_root / ".home", ignore_errors=True)
+
+
+def package_name_from_lock_path(path):
+    parts = PurePosixPath(path).parts
+    positions = [index for index, part in enumerate(parts) if part == "node_modules"]
+    if not positions:
+        die(f"npm lock path has no node_modules component: {path}")
+    index = positions[-1] + 1
+    if index >= len(parts):
+        die(f"npm lock path has no package name: {path}")
+    if parts[index].startswith("@"):
+        if index + 1 >= len(parts):
+            die(f"npm lock path has an incomplete scope: {path}")
+        return f"{parts[index]}/{parts[index + 1]}"
+    return parts[index]
+
+
+def installed_package_paths(npm_root):
+    found = set()
+    for current, _, _ in os.walk(
+        npm_root / "node_modules", topdown=True, followlinks=False
+    ):
+        directory = Path(current)
+        if directory.name != "node_modules":
+            continue
+        for entry in directory.iterdir():
+            if entry.name == ".bin" or entry.name.startswith("."):
+                continue
+            if entry.is_symlink() or not entry.is_dir():
+                die(f"npm package container is not a real directory: {entry}")
+            if entry.name.startswith("@"):
+                for package in entry.iterdir():
+                    if package.is_symlink() or not package.is_dir():
+                        die(f"npm scoped package is not a real directory: {package}")
+                    found.add(package.relative_to(npm_root).as_posix())
+            else:
+                found.add(entry.relative_to(npm_root).as_posix())
+    return found
+
+
+def verify_npm_inventory(npm_root, package_lock_path, target_lock_path):
+    package_lock = json.loads(package_lock_path.read_text())
+    target = tomllib.loads(target_lock_path.read_text())
+    if (
+        target.get("schema_version") != 1
+        or target.get("npm_version") != "11.12.1"
+        or target.get("os") != "linux"
+        or target.get("cpu") != "arm64"
+        or target.get("libc") != "glibc"
+    ):
+        die("npm target lock platform differs from review")
+    excluded = target.get("excluded_paths")
+    if not isinstance(excluded, list) or len(set(excluded)) != len(excluded):
+        die("npm target lock exclusions are invalid")
+    excluded = set(excluded)
+    packages = package_lock.get("packages")
+    if not isinstance(packages, dict) or "" not in packages:
+        die("npm package lock inventory is invalid")
+    expected = set(packages) - {""} - excluded
+    if len(expected) != target.get("record_count"):
+        die("npm target lock record count differs from package lock")
+    actual = installed_package_paths(npm_root)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        die(
+            "installed npm inventory differs from target lock: "
+            f"missing={missing} extra={extra}"
+        )
+    for path in sorted(expected):
+        record = packages[path]
+        manifest_path = npm_root / path / "package.json"
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            die(f"npm package manifest is not a regular file: {path}")
+        manifest = json.loads(manifest_path.read_text())
+        expected_name = record.get("name") or package_name_from_lock_path(path)
+        if (
+            manifest.get("name") != expected_name
+            or manifest.get("version") != record.get("version")
+        ):
+            die(f"installed npm package identity differs from lock: {path}")
 
 
 if len(sys.argv) == 3 and sys.argv[1] == "validate-tar":
@@ -229,8 +391,17 @@ if len(sys.argv) == 6 and sys.argv[1] == "validate-file":
     elif sys.argv[5] != "regular":
         die("unknown file validation kind")
     raise SystemExit(0)
-if len(sys.argv) == 5 and sys.argv[1] == "npm-ci":
-    npm_ci(Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4])
+if len(sys.argv) == 7 and sys.argv[1] == "npm-ci":
+    npm_ci(
+        Path(sys.argv[2]),
+        Path(sys.argv[3]),
+        Path(sys.argv[4]),
+        sys.argv[5],
+        sys.argv[6],
+    )
+    raise SystemExit(0)
+if len(sys.argv) == 5 and sys.argv[1] == "verify-inventory":
+    verify_npm_inventory(Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4]))
     raise SystemExit(0)
 if len(sys.argv) == 5 and sys.argv[1] == "verify-version":
     exact_version(Path(sys.argv[2]), sys.argv[3], sys.argv[4])
@@ -239,10 +410,10 @@ if len(sys.argv) == 3 and sys.argv[1] == "seal-tree":
     immutable_tree(Path(sys.argv[2]))
     raise SystemExit(0)
 
-if len(sys.argv) != 6 or sys.argv[1] != "install":
-    die("usage: install SOURCE PREFIX COMMAND_DIR VERSIONS_LOCK")
+if len(sys.argv) != 7 or sys.argv[1] != "install":
+    die("usage: install SOURCE PREFIX COMMAND_DIR VERSIONS_LOCK TARGET_LOCK")
 
-source, prefix, command_dir, lock_path = map(Path, sys.argv[2:])
+source, prefix, command_dir, lock_path, target_lock_path = map(Path, sys.argv[2:])
 if prefix.exists() or prefix.is_symlink():
     die(f"immutable prefix already exists: {prefix}")
 if not source.is_dir() or source.is_symlink():
@@ -264,6 +435,12 @@ validate_file(
     npm_lock["claude_native"]["sha256"],
 )
 validate_file(
+    source / "npm-cli.tgz",
+    npm_lock["bootstrap"]["size"],
+    npm_lock["bootstrap"]["sha256"],
+)
+validate_integrity(source / "npm-cli.tgz", npm_lock["bootstrap"]["integrity"])
+validate_file(
     source / "package.json",
     (source / "package.json").stat().st_size,
     npm_lock["package_manifest_sha256"],
@@ -280,7 +457,14 @@ prefix.parent.mkdir(parents=True, exist_ok=True)
 staging = Path(tempfile.mkdtemp(prefix=".workstation-", dir=prefix.parent))
 try:
     npm_root = staging / "npm"
-    npm_ci(source, npm_root, npm_lock["npm_version"])
+    npm_ci(
+        source,
+        npm_root,
+        source / "npm-cli.tgz",
+        npm_lock["npm_version"],
+        lock["tools"]["node"],
+    )
+    verify_npm_inventory(npm_root, source / "package-lock.json", target_lock_path)
 
     bin_dir = staging / "bin"
     bin_dir.mkdir(mode=0o700)
@@ -329,8 +513,17 @@ try:
     }
     for name, version in expected.items():
         exact_version(bin_dir / name, name, version)
+    commands = lock.get("workstation_commands")
+    if (
+        not isinstance(commands, dict)
+        or not commands
+        or any(not isinstance(value, str) or not value for value in commands.values())
+        or set(commands).intersection(expected)
+    ):
+        die("workstation command version evidence is invalid")
+    evidence = {**expected, **commands}
     (staging / "versions.json").write_text(
-        json.dumps(expected, sort_keys=True) + "\n"
+        json.dumps(evidence, sort_keys=True) + "\n"
     )
 
     immutable_tree(staging)

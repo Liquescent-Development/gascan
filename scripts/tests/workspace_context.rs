@@ -376,8 +376,21 @@ fn scripts_separate_network_prefetch_from_cache_only_build() {
 }
 
 #[test]
-fn pending_records_fail_before_any_apple_command() {
+fn pending_build_mode_fails_before_any_apple_command() {
     let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repo");
+    fs::create_dir_all(root.join("scripts")).unwrap();
+    fs::create_dir_all(root.join("images/workspace")).unwrap();
+    fs::copy(
+        repository_root().join("scripts/build-workspace-image.sh"),
+        root.join("scripts/build-workspace-image.sh"),
+    )
+    .unwrap();
+    fs::write(
+        root.join("images/workspace/versions.lock"),
+        "workspace_build_mode = \"pending\"\n",
+    )
+    .unwrap();
     let bin = temporary.path().join("bin");
     fs::create_dir(&bin).unwrap();
     fs::write(
@@ -389,7 +402,7 @@ fn pending_records_fail_before_any_apple_command() {
     let calls = temporary.path().join("calls");
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     let output = Command::new("bash")
-        .arg(repository_root().join("scripts/build-workspace-image.sh"))
+        .arg(root.join("scripts/build-workspace-image.sh"))
         .env("PATH", path)
         .env("GASCAN_CALLS", &calls)
         .env("CARGO_TARGET_DIR", temporary.path().join("cargo-target"))

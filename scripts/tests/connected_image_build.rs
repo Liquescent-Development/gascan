@@ -40,6 +40,57 @@ fn npm_cache_path(root: &Path, integrity: &str) -> PathBuf {
         .join(&hex[4..])
 }
 
+fn fixture_target_lock(package_lock: &[u8], npm_cache: &Path) -> String {
+    let parsed: serde_json::Value = serde_json::from_slice(package_lock).unwrap();
+    let mut identities = Vec::new();
+    let mut compressed_bytes = 0_u64;
+    for (path, record) in parsed["packages"].as_object().unwrap() {
+        if path.is_empty() {
+            continue;
+        }
+        let url = record["resolved"].as_str().unwrap();
+        let integrity = record["integrity"].as_str().unwrap();
+        identities.push(format!("{path}\t{url}\t{integrity}\n"));
+        compressed_bytes += fs::metadata(npm_cache_path(npm_cache, integrity))
+            .unwrap()
+            .len();
+    }
+    identities.sort();
+    let mut target = Sha256::new();
+    target.update(b"gascan-workstation-npm-target-closure-v1\n");
+    for identity in &identities {
+        target.update(identity.as_bytes());
+    }
+    let excluded = Sha256::digest(b"gascan-workstation-npm-excluded-closure-v1\n");
+    format!(
+        "schema_version = 1\n\
+         npm_version = \"11.12.1\"\n\
+         package_lock_sha256 = \"{:x}\"\n\
+         os = \"linux\"\n\
+         cpu = \"arm64\"\n\
+         libc = \"glibc\"\n\
+         record_count = {}\n\
+         compressed_bytes = {compressed_bytes}\n\
+         closure_sha256 = \"{:x}\"\n\
+         excluded_record_count = 0\n\
+         excluded_compressed_bytes = 0\n\
+         excluded_closure_sha256 = \"{excluded:x}\"\n\
+         excluded_paths = []\n",
+        Sha256::digest(package_lock),
+        identities.len(),
+        target.finalize(),
+    )
+}
+
+fn fixture_prefetch_receipt(lock: &[u8], target_lock: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"gascan-workstation-prefetch-lock-v2\0");
+    hasher.update(lock);
+    hasher.update(b"\0");
+    hasher.update(target_lock);
+    format!("{:x}", hasher.finalize())
+}
+
 fn populate_minimal_workstation(repository: &Path, cache: &Path) {
     for directory in ["bin", "etc", "libexec", "tests"] {
         copy_tree(
@@ -89,10 +140,12 @@ fn populate_minimal_workstation(repository: &Path, cache: &Path) {
     )
     .unwrap();
     let native = b"native\n";
+    let npm_bootstrap = b"npm bootstrap\n";
     fs::create_dir_all(cache.join("workstation")).unwrap();
     for name in ["claude-native.tgz", "glab.tar.gz", "herdr", "neovim.tar.gz"] {
         fs::write(cache.join("workstation").join(name), native).unwrap();
     }
+    fs::write(cache.join("workstation/npm-cli.tgz"), npm_bootstrap).unwrap();
     let mut artifacts = String::new();
     for (name, kind, host) in [
         ("claude", "npm_tgz", "registry.npmjs.org"),
@@ -118,23 +171,56 @@ fn populate_minimal_workstation(repository: &Path, cache: &Path) {
     }
     let native_integrity = format!("sha512-{}", BASE64.encode(Sha512::digest(native)));
     let lock = format!(
-        "base_image = \"ubuntu@sha256:{}\"\nworkspace_build_mode = \"connected\"\nworkspace_tag = \"gascan-workspace:fixture\"\n[mise]\nurl = \"https://example.invalid/mise\"\nsha256 = \"{}\"\n[playwright_chromium]\nurl = \"https://example.invalid/chromium\"\nsha256 = \"{}\"\n[gascamp]\nrevision = \"f6b248c5926240856dbea83d1d2c5c90ea1c1456\"\n[workspace_bundles]\npublication = \"pending\"\n{artifacts}\n[workstation_npm]\nscripts = \"disabled\"\nnpm_version = \"11.12.1\"\npackage_manifest_sha256 = \"{:x}\"\npackage_lock_sha256 = \"{:x}\"\n[workstation_npm.claude_native]\npackage = \"fixture\"\nversion = \"1.0.0\"\nurl = \"https://registry.npmjs.org/fixture/native\"\nintegrity = \"{}\"\nsha256 = \"{:x}\"\nsize = {}\nbinary_path = \"package/claude\"\nbinary_sha256 = \"{}\"\nbinary_size = 1\nplatform = \"linux-arm64\"\n",
+        "base_image = \"ubuntu@sha256:{}\"\nworkspace_build_mode = \"connected\"\nworkspace_tag = \"gascan-workspace:fixture\"\n[mise]\nurl = \"https://example.invalid/mise\"\nsha256 = \"{}\"\n[playwright_chromium]\nurl = \"https://example.invalid/chromium\"\nsha256 = \"{}\"\n[gascamp]\nrevision = \"f6b248c5926240856dbea83d1d2c5c90ea1c1456\"\n[workspace_bundles]\npublication = \"pending\"\n{artifacts}\n[workstation_npm]\nscripts = \"disabled\"\nnpm_version = \"11.12.1\"\npackage_manifest_sha256 = \"{:x}\"\npackage_lock_sha256 = \"{:x}\"\n[workstation_npm.bootstrap]\npackage = \"npm\"\nversion = \"11.12.1\"\nurl = \"https://registry.npmjs.org/npm/-/npm-11.12.1.tgz\"\nintegrity = \"sha512-{}\"\nsha256 = \"{:x}\"\nsize = {}\nkind = \"npm_tgz\"\n[workstation_npm.claude_native]\npackage = \"fixture\"\nversion = \"1.0.0\"\nurl = \"https://registry.npmjs.org/fixture/native\"\nintegrity = \"{}\"\nsha256 = \"{:x}\"\nsize = {}\nbinary_path = \"package/claude\"\nbinary_sha256 = \"{}\"\nbinary_size = 1\nplatform = \"linux-arm64\"\n",
         "7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab",
         "b".repeat(64),
         "c".repeat(64),
         Sha256::digest(package),
         Sha256::digest(package_lock.as_bytes()),
+        BASE64.encode(Sha512::digest(npm_bootstrap)),
+        Sha256::digest(npm_bootstrap),
+        npm_bootstrap.len(),
         native_integrity,
         Sha256::digest(native),
         native.len(),
         "d".repeat(64),
     );
     fs::write(repository.join("images/workspace/versions.lock"), &lock).unwrap();
+    let target_lock = fixture_target_lock(
+        package_lock.as_bytes(),
+        &cache.join("workstation/npm-cache"),
+    );
     fs::write(
-        cache.join("workstation/prefetch-lock.sha256"),
-        format!("{:x}\n", Sha256::digest(lock.as_bytes())),
+        repository.join("images/workspace/workstation-target-lock.toml"),
+        &target_lock,
     )
     .unwrap();
+    fs::write(
+        cache.join("workstation/prefetch-lock.sha256"),
+        format!(
+            "{}\n",
+            fixture_prefetch_receipt(lock.as_bytes(), target_lock.as_bytes())
+        ),
+    )
+    .unwrap();
+    let staging = cache.parent().unwrap().join("fixture-prefetch");
+    fs::create_dir(&staging).unwrap();
+    fs::rename(cache.join("workstation"), staging.join("workstation")).unwrap();
+    let indexed = Command::new(env!("CARGO_BIN_EXE_prepare-workspace-context"))
+        .arg("--publish-workstation-cache")
+        .arg(repository.join("images/workspace/versions.lock"))
+        .arg(repository.join("images/workspace/workstation-package.json"))
+        .arg(repository.join("images/workspace/workstation-package-lock.json"))
+        .arg(repository.join("images/workspace/workstation-target-lock.toml"))
+        .arg(&staging)
+        .arg(cache.join("workstation"))
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
 }
 
 #[test]

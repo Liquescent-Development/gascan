@@ -61,6 +61,23 @@ fn validate_npm_lock(contents: &serde_json::Value) -> std::process::Output {
     validate_npm_lock_bytes_with_primary(&serde_json::to_vec_pretty(contents).unwrap(), true)
 }
 
+fn validate_target_lock(contents: &str) -> std::process::Output {
+    let temporary = tempfile::tempdir().unwrap();
+    let target_lock_path = temporary.path().join("workstation-target-lock.toml");
+    fs::write(&target_lock_path, contents).unwrap();
+    Command::new(env!("CARGO_BIN_EXE_update-image-lock"))
+        .args([
+            "--validate-workstation-target-lock",
+            root()
+                .join("images/workspace/workstation-package-lock.json")
+                .to_str()
+                .unwrap(),
+            target_lock_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap()
+}
+
 fn replace_in_table(lock: &str, table: &str, from: &str, to: &str) -> String {
     let header = format!("[{table}]");
     let start = lock
@@ -89,6 +106,45 @@ fn generated_workstation_lock_passes_offline_security_validation() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn reviewed_workstation_target_lock_passes_and_mutations_fail_closed() {
+    let target =
+        fs::read_to_string(root().join("images/workspace/workstation-target-lock.toml")).unwrap();
+    let output = validate_target_lock(&target);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mutations = [
+        target.replacen("record_count = 144", "record_count = 143", 1),
+        target.replacen(
+            "compressed_bytes = 240013303",
+            "compressed_bytes = 240013302",
+            1,
+        ),
+        target.replacen("os = \"linux\"", "os = \"darwin\"", 1),
+        target.replacen(
+            "node_modules/@openai/codex-linux-x64",
+            "node_modules/@openai/codex-linux-arm64",
+            1,
+        ),
+        target.replacen(
+            "a82521814dc27a9a460700ee49ffceebf719bbb5a32f62e8b6540dd8e13c21b5",
+            "b82521814dc27a9a460700ee49ffceebf719bbb5a32f62e8b6540dd8e13c21b5",
+            1,
+        ),
+    ];
+    for mutation in mutations {
+        let output = validate_target_lock(&mutation);
+        assert!(
+            !output.status.success(),
+            "accepted target-lock mutation:\n{mutation}"
+        );
+    }
 }
 
 #[test]
@@ -147,6 +203,37 @@ fn lifecycle_and_native_evidence_mutations_fail_closed() {
             "workstation_npm",
             "npm_version = \"11.12.1\"",
             "npm_version = \"11.12.2\"",
+        ),
+        (
+            "workstation_npm.bootstrap",
+            "package = \"npm\"",
+            "package = \"npm-lookalike\"",
+        ),
+        (
+            "workstation_npm.bootstrap",
+            "version = \"11.12.1\"",
+            "version = \"11.12.2\"",
+        ),
+        (
+            "workstation_npm.bootstrap",
+            "url = \"https://registry.npmjs.org/npm/-/npm-11.12.1.tgz\"",
+            "url = \"https://packages.example.invalid/npm-11.12.1.tgz\"",
+        ),
+        (
+            "workstation_npm.bootstrap",
+            "integrity = \"sha512-z",
+            "integrity = \"sha512-X",
+        ),
+        ("workstation_npm.bootstrap", "sha256 = \"e", "sha256 = \"0"),
+        (
+            "workstation_npm.bootstrap",
+            "size = 2833345",
+            "size = 2833346",
+        ),
+        (
+            "workstation_npm.bootstrap",
+            "kind = \"npm_tgz\"",
+            "kind = \"raw_binary\"",
         ),
         (
             "workstation_npm",

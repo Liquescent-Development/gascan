@@ -86,6 +86,7 @@ async fn image_replace_reuses_unchanged_persistent_tools_without_reinstalling() 
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (
                 br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
                 Vec::new(),
@@ -177,6 +178,7 @@ async fn apply_uses_literal_mise_argv_streams_steps_and_persists_exact_versions(
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (
                 br#"{"node":[{"version":"24.18.0","installed":true,"active":true}],"python":[{"version":"3.14.6","installed":true,"active":true}]}"#.to_vec(),
                 Vec::new(),
@@ -219,6 +221,12 @@ async fn apply_uses_literal_mise_argv_streams_steps_and_persists_exact_versions(
                 "/home/workspace/.local/share/mise",
                 "/home/workspace/.cache",
                 "/home/workspace/.config/gascan",
+            ]
+            .as_slice(),
+            [
+                "/usr/bin/env",
+                "HOME=/home/workspace",
+                "/usr/local/bin/configure-workstation-home",
             ]
             .as_slice(),
             [
@@ -344,6 +352,7 @@ async fn failed_install_retains_applied_state_and_retry_can_succeed() -> TestRes
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), b"install failed".to_vec(), 23),
         ])
         .await;
@@ -361,6 +370,7 @@ async fn failed_install_retains_applied_state_and_retry_can_succeed() -> TestRes
 
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
@@ -405,6 +415,7 @@ async fn verbose_stderr_does_not_fail_successful_tool_install() -> TestResult {
     write_manifest(root, &[("node", "lts")])?;
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
@@ -529,9 +540,10 @@ async fn failed_safe_config_commands_record_fixed_boundary_and_guest_stderr() ->
     const DIAGNOSTIC: &str = "guest command diagnostic";
     let cases = [
         (0, "initialize_managed_volume_roots"),
-        (1, "reset_safe_mise_workdir"),
-        (2, "create_safe_mise_workdir"),
-        (3, "write_safe_mise_config"),
+        (1, "initialize_workstation_home"),
+        (2, "reset_safe_mise_workdir"),
+        (3, "create_safe_mise_workdir"),
+        (4, "write_safe_mise_config"),
     ];
     for (failure_index, action) in cases {
         let root = tempfile::tempdir()?;
@@ -685,6 +697,7 @@ async fn legacy_matching_fingerprint_without_tool_hash_requires_one_explicit_app
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (
                 br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
                 Vec::new(),
@@ -712,6 +725,7 @@ async fn legacy_matching_fingerprint_without_tool_hash_requires_one_explicit_app
     let before = runtime.calls().await.len();
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
@@ -754,6 +768,7 @@ async fn removing_last_tool_writes_empty_config_and_persists_empty_resolution() 
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (
                 br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
                 Vec::new(),
@@ -773,6 +788,7 @@ async fn removing_last_tool_writes_empty_config_and_persists_empty_resolution() 
     let before = runtime.calls().await.len();
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
@@ -860,6 +876,7 @@ async fn missing_container_forces_tool_install_even_when_durable_hash_matches() 
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (
                 br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
                 Vec::new(),
@@ -887,6 +904,7 @@ async fn missing_container_forces_tool_install_even_when_durable_hash_matches() 
     let before = runtime.calls().await.len();
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),

@@ -1,9 +1,5 @@
 use std::{
-    collections::BTreeSet,
-    fs,
-    os::unix::fs::PermissionsExt,
-    os::unix::fs::symlink,
-    path::Path,
+    collections::BTreeSet, fs, os::unix::fs::PermissionsExt, os::unix::fs::symlink, path::Path,
     process::Command,
 };
 
@@ -86,17 +82,17 @@ fn root() -> &'static Path {
 #[test]
 fn dockerfile_assembles_workstation_only_from_the_verified_context() {
     let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
-    let installer = fs::read_to_string(
-        root().join("images/workspace/bin/install-workstation-artifacts"),
-    )
-    .unwrap();
+    let installer =
+        fs::read_to_string(root().join("images/workspace/bin/install-workstation-artifacts"))
+            .unwrap();
     for required in [
         "COPY --chmod=0555 images/workspace/bin/install-workstation-artifacts /usr/local/bin/install-workstation-artifacts",
         "COPY workstation /tmp/workstation",
+        "RUN --network=none test -x /opt/gascan/gascamp/bin/camp",
         "/usr/local/bin/install-workstation-artifacts",
         "/opt/gascan/workstation",
         "chown -R root:root /opt/gascan/workstation",
-        "find /opt/gascan/workstation -perm /022 -print -quit",
+        "find /opt/gascan/workstation ! -type l \\( -perm -020 -o -perm -002 \\) -print -quit",
         "find /opt/gascan/workstation \\( ! -user root -o ! -group root \\) -print -quit",
     ] {
         assert!(
@@ -108,6 +104,8 @@ fn dockerfile_assembles_workstation_only_from_the_verified_context() {
         "\"ci\"",
         "\"--offline\"",
         "\"--ignore-scripts\"",
+        "\"npm_config_logs_dir\": str(npm_root / \".home\" / \"logs\")",
+        "verify_npm_inventory(npm_root, source / \"package-lock.json\", target_lock_path)",
         "checked_link(command_dir / \"fd\", Path(\"/usr/bin/fdfind\"))",
         "checked_link(command_dir / \"pico\", Path(\"/usr/bin/nano\"))",
     ] {
@@ -134,6 +132,81 @@ fn dockerfile_assembles_workstation_only_from_the_verified_context() {
             "network-capable workstation assembly path: {forbidden}"
         );
     }
+}
+
+#[test]
+fn workstation_step_diagnostics_name_only_the_failing_boundary() {
+    let wrapper = root().join("images/workspace/bin/run-workstation-step");
+    let output = Command::new(&wrapper)
+        .args([
+            "immutable-owner",
+            "sh",
+            "-c",
+            "printf 'private-command-output\\n' >&2; exit 7",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "private-command-output\nworkstation assembly: immutable-owner failed\n"
+    );
+
+    let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
+    for boundary in [
+        "installer",
+        "immutable-owner",
+        "immutable-mode",
+        "immutable-ownership",
+        "home-directories",
+        "home-configuration",
+        "home-owner",
+        "home-link-owner",
+        "sudoers-mode",
+        "sudoers-validation",
+        "chromium-mode",
+        "chromium-command",
+        "chromium-seal",
+        "temporary-cleanup",
+    ] {
+        assert!(
+            dockerfile.contains(&format!("run-workstation-step {boundary} ")),
+            "missing named workstation boundary {boundary}"
+        );
+    }
+    assert!(dockerfile.contains("workstation assembly: installer complete"));
+}
+
+#[test]
+fn immutable_mode_check_excludes_links_but_rejects_writable_content() {
+    let temporary = tempfile::tempdir().unwrap();
+    let tree = temporary.path().join("immutable");
+    fs::create_dir(&tree).unwrap();
+    let target = tree.join("target");
+    fs::write(&target, b"locked\n").unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o444)).unwrap();
+    std::os::unix::fs::symlink("target", tree.join("command")).unwrap();
+    let check = r#"test -z "$(find "$1" ! -type l \( -perm -020 -o -perm -002 \) -print -quit)""#;
+    assert!(
+        Command::new("sh")
+            .args(["-c", check, "sh", tree.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o464)).unwrap();
+    assert!(
+        !Command::new("sh")
+            .args(["-c", check, "sh", tree.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
+    assert!(dockerfile.contains(
+        r#"find /opt/gascan/workstation ! -type l \( -perm -020 -o -perm -002 \) -print -quit"#
+    ));
 }
 
 #[test]
@@ -194,6 +267,67 @@ fn workstation_installer_rejects_unsafe_archives_behaviorally() {
 }
 
 #[test]
+fn workstation_installer_enforces_exact_target_npm_inventory_behaviorally() {
+    let installer = root().join("images/workspace/bin/install-workstation-artifacts");
+    let temporary = tempfile::tempdir_in("/tmp").unwrap();
+    let npm_root = temporary.path().join("npm");
+    let alpha = npm_root.join("node_modules/alpha");
+    fs::create_dir_all(&alpha).unwrap();
+    fs::write(
+        alpha.join("package.json"),
+        "{\"name\":\"alpha\",\"version\":\"1.0.0\"}\n",
+    )
+    .unwrap();
+    let package_lock = temporary.path().join("package-lock.json");
+    fs::write(
+        &package_lock,
+        "{\"lockfileVersion\":3,\"packages\":{\"\":{},\"node_modules/alpha\":{\"name\":\"alpha\",\"version\":\"1.0.0\"},\"node_modules/excluded\":{\"name\":\"excluded\",\"version\":\"1.0.0\"}}}\n",
+    )
+    .unwrap();
+    let target_lock = temporary.path().join("target-lock.toml");
+    fs::write(
+        &target_lock,
+        "schema_version = 1\nnpm_version = \"11.12.1\"\nos = \"linux\"\ncpu = \"arm64\"\nlibc = \"glibc\"\nrecord_count = 1\nexcluded_paths = [\"node_modules/excluded\"]\n",
+    )
+    .unwrap();
+    let verify = || {
+        Command::new(&installer)
+            .args([
+                "verify-inventory",
+                npm_root.to_str().unwrap(),
+                package_lock.to_str().unwrap(),
+                target_lock.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap()
+    };
+    assert!(verify().success(), "exact target inventory was rejected");
+
+    let extra = npm_root.join("node_modules/extra");
+    fs::create_dir(&extra).unwrap();
+    fs::write(
+        extra.join("package.json"),
+        "{\"name\":\"extra\",\"version\":\"1.0.0\"}\n",
+    )
+    .unwrap();
+    assert!(!verify().success(), "extra package was accepted");
+    fs::remove_dir_all(extra).unwrap();
+
+    fs::write(
+        alpha.join("package.json"),
+        "{\"name\":\"alpha\",\"version\":\"2.0.0\"}\n",
+    )
+    .unwrap();
+    assert!(!verify().success(), "wrong package identity was accepted");
+    fs::remove_file(alpha.join("package.json")).unwrap();
+    assert!(!verify().success(), "missing package manifest was accepted");
+
+    fs::remove_dir_all(&alpha).unwrap();
+    symlink(temporary.path(), &alpha).unwrap();
+    assert!(!verify().success(), "symlink package root was accepted");
+}
+
+#[test]
 fn workstation_installer_enforces_file_npm_version_and_mode_boundaries_behaviorally() {
     let installer = root().join("images/workspace/bin/install-workstation-artifacts");
     let temp = tempfile::tempdir().unwrap();
@@ -231,40 +365,52 @@ fn workstation_installer_enforces_file_npm_version_and_mode_boundaries_behaviora
     fs::create_dir(&fake_bin).unwrap();
     fs::write(source.join("package.json"), "{}\n").unwrap();
     fs::write(source.join("package-lock.json"), "{}\n").unwrap();
+    let bootstrap = temp.path().join("npm-cli.tgz");
+    let bootstrap_status = Command::new("python3")
+        .args([
+            "-c",
+            "import io,json,sys,tarfile\nwith tarfile.open(sys.argv[1],'w:gz') as t:\n files={'package/package.json':json.dumps({'name':'npm','version':'11.12.1','bin':{'npm':'bin/npm-cli.js','npx':'bin/npx-cli.js'}}).encode(),'package/bin/npm-cli.js':b'require(\"../lib/cli.js\");\\n','package/lib/cli.js':b''}\n for name,data in files.items():\n  i=tarfile.TarInfo(name); i.mode=0o755 if name.endswith('.js') else 0o644; i.size=len(data); t.addfile(i,io.BytesIO(data))",
+        ])
+        .arg(&bootstrap)
+        .status()
+        .unwrap();
+    assert!(bootstrap_status.success());
     let args_file = temp.path().join("npm-args");
-    let fake_npm = fake_bin.join("npm");
+    let fake_node = fake_bin.join("node");
     fs::write(
-        &fake_npm,
-        "#!/bin/sh\nprintf '%s\\n' CALL \"$@\" >>\"$NPM_ARGS\"\nif [ \"$1\" = --version ]; then printf '%s\\n' \"$FAKE_NPM_VERSION\"; exit 0; fi\nmkdir -p node_modules\n",
+        &fake_node,
+        "#!/bin/sh\nprintf '%s\\n' CALL \"$@\" >>\"$NPM_ARGS\"\nif [ \"$1\" = --version ]; then printf '%s\\n' \"$FAKE_NODE_VERSION\"; exit 0; fi\nif [ \"$2\" = --version ]; then printf '%s\\n' \"$FAKE_NPM_VERSION\"; exit 0; fi\nmkdir -p node_modules\n",
     )
     .unwrap();
-    fs::set_permissions(&fake_npm, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&fake_node, fs::Permissions::from_mode(0o755)).unwrap();
     let status = Command::new(&installer)
         .args([
             "npm-ci",
             source.to_str().unwrap(),
             destination.to_str().unwrap(),
+            bootstrap.to_str().unwrap(),
             "11.12.1",
+            "24.18.0",
         ])
         .env(
             "PATH",
-            format!(
-                "{}:{}",
-                fake_bin.display(),
-                std::env::var("PATH").unwrap()
-            ),
+            format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
         )
         .env("NPM_ARGS", &args_file)
         .env("FAKE_NPM_VERSION", "11.12.1")
+        .env("FAKE_NODE_VERSION", "v24.18.0")
         .status()
         .unwrap();
     assert!(status.success());
-    assert_eq!(
-        fs::read_to_string(&args_file).unwrap(),
-        format!(
-            "CALL\n--version\nCALL\nci\n--offline\n--ignore-scripts\n--cache\n{}\n",
+    let calls = fs::read_to_string(&args_file).unwrap();
+    assert!(calls.starts_with("CALL\n--version\nCALL\n"));
+    assert!(calls.contains("/package/bin/npm-cli.js\n--version\nCALL\n"));
+    assert!(
+        calls.ends_with(&format!(
+            "/package/bin/npm-cli.js\nci\n--offline\n--ignore-scripts\n--cache\n{}\n",
             source.join("npm-cache").display()
-        )
+        )),
+        "{calls}"
     );
     fs::write(&args_file, "").unwrap();
     let mismatch_destination = temp.path().join("npm-mismatch");
@@ -273,23 +419,24 @@ fn workstation_installer_enforces_file_npm_version_and_mode_boundaries_behaviora
             "npm-ci",
             source.to_str().unwrap(),
             mismatch_destination.to_str().unwrap(),
+            bootstrap.to_str().unwrap(),
             "11.12.1",
+            "24.18.0",
         ])
         .env(
             "PATH",
-            format!(
-                "{}:{}",
-                fake_bin.display(),
-                std::env::var("PATH").unwrap()
-            ),
+            format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
         )
         .env("NPM_ARGS", &args_file)
         .env("FAKE_NPM_VERSION", "11.12.2")
+        .env("FAKE_NODE_VERSION", "v24.18.0")
         .status()
         .unwrap();
     assert!(!mismatch.success(), "accepted the wrong npm version");
     assert!(!mismatch_destination.exists());
-    assert_eq!(fs::read_to_string(&args_file).unwrap(), "CALL\n--version\n");
+    let calls = fs::read_to_string(&args_file).unwrap();
+    assert!(calls.starts_with("CALL\n--version\nCALL\n"));
+    assert!(calls.ends_with("/package/bin/npm-cli.js\n--version\n"));
 
     let version = temp.path().join("version-tool");
     fs::write(&version, "#!/bin/sh\nexit 99\n").unwrap();
@@ -297,19 +444,39 @@ fn workstation_installer_enforces_file_npm_version_and_mode_boundaries_behaviora
     let version_status = |tool: &str, expected: &str, output: &str| {
         fs::write(
             &version,
-            format!("#!/bin/sh\nprintf '%s' '{}'\n", output.replace('\'', "'\\''")),
+            format!(
+                "#!/bin/sh\nprintf '%s' '{}'\n",
+                output.replace('\'', "'\\''")
+            ),
         )
         .unwrap();
+        Command::new(&installer)
+            .args(["verify-version", version.to_str().unwrap(), tool, expected])
+            .status()
+            .unwrap()
+    };
+    fs::write(
+        &version,
+        "#!/bin/sh\n\
+         set -eu\n\
+         test -d \"$HOME\"\n\
+         test \"$HOME\" != /tmp\n\
+         printf '%s\\n' 'codex-cli 0.145.0'\n",
+    )
+    .unwrap();
+    assert!(
         Command::new(&installer)
             .args([
                 "verify-version",
                 version.to_str().unwrap(),
-                tool,
-                expected,
+                "codex",
+                "0.145.0",
             ])
             .status()
             .unwrap()
-    };
+            .success(),
+        "version verification did not provide a safe private home"
+    );
     for (tool, expected, output) in [
         ("claude", "2.1.218", "2.1.218 (Claude Code)\n"),
         ("codex", "0.145.0", "codex-cli 0.145.0\n"),
@@ -355,7 +522,10 @@ fn workstation_installer_enforces_file_npm_version_and_mode_boundaries_behaviora
             .unwrap()
             .success()
     );
-    assert_eq!(fs::metadata(&tree).unwrap().permissions().mode() & 0o777, 0o555);
+    assert_eq!(
+        fs::metadata(&tree).unwrap().permissions().mode() & 0o777,
+        0o555
+    );
     assert_eq!(
         fs::metadata(tree.join("metadata"))
             .unwrap()

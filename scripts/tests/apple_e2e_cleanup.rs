@@ -213,11 +213,15 @@ fn stale_owned_dns_route_is_reconciled_and_record_cleared() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!path.exists());
-    assert!(String::from_utf8_lossy(&output.stdout)
-        .contains("Gate 4 abort recovery reconciled exact recorded resources"));
-    assert!(fs::read_to_string(calls)
-        .unwrap()
-        .contains(&format!("container system dns delete {domain}")));
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("Gate 4 abort recovery reconciled exact recorded resources")
+    );
+    assert!(
+        fs::read_to_string(calls)
+            .unwrap()
+            .contains(&format!("container system dns delete {domain}"))
+    );
 }
 
 #[test]
@@ -307,9 +311,11 @@ fn dns_delete_failure_is_surfaced_and_manifest_retained() {
     assert!(!output.status.success());
     assert!(path.exists());
     assert!(!String::from_utf8_lossy(&output.stdout).contains("abort recovery reconciled"));
-    assert!(fs::read_to_string(calls)
-        .unwrap()
-        .contains(&format!("container system dns delete {domain}")));
+    assert!(
+        fs::read_to_string(calls)
+            .unwrap()
+            .contains(&format!("container system dns delete {domain}"))
+    );
 }
 
 fn run(temp: &tempfile::TempDir, path: &PathBuf, calls: &PathBuf) -> std::process::Output {
@@ -647,9 +653,11 @@ fn inventory_runtime_failure_retains_manifest_without_deletes() {
     assert!(!output.status.success());
     assert!(path.exists());
     let calls = fs::read_to_string(calls).unwrap();
-    assert!(!calls
-        .lines()
-        .any(|line| line.starts_with("delete ") || line.starts_with("volume delete ")));
+    assert!(
+        !calls
+            .lines()
+            .any(|line| line.starts_with("delete ") || line.starts_with("volume delete "))
+    );
 }
 
 #[test]
@@ -823,9 +831,11 @@ fn exact_name_collision_is_retained_and_never_deleted() {
     assert!(!output.status.success());
     assert!(path.exists());
     let calls = fs::read_to_string(calls).unwrap();
-    assert!(!calls
-        .lines()
-        .any(|line| line.starts_with("delete ") || line.starts_with("volume delete ")));
+    assert!(
+        !calls
+            .lines()
+            .any(|line| line.starts_with("delete ") || line.starts_with("volume delete "))
+    );
 }
 
 #[test]
@@ -970,10 +980,12 @@ fn daemon_residue_retains_manifest_after_term_and_kill() {
         String::from_utf8_lossy(&retry.stderr)
     );
     assert!(!path.exists());
-    assert!(!temp
-        .path()
-        .join("session-test/gascan-gate4-runtime-test")
-        .exists());
+    assert!(
+        !temp
+            .path()
+            .join("session-test/gascan-gate4-runtime-test")
+            .exists()
+    );
 }
 
 #[test]

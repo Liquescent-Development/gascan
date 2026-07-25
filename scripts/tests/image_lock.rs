@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fs, path::Path};
 
 use serde::Deserialize;
 
@@ -51,8 +51,20 @@ struct WorkstationNpm {
     npm_version: String,
     package_manifest_sha256: String,
     package_lock_sha256: String,
+    bootstrap: NpmBootstrap,
     lifecycle_exceptions: BTreeMap<String, NpmLifecycleException>,
     claude_native: ClaudeNative,
+}
+
+#[derive(Deserialize)]
+struct NpmBootstrap {
+    package: String,
+    version: String,
+    url: String,
+    integrity: String,
+    sha256: String,
+    size: u64,
+    kind: String,
 }
 
 #[derive(Deserialize)]
@@ -90,11 +102,60 @@ struct WorkspaceBundles {
     publication: String,
 }
 
+#[derive(Deserialize)]
+struct WorkstationTargetLock {
+    schema_version: u64,
+    npm_version: String,
+    package_lock_sha256: String,
+    os: String,
+    cpu: String,
+    libc: String,
+    record_count: u64,
+    compressed_bytes: u64,
+    closure_sha256: String,
+    excluded_record_count: u64,
+    excluded_compressed_bytes: u64,
+    excluded_closure_sha256: String,
+    excluded_paths: Vec<String>,
+}
+
 fn sha256_is_lower_hex(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[test]
+fn workstation_target_lock_binds_the_reviewed_npm_behavioral_closure() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let bytes = fs::read(root.join("images/workspace/workstation-target-lock.toml")).unwrap();
+    let target: WorkstationTargetLock =
+        toml::from_str(std::str::from_utf8(&bytes).unwrap()).unwrap();
+    assert_eq!(target.schema_version, 1);
+    assert_eq!(target.npm_version, "11.12.1");
+    assert_eq!(
+        target.package_lock_sha256,
+        "22521261a3bee269f2b992011e417eb4c47a94bcde34c92f29b4504f77454d5c"
+    );
+    assert_eq!(
+        (&*target.os, &*target.cpu, &*target.libc),
+        ("linux", "arm64", "glibc")
+    );
+    assert_eq!(target.record_count, 144);
+    assert_eq!(target.compressed_bytes, 240_013_303);
+    assert!(sha256_is_lower_hex(&target.closure_sha256));
+    assert_eq!(target.excluded_record_count, 12);
+    assert_eq!(target.excluded_compressed_bytes, 1_255_140_640);
+    assert!(sha256_is_lower_hex(&target.excluded_closure_sha256));
+    assert_eq!(target.excluded_paths.len(), 12);
+    assert!(
+        target
+            .excluded_paths
+            .iter()
+            .all(|path| !path.contains("@mariozechner/clipboard-")),
+        "npm 11.12.1 installs every reviewed clipboard platform package"
+    );
 }
 
 #[test]
@@ -164,6 +225,17 @@ fn every_remote_image_input_is_immutable_and_checksummed() {
     }
     assert_eq!(lock.workstation_npm.scripts, "disabled");
     assert_eq!(lock.workstation_npm.npm_version, "11.12.1");
+    let bootstrap = &lock.workstation_npm.bootstrap;
+    assert_eq!(bootstrap.package, "npm");
+    assert_eq!(bootstrap.version, lock.workstation_npm.npm_version);
+    assert_eq!(
+        bootstrap.url,
+        "https://registry.npmjs.org/npm/-/npm-11.12.1.tgz"
+    );
+    assert!(bootstrap.integrity.starts_with("sha512-"));
+    assert!(sha256_is_lower_hex(&bootstrap.sha256));
+    assert_eq!(bootstrap.size, 2_833_345);
+    assert_eq!(bootstrap.kind, "npm_tgz");
     assert!(sha256_is_lower_hex(
         &lock.workstation_npm.package_manifest_sha256
     ));

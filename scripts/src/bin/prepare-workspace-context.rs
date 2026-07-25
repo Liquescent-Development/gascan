@@ -19,15 +19,17 @@ use cap_std::{ambient_authority, fs::Dir};
 use gascan_image_tools::bundle::{PublishedBundleLocks, validate_bundle};
 use gascan_image_tools::{ReviewedInputKind, parse_dockerfile_copies, reviewed_input_kind_allowed};
 use serde::Deserialize;
+use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
 
 type DynError = Box<dyn Error>;
 
-const REPOSITORY_FILES: [&str; 10] = [
+const REPOSITORY_FILES: [&str; 11] = [
     "images/workspace/Dockerfile",
     "images/workspace/bin/gascan-entrypoint",
     "images/workspace/bin/select-gascamp",
     "images/workspace/bin/migrate-workspace-identity",
+    "images/workspace/bin/run-workstation-step",
     "images/workspace/libexec/migrate-workspace-identity-core",
     "images/workspace/etc/mise/config.toml",
     "images/workspace/etc/profile.d/mise.sh",
@@ -37,6 +39,32 @@ const REPOSITORY_FILES: [&str; 10] = [
 ];
 const CACHE_FILES: [&str; 2] = ["mise-linux-arm64", "expected-tool-versions.json"];
 const RECORDS: [&str; 3] = ["ubuntu_packages", "mise_runtimes", "gascamp_source_vendor"];
+const REVIEWED_EXCLUDED_NPM_PATHS: [&str; 12] = [
+    "node_modules/@anthropic-ai/claude-code-darwin-arm64",
+    "node_modules/@anthropic-ai/claude-code-darwin-x64",
+    "node_modules/@anthropic-ai/claude-code-linux-arm64-musl",
+    "node_modules/@anthropic-ai/claude-code-linux-x64",
+    "node_modules/@anthropic-ai/claude-code-linux-x64-musl",
+    "node_modules/@anthropic-ai/claude-code-win32-arm64",
+    "node_modules/@anthropic-ai/claude-code-win32-x64",
+    "node_modules/@openai/codex-darwin-arm64",
+    "node_modules/@openai/codex-darwin-x64",
+    "node_modules/@openai/codex-linux-x64",
+    "node_modules/@openai/codex-win32-arm64",
+    "node_modules/@openai/codex-win32-x64",
+];
+const REVIEWED_CLIPBOARD_NPM_PATHS: [&str; 10] = [
+    "node_modules/@earendil-works/pi-coding-agent/node_modules/@mariozechner/clipboard-darwin-arm64",
+    "node_modules/@earendil-works/pi-coding-agent/node_modules/@mariozechner/clipboard-darwin-universal",
+    "node_modules/@earendil-works/pi-coding-agent/node_modules/@mariozechner/clipboard-darwin-x64",
+    "node_modules/@earendil-works/pi-coding-agent/node_modules/@mariozechner/clipboard-linux-arm64-gnu",
+    "node_modules/@earendil-works/pi-coding-agent/node_modules/@mariozechner/clipboard-linux-arm64-musl",
+    "node_modules/@earendil-works/pi-coding-agent/node_modules/@mariozechner/clipboard-linux-riscv64-gnu",
+    "node_modules/@earendil-works/pi-coding-agent/node_modules/@mariozechner/clipboard-linux-x64-gnu",
+    "node_modules/@earendil-works/pi-coding-agent/node_modules/@mariozechner/clipboard-linux-x64-musl",
+    "node_modules/@earendil-works/pi-coding-agent/node_modules/@mariozechner/clipboard-win32-arm64-msvc",
+    "node_modules/@earendil-works/pi-coding-agent/node_modules/@mariozechner/clipboard-win32-x64-msvc",
+];
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
@@ -84,9 +112,22 @@ struct WorkstationArtifact {
 #[derive(Deserialize)]
 struct WorkstationNpm {
     scripts: String,
+    npm_version: String,
     package_manifest_sha256: String,
     package_lock_sha256: String,
+    bootstrap: NpmBootstrap,
     claude_native: ClaudeNative,
+}
+
+#[derive(Deserialize)]
+struct NpmBootstrap {
+    package: String,
+    version: String,
+    url: String,
+    integrity: String,
+    sha256: String,
+    size: u64,
+    kind: String,
 }
 
 #[derive(Deserialize)]
@@ -105,13 +146,33 @@ struct PackageLock {
     packages: BTreeMap<String, PackageRecord>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct PackageRecord {
     resolved: Option<String>,
     integrity: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkstationTargetLock {
+    schema_version: u64,
+    npm_version: String,
+    package_lock_sha256: String,
+    os: String,
+    cpu: String,
+    libc: String,
+    record_count: u64,
+    compressed_bytes: u64,
+    closure_sha256: String,
+    excluded_record_count: u64,
+    excluded_compressed_bytes: u64,
+    excluded_closure_sha256: String,
+    excluded_paths: Vec<String>,
+}
+
+#[derive(Clone)]
 struct NpmInput {
+    package_path: String,
     relative: PathBuf,
     url: String,
     integrity: String,
@@ -131,6 +192,9 @@ struct NativeInput {
 struct WorkstationInputs {
     natives: Vec<NativeInput>,
     npm: Vec<NpmInput>,
+    full_npm: Vec<NpmInput>,
+    target_compressed_bytes: u64,
+    excluded_compressed_bytes: u64,
     lock_sha256: String,
 }
 
@@ -168,14 +232,16 @@ fn run() -> Result<(), DynError> {
         let lock_path = required(&mut arguments, "LOCK_FILE")?;
         let manifest_path = required(&mut arguments, "PACKAGE_MANIFEST")?;
         let package_lock_path = required(&mut arguments, "PACKAGE_LOCK")?;
+        let target_lock_path = required(&mut arguments, "TARGET_LOCK")?;
         if arguments.next().is_some() {
-            return Err("usage: prepare-workspace-context --workstation-lock LOCK_FILE PACKAGE_MANIFEST PACKAGE_LOCK".into());
+            return Err("usage: prepare-workspace-context --workstation-lock LOCK_FILE PACKAGE_MANIFEST PACKAGE_LOCK TARGET_LOCK".into());
         }
         let contents = fs::read_to_string(&lock_path)?;
         let inputs = workstation_inputs(
             &contents,
             &fs::read(&manifest_path)?,
             &fs::read(&package_lock_path)?,
+            &fs::read(&target_lock_path)?,
         )?;
         println!("receipt\tprefetch-lock.sha256\t{}", inputs.lock_sha256);
         for native in inputs.natives {
@@ -184,10 +250,11 @@ fn run() -> Result<(), DynError> {
                 native.name, native.class, native.url, native.sha256, native.size
             );
         }
-        for input in inputs.npm {
+        for input in inputs.full_npm {
+            let relative = Path::new("npm-cache").join(&input.relative);
             println!(
                 "npm\t{}\tworkstation-npm\t{}\t{}\t{}",
-                input.relative.display(),
+                relative.display(),
                 input.url,
                 input.integrity,
                 200 * 1024 * 1024_u64
@@ -199,19 +266,128 @@ fn run() -> Result<(), DynError> {
         let lock_path = required(&mut arguments, "LOCK_FILE")?;
         let manifest_path = required(&mut arguments, "PACKAGE_MANIFEST")?;
         let package_lock_path = required(&mut arguments, "PACKAGE_LOCK")?;
+        let target_lock_path = required(&mut arguments, "TARGET_LOCK")?;
         let staging_parent = required(&mut arguments, "STAGING_DIRECTORY")?;
         let destination = required(&mut arguments, "DESTINATION")?;
         if arguments.next().is_some() {
-            return Err("usage: prepare-workspace-context --publish-workstation-cache LOCK_FILE PACKAGE_MANIFEST PACKAGE_LOCK STAGING_DIRECTORY DESTINATION".into());
+            return Err("usage: prepare-workspace-context --publish-workstation-cache LOCK_FILE PACKAGE_MANIFEST PACKAGE_LOCK TARGET_LOCK STAGING_DIRECTORY DESTINATION".into());
         }
         let lock_contents = fs::read_to_string(lock_path)?;
         let inputs = workstation_inputs(
             &lock_contents,
             &fs::read(manifest_path)?,
             &fs::read(package_lock_path)?,
+            &fs::read(target_lock_path)?,
         )?;
+        if staging_parent
+            .join("workstation/npm-cache/_cacache/index-v5")
+            .exists()
+        {
+            validate_workstation_cache(&staging_parent, &inputs)?;
+        } else {
+            let full = validate_workstation_cache_with_inputs(
+                &staging_parent,
+                &inputs,
+                &inputs.full_npm,
+                false,
+            );
+            if full.is_ok() {
+                prune_workstation_npm_cache(&staging_parent, &inputs)?;
+            } else {
+                validate_workstation_cache_with_index(&staging_parent, &inputs, false)?;
+            }
+            prepare_workstation_npm_index(&staging_parent, &inputs)?;
+        }
         validate_workstation_cache(&staging_parent, &inputs)?;
         publish_workstation_cache(&staging_parent.join("workstation"), &destination)?;
+        return Ok(());
+    }
+    if first.as_deref() == Some(OsStr::new("--verify-full-workstation-cache")) {
+        let lock_path = required(&mut arguments, "LOCK_FILE")?;
+        let manifest_path = required(&mut arguments, "PACKAGE_MANIFEST")?;
+        let package_lock_path = required(&mut arguments, "PACKAGE_LOCK")?;
+        let target_lock_path = required(&mut arguments, "TARGET_LOCK")?;
+        let workstation = required(&mut arguments, "WORKSTATION_CACHE")?;
+        if arguments.next().is_some() {
+            return Err("usage: prepare-workspace-context --verify-full-workstation-cache LOCK_FILE PACKAGE_MANIFEST PACKAGE_LOCK TARGET_LOCK WORKSTATION_CACHE".into());
+        }
+        if workstation.file_name() != Some(OsStr::new("workstation")) {
+            return Err("full workstation cache path must end in workstation".into());
+        }
+        let lock_contents = fs::read_to_string(lock_path)?;
+        let mut inputs = workstation_inputs(
+            &lock_contents,
+            &fs::read(manifest_path)?,
+            &fs::read(package_lock_path)?,
+            &fs::read(target_lock_path)?,
+        )?;
+        let legacy_receipt = format!("{:x}", Sha256::digest(lock_contents.as_bytes()));
+        let actual_receipt = fs::read_to_string(workstation.join("prefetch-lock.sha256"))?;
+        let actual_receipt = actual_receipt
+            .strip_suffix('\n')
+            .ok_or("workstation cache receipt is not canonical")?;
+        if actual_receipt != inputs.lock_sha256 && actual_receipt != legacy_receipt {
+            return Err("workstation cache receipt differs from reviewed lock bytes".into());
+        }
+        inputs.lock_sha256 = actual_receipt.to_owned();
+        verify_full_workstation_cache_from_private_copy(&workstation, &inputs)?;
+        eprintln!(
+            "prepare-workspace-context: verified exact full workstation cache ({} npm records, {} bytes) without rewriting",
+            inputs.full_npm.len(),
+            inputs
+                .target_compressed_bytes
+                .checked_add(inputs.excluded_compressed_bytes)
+                .ok_or("workstation npm full byte count overflow")?
+        );
+        return Ok(());
+    }
+    if first.as_deref() == Some(OsStr::new("--publish-target-workstation-cache-from-full")) {
+        let lock_path = required(&mut arguments, "LOCK_FILE")?;
+        let manifest_path = required(&mut arguments, "PACKAGE_MANIFEST")?;
+        let package_lock_path = required(&mut arguments, "PACKAGE_LOCK")?;
+        let target_lock_path = required(&mut arguments, "TARGET_LOCK")?;
+        let workstation = required(&mut arguments, "FULL_WORKSTATION_CACHE")?;
+        let destination = required(&mut arguments, "DESTINATION")?;
+        if arguments.next().is_some() {
+            return Err("usage: prepare-workspace-context --publish-target-workstation-cache-from-full LOCK_FILE PACKAGE_MANIFEST PACKAGE_LOCK TARGET_LOCK FULL_WORKSTATION_CACHE DESTINATION".into());
+        }
+        if workstation.file_name() != Some(OsStr::new("workstation")) {
+            return Err("full workstation cache path must end in workstation".into());
+        }
+        let lock_contents = fs::read_to_string(lock_path)?;
+        let mut inputs = workstation_inputs(
+            &lock_contents,
+            &fs::read(manifest_path)?,
+            &fs::read(package_lock_path)?,
+            &fs::read(target_lock_path)?,
+        )?;
+        let publication_receipt = inputs.lock_sha256.clone();
+        let legacy_receipt = format!("{:x}", Sha256::digest(lock_contents.as_bytes()));
+        let actual_receipt = fs::read_to_string(workstation.join("prefetch-lock.sha256"))?;
+        let actual_receipt = actual_receipt
+            .strip_suffix('\n')
+            .ok_or("workstation cache receipt is not canonical")?;
+        if actual_receipt != publication_receipt && actual_receipt != legacy_receipt {
+            return Err("workstation cache receipt differs from reviewed lock bytes".into());
+        }
+        inputs.lock_sha256 = actual_receipt.to_owned();
+        let derived = derive_full_workstation_cache_copy(&workstation, &inputs)?;
+        let derived_parent = derived.path();
+        let receipt = derived_parent.join("workstation/prefetch-lock.sha256");
+        validate_plain_regular(&receipt)?;
+        fs::remove_file(&receipt)?;
+        write_validated_bytes(&receipt, format!("{publication_receipt}\n").as_bytes())?;
+        inputs.lock_sha256 = publication_receipt;
+        fs::remove_dir_all(derived_parent.join("workstation/npm-cache/_cacache/index-v5"))?;
+        prune_workstation_npm_cache(derived_parent, &inputs)?;
+        prepare_workstation_npm_index(derived_parent, &inputs)?;
+        validate_workstation_cache(derived_parent, &inputs)?;
+        publish_workstation_cache(&derived_parent.join("workstation"), &destination)?;
+        eprintln!(
+            "prepare-workspace-context: published reviewed target workstation cache ({} npm records, {} bytes)",
+            inputs.npm.len(),
+            inputs.target_compressed_bytes
+        );
         return Ok(());
     }
     if first.as_deref() == Some(OsStr::new("--mode")) {
@@ -366,6 +542,23 @@ fn parse_connected_lock(contents: &str) -> Result<ConnectedLock, DynError> {
         return Err("Claude native artifact lock is invalid".into());
     }
     parse_sri(&lock.workstation_npm.claude_native.integrity)?;
+    let bootstrap = &lock.workstation_npm.bootstrap;
+    if bootstrap.package != "npm"
+        || bootstrap.version != lock.workstation_npm.npm_version
+        || bootstrap.kind != "npm_tgz"
+        || bootstrap.size == 0
+        || bootstrap.size > 16 * 1024 * 1024
+        || !lower_hex(&bootstrap.sha256, 64)
+        || bootstrap.url
+            != format!(
+                "https://registry.npmjs.org/npm/-/npm-{}.tgz",
+                bootstrap.version
+            )
+        || !approved_workstation_url(&bootstrap.url, "npm-bootstrap")?
+    {
+        return Err("npm bootstrap artifact lock is invalid".into());
+    }
+    parse_sri(&bootstrap.integrity)?;
     Ok(lock)
 }
 
@@ -375,7 +568,7 @@ fn approved_workstation_url(url: &str, name: &str) -> Result<bool, DynError> {
         return Ok(false);
     }
     let expected = match name {
-        "claude" | "codex" | "pi" | "claude-native" => "registry.npmjs.org",
+        "claude" | "codex" | "pi" | "claude-native" | "npm-bootstrap" => "registry.npmjs.org",
         "glab" => "gitlab.com",
         "herdr" | "neovim" => "github.com",
         _ => return Ok(false),
@@ -389,6 +582,7 @@ fn workstation_inputs(
     lock_contents: &str,
     package_manifest: &[u8],
     package_lock_bytes: &[u8],
+    target_lock_bytes: &[u8],
 ) -> Result<WorkstationInputs, DynError> {
     let lock = parse_connected_lock(lock_contents)?;
     let manifest_sha = format!("{:x}", Sha256::digest(package_manifest));
@@ -397,6 +591,42 @@ fn workstation_inputs(
         || package_lock_sha != lock.workstation_npm.package_lock_sha256
     {
         return Err("workstation npm manifest bytes differ from the reviewed lock".into());
+    }
+    let target: WorkstationTargetLock = toml::from_str(std::str::from_utf8(target_lock_bytes)?)?;
+    let excluded_paths: BTreeSet<String> = target.excluded_paths.iter().cloned().collect();
+    if target.schema_version != 1
+        || target.npm_version != lock.workstation_npm.npm_version
+        || target.package_lock_sha256 != package_lock_sha
+        || target.os != "linux"
+        || target.cpu != "arm64"
+        || target.libc != "glibc"
+        || target.record_count == 0
+        || target.compressed_bytes == 0
+        || !lower_hex(&target.closure_sha256, 64)
+        || !lower_hex(&target.excluded_closure_sha256, 64)
+        || excluded_paths.len() != target.excluded_paths.len()
+    {
+        return Err(
+            "workstation npm target lock differs from the reviewed linux/arm64/glibc closure"
+                .into(),
+        );
+    }
+    if package_lock_sha == "22521261a3bee269f2b992011e417eb4c47a94bcde34c92f29b4504f77454d5c"
+        && (target.record_count != 144
+            || target.compressed_bytes != 240_013_303
+            || target.closure_sha256
+                != "a82521814dc27a9a460700ee49ffceebf719bbb5a32f62e8b6540dd8e13c21b5"
+            || target.excluded_record_count != 12
+            || target.excluded_compressed_bytes != 1_255_140_640
+            || target.excluded_closure_sha256
+                != "b0f4e28bfd87590a7c6189454fa302c98b14d56efcb2fd8c9574e3bfa6295063"
+            || excluded_paths
+                != REVIEWED_EXCLUDED_NPM_PATHS
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect())
+    {
+        return Err("workstation npm reviewed closure differs from npm 11.12.1 behavior".into());
     }
     let package_lock: PackageLock = serde_json::from_slice(package_lock_bytes)?;
     if package_lock.lockfile_version != 3 || !package_lock.packages.contains_key("") {
@@ -455,6 +685,7 @@ fn workstation_inputs(
         let relative = npm_cache_relative(&integrity)?;
         let locked = locked_npm.remove(&url);
         let input = NpmInput {
+            package_path: path,
             relative: relative.clone(),
             url,
             integrity,
@@ -474,6 +705,45 @@ fn workstation_inputs(
     }
     if !locked_npm.is_empty() {
         return Err("workstation npm artifact lock is absent from package-lock.json".into());
+    }
+    let full_npm: Vec<NpmInput> = npm_by_path.into_values().collect();
+    let (npm, excluded): (Vec<_>, Vec<_>) = full_npm
+        .iter()
+        .cloned()
+        .partition(|input| !excluded_paths.contains(&input.package_path));
+    let target_paths: BTreeSet<&str> = npm
+        .iter()
+        .map(|input| input.package_path.as_str())
+        .collect();
+    let all_paths: BTreeSet<&str> = full_npm
+        .iter()
+        .map(|input| input.package_path.as_str())
+        .collect();
+    let reviewed_clipboards: BTreeSet<&str> = REVIEWED_CLIPBOARD_NPM_PATHS.into_iter().collect();
+    let actual_clipboards: BTreeSet<&str> = all_paths
+        .iter()
+        .copied()
+        .filter(|path| path.contains("/@mariozechner/clipboard-"))
+        .collect();
+    if npm.len() != target.record_count as usize
+        || excluded.len() != target.excluded_record_count as usize
+        || (!actual_clipboards.is_empty()
+            && (actual_clipboards != reviewed_clipboards
+                || reviewed_clipboards
+                    .iter()
+                    .any(|path| !target_paths.contains(path))))
+    {
+        return Err("workstation npm target closure membership differs from review".into());
+    }
+    let closure_sha256 = canonical_npm_closure_sha256("target", &npm)?;
+    let excluded_closure_sha256 = canonical_npm_closure_sha256("excluded", &excluded)?;
+    if closure_sha256 != target.closure_sha256
+        || excluded_closure_sha256 != target.excluded_closure_sha256
+    {
+        return Err(format!(
+            "workstation npm target closure digest differs from review: target={closure_sha256} excluded={excluded_closure_sha256}"
+        )
+        .into());
     }
     let native = &lock.workstation_npm.claude_native;
     let mut natives = Vec::new();
@@ -503,11 +773,51 @@ fn workstation_inputs(
         class: "workstation-npm-native",
         integrity: Some(native.integrity.clone()),
     });
+    let bootstrap = &lock.workstation_npm.bootstrap;
+    natives.push(NativeInput {
+        name: "npm-cli.tgz",
+        url: bootstrap.url.clone(),
+        sha256: bootstrap.sha256.clone(),
+        size: bootstrap.size,
+        class: "workstation-npm-native",
+        integrity: Some(bootstrap.integrity.clone()),
+    });
     Ok(WorkstationInputs {
         natives,
-        npm: npm_by_path.into_values().collect(),
-        lock_sha256: format!("{:x}", Sha256::digest(lock_contents.as_bytes())),
+        npm,
+        full_npm,
+        target_compressed_bytes: target.compressed_bytes,
+        excluded_compressed_bytes: target.excluded_compressed_bytes,
+        lock_sha256: {
+            let mut hasher = Sha256::new();
+            hasher.update(b"gascan-workstation-prefetch-lock-v2\0");
+            hasher.update(lock_contents.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(target_lock_bytes);
+            format!("{:x}", hasher.finalize())
+        },
     })
+}
+
+fn canonical_npm_closure_sha256(class: &str, inputs: &[NpmInput]) -> Result<String, DynError> {
+    let mut records: Vec<_> = inputs.iter().collect();
+    records.sort_by(|left, right| left.package_path.cmp(&right.package_path));
+    let mut hasher = Sha256::new();
+    hasher.update(format!("gascan-workstation-npm-{class}-closure-v1\n"));
+    for input in records {
+        for value in [&input.package_path, &input.url, &input.integrity] {
+            if value.contains(['\0', '\n', '\r', '\t']) {
+                return Err("workstation npm closure identity contains a separator".into());
+            }
+        }
+        hasher.update(input.package_path.as_bytes());
+        hasher.update(b"\t");
+        hasher.update(input.url.as_bytes());
+        hasher.update(b"\t");
+        hasher.update(input.integrity.as_bytes());
+        hasher.update(b"\n");
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn parse_sri(integrity: &str) -> Result<Vec<u8>, DynError> {
@@ -750,8 +1060,10 @@ fn verify_context(root: &Path, mode: Mode) -> Result<Vec<u8>, DynError> {
             "workstation/glab.tar.gz",
             "workstation/herdr",
             "workstation/neovim.tar.gz",
+            "workstation/npm-cli.tgz",
             "workstation/package.json",
             "workstation/package-lock.json",
+            "workstation/target-lock.toml",
         ] {
             if !root.join(required).is_file() {
                 return Err(format!("context is missing {required}").into());
@@ -899,7 +1211,14 @@ fn assemble_connected(
         fs::read(repository_path.join("images/workspace/workstation-package.json"))?;
     let package_lock =
         fs::read(repository_path.join("images/workspace/workstation-package-lock.json"))?;
-    let inputs = workstation_inputs(lock_contents, &package_manifest, &package_lock)?;
+    let target_lock =
+        fs::read(repository_path.join("images/workspace/workstation-target-lock.toml"))?;
+    let inputs = workstation_inputs(
+        lock_contents,
+        &package_manifest,
+        &package_lock,
+        &target_lock,
+    )?;
     validate_workstation_cache(cache_path, &inputs)?;
     let repository = Dir::open_ambient_dir(repository_path, ambient_authority())?;
     let cache = Dir::open_ambient_dir(cache_path, ambient_authority())?;
@@ -955,6 +1274,7 @@ fn assemble_connected(
         ("workstation/glab.tar.gz", "workstation/glab.tar.gz"),
         ("workstation/herdr", "workstation/herdr"),
         ("workstation/neovim.tar.gz", "workstation/neovim.tar.gz"),
+        ("workstation/npm-cli.tgz", "workstation/npm-cli.tgz"),
     ] {
         copy_regular(&cache, Path::new(source), staging.join(destination))?;
     }
@@ -968,6 +1288,7 @@ fn assemble_connected(
         &staging.join("workstation/package-lock.json"),
         &package_lock,
     )?;
+    write_validated_bytes(&staging.join("workstation/target-lock.toml"), &target_lock)?;
     validate_dockerfile_copy_sources(staging)?;
     make_tree_read_only(staging)?;
     write_manifest(staging)?;
@@ -993,9 +1314,125 @@ fn write_validated_bytes(destination: &Path, bytes: &[u8]) -> Result<(), DynErro
     Ok(())
 }
 
+fn npm_index_key(url: &str) -> String {
+    format!("make-fetch-happen:request-cache:{url}")
+}
+
+fn npm_index_relative(url: &str) -> PathBuf {
+    let digest = format!("{:x}", Sha256::digest(npm_index_key(url).as_bytes()));
+    Path::new("_cacache/index-v5")
+        .join(&digest[..2])
+        .join(&digest[2..4])
+        .join(&digest[4..])
+}
+
+fn npm_index_records(
+    root: &Path,
+    npm_inputs: &[NpmInput],
+) -> Result<BTreeMap<PathBuf, Vec<u8>>, DynError> {
+    let mut buckets = BTreeMap::<PathBuf, Vec<String>>::new();
+    for input in npm_inputs {
+        let content = root.join("npm-cache").join(&input.relative);
+        validate_plain_regular(&content)?;
+        let size = fs::metadata(&content)?.len();
+        let key = npm_index_key(&input.url);
+        let entry = serde_json::json!({
+            "key": key,
+            "integrity": input.integrity,
+            "time": 1,
+            "size": size,
+            "metadata": {
+                "time": 1,
+                "url": input.url,
+                "reqHeaders": {},
+                "resHeaders": {},
+                "options": {"compress": true}
+            }
+        });
+        let json = serde_json::to_string(&entry)?;
+        let checksum = format!("{:x}", Sha1::digest(json.as_bytes()));
+        buckets
+            .entry(npm_index_relative(&input.url))
+            .or_default()
+            .push(format!("{checksum}\t{json}"));
+    }
+    buckets
+        .into_iter()
+        .map(|(path, mut entries)| {
+            entries.sort();
+            Ok((path, format!("\n{}", entries.join("\n")).into_bytes()))
+        })
+        .collect()
+}
+
+fn prepare_workstation_npm_index(
+    cache_path: &Path,
+    inputs: &WorkstationInputs,
+) -> Result<(), DynError> {
+    let root = cache_path.join("workstation");
+    let index = root.join("npm-cache/_cacache/index-v5");
+    if index.exists() {
+        return Ok(());
+    }
+    validate_workstation_cache_with_index(cache_path, inputs, false)?;
+    for (relative, bytes) in npm_index_records(&root, &inputs.npm)? {
+        write_validated_bytes(&root.join("npm-cache").join(relative), &bytes)?;
+    }
+    Ok(())
+}
+
+fn prune_workstation_npm_cache(
+    cache_path: &Path,
+    inputs: &WorkstationInputs,
+) -> Result<(), DynError> {
+    let npm_root = cache_path.join("workstation/npm-cache");
+    let included: BTreeSet<&Path> = inputs
+        .npm
+        .iter()
+        .map(|input| input.relative.as_path())
+        .collect();
+    for input in &inputs.full_npm {
+        if included.contains(input.relative.as_path()) {
+            continue;
+        }
+        let path = npm_root.join(&input.relative);
+        validate_plain_regular(&path)?;
+        fs::remove_file(&path)?;
+        let mut current = path.parent();
+        while let Some(directory) = current {
+            if directory == npm_root {
+                break;
+            }
+            match fs::remove_dir(directory) {
+                Ok(()) => current = directory.parent(),
+                Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_workstation_cache(
     cache_path: &Path,
     inputs: &WorkstationInputs,
+) -> Result<(), DynError> {
+    validate_workstation_cache_with_inputs(cache_path, inputs, &inputs.npm, true)
+}
+
+fn validate_workstation_cache_with_index(
+    cache_path: &Path,
+    inputs: &WorkstationInputs,
+    expect_index: bool,
+) -> Result<(), DynError> {
+    validate_workstation_cache_with_inputs(cache_path, inputs, &inputs.npm, expect_index)
+}
+
+fn validate_workstation_cache_with_inputs(
+    cache_path: &Path,
+    inputs: &WorkstationInputs,
+    npm_inputs: &[NpmInput],
+    expect_index: bool,
 ) -> Result<(), DynError> {
     let root = cache_path.join("workstation");
     let top_level: BTreeSet<String> = fs::read_dir(&root)?
@@ -1011,6 +1448,7 @@ fn validate_workstation_cache(
         "glab.tar.gz",
         "herdr",
         "neovim.tar.gz",
+        "npm-cli.tgz",
         "npm-cache",
         "prefetch-lock.sha256",
     ]
@@ -1025,7 +1463,7 @@ fn validate_workstation_cache(
     if fs::read_to_string(receipt)? != format!("{}\n", inputs.lock_sha256) {
         return Err("workstation lock changed after prefetch".into());
     }
-    validate_workstation_payload(&root, inputs)
+    validate_workstation_payload(&root, inputs, npm_inputs, expect_index)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1109,10 +1547,12 @@ fn validate_connected_context_inputs(
     let root = context.join("workstation");
     let manifest = fs::read(root.join("package.json"))?;
     let package_lock = fs::read(root.join("package-lock.json"))?;
+    let target_lock = fs::read(root.join("target-lock.toml"))?;
     let inputs = workstation_inputs(
         std::str::from_utf8(&repository_lock)?,
         &manifest,
         &package_lock,
+        &target_lock,
     )?;
     let top_level: BTreeSet<String> = fs::read_dir(&root)?
         .map(|entry| {
@@ -1127,9 +1567,11 @@ fn validate_connected_context_inputs(
         "glab.tar.gz",
         "herdr",
         "neovim.tar.gz",
+        "npm-cli.tgz",
         "npm-cache",
         "package-lock.json",
         "package.json",
+        "target-lock.toml",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -1137,10 +1579,15 @@ fn validate_connected_context_inputs(
     if top_level != expected_top {
         return Err("workstation context top-level allowlist does not match".into());
     }
-    validate_workstation_payload(&root, &inputs)
+    validate_workstation_payload(&root, &inputs, &inputs.npm, true)
 }
 
-fn validate_workstation_payload(root: &Path, inputs: &WorkstationInputs) -> Result<(), DynError> {
+fn validate_workstation_payload(
+    root: &Path,
+    inputs: &WorkstationInputs,
+    npm_inputs: &[NpmInput],
+    expect_index: bool,
+) -> Result<(), DynError> {
     for native in &inputs.natives {
         let path = root.join(native.name);
         validate_plain_regular(&path)?;
@@ -1166,7 +1613,8 @@ fn validate_workstation_payload(root: &Path, inputs: &WorkstationInputs) -> Resu
     }
     let npm_root = root.join("npm-cache");
     let mut expected_paths = BTreeSet::new();
-    for input in &inputs.npm {
+    let mut compressed_bytes = 0_u64;
+    for input in npm_inputs {
         let path = npm_root.join(&input.relative);
         validate_plain_regular(&path)?;
         let mut file = fs::File::open(&path)?;
@@ -1185,6 +1633,9 @@ fn validate_workstation_payload(root: &Path, inputs: &WorkstationInputs) -> Resu
             )
             .into());
         }
+        compressed_bytes = compressed_bytes
+            .checked_add(size)
+            .ok_or("workstation npm cache byte count overflow")?;
         if let (Some(sha256), Some(exact_size)) = (&input.locked_sha256, input.locked_size) {
             let bytes = hash_file_bounded(&path, exact_size)?;
             if bytes.0 != exact_size || bytes.1 != *sha256 {
@@ -1207,14 +1658,116 @@ fn validate_workstation_payload(root: &Path, inputs: &WorkstationInputs) -> Resu
             current = parent;
         }
     }
+    let expected_compressed_bytes = if npm_inputs.len() == inputs.npm.len() {
+        inputs.target_compressed_bytes
+    } else if npm_inputs.len() == inputs.full_npm.len() {
+        inputs
+            .target_compressed_bytes
+            .checked_add(inputs.excluded_compressed_bytes)
+            .ok_or("workstation npm full byte count overflow")?
+    } else {
+        return Err("workstation npm validator received an unknown closure".into());
+    };
+    if compressed_bytes != expected_compressed_bytes {
+        return Err("workstation npm cache byte count differs from target lock".into());
+    }
+    if expect_index {
+        for (relative, expected) in npm_index_records(root, npm_inputs)? {
+            let path = npm_root.join(&relative);
+            validate_plain_regular(&path)?;
+            if fs::read(&path)? != expected {
+                return Err(format!(
+                    "workstation npm index {} differs from locked URL record",
+                    relative.display()
+                )
+                .into());
+            }
+            let mut current = relative.as_path();
+            loop {
+                expected_paths.insert(current.to_path_buf());
+                let Some(parent) = current.parent() else {
+                    break;
+                };
+                if parent.as_os_str().is_empty() {
+                    break;
+                }
+                current = parent;
+            }
+        }
+    }
     let actual_paths: BTreeSet<PathBuf> = all_paths(&npm_root)?
         .into_iter()
         .map(|path| path.strip_prefix(&npm_root).map(Path::to_owned))
         .collect::<Result<_, _>>()?;
     if actual_paths != expected_paths {
-        return Err("workstation npm cache is not the exact locked closure".into());
+        let missing = expected_paths
+            .difference(&actual_paths)
+            .take(8)
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let unexpected = actual_paths
+            .difference(&expected_paths)
+            .take(8)
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "workstation npm cache is not the exact locked closure (missing: [{missing}]; unexpected: [{unexpected}])"
+        )
+        .into());
     }
     Ok(())
+}
+
+fn verify_full_workstation_cache_from_private_copy(
+    workstation: &Path,
+    inputs: &WorkstationInputs,
+) -> Result<(), DynError> {
+    let _derived = derive_full_workstation_cache_copy(workstation, inputs)?;
+    Ok(())
+}
+
+fn derive_full_workstation_cache_copy(
+    workstation: &Path,
+    inputs: &WorkstationInputs,
+) -> Result<tempfile::TempDir, DynError> {
+    let workstation_metadata = fs::symlink_metadata(workstation)?;
+    if !workstation_metadata.is_dir() || workstation_metadata.file_type().is_symlink() {
+        return Err("full workstation cache is not a real directory".into());
+    }
+    let temporary_path = workstation.join("npm-cache/_cacache/tmp");
+    let temporary_metadata = fs::symlink_metadata(&temporary_path)?;
+    if !temporary_metadata.is_dir()
+        || temporary_metadata.file_type().is_symlink()
+        || temporary_metadata.nlink() != 2
+        || temporary_metadata.uid() != workstation_metadata.uid()
+        || temporary_metadata.gid() != workstation_metadata.gid()
+        || temporary_metadata.permissions().mode() & 0o022 != 0
+        || fs::read_dir(&temporary_path)?.next().is_some()
+    {
+        return Err(
+            "workstation npm temporary path must be a real empty single-owner directory".into(),
+        );
+    }
+
+    let source_parent_path = workstation
+        .parent()
+        .ok_or("workstation cache has no parent directory")?;
+    let source_parent = Dir::open_ambient_dir(source_parent_path, ambient_authority())?;
+    let derived_parent = tempfile::tempdir_in("/tmp")?;
+    copy_tree(
+        &source_parent,
+        Path::new("workstation"),
+        &derived_parent.path().join("workstation"),
+    )?;
+    fs::remove_dir(
+        derived_parent
+            .path()
+            .join("workstation/npm-cache/_cacache/tmp"),
+    )?;
+    validate_workstation_cache_with_inputs(derived_parent.path(), inputs, &inputs.full_npm, true)?;
+    Ok(derived_parent)
 }
 
 fn validate_plain_regular(path: &Path) -> Result<(), DynError> {

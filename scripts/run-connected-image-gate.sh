@@ -68,7 +68,7 @@ else
 fi
 [[ "$owner_token" =~ ^[0-9a-f]{32}$ ]] || die 'invalid cleanup ownership token'
 
-names=("gascan-image-user-test-$owner_token" "gascan-image-polyglot-test-$owner_token" "gascan-image-gascamp-test-$owner_token")
+names=("gascan-image-user-test-$owner_token" "gascan-image-polyglot-test-$owner_token" "gascan-image-gascamp-test-$owner_token" "gascan-image-workstation-test-$owner_token")
 cleaning=false
 inventory_proves_absent() {
   local inventory
@@ -146,7 +146,7 @@ inspect=$("$container_bin" image inspect "$inspection_image") || die 'built imag
 inspected_digest=$(printf '%s' "$inspect" | run_tool validate-connected-build "$inspection_image") || die 'structured image inspection is invalid'
 test "$inspected_digest" = "${image##*@}" || die 'inspection digest differs from receipt'
 
-for smoke in user-and-volumes.sh polyglot-smoke.sh gascamp-smoke.sh; do
+for smoke in user-and-volumes.sh polyglot-smoke.sh gascamp-smoke.sh workstation-smoke.sh; do
   GASCAN_IMAGE_REF_FILE="$reference_file" GASCAN_IMAGE_ARTIFACTS="$artifacts" GASCAN_TEST_OWNER_TOKEN="$owner_token" CONTAINER_BIN="$container_bin" CALLS="${CALLS:-}" FAIL_SMOKE="${FAIL_SMOKE:-}" \
     "$root/tests/image/$smoke"
 done

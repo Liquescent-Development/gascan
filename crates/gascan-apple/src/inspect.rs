@@ -95,9 +95,24 @@ struct ContainerRecord {
 struct ContainerConfiguration {
     id: String,
     #[serde(default)]
-    image: Option<String>,
+    image: Option<ContainerImage>,
     #[serde(default)]
     labels: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ContainerImage {
+    Reference(String),
+    Structured {
+        reference: String,
+        descriptor: ContainerImageDescriptor,
+    },
+}
+
+#[derive(Deserialize)]
+struct ContainerImageDescriptor {
+    digest: String,
 }
 
 #[derive(Deserialize)]
@@ -113,13 +128,37 @@ fn parse_id(operation: &str, id: String) -> Result<SandboxId, RuntimeError> {
     SandboxId::try_from(id).map_err(|error| invalid_output(operation, error.to_string()))
 }
 
-fn parse_image(image: Option<String>) -> Result<String, RuntimeError> {
+fn parse_image(image: Option<ContainerImage>) -> Result<String, RuntimeError> {
     let image = image.ok_or_else(|| {
         invalid_output(
             "container inspect",
             "missing inspected container image".to_owned(),
         )
     })?;
+    let image = match image {
+        ContainerImage::Reference(reference) => reference,
+        ContainerImage::Structured {
+            reference,
+            descriptor,
+        } => {
+            let expected = reference
+                .rsplit_once('@')
+                .map(|(_, digest)| digest)
+                .ok_or_else(|| {
+                    invalid_output(
+                        "container inspect",
+                        "structured container image reference is not immutable".to_owned(),
+                    )
+                })?;
+            if descriptor.digest != expected {
+                return Err(invalid_output(
+                    "container inspect",
+                    "structured container image descriptor differs from its reference".to_owned(),
+                ));
+            }
+            reference
+        }
+    };
     let Some((name, digest)) = image.split_once("@sha256:") else {
         return Err(invalid_output(
             "container inspect",

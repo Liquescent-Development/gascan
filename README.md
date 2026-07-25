@@ -312,6 +312,70 @@ The image preinstalls these versions, which resolve without any download:
 | `ruby` | 3.4.10 |
 | `rust` | 1.97.0 |
 
+### Default developer workstation
+
+Every sandbox also includes a credential-free workstation baseline:
+
+- Editors: Vim, Neovim, Emacs, and Pico (the reviewed Nano alternative).
+- Coding agents: Claude Code, Codex, Pi, and Herdr.
+- Forge and source tools: Git, GitHub CLI (`gh`), and GitLab CLI (`glab`).
+- Network diagnostics: `ip`, `ss`, `ping`, `ifconfig`, `netstat`, `dig`,
+  `nslookup`, `traceroute`, and `nc`.
+- Terminal and inspection tools: `curl`, `wget`, `rsync`, `lsof`, `file`,
+  `jq`, `ps`, `top`, `pstree`, `tree`, `less`, `rg`, `fd`, `fzf`, and `tmux`.
+
+Discover the installed versions with each tool's normal command:
+
+```sh
+vim --version
+nvim --version
+emacs --version
+pico --version
+claude --version
+codex --version
+pi --version
+herdr --version
+go version
+rustc --version
+cargo --version
+gh --version
+glab --version
+git --version
+ip -Version
+ss --version
+ping -V
+ifconfig --version
+netstat --version
+dig -v
+traceroute --version
+nc -h
+rg --version
+fd --version
+fzf --version
+tmux -V
+```
+
+The image gate compares locked tools with their exact locked versions and
+checks documented output formats for snapshot-pinned Ubuntu tools. These
+commands work in the default offline sandbox and do not download anything at
+startup. Diagnostic packages do not grant the sandbox extra Linux
+capabilities, devices, or host access.
+
+Image-owned workstation files under `/opt/gascan/workstation` are immutable.
+An explicit `[tools]` entry is installed into the sandbox's writable
+`/home/workspace/.local/share/mise` managed tools volume; its mise shim is
+first in `PATH`, ahead of the reviewed defaults in the immutable
+`/opt/gascan/mise` system data tree. The requested version therefore overrides
+an image default without changing the immutable workstation tree.
+
+Agent and forge configuration is sandbox-local under the managed
+`/home/workspace/.config/gascan` volume. Caches and logs are kept separately
+under the managed `/home/workspace/.cache` volume. Gas Can never imports the
+host home directory, SSH material, agent/forge tokens, Docker socket, or macOS
+keychain into the sandbox. Sandbox-local login state survives `gascan down`,
+`gascan up`, and container-only image replacement; `gascan destroy --yes`
+deletes it with the config volume.
+
 Requesting any other tool or version makes mise download it, which requires
 `network = "networked"`. Installed tools persist in a per-sandbox volume, so
 they survive `gascan down` and are removed by `gascan destroy`.
