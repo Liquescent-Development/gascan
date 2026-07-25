@@ -30,6 +30,7 @@ mod api;
 mod reconcile;
 mod service;
 mod socket;
+mod ssh;
 mod store;
 
 pub use api::{
@@ -37,6 +38,10 @@ pub use api::{
     OperationLease, SandboxApi,
 };
 pub use socket::{OwnedSocket, PeerUid, PeerUidMismatch, SocketPaths, validate_peer_uid};
+pub use ssh::{
+    ActiveSsh, HostIdentity, ManagedSshHost, SshError, SshPaths, ensure_host_identity,
+    publish_openssh_files, readiness_ssh_args,
+};
 
 pub use reconcile::{ReconcileFinding, ReconcileReport};
 pub use service::{
