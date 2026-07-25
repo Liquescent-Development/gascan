@@ -1,5 +1,10 @@
 # Managed SSH Access Implementation Plan
 
+> **Superseded on 2026-07-25:** Do not execute this plan. The approved
+> networked-only native publication replacement is
+> `docs/superpowers/plans/2026-07-25-networked-native-ssh.md`. In particular,
+> do not implement the TCP bridge or offline SSH tasks below.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Give every sandbox secure, persistent, loopback-only SSH access that works for people, automation, and Remote SSH clients without weakening offline isolation.
