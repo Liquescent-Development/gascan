@@ -652,7 +652,8 @@ impl<B: RuntimeBackend> SandboxService<B> {
             .iter()
             .filter(|mapping| mapping.guest_port == 22)
             .collect::<Vec<_>>();
-        let enabled = prior_policy.map_or(!mappings.is_empty(), SshTransportPolicy::is_enabled);
+        let enabled =
+            !mappings.is_empty() || prior_policy.is_some_and(SshTransportPolicy::is_enabled);
         if !enabled {
             return PolicyCompiler::restore_ssh_transport(create, None).map_err(Into::into);
         }
@@ -867,15 +868,19 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let lock = self.keyed_lock(&id)?;
         let _guard = lock.lock().await;
         let capabilities = self.runtime_capabilities().await?;
-        let prepared_ssh = self.prepare_ssh_create(&request.spec).await?;
-        let create =
-            self.compile_policy(request.spec.clone(), capabilities, prepared_ssh.as_ref())?;
+        let create = self.compile_policy(request.spec.clone(), capabilities, None)?;
         let requested_ssh_transport = requested_ssh_transport(&request.spec);
         let requested_storage = requested_storage(&create)?;
         let existing = self
             .database({
                 let id = id.clone();
                 move |store| store.sandbox(&id)
+            })
+            .await?;
+        let prior_ssh_transport = self
+            .database({
+                let id = id.clone();
+                move |store| store.ssh_transport_policy(&id)
             })
             .await?;
         if let Some(prior) = existing
@@ -929,9 +934,9 @@ impl<B: RuntimeBackend> SandboxService<B> {
             .up_runtime(
                 &request.spec,
                 create,
-                prepared_ssh,
                 capabilities,
                 prior.as_ref(),
+                prior_ssh_transport,
                 UpRuntimeContext {
                     operation_id: operation.id,
                     sender: &sender,
@@ -941,7 +946,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             )
             .await;
         match result {
-            Ok((actual, provisioned, ssh_resolution)) => {
+            Ok((actual, provisioned, ssh_resolution, ssh_transport_applied)) => {
                 if let Some(provisioned) = provisioned {
                     let resolution = provisioned.resolution;
                     record.setup_resolution = Some(SetupResolution::new(
@@ -960,9 +965,12 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 record.actual_state = actual;
                 self.database({
                     let record = record.clone();
-                    move |store| {
-                        store.put_sandbox_with_ssh_transport(&record, Some(requested_ssh_transport))
-                    }
+                    let ssh_transport = if ssh_transport_applied {
+                        Some(requested_ssh_transport)
+                    } else {
+                        prior_ssh_transport
+                    };
+                    move |store| store.put_sandbox_with_ssh_transport(&record, ssh_transport)
                 })
                 .await?;
                 let terminal = self
@@ -996,15 +1004,16 @@ impl<B: RuntimeBackend> SandboxService<B> {
         &self,
         spec: &SandboxSpec,
         mut create: CreateRequest,
-        mut prepared_ssh: Option<PreparedSshCreate>,
         capabilities: &RuntimeCapabilities,
         prior: Option<&SandboxRecord>,
+        prior_ssh_transport: Option<SshTransportPolicy>,
         context: UpRuntimeContext<'_>,
     ) -> Result<
         (
             ActualState,
             Option<ProvisionedResolution>,
             Option<crate::SshResolution>,
+            bool,
         ),
         ServiceError,
     > {
@@ -1041,9 +1050,42 @@ impl<B: RuntimeBackend> SandboxService<B> {
                     ContainerState::Stopped => ActualState::Stopped,
                 };
                 let ssh_resolution = prior.and_then(|record| record.ssh_resolution.clone());
-                return Ok((actual, None, ssh_resolution));
+                return Ok((actual, None, ssh_resolution, false));
             }
-        } else {
+            if let Some(prior) = prior {
+                let has_complete_resolution =
+                    prior.setup_resolution.is_some() && prior.tool_resolution.is_some();
+                let ssh_transport_changed = (prior_ssh_transport.is_some()
+                    || has_complete_resolution)
+                    && ssh_transport_policy_changed(
+                        prior,
+                        runtime,
+                        spec,
+                        prior_ssh_transport.as_ref(),
+                        has_complete_resolution,
+                    );
+                if ssh_transport_changed {
+                    self.emit(
+                        operation_id,
+                        json!({
+                            "phase": "apply_required",
+                            "reason": "ssh_transport_changed",
+                        }),
+                        sender,
+                    )
+                    .await?;
+                    let actual = match runtime.state {
+                        ContainerState::Creating => ActualState::Creating,
+                        ContainerState::Running => ActualState::Running,
+                        ContainerState::Stopped => ActualState::Stopped,
+                    };
+                    return Ok((actual, None, prior.ssh_resolution.clone(), false));
+                }
+            }
+        }
+        let mut prepared_ssh = self.prepare_ssh_create(spec).await?;
+        create = self.compile_policy(spec.clone(), capabilities, prepared_ssh.as_ref())?;
+        if inspected.is_none() {
             let automatic_ssh =
                 spec.manifest().ssh().enabled() && spec.manifest().ssh().host_port().is_none();
             let mut attempts = 0;
@@ -1054,8 +1096,13 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 }
                 match self.runtime.create(create.clone()).await {
                     Ok(outcome) => {
-                        if let Err(error) =
-                            self.persist_created_storage(id, requested_storage).await
+                        if let Err(error) = self
+                            .persist_created_state(
+                                id,
+                                requested_storage,
+                                requested_ssh_transport(spec),
+                            )
+                            .await
                         {
                             return Err(self.rollback_created(id, outcome, error).await);
                         }
@@ -1172,9 +1219,12 @@ impl<B: RuntimeBackend> SandboxService<B> {
         }
         .await;
         match result {
-            Ok((provisioned, ssh_resolution)) => {
-                Ok((ActualState::Running, provisioned, Some(ssh_resolution)))
-            }
+            Ok((provisioned, ssh_resolution)) => Ok((
+                ActualState::Running,
+                provisioned,
+                Some(ssh_resolution),
+                true,
+            )),
             Err(error) if error.is_setup_failure() => Err(error),
             Err(error) if created.is_some() => {
                 if let Some(outcome) = created {
@@ -1588,10 +1638,11 @@ impl<B: RuntimeBackend> SandboxService<B> {
             .map_err(|error| precondition(error.to_string()))
     }
 
-    async fn persist_created_storage(
+    async fn persist_created_state(
         &self,
         id: &SandboxId,
         requested_storage: StorageCapacities,
+        requested_ssh_transport: SshTransportPolicy,
     ) -> Result<(), ServiceError> {
         let mut record = self
             .database({
@@ -1601,7 +1652,10 @@ impl<B: RuntimeBackend> SandboxService<B> {
             .await?
             .ok_or_else(|| ServiceError::Missing(id.clone()))?;
         record.storage_resolution = Some(storage_resolution(requested_storage));
-        self.database(move |store| store.put_sandbox(&record)).await
+        self.database(move |store| {
+            store.put_sandbox_with_ssh_transport(&record, Some(requested_ssh_transport))
+        })
+        .await
     }
 
     async fn rollback_created(
@@ -2255,6 +2309,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 &runtime,
                 &request.spec,
                 prior_ssh_transport.as_ref(),
+                true,
             );
             if image.change_required() {
                 return Ok::<_, ServiceError>((runtime, image, ssh_policy_changed));
@@ -3329,6 +3384,7 @@ fn ssh_transport_policy_changed(
     runtime: &gascan_core::runtime::RuntimeSandbox,
     spec: &SandboxSpec,
     recorded_policy: Option<&SshTransportPolicy>,
+    require_ssh_resolution: bool,
 ) -> bool {
     let desired_policy = requested_ssh_transport(spec);
     if recorded_policy != Some(&desired_policy) {
@@ -3336,7 +3392,7 @@ fn ssh_transport_policy_changed(
     }
     let desired_enabled = spec.manifest().ssh().enabled();
     let recorded_enabled = ssh_resolution_enabled(record.ssh_resolution.as_ref());
-    if desired_enabled != recorded_enabled {
+    if require_ssh_resolution && desired_enabled != recorded_enabled {
         return true;
     }
     if !desired_enabled {

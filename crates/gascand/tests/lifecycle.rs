@@ -1097,6 +1097,148 @@ async fn retained_setup_failure_persists_storage_and_up_retries_setup() -> TestR
 }
 
 #[tokio::test]
+async fn retained_setup_failure_preserves_created_ssh_policy_for_changed_up() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let state_path = root.join("state.db");
+    let setup = b"exit 28\n";
+    std::fs::write(root.join("setup.sh"), setup)?;
+    std::fs::write(
+        root.join("gascan.toml"),
+        "version = 1\nnetwork = 'networked'\nsetup = 'setup.sh'\n[ssh]\nhost_port = 24305\n",
+    )?;
+    let make_spec = || SandboxSpec::from_root("retry-retained-ssh", root, Manifest::load(root)?);
+    let runtime = FakeRuntime::default();
+    let digest = format!("{:x}  /workspace/setup.sh\n", Sha256::digest(setup)).into_bytes();
+    runtime
+        .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (digest, Vec::new(), 0),
+            (Vec::new(), b"No space left on device".to_vec(), 28),
+        ])
+        .await;
+    let service = test_service(
+        runtime.clone(),
+        root,
+        ssh_paths(root, "ssh-retry-retained")?,
+    )?;
+
+    assert!(service.up(UpRequest::new(make_spec()?)).await.is_err());
+    let id = make_spec()?.id().clone();
+    let connection = rusqlite::Connection::open(&state_path)?;
+    let created_policy: (Option<i64>, Option<i64>) = connection.query_row(
+        "SELECT ssh_transport_enabled, ssh_transport_host_port FROM sandboxes WHERE id = ?1",
+        [id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(created_policy, (Some(1), Some(24_305)));
+
+    std::fs::write(
+        root.join("gascan.toml"),
+        "version = 1\nnetwork = 'networked'\nsetup = 'setup.sh'\n[ssh]\nenabled = false\n",
+    )?;
+    let operation = service.up(UpRequest::new(make_spec()?)).await?;
+    let events = service.store().operation_events(operation.id)?;
+    assert!(events.iter().any(|event| {
+        event.details.as_ref().is_some_and(|details| {
+            details["phase"] == "apply_required" && details["reason"] == "ssh_transport_changed"
+        })
+    }));
+    assert_eq!(
+        runtime
+            .inspect(&id)
+            .await?
+            .ok_or("retained runtime")?
+            .ports(),
+        [gascan_core::runtime::RuntimePort {
+            host_address: std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+            host_port: 24_305,
+            guest_port: 22,
+        }]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn retained_setup_failure_with_unchanged_ssh_retries_setup() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let setup = b"exit 28\n";
+    std::fs::write(root.join("setup.sh"), setup)?;
+    std::fs::write(
+        root.join("gascan.toml"),
+        "version = 1\nnetwork = 'networked'\nsetup = 'setup.sh'\n[ssh]\nhost_port = 24306\n",
+    )?;
+    let make_spec =
+        || SandboxSpec::from_root("retry-retained-same-ssh", root, Manifest::load(root)?);
+    let runtime = FakeRuntime::default();
+    let digest = format!("{:x}  /workspace/setup.sh\n", Sha256::digest(setup)).into_bytes();
+    runtime
+        .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (digest.clone(), Vec::new(), 0),
+            (Vec::new(), b"No space left on device".to_vec(), 28),
+        ])
+        .await;
+    let service = test_service(
+        runtime.clone(),
+        root,
+        ssh_paths(root, "ssh-retry-retained-same")?,
+    )?;
+
+    assert!(service.up(UpRequest::new(make_spec()?)).await.is_err());
+    let host_public_key = generated_public_key(root, "host-retry-retained-same").await?;
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    runtime
+        .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (digest, Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (format!("{host_public_key}\n").into_bytes(), Vec::new(), 0),
+        ])
+        .await;
+
+    let operation = service.up(UpRequest::new(make_spec()?)).await?;
+    let events = service.store().operation_events(operation.id)?;
+    assert!(events.iter().all(|event| {
+        event
+            .details
+            .as_ref()
+            .and_then(|details| details["phase"].as_str())
+            != Some("apply_required")
+    }));
+    let setup_runs = runtime
+        .calls()
+        .await
+        .into_iter()
+        .filter(|call| {
+            matches!(
+                call,
+                RuntimeCall::Exec(request)
+                    if request.argv.first().map(String::as_str) == Some("/bin/bash")
+            )
+        })
+        .count();
+    assert_eq!(setup_runs, 2);
+    assert!(
+        service
+            .status(make_spec()?.id())?
+            .ok_or("retried SSH record")?
+            .ssh_resolution
+            .is_some()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn create_failure_before_resources_does_not_persist_storage_resolution() -> TestResult {
     let root = tempfile::tempdir()?;
     let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
