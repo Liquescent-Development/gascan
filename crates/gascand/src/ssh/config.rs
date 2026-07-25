@@ -7,6 +7,7 @@ use super::{
 };
 use camino::{Utf8Path, Utf8PathBuf};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -378,18 +379,45 @@ fn verify_host_generation_record(
     host: &ManagedSshHost,
     normalized_host_key: &str,
 ) -> Result<(), SshError> {
+    const INVALID_CONTENTS: SshError =
+        SshError::InvalidState("managed known-hosts generation contents are invalid");
     let text = std::str::from_utf8(contents).map_err(|_| {
         SshError::InvalidState("managed known-hosts generation contents are invalid")
     })?;
-    let expected = format!(
-        "{},[127.0.0.1]:{} {}",
-        host.active.alias, host.active.port, normalized_host_key
-    );
-    let mut records = text.lines().filter(|line| {
-        line.split_once(',')
-            .is_some_and(|(alias, _)| alias == host.active.alias)
-    });
-    if records.next() != Some(expected.as_str()) || records.next().is_some() {
+    let mut aliases = HashSet::new();
+    let mut endpoints = HashSet::new();
+    let mut target_records = 0_u8;
+    for line in text.lines().filter(|line| !line.is_empty()) {
+        let mut fields = line.split_ascii_whitespace();
+        let (Some(host_pattern), Some(algorithm), Some(encoded), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(INVALID_CONTENTS);
+        };
+        let Some((alias, endpoint)) = host_pattern.split_once(',') else {
+            return Err(INVALID_CONTENTS);
+        };
+        validate_alias(alias)?;
+        let Some(port_text) = endpoint.strip_prefix("[127.0.0.1]:") else {
+            return Err(INVALID_CONTENTS);
+        };
+        let port = port_text.parse::<u16>().map_err(|_| INVALID_CONTENTS)?;
+        if port == 0 || port.to_string() != port_text {
+            return Err(INVALID_CONTENTS);
+        }
+        let parsed_key = parse_public_key(format!("{algorithm} {encoded}").as_bytes())?;
+        let canonical = format!("{alias},[127.0.0.1]:{port} {}", parsed_key.normalized);
+        if line != canonical || !aliases.insert(alias) || !endpoints.insert(port) {
+            return Err(INVALID_CONTENTS);
+        }
+        if alias == host.active.alias
+            && port == host.active.port
+            && parsed_key.normalized == normalized_host_key
+        {
+            target_records += 1;
+        }
+    }
+    if target_records != 1 {
         return Err(SshError::InvalidState(
             "managed known-hosts generation does not match endpoint",
         ));

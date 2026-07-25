@@ -41,6 +41,67 @@ fn configured_known_hosts(config: &str) -> Result<&str, Box<dyn std::error::Erro
         .ok_or_else(|| "generated config does not name known-hosts".into())
 }
 
+fn write_generation(
+    paths: &SshPaths,
+    contents: &str,
+) -> Result<camino::Utf8PathBuf, Box<dyn std::error::Error>> {
+    let digest = Sha256::digest(contents.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let path = paths.directory().join(format!("known_hosts.{digest}"));
+    fs::write(path.as_std_path(), contents)?;
+    fs::set_permissions(path.as_std_path(), fs::Permissions::from_mode(0o644))?;
+    Ok(path)
+}
+
+fn hashed_host_record(alias: &str, public_key: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+    let known_hosts = temp.path().join("known_hosts");
+    fs::write(&known_hosts, format!("{alias} {public_key}\n"))?;
+    let hashed = Command::new("/usr/bin/ssh-keygen")
+        .args(["-q", "-H", "-f"])
+        .arg(&known_hosts)
+        .output()?;
+    if !hashed.status.success() {
+        return Err("ssh-keygen could not hash the hostile known-host record".into());
+    }
+    let lookup = Command::new("/usr/bin/ssh-keygen")
+        .args(["-F", alias, "-f"])
+        .arg(&known_hosts)
+        .output()?;
+    if !lookup.status.success() {
+        return Err("hashed hostile known-host record does not match its alias".into());
+    }
+    let record = fs::read_to_string(known_hosts)?
+        .lines()
+        .next()
+        .ok_or("ssh-keygen produced an empty hashed known-host file")?
+        .to_owned();
+    if !record.starts_with("|1|") {
+        return Err("ssh-keygen did not produce a hashed known-host record".into());
+    }
+    Ok(record)
+}
+
+fn require_matching_host_record(
+    lookup: &str,
+    record: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+    let known_hosts = temp.path().join("known_hosts");
+    fs::write(&known_hosts, format!("{record}\n"))?;
+    let matched = Command::new("/usr/bin/ssh-keygen")
+        .args(["-F", lookup, "-f"])
+        .arg(&known_hosts)
+        .output()?;
+    let output = String::from_utf8(matched.stdout)?;
+    if !matched.status.success() || !output.lines().any(|line| line == record) {
+        return Err(format!("hostile known-host record did not match {lookup}").into());
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn publishes_stable_sorted_strict_openssh_files() -> TestResult {
     let temp = TempDir::new()?;
@@ -326,6 +387,196 @@ async fn readiness_rejects_a_valid_generation_with_the_wrong_host_key() -> TestR
             .await
             .is_err()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn readiness_rejects_a_plain_alias_record_with_another_key() -> TestResult {
+    let temp = TempDir::new()?;
+    let managed_paths = paths(&temp)?;
+    let identity = ensure_host_identity(&managed_paths).await?;
+    let ready = host("gascan-ready", 2222, &identity);
+    let other_temp = TempDir::new()?;
+    let other_identity = ensure_host_identity(&paths(&other_temp)?).await?;
+    let hostile = format!("gascan-ready {}", other_identity.public_key());
+    require_matching_host_record("gascan-ready", &hostile)?;
+    let generation = write_generation(
+        &managed_paths,
+        &format!(
+            "gascan-ready,[127.0.0.1]:2222 {}\n{hostile}\n",
+            ready.host_public_key
+        ),
+    )?;
+
+    assert!(
+        readiness_ssh_args(&managed_paths, &identity, &ready, &generation)
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn readiness_rejects_a_hashed_alias_record_with_another_key() -> TestResult {
+    let temp = TempDir::new()?;
+    let managed_paths = paths(&temp)?;
+    let identity = ensure_host_identity(&managed_paths).await?;
+    let ready = host("gascan-ready", 2222, &identity);
+    let other_temp = TempDir::new()?;
+    let other_identity = ensure_host_identity(&paths(&other_temp)?).await?;
+    let hostile = hashed_host_record("gascan-ready", other_identity.public_key())?;
+    let generation = write_generation(
+        &managed_paths,
+        &format!(
+            "gascan-ready,[127.0.0.1]:2222 {}\n{hostile}\n",
+            ready.host_public_key
+        ),
+    )?;
+
+    assert!(
+        readiness_ssh_args(&managed_paths, &identity, &ready, &generation)
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn readiness_rejects_a_wildcard_comma_host_pattern() -> TestResult {
+    let temp = TempDir::new()?;
+    let managed_paths = paths(&temp)?;
+    let identity = ensure_host_identity(&managed_paths).await?;
+    let ready = host("gascan-ready", 2222, &identity);
+    let other_temp = TempDir::new()?;
+    let other_identity = ensure_host_identity(&paths(&other_temp)?).await?;
+    let hostile = format!("gascan-other,gascan-* {}", other_identity.public_key());
+    require_matching_host_record("gascan-ready", &hostile)?;
+    let generation = write_generation(
+        &managed_paths,
+        &format!(
+            "gascan-ready,[127.0.0.1]:2222 {}\n{hostile}\n",
+            ready.host_public_key
+        ),
+    )?;
+
+    assert!(
+        readiness_ssh_args(&managed_paths, &identity, &ready, &generation)
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn readiness_rejects_a_duplicate_canonical_endpoint() -> TestResult {
+    let temp = TempDir::new()?;
+    let managed_paths = paths(&temp)?;
+    let identity = ensure_host_identity(&managed_paths).await?;
+    let ready = host("gascan-ready", 2222, &identity);
+    let other_temp = TempDir::new()?;
+    let other_identity = ensure_host_identity(&paths(&other_temp)?).await?;
+    let hostile = format!(
+        "gascan-other,[127.0.0.1]:2222 {}",
+        other_identity.public_key()
+    );
+    require_matching_host_record("[127.0.0.1]:2222", &hostile)?;
+    let generation = write_generation(
+        &managed_paths,
+        &format!(
+            "gascan-ready,[127.0.0.1]:2222 {}\n{hostile}\n",
+            ready.host_public_key
+        ),
+    )?;
+
+    assert!(
+        readiness_ssh_args(&managed_paths, &identity, &ready, &generation)
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn readiness_accepts_other_canonical_managed_records() -> TestResult {
+    let temp = TempDir::new()?;
+    let managed_paths = paths(&temp)?;
+    let identity = ensure_host_identity(&managed_paths).await?;
+    let ready = host("gascan-ready", 2222, &identity);
+    let other_temp = TempDir::new()?;
+    let other_identity = ensure_host_identity(&paths(&other_temp)?).await?;
+    let generation = write_generation(
+        &managed_paths,
+        &format!(
+            "gascan-ready,[127.0.0.1]:2222 {}\n\ngascan-other,[127.0.0.1]:2223 {}\n",
+            ready.host_public_key,
+            other_identity.public_key()
+        ),
+    )?;
+
+    readiness_ssh_args(&managed_paths, &identity, &ready, &generation).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn readiness_rejects_noncanonical_generation_grammar() -> TestResult {
+    let temp = TempDir::new()?;
+    let managed_paths = paths(&temp)?;
+    let identity = ensure_host_identity(&managed_paths).await?;
+    let ready = host("gascan-ready", 2222, &identity);
+    let other_temp = TempDir::new()?;
+    let other_identity = ensure_host_identity(&paths(&other_temp)?).await?;
+    let canonical = format!("gascan-ready,[127.0.0.1]:2222 {}\n", ready.host_public_key);
+    let cases = [
+        ("comment", "# trusted by somebody else\n".to_owned()),
+        (
+            "negated pattern",
+            format!("!gascan-ready {}\n", other_identity.public_key()),
+        ),
+        (
+            "malformed alias",
+            format!(
+                "gascan--other,[127.0.0.1]:2223 {}\n",
+                other_identity.public_key()
+            ),
+        ),
+        (
+            "malformed endpoint",
+            format!(
+                "gascan-other,[127.0.0.1]:02223 {}\n",
+                other_identity.public_key()
+            ),
+        ),
+        (
+            "non-loopback endpoint",
+            format!(
+                "gascan-other,[192.0.2.1]:2223 {}\n",
+                other_identity.public_key()
+            ),
+        ),
+        (
+            "invalid public key",
+            "gascan-other,[127.0.0.1]:2223 ssh-ed25519 AAAA\n".to_owned(),
+        ),
+        (
+            "duplicate alias",
+            format!(
+                "gascan-other,[127.0.0.1]:2223 {}\ngascan-other,[127.0.0.1]:2224 {}\n",
+                other_identity.public_key(),
+                other_identity.public_key()
+            ),
+        ),
+        ("duplicate target record", canonical.clone()),
+    ];
+
+    for (case, hostile) in cases {
+        let generation = write_generation(&managed_paths, &format!("{canonical}{hostile}"))?;
+        assert!(
+            readiness_ssh_args(&managed_paths, &identity, &ready, &generation)
+                .await
+                .is_err(),
+            "readiness accepted {case}"
+        );
+    }
     Ok(())
 }
 
