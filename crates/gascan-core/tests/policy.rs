@@ -173,6 +173,72 @@ fn ssh_control_plane_appends_one_loopback_native_port_after_application_ports() 
 }
 
 #[test]
+fn explicit_ssh_host_port_accepts_the_same_control_plane_port() {
+    let (_temp, spec) = spec("version = 1\nnetwork = 'networked'\n[ssh]\nhost_port = 2222\n");
+    let request = PolicyCompiler::compile_with_control_plane(
+        spec,
+        &capabilities(),
+        ControlPlanePolicy {
+            ssh_authorized_key: Some(SSH_PUBLIC_KEY),
+            ssh_host_port: Some(2222),
+        },
+    )
+    .expect("matching explicit SSH host port compiles");
+
+    assert_eq!(
+        request.ports(),
+        [gascan_core::runtime::RuntimePort {
+            host_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            host_port: 2222,
+            guest_port: 22,
+        }]
+    );
+}
+
+#[test]
+fn explicit_ssh_host_port_rejects_a_different_control_plane_port() {
+    let (_temp, spec) = spec("version = 1\nnetwork = 'networked'\n[ssh]\nhost_port = 2222\n");
+    let error = PolicyCompiler::compile_with_control_plane(
+        spec,
+        &capabilities(),
+        ControlPlanePolicy {
+            ssh_authorized_key: Some(SSH_PUBLIC_KEY),
+            ssh_host_port: Some(22222),
+        },
+    )
+    .expect_err("control plane must preserve an explicit manifest SSH port");
+
+    assert_eq!(error.code(), "ssh_host_port_mismatch");
+    assert_eq!(
+        error.to_string(),
+        "control-plane SSH host port 22222 does not match manifest SSH host port 2222"
+    );
+}
+
+#[test]
+fn omitted_ssh_host_port_accepts_an_automatic_control_plane_port() {
+    let (_temp, spec) = spec("version = 1\nnetwork = 'networked'\n");
+    let request = PolicyCompiler::compile_with_control_plane(
+        spec,
+        &capabilities(),
+        ControlPlanePolicy {
+            ssh_authorized_key: Some(SSH_PUBLIC_KEY),
+            ssh_host_port: Some(22222),
+        },
+    )
+    .expect("automatic SSH host port compiles");
+
+    assert_eq!(
+        request.ports(),
+        [gascan_core::runtime::RuntimePort {
+            host_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            host_port: 22222,
+            guest_port: 22,
+        }]
+    );
+}
+
+#[test]
 fn offline_and_disabled_ssh_policy_emit_no_key_or_native_port() {
     let (_temp_offline, offline) = spec("version = 1\nnetwork = 'offline'\n");
     let offline_request = PolicyCompiler::compile_with_control_plane(

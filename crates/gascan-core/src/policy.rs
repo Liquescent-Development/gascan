@@ -129,6 +129,14 @@ impl PolicyCompiler {
             if host_port < 1024 {
                 return Err(PolicyError::InvalidSshHostPort);
             }
+            if let Some(manifest_host_port) = manifest.ssh().host_port()
+                && manifest_host_port != host_port
+            {
+                return Err(PolicyError::SshHostPortMismatch {
+                    manifest: manifest_host_port,
+                    control_plane: host_port,
+                });
+            }
             Some(host_port)
         } else {
             None
@@ -397,6 +405,10 @@ pub enum PolicyError {
     MissingSshHostPort,
     #[error("SSH host port must be in 1024..=65535")]
     InvalidSshHostPort,
+    #[error(
+        "control-plane SSH host port {control_plane} does not match manifest SSH host port {manifest}"
+    )]
+    SshHostPortMismatch { manifest: u16, control_plane: u16 },
     #[error("sandbox must contain exactly the canonical writable /workspace mount")]
     InvalidMount,
     #[error("runtime cannot provide bind mounts")]
@@ -433,6 +445,7 @@ impl PolicyError {
             Self::MissingSshAuthorizedKey => "missing_ssh_authorized_key",
             Self::MissingSshHostPort => "missing_ssh_host_port",
             Self::InvalidSshHostPort => "invalid_ssh_host_port",
+            Self::SshHostPortMismatch { .. } => "ssh_host_port_mismatch",
             Self::InvalidMount => "invalid_mount",
             Self::BindMountsUnavailable => "bind_mounts_unavailable",
             Self::NamedVolumesUnavailable => "named_volumes_unavailable",
