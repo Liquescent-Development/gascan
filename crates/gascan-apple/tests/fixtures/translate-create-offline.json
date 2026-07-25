@@ -15,7 +15,7 @@
   "--volume",
   "gascan-config-$ID:/home/workspace/.config/gascan",
   "--env",
-  "GASCAN_SSH_ENABLED=1",
+  "GASCAN_SSH_ENABLED=0",
   "--env",
   "HOME=/home/workspace",
   "--env",

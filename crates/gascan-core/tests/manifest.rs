@@ -34,24 +34,44 @@ fn omitted_policy_uses_security_defaults() {
 }
 
 #[test]
-fn ssh_policy_defaults_to_enabled_without_a_host_port() {
-    let manifest = load("version = 1\n").expect("minimal manifest parses");
+fn ssh_policy_defaults_to_the_resolved_network_mode() {
+    for (source, expected_enabled) in [
+        ("version = 1\nnetwork = 'networked'\n", true),
+        ("version = 1\nnetwork = 'offline'\n", false),
+        (
+            "version = 1\nnetwork = 'networked'\n[ssh]\nenabled = false\n",
+            false,
+        ),
+        (
+            "version = 1\nnetwork = 'networked'\n[ssh]\nenabled = true\nhost_port = 2222\n",
+            true,
+        ),
+    ] {
+        let manifest = load(source).expect("valid SSH policy parses");
+        assert_eq!(
+            manifest.ssh().enabled(),
+            expected_enabled,
+            "resolved wrong SSH state for {source}"
+        );
+    }
 
-    assert_eq!(manifest.ssh(), &Ssh::default());
-    assert!(manifest.ssh().enabled());
-    assert_eq!(manifest.ssh().host_port(), None);
+    let offline = load("version = 1\nnetwork = 'offline'\n").expect("offline policy parses");
+    assert_eq!(offline.ssh(), &Ssh::default());
+    assert_eq!(offline.ssh().host_port(), None);
 }
 
 #[test]
-fn ssh_policy_accepts_an_explicit_high_host_port_and_disable() {
-    let configured = load("version = 1\n[ssh]\nenabled = true\nhost_port = 22222\n")
-        .expect("SSH high port is accepted");
-    assert!(configured.ssh().enabled());
-    assert_eq!(configured.ssh().host_port(), Some(22222));
+fn ssh_policy_rejects_explicit_enablement_while_offline() {
+    let error = load("version = 1\nnetwork = 'offline'\n[ssh]\nenabled = true\n")
+        .expect_err("offline SSH must fail closed");
 
-    let disabled = load("version = 1\n[ssh]\nenabled = false\n").expect("SSH can be disabled");
-    assert!(!disabled.ssh().enabled());
-    assert_eq!(disabled.ssh().host_port(), None);
+    match error {
+        gascan_core::manifest::ManifestError::Invalid(message) => assert_eq!(
+            message,
+            "ssh requires network = \"networked\"; disable SSH or enable sandbox networking"
+        ),
+        other => panic!("expected invalid SSH/network policy, got {other}"),
+    }
 }
 
 #[test]

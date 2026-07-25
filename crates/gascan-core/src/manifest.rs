@@ -132,19 +132,10 @@ impl Manifest {
 /// Validated SSH policy loaded as part of a [`Manifest`].
 ///
 /// SSH host ports cannot be constructed independently of manifest validation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct Ssh {
     enabled: bool,
     host_port: Option<u16>,
-}
-
-impl Default for Ssh {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            host_port: None,
-        }
-    }
 }
 
 impl Ssh {
@@ -419,25 +410,11 @@ struct RawManifest {
     ssh: RawSsh,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawSsh {
-    #[serde(default = "default_ssh_enabled")]
-    enabled: bool,
+    enabled: Option<bool>,
     host_port: Option<u16>,
-}
-
-impl Default for RawSsh {
-    fn default() -> Self {
-        Self {
-            enabled: default_ssh_enabled(),
-            host_port: None,
-        }
-    }
-}
-
-const fn default_ssh_enabled() -> bool {
-    true
 }
 
 impl RawManifest {
@@ -452,7 +429,17 @@ impl RawManifest {
                 "resources.cpus must be greater than zero".to_owned(),
             ));
         }
-        if !self.ssh.enabled && self.ssh.host_port.is_some() {
+        if self.network == NetworkMode::Offline && self.ssh.enabled == Some(true) {
+            return Err(ManifestError::Invalid(
+                "ssh requires network = \"networked\"; disable SSH or enable sandbox networking"
+                    .to_owned(),
+            ));
+        }
+        let ssh_enabled = self
+            .ssh
+            .enabled
+            .unwrap_or(self.network == NetworkMode::Networked);
+        if !ssh_enabled && self.ssh.host_port.is_some() {
             return Err(ManifestError::Invalid(
                 "ssh.host_port cannot be set when ssh.enabled is false".to_owned(),
             ));
@@ -517,7 +504,7 @@ impl RawManifest {
             tools: self.tools,
             ports: self.ports,
             ssh: Ssh {
-                enabled: self.ssh.enabled,
+                enabled: ssh_enabled,
                 host_port: self.ssh.host_port,
             },
             canonical_root: canonical_root.to_owned(),

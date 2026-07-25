@@ -32,6 +32,7 @@ pub const CONTAINER_PATH: &str = "/home/workspace/.local/share/mise/shims:/opt/g
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ControlPlanePolicy<'a> {
     pub ssh_authorized_key: Option<&'a str>,
+    pub ssh_host_port: Option<u16>,
 }
 
 pub struct PolicyCompiler;
@@ -75,12 +76,7 @@ impl PolicyCompiler {
         capabilities: &RuntimeCapabilities,
         workspace_image: &str,
     ) -> Result<CreateRequest, PolicyError> {
-        Self::compile_for_image_with_control_plane(
-            spec,
-            capabilities,
-            workspace_image,
-            ControlPlanePolicy::default(),
-        )
+        Self::compile_for_image_internal(spec, capabilities, workspace_image, None)
     }
 
     pub fn compile_with_control_plane(
@@ -102,21 +98,42 @@ impl PolicyCompiler {
         workspace_image: &str,
         control: ControlPlanePolicy<'_>,
     ) -> Result<CreateRequest, PolicyError> {
+        Self::compile_for_image_internal(spec, capabilities, workspace_image, Some(control))
+    }
+
+    fn compile_for_image_internal(
+        spec: SandboxSpec,
+        capabilities: &RuntimeCapabilities,
+        workspace_image: &str,
+        control: Option<ControlPlanePolicy<'_>>,
+    ) -> Result<CreateRequest, PolicyError> {
         if !immutable_image_reference(workspace_image) {
             return Err(PolicyError::InvalidWorkspaceImage);
         }
         validate_spec(&spec)?;
-        validate_capabilities(&spec, capabilities)?;
 
         let manifest = spec.manifest();
-        if manifest.ssh().enabled()
-            && control
+        let ssh_enabled = manifest.ssh().enabled() && control.is_some();
+        validate_capabilities(&spec, capabilities, ssh_enabled)?;
+        let control = control.unwrap_or_default();
+        let ssh_host_port = if ssh_enabled {
+            let authorized_key = control
                 .ssh_authorized_key
-                .is_some_and(|key| !is_ssh_public_key(key))
-        {
-            return Err(PolicyError::InvalidSshAuthorizedKey);
-        }
-        let ports = compile_ports(manifest.network(), manifest.ports())?;
+                .ok_or(PolicyError::MissingSshAuthorizedKey)?;
+            if !is_ssh_public_key(authorized_key) {
+                return Err(PolicyError::InvalidSshAuthorizedKey);
+            }
+            let host_port = control
+                .ssh_host_port
+                .ok_or(PolicyError::MissingSshHostPort)?;
+            if host_port < 1024 {
+                return Err(PolicyError::InvalidSshHostPort);
+            }
+            Some(host_port)
+        } else {
+            None
+        };
+        let ports = compile_ports(manifest.network(), manifest.ports(), ssh_host_port)?;
         let resources = compile_resources(manifest.resources())?;
         let ownership = OwnershipMetadata {
             managed_by: MANAGED_BY.to_owned(),
@@ -149,7 +166,7 @@ impl PolicyCompiler {
             bind_mounts,
             volumes,
             ports,
-            environment: guest_environment(manifest.ssh().enabled(), control),
+            environment: guest_environment(ssh_enabled, control),
             resources,
             network,
             user,
@@ -257,6 +274,7 @@ fn validate_spec(spec: &SandboxSpec) -> Result<(), PolicyError> {
 fn validate_capabilities(
     spec: &SandboxSpec,
     capabilities: &RuntimeCapabilities,
+    ssh_enabled: bool,
 ) -> Result<(), PolicyError> {
     if !capabilities.bind_mounts {
         return Err(PolicyError::BindMountsUnavailable);
@@ -267,7 +285,7 @@ fn validate_capabilities(
     if !capabilities.resource_limits {
         return Err(PolicyError::ResourceLimitsUnavailable);
     }
-    if !spec.manifest().ports().is_empty() && !capabilities.loopback_publish {
+    if (!spec.manifest().ports().is_empty() || ssh_enabled) && !capabilities.loopback_publish {
         return Err(PolicyError::LoopbackPublishUnavailable);
     }
     if spec.manifest().network() == NetworkMode::Offline
@@ -281,12 +299,13 @@ fn validate_capabilities(
 fn compile_ports(
     network: NetworkMode,
     declared: &BTreeMap<String, u16>,
+    ssh_host_port: Option<u16>,
 ) -> Result<Vec<RuntimePort>, PolicyError> {
     if network == NetworkMode::Offline && !declared.is_empty() {
         return Err(PolicyError::OfflinePortsForbidden);
     }
     let mut seen = BTreeSet::new();
-    declared
+    let mut ports = declared
         .values()
         .map(|port| {
             if *port == 0 {
@@ -301,7 +320,18 @@ fn compile_ports(
                 guest_port: *port,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(host_port) = ssh_host_port {
+        if !seen.insert(host_port) {
+            return Err(PolicyError::DuplicatePort(host_port));
+        }
+        ports.push(RuntimePort {
+            host_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            host_port,
+            guest_port: 22,
+        });
+    }
+    Ok(ports)
 }
 
 fn compile_resources(
@@ -361,6 +391,12 @@ pub enum PolicyError {
     InvalidWorkspaceImage,
     #[error("SSH authorized key must be an OpenSSH public key")]
     InvalidSshAuthorizedKey,
+    #[error("enabled SSH requires an authorized public key")]
+    MissingSshAuthorizedKey,
+    #[error("enabled SSH requires a host port")]
+    MissingSshHostPort,
+    #[error("SSH host port must be in 1024..=65535")]
+    InvalidSshHostPort,
     #[error("sandbox must contain exactly the canonical writable /workspace mount")]
     InvalidMount,
     #[error("runtime cannot provide bind mounts")]
@@ -394,6 +430,9 @@ impl PolicyError {
         match self {
             Self::InvalidWorkspaceImage => "invalid_workspace_image",
             Self::InvalidSshAuthorizedKey => "invalid_ssh_authorized_key",
+            Self::MissingSshAuthorizedKey => "missing_ssh_authorized_key",
+            Self::MissingSshHostPort => "missing_ssh_host_port",
+            Self::InvalidSshHostPort => "invalid_ssh_host_port",
             Self::InvalidMount => "invalid_mount",
             Self::BindMountsUnavailable => "bind_mounts_unavailable",
             Self::NamedVolumesUnavailable => "named_volumes_unavailable",

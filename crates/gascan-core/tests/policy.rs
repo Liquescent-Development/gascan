@@ -13,6 +13,9 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
 
+const SSH_PUBLIC_KEY: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB";
+
 fn capabilities() -> RuntimeCapabilities {
     RuntimeCapabilities {
         version: RuntimeVersion::new(1, 0, 0),
@@ -117,29 +120,42 @@ fn host_environment_has_a_fixed_allowlist() {
 }
 
 #[test]
-fn ssh_control_plane_seals_only_the_public_key_without_publishing_a_runtime_port() {
-    let public_key =
-        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB";
+fn ssh_control_plane_appends_one_loopback_native_port_after_application_ports() {
     let private_key = "-----BEGIN OPENSSH PRIVATE KEY-----";
-    let (_temp, spec) = spec("version = 1\nnetwork = 'networked'\n[ssh]\nhost_port = 22222\n");
+    let (_temp, spec) = spec("version = 1\nnetwork = 'networked'\n[ports]\nweb = 3000\n");
     let host_path = spec.canonical_root().as_str().to_owned();
 
     let request = PolicyCompiler::compile_with_control_plane(
         spec,
         &capabilities(),
         ControlPlanePolicy {
-            ssh_authorized_key: Some(public_key),
+            ssh_authorized_key: Some(SSH_PUBLIC_KEY),
+            ssh_host_port: Some(22222),
         },
     )
     .expect("compile SSH control-plane policy");
 
-    assert!(request.ports().is_empty(), "SSH is not an application port");
+    assert_eq!(
+        request.ports(),
+        [
+            gascan_core::runtime::RuntimePort {
+                host_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                host_port: 3000,
+                guest_port: 3000,
+            },
+            gascan_core::runtime::RuntimePort {
+                host_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                host_port: 22222,
+                guest_port: 22,
+            },
+        ]
+    );
     assert_eq!(
         request
             .environment()
             .get("GASCAN_SSH_AUTHORIZED_KEY")
             .map(String::as_str),
-        Some(public_key)
+        Some(SSH_PUBLIC_KEY)
     );
     assert_eq!(
         request
@@ -157,15 +173,14 @@ fn ssh_control_plane_seals_only_the_public_key_without_publishing_a_runtime_port
 }
 
 #[test]
-fn offline_and_disabled_ssh_policy_never_publish_ssh_and_only_toggle_guest_enablement() {
-    let public_key =
-        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB";
+fn offline_and_disabled_ssh_policy_emit_no_key_or_native_port() {
     let (_temp_offline, offline) = spec("version = 1\nnetwork = 'offline'\n");
     let offline_request = PolicyCompiler::compile_with_control_plane(
         offline,
         &capabilities(),
         ControlPlanePolicy {
-            ssh_authorized_key: Some(public_key),
+            ssh_authorized_key: Some(SSH_PUBLIC_KEY),
+            ssh_host_port: Some(22222),
         },
     )
     .expect("offline SSH control policy compiles without a runtime port");
@@ -173,24 +188,24 @@ fn offline_and_disabled_ssh_policy_never_publish_ssh_and_only_toggle_guest_enabl
     assert_eq!(
         offline_request
             .environment()
-            .get("GASCAN_SSH_AUTHORIZED_KEY")
-            .map(String::as_str),
-        Some(public_key)
-    );
-    assert_eq!(
-        offline_request
-            .environment()
             .get("GASCAN_SSH_ENABLED")
             .map(String::as_str),
-        Some("1")
+        Some("0")
+    );
+    assert!(
+        !offline_request
+            .environment()
+            .contains_key("GASCAN_SSH_AUTHORIZED_KEY")
     );
 
-    let (_temp_disabled, disabled) = spec("version = 1\n[ssh]\nenabled = false\n");
+    let (_temp_disabled, disabled) =
+        spec("version = 1\nnetwork = 'networked'\n[ssh]\nenabled = false\n");
     let disabled_request = PolicyCompiler::compile_with_control_plane(
         disabled,
         &capabilities(),
         ControlPlanePolicy {
-            ssh_authorized_key: Some(public_key),
+            ssh_authorized_key: Some(SSH_PUBLIC_KEY),
+            ssh_host_port: Some(22222),
         },
     )
     .expect("disabled SSH control policy compiles");
@@ -210,13 +225,104 @@ fn offline_and_disabled_ssh_policy_never_publish_ssh_and_only_toggle_guest_enabl
 }
 
 #[test]
+fn enabled_ssh_control_plane_requires_both_key_and_host_port() {
+    for (control, expected_code) in [
+        (
+            ControlPlanePolicy {
+                ssh_authorized_key: Some(SSH_PUBLIC_KEY),
+                ssh_host_port: None,
+            },
+            "missing_ssh_host_port",
+        ),
+        (
+            ControlPlanePolicy {
+                ssh_authorized_key: None,
+                ssh_host_port: Some(22222),
+            },
+            "missing_ssh_authorized_key",
+        ),
+    ] {
+        let (_temp, spec) = spec("version = 1\nnetwork = 'networked'\n");
+        let error = PolicyCompiler::compile_with_control_plane(spec, &capabilities(), control)
+            .expect_err("enabled SSH requires complete control-plane inputs");
+        assert_eq!(error.code(), expected_code);
+    }
+}
+
+#[test]
+fn legacy_compilers_leave_default_networked_ssh_disabled() {
+    let (_temp, compile_spec) = spec("version = 1\nnetwork = 'networked'\n");
+    let (_temp_image, image_spec) = spec("version = 1\nnetwork = 'networked'\n");
+    let requests = [
+        PolicyCompiler::compile(compile_spec, &capabilities()).expect("legacy compile"),
+        PolicyCompiler::compile_for_image(
+            image_spec,
+            &capabilities(),
+            PolicyCompiler::workspace_image(),
+        )
+        .expect("legacy compile for image"),
+    ];
+
+    for request in requests {
+        assert!(request.ports().is_empty());
+        assert_eq!(
+            request
+                .environment()
+                .get("GASCAN_SSH_ENABLED")
+                .map(String::as_str),
+            Some("0")
+        );
+        assert!(
+            !request
+                .environment()
+                .contains_key("GASCAN_SSH_AUTHORIZED_KEY")
+        );
+    }
+}
+
+#[test]
+fn ssh_host_port_cannot_collide_with_an_application_port() {
+    let (_temp, spec) = spec("version = 1\nnetwork = 'networked'\n[ports]\nweb = 22222\n");
+    let error = PolicyCompiler::compile_with_control_plane(
+        spec,
+        &capabilities(),
+        ControlPlanePolicy {
+            ssh_authorized_key: Some(SSH_PUBLIC_KEY),
+            ssh_host_port: Some(22222),
+        },
+    )
+    .expect_err("SSH must not reuse an application host port");
+
+    assert_eq!(error.code(), "duplicate_port");
+}
+
+#[test]
+fn ssh_control_plane_rejects_zero_and_privileged_host_ports() {
+    for host_port in [0, 1023] {
+        let (_temp, spec) = spec("version = 1\nnetwork = 'networked'\n");
+        let error = PolicyCompiler::compile_with_control_plane(
+            spec,
+            &capabilities(),
+            ControlPlanePolicy {
+                ssh_authorized_key: Some(SSH_PUBLIC_KEY),
+                ssh_host_port: Some(host_port),
+            },
+        )
+        .expect_err("SSH control-plane ports must be unprivileged");
+
+        assert_eq!(error.code(), "invalid_ssh_host_port");
+    }
+}
+
+#[test]
 fn ssh_control_plane_rejects_private_key_material() {
-    let (_temp, spec) = spec("version = 1\n");
+    let (_temp, spec) = spec("version = 1\nnetwork = 'networked'\n");
     let error = PolicyCompiler::compile_with_control_plane(
         spec,
         &capabilities(),
         ControlPlanePolicy {
             ssh_authorized_key: Some("-----BEGIN OPENSSH PRIVATE KEY-----"),
+            ssh_host_port: Some(22222),
         },
     )
     .expect_err("private key material must never enter the guest environment");
@@ -226,7 +332,7 @@ fn ssh_control_plane_rejects_private_key_material() {
 
 #[test]
 fn ssh_control_plane_rejects_private_material_after_a_public_key_record() {
-    let (_temp, spec) = spec("version = 1\n");
+    let (_temp, spec) = spec("version = 1\nnetwork = 'networked'\n");
     let error = PolicyCompiler::compile_with_control_plane(
         spec,
         &capabilities(),
@@ -234,6 +340,7 @@ fn ssh_control_plane_rejects_private_material_after_a_public_key_record() {
             ssh_authorized_key: Some(
                 "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB\n-----BEGIN OPENSSH PRIVATE KEY-----",
             ),
+            ssh_host_port: Some(22222),
         },
     )
     .expect_err("private key material following a public key record must be rejected");
@@ -243,12 +350,13 @@ fn ssh_control_plane_rejects_private_material_after_a_public_key_record() {
 
 #[test]
 fn ssh_control_plane_rejects_a_private_key_blob_disguised_as_ed25519() {
-    let (_temp, spec) = spec("version = 1\n");
+    let (_temp, spec) = spec("version = 1\nnetwork = 'networked'\n");
     let error = PolicyCompiler::compile_with_control_plane(
         spec,
         &capabilities(),
         ControlPlanePolicy {
             ssh_authorized_key: Some("ssh-ed25519 b3BlbnNzaC1rZXktdjEAAAA="),
+            ssh_host_port: Some(22222),
         },
     )
     .expect_err("an OpenSSH private-key blob is not an authorized public key");
@@ -316,7 +424,7 @@ fn canonical_request_has_one_root_mount_owned_volumes_loopback_ports_and_init() 
     assert_eq!(
         request.environment(),
         &BTreeMap::from([
-            ("GASCAN_SSH_ENABLED".to_owned(), "1".to_owned()),
+            ("GASCAN_SSH_ENABLED".to_owned(), "0".to_owned()),
             ("HOME".to_owned(), "/home/workspace".to_owned()),
             (
                 "MISE_CACHE_DIR".to_owned(),

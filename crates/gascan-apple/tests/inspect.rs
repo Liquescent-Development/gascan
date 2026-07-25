@@ -2,9 +2,10 @@ use std::{collections::VecDeque, sync::Mutex};
 
 use gascan_apple::{AppleInspector, CommandOutput, CommandRunner, CommandSpec};
 use gascan_core::{
-    runtime::{ContainerState, ResourceOwnership, RuntimeError},
+    runtime::{ContainerState, ResourceOwnership, RuntimeError, RuntimePort},
     sandbox::SandboxId,
 };
+use std::net::{IpAddr, Ipv4Addr};
 
 struct FixtureRunner(Mutex<VecDeque<Result<CommandOutput, RuntimeError>>>);
 
@@ -55,8 +56,53 @@ async fn inspect_maps_running_and_stopped_fixtures() {
              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
         assert_eq!(actual.state, expected);
+        if expected == ContainerState::Running {
+            assert_eq!(
+                actual.ports(),
+                [RuntimePort {
+                    host_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    host_port: 22222,
+                    guest_port: 22,
+                }]
+            );
+        } else {
+            assert!(actual.ports().is_empty());
+        }
         assert_eq!(actual.ownership.managed_by, "gascan");
         assert_eq!(actual.ownership.sandbox_id, id());
+    }
+}
+
+fn inspect_record(published_ports: &str) -> Vec<u8> {
+    format!(
+        r#"[{{"configuration":{{"id":"code-a1b2c3d4e5f6","image":"ghcr.io/liquescent-development/gascan/workspace:fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","labels":{{"dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":"code-a1b2c3d4e5f6"}},"publishedPorts":{published_ports}}},"status":{{"state":"running"}}}}]"#
+    )
+    .into_bytes()
+}
+
+#[tokio::test]
+async fn inspect_rejects_untrusted_published_port_shapes_and_values() {
+    for published_ports in [
+        r#"[{"hostAddress":"127.0.0.1","hostPort":22222,"containerPort":22,"protocol":"udp"}]"#,
+        r#"[{"hostAddress":"0.0.0.0","hostPort":22222,"containerPort":22,"protocol":"tcp"}]"#,
+        r#"[{"hostAddress":"192.0.2.1","hostPort":22222,"containerPort":22,"protocol":"tcp"}]"#,
+        r#"[{"hostAddress":"::1","hostPort":22222,"containerPort":22,"protocol":"tcp"}]"#,
+        r#"[{"hostAddress":"127.0.0.1","hostPort":0,"containerPort":22,"protocol":"tcp"}]"#,
+        r#"[{"hostAddress":"127.0.0.1","hostPort":22222,"containerPort":0,"protocol":"tcp"}]"#,
+        r#"[{"hostAddress":"127.0.0.1","hostPort":"22222","containerPort":22,"protocol":"tcp"}]"#,
+        r#"[{"hostAddress":"127.0.0.1","hostPort":65536,"containerPort":22,"protocol":"tcp"}]"#,
+        r#"[{"hostAddress":"127.0.0.1","hostPort":22222,"containerPort":22,"protocol":"tcp"},{"hostAddress":"127.0.0.1","hostPort":22222,"containerPort":22,"protocol":"tcp"}]"#,
+    ] {
+        let response = inspect_record(published_ports);
+        let error = inspector(output(&response))
+            .inspect(&id())
+            .await
+            .expect_err("untrusted published port must fail closed");
+        assert_eq!(
+            error.code(),
+            "invalid_output",
+            "published ports: {published_ports}"
+        );
     }
 }
 

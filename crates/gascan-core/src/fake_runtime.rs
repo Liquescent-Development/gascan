@@ -189,6 +189,7 @@ impl FakeRuntime {
                 image: FAKE_WORKSPACE_IMAGE.to_owned(),
                 state: ContainerState::Stopped,
                 ownership,
+                ports: Vec::new(),
             },
         );
         insert_container_resource(&mut state, id, ResourceOwnership::Foreign);
@@ -257,6 +258,7 @@ impl FakeRuntime {
                 image: FAKE_WORKSPACE_IMAGE.to_owned(),
                 state: ContainerState::Stopped,
                 ownership,
+                ports: Vec::new(),
             },
         );
         insert_container_resource(&mut state, id, ResourceOwnership::GasCanOwned);
@@ -275,6 +277,7 @@ impl FakeRuntime {
                 image: FAKE_WORKSPACE_IMAGE.to_owned(),
                 state: ContainerState::Stopped,
                 ownership,
+                ports: Vec::new(),
             },
         );
         insert_container_resource(&mut state, id, ResourceOwnership::Mismatched);
@@ -632,6 +635,7 @@ impl RuntimeBackend for FakeRuntime {
                 image: request.image.clone(),
                 state: ContainerState::Stopped,
                 ownership: request.ownership.clone(),
+                ports: request.ports.clone(),
             },
         );
         let identity = ResourceIdentity::new(ResourceKind::Container, request.id.to_string())
@@ -707,6 +711,7 @@ impl RuntimeBackend for FakeRuntime {
                 image: create.image().to_owned(),
                 state: ContainerState::Stopped,
                 ownership: create.ownership().clone(),
+                ports: create.ports().to_vec(),
             },
         );
         let identity = ResourceIdentity::new(ResourceKind::Container, create.id().to_string())

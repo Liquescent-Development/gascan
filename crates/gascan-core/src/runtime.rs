@@ -256,6 +256,30 @@ pub struct RuntimeSandbox {
     pub image: String,
     pub state: ContainerState,
     pub ownership: OwnershipMetadata,
+    #[serde(default)]
+    pub(crate) ports: Vec<RuntimePort>,
+}
+
+impl RuntimeSandbox {
+    pub fn observed(
+        id: SandboxId,
+        image: String,
+        state: ContainerState,
+        ownership: OwnershipMetadata,
+        ports: Vec<RuntimePort>,
+    ) -> Self {
+        Self {
+            id,
+            image,
+            state,
+            ownership,
+            ports,
+        }
+    }
+
+    pub fn ports(&self) -> &[RuntimePort] {
+        &self.ports
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
