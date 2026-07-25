@@ -31,6 +31,11 @@
 - JSON and noninteractive commands never prompt or mutate `~/.ssh/config`.
 - All subprocess arguments are discrete strings; no shell command construction.
 - The custom `SshBridge`, exec-to-`nc` transport, listener registry, and offline SSH acceptance do not exist.
+- Until Task 3 switches the daemon to the control-plane compiler, legacy
+  `PolicyCompiler::compile` and `compile_for_image` calls without SSH control
+  input emit `GASCAN_SSH_ENABLED=0` and no SSH port. Only the
+  `*_with_control_plane` APIs materialize enabled SSH. This transition keeps
+  every intermediate commit testable and is not used by the final daemon.
 
 ---
 
@@ -130,6 +135,8 @@ Prove:
 
 - a disabled/offline request emits `GASCAN_SSH_ENABLED=0`, no authorized key, and no SSH port;
 - an enabled request requires both an authorized key and host port;
+- legacy compiler calls without control-plane input remain SSH-disabled until
+  Task 3 replaces the daemon call site;
 - user application ports remain unchanged and cannot claim the selected SSH host port;
 - Apple translation emits `--publish 127.0.0.1:22222:22`;
 - non-loopback SSH ports remain impossible.
@@ -633,20 +640,19 @@ rtk git add crates/gascan-core/src/doctor.rs crates/gascand/src/main.rs \
 rtk git commit -m "feat: verify native sandbox SSH"
 ```
 
-- [ ] **Step 7: Finish the branch**
+## Post-Plan Delivery
 
-Run a whole-branch review from the branch merge base through Task 5. Resolve all Critical/Important findings. Push the branch, create the pull request, wait for required checks, and squash-merge after approval. Synchronize local `main` with `origin/main`.
+These actions occur only after all five task reviews and the required
+whole-branch review pass:
 
-- [ ] **Step 8: Version and release**
-
-Use the repository release driver without bypassing its preflight:
-
-1. Bump the current released version from `0.1.7` to `0.1.8`.
-2. Run the version-bump phase.
-3. Commit and push the version bump if the driver does not do so.
-4. Run release preflight.
-5. Create the new immutable tag.
-6. Run publish and GitHub-release phases.
-7. Verify the release artifacts and GitHub release reference the merged commit and approved image.
+1. Push the branch and create the pull request.
+2. Wait for required checks and squash-merge after approval.
+3. Synchronize local `main` with `origin/main`.
+4. Use the repository release driver to bump `0.1.7` to `0.1.8`.
+5. Run release preflight without bypasses.
+6. Create the new immutable tag.
+7. Run publish and GitHub-release phases.
+8. Verify release artifacts and the GitHub release reference the merged commit
+   and approved image.
 
 Do not delete, move, or overwrite an existing tag.
