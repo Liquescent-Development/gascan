@@ -1,4 +1,6 @@
-use super::identity::{HostIdentity, open_revalidated_identity, parse_public_key};
+use super::identity::{
+    HostIdentity, open_revalidated_identity, open_revalidated_identity_async, parse_public_key,
+};
 use super::{
     ManagedSshHost, PUBLIC_MODE, SshError, SshPaths, StateDirectory, maximum_managed_file_bytes,
     random_staging_name,
@@ -83,18 +85,28 @@ where
     )
 }
 
-pub fn readiness_ssh_args(
+pub async fn readiness_ssh_args(
     paths: &SshPaths,
     identity: &HostIdentity,
     host: &ManagedSshHost,
     generation_known_hosts: &Utf8Path,
 ) -> Result<Vec<OsString>, SshError> {
     validate_identity_metadata(paths, identity)?;
-    validate_host(identity, host)?;
+    let normalized_host_key = validate_host(identity, host)?;
     validate_generation_path(paths, generation_known_hosts)?;
+    let directory = open_revalidated_identity_async(paths, identity).await?;
+    let generation = generation_known_hosts
+        .file_name()
+        .ok_or(SshError::InvalidState(
+            "managed known-hosts generation is invalid",
+        ))?;
+    let contents = read_verified_generation(&directory, generation)?;
+    verify_host_generation_record(&contents, host, &normalized_host_key)?;
     let identity_path = openssh_path(identity.private_key())?;
     let known_hosts_path = openssh_path(generation_known_hosts)?;
     Ok(vec![
+        OsString::from("-F"),
+        OsString::from("/dev/null"),
         OsString::from("-o"),
         OsString::from("HostName=127.0.0.1"),
         OsString::from("-o"),
@@ -344,11 +356,42 @@ fn ensure_generation(
 }
 
 fn verify_generation(directory: &StateDirectory, generation: &str) -> Result<(), SshError> {
+    read_verified_generation(directory, generation).map(|_| ())
+}
+
+fn read_verified_generation(
+    directory: &StateDirectory,
+    generation: &str,
+) -> Result<Vec<u8>, SshError> {
     let (contents, _) =
         directory.read_file(generation, PUBLIC_MODE, maximum_managed_file_bytes())?;
     if generation_name(&contents) != generation {
         return Err(SshError::InvalidState(
             "managed known-hosts generation failed verification",
+        ));
+    }
+    Ok(contents)
+}
+
+fn verify_host_generation_record(
+    contents: &[u8],
+    host: &ManagedSshHost,
+    normalized_host_key: &str,
+) -> Result<(), SshError> {
+    let text = std::str::from_utf8(contents).map_err(|_| {
+        SshError::InvalidState("managed known-hosts generation contents are invalid")
+    })?;
+    let expected = format!(
+        "{},[127.0.0.1]:{} {}",
+        host.active.alias, host.active.port, normalized_host_key
+    );
+    let mut records = text.lines().filter(|line| {
+        line.split_once(',')
+            .is_some_and(|(alias, _)| alias == host.active.alias)
+    });
+    if records.next() != Some(expected.as_str()) || records.next().is_some() {
+        return Err(SshError::InvalidState(
+            "managed known-hosts generation does not match endpoint",
         ));
     }
     Ok(())

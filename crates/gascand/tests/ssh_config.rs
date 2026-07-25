@@ -145,9 +145,12 @@ async fn readiness_args_are_discrete_and_do_not_weaken_reusable_config() -> Test
     assert!(generation_known_hosts.exists());
     assert!(!paths.config().exists());
 
+    let args = readiness_ssh_args(&paths, &identity, &ready, &generation_known_hosts).await?;
     assert_eq!(
-        readiness_ssh_args(&paths, &identity, &ready, &generation_known_hosts)?,
+        args,
         vec![
+            OsString::from("-F"),
+            OsString::from("/dev/null"),
             OsString::from("-o"),
             OsString::from("HostName=127.0.0.1"),
             OsString::from("-o"),
@@ -174,7 +177,191 @@ async fn readiness_args_are_discrete_and_do_not_weaken_reusable_config() -> Test
             OsString::from("/usr/bin/true"),
         ]
     );
+
+    let hostile_home = root(&temp)?.join("hostile-home");
+    let hostile_ssh = hostile_home.join(".ssh");
+    fs::create_dir_all(&hostile_ssh)?;
+    let hostile_identity = hostile_home.join("hostile-identity");
+    fs::write(&hostile_identity, b"hostile")?;
+    let included = hostile_home.join("system-like.conf");
+    fs::write(
+        &included,
+        format!(
+            "Host *\n    ProxyCommand /usr/bin/false hostile-proxy\n    ProxyJump hostile.invalid\n    ControlMaster yes\n    PermitLocalCommand yes\n    LocalCommand /usr/bin/false hostile-local\n    IdentityFile {}\n",
+            hostile_identity.display()
+        ),
+    )?;
+    let hostile_config = hostile_ssh.join("config");
+    fs::write(
+        &hostile_config,
+        format!("Host *\n    Include {}\n", included.display()),
+    )?;
+    let mut control_args = args.clone();
+    control_args[1] = hostile_config.clone().into_os_string();
+    let control = Command::new("/usr/bin/ssh")
+        .arg("-G")
+        .args(&control_args)
+        .env_clear()
+        .output()?;
+    assert!(control.status.success());
+    let control = String::from_utf8(control.stdout)?;
+    let expanded = Command::new("/usr/bin/ssh")
+        .arg("-G")
+        .args(&args)
+        .env_clear()
+        .env("HOME", &hostile_home)
+        .output()?;
+    assert!(expanded.status.success());
+    let expanded = String::from_utf8(expanded.stdout)?;
+    let hostile_identity = hostile_identity
+        .to_str()
+        .ok_or("hostile path is not UTF-8")?;
+    for hostile in ["hostile-proxy", "hostile-local", hostile_identity] {
+        assert!(
+            control.contains(hostile),
+            "hostile SSH control config was not observed: {hostile}"
+        );
+    }
+    for hostile in [
+        "hostile-proxy",
+        "hostile.invalid",
+        "hostile-local",
+        hostile_identity,
+    ] {
+        assert!(
+            !expanded.contains(hostile),
+            "ambient SSH config affected readiness: {hostile}"
+        );
+    }
     assert!(!paths.config().exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn readiness_revalidates_the_managed_identity_pair() -> TestResult {
+    let managed_temp = TempDir::new()?;
+    let managed_paths = paths(&managed_temp)?;
+    let stale_identity = ensure_host_identity(&managed_paths).await?;
+    let ready = host("gascan-ready", 2222, &stale_identity);
+    let prepared = prepare_openssh_files(
+        &managed_paths,
+        &stale_identity,
+        std::slice::from_ref(&ready),
+    )?;
+    let generation_known_hosts = prepared.known_hosts().to_owned();
+
+    let replacement_temp = TempDir::new()?;
+    let replacement_paths = paths(&replacement_temp)?;
+    ensure_host_identity(&replacement_paths).await?;
+    fs::copy(
+        replacement_paths.private_key().as_std_path(),
+        managed_paths.private_key().as_std_path(),
+    )?;
+    fs::set_permissions(
+        managed_paths.private_key().as_std_path(),
+        fs::Permissions::from_mode(0o600),
+    )?;
+    fs::copy(
+        replacement_paths.public_key().as_std_path(),
+        managed_paths.public_key().as_std_path(),
+    )?;
+    fs::set_permissions(
+        managed_paths.public_key().as_std_path(),
+        fs::Permissions::from_mode(0o644),
+    )?;
+
+    assert!(
+        readiness_ssh_args(
+            &managed_paths,
+            &stale_identity,
+            &ready,
+            &generation_known_hosts
+        )
+        .await
+        .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn readiness_rejects_a_replaced_generation() -> TestResult {
+    let temp = TempDir::new()?;
+    let paths = paths(&temp)?;
+    let identity = ensure_host_identity(&paths).await?;
+    let ready = host("gascan-ready", 2222, &identity);
+    let prepared = prepare_openssh_files(&paths, &identity, std::slice::from_ref(&ready))?;
+    fs::write(
+        prepared.known_hosts().as_std_path(),
+        format!(
+            "{},[127.0.0.1]:{} {}\n",
+            ready.active.alias, 2223, ready.host_public_key
+        ),
+    )?;
+
+    assert!(
+        readiness_ssh_args(&paths, &identity, &ready, prepared.known_hosts())
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn readiness_rejects_a_valid_generation_with_the_wrong_host_key() -> TestResult {
+    let temp = TempDir::new()?;
+    let managed_paths = paths(&temp)?;
+    let identity = ensure_host_identity(&managed_paths).await?;
+    let expected = host("gascan-ready", 2222, &identity);
+
+    let other_temp = TempDir::new()?;
+    let other_paths = paths(&other_temp)?;
+    let other_identity = ensure_host_identity(&other_paths).await?;
+    let mut wrong_key = expected.clone();
+    wrong_key.host_public_key = other_identity.public_key().to_owned();
+    wrong_key.active.host_key_fingerprint = other_identity.fingerprint().to_owned();
+    let prepared = prepare_openssh_files(&managed_paths, &identity, &[wrong_key])?;
+
+    assert!(
+        readiness_ssh_args(&managed_paths, &identity, &expected, prepared.known_hosts())
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn readiness_rejects_a_generation_for_a_different_alias() -> TestResult {
+    let temp = TempDir::new()?;
+    let paths = paths(&temp)?;
+    let identity = ensure_host_identity(&paths).await?;
+    let expected = host("gascan-ready", 2222, &identity);
+    let prepared = prepare_openssh_files(&paths, &identity, std::slice::from_ref(&expected))?;
+    let mut wrong_alias = expected;
+    wrong_alias.active.alias = "gascan-other".to_owned();
+
+    assert!(
+        readiness_ssh_args(&paths, &identity, &wrong_alias, prepared.known_hosts())
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn readiness_rejects_a_generation_for_a_different_port() -> TestResult {
+    let temp = TempDir::new()?;
+    let paths = paths(&temp)?;
+    let identity = ensure_host_identity(&paths).await?;
+    let expected = host("gascan-ready", 2222, &identity);
+    let prepared = prepare_openssh_files(&paths, &identity, std::slice::from_ref(&expected))?;
+    let mut wrong_port = expected;
+    wrong_port.active.port = 2223;
+
+    assert!(
+        readiness_ssh_args(&paths, &identity, &wrong_port, prepared.known_hosts())
+            .await
+            .is_err()
+    );
     Ok(())
 }
 

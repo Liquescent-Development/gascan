@@ -4,7 +4,7 @@ use super::{
 };
 use base64::Engine as _;
 use camino::{Utf8Path, Utf8PathBuf};
-use rustix::fd::OwnedFd;
+use command_fds::{CommandFdExt, FdMapping};
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::fs::File;
@@ -76,30 +76,32 @@ pub(crate) fn open_revalidated_identity(
     paths: &SshPaths,
     identity: &HostIdentity,
 ) -> Result<StateDirectory, SshError> {
+    let validated = std::thread::scope(|scope| {
+        scope
+            .spawn(|| -> Result<StateDirectory, SshError> {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| SshError::io("start SSH identity validation worker", error))?;
+                runtime.block_on(open_revalidated_identity_async(paths, identity))
+            })
+            .join()
+    })
+    .map_err(|_| SshError::InvalidState("managed SSH identity validation worker failed"))??;
+    Ok(validated)
+}
+
+pub(crate) async fn open_revalidated_identity_async(
+    paths: &SshPaths,
+    identity: &HostIdentity,
+) -> Result<StateDirectory, SshError> {
     if identity.private_key != paths.private_key {
         return Err(SshError::InvalidState(
             "SSH config identity is outside managed state",
         ));
     }
-    let validated = std::thread::scope(|scope| {
-        scope
-            .spawn(|| -> Result<(StateDirectory, ParsedPublicKey), SshError> {
-                let directory = StateDirectory::open(paths)?;
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|error| SshError::io("start SSH identity validation worker", error))?;
-                let parsed = runtime.block_on(validate_pair(
-                    &directory,
-                    PRIVATE_KEY_NAME,
-                    PUBLIC_KEY_NAME,
-                ))?;
-                Ok((directory, parsed))
-            })
-            .join()
-    })
-    .map_err(|_| SshError::InvalidState("managed SSH identity validation worker failed"))??;
-    let (directory, parsed) = validated;
+    let directory = StateDirectory::open(paths)?;
+    let parsed = validate_pair(&directory, PRIVATE_KEY_NAME, PUBLIC_KEY_NAME).await?;
     if parsed.normalized != identity.public_key || parsed.fingerprint != identity.fingerprint {
         return Err(SshError::InvalidState(
             "managed SSH identity changed after validation",
@@ -177,6 +179,21 @@ async fn validate_pair_with<F>(
 where
     F: FnOnce() -> Result<(), SshError>,
 {
+    validate_pair_with_spawn_hook(directory, private_name, public_name, after_open, |_| Ok(()))
+        .await
+}
+
+async fn validate_pair_with_spawn_hook<F, G>(
+    directory: &StateDirectory,
+    private_name: &str,
+    public_name: &str,
+    after_open: F,
+    before_spawn: G,
+) -> Result<ParsedPublicKey, SshError>
+where
+    F: FnOnce() -> Result<(), SshError>,
+    G: FnOnce(i32) -> Result<(), SshError>,
+{
     let (private_file, private_identity) = directory.open_file(private_name, PRIVATE_MODE)?;
     let (public_bytes, public_identity) = directory.read_file(
         public_name,
@@ -186,7 +203,7 @@ where
     let stored_public = parse_public_key(&public_bytes)?;
 
     after_open()?;
-    let derived = derive_public_key(&private_file).await?;
+    let derived = derive_public_key_with_spawn_hook(&private_file, before_spawn).await?;
     let derived_public = parse_public_key(&derived)?;
     if stored_public.normalized != derived_public.normalized {
         return Err(SshError::InvalidState(
@@ -198,24 +215,36 @@ where
     Ok(stored_public)
 }
 
-async fn derive_public_key(private_file: &File) -> Result<Vec<u8>, SshError> {
-    let inherited = rustix::io::dup(private_file)
+async fn derive_public_key_with_spawn_hook<F>(
+    private_file: &File,
+    before_spawn: F,
+) -> Result<Vec<u8>, SshError>
+where
+    F: FnOnce(i32) -> Result<(), SshError>,
+{
+    let inherited = rustix::io::fcntl_dupfd_cloexec(private_file, 3)
         .map_err(|error| SshError::io("duplicate managed SSH private descriptor", error))?;
-    let mut flags = rustix::io::fcntl_getfd(&inherited)
-        .map_err(|error| SshError::io("inspect managed SSH private descriptor flags", error))?;
-    flags.remove(rustix::io::FdFlags::CLOEXEC);
-    rustix::io::fcntl_setfd(&inherited, flags)
-        .map_err(|error| SshError::io("make SSH private descriptor inheritable", error))?;
-    let descriptor_path = format!("/dev/fd/{}", inherited.as_raw_fd());
-    run_ssh_keygen_with_inherited_fd(
-        vec![
-            OsString::from("-y"),
-            OsString::from("-f"),
-            OsString::from(descriptor_path),
-        ],
-        Some(inherited),
-    )
-    .await
+    let parent_fd = inherited.as_raw_fd();
+    let descriptor_path = format!("/dev/fd/{parent_fd}");
+    let mut command = ssh_keygen_command(vec![
+        OsString::from("-y"),
+        OsString::from("-f"),
+        OsString::from(descriptor_path),
+    ]);
+    command
+        .as_std_mut()
+        .fd_mappings(vec![FdMapping {
+            parent_fd: inherited,
+            child_fd: parent_fd,
+        }])
+        .map_err(|error| {
+            SshError::io(
+                "configure managed SSH private descriptor mapping",
+                std::io::Error::other(error),
+            )
+        })?;
+    before_spawn(parent_fd)?;
+    run_configured_ssh_keygen(command).await
 }
 
 fn require_unchanged(
@@ -291,13 +320,10 @@ fn validate_ed25519_blob(blob: &[u8]) -> Result<(), SshError> {
 }
 
 async fn run_ssh_keygen(args: Vec<OsString>) -> Result<Vec<u8>, SshError> {
-    run_ssh_keygen_with_inherited_fd(args, None).await
+    run_configured_ssh_keygen(ssh_keygen_command(args)).await
 }
 
-async fn run_ssh_keygen_with_inherited_fd(
-    args: Vec<OsString>,
-    inherited_fd: Option<OwnedFd>,
-) -> Result<Vec<u8>, SshError> {
+fn ssh_keygen_command(args: Vec<OsString>) -> Command {
     let mut child = Command::new(SSH_KEYGEN);
     child
         .args(args)
@@ -306,10 +332,14 @@ async fn run_ssh_keygen_with_inherited_fd(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let mut child = child
+    child
+}
+
+async fn run_configured_ssh_keygen(mut command: Command) -> Result<Vec<u8>, SshError> {
+    let mut child = command
         .spawn()
         .map_err(|error| SshError::io("start bounded ssh-keygen", error))?;
-    drop(inherited_fd);
+    drop(command);
     let stdout = child.stdout.take().ok_or(SshError::KeygenOutput)?;
     let stderr = child.stderr.take().ok_or(SshError::KeygenOutput)?;
     let completed = tokio::time::timeout(KEYGEN_TIMEOUT, async {
@@ -328,6 +358,14 @@ async fn run_ssh_keygen_with_inherited_fd(
         return Err(SshError::KeygenOutput);
     }
     if !status.success() {
+        #[cfg(test)]
+        eprintln!(
+            "ssh-keygen rejection: code={:?} stdout_bytes={} stderr_bytes={} stderr_sha256={:x}",
+            status.code(),
+            stdout.len(),
+            stderr.len(),
+            Sha256::digest(&stderr)
+        );
         return Err(SshError::KeygenRejected);
     }
     Ok(stdout)
@@ -378,30 +416,36 @@ impl Drop for StagingGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PRIVATE_KEY_NAME, PUBLIC_KEY_NAME, SshError, ensure_host_identity, validate_pair_with,
+        PRIVATE_KEY_NAME, PUBLIC_KEY_NAME, SshError, ensure_host_identity,
+        validate_pair_with_spawn_hook,
     };
     use crate::ssh::SshPaths;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
 
     #[tokio::test]
-    async fn private_key_validation_uses_the_descriptor_opened_before_path_replacement()
+    async fn private_key_descriptor_is_inherited_only_by_the_intended_child()
     -> Result<(), Box<dyn std::error::Error>> {
         let managed = tempfile::tempdir()?;
         let managed_home = managed.path().canonicalize()?.join("xdg");
         let paths = SshPaths::for_environment(Some(managed_home.as_os_str()), None)?;
-        ensure_host_identity(&paths).await?;
+        ensure_host_identity(&paths)
+            .await
+            .map_err(|error| format!("prepare managed identity: {error}"))?;
 
         let replacement = tempfile::tempdir()?;
         let replacement_home = replacement.path().canonicalize()?.join("xdg");
         let replacement_paths =
             SshPaths::for_environment(Some(replacement_home.as_os_str()), None)?;
-        ensure_host_identity(&replacement_paths).await?;
+        ensure_host_identity(&replacement_paths)
+            .await
+            .map_err(|error| format!("prepare replacement identity: {error}"))?;
         let replacement_private = fs::read(replacement_paths.private_key().as_std_path())?;
 
         let directory = crate::ssh::StateDirectory::open(&paths)?;
         let displaced = paths.directory().join("identity_ed25519.displaced");
-        let result = validate_pair_with(
+        let result = validate_pair_with_spawn_hook(
             &directory,
             PRIVATE_KEY_NAME,
             PUBLIC_KEY_NAME,
@@ -416,6 +460,21 @@ mod tests {
                 )
                 .map_err(|error| SshError::io("secure replacement private key", error))
             },
+            |parent_fd| {
+                let output = Command::new("/bin/cat")
+                    .arg(format!("/dev/fd/{parent_fd}"))
+                    .env_clear()
+                    .stdin(Stdio::null())
+                    .stderr(Stdio::null())
+                    .output()
+                    .map_err(|error| SshError::io("spawn unrelated descriptor probe", error))?;
+                if output.status.success() || !output.stdout.is_empty() {
+                    return Err(SshError::InvalidState(
+                        "unrelated child inherited managed SSH private descriptor",
+                    ));
+                }
+                Ok(())
+            },
         )
         .await;
         let error = match result {
@@ -427,10 +486,13 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(matches!(
-            error,
-            SshError::InvalidState("managed SSH file changed during validation")
-        ));
+        assert!(
+            matches!(
+                &error,
+                SshError::InvalidState("managed SSH file changed during validation")
+            ),
+            "intended descriptor validation returned an unexpected error: {error}"
+        );
         Ok(())
     }
 }
