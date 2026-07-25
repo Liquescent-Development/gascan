@@ -101,6 +101,57 @@ impl PolicyCompiler {
         Self::compile_for_image_internal(spec, capabilities, workspace_image, Some(control))
     }
 
+    /// Replaces only the native SSH transport fields on an already validated request.
+    ///
+    /// This is used to reconstruct a previously inspected transport during rollback,
+    /// including when the newly requested manifest disabled SSH.
+    pub fn restore_ssh_transport(
+        mut request: CreateRequest,
+        control: Option<ControlPlanePolicy<'_>>,
+    ) -> Result<CreateRequest, PolicyError> {
+        request.ports.retain(|mapping| mapping.guest_port != 22);
+        request.environment.remove("GASCAN_SSH_AUTHORIZED_KEY");
+        request.environment.insert(
+            "GASCAN_SSH_ENABLED".to_owned(),
+            if control.is_some() { "1" } else { "0" }.to_owned(),
+        );
+        let Some(control) = control else {
+            return Ok(request);
+        };
+        if matches!(request.network, RuntimeNetwork::Offline) {
+            return Err(PolicyError::OfflinePortsForbidden);
+        }
+        let authorized_key = control
+            .ssh_authorized_key
+            .ok_or(PolicyError::MissingSshAuthorizedKey)?;
+        if !is_ssh_public_key(authorized_key) {
+            return Err(PolicyError::InvalidSshAuthorizedKey);
+        }
+        let host_port = control
+            .ssh_host_port
+            .ok_or(PolicyError::MissingSshHostPort)?;
+        if host_port < 1024 {
+            return Err(PolicyError::InvalidSshHostPort);
+        }
+        if request
+            .ports
+            .iter()
+            .any(|mapping| mapping.host_port == host_port)
+        {
+            return Err(PolicyError::DuplicatePort(host_port));
+        }
+        request.ports.push(RuntimePort {
+            host_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            host_port,
+            guest_port: 22,
+        });
+        request.environment.insert(
+            "GASCAN_SSH_AUTHORIZED_KEY".to_owned(),
+            authorized_key.to_owned(),
+        );
+        Ok(request)
+    }
+
     fn compile_for_image_internal(
         spec: SandboxSpec,
         capabilities: &RuntimeCapabilities,

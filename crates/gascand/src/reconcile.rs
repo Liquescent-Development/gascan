@@ -15,6 +15,9 @@ pub enum ReconcileFinding {
         sandbox_id: SandboxId,
         reason: String,
     },
+    SshPublicationUnavailable {
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

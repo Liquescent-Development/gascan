@@ -10,12 +10,14 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIAL_MIGRATION: &str = include_str!("../migrations/001_initial.sql");
 const DURABLE_METADATA_MIGRATION: &str = include_str!("../migrations/002_durable_metadata.sql");
 const STORAGE_RESOLUTION_MIGRATION: &str = include_str!("../migrations/003_storage_resolution.sql");
 const SSH_RESOLUTION_MIGRATION: &str = include_str!("../migrations/004_ssh_resolution.sql");
+const SSH_TRANSPORT_POLICY_MIGRATION: &str =
+    include_str!("../migrations/005_ssh_transport_policy.sql");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DesiredState {
@@ -107,6 +109,32 @@ resolution_record!(ToolResolution);
 resolution_record!(ImageResolution);
 resolution_record!(StorageResolution);
 resolution_record!(SshResolution);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SshTransportPolicy {
+    enabled: bool,
+    host_port: Option<u16>,
+}
+
+impl SshTransportPolicy {
+    pub(crate) const fn disabled() -> Self {
+        Self {
+            enabled: false,
+            host_port: None,
+        }
+    }
+
+    pub(crate) const fn enabled(host_port: Option<u16>) -> Self {
+        Self {
+            enabled: true,
+            host_port,
+        }
+    }
+
+    pub(crate) const fn is_enabled(self) -> bool {
+        self.enabled
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SandboxRecord {
@@ -220,9 +248,40 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn put_sandbox_with_ssh_transport(
+        &self,
+        sandbox: &SandboxRecord,
+        policy: Option<SshTransportPolicy>,
+    ) -> Result<(), StoreError> {
+        validate_resolutions(sandbox)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        put_sandbox_in(&transaction, sandbox)?;
+        set_ssh_transport_policy_in(&transaction, &sandbox.id, policy)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn sandbox(&self, id: &SandboxId) -> Result<Option<SandboxRecord>, StoreError> {
         let connection = self.lock()?;
         load_sandbox(&connection, id.as_str())
+    }
+
+    pub(crate) fn ssh_transport_policy(
+        &self,
+        id: &SandboxId,
+    ) -> Result<Option<SshTransportPolicy>, StoreError> {
+        let connection = self.lock()?;
+        let raw = connection
+            .query_row(
+                "SELECT ssh_transport_enabled, ssh_transport_host_port FROM sandboxes WHERE id = ?1",
+                [id.as_str()],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()?;
+        raw.map(decode_ssh_transport_policy)
+            .transpose()
+            .map(Option::flatten)
     }
 
     /// Stores validated SSH identity evidence without touching runtime connection state.
@@ -513,8 +572,9 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), StoreError> {
                 transaction.execute_batch(DURABLE_METADATA_MIGRATION)?;
                 transaction.execute_batch(STORAGE_RESOLUTION_MIGRATION)?;
                 transaction.execute_batch(SSH_RESOLUTION_MIGRATION)?;
+                transaction.execute_batch(SSH_TRANSPORT_POLICY_MIGRATION)?;
                 transaction.commit()?;
-                validate_v4_schema(connection)
+                validate_v5_schema(connection)
             }
             2 => {
                 validate_v2_schema(connection)?;
@@ -522,18 +582,28 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), StoreError> {
                     connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 transaction.execute_batch(STORAGE_RESOLUTION_MIGRATION)?;
                 transaction.execute_batch(SSH_RESOLUTION_MIGRATION)?;
+                transaction.execute_batch(SSH_TRANSPORT_POLICY_MIGRATION)?;
                 transaction.commit()?;
-                validate_v4_schema(connection)
+                validate_v5_schema(connection)
             }
             3 => {
                 validate_v3_schema(connection)?;
                 let transaction =
                     connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 transaction.execute_batch(SSH_RESOLUTION_MIGRATION)?;
+                transaction.execute_batch(SSH_TRANSPORT_POLICY_MIGRATION)?;
                 transaction.commit()?;
-                validate_v4_schema(connection)
+                validate_v5_schema(connection)
             }
-            SCHEMA_VERSION => validate_v4_schema(connection),
+            4 => {
+                validate_v4_schema(connection)?;
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                transaction.execute_batch(SSH_TRANSPORT_POLICY_MIGRATION)?;
+                transaction.commit()?;
+                validate_v5_schema(connection)
+            }
+            SCHEMA_VERSION => validate_v5_schema(connection),
             _ => Err(StoreError::UnsupportedSchemaVersion(version)),
         };
     }
@@ -561,8 +631,9 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), StoreError> {
     transaction.execute_batch(DURABLE_METADATA_MIGRATION)?;
     transaction.execute_batch(STORAGE_RESOLUTION_MIGRATION)?;
     transaction.execute_batch(SSH_RESOLUTION_MIGRATION)?;
+    transaction.execute_batch(SSH_TRANSPORT_POLICY_MIGRATION)?;
     transaction.commit()?;
-    validate_v4_schema(connection)
+    validate_v5_schema(connection)
 }
 
 const SANDBOX_SELECT: &str = "SELECT id, canonical_root, desired_state, actual_state, setup_resolution_version, setup_resolution_details, tool_resolution_version, tool_resolution_details, image_resolution_version, image_resolution_details, storage_resolution_version, storage_resolution_details, ssh_resolution_version, ssh_resolution_details, (SELECT id FROM operations WHERE sandbox_id = sandboxes.id ORDER BY id DESC LIMIT 1), updated_at_millis FROM sandboxes";
@@ -609,6 +680,52 @@ fn put_sandbox_in(
         params![sandbox.id.as_str(), sandbox.canonical_root.as_str(), sandbox.desired_state.as_db(), sandbox.actual_state.as_db(), setup.0, setup.1, tools.0, tools.1, image.0, image.1, storage.0, storage.1, ssh.0, ssh.1, current_time_millis()?],
     )?;
     Ok(())
+}
+
+fn set_ssh_transport_policy_in(
+    transaction: &Transaction<'_>,
+    id: &SandboxId,
+    policy: Option<SshTransportPolicy>,
+) -> Result<(), StoreError> {
+    let (enabled, host_port) = match policy {
+        Some(policy) => (
+            Some(i64::from(policy.enabled)),
+            policy.host_port.map(i64::from),
+        ),
+        None => (None, None),
+    };
+    let updated = transaction.execute(
+        "UPDATE sandboxes SET ssh_transport_enabled = ?1, ssh_transport_host_port = ?2 WHERE id = ?3",
+        params![enabled, host_port, id.as_str()],
+    )?;
+    if updated == 0 {
+        return Err(StoreError::SandboxNotFound(id.clone()));
+    }
+    Ok(())
+}
+
+fn decode_ssh_transport_policy(
+    raw: (Option<i64>, Option<i64>),
+) -> Result<Option<SshTransportPolicy>, StoreError> {
+    match raw {
+        (None, None) => Ok(None),
+        (Some(0), None) => Ok(Some(SshTransportPolicy::disabled())),
+        (Some(1), host_port) => {
+            let host_port = host_port
+                .map(|port| {
+                    u16::try_from(port).map_err(|_| {
+                        StoreError::CorruptData(
+                            "SSH transport host port is out of range".to_owned(),
+                        )
+                    })
+                })
+                .transpose()?;
+            Ok(Some(SshTransportPolicy::enabled(host_port)))
+        }
+        _ => Err(StoreError::CorruptData(
+            "invalid SSH transport policy".to_owned(),
+        )),
+    }
 }
 
 fn load_sandbox(connection: &Connection, id: &str) -> Result<Option<SandboxRecord>, StoreError> {
@@ -1060,6 +1177,46 @@ fn validate_v4_schema(connection: &Connection) -> Result<(), StoreError> {
             ("storage_resolution_details", "TEXT", 0, 0),
             ("ssh_resolution_version", "INTEGER", 0, 0),
             ("ssh_resolution_details", "TEXT", 0, 0),
+        ],
+    )?;
+    validate_table_columns(
+        connection,
+        "operation_events",
+        &[
+            ("sequence", "INTEGER", 0, 1),
+            ("operation_id", "INTEGER", 1, 0),
+            ("status", "TEXT", 1, 0),
+            ("details", "TEXT", 0, 0),
+            ("error_code", "TEXT", 0, 0),
+            ("timestamp_millis", "INTEGER", 1, 0),
+        ],
+    )?;
+    validate_operations_and_constraints(connection)
+}
+
+fn validate_v5_schema(connection: &Connection) -> Result<(), StoreError> {
+    validate_schema_inventory(connection)?;
+    validate_table_columns(
+        connection,
+        "sandboxes",
+        &[
+            ("id", "TEXT", 1, 1),
+            ("canonical_root", "TEXT", 1, 0),
+            ("desired_state", "TEXT", 1, 0),
+            ("actual_state", "TEXT", 1, 0),
+            ("setup_resolution_version", "INTEGER", 0, 0),
+            ("setup_resolution_details", "TEXT", 0, 0),
+            ("tool_resolution_version", "INTEGER", 0, 0),
+            ("tool_resolution_details", "TEXT", 0, 0),
+            ("image_resolution_version", "INTEGER", 0, 0),
+            ("image_resolution_details", "TEXT", 0, 0),
+            ("updated_at_millis", "INTEGER", 1, 0),
+            ("storage_resolution_version", "INTEGER", 0, 0),
+            ("storage_resolution_details", "TEXT", 0, 0),
+            ("ssh_resolution_version", "INTEGER", 0, 0),
+            ("ssh_resolution_details", "TEXT", 0, 0),
+            ("ssh_transport_enabled", "INTEGER", 0, 0),
+            ("ssh_transport_host_port", "INTEGER", 0, 0),
         ],
     )?;
     validate_table_columns(

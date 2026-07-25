@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use gascan_core::fake_runtime::{FailureBoundary, FakeRuntime};
 use gascan_core::manifest::Manifest;
-use gascan_core::runtime::{ContainerState, ResourceKind, RuntimeBackend, RuntimeCall};
+use gascan_core::runtime::{
+    ContainerState, ResourceKind, RuntimeBackend, RuntimeCall, RuntimeError,
+};
 use gascan_core::sandbox::SandboxSpec;
 use gascand::{
     ActualState, NoopProvisioner, ProvisionRequest, ProvisionResolution, Provisioner,
@@ -720,6 +722,20 @@ async fn same_image_apply_recreates_automatic_ssh_as_explicit() -> TestResult {
 }
 
 #[tokio::test]
+async fn same_image_apply_recreates_explicit_ssh_as_automatic() -> TestResult {
+    assert_same_image_ssh_policy_recreate(
+        "ssh-explicit-auto-apply",
+        true,
+        Some(24_107),
+        true,
+        None,
+        None,
+        Some(24_108),
+    )
+    .await
+}
+
+#[tokio::test]
 async fn same_image_apply_recreates_changed_explicit_ssh_port() -> TestResult {
     assert_same_image_ssh_policy_recreate(
         "ssh-explicit-change-apply",
@@ -731,4 +747,228 @@ async fn same_image_apply_recreates_changed_explicit_ssh_port() -> TestResult {
         None,
     )
     .await
+}
+
+fn loopback_port_collision(port: u16) -> RuntimeError {
+    RuntimeError::CommandFailed {
+        operation: "container".to_owned(),
+        exit_code: Some(1),
+        stderr: format!("Error: listen tcp 127.0.0.1:{port}: bind: address already in use\n"),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InitialSshFixture {
+    enabled: bool,
+    requested_port: Option<u16>,
+    observed_port: Option<u16>,
+    forget_durable_enablement: bool,
+}
+
+async fn failed_ssh_policy_apply_requests(
+    name: &str,
+    initial: InitialSshFixture,
+    next_enabled: bool,
+    next_port: Option<u16>,
+    next_failure: Option<RuntimeError>,
+) -> TestResult<Vec<gascan_core::runtime::CreateRequest>> {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    write_ssh_manifest(root, initial.enabled, initial.requested_port)?;
+    let initial_spec = spec(root, name)?;
+    let paths = ssh_paths(root, &format!("{name}-client"))?;
+    let host_paths = ssh_paths(root, &format!("{name}-host"))?;
+    let host_public_key = ensure_host_identity(&host_paths)
+        .await?
+        .public_key()
+        .to_owned();
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    if let Some(port) = initial.observed_port {
+        runtime.queue_created_ssh_host_port(port).await;
+    }
+    let provisioner = Arc::new(FailingProvisioner::default());
+    let service = SandboxService::new_with_ssh_for_tests(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        provisioner.clone(),
+        paths.clone(),
+        Utf8PathBuf::from("/usr/bin/true"),
+    );
+    service.up(UpRequest::new(initial_spec.clone())).await?;
+    if initial.forget_durable_enablement {
+        service.store().update_ssh_resolution(
+            initial_spec.id(),
+            gascand::SshResolution::new(
+                1,
+                serde_json::json!({
+                    "enabled": false,
+                    "host_key_fingerprint": "",
+                    "client_key_fingerprint": "",
+                }),
+            ),
+        )?;
+    }
+    let replacements_before = runtime
+        .calls()
+        .await
+        .iter()
+        .filter(|call| matches!(call, RuntimeCall::CreateContainer(_)))
+        .count();
+
+    write_ssh_manifest(root, next_enabled, next_port)?;
+    let next = spec(root, name)?;
+    if let Some(error) = next_failure {
+        runtime.queue_create_error(error).await;
+    } else {
+        provisioner.0.store(true, Ordering::SeqCst);
+    }
+
+    assert!(
+        service.apply(UpRequest::new(next.clone())).await.is_err(),
+        "transport replacement unexpectedly succeeded"
+    );
+    let inspected = runtime
+        .inspect(next.id())
+        .await?
+        .ok_or("rolled back runtime")?;
+    let expected_ports = initial
+        .observed_port
+        .or(initial.requested_port)
+        .into_iter()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        inspected
+            .ports()
+            .iter()
+            .filter(|mapping| mapping.guest_port == 22)
+            .map(|mapping| mapping.host_port)
+            .collect::<Vec<_>>(),
+        expected_ports
+    );
+    let resolution = service
+        .status(next.id())?
+        .ok_or("rolled back record")?
+        .ssh_resolution
+        .ok_or("rolled back SSH resolution")?;
+    assert_eq!(
+        resolution.details["enabled"].as_bool(),
+        Some(initial.enabled)
+    );
+    let config_has_alias = paths.config().exists()
+        && std::fs::read_to_string(paths.config())?.contains(&format!("Host gascan-{}", next.id()));
+    assert_eq!(config_has_alias, initial.enabled);
+
+    Ok(runtime
+        .calls()
+        .await
+        .into_iter()
+        .filter_map(|call| match call {
+            RuntimeCall::CreateContainer(request) => Some(request.create().clone()),
+            _ => None,
+        })
+        .skip(replacements_before)
+        .collect())
+}
+
+#[tokio::test]
+async fn failed_enabled_to_disabled_apply_restores_enabled_native_ssh() -> TestResult {
+    let requests = failed_ssh_policy_apply_requests(
+        "ssh-enable-disable-rollback",
+        InitialSshFixture {
+            enabled: true,
+            requested_port: None,
+            observed_port: Some(24_201),
+            forget_durable_enablement: true,
+        },
+        false,
+        None,
+        None,
+    )
+    .await?;
+    let rollback = requests.last().ok_or("rollback request")?;
+
+    assert_eq!(
+        rollback.environment().get("GASCAN_SSH_ENABLED"),
+        Some(&"1".to_owned())
+    );
+    assert!(
+        rollback
+            .environment()
+            .contains_key("GASCAN_SSH_AUTHORIZED_KEY")
+    );
+    assert!(
+        rollback
+            .ports()
+            .iter()
+            .any(|mapping| { mapping.guest_port == 22 && mapping.host_port == 24_201 })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_disabled_to_enabled_apply_restores_disabled_native_ssh() -> TestResult {
+    let requests = failed_ssh_policy_apply_requests(
+        "ssh-disable-enable-rollback",
+        InitialSshFixture {
+            enabled: false,
+            requested_port: None,
+            observed_port: None,
+            forget_durable_enablement: false,
+        },
+        true,
+        Some(24_202),
+        None,
+    )
+    .await?;
+    let rollback = requests.last().ok_or("rollback request")?;
+
+    assert_eq!(
+        rollback.environment().get("GASCAN_SSH_ENABLED"),
+        Some(&"0".to_owned())
+    );
+    assert!(
+        !rollback
+            .environment()
+            .contains_key("GASCAN_SSH_AUTHORIZED_KEY")
+    );
+    assert!(
+        rollback
+            .ports()
+            .iter()
+            .all(|mapping| mapping.guest_port != 22)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_explicit_port_change_restores_old_port_without_retrying_new_port() -> TestResult {
+    let requests = failed_ssh_policy_apply_requests(
+        "ssh-explicit-port-rollback",
+        InitialSshFixture {
+            enabled: true,
+            requested_port: Some(24_203),
+            observed_port: None,
+            forget_durable_enablement: false,
+        },
+        true,
+        Some(24_204),
+        Some(loopback_port_collision(24_204)),
+    )
+    .await?;
+    let attempted_ports = requests
+        .iter()
+        .filter_map(|request| {
+            request
+                .ports()
+                .iter()
+                .find(|mapping| mapping.guest_port == 22)
+                .map(|mapping| mapping.host_port)
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(attempted_ports, vec![24_204, 24_203]);
+    Ok(())
 }

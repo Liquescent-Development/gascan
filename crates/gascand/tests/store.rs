@@ -474,11 +474,11 @@ fn newer_and_unknown_schema_versions_are_rejected() -> TestResult {
     let path = temp.path().join("state.db");
     drop(Store::open(&path)?);
     let connection = rusqlite::Connection::open(&path)?;
-    connection.execute("UPDATE schema_version SET version = ?1", [5])?;
+    connection.execute("UPDATE schema_version SET version = ?1", [6])?;
     drop(connection);
     assert!(matches!(
         Store::open(&path),
-        Err(StoreError::UnsupportedSchemaVersion(5))
+        Err(StoreError::UnsupportedSchemaVersion(6))
     ));
 
     let empty = temp.path().join("unknown.db");
@@ -518,7 +518,7 @@ fn version_two_database_migrates_storage_resolution_as_absent() -> TestResult {
     assert_eq!(
         connection.query_row("SELECT version FROM schema_version", [], |row| row
             .get::<_, i64>(0))?,
-        4
+        5
     );
     Ok(())
 }
@@ -555,8 +555,52 @@ fn version_three_database_migrates_ssh_resolution_as_absent() -> TestResult {
     assert_eq!(
         connection.query_row("SELECT version FROM schema_version", [], |row| row
             .get::<_, i64>(0))?,
-        4
+        5
     );
+    Ok(())
+}
+
+#[test]
+fn version_four_database_migrates_ssh_transport_policy_as_unknown() -> TestResult {
+    const INITIAL_MIGRATION: &str = include_str!("../migrations/001_initial.sql");
+    const DURABLE_METADATA_MIGRATION: &str = include_str!("../migrations/002_durable_metadata.sql");
+    const STORAGE_RESOLUTION_MIGRATION: &str =
+        include_str!("../migrations/003_storage_resolution.sql");
+    const SSH_RESOLUTION_MIGRATION: &str = include_str!("../migrations/004_ssh_resolution.sql");
+
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("version-four.db");
+    let connection = rusqlite::Connection::open(&path)?;
+    connection.execute_batch(INITIAL_MIGRATION)?;
+    connection.execute_batch(DURABLE_METADATA_MIGRATION)?;
+    connection.execute_batch(STORAGE_RESOLUTION_MIGRATION)?;
+    connection.execute_batch(SSH_RESOLUTION_MIGRATION)?;
+    let sandbox = fixture("/workspace/legacy-v4");
+    connection.execute(
+        "INSERT INTO sandboxes (id, canonical_root, desired_state, actual_state) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            sandbox.id.as_str(),
+            sandbox.canonical_root.as_str(),
+            "running",
+            "creating"
+        ],
+    )?;
+    drop(connection);
+
+    let store = Store::open(&path)?;
+    assert!(store.sandbox(&sandbox.id)?.is_some());
+    let connection = rusqlite::Connection::open(path)?;
+    assert_eq!(
+        connection.query_row("SELECT version FROM schema_version", [], |row| row
+            .get::<_, i64>(0))?,
+        5
+    );
+    let policy = connection.query_row(
+        "SELECT ssh_transport_enabled, ssh_transport_host_port FROM sandboxes WHERE id = ?1",
+        [sandbox.id.as_str()],
+        |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+    )?;
+    assert_eq!(policy, (None, None));
     Ok(())
 }
 

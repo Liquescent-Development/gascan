@@ -229,6 +229,56 @@ async fn reopen_reconciliation_terminalizes_every_pending_operation_kind()
 }
 
 #[tokio::test]
+async fn pending_inspect_failure_is_reported_and_other_recovery_continues() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let store = Store::open(temp.path().join("state.db"))?;
+    let broken_id = gascan_core::sandbox::SandboxId::test("pending-inspect-broken");
+    let continued_id = gascan_core::sandbox::SandboxId::test("pending-inspect-continued");
+    let pending_record = |id: gascan_core::sandbox::SandboxId| SandboxRecord {
+        canonical_root: Utf8PathBuf::from(format!("/pending/{id}")),
+        id,
+        desired_state: DesiredState::Running,
+        actual_state: ActualState::Stopped,
+        setup_resolution: None,
+        tool_resolution: None,
+        image_resolution: None,
+        storage_resolution: None,
+        ssh_resolution: None,
+        last_operation_id: None,
+        updated_at_millis: 0,
+    };
+    let broken = store.begin_operation(&pending_record(broken_id.clone()), OperationKind::Start)?;
+    let continued =
+        store.begin_operation(&pending_record(continued_id.clone()), OperationKind::Start)?;
+    let runtime = FakeRuntime::default();
+    runtime.seed_owned(broken_id.clone()).await;
+    runtime.seed_owned(continued_id.clone()).await;
+    runtime.start(&broken_id).await?;
+    runtime.start(&continued_id).await?;
+    let unknown = gascan_core::sandbox::SandboxId::test("pending-inspect-unknown");
+    runtime.seed_owned(unknown.clone()).await;
+    runtime.inject_failure(FailureBoundary::Inspect).await;
+    let service = SandboxService::new(runtime, store.clone(), Arc::new(NoopProvisioner));
+
+    let report = service.reconcile().await?;
+
+    assert!(report.findings.iter().any(|finding| matches!(
+        finding,
+        ReconcileFinding::InspectionUnavailable { sandbox_id, reason }
+            if sandbox_id == &broken_id && reason == "injected_failure"
+    )));
+    assert!(report.findings.iter().any(|finding| matches!(
+        finding,
+        ReconcileFinding::UnknownOwned(resource)
+            if resource.sandbox_id() == Some(&unknown)
+    )));
+    let pending = store.pending_operations()?;
+    assert!(pending.iter().any(|operation| operation.id == broken.id));
+    assert!(!pending.iter().any(|operation| operation.id == continued.id));
+    Ok(())
+}
+
+#[tokio::test]
 async fn pending_create_completes_only_with_durable_resolution_and_health_evidence()
 -> Result<(), Box<dyn Error>> {
     let temp = tempfile::tempdir()?;
@@ -709,6 +759,70 @@ async fn ssh_reconcile_continues_after_one_record_inspect_failure() -> TestResul
     let config = std::fs::read_to_string(paths.config())?;
     assert!(!config.contains(&format!("Host gascan-{}", broken.id())));
     assert!(config.contains(&format!("Host gascan-{}", valid.id())));
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_ssh_publication_failure_is_a_sanitized_finding() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "empty-publication-client")?;
+    let host_paths = ssh_paths(root, "empty-publication-host")?;
+    let host_public_key = ensure_host_identity(&host_paths)
+        .await?
+        .public_key()
+        .to_owned();
+    let project = root.join("project");
+    std::fs::create_dir(&project)?;
+    std::fs::write(
+        project.join("gascan.toml"),
+        "version = 1\nnetwork = 'networked'\n[ssh]\nhost_port = 25251\n",
+    )?;
+    let desired = SandboxSpec::from_root("empty-publication", &project, Manifest::load(&project)?)?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let store = Store::open(root.join("state.db"))?;
+    let service = ssh_service(
+        runtime,
+        store.clone(),
+        paths.clone(),
+        readiness_program(root, None)?,
+    );
+    service.up(UpRequest::new(desired.clone())).await?;
+    store.update_ssh_resolution(
+        desired.id(),
+        SshResolution::new(
+            1,
+            json!({
+                "enabled": false,
+                "host_key_fingerprint": "",
+                "client_key_fingerprint": "",
+            }),
+        ),
+    )?;
+    std::fs::remove_file(paths.config())?;
+    let victim = root.join("publication-victim");
+    std::fs::write(&victim, "unchanged")?;
+    std::os::unix::fs::symlink(&victim, paths.config())?;
+
+    let report = service.reconcile().await?;
+
+    assert!(
+        report.findings.iter().any(|finding| matches!(
+            finding,
+            ReconcileFinding::SshPublicationUnavailable { reason }
+                if reason == "ssh_config_update_failed"
+        )),
+        "{:?}",
+        report.findings
+    );
+    assert_eq!(std::fs::read_to_string(victim)?, "unchanged");
+    assert!(
+        !format!("{:?}", report.findings).contains(root.as_str()),
+        "finding leaked a host path"
+    );
     Ok(())
 }
 
