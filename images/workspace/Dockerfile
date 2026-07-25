@@ -72,6 +72,7 @@ ARG GASCAMP_REVISION
 COPY .artifacts/playwright-chromium-reviewed /opt/gascan/chromium
 COPY --chmod=0440 images/workspace/etc/sudoers.d/workspace /etc/sudoers.d/workspace
 COPY --chmod=0555 images/workspace/bin/gascan-entrypoint /usr/local/bin/gascan-entrypoint
+COPY --chmod=0555 images/workspace/bin/start-gascan-sshd /usr/local/bin/start-gascan-sshd
 COPY --chmod=0555 images/workspace/bin/select-gascamp /usr/local/bin/select-gascamp
 COPY --chmod=0555 images/workspace/bin/migrate-workspace-identity /usr/local/bin/migrate-workspace-identity
 COPY --chmod=0555 images/workspace/libexec/migrate-workspace-identity-core /usr/local/libexec/gascan/migrate-workspace-identity-core
@@ -79,6 +80,7 @@ COPY --from=gascamp-builder /out /opt/gascan/gascamp
 COPY --chmod=0444 images/workspace/etc/profile.d/mise.sh /etc/profile.d/mise.sh
 COPY --chmod=0444 images/workspace/tests/playwright-smoke.mjs /opt/gascan/tests/playwright-smoke.mjs
 COPY --chmod=0555 images/workspace/tests/workstation-contract.sh /opt/gascan/tests/workstation-contract.sh
+COPY --chmod=0555 images/workspace/tests/ssh-contract.sh /opt/gascan/tests/ssh-contract.sh
 COPY --chmod=0555 images/workspace/bin/install-workstation-artifacts /usr/local/bin/install-workstation-artifacts
 COPY --chmod=0555 images/workspace/bin/run-workstation-step /usr/local/bin/run-workstation-step
 COPY --chmod=0555 images/workspace/bin/configure-workstation-home /usr/local/bin/configure-workstation-home

@@ -80,6 +80,226 @@ fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
 }
 
+fn ssh_public_key(directory: &Path, name: &str) -> String {
+    let private_key = directory.join(name);
+    let status = Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(&private_key)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    fs::read_to_string(private_key.with_extension("pub"))
+        .unwrap()
+        .trim()
+        .to_owned()
+}
+
+fn prepare_guest_ssh(test_root: &Path, key: &str) -> std::process::Output {
+    fs::create_dir_all(test_root.join("run")).unwrap();
+    let fake_sshd = test_root.join("fake-sshd");
+    fs::write(
+        &fake_sshd,
+        "#!/bin/sh\nset -eu\ntest \"$1\" = -t\ntest \"$2\" = -f\ntest -r \"$3\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_sshd, fs::Permissions::from_mode(0o755)).unwrap();
+    Command::new(root().join("images/workspace/bin/start-gascan-sshd"))
+        .env("GASCAN_SSH_AUTHORIZED_KEY", key)
+        .env("GASCAN_SSH_CONTRACT_TEST_ROOT", test_root)
+        .env("GASCAN_SSH_CONTRACT_TEST_SSHD", &fake_sshd)
+        .env("GASCAN_SSH_CONTRACT_TEST_PREPARE_ONLY", "1")
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn ssh_guest_layer_is_offline_fixed_and_loopback_only() {
+    let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
+    let entrypoint =
+        fs::read_to_string(root().join("images/workspace/bin/gascan-entrypoint")).unwrap();
+    let initializer =
+        fs::read_to_string(root().join("images/workspace/bin/start-gascan-sshd")).unwrap();
+
+    for required in [
+        "COPY --chmod=0555 images/workspace/bin/start-gascan-sshd /usr/local/bin/start-gascan-sshd",
+        "COPY --chmod=0555 images/workspace/tests/ssh-contract.sh /opt/gascan/tests/ssh-contract.sh",
+    ] {
+        assert!(
+            dockerfile.contains(required),
+            "missing sealed SSH image input: {required}"
+        );
+    }
+    assert!(entrypoint.contains("exec \"$@\""));
+    assert!(entrypoint.contains("exec sleep infinity"));
+    assert!(entrypoint.contains("GASCAN_SSH_ENABLED"));
+    assert!(entrypoint.contains("/usr/bin/sudo"));
+    assert!(entrypoint.contains("/usr/local/bin/start-gascan-sshd"));
+
+    for required in [
+        "ListenAddress 127.0.0.1",
+        "Port 22",
+        "PasswordAuthentication no",
+        "KbdInteractiveAuthentication no",
+        "PermitRootLogin no",
+        "PubkeyAuthentication yes",
+        "AuthenticationMethods publickey",
+        "AllowUsers workspace",
+        "PermitUserEnvironment no",
+        "AllowAgentForwarding no",
+        "AllowTcpForwarding local",
+        "AllowStreamLocalForwarding no",
+        "PermitOpen 127.0.0.1:*",
+        "GatewayPorts no",
+        "PermitTunnel no",
+        "X11Forwarding no",
+        "StrictModes yes",
+        "Subsystem sftp internal-sftp",
+        "/home/workspace/.config/gascan/ssh/host/ssh_host_ed25519_key",
+        "/home/workspace/.config/gascan/ssh/authorized_keys",
+        "/home/workspace/.config/gascan/ssh/sshd_config",
+    ] {
+        assert!(
+            initializer.contains(required),
+            "missing locked SSH directive or managed path: {required}"
+        );
+    }
+    for forbidden in [
+        "ListenAddress 0.0.0.0",
+        "ListenAddress ::",
+        "/home/workspace/.ssh",
+        "/etc/ssh/ssh_host_",
+        "chpasswd",
+        "passwd ",
+        "ssh-keygen -A",
+        "AllowTcpForwarding yes",
+        "GatewayPorts yes",
+        "PermitRootLogin yes",
+    ] {
+        assert!(
+            !initializer.contains(forbidden),
+            "unsafe SSH initialization policy: {forbidden}"
+        );
+    }
+    let ssh_layer = dockerfile
+        .split_once(
+            "COPY --chmod=0555 images/workspace/bin/start-gascan-sshd /usr/local/bin/start-gascan-sshd",
+        )
+        .unwrap()
+        .1;
+    for network_acquisition in ["curl ", "wget ", "apt-get ", "git clone", "npm "] {
+        assert!(
+            !ssh_layer.contains(network_acquisition),
+            "SSH guest layer performs acquisition: {network_acquisition}"
+        );
+    }
+}
+
+#[test]
+fn ssh_guest_initialization_is_behavioral_atomic_and_idempotent() {
+    use std::os::unix::fs::{MetadataExt, symlink};
+
+    let temporary = tempfile::tempdir().unwrap();
+    let test_root = temporary.path().join("root");
+    let config_root = test_root.join("home/workspace/.config/gascan");
+    fs::create_dir_all(&config_root).unwrap();
+    fs::set_permissions(&config_root, fs::Permissions::from_mode(0o700)).unwrap();
+    let key_one = ssh_public_key(temporary.path(), "client-one");
+    let key_two = ssh_public_key(temporary.path(), "client-two");
+
+    let first = prepare_guest_ssh(&test_root, &key_one);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let ssh_root = config_root.join("ssh");
+    let private_key = ssh_root.join("host/ssh_host_ed25519_key");
+    let public_key = ssh_root.join("host/ssh_host_ed25519_key.pub");
+    let authorized_keys = ssh_root.join("authorized_keys");
+    let config = ssh_root.join("sshd_config");
+    let original_private_key = fs::read(&private_key).unwrap();
+    let original_public_key = fs::read(&public_key).unwrap();
+
+    let second = prepare_guest_ssh(&test_root, &key_two);
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(fs::read(&private_key).unwrap(), original_private_key);
+    assert_eq!(fs::read(&public_key).unwrap(), original_public_key);
+    assert_eq!(
+        fs::read_to_string(&authorized_keys).unwrap(),
+        format!("{key_two}\n")
+    );
+
+    for (path, mode) in [
+        (&ssh_root, 0o700),
+        (&ssh_root.join("host"), 0o700),
+        (&private_key, 0o600),
+        (&public_key, 0o644),
+        (&authorized_keys, 0o600),
+        (&config, 0o600),
+    ] {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        assert!(
+            !metadata.file_type().is_symlink(),
+            "symlink: {}",
+            path.display()
+        );
+        assert_eq!(metadata.mode() & 0o777, mode, "mode: {}", path.display());
+        if metadata.is_file() {
+            assert_eq!(metadata.nlink(), 1, "hard-linked path: {}", path.display());
+        }
+    }
+
+    fs::set_permissions(&private_key, fs::Permissions::from_mode(0o644)).unwrap();
+    let unsafe_existing = prepare_guest_ssh(&test_root, &key_one);
+    assert!(
+        !unsafe_existing.status.success(),
+        "unsafe existing host private key was accepted"
+    );
+    assert_eq!(fs::read(&private_key).unwrap(), original_private_key);
+
+    let symlink_root = temporary.path().join("symlink-root");
+    let symlink_config = symlink_root.join("home/workspace/.config/gascan");
+    let outside = temporary.path().join("outside");
+    fs::create_dir_all(&symlink_config).unwrap();
+    fs::create_dir(&outside).unwrap();
+    symlink(&outside, symlink_config.join("ssh")).unwrap();
+    let symlink_result = prepare_guest_ssh(&symlink_root, &key_one);
+    assert!(
+        !symlink_result.status.success(),
+        "managed SSH symlink was followed"
+    );
+    assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+
+    for invalid in [
+        "",
+        "ssh-rsa AAAA",
+        "command=\"id\" ssh-ed25519 AAAA",
+        "ssh-ed25519 AAAA\nssh-ed25519 AAAA",
+        "ssh-ed25519 not-base64",
+    ] {
+        let invalid_root = temporary.path().join(format!(
+            "invalid-{}",
+            invalid
+                .as_bytes()
+                .iter()
+                .map(|byte| *byte as u64)
+                .sum::<u64>()
+        ));
+        let invalid_config = invalid_root.join("home/workspace/.config/gascan");
+        fs::create_dir_all(&invalid_config).unwrap();
+        let output = prepare_guest_ssh(&invalid_root, invalid);
+        assert!(
+            !output.status.success(),
+            "invalid key was accepted: {invalid:?}"
+        );
+        assert!(!invalid_config.join("ssh").exists());
+    }
+}
+
 #[test]
 fn dockerfile_assembles_workstation_only_from_the_verified_context() {
     let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();

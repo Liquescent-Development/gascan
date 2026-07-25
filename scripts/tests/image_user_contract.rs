@@ -489,6 +489,71 @@ fn sudoers_and_entrypoint_are_exact_and_non_bootstrapping() {
 }
 
 #[test]
+fn ssh_entrypoint_preserves_commands_and_has_fail_closed_default_dispatch() {
+    let entrypoint_path = root().join("images/workspace/bin/gascan-entrypoint");
+    let temporary = tempfile::tempdir().unwrap();
+    let marker = temporary.path().join("marker");
+    let command = temporary.path().join("explicit-command");
+    fs::write(
+        &command,
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" >\"$MARKER\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&command, fs::Permissions::from_mode(0o755)).unwrap();
+    let status = Command::new(&entrypoint_path)
+        .arg(&command)
+        .args(["one", "two words"])
+        .env("MARKER", &marker)
+        .env("GASCAN_SSH_ENABLED", "1")
+        .env("GASCAN_SSH_AUTHORIZED_KEY", "not-a-key")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "one two words\n");
+
+    let sleep = temporary.path().join("sleep");
+    fs::write(
+        &sleep,
+        "#!/bin/sh\nset -eu\nprintf 'sleep:%s\\n' \"$*\" >\"$MARKER\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&sleep, fs::Permissions::from_mode(0o755)).unwrap();
+    let disabled = Command::new(&entrypoint_path)
+        .env("MARKER", &marker)
+        .env("PATH", temporary.path())
+        .env("GASCAN_SSH_ENABLED", "0")
+        .status()
+        .unwrap();
+    assert!(disabled.success());
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "sleep:infinity\n");
+
+    let invalid = Command::new(&entrypoint_path)
+        .env("GASCAN_SSH_ENABLED", "yes")
+        .status()
+        .unwrap();
+    assert!(!invalid.success());
+
+    let entrypoint = fs::read_to_string(&entrypoint_path).unwrap();
+    assert!(
+        entrypoint.find("exec \"$@\"").unwrap() < entrypoint.find("GASCAN_SSH_ENABLED").unwrap(),
+        "explicit image commands must dispatch before managed SSH startup"
+    );
+    for required in [
+        "GASCAN_SSH_ENABLED:-0",
+        "0)",
+        "1)",
+        "--preserve-env=GASCAN_SSH_AUTHORIZED_KEY",
+        "/usr/local/bin/start-gascan-sshd",
+        "exec sleep infinity",
+    ] {
+        assert!(
+            entrypoint.contains(required),
+            "missing SSH dispatch: {required}"
+        );
+    }
+}
+
+#[test]
 fn smoke_fixture_uses_built_ref_and_checks_signal_and_zombies() {
     let smoke = fs::read_to_string(root().join("tests/image/user-and-volumes.sh")).unwrap();
     for required in [

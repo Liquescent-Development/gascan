@@ -115,6 +115,12 @@ fn fixture() -> Fixture {
         )
         .unwrap();
     }
+    fs::create_dir_all(root.join("images/workspace/tests")).unwrap();
+    fs::copy(
+        repository_root().join("images/workspace/tests/ssh-contract.sh"),
+        root.join("images/workspace/tests/ssh-contract.sh"),
+    )
+    .unwrap();
     let raw_container = temp.path().join("container-raw");
     executable(
         &raw_container,
@@ -248,6 +254,45 @@ fn workstation_smoke_initializes_the_mounted_home_before_contract_checks() {
         initialize < contract,
         "mounted workstation home must be initialized before its contract is checked"
     );
+}
+
+#[test]
+fn connected_gate_runs_the_managed_ssh_contract_without_publishing_a_port() {
+    let gate =
+        fs::read_to_string(repository_root().join("scripts/run-connected-image-gate.sh")).unwrap();
+    let contract =
+        fs::read_to_string(repository_root().join("images/workspace/tests/ssh-contract.sh"))
+            .unwrap();
+    assert!(
+        gate.contains("\"$root/images/workspace/tests/ssh-contract.sh\""),
+        "connected gate does not run the managed SSH contract"
+    );
+    assert!(
+        gate.contains("GASCAN_IMAGE_REF_FILE=\"$reference_file\""),
+        "SSH contract does not consume the candidate receipt"
+    );
+    assert!(
+        !gate.contains("--publish"),
+        "connected gate publishes a runtime port"
+    );
+    for required in [
+        "--network none",
+        "GASCAN_SSH_ENABLED=1",
+        "GASCAN_SSH_AUTHORIZED_KEY",
+        "127.0.0.1:22",
+        "ssh-keygen",
+        "PasswordAuthentication",
+        "PermitRootLogin",
+        "AllowTcpForwarding",
+        "AllowAgentForwarding",
+        "fingerprint",
+        "sftp",
+    ] {
+        assert!(
+            contract.contains(required),
+            "SSH live contract omits: {required}"
+        );
+    }
 }
 
 #[test]
