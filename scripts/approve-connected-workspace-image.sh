@@ -48,12 +48,18 @@ approved_existed=false
 published_evidence=false
 published_approval=false
 if test -f "$evidence_file"; then
-  cp "$evidence_file" "$evidence_backup"
+  cp -p "$evidence_file" "$evidence_backup"
+  cp -p "$evidence_file" "$evidence_tmp"
   evidence_existed=true
+else
+  chmod 0644 "$evidence_tmp"
 fi
 if test -f "$approved_file"; then
-  cp "$approved_file" "$approved_backup"
+  cp -p "$approved_file" "$approved_backup"
+  cp -p "$approved_file" "$approved_tmp"
   approved_existed=true
+else
+  chmod 0644 "$approved_tmp"
 fi
 rollback() {
   if $published_approval; then
@@ -70,6 +76,19 @@ on_signal() {
   rollback
   exit "$code"
 }
+test_boundary() {
+  boundary=$1
+  legacy=${2:-}
+  if test "${GASCAN_APPROVAL_TEST_BOUNDARY:-}" = "$boundary" ||
+    { test -n "$legacy" && test "${GASCAN_APPROVAL_TEST_BOUNDARY:-}" = "$legacy"; }
+  then
+    case "${GASCAN_APPROVAL_TEST_ACTION:-}" in
+      FAIL) false ;;
+      INT) kill -INT $$ ;;
+      TERM) kill -TERM $$ ;;
+    esac
+  fi
+}
 trap rollback EXIT
 trap 'on_signal 130' INT
 trap 'on_signal 143' TERM
@@ -78,19 +97,16 @@ receipt_digest=$(shasum -a 256 "$receipt_file" | awk '{print $1}')
 printf '# Connected workspace image evidence\n\n- status: `PASS`\n- platform: `linux/arm64`\n- image: `%s`\n- versions lock SHA-256: `%s`\n- build receipt SHA-256: `%s`\n- final current-token residue: `absent`\n' \
   "$candidate" "$lock_digest" "$receipt_digest" >"$evidence_tmp"
 printf '%s' "$candidate" >"$approved_tmp"
-mv -f "$evidence_tmp" "$evidence_file"
-evidence_tmp=''
 published_evidence=true
-if test "${GASCAN_APPROVAL_TEST_BOUNDARY:-}" = after-evidence; then
-  case "${GASCAN_APPROVAL_TEST_ACTION:-}" in
-    FAIL) false ;;
-    INT) kill -INT $$ ;;
-    TERM) kill -TERM $$ ;;
-  esac
-fi
-mv -f "$approved_tmp" "$approved_file"
-approved_tmp=''
+test_boundary before-evidence-replacement
+mv -f "$evidence_tmp" "$evidence_file"
+test_boundary after-evidence-replacement after-evidence
+evidence_tmp=''
 published_approval=true
+test_boundary before-approval-replacement
+mv -f "$approved_tmp" "$approved_file"
+test_boundary after-approval-replacement
+approved_tmp=''
 trap - EXIT INT TERM
 rm -f "$evidence_backup" "$approved_backup"
 printf '%s\n' "$candidate"

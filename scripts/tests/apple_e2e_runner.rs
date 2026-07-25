@@ -167,6 +167,78 @@ fn successful_apple_apply_targets_candidate_and_publishes_matching_live_receipt(
 }
 
 #[test]
+fn nonempty_scoped_session_root_fails_without_publishing_live_receipt() {
+    let fixture = runner_fixture(
+        "#!/bin/sh\nset -eu\nmkdir -p \"$RUNNER_FIXTURE_ROOT/target\"\nprintf '#!/bin/sh\\n' >\"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\nchmod 755 \"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\n",
+    );
+    let root = fixture.path();
+    let log = root.join("runner.log");
+    let artifacts = root.join(".artifacts");
+    fs::create_dir(&artifacts).unwrap();
+    let candidate = "ghcr.io/liquescent-development/gascan/workspace:candidate@sha256:\
+                     aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let candidate_file = artifacts.join("connected-workspace-image-candidate.txt");
+    let live_file = artifacts.join("connected-workspace-image-apple-live.txt");
+    fs::write(&candidate_file, format!("{candidate}\n")).unwrap();
+    write_executable(
+        &root.join("bin/cargo"),
+        "#!/bin/sh\nset -eu\ncase \" $* \" in\n *' build '*) mkdir -p \"$RUNNER_FIXTURE_ROOT/target/debug\"; printf '#!/bin/sh\\n' >\"$RUNNER_FIXTURE_ROOT/target/debug/gascan-e2e-cli\"; chmod 755 \"$RUNNER_FIXTURE_ROOT/target/debug/gascan-e2e-cli\";;\n *' test '*) printf 'unremoved\\n' >\"$GASCAN_E2E_SESSION_ROOT/scoped-residue\";;\nesac\n",
+    );
+
+    let output = Command::new(root.join("scripts/run-apple-e2e.sh"))
+        .arg("apple_apply")
+        .env("RUNNER_FIXTURE_ROOT", root)
+        .env("RUNNER_FIXTURE_LOG", &log)
+        .env("GASCAN_E2E_CANDIDATE_IMAGE_FILE", &candidate_file)
+        .env("GASCAN_E2E_LIVE_ACCEPTANCE_FILE", &live_file)
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", root.join("bin").display()),
+        )
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(!live_file.exists());
+}
+
+#[test]
+fn interrupted_apple_apply_does_not_publish_live_receipt() {
+    let fixture = runner_fixture(
+        "#!/bin/sh\nset -eu\nmkdir -p \"$RUNNER_FIXTURE_ROOT/target\"\nprintf '#!/bin/sh\\n' >\"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\nchmod 755 \"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\n",
+    );
+    let root = fixture.path();
+    let log = root.join("runner.log");
+    let artifacts = root.join(".artifacts");
+    fs::create_dir(&artifacts).unwrap();
+    let candidate = "ghcr.io/liquescent-development/gascan/workspace:candidate@sha256:\
+                     aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let candidate_file = artifacts.join("connected-workspace-image-candidate.txt");
+    let live_file = artifacts.join("connected-workspace-image-apple-live.txt");
+    fs::write(&candidate_file, format!("{candidate}\n")).unwrap();
+    write_executable(
+        &root.join("bin/cargo"),
+        "#!/bin/sh\nset -eu\ncase \" $* \" in\n *' build '*) mkdir -p \"$RUNNER_FIXTURE_ROOT/target/debug\"; printf '#!/bin/sh\\n' >\"$RUNNER_FIXTURE_ROOT/target/debug/gascan-e2e-cli\"; chmod 755 \"$RUNNER_FIXTURE_ROOT/target/debug/gascan-e2e-cli\";;\n *' test '*) kill -TERM \"$PPID\"; sleep 1;;\nesac\n",
+    );
+
+    let output = Command::new(root.join("scripts/run-apple-e2e.sh"))
+        .arg("apple_apply")
+        .env("RUNNER_FIXTURE_ROOT", root)
+        .env("RUNNER_FIXTURE_LOG", &log)
+        .env("GASCAN_E2E_CANDIDATE_IMAGE_FILE", &candidate_file)
+        .env("GASCAN_E2E_LIVE_ACCEPTANCE_FILE", &live_file)
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", root.join("bin").display()),
+        )
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(!live_file.exists());
+}
+
+#[test]
 fn runner_accepts_apple_security_as_an_explicit_single_target() {
     let fixture = runner_fixture(
         "#!/bin/sh\nset -eu\nmkdir -p \"$RUNNER_FIXTURE_ROOT/target\"\nprintf '#!/bin/sh\\n' >\"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\nchmod 755 \"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\n",

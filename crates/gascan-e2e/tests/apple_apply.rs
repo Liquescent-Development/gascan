@@ -272,10 +272,25 @@ fn shell_quote(value: &str) -> String {
 fn workstation_defaults_are_exact_credential_free_and_offline() -> TestResult {
     let env = AppleE2e::new("workstation-offline")?;
     let root = std::path::Path::new(env.root());
+    std::fs::create_dir(root.join(".gascan"))?;
+    let persistence = root.join(".gascan/workstation-state-persistence.sh");
+    std::fs::write(
+        &persistence,
+        include_str!("../../../tests/image/workstation-state-persistence.sh"),
+    )?;
+    std::fs::set_permissions(
+        &persistence,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )?;
+    std::fs::write(
+        root.join(".gascan/gascan-pi-extension.js"),
+        "export default function gascanPersistenceFixture() {}\n",
+    )?;
     env.success_with_timeout(
         ["up", root.to_str().ok_or("non-UTF-8 root")?],
         std::time::Duration::from_secs(10 * 60),
     )?;
+    env.assert_no_network_attachments()?;
     let contract = env.success_with_timeout(
         [
             "--sandbox",
@@ -293,6 +308,34 @@ fn workstation_defaults_are_exact_credential_free_and_offline() -> TestResult {
         )
         .into());
     }
+    env.success_with_timeout(
+        [
+            "--sandbox",
+            env.id(),
+            "run",
+            "--",
+            "/workspace/.gascan/workstation-state-persistence.sh",
+            "seed",
+        ],
+        std::time::Duration::from_secs(2 * 60),
+    )?;
+    env.success(["--sandbox", env.id(), "down"])?;
+    env.success_with_timeout(
+        ["up", root.to_str().ok_or("non-UTF-8 root")?],
+        std::time::Duration::from_secs(10 * 60),
+    )?;
+    env.assert_no_network_attachments()?;
+    env.success_with_timeout(
+        [
+            "--sandbox",
+            env.id(),
+            "run",
+            "--",
+            "/workspace/.gascan/workstation-state-persistence.sh",
+            "probe",
+        ],
+        std::time::Duration::from_secs(2 * 60),
+    )?;
     env.success(["--sandbox", env.id(), "destroy", "--yes"])?;
     env.assert_no_owned_resources()
 }

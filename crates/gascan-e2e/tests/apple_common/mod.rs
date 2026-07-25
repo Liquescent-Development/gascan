@@ -802,6 +802,10 @@ impl AppleE2e {
         validate_managed_network_attachment(&inspect, &inventory, self.id())
     }
 
+    pub fn assert_no_network_attachments(&self) -> TestResult {
+        validate_no_network_attachments(&self.container_json(["inspect", self.id()])?)
+    }
+
     pub fn kill_daemon(&self) -> TestResult {
         let pid = self.validated_daemon_pid()?.pid;
         let pid =
@@ -1082,6 +1086,21 @@ fn validate_managed_network_attachment(inspect: &Value, inventory: &Value, id: &
         return Err(format!("managed network ownership labels mismatch: {labels:?}").into());
     }
     Ok(())
+}
+
+fn validate_no_network_attachments(inspect: &Value) -> TestResult {
+    let record = inspect
+        .as_array()
+        .and_then(|records| (records.len() == 1).then(|| &records[0]))
+        .ok_or("container inspect is absent or ambiguous")?;
+    let networks = record["configuration"]["networks"]
+        .as_array()
+        .ok_or("container inspect lacks structured network attachments")?;
+    if networks.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("offline container has network attachments: {networks:?}").into())
+    }
 }
 
 fn owned_inventory_identities(
@@ -3413,6 +3432,22 @@ mod tests {
             "start-a",
             &wrong_socket
         ));
+    }
+
+    #[test]
+    fn exact_offline_attachment_validation_requires_one_container_and_no_networks() {
+        let offline = serde_json::json!([{"configuration": {"networks": []}}]);
+        assert!(validate_no_network_attachments(&offline).is_ok());
+        for invalid in [
+            serde_json::json!([]),
+            serde_json::json!([{}, {}]),
+            serde_json::json!([{"configuration": {}}]),
+            serde_json::json!([{
+                "configuration": {"networks": [{"network": "default"}]}
+            }]),
+        ] {
+            assert!(validate_no_network_attachments(&invalid).is_err());
+        }
     }
 
     #[test]

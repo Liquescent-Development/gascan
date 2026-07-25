@@ -1,7 +1,7 @@
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -78,6 +78,10 @@ fn fixture() -> Fixture {
 
 fn digest(path: &Path) -> String {
     format!("{:x}", Sha256::digest(fs::read(path).unwrap()))
+}
+
+fn mode(path: &Path) -> u32 {
+    fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
 
 #[test]
@@ -168,5 +172,126 @@ fn interruption_after_evidence_publication_restores_the_previous_pair() {
                     .to_string_lossy()
                     .starts_with(".approved-image."))
         );
+    }
+}
+
+#[test]
+fn interruption_immediately_before_evidence_replacement_restores_the_previous_pair() {
+    let mut f = fixture();
+    fs::write(
+        f.root.join("images/workspace/approved-image.txt"),
+        "previous-approval",
+    )
+    .unwrap();
+    fs::write(
+        f.root.join("docs/evidence/connected-workspace-image.md"),
+        "previous-evidence\n",
+    )
+    .unwrap();
+    f.command
+        .env(
+            "GASCAN_APPROVAL_TEST_BOUNDARY",
+            "before-evidence-replacement",
+        )
+        .env("GASCAN_APPROVAL_TEST_ACTION", "INT");
+
+    let output = f.command.output().unwrap();
+    assert_eq!(output.status.code(), Some(130));
+    assert_eq!(
+        fs::read_to_string(f.root.join("images/workspace/approved-image.txt")).unwrap(),
+        "previous-approval"
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join("docs/evidence/connected-workspace-image.md")).unwrap(),
+        "previous-evidence\n"
+    );
+}
+
+#[test]
+fn successful_replacement_preserves_the_prior_pair_modes() {
+    let mut f = fixture();
+    let approval = f.root.join("images/workspace/approved-image.txt");
+    let evidence = f.root.join("docs/evidence/connected-workspace-image.md");
+    fs::write(&approval, "previous-approval").unwrap();
+    fs::write(&evidence, "previous-evidence\n").unwrap();
+    fs::set_permissions(&approval, fs::Permissions::from_mode(0o640)).unwrap();
+    fs::set_permissions(&evidence, fs::Permissions::from_mode(0o604)).unwrap();
+    let approval_identity = (
+        fs::metadata(&approval).unwrap().uid(),
+        fs::metadata(&approval).unwrap().gid(),
+    );
+    let evidence_identity = (
+        fs::metadata(&evidence).unwrap().uid(),
+        fs::metadata(&evidence).unwrap().gid(),
+    );
+
+    let output = f.command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(mode(&approval), 0o640);
+    assert_eq!(mode(&evidence), 0o604);
+    assert_eq!(
+        (
+            fs::metadata(&approval).unwrap().uid(),
+            fs::metadata(&approval).unwrap().gid(),
+        ),
+        approval_identity
+    );
+    assert_eq!(
+        (
+            fs::metadata(&evidence).unwrap().uid(),
+            fs::metadata(&evidence).unwrap().gid(),
+        ),
+        evidence_identity
+    );
+}
+
+#[test]
+fn signals_at_every_replacement_boundary_restore_exact_prior_pair_or_absence() {
+    for boundary in [
+        "before-evidence-replacement",
+        "after-evidence-replacement",
+        "before-approval-replacement",
+        "after-approval-replacement",
+    ] {
+        for (action, code) in [("INT", 130), ("TERM", 143)] {
+            for prior_exists in [false, true] {
+                let mut f = fixture();
+                let approval = f.root.join("images/workspace/approved-image.txt");
+                let evidence = f.root.join("docs/evidence/connected-workspace-image.md");
+                if prior_exists {
+                    fs::write(&approval, "previous-approval").unwrap();
+                    fs::write(&evidence, "previous-evidence\n").unwrap();
+                    fs::set_permissions(&approval, fs::Permissions::from_mode(0o640)).unwrap();
+                    fs::set_permissions(&evidence, fs::Permissions::from_mode(0o604)).unwrap();
+                }
+                f.command
+                    .env("GASCAN_APPROVAL_TEST_BOUNDARY", boundary)
+                    .env("GASCAN_APPROVAL_TEST_ACTION", action);
+
+                let output = f.command.output().unwrap();
+                assert_eq!(
+                    output.status.code(),
+                    Some(code),
+                    "{boundary} {action} prior={prior_exists}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if prior_exists {
+                    assert_eq!(fs::read_to_string(&approval).unwrap(), "previous-approval");
+                    assert_eq!(
+                        fs::read_to_string(&evidence).unwrap(),
+                        "previous-evidence\n"
+                    );
+                    assert_eq!(mode(&approval), 0o640);
+                    assert_eq!(mode(&evidence), 0o604);
+                } else {
+                    assert!(!approval.exists(), "{boundary} {action}");
+                    assert!(!evidence.exists(), "{boundary} {action}");
+                }
+            }
+        }
     }
 }

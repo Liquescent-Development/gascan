@@ -368,13 +368,16 @@ first in `PATH`, ahead of the reviewed defaults in the immutable
 `/opt/gascan/mise` system data tree. The requested version therefore overrides
 an image default without changing the immutable workstation tree.
 
-Agent and forge configuration is sandbox-local under the managed
-`/home/workspace/.config/gascan` volume. Caches and logs are kept separately
-under the managed `/home/workspace/.cache` volume. Gas Can never imports the
-host home directory, SSH material, agent/forge tokens, Docker socket, or macOS
-keychain into the sandbox. Sandbox-local login state survives `gascan down`,
-`gascan up`, and container-only image replacement; `gascan destroy --yes`
-deletes it with the config volume.
+Native Claude Code, Codex, Pi, GitHub CLI, and GitLab CLI configuration is
+sandbox-local under the managed `/home/workspace/.config/gascan` volume. Mise
+caches and Pi session data are kept separately under the managed
+`/home/workspace/.cache` volume. Herdr is configured to read
+`/home/workspace/.config/gascan/herdr/config.toml` and place its logs beside
+that file, but Gas Can does not create a Herdr configuration or login. Gas Can
+never imports the host home directory, SSH material, agent/forge tokens,
+Docker socket, or macOS keychain into the sandbox. Native sandbox-local
+configuration survives `gascan down`, `gascan up`, and container-only image
+replacement; `gascan destroy --yes` deletes it with the config volume.
 
 Requesting any other tool or version makes mise download it, which requires
 `network = "networked"`. Installed tools persist in a per-sandbox volume, so
