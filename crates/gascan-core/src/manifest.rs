@@ -23,6 +23,7 @@ pub struct Manifest {
     storage: Storage,
     tools: BTreeMap<String, String>,
     ports: BTreeMap<String, u16>,
+    ssh: Ssh,
     #[serde(skip)]
     canonical_root: Utf8PathBuf,
 }
@@ -65,6 +66,7 @@ impl Manifest {
             storage: Storage::defaults(),
             tools: BTreeMap::new(),
             ports: BTreeMap::new(),
+            ssh: Ssh::default(),
             canonical_root,
         }
     }
@@ -120,6 +122,38 @@ impl Manifest {
 
     pub const fn ports(&self) -> &BTreeMap<String, u16> {
         &self.ports
+    }
+
+    pub const fn ssh(&self) -> &Ssh {
+        &self.ssh
+    }
+}
+
+/// Validated SSH policy loaded as part of a [`Manifest`].
+///
+/// SSH host ports cannot be constructed independently of manifest validation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct Ssh {
+    enabled: bool,
+    host_port: Option<u16>,
+}
+
+impl Default for Ssh {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            host_port: None,
+        }
+    }
+}
+
+impl Ssh {
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub const fn host_port(&self) -> Option<u16> {
+        self.host_port
     }
 }
 
@@ -381,6 +415,29 @@ struct RawManifest {
     tools: BTreeMap<String, String>,
     #[serde(default)]
     ports: BTreeMap<String, u16>,
+    #[serde(default)]
+    ssh: RawSsh,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSsh {
+    #[serde(default = "default_ssh_enabled")]
+    enabled: bool,
+    host_port: Option<u16>,
+}
+
+impl Default for RawSsh {
+    fn default() -> Self {
+        Self {
+            enabled: default_ssh_enabled(),
+            host_port: None,
+        }
+    }
+}
+
+const fn default_ssh_enabled() -> bool {
+    true
 }
 
 impl RawManifest {
@@ -393,6 +450,16 @@ impl RawManifest {
         if self.resources.cpus == Some(0) {
             return Err(ManifestError::Invalid(
                 "resources.cpus must be greater than zero".to_owned(),
+            ));
+        }
+        if !self.ssh.enabled && self.ssh.host_port.is_some() {
+            return Err(ManifestError::Invalid(
+                "ssh.host_port cannot be set when ssh.enabled is false".to_owned(),
+            ));
+        }
+        if self.ssh.host_port.is_some_and(|port| port < 1024) {
+            return Err(ManifestError::Invalid(
+                "ssh.host_port must be in 1024..=65535".to_owned(),
             ));
         }
         let resources = Resources {
@@ -449,6 +516,10 @@ impl RawManifest {
             storage,
             tools: self.tools,
             ports: self.ports,
+            ssh: Ssh {
+                enabled: self.ssh.enabled,
+                host_port: self.ssh.host_port,
+            },
             canonical_root: canonical_root.to_owned(),
         })
     }

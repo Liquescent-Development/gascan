@@ -5,6 +5,7 @@ use crate::runtime::{
     RuntimeResourceLimits, RuntimeUser, RuntimeVolume, immutable_image_reference,
 };
 use crate::sandbox::{SandboxSpec, WORKSPACE_TARGET};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use camino::{Utf8Path, Utf8PathBuf};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr};
@@ -27,6 +28,11 @@ pub const MISE_GLOBAL_CONFIG_FILE: &str = "/home/workspace/.config/gascan/mise.t
 pub const MISE_STATE_DIR: &str = "/home/workspace/.config/gascan/mise-state";
 pub const MISE_SYSTEM_DATA_DIR: &str = "/opt/gascan/mise";
 pub const CONTAINER_PATH: &str = "/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ControlPlanePolicy<'a> {
+    pub ssh_authorized_key: Option<&'a str>,
+}
 
 pub struct PolicyCompiler;
 
@@ -69,6 +75,33 @@ impl PolicyCompiler {
         capabilities: &RuntimeCapabilities,
         workspace_image: &str,
     ) -> Result<CreateRequest, PolicyError> {
+        Self::compile_for_image_with_control_plane(
+            spec,
+            capabilities,
+            workspace_image,
+            ControlPlanePolicy::default(),
+        )
+    }
+
+    pub fn compile_with_control_plane(
+        spec: SandboxSpec,
+        capabilities: &RuntimeCapabilities,
+        control: ControlPlanePolicy<'_>,
+    ) -> Result<CreateRequest, PolicyError> {
+        Self::compile_for_image_with_control_plane(
+            spec,
+            capabilities,
+            Self::workspace_image(),
+            control,
+        )
+    }
+
+    pub fn compile_for_image_with_control_plane(
+        spec: SandboxSpec,
+        capabilities: &RuntimeCapabilities,
+        workspace_image: &str,
+        control: ControlPlanePolicy<'_>,
+    ) -> Result<CreateRequest, PolicyError> {
         if !immutable_image_reference(workspace_image) {
             return Err(PolicyError::InvalidWorkspaceImage);
         }
@@ -76,6 +109,13 @@ impl PolicyCompiler {
         validate_capabilities(&spec, capabilities)?;
 
         let manifest = spec.manifest();
+        if manifest.ssh().enabled()
+            && control
+                .ssh_authorized_key
+                .is_some_and(|key| !is_ssh_public_key(key))
+        {
+            return Err(PolicyError::InvalidSshAuthorizedKey);
+        }
         let ports = compile_ports(manifest.network(), manifest.ports())?;
         let resources = compile_resources(manifest.resources())?;
         let ownership = OwnershipMetadata {
@@ -109,21 +149,7 @@ impl PolicyCompiler {
             bind_mounts,
             volumes,
             ports,
-            environment: BTreeMap::from([
-                ("HOME".to_owned(), WORKSPACE_HOME.to_owned()),
-                ("MISE_CACHE_DIR".to_owned(), MISE_CACHE_DIR.to_owned()),
-                ("MISE_DATA_DIR".to_owned(), MISE_DATA_DIR.to_owned()),
-                (
-                    "MISE_GLOBAL_CONFIG_FILE".to_owned(),
-                    MISE_GLOBAL_CONFIG_FILE.to_owned(),
-                ),
-                ("MISE_STATE_DIR".to_owned(), MISE_STATE_DIR.to_owned()),
-                (
-                    "MISE_SYSTEM_DATA_DIR".to_owned(),
-                    MISE_SYSTEM_DATA_DIR.to_owned(),
-                ),
-                ("PATH".to_owned(), CONTAINER_PATH.to_owned()),
-            ]),
+            environment: guest_environment(manifest.ssh().enabled(), control),
             resources,
             network,
             user,
@@ -131,6 +157,68 @@ impl PolicyCompiler {
             ownership,
         })
     }
+}
+
+fn guest_environment(
+    ssh_enabled: bool,
+    control: ControlPlanePolicy<'_>,
+) -> BTreeMap<String, String> {
+    let mut environment = BTreeMap::from([
+        (
+            "GASCAN_SSH_ENABLED".to_owned(),
+            if ssh_enabled { "1" } else { "0" }.to_owned(),
+        ),
+        ("HOME".to_owned(), WORKSPACE_HOME.to_owned()),
+        ("MISE_CACHE_DIR".to_owned(), MISE_CACHE_DIR.to_owned()),
+        ("MISE_DATA_DIR".to_owned(), MISE_DATA_DIR.to_owned()),
+        (
+            "MISE_GLOBAL_CONFIG_FILE".to_owned(),
+            MISE_GLOBAL_CONFIG_FILE.to_owned(),
+        ),
+        ("MISE_STATE_DIR".to_owned(), MISE_STATE_DIR.to_owned()),
+        (
+            "MISE_SYSTEM_DATA_DIR".to_owned(),
+            MISE_SYSTEM_DATA_DIR.to_owned(),
+        ),
+        ("PATH".to_owned(), CONTAINER_PATH.to_owned()),
+    ]);
+    if ssh_enabled && let Some(authorized_key) = control.ssh_authorized_key {
+        environment.insert(
+            "GASCAN_SSH_AUTHORIZED_KEY".to_owned(),
+            authorized_key.to_owned(),
+        );
+    }
+    environment
+}
+
+fn is_ssh_public_key(key: &str) -> bool {
+    let mut fields = key.split_ascii_whitespace();
+    let (Some(kind), Some(encoded)) = (fields.next(), fields.next()) else {
+        return false;
+    };
+    if kind != "ssh-ed25519"
+        || fields.next().is_some()
+        || key.len() != kind.len() + 1 + encoded.len()
+        || key.as_bytes().get(kind.len()) != Some(&b' ')
+    {
+        return false;
+    }
+    let Ok(blob) = STANDARD.decode(encoded) else {
+        return false;
+    };
+    let Some((wire_kind, key_data)) = ssh_wire_string(&blob) else {
+        return false;
+    };
+    let Some((public_key, trailing)) = ssh_wire_string(key_data) else {
+        return false;
+    };
+    wire_kind == kind.as_bytes() && public_key.len() == 32 && trailing.is_empty()
+}
+
+fn ssh_wire_string(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    let length = u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
+    let content = bytes.get(4..)?;
+    Some((content.get(..length)?, content.get(length..)?))
 }
 
 pub fn filtered_host_environment<I, K, V>(environment: I) -> BTreeMap<String, String>
@@ -271,6 +359,8 @@ fn managed_volume_names(sandbox_id: &str) -> [String; 3] {
 pub enum PolicyError {
     #[error("workspace image must be an immutable digest-qualified reference")]
     InvalidWorkspaceImage,
+    #[error("SSH authorized key must be an OpenSSH public key")]
+    InvalidSshAuthorizedKey,
     #[error("sandbox must contain exactly the canonical writable /workspace mount")]
     InvalidMount,
     #[error("runtime cannot provide bind mounts")]
@@ -303,6 +393,7 @@ impl PolicyError {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::InvalidWorkspaceImage => "invalid_workspace_image",
+            Self::InvalidSshAuthorizedKey => "invalid_ssh_authorized_key",
             Self::InvalidMount => "invalid_mount",
             Self::BindMountsUnavailable => "bind_mounts_unavailable",
             Self::NamedVolumesUnavailable => "named_volumes_unavailable",

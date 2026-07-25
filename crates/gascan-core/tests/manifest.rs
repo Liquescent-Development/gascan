@@ -1,7 +1,7 @@
 use camino::Utf8Path;
 use gascan_core::manifest::{
     DEFAULT_CACHE_STORAGE_BYTES, DEFAULT_CONFIG_STORAGE_BYTES, DEFAULT_TOOLS_STORAGE_BYTES,
-    Manifest, NetworkMode, UserMode,
+    Manifest, NetworkMode, Ssh, UserMode,
 };
 use std::collections::BTreeMap;
 
@@ -31,6 +31,42 @@ fn omitted_policy_uses_security_defaults() {
     assert_eq!(manifest.setup(), None);
     assert_eq!(manifest.tools(), &BTreeMap::new());
     assert_eq!(manifest.ports(), &BTreeMap::new());
+}
+
+#[test]
+fn ssh_policy_defaults_to_enabled_without_a_host_port() {
+    let manifest = load("version = 1\n").expect("minimal manifest parses");
+
+    assert_eq!(manifest.ssh(), &Ssh::default());
+    assert!(manifest.ssh().enabled());
+    assert_eq!(manifest.ssh().host_port(), None);
+}
+
+#[test]
+fn ssh_policy_accepts_an_explicit_high_host_port_and_disable() {
+    let configured = load("version = 1\n[ssh]\nenabled = true\nhost_port = 22222\n")
+        .expect("SSH high port is accepted");
+    assert!(configured.ssh().enabled());
+    assert_eq!(configured.ssh().host_port(), Some(22222));
+
+    let disabled = load("version = 1\n[ssh]\nenabled = false\n").expect("SSH can be disabled");
+    assert!(!disabled.ssh().enabled());
+    assert_eq!(disabled.ssh().host_port(), None);
+}
+
+#[test]
+fn ssh_policy_rejects_unknown_zero_privileged_and_disabled_host_ports() {
+    for source in [
+        "version = 1\n[ssh]\nagent_forwarding = true\n",
+        "version = 1\n[ssh]\nhost_port = 0\n",
+        "version = 1\n[ssh]\nhost_port = 1023\n",
+        "version = 1\n[ssh]\nenabled = false\nhost_port = 22222\n",
+    ] {
+        assert!(
+            load(source).is_err(),
+            "accepted invalid SSH policy: {source}"
+        );
+    }
 }
 
 #[test]

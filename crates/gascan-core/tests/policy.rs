@@ -1,8 +1,8 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use gascan_core::manifest::Manifest;
 use gascan_core::policy::{
-    DEFAULT_CPUS, DEFAULT_MEMORY_BYTES, MAX_CPUS, MAX_MEMORY_BYTES, PolicyCompiler,
-    filtered_host_environment,
+    ControlPlanePolicy, DEFAULT_CPUS, DEFAULT_MEMORY_BYTES, MAX_CPUS, MAX_MEMORY_BYTES,
+    PolicyCompiler, filtered_host_environment,
 };
 use gascan_core::runtime::{
     NetworkIsolation, ResourceKind, RuntimeCapabilities, RuntimeNetwork, RuntimeUser,
@@ -117,6 +117,146 @@ fn host_environment_has_a_fixed_allowlist() {
 }
 
 #[test]
+fn ssh_control_plane_seals_only_the_public_key_without_publishing_a_runtime_port() {
+    let public_key =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB";
+    let private_key = "-----BEGIN OPENSSH PRIVATE KEY-----";
+    let (_temp, spec) = spec("version = 1\nnetwork = 'networked'\n[ssh]\nhost_port = 22222\n");
+    let host_path = spec.canonical_root().as_str().to_owned();
+
+    let request = PolicyCompiler::compile_with_control_plane(
+        spec,
+        &capabilities(),
+        ControlPlanePolicy {
+            ssh_authorized_key: Some(public_key),
+        },
+    )
+    .expect("compile SSH control-plane policy");
+
+    assert!(request.ports().is_empty(), "SSH is not an application port");
+    assert_eq!(
+        request
+            .environment()
+            .get("GASCAN_SSH_AUTHORIZED_KEY")
+            .map(String::as_str),
+        Some(public_key)
+    );
+    assert_eq!(
+        request
+            .environment()
+            .get("GASCAN_SSH_ENABLED")
+            .map(String::as_str),
+        Some("1")
+    );
+    assert!(
+        request.environment().values().all(|value| {
+            !value.contains(private_key) && !value.contains("22222") && !value.contains(&host_path)
+        }),
+        "guest environment excludes private keys, host ports, and host paths"
+    );
+}
+
+#[test]
+fn offline_and_disabled_ssh_policy_never_publish_ssh_and_only_toggle_guest_enablement() {
+    let public_key =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB";
+    let (_temp_offline, offline) = spec("version = 1\nnetwork = 'offline'\n");
+    let offline_request = PolicyCompiler::compile_with_control_plane(
+        offline,
+        &capabilities(),
+        ControlPlanePolicy {
+            ssh_authorized_key: Some(public_key),
+        },
+    )
+    .expect("offline SSH control policy compiles without a runtime port");
+    assert!(offline_request.ports().is_empty());
+    assert_eq!(
+        offline_request
+            .environment()
+            .get("GASCAN_SSH_AUTHORIZED_KEY")
+            .map(String::as_str),
+        Some(public_key)
+    );
+    assert_eq!(
+        offline_request
+            .environment()
+            .get("GASCAN_SSH_ENABLED")
+            .map(String::as_str),
+        Some("1")
+    );
+
+    let (_temp_disabled, disabled) = spec("version = 1\n[ssh]\nenabled = false\n");
+    let disabled_request = PolicyCompiler::compile_with_control_plane(
+        disabled,
+        &capabilities(),
+        ControlPlanePolicy {
+            ssh_authorized_key: Some(public_key),
+        },
+    )
+    .expect("disabled SSH control policy compiles");
+    assert!(disabled_request.ports().is_empty());
+    assert_eq!(
+        disabled_request
+            .environment()
+            .get("GASCAN_SSH_ENABLED")
+            .map(String::as_str),
+        Some("0")
+    );
+    assert!(
+        !disabled_request
+            .environment()
+            .contains_key("GASCAN_SSH_AUTHORIZED_KEY")
+    );
+}
+
+#[test]
+fn ssh_control_plane_rejects_private_key_material() {
+    let (_temp, spec) = spec("version = 1\n");
+    let error = PolicyCompiler::compile_with_control_plane(
+        spec,
+        &capabilities(),
+        ControlPlanePolicy {
+            ssh_authorized_key: Some("-----BEGIN OPENSSH PRIVATE KEY-----"),
+        },
+    )
+    .expect_err("private key material must never enter the guest environment");
+
+    assert_eq!(error.code(), "invalid_ssh_authorized_key");
+}
+
+#[test]
+fn ssh_control_plane_rejects_private_material_after_a_public_key_record() {
+    let (_temp, spec) = spec("version = 1\n");
+    let error = PolicyCompiler::compile_with_control_plane(
+        spec,
+        &capabilities(),
+        ControlPlanePolicy {
+            ssh_authorized_key: Some(
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB\n-----BEGIN OPENSSH PRIVATE KEY-----",
+            ),
+        },
+    )
+    .expect_err("private key material following a public key record must be rejected");
+
+    assert_eq!(error.code(), "invalid_ssh_authorized_key");
+}
+
+#[test]
+fn ssh_control_plane_rejects_a_private_key_blob_disguised_as_ed25519() {
+    let (_temp, spec) = spec("version = 1\n");
+    let error = PolicyCompiler::compile_with_control_plane(
+        spec,
+        &capabilities(),
+        ControlPlanePolicy {
+            ssh_authorized_key: Some("ssh-ed25519 b3BlbnNzaC1rZXktdjEAAAA="),
+        },
+    )
+    .expect_err("an OpenSSH private-key blob is not an authorized public key");
+
+    assert_eq!(error.code(), "invalid_ssh_authorized_key");
+}
+
+#[test]
 fn canonical_request_has_one_root_mount_owned_volumes_loopback_ports_and_init() {
     let (_temp, spec) = spec(
         "version = 1\nnetwork = 'networked'\nuser = 'root'\n[storage]\ntools = '11GiB'\ncache = '12GiB'\nconfig = '2GiB'\n[ports]\napi = 8080\nweb = 3000\n",
@@ -176,6 +316,7 @@ fn canonical_request_has_one_root_mount_owned_volumes_loopback_ports_and_init() 
     assert_eq!(
         request.environment(),
         &BTreeMap::from([
+            ("GASCAN_SSH_ENABLED".to_owned(), "1".to_owned()),
             ("HOME".to_owned(), "/home/workspace".to_owned()),
             (
                 "MISE_CACHE_DIR".to_owned(),
@@ -430,7 +571,7 @@ fn approved_json_shape_exposes_no_unsafe_backend_surface() {
             "snapshot contains {forbidden}: {snapshot}"
         );
     }
-    assert_eq!(request.environment().len(), 7);
+    assert_eq!(request.environment().len(), 8);
     assert_eq!(
         request
             .environment()

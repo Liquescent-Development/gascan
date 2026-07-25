@@ -477,6 +477,7 @@ name = "gascan-core"
 version = "0.1.7"
 dependencies = [
  "async-trait",
+ "base64",
  "camino",
  "rustix",
  "serde",
