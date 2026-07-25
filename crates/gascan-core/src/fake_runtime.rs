@@ -59,6 +59,14 @@ pub enum FailureBoundary {
     ListResources,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FakeExecHangPhase {
+    Start,
+    Close,
+    Output,
+    Drain,
+}
+
 impl FailureBoundary {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -92,7 +100,9 @@ struct FakeState {
     exec_results: VecDeque<(Vec<u8>, Vec<u8>, i32, i32)>,
     exec_errors: VecDeque<RuntimeError>,
     create_errors: VecDeque<RuntimeError>,
+    ssh_port_collisions: usize,
     created_ssh_host_ports: VecDeque<u16>,
+    exec_hangs: VecDeque<FakeExecHangPhase>,
     exec_input_failures: usize,
     exec_stream_errors: VecDeque<RuntimeError>,
     exec_cancellations: usize,
@@ -116,7 +126,9 @@ impl FakeRuntime {
                 exec_results: VecDeque::new(),
                 exec_errors: VecDeque::new(),
                 create_errors: VecDeque::new(),
+                ssh_port_collisions: 0,
                 created_ssh_host_ports: VecDeque::new(),
+                exec_hangs: VecDeque::new(),
                 exec_input_failures: 0,
                 exec_stream_errors: VecDeque::new(),
                 exec_cancellations: 0,
@@ -229,6 +241,10 @@ impl FakeRuntime {
         self.inner.lock().await.create_errors.push_back(error);
     }
 
+    pub async fn queue_ssh_port_collision(&self) {
+        self.inner.lock().await.ssh_port_collisions += 1;
+    }
+
     pub async fn queue_created_ssh_host_port(&self, port: u16) {
         self.inner
             .lock()
@@ -267,6 +283,10 @@ impl FakeRuntime {
 
     pub async fn queue_exec_input_failure(&self) {
         self.inner.lock().await.exec_input_failures += 1;
+    }
+
+    pub async fn queue_exec_hang(&self, phase: FakeExecHangPhase) {
+        self.inner.lock().await.exec_hangs.push_back(phase);
     }
 
     pub async fn queue_exec_stream_error(&self, error: RuntimeError) {
@@ -494,7 +514,9 @@ fn load_state(capabilities: RuntimeCapabilities, path: &Path) -> Result<FakeStat
         exec_results: VecDeque::new(),
         exec_errors: VecDeque::new(),
         create_errors: VecDeque::new(),
+        ssh_port_collisions: 0,
         created_ssh_host_ports: VecDeque::new(),
+        exec_hangs: VecDeque::new(),
         exec_input_failures: 0,
         exec_stream_errors: VecDeque::new(),
         exec_cancellations: 0,
@@ -608,6 +630,15 @@ impl RuntimeBackend for FakeRuntime {
     async fn create(&self, request: CreateRequest) -> Result<CreateOutcome, CreateFailure> {
         let mut state = self.inner.lock().await;
         state.calls.push(RuntimeCall::Create(request.clone()));
+        if state.ssh_port_collisions > 0 {
+            state.ssh_port_collisions -= 1;
+            let error = selected_ssh_port_collision(&request);
+            state.outcomes.push(RuntimeOutcome::Failure {
+                boundary: "create".to_owned(),
+                code: error.code().to_owned(),
+            });
+            return Err(CreateFailure::from_source(error));
+        }
         if let Some(error) = state.create_errors.pop_front() {
             state.outcomes.push(RuntimeOutcome::Failure {
                 boundary: "create".to_owned(),
@@ -740,6 +771,15 @@ impl RuntimeBackend for FakeRuntime {
         state
             .calls
             .push(RuntimeCall::CreateContainer(request.clone()));
+        if state.ssh_port_collisions > 0 {
+            state.ssh_port_collisions -= 1;
+            let error = selected_ssh_port_collision(request.create());
+            state.outcomes.push(RuntimeOutcome::Failure {
+                boundary: "create_container".to_owned(),
+                code: error.code().to_owned(),
+            });
+            return Err(CreateFailure::from_source(error));
+        }
         if let Some(error) = state.create_errors.pop_front() {
             state.outcomes.push(RuntimeOutcome::Failure {
                 boundary: "create_container".to_owned(),
@@ -893,6 +933,56 @@ impl RuntimeBackend for FakeRuntime {
                 resource: request.id.to_string(),
                 message: "exec requires a running sandbox".to_owned(),
             });
+        }
+        let hang = state.exec_hangs.pop_front();
+        if hang == Some(FakeExecHangPhase::Start) {
+            drop(state);
+            return std::future::pending::<Result<ExecSession, RuntimeError>>().await;
+        }
+        if let Some(phase) = hang {
+            let runtime = self.clone();
+            let (cancellation, mut cancelled) = ExecCancellation::channel();
+            tokio::spawn(async move {
+                if cancelled.changed().await.is_ok() && *cancelled.borrow() {
+                    runtime.inner.lock().await.exec_cancellations += 1;
+                }
+            });
+            let (input, mut inputs) = tokio::sync::mpsc::channel(1);
+            let (outputs, output) = tokio::sync::mpsc::channel(1);
+            match phase {
+                FakeExecHangPhase::Start => unreachable!(),
+                FakeExecHangPhase::Close => {
+                    input.try_send(ExecInput::Stdin(Vec::new())).map_err(|_| {
+                        RuntimeError::InvalidState {
+                            resource: request.id.to_string(),
+                            message: "could not prepare fake close hang".to_owned(),
+                        }
+                    })?;
+                    tokio::spawn(async move {
+                        let _inputs = inputs;
+                        let _outputs = outputs;
+                        std::future::pending::<()>().await;
+                    });
+                }
+                FakeExecHangPhase::Output => {
+                    tokio::spawn(async move {
+                        let _ = inputs.recv().await;
+                        let _outputs = outputs;
+                        std::future::pending::<()>().await;
+                    });
+                }
+                FakeExecHangPhase::Drain => {
+                    tokio::spawn(async move {
+                        let _ = inputs.recv().await;
+                        let _ = outputs
+                            .send(Ok(ExecOutput::Stdout(vec![b'x'; 16 * 1024 + 1])))
+                            .await;
+                        let _outputs = outputs;
+                        std::future::pending::<()>().await;
+                    });
+                }
+            }
+            return Ok(ExecSession::live_cancellable(input, output, cancellation));
         }
         if state.exec_input_failures > 0 {
             state.exec_input_failures -= 1;
@@ -1067,6 +1157,19 @@ fn observed_created_ports(
         mapping.host_port = host_port;
     }
     ports
+}
+
+fn selected_ssh_port_collision(request: &CreateRequest) -> RuntimeError {
+    let port = request
+        .ports()
+        .iter()
+        .find(|mapping| mapping.guest_port == 22)
+        .map_or(49_152, |mapping| mapping.host_port);
+    RuntimeError::CommandFailed {
+        operation: "container".to_owned(),
+        exit_code: Some(1),
+        stderr: format!("Error: listen tcp 127.0.0.1:{port}: bind: address already in use\n"),
+    }
 }
 
 fn fail_after_create_mutation(

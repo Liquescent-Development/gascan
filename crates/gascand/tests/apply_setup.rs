@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use gascan_core::fake_runtime::{FailureBoundary, FakeRuntime};
 use gascan_core::manifest::Manifest;
-use gascan_core::runtime::{ContainerState, RuntimeBackend, RuntimeCall};
+use gascan_core::runtime::{ContainerState, ResourceKind, RuntimeBackend, RuntimeCall};
 use gascan_core::sandbox::SandboxSpec;
 use gascand::{
     ActualState, NoopProvisioner, ProvisionRequest, ProvisionResolution, Provisioner,
@@ -44,6 +44,15 @@ fn write_setup(root: &Utf8Path, relative: &str, bytes: &[u8]) -> TestResult {
 
 fn spec(root: &Utf8Path, name: &str) -> TestResult<SandboxSpec> {
     Ok(SandboxSpec::from_root(name, root, Manifest::load(root)?)?)
+}
+
+fn write_ssh_manifest(root: &Utf8Path, enabled: bool, host_port: Option<u16>) -> TestResult {
+    let port = host_port.map_or_else(String::new, |port| format!("host_port = {port}\n"));
+    std::fs::write(
+        root.join("gascan.toml"),
+        format!("version = 1\nnetwork = 'networked'\n[ssh]\nenabled = {enabled}\n{port}"),
+    )?;
+    Ok(())
 }
 
 fn setup_resolution(record: &gascand::SandboxRecord) -> Option<&Value> {
@@ -569,4 +578,157 @@ async fn ssh_image_apply_preserves_fingerprints_while_accepting_new_inspected_au
     assert!(config.contains(&format!("Host gascan-{}", desired.id())));
     assert!(config.contains("    Port 24002\n"));
     Ok(())
+}
+
+async fn assert_same_image_ssh_policy_recreate(
+    name: &str,
+    initial_enabled: bool,
+    initial_port: Option<u16>,
+    next_enabled: bool,
+    next_port: Option<u16>,
+    initial_observed_port: Option<u16>,
+    next_observed_port: Option<u16>,
+) -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    write_ssh_manifest(root, initial_enabled, initial_port)?;
+    let initial = spec(root, name)?;
+    let paths = ssh_paths(root, &format!("{name}-client"))?;
+    let host_paths = ssh_paths(root, &format!("{name}-host"))?;
+    let host_public_key = ensure_host_identity(&host_paths)
+        .await?
+        .public_key()
+        .to_owned();
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    if let Some(port) = initial_observed_port {
+        runtime.queue_created_ssh_host_port(port).await;
+    }
+    let service = SandboxService::new_with_ssh_for_tests(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+        paths.clone(),
+        Utf8PathBuf::from("/usr/bin/true"),
+    );
+    service.up(UpRequest::new(initial.clone())).await?;
+    let mut retained_volumes = runtime
+        .list_resources()
+        .await?
+        .into_iter()
+        .filter(|resource| resource.kind() == ResourceKind::Volume)
+        .map(|resource| resource.name().to_owned())
+        .collect::<Vec<_>>();
+    retained_volumes.sort();
+    let replacements_before = runtime
+        .calls()
+        .await
+        .iter()
+        .filter(|call| matches!(call, RuntimeCall::CreateContainer(_)))
+        .count();
+
+    write_ssh_manifest(root, next_enabled, next_port)?;
+    let next = spec(root, name)?;
+    if let Some(port) = next_observed_port {
+        runtime.queue_created_ssh_host_port(port).await;
+    }
+    service.apply(UpRequest::new(next.clone())).await?;
+
+    let replacements_after = runtime
+        .calls()
+        .await
+        .iter()
+        .filter(|call| matches!(call, RuntimeCall::CreateContainer(_)))
+        .count();
+    assert_eq!(replacements_after, replacements_before + 1);
+    let mut replaced_volumes = runtime
+        .list_resources()
+        .await?
+        .into_iter()
+        .filter(|resource| resource.kind() == ResourceKind::Volume)
+        .map(|resource| resource.name().to_owned())
+        .collect::<Vec<_>>();
+    replaced_volumes.sort();
+    assert_eq!(replaced_volumes, retained_volumes);
+    let inspected = runtime.inspect(next.id()).await?.ok_or("runtime")?;
+    let ssh_ports = inspected
+        .ports()
+        .iter()
+        .filter(|mapping| mapping.guest_port == 22)
+        .map(|mapping| mapping.host_port)
+        .collect::<Vec<_>>();
+    let expected_port = next_observed_port.or(next_port);
+    assert_eq!(ssh_ports, expected_port.into_iter().collect::<Vec<_>>());
+    let record = service.status(next.id())?.ok_or("record")?;
+    assert_eq!(
+        record
+            .ssh_resolution
+            .as_ref()
+            .and_then(|resolution| resolution.details["enabled"].as_bool()),
+        Some(next_enabled)
+    );
+    let config = std::fs::read_to_string(paths.config())?;
+    assert_eq!(
+        config.contains(&format!("Host gascan-{}", next.id())),
+        next_enabled
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn same_image_apply_recreates_enabled_ssh_as_disabled() -> TestResult {
+    assert_same_image_ssh_policy_recreate(
+        "ssh-disable-apply",
+        true,
+        Some(24_101),
+        false,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn same_image_apply_recreates_disabled_ssh_as_enabled() -> TestResult {
+    assert_same_image_ssh_policy_recreate(
+        "ssh-enable-apply",
+        false,
+        None,
+        true,
+        Some(24_102),
+        None,
+        None,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn same_image_apply_recreates_automatic_ssh_as_explicit() -> TestResult {
+    assert_same_image_ssh_policy_recreate(
+        "ssh-auto-explicit-apply",
+        true,
+        None,
+        true,
+        Some(24_104),
+        Some(24_103),
+        None,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn same_image_apply_recreates_changed_explicit_ssh_port() -> TestResult {
+    assert_same_image_ssh_policy_recreate(
+        "ssh-explicit-change-apply",
+        true,
+        Some(24_105),
+        true,
+        Some(24_106),
+        None,
+        None,
+    )
+    .await
 }

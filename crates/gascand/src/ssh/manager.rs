@@ -15,18 +15,25 @@ use gascan_core::runtime::{
     ContainerState, CreateFailure, ExecInput, ExecOutput, ExecRequest, RuntimeBackend, RuntimeError,
 };
 use gascan_core::sandbox::{SandboxId, SandboxSpec};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::net::{IpAddr, Ipv4Addr};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 use tokio::process::Command;
+use tokio::sync::OwnedMutexGuard;
 
 const CONFIG_NAME: &str = "config";
 const SSH_CLIENT: &str = "/usr/bin/ssh";
 const READINESS_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const HOST_KEY_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_HOST_KEY_OUTPUT: usize = 16 * 1024;
 const HOST_KEY_PATH: &str = "/home/workspace/.config/gascan/ssh/host/ssh_host_ed25519_key.pub";
+type PublicationLock = Arc<tokio::sync::Mutex<()>>;
+type PublicationGuard = OwnedMutexGuard<()>;
+static PUBLICATION_LOCKS: OnceLock<Mutex<HashMap<Utf8PathBuf, Weak<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
 
 pub struct PreparedSshCreate {
     identity: HostIdentity,
@@ -64,6 +71,7 @@ pub(crate) struct PreparedSshActivation {
     managed: ManagedSshHost,
     paths: SshPaths,
     prepared: PreparedSshFiles,
+    _publication: PublicationGuard,
 }
 
 impl PreparedSshActivation {
@@ -86,6 +94,9 @@ impl SshManager {
         &self,
         spec: &SandboxSpec,
     ) -> Result<Option<PreparedSshCreate>, ServiceError> {
+        if !spec.manifest().ssh().enabled() {
+            return Ok(None);
+        }
         let paths = SshPaths::for_user().map_err(ServiceError::SshConfigUnsafe)?;
         self.prepare_create_for_paths(spec, &paths).await
     }
@@ -124,14 +135,21 @@ impl SshManager {
     ) -> Result<Option<ActiveSsh>, ServiceError> {
         let paths = SshPaths::for_user().map_err(ServiceError::SshConfigUnsafe)?;
         let prepared = self
-            .prepare_activation_for_paths(id, runtime, expected, &paths, Utf8Path::new(SSH_CLIENT))
+            .prepare_activation_for_paths(
+                id,
+                runtime,
+                expected,
+                &paths,
+                Utf8Path::new(SSH_CLIENT),
+                HOST_KEY_READ_TIMEOUT,
+            )
             .await?;
         prepared.map(PreparedSshActivation::commit).transpose()
     }
 
-    pub fn deactivate(&self, id: &SandboxId) -> Result<(), ServiceError> {
+    pub async fn deactivate(&self, id: &SandboxId) -> Result<(), ServiceError> {
         let paths = SshPaths::for_user().map_err(ServiceError::SshConfigUnsafe)?;
-        self.deactivate_for_paths(id, &paths)
+        self.deactivate_for_paths(id, &paths).await
     }
 
     pub(crate) async fn prepare_activation_for_paths(
@@ -141,14 +159,17 @@ impl SshManager {
         expected: Option<&SshResolution>,
         paths: &SshPaths,
         readiness_program: &Utf8Path,
+        host_key_timeout: Duration,
     ) -> Result<Option<PreparedSshActivation>, ServiceError> {
         if expected.is_some_and(|resolution| !resolution_enabled(resolution)) {
             return Ok(None);
         }
+        let publication = publication_guard(paths).await?;
         let identity = ensure_host_identity(paths)
             .await
             .map_err(ServiceError::SshConfigUnsafe)?;
-        let managed = verified_managed_host(id, runtime, expected, &identity).await?;
+        let managed =
+            verified_managed_host(id, runtime, expected, &identity, host_key_timeout).await?;
         let mut hosts = load_active_hosts(paths, &identity)?;
         hosts.retain(|host| host.active.alias != managed.active.alias);
         hosts.push(managed.clone());
@@ -165,6 +186,7 @@ impl SshManager {
             managed,
             paths: paths.clone(),
             prepared,
+            _publication: publication,
         }))
     }
 
@@ -175,6 +197,7 @@ impl SshManager {
         expected: &SshResolution,
         paths: &SshPaths,
         readiness_program: &Utf8Path,
+        host_key_timeout: Duration,
     ) -> Result<Option<ManagedSshHost>, ServiceError> {
         if !resolution_enabled(expected) {
             return Ok(None);
@@ -182,7 +205,8 @@ impl SshManager {
         let identity = ensure_host_identity(paths)
             .await
             .map_err(ServiceError::SshConfigUnsafe)?;
-        let managed = verified_managed_host(id, runtime, Some(expected), &identity).await?;
+        let managed =
+            verified_managed_host(id, runtime, Some(expected), &identity, host_key_timeout).await?;
         let prepared = prepare_openssh_files(paths, &identity, std::slice::from_ref(&managed))
             .map_err(ServiceError::SshConfigUnsafe)?;
         run_readiness(
@@ -195,22 +219,24 @@ impl SshManager {
         Ok(Some(managed))
     }
 
-    pub(crate) fn publish_reconciled(
+    pub(crate) async fn publish_reconciled(
         &self,
         paths: &SshPaths,
         hosts: &[ManagedSshHost],
     ) -> Result<(), ServiceError> {
+        let _publication = publication_guard(paths).await?;
         let identity = futures_identity(paths).map_err(ServiceError::SshConfigUnsafe)?;
         let prepared = prepare_openssh_files(paths, &identity, hosts)
             .map_err(ServiceError::SshConfigUnsafe)?;
         commit_openssh_files(paths, prepared).map_err(ServiceError::SshConfigUpdateFailed)
     }
 
-    pub(crate) fn deactivate_for_paths(
+    pub(crate) async fn deactivate_for_paths(
         &self,
         id: &SandboxId,
         paths: &SshPaths,
     ) -> Result<(), ServiceError> {
+        let _publication = publication_guard(paths).await?;
         let identity = futures_identity(paths).map_err(ServiceError::SshConfigUnsafe)?;
         let mut hosts = load_active_hosts(paths, &identity)?;
         let alias = alias(id);
@@ -225,6 +251,27 @@ impl SshManager {
     }
 }
 
+async fn publication_guard(paths: &SshPaths) -> Result<PublicationGuard, ServiceError> {
+    let key = paths.directory().to_owned();
+    let publication = {
+        let registry = PUBLICATION_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut registry = registry.lock().map_err(|_| {
+            ServiceError::SshConfigUnsafe(super::SshError::InvalidState(
+                "managed SSH publication lock registry was poisoned",
+            ))
+        })?;
+        registry.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = registry.get(&key).and_then(Weak::upgrade) {
+            lock
+        } else {
+            let lock = PublicationLock::new(tokio::sync::Mutex::new(()));
+            registry.insert(key, Arc::downgrade(&lock));
+            lock
+        }
+    };
+    Ok(publication.lock_owned().await)
+}
+
 pub(crate) fn disabled_resolution() -> SshResolution {
     SshResolution::new(
         1,
@@ -236,7 +283,7 @@ pub(crate) fn disabled_resolution() -> SshResolution {
     )
 }
 
-pub(crate) fn is_native_port_collision(failure: &CreateFailure) -> bool {
+pub(crate) fn is_native_port_collision(failure: &CreateFailure, selected_port: u16) -> bool {
     matches!(
         failure.source(),
         RuntimeError::CommandFailed {
@@ -245,8 +292,10 @@ pub(crate) fn is_native_port_collision(failure: &CreateFailure) -> bool {
             stderr,
         } if operation == "container"
             && stderr.lines().any(|line| {
-                line.starts_with("Error: listen tcp 127.0.0.1:")
-                    && line.ends_with(": bind: address already in use")
+                line.strip_prefix("Error: listen tcp 127.0.0.1:")
+                    .and_then(|line| line.strip_suffix(": bind: address already in use"))
+                    .and_then(|port| port.parse::<u16>().ok())
+                    == Some(selected_port)
             })
     )
 }
@@ -306,6 +355,7 @@ async fn verified_managed_host(
     runtime: &impl RuntimeBackend,
     expected: Option<&SshResolution>,
     identity: &HostIdentity,
+    host_key_timeout: Duration,
 ) -> Result<ManagedSshHost, ServiceError> {
     let inspected = runtime
         .inspect(id)
@@ -334,7 +384,7 @@ async fn verified_managed_host(
             "runtime inspection has an invalid native SSH mapping",
         ));
     }
-    let public_key = read_host_public_key(id, runtime).await?;
+    let public_key = read_host_public_key(id, runtime, host_key_timeout).await?;
     let parsed = parse_public_key(&public_key)
         .map_err(|_| ServiceError::SshHostKeyMismatch("guest SSH host key is invalid"))?;
     if let Some((expected_host, expected_client)) = expected_fingerprints(expected)?
@@ -357,6 +407,16 @@ async fn verified_managed_host(
 }
 
 async fn read_host_public_key(
+    id: &SandboxId,
+    runtime: &impl RuntimeBackend,
+    timeout: Duration,
+) -> Result<Vec<u8>, ServiceError> {
+    tokio::time::timeout(timeout, read_host_public_key_inner(id, runtime))
+        .await
+        .map_err(|_| ServiceError::SshHostKeyMismatch("guest SSH host key read timed out"))?
+}
+
+async fn read_host_public_key_inner(
     id: &SandboxId,
     runtime: &impl RuntimeBackend,
 ) -> Result<Vec<u8>, ServiceError> {

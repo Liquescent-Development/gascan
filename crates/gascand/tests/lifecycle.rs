@@ -17,6 +17,7 @@ use sha2::{Digest as _, Sha256};
 use std::error::Error;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::os::unix::fs::PermissionsExt;
+use std::process::Command;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -93,6 +94,33 @@ fn capturing_readiness_program(
     )
 }
 
+fn gated_readiness_program(
+    root: &Utf8Path,
+    name: &str,
+    port: u16,
+    entered: &Utf8Path,
+    release: &Utf8Path,
+) -> Result<Utf8PathBuf, Box<dyn Error>> {
+    readiness_program(
+        root,
+        name,
+        &format!(
+            "for arg do\n  if [ \"$arg\" = \"Port={port}\" ]; then\n    /usr/bin/touch '{entered}'\n    while [ ! -e '{release}' ]; do /bin/sleep 0.01; done\n  fi\ndone"
+        ),
+    )
+}
+
+async fn wait_for_path(path: &Utf8Path) -> Result<(), Box<dyn Error>> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| format!("timed out waiting for {path}"))?;
+    Ok(())
+}
+
 async fn generated_public_key(root: &Utf8Path, name: &str) -> Result<String, Box<dyn Error>> {
     let paths = ssh_paths(root, name)?;
     Ok(ensure_host_identity(&paths).await?.public_key().to_owned())
@@ -128,11 +156,11 @@ fn rewrite_runtime_image(path: &Utf8Path, image: &str) -> TestResult {
     Ok(())
 }
 
-fn automatic_port_collision() -> RuntimeError {
+fn loopback_port_collision(port: u16) -> RuntimeError {
     RuntimeError::CommandFailed {
         operation: "container".to_owned(),
         exit_code: Some(1),
-        stderr: "Error: listen tcp 127.0.0.1:49152: bind: address already in use\n".to_owned(),
+        stderr: format!("Error: listen tcp 127.0.0.1:{port}: bind: address already in use\n"),
     }
 }
 
@@ -180,7 +208,7 @@ async fn automatic_ssh_port_retries_exactly_eight_native_bind_collisions() -> Te
     let desired = networked_ssh_spec("automatic-retries", root, None)?;
     let runtime = FakeRuntime::default();
     for _ in 0..8 {
-        runtime.queue_create_error(automatic_port_collision()).await;
+        runtime.queue_ssh_port_collision().await;
     }
     let service = test_service(
         runtime.clone(),
@@ -213,7 +241,9 @@ async fn explicit_ssh_port_collision_never_retries_or_substitutes() -> TestResul
     let port = PortReservation::reserve()?.port();
     let desired = networked_ssh_spec("explicit-collision", root, Some(port))?;
     let runtime = FakeRuntime::default();
-    runtime.queue_create_error(automatic_port_collision()).await;
+    runtime
+        .queue_create_error(loopback_port_collision(port))
+        .await;
     let service = test_service(
         runtime.clone(),
         root,
@@ -241,6 +271,39 @@ async fn explicit_ssh_port_collision_never_retries_or_substitutes() -> TestResul
             && mapping.host_port == port
             && mapping.guest_port == 22
     }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn nonmatching_loopback_collision_is_not_retried_or_relabelled_as_ssh() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let desired = networked_ssh_spec("application-collision", root, Some(26_001))?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .queue_create_error(loopback_port_collision(30_000))
+        .await;
+    let service = test_service(
+        runtime.clone(),
+        root,
+        ssh_paths(root, "ssh-application-collision")?,
+    )?;
+
+    let error = match service.up(UpRequest::new(desired)).await {
+        Ok(_) => return Err("an application collision unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "command_failed");
+    assert_eq!(
+        runtime
+            .calls()
+            .await
+            .iter()
+            .filter(|call| matches!(call, RuntimeCall::Create(_)))
+            .count(),
+        1
+    );
     Ok(())
 }
 
@@ -342,6 +405,36 @@ async fn offline_default_create_injects_no_key_and_publishes_no_ssh_port() -> Te
     Ok(())
 }
 
+#[test]
+fn disabled_offline_prepare_ignores_missing_home_and_xdg_config_home() -> TestResult {
+    const CHILD: &str = "GASCAN_DISABLED_SSH_NO_HOME_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let temp = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+        let desired = spec("offline-no-home", root)?;
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        let prepared = runtime.block_on(SshManager.prepare_create(&desired))?;
+        assert!(prepared.is_none());
+        return Ok(());
+    }
+
+    let output = Command::new(std::env::current_exe()?)
+        .arg("--exact")
+        .arg("disabled_offline_prepare_ignores_missing_home_and_xdg_config_home")
+        .arg("--nocapture")
+        .env(CHILD, "1")
+        .env_remove("HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "disabled SSH consulted host paths:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn ssh_up_inspects_mapping_reads_host_key_runs_strict_readiness_and_commits_alias()
 -> TestResult {
@@ -431,13 +524,10 @@ async fn ssh_up_inspects_mapping_reads_host_key_runs_strict_readiness_and_commit
         resolution.details["client_key_fingerprint"],
         client.fingerprint()
     );
-    assert_eq!(
-        std::fs::read_to_string(paths.config())?.contains(&format!(
-            "Host gascan-{}\n    HostName 127.0.0.1\n    Port 23457",
-            desired.id()
-        )),
-        true
-    );
+    assert!(std::fs::read_to_string(paths.config())?.contains(&format!(
+        "Host gascan-{}\n    HostName 127.0.0.1\n    Port 23457",
+        desired.id()
+    )));
     Ok(())
 }
 
@@ -623,6 +713,108 @@ async fn ssh_config_commit_failure_publishes_no_alias_restores_resolution_and_ro
             .ssh_resolution
             .is_none()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_ssh_activations_publish_both_aliases_without_lost_update() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-concurrent-activate")?;
+    let host_public_key = generated_public_key(root, "host-concurrent-activate").await?;
+    let first_root = root.join("first-project");
+    let second_root = root.join("second-project");
+    std::fs::create_dir(&first_root)?;
+    std::fs::create_dir(&second_root)?;
+    let first = networked_ssh_spec("ssh-concurrent-first", &first_root, Some(26_101))?;
+    let second = networked_ssh_spec("ssh-concurrent-second", &second_root, Some(26_102))?;
+    let entered = root.join("first-readiness-entered");
+    let release = root.join("release-first-readiness");
+    let readiness =
+        gated_readiness_program(root, "gate-first-readiness", 26_101, &entered, &release)?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let service = Arc::new(service_with_readiness(
+        runtime,
+        root,
+        paths.clone(),
+        readiness,
+    )?);
+
+    let first_up = {
+        let service = Arc::clone(&service);
+        tokio::spawn(async move { service.up(UpRequest::new(first.clone())).await })
+    };
+    wait_for_path(&entered).await?;
+    let second_up = {
+        let service = Arc::clone(&service);
+        tokio::spawn(async move { service.up(UpRequest::new(second.clone())).await })
+    };
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    std::fs::write(&release, b"release")?;
+    first_up.await??;
+    second_up.await??;
+
+    let config = std::fs::read_to_string(paths.config())?;
+    assert!(config.contains("Host gascan-ssh-concurrent-first"));
+    assert!(config.contains("Host gascan-ssh-concurrent-second"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_deactivate_after_activate_read_does_not_resurrect_removed_alias() -> TestResult
+{
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-concurrent-deactivate")?;
+    let host_public_key = generated_public_key(root, "host-concurrent-deactivate").await?;
+    let first_root = root.join("first-project");
+    let second_root = root.join("second-project");
+    std::fs::create_dir(&first_root)?;
+    std::fs::create_dir(&second_root)?;
+    let first = networked_ssh_spec("ssh-deactivate-first", &first_root, Some(26_201))?;
+    let second = networked_ssh_spec("ssh-deactivate-second", &second_root, Some(26_202))?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let initial = test_service(runtime.clone(), root, paths.clone())?;
+    initial.up(UpRequest::new(first.clone())).await?;
+    initial.up(UpRequest::new(second.clone())).await?;
+    initial.stop(second.id()).await?;
+    drop(initial);
+
+    let entered = root.join("second-readiness-entered");
+    let release = root.join("release-second-readiness");
+    let readiness =
+        gated_readiness_program(root, "gate-second-readiness", 26_202, &entered, &release)?;
+    let service = Arc::new(service_with_readiness(
+        runtime,
+        root,
+        paths.clone(),
+        readiness,
+    )?);
+    let second_id = second.id().clone();
+    let activation = {
+        let service = Arc::clone(&service);
+        tokio::spawn(async move { service.start(&second_id).await })
+    };
+    wait_for_path(&entered).await?;
+    let first_id = first.id().clone();
+    let deactivation = {
+        let service = Arc::clone(&service);
+        tokio::spawn(async move { service.stop(&first_id).await })
+    };
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    std::fs::write(&release, b"release")?;
+    activation.await??;
+    deactivation.await??;
+
+    let config = std::fs::read_to_string(paths.config())?;
+    assert!(!config.contains("Host gascan-ssh-deactivate-first"));
+    assert!(config.contains("Host gascan-ssh-deactivate-second"));
     Ok(())
 }
 

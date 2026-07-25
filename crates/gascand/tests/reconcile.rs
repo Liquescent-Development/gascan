@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
-use gascan_core::fake_runtime::FakeRuntime;
+use gascan_core::fake_runtime::{FailureBoundary, FakeExecHangPhase, FakeRuntime};
 use gascan_core::manifest::Manifest;
 use gascan_core::policy::PolicyCompiler;
 use gascan_core::runtime::{ResourceKind, ResourceOwnership, RuntimeBackend, RuntimePort};
@@ -17,7 +17,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -650,5 +650,192 @@ async fn ssh_reconcile_publishes_one_complete_generation_and_isolates_broken_rec
         );
     }
     assert_eq!(config.matches("\nHost ").count(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn ssh_reconcile_continues_after_one_record_inspect_failure() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-inspect-isolation")?;
+    let host_paths = ssh_paths(root, "ssh-inspect-isolation-host")?;
+    let host_public_key = ensure_host_identity(&host_paths)
+        .await?
+        .public_key()
+        .to_owned();
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let store = Store::open(root.join("state.db"))?;
+    let service = ssh_service(
+        runtime.clone(),
+        store,
+        paths.clone(),
+        readiness_program(root, None)?,
+    );
+    let broken_root = root.join("broken-project");
+    let valid_root = root.join("valid-project");
+    std::fs::create_dir(&broken_root)?;
+    std::fs::create_dir(&valid_root)?;
+    std::fs::write(
+        broken_root.join("gascan.toml"),
+        "version = 1\nnetwork = 'networked'\n[ssh]\nhost_port = 25201\n",
+    )?;
+    let broken = SandboxSpec::from_root(
+        "aaa-inspect-broken",
+        &broken_root,
+        Manifest::load(&broken_root)?,
+    )?;
+    service.up(UpRequest::new(broken.clone())).await?;
+    std::fs::write(
+        valid_root.join("gascan.toml"),
+        "version = 1\nnetwork = 'networked'\n[ssh]\nhost_port = 25202\n",
+    )?;
+    let valid = SandboxSpec::from_root(
+        "zzz-inspect-valid",
+        &valid_root,
+        Manifest::load(&valid_root)?,
+    )?;
+    service.up(UpRequest::new(valid.clone())).await?;
+    std::fs::remove_file(paths.config())?;
+    runtime.inject_failure(FailureBoundary::Inspect).await;
+
+    let report = service.reconcile().await?;
+
+    assert!(report.findings.iter().any(
+        |finding| matches!(finding, ReconcileFinding::InspectionUnavailable { sandbox_id, .. } if sandbox_id == broken.id())
+    ));
+    let config = std::fs::read_to_string(paths.config())?;
+    assert!(!config.contains(&format!("Host gascan-{}", broken.id())));
+    assert!(config.contains(&format!("Host gascan-{}", valid.id())));
+    Ok(())
+}
+
+async fn assert_reconcile_bounds_host_key_hang(phase: FakeExecHangPhase) -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    std::fs::write(
+        root.join("gascan.toml"),
+        "version = 1\nnetwork = 'networked'\n[ssh]\nhost_port = 25301\n",
+    )?;
+    let desired = SandboxSpec::from_root("ssh-host-key-hang", root, Manifest::load(root)?)?;
+    let paths = ssh_paths(root, "ssh-host-key-hang-client")?;
+    let host_paths = ssh_paths(root, "ssh-host-key-hang-host")?;
+    let host_public_key = ensure_host_identity(&host_paths)
+        .await?
+        .public_key()
+        .to_owned();
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let store = Store::open(root.join("state.db"))?;
+    let first = ssh_service(
+        runtime.clone(),
+        store.clone(),
+        paths.clone(),
+        readiness_program(root, None)?,
+    );
+    first.up(UpRequest::new(desired.clone())).await?;
+    std::fs::remove_file(paths.config())?;
+    drop(first);
+    runtime.queue_exec_hang(phase).await;
+    let restarted = SandboxService::new_with_ssh_timeouts_for_tests(
+        runtime.clone(),
+        store,
+        Arc::new(NoopProvisioner),
+        paths,
+        readiness_program(root, None)?,
+        Duration::from_millis(75),
+    );
+
+    let started = Instant::now();
+    let report = restarted.reconcile().await?;
+
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{phase:?} host-key read was not bounded"
+    );
+    assert!(report.findings.iter().any(
+        |finding| matches!(finding, ReconcileFinding::SshUnavailable { sandbox_id, .. } if sandbox_id.as_str() == desired.id().as_str())
+    ));
+    if phase != FakeExecHangPhase::Start {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runtime.exec_cancellations().await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| format!("{phase:?} session cancellation was not observed"))?;
+        assert!(runtime.exec_cancellations().await >= 1);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn ssh_reconcile_bounds_host_key_exec_startup_hang() -> TestResult {
+    assert_reconcile_bounds_host_key_hang(FakeExecHangPhase::Start).await
+}
+
+#[tokio::test]
+async fn ssh_reconcile_bounds_host_key_input_close_hang() -> TestResult {
+    assert_reconcile_bounds_host_key_hang(FakeExecHangPhase::Close).await
+}
+
+#[tokio::test]
+async fn ssh_reconcile_bounds_host_key_output_collection_hang() -> TestResult {
+    assert_reconcile_bounds_host_key_hang(FakeExecHangPhase::Output).await
+}
+
+#[tokio::test]
+async fn ssh_reconcile_bounds_host_key_cancellation_drain_hang() -> TestResult {
+    assert_reconcile_bounds_host_key_hang(FakeExecHangPhase::Drain).await
+}
+
+#[tokio::test]
+async fn ssh_reconcile_without_enabled_records_clears_stale_managed_aliases() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    std::fs::write(
+        root.join("gascan.toml"),
+        "version = 1\nnetwork = 'networked'\n[ssh]\nhost_port = 25401\n",
+    )?;
+    let desired = SandboxSpec::from_root("ssh-stale-alias", root, Manifest::load(root)?)?;
+    let paths = ssh_paths(root, "ssh-stale-alias-client")?;
+    let host_paths = ssh_paths(root, "ssh-stale-alias-host")?;
+    let host_public_key = ensure_host_identity(&host_paths)
+        .await?
+        .public_key()
+        .to_owned();
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let service = ssh_service(
+        runtime,
+        Store::open(root.join("state.db"))?,
+        paths.clone(),
+        readiness_program(root, None)?,
+    );
+    service.up(UpRequest::new(desired.clone())).await?;
+    assert!(
+        std::fs::read_to_string(paths.config())?.contains(&format!("Host gascan-{}", desired.id()))
+    );
+    let mut record = service.status(desired.id())?.ok_or("record")?;
+    record.ssh_resolution = Some(SshResolution::new(
+        1,
+        json!({
+            "enabled": false,
+            "host_key_fingerprint": "",
+            "client_key_fingerprint": "",
+        }),
+    ));
+    service.store().put_sandbox(&record)?;
+
+    service.reconcile().await?;
+
+    let config = std::fs::read_to_string(paths.config())?;
+    assert!(!config.contains("\nHost "));
     Ok(())
 }
