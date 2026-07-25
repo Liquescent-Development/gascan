@@ -165,6 +165,66 @@ fn ssh_resolution_rejects_invalid_or_incomplete_durable_data() -> TestResult {
 }
 
 #[test]
+fn ssh_resolution_v1_rejects_runtime_or_unknown_details_on_every_write_path() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let store = Store::open(temp.path().join("state.db"))?;
+    let sandbox = fixture("/workspace/ssh-forbidden-details");
+    store.put_sandbox(&sandbox)?;
+
+    for details in [
+        json!({"enabled": true, "host_key_fingerprint": "SHA256:host", "client_key_fingerprint": "SHA256:client", "active": true}),
+        json!({"enabled": true, "host_key_fingerprint": "SHA256:host", "client_key_fingerprint": "SHA256:client", "host": "127.0.0.1"}),
+        json!({"enabled": true, "host_key_fingerprint": "SHA256:host", "client_key_fingerprint": "SHA256:client", "port": 49152}),
+        json!({"enabled": true, "host_key_fingerprint": "SHA256:host", "client_key_fingerprint": "SHA256:client", "alias": "gascan-fixture"}),
+        json!({"enabled": true, "host_key_fingerprint": "SHA256:host", "client_key_fingerprint": "SHA256:client", "unexpected": "value"}),
+    ] {
+        let resolution = SshResolution::new(1, details);
+        assert!(matches!(
+            store.update_ssh_resolution(&sandbox.id, resolution.clone()),
+            Err(StoreError::CorruptData(_))
+        ));
+
+        let mut upsert = sandbox.clone();
+        upsert.ssh_resolution = Some(resolution);
+        assert!(matches!(
+            store.put_sandbox(&upsert),
+            Err(StoreError::CorruptData(_))
+        ));
+        assert_eq!(
+            store
+                .sandbox(&sandbox.id)?
+                .ok_or("sandbox missing")?
+                .ssh_resolution,
+            None
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn ssh_resolution_v1_requires_all_identity_fields_with_declared_types() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let store = Store::open(temp.path().join("state.db"))?;
+    let sandbox = fixture("/workspace/ssh-invalid-shape");
+    store.put_sandbox(&sandbox)?;
+
+    for details in [
+        json!({"host_key_fingerprint": "SHA256:host", "client_key_fingerprint": "SHA256:client"}),
+        json!({"enabled": true, "client_key_fingerprint": "SHA256:client"}),
+        json!({"enabled": true, "host_key_fingerprint": "SHA256:host"}),
+        json!({"enabled": "true", "host_key_fingerprint": "SHA256:host", "client_key_fingerprint": "SHA256:client"}),
+        json!({"enabled": true, "host_key_fingerprint": 1, "client_key_fingerprint": "SHA256:client"}),
+        json!({"enabled": true, "host_key_fingerprint": "SHA256:host", "client_key_fingerprint": false}),
+    ] {
+        assert!(matches!(
+            store.update_ssh_resolution(&sandbox.id, SshResolution::new(1, details)),
+            Err(StoreError::CorruptData(_))
+        ));
+    }
+    Ok(())
+}
+
+#[test]
 fn sandbox_metadata_and_operation_event_timestamps_are_durable() -> TestResult {
     let temp = tempfile::tempdir()?;
     let path = temp.path().join("state.db");

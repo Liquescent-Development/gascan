@@ -231,7 +231,7 @@ impl Store {
         id: &SandboxId,
         resolution: SshResolution,
     ) -> Result<(), StoreError> {
-        validate_resolution_version(resolution.version)?;
+        validate_ssh_resolution(&resolution)?;
         let (version, details) = encode_resolution(Some(&resolution))?;
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -750,12 +750,14 @@ fn validate_resolutions(sandbox: &SandboxRecord) -> Result<(), StoreError> {
         sandbox.tool_resolution.as_ref().map(|v| v.version),
         sandbox.image_resolution.as_ref().map(|v| v.version),
         sandbox.storage_resolution.as_ref().map(|v| v.version),
-        sandbox.ssh_resolution.as_ref().map(|v| v.version),
     ]
     .into_iter()
     .flatten()
     {
         validate_resolution_version(version)?;
+    }
+    if let Some(resolution) = sandbox.ssh_resolution.as_ref() {
+        validate_ssh_resolution(resolution)?;
     }
     Ok(())
 }
@@ -764,6 +766,39 @@ fn validate_resolution_version(version: u32) -> Result<(), StoreError> {
     if version == 0 {
         return Err(StoreError::CorruptData(
             "resolution version must be positive".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_ssh_resolution(resolution: &SshResolution) -> Result<(), StoreError> {
+    validate_resolution_version(resolution.version)?;
+    if resolution.version != 1 {
+        return Ok(());
+    }
+
+    let details = resolution.details.as_object().ok_or_else(|| {
+        StoreError::CorruptData("SSH resolution version 1 details must be an object".to_owned())
+    })?;
+    let required = ["enabled", "host_key_fingerprint", "client_key_fingerprint"];
+    if details.len() != required.len()
+        || details.keys().any(|key| !required.contains(&key.as_str()))
+    {
+        return Err(StoreError::CorruptData(
+            "SSH resolution version 1 details contain unsupported fields".to_owned(),
+        ));
+    }
+    if !details.get("enabled").is_some_and(Value::is_boolean)
+        || !details
+            .get("host_key_fingerprint")
+            .is_some_and(Value::is_string)
+        || !details
+            .get("client_key_fingerprint")
+            .is_some_and(Value::is_string)
+    {
+        return Err(StoreError::CorruptData(
+            "SSH resolution version 1 details are missing required fields or have invalid types"
+                .to_owned(),
         ));
     }
     Ok(())
