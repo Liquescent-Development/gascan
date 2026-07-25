@@ -637,6 +637,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             tool_resolution: None,
             image_resolution: Some(ImageResolution::new(1, json!({"digest": create.image()}))),
             storage_resolution: None,
+            ssh_resolution: None,
             last_operation_id: None,
             updated_at_millis: 0,
         });

@@ -10,11 +10,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIAL_MIGRATION: &str = include_str!("../migrations/001_initial.sql");
 const DURABLE_METADATA_MIGRATION: &str = include_str!("../migrations/002_durable_metadata.sql");
 const STORAGE_RESOLUTION_MIGRATION: &str = include_str!("../migrations/003_storage_resolution.sql");
+const SSH_RESOLUTION_MIGRATION: &str = include_str!("../migrations/004_ssh_resolution.sql");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DesiredState {
@@ -105,6 +106,7 @@ resolution_record!(SetupResolution);
 resolution_record!(ToolResolution);
 resolution_record!(ImageResolution);
 resolution_record!(StorageResolution);
+resolution_record!(SshResolution);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SandboxRecord {
@@ -116,6 +118,7 @@ pub struct SandboxRecord {
     pub tool_resolution: Option<ToolResolution>,
     pub image_resolution: Option<ImageResolution>,
     pub storage_resolution: Option<StorageResolution>,
+    pub ssh_resolution: Option<SshResolution>,
     pub last_operation_id: Option<OperationId>,
     pub updated_at_millis: i64,
 }
@@ -178,6 +181,8 @@ pub enum StoreError {
     InvalidTransition { from: String, to: String },
     #[error("operation {0} does not exist")]
     OperationNotFound(OperationId),
+    #[error("sandbox {0} does not exist")]
+    SandboxNotFound(SandboxId),
     #[error("operation ID must be positive, got {0}")]
     InvalidOperationId(i64),
     #[error("stored value is invalid: {0}")]
@@ -218,6 +223,27 @@ impl Store {
     pub fn sandbox(&self, id: &SandboxId) -> Result<Option<SandboxRecord>, StoreError> {
         let connection = self.lock()?;
         load_sandbox(&connection, id.as_str())
+    }
+
+    /// Stores validated SSH identity evidence without touching runtime connection state.
+    pub fn update_ssh_resolution(
+        &self,
+        id: &SandboxId,
+        resolution: SshResolution,
+    ) -> Result<(), StoreError> {
+        validate_resolution_version(resolution.version)?;
+        let (version, details) = encode_resolution(Some(&resolution))?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = transaction.execute(
+            "UPDATE sandboxes SET ssh_resolution_version = ?1, ssh_resolution_details = ?2, updated_at_millis = ?3 WHERE id = ?4",
+            params![version, details, current_time_millis()?, id.as_str()],
+        )?;
+        if updated == 0 {
+            return Err(StoreError::SandboxNotFound(id.clone()));
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn list_sandboxes(&self) -> Result<Vec<SandboxRecord>, StoreError> {
@@ -476,18 +502,28 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), StoreError> {
                     connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 transaction.execute_batch(DURABLE_METADATA_MIGRATION)?;
                 transaction.execute_batch(STORAGE_RESOLUTION_MIGRATION)?;
+                transaction.execute_batch(SSH_RESOLUTION_MIGRATION)?;
                 transaction.commit()?;
-                validate_v3_schema(connection)
+                validate_v4_schema(connection)
             }
             2 => {
                 validate_v2_schema(connection)?;
                 let transaction =
                     connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 transaction.execute_batch(STORAGE_RESOLUTION_MIGRATION)?;
+                transaction.execute_batch(SSH_RESOLUTION_MIGRATION)?;
                 transaction.commit()?;
-                validate_v3_schema(connection)
+                validate_v4_schema(connection)
             }
-            SCHEMA_VERSION => validate_v3_schema(connection),
+            3 => {
+                validate_v3_schema(connection)?;
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                transaction.execute_batch(SSH_RESOLUTION_MIGRATION)?;
+                transaction.commit()?;
+                validate_v4_schema(connection)
+            }
+            SCHEMA_VERSION => validate_v4_schema(connection),
             _ => Err(StoreError::UnsupportedSchemaVersion(version)),
         };
     }
@@ -514,11 +550,12 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), StoreError> {
     transaction.execute_batch(INITIAL_MIGRATION)?;
     transaction.execute_batch(DURABLE_METADATA_MIGRATION)?;
     transaction.execute_batch(STORAGE_RESOLUTION_MIGRATION)?;
+    transaction.execute_batch(SSH_RESOLUTION_MIGRATION)?;
     transaction.commit()?;
-    validate_v3_schema(connection)
+    validate_v4_schema(connection)
 }
 
-const SANDBOX_SELECT: &str = "SELECT id, canonical_root, desired_state, actual_state, setup_resolution_version, setup_resolution_details, tool_resolution_version, tool_resolution_details, image_resolution_version, image_resolution_details, storage_resolution_version, storage_resolution_details, (SELECT id FROM operations WHERE sandbox_id = sandboxes.id ORDER BY id DESC LIMIT 1), updated_at_millis FROM sandboxes";
+const SANDBOX_SELECT: &str = "SELECT id, canonical_root, desired_state, actual_state, setup_resolution_version, setup_resolution_details, tool_resolution_version, tool_resolution_details, image_resolution_version, image_resolution_details, storage_resolution_version, storage_resolution_details, ssh_resolution_version, ssh_resolution_details, (SELECT id FROM operations WHERE sandbox_id = sandboxes.id ORDER BY id DESC LIMIT 1), updated_at_millis FROM sandboxes";
 const OPERATION_SELECT: &str =
     "SELECT id, sandbox_id, kind, status, error_code, error_details FROM operations";
 
@@ -556,9 +593,10 @@ fn put_sandbox_in(
     let tools = encode_resolution(sandbox.tool_resolution.as_ref())?;
     let image = encode_resolution(sandbox.image_resolution.as_ref())?;
     let storage = encode_resolution(sandbox.storage_resolution.as_ref())?;
+    let ssh = encode_resolution(sandbox.ssh_resolution.as_ref())?;
     transaction.execute(
-        "INSERT INTO sandboxes (id, canonical_root, desired_state, actual_state, setup_resolution_version, setup_resolution_details, tool_resolution_version, tool_resolution_details, image_resolution_version, image_resolution_details, storage_resolution_version, storage_resolution_details, updated_at_millis) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) ON CONFLICT(id) DO UPDATE SET desired_state = excluded.desired_state, actual_state = excluded.actual_state, setup_resolution_version = excluded.setup_resolution_version, setup_resolution_details = excluded.setup_resolution_details, tool_resolution_version = excluded.tool_resolution_version, tool_resolution_details = excluded.tool_resolution_details, image_resolution_version = excluded.image_resolution_version, image_resolution_details = excluded.image_resolution_details, storage_resolution_version = excluded.storage_resolution_version, storage_resolution_details = excluded.storage_resolution_details, updated_at_millis = excluded.updated_at_millis",
-        params![sandbox.id.as_str(), sandbox.canonical_root.as_str(), sandbox.desired_state.as_db(), sandbox.actual_state.as_db(), setup.0, setup.1, tools.0, tools.1, image.0, image.1, storage.0, storage.1, current_time_millis()?],
+        "INSERT INTO sandboxes (id, canonical_root, desired_state, actual_state, setup_resolution_version, setup_resolution_details, tool_resolution_version, tool_resolution_details, image_resolution_version, image_resolution_details, storage_resolution_version, storage_resolution_details, ssh_resolution_version, ssh_resolution_details, updated_at_millis) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) ON CONFLICT(id) DO UPDATE SET desired_state = excluded.desired_state, actual_state = excluded.actual_state, setup_resolution_version = excluded.setup_resolution_version, setup_resolution_details = excluded.setup_resolution_details, tool_resolution_version = excluded.tool_resolution_version, tool_resolution_details = excluded.tool_resolution_details, image_resolution_version = excluded.image_resolution_version, image_resolution_details = excluded.image_resolution_details, storage_resolution_version = excluded.storage_resolution_version, storage_resolution_details = excluded.storage_resolution_details, ssh_resolution_version = excluded.ssh_resolution_version, ssh_resolution_details = excluded.ssh_resolution_details, updated_at_millis = excluded.updated_at_millis",
+        params![sandbox.id.as_str(), sandbox.canonical_root.as_str(), sandbox.desired_state.as_db(), sandbox.actual_state.as_db(), setup.0, setup.1, tools.0, tools.1, image.0, image.1, storage.0, storage.1, ssh.0, ssh.1, current_time_millis()?],
     )?;
     Ok(())
 }
@@ -589,6 +627,7 @@ struct RawSandbox {
     tools: (Option<u32>, Option<String>),
     image: (Option<u32>, Option<String>),
     storage: (Option<u32>, Option<String>),
+    ssh: (Option<u32>, Option<String>),
     last_operation_id: Option<i64>,
     updated_at_millis: i64,
 }
@@ -606,6 +645,7 @@ impl TryFrom<RawSandbox> for SandboxRecord {
             tool_resolution: decode_resolution(raw.tools, ToolResolution::new)?,
             image_resolution: decode_resolution(raw.image, ImageResolution::new)?,
             storage_resolution: decode_resolution(raw.storage, StorageResolution::new)?,
+            ssh_resolution: decode_resolution(raw.ssh, SshResolution::new)?,
             last_operation_id: raw.last_operation_id.map(OperationId::new).transpose()?,
             updated_at_millis: raw.updated_at_millis,
         })
@@ -622,8 +662,9 @@ fn raw_sandbox_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSandbox>
         tools: (row.get(6)?, row.get(7)?),
         image: (row.get(8)?, row.get(9)?),
         storage: (row.get(10)?, row.get(11)?),
-        last_operation_id: row.get(12)?,
-        updated_at_millis: row.get(13)?,
+        ssh: (row.get(12)?, row.get(13)?),
+        last_operation_id: row.get(14)?,
+        updated_at_millis: row.get(15)?,
     })
 }
 
@@ -709,15 +750,21 @@ fn validate_resolutions(sandbox: &SandboxRecord) -> Result<(), StoreError> {
         sandbox.tool_resolution.as_ref().map(|v| v.version),
         sandbox.image_resolution.as_ref().map(|v| v.version),
         sandbox.storage_resolution.as_ref().map(|v| v.version),
+        sandbox.ssh_resolution.as_ref().map(|v| v.version),
     ]
     .into_iter()
     .flatten()
     {
-        if version == 0 {
-            return Err(StoreError::CorruptData(
-                "resolution version must be positive".to_owned(),
-            ));
-        }
+        validate_resolution_version(version)?;
+    }
+    Ok(())
+}
+
+fn validate_resolution_version(version: u32) -> Result<(), StoreError> {
+    if version == 0 {
+        return Err(StoreError::CorruptData(
+            "resolution version must be positive".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -756,6 +803,7 @@ impl_resolution!(SetupResolution);
 impl_resolution!(ToolResolution);
 impl_resolution!(ImageResolution);
 impl_resolution!(StorageResolution);
+impl_resolution!(SshResolution);
 
 fn decode_resolution<T>(
     raw: (Option<u32>, Option<String>),
@@ -929,6 +977,44 @@ fn validate_v3_schema(connection: &Connection) -> Result<(), StoreError> {
             ("updated_at_millis", "INTEGER", 1, 0),
             ("storage_resolution_version", "INTEGER", 0, 0),
             ("storage_resolution_details", "TEXT", 0, 0),
+        ],
+    )?;
+    validate_table_columns(
+        connection,
+        "operation_events",
+        &[
+            ("sequence", "INTEGER", 0, 1),
+            ("operation_id", "INTEGER", 1, 0),
+            ("status", "TEXT", 1, 0),
+            ("details", "TEXT", 0, 0),
+            ("error_code", "TEXT", 0, 0),
+            ("timestamp_millis", "INTEGER", 1, 0),
+        ],
+    )?;
+    validate_operations_and_constraints(connection)
+}
+
+fn validate_v4_schema(connection: &Connection) -> Result<(), StoreError> {
+    validate_schema_inventory(connection)?;
+    validate_table_columns(
+        connection,
+        "sandboxes",
+        &[
+            ("id", "TEXT", 1, 1),
+            ("canonical_root", "TEXT", 1, 0),
+            ("desired_state", "TEXT", 1, 0),
+            ("actual_state", "TEXT", 1, 0),
+            ("setup_resolution_version", "INTEGER", 0, 0),
+            ("setup_resolution_details", "TEXT", 0, 0),
+            ("tool_resolution_version", "INTEGER", 0, 0),
+            ("tool_resolution_details", "TEXT", 0, 0),
+            ("image_resolution_version", "INTEGER", 0, 0),
+            ("image_resolution_details", "TEXT", 0, 0),
+            ("updated_at_millis", "INTEGER", 1, 0),
+            ("storage_resolution_version", "INTEGER", 0, 0),
+            ("storage_resolution_details", "TEXT", 0, 0),
+            ("ssh_resolution_version", "INTEGER", 0, 0),
+            ("ssh_resolution_details", "TEXT", 0, 0),
         ],
     )?;
     validate_table_columns(

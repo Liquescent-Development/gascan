@@ -2,7 +2,8 @@ use camino::Utf8PathBuf;
 use gascan_core::sandbox::SandboxId;
 use gascand::{
     ActualState, DesiredState, ImageResolution, OperationId, OperationKind, OperationStatus,
-    SandboxRecord, SetupResolution, StorageResolution, Store, StoreError, ToolResolution,
+    SandboxRecord, SetupResolution, SshResolution, StorageResolution, Store, StoreError,
+    ToolResolution,
 };
 use serde_json::json;
 use std::error::Error;
@@ -60,6 +61,7 @@ fn fixture(root: &str) -> SandboxRecord {
                 "config_bytes": 1024_u64.pow(3),
             }),
         )),
+        ssh_resolution: None,
         last_operation_id: None,
         updated_at_millis: 0,
     }
@@ -94,6 +96,71 @@ fn sandbox_round_trips_and_lists_in_id_order() -> TestResult {
     let mut expected = vec![stored_one, stored_two];
     expected.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
     assert_eq!(store.list_sandboxes()?, expected);
+    Ok(())
+}
+
+#[test]
+fn ssh_resolution_round_trips_without_runtime_connection_status() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let store = Store::open(temp.path().join("state.db"))?;
+    let sandbox = fixture("/workspace/ssh-round-trip");
+    store.put_sandbox(&sandbox)?;
+
+    let resolution = SshResolution::new(
+        1,
+        json!({
+            "enabled": true,
+            "host_key_fingerprint": "SHA256:host",
+            "client_key_fingerprint": "SHA256:client",
+        }),
+    );
+    store.update_ssh_resolution(&sandbox.id, resolution.clone())?;
+
+    let stored = store.sandbox(&sandbox.id)?.ok_or("sandbox missing")?;
+    assert_eq!(stored.ssh_resolution, Some(resolution));
+    let connection = rusqlite::Connection::open(temp.path().join("state.db"))?;
+    let details: String = connection.query_row(
+        "SELECT ssh_resolution_details FROM sandboxes WHERE id = ?1",
+        [sandbox.id.as_str()],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&details)?,
+        json!({
+            "enabled": true,
+            "host_key_fingerprint": "SHA256:host",
+            "client_key_fingerprint": "SHA256:client",
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn ssh_resolution_rejects_invalid_or_incomplete_durable_data() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("state.db");
+    let store = Store::open(&path)?;
+    let sandbox = fixture("/workspace/ssh-corrupt");
+    store.put_sandbox(&sandbox)?;
+    let connection = rusqlite::Connection::open(&path)?;
+
+    connection.execute(
+        "UPDATE sandboxes SET ssh_resolution_version = 1, ssh_resolution_details = '{not json' WHERE id = ?1",
+        [sandbox.id.as_str()],
+    )?;
+    assert!(matches!(
+        store.sandbox(&sandbox.id),
+        Err(StoreError::Json(_))
+    ));
+
+    connection.execute(
+        "UPDATE sandboxes SET ssh_resolution_version = NULL, ssh_resolution_details = '{}' WHERE id = ?1",
+        [sandbox.id.as_str()],
+    )?;
+    assert!(matches!(
+        store.sandbox(&sandbox.id),
+        Err(StoreError::CorruptData(_))
+    ));
     Ok(())
 }
 
@@ -347,11 +414,11 @@ fn newer_and_unknown_schema_versions_are_rejected() -> TestResult {
     let path = temp.path().join("state.db");
     drop(Store::open(&path)?);
     let connection = rusqlite::Connection::open(&path)?;
-    connection.execute("UPDATE schema_version SET version = ?1", [4])?;
+    connection.execute("UPDATE schema_version SET version = ?1", [5])?;
     drop(connection);
     assert!(matches!(
         Store::open(&path),
-        Err(StoreError::UnsupportedSchemaVersion(4))
+        Err(StoreError::UnsupportedSchemaVersion(5))
     ));
 
     let empty = temp.path().join("unknown.db");
@@ -391,7 +458,44 @@ fn version_two_database_migrates_storage_resolution_as_absent() -> TestResult {
     assert_eq!(
         connection.query_row("SELECT version FROM schema_version", [], |row| row
             .get::<_, i64>(0))?,
-        3
+        4
+    );
+    Ok(())
+}
+
+#[test]
+fn version_three_database_migrates_ssh_resolution_as_absent() -> TestResult {
+    const INITIAL_MIGRATION: &str = include_str!("../migrations/001_initial.sql");
+    const DURABLE_METADATA_MIGRATION: &str = include_str!("../migrations/002_durable_metadata.sql");
+    const STORAGE_RESOLUTION_MIGRATION: &str =
+        include_str!("../migrations/003_storage_resolution.sql");
+
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("version-three.db");
+    let connection = rusqlite::Connection::open(&path)?;
+    connection.execute_batch(INITIAL_MIGRATION)?;
+    connection.execute_batch(DURABLE_METADATA_MIGRATION)?;
+    connection.execute_batch(STORAGE_RESOLUTION_MIGRATION)?;
+    let sandbox = fixture("/workspace/legacy-v3");
+    connection.execute(
+        "INSERT INTO sandboxes (id, canonical_root, desired_state, actual_state) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            sandbox.id.as_str(),
+            sandbox.canonical_root.as_str(),
+            "running",
+            "creating"
+        ],
+    )?;
+    drop(connection);
+
+    let store = Store::open(&path)?;
+    let loaded = store.sandbox(&sandbox.id)?.ok_or("sandbox missing")?;
+    assert_eq!(loaded.ssh_resolution, None);
+    let connection = rusqlite::Connection::open(path)?;
+    assert_eq!(
+        connection.query_row("SELECT version FROM schema_version", [], |row| row
+            .get::<_, i64>(0))?,
+        4
     );
     Ok(())
 }

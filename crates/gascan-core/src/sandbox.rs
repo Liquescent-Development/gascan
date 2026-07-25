@@ -7,6 +7,17 @@ use thiserror::Error;
 
 pub const WORKSPACE_TARGET: &str = "/workspace";
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SshStatus {
+    pub enabled: bool,
+    pub active: bool,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub alias: Option<String>,
+    pub host_key_fingerprint: Option<String>,
+    pub client_key_fingerprint: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct SandboxId(String);
 

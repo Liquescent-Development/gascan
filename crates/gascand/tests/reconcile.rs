@@ -145,6 +145,7 @@ async fn reopen_reconciliation_terminalizes_every_pending_operation_kind()
             tool_resolution: None,
             image_resolution: None,
             storage_resolution: None,
+            ssh_resolution: None,
             last_operation_id: None,
             updated_at_millis: 0,
         };
@@ -192,6 +193,7 @@ async fn pending_create_completes_only_with_durable_resolution_and_health_eviden
         tool_resolution: None,
         image_resolution: None,
         storage_resolution: None,
+        ssh_resolution: None,
         last_operation_id: None,
         updated_at_millis: 0,
     };
@@ -236,6 +238,7 @@ async fn pending_create_rejects_out_of_order_hook_evidence() -> Result<(), Box<d
         tool_resolution: None,
         image_resolution: None,
         storage_resolution: None,
+        ssh_resolution: None,
         last_operation_id: None,
         updated_at_millis: 0,
     };

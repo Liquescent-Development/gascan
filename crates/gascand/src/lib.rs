@@ -46,6 +46,6 @@ pub use service::{
 };
 pub use store::{
     ActualState, DesiredState, ImageResolution, OperationEvent, OperationId, OperationKind,
-    OperationRecord, OperationStatus, SandboxRecord, SetupResolution, StorageResolution, Store,
-    StoreError, ToolResolution,
+    OperationRecord, OperationStatus, SandboxRecord, SetupResolution, SshResolution,
+    StorageResolution, Store, StoreError, ToolResolution,
 };
