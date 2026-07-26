@@ -435,6 +435,23 @@ impl Store {
         .map(|(operation, _)| operation)
     }
 
+    pub(crate) fn fail_create_operation_clearing_ssh(
+        &self,
+        id: OperationId,
+        error_code: impl Into<String>,
+        error_details: Value,
+    ) -> Result<OperationRecord, StoreError> {
+        self.finish_operation(
+            id,
+            ActualState::Absent,
+            OperationStatus::Failed,
+            Some(error_code.into()),
+            Some(error_details),
+            true,
+        )
+        .map(|(operation, _)| operation)
+    }
+
     pub(crate) fn complete_operation_with_event(
         &self,
         id: OperationId,
@@ -574,11 +591,19 @@ impl Store {
         )?;
         let current_state = ActualState::from_db(&current_state)?;
         validate_terminal_actual_transition(current_state, actual_state, operation.kind, status)?;
-        if clear_ssh_trust
-            && (operation.kind != OperationKind::Destroy
-                || status != OperationStatus::Completed
-                || actual_state != ActualState::Absent)
-        {
+        let may_clear_ssh_trust = matches!(
+            (operation.kind, status, actual_state),
+            (
+                OperationKind::Destroy,
+                OperationStatus::Completed,
+                ActualState::Absent
+            ) | (
+                OperationKind::Create,
+                OperationStatus::Failed,
+                ActualState::Absent
+            )
+        );
+        if clear_ssh_trust && !may_clear_ssh_trust {
             return Err(StoreError::InvalidTransition {
                 from: operation.kind.as_db().to_owned(),
                 to: "clear_ssh_trust".to_owned(),

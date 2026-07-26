@@ -64,6 +64,369 @@ fn ssh_mapping(port: u16) -> RuntimePort {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PendingSshCreateWindow {
+    BeforeResolutionPersistence,
+    AfterResolutionBeforeConfigPublication,
+    AfterConfigPublicationBeforeMarkerPersistence,
+}
+
+async fn assert_pending_ssh_create_recovers_publication(
+    label: &str,
+    host_port: u16,
+    window: PendingSshCreateWindow,
+) -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    std::fs::write(
+        root.join("gascan.toml"),
+        format!("version = 1\nnetwork = 'networked'\n[ssh]\nhost_port = {host_port}\n"),
+    )?;
+    let desired = SandboxSpec::from_root(label, root, Manifest::load(root)?)?;
+    let paths = ssh_paths(root, &format!("{label}-client"))?;
+    let host_paths = ssh_paths(root, &format!("{label}-host"))?;
+    let host_public_key = ensure_host_identity(&host_paths)
+        .await?
+        .public_key()
+        .to_owned();
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let state_path = root.join("state.db");
+    let store = Store::open(&state_path)?;
+    let service = ssh_service(
+        runtime,
+        store.clone(),
+        paths.clone(),
+        readiness_program(root, None)?,
+    );
+    service.up(UpRequest::new(desired.clone())).await?;
+    let mut record = store.sandbox(desired.id())?.ok_or("sandbox")?;
+    let fingerprint = record
+        .setup_resolution
+        .as_ref()
+        .and_then(|resolution| resolution.details.get("desired_fingerprint"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or("desired fingerprint")?
+        .to_owned();
+    if matches!(window, PendingSshCreateWindow::BeforeResolutionPersistence) {
+        record.ssh_resolution = None;
+    }
+    store.put_sandbox(&record)?;
+    if !matches!(
+        window,
+        PendingSshCreateWindow::AfterConfigPublicationBeforeMarkerPersistence
+    ) {
+        std::fs::remove_file(paths.config())?;
+    }
+    let pending = store.begin_operation(&record, OperationKind::Create)?;
+    rusqlite::Connection::open(&state_path)?.execute(
+        "UPDATE sandboxes SET actual_state = 'creating' WHERE id = ?1",
+        [desired.id().as_str()],
+    )?;
+    store.append_operation_event(
+        pending.id,
+        json!({"phase":"before_health","step":"health_check"}),
+    )?;
+    store.append_operation_event(
+        pending.id,
+        json!({"phase":"after_health","desired_fingerprint":fingerprint}),
+    )?;
+
+    service.reconcile().await?;
+
+    let recovered = store.sandbox(desired.id())?.ok_or("recovered sandbox")?;
+    assert_eq!(recovered.actual_state, ActualState::Running);
+    assert!(
+        recovered.ssh_resolution.is_some(),
+        "recovery completed without durable SSH identity evidence"
+    );
+    assert!(
+        std::fs::read_to_string(paths.config())?.contains(&format!("Host gascan-{}", desired.id())),
+        "recovery completed without publishing the SSH alias"
+    );
+    let events = store.operation_events(pending.id)?;
+    assert!(
+        events.iter().any(|event| {
+            event
+                .details
+                .as_ref()
+                .and_then(|details| details.get("phase").and_then(serde_json::Value::as_str))
+                == Some("after_ssh_publication")
+        }),
+        "recovery completed without durable SSH publication evidence"
+    );
+    assert_eq!(
+        store.latest_operation()?.ok_or("operation")?.status,
+        OperationStatus::Completed
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_ssh_create_before_resolution_persistence_repairs_publication() -> TestResult {
+    assert_pending_ssh_create_recovers_publication(
+        "ssh-crash-before-resolution",
+        25_601,
+        PendingSshCreateWindow::BeforeResolutionPersistence,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn pending_ssh_create_after_resolution_before_config_repairs_publication() -> TestResult {
+    assert_pending_ssh_create_recovers_publication(
+        "ssh-crash-after-resolution",
+        25_602,
+        PendingSshCreateWindow::AfterResolutionBeforeConfigPublication,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn pending_ssh_create_after_config_before_marker_verifies_publication() -> TestResult {
+    assert_pending_ssh_create_recovers_publication(
+        "ssh-crash-after-config",
+        25_603,
+        PendingSshCreateWindow::AfterConfigPublicationBeforeMarkerPersistence,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn pending_ssh_create_failed_publication_repair_rolls_back_closed() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    std::fs::write(
+        root.join("gascan.toml"),
+        "version = 1\nnetwork = 'networked'\n[ssh]\nhost_port = 25604\n",
+    )?;
+    let desired = SandboxSpec::from_root("ssh-crash-repair-failure", root, Manifest::load(root)?)?;
+    let paths = ssh_paths(root, "ssh-crash-repair-failure-client")?;
+    let host_paths = ssh_paths(root, "ssh-crash-repair-failure-host")?;
+    let host_public_key = ensure_host_identity(&host_paths)
+        .await?
+        .public_key()
+        .to_owned();
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let state_path = root.join("state.db");
+    let store = Store::open(&state_path)?;
+    let service = ssh_service(
+        runtime.clone(),
+        store.clone(),
+        paths.clone(),
+        readiness_program(root, None)?,
+    );
+    service.up(UpRequest::new(desired.clone())).await?;
+    let mut record = store.sandbox(desired.id())?.ok_or("sandbox")?;
+    let fingerprint = record
+        .setup_resolution
+        .as_ref()
+        .and_then(|resolution| resolution.details.get("desired_fingerprint"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or("desired fingerprint")?
+        .to_owned();
+    record.ssh_resolution = None;
+    store.put_sandbox(&record)?;
+    std::fs::remove_file(paths.config())?;
+    let pending = store.begin_operation(&record, OperationKind::Create)?;
+    rusqlite::Connection::open(&state_path)?.execute(
+        "UPDATE sandboxes SET actual_state = 'creating' WHERE id = ?1",
+        [desired.id().as_str()],
+    )?;
+    store.append_operation_event(
+        pending.id,
+        json!({"phase":"before_health","step":"health_check"}),
+    )?;
+    store.append_operation_event(
+        pending.id,
+        json!({"phase":"after_health","desired_fingerprint":fingerprint}),
+    )?;
+    runtime
+        .set_exec_result(b"not-a-public-key\n".to_vec(), Vec::new(), 0)
+        .await;
+
+    service.reconcile().await?;
+
+    assert!(
+        runtime.inspect(desired.id()).await?.is_none(),
+        "failed recovery retained runtime resources"
+    );
+    assert!(runtime.list_resources().await?.is_empty());
+    let recovered = store.sandbox(desired.id())?.ok_or("sandbox")?;
+    assert_eq!(recovered.actual_state, ActualState::Absent);
+    assert!(recovered.ssh_resolution.is_none());
+    let transport: (Option<i64>, Option<i64>) = rusqlite::Connection::open(&state_path)?
+        .query_row(
+            "SELECT ssh_transport_enabled, ssh_transport_host_port FROM sandboxes WHERE id = ?1",
+            [desired.id().as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+    assert_eq!(transport, (None, None));
+    assert!(
+        !paths.config().exists()
+            || !std::fs::read_to_string(paths.config())?
+                .contains(&format!("Host gascan-{}", desired.id()))
+    );
+    assert_eq!(
+        store.latest_operation()?.ok_or("operation")?.status,
+        OperationStatus::Failed
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ssh_publication_kill_point_matrix_recovers_every_durable_window() -> TestResult {
+    for (label, target, has_resolution, has_alias) in [
+        ("before-resolution", "after_health", false, false),
+        ("after-resolution", "before_ssh_publication", true, false),
+        ("after-config", "before_ssh_publication_marker", true, true),
+    ] {
+        let temp = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+        let state_path = root.join("state.db");
+        let status = Command::new(std::env::current_exe()?)
+            .args(["--exact", "ssh_publication_crash_child"])
+            .env("GASCAN_SSH_CRASH_DB", &state_path)
+            .env("GASCAN_SSH_CRASH_LABEL", label)
+            .env("GASCAN_SSH_CRASH_PHASE", target)
+            .status()?;
+        assert_eq!(
+            status.signal(),
+            Some(6),
+            "{label}: child must terminate via SIGABRT at the SSH kill point"
+        );
+        let store = Store::open(&state_path)?;
+        let record = store
+            .list_sandboxes()?
+            .into_iter()
+            .next()
+            .ok_or("sandbox")?;
+        assert_eq!(
+            record.ssh_resolution.is_some(),
+            has_resolution,
+            "{label}: wrong durable resolution window"
+        );
+        let client_home = root.join("ssh-crash-client");
+        let client_home = std::fs::canonicalize(client_home)?;
+        let paths = SshPaths::for_environment(None, Some(client_home.as_os_str()))?;
+        let alias = format!("Host gascan-{}", record.id);
+        assert_eq!(
+            paths.config().exists() && std::fs::read_to_string(paths.config())?.contains(&alias),
+            has_alias,
+            "{label}: wrong config publication window"
+        );
+        assert!(
+            !store
+                .operation_events(
+                    store
+                        .pending_operations()?
+                        .into_iter()
+                        .next()
+                        .ok_or("pending operation")?
+                        .id
+                )?
+                .iter()
+                .any(|event| {
+                    event
+                        .details
+                        .as_ref()
+                        .and_then(|details| details.get("phase"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("after_ssh_publication")
+                }),
+            "{label}: completion marker existed before recovery"
+        );
+        let host_home = root.join("ssh-crash-host");
+        let host_home = std::fs::canonicalize(host_home)?;
+        let host_paths = SshPaths::for_environment(None, Some(host_home.as_os_str()))?;
+        let host_public_key = ensure_host_identity(&host_paths)
+            .await?
+            .public_key()
+            .to_owned();
+        let runtime = FakeRuntime::default();
+        runtime.seed_owned(record.id.clone()).await;
+        runtime
+            .set_sandbox_ports(&record.id, vec![ssh_mapping(25_605)])
+            .await?;
+        runtime.start(&record.id).await?;
+        runtime
+            .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+            .await;
+        let service = ssh_service(
+            runtime,
+            store.clone(),
+            paths.clone(),
+            readiness_program(root, None)?,
+        );
+
+        service.reconcile().await?;
+
+        let recovered = store.sandbox(&record.id)?.ok_or("recovered sandbox")?;
+        assert_eq!(recovered.actual_state, ActualState::Running, "{label}");
+        assert!(recovered.ssh_resolution.is_some(), "{label}");
+        assert!(
+            std::fs::read_to_string(paths.config())?.contains(&alias),
+            "{label}"
+        );
+        let operation = store.latest_operation()?.ok_or("operation")?;
+        assert_eq!(operation.status, OperationStatus::Completed, "{label}");
+        assert!(store.operation_events(operation.id)?.iter().any(|event| {
+            event
+                .details
+                .as_ref()
+                .and_then(|details| details.get("phase"))
+                .and_then(serde_json::Value::as_str)
+                == Some("after_ssh_publication")
+        }));
+    }
+    Ok(())
+}
+
+#[test]
+fn ssh_publication_crash_child() -> TestResult {
+    let Ok(path) = std::env::var("GASCAN_SSH_CRASH_DB") else {
+        return Ok(());
+    };
+    let label = std::env::var("GASCAN_SSH_CRASH_LABEL")?;
+    let root = std::path::Path::new(&path).parent().ok_or("db parent")?;
+    let root = Utf8Path::from_path(root).ok_or("utf8 root")?;
+    std::fs::write(
+        root.join("gascan.toml"),
+        "version = 1\nnetwork = 'networked'\n[ssh]\nhost_port = 25605\n",
+    )?;
+    let desired =
+        SandboxSpec::from_root(&format!("ssh-kill-{label}"), root, Manifest::load(root)?)?;
+    let paths = ssh_paths(root, "ssh-crash-client")?;
+    let host_paths = ssh_paths(root, "ssh-crash-host")?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()?;
+    runtime.block_on(async move {
+        let host_public_key = ensure_host_identity(&host_paths)
+            .await?
+            .public_key()
+            .to_owned();
+        let backend = FakeRuntime::default();
+        backend
+            .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+            .await;
+        let service = ssh_service(
+            backend,
+            Store::open(path)?,
+            paths,
+            Utf8PathBuf::from("/usr/bin/true"),
+        );
+        let _ = service.up(UpRequest::new(desired)).await;
+        Err::<(), Box<dyn Error>>("service completed before SSH crash hook fired".into())
+    })
+}
+
 #[tokio::test]
 async fn reconcile_reports_unknown_owned_resources_without_deleting() -> Result<(), Box<dyn Error>>
 {

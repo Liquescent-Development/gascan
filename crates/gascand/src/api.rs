@@ -931,7 +931,9 @@ fn service_error_diagnostic(error: &ServiceError) -> String {
         | ServiceError::SshHostKeyMismatch(_)
         | ServiceError::SshNotReady(_)
         | ServiceError::SshConfigUnsafe(_)
-        | ServiceError::SshConfigUpdateFailed(_) => {
+        | ServiceError::SshConfigUpdateFailed(_)
+        | ServiceError::SshConfigPublicationUncertain(_)
+        | ServiceError::SshPublicationUncertain(_) => {
             format!("service_kind=ssh service_code={}", error.code())
         }
         ServiceError::Rollback { original, rollback } => format!(

@@ -17,8 +17,8 @@ use std::path::{Component, Path, PathBuf};
 
 pub(crate) use config::validate_managed_config_if_present;
 pub use config::{
-    PreparedSshFiles, commit_openssh_files, prepare_openssh_files, publish_openssh_files,
-    readiness_ssh_args,
+    PreparedSshFiles, SshConfigCommitError, SshConfigCommitFault, commit_openssh_files,
+    prepare_openssh_files, publish_openssh_files, readiness_ssh_args,
 };
 pub(crate) use identity::validate_host_identity_if_present;
 pub use identity::{HostIdentity, ensure_host_identity};
@@ -328,6 +328,11 @@ impl StateDirectory {
 
     pub(crate) fn remove(&self, name: &str) {
         let _ = rustix::fs::unlinkat(&self.fd, name, AtFlags::empty());
+    }
+
+    pub(crate) fn remove_checked(&self, name: &str) -> Result<(), SshError> {
+        rustix::fs::unlinkat(&self.fd, name, AtFlags::empty())
+            .map_err(|error| SshError::io("remove managed SSH file", error))
     }
 
     pub(crate) fn sync(&self) -> Result<(), SshError> {

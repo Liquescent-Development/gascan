@@ -1,5 +1,6 @@
 use super::config::{
-    PreparedSshFiles, commit_openssh_files, prepare_openssh_files, readiness_ssh_args,
+    PreparedSshFiles, SshConfigCommitError, SshConfigCommitFault, commit_openssh_files,
+    commit_openssh_files_with_fault, prepare_openssh_files, readiness_ssh_args,
 };
 use super::identity::{load_host_identity, parse_public_key};
 use super::port::PortReservation;
@@ -81,9 +82,16 @@ impl PreparedSshActivation {
     }
 
     pub(crate) fn commit(self) -> Result<ActiveSsh, ServiceError> {
+        self.commit_with_fault(None)
+    }
+
+    pub(crate) fn commit_with_fault(
+        self,
+        fault: Option<SshConfigCommitFault>,
+    ) -> Result<ActiveSsh, ServiceError> {
         let active = self.managed.active;
-        commit_openssh_files(&self.paths, self.prepared)
-            .map_err(ServiceError::SshConfigUpdateFailed)?;
+        commit_openssh_files_with_fault(&self.paths, self.prepared, fault)
+            .map_err(config_commit_error)?;
         Ok(active)
     }
 }
@@ -289,7 +297,7 @@ impl SshManager {
         let identity = futures_identity(paths).map_err(ServiceError::SshConfigUnsafe)?;
         let prepared = prepare_openssh_files(paths, &identity, hosts)
             .map_err(ServiceError::SshConfigUnsafe)?;
-        commit_openssh_files(paths, prepared).map_err(ServiceError::SshConfigUpdateFailed)
+        commit_openssh_files(paths, prepared).map_err(config_commit_error)
     }
 
     #[doc(hidden)]
@@ -344,7 +352,16 @@ impl SshManager {
         }
         let prepared = prepare_openssh_files(paths, &identity, &hosts)
             .map_err(ServiceError::SshConfigUnsafe)?;
-        commit_openssh_files(paths, prepared).map_err(ServiceError::SshConfigUpdateFailed)
+        commit_openssh_files(paths, prepared).map_err(config_commit_error)
+    }
+}
+
+fn config_commit_error(error: SshConfigCommitError) -> ServiceError {
+    match error {
+        SshConfigCommitError::Unpublished(error) => ServiceError::SshConfigUpdateFailed(error),
+        error @ SshConfigCommitError::PublishedButUncertain { .. } => {
+            ServiceError::SshConfigPublicationUncertain(error)
+        }
     }
 }
 

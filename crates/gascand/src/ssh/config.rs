@@ -16,6 +16,32 @@ use std::net::{IpAddr, Ipv4Addr};
 const CONFIG_NAME: &str = "config";
 const KNOWN_HOSTS_PREFIX: &str = "known_hosts.";
 
+#[derive(Debug, thiserror::Error)]
+pub enum SshConfigCommitError {
+    #[error("{0}")]
+    Unpublished(#[source] SshError),
+    #[error(
+        "managed SSH publication durability is uncertain after {original}; restoration failed: {restoration}"
+    )]
+    PublishedButUncertain {
+        original: SshError,
+        restoration: SshError,
+    },
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SshConfigCommitFault {
+    AfterRename,
+    AfterRenameAndRestore,
+}
+
+impl From<SshError> for SshConfigCommitError {
+    fn from(error: SshError) -> Self {
+        Self::Unpublished(error)
+    }
+}
+
 pub(crate) fn validate_managed_config_if_present(paths: &SshPaths) -> Result<bool, SshError> {
     let Some(directory) = StateDirectory::open_existing(paths)? else {
         return Ok(false);
@@ -61,7 +87,7 @@ pub fn publish_openssh_files(
     paths: &SshPaths,
     identity: &HostIdentity,
     hosts: &[ManagedSshHost],
-) -> Result<(), SshError> {
+) -> Result<(), SshConfigCommitError> {
     let prepared = prepare_openssh_files(paths, identity, hosts)?;
     commit_openssh_files(paths, prepared)
 }
@@ -86,26 +112,70 @@ pub fn prepare_openssh_files(
     })
 }
 
-pub fn commit_openssh_files(paths: &SshPaths, prepared: PreparedSshFiles) -> Result<(), SshError> {
-    commit_openssh_files_with(paths, prepared, || Ok(()))
+pub fn commit_openssh_files(
+    paths: &SshPaths,
+    prepared: PreparedSshFiles,
+) -> Result<(), SshConfigCommitError> {
+    commit_openssh_files_with_fault(paths, prepared, None)
 }
 
+#[doc(hidden)]
+pub fn commit_openssh_files_with_fault(
+    paths: &SshPaths,
+    prepared: PreparedSshFiles,
+    fault: Option<SshConfigCommitFault>,
+) -> Result<(), SshConfigCommitError> {
+    commit_openssh_files_with_points(
+        paths,
+        prepared,
+        || Ok(()),
+        move |point| match point {
+            AtomicReplacePoint::AfterRenameBeforeDirectorySync if fault.is_some() => Err(
+                SshError::InvalidState("injected post-rename config publication failure"),
+            ),
+            AtomicReplacePoint::BeforeRestore
+                if fault == Some(SshConfigCommitFault::AfterRenameAndRestore) =>
+            {
+                Err(SshError::InvalidState(
+                    "injected config publication restoration failure",
+                ))
+            }
+            _ => Ok(()),
+        },
+    )
+}
+
+#[cfg(test)]
 fn commit_openssh_files_with<F>(
     paths: &SshPaths,
     prepared: PreparedSshFiles,
     before_config_commit: F,
-) -> Result<(), SshError>
+) -> Result<(), SshConfigCommitError>
 where
     F: FnOnce() -> Result<(), SshError>,
+{
+    commit_openssh_files_with_points(paths, prepared, before_config_commit, |_| Ok(()))
+}
+
+fn commit_openssh_files_with_points<F, G>(
+    paths: &SshPaths,
+    prepared: PreparedSshFiles,
+    before_config_commit: F,
+    at_point: G,
+) -> Result<(), SshConfigCommitError>
+where
+    F: FnOnce() -> Result<(), SshError>,
+    G: FnMut(AtomicReplacePoint) -> Result<(), SshError>,
 {
     validate_generation_reference(paths, &prepared)?;
     let directory = StateDirectory::open(paths)?;
     verify_generation(&directory, &prepared.generation)?;
-    atomic_replace_with(
+    atomic_replace_with_faults(
         &directory,
         CONFIG_NAME,
         &prepared.config,
         before_config_commit,
+        at_point,
     )
 }
 
@@ -453,25 +523,57 @@ fn atomic_replace(
     directory: &StateDirectory,
     target: &str,
     contents: &[u8],
-) -> Result<(), SshError> {
+) -> Result<(), SshConfigCommitError> {
     atomic_replace_with(directory, target, contents, || Ok(()))
 }
 
+#[cfg(test)]
 fn atomic_replace_with<F>(
     directory: &StateDirectory,
     target: &str,
     contents: &[u8],
     before_publish: F,
-) -> Result<(), SshError>
+) -> Result<(), SshConfigCommitError>
 where
     F: FnOnce() -> Result<(), SshError>,
 {
+    atomic_replace_with_faults(directory, target, contents, before_publish, |_| Ok(()))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AtomicReplacePoint {
+    AfterRenameBeforeDirectorySync,
+    AfterDirectorySyncBeforeMetadata,
+    BeforeRestore,
+}
+
+fn atomic_replace_with_faults<F, G>(
+    directory: &StateDirectory,
+    target: &str,
+    contents: &[u8],
+    before_publish: F,
+    mut at_point: G,
+) -> Result<(), SshConfigCommitError>
+where
+    F: FnOnce() -> Result<(), SshError>,
+    G: FnMut(AtomicReplacePoint) -> Result<(), SshError>,
+{
     if contents.len() as u64 > maximum_managed_file_bytes() {
-        return Err(SshError::InvalidState(
-            "generated managed SSH file is too large",
-        ));
+        return Err(SshError::InvalidState("generated managed SSH file is too large").into());
     }
-    let previous = directory.metadata(target, PUBLIC_MODE)?;
+    let previous_identity = directory.metadata(target, PUBLIC_MODE)?;
+    let previous = if previous_identity.is_some() {
+        let (contents, identity) =
+            directory.read_file(target, PUBLIC_MODE, maximum_managed_file_bytes())?;
+        if Some(identity) != previous_identity {
+            return Err(
+                SshError::InvalidState("managed SSH target changed during replacement").into(),
+            );
+        }
+        Some(contents)
+    } else {
+        None
+    };
     let staging = random_staging_name()?;
     let mut guard = StagingGuard::new(directory, &staging);
     {
@@ -483,23 +585,108 @@ where
         file.sync_all()
             .map_err(|error| SshError::io("sync managed SSH staging file", error))?;
     }
+    let replacement_identity =
+        directory
+            .metadata(&staging, PUBLIC_MODE)?
+            .ok_or(SshError::InvalidState(
+                "managed SSH staging file disappeared before publication",
+            ))?;
     before_publish()?;
-    if directory.metadata(target, PUBLIC_MODE)? != previous {
-        return Err(SshError::InvalidState(
-            "managed SSH target changed during replacement",
-        ));
+    if directory.metadata(target, PUBLIC_MODE)? != previous_identity {
+        return Err(SshError::InvalidState("managed SSH target changed during replacement").into());
     }
-    match previous {
+    match previous_identity {
         None => directory.rename_new(&staging, target)?,
         Some(_) => directory.rename_replace(&staging, target)?,
     }
-    directory.sync()?;
-    directory
-        .metadata(target, PUBLIC_MODE)?
-        .ok_or(SshError::InvalidState(
-            "managed SSH file disappeared after replacement",
-        ))?;
     guard.disarm();
+    let published = (|| {
+        at_point(AtomicReplacePoint::AfterRenameBeforeDirectorySync)?;
+        directory.sync()?;
+        at_point(AtomicReplacePoint::AfterDirectorySyncBeforeMetadata)?;
+        directory
+            .metadata(target, PUBLIC_MODE)?
+            .ok_or(SshError::InvalidState(
+                "managed SSH file disappeared after replacement",
+            ))?;
+        Ok::<_, SshError>(())
+    })();
+    if let Err(error) = published {
+        return match restore_previous(
+            directory,
+            target,
+            replacement_identity,
+            previous.as_deref(),
+            &mut at_point,
+        ) {
+            Ok(()) => Err(SshConfigCommitError::Unpublished(error)),
+            Err(restoration) => Err(SshConfigCommitError::PublishedButUncertain {
+                original: error,
+                restoration,
+            }),
+        };
+    }
+    Ok(())
+}
+
+fn restore_previous<G>(
+    directory: &StateDirectory,
+    target: &str,
+    replacement_identity: super::FileIdentity,
+    previous: Option<&[u8]>,
+    at_point: &mut G,
+) -> Result<(), SshError>
+where
+    G: FnMut(AtomicReplacePoint) -> Result<(), SshError>,
+{
+    at_point(AtomicReplacePoint::BeforeRestore)?;
+    if let Some(previous) = previous {
+        let staging = random_staging_name()?;
+        let mut guard = StagingGuard::new(directory, &staging);
+        {
+            let mut file = directory.create_staging(&staging, PUBLIC_MODE)?;
+            file.write_all(previous)
+                .map_err(|error| SshError::io("write SSH restoration staging file", error))?;
+            file.flush()
+                .map_err(|error| SshError::io("flush SSH restoration staging file", error))?;
+            file.sync_all()
+                .map_err(|error| SshError::io("sync SSH restoration staging file", error))?;
+        }
+        let restored_identity =
+            directory
+                .metadata(&staging, PUBLIC_MODE)?
+                .ok_or(SshError::InvalidState(
+                    "SSH restoration staging file disappeared",
+                ))?;
+        if directory.metadata(target, PUBLIC_MODE)? != Some(replacement_identity) {
+            return Err(SshError::InvalidState(
+                "managed SSH target changed before restoration",
+            ));
+        }
+        directory.rename_replace(&staging, target)?;
+        guard.disarm();
+        directory.sync()?;
+        let (restored, identity) =
+            directory.read_file(target, PUBLIC_MODE, maximum_managed_file_bytes())?;
+        if identity != restored_identity || restored != previous {
+            return Err(SshError::InvalidState(
+                "managed SSH config restoration could not be verified",
+            ));
+        }
+    } else {
+        if directory.metadata(target, PUBLIC_MODE)? != Some(replacement_identity) {
+            return Err(SshError::InvalidState(
+                "managed SSH target changed before restoration",
+            ));
+        }
+        directory.remove_checked(target)?;
+        directory.sync()?;
+        if directory.metadata(target, PUBLIC_MODE)?.is_some() {
+            return Err(SshError::InvalidState(
+                "managed SSH config removal could not be verified",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -534,8 +721,9 @@ impl Drop for StagingGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PUBLIC_MODE, SshError, SshPaths, StateDirectory, atomic_replace, atomic_replace_with,
-        commit_openssh_files_with, prepare_openssh_files, publish_openssh_files,
+        AtomicReplacePoint, PUBLIC_MODE, SshConfigCommitError, SshError, SshPaths, StateDirectory,
+        atomic_replace, atomic_replace_with, atomic_replace_with_faults, commit_openssh_files_with,
+        prepare_openssh_files, publish_openssh_files,
     };
     use crate::ssh::{ActiveSsh, HostIdentity, ManagedSshHost, ensure_host_identity};
     use std::fs;
@@ -605,6 +793,128 @@ mod tests {
         assert!(fs::read_dir(paths.directory().as_std_path())?.all(|entry| {
             entry.is_ok_and(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn directory_sync_failure_after_rename_restores_previous_config()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().canonicalize()?;
+        let paths = SshPaths::for_environment(None, Some(home.as_os_str()))?;
+        let directory = StateDirectory::open(&paths)?;
+        atomic_replace(&directory, "config", b"previous\n")?;
+
+        let result = atomic_replace_with_faults(
+            &directory,
+            "config",
+            b"replacement\n",
+            || Ok(()),
+            |point| {
+                if point == AtomicReplacePoint::AfterRenameBeforeDirectorySync {
+                    Err(SshError::InvalidState(
+                        "injected directory synchronization failure",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(paths.config().as_std_path())?, b"previous\n");
+        Ok(())
+    }
+
+    #[test]
+    fn post_rename_metadata_failure_restores_previous_config()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().canonicalize()?;
+        let paths = SshPaths::for_environment(None, Some(home.as_os_str()))?;
+        let directory = StateDirectory::open(&paths)?;
+        atomic_replace(&directory, "config", b"previous\n")?;
+
+        let result = atomic_replace_with_faults(
+            &directory,
+            "config",
+            b"replacement\n",
+            || Ok(()),
+            |point| {
+                if point == AtomicReplacePoint::AfterDirectorySyncBeforeMetadata {
+                    Err(SshError::InvalidState(
+                        "injected post-rename metadata failure",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(paths.config().as_std_path())?, b"previous\n");
+        Ok(())
+    }
+
+    #[test]
+    fn post_rename_failure_removes_fresh_config_when_no_prior_config_existed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().canonicalize()?;
+        let paths = SshPaths::for_environment(None, Some(home.as_os_str()))?;
+        let directory = StateDirectory::open(&paths)?;
+
+        let result = atomic_replace_with_faults(
+            &directory,
+            "config",
+            b"replacement\n",
+            || Ok(()),
+            |point| {
+                if point == AtomicReplacePoint::AfterRenameBeforeDirectorySync {
+                    Err(SshError::InvalidState(
+                        "injected directory synchronization failure",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(!paths.config().exists());
+        Ok(())
+    }
+
+    #[test]
+    fn restoration_failure_reports_published_but_uncertain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().canonicalize()?;
+        let paths = SshPaths::for_environment(None, Some(home.as_os_str()))?;
+        let directory = StateDirectory::open(&paths)?;
+        atomic_replace(&directory, "config", b"previous\n")?;
+
+        let result = atomic_replace_with_faults(
+            &directory,
+            "config",
+            b"replacement\n",
+            || Ok(()),
+            |point| match point {
+                AtomicReplacePoint::AfterRenameBeforeDirectorySync => Err(SshError::InvalidState(
+                    "injected directory synchronization failure",
+                )),
+                AtomicReplacePoint::BeforeRestore => {
+                    Err(SshError::InvalidState("injected restoration failure"))
+                }
+                AtomicReplacePoint::AfterDirectorySyncBeforeMetadata => Ok(()),
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(SshConfigCommitError::PublishedButUncertain { .. })
+        ));
+        assert_eq!(fs::read(paths.config().as_std_path())?, b"replacement\n");
         Ok(())
     }
 }

@@ -5,15 +5,16 @@ use gascan_core::fake_runtime::{FailureBoundary, FakeRuntime};
 use gascan_core::manifest::Manifest;
 use gascan_core::policy::PolicyCompiler;
 use gascan_core::runtime::{
-    ResourceIdentity, ResourceKind, ResourceOwnership, RuntimeBackend, RuntimeCall, RuntimeError,
+    ContainerState, RemoveRequest, ResourceIdentity, ResourceKind, ResourceOwnership,
+    RuntimeBackend, RuntimeCall, RuntimeError,
 };
 use gascan_core::sandbox::{SandboxId, SandboxSpec};
 use gascan_proto::v1;
 use gascan_proto::v1::gas_can_server::GasCan;
 use gascand::{
     ActivityTracker, ActualState, DesiredState, NoopProvisioner, OperationKind, OperationStatus,
-    PortReservation, SandboxApi, SandboxRecord, SandboxService, SshManager, SshPaths,
-    SshResolution, Store, UpRequest, ensure_host_identity,
+    PortReservation, SandboxApi, SandboxRecord, SandboxService, SshConfigCommitFault, SshManager,
+    SshPaths, SshResolution, Store, UpRequest, ensure_host_identity,
 };
 use gascand::{ProvisionRequest, ProvisionResolution, Provisioner, ServiceError};
 use serde_json::json;
@@ -1020,6 +1021,354 @@ async fn ssh_config_commit_failure_publishes_no_alias_restores_resolution_and_ro
             .ok_or("failed record")?
             .ssh_resolution
             .is_none()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fresh_ssh_create_post_rename_restoration_is_typed_unpublished_and_rolls_back() -> TestResult
+{
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-post-rename-restored")?;
+    let host_public_key = generated_public_key(root, "host-post-rename-restored").await?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let service = test_service(runtime.clone(), root, paths.clone())?
+        .with_ssh_config_commit_fault_for_tests(SshConfigCommitFault::AfterRename);
+    let desired = networked_ssh_spec("ssh-post-rename-restored", root, Some(24_104))?;
+
+    let error = match service.up(UpRequest::new(desired.clone())).await {
+        Ok(_) => return Err("restored post-rename failure unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "ssh_config_update_failed");
+    assert!(runtime.inspect(desired.id()).await?.is_none());
+    assert!(
+        service
+            .status(desired.id())?
+            .ok_or("failed record")?
+            .ssh_resolution
+            .is_none()
+    );
+    assert!(
+        !paths.config().exists()
+            || !std::fs::read_to_string(paths.config())?
+                .contains(&format!("Host gascan-{}", desired.id()))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fresh_ssh_create_uncertain_publication_preserves_runtime_and_durable_resolution()
+-> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-post-rename-uncertain")?;
+    let host_public_key = generated_public_key(root, "host-post-rename-uncertain").await?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let service = test_service(runtime.clone(), root, paths.clone())?
+        .with_ssh_config_commit_fault_for_tests(SshConfigCommitFault::AfterRenameAndRestore);
+    let desired = networked_ssh_spec("ssh-post-rename-uncertain", root, Some(24_105))?;
+
+    let error = match service.up(UpRequest::new(desired.clone())).await {
+        Ok(_) => return Err("uncertain post-rename failure unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "ssh_config_publication_uncertain");
+    assert_eq!(
+        runtime.inspect(desired.id()).await?.ok_or("runtime")?.state,
+        ContainerState::Running
+    );
+    assert!(
+        service
+            .status(desired.id())?
+            .ok_or("failed record")?
+            .ssh_resolution
+            .is_some()
+    );
+    assert!(
+        std::fs::read_to_string(paths.config())?.contains(&format!("Host gascan-{}", desired.id()))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn retained_ssh_host_key_failure_removes_prior_alias_before_stop() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-retained-host-key-failure")?;
+    let host_public_key = generated_public_key(root, "host-retained-host-key-failure").await?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let service = test_service(runtime.clone(), root, paths.clone())?;
+    let desired = networked_ssh_spec("ssh-retained-host-key-failure", root, Some(24_101))?;
+    service.up(UpRequest::new(desired.clone())).await?;
+    runtime
+        .set_exec_result(b"ssh-rsa invalid\n".to_vec(), Vec::new(), 0)
+        .await;
+
+    let error = match service.up(UpRequest::new(desired.clone())).await {
+        Ok(_) => return Err("invalid retained host key unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "ssh_host_key_mismatch");
+    assert_eq!(
+        runtime.inspect(desired.id()).await?.ok_or("runtime")?.state,
+        ContainerState::Stopped
+    );
+    assert!(
+        !std::fs::read_to_string(paths.config())?
+            .contains(&format!("Host gascan-{}", desired.id()))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn retained_ssh_readiness_failure_removes_prior_alias_before_stop() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-retained-readiness-failure")?;
+    let host_public_key = generated_public_key(root, "host-retained-readiness-failure").await?;
+    let state = root.join("state.db");
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let desired = networked_ssh_spec("ssh-retained-readiness-failure", root, Some(24_102))?;
+    let first = service_with_readiness(
+        runtime.clone(),
+        root,
+        paths.clone(),
+        Utf8PathBuf::from("/usr/bin/true"),
+    )?;
+    first.up(UpRequest::new(desired.clone())).await?;
+    drop(first);
+    let failing = SandboxService::new_with_ssh_for_tests(
+        runtime.clone(),
+        Store::open(state)?,
+        Arc::new(NoopProvisioner),
+        paths.clone(),
+        readiness_program(root, "fail-retained-readiness", "exit 23")?,
+    );
+
+    let error = match failing.up(UpRequest::new(desired.clone())).await {
+        Ok(_) => return Err("failed retained readiness unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "ssh_not_ready");
+    assert_eq!(
+        runtime.inspect(desired.id()).await?.ok_or("runtime")?.state,
+        ContainerState::Stopped
+    );
+    assert!(
+        !std::fs::read_to_string(paths.config())?
+            .contains(&format!("Host gascan-{}", desired.id()))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn retained_ssh_readiness_failure_deactivates_before_cleanup_inspect_and_preserves_primary()
+-> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-retained-readiness-inspect-failure")?;
+    let host_public_key =
+        generated_public_key(root, "host-retained-readiness-inspect-failure").await?;
+    let state = root.join("state.db");
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let desired = networked_ssh_spec("ssh-retained-readiness-inspect-failure", root, Some(24_106))?;
+    let first = service_with_readiness(
+        runtime.clone(),
+        root,
+        paths.clone(),
+        Utf8PathBuf::from("/usr/bin/true"),
+    )?;
+    first.up(UpRequest::new(desired.clone())).await?;
+    drop(first);
+
+    let entered = root.join("retained-readiness-entered");
+    let release = root.join("release-retained-readiness");
+    let readiness = readiness_program(
+        root,
+        "gate-failed-retained-readiness",
+        &format!(
+            "/usr/bin/touch '{entered}'\n\
+             while [ ! -e '{release}' ]; do /bin/sleep 0.01; done\n\
+             exit 23"
+        ),
+    )?;
+    let failing = Arc::new(SandboxService::new_with_ssh_for_tests(
+        runtime.clone(),
+        Store::open(state)?,
+        Arc::new(NoopProvisioner),
+        paths.clone(),
+        readiness,
+    ));
+    let up = {
+        let failing = Arc::clone(&failing);
+        let desired = desired.clone();
+        tokio::spawn(async move { failing.up(UpRequest::new(desired)).await })
+    };
+    wait_for_path(&entered).await?;
+    runtime.inject_failure(FailureBoundary::Inspect).await;
+    std::fs::write(&release, b"release")?;
+
+    let error = match up.await? {
+        Ok(_) => return Err("failed retained readiness unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "ssh_not_ready");
+    assert_eq!(
+        runtime.inspect(desired.id()).await?.ok_or("runtime")?.state,
+        ContainerState::Running
+    );
+    assert!(
+        !std::fs::read_to_string(paths.config())?
+            .contains(&format!("Host gascan-{}", desired.id()))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn retained_ssh_readiness_failure_deactivates_when_cleanup_inspect_finds_no_runtime()
+-> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-retained-readiness-missing-runtime")?;
+    let host_public_key =
+        generated_public_key(root, "host-retained-readiness-missing-runtime").await?;
+    let state = root.join("state.db");
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let desired = networked_ssh_spec("ssh-retained-readiness-missing-runtime", root, Some(24_107))?;
+    let first = service_with_readiness(
+        runtime.clone(),
+        root,
+        paths.clone(),
+        Utf8PathBuf::from("/usr/bin/true"),
+    )?;
+    first.up(UpRequest::new(desired.clone())).await?;
+    drop(first);
+
+    let entered = root.join("retained-missing-readiness-entered");
+    let release = root.join("release-retained-missing-readiness");
+    let readiness = readiness_program(
+        root,
+        "gate-failed-retained-missing-readiness",
+        &format!(
+            "/usr/bin/touch '{entered}'\n\
+             while [ ! -e '{release}' ]; do /bin/sleep 0.01; done\n\
+             exit 23"
+        ),
+    )?;
+    let failing = Arc::new(SandboxService::new_with_ssh_for_tests(
+        runtime.clone(),
+        Store::open(state)?,
+        Arc::new(NoopProvisioner),
+        paths.clone(),
+        readiness,
+    ));
+    let up = {
+        let failing = Arc::clone(&failing);
+        let desired = desired.clone();
+        tokio::spawn(async move { failing.up(UpRequest::new(desired)).await })
+    };
+    wait_for_path(&entered).await?;
+    let resources = runtime
+        .list_resources()
+        .await?
+        .into_iter()
+        .filter(|resource| resource.sandbox_id() == Some(desired.id()))
+        .collect();
+    runtime
+        .remove(RemoveRequest::from_resources(resources)?)
+        .await?;
+    std::fs::write(&release, b"release")?;
+
+    let error = match up.await? {
+        Ok(_) => return Err("failed retained readiness unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "ssh_not_ready");
+    assert!(runtime.inspect(desired.id()).await?.is_none());
+    assert!(
+        !std::fs::read_to_string(paths.config())?
+            .contains(&format!("Host gascan-{}", desired.id()))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn retained_config_failure_preserves_primary_error_when_deactivation_is_unsafe() -> TestResult
+{
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-retained-config-failure")?;
+    let host_public_key = generated_public_key(root, "host-retained-config-failure").await?;
+    let target = root.join("hostile-retained-config");
+    std::fs::write(&target, "Host hostile\n")?;
+    let state = root.join("state.db");
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let desired = networked_ssh_spec("ssh-retained-config-failure", root, Some(24_103))?;
+    let first = SandboxService::new_with_ssh_for_tests(
+        runtime.clone(),
+        Store::open(&state)?,
+        Arc::new(NoopProvisioner),
+        paths.clone(),
+        Utf8PathBuf::from("/usr/bin/true"),
+    );
+    first.up(UpRequest::new(desired.clone())).await?;
+    drop(first);
+    let failure = readiness_program(
+        root,
+        "replace-retained-config-before-commit",
+        &format!(
+            "/bin/rm -f '{}'\n/bin/ln -s '{}' '{}'",
+            paths.config(),
+            target,
+            paths.config()
+        ),
+    )?;
+    let failing = SandboxService::new_with_ssh_for_tests(
+        runtime.clone(),
+        Store::open(state)?,
+        Arc::new(NoopProvisioner),
+        paths,
+        failure,
+    );
+
+    let error = match failing.up(UpRequest::new(desired.clone())).await {
+        Ok(_) => return Err("unsafe retained config unexpectedly committed".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "ssh_config_update_failed");
+    assert_eq!(
+        runtime.inspect(desired.id()).await?.ok_or("runtime")?.state,
+        ContainerState::Running
     );
     Ok(())
 }
