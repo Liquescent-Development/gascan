@@ -78,6 +78,68 @@ fn production_authority_matches_openssh_tilde_and_ignores_overridden_home() -> T
 }
 
 #[test]
+fn environment_overrides_cannot_select_production_ssh_mutation_paths() -> TestResult {
+    const CHILD: &str = "GASCAN_TEST_SSH_MUTATION_AUTHORITY_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let overridden_home =
+            PathBuf::from(std::env::var_os("HOME").ok_or("child HOME is missing")?);
+        let account_home = gascan_core::account::effective_account_home()?;
+        let production = SshConfig::for_user()?;
+        assert_eq!(
+            production.user_config_path(),
+            account_home.join(".ssh/config")
+        );
+        assert_eq!(
+            production.managed_config_path(),
+            account_home.join(".config/gascan/ssh/config")
+        );
+        assert_ne!(
+            production.user_config_path(),
+            overridden_home.join(".ssh/config")
+        );
+        assert_ne!(
+            production
+                .managed_config_path()
+                .parent()
+                .ok_or("managed config has no parent")?
+                .join("include-offer-v1"),
+            overridden_home.join(".config/gascan/ssh/include-offer-v1")
+        );
+
+        let injected = SshConfig::for_environment(None, Some(&overridden_home))?;
+        assert_eq!(
+            injected.user_config_path(),
+            overridden_home.join(".ssh/config")
+        );
+        assert_eq!(
+            injected.managed_config_path(),
+            overridden_home.join(".config/gascan/ssh/config")
+        );
+        return Ok(());
+    }
+
+    let temp = tempfile::tempdir()?;
+    let overridden_home = temp.path().join("overridden-home");
+    fs::create_dir(&overridden_home)?;
+    let output = std::process::Command::new(std::env::current_exe()?)
+        .env(CHILD, "1")
+        .env("HOME", &overridden_home)
+        .env("XDG_CONFIG_HOME", temp.path().join("overridden-xdg"))
+        .args([
+            "--exact",
+            "environment_overrides_cannot_select_production_ssh_mutation_paths",
+            "--nocapture",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "production mutation authority trusted environment overrides: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+#[test]
 fn install_and_remove_are_idempotent_and_touch_only_the_exact_block() -> TestResult {
     let (_temp, config) = fixture()?;
     let original = b"Host personal\n    HostName example.test\n";

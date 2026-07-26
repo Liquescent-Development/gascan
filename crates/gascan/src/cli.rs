@@ -298,13 +298,16 @@ pub async fn execute() -> Result<i32, CliError> {
         Command::Up { project_root, json } => {
             let project_root = resolve_project_root(&project_root)?;
             match client.api.up(v1::UpRequest { project_root }).await {
-                Ok(response) => operation(response.into_inner(), json, OperationKind::Up, None)
-                    .await
-                    .inspect(|code| {
-                        if *code == 0 && !json {
-                            offer_ssh_config_include();
-                        }
-                    }),
+                Ok(response) => {
+                    let result =
+                        operation(response.into_inner(), json, OperationKind::Up, None).await;
+                    preserve_up_result_with_optional_offer(
+                        result,
+                        json,
+                        &mut std::io::stderr(),
+                        try_offer_ssh_config_include,
+                    )
+                }
                 Err(status) => pre_stream_operation_failure(status.into(), json),
             }
         }
@@ -503,13 +506,24 @@ fn ssh_config_error(error: crate::ssh_config::SshConfigError) -> CliError {
     }
 }
 
-fn offer_ssh_config_include() {
-    if try_offer_ssh_config_include().is_err() {
-        let _ = writeln!(
-            std::io::stderr(),
-            "Warning: automatic SSH config setup failed; run `gascan ssh-config install` to try again."
-        );
-    }
+fn preserve_up_result_with_optional_offer<F, W>(
+    result: Result<i32, CliError>,
+    json: bool,
+    warning: &mut W,
+    offer: F,
+) -> Result<i32, CliError>
+where
+    F: FnOnce() -> Result<(), CliError>,
+    W: Write,
+{
+    result.inspect(|code| {
+        if *code == 0 && !json && offer().is_err() {
+            let _ = writeln!(
+                warning,
+                "Warning: automatic SSH config setup failed; run `gascan ssh-config install` to try again."
+            );
+        }
+    })
 }
 
 fn try_offer_ssh_config_include() -> Result<(), CliError> {
@@ -1068,6 +1082,45 @@ fn confirm_destroy() -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_include_offer_failure_preserves_successful_up_result()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().join("home");
+        let ssh = home.join(".ssh");
+        std::fs::create_dir(&home)?;
+        std::fs::create_dir(&ssh)?;
+        std::fs::set_permissions(
+            &ssh,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )?;
+        let config = SshConfig::for_environment(None, Some(&home))?;
+        let mut warning = Vec::new();
+
+        let result = preserve_up_result_with_optional_offer(
+            Ok(0),
+            false,
+            &mut warning,
+            || -> Result<(), CliError> {
+                let _ = first_use_offer(&config, true, true).map_err(ssh_config_error)?;
+                Ok(())
+            },
+        );
+
+        assert_eq!(result?, 0);
+        assert_eq!(
+            String::from_utf8(warning)?,
+            "Warning: automatic SSH config setup failed; run `gascan ssh-config install` to try again.\n"
+        );
+        assert_eq!(config.user_config_path(), home.join(".ssh/config"));
+        assert_eq!(
+            config.managed_config_path(),
+            home.join(".config/gascan/ssh/config")
+        );
+        assert!(!home.join(".config/gascan/ssh/include-offer-v1").exists());
+        Ok(())
+    }
 
     #[test]
     fn root_help_advertises_the_standard_version_flags() {

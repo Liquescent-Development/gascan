@@ -327,63 +327,6 @@ fn interactive_lifecycle_progress_updates_in_place_and_finishes_cleanly() -> Tes
 }
 
 #[test]
-fn optional_ssh_offer_failure_cannot_fail_a_successful_up() -> TestResult {
-    let env = Environment::new()?;
-    assert!(env.invoke(&["doctor", "--json"])?.status.success());
-    let home = tempfile::tempdir()?;
-    let ssh = home.path().join(".ssh");
-    std::fs::create_dir(&ssh)?;
-    std::fs::set_permissions(&ssh, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
-
-    let pty = rustix_openpty::openpty(None, None)?;
-    let stdin = std::fs::File::from(rustix_openpty::rustix::io::dup(&pty.user)?);
-    let stderr = std::fs::File::from(rustix_openpty::rustix::io::dup(&pty.user)?);
-    let mut command = env.command(&["up", env.root()?]);
-    command
-        .env("HOME", home.path())
-        .env_remove("CI")
-        .env_remove("GITHUB_ACTIONS")
-        .env_remove("BUILD_BUILDID")
-        .stdin(stdin)
-        .stdout(Stdio::null())
-        .stderr(stderr);
-    let mut child = command.spawn()?;
-    drop(command);
-    drop(pty.user);
-
-    let mut controller = std::fs::File::from(pty.controller);
-    let mut writer = controller.try_clone()?;
-    writer.write_all(b"y\n")?;
-    drop(writer);
-    let reader = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
-        let mut output = Vec::new();
-        match controller.read_to_end(&mut output) {
-            Ok(_) => {}
-            Err(error) if error.raw_os_error() == Some(5) => {}
-            Err(error) => return Err(error),
-        }
-        Ok(output)
-    });
-    let status = child.wait()?;
-    let output = reader.join().map_err(|_| "PTY reader panicked")??;
-    let transcript = String::from_utf8(output)?;
-
-    assert!(
-        status.success(),
-        "optional SSH setup changed successful up to {status}: {}",
-        transcript.escape_debug()
-    );
-    assert!(
-        transcript.contains(
-            "Warning: automatic SSH config setup failed; run `gascan ssh-config install` to try again."
-        ),
-        "manual recovery warning missing: {}",
-        transcript.escape_debug()
-    );
-    Ok(())
-}
-
-#[test]
 fn interactive_streamed_operation_failure_clears_spinner_before_error() -> TestResult {
     let env = Environment::new()?;
     assert!(
