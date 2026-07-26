@@ -54,6 +54,10 @@ pub struct DoctorFacts {
     pub loopback_publish: DoctorFact,
     pub resource_limits: DoctorFact,
     pub offline: DoctorFact,
+    pub ssh_client: DoctorFact,
+    pub ssh_identity: DoctorFact,
+    pub ssh_config: DoctorFact,
+    pub ssh_native_publish: DoctorFact,
 }
 
 impl DoctorFacts {
@@ -78,6 +82,10 @@ impl DoctorFacts {
             loopback_publish: fact(),
             resource_limits: fact(),
             offline: fact(),
+            ssh_client: fact(),
+            ssh_identity: fact(),
+            ssh_config: fact(),
+            ssh_native_publish: fact(),
         }
     }
     #[cfg(debug_assertions)]
@@ -102,6 +110,10 @@ impl DoctorFacts {
             loopback_publish: pass(),
             resource_limits: pass(),
             offline: pass(),
+            ssh_client: pass(),
+            ssh_identity: pass(),
+            ssh_config: pass(),
+            ssh_native_publish: pass(),
         }
     }
 
@@ -191,6 +203,26 @@ impl DoctorFacts {
                 "runtime.offline",
                 self.offline,
                 "install a supported Apple container release with proven offline isolation",
+            ),
+            (
+                "ssh.client",
+                self.ssh_client,
+                "install the system OpenSSH client at /usr/bin/ssh",
+            ),
+            (
+                "ssh.identity",
+                self.ssh_identity,
+                "restore the matching managed SSH identity and safe permissions; otherwise destroy and recreate affected sandboxes",
+            ),
+            (
+                "ssh.config",
+                self.ssh_config,
+                "remove unsafe generated SSH config state, then run `gascan up`",
+            ),
+            (
+                "ssh.native_publish",
+                self.ssh_native_publish,
+                "install a supported Apple container release with loopback publication support",
             ),
         ];
         DoctorReport {

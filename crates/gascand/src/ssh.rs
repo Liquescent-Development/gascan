@@ -15,10 +15,12 @@ use std::net::IpAddr;
 use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 
+pub(crate) use config::validate_managed_config_if_present;
 pub use config::{
     PreparedSshFiles, commit_openssh_files, prepare_openssh_files, publish_openssh_files,
     readiness_ssh_args,
 };
+pub(crate) use identity::validate_host_identity_if_present;
 pub use identity::{HostIdentity, ensure_host_identity};
 pub use manager::{PreparedSshCreate, PublishedSshSnapshot, SshManager};
 pub use port::PortReservation;
@@ -178,6 +180,28 @@ impl StateDirectory {
             fd,
             expected_uid: paths.expected_uid,
         })
+    }
+
+    pub(crate) fn open_existing(paths: &SshPaths) -> Result<Option<Self>, SshError> {
+        let Some(config_home) =
+            open_existing_config_home(paths.config_home.as_std_path(), paths.expected_uid)?
+        else {
+            return Ok(None);
+        };
+        let Some(gascan) =
+            open_existing_managed_directory(&config_home, "gascan", paths.expected_uid)?
+        else {
+            return Ok(None);
+        };
+        let Some(fd) = open_existing_managed_directory(&gascan, "ssh", paths.expected_uid)? else {
+            return Ok(None);
+        };
+        rustix::fs::flock(&fd, FlockOperation::LockExclusive)
+            .map_err(|error| SshError::io("lock managed SSH directory", error))?;
+        Ok(Some(Self {
+            fd,
+            expected_uid: paths.expected_uid,
+        }))
     }
 
     pub(crate) fn metadata(
@@ -451,6 +475,55 @@ fn open_config_home(path: &Path, expected_uid: u32) -> Result<OwnedFd, SshError>
     Ok(directory)
 }
 
+fn open_existing_config_home(path: &Path, expected_uid: u32) -> Result<Option<OwnedFd>, SshError> {
+    if !path.is_absolute() {
+        return Err(SshError::InvalidState(
+            "SSH configuration home must be absolute",
+        ));
+    }
+    let mut components = path.components();
+    if components.next() != Some(Component::RootDir) {
+        return Err(SshError::InvalidState(
+            "SSH configuration home must be absolute",
+        ));
+    }
+    let mut directory = rustix::fs::open(
+        "/",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| SshError::io("open filesystem root", error))?;
+    for component in components {
+        let Component::Normal(name) = component else {
+            return Err(SshError::InvalidState(
+                "SSH configuration path contains a non-normal component",
+            ));
+        };
+        directory = match rustix::fs::openat(
+            &directory,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(next) => next,
+            Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
+            Err(error) => return Err(SshError::io("open SSH configuration ancestor", error)),
+        };
+        validate_path_ancestor(&directory)?;
+    }
+    let stat = rustix::fs::fstat(&directory)
+        .map_err(|error| SshError::io("inspect SSH configuration home", error))?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
+        || stat.st_uid != expected_uid
+        || stat.st_mode & 0o022 != 0
+    {
+        return Err(SshError::InvalidState(
+            "SSH configuration home ownership or mode is unsafe",
+        ));
+    }
+    Ok(Some(directory))
+}
+
 fn validate_path_ancestor(directory: &OwnedFd) -> Result<(), SshError> {
     let stat = rustix::fs::fstat(directory)
         .map_err(|error| SshError::io("inspect SSH configuration ancestor", error))?;
@@ -504,6 +577,34 @@ fn open_managed_directory(
         ));
     }
     Ok(directory)
+}
+
+fn open_existing_managed_directory(
+    parent: &OwnedFd,
+    name: &str,
+    expected_uid: u32,
+) -> Result<Option<OwnedFd>, SshError> {
+    let directory = match rustix::fs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(directory) => directory,
+        Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
+        Err(error) => return Err(SshError::io("open managed SSH directory", error)),
+    };
+    let stat = rustix::fs::fstat(&directory)
+        .map_err(|error| SshError::io("inspect managed SSH directory", error))?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
+        || stat.st_uid != expected_uid
+        || stat.st_mode & 0o7777 != DIRECTORY_MODE
+    {
+        return Err(SshError::InvalidState(
+            "managed SSH directory ownership or mode is unsafe",
+        ));
+    }
+    Ok(Some(directory))
 }
 
 fn utf8_path(path: PathBuf) -> Result<Utf8PathBuf, SshError> {

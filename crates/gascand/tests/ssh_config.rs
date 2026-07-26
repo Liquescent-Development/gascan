@@ -193,6 +193,28 @@ async fn publishes_stable_sorted_strict_openssh_files() -> TestResult {
 }
 
 #[tokio::test]
+async fn successful_publication_preserves_the_previous_known_hosts_generation_for_readers()
+-> TestResult {
+    let temp = TempDir::new()?;
+    let paths = paths(&temp)?;
+    let identity = ensure_host_identity(&paths).await?;
+    publish_openssh_files(&paths, &identity, &[host("gascan-before", 2222, &identity)])?;
+    let previous_config = fs::read_to_string(paths.config().as_std_path())?;
+    let previous_generation = std::path::PathBuf::from(configured_known_hosts(&previous_config)?);
+    let previous_contents = fs::read(&previous_generation)?;
+    assert!(previous_generation.exists());
+
+    publish_openssh_files(&paths, &identity, &[host("gascan-after", 2223, &identity)])?;
+    let current_config = fs::read_to_string(paths.config().as_std_path())?;
+    let current_generation = std::path::PathBuf::from(configured_known_hosts(&current_config)?);
+
+    assert_ne!(current_generation, previous_generation);
+    assert!(current_generation.exists());
+    assert_eq!(fs::read(previous_generation)?, previous_contents);
+    Ok(())
+}
+
+#[tokio::test]
 async fn readiness_args_are_discrete_and_do_not_weaken_reusable_config() -> TestResult {
     let temp = TempDir::new()?;
     let paths = paths(&temp)?;

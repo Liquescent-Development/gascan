@@ -12,7 +12,8 @@
           "hostAddress": "127.0.0.1",
           "hostPort": 22222,
           "containerPort": 22,
-          "protocol": "tcp"
+          "count": 1,
+          "proto": "tcp"
         }
       ]
     },

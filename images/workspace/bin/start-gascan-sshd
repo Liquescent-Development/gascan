@@ -26,9 +26,13 @@ fi
 
 workspace_uid=1000
 workspace_gid=1000
+fresh_config_uid=0
+fresh_config_gid=0
 test -z "$test_root" || {
     workspace_uid=$owner_uid
     workspace_gid=$owner_gid
+    fresh_config_uid=$owner_uid
+    fresh_config_gid=$owner_gid
 }
 
 config_root=$test_root/home/workspace/.config/gascan
@@ -136,6 +140,19 @@ validate_replace_target()
     validate_regular "$path" "$uid" "$gid" "$mode"
 }
 
+validate_fresh_config_root()
+{
+    unexpected=$(find "$config_root" -mindepth 1 -maxdepth 1 ! -name lost+found -print -quit)
+    test -z "$unexpected" ||
+        die 'root-owned Gas Can config root contains unexpected state'
+    lost_found=$config_root/lost+found
+    if path_exists "$lost_found"; then
+        validate_directory "$lost_found" "$owner_uid" "$owner_gid" 700
+        test -z "$(find "$lost_found" -mindepth 1 -print -quit)" ||
+            die 'Gas Can config volume lost+found is not empty'
+    fi
+}
+
 validate_authorized_key()
 {
     key=$1
@@ -192,8 +209,8 @@ fi
 config_metadata=$(metadata "$config_root")
 workspace_config_metadata=$(directory_metadata "$workspace_uid" "$workspace_gid" 700)
 managed_config_metadata=$(directory_metadata "$owner_uid" "$workspace_gid" 1770)
-root_config_metadata_755=$(directory_metadata 0 0 755)
-root_config_metadata_700=$(directory_metadata 0 0 700)
+root_config_metadata_755=$(directory_metadata "$fresh_config_uid" "$fresh_config_gid" 755)
+root_config_metadata_700=$(directory_metadata "$fresh_config_uid" "$fresh_config_gid" 700)
 case "$config_metadata" in
     "$managed_config_metadata"*) ;;
     "$workspace_config_metadata"*)
@@ -201,8 +218,7 @@ case "$config_metadata" in
         chmod 1770 "$config_root"
         ;;
     "$root_config_metadata_755"*|"$root_config_metadata_700"*)
-        test -z "$(find "$config_root" -mindepth 1 -print -quit)" ||
-            die 'root-owned Gas Can config root is not empty'
+        validate_fresh_config_root
         chown "$owner_uid:$workspace_gid" "$config_root"
         chmod 1770 "$config_root"
         ;;
@@ -278,10 +294,12 @@ chown "$owner_uid:$owner_gid" "$config_tmp"
 {
     printf '%s\n' \
         'AddressFamily inet' \
-        'ListenAddress 127.0.0.1' \
+        'ListenAddress 0.0.0.0' \
         'Port 22' \
         "HostKey $host_key" \
-        "AuthorizedKeysFile $authorized_keys" \
+        'AuthorizedKeysFile none' \
+        "AuthorizedKeysCommand /bin/cat $authorized_keys" \
+        'AuthorizedKeysCommandUser root' \
         "PidFile $test_root/run/gascan-sshd.pid" \
         'PasswordAuthentication no' \
         'KbdInteractiveAuthentication no' \
@@ -303,17 +321,7 @@ chown "$owner_uid:$owner_gid" "$config_tmp"
         'PrintMotd no' \
         'PermitUserRC no' \
         'Subsystem sftp internal-sftp' \
-        'SetEnv HOME=/home/workspace' \
-        'SetEnv USER=workspace' \
-        'SetEnv LOGNAME=workspace' \
-        'SetEnv LANG=C.UTF-8' \
-        'SetEnv LC_ALL=C.UTF-8' \
-        'SetEnv MISE_CACHE_DIR=/home/workspace/.cache/mise' \
-        'SetEnv MISE_DATA_DIR=/home/workspace/.local/share/mise' \
-        'SetEnv MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml' \
-        'SetEnv MISE_STATE_DIR=/home/workspace/.config/gascan/mise-state' \
-        'SetEnv MISE_SYSTEM_DATA_DIR=/opt/gascan/mise' \
-        'SetEnv PATH=/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+        'SetEnv HOME=/home/workspace USER=workspace LOGNAME=workspace LANG=C.UTF-8 LC_ALL=C.UTF-8 MISE_CACHE_DIR=/home/workspace/.cache/mise MISE_DATA_DIR=/home/workspace/.local/share/mise MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml MISE_STATE_DIR=/home/workspace/.config/gascan/mise-state MISE_SYSTEM_DATA_DIR=/opt/gascan/mise PATH=/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 } >"$config_tmp"
 validate_regular "$config_tmp" "$owner_uid" "$owner_gid" 600
 "$sshd_bin" -t -f "$config_tmp"

@@ -7,6 +7,8 @@ fn doctor(json: bool) -> Result<std::process::Output, Box<dyn std::error::Error>
     let daemon = std::env::var_os("CARGO_BIN_EXE_gascan-e2e-daemon").ok_or("gascand missing")?;
     let runtime = tempfile::tempdir()?;
     let root = runtime.path().canonicalize()?;
+    let account_home = root.join("account-home");
+    std::fs::create_dir(&account_home)?;
     let mut command = Command::new(cli);
     command
         .arg("doctor")
@@ -14,6 +16,7 @@ fn doctor(json: bool) -> Result<std::process::Output, Box<dyn std::error::Error>
         .env("GASCAN_STATE_PATH", root.join("state.sqlite3"))
         .env("GASCAN_FAKE_STATE_PATH", root.join("runtime.json"))
         .env("GASCAN_PID_PATH", root.join("daemon.pid"))
+        .env("GASCAN_E2E_ACCOUNT_HOME", account_home)
         .env("GASCAN_DAEMON", daemon)
         .env("GASCAN_TEST_FAKE_BACKEND", "1");
     if json {

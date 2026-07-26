@@ -84,6 +84,22 @@ pub(crate) async fn load_host_identity(paths: &SshPaths) -> Result<HostIdentity,
     }
 }
 
+pub(crate) async fn validate_host_identity_if_present(
+    paths: &SshPaths,
+) -> Result<Option<HostIdentity>, SshError> {
+    let Some(directory) = StateDirectory::open_existing(paths)? else {
+        return Ok(None);
+    };
+    match (
+        directory.metadata(PRIVATE_KEY_NAME, PRIVATE_MODE)?,
+        directory.metadata(PUBLIC_KEY_NAME, PUBLIC_MODE)?,
+    ) {
+        (Some(_), Some(_)) => load_existing(&directory, paths).await.map(Some),
+        (None, None) => Ok(None),
+        _ => Err(SshError::InvalidState("managed SSH identity is incomplete")),
+    }
+}
+
 pub(crate) fn open_revalidated_identity(
     paths: &SshPaths,
     identity: &HostIdentity,

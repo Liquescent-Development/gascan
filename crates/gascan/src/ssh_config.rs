@@ -5,6 +5,8 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
+#[cfg(debug_assertions)]
+use std::sync::OnceLock;
 
 pub const INCLUDE_BLOCK_LF: &[u8] = concat!(
     "# >>> gascan managed ssh include >>>\n",
@@ -19,6 +21,8 @@ const INCLUDE_BLOCK_CRLF: &[u8] = concat!(
 )
 .as_bytes();
 const OFFER_RECEIPT: &str = "include-offer-v1";
+#[cfg(debug_assertions)]
+static E2E_ACCOUNT_HOME: OnceLock<PathBuf> = OnceLock::new();
 const USER_CONFIG: &str = "config";
 const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
 const DIRECTORY_MODE: u16 = 0o700;
@@ -116,6 +120,10 @@ pub struct SshConfig {
 
 impl SshConfig {
     pub fn for_user() -> Result<Self, SshConfigError> {
+        #[cfg(debug_assertions)]
+        if let Some(home) = E2E_ACCOUNT_HOME.get() {
+            return Self::for_environment(None, Some(home));
+        }
         let home = gascan_core::account::effective_account_home().map_err(|_| {
             SshConfigError::unsafe_path("effective account home is unavailable or unsafe")
         })?;
@@ -270,6 +278,19 @@ impl SshConfig {
         };
         open_child_directory(&gascan.fd, "ssh", self.expected_uid, create, true)
     }
+}
+
+#[doc(hidden)]
+#[cfg(debug_assertions)]
+pub fn configure_e2e_account_home(home: &Path) -> Result<(), SshConfigError> {
+    let home = validated_absolute(home)?;
+    E2E_ACCOUNT_HOME.set(home.clone()).map_err(|existing| {
+        if existing == home {
+            SshConfigError::unsafe_path("e2e account home was configured more than once")
+        } else {
+            SshConfigError::unsafe_path("e2e account home authority changed")
+        }
+    })
 }
 
 pub fn managed_config_path(

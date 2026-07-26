@@ -541,6 +541,27 @@ mod tests {
     }
 
     #[test]
+    fn passing_ssh_doctor_facts_are_compact_and_hide_success_details() {
+        let report = gascan_core::doctor::DoctorFacts::all_supported_for_tests().into_report();
+        let checks = report
+            .checks
+            .into_iter()
+            .map(|check| DoctorCheck {
+                id: check.id,
+                status: "pass".to_owned(),
+                detail: "/Users/example/.config/gascan/ssh/identity_ed25519".to_owned(),
+                remedy: check.remedy,
+            })
+            .collect::<Vec<_>>();
+
+        let output = render_doctor(&checks, OutputCapabilities::plain());
+
+        assert!(output.contains("  Ssh"));
+        assert!(output.contains("4/4 checks passed"));
+        assert!(!output.contains("/Users/example"));
+    }
+
+    #[test]
     fn mixed_doctor_report_expands_only_failed_checks() {
         let checks = vec![
             check("host.release", "pass", "passing release detail", ""),

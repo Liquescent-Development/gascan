@@ -119,7 +119,8 @@ struct PublishedPort {
     host_address: IpAddr,
     host_port: u16,
     container_port: u16,
-    protocol: String,
+    count: u16,
+    proto: String,
 }
 
 #[derive(Deserialize)]
@@ -163,16 +164,16 @@ fn parse_published_ports(
                     "published port does not bind to IPv4 loopback".to_owned(),
                 ));
             }
-            if port.protocol != "tcp" {
+            if port.proto != "tcp" {
                 return Err(invalid_output(
                     "container inspect",
                     "published port protocol is not TCP".to_owned(),
                 ));
             }
-            if port.host_port == 0 || port.container_port == 0 {
+            if port.host_port == 0 || port.container_port == 0 || port.count != 1 {
                 return Err(invalid_output(
                     "container inspect",
-                    "published port values must be nonzero".to_owned(),
+                    "published port values must be nonzero single-port mappings".to_owned(),
                 ));
             }
             if !seen.insert((port.host_address, port.host_port)) {

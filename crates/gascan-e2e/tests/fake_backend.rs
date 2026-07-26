@@ -39,6 +39,7 @@ struct Environment {
     root: tempfile::TempDir,
     runtime: tempfile::TempDir,
     runtime_root: std::path::PathBuf,
+    account_home: std::path::PathBuf,
 }
 
 impl Environment {
@@ -49,12 +50,15 @@ impl Environment {
         let root = tempfile::tempdir()?;
         let runtime = tempfile::tempdir()?;
         let runtime_root = runtime.path().canonicalize()?;
+        let account_home = runtime_root.join("account-home");
+        std::fs::create_dir(&account_home)?;
         Ok(Self {
             gascan,
             gascand,
             root,
             runtime,
             runtime_root,
+            account_home,
         })
     }
     fn command(&self, arguments: &[&str]) -> Command {
@@ -68,6 +72,7 @@ impl Environment {
                 self.runtime_root.join("runtime.json"),
             )
             .env("GASCAN_PID_PATH", self.runtime_root.join("daemon.pid"))
+            .env("GASCAN_E2E_ACCOUNT_HOME", &self.account_home)
             .env("GASCAN_DAEMON", &self.gascand);
         command.env("GASCAN_TEST_FAKE_BACKEND", "1");
         command

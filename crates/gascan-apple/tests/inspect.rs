@@ -81,17 +81,41 @@ fn inspect_record(published_ports: &str) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn inspect_accepts_exact_apple_1_1_published_port_shape() {
+    let response = inspect_record(
+        r#"[{"hostAddress":"127.0.0.1","hostPort":22222,"containerPort":22,"count":1,"proto":"tcp"}]"#,
+    );
+    let actual = inspector(output(&response))
+        .inspect(&id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        actual.ports(),
+        [RuntimePort {
+            host_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            host_port: 22222,
+            guest_port: 22,
+        }]
+    );
+}
+
+#[tokio::test]
 async fn inspect_rejects_untrusted_published_port_shapes_and_values() {
     for published_ports in [
-        r#"[{"hostAddress":"127.0.0.1","hostPort":22222,"containerPort":22,"protocol":"udp"}]"#,
-        r#"[{"hostAddress":"0.0.0.0","hostPort":22222,"containerPort":22,"protocol":"tcp"}]"#,
-        r#"[{"hostAddress":"192.0.2.1","hostPort":22222,"containerPort":22,"protocol":"tcp"}]"#,
-        r#"[{"hostAddress":"::1","hostPort":22222,"containerPort":22,"protocol":"tcp"}]"#,
-        r#"[{"hostAddress":"127.0.0.1","hostPort":0,"containerPort":22,"protocol":"tcp"}]"#,
-        r#"[{"hostAddress":"127.0.0.1","hostPort":22222,"containerPort":0,"protocol":"tcp"}]"#,
-        r#"[{"hostAddress":"127.0.0.1","hostPort":"22222","containerPort":22,"protocol":"tcp"}]"#,
-        r#"[{"hostAddress":"127.0.0.1","hostPort":65536,"containerPort":22,"protocol":"tcp"}]"#,
-        r#"[{"hostAddress":"127.0.0.1","hostPort":22222,"containerPort":22,"protocol":"tcp"},{"hostAddress":"127.0.0.1","hostPort":22222,"containerPort":22,"protocol":"tcp"}]"#,
+        r#"[{"hostAddress":"127.0.0.1","hostPort":22222,"containerPort":22,"count":1,"proto":"udp"}]"#,
+        r#"[{"hostAddress":"0.0.0.0","hostPort":22222,"containerPort":22,"count":1,"proto":"tcp"}]"#,
+        r#"[{"hostAddress":"192.0.2.1","hostPort":22222,"containerPort":22,"count":1,"proto":"tcp"}]"#,
+        r#"[{"hostAddress":"::1","hostPort":22222,"containerPort":22,"count":1,"proto":"tcp"}]"#,
+        r#"[{"hostAddress":"127.0.0.1","hostPort":0,"containerPort":22,"count":1,"proto":"tcp"}]"#,
+        r#"[{"hostAddress":"127.0.0.1","hostPort":22222,"containerPort":0,"count":1,"proto":"tcp"}]"#,
+        r#"[{"hostAddress":"127.0.0.1","hostPort":"22222","containerPort":22,"count":1,"proto":"tcp"}]"#,
+        r#"[{"hostAddress":"127.0.0.1","hostPort":65536,"containerPort":22,"count":1,"proto":"tcp"}]"#,
+        r#"[{"hostAddress":"127.0.0.1","hostPort":22222,"containerPort":22,"count":0,"proto":"tcp"}]"#,
+        r#"[{"hostAddress":"127.0.0.1","hostPort":22222,"containerPort":22,"count":2,"proto":"tcp"}]"#,
+        r#"[{"hostAddress":"127.0.0.1","hostPort":22222,"containerPort":22,"proto":"tcp"}]"#,
+        r#"[{"hostAddress":"127.0.0.1","hostPort":22222,"containerPort":22,"count":1,"protocol":"tcp"}]"#,
+        r#"[{"hostAddress":"127.0.0.1","hostPort":22222,"containerPort":22,"count":1,"proto":"tcp"},{"hostAddress":"127.0.0.1","hostPort":22222,"containerPort":22,"count":1,"proto":"tcp"}]"#,
     ] {
         let response = inspect_record(published_ports);
         let error = inspector(output(&response))

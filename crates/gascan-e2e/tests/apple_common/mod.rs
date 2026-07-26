@@ -114,12 +114,134 @@ pub struct AppleE2e {
     runtime: Option<tempfile::TempDir>,
     root_path: std::path::PathBuf,
     runtime_root: std::path::PathBuf,
+    account_home: std::path::PathBuf,
     id: SandboxId,
     manifest_name: String,
     owner_token: String,
     error_diagnostics: bool,
     network_mode: Option<String>,
     cleanup_manifest: Option<std::path::PathBuf>,
+}
+
+const DEFAULT_NETWORK_PROBE: &str = r#"import os, socket, time
+from pathlib import Path
+
+target = Path("/probe/target")
+deadline = time.monotonic() + 600
+while not target.exists():
+    if time.monotonic() >= deadline:
+        raise SystemExit("target rendezvous timed out")
+    time.sleep(0.05)
+address = target.read_text().strip()
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.settimeout(2.0)
+try:
+    sock.connect((address, 22))
+except OSError:
+    result = "isolated-default-network\n"
+else:
+    result = "unexpected-ssh-reachability\n"
+Path("/probe/result.tmp").write_text(result)
+os.replace("/probe/result.tmp", "/probe/result")
+time.sleep(600)
+"#;
+
+pub struct DefaultNetworkProbe {
+    name: String,
+    owner_token: String,
+    rendezvous: tempfile::TempDir,
+    active: bool,
+}
+
+impl DefaultNetworkProbe {
+    fn assert_owned(&self) -> TestResult {
+        let output = container_command_bounded(
+            ["inspect", self.name.as_str()],
+            std::time::Duration::from_secs(15),
+        )?;
+        if !output.status.success() {
+            return Err(format!(
+                "default-network probe inspection failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        let records: Value = serde_json::from_slice(&output.stdout)?;
+        let record = records
+            .as_array()
+            .and_then(|records| (records.len() == 1).then(|| &records[0]))
+            .ok_or("default-network probe inspection is absent or ambiguous")?;
+        if record["configuration"]["id"].as_str() != Some(self.name.as_str())
+            || record["configuration"]["labels"]["dev.gascan.test"].as_str() != Some("true")
+            || record["configuration"]["labels"]["dev.gascan.test.owner"].as_str()
+                != Some(self.owner_token.as_str())
+        {
+            return Err("default-network probe ownership changed".into());
+        }
+        Ok(())
+    }
+
+    fn assert_isolated_from(&self, address: &str) -> TestResult {
+        let target = self.rendezvous.path().join("target");
+        let target_staging = self.rendezvous.path().join("target.tmp");
+        let result = self.rendezvous.path().join("result");
+        if target.try_exists()? || target_staging.try_exists()? || result.try_exists()? {
+            return Err("default-network probe rendezvous was already used".into());
+        }
+        std::fs::write(&target_staging, format!("{address}\n"))?;
+        std::fs::rename(&target_staging, &target)?;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            match std::fs::metadata(&result) {
+                Ok(metadata) => {
+                    if metadata.len() > 128 {
+                        return Err("default-network probe result is excessive".into());
+                    }
+                    return match std::fs::read_to_string(&result)?.as_str() {
+                        "isolated-default-network\n" => Ok(()),
+                        other => Err(format!(
+                            "Apple default network reached sandbox SSH or the probe failed: {other:?}"
+                        )
+                        .into()),
+                    };
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("default-network probe result timed out".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    fn cleanup(&mut self) -> TestResult {
+        if !self.active {
+            return Ok(());
+        }
+        if assert_container_id_absent(&self.name).is_ok() {
+            self.active = false;
+            return Ok(());
+        }
+        self.assert_owned()?;
+        let _ = cleanup_mutation(["stop", "--time", "5", self.name.as_str()]);
+        if assert_container_id_absent(&self.name).is_err() {
+            self.assert_owned()?;
+            cleanup_mutation(["delete", self.name.as_str()])?;
+        }
+        assert_container_id_absent(&self.name)?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for DefaultNetworkProbe {
+    fn drop(&mut self) {
+        if let Err(error) = self.cleanup() {
+            eprintln!("Gate 4 default-network probe cleanup failed: {error}");
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -158,6 +280,72 @@ impl AppleE2e {
         )
     }
 
+    pub fn start_default_network_probe(&self) -> TestResult<DefaultNetworkProbe> {
+        let image = std::env::var("GASCAN_E2E_CANDIDATE_IMAGE")
+            .map_err(|_| "GASCAN_E2E_CANDIDATE_IMAGE is required")?;
+        let name = format!("gascan-ssh-isolation-{}", self.owner_token);
+        assert_container_id_absent(&name)?;
+        let rendezvous = tempfile::Builder::new()
+            .prefix("gascan-ssh-probe-")
+            .tempdir_in(&self.runtime_root)?;
+        std::fs::set_permissions(
+            rendezvous.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )?;
+        let rendezvous_path = rendezvous.path().canonicalize()?;
+        let rendezvous_path = rendezvous_path
+            .to_str()
+            .ok_or("default-network probe path is not UTF-8")?;
+        let mut probe = DefaultNetworkProbe {
+            name,
+            owner_token: self.owner_token.clone(),
+            rendezvous,
+            active: true,
+        };
+        let owner_label = format!("dev.gascan.test.owner={}", probe.owner_token);
+        let mount = format!("type=bind,source={rendezvous_path},target=/probe");
+        let output = container_command_bounded(
+            [
+                "run",
+                "--remove",
+                "--detach",
+                "--progress",
+                "none",
+                "--name",
+                probe.name.as_str(),
+                "--label",
+                "dev.gascan.test=true",
+                "--label",
+                owner_label.as_str(),
+                "--network",
+                "default",
+                "--user",
+                "root",
+                "--mount",
+                mount.as_str(),
+                image.as_str(),
+                "python3",
+                "-c",
+                DEFAULT_NETWORK_PROBE,
+            ],
+            std::time::Duration::from_secs(2 * 60),
+        )?;
+        if !output.status.success() {
+            let error = format!(
+                "default-network probe start failed with {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let cleanup = probe.cleanup();
+            return match cleanup {
+                Ok(()) => Err(error.into()),
+                Err(cleanup) => Err(format!("{error}; cleanup failed: {cleanup}").into()),
+            };
+        }
+        probe.assert_owned()?;
+        Ok(probe)
+    }
+
     fn new_scoped(
         name: &str,
         session_root: std::path::PathBuf,
@@ -191,6 +379,12 @@ impl AppleE2e {
         }
         let root_path = root.path().canonicalize()?;
         let runtime_root = runtime.path().canonicalize()?;
+        let account_home = runtime_root.join("account-home");
+        std::fs::create_dir(&account_home)?;
+        std::fs::set_permissions(
+            &account_home,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )?;
         let utf8_root = camino::Utf8Path::from_path(&root_path).ok_or("non-UTF-8 test root")?;
         let network_line = match network_mode {
             Some(mode) => format!("network = {}\n", serde_json::to_string(mode)?),
@@ -253,6 +447,7 @@ impl AppleE2e {
             runtime: Some(runtime),
             root_path,
             runtime_root,
+            account_home,
             id,
             manifest_name,
             owner_token,
@@ -276,6 +471,10 @@ impl AppleE2e {
 
     pub fn runtime_root(&self) -> &std::path::Path {
         &self.runtime_root
+    }
+
+    pub fn account_home(&self) -> &std::path::Path {
+        &self.account_home
     }
 
     pub fn record_dns_domain(&self, domain: Option<&str>) -> TestResult {
@@ -448,6 +647,21 @@ impl AppleE2e {
         validate_distinct_image_fixtures(image, &approved_workspace_image()?)?;
         let root = camino::Utf8Path::from_path(&self.root_path).ok_or("non-UTF-8 project root")?;
         let manifest = gascan_core::manifest::Manifest::load(root)?;
+        let ssh_control = if manifest.ssh().enabled() {
+            let (_, host_port) = self.native_ssh_endpoint()?;
+            let public_key = std::fs::read_to_string(
+                self.account_home
+                    .join(".config/gascan/ssh/identity_ed25519.pub"),
+            )?;
+            let mut fields = public_key.split_ascii_whitespace();
+            let kind = fields.next().ok_or("managed SSH public key is empty")?;
+            let encoded = fields
+                .next()
+                .ok_or("managed SSH public key lacks encoded key material")?;
+            Some((format!("{kind} {encoded}"), host_port))
+        } else {
+            None
+        };
         let spec =
             gascan_core::sandbox::SandboxSpec::from_root(&self.manifest_name, root, manifest)?;
         if spec.id() != &self.id {
@@ -456,8 +670,11 @@ impl AppleE2e {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        let result =
-            block_on_with_timeout(&runtime, timeout, recreate_owned_container(spec, image));
+        let result = block_on_with_timeout(
+            &runtime,
+            timeout,
+            recreate_owned_container(spec, image, ssh_control),
+        );
         match result {
             Ok(result) => result,
             Err(_) => Err(format!(
@@ -623,6 +840,7 @@ impl AppleE2e {
                 self.runtime_root.join("daemon.stderr"),
             )
             .env("GASCAN_DAEMON", &self.gascand)
+            .env("GASCAN_E2E_ACCOUNT_HOME", &self.account_home)
             .env_remove("GASCAN_TEST_FAKE_BACKEND");
         if let Some(candidate) = std::env::var_os("GASCAN_E2E_CANDIDATE_IMAGE") {
             command.env("GASCAN_E2E_CANDIDATE_IMAGE", candidate);
@@ -695,8 +913,10 @@ impl AppleE2e {
                 .is_ok_and(|status| status.success());
             let socket = self.runtime_root.join("gascan/gascand.sock");
             let raw_socket_connects = std::os::unix::net::UnixStream::connect(&socket).is_ok();
+            let operation_diagnostics = self.bounded_operation_diagnostics();
+            let doctor_diagnostics = self.bounded_doctor_diagnostics();
             return Err(format!(
-                "gascan failed with {:?}: stdout={} stderr={} daemon_pid={} daemon_alive={} socket={} raw_socket_connects={} daemon_stderr={}",
+                "gascan failed with {:?}: stdout={} stderr={} daemon_pid={} daemon_alive={} socket={} raw_socket_connects={} daemon_stderr={} operation_diagnostics={} doctor_diagnostics={}",
                 output.status.code(),
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr),
@@ -704,7 +924,9 @@ impl AppleE2e {
                 daemon_alive,
                 socket.display(),
                 raw_socket_connects,
-                daemon_stderr
+                daemon_stderr,
+                operation_diagnostics,
+                doctor_diagnostics,
             )
             .into());
         }
@@ -770,6 +992,44 @@ impl AppleE2e {
         result.unwrap_or_else(|error| format!("<unavailable: {error}>"))
     }
 
+    fn bounded_operation_diagnostics(&self) -> String {
+        let result = (|| -> TestResult<String> {
+            let store = gascand::Store::open(self.state_path())?;
+            let Some(operation) = store.latest_operation()? else {
+                return Ok("<no operation>".to_owned());
+            };
+            let events = store.operation_events(operation.id)?;
+            let diagnostics = format!("operation={operation:?} events={events:?}");
+            const MAXIMUM: usize = 16 * 1_024;
+            if diagnostics.len() <= MAXIMUM {
+                return Ok(diagnostics);
+            }
+            let boundary = diagnostics
+                .char_indices()
+                .map(|(index, _)| index)
+                .take_while(|index| *index <= MAXIMUM)
+                .last()
+                .unwrap_or(0);
+            Ok(format!("{}<truncated>", &diagnostics[..boundary]))
+        })();
+        result.unwrap_or_else(|error| format!("<unavailable: {error}>"))
+    }
+
+    fn bounded_doctor_diagnostics(&self) -> String {
+        if !self.error_diagnostics {
+            return "<disabled>".to_owned();
+        }
+        match self.invoke(["doctor", "--json"]) {
+            Ok(output) => format!(
+                "status={:?} stdout={} stderr={}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            ),
+            Err(error) => format!("<unavailable: {error}>"),
+        }
+    }
+
     pub fn status_json(&self) -> TestResult<Value> {
         let output = self.success(["--sandbox", self.id(), "status", "--json"])?;
         Ok(serde_json::from_slice(&output.stdout)?)
@@ -806,11 +1066,80 @@ impl AppleE2e {
         validate_no_network_attachments(&self.container_json(["inspect", self.id()])?)
     }
 
+    pub fn native_ssh_endpoint(&self) -> TestResult<(String, u16)> {
+        let inspect = self.container_json(["inspect", self.id()])?;
+        let ports = published_ports(&inspect)?;
+        if ports.len() != 1 {
+            return Err(
+                format!("networked SSH sandbox published unexpected ports: {ports:?}").into(),
+            );
+        }
+        let port = &ports[0];
+        let host = port["hostAddress"]
+            .as_str()
+            .ok_or("native SSH host address is absent")?;
+        let host_port = port["hostPort"]
+            .as_u64()
+            .and_then(|value| u16::try_from(value).ok())
+            .ok_or("native SSH host port is invalid")?;
+        if host != "127.0.0.1"
+            || port["containerPort"].as_u64() != Some(22)
+            || port["proto"].as_str() != Some("tcp")
+        {
+            return Err(
+                format!("native SSH publication is not exact loopback TCP: {port:?}").into(),
+            );
+        }
+        Ok((host.to_owned(), host_port))
+    }
+
+    pub fn assert_default_network_cannot_reach_native_ssh(
+        &self,
+        probe: &DefaultNetworkProbe,
+    ) -> TestResult {
+        let inspect = self.container_json(["inspect", self.id()])?;
+        let record = inspect
+            .as_array()
+            .and_then(|records| (records.len() == 1).then(|| &records[0]))
+            .ok_or("container inspect is absent or ambiguous")?;
+        let networks = record["status"]["networks"]
+            .as_array()
+            .ok_or("container status lacks network attachments")?;
+        let [network] = networks.as_slice() else {
+            return Err(format!("sandbox does not have exactly one network: {networks:?}").into());
+        };
+        let address = network["ipv4Address"]
+            .as_str()
+            .and_then(|value| value.split_once('/').map(|(address, _)| address))
+            .ok_or("sandbox network lacks an IPv4 CIDR")?;
+        let _: std::net::Ipv4Addr = address.parse()?;
+        probe.assert_isolated_from(address)
+    }
+
+    pub fn assert_no_native_ssh_port(&self) -> TestResult {
+        let inspect = self.container_json(["inspect", self.id()])?;
+        let ports = published_ports(&inspect)?;
+        if ports
+            .iter()
+            .any(|port| port["containerPort"].as_u64() == Some(22))
+        {
+            return Err(format!("offline sandbox published guest SSH: {ports:?}").into());
+        }
+        Ok(())
+    }
+
     pub fn kill_daemon(&self) -> TestResult {
-        let pid = self.validated_daemon_pid()?.pid;
-        let pid =
-            rustix::process::Pid::from_raw(i32::try_from(pid)?).ok_or("invalid daemon pid")?;
+        let record = self.validated_daemon_pid()?;
+        let pid = rustix::process::Pid::from_raw(i32::try_from(record.pid)?)
+            .ok_or("invalid daemon pid")?;
         rustix::process::kill_process(pid, rustix::process::Signal::KILL)?;
+        if !wait_for_process_identity_exit(
+            record.pid,
+            &record.start_identity,
+            std::time::Duration::from_secs(5),
+        )? {
+            return Err("killed daemon process identity did not exit".into());
+        }
         let socket = self.runtime_root.join("gascan/gascand.sock");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::os::unix::net::UnixStream::connect(&socket).is_ok() {
@@ -972,13 +1301,27 @@ where
 async fn recreate_owned_container(
     spec: gascan_core::sandbox::SandboxSpec,
     image: &str,
+    ssh_control: Option<(String, u16)>,
 ) -> TestResult {
     use gascan_core::runtime::RuntimeBackend as _;
 
     let backend = gascan_apple::AppleBackend::new(gascan_apple::ProcessRunner);
     backend.prepare_image(image).await?;
     let capabilities = backend.capabilities().await?;
-    let create = gascan_core::policy::PolicyCompiler::compile(spec, &capabilities)?;
+    let create = match ssh_control.as_ref() {
+        Some((authorized_key, host_port)) => {
+            gascan_core::policy::PolicyCompiler::compile_for_image_with_control_plane(
+                spec,
+                &capabilities,
+                image,
+                gascan_core::policy::ControlPlanePolicy {
+                    ssh_authorized_key: Some(authorized_key),
+                    ssh_host_port: Some(*host_port),
+                },
+            )?
+        }
+        None => gascan_core::policy::PolicyCompiler::compile_for_image(spec, &capabilities, image)?,
+    };
     let expected = gascan_core::policy::PolicyCompiler::expected_resource_identities(create.id())?;
     let resources = backend
         .list_resources()
@@ -1101,6 +1444,41 @@ fn validate_no_network_attachments(inspect: &Value) -> TestResult {
     } else {
         Err(format!("offline container has network attachments: {networks:?}").into())
     }
+}
+
+fn published_ports(inspect: &Value) -> TestResult<&Vec<Value>> {
+    let record = inspect
+        .as_array()
+        .and_then(|records| (records.len() == 1).then(|| &records[0]))
+        .ok_or("container inspect is absent or ambiguous")?;
+    record["configuration"]["publishedPorts"]
+        .as_array()
+        .ok_or_else(|| "container inspect lacks structured published ports".into())
+}
+
+fn assert_container_id_absent(name: &str) -> TestResult {
+    let output = container_command_bounded(
+        ["list", "--all", "--format", "json"],
+        std::time::Duration::from_secs(15),
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "unable to inventory containers: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let records: Value = serde_json::from_slice(&output.stdout)?;
+    let records = records
+        .as_array()
+        .ok_or("container inventory must be an array")?;
+    if records
+        .iter()
+        .any(|record| record["configuration"]["id"].as_str() == Some(name))
+    {
+        return Err(format!("task-owned isolation probe remains: {name}").into());
+    }
+    Ok(())
 }
 
 fn owned_inventory_identities(
@@ -1330,6 +1708,17 @@ fn wait_with_output_bounded(
         )
         .into()),
     }
+}
+
+pub fn run_command_bounded(
+    mut command: Command,
+    timeout: std::time::Duration,
+) -> TestResult<Output> {
+    let child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    wait_with_output_bounded(child, timeout)
 }
 
 fn drain_child_pipes(

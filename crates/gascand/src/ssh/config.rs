@@ -16,6 +16,25 @@ use std::net::{IpAddr, Ipv4Addr};
 const CONFIG_NAME: &str = "config";
 const KNOWN_HOSTS_PREFIX: &str = "known_hosts.";
 
+pub(crate) fn validate_managed_config_if_present(paths: &SshPaths) -> Result<bool, SshError> {
+    let Some(directory) = StateDirectory::open_existing(paths)? else {
+        return Ok(false);
+    };
+    let Some(_) = directory.metadata(CONFIG_NAME, PUBLIC_MODE)? else {
+        return Ok(false);
+    };
+    let (contents, _) =
+        directory.read_file(CONFIG_NAME, PUBLIC_MODE, maximum_managed_file_bytes())?;
+    let text = std::str::from_utf8(&contents)
+        .map_err(|_| SshError::InvalidState("managed SSH config is not UTF-8"))?;
+    if text.contains('\0') {
+        return Err(SshError::InvalidState(
+            "managed SSH config contains a null byte",
+        ));
+    }
+    Ok(true)
+}
+
 pub struct PreparedSshFiles {
     generation: String,
     known_hosts: Utf8PathBuf,

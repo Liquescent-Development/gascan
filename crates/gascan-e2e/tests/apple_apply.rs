@@ -6,12 +6,461 @@ mod apple_common;
 use apple_common::{AppleE2e, TestResult};
 use serde::de::{Error as _, MapAccess, Visitor};
 use std::collections::BTreeMap;
+use std::io::{Read as _, Write as _};
+use std::os::unix::fs::MetadataExt as _;
+use std::process::{Command, Stdio};
 
 const PERSISTENT_WORKSTATION_SENTINELS: [&str; 3] = [
     "/home/workspace/.local/share/mise/image-replace-sentinel",
     "/home/workspace/.cache/mise/image-replace-sentinel",
     "/home/workspace/.config/gascan/image-replace-sentinel",
 ];
+
+#[test]
+#[ignore = "requires supported Apple runtime, candidate and predecessor workspace images, network access, and OpenSSH"]
+fn native_ssh_is_loopback_only_durable_reconciled_and_cleaned() -> TestResult {
+    let predecessor = std::env::var("GASCAN_E2E_PREDECESSOR_IMAGE")
+        .map_err(|_| "GASCAN_E2E_PREDECESSOR_IMAGE must name the compatible predecessor fixture")?;
+    let approved = apple_common::approved_workspace_image()?;
+    apple_common::validate_distinct_image_fixtures(&predecessor, &approved)?;
+
+    let env = AppleE2e::new_networked("native-ssh")?;
+    let default_network_probe = env.start_default_network_probe()?;
+    let root = std::path::Path::new(env.root());
+    env.success_with_timeout(
+        ["up", root.to_str().ok_or("non-UTF-8 root")?],
+        std::time::Duration::from_secs(10 * 60),
+    )?;
+    env.assert_managed_network_attachment()?;
+    let (ssh_host, ssh_port) = env.native_ssh_endpoint()?;
+    if ssh_host != "127.0.0.1" || ssh_port < 1024 {
+        return Err(format!("unexpected native SSH endpoint: {ssh_host}:{ssh_port}").into());
+    }
+    let before = ssh_status(
+        &env.status_json()
+            .map_err(|error| format!("initial SSH status failed: {error}"))?,
+    )?;
+
+    let argument = "gascan-native-ssh-exact-argument";
+    let remote = env.success(["--sandbox", env.id(), "ssh", "--", "printf", "%s", argument])?;
+    if remote.stdout != argument.as_bytes() {
+        return Err(format!(
+            "native SSH remote argument changed: {}",
+            String::from_utf8_lossy(&remote.stdout)
+        )
+        .into());
+    }
+    env.assert_default_network_cannot_reach_native_ssh(&default_network_probe)?;
+
+    let alias = before.alias.as_str();
+    let config = env.account_home().join(".config/gascan/ssh/config");
+    let guest_port = 38_181_u16;
+    let guest_server = OwnedChild::spawn(
+        env.command([
+            "--sandbox",
+            env.id(),
+            "run",
+            "--",
+            "python3",
+            "-m",
+            "http.server",
+            &guest_port.to_string(),
+            "--bind",
+            "127.0.0.1",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped()),
+    )?;
+    let forward_port = reserve_loopback_port()?;
+    let mut forward = Command::new("/usr/bin/ssh");
+    forward
+        .args(["-F"])
+        .arg(&config)
+        .args(["-N", "-o", "ExitOnForwardFailure=yes", "-L"])
+        .arg(format!("127.0.0.1:{forward_port}:127.0.0.1:{guest_port}"))
+        .arg(alias)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let forward = OwnedChild::spawn(&mut forward)?;
+    let body = http_get_with_retry(forward_port, std::time::Duration::from_secs(10))
+        .map_err(|error| format!("VS Code-style local forwarding failed: {error}"))?;
+    if !body.contains("Directory listing") {
+        return Err("VS Code-style local forwarding did not reach guest loopback".into());
+    }
+
+    let remote_port = reserve_loopback_port()?;
+    let mut remote_forward = Command::new("/usr/bin/ssh");
+    remote_forward
+        .args(["-F"])
+        .arg(&config)
+        .args(["-o", "ExitOnForwardFailure=yes", "-R"])
+        .arg(format!("127.0.0.1:{remote_port}:127.0.0.1:{guest_port}"))
+        .arg(alias)
+        .arg("/usr/bin/true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let rejected =
+        apple_common::run_command_bounded(remote_forward, std::time::Duration::from_secs(10))
+            .map_err(|error| format!("remote-forward rejection check failed: {error}"))?;
+    if rejected.status.success() {
+        return Err("OpenSSH remote forwarding unexpectedly succeeded".into());
+    }
+
+    let agent_socket = env.runtime_root().join("ssh-agent.sock");
+    let mut agent_process = Command::new("/usr/bin/ssh-agent");
+    agent_process
+        .args(["-D", "-a"])
+        .arg(&agent_socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let agent_process = OwnedChild::spawn(&mut agent_process)?;
+    let agent_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::os::unix::net::UnixStream::connect(&agent_socket).is_err() {
+        if std::time::Instant::now() >= agent_deadline {
+            return Err("local SSH agent did not become ready".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let mut agent_forward = Command::new("/usr/bin/ssh");
+    agent_forward
+        .args(["-A", "-F"])
+        .arg(&config)
+        .arg(alias)
+        .arg("test -z \"${SSH_AUTH_SOCK:-}\"")
+        .env("SSH_AUTH_SOCK", &agent_socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let agent =
+        apple_common::run_command_bounded(agent_forward, std::time::Duration::from_secs(10))
+            .map_err(|error| format!("agent-forwarding rejection check failed: {error}"))?;
+    if !agent.status.success() {
+        return Err(format!(
+            "server exposed or failed to reject agent forwarding: {}",
+            String::from_utf8_lossy(&agent.stderr)
+        )
+        .into());
+    }
+    drop(agent_process);
+
+    drop(forward);
+    drop(guest_server);
+    env.success(["--sandbox", env.id(), "down"])?;
+    env.success_with_timeout(
+        ["up", root.to_str().ok_or("non-UTF-8 root")?],
+        std::time::Duration::from_secs(10 * 60),
+    )?;
+    let after_restart = ssh_status(
+        &env.status_json()
+            .map_err(|error| format!("post-restart SSH status failed: {error}"))?,
+    )?;
+    before.assert_same_fingerprints(&after_restart)?;
+
+    env.replace_owned_container_image(&predecessor, std::time::Duration::from_secs(10 * 60))?;
+    env.seed_stored_image_resolution(&predecessor)?;
+    env.success_with_timeout(
+        [
+            "--sandbox",
+            env.id(),
+            "apply",
+            root.to_str().ok_or("non-UTF-8 root")?,
+        ],
+        std::time::Duration::from_secs(10 * 60),
+    )?;
+    let after_apply = ssh_status(
+        &env.status_json()
+            .map_err(|error| format!("post-image-apply SSH status failed: {error}"))?,
+    )?;
+    before.assert_same_fingerprints(&after_apply)?;
+
+    env.kill_daemon()?;
+    let (removed_config, removed_generation) = remove_active_ssh_publication(&env)?;
+    let after_daemon_restart = ssh_status(
+        &env.status_json()
+            .map_err(|error| format!("post-daemon-restart SSH status failed: {error}"))?,
+    )?;
+    if !removed_config.is_file() || !removed_generation.is_file() {
+        return Err("daemon restart did not reconstruct the removed SSH publication".into());
+    }
+    before.assert_same_fingerprints(&after_daemon_restart)?;
+    let reconciled = env.invoke([
+        "--sandbox",
+        env.id(),
+        "ssh",
+        "--",
+        "printf",
+        "%s",
+        "reconciled",
+    ])?;
+    if !reconciled.status.success() {
+        let mut direct = Command::new("/usr/bin/ssh");
+        direct
+            .args(["-vv", "-F"])
+            .arg(&config)
+            .arg(alias)
+            .args(["printf", "%s", "reconciled"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let direct = apple_common::run_command_bounded(direct, std::time::Duration::from_secs(10))?;
+        return Err(format!(
+            "daemon restart SSH failed: gascan_status={:?} gascan_stdout={} gascan_stderr={} \
+             direct_status={:?} direct_stdout={} direct_stderr={}",
+            reconciled.status.code(),
+            String::from_utf8_lossy(&reconciled.stdout),
+            String::from_utf8_lossy(&reconciled.stderr),
+            direct.status.code(),
+            String::from_utf8_lossy(&direct.stdout),
+            String::from_utf8_lossy(&direct.stderr),
+        )
+        .into());
+    }
+    if reconciled.stdout != b"reconciled" {
+        return Err("daemon restart did not reconstruct a working SSH alias".into());
+    }
+
+    let collision_listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    let collision_port = collision_listener.local_addr()?.port();
+    let collision = AppleE2e::new_networked("native-ssh-collision")?;
+    collision.write_manifest(&format!(
+        "version = 1\nname = 'native-ssh-collision'\nnetwork = 'networked'\n\
+         [ssh]\nenabled = true\nhost_port = {collision_port}\n"
+    ))?;
+    let collision_output = collision.invoke_with_timeout(
+        [
+            "up",
+            collision.root().to_str().ok_or("non-UTF-8 root")?,
+            "--json",
+        ],
+        std::time::Duration::from_secs(2 * 60),
+    )?;
+    if collision_output.status.success()
+        || !String::from_utf8_lossy(&collision_output.stdout).contains("ssh_port_unavailable")
+    {
+        return Err(format!(
+            "explicit SSH collision was not actionable: stdout={} stderr={}",
+            String::from_utf8_lossy(&collision_output.stdout),
+            String::from_utf8_lossy(&collision_output.stderr)
+        )
+        .into());
+    }
+    collision.assert_no_owned_resources()?;
+    drop(collision_listener);
+
+    env.success(["--sandbox", env.id(), "destroy", "--yes"])?;
+    env.assert_no_owned_resources()?;
+    assert_destroyed_ssh_state(&env, alias)?;
+
+    let offline = AppleE2e::new("native-ssh-offline")?;
+    offline.success_with_timeout(
+        ["up", offline.root().to_str().ok_or("non-UTF-8 root")?],
+        std::time::Duration::from_secs(10 * 60),
+    )?;
+    offline.assert_no_native_ssh_port()?;
+    offline.success(["--sandbox", offline.id(), "destroy", "--yes"])?;
+    offline.assert_no_owned_resources()?;
+    std::fs::write(
+        std::path::Path::new(offline.root()).join("gascan.toml"),
+        "version = 1\nname = 'native-ssh-offline'\nnetwork = 'offline'\n\
+         [ssh]\nenabled = true\n",
+    )?;
+    let invalid = offline.invoke(["up", offline.root().to_str().ok_or("non-UTF-8 root")?])?;
+    if invalid.status.success()
+        || !String::from_utf8_lossy(&invalid.stderr).contains("ssh requires network")
+    {
+        return Err("explicit offline SSH was not rejected with actionable validation".into());
+    }
+
+    if std::net::TcpStream::connect(("127.0.0.1", ssh_port)).is_ok() {
+        return Err("destroy retained the native SSH listener".into());
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct LiveSshStatus {
+    alias: String,
+    host_fingerprint: String,
+    client_fingerprint: String,
+}
+
+impl LiveSshStatus {
+    fn assert_same_fingerprints(&self, other: &Self) -> TestResult {
+        if self.host_fingerprint != other.host_fingerprint
+            || self.client_fingerprint != other.client_fingerprint
+        {
+            return Err("SSH fingerprints changed across a durable lifecycle transition".into());
+        }
+        Ok(())
+    }
+}
+
+fn ssh_status(status: &serde_json::Value) -> TestResult<LiveSshStatus> {
+    let ssh = status["ssh"]
+        .as_object()
+        .ok_or("status omitted structured SSH state")?;
+    if ssh.get("state").and_then(serde_json::Value::as_str) != Some("ready")
+        || ssh.get("host").and_then(serde_json::Value::as_str) != Some("127.0.0.1")
+    {
+        return Err(format!("SSH is not ready on IPv4 loopback: {ssh:?}").into());
+    }
+    Ok(LiveSshStatus {
+        alias: ssh
+            .get("alias")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("SSH status omitted alias")?
+            .to_owned(),
+        host_fingerprint: ssh
+            .get("host_key_fingerprint")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("SSH status omitted host fingerprint")?
+            .to_owned(),
+        client_fingerprint: ssh
+            .get("client_key_fingerprint")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("SSH status omitted client fingerprint")?
+            .to_owned(),
+    })
+}
+
+fn reserve_loopback_port() -> TestResult<u16> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    Ok(listener.local_addr()?.port())
+}
+
+fn http_get_with_retry(port: u16, timeout: std::time::Duration) -> TestResult<String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let attempt = (|| -> std::io::Result<String> {
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+            stream.write_all(b"GET / HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")?;
+            let mut response = String::new();
+            stream.read_to_string(&mut response)?;
+            Ok(response)
+        })();
+        match attempt {
+            Ok(response) => return Ok(response),
+            Err(error) if std::time::Instant::now() < deadline => {
+                let _ = error;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+struct OwnedChild(Option<std::process::Child>);
+
+impl OwnedChild {
+    fn spawn(command: &mut Command) -> TestResult<Self> {
+        Ok(Self(Some(command.spawn()?)))
+    }
+}
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn assert_destroyed_ssh_state(env: &AppleE2e, alias: &str) -> TestResult {
+    let directory = env.account_home().join(".config/gascan/ssh");
+    if !directory.join("identity_ed25519").is_file() {
+        return Err("destroy removed the install-wide SSH client identity".into());
+    }
+    let config_path = directory.join("config");
+    let config = std::fs::read_to_string(&config_path)?;
+    if config.contains(alias) {
+        return Err("destroy retained the sandbox alias in active SSH config".into());
+    }
+    for generation in active_known_hosts_paths(&directory, &config)? {
+        let contents = std::fs::read(&generation)?;
+        if contents
+            .windows(alias.len())
+            .any(|window| window == alias.as_bytes())
+        {
+            return Err(format!(
+                "destroy retained active sandbox SSH trust in {}",
+                generation.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn remove_active_ssh_publication(
+    env: &AppleE2e,
+) -> TestResult<(std::path::PathBuf, std::path::PathBuf)> {
+    let directory = env.account_home().join(".config/gascan/ssh");
+    let config = directory.join("config");
+    validate_owned_publication_file(&config)?;
+    let config_contents = std::fs::read_to_string(&config)?;
+    let generations = active_known_hosts_paths(&directory, &config_contents)?;
+    let [generation] = generations.as_slice() else {
+        return Err("active SSH publication did not reference exactly one trust generation".into());
+    };
+    validate_owned_publication_file(generation)?;
+    let generation = generation.clone();
+    std::fs::remove_file(&config)?;
+    std::fs::remove_file(&generation)?;
+    Ok((config, generation))
+}
+
+fn active_known_hosts_paths(
+    directory: &std::path::Path,
+    config: &str,
+) -> TestResult<Vec<std::path::PathBuf>> {
+    let mut paths = config
+        .lines()
+        .filter_map(|line| line.strip_prefix("    UserKnownHostsFile "))
+        .map(std::path::PathBuf::from)
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    for path in &paths {
+        let name = path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or("managed known-hosts generation name is invalid")?;
+        let digest = name
+            .strip_prefix("known_hosts.")
+            .ok_or("managed known-hosts generation prefix is invalid")?;
+        if path.parent() != Some(directory)
+            || digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err("managed known-hosts generation path is unsafe".into());
+        }
+    }
+    Ok(paths)
+}
+
+fn validate_owned_publication_file(path: &std::path::Path) -> TestResult {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o7777 != 0o644
+        || metadata.nlink() != 1
+    {
+        return Err(format!(
+            "refusing unsafe managed SSH publication: {}",
+            path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
 
 #[test]
 #[ignore = "requires supported Apple runtime, two compatible digest-qualified workspace images, and network access"]

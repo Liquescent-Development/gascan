@@ -10,7 +10,8 @@ acceptance portions of
 corresponding unfinished work in
 `docs/superpowers/plans/2026-07-23-managed-ssh-access.md`.
 
-The completed developer-workstation image contract remains unchanged.
+The completed developer-workstation image contract remains unchanged except
+for the listener correction described in the guest contract below.
 
 ## Goal
 
@@ -72,9 +73,14 @@ daemon-owned connection task exists.
 ## Guest Contract
 
 The approved workspace image provides the locked-down OpenSSH service already
-specified and implemented:
+specified and implemented, with the listener reachable by Apple Container's
+native publisher:
 
-- `sshd` listens only on guest `127.0.0.1:22`.
+- `sshd` listens on guest IPv4 `0.0.0.0:22`. Apple Container publishes that
+  port only on host IPv4 loopback.
+- The sandbox's dedicated Apple network is the guest-side isolation boundary.
+  Containers on Apple's default or another sandbox network cannot reach the
+  listener unless they are explicitly attached to this sandbox's network.
 - Only the generated Gas Can Ed25519 public key is accepted.
 - Password, keyboard-interactive, root, agent, remote, tunnel, X11, user
   environment, and gateway forwarding are disabled.
@@ -120,7 +126,10 @@ ownership, permissions, symlinks, hard links, non-regular files, malformed
 keys, OpenSSH path expansion, and interrupted publication. Known-host data is
 written as an immutable generation; the config rename is the publication
 commit point, so readers observe either the complete previous generation or
-the complete new generation.
+the complete new generation. Retired immutable generations remain
+unreferenced so an OpenSSH process that read the previous config can still
+open its matching trust file. Only the generation referenced by the current
+managed config is active trust.
 
 The CLI safely offers one-time installation of the exact managed include in
 `~/.ssh/config`. JSON and noninteractive execution never prompt or mutate the
@@ -167,9 +176,11 @@ updated alias.
 
 ### Destroy
 
-Destroy removes the active alias and sandbox trust generation, then deletes
-the container and owned volumes. This removes the sandbox host key and
-sandbox-local credentials. The installation client identity remains.
+Destroy removes the active alias and sandbox from the current trust
+generation, then deletes the container and owned volumes. This removes the
+sandbox host key and sandbox-local credentials. Unreferenced immutable trust
+generations may remain for concurrent-reader consistency; they are not loaded
+by the current config. The installation client identity remains.
 
 ### Daemon restart
 
@@ -231,14 +242,17 @@ Static and component verification covers:
 One release-blocking live Apple acceptance proves:
 
 1. A networked sandbox publishes SSH only on host IPv4 loopback.
-2. Public-key login and exact remote command arguments work.
-3. VS Code-style local forwarding reaches a guest-loopback service.
-4. Remote and agent forwarding fail.
-5. Host and client fingerprints survive down/up and image replacement.
-6. Daemon restart regenerates a working alias from native runtime state.
-7. Explicit-port collisions are actionable.
-8. Destroy removes sandbox SSH state and leaves no owned resources.
-9. Offline defaults publish no SSH port, and explicit offline SSH is rejected.
+2. A container on Apple's default network cannot reach the sandbox SSH
+   listener.
+3. Public-key login and exact remote command arguments work.
+4. VS Code-style local forwarding reaches a guest-loopback service.
+5. Remote and agent forwarding fail.
+6. Host and client fingerprints survive down/up and image replacement.
+7. Daemon restart regenerates a working alias from native runtime state.
+8. Explicit-port collisions are actionable.
+9. Destroy removes sandbox SSH state and leaves no owned resources.
+10. Offline defaults publish no SSH port, and explicit offline SSH is
+    rejected.
 
 The custom byte-stream, backpressure, half-close, connection-cancellation,
 offline-SSH, bridge-listener, and bridge-isolation test matrices are deleted.

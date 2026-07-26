@@ -46,35 +46,42 @@ if test "${1:-}" = --inside; then
     remainder=${remainder#*:}
     mode=${remainder%%:*}
     kind=${remainder#*:}
-    test ! -L "$path"
-    test "$(stat -c %F "$path")" = "$kind"
-    test "$(stat -c %U:%G "$path")" = "$owner:$group"
-    test "$(stat -c %a "$path")" = "$mode"
-    test "$kind" = directory || test "$(stat -c %h "$path")" = 1
+    sudo -n /usr/bin/test ! -L "$path"
+    test "$(sudo -n stat -c %F "$path")" = "$kind"
+    test "$(sudo -n stat -c %U:%G "$path")" = "$owner:$group"
+    test "$(sudo -n stat -c %a "$path")" = "$mode"
+    test "$kind" = directory || test "$(sudo -n stat -c %h "$path")" = 1
   done
 
-  test "$(wc -l <"$authorized_keys" | tr -d ' ')" = 1
-  awk 'NF >= 2 && $1 == "ssh-ed25519" { found = 1 } END { exit !found }' \
+  test "$(sudo -n wc -l "$authorized_keys" | awk '{print $1}')" = 1
+  sudo -n awk 'NF >= 2 && $1 == "ssh-ed25519" { found = 1 } END { exit !found }' \
     "$authorized_keys"
-  ssh-keygen -l -f "$authorized_keys" >/dev/null
-  ssh-keygen -y -P '' -f "$host_key" >/dev/null
+  sudo -n ssh-keygen -l -f "$authorized_keys" >/dev/null
+  sudo -n ssh-keygen -y -P '' -f "$host_key" >/dev/null
 
   for directive in \
     'PasswordAuthentication no' \
     'PermitRootLogin no' \
+    'AuthorizedKeysFile none' \
+    "AuthorizedKeysCommand /bin/cat $authorized_keys" \
+    'AuthorizedKeysCommandUser root' \
     'AllowAgentForwarding no' \
-    'AllowTcpForwarding local'
+    'AllowTcpForwarding local' \
+    'SetEnv HOME=/home/workspace USER=workspace LOGNAME=workspace LANG=C.UTF-8 LC_ALL=C.UTF-8 MISE_CACHE_DIR=/home/workspace/.cache/mise MISE_DATA_DIR=/home/workspace/.local/share/mise MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml MISE_STATE_DIR=/home/workspace/.config/gascan/mise-state MISE_SYSTEM_DATA_DIR=/opt/gascan/mise PATH=/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
   do
-    grep -Fqx "$directive" "$sshd_config"
+    sudo -n grep -Fqx "$directive" "$sshd_config"
   done
   effective=$(sudo -n /usr/sbin/sshd -T -f "$sshd_config")
   for directive in \
-    'listenaddress 127.0.0.1:22' \
+    'listenaddress 0.0.0.0:22' \
     'passwordauthentication no' \
     'kbdinteractiveauthentication no' \
     'permitrootlogin no' \
     'pubkeyauthentication yes' \
     'authenticationmethods publickey' \
+    'authorizedkeysfile none' \
+    "authorizedkeyscommand /bin/cat $authorized_keys" \
+    'authorizedkeyscommanduser root' \
     'allowusers workspace' \
     'permituserenvironment no' \
     'allowagentforwarding no' \
@@ -85,16 +92,28 @@ if test "${1:-}" = --inside; then
     'permittunnel no' \
     'x11forwarding no' \
     'strictmodes yes' \
-    'subsystem sftp internal-sftp'
+    'setenv HOME=/home/workspace' \
+    'setenv USER=workspace' \
+    'setenv LOGNAME=workspace' \
+    'setenv LANG=C.UTF-8' \
+    'setenv LC_ALL=C.UTF-8' \
+    'setenv MISE_CACHE_DIR=/home/workspace/.cache/mise' \
+    'setenv MISE_DATA_DIR=/home/workspace/.local/share/mise' \
+    'setenv MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml' \
+    'setenv MISE_STATE_DIR=/home/workspace/.config/gascan/mise-state' \
+    'setenv MISE_SYSTEM_DATA_DIR=/opt/gascan/mise' \
+    'setenv PATH=/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
   do
     printf '%s\n' "$effective" | grep -Fqx "$directive"
   done
+  printf '%s\n' "$effective" |
+    awk '$1 == "subsystem" && $2 == "sftp" && $3 == "internal-sftp" && NF == 3 { found = 1 } END { exit !found }'
 
   pgrep -a -x sshd | grep -F -- "-D -e -f $sshd_config" >/dev/null
   listeners=$(sudo -n ss -ltnp)
-  printf '%s\n' "$listeners" | awk '$4 == "127.0.0.1:22" { found = 1 } END { exit !found }'
+  printf '%s\n' "$listeners" | awk '$4 == "0.0.0.0:22" { found = 1 } END { exit !found }'
   ! printf '%s\n' "$listeners" |
-    awk '$4 ~ /:22$/ && $4 != "127.0.0.1:22" { found = 1 } END { exit !found }'
+    awk '$4 ~ /:22$/ && $4 != "0.0.0.0:22" { found = 1 } END { exit !found }'
   printf 'ssh-contract-inside-ok\n'
   exit 0
 fi
@@ -191,7 +210,7 @@ owned_image
 
 ready=false
 for _ in {1..100}; do
-  if "$container_bin" exec "$name" sh -c 'ss -ltn | awk '"'"'$4 == "127.0.0.1:22" { found = 1 } END { exit !found }'"'"''; then
+  if "$container_bin" exec "$name" sh -c 'ss -ltn | awk '"'"'$4 == "0.0.0.0:22" { found = 1 } END { exit !found }'"'"''; then
     ready=true
     break
   fi
@@ -200,8 +219,8 @@ done
 $ready || { printf 'ssh contract: guest listener did not become ready\n' >&2; exit 1; }
 "$container_bin" exec "$name" /opt/gascan/tests/ssh-contract.sh --inside
 
-fingerprint_before=$("$container_bin" exec "$name" ssh-keygen -l -f "$host_key")
-"$container_bin" exec "$name" cat "$host_key.pub" |
+fingerprint_before=$("$container_bin" exec "$name" sudo -n ssh-keygen -l -f "$host_key")
+"$container_bin" exec "$name" sudo -n cat "$host_key.pub" |
   awk '{print "gascan-contract " $1 " " $2}' >"$known_hosts"
 chmod 0600 "$known_hosts"
 {
@@ -287,11 +306,11 @@ owned_image
 "$container_bin" start "$name" >/dev/null
 owned_image
 for _ in {1..100}; do
-  "$container_bin" exec "$name" sh -c 'ss -ltn | grep -Fq "127.0.0.1:22"' && break
+  "$container_bin" exec "$name" sh -c 'ss -ltn | grep -Fq "0.0.0.0:22"' && break
   sleep 0.05
 done
 "$container_bin" exec "$name" /opt/gascan/tests/ssh-contract.sh --inside
-fingerprint_after=$("$container_bin" exec "$name" ssh-keygen -l -f "$host_key")
+fingerprint_after=$("$container_bin" exec "$name" sudo -n ssh-keygen -l -f "$host_key")
 test "$fingerprint_after" = "$fingerprint_before" ||
   { printf 'ssh contract: host-key fingerprint changed across restart\n' >&2; exit 1; }
 

@@ -47,6 +47,22 @@ fn networked_ssh_spec(
     Ok(SandboxSpec::from_root(name, root, Manifest::load(root)?)?)
 }
 
+fn networked_ssh_with_application_port_spec(
+    name: &str,
+    root: &Utf8Path,
+    ssh_host_port: u16,
+) -> Result<SandboxSpec, Box<dyn Error>> {
+    std::fs::write(
+        root.join("gascan.toml"),
+        format!(
+            "version = 1\nnetwork = 'networked'\n\
+             [ports]\nweb = 30_000\n\
+             [ssh]\nhost_port = {ssh_host_port}\n"
+        ),
+    )?;
+    Ok(SandboxSpec::from_root(name, root, Manifest::load(root)?)?)
+}
+
 fn ssh_paths(root: &Utf8Path, name: &str) -> Result<SshPaths, Box<dyn Error>> {
     let home = root.join(name);
     std::fs::create_dir(&home)?;
@@ -183,6 +199,16 @@ fn loopback_port_collision(port: u16) -> RuntimeError {
     }
 }
 
+fn apple_bootstrap_port_collision() -> RuntimeError {
+    RuntimeError::CommandFailed {
+        operation: "container".to_owned(),
+        exit_code: Some(1),
+        stderr: "Error: failed to bootstrap container (cause: \
+                 bind(descriptor:ptr:bytes:): Address already in use) (errno: 48)\n"
+            .to_owned(),
+    }
+}
+
 #[test]
 fn automatic_ssh_port_reservation_is_loopback_unprivileged_and_exclusive() -> TestResult {
     let reservation = PortReservation::reserve()?;
@@ -290,6 +316,117 @@ async fn explicit_ssh_port_collision_never_retries_or_substitutes() -> TestResul
             && mapping.host_port == port
             && mapping.guest_port == 22
     }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn explicit_ssh_port_maps_apple_bootstrap_collision_without_retry() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let occupied = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+    let port = occupied.local_addr()?.port();
+    let desired = networked_ssh_spec("apple-explicit-collision", root, Some(port))?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .queue_create_error(apple_bootstrap_port_collision())
+        .await;
+    let service = test_service(
+        runtime.clone(),
+        root,
+        ssh_paths(root, "ssh-apple-explicit-collision")?,
+    )?;
+
+    let error = match service.up(UpRequest::new(desired)).await {
+        Ok(_) => return Err("an Apple bootstrap collision unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "ssh_port_unavailable");
+    assert_eq!(
+        runtime
+            .calls()
+            .await
+            .iter()
+            .filter(|call| matches!(call, RuntimeCall::Create(_)))
+            .count(),
+        1
+    );
+    drop(occupied);
+    Ok(())
+}
+
+#[tokio::test]
+async fn apple_bootstrap_collision_with_application_port_is_not_relabelled_as_ssh() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let port = PortReservation::reserve()?.port();
+    let desired =
+        networked_ssh_with_application_port_spec("apple-application-collision", root, port)?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .queue_create_error(apple_bootstrap_port_collision())
+        .await;
+    let service = test_service(
+        runtime.clone(),
+        root,
+        ssh_paths(root, "ssh-apple-application-collision")?,
+    )?;
+
+    let error = match service.up(UpRequest::new(desired)).await {
+        Ok(_) => return Err("an application collision unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "command_failed");
+    assert_eq!(
+        runtime
+            .calls()
+            .await
+            .iter()
+            .filter(|call| matches!(call, RuntimeCall::Create(_)))
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn apple_bootstrap_collision_on_ssh_port_with_application_mapping_is_actionable() -> TestResult
+{
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let occupied = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+    let port = occupied.local_addr()?.port();
+    if port == 30_000 {
+        return Err("ephemeral SSH test port collided with the application fixture port".into());
+    }
+    let desired = networked_ssh_with_application_port_spec("apple-ssh-collision", root, port)?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .queue_create_error(apple_bootstrap_port_collision())
+        .await;
+    let service = test_service(
+        runtime.clone(),
+        root,
+        ssh_paths(root, "ssh-apple-ssh-collision")?,
+    )?;
+
+    let error = match service.up(UpRequest::new(desired)).await {
+        Ok(_) => return Err("a mixed-port SSH collision unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "ssh_port_unavailable");
+    assert_eq!(
+        runtime
+            .calls()
+            .await
+            .iter()
+            .filter(|call| matches!(call, RuntimeCall::Create(_)))
+            .count(),
+        1
+    );
+    drop(occupied);
     Ok(())
 }
 
@@ -495,6 +632,8 @@ async fn ssh_up_inspects_mapping_reads_host_key_runs_strict_readiness_and_commit
             RuntimeCall::Exec(request)
                 if request.argv
                     == [
+                        "/usr/bin/sudo",
+                        "-n",
                         "/usr/bin/cat",
                         "/home/workspace/.config/gascan/ssh/host/ssh_host_ed25519_key.pub",
                     ] =>

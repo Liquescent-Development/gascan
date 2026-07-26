@@ -515,6 +515,13 @@ impl<B: RuntimeBackend> SandboxService<B> {
     }
 
     #[doc(hidden)]
+    #[cfg(debug_assertions)]
+    pub fn with_ssh_paths_for_e2e(mut self, ssh_paths: SshPaths) -> Self {
+        self.ssh_paths = Some(ssh_paths);
+        self
+    }
+
+    #[doc(hidden)]
     pub fn new_with_ssh_timeouts_for_tests(
         runtime: B,
         store: Store,
@@ -1119,11 +1126,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
                         break;
                     }
                     Err(failure) => {
-                        let collision = prepared_ssh
-                            .as_ref()
-                            .is_some_and(|ssh| is_native_port_collision(&failure, ssh.host_port()));
                         let partial = failure.created().to_vec();
-                        let original = ServiceError::Create(failure);
                         if !partial.is_empty()
                             && let Err(rollback) = self
                                 .runtime
@@ -1131,10 +1134,14 @@ impl<B: RuntimeBackend> SandboxService<B> {
                                 .await
                         {
                             return Err(ServiceError::Rollback {
-                                original: Box::new(original),
+                                original: Box::new(ServiceError::Create(failure)),
                                 rollback,
                             });
                         }
+                        let collision = prepared_ssh.as_ref().is_some_and(|ssh| {
+                            is_native_port_collision(&failure, ssh.host_port(), &create)
+                        });
+                        let original = ServiceError::Create(failure);
                         if collision {
                             if !automatic_ssh || attempts == AUTOMATIC_PORT_ATTEMPTS {
                                 return Err(ServiceError::SshPortUnavailable(format!(
@@ -1465,15 +1472,11 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 match self.runtime.create_container(recreate).await {
                     Ok(_) => break,
                     Err(failure) => {
-                        let collision = prepared_ssh.as_ref().is_some_and(|ssh| {
-                            is_native_port_collision(&failure, ssh.host_port())
-                        });
                         let partial = failure.created().to_vec();
-                        let original = ServiceError::Create(failure);
                         if !partial.is_empty() {
                             let [container] = partial.as_slice() else {
                                 return Err(ServiceError::ImageRollback {
-                                    original: Box::new(original),
+                                    original: Box::new(ServiceError::Create(failure)),
                                     rollback: Box::new(ServiceError::Runtime(
                                         RuntimeError::InvalidState {
                                             resource: create.id().to_string(),
@@ -1490,7 +1493,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
                             )?;
                             if container.identity() != &expected {
                                 return Err(ServiceError::ImageRollback {
-                                    original: Box::new(original),
+                                    original: Box::new(ServiceError::Create(failure)),
                                     rollback: Box::new(ServiceError::Runtime(
                                         RuntimeError::OwnershipMismatch {
                                             resource: container.name().to_owned(),
@@ -1502,11 +1505,15 @@ impl<B: RuntimeBackend> SandboxService<B> {
                                 self.remove_exact_container(&create, container.clone()).await
                             {
                                 return Err(ServiceError::ImageRollback {
-                                    original: Box::new(original),
+                                    original: Box::new(ServiceError::Create(failure)),
                                     rollback: Box::new(rollback),
                                 });
                             }
                         }
+                        let collision = prepared_ssh.as_ref().is_some_and(|ssh| {
+                            is_native_port_collision(&failure, ssh.host_port(), &create)
+                        });
+                        let original = ServiceError::Create(failure);
                         if collision {
                             if !automatic_ssh || attempts == AUTOMATIC_PORT_ATTEMPTS {
                                 return Err(ServiceError::SshPortUnavailable(format!(

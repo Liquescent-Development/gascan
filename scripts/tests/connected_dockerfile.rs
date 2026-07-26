@@ -113,7 +113,7 @@ fn prepare_guest_ssh(test_root: &Path, key: &str) -> std::process::Output {
 }
 
 #[test]
-fn ssh_guest_layer_is_offline_fixed_and_loopback_only() {
+fn ssh_guest_layer_is_offline_fixed_and_network_isolated() {
     let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
     let entrypoint =
         fs::read_to_string(root().join("images/workspace/bin/gascan-entrypoint")).unwrap();
@@ -136,13 +136,16 @@ fn ssh_guest_layer_is_offline_fixed_and_loopback_only() {
     assert!(entrypoint.contains("/usr/local/bin/start-gascan-sshd"));
 
     for required in [
-        "ListenAddress 127.0.0.1",
+        "ListenAddress 0.0.0.0",
         "Port 22",
         "PasswordAuthentication no",
         "KbdInteractiveAuthentication no",
         "PermitRootLogin no",
         "PubkeyAuthentication yes",
         "AuthenticationMethods publickey",
+        "AuthorizedKeysFile none",
+        "AuthorizedKeysCommand /bin/cat $authorized_keys",
+        "AuthorizedKeysCommandUser root",
         "AllowUsers workspace",
         "PermitUserEnvironment no",
         "AllowAgentForwarding no",
@@ -155,6 +158,9 @@ fn ssh_guest_layer_is_offline_fixed_and_loopback_only() {
         "StrictModes yes",
         "Subsystem sftp internal-sftp",
         "findmnt -n -o TARGET -T \"$config_root\"",
+        "validate_fresh_config_root",
+        "! -name lost+found",
+        "Gas Can config volume lost+found is not empty",
         "/home/workspace/.config/gascan/ssh/host/ssh_host_ed25519_key",
         "/home/workspace/.config/gascan/ssh/authorized_keys",
         "/home/workspace/.config/gascan/ssh/sshd_config",
@@ -165,7 +171,7 @@ fn ssh_guest_layer_is_offline_fixed_and_loopback_only() {
         );
     }
     for forbidden in [
-        "ListenAddress 0.0.0.0",
+        "ListenAddress 127.0.0.1",
         "ListenAddress ::",
         "/home/workspace/.ssh",
         "/etc/ssh/ssh_host_",
@@ -220,6 +226,69 @@ fn ssh_guest_initialization_is_behavioral_atomic_and_idempotent() {
     let config = ssh_root.join("sshd_config");
     let original_private_key = fs::read(&private_key).unwrap();
     let original_public_key = fs::read(&public_key).unwrap();
+    let generated_config = fs::read_to_string(&config).unwrap();
+    assert!(
+        generated_config
+            .lines()
+            .any(|line| line == "ListenAddress 0.0.0.0"),
+        "sshd must listen on the isolated sandbox network interface for Apple port publication"
+    );
+    assert!(
+        !generated_config
+            .lines()
+            .any(|line| line == "ListenAddress 127.0.0.1"),
+        "guest loopback is unreachable through Apple port publication"
+    );
+    let authorized_keys_command = format!(
+        "AuthorizedKeysCommand /bin/cat {}",
+        authorized_keys.display()
+    );
+    for directive in [
+        "AuthorizedKeysFile none",
+        authorized_keys_command.as_str(),
+        "AuthorizedKeysCommandUser root",
+        "StrictModes yes",
+    ] {
+        assert!(
+            generated_config.lines().any(|line| line == directive),
+            "missing safe authorized-key directive: {directive}"
+        );
+    }
+    assert!(
+        !generated_config.lines().any(|line| {
+            line.starts_with("AuthorizedKeysFile ") && line != "AuthorizedKeysFile none"
+        }),
+        "sshd must not open the root-only authorized key as workspace"
+    );
+    let setenv_lines = generated_config
+        .lines()
+        .filter(|line| line.starts_with("SetEnv "))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        setenv_lines.len(),
+        1,
+        "OpenSSH retains only the first SetEnv directive"
+    );
+    for assignment in [
+        "HOME=/home/workspace",
+        "USER=workspace",
+        "LOGNAME=workspace",
+        "LANG=C.UTF-8",
+        "LC_ALL=C.UTF-8",
+        "MISE_CACHE_DIR=/home/workspace/.cache/mise",
+        "MISE_DATA_DIR=/home/workspace/.local/share/mise",
+        "MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
+        "MISE_STATE_DIR=/home/workspace/.config/gascan/mise-state",
+        "MISE_SYSTEM_DATA_DIR=/opt/gascan/mise",
+        "PATH=/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    ] {
+        assert!(
+            setenv_lines[0]
+                .split_ascii_whitespace()
+                .any(|field| field == assignment),
+            "combined SetEnv omits exact assignment: {assignment}"
+        );
+    }
 
     let second = prepare_guest_ssh(&test_root, &key_two);
     assert!(
@@ -351,6 +420,59 @@ fn ssh_guest_initialization_is_behavioral_atomic_and_idempotent() {
 }
 
 #[test]
+fn ssh_guest_initialization_accepts_only_an_empty_safe_volume_lost_found() {
+    let temporary = tempfile::tempdir().unwrap();
+    let key = ssh_public_key(temporary.path(), "volume-client");
+
+    let valid_root = temporary.path().join("valid-volume");
+    let valid_config = valid_root.join("home/workspace/.config/gascan");
+    let valid_lost_found = valid_config.join("lost+found");
+    fs::create_dir_all(&valid_lost_found).unwrap();
+    fs::set_permissions(&valid_config, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&valid_lost_found, fs::Permissions::from_mode(0o700)).unwrap();
+    let valid = prepare_guest_ssh(&valid_root, &key);
+    assert!(
+        valid.status.success(),
+        "{}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
+
+    for case in ["unexpected", "nonempty", "wrong-mode", "symlink"] {
+        let test_root = temporary.path().join(case);
+        let config_root = test_root.join("home/workspace/.config/gascan");
+        let lost_found = config_root.join("lost+found");
+        fs::create_dir_all(&config_root).unwrap();
+        fs::set_permissions(&config_root, fs::Permissions::from_mode(0o755)).unwrap();
+        match case {
+            "unexpected" => fs::write(config_root.join("foreign"), "unsafe\n").unwrap(),
+            "nonempty" => {
+                fs::create_dir(&lost_found).unwrap();
+                fs::set_permissions(&lost_found, fs::Permissions::from_mode(0o700)).unwrap();
+                fs::write(lost_found.join("recovered"), "unsafe\n").unwrap();
+            }
+            "wrong-mode" => {
+                fs::create_dir(&lost_found).unwrap();
+                fs::set_permissions(&lost_found, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            "symlink" => {
+                let outside = temporary.path().join("lost-found-outside");
+                if !outside.exists() {
+                    fs::create_dir(&outside).unwrap();
+                }
+                symlink(&outside, &lost_found).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let output = prepare_guest_ssh(&test_root, &key);
+        assert!(
+            !output.status.success(),
+            "unsafe fresh-volume state was accepted: {case}"
+        );
+        assert!(!config_root.join("ssh").exists());
+    }
+}
+
+#[test]
 fn ssh_live_contract_blocks_workspace_replacement_but_allows_non_ssh_state() {
     let contract =
         fs::read_to_string(root().join("images/workspace/tests/ssh-contract.sh")).unwrap();
@@ -358,11 +480,48 @@ fn ssh_live_contract_blocks_workspace_replacement_but_allows_non_ssh_state() {
         "if mv \"$managed_root\"",
         "if rm -rf \"$managed_root\"",
         "workspace-non-ssh-state",
+        "sudo -n stat -c %F",
+        "sudo -n grep -Fqx",
+        "sudo -n ssh-keygen -y",
+        "exec \"$name\" sudo -n ssh-keygen -l",
     ] {
         assert!(
             contract.contains(behavioral_check),
             "live SSH contract omits workspace filesystem behavior: {behavioral_check}"
         );
+    }
+}
+
+#[test]
+fn ssh_live_contract_normalizes_only_the_exact_sftp_effective_directive() {
+    const SFTP_DIRECTIVE_FILTER: &str = r#"$1 == "subsystem" && $2 == "sftp" && $3 == "internal-sftp" && NF == 3 { found = 1 } END { exit !found }"#;
+
+    let contract =
+        fs::read_to_string(root().join("images/workspace/tests/ssh-contract.sh")).unwrap();
+    assert!(
+        contract.contains(SFTP_DIRECTIVE_FILTER),
+        "live SSH contract must compare the exact normalized SFTP directive"
+    );
+
+    let temporary = tempfile::tempdir().unwrap();
+    let effective = temporary.path().join("sshd-effective.txt");
+    let accepts = |value: &str| {
+        fs::write(&effective, value).unwrap();
+        Command::new("awk")
+            .arg(SFTP_DIRECTIVE_FILTER)
+            .arg(&effective)
+            .status()
+            .unwrap()
+            .success()
+    };
+
+    assert!(accepts("subsystem sftp internal-sftp \n"));
+    for rejected in [
+        "subsystem sftp internal-sftp unsafe\n",
+        "subsystem sftp /usr/lib/openssh/sftp-server\n",
+        "subsystem other internal-sftp\n",
+    ] {
+        assert!(!accepts(rejected), "accepted unsafe directive: {rejected:?}");
     }
 }
 

@@ -12,7 +12,8 @@ use crate::store::SshResolution;
 use camino::{Utf8Path, Utf8PathBuf};
 use gascan_core::policy::ControlPlanePolicy;
 use gascan_core::runtime::{
-    ContainerState, CreateFailure, ExecInput, ExecOutput, ExecRequest, RuntimeBackend, RuntimeError,
+    ContainerState, CreateFailure, CreateRequest, ExecInput, ExecOutput, ExecRequest,
+    RuntimeBackend, RuntimeError,
 };
 use gascan_core::sandbox::{SandboxId, SandboxSpec};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -350,7 +351,11 @@ pub(crate) fn disabled_resolution() -> SshResolution {
     )
 }
 
-pub(crate) fn is_native_port_collision(failure: &CreateFailure, selected_port: u16) -> bool {
+pub(crate) fn is_native_port_collision(
+    failure: &CreateFailure,
+    selected_port: u16,
+    create: &CreateRequest,
+) -> bool {
     matches!(
         failure.source(),
         RuntimeError::CommandFailed {
@@ -358,12 +363,27 @@ pub(crate) fn is_native_port_collision(failure: &CreateFailure, selected_port: u
             exit_code: Some(_),
             stderr,
         } if operation == "container"
-            && stderr.lines().any(|line| {
-                line.strip_prefix("Error: listen tcp 127.0.0.1:")
-                    .and_then(|line| line.strip_suffix(": bind: address already in use"))
-                    .and_then(|port| port.parse::<u16>().ok())
-                    == Some(selected_port)
-            })
+            && (
+                stderr.lines().any(|line| {
+                    line.strip_prefix("Error: listen tcp 127.0.0.1:")
+                        .and_then(|line| line.strip_suffix(": bind: address already in use"))
+                        .and_then(|port| port.parse::<u16>().ok())
+                        == Some(selected_port)
+                })
+                || (
+                    create.ports().iter().any(|mapping| {
+                        mapping.host_address == IpAddr::V4(Ipv4Addr::LOCALHOST)
+                            && mapping.host_port == selected_port
+                            && mapping.guest_port == 22
+                    })
+                    && stderr.contains("Error: failed to bootstrap container")
+                    && stderr
+                        .contains("bind(descriptor:ptr:bytes:): Address already in use")
+                    && stderr.contains("(errno: 48)")
+                    && std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, selected_port))
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+                )
+            )
     )
 }
 
@@ -490,7 +510,12 @@ async fn read_host_public_key_inner(
     let mut session = runtime
         .exec(ExecRequest {
             id: id.clone(),
-            argv: vec!["/usr/bin/cat".to_owned(), HOST_KEY_PATH.to_owned()],
+            argv: vec![
+                "/usr/bin/sudo".to_owned(),
+                "-n".to_owned(),
+                "/usr/bin/cat".to_owned(),
+                HOST_KEY_PATH.to_owned(),
+            ],
             stdin: Vec::new(),
             environment: BTreeMap::new(),
             tty: false,
