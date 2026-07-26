@@ -23,6 +23,7 @@ pub struct Manifest {
     storage: Storage,
     tools: BTreeMap<String, String>,
     ports: BTreeMap<String, u16>,
+    ssh: Ssh,
     #[serde(skip)]
     canonical_root: Utf8PathBuf,
 }
@@ -65,6 +66,7 @@ impl Manifest {
             storage: Storage::defaults(),
             tools: BTreeMap::new(),
             ports: BTreeMap::new(),
+            ssh: Ssh::default(),
             canonical_root,
         }
     }
@@ -120,6 +122,29 @@ impl Manifest {
 
     pub const fn ports(&self) -> &BTreeMap<String, u16> {
         &self.ports
+    }
+
+    pub const fn ssh(&self) -> &Ssh {
+        &self.ssh
+    }
+}
+
+/// Validated SSH policy loaded as part of a [`Manifest`].
+///
+/// SSH host ports cannot be constructed independently of manifest validation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct Ssh {
+    enabled: bool,
+    host_port: Option<u16>,
+}
+
+impl Ssh {
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub const fn host_port(&self) -> Option<u16> {
+        self.host_port
     }
 }
 
@@ -381,6 +406,15 @@ struct RawManifest {
     tools: BTreeMap<String, String>,
     #[serde(default)]
     ports: BTreeMap<String, u16>,
+    #[serde(default)]
+    ssh: RawSsh,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSsh {
+    enabled: Option<bool>,
+    host_port: Option<u16>,
 }
 
 impl RawManifest {
@@ -393,6 +427,26 @@ impl RawManifest {
         if self.resources.cpus == Some(0) {
             return Err(ManifestError::Invalid(
                 "resources.cpus must be greater than zero".to_owned(),
+            ));
+        }
+        if self.network == NetworkMode::Offline && self.ssh.enabled == Some(true) {
+            return Err(ManifestError::Invalid(
+                "ssh requires network = \"networked\"; disable SSH or enable sandbox networking"
+                    .to_owned(),
+            ));
+        }
+        let ssh_enabled = self
+            .ssh
+            .enabled
+            .unwrap_or(self.network == NetworkMode::Networked);
+        if !ssh_enabled && self.ssh.host_port.is_some() {
+            return Err(ManifestError::Invalid(
+                "ssh.host_port cannot be set when ssh.enabled is false".to_owned(),
+            ));
+        }
+        if self.ssh.host_port.is_some_and(|port| port < 1024) {
+            return Err(ManifestError::Invalid(
+                "ssh.host_port must be in 1024..=65535".to_owned(),
             ));
         }
         let resources = Resources {
@@ -449,6 +503,10 @@ impl RawManifest {
             storage,
             tools: self.tools,
             ports: self.ports,
+            ssh: Ssh {
+                enabled: ssh_enabled,
+                host_port: self.ssh.host_port,
+            },
             canonical_root: canonical_root.to_owned(),
         })
     }

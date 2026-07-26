@@ -73,3 +73,68 @@ fn version_source_pins_erlang_dependency_exactly() {
     let source: toml::Value = toml::from_str(&source).unwrap();
     assert_eq!(source["tools"]["erlang"].as_str(), Some("29.0.3"));
 }
+
+#[test]
+fn workstation_source_contains_only_reviewed_resolver_intent() {
+    let source = fs::read_to_string(root().join("images/workspace/versions.toml")).unwrap();
+    let source: toml::Value = toml::from_str(&source).unwrap();
+    let workstation = source["workstation"].as_table().unwrap();
+    assert_eq!(workstation.len(), 6);
+    for tool in ["claude", "codex", "pi", "herdr", "glab"] {
+        assert_eq!(workstation[tool].as_str(), Some("latest"));
+    }
+    assert_eq!(workstation["neovim"].as_str(), Some("0.11"));
+}
+
+#[test]
+fn workstation_update_preserves_preexisting_runtime_locks() {
+    let lock = fs::read_to_string(root().join("images/workspace/versions.lock")).unwrap();
+    let lock: toml::Value = toml::from_str(&lock).unwrap();
+    let expected: toml::Value = toml::from_str(LOCK).unwrap();
+    assert_eq!(lock["tools"], expected["tools"]);
+    assert_eq!(lock["workspace_build_mode"].as_str(), Some("connected"));
+    assert_eq!(
+        lock["ubuntu_snapshot"].as_str(),
+        Some("2026-07-13T00:00:00Z")
+    );
+    assert_eq!(
+        lock["workspace_bundles"],
+        toml::Value::Table(toml::toml! {
+            media_type = "application/vnd.gascan.workspace-bundle.v1+tar.zstd"
+            platform = "linux/arm64"
+            publication = "pending"
+        })
+    );
+    assert_eq!(
+        lock["base_image"].as_str(),
+        Some("ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab")
+    );
+    assert_eq!(lock["mise"]["version"].as_str(), Some("2026.5.0"));
+    assert_eq!(
+        lock["mise"]["sha256"].as_str(),
+        Some("fba7c8a383cf3c59eb5a9995d5299fd2c78eba7eb1daace48d75fe491362f79a")
+    );
+    assert_eq!(
+        lock["playwright_chromium"]["version"].as_str(),
+        Some("149.0.7827.55+1228")
+    );
+    assert_eq!(
+        lock["playwright_chromium"]["sha256"].as_str(),
+        Some("ec044b50ed065adeb4c5ffdb42d1529901cbaf897cdf542bfef8af01d6e0cc79")
+    );
+    assert_eq!(
+        lock["gascamp"]["revision"].as_str(),
+        Some("f6b248c5926240856dbea83d1d2c5c90ea1c1456")
+    );
+}
+
+#[test]
+fn updater_pins_npm_and_disables_inherited_script_configuration() {
+    let source = fs::read_to_string(root().join("scripts/src/bin/update-image-lock.rs")).unwrap();
+    assert!(source.contains("11.12.1"));
+    assert!(source.contains("--ignore-scripts"));
+    assert!(source.contains("npm_config_"));
+    assert!(source.contains("--globalconfig="));
+    assert!(source.contains("--install-strategy=hoisted"));
+    assert!(source.contains("--include=optional"));
+}

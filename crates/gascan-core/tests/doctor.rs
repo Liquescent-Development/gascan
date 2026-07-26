@@ -46,11 +46,36 @@ fn stable_ids_each_have_a_remedy_and_evidence() {
         "runtime.loopback_publish",
         "runtime.resource_limits",
         "runtime.offline",
+        "ssh.client",
+        "ssh.identity",
+        "ssh.config",
+        "ssh.native_publish",
     ] {
         let check = report.check(id).unwrap();
         assert!(!check.detail.is_empty(), "missing evidence for {id}");
         assert!(!check.remedy.is_empty(), "missing remedy for {id}");
     }
+}
+
+#[test]
+fn doctor_reports_every_native_ssh_prerequisite_with_stable_ids() {
+    let report = ready_facts().into_report();
+    let ssh = report
+        .checks
+        .iter()
+        .filter(|check| check.id.starts_with("ssh."))
+        .map(|check| check.id.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        ssh,
+        [
+            "ssh.client",
+            "ssh.identity",
+            "ssh.config",
+            "ssh.native_publish",
+        ]
+    );
 }
 
 #[test]

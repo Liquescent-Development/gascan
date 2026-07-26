@@ -7,6 +7,8 @@ use std::time::Duration;
 use tonic::transport::{Channel, Endpoint};
 use tower::service_fn;
 
+const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(15);
+
 #[derive(Debug)]
 pub enum ClientError {
     Io(std::io::Error),
@@ -113,7 +115,7 @@ impl Client {
         }
         let _child = command.spawn()?;
         let started_at = tokio::time::Instant::now();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + DAEMON_READY_TIMEOUT;
         let mut probes = 0_u64;
         loop {
             probes = probes.saturating_add(1);

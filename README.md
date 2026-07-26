@@ -44,7 +44,7 @@ every installed executable.
 Then confirm the host and runtime satisfy the security contract. `doctor`
 reports one fact per capability — architecture, macOS version, runtime service,
 storage, bind mounts, named volumes, TTY, signals, loopback publishing,
-resource limits, and offline isolation:
+resource limits, offline isolation, and managed SSH:
 
 ```sh
 gascan doctor --json | jq
@@ -72,7 +72,7 @@ commit signature or exact signed v0.1.7 tag`.
 Verification runs through Git's own trust policy, so the tag's signing key must
 be one you have chosen to trust. Releases are signed with this SSH key:
 
-```
+```text
 richard@liquescent.dev ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHyTKmfAwcJcdfKXmj2h3mwfgPaelE6gSMrquAcPmW09
 ```
 
@@ -81,7 +81,9 @@ to a Git allowed-signers file and point Git at it:
 
 ```sh
 mkdir -p ~/.config/git
-printf 'richard@liquescent.dev ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHyTKmfAwcJcdfKXmj2h3mwfgPaelE6gSMrquAcPmW09\n' \
+signer='richard@liquescent.dev'
+key='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHyTKmfAwcJcdfKXmj2h3mwfgPaelE6gSMrquAcPmW09'
+printf '%s %s\n' "$signer" "$key" \
   >> ~/.config/git/allowed_signers
 git config --global gpg.ssh.allowedSignersFile ~/.config/git/allowed_signers
 git verify-tag v0.1.7
@@ -114,6 +116,7 @@ Create the sandbox, use it, then stop it:
 gascan up /path/to/project     # create and start; mounts the project at /workspace
 gascan run -- node --version   # run one command in the sandbox
 gascan shell                   # interactive shell at /workspace
+gascan ssh                     # connect with the managed OpenSSH identity
 gascan apply /path/to/project  # re-apply gascan.toml after editing it
 gascan down                    # stop the sandbox, keep its state
 gascan destroy --yes           # remove the sandbox and its managed volumes
@@ -125,24 +128,113 @@ stable plain text without animation or color. Set `NO_COLOR=1` to disable color
 while keeping interactive progress. Use `--json` on supported commands for
 machine-readable output.
 
+Workspace image updates are reported by `gascan status`. Run `gascan apply` to
+replace only the container while preserving the workspace and managed tools,
+cache, and configuration volumes. Changes made directly to the container root
+filesystem are not durable.
+
+If replacement fails, Gascan reports the primary failure and restores the
+previous workspace image. Fix the primary error and run `gascan apply` again.
+If rollback also fails, preserve the reported primary and rollback diagnostics,
+avoid changing or deleting the managed volumes, and retry `gascan apply` after
+restoring access to both digest-qualified images. Use `gascan destroy --yes`
+only when you intend to delete the sandbox and all of its managed volumes.
+
 Commands other than `up` resolve the sandbox implicitly when exactly one
 exists. With more than one, pass `--sandbox <id>`; `gascan list` prints the
 ids. A sandbox id is the slugified `name` plus a short digest of the canonical
 project root, so the same project always maps to the same sandbox.
 
+### SSH and VS Code Remote SSH
+
+A networked sandbox enables SSH by default. Apple Container publishes guest
+port 22 on a host IPv4 loopback port, so SSH is reachable from the Mac but is
+not exposed to the LAN. Inside the sandbox, `sshd` listens on its isolated
+Gas Can network so Apple's native publisher can reach it; containers on the
+Apple default network or another sandbox network cannot. Gas Can creates a
+stable `gascan-<sandbox-id>` alias after strict host-key verification succeeds:
+
+```sh
+gascan status
+gascan ssh
+gascan ssh -- git status
+```
+
+Gas Can preserves each argument after `--` as a discrete local OpenSSH
+argument and never invokes a local shell. Standard OpenSSH remote-command and
+remote-shell semantics still apply inside the sandbox.
+
+The host port is selected automatically unless `[ssh].host_port` requests a
+specific port. An unavailable explicit port fails with
+`ssh_port_unavailable`; Gas Can never silently substitutes another port.
+Offline sandboxes have no SSH listener, identity authorization, or alias.
+Explicitly enabling SSH while `network = "offline"` is rejected rather than
+changing the sandbox's network policy.
+
+On the first successful interactive `gascan up`, Gas Can offers to add its
+managed SSH config to `~/.ssh/config`. Noninteractive and JSON commands never
+prompt or modify that file. The same operation is available explicitly:
+
+```sh
+gascan ssh-config install
+gascan ssh-config path
+gascan ssh-config remove
+```
+
+After installing the include, connect from VS Code's **Remote - SSH: Connect
+to Host...** command by selecting `gascan-<sandbox-id>`. Removing the include
+does not remove Gas Can's managed aliases or prevent `gascan ssh`; it only
+stops other OpenSSH clients from discovering them through `~/.ssh/config`.
+
+Gas Can maintains one installation-wide Ed25519 client identity under
+`~/.config/gascan/ssh`. Its private key remains on the host and survives
+sandbox destruction. Each sandbox has a separate persistent host key in its
+managed config volume. `down` temporarily removes the active alias; the next
+`up` verifies the retained fingerprint before restoring it. `apply` preserves
+both fingerprints and updates the alias if an automatically selected port
+changes.
+
+A host or client fingerprint mismatch fails closed with
+`ssh_host_key_mismatch`: Gas Can does not publish or use an unverified alias.
+Run `gascan doctor` and inspect the sandbox before retrying. Destroy and
+recreate only when intentionally resetting trust, because
+`gascan destroy --yes` removes the alias, active sandbox trust, sandbox host
+key, and all managed volumes. Retired immutable known-host generations can
+remain unreferenced so concurrent OpenSSH readers keep a consistent snapshot;
+the current managed config does not load them. Destroy retains the
+installation-wide client identity and does not remove the optional
+`~/.ssh/config` include.
+
+For SSH diagnostics, human output gives a compact summary; JSON includes the
+exact fact details and remedies:
+
+```sh
+gascan doctor
+gascan doctor --json | jq '.checks[] | select(.id | startswith("ssh."))'
+```
+
+The SSH facts are `ssh.client`, `ssh.identity`, `ssh.config`, and
+`ssh.native_publish`. Also check `gascan status`: `Starting`, `Unhealthy`, or
+`Unavailable` means `gascan ssh` will refuse the connection until a successful
+`gascan up` verifies and publishes the alias.
+
 ### Commands
 
 | Command | Purpose |
 | --- | --- |
-| `gascan up <project-root> [--json]` | Create and start the sandbox for a project root. |
-| `gascan apply [project-root] [--json]` | Reconcile the running sandbox with the current `gascan.toml`. |
+| `gascan up <project-root> [--json]` | Create and start a sandbox. |
+| `gascan apply [project-root] [--json]` | Apply `gascan.toml` changes. |
 | `gascan run -- <argv...>` | Run a single command in the sandbox. |
 | `gascan shell [-- <argv...>]` | Open an interactive shell. |
+| `gascan ssh [-- <argv...>]` | Open SSH or run a remote command. |
+| `gascan ssh-config install` | Install the managed SSH include. |
+| `gascan ssh-config remove` | Remove the managed SSH include. |
+| `gascan ssh-config path` | Print the absolute generated OpenSSH config path. |
 | `gascan status [--json]` | Show desired and actual state for one sandbox. |
 | `gascan list [--json]` | List all sandboxes. |
 | `gascan logs [--follow] [--since-millis <n>]` | Stream sandbox logs. |
 | `gascan down [--json]` | Stop the sandbox without deleting state. |
-| `gascan destroy --yes [--json]` | Delete the sandbox and its Gas Can-owned volumes. |
+| `gascan destroy --yes [--json]` | Delete the sandbox and volumes. |
 | `gascan doctor [--json]` | Report host, runtime, and capability facts. |
 
 `--sandbox <id>` is accepted on every command.
@@ -157,6 +249,8 @@ published ports, and default resources.
 The schema is deliberately small. **Unknown keys are rejected**, so a
 misspelled security setting fails loudly instead of being silently ignored.
 Invalid manifests fail before the workspace is ever mounted.
+See the [`gascan.toml` reference](docs/reference/manifest.md) for a compact
+key-by-key specification.
 
 ### Full schema
 
@@ -183,6 +277,10 @@ python = "3.13"
 
 [ports]                         # label = port, published on loopback only
 web = 3000
+
+[ssh]                           # optional; defaults from network mode
+enabled = true
+host_port = 2222                # optional; automatic when omitted
 ```
 
 ### `version`
@@ -199,9 +297,29 @@ id, so renaming a project changes its sandbox id.
 
 - `offline` (default) — fail-closed isolation. Gas Can refuses to start unless
   the runtime can *prove* offline isolation, and an offline sandbox may not
-  publish ports.
+  publish ports or enable SSH.
 - `networked` — outbound network access. Required for anything that downloads,
-  including installing tool versions that are not already in the image.
+  including installing tool versions that are not already in the image. SSH
+  is enabled by default.
+
+### `[ssh]`
+
+Controls native OpenSSH access:
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `enabled` | From `network` | Explicit offline enablement is invalid. |
+| `host_port` | automatic | Exact loopback port in `1024..=65535`. |
+
+When enabled, Gas Can publishes exactly `127.0.0.1:<host-port>:22`. An
+automatic port is selected for each creation and may change after
+container-only image replacement; the `gascan-<sandbox-id>` alias remains
+stable. An explicit port is used exactly, and a collision fails with
+`ssh_port_unavailable`.
+
+`host_port` is invalid when `enabled = false`, and it cannot collide with a
+port declared in `[ports]`. Unknown SSH keys are rejected. Gas Can never
+silently changes `network` to satisfy an SSH setting.
 
 ### `user`
 
@@ -244,11 +362,12 @@ mid-operation fails rather than running.
 | --- | --- | --- | --- |
 | `cpus` | 4 | 16 | Integer; must be greater than zero. |
 | `memory` | `8GiB` | `64GiB` | String with binary units. |
-| `disk` | — | — | Parsed, but **rejected**: Apple cannot enforce a container root-filesystem ceiling. It does not size managed volumes. |
+| `disk` | — | — | **Rejected**; use `[storage]`. |
 
 Sizes must be a positive integer plus one of `KiB`, `MiB`, `GiB`, or `TiB`.
 Decimal units (`GB`), bare numbers, and zero are all rejected. Unknown
-process-limit requests are rejected as well.
+process-limit requests are rejected as well. Apple cannot enforce a container
+root-filesystem ceiling, so `disk` does not size managed volumes.
 
 ### `[storage]`
 
@@ -300,6 +419,73 @@ The image preinstalls these versions, which resolve without any download:
 | `ruby` | 3.4.10 |
 | `rust` | 1.97.0 |
 
+### Default developer workstation
+
+Every sandbox also includes a credential-free workstation baseline:
+
+- Editors: Vim, Neovim, Emacs, and Pico (the reviewed Nano alternative).
+- Coding agents: Claude Code, Codex, Pi, and Herdr.
+- Forge and source tools: Git, GitHub CLI (`gh`), and GitLab CLI (`glab`).
+- Network diagnostics: `ip`, `ss`, `ping`, `ifconfig`, `netstat`, `dig`,
+  `nslookup`, `traceroute`, and `nc`.
+- Terminal and inspection tools: `curl`, `wget`, `rsync`, `lsof`, `file`,
+  `jq`, `ps`, `top`, `pstree`, `tree`, `less`, `rg`, `fd`, `fzf`, and `tmux`.
+
+Discover the installed versions with each tool's normal command:
+
+```sh
+vim --version
+nvim --version
+emacs --version
+pico --version
+claude --version
+codex --version
+pi --version
+herdr --version
+go version
+rustc --version
+cargo --version
+gh --version
+glab --version
+git --version
+ip -Version
+ss --version
+ping -V
+ifconfig --version
+netstat --version
+dig -v
+traceroute --version
+nc -h
+rg --version
+fd --version
+fzf --version
+tmux -V
+```
+
+The image gate compares locked tools with their exact locked versions and
+checks documented output formats for snapshot-pinned Ubuntu tools. These
+commands work in the default offline sandbox and do not download anything at
+startup. Diagnostic packages do not grant the sandbox extra Linux
+capabilities, devices, or host access.
+
+Image-owned workstation files under `/opt/gascan/workstation` are immutable.
+An explicit `[tools]` entry is installed into the sandbox's writable
+`/home/workspace/.local/share/mise` managed tools volume; its mise shim is
+first in `PATH`, ahead of the reviewed defaults in the immutable
+`/opt/gascan/mise` system data tree. The requested version therefore overrides
+an image default without changing the immutable workstation tree.
+
+Native Claude Code, Codex, Pi, GitHub CLI, and GitLab CLI configuration is
+sandbox-local under the managed `/home/workspace/.config/gascan` volume. Mise
+caches and Pi session data are kept separately under the managed
+`/home/workspace/.cache` volume. Herdr is configured to read
+`/home/workspace/.config/gascan/herdr/config.toml` and place its logs beside
+that file, but Gas Can does not create a Herdr configuration or login. Gas Can
+never imports the host home directory, SSH material, agent/forge tokens,
+Docker socket, or macOS keychain into the sandbox. Native sandbox-local
+configuration survives `gascan down`, `gascan up`, and container-only image
+replacement; `gascan destroy --yes` deletes it with the config volume.
+
 Requesting any other tool or version makes mise download it, which requires
 `network = "networked"`. Installed tools persist in a per-sandbox volume, so
 they survive `gascan down` and are removed by `gascan destroy`.
@@ -330,6 +516,8 @@ carried over from the host.
 
 ## Further reading
 
-See the [macOS release checklist](docs/release/macos-checklist.md) for package
+See the [`gascan.toml` reference](docs/reference/manifest.md) for the complete
+configuration contract and the
+[macOS release checklist](docs/release/macos-checklist.md) for package
 contents, signing/notarization inputs, the exact security contract, data
 locations, clean-host verification, and conservative uninstall behavior.

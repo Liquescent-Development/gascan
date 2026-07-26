@@ -46,7 +46,7 @@ fn runner_fixture(build_helper: &str) -> tempfile::TempDir {
     );
     write_executable(
         &root.join("bin/cargo"),
-        "#!/bin/sh\nset -eu\nprintf 'cargo:%s:%s\\n' \"$*\" \"${GASCAN_APPLE_ATTACH_HELPER-unset}\" >>\"$RUNNER_FIXTURE_LOG\"\ncase \" $* \" in\n  *' build '*) mkdir -p \"$RUNNER_FIXTURE_ROOT/target/debug\"; printf '#!/bin/sh\\n' >\"$RUNNER_FIXTURE_ROOT/target/debug/gascan-e2e-cli\"; chmod 755 \"$RUNNER_FIXTURE_ROOT/target/debug/gascan-e2e-cli\";;\nesac\n",
+        "#!/bin/sh\nset -eu\nprintf 'cargo:%s:%s\\n' \"$*\" \"${GASCAN_APPLE_ATTACH_HELPER-unset}\" >>\"$RUNNER_FIXTURE_LOG\"\nif test -n \"${GASCAN_E2E_CANDIDATE_IMAGE:-}\"; then printf 'candidate:%s\\n' \"$GASCAN_E2E_CANDIDATE_IMAGE\" >>\"$RUNNER_FIXTURE_LOG\"; fi\ncase \" $* \" in\n  *' build '*) mkdir -p \"$RUNNER_FIXTURE_ROOT/target/debug\"; printf '#!/bin/sh\\n' >\"$RUNNER_FIXTURE_ROOT/target/debug/gascan-e2e-cli\"; chmod 755 \"$RUNNER_FIXTURE_ROOT/target/debug/gascan-e2e-cli\";;\nesac\n",
     );
     fs::create_dir_all(root.join("cleanup")).unwrap();
     fixture
@@ -121,6 +121,121 @@ fn runner_accepts_apple_apply_as_an_explicit_single_target() {
     )));
     assert!(!records.contains("--test apple_lifecycle"));
     assert!(!records.contains("--test apple_recovery"));
+}
+
+#[test]
+fn successful_apple_apply_targets_candidate_and_publishes_matching_live_receipt() {
+    let fixture = runner_fixture(
+        "#!/bin/sh\nset -eu\nmkdir -p \"$RUNNER_FIXTURE_ROOT/target\"\nprintf '#!/bin/sh\\n' >\"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\nchmod 755 \"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\n",
+    );
+    let root = fixture.path();
+    let log = root.join("runner.log");
+    let artifacts = root.join(".artifacts");
+    fs::create_dir(&artifacts).unwrap();
+    let candidate = "ghcr.io/liquescent-development/gascan/workspace:candidate@sha256:\
+                     aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let candidate_file = artifacts.join("connected-workspace-image-candidate.txt");
+    let live_file = artifacts.join("connected-workspace-image-apple-live.txt");
+    fs::write(&candidate_file, format!("{candidate}\n")).unwrap();
+
+    let output = Command::new(root.join("scripts/run-apple-e2e.sh"))
+        .arg("apple_apply")
+        .env("RUNNER_FIXTURE_ROOT", root)
+        .env("RUNNER_FIXTURE_LOG", &log)
+        .env("GASCAN_E2E_CANDIDATE_IMAGE_FILE", &candidate_file)
+        .env("GASCAN_E2E_LIVE_ACCEPTANCE_FILE", &live_file)
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", root.join("bin").display()),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fs::read_to_string(log)
+            .unwrap()
+            .contains(&format!("candidate:{candidate}\n"))
+    );
+    assert_eq!(
+        fs::read_to_string(live_file).unwrap(),
+        format!("{candidate}\n")
+    );
+}
+
+#[test]
+fn nonempty_scoped_session_root_fails_without_publishing_live_receipt() {
+    let fixture = runner_fixture(
+        "#!/bin/sh\nset -eu\nmkdir -p \"$RUNNER_FIXTURE_ROOT/target\"\nprintf '#!/bin/sh\\n' >\"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\nchmod 755 \"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\n",
+    );
+    let root = fixture.path();
+    let log = root.join("runner.log");
+    let artifacts = root.join(".artifacts");
+    fs::create_dir(&artifacts).unwrap();
+    let candidate = "ghcr.io/liquescent-development/gascan/workspace:candidate@sha256:\
+                     aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let candidate_file = artifacts.join("connected-workspace-image-candidate.txt");
+    let live_file = artifacts.join("connected-workspace-image-apple-live.txt");
+    fs::write(&candidate_file, format!("{candidate}\n")).unwrap();
+    write_executable(
+        &root.join("bin/cargo"),
+        "#!/bin/sh\nset -eu\ncase \" $* \" in\n *' build '*) mkdir -p \"$RUNNER_FIXTURE_ROOT/target/debug\"; printf '#!/bin/sh\\n' >\"$RUNNER_FIXTURE_ROOT/target/debug/gascan-e2e-cli\"; chmod 755 \"$RUNNER_FIXTURE_ROOT/target/debug/gascan-e2e-cli\";;\n *' test '*) printf 'unremoved\\n' >\"$GASCAN_E2E_SESSION_ROOT/scoped-residue\";;\nesac\n",
+    );
+
+    let output = Command::new(root.join("scripts/run-apple-e2e.sh"))
+        .arg("apple_apply")
+        .env("RUNNER_FIXTURE_ROOT", root)
+        .env("RUNNER_FIXTURE_LOG", &log)
+        .env("GASCAN_E2E_CANDIDATE_IMAGE_FILE", &candidate_file)
+        .env("GASCAN_E2E_LIVE_ACCEPTANCE_FILE", &live_file)
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", root.join("bin").display()),
+        )
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(!live_file.exists());
+}
+
+#[test]
+fn interrupted_apple_apply_does_not_publish_live_receipt() {
+    let fixture = runner_fixture(
+        "#!/bin/sh\nset -eu\nmkdir -p \"$RUNNER_FIXTURE_ROOT/target\"\nprintf '#!/bin/sh\\n' >\"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\nchmod 755 \"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\n",
+    );
+    let root = fixture.path();
+    let log = root.join("runner.log");
+    let artifacts = root.join(".artifacts");
+    fs::create_dir(&artifacts).unwrap();
+    let candidate = "ghcr.io/liquescent-development/gascan/workspace:candidate@sha256:\
+                     aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let candidate_file = artifacts.join("connected-workspace-image-candidate.txt");
+    let live_file = artifacts.join("connected-workspace-image-apple-live.txt");
+    fs::write(&candidate_file, format!("{candidate}\n")).unwrap();
+    write_executable(
+        &root.join("bin/cargo"),
+        "#!/bin/sh\nset -eu\ncase \" $* \" in\n *' build '*) mkdir -p \"$RUNNER_FIXTURE_ROOT/target/debug\"; printf '#!/bin/sh\\n' >\"$RUNNER_FIXTURE_ROOT/target/debug/gascan-e2e-cli\"; chmod 755 \"$RUNNER_FIXTURE_ROOT/target/debug/gascan-e2e-cli\";;\n *' test '*) kill -TERM \"$PPID\"; sleep 1;;\nesac\n",
+    );
+
+    let output = Command::new(root.join("scripts/run-apple-e2e.sh"))
+        .arg("apple_apply")
+        .env("RUNNER_FIXTURE_ROOT", root)
+        .env("RUNNER_FIXTURE_LOG", &log)
+        .env("GASCAN_E2E_CANDIDATE_IMAGE_FILE", &candidate_file)
+        .env("GASCAN_E2E_LIVE_ACCEPTANCE_FILE", &live_file)
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", root.join("bin").display()),
+        )
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(!live_file.exists());
 }
 
 #[test]

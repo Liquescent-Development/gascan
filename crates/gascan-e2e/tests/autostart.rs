@@ -10,6 +10,7 @@ struct Environment {
     gascand: std::ffi::OsString,
     runtime: tempfile::TempDir,
     runtime_root: std::path::PathBuf,
+    account_home: std::path::PathBuf,
 }
 
 impl Environment {
@@ -19,11 +20,14 @@ impl Environment {
             std::env::var_os("CARGO_BIN_EXE_gascan-e2e-daemon").ok_or("gascand missing")?;
         let runtime = tempfile::tempdir()?;
         let runtime_root = runtime.path().canonicalize()?;
+        let account_home = runtime_root.join("home");
+        std::fs::create_dir(&account_home)?;
         Ok(Self {
             gascan,
             gascand,
             runtime,
             runtime_root,
+            account_home,
         })
     }
 
@@ -42,6 +46,7 @@ impl Environment {
                 "GASCAN_DAEMON_STDERR_PATH",
                 self.runtime_root.join("daemon.stderr"),
             )
+            .env("GASCAN_E2E_ACCOUNT_HOME", &self.account_home)
             .env("GASCAN_DAEMON", &self.gascand);
         command.env("GASCAN_TEST_FAKE_BACKEND", "1");
         command
@@ -115,6 +120,30 @@ fn accepted_socket_without_http2_cannot_block_initial_probe() -> TestResult {
     holder
         .join()
         .map_err(|_| "withholding socket thread panicked")??;
+    Ok(())
+}
+
+#[test]
+fn autostart_waits_for_a_slow_but_healthy_daemon() -> TestResult {
+    let env = Environment::new()?;
+    let started = std::time::Instant::now();
+    let output = env
+        .command()
+        .env("GASCAN_E2E_DAEMON_START_DELAY_MS", "5500")
+        .output()?;
+    if !output.status.success() {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        return Err(format!(
+            "slow healthy daemon was abandoned: status={:?}, stdout={}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    if started.elapsed() >= std::time::Duration::from_secs(15) {
+        return Err("slow healthy daemon exceeded the bounded readiness window".into());
+    }
     Ok(())
 }
 

@@ -39,6 +39,7 @@ struct Environment {
     root: tempfile::TempDir,
     runtime: tempfile::TempDir,
     runtime_root: std::path::PathBuf,
+    account_home: std::path::PathBuf,
 }
 
 impl Environment {
@@ -49,12 +50,15 @@ impl Environment {
         let root = tempfile::tempdir()?;
         let runtime = tempfile::tempdir()?;
         let runtime_root = runtime.path().canonicalize()?;
+        let account_home = runtime_root.join("account-home");
+        std::fs::create_dir(&account_home)?;
         Ok(Self {
             gascan,
             gascand,
             root,
             runtime,
             runtime_root,
+            account_home,
         })
     }
     fn command(&self, arguments: &[&str]) -> Command {
@@ -68,6 +72,7 @@ impl Environment {
                 self.runtime_root.join("runtime.json"),
             )
             .env("GASCAN_PID_PATH", self.runtime_root.join("daemon.pid"))
+            .env("GASCAN_E2E_ACCOUNT_HOME", &self.account_home)
             .env("GASCAN_DAEMON", &self.gascand);
         command.env("GASCAN_TEST_FAKE_BACKEND", "1");
         command
@@ -170,10 +175,19 @@ fn invoke_with_stderr_pty(
     arguments: &[&str],
     no_color: bool,
 ) -> TestResult<(std::process::ExitStatus, Vec<u8>)> {
+    invoke_command_with_stderr_pty(env.command(arguments), no_color)
+}
+
+fn invoke_command_with_stderr_pty(
+    mut command: Command,
+    no_color: bool,
+) -> TestResult<(std::process::ExitStatus, Vec<u8>)> {
     let pty = rustix_openpty::openpty(None, None)?;
     let stderr = std::fs::File::from(rustix_openpty::rustix::io::dup(&pty.user)?);
-    let mut command = env.command(arguments);
-    command.stdout(Stdio::piped()).stderr(stderr);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(stderr);
     if no_color {
         command.env("NO_COLOR", "1");
     }
@@ -291,7 +305,40 @@ fn complete_cli_lifecycle_uses_daemon_api() -> TestResult {
 }
 
 #[test]
-fn interactive_lifecycle_progress_updates_in_place_and_finishes_cleanly() -> TestResult {
+fn progress_stderr_pty_child_has_non_tty_stdin_and_tty_stderr() -> TestResult {
+    const CHILD: &str = "GASCAN_PROGRESS_PTY_CONTRACT_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let mut probe = Command::new("/bin/sh");
+        probe.args(["-c", "test ! -t 0 && test -t 2"]);
+        let (status, _stderr) = invoke_command_with_stderr_pty(probe, false)?;
+        assert!(status.success(), "progress PTY contract probe failed");
+        return Ok(());
+    }
+
+    let pty = rustix_openpty::openpty(None, None)?;
+    let stdin = std::fs::File::from(rustix_openpty::rustix::io::dup(&pty.user)?);
+    let output = Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "progress_stderr_pty_child_has_non_tty_stdin_and_tty_stderr",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .stdin(stdin)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "progress PTY helper inherited terminal stdin:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+#[test]
+fn tty_stderr_lifecycle_progress_updates_in_place_and_finishes_cleanly() -> TestResult {
     let env = Environment::new()?;
     assert!(env.invoke(&["doctor", "--json"])?.status.success());
     for no_color in [false, true] {
@@ -540,8 +587,8 @@ fn inspection_confirmation_and_remaining_commands_are_stable() -> TestResult {
     let status = String::from_utf8(env.invoke(&["status"])?.stdout)?;
     let sandbox_id = status
         .strip_prefix("Sandbox: ")
-        .and_then(|status| status.strip_suffix("\nState:   Running\n"))
-        .ok_or("unexpected human status output")?;
+        .and_then(|status| status.strip_suffix("\nState:   Running\nSSH     Disabled\n"))
+        .ok_or_else(|| format!("unexpected human status output: {status:?}"))?;
     let list = String::from_utf8(env.invoke(&["list"])?.stdout)?;
     let width = sandbox_id.len().max("SANDBOX".len());
     assert_eq!(

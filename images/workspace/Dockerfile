@@ -72,41 +72,89 @@ ARG GASCAMP_REVISION
 COPY .artifacts/playwright-chromium-reviewed /opt/gascan/chromium
 COPY --chmod=0440 images/workspace/etc/sudoers.d/workspace /etc/sudoers.d/workspace
 COPY --chmod=0555 images/workspace/bin/gascan-entrypoint /usr/local/bin/gascan-entrypoint
+COPY --chmod=0555 images/workspace/bin/start-gascan-sshd /usr/local/bin/start-gascan-sshd
 COPY --chmod=0555 images/workspace/bin/select-gascamp /usr/local/bin/select-gascamp
 COPY --chmod=0555 images/workspace/bin/migrate-workspace-identity /usr/local/bin/migrate-workspace-identity
 COPY --chmod=0555 images/workspace/libexec/migrate-workspace-identity-core /usr/local/libexec/gascan/migrate-workspace-identity-core
 COPY --from=gascamp-builder /out /opt/gascan/gascamp
 COPY --chmod=0444 images/workspace/etc/profile.d/mise.sh /etc/profile.d/mise.sh
 COPY --chmod=0444 images/workspace/tests/playwright-smoke.mjs /opt/gascan/tests/playwright-smoke.mjs
+COPY --chmod=0555 images/workspace/tests/workstation-contract.sh /opt/gascan/tests/workstation-contract.sh
+COPY --chmod=0555 images/workspace/tests/ssh-contract.sh /opt/gascan/tests/ssh-contract.sh
+COPY --chmod=0555 images/workspace/bin/install-workstation-artifacts /usr/local/bin/install-workstation-artifacts
+COPY --chmod=0555 images/workspace/bin/run-workstation-step /usr/local/bin/run-workstation-step
+COPY --chmod=0555 images/workspace/bin/configure-workstation-home /usr/local/bin/configure-workstation-home
+COPY --chmod=0444 images/workspace/versions.lock /tmp/versions.lock
+COPY workstation /tmp/workstation
 
 USER root
-RUN test -x /opt/gascan/gascamp/bin/camp \
+RUN --network=none test -x /opt/gascan/gascamp/bin/camp \
     && test -L /opt/gascan/gascamp/bin/campd \
     && test "$(cat /opt/gascan/gascamp/REVISION)" = "$GASCAMP_REVISION" \
     && /usr/local/bin/migrate-workspace-identity \
     && chown workspace:workspace /opt/gascan/mise \
-    && install -d -o workspace -g workspace \
+    && /usr/local/bin/run-workstation-step test-directory-mode \
+       chmod 0555 /opt/gascan/tests \
+    && PATH="/opt/gascan/mise/shims:$PATH" /usr/local/bin/run-workstation-step installer \
+       /usr/local/bin/install-workstation-artifacts \
+       install /tmp/workstation /opt/gascan/workstation /usr/local/bin /tmp/versions.lock \
+       /tmp/workstation/target-lock.toml \
+    && printf 'workstation assembly: installer complete\n' >&2 \
+    && /usr/local/bin/run-workstation-step immutable-owner \
+       chown -R root:root /opt/gascan/workstation \
+    && /usr/local/bin/run-workstation-step immutable-mode \
+       sh -c 'test -z "$(find /opt/gascan/workstation ! -type l \( -perm -020 -o -perm -002 \) -print -quit)"' \
+    && /usr/local/bin/run-workstation-step immutable-ownership \
+       sh -c 'test -z "$(find /opt/gascan/workstation \( ! -user root -o ! -group root \) -print -quit)"' \
+    && /usr/local/bin/run-workstation-step home-directories \
+       install -d -o workspace -g workspace \
        /workspace \
+       /home/workspace/.local/share/mise \
+       /home/workspace/.local/state \
        /home/workspace/.cache \
        /home/workspace/.config/gascan \
-    && chmod 0440 /etc/sudoers.d/workspace \
-    && visudo -cf /etc/sudoers.d/workspace \
-    && chmod 0555 /opt/gascan/chromium/chrome-linux/chrome \
-    && chmod 0555 /opt/gascan/chromium/chrome-linux/chrome-wrapper \
-    && chmod 0555 /opt/gascan/chromium/chrome-linux/chrome_crashpad_handler \
-    && chmod 0555 /opt/gascan/chromium/chrome-linux/chrome_sandbox \
-    && chmod 0555 /opt/gascan/chromium/chrome-linux/libEGL.so \
-    && chmod 0555 /opt/gascan/chromium/chrome-linux/libGLESv2.so \
-    && chmod 0555 /opt/gascan/chromium/chrome-linux/libvulkan.so.1 \
-    && chmod 0555 /opt/gascan/chromium/chrome-linux/libvk_swiftshader.so \
-    && test -x /opt/gascan/chromium/chrome-linux/chrome \
-    && chmod -R a-w /opt/gascan/chromium
+    && /usr/local/bin/run-workstation-step home-configuration \
+       env HOME=/home/workspace /usr/local/bin/configure-workstation-home \
+    && /usr/local/bin/run-workstation-step home-owner \
+       chown -R workspace:workspace /home/workspace/.cache /home/workspace/.config/gascan \
+    && /usr/local/bin/run-workstation-step home-link-owner \
+       chown -h workspace:workspace \
+       /home/workspace/.claude \
+       /home/workspace/.codex \
+       /home/workspace/.pi \
+       /home/workspace/.config/herdr \
+    && /usr/local/bin/run-workstation-step sudoers-mode \
+       chmod 0440 /etc/sudoers.d/workspace \
+    && /usr/local/bin/run-workstation-step sudoers-validation \
+       visudo -cf /etc/sudoers.d/workspace \
+    && /usr/local/bin/run-workstation-step chromium-mode chmod 0555 \
+       /opt/gascan/chromium/chrome-linux/chrome \
+       /opt/gascan/chromium/chrome-linux/chrome-wrapper \
+       /opt/gascan/chromium/chrome-linux/chrome_crashpad_handler \
+       /opt/gascan/chromium/chrome-linux/chrome_sandbox \
+       /opt/gascan/chromium/chrome-linux/libEGL.so \
+       /opt/gascan/chromium/chrome-linux/libGLESv2.so \
+       /opt/gascan/chromium/chrome-linux/libvulkan.so.1 \
+       /opt/gascan/chromium/chrome-linux/libvk_swiftshader.so \
+    && /usr/local/bin/run-workstation-step chromium-command \
+       test -x /opt/gascan/chromium/chrome-linux/chrome \
+    && /usr/local/bin/run-workstation-step chromium-seal \
+       chmod -R a-w /opt/gascan/chromium \
+    && /usr/local/bin/run-workstation-step temporary-cleanup \
+       sh -c 'rm -rf /tmp/workstation /tmp/versions.lock; rm -f /usr/local/bin/run-workstation-step'
 
 ENV HOME=/home/workspace
 ENV MISE_CACHE_DIR=/home/workspace/.cache/mise
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/opt/gascan/chromium/chrome-linux/chrome
-ENV PATH=/opt/gascan/mise/shims:${PATH}
+ENV CLAUDE_CONFIG_DIR=/home/workspace/.config/gascan/agents/claude
+ENV CODEX_HOME=/home/workspace/.config/gascan/agents/codex
+ENV PI_CODING_AGENT_DIR=/home/workspace/.config/gascan/agents/pi
+ENV PI_CODING_AGENT_SESSION_DIR=/home/workspace/.cache/pi
+ENV HERDR_CONFIG_PATH=/home/workspace/.config/gascan/herdr/config.toml
+ENV GH_CONFIG_DIR=/home/workspace/.config/gascan/gh
+ENV GLAB_CONFIG_DIR=/home/workspace/.config/gascan/glab
+ENV PATH=/opt/gascan/mise/shims:/usr/local/bin:/opt/gascan/workstation/bin:${PATH}
 USER workspace:workspace
 WORKDIR /workspace
-VOLUME ["/opt/gascan/mise", "/home/workspace/.cache", "/home/workspace/.config/gascan"]
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/gascan-entrypoint"]
+VOLUME ["/home/workspace/.local/share/mise", "/home/workspace/.cache", "/home/workspace/.config/gascan"]
+ENTRYPOINT ["/usr/local/bin/gascan-entrypoint"]

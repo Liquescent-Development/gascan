@@ -1,0 +1,540 @@
+#!/bin/sh
+set -eu
+
+exec python3 - "$@" <<'PY'
+import hashlib
+import json
+import os
+import base64
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tarfile
+import tempfile
+import tomllib
+
+
+def die(message):
+    raise SystemExit(f"install-workstation-artifacts: {message}")
+
+
+def archive_members(path):
+    with tarfile.open(path, "r:gz") as archive:
+        members = archive.getmembers()
+        names = set()
+        for member in members:
+            name = PurePosixPath(member.name)
+            if name.is_absolute() or not name.parts or ".." in name.parts:
+                die(f"unsafe archive path: {member.name}")
+            normalized = str(name)
+            if normalized in names:
+                die(f"duplicate archive path: {normalized}")
+            names.add(normalized)
+            if not (member.isdir() or member.isreg() or member.issym()):
+                die(f"unsafe archive member type: {member.name}")
+            if member.issym():
+                target = PurePosixPath(member.linkname)
+                if target.is_absolute():
+                    die(f"absolute archive link: {member.name}")
+                resolved = name.parent.joinpath(target)
+                depth = 0
+                for component in resolved.parts:
+                    depth = depth - 1 if component == ".." else depth + (component != ".")
+                    if depth < 0:
+                        die(f"escaping archive link: {member.name}")
+        return members
+
+
+def extract_reviewed(path, destination):
+    members = archive_members(path)
+    destination.mkdir(mode=0o700)
+    with tarfile.open(path, "r:gz") as archive:
+        for member in members:
+            output = destination.joinpath(*PurePosixPath(member.name).parts)
+            if member.isdir():
+                output.mkdir(mode=0o700, parents=True, exist_ok=True)
+            elif member.isreg():
+                output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                source = archive.extractfile(member)
+                if source is None:
+                    die(f"archive file has no content: {member.name}")
+                with output.open("xb") as target:
+                    shutil.copyfileobj(source, target)
+                output.chmod(0o700 if member.mode & 0o111 else 0o600)
+            else:
+                output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                output.symlink_to(member.linkname)
+
+
+def digest(path):
+    value = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            value.update(block)
+    return value.hexdigest()
+
+
+def validate_file(path, expected_size, expected_digest):
+    if path.is_symlink() or not path.is_file():
+        die(f"artifact is not one regular file: {path}")
+    if path.stat().st_size != expected_size:
+        die(f"artifact size mismatch: {path}")
+    if digest(path) != expected_digest:
+        die(f"artifact digest mismatch: {path}")
+
+
+def validate_integrity(path, expected):
+    if not expected.startswith("sha512-"):
+        die(f"artifact integrity is not SHA-512: {path}")
+    actual = base64.b64encode(hashlib.sha512(path.read_bytes()).digest()).decode()
+    if actual != expected.removeprefix("sha512-"):
+        die(f"artifact integrity mismatch: {path}")
+
+
+def validate_arm64_elf(path):
+    with path.open("rb") as source:
+        header = source.read(20)
+    if (
+        len(header) != 20
+        or header[:4] != b"\x7fELF"
+        or header[4] != 2
+        or header[5] != 1
+        or struct.unpack("<H", header[18:20])[0] != 183
+    ):
+        die(f"artifact is not a 64-bit little-endian ARM64 ELF: {path}")
+
+
+def sole_candidate(root, endings):
+    candidates = [
+        path
+        for path in root.rglob("*")
+        if path.is_file() and any(path.as_posix().endswith(ending) for ending in endings)
+    ]
+    if len(candidates) != 1:
+        die(f"expected one reviewed archive command, found {len(candidates)}")
+    return candidates[0]
+
+
+def checked_link(link, target):
+    if link.exists() or link.is_symlink():
+        die(f"refusing to replace command path: {link}")
+    link.symlink_to(target)
+
+
+def exact_version(command, tool, version):
+    with tempfile.TemporaryDirectory(
+        prefix=".version-home-", dir=command.parent
+    ) as version_home:
+        result = subprocess.run(
+            [str(command), "--version"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=30,
+            env={
+                "HOME": version_home,
+                "PATH": os.environ["PATH"],
+                "NO_COLOR": "1",
+            },
+        )
+    output = result.stdout.strip()
+    lines = output.splitlines()
+    valid = {
+        "claude": output == f"{version} (Claude Code)",
+        "codex": output == f"codex-cli {version}",
+        "pi": output == version,
+        "herdr": output == f"herdr {version}",
+        "glab": re.fullmatch(rf"glab {re.escape(version)} \([^()\n]*\)", output)
+        is not None,
+        "nvim": bool(lines) and lines[0] == f"NVIM v{version}",
+    }.get(tool)
+    if result.returncode != 0 or valid is not True:
+        die(f"unexpected {command.name} version output: {output!r}")
+
+
+def immutable_tree(root):
+    resolved_root = root.resolve(strict=True)
+    for current, directories, files in os.walk(root, followlinks=False):
+        directory = Path(current)
+        if directory.is_symlink():
+            continue
+        directory.chmod(0o555)
+        for name in files:
+            path = directory / name
+            if path.is_symlink():
+                continue
+            mode = path.stat().st_mode
+            path.chmod(0o555 if mode & 0o111 else 0o444)
+        for name in directories:
+            path = directory / name
+            if not path.is_symlink():
+                path.chmod(0o555)
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            if Path(os.readlink(path)).is_absolute():
+                die(f"absolute immutable-tool symlink: {path}")
+            try:
+                path.resolve(strict=False).relative_to(resolved_root)
+            except ValueError:
+                die(f"escaping immutable-tool symlink: {path}")
+        elif path.stat().st_mode & 0o022:
+            die(f"mutable immutable-tool path: {path}")
+
+
+def extract_npm_bootstrap(path, destination, expected_version):
+    members = archive_members(path)
+    if not members:
+        die("npm bootstrap archive is empty")
+    for member in members:
+        parts = PurePosixPath(member.name).parts
+        if not member.isreg() or not parts or parts[0] != "package":
+            die(f"unexpected npm bootstrap archive member: {member.name}")
+    extract_reviewed(path, destination)
+    package_root = destination / "package"
+    manifest_path = package_root / "package.json"
+    cli = package_root / "bin" / "npm-cli.js"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        die("npm bootstrap manifest is not one regular file")
+    if cli.is_symlink() or not cli.is_file():
+        die("npm bootstrap CLI is not one regular file")
+    manifest = json.loads(manifest_path.read_text())
+    if (
+        manifest.get("name") != "npm"
+        or manifest.get("version") != expected_version
+        or manifest.get("bin") != {
+            "npm": "bin/npm-cli.js",
+            "npx": "bin/npx-cli.js",
+        }
+    ):
+        die("npm bootstrap package identity differs from lock")
+    return cli
+
+
+def npm_ci(
+    source,
+    npm_root,
+    bootstrap_archive,
+    expected_version,
+    expected_node_version,
+):
+    if npm_root.exists() or npm_root.is_symlink():
+        die(f"npm destination already exists: {npm_root}")
+    node = shutil.which("node")
+    if node is None:
+        die("locked Node command is unavailable")
+    node_version = subprocess.run(
+        [node, "--version"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=30,
+        env=os.environ.copy(),
+    )
+    if (
+        node_version.returncode != 0
+        or node_version.stdout.strip() != f"v{expected_node_version}"
+    ):
+        die(f"unexpected Node version output: {node_version.stdout.strip()!r}")
+    with tempfile.TemporaryDirectory(prefix="gascan-npm-bootstrap-") as temporary:
+        cli = extract_npm_bootstrap(
+            bootstrap_archive,
+            Path(temporary) / "npm-cli",
+            expected_version,
+        )
+        version_result = subprocess.run(
+            [node, str(cli), "--version"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=30,
+            env=os.environ.copy(),
+        )
+        actual_version = version_result.stdout.strip()
+        if version_result.returncode != 0 or actual_version != expected_version:
+            die(f"unexpected npm version output: {actual_version!r}")
+        npm_root.mkdir(mode=0o700)
+        shutil.copyfile(source / "package.json", npm_root / "package.json")
+        shutil.copyfile(source / "package-lock.json", npm_root / "package-lock.json")
+        npm_env = {
+            name: value
+            for name, value in os.environ.items()
+            if not name.lower().startswith("npm_config_")
+            and name not in {"NODE_OPTIONS", "NPM_TOKEN", "NODE_AUTH_TOKEN"}
+        }
+        npm_env.update(
+            {
+                "HOME": str(npm_root / ".home"),
+                "npm_config_audit": "false",
+                "npm_config_fund": "false",
+                "npm_config_logs_dir": str(npm_root / ".home" / "logs"),
+                "npm_config_update_notifier": "false",
+            }
+        )
+        subprocess.run(
+            [
+                node,
+                str(cli),
+                "ci",
+                "--offline",
+                "--ignore-scripts",
+                "--cache",
+                str(source / "npm-cache"),
+            ],
+            cwd=npm_root,
+            env=npm_env,
+            stdin=subprocess.DEVNULL,
+            timeout=300,
+            check=True,
+        )
+    shutil.rmtree(npm_root / ".home", ignore_errors=True)
+
+
+def package_name_from_lock_path(path):
+    parts = PurePosixPath(path).parts
+    positions = [index for index, part in enumerate(parts) if part == "node_modules"]
+    if not positions:
+        die(f"npm lock path has no node_modules component: {path}")
+    index = positions[-1] + 1
+    if index >= len(parts):
+        die(f"npm lock path has no package name: {path}")
+    if parts[index].startswith("@"):
+        if index + 1 >= len(parts):
+            die(f"npm lock path has an incomplete scope: {path}")
+        return f"{parts[index]}/{parts[index + 1]}"
+    return parts[index]
+
+
+def installed_package_paths(npm_root):
+    found = set()
+    for current, _, _ in os.walk(
+        npm_root / "node_modules", topdown=True, followlinks=False
+    ):
+        directory = Path(current)
+        if directory.name != "node_modules":
+            continue
+        for entry in directory.iterdir():
+            if entry.name == ".bin" or entry.name.startswith("."):
+                continue
+            if entry.is_symlink() or not entry.is_dir():
+                die(f"npm package container is not a real directory: {entry}")
+            if entry.name.startswith("@"):
+                for package in entry.iterdir():
+                    if package.is_symlink() or not package.is_dir():
+                        die(f"npm scoped package is not a real directory: {package}")
+                    found.add(package.relative_to(npm_root).as_posix())
+            else:
+                found.add(entry.relative_to(npm_root).as_posix())
+    return found
+
+
+def verify_npm_inventory(npm_root, package_lock_path, target_lock_path):
+    package_lock = json.loads(package_lock_path.read_text())
+    target = tomllib.loads(target_lock_path.read_text())
+    if (
+        target.get("schema_version") != 1
+        or target.get("npm_version") != "11.12.1"
+        or target.get("os") != "linux"
+        or target.get("cpu") != "arm64"
+        or target.get("libc") != "glibc"
+    ):
+        die("npm target lock platform differs from review")
+    excluded = target.get("excluded_paths")
+    if not isinstance(excluded, list) or len(set(excluded)) != len(excluded):
+        die("npm target lock exclusions are invalid")
+    excluded = set(excluded)
+    packages = package_lock.get("packages")
+    if not isinstance(packages, dict) or "" not in packages:
+        die("npm package lock inventory is invalid")
+    expected = set(packages) - {""} - excluded
+    if len(expected) != target.get("record_count"):
+        die("npm target lock record count differs from package lock")
+    actual = installed_package_paths(npm_root)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        die(
+            "installed npm inventory differs from target lock: "
+            f"missing={missing} extra={extra}"
+        )
+    for path in sorted(expected):
+        record = packages[path]
+        manifest_path = npm_root / path / "package.json"
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            die(f"npm package manifest is not a regular file: {path}")
+        manifest = json.loads(manifest_path.read_text())
+        expected_name = record.get("name") or package_name_from_lock_path(path)
+        if (
+            manifest.get("name") != expected_name
+            or manifest.get("version") != record.get("version")
+        ):
+            die(f"installed npm package identity differs from lock: {path}")
+
+
+if len(sys.argv) == 3 and sys.argv[1] == "validate-tar":
+    archive_members(Path(sys.argv[2]))
+    raise SystemExit(0)
+if len(sys.argv) == 6 and sys.argv[1] == "validate-file":
+    candidate = Path(sys.argv[2])
+    try:
+        expected_size = int(sys.argv[3])
+    except ValueError:
+        die("expected size is not an integer")
+    validate_file(candidate, expected_size, sys.argv[4])
+    if sys.argv[5] == "arm64-elf":
+        validate_arm64_elf(candidate)
+    elif sys.argv[5] != "regular":
+        die("unknown file validation kind")
+    raise SystemExit(0)
+if len(sys.argv) == 7 and sys.argv[1] == "npm-ci":
+    npm_ci(
+        Path(sys.argv[2]),
+        Path(sys.argv[3]),
+        Path(sys.argv[4]),
+        sys.argv[5],
+        sys.argv[6],
+    )
+    raise SystemExit(0)
+if len(sys.argv) == 5 and sys.argv[1] == "verify-inventory":
+    verify_npm_inventory(Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4]))
+    raise SystemExit(0)
+if len(sys.argv) == 5 and sys.argv[1] == "verify-version":
+    exact_version(Path(sys.argv[2]), sys.argv[3], sys.argv[4])
+    raise SystemExit(0)
+if len(sys.argv) == 3 and sys.argv[1] == "seal-tree":
+    immutable_tree(Path(sys.argv[2]))
+    raise SystemExit(0)
+
+if len(sys.argv) != 7 or sys.argv[1] != "install":
+    die("usage: install SOURCE PREFIX COMMAND_DIR VERSIONS_LOCK TARGET_LOCK")
+
+source, prefix, command_dir, lock_path, target_lock_path = map(Path, sys.argv[2:])
+if prefix.exists() or prefix.is_symlink():
+    die(f"immutable prefix already exists: {prefix}")
+if not source.is_dir() or source.is_symlink():
+    die("workstation source must be one directory")
+lock = tomllib.loads(lock_path.read_text())
+artifacts = lock["workstation_artifacts"]
+npm_lock = lock["workstation_npm"]
+
+for filename, key in [
+    ("glab.tar.gz", "glab"),
+    ("herdr", "herdr"),
+    ("neovim.tar.gz", "neovim"),
+]:
+    record = artifacts[key]
+    validate_file(source / filename, record["size"], record["sha256"])
+validate_file(
+    source / "claude-native.tgz",
+    npm_lock["claude_native"]["size"],
+    npm_lock["claude_native"]["sha256"],
+)
+validate_file(
+    source / "npm-cli.tgz",
+    npm_lock["bootstrap"]["size"],
+    npm_lock["bootstrap"]["sha256"],
+)
+validate_integrity(source / "npm-cli.tgz", npm_lock["bootstrap"]["integrity"])
+validate_file(
+    source / "package.json",
+    (source / "package.json").stat().st_size,
+    npm_lock["package_manifest_sha256"],
+)
+validate_file(
+    source / "package-lock.json",
+    (source / "package-lock.json").stat().st_size,
+    npm_lock["package_lock_sha256"],
+)
+validate_file(source / "herdr", artifacts["herdr"]["size"], artifacts["herdr"]["sha256"])
+validate_arm64_elf(source / "herdr")
+
+prefix.parent.mkdir(parents=True, exist_ok=True)
+staging = Path(tempfile.mkdtemp(prefix=".workstation-", dir=prefix.parent))
+try:
+    npm_root = staging / "npm"
+    npm_ci(
+        source,
+        npm_root,
+        source / "npm-cli.tgz",
+        npm_lock["npm_version"],
+        lock["tools"]["node"],
+    )
+    verify_npm_inventory(npm_root, source / "package-lock.json", target_lock_path)
+
+    bin_dir = staging / "bin"
+    bin_dir.mkdir(mode=0o700)
+    claude_tree = staging / "claude-native"
+    extract_reviewed(source / "claude-native.tgz", claude_tree)
+    claude = claude_tree.joinpath(*PurePosixPath(npm_lock["claude_native"]["binary_path"]).parts)
+    validate_file(
+        claude,
+        npm_lock["claude_native"]["binary_size"],
+        npm_lock["claude_native"]["binary_sha256"],
+    )
+    validate_arm64_elf(claude)
+    shutil.copyfile(claude, bin_dir / "claude")
+    (bin_dir / "claude").chmod(0o700)
+
+    shutil.copyfile(source / "herdr", bin_dir / "herdr")
+    (bin_dir / "herdr").chmod(0o700)
+
+    glab_tree = staging / "glab"
+    extract_reviewed(source / "glab.tar.gz", glab_tree)
+    glab = sole_candidate(glab_tree, ("/bin/glab", "/glab"))
+    validate_arm64_elf(glab)
+    shutil.copyfile(glab, bin_dir / "glab")
+    (bin_dir / "glab").chmod(0o700)
+
+    neovim_tree = staging / "neovim"
+    extract_reviewed(source / "neovim.tar.gz", neovim_tree)
+    nvim = sole_candidate(neovim_tree, ("/bin/nvim",))
+    validate_arm64_elf(nvim)
+    relative_nvim = nvim.relative_to(neovim_tree)
+    checked_link(bin_dir / "nvim", Path("..") / "neovim" / relative_nvim)
+
+    for name in ["codex", "pi"]:
+        npm_command = npm_root / "node_modules" / ".bin" / name
+        if not npm_command.is_symlink():
+            die(f"npm did not create the reviewed {name} command")
+        checked_link(bin_dir / name, Path("..") / "npm" / "node_modules" / ".bin" / name)
+
+    expected = {
+        "claude": artifacts["claude"]["version"],
+        "codex": artifacts["codex"]["version"],
+        "pi": artifacts["pi"]["version"],
+        "herdr": artifacts["herdr"]["version"],
+        "glab": artifacts["glab"]["version"],
+        "nvim": artifacts["neovim"]["version"],
+    }
+    for name, version in expected.items():
+        exact_version(bin_dir / name, name, version)
+    commands = lock.get("workstation_commands")
+    if (
+        not isinstance(commands, dict)
+        or not commands
+        or any(not isinstance(value, str) or not value for value in commands.values())
+        or set(commands).intersection(expected)
+    ):
+        die("workstation command version evidence is invalid")
+    evidence = {**expected, **commands}
+    (staging / "versions.json").write_text(
+        json.dumps(evidence, sort_keys=True) + "\n"
+    )
+
+    immutable_tree(staging)
+    staging.rename(prefix)
+finally:
+    if staging.exists():
+        shutil.rmtree(staging)
+
+command_dir.mkdir(parents=True, exist_ok=True)
+for name in ["claude", "codex", "pi", "herdr", "glab", "nvim"]:
+    checked_link(command_dir / name, prefix / "bin" / name)
+checked_link(command_dir / "fd", Path("/usr/bin/fdfind"))
+checked_link(command_dir / "pico", Path("/usr/bin/nano"))
+PY

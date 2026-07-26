@@ -3,20 +3,26 @@
 
 use gascan_apple::{AppleBackend, AppleProbe, ProcessRunner};
 use gascan_core::doctor::{DoctorFact, DoctorFacts, DoctorReport};
-#[cfg(debug_assertions)]
 use gascan_core::fake_runtime::FakeRuntime;
 use gascan_core::runtime::RuntimeBackend;
 use gascand::{
     BackendSelection, Daemon, DaemonConfig, DoctorState, ErrorDiagnostics, ProvisionRequest,
-    ProvisionResolution, Provisioner, SandboxApi, SandboxService, ServiceError, SocketPaths, Store,
-    backend_selection,
+    ProvisionResolution, Provisioner, SandboxApi, SandboxService, ServiceError, SocketPaths,
+    SshPaths, Store, backend_selection,
 };
 use std::{sync::Arc, time::Duration};
 
 struct ConfiguredProvisioner {
     delay: Duration,
     fail: bool,
+    rollback_failure_runtime: Option<FakeRuntime>,
 }
+
+struct DaemonSshConfig {
+    e2e_paths: Option<SshPaths>,
+    refresh_doctor: bool,
+}
+
 #[async_trait::async_trait]
 impl Provisioner for ConfiguredProvisioner {
     async fn provision(
@@ -25,6 +31,11 @@ impl Provisioner for ConfiguredProvisioner {
     ) -> Result<ProvisionResolution, ServiceError> {
         tokio::time::sleep(self.delay).await;
         if self.fail {
+            if let Some(runtime) = &self.rollback_failure_runtime {
+                runtime
+                    .inject_failure(gascan_core::fake_runtime::FailureBoundary::Remove)
+                    .await;
+            }
             return Err(ServiceError::Provision("configured failure".to_owned()));
         }
         Ok(ProvisionResolution::default())
@@ -39,6 +50,15 @@ impl Provisioner for ConfiguredProvisioner {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(debug_assertions)]
+    if option_env!("CARGO_BIN_NAME") == Some("gascan-e2e-daemon") {
+        if let Some(delay) = std::env::var("GASCAN_E2E_DAEMON_START_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+    }
     let idle_timeout = std::env::var("GASCAN_IDLE_TIMEOUT_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -49,6 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| paths.directory().join("state.sqlite3"));
     let store = Store::open(state_path)?;
+    let e2e_ssh_paths = e2e_ssh_paths()?;
     #[cfg(debug_assertions)]
     let fake_requested = std::env::var_os(gascand::TEST_FAKE_BACKEND_ENV).is_some();
     #[cfg(not(debug_assertions))]
@@ -62,9 +83,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 store,
                 paths,
                 idle_timeout,
-                Duration::ZERO,
-                false,
+                ConfiguredProvisioner {
+                    delay: Duration::ZERO,
+                    fail: false,
+                    rollback_failure_runtime: None,
+                },
                 doctor,
+                DaemonSshConfig {
+                    e2e_paths: e2e_ssh_paths,
+                    refresh_doctor: true,
+                },
             )
             .await
         }
@@ -100,14 +128,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .await;
                 });
             }
+            let refresh_ssh_doctor = e2e_ssh_paths.is_some();
             run_daemon(
-                runtime,
+                runtime.clone(),
                 store,
                 paths,
                 idle_timeout,
-                provision_delay,
-                provision_fail,
+                ConfiguredProvisioner {
+                    delay: provision_delay,
+                    fail: provision_fail,
+                    rollback_failure_runtime: std::env::var_os("GASCAN_FAKE_ROLLBACK_REMOVE_FAIL")
+                        .is_some()
+                        .then_some(runtime),
+                },
                 DoctorState::ready(DoctorFacts::all_supported_for_tests().into_report()),
+                DaemonSshConfig {
+                    e2e_paths: e2e_ssh_paths,
+                    refresh_doctor: refresh_ssh_doctor,
+                },
             )
             .await
         }
@@ -119,19 +157,36 @@ async fn run_daemon<B: RuntimeBackend + 'static>(
     store: Store,
     paths: SocketPaths,
     idle_timeout: Duration,
-    provision_delay: Duration,
-    provision_fail: bool,
+    provisioner: ConfiguredProvisioner,
     doctor: DoctorState,
+    ssh: DaemonSshConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let service = Arc::new(SandboxService::new_with_doctor_state(
-        runtime,
-        store,
-        Arc::new(ConfiguredProvisioner {
-            delay: provision_delay,
-            fail: provision_fail,
-        }),
-        doctor,
-    ));
+    let candidate_image = if option_env!("CARGO_BIN_NAME") == Some("gascan-e2e-daemon") {
+        std::env::var("GASCAN_E2E_CANDIDATE_IMAGE").ok()
+    } else {
+        None
+    };
+    let mut service = match candidate_image {
+        Some(image) => SandboxService::new_with_doctor_state_for_image(
+            runtime,
+            store,
+            Arc::new(provisioner),
+            doctor,
+            image,
+        )?,
+        None => {
+            SandboxService::new_with_doctor_state(runtime, store, Arc::new(provisioner), doctor)
+        }
+    };
+    service = service.with_ssh_doctor_refresh(ssh.refresh_doctor);
+    #[cfg(debug_assertions)]
+    if let Some(ssh_paths) = ssh.e2e_paths {
+        service = service.with_ssh_paths_for_e2e(ssh_paths);
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = ssh.e2e_paths;
+    let service = Arc::new(service);
+    let _ = service.reconcile().await?;
     let config = DaemonConfig::new(paths, idle_timeout);
     let error_diagnostics = if std::env::var_os(gascand::TEST_ERROR_DIAGNOSTICS_ENV).is_some() {
         ErrorDiagnostics::enabled_for_tests()
@@ -141,6 +196,19 @@ async fn run_daemon<B: RuntimeBackend + 'static>(
     let api = SandboxApi::new_with_error_diagnostics(service, config.activity(), error_diagnostics);
     Daemon::serve(config, api).await?;
     Ok(())
+}
+
+fn e2e_ssh_paths() -> Result<Option<SshPaths>, Box<dyn std::error::Error>> {
+    #[cfg(debug_assertions)]
+    if option_env!("CARGO_BIN_NAME") == Some("gascan-e2e-daemon") {
+        let home = std::env::var_os("GASCAN_E2E_ACCOUNT_HOME")
+            .ok_or("GASCAN_E2E_ACCOUNT_HOME is required")?;
+        return Ok(Some(SshPaths::for_environment(
+            None,
+            Some(home.as_os_str()),
+        )?));
+    }
+    Ok(None)
 }
 
 async fn production_doctor_report() -> DoctorReport {

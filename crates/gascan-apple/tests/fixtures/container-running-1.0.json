@@ -2,10 +2,20 @@
   {
     "configuration": {
       "id": "code-a1b2c3d4e5f6",
+      "image": "ghcr.io/liquescent-development/gascan/workspace:fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "labels": {
         "dev.gascan.managed-by": "gascan",
         "dev.gascan.sandbox-id": "code-a1b2c3d4e5f6"
-      }
+      },
+      "publishedPorts": [
+        {
+          "hostAddress": "127.0.0.1",
+          "hostPort": 22222,
+          "containerPort": 22,
+          "count": 1,
+          "proto": "tcp"
+        }
+      ]
     },
     "status": { "state": "running" },
     "future": { "isTolerated": true }

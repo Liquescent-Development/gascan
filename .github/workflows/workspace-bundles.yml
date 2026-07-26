@@ -306,12 +306,35 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
-      - name: Install deterministic repository tooling
-        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends python3-apt xz-utils zstd
-      - name: Produce Ubuntu package closure
+      - name: Produce Ubuntu package closure from a pristine pinned command root
         run: |
-          scripts/produce-ubuntu-package-bundle.sh "$RUNNER_TEMP/ubuntu-package-bundle"
-          sha256sum images/workspace/versions.lock | cut -d' ' -f1 >"$RUNNER_TEMP/ubuntu-package-bundle/versions.lock.sha256"
+          set -euo pipefail
+          image=ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab
+          docker pull "$image"
+          test "$(docker image inspect --format '{{.Architecture}}/{{.Os}}' "$image")" = arm64/linux
+          docker image inspect --format '{{join .RepoDigests "\n"}}' "$image" | grep -Fx "$image"
+          mkdir "$RUNNER_TEMP/ubuntu-package-bundle"
+          timeout --signal=KILL 1800s docker run --rm --platform linux/arm64 \
+            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/src,readonly" \
+            --mount "type=bind,source=$RUNNER_TEMP/ubuntu-package-bundle,target=/output" \
+            "$image" bash -ceu '
+              mkdir /pristine-root
+              tar --one-file-system --exclude=./pristine-root -C / -cf - . | tar -C /pristine-root -xf -
+              for device in "null c 1 3" "zero c 1 5" "random c 1 8" "urandom c 1 9"; do
+                read -r name kind major minor <<<"$device"
+                rm -f "/pristine-root/dev/$name"
+                mknod -m 0666 "/pristine-root/dev/$name" "$kind" "$major" "$minor"
+              done
+              pristine_status=$(sha256sum /pristine-root/var/lib/dpkg/status | cut -d" " -f1)
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends ca-certificates curl gpgv python3-apt xz-utils zstd
+              UBUNTU_COMMAND_ROOTFS=/pristine-root \
+              UBUNTU_COMMAND_ROOTFS_STATUS_SHA256="$pristine_status" \
+                /src/scripts/produce-ubuntu-package-bundle.sh /output/bundle
+              sha256sum /src/images/workspace/versions.lock | cut -d" " -f1 >/output/bundle/versions.lock.sha256
+              mv /output/bundle/* /output/
+              rmdir /output/bundle
+            '
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: ubuntu-packages-linux-arm64
@@ -396,7 +419,33 @@ jobs:
             done
           } >"$lock"
           cargo run --quiet --manifest-path scripts/Cargo.toml --bin validate-workspace-bundle -- "$lock" ubuntu_packages "$archive" "$RUNNER_TEMP/validated-evidence"
-          scripts/produce-ubuntu-package-bundle.sh --verify-evidence "$RUNNER_TEMP/validated-evidence"
+          scripts/produce-ubuntu-package-bundle.sh --verify-evidence-structure "$RUNNER_TEMP/validated-evidence"
+          image=ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab
+          docker pull "$image"
+          test "$(docker image inspect --format '{{.Architecture}}/{{.Os}}' "$image")" = arm64/linux
+          docker image inspect --format '{{join .RepoDigests "\n"}}' "$image" | grep -Fx "$image"
+          timeout --signal=KILL 300s docker run --rm --network none --platform linux/arm64 \
+            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/src,readonly" \
+            --mount "type=bind,source=$RUNNER_TEMP/validated-evidence,target=/evidence,readonly" \
+            "$image" bash -ceu '
+              printf "deb [trusted=yes] file:/evidence/repository gascan main\n" >/tmp/gascan-local.list
+              apt_options=(
+                -o Dir::Etc::sourcelist=/tmp/gascan-local.list
+                -o Dir::Etc::sourceparts=-
+                -o APT::Architecture=arm64
+                -o APT::Install-Recommends=false
+                -o Acquire::Retries=0
+                -o Acquire::http::Proxy=false
+                -o Acquire::https::Proxy=false
+                -o Dir::Bin::Methods::http=/bin/false
+                -o Dir::Bin::Methods::https=/bin/false
+              )
+              apt-get "${apt_options[@]}" update
+              mapfile -t exact < <(awk -F "\t" '\''{print $3 == "all" ? $1 "=" $2 : $1 ":" $3 "=" $2}'\'' /evidence/package-manifest.tsv)
+              DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" --yes --no-install-recommends install "${exact[@]}"
+              test -z "$(dpkg --audit)"
+              /src/scripts/verify-ubuntu-command-evidence.sh /evidence
+            '
           inner=$(zstd --decompress --stdout "$archive" | tar -xOf - bundle-manifest.json | sha256sum | cut -d' ' -f1)
           packages=$(sha256sum "$RUNNER_TEMP/validated-evidence/package-manifest.tsv" | cut -d' ' -f1)
           signed=$(cd "$RUNNER_TEMP/validated-evidence" && find signed-releases signed-indexes -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)

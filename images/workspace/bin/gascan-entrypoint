@@ -5,4 +5,18 @@ if [ "$#" -gt 0 ]; then
     exec "$@"
 fi
 
-exec sleep infinity
+case "${GASCAN_SSH_ENABLED:-0}" in
+    0) exec sleep infinity ;;
+    1)
+        test -n "${GASCAN_SSH_AUTHORIZED_KEY:-}" || {
+            printf 'gascan entrypoint: managed SSH key is missing\n' >&2
+            exit 1
+        }
+        exec /usr/bin/sudo -n --preserve-env=GASCAN_SSH_AUTHORIZED_KEY \
+            /usr/local/bin/start-gascan-sshd
+        ;;
+    *)
+        printf 'gascan entrypoint: invalid GASCAN_SSH_ENABLED value\n' >&2
+        exit 1
+        ;;
+esac

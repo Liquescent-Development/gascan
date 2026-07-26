@@ -72,6 +72,92 @@ async fn existing_up_reports_apply_required_without_executing_tool_changes() -> 
 }
 
 #[tokio::test]
+async fn image_replace_reuses_unchanged_persistent_tools_without_reinstalling() -> TestResult {
+    let old_image = "ghcr.io/liquescent-development/gascan/workspace:old@sha256:\
+                     bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    write_manifest(root, &[("node", "lts")])?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (
+                br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
+                Vec::new(),
+                0,
+            ),
+            (
+                br#"{"source":"bundled","revision":"initial"}"#.to_vec(),
+                Vec::new(),
+                0,
+            ),
+        ])
+        .await;
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    );
+    let desired = spec(root, "image-replace-tools")?;
+    service.up(UpRequest::new(desired.clone())).await?;
+    let mut record = service.status(desired.id())?.ok_or("record")?;
+    let prior_tools = record.tool_resolution.clone();
+    record.image_resolution = Some(gascand::ImageResolution::new(
+        1,
+        json!({"digest":old_image}),
+    ));
+    service.store().put_sandbox(&record)?;
+    runtime
+        .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (
+                br#"{"source":"bundled","revision":"replacement"}"#.to_vec(),
+                Vec::new(),
+                0,
+            ),
+        ])
+        .await;
+    let installs_before = runtime
+        .calls()
+        .await
+        .iter()
+        .filter(|call| {
+            matches!(call, RuntimeCall::Exec(request)
+                if request.argv.iter().any(|arg| arg == "install"))
+        })
+        .count();
+
+    service.apply(UpRequest::new(desired.clone())).await?;
+
+    let installs_after = runtime
+        .calls()
+        .await
+        .iter()
+        .filter(|call| {
+            matches!(call, RuntimeCall::Exec(request)
+                if request.argv.iter().any(|arg| arg == "install"))
+        })
+        .count();
+    assert_eq!(installs_after, installs_before);
+    assert_eq!(
+        service
+            .status(desired.id())?
+            .ok_or("replacement record")?
+            .tool_resolution,
+        prior_tools
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn apply_uses_literal_mise_argv_streams_steps_and_persists_exact_versions() -> TestResult {
     let root = tempfile::tempdir()?;
     let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
@@ -89,6 +175,8 @@ async fn apply_uses_literal_mise_argv_streams_steps_and_persists_exact_versions(
     write_manifest(root, &[("python", "3.14"), ("node", "lts")])?;
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
@@ -135,7 +223,26 @@ async fn apply_uses_literal_mise_argv_streams_steps_and_persists_exact_versions(
                 "0700",
                 "/home/workspace/.local/share/mise",
                 "/home/workspace/.cache",
+            ]
+            .as_slice(),
+            [
+                "/usr/bin/sudo",
+                "-n",
+                "/usr/bin/install",
+                "-d",
+                "-o",
+                "root",
+                "-g",
+                "workspace",
+                "-m",
+                "1770",
                 "/home/workspace/.config/gascan",
+            ]
+            .as_slice(),
+            [
+                "/usr/bin/env",
+                "HOME=/home/workspace",
+                "/usr/local/bin/configure-workstation-home",
             ]
             .as_slice(),
             [
@@ -261,6 +368,8 @@ async fn failed_install_retains_applied_state_and_retry_can_succeed() -> TestRes
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), b"install failed".to_vec(), 23),
         ])
         .await;
@@ -278,6 +387,8 @@ async fn failed_install_retains_applied_state_and_retry_can_succeed() -> TestRes
 
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
@@ -326,6 +437,8 @@ async fn verbose_stderr_does_not_fail_successful_tool_install() -> TestResult {
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), vec![b'x'; 2 * 1024 * 1024], 0),
             (
                 br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
@@ -368,6 +481,7 @@ async fn terminal_stderr_is_retained_in_command_failure() -> TestResult {
     stderr.extend_from_slice(TERMINAL.as_bytes());
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
@@ -421,6 +535,7 @@ async fn oversized_stdout_cancels_guest_exec_session() -> TestResult {
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (vec![b'x'; 2 * 1024 * 1024], Vec::new(), 0),
         ])
         .await;
@@ -446,9 +561,11 @@ async fn failed_safe_config_commands_record_fixed_boundary_and_guest_stderr() ->
     const DIAGNOSTIC: &str = "guest command diagnostic";
     let cases = [
         (0, "initialize_managed_volume_roots"),
-        (1, "reset_safe_mise_workdir"),
-        (2, "create_safe_mise_workdir"),
-        (3, "write_safe_mise_config"),
+        (1, "secure_managed_config_root"),
+        (2, "initialize_workstation_home"),
+        (3, "reset_safe_mise_workdir"),
+        (4, "create_safe_mise_workdir"),
+        (5, "write_safe_mise_config"),
     ];
     for (failure_index, action) in cases {
         let root = tempfile::tempdir()?;
@@ -523,7 +640,6 @@ async fn empty_noop_apply_executes_no_guest_commands() -> TestResult {
             "0700",
             "/home/workspace/.local/share/mise",
             "/home/workspace/.cache",
-            "/home/workspace/.config/gascan",
         ])
     );
     let before = runtime.calls().await.len();
@@ -536,6 +652,75 @@ async fn empty_noop_apply_executes_no_guest_commands() -> TestResult {
         runtime.calls().await[before..]
             .iter()
             .all(|call| !matches!(call, RuntimeCall::Exec(_)))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn managed_config_root_remains_writable_but_protects_root_owned_entries() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    write_manifest(root, &[])?;
+    let runtime = FakeRuntime::default();
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    );
+
+    service
+        .up(UpRequest::new(spec(root, "secure-config-root")?))
+        .await?;
+    let execs = runtime
+        .calls()
+        .await
+        .into_iter()
+        .filter_map(|call| match call {
+            RuntimeCall::Exec(request) => Some(request.argv),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(execs.len() >= 3);
+    assert_eq!(
+        execs[0],
+        [
+            "/usr/bin/sudo",
+            "-n",
+            "/usr/bin/install",
+            "-d",
+            "-o",
+            "workspace",
+            "-g",
+            "workspace",
+            "-m",
+            "0700",
+            "/home/workspace/.local/share/mise",
+            "/home/workspace/.cache",
+        ]
+    );
+    assert_eq!(
+        execs[1],
+        [
+            "/usr/bin/sudo",
+            "-n",
+            "/usr/bin/install",
+            "-d",
+            "-o",
+            "root",
+            "-g",
+            "workspace",
+            "-m",
+            "1770",
+            "/home/workspace/.config/gascan",
+        ]
+    );
+    assert_eq!(
+        execs[2],
+        [
+            "/usr/bin/env",
+            "HOME=/home/workspace",
+            "/usr/local/bin/configure-workstation-home",
+        ]
     );
     Ok(())
 }
@@ -559,6 +744,7 @@ async fn duplicate_mise_tool_keys_are_rejected_without_advancing_state() -> Test
     write_manifest(root, &[("node", "lts")])?;
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
@@ -602,6 +788,8 @@ async fn legacy_matching_fingerprint_without_tool_hash_requires_one_explicit_app
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (
                 br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
                 Vec::new(),
@@ -629,6 +817,8 @@ async fn legacy_matching_fingerprint_without_tool_hash_requires_one_explicit_app
     let before = runtime.calls().await.len();
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
@@ -671,6 +861,8 @@ async fn removing_last_tool_writes_empty_config_and_persists_empty_resolution() 
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (
                 br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
                 Vec::new(),
@@ -690,6 +882,8 @@ async fn removing_last_tool_writes_empty_config_and_persists_empty_resolution() 
     let before = runtime.calls().await.len();
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
@@ -777,6 +971,8 @@ async fn missing_container_forces_tool_install_even_when_durable_hash_matches() 
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (
                 br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
                 Vec::new(),
@@ -804,6 +1000,8 @@ async fn missing_container_forces_tool_install_even_when_durable_hash_matches() 
     let before = runtime.calls().await.len();
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),

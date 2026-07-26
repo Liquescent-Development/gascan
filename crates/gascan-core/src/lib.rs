@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+pub mod account;
 pub mod doctor;
 pub mod fake_runtime;
 pub mod gascamp;

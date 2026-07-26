@@ -4,6 +4,28 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 
+candidate_image=
+live_acceptance_file=
+if test -n "${GASCAN_E2E_CANDIDATE_IMAGE_FILE:-}"; then
+  test -f "$GASCAN_E2E_CANDIDATE_IMAGE_FILE" || {
+    printf 'apple e2e: candidate receipt is unavailable\n' >&2
+    exit 1
+  }
+  test "$(wc -l <"$GASCAN_E2E_CANDIDATE_IMAGE_FILE" | tr -d ' ')" = 1 || {
+    printf 'apple e2e: candidate receipt must contain exactly one line\n' >&2
+    exit 1
+  }
+  IFS= read -r candidate_image <"$GASCAN_E2E_CANDIDATE_IMAGE_FILE"
+  printf '%s\n' "$candidate_image" |
+    grep -Eq '^[a-z0-9][a-z0-9._/-]*:[a-zA-Z0-9._-]+@sha256:[0-9a-f]{64}$' || {
+      printf 'apple e2e: candidate receipt is not immutable\n' >&2
+      exit 1
+    }
+  export GASCAN_E2E_CANDIDATE_IMAGE=$candidate_image
+  live_acceptance_file=${GASCAN_E2E_LIVE_ACCEPTANCE_FILE:-"$root/.artifacts/connected-workspace-image-apple-live.txt"}
+  rm -f "$live_acceptance_file"
+fi
+
 cleanup_root=$("$root/scripts/apple-e2e-session-root.sh")
 cargo build -p gascan-e2e --bin gascan-e2e-cli
 trusted_cli=$(realpath "$root/target/debug/gascan-e2e-cli")
@@ -27,16 +49,34 @@ session_root=$(mktemp -d "$cleanup_root/session-XXXXXXXXXXXX")
 chmod 700 "$session_root"
 export GASCAN_E2E_SESSION_ROOT=$session_root
 manifest=
-cleanup() {
+cleanup_scoped() {
+  result=0
+  if test -n "$manifest" && test -f "$manifest"; then
+    "$root/scripts/apple-e2e-cleanup.sh" "$manifest" "$trusted_cli" "$cleanup_root" || result=1
+    manifest=
+  fi
+  if test -e "$session_root" && ! rmdir "$session_root"; then
+    printf 'apple e2e: scoped session root cleanup failed: %s\n' "$session_root" >&2
+    result=1
+  fi
+  return "$result"
+}
+finish() {
   status=$?
   trap - EXIT INT TERM HUP
-  if test -n "$manifest" && test -f "$manifest"; then
-    "$root/scripts/apple-e2e-cleanup.sh" "$manifest" "$trusted_cli" "$cleanup_root" || status=1
-  fi
-  rmdir "$session_root" 2>/dev/null || true
+  cleanup_scoped || status=1
   exit "$status"
 }
-trap cleanup EXIT INT TERM HUP
+on_signal() {
+  status=$1
+  trap - EXIT INT TERM HUP
+  cleanup_scoped || status=1
+  exit "$status"
+}
+trap finish EXIT
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
+trap 'on_signal 129' HUP
 
 for stale in "$cleanup_root"/*.json; do
   test -e "$stale" || continue
@@ -58,6 +98,7 @@ case ${1-} in
     ;;
 esac
 
+accepted_candidate=false
 for test_name in $tests; do
   manifest="$cleanup_root/$test_name-$$.json"
   export GASCAN_E2E_CLEANUP_MANIFEST=$manifest
@@ -66,4 +107,16 @@ for test_name in $tests; do
     "$root/scripts/apple-e2e-cleanup.sh" "$manifest" "$trusted_cli" "$cleanup_root"
   fi
   manifest=
+  if test "$test_name" = apple_apply && test -n "$candidate_image"; then
+    accepted_candidate=true
+  fi
 done
+
+cleanup_scoped
+trap - EXIT INT TERM HUP
+if $accepted_candidate; then
+  mkdir -p "$(dirname "$live_acceptance_file")"
+  live_tmp=$(mktemp "$(dirname "$live_acceptance_file")/.connected-workspace-image-apple-live.XXXXXX")
+  printf '%s\n' "$candidate_image" >"$live_tmp"
+  mv -f "$live_tmp" "$live_acceptance_file"
+fi

@@ -1,8 +1,11 @@
 use camino::Utf8Path;
 use gascan_apple::AppleCommandBuilder;
 use gascan_core::manifest::Manifest;
-use gascan_core::policy::PolicyCompiler;
-use gascan_core::runtime::{NetworkIsolation, RuntimeCapabilities, RuntimeVersion};
+use gascan_core::policy::{ControlPlanePolicy, PolicyCompiler};
+use gascan_core::runtime::{
+    NetworkIsolation, RecreateRequest, ResourceIdentity, ResourceKind, ResourceOwnership,
+    RetainedResources, RuntimeCapabilities, RuntimeResource, RuntimeVersion,
+};
 use gascan_core::sandbox::{SandboxId, SandboxSpec};
 
 fn capabilities() -> RuntimeCapabilities {
@@ -25,6 +28,31 @@ fn request(name: &str, manifest: &str) -> (tempfile::TempDir, gascan_core::runti
     let manifest = Manifest::load(root).expect("load translation manifest");
     let spec = SandboxSpec::from_root(name, root, manifest).expect("build sealed sandbox spec");
     let request = PolicyCompiler::compile(spec, &capabilities()).expect("compile policy");
+    (temp, request)
+}
+
+fn ssh_request() -> (tempfile::TempDir, gascan_core::runtime::CreateRequest) {
+    let temp = tempfile::tempdir().expect("temporary SSH translation root");
+    let root = Utf8Path::from_path(temp.path()).expect("UTF-8 temporary path");
+    std::fs::write(
+        root.join("gascan.toml"),
+        "version = 1\nnetwork = 'networked'\n",
+    )
+    .expect("write SSH translation manifest");
+    let manifest = Manifest::load(root).expect("load SSH translation manifest");
+    let spec =
+        SandboxSpec::from_root("ssh", root, manifest).expect("build sealed SSH sandbox spec");
+    let request = PolicyCompiler::compile_with_control_plane(
+        spec,
+        &capabilities(),
+        ControlPlanePolicy {
+            ssh_authorized_key: Some(
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB",
+            ),
+            ssh_host_port: Some(22222),
+        },
+    )
+    .expect("compile SSH policy");
     (temp, request)
 }
 
@@ -89,6 +117,53 @@ fn networked_create_uses_the_managed_network_and_loopback_publish() {
             .args
             .windows(2)
             .any(|pair| pair == ["--network", "default"])
+    );
+}
+
+#[test]
+fn networked_ssh_create_publishes_guest_port_22_only_on_ipv4_loopback() {
+    let (_root, request) = ssh_request();
+    let spec = AppleCommandBuilder::create(&request).expect("translate approved SSH request");
+
+    assert!(
+        spec.args
+            .windows(2)
+            .any(|pair| pair == ["--publish", "127.0.0.1:22222:22"])
+    );
+    assert!(!spec.args.iter().any(|argument| {
+        argument.contains("0.0.0.0:22222:22") || argument.contains("[::1]:22222:22")
+    }));
+}
+
+#[test]
+fn retained_create_uses_the_validated_topology_without_resource_create_commands() {
+    let (_root, create) = request("retained-create", "version = 1\nnetwork = 'networked'\n");
+    let mut resources = create
+        .volumes()
+        .iter()
+        .map(|volume| {
+            RuntimeResource::discovered(
+                ResourceIdentity::new(ResourceKind::Volume, volume.name.clone()).unwrap(),
+                Some(create.id().clone()),
+                ResourceOwnership::GasCanOwned,
+            )
+        })
+        .collect::<Vec<_>>();
+    resources.push(RuntimeResource::discovered(
+        ResourceIdentity::new(
+            ResourceKind::Network,
+            create.network().managed_name().unwrap(),
+        )
+        .unwrap(),
+        Some(create.id().clone()),
+        ResourceOwnership::GasCanOwned,
+    ));
+    let retained = RetainedResources::new(&create, resources).unwrap();
+    let recreate = RecreateRequest::new(create.clone(), retained).unwrap();
+
+    assert_eq!(
+        AppleCommandBuilder::create_with_retained(&recreate).unwrap(),
+        AppleCommandBuilder::create(&create).unwrap()
     );
 }
 

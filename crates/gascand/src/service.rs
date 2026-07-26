@@ -1,23 +1,34 @@
 use crate::reconcile::{ReconcileFinding, ReconcileReport};
+use crate::ssh::manager::{
+    HOST_KEY_READ_TIMEOUT, PreparedSshActivation, SshManager, disabled_resolution,
+    is_native_port_collision,
+};
+use crate::ssh::port::AUTOMATIC_PORT_ATTEMPTS;
+use crate::ssh::{
+    PreparedSshCreate, SshConfigCommitError, SshConfigCommitFault, SshPaths, ensure_host_identity,
+};
+use crate::store::SshTransportPolicy;
 use crate::{
     ActualState, DesiredState, ImageResolution, OperationEvent, OperationId, OperationKind,
     OperationRecord, SandboxRecord, SetupResolution, StorageResolution, Store, StoreError,
     ToolResolution,
 };
 use async_trait::async_trait;
-use gascan_core::doctor::{DoctorFacts, DoctorReport};
+use camino::{Utf8Path, Utf8PathBuf};
+use gascan_core::doctor::{DoctorFact, DoctorFacts, DoctorReport, DoctorStatus};
 use gascan_core::manifest::ManifestError;
 use gascan_core::policy::{
-    CONTAINER_PATH, MISE_CACHE_DIR, MISE_DATA_DIR, MISE_GLOBAL_CONFIG_FILE, MISE_SYSTEM_DATA_DIR,
-    PolicyCompiler, PolicyError, WORKSPACE_HOME,
+    CONTAINER_PATH, ControlPlanePolicy, MISE_CACHE_DIR, MISE_DATA_DIR, MISE_GLOBAL_CONFIG_FILE,
+    MISE_SYSTEM_DATA_DIR, PolicyCompiler, PolicyError, WORKSPACE_HOME,
 };
 use gascan_core::provision::{
     AppliedState, ProvisionPlan, ProvisionStep, ProvisioningPlanner, SetupScript,
 };
 use gascan_core::runtime::{
     ContainerState, CreateFailure, CreateOutcome, CreateRequest, ExecInput, ExecOutput,
-    ExecRequest, RemoveRequest, ResourceKind, ResourceOwnership, RuntimeBackend,
-    RuntimeCapabilities, RuntimeError,
+    ExecRequest, RecreateRequest, RemoveRequest, ResourceIdentity, ResourceKind, ResourceOwnership,
+    RetainedResources, RuntimeBackend, RuntimeCapabilities, RuntimeError, RuntimeResource,
+    immutable_image_reference, same_immutable_image,
 };
 use gascan_core::sandbox::{SandboxError, SandboxId, SandboxSpec};
 use serde::de::{Error as _, MapAccess, Visitor};
@@ -25,6 +36,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex, Weak};
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
@@ -44,6 +56,30 @@ struct UpRuntimeContext<'a> {
     operation_id: OperationId,
     sender: &'a mpsc::Sender<OperationEvent>,
     desired_fingerprint: &'a str,
+    requested_storage: StorageCapacities,
+}
+
+struct ImageReplaceContext<'a> {
+    previous_image: &'a str,
+    operation_id: OperationId,
+    sender: &'a mpsc::Sender<OperationEvent>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ImageState {
+    recorded: Option<String>,
+    running: String,
+    approved: String,
+}
+
+impl ImageState {
+    fn change_required(&self) -> bool {
+        !self
+            .recorded
+            .as_deref()
+            .is_some_and(|recorded| same_immutable_image(recorded, &self.approved))
+            || !same_immutable_image(&self.running, &self.approved)
+    }
 }
 
 struct BoundedTail {
@@ -213,9 +249,15 @@ pub struct SandboxService<B: RuntimeBackend> {
     runtime: B,
     store: Store,
     provisioner: Arc<dyn Provisioner>,
+    workspace_image: Option<String>,
     locks: Mutex<HashMap<SandboxId, Weak<AsyncMutex<()>>>>,
     doctor: DoctorState,
     capabilities: tokio::sync::OnceCell<RuntimeCapabilities>,
+    ssh_paths: Option<SshPaths>,
+    ssh_readiness_program: Option<Utf8PathBuf>,
+    ssh_host_key_timeout: std::time::Duration,
+    ssh_config_commit_fault: Option<SshConfigCommitFault>,
+    refresh_ssh_doctor: bool,
 }
 
 #[derive(Clone)]
@@ -298,6 +340,14 @@ pub enum ServiceError {
     Ownership(SandboxId),
     #[error("{}", format_storage_change_message(changes))]
     StorageChangeRequiresRecreate { changes: Vec<StorageCapacityChange> },
+    #[error(
+        "workspace image replacement cannot safely continue: {cause}; current image {current}; requested image {requested}; run `gascan apply` again"
+    )]
+    ImageUpgradeRequired {
+        current: String,
+        requested: String,
+        cause: String,
+    },
     #[error("compiled storage invariant failed: {0}")]
     StorageInvariant(&'static str),
     #[error("provisioning failed: {0}")]
@@ -344,10 +394,34 @@ pub enum ServiceError {
     Fingerprint(String),
     #[error("destroy left expected owned resources for sandbox {0}")]
     IncompleteDestroy(SandboxId),
+    #[error("SSH host port is unavailable: {0}")]
+    SshPortUnavailable(String),
+    #[error("SSH host key verification failed: {0}")]
+    SshHostKeyMismatch(&'static str),
+    #[error("SSH is not ready: {0}")]
+    SshNotReady(&'static str),
+    #[error("SSH configuration is unsafe: {0}")]
+    SshConfigUnsafe(crate::SshError),
+    #[error("SSH configuration update failed: {0}")]
+    SshConfigUpdateFailed(crate::SshError),
+    #[error("SSH configuration publication is uncertain: {0}")]
+    SshConfigPublicationUncertain(SshConfigCommitError),
+    #[error("SSH publication completion is uncertain: {0}")]
+    SshPublicationUncertain(Box<ServiceError>),
     #[error("{original}; rollback failed: {rollback}")]
     Rollback {
         original: Box<ServiceError>,
         rollback: RuntimeError,
+    },
+    #[error("{original}; rollback failed: {rollback}")]
+    ImageRollback {
+        original: Box<ServiceError>,
+        rollback: Box<ServiceError>,
+    },
+    #[error("{original}; recording operation failure failed: {reporting}")]
+    FailureReporting {
+        original: Box<ServiceError>,
+        reporting: Box<ServiceError>,
     },
 }
 
@@ -362,7 +436,10 @@ impl<B: RuntimeBackend> SandboxService<B> {
         provisioner: Arc<dyn Provisioner>,
         doctor: DoctorReport,
     ) -> Self {
-        Self::new_with_doctor_state(runtime, store, provisioner, DoctorState::ready(doctor))
+        let mut service =
+            Self::new_with_doctor_state(runtime, store, provisioner, DoctorState::ready(doctor));
+        service.refresh_ssh_doctor = false;
+        service
     }
 
     pub fn new_with_doctor_state(
@@ -375,9 +452,416 @@ impl<B: RuntimeBackend> SandboxService<B> {
             runtime,
             store,
             provisioner,
+            workspace_image: None,
             locks: Mutex::new(HashMap::new()),
             doctor,
             capabilities: tokio::sync::OnceCell::new(),
+            ssh_paths: None,
+            ssh_readiness_program: None,
+            ssh_host_key_timeout: HOST_KEY_READ_TIMEOUT,
+            ssh_config_commit_fault: None,
+            refresh_ssh_doctor: true,
+        }
+    }
+
+    pub fn new_with_doctor_state_for_image(
+        runtime: B,
+        store: Store,
+        provisioner: Arc<dyn Provisioner>,
+        doctor: DoctorState,
+        workspace_image: String,
+    ) -> Result<Self, PolicyError> {
+        if !immutable_image_reference(&workspace_image) {
+            return Err(PolicyError::InvalidWorkspaceImage);
+        }
+        Ok(Self {
+            runtime,
+            store,
+            provisioner,
+            workspace_image: Some(workspace_image),
+            locks: Mutex::new(HashMap::new()),
+            doctor,
+            capabilities: tokio::sync::OnceCell::new(),
+            ssh_paths: None,
+            ssh_readiness_program: None,
+            ssh_host_key_timeout: HOST_KEY_READ_TIMEOUT,
+            ssh_config_commit_fault: None,
+            refresh_ssh_doctor: true,
+        })
+    }
+
+    fn compile_policy(
+        &self,
+        spec: SandboxSpec,
+        capabilities: &RuntimeCapabilities,
+        ssh: Option<&PreparedSshCreate>,
+    ) -> Result<CreateRequest, PolicyError> {
+        if let Some(ssh) = ssh {
+            PolicyCompiler::compile_for_image_with_control_plane(
+                spec,
+                capabilities,
+                self.workspace_image(),
+                ssh.control_plane(),
+            )
+        } else {
+            PolicyCompiler::compile_for_image(spec, capabilities, self.workspace_image())
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_ssh_for_tests(
+        runtime: B,
+        store: Store,
+        provisioner: Arc<dyn Provisioner>,
+        ssh_paths: SshPaths,
+        readiness_program: Utf8PathBuf,
+    ) -> Self {
+        Self {
+            runtime,
+            store,
+            provisioner,
+            workspace_image: None,
+            locks: Mutex::new(HashMap::new()),
+            doctor: DoctorState::ready(default_doctor_report()),
+            capabilities: tokio::sync::OnceCell::new(),
+            ssh_paths: Some(ssh_paths),
+            ssh_readiness_program: Some(readiness_program),
+            ssh_host_key_timeout: HOST_KEY_READ_TIMEOUT,
+            ssh_config_commit_fault: None,
+            refresh_ssh_doctor: true,
+        }
+    }
+
+    #[doc(hidden)]
+    #[cfg(debug_assertions)]
+    pub fn with_ssh_paths_for_e2e(mut self, ssh_paths: SshPaths) -> Self {
+        self.ssh_paths = Some(ssh_paths);
+        self.refresh_ssh_doctor = true;
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_ssh_doctor_refresh(mut self, enabled: bool) -> Self {
+        self.refresh_ssh_doctor = enabled;
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_ssh_config_commit_fault_for_tests(mut self, fault: SshConfigCommitFault) -> Self {
+        self.ssh_config_commit_fault = Some(fault);
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_ssh_timeouts_for_tests(
+        runtime: B,
+        store: Store,
+        provisioner: Arc<dyn Provisioner>,
+        ssh_paths: SshPaths,
+        readiness_program: Utf8PathBuf,
+        host_key_timeout: std::time::Duration,
+    ) -> Self {
+        Self {
+            runtime,
+            store,
+            provisioner,
+            workspace_image: None,
+            locks: Mutex::new(HashMap::new()),
+            doctor: DoctorState::ready(default_doctor_report()),
+            capabilities: tokio::sync::OnceCell::new(),
+            ssh_paths: Some(ssh_paths),
+            ssh_readiness_program: Some(readiness_program),
+            ssh_host_key_timeout: host_key_timeout,
+            ssh_config_commit_fault: None,
+            refresh_ssh_doctor: true,
+        }
+    }
+
+    fn ssh_paths(&self) -> Result<SshPaths, ServiceError> {
+        self.ssh_paths
+            .clone()
+            .map_or_else(SshPaths::for_user, Ok)
+            .map_err(ServiceError::SshConfigUnsafe)
+    }
+
+    fn ssh_readiness_program(&self) -> &Utf8Path {
+        self.ssh_readiness_program
+            .as_deref()
+            .unwrap_or(Utf8Path::new("/usr/bin/ssh"))
+    }
+
+    async fn prepare_ssh_create(
+        &self,
+        spec: &SandboxSpec,
+    ) -> Result<Option<PreparedSshCreate>, ServiceError> {
+        if !spec.manifest().ssh().enabled() {
+            return Ok(None);
+        }
+        let paths = self.ssh_paths()?;
+        SshManager.prepare_create_for_paths(spec, &paths).await
+    }
+
+    async fn prepare_ssh_activation(
+        &self,
+        id: &SandboxId,
+        expected: Option<&crate::SshResolution>,
+    ) -> Result<Option<PreparedSshActivation>, ServiceError> {
+        let paths = self.ssh_paths()?;
+        SshManager
+            .prepare_activation_for_paths(
+                id,
+                &self.runtime,
+                expected,
+                &paths,
+                self.ssh_readiness_program(),
+                self.ssh_host_key_timeout,
+            )
+            .await
+    }
+
+    async fn deactivate_ssh(&self, id: &SandboxId) -> Result<(), ServiceError> {
+        let paths = self.ssh_paths()?;
+        SshManager.deactivate_for_paths(id, &paths).await
+    }
+
+    async fn activate_and_persist_ssh(
+        &self,
+        id: &SandboxId,
+        prior: Option<crate::SshResolution>,
+        publication: Option<(OperationId, &mpsc::Sender<OperationEvent>)>,
+    ) -> Result<crate::SshResolution, ServiceError> {
+        let expected = prior
+            .as_ref()
+            .filter(|resolution| ssh_resolution_enabled(Some(*resolution)));
+        let prepared =
+            self.prepare_ssh_activation(id, expected)
+                .await?
+                .ok_or(ServiceError::SshNotReady(
+                    "enabled SSH did not produce activation evidence",
+                ))?;
+        let resolution = prepared.resolution();
+        self.database({
+            let id = id.clone();
+            let resolution = resolution.clone();
+            move |store| store.set_ssh_resolution(&id, Some(resolution))
+        })
+        .await?;
+        if let Some((operation_id, sender)) = publication {
+            if let Err(original) = self
+                .emit(
+                    operation_id,
+                    json!({
+                        "phase": "before_ssh_publication",
+                        "resolution_version": resolution.version,
+                    }),
+                    sender,
+                )
+                .await
+            {
+                return Err(self.restore_prior_ssh_resolution(id, prior, original).await);
+            }
+        }
+        if let Err(original) = prepared.commit_with_fault(self.ssh_config_commit_fault) {
+            if original.is_ssh_publication_uncertain() {
+                return Err(original);
+            }
+            return Err(self.restore_prior_ssh_resolution(id, prior, original).await);
+        }
+        Ok(resolution)
+    }
+
+    async fn restore_prior_ssh_resolution(
+        &self,
+        id: &SandboxId,
+        prior: Option<crate::SshResolution>,
+        original: ServiceError,
+    ) -> ServiceError {
+        match self
+            .database({
+                let id = id.clone();
+                move |store| store.set_ssh_resolution(&id, prior)
+            })
+            .await
+        {
+            Ok(()) => original,
+            Err(reporting) => ServiceError::FailureReporting {
+                original: Box::new(original),
+                reporting: Box::new(reporting),
+            },
+        }
+    }
+
+    async fn preflight_recovered_ssh_mapping(&self, id: &SandboxId) -> Result<(), ServiceError> {
+        let runtime = self
+            .runtime
+            .inspect(id)
+            .await?
+            .ok_or_else(|| ServiceError::Missing(id.clone()))?;
+        if runtime.ownership.managed_by != "gascan" || runtime.ownership.sandbox_id != *id {
+            return Err(ServiceError::Ownership(id.clone()));
+        }
+        if runtime.state != ContainerState::Running {
+            return Err(ServiceError::SshNotReady(
+                "SSH recovery requires a running sandbox",
+            ));
+        }
+        let port = inspected_native_ssh_port(&runtime)?;
+        let policy = self
+            .database({
+                let id = id.clone();
+                move |store| store.ssh_transport_policy(&id)
+            })
+            .await?;
+        validate_inspected_ssh_policy(policy, port)
+    }
+
+    async fn verify_exact_ssh_publication(&self) -> Result<(), ServiceError> {
+        let paths = self.ssh_paths()?;
+        let _publication = SshManager.inspection_guard_for_paths(&paths).await?;
+        let records = self.database(|store| store.list_sandboxes()).await?;
+        let mut expected = Vec::new();
+        for record in records {
+            if !ssh_resolution_enabled(record.ssh_resolution.as_ref()) {
+                continue;
+            }
+            let Some(runtime) = self.runtime.inspect(&record.id).await? else {
+                continue;
+            };
+            if runtime.ownership.managed_by != "gascan" || runtime.ownership.sandbox_id != record.id
+            {
+                return Err(ServiceError::Ownership(record.id));
+            }
+            if runtime.state != ContainerState::Running {
+                continue;
+            }
+            let port = inspected_native_ssh_port(&runtime)?;
+            let policy = self
+                .database({
+                    let id = record.id.clone();
+                    move |store| store.ssh_transport_policy(&id)
+                })
+                .await?;
+            validate_inspected_ssh_policy(policy, port)?;
+            expected.push((
+                record.id,
+                record.ssh_resolution.ok_or(ServiceError::SshNotReady(
+                    "durable SSH resolution is missing",
+                ))?,
+                Some(port),
+            ));
+        }
+        let snapshot = SshManager.published_snapshot_for_paths(&paths).await?;
+        let borrowed = expected
+            .iter()
+            .map(|(id, resolution, port)| (id, resolution, *port))
+            .collect::<Vec<_>>();
+        snapshot.validate_exact(&borrowed)
+    }
+
+    async fn mark_ssh_publication(
+        &self,
+        operation_id: OperationId,
+        resolution: &crate::SshResolution,
+        sender: &mpsc::Sender<OperationEvent>,
+    ) -> Result<(), ServiceError> {
+        self.emit(
+            operation_id,
+            json!({
+                "phase": "after_ssh_publication",
+                "resolution_version": resolution.version,
+            }),
+            sender,
+        )
+        .await
+        .map_err(|error| ServiceError::SshPublicationUncertain(Box::new(error)))
+    }
+
+    async fn disable_and_persist_ssh(
+        &self,
+        id: &SandboxId,
+        prior: Option<crate::SshResolution>,
+    ) -> Result<crate::SshResolution, ServiceError> {
+        if ssh_resolution_enabled(prior.as_ref()) {
+            self.deactivate_ssh(id).await?;
+        }
+        let resolution = disabled_resolution();
+        self.database({
+            let id = id.clone();
+            let resolution = resolution.clone();
+            move |store| store.set_ssh_resolution(&id, Some(resolution))
+        })
+        .await?;
+        Ok(resolution)
+    }
+
+    async fn rollback_create_for_inspected_transport(
+        &self,
+        create: CreateRequest,
+        runtime: &gascan_core::runtime::RuntimeSandbox,
+        prior_policy: Option<SshTransportPolicy>,
+    ) -> Result<CreateRequest, ServiceError> {
+        let mappings = runtime
+            .ports()
+            .iter()
+            .filter(|mapping| mapping.guest_port == 22)
+            .collect::<Vec<_>>();
+        let enabled =
+            !mappings.is_empty() || prior_policy.is_some_and(SshTransportPolicy::is_enabled);
+        if !enabled {
+            return PolicyCompiler::restore_ssh_transport(create, None).map_err(Into::into);
+        }
+        let [mapping] = mappings.as_slice() else {
+            return Err(ServiceError::SshNotReady(
+                "prior native SSH transport is not uniquely observable",
+            ));
+        };
+        if !mapping.host_address.is_loopback() || mapping.host_port < 1024 {
+            return Err(ServiceError::SshNotReady(
+                "prior native SSH transport is not uniquely observable",
+            ));
+        }
+        let paths = self.ssh_paths()?;
+        let identity = ensure_host_identity(&paths)
+            .await
+            .map_err(ServiceError::SshConfigUnsafe)?;
+        PolicyCompiler::restore_ssh_transport(
+            create,
+            Some(ControlPlanePolicy {
+                ssh_authorized_key: Some(identity.public_key()),
+                ssh_host_port: Some(mapping.host_port),
+            }),
+        )
+        .map_err(Into::into)
+    }
+
+    async fn restore_prior_ssh(
+        &self,
+        id: &SandboxId,
+        enabled: bool,
+        prior: Option<crate::SshResolution>,
+    ) -> Result<crate::SshResolution, ServiceError> {
+        if enabled {
+            self.activate_and_persist_ssh(id, prior, None).await
+        } else {
+            self.deactivate_ssh(id).await?;
+            let resolution = prior
+                .filter(|resolution| !ssh_resolution_enabled(Some(resolution)))
+                .unwrap_or_else(disabled_resolution);
+            self.database({
+                let id = id.clone();
+                let resolution = resolution.clone();
+                move |store| store.set_ssh_resolution(&id, Some(resolution))
+            })
+            .await?;
+            Ok(resolution)
+        }
+    }
+
+    #[must_use]
+    pub fn workspace_image(&self) -> &str {
+        match &self.workspace_image {
+            Some(image) => image,
+            None => PolicyCompiler::workspace_image(),
         }
     }
 
@@ -455,21 +939,47 @@ impl<B: RuntimeBackend> SandboxService<B> {
     pub fn status(&self, id: &SandboxId) -> Result<Option<SandboxRecord>, ServiceError> {
         Ok(self.store.sandbox(id)?)
     }
+
+    pub(crate) async fn published_ssh_snapshot(
+        &self,
+    ) -> Result<crate::PublishedSshSnapshot, ServiceError> {
+        let paths = self.ssh_paths()?;
+        SshManager.published_snapshot_for_paths(&paths).await
+    }
     pub fn latest_operation(&self) -> Result<Option<OperationRecord>, ServiceError> {
         Ok(self.store.latest_operation()?)
     }
 
     pub async fn doctor_report(&self) -> DoctorReport {
-        self.doctor.report().await
+        let mut report = self.doctor.report().await;
+        if !self.refresh_ssh_doctor {
+            return report;
+        }
+        let native_publish = report
+            .check("runtime.loopback_publish")
+            .is_some_and(|check| check.status == DoctorStatus::Pass);
+        let ssh = match self.ssh_paths.as_ref() {
+            Some(paths) => {
+                crate::ssh_doctor_facts_for_paths(
+                    paths,
+                    std::path::Path::new("/usr/bin/ssh"),
+                    &self.store,
+                    native_publish,
+                )
+                .await
+            }
+            None => crate::ssh_doctor_facts(&self.store, native_publish).await,
+        };
+        replace_doctor_fact(&mut report, "ssh.client", ssh.client);
+        replace_doctor_fact(&mut report, "ssh.identity", ssh.identity);
+        replace_doctor_fact(&mut report, "ssh.config", ssh.config);
+        replace_doctor_fact(&mut report, "ssh.native_publish", ssh.native_publish);
+        report
     }
 
     pub async fn require_runtime_ready(&self) -> Result<(), ServiceError> {
         let report = self.doctor_report().await;
-        if let Some(check) = report
-            .checks
-            .into_iter()
-            .find(|check| check.status != gascan_core::doctor::DoctorStatus::Pass)
-        {
+        if let Some(check) = report.runtime_readiness_failure() {
             return Err(ServiceError::Runtime(RuntimeError::UnsupportedCapability {
                 capability: format!("{}: {}; remedy: {}", check.id, check.detail, check.remedy),
             }));
@@ -537,12 +1047,19 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let lock = self.keyed_lock(&id)?;
         let _guard = lock.lock().await;
         let capabilities = self.runtime_capabilities().await?;
-        let create = PolicyCompiler::compile(request.spec.clone(), capabilities)?;
+        let create = self.compile_policy(request.spec.clone(), capabilities, None)?;
+        let requested_ssh_transport = requested_ssh_transport(&request.spec);
         let requested_storage = requested_storage(&create)?;
         let existing = self
             .database({
                 let id = id.clone();
                 move |store| store.sandbox(&id)
+            })
+            .await?;
+        let prior_ssh_transport = self
+            .database({
+                let id = id.clone();
+                move |store| store.ssh_transport_policy(&id)
             })
             .await?;
         if let Some(prior) = existing
@@ -562,6 +1079,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             tool_resolution: None,
             image_resolution: Some(ImageResolution::new(1, json!({"digest": create.image()}))),
             storage_resolution: None,
+            ssh_resolution: None,
             last_operation_id: None,
             updated_at_millis: 0,
         });
@@ -594,18 +1112,20 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let result = self
             .up_runtime(
                 &request.spec,
-                &create,
+                create,
+                capabilities,
                 prior.as_ref(),
-                requested_storage,
+                prior_ssh_transport,
                 UpRuntimeContext {
                     operation_id: operation.id,
                     sender: &sender,
                     desired_fingerprint: &desired_fingerprint,
+                    requested_storage,
                 },
             )
             .await;
         match result {
-            Ok((actual, provisioned)) => {
+            Ok((actual, provisioned, ssh_resolution, ssh_transport_applied)) => {
                 if let Some(provisioned) = provisioned {
                     let resolution = provisioned.resolution;
                     record.setup_resolution = Some(SetupResolution::new(
@@ -618,10 +1138,18 @@ impl<B: RuntimeBackend> SandboxService<B> {
                     ));
                 }
                 record.storage_resolution = Some(storage_resolution(requested_storage));
+                if let Some(ssh_resolution) = ssh_resolution {
+                    record.ssh_resolution = Some(ssh_resolution);
+                }
                 record.actual_state = actual;
                 self.database({
                     let record = record.clone();
-                    move |store| store.put_sandbox(&record)
+                    let ssh_transport = if ssh_transport_applied {
+                        Some(requested_ssh_transport)
+                    } else {
+                        prior_ssh_transport
+                    };
+                    move |store| store.put_sandbox_with_ssh_transport(&record, ssh_transport)
                 })
                 .await?;
                 let terminal = self
@@ -641,11 +1169,23 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 };
                 let code = error.code();
                 let details = failure_details(&error);
-                self.database(move |store| {
-                    store.fail_operation(operation.id, actual, code, details)
-                })
-                .await?;
-                self.send_terminal(operation.id, &sender).await?;
+                if let Err(reporting) = self
+                    .database(move |store| {
+                        store.fail_operation(operation.id, actual, code, details)
+                    })
+                    .await
+                {
+                    return Err(ServiceError::FailureReporting {
+                        original: Box::new(error),
+                        reporting: Box::new(reporting),
+                    });
+                }
+                if let Err(reporting) = self.send_terminal(operation.id, &sender).await {
+                    return Err(ServiceError::FailureReporting {
+                        original: Box::new(error),
+                        reporting: Box::new(reporting),
+                    });
+                }
                 Err(error)
             }
         }
@@ -654,15 +1194,25 @@ impl<B: RuntimeBackend> SandboxService<B> {
     async fn up_runtime(
         &self,
         spec: &SandboxSpec,
-        create: &CreateRequest,
+        mut create: CreateRequest,
+        capabilities: &RuntimeCapabilities,
         prior: Option<&SandboxRecord>,
-        requested_storage: StorageCapacities,
+        prior_ssh_transport: Option<SshTransportPolicy>,
         context: UpRuntimeContext<'_>,
-    ) -> Result<(ActualState, Option<ProvisionedResolution>), ServiceError> {
+    ) -> Result<
+        (
+            ActualState,
+            Option<ProvisionedResolution>,
+            Option<crate::SshResolution>,
+            bool,
+        ),
+        ServiceError,
+    > {
         let UpRuntimeContext {
             operation_id,
             sender,
             desired_fingerprint,
+            requested_storage,
         } = context;
         let id = spec.id();
         let inspected = self.runtime.inspect(id).await?;
@@ -671,21 +1221,121 @@ impl<B: RuntimeBackend> SandboxService<B> {
             if runtime.ownership.managed_by != "gascan" || runtime.ownership.sandbox_id != *id {
                 return Err(ServiceError::Ownership(id.clone()));
             }
-        } else {
-            match self.runtime.create(create.clone()).await {
-                Ok(outcome) => {
-                    if let Err(error) = self.persist_created_storage(id, requested_storage).await {
-                        return Err(self.rollback_created(id, outcome, error).await);
-                    }
-                    created = Some(outcome);
+            let state = image_state(prior, &runtime.image, create.image())?;
+            if state.change_required() {
+                self.emit(
+                    operation_id,
+                    json!({
+                        "phase": "apply_required",
+                        "reason": "image_changed",
+                        "recorded_image": state.recorded,
+                        "running_image": state.running,
+                        "approved_image": state.approved,
+                    }),
+                    sender,
+                )
+                .await?;
+                let actual = match runtime.state {
+                    ContainerState::Creating => ActualState::Creating,
+                    ContainerState::Running => ActualState::Running,
+                    ContainerState::Stopped => ActualState::Stopped,
+                };
+                let ssh_resolution = prior.and_then(|record| record.ssh_resolution.clone());
+                return Ok((actual, None, ssh_resolution, false));
+            }
+            let has_complete_resolution = prior.is_some_and(|record| {
+                record.setup_resolution.is_some() && record.tool_resolution.is_some()
+            });
+            let ssh_transport_changed = match prior {
+                Some(prior) => ssh_transport_policy_changed(
+                    prior,
+                    runtime,
+                    spec,
+                    prior_ssh_transport.as_ref(),
+                    has_complete_resolution,
+                    false,
+                ),
+                _ => runtime_ssh_transport_changed(runtime, spec),
+            };
+            if ssh_transport_changed {
+                self.emit(
+                    operation_id,
+                    json!({
+                        "phase": "apply_required",
+                        "reason": "ssh_transport_changed",
+                    }),
+                    sender,
+                )
+                .await?;
+                let actual = match runtime.state {
+                    ContainerState::Creating => ActualState::Creating,
+                    ContainerState::Running => ActualState::Running,
+                    ContainerState::Stopped => ActualState::Stopped,
+                };
+                let ssh_resolution = prior.and_then(|record| record.ssh_resolution.clone());
+                return Ok((actual, None, ssh_resolution, false));
+            }
+        }
+        let mut prepared_ssh = self.prepare_ssh_create(spec).await?;
+        create = self.compile_policy(spec.clone(), capabilities, prepared_ssh.as_ref())?;
+        if inspected.is_none() {
+            let automatic_ssh =
+                spec.manifest().ssh().enabled() && spec.manifest().ssh().host_port().is_none();
+            let mut attempts = 0;
+            loop {
+                attempts += 1;
+                if let Some(ssh) = prepared_ssh.as_mut() {
+                    ssh.release_reservation();
                 }
-                Err(failure) => {
-                    if !failure.created().is_empty() {
-                        self.runtime
-                            .remove(RemoveRequest::from_resources(failure.created().to_vec())?)
-                            .await?;
+                match self.runtime.create(create.clone()).await {
+                    Ok(outcome) => {
+                        if let Err(error) = self
+                            .persist_created_state(
+                                id,
+                                requested_storage,
+                                requested_ssh_transport(spec),
+                            )
+                            .await
+                        {
+                            return Err(self.rollback_created(id, outcome, error).await);
+                        }
+                        created = Some(outcome);
+                        break;
                     }
-                    return Err(ServiceError::Create(failure));
+                    Err(failure) => {
+                        let partial = failure.created().to_vec();
+                        if !partial.is_empty() {
+                            if let Err(rollback) = self
+                                .runtime
+                                .remove(RemoveRequest::from_resources(partial)?)
+                                .await
+                            {
+                                return Err(ServiceError::Rollback {
+                                    original: Box::new(ServiceError::Create(failure)),
+                                    rollback,
+                                });
+                            }
+                        }
+                        let collision = prepared_ssh.as_ref().is_some_and(|ssh| {
+                            is_native_port_collision(&failure, ssh.host_port(), &create)
+                        });
+                        let original = ServiceError::Create(failure);
+                        if collision {
+                            if !automatic_ssh || attempts == AUTOMATIC_PORT_ATTEMPTS {
+                                return Err(ServiceError::SshPortUnavailable(format!(
+                                    "native loopback port collision after {attempts} create attempt(s)"
+                                )));
+                            }
+                            prepared_ssh = self.prepare_ssh_create(spec).await?;
+                            create = self.compile_policy(
+                                spec.clone(),
+                                capabilities,
+                                prepared_ssh.as_ref(),
+                            )?;
+                            continue;
+                        }
+                        return Err(original);
+                    }
                 }
             }
             self.emit(operation_id, json!({"phase":"created"}), sender)
@@ -702,9 +1352,11 @@ impl<B: RuntimeBackend> SandboxService<B> {
             }
             self.emit(operation_id, json!({"phase":"started"}), sender)
                 .await?;
+            let image_state = image_state(prior, &current.image, create.image())?;
             let durable_match = if let Some(record) = prior.filter(|_| inspected.is_some()) {
                 resolution_matches(record, desired_fingerprint)
                     && tool_state_matches(record, spec.canonical_root(), spec.manifest())?
+                    && !image_state.change_required()
             } else {
                 false
             };
@@ -737,7 +1389,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 let provisioned = self
                     .provision_explicit(
                         spec,
-                        create,
+                        &create,
                         prior_for_provision,
                         operation_id,
                         sender,
@@ -751,12 +1403,44 @@ impl<B: RuntimeBackend> SandboxService<B> {
             self.emit(operation_id, json!({"phase":"before_health","step":ProvisionStep::HealthCheck.as_str()}), sender).await?;
             self.provisioner.health_check(id).await?;
             self.emit(operation_id, json!({"phase":"after_health","desired_fingerprint":desired_fingerprint}), sender).await?;
-            Ok::<_, ServiceError>(provisioned)
+            let prior_ssh = prior
+                .filter(|_| inspected.is_some())
+                .and_then(|record| record.ssh_resolution.clone());
+            let ssh_resolution = if spec.manifest().ssh().enabled() {
+                let resolution = self
+                    .activate_and_persist_ssh(id, prior_ssh, Some((operation_id, sender)))
+                    .await?;
+                self.verify_exact_ssh_publication()
+                    .await
+                    .map_err(|error| ServiceError::SshPublicationUncertain(Box::new(error)))?;
+                self.emit(
+                    operation_id,
+                    json!({
+                        "phase": "before_ssh_publication_marker",
+                        "resolution_version": resolution.version,
+                    }),
+                    sender,
+                )
+                .await
+                .map_err(|error| ServiceError::SshPublicationUncertain(Box::new(error)))?;
+                self.mark_ssh_publication(operation_id, &resolution, sender)
+                    .await?;
+                resolution
+            } else {
+                self.disable_and_persist_ssh(id, prior_ssh).await?
+            };
+            Ok::<_, ServiceError>((provisioned, ssh_resolution))
         }
         .await;
         match result {
-            Ok(provisioned) => Ok((ActualState::Running, provisioned)),
+            Ok((provisioned, ssh_resolution)) => Ok((
+                ActualState::Running,
+                provisioned,
+                Some(ssh_resolution),
+                true,
+            )),
             Err(error) if error.is_setup_failure() => Err(error),
+            Err(error) if error.is_ssh_publication_uncertain() => Err(error),
             Err(error) if created.is_some() => {
                 if let Some(outcome) = created {
                     return Err(self.rollback_created(id, outcome, error).await);
@@ -764,8 +1448,10 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 Err(error)
             }
             Err(error) => {
-                if self.runtime.inspect(id).await?.is_some() {
-                    let _ = self.runtime.stop(id).await;
+                if self.deactivate_ssh(id).await.is_ok() {
+                    if let Ok(Some(_)) = self.runtime.inspect(id).await {
+                        let _ = self.runtime.stop(id).await;
+                    }
                 }
                 Err(error)
             }
@@ -781,6 +1467,19 @@ impl<B: RuntimeBackend> SandboxService<B> {
         sender: &mpsc::Sender<OperationEvent>,
     ) -> Result<ProvisionedResolution, ServiceError> {
         let applied = applied_state(prior);
+        self.provision_with_applied(spec, create, prior, applied, operation_id, sender)
+            .await
+    }
+
+    async fn provision_with_applied(
+        &self,
+        spec: &SandboxSpec,
+        create: &CreateRequest,
+        prior: Option<&SandboxRecord>,
+        applied: AppliedState,
+        operation_id: OperationId,
+        sender: &mpsc::Sender<OperationEvent>,
+    ) -> Result<ProvisionedResolution, ServiceError> {
         let plan =
             ProvisioningPlanner::plan_for_root(spec.canonical_root(), spec.manifest(), &applied)
                 .map_err(|_| ServiceError::Provision("could not plan provisioning".to_owned()))?;
@@ -830,10 +1529,338 @@ impl<B: RuntimeBackend> SandboxService<B> {
         })
     }
 
-    async fn persist_created_storage(
+    async fn retained_resources(
+        &self,
+        create: &CreateRequest,
+    ) -> Result<(RuntimeResource, RetainedResources), ServiceError> {
+        let resources = self.runtime.list_resources().await?;
+        let container = exact_owned_container(create, &resources)?.ok_or_else(|| {
+            ServiceError::Runtime(RuntimeError::InvalidState {
+                resource: create.id().to_string(),
+                message: "expected exactly one owned container resource".to_owned(),
+            })
+        })?;
+        let retained = resources
+            .into_iter()
+            .filter(|resource| {
+                resource.ownership() == ResourceOwnership::GasCanOwned
+                    && resource.sandbox_id() == Some(create.id())
+                    && resource.kind() != ResourceKind::Container
+            })
+            .collect();
+        Ok((
+            container,
+            RetainedResources::new(create, retained).map_err(ServiceError::Runtime)?,
+        ))
+    }
+
+    async fn remove_exact_container(
+        &self,
+        create: &CreateRequest,
+        container: RuntimeResource,
+    ) -> Result<(), ServiceError> {
+        if let Some(runtime) = self.runtime.inspect(create.id()).await? {
+            if runtime.ownership.managed_by != "gascan"
+                || runtime.ownership.sandbox_id != *create.id()
+            {
+                return Err(ServiceError::Ownership(create.id().clone()));
+            }
+            if runtime.state == ContainerState::Running {
+                self.runtime.stop(create.id()).await?;
+            }
+        }
+        self.runtime
+            .remove(RemoveRequest::from_resources(vec![container])?)
+            .await?;
+        Ok(())
+    }
+
+    async fn rollback_image(
+        &self,
+        create: &CreateRequest,
+        previous_image: &str,
+        retained: RetainedResources,
+        operation_id: OperationId,
+        sender: &mpsc::Sender<OperationEvent>,
+    ) -> Result<(), ServiceError> {
+        let resources = self.runtime.list_resources().await?;
+        let container = exact_owned_container(create, &resources)?;
+        if let Some(container) = container {
+            self.remove_exact_container(create, container).await?;
+        }
+        let rollback =
+            RecreateRequest::for_image(create.clone(), previous_image.to_owned(), retained)?;
+        self.runtime
+            .create_container(rollback)
+            .await
+            .map_err(ServiceError::Create)?;
+        self.runtime.start(create.id()).await?;
+        self.emit(
+            operation_id,
+            json!({"phase":"image_rollback","image":previous_image}),
+            sender,
+        )
+        .await
+    }
+
+    async fn replace_image(
+        &self,
+        spec: &SandboxSpec,
+        mut create: CreateRequest,
+        mut prepared_ssh: Option<PreparedSshCreate>,
+        capabilities: &RuntimeCapabilities,
+        prior_ssh_transport: Option<SshTransportPolicy>,
+        context: ImageReplaceContext<'_>,
+    ) -> Result<(ProvisionedResolution, crate::SshResolution, CreateRequest), ServiceError> {
+        let ImageReplaceContext {
+            previous_image,
+            operation_id,
+            sender,
+        } = context;
+        self.emit(
+            operation_id,
+            json!({"phase":"before_image_replace","previous_image":previous_image,"approved_image":create.image()}),
+            sender,
+        )
+        .await?;
+        self.runtime.prepare_image(create.image()).await?;
+        let prior = self
+            .database({
+                let id = create.id().clone();
+                move |store| store.sandbox(&id)
+            })
+            .await?
+            .ok_or_else(|| ServiceError::Missing(create.id().clone()))?;
+        let runtime = self
+            .runtime
+            .inspect(create.id())
+            .await?
+            .ok_or_else(|| ServiceError::Missing(create.id().clone()))?;
+        let rollback_create = self
+            .rollback_create_for_inspected_transport(create.clone(), &runtime, prior_ssh_transport)
+            .await?;
+        let (container, retained) = self
+            .replacement_evidence(&create, &runtime, previous_image)
+            .await?;
+        let rollback_retained = retained.clone();
+        self.emit(
+            operation_id,
+            json!({"phase":"image_replacing","image":create.image()}),
+            sender,
+        )
+        .await?;
+        let mut mutation_started = false;
+        let result = async {
+            mutation_started = true;
+            if ssh_resolution_enabled(prior.ssh_resolution.as_ref()) {
+                self.deactivate_ssh(create.id()).await?;
+            }
+            if runtime.state == ContainerState::Running {
+                self.runtime.stop(create.id()).await?;
+            }
+            self.runtime
+                .remove(RemoveRequest::from_resources(vec![container])?)
+                .await?;
+            let automatic_ssh =
+                spec.manifest().ssh().enabled() && spec.manifest().ssh().host_port().is_none();
+            let mut attempts = 0;
+            loop {
+                attempts += 1;
+                if let Some(ssh) = prepared_ssh.as_mut() {
+                    ssh.release_reservation();
+                }
+                let recreate = RecreateRequest::new(create.clone(), retained.clone())?;
+                match self.runtime.create_container(recreate).await {
+                    Ok(_) => break,
+                    Err(failure) => {
+                        let partial = failure.created().to_vec();
+                        if !partial.is_empty() {
+                            let [container] = partial.as_slice() else {
+                                return Err(ServiceError::ImageRollback {
+                                    original: Box::new(ServiceError::Create(failure)),
+                                    rollback: Box::new(ServiceError::Runtime(
+                                        RuntimeError::InvalidState {
+                                            resource: create.id().to_string(),
+                                            message:
+                                                "replacement failure returned non-container evidence"
+                                                    .to_owned(),
+                                        },
+                                    )),
+                                });
+                            };
+                            let expected = ResourceIdentity::new(
+                                ResourceKind::Container,
+                                create.id().to_string(),
+                            )?;
+                            if container.identity() != &expected {
+                                return Err(ServiceError::ImageRollback {
+                                    original: Box::new(ServiceError::Create(failure)),
+                                    rollback: Box::new(ServiceError::Runtime(
+                                        RuntimeError::OwnershipMismatch {
+                                            resource: container.name().to_owned(),
+                                        },
+                                    )),
+                                });
+                            }
+                            if let Err(rollback) =
+                                self.remove_exact_container(&create, container.clone()).await
+                            {
+                                return Err(ServiceError::ImageRollback {
+                                    original: Box::new(ServiceError::Create(failure)),
+                                    rollback: Box::new(rollback),
+                                });
+                            }
+                        }
+                        let collision = prepared_ssh.as_ref().is_some_and(|ssh| {
+                            is_native_port_collision(&failure, ssh.host_port(), &create)
+                        });
+                        let original = ServiceError::Create(failure);
+                        if collision {
+                            if !automatic_ssh || attempts == AUTOMATIC_PORT_ATTEMPTS {
+                                return Err(ServiceError::SshPortUnavailable(format!(
+                                    "native loopback port collision after {attempts} replacement create attempt(s)"
+                                )));
+                            }
+                            prepared_ssh = self.prepare_ssh_create(spec).await?;
+                            create = self.compile_policy(
+                                spec.clone(),
+                                capabilities,
+                                prepared_ssh.as_ref(),
+                            )?;
+                            continue;
+                        }
+                        return Err(original);
+                    }
+                }
+            }
+            self.runtime.start(create.id()).await?;
+            self.emit(operation_id, json!({"phase":"before_provision"}), sender)
+                .await?;
+            let provisioned = self
+                .provision_with_applied(
+                    spec,
+                    &create,
+                    Some(&prior),
+                    replacement_applied_state(&prior),
+                    operation_id,
+                    sender,
+                )
+                .await?;
+            self.emit(
+                operation_id,
+                json!({
+                    "phase":"after_provision",
+                    "resolution_version":1,
+                    "setup":provisioned.resolution.setup,
+                    "tools":provisioned.resolution.tools,
+                    "tool_hash":provisioned.tool_hash,
+                }),
+                sender,
+            )
+            .await?;
+            self.emit(
+                operation_id,
+                json!({"phase":"before_health","step":ProvisionStep::HealthCheck.as_str()}),
+                sender,
+            )
+            .await?;
+            self.provisioner.health_check(create.id()).await?;
+            self.emit(operation_id, json!({"phase":"after_health"}), sender)
+                .await?;
+            let prior_ssh = prior.ssh_resolution.clone();
+            let ssh_resolution = if spec.manifest().ssh().enabled() {
+                self.activate_and_persist_ssh(create.id(), prior_ssh, None)
+                    .await?
+            } else {
+                self.disable_and_persist_ssh(create.id(), prior_ssh).await?
+            };
+            self.emit(
+                operation_id,
+                json!({"phase":"image_replaced","image":create.image()}),
+                sender,
+            )
+            .await?;
+            self.emit(
+                operation_id,
+                json!({"phase":"after_image_replace","image":create.image()}),
+                sender,
+            )
+            .await?;
+            Ok::<_, ServiceError>((provisioned, ssh_resolution, rollback_create.clone()))
+        }
+        .await;
+        match result {
+            Ok(result) => Ok(result),
+            Err(original) if mutation_started => {
+                match self
+                    .rollback_image(
+                        &rollback_create,
+                        previous_image,
+                        rollback_retained,
+                        operation_id,
+                        sender,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        let rollback_enabled = create_request_ssh_enabled(&rollback_create);
+                        if let Err(rollback) = self
+                            .restore_prior_ssh(
+                                create.id(),
+                                rollback_enabled,
+                                prior.ssh_resolution.clone(),
+                            )
+                            .await
+                        {
+                            return Err(ServiceError::ImageRollback {
+                                original: Box::new(original),
+                                rollback: Box::new(rollback),
+                            });
+                        }
+                        Err(original)
+                    }
+                    Err(rollback) => Err(ServiceError::ImageRollback {
+                        original: Box::new(original),
+                        rollback: Box::new(rollback),
+                    }),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn replacement_evidence(
+        &self,
+        create: &CreateRequest,
+        runtime: &gascan_core::runtime::RuntimeSandbox,
+        expected_previous: &str,
+    ) -> Result<(RuntimeResource, RetainedResources), ServiceError> {
+        let precondition = |cause: String| ServiceError::ImageUpgradeRequired {
+            current: runtime.image.clone(),
+            requested: create.image().to_owned(),
+            cause,
+        };
+        if runtime.image != expected_previous {
+            return Err(precondition(format!(
+                "runtime image changed after preflight from {expected_previous}"
+            )));
+        }
+        if runtime.ownership.managed_by != "gascan" || runtime.ownership.sandbox_id != *create.id()
+        {
+            return Err(precondition(
+                "sandbox ownership changed after preflight".to_owned(),
+            ));
+        }
+        self.retained_resources(create)
+            .await
+            .map_err(|error| precondition(error.to_string()))
+    }
+
+    async fn persist_created_state(
         &self,
         id: &SandboxId,
         requested_storage: StorageCapacities,
+        requested_ssh_transport: SshTransportPolicy,
     ) -> Result<(), ServiceError> {
         let mut record = self
             .database({
@@ -843,7 +1870,10 @@ impl<B: RuntimeBackend> SandboxService<B> {
             .await?
             .ok_or_else(|| ServiceError::Missing(id.clone()))?;
         record.storage_resolution = Some(storage_resolution(requested_storage));
-        self.database(move |store| store.put_sandbox(&record)).await
+        self.database(move |store| {
+            store.put_sandbox_with_ssh_transport(&record, Some(requested_ssh_transport))
+        })
+        .await
     }
 
     async fn rollback_created(
@@ -1026,7 +2056,38 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 "0700",
                 MISE_DATA_DIR,
                 "/home/workspace/.cache",
+            ],
+            Vec::new(),
+        )
+        .await?;
+        self.exec_guest(
+            spec.id(),
+            ProvisionStep::WriteSafeMiseConfig,
+            "secure_managed_config_root",
+            [
+                "/usr/bin/sudo",
+                "-n",
+                "/usr/bin/install",
+                "-d",
+                "-o",
+                "root",
+                "-g",
+                "workspace",
+                "-m",
+                "1770",
                 "/home/workspace/.config/gascan",
+            ],
+            Vec::new(),
+        )
+        .await?;
+        self.exec_guest(
+            spec.id(),
+            ProvisionStep::WriteSafeMiseConfig,
+            "initialize_workstation_home",
+            [
+                "/usr/bin/env",
+                "HOME=/home/workspace",
+                "/usr/local/bin/configure-workstation-home",
             ],
             Vec::new(),
         )
@@ -1231,11 +2292,34 @@ impl<B: RuntimeBackend> SandboxService<B> {
             if runtime.ownership.managed_by != "gascan" || runtime.ownership.sandbox_id != *id {
                 return Err(ServiceError::Ownership(id.clone()));
             }
-            match (target, runtime.state) {
-                (ActualState::Running, ContainerState::Running)
-                | (ActualState::Stopped, ContainerState::Stopped) => Ok(()),
-                (ActualState::Running, _) => self.runtime.start(id).await.map_err(Into::into),
-                _ => self.runtime.stop(id).await.map_err(Into::into),
+            match target {
+                ActualState::Running => {
+                    if runtime.state != ContainerState::Running {
+                        self.runtime.start(id).await?;
+                    }
+                    if ssh_resolution_enabled(record.ssh_resolution.as_ref()) {
+                        self.prepare_ssh_activation(id, record.ssh_resolution.as_ref())
+                            .await?
+                            .ok_or(ServiceError::SshNotReady(
+                                "verified SSH resolution did not produce activation evidence",
+                            ))?
+                            .commit()?;
+                    }
+                    Ok(())
+                }
+                ActualState::Stopped => {
+                    if ssh_resolution_enabled(record.ssh_resolution.as_ref()) {
+                        self.deactivate_ssh(id).await?;
+                    }
+                    if runtime.state != ContainerState::Stopped {
+                        self.runtime.stop(id).await?;
+                    }
+                    Ok(())
+                }
+                _ => Err(ServiceError::Runtime(RuntimeError::InvalidState {
+                    resource: id.to_string(),
+                    message: "simple lifecycle target must be running or stopped".to_owned(),
+                })),
             }
         }
         .await;
@@ -1301,6 +2385,9 @@ impl<B: RuntimeBackend> SandboxService<B> {
             .await?;
         let receiver = publish_operation(started, operation.id, receiver);
         let result = async {
+            if ssh_resolution_enabled(record.ssh_resolution.as_ref()) {
+                self.deactivate_ssh(id).await?;
+            }
             if let Some(runtime) = self.runtime.inspect(id).await? {
                 if runtime.ownership.managed_by != "gascan" || runtime.ownership.sandbox_id != *id {
                     return Err(ServiceError::Ownership(id.clone()));
@@ -1353,7 +2440,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             self.send_terminal(operation.id, &sender).await?;
             return Err(error);
         }
-        self.database(move |store| store.complete_operation(operation.id, ActualState::Absent))
+        self.database(move |store| store.complete_destroy_operation(operation.id))
             .await?;
         self.send_terminal(operation.id, &sender).await?;
         Ok(receiver.map(|events| Operation {
@@ -1385,7 +2472,10 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let lock = self.keyed_lock(&id)?;
         let _guard = lock.lock().await;
         let capabilities = self.runtime_capabilities().await?;
-        let create = PolicyCompiler::compile(request.spec.clone(), capabilities)?;
+        let prepared_ssh = self.prepare_ssh_create(&request.spec).await?;
+        let create =
+            self.compile_policy(request.spec.clone(), capabilities, prepared_ssh.as_ref())?;
+        let requested_ssh_transport = requested_ssh_transport(&request.spec);
         let requested_storage = requested_storage(&create)?;
         let mut record = self
             .database({
@@ -1394,6 +2484,12 @@ impl<B: RuntimeBackend> SandboxService<B> {
             })
             .await?
             .ok_or_else(|| ServiceError::Missing(id.clone()))?;
+        let prior_ssh_transport = self
+            .database({
+                let id = id.clone();
+                move |store| store.ssh_transport_policy(&id)
+            })
+            .await?;
         validate_storage_capacities(&record, requested_storage)?;
         let desired_fingerprint = desired_fingerprint(&request.spec).await?;
         let desired_plan = ProvisioningPlanner::plan_for_root(
@@ -1415,7 +2511,6 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let (sender, receiver) = mpsc::channel(16);
         self.initialize_operation(operation.id, &id, record.actual_state, &sender)
             .await?;
-        let receiver = publish_operation(started, operation.id, receiver);
         let prior_actual = record.actual_state;
         let preflight = async {
             let runtime = self
@@ -1426,25 +2521,229 @@ impl<B: RuntimeBackend> SandboxService<B> {
             if runtime.ownership.managed_by != "gascan" || runtime.ownership.sandbox_id != id {
                 return Err(ServiceError::Ownership(id.clone()));
             }
-            if runtime.state == ContainerState::Running && setup_changed {
+            let image = image_state(Some(&record), &runtime.image, create.image())?;
+            let ssh_policy_changed = ssh_transport_policy_changed(
+                &record,
+                &runtime,
+                &request.spec,
+                prior_ssh_transport.as_ref(),
+                true,
+                true,
+            );
+            if image.change_required() {
+                return Ok::<_, ServiceError>((runtime, image, ssh_policy_changed));
+            }
+            if !ssh_policy_changed && runtime.state == ContainerState::Running && setup_changed {
+                if ssh_resolution_enabled(record.ssh_resolution.as_ref()) {
+                    self.deactivate_ssh(&id).await?;
+                }
                 self.runtime.stop(&id).await?;
                 self.runtime.start(&id).await?;
-            } else if runtime.state != ContainerState::Running {
+            } else if !ssh_policy_changed && runtime.state != ContainerState::Running {
                 self.runtime.start(&id).await?;
             }
-            Ok::<_, ServiceError>(())
+            Ok::<_, ServiceError>((runtime, image, ssh_policy_changed))
         }
         .await;
-        if let Err(error) = preflight {
-            let actual = self.runtime_actual(&id, prior_actual).await;
-            let code = error.code();
-            let details = json!({"message":error.to_string()});
-            self.database(move |store| store.fail_operation(operation.id, actual, code, details))
+        let (runtime, image, ssh_policy_changed) = match preflight {
+            Ok(value) => value,
+            Err(error) => {
+                let actual = self.runtime_actual(&id, prior_actual).await;
+                let code = error.code();
+                let details = json!({"message":error.to_string()});
+                self.database(move |store| {
+                    store.fail_operation(operation.id, actual, code, details)
+                })
                 .await?;
-            self.send_terminal(operation.id, &sender).await?;
-            return Err(error);
+                self.send_terminal(operation.id, &sender).await?;
+                return Err(error);
+            }
+        };
+        if image.change_required() || ssh_policy_changed {
+            if let Err(error) = self
+                .replacement_evidence(&create, &runtime, &runtime.image)
+                .await
+            {
+                let actual = self.runtime_actual(&id, prior_actual).await;
+                let code = error.code();
+                let details = failure_details(&error);
+                self.database(move |store| {
+                    store.fail_operation(operation.id, actual, code, details)
+                })
+                .await?;
+                self.send_terminal(operation.id, &sender).await?;
+                return Err(error);
+            }
+        }
+        let receiver = publish_operation(started, operation.id, receiver);
+        if image.change_required() || ssh_policy_changed {
+            let previous_record = record.clone();
+            let (provisioned, ssh_resolution, rollback_create) = match self
+                .replace_image(
+                    &request.spec,
+                    create.clone(),
+                    prepared_ssh,
+                    capabilities,
+                    prior_ssh_transport,
+                    ImageReplaceContext {
+                        previous_image: &runtime.image,
+                        operation_id: operation.id,
+                        sender: &sender,
+                    },
+                )
+                .await
+            {
+                Ok(provisioned) => provisioned,
+                Err(error) => {
+                    let actual = self.runtime_actual(&id, prior_actual).await;
+                    let (code, details) =
+                        if matches!(error, ServiceError::ImageUpgradeRequired { .. }) {
+                            (error.code(), failure_details(&error))
+                        } else {
+                            (
+                                gascan_proto::error_code::IMAGE_REPLACEMENT_FAILED,
+                                image_replacement_failure_details(&error),
+                            )
+                        };
+                    if let Err(reporting) = self
+                        .database(move |store| {
+                            store.fail_operation(operation.id, actual, code, details)
+                        })
+                        .await
+                    {
+                        return Err(ServiceError::FailureReporting {
+                            original: Box::new(error),
+                            reporting: Box::new(reporting),
+                        });
+                    }
+                    if let Err(reporting) = self.send_terminal(operation.id, &sender).await {
+                        return Err(ServiceError::FailureReporting {
+                            original: Box::new(error),
+                            reporting: Box::new(reporting),
+                        });
+                    }
+                    return Err(error);
+                }
+            };
+            record.setup_resolution = Some(SetupResolution::new(
+                1,
+                json!({"desired_fingerprint":desired_fingerprint,"resolution":provisioned.resolution.setup}),
+            ));
+            record.tool_resolution = Some(ToolResolution::new(
+                1,
+                json!({"desired_fingerprint":desired_fingerprint,"tool_hash":provisioned.tool_hash,"resolution":provisioned.resolution.tools}),
+            ));
+            record.image_resolution =
+                Some(ImageResolution::new(1, json!({"digest": create.image()})));
+            record.ssh_resolution = Some(ssh_resolution);
+            record.actual_state = ActualState::Running;
+            let commit = async {
+                self.database({
+                    let record = record.clone();
+                    move |store| {
+                        store.put_sandbox_with_ssh_transport(&record, Some(requested_ssh_transport))
+                    }
+                })
+                .await?;
+                self.database(move |store| store.operation_events(operation.id))
+                    .await?;
+                let (_, terminal) = self
+                    .database(move |store| {
+                        store.complete_operation_with_event(operation.id, ActualState::Running)
+                    })
+                    .await?;
+                let _ = sender.try_send(terminal);
+                Ok::<_, ServiceError>(())
+            }
+            .await;
+            if let Err(original) = commit {
+                let prior_ssh_resolution = previous_record.ssh_resolution.clone();
+                let rollback_enabled = create_request_ssh_enabled(&rollback_create);
+                let runtime_rollback = async {
+                    let (_, retained) = self.retained_resources(&rollback_create).await?;
+                    self.rollback_image(
+                        &rollback_create,
+                        &runtime.image,
+                        retained,
+                        operation.id,
+                        &sender,
+                    )
+                    .await?;
+                    self.restore_prior_ssh(&id, rollback_enabled, prior_ssh_resolution)
+                        .await
+                }
+                .await;
+                let mut previous_record = previous_record;
+                if let Ok(resolution) = runtime_rollback.as_ref() {
+                    previous_record.ssh_resolution = Some(resolution.clone());
+                }
+                let record_rollback = self
+                    .database(move |store| {
+                        store.put_sandbox_with_ssh_transport(&previous_record, prior_ssh_transport)
+                    })
+                    .await;
+                let failure = match (runtime_rollback, record_rollback) {
+                    (Ok(_), Ok(())) => original,
+                    (Err(runtime), Ok(())) => ServiceError::ImageRollback {
+                        original: Box::new(original),
+                        rollback: Box::new(runtime),
+                    },
+                    (Ok(_), Err(store)) => ServiceError::ImageRollback {
+                        original: Box::new(original),
+                        rollback: Box::new(store),
+                    },
+                    (Err(runtime), Err(store)) => ServiceError::ImageRollback {
+                        original: Box::new(original),
+                        rollback: Box::new(ServiceError::ImageRollback {
+                            original: Box::new(runtime),
+                            rollback: Box::new(store),
+                        }),
+                    },
+                };
+                let actual = self.runtime_actual(&id, prior_actual).await;
+                let code = gascan_proto::error_code::IMAGE_REPLACEMENT_FAILED;
+                let details = image_replacement_failure_details(&failure);
+                let terminal = self
+                    .database(move |store| {
+                        store.fail_operation_with_event(operation.id, actual, code, details)
+                    })
+                    .await;
+                match terminal {
+                    Ok((_, event)) => {
+                        let _ = sender.try_send(event);
+                        return Err(failure);
+                    }
+                    Err(reporting) => {
+                        return Err(ServiceError::FailureReporting {
+                            original: Box::new(failure),
+                            reporting: Box::new(reporting),
+                        });
+                    }
+                }
+            }
+            return Ok(receiver.map(|events| Operation {
+                id: operation.id,
+                events,
+            }));
         }
         if unchanged {
+            let prior_ssh = record.ssh_resolution.clone();
+            let ssh_result = if request.spec.manifest().ssh().enabled() {
+                self.activate_and_persist_ssh(&id, prior_ssh, None).await
+            } else {
+                self.disable_and_persist_ssh(&id, prior_ssh).await
+            };
+            if let Err(error) = ssh_result {
+                let actual = self.runtime_actual(&id, prior_actual).await;
+                let code = error.code();
+                let details = failure_details(&error);
+                self.database(move |store| {
+                    store.fail_operation(operation.id, actual, code, details)
+                })
+                .await?;
+                self.send_terminal(operation.id, &sender).await?;
+                return Err(error);
+            }
             self.database(move |store| {
                 store.complete_operation(operation.id, ActualState::Running)
             })
@@ -1464,11 +2763,17 @@ impl<B: RuntimeBackend> SandboxService<B> {
             self.emit(operation.id, json!({"phase":"before_health","step":ProvisionStep::HealthCheck.as_str()}), &sender).await?;
             self.provisioner.health_check(&id).await?;
             self.emit(operation.id, json!({"phase":"after_health","desired_fingerprint":desired_fingerprint}), &sender).await?;
-            Ok::<_, ServiceError>(provisioned)
+            let prior_ssh = record.ssh_resolution.clone();
+            let ssh_resolution = if request.spec.manifest().ssh().enabled() {
+                self.activate_and_persist_ssh(&id, prior_ssh, None).await?
+            } else {
+                self.disable_and_persist_ssh(&id, prior_ssh).await?
+            };
+            Ok::<_, ServiceError>((provisioned, ssh_resolution))
         }
         .await;
-        let provisioned = match result {
-            Ok(provisioned) => provisioned,
+        let (provisioned, ssh_resolution) = match result {
+            Ok(result) => result,
             Err(error) => {
                 let actual = if error.setup_stop_confirmed() {
                     ActualState::Stopped
@@ -1493,6 +2798,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             1,
             json!({"desired_fingerprint":desired_fingerprint,"tool_hash":provisioned.tool_hash,"resolution":provisioned.resolution.tools}),
         ));
+        record.ssh_resolution = Some(ssh_resolution);
         record.actual_state = ActualState::Running;
         self.database({
             let record = record.clone();
@@ -1509,7 +2815,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
     }
 
     pub async fn reconcile(&self) -> Result<ReconcileReport, ServiceError> {
-        self.recover_pending().await?;
+        let mut findings = self.recover_pending().await?;
         let records = self.database(|store| store.list_sandboxes()).await?;
         let known = records
             .iter()
@@ -1531,24 +2837,36 @@ impl<B: RuntimeBackend> SandboxService<B> {
             })
             .filter_map(|resource| resource.sandbox_id().cloned())
             .collect::<HashSet<_>>();
-        let mut findings = inventory
-            .into_iter()
-            .filter_map(|resource| match resource.ownership() {
-                ResourceOwnership::GasCanOwned
-                    if resource.sandbox_id().is_none_or(|id| !known.contains(id))
-                        || !expected.contains(resource.identity()) =>
-                {
-                    Some(ReconcileFinding::UnknownOwned(resource))
+        findings.extend(
+            inventory
+                .into_iter()
+                .filter_map(|resource| match resource.ownership() {
+                    ResourceOwnership::GasCanOwned
+                        if resource.sandbox_id().is_none_or(|id| !known.contains(id))
+                            || !expected.contains(resource.identity()) =>
+                    {
+                        Some(ReconcileFinding::UnknownOwned(resource))
+                    }
+                    ResourceOwnership::GasCanOwned => None,
+                    ResourceOwnership::Foreign => Some(ReconcileFinding::UnknownUnowned(resource)),
+                    ResourceOwnership::Mismatched => {
+                        Some(ReconcileFinding::OwnershipMismatch(resource))
+                    }
+                }),
+        );
+        let mut inspection_failed = HashSet::new();
+        for record in &records {
+            let inspected = match self.runtime.inspect(&record.id).await {
+                Ok(inspected) => inspected,
+                Err(error) => {
+                    findings.push(ReconcileFinding::InspectionUnavailable {
+                        sandbox_id: record.id.clone(),
+                        reason: error.code().to_owned(),
+                    });
+                    inspection_failed.insert(record.id.clone());
+                    continue;
                 }
-                ResourceOwnership::GasCanOwned => None,
-                ResourceOwnership::Foreign => Some(ReconcileFinding::UnknownUnowned(resource)),
-                ResourceOwnership::Mismatched => {
-                    Some(ReconcileFinding::OwnershipMismatch(resource))
-                }
-            })
-            .collect::<Vec<_>>();
-        for record in records {
-            let inspected = self.runtime.inspect(&record.id).await?;
+            };
             if inspected.as_ref().is_some_and(|runtime| {
                 runtime.ownership.managed_by != "gascan"
                     || runtime.ownership.sandbox_id != record.id
@@ -1566,7 +2884,101 @@ impl<B: RuntimeBackend> SandboxService<B> {
                     findings.push(ReconcileFinding::OwnershipMismatch(resource));
                 }
             } else if !actual_owned.contains(&record.id) {
-                findings.push(ReconcileFinding::MissingOwned(record.id));
+                findings.push(ReconcileFinding::MissingOwned(record.id.clone()));
+            }
+        }
+        let enabled_records = records
+            .iter()
+            .filter(|record| ssh_resolution_enabled(record.ssh_resolution.as_ref()))
+            .collect::<Vec<_>>();
+        if enabled_records.is_empty() {
+            match self.ssh_paths() {
+                Ok(paths) => {
+                    if let Err(error) = SshManager.publish_reconciled(&paths, &[]).await {
+                        findings.push(ReconcileFinding::SshPublicationUnavailable {
+                            reason: error.code().to_owned(),
+                        });
+                    }
+                }
+                Err(error) => {
+                    findings.push(ReconcileFinding::SshPublicationUnavailable {
+                        reason: error.code().to_owned(),
+                    });
+                }
+            }
+        } else {
+            let paths = match self.ssh_paths() {
+                Ok(paths) => paths,
+                Err(error) => {
+                    for record in enabled_records {
+                        findings.push(ReconcileFinding::SshUnavailable {
+                            sandbox_id: record.id.clone(),
+                            reason: error.code().to_owned(),
+                        });
+                    }
+                    findings.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+                    findings.dedup();
+                    return Ok(ReconcileReport { findings });
+                }
+            };
+            let mut hosts = Vec::new();
+            let mut verified_ids = Vec::new();
+            for record in enabled_records {
+                if inspection_failed.contains(&record.id) {
+                    continue;
+                }
+                let Some(expected) = record.ssh_resolution.as_ref() else {
+                    continue;
+                };
+                if record.actual_state != ActualState::Running {
+                    continue;
+                }
+                let runtime = match self.runtime.inspect(&record.id).await {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        findings.push(ReconcileFinding::SshUnavailable {
+                            sandbox_id: record.id.clone(),
+                            reason: ServiceError::Runtime(error).code().to_owned(),
+                        });
+                        continue;
+                    }
+                };
+                if runtime.as_ref().is_none_or(|sandbox| {
+                    sandbox.state != ContainerState::Running
+                        || sandbox.ownership.managed_by != "gascan"
+                        || sandbox.ownership.sandbox_id != record.id
+                }) {
+                    continue;
+                }
+                match SshManager
+                    .verify_for_reconcile(
+                        &record.id,
+                        &self.runtime,
+                        expected,
+                        &paths,
+                        self.ssh_readiness_program(),
+                        self.ssh_host_key_timeout,
+                    )
+                    .await
+                {
+                    Ok(Some(host)) => {
+                        hosts.push(host);
+                        verified_ids.push(record.id.clone());
+                    }
+                    Ok(None) => {}
+                    Err(error) => findings.push(ReconcileFinding::SshUnavailable {
+                        sandbox_id: record.id.clone(),
+                        reason: error.code().to_owned(),
+                    }),
+                }
+            }
+            if let Err(error) = SshManager.publish_reconciled(&paths, &hosts).await {
+                for sandbox_id in verified_ids {
+                    findings.push(ReconcileFinding::SshUnavailable {
+                        sandbox_id,
+                        reason: error.code().to_owned(),
+                    });
+                }
             }
         }
         findings.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
@@ -1574,7 +2986,95 @@ impl<B: RuntimeBackend> SandboxService<B> {
         Ok(ReconcileReport { findings })
     }
 
-    async fn recover_pending(&self) -> Result<(), ServiceError> {
+    async fn recover_pending_ssh_publication(
+        &self,
+        operation_id: OperationId,
+        id: &SandboxId,
+        record: &SandboxRecord,
+        events: &[OperationEvent],
+    ) -> Result<(), ServiceError> {
+        let marked = events.iter().any(|event| {
+            event
+                .details
+                .as_ref()
+                .and_then(|details| details.get("phase").and_then(Value::as_str))
+                == Some("after_ssh_publication")
+        });
+        self.preflight_recovered_ssh_mapping(id).await?;
+        let mut resolution = record.ssh_resolution.clone();
+        let exact = resolution.is_some() && self.verify_exact_ssh_publication().await.is_ok();
+        if !exact {
+            resolution = Some(self.activate_and_persist_ssh(id, resolution, None).await?);
+            self.verify_exact_ssh_publication()
+                .await
+                .map_err(|error| ServiceError::SshPublicationUncertain(Box::new(error)))?;
+        }
+        if !marked {
+            let version = resolution
+                .as_ref()
+                .ok_or(ServiceError::SshNotReady(
+                    "recovered SSH resolution is missing",
+                ))?
+                .version;
+            self.database(move |store| {
+                store
+                    .append_operation_event(
+                        operation_id,
+                        json!({
+                            "phase": "after_ssh_publication",
+                            "resolution_version": version,
+                            "recovered": true,
+                        }),
+                    )
+                    .map(drop)
+            })
+            .await
+            .map_err(|error| ServiceError::SshPublicationUncertain(Box::new(error)))?;
+        }
+        Ok(())
+    }
+
+    async fn rollback_interrupted_ssh_create(&self, id: &SandboxId) -> Result<(), ServiceError> {
+        self.deactivate_ssh(id).await?;
+        if let Some(runtime) = self.runtime.inspect(id).await? {
+            if runtime.ownership.managed_by != "gascan" || runtime.ownership.sandbox_id != *id {
+                return Err(ServiceError::Ownership(id.clone()));
+            }
+            if runtime.state == ContainerState::Running {
+                self.runtime.stop(id).await?;
+            }
+        }
+        let expected = PolicyCompiler::expected_resource_identities(id)?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let resources = self
+            .runtime
+            .list_resources()
+            .await?
+            .into_iter()
+            .filter(|resource| {
+                expected.contains(resource.identity())
+                    && resource.sandbox_id() == Some(id)
+                    && resource.ownership() == ResourceOwnership::GasCanOwned
+            })
+            .collect::<Vec<_>>();
+        if !resources.is_empty() {
+            self.runtime
+                .remove(RemoveRequest::from_resources(resources)?)
+                .await?;
+        }
+        if self.runtime.list_resources().await?.iter().any(|resource| {
+            expected.contains(resource.identity())
+                && resource.sandbox_id() == Some(id)
+                && resource.ownership() == ResourceOwnership::GasCanOwned
+        }) {
+            return Err(ServiceError::IncompleteDestroy(id.clone()));
+        }
+        Ok(())
+    }
+
+    async fn recover_pending(&self) -> Result<Vec<ReconcileFinding>, ServiceError> {
+        let mut findings = Vec::new();
         for operation in self.database(|store| store.pending_operations()).await? {
             let lock = self.keyed_lock(&operation.sandbox_id)?;
             let _guard = lock.lock().await;
@@ -1606,7 +3106,16 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 .await?
                 .ok_or_else(|| ServiceError::Missing(operation.sandbox_id.clone()))?;
             let hook_evidence = ordered_hook_evidence(&events, &record);
-            let inspected = self.runtime.inspect(&operation.sandbox_id).await?;
+            let inspected = match self.runtime.inspect(&operation.sandbox_id).await {
+                Ok(inspected) => inspected,
+                Err(error) => {
+                    findings.push(ReconcileFinding::InspectionUnavailable {
+                        sandbox_id: operation.sandbox_id.clone(),
+                        reason: error.code().to_owned(),
+                    });
+                    continue;
+                }
+            };
             if inspected.as_ref().is_some_and(|runtime| {
                 runtime.ownership.managed_by != "gascan"
                     || runtime.ownership.sandbox_id != operation.sandbox_id
@@ -1631,6 +3140,66 @@ impl<B: RuntimeBackend> SandboxService<B> {
                         ContainerState::Running => ActualState::Running,
                         ContainerState::Stopped => ActualState::Stopped,
                     });
+            let ssh_transport = self
+                .database({
+                    let id = operation.sandbox_id.clone();
+                    move |store| store.ssh_transport_policy(&id)
+                })
+                .await?;
+            let mut create_ssh_ready = !ssh_transport.is_some_and(SshTransportPolicy::is_enabled);
+            if operation.kind == OperationKind::Create
+                && !create_ssh_ready
+                && actual == ActualState::Running
+                && hook_evidence
+            {
+                match self
+                    .recover_pending_ssh_publication(
+                        operation.id,
+                        &operation.sandbox_id,
+                        &record,
+                        &events,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        create_ssh_ready = true;
+                        record = self
+                            .database({
+                                let id = operation.sandbox_id.clone();
+                                move |store| store.sandbox(&id)
+                            })
+                            .await?
+                            .ok_or_else(|| ServiceError::Missing(operation.sandbox_id.clone()))?;
+                    }
+                    Err(error) if error.is_ssh_publication_uncertain() => {
+                        findings.push(ReconcileFinding::SshUnavailable {
+                            sandbox_id: operation.sandbox_id.clone(),
+                            reason: error.code().to_owned(),
+                        });
+                        continue;
+                    }
+                    Err(error) => {
+                        let code = error.code();
+                        let details = failure_details(&error);
+                        if self
+                            .rollback_interrupted_ssh_create(&operation.sandbox_id)
+                            .await
+                            .is_err()
+                        {
+                            findings.push(ReconcileFinding::SshUnavailable {
+                                sandbox_id: operation.sandbox_id.clone(),
+                                reason: code.to_owned(),
+                            });
+                            continue;
+                        }
+                        self.database(move |store| {
+                            store.fail_create_operation_clearing_ssh(operation.id, code, details)
+                        })
+                        .await?;
+                        continue;
+                    }
+                }
+            }
             let expected_absent = if operation.kind == OperationKind::Destroy {
                 let expected = PolicyCompiler::expected_resource_identities(&operation.sandbox_id)?
                     .into_iter()
@@ -1644,7 +3213,9 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 false
             };
             let converged = match operation.kind {
-                OperationKind::Create => actual == ActualState::Running && hook_evidence,
+                OperationKind::Create => {
+                    actual == ActualState::Running && hook_evidence && create_ssh_ready
+                }
                 OperationKind::Start => actual == ActualState::Running,
                 OperationKind::Stop => actual == ActualState::Stopped,
                 OperationKind::Destroy => actual == ActualState::Absent && expected_absent,
@@ -1696,7 +3267,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 .await?;
             }
         }
-        Ok(())
+        Ok(findings)
     }
 
     async fn runtime_actual(&self, id: &SandboxId, fallback: ActualState) -> ActualState {
@@ -1718,10 +3289,21 @@ impl<B: RuntimeBackend> SandboxService<B> {
         details: Value,
         sender: &mpsc::Sender<OperationEvent>,
     ) -> Result<(), ServiceError> {
+        #[cfg(debug_assertions)]
+        let durable_phase = details
+            .get("phase")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let event = self
             .database(move |store| store.append_operation_event(id, details))
             .await?;
         let _ = sender.try_send(event);
+        #[cfg(debug_assertions)]
+        if let Ok(target) = std::env::var("GASCAN_SSH_CRASH_PHASE") {
+            if durable_phase.as_deref() == Some(target.as_str()) {
+                std::process::abort();
+            }
+        }
         Ok(())
     }
     async fn send_initial(
@@ -1775,6 +3357,13 @@ impl<B: RuntimeBackend> SandboxService<B> {
     }
 }
 
+fn replace_doctor_fact(report: &mut DoctorReport, id: &str, fact: DoctorFact) {
+    if let Some(check) = report.checks.iter_mut().find(|check| check.id == id) {
+        check.status = fact.status;
+        check.detail = fact.detail;
+    }
+}
+
 #[cfg(debug_assertions)]
 fn default_doctor_report() -> DoctorReport {
     DoctorFacts::all_supported_for_tests().into_report()
@@ -1794,6 +3383,7 @@ impl ServiceError {
             Self::Missing(_) => "not_found",
             Self::Ownership(_) => "ownership_mismatch",
             Self::StorageChangeRequiresRecreate { .. } => "storage_change_requires_recreate",
+            Self::ImageUpgradeRequired { .. } => gascan_proto::error_code::IMAGE_UPGRADE_REQUIRED,
             Self::StorageInvariant(_) => "storage_invariant_failed",
             Self::Provision(_)
             | Self::ProvisionCommandFailed { .. }
@@ -1809,7 +3399,16 @@ impl ServiceError {
             Self::DatabaseWorker(_) => "database_worker_failed",
             Self::Fingerprint(_) => "fingerprint_failed",
             Self::IncompleteDestroy(_) => "incomplete_destroy",
-            Self::Rollback { original, .. } => original.code(),
+            Self::SshPortUnavailable(_) => "ssh_port_unavailable",
+            Self::SshHostKeyMismatch(_) => "ssh_host_key_mismatch",
+            Self::SshNotReady(_) => "ssh_not_ready",
+            Self::SshConfigUnsafe(_) => "ssh_config_unsafe",
+            Self::SshConfigUpdateFailed(_) => "ssh_config_update_failed",
+            Self::SshConfigPublicationUncertain(_) => "ssh_config_publication_uncertain",
+            Self::SshPublicationUncertain(_) => "ssh_publication_uncertain",
+            Self::Rollback { original, .. }
+            | Self::ImageRollback { original, .. }
+            | Self::FailureReporting { original, .. } => original.code(),
         }
     }
 
@@ -1820,6 +3419,13 @@ impl ServiceError {
                 | Self::SetupCommandFailed { .. }
                 | Self::SetupChangedStopUnconfirmed
                 | Self::SetupCommandFailedStopUnconfirmed { .. }
+        )
+    }
+
+    const fn is_ssh_publication_uncertain(&self) -> bool {
+        matches!(
+            self,
+            Self::SshConfigPublicationUncertain(_) | Self::SshPublicationUncertain(_)
         )
     }
 
@@ -1872,6 +3478,20 @@ pub(crate) fn failure_details(error: &ServiceError) -> Value {
                 "requested_bytes": change.requested_bytes,
             })).collect::<Vec<_>>(),
         })
+    } else if let ServiceError::ImageUpgradeRequired {
+        current,
+        requested,
+        cause,
+    } = error
+    {
+        json!({
+            "message": error.to_string(),
+            "reason": "image_changed",
+            "current": current,
+            "requested": requested,
+            "cause": cause,
+            "recovery": "run `gascan apply` again",
+        })
     } else if let ServiceError::ProvisionCommandFailed {
         step,
         action,
@@ -1919,6 +3539,26 @@ pub(crate) fn failure_details(error: &ServiceError) -> Value {
     } else {
         json!({"message":error.to_string()})
     }
+}
+
+fn image_replacement_failure_details(error: &ServiceError) -> Value {
+    let (primary, rollback) = match error {
+        ServiceError::ImageRollback { original, rollback } => {
+            (original.as_ref(), Some(rollback.as_ref()))
+        }
+        other => (other, None),
+    };
+    json!({
+        "message": error.to_string(),
+        "primary": {
+            "code": primary.code(),
+            "message": primary.to_string(),
+        },
+        "rollback": rollback.map(|rollback| json!({
+            "code": rollback.code(),
+            "message": rollback.to_string(),
+        })),
+    })
 }
 
 type StorageCapacities = [(&'static str, u64); 3];
@@ -2044,6 +3684,190 @@ fn applied_state(record: Option<&SandboxRecord>) -> AppliedState {
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
     AppliedState::with_hashes(tool_hash, setup_sha256)
+}
+
+fn replacement_applied_state(record: &SandboxRecord) -> AppliedState {
+    let tool_hash = record
+        .tool_resolution
+        .as_ref()
+        .and_then(|resolution| resolution.details.get("tool_hash"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    AppliedState::with_hashes(tool_hash, None)
+}
+
+fn exact_owned_container(
+    create: &CreateRequest,
+    resources: &[RuntimeResource],
+) -> Result<Option<RuntimeResource>, ServiceError> {
+    let mut containers = resources.iter().filter(|resource| {
+        resource.kind() == ResourceKind::Container
+            && resource.ownership() == ResourceOwnership::GasCanOwned
+            && resource.sandbox_id() == Some(create.id())
+    });
+    let Some(container) = containers.next() else {
+        return Ok(None);
+    };
+    if containers.next().is_some() {
+        return Err(ServiceError::Runtime(RuntimeError::InvalidState {
+            resource: create.id().to_string(),
+            message: "expected at most one owned container resource".to_owned(),
+        }));
+    }
+    let expected = ResourceIdentity::new(ResourceKind::Container, create.id().to_string())?;
+    if container.identity() != &expected {
+        return Err(ServiceError::Runtime(RuntimeError::OwnershipMismatch {
+            resource: container.name().to_owned(),
+        }));
+    }
+    Ok(Some(container.clone()))
+}
+
+fn image_state(
+    record: Option<&SandboxRecord>,
+    running: &str,
+    approved: &str,
+) -> Result<ImageState, RuntimeError> {
+    if !immutable_image_reference(running) {
+        return Err(RuntimeError::InvalidOutput {
+            operation: "runtime image inspection".to_owned(),
+            message: "running workspace image is not digest-qualified".to_owned(),
+        });
+    }
+    if !immutable_image_reference(approved) {
+        return Err(RuntimeError::InvalidOutput {
+            operation: "workspace image policy".to_owned(),
+            message: "approved workspace image is not digest-qualified".to_owned(),
+        });
+    }
+    Ok(ImageState {
+        recorded: record.and_then(stored_image),
+        running: running.to_owned(),
+        approved: approved.to_owned(),
+    })
+}
+
+fn stored_image(record: &SandboxRecord) -> Option<String> {
+    let resolution = record.image_resolution.as_ref()?;
+    if resolution.version != 1 {
+        return None;
+    }
+    resolution
+        .details
+        .get("digest")?
+        .as_str()
+        .filter(|value| immutable_image_reference(value))
+        .map(ToOwned::to_owned)
+}
+
+fn ssh_resolution_enabled(resolution: Option<&crate::SshResolution>) -> bool {
+    resolution.is_some_and(|resolution| {
+        resolution.version == 1
+            && resolution.details.get("enabled").and_then(Value::as_bool) == Some(true)
+    })
+}
+
+fn inspected_native_ssh_port(
+    runtime: &gascan_core::runtime::RuntimeSandbox,
+) -> Result<u16, ServiceError> {
+    let mut mappings = runtime
+        .ports()
+        .iter()
+        .filter(|mapping| mapping.guest_port == 22);
+    let mapping = mappings.next().ok_or(ServiceError::SshNotReady(
+        "runtime inspection is missing the native SSH mapping",
+    ))?;
+    if mappings.next().is_some()
+        || mapping.host_address != IpAddr::V4(Ipv4Addr::LOCALHOST)
+        || mapping.host_port < 1024
+    {
+        return Err(ServiceError::SshNotReady(
+            "runtime inspection has an invalid native SSH mapping",
+        ));
+    }
+    Ok(mapping.host_port)
+}
+
+fn validate_inspected_ssh_policy(
+    policy: Option<SshTransportPolicy>,
+    inspected_port: u16,
+) -> Result<(), ServiceError> {
+    match policy {
+        Some(policy) if !policy.is_enabled() => Err(ServiceError::SshNotReady(
+            "durable SSH transport policy is disabled",
+        )),
+        Some(policy)
+            if policy
+                .host_port()
+                .is_some_and(|port| port != inspected_port) =>
+        {
+            Err(ServiceError::SshNotReady(
+                "runtime SSH mapping differs from durable explicit port",
+            ))
+        }
+        Some(_) | None => Ok(()),
+    }
+}
+
+fn create_request_ssh_enabled(request: &CreateRequest) -> bool {
+    request
+        .environment()
+        .get("GASCAN_SSH_ENABLED")
+        .is_some_and(|enabled| enabled == "1")
+}
+
+fn runtime_ssh_transport_changed(
+    runtime: &gascan_core::runtime::RuntimeSandbox,
+    spec: &SandboxSpec,
+) -> bool {
+    let desired_enabled = spec.manifest().ssh().enabled();
+    let mut mappings = runtime
+        .ports()
+        .iter()
+        .filter(|mapping| mapping.guest_port == 22);
+    let Some(mapping) = mappings.next() else {
+        return desired_enabled;
+    };
+    if !desired_enabled || mappings.next().is_some() {
+        return true;
+    }
+    spec.manifest()
+        .ssh()
+        .host_port()
+        .is_some_and(|port| mapping.host_port != port)
+}
+
+fn ssh_transport_policy_changed(
+    record: &SandboxRecord,
+    runtime: &gascan_core::runtime::RuntimeSandbox,
+    spec: &SandboxSpec,
+    recorded_policy: Option<&SshTransportPolicy>,
+    require_ssh_resolution: bool,
+    require_recorded_policy: bool,
+) -> bool {
+    if runtime_ssh_transport_changed(runtime, spec) {
+        return true;
+    }
+    let desired_policy = requested_ssh_transport(spec);
+    if recorded_policy.is_some_and(|policy| policy != &desired_policy)
+        || (require_recorded_policy && recorded_policy.is_none())
+    {
+        return true;
+    }
+    let desired_enabled = spec.manifest().ssh().enabled();
+    let recorded_enabled = ssh_resolution_enabled(record.ssh_resolution.as_ref());
+    if require_ssh_resolution && desired_enabled != recorded_enabled {
+        return true;
+    }
+    false
+}
+
+fn requested_ssh_transport(spec: &SandboxSpec) -> SshTransportPolicy {
+    if spec.manifest().ssh().enabled() {
+        SshTransportPolicy::enabled(spec.manifest().ssh().host_port())
+    } else {
+        SshTransportPolicy::disabled()
+    }
 }
 
 fn provisioning_transport_error() -> ServiceError {
@@ -2224,7 +4048,7 @@ async fn desired_fingerprint(spec: &SandboxSpec) -> Result<String, ServiceError>
 mod storage_tests {
     use super::{
         BoundedTail, NoopProvisioner, SandboxService, ServiceError, Store,
-        requested_storage_from_volumes,
+        image_replacement_failure_details, requested_storage_from_volumes,
     };
     use camino::Utf8Path;
     use gascan_core::fake_runtime::FakeRuntime;
@@ -2257,6 +4081,29 @@ mod storage_tests {
                 "managed volume is missing from compiled create request"
             ))
         ));
+    }
+
+    #[test]
+    fn image_replacement_failure_details_preserve_primary_and_rollback() {
+        let error = ServiceError::ImageRollback {
+            original: Box::new(ServiceError::Provision("primary failure".to_owned())),
+            rollback: Box::new(ServiceError::Provision("rollback failure".to_owned())),
+        };
+
+        assert_eq!(
+            image_replacement_failure_details(&error),
+            serde_json::json!({
+                "message": error.to_string(),
+                "primary": {
+                    "code": "provision_failed",
+                    "message": "provisioning failed: primary failure",
+                },
+                "rollback": {
+                    "code": "provision_failed",
+                    "message": "provisioning failed: rollback failure",
+                },
+            })
+        );
     }
 
     #[tokio::test]

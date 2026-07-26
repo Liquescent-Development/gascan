@@ -13,6 +13,7 @@ fn version_flags_are_exact_and_do_not_require_the_daemon() -> TestResult {
             .env("XDG_RUNTIME_DIR", runtime.path())
             .env("GASCAN_STATE_PATH", runtime.path().join("state.sqlite3"))
             .env("GASCAN_PID_PATH", runtime.path().join("daemon.pid"))
+            .env("GASCAN_E2E_ACCOUNT_HOME", runtime.path())
             .env("GASCAN_DAEMON", runtime.path().join("missing-gascand"))
             .output()?;
 

@@ -4,8 +4,8 @@ use common::{capabilities, create_request, create_request_with_network};
 use gascan_core::fake_runtime::{FailureBoundary, FakeRuntime};
 use gascan_core::runtime::{
     CreateFailure, CreateOutcome, ExecCancellation, ExecInput, ExecOutput, ExecRequest,
-    ExecSession, RemoveRequest, ResourceIdentity, ResourceKind, ResourceOwnership, RuntimeBackend,
-    RuntimeCall, RuntimeError, RuntimeOutcome, RuntimeResource,
+    ExecSession, RecreateRequest, RemoveRequest, ResourceIdentity, ResourceKind, ResourceOwnership,
+    RetainedResources, RuntimeBackend, RuntimeCall, RuntimeError, RuntimeOutcome, RuntimeResource,
 };
 use gascan_core::sandbox::SandboxId;
 
@@ -330,6 +330,202 @@ fn networked_create_outcome_requires_the_managed_network() {
     assert_eq!(error.code(), "invalid_state");
 }
 
+fn retained_resource(
+    request: &gascan_core::runtime::CreateRequest,
+    kind: ResourceKind,
+    name: impl Into<String>,
+) -> RuntimeResource {
+    RuntimeResource::discovered(
+        ResourceIdentity::new(kind, name).unwrap(),
+        Some(request.id().clone()),
+        ResourceOwnership::GasCanOwned,
+    )
+}
+
+fn expected_retained(request: &gascan_core::runtime::CreateRequest) -> Vec<RuntimeResource> {
+    let mut resources = request
+        .volumes()
+        .iter()
+        .map(|volume| retained_resource(request, ResourceKind::Volume, volume.name.clone()))
+        .collect::<Vec<_>>();
+    if let Some(network) = request.network().managed_name() {
+        resources.push(retained_resource(request, ResourceKind::Network, network));
+    }
+    resources
+}
+
+#[test]
+fn retained_resources_accept_exact_owned_request_resources() {
+    for fixture in [
+        create_request("retained-offline"),
+        create_request_with_network("retained-networked", "networked"),
+    ] {
+        let resources = expected_retained(&fixture);
+        let retained = RetainedResources::new(&fixture.request(), resources.clone()).unwrap();
+        assert_eq!(retained.resources(), resources);
+    }
+}
+
+#[test]
+fn retained_resources_reject_containers_missing_extra_and_duplicate_volumes() {
+    let fixture = create_request("retained-shape");
+    let exact = expected_retained(&fixture);
+    let container = retained_resource(&fixture, ResourceKind::Container, fixture.id().to_string());
+    assert!(
+        RetainedResources::new(
+            &fixture.request(),
+            [exact.clone(), vec![container]].concat()
+        )
+        .is_err()
+    );
+    assert!(RetainedResources::new(&fixture.request(), exact[1..].to_vec()).is_err());
+    let extra = retained_resource(&fixture, ResourceKind::Volume, "unexpected-volume");
+    assert!(
+        RetainedResources::new(&fixture.request(), [exact.clone(), vec![extra]].concat()).is_err()
+    );
+    assert!(
+        RetainedResources::new(
+            &fixture.request(),
+            [exact.clone(), vec![exact[0].clone()]].concat()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn retained_resources_reject_non_owned_or_wrong_sandbox_resources() {
+    let fixture = create_request("retained-ownership");
+    for ownership in [ResourceOwnership::Foreign, ResourceOwnership::Mismatched] {
+        let mut resources = expected_retained(&fixture);
+        resources[0] = RuntimeResource::discovered(
+            resources[0].identity().clone(),
+            Some(fixture.id().clone()),
+            ownership,
+        );
+        assert!(RetainedResources::new(&fixture.request(), resources).is_err());
+    }
+    let mut resources = expected_retained(&fixture);
+    resources[0] = RuntimeResource::discovered(
+        resources[0].identity().clone(),
+        None,
+        ResourceOwnership::GasCanOwned,
+    );
+    assert!(RetainedResources::new(&fixture.request(), resources).is_err());
+    let mut resources = expected_retained(&fixture);
+    resources[0] = RuntimeResource::discovered(
+        resources[0].identity().clone(),
+        Some(SandboxId::test("other-retained-owner")),
+        ResourceOwnership::GasCanOwned,
+    );
+    assert!(RetainedResources::new(&fixture.request(), resources).is_err());
+}
+
+#[test]
+fn retained_resources_reject_wrong_network_topology() {
+    let offline = create_request("retained-offline-network");
+    let mut resources = expected_retained(&offline);
+    resources.push(retained_resource(
+        &offline,
+        ResourceKind::Network,
+        "unexpected-network",
+    ));
+    assert!(RetainedResources::new(&offline.request(), resources).is_err());
+
+    let networked = create_request_with_network("retained-wrong-network", "networked");
+    let mut resources = expected_retained(&networked);
+    let network = resources
+        .iter_mut()
+        .find(|resource| resource.kind() == ResourceKind::Network)
+        .unwrap();
+    *network = retained_resource(&networked, ResourceKind::Network, "wrong-network");
+    assert!(RetainedResources::new(&networked.request(), resources).is_err());
+}
+
+#[test]
+fn rollback_recreate_accepts_only_immutable_images_and_preserves_topology() {
+    let fixture = create_request_with_network("rollback-image", "networked");
+    let create = fixture.request();
+    let retained = RetainedResources::new(&create, expected_retained(&fixture)).unwrap();
+    let rollback_image = "registry.example/workspace:old@sha256:\
+                          bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let recreate =
+        RecreateRequest::for_image(create.clone(), rollback_image.to_owned(), retained.clone())
+            .unwrap();
+
+    assert_eq!(recreate.create().image(), rollback_image);
+    assert_eq!(recreate.create().id(), create.id());
+    assert_eq!(recreate.create().bind_mounts(), create.bind_mounts());
+    assert_eq!(recreate.create().volumes(), create.volumes());
+    assert_eq!(recreate.create().ports(), create.ports());
+    assert_eq!(recreate.create().environment(), create.environment());
+    assert_eq!(recreate.create().resources(), create.resources());
+    assert_eq!(recreate.create().network(), create.network());
+    assert_eq!(recreate.create().user(), create.user());
+    assert_eq!(recreate.create().init(), create.init());
+    assert_eq!(recreate.create().ownership(), create.ownership());
+    assert_eq!(recreate.retained(), &retained);
+
+    for invalid in [
+        "registry.example/workspace:latest",
+        "registry.example/workspace@sha256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+        "registry.example/workspace@sha256:bbbb",
+        "@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        " registry.example/workspace@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "registry.example//workspace@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "registry.example/Workspace@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "registry.example/-workspace@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "registry.example/workspace:@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    ] {
+        assert!(
+            RecreateRequest::for_image(create.clone(), invalid.to_owned(), retained.clone(),)
+                .is_err(),
+            "accepted invalid rollback image {invalid}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn fake_recreate_records_prepare_then_container_create() {
+    let backend = FakeRuntime::new(capabilities());
+    let fixture = create_request("fake-recreate");
+    backend.create(fixture.request()).await.unwrap();
+    backend
+        .remove(
+            RemoveRequest::from_resources(
+                backend
+                    .list_resources()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .filter(|resource| resource.kind() == ResourceKind::Container)
+                    .collect(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let retained =
+        RetainedResources::new(&fixture.request(), backend.list_resources().await.unwrap())
+            .unwrap();
+    let recreate = RecreateRequest::new(fixture.request(), retained).unwrap();
+    let new_image = fixture.image();
+    let calls_before = backend.calls().await.len();
+
+    backend.prepare_image(new_image).await.unwrap();
+    let outcome = backend.create_container(recreate.clone()).await.unwrap();
+
+    assert_eq!(outcome.created().len(), 1);
+    assert_eq!(outcome.created()[0].kind(), ResourceKind::Container);
+    assert_eq!(
+        &backend.calls().await[calls_before..],
+        [
+            RuntimeCall::PrepareImage(new_image.to_owned()),
+            RuntimeCall::CreateContainer(recreate),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn networked_fake_create_reports_network_then_volumes_then_container() {
     let backend = FakeRuntime::new(capabilities());
@@ -595,6 +791,9 @@ async fn every_backend_boundary_supports_fail_once_injection() {
         FailureBoundary::Capabilities,
         FailureBoundary::Inspect,
         FailureBoundary::Create,
+        FailureBoundary::PrepareImage,
+        FailureBoundary::CreateContainer,
+        FailureBoundary::CreateContainerAfterMutation,
     ] {
         let backend = FakeRuntime::failing_once(boundary);
         let id = SandboxId::test(boundary.as_str());
@@ -605,6 +804,46 @@ async fn every_backend_boundary_supports_fail_once_injection() {
                 let fixture = create_request(boundary.as_str());
                 let error = backend.create(fixture.request()).await.unwrap_err();
                 assert_eq!(error.code(), "injected_failure");
+                continue;
+            }
+            FailureBoundary::PrepareImage => {
+                backend.prepare_image("fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                    .await
+                    .unwrap_err()
+            }
+            FailureBoundary::CreateContainer
+            | FailureBoundary::CreateContainerAfterMutation => {
+                let fixture = create_request(boundary.as_str());
+                let created = backend.create(fixture.request()).await.unwrap();
+                backend
+                    .remove(
+                        RemoveRequest::from_resources(
+                            created
+                                .created()
+                                .iter()
+                                .filter(|resource| resource.kind() == ResourceKind::Container)
+                                .cloned()
+                                .collect(),
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let retained = RetainedResources::new(
+                    &fixture.request(),
+                    backend.list_resources().await.unwrap(),
+                )
+                .unwrap();
+                let failure = backend
+                    .create_container(
+                        RecreateRequest::new(fixture.request(), retained).unwrap(),
+                    )
+                    .await
+                    .unwrap_err();
+                if boundary == FailureBoundary::CreateContainerAfterMutation {
+                    assert_eq!(failure.created().len(), 1);
+                }
+                assert_eq!(failure.code(), "injected_failure");
                 continue;
             }
             _ => continue,

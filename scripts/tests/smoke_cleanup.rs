@@ -1,5 +1,5 @@
-use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
 use sha2::{Digest, Sha256};
+use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
 
 const TOKEN: &str = "00112233445566778899aabbccddeeff";
 
@@ -12,6 +12,11 @@ fn fake_container(mode: &str) -> (tempfile::TempDir, std::path::PathBuf, std::pa
         r#"#!/bin/sh
 set -eu
 printf '%s\n' "$*" >>"$CALLS"
+if [ "$1 ${2:-}" = "image inspect" ]; then
+  digest="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  printf '[{"id":"%s","configuration":{"name":"gascan-workspace:d4964500a3295a33","descriptor":{"digest":"%s"}},"variants":[{"platform":{"os":"linux","architecture":"arm64"},"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]}]\n' "${digest#sha256:}" "$digest"
+  exit 0
+fi
 case "$1" in
   create)
     if [ "$MODE" = collision ]; then exit 1; fi
@@ -19,7 +24,8 @@ case "$1" in
     ;;
   inspect)
     if [ "$MODE" = collision ]; then owner=ffeeddccbbaa99887766554433221100; else owner="$OWNER"; fi
-    printf '[{"id":"%s","configuration":{"id":"%s","name":"%s","labels":{"dev.gascan.test":"true","dev.gascan.test.owner":"%s"}}}]\n' "$NAME" "$NAME" "$NAME" "$owner"
+    if [ "$MODE" = wrong-image ]; then digest="sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"; else digest="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; fi
+    printf '[{"id":"%s","configuration":{"id":"%s","name":"%s","labels":{"dev.gascan.test":"true","dev.gascan.test.owner":"%s"},"image":{"descriptor":{"digest":"%s"},"reference":"gascan-workspace:d4964500a3295a33"}}}]\n' "$NAME" "$NAME" "$NAME" "$owner" "$digest"
     ;;
   start)
     [ "$MODE" != start-fails ]
@@ -36,7 +42,8 @@ esac
     fs::set_permissions(&bin, permissions).unwrap();
     fs::create_dir_all(temp.path().join("connected-workspace-context")).unwrap();
     fs::write(
-        temp.path().join("connected-workspace-context/context-manifest.tsv"),
+        temp.path()
+            .join("connected-workspace-context/context-manifest.tsv"),
         "fixture\n",
     )
     .unwrap();
@@ -91,6 +98,10 @@ fn create_success_then_start_failure_is_owned_and_deleted() {
     );
     assert!(calls.contains("start "));
     assert!(calls.contains("delete "));
+    assert!(calls.contains("gascan-workspace:d4964500a3295a33\n"));
+    assert!(!calls.contains(
+        "gascan-workspace:d4964500a3295a33@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+    ));
 }
 
 #[test]
@@ -116,4 +127,13 @@ fn wrong_label_collision_is_retained_without_delete() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!calls.contains("delete "));
+}
+
+#[test]
+fn created_container_with_wrong_image_digest_is_never_started_and_is_deleted() {
+    let (output, calls) = run("wrong-image");
+    assert!(!output.status.success());
+    assert!(calls.contains("create "));
+    assert!(!calls.contains("start "));
+    assert!(calls.contains("delete "));
 }

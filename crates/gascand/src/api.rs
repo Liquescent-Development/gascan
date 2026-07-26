@@ -5,12 +5,14 @@ use crate::{
 use camino::Utf8PathBuf;
 use gascan_core::doctor::DoctorStatus;
 use gascan_core::manifest::Manifest;
-use gascan_core::runtime::RuntimeBackend;
+use gascan_core::runtime::{RuntimeBackend, immutable_image_reference};
 use gascan_core::sandbox::{SandboxError, SandboxId, SandboxSpec};
 use gascan_proto::v1;
 use gascan_proto::v1::gas_can_server::{GasCan, GasCanServer};
 use gascan_proto::{
-    API_MAJOR, API_MINOR, error_code, local_transport_security, validate_api_major,
+    API_MAJOR, API_MINOR, error_code, local_transport_security,
+    ssh_status::{SshState, classify as classify_ssh},
+    validate_api_major,
 };
 use std::io;
 use std::pin::Pin;
@@ -580,7 +582,11 @@ fn wire_event(event: StoredEvent) -> v1::OperationEvent {
     }
 }
 
-fn wire_status(record: crate::SandboxRecord) -> v1::SandboxStatus {
+fn wire_status(
+    record: crate::SandboxRecord,
+    policy_image: &str,
+    active_ssh: Option<&crate::ActiveSsh>,
+) -> v1::SandboxStatus {
     let desired_state = match record.desired_state {
         DesiredState::Running => v1::DesiredState::Running,
         DesiredState::Stopped => v1::DesiredState::Stopped,
@@ -592,6 +598,22 @@ fn wire_status(record: crate::SandboxRecord) -> v1::SandboxStatus {
         ActualState::Stopped => v1::ActualState::Stopped,
         ActualState::Absent => v1::ActualState::Absent,
     } as i32;
+    let apply_requirements = record
+        .image_resolution
+        .as_ref()
+        .filter(|resolution| resolution.version == 1)
+        .and_then(|resolution| resolution.details.get("digest"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|current| immutable_image_reference(current))
+        .filter(|current| *current != policy_image)
+        .map(|current| {
+            vec![v1::ApplyRequirement {
+                reason: "image_changed".to_owned(),
+                current: current.to_owned(),
+                requested: policy_image.to_owned(),
+            }]
+        })
+        .unwrap_or_default();
     v1::SandboxStatus {
         sandbox_id: record.id.to_string(),
         desired_state,
@@ -601,7 +623,80 @@ fn wire_status(record: crate::SandboxRecord) -> v1::SandboxStatus {
         }),
         updated_at: Some(timestamp_from_millis(record.updated_at_millis)),
         capabilities: Vec::new(),
+        apply_requirements,
+        ssh: wire_ssh_status(&record, active_ssh),
     }
+}
+
+fn wire_ssh_status(
+    record: &crate::SandboxRecord,
+    active: Option<&crate::ActiveSsh>,
+) -> Option<v1::SshStatus> {
+    let resolution = record.ssh_resolution.as_ref()?;
+    let details = resolution.details.as_object()?;
+    if resolution.version != 1 || details.len() != 3 {
+        return None;
+    }
+    let enabled = details
+        .get("enabled")
+        .and_then(serde_json::Value::as_bool)?;
+    let expected_host = details
+        .get("host_key_fingerprint")
+        .and_then(serde_json::Value::as_str)?;
+    let expected_client = details
+        .get("client_key_fingerprint")
+        .and_then(serde_json::Value::as_str)?;
+    if !enabled {
+        return (expected_host.is_empty() && expected_client.is_empty()).then_some(v1::SshStatus {
+            enabled: false,
+            active: false,
+            host: None,
+            port: None,
+            alias: None,
+            host_key_fingerprint: None,
+            client_key_fingerprint: None,
+        });
+    }
+    if expected_host.is_empty() || expected_client.is_empty() {
+        return None;
+    }
+    let matching = active.filter(|active| {
+        record.actual_state == ActualState::Running
+            && active.host_key_fingerprint == expected_host
+            && active.client_key_fingerprint == expected_client
+    });
+    let candidate = v1::SshStatus {
+        enabled: true,
+        active: matching.is_some(),
+        host: matching.map(|active| active.host.to_string()),
+        port: matching.map(|active| u32::from(active.port)),
+        alias: matching.map(|active| active.alias.clone()),
+        host_key_fingerprint: matching.map(|active| active.host_key_fingerprint.clone()),
+        client_key_fingerprint: matching.map(|active| active.client_key_fingerprint.clone()),
+    };
+    let probe = v1::SandboxStatus {
+        sandbox_id: record.id.to_string(),
+        actual_state: match record.actual_state {
+            ActualState::Creating | ActualState::Destroying => v1::ActualState::Pending,
+            ActualState::Running => v1::ActualState::Running,
+            ActualState::Stopped => v1::ActualState::Stopped,
+            ActualState::Absent => v1::ActualState::Absent,
+        } as i32,
+        ssh: Some(candidate.clone()),
+        ..Default::default()
+    };
+    if matching.is_some() && classify_ssh(&probe) != SshState::Ready {
+        return Some(v1::SshStatus {
+            enabled: true,
+            active: false,
+            host: None,
+            port: None,
+            alias: None,
+            host_key_fingerprint: None,
+            client_key_fingerprint: None,
+        });
+    }
+    Some(candidate)
 }
 
 #[derive(Clone, Copy)]
@@ -664,6 +759,9 @@ fn selector_id(selector: Option<v1::SandboxSelector>) -> Result<SandboxId, ApiIn
 
 fn service_status(error: ServiceError) -> tonic::Status {
     match error {
+        ServiceError::Rollback { original, .. }
+        | ServiceError::ImageRollback { original, .. }
+        | ServiceError::FailureReporting { original, .. } => service_status(*original),
         ServiceError::Store(crate::StoreError::PendingOperationExists { .. }) => {
             tonic::Status::already_exists(error_code::OPERATION_CONFLICT)
         }
@@ -677,6 +775,19 @@ fn service_status(error: ServiceError) -> tonic::Status {
         }
         error @ ServiceError::StorageChangeRequiresRecreate { .. } => {
             let code = gascan_proto::error_code::STORAGE_CHANGE_REQUIRES_RECREATE;
+            let message = error.to_string();
+            let details =
+                serde_json::to_vec(&crate::service::failure_details(&error)).unwrap_or_default();
+            tonic::Status::with_details(
+                tonic::Code::FailedPrecondition,
+                code,
+                tonic::codegen::Bytes::from(gascan_proto::error_detail::encode_with_details(
+                    code, &message, &details,
+                )),
+            )
+        }
+        error @ ServiceError::ImageUpgradeRequired { .. } => {
+            let code = error_code::IMAGE_UPGRADE_REQUIRED;
             let message = error.to_string();
             let details =
                 serde_json::to_vec(&crate::service::failure_details(&error)).unwrap_or_default();
@@ -799,6 +910,9 @@ fn service_error_diagnostic(error: &ServiceError) -> String {
         ServiceError::StorageChangeRequiresRecreate { .. } => {
             "service_kind=storage_change_requires_recreate".to_owned()
         }
+        ServiceError::ImageUpgradeRequired { .. } => {
+            "service_kind=image_upgrade_required".to_owned()
+        }
         ServiceError::StorageInvariant(_) => "service_kind=storage_invariant".to_owned(),
         ServiceError::Provision(_)
         | ServiceError::ProvisionCommandFailed { .. }
@@ -813,10 +927,32 @@ fn service_error_diagnostic(error: &ServiceError) -> String {
         ServiceError::DatabaseWorker(_) => "service_kind=database_worker".to_owned(),
         ServiceError::Fingerprint(_) => "service_kind=fingerprint".to_owned(),
         ServiceError::IncompleteDestroy(_) => "service_kind=incomplete_destroy".to_owned(),
+        ServiceError::SshPortUnavailable(_)
+        | ServiceError::SshHostKeyMismatch(_)
+        | ServiceError::SshNotReady(_)
+        | ServiceError::SshConfigUnsafe(_)
+        | ServiceError::SshConfigUpdateFailed(_)
+        | ServiceError::SshConfigPublicationUncertain(_)
+        | ServiceError::SshPublicationUncertain(_) => {
+            format!("service_kind=ssh service_code={}", error.code())
+        }
         ServiceError::Rollback { original, rollback } => format!(
             "service_kind=rollback original_code={} rollback_code={}",
             original.code(),
             rollback.code()
+        ),
+        ServiceError::ImageRollback { original, rollback } => format!(
+            "service_kind=image_rollback original_code={} rollback_code={}",
+            original.code(),
+            rollback.code()
+        ),
+        ServiceError::FailureReporting {
+            original,
+            reporting,
+        } => format!(
+            "service_kind=failure_reporting original_code={} reporting_code={}",
+            original.code(),
+            reporting.code()
         ),
     }
 }
@@ -1365,8 +1501,23 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             .map_err(|_| tonic::Status::internal(error_code::INTERNAL))?
             .map_err(|_| tonic::Status::internal(error_code::INTERNAL))?
             .ok_or_else(|| tonic::Status::not_found(error_code::SANDBOX_NOT_FOUND))?;
+        let published = if record.actual_state == ActualState::Running {
+            self.service.published_ssh_snapshot().await.ok()
+        } else {
+            None
+        };
+        let active_ssh = published.as_ref().and_then(|snapshot| {
+            snapshot
+                .for_sandbox(&record.id, record.ssh_resolution.as_ref())
+                .ok()
+                .flatten()
+        });
         Ok(tonic::Response::new(v1::StatusResponse {
-            sandbox: Some(wire_status(record)),
+            sandbox: Some(wire_status(
+                record,
+                self.service.workspace_image(),
+                active_ssh.as_ref(),
+            )),
         }))
     }
     async fn list(
@@ -1380,9 +1531,33 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             .await
             .map_err(|_| tonic::Status::internal(error_code::INTERNAL))?
             .map_err(|_| tonic::Status::internal(error_code::INTERNAL))?;
-        Ok(tonic::Response::new(v1::ListResponse {
-            sandboxes: records.into_iter().map(wire_status).collect(),
-        }))
+        let published = if records
+            .iter()
+            .any(|record| record.actual_state == ActualState::Running)
+        {
+            self.service.published_ssh_snapshot().await.ok()
+        } else {
+            None
+        };
+        let mut sandboxes = Vec::with_capacity(records.len());
+        for record in records {
+            let active_ssh = (record.actual_state == ActualState::Running)
+                .then(|| {
+                    published.as_ref().and_then(|snapshot| {
+                        snapshot
+                            .for_sandbox(&record.id, record.ssh_resolution.as_ref())
+                            .ok()
+                            .flatten()
+                    })
+                })
+                .flatten();
+            sandboxes.push(wire_status(
+                record,
+                self.service.workspace_image(),
+                active_ssh.as_ref(),
+            ));
+        }
+        Ok(tonic::Response::new(v1::ListResponse { sandboxes }))
     }
     async fn doctor(
         &self,
@@ -1755,7 +1930,7 @@ mod tests {
         ActivityTracker, ApiEventStream, AttachBridgeControl, AttachStream, AttachTerminal,
         ErrorDiagnostics, PendingSession, SessionRegistry, attach_shutdown_requested_with,
         run_attach_bridge as run_attach_bridge_impl, service_status,
-        service_status_with_diagnostics, spec_for_root, wire_event, wire_status,
+        service_status_with_diagnostics, spec_for_root, wire_event, wire_ssh_status, wire_status,
     };
     use crate::{
         ActualState, DesiredState, OperationEvent, OperationId, OperationStatus, SandboxRecord,
@@ -2640,18 +2815,23 @@ mod tests {
         );
 
         let root = Utf8PathBuf::from("/workspace/api-metadata");
-        let status = wire_status(SandboxRecord {
-            id: SandboxId::from_root("metadata", &root),
-            canonical_root: root,
-            desired_state: DesiredState::Running,
-            actual_state: ActualState::Running,
-            setup_resolution: None,
-            tool_resolution: None,
-            image_resolution: None,
-            storage_resolution: None,
-            last_operation_id: Some(operation_id),
-            updated_at_millis: 1_725_000_001_456,
-        });
+        let status = wire_status(
+            SandboxRecord {
+                id: SandboxId::from_root("metadata", &root),
+                canonical_root: root,
+                desired_state: DesiredState::Running,
+                actual_state: ActualState::Running,
+                setup_resolution: None,
+                tool_resolution: None,
+                image_resolution: None,
+                storage_resolution: None,
+                ssh_resolution: None,
+                last_operation_id: Some(operation_id),
+                updated_at_millis: 1_725_000_001_456,
+            },
+            gascan_core::policy::PolicyCompiler::workspace_image(),
+            None,
+        );
         assert_eq!(status.last_operation_id.map(|id| id.value), Some(17));
         assert_eq!(
             status
@@ -2660,6 +2840,231 @@ mod tests {
             Some((1_725_000_001, 456_000_000))
         );
         Ok(())
+    }
+
+    #[test]
+    fn wire_status_exposes_durable_image_upgrade_requirement() {
+        let root = Utf8PathBuf::from("/workspace/image-upgrade");
+        let current = "registry.example/workspace:old@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let status = wire_status(
+            SandboxRecord {
+                id: SandboxId::from_root("image-upgrade", &root),
+                canonical_root: root,
+                desired_state: DesiredState::Running,
+                actual_state: ActualState::Running,
+                setup_resolution: None,
+                tool_resolution: None,
+                image_resolution: Some(crate::ImageResolution::new(
+                    1,
+                    serde_json::json!({"digest": current}),
+                )),
+                storage_resolution: None,
+                ssh_resolution: None,
+                last_operation_id: None,
+                updated_at_millis: 1,
+            },
+            gascan_core::policy::PolicyCompiler::workspace_image(),
+            None,
+        );
+
+        assert_eq!(
+            status.apply_requirements,
+            vec![v1::ApplyRequirement {
+                reason: "image_changed".to_owned(),
+                current: current.to_owned(),
+                requested: include_str!("../../../images/workspace/approved-image.txt").to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn wire_status_uses_the_service_policy_image_for_upgrade_requirements() {
+        let root = Utf8PathBuf::from("/workspace/candidate-image-upgrade");
+        let current = "registry.example/workspace:old@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let candidate = "registry.example/workspace:candidate@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let status = wire_status(
+            SandboxRecord {
+                id: SandboxId::from_root("candidate-image-upgrade", &root),
+                canonical_root: root,
+                desired_state: DesiredState::Running,
+                actual_state: ActualState::Running,
+                setup_resolution: None,
+                tool_resolution: None,
+                image_resolution: Some(crate::ImageResolution::new(
+                    1,
+                    serde_json::json!({"digest": current}),
+                )),
+                storage_resolution: None,
+                ssh_resolution: None,
+                last_operation_id: None,
+                updated_at_millis: 1,
+            },
+            candidate,
+            None,
+        );
+
+        assert_eq!(
+            status.apply_requirements,
+            vec![v1::ApplyRequirement {
+                reason: "image_changed".to_owned(),
+                current: current.to_owned(),
+                requested: candidate.to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn wire_ssh_status_omits_endpoint_until_an_alias_is_active() {
+        let root = Utf8PathBuf::from("/workspace/ssh-inactive");
+        let record = SandboxRecord {
+            id: SandboxId::from_root("ssh-inactive", &root),
+            canonical_root: root,
+            desired_state: DesiredState::Running,
+            actual_state: ActualState::Running,
+            setup_resolution: None,
+            tool_resolution: None,
+            image_resolution: None,
+            storage_resolution: None,
+            ssh_resolution: Some(crate::SshResolution::new(
+                1,
+                serde_json::json!({
+                    "enabled": true,
+                    "host_key_fingerprint": "SHA256:host",
+                    "client_key_fingerprint": "SHA256:client",
+                }),
+            )),
+            last_operation_id: None,
+            updated_at_millis: 1,
+        };
+
+        assert_eq!(
+            wire_ssh_status(&record, None),
+            Some(v1::SshStatus {
+                enabled: true,
+                active: false,
+                host: None,
+                port: None,
+                alias: None,
+                host_key_fingerprint: None,
+                client_key_fingerprint: None,
+            })
+        );
+    }
+
+    #[test]
+    fn wire_ssh_status_reports_only_the_verified_active_alias()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = Utf8PathBuf::from("/workspace/ssh-active");
+        let id = SandboxId::from_root("ssh-active", &root);
+        let record = SandboxRecord {
+            id: id.clone(),
+            canonical_root: root,
+            desired_state: DesiredState::Running,
+            actual_state: ActualState::Running,
+            setup_resolution: None,
+            tool_resolution: None,
+            image_resolution: None,
+            storage_resolution: None,
+            ssh_resolution: Some(crate::SshResolution::new(
+                1,
+                serde_json::json!({
+                    "enabled": true,
+                    "host_key_fingerprint": "SHA256:host",
+                    "client_key_fingerprint": "SHA256:client",
+                }),
+            )),
+            last_operation_id: None,
+            updated_at_millis: 1,
+        };
+        let active = crate::ActiveSsh {
+            host: "127.0.0.1".parse()?,
+            port: 22222,
+            alias: format!("gascan-{id}"),
+            host_key_fingerprint: "SHA256:host".to_owned(),
+            client_key_fingerprint: "SHA256:client".to_owned(),
+        };
+
+        assert_eq!(
+            wire_ssh_status(&record, Some(&active)),
+            Some(v1::SshStatus {
+                enabled: true,
+                active: true,
+                host: Some("127.0.0.1".to_owned()),
+                port: Some(22222),
+                alias: Some(format!("gascan-{id}")),
+                host_key_fingerprint: Some("SHA256:host".to_owned()),
+                client_key_fingerprint: Some("SHA256:client".to_owned()),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wire_ssh_status_keeps_disabled_resolution_inactive() {
+        let root = Utf8PathBuf::from("/workspace/ssh-disabled");
+        let record = SandboxRecord {
+            id: SandboxId::from_root("ssh-disabled", &root),
+            canonical_root: root,
+            desired_state: DesiredState::Running,
+            actual_state: ActualState::Running,
+            setup_resolution: None,
+            tool_resolution: None,
+            image_resolution: None,
+            storage_resolution: None,
+            ssh_resolution: Some(crate::SshResolution::new(
+                1,
+                serde_json::json!({
+                    "enabled": false,
+                    "host_key_fingerprint": "",
+                    "client_key_fingerprint": "",
+                }),
+            )),
+            last_operation_id: None,
+            updated_at_millis: 1,
+        };
+
+        assert_eq!(
+            wire_ssh_status(&record, None),
+            Some(v1::SshStatus {
+                enabled: false,
+                active: false,
+                host: None,
+                port: None,
+                alias: None,
+                host_key_fingerprint: None,
+                client_key_fingerprint: None,
+            })
+        );
+    }
+
+    #[test]
+    fn missing_unsupported_and_malformed_resolutions_are_not_reported_as_disabled() {
+        let root = Utf8PathBuf::from("/workspace/ssh-unavailable");
+        let mut record = SandboxRecord {
+            id: SandboxId::from_root("ssh-unavailable", &root),
+            canonical_root: root,
+            desired_state: DesiredState::Running,
+            actual_state: ActualState::Running,
+            setup_resolution: None,
+            tool_resolution: None,
+            image_resolution: None,
+            storage_resolution: None,
+            ssh_resolution: None,
+            last_operation_id: None,
+            updated_at_millis: 1,
+        };
+
+        assert!(wire_status(record.clone(), "image", None).ssh.is_none());
+        record.ssh_resolution = Some(crate::SshResolution::new(
+            99,
+            serde_json::json!({"enabled": false}),
+        ));
+        assert!(wire_status(record.clone(), "image", None).ssh.is_none());
+        record.ssh_resolution = Some(crate::SshResolution::new(
+            1,
+            serde_json::json!({"enabled": false, "host_key_fingerprint": "unexpected"}),
+        ));
+        assert!(wire_status(record, "image", None).ssh.is_none());
     }
 
     #[test]
@@ -2678,6 +3083,43 @@ mod tests {
         let direct = service_status(ServiceError::Policy(PolicyError::DiskControlUnsupported));
         assert_eq!(direct.code(), tonic::Code::InvalidArgument);
         assert_eq!(direct.message(), error_code::DISK_CONTROL_UNSUPPORTED);
+    }
+
+    #[test]
+    fn replacement_error_wrappers_preserve_primary_public_status() {
+        let unavailable = service_status(ServiceError::ImageRollback {
+            original: Box::new(ServiceError::Runtime(
+                gascan_core::runtime::RuntimeError::NotFound {
+                    resource: "replacement".to_owned(),
+                },
+            )),
+            rollback: Box::new(ServiceError::Store(StoreError::InvalidTransition {
+                from: "pending".to_owned(),
+                to: "failed".to_owned(),
+            })),
+        });
+        assert_eq!(unavailable.code(), tonic::Code::Unavailable);
+        assert_eq!(unavailable.message(), error_code::BACKEND_UNAVAILABLE);
+
+        let precondition = service_status(ServiceError::FailureReporting {
+            original: Box::new(ServiceError::StorageChangeRequiresRecreate {
+                changes: vec![crate::service::StorageCapacityChange {
+                    volume: "tools",
+                    recorded_bytes: Some(1),
+                    requested_bytes: 2,
+                }],
+            }),
+            reporting: Box::new(ServiceError::Runtime(
+                gascan_core::runtime::RuntimeError::NotFound {
+                    resource: "terminal event".to_owned(),
+                },
+            )),
+        });
+        assert_eq!(precondition.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            precondition.message(),
+            gascan_proto::error_code::STORAGE_CHANGE_REQUIRES_RECREATE
+        );
     }
 
     #[test]

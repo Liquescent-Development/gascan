@@ -1,7 +1,7 @@
 use std::{
     fs,
     io::Write,
-    os::unix::fs::{symlink, PermissionsExt},
+    os::unix::fs::{PermissionsExt, symlink},
     process::{Command, Stdio},
 };
 
@@ -14,7 +14,10 @@ fn run_with_limit(
     limit: usize,
 ) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_sanitize-build-output"));
-    command.arg(output).arg(limit.to_string()).stdin(Stdio::piped());
+    command
+        .arg(output)
+        .arg(limit.to_string())
+        .stdin(Stdio::piped());
     if let Some((name, value)) = env {
         command.env(name, value);
     }
@@ -53,9 +56,11 @@ fn oversized_safe_output_preserves_the_terminal_failure_with_an_omission_marker(
     assert!(result.status.success(), "{:?}", result);
     let diagnostic = fs::read(&path).unwrap();
     assert!(diagnostic.len() <= 131_073);
-    assert!(diagnostic
-        .windows(terminal.len())
-        .any(|window| window == terminal));
+    assert!(
+        diagnostic
+            .windows(terminal.len())
+            .any(|window| window == terminal)
+    );
     assert!(
         String::from_utf8_lossy(&diagnostic).contains("[... middle diagnostic output omitted ...]")
     );

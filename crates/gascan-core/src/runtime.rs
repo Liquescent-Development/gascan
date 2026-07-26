@@ -253,8 +253,33 @@ pub enum ContainerState {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeSandbox {
     pub id: SandboxId,
+    pub image: String,
     pub state: ContainerState,
     pub ownership: OwnershipMetadata,
+    #[serde(default)]
+    pub(crate) ports: Vec<RuntimePort>,
+}
+
+impl RuntimeSandbox {
+    pub fn observed(
+        id: SandboxId,
+        image: String,
+        state: ContainerState,
+        ownership: OwnershipMetadata,
+        ports: Vec<RuntimePort>,
+    ) -> Self {
+        Self {
+            id,
+            image,
+            state,
+            ownership,
+            ports,
+        }
+    }
+
+    pub fn ports(&self) -> &[RuntimePort] {
+        &self.ports
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -505,6 +530,188 @@ impl RuntimeResource {
     }
 }
 
+/// Exact retained runtime observations authorized by a validated create request.
+///
+/// Callers cannot forge retained evidence with a struct literal.
+///
+/// ```compile_fail
+/// use gascan_core::runtime::RetainedResources;
+///
+/// let _forged = RetainedResources { resources: Vec::new() };
+/// ```
+///
+/// Serialized diagnostics cannot be deserialized into retained evidence.
+///
+/// ```compile_fail
+/// use gascan_core::runtime::RetainedResources;
+///
+/// let _forged: RetainedResources = serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RetainedResources {
+    resources: Vec<RuntimeResource>,
+}
+
+impl RetainedResources {
+    pub fn new(
+        request: &CreateRequest,
+        resources: Vec<RuntimeResource>,
+    ) -> Result<Self, RuntimeError> {
+        validate_retained_resources(request, &resources)?;
+        Ok(Self { resources })
+    }
+
+    pub fn resources(&self) -> &[RuntimeResource] {
+        &self.resources
+    }
+}
+
+/// A validated desired topology paired with exact retained runtime evidence.
+///
+/// Callers cannot forge recreation requests with a struct literal.
+///
+/// ```compile_fail
+/// use gascan_core::runtime::{CreateRequest, RecreateRequest, RetainedResources};
+///
+/// fn parts() -> (CreateRequest, RetainedResources) {
+///     todo!()
+/// }
+/// let (create, retained) = parts();
+/// let _forged = RecreateRequest { create, retained };
+/// ```
+///
+/// Serialized diagnostics cannot be deserialized into recreation authority.
+///
+/// ```compile_fail
+/// use gascan_core::runtime::RecreateRequest;
+///
+/// let _forged: RecreateRequest = serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RecreateRequest {
+    create: CreateRequest,
+    retained: RetainedResources,
+}
+
+impl RecreateRequest {
+    pub fn new(create: CreateRequest, retained: RetainedResources) -> Result<Self, RuntimeError> {
+        validate_retained_resources(&create, retained.resources())?;
+        Ok(Self { create, retained })
+    }
+
+    pub fn for_image(
+        mut create: CreateRequest,
+        image: String,
+        retained: RetainedResources,
+    ) -> Result<Self, RuntimeError> {
+        if !immutable_image_reference(&image) {
+            return Err(RuntimeError::InvalidState {
+                resource: "recreate image".to_owned(),
+                message: "image must be a nonempty named sha256 digest reference".to_owned(),
+            });
+        }
+        create.image = image;
+        Self::new(create, retained)
+    }
+
+    pub const fn create(&self) -> &CreateRequest {
+        &self.create
+    }
+
+    pub const fn retained(&self) -> &RetainedResources {
+        &self.retained
+    }
+}
+
+pub fn immutable_image_reference(image: &str) -> bool {
+    let Some((name, digest)) = image.split_once("@sha256:") else {
+        return false;
+    };
+    valid_image_name(name)
+        && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub fn same_immutable_image(left: &str, right: &str) -> bool {
+    let Some(left) = immutable_image_identity(left) else {
+        return false;
+    };
+    let Some(right) = immutable_image_identity(right) else {
+        return false;
+    };
+    left == right
+}
+
+fn immutable_image_identity(image: &str) -> Option<(&str, &str)> {
+    if !immutable_image_reference(image) {
+        return None;
+    }
+    let (name, digest) = image.split_once("@sha256:")?;
+    let last_slash = name.rfind('/');
+    let tag_separator = name
+        .rfind(':')
+        .filter(|separator| last_slash.is_none_or(|slash| *separator > slash));
+    let repository = tag_separator.map_or(name, |separator| &name[..separator]);
+    Some((repository, digest))
+}
+
+fn valid_image_name(name: &str) -> bool {
+    if name.is_empty() || !name.is_ascii() || name.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return false;
+    }
+    let last_slash = name.rfind('/');
+    let tag_separator = name
+        .rfind(':')
+        .filter(|separator| last_slash.is_none_or(|slash| *separator > slash));
+    let (repository, tag) = tag_separator.map_or((name, None), |separator| {
+        (&name[..separator], Some(&name[separator + 1..]))
+    });
+    if tag.is_some_and(|tag| {
+        tag.is_empty()
+            || tag.len() > 128
+            || !tag
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            || !tag
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    }) {
+        return false;
+    }
+    repository
+        .split('/')
+        .enumerate()
+        .all(|(index, component)| valid_repository_component(component, index == 0))
+}
+
+fn valid_repository_component(component: &str, allow_port: bool) -> bool {
+    let (component, port) = if allow_port {
+        component
+            .split_once(':')
+            .map_or((component, None), |(host, port)| (host, Some(port)))
+    } else {
+        (component, None)
+    };
+    if port.is_some_and(|port| port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit())) {
+        return false;
+    }
+    !component.is_empty()
+        && component
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && component
+            .bytes()
+            .last()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && component.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateOutcome {
     created: Vec<RuntimeResource>,
@@ -521,6 +728,14 @@ impl CreateOutcome {
 
     pub fn created(&self) -> &[RuntimeResource] {
         &self.created
+    }
+
+    pub fn for_recreate(
+        request: &RecreateRequest,
+        created: Vec<RuntimeResource>,
+    ) -> Result<Self, RuntimeError> {
+        validate_recreated_container(request.create(), &created)?;
+        Ok(Self { created })
     }
 }
 
@@ -618,6 +833,62 @@ fn allowed_network(request: &CreateRequest) -> Option<ResourceIdentity> {
         })
 }
 
+fn validate_retained_resources(
+    request: &CreateRequest,
+    resources: &[RuntimeResource],
+) -> Result<(), RuntimeError> {
+    let expected_volumes = request
+        .volumes()
+        .iter()
+        .map(|volume| ResourceIdentity::new(ResourceKind::Volume, volume.name.clone()))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let expected_network = allowed_network(request);
+    let mut identities = BTreeSet::new();
+    for resource in resources {
+        let expected = expected_volumes.contains(resource.identity())
+            || expected_network.as_ref() == Some(resource.identity());
+        if !expected
+            || resource.ownership() != ResourceOwnership::GasCanOwned
+            || resource.sandbox_id() != Some(request.id())
+            || !identities.insert(resource.identity().clone())
+        {
+            return Err(RuntimeError::OwnershipMismatch {
+                resource: resource.name().to_owned(),
+            });
+        }
+    }
+    let expected_count = expected_volumes.len() + usize::from(expected_network.is_some());
+    if identities.len() != expected_count {
+        return Err(RuntimeError::InvalidState {
+            resource: request.id().to_string(),
+            message: "retained resources do not exactly match the requested topology".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_recreated_container(
+    request: &CreateRequest,
+    created: &[RuntimeResource],
+) -> Result<(), RuntimeError> {
+    let expected = ResourceIdentity::new(ResourceKind::Container, request.id().to_string())?;
+    let [container] = created else {
+        return Err(RuntimeError::InvalidState {
+            resource: request.id().to_string(),
+            message: "recreate outcome must contain exactly the requested container".to_owned(),
+        });
+    };
+    if container.identity() != &expected
+        || container.ownership() != ResourceOwnership::GasCanOwned
+        || container.sandbox_id() != Some(request.id())
+    {
+        return Err(RuntimeError::OwnershipMismatch {
+            resource: container.name().to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_created_resources(
     request: &CreateRequest,
     created: &[RuntimeResource],
@@ -698,6 +969,8 @@ pub enum RuntimeCall {
     Capabilities,
     Inspect(SandboxId),
     Create(CreateRequest),
+    PrepareImage(String),
+    CreateContainer(RecreateRequest),
     Start(SandboxId),
     Stop(SandboxId),
     Remove(RemoveRequest),
@@ -718,6 +991,11 @@ pub trait RuntimeBackend: Send + Sync {
     async fn capabilities(&self) -> Result<RuntimeCapabilities, RuntimeError>;
     async fn inspect(&self, id: &SandboxId) -> Result<Option<RuntimeSandbox>, RuntimeError>;
     async fn create(&self, request: CreateRequest) -> Result<CreateOutcome, CreateFailure>;
+    async fn prepare_image(&self, image: &str) -> Result<(), RuntimeError>;
+    async fn create_container(
+        &self,
+        request: RecreateRequest,
+    ) -> Result<CreateOutcome, CreateFailure>;
     async fn start(&self, id: &SandboxId) -> Result<(), RuntimeError>;
     async fn stop(&self, id: &SandboxId) -> Result<(), RuntimeError>;
     async fn remove(&self, request: RemoveRequest) -> Result<(), RuntimeError>;

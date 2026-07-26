@@ -144,6 +144,21 @@ message OperationEvent {
 }
 
 message StatusRequest { SandboxSelector sandbox = 1; reserved 2; }
+message ApplyRequirement {
+  string reason = 1;
+  string current = 2;
+  string requested = 3;
+  reserved 4;
+}
+message SshStatus {
+  bool enabled = 1;
+  bool active = 2;
+  optional string host = 3;
+  optional uint32 port = 4;
+  optional string alias = 5;
+  optional string host_key_fingerprint = 6;
+  optional string client_key_fingerprint = 7;
+}
 message SandboxStatus {
   string sandbox_id = 1;
   DesiredState desired_state = 2;
@@ -152,6 +167,8 @@ message SandboxStatus {
   google.protobuf.Timestamp updated_at = 5;
   repeated Capability capabilities = 6;
   reserved 7;
+  repeated ApplyRequirement apply_requirements = 8;
+  SshStatus ssh = 9;
 }
 message StatusResponse { SandboxStatus sandbox = 1; reserved 2; }
 message ListRequest { reserved 1; }

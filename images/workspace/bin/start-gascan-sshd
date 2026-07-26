@@ -1,0 +1,337 @@
+#!/bin/sh
+set -eu
+
+die()
+{
+    printf 'gascan sshd: %s\n' "$*" >&2
+    exit 1
+}
+
+test_root=${GASCAN_SSH_CONTRACT_TEST_ROOT:-}
+if test -n "$test_root"; then
+    case "$test_root" in /*) ;; *) die 'contract test root must be absolute' ;; esac
+    test ! -L "$test_root" && test -d "$test_root" ||
+        die 'contract test root is unsafe'
+    owner_uid=$(id -u)
+    owner_gid=$(id -g)
+    sshd_bin=${GASCAN_SSH_CONTRACT_TEST_SSHD:-/usr/sbin/sshd}
+    prepare_only=${GASCAN_SSH_CONTRACT_TEST_PREPARE_ONLY:-0}
+else
+    test "$(id -u)" = 0 || die 'initialization requires root'
+    owner_uid=0
+    owner_gid=0
+    sshd_bin=/usr/sbin/sshd
+    prepare_only=0
+fi
+
+workspace_uid=1000
+workspace_gid=1000
+fresh_config_uid=0
+fresh_config_gid=0
+test -z "$test_root" || {
+    workspace_uid=$owner_uid
+    workspace_gid=$owner_gid
+    fresh_config_uid=$owner_uid
+    fresh_config_gid=$owner_gid
+}
+
+config_root=$test_root/home/workspace/.config/gascan
+ssh_root=$test_root/home/workspace/.config/gascan/ssh
+host_root=$test_root/home/workspace/.config/gascan/ssh/host
+host_key=$test_root/home/workspace/.config/gascan/ssh/host/ssh_host_ed25519_key
+host_public_key=$test_root/home/workspace/.config/gascan/ssh/host/ssh_host_ed25519_key.pub
+authorized_keys=$test_root/home/workspace/.config/gascan/ssh/authorized_keys
+sshd_config=$test_root/home/workspace/.config/gascan/ssh/sshd_config
+runtime_root=$test_root/run/sshd
+
+path_exists()
+{
+    test -e "$1" || test -L "$1"
+}
+
+metadata()
+{
+    if test -n "$test_root"; then
+        stat -f '%HT:%u:%g:%p:%l' "$1"
+    else
+        stat -c '%F:%u:%g:%a:%h' "$1"
+    fi
+}
+
+directory_metadata()
+{
+    if test -n "$test_root"; then
+        case "$3" in
+            700) file_mode=40700 ;;
+            755) file_mode=40755 ;;
+            1770) file_mode=41770 ;;
+            *) die "unsupported contract-test directory mode: $3" ;;
+        esac
+        printf 'Directory:%s:%s:%s:' "$1" "$2" "$file_mode"
+    else
+        printf 'directory:%s:%s:%s:' "$1" "$2" "$3"
+    fi
+}
+
+regular_metadata()
+{
+    if test -n "$test_root"; then
+        case "$3" in
+            600) file_mode=100600 ;;
+            644) file_mode=100644 ;;
+            *) die "unsupported contract-test regular mode: $3" ;;
+        esac
+        printf 'Regular File:%s:%s:%s:1' "$1" "$2" "$file_mode"
+    else
+        printf 'regular file:%s:%s:%s:1' "$1" "$2" "$3"
+    fi
+}
+
+validate_directory()
+{
+    path=$1
+    uid=$2
+    gid=$3
+    mode=$4
+    test ! -L "$path" && test -d "$path" ||
+        die "unsafe managed directory: $path"
+    expected=$(directory_metadata "$uid" "$gid" "$mode")
+    case "$(metadata "$path")" in
+        "$expected"*) ;;
+        *) die "managed directory metadata changed: $path" ;;
+    esac
+}
+
+ensure_directory()
+{
+    path=$1
+    uid=$2
+    gid=$3
+    mode=$4
+    if path_exists "$path"; then
+        validate_directory "$path" "$uid" "$gid" "$mode"
+        return
+    fi
+    mkdir "$path" || die "cannot create managed directory: $path"
+    chown "$uid:$gid" "$path"
+    chmod "$mode" "$path"
+    validate_directory "$path" "$uid" "$gid" "$mode"
+}
+
+validate_regular()
+{
+    path=$1
+    uid=$2
+    gid=$3
+    mode=$4
+    test ! -L "$path" && test -f "$path" ||
+        die "unsafe managed file: $path"
+    test "$(metadata "$path")" = "$(regular_metadata "$uid" "$gid" "$mode")" ||
+        die "managed file metadata changed: $path"
+}
+
+validate_replace_target()
+{
+    path=$1
+    uid=$2
+    gid=$3
+    mode=$4
+    path_exists "$path" || return 0
+    validate_regular "$path" "$uid" "$gid" "$mode"
+}
+
+validate_fresh_config_root()
+{
+    unexpected=$(find "$config_root" -mindepth 1 -maxdepth 1 ! -name lost+found -print -quit)
+    test -z "$unexpected" ||
+        die 'root-owned Gas Can config root contains unexpected state'
+    lost_found=$config_root/lost+found
+    if path_exists "$lost_found"; then
+        validate_directory "$lost_found" "$owner_uid" "$owner_gid" 700
+        test -z "$(find "$lost_found" -mindepth 1 -print -quit)" ||
+            die 'Gas Can config volume lost+found is not empty'
+    fi
+}
+
+validate_authorized_key()
+{
+    key=$1
+    test -n "$key" || die 'authorized key is required'
+    printf '%s\n' "$key" |
+        awk '
+            BEGIN { valid = 0 }
+            index($0, "\r") != 0 { exit 1 }
+            NR == 1 && NF >= 2 && $1 == "ssh-ed25519" { valid = 1; next }
+            { exit 1 }
+            END { exit !(valid && NR == 1) }
+        ' || die 'authorized key must be one Ed25519 public-key record'
+}
+
+key=${GASCAN_SSH_AUTHORIZED_KEY:-}
+validate_authorized_key "$key"
+
+validation_key=$(mktemp "${TMPDIR:-/tmp}/gascan-authorized-key.XXXXXX") ||
+    die 'cannot create authorized-key validation file'
+authorized_tmp=
+config_tmp=
+public_tmp=
+generation_root=
+cleanup()
+{
+    test -z "$validation_key" || rm -f "$validation_key"
+    test -z "$authorized_tmp" || rm -f "$authorized_tmp"
+    test -z "$config_tmp" || rm -f "$config_tmp"
+    test -z "$public_tmp" || rm -f "$public_tmp"
+    test -z "$generation_root" || rm -rf "$generation_root"
+}
+trap cleanup EXIT HUP INT TERM
+chmod 0600 "$validation_key"
+printf '%s\n' "$key" >"$validation_key"
+ssh-keygen -l -f "$validation_key" >/dev/null 2>&1 ||
+    die 'authorized Ed25519 public key is malformed'
+
+test ! -L "$test_root/home" && test -d "$test_root/home" ||
+    die 'workspace home parent is unsafe'
+test ! -L "$test_root/home/workspace" && test -d "$test_root/home/workspace" ||
+    die 'workspace home is unsafe'
+test ! -L "$test_root/home/workspace/.config" &&
+    test -d "$test_root/home/workspace/.config" ||
+    die 'workspace config parent is unsafe'
+test ! -L "$config_root" && test -d "$config_root" ||
+    die 'Gas Can config root is unsafe'
+if test -z "$test_root"; then
+    config_mount=$(findmnt -n -o TARGET -T "$config_root") ||
+        die 'Gas Can config volume is unavailable'
+    test "$config_mount" = "$config_root" ||
+        die 'Gas Can config root is not its own mount'
+fi
+
+config_metadata=$(metadata "$config_root")
+workspace_config_metadata=$(directory_metadata "$workspace_uid" "$workspace_gid" 700)
+managed_config_metadata=$(directory_metadata "$owner_uid" "$workspace_gid" 1770)
+root_config_metadata_755=$(directory_metadata "$fresh_config_uid" "$fresh_config_gid" 755)
+root_config_metadata_700=$(directory_metadata "$fresh_config_uid" "$fresh_config_gid" 700)
+case "$config_metadata" in
+    "$managed_config_metadata"*) ;;
+    "$workspace_config_metadata"*)
+        chown "$owner_uid:$workspace_gid" "$config_root"
+        chmod 1770 "$config_root"
+        ;;
+    "$root_config_metadata_755"*|"$root_config_metadata_700"*)
+        validate_fresh_config_root
+        chown "$owner_uid:$workspace_gid" "$config_root"
+        chmod 1770 "$config_root"
+        ;;
+    *) die 'Gas Can config root metadata changed' ;;
+esac
+validate_directory "$config_root" "$owner_uid" "$workspace_gid" 1770
+
+ensure_directory "$ssh_root" "$owner_uid" "$owner_gid" 700
+ensure_directory "$host_root" "$owner_uid" "$owner_gid" 700
+
+if path_exists "$host_key"; then
+    validate_regular "$host_key" "$owner_uid" "$owner_gid" 600
+    ssh-keygen -y -P '' -f "$host_key" >/dev/null 2>&1 ||
+        die 'existing SSH host private key is invalid'
+    public_tmp=$(mktemp "$host_root/.host-public.XXXXXX")
+    chmod 0644 "$public_tmp"
+    chown "$owner_uid:$owner_gid" "$public_tmp"
+    ssh-keygen -y -P '' -f "$host_key" >"$public_tmp"
+    awk 'NR == 1 && NF == 2 && $1 == "ssh-ed25519" { valid = 1 } END { exit !(valid && NR == 1) }' \
+        "$public_tmp" || die 'existing SSH host private key is not Ed25519'
+    if path_exists "$host_public_key"; then
+        validate_regular "$host_public_key" "$owner_uid" "$owner_gid" 644
+        cmp -s "$public_tmp" "$host_public_key" ||
+            die 'SSH host public key does not match its private key'
+        rm -f "$public_tmp"
+        public_tmp=
+    else
+        mv -f "$public_tmp" "$host_public_key"
+        public_tmp=
+        validate_regular "$host_public_key" "$owner_uid" "$owner_gid" 644
+    fi
+else
+    path_exists "$host_public_key" &&
+        die 'SSH host public key exists without its private key'
+    generation_root=$(mktemp -d "$host_root/.generate.XXXXXX")
+    chmod 0700 "$generation_root"
+    chown "$owner_uid:$owner_gid" "$generation_root"
+    generated_key=$generation_root/ssh_host_ed25519_key
+    ssh-keygen -q -t ed25519 -N '' -C '' -f "$generated_key"
+    ssh-keygen -y -P '' -f "$generated_key" >"$generated_key.pub"
+    chown "$owner_uid:$owner_gid" "$generated_key" "$generated_key.pub"
+    chmod 0600 "$generated_key"
+    chmod 0644 "$generated_key.pub"
+    validate_regular "$generated_key" "$owner_uid" "$owner_gid" 600
+    validate_regular "$generated_key.pub" "$owner_uid" "$owner_gid" 644
+    ssh-keygen -y -P '' -f "$generated_key" >/dev/null 2>&1 ||
+        die 'generated SSH host key is invalid'
+    mv -f "$generated_key" "$host_key"
+    mv -f "$generated_key.pub" "$host_public_key"
+    rmdir "$generation_root"
+    generation_root=
+    validate_regular "$host_key" "$owner_uid" "$owner_gid" 600
+    validate_regular "$host_public_key" "$owner_uid" "$owner_gid" 644
+fi
+
+authorized_tmp=$(mktemp "$ssh_root/.authorized-keys.XXXXXX")
+chmod 0600 "$authorized_tmp"
+chown "$owner_uid:$owner_gid" "$authorized_tmp"
+printf '%s\n' "$key" >"$authorized_tmp"
+validate_regular "$authorized_tmp" "$owner_uid" "$owner_gid" 600
+validate_replace_target "$authorized_keys" "$owner_uid" "$owner_gid" 600
+mv -f "$authorized_tmp" "$authorized_keys"
+authorized_tmp=
+validate_regular "$authorized_keys" "$owner_uid" "$owner_gid" 600
+
+test ! -L "$test_root/run" && test -d "$test_root/run" ||
+    die 'runtime parent is unsafe'
+ensure_directory "$runtime_root" "$owner_uid" "$owner_gid" 755
+
+config_tmp=$(mktemp "$ssh_root/.sshd-config.XXXXXX")
+chmod 0600 "$config_tmp"
+chown "$owner_uid:$owner_gid" "$config_tmp"
+{
+    printf '%s\n' \
+        'AddressFamily inet' \
+        'ListenAddress 0.0.0.0' \
+        'Port 22' \
+        "HostKey $host_key" \
+        'AuthorizedKeysFile none' \
+        "AuthorizedKeysCommand /bin/cat $authorized_keys" \
+        'AuthorizedKeysCommandUser root' \
+        "PidFile $test_root/run/gascan-sshd.pid" \
+        'PasswordAuthentication no' \
+        'KbdInteractiveAuthentication no' \
+        'ChallengeResponseAuthentication no' \
+        'PermitRootLogin no' \
+        'PubkeyAuthentication yes' \
+        'AuthenticationMethods publickey' \
+        'AllowUsers workspace' \
+        'PermitUserEnvironment no' \
+        'AllowAgentForwarding no' \
+        'AllowTcpForwarding local' \
+        'AllowStreamLocalForwarding no' \
+        'PermitOpen 127.0.0.1:*' \
+        'GatewayPorts no' \
+        'PermitTunnel no' \
+        'X11Forwarding no' \
+        'StrictModes yes' \
+        'UsePAM yes' \
+        'PrintMotd no' \
+        'PermitUserRC no' \
+        'Subsystem sftp internal-sftp' \
+        'SetEnv HOME=/home/workspace USER=workspace LOGNAME=workspace LANG=C.UTF-8 LC_ALL=C.UTF-8 MISE_CACHE_DIR=/home/workspace/.cache/mise MISE_DATA_DIR=/home/workspace/.local/share/mise MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml MISE_STATE_DIR=/home/workspace/.config/gascan/mise-state MISE_SYSTEM_DATA_DIR=/opt/gascan/mise PATH=/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+} >"$config_tmp"
+validate_regular "$config_tmp" "$owner_uid" "$owner_gid" 600
+"$sshd_bin" -t -f "$config_tmp"
+validate_replace_target "$sshd_config" "$owner_uid" "$owner_gid" 600
+mv -f "$config_tmp" "$sshd_config"
+config_tmp=
+validate_regular "$sshd_config" "$owner_uid" "$owner_gid" 600
+
+rm -f "$validation_key"
+validation_key=
+trap - EXIT HUP INT TERM
+test "$prepare_only" = 1 && exit 0
+exec "$sshd_bin" -D -e -f "$sshd_config"

@@ -79,6 +79,10 @@ fn invalid_variant_digest_fails_closed() {
         format!("sha256:{}", "A".repeat(64)),
         format!("sha256:{}", "a".repeat(63)),
     ] {
-        assert!(!validate(&inspect("linux", "arm64", &digest)).status.success());
+        assert!(
+            !validate(&inspect("linux", "arm64", &digest))
+                .status
+                .success()
+        );
     }
 }

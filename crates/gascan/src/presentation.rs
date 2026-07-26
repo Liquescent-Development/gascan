@@ -1,4 +1,5 @@
 use console::{Style, Term};
+use gascan_proto::ssh_status::{SshState, classify as classify_ssh};
 use gascan_proto::v1;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::fmt::Write as _;
@@ -145,8 +146,9 @@ pub(crate) fn render_doctor(checks: &[DoctorCheck], capabilities: OutputCapabili
                 .map_or(check.id.as_str(), |(_, id)| id);
             let check_heading = styled_heading(&humanize(check_id), "✗", false, capabilities);
             let _ = writeln!(output, "    {check_heading}");
-            if !check.detail.is_empty() {
-                let _ = writeln!(output, "      {}", check.detail);
+            let detail = human_doctor_detail(check);
+            if !detail.is_empty() {
+                let _ = writeln!(output, "      {detail}");
             }
             if !check.remedy.is_empty() {
                 let _ = writeln!(output, "      Fix: {}", check.remedy);
@@ -156,15 +158,71 @@ pub(crate) fn render_doctor(checks: &[DoctorCheck], capabilities: OutputCapabili
     output
 }
 
+fn human_doctor_detail(check: &DoctorCheck) -> &str {
+    match check.id.as_str() {
+        "ssh.identity" => "Managed SSH identity is missing, incomplete, or unsafe",
+        "ssh.config" => "Managed SSH configuration is missing, inconsistent, or unsafe",
+        _ => &check.detail,
+    }
+}
+
 pub(crate) fn render_status(
     status: &v1::SandboxStatus,
     _capabilities: OutputCapabilities,
 ) -> String {
-    format!(
+    let mut output = format!(
         "Sandbox: {}\nState:   {}\n",
         status.sandbox_id,
         human_state(status.actual_state)
-    )
+    );
+    match classify_ssh(status) {
+        SshState::Ready => {
+            let ssh = status.ssh.as_ref();
+            let _ = writeln!(
+                output,
+                "SSH     {} ({}:{})",
+                ssh.and_then(|value| value.alias.as_deref())
+                    .unwrap_or_default(),
+                ssh.and_then(|value| value.host.as_deref())
+                    .unwrap_or_default(),
+                ssh.and_then(|value| value.port).unwrap_or_default()
+            );
+        }
+        SshState::Disabled => output.push_str("SSH     Disabled\n"),
+        SshState::Starting => output.push_str("SSH     Starting\n"),
+        SshState::Unhealthy => output.push_str("SSH     Unhealthy\n"),
+        SshState::Unavailable => output.push_str("SSH     Unavailable\n"),
+    }
+    let image_changes = status
+        .apply_requirements
+        .iter()
+        .filter(|requirement| requirement.reason == "image_changed")
+        .collect::<Vec<_>>();
+    if !image_changes.is_empty() {
+        output.push_str("\nUpdate available\n");
+        for requirement in image_changes {
+            let _ = writeln!(
+                output,
+                "  Workspace image  {} → {}",
+                short_image_reference(&requirement.current),
+                short_image_reference(&requirement.requested)
+            );
+        }
+        output.push_str("  Run gascan apply\n");
+    }
+    output
+}
+
+fn short_image_reference(reference: &str) -> String {
+    let Some((name, digest)) = reference.rsplit_once("@sha256:") else {
+        return reference.to_owned();
+    };
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return reference.to_owned();
+    }
+    let leaf = name.rsplit('/').next().unwrap_or(name);
+    let digest = &digest[..12];
+    format!("{leaf}@sha256:{digest}…")
 }
 
 pub(crate) fn render_list(
@@ -320,6 +378,9 @@ impl OperationProgress {
             ("created", _) => Some("Creating sandbox"),
             ("started", _) => Some("Starting sandbox"),
             ("apply_required", _) => Some("Preparing configuration changes"),
+            ("before_image_replace", _) => Some("Preparing workspace image"),
+            ("image_replacing", _) => Some("Replacing sandbox container"),
+            ("image_rollback", _) => Some("Restoring previous workspace image"),
             ("before_health", _) => Some("Checking sandbox health"),
             ("provision_step", Some(v1::ProvisionStep::WriteSafeMiseConfig)) => {
                 Some("Writing safe mise configuration")
@@ -489,6 +550,27 @@ mod tests {
     }
 
     #[test]
+    fn passing_ssh_doctor_facts_are_compact_and_hide_success_details() {
+        let report = gascan_core::doctor::DoctorFacts::all_supported_for_tests().into_report();
+        let checks = report
+            .checks
+            .into_iter()
+            .map(|check| DoctorCheck {
+                id: check.id,
+                status: "pass".to_owned(),
+                detail: "/Users/example/.config/gascan/ssh/identity_ed25519".to_owned(),
+                remedy: check.remedy,
+            })
+            .collect::<Vec<_>>();
+
+        let output = render_doctor(&checks, OutputCapabilities::plain());
+
+        assert!(output.contains("  Ssh"));
+        assert!(output.contains("4/4 checks passed"));
+        assert!(!output.contains("/Users/example"));
+    }
+
+    #[test]
     fn mixed_doctor_report_expands_only_failed_checks() {
         let checks = vec![
             check("host.release", "pass", "passing release detail", ""),
@@ -509,6 +591,32 @@ mod tests {
         assert!(output.contains("Fix: install a supported runtime"));
         assert!(!output.contains("passing release detail"));
         assert!(!output.contains("passing version detail"));
+    }
+
+    #[test]
+    fn failed_ssh_checks_hide_managed_paths_and_raw_errors() {
+        let checks = vec![
+            check(
+                "ssh.identity",
+                "fail",
+                "managed SSH identity at /Users/example/.config/gascan/ssh/identity_ed25519 is unsafe: private-key-sentinel",
+                "restore the managed identity",
+            ),
+            check(
+                "ssh.config",
+                "fail",
+                "generated SSH config at /Users/example/.config/gascan/ssh/config was rejected: raw-openssh-error",
+                "regenerate the managed config",
+            ),
+        ];
+
+        let output = render_doctor(&checks, OutputCapabilities::plain());
+
+        assert!(output.contains("Managed SSH identity is missing, incomplete, or unsafe"));
+        assert!(output.contains("Managed SSH configuration is missing, inconsistent, or unsafe"));
+        assert!(!output.contains("/Users/example"));
+        assert!(!output.contains("private-key-sentinel"));
+        assert!(!output.contains("raw-openssh-error"));
     }
 
     #[test]
@@ -533,7 +641,101 @@ mod tests {
                 &status("code-123", v1::ActualState::Running),
                 OutputCapabilities::plain()
             ),
-            "Sandbox: code-123\nState:   Running\n"
+            "Sandbox: code-123\nState:   Running\nSSH     Unavailable\n"
+        );
+    }
+
+    #[test]
+    fn status_reports_image_update_with_truncated_digests() {
+        let mut status = status("code-123", v1::ActualState::Running);
+        status.apply_requirements.push(v1::ApplyRequirement {
+            reason: "image_changed".to_owned(),
+            current: "registry.example/workspace:old@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            requested: "registry.example/workspace:new@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+        });
+
+        assert_eq!(
+            render_status(&status, OutputCapabilities::plain()),
+            "Sandbox: code-123\nState:   Running\nSSH     Unavailable\n\nUpdate available\n  Workspace image  workspace:old@sha256:aaaaaaaaaaaa… → workspace:new@sha256:bbbbbbbbbbbb…\n  Run gascan apply\n"
+        );
+    }
+
+    #[test]
+    fn status_reports_the_active_native_ssh_alias_and_endpoint() {
+        let mut status = status("code-123", v1::ActualState::Running);
+        status.ssh = Some(v1::SshStatus {
+            enabled: true,
+            active: true,
+            host: Some("127.0.0.1".to_owned()),
+            port: Some(22222),
+            alias: Some("gascan-code-123".to_owned()),
+            host_key_fingerprint: Some("SHA256:host".to_owned()),
+            client_key_fingerprint: Some("SHA256:client".to_owned()),
+        });
+
+        assert_eq!(
+            render_status(&status, OutputCapabilities::plain()),
+            "Sandbox: code-123\nState:   Running\nSSH     gascan-code-123 (127.0.0.1:22222)\n"
+        );
+    }
+
+    #[test]
+    fn status_never_presents_incomplete_or_missing_ssh_state_as_ready() {
+        let missing = status("code-123", v1::ActualState::Running);
+        assert_eq!(
+            render_status(&missing, OutputCapabilities::plain()),
+            "Sandbox: code-123\nState:   Running\nSSH     Unavailable\n"
+        );
+
+        let mut incomplete = status("code-123", v1::ActualState::Running);
+        incomplete.ssh = Some(v1::SshStatus {
+            enabled: true,
+            active: true,
+            host: Some("127.0.0.1".to_owned()),
+            port: Some(22222),
+            alias: Some("gascan-code-123".to_owned()),
+            host_key_fingerprint: None,
+            client_key_fingerprint: Some("SHA256:client".to_owned()),
+        });
+        assert_eq!(
+            render_status(&incomplete, OutputCapabilities::plain()),
+            "Sandbox: code-123\nState:   Running\nSSH     Unhealthy\n"
+        );
+    }
+
+    #[test]
+    fn image_reference_summary_handles_tagged_untagged_ports_and_malformed_values() {
+        let digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert_eq!(
+            short_image_reference(&format!("registry.example/team/repo:old@sha256:{digest}")),
+            "repo:old@sha256:aaaaaaaaaaaa…"
+        );
+        assert_eq!(
+            short_image_reference(&format!("registry.example/team/repo@sha256:{digest}")),
+            "repo@sha256:aaaaaaaaaaaa…"
+        );
+        assert_eq!(
+            short_image_reference(&format!("localhost:5000/team/repo:old@sha256:{digest}")),
+            "repo:old@sha256:aaaaaaaaaaaa…"
+        );
+        assert_eq!(
+            short_image_reference("registry.example/team/repo:old"),
+            "registry.example/team/repo:old"
+        );
+    }
+
+    #[test]
+    fn unknown_apply_requirements_do_not_reach_human_output() {
+        let mut status = status("code-123", v1::ActualState::Running);
+        status.apply_requirements.push(v1::ApplyRequirement {
+            reason: "future_reason".to_owned(),
+            current: "private-current".to_owned(),
+            requested: "private-requested".to_owned(),
+        });
+
+        assert_eq!(
+            render_status(&status, OutputCapabilities::plain()),
+            "Sandbox: code-123\nState:   Running\nSSH     Unavailable\n"
         );
     }
 
@@ -641,6 +843,24 @@ mod tests {
         let mut unknown = event("private_internal_phase");
         unknown.payload = b"secret-material".to_vec();
         assert_eq!(progress.update(&unknown), None);
+    }
+
+    #[test]
+    fn image_replacement_phases_use_professional_progress_copy() {
+        let (mut progress, _) =
+            OperationProgress::new(OperationKind::Apply, None, OutputCapabilities::plain());
+        assert_eq!(
+            progress.update(&event("before_image_replace")).as_deref(),
+            Some("Preparing workspace image")
+        );
+        assert_eq!(
+            progress.update(&event("image_replacing")).as_deref(),
+            Some("Replacing sandbox container")
+        );
+        assert_eq!(
+            progress.update(&event("image_rollback")).as_deref(),
+            Some("Restoring previous workspace image")
+        );
     }
 
     #[test]

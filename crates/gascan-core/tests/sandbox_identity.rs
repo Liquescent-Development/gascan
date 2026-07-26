@@ -1,6 +1,6 @@
 use camino::Utf8Path;
 use gascan_core::manifest::Manifest;
-use gascan_core::sandbox::{SandboxId, SandboxSpec, WORKSPACE_TARGET};
+use gascan_core::sandbox::{SandboxId, SandboxSpec, SshStatus, WORKSPACE_TARGET};
 
 #[test]
 fn canonical_path_produces_stable_noncolliding_id() {
@@ -108,5 +108,29 @@ fn sandbox_id_deserialization_rejects_unchecked_strings() {
     assert_eq!(
         serde_json::from_str::<SandboxId>(&encoded).expect("deserialize checked ID"),
         generated
+    );
+}
+
+#[test]
+fn ssh_status_reports_durable_identity_and_ephemeral_connection_state() {
+    let status = SshStatus {
+        enabled: true,
+        active: true,
+        host: Some("127.0.0.1".to_owned()),
+        port: Some(49152),
+        alias: Some("gascan-fixture".to_owned()),
+        host_key_fingerprint: Some("SHA256:host".to_owned()),
+        client_key_fingerprint: Some("SHA256:client".to_owned()),
+    };
+
+    assert!(status.enabled);
+    assert!(status.active);
+    assert_eq!(status.host.as_deref(), Some("127.0.0.1"));
+    assert_eq!(status.port, Some(49152));
+    assert_eq!(status.alias.as_deref(), Some("gascan-fixture"));
+    assert_eq!(status.host_key_fingerprint.as_deref(), Some("SHA256:host"));
+    assert_eq!(
+        status.client_key_fingerprint.as_deref(),
+        Some("SHA256:client")
     );
 }

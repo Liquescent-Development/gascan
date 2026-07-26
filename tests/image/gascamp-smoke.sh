@@ -33,6 +33,8 @@ image=$(bash "$root/scripts/validate-connected-image-receipt.sh" "$reference_fil
   printf 'image reference is not digest-qualified\n' >&2
   exit 1
 }
+image_digest=${image##*@}
+local_image=$(approved_local_image "$image")
 owner_token=${GASCAN_TEST_OWNER_TOKEN:-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')}
 [[ "$owner_token" =~ ^[0-9a-f]{32}$ ]] || { printf 'invalid owner token\n' >&2; exit 1; }
 name="gascan-image-gascamp-test-$owner_token"
@@ -42,6 +44,9 @@ owned() {
   inspect=$(bounded_container inspect "$name") || return 1
   printf '%s' "$inspect" | cargo run --quiet --locked --offline \
     --manifest-path "$root/scripts/Cargo.toml" --bin validate-owned-container -- "$name" "$owner_token"
+}
+owned_image() {
+  owned_container_from_approved_image "$name" "$owner_token" "$image_digest" "$local_image"
 }
 cleanup() {
   $cleaning && return
@@ -54,10 +59,11 @@ cleanup() {
 on_signal() { trap - EXIT INT TERM; cleanup; exit 130; }
 trap cleanup EXIT
 trap on_signal INT TERM
-"$container_bin" create --name "$name" --label dev.gascan.test=true \
-  --label "dev.gascan.test.owner=$owner_token" "$image" >/dev/null
-owned
+"$container_bin" create --name "$name" --init --label dev.gascan.test=true \
+  --label "dev.gascan.test.owner=$owner_token" "$local_image" >/dev/null
+owned_image
 "$container_bin" start "$name" >/dev/null
+owned_image
 "$container_bin" exec "$name" bash -ceu '
   revision=f6b248c5926240856dbea83d1d2c5c90ea1c1456
   test "$(cat /opt/gascan/gascamp/REVISION)" = "$revision"

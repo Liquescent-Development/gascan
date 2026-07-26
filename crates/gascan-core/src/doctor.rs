@@ -8,6 +8,99 @@ pub enum DoctorStatus {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DoctorCheckRole {
+    ReadinessPrerequisite,
+    OperationalDiagnostic,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DoctorCheckId {
+    HostArchitecture,
+    HostMacos,
+    RuntimeCli,
+    RuntimeVersion,
+    RuntimeService,
+    RuntimeKernel,
+    RuntimeSchema,
+    StorageState,
+    StorageImages,
+    WorkspaceAccess,
+    RuntimeBindMounts,
+    RuntimeNamedVolumes,
+    RuntimeTty,
+    RuntimeSignals,
+    RuntimeLoopbackPublish,
+    RuntimeResourceLimits,
+    RuntimeOffline,
+    SshClient,
+    SshIdentity,
+    SshConfig,
+    SshNativePublish,
+}
+
+impl DoctorCheckId {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HostArchitecture => "host.architecture",
+            Self::HostMacos => "host.macos",
+            Self::RuntimeCli => "runtime.cli",
+            Self::RuntimeVersion => "runtime.version",
+            Self::RuntimeService => "runtime.service",
+            Self::RuntimeKernel => "runtime.kernel",
+            Self::RuntimeSchema => "runtime.schema",
+            Self::StorageState => "storage.state",
+            Self::StorageImages => "storage.images",
+            Self::WorkspaceAccess => "workspace.access",
+            Self::RuntimeBindMounts => "runtime.bind_mounts",
+            Self::RuntimeNamedVolumes => "runtime.named_volumes",
+            Self::RuntimeTty => "runtime.tty",
+            Self::RuntimeSignals => "runtime.signals",
+            Self::RuntimeLoopbackPublish => "runtime.loopback_publish",
+            Self::RuntimeResourceLimits => "runtime.resource_limits",
+            Self::RuntimeOffline => "runtime.offline",
+            Self::SshClient => "ssh.client",
+            Self::SshIdentity => "ssh.identity",
+            Self::SshConfig => "ssh.config",
+            Self::SshNativePublish => "ssh.native_publish",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "host.architecture" => Self::HostArchitecture,
+            "host.macos" => Self::HostMacos,
+            "runtime.cli" => Self::RuntimeCli,
+            "runtime.version" => Self::RuntimeVersion,
+            "runtime.service" => Self::RuntimeService,
+            "runtime.kernel" => Self::RuntimeKernel,
+            "runtime.schema" => Self::RuntimeSchema,
+            "storage.state" => Self::StorageState,
+            "storage.images" => Self::StorageImages,
+            "workspace.access" => Self::WorkspaceAccess,
+            "runtime.bind_mounts" => Self::RuntimeBindMounts,
+            "runtime.named_volumes" => Self::RuntimeNamedVolumes,
+            "runtime.tty" => Self::RuntimeTty,
+            "runtime.signals" => Self::RuntimeSignals,
+            "runtime.loopback_publish" => Self::RuntimeLoopbackPublish,
+            "runtime.resource_limits" => Self::RuntimeResourceLimits,
+            "runtime.offline" => Self::RuntimeOffline,
+            "ssh.client" => Self::SshClient,
+            "ssh.identity" => Self::SshIdentity,
+            "ssh.config" => Self::SshConfig,
+            "ssh.native_publish" => Self::SshNativePublish,
+            _ => return None,
+        })
+    }
+
+    pub const fn role(self) -> DoctorCheckRole {
+        match self {
+            Self::SshIdentity | Self::SshConfig => DoctorCheckRole::OperationalDiagnostic,
+            _ => DoctorCheckRole::ReadinessPrerequisite,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DoctorFact {
     pub status: DoctorStatus,
@@ -54,6 +147,10 @@ pub struct DoctorFacts {
     pub loopback_publish: DoctorFact,
     pub resource_limits: DoctorFact,
     pub offline: DoctorFact,
+    pub ssh_client: DoctorFact,
+    pub ssh_identity: DoctorFact,
+    pub ssh_config: DoctorFact,
+    pub ssh_native_publish: DoctorFact,
 }
 
 impl DoctorFacts {
@@ -78,6 +175,10 @@ impl DoctorFacts {
             loopback_publish: fact(),
             resource_limits: fact(),
             offline: fact(),
+            ssh_client: fact(),
+            ssh_identity: fact(),
+            ssh_config: fact(),
+            ssh_native_publish: fact(),
         }
     }
     #[cfg(debug_assertions)]
@@ -102,102 +203,126 @@ impl DoctorFacts {
             loopback_publish: pass(),
             resource_limits: pass(),
             offline: pass(),
+            ssh_client: pass(),
+            ssh_identity: pass(),
+            ssh_config: pass(),
+            ssh_native_publish: pass(),
         }
     }
 
     pub fn into_report(self) -> DoctorReport {
         let entries = [
             (
-                "host.architecture",
+                DoctorCheckId::HostArchitecture,
                 self.architecture,
                 "run gascan on Apple silicon",
             ),
             (
-                "host.macos",
+                DoctorCheckId::HostMacos,
                 self.macos,
                 "upgrade this host to macOS 26 or newer",
             ),
             (
-                "runtime.cli",
+                DoctorCheckId::RuntimeCli,
                 self.cli,
                 "install Apple container 1.1.0 in PATH",
             ),
             (
-                "runtime.version",
+                DoctorCheckId::RuntimeVersion,
                 self.version,
                 "install the supported Apple container 1.1.0 release",
             ),
             (
-                "runtime.service",
+                DoctorCheckId::RuntimeService,
                 self.service,
                 "run `container system start` and retry",
             ),
             (
-                "runtime.kernel",
+                DoctorCheckId::RuntimeKernel,
                 self.kernel,
                 "run `container system start`, install its recommended kernel, and retry",
             ),
             (
-                "runtime.schema",
+                DoctorCheckId::RuntimeSchema,
                 self.schema,
                 "install matching Apple container 1.1.0 CLI and service components",
             ),
             (
-                "storage.state",
+                DoctorCheckId::StorageState,
                 self.state_storage,
                 "free disk space in the Apple container application root",
             ),
             (
-                "storage.images",
+                DoctorCheckId::StorageImages,
                 self.image_storage,
                 "free disk space on the Apple application/state/image filesystem",
             ),
             (
-                "workspace.access",
+                DoctorCheckId::WorkspaceAccess,
                 self.workspace,
                 "grant gascan read/write access to the canonical workspace",
             ),
             (
-                "runtime.bind_mounts",
+                DoctorCheckId::RuntimeBindMounts,
                 self.bind_mounts,
                 "install a supported Apple container release with bind-mount support",
             ),
             (
-                "runtime.named_volumes",
+                DoctorCheckId::RuntimeNamedVolumes,
                 self.named_volumes,
                 "install a supported Apple container release with named-volume support",
             ),
             (
-                "runtime.tty",
+                DoctorCheckId::RuntimeTty,
                 self.tty,
                 "install a supported Apple container release with TTY support",
             ),
             (
-                "runtime.signals",
+                DoctorCheckId::RuntimeSignals,
                 self.signals,
                 "install a supported Apple container release with signal support",
             ),
             (
-                "runtime.loopback_publish",
+                DoctorCheckId::RuntimeLoopbackPublish,
                 self.loopback_publish,
                 "install a supported Apple container release with loopback publication support",
             ),
             (
-                "runtime.resource_limits",
+                DoctorCheckId::RuntimeResourceLimits,
                 self.resource_limits,
                 "install a supported Apple container release with resource-limit support",
             ),
             (
-                "runtime.offline",
+                DoctorCheckId::RuntimeOffline,
                 self.offline,
                 "install a supported Apple container release with proven offline isolation",
+            ),
+            (
+                DoctorCheckId::SshClient,
+                self.ssh_client,
+                "install the system OpenSSH client at /usr/bin/ssh",
+            ),
+            (
+                DoctorCheckId::SshIdentity,
+                self.ssh_identity,
+                "restore the matching managed SSH identity and safe permissions; otherwise destroy and recreate affected sandboxes",
+            ),
+            (
+                DoctorCheckId::SshConfig,
+                self.ssh_config,
+                "remove unsafe generated SSH config state, then run `gascan up`",
+            ),
+            (
+                DoctorCheckId::SshNativePublish,
+                self.ssh_native_publish,
+                "install a supported Apple container release with loopback publication support",
             ),
         ];
         DoctorReport {
             checks: entries
                 .into_iter()
                 .map(|(id, fact, remedy)| DoctorCheck {
-                    id: id.to_owned(),
+                    id: id.as_str().to_owned(),
                     status: fact.status,
                     detail: fact.detail,
                     remedy: remedy.to_owned(),
@@ -228,5 +353,13 @@ impl DoctorReport {
         self.checks
             .iter()
             .all(|check| check.status == DoctorStatus::Pass)
+    }
+
+    pub fn runtime_readiness_failure(&self) -> Option<&DoctorCheck> {
+        self.checks.iter().find(|check| {
+            check.status != DoctorStatus::Pass
+                && DoctorCheckId::from_name(&check.id)
+                    .is_none_or(|id| id.role() == DoctorCheckRole::ReadinessPrerequisite)
+        })
     }
 }

@@ -1,33 +1,1752 @@
 use async_trait::async_trait;
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
+use gascan_core::doctor::{DoctorFacts, DoctorStatus};
 use gascan_core::fake_runtime::{FailureBoundary, FakeRuntime};
 use gascan_core::manifest::Manifest;
 use gascan_core::policy::PolicyCompiler;
-use gascan_core::runtime::{ResourceKind, ResourceOwnership, RuntimeBackend, RuntimeCall};
-use gascan_core::sandbox::SandboxSpec;
-use gascand::{NoopProvisioner, OperationStatus, SandboxService, UpRequest};
+use gascan_core::runtime::{
+    ContainerState, RemoveRequest, ResourceIdentity, ResourceKind, ResourceOwnership,
+    RuntimeBackend, RuntimeCall, RuntimeError,
+};
+use gascan_core::sandbox::{SandboxId, SandboxSpec};
+use gascan_proto::v1;
+use gascan_proto::v1::gas_can_server::GasCan;
+use gascand::{
+    ActivityTracker, ActualState, DesiredState, NoopProvisioner, OperationKind, OperationStatus,
+    PortReservation, SandboxApi, SandboxRecord, SandboxService, SshConfigCommitFault, SshManager,
+    SshPaths, SshResolution, Store, UpRequest, ensure_host_identity,
+};
 use gascand::{ProvisionRequest, ProvisionResolution, Provisioner, ServiceError};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use std::error::Error;
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+use std::os::unix::fs::PermissionsExt;
+use std::process::Command;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
+use tokio_stream::StreamExt as _;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
 fn networked_spec(name: &str, root: &Utf8Path) -> Result<SandboxSpec, Box<dyn Error>> {
     std::fs::write(
         root.join("gascan.toml"),
-        "version = 1\nnetwork = 'networked'\n",
+        "version = 1\nnetwork = 'networked'\n[ssh]\nenabled = false\n",
     )?;
     Ok(SandboxSpec::from_root(name, root, Manifest::load(root)?)?)
 }
 
+fn networked_ssh_spec(
+    name: &str,
+    root: &Utf8Path,
+    host_port: Option<u16>,
+) -> Result<SandboxSpec, Box<dyn Error>> {
+    let port = host_port.map_or_else(String::new, |port| format!("host_port = {port}\n"));
+    std::fs::write(
+        root.join("gascan.toml"),
+        format!("version = 1\nnetwork = 'networked'\n[ssh]\n{port}"),
+    )?;
+    Ok(SandboxSpec::from_root(name, root, Manifest::load(root)?)?)
+}
+
+fn networked_ssh_with_application_port_spec(
+    name: &str,
+    root: &Utf8Path,
+    ssh_host_port: u16,
+) -> Result<SandboxSpec, Box<dyn Error>> {
+    std::fs::write(
+        root.join("gascan.toml"),
+        format!(
+            "version = 1\nnetwork = 'networked'\n\
+             [ports]\nweb = 30_000\n\
+             [ssh]\nhost_port = {ssh_host_port}\n"
+        ),
+    )?;
+    Ok(SandboxSpec::from_root(name, root, Manifest::load(root)?)?)
+}
+
+fn ssh_paths(root: &Utf8Path, name: &str) -> Result<SshPaths, Box<dyn Error>> {
+    let home = root.join(name);
+    std::fs::create_dir(&home)?;
+    let home = std::fs::canonicalize(home)?;
+    Ok(SshPaths::for_environment(None, Some(home.as_os_str()))?)
+}
+
+fn test_service(
+    runtime: FakeRuntime,
+    root: &Utf8Path,
+    paths: SshPaths,
+) -> Result<SandboxService<FakeRuntime>, Box<dyn Error>> {
+    Ok(SandboxService::new_with_ssh_for_tests(
+        runtime,
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+        paths,
+        Utf8PathBuf::from("/usr/bin/true"),
+    ))
+}
+
+fn readiness_program(
+    root: &Utf8Path,
+    name: &str,
+    body: &str,
+) -> Result<Utf8PathBuf, Box<dyn Error>> {
+    let path = root.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}\n"))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    Ok(path)
+}
+
+fn capturing_readiness_program(
+    root: &Utf8Path,
+    name: &str,
+    capture: &Utf8Path,
+) -> Result<Utf8PathBuf, Box<dyn Error>> {
+    readiness_program(
+        root,
+        name,
+        &format!("printf '%s\\n' \"$@\" > '{}'", capture),
+    )
+}
+
+fn gated_readiness_program(
+    root: &Utf8Path,
+    name: &str,
+    port: u16,
+    entered: &Utf8Path,
+    release: &Utf8Path,
+) -> Result<Utf8PathBuf, Box<dyn Error>> {
+    readiness_program(
+        root,
+        name,
+        &format!(
+            "for arg do\n  if [ \"$arg\" = \"Port={port}\" ]; then\n    /usr/bin/touch '{entered}'\n    while [ ! -e '{release}' ]; do /bin/sleep 0.01; done\n  fi\ndone"
+        ),
+    )
+}
+
+async fn wait_for_path(path: &Utf8Path) -> Result<(), Box<dyn Error>> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| format!("timed out waiting for {path}"))?;
+    Ok(())
+}
+
+async fn generated_public_key(root: &Utf8Path, name: &str) -> Result<String, Box<dyn Error>> {
+    let paths = ssh_paths(root, name)?;
+    Ok(ensure_host_identity(&paths).await?.public_key().to_owned())
+}
+
+fn sandbox_record(
+    id: SandboxId,
+    root: &Utf8Path,
+    actual_state: ActualState,
+    ssh_resolution: Option<SshResolution>,
+) -> SandboxRecord {
+    SandboxRecord {
+        id,
+        canonical_root: root.to_owned(),
+        desired_state: DesiredState::Running,
+        actual_state,
+        setup_resolution: None,
+        tool_resolution: None,
+        image_resolution: None,
+        storage_resolution: None,
+        ssh_resolution,
+        last_operation_id: None,
+        updated_at_millis: 0,
+    }
+}
+
+fn service_with_readiness(
+    runtime: FakeRuntime,
+    root: &Utf8Path,
+    paths: SshPaths,
+    readiness: Utf8PathBuf,
+) -> Result<SandboxService<FakeRuntime>, Box<dyn Error>> {
+    Ok(SandboxService::new_with_ssh_for_tests(
+        runtime,
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+        paths,
+        readiness,
+    ))
+}
+
 fn spec(name: &str, root: &Utf8Path) -> Result<SandboxSpec, Box<dyn Error>> {
     Ok(SandboxSpec::from_root(name, root, Manifest::load(root)?)?)
+}
+
+fn rewrite_runtime_image(path: &Utf8Path, image: &str) -> TestResult {
+    let mut snapshot: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    let sandboxes = snapshot["sandboxes"]
+        .as_array_mut()
+        .ok_or("runtime sandboxes")?;
+    let sandbox = sandboxes.first_mut().ok_or("runtime sandbox")?;
+    sandbox["image"] = json!(image);
+    std::fs::write(path, serde_json::to_vec(&snapshot)?)?;
+    Ok(())
+}
+
+fn clear_stored_ssh_transport_policy(
+    state_path: &Utf8Path,
+    id: &gascan_core::sandbox::SandboxId,
+) -> TestResult {
+    let connection = rusqlite::Connection::open(state_path)?;
+    let updated = connection.execute(
+        "UPDATE sandboxes
+         SET ssh_transport_enabled = NULL, ssh_transport_host_port = NULL
+         WHERE id = ?1",
+        [id.as_str()],
+    )?;
+    assert_eq!(updated, 1);
+    let policy: (Option<i64>, Option<i64>) = connection.query_row(
+        "SELECT ssh_transport_enabled, ssh_transport_host_port
+         FROM sandboxes WHERE id = ?1",
+        [id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(policy, (None, None));
+    Ok(())
+}
+
+fn loopback_port_collision(port: u16) -> RuntimeError {
+    RuntimeError::CommandFailed {
+        operation: "container".to_owned(),
+        exit_code: Some(1),
+        stderr: format!("Error: listen tcp 127.0.0.1:{port}: bind: address already in use\n"),
+    }
+}
+
+fn apple_bootstrap_port_collision() -> RuntimeError {
+    RuntimeError::CommandFailed {
+        operation: "container".to_owned(),
+        exit_code: Some(1),
+        stderr: "Error: failed to bootstrap container (cause: \
+                 bind(descriptor:ptr:bytes:): Address already in use) (errno: 48)\n"
+            .to_owned(),
+    }
+}
+
+#[test]
+fn automatic_ssh_port_reservation_is_loopback_unprivileged_and_exclusive() -> TestResult {
+    let reservation = PortReservation::reserve()?;
+    let port = reservation.port();
+    assert!((1024..=u16::MAX).contains(&port));
+    assert!(
+        TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).is_err(),
+        "the reservation must remain live until explicitly released"
+    );
+    reservation.release();
+    let rebound = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))?;
+    assert_eq!(
+        rebound.local_addr()?,
+        std::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn explicit_ssh_port_bypasses_automatic_reservation() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let occupied = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+    let port = occupied.local_addr()?.port();
+    let desired = networked_ssh_spec("explicit-bypass", root, Some(port))?;
+    let paths = ssh_paths(root, "ssh-explicit-bypass")?;
+
+    let prepared = SshManager
+        .prepare_create_for_paths(&desired, &paths)
+        .await?
+        .ok_or("enabled SSH preparation")?;
+
+    assert_eq!(prepared.host_port(), port);
+    drop(occupied);
+    Ok(())
+}
+
+#[tokio::test]
+async fn automatic_ssh_port_retries_exactly_eight_native_bind_collisions() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let desired = networked_ssh_spec("automatic-retries", root, None)?;
+    let runtime = FakeRuntime::default();
+    for _ in 0..8 {
+        runtime.queue_ssh_port_collision().await;
+    }
+    let service = test_service(
+        runtime.clone(),
+        root,
+        ssh_paths(root, "ssh-automatic-retries")?,
+    )?;
+
+    let error = match service.up(UpRequest::new(desired)).await {
+        Ok(_) => return Err("eight collisions unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "ssh_port_unavailable");
+    assert_eq!(
+        runtime
+            .calls()
+            .await
+            .iter()
+            .filter(|call| matches!(call, RuntimeCall::Create(_)))
+            .count(),
+        8
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn explicit_ssh_port_collision_never_retries_or_substitutes() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let port = PortReservation::reserve()?.port();
+    let desired = networked_ssh_spec("explicit-collision", root, Some(port))?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .queue_create_error(loopback_port_collision(port))
+        .await;
+    let service = test_service(
+        runtime.clone(),
+        root,
+        ssh_paths(root, "ssh-explicit-collision")?,
+    )?;
+
+    let error = match service.up(UpRequest::new(desired)).await {
+        Ok(_) => return Err("an explicit collision unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "ssh_port_unavailable");
+    let creates = runtime
+        .calls()
+        .await
+        .into_iter()
+        .filter_map(|call| match call {
+            RuntimeCall::Create(request) => Some(request),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(creates.len(), 1);
+    assert!(creates[0].ports().iter().any(|mapping| {
+        mapping.host_address == std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)
+            && mapping.host_port == port
+            && mapping.guest_port == 22
+    }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn explicit_ssh_port_maps_apple_bootstrap_collision_without_retry() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let occupied = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+    let port = occupied.local_addr()?.port();
+    let desired = networked_ssh_spec("apple-explicit-collision", root, Some(port))?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .queue_create_error(apple_bootstrap_port_collision())
+        .await;
+    let service = test_service(
+        runtime.clone(),
+        root,
+        ssh_paths(root, "ssh-apple-explicit-collision")?,
+    )?;
+
+    let error = match service.up(UpRequest::new(desired)).await {
+        Ok(_) => return Err("an Apple bootstrap collision unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "ssh_port_unavailable");
+    assert_eq!(
+        runtime
+            .calls()
+            .await
+            .iter()
+            .filter(|call| matches!(call, RuntimeCall::Create(_)))
+            .count(),
+        1
+    );
+    drop(occupied);
+    Ok(())
+}
+
+#[tokio::test]
+async fn apple_bootstrap_collision_with_application_port_is_not_relabelled_as_ssh() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let port = PortReservation::reserve()?.port();
+    let desired =
+        networked_ssh_with_application_port_spec("apple-application-collision", root, port)?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .queue_create_error(apple_bootstrap_port_collision())
+        .await;
+    let service = test_service(
+        runtime.clone(),
+        root,
+        ssh_paths(root, "ssh-apple-application-collision")?,
+    )?;
+
+    let error = match service.up(UpRequest::new(desired)).await {
+        Ok(_) => return Err("an application collision unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "command_failed");
+    assert_eq!(
+        runtime
+            .calls()
+            .await
+            .iter()
+            .filter(|call| matches!(call, RuntimeCall::Create(_)))
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn apple_bootstrap_collision_on_ssh_port_with_application_mapping_is_actionable() -> TestResult
+{
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let occupied = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+    let port = occupied.local_addr()?.port();
+    if port == 30_000 {
+        return Err("ephemeral SSH test port collided with the application fixture port".into());
+    }
+    let desired = networked_ssh_with_application_port_spec("apple-ssh-collision", root, port)?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .queue_create_error(apple_bootstrap_port_collision())
+        .await;
+    let service = test_service(
+        runtime.clone(),
+        root,
+        ssh_paths(root, "ssh-apple-ssh-collision")?,
+    )?;
+
+    let error = match service.up(UpRequest::new(desired)).await {
+        Ok(_) => return Err("a mixed-port SSH collision unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "ssh_port_unavailable");
+    assert_eq!(
+        runtime
+            .calls()
+            .await
+            .iter()
+            .filter(|call| matches!(call, RuntimeCall::Create(_)))
+            .count(),
+        1
+    );
+    drop(occupied);
+    Ok(())
+}
+
+#[tokio::test]
+async fn nonmatching_loopback_collision_is_not_retried_or_relabelled_as_ssh() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let desired = networked_ssh_spec("application-collision", root, Some(26_001))?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .queue_create_error(loopback_port_collision(30_000))
+        .await;
+    let service = test_service(
+        runtime.clone(),
+        root,
+        ssh_paths(root, "ssh-application-collision")?,
+    )?;
+
+    let error = match service.up(UpRequest::new(desired)).await {
+        Ok(_) => return Err("an application collision unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "command_failed");
+    assert_eq!(
+        runtime
+            .calls()
+            .await
+            .iter()
+            .filter(|call| matches!(call, RuntimeCall::Create(_)))
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn networked_default_create_injects_client_key_and_native_loopback_mapping() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-networked-create")?;
+    let client = ensure_host_identity(&paths).await?;
+    let host_public_key = generated_public_key(root, "host-networked-create").await?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    runtime.queue_created_ssh_host_port(23_456).await;
+    let service = test_service(runtime.clone(), root, paths)?;
+    let desired = networked_ssh_spec("networked-create", root, None)?;
+
+    service.up(UpRequest::new(desired.clone())).await?;
+
+    let create = runtime
+        .calls()
+        .await
+        .into_iter()
+        .find_map(|call| match call {
+            RuntimeCall::Create(request) => Some(request),
+            _ => None,
+        })
+        .ok_or("create request")?;
+    assert_eq!(
+        create
+            .environment()
+            .get("GASCAN_SSH_AUTHORIZED_KEY")
+            .map(String::as_str),
+        Some(client.public_key())
+    );
+    assert_eq!(
+        create.environment().get("GASCAN_SSH_ENABLED"),
+        Some(&"1".to_owned())
+    );
+    assert!(create.ports().iter().any(|port| {
+        port.host_address == std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)
+            && port.guest_port == 22
+            && port.host_port >= 1024
+    }));
+    assert_eq!(
+        runtime
+            .inspect(desired.id())
+            .await?
+            .ok_or("runtime sandbox")?
+            .ports(),
+        [gascan_core::runtime::RuntimePort {
+            host_address: std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+            host_port: 23_456,
+            guest_port: 22,
+        }]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn offline_default_create_injects_no_key_and_publishes_no_ssh_port() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let desired = spec("offline-no-ssh", root)?;
+    let runtime = FakeRuntime::default();
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    );
+
+    service.up(UpRequest::new(desired)).await?;
+
+    let create = runtime
+        .calls()
+        .await
+        .into_iter()
+        .find_map(|call| match call {
+            RuntimeCall::Create(request) => Some(request),
+            _ => None,
+        })
+        .ok_or("create request")?;
+    assert_eq!(
+        create.environment().get("GASCAN_SSH_ENABLED"),
+        Some(&"0".to_owned())
+    );
+    assert!(
+        !create
+            .environment()
+            .contains_key("GASCAN_SSH_AUTHORIZED_KEY")
+    );
+    assert!(
+        create
+            .ports()
+            .iter()
+            .all(|mapping| mapping.guest_port != 22)
+    );
+    Ok(())
+}
+
+#[test]
+fn disabled_offline_prepare_ignores_missing_home_and_xdg_config_home() -> TestResult {
+    const CHILD: &str = "GASCAN_DISABLED_SSH_NO_HOME_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let temp = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+        let desired = spec("offline-no-home", root)?;
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        let prepared = runtime.block_on(SshManager.prepare_create(&desired))?;
+        assert!(prepared.is_none());
+        return Ok(());
+    }
+
+    let output = Command::new(std::env::current_exe()?)
+        .arg("--exact")
+        .arg("disabled_offline_prepare_ignores_missing_home_and_xdg_config_home")
+        .arg("--nocapture")
+        .env(CHILD, "1")
+        .env_remove("HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "disabled SSH consulted host paths:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ssh_up_inspects_mapping_reads_host_key_runs_strict_readiness_and_commits_alias()
+-> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-up-sequence")?;
+    let client = ensure_host_identity(&paths).await?;
+    let host_public_key = generated_public_key(root, "host-up-sequence").await?;
+    let capture = root.join("readiness-args");
+    let readiness = capturing_readiness_program(root, "capture-readiness", &capture)?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    runtime.queue_created_ssh_host_port(23_457).await;
+    let service = service_with_readiness(runtime.clone(), root, paths.clone(), readiness)?;
+    let desired = networked_ssh_spec("ssh-up-sequence", root, None)?;
+
+    service.up(UpRequest::new(desired.clone())).await?;
+
+    let calls = runtime.calls().await;
+    let start = calls
+        .iter()
+        .position(|call| matches!(call, RuntimeCall::Start(id) if id == desired.id()))
+        .ok_or("start")?;
+    let mapping_inspect = calls
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find_map(|(index, call)| {
+            matches!(call, RuntimeCall::Inspect(id) if id == desired.id()).then_some(index)
+        })
+        .ok_or("mapping inspect")?;
+    let host_key = calls
+        .iter()
+        .enumerate()
+        .skip(mapping_inspect + 1)
+        .find_map(|(index, call)| match call {
+            RuntimeCall::Exec(request)
+                if request.argv
+                    == [
+                        "/usr/bin/sudo",
+                        "-n",
+                        "/usr/bin/cat",
+                        "/home/workspace/.config/gascan/ssh/host/ssh_host_ed25519_key.pub",
+                    ] =>
+            {
+                Some(index)
+            }
+            _ => None,
+        })
+        .ok_or("fixed host-key read")?;
+    assert!(start < mapping_inspect && mapping_inspect < host_key);
+
+    let args = std::fs::read_to_string(&capture)?;
+    for required in [
+        "-F",
+        "/dev/null",
+        "HostName=127.0.0.1",
+        "Port=23457",
+        "User=workspace",
+        "StrictHostKeyChecking=yes",
+        "IdentitiesOnly=yes",
+        "BatchMode=yes",
+        "ForwardAgent=no",
+        "ClearAllForwardings=yes",
+        "127.0.0.1",
+        "/usr/bin/true",
+    ] {
+        assert!(
+            args.lines().any(|argument| argument == required),
+            "missing readiness argument {required:?}: {args}"
+        );
+    }
+    assert!(
+        args.lines()
+            .any(|argument| { argument == format!("IdentityFile={}", client.private_key()) })
+    );
+    assert!(
+        args.lines()
+            .any(|argument| argument.starts_with("UserKnownHostsFile="))
+    );
+
+    let record = service.status(desired.id())?.ok_or("sandbox record")?;
+    let resolution = record.ssh_resolution.ok_or("SSH resolution")?;
+    assert_eq!(resolution.version, 1);
+    assert_eq!(resolution.details["enabled"], true);
+    assert_eq!(
+        resolution.details["client_key_fingerprint"],
+        client.fingerprint()
+    );
+    assert!(std::fs::read_to_string(paths.config())?.contains(&format!(
+        "Host gascan-{}\n    HostName 127.0.0.1\n    Port 23457",
+        desired.id()
+    )));
+    Ok(())
+}
+
+#[tokio::test]
+async fn ssh_down_removes_alias_before_attempting_runtime_stop() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-down-order")?;
+    let host_public_key = generated_public_key(root, "host-down-order").await?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let service = test_service(runtime.clone(), root, paths.clone())?;
+    let desired = networked_ssh_spec("ssh-down-order", root, None)?;
+    service.up(UpRequest::new(desired.clone())).await?;
+    runtime.inject_failure(FailureBoundary::Stop).await;
+
+    assert!(service.stop(desired.id()).await.is_err());
+
+    assert!(
+        !std::fs::read_to_string(paths.config())?
+            .contains(&format!("Host gascan-{}", desired.id()))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ssh_up_after_down_restores_same_inspected_native_mapping() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-down-up")?;
+    let host_public_key = generated_public_key(root, "host-down-up").await?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    runtime.queue_created_ssh_host_port(23_458).await;
+    let service = test_service(runtime.clone(), root, paths.clone())?;
+    let desired = networked_ssh_spec("ssh-down-up", root, None)?;
+    service.up(UpRequest::new(desired.clone())).await?;
+    service.stop(desired.id()).await?;
+
+    service.up(UpRequest::new(desired.clone())).await?;
+
+    let config = std::fs::read_to_string(paths.config())?;
+    assert!(config.contains(&format!("Host gascan-{}", desired.id())));
+    assert!(config.contains("    Port 23458\n"));
+    assert_eq!(
+        runtime
+            .inspect(desired.id())
+            .await?
+            .ok_or("runtime")?
+            .ports()[0]
+            .host_port,
+        23_458
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ssh_destroy_removes_alias_and_sandbox_resources_but_retains_client_identity() -> TestResult
+{
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-destroy")?;
+    let client = ensure_host_identity(&paths).await?;
+    let host_public_key = generated_public_key(root, "host-destroy").await?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let service = test_service(runtime.clone(), root, paths.clone())?;
+    let desired = networked_ssh_spec("ssh-destroy", root, None)?;
+    service.up(UpRequest::new(desired.clone())).await?;
+
+    service.destroy(desired.id()).await?;
+
+    assert!(
+        !std::fs::read_to_string(paths.config())?
+            .contains(&format!("Host gascan-{}", desired.id()))
+    );
+    assert!(client.private_key().exists());
+    assert!(paths.public_key().exists());
+    assert!(runtime.list_resources().await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn ssh_up_after_destroy_accepts_new_host_key_and_replaces_durable_trust() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let state_path = root.join("state.db");
+    let paths = ssh_paths(root, "ssh-destroy-recreate")?;
+    let first_host_public_key = generated_public_key(root, "host-destroy-recreate-first").await?;
+    let second_host_public_key = generated_public_key(root, "host-destroy-recreate-second").await?;
+    assert_ne!(first_host_public_key, second_host_public_key);
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(
+            format!("{first_host_public_key}\n").into_bytes(),
+            Vec::new(),
+            0,
+        )
+        .await;
+    runtime.queue_created_ssh_host_port(23_460).await;
+    let service = test_service(runtime.clone(), root, paths.clone())?;
+    let desired = networked_ssh_spec("ssh-destroy-recreate", root, None)?;
+
+    service.up(UpRequest::new(desired.clone())).await?;
+    let first_resolution = service
+        .status(desired.id())?
+        .ok_or("first sandbox record")?
+        .ssh_resolution
+        .ok_or("first SSH resolution")?;
+
+    service.destroy(desired.id()).await?;
+
+    let destroyed = service.status(desired.id())?.ok_or("destroyed record")?;
+    assert!(destroyed.ssh_resolution.is_none());
+    let connection = rusqlite::Connection::open(state_path)?;
+    let durable: (Option<i64>, Option<String>, Option<i64>, Option<i64>) = connection.query_row(
+        "SELECT ssh_resolution_version, ssh_resolution_details,
+                ssh_transport_enabled, ssh_transport_host_port
+         FROM sandboxes WHERE id = ?1",
+        [desired.id().as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    assert_eq!(durable, (None, None, None, None));
+
+    runtime
+        .set_exec_result(
+            format!("{second_host_public_key}\n").into_bytes(),
+            Vec::new(),
+            0,
+        )
+        .await;
+    runtime.queue_created_ssh_host_port(23_461).await;
+    service.up(UpRequest::new(desired.clone())).await?;
+
+    let second_resolution = service
+        .status(desired.id())?
+        .ok_or("recreated sandbox record")?
+        .ssh_resolution
+        .ok_or("recreated SSH resolution")?;
+    assert_ne!(
+        first_resolution.details["host_key_fingerprint"],
+        second_resolution.details["host_key_fingerprint"]
+    );
+    assert_eq!(
+        first_resolution.details["client_key_fingerprint"],
+        second_resolution.details["client_key_fingerprint"]
+    );
+    let active = SshManager
+        .published_for_paths(desired.id(), Some(&second_resolution), &paths)
+        .await?
+        .ok_or("recreated SSH alias")?;
+    assert_eq!(active.port, 23_461);
+    Ok(())
+}
+
+#[tokio::test]
+async fn fresh_ssh_create_never_enforces_stale_fingerprints_without_owned_runtime() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-fresh-stale-trust")?;
+    let first_host_public_key = generated_public_key(root, "host-fresh-stale-first").await?;
+    let second_host_public_key = generated_public_key(root, "host-fresh-stale-second").await?;
+    assert_ne!(first_host_public_key, second_host_public_key);
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(
+            format!("{first_host_public_key}\n").into_bytes(),
+            Vec::new(),
+            0,
+        )
+        .await;
+    let service = test_service(runtime.clone(), root, paths)?;
+    let desired = networked_ssh_spec("ssh-fresh-stale-trust", root, None)?;
+
+    service.up(UpRequest::new(desired.clone())).await?;
+    let stale_resolution = service
+        .status(desired.id())?
+        .ok_or("first sandbox record")?
+        .ssh_resolution
+        .ok_or("first SSH resolution")?;
+    service.destroy(desired.id()).await?;
+    service
+        .store()
+        .update_ssh_resolution(desired.id(), stale_resolution.clone())?;
+    runtime
+        .set_exec_result(
+            format!("{second_host_public_key}\n").into_bytes(),
+            Vec::new(),
+            0,
+        )
+        .await;
+
+    service.up(UpRequest::new(desired.clone())).await?;
+
+    let fresh_resolution = service
+        .status(desired.id())?
+        .ok_or("fresh sandbox record")?
+        .ssh_resolution
+        .ok_or("fresh SSH resolution")?;
+    assert_ne!(
+        stale_resolution.details["host_key_fingerprint"],
+        fresh_resolution.details["host_key_fingerprint"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ssh_host_key_failure_publishes_no_alias_and_rolls_back_created_resources() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-host-key-failure")?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(b"ssh-rsa invalid\n".to_vec(), Vec::new(), 0)
+        .await;
+    let service = test_service(runtime.clone(), root, paths.clone())?;
+    let desired = networked_ssh_spec("ssh-host-key-failure", root, None)?;
+
+    let error = match service.up(UpRequest::new(desired.clone())).await {
+        Ok(_) => return Err("invalid host key unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "ssh_host_key_mismatch");
+    assert!(runtime.inspect(desired.id()).await?.is_none());
+    assert!(
+        !paths.config().exists()
+            || !std::fs::read_to_string(paths.config())?
+                .contains(&format!("Host gascan-{}", desired.id()))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ssh_readiness_failure_publishes_no_alias_and_rolls_back_created_resources() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-readiness-failure")?;
+    let host_public_key = generated_public_key(root, "host-readiness-failure").await?;
+    let readiness = readiness_program(root, "fail-readiness", "exit 23")?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let service = service_with_readiness(runtime.clone(), root, paths.clone(), readiness)?;
+    let desired = networked_ssh_spec("ssh-readiness-failure", root, None)?;
+
+    let error = match service.up(UpRequest::new(desired.clone())).await {
+        Ok(_) => return Err("failed readiness unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "ssh_not_ready");
+    assert!(runtime.inspect(desired.id()).await?.is_none());
+    assert!(
+        !paths.config().exists()
+            || !std::fs::read_to_string(paths.config())?
+                .contains(&format!("Host gascan-{}", desired.id()))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ssh_config_commit_failure_publishes_no_alias_restores_resolution_and_rolls_back()
+-> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-config-failure")?;
+    let host_public_key = generated_public_key(root, "host-config-failure").await?;
+    let target = root.join("hostile-config-target");
+    std::fs::write(&target, "Host hostile\n")?;
+    let readiness = readiness_program(
+        root,
+        "replace-config-before-commit",
+        &format!(
+            "/bin/rm -f '{}'\n/bin/ln -s '{}' '{}'",
+            paths.config(),
+            target,
+            paths.config()
+        ),
+    )?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let service = service_with_readiness(runtime.clone(), root, paths.clone(), readiness)?;
+    let desired = networked_ssh_spec("ssh-config-failure", root, None)?;
+
+    let error = match service.up(UpRequest::new(desired.clone())).await {
+        Ok(_) => return Err("unsafe config target unexpectedly committed".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "ssh_config_update_failed");
+    assert_eq!(std::fs::read_to_string(&target)?, "Host hostile\n");
+    assert!(runtime.inspect(desired.id()).await?.is_none());
+    assert!(
+        service
+            .status(desired.id())?
+            .ok_or("failed record")?
+            .ssh_resolution
+            .is_none()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fresh_ssh_create_post_rename_restoration_is_typed_unpublished_and_rolls_back() -> TestResult
+{
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-post-rename-restored")?;
+    let host_public_key = generated_public_key(root, "host-post-rename-restored").await?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let service = test_service(runtime.clone(), root, paths.clone())?
+        .with_ssh_config_commit_fault_for_tests(SshConfigCommitFault::AfterRename);
+    let desired = networked_ssh_spec("ssh-post-rename-restored", root, Some(24_104))?;
+
+    let error = match service.up(UpRequest::new(desired.clone())).await {
+        Ok(_) => return Err("restored post-rename failure unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "ssh_config_update_failed");
+    assert!(runtime.inspect(desired.id()).await?.is_none());
+    assert!(
+        service
+            .status(desired.id())?
+            .ok_or("failed record")?
+            .ssh_resolution
+            .is_none()
+    );
+    assert!(
+        !paths.config().exists()
+            || !std::fs::read_to_string(paths.config())?
+                .contains(&format!("Host gascan-{}", desired.id()))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fresh_ssh_create_uncertain_publication_preserves_runtime_and_durable_resolution()
+-> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-post-rename-uncertain")?;
+    let host_public_key = generated_public_key(root, "host-post-rename-uncertain").await?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let service = test_service(runtime.clone(), root, paths.clone())?
+        .with_ssh_config_commit_fault_for_tests(SshConfigCommitFault::AfterRenameAndRestore);
+    let desired = networked_ssh_spec("ssh-post-rename-uncertain", root, Some(24_105))?;
+
+    let error = match service.up(UpRequest::new(desired.clone())).await {
+        Ok(_) => return Err("uncertain post-rename failure unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "ssh_config_publication_uncertain");
+    assert_eq!(
+        runtime.inspect(desired.id()).await?.ok_or("runtime")?.state,
+        ContainerState::Running
+    );
+    assert!(
+        service
+            .status(desired.id())?
+            .ok_or("failed record")?
+            .ssh_resolution
+            .is_some()
+    );
+    assert!(
+        std::fs::read_to_string(paths.config())?.contains(&format!("Host gascan-{}", desired.id()))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn retained_ssh_host_key_failure_removes_prior_alias_before_stop() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-retained-host-key-failure")?;
+    let host_public_key = generated_public_key(root, "host-retained-host-key-failure").await?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let service = test_service(runtime.clone(), root, paths.clone())?;
+    let desired = networked_ssh_spec("ssh-retained-host-key-failure", root, Some(24_101))?;
+    service.up(UpRequest::new(desired.clone())).await?;
+    runtime
+        .set_exec_result(b"ssh-rsa invalid\n".to_vec(), Vec::new(), 0)
+        .await;
+
+    let error = match service.up(UpRequest::new(desired.clone())).await {
+        Ok(_) => return Err("invalid retained host key unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "ssh_host_key_mismatch");
+    assert_eq!(
+        runtime.inspect(desired.id()).await?.ok_or("runtime")?.state,
+        ContainerState::Stopped
+    );
+    assert!(
+        !std::fs::read_to_string(paths.config())?
+            .contains(&format!("Host gascan-{}", desired.id()))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn retained_ssh_readiness_failure_removes_prior_alias_before_stop() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-retained-readiness-failure")?;
+    let host_public_key = generated_public_key(root, "host-retained-readiness-failure").await?;
+    let state = root.join("state.db");
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let desired = networked_ssh_spec("ssh-retained-readiness-failure", root, Some(24_102))?;
+    let first = service_with_readiness(
+        runtime.clone(),
+        root,
+        paths.clone(),
+        Utf8PathBuf::from("/usr/bin/true"),
+    )?;
+    first.up(UpRequest::new(desired.clone())).await?;
+    drop(first);
+    let failing = SandboxService::new_with_ssh_for_tests(
+        runtime.clone(),
+        Store::open(state)?,
+        Arc::new(NoopProvisioner),
+        paths.clone(),
+        readiness_program(root, "fail-retained-readiness", "exit 23")?,
+    );
+
+    let error = match failing.up(UpRequest::new(desired.clone())).await {
+        Ok(_) => return Err("failed retained readiness unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "ssh_not_ready");
+    assert_eq!(
+        runtime.inspect(desired.id()).await?.ok_or("runtime")?.state,
+        ContainerState::Stopped
+    );
+    assert!(
+        !std::fs::read_to_string(paths.config())?
+            .contains(&format!("Host gascan-{}", desired.id()))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn retained_ssh_readiness_failure_deactivates_before_cleanup_inspect_and_preserves_primary()
+-> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-retained-readiness-inspect-failure")?;
+    let host_public_key =
+        generated_public_key(root, "host-retained-readiness-inspect-failure").await?;
+    let state = root.join("state.db");
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let desired = networked_ssh_spec("ssh-retained-readiness-inspect-failure", root, Some(24_106))?;
+    let first = service_with_readiness(
+        runtime.clone(),
+        root,
+        paths.clone(),
+        Utf8PathBuf::from("/usr/bin/true"),
+    )?;
+    first.up(UpRequest::new(desired.clone())).await?;
+    drop(first);
+
+    let entered = root.join("retained-readiness-entered");
+    let release = root.join("release-retained-readiness");
+    let readiness = readiness_program(
+        root,
+        "gate-failed-retained-readiness",
+        &format!(
+            "/usr/bin/touch '{entered}'\n\
+             while [ ! -e '{release}' ]; do /bin/sleep 0.01; done\n\
+             exit 23"
+        ),
+    )?;
+    let failing = Arc::new(SandboxService::new_with_ssh_for_tests(
+        runtime.clone(),
+        Store::open(state)?,
+        Arc::new(NoopProvisioner),
+        paths.clone(),
+        readiness,
+    ));
+    let up = {
+        let failing = Arc::clone(&failing);
+        let desired = desired.clone();
+        tokio::spawn(async move { failing.up(UpRequest::new(desired)).await })
+    };
+    wait_for_path(&entered).await?;
+    runtime.inject_failure(FailureBoundary::Inspect).await;
+    std::fs::write(&release, b"release")?;
+
+    let error = match up.await? {
+        Ok(_) => return Err("failed retained readiness unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "ssh_not_ready");
+    assert_eq!(
+        runtime.inspect(desired.id()).await?.ok_or("runtime")?.state,
+        ContainerState::Running
+    );
+    assert!(
+        !std::fs::read_to_string(paths.config())?
+            .contains(&format!("Host gascan-{}", desired.id()))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn retained_ssh_readiness_failure_deactivates_when_cleanup_inspect_finds_no_runtime()
+-> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-retained-readiness-missing-runtime")?;
+    let host_public_key =
+        generated_public_key(root, "host-retained-readiness-missing-runtime").await?;
+    let state = root.join("state.db");
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let desired = networked_ssh_spec("ssh-retained-readiness-missing-runtime", root, Some(24_107))?;
+    let first = service_with_readiness(
+        runtime.clone(),
+        root,
+        paths.clone(),
+        Utf8PathBuf::from("/usr/bin/true"),
+    )?;
+    first.up(UpRequest::new(desired.clone())).await?;
+    drop(first);
+
+    let entered = root.join("retained-missing-readiness-entered");
+    let release = root.join("release-retained-missing-readiness");
+    let readiness = readiness_program(
+        root,
+        "gate-failed-retained-missing-readiness",
+        &format!(
+            "/usr/bin/touch '{entered}'\n\
+             while [ ! -e '{release}' ]; do /bin/sleep 0.01; done\n\
+             exit 23"
+        ),
+    )?;
+    let failing = Arc::new(SandboxService::new_with_ssh_for_tests(
+        runtime.clone(),
+        Store::open(state)?,
+        Arc::new(NoopProvisioner),
+        paths.clone(),
+        readiness,
+    ));
+    let up = {
+        let failing = Arc::clone(&failing);
+        let desired = desired.clone();
+        tokio::spawn(async move { failing.up(UpRequest::new(desired)).await })
+    };
+    wait_for_path(&entered).await?;
+    let resources = runtime
+        .list_resources()
+        .await?
+        .into_iter()
+        .filter(|resource| resource.sandbox_id() == Some(desired.id()))
+        .collect();
+    runtime
+        .remove(RemoveRequest::from_resources(resources)?)
+        .await?;
+    std::fs::write(&release, b"release")?;
+
+    let error = match up.await? {
+        Ok(_) => return Err("failed retained readiness unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "ssh_not_ready");
+    assert!(runtime.inspect(desired.id()).await?.is_none());
+    assert!(
+        !std::fs::read_to_string(paths.config())?
+            .contains(&format!("Host gascan-{}", desired.id()))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn retained_config_failure_preserves_primary_error_when_deactivation_is_unsafe() -> TestResult
+{
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-retained-config-failure")?;
+    let host_public_key = generated_public_key(root, "host-retained-config-failure").await?;
+    let target = root.join("hostile-retained-config");
+    std::fs::write(&target, "Host hostile\n")?;
+    let state = root.join("state.db");
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let desired = networked_ssh_spec("ssh-retained-config-failure", root, Some(24_103))?;
+    let first = SandboxService::new_with_ssh_for_tests(
+        runtime.clone(),
+        Store::open(&state)?,
+        Arc::new(NoopProvisioner),
+        paths.clone(),
+        Utf8PathBuf::from("/usr/bin/true"),
+    );
+    first.up(UpRequest::new(desired.clone())).await?;
+    drop(first);
+    let failure = readiness_program(
+        root,
+        "replace-retained-config-before-commit",
+        &format!(
+            "/bin/rm -f '{}'\n/bin/ln -s '{}' '{}'",
+            paths.config(),
+            target,
+            paths.config()
+        ),
+    )?;
+    let failing = SandboxService::new_with_ssh_for_tests(
+        runtime.clone(),
+        Store::open(state)?,
+        Arc::new(NoopProvisioner),
+        paths,
+        failure,
+    );
+
+    let error = match failing.up(UpRequest::new(desired.clone())).await {
+        Ok(_) => return Err("unsafe retained config unexpectedly committed".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "ssh_config_update_failed");
+    assert_eq!(
+        runtime.inspect(desired.id()).await?.ok_or("runtime")?.state,
+        ContainerState::Running
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_ssh_activations_publish_both_aliases_without_lost_update() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-concurrent-activate")?;
+    let host_public_key = generated_public_key(root, "host-concurrent-activate").await?;
+    let first_root = root.join("first-project");
+    let second_root = root.join("second-project");
+    std::fs::create_dir(&first_root)?;
+    std::fs::create_dir(&second_root)?;
+    let first = networked_ssh_spec("ssh-concurrent-first", &first_root, Some(26_101))?;
+    let second = networked_ssh_spec("ssh-concurrent-second", &second_root, Some(26_102))?;
+    let entered = root.join("first-readiness-entered");
+    let release = root.join("release-first-readiness");
+    let readiness =
+        gated_readiness_program(root, "gate-first-readiness", 26_101, &entered, &release)?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let service = Arc::new(service_with_readiness(
+        runtime,
+        root,
+        paths.clone(),
+        readiness,
+    )?);
+
+    let first_up = {
+        let service = Arc::clone(&service);
+        tokio::spawn(async move { service.up(UpRequest::new(first.clone())).await })
+    };
+    wait_for_path(&entered).await?;
+    let second_up = {
+        let service = Arc::clone(&service);
+        tokio::spawn(async move { service.up(UpRequest::new(second.clone())).await })
+    };
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    std::fs::write(&release, b"release")?;
+    first_up.await??;
+    second_up.await??;
+
+    let config = std::fs::read_to_string(paths.config())?;
+    assert!(config.contains("Host gascan-ssh-concurrent-first"));
+    assert!(config.contains("Host gascan-ssh-concurrent-second"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn doctor_does_not_observe_ssh_activation_halfway_through_publication() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-doctor-activation")?;
+    let host_public_key = generated_public_key(root, "host-doctor-activation").await?;
+    let desired = networked_ssh_spec("ssh-doctor-activation", root, Some(26_151))?;
+    let entered = root.join("readiness-entered");
+    let release = root.join("release-readiness");
+    let readiness =
+        gated_readiness_program(root, "gate-doctor-readiness", 26_151, &entered, &release)?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let service = Arc::new(service_with_readiness(runtime, root, paths, readiness)?);
+
+    let up = {
+        let service = Arc::clone(&service);
+        tokio::spawn(async move { service.up(UpRequest::new(desired)).await })
+    };
+    wait_for_path(&entered).await?;
+    let doctor = {
+        let service = Arc::clone(&service);
+        tokio::spawn(async move { service.doctor_report().await })
+    };
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    assert!(
+        !doctor.is_finished(),
+        "doctor returned while SSH publication was incomplete"
+    );
+
+    std::fs::write(&release, b"release")?;
+    up.await??;
+    let during = doctor.await?;
+    let during_config = during.check("ssh.config").ok_or("ssh.config")?;
+    assert_ne!(
+        during_config.status,
+        gascan_core::doctor::DoctorStatus::Fail,
+        "{}",
+        during_config.detail
+    );
+    let settled = service.doctor_report().await;
+    assert_eq!(
+        settled.check("ssh.config").ok_or("ssh.config")?.status,
+        gascan_core::doctor::DoctorStatus::Pass
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn api_up_repairs_missing_managed_ssh_config_instead_of_failing_preflight() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let project = root.join("project");
+    std::fs::create_dir(&project)?;
+    let paths = ssh_paths(root, "ssh-api-repair")?;
+    ensure_host_identity(&paths).await?;
+    assert!(!paths.config().exists());
+    let host_public_key = generated_public_key(root, "host-api-repair").await?;
+    let desired = networked_ssh_spec("ssh-api-repair", &project, Some(26_161))?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let service = Arc::new(service_with_readiness(
+        runtime,
+        root,
+        paths.clone(),
+        Utf8PathBuf::from("/usr/bin/true"),
+    )?);
+    let api = SandboxApi::new(service, ActivityTracker::new());
+
+    let response = GasCan::up(
+        &api,
+        tonic::Request::new(v1::UpRequest {
+            project_root: desired.canonical_root().to_string(),
+        }),
+    )
+    .await;
+
+    assert!(
+        response.is_ok(),
+        "repairable managed config was rejected by preflight: {:?}",
+        response.as_ref().err().map(tonic::Status::message)
+    );
+    let mut stream = response?.into_inner();
+    let mut terminal = None;
+    while let Some(event) = stream.next().await {
+        terminal = Some(event?);
+    }
+    assert_eq!(
+        terminal.ok_or("terminal event")?.status,
+        v1::OperationStatus::Completed as i32
+    );
+    assert!(paths.config().exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn api_up_reports_specific_ssh_error_for_unsafe_managed_config() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let project = root.join("project");
+    std::fs::create_dir(&project)?;
+    let paths = ssh_paths(root, "ssh-api-unsafe")?;
+    ensure_host_identity(&paths).await?;
+    let hostile = root.join("hostile-config");
+    std::fs::write(&hostile, "Host hostile\n")?;
+    std::os::unix::fs::symlink(&hostile, paths.config())?;
+    let host_public_key = generated_public_key(root, "host-api-unsafe").await?;
+    let desired = networked_ssh_spec("ssh-api-unsafe", &project, Some(26_162))?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let service = Arc::new(service_with_readiness(
+        runtime,
+        root,
+        paths,
+        Utf8PathBuf::from("/usr/bin/true"),
+    )?);
+    let api = SandboxApi::new(service, ActivityTracker::new());
+
+    let response = GasCan::up(
+        &api,
+        tonic::Request::new(v1::UpRequest {
+            project_root: desired.canonical_root().to_string(),
+        }),
+    )
+    .await;
+
+    assert!(
+        response.is_ok(),
+        "unsafe managed config was hidden by preflight: {:?}",
+        response.as_ref().err().map(tonic::Status::message)
+    );
+    let mut stream = response?.into_inner();
+    let mut terminal = None;
+    while let Some(event) = stream.next().await {
+        terminal = Some(event?);
+    }
+    let error = terminal
+        .ok_or("terminal event")?
+        .error
+        .ok_or("terminal error")?;
+    assert_eq!(error.code, "ssh_config_unsafe");
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_ssh_operation_does_not_preflight_block_independent_api_up() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let first_project = root.join("first-project");
+    let second_project = root.join("second-project");
+    std::fs::create_dir(&first_project)?;
+    std::fs::create_dir(&second_project)?;
+    let paths = ssh_paths(root, "ssh-api-pending")?;
+    let identity = ensure_host_identity(&paths).await?;
+    let store = Store::open(root.join("state.db"))?;
+    let first_id = SandboxId::from_root("ssh-api-pending-first", &first_project);
+    store.begin_operation(
+        &sandbox_record(
+            first_id,
+            &first_project,
+            ActualState::Creating,
+            Some(SshResolution::new(
+                1,
+                json!({
+                    "enabled": true,
+                    "host_key_fingerprint": identity.fingerprint(),
+                    "client_key_fingerprint": identity.fingerprint(),
+                }),
+            )),
+        ),
+        OperationKind::Create,
+    )?;
+    let host_public_key = generated_public_key(root, "host-api-pending").await?;
+    let second = networked_ssh_spec("ssh-api-pending-second", &second_project, Some(26_163))?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let service = Arc::new(SandboxService::new_with_ssh_for_tests(
+        runtime,
+        store,
+        Arc::new(NoopProvisioner),
+        paths,
+        Utf8PathBuf::from("/usr/bin/true"),
+    ));
+    let api = SandboxApi::new(service, ActivityTracker::new());
+
+    let response = GasCan::up(
+        &api,
+        tonic::Request::new(v1::UpRequest {
+            project_root: second.canonical_root().to_string(),
+        }),
+    )
+    .await;
+
+    assert!(
+        response.is_ok(),
+        "sandbox A's pending SSH diagnostics blocked sandbox B: {:?}",
+        response.as_ref().err().map(tonic::Status::message)
+    );
+    let mut stream = response?.into_inner();
+    let mut terminal = None;
+    while let Some(event) = stream.next().await {
+        terminal = Some(event?);
+    }
+    assert_eq!(
+        terminal.ok_or("terminal event")?.status,
+        v1::OperationStatus::Completed as i32
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn managed_ssh_diagnostics_do_not_gate_runtime_readiness() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    for (id, status) in [
+        ("ssh.identity", DoctorStatus::Fail),
+        ("ssh.config", DoctorStatus::Unknown),
+    ] {
+        let mut report = DoctorFacts::all_supported_for_tests().into_report();
+        let check = report
+            .checks
+            .iter_mut()
+            .find(|check| check.id == id)
+            .ok_or("doctor check")?;
+        check.status = status;
+        check.detail = "repairable managed SSH diagnostic".to_owned();
+        let service = SandboxService::new_with_doctor(
+            FakeRuntime::default(),
+            Store::open(root.join(format!("{}.db", id.replace('.', "-"))))?,
+            Arc::new(NoopProvisioner),
+            report,
+        );
+        service.require_runtime_ready().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn immutable_and_transport_prerequisites_still_gate_runtime_readiness() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    for id in ["host.architecture", "ssh.client", "ssh.native_publish"] {
+        let mut report = DoctorFacts::all_supported_for_tests().into_report();
+        let check = report
+            .checks
+            .iter_mut()
+            .find(|check| check.id == id)
+            .ok_or("doctor check")?;
+        check.status = DoctorStatus::Fail;
+        check.detail = "required prerequisite failed".to_owned();
+        let service = SandboxService::new_with_doctor(
+            FakeRuntime::default(),
+            Store::open(root.join(format!("{}.db", id.replace('.', "-"))))?,
+            Arc::new(NoopProvisioner),
+            report,
+        );
+        let error = service
+            .require_runtime_ready()
+            .await
+            .expect_err("failed prerequisite passed readiness");
+        assert_eq!(error.code(), "unsupported_capability");
+        assert!(error.to_string().contains(id));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_deactivate_after_activate_read_does_not_resurrect_removed_alias() -> TestResult
+{
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-concurrent-deactivate")?;
+    let host_public_key = generated_public_key(root, "host-concurrent-deactivate").await?;
+    let first_root = root.join("first-project");
+    let second_root = root.join("second-project");
+    std::fs::create_dir(&first_root)?;
+    std::fs::create_dir(&second_root)?;
+    let first = networked_ssh_spec("ssh-deactivate-first", &first_root, Some(26_201))?;
+    let second = networked_ssh_spec("ssh-deactivate-second", &second_root, Some(26_202))?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let initial = test_service(runtime.clone(), root, paths.clone())?;
+    initial.up(UpRequest::new(first.clone())).await?;
+    initial.up(UpRequest::new(second.clone())).await?;
+    initial.stop(second.id()).await?;
+    drop(initial);
+
+    let entered = root.join("second-readiness-entered");
+    let release = root.join("release-second-readiness");
+    let readiness =
+        gated_readiness_program(root, "gate-second-readiness", 26_202, &entered, &release)?;
+    let service = Arc::new(service_with_readiness(
+        runtime,
+        root,
+        paths.clone(),
+        readiness,
+    )?);
+    let second_id = second.id().clone();
+    let activation = {
+        let service = Arc::clone(&service);
+        tokio::spawn(async move { service.start(&second_id).await })
+    };
+    wait_for_path(&entered).await?;
+    let first_id = first.id().clone();
+    let deactivation = {
+        let service = Arc::clone(&service);
+        tokio::spawn(async move { service.stop(&first_id).await })
+    };
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    std::fs::write(&release, b"release")?;
+    activation.await??;
+    deactivation.await??;
+
+    let config = std::fs::read_to_string(paths.config())?;
+    assert!(!config.contains("Host gascan-ssh-deactivate-first"));
+    assert!(config.contains("Host gascan-ssh-deactivate-second"));
+    Ok(())
 }
 
 #[tokio::test]
@@ -130,6 +1849,83 @@ impl Provisioner for ControlledProvisioner {
     }
 }
 
+struct RollbackFailingProvisioner {
+    runtime: FakeRuntime,
+}
+
+struct ExtraContainerProvisioner {
+    runtime: FakeRuntime,
+    id: gascan_core::sandbox::SandboxId,
+}
+
+#[async_trait]
+impl Provisioner for ExtraContainerProvisioner {
+    async fn provision(
+        &self,
+        _request: ProvisionRequest<'_>,
+    ) -> Result<ProvisionResolution, ServiceError> {
+        self.runtime
+            .seed_container_resource(
+                "extra-rollback-container",
+                self.id.clone(),
+                ResourceOwnership::GasCanOwned,
+            )
+            .await?;
+        Err(ServiceError::Provision(
+            "injected provision failure with extra container".to_owned(),
+        ))
+    }
+
+    async fn health_check(
+        &self,
+        _id: &gascan_core::sandbox::SandboxId,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+}
+
+struct TerminalReadFailingProvisioner {
+    store: gascand::Store,
+}
+
+#[async_trait]
+impl Provisioner for TerminalReadFailingProvisioner {
+    async fn provision(
+        &self,
+        _request: ProvisionRequest<'_>,
+    ) -> Result<ProvisionResolution, ServiceError> {
+        Ok(ProvisionResolution::default())
+    }
+
+    async fn health_check(
+        &self,
+        _id: &gascan_core::sandbox::SandboxId,
+    ) -> Result<(), ServiceError> {
+        self.store.fail_next_operation_event_read();
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Provisioner for RollbackFailingProvisioner {
+    async fn provision(
+        &self,
+        _request: ProvisionRequest<'_>,
+    ) -> Result<ProvisionResolution, ServiceError> {
+        self.runtime.inject_failure(FailureBoundary::Remove).await;
+        Err(ServiceError::Provision(
+            "injected replacement provision failure".to_owned(),
+        ))
+    }
+
+    async fn health_check(
+        &self,
+        _id: &gascan_core::sandbox::SandboxId,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn failed_initial_up_retry_runs_provision_and_persists_actual_resolution() -> TestResult {
     let root = tempfile::tempdir()?;
@@ -163,6 +1959,7 @@ async fn failed_initial_up_retry_runs_provision_and_persists_actual_resolution()
 async fn retained_setup_failure_persists_storage_and_up_retries_setup() -> TestResult {
     let root = tempfile::tempdir()?;
     let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let state_path = root.join("state.db");
     let setup = b"exit 28\n";
     std::fs::write(root.join("setup.sh"), setup)?;
     std::fs::write(
@@ -175,18 +1972,21 @@ async fn retained_setup_failure_persists_storage_and_up_retries_setup() -> TestR
     runtime
         .queue_exec_results([
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (digest.clone(), Vec::new(), 0),
             (Vec::new(), b"No space left on device".to_vec(), 28),
         ])
         .await;
     let service = SandboxService::new(
         runtime.clone(),
-        gascand::Store::open(root.join("state.db"))?,
+        gascand::Store::open(&state_path)?,
         Arc::new(NoopProvisioner),
     );
 
     assert!(service.up(UpRequest::new(make_spec()?)).await.is_err());
     let id = make_spec()?.id().clone();
+    clear_stored_ssh_transport_policy(&state_path, &id)?;
     let failed = service.status(&id)?.ok_or("failed record")?;
     assert_eq!(
         failed
@@ -198,6 +1998,8 @@ async fn retained_setup_failure_persists_storage_and_up_retries_setup() -> TestR
 
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (digest, Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
@@ -222,6 +2024,151 @@ async fn retained_setup_failure_persists_storage_and_up_retries_setup() -> TestR
             .status(&id)?
             .ok_or("retried record")?
             .setup_resolution
+            .is_some()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn retained_setup_failure_preserves_created_ssh_policy_for_changed_up() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let state_path = root.join("state.db");
+    let setup = b"exit 28\n";
+    std::fs::write(root.join("setup.sh"), setup)?;
+    std::fs::write(
+        root.join("gascan.toml"),
+        "version = 1\nnetwork = 'networked'\nsetup = 'setup.sh'\n[ssh]\nhost_port = 24305\n",
+    )?;
+    let make_spec = || SandboxSpec::from_root("retry-retained-ssh", root, Manifest::load(root)?);
+    let runtime = FakeRuntime::default();
+    let digest = format!("{:x}  /workspace/setup.sh\n", Sha256::digest(setup)).into_bytes();
+    runtime
+        .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (digest, Vec::new(), 0),
+            (Vec::new(), b"No space left on device".to_vec(), 28),
+        ])
+        .await;
+    let service = test_service(
+        runtime.clone(),
+        root,
+        ssh_paths(root, "ssh-retry-retained")?,
+    )?;
+
+    assert!(service.up(UpRequest::new(make_spec()?)).await.is_err());
+    let id = make_spec()?.id().clone();
+    let connection = rusqlite::Connection::open(&state_path)?;
+    let created_policy: (Option<i64>, Option<i64>) = connection.query_row(
+        "SELECT ssh_transport_enabled, ssh_transport_host_port FROM sandboxes WHERE id = ?1",
+        [id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(created_policy, (Some(1), Some(24_305)));
+
+    std::fs::write(
+        root.join("gascan.toml"),
+        "version = 1\nnetwork = 'networked'\nsetup = 'setup.sh'\n[ssh]\nenabled = false\n",
+    )?;
+    let operation = service.up(UpRequest::new(make_spec()?)).await?;
+    let events = service.store().operation_events(operation.id)?;
+    assert!(events.iter().any(|event| {
+        event.details.as_ref().is_some_and(|details| {
+            details["phase"] == "apply_required" && details["reason"] == "ssh_transport_changed"
+        })
+    }));
+    assert_eq!(
+        runtime
+            .inspect(&id)
+            .await?
+            .ok_or("retained runtime")?
+            .ports(),
+        [gascan_core::runtime::RuntimePort {
+            host_address: std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+            host_port: 24_305,
+            guest_port: 22,
+        }]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn retained_setup_failure_with_unchanged_ssh_retries_setup() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let state_path = root.join("state.db");
+    let setup = b"exit 28\n";
+    std::fs::write(root.join("setup.sh"), setup)?;
+    std::fs::write(
+        root.join("gascan.toml"),
+        "version = 1\nnetwork = 'networked'\nsetup = 'setup.sh'\n[ssh]\nhost_port = 24306\n",
+    )?;
+    let make_spec =
+        || SandboxSpec::from_root("retry-retained-same-ssh", root, Manifest::load(root)?);
+    let runtime = FakeRuntime::default();
+    let digest = format!("{:x}  /workspace/setup.sh\n", Sha256::digest(setup)).into_bytes();
+    runtime
+        .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (digest.clone(), Vec::new(), 0),
+            (Vec::new(), b"No space left on device".to_vec(), 28),
+        ])
+        .await;
+    let service = test_service(
+        runtime.clone(),
+        root,
+        ssh_paths(root, "ssh-retry-retained-same")?,
+    )?;
+
+    assert!(service.up(UpRequest::new(make_spec()?)).await.is_err());
+    let id = make_spec()?.id().clone();
+    clear_stored_ssh_transport_policy(&state_path, &id)?;
+    let host_public_key = generated_public_key(root, "host-retry-retained-same").await?;
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    runtime
+        .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (digest, Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (format!("{host_public_key}\n").into_bytes(), Vec::new(), 0),
+        ])
+        .await;
+
+    let operation = service.up(UpRequest::new(make_spec()?)).await?;
+    let events = service.store().operation_events(operation.id)?;
+    assert!(events.iter().all(|event| {
+        event
+            .details
+            .as_ref()
+            .and_then(|details| details["phase"].as_str())
+            != Some("apply_required")
+    }));
+    let setup_runs = runtime
+        .calls()
+        .await
+        .into_iter()
+        .filter(|call| {
+            matches!(
+                call,
+                RuntimeCall::Exec(request)
+                    if request.argv.first().map(String::as_str) == Some("/bin/bash")
+            )
+        })
+        .count();
+    assert_eq!(setup_runs, 2);
+    assert!(
+        service
+            .status(make_spec()?.id())?
+            .ok_or("retried SSH record")?
+            .ssh_resolution
             .is_some()
     );
     Ok(())
@@ -308,6 +2255,747 @@ async fn unchanged_apply_inspects_and_starts_stopped_runtime_without_rerunning_h
         gascan_core::runtime::ContainerState::Running
     );
     assert_eq!(provisioner.provisions.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_resolution_only_proves_the_approved_image_when_valid_and_matching() -> TestResult {
+    let old_digest = "ghcr.io/liquescent-development/gascan/workspace:old@sha256:\
+                      bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    for (recorded, change_required) in [
+        (None, true),
+        (Some(json!({"digest": "RUNNING"})), false),
+        (Some(json!({"digest": old_digest})), true),
+        (Some(json!({"digest": 7})), true),
+    ] {
+        let root = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+        let make_spec = || SandboxSpec::from_root("image-state", root, Manifest::load(root)?);
+        let id = make_spec()?.id().clone();
+        let runtime = FakeRuntime::default();
+        let service = SandboxService::new(
+            runtime.clone(),
+            gascand::Store::open(root.join("state.db"))?,
+            Arc::new(NoopProvisioner),
+        );
+        service.up(UpRequest::new(make_spec()?)).await?;
+        let running_digest = runtime.inspect(&id).await?.ok_or("running sandbox")?.image;
+        let mut record = service.status(&id)?.ok_or("sandbox record")?;
+        record.image_resolution = recorded.map(|details| {
+            let details = if details["digest"] == "RUNNING" {
+                json!({"digest": running_digest})
+            } else {
+                details
+            };
+            gascand::ImageResolution::new(1, details)
+        });
+        service.store().put_sandbox(&record)?;
+
+        let operation = service.up(UpRequest::new(make_spec()?)).await?;
+        let events = service.store().operation_events(operation.id)?;
+        assert_eq!(
+            events.iter().any(|event| {
+                event
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("phase"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("apply_required")
+            }),
+            change_required,
+            "recorded image: {:?}, running image: {running_digest}",
+            record.image_resolution
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_replace_apply_preserves_resources_and_commits_new_image() -> TestResult {
+    let old_image = "ghcr.io/liquescent-development/gascan/workspace:old@sha256:\
+                     bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let runtime_path = root.join("runtime.json");
+    let state_path = root.join("state.db");
+    let capabilities = FakeRuntime::default().capabilities().await?;
+    let initial_runtime = FakeRuntime::persistent(capabilities.clone(), &runtime_path).await?;
+    let desired = networked_spec("image-replace-success", root)?;
+    let initial_service = SandboxService::new(
+        initial_runtime.clone(),
+        gascand::Store::open(&state_path)?,
+        Arc::new(NoopProvisioner),
+    );
+    initial_service.up(UpRequest::new(desired.clone())).await?;
+    let mut record = initial_service
+        .status(desired.id())?
+        .ok_or("sandbox record")?;
+    record.image_resolution = Some(gascand::ImageResolution::new(
+        1,
+        json!({"digest": old_image}),
+    ));
+    initial_service.store().put_sandbox(&record)?;
+    let before_resources = initial_runtime
+        .list_resources()
+        .await?
+        .into_iter()
+        .map(|resource| (resource.kind(), resource.name().to_owned()))
+        .collect::<Vec<_>>();
+    drop(initial_service);
+    drop(initial_runtime);
+    rewrite_runtime_image(&runtime_path, old_image)?;
+
+    let runtime = FakeRuntime::persistent(capabilities, &runtime_path).await?;
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(&state_path)?,
+        Arc::new(NoopProvisioner),
+    );
+    let approved_image = PolicyCompiler::compile(desired.clone(), &runtime.capabilities().await?)?
+        .image()
+        .to_owned();
+
+    service.apply(UpRequest::new(desired.clone())).await?;
+
+    let calls = runtime.calls().await;
+    let prepare = calls
+        .iter()
+        .position(
+            |call| matches!(call, RuntimeCall::PrepareImage(image) if image == &approved_image),
+        )
+        .ok_or("prepare image")?;
+    let list = calls
+        .iter()
+        .enumerate()
+        .skip(prepare + 1)
+        .find_map(|(index, call)| matches!(call, RuntimeCall::ListResources).then_some(index))
+        .ok_or("list resources")?;
+    let stop = calls
+        .iter()
+        .position(|call| matches!(call, RuntimeCall::Stop(id) if id == desired.id()))
+        .ok_or("stop old container")?;
+    let remove = calls
+        .iter()
+        .position(|call| {
+            matches!(call, RuntimeCall::Remove(request)
+                if request.resources().len() == 1
+                    && request.resources()[0].kind() == ResourceKind::Container)
+        })
+        .ok_or("remove old container")?;
+    let create = calls
+        .iter()
+        .position(|call| matches!(call, RuntimeCall::CreateContainer(_)))
+        .ok_or("create replacement container")?;
+    assert!(prepare < list && list < stop && stop < remove && remove < create);
+    let after_resources = runtime
+        .list_resources()
+        .await?
+        .into_iter()
+        .map(|resource| (resource.kind(), resource.name().to_owned()))
+        .collect::<Vec<_>>();
+    assert_eq!(after_resources, before_resources);
+    assert_eq!(
+        runtime
+            .inspect(desired.id())
+            .await?
+            .ok_or("replacement runtime")?
+            .image,
+        approved_image
+    );
+    assert_eq!(
+        service
+            .status(desired.id())?
+            .ok_or("replacement record")?
+            .image_resolution
+            .and_then(|resolution| resolution.details["digest"].as_str().map(ToOwned::to_owned)),
+        Some(approved_image)
+    );
+    assert_eq!(
+        service
+            .latest_operation()?
+            .ok_or("completed operation")?
+            .status,
+        OperationStatus::Completed
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_replace_up_reports_apply_required_without_runtime_mutation() -> TestResult {
+    let old_image = "ghcr.io/liquescent-development/gascan/workspace:old@sha256:\
+                     bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    for recorded in ["approved", "invalid"] {
+        let root = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+        let runtime_path = root.join("runtime.json");
+        let state_path = root.join("state.db");
+        let capabilities = FakeRuntime::default().capabilities().await?;
+        let initial_runtime = FakeRuntime::persistent(capabilities.clone(), &runtime_path).await?;
+        let desired = spec("image-replace-up", root)?;
+        let initial_service = SandboxService::new(
+            initial_runtime.clone(),
+            gascand::Store::open(&state_path)?,
+            Arc::new(NoopProvisioner),
+        );
+        initial_service.up(UpRequest::new(desired.clone())).await?;
+        let approved_image = initial_runtime
+            .inspect(desired.id())
+            .await?
+            .ok_or("initial runtime")?
+            .image;
+        let mut record = initial_service
+            .status(desired.id())?
+            .ok_or("sandbox record")?;
+        if recorded == "invalid" {
+            record.image_resolution = Some(gascand::ImageResolution::new(
+                1,
+                json!({"digest":"workspace:latest"}),
+            ));
+            initial_service.store().put_sandbox(&record)?;
+        }
+        drop(initial_service);
+        drop(initial_runtime);
+        rewrite_runtime_image(&runtime_path, old_image)?;
+
+        let runtime = FakeRuntime::persistent(capabilities, &runtime_path).await?;
+        let service = SandboxService::new(
+            runtime.clone(),
+            gascand::Store::open(&state_path)?,
+            Arc::new(NoopProvisioner),
+        );
+        let operation = service.up(UpRequest::new(desired)).await?;
+        let events = service.store().operation_events(operation.id)?;
+
+        assert!(runtime.calls().await.iter().all(|call| {
+            matches!(
+                call,
+                RuntimeCall::Capabilities | RuntimeCall::Inspect(_) | RuntimeCall::ListResources
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            event.details.as_ref().is_some_and(|details| {
+                details["phase"] == "apply_required"
+                    && details["reason"] == "image_changed"
+                    && details["running_image"] == old_image
+                    && details["approved_image"] == approved_image
+                    && if recorded == "invalid" {
+                        details["recorded_image"].is_null()
+                    } else {
+                        details["recorded_image"] == approved_image
+                    }
+            })
+        }));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_replace_rejects_runtime_image_change_after_preflight() -> TestResult {
+    let old_image = "ghcr.io/liquescent-development/gascan/workspace:old@sha256:\
+                     bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let changed_image = "ghcr.io/liquescent-development/gascan/workspace:changed@sha256:\
+                         cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let runtime_path = root.join("runtime.json");
+    let state_path = root.join("state.db");
+    let capabilities = FakeRuntime::default().capabilities().await?;
+    let initial_runtime = FakeRuntime::persistent(capabilities.clone(), &runtime_path).await?;
+    let desired = spec("image-change-after-preflight", root)?;
+    let initial_service = SandboxService::new(
+        initial_runtime.clone(),
+        gascand::Store::open(&state_path)?,
+        Arc::new(NoopProvisioner),
+    );
+    initial_service.up(UpRequest::new(desired.clone())).await?;
+    let mut record = initial_service
+        .status(desired.id())?
+        .ok_or("sandbox record")?;
+    record.image_resolution = Some(gascand::ImageResolution::new(
+        1,
+        json!({"digest": old_image}),
+    ));
+    initial_service.store().put_sandbox(&record)?;
+    drop(initial_service);
+    drop(initial_runtime);
+    rewrite_runtime_image(&runtime_path, old_image)?;
+
+    let runtime = FakeRuntime::persistent(capabilities, &runtime_path).await?;
+    runtime
+        .change_image_on_prepare(changed_image.to_owned())
+        .await;
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(&state_path)?,
+        Arc::new(NoopProvisioner),
+    );
+
+    let error = match service.apply(UpRequest::new(desired)).await {
+        Ok(_) => return Err("changed predecessor image unexpectedly applied".into()),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        ServiceError::ImageUpgradeRequired {
+            ref current,
+            ref requested,
+            ..
+        } if current == changed_image
+            && requested == include_str!("../../../images/workspace/approved-image.txt")
+    ));
+    let operation = service.latest_operation()?.ok_or("failed operation")?;
+    assert_eq!(
+        operation.error_code.as_deref(),
+        Some(gascan_proto::error_code::IMAGE_UPGRADE_REQUIRED)
+    );
+    assert_eq!(
+        operation
+            .error_details
+            .as_ref()
+            .and_then(|details| details.get("current"))
+            .and_then(serde_json::Value::as_str),
+        Some(changed_image)
+    );
+    assert!(runtime.calls().await.iter().all(|call| {
+        !matches!(
+            call,
+            RuntimeCall::Stop(_) | RuntimeCall::Remove(_) | RuntimeCall::CreateContainer(_)
+        )
+    }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_replace_failures_restore_previous_image_and_resources() -> TestResult {
+    let old_image = "ghcr.io/liquescent-development/gascan/workspace:old@sha256:\
+                     bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    for (boundary, fail_provision, fail_health) in [
+        (Some(FailureBoundary::Stop), false, false),
+        (Some(FailureBoundary::Remove), false, false),
+        (Some(FailureBoundary::CreateContainer), false, false),
+        (
+            Some(FailureBoundary::CreateContainerAfterMutation),
+            false,
+            false,
+        ),
+        (Some(FailureBoundary::Start), false, false),
+        (None, true, false),
+        (None, false, true),
+    ] {
+        let root = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+        let runtime_path = root.join("runtime.json");
+        let state_path = root.join("state.db");
+        let capabilities = FakeRuntime::default().capabilities().await?;
+        let initial_runtime = FakeRuntime::persistent(capabilities.clone(), &runtime_path).await?;
+        let desired = networked_spec("image-replace-rollback", root)?;
+        let provisioner = Arc::new(ControlledProvisioner::default());
+        let initial_service = SandboxService::new(
+            initial_runtime.clone(),
+            gascand::Store::open(&state_path)?,
+            provisioner.clone(),
+        );
+        initial_service.up(UpRequest::new(desired.clone())).await?;
+        let mut record = initial_service
+            .status(desired.id())?
+            .ok_or("sandbox record")?;
+        record.image_resolution = Some(gascand::ImageResolution::new(
+            1,
+            json!({"digest": old_image}),
+        ));
+        initial_service.store().put_sandbox(&record)?;
+        let before_resources = initial_runtime
+            .list_resources()
+            .await?
+            .into_iter()
+            .map(|resource| (resource.kind(), resource.name().to_owned()))
+            .collect::<Vec<_>>();
+        drop(initial_service);
+        drop(initial_runtime);
+        rewrite_runtime_image(&runtime_path, old_image)?;
+
+        let runtime = FakeRuntime::persistent(capabilities, &runtime_path).await?;
+        if let Some(boundary) = boundary {
+            runtime.inject_failure(boundary).await;
+        }
+        provisioner
+            .fail_provision
+            .store(fail_provision, Ordering::SeqCst);
+        provisioner.fail_health.store(fail_health, Ordering::SeqCst);
+        let service = SandboxService::new(
+            runtime.clone(),
+            gascand::Store::open(&state_path)?,
+            provisioner,
+        );
+
+        assert!(
+            service
+                .apply(UpRequest::new(desired.clone()))
+                .await
+                .is_err()
+        );
+
+        assert_eq!(
+            runtime
+                .inspect(desired.id())
+                .await?
+                .ok_or("rolled back runtime")?
+                .image,
+            old_image,
+            "boundary {boundary:?}, provision={fail_provision}, health={fail_health}"
+        );
+        assert_eq!(
+            service
+                .status(desired.id())?
+                .ok_or("rolled back record")?
+                .image_resolution
+                .and_then(|resolution| resolution.details["digest"]
+                    .as_str()
+                    .map(ToOwned::to_owned)),
+            Some(old_image.to_owned())
+        );
+        assert_eq!(
+            service
+                .latest_operation()?
+                .ok_or("failed operation")?
+                .status,
+            OperationStatus::Failed
+        );
+        let after_resources = runtime
+            .list_resources()
+            .await?
+            .into_iter()
+            .map(|resource| (resource.kind(), resource.name().to_owned()))
+            .collect::<Vec<_>>();
+        assert_eq!(after_resources, before_resources);
+        assert!(runtime.calls().await.iter().all(|call| {
+            !matches!(call, RuntimeCall::Remove(request)
+            if request.resources().iter().any(|resource| {
+                matches!(resource.kind(), ResourceKind::Volume | ResourceKind::Network)
+            }))
+        }));
+        if boundary == Some(FailureBoundary::CreateContainerAfterMutation) {
+            let calls = runtime.calls().await;
+            let failed_create = calls
+                .iter()
+                .position(|call| matches!(call, RuntimeCall::CreateContainer(_)))
+                .ok_or("failed replacement create")?;
+            let partial_remove = calls[failed_create + 1..]
+                .iter()
+                .position(|call| matches!(call, RuntimeCall::Remove(_)))
+                .map(|offset| failed_create + 1 + offset)
+                .ok_or("partial replacement remove")?;
+            assert!(
+                calls[failed_create + 1..partial_remove]
+                    .iter()
+                    .all(|call| !matches!(call, RuntimeCall::ListResources)),
+                "partial cleanup rediscovered evidence instead of using CreateFailure"
+            );
+            assert!(matches!(
+                &calls[partial_remove],
+                RuntimeCall::Remove(request)
+                    if request.resources().len() == 1
+                        && request.resources()[0].kind() == ResourceKind::Container
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_runtime_image_identity_starts_without_apply_required() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let runtime_path = root.join("runtime.json");
+    let state_path = root.join("state.db");
+    let desired = spec("canonical-runtime-image", root)?;
+    let capabilities = FakeRuntime::default().capabilities().await?;
+    let approved = PolicyCompiler::compile(desired.clone(), &capabilities)?
+        .image()
+        .to_owned();
+    let (tagged_name, digest) = approved
+        .rsplit_once('@')
+        .ok_or("approved image lacks digest")?;
+    let tag_separator = tagged_name.rfind(':').ok_or("approved image lacks a tag")?;
+    let canonical = format!("{}@{digest}", &tagged_name[..tag_separator]);
+
+    let initial_runtime = FakeRuntime::persistent(capabilities.clone(), &runtime_path).await?;
+    let initial_service = SandboxService::new(
+        initial_runtime.clone(),
+        gascand::Store::open(&state_path)?,
+        Arc::new(NoopProvisioner),
+    );
+    initial_service.up(UpRequest::new(desired.clone())).await?;
+    initial_runtime.stop(desired.id()).await?;
+    drop(initial_service);
+    drop(initial_runtime);
+    rewrite_runtime_image(&runtime_path, &canonical)?;
+
+    let runtime = FakeRuntime::persistent(capabilities, &runtime_path).await?;
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(&state_path)?,
+        Arc::new(NoopProvisioner),
+    );
+    let operation = service.up(UpRequest::new(desired.clone())).await?;
+    let events = service.store().operation_events(operation.id)?;
+
+    assert!(events.iter().all(|event| {
+        event
+            .details
+            .as_ref()
+            .and_then(|details| details["phase"].as_str())
+            != Some("apply_required")
+    }));
+    assert!(
+        runtime
+            .calls()
+            .await
+            .iter()
+            .any(|call| matches!(call, RuntimeCall::Start(id) if id == desired.id()))
+    );
+    assert_eq!(
+        runtime
+            .inspect(desired.id())
+            .await?
+            .ok_or("runtime sandbox")?
+            .state,
+        gascan_core::runtime::ContainerState::Running
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_replace_rejects_missing_or_extra_owned_container_evidence() -> TestResult {
+    let old_image = "ghcr.io/liquescent-development/gascan/workspace:old@sha256:\
+                     bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    for extra in [false, true] {
+        let root = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+        let desired = spec("image-replace-container-evidence", root)?;
+        let runtime = FakeRuntime::default();
+        let service = SandboxService::new(
+            runtime.clone(),
+            gascand::Store::open(root.join("state.db"))?,
+            Arc::new(NoopProvisioner),
+        );
+        service.up(UpRequest::new(desired.clone())).await?;
+        let mut record = service.status(desired.id())?.ok_or("record")?;
+        record.image_resolution = Some(gascand::ImageResolution::new(
+            1,
+            json!({"digest":old_image}),
+        ));
+        service.store().put_sandbox(&record)?;
+        if extra {
+            runtime
+                .seed_container_resource(
+                    "extra-owned-container",
+                    desired.id().clone(),
+                    ResourceOwnership::GasCanOwned,
+                )
+                .await?;
+        } else {
+            runtime
+                .forget_resource(&ResourceIdentity::new(
+                    ResourceKind::Container,
+                    desired.id().to_string(),
+                )?)
+                .await;
+        }
+        let before = runtime.calls().await.len();
+
+        assert!(service.apply(UpRequest::new(desired)).await.is_err());
+
+        assert!(runtime.calls().await[before..].iter().all(|call| {
+            !matches!(
+                call,
+                RuntimeCall::Stop(_)
+                    | RuntimeCall::Remove(_)
+                    | RuntimeCall::CreateContainer(_)
+                    | RuntimeCall::Start(_)
+                    | RuntimeCall::Exec(_)
+            )
+        }));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_replace_rollback_rejects_extra_owned_container_evidence_before_cleanup() -> TestResult
+{
+    let old_image = "ghcr.io/liquescent-development/gascan/workspace:old@sha256:\
+                     bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let desired = spec("image-replace-rollback-container-evidence", root)?;
+    let runtime = FakeRuntime::default();
+    let initial_service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    );
+    initial_service.up(UpRequest::new(desired.clone())).await?;
+    let mut record = initial_service.status(desired.id())?.ok_or("record")?;
+    record.image_resolution = Some(gascand::ImageResolution::new(
+        1,
+        json!({"digest":old_image}),
+    ));
+    initial_service.store().put_sandbox(&record)?;
+    drop(initial_service);
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(ExtraContainerProvisioner {
+            runtime: runtime.clone(),
+            id: desired.id().clone(),
+        }),
+    );
+
+    assert!(service.apply(UpRequest::new(desired)).await.is_err());
+
+    let removes = runtime
+        .calls()
+        .await
+        .into_iter()
+        .filter(|call| matches!(call, RuntimeCall::Remove(_)))
+        .count();
+    assert_eq!(removes, 1, "rollback mutated ambiguous container evidence");
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_replace_preserves_primary_and_rollback_errors() -> TestResult {
+    let old_image = "ghcr.io/liquescent-development/gascan/workspace:old@sha256:\
+                     bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let runtime_path = root.join("runtime.json");
+    let state_path = root.join("state.db");
+    let capabilities = FakeRuntime::default().capabilities().await?;
+    let initial_runtime = FakeRuntime::persistent(capabilities.clone(), &runtime_path).await?;
+    let desired = spec("image-replace-double-failure", root)?;
+    let initial_service = SandboxService::new(
+        initial_runtime.clone(),
+        gascand::Store::open(&state_path)?,
+        Arc::new(NoopProvisioner),
+    );
+    initial_service.up(UpRequest::new(desired.clone())).await?;
+    let mut record = initial_service
+        .status(desired.id())?
+        .ok_or("sandbox record")?;
+    record.image_resolution = Some(gascand::ImageResolution::new(
+        1,
+        json!({"digest": old_image}),
+    ));
+    initial_service.store().put_sandbox(&record)?;
+    drop(initial_service);
+    drop(initial_runtime);
+    rewrite_runtime_image(&runtime_path, old_image)?;
+
+    let runtime = FakeRuntime::persistent(capabilities, &runtime_path).await?;
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(&state_path)?,
+        Arc::new(RollbackFailingProvisioner {
+            runtime: runtime.clone(),
+        }),
+    );
+
+    let error = match service.apply(UpRequest::new(desired)).await {
+        Ok(_) => return Err("replacement unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+
+    assert!(
+        error
+            .to_string()
+            .contains("injected replacement provision failure")
+    );
+    assert!(error.to_string().contains("rollback failed"));
+    assert!(error.to_string().contains("injected failure at remove"));
+    assert_eq!(
+        service
+            .latest_operation()?
+            .ok_or("failed operation")?
+            .status,
+        OperationStatus::Failed
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_replace_database_commit_failure_restores_runtime_and_resolution() -> TestResult {
+    let old_image = "ghcr.io/liquescent-development/gascan/workspace:old@sha256:\
+                     bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let runtime_path = root.join("runtime.json");
+    let state_path = root.join("state.db");
+    let capabilities = FakeRuntime::default().capabilities().await?;
+    let initial_runtime = FakeRuntime::persistent(capabilities.clone(), &runtime_path).await?;
+    let desired = spec("image-replace-database-failure", root)?;
+    let id = desired.id().clone();
+    let initial_service = SandboxService::new(
+        initial_runtime.clone(),
+        gascand::Store::open(&state_path)?,
+        Arc::new(NoopProvisioner),
+    );
+    initial_service.up(UpRequest::new(desired.clone())).await?;
+    let mut record = initial_service
+        .status(desired.id())?
+        .ok_or("sandbox record")?;
+    record.image_resolution = Some(gascand::ImageResolution::new(
+        1,
+        json!({"digest": old_image}),
+    ));
+    initial_service.store().put_sandbox(&record)?;
+    drop(initial_service);
+    drop(initial_runtime);
+    rewrite_runtime_image(&runtime_path, old_image)?;
+
+    let runtime = FakeRuntime::persistent(capabilities, &runtime_path).await?;
+    let store = gascand::Store::open(&state_path)?;
+    let service = SandboxService::new(
+        runtime.clone(),
+        store.clone(),
+        Arc::new(TerminalReadFailingProvisioner {
+            store: store.clone(),
+        }),
+    );
+
+    let error = match service.apply(UpRequest::new(desired)).await {
+        Ok(_) => return Err("database race unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("injected operation event read failure")
+    );
+    assert_eq!(
+        runtime
+            .inspect(&id)
+            .await?
+            .ok_or("rolled back runtime")?
+            .image,
+        old_image
+    );
+    assert_eq!(
+        service
+            .status(&id)?
+            .ok_or("rolled back record")?
+            .image_resolution
+            .and_then(|resolution| resolution.details["digest"].as_str().map(ToOwned::to_owned)),
+        Some(old_image.to_owned())
+    );
+    assert_eq!(
+        service
+            .latest_operation()?
+            .ok_or("terminal operation")?
+            .status,
+        OperationStatus::Failed
+    );
     Ok(())
 }
 

@@ -38,6 +38,8 @@ image=$(bash "$root/scripts/validate-connected-image-receipt.sh" "$reference_fil
   printf 'image reference is not digest-qualified\n' >&2
   exit 1
 }
+image_digest=${image##*@}
+local_image=$(approved_local_image "$image")
 owner_token=${GASCAN_TEST_OWNER_TOKEN:-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')}
 [[ "$owner_token" =~ ^[0-9a-f]{32}$ ]] || { printf 'invalid owner token\n' >&2; exit 1; }
 name="gascan-image-user-test-$owner_token"
@@ -49,6 +51,9 @@ owned() {
   printf '%s' "$inspect" | cargo run --quiet --locked --offline \
     --manifest-path "$root/scripts/Cargo.toml" --bin validate-owned-container -- \
     "$name" "$owner_token"
+}
+owned_image() {
+  owned_container_from_approved_image "$name" "$owner_token" "$image_digest" "$local_image"
 }
 
 cleanup() {
@@ -73,12 +78,14 @@ trap on_signal INT TERM
 
 "$container_bin" create \
   --name "$name" \
+  --init \
   --label dev.gascan.test=true \
   --label "dev.gascan.test.owner=$owner_token" \
   --mount "type=bind,source=$root,target=/workspace" \
-  "$image" >/dev/null
-owned
+  "$local_image" >/dev/null
+owned_image
 "$container_bin" start "$name" >/dev/null
+owned_image
 "$container_bin" exec "$name" bash /workspace/tests/image/user-and-volumes.sh --inside
 
 started=$(date +%s)
@@ -86,3 +93,7 @@ owned && owned || { printf 'container ownership changed before stop\n' >&2; exit
 bounded_container stop --time 5 "$name" >/dev/null
 elapsed=$(( $(date +%s) - started ))
 test "$elapsed" -le 5
+owned_image
+"$container_bin" start "$name" >/dev/null
+owned_image
+"$container_bin" exec "$name" bash /workspace/tests/image/user-and-volumes.sh --inside

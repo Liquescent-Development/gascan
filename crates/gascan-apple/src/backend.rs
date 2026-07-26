@@ -4,9 +4,9 @@ use async_trait::async_trait;
 use gascan_core::{
     runtime::{
         ContainerState, CreateFailure, CreateOutcome, CreateRequest, ExecCancellation, ExecInput,
-        ExecOutput, ExecRequest, ExecSession, RemoveRequest, ResourceIdentity, ResourceKind,
-        ResourceOwnership, RuntimeBackend, RuntimeCapabilities, RuntimeError, RuntimeResource,
-        RuntimeSandbox,
+        ExecOutput, ExecRequest, ExecSession, RecreateRequest, RemoveRequest, ResourceIdentity,
+        ResourceKind, ResourceOwnership, RuntimeBackend, RuntimeCapabilities, RuntimeError,
+        RuntimeResource, RuntimeSandbox,
     },
     sandbox::SandboxId,
 };
@@ -178,6 +178,27 @@ impl<R: CommandRunner + Clone> AppleBackend<R> {
         }
         created
     }
+
+    async fn reconcile_recreated_container(
+        &self,
+        request: &RecreateRequest,
+    ) -> Vec<RuntimeResource> {
+        let Ok(identity) =
+            ResourceIdentity::new(ResourceKind::Container, request.create().id().to_string())
+        else {
+            return Vec::new();
+        };
+        let Ok(Some(resource)) = self.current_for(&identity).await else {
+            return Vec::new();
+        };
+        if resource.ownership() == ResourceOwnership::GasCanOwned
+            && resource.sandbox_id() == Some(request.create().id())
+        {
+            vec![resource]
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 #[async_trait]
@@ -348,6 +369,68 @@ where
             Ok(outcome) => Ok(outcome),
             Err(error) => Err(create_failure(&request, created, error)),
         }
+    }
+
+    async fn prepare_image(&self, image: &str) -> Result<(), RuntimeError> {
+        self.pull(image).await
+    }
+
+    async fn create_container(
+        &self,
+        request: RecreateRequest,
+    ) -> Result<CreateOutcome, CreateFailure> {
+        let create = request.create();
+        let inventory = self.inventory().await.map_err(CreateFailure::from_source)?;
+        for retained in request.retained().resources() {
+            if inventory
+                .iter()
+                .find(|resource| resource.identity() == retained.identity())
+                != Some(retained)
+            {
+                return Err(CreateFailure::from_source(
+                    RuntimeError::OwnershipMismatch {
+                        resource: retained.name().to_owned(),
+                    },
+                ));
+            }
+        }
+        if inventory.iter().any(|resource| {
+            resource.kind() == ResourceKind::Container && resource.name() == create.id().as_str()
+        }) {
+            return Err(CreateFailure::from_source(RuntimeError::Conflict {
+                resource: create.id().to_string(),
+                message: "container already exists".to_owned(),
+            }));
+        }
+        let spec = AppleCommandBuilder::create_with_retained(&request)
+            .map_err(|error| CreateFailure::from_source(translation_error(error)))?;
+        if let Err(error) = self.runner.run(spec).await {
+            let created = if matches!(&error, RuntimeError::CommandIo { .. }) {
+                self.reconcile_recreated_container(&request).await
+            } else {
+                Vec::new()
+            };
+            return Err(CreateFailure::from_created_evidence(create, created, error));
+        }
+        let identity = ResourceIdentity::new(ResourceKind::Container, create.id().to_string())
+            .map_err(CreateFailure::from_source)?;
+        let container = match self.current_for(&identity).await {
+            Ok(Some(resource))
+                if resource.ownership() == ResourceOwnership::GasCanOwned
+                    && resource.sandbox_id() == Some(create.id()) =>
+            {
+                resource
+            }
+            Ok(_) => {
+                return Err(CreateFailure::from_source(
+                    RuntimeError::OwnershipMismatch {
+                        resource: create.id().to_string(),
+                    },
+                ));
+            }
+            Err(error) => return Err(CreateFailure::from_source(error)),
+        };
+        CreateOutcome::for_recreate(&request, vec![container]).map_err(CreateFailure::from_source)
     }
 
     async fn start(&self, id: &SandboxId) -> Result<(), RuntimeError> {

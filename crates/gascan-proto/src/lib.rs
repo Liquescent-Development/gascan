@@ -5,13 +5,91 @@
 /// Supported API major version.
 pub const API_MAJOR: u32 = 1;
 /// Current backwards-compatible API minor version.
-pub const API_MINOR: u32 = 1;
+pub const API_MINOR: u32 = 3;
 /// Required POSIX permission bits for the local socket directory (`0700`).
 pub const SOCKET_DIRECTORY_MODE: u32 = 0o700;
 /// Required POSIX permission bits for the local socket (`0600`).
 pub const SOCKET_MODE: u32 = 0o600;
 /// Stable code returned when an attach frame has no session token.
 pub const SESSION_TOKEN_EMPTY: &str = "empty_session_token";
+
+/// Canonical interpretation of SSH status fields shared by every API consumer.
+pub mod ssh_status {
+    use super::v1;
+
+    /// User-facing readiness state derived from one complete sandbox status.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum SshState {
+        Disabled,
+        Starting,
+        Ready,
+        Unhealthy,
+        Unavailable,
+    }
+
+    impl SshState {
+        /// Stable lowercase name used by structured output.
+        #[must_use]
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::Disabled => "disabled",
+                Self::Starting => "starting",
+                Self::Ready => "ready",
+                Self::Unhealthy => "unhealthy",
+                Self::Unavailable => "unavailable",
+            }
+        }
+    }
+
+    /// Classify SSH state without trusting contradictory or incomplete fields.
+    #[must_use]
+    pub fn classify(status: &v1::SandboxStatus) -> SshState {
+        let Some(ssh) = status.ssh.as_ref() else {
+            return SshState::Unavailable;
+        };
+        let has_endpoint = ssh.host.is_some()
+            || ssh.port.is_some()
+            || ssh.alias.is_some()
+            || ssh.host_key_fingerprint.is_some()
+            || ssh.client_key_fingerprint.is_some();
+        if !ssh.enabled {
+            return if !ssh.active && !has_endpoint {
+                SshState::Disabled
+            } else {
+                SshState::Unhealthy
+            };
+        }
+        if ssh.active {
+            return if status.actual_state == v1::ActualState::Running as i32
+                && ssh.host.as_deref() == Some("127.0.0.1")
+                && ssh
+                    .port
+                    .is_some_and(|port| (1024..=u32::from(u16::MAX)).contains(&port))
+                && ssh.alias.as_deref() == Some(format!("gascan-{}", status.sandbox_id).as_str())
+                && ssh
+                    .host_key_fingerprint
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
+                && ssh
+                    .client_key_fingerprint
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
+            {
+                SshState::Ready
+            } else {
+                SshState::Unhealthy
+            };
+        }
+        if has_endpoint {
+            return SshState::Unhealthy;
+        }
+        match v1::ActualState::try_from(status.actual_state).unwrap_or(v1::ActualState::Unknown) {
+            v1::ActualState::Pending => SshState::Starting,
+            v1::ActualState::Failed => SshState::Unhealthy,
+            _ => SshState::Unavailable,
+        }
+    }
+}
 
 /// Stable machine-readable values carried by [`v1::Error::code`].
 pub mod error_code {
@@ -27,6 +105,10 @@ pub mod error_code {
     pub const DISK_CONTROL_UNSUPPORTED: &str = "disk_control_unsupported";
     /// Existing managed storage differs from the requested immutable capacity.
     pub const STORAGE_CHANGE_REQUIRES_RECREATE: &str = "storage_change_requires_recreate";
+    /// The workspace image differs and must be applied before continuing.
+    pub const IMAGE_UPGRADE_REQUIRED: &str = "image_upgrade_required";
+    /// Replacing the workspace image failed.
+    pub const IMAGE_REPLACEMENT_FAILED: &str = "image_replacement_failed";
     /// The selected sandbox does not exist.
     pub const SANDBOX_NOT_FOUND: &str = "sandbox_not_found";
     /// Another operation prevents this request from running.
@@ -43,6 +125,22 @@ pub mod error_code {
     pub const EXPIRED_SESSION_TOKEN: &str = "expired_session_token";
     /// A later frame tried to change the session bound by the first frame.
     pub const SESSION_TOKEN_MISMATCH: &str = "session_token_mismatch";
+    /// SSH requires a networked sandbox.
+    pub const SSH_REQUIRES_NETWORK: &str = "ssh_requires_network";
+    /// SSH is disabled for the selected sandbox.
+    pub const SSH_DISABLED: &str = "ssh_disabled";
+    /// SSH has not published a verified active alias.
+    pub const SSH_NOT_READY: &str = "ssh_not_ready";
+    /// The requested loopback SSH host port is unavailable.
+    pub const SSH_PORT_UNAVAILABLE: &str = "ssh_port_unavailable";
+    /// The verified SSH host identity changed.
+    pub const SSH_HOST_KEY_MISMATCH: &str = "ssh_host_key_mismatch";
+    /// Managed SSH configuration is unsafe.
+    pub const SSH_CONFIG_UNSAFE: &str = "ssh_config_unsafe";
+    /// Managed SSH configuration could not be updated atomically.
+    pub const SSH_CONFIG_UPDATE_FAILED: &str = "ssh_config_update_failed";
+    /// The system OpenSSH client is unavailable.
+    pub const SSH_CLIENT_UNAVAILABLE: &str = "ssh_client_unavailable";
 
     /// All codes defined by API v1.
     pub const ALL: &[&str] = &[
@@ -52,6 +150,8 @@ pub mod error_code {
         INVALID_PROJECT_ROOT,
         DISK_CONTROL_UNSUPPORTED,
         STORAGE_CHANGE_REQUIRES_RECREATE,
+        IMAGE_UPGRADE_REQUIRED,
+        IMAGE_REPLACEMENT_FAILED,
         SANDBOX_NOT_FOUND,
         OPERATION_CONFLICT,
         BACKEND_UNAVAILABLE,
@@ -60,6 +160,14 @@ pub mod error_code {
         UNKNOWN_SESSION_TOKEN,
         EXPIRED_SESSION_TOKEN,
         SESSION_TOKEN_MISMATCH,
+        SSH_REQUIRES_NETWORK,
+        SSH_DISABLED,
+        SSH_NOT_READY,
+        SSH_PORT_UNAVAILABLE,
+        SSH_HOST_KEY_MISMATCH,
+        SSH_CONFIG_UNSAFE,
+        SSH_CONFIG_UPDATE_FAILED,
+        SSH_CLIENT_UNAVAILABLE,
     ];
 }
 

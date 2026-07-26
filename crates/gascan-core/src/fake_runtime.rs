@@ -1,8 +1,8 @@
 use crate::runtime::{
     ContainerState, CreateFailure, CreateOutcome, CreateRequest, ExecCancellation, ExecInput,
-    ExecOutput, ExecRequest, ExecSession, RemoveRequest, ResourceIdentity, ResourceKind,
-    ResourceOwnership, RuntimeBackend, RuntimeCall, RuntimeCapabilities, RuntimeError,
-    RuntimeOutcome, RuntimeResource, RuntimeSandbox,
+    ExecOutput, ExecRequest, ExecSession, RecreateRequest, RemoveRequest, ResourceIdentity,
+    ResourceKind, ResourceOwnership, RuntimeBackend, RuntimeCall, RuntimeCapabilities,
+    RuntimeError, RuntimeOutcome, RuntimeResource, RuntimeSandbox,
 };
 use crate::sandbox::SandboxId;
 use async_trait::async_trait;
@@ -11,6 +11,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
+
+const FAKE_WORKSPACE_IMAGE: &str = "ghcr.io/liquescent-development/gascan/workspace:fake@sha256:\
+     aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 #[derive(Clone)]
 pub struct FakeRuntime {
@@ -45,6 +48,9 @@ pub enum FailureBoundary {
     Capabilities,
     Inspect,
     Create,
+    PrepareImage,
+    CreateContainer,
+    CreateContainerAfterMutation,
     Start,
     Stop,
     Remove,
@@ -53,12 +59,23 @@ pub enum FailureBoundary {
     ListResources,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FakeExecHangPhase {
+    Start,
+    Close,
+    Output,
+    Drain,
+}
+
 impl FailureBoundary {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Capabilities => "capabilities",
             Self::Inspect => "inspect",
             Self::Create => "create",
+            Self::PrepareImage => "prepare_image",
+            Self::CreateContainer => "create_container",
+            Self::CreateContainerAfterMutation => "create_container_after_mutation",
             Self::Start => "start",
             Self::Stop => "stop",
             Self::Remove => "remove",
@@ -78,9 +95,14 @@ struct FakeState {
     outcomes: Vec<RuntimeOutcome>,
     failures: HashSet<FailureBoundary>,
     create_failure_after_mutations: Option<usize>,
+    image_change_on_prepare: Option<String>,
     exec_result: (Vec<u8>, Vec<u8>, i32, i32),
     exec_results: VecDeque<(Vec<u8>, Vec<u8>, i32, i32)>,
     exec_errors: VecDeque<RuntimeError>,
+    create_errors: VecDeque<RuntimeError>,
+    ssh_port_collisions: usize,
+    created_ssh_host_ports: VecDeque<u16>,
+    exec_hangs: VecDeque<FakeExecHangPhase>,
     exec_input_failures: usize,
     exec_stream_errors: VecDeque<RuntimeError>,
     exec_cancellations: usize,
@@ -99,9 +121,14 @@ impl FakeRuntime {
                 outcomes: Vec::new(),
                 failures: HashSet::new(),
                 create_failure_after_mutations: None,
+                image_change_on_prepare: None,
                 exec_result: (Vec::new(), Vec::new(), 0, 0),
                 exec_results: VecDeque::new(),
                 exec_errors: VecDeque::new(),
+                create_errors: VecDeque::new(),
+                ssh_port_collisions: 0,
+                created_ssh_host_ports: VecDeque::new(),
+                exec_hangs: VecDeque::new(),
                 exec_input_failures: 0,
                 exec_stream_errors: VecDeque::new(),
                 exec_cancellations: 0,
@@ -161,6 +188,10 @@ impl FakeRuntime {
         self.inner.lock().await.create_failure_after_mutations = Some(mutations);
     }
 
+    pub async fn change_image_on_prepare(&self, image: String) {
+        self.inner.lock().await.image_change_on_prepare = Some(image);
+    }
+
     pub async fn seed_unowned(&self, id: SandboxId) {
         let ownership = crate::runtime::OwnershipMetadata {
             managed_by: "foreign-runtime-client".to_owned(),
@@ -171,8 +202,10 @@ impl FakeRuntime {
             id.clone(),
             RuntimeSandbox {
                 id: id.clone(),
+                image: FAKE_WORKSPACE_IMAGE.to_owned(),
                 state: ContainerState::Stopped,
                 ownership,
+                ports: Vec::new(),
             },
         );
         insert_container_resource(&mut state, id, ResourceOwnership::Foreign);
@@ -204,8 +237,56 @@ impl FakeRuntime {
         self.inner.lock().await.exec_errors.push_back(error);
     }
 
+    pub async fn queue_create_error(&self, error: RuntimeError) {
+        self.inner.lock().await.create_errors.push_back(error);
+    }
+
+    pub async fn queue_ssh_port_collision(&self) {
+        self.inner.lock().await.ssh_port_collisions += 1;
+    }
+
+    pub async fn queue_created_ssh_host_port(&self, port: u16) {
+        self.inner
+            .lock()
+            .await
+            .created_ssh_host_ports
+            .push_back(port);
+    }
+
+    pub async fn set_sandbox_ports(
+        &self,
+        id: &SandboxId,
+        ports: Vec<crate::runtime::RuntimePort>,
+    ) -> Result<(), RuntimeError> {
+        let mut state = self.inner.lock().await;
+        state
+            .sandboxes
+            .get_mut(id)
+            .ok_or_else(|| missing(id))?
+            .ports = ports;
+        persist_state(&state, self.persistence.as_deref())
+    }
+
+    pub async fn set_sandbox_image(
+        &self,
+        id: &SandboxId,
+        image: String,
+    ) -> Result<(), RuntimeError> {
+        let mut state = self.inner.lock().await;
+        state
+            .sandboxes
+            .get_mut(id)
+            .ok_or_else(|| missing(id))?
+            .image = image;
+        persist_state(&state, self.persistence.as_deref())
+    }
+
     pub async fn queue_exec_input_failure(&self) {
         self.inner.lock().await.exec_input_failures += 1;
+    }
+
+    pub async fn queue_exec_hang(&self, phase: FakeExecHangPhase) {
+        self.inner.lock().await.exec_hangs.push_back(phase);
     }
 
     pub async fn queue_exec_stream_error(&self, error: RuntimeError) {
@@ -238,8 +319,10 @@ impl FakeRuntime {
             id.clone(),
             RuntimeSandbox {
                 id: id.clone(),
+                image: FAKE_WORKSPACE_IMAGE.to_owned(),
                 state: ContainerState::Stopped,
                 ownership,
+                ports: Vec::new(),
             },
         );
         insert_container_resource(&mut state, id, ResourceOwnership::GasCanOwned);
@@ -255,8 +338,10 @@ impl FakeRuntime {
             id.clone(),
             RuntimeSandbox {
                 id: id.clone(),
+                image: FAKE_WORKSPACE_IMAGE.to_owned(),
                 state: ContainerState::Stopped,
                 ownership,
+                ports: Vec::new(),
             },
         );
         insert_container_resource(&mut state, id, ResourceOwnership::Mismatched);
@@ -288,6 +373,24 @@ impl FakeRuntime {
             RuntimeResource::discovered(identity, sandbox_id, ownership),
         );
         Ok(())
+    }
+
+    pub async fn seed_container_resource(
+        &self,
+        name: &str,
+        sandbox_id: SandboxId,
+        ownership: ResourceOwnership,
+    ) -> Result<(), RuntimeError> {
+        let identity = ResourceIdentity::new(ResourceKind::Container, name)?;
+        self.inner.lock().await.resources.insert(
+            identity.clone(),
+            RuntimeResource::discovered(identity, Some(sandbox_id), ownership),
+        );
+        Ok(())
+    }
+
+    pub async fn forget_resource(&self, identity: &ResourceIdentity) {
+        self.inner.lock().await.resources.remove(identity);
     }
 
     pub async fn volume_exists(&self, name: &str) -> bool {
@@ -406,9 +509,14 @@ fn load_state(capabilities: RuntimeCapabilities, path: &Path) -> Result<FakeStat
         outcomes: Vec::new(),
         failures: HashSet::new(),
         create_failure_after_mutations: None,
+        image_change_on_prepare: None,
         exec_result: (Vec::new(), Vec::new(), 0, 0),
         exec_results: VecDeque::new(),
         exec_errors: VecDeque::new(),
+        create_errors: VecDeque::new(),
+        ssh_port_collisions: 0,
+        created_ssh_host_ports: VecDeque::new(),
+        exec_hangs: VecDeque::new(),
         exec_input_failures: 0,
         exec_stream_errors: VecDeque::new(),
         exec_cancellations: 0,
@@ -522,6 +630,22 @@ impl RuntimeBackend for FakeRuntime {
     async fn create(&self, request: CreateRequest) -> Result<CreateOutcome, CreateFailure> {
         let mut state = self.inner.lock().await;
         state.calls.push(RuntimeCall::Create(request.clone()));
+        if state.ssh_port_collisions > 0 {
+            state.ssh_port_collisions -= 1;
+            let error = selected_ssh_port_collision(&request);
+            state.outcomes.push(RuntimeOutcome::Failure {
+                boundary: "create".to_owned(),
+                code: error.code().to_owned(),
+            });
+            return Err(CreateFailure::from_source(error));
+        }
+        if let Some(error) = state.create_errors.pop_front() {
+            state.outcomes.push(RuntimeOutcome::Failure {
+                boundary: "create".to_owned(),
+                code: error.code().to_owned(),
+            });
+            return Err(CreateFailure::from_source(error));
+        }
         fail_once(&mut state, FailureBoundary::Create).map_err(CreateFailure::from_source)?;
         if request.id != request.ownership.sandbox_id {
             return Err(CreateFailure::from_source(
@@ -588,12 +712,15 @@ impl RuntimeBackend for FakeRuntime {
                 fail_after_create_mutation(&mut state, &request, &created)?;
             }
         }
+        let ports = observed_created_ports(&request, &mut state);
         state.sandboxes.insert(
             request.id.clone(),
             RuntimeSandbox {
                 id: request.id.clone(),
+                image: request.image.clone(),
                 state: ContainerState::Stopped,
                 ownership: request.ownership.clone(),
+                ports,
             },
         );
         let identity = ResourceIdentity::new(ResourceKind::Container, request.id.to_string())
@@ -607,6 +734,105 @@ impl RuntimeBackend for FakeRuntime {
         created.push(resource);
         fail_after_create_mutation(&mut state, &request, &created)?;
         let outcome = CreateOutcome::new(&request, created).map_err(CreateFailure::from_source)?;
+        state
+            .outcomes
+            .push(RuntimeOutcome::Created(outcome.clone()));
+        persist_state(&state, self.persistence.as_deref()).map_err(CreateFailure::from_source)?;
+        Ok(outcome)
+    }
+
+    async fn prepare_image(&self, image: &str) -> Result<(), RuntimeError> {
+        let mut state = self.inner.lock().await;
+        state
+            .calls
+            .push(RuntimeCall::PrepareImage(image.to_owned()));
+        fail_once(&mut state, FailureBoundary::PrepareImage)?;
+        if let Some(changed) = state.image_change_on_prepare.take() {
+            let sandbox =
+                state
+                    .sandboxes
+                    .values_mut()
+                    .next()
+                    .ok_or_else(|| RuntimeError::InvalidState {
+                        resource: "fake runtime".to_owned(),
+                        message: "no sandbox exists for configured image change".to_owned(),
+                    })?;
+            sandbox.image = changed;
+            persist_state(&state, self.persistence.as_deref())?;
+        }
+        Ok(())
+    }
+
+    async fn create_container(
+        &self,
+        request: RecreateRequest,
+    ) -> Result<CreateOutcome, CreateFailure> {
+        let mut state = self.inner.lock().await;
+        state
+            .calls
+            .push(RuntimeCall::CreateContainer(request.clone()));
+        if state.ssh_port_collisions > 0 {
+            state.ssh_port_collisions -= 1;
+            let error = selected_ssh_port_collision(request.create());
+            state.outcomes.push(RuntimeOutcome::Failure {
+                boundary: "create_container".to_owned(),
+                code: error.code().to_owned(),
+            });
+            return Err(CreateFailure::from_source(error));
+        }
+        if let Some(error) = state.create_errors.pop_front() {
+            state.outcomes.push(RuntimeOutcome::Failure {
+                boundary: "create_container".to_owned(),
+                code: error.code().to_owned(),
+            });
+            return Err(CreateFailure::from_source(error));
+        }
+        fail_once(&mut state, FailureBoundary::CreateContainer)
+            .map_err(CreateFailure::from_source)?;
+        let create = request.create();
+        if state.sandboxes.contains_key(create.id()) {
+            return Err(CreateFailure::from_source(RuntimeError::Conflict {
+                resource: create.id().to_string(),
+                message: "sandbox already exists".to_owned(),
+            }));
+        }
+        for retained in request.retained().resources() {
+            if state.resources.get(retained.identity()) != Some(retained) {
+                return Err(CreateFailure::from_source(
+                    RuntimeError::OwnershipMismatch {
+                        resource: retained.name().to_owned(),
+                    },
+                ));
+            }
+        }
+        let ports = observed_created_ports(create, &mut state);
+        state.sandboxes.insert(
+            create.id().clone(),
+            RuntimeSandbox {
+                id: create.id().clone(),
+                image: create.image().to_owned(),
+                state: ContainerState::Stopped,
+                ownership: create.ownership().clone(),
+                ports,
+            },
+        );
+        let identity = ResourceIdentity::new(ResourceKind::Container, create.id().to_string())
+            .map_err(CreateFailure::from_source)?;
+        let container = RuntimeResource::discovered(
+            identity.clone(),
+            Some(create.id().clone()),
+            ResourceOwnership::GasCanOwned,
+        );
+        state.resources.insert(identity, container.clone());
+        if let Err(source) = fail_once(&mut state, FailureBoundary::CreateContainerAfterMutation) {
+            return Err(CreateFailure::from_created_evidence(
+                create,
+                vec![container],
+                source,
+            ));
+        }
+        let outcome = CreateOutcome::for_recreate(&request, vec![container])
+            .map_err(CreateFailure::from_source)?;
         state
             .outcomes
             .push(RuntimeOutcome::Created(outcome.clone()));
@@ -707,6 +933,56 @@ impl RuntimeBackend for FakeRuntime {
                 resource: request.id.to_string(),
                 message: "exec requires a running sandbox".to_owned(),
             });
+        }
+        let hang = state.exec_hangs.pop_front();
+        if hang == Some(FakeExecHangPhase::Start) {
+            drop(state);
+            return std::future::pending::<Result<ExecSession, RuntimeError>>().await;
+        }
+        if let Some(phase) = hang {
+            let runtime = self.clone();
+            let (cancellation, mut cancelled) = ExecCancellation::channel();
+            tokio::spawn(async move {
+                if cancelled.changed().await.is_ok() && *cancelled.borrow() {
+                    runtime.inner.lock().await.exec_cancellations += 1;
+                }
+            });
+            let (input, mut inputs) = tokio::sync::mpsc::channel(1);
+            let (outputs, output) = tokio::sync::mpsc::channel(1);
+            match phase {
+                FakeExecHangPhase::Start => unreachable!(),
+                FakeExecHangPhase::Close => {
+                    input.try_send(ExecInput::Stdin(Vec::new())).map_err(|_| {
+                        RuntimeError::InvalidState {
+                            resource: request.id.to_string(),
+                            message: "could not prepare fake close hang".to_owned(),
+                        }
+                    })?;
+                    tokio::spawn(async move {
+                        let _inputs = inputs;
+                        let _outputs = outputs;
+                        std::future::pending::<()>().await;
+                    });
+                }
+                FakeExecHangPhase::Output => {
+                    tokio::spawn(async move {
+                        let _ = inputs.recv().await;
+                        let _outputs = outputs;
+                        std::future::pending::<()>().await;
+                    });
+                }
+                FakeExecHangPhase::Drain => {
+                    tokio::spawn(async move {
+                        let _ = inputs.recv().await;
+                        let _ = outputs
+                            .send(Ok(ExecOutput::Stdout(vec![b'x'; 16 * 1024 + 1])))
+                            .await;
+                        let _outputs = outputs;
+                        std::future::pending::<()>().await;
+                    });
+                }
+            }
+            return Ok(ExecSession::live_cancellable(input, output, cancellation));
         }
         if state.exec_input_failures > 0 {
             state.exec_input_failures -= 1;
@@ -868,6 +1144,32 @@ fn create_failure(
     source: RuntimeError,
 ) -> CreateFailure {
     CreateFailure::new(request, created, source).unwrap_or_else(CreateFailure::from_source)
+}
+
+fn observed_created_ports(
+    request: &CreateRequest,
+    state: &mut FakeState,
+) -> Vec<crate::runtime::RuntimePort> {
+    let mut ports = request.ports().to_vec();
+    if let Some(host_port) = state.created_ssh_host_ports.pop_front() {
+        if let Some(mapping) = ports.iter_mut().find(|mapping| mapping.guest_port == 22) {
+            mapping.host_port = host_port;
+        }
+    }
+    ports
+}
+
+fn selected_ssh_port_collision(request: &CreateRequest) -> RuntimeError {
+    let port = request
+        .ports()
+        .iter()
+        .find(|mapping| mapping.guest_port == 22)
+        .map_or(49_152, |mapping| mapping.host_port);
+    RuntimeError::CommandFailed {
+        operation: "container".to_owned(),
+        exit_code: Some(1),
+        stderr: format!("Error: listen tcp 127.0.0.1:{port}: bind: address already in use\n"),
+    }
 }
 
 fn fail_after_create_mutation(

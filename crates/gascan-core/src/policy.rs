@@ -2,9 +2,10 @@ use crate::manifest::{NetworkMode, Storage, UserMode};
 use crate::runtime::{
     CreateRequest, NetworkIsolation, OwnershipMetadata, ResourceIdentity, ResourceKind,
     RuntimeBindMount, RuntimeCapabilities, RuntimeError, RuntimeNetwork, RuntimePort,
-    RuntimeResourceLimits, RuntimeUser, RuntimeVolume,
+    RuntimeResourceLimits, RuntimeUser, RuntimeVolume, immutable_image_reference,
 };
 use crate::sandbox::{SandboxSpec, WORKSPACE_TARGET};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use camino::{Utf8Path, Utf8PathBuf};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr};
@@ -28,9 +29,20 @@ pub const MISE_STATE_DIR: &str = "/home/workspace/.config/gascan/mise-state";
 pub const MISE_SYSTEM_DATA_DIR: &str = "/opt/gascan/mise";
 pub const CONTAINER_PATH: &str = "/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ControlPlanePolicy<'a> {
+    pub ssh_authorized_key: Option<&'a str>,
+    pub ssh_host_port: Option<u16>,
+}
+
 pub struct PolicyCompiler;
 
 impl PolicyCompiler {
+    #[must_use]
+    pub const fn workspace_image() -> &'static str {
+        WORKSPACE_IMAGE
+    }
+
     pub fn managed_network_name(id: &crate::sandbox::SandboxId) -> String {
         format!("gascan-network-{id}")
     }
@@ -56,11 +68,131 @@ impl PolicyCompiler {
         spec: SandboxSpec,
         capabilities: &RuntimeCapabilities,
     ) -> Result<CreateRequest, PolicyError> {
+        Self::compile_for_image(spec, capabilities, Self::workspace_image())
+    }
+
+    pub fn compile_for_image(
+        spec: SandboxSpec,
+        capabilities: &RuntimeCapabilities,
+        workspace_image: &str,
+    ) -> Result<CreateRequest, PolicyError> {
+        Self::compile_for_image_internal(spec, capabilities, workspace_image, None)
+    }
+
+    pub fn compile_with_control_plane(
+        spec: SandboxSpec,
+        capabilities: &RuntimeCapabilities,
+        control: ControlPlanePolicy<'_>,
+    ) -> Result<CreateRequest, PolicyError> {
+        Self::compile_for_image_with_control_plane(
+            spec,
+            capabilities,
+            Self::workspace_image(),
+            control,
+        )
+    }
+
+    pub fn compile_for_image_with_control_plane(
+        spec: SandboxSpec,
+        capabilities: &RuntimeCapabilities,
+        workspace_image: &str,
+        control: ControlPlanePolicy<'_>,
+    ) -> Result<CreateRequest, PolicyError> {
+        Self::compile_for_image_internal(spec, capabilities, workspace_image, Some(control))
+    }
+
+    /// Replaces only the native SSH transport fields on an already validated request.
+    ///
+    /// This is used to reconstruct a previously inspected transport during rollback,
+    /// including when the newly requested manifest disabled SSH.
+    pub fn restore_ssh_transport(
+        mut request: CreateRequest,
+        control: Option<ControlPlanePolicy<'_>>,
+    ) -> Result<CreateRequest, PolicyError> {
+        request.ports.retain(|mapping| mapping.guest_port != 22);
+        request.environment.remove("GASCAN_SSH_AUTHORIZED_KEY");
+        request.environment.insert(
+            "GASCAN_SSH_ENABLED".to_owned(),
+            if control.is_some() { "1" } else { "0" }.to_owned(),
+        );
+        let Some(control) = control else {
+            return Ok(request);
+        };
+        if matches!(request.network, RuntimeNetwork::Offline) {
+            return Err(PolicyError::OfflinePortsForbidden);
+        }
+        let authorized_key = control
+            .ssh_authorized_key
+            .ok_or(PolicyError::MissingSshAuthorizedKey)?;
+        if !is_ssh_public_key(authorized_key) {
+            return Err(PolicyError::InvalidSshAuthorizedKey);
+        }
+        let host_port = control
+            .ssh_host_port
+            .ok_or(PolicyError::MissingSshHostPort)?;
+        if host_port < 1024 {
+            return Err(PolicyError::InvalidSshHostPort);
+        }
+        if request
+            .ports
+            .iter()
+            .any(|mapping| mapping.host_port == host_port)
+        {
+            return Err(PolicyError::DuplicatePort(host_port));
+        }
+        request.ports.push(RuntimePort {
+            host_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            host_port,
+            guest_port: 22,
+        });
+        request.environment.insert(
+            "GASCAN_SSH_AUTHORIZED_KEY".to_owned(),
+            authorized_key.to_owned(),
+        );
+        Ok(request)
+    }
+
+    fn compile_for_image_internal(
+        spec: SandboxSpec,
+        capabilities: &RuntimeCapabilities,
+        workspace_image: &str,
+        control: Option<ControlPlanePolicy<'_>>,
+    ) -> Result<CreateRequest, PolicyError> {
+        if !immutable_image_reference(workspace_image) {
+            return Err(PolicyError::InvalidWorkspaceImage);
+        }
         validate_spec(&spec)?;
-        validate_capabilities(&spec, capabilities)?;
 
         let manifest = spec.manifest();
-        let ports = compile_ports(manifest.network(), manifest.ports())?;
+        let ssh_enabled = manifest.ssh().enabled() && control.is_some();
+        validate_capabilities(&spec, capabilities, ssh_enabled)?;
+        let control = control.unwrap_or_default();
+        let ssh_host_port = if ssh_enabled {
+            let authorized_key = control
+                .ssh_authorized_key
+                .ok_or(PolicyError::MissingSshAuthorizedKey)?;
+            if !is_ssh_public_key(authorized_key) {
+                return Err(PolicyError::InvalidSshAuthorizedKey);
+            }
+            let host_port = control
+                .ssh_host_port
+                .ok_or(PolicyError::MissingSshHostPort)?;
+            if host_port < 1024 {
+                return Err(PolicyError::InvalidSshHostPort);
+            }
+            if let Some(manifest_host_port) = manifest.ssh().host_port() {
+                if manifest_host_port != host_port {
+                    return Err(PolicyError::SshHostPortMismatch {
+                        manifest: manifest_host_port,
+                        control_plane: host_port,
+                    });
+                }
+            }
+            Some(host_port)
+        } else {
+            None
+        };
+        let ports = compile_ports(manifest.network(), manifest.ports(), ssh_host_port)?;
         let resources = compile_resources(manifest.resources())?;
         let ownership = OwnershipMetadata {
             managed_by: MANAGED_BY.to_owned(),
@@ -89,25 +221,11 @@ impl PolicyCompiler {
 
         Ok(CreateRequest {
             id: spec.id().clone(),
-            image: WORKSPACE_IMAGE.to_owned(),
+            image: workspace_image.to_owned(),
             bind_mounts,
             volumes,
             ports,
-            environment: BTreeMap::from([
-                ("HOME".to_owned(), WORKSPACE_HOME.to_owned()),
-                ("MISE_CACHE_DIR".to_owned(), MISE_CACHE_DIR.to_owned()),
-                ("MISE_DATA_DIR".to_owned(), MISE_DATA_DIR.to_owned()),
-                (
-                    "MISE_GLOBAL_CONFIG_FILE".to_owned(),
-                    MISE_GLOBAL_CONFIG_FILE.to_owned(),
-                ),
-                ("MISE_STATE_DIR".to_owned(), MISE_STATE_DIR.to_owned()),
-                (
-                    "MISE_SYSTEM_DATA_DIR".to_owned(),
-                    MISE_SYSTEM_DATA_DIR.to_owned(),
-                ),
-                ("PATH".to_owned(), CONTAINER_PATH.to_owned()),
-            ]),
+            environment: guest_environment(ssh_enabled, control),
             resources,
             network,
             user,
@@ -115,6 +233,70 @@ impl PolicyCompiler {
             ownership,
         })
     }
+}
+
+fn guest_environment(
+    ssh_enabled: bool,
+    control: ControlPlanePolicy<'_>,
+) -> BTreeMap<String, String> {
+    let mut environment = BTreeMap::from([
+        (
+            "GASCAN_SSH_ENABLED".to_owned(),
+            if ssh_enabled { "1" } else { "0" }.to_owned(),
+        ),
+        ("HOME".to_owned(), WORKSPACE_HOME.to_owned()),
+        ("MISE_CACHE_DIR".to_owned(), MISE_CACHE_DIR.to_owned()),
+        ("MISE_DATA_DIR".to_owned(), MISE_DATA_DIR.to_owned()),
+        (
+            "MISE_GLOBAL_CONFIG_FILE".to_owned(),
+            MISE_GLOBAL_CONFIG_FILE.to_owned(),
+        ),
+        ("MISE_STATE_DIR".to_owned(), MISE_STATE_DIR.to_owned()),
+        (
+            "MISE_SYSTEM_DATA_DIR".to_owned(),
+            MISE_SYSTEM_DATA_DIR.to_owned(),
+        ),
+        ("PATH".to_owned(), CONTAINER_PATH.to_owned()),
+    ]);
+    if ssh_enabled {
+        if let Some(authorized_key) = control.ssh_authorized_key {
+            environment.insert(
+                "GASCAN_SSH_AUTHORIZED_KEY".to_owned(),
+                authorized_key.to_owned(),
+            );
+        }
+    }
+    environment
+}
+
+fn is_ssh_public_key(key: &str) -> bool {
+    let mut fields = key.split_ascii_whitespace();
+    let (Some(kind), Some(encoded)) = (fields.next(), fields.next()) else {
+        return false;
+    };
+    if kind != "ssh-ed25519"
+        || fields.next().is_some()
+        || key.len() != kind.len() + 1 + encoded.len()
+        || key.as_bytes().get(kind.len()) != Some(&b' ')
+    {
+        return false;
+    }
+    let Ok(blob) = STANDARD.decode(encoded) else {
+        return false;
+    };
+    let Some((wire_kind, key_data)) = ssh_wire_string(&blob) else {
+        return false;
+    };
+    let Some((public_key, trailing)) = ssh_wire_string(key_data) else {
+        return false;
+    };
+    wire_kind == kind.as_bytes() && public_key.len() == 32 && trailing.is_empty()
+}
+
+fn ssh_wire_string(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    let length = u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
+    let content = bytes.get(4..)?;
+    Some((content.get(..length)?, content.get(length..)?))
 }
 
 pub fn filtered_host_environment<I, K, V>(environment: I) -> BTreeMap<String, String>
@@ -153,6 +335,7 @@ fn validate_spec(spec: &SandboxSpec) -> Result<(), PolicyError> {
 fn validate_capabilities(
     spec: &SandboxSpec,
     capabilities: &RuntimeCapabilities,
+    ssh_enabled: bool,
 ) -> Result<(), PolicyError> {
     if !capabilities.bind_mounts {
         return Err(PolicyError::BindMountsUnavailable);
@@ -163,7 +346,7 @@ fn validate_capabilities(
     if !capabilities.resource_limits {
         return Err(PolicyError::ResourceLimitsUnavailable);
     }
-    if !spec.manifest().ports().is_empty() && !capabilities.loopback_publish {
+    if (!spec.manifest().ports().is_empty() || ssh_enabled) && !capabilities.loopback_publish {
         return Err(PolicyError::LoopbackPublishUnavailable);
     }
     if spec.manifest().network() == NetworkMode::Offline
@@ -177,12 +360,13 @@ fn validate_capabilities(
 fn compile_ports(
     network: NetworkMode,
     declared: &BTreeMap<String, u16>,
+    ssh_host_port: Option<u16>,
 ) -> Result<Vec<RuntimePort>, PolicyError> {
     if network == NetworkMode::Offline && !declared.is_empty() {
         return Err(PolicyError::OfflinePortsForbidden);
     }
     let mut seen = BTreeSet::new();
-    declared
+    let mut ports = declared
         .values()
         .map(|port| {
             if *port == 0 {
@@ -197,7 +381,18 @@ fn compile_ports(
                 guest_port: *port,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(host_port) = ssh_host_port {
+        if !seen.insert(host_port) {
+            return Err(PolicyError::DuplicatePort(host_port));
+        }
+        ports.push(RuntimePort {
+            host_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            host_port,
+            guest_port: 22,
+        });
+    }
+    Ok(ports)
 }
 
 fn compile_resources(
@@ -253,6 +448,20 @@ fn managed_volume_names(sandbox_id: &str) -> [String; 3] {
 #[derive(Debug, Error, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum PolicyError {
+    #[error("workspace image must be an immutable digest-qualified reference")]
+    InvalidWorkspaceImage,
+    #[error("SSH authorized key must be an OpenSSH public key")]
+    InvalidSshAuthorizedKey,
+    #[error("enabled SSH requires an authorized public key")]
+    MissingSshAuthorizedKey,
+    #[error("enabled SSH requires a host port")]
+    MissingSshHostPort,
+    #[error("SSH host port must be in 1024..=65535")]
+    InvalidSshHostPort,
+    #[error(
+        "control-plane SSH host port {control_plane} does not match manifest SSH host port {manifest}"
+    )]
+    SshHostPortMismatch { manifest: u16, control_plane: u16 },
     #[error("sandbox must contain exactly the canonical writable /workspace mount")]
     InvalidMount,
     #[error("runtime cannot provide bind mounts")]
@@ -284,6 +493,12 @@ pub enum PolicyError {
 impl PolicyError {
     pub const fn code(&self) -> &'static str {
         match self {
+            Self::InvalidWorkspaceImage => "invalid_workspace_image",
+            Self::InvalidSshAuthorizedKey => "invalid_ssh_authorized_key",
+            Self::MissingSshAuthorizedKey => "missing_ssh_authorized_key",
+            Self::MissingSshHostPort => "missing_ssh_host_port",
+            Self::InvalidSshHostPort => "invalid_ssh_host_port",
+            Self::SshHostPortMismatch { .. } => "ssh_host_port_mismatch",
             Self::InvalidMount => "invalid_mount",
             Self::BindMountsUnavailable => "bind_mounts_unavailable",
             Self::NamedVolumesUnavailable => "named_volumes_unavailable",

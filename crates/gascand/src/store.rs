@@ -5,15 +5,19 @@ use serde::Serialize;
 use serde_json::Value;
 use std::fmt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 5;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIAL_MIGRATION: &str = include_str!("../migrations/001_initial.sql");
 const DURABLE_METADATA_MIGRATION: &str = include_str!("../migrations/002_durable_metadata.sql");
 const STORAGE_RESOLUTION_MIGRATION: &str = include_str!("../migrations/003_storage_resolution.sql");
+const SSH_RESOLUTION_MIGRATION: &str = include_str!("../migrations/004_ssh_resolution.sql");
+const SSH_TRANSPORT_POLICY_MIGRATION: &str =
+    include_str!("../migrations/005_ssh_transport_policy.sql");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DesiredState {
@@ -104,6 +108,43 @@ resolution_record!(SetupResolution);
 resolution_record!(ToolResolution);
 resolution_record!(ImageResolution);
 resolution_record!(StorageResolution);
+resolution_record!(SshResolution);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SshTransportPolicy {
+    enabled: bool,
+    host_port: Option<u16>,
+}
+
+pub(crate) struct SshDoctorRecord {
+    pub(crate) record: SandboxRecord,
+    pub(crate) transport: Option<SshTransportPolicy>,
+    pub(crate) operation_pending: bool,
+}
+
+impl SshTransportPolicy {
+    pub(crate) const fn disabled() -> Self {
+        Self {
+            enabled: false,
+            host_port: None,
+        }
+    }
+
+    pub(crate) const fn enabled(host_port: Option<u16>) -> Self {
+        Self {
+            enabled: true,
+            host_port,
+        }
+    }
+
+    pub(crate) const fn is_enabled(self) -> bool {
+        self.enabled
+    }
+
+    pub(crate) const fn host_port(self) -> Option<u16> {
+        self.host_port
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SandboxRecord {
@@ -115,6 +156,7 @@ pub struct SandboxRecord {
     pub tool_resolution: Option<ToolResolution>,
     pub image_resolution: Option<ImageResolution>,
     pub storage_resolution: Option<StorageResolution>,
+    pub ssh_resolution: Option<SshResolution>,
     pub last_operation_id: Option<OperationId>,
     pub updated_at_millis: i64,
 }
@@ -142,6 +184,7 @@ pub struct OperationEvent {
 #[derive(Clone)]
 pub struct Store {
     connection: Arc<Mutex<Connection>>,
+    fail_operation_event_read: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Error)]
@@ -176,12 +219,16 @@ pub enum StoreError {
     InvalidTransition { from: String, to: String },
     #[error("operation {0} does not exist")]
     OperationNotFound(OperationId),
+    #[error("sandbox {0} does not exist")]
+    SandboxNotFound(SandboxId),
     #[error("operation ID must be positive, got {0}")]
     InvalidOperationId(i64),
     #[error("stored value is invalid: {0}")]
     CorruptData(String),
     #[error("system clock cannot be represented as a Unix timestamp")]
     InvalidSystemTime,
+    #[error("injected operation event read failure")]
+    InjectedOperationEventRead,
 }
 
 impl Store {
@@ -193,7 +240,13 @@ impl Store {
         initialize_schema(&mut connection)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
+            fail_operation_event_read: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    #[doc(hidden)]
+    pub fn fail_next_operation_event_read(&self) {
+        self.fail_operation_event_read.store(true, Ordering::SeqCst);
     }
 
     pub fn put_sandbox(&self, sandbox: &SandboxRecord) -> Result<(), StoreError> {
@@ -205,9 +258,71 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn put_sandbox_with_ssh_transport(
+        &self,
+        sandbox: &SandboxRecord,
+        policy: Option<SshTransportPolicy>,
+    ) -> Result<(), StoreError> {
+        validate_resolutions(sandbox)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        put_sandbox_in(&transaction, sandbox)?;
+        set_ssh_transport_policy_in(&transaction, &sandbox.id, policy)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn sandbox(&self, id: &SandboxId) -> Result<Option<SandboxRecord>, StoreError> {
         let connection = self.lock()?;
         load_sandbox(&connection, id.as_str())
+    }
+
+    pub(crate) fn ssh_transport_policy(
+        &self,
+        id: &SandboxId,
+    ) -> Result<Option<SshTransportPolicy>, StoreError> {
+        let connection = self.lock()?;
+        let raw = connection
+            .query_row(
+                "SELECT ssh_transport_enabled, ssh_transport_host_port FROM sandboxes WHERE id = ?1",
+                [id.as_str()],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()?;
+        raw.map(decode_ssh_transport_policy)
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    /// Stores validated SSH identity evidence without touching runtime connection state.
+    pub fn update_ssh_resolution(
+        &self,
+        id: &SandboxId,
+        resolution: SshResolution,
+    ) -> Result<(), StoreError> {
+        self.set_ssh_resolution(id, Some(resolution))
+    }
+
+    pub(crate) fn set_ssh_resolution(
+        &self,
+        id: &SandboxId,
+        resolution: Option<SshResolution>,
+    ) -> Result<(), StoreError> {
+        if let Some(resolution) = resolution.as_ref() {
+            validate_ssh_resolution(resolution)?;
+        }
+        let (version, details) = encode_resolution(resolution.as_ref())?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = transaction.execute(
+            "UPDATE sandboxes SET ssh_resolution_version = ?1, ssh_resolution_details = ?2, updated_at_millis = ?3 WHERE id = ?4",
+            params![version, details, current_time_millis()?, id.as_str()],
+        )?;
+        if updated == 0 {
+            return Err(StoreError::SandboxNotFound(id.clone()));
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn list_sandboxes(&self) -> Result<Vec<SandboxRecord>, StoreError> {
@@ -215,6 +330,40 @@ impl Store {
         let mut statement = connection.prepare(&format!("{SANDBOX_SELECT} ORDER BY id"))?;
         let rows = statement.query_map([], sandbox_from_row)?;
         collect_rows(rows)
+    }
+
+    pub(crate) fn ssh_doctor_snapshot(&self) -> Result<Vec<SshDoctorRecord>, StoreError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let records = {
+            let mut statement = transaction.prepare(&format!("{SANDBOX_SELECT} ORDER BY id"))?;
+            let rows = statement.query_map([], sandbox_from_row)?;
+            collect_rows(rows)?
+        };
+        let mut snapshot = Vec::with_capacity(records.len());
+        for record in records {
+            let raw = transaction.query_row(
+                "SELECT ssh_transport_enabled, ssh_transport_host_port FROM sandboxes WHERE id = ?1",
+                [record.id.as_str()],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )?;
+            let transport = decode_ssh_transport_policy(raw)?;
+            let operation_pending = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM operations
+                    WHERE sandbox_id = ?1 AND status = ?2
+                )",
+                params![record.id.as_str(), OperationStatus::Pending.as_db()],
+                |row| row.get(0),
+            )?;
+            snapshot.push(SshDoctorRecord {
+                record,
+                transport,
+                operation_pending,
+            });
+        }
+        transaction.commit()?;
+        Ok(snapshot)
     }
 
     pub fn begin_operation(
@@ -260,7 +409,62 @@ impl Store {
         id: OperationId,
         actual_state: ActualState,
     ) -> Result<OperationRecord, StoreError> {
-        self.finish_operation(id, actual_state, OperationStatus::Completed, None, None)
+        self.finish_operation(
+            id,
+            actual_state,
+            OperationStatus::Completed,
+            None,
+            None,
+            false,
+        )
+        .map(|(operation, _)| operation)
+    }
+
+    pub(crate) fn complete_destroy_operation(
+        &self,
+        id: OperationId,
+    ) -> Result<OperationRecord, StoreError> {
+        self.finish_operation(
+            id,
+            ActualState::Absent,
+            OperationStatus::Completed,
+            None,
+            None,
+            true,
+        )
+        .map(|(operation, _)| operation)
+    }
+
+    pub(crate) fn fail_create_operation_clearing_ssh(
+        &self,
+        id: OperationId,
+        error_code: impl Into<String>,
+        error_details: Value,
+    ) -> Result<OperationRecord, StoreError> {
+        self.finish_operation(
+            id,
+            ActualState::Absent,
+            OperationStatus::Failed,
+            Some(error_code.into()),
+            Some(error_details),
+            true,
+        )
+        .map(|(operation, _)| operation)
+    }
+
+    pub(crate) fn complete_operation_with_event(
+        &self,
+        id: OperationId,
+        actual_state: ActualState,
+    ) -> Result<(OperationRecord, OperationEvent), StoreError> {
+        self.finish_operation(
+            id,
+            actual_state,
+            OperationStatus::Completed,
+            None,
+            None,
+            false,
+        )
     }
 
     pub fn fail_operation(
@@ -270,12 +474,24 @@ impl Store {
         error_code: impl Into<String>,
         error_details: Value,
     ) -> Result<OperationRecord, StoreError> {
+        self.fail_operation_with_event(id, actual_state, error_code, error_details)
+            .map(|(operation, _)| operation)
+    }
+
+    pub(crate) fn fail_operation_with_event(
+        &self,
+        id: OperationId,
+        actual_state: ActualState,
+        error_code: impl Into<String>,
+        error_details: Value,
+    ) -> Result<(OperationRecord, OperationEvent), StoreError> {
         self.finish_operation(
             id,
             actual_state,
             OperationStatus::Failed,
             Some(error_code.into()),
             Some(error_details),
+            false,
         )
     }
 
@@ -291,6 +507,9 @@ impl Store {
         &self,
         operation_id: OperationId,
     ) -> Result<Vec<OperationEvent>, StoreError> {
+        if self.fail_operation_event_read.swap(false, Ordering::SeqCst) {
+            return Err(StoreError::InjectedOperationEventRead);
+        }
         let connection = self.lock()?;
         let mut statement = connection.prepare(
             "SELECT sequence, operation_id, status, details, error_code, timestamp_millis FROM operation_events WHERE operation_id = ?1 ORDER BY sequence",
@@ -358,7 +577,8 @@ impl Store {
         status: OperationStatus,
         error_code: Option<String>,
         error_details: Option<Value>,
-    ) -> Result<OperationRecord, StoreError> {
+        clear_ssh_trust: bool,
+    ) -> Result<(OperationRecord, OperationEvent), StoreError> {
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let operation =
@@ -371,18 +591,54 @@ impl Store {
         )?;
         let current_state = ActualState::from_db(&current_state)?;
         validate_terminal_actual_transition(current_state, actual_state, operation.kind, status)?;
+        let may_clear_ssh_trust = matches!(
+            (operation.kind, status, actual_state),
+            (
+                OperationKind::Destroy,
+                OperationStatus::Completed,
+                ActualState::Absent
+            ) | (
+                OperationKind::Create,
+                OperationStatus::Failed,
+                ActualState::Absent
+            )
+        );
+        if clear_ssh_trust && !may_clear_ssh_trust {
+            return Err(StoreError::InvalidTransition {
+                from: operation.kind.as_db().to_owned(),
+                to: "clear_ssh_trust".to_owned(),
+            });
+        }
         let details_json = error_details
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
-        transaction.execute(
-            "UPDATE sandboxes SET actual_state = ?1, updated_at_millis = ?2 WHERE id = ?3",
-            params![
-                actual_state.as_db(),
-                current_time_millis()?,
-                operation.sandbox_id.as_str()
-            ],
-        )?;
+        if clear_ssh_trust {
+            transaction.execute(
+                "UPDATE sandboxes
+                 SET actual_state = ?1,
+                     ssh_resolution_version = NULL,
+                     ssh_resolution_details = NULL,
+                     ssh_transport_enabled = NULL,
+                     ssh_transport_host_port = NULL,
+                     updated_at_millis = ?2
+                 WHERE id = ?3",
+                params![
+                    actual_state.as_db(),
+                    current_time_millis()?,
+                    operation.sandbox_id.as_str()
+                ],
+            )?;
+        } else {
+            transaction.execute(
+                "UPDATE sandboxes SET actual_state = ?1, updated_at_millis = ?2 WHERE id = ?3",
+                params![
+                    actual_state.as_db(),
+                    current_time_millis()?,
+                    operation.sandbox_id.as_str()
+                ],
+            )?;
+        }
         transaction.execute(
             "UPDATE operations SET status = ?1, error_code = ?2, error_details = ?3 WHERE id = ?4",
             params![status.as_db(), error_code, details_json, id.get()],
@@ -391,9 +647,15 @@ impl Store {
             "INSERT INTO operation_events (operation_id, status, details, error_code, timestamp_millis) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![id.get(), status.as_db(), details_json, error_code, current_time_millis()?],
         )?;
+        let sequence = transaction.last_insert_rowid();
+        let terminal = transaction.query_row(
+            "SELECT sequence, operation_id, status, details, error_code, timestamp_millis FROM operation_events WHERE sequence = ?1",
+            [sequence],
+            event_from_row,
+        )?;
         let updated = load_operation(&transaction, id)?.ok_or(StoreError::OperationNotFound(id))?;
         transaction.commit()?;
-        Ok(updated)
+        Ok((updated, terminal))
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
@@ -437,18 +699,39 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), StoreError> {
                     connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 transaction.execute_batch(DURABLE_METADATA_MIGRATION)?;
                 transaction.execute_batch(STORAGE_RESOLUTION_MIGRATION)?;
+                transaction.execute_batch(SSH_RESOLUTION_MIGRATION)?;
+                transaction.execute_batch(SSH_TRANSPORT_POLICY_MIGRATION)?;
                 transaction.commit()?;
-                validate_v3_schema(connection)
+                validate_v5_schema(connection)
             }
             2 => {
                 validate_v2_schema(connection)?;
                 let transaction =
                     connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 transaction.execute_batch(STORAGE_RESOLUTION_MIGRATION)?;
+                transaction.execute_batch(SSH_RESOLUTION_MIGRATION)?;
+                transaction.execute_batch(SSH_TRANSPORT_POLICY_MIGRATION)?;
                 transaction.commit()?;
-                validate_v3_schema(connection)
+                validate_v5_schema(connection)
             }
-            SCHEMA_VERSION => validate_v3_schema(connection),
+            3 => {
+                validate_v3_schema(connection)?;
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                transaction.execute_batch(SSH_RESOLUTION_MIGRATION)?;
+                transaction.execute_batch(SSH_TRANSPORT_POLICY_MIGRATION)?;
+                transaction.commit()?;
+                validate_v5_schema(connection)
+            }
+            4 => {
+                validate_v4_schema(connection)?;
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                transaction.execute_batch(SSH_TRANSPORT_POLICY_MIGRATION)?;
+                transaction.commit()?;
+                validate_v5_schema(connection)
+            }
+            SCHEMA_VERSION => validate_v5_schema(connection),
             _ => Err(StoreError::UnsupportedSchemaVersion(version)),
         };
     }
@@ -475,11 +758,13 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), StoreError> {
     transaction.execute_batch(INITIAL_MIGRATION)?;
     transaction.execute_batch(DURABLE_METADATA_MIGRATION)?;
     transaction.execute_batch(STORAGE_RESOLUTION_MIGRATION)?;
+    transaction.execute_batch(SSH_RESOLUTION_MIGRATION)?;
+    transaction.execute_batch(SSH_TRANSPORT_POLICY_MIGRATION)?;
     transaction.commit()?;
-    validate_v3_schema(connection)
+    validate_v5_schema(connection)
 }
 
-const SANDBOX_SELECT: &str = "SELECT id, canonical_root, desired_state, actual_state, setup_resolution_version, setup_resolution_details, tool_resolution_version, tool_resolution_details, image_resolution_version, image_resolution_details, storage_resolution_version, storage_resolution_details, (SELECT id FROM operations WHERE sandbox_id = sandboxes.id ORDER BY id DESC LIMIT 1), updated_at_millis FROM sandboxes";
+const SANDBOX_SELECT: &str = "SELECT id, canonical_root, desired_state, actual_state, setup_resolution_version, setup_resolution_details, tool_resolution_version, tool_resolution_details, image_resolution_version, image_resolution_details, storage_resolution_version, storage_resolution_details, ssh_resolution_version, ssh_resolution_details, (SELECT id FROM operations WHERE sandbox_id = sandboxes.id ORDER BY id DESC LIMIT 1), updated_at_millis FROM sandboxes";
 const OPERATION_SELECT: &str =
     "SELECT id, sandbox_id, kind, status, error_code, error_details FROM operations";
 
@@ -517,11 +802,58 @@ fn put_sandbox_in(
     let tools = encode_resolution(sandbox.tool_resolution.as_ref())?;
     let image = encode_resolution(sandbox.image_resolution.as_ref())?;
     let storage = encode_resolution(sandbox.storage_resolution.as_ref())?;
+    let ssh = encode_resolution(sandbox.ssh_resolution.as_ref())?;
     transaction.execute(
-        "INSERT INTO sandboxes (id, canonical_root, desired_state, actual_state, setup_resolution_version, setup_resolution_details, tool_resolution_version, tool_resolution_details, image_resolution_version, image_resolution_details, storage_resolution_version, storage_resolution_details, updated_at_millis) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) ON CONFLICT(id) DO UPDATE SET desired_state = excluded.desired_state, actual_state = excluded.actual_state, setup_resolution_version = excluded.setup_resolution_version, setup_resolution_details = excluded.setup_resolution_details, tool_resolution_version = excluded.tool_resolution_version, tool_resolution_details = excluded.tool_resolution_details, image_resolution_version = excluded.image_resolution_version, image_resolution_details = excluded.image_resolution_details, storage_resolution_version = excluded.storage_resolution_version, storage_resolution_details = excluded.storage_resolution_details, updated_at_millis = excluded.updated_at_millis",
-        params![sandbox.id.as_str(), sandbox.canonical_root.as_str(), sandbox.desired_state.as_db(), sandbox.actual_state.as_db(), setup.0, setup.1, tools.0, tools.1, image.0, image.1, storage.0, storage.1, current_time_millis()?],
+        "INSERT INTO sandboxes (id, canonical_root, desired_state, actual_state, setup_resolution_version, setup_resolution_details, tool_resolution_version, tool_resolution_details, image_resolution_version, image_resolution_details, storage_resolution_version, storage_resolution_details, ssh_resolution_version, ssh_resolution_details, updated_at_millis) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) ON CONFLICT(id) DO UPDATE SET desired_state = excluded.desired_state, actual_state = excluded.actual_state, setup_resolution_version = excluded.setup_resolution_version, setup_resolution_details = excluded.setup_resolution_details, tool_resolution_version = excluded.tool_resolution_version, tool_resolution_details = excluded.tool_resolution_details, image_resolution_version = excluded.image_resolution_version, image_resolution_details = excluded.image_resolution_details, storage_resolution_version = excluded.storage_resolution_version, storage_resolution_details = excluded.storage_resolution_details, ssh_resolution_version = excluded.ssh_resolution_version, ssh_resolution_details = excluded.ssh_resolution_details, updated_at_millis = excluded.updated_at_millis",
+        params![sandbox.id.as_str(), sandbox.canonical_root.as_str(), sandbox.desired_state.as_db(), sandbox.actual_state.as_db(), setup.0, setup.1, tools.0, tools.1, image.0, image.1, storage.0, storage.1, ssh.0, ssh.1, current_time_millis()?],
     )?;
     Ok(())
+}
+
+fn set_ssh_transport_policy_in(
+    transaction: &Transaction<'_>,
+    id: &SandboxId,
+    policy: Option<SshTransportPolicy>,
+) -> Result<(), StoreError> {
+    let (enabled, host_port) = match policy {
+        Some(policy) => (
+            Some(i64::from(policy.enabled)),
+            policy.host_port.map(i64::from),
+        ),
+        None => (None, None),
+    };
+    let updated = transaction.execute(
+        "UPDATE sandboxes SET ssh_transport_enabled = ?1, ssh_transport_host_port = ?2 WHERE id = ?3",
+        params![enabled, host_port, id.as_str()],
+    )?;
+    if updated == 0 {
+        return Err(StoreError::SandboxNotFound(id.clone()));
+    }
+    Ok(())
+}
+
+fn decode_ssh_transport_policy(
+    raw: (Option<i64>, Option<i64>),
+) -> Result<Option<SshTransportPolicy>, StoreError> {
+    match raw {
+        (None, None) => Ok(None),
+        (Some(0), None) => Ok(Some(SshTransportPolicy::disabled())),
+        (Some(1), host_port) => {
+            let host_port = host_port
+                .map(|port| {
+                    u16::try_from(port).map_err(|_| {
+                        StoreError::CorruptData(
+                            "SSH transport host port is out of range".to_owned(),
+                        )
+                    })
+                })
+                .transpose()?;
+            Ok(Some(SshTransportPolicy::enabled(host_port)))
+        }
+        _ => Err(StoreError::CorruptData(
+            "invalid SSH transport policy".to_owned(),
+        )),
+    }
 }
 
 fn load_sandbox(connection: &Connection, id: &str) -> Result<Option<SandboxRecord>, StoreError> {
@@ -550,6 +882,7 @@ struct RawSandbox {
     tools: (Option<u32>, Option<String>),
     image: (Option<u32>, Option<String>),
     storage: (Option<u32>, Option<String>),
+    ssh: (Option<u32>, Option<String>),
     last_operation_id: Option<i64>,
     updated_at_millis: i64,
 }
@@ -567,6 +900,7 @@ impl TryFrom<RawSandbox> for SandboxRecord {
             tool_resolution: decode_resolution(raw.tools, ToolResolution::new)?,
             image_resolution: decode_resolution(raw.image, ImageResolution::new)?,
             storage_resolution: decode_resolution(raw.storage, StorageResolution::new)?,
+            ssh_resolution: decode_resolution(raw.ssh, SshResolution::new)?,
             last_operation_id: raw.last_operation_id.map(OperationId::new).transpose()?,
             updated_at_millis: raw.updated_at_millis,
         })
@@ -583,8 +917,9 @@ fn raw_sandbox_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSandbox>
         tools: (row.get(6)?, row.get(7)?),
         image: (row.get(8)?, row.get(9)?),
         storage: (row.get(10)?, row.get(11)?),
-        last_operation_id: row.get(12)?,
-        updated_at_millis: row.get(13)?,
+        ssh: (row.get(12)?, row.get(13)?),
+        last_operation_id: row.get(14)?,
+        updated_at_millis: row.get(15)?,
     })
 }
 
@@ -674,11 +1009,52 @@ fn validate_resolutions(sandbox: &SandboxRecord) -> Result<(), StoreError> {
     .into_iter()
     .flatten()
     {
-        if version == 0 {
-            return Err(StoreError::CorruptData(
-                "resolution version must be positive".to_owned(),
-            ));
-        }
+        validate_resolution_version(version)?;
+    }
+    if let Some(resolution) = sandbox.ssh_resolution.as_ref() {
+        validate_ssh_resolution(resolution)?;
+    }
+    Ok(())
+}
+
+fn validate_resolution_version(version: u32) -> Result<(), StoreError> {
+    if version == 0 {
+        return Err(StoreError::CorruptData(
+            "resolution version must be positive".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_ssh_resolution(resolution: &SshResolution) -> Result<(), StoreError> {
+    validate_resolution_version(resolution.version)?;
+    if resolution.version != 1 {
+        return Ok(());
+    }
+
+    let details = resolution.details.as_object().ok_or_else(|| {
+        StoreError::CorruptData("SSH resolution version 1 details must be an object".to_owned())
+    })?;
+    let required = ["enabled", "host_key_fingerprint", "client_key_fingerprint"];
+    if details.len() != required.len()
+        || details.keys().any(|key| !required.contains(&key.as_str()))
+    {
+        return Err(StoreError::CorruptData(
+            "SSH resolution version 1 details contain unsupported fields".to_owned(),
+        ));
+    }
+    if !details.get("enabled").is_some_and(Value::is_boolean)
+        || !details
+            .get("host_key_fingerprint")
+            .is_some_and(Value::is_string)
+        || !details
+            .get("client_key_fingerprint")
+            .is_some_and(Value::is_string)
+    {
+        return Err(StoreError::CorruptData(
+            "SSH resolution version 1 details are missing required fields or have invalid types"
+                .to_owned(),
+        ));
     }
     Ok(())
 }
@@ -717,6 +1093,7 @@ impl_resolution!(SetupResolution);
 impl_resolution!(ToolResolution);
 impl_resolution!(ImageResolution);
 impl_resolution!(StorageResolution);
+impl_resolution!(SshResolution);
 
 fn decode_resolution<T>(
     raw: (Option<u32>, Option<String>),
@@ -890,6 +1267,84 @@ fn validate_v3_schema(connection: &Connection) -> Result<(), StoreError> {
             ("updated_at_millis", "INTEGER", 1, 0),
             ("storage_resolution_version", "INTEGER", 0, 0),
             ("storage_resolution_details", "TEXT", 0, 0),
+        ],
+    )?;
+    validate_table_columns(
+        connection,
+        "operation_events",
+        &[
+            ("sequence", "INTEGER", 0, 1),
+            ("operation_id", "INTEGER", 1, 0),
+            ("status", "TEXT", 1, 0),
+            ("details", "TEXT", 0, 0),
+            ("error_code", "TEXT", 0, 0),
+            ("timestamp_millis", "INTEGER", 1, 0),
+        ],
+    )?;
+    validate_operations_and_constraints(connection)
+}
+
+fn validate_v4_schema(connection: &Connection) -> Result<(), StoreError> {
+    validate_schema_inventory(connection)?;
+    validate_table_columns(
+        connection,
+        "sandboxes",
+        &[
+            ("id", "TEXT", 1, 1),
+            ("canonical_root", "TEXT", 1, 0),
+            ("desired_state", "TEXT", 1, 0),
+            ("actual_state", "TEXT", 1, 0),
+            ("setup_resolution_version", "INTEGER", 0, 0),
+            ("setup_resolution_details", "TEXT", 0, 0),
+            ("tool_resolution_version", "INTEGER", 0, 0),
+            ("tool_resolution_details", "TEXT", 0, 0),
+            ("image_resolution_version", "INTEGER", 0, 0),
+            ("image_resolution_details", "TEXT", 0, 0),
+            ("updated_at_millis", "INTEGER", 1, 0),
+            ("storage_resolution_version", "INTEGER", 0, 0),
+            ("storage_resolution_details", "TEXT", 0, 0),
+            ("ssh_resolution_version", "INTEGER", 0, 0),
+            ("ssh_resolution_details", "TEXT", 0, 0),
+        ],
+    )?;
+    validate_table_columns(
+        connection,
+        "operation_events",
+        &[
+            ("sequence", "INTEGER", 0, 1),
+            ("operation_id", "INTEGER", 1, 0),
+            ("status", "TEXT", 1, 0),
+            ("details", "TEXT", 0, 0),
+            ("error_code", "TEXT", 0, 0),
+            ("timestamp_millis", "INTEGER", 1, 0),
+        ],
+    )?;
+    validate_operations_and_constraints(connection)
+}
+
+fn validate_v5_schema(connection: &Connection) -> Result<(), StoreError> {
+    validate_schema_inventory(connection)?;
+    validate_table_columns(
+        connection,
+        "sandboxes",
+        &[
+            ("id", "TEXT", 1, 1),
+            ("canonical_root", "TEXT", 1, 0),
+            ("desired_state", "TEXT", 1, 0),
+            ("actual_state", "TEXT", 1, 0),
+            ("setup_resolution_version", "INTEGER", 0, 0),
+            ("setup_resolution_details", "TEXT", 0, 0),
+            ("tool_resolution_version", "INTEGER", 0, 0),
+            ("tool_resolution_details", "TEXT", 0, 0),
+            ("image_resolution_version", "INTEGER", 0, 0),
+            ("image_resolution_details", "TEXT", 0, 0),
+            ("updated_at_millis", "INTEGER", 1, 0),
+            ("storage_resolution_version", "INTEGER", 0, 0),
+            ("storage_resolution_details", "TEXT", 0, 0),
+            ("ssh_resolution_version", "INTEGER", 0, 0),
+            ("ssh_resolution_details", "TEXT", 0, 0),
+            ("ssh_transport_enabled", "INTEGER", 0, 0),
+            ("ssh_transport_host_port", "INTEGER", 0, 0),
         ],
     )?;
     validate_table_columns(

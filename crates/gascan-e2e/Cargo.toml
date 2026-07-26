@@ -20,6 +20,7 @@ console.workspace = true
 gascan-core = { path = "../gascan-core" }
 gascan-apple = { path = "../gascan-apple" }
 gascan-proto = { path = "../gascan-proto" }
+gascan = { path = "../gascan" }
 gascand = { path = "../gascand" }
 hyper-util.workspace = true
 indicatif.workspace = true

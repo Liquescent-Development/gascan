@@ -48,7 +48,7 @@ fn fixture() -> Fixture {
     }
     fs::write(
         root.join("images/workspace/versions.lock"),
-        "workspace_build_mode = \"connected\"\nworkspace_tag = \"gascan-workspace:test\"\n",
+        "workspace_build_mode = \"connected\"\nworkspace_tag = \"gascan-workspace:d4964500a3295a33\"\n",
     )
     .unwrap();
     fs::write(
@@ -57,9 +57,8 @@ fn fixture() -> Fixture {
     )
     .unwrap();
     let lock_digest = file_digest(&root.join("images/workspace/versions.lock"));
-    let context_digest = file_digest(
-        &root.join(".artifacts/connected-workspace-context/context-manifest.tsv"),
-    );
+    let context_digest =
+        file_digest(&root.join(".artifacts/connected-workspace-context/context-manifest.tsv"));
     for cargo_file in ["Cargo.toml", "Cargo.lock"] {
         std::os::unix::fs::symlink(
             repository_root().join("scripts").join(cargo_file),
@@ -91,7 +90,7 @@ fn fixture() -> Fixture {
     executable(
         &root.join("scripts/build-connected-workspace-image.sh"),
         &format!(
-            "#!/bin/sh\nset -eu\nprintf 'build\\n' >>\"$CALLS\"\n[ \"${{GASCAN_GATE_TEST_BUILD_FAILURE:-}}\" != 1 ]\nmkdir -p \"$GASCAN_GATE_ARTIFACTS\"\nref='gascan-workspace:test@sha256:{DIGEST}'\n[ \"${{REFERENCE_KIND:-}}\" != mutable ] || ref=gascan-workspace:test\nprintf '%s\\n' \"$ref\" >\"$GASCAN_GATE_ARTIFACTS/workspace-image-ref\"\nprintf '{{\"reference\":\"%s\",\"tag\":\"gascan-workspace:test\",\"platform\":\"linux/arm64\",\"lock_digest\":\"{lock_digest}\",\"context_digest\":\"{context_digest}\",\"image_digest\":\"sha256:{DIGEST}\",\"status\":\"succeeded\"}}\\n' \"$ref\" >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\"\ncase \"${{RECEIPT_KIND:-}}\" in missing) rm -f \"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; malformed) printf '{{bad\\n' >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; mismatched) printf '{{\"reference\":\"wrong\"}}\\n' >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; esac\nprintf '%s\\n' \"$ref\"\n"
+            "#!/bin/sh\nset -eu\nprintf 'build\\n' >>\"$CALLS\"\n[ \"${{GASCAN_GATE_TEST_BUILD_FAILURE:-}}\" != 1 ]\nmkdir -p \"$GASCAN_GATE_ARTIFACTS\"\nref='gascan-workspace:d4964500a3295a33@sha256:{DIGEST}'\n[ \"${{REFERENCE_KIND:-}}\" != mutable ] || ref=gascan-workspace:d4964500a3295a33\nprintf '%s\\n' \"$ref\" >\"$GASCAN_GATE_ARTIFACTS/workspace-image-ref\"\nprintf '{{\"reference\":\"%s\",\"tag\":\"gascan-workspace:d4964500a3295a33\",\"platform\":\"linux/arm64\",\"lock_digest\":\"{lock_digest}\",\"context_digest\":\"{context_digest}\",\"image_digest\":\"sha256:{DIGEST}\",\"status\":\"succeeded\"}}\\n' \"$ref\" >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\"\ncase \"${{RECEIPT_KIND:-}}\" in missing) rm -f \"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; malformed) printf '{{bad\\n' >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; mismatched) printf '{{\"reference\":\"wrong\"}}\\n' >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; esac\nprintf '%s\\n' \"$ref\"\n"
         ),
     );
     fs::copy(
@@ -107,6 +106,7 @@ fn fixture() -> Fixture {
         "user-and-volumes.sh",
         "polyglot-smoke.sh",
         "gascamp-smoke.sh",
+        "workstation-smoke.sh",
         "container-cli.sh",
     ] {
         fs::copy(
@@ -115,11 +115,17 @@ fn fixture() -> Fixture {
         )
         .unwrap();
     }
+    fs::create_dir_all(root.join("images/workspace/tests")).unwrap();
+    fs::copy(
+        repository_root().join("images/workspace/tests/ssh-contract.sh"),
+        root.join("images/workspace/tests/ssh-contract.sh"),
+    )
+    .unwrap();
     let raw_container = temp.path().join("container-raw");
     executable(
         &raw_container,
         &format!(
-            "#!/bin/sh\nset -eu\nprintf 'container:%s\\n' \"$*\" >>\"$CALLS\"\nif [ \"$1 ${{2:-}}\" = 'image inspect' ]; then [ $# -eq 3 ] || exit 93; expected=${{INSPECT_REFERENCE:-gascan-workspace:test}}; [ \"$3\" = \"$expected\" ] || {{ printf 'image not found\\n' >&2; exit 94; }}; [ \"${{IMAGE_AVAILABLE:-1}}\" = 1 ] || exit 94; platform=${{IMAGE_PLATFORM:-arm64}}; image_digest=${{IMAGE_DIGEST:-sha256:{DIGEST}}}; image_id=${{image_digest#sha256:}}; printf '[{{\"id\":\"%s\",\"configuration\":{{\"name\":\"%s\",\"descriptor\":{{\"digest\":\"%s\"}}}},\"variants\":[{{\"platform\":{{\"os\":\"linux\",\"architecture\":\"%s\"}},\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}]}}]\\n' \"$image_id\" \"$expected\" \"$image_digest\" \"$platform\"; exit 0; fi\ncase \"$1\" in create) while [ $# -gt 0 ]; do [ \"$1\" = --name ] && {{ touch \"$STATE/$2\"; break; }}; shift; done ;; inspect) name=$2; [ \"${{RESIDUE:-}}\" = \"$name\" ] || [ -f \"$STATE/$name\" ] || exit 1; count_file=\"$STATE/.inspect-$name\"; count=0; [ ! -f \"$count_file\" ] || count=$(cat \"$count_file\"); count=$((count+1)); printf '%s' \"$count\" >\"$count_file\"; owner=$OWNER; [ \"${{FOREIGN:-}}\" = \"$name\" ] && owner=ffffffffffffffffffffffffffffffff; [ \"${{REPLACE_ON_SECOND_INSPECT:-}}\" = \"$name\" ] && [ \"$count\" -ge 2 ] && owner=ffffffffffffffffffffffffffffffff; printf '[{{\"id\":\"%s\",\"configuration\":{{\"id\":\"%s\",\"labels\":{{\"dev.gascan.test\":\"true\",\"dev.gascan.test.owner\":\"%s\"}}}}}}]\\n' \"$name\" \"$name\" \"$owner\" ;; stop) : ;; delete) name=${{@:$#}}; [ \"${{FAIL_DELETE:-}}\" != \"$name\" ] || exit 1; rm -f \"$STATE/$name\" ;; esac\n"
+            "#!/bin/sh\nset -eu\nprintf 'container:%s\\n' \"$*\" >>\"$CALLS\"\nif [ \"$1 ${{2:-}}\" = 'image inspect' ]; then [ $# -eq 3 ] || exit 93; expected=${{INSPECT_REFERENCE:-gascan-workspace:d4964500a3295a33}}; [ \"$3\" = \"$expected\" ] || {{ printf 'image not found\\n' >&2; exit 94; }}; [ \"${{IMAGE_AVAILABLE:-1}}\" = 1 ] || exit 94; platform=${{IMAGE_PLATFORM:-arm64}}; image_digest=${{IMAGE_DIGEST:-sha256:{DIGEST}}}; image_id=${{image_digest#sha256:}}; printf '[{{\"id\":\"%s\",\"configuration\":{{\"name\":\"%s\",\"descriptor\":{{\"digest\":\"%s\"}}}},\"variants\":[{{\"platform\":{{\"os\":\"linux\",\"architecture\":\"%s\"}},\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}]}}]\\n' \"$image_id\" \"$expected\" \"$image_digest\" \"$platform\"; exit 0; fi\nif [ \"$1\" = volume ]; then action=$2; shift 2; case \"$action\" in list) first=true; printf '['; for kind in tools cache config; do name=gascan-image-workstation-$kind-$OWNER; if [ -f \"$STATE/.volume-$name\" ]; then $first || printf ','; first=false; printf '{{\"id\":\"%s\"}}' \"$name\"; fi; done; printf ']\\n' ;; create) name=; for argument in \"$@\"; do name=$argument; done; touch \"$STATE/.volume-$name\" ;; inspect) name=$1; [ -f \"$STATE/.volume-$name\" ] || exit 1; count_file=\"$STATE/.volume-inspect-$name\"; count=0; [ ! -f \"$count_file\" ] || count=$(cat \"$count_file\"); count=$((count+1)); printf '%s' \"$count\" >\"$count_file\"; owner=$OWNER; [ \"${{FOREIGN_VOLUME:-}}\" = \"$name\" ] && owner=ffffffffffffffffffffffffffffffff; [ \"${{REPLACE_VOLUME_ON_SECOND_INSPECT:-}}\" = \"$name\" ] && [ \"$count\" -ge 2 ] && owner=ffffffffffffffffffffffffffffffff; printf '[{{\"id\":\"%s\",\"configuration\":{{\"name\":\"%s\",\"labels\":{{\"dev.gascan.test\":\"true\",\"dev.gascan.test.owner\":\"%s\"}}}}}}]\\n' \"$name\" \"$name\" \"$owner\" ;; delete) name=$1; [ \"${{FAIL_VOLUME_DELETE:-}}\" != \"$name\" ] || exit 1; rm -f \"$STATE/.volume-$name\" ;; esac; exit 0; fi\ncase \"$1\" in create) name=; image=; shift; while [ $# -gt 0 ]; do if [ \"$1\" = --name ]; then name=$2; shift 2; continue; fi; image=$1; shift; done; touch \"$STATE/$name\"; printf '%s' \"$image\" >\"$STATE/.image-$name\" ;; inspect) name=$2; [ \"${{RESIDUE:-}}\" = \"$name\" ] || [ -f \"$STATE/$name\" ] || exit 1; count_file=\"$STATE/.inspect-$name\"; count=0; [ ! -f \"$count_file\" ] || count=$(cat \"$count_file\"); count=$((count+1)); printf '%s' \"$count\" >\"$count_file\"; owner=$OWNER; [ \"${{FOREIGN:-}}\" = \"$name\" ] && owner=ffffffffffffffffffffffffffffffff; [ \"${{REPLACE_ON_SECOND_INSPECT:-}}\" = \"$name\" ] && [ \"$count\" -ge 2 ] && owner=ffffffffffffffffffffffffffffffff; image=${{CONTAINER_IMAGE_REFERENCE:-$(cat \"$STATE/.image-$name\" 2>/dev/null || printf 'gascan-workspace:d4964500a3295a33')}}; digest=${{CONTAINER_IMAGE_DIGEST:-sha256:{DIGEST}}}; printf '[{{\"id\":\"%s\",\"configuration\":{{\"id\":\"%s\",\"labels\":{{\"dev.gascan.test\":\"true\",\"dev.gascan.test.owner\":\"%s\"}},\"image\":{{\"descriptor\":{{\"digest\":\"%s\"}},\"reference\":\"%s\"}}}}}}]\\n' \"$name\" \"$name\" \"$owner\" \"$digest\" \"$image\" ;; exec) if [ \"${{FAIL_WORKSTATION_EXEC:-0}}\" = 1 ]; then case \"$*\" in *workstation-contract.sh*) exit 1 ;; esac; fi ;; stop) : ;; delete) name=${{@:$#}}; [ \"${{FAIL_DELETE:-}}\" != \"$name\" ] || exit 1; rm -f \"$STATE/$name\" \"$STATE/.image-$name\" ;; esac\n"
         ),
     );
     let container = temp.path().join("container");
@@ -153,7 +159,7 @@ fn fixture() -> Fixture {
 fn seed_valid_receipt(f: &Fixture) {
     let artifacts = f.root.join(".artifacts");
     fs::create_dir_all(&artifacts).unwrap();
-    let reference = format!("gascan-workspace:test@sha256:{DIGEST}");
+    let reference = format!("gascan-workspace:d4964500a3295a33@sha256:{DIGEST}");
     let lock_digest = file_digest(&f.root.join("images/workspace/versions.lock"));
     let context_digest =
         file_digest(&artifacts.join("connected-workspace-context/context-manifest.tsv"));
@@ -165,7 +171,7 @@ fn seed_valid_receipt(f: &Fixture) {
     fs::write(
         artifacts.join("workspace-image-build.json"),
         format!(
-            "{{\"reference\":\"{reference}\",\"tag\":\"gascan-workspace:test\",\"platform\":\"linux/arm64\",\"lock_digest\":\"{lock_digest}\",\"context_digest\":\"{context_digest}\",\"image_digest\":\"sha256:{DIGEST}\",\"status\":\"succeeded\"}}\n"
+            "{{\"reference\":\"{reference}\",\"tag\":\"gascan-workspace:d4964500a3295a33\",\"platform\":\"linux/arm64\",\"lock_digest\":\"{lock_digest}\",\"context_digest\":\"{context_digest}\",\"image_digest\":\"sha256:{DIGEST}\",\"status\":\"succeeded\"}}\n"
         ),
     )
     .unwrap();
@@ -177,9 +183,8 @@ fn seed_valid_ghcr_receipt(f: &Fixture) -> String {
     let tag = "ghcr.io/liquescent-development/gascan/workspace:d4964500a3295a33";
     let reference = format!("{tag}@sha256:{DIGEST}");
     let lock_digest = file_digest(&f.root.join("images/workspace/versions.lock"));
-    let context_digest = file_digest(
-        &artifacts.join("connected-workspace-context/context-manifest.tsv"),
-    );
+    let context_digest =
+        file_digest(&artifacts.join("connected-workspace-context/context-manifest.tsv"));
     fs::write(
         artifacts.join("workspace-image-ref"),
         format!("{reference}\n"),
@@ -196,10 +201,11 @@ fn seed_valid_ghcr_receipt(f: &Fixture) -> String {
 }
 
 fn assert_no_publications(f: &Fixture) {
-    assert!(!f
-        .root
-        .join("docs/evidence/connected-workspace-image.md")
-        .exists());
+    assert!(
+        !f.root
+            .join("docs/evidence/connected-workspace-image.md")
+            .exists()
+    );
     assert!(!f.root.join("images/workspace/approved-image.txt").exists());
 }
 
@@ -223,15 +229,111 @@ fn connected_gate_has_no_privileged_snapshot_or_sudo_precondition() {
 
 #[test]
 fn repository_receipt_validator_is_executable() {
-    let permissions = fs::metadata(
-        repository_root().join("scripts/validate-connected-image-receipt.sh"),
-    )
-    .unwrap()
-    .permissions();
+    let permissions =
+        fs::metadata(repository_root().join("scripts/validate-connected-image-receipt.sh"))
+            .unwrap()
+            .permissions();
     assert_eq!(
         permissions.mode() & 0o100,
         0o100,
         "connected receipt validator must set the owner-execute bit in a checkout"
+    );
+}
+
+#[test]
+fn workstation_smoke_initializes_the_mounted_home_before_contract_checks() {
+    let smoke =
+        fs::read_to_string(repository_root().join("tests/image/workstation-smoke.sh")).unwrap();
+    let initialize = smoke
+        .find("/usr/local/bin/configure-workstation-home")
+        .expect("workstation smoke must initialize image-owned home defaults");
+    let contract = smoke
+        .find("/opt/gascan/tests/workstation-contract.sh")
+        .expect("workstation smoke must run the image contract");
+    assert!(
+        initialize < contract,
+        "mounted workstation home must be initialized before its contract is checked"
+    );
+}
+
+#[test]
+fn connected_gate_runs_the_managed_ssh_contract_without_publishing_a_port() {
+    let gate =
+        fs::read_to_string(repository_root().join("scripts/run-connected-image-gate.sh")).unwrap();
+    let contract =
+        fs::read_to_string(repository_root().join("images/workspace/tests/ssh-contract.sh"))
+            .unwrap();
+    assert!(
+        gate.contains("\"$root/images/workspace/tests/ssh-contract.sh\""),
+        "connected gate does not run the managed SSH contract"
+    );
+    assert!(
+        gate.contains("GASCAN_IMAGE_REF_FILE=\"$reference_file\""),
+        "SSH contract does not consume the candidate receipt"
+    );
+    assert!(
+        !gate.contains("--publish"),
+        "connected gate publishes a runtime port"
+    );
+    for required in [
+        "--network none",
+        "GASCAN_SSH_ENABLED=1",
+        "GASCAN_SSH_AUTHORIZED_KEY",
+        "127.0.0.1:22",
+        "ssh-keygen",
+        "PasswordAuthentication",
+        "PermitRootLogin",
+        "AllowTcpForwarding",
+        "AllowAgentForwarding",
+        "fingerprint",
+        "sftp",
+    ] {
+        assert!(
+            contract.contains(required),
+            "SSH live contract omits: {required}"
+        );
+    }
+}
+
+#[test]
+fn successful_candidate_validation_preserves_tracked_approval_and_stages_only_candidate() {
+    let mut f = fixture();
+    let existing_approval = "ghcr.io/liquescent-development/gascan/workspace:approved@sha256:\
+         bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let existing_evidence = "# Connected workspace image evidence\n\n- status: `PASS`\n\
+                             - image: `existing-approved-image`\n";
+    fs::write(
+        f.root.join("images/workspace/approved-image.txt"),
+        existing_approval,
+    )
+    .unwrap();
+    fs::write(
+        f.root.join("docs/evidence/connected-workspace-image.md"),
+        existing_evidence,
+    )
+    .unwrap();
+
+    let output = f.command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join("images/workspace/approved-image.txt")).unwrap(),
+        existing_approval
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join("docs/evidence/connected-workspace-image.md")).unwrap(),
+        existing_evidence
+    );
+    assert_eq!(
+        fs::read_to_string(
+            f.root
+                .join(".artifacts/connected-workspace-image-candidate.txt")
+        )
+        .unwrap(),
+        format!("gascan-workspace:d4964500a3295a33@sha256:{DIGEST}\n")
     );
 }
 
@@ -246,10 +348,10 @@ fn successful_gate_uses_one_reference_and_token_then_publishes_atomically() {
     );
     let calls = fs::read_to_string(&f.calls).unwrap();
     assert!(calls.find("prefetch").unwrap() < calls.find("build").unwrap());
-    for prefix in ["user", "polyglot", "gascamp"] {
+    for prefix in ["user", "polyglot", "gascamp", "workstation"] {
         assert!(calls.contains(&format!("inspect gascan-image-{prefix}-test-{TOKEN}")));
     }
-    for prefix in ["user", "polyglot", "gascamp"] {
+    for prefix in ["user", "polyglot", "gascamp", "workstation"] {
         let name = format!("gascan-image-{prefix}-test-{TOKEN}");
         let create = calls.find(&format!("create --name {name} ")).unwrap();
         let stop = calls.find(&format!("stop --time 5 {name}")).unwrap();
@@ -272,14 +374,15 @@ fn successful_gate_uses_one_reference_and_token_then_publishes_atomically() {
             "mutation lacked immediately preceding structural inspect: {line}"
         );
     }
-    let evidence =
-        fs::read_to_string(f.root.join("docs/evidence/connected-workspace-image.md")).unwrap();
-    assert!(evidence.contains(&format!("gascan-workspace:test@sha256:{DIGEST}")));
-    assert!(evidence.contains("platform: `linux/arm64`"));
     assert_eq!(
-        fs::read(f.root.join("images/workspace/approved-image.txt")).unwrap(),
-        format!("gascan-workspace:test@sha256:{DIGEST}").as_bytes()
+        fs::read_to_string(
+            f.root
+                .join(".artifacts/connected-workspace-image-candidate.txt")
+        )
+        .unwrap(),
+        format!("gascan-workspace:d4964500a3295a33@sha256:{DIGEST}\n")
     );
+    assert_no_publications(&f);
     assert_eq!(
         fs::read(f.temp.path().join("state/unrelated-resource")).unwrap(),
         b"foreign"
@@ -287,7 +390,7 @@ fn successful_gate_uses_one_reference_and_token_then_publishes_atomically() {
 }
 
 #[test]
-fn successful_prebuilt_gate_skips_build_work_and_publishes_exact_receipt_reference() {
+fn successful_prebuilt_gate_skips_build_work_and_stages_exact_candidate_reference() {
     let mut f = fixture();
     seed_valid_receipt(&f);
     let output = f.command.arg("--prebuilt").output().unwrap();
@@ -297,22 +400,173 @@ fn successful_prebuilt_gate_skips_build_work_and_publishes_exact_receipt_referen
         String::from_utf8_lossy(&output.stderr)
     );
     let calls = fs::read_to_string(&f.calls).unwrap();
-    assert!(!calls.lines().any(|line| line == "prefetch" || line == "build"));
-    assert!(calls.contains("container:image inspect gascan-workspace:test"));
-    for prefix in ["user", "polyglot", "gascamp"] {
+    assert!(
+        !calls
+            .lines()
+            .any(|line| line == "prefetch" || line == "build")
+    );
+    assert!(calls.contains("container:image inspect gascan-workspace:d4964500a3295a33"));
+    for prefix in ["user", "polyglot", "gascamp", "workstation"] {
         let name = format!("gascan-image-{prefix}-test-{TOKEN}");
         assert!(calls.contains(&format!("create --name {name} ")));
         assert!(calls.contains(&format!("delete {name}")));
         assert!(!f.temp.path().join("state").join(name).exists());
     }
-    let reference = format!("gascan-workspace:test@sha256:{DIGEST}");
+    for kind in ["tools", "cache", "config"] {
+        let name = format!("gascan-image-workstation-{kind}-{TOKEN}");
+        assert!(calls.contains("container:volume create "));
+        assert!(calls.contains(&format!(" {name}\n")));
+        assert!(calls.contains(&format!("container:volume delete {name}")));
+        assert!(
+            !f.temp
+                .path()
+                .join("state")
+                .join(format!(".volume-{name}"))
+                .exists()
+        );
+    }
+    let reference = format!("gascan-workspace:d4964500a3295a33@sha256:{DIGEST}");
     assert_eq!(
-        fs::read(f.root.join("images/workspace/approved-image.txt")).unwrap(),
-        reference.as_bytes()
-    );
-    assert!(fs::read_to_string(f.root.join("docs/evidence/connected-workspace-image.md"))
+        fs::read_to_string(
+            f.root
+                .join(".artifacts/connected-workspace-image-candidate.txt")
+        )
         .unwrap()
-        .contains(&reference));
+        .trim(),
+        reference
+    );
+    assert_no_publications(&f);
+}
+
+#[test]
+fn workstation_contract_is_wired_into_the_release_blocking_gate() {
+    let gate =
+        fs::read_to_string(repository_root().join("scripts/run-connected-image-gate.sh")).unwrap();
+    assert!(
+        gate.contains("workstation-smoke.sh"),
+        "connected image gate must execute the workstation smoke"
+    );
+    let smoke =
+        fs::read_to_string(repository_root().join("tests/image/workstation-smoke.sh")).unwrap();
+    let contract = fs::read_to_string(
+        repository_root().join("images/workspace/tests/workstation-contract.sh"),
+    )
+    .unwrap();
+    assert!(
+        smoke.contains("/opt/gascan/tests/workstation-contract.sh"),
+        "host smoke must invoke the immutable guest contract"
+    );
+    for required in [
+        "--volume \"$tools_volume:/home/workspace/.local/share/mise\"",
+        "--volume \"$cache_volume:/home/workspace/.cache\"",
+        "--volume \"$config_volume:/home/workspace/.config/gascan\"",
+        "--env MISE_DATA_DIR=/home/workspace/.local/share/mise",
+        "--env MISE_SYSTEM_DATA_DIR=/opt/gascan/mise",
+        "--env MISE_CACHE_DIR=/home/workspace/.cache/mise",
+        "--env MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
+        "--bin validate-owned-volume",
+        "bounded_container volume delete \"$volume\"",
+    ] {
+        assert!(
+            smoke.contains(required),
+            "workstation smoke omitted production topology or owner-scoped cleanup: {required}"
+        );
+    }
+    assert!(
+        !smoke.contains("type=bind"),
+        "credential-free workstation smoke must not mount the host checkout"
+    );
+    for command in [
+        "vim --version",
+        "nvim --version",
+        "emacs --version",
+        "pico --version",
+        "claude --version",
+        "codex --version",
+        "pi --version",
+        "herdr --version",
+        "go version",
+        "rustc --version",
+        "cargo --version",
+        "gh --version",
+        "glab --version",
+        "git --version",
+        "ip -Version",
+        "ss --version",
+        "ping -V",
+        "ifconfig --version",
+        "netstat --version",
+        "dig -v",
+        "traceroute --version",
+        "nc -h",
+        "rg --version",
+        "fd --version",
+        "fzf --version",
+        "tmux -V",
+    ] {
+        assert!(
+            contract.contains(command),
+            "guest contract omitted guaranteed command: {command}"
+        );
+    }
+    for diagnostic in [
+        "nslookup -version",
+        "curl --fail --silent file:///etc/os-release",
+        "wget --version",
+        "rsync --version",
+        "lsof -v",
+        "file /bin/sh",
+        "jq -e",
+        "ps -o comm=",
+        "top -b -n 1",
+        "pstree -p",
+        "tree --version",
+        "less -F -X",
+    ] {
+        assert!(
+            smoke.contains(diagnostic),
+            "host-side workstation smoke omitted advertised diagnostic: {diagnostic}"
+        );
+    }
+    for boundary in [
+        "--network none",
+        "/home/workspace/.local/share/mise",
+        "/home/workspace/.config/gascan",
+        "/home/workspace/.cache",
+        "/var/run/docker.sock",
+        "/Library/Keychains",
+        "CapEff:",
+    ] {
+        assert!(
+            smoke.contains(boundary) || contract.contains(boundary),
+            "workstation gate omitted security boundary: {boundary}"
+        );
+    }
+}
+
+#[test]
+fn workstation_contract_matches_the_reviewed_ubuntu_fzf_version_format_exactly() {
+    let contract = fs::read_to_string(
+        repository_root().join("images/workspace/tests/workstation-contract.sh"),
+    )
+    .unwrap();
+    let lock: toml::Value = toml::from_str(
+        &fs::read_to_string(repository_root().join("images/workspace/versions.lock")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        lock["workstation_commands"]["fzf"].as_str(),
+        Some("0.44.1 (debian)"),
+        "reviewed Ubuntu fzf output must remain exact in the workstation lock"
+    );
+    assert!(
+        contract.contains("expect_exact \"$(locked_version fzf)\" fzf --version"),
+        "fzf must be checked against the exact locked Ubuntu output"
+    );
+    assert!(
+        !contract.contains("expect_pattern '^fzf "),
+        "fzf provenance must not be weakened to a broad version pattern"
+    );
 }
 
 #[test]
@@ -337,13 +591,18 @@ fn ghcr_prebuilt_gate_inspects_canonical_name_and_smokes_original_reference() {
         }));
     }
     assert_eq!(
-        fs::read(f.root.join("images/workspace/approved-image.txt")).unwrap(),
-        reference.as_bytes()
+        fs::read_to_string(
+            f.root
+                .join(".artifacts/connected-workspace-image-candidate.txt")
+        )
+        .unwrap(),
+        format!("{reference}\n")
     );
+    assert_no_publications(&f);
 }
 
 #[test]
-fn invalid_arguments_skip_work_and_retire_stale_pass_publications() {
+fn invalid_arguments_skip_work_and_preserve_existing_approval() {
     for arguments in [["--unknown"].as_slice(), ["--prebuilt", "extra"].as_slice()] {
         let mut f = fixture();
         fs::write(
@@ -356,7 +615,14 @@ fn invalid_arguments_skip_work_and_retire_stale_pass_publications() {
         assert!(!output.status.success(), "arguments={arguments:?}");
         assert!(String::from_utf8_lossy(&output.stderr).contains("usage:"));
         assert!(!f.calls.exists(), "arguments={arguments:?} reached work");
-        assert_no_publications(&f);
+        assert_eq!(
+            fs::read_to_string(f.root.join("docs/evidence/connected-workspace-image.md")).unwrap(),
+            "status: `PASS`\n"
+        );
+        assert_eq!(
+            fs::read_to_string(f.root.join("images/workspace/approved-image.txt")).unwrap(),
+            "stale"
+        );
     }
 }
 
@@ -397,7 +663,11 @@ fn invalid_prebuilt_receipt_or_inspection_never_rebuilds_smokes_or_publishes() {
             )
             .unwrap(),
             "mutable" => {
-                fs::write(artifacts.join("workspace-image-ref"), "gascan-workspace:test\n").unwrap()
+                fs::write(
+                    artifacts.join("workspace-image-ref"),
+                    "gascan-workspace:d4964500a3295a33\n",
+                )
+                .unwrap()
             }
             "wrong-platform" => {
                 f.command.env("IMAGE_PLATFORM", "amd64");
@@ -416,9 +686,28 @@ fn invalid_prebuilt_receipt_or_inspection_never_rebuilds_smokes_or_publishes() {
         let output = f.command.arg("--prebuilt").output().unwrap();
         assert!(!output.status.success(), "failure={failure}");
         let calls = fs::read_to_string(&f.calls).unwrap_or_default();
-        assert!(!calls.lines().any(|line| line == "prefetch" || line == "build"));
-        assert!(!calls.contains("container:create"), "failure={failure} reached smoke");
-        assert_no_publications(&f);
+        assert!(
+            !calls
+                .lines()
+                .any(|line| line == "prefetch" || line == "build")
+        );
+        assert!(
+            !calls.contains("container:create"),
+            "failure={failure} reached smoke"
+        );
+        assert_eq!(
+            fs::read_to_string(f.root.join("docs/evidence/connected-workspace-image.md")).unwrap(),
+            "status: `PASS`\n"
+        );
+        assert_eq!(
+            fs::read_to_string(f.root.join("images/workspace/approved-image.txt")).unwrap(),
+            "stale"
+        );
+        assert!(
+            !f.root
+                .join(".artifacts/connected-workspace-image-candidate.txt")
+                .exists()
+        );
     }
 }
 
@@ -445,7 +734,7 @@ fn injected_random_source_proves_fresh_live_tokens_across_runs() {
 }
 
 #[test]
-fn every_failure_prevents_both_publications() {
+fn every_failure_prevents_candidate_publication() {
     for failure in ["build", "receipt", "smoke", "residue"] {
         let mut f = fixture();
         match failure {
@@ -472,16 +761,22 @@ fn every_failure_prevents_both_publications() {
             _ => unreachable!(),
         };
         assert!(!f.command.status().unwrap().success(), "{failure}");
-        assert!(!f
-            .root
-            .join("docs/evidence/connected-workspace-image.md")
-            .exists());
+        assert!(
+            !f.root
+                .join("docs/evidence/connected-workspace-image.md")
+                .exists()
+        );
         assert!(!f.root.join("images/workspace/approved-image.txt").exists());
+        assert!(
+            !f.root
+                .join(".artifacts/connected-workspace-image-candidate.txt")
+                .exists()
+        );
     }
 }
 
 #[test]
-fn stale_pass_pair_is_retired_before_work_and_owner_token_is_never_evidence() {
+fn existing_approval_is_preserved_on_failure_and_owner_token_is_never_candidate_evidence() {
     let mut f = fixture();
     fs::write(
         f.root.join("docs/evidence/connected-workspace-image.md"),
@@ -491,22 +786,27 @@ fn stale_pass_pair_is_retired_before_work_and_owner_token_is_never_evidence() {
     fs::write(f.root.join("images/workspace/approved-image.txt"), "stale").unwrap();
     f.command.env("GASCAN_GATE_TEST_BUILD_FAILURE", "1");
     assert!(!f.command.status().unwrap().success());
-    assert!(!f
-        .root
-        .join("docs/evidence/connected-workspace-image.md")
-        .exists());
-    assert!(!f.root.join("images/workspace/approved-image.txt").exists());
+    assert_eq!(
+        fs::read_to_string(f.root.join("docs/evidence/connected-workspace-image.md")).unwrap(),
+        "status: `PASS`\n"
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join("images/workspace/approved-image.txt")).unwrap(),
+        "stale"
+    );
 
     let mut f = fixture();
     assert!(f.command.status().unwrap().success());
-    let evidence =
-        fs::read_to_string(f.root.join("docs/evidence/connected-workspace-image.md")).unwrap();
-    assert!(!evidence.contains(TOKEN));
-    assert!(!evidence.to_ascii_lowercase().contains("owner token"));
+    let candidate = fs::read_to_string(
+        f.root
+            .join(".artifacts/connected-workspace-image-candidate.txt"),
+    )
+    .unwrap();
+    assert!(!candidate.contains(TOKEN));
 }
 
 #[test]
-fn stale_pass_pair_is_retired_when_obsolete_credential_input_is_rejected() {
+fn existing_approval_is_preserved_when_obsolete_credential_input_is_rejected() {
     let mut f = fixture();
     fs::write(
         f.root.join("docs/evidence/connected-workspace-image.md"),
@@ -517,47 +817,47 @@ fn stale_pass_pair_is_retired_when_obsolete_credential_input_is_rejected() {
     f.command
         .env("GASCAMP_READ_TOKEN_FILE", "/tmp/obsolete-token");
     assert!(!f.command.status().unwrap().success());
-    assert!(!f
-        .root
-        .join("docs/evidence/connected-workspace-image.md")
-        .exists());
-    assert!(!f.root.join("images/workspace/approved-image.txt").exists());
+    assert_eq!(
+        fs::read_to_string(f.root.join("docs/evidence/connected-workspace-image.md")).unwrap(),
+        "status: `PASS`\n"
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join("images/workspace/approved-image.txt")).unwrap(),
+        "stale"
+    );
     assert!(!f.calls.exists());
 }
 
 #[test]
-fn every_publication_boundary_rolls_back_the_pair() {
-    for boundary in ["after-stage", "after-evidence"] {
-        for action in ["FAIL", "INT", "TERM"] {
-            let mut f = fixture();
-            f.command
-                .env("GASCAN_GATE_TEST_PUBLICATION_BOUNDARY", boundary)
-                .env("GASCAN_GATE_TEST_PUBLICATION_ACTION", action);
-            let status = f.command.status().unwrap();
-            assert!(!status.success(), "{boundary}/{action}");
-            if action == "INT" {
-                assert_eq!(status.code(), Some(130));
-            }
-            if action == "TERM" {
-                assert_eq!(status.code(), Some(143));
-            }
-            assert!(!f
-                .root
-                .join("docs/evidence/connected-workspace-image.md")
-                .exists());
-            assert!(!f.root.join("images/workspace/approved-image.txt").exists());
-            assert_eq!(
-                fs::read_dir(f.root.join("docs/evidence")).unwrap().count(),
-                0
-            );
-            assert!(!fs::read_dir(f.root.join("images/workspace"))
+fn every_candidate_staging_boundary_removes_temporary_evidence() {
+    for action in ["FAIL", "INT", "TERM"] {
+        let mut f = fixture();
+        f.command
+            .env("GASCAN_GATE_TEST_CANDIDATE_BOUNDARY", "after-stage")
+            .env("GASCAN_GATE_TEST_CANDIDATE_ACTION", action);
+        let status = f.command.status().unwrap();
+        assert!(!status.success(), "{action}");
+        if action == "INT" {
+            assert_eq!(status.code(), Some(130));
+        }
+        if action == "TERM" {
+            assert_eq!(status.code(), Some(143));
+        }
+        assert_no_publications(&f);
+        assert!(
+            !f.root
+                .join(".artifacts/connected-workspace-image-candidate.txt")
+                .exists()
+        );
+        assert!(
+            !fs::read_dir(f.root.join(".artifacts"))
                 .unwrap()
                 .any(|entry| entry
                     .unwrap()
                     .file_name()
                     .to_string_lossy()
-                    .starts_with(".approved-image.")));
-        }
+                    .starts_with(".connected-workspace-image-candidate."))
+        );
     }
 }
 
@@ -588,10 +888,11 @@ fn malformed_missing_mismatched_mutable_and_wrong_platform_are_fail_closed() {
         let mut f = fixture();
         f.command.env(variable, value);
         assert!(!f.command.status().unwrap().success(), "{variable}={value}");
-        assert!(!f
-            .root
-            .join("docs/evidence/connected-workspace-image.md")
-            .exists());
+        assert!(
+            !f.root
+                .join("docs/evidence/connected-workspace-image.md")
+                .exists()
+        );
         assert!(!f.root.join("images/workspace/approved-image.txt").exists());
     }
 }
@@ -609,6 +910,45 @@ fn foreign_replacement_between_checks_is_never_mutated() {
     assert!(calls.matches(&format!("container:inspect {name}")).count() >= 2);
     assert!(!calls.contains(&format!("container:stop --time 5 {name}")));
     assert!(!calls.contains(&format!("container:delete {name}")));
+}
+
+#[test]
+fn foreign_volume_replacement_between_checks_is_never_deleted() {
+    let mut f = fixture();
+    seed_valid_receipt(&f);
+    let name = format!("gascan-image-workstation-tools-{TOKEN}");
+    f.command
+        .env("REPLACE_VOLUME_ON_SECOND_INSPECT", &name)
+        .env("FAIL_WORKSTATION_EXEC", "1");
+    assert!(!f.command.arg("--prebuilt").status().unwrap().success());
+    let calls = fs::read_to_string(&f.calls).unwrap();
+    assert!(
+        calls
+            .matches(&format!("container:volume inspect {name}"))
+            .count()
+            >= 2
+    );
+    assert!(!calls.contains(&format!("container:volume delete {name}")));
+    assert!(
+        f.temp
+            .path()
+            .join("state")
+            .join(format!(".volume-{name}"))
+            .exists()
+    );
+}
+
+#[test]
+fn workstation_volume_delete_failure_is_detected_by_exact_inventory_and_never_publishes() {
+    let mut f = fixture();
+    seed_valid_receipt(&f);
+    let name = format!("gascan-image-workstation-cache-{TOKEN}");
+    f.command.env("FAIL_VOLUME_DELETE", &name);
+    assert!(!f.command.arg("--prebuilt").status().unwrap().success());
+    let calls = fs::read_to_string(&f.calls).unwrap();
+    assert!(calls.contains(&format!("container:volume delete {name}")));
+    assert!(calls.contains("container:volume list --format json"));
+    assert_no_publications(&f);
 }
 
 #[test]
@@ -636,17 +976,19 @@ fn int_and_term_exit_nonzero_after_bounded_cleanup() {
         let calls = fs::read_to_string(&f.calls).unwrap();
         assert!(calls.contains("stop --time 5"));
         assert!(calls.contains("delete gascan-image-user-test-"));
-        assert!(!f
-            .root
-            .join("docs/evidence/connected-workspace-image.md")
-            .exists());
+        assert!(
+            !f.root
+                .join("docs/evidence/connected-workspace-image.md")
+                .exists()
+        );
         assert!(!f.root.join("images/workspace/approved-image.txt").exists());
-        assert!(!f
-            .temp
-            .path()
-            .join("state")
-            .join(format!("gascan-image-user-test-{TOKEN}"))
-            .exists());
+        assert!(
+            !f.temp
+                .path()
+                .join("state")
+                .join(format!("gascan-image-user-test-{TOKEN}"))
+                .exists()
+        );
     }
 }
 
@@ -658,10 +1000,11 @@ fn cleanup_failure_is_nonzero_and_never_publishes() {
         .env("FAIL_DELETE", format!("gascan-image-user-test-{TOKEN}"));
     let status = f.command.status().unwrap();
     assert_eq!(status.code(), Some(1));
-    assert!(!f
-        .root
-        .join("docs/evidence/connected-workspace-image.md")
-        .exists());
+    assert!(
+        !f.root
+            .join("docs/evidence/connected-workspace-image.md")
+            .exists()
+    );
     assert!(!f.root.join("images/workspace/approved-image.txt").exists());
 }
 
@@ -719,18 +1062,21 @@ fn every_blocking_cleanup_cli_is_killed_reaped_and_fail_closed() {
                 "blocked child survived: {pid}"
             );
         }
-        assert!(!f
-            .root
-            .join("docs/evidence/connected-workspace-image.md")
-            .exists());
+        assert!(
+            !f.root
+                .join("docs/evidence/connected-workspace-image.md")
+                .exists()
+        );
         assert!(!f.root.join("images/workspace/approved-image.txt").exists());
-        assert!(!fs::read_dir(f.root.join("docs/evidence"))
-            .unwrap()
-            .any(|entry| entry
+        assert!(
+            !fs::read_dir(f.root.join("docs/evidence"))
                 .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".connected-workspace-image.")));
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".connected-workspace-image."))
+        );
     }
 }
 
@@ -768,16 +1114,19 @@ fn real_smoke_cleanup_controller_hang_is_bounded_and_reaped() {
     };
     assert!(!status.success());
     for pid in fs::read_to_string(&pids).unwrap().lines() {
-        assert!(!Command::new("kill")
-            .args(["-0", pid])
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            !Command::new("kill")
+                .args(["-0", pid])
+                .status()
+                .unwrap()
+                .success()
+        );
     }
-    assert!(!f
-        .root
-        .join("docs/evidence/connected-workspace-image.md")
-        .exists());
+    assert!(
+        !f.root
+            .join("docs/evidence/connected-workspace-image.md")
+            .exists()
+    );
     assert!(!f.root.join("images/workspace/approved-image.txt").exists());
 }
 
@@ -807,10 +1156,11 @@ fn inspect_failure_never_proves_absence_without_authoritative_inventory() {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        assert!(!f
-            .root
-            .join("docs/evidence/connected-workspace-image.md")
-            .exists());
+        assert!(
+            !f.root
+                .join("docs/evidence/connected-workspace-image.md")
+                .exists()
+        );
         assert!(!f.root.join("images/workspace/approved-image.txt").exists());
     }
 }

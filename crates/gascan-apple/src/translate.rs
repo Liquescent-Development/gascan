@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 
 use camino::Utf8PathBuf;
 use gascan_core::runtime::{
-    CreateRequest, OwnershipMetadata, RuntimeNetwork, RuntimePort, RuntimeResourceLimits,
-    RuntimeUser,
+    CreateRequest, OwnershipMetadata, RecreateRequest, RuntimeNetwork, RuntimePort,
+    RuntimeResourceLimits, RuntimeUser,
 };
 use gascan_core::sandbox::SandboxId;
 use thiserror::Error;
@@ -161,6 +161,12 @@ impl AppleCommandBuilder {
         args.push(view.image);
 
         Ok(CommandSpec::new("container", args))
+    }
+
+    pub fn create_with_retained(
+        request: &RecreateRequest,
+    ) -> Result<CommandSpec, TranslationError> {
+        Self::create(request.create())
     }
 }
 

@@ -152,11 +152,13 @@ fn rejects_authentication_and_source_leak_patterns() {
         ),
         base.replace("rm -rf .git", "cp -R .git /out/git; rm -rf .git"),
     ] {
-        assert!(std::panic::catch_unwind(|| {
-            assert_anonymous_public_builder(&mutation);
-            assert_only_reviewed_outputs(&mutation);
-        })
-        .is_err());
+        assert!(
+            std::panic::catch_unwind(|| {
+                assert_anonymous_public_builder(&mutation);
+                assert_only_reviewed_outputs(&mutation);
+            })
+            .is_err()
+        );
     }
 }
 
@@ -168,11 +170,13 @@ fn rejects_mutable_fetch_refs_and_unlocked_cargo() {
         base.replace("cargo test --locked", "cargo test"),
         base.replace("cargo build --locked", "cargo build"),
     ] {
-        assert!(std::panic::catch_unwind(|| {
-            assert_anonymous_public_builder(&mutation);
-            assert_exact_revision_pin(&mutation);
-        })
-        .is_err());
+        assert!(
+            std::panic::catch_unwind(|| {
+                assert_anonymous_public_builder(&mutation);
+                assert_exact_revision_pin(&mutation);
+            })
+            .is_err()
+        );
     }
 }
 
