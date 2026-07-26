@@ -25,6 +25,10 @@ Base commit: `e8b6331`
 - The canonical configuration endpoint must equal the inspected live mapping.
   An explicit durable port must also equal that mapping before recovery can
   persist the completion marker.
+- Recovery preflights the inspected mapping against an explicit durable port
+  before any activation or configuration commit. A known mismatch therefore
+  deactivates and rolls back without ever publishing the inspected wrong
+  port, while automatic-port recovery can still repair stale configuration.
 - Added a debug-only crash hook and child-process `SIGABRT` tests for all three
   required publication windows.
 
@@ -81,6 +85,10 @@ changes:
   configuration without comparing its endpoint to the inspected runtime.
 - Explicit-port recovery accepted both a missing mapping and a live mapping
   that differed from the durable explicit port.
+- The first explicit-mismatch fix detected the mismatch only after activation
+  had already published the inspected wrong port. The operation remained
+  pending, but the alias was briefly left at an endpoint forbidden by durable
+  policy.
 
 The same focused tests pass with the completed implementation.
 
@@ -110,12 +118,12 @@ and the fresh 410-test run above is the recorded result.
 - Apple preflight passed on macOS 26.5.1 arm64.
 - Apple Container CLI and API server reported version 1.1.0 and revision
   `5973b9c`.
-- Native SSH acceptance was rerun after the final mapping-proof fix and
-  passed: 1 passed, 0 failed, 59 filtered, in 37.17 seconds.
+- Native SSH acceptance was rerun after the final explicit-port preflight fix
+  and passed: 1 passed, 0 failed, 59 filtered, in 37.53 seconds.
 - The test used the unchanged approved immutable candidate image and its
   distinct compatible predecessor.
 - The repository's official cleanup accepted and removed
-  `native-ssh-mapping-Ak1zRjzLHCKA.json`.
+  `native-ssh-preflight-ARO28oykdJVH.json`.
 - The scoped Apple cleanup root was empty after cleanup.
 
 ## Review
@@ -139,6 +147,13 @@ additional RED-to-GREEN regressions cover automatic missing and stale
 mappings plus explicit missing and mismatched mappings. Final independent
 mapping-proof review found no Critical, Important, or Minor issues and
 returned Ready.
+
+A final ordering review found that the explicit mismatch was initially
+discarded before repair, allowing activation to publish the wrong live port
+before the second verification rejected it. A strict RED-to-GREEN regression
+now proves that neither the alias nor mismatched port is published. Final
+independent preflight review found no Critical, Important, or Minor issues
+and returned Ready.
 
 No approved image, bridge, offline SSH support, push, pull request, version,
 tag, or release was changed in this fix round.

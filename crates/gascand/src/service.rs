@@ -690,6 +690,30 @@ impl<B: RuntimeBackend> SandboxService<B> {
         }
     }
 
+    async fn preflight_recovered_ssh_mapping(&self, id: &SandboxId) -> Result<(), ServiceError> {
+        let runtime = self
+            .runtime
+            .inspect(id)
+            .await?
+            .ok_or_else(|| ServiceError::Missing(id.clone()))?;
+        if runtime.ownership.managed_by != "gascan" || runtime.ownership.sandbox_id != *id {
+            return Err(ServiceError::Ownership(id.clone()));
+        }
+        if runtime.state != ContainerState::Running {
+            return Err(ServiceError::SshNotReady(
+                "SSH recovery requires a running sandbox",
+            ));
+        }
+        let port = inspected_native_ssh_port(&runtime)?;
+        let policy = self
+            .database({
+                let id = id.clone();
+                move |store| store.ssh_transport_policy(&id)
+            })
+            .await?;
+        validate_inspected_ssh_policy(policy, port)
+    }
+
     async fn verify_exact_ssh_publication(&self) -> Result<(), ServiceError> {
         let paths = self.ssh_paths()?;
         let _publication = SshManager.inspection_guard_for_paths(&paths).await?;
@@ -709,50 +733,20 @@ impl<B: RuntimeBackend> SandboxService<B> {
             if runtime.state != ContainerState::Running {
                 continue;
             }
-            let mut mappings = runtime
-                .ports()
-                .iter()
-                .filter(|mapping| mapping.guest_port == 22);
-            let mapping = mappings.next().ok_or(ServiceError::SshNotReady(
-                "runtime inspection is missing the native SSH mapping",
-            ))?;
-            if mappings.next().is_some()
-                || mapping.host_address != IpAddr::V4(Ipv4Addr::LOCALHOST)
-                || mapping.host_port < 1024
-            {
-                return Err(ServiceError::SshNotReady(
-                    "runtime inspection has an invalid native SSH mapping",
-                ));
-            }
+            let port = inspected_native_ssh_port(&runtime)?;
             let policy = self
                 .database({
                     let id = record.id.clone();
                     move |store| store.ssh_transport_policy(&id)
                 })
                 .await?;
-            match policy {
-                Some(policy) if !policy.is_enabled() => {
-                    return Err(ServiceError::SshNotReady(
-                        "durable SSH transport policy is disabled",
-                    ));
-                }
-                Some(policy)
-                    if policy
-                        .host_port()
-                        .is_some_and(|port| port != mapping.host_port) =>
-                {
-                    return Err(ServiceError::SshNotReady(
-                        "runtime SSH mapping differs from durable explicit port",
-                    ));
-                }
-                Some(_) | None => {}
-            }
+            validate_inspected_ssh_policy(policy, port)?;
             expected.push((
                 record.id,
                 record.ssh_resolution.ok_or(ServiceError::SshNotReady(
                     "durable SSH resolution is missing",
                 ))?,
-                Some(mapping.host_port),
+                Some(port),
             ));
         }
         let snapshot = SshManager.published_snapshot_for_paths(&paths).await?;
@@ -3004,6 +2998,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 .and_then(|details| details.get("phase").and_then(Value::as_str))
                 == Some("after_ssh_publication")
         });
+        self.preflight_recovered_ssh_mapping(id).await?;
         let mut resolution = record.ssh_resolution.clone();
         let exact = resolution.is_some() && self.verify_exact_ssh_publication().await.is_ok();
         if !exact {
@@ -3768,6 +3763,48 @@ fn ssh_resolution_enabled(resolution: Option<&crate::SshResolution>) -> bool {
         resolution.version == 1
             && resolution.details.get("enabled").and_then(Value::as_bool) == Some(true)
     })
+}
+
+fn inspected_native_ssh_port(
+    runtime: &gascan_core::runtime::RuntimeSandbox,
+) -> Result<u16, ServiceError> {
+    let mut mappings = runtime
+        .ports()
+        .iter()
+        .filter(|mapping| mapping.guest_port == 22);
+    let mapping = mappings.next().ok_or(ServiceError::SshNotReady(
+        "runtime inspection is missing the native SSH mapping",
+    ))?;
+    if mappings.next().is_some()
+        || mapping.host_address != IpAddr::V4(Ipv4Addr::LOCALHOST)
+        || mapping.host_port < 1024
+    {
+        return Err(ServiceError::SshNotReady(
+            "runtime inspection has an invalid native SSH mapping",
+        ));
+    }
+    Ok(mapping.host_port)
+}
+
+fn validate_inspected_ssh_policy(
+    policy: Option<SshTransportPolicy>,
+    inspected_port: u16,
+) -> Result<(), ServiceError> {
+    match policy {
+        Some(policy) if !policy.is_enabled() => Err(ServiceError::SshNotReady(
+            "durable SSH transport policy is disabled",
+        )),
+        Some(policy)
+            if policy
+                .host_port()
+                .is_some_and(|port| port != inspected_port) =>
+        {
+            Err(ServiceError::SshNotReady(
+                "runtime SSH mapping differs from durable explicit port",
+            ))
+        }
+        Some(_) | None => Ok(()),
+    }
 }
 
 fn create_request_ssh_enabled(request: &CreateRequest) -> bool {

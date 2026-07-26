@@ -198,7 +198,7 @@ async fn pending_ssh_create_after_config_before_marker_verifies_publication() ->
 enum PendingMappingExpectation {
     Repair(u16),
     RollBack,
-    PreservePending,
+    RejectExplicitMismatch(u16),
 }
 
 async fn assert_pending_ssh_mapping_recovery(
@@ -263,7 +263,7 @@ async fn assert_pending_ssh_mapping_recovery(
         .set_sandbox_ports(desired.id(), recovered_ports)
         .await?;
 
-    let report = service.reconcile().await?;
+    service.reconcile().await?;
     let operation = store.latest_operation()?.ok_or("operation")?;
     let events = store.operation_events(pending.id)?;
     let marked = events.iter().any(|event| {
@@ -293,18 +293,26 @@ async fn assert_pending_ssh_mapping_recovery(
                     || !std::fs::read_to_string(paths.config())?.contains(&alias)
             );
         }
-        PendingMappingExpectation::PreservePending => {
-            assert_eq!(operation.status, OperationStatus::Pending);
+        PendingMappingExpectation::RejectExplicitMismatch(port) => {
+            assert_eq!(operation.status, OperationStatus::Failed);
             assert!(
                 !marked,
                 "mismatched explicit mapping was marked as published"
             );
-            assert!(runtime.inspect(desired.id()).await?.is_some());
-            assert!(report.findings.iter().any(|finding| matches!(
-                finding,
-                ReconcileFinding::SshUnavailable { sandbox_id, .. }
-                    if sandbox_id == desired.id()
-            )));
+            assert!(runtime.inspect(desired.id()).await?.is_none());
+            let config = if paths.config().exists() {
+                std::fs::read_to_string(paths.config())?
+            } else {
+                String::new()
+            };
+            assert!(
+                !config.contains(&alias),
+                "mismatched explicit alias remained published"
+            );
+            assert!(
+                !config.contains(&format!("    Port {port}\n")),
+                "mismatched inspected port was published before rejection"
+            );
         }
     }
     Ok(())
@@ -347,13 +355,13 @@ async fn pending_explicit_ssh_create_rejects_missing_inspected_mapping() -> Test
 }
 
 #[tokio::test]
-async fn pending_explicit_ssh_create_preserves_pending_on_inspected_port_mismatch() -> TestResult {
+async fn pending_explicit_ssh_create_rejects_port_mismatch_without_publishing() -> TestResult {
     assert_pending_ssh_mapping_recovery(
         "ssh-pending-explicit-mismatched-mapping",
         Some(25_615),
         25_615,
         vec![ssh_mapping(25_616)],
-        PendingMappingExpectation::PreservePending,
+        PendingMappingExpectation::RejectExplicitMismatch(25_616),
     )
     .await
 }
