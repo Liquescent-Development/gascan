@@ -58,16 +58,16 @@ be either a trusted signed commit or the exact signed release tag. Build from
 the tag rather than from `main`, which moves ahead between releases:
 
 ```sh
-git checkout v0.1.7
+git checkout v0.1.8
 package=$(./packaging/macos/package.sh)
 GASCAN_EXPECTED_SOURCE_REVISION=$(git rev-parse HEAD) \
-GASCAN_EXPECTED_VERSION=0.1.7 \
+GASCAN_EXPECTED_VERSION=0.1.8 \
   ./packaging/macos/install.sh "$package"
 ```
 
 Skipping the checkout leaves `HEAD` on a commit the release tag does not
 attest, and `package.sh` exits 65 with `release source HEAD needs a trusted
-commit signature or exact signed v0.1.7 tag`.
+commit signature or exact signed v0.1.8 tag`.
 
 Verification runs through Git's own trust policy, so the tag's signing key must
 be one you have chosen to trust. Releases are signed with this SSH key:
@@ -86,7 +86,7 @@ key='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHyTKmfAwcJcdfKXmj2h3mwfgPaelE6gSMrquAc
 printf '%s %s\n' "$signer" "$key" \
   >> ~/.config/git/allowed_signers
 git config --global gpg.ssh.allowedSignersFile ~/.config/git/allowed_signers
-git verify-tag v0.1.7
+git verify-tag v0.1.8
 ```
 
 ## Quickstart
