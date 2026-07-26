@@ -497,6 +497,7 @@ dependencies = [
  "async-trait",
  "base64",
  "camino",
+ "nix",
  "rustix",
  "serde",
  "serde_json",

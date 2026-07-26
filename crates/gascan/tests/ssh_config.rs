@@ -32,6 +32,52 @@ fn managed_path_always_matches_the_fixed_home_relative_include() -> TestResult {
 }
 
 #[test]
+fn production_authority_matches_openssh_tilde_and_ignores_overridden_home() -> TestResult {
+    let account_home = gascan_core::account::effective_account_home()?;
+    let production = SshConfig::for_user()?;
+    assert_eq!(
+        production.managed_config_path(),
+        account_home.join(".config/gascan/ssh/config")
+    );
+
+    let temp = tempfile::tempdir()?;
+    let override_home = temp.path().join("overridden-home");
+    fs::create_dir(&override_home)?;
+    let openssh = std::process::Command::new("/usr/bin/ssh")
+        .env("HOME", &override_home)
+        .args(["-G", "-F", "/dev/null"])
+        .arg("gascan-account-home-probe")
+        .output()?;
+    assert!(openssh.status.success(), "{openssh:?}");
+    let openssh = String::from_utf8(openssh.stdout)?;
+    assert!(
+        openssh.lines().any(|line| {
+            line == format!(
+                "userknownhostsfile {0}/.ssh/known_hosts {0}/.ssh/known_hosts2",
+                account_home.display()
+            )
+        }),
+        "OpenSSH account-home expansion missing: {openssh}"
+    );
+
+    let path = std::process::Command::new(env!("CARGO_BIN_EXE_gascan"))
+        .env("HOME", &override_home)
+        .env("XDG_CONFIG_HOME", temp.path().join("overridden-xdg"))
+        .args(["ssh-config", "path"])
+        .output()?;
+    assert!(path.status.success(), "{path:?}");
+    assert_eq!(
+        path.stdout,
+        format!(
+            "{}\n",
+            account_home.join(".config/gascan/ssh/config").display()
+        )
+        .as_bytes()
+    );
+    Ok(())
+}
+
+#[test]
 fn install_and_remove_are_idempotent_and_touch_only_the_exact_block() -> TestResult {
     let (_temp, config) = fixture()?;
     let original = b"Host personal\n    HostName example.test\n";
@@ -289,9 +335,14 @@ fn ssh_config_path_command_is_local_and_prints_the_absolute_managed_path() -> Te
         .args(["ssh-config", "path"])
         .output()?;
     assert!(output.status.success(), "{output:?}");
+    let account_home = gascan_core::account::effective_account_home()?;
     assert_eq!(
         output.stdout,
-        format!("{}\n", home.join(".config/gascan/ssh/config").display()).as_bytes()
+        format!(
+            "{}\n",
+            account_home.join(".config/gascan/ssh/config").display()
+        )
+        .as_bytes()
     );
     assert!(output.stderr.is_empty());
     Ok(())
@@ -305,21 +356,12 @@ fn custom_xdg_install_and_path_resolve_the_same_fixed_include_target() -> TestRe
     fs::create_dir(&home)?;
     fs::create_dir(&xdg)?;
 
-    let install = std::process::Command::new(env!("CARGO_BIN_EXE_gascan"))
-        .env("HOME", &home)
-        .env("XDG_CONFIG_HOME", &xdg)
-        .args(["ssh-config", "install"])
-        .output()?;
-    assert!(install.status.success(), "{install:?}");
-
-    let path = std::process::Command::new(env!("CARGO_BIN_EXE_gascan"))
-        .env("HOME", &home)
-        .env("XDG_CONFIG_HOME", &xdg)
-        .args(["ssh-config", "path"])
-        .output()?;
-    assert!(path.status.success(), "{path:?}");
-    let printed = PathBuf::from(String::from_utf8(path.stdout)?.trim());
-    assert_eq!(printed, home.join(".config/gascan/ssh/config"));
+    let config = SshConfig::for_environment(Some(&xdg), Some(&home))?;
+    assert_eq!(config.install()?, IncludeChange::Changed);
+    assert_eq!(
+        config.managed_config_path(),
+        home.join(".config/gascan/ssh/config")
+    );
     assert_eq!(fs::read(home.join(".ssh/config"))?, INCLUDE_BLOCK_LF);
     assert!(!xdg.join("gascan/ssh/config").exists());
     Ok(())

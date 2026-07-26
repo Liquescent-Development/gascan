@@ -68,7 +68,10 @@ impl SshConfigError {
     }
 
     fn open_path(message: &'static str, source: rustix::io::Errno) -> Self {
-        if matches!(source, rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) {
+        if matches!(
+            source,
+            rustix::io::Errno::ACCESS | rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR
+        ) {
             Self::unsafe_path("SSH configuration path type is unsafe")
         } else {
             Self::io(message, source)
@@ -113,12 +116,10 @@ pub struct SshConfig {
 
 impl SshConfig {
     pub fn for_user() -> Result<Self, SshConfigError> {
-        let xdg = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty());
-        let home = std::env::var_os("HOME");
-        Self::for_environment(
-            xdg.as_deref().map(Path::new),
-            home.as_deref().map(Path::new),
-        )
+        let home = gascan_core::account::effective_account_home().map_err(|_| {
+            SshConfigError::unsafe_path("effective account home is unavailable or unsafe")
+        })?;
+        Self::for_environment(None, Some(&home))
     }
 
     pub fn for_environment(
@@ -504,6 +505,28 @@ fn atomic_replace_with_hook<F>(
 where
     F: FnOnce() -> Result<(), SshConfigError>,
 {
+    atomic_replace_with_hooks(
+        directory,
+        target,
+        previous,
+        contents,
+        before_publish,
+        || Ok(()),
+    )
+}
+
+fn atomic_replace_with_hooks<F, G>(
+    directory: &SecureDirectory,
+    target: &str,
+    previous: Option<PreviousFile<'_>>,
+    contents: &[u8],
+    before_publish: F,
+    before_rollback: G,
+) -> Result<(), SshConfigError>
+where
+    F: FnOnce() -> Result<(), SshConfigError>,
+    G: FnOnce() -> Result<(), SshConfigError>,
+{
     if contents.len() as u64 > MAX_CONFIG_BYTES {
         return Err(SshConfigError::unsafe_path(
             "SSH configuration is too large",
@@ -551,13 +574,34 @@ where
                 )
                 .map_err(|error| SshConfigError::io("exchange SSH configuration", error))?;
                 cleanup_staging.set(false);
-                let preserved = read_file(directory, staging.to_string_lossy().as_ref(), FILE_MODE)
-                    .is_ok_and(|observed| {
-                        observed.is_some_and(|(bytes, identity)| {
-                            identity == previous.identity && bytes == previous.contents
-                        })
-                    });
+                let staging_name = staging.to_string_lossy();
+                let observed = read_file(directory, &staging_name, FILE_MODE);
+                let observed_identity = observed
+                    .as_ref()
+                    .ok()
+                    .and_then(|observed| observed.as_ref().map(|(_bytes, identity)| *identity))
+                    .or(entry_identity(directory, &staging)?);
+                let preserved = observed.is_ok_and(|observed| {
+                    observed.is_some_and(|(bytes, identity)| {
+                        identity == previous.identity && bytes == previous.contents
+                    })
+                });
                 if !preserved {
+                    before_rollback()?;
+                    if !entry_has_contents(directory, target, staged_identity, contents, FILE_MODE)
+                    {
+                        if let Some(observed_identity) = observed_identity {
+                            preserve_staging_for_recovery(
+                                directory,
+                                target,
+                                &staging,
+                                observed_identity,
+                            )?;
+                        }
+                        return Err(SshConfigError::unsafe_path(
+                            "SSH configuration changed before concurrent-update recovery",
+                        ));
+                    }
                     rustix::fs::renameat_with(
                         &directory.fd,
                         &staging,
@@ -568,10 +612,30 @@ where
                     .map_err(|error| {
                         SshConfigError::io("restore concurrently changed SSH configuration", error)
                     })?;
-                    cleanup_staging.set(true);
                     rustix::fs::fsync(&directory.fd).map_err(|error| {
                         SshConfigError::io("sync restored SSH directory", error)
                     })?;
+                    if !entry_has_contents(
+                        directory,
+                        &staging_name,
+                        staged_identity,
+                        contents,
+                        FILE_MODE,
+                    ) {
+                        let restored_staging = entry_identity(directory, &staging)?;
+                        if let Some(restored_staging) = restored_staging {
+                            preserve_staging_for_recovery(
+                                directory,
+                                target,
+                                &staging,
+                                restored_staging,
+                            )?;
+                        }
+                        return Err(SshConfigError::unsafe_path(
+                            "SSH configuration changed during concurrent-update recovery",
+                        ));
+                    }
+                    cleanup_staging.set(true);
                     return Err(SshConfigError::unsafe_path(
                         "SSH configuration changed during replacement",
                     ));
@@ -605,6 +669,61 @@ where
         let _ = rustix::fs::unlinkat(&directory.fd, &staging, AtFlags::empty());
     }
     result
+}
+
+fn entry_has_contents(
+    directory: &SecureDirectory,
+    name: &str,
+    expected: FileIdentity,
+    contents: &[u8],
+    required_mode: u16,
+) -> bool {
+    read_file(directory, name, required_mode).is_ok_and(|observed| {
+        observed.is_some_and(|(bytes, identity)| identity == expected && bytes == contents)
+    })
+}
+
+fn entry_identity(
+    directory: &SecureDirectory,
+    name: &std::ffi::OsStr,
+) -> Result<Option<FileIdentity>, SshConfigError> {
+    match rustix::fs::statat(&directory.fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => Ok(Some(FileIdentity::from_stat(&stat))),
+        Err(error) if error == rustix::io::Errno::NOENT => Ok(None),
+        Err(error) => Err(SshConfigError::io("inspect SSH recovery source", error)),
+    }
+}
+
+fn preserve_staging_for_recovery(
+    directory: &SecureDirectory,
+    target: &str,
+    staging: &std::ffi::OsStr,
+    expected: FileIdentity,
+) -> Result<(), SshConfigError> {
+    if entry_identity(directory, staging)? != Some(expected) {
+        return Err(SshConfigError::unsafe_path(
+            "SSH recovery source changed before preservation",
+        ));
+    }
+    let recovery = format!(
+        ".gascan-recovery-{target}-{:016x}-{:016x}",
+        expected.device, expected.inode
+    );
+    rustix::fs::renameat_with(
+        &directory.fd,
+        staging,
+        &directory.fd,
+        &recovery,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| SshConfigError::io("preserve concurrent SSH configuration", error))?;
+    if entry_identity(directory, std::ffi::OsStr::new(&recovery))? != Some(expected) {
+        return Err(SshConfigError::unsafe_path(
+            "preserved SSH recovery file changed unexpectedly",
+        ));
+    }
+    rustix::fs::fsync(&directory.fd)
+        .map_err(|error| SshConfigError::io("sync SSH recovery file", error))
 }
 
 fn staging_name() -> Result<OsString, SshConfigError> {
@@ -674,7 +793,7 @@ fn validated_absolute(path: &Path) -> Result<PathBuf, SshConfigError> {
 mod tests {
     use super::{
         FILE_MODE, INCLUDE_BLOCK_LF, PreviousFile, SshConfig, SshConfigError, USER_CONFIG,
-        atomic_replace_with_hook, read_file, validate_file_stat,
+        atomic_replace_with_hook, atomic_replace_with_hooks, read_file, validate_file_stat,
     };
     use std::fs;
     use std::os::unix::fs::PermissionsExt as _;
@@ -744,5 +863,82 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(fs::read(config.user_config_path())?, concurrent);
         Ok(())
+    }
+
+    #[test]
+    fn second_concurrent_replacement_survives_failed_rollback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().join("home");
+        fs::create_dir(&home)?;
+        let config = SshConfig::for_environment(None, Some(&home))?;
+        fs::create_dir(config.ssh_directory_path())?;
+        fs::set_permissions(
+            config.ssh_directory_path(),
+            fs::Permissions::from_mode(0o700),
+        )?;
+        let original = b"Host original\n";
+        fs::write(config.user_config_path(), original)?;
+        fs::set_permissions(config.user_config_path(), fs::Permissions::from_mode(0o600))?;
+        let directory = config
+            .open_user_ssh(false)?
+            .ok_or("test SSH directory missing")?;
+        let (current, identity) =
+            read_file(&directory, USER_CONFIG, FILE_MODE)?.ok_or("test config missing")?;
+        let replacement = [INCLUDE_BLOCK_LF, current.as_slice()].concat();
+        let first_editor = b"Host first-editor\n";
+        let second_editor = b"Host second-editor\n";
+        let first_path = config.ssh_directory_path().join("first-editor");
+        let second_path = config.ssh_directory_path().join("second-editor");
+
+        let result = atomic_replace_with_hooks(
+            &directory,
+            USER_CONFIG,
+            Some(PreviousFile {
+                identity,
+                contents: &current,
+            }),
+            &replacement,
+            || {
+                fs::write(&first_path, first_editor)
+                    .map_err(|error| SshConfigError::io("write first replacement", error))?;
+                fs::set_permissions(&first_path, fs::Permissions::from_mode(0o600))
+                    .map_err(|error| SshConfigError::io("secure first replacement", error))?;
+                fs::rename(&first_path, config.user_config_path())
+                    .map_err(|error| SshConfigError::io("publish first replacement", error))
+            },
+            || {
+                fs::write(&second_path, second_editor)
+                    .map_err(|error| SshConfigError::io("write second replacement", error))?;
+                fs::set_permissions(&second_path, fs::Permissions::from_mode(0o600))
+                    .map_err(|error| SshConfigError::io("secure second replacement", error))?;
+                fs::rename(&second_path, config.user_config_path())
+                    .map_err(|error| SshConfigError::io("publish second replacement", error))
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(config.user_config_path())?, second_editor);
+        let recoveries = fs::read_dir(config.ssh_directory_path())?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".gascan-recovery-config-")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(recoveries.len(), 1);
+        assert_eq!(fs::read(recoveries[0].path())?, first_editor);
+        Ok(())
+    }
+
+    #[test]
+    fn permission_denied_while_opening_a_path_is_unsafe() {
+        let error = SshConfigError::open_path("open SSH directory", rustix::io::Errno::ACCESS);
+        assert_eq!(
+            error.stable_code(),
+            gascan_proto::error_code::SSH_CONFIG_UNSAFE
+        );
     }
 }

@@ -57,9 +57,10 @@ pub struct SshPaths {
 
 impl SshPaths {
     pub fn for_user() -> Result<Self, SshError> {
-        let xdg = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty());
-        let home = std::env::var_os("HOME");
-        Self::for_environment(xdg.as_deref(), home.as_deref())
+        let home = gascan_core::account::effective_account_home().map_err(|_| {
+            SshError::InvalidState("effective account home is unavailable or unsafe")
+        })?;
+        Self::for_environment(None, Some(home.as_os_str()))
     }
 
     pub fn for_environment(

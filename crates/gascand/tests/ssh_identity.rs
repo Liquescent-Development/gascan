@@ -58,6 +58,37 @@ fn production_managed_ssh_path_always_matches_the_home_relative_include() -> Tes
     Ok(())
 }
 
+#[test]
+fn production_paths_use_account_home_even_when_home_is_overridden() -> TestResult {
+    const CHILD: &str = "GASCAN_TEST_ACCOUNT_HOME_CHILD";
+    let account_home = gascan_core::account::effective_account_home()?;
+    if std::env::var_os(CHILD).is_some() {
+        assert_eq!(
+            SshPaths::for_user()?.directory().as_std_path(),
+            account_home.join(".config/gascan/ssh")
+        );
+        return Ok(());
+    }
+
+    let temp = TempDir::new()?;
+    let output = Command::new(std::env::current_exe()?)
+        .env(CHILD, "1")
+        .env("HOME", temp.path().join("overridden-home"))
+        .env("XDG_CONFIG_HOME", temp.path().join("overridden-xdg"))
+        .args([
+            "--exact",
+            "production_paths_use_account_home_even_when_home_is_overridden",
+            "--nocapture",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "daemon production path trusted overridden HOME: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn generates_one_valid_ed25519_identity_with_exact_metadata() -> TestResult {
     let temp = TempDir::new()?;

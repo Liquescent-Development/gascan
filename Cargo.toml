@@ -18,6 +18,7 @@ tokio = { version = "1", features = ["io-std", "io-util", "macros", "net", "proc
 tokio-stream = { version = "0.1", features = ["net"] }
 rustix = { version = "1", features = ["fs", "process"] }
 signal-hook = "0.3"
+nix = { version = "0.31.3", features = ["user"] }
 camino = { version = "1", features = ["serde1"] }
 sha2 = "0.10"
 toml = "0.8"
