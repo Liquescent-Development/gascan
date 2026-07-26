@@ -42,13 +42,16 @@ and open it. Each release also publishes a `.sha256` checksum and the
 every installed executable.
 
 Then confirm the host and runtime satisfy the security contract. `doctor`
-reports one fact per capability — architecture, macOS version, runtime service,
-storage, bind mounts, named volumes, TTY, signals, loopback publishing,
-resource limits, offline isolation, and managed SSH:
+reports one concise result per capability — architecture, macOS version,
+runtime service, storage, bind mounts, named volumes, TTY, signals, loopback
+publishing, resource limits, offline isolation, and managed SSH:
 
 ```sh
-gascan doctor --json | jq
+gascan doctor
 ```
+
+Use `gascan doctor --json | jq` when you need the complete machine-readable
+report.
 
 ### Building from source
 
@@ -91,8 +94,10 @@ git verify-tag v0.1.8
 
 ## Quickstart
 
-Copy [`packaging/macos/default-gascan.toml`](packaging/macos/default-gascan.toml)
-to `gascan.toml` in the project root and set `name` to your project:
+Create `gascan.toml` in the project root. This practical starting point enables
+network access for agent authentication and tool downloads, gives the sandbox
+room for development, and installs the latest Claude Code into the persistent
+tools volume:
 
 ```toml
 version = 1
@@ -102,25 +107,66 @@ user = "workspace"
 gascamp = "bundled"
 
 [resources]
-cpus = 2
-memory = "4GiB"
+cpus = 4
+memory = "8GiB"
+
+[storage]
+tools = "10GiB"
+cache = "10GiB"
+config = "1GiB"
 
 [tools]
-node = "24.18.0"
-python = "3.14.6"
+node = "lts"
+"npm:@anthropic-ai/claude-code" = "latest"
 ```
 
-Create the sandbox, use it, then stop it:
+From the project root, check the host and create the sandbox:
 
 ```sh
-gascan up /path/to/project     # create and start; mounts the project at /workspace
-gascan run -- node --version   # run one command in the sandbox
-gascan shell                   # interactive shell at /workspace
-gascan ssh                     # connect with the managed OpenSSH identity
-gascan apply /path/to/project  # re-apply gascan.toml after editing it
-gascan down                    # stop the sandbox, keep its state
-gascan destroy --yes           # remove the sandbox and its managed volumes
+gascan doctor
+gascan up .
+gascan shell
 ```
+
+The shell opens at `/workspace`, backed by the project directory on the Mac.
+Claude Code and Herdr are ready to launch inside it:
+
+```sh
+claude --version
+claude
+
+herdr --version
+herdr
+```
+
+Claude prompts for sandbox-local authentication on first use. Herdr opens its
+first-run onboarding; after that, running `herdr` starts or reattaches to the
+background session. Press `Ctrl-B`, then `q` to detach while its panes keep
+running. Agent credentials and configuration, plus Herdr configuration and
+logs, remain inside the sandbox's managed volumes through `down`, `up`, and
+workspace-image replacement. Stopping the sandbox stops its running processes;
+starting Herdr again restores what the installed Herdr version can recover
+from its persisted state. `gascan destroy --yes` deletes the managed volumes.
+
+After editing `gascan.toml`, reconcile the running sandbox explicitly:
+
+```sh
+gascan apply
+```
+
+The essential host-side lifecycle is:
+
+```sh
+gascan status         # inspect the running sandbox and available updates
+gascan shell          # return to an interactive shell at /workspace
+gascan down           # stop the sandbox but retain its managed volumes
+gascan up .           # start it again
+gascan destroy --yes  # permanently delete the sandbox and managed volumes
+```
+
+See [Configuring `gascan.toml`](#configuring-gascantoml) for the full manifest,
+and [SSH and VS Code Remote SSH](#ssh-and-vs-code-remote-ssh) for host-side
+editor access.
 
 Gascan shows live, in-place progress when stderr is an interactive terminal.
 When output is redirected, the same meaningful milestones are printed as
@@ -274,6 +320,7 @@ config = "1GiB"
 [tools]                         # mise tool name = version
 node = "lts"
 python = "3.13"
+"npm:@anthropic-ai/claude-code" = "latest"
 
 [ports]                         # label = port, published on loopback only
 web = 3000
@@ -494,6 +541,43 @@ Gas Can hashes the desired tool set and reinstalls only when that hash
 changes. As with `setup`, editing `[tools]` and running `up` on an existing
 sandbox reports `apply_required` with reason `tools_changed`; run
 `gascan apply` to reconcile.
+
+#### Updating an image-provided tool
+
+An explicit `[tools]` declaration overrides an immutable image default. Use
+mise's normal tool name for language runtimes, or its package backend for
+tools distributed through an ecosystem such as npm:
+
+```toml
+[tools]
+go = "latest"
+rust = "latest"
+"npm:@anthropic-ai/claude-code" = "latest"
+```
+
+This is especially useful for Claude Code because new releases add support for
+new Claude models more frequently than Gas Can publishes workspace images.
+`latest` resolves the newest available release when the declaration is first
+installed. For a controlled upgrade, pin an exact release and change the value
+when ready:
+
+```toml
+[tools]
+"npm:@anthropic-ai/claude-code" = "2.1.218"
+```
+
+After adding or changing an override, run:
+
+```sh
+gascan apply
+```
+
+The requested version is downloaded into the sandbox's persistent tools
+volume and its mise shim takes precedence over the bundled fallback. The
+sandbox must be `networked` unless that exact artifact is already cached.
+Gas Can only reapplies tools when the `[tools]` declaration changes; an
+unchanged `latest` entry is not a promise to check the registry on every
+`gascan apply`.
 
 ### `[ports]`
 

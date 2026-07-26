@@ -167,7 +167,7 @@ impl SshConfig {
         let Some(directory) = self.open_user_ssh(false)? else {
             return Ok(false);
         };
-        let Some((contents, _)) = read_file(&directory, USER_CONFIG, FILE_MODE)? else {
+        let Some((contents, _)) = read_file(&directory, USER_CONFIG)? else {
             return Ok(false);
         };
         Ok(find_block(&contents)?.is_some())
@@ -177,7 +177,7 @@ impl SshConfig {
         let directory = self
             .open_user_ssh(true)?
             .ok_or_else(|| SshConfigError::unsafe_path("cannot create ~/.ssh"))?;
-        let (current, identity) = match read_file(&directory, USER_CONFIG, FILE_MODE)? {
+        let (current, identity) = match read_file(&directory, USER_CONFIG)? {
             Some((current, identity)) => (current, Some(identity)),
             None => (Vec::new(), None),
         };
@@ -214,7 +214,7 @@ impl SshConfig {
         let Some(directory) = self.open_user_ssh(false)? else {
             return Ok(IncludeChange::Unchanged);
         };
-        let Some((current, identity)) = read_file(&directory, USER_CONFIG, FILE_MODE)? else {
+        let Some((current, identity)) = read_file(&directory, USER_CONFIG)? else {
             return Ok(IncludeChange::Unchanged);
         };
         let Some((start, end, _line_ending)) = find_block(&current)? else {
@@ -240,14 +240,14 @@ impl SshConfig {
         let Some(directory) = self.open_managed_ssh(false)? else {
             return Ok(false);
         };
-        Ok(read_file(&directory, OFFER_RECEIPT, FILE_MODE)?.is_some())
+        Ok(read_file(&directory, OFFER_RECEIPT)?.is_some())
     }
 
     pub fn record_offer_receipt(&self) -> Result<(), SshConfigError> {
         let directory = self
             .open_managed_ssh(true)?
             .ok_or_else(|| SshConfigError::unsafe_path("cannot create managed SSH state"))?;
-        let previous = read_file(&directory, OFFER_RECEIPT, FILE_MODE)?;
+        let previous = read_file(&directory, OFFER_RECEIPT)?;
         atomic_replace(
             &directory,
             OFFER_RECEIPT,
@@ -260,23 +260,23 @@ impl SshConfig {
     }
 
     fn open_user_ssh(&self, create: bool) -> Result<Option<SecureDirectory>, SshConfigError> {
-        let home = open_directory(&self.home, self.expected_uid, false)?;
-        open_child_directory(&home.fd, ".ssh", self.expected_uid, create, true)
+        let home = open_directory(&self.home, self.expected_uid)?;
+        open_child_directory(&home.fd, ".ssh", self.expected_uid, create)
     }
 
     fn open_managed_ssh(&self, create: bool) -> Result<Option<SecureDirectory>, SshConfigError> {
-        let home = open_directory(&self.home, self.expected_uid, false)?;
+        let home = open_directory(&self.home, self.expected_uid)?;
         let Some(config_home) =
-            open_child_directory(&home.fd, ".config", self.expected_uid, create, false)?
+            open_child_directory(&home.fd, ".config", self.expected_uid, create)?
         else {
             return Ok(None);
         };
         let Some(gascan) =
-            open_child_directory(&config_home.fd, "gascan", self.expected_uid, create, true)?
+            open_child_directory(&config_home.fd, "gascan", self.expected_uid, create)?
         else {
             return Ok(None);
         };
-        open_child_directory(&gascan.fd, "ssh", self.expected_uid, create, true)
+        open_child_directory(&gascan.fd, "ssh", self.expected_uid, create)
     }
 }
 
@@ -341,6 +341,7 @@ pub fn answer_first_use_offer(
 struct FileIdentity {
     device: u64,
     inode: u64,
+    mode: u16,
 }
 
 #[derive(Clone, Copy)]
@@ -354,6 +355,7 @@ impl FileIdentity {
         Self {
             device: stat.st_dev as u64,
             inode: stat.st_ino,
+            mode: (stat.st_mode & 0o7777) as u16,
         }
     }
 }
@@ -363,11 +365,7 @@ struct SecureDirectory {
     expected_uid: u32,
 }
 
-fn open_directory(
-    path: &Path,
-    expected_uid: u32,
-    exact_private_mode: bool,
-) -> Result<SecureDirectory, SshConfigError> {
+fn open_directory(path: &Path, expected_uid: u32) -> Result<SecureDirectory, SshConfigError> {
     let fd = rustix::fs::open(
         path,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -376,7 +374,7 @@ fn open_directory(
     .map_err(|error| SshConfigError::open_path("open SSH directory", error))?;
     let stat = rustix::fs::fstat(&fd)
         .map_err(|error| SshConfigError::io("inspect SSH directory", error))?;
-    validate_directory_stat(&stat, expected_uid, exact_private_mode)?;
+    validate_directory_stat(&stat, expected_uid)?;
     Ok(SecureDirectory { fd, expected_uid })
 }
 
@@ -385,7 +383,6 @@ fn open_child_directory(
     name: &str,
     expected_uid: u32,
     create: bool,
-    exact_private_mode: bool,
 ) -> Result<Option<SecureDirectory>, SshConfigError> {
     let fd = match rustix::fs::openat(
         parent,
@@ -413,20 +410,17 @@ fn open_child_directory(
     };
     let stat = rustix::fs::fstat(&fd)
         .map_err(|error| SshConfigError::io("inspect SSH directory", error))?;
-    validate_directory_stat(&stat, expected_uid, exact_private_mode)?;
+    validate_directory_stat(&stat, expected_uid)?;
     Ok(Some(SecureDirectory { fd, expected_uid }))
 }
 
 fn validate_directory_stat(
     stat: &rustix::fs::Stat,
     expected_uid: u32,
-    exact_private_mode: bool,
 ) -> Result<(), SshConfigError> {
-    let mode = stat.st_mode & 0o7777;
     if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
         || stat.st_uid != expected_uid
-        || (exact_private_mode && mode != DIRECTORY_MODE)
-        || (!exact_private_mode && mode & 0o022 != 0)
+        || stat.st_mode & 0o022 != 0
     {
         return Err(SshConfigError::unsafe_path(
             "SSH directory ownership or permissions are unsafe",
@@ -438,9 +432,8 @@ fn validate_directory_stat(
 fn read_file(
     directory: &SecureDirectory,
     name: &str,
-    required_mode: u16,
 ) -> Result<Option<(Vec<u8>, FileIdentity)>, SshConfigError> {
-    let Some(expected) = file_identity(directory, name, required_mode)? else {
+    let Some(expected) = file_identity(directory, name)? else {
         return Ok(None);
     };
     let fd = rustix::fs::openat(
@@ -452,7 +445,7 @@ fn read_file(
     .map_err(|error| SshConfigError::open_path("open SSH configuration", error))?;
     let stat = rustix::fs::fstat(&fd)
         .map_err(|error| SshConfigError::io("inspect open SSH configuration", error))?;
-    validate_file_stat(&stat, directory.expected_uid, required_mode)?;
+    validate_file_stat(&stat, directory.expected_uid)?;
     if FileIdentity::from_stat(&stat) != expected {
         return Err(SshConfigError::unsafe_path(
             "SSH configuration changed while opening it",
@@ -468,7 +461,7 @@ fn read_file(
             "SSH configuration is too large",
         ));
     }
-    if file_identity(directory, name, required_mode)? != Some(expected) {
+    if file_identity(directory, name)? != Some(expected) {
         return Err(SshConfigError::unsafe_path(
             "SSH configuration changed while reading it",
         ));
@@ -479,26 +472,21 @@ fn read_file(
 fn file_identity(
     directory: &SecureDirectory,
     name: &str,
-    required_mode: u16,
 ) -> Result<Option<FileIdentity>, SshConfigError> {
     let stat = match rustix::fs::statat(&directory.fd, name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(stat) => stat,
         Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
         Err(error) => return Err(SshConfigError::io("inspect SSH configuration", error)),
     };
-    validate_file_stat(&stat, directory.expected_uid, required_mode)?;
+    validate_file_stat(&stat, directory.expected_uid)?;
     Ok(Some(FileIdentity::from_stat(&stat)))
 }
 
-fn validate_file_stat(
-    stat: &rustix::fs::Stat,
-    expected_uid: u32,
-    required_mode: u16,
-) -> Result<(), SshConfigError> {
+fn validate_file_stat(stat: &rustix::fs::Stat, expected_uid: u32) -> Result<(), SshConfigError> {
     if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
         || stat.st_uid != expected_uid
         || stat.st_nlink != 1
-        || stat.st_mode & 0o7777 != required_mode
+        || stat.st_mode & 0o022 != 0
     {
         return Err(SshConfigError::unsafe_path(
             "SSH configuration ownership, type, links, or permissions are unsafe",
@@ -553,22 +541,30 @@ where
             "SSH configuration is too large",
         ));
     }
+    let replacement_mode = previous
+        .map(|previous| previous.identity.mode)
+        .unwrap_or(FILE_MODE);
     let staging = staging_name()?;
     let cleanup_staging = Cell::new(true);
     let fd = rustix::fs::openat(
         &directory.fd,
         &staging,
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_raw_mode(FILE_MODE),
+        Mode::from_raw_mode(replacement_mode),
     )
     .map_err(|error| SshConfigError::io("create SSH configuration staging file", error))?;
     let result = (|| {
-        rustix::fs::fchmod(&fd, Mode::from_raw_mode(FILE_MODE))
+        rustix::fs::fchmod(&fd, Mode::from_raw_mode(replacement_mode))
             .map_err(|error| SshConfigError::io("secure SSH configuration staging file", error))?;
         let stat = rustix::fs::fstat(&fd)
             .map_err(|error| SshConfigError::io("inspect SSH configuration staging file", error))?;
-        validate_file_stat(&stat, directory.expected_uid, FILE_MODE)?;
+        validate_file_stat(&stat, directory.expected_uid)?;
         let staged_identity = FileIdentity::from_stat(&stat);
+        if staged_identity.mode != replacement_mode {
+            return Err(SshConfigError::unsafe_path(
+                "SSH configuration staging permissions changed unexpectedly",
+            ));
+        }
         let mut file = File::from(fd);
         file.write_all(contents)
             .map_err(|error| SshConfigError::io("write SSH configuration", error))?;
@@ -576,9 +572,7 @@ where
             .map_err(|error| SshConfigError::io("flush SSH configuration", error))?;
         file.sync_all()
             .map_err(|error| SshConfigError::io("sync SSH configuration", error))?;
-        if file_identity(directory, target, FILE_MODE)?
-            != previous.map(|previous| previous.identity)
-        {
+        if file_identity(directory, target)? != previous.map(|previous| previous.identity) {
             return Err(SshConfigError::unsafe_path(
                 "SSH configuration changed before replacement",
             ));
@@ -596,7 +590,7 @@ where
                 .map_err(|error| SshConfigError::io("exchange SSH configuration", error))?;
                 cleanup_staging.set(false);
                 let staging_name = staging.to_string_lossy();
-                let observed = read_file(directory, &staging_name, FILE_MODE);
+                let observed = read_file(directory, &staging_name);
                 let observed_identity = observed
                     .as_ref()
                     .ok()
@@ -609,8 +603,7 @@ where
                 });
                 if !preserved {
                     before_rollback()?;
-                    if !entry_has_contents(directory, target, staged_identity, contents, FILE_MODE)
-                    {
+                    if !entry_has_contents(directory, target, staged_identity, contents) {
                         if let Some(observed_identity) = observed_identity {
                             preserve_staging_for_recovery(
                                 directory,
@@ -636,13 +629,7 @@ where
                     rustix::fs::fsync(&directory.fd).map_err(|error| {
                         SshConfigError::io("sync restored SSH directory", error)
                     })?;
-                    if !entry_has_contents(
-                        directory,
-                        &staging_name,
-                        staged_identity,
-                        contents,
-                        FILE_MODE,
-                    ) {
+                    if !entry_has_contents(directory, &staging_name, staged_identity, contents) {
                         let restored_staging = entry_identity(directory, &staging)?;
                         if let Some(restored_staging) = restored_staging {
                             preserve_staging_for_recovery(
@@ -661,7 +648,7 @@ where
                         "SSH configuration changed during replacement",
                     ));
                 }
-                if file_identity(directory, target, FILE_MODE)? != Some(staged_identity) {
+                if file_identity(directory, target)? != Some(staged_identity) {
                     return Err(SshConfigError::unsafe_path(
                         "SSH configuration changed after replacement",
                     ));
@@ -681,7 +668,7 @@ where
         }
         rustix::fs::fsync(&directory.fd)
             .map_err(|error| SshConfigError::io("sync SSH directory", error))?;
-        file_identity(directory, target, FILE_MODE)?.ok_or_else(|| {
+        file_identity(directory, target)?.ok_or_else(|| {
             SshConfigError::unsafe_path("SSH configuration disappeared after replacement")
         })?;
         Ok(())
@@ -697,9 +684,8 @@ fn entry_has_contents(
     name: &str,
     expected: FileIdentity,
     contents: &[u8],
-    required_mode: u16,
 ) -> bool {
-    read_file(directory, name, required_mode).is_ok_and(|observed| {
+    read_file(directory, name).is_ok_and(|observed| {
         observed.is_some_and(|(bytes, identity)| identity == expected && bytes == contents)
     })
 }
@@ -813,7 +799,7 @@ fn validated_absolute(path: &Path) -> Result<PathBuf, SshConfigError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FILE_MODE, INCLUDE_BLOCK_LF, PreviousFile, SshConfig, SshConfigError, USER_CONFIG,
+        INCLUDE_BLOCK_LF, PreviousFile, SshConfig, SshConfigError, USER_CONFIG,
         atomic_replace_with_hook, atomic_replace_with_hooks, read_file, validate_file_stat,
     };
     use std::fs;
@@ -833,7 +819,7 @@ mod tests {
         )?;
         let stat = rustix::fs::fstat(fd)?;
         assert!(matches!(
-            validate_file_stat(&stat, stat.st_uid.saturating_add(1), 0o600),
+            validate_file_stat(&stat, stat.st_uid.saturating_add(1)),
             Err(SshConfigError { .. })
         ));
         Ok(())
@@ -858,7 +844,7 @@ mod tests {
             .open_user_ssh(false)?
             .ok_or("test SSH directory missing")?;
         let (current, identity) =
-            read_file(&directory, USER_CONFIG, FILE_MODE)?.ok_or("test config missing")?;
+            read_file(&directory, USER_CONFIG)?.ok_or("test config missing")?;
         let replacement = [INCLUDE_BLOCK_LF, current.as_slice()].concat();
         let concurrent = b"Host concurrent-editor\n";
         let concurrent_path = config.ssh_directory_path().join("concurrent");
@@ -905,7 +891,7 @@ mod tests {
             .open_user_ssh(false)?
             .ok_or("test SSH directory missing")?;
         let (current, identity) =
-            read_file(&directory, USER_CONFIG, FILE_MODE)?.ok_or("test config missing")?;
+            read_file(&directory, USER_CONFIG)?.ok_or("test config missing")?;
         let replacement = [INCLUDE_BLOCK_LF, current.as_slice()].concat();
         let first_editor = b"Host first-editor\n";
         let second_editor = b"Host second-editor\n";

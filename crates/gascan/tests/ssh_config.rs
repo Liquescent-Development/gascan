@@ -219,6 +219,49 @@ fn installer_creates_exact_private_modes() -> TestResult {
 }
 
 #[test]
+fn conventional_user_config_mode_is_accepted_and_preserved() -> TestResult {
+    let (_temp, config) = fixture()?;
+    write_user_config(&config, b"Host personal\n")?;
+    fs::set_permissions(config.user_config_path(), fs::Permissions::from_mode(0o644))?;
+
+    assert_eq!(config.install()?, IncludeChange::Changed);
+    assert_eq!(
+        fs::metadata(config.user_config_path())?.mode() & 0o777,
+        0o644
+    );
+    assert_eq!(config.remove()?, IncludeChange::Changed);
+    assert_eq!(
+        fs::metadata(config.user_config_path())?.mode() & 0o777,
+        0o644
+    );
+    Ok(())
+}
+
+#[test]
+fn conventional_owner_controlled_directory_modes_are_accepted() -> TestResult {
+    let (_temp, user_config) = fixture()?;
+    fs::create_dir(user_config.ssh_directory_path())?;
+    fs::set_permissions(
+        user_config.ssh_directory_path(),
+        fs::Permissions::from_mode(0o755),
+    )?;
+    assert_eq!(user_config.install()?, IncludeChange::Changed);
+
+    let (_temp, managed_config) = fixture()?;
+    let managed_ssh = managed_config
+        .managed_config_path()
+        .parent()
+        .ok_or("managed SSH directory")?;
+    let gascan = managed_ssh.parent().ok_or("managed Gas Can directory")?;
+    fs::create_dir_all(managed_ssh)?;
+    fs::set_permissions(gascan, fs::Permissions::from_mode(0o755))?;
+    fs::set_permissions(managed_ssh, fs::Permissions::from_mode(0o755))?;
+    managed_config.record_offer_receipt()?;
+    assert!(managed_config.offer_receipt_exists()?);
+    Ok(())
+}
+
+#[test]
 fn installer_rejects_symlink_hard_link_fifo_owner_and_mode_attacks() -> TestResult {
     symlink_attack()?;
     hard_link_attack()?;
@@ -265,7 +308,7 @@ fn fifo_attack() -> TestResult {
 fn unsafe_mode_attack() -> TestResult {
     let (_temp, config) = fixture()?;
     write_user_config(&config, b"Host personal\n")?;
-    fs::set_permissions(config.user_config_path(), fs::Permissions::from_mode(0o644))?;
+    fs::set_permissions(config.user_config_path(), fs::Permissions::from_mode(0o664))?;
     assert!(config.install().is_err());
     Ok(())
 }
@@ -276,12 +319,12 @@ fn unsafe_ssh_directory_is_rejected_without_repairing_it() -> TestResult {
     fs::create_dir(config.ssh_directory_path())?;
     fs::set_permissions(
         config.ssh_directory_path(),
-        fs::Permissions::from_mode(0o755),
+        fs::Permissions::from_mode(0o775),
     )?;
     assert!(config.install().is_err());
     assert_eq!(
         fs::metadata(config.ssh_directory_path())?.mode() & 0o777,
-        0o755
+        0o775
     );
     Ok(())
 }
@@ -303,7 +346,7 @@ fn update_io_and_unsafe_path_failures_have_distinct_stable_codes() -> TestResult
     fs::create_dir(unsafe_config.ssh_directory_path())?;
     fs::set_permissions(
         unsafe_config.ssh_directory_path(),
-        fs::Permissions::from_mode(0o755),
+        fs::Permissions::from_mode(0o775),
     )?;
     assert_eq!(
         unsafe_config
