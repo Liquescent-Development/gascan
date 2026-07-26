@@ -20,6 +20,11 @@ Base commit: `e8b6331`
   absent.
 - Uncertain alias removal, cleanup, or publication preserves pending state and
   runtime resources for a safe retry.
+- Publication verification always requires exactly one inspected guest-port
+  22 mapping on `127.0.0.1` with an unprivileged host port.
+- The canonical configuration endpoint must equal the inspected live mapping.
+  An explicit durable port must also equal that mapping before recovery can
+  persist the completion marker.
 - Added a debug-only crash hook and child-process `SIGABRT` tests for all three
   required publication windows.
 
@@ -72,6 +77,10 @@ changes:
   failure before alias removal.
 - Cleanup inspection returning no runtime skipped alias removal and left the
   stale published alias.
+- Automatic-port recovery accepted a missing mapping and marked stale
+  configuration without comparing its endpoint to the inspected runtime.
+- Explicit-port recovery accepted both a missing mapping and a live mapping
+  that differed from the durable explicit port.
 
 The same focused tests pass with the completed implementation.
 
@@ -79,10 +88,10 @@ The same focused tests pass with the completed implementation.
 
 - Focused configuration tests: 6 passed.
 - Full lifecycle integration suite: 78 passed.
-- Full reconciliation integration suite: 24 passed.
+- Full reconciliation integration suite: 28 passed.
 - Concurrent SSH publication regression: passed.
-- Complete daemon package: 296 passed, 15 suites.
-- Complete workspace: 875 passed, 20 ignored, 61 filtered, 60 suites.
+- Complete daemon package: 300 passed, 15 suites.
+- Complete workspace: 879 passed, 20 ignored, 61 filtered, 60 suites.
 - Complete scripts workspace: 410 passed, 47 suites.
 - `cargo check --workspace --all-targets --all-features`: passed.
 - Strict Clippy for the workspace, all targets, and all features: passed with
@@ -101,12 +110,12 @@ and the fresh 410-test run above is the recorded result.
 - Apple preflight passed on macOS 26.5.1 arm64.
 - Apple Container CLI and API server reported version 1.1.0 and revision
   `5973b9c`.
-- Native SSH acceptance passed: 1 passed, 0 failed, 59 filtered, in 39.52
-  seconds.
+- Native SSH acceptance was rerun after the final mapping-proof fix and
+  passed: 1 passed, 0 failed, 59 filtered, in 37.17 seconds.
 - The test used the unchanged approved immutable candidate image and its
   distinct compatible predecessor.
 - The repository's official cleanup accepted and removed
-  `native-ssh-fix1-3C9KyTdq8Csc.json`.
+  `native-ssh-mapping-Ak1zRjzLHCKA.json`.
 - The scoped Apple cleanup root was empty after cleanup.
 
 ## Review
@@ -123,6 +132,13 @@ three original blockers were closed. Two additional RED-to-GREEN regressions
 now prove both inspection-error and missing-runtime behavior. The final
 review accepted the corrected deactivation ordering and primary-error
 precedence.
+
+A subsequent whole-branch review identified that recovery publication
+verification did not always prove the live native SSH mapping. Four
+additional RED-to-GREEN regressions cover automatic missing and stale
+mappings plus explicit missing and mismatched mappings. Final independent
+mapping-proof review found no Critical, Important, or Minor issues and
+returned Ready.
 
 No approved image, bridge, offline SSH support, push, pull request, version,
 tag, or release was changed in this fix round.

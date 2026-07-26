@@ -194,6 +194,170 @@ async fn pending_ssh_create_after_config_before_marker_verifies_publication() ->
     .await
 }
 
+#[derive(Clone, Copy)]
+enum PendingMappingExpectation {
+    Repair(u16),
+    RollBack,
+    PreservePending,
+}
+
+async fn assert_pending_ssh_mapping_recovery(
+    label: &str,
+    explicit_port: Option<u16>,
+    initial_port: u16,
+    recovered_ports: Vec<RuntimePort>,
+    expectation: PendingMappingExpectation,
+) -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let host_port = explicit_port.map_or_else(String::new, |port| format!("host_port = {port}\n"));
+    std::fs::write(
+        root.join("gascan.toml"),
+        format!("version = 1\nnetwork = 'networked'\n[ssh]\n{host_port}"),
+    )?;
+    let desired = SandboxSpec::from_root(label, root, Manifest::load(root)?)?;
+    let paths = ssh_paths(root, &format!("{label}-client"))?;
+    let host_paths = ssh_paths(root, &format!("{label}-host"))?;
+    let host_public_key = ensure_host_identity(&host_paths)
+        .await?
+        .public_key()
+        .to_owned();
+    let runtime = FakeRuntime::default();
+    runtime.queue_created_ssh_host_port(initial_port).await;
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let state_path = root.join("state.db");
+    let store = Store::open(&state_path)?;
+    let service = ssh_service(
+        runtime.clone(),
+        store.clone(),
+        paths.clone(),
+        readiness_program(root, None)?,
+    );
+    service.up(UpRequest::new(desired.clone())).await?;
+    let record = store.sandbox(desired.id())?.ok_or("sandbox")?;
+    let fingerprint = record
+        .setup_resolution
+        .as_ref()
+        .and_then(|resolution| resolution.details.get("desired_fingerprint"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or("desired fingerprint")?
+        .to_owned();
+    let initial_config = std::fs::read_to_string(paths.config())?;
+    assert!(initial_config.contains(&format!("    Port {initial_port}\n")));
+    let pending = store.begin_operation(&record, OperationKind::Create)?;
+    rusqlite::Connection::open(&state_path)?.execute(
+        "UPDATE sandboxes SET actual_state = 'creating' WHERE id = ?1",
+        [desired.id().as_str()],
+    )?;
+    store.append_operation_event(
+        pending.id,
+        json!({"phase":"before_health","step":"health_check"}),
+    )?;
+    store.append_operation_event(
+        pending.id,
+        json!({"phase":"after_health","desired_fingerprint":fingerprint}),
+    )?;
+    runtime
+        .set_sandbox_ports(desired.id(), recovered_ports)
+        .await?;
+
+    let report = service.reconcile().await?;
+    let operation = store.latest_operation()?.ok_or("operation")?;
+    let events = store.operation_events(pending.id)?;
+    let marked = events.iter().any(|event| {
+        event
+            .details
+            .as_ref()
+            .and_then(|details| details.get("phase"))
+            .and_then(serde_json::Value::as_str)
+            == Some("after_ssh_publication")
+    });
+    let alias = format!("Host gascan-{}", desired.id());
+    match expectation {
+        PendingMappingExpectation::Repair(port) => {
+            assert_eq!(operation.status, OperationStatus::Completed);
+            assert!(marked, "repaired recovery did not persist its marker");
+            let config = std::fs::read_to_string(paths.config())?;
+            assert!(config.contains(&alias));
+            assert!(config.contains(&format!("    Port {port}\n")));
+            assert!(!config.contains(&format!("    Port {initial_port}\n")));
+        }
+        PendingMappingExpectation::RollBack => {
+            assert_eq!(operation.status, OperationStatus::Failed);
+            assert!(!marked, "invalid mapping was marked as published");
+            assert!(runtime.inspect(desired.id()).await?.is_none());
+            assert!(
+                !paths.config().exists()
+                    || !std::fs::read_to_string(paths.config())?.contains(&alias)
+            );
+        }
+        PendingMappingExpectation::PreservePending => {
+            assert_eq!(operation.status, OperationStatus::Pending);
+            assert!(
+                !marked,
+                "mismatched explicit mapping was marked as published"
+            );
+            assert!(runtime.inspect(desired.id()).await?.is_some());
+            assert!(report.findings.iter().any(|finding| matches!(
+                finding,
+                ReconcileFinding::SshUnavailable { sandbox_id, .. }
+                    if sandbox_id == desired.id()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_automatic_ssh_create_rejects_missing_inspected_mapping() -> TestResult {
+    assert_pending_ssh_mapping_recovery(
+        "ssh-pending-auto-missing-mapping",
+        None,
+        25_611,
+        Vec::new(),
+        PendingMappingExpectation::RollBack,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn pending_automatic_ssh_create_repairs_stale_config_to_inspected_mapping() -> TestResult {
+    assert_pending_ssh_mapping_recovery(
+        "ssh-pending-auto-stale-mapping",
+        None,
+        25_612,
+        vec![ssh_mapping(25_613)],
+        PendingMappingExpectation::Repair(25_613),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn pending_explicit_ssh_create_rejects_missing_inspected_mapping() -> TestResult {
+    assert_pending_ssh_mapping_recovery(
+        "ssh-pending-explicit-missing-mapping",
+        Some(25_614),
+        25_614,
+        Vec::new(),
+        PendingMappingExpectation::RollBack,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn pending_explicit_ssh_create_preserves_pending_on_inspected_port_mismatch() -> TestResult {
+    assert_pending_ssh_mapping_recovery(
+        "ssh-pending-explicit-mismatched-mapping",
+        Some(25_615),
+        25_615,
+        vec![ssh_mapping(25_616)],
+        PendingMappingExpectation::PreservePending,
+    )
+    .await
+}
+
 #[tokio::test]
 async fn pending_ssh_create_failed_publication_repair_rolls_back_closed() -> TestResult {
     let temp = tempfile::tempdir()?;

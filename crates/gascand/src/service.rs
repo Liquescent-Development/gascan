@@ -36,6 +36,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex, Weak};
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
@@ -708,43 +709,50 @@ impl<B: RuntimeBackend> SandboxService<B> {
             if runtime.state != ContainerState::Running {
                 continue;
             }
+            let mut mappings = runtime
+                .ports()
+                .iter()
+                .filter(|mapping| mapping.guest_port == 22);
+            let mapping = mappings.next().ok_or(ServiceError::SshNotReady(
+                "runtime inspection is missing the native SSH mapping",
+            ))?;
+            if mappings.next().is_some()
+                || mapping.host_address != IpAddr::V4(Ipv4Addr::LOCALHOST)
+                || mapping.host_port < 1024
+            {
+                return Err(ServiceError::SshNotReady(
+                    "runtime inspection has an invalid native SSH mapping",
+                ));
+            }
             let policy = self
                 .database({
                     let id = record.id.clone();
                     move |store| store.ssh_transport_policy(&id)
                 })
                 .await?;
-            let explicit_port = match policy {
-                Some(policy) if policy.is_enabled() => policy.host_port(),
-                Some(_) => {
+            match policy {
+                Some(policy) if !policy.is_enabled() => {
                     return Err(ServiceError::SshNotReady(
                         "durable SSH transport policy is disabled",
                     ));
                 }
-                None => {
-                    let mappings = runtime
-                        .ports()
-                        .iter()
-                        .filter(|mapping| {
-                            mapping.guest_port == 22
-                                && mapping.host_address.is_loopback()
-                                && mapping.host_port >= 1024
-                        })
-                        .collect::<Vec<_>>();
-                    let [mapping] = mappings.as_slice() else {
-                        return Err(ServiceError::SshNotReady(
-                            "live SSH transport is not uniquely observable",
-                        ));
-                    };
-                    Some(mapping.host_port)
+                Some(policy)
+                    if policy
+                        .host_port()
+                        .is_some_and(|port| port != mapping.host_port) =>
+                {
+                    return Err(ServiceError::SshNotReady(
+                        "runtime SSH mapping differs from durable explicit port",
+                    ));
                 }
-            };
+                Some(_) | None => {}
+            }
             expected.push((
                 record.id,
                 record.ssh_resolution.ok_or(ServiceError::SshNotReady(
                     "durable SSH resolution is missing",
                 ))?,
-                explicit_port,
+                Some(mapping.host_port),
             ));
         }
         let snapshot = SshManager.published_snapshot_for_paths(&paths).await?;
