@@ -13,7 +13,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
-use gascan_core::doctor::{DoctorFacts, DoctorReport};
+use gascan_core::doctor::{DoctorFact, DoctorFacts, DoctorReport, DoctorStatus};
 use gascan_core::manifest::ManifestError;
 use gascan_core::policy::{
     CONTAINER_PATH, ControlPlanePolicy, MISE_CACHE_DIR, MISE_DATA_DIR, MISE_GLOBAL_CONFIG_FILE,
@@ -253,6 +253,7 @@ pub struct SandboxService<B: RuntimeBackend> {
     ssh_paths: Option<SshPaths>,
     ssh_readiness_program: Option<Utf8PathBuf>,
     ssh_host_key_timeout: std::time::Duration,
+    refresh_ssh_doctor: bool,
 }
 
 #[derive(Clone)]
@@ -427,7 +428,10 @@ impl<B: RuntimeBackend> SandboxService<B> {
         provisioner: Arc<dyn Provisioner>,
         doctor: DoctorReport,
     ) -> Self {
-        Self::new_with_doctor_state(runtime, store, provisioner, DoctorState::ready(doctor))
+        let mut service =
+            Self::new_with_doctor_state(runtime, store, provisioner, DoctorState::ready(doctor));
+        service.refresh_ssh_doctor = false;
+        service
     }
 
     pub fn new_with_doctor_state(
@@ -447,6 +451,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             ssh_paths: None,
             ssh_readiness_program: None,
             ssh_host_key_timeout: HOST_KEY_READ_TIMEOUT,
+            refresh_ssh_doctor: true,
         }
     }
 
@@ -471,6 +476,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             ssh_paths: None,
             ssh_readiness_program: None,
             ssh_host_key_timeout: HOST_KEY_READ_TIMEOUT,
+            refresh_ssh_doctor: true,
         })
     }
 
@@ -511,6 +517,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             ssh_paths: Some(ssh_paths),
             ssh_readiness_program: Some(readiness_program),
             ssh_host_key_timeout: HOST_KEY_READ_TIMEOUT,
+            refresh_ssh_doctor: true,
         }
     }
 
@@ -518,6 +525,13 @@ impl<B: RuntimeBackend> SandboxService<B> {
     #[cfg(debug_assertions)]
     pub fn with_ssh_paths_for_e2e(mut self, ssh_paths: SshPaths) -> Self {
         self.ssh_paths = Some(ssh_paths);
+        self.refresh_ssh_doctor = true;
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_ssh_doctor_refresh(mut self, enabled: bool) -> Self {
+        self.refresh_ssh_doctor = enabled;
         self
     }
 
@@ -541,6 +555,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             ssh_paths: Some(ssh_paths),
             ssh_readiness_program: Some(readiness_program),
             ssh_host_key_timeout: host_key_timeout,
+            refresh_ssh_doctor: true,
         }
     }
 
@@ -805,7 +820,30 @@ impl<B: RuntimeBackend> SandboxService<B> {
     }
 
     pub async fn doctor_report(&self) -> DoctorReport {
-        self.doctor.report().await
+        let mut report = self.doctor.report().await;
+        if !self.refresh_ssh_doctor {
+            return report;
+        }
+        let native_publish = report
+            .check("runtime.loopback_publish")
+            .is_some_and(|check| check.status == DoctorStatus::Pass);
+        let ssh = match self.ssh_paths.as_ref() {
+            Some(paths) => {
+                crate::ssh_doctor_facts_for_paths(
+                    paths,
+                    std::path::Path::new("/usr/bin/ssh"),
+                    &self.store,
+                    native_publish,
+                )
+                .await
+            }
+            None => crate::ssh_doctor_facts(&self.store, native_publish).await,
+        };
+        replace_doctor_fact(&mut report, "ssh.client", ssh.client);
+        replace_doctor_fact(&mut report, "ssh.identity", ssh.identity);
+        replace_doctor_fact(&mut report, "ssh.config", ssh.config);
+        replace_doctor_fact(&mut report, "ssh.native_publish", ssh.native_publish);
+        report
     }
 
     pub async fn require_runtime_ready(&self) -> Result<(), ServiceError> {
@@ -1225,7 +1263,9 @@ impl<B: RuntimeBackend> SandboxService<B> {
             self.emit(operation_id, json!({"phase":"before_health","step":ProvisionStep::HealthCheck.as_str()}), sender).await?;
             self.provisioner.health_check(id).await?;
             self.emit(operation_id, json!({"phase":"after_health","desired_fingerprint":desired_fingerprint}), sender).await?;
-            let prior_ssh = prior.and_then(|record| record.ssh_resolution.clone());
+            let prior_ssh = prior
+                .filter(|_| inspected.is_some())
+                .and_then(|record| record.ssh_resolution.clone());
             let ssh_resolution = if spec.manifest().ssh().enabled() {
                 self.activate_and_persist_ssh(id, prior_ssh).await?
             } else {
@@ -2238,7 +2278,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             self.send_terminal(operation.id, &sender).await?;
             return Err(error);
         }
-        self.database(move |store| store.complete_operation(operation.id, ActualState::Absent))
+        self.database(move |store| store.complete_destroy_operation(operation.id))
             .await?;
         self.send_terminal(operation.id, &sender).await?;
         Ok(receiver.map(|events| Operation {
@@ -2992,6 +3032,13 @@ impl<B: RuntimeBackend> SandboxService<B> {
             return Err(error);
         }
         Ok(())
+    }
+}
+
+fn replace_doctor_fact(report: &mut DoctorReport, id: &str, fact: DoctorFact) {
+    if let Some(check) = report.checks.iter_mut().find(|check| check.id == id) {
+        check.status = fact.status;
+        check.detail = fact.detail;
     }
 }
 

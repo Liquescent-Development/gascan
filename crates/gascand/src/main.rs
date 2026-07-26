@@ -8,7 +8,7 @@ use gascan_core::runtime::RuntimeBackend;
 use gascand::{
     BackendSelection, Daemon, DaemonConfig, DoctorState, ErrorDiagnostics, ProvisionRequest,
     ProvisionResolution, Provisioner, SandboxApi, SandboxService, ServiceError, SocketPaths,
-    SshPaths, Store, backend_selection, ssh_doctor_facts, ssh_doctor_facts_for_paths,
+    SshPaths, Store, backend_selection,
 };
 use std::{sync::Arc, time::Duration};
 
@@ -17,6 +17,12 @@ struct ConfiguredProvisioner {
     fail: bool,
     rollback_failure_runtime: Option<FakeRuntime>,
 }
+
+struct DaemonSshConfig {
+    e2e_paths: Option<SshPaths>,
+    refresh_doctor: bool,
+}
+
 #[async_trait::async_trait]
 impl Provisioner for ConfiguredProvisioner {
     async fn provision(
@@ -69,10 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fake_requested = false;
     match backend_selection(fake_requested) {
         BackendSelection::Apple => {
-            let doctor = DoctorState::collect(
-                Duration::from_secs(60),
-                production_doctor_report(e2e_ssh_paths.clone()),
-            );
+            let doctor = DoctorState::collect(Duration::from_secs(60), production_doctor_report());
             let attach = gascan_apple::AppleAttach::configured_from_environment()?;
             run_daemon(
                 AppleBackend::with_attach(ProcessRunner, attach),
@@ -85,7 +88,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     rollback_failure_runtime: None,
                 },
                 doctor,
-                e2e_ssh_paths,
+                DaemonSshConfig {
+                    e2e_paths: e2e_ssh_paths,
+                    refresh_doctor: true,
+                },
             )
             .await
         }
@@ -121,6 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .await;
                 });
             }
+            let refresh_ssh_doctor = e2e_ssh_paths.is_some();
             run_daemon(
                 runtime.clone(),
                 store,
@@ -134,7 +141,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .then_some(runtime),
                 },
                 DoctorState::ready(DoctorFacts::all_supported_for_tests().into_report()),
-                e2e_ssh_paths,
+                DaemonSshConfig {
+                    e2e_paths: e2e_ssh_paths,
+                    refresh_doctor: refresh_ssh_doctor,
+                },
             )
             .await
         }
@@ -148,7 +158,7 @@ async fn run_daemon<B: RuntimeBackend + 'static>(
     idle_timeout: Duration,
     provisioner: ConfiguredProvisioner,
     doctor: DoctorState,
-    e2e_ssh_paths: Option<SshPaths>,
+    ssh: DaemonSshConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let candidate_image = if option_env!("CARGO_BIN_NAME") == Some("gascan-e2e-daemon") {
         std::env::var("GASCAN_E2E_CANDIDATE_IMAGE").ok()
@@ -167,12 +177,13 @@ async fn run_daemon<B: RuntimeBackend + 'static>(
             SandboxService::new_with_doctor_state(runtime, store, Arc::new(provisioner), doctor)
         }
     };
+    service = service.with_ssh_doctor_refresh(ssh.refresh_doctor);
     #[cfg(debug_assertions)]
-    if let Some(ssh_paths) = e2e_ssh_paths {
+    if let Some(ssh_paths) = ssh.e2e_paths {
         service = service.with_ssh_paths_for_e2e(ssh_paths);
     }
     #[cfg(not(debug_assertions))]
-    let _ = e2e_ssh_paths;
+    let _ = ssh.e2e_paths;
     let service = Arc::new(service);
     let _ = service.reconcile().await?;
     let config = DaemonConfig::new(paths, idle_timeout);
@@ -199,7 +210,7 @@ fn e2e_ssh_paths() -> Result<Option<SshPaths>, Box<dyn std::error::Error>> {
     Ok(None)
 }
 
-async fn production_doctor_report(e2e_ssh_paths: Option<SshPaths>) -> DoctorReport {
+async fn production_doctor_report() -> DoctorReport {
     let mut facts = DoctorFacts::unavailable("evidence was not collected");
     facts.architecture = architecture_fact(std::env::consts::ARCH);
     facts.macos = macos_fact();
@@ -312,18 +323,6 @@ async fn production_doctor_report(e2e_ssh_paths: Option<SshPaths>) -> DoctorRepo
             "workspace was not accessed because an earlier runtime prerequisite failed",
         );
     }
-    let native_publish = facts.loopback_publish.status == gascan_core::doctor::DoctorStatus::Pass;
-    let ssh = match e2e_ssh_paths {
-        Some(paths) => {
-            ssh_doctor_facts_for_paths(&paths, std::path::Path::new("/usr/bin/ssh"), native_publish)
-                .await
-        }
-        None => ssh_doctor_facts(native_publish).await,
-    };
-    facts.ssh_client = ssh.client;
-    facts.ssh_identity = ssh.identity;
-    facts.ssh_config = ssh.config;
-    facts.ssh_native_publish = ssh.native_publish;
     facts.into_report()
 }
 

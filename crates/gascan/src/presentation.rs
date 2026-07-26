@@ -146,8 +146,9 @@ pub(crate) fn render_doctor(checks: &[DoctorCheck], capabilities: OutputCapabili
                 .map_or(check.id.as_str(), |(_, id)| id);
             let check_heading = styled_heading(&humanize(check_id), "✗", false, capabilities);
             let _ = writeln!(output, "    {check_heading}");
-            if !check.detail.is_empty() {
-                let _ = writeln!(output, "      {}", check.detail);
+            let detail = human_doctor_detail(check);
+            if !detail.is_empty() {
+                let _ = writeln!(output, "      {detail}");
             }
             if !check.remedy.is_empty() {
                 let _ = writeln!(output, "      Fix: {}", check.remedy);
@@ -155,6 +156,14 @@ pub(crate) fn render_doctor(checks: &[DoctorCheck], capabilities: OutputCapabili
         }
     }
     output
+}
+
+fn human_doctor_detail(check: &DoctorCheck) -> &str {
+    match check.id.as_str() {
+        "ssh.identity" => "Managed SSH identity is missing, incomplete, or unsafe",
+        "ssh.config" => "Managed SSH configuration is missing, inconsistent, or unsafe",
+        _ => &check.detail,
+    }
 }
 
 pub(crate) fn render_status(
@@ -582,6 +591,32 @@ mod tests {
         assert!(output.contains("Fix: install a supported runtime"));
         assert!(!output.contains("passing release detail"));
         assert!(!output.contains("passing version detail"));
+    }
+
+    #[test]
+    fn failed_ssh_checks_hide_managed_paths_and_raw_errors() {
+        let checks = vec![
+            check(
+                "ssh.identity",
+                "fail",
+                "managed SSH identity at /Users/example/.config/gascan/ssh/identity_ed25519 is unsafe: private-key-sentinel",
+                "restore the managed identity",
+            ),
+            check(
+                "ssh.config",
+                "fail",
+                "generated SSH config at /Users/example/.config/gascan/ssh/config was rejected: raw-openssh-error",
+                "regenerate the managed config",
+            ),
+        ];
+
+        let output = render_doctor(&checks, OutputCapabilities::plain());
+
+        assert!(output.contains("Managed SSH identity is missing, incomplete, or unsafe"));
+        assert!(output.contains("Managed SSH configuration is missing, inconsistent, or unsafe"));
+        assert!(!output.contains("/Users/example"));
+        assert!(!output.contains("private-key-sentinel"));
+        assert!(!output.contains("raw-openssh-error"));
     }
 
     #[test]

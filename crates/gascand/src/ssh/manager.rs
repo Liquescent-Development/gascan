@@ -32,7 +32,7 @@ pub(crate) const HOST_KEY_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_HOST_KEY_OUTPUT: usize = 16 * 1024;
 const HOST_KEY_PATH: &str = "/home/workspace/.config/gascan/ssh/host/ssh_host_ed25519_key.pub";
 type PublicationLock = Arc<tokio::sync::Mutex<()>>;
-type PublicationGuard = OwnedMutexGuard<()>;
+pub(crate) type PublicationGuard = OwnedMutexGuard<()>;
 static PUBLICATION_LOCKS: OnceLock<Mutex<HashMap<Utf8PathBuf, Weak<tokio::sync::Mutex<()>>>>> =
     OnceLock::new();
 
@@ -125,6 +125,28 @@ impl PublishedSshSnapshot {
             )),
             None => Ok(None),
         }
+    }
+
+    pub(crate) fn validate_exact(
+        &self,
+        expected: &[(&SandboxId, &SshResolution, Option<u16>)],
+    ) -> Result<(), ServiceError> {
+        if self.hosts.len() != expected.len() {
+            return Err(config_state(
+                "managed SSH publication differs from durable state",
+            ));
+        }
+        for (id, resolution, explicit_port) in expected {
+            let active = self.for_sandbox(id, Some(resolution))?.ok_or_else(|| {
+                config_state("managed SSH publication differs from durable state")
+            })?;
+            if explicit_port.is_some_and(|port| active.port != port) {
+                return Err(config_state(
+                    "managed SSH publication differs from durable state",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -299,6 +321,13 @@ impl SshManager {
         })
     }
 
+    pub(crate) async fn inspection_guard_for_paths(
+        &self,
+        paths: &SshPaths,
+    ) -> Result<PublicationGuard, ServiceError> {
+        publication_guard(paths).await
+    }
+
     pub(crate) async fn deactivate_for_paths(
         &self,
         id: &SandboxId,
@@ -398,7 +427,7 @@ fn enabled_resolution(active: &ActiveSsh) -> SshResolution {
     )
 }
 
-fn resolution_enabled(resolution: &SshResolution) -> bool {
+pub(crate) fn resolution_enabled(resolution: &SshResolution) -> bool {
     resolution.version == 1
         && resolution
             .details

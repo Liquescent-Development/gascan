@@ -116,6 +116,12 @@ pub(crate) struct SshTransportPolicy {
     host_port: Option<u16>,
 }
 
+pub(crate) struct SshDoctorRecord {
+    pub(crate) record: SandboxRecord,
+    pub(crate) transport: Option<SshTransportPolicy>,
+    pub(crate) operation_pending: bool,
+}
+
 impl SshTransportPolicy {
     pub(crate) const fn disabled() -> Self {
         Self {
@@ -133,6 +139,10 @@ impl SshTransportPolicy {
 
     pub(crate) const fn is_enabled(self) -> bool {
         self.enabled
+    }
+
+    pub(crate) const fn host_port(self) -> Option<u16> {
+        self.host_port
     }
 }
 
@@ -322,6 +332,40 @@ impl Store {
         collect_rows(rows)
     }
 
+    pub(crate) fn ssh_doctor_snapshot(&self) -> Result<Vec<SshDoctorRecord>, StoreError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let records = {
+            let mut statement = transaction.prepare(&format!("{SANDBOX_SELECT} ORDER BY id"))?;
+            let rows = statement.query_map([], sandbox_from_row)?;
+            collect_rows(rows)?
+        };
+        let mut snapshot = Vec::with_capacity(records.len());
+        for record in records {
+            let raw = transaction.query_row(
+                "SELECT ssh_transport_enabled, ssh_transport_host_port FROM sandboxes WHERE id = ?1",
+                [record.id.as_str()],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )?;
+            let transport = decode_ssh_transport_policy(raw)?;
+            let operation_pending = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM operations
+                    WHERE sandbox_id = ?1 AND status = ?2
+                )",
+                params![record.id.as_str(), OperationStatus::Pending.as_db()],
+                |row| row.get(0),
+            )?;
+            snapshot.push(SshDoctorRecord {
+                record,
+                transport,
+                operation_pending,
+            });
+        }
+        transaction.commit()?;
+        Ok(snapshot)
+    }
+
     pub fn begin_operation(
         &self,
         sandbox: &SandboxRecord,
@@ -365,8 +409,30 @@ impl Store {
         id: OperationId,
         actual_state: ActualState,
     ) -> Result<OperationRecord, StoreError> {
-        self.finish_operation(id, actual_state, OperationStatus::Completed, None, None)
-            .map(|(operation, _)| operation)
+        self.finish_operation(
+            id,
+            actual_state,
+            OperationStatus::Completed,
+            None,
+            None,
+            false,
+        )
+        .map(|(operation, _)| operation)
+    }
+
+    pub(crate) fn complete_destroy_operation(
+        &self,
+        id: OperationId,
+    ) -> Result<OperationRecord, StoreError> {
+        self.finish_operation(
+            id,
+            ActualState::Absent,
+            OperationStatus::Completed,
+            None,
+            None,
+            true,
+        )
+        .map(|(operation, _)| operation)
     }
 
     pub(crate) fn complete_operation_with_event(
@@ -374,7 +440,14 @@ impl Store {
         id: OperationId,
         actual_state: ActualState,
     ) -> Result<(OperationRecord, OperationEvent), StoreError> {
-        self.finish_operation(id, actual_state, OperationStatus::Completed, None, None)
+        self.finish_operation(
+            id,
+            actual_state,
+            OperationStatus::Completed,
+            None,
+            None,
+            false,
+        )
     }
 
     pub fn fail_operation(
@@ -401,6 +474,7 @@ impl Store {
             OperationStatus::Failed,
             Some(error_code.into()),
             Some(error_details),
+            false,
         )
     }
 
@@ -486,6 +560,7 @@ impl Store {
         status: OperationStatus,
         error_code: Option<String>,
         error_details: Option<Value>,
+        clear_ssh_trust: bool,
     ) -> Result<(OperationRecord, OperationEvent), StoreError> {
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -499,18 +574,46 @@ impl Store {
         )?;
         let current_state = ActualState::from_db(&current_state)?;
         validate_terminal_actual_transition(current_state, actual_state, operation.kind, status)?;
+        if clear_ssh_trust
+            && (operation.kind != OperationKind::Destroy
+                || status != OperationStatus::Completed
+                || actual_state != ActualState::Absent)
+        {
+            return Err(StoreError::InvalidTransition {
+                from: operation.kind.as_db().to_owned(),
+                to: "clear_ssh_trust".to_owned(),
+            });
+        }
         let details_json = error_details
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
-        transaction.execute(
-            "UPDATE sandboxes SET actual_state = ?1, updated_at_millis = ?2 WHERE id = ?3",
-            params![
-                actual_state.as_db(),
-                current_time_millis()?,
-                operation.sandbox_id.as_str()
-            ],
-        )?;
+        if clear_ssh_trust {
+            transaction.execute(
+                "UPDATE sandboxes
+                 SET actual_state = ?1,
+                     ssh_resolution_version = NULL,
+                     ssh_resolution_details = NULL,
+                     ssh_transport_enabled = NULL,
+                     ssh_transport_host_port = NULL,
+                     updated_at_millis = ?2
+                 WHERE id = ?3",
+                params![
+                    actual_state.as_db(),
+                    current_time_millis()?,
+                    operation.sandbox_id.as_str()
+                ],
+            )?;
+        } else {
+            transaction.execute(
+                "UPDATE sandboxes SET actual_state = ?1, updated_at_millis = ?2 WHERE id = ?3",
+                params![
+                    actual_state.as_db(),
+                    current_time_millis()?,
+                    operation.sandbox_id.as_str()
+                ],
+            )?;
+        }
         transaction.execute(
             "UPDATE operations SET status = ?1, error_code = ?2, error_details = ?3 WHERE id = ?4",
             params![status.as_db(), error_code, details_json, id.get()],

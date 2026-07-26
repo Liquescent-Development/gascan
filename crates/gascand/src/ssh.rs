@@ -253,6 +253,18 @@ impl StateDirectory {
         Ok((bytes, identity))
     }
 
+    pub(crate) fn has_entries(&self) -> Result<bool, SshError> {
+        let mut directory = rustix::fs::Dir::read_from(&self.fd)
+            .map_err(|error| SshError::io("read managed SSH directory", error))?;
+        while let Some(entry) = directory.read() {
+            let entry = entry.map_err(|error| SshError::io("read managed SSH directory", error))?;
+            if !matches!(entry.file_name().to_bytes(), b"." | b"..") {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub(crate) fn create_staging(&self, name: &str, mode: u16) -> Result<File, SshError> {
         let fd = rustix::fs::openat(
             &self.fd,
@@ -343,6 +355,13 @@ impl StateDirectory {
             Ok(path.join(name))
         }
     }
+}
+
+pub(crate) fn managed_ssh_artifacts_present(paths: &SshPaths) -> Result<bool, SshError> {
+    StateDirectory::open_existing(paths)?
+        .map(|directory| directory.has_entries())
+        .transpose()
+        .map(Option::unwrap_or_default)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

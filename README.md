@@ -160,8 +160,9 @@ gascan ssh
 gascan ssh -- git status
 ```
 
-Arguments after `--` are passed directly to OpenSSH as the remote command,
-without a shell joining or reinterpreting them.
+Gas Can preserves each argument after `--` as a discrete local OpenSSH
+argument and never invokes a local shell. Standard OpenSSH remote-command and
+remote-shell semantics still apply inside the sandbox.
 
 The host port is selected automatically unless `[ssh].host_port` requests a
 specific port. An unavailable explicit port fails with

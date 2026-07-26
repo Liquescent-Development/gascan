@@ -775,6 +775,130 @@ async fn ssh_destroy_removes_alias_and_sandbox_resources_but_retains_client_iden
 }
 
 #[tokio::test]
+async fn ssh_up_after_destroy_accepts_new_host_key_and_replaces_durable_trust() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let state_path = root.join("state.db");
+    let paths = ssh_paths(root, "ssh-destroy-recreate")?;
+    let first_host_public_key = generated_public_key(root, "host-destroy-recreate-first").await?;
+    let second_host_public_key = generated_public_key(root, "host-destroy-recreate-second").await?;
+    assert_ne!(first_host_public_key, second_host_public_key);
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(
+            format!("{first_host_public_key}\n").into_bytes(),
+            Vec::new(),
+            0,
+        )
+        .await;
+    runtime.queue_created_ssh_host_port(23_460).await;
+    let service = test_service(runtime.clone(), root, paths.clone())?;
+    let desired = networked_ssh_spec("ssh-destroy-recreate", root, None)?;
+
+    service.up(UpRequest::new(desired.clone())).await?;
+    let first_resolution = service
+        .status(desired.id())?
+        .ok_or("first sandbox record")?
+        .ssh_resolution
+        .ok_or("first SSH resolution")?;
+
+    service.destroy(desired.id()).await?;
+
+    let destroyed = service.status(desired.id())?.ok_or("destroyed record")?;
+    assert!(destroyed.ssh_resolution.is_none());
+    let connection = rusqlite::Connection::open(state_path)?;
+    let durable: (Option<i64>, Option<String>, Option<i64>, Option<i64>) = connection.query_row(
+        "SELECT ssh_resolution_version, ssh_resolution_details,
+                ssh_transport_enabled, ssh_transport_host_port
+         FROM sandboxes WHERE id = ?1",
+        [desired.id().as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    assert_eq!(durable, (None, None, None, None));
+
+    runtime
+        .set_exec_result(
+            format!("{second_host_public_key}\n").into_bytes(),
+            Vec::new(),
+            0,
+        )
+        .await;
+    runtime.queue_created_ssh_host_port(23_461).await;
+    service.up(UpRequest::new(desired.clone())).await?;
+
+    let second_resolution = service
+        .status(desired.id())?
+        .ok_or("recreated sandbox record")?
+        .ssh_resolution
+        .ok_or("recreated SSH resolution")?;
+    assert_ne!(
+        first_resolution.details["host_key_fingerprint"],
+        second_resolution.details["host_key_fingerprint"]
+    );
+    assert_eq!(
+        first_resolution.details["client_key_fingerprint"],
+        second_resolution.details["client_key_fingerprint"]
+    );
+    let active = SshManager
+        .published_for_paths(desired.id(), Some(&second_resolution), &paths)
+        .await?
+        .ok_or("recreated SSH alias")?;
+    assert_eq!(active.port, 23_461);
+    Ok(())
+}
+
+#[tokio::test]
+async fn fresh_ssh_create_never_enforces_stale_fingerprints_without_owned_runtime() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-fresh-stale-trust")?;
+    let first_host_public_key = generated_public_key(root, "host-fresh-stale-first").await?;
+    let second_host_public_key = generated_public_key(root, "host-fresh-stale-second").await?;
+    assert_ne!(first_host_public_key, second_host_public_key);
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(
+            format!("{first_host_public_key}\n").into_bytes(),
+            Vec::new(),
+            0,
+        )
+        .await;
+    let service = test_service(runtime.clone(), root, paths)?;
+    let desired = networked_ssh_spec("ssh-fresh-stale-trust", root, None)?;
+
+    service.up(UpRequest::new(desired.clone())).await?;
+    let stale_resolution = service
+        .status(desired.id())?
+        .ok_or("first sandbox record")?
+        .ssh_resolution
+        .ok_or("first SSH resolution")?;
+    service.destroy(desired.id()).await?;
+    service
+        .store()
+        .update_ssh_resolution(desired.id(), stale_resolution.clone())?;
+    runtime
+        .set_exec_result(
+            format!("{second_host_public_key}\n").into_bytes(),
+            Vec::new(),
+            0,
+        )
+        .await;
+
+    service.up(UpRequest::new(desired.clone())).await?;
+
+    let fresh_resolution = service
+        .status(desired.id())?
+        .ok_or("fresh sandbox record")?
+        .ssh_resolution
+        .ok_or("fresh SSH resolution")?;
+    assert_ne!(
+        stale_resolution.details["host_key_fingerprint"],
+        fresh_resolution.details["host_key_fingerprint"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn ssh_host_key_failure_publishes_no_alias_and_rolls_back_created_resources() -> TestResult {
     let temp = tempfile::tempdir()?;
     let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
@@ -918,6 +1042,56 @@ async fn concurrent_ssh_activations_publish_both_aliases_without_lost_update() -
     let config = std::fs::read_to_string(paths.config())?;
     assert!(config.contains("Host gascan-ssh-concurrent-first"));
     assert!(config.contains("Host gascan-ssh-concurrent-second"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn doctor_does_not_observe_ssh_activation_halfway_through_publication() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let paths = ssh_paths(root, "ssh-doctor-activation")?;
+    let host_public_key = generated_public_key(root, "host-doctor-activation").await?;
+    let desired = networked_ssh_spec("ssh-doctor-activation", root, Some(26_151))?;
+    let entered = root.join("readiness-entered");
+    let release = root.join("release-readiness");
+    let readiness =
+        gated_readiness_program(root, "gate-doctor-readiness", 26_151, &entered, &release)?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let service = Arc::new(service_with_readiness(runtime, root, paths, readiness)?);
+
+    let up = {
+        let service = Arc::clone(&service);
+        tokio::spawn(async move { service.up(UpRequest::new(desired)).await })
+    };
+    wait_for_path(&entered).await?;
+    let doctor = {
+        let service = Arc::clone(&service);
+        tokio::spawn(async move { service.doctor_report().await })
+    };
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    assert!(
+        !doctor.is_finished(),
+        "doctor returned while SSH publication was incomplete"
+    );
+
+    std::fs::write(&release, b"release")?;
+    up.await??;
+    let during = doctor.await?;
+    let during_config = during.check("ssh.config").ok_or("ssh.config")?;
+    assert_ne!(
+        during_config.status,
+        gascan_core::doctor::DoctorStatus::Fail,
+        "{}",
+        during_config.detail
+    );
+    let settled = service.doctor_report().await;
+    assert_eq!(
+        settled.check("ssh.config").ok_or("ssh.config")?.status,
+        gascan_core::doctor::DoctorStatus::Pass
+    );
     Ok(())
 }
 
