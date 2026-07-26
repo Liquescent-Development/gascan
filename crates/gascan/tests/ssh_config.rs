@@ -222,10 +222,7 @@ fn installer_creates_exact_private_modes() -> TestResult {
 fn conventional_user_config_mode_is_accepted_and_preserved() -> TestResult {
     let (_temp, config) = fixture()?;
     write_user_config(&config, b"Host personal\n")?;
-    fs::set_permissions(
-        config.user_config_path(),
-        fs::Permissions::from_mode(0o644),
-    )?;
+    fs::set_permissions(config.user_config_path(), fs::Permissions::from_mode(0o644))?;
 
     assert_eq!(config.install()?, IncludeChange::Changed);
     assert_eq!(

@@ -482,10 +482,7 @@ fn file_identity(
     Ok(Some(FileIdentity::from_stat(&stat)))
 }
 
-fn validate_file_stat(
-    stat: &rustix::fs::Stat,
-    expected_uid: u32,
-) -> Result<(), SshConfigError> {
+fn validate_file_stat(stat: &rustix::fs::Stat, expected_uid: u32) -> Result<(), SshConfigError> {
     if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
         || stat.st_uid != expected_uid
         || stat.st_nlink != 1
