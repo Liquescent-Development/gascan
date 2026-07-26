@@ -1,5 +1,6 @@
 use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+use std::cell::Cell;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read as _, Write as _};
@@ -38,13 +39,21 @@ pub enum OfferAnswer {
 
 #[derive(Debug)]
 pub struct SshConfigError {
+    kind: SshConfigErrorKind,
     message: &'static str,
     source: Option<std::io::Error>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SshConfigErrorKind {
+    Unsafe,
+    UpdateFailed,
 }
 
 impl SshConfigError {
     fn unsafe_path(message: &'static str) -> Self {
         Self {
+            kind: SshConfigErrorKind::Unsafe,
             message,
             source: None,
         }
@@ -52,8 +61,25 @@ impl SshConfigError {
 
     fn io(message: &'static str, source: impl Into<std::io::Error>) -> Self {
         Self {
+            kind: SshConfigErrorKind::UpdateFailed,
             message,
             source: Some(source.into()),
+        }
+    }
+
+    fn open_path(message: &'static str, source: rustix::io::Errno) -> Self {
+        if matches!(source, rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) {
+            Self::unsafe_path("SSH configuration path type is unsafe")
+        } else {
+            Self::io(message, source)
+        }
+    }
+
+    #[must_use]
+    pub const fn stable_code(&self) -> &'static str {
+        match self.kind {
+            SshConfigErrorKind::Unsafe => gascan_proto::error_code::SSH_CONFIG_UNSAFE,
+            SshConfigErrorKind::UpdateFailed => gascan_proto::error_code::SSH_CONFIG_UPDATE_FAILED,
         }
     }
 }
@@ -79,7 +105,6 @@ impl std::error::Error for SshConfigError {
 #[derive(Clone, Debug)]
 pub struct SshConfig {
     home: PathBuf,
-    config_home: PathBuf,
     ssh_directory: PathBuf,
     user_config: PathBuf,
     managed_config: PathBuf,
@@ -104,20 +129,11 @@ impl SshConfig {
             home.ok_or_else(|| SshConfigError::unsafe_path("HOME is required for SSH setup"))?,
         )?;
         let managed_config = managed_config_path(xdg_config_home, Some(&home))?;
-        let config_home = managed_config
-            .parent()
-            .and_then(Path::parent)
-            .and_then(Path::parent)
-            .ok_or_else(|| {
-                SshConfigError::unsafe_path("managed SSH configuration path is invalid")
-            })?
-            .to_owned();
         let ssh_directory = home.join(".ssh");
         Ok(Self {
             user_config: ssh_directory.join(USER_CONFIG),
             ssh_directory,
             home,
-            config_home,
             managed_config,
             expected_uid: rustix::process::geteuid().as_raw(),
         })
@@ -173,7 +189,15 @@ impl SshConfig {
         let mut replacement = Vec::with_capacity(block.len() + current.len());
         replacement.extend_from_slice(block);
         replacement.extend_from_slice(&current);
-        atomic_replace(&directory, USER_CONFIG, identity, &replacement)?;
+        atomic_replace(
+            &directory,
+            USER_CONFIG,
+            identity.map(|identity| PreviousFile {
+                identity,
+                contents: &current,
+            }),
+            &replacement,
+        )?;
         Ok(IncludeChange::Changed)
     }
 
@@ -191,7 +215,15 @@ impl SshConfig {
         let mut replacement = Vec::with_capacity(current.len() - (end - start));
         replacement.extend_from_slice(&current[..start]);
         replacement.extend_from_slice(&current[end..]);
-        atomic_replace(&directory, USER_CONFIG, Some(identity), &replacement)?;
+        atomic_replace(
+            &directory,
+            USER_CONFIG,
+            Some(PreviousFile {
+                identity,
+                contents: &current,
+            }),
+            &replacement,
+        )?;
         Ok(IncludeChange::Changed)
     }
 
@@ -206,38 +238,47 @@ impl SshConfig {
         let directory = self
             .open_managed_ssh(true)?
             .ok_or_else(|| SshConfigError::unsafe_path("cannot create managed SSH state"))?;
-        let previous =
-            read_file(&directory, OFFER_RECEIPT, FILE_MODE)?.map(|(_, identity)| identity);
-        atomic_replace(&directory, OFFER_RECEIPT, previous, b"answered\n")
+        let previous = read_file(&directory, OFFER_RECEIPT, FILE_MODE)?;
+        atomic_replace(
+            &directory,
+            OFFER_RECEIPT,
+            previous.as_ref().map(|(contents, identity)| PreviousFile {
+                identity: *identity,
+                contents,
+            }),
+            b"answered\n",
+        )
     }
 
     fn open_user_ssh(&self, create: bool) -> Result<Option<SecureDirectory>, SshConfigError> {
         let home = open_directory(&self.home, self.expected_uid, false)?;
-        open_child_directory(&home.fd, ".ssh", self.expected_uid, create)
+        open_child_directory(&home.fd, ".ssh", self.expected_uid, create, true)
     }
 
     fn open_managed_ssh(&self, create: bool) -> Result<Option<SecureDirectory>, SshConfigError> {
-        let config_home = open_directory(&self.config_home, self.expected_uid, false)?;
-        let Some(gascan) =
-            open_child_directory(&config_home.fd, "gascan", self.expected_uid, create)?
+        let home = open_directory(&self.home, self.expected_uid, false)?;
+        let Some(config_home) =
+            open_child_directory(&home.fd, ".config", self.expected_uid, create, false)?
         else {
             return Ok(None);
         };
-        open_child_directory(&gascan.fd, "ssh", self.expected_uid, create)
+        let Some(gascan) =
+            open_child_directory(&config_home.fd, "gascan", self.expected_uid, create, true)?
+        else {
+            return Ok(None);
+        };
+        open_child_directory(&gascan.fd, "ssh", self.expected_uid, create, true)
     }
 }
 
 pub fn managed_config_path(
-    xdg_config_home: Option<&Path>,
+    _xdg_config_home: Option<&Path>,
     home: Option<&Path>,
 ) -> Result<PathBuf, SshConfigError> {
-    let config_home = match xdg_config_home {
-        Some(path) => validated_absolute(path)?,
-        None => validated_absolute(home.ok_or_else(|| {
-            SshConfigError::unsafe_path("HOME is required when XDG_CONFIG_HOME is not configured")
-        })?)?
-        .join(".config"),
-    };
+    let config_home = validated_absolute(
+        home.ok_or_else(|| SshConfigError::unsafe_path("HOME is required for SSH setup"))?,
+    )?
+    .join(".config");
     if config_home.as_os_str().as_encoded_bytes().contains(&b'$') {
         return Err(SshConfigError::unsafe_path(
             "managed SSH path contains OpenSSH expansion",
@@ -280,6 +321,12 @@ struct FileIdentity {
     inode: u64,
 }
 
+#[derive(Clone, Copy)]
+struct PreviousFile<'a> {
+    identity: FileIdentity,
+    contents: &'a [u8],
+}
+
 impl FileIdentity {
     fn from_stat(stat: &rustix::fs::Stat) -> Self {
         Self {
@@ -304,7 +351,7 @@ fn open_directory(
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|error| SshConfigError::io("open SSH directory", error))?;
+    .map_err(|error| SshConfigError::open_path("open SSH directory", error))?;
     let stat = rustix::fs::fstat(&fd)
         .map_err(|error| SshConfigError::io("inspect SSH directory", error))?;
     validate_directory_stat(&stat, expected_uid, exact_private_mode)?;
@@ -316,6 +363,7 @@ fn open_child_directory(
     name: &str,
     expected_uid: u32,
     create: bool,
+    exact_private_mode: bool,
 ) -> Result<Option<SecureDirectory>, SshConfigError> {
     let fd = match rustix::fs::openat(
         parent,
@@ -334,16 +382,16 @@ fn open_child_directory(
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             )
-            .map_err(|error| SshConfigError::io("open new SSH directory", error))?;
+            .map_err(|error| SshConfigError::open_path("open new SSH directory", error))?;
             rustix::fs::fchmod(&fd, Mode::from_raw_mode(DIRECTORY_MODE))
                 .map_err(|error| SshConfigError::io("secure new SSH directory", error))?;
             fd
         }
-        Err(error) => return Err(SshConfigError::io("open SSH directory", error)),
+        Err(error) => return Err(SshConfigError::open_path("open SSH directory", error)),
     };
     let stat = rustix::fs::fstat(&fd)
         .map_err(|error| SshConfigError::io("inspect SSH directory", error))?;
-    validate_directory_stat(&stat, expected_uid, true)?;
+    validate_directory_stat(&stat, expected_uid, exact_private_mode)?;
     Ok(Some(SecureDirectory { fd, expected_uid }))
 }
 
@@ -379,7 +427,7 @@ fn read_file(
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|error| SshConfigError::io("open SSH configuration", error))?;
+    .map_err(|error| SshConfigError::open_path("open SSH configuration", error))?;
     let stat = rustix::fs::fstat(&fd)
         .map_err(|error| SshConfigError::io("inspect open SSH configuration", error))?;
     validate_file_stat(&stat, directory.expected_uid, required_mode)?;
@@ -440,15 +488,29 @@ fn validate_file_stat(
 fn atomic_replace(
     directory: &SecureDirectory,
     target: &str,
-    previous: Option<FileIdentity>,
+    previous: Option<PreviousFile<'_>>,
     contents: &[u8],
 ) -> Result<(), SshConfigError> {
+    atomic_replace_with_hook(directory, target, previous, contents, || Ok(()))
+}
+
+fn atomic_replace_with_hook<F>(
+    directory: &SecureDirectory,
+    target: &str,
+    previous: Option<PreviousFile<'_>>,
+    contents: &[u8],
+    before_publish: F,
+) -> Result<(), SshConfigError>
+where
+    F: FnOnce() -> Result<(), SshConfigError>,
+{
     if contents.len() as u64 > MAX_CONFIG_BYTES {
         return Err(SshConfigError::unsafe_path(
             "SSH configuration is too large",
         ));
     }
     let staging = staging_name()?;
+    let cleanup_staging = Cell::new(true);
     let fd = rustix::fs::openat(
         &directory.fd,
         &staging,
@@ -462,6 +524,7 @@ fn atomic_replace(
         let stat = rustix::fs::fstat(&fd)
             .map_err(|error| SshConfigError::io("inspect SSH configuration staging file", error))?;
         validate_file_stat(&stat, directory.expected_uid, FILE_MODE)?;
+        let staged_identity = FileIdentity::from_stat(&stat);
         let mut file = File::from(fd);
         file.write_all(contents)
             .map_err(|error| SshConfigError::io("write SSH configuration", error))?;
@@ -469,14 +532,59 @@ fn atomic_replace(
             .map_err(|error| SshConfigError::io("flush SSH configuration", error))?;
         file.sync_all()
             .map_err(|error| SshConfigError::io("sync SSH configuration", error))?;
-        if file_identity(directory, target, FILE_MODE)? != previous {
+        if file_identity(directory, target, FILE_MODE)?
+            != previous.map(|previous| previous.identity)
+        {
             return Err(SshConfigError::unsafe_path(
                 "SSH configuration changed before replacement",
             ));
         }
+        before_publish()?;
         match previous {
-            Some(_) => rustix::fs::renameat(&directory.fd, &staging, &directory.fd, target)
-                .map_err(|error| SshConfigError::io("replace SSH configuration", error))?,
+            Some(previous) => {
+                rustix::fs::renameat_with(
+                    &directory.fd,
+                    &staging,
+                    &directory.fd,
+                    target,
+                    rustix::fs::RenameFlags::EXCHANGE,
+                )
+                .map_err(|error| SshConfigError::io("exchange SSH configuration", error))?;
+                cleanup_staging.set(false);
+                let preserved = read_file(directory, staging.to_string_lossy().as_ref(), FILE_MODE)
+                    .is_ok_and(|observed| {
+                        observed.is_some_and(|(bytes, identity)| {
+                            identity == previous.identity && bytes == previous.contents
+                        })
+                    });
+                if !preserved {
+                    rustix::fs::renameat_with(
+                        &directory.fd,
+                        &staging,
+                        &directory.fd,
+                        target,
+                        rustix::fs::RenameFlags::EXCHANGE,
+                    )
+                    .map_err(|error| {
+                        SshConfigError::io("restore concurrently changed SSH configuration", error)
+                    })?;
+                    cleanup_staging.set(true);
+                    rustix::fs::fsync(&directory.fd).map_err(|error| {
+                        SshConfigError::io("sync restored SSH directory", error)
+                    })?;
+                    return Err(SshConfigError::unsafe_path(
+                        "SSH configuration changed during replacement",
+                    ));
+                }
+                if file_identity(directory, target, FILE_MODE)? != Some(staged_identity) {
+                    return Err(SshConfigError::unsafe_path(
+                        "SSH configuration changed after replacement",
+                    ));
+                }
+                rustix::fs::unlinkat(&directory.fd, &staging, AtFlags::empty()).map_err(
+                    |error| SshConfigError::io("remove previous SSH configuration", error),
+                )?;
+            }
             None => rustix::fs::renameat_with(
                 &directory.fd,
                 &staging,
@@ -493,7 +601,7 @@ fn atomic_replace(
         })?;
         Ok(())
     })();
-    if result.is_err() {
+    if result.is_err() && cleanup_staging.get() {
         let _ = rustix::fs::unlinkat(&directory.fd, &staging, AtFlags::empty());
     }
     result
@@ -564,7 +672,12 @@ fn validated_absolute(path: &Path) -> Result<PathBuf, SshConfigError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SshConfigError, validate_file_stat};
+    use super::{
+        FILE_MODE, INCLUDE_BLOCK_LF, PreviousFile, SshConfig, SshConfigError, USER_CONFIG,
+        atomic_replace_with_hook, read_file, validate_file_stat,
+    };
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
 
     #[test]
     fn file_validation_rejects_foreign_ownership() -> Result<(), Box<dyn std::error::Error>> {
@@ -583,6 +696,53 @@ mod tests {
             validate_file_stat(&stat, stat.st_uid.saturating_add(1), 0o600),
             Err(SshConfigError { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_replacement_is_restored_instead_of_being_overwritten()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().join("home");
+        fs::create_dir(&home)?;
+        let config = SshConfig::for_environment(None, Some(&home))?;
+        fs::create_dir(config.ssh_directory_path())?;
+        fs::set_permissions(
+            config.ssh_directory_path(),
+            fs::Permissions::from_mode(0o700),
+        )?;
+        let original = b"Host original\n";
+        fs::write(config.user_config_path(), original)?;
+        fs::set_permissions(config.user_config_path(), fs::Permissions::from_mode(0o600))?;
+        let directory = config
+            .open_user_ssh(false)?
+            .ok_or("test SSH directory missing")?;
+        let (current, identity) =
+            read_file(&directory, USER_CONFIG, FILE_MODE)?.ok_or("test config missing")?;
+        let replacement = [INCLUDE_BLOCK_LF, current.as_slice()].concat();
+        let concurrent = b"Host concurrent-editor\n";
+        let concurrent_path = config.ssh_directory_path().join("concurrent");
+
+        let result = atomic_replace_with_hook(
+            &directory,
+            USER_CONFIG,
+            Some(PreviousFile {
+                identity,
+                contents: &current,
+            }),
+            &replacement,
+            || {
+                fs::write(&concurrent_path, concurrent)
+                    .map_err(|error| SshConfigError::io("write concurrent replacement", error))?;
+                fs::set_permissions(&concurrent_path, fs::Permissions::from_mode(0o600))
+                    .map_err(|error| SshConfigError::io("secure concurrent replacement", error))?;
+                fs::rename(&concurrent_path, config.user_config_path())
+                    .map_err(|error| SshConfigError::io("publish concurrent replacement", error))
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(config.user_config_path())?, concurrent);
         Ok(())
     }
 }

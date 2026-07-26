@@ -18,16 +18,16 @@ fn fixture() -> TestResult<(tempfile::TempDir, SshConfig)> {
 }
 
 #[test]
-fn managed_path_uses_absolute_xdg_or_home_config() -> TestResult {
+fn managed_path_always_matches_the_fixed_home_relative_include() -> TestResult {
     assert_eq!(
         managed_config_path(Some(Path::new("/tmp/xdg")), Some(Path::new("/tmp/home")))?,
-        PathBuf::from("/tmp/xdg/gascan/ssh/config")
+        PathBuf::from("/tmp/home/.config/gascan/ssh/config")
     );
     assert_eq!(
         managed_config_path(None, Some(Path::new("/tmp/home")))?,
         PathBuf::from("/tmp/home/.config/gascan/ssh/config")
     );
-    assert!(managed_config_path(Some(Path::new("relative")), None).is_err());
+    assert!(managed_config_path(Some(Path::new("/tmp/xdg")), None).is_err());
     Ok(())
 }
 
@@ -178,6 +178,50 @@ fn unsafe_ssh_directory_is_rejected_without_repairing_it() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn update_io_and_unsafe_path_failures_have_distinct_stable_codes() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let missing_home = temp.path().join("missing-home");
+    let missing = SshConfig::for_environment(None, Some(&missing_home))?;
+    assert_eq!(
+        missing
+            .install()
+            .expect_err("missing HOME must fail")
+            .stable_code(),
+        gascan_proto::error_code::SSH_CONFIG_UPDATE_FAILED
+    );
+
+    let (_temp, unsafe_config) = fixture()?;
+    fs::create_dir(unsafe_config.ssh_directory_path())?;
+    fs::set_permissions(
+        unsafe_config.ssh_directory_path(),
+        fs::Permissions::from_mode(0o755),
+    )?;
+    assert_eq!(
+        unsafe_config
+            .install()
+            .expect_err("unsafe directory must fail")
+            .stable_code(),
+        gascan_proto::error_code::SSH_CONFIG_UNSAFE
+    );
+
+    let symlink_temp = tempfile::tempdir()?;
+    let symlink_home = symlink_temp.path().join("home");
+    let symlink_target = symlink_temp.path().join("target");
+    fs::create_dir(&symlink_home)?;
+    fs::create_dir(&symlink_target)?;
+    std::os::unix::fs::symlink(&symlink_target, symlink_home.join(".ssh"))?;
+    let symlink_config = SshConfig::for_environment(None, Some(&symlink_home))?;
+    assert_eq!(
+        symlink_config
+            .install()
+            .expect_err("symlinked SSH directory must fail")
+            .stable_code(),
+        gascan_proto::error_code::SSH_CONFIG_UNSAFE
+    );
+    Ok(())
+}
+
 fn prepare_ssh_directory(config: &SshConfig) -> TestResult {
     fs::create_dir(config.ssh_directory_path())?;
     fs::set_permissions(
@@ -247,8 +291,36 @@ fn ssh_config_path_command_is_local_and_prints_the_absolute_managed_path() -> Te
     assert!(output.status.success(), "{output:?}");
     assert_eq!(
         output.stdout,
-        format!("{}\n", xdg.join("gascan/ssh/config").display()).as_bytes()
+        format!("{}\n", home.join(".config/gascan/ssh/config").display()).as_bytes()
     );
     assert!(output.stderr.is_empty());
+    Ok(())
+}
+
+#[test]
+fn custom_xdg_install_and_path_resolve_the_same_fixed_include_target() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let home = temp.path().join("home");
+    let xdg = temp.path().join("custom-xdg");
+    fs::create_dir(&home)?;
+    fs::create_dir(&xdg)?;
+
+    let install = std::process::Command::new(env!("CARGO_BIN_EXE_gascan"))
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .args(["ssh-config", "install"])
+        .output()?;
+    assert!(install.status.success(), "{install:?}");
+
+    let path = std::process::Command::new(env!("CARGO_BIN_EXE_gascan"))
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .args(["ssh-config", "path"])
+        .output()?;
+    assert!(path.status.success(), "{path:?}");
+    let printed = PathBuf::from(String::from_utf8(path.stdout)?.trim());
+    assert_eq!(printed, home.join(".config/gascan/ssh/config"));
+    assert_eq!(fs::read(home.join(".ssh/config"))?, INCLUDE_BLOCK_LF);
+    assert!(!xdg.join("gascan/ssh/config").exists());
     Ok(())
 }

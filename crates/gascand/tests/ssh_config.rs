@@ -18,8 +18,8 @@ fn root(temp: &TempDir) -> Result<std::path::PathBuf, std::io::Error> {
 }
 
 fn paths(temp: &TempDir) -> Result<SshPaths, Box<dyn std::error::Error>> {
-    let xdg = root(temp)?.join("xdg");
-    Ok(SshPaths::for_environment(Some(xdg.as_os_str()), None)?)
+    let home = root(temp)?;
+    Ok(SshPaths::for_environment(None, Some(home.as_os_str()))?)
 }
 
 fn host(alias: &str, port: u16, identity: &gascand::HostIdentity) -> ManagedSshHost {
@@ -736,6 +736,44 @@ async fn published_status_reads_only_the_matching_committed_alias() -> TestResul
             .published_for_paths(&id, Some(&expected), &paths)
             .await?,
         Some(managed.active)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn one_published_snapshot_serves_multiple_records_without_revalidating_identity() -> TestResult
+{
+    let temp = TempDir::new()?;
+    let paths = paths(&temp)?;
+    let identity = ensure_host_identity(&paths).await?;
+    let first_id = SandboxId::try_from("code-111111111111".to_owned())?;
+    let second_id = SandboxId::try_from("code-222222222222".to_owned())?;
+    let first = host(&format!("gascan-{first_id}"), 22221, &identity);
+    let second = host(&format!("gascan-{second_id}"), 22222, &identity);
+    publish_openssh_files(&paths, &identity, &[first.clone(), second.clone()])?;
+    let resolution = |active: &ActiveSsh| {
+        SshResolution::new(
+            1,
+            serde_json::json!({
+                "enabled": true,
+                "host_key_fingerprint": active.host_key_fingerprint,
+                "client_key_fingerprint": active.client_key_fingerprint,
+            }),
+        )
+    };
+    let first_resolution = resolution(&first.active);
+    let second_resolution = resolution(&second.active);
+
+    let snapshot = SshManager.published_snapshot_for_paths(&paths).await?;
+    fs::remove_file(paths.private_key().as_std_path())?;
+
+    assert_eq!(
+        snapshot.for_sandbox(&first_id, Some(&first_resolution))?,
+        Some(first.active)
+    );
+    assert_eq!(
+        snapshot.for_sandbox(&second_id, Some(&second_resolution))?,
+        Some(second.active)
     );
     Ok(())
 }

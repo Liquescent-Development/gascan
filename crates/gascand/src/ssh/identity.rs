@@ -440,16 +440,16 @@ mod tests {
     async fn private_key_descriptor_is_inherited_only_by_the_intended_child()
     -> Result<(), Box<dyn std::error::Error>> {
         let managed = tempfile::tempdir()?;
-        let managed_home = managed.path().canonicalize()?.join("xdg");
-        let paths = SshPaths::for_environment(Some(managed_home.as_os_str()), None)?;
+        let managed_home = managed.path().canonicalize()?;
+        let paths = SshPaths::for_environment(None, Some(managed_home.as_os_str()))?;
         ensure_host_identity(&paths)
             .await
             .map_err(|error| format!("prepare managed identity: {error}"))?;
 
         let replacement = tempfile::tempdir()?;
-        let replacement_home = replacement.path().canonicalize()?.join("xdg");
+        let replacement_home = replacement.path().canonicalize()?;
         let replacement_paths =
-            SshPaths::for_environment(Some(replacement_home.as_os_str()), None)?;
+            SshPaths::for_environment(None, Some(replacement_home.as_os_str()))?;
         ensure_host_identity(&replacement_paths)
             .await
             .map_err(|error| format!("prepare replacement identity: {error}"))?;

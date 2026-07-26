@@ -10,7 +10,9 @@ use gascan_core::sandbox::{SandboxError, SandboxId, SandboxSpec};
 use gascan_proto::v1;
 use gascan_proto::v1::gas_can_server::{GasCan, GasCanServer};
 use gascan_proto::{
-    API_MAJOR, API_MINOR, error_code, local_transport_security, validate_api_major,
+    API_MAJOR, API_MINOR, error_code, local_transport_security,
+    ssh_status::{SshState, classify as classify_ssh},
+    validate_api_major,
 };
 use std::io;
 use std::pin::Pin;
@@ -622,48 +624,79 @@ fn wire_status(
         updated_at: Some(timestamp_from_millis(record.updated_at_millis)),
         capabilities: Vec::new(),
         apply_requirements,
-        ssh: Some(wire_ssh_status(&record, active_ssh)),
+        ssh: wire_ssh_status(&record, active_ssh),
     }
 }
 
 fn wire_ssh_status(
     record: &crate::SandboxRecord,
     active: Option<&crate::ActiveSsh>,
-) -> v1::SshStatus {
-    let details = record
-        .ssh_resolution
-        .as_ref()
-        .filter(|resolution| resolution.version == 1)
-        .and_then(|resolution| resolution.details.as_object());
-    let enabled = details
-        .and_then(|details| details.get("enabled"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let expected_host = details
-        .and_then(|details| details.get("host_key_fingerprint"))
-        .and_then(serde_json::Value::as_str);
-    let expected_client = details
-        .and_then(|details| details.get("client_key_fingerprint"))
-        .and_then(serde_json::Value::as_str);
-    let expected_alias = format!("gascan-{}", record.id);
-    let active = active.filter(|active| {
-        enabled
-            && record.actual_state == ActualState::Running
-            && active.host == std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-            && active.port >= 1024
-            && active.alias == expected_alias
-            && Some(active.host_key_fingerprint.as_str()) == expected_host
-            && Some(active.client_key_fingerprint.as_str()) == expected_client
-    });
-    v1::SshStatus {
-        enabled,
-        active: active.is_some(),
-        host: active.map(|active| active.host.to_string()),
-        port: active.map(|active| u32::from(active.port)),
-        alias: active.map(|active| active.alias.clone()),
-        host_key_fingerprint: active.map(|active| active.host_key_fingerprint.clone()),
-        client_key_fingerprint: active.map(|active| active.client_key_fingerprint.clone()),
+) -> Option<v1::SshStatus> {
+    let resolution = record.ssh_resolution.as_ref()?;
+    let details = resolution.details.as_object()?;
+    if resolution.version != 1 || details.len() != 3 {
+        return None;
     }
+    let enabled = details
+        .get("enabled")
+        .and_then(serde_json::Value::as_bool)?;
+    let expected_host = details
+        .get("host_key_fingerprint")
+        .and_then(serde_json::Value::as_str)?;
+    let expected_client = details
+        .get("client_key_fingerprint")
+        .and_then(serde_json::Value::as_str)?;
+    if !enabled {
+        return (expected_host.is_empty() && expected_client.is_empty()).then_some(v1::SshStatus {
+            enabled: false,
+            active: false,
+            host: None,
+            port: None,
+            alias: None,
+            host_key_fingerprint: None,
+            client_key_fingerprint: None,
+        });
+    }
+    if expected_host.is_empty() || expected_client.is_empty() {
+        return None;
+    }
+    let matching = active.filter(|active| {
+        record.actual_state == ActualState::Running
+            && active.host_key_fingerprint == expected_host
+            && active.client_key_fingerprint == expected_client
+    });
+    let candidate = v1::SshStatus {
+        enabled: true,
+        active: matching.is_some(),
+        host: matching.map(|active| active.host.to_string()),
+        port: matching.map(|active| u32::from(active.port)),
+        alias: matching.map(|active| active.alias.clone()),
+        host_key_fingerprint: matching.map(|active| active.host_key_fingerprint.clone()),
+        client_key_fingerprint: matching.map(|active| active.client_key_fingerprint.clone()),
+    };
+    let probe = v1::SandboxStatus {
+        sandbox_id: record.id.to_string(),
+        actual_state: match record.actual_state {
+            ActualState::Creating | ActualState::Destroying => v1::ActualState::Pending,
+            ActualState::Running => v1::ActualState::Running,
+            ActualState::Stopped => v1::ActualState::Stopped,
+            ActualState::Absent => v1::ActualState::Absent,
+        } as i32,
+        ssh: Some(candidate.clone()),
+        ..Default::default()
+    };
+    if matching.is_some() && classify_ssh(&probe) != SshState::Ready {
+        return Some(v1::SshStatus {
+            enabled: true,
+            active: false,
+            host: None,
+            port: None,
+            alias: None,
+            host_key_fingerprint: None,
+            client_key_fingerprint: None,
+        });
+    }
+    Some(candidate)
 }
 
 #[derive(Clone, Copy)]
@@ -1466,7 +1499,17 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             .map_err(|_| tonic::Status::internal(error_code::INTERNAL))?
             .map_err(|_| tonic::Status::internal(error_code::INTERNAL))?
             .ok_or_else(|| tonic::Status::not_found(error_code::SANDBOX_NOT_FOUND))?;
-        let active_ssh = self.service.published_ssh(&record).await.unwrap_or(None);
+        let published = if record.actual_state == ActualState::Running {
+            self.service.published_ssh_snapshot().await.ok()
+        } else {
+            None
+        };
+        let active_ssh = published.as_ref().and_then(|snapshot| {
+            snapshot
+                .for_sandbox(&record.id, record.ssh_resolution.as_ref())
+                .ok()
+                .flatten()
+        });
         Ok(tonic::Response::new(v1::StatusResponse {
             sandbox: Some(wire_status(
                 record,
@@ -1486,9 +1529,26 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             .await
             .map_err(|_| tonic::Status::internal(error_code::INTERNAL))?
             .map_err(|_| tonic::Status::internal(error_code::INTERNAL))?;
+        let published = if records
+            .iter()
+            .any(|record| record.actual_state == ActualState::Running)
+        {
+            self.service.published_ssh_snapshot().await.ok()
+        } else {
+            None
+        };
         let mut sandboxes = Vec::with_capacity(records.len());
         for record in records {
-            let active_ssh = self.service.published_ssh(&record).await.unwrap_or(None);
+            let active_ssh = (record.actual_state == ActualState::Running)
+                .then(|| {
+                    published.as_ref().and_then(|snapshot| {
+                        snapshot
+                            .for_sandbox(&record.id, record.ssh_resolution.as_ref())
+                            .ok()
+                            .flatten()
+                    })
+                })
+                .flatten();
             sandboxes.push(wire_status(
                 record,
                 self.service.workspace_image(),
@@ -2877,7 +2937,7 @@ mod tests {
 
         assert_eq!(
             wire_ssh_status(&record, None),
-            v1::SshStatus {
+            Some(v1::SshStatus {
                 enabled: true,
                 active: false,
                 host: None,
@@ -2885,7 +2945,7 @@ mod tests {
                 alias: None,
                 host_key_fingerprint: None,
                 client_key_fingerprint: None,
-            }
+            })
         );
     }
 
@@ -2924,7 +2984,7 @@ mod tests {
 
         assert_eq!(
             wire_ssh_status(&record, Some(&active)),
-            v1::SshStatus {
+            Some(v1::SshStatus {
                 enabled: true,
                 active: true,
                 host: Some("127.0.0.1".to_owned()),
@@ -2932,7 +2992,7 @@ mod tests {
                 alias: Some(format!("gascan-{id}")),
                 host_key_fingerprint: Some("SHA256:host".to_owned()),
                 client_key_fingerprint: Some("SHA256:client".to_owned()),
-            }
+            })
         );
         Ok(())
     }
@@ -2963,7 +3023,7 @@ mod tests {
 
         assert_eq!(
             wire_ssh_status(&record, None),
-            v1::SshStatus {
+            Some(v1::SshStatus {
                 enabled: false,
                 active: false,
                 host: None,
@@ -2971,8 +3031,38 @@ mod tests {
                 alias: None,
                 host_key_fingerprint: None,
                 client_key_fingerprint: None,
-            }
+            })
         );
+    }
+
+    #[test]
+    fn missing_unsupported_and_malformed_resolutions_are_not_reported_as_disabled() {
+        let root = Utf8PathBuf::from("/workspace/ssh-unavailable");
+        let mut record = SandboxRecord {
+            id: SandboxId::from_root("ssh-unavailable", &root),
+            canonical_root: root,
+            desired_state: DesiredState::Running,
+            actual_state: ActualState::Running,
+            setup_resolution: None,
+            tool_resolution: None,
+            image_resolution: None,
+            storage_resolution: None,
+            ssh_resolution: None,
+            last_operation_id: None,
+            updated_at_millis: 1,
+        };
+
+        assert!(wire_status(record.clone(), "image", None).ssh.is_none());
+        record.ssh_resolution = Some(crate::SshResolution::new(
+            99,
+            serde_json::json!({"enabled": false}),
+        ));
+        assert!(wire_status(record.clone(), "image", None).ssh.is_none());
+        record.ssh_resolution = Some(crate::SshResolution::new(
+            1,
+            serde_json::json!({"enabled": false, "host_key_fingerprint": "unexpected"}),
+        ));
+        assert!(wire_status(record, "image", None).ssh.is_none());
     }
 
     #[test]

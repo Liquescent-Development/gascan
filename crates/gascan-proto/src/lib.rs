@@ -13,6 +13,84 @@ pub const SOCKET_MODE: u32 = 0o600;
 /// Stable code returned when an attach frame has no session token.
 pub const SESSION_TOKEN_EMPTY: &str = "empty_session_token";
 
+/// Canonical interpretation of SSH status fields shared by every API consumer.
+pub mod ssh_status {
+    use super::v1;
+
+    /// User-facing readiness state derived from one complete sandbox status.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum SshState {
+        Disabled,
+        Starting,
+        Ready,
+        Unhealthy,
+        Unavailable,
+    }
+
+    impl SshState {
+        /// Stable lowercase name used by structured output.
+        #[must_use]
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::Disabled => "disabled",
+                Self::Starting => "starting",
+                Self::Ready => "ready",
+                Self::Unhealthy => "unhealthy",
+                Self::Unavailable => "unavailable",
+            }
+        }
+    }
+
+    /// Classify SSH state without trusting contradictory or incomplete fields.
+    #[must_use]
+    pub fn classify(status: &v1::SandboxStatus) -> SshState {
+        let Some(ssh) = status.ssh.as_ref() else {
+            return SshState::Unavailable;
+        };
+        let has_endpoint = ssh.host.is_some()
+            || ssh.port.is_some()
+            || ssh.alias.is_some()
+            || ssh.host_key_fingerprint.is_some()
+            || ssh.client_key_fingerprint.is_some();
+        if !ssh.enabled {
+            return if !ssh.active && !has_endpoint {
+                SshState::Disabled
+            } else {
+                SshState::Unhealthy
+            };
+        }
+        if ssh.active {
+            return if status.actual_state == v1::ActualState::Running as i32
+                && ssh.host.as_deref() == Some("127.0.0.1")
+                && ssh
+                    .port
+                    .is_some_and(|port| (1024..=u32::from(u16::MAX)).contains(&port))
+                && ssh.alias.as_deref() == Some(format!("gascan-{}", status.sandbox_id).as_str())
+                && ssh
+                    .host_key_fingerprint
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
+                && ssh
+                    .client_key_fingerprint
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
+            {
+                SshState::Ready
+            } else {
+                SshState::Unhealthy
+            };
+        }
+        if has_endpoint {
+            return SshState::Unhealthy;
+        }
+        match v1::ActualState::try_from(status.actual_state).unwrap_or(v1::ActualState::Unknown) {
+            v1::ActualState::Pending => SshState::Starting,
+            v1::ActualState::Failed => SshState::Unhealthy,
+            _ => SshState::Unavailable,
+        }
+    }
+}
+
 /// Stable machine-readable values carried by [`v1::Error::code`].
 pub mod error_code {
     /// The peer requested a different API major version.

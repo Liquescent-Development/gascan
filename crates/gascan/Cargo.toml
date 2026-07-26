@@ -16,6 +16,7 @@ indicatif.workspace = true
 prost-types.workspace = true
 rustix = { workspace = true, features = ["termios"] }
 serde_json.workspace = true
+signal-hook.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true

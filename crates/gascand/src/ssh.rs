@@ -20,7 +20,7 @@ pub use config::{
     readiness_ssh_args,
 };
 pub use identity::{HostIdentity, ensure_host_identity};
-pub use manager::{PreparedSshCreate, SshManager};
+pub use manager::{PreparedSshCreate, PublishedSshSnapshot, SshManager};
 pub use port::PortReservation;
 
 const DIRECTORY_MODE: u16 = 0o700;
@@ -70,18 +70,14 @@ impl SshPaths {
     }
 
     fn from_environment_with_uid(
-        xdg_config_home: Option<&OsStr>,
+        _xdg_config_home: Option<&OsStr>,
         home: Option<&OsStr>,
         expected_uid: u32,
     ) -> Result<Self, SshError> {
-        let config_home = if let Some(config_home) = xdg_config_home {
-            PathBuf::from(config_home)
-        } else {
-            PathBuf::from(home.ok_or(SshError::InvalidState(
-                "HOME is required when XDG_CONFIG_HOME is unset",
-            ))?)
-            .join(".config")
-        };
+        let config_home = PathBuf::from(home.ok_or(SshError::InvalidState(
+            "HOME is required for managed SSH configuration",
+        ))?)
+        .join(".config");
         if !config_home.is_absolute() {
             return Err(SshError::InvalidState(
                 "SSH configuration home must be absolute",

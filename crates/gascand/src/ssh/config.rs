@@ -546,8 +546,8 @@ mod tests {
     async fn failure_before_config_commit_preserves_the_active_generation()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
-        let config_home = temp.path().canonicalize()?.join("xdg");
-        let paths = SshPaths::for_environment(Some(config_home.as_os_str()), None)?;
+        let home = temp.path().canonicalize()?;
+        let paths = SshPaths::for_environment(None, Some(home.as_os_str()))?;
         let identity = ensure_host_identity(&paths).await?;
         publish_openssh_files(&paths, &identity, &[host("gascan-before", 2222, &identity)])?;
         let config_before = fs::read_to_string(paths.config().as_std_path())?;
@@ -573,8 +573,8 @@ mod tests {
     fn interrupted_atomic_replacement_preserves_previous_valid_file()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
-        let config_home = temp.path().canonicalize()?.join("xdg");
-        let paths = SshPaths::for_environment(Some(config_home.as_os_str()), None)?;
+        let home = temp.path().canonicalize()?;
+        let paths = SshPaths::for_environment(None, Some(home.as_os_str()))?;
         let directory = StateDirectory::open(&paths)?;
         atomic_replace(&directory, "config", b"previous\n")?;
         let result = atomic_replace_with(&directory, "config", b"replacement\n", || {

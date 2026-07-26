@@ -22,13 +22,10 @@ use std::time::{Duration, Instant};
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 fn ssh_paths(root: &Utf8Path, name: &str) -> TestResult<SshPaths> {
-    let config_home = root.join(name);
-    std::fs::create_dir(&config_home)?;
-    let config_home = std::fs::canonicalize(config_home)?;
-    Ok(SshPaths::for_environment(
-        Some(config_home.as_os_str()),
-        None,
-    )?)
+    let home = root.join(name);
+    std::fs::create_dir(&home)?;
+    let home = std::fs::canonicalize(home)?;
+    Ok(SshPaths::for_environment(None, Some(home.as_os_str()))?)
 }
 
 fn readiness_program(root: &Utf8Path, failing_port: Option<u16>) -> TestResult<Utf8PathBuf> {

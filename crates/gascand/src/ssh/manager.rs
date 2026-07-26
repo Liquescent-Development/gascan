@@ -89,6 +89,44 @@ impl PreparedSshActivation {
 
 pub struct SshManager;
 
+#[derive(Clone, Debug)]
+pub struct PublishedSshSnapshot {
+    client_key_fingerprint: String,
+    hosts: BTreeMap<String, ActiveSsh>,
+}
+
+impl PublishedSshSnapshot {
+    pub fn for_sandbox(
+        &self,
+        id: &SandboxId,
+        expected: Option<&SshResolution>,
+    ) -> Result<Option<ActiveSsh>, ServiceError> {
+        let Some(expected) = expected.filter(|resolution| resolution_enabled(resolution)) else {
+            return Ok(None);
+        };
+        let Some((expected_host, expected_client)) = expected_fingerprints(Some(expected))? else {
+            return Ok(None);
+        };
+        if self.client_key_fingerprint != expected_client {
+            return Err(ServiceError::SshHostKeyMismatch(
+                "stored client identity fingerprint changed",
+            ));
+        }
+        match self.hosts.get(&alias(id)) {
+            Some(active)
+                if active.host_key_fingerprint == expected_host
+                    && active.client_key_fingerprint == expected_client =>
+            {
+                Ok(Some(active.clone()))
+            }
+            Some(_) => Err(ServiceError::SshHostKeyMismatch(
+                "published SSH fingerprints changed",
+            )),
+            None => Ok(None),
+        }
+    }
+}
+
 impl SshManager {
     pub async fn prepare_create(
         &self,
@@ -238,37 +276,26 @@ impl SshManager {
         expected: Option<&SshResolution>,
         paths: &SshPaths,
     ) -> Result<Option<ActiveSsh>, ServiceError> {
-        let Some(expected) = expected.filter(|resolution| resolution_enabled(resolution)) else {
-            return Ok(None);
-        };
+        self.published_snapshot_for_paths(paths)
+            .await?
+            .for_sandbox(id, expected)
+    }
+
+    pub async fn published_snapshot_for_paths(
+        &self,
+        paths: &SshPaths,
+    ) -> Result<PublishedSshSnapshot, ServiceError> {
         let identity = load_host_identity(paths)
             .await
             .map_err(ServiceError::SshConfigUnsafe)?;
-        let Some((expected_host, expected_client)) = expected_fingerprints(Some(expected))? else {
-            return Ok(None);
-        };
-        if identity.fingerprint() != expected_client {
-            return Err(ServiceError::SshHostKeyMismatch(
-                "stored client identity fingerprint changed",
-            ));
-        }
-        let alias = alias(id);
-        let active = load_active_hosts(paths, &identity)?
+        let hosts = load_active_hosts(paths, &identity)?
             .into_iter()
-            .find(|host| host.active.alias == alias)
-            .map(|host| host.active);
-        match active {
-            Some(active)
-                if active.host_key_fingerprint == expected_host
-                    && active.client_key_fingerprint == expected_client =>
-            {
-                Ok(Some(active))
-            }
-            Some(_) => Err(ServiceError::SshHostKeyMismatch(
-                "published SSH fingerprints changed",
-            )),
-            None => Ok(None),
-        }
+            .map(|host| (host.active.alias.clone(), host.active))
+            .collect();
+        Ok(PublishedSshSnapshot {
+            client_key_fingerprint: identity.fingerprint().to_owned(),
+            hosts,
+        })
     }
 
     pub(crate) async fn deactivate_for_paths(

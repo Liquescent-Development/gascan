@@ -12,18 +12,23 @@ fn root(temp: &TempDir) -> Result<std::path::PathBuf, std::io::Error> {
 }
 
 fn paths(temp: &TempDir) -> Result<SshPaths, Box<dyn std::error::Error>> {
-    let xdg = root(temp)?.join("xdg");
-    Ok(SshPaths::for_environment(Some(xdg.as_os_str()), None)?)
+    let home = root(temp)?;
+    Ok(SshPaths::for_environment(None, Some(home.as_os_str()))?)
 }
 
 #[test]
-fn rejects_openssh_expansion_in_xdg_or_home_paths() -> TestResult {
+fn ignores_custom_xdg_but_rejects_openssh_expansion_in_home() -> TestResult {
     let temp = TempDir::new()?;
     let base = root(&temp)?;
     let xdg = base.join("xdg$attacker");
+    let safe_home = base.join("home");
     let home = base.join("home$attacker");
 
-    assert!(SshPaths::for_environment(Some(xdg.as_os_str()), None).is_err());
+    let paths = SshPaths::for_environment(Some(xdg.as_os_str()), Some(safe_home.as_os_str()))?;
+    assert_eq!(
+        paths.directory().as_std_path(),
+        safe_home.join(".config/gascan/ssh")
+    );
     assert!(SshPaths::for_environment(None, Some(home.as_os_str())).is_err());
     assert!(!xdg.exists());
     assert!(!home.join(".config").exists());
@@ -31,14 +36,17 @@ fn rejects_openssh_expansion_in_xdg_or_home_paths() -> TestResult {
 }
 
 #[test]
-fn resolves_xdg_config_home_before_home_fallback() -> TestResult {
+fn production_managed_ssh_path_always_matches_the_home_relative_include() -> TestResult {
     let temp = TempDir::new()?;
     let base = root(&temp)?;
     let xdg = base.join("xdg");
     let home = base.join("home");
 
     let preferred = SshPaths::for_environment(Some(xdg.as_os_str()), Some(home.as_os_str()))?;
-    assert_eq!(preferred.directory().as_std_path(), xdg.join("gascan/ssh"));
+    assert_eq!(
+        preferred.directory().as_std_path(),
+        home.join(".config/gascan/ssh")
+    );
 
     let fallback = SshPaths::for_environment(None, Some(home.as_os_str()))?;
     assert_eq!(
@@ -46,9 +54,7 @@ fn resolves_xdg_config_home_before_home_fallback() -> TestResult {
         home.join(".config/gascan/ssh")
     );
     assert!(SshPaths::for_environment(None, None).is_err());
-    assert!(
-        SshPaths::for_environment(Some(OsStr::new("relative")), Some(home.as_os_str())).is_err()
-    );
+    assert!(SshPaths::for_environment(Some(OsStr::new("relative")), None).is_err());
     Ok(())
 }
 
@@ -99,7 +105,7 @@ async fn rejects_symlink_ancestors_and_managed_key_paths() -> TestResult {
     fs::create_dir(&target)?;
     let linked = base.join("linked");
     std::os::unix::fs::symlink(&target, &linked)?;
-    let attacked = SshPaths::for_environment(Some(linked.as_os_str()), None)?;
+    let attacked = SshPaths::for_environment(None, Some(linked.as_os_str()))?;
     assert!(ensure_host_identity(&attacked).await.is_err());
     assert!(!target.join("gascan").exists());
 
@@ -124,10 +130,9 @@ async fn rejects_non_sticky_world_writable_path_ancestors() -> TestResult {
     let unsafe_ancestor = base.join("unsafe");
     fs::create_dir(&unsafe_ancestor)?;
     fs::set_permissions(&unsafe_ancestor, fs::Permissions::from_mode(0o777))?;
-    let config_home = unsafe_ancestor.join("xdg");
-    let attacked = SshPaths::for_environment(Some(config_home.as_os_str()), None)?;
+    let attacked = SshPaths::for_environment(None, Some(unsafe_ancestor.as_os_str()))?;
     assert!(ensure_host_identity(&attacked).await.is_err());
-    assert!(!config_home.join("gascan").exists());
+    assert!(!unsafe_ancestor.join(".config/gascan").exists());
     Ok(())
 }
 

@@ -4,6 +4,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::Path;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -123,6 +124,19 @@ fn malformed_active_status_is_never_used_to_build_a_command() {
 }
 
 #[test]
+fn contradictory_disabled_status_is_not_treated_as_intentionally_disabled() {
+    let mut sandbox = status(false, false);
+    sandbox.ssh.as_mut().expect("fixture has SSH").alias = Some("gascan-code-123".to_owned());
+    let error = ssh_invocation(
+        &sandbox,
+        Path::new("/Users/test/.config/gascan/ssh/config"),
+        Vec::<OsString>::new(),
+    )
+    .expect_err("contradictory state must be rejected");
+    assert_eq!(error.stable_code(), Some("ssh_not_ready"));
+}
+
+#[test]
 fn process_execution_inherits_discrete_arguments_and_propagates_exit_code() -> TestResult {
     let temp = tempfile::tempdir()?;
     let capture = temp.path().join("arguments");
@@ -155,10 +169,23 @@ fn process_execution_inherits_discrete_arguments_and_propagates_exit_code() -> T
 
 #[test]
 fn process_execution_propagates_signal_status() -> TestResult {
-    let temp = tempfile::tempdir()?;
-    let helper = executable(temp.path(), "signal", "#!/bin/sh\nkill -TERM $$\n")?;
-    let code = wait_for_ssh(&helper, &[], std::iter::empty::<(OsString, OsString)>())?;
-    assert_eq!(code, 143);
+    const CHILD: &str = "GASCAN_TEST_SSH_SIGNAL_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let temp = tempfile::tempdir()?;
+        let helper = executable(temp.path(), "signal", "#!/bin/sh\nkill -TERM $$\n")?;
+        let code = wait_for_ssh(&helper, &[], std::iter::empty::<(OsString, OsString)>())?;
+        std::process::exit(code);
+    }
+
+    let status = std::process::Command::new(std::env::current_exe()?)
+        .env(CHILD, "1")
+        .args([
+            "--exact",
+            "process_execution_propagates_signal_status",
+            "--nocapture",
+        ])
+        .status()?;
+    assert_eq!(status.signal(), Some(15), "{status:?}");
     Ok(())
 }
 

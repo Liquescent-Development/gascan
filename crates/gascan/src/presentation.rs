@@ -1,4 +1,5 @@
 use console::{Style, Term};
+use gascan_proto::ssh_status::{SshState, classify as classify_ssh};
 use gascan_proto::v1;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::fmt::Write as _;
@@ -165,30 +166,23 @@ pub(crate) fn render_status(
         status.sandbox_id,
         human_state(status.actual_state)
     );
-    match status.ssh.as_ref() {
-        Some(ssh)
-            if ssh.active
-                && ssh.host.as_deref() == Some("127.0.0.1")
-                && ssh.port.is_some()
-                && ssh.alias.is_some() =>
-        {
+    match classify_ssh(status) {
+        SshState::Ready => {
+            let ssh = status.ssh.as_ref();
             let _ = writeln!(
                 output,
                 "SSH     {} ({}:{})",
-                ssh.alias.as_deref().unwrap_or_default(),
-                ssh.host.as_deref().unwrap_or_default(),
-                ssh.port.unwrap_or_default()
+                ssh.and_then(|value| value.alias.as_deref())
+                    .unwrap_or_default(),
+                ssh.and_then(|value| value.host.as_deref())
+                    .unwrap_or_default(),
+                ssh.and_then(|value| value.port).unwrap_or_default()
             );
         }
-        Some(ssh) if !ssh.enabled => output.push_str("SSH     Disabled\n"),
-        Some(_) if status.actual_state == v1::ActualState::Pending as i32 => {
-            output.push_str("SSH     Starting\n");
-        }
-        Some(_) if status.actual_state == v1::ActualState::Failed as i32 => {
-            output.push_str("SSH     Unhealthy\n");
-        }
-        Some(_) => output.push_str("SSH     Unavailable\n"),
-        None => {}
+        SshState::Disabled => output.push_str("SSH     Disabled\n"),
+        SshState::Starting => output.push_str("SSH     Starting\n"),
+        SshState::Unhealthy => output.push_str("SSH     Unhealthy\n"),
+        SshState::Unavailable => output.push_str("SSH     Unavailable\n"),
     }
     let image_changes = status
         .apply_requirements
@@ -591,7 +585,7 @@ mod tests {
                 &status("code-123", v1::ActualState::Running),
                 OutputCapabilities::plain()
             ),
-            "Sandbox: code-123\nState:   Running\n"
+            "Sandbox: code-123\nState:   Running\nSSH     Unavailable\n"
         );
     }
 
@@ -606,7 +600,7 @@ mod tests {
 
         assert_eq!(
             render_status(&status, OutputCapabilities::plain()),
-            "Sandbox: code-123\nState:   Running\n\nUpdate available\n  Workspace image  workspace:old@sha256:aaaaaaaaaaaa… → workspace:new@sha256:bbbbbbbbbbbb…\n  Run gascan apply\n"
+            "Sandbox: code-123\nState:   Running\nSSH     Unavailable\n\nUpdate available\n  Workspace image  workspace:old@sha256:aaaaaaaaaaaa… → workspace:new@sha256:bbbbbbbbbbbb…\n  Run gascan apply\n"
         );
     }
 
@@ -626,6 +620,30 @@ mod tests {
         assert_eq!(
             render_status(&status, OutputCapabilities::plain()),
             "Sandbox: code-123\nState:   Running\nSSH     gascan-code-123 (127.0.0.1:22222)\n"
+        );
+    }
+
+    #[test]
+    fn status_never_presents_incomplete_or_missing_ssh_state_as_ready() {
+        let missing = status("code-123", v1::ActualState::Running);
+        assert_eq!(
+            render_status(&missing, OutputCapabilities::plain()),
+            "Sandbox: code-123\nState:   Running\nSSH     Unavailable\n"
+        );
+
+        let mut incomplete = status("code-123", v1::ActualState::Running);
+        incomplete.ssh = Some(v1::SshStatus {
+            enabled: true,
+            active: true,
+            host: Some("127.0.0.1".to_owned()),
+            port: Some(22222),
+            alias: Some("gascan-code-123".to_owned()),
+            host_key_fingerprint: None,
+            client_key_fingerprint: Some("SHA256:client".to_owned()),
+        });
+        assert_eq!(
+            render_status(&incomplete, OutputCapabilities::plain()),
+            "Sandbox: code-123\nState:   Running\nSSH     Unhealthy\n"
         );
     }
 
@@ -661,7 +679,7 @@ mod tests {
 
         assert_eq!(
             render_status(&status, OutputCapabilities::plain()),
-            "Sandbox: code-123\nState:   Running\n"
+            "Sandbox: code-123\nState:   Running\nSSH     Unavailable\n"
         );
     }
 

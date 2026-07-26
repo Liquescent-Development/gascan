@@ -9,6 +9,7 @@ use crate::ssh_config::{
 };
 use crate::terminal::RawTerminal;
 use clap::{CommandFactory as _, Parser, Subcommand, error::ErrorKind};
+use gascan_proto::ssh_status::{SshState, classify as classify_ssh};
 use gascan_proto::v1;
 use std::ffi::{OsStr, OsString};
 use std::io::{IsTerminal, Write};
@@ -299,11 +300,10 @@ pub async fn execute() -> Result<i32, CliError> {
             match client.api.up(v1::UpRequest { project_root }).await {
                 Ok(response) => operation(response.into_inner(), json, OperationKind::Up, None)
                     .await
-                    .and_then(|code| {
-                        if code == 0 && !json {
-                            offer_ssh_config_include()?;
+                    .inspect(|code| {
+                        if *code == 0 && !json {
+                            offer_ssh_config_include();
                         }
-                        Ok(code)
                     }),
                 Err(status) => pre_stream_operation_failure(status.into(), json),
             }
@@ -491,13 +491,28 @@ fn execute_ssh_config(command: SshConfigCommand) -> Result<i32, CliError> {
 }
 
 fn ssh_config_error(error: crate::ssh_config::SshConfigError) -> CliError {
+    let code = error.stable_code().to_owned();
+    let context = if code == gascan_proto::error_code::SSH_CONFIG_UNSAFE {
+        "SSH configuration is unsafe"
+    } else {
+        "SSH configuration could not be updated"
+    };
     CliError::Operation {
-        code: gascan_proto::error_code::SSH_CONFIG_UNSAFE.to_owned(),
-        message: format!("SSH configuration is unsafe: {error}"),
+        code,
+        message: format!("{context}: {error}"),
     }
 }
 
-fn offer_ssh_config_include() -> Result<(), CliError> {
+fn offer_ssh_config_include() {
+    if try_offer_ssh_config_include().is_err() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "Warning: automatic SSH config setup failed; run `gascan ssh-config install` to try again."
+        );
+    }
+}
+
+fn try_offer_ssh_config_include() -> Result<(), CliError> {
     if !std::io::stdin().is_terminal()
         || !std::io::stderr().is_terminal()
         || continuous_integration()
@@ -533,46 +548,34 @@ pub fn ssh_invocation<I>(
 where
     I: IntoIterator<Item = OsString>,
 {
-    let Some(ssh) = status.ssh.as_ref() else {
+    match classify_ssh(status) {
+        SshState::Disabled => {
+            return Err(CliError::Operation {
+                code: gascan_proto::error_code::SSH_DISABLED.to_owned(),
+                message: "SSH requires a networked sandbox with SSH enabled".to_owned(),
+            });
+        }
+        SshState::Ready => {}
+        SshState::Starting | SshState::Unavailable => {
+            return Err(CliError::Operation {
+                code: gascan_proto::error_code::SSH_NOT_READY.to_owned(),
+                message: "SSH is not ready; run `gascan up <project-root>`".to_owned(),
+            });
+        }
+        SshState::Unhealthy => {
+            return Err(CliError::Operation {
+                code: gascan_proto::error_code::SSH_NOT_READY.to_owned(),
+                message: "SSH status is incomplete or unsafe; run `gascan up` again".to_owned(),
+            });
+        }
+    }
+    if !managed_config.is_absolute() {
         return Err(CliError::Operation {
             code: gascan_proto::error_code::SSH_NOT_READY.to_owned(),
-            message: "SSH status is unavailable; restart Gas Can and run `gascan up`".to_owned(),
-        });
-    };
-    if !ssh.enabled {
-        return Err(CliError::Operation {
-            code: gascan_proto::error_code::SSH_DISABLED.to_owned(),
-            message: "SSH requires a networked sandbox with SSH enabled".to_owned(),
+            message: "managed SSH configuration path is unsafe".to_owned(),
         });
     }
-    if !ssh.active {
-        return Err(CliError::Operation {
-            code: gascan_proto::error_code::SSH_NOT_READY.to_owned(),
-            message: "SSH is not ready; run `gascan up <project-root>`".to_owned(),
-        });
-    }
-    let alias = ssh.alias.as_deref();
     let expected_alias = format!("gascan-{}", status.sandbox_id);
-    let valid = ssh.host.as_deref() == Some("127.0.0.1")
-        && ssh
-            .port
-            .is_some_and(|port| (1024..=u32::from(u16::MAX)).contains(&port))
-        && alias == Some(expected_alias.as_str())
-        && ssh
-            .host_key_fingerprint
-            .as_deref()
-            .is_some_and(|value| !value.is_empty())
-        && ssh
-            .client_key_fingerprint
-            .as_deref()
-            .is_some_and(|value| !value.is_empty())
-        && managed_config.is_absolute();
-    if !valid {
-        return Err(CliError::Operation {
-            code: gascan_proto::error_code::SSH_NOT_READY.to_owned(),
-            message: "SSH status is incomplete or unsafe; run `gascan up` again".to_owned(),
-        });
-    }
     let mut arguments = vec![
         OsString::from("-F"),
         managed_config.as_os_str().to_owned(),
@@ -603,7 +606,11 @@ where
         return Ok(code);
     }
     use std::os::unix::process::ExitStatusExt as _;
-    Ok(status.signal().map_or(EXIT_RUNTIME, |signal| 128 + signal))
+    let Some(signal) = status.signal() else {
+        return Ok(EXIT_RUNTIME);
+    };
+    signal_hook::low_level::emulate_default_handler(signal)?;
+    Ok(EXIT_RUNTIME)
 }
 
 pub fn ssh_arguments_from<I, T>(arguments: I) -> Result<ParsedSshArguments, clap::Error>
@@ -987,13 +994,8 @@ fn actual_name(value: i32) -> &'static str {
 }
 fn status_json(status: &v1::SandboxStatus) -> serde_json::Value {
     let ssh = status.ssh.as_ref();
-    let ssh_state = match ssh {
-        Some(ssh) if !ssh.enabled => "disabled",
-        Some(ssh) if ssh.active => "ready",
-        Some(_) if status.actual_state == v1::ActualState::Pending as i32 => "starting",
-        Some(_) if status.actual_state == v1::ActualState::Failed as i32 => "unhealthy",
-        Some(_) | None => "unavailable",
-    };
+    let ssh_state = classify_ssh(status);
+    let ready = ssh_state == SshState::Ready;
     serde_json::json!({
         "sandbox_id": status.sandbox_id,
         "actual_state": actual_name(status.actual_state),
@@ -1006,13 +1008,13 @@ fn status_json(status: &v1::SandboxStatus) -> serde_json::Value {
         }).collect::<Vec<_>>(),
         "ssh": {
             "enabled": ssh.is_some_and(|ssh| ssh.enabled),
-            "active": ssh.is_some_and(|ssh| ssh.active),
-            "state": ssh_state,
-            "host": ssh.and_then(|ssh| ssh.host.as_deref()),
-            "port": ssh.and_then(|ssh| ssh.port),
-            "alias": ssh.and_then(|ssh| ssh.alias.as_deref()),
-            "host_key_fingerprint": ssh.and_then(|ssh| ssh.host_key_fingerprint.as_deref()),
-            "client_key_fingerprint": ssh.and_then(|ssh| ssh.client_key_fingerprint.as_deref()),
+            "active": ready,
+            "state": ssh_state.as_str(),
+            "host": ready.then(|| ssh.and_then(|ssh| ssh.host.as_deref())).flatten(),
+            "port": ready.then(|| ssh.and_then(|ssh| ssh.port)).flatten(),
+            "alias": ready.then(|| ssh.and_then(|ssh| ssh.alias.as_deref())).flatten(),
+            "host_key_fingerprint": ready.then(|| ssh.and_then(|ssh| ssh.host_key_fingerprint.as_deref())).flatten(),
+            "client_key_fingerprint": ready.then(|| ssh.and_then(|ssh| ssh.client_key_fingerprint.as_deref())).flatten(),
         },
     })
 }
@@ -1143,6 +1145,38 @@ mod tests {
                 "alias": "gascan-code-123",
                 "host_key_fingerprint": "SHA256:host",
                 "client_key_fingerprint": "SHA256:client",
+            })
+        );
+    }
+
+    #[test]
+    fn status_json_suppresses_incomplete_active_endpoint_and_uses_shared_state() {
+        let status = v1::SandboxStatus {
+            sandbox_id: "code-123".to_owned(),
+            actual_state: v1::ActualState::Running as i32,
+            ssh: Some(v1::SshStatus {
+                enabled: true,
+                active: true,
+                host: Some("127.0.0.1".to_owned()),
+                port: Some(22222),
+                alias: Some("gascan-code-123".to_owned()),
+                host_key_fingerprint: None,
+                client_key_fingerprint: Some("SHA256:client".to_owned()),
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            status_json(&status)["ssh"],
+            serde_json::json!({
+                "enabled": true,
+                "active": false,
+                "state": "unhealthy",
+                "host": null,
+                "port": null,
+                "alias": null,
+                "host_key_fingerprint": null,
+                "client_key_fingerprint": null,
             })
         );
     }
