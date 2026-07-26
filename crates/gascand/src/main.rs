@@ -51,12 +51,13 @@ impl Provisioner for ConfiguredProvisioner {
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(debug_assertions)]
-    if option_env!("CARGO_BIN_NAME") == Some("gascan-e2e-daemon")
-        && let Some(delay) = std::env::var("GASCAN_E2E_DAEMON_START_DELAY_MS")
+    if option_env!("CARGO_BIN_NAME") == Some("gascan-e2e-daemon") {
+        if let Some(delay) = std::env::var("GASCAN_E2E_DAEMON_START_DELAY_MS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
-    {
-        tokio::time::sleep(Duration::from_millis(delay)).await;
+        {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
     }
     let idle_timeout = std::env::var("GASCAN_IDLE_TIMEOUT_MS")
         .ok()

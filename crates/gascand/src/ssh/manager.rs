@@ -520,12 +520,12 @@ async fn verified_managed_host(
     let public_key = read_host_public_key(id, runtime, host_key_timeout).await?;
     let parsed = parse_public_key(&public_key)
         .map_err(|_| ServiceError::SshHostKeyMismatch("guest SSH host key is invalid"))?;
-    if let Some((expected_host, expected_client)) = expected_fingerprints(expected)?
-        && (parsed.fingerprint != expected_host || identity.fingerprint() != expected_client)
-    {
-        return Err(ServiceError::SshHostKeyMismatch(
-            "guest or client SSH identity changed",
-        ));
+    if let Some((expected_host, expected_client)) = expected_fingerprints(expected)? {
+        if parsed.fingerprint != expected_host || identity.fingerprint() != expected_client {
+            return Err(ServiceError::SshHostKeyMismatch(
+                "guest or client SSH identity changed",
+            ));
+        }
     }
     Ok(ManagedSshHost {
         active: ActiveSsh {

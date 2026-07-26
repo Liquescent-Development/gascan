@@ -1151,10 +1151,10 @@ fn observed_created_ports(
     state: &mut FakeState,
 ) -> Vec<crate::runtime::RuntimePort> {
     let mut ports = request.ports().to_vec();
-    if let Some(host_port) = state.created_ssh_host_ports.pop_front()
-        && let Some(mapping) = ports.iter_mut().find(|mapping| mapping.guest_port == 22)
-    {
-        mapping.host_port = host_port;
+    if let Some(host_port) = state.created_ssh_host_ports.pop_front() {
+        if let Some(mapping) = ports.iter_mut().find(|mapping| mapping.guest_port == 22) {
+            mapping.host_port = host_port;
+        }
     }
     ports
 }

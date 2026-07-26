@@ -646,8 +646,8 @@ impl<B: RuntimeBackend> SandboxService<B> {
             move |store| store.set_ssh_resolution(&id, Some(resolution))
         })
         .await?;
-        if let Some((operation_id, sender)) = publication
-            && let Err(original) = self
+        if let Some((operation_id, sender)) = publication {
+            if let Err(original) = self
                 .emit(
                     operation_id,
                     json!({
@@ -657,8 +657,9 @@ impl<B: RuntimeBackend> SandboxService<B> {
                     sender,
                 )
                 .await
-        {
-            return Err(self.restore_prior_ssh_resolution(id, prior, original).await);
+            {
+                return Err(self.restore_prior_ssh_resolution(id, prior, original).await);
+            }
         }
         if let Err(original) = prepared.commit_with_fault(self.ssh_config_commit_fault) {
             if original.is_ssh_publication_uncertain() {
@@ -1303,16 +1304,17 @@ impl<B: RuntimeBackend> SandboxService<B> {
                     }
                     Err(failure) => {
                         let partial = failure.created().to_vec();
-                        if !partial.is_empty()
-                            && let Err(rollback) = self
+                        if !partial.is_empty() {
+                            if let Err(rollback) = self
                                 .runtime
                                 .remove(RemoveRequest::from_resources(partial)?)
                                 .await
-                        {
-                            return Err(ServiceError::Rollback {
-                                original: Box::new(ServiceError::Create(failure)),
-                                rollback,
-                            });
+                            {
+                                return Err(ServiceError::Rollback {
+                                    original: Box::new(ServiceError::Create(failure)),
+                                    rollback,
+                                });
+                            }
                         }
                         let collision = prepared_ssh.as_ref().is_some_and(|ssh| {
                             is_native_port_collision(&failure, ssh.host_port(), &create)
@@ -3297,10 +3299,10 @@ impl<B: RuntimeBackend> SandboxService<B> {
             .await?;
         let _ = sender.try_send(event);
         #[cfg(debug_assertions)]
-        if let Ok(target) = std::env::var("GASCAN_SSH_CRASH_PHASE")
-            && durable_phase.as_deref() == Some(target.as_str())
-        {
-            std::process::abort();
+        if let Ok(target) = std::env::var("GASCAN_SSH_CRASH_PHASE") {
+            if durable_phase.as_deref() == Some(target.as_str()) {
+                std::process::abort();
+            }
         }
         Ok(())
     }
