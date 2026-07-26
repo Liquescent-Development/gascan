@@ -1,15 +1,19 @@
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
+use gascan_core::doctor::{DoctorFacts, DoctorStatus};
 use gascan_core::fake_runtime::{FailureBoundary, FakeRuntime};
 use gascan_core::manifest::Manifest;
 use gascan_core::policy::PolicyCompiler;
 use gascan_core::runtime::{
     ResourceIdentity, ResourceKind, ResourceOwnership, RuntimeBackend, RuntimeCall, RuntimeError,
 };
-use gascan_core::sandbox::SandboxSpec;
+use gascan_core::sandbox::{SandboxId, SandboxSpec};
+use gascan_proto::v1;
+use gascan_proto::v1::gas_can_server::GasCan;
 use gascand::{
-    NoopProvisioner, OperationStatus, PortReservation, SandboxService, SshManager, SshPaths,
-    UpRequest, ensure_host_identity,
+    ActivityTracker, ActualState, DesiredState, NoopProvisioner, OperationKind, OperationStatus,
+    PortReservation, SandboxApi, SandboxRecord, SandboxService, SshManager, SshPaths,
+    SshResolution, Store, UpRequest, ensure_host_identity,
 };
 use gascand::{ProvisionRequest, ProvisionResolution, Provisioner, ServiceError};
 use serde_json::json;
@@ -23,6 +27,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
+use tokio_stream::StreamExt as _;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -137,6 +142,27 @@ async fn wait_for_path(path: &Utf8Path) -> Result<(), Box<dyn Error>> {
 async fn generated_public_key(root: &Utf8Path, name: &str) -> Result<String, Box<dyn Error>> {
     let paths = ssh_paths(root, name)?;
     Ok(ensure_host_identity(&paths).await?.public_key().to_owned())
+}
+
+fn sandbox_record(
+    id: SandboxId,
+    root: &Utf8Path,
+    actual_state: ActualState,
+    ssh_resolution: Option<SshResolution>,
+) -> SandboxRecord {
+    SandboxRecord {
+        id,
+        canonical_root: root.to_owned(),
+        desired_state: DesiredState::Running,
+        actual_state,
+        setup_resolution: None,
+        tool_resolution: None,
+        image_resolution: None,
+        storage_resolution: None,
+        ssh_resolution,
+        last_operation_id: None,
+        updated_at_millis: 0,
+    }
 }
 
 fn service_with_readiness(
@@ -1092,6 +1118,230 @@ async fn doctor_does_not_observe_ssh_activation_halfway_through_publication() ->
         settled.check("ssh.config").ok_or("ssh.config")?.status,
         gascan_core::doctor::DoctorStatus::Pass
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn api_up_repairs_missing_managed_ssh_config_instead_of_failing_preflight() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let project = root.join("project");
+    std::fs::create_dir(&project)?;
+    let paths = ssh_paths(root, "ssh-api-repair")?;
+    ensure_host_identity(&paths).await?;
+    assert!(!paths.config().exists());
+    let host_public_key = generated_public_key(root, "host-api-repair").await?;
+    let desired = networked_ssh_spec("ssh-api-repair", &project, Some(26_161))?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let service = Arc::new(service_with_readiness(
+        runtime,
+        root,
+        paths.clone(),
+        Utf8PathBuf::from("/usr/bin/true"),
+    )?);
+    let api = SandboxApi::new(service, ActivityTracker::new());
+
+    let response = GasCan::up(
+        &api,
+        tonic::Request::new(v1::UpRequest {
+            project_root: desired.canonical_root().to_string(),
+        }),
+    )
+    .await;
+
+    assert!(
+        response.is_ok(),
+        "repairable managed config was rejected by preflight: {:?}",
+        response.as_ref().err().map(tonic::Status::message)
+    );
+    let mut stream = response?.into_inner();
+    let mut terminal = None;
+    while let Some(event) = stream.next().await {
+        terminal = Some(event?);
+    }
+    assert_eq!(
+        terminal.ok_or("terminal event")?.status,
+        v1::OperationStatus::Completed as i32
+    );
+    assert!(paths.config().exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn api_up_reports_specific_ssh_error_for_unsafe_managed_config() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let project = root.join("project");
+    std::fs::create_dir(&project)?;
+    let paths = ssh_paths(root, "ssh-api-unsafe")?;
+    ensure_host_identity(&paths).await?;
+    let hostile = root.join("hostile-config");
+    std::fs::write(&hostile, "Host hostile\n")?;
+    std::os::unix::fs::symlink(&hostile, paths.config())?;
+    let host_public_key = generated_public_key(root, "host-api-unsafe").await?;
+    let desired = networked_ssh_spec("ssh-api-unsafe", &project, Some(26_162))?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let service = Arc::new(service_with_readiness(
+        runtime,
+        root,
+        paths,
+        Utf8PathBuf::from("/usr/bin/true"),
+    )?);
+    let api = SandboxApi::new(service, ActivityTracker::new());
+
+    let response = GasCan::up(
+        &api,
+        tonic::Request::new(v1::UpRequest {
+            project_root: desired.canonical_root().to_string(),
+        }),
+    )
+    .await;
+
+    assert!(
+        response.is_ok(),
+        "unsafe managed config was hidden by preflight: {:?}",
+        response.as_ref().err().map(tonic::Status::message)
+    );
+    let mut stream = response?.into_inner();
+    let mut terminal = None;
+    while let Some(event) = stream.next().await {
+        terminal = Some(event?);
+    }
+    let error = terminal
+        .ok_or("terminal event")?
+        .error
+        .ok_or("terminal error")?;
+    assert_eq!(error.code, "ssh_config_unsafe");
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_ssh_operation_does_not_preflight_block_independent_api_up() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    let first_project = root.join("first-project");
+    let second_project = root.join("second-project");
+    std::fs::create_dir(&first_project)?;
+    std::fs::create_dir(&second_project)?;
+    let paths = ssh_paths(root, "ssh-api-pending")?;
+    let identity = ensure_host_identity(&paths).await?;
+    let store = Store::open(root.join("state.db"))?;
+    let first_id = SandboxId::from_root("ssh-api-pending-first", &first_project);
+    store.begin_operation(
+        &sandbox_record(
+            first_id,
+            &first_project,
+            ActualState::Creating,
+            Some(SshResolution::new(
+                1,
+                json!({
+                    "enabled": true,
+                    "host_key_fingerprint": identity.fingerprint(),
+                    "client_key_fingerprint": identity.fingerprint(),
+                }),
+            )),
+        ),
+        OperationKind::Create,
+    )?;
+    let host_public_key = generated_public_key(root, "host-api-pending").await?;
+    let second = networked_ssh_spec("ssh-api-pending-second", &second_project, Some(26_163))?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    let service = Arc::new(SandboxService::new_with_ssh_for_tests(
+        runtime,
+        store,
+        Arc::new(NoopProvisioner),
+        paths,
+        Utf8PathBuf::from("/usr/bin/true"),
+    ));
+    let api = SandboxApi::new(service, ActivityTracker::new());
+
+    let response = GasCan::up(
+        &api,
+        tonic::Request::new(v1::UpRequest {
+            project_root: second.canonical_root().to_string(),
+        }),
+    )
+    .await;
+
+    assert!(
+        response.is_ok(),
+        "sandbox A's pending SSH diagnostics blocked sandbox B: {:?}",
+        response.as_ref().err().map(tonic::Status::message)
+    );
+    let mut stream = response?.into_inner();
+    let mut terminal = None;
+    while let Some(event) = stream.next().await {
+        terminal = Some(event?);
+    }
+    assert_eq!(
+        terminal.ok_or("terminal event")?.status,
+        v1::OperationStatus::Completed as i32
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn managed_ssh_diagnostics_do_not_gate_runtime_readiness() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    for (id, status) in [
+        ("ssh.identity", DoctorStatus::Fail),
+        ("ssh.config", DoctorStatus::Unknown),
+    ] {
+        let mut report = DoctorFacts::all_supported_for_tests().into_report();
+        let check = report
+            .checks
+            .iter_mut()
+            .find(|check| check.id == id)
+            .ok_or("doctor check")?;
+        check.status = status;
+        check.detail = "repairable managed SSH diagnostic".to_owned();
+        let service = SandboxService::new_with_doctor(
+            FakeRuntime::default(),
+            Store::open(root.join(format!("{}.db", id.replace('.', "-"))))?,
+            Arc::new(NoopProvisioner),
+            report,
+        );
+        service.require_runtime_ready().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn immutable_and_transport_prerequisites_still_gate_runtime_readiness() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
+    for id in ["host.architecture", "ssh.client", "ssh.native_publish"] {
+        let mut report = DoctorFacts::all_supported_for_tests().into_report();
+        let check = report
+            .checks
+            .iter_mut()
+            .find(|check| check.id == id)
+            .ok_or("doctor check")?;
+        check.status = DoctorStatus::Fail;
+        check.detail = "required prerequisite failed".to_owned();
+        let service = SandboxService::new_with_doctor(
+            FakeRuntime::default(),
+            Store::open(root.join(format!("{}.db", id.replace('.', "-"))))?,
+            Arc::new(NoopProvisioner),
+            report,
+        );
+        let error = service
+            .require_runtime_ready()
+            .await
+            .expect_err("failed prerequisite passed readiness");
+        assert_eq!(error.code(), "unsupported_capability");
+        assert!(error.to_string().contains(id));
+    }
     Ok(())
 }
 

@@ -848,11 +848,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
 
     pub async fn require_runtime_ready(&self) -> Result<(), ServiceError> {
         let report = self.doctor_report().await;
-        if let Some(check) = report
-            .checks
-            .into_iter()
-            .find(|check| check.status != gascan_core::doctor::DoctorStatus::Pass)
-        {
+        if let Some(check) = report.runtime_readiness_failure() {
             return Err(ServiceError::Runtime(RuntimeError::UnsupportedCapability {
                 capability: format!("{}: {}; remedy: {}", check.id, check.detail, check.remedy),
             }));
