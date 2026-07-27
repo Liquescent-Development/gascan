@@ -15,7 +15,7 @@ use tempfile::TempDir;
 
 const REVIEWED_GASCAMP_REVISION: &str = "f6b248c5926240856dbea83d1d2c5c90ea1c1456";
 
-const REQUIRED: [&str; 19] = [
+const REQUIRED: [&str; 20] = [
     "Dockerfile",
     ".artifacts/mise-linux-arm64",
     ".artifacts/playwright-chromium-reviewed",
@@ -33,11 +33,12 @@ const REQUIRED: [&str; 19] = [
     "workstation/npm-cache",
     "workstation/package-lock.json",
     "workstation/package.json",
+    "workstation/starship.tar.gz",
     "workstation/target-lock.toml",
     "tests/image/system-tools.txt",
 ];
 
-const NATIVE_FIXTURES: [(&str, &[u8], &str, &str); 4] = [
+const NATIVE_FIXTURES: [(&str, &[u8], &str, &str); 5] = [
     (
         "claude-native.tgz",
         b"claude native fixture\n",
@@ -47,6 +48,12 @@ const NATIVE_FIXTURES: [(&str, &[u8], &str, &str); 4] = [
     ("glab.tar.gz", b"glab fixture\n", "tar_gz", "gitlab.com"),
     ("herdr", b"herdr fixture\n", "raw_binary", "github.com"),
     ("neovim.tar.gz", b"neovim fixture\n", "tar_gz", "github.com"),
+    (
+        "starship.tar.gz",
+        b"starship fixture\n",
+        "tar_gz",
+        "github.com",
+    ),
 ];
 const NPM_FIXTURES: [(&str, &[u8]); 5] = [
     ("claude", b"claude npm fixture\n"),
@@ -1418,9 +1425,10 @@ case "$*" in
   *'prepare-workspace-context -- --connected-lock'*)
     printf '%s\n%s\n%s\n%s\n%s\n' 'ubuntu@sha256:{digest}' 'https://example.invalid/mise' '{mise}' 'https://example.invalid/chromium' '{chromium}' ;;
   *'prepare-workspace-context -- --workstation-lock'*)
-    printf '%s\n%s\n%s\n' \
+    printf '%s\n%s\n%s\n%s\n' \
       'receipt	prefetch-lock.sha256	{receipt}' \
       'native	herdr	workstation-github	https://github.com/example/herdr	{native}	1' \
+      'native	starship.tar.gz	workstation-github	https://github.com/example/starship	{native}	1' \
       'npm	npm-cache/_cacache/content-v2/sha512/aa/bb/cc	workstation-npm	https://registry.npmjs.org/example/-/example.tgz	sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==	209715200' ;;
   *'prepare-workspace-context -- --publish-workstation-cache'*)
     mv "$previous/workstation" "$last" ;;
@@ -1484,4 +1492,8 @@ esac
         "a".repeat(64)
     )));
     assert!(calls.contains(&format!("image inspect ubuntu@sha256:{}\n", "a".repeat(64))));
+    assert!(
+        root.join(".artifacts/workstation/starship.tar.gz")
+            .is_file()
+    );
 }

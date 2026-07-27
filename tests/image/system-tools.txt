@@ -1,4 +1,5 @@
 autoconf
+bash-completion
 bind9-dnsutils
 bison
 build-essential

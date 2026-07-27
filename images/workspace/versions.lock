@@ -1,8 +1,8 @@
 base_image = "ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab"
-ubuntu_snapshot = "2026-07-13T00:00:00Z"
 system_packages_sha256 = "a17fcdf2d9a54e9287711cca394a37b82d742aae570b5c51da9fa110ba925624"
+ubuntu_snapshot = "2026-07-13T00:00:00Z"
 workspace_build_mode = "connected"
-workspace_tag = "gascan-workspace:0cda90a4b7ac4969"
+workspace_tag = "gascan-workspace:f0078fa83191dc73"
 
 [gascamp]
 revision = "f6b248c5926240856dbea83d1d2c5c90ea1c1456"
@@ -31,27 +31,6 @@ rust = "1.97.0"
 media_type = "application/vnd.gascan.workspace-bundle.v1+tar.zstd"
 platform = "linux/arm64"
 publication = "pending"
-
-[workstation_commands]
-cargo = "cargo 1.97.0"
-dig = "DiG 9.18.39-0ubuntu0.24.04.5-Ubuntu"
-emacs = "GNU Emacs 29.3"
-fd = "fdfind 9.0.0"
-fzf = "0.44.1 (debian)"
-gh = "gh version 2.45.0"
-git = "git version 2.43.0"
-ifconfig = "net-tools 2.10"
-ip = "ip utility, iproute2-6.1.0"
-nc = "OpenBSD netcat (Debian patchlevel 1.226-1ubuntu2)"
-netstat = "net-tools 2.10"
-pico = "GNU nano, version 7.2"
-ping = "ping from iputils 20240117"
-rg = "ripgrep 14.1.0"
-rustc = "rustc 1.97.0"
-ss = "ss utility, iproute2-6.1.0"
-tmux = "tmux 3.4"
-traceroute = "Modern traceroute for Linux, version 2.1.5"
-vim = "VIM - Vi IMproved 9.1"
 
 [workstation_artifacts.claude]
 kind = "npm_tgz"
@@ -100,6 +79,35 @@ sha256 = "420113c0282160e6181656fd16cf18742f76bf9040ee3dfb9cb67e3e6ad5641c"
 size = 4967228
 url = "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.81.1.tgz"
 version = "0.81.1"
+
+[workstation_artifacts.starship]
+kind = "tar_gz"
+platform = "linux-arm64"
+sha256 = "01517aab398959ea9ea73bdb4f032ea4dbb51dff5c8e5eb05b4a1b9b7ab872b8"
+size = 4652881
+url = "https://github.com/starship/starship/releases/download/v1.25.1/starship-aarch64-unknown-linux-musl.tar.gz"
+version = "1.25.1"
+
+[workstation_commands]
+cargo = "cargo 1.97.0"
+dig = "DiG 9.18.39-0ubuntu0.24.04.5-Ubuntu"
+emacs = "GNU Emacs 29.3"
+fd = "fdfind 9.0.0"
+fzf = "0.44.1 (debian)"
+gh = "gh version 2.45.0"
+git = "git version 2.43.0"
+ifconfig = "net-tools 2.10"
+ip = "ip utility, iproute2-6.1.0"
+nc = "OpenBSD netcat (Debian patchlevel 1.226-1ubuntu2)"
+netstat = "net-tools 2.10"
+pico = "GNU nano, version 7.2"
+ping = "ping from iputils 20240117"
+rg = "ripgrep 14.1.0"
+rustc = "rustc 1.97.0"
+ss = "ss utility, iproute2-6.1.0"
+tmux = "tmux 3.4"
+traceroute = "Modern traceroute for Linux, version 2.1.5"
+vim = "VIM - Vi IMproved 9.1"
 
 [workstation_npm]
 npm_version = "11.12.1"

@@ -92,8 +92,9 @@ struct ClaudeNative {
     platform: String,
 }
 
-const REQUIRED_WORKSTATION_ARTIFACTS: &[&str] =
-    &["claude", "codex", "pi", "herdr", "glab", "neovim"];
+const REQUIRED_WORKSTATION_ARTIFACTS: &[&str] = &[
+    "claude", "codex", "pi", "herdr", "glab", "neovim", "starship",
+];
 
 #[derive(Deserialize)]
 struct WorkspaceBundles {
@@ -220,6 +221,16 @@ fn every_remote_image_input_is_immutable_and_checksummed() {
             assert!(
                 matches!(artifact.kind.as_str(), "npm_tgz" | "tar_gz"),
                 "{name}"
+            );
+        }
+        if name == "starship" {
+            assert_eq!(artifact.version, "1.25.1");
+            assert_eq!(artifact.platform, "linux-arm64");
+            assert_eq!(artifact.kind, "tar_gz");
+            assert!(
+                artifact
+                    .url
+                    .ends_with("/starship-aarch64-unknown-linux-musl.tar.gz")
             );
         }
     }

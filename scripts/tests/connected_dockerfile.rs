@@ -19,6 +19,7 @@ const RUNTIME_PATH: &str = concat!(
 );
 const EXPECTED_SYSTEM_TOOLS: &str = "\
 autoconf
+bash-completion
 bind9-dnsutils
 bison
 build-essential
@@ -755,6 +756,109 @@ fn workstation_installer_rejects_unsafe_archives_behaviorally() {
 }
 
 #[test]
+fn workstation_installer_accepts_only_the_reviewed_starship_archive_behaviorally() {
+    let installer = root().join("images/workspace/bin/install-workstation-artifacts");
+    let temporary = tempfile::tempdir().unwrap();
+    let make_archive = |name: &str, scenario: &str| {
+        let archive = temporary.path().join(name);
+        let status = Command::new("python3")
+            .args([
+                "-c",
+                r#"import io,sys,tarfile
+archive,scenario=sys.argv[1:]
+elf=bytearray(20)
+elf[:6]=b'\x7fELF\x02\x01'
+elf[18:20]=(183).to_bytes(2,'little')
+def add_file(t,name,data,mode=0o755):
+ i=tarfile.TarInfo(name); i.mode=mode; i.size=len(data); t.addfile(i,io.BytesIO(data))
+with tarfile.open(archive,'w:gz') as t:
+ if scenario == 'duplicate':
+  add_file(t,'starship',elf); add_file(t,'starship',elf)
+ elif scenario == 'escaping-link':
+  add_file(t,'starship',elf)
+  i=tarfile.TarInfo('escape'); i.type=tarfile.SYMTYPE; i.linkname='../escape'; t.addfile(i)
+ elif scenario == 'wrong-arch':
+  elf[18:20]=(62).to_bytes(2,'little'); add_file(t,'starship',elf)
+ elif scenario == 'extra-executable':
+  add_file(t,'starship',elf); add_file(t,'helper',elf)
+ else:
+  add_file(t,'starship',elf)
+"#,
+            ])
+            .args([archive.to_str().unwrap(), scenario])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        archive
+    };
+    let install = |archive: &Path, destination: &Path, size: u64, digest: &str| {
+        Command::new(&installer)
+            .args([
+                "install-starship",
+                archive.to_str().unwrap(),
+                destination.to_str().unwrap(),
+                &size.to_string(),
+                digest,
+            ])
+            .status()
+            .unwrap()
+    };
+
+    let valid = make_archive("valid-starship.tar.gz", "valid");
+    let valid_bytes = fs::read(&valid).unwrap();
+    let valid_size = u64::try_from(valid_bytes.len()).unwrap();
+    let valid_sha = format!("{:x}", Sha256::digest(&valid_bytes));
+    assert!(
+        !install(
+            &valid,
+            &temporary.path().join("wrong-size"),
+            valid_size - 1,
+            &valid_sha
+        )
+        .success(),
+        "Starship archive size mismatch was accepted"
+    );
+    assert!(
+        !install(
+            &valid,
+            &temporary.path().join("wrong-digest"),
+            valid_size,
+            &"0".repeat(64)
+        )
+        .success(),
+        "Starship archive digest mismatch was accepted"
+    );
+    let installed = temporary.path().join("installed-starship");
+    assert!(
+        install(&valid, &installed, valid_size, &valid_sha).success(),
+        "reviewed Starship archive was rejected"
+    );
+    assert_eq!(fs::read(&installed).unwrap()[..6], *b"\x7fELF\x02\x01");
+
+    for (name, scenario) in [
+        ("duplicate-starship.tar.gz", "duplicate"),
+        ("escaping-starship.tar.gz", "escaping-link"),
+        ("wrong-arch-starship.tar.gz", "wrong-arch"),
+        ("extra-executable-starship.tar.gz", "extra-executable"),
+    ] {
+        let archive = make_archive(name, scenario);
+        let bytes = fs::read(&archive).unwrap();
+        let size = u64::try_from(bytes.len()).unwrap();
+        let sha = format!("{:x}", Sha256::digest(&bytes));
+        assert!(
+            !install(
+                &archive,
+                &temporary.path().join(format!("installed-{scenario}")),
+                size,
+                &sha
+            )
+            .success(),
+            "invalid Starship archive was accepted: {scenario}"
+        );
+    }
+}
+
+#[test]
 fn workstation_installer_enforces_exact_target_npm_inventory_behaviorally() {
     let installer = root().join("images/workspace/bin/install-workstation-artifacts");
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
@@ -976,6 +1080,7 @@ fn workstation_installer_enforces_file_npm_version_and_mode_boundaries_behaviora
             "0.11.7",
             "NVIM v0.11.7\nBuild type: Release\nLuaJIT 2.1\n",
         ),
+        ("starship", "1.25.1", "starship 1.25.1\n"),
     ] {
         assert!(
             version_status(tool, expected, output).success(),
@@ -990,6 +1095,7 @@ fn workstation_installer_enforces_file_npm_version_and_mode_boundaries_behaviora
         ("herdr", "0.7.5", "other 0.7.5\n"),
         ("glab", "1.109.0", "glab 1.109.0beta (abcdef)\n"),
         ("nvim", "0.11.7", "NVIM v0.11.70\n"),
+        ("starship", "1.25.1", "starship 1.25.10\n"),
     ] {
         assert!(
             !version_status(tool, expected, output).success(),
@@ -1452,6 +1558,19 @@ fn dockerfile_installs_exactly_the_sorted_unique_reviewed_package_list() {
         );
     }
     assert_sole_reviewed_package_install(&dockerfile).unwrap();
+}
+
+#[test]
+fn workstation_package_inputs_include_bash_completion_exactly_once() {
+    let package_text = fs::read_to_string(root().join("tests/image/system-tools.txt")).unwrap();
+    assert_eq!(
+        package_text
+            .lines()
+            .filter(|package| *package == "bash-completion")
+            .count(),
+        1
+    );
+    assert_exact_system_tools(&package_text).unwrap();
 }
 
 #[test]

@@ -142,7 +142,13 @@ fn populate_minimal_workstation(repository: &Path, cache: &Path) {
     let native = b"native\n";
     let npm_bootstrap = b"npm bootstrap\n";
     fs::create_dir_all(cache.join("workstation")).unwrap();
-    for name in ["claude-native.tgz", "glab.tar.gz", "herdr", "neovim.tar.gz"] {
+    for name in [
+        "claude-native.tgz",
+        "glab.tar.gz",
+        "herdr",
+        "neovim.tar.gz",
+        "starship.tar.gz",
+    ] {
         fs::write(cache.join("workstation").join(name), native).unwrap();
     }
     fs::write(cache.join("workstation/npm-cli.tgz"), npm_bootstrap).unwrap();
@@ -154,8 +160,9 @@ fn populate_minimal_workstation(repository: &Path, cache: &Path) {
         ("herdr", "raw_binary", "github.com"),
         ("neovim", "tar_gz", "github.com"),
         ("pi", "npm_tgz", "registry.npmjs.org"),
+        ("starship", "tar_gz", "github.com"),
     ] {
-        let bytes: &[u8] = if matches!(name, "glab" | "herdr" | "neovim") {
+        let bytes: &[u8] = if matches!(name, "glab" | "herdr" | "neovim" | "starship") {
             native
         } else {
             npm_fixtures
