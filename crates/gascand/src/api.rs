@@ -1743,7 +1743,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             tty: true,
         });
         let argv = if command.argv.is_empty() {
-            vec!["sh".to_owned()]
+            vec!["/bin/bash".to_owned(), "--login".to_owned()]
         } else {
             argv_from_wire(command.argv).map_err(ApiInputError::status)?
         };
