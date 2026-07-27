@@ -68,7 +68,7 @@ setup = ".gascan/setup.sh"
 
 [resources]
 cpus = 1
-memory = "256MiB"
+memory = "1GiB"
 
 [tools]
 elixir = "1.20.2-otp-29"
