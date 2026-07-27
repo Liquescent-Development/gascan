@@ -2417,9 +2417,8 @@ mod tests {
         checksum_for, chromium_from_manifest, configured_npm_command, merge_workstation_sections,
         next_npm_download_limit, npm_metadata_url, preserve_reviewed_workstation_artifacts,
         publish_generated_bundle_with, read_existing_bundle_without_writes,
-        rust_version_from_channel, sha256, validate_claude_elf,
-        verify_and_publish_generated_bundle_with, verify_npm_closure_tarballs_with,
-        verify_npm_closure_tarballs_with_limits,
+        rust_version_from_channel, validate_claude_elf, verify_and_publish_generated_bundle_with,
+        verify_npm_closure_tarballs_with, verify_npm_closure_tarballs_with_limits,
     };
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use sha2::{Digest, Sha512};
@@ -2748,7 +2747,7 @@ scripts = "old"
     }
 
     #[test]
-    fn artifact_byte_mismatch_prevents_generated_output_staging_and_publication() {
+    fn preserved_legacy_artifact_byte_mismatch_prevents_staging_and_publication() {
         for mismatch in ["size", "digest"] {
             let temporary = tempfile::tempdir().unwrap();
             let paths = ["manifest.json", "package-lock.json", "versions.lock"]
@@ -2764,36 +2763,39 @@ scripts = "old"
                 (paths[2].as_path(), new[2]),
             ];
 
-            let mut artifacts = BTreeMap::new();
-            let mut bodies = BTreeMap::new();
-            for name in [
-                "claude", "codex", "pi", "herdr", "glab", "neovim", "starship",
-            ] {
-                let url = format!("https://example.invalid/{name}");
-                let bytes = format!("{name} reviewed bytes").into_bytes();
-                artifacts.insert(
-                    name.to_owned(),
-                    super::WorkstationArtifact {
-                        version: "1.2.3".to_owned(),
-                        url: url.clone(),
-                        sha256: sha256(&bytes),
-                        platform: "linux-arm64".to_owned(),
-                        kind: "tar_gz".to_owned(),
-                        size: u64::try_from(bytes.len()).unwrap(),
-                    },
-                );
-                bodies.insert(url, bytes);
-            }
-            let starship = artifacts.get_mut("starship").unwrap();
+            let parsed: super::WorkstationValidationLock =
+                toml::from_str(include_str!("../../../images/workspace/versions.lock")).unwrap();
+            let mut resolved = parsed.workstation_artifacts;
+            let claude_bytes = b"claude resolved bytes".to_vec();
+            let claude = resolved.get_mut("claude").unwrap();
+            claude.sha256 =
+                "03dd245e065fcd87e2b5fc079b3ff4144962f9f9427d9a762b55c27ffc9157ae".to_owned();
+            claude.size = u64::try_from(claude_bytes.len()).unwrap();
+            let claude_url = claude.url.clone();
+            let starship_bytes = b"starship resolved bytes".to_vec();
+            let starship = resolved.get_mut("starship").unwrap();
+            starship.sha256 =
+                "d92613055916f08c1f04989d90b2caf2e31aa1c553eece916e7d8b591be283b9".to_owned();
+            starship.size = u64::try_from(starship_bytes.len()).unwrap();
+            let starship_url = starship.url.clone();
+            let bodies =
+                BTreeMap::from([(claude_url, claude_bytes), (starship_url, starship_bytes)]);
+            let mut existing = resolved.clone();
+            existing.remove("starship");
+            let reviewed_claude = existing.get_mut("claude").unwrap();
             if mismatch == "size" {
-                starship.size += 1;
+                reviewed_claude.size += 1;
             } else {
-                starship.sha256 = "0".repeat(64);
+                reviewed_claude.sha256 = "0".repeat(64);
             }
+            let selected = preserve_reviewed_workstation_artifacts(&resolved, &existing).unwrap();
+            assert_eq!(selected["claude"], existing["claude"]);
+            assert_ne!(selected["claude"], resolved["claude"]);
+            assert_eq!(selected["starship"], resolved["starship"]);
 
             let mut boundaries = Vec::new();
             let result = verify_and_publish_generated_bundle_with(
-                &artifacts,
+                &selected,
                 |url, maximum| {
                     let bytes = bodies.get(url).unwrap().clone();
                     assert!(bytes.len() <= maximum);
@@ -2811,7 +2813,7 @@ scripts = "old"
                 result
                     .unwrap_err()
                     .to_string()
-                    .contains("starship workstation artifact bytes differ from reviewed lock"),
+                    .contains("claude workstation artifact bytes differ from reviewed lock"),
                 "{mismatch} mismatch was not rejected"
             );
             assert!(
