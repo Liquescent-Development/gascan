@@ -517,6 +517,78 @@ fn writable_rust_bootstrap_revalidates_a_marker_publication_race() {
 }
 
 #[test]
+fn writable_rust_bootstrap_recovers_every_valid_gnu_no_clobber_race() {
+    let script = root().join("images/workspace/bin/initialize-rust-home");
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let destination = temp.path().join("destination");
+    write_test_toolchain(
+        &source,
+        "1.97.0-aarch64-unknown-linux-gnu",
+        "bundled cargo\n",
+    );
+    let fake_mv = temp.path().join("test-bin/mv");
+    fs::create_dir_all(fake_mv.parent().unwrap()).unwrap();
+    fs::write(
+        &fake_mv,
+        "#!/bin/sh\nprevious=\nlast=\nfor argument in \"$@\"; do previous=$last; last=$argument; done\nkind=\ncase \"$last\" in\n  */toolchains/*) kind=toolchain; cp -R \"$previous\" \"$last\" ;;\n  */update-hashes/*) kind=hash; cp \"$previous\" \"$last\" ;;\n  */cargo-bin/rustup) kind=rustup; cp \"$previous\" \"$last\"; chmod 0700 \"$last\" ;;\n  */cargo-bin/*) kind=proxy; ln -s \"$(readlink \"$previous\")\" \"$last\" ;;\n  */settings.toml) kind=settings; cp \"$previous\" \"$last\" ;;\n  */.gascan-bundled-toolchains-v1) kind=marker; cp \"$previous\" \"$last\" ;;\nesac\nif [ -n \"$kind\" ]; then printf '%s\\n' \"$kind\" >>\"$GASCAN_TEST_COLLISIONS\"; exit 1; fi\nexec \"$GASCAN_TEST_REAL_MV\" \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_mv, fs::Permissions::from_mode(0o700)).unwrap();
+    let collisions = temp.path().join("collisions");
+
+    let result = rust_seed_command(&script, &source, &destination, temp.path())
+        .env("GASCAN_TEST_REAL_MV", gnu_mv_path())
+        .env("GASCAN_TEST_COLLISIONS", &collisions)
+        .status()
+        .unwrap();
+    assert!(result.success());
+    let collision_kinds = fs::read_to_string(collisions).unwrap();
+    for kind in ["toolchain", "hash", "rustup", "proxy", "settings", "marker"] {
+        assert!(
+            collision_kinds.lines().any(|actual| actual == kind),
+            "missing GNU no-clobber race: {kind}"
+        );
+    }
+    assert!(rust_staging_residue(&destination).is_empty());
+    assert!(rust_proxy_staging_residue(&destination).is_empty());
+    assert!(rust_settings_staging_residue(&destination).is_empty());
+}
+
+#[test]
+fn writable_rust_bootstrap_rejects_every_unsafe_gnu_no_clobber_race() {
+    for unsafe_kind in ["toolchain", "hash", "rustup", "proxy", "settings", "marker"] {
+        let script = root().join("images/workspace/bin/initialize-rust-home");
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        write_test_toolchain(
+            &source,
+            "1.97.0-aarch64-unknown-linux-gnu",
+            "bundled cargo\n",
+        );
+        let fake_mv = temp.path().join("test-bin/mv");
+        fs::create_dir_all(fake_mv.parent().unwrap()).unwrap();
+        fs::write(
+            &fake_mv,
+            "#!/bin/sh\nprevious=\nlast=\nfor argument in \"$@\"; do previous=$last; last=$argument; done\nkind=\ncase \"$last\" in\n  */toolchains/*) kind=toolchain ;;\n  */update-hashes/*) kind=hash ;;\n  */cargo-bin/rustup) kind=rustup ;;\n  */cargo-bin/*) kind=proxy ;;\n  */settings.toml) kind=settings ;;\n  */.gascan-bundled-toolchains-v1) kind=marker ;;\nesac\nif [ \"$kind\" = \"$GASCAN_TEST_UNSAFE_KIND\" ]; then\n  case \"$kind\" in\n    toolchain|settings) mkdir \"$last\" ;;\n    hash) printf 'wrong hash\\n' >\"$last\" ;;\n    rustup) printf '#!/bin/sh\\nexit 99\\n' >\"$last\"; chmod 0700 \"$last\" ;;\n    proxy) ln -s wrong-target \"$last\" ;;\n    marker) printf 'unknown-toolchain\\n' >\"$last\"; chmod 0600 \"$last\" ;;\n  esac\n  exit 1\nfi\nexec \"$GASCAN_TEST_REAL_MV\" \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_mv, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let result = rust_seed_command(&script, &source, &destination, temp.path())
+            .env("GASCAN_TEST_REAL_MV", gnu_mv_path())
+            .env("GASCAN_TEST_UNSAFE_KIND", unsafe_kind)
+            .status()
+            .unwrap();
+        assert!(!result.success(), "accepted unsafe {unsafe_kind} race");
+        assert!(rust_staging_residue(&destination).is_empty());
+        assert!(rust_proxy_staging_residue(&destination).is_empty());
+        assert!(rust_settings_staging_residue(&destination).is_empty());
+    }
+}
+
+#[test]
 fn writable_rust_bootstrap_rejects_an_unsafe_existing_marker() {
     for case in [
         "unknown",

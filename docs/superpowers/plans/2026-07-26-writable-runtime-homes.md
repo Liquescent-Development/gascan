@@ -648,7 +648,7 @@ cargo run --manifest-path "$fixture/rust-app/Cargo.toml"
 cargo install --path "$fixture/rust-bin"
 npm pack "$fixture/npm-bin" --pack-destination "$fixture"
 npm install --global "$fixture/gascan-npm-local-1.0.0.tgz"
-go install "$fixture/go-bin"
+(cd "$fixture" && go install ./go-bin)
 (cd "$fixture/python-wheel" && python -m zipfile -c ../gascan_python_local-0.1.0-py3-none-any.whl ...)
 python -m pip install --user --no-deps "$fixture/gascan_python_local-0.1.0-py3-none-any.whl"
 (cd "$fixture/ruby-bin" && gem build gascan-ruby-local.gemspec --output ../ruby-bin.gem)

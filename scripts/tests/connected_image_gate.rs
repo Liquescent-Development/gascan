@@ -189,7 +189,7 @@ exec "$executable" "$@"
     let container = temp.path().join("container");
     executable(
         &container,
-        "#!/bin/sh\nset -eu\nif [ \"$1\" = list ]; then first=true; printf '['; for name in gascan-image-user-test-$OWNER gascan-image-polyglot-test-$OWNER gascan-image-gascamp-test-$OWNER; do if [ \"${RESIDUE:-}\" = \"$name\" ] || [ -f \"$STATE/$name\" ]; then $first || printf ','; first=false; printf '{\"id\":\"%s\",\"configuration\":{\"id\":\"%s\",\"labels\":{}}}' \"$name\" \"$name\"; fi; done; printf ']\\n'; exit 0; fi\nexec \"$RAW_CONTAINER\" \"$@\"\n",
+        "#!/bin/sh\nset -eu\nif [ \"$1\" = list ]; then first=true; printf '['; for name in gascan-image-user-test-$OWNER gascan-image-polyglot-test-$OWNER gascan-image-gascamp-test-$OWNER gascan-image-workstation-test-$OWNER gascan-image-ws-network-test-$OWNER gascan-image-ssh-test-$OWNER; do if [ \"${RESIDUE:-}\" = \"$name\" ] || [ -f \"$STATE/$name\" ]; then $first || printf ','; first=false; printf '{\"id\":\"%s\",\"configuration\":{\"id\":\"%s\",\"labels\":{}}}' \"$name\" \"$name\"; fi; done; printf ']\\n'; exit 0; fi\nexec \"$RAW_CONTAINER\" \"$@\"\n",
     );
     let state = temp.path().join("state");
     fs::create_dir(&state).unwrap();
@@ -637,7 +637,7 @@ fn workstation_contract_is_wired_into_the_release_blocking_gate() {
         "offline_verified=false",
         "network_verified=false",
         "container_inventory_proves_absent",
-        "refusing cleanup of never-verified container",
+        "refusing cleanup of unattested container",
     ] {
         assert!(
             smoke.contains(required),
@@ -1153,6 +1153,55 @@ fn workstation_volume_delete_failure_is_detected_by_exact_inventory_and_never_pu
     let calls = fs::read_to_string(&f.calls).unwrap();
     assert!(calls.contains(&format!("container:volume delete {name}")));
     assert!(calls.contains("container:volume list --format json"));
+    assert_no_publications(&f);
+}
+
+#[test]
+fn network_image_attestation_failure_is_recovered_without_silent_residue() {
+    let mut f = fixture();
+    seed_valid_receipt(&f);
+    let name = format!("gascan-image-ws-network-test-{TOKEN}");
+    let real_raw = f.temp.path().join("container-raw");
+    let mismatch = f.temp.path().join("container-network-image-mismatch");
+    executable(
+        &mismatch,
+        "#!/bin/sh\nset -eu\nif [ \"$1\" = inspect ] && [ \"$2\" = \"gascan-image-ws-network-test-$OWNER\" ]; then\n  \"$REAL_RAW_CONTAINER\" \"$@\" | sed 's/sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc/g'\n  exit 0\nfi\nexec \"$REAL_RAW_CONTAINER\" \"$@\"\n",
+    );
+    let output = f
+        .command
+        .env("RAW_CONTAINER", &mismatch)
+        .env("REAL_RAW_CONTAINER", &real_raw)
+        .arg("--prebuilt")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let calls = fs::read_to_string(&f.calls).unwrap();
+    assert!(calls.contains(&format!("create --name {name} ")));
+    assert!(calls.contains(&format!("stop --time 5 {name}")));
+    assert!(calls.contains(&format!("delete {name}")));
+    assert!(!f.temp.path().join("state").join(&name).exists());
+    assert_no_publications(&f);
+}
+
+#[test]
+fn foreign_network_attestation_failure_is_visible_and_never_deleted() {
+    let mut f = fixture();
+    seed_valid_receipt(&f);
+    let name = format!("gascan-image-ws-network-test-{TOKEN}");
+    assert!(
+        !f.command
+            .env("FOREIGN", &name)
+            .arg("--prebuilt")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let calls = fs::read_to_string(&f.calls).unwrap();
+    assert!(calls.contains(&format!("create --name {name} ")));
+    assert!(calls.contains(&format!("inspect {name}")));
+    assert!(!calls.contains(&format!("stop --time 5 {name}")));
+    assert!(!calls.contains(&format!("delete {name}")));
+    assert!(f.temp.path().join("state").join(&name).exists());
     assert_no_publications(&f);
 }
 

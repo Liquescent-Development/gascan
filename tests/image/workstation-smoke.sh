@@ -61,9 +61,16 @@ cleanup_container() {
   $created || return 0
   name=$target
   if ! $verified; then
-    name=$original_name
-    printf 'refusing cleanup of never-verified container: %s\n' "$target" >&2
-    return 1
+    if owned && owned; then
+      verified=true
+    elif container_inventory_proves_absent "$target"; then
+      name=$original_name
+      return 0
+    else
+      name=$original_name
+      printf 'refusing cleanup of unattested container: %s\n' "$target" >&2
+      return 1
+    fi
   fi
   if owned && owned; then
     if ! bounded_container stop --time 5 "$name" >/dev/null 2>&1; then

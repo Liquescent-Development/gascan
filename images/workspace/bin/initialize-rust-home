@@ -352,12 +352,25 @@ for source in "$source_root"/toolchains/*; do
         printf '%s\n' "incomplete bundled Rust toolchain: $toolchain" >&2
         exit 1
     fi
-    mv --no-clobber --no-target-directory "$stage" "$destination"
-    if [ -d "$stage" ]; then
+    if ! mv --no-clobber --no-target-directory "$stage" "$destination"; then
+        if [ -L "$destination" ] || [ ! -d "$destination" ]; then
+            printf '%s\n' "failed Rust toolchain publication: $destination" >&2
+            exit 1
+        fi
+        for published_command in cargo rustc; do
+            published_path="$destination/bin/$published_command"
+            if [ -L "$published_path" ] ||
+                [ ! -f "$published_path" ] ||
+                [ ! -x "$published_path" ]
+            then
+                printf '%s\n' "invalid raced Rust toolchain: $destination" >&2
+                exit 1
+            fi
+        done
         cleanup
-        continue
+    else
+        stage=
     fi
-    stage=
 
     source_hash="$source_root/update-hashes/$toolchain"
     destination_hash="$destination_root/update-hashes/$toolchain"
@@ -368,7 +381,15 @@ for source in "$source_root"/toolchains/*; do
         stage=$hash_stage
         chmod 0600 "$hash_stage"
         cp "$source_hash" "$hash_stage"
-        mv --no-clobber --no-target-directory "$hash_stage" "$destination_hash"
+        if ! mv --no-clobber --no-target-directory "$hash_stage" "$destination_hash"; then
+            if [ -L "$destination_hash" ] ||
+                [ ! -f "$destination_hash" ] ||
+                ! cmp -s "$hash_stage" "$destination_hash"
+            then
+                printf '%s\n' "failed Rust update-hash publication: $destination_hash" >&2
+                exit 1
+            fi
+        fi
         cleanup
     fi
 done
@@ -395,7 +416,16 @@ if [ ! -e "$destination_rustup" ] && [ ! -L "$destination_rustup" ]; then
         printf '%s\n' "incomplete rustup proxy publication" >&2
         exit 1
     fi
-    mv --no-clobber --no-target-directory "$rustup_stage" "$destination_rustup"
+    if ! mv --no-clobber --no-target-directory "$rustup_stage" "$destination_rustup"; then
+        if [ -L "$destination_rustup" ] ||
+            [ ! -f "$destination_rustup" ] ||
+            [ ! -x "$destination_rustup" ] ||
+            ! cmp -s "$rustup_stage" "$destination_rustup"
+        then
+            printf '%s\n' "failed rustup proxy publication: $destination_rustup" >&2
+            exit 1
+        fi
+    fi
     cleanup
 fi
 if [ -L "$destination_rustup" ] ||
@@ -415,7 +445,15 @@ do
         proxy_stage=$(mktemp -d "$cargo_destination_bin/.gascan-rust-proxy.$proxy.XXXXXX")
         stage=$proxy_stage
         ln -s rustup "$proxy_stage/proxy"
-        mv --no-clobber --no-target-directory "$proxy_stage/proxy" "$destination_proxy"
+        if ! mv --no-clobber --no-target-directory "$proxy_stage/proxy" "$destination_proxy"; then
+            if [ ! -L "$destination_proxy" ] ||
+                [ "$(readlink "$destination_proxy")" != rustup ] ||
+                [ ! -x "$destination_proxy" ]
+            then
+                printf '%s\n' "failed Rust proxy publication: $destination_proxy" >&2
+                exit 1
+            fi
+        fi
         cleanup
     fi
     if [ -L "$destination_proxy" ]; then
@@ -442,7 +480,12 @@ if [ ! -e "$destination_settings" ] && [ ! -L "$destination_settings" ]; then
         printf '\n%s\n' '[overrides]'
     } >"$settings_stage"
     chmod 0600 "$settings_stage"
-    mv --no-clobber --no-target-directory "$settings_stage" "$destination_settings"
+    if ! mv --no-clobber --no-target-directory "$settings_stage" "$destination_settings"; then
+        if [ -L "$destination_settings" ] || [ ! -f "$destination_settings" ]; then
+            printf '%s\n' "failed writable rustup settings publication: $destination_settings" >&2
+            exit 1
+        fi
+    fi
     cleanup
 fi
 if [ -L "$destination_settings" ] || [ ! -f "$destination_settings" ]; then

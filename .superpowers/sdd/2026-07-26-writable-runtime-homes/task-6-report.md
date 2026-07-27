@@ -64,7 +64,7 @@ also corrected four host-side assumptions:
 
 - npm now packs the local fixture before global install, avoiding a symlink
   back into `/tmp`;
-- Python now installs a deterministic standard-library-built wheel, avoiding
+- Python now installs a self-contained, network-independent standard-library-built wheel, avoiding
   absent setuptools and build-isolation network access;
 - Ruby builds from the gemspec directory so relative `spec.files` resolve;
 - the owner-scoped network container name is at most Apple's 64-character
@@ -352,6 +352,54 @@ The sandboxed workspace, scripts, and Swift attempts encountered only their
 known macOS PTY, local fixture-server, or compiler-cache permission denials.
 Each authoritative host-permission rerun passed.
 
+## Independent Review of the Second Live-Gate Fixes
+
+Independent read-only review of `49a638a..5b69d58` withheld rebuild approval
+for two Important findings:
+
+1. marker publication caught GNU no-clobber collisions, but toolchain,
+   update-hash, rustup-binary, proxy-symlink, and settings publication still
+   used bare collision-prone moves under `set -e`;
+2. a shortened network smoke container whose first image attestation failed
+   could remain outside both the local cleanup's verified set and the outer
+   gate's exact inventory set.
+
+Every publication family now catches nonzero GNU `mv`, independently validates
+the family-specific final object, cleans only its own stage, preserves valid
+user/raced entries, and fails on missing or unsafe finals. Injected real-GNU
+tests exercise valid and unsafe collisions for all six families and prove no
+staging residue:
+
+```text
+focused writable Rust bootstrap: 17 passed
+complete image_user_contract: 34 passed
+```
+
+The outer gate now registers both workstation container names and all three
+workstation volume names before smoke execution, validates exact label
+ownership before cleanup, and proves all registered names absent. The local
+trap distinguishes creation from image attestation: an unattested created
+container is independently double-attested by exact labels before mutation;
+foreign or indeterminate resources are never deleted and cause a visible hard
+failure.
+
+Executable adversarial tests prove both branches:
+
+- an owner-labeled network container with a deliberately mismatched image
+  attestation is stopped, deleted, and proven absent;
+- a foreign-labeled network container is never stopped or deleted, remains
+  visible to the outer inventory, fails the gate, and cannot publish.
+
+Review-fix verification:
+
+```text
+connected_image_gate: 33 passed
+scripts workspace: 437 passed (47 suites)
+clippy: no issues
+all 11 release contracts: PASS
+shell syntax, formatting, and diff hygiene: PASS
+```
+
 ## Refreshed Review and Minor Closure
 
 The read-only package
@@ -390,7 +438,7 @@ PASS
 
 ## Remaining Work
 
-1. Commit the latest live-gate fixes and obtain fresh independent approval.
+1. Obtain fresh independent approval for the follow-up review-fix commit.
 2. Run a fresh no-cache connected build and the complete live gate.
 3. Publish one unique digest-derived immutable GHCR candidate only after that
    gate passes.
