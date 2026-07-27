@@ -92,6 +92,29 @@ do
   }
 done
 
+manifest_reference=$repo_root/docs/reference/manifest.md
+for required in \
+  '| `tools` | `"10GiB"` | `/home/workspace/.local` |' \
+  '| `cache` | `"10GiB"` | `/home/workspace/.cache` |' \
+  '| `config` | `"1GiB"` | `/home/workspace/.config` |'
+do
+  grep -F "$required" "$manifest_reference" >/dev/null || {
+    printf 'manifest reference omits version-2 storage mount: %s\n' "$required" >&2
+    exit 1
+  }
+done
+for obsolete in \
+  '| `tools` | `"10GiB"` | `/home/workspace/.local/share/mise` |' \
+  '| `config` | `"1GiB"` | `/home/workspace/.config/gascan` |' \
+  '`/home/workspace/.local/share/mise` managed tools volume' \
+  'managed `/home/workspace/.config/gascan` volume'
+do
+  if grep -F "$obsolete" "$readme" "$manifest_reference" >/dev/null; then
+    printf 'public documentation retains obsolete storage boundary: %s\n' "$obsolete" >&2
+    exit 1
+  fi
+done
+
 checklist=$repo_root/docs/release/macos-checklist.md
 for required in \
   'managed storage layout version 2' \

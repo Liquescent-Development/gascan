@@ -189,3 +189,43 @@ contract's status was authoritative.
   when creating the local Task 5 commit. As already documented for Task 4,
   the task commit was therefore created with `--no-gpg-sign`; release tags
   remain subject to their separate signed provenance requirement.
+
+## Reviewer Documentation Follow-up
+
+A reviewer found two later README sentences and the public manifest reference
+still describing the former mise/config leaf directories as volume or mount
+boundaries. A focused release documentation contract was added first and
+failed with:
+
+```text
+manifest reference omits version-2 storage mount: | `tools` | `"10GiB"` | `/home/workspace/.local` |
+```
+
+The README now distinguishes the valid mise and Gas Can application
+subdirectories from the broad managed volume roots. The manifest reference
+lists the exact version-2 mounts:
+
+- `/home/workspace/.local`
+- `/home/workspace/.cache`
+- `/home/workspace/.config`
+
+The focused contract also rejects the former tools/config mount-table rows and
+the obsolete README leaf-as-volume phrases. Other public documentation was
+searched for both leaf paths; the remaining Herdr and application paths are
+valid subdirectory references rather than volume-boundary claims.
+
+Focused follow-up verification:
+
+```text
+rtk bash tests/release/smoke-contract.sh
+PASS: Gas Can release smoke command contract
+
+rtk cargo fmt --all -- --check
+PASS
+
+rtk cargo fmt --all --manifest-path scripts/Cargo.toml -- --check
+PASS
+
+rtk git diff --check
+PASS
+```

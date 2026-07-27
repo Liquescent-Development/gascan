@@ -555,16 +555,18 @@ startup. Diagnostic packages do not grant the sandbox extra Linux
 capabilities, devices, or host access.
 
 Image-owned workstation files under `/opt/gascan/workstation` are immutable.
-An explicit `[tools]` entry is installed into the sandbox's writable
-`/home/workspace/.local/share/mise` managed tools volume; its mise shim is
-first in `PATH`, ahead of the reviewed defaults in the immutable
-`/opt/gascan/mise` system data tree. The requested version therefore overrides
-an image default without changing the immutable workstation tree.
+An explicit `[tools]` entry is installed below
+`/home/workspace/.local/share/mise`, within the managed tools volume mounted at
+`/home/workspace/.local`. Its mise shim is first in `PATH`, ahead of the
+reviewed defaults in the immutable `/opt/gascan/mise` system data tree. The
+requested version therefore overrides an image default without changing the
+immutable workstation tree.
 
 Native Claude Code, Codex, Pi, GitHub CLI, and GitLab CLI configuration is
-sandbox-local under the managed `/home/workspace/.config/gascan` volume. Mise
-caches and Pi session data are kept separately under the managed
-`/home/workspace/.cache` volume. Herdr is configured to read
+sandbox-local below `/home/workspace/.config/gascan`, within the managed config
+volume mounted at `/home/workspace/.config`. Mise caches and Pi session data
+are kept separately in the managed cache volume mounted at
+`/home/workspace/.cache`. Herdr is configured to read
 `/home/workspace/.config/gascan/herdr/config.toml` and place its logs beside
 that file, but Gas Can does not create a Herdr configuration or login. Gas Can
 never imports the host home directory, SSH material, agent/forge tokens,
