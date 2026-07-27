@@ -7,13 +7,24 @@ inside_image() {
   test "$(id -g)" = 1000
   test "$(sudo -n id -u)" = 0
 
+  immutable=/opt/gascan/mise
+  test "$(stat -c %U:%G "$immutable")" = root:root
+  test ! -w "$immutable"
+
   for directory in \
-    /opt/gascan/mise \
-    /home/workspace/.cache \
+    /home/workspace/.local \
+    /home/workspace/.cache
+  do
+    test "$(stat -c %U:%G "$directory")" = workspace:workspace
+    test -w "$directory"
+  done
+
+  for directory in \
+    /home/workspace/.config \
     /home/workspace/.config/gascan
   do
-    test "$(stat -c %U "$directory")" = workspace
-    test "$(stat -c %G "$directory")" = workspace
+    test "$(stat -c %U:%G "$directory")" = root:workspace
+    test -w "$directory"
   done
 
   test ! -e /run/host-services/ssh-auth.sock

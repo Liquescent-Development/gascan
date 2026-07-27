@@ -976,6 +976,23 @@ fn smoke_fixture_uses_built_ref_and_checks_signal_and_zombies() {
 }
 
 #[test]
+fn smoke_fixture_distinguishes_immutable_and_writable_runtime_homes() {
+    let smoke = fs::read_to_string(root().join("tests/image/user-and-volumes.sh")).unwrap();
+    for required in [
+        r#"test "$(stat -c %U:%G "$immutable")" = root:root"#,
+        r#"test ! -w "$immutable""#,
+        r#"test "$(stat -c %U:%G "$directory")" = workspace:workspace"#,
+        r#"test "$(stat -c %U:%G "$directory")" = root:workspace"#,
+        r#"test -w "$directory""#,
+    ] {
+        assert!(
+            smoke.contains(required),
+            "missing runtime-home ownership contract: {required}"
+        );
+    }
+}
+
+#[test]
 fn smoke_fixture_restarts_and_rechecks_the_process_contract_after_stop() {
     let smoke = fs::read_to_string(root().join("tests/image/user-and-volumes.sh")).unwrap();
     assert_eq!(
