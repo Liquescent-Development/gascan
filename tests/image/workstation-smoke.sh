@@ -31,9 +31,9 @@ owned_image() {
   owned_container_from_approved_image "$name" "$owner_token" "$image_digest" "$local_image"
 }
 owned_volume() {
-  local volume=$1 inspect
-  inspect=$(bounded_container volume inspect "$volume") || return 1
-  printf '%s' "$inspect" | cargo run --quiet --locked --offline \
+  local volume=$1
+  bounded_container volume inspect "$volume" |
+    cargo run --quiet --locked --offline \
     --manifest-path "$root/scripts/Cargo.toml" --bin validate-owned-volume -- \
     "$volume" "$owner_token"
 }
@@ -169,12 +169,12 @@ owned_image
   npm install --global "$fixture/npm-bin" >/dev/null
 
   printf "%s\n" "module example.com/gascan/go-local" "go 1.26" \
-    >"$fixture/go-bin/go.mod"
+    >"$fixture/go.mod"
   printf "%s\n" \
     "package main" \
     "import \"fmt\"" \
     "func main() { fmt.Println(\"go-local-ok\") }" >"$fixture/go-bin/main.go"
-  go install "$fixture/go-bin"
+  (cd "$fixture" && go install ./go-bin)
 
   printf "%s\n" \
     "from setuptools import setup" \

@@ -4,6 +4,10 @@ use serde::Deserialize;
 
 type DynError = Box<dyn Error + Send + Sync>;
 
+// A single volume record is small. Read at most MAX+1 bytes so container CLI
+// output cannot cause unbounded memory growth before ownership is established.
+const MAX_VOLUME_INSPECT_BYTES: usize = 64 * 1024;
+
 #[derive(Deserialize)]
 struct VolumeRecord {
     id: String,
@@ -27,9 +31,16 @@ fn main() -> Result<(), DynError> {
         return Err("owner token must be 128-bit lowercase hexadecimal".into());
     }
 
-    let mut input = String::new();
-    std::io::stdin().read_to_string(&mut input)?;
-    let records: Vec<VolumeRecord> = serde_json::from_str(&input)?;
+    let mut input = Vec::with_capacity(MAX_VOLUME_INSPECT_BYTES + 1);
+    let stdin = std::io::stdin();
+    stdin
+        .lock()
+        .take((MAX_VOLUME_INSPECT_BYTES + 1) as u64)
+        .read_to_end(&mut input)?;
+    if input.len() > MAX_VOLUME_INSPECT_BYTES {
+        return Err(format!("volume inspect exceeds {MAX_VOLUME_INSPECT_BYTES}-byte limit").into());
+    }
+    let records: Vec<VolumeRecord> = serde_json::from_slice(&input)?;
     if records.len() != 1 {
         return Err("inspect must contain exactly one volume record".into());
     }

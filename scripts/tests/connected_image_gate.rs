@@ -476,6 +476,7 @@ fn workstation_contract_is_wired_into_the_release_blocking_gate() {
         "--env MISE_CACHE_DIR=/home/workspace/.cache/mise",
         "--env MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
         "--bin validate-owned-volume",
+        "bounded_container volume inspect \"$volume\" |\n    cargo run --quiet --locked --offline",
         "bounded_container volume delete \"$volume\"",
     ] {
         assert!(
@@ -487,7 +488,8 @@ fn workstation_contract_is_wired_into_the_release_blocking_gate() {
         "cargo run --manifest-path \"$fixture/rust-app/Cargo.toml\"",
         "cargo install --path \"$fixture/rust-bin\"",
         "npm install --global \"$fixture/npm-bin\"",
-        "go install \"$fixture/go-bin\"",
+        "\"$fixture/go.mod\"",
+        "cd \"$fixture\" && go install ./go-bin",
         "python -m pip install --user --no-deps \"$fixture/python-bin\"",
         "gem install --local \"$fixture/ruby-bin.gem\"",
         "cfg-if = \\\"=1.0.4\\\"",
@@ -503,6 +505,15 @@ fn workstation_contract_is_wired_into_the_release_blocking_gate() {
         !smoke.contains("type=bind"),
         "credential-free workstation smoke must not mount the host checkout"
     );
+    for forbidden in [
+        "inspect=$(bounded_container volume inspect",
+        "\"$fixture/go-bin/go.mod\"",
+    ] {
+        assert!(
+            !smoke.contains(forbidden),
+            "workstation smoke retained unsafe or invalid fixture wiring: {forbidden}"
+        );
+    }
     for command in [
         "vim --version",
         "nvim --version",
