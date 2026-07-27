@@ -2,10 +2,10 @@
 
 ## Current Outcome
 
-Task 6 remains in progress at the remote-publication boundary. Independent
-re-review approved the complete live-gate fix range through `d41e1a8`, and a
-fresh no-cache connected image has now passed the complete local connected
-gate:
+Task 6 is complete. Independent re-review approved the complete live-gate fix
+range through `d41e1a8`; a fresh no-cache connected image passed the complete
+local and public connected gates; the focused and full Apple apply gates
+passed; and the exact public image was approved in `6c4ff01`:
 
 ```text
 gascan-workspace:0cda90a4b7ac4969
@@ -22,13 +22,14 @@ Gascamp, workstation, local package-manager writes, network Cargo dependency,
 rustup component persistence, native SSH security/persistence, cleanup, and
 final owned-residue checks all passed.
 
-The exact plan-prescribed publication block was submitted only after this
-success. The external-action safety reviewer rejected it before process
-creation because publishing the locally built organization image to public
-GHCR requires fresh explicit informed user approval. Therefore no command in
-that block executed: no GHCR tag or manifest was written, and the local receipt
-was not rewritten to a public reference. Publication is paused at that
-authorization boundary; no bypass was attempted.
+Before authorization, the exact plan-prescribed publication block was first
+submitted only after this local success. The external-action safety reviewer
+rejected that initial attempt before process creation because publishing the
+locally built organization image to public GHCR required fresh explicit
+informed user approval. At that point, no command in the block had executed:
+no GHCR tag or manifest had been written, and the local receipt had not been
+rewritten to a public reference. No bypass was attempted. After explicit
+authorization, the later publication and approval completed as recorded below.
 
 The first fresh build from Tasks 1-5 completed with local digest
 `sha256:1412ce0d21e640e450a35622ace461a90d06d50c70ec0d21d50db420d5eae8c4`.
@@ -64,9 +65,10 @@ Those fixes are locally green and the disposable old-image remainder is
 complete, but this digest is failed-gate evidence only and must not be
 published or approved.
 
-No remote candidate has been published. The local candidate exists only as
-successful gate evidence, and neither `images/workspace/approved-image.txt`
-nor connected-image evidence has been modified.
+At that intermediate stage, no remote candidate had been published. The local
+candidate existed only as successful gate evidence, and neither
+`images/workspace/approved-image.txt` nor connected-image evidence had yet
+been modified.
 
 ## Second Live Gate Diagnosis and Fixes
 
@@ -480,9 +482,13 @@ ghcr.io/liquescent-development/gascan/workspace:0cda90a4b7ac4969-7f77de93f5e4f66
 ```
 
 The remote descriptor and canonical Apple inspection both matched the expected
-immutable digest. The approval helper atomically transitioned the local
-receipt and candidate reference, and the public prebuilt connected-image gate
-passed with zero owned residue.
+immutable digest. The publication step atomically transitioned the ignored
+local build receipt and reference to the public reference. The public prebuilt
+connected-image gate then passed with zero owned residue. After matching
+candidate and Apple-live acceptance, the approval helper validated all receipt
+inputs and atomically updated only the two tracked outputs:
+`images/workspace/approved-image.txt` and
+`docs/evidence/connected-workspace-image.md`.
 
 The first full Apple apply run exposed two test-runner/fixture issues rather
 than an image failure:
@@ -499,7 +505,7 @@ passes:
 
 ```text
 apple_e2e_runner: 18 passed
-image_replace_persistence_sentinels_cover_three_managed_roots: PASS
+explicit_sentinels_target_the_three_managed_volume_roots: PASS
 sh -n scripts/run-apple-e2e.sh: PASS
 ```
 
