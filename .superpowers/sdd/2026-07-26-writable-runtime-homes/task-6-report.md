@@ -2,9 +2,33 @@
 
 ## Current Outcome
 
-Task 6 remains in progress. Publication and approval are intentionally blocked
-until the latest live-gate fixes receive a fresh independent approval and a new
-no-cache connected image passes the complete live gate.
+Task 6 remains in progress at the remote-publication boundary. Independent
+re-review approved the complete live-gate fix range through `d41e1a8`, and a
+fresh no-cache connected image has now passed the complete local connected
+gate:
+
+```text
+gascan-workspace:0cda90a4b7ac4969
+sha256:7f77de93f5e4f66ad3986a4cbd2b91f0f55d5041d8210feae0b009e642f67739
+context: db10dcade4beeae2a06a7f83394b6859b8e01b48da12f9ca41d04a2ca8f5a4c5
+started: 2026-07-27T12:22:21Z
+finished: 2026-07-27T12:37:42Z
+status: succeeded
+```
+
+The local receipt validator returned that exact digest-qualified reference.
+The candidate and reference files are byte-identical. Polyglot, browser,
+Gascamp, workstation, local package-manager writes, network Cargo dependency,
+rustup component persistence, native SSH security/persistence, cleanup, and
+final owned-residue checks all passed.
+
+The exact plan-prescribed publication block was submitted only after this
+success. The external-action safety reviewer rejected it before process
+creation because publishing the locally built organization image to public
+GHCR requires fresh explicit informed user approval. Therefore no command in
+that block executed: no GHCR tag or manifest was written, and the local receipt
+was not rewritten to a public reference. Publication is paused at that
+authorization boundary; no bypass was attempted.
 
 The first fresh build from Tasks 1-5 completed with local digest
 `sha256:1412ce0d21e640e450a35622ace461a90d06d50c70ec0d21d50db420d5eae8c4`.
@@ -40,9 +64,9 @@ Those fixes are locally green and the disposable old-image remainder is
 complete, but this digest is failed-gate evidence only and must not be
 published or approved.
 
-No remote candidate has been published. The approval candidate file remains
-absent, and neither `images/workspace/approved-image.txt` nor connected-image
-evidence has been modified.
+No remote candidate has been published. The local candidate exists only as
+successful gate evidence, and neither `images/workspace/approved-image.txt`
+nor connected-image evidence has been modified.
 
 ## Second Live Gate Diagnosis and Fixes
 
@@ -432,18 +456,212 @@ PASS
 - Cleanup double-validated exact ownership and then proved names absent.
 - Foreign Gas Can sandboxes, the builder, and user-managed volumes were not
   modified or deleted.
-- The failed and superseded local image/receipt remain local evidence only.
-- No GHCR tag, remote manifest, approval candidate, approval file, or release
-  evidence was changed.
+- A fresh build attempt first failed before receipt publication when host free
+  space reached 117 MiB. Scoped `cargo clean` removed only worktree-derived
+  Rust caches. After exact receipt/image attestation, only the superseded
+  failed-gate image tag and stale ignored receipt/ref were removed; Apple
+  reported 154.16 GB reclaimed. Cached locked inputs and the fresh context were
+  preserved.
+- The next fresh build attempt failed before receipt publication with Apple
+  builder `Error: unavailable: "Stream unexpectedly closed."` during Gascamp
+  Cargo compilation. Inspection found no candidate, local release image, or
+  owned smoke residue and 157 GiB free.
+- The final retry reproduced context digest `db10dc...`, completed the build
+  and all local smokes, and published only local ignored receipt/candidate
+  artifacts for digest `7f77de...`.
+
+## Public Publication and Live Apple Gate
+
+The validated image was published to public GHCR only after explicit informed
+authorization:
+
+```text
+ghcr.io/liquescent-development/gascan/workspace:0cda90a4b7ac4969-7f77de93f5e4f66ad3986a4cbd2b91f0f55d5041d8210feae0b009e642f67739@sha256:7f77de93f5e4f66ad3986a4cbd2b91f0f55d5041d8210feae0b009e642f67739
+```
+
+The remote descriptor and canonical Apple inspection both matched the expected
+immutable digest. The approval helper atomically transitioned the local
+receipt and candidate reference, and the public prebuilt connected-image gate
+passed with zero owned residue.
+
+The first full Apple apply run exposed two test-runner/fixture issues rather
+than an image failure:
+
+1. the runner did not supply `GASCAN_E2E_PREDECESSOR_IMAGE`;
+2. the replacement test wrote its tools sentinel below the optional
+   `.local/share/mise` directory instead of at the managed `.local` root.
+
+Test-driven fixes now make the runner safely default to the tracked approved
+immutable predecessor, reject malformed, multiline, mutable, or explicit
+invalid values before live execution, and place all three sentinels directly
+under the managed `.local`, `.cache`, and `.config` roots. Focused verification
+passes:
+
+```text
+apple_e2e_runner: 18 passed
+image_replace_persistence_sentinels_cover_three_managed_roots: PASS
+sh -n scripts/run-apple-e2e.sh: PASS
+```
+
+The subsequent focused live replacement test advanced past all sentinel
+creation and candidate restart checks, then failed after recreating the
+container with the tracked predecessor:
+
+```text
+helper_error: cannot exec: container is not running
+```
+
+Runtime timestamps distinguish the phases: the candidate restarted at
+07:30:44 and was deliberately stopped at 07:30:48 for replacement; the
+predecessor runtime started at 07:30:48.722 and had stopped before the probe at
+07:30:51. The latest Gas Can operation remained the earlier completed
+candidate restart because the fixture's direct replacement helper bypasses
+the operation journal.
+
+Read-only inspection proves the tracked `6b2c2a...` predecessor is a storage
+layout v1 image, not a compatible v2 fixture:
+
+- its declared volumes are `.local/share/mise`, `.cache`, and
+  `.config/gascan`;
+- its embedded SSH bootstrap requires the `findmnt` target for
+  `.config/gascan` to equal `.config/gascan`;
+- current recreation correctly supplies the layout v2 `.config` mount, so the
+  old bootstrap deterministically exits because the observed mount target is
+  `.config`;
+- the current image instead validates `.config` as the managed mount root.
+
+This also explains why the earlier SSH-identity scenario can continue: it
+recreates the predecessor but immediately applies the candidate without
+health-checking or running the predecessor. The image-replacement scenario
+correctly probes the predecessor and exposes the incompatibility.
+
+The failed focused run used exact owner labels, cleaned its exact container and
+volumes, and proved zero test-owned residue.
+
+### Local v2-Compatible Predecessor Fixture
+
+Because v1 compatibility is explicitly out of scope, the replacement tests
+were not weakened or skipped. A local-only synthetic predecessor was instead
+built from the exact `7f77de...` candidate with no filesystem-changing
+instruction. Its only intentional differences are deterministic labels marking
+it test-only, non-release, and source-bound to the candidate digest.
+
+The first local derivation was rejected before use: Apple preserved all 28
+filesystem layers and diff IDs but dropped the inherited OCI `Volumes` config.
+The minimal fixture Dockerfile now restates the candidate's exact three
+`.local`, `.cache`, and `.config` volume declarations before adding the labels.
+The corrected local fixture is:
+
+```text
+ghcr.io/liquescent-development/gascan/workspace:apple-e2e-v2-predecessor-7f77de93f5e4f66a@sha256:5f49a38a63c3d3cc54033aa8d82c2e610c1ee2e7107ea5022ed7302e5490c8bf
+```
+
+Ten local checks pass:
+
+1. every candidate and fixture CAS descriptor hashes to its filename;
+2. the index digests are distinct;
+3. both descriptors are OCI image indexes;
+4. both contain exactly one linux/arm64 variant;
+5. all 28 compressed layer descriptors are byte-identical;
+6. all 28 rootfs diff IDs are byte-identical;
+7. the complete runtime config, excluding labels, is byte-identical;
+8. the three fixture labels are exact and all inherited labels are unchanged;
+9. the only two history additions are empty metadata entries for the restated
+   volumes and labels;
+10. the saved OCI archive's wrapper, index, and manifest hashes resolve to the
+    exact fixture descriptors.
+
+Archive evidence:
+
+```text
+.artifacts/apple-e2e-v2-predecessor-5f49a38a.oci.tar
+size: 3001747456 bytes
+sha256:8b7d41a9d1ea2d00af57293339042c232342d8c17120a2102dd0ef1f2b9d29d1
+```
+
+The build context, archive, and proposed exact reference remained ignored local
+artifacts until a second explicit informed authorization covered the additional
+public test-fixture upload. Publication refused to overwrite a mismatched
+remote tag. The GHCR descriptor and canonical Apple pull/inspection matched
+`5f49a3...`, and all ten equivalence checks passed again against the pulled
+tag-at-digest reference.
+
+## Final Live Results and Approval
+
+The first focused invocation used a diagnostic session directory prefix longer
+than the reviewed runner's template. It failed before image work because the
+daemon's Unix socket staging path exceeded `SUN_LEN`; its scoped trap cleaned
+the empty session and inventories proved zero residue. Re-running with the
+exact reviewed `session-XXXXXXXXXXXX` template passed the complete focused
+replacement scenario:
+
+```text
+image_replace_preserves_durable_resources_and_rolls_back_failure:
+1 passed, 0 failed, 48.43s
+```
+
+The reviewed runner then passed the full public Apple apply suite:
+
+```text
+apple_apply: 6 passed, 0 failed, 151.11s
+```
+
+This includes candidate-to-fixture execution, successful apply back to the
+candidate, failed-setup rollback to the fixture, retained volume/network
+identities, root-layer replacement, native SSH key durability, writable
+package-manager homes, and credential-free workstation defaults.
+
+After the run:
+
+- the cleanup root contained no manifests or session directories;
+- Apple container inventory contained no test sandbox;
+- Apple volume inventory contained no test volume;
+- the candidate, Apple-live receipt, public reference file, and build receipt
+  reference were byte-identical;
+- the receipt pair independently validated to the same exact public reference.
+
+Only `scripts/approve-connected-workspace-image.sh` updated the tracked approval
+and evidence. The dedicated approval commit is:
+
+```text
+6c4ff01 build: approve writable workspace image
+```
+
+The runner/sentinel correction is independently recorded as:
+
+```text
+8616f78 test: harden Apple image replacement gate
+```
+
+Final post-approval verification:
+
+```text
+cargo test --workspace:
+889 passed, 20 ignored, 63 filtered out (60 suites)
+
+cargo test --manifest-path scripts/Cargo.toml:
+439 passed (47 suites)
+
+cargo clippy --workspace --all-targets -- -D warnings:
+no issues
+
+cargo fmt --all -- --check:
+PASS
+
+sh -n scripts/run-apple-e2e.sh:
+PASS
+
+git diff --check:
+PASS
+```
+
+The sandboxed workspace and scripts attempts encountered only their known PTY
+and loopback fixture-server permission denials. Both authoritative
+host-permission reruns passed.
 
 ## Remaining Work
 
-1. Obtain fresh independent approval for the follow-up review-fix commit.
-2. Run a fresh no-cache connected build and the complete live gate.
-3. Publish one unique digest-derived immutable GHCR candidate only after that
-   gate passes.
-4. Pull and inspect the exact remote digest, run remote digest-pinned smokes,
-   and record immutable evidence.
-5. Use only the approval script to update approval/evidence.
-6. Finish this report with final digests, timestamps, gate results, publication
-   evidence, cleanup proof, and approval commit.
+1. Obtain final independent read-only review of the two closure commits and
+   Task 6 evidence.
+2. Hand the completed branch back for Task 7 integration; do not start a PR or
+   release from this task.
