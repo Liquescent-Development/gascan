@@ -404,6 +404,9 @@ impl OperationProgress {
             ("provision_step", Some(v1::ProvisionStep::InstallTools)) => {
                 Some("Installing project tools")
             }
+            ("provision_step", Some(v1::ProvisionStep::ConfigureShell)) => {
+                Some("Configuring interactive shell")
+            }
             ("provision_step", Some(v1::ProvisionStep::RunSetup)) => Some("Running project setup"),
             ("provision_step", Some(v1::ProvisionStep::VerifyGascamp)) => Some("Verifying Gascamp"),
             ("provision_step", Some(v1::ProvisionStep::HealthCheck)) => {
@@ -856,6 +859,12 @@ mod tests {
             Some("Installing project tools")
         );
         assert_eq!(progress.update(&install), None);
+        assert_eq!(
+            progress
+                .update(&provision_event(v1::ProvisionStep::ConfigureShell))
+                .as_deref(),
+            Some("Configuring interactive shell")
+        );
         assert_eq!(
             progress
                 .update(&provision_event(v1::ProvisionStep::RunSetup))

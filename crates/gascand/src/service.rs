@@ -3747,7 +3747,7 @@ fn applied_state(record: Option<&SandboxRecord>) -> AppliedState {
         .and_then(|resolution| resolution.get("sha256"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    AppliedState::with_hashes(tool_hash, setup_sha256)
+    AppliedState::with_hashes(tool_hash, setup_sha256, None)
 }
 
 fn replacement_applied_state(record: &SandboxRecord) -> AppliedState {
@@ -3757,7 +3757,7 @@ fn replacement_applied_state(record: &SandboxRecord) -> AppliedState {
         .and_then(|resolution| resolution.details.get("tool_hash"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    AppliedState::with_hashes(tool_hash, None)
+    AppliedState::with_hashes(tool_hash, None, None)
 }
 
 fn exact_owned_container(
