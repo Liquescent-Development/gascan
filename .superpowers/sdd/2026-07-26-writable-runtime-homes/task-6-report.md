@@ -751,7 +751,45 @@ containers, volumes, or networks. The approval helper atomically updated only
 `images/workspace/approved-image.txt` and
 `docs/evidence/connected-workspace-image.md` to a914.
 
+## Task 7 Reopen Final Verification and Review
+
+Final verification from approval commit `bba8fa1` passed:
+
+```text
+cargo test --workspace:
+889 passed, 20 ignored, 63 filtered out (60 suites)
+
+cargo test --manifest-path scripts/Cargo.toml:
+446 passed (47 suites)
+
+cargo clippy --workspace --all-targets -- -D warnings:
+no issues
+
+cargo fmt --all -- --check:
+PASS
+
+changed shell syntax:
+13 executables plus the mise profile passed
+
+git diff --check:
+PASS
+
+git status --short:
+clean
+```
+
+The temporary public OCI archive was removed after remote and live
+verification. A final receipt check proved that the deterministic connected
+context is required validation evidence, so it was restored only from cached
+locked inputs. Its publisher reproduced exact digest `85c1aba...`, and the
+receipt validator, approval, candidate, Apple-live receipt, tracked evidence,
+and build receipt then revalidated together.
+
+A final read-only bounded review of `d4e56fc..bba8fa1` found no Critical,
+Important, or Minor issue. It independently confirmed that no embedded or
+source code changed after the reviewed fix, the embedded script matches the
+preserved context manifest, and all a914 references and receipt hashes agree.
+
 ## Remaining Work
 
-1. Run final post-approval verification and bounded review.
-2. Complete Task 7 PR/check/squash integration without starting a release.
+1. Complete Task 7 PR/check/squash integration without starting a release.
