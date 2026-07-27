@@ -1,11 +1,23 @@
+#[cfg(target_os = "macos")]
+use std::ffi::OsString;
 use std::{
     fs,
     os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     path::Path,
     process::Command,
 };
-#[cfg(target_os = "macos")]
-use std::ffi::OsString;
+
+const RUNTIME_PATH: &str = concat!(
+    "/home/workspace/.local/bin:",
+    "/home/workspace/.local/share/cargo/bin:",
+    "/home/workspace/.local/share/go/bin:",
+    "/home/workspace/.local/share/gem/bin:",
+    "/home/workspace/.local/share/mise/shims:",
+    "/opt/gascan/mise/shims:",
+    "/usr/local/sbin:/usr/local/bin:",
+    "/opt/gascan/workstation/bin:",
+    "/usr/sbin:/usr/bin:/sbin:/bin"
+);
 
 fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
@@ -35,7 +47,10 @@ fn rust_seed_command(
         path.extend(std::env::split_paths(
             &std::env::var_os("PATH").unwrap_or_default(),
         ));
-        command.env("PATH", std::env::join_paths(path).unwrap_or(OsString::new()));
+        command.env(
+            "PATH",
+            std::env::join_paths(path).unwrap_or(OsString::new()),
+        );
     }
     command
 }
@@ -132,7 +147,10 @@ fn writable_rust_bootstrap_is_idempotent_fail_closed_and_never_mutates_source() 
         fs::read_to_string(&marker).unwrap(),
         "1.97.0-aarch64-unknown-linux-gnu\n"
     );
-    assert_eq!(fs::metadata(&marker).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        fs::metadata(&marker).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     assert_eq!(fs::metadata(&source_cargo).unwrap().ino(), source_inode);
     assert_eq!(fs::read(&source_cargo).unwrap(), source_contents);
 }
@@ -142,11 +160,7 @@ fn writable_rust_bootstrap_rejects_unsafe_source_root_components() {
     let script = root().join("images/workspace/bin/initialize-rust-home");
     let temp = tempfile::tempdir().unwrap();
     let valid_source = temp.path().join("valid-source");
-    write_test_toolchain(
-        &valid_source,
-        "1.97.0-aarch64-unknown-linux-gnu",
-        "cargo\n",
-    );
+    write_test_toolchain(&valid_source, "1.97.0-aarch64-unknown-linux-gnu", "cargo\n");
 
     let source_link = temp.path().join("source-link");
     symlink(&valid_source, &source_link).unwrap();
@@ -221,13 +235,7 @@ fn writable_rust_bootstrap_cleans_staging_and_rejects_unsafe_paths() {
     let source = temp.path().join("source");
     let incomplete = "1.97.0-aarch64-unknown-linux-gnu";
     write_test_toolchain(&source, incomplete, "cargo\n");
-    fs::remove_file(
-        source
-            .join("toolchains")
-            .join(incomplete)
-            .join("bin/rustc"),
-    )
-    .unwrap();
+    fs::remove_file(source.join("toolchains").join(incomplete).join("bin/rustc")).unwrap();
     let retry_destination = temp.path().join("retry-destination");
     let failed = rust_seed_command(&script, &source, &retry_destination, temp.path())
         .status()
@@ -235,18 +243,12 @@ fn writable_rust_bootstrap_cleans_staging_and_rejects_unsafe_paths() {
     assert!(!failed.success());
     assert!(rust_staging_residue(&retry_destination).is_empty());
     fs::write(
-        source
-            .join("toolchains")
-            .join(incomplete)
-            .join("bin/rustc"),
+        source.join("toolchains").join(incomplete).join("bin/rustc"),
         "rustc\n",
     )
     .unwrap();
     fs::set_permissions(
-        source
-            .join("toolchains")
-            .join(incomplete)
-            .join("bin/rustc"),
+        source.join("toolchains").join(incomplete).join("bin/rustc"),
         fs::Permissions::from_mode(0o755),
     )
     .unwrap();
@@ -357,6 +359,10 @@ fn workstation_home_configuration_is_idempotent_and_refuses_unmanaged_paths() {
     let run = || Command::new(&script).env("HOME", &home).status().unwrap();
     assert!(run().success());
     assert!(run().success());
+    assert!(
+        !home.join(".config/gascan/.gascan-managed").exists(),
+        "broad Gas Can config boundary must not be claimed as an application directory"
+    );
     for agent in ["claude", "codex", "pi"] {
         let link = home.join(format!(".{agent}"));
         assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
@@ -460,6 +466,66 @@ fn workstation_home_configuration_is_idempotent_and_refuses_unmanaged_paths() {
 }
 
 #[test]
+fn profile_defaults_are_exact_and_idempotent() {
+    let profile = root().join("images/workspace/etc/profile.d/mise.sh");
+    let script = format!(". '{}'; . '{}'; env", profile.display(), profile.display());
+    let output = Command::new("/bin/sh")
+        .args(["-c", &script])
+        .env_clear()
+        .env("HOME", "/home/workspace")
+        .env("PATH", "/tmp/duplicate:/opt/gascan/mise/shims")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let environment = stdout
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for (name, value) in [
+        ("XDG_DATA_HOME", "/home/workspace/.local/share"),
+        ("XDG_CACHE_HOME", "/home/workspace/.cache"),
+        ("XDG_CONFIG_HOME", "/home/workspace/.config"),
+        ("MISE_DATA_DIR", "/home/workspace/.local/share/mise"),
+        ("MISE_SYSTEM_DATA_DIR", "/opt/gascan/mise"),
+        ("MISE_CACHE_DIR", "/home/workspace/.cache/mise"),
+        (
+            "MISE_GLOBAL_CONFIG_FILE",
+            "/home/workspace/.config/gascan/mise.toml",
+        ),
+        (
+            "MISE_SYSTEM_CONFIG_FILE",
+            "/home/workspace/.config/gascan/mise.toml",
+        ),
+        (
+            "MISE_STATE_DIR",
+            "/home/workspace/.config/gascan/mise-state",
+        ),
+        ("CARGO_HOME", "/home/workspace/.local/share/cargo"),
+        ("MISE_CARGO_HOME", "/home/workspace/.local/share/cargo"),
+        ("RUSTUP_HOME", "/home/workspace/.local/share/rustup"),
+        ("MISE_RUSTUP_HOME", "/home/workspace/.local/share/rustup"),
+        ("NPM_CONFIG_PREFIX", "/home/workspace/.local"),
+        ("NPM_CONFIG_CACHE", "/home/workspace/.cache/npm"),
+        ("GOPATH", "/home/workspace/.local/share/go"),
+        ("GOCACHE", "/home/workspace/.cache/go-build"),
+        ("GOMODCACHE", "/home/workspace/.cache/go-mod"),
+        ("PYTHONUSERBASE", "/home/workspace/.local"),
+        ("GEM_HOME", "/home/workspace/.local/share/gem"),
+        ("MIX_HOME", "/home/workspace/.local/share/mix"),
+        ("HEX_HOME", "/home/workspace/.local/share/hex"),
+        ("REBAR_CACHE_DIR", "/home/workspace/.cache/rebar3"),
+        ("PATH", RUNTIME_PATH),
+    ] {
+        assert_eq!(environment.get(name), Some(&value), "{name}");
+    }
+}
+
+#[test]
 fn workstation_home_configuration_contains_no_credentials() {
     let script =
         fs::read_to_string(root().join("images/workspace/bin/configure-workstation-home")).unwrap();
@@ -523,16 +589,17 @@ fn dockerfile_declares_workspace_user_init_and_persistent_layout() {
         "COPY --chmod=0555 images/workspace/bin/initialize-rust-home /usr/local/bin/initialize-rust-home",
         "COPY --chmod=0555 images/workspace/libexec/migrate-workspace-identity-core /usr/local/libexec/gascan/migrate-workspace-identity-core",
         "/usr/local/bin/migrate-workspace-identity",
-        "chown workspace:workspace /opt/gascan/mise",
+        "chown -R root:root /opt/gascan/mise",
+        "chmod -R a-w /opt/gascan/mise",
         "/opt/gascan/mise",
         "/home/workspace/.cache",
-        "/home/workspace/.local/state",
-        "/home/workspace/.config/gascan",
+        "/home/workspace/.local",
+        "/home/workspace/.config",
         "visudo -cf /etc/sudoers.d/workspace",
         "USER workspace:workspace",
         "WORKDIR /workspace",
         "ENTRYPOINT [\"/usr/local/bin/gascan-entrypoint\"]",
-        "VOLUME [\"/home/workspace/.local/share/mise\", \"/home/workspace/.cache\", \"/home/workspace/.config/gascan\"]",
+        "VOLUME [\"/home/workspace/.local\", \"/home/workspace/.cache\", \"/home/workspace/.config\"]",
     ] {
         assert!(
             dockerfile.contains(required),
@@ -545,6 +612,43 @@ fn dockerfile_declares_workspace_user_init_and_persistent_layout() {
         ),
         "Apple --init must be the sole init boundary"
     );
+}
+
+#[test]
+fn workstation_contract_audits_reported_writable_destinations() {
+    let contract =
+        fs::read_to_string(root().join("images/workspace/tests/workstation-contract.sh")).unwrap();
+    for required in [
+        "rustup show home",
+        "npm config get prefix",
+        "npm config get cache",
+        "go env GOPATH",
+        "go env GOCACHE",
+        "go env GOMODCACHE",
+        "python -m site --user-base",
+        "gem env home",
+        "realpath -m",
+        "nearest_existing_parent",
+        "/home/workspace/.local",
+        "/home/workspace/.cache",
+        "/home/workspace/.config",
+    ] {
+        assert!(
+            contract.contains(required),
+            "workstation destination audit omits: {required}"
+        );
+    }
+    for install_bin in [
+        "/home/workspace/.local/bin",
+        "/home/workspace/.local/share/cargo/bin",
+        "/home/workspace/.local/share/go/bin",
+        "/home/workspace/.local/share/gem/bin",
+    ] {
+        assert!(
+            contract.contains(install_bin),
+            "PATH audit omits install bin: {install_bin}"
+        );
+    }
 }
 
 #[test]

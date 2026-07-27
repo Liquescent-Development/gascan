@@ -2,6 +2,18 @@ use std::{collections::BTreeMap, fs, path::Path, process::Command};
 
 use serde::Deserialize;
 
+const RUNTIME_PATH: &str = concat!(
+    "/home/workspace/.local/bin:",
+    "/home/workspace/.local/share/cargo/bin:",
+    "/home/workspace/.local/share/go/bin:",
+    "/home/workspace/.local/share/gem/bin:",
+    "/home/workspace/.local/share/mise/shims:",
+    "/opt/gascan/mise/shims:",
+    "/usr/local/sbin:/usr/local/bin:",
+    "/opt/gascan/workstation/bin:",
+    "/usr/sbin:/usr/bin:/sbin:/bin"
+);
+
 #[derive(Deserialize)]
 struct Lock {
     tools: BTreeMap<String, String>,
@@ -21,13 +33,12 @@ fn workstation_commands_and_mutable_shims_have_reviewed_path_precedence() {
     let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
     let profile =
         fs::read_to_string(root().join("images/workspace/etc/profile.d/mise.sh")).unwrap();
-    let expected = "/opt/gascan/mise/shims:/usr/local/bin:/opt/gascan/workstation/bin:${PATH}";
     assert!(
-        dockerfile.contains(&format!("ENV PATH={expected}")),
+        dockerfile.contains(&format!("ENV PATH={RUNTIME_PATH}")),
         "image PATH must preserve mutable mise shims before immutable workstation tools"
     );
     assert!(
-        profile.contains("export PATH=\"$MISE_DATA_DIR/shims:$MISE_SYSTEM_DATA_DIR/shims:/usr/local/bin:/opt/gascan/workstation/bin:$PATH\""),
+        profile.contains(&format!("export PATH={RUNTIME_PATH}")),
         "interactive PATH must keep writable user shims before immutable system shims"
     );
     for required in [
@@ -71,14 +82,17 @@ fn interactive_mise_profile_preserves_runtime_managed_storage_overrides() {
             "/home/workspace/.local/share/mise\n",
             "/home/workspace/.cache/mise\n",
             "/home/workspace/.config/gascan/mise.toml\n",
+            "/home/workspace/.local/bin:/home/workspace/.local/share/cargo/bin:",
+            "/home/workspace/.local/share/go/bin:/home/workspace/.local/share/gem/bin:",
             "/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:",
-            "/usr/local/bin:/opt/gascan/workstation/bin:/runtime/bin\n"
+            "/usr/local/sbin:/usr/local/bin:/opt/gascan/workstation/bin:",
+            "/usr/sbin:/usr/bin:/sbin:/bin\n"
         )
     );
 }
 
 #[test]
-fn interactive_mise_profile_falls_back_to_immutable_reviewed_defaults() {
+fn interactive_mise_profile_defaults_to_writable_runtime_policy() {
     let profile = root().join("images/workspace/etc/profile.d/mise.sh");
     let output = Command::new("/bin/sh")
         .arg("-c")
@@ -97,12 +111,15 @@ fn interactive_mise_profile_falls_back_to_immutable_reviewed_defaults() {
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         concat!(
-            "/opt/gascan/mise\n",
+            "/home/workspace/.local/share/mise\n",
             "/opt/gascan/mise\n",
             "/home/workspace/.cache/mise\n",
-            "/etc/mise/config.toml\n",
-            "/opt/gascan/mise/shims:/usr/local/bin:",
-            "/opt/gascan/workstation/bin:/runtime/bin\n"
+            "/home/workspace/.config/gascan/mise.toml\n",
+            "/home/workspace/.local/bin:/home/workspace/.local/share/cargo/bin:",
+            "/home/workspace/.local/share/go/bin:/home/workspace/.local/share/gem/bin:",
+            "/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:",
+            "/usr/local/sbin:/usr/local/bin:/opt/gascan/workstation/bin:",
+            "/usr/sbin:/usr/bin:/sbin:/bin\n"
         )
     );
 }

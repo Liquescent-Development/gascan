@@ -8,9 +8,12 @@ sshd_config="$managed_root/sshd_config"
 
 if test "${1:-}" = --inside; then
   test $# -eq 1
-  config_root=/home/workspace/.config/gascan
+  config_root=/home/workspace/.config
+  gascan_root=/home/workspace/.config/gascan
   test "$(stat -c %U:%G "$config_root")" = root:workspace
   test "$(stat -c %a "$config_root")" = 1770
+  test "$(stat -c %U:%G "$gascan_root")" = root:workspace
+  test "$(stat -c %a "$gascan_root")" = 1770
   replacement="$config_root/workspace-non-ssh-state"
   mkdir "$replacement"
   printf 'workspace-write-ok\n' >"$replacement/config"
@@ -67,7 +70,7 @@ if test "${1:-}" = --inside; then
     'AuthorizedKeysCommandUser root' \
     'AllowAgentForwarding no' \
     'AllowTcpForwarding local' \
-    'SetEnv HOME=/home/workspace USER=workspace LOGNAME=workspace LANG=C.UTF-8 LC_ALL=C.UTF-8 MISE_CACHE_DIR=/home/workspace/.cache/mise MISE_DATA_DIR=/home/workspace/.local/share/mise MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml MISE_STATE_DIR=/home/workspace/.config/gascan/mise-state MISE_SYSTEM_DATA_DIR=/opt/gascan/mise PATH=/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+    'SetEnv HOME=/home/workspace USER=workspace LOGNAME=workspace LANG=C.UTF-8 LC_ALL=C.UTF-8 XDG_DATA_HOME=/home/workspace/.local/share XDG_CACHE_HOME=/home/workspace/.cache XDG_CONFIG_HOME=/home/workspace/.config CARGO_HOME=/home/workspace/.local/share/cargo MISE_CARGO_HOME=/home/workspace/.local/share/cargo RUSTUP_HOME=/home/workspace/.local/share/rustup MISE_RUSTUP_HOME=/home/workspace/.local/share/rustup NPM_CONFIG_PREFIX=/home/workspace/.local NPM_CONFIG_CACHE=/home/workspace/.cache/npm GOPATH=/home/workspace/.local/share/go GOCACHE=/home/workspace/.cache/go-build GOMODCACHE=/home/workspace/.cache/go-mod PYTHONUSERBASE=/home/workspace/.local GEM_HOME=/home/workspace/.local/share/gem MIX_HOME=/home/workspace/.local/share/mix HEX_HOME=/home/workspace/.local/share/hex REBAR_CACHE_DIR=/home/workspace/.cache/rebar3 MISE_CACHE_DIR=/home/workspace/.cache/mise MISE_DATA_DIR=/home/workspace/.local/share/mise MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml MISE_SYSTEM_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml MISE_STATE_DIR=/home/workspace/.config/gascan/mise-state MISE_SYSTEM_DATA_DIR=/opt/gascan/mise PATH=/home/workspace/.local/bin:/home/workspace/.local/share/cargo/bin:/home/workspace/.local/share/go/bin:/home/workspace/.local/share/gem/bin:/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/opt/gascan/workstation/bin:/usr/sbin:/usr/bin:/sbin:/bin'
   do
     sudo -n grep -Fqx "$directive" "$sshd_config"
   done
@@ -97,12 +100,30 @@ if test "${1:-}" = --inside; then
     'setenv LOGNAME=workspace' \
     'setenv LANG=C.UTF-8' \
     'setenv LC_ALL=C.UTF-8' \
+    'setenv XDG_DATA_HOME=/home/workspace/.local/share' \
+    'setenv XDG_CACHE_HOME=/home/workspace/.cache' \
+    'setenv XDG_CONFIG_HOME=/home/workspace/.config' \
+    'setenv CARGO_HOME=/home/workspace/.local/share/cargo' \
+    'setenv MISE_CARGO_HOME=/home/workspace/.local/share/cargo' \
+    'setenv RUSTUP_HOME=/home/workspace/.local/share/rustup' \
+    'setenv MISE_RUSTUP_HOME=/home/workspace/.local/share/rustup' \
+    'setenv NPM_CONFIG_PREFIX=/home/workspace/.local' \
+    'setenv NPM_CONFIG_CACHE=/home/workspace/.cache/npm' \
+    'setenv GOPATH=/home/workspace/.local/share/go' \
+    'setenv GOCACHE=/home/workspace/.cache/go-build' \
+    'setenv GOMODCACHE=/home/workspace/.cache/go-mod' \
+    'setenv PYTHONUSERBASE=/home/workspace/.local' \
+    'setenv GEM_HOME=/home/workspace/.local/share/gem' \
+    'setenv MIX_HOME=/home/workspace/.local/share/mix' \
+    'setenv HEX_HOME=/home/workspace/.local/share/hex' \
+    'setenv REBAR_CACHE_DIR=/home/workspace/.cache/rebar3' \
     'setenv MISE_CACHE_DIR=/home/workspace/.cache/mise' \
     'setenv MISE_DATA_DIR=/home/workspace/.local/share/mise' \
     'setenv MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml' \
+    'setenv MISE_SYSTEM_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml' \
     'setenv MISE_STATE_DIR=/home/workspace/.config/gascan/mise-state' \
     'setenv MISE_SYSTEM_DATA_DIR=/opt/gascan/mise' \
-    'setenv PATH=/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+    'setenv PATH=/home/workspace/.local/bin:/home/workspace/.local/share/cargo/bin:/home/workspace/.local/share/go/bin:/home/workspace/.local/share/gem/bin:/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/opt/gascan/workstation/bin:/usr/sbin:/usr/bin:/sbin:/bin'
   do
     printf '%s\n' "$effective" | grep -Fqx "$directive"
   done
@@ -200,7 +221,7 @@ authorized_key=$(cat "$private_key.pub")
 owned_volume
 "$container_bin" create --name "$name" --init --label dev.gascan.test=true \
   --label "dev.gascan.test.owner=$owner_token" --network none \
-  --volume "$config_volume:/home/workspace/.config/gascan" \
+  --volume "$config_volume:/home/workspace/.config" \
   --env GASCAN_SSH_ENABLED=1 \
   --env "GASCAN_SSH_AUTHORIZED_KEY=$authorized_key" \
   "$local_image" >/dev/null
@@ -248,12 +269,30 @@ for variable in \
   'LOGNAME=workspace' \
   'LANG=C.UTF-8' \
   'LC_ALL=C.UTF-8' \
+  'XDG_DATA_HOME=/home/workspace/.local/share' \
+  'XDG_CACHE_HOME=/home/workspace/.cache' \
+  'XDG_CONFIG_HOME=/home/workspace/.config' \
+  'CARGO_HOME=/home/workspace/.local/share/cargo' \
+  'MISE_CARGO_HOME=/home/workspace/.local/share/cargo' \
+  'RUSTUP_HOME=/home/workspace/.local/share/rustup' \
+  'MISE_RUSTUP_HOME=/home/workspace/.local/share/rustup' \
+  'NPM_CONFIG_PREFIX=/home/workspace/.local' \
+  'NPM_CONFIG_CACHE=/home/workspace/.cache/npm' \
+  'GOPATH=/home/workspace/.local/share/go' \
+  'GOCACHE=/home/workspace/.cache/go-build' \
+  'GOMODCACHE=/home/workspace/.cache/go-mod' \
+  'PYTHONUSERBASE=/home/workspace/.local' \
+  'GEM_HOME=/home/workspace/.local/share/gem' \
+  'MIX_HOME=/home/workspace/.local/share/mix' \
+  'HEX_HOME=/home/workspace/.local/share/hex' \
+  'REBAR_CACHE_DIR=/home/workspace/.cache/rebar3' \
   'MISE_CACHE_DIR=/home/workspace/.cache/mise' \
   'MISE_DATA_DIR=/home/workspace/.local/share/mise' \
   'MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml' \
+  'MISE_SYSTEM_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml' \
   'MISE_STATE_DIR=/home/workspace/.config/gascan/mise-state' \
   'MISE_SYSTEM_DATA_DIR=/opt/gascan/mise' \
-  'PATH=/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+  'PATH=/home/workspace/.local/bin:/home/workspace/.local/share/cargo/bin:/home/workspace/.local/share/go/bin:/home/workspace/.local/share/gem/bin:/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/opt/gascan/workstation/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 do
   printf '%s\n' "$remote_environment" | grep -Fqx "$variable"
 done

@@ -26,6 +26,52 @@ expect_exact()
     test "$actual" = "$expected" || die "$* reported '$actual', expected '$expected'"
 }
 
+nearest_existing_parent()
+{
+    candidate=$(realpath -m "$1")
+    while test ! -e "$candidate"; do
+        parent=$(dirname "$candidate")
+        test "$parent" != "$candidate" || die "no existing parent for $1"
+        candidate=$parent
+    done
+    printf '%s\n' "$candidate"
+}
+
+audit_writable_destination()
+{
+    name=$1
+    path=$2
+    resolved=$(realpath -m "$path")
+    case "$resolved" in
+        /home/workspace/.local|/home/workspace/.local/*|\
+        /home/workspace/.cache|/home/workspace/.cache/*|\
+        /home/workspace/.config|/home/workspace/.config/*) ;;
+        *) die "$name escaped managed writable roots: $resolved" ;;
+    esac
+    case "$resolved" in /opt/gascan|/opt/gascan/*) die "$name resolved below /opt/gascan" ;; esac
+    parent=$(nearest_existing_parent "$resolved")
+    test -d "$parent" && test -w "$parent" ||
+        die "$name has no writable existing parent: $parent"
+}
+
+path_position()
+{
+    wanted=$1
+    old_ifs=$IFS
+    IFS=:
+    index=0
+    for entry in $PATH; do
+        test "$entry" != "$wanted" || {
+            IFS=$old_ifs
+            printf '%s\n' "$index"
+            return
+        }
+        index=$((index + 1))
+    done
+    IFS=$old_ifs
+    die "PATH entry is absent: $wanted"
+}
+
 locked=/opt/gascan/workstation/versions.json
 mise_locked=/opt/gascan/image-tool-versions.json
 test -r "$locked" && test -r "$mise_locked" || die 'locked version evidence is unavailable'
@@ -96,45 +142,86 @@ test "$MISE_CACHE_DIR" = /home/workspace/.cache/mise ||
     die 'mise cache root differs from production policy'
 test "$MISE_GLOBAL_CONFIG_FILE" = /home/workspace/.config/gascan/mise.toml ||
     die 'mise config root differs from production policy'
-case "$PATH" in
-    /home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:*) ;;
-    *) die 'writable mise shims do not precede immutable system shims' ;;
-esac
+test "$PATH" = /home/workspace/.local/bin:/home/workspace/.local/share/cargo/bin:/home/workspace/.local/share/go/bin:/home/workspace/.local/share/gem/bin:/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/opt/gascan/workstation/bin:/usr/sbin:/usr/bin:/sbin:/bin ||
+    die 'PATH differs from production policy'
 test -r /opt/gascan/image-tool-versions.json ||
     die 'immutable reviewed mise defaults are unavailable'
 
+test "$(rustup show home)" = "$RUSTUP_HOME" || die 'rustup home differs from runtime policy'
+test "$(npm config get prefix)" = "$NPM_CONFIG_PREFIX" || die 'npm prefix differs from runtime policy'
+test "$(npm config get cache)" = "$NPM_CONFIG_CACHE" || die 'npm cache differs from runtime policy'
+test "$(go env GOPATH)" = "$GOPATH" || die 'Go path differs from runtime policy'
+test "$(go env GOCACHE)" = "$GOCACHE" || die 'Go build cache differs from runtime policy'
+test "$(go env GOMODCACHE)" = "$GOMODCACHE" || die 'Go module cache differs from runtime policy'
+test "$(python -m site --user-base)" = "$PYTHONUSERBASE" ||
+    die 'Python user base differs from runtime policy'
+test "$(gem env home)" = "$GEM_HOME" || die 'RubyGems home differs from runtime policy'
+
 for mapping in \
+    "$XDG_DATA_HOME:/home/workspace/.local" \
+    "$XDG_CACHE_HOME:/home/workspace/.cache" \
+    "$XDG_CONFIG_HOME:/home/workspace/.config" \
+    "$MISE_DATA_DIR:/home/workspace/.local" \
+    "$MISE_CACHE_DIR:/home/workspace/.cache" \
+    "$MISE_GLOBAL_CONFIG_FILE:/home/workspace/.config" \
+    "$MISE_SYSTEM_CONFIG_FILE:/home/workspace/.config" \
+    "$MISE_STATE_DIR:/home/workspace/.config" \
+    "$CARGO_HOME:/home/workspace/.local" \
+    "$MISE_CARGO_HOME:/home/workspace/.local" \
+    "$RUSTUP_HOME:/home/workspace/.local" \
+    "$MISE_RUSTUP_HOME:/home/workspace/.local" \
+    "$NPM_CONFIG_PREFIX:/home/workspace/.local" \
+    "$NPM_CONFIG_CACHE:/home/workspace/.cache" \
+    "$GOPATH:/home/workspace/.local" \
+    "$GOCACHE:/home/workspace/.cache" \
+    "$GOMODCACHE:/home/workspace/.cache" \
+    "$PYTHONUSERBASE:/home/workspace/.local" \
+    "$GEM_HOME:/home/workspace/.local" \
+    "$MIX_HOME:/home/workspace/.local" \
+    "$HEX_HOME:/home/workspace/.local" \
+    "$REBAR_CACHE_DIR:/home/workspace/.cache" \
     "$CLAUDE_CONFIG_DIR:/home/workspace/.config/gascan" \
     "$CODEX_HOME:/home/workspace/.config/gascan" \
     "$PI_CODING_AGENT_DIR:/home/workspace/.config/gascan" \
     "$HERDR_CONFIG_PATH:/home/workspace/.config/gascan" \
     "$GH_CONFIG_DIR:/home/workspace/.config/gascan" \
     "$GLAB_CONFIG_DIR:/home/workspace/.config/gascan" \
-    "$MISE_CACHE_DIR:/home/workspace/.cache" \
     "$PI_CODING_AGENT_SESSION_DIR:/home/workspace/.cache"
 do
     path=${mapping%%:*}
     root=${mapping#*:}
     resolved=$(realpath -m "$path")
     case "$resolved" in "$root"|"$root"/*) ;; *) die "persistent path escaped its volume: $path" ;; esac
+    audit_writable_destination "$path" "$path"
 done
 
-for volume in /home/workspace/.local/share/mise /home/workspace/.cache /home/workspace/.config/gascan
+immutable_position=$(path_position /opt/gascan/mise/shims)
+for install_bin in \
+    /home/workspace/.local/bin \
+    /home/workspace/.local/share/cargo/bin \
+    /home/workspace/.local/share/go/bin \
+    /home/workspace/.local/share/gem/bin \
+    /home/workspace/.local/share/mise/shims
+do
+    test "$(path_position "$install_bin")" -lt "$immutable_position" ||
+        die "user install bin does not precede immutable shims: $install_bin"
+done
+
+for volume in /home/workspace/.local /home/workspace/.cache /home/workspace/.config
 do
     target=$(findmnt -n -o TARGET -T "$volume") || die "volume is not mounted: $volume"
     test "$target" = "$volume" || die "persistent path is not its own mount: $volume ($target)"
-    if test "$volume" = /home/workspace/.config/gascan; then
-        case "$(stat -c %U:%G:%a "$volume")" in
-            workspace:workspace:700|root:workspace:1770) ;;
-            *) die "persistent config root metadata changed: $volume" ;;
-        esac
+    if test "$volume" = /home/workspace/.config; then
+        test "$(stat -c %U:%G:%a "$volume")" = root:workspace:1770 ||
+            die "persistent config root metadata changed: $volume"
         probe="$volume/.workstation-write-probe"
-        printf 'write-ok\n' >"$probe"
-        test "$(cat "$probe")" = write-ok || die 'persistent config root is not writable'
-        rm -f "$probe"
+        mkdir "$probe"
+        printf 'write-ok\n' >"$probe/config"
+        test "$(cat "$probe/config")" = write-ok || die 'persistent config root is not writable'
+        rm -rf "$probe"
     else
-        test "$(stat -c %U:%G "$volume")" = workspace:workspace ||
-            die "persistent path owner changed: $volume"
+        test "$(stat -c %U:%G:%a "$volume")" = workspace:workspace:700 ||
+            die "persistent path metadata changed: $volume"
     fi
 done
 

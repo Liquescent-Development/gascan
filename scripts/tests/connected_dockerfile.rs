@@ -6,6 +6,17 @@ use std::{
 use sha2::{Digest, Sha256};
 
 const MISE_LS_FILTER: &str = r#"if ((keys|sort) != ["elixir","erlang","go","java","node","python","ruby","rust"]) then error("unexpected mise tool set") else to_entries | map(if ((.value|type)!="array") or ((.value|length)!=1) or (.value[0].installed != true) or (.value[0].active != true) or ((.value[0].version|type)!="string") or (.value[0].version=="") then error("invalid mise ls record") else {key:.key,value:.value[0].version} end) | from_entries end"#;
+const RUNTIME_PATH: &str = concat!(
+    "/home/workspace/.local/bin:",
+    "/home/workspace/.local/share/cargo/bin:",
+    "/home/workspace/.local/share/go/bin:",
+    "/home/workspace/.local/share/gem/bin:",
+    "/home/workspace/.local/share/mise/shims:",
+    "/opt/gascan/mise/shims:",
+    "/usr/local/sbin:/usr/local/bin:",
+    "/opt/gascan/workstation/bin:",
+    "/usr/sbin:/usr/bin:/sbin:/bin"
+);
 const EXPECTED_SYSTEM_TOOLS: &str = "\
 autoconf
 bind9-dnsutils
@@ -157,10 +168,7 @@ fn ssh_guest_layer_is_offline_fixed_and_network_isolated() {
         "X11Forwarding no",
         "StrictModes yes",
         "Subsystem sftp internal-sftp",
-        "findmnt -n -o TARGET -T \"$config_root\"",
-        "validate_fresh_config_root",
-        "! -name lost+found",
-        "Gas Can config volume lost+found is not empty",
+        "findmnt -n -o TARGET -T \"$managed_config_root\"",
         "/home/workspace/.config/gascan/ssh/host/ssh_host_ed25519_key",
         "/home/workspace/.config/gascan/ssh/authorized_keys",
         "/home/workspace/.config/gascan/ssh/sshd_config",
@@ -207,8 +215,10 @@ fn ssh_guest_initialization_is_behavioral_atomic_and_idempotent() {
 
     let temporary = tempfile::tempdir().unwrap();
     let test_root = temporary.path().join("root");
+    let managed_config_root = test_root.join("home/workspace/.config");
     let config_root = test_root.join("home/workspace/.config/gascan");
     fs::create_dir_all(&config_root).unwrap();
+    fs::set_permissions(&managed_config_root, fs::Permissions::from_mode(0o1770)).unwrap();
     fs::set_permissions(&config_root, fs::Permissions::from_mode(0o700)).unwrap();
     let key_one = ssh_public_key(temporary.path(), "client-one");
     let key_two = ssh_public_key(temporary.path(), "client-two");
@@ -275,12 +285,29 @@ fn ssh_guest_initialization_is_behavioral_atomic_and_idempotent() {
         "LOGNAME=workspace",
         "LANG=C.UTF-8",
         "LC_ALL=C.UTF-8",
+        "XDG_DATA_HOME=/home/workspace/.local/share",
+        "XDG_CACHE_HOME=/home/workspace/.cache",
+        "XDG_CONFIG_HOME=/home/workspace/.config",
+        "CARGO_HOME=/home/workspace/.local/share/cargo",
+        "MISE_CARGO_HOME=/home/workspace/.local/share/cargo",
+        "RUSTUP_HOME=/home/workspace/.local/share/rustup",
+        "MISE_RUSTUP_HOME=/home/workspace/.local/share/rustup",
+        "NPM_CONFIG_PREFIX=/home/workspace/.local",
+        "NPM_CONFIG_CACHE=/home/workspace/.cache/npm",
+        "GOPATH=/home/workspace/.local/share/go",
+        "GOCACHE=/home/workspace/.cache/go-build",
+        "GOMODCACHE=/home/workspace/.cache/go-mod",
+        "PYTHONUSERBASE=/home/workspace/.local",
+        "GEM_HOME=/home/workspace/.local/share/gem",
+        "MIX_HOME=/home/workspace/.local/share/mix",
+        "HEX_HOME=/home/workspace/.local/share/hex",
+        "REBAR_CACHE_DIR=/home/workspace/.cache/rebar3",
         "MISE_CACHE_DIR=/home/workspace/.cache/mise",
         "MISE_DATA_DIR=/home/workspace/.local/share/mise",
         "MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
+        "MISE_SYSTEM_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
         "MISE_STATE_DIR=/home/workspace/.config/gascan/mise-state",
         "MISE_SYSTEM_DATA_DIR=/opt/gascan/mise",
-        "PATH=/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     ] {
         assert!(
             setenv_lines[0]
@@ -289,6 +316,12 @@ fn ssh_guest_initialization_is_behavioral_atomic_and_idempotent() {
             "combined SetEnv omits exact assignment: {assignment}"
         );
     }
+    assert!(
+        setenv_lines[0]
+            .split_ascii_whitespace()
+            .any(|field| field == format!("PATH={RUNTIME_PATH}")),
+        "combined SetEnv omits exact PATH"
+    );
 
     let second = prepare_guest_ssh(&test_root, &key_two);
     assert!(
@@ -305,7 +338,12 @@ fn ssh_guest_initialization_is_behavioral_atomic_and_idempotent() {
     assert_eq!(
         fs::symlink_metadata(&config_root).unwrap().mode() & 0o7777,
         0o1770,
-        "config root must be sticky and root-controlled while remaining group-writable"
+        "Gas Can config boundary must be sticky and root-controlled while remaining group-writable"
+    );
+    assert_eq!(
+        fs::symlink_metadata(&managed_config_root).unwrap().mode() & 0o7777,
+        0o1770,
+        "managed config root must remain sticky and group-writable"
     );
     let non_ssh_state = config_root.join("agent-state");
     fs::create_dir(&non_ssh_state).unwrap();
@@ -425,7 +463,7 @@ fn ssh_guest_initialization_accepts_only_an_empty_safe_volume_lost_found() {
     let key = ssh_public_key(temporary.path(), "volume-client");
 
     let valid_root = temporary.path().join("valid-volume");
-    let valid_config = valid_root.join("home/workspace/.config/gascan");
+    let valid_config = valid_root.join("home/workspace/.config");
     let valid_lost_found = valid_config.join("lost+found");
     fs::create_dir_all(&valid_lost_found).unwrap();
     fs::set_permissions(&valid_config, fs::Permissions::from_mode(0o755)).unwrap();
@@ -439,7 +477,7 @@ fn ssh_guest_initialization_accepts_only_an_empty_safe_volume_lost_found() {
 
     for case in ["unexpected", "nonempty", "wrong-mode", "symlink"] {
         let test_root = temporary.path().join(case);
-        let config_root = test_root.join("home/workspace/.config/gascan");
+        let config_root = test_root.join("home/workspace/.config");
         let lost_found = config_root.join("lost+found");
         fs::create_dir_all(&config_root).unwrap();
         fs::set_permissions(&config_root, fs::Permissions::from_mode(0o755)).unwrap();
@@ -468,7 +506,7 @@ fn ssh_guest_initialization_accepts_only_an_empty_safe_volume_lost_found() {
             !output.status.success(),
             "unsafe fresh-volume state was accepted: {case}"
         );
-        assert!(!config_root.join("ssh").exists());
+        assert!(!config_root.join("gascan/ssh").exists());
     }
 }
 
@@ -521,7 +559,10 @@ fn ssh_live_contract_normalizes_only_the_exact_sftp_effective_directive() {
         "subsystem sftp /usr/lib/openssh/sftp-server\n",
         "subsystem other internal-sftp\n",
     ] {
-        assert!(!accepts(rejected), "accepted unsafe directive: {rejected:?}");
+        assert!(
+            !accepts(rejected),
+            "accepted unsafe directive: {rejected:?}"
+        );
     }
 }
 
@@ -606,7 +647,7 @@ fn workstation_step_diagnostics_name_only_the_failing_boundary() {
         "immutable-ownership",
         "home-directories",
         "home-configuration",
-        "home-owner",
+        "gascan-config-boundary",
         "home-link-owner",
         "sudoers-mode",
         "sudoers-validation",
@@ -1061,24 +1102,27 @@ fn effective_env_value<'a>(dockerfile: &'a str, variable: &str) -> Option<&'a st
         .next_back()
 }
 
-fn assert_persistent_rustup_homes(dockerfile: &str) -> Result<(), &'static str> {
+fn assert_env_before_first_install(
+    dockerfile: &str,
+    variable: &str,
+    value: &str,
+) -> Result<(), &'static str> {
     let first_install = dockerfile
         .find("mise install --yes")
         .ok_or("missing mise install")?;
-    for (variable, value) in [
-        ("CARGO_HOME", "/opt/gascan/mise/cargo"),
-        ("RUSTUP_HOME", "/opt/gascan/mise/rustup"),
-    ] {
-        let declaration = format!("ENV {variable}={value}");
-        let position = dockerfile
-            .find(&declaration)
-            .ok_or("missing persistent Rustup home")?;
-        if position >= first_install {
-            return Err("Rustup homes must be set before mise installs tools");
-        }
-        if effective_env_value(dockerfile, variable) != Some(value) {
-            return Err("effective Rustup homes must remain persistent");
-        }
+    let declaration = format!("ENV {variable}={value}");
+    let position = dockerfile
+        .find(&declaration)
+        .ok_or("missing build-time environment")?;
+    if position >= first_install {
+        return Err("build-time environment must be set before mise installs tools");
+    }
+    Ok(())
+}
+
+fn assert_effective_env(dockerfile: &str, variable: &str, value: &str) -> Result<(), &'static str> {
+    if effective_env_value(dockerfile, variable) != Some(value) {
+        return Err("effective environment differs from runtime policy");
     }
     Ok(())
 }
@@ -1131,21 +1175,113 @@ fn dockerfile_creates_traversable_mise_config_directory_before_copying_config() 
 }
 
 #[test]
-fn dockerfile_sets_persistent_rustup_homes_before_mise_installs_tools() {
+fn dockerfile_separates_build_time_and_runtime_rust_homes() {
     let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
-    assert_persistent_rustup_homes(&dockerfile).unwrap();
+    assert_env_before_first_install(&dockerfile, "CARGO_HOME", "/opt/gascan/mise/cargo").unwrap();
+    assert_env_before_first_install(&dockerfile, "RUSTUP_HOME", "/opt/gascan/mise/rustup").unwrap();
+    assert_effective_env(
+        &dockerfile,
+        "CARGO_HOME",
+        "/home/workspace/.local/share/cargo",
+    )
+    .unwrap();
+    assert_effective_env(
+        &dockerfile,
+        "RUSTUP_HOME",
+        "/home/workspace/.local/share/rustup",
+    )
+    .unwrap();
 }
 
 #[test]
-fn rustup_home_contract_rejects_later_overrides() {
+fn rustup_home_contract_rejects_incorrect_final_overrides() {
     let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
     for later_override in ["ENV CARGO_HOME=/tmp/cargo", "ENV RUSTUP_HOME=/tmp/rustup"] {
         let mutated = format!("{dockerfile}\n{later_override}\n");
+        let variable = later_override
+            .strip_prefix("ENV ")
+            .unwrap()
+            .split_once('=')
+            .unwrap()
+            .0;
+        let expected = if variable == "CARGO_HOME" {
+            "/home/workspace/.local/share/cargo"
+        } else {
+            "/home/workspace/.local/share/rustup"
+        };
         assert!(
-            assert_persistent_rustup_homes(&mutated).is_err(),
+            assert_effective_env(&mutated, variable, expected).is_err(),
             "accepted later override: {later_override}"
         );
     }
+}
+
+#[test]
+fn dockerfile_final_stage_matches_writable_runtime_policy() {
+    let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
+    for (variable, value) in [
+        ("XDG_DATA_HOME", "/home/workspace/.local/share"),
+        ("XDG_CACHE_HOME", "/home/workspace/.cache"),
+        ("XDG_CONFIG_HOME", "/home/workspace/.config"),
+        ("MISE_DATA_DIR", "/home/workspace/.local/share/mise"),
+        ("MISE_CACHE_DIR", "/home/workspace/.cache/mise"),
+        (
+            "MISE_GLOBAL_CONFIG_FILE",
+            "/home/workspace/.config/gascan/mise.toml",
+        ),
+        (
+            "MISE_SYSTEM_CONFIG_FILE",
+            "/home/workspace/.config/gascan/mise.toml",
+        ),
+        (
+            "MISE_STATE_DIR",
+            "/home/workspace/.config/gascan/mise-state",
+        ),
+        ("MISE_SYSTEM_DATA_DIR", "/opt/gascan/mise"),
+        ("CARGO_HOME", "/home/workspace/.local/share/cargo"),
+        ("MISE_CARGO_HOME", "/home/workspace/.local/share/cargo"),
+        ("RUSTUP_HOME", "/home/workspace/.local/share/rustup"),
+        ("MISE_RUSTUP_HOME", "/home/workspace/.local/share/rustup"),
+        ("NPM_CONFIG_PREFIX", "/home/workspace/.local"),
+        ("NPM_CONFIG_CACHE", "/home/workspace/.cache/npm"),
+        ("GOPATH", "/home/workspace/.local/share/go"),
+        ("GOCACHE", "/home/workspace/.cache/go-build"),
+        ("GOMODCACHE", "/home/workspace/.cache/go-mod"),
+        ("PYTHONUSERBASE", "/home/workspace/.local"),
+        ("GEM_HOME", "/home/workspace/.local/share/gem"),
+        ("MIX_HOME", "/home/workspace/.local/share/mix"),
+        ("HEX_HOME", "/home/workspace/.local/share/hex"),
+        ("REBAR_CACHE_DIR", "/home/workspace/.cache/rebar3"),
+    ] {
+        assert_effective_env(&dockerfile, variable, value).unwrap();
+    }
+    assert_effective_env(
+        &dockerfile,
+        "PATH",
+        concat!(
+            "/home/workspace/.local/bin:",
+            "/home/workspace/.local/share/cargo/bin:",
+            "/home/workspace/.local/share/go/bin:",
+            "/home/workspace/.local/share/gem/bin:",
+            "/home/workspace/.local/share/mise/shims:",
+            "/opt/gascan/mise/shims:",
+            "/usr/local/sbin:/usr/local/bin:",
+            "/opt/gascan/workstation/bin:",
+            "/usr/sbin:/usr/bin:/sbin:/bin"
+        ),
+    )
+    .unwrap();
+    let volume = dockerfile
+        .lines()
+        .rfind(|line| line.starts_with("VOLUME "))
+        .unwrap();
+    assert_eq!(
+        volume,
+        "VOLUME [\"/home/workspace/.local\", \"/home/workspace/.cache\", \"/home/workspace/.config\"]"
+    );
+    assert!(dockerfile.contains(
+        "COPY --chmod=0555 images/workspace/bin/initialize-rust-home /usr/local/bin/initialize-rust-home"
+    ));
 }
 
 fn normalize_mise_ls(input: &str) -> std::process::Output {

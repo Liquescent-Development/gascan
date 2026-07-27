@@ -244,16 +244,25 @@ fn repository_receipt_validator_is_executable() {
 fn workstation_smoke_initializes_the_mounted_home_before_contract_checks() {
     let smoke =
         fs::read_to_string(repository_root().join("tests/image/workstation-smoke.sh")).unwrap();
-    let initialize = smoke
+    let initialize_rust = smoke
+        .find("/usr/local/bin/initialize-rust-home")
+        .expect("workstation smoke must seed the mounted Rust home");
+    let initialize_workstation = smoke
         .find("/usr/local/bin/configure-workstation-home")
         .expect("workstation smoke must initialize image-owned home defaults");
     let contract = smoke
         .find("/opt/gascan/tests/workstation-contract.sh")
         .expect("workstation smoke must run the image contract");
     assert!(
-        initialize < contract,
+        initialize_rust < initialize_workstation && initialize_workstation < contract,
         "mounted workstation home must be initialized before its contract is checked"
     );
+    for rust_command in ["cargo run --manifest-path", "cargo install --path"] {
+        assert!(
+            initialize_rust < smoke.find(rust_command).expect("missing Rust write smoke"),
+            "Rust command ran before the writable Rust home was seeded: {rust_command}"
+        );
+    }
 }
 
 #[test]
@@ -457,9 +466,11 @@ fn workstation_contract_is_wired_into_the_release_blocking_gate() {
         "host smoke must invoke the immutable guest contract"
     );
     for required in [
-        "--volume \"$tools_volume:/home/workspace/.local/share/mise\"",
+        "--volume \"$tools_volume:/home/workspace/.local\"",
         "--volume \"$cache_volume:/home/workspace/.cache\"",
-        "--volume \"$config_volume:/home/workspace/.config/gascan\"",
+        "--volume \"$config_volume:/home/workspace/.config\"",
+        "--env CARGO_HOME=/home/workspace/.local/share/cargo",
+        "--env RUSTUP_HOME=/home/workspace/.local/share/rustup",
         "--env MISE_DATA_DIR=/home/workspace/.local/share/mise",
         "--env MISE_SYSTEM_DATA_DIR=/opt/gascan/mise",
         "--env MISE_CACHE_DIR=/home/workspace/.cache/mise",
@@ -470,6 +481,22 @@ fn workstation_contract_is_wired_into_the_release_blocking_gate() {
         assert!(
             smoke.contains(required),
             "workstation smoke omitted production topology or owner-scoped cleanup: {required}"
+        );
+    }
+    for command in [
+        "cargo run --manifest-path \"$fixture/rust-app/Cargo.toml\"",
+        "cargo install --path \"$fixture/rust-bin\"",
+        "npm install --global \"$fixture/npm-bin\"",
+        "go install \"$fixture/go-bin\"",
+        "python -m pip install --user --no-deps \"$fixture/python-bin\"",
+        "gem install --local \"$fixture/ruby-bin.gem\"",
+        "cfg-if = \\\"=1.0.4\\\"",
+        "rustup component add rust-src",
+        "rustup component list --installed",
+    ] {
+        assert!(
+            smoke.contains(command),
+            "workstation smoke omitted writable package-manager proof: {command}"
         );
     }
     assert!(
@@ -530,8 +557,8 @@ fn workstation_contract_is_wired_into_the_release_blocking_gate() {
     }
     for boundary in [
         "--network none",
-        "/home/workspace/.local/share/mise",
-        "/home/workspace/.config/gascan",
+        "/home/workspace/.local",
+        "/home/workspace/.config",
         "/home/workspace/.cache",
         "/var/run/docker.sock",
         "/Library/Keychains",

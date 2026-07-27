@@ -1,0 +1,16 @@
+#!/bin/sh
+set -u
+
+step=${1:?workstation step name is required}
+shift
+test "$#" -gt 0 || {
+    printf 'workstation assembly: %s has no command\n' "$step" >&2
+    exit 2
+}
+
+"$@"
+status=$?
+if test "$status" -ne 0; then
+    printf 'workstation assembly: %s failed\n' "$step" >&2
+fi
+exit "$status"

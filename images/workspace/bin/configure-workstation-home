@@ -5,7 +5,9 @@ set -eu
 
 marker_name=.gascan-managed
 marker_value=gascan-workstation-home-v1
-agents_root=$HOME/.config/gascan/agents
+config_root=$HOME/.config
+gascan_root=$config_root/gascan
+agents_root=$gascan_root/agents
 herdr_link=$HOME/.config/herdr
 herdr_expected=../.cache/herdr
 
@@ -58,8 +60,8 @@ ensure_managed_dir()
 
 # Complete preflight: no mkdir, marker, or link mutation may precede this list.
 preflight_parent "$HOME"
-preflight_parent "$HOME/.config"
-preflight_parent "$HOME/.config/gascan"
+preflight_parent "$config_root"
+preflight_parent "$gascan_root"
 preflight_parent "$HOME/.cache"
 for agent in claude codex pi; do
     preflight_link "$HOME/.$agent" ".config/gascan/agents/$agent"
@@ -71,9 +73,9 @@ for directory in \
     "$agents_root/claude" \
     "$agents_root/codex" \
     "$agents_root/pi" \
-    "$HOME/.config/gascan/herdr" \
-    "$HOME/.config/gascan/gh" \
-    "$HOME/.config/gascan/glab" \
+    "$gascan_root/herdr" \
+    "$gascan_root/gh" \
+    "$gascan_root/glab" \
     "$HOME/.cache/mise" \
     "$HOME/.cache/claude" \
     "$HOME/.cache/codex" \
@@ -90,9 +92,9 @@ for directory in \
     "$agents_root/claude" \
     "$agents_root/codex" \
     "$agents_root/pi" \
-    "$HOME/.config/gascan/herdr" \
-    "$HOME/.config/gascan/gh" \
-    "$HOME/.config/gascan/glab" \
+    "$gascan_root/herdr" \
+    "$gascan_root/gh" \
+    "$gascan_root/glab" \
     "$HOME/.cache/mise" \
     "$HOME/.cache/claude" \
     "$HOME/.cache/codex" \
