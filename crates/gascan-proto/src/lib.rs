@@ -105,6 +105,8 @@ pub mod error_code {
     pub const DISK_CONTROL_UNSUPPORTED: &str = "disk_control_unsupported";
     /// Existing managed storage differs from the requested immutable capacity.
     pub const STORAGE_CHANGE_REQUIRES_RECREATE: &str = "storage_change_requires_recreate";
+    /// Existing managed storage uses an incompatible layout.
+    pub const STORAGE_LAYOUT_REQUIRES_RECREATE: &str = "storage_layout_requires_recreate";
     /// The workspace image differs and must be applied before continuing.
     pub const IMAGE_UPGRADE_REQUIRED: &str = "image_upgrade_required";
     /// Replacing the workspace image failed.
@@ -150,6 +152,7 @@ pub mod error_code {
         INVALID_PROJECT_ROOT,
         DISK_CONTROL_UNSUPPORTED,
         STORAGE_CHANGE_REQUIRES_RECREATE,
+        STORAGE_LAYOUT_REQUIRES_RECREATE,
         IMAGE_UPGRADE_REQUIRED,
         IMAGE_REPLACEMENT_FAILED,
         SANDBOX_NOT_FOUND,

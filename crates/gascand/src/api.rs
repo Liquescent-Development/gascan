@@ -598,22 +598,40 @@ fn wire_status(
         ActualState::Stopped => v1::ActualState::Stopped,
         ActualState::Absent => v1::ActualState::Absent,
     } as i32;
-    let apply_requirements = record
-        .image_resolution
+    let mut apply_requirements = Vec::new();
+    if record
+        .storage_resolution
         .as_ref()
-        .filter(|resolution| resolution.version == 1)
-        .and_then(|resolution| resolution.details.get("digest"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|current| immutable_image_reference(current))
-        .filter(|current| *current != policy_image)
-        .map(|current| {
-            vec![v1::ApplyRequirement {
-                reason: "image_changed".to_owned(),
-                current: current.to_owned(),
-                requested: policy_image.to_owned(),
-            }]
-        })
-        .unwrap_or_default();
+        .map(|resolution| resolution.version)
+        != Some(2)
+    {
+        apply_requirements.push(v1::ApplyRequirement {
+            reason: "storage_layout_changed".to_owned(),
+            current: record.storage_resolution.as_ref().map_or_else(
+                || "unknown".to_owned(),
+                |resolution| resolution.version.to_string(),
+            ),
+            requested: "2".to_owned(),
+        });
+    }
+    apply_requirements.extend(
+        record
+            .image_resolution
+            .as_ref()
+            .filter(|resolution| resolution.version == 1)
+            .and_then(|resolution| resolution.details.get("digest"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|current| immutable_image_reference(current))
+            .filter(|current| *current != policy_image)
+            .map(|current| {
+                vec![v1::ApplyRequirement {
+                    reason: "image_changed".to_owned(),
+                    current: current.to_owned(),
+                    requested: policy_image.to_owned(),
+                }]
+            })
+            .unwrap_or_default(),
+    );
     v1::SandboxStatus {
         sandbox_id: record.id.to_string(),
         desired_state,
@@ -786,6 +804,19 @@ fn service_status(error: ServiceError) -> tonic::Status {
                 )),
             )
         }
+        error @ ServiceError::StorageLayoutRequiresRecreate { .. } => {
+            let code = error_code::STORAGE_LAYOUT_REQUIRES_RECREATE;
+            let message = error.to_string();
+            let details =
+                serde_json::to_vec(&crate::service::failure_details(&error)).unwrap_or_default();
+            tonic::Status::with_details(
+                tonic::Code::FailedPrecondition,
+                code,
+                tonic::codegen::Bytes::from(gascan_proto::error_detail::encode_with_details(
+                    code, &message, &details,
+                )),
+            )
+        }
         error @ ServiceError::ImageUpgradeRequired { .. } => {
             let code = error_code::IMAGE_UPGRADE_REQUIRED;
             let message = error.to_string();
@@ -907,6 +938,9 @@ fn service_error_diagnostic(error: &ServiceError) -> String {
         ServiceError::Manifest(_) => "service_kind=manifest".to_owned(),
         ServiceError::Missing(_) => "service_kind=missing".to_owned(),
         ServiceError::Ownership(_) => "service_kind=ownership".to_owned(),
+        ServiceError::StorageLayoutRequiresRecreate { .. } => {
+            "service_kind=storage_layout_requires_recreate".to_owned()
+        }
         ServiceError::StorageChangeRequiresRecreate { .. } => {
             "service_kind=storage_change_requires_recreate".to_owned()
         }
@@ -2824,7 +2858,7 @@ mod tests {
                 setup_resolution: None,
                 tool_resolution: None,
                 image_resolution: None,
-                storage_resolution: None,
+                storage_resolution: Some(crate::StorageResolution::new(2, json!({}))),
                 ssh_resolution: None,
                 last_operation_id: Some(operation_id),
                 updated_at_millis: 1_725_000_001_456,
@@ -2858,7 +2892,7 @@ mod tests {
                     1,
                     serde_json::json!({"digest": current}),
                 )),
-                storage_resolution: None,
+                storage_resolution: Some(crate::StorageResolution::new(2, json!({}))),
                 ssh_resolution: None,
                 last_operation_id: None,
                 updated_at_millis: 1,
@@ -2874,6 +2908,77 @@ mod tests {
                 current: current.to_owned(),
                 requested: include_str!("../../../images/workspace/approved-image.txt").to_owned(),
             }]
+        );
+    }
+
+    #[test]
+    fn wire_status_exposes_storage_layout_recreate_requirement() {
+        let root = Utf8PathBuf::from("/workspace/storage-layout");
+        let status = wire_status(
+            SandboxRecord {
+                id: SandboxId::from_root("storage-layout", &root),
+                canonical_root: root,
+                desired_state: DesiredState::Running,
+                actual_state: ActualState::Running,
+                setup_resolution: None,
+                tool_resolution: None,
+                image_resolution: None,
+                storage_resolution: Some(crate::StorageResolution::new(1, json!({}))),
+                ssh_resolution: None,
+                last_operation_id: None,
+                updated_at_millis: 1,
+            },
+            "image",
+            None,
+        );
+
+        assert_eq!(
+            status.apply_requirements,
+            [v1::ApplyRequirement {
+                reason: "storage_layout_changed".to_owned(),
+                current: "1".to_owned(),
+                requested: "2".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn wire_status_orders_unknown_storage_layout_before_image_change() {
+        let root = Utf8PathBuf::from("/workspace/unknown-storage-layout");
+        let current = "registry.example/workspace:old@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let requested = "registry.example/workspace:new@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let status = wire_status(
+            SandboxRecord {
+                id: SandboxId::from_root("unknown-storage-layout", &root),
+                canonical_root: root,
+                desired_state: DesiredState::Running,
+                actual_state: ActualState::Running,
+                setup_resolution: None,
+                tool_resolution: None,
+                image_resolution: Some(crate::ImageResolution::new(1, json!({"digest": current}))),
+                storage_resolution: None,
+                ssh_resolution: None,
+                last_operation_id: None,
+                updated_at_millis: 1,
+            },
+            requested,
+            None,
+        );
+
+        assert_eq!(
+            status.apply_requirements,
+            [
+                v1::ApplyRequirement {
+                    reason: "storage_layout_changed".to_owned(),
+                    current: "unknown".to_owned(),
+                    requested: "2".to_owned(),
+                },
+                v1::ApplyRequirement {
+                    reason: "image_changed".to_owned(),
+                    current: current.to_owned(),
+                    requested: requested.to_owned(),
+                },
+            ]
         );
     }
 
@@ -2894,7 +2999,7 @@ mod tests {
                     1,
                     serde_json::json!({"digest": current}),
                 )),
-                storage_resolution: None,
+                storage_resolution: Some(crate::StorageResolution::new(2, json!({}))),
                 ssh_resolution: None,
                 last_operation_id: None,
                 updated_at_millis: 1,
@@ -3119,6 +3224,30 @@ mod tests {
         assert_eq!(
             precondition.message(),
             gascan_proto::error_code::STORAGE_CHANGE_REQUIRES_RECREATE
+        );
+    }
+
+    #[test]
+    fn storage_layout_recreate_error_includes_recovery_details() {
+        let status =
+            service_status(ServiceError::StorageLayoutRequiresRecreate { recorded: Some(1) });
+
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            status.message(),
+            error_code::STORAGE_LAYOUT_REQUIRES_RECREATE
+        );
+        let details = gascan_proto::error_detail::decode_details(status.details())
+            .expect("storage layout error must include details");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&details)
+                .expect("storage layout details must be valid JSON"),
+            json!({
+                "reason": "storage_layout_changed",
+                "recorded_layout": 1,
+                "requested_layout": 2,
+                "recovery": "run `gascan destroy --yes` and then `gascan up`",
+            })
         );
     }
 

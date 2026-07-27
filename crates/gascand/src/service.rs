@@ -18,8 +18,9 @@ use camino::{Utf8Path, Utf8PathBuf};
 use gascan_core::doctor::{DoctorFact, DoctorFacts, DoctorReport, DoctorStatus};
 use gascan_core::manifest::ManifestError;
 use gascan_core::policy::{
-    CONTAINER_PATH, ControlPlanePolicy, MISE_CACHE_DIR, MISE_DATA_DIR, MISE_GLOBAL_CONFIG_FILE,
-    MISE_SYSTEM_DATA_DIR, PolicyCompiler, PolicyError, WORKSPACE_HOME,
+    CACHE_ROOT, CONFIG_ROOT, CONTAINER_PATH, ControlPlanePolicy, MISE_CACHE_DIR, MISE_DATA_DIR,
+    MISE_GLOBAL_CONFIG_FILE, MISE_SYSTEM_DATA_DIR, PolicyCompiler, PolicyError, TOOLS_ROOT,
+    WORKSPACE_HOME,
 };
 use gascan_core::provision::{
     AppliedState, ProvisionPlan, ProvisionStep, ProvisioningPlanner, SetupScript,
@@ -44,6 +45,7 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc};
 const SAFE_MISE_WORKDIR: &str = "/home/workspace/.config/gascan/mise-workdir";
 const MAX_PROVISION_STDOUT_BYTES: usize = 1024 * 1024;
 const MAX_PROVISION_STDERR_TAIL_BYTES: usize = 64 * 1024;
+const STORAGE_LAYOUT_VERSION: u32 = 2;
 
 struct GuestExecOutcome {
     stdout: Vec<u8>,
@@ -338,6 +340,8 @@ pub enum ServiceError {
     Missing(SandboxId),
     #[error("sandbox {0} is not owned by gascan")]
     Ownership(SandboxId),
+    #[error("managed storage layout changed; run `gascan destroy --yes` and then `gascan up`")]
+    StorageLayoutRequiresRecreate { recorded: Option<u32> },
     #[error("{}", format_storage_change_message(changes))]
     StorageChangeRequiresRecreate { changes: Vec<StorageCapacityChange> },
     #[error(
@@ -1046,16 +1050,22 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let id = request.spec.id().clone();
         let lock = self.keyed_lock(&id)?;
         let _guard = lock.lock().await;
-        let capabilities = self.runtime_capabilities().await?;
-        let create = self.compile_policy(request.spec.clone(), capabilities, None)?;
-        let requested_ssh_transport = requested_ssh_transport(&request.spec);
-        let requested_storage = requested_storage(&create)?;
         let existing = self
             .database({
                 let id = id.clone();
                 move |store| store.sandbox(&id)
             })
             .await?;
+        if let Some(prior) = existing
+            .as_ref()
+            .filter(|record| record.actual_state != ActualState::Absent)
+        {
+            validate_storage_layout(prior)?;
+        }
+        let capabilities = self.runtime_capabilities().await?;
+        let create = self.compile_policy(request.spec.clone(), capabilities, None)?;
+        let requested_ssh_transport = requested_ssh_transport(&request.spec);
+        let requested_storage = requested_storage(&create)?;
         let prior_ssh_transport = self
             .database({
                 let id = id.clone();
@@ -2471,12 +2481,6 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let id = request.spec.id().clone();
         let lock = self.keyed_lock(&id)?;
         let _guard = lock.lock().await;
-        let capabilities = self.runtime_capabilities().await?;
-        let prepared_ssh = self.prepare_ssh_create(&request.spec).await?;
-        let create =
-            self.compile_policy(request.spec.clone(), capabilities, prepared_ssh.as_ref())?;
-        let requested_ssh_transport = requested_ssh_transport(&request.spec);
-        let requested_storage = requested_storage(&create)?;
         let mut record = self
             .database({
                 let id = id.clone();
@@ -2484,13 +2488,24 @@ impl<B: RuntimeBackend> SandboxService<B> {
             })
             .await?
             .ok_or_else(|| ServiceError::Missing(id.clone()))?;
+        if record.actual_state != ActualState::Absent {
+            validate_storage_layout(&record)?;
+        }
+        let capabilities = self.runtime_capabilities().await?;
+        let prepared_ssh = self.prepare_ssh_create(&request.spec).await?;
+        let create =
+            self.compile_policy(request.spec.clone(), capabilities, prepared_ssh.as_ref())?;
+        let requested_ssh_transport = requested_ssh_transport(&request.spec);
+        let requested_storage = requested_storage(&create)?;
         let prior_ssh_transport = self
             .database({
                 let id = id.clone();
                 move |store| store.ssh_transport_policy(&id)
             })
             .await?;
-        validate_storage_capacities(&record, requested_storage)?;
+        if record.actual_state != ActualState::Absent {
+            validate_storage_capacities(&record, requested_storage)?;
+        }
         let desired_fingerprint = desired_fingerprint(&request.spec).await?;
         let desired_plan = ProvisioningPlanner::plan_for_root(
             request.spec.canonical_root(),
@@ -3382,6 +3397,9 @@ impl ServiceError {
             Self::Policy(error) => error.code(),
             Self::Missing(_) => "not_found",
             Self::Ownership(_) => "ownership_mismatch",
+            Self::StorageLayoutRequiresRecreate { .. } => {
+                gascan_proto::error_code::STORAGE_LAYOUT_REQUIRES_RECREATE
+            }
             Self::StorageChangeRequiresRecreate { .. } => "storage_change_requires_recreate",
             Self::ImageUpgradeRequired { .. } => gascan_proto::error_code::IMAGE_UPGRADE_REQUIRED,
             Self::StorageInvariant(_) => "storage_invariant_failed",
@@ -3469,6 +3487,14 @@ impl ServiceError {
 }
 
 pub(crate) fn failure_details(error: &ServiceError) -> Value {
+    if let ServiceError::StorageLayoutRequiresRecreate { recorded } = error {
+        return json!({
+            "reason": "storage_layout_changed",
+            "recorded_layout": recorded,
+            "requested_layout": STORAGE_LAYOUT_VERSION,
+            "recovery": "run `gascan destroy --yes` and then `gascan up`",
+        });
+    }
     if let ServiceError::StorageChangeRequiresRecreate { changes } = error {
         json!({
             "message": error.to_string(),
@@ -3565,7 +3591,7 @@ type StorageCapacities = [(&'static str, u64); 3];
 
 fn storage_resolution(requested: StorageCapacities) -> StorageResolution {
     StorageResolution::new(
-        1,
+        STORAGE_LAYOUT_VERSION,
         json!({
             "tools_bytes": requested[0].1,
             "cache_bytes": requested[1].1,
@@ -3578,15 +3604,17 @@ fn validate_storage_capacities(
     record: &SandboxRecord,
     requested: StorageCapacities,
 ) -> Result<(), ServiceError> {
+    validate_storage_layout(record)?;
     let recorded = record
         .storage_resolution
         .as_ref()
-        .filter(|resolution| resolution.version == 1);
+        .expect("storage layout validation requires a current resolution");
     let changes = requested
         .into_iter()
         .filter_map(|(volume, requested_bytes)| {
             let recorded_bytes = recorded
-                .and_then(|resolution| resolution.details.get(format!("{volume}_bytes")))
+                .details
+                .get(format!("{volume}_bytes"))
                 .and_then(Value::as_u64);
             (recorded_bytes != Some(requested_bytes)).then_some(StorageCapacityChange {
                 volume,
@@ -3602,6 +3630,18 @@ fn validate_storage_capacities(
     }
 }
 
+fn validate_storage_layout(record: &SandboxRecord) -> Result<(), ServiceError> {
+    let recorded = record
+        .storage_resolution
+        .as_ref()
+        .map(|resolution| resolution.version);
+    if recorded == Some(STORAGE_LAYOUT_VERSION) {
+        Ok(())
+    } else {
+        Err(ServiceError::StorageLayoutRequiresRecreate { recorded })
+    }
+}
+
 fn requested_storage(create: &CreateRequest) -> Result<StorageCapacities, ServiceError> {
     requested_storage_from_volumes(create.volumes())
 }
@@ -3610,9 +3650,9 @@ fn requested_storage_from_volumes(
     volumes: &[gascan_core::runtime::RuntimeVolume],
 ) -> Result<StorageCapacities, ServiceError> {
     [
-        ("tools", "/home/workspace/.local/share/mise"),
-        ("cache", "/home/workspace/.cache"),
-        ("config", "/home/workspace/.config/gascan"),
+        ("tools", TOOLS_ROOT),
+        ("cache", CACHE_ROOT),
+        ("config", CONFIG_ROOT),
     ]
     .into_iter()
     .map(|(volume, target)| {
