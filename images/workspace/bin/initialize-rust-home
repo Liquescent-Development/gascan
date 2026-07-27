@@ -1,0 +1,107 @@
+#!/bin/sh
+set -eu
+
+source_root=${1:-/opt/gascan/mise/rustup}
+destination_root=${2:-/home/workspace/.local/share/rustup}
+stage=
+
+cleanup() {
+    if [ -n "$stage" ]; then
+        rm -rf -- "$stage"
+        stage=
+    fi
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
+if [ -L "$source_root/toolchains" ] || [ ! -d "$source_root/toolchains" ]; then
+    printf '%s\n' "invalid Rust toolchain source: $source_root/toolchains" >&2
+    exit 1
+fi
+if [ -L "$destination_root" ] ||
+    { [ -e "$destination_root" ] && [ ! -d "$destination_root" ]; }
+then
+    printf '%s\n' "invalid Rust destination: $destination_root" >&2
+    exit 1
+fi
+
+umask 077
+install -d -m 0700 "$destination_root"
+for directory in "$destination_root/toolchains" "$destination_root/update-hashes"; do
+    if [ -L "$directory" ] || { [ -e "$directory" ] && [ ! -d "$directory" ]; }; then
+        printf '%s\n' "invalid Rust destination directory: $directory" >&2
+        exit 1
+    fi
+    install -d -m 0700 "$directory"
+done
+
+for source in "$source_root"/toolchains/*; do
+    if [ ! -e "$source" ] && [ ! -L "$source" ]; then
+        continue
+    fi
+    toolchain=${source##*/}
+    if [ -L "$source" ] || [ ! -d "$source" ]; then
+        printf '%s\n' "invalid bundled Rust toolchain: $source" >&2
+        exit 1
+    fi
+
+    destination="$destination_root/toolchains/$toolchain"
+    if [ -L "$destination" ]; then
+        printf '%s\n' "invalid Rust toolchain destination: $destination" >&2
+        exit 1
+    fi
+    if [ -d "$destination" ]; then
+        continue
+    fi
+    if [ -e "$destination" ]; then
+        printf '%s\n' "invalid Rust toolchain destination: $destination" >&2
+        exit 1
+    fi
+
+    stage="$destination_root/.gascan-rust-seed.$toolchain.$$"
+    mkdir -m 0700 "$stage"
+    cp -R "$source/." "$stage/"
+    if [ ! -x "$stage/bin/cargo" ] || [ ! -x "$stage/bin/rustc" ]; then
+        printf '%s\n' "incomplete bundled Rust toolchain: $toolchain" >&2
+        exit 1
+    fi
+    mv --no-clobber --no-target-directory "$stage" "$destination"
+    if [ -d "$stage" ]; then
+        cleanup
+        continue
+    fi
+    stage=
+
+    source_hash="$source_root/update-hashes/$toolchain"
+    destination_hash="$destination_root/update-hashes/$toolchain"
+    if [ ! -e "$destination_hash" ] && [ ! -L "$destination_hash" ] &&
+        [ -f "$source_hash" ] && [ ! -L "$source_hash" ]
+    then
+        hash_stage="$destination_root/.gascan-rust-hash.$toolchain.$$"
+        stage=$hash_stage
+        install -m 0600 "$source_hash" "$hash_stage"
+        mv --no-clobber --no-target-directory "$hash_stage" "$destination_hash"
+        cleanup
+    fi
+done
+
+marker="$destination_root/.gascan-bundled-toolchains-v1"
+marker_stage="$destination_root/.gascan-rust-marker.$$"
+stage=$marker_stage
+: >"$marker_stage"
+chmod 0600 "$marker_stage"
+for source in "$source_root"/toolchains/*; do
+    if [ ! -e "$source" ] && [ ! -L "$source" ]; then
+        continue
+    fi
+    if [ -L "$source" ] || [ ! -d "$source" ]; then
+        printf '%s\n' "invalid bundled Rust toolchain: $source" >&2
+        exit 1
+    fi
+    printf '%s\n' "${source##*/}" >>"$marker_stage"
+done
+LC_ALL=C sort -o "$marker_stage" "$marker_stage"
+chmod 0600 "$marker_stage"
+mv --force --no-target-directory "$marker_stage" "$marker"
+stage=

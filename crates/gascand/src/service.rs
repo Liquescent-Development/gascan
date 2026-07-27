@@ -18,9 +18,9 @@ use camino::{Utf8Path, Utf8PathBuf};
 use gascan_core::doctor::{DoctorFact, DoctorFacts, DoctorReport, DoctorStatus};
 use gascan_core::manifest::ManifestError;
 use gascan_core::policy::{
-    CACHE_ROOT, CONFIG_ROOT, CONTAINER_PATH, ControlPlanePolicy, MISE_CACHE_DIR, MISE_DATA_DIR,
-    MISE_GLOBAL_CONFIG_FILE, MISE_SYSTEM_DATA_DIR, PolicyCompiler, PolicyError, TOOLS_ROOT,
-    WORKSPACE_HOME,
+    CACHE_ROOT, CARGO_HOME, CONFIG_ROOT, CONTAINER_PATH, ControlPlanePolicy, GO_PATH,
+    MISE_CACHE_DIR, MISE_DATA_DIR, MISE_GLOBAL_CONFIG_FILE, MISE_STATE_DIR, MISE_SYSTEM_DATA_DIR,
+    NPM_CACHE_DIR, PolicyCompiler, PolicyError, RUSTUP_HOME, TOOLS_ROOT, WORKSPACE_HOME,
 };
 use gascan_core::provision::{
     AppliedState, ProvisionPlan, ProvisionStep, ProvisioningPlanner, SetupScript,
@@ -1490,10 +1490,11 @@ impl<B: RuntimeBackend> SandboxService<B> {
         operation_id: OperationId,
         sender: &mpsc::Sender<OperationEvent>,
     ) -> Result<ProvisionedResolution, ServiceError> {
+        self.initialize_managed_volume_roots(spec, operation_id, sender)
+            .await?;
         let plan =
             ProvisioningPlanner::plan_for_root(spec.canonical_root(), spec.manifest(), &applied)
                 .map_err(|_| ServiceError::Provision("could not plan provisioning".to_owned()))?;
-        self.initialize_managed_volume_roots(spec).await?;
         let resolved_tools = if plan.tools_changed() {
             Some(
                 self.install_tools(spec, &plan, operation_id, sender)
@@ -2048,6 +2049,8 @@ impl<B: RuntimeBackend> SandboxService<B> {
     async fn initialize_managed_volume_roots(
         &self,
         spec: &SandboxSpec,
+        operation_id: OperationId,
+        sender: &mpsc::Sender<OperationEvent>,
     ) -> Result<(), ServiceError> {
         self.exec_guest(
             spec.id(),
@@ -2064,8 +2067,8 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 "workspace",
                 "-m",
                 "0700",
-                MISE_DATA_DIR,
-                "/home/workspace/.cache",
+                TOOLS_ROOT,
+                CACHE_ROOT,
             ],
             Vec::new(),
         )
@@ -2085,7 +2088,23 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 "workspace",
                 "-m",
                 "1770",
-                "/home/workspace/.config/gascan",
+                CONFIG_ROOT,
+            ],
+            Vec::new(),
+        )
+        .await?;
+        self.emit_provision_step(operation_id, ProvisionStep::InitializeRuntimeHome, sender)
+            .await?;
+        self.exec_guest(
+            spec.id(),
+            ProvisionStep::InitializeRuntimeHome,
+            "initialize_rust_home",
+            [
+                "/usr/bin/env".to_owned(),
+                format!("HOME={WORKSPACE_HOME}"),
+                format!("CARGO_HOME={CARGO_HOME}"),
+                format!("RUSTUP_HOME={RUSTUP_HOME}"),
+                "/usr/local/bin/initialize-rust-home".to_owned(),
             ],
             Vec::new(),
         )
@@ -3940,13 +3959,31 @@ fn mise_command(args: &[&str]) -> Vec<String> {
     let mut argv = vec![
         "/usr/bin/env".to_owned(),
         format!("HOME={WORKSPACE_HOME}"),
+        format!("CARGO_HOME={CARGO_HOME}"),
+        "GEM_HOME=/home/workspace/.local/share/gem".to_owned(),
+        "GOCACHE=/home/workspace/.cache/go-build".to_owned(),
+        "GOMODCACHE=/home/workspace/.cache/go-mod".to_owned(),
+        format!("GOPATH={GO_PATH}"),
+        "HEX_HOME=/home/workspace/.local/share/hex".to_owned(),
+        format!("MISE_CARGO_HOME={CARGO_HOME}"),
         format!("MISE_CACHE_DIR={MISE_CACHE_DIR}"),
         format!("MISE_CEILING_PATHS={SAFE_MISE_WORKDIR}"),
         format!("MISE_DATA_DIR={MISE_DATA_DIR}"),
         format!("MISE_GLOBAL_CONFIG_FILE={MISE_GLOBAL_CONFIG_FILE}"),
+        format!("MISE_RUSTUP_HOME={RUSTUP_HOME}"),
+        format!("MISE_STATE_DIR={MISE_STATE_DIR}"),
         format!("MISE_SYSTEM_CONFIG_FILE={MISE_GLOBAL_CONFIG_FILE}"),
         format!("MISE_SYSTEM_DATA_DIR={MISE_SYSTEM_DATA_DIR}"),
+        "MIX_HOME=/home/workspace/.local/share/mix".to_owned(),
+        format!("NPM_CONFIG_CACHE={NPM_CACHE_DIR}"),
+        format!("NPM_CONFIG_PREFIX={TOOLS_ROOT}"),
         format!("PATH={CONTAINER_PATH}"),
+        format!("PYTHONUSERBASE={TOOLS_ROOT}"),
+        "REBAR_CACHE_DIR=/home/workspace/.cache/rebar3".to_owned(),
+        format!("RUSTUP_HOME={RUSTUP_HOME}"),
+        format!("XDG_CACHE_HOME={CACHE_ROOT}"),
+        format!("XDG_CONFIG_HOME={CONFIG_ROOT}"),
+        format!("XDG_DATA_HOME={TOOLS_ROOT}/share"),
         "/usr/local/bin/mise".to_owned(),
         "--cd".to_owned(),
         SAFE_MISE_WORKDIR.to_owned(),

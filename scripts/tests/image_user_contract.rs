@@ -1,12 +1,221 @@
 use std::{
     fs,
-    os::unix::fs::{PermissionsExt, symlink},
+    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     path::Path,
     process::Command,
 };
+#[cfg(target_os = "macos")]
+use std::ffi::OsString;
 
 fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
+}
+
+fn rust_seed_command(
+    script: &Path,
+    source: &Path,
+    destination: &Path,
+    test_root: &Path,
+) -> Command {
+    let mut command = Command::new(script);
+    command.arg(source).arg(destination);
+    #[cfg(target_os = "macos")]
+    {
+        let bin = test_root.join("gnu-bin");
+        fs::create_dir_all(&bin).unwrap();
+        let mv = bin.join("mv");
+        if !mv.exists() {
+            let gmv = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .map(|directory| directory.join("gmv"))
+                .find(|candidate| candidate.is_file())
+                .expect("GNU mv is required to exercise Linux publication semantics on macOS");
+            symlink(gmv, &mv).unwrap();
+        }
+        let mut path = vec![bin];
+        path.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        command.env("PATH", std::env::join_paths(path).unwrap_or(OsString::new()));
+    }
+    command
+}
+
+fn write_test_toolchain(source_root: &Path, name: &str, cargo: &str) {
+    let bin = source_root.join("toolchains").join(name).join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(bin.join("cargo"), cargo).unwrap();
+    fs::write(bin.join("rustc"), format!("rustc for {name}\n")).unwrap();
+    for command in ["cargo", "rustc"] {
+        fs::set_permissions(bin.join(command), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::create_dir_all(source_root.join("update-hashes")).unwrap();
+    fs::write(
+        source_root.join("update-hashes").join(name),
+        format!("hash for {name}\n"),
+    )
+    .unwrap();
+}
+
+fn rust_staging_residue(destination_root: &Path) -> Vec<String> {
+    fs::read_dir(destination_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with(".gascan-rust-"))
+        .collect()
+}
+
+#[test]
+fn writable_rust_bootstrap_is_idempotent_fail_closed_and_never_mutates_source() {
+    let script = root().join("images/workspace/bin/initialize-rust-home");
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let destination = temp.path().join("destination");
+    let bundled = "1.97.0-aarch64-unknown-linux-gnu";
+    write_test_toolchain(&source, bundled, "bundled cargo\n");
+
+    let source_cargo = source.join("toolchains").join(bundled).join("bin/cargo");
+    let source_inode = fs::metadata(&source_cargo).unwrap().ino();
+    let source_contents = fs::read(&source_cargo).unwrap();
+    let user_toolchain = destination.join("toolchains/user-installed");
+    fs::create_dir_all(&user_toolchain).unwrap();
+    fs::write(user_toolchain.join("sentinel"), "keep me\n").unwrap();
+
+    let run = || rust_seed_command(&script, &source, &destination, temp.path()).status();
+    assert!(run().unwrap().success());
+    let published = destination
+        .join("toolchains")
+        .join(bundled)
+        .join("bin/cargo");
+    let first_inode = fs::metadata(&published).unwrap().ino();
+    let first_contents = fs::read(&published).unwrap();
+    assert_eq!(first_contents, b"bundled cargo\n");
+    assert_eq!(
+        fs::metadata(&published).unwrap().uid(),
+        fs::metadata(&destination).unwrap().uid(),
+        "published files must belong to the invoking user"
+    );
+    assert_eq!(
+        fs::read_to_string(destination.join("update-hashes").join(bundled)).unwrap(),
+        "hash for 1.97.0-aarch64-unknown-linux-gnu\n"
+    );
+
+    assert!(run().unwrap().success());
+    assert_eq!(fs::metadata(&published).unwrap().ino(), first_inode);
+    assert_eq!(fs::read(&published).unwrap(), first_contents);
+    assert_eq!(
+        fs::read_to_string(user_toolchain.join("sentinel")).unwrap(),
+        "keep me\n"
+    );
+
+    let additional = "1.98.0-aarch64-unknown-linux-gnu";
+    write_test_toolchain(&source, additional, "new cargo\n");
+    assert!(run().unwrap().success());
+    assert_eq!(fs::metadata(&published).unwrap().ino(), first_inode);
+    assert_eq!(fs::read(&published).unwrap(), first_contents);
+    assert_eq!(
+        fs::read_to_string(
+            destination
+                .join("toolchains")
+                .join(additional)
+                .join("bin/cargo")
+        )
+        .unwrap(),
+        "new cargo\n"
+    );
+    let marker = destination.join(".gascan-bundled-toolchains-v1");
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap(),
+        "1.97.0-aarch64-unknown-linux-gnu\n1.98.0-aarch64-unknown-linux-gnu\n"
+    );
+    assert_eq!(fs::metadata(&marker).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(fs::metadata(&source_cargo).unwrap().ino(), source_inode);
+    assert_eq!(fs::read(&source_cargo).unwrap(), source_contents);
+}
+
+#[test]
+fn writable_rust_bootstrap_cleans_staging_and_rejects_unsafe_paths() {
+    let script = root().join("images/workspace/bin/initialize-rust-home");
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let incomplete = "1.97.0-aarch64-unknown-linux-gnu";
+    write_test_toolchain(&source, incomplete, "cargo\n");
+    fs::remove_file(
+        source
+            .join("toolchains")
+            .join(incomplete)
+            .join("bin/rustc"),
+    )
+    .unwrap();
+    let retry_destination = temp.path().join("retry-destination");
+    let failed = rust_seed_command(&script, &source, &retry_destination, temp.path())
+        .status()
+        .unwrap();
+    assert!(!failed.success());
+    assert!(rust_staging_residue(&retry_destination).is_empty());
+    fs::write(
+        source
+            .join("toolchains")
+            .join(incomplete)
+            .join("bin/rustc"),
+        "rustc\n",
+    )
+    .unwrap();
+    fs::set_permissions(
+        source
+            .join("toolchains")
+            .join(incomplete)
+            .join("bin/rustc"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    assert!(
+        rust_seed_command(&script, &source, &retry_destination, temp.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(rust_staging_residue(&retry_destination).is_empty());
+
+    for collision in ["symlink", "file"] {
+        let destination = temp.path().join(format!("{collision}-destination"));
+        fs::create_dir_all(destination.join("toolchains")).unwrap();
+        let final_path = destination.join("toolchains").join(incomplete);
+        if collision == "symlink" {
+            symlink(temp.path(), &final_path).unwrap();
+        } else {
+            fs::write(&final_path, "unmanaged").unwrap();
+        }
+        let rejected = rust_seed_command(&script, &source, &destination, temp.path())
+            .status()
+            .unwrap();
+        assert!(
+            !rejected.success(),
+            "accepted {collision} destination collision"
+        );
+        assert!(rust_staging_residue(&destination).is_empty());
+    }
+
+    for source_collision in ["symlink", "file"] {
+        let unsafe_source = temp.path().join(format!("{source_collision}-source"));
+        fs::create_dir_all(unsafe_source.join("toolchains")).unwrap();
+        fs::create_dir_all(unsafe_source.join("update-hashes")).unwrap();
+        let toolchain = unsafe_source.join("toolchains/unsafe");
+        if source_collision == "symlink" {
+            symlink(source.join("toolchains").join(incomplete), &toolchain).unwrap();
+        } else {
+            fs::write(&toolchain, "not a directory").unwrap();
+        }
+        let destination = temp
+            .path()
+            .join(format!("{source_collision}-source-destination"));
+        let rejected = rust_seed_command(&script, &unsafe_source, &destination, temp.path())
+            .status()
+            .unwrap();
+        assert!(
+            !rejected.success(),
+            "accepted {source_collision} source collision"
+        );
+    }
 }
 
 #[test]
@@ -229,6 +438,7 @@ fn dockerfile_declares_workspace_user_init_and_persistent_layout() {
     for required in [
         "COPY --chmod=0440 images/workspace/etc/sudoers.d/workspace /etc/sudoers.d/workspace",
         "COPY --chmod=0555 images/workspace/bin/migrate-workspace-identity /usr/local/bin/migrate-workspace-identity",
+        "COPY --chmod=0555 images/workspace/bin/initialize-rust-home /usr/local/bin/initialize-rust-home",
         "COPY --chmod=0555 images/workspace/libexec/migrate-workspace-identity-core /usr/local/libexec/gascan/migrate-workspace-identity-core",
         "/usr/local/bin/migrate-workspace-identity",
         "chown workspace:workspace /opt/gascan/mise",

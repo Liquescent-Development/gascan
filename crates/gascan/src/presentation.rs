@@ -409,6 +409,9 @@ impl OperationProgress {
             ("provision_step", Some(v1::ProvisionStep::HealthCheck)) => {
                 Some("Checking sandbox health")
             }
+            ("provision_step", Some(v1::ProvisionStep::InitializeRuntimeHome)) => {
+                Some("Preparing writable tool storage")
+            }
             _ => None,
         }?;
 
@@ -841,6 +844,12 @@ mod tests {
     fn provision_steps_are_typed_human_copy_and_deduplicated() {
         let (mut progress, _) =
             OperationProgress::new(OperationKind::Apply, None, OutputCapabilities::plain());
+        assert_eq!(
+            progress
+                .update(&provision_event(v1::ProvisionStep::InitializeRuntimeHome))
+                .as_deref(),
+            Some("Preparing writable tool storage")
+        );
         let install = provision_event(v1::ProvisionStep::InstallTools);
         assert_eq!(
             progress.update(&install).as_deref(),

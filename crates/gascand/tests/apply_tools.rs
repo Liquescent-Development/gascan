@@ -88,6 +88,7 @@ async fn image_replace_reuses_unchanged_persistent_tools_without_reinstalling() 
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (
                 br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
                 Vec::new(),
@@ -116,6 +117,8 @@ async fn image_replace_reuses_unchanged_persistent_tools_without_reinstalling() 
     service.store().put_sandbox(&record)?;
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (
@@ -182,6 +185,7 @@ async fn apply_uses_literal_mise_argv_streams_steps_and_persists_exact_versions(
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (
                 br#"{"node":[{"version":"24.18.0","installed":true,"active":true}],"python":[{"version":"3.14.6","installed":true,"active":true}]}"#.to_vec(),
                 Vec::new(),
@@ -221,7 +225,7 @@ async fn apply_uses_literal_mise_argv_streams_steps_and_persists_exact_versions(
                 "workspace",
                 "-m",
                 "0700",
-                "/home/workspace/.local/share/mise",
+                "/home/workspace/.local",
                 "/home/workspace/.cache",
             ]
             .as_slice(),
@@ -236,7 +240,15 @@ async fn apply_uses_literal_mise_argv_streams_steps_and_persists_exact_versions(
                 "workspace",
                 "-m",
                 "1770",
-                "/home/workspace/.config/gascan",
+                "/home/workspace/.config",
+            ]
+            .as_slice(),
+            [
+                "/usr/bin/env",
+                "HOME=/home/workspace",
+                "CARGO_HOME=/home/workspace/.local/share/cargo",
+                "RUSTUP_HOME=/home/workspace/.local/share/rustup",
+                "/usr/local/bin/initialize-rust-home",
             ]
             .as_slice(),
             [
@@ -272,13 +284,31 @@ async fn apply_uses_literal_mise_argv_streams_steps_and_persists_exact_versions(
             [
                 "/usr/bin/env",
                 "HOME=/home/workspace",
+                "CARGO_HOME=/home/workspace/.local/share/cargo",
+                "GEM_HOME=/home/workspace/.local/share/gem",
+                "GOCACHE=/home/workspace/.cache/go-build",
+                "GOMODCACHE=/home/workspace/.cache/go-mod",
+                "GOPATH=/home/workspace/.local/share/go",
+                "HEX_HOME=/home/workspace/.local/share/hex",
+                "MISE_CARGO_HOME=/home/workspace/.local/share/cargo",
                 "MISE_CACHE_DIR=/home/workspace/.cache/mise",
                 "MISE_CEILING_PATHS=/home/workspace/.config/gascan/mise-workdir",
                 "MISE_DATA_DIR=/home/workspace/.local/share/mise",
                 "MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
+                "MISE_RUSTUP_HOME=/home/workspace/.local/share/rustup",
+                "MISE_STATE_DIR=/home/workspace/.config/gascan/mise-state",
                 "MISE_SYSTEM_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
                 "MISE_SYSTEM_DATA_DIR=/opt/gascan/mise",
+                "MIX_HOME=/home/workspace/.local/share/mix",
+                "NPM_CONFIG_CACHE=/home/workspace/.cache/npm",
+                "NPM_CONFIG_PREFIX=/home/workspace/.local",
                 "PATH=/home/workspace/.local/bin:/home/workspace/.local/share/cargo/bin:/home/workspace/.local/share/go/bin:/home/workspace/.local/share/gem/bin:/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/opt/gascan/workstation/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "PYTHONUSERBASE=/home/workspace/.local",
+                "REBAR_CACHE_DIR=/home/workspace/.cache/rebar3",
+                "RUSTUP_HOME=/home/workspace/.local/share/rustup",
+                "XDG_CACHE_HOME=/home/workspace/.cache",
+                "XDG_CONFIG_HOME=/home/workspace/.config",
+                "XDG_DATA_HOME=/home/workspace/.local/share",
                 "/usr/local/bin/mise",
                 "--cd",
                 "/home/workspace/.config/gascan/mise-workdir",
@@ -291,13 +321,31 @@ async fn apply_uses_literal_mise_argv_streams_steps_and_persists_exact_versions(
             [
                 "/usr/bin/env",
                 "HOME=/home/workspace",
+                "CARGO_HOME=/home/workspace/.local/share/cargo",
+                "GEM_HOME=/home/workspace/.local/share/gem",
+                "GOCACHE=/home/workspace/.cache/go-build",
+                "GOMODCACHE=/home/workspace/.cache/go-mod",
+                "GOPATH=/home/workspace/.local/share/go",
+                "HEX_HOME=/home/workspace/.local/share/hex",
+                "MISE_CARGO_HOME=/home/workspace/.local/share/cargo",
                 "MISE_CACHE_DIR=/home/workspace/.cache/mise",
                 "MISE_CEILING_PATHS=/home/workspace/.config/gascan/mise-workdir",
                 "MISE_DATA_DIR=/home/workspace/.local/share/mise",
                 "MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
+                "MISE_RUSTUP_HOME=/home/workspace/.local/share/rustup",
+                "MISE_STATE_DIR=/home/workspace/.config/gascan/mise-state",
                 "MISE_SYSTEM_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
                 "MISE_SYSTEM_DATA_DIR=/opt/gascan/mise",
+                "MIX_HOME=/home/workspace/.local/share/mix",
+                "NPM_CONFIG_CACHE=/home/workspace/.cache/npm",
+                "NPM_CONFIG_PREFIX=/home/workspace/.local",
                 "PATH=/home/workspace/.local/bin:/home/workspace/.local/share/cargo/bin:/home/workspace/.local/share/go/bin:/home/workspace/.local/share/gem/bin:/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/opt/gascan/workstation/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "PYTHONUSERBASE=/home/workspace/.local",
+                "REBAR_CACHE_DIR=/home/workspace/.cache/rebar3",
+                "RUSTUP_HOME=/home/workspace/.local/share/rustup",
+                "XDG_CACHE_HOME=/home/workspace/.cache",
+                "XDG_CONFIG_HOME=/home/workspace/.config",
+                "XDG_DATA_HOME=/home/workspace/.local/share",
                 "/usr/local/bin/mise",
                 "--cd",
                 "/home/workspace/.config/gascan/mise-workdir",
@@ -313,6 +361,56 @@ async fn apply_uses_literal_mise_argv_streams_steps_and_persists_exact_versions(
         ]
     );
     assert!(execs.iter().all(|request| request.environment.is_empty()));
+    let create_environment = calls
+        .iter()
+        .find_map(|call| match call {
+            RuntimeCall::Create(request) => Some(request.environment()),
+            _ => None,
+        })
+        .ok_or("create request")?;
+    let mise_environment = execs[8].argv[1..]
+        .iter()
+        .take_while(|arg| arg.as_str() != "/usr/local/bin/mise")
+        .map(|entry| entry.split_once('=').ok_or("mise environment entry"))
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+    for key in [
+        "CARGO_HOME",
+        "GEM_HOME",
+        "GOCACHE",
+        "GOMODCACHE",
+        "GOPATH",
+        "HEX_HOME",
+        "HOME",
+        "MISE_CARGO_HOME",
+        "MISE_CACHE_DIR",
+        "MISE_DATA_DIR",
+        "MISE_GLOBAL_CONFIG_FILE",
+        "MISE_RUSTUP_HOME",
+        "MISE_STATE_DIR",
+        "MISE_SYSTEM_DATA_DIR",
+        "MIX_HOME",
+        "NPM_CONFIG_CACHE",
+        "NPM_CONFIG_PREFIX",
+        "PATH",
+        "PYTHONUSERBASE",
+        "REBAR_CACHE_DIR",
+        "RUSTUP_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+    ] {
+        assert_eq!(
+            mise_environment.get(key).copied(),
+            create_environment.get(key).map(String::as_str),
+            "{key} differs between runtime and provisioning"
+        );
+    }
+    assert!(
+        details
+            .iter()
+            .any(|event| event.get("step").and_then(Value::as_str)
+                == Some("initialize_runtime_home"))
+    );
     assert!(
         details.iter().any(
             |event| event.get("step").and_then(Value::as_str) == Some("write_safe_mise_config")
@@ -370,6 +468,7 @@ async fn failed_install_retains_applied_state_and_retry_can_succeed() -> TestRes
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), b"install failed".to_vec(), 23),
         ])
         .await;
@@ -384,9 +483,14 @@ async fn failed_install_retains_applied_state_and_retry_can_succeed() -> TestRes
         service.status(&id)?.ok_or("failed record")?.tool_resolution,
         prior
     );
+    let failure = service.latest_operation()?.ok_or("failed operation")?;
+    let details = failure.error_details.ok_or("install failure details")?;
+    assert_eq!(details["step"], "install_tools");
+    assert_eq!(details["action"], "install_tools");
 
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
@@ -439,6 +543,7 @@ async fn verbose_stderr_does_not_fail_successful_tool_install() -> TestResult {
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), vec![b'x'; 2 * 1024 * 1024], 0),
             (
                 br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
@@ -481,6 +586,8 @@ async fn terminal_stderr_is_retained_in_command_failure() -> TestResult {
     stderr.extend_from_slice(TERMINAL.as_bytes());
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
@@ -536,6 +643,7 @@ async fn oversized_stdout_cancels_guest_exec_session() -> TestResult {
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (vec![b'x'; 2 * 1024 * 1024], Vec::new(), 0),
         ])
         .await;
@@ -562,10 +670,11 @@ async fn failed_safe_config_commands_record_fixed_boundary_and_guest_stderr() ->
     let cases = [
         (0, "initialize_managed_volume_roots"),
         (1, "secure_managed_config_root"),
-        (2, "initialize_workstation_home"),
-        (3, "reset_safe_mise_workdir"),
-        (4, "create_safe_mise_workdir"),
-        (5, "write_safe_mise_config"),
+        (2, "initialize_rust_home"),
+        (3, "initialize_workstation_home"),
+        (4, "reset_safe_mise_workdir"),
+        (5, "create_safe_mise_workdir"),
+        (6, "write_safe_mise_config"),
     ];
     for (failure_index, action) in cases {
         let root = tempfile::tempdir()?;
@@ -594,7 +703,12 @@ async fn failed_safe_config_commands_record_fixed_boundary_and_guest_stderr() ->
         assert!(error.to_string().contains(DIAGNOSTIC));
         let operation = service.latest_operation()?.ok_or("operation")?;
         let details = operation.error_details.ok_or("error details")?;
-        assert_eq!(details["step"], "write_safe_mise_config");
+        let expected_step = if action == "initialize_rust_home" {
+            "initialize_runtime_home"
+        } else {
+            "write_safe_mise_config"
+        };
+        assert_eq!(details["step"], expected_step);
         assert_eq!(details["action"], action);
         assert_eq!(details["exit_code"], 23);
         assert_eq!(details["signal"], 0);
@@ -638,7 +752,7 @@ async fn empty_noop_apply_executes_no_guest_commands() -> TestResult {
             "workspace",
             "-m",
             "0700",
-            "/home/workspace/.local/share/mise",
+            "/home/workspace/.local",
             "/home/workspace/.cache",
         ])
     );
@@ -694,7 +808,7 @@ async fn managed_config_root_remains_writable_but_protects_root_owned_entries() 
             "workspace",
             "-m",
             "0700",
-            "/home/workspace/.local/share/mise",
+            "/home/workspace/.local",
             "/home/workspace/.cache",
         ]
     );
@@ -711,11 +825,21 @@ async fn managed_config_root_remains_writable_but_protects_root_owned_entries() 
             "workspace",
             "-m",
             "1770",
-            "/home/workspace/.config/gascan",
+            "/home/workspace/.config",
         ]
     );
     assert_eq!(
         execs[2],
+        [
+            "/usr/bin/env",
+            "HOME=/home/workspace",
+            "CARGO_HOME=/home/workspace/.local/share/cargo",
+            "RUSTUP_HOME=/home/workspace/.local/share/rustup",
+            "/usr/local/bin/initialize-rust-home",
+        ]
+    );
+    assert_eq!(
+        execs[3],
         [
             "/usr/bin/env",
             "HOME=/home/workspace",
@@ -744,6 +868,8 @@ async fn duplicate_mise_tool_keys_are_rejected_without_advancing_state() -> Test
     write_manifest(root, &[("node", "lts")])?;
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
@@ -790,6 +916,7 @@ async fn legacy_matching_fingerprint_without_tool_hash_requires_one_explicit_app
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (
                 br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
                 Vec::new(),
@@ -817,6 +944,7 @@ async fn legacy_matching_fingerprint_without_tool_hash_requires_one_explicit_app
     let before = runtime.calls().await.len();
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
@@ -863,6 +991,7 @@ async fn removing_last_tool_writes_empty_config_and_persists_empty_resolution() 
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (
                 br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
                 Vec::new(),
@@ -882,6 +1011,7 @@ async fn removing_last_tool_writes_empty_config_and_persists_empty_resolution() 
     let before = runtime.calls().await.len();
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
@@ -928,13 +1058,31 @@ async fn removing_last_tool_writes_empty_config_and_persists_empty_resolution() 
         [
             "/usr/bin/env",
             "HOME=/home/workspace",
+            "CARGO_HOME=/home/workspace/.local/share/cargo",
+            "GEM_HOME=/home/workspace/.local/share/gem",
+            "GOCACHE=/home/workspace/.cache/go-build",
+            "GOMODCACHE=/home/workspace/.cache/go-mod",
+            "GOPATH=/home/workspace/.local/share/go",
+            "HEX_HOME=/home/workspace/.local/share/hex",
+            "MISE_CARGO_HOME=/home/workspace/.local/share/cargo",
             "MISE_CACHE_DIR=/home/workspace/.cache/mise",
             "MISE_CEILING_PATHS=/home/workspace/.config/gascan/mise-workdir",
             "MISE_DATA_DIR=/home/workspace/.local/share/mise",
             "MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
+            "MISE_RUSTUP_HOME=/home/workspace/.local/share/rustup",
+            "MISE_STATE_DIR=/home/workspace/.config/gascan/mise-state",
             "MISE_SYSTEM_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
             "MISE_SYSTEM_DATA_DIR=/opt/gascan/mise",
+            "MIX_HOME=/home/workspace/.local/share/mix",
+            "NPM_CONFIG_CACHE=/home/workspace/.cache/npm",
+            "NPM_CONFIG_PREFIX=/home/workspace/.local",
             "PATH=/home/workspace/.local/bin:/home/workspace/.local/share/cargo/bin:/home/workspace/.local/share/go/bin:/home/workspace/.local/share/gem/bin:/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/opt/gascan/workstation/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "PYTHONUSERBASE=/home/workspace/.local",
+            "REBAR_CACHE_DIR=/home/workspace/.cache/rebar3",
+            "RUSTUP_HOME=/home/workspace/.local/share/rustup",
+            "XDG_CACHE_HOME=/home/workspace/.cache",
+            "XDG_CONFIG_HOME=/home/workspace/.config",
+            "XDG_DATA_HOME=/home/workspace/.local/share",
             "/usr/local/bin/mise",
             "--cd",
             "/home/workspace/.config/gascan/mise-workdir",
@@ -973,6 +1121,7 @@ async fn missing_container_forces_tool_install_even_when_durable_hash_matches() 
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (
                 br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
                 Vec::new(),
@@ -1000,6 +1149,7 @@ async fn missing_container_forces_tool_install_even_when_durable_hash_matches() 
     let before = runtime.calls().await.len();
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),

@@ -79,6 +79,22 @@ fn empty_tool_plan_still_contains_create_verification_boundaries() -> TestResult
 }
 
 #[test]
+fn runtime_home_initialization_is_typed_but_not_manifest_planned() -> TestResult {
+    let manifest = manifest("version = 1\n[tools]\nnode = 'lts'\n")?;
+    let plan = ProvisioningPlanner::plan(&manifest, &AppliedState::empty())?;
+
+    assert_eq!(
+        ProvisionStep::InitializeRuntimeHome.as_str(),
+        "initialize_runtime_home"
+    );
+    assert!(
+        !plan.steps().contains(&ProvisionStep::InitializeRuntimeHome),
+        "idempotent runtime initialization belongs before the manifest plan"
+    );
+    Ok(())
+}
+
+#[test]
 fn removing_last_tool_rewrites_an_empty_tools_only_config() -> TestResult {
     let with_node = manifest("version = 1\n[tools]\nnode = 'lts'\n")?;
     let installed = ProvisioningPlanner::plan(&with_node, &AppliedState::empty())?;

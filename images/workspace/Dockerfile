@@ -84,6 +84,7 @@ COPY --chmod=0555 images/workspace/tests/ssh-contract.sh /opt/gascan/tests/ssh-c
 COPY --chmod=0555 images/workspace/bin/install-workstation-artifacts /usr/local/bin/install-workstation-artifacts
 COPY --chmod=0555 images/workspace/bin/run-workstation-step /usr/local/bin/run-workstation-step
 COPY --chmod=0555 images/workspace/bin/configure-workstation-home /usr/local/bin/configure-workstation-home
+COPY --chmod=0555 images/workspace/bin/initialize-rust-home /usr/local/bin/initialize-rust-home
 COPY --chmod=0444 images/workspace/versions.lock /tmp/versions.lock
 COPY workstation /tmp/workstation
 

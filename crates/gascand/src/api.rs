@@ -564,6 +564,7 @@ fn wire_event(event: StoredEvent) -> v1::OperationEvent {
         Some("run_setup") => v1::ProvisionStep::RunSetup,
         Some("verify_gascamp") => v1::ProvisionStep::VerifyGascamp,
         Some("health_check") => v1::ProvisionStep::HealthCheck,
+        Some("initialize_runtime_home") => v1::ProvisionStep::InitializeRuntimeHome,
         _ => v1::ProvisionStep::Unspecified,
     } as i32;
     v1::OperationEvent {
@@ -2832,7 +2833,7 @@ mod tests {
             sequence: 2,
             operation_id,
             status: OperationStatus::Failed,
-            details: Some(json!({"message":"broken","step":"install_tools"})),
+            details: Some(json!({"message":"broken","step":"initialize_runtime_home"})),
             error_code: Some("backend_unavailable".to_owned()),
             timestamp_millis: 1_725_000_000_123,
         });
@@ -2840,7 +2841,10 @@ mod tests {
             event.error.map(|error| error.code),
             Some("backend_unavailable".to_owned())
         );
-        assert_eq!(event.provision_step, v1::ProvisionStep::InstallTools as i32);
+        assert_eq!(
+            event.provision_step,
+            v1::ProvisionStep::InitializeRuntimeHome as i32
+        );
         assert_eq!(
             event
                 .timestamp

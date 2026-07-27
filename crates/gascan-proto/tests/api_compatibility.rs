@@ -1078,6 +1078,7 @@ fn v1_descriptor_exactly_covers_every_exported_message_enum_and_rpc() {
                 ("PROVISION_STEP_RUN_SETUP", 3),
                 ("PROVISION_STEP_VERIFY_GASCAMP", 4),
                 ("PROVISION_STEP_HEALTH_CHECK", 5),
+                ("PROVISION_STEP_INITIALIZE_RUNTIME_HOME", 6),
             ],
         ),
     ];
