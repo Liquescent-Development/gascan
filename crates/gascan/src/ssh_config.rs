@@ -26,7 +26,7 @@ static E2E_ACCOUNT_HOME: OnceLock<PathBuf> = OnceLock::new();
 const USER_CONFIG: &str = "config";
 const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
 const DIRECTORY_MODE: u16 = 0o700;
-const FILE_MODE: u16 = 0o600;
+const FILE_MODE: rustix::fs::RawMode = 0o600;
 type ManagedBlock = (usize, usize, &'static [u8]);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -341,7 +341,7 @@ pub fn answer_first_use_offer(
 struct FileIdentity {
     device: u64,
     inode: u64,
-    mode: u16,
+    mode: rustix::fs::RawMode,
 }
 
 #[derive(Clone, Copy)]
@@ -355,7 +355,7 @@ impl FileIdentity {
         Self {
             device: stat.st_dev as u64,
             inode: stat.st_ino,
-            mode: (stat.st_mode & 0o7777) as u16,
+            mode: stat.st_mode & 0o7777,
         }
     }
 }

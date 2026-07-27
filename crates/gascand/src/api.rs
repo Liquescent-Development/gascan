@@ -3241,11 +3241,15 @@ mod tests {
             status.message(),
             error_code::STORAGE_LAYOUT_REQUIRES_RECREATE
         );
-        let details = gascan_proto::error_detail::decode_details(status.details())
-            .expect("storage layout error must include details");
+        let details = gascan_proto::error_detail::decode_details(status.details());
+        assert!(
+            details.is_some(),
+            "storage layout error must include details"
+        );
+        let parsed = serde_json::from_slice::<serde_json::Value>(&details.unwrap_or_default());
+        assert!(parsed.is_ok(), "storage layout details must be valid JSON");
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&details)
-                .expect("storage layout details must be valid JSON"),
+            parsed.unwrap_or_default(),
             json!({
                 "reason": "storage_layout_changed",
                 "recorded_layout": 1,

@@ -185,6 +185,17 @@ Copy the default manifest into a project as `gascan.toml`, choose a unique
 `gascan apply`, `gascan down`, and `gascan destroy --yes`. Setup changes run
 only on initial creation or explicit `apply`.
 
+Gas Can 0.1.10 uses managed storage layout version 2. Before upgrading a
+pre-0.1.10 sandbox, back up required volume content and recreate it with
+`gascan destroy --yes` followed by `gascan up .`; old volumes must never be
+mounted at the new targets. The installed-release smoke must verify exactly
+one managed volume at each of `/home/workspace/.local`,
+`/home/workspace/.cache`, and `/home/workspace/.config`. It must also verify
+writable runtime homes and `cargo run` with a crates.io dependency. It must
+also verify local Rust, npm, Go, Python, and Ruby installs and XDG configuration creation. Every
+fixture and sandbox created for these checks remains release-smoke-owned and
+must be removed by its recorded cleanup path.
+
 Host controller state and the on-demand socket live under
 `${XDG_RUNTIME_DIR}/gascan` when `XDG_RUNTIME_DIR` is set, otherwise under
 `/private/tmp/gascan-UID` on macOS. The canonical path avoids the `/tmp`

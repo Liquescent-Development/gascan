@@ -1093,7 +1093,7 @@ mod tests {
         std::fs::create_dir(&ssh)?;
         std::fs::set_permissions(
             &ssh,
-            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o775),
         )?;
         let config = SshConfig::for_environment(None, Some(&home))?;
         let mut warning = Vec::new();
@@ -1119,6 +1119,36 @@ mod tests {
             home.join(".config/gascan/ssh/config")
         );
         assert!(!home.join(".config/gascan/ssh/include-offer-v1").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn optional_include_offer_accepts_conventional_0755_directory_without_warning()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().join("home");
+        let ssh = home.join(".ssh");
+        std::fs::create_dir(&home)?;
+        std::fs::create_dir(&ssh)?;
+        std::fs::set_permissions(
+            &ssh,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )?;
+        let config = SshConfig::for_environment(None, Some(&home))?;
+        let mut warning = Vec::new();
+
+        let result = preserve_up_result_with_optional_offer(
+            Ok(0),
+            false,
+            &mut warning,
+            || -> Result<(), CliError> {
+                let _ = first_use_offer(&config, true, true).map_err(ssh_config_error)?;
+                Ok(())
+            },
+        );
+
+        assert_eq!(result?, 0);
+        assert!(warning.is_empty());
         Ok(())
     }
 

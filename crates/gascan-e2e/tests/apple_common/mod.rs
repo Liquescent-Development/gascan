@@ -2854,9 +2854,9 @@ mod tests {
                     .map(|volume| volume.target.as_str())
                     .collect::<Vec<_>>(),
                 vec![
-                    "/home/workspace/.local/share/mise",
+                    "/home/workspace/.local",
                     "/home/workspace/.cache",
-                    "/home/workspace/.config/gascan",
+                    "/home/workspace/.config",
                 ]
             );
             assert_eq!(request.ownership().managed_by, "gascan");

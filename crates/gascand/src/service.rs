@@ -3623,10 +3623,9 @@ fn validate_storage_capacities(
     requested: StorageCapacities,
 ) -> Result<(), ServiceError> {
     validate_storage_layout(record)?;
-    let recorded = record
-        .storage_resolution
-        .as_ref()
-        .expect("storage layout validation requires a current resolution");
+    let Some(recorded) = record.storage_resolution.as_ref() else {
+        return Err(ServiceError::StorageLayoutRequiresRecreate { recorded: None });
+    };
     let changes = requested
         .into_iter()
         .filter_map(|(volume, requested_bytes)| {

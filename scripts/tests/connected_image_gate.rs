@@ -1,9 +1,10 @@
 use sha2::{Digest, Sha256};
 use std::{
     fs,
+    io::Write,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     time::{Duration, Instant},
 };
 
@@ -27,10 +28,39 @@ fn file_digest(path: &Path) -> String {
     format!("{:x}", Sha256::digest(fs::read(path).unwrap()))
 }
 
+fn configure_validator_dispatcher(command: &mut Command, fixture_manifest: &Path) {
+    let fixture_manifest = fs::canonicalize(fixture_manifest.parent().unwrap())
+        .unwrap()
+        .join(fixture_manifest.file_name().unwrap());
+    command
+        .env(
+            "GASCAN_GATE_TEST_CARGO_MANIFEST",
+            repository_root().join("scripts/Cargo.toml"),
+        )
+        .env("GASCAN_GATE_TEST_FIXTURE_CARGO_MANIFEST", fixture_manifest)
+        .env(
+            "GASCAN_GATE_TEST_VALIDATE_CONNECTED_BUILD",
+            env!("CARGO_BIN_EXE_validate-connected-build"),
+        )
+        .env(
+            "GASCAN_GATE_TEST_VALIDATE_CONTAINER_INVENTORY",
+            env!("CARGO_BIN_EXE_validate-container-inventory"),
+        )
+        .env(
+            "GASCAN_GATE_TEST_VALIDATE_OWNED_CONTAINER",
+            env!("CARGO_BIN_EXE_validate-owned-container"),
+        )
+        .env(
+            "GASCAN_GATE_TEST_VALIDATE_OWNED_VOLUME",
+            env!("CARGO_BIN_EXE_validate-owned-volume"),
+        );
+}
+
 struct Fixture {
     temp: tempfile::TempDir,
     root: PathBuf,
     calls: PathBuf,
+    path: std::ffi::OsString,
     command: Command,
 }
 
@@ -83,6 +113,34 @@ fn fixture() -> Fixture {
     )
     .unwrap();
     let calls = temp.path().join("calls");
+    executable(
+        &temp.path().join("cargo"),
+        r#"#!/bin/sh
+set -eu
+test "$#" -ge 9 || exit 64
+test "$1" = run || exit 64
+test "$2" = --quiet || exit 64
+test "$3" = --locked || exit 64
+test "$4" = --offline || exit 64
+test "$5" = --manifest-path || exit 64
+case "$6" in
+  "$GASCAN_GATE_TEST_CARGO_MANIFEST"|"$GASCAN_GATE_TEST_FIXTURE_CARGO_MANIFEST") ;;
+  *) exit 64 ;;
+esac
+test "$7" = --bin || exit 64
+bin=$8
+test "$9" = -- || exit 64
+shift 9
+case "$bin" in
+  validate-connected-build) executable=$GASCAN_GATE_TEST_VALIDATE_CONNECTED_BUILD ;;
+  validate-container-inventory) executable=$GASCAN_GATE_TEST_VALIDATE_CONTAINER_INVENTORY ;;
+  validate-owned-container) executable=$GASCAN_GATE_TEST_VALIDATE_OWNED_CONTAINER ;;
+  validate-owned-volume) executable=$GASCAN_GATE_TEST_VALIDATE_OWNED_VOLUME ;;
+  *) exit 64 ;;
+esac
+exec "$executable" "$@"
+"#,
+    );
     executable(
         &root.join("scripts/prefetch-connected-workspace-image.sh"),
         "#!/bin/sh\nset -eu\nprintf 'prefetch\\n' >>\"$CALLS\"\n",
@@ -137,8 +195,13 @@ fn fixture() -> Fixture {
     fs::create_dir(&state).unwrap();
     fs::write(state.join("unrelated-resource"), "foreign").unwrap();
     let mut command = Command::new("bash");
+    let path = std::env::join_paths(std::iter::once(temp.path().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
     command
         .arg(repository_root().join("scripts/run-connected-image-gate.sh"))
+        .env("PATH", &path)
         .env("GASCAN_GATE_TEST_ROOT", &root)
         .env("GASCAN_GATE_ARTIFACTS", root.join(".artifacts"))
         .env("GASCAN_TEST_OWNER_TOKEN", TOKEN)
@@ -146,14 +209,83 @@ fn fixture() -> Fixture {
         .env("CALLS", &calls)
         .env("STATE", &state)
         .env("OWNER", TOKEN)
-        .env("RAW_CONTAINER", &raw_container)
-        .env("CARGO_TARGET_DIR", repository_root().join("scripts/target"));
+        .env("RAW_CONTAINER", &raw_container);
+    configure_validator_dispatcher(&mut command, &root.join("scripts/Cargo.toml"));
     Fixture {
         temp,
         root,
         calls,
+        path,
         command,
     }
+}
+
+#[test]
+fn fixture_cargo_dispatcher_is_strict_and_preserves_validator_io() {
+    let f = fixture();
+    let cargo = f.temp.path().join("cargo");
+    let manifest = repository_root().join("scripts/Cargo.toml");
+    let name = "gascan-image-user-test-owner";
+    let token = TOKEN;
+    let inventory = format!(
+        r#"[{{"id":"{name}","configuration":{{"id":"{name}","labels":{{"dev.gascan.test":"true","dev.gascan.test.owner":"{token}"}}}}}}]"#
+    );
+    let mut valid = Command::new(&cargo);
+    valid
+        .args(["run", "--quiet", "--locked", "--offline", "--manifest-path"])
+        .arg(&manifest)
+        .args(["--bin", "validate-owned-container", "--", name, token])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_validator_dispatcher(&mut valid, &f.root.join("scripts/Cargo.toml"));
+    let mut child = valid.spawn().unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(inventory.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+
+    for invalid in [
+        &["check", "--quiet"][..],
+        &["run", "--verbose"][..],
+        &["run", "--quiet", "--locked"][..],
+    ] {
+        let mut command = Command::new(&cargo);
+        command.args(invalid);
+        configure_validator_dispatcher(&mut command, &f.root.join("scripts/Cargo.toml"));
+        assert_eq!(command.status().unwrap().code(), Some(64));
+    }
+    let mut unknown_bin = Command::new(&cargo);
+    unknown_bin
+        .args(["run", "--quiet", "--locked", "--offline", "--manifest-path"])
+        .arg(manifest)
+        .args(["--bin", "unknown-validator", "--"]);
+    configure_validator_dispatcher(&mut unknown_bin, &f.root.join("scripts/Cargo.toml"));
+    assert_eq!(unknown_bin.status().unwrap().code(), Some(64));
+
+    let mut unknown_manifest = Command::new(&cargo);
+    unknown_manifest.args([
+        "run",
+        "--quiet",
+        "--locked",
+        "--offline",
+        "--manifest-path",
+        "/tmp/foreign/Cargo.toml",
+        "--bin",
+        "validate-owned-container",
+        "--",
+    ]);
+    configure_validator_dispatcher(&mut unknown_manifest, &f.root.join("scripts/Cargo.toml"));
+    assert_eq!(unknown_manifest.status().unwrap().code(), Some(64));
 }
 
 fn seed_valid_receipt(f: &Fixture) {
@@ -175,6 +307,28 @@ fn seed_valid_receipt(f: &Fixture) {
         ),
     )
     .unwrap();
+}
+
+#[test]
+fn fixture_cargo_dispatcher_accepts_the_canonical_fixture_manifest() {
+    let f = fixture();
+    seed_valid_receipt(&f);
+    let artifacts = f.root.join(".artifacts");
+    let mut command = Command::new(f.root.join("scripts/validate-connected-image-receipt.sh"));
+    command
+        .args([
+            artifacts.join("workspace-image-ref"),
+            artifacts.join("workspace-image-build.json"),
+        ])
+        .env("PATH", &f.path)
+        .env("GASCAN_IMAGE_ARTIFACTS", &artifacts);
+    configure_validator_dispatcher(&mut command, &f.root.join("scripts/Cargo.toml"));
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn seed_valid_ghcr_receipt(f: &Fixture) -> String {

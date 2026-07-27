@@ -163,17 +163,17 @@ fn validates_exact_managed_volume_labels_mounts_and_capacity_bounds() {
             "dev.gascan.managed-by":"gascan","dev.gascan.sandbox-id":id}}}
     ]);
     let inspect = serde_json::json!([{"configuration":{"mounts":[
-        {"type":{"volume":{"name":format!("gascan-mise-{id}")}},"source":"/host/volume.img","destination":"/home/workspace/.local/share/mise","options":[]},
+        {"type":{"volume":{"name":format!("gascan-mise-{id}")}},"source":"/host/volume.img","destination":"/home/workspace/.local","options":[]},
         {"type":{"volume":{"name":format!("gascan-cache-{id}")}},"source":"/host/volume.img","destination":"/home/workspace/.cache","options":[]},
-        {"type":{"volume":{"name":format!("gascan-config-{id}")}},"source":"/host/volume.img","destination":"/home/workspace/.config/gascan","options":[]}
+        {"type":{"volume":{"name":format!("gascan-config-{id}")}},"source":"/host/volume.img","destination":"/home/workspace/.config","options":[]}
     ]}}]);
     let capacities = BTreeMap::from([
         ("/home/workspace/.cache".to_owned(), 12 * GIB),
         (
-            "/home/workspace/.config/gascan".to_owned(),
+            "/home/workspace/.config".to_owned(),
             2 * GIB + CAPACITY_ROUNDING_BYTES,
         ),
-        ("/home/workspace/.local/share/mise".to_owned(), 11 * GIB),
+        ("/home/workspace/.local".to_owned(), 11 * GIB),
     ]);
 
     assert_managed_storage(
@@ -181,9 +181,9 @@ fn validates_exact_managed_volume_labels_mounts_and_capacity_bounds() {
         &inspect,
         id,
         &[
-            ("mise", "/home/workspace/.local/share/mise", 11 * GIB),
+            ("mise", "/home/workspace/.local", 11 * GIB),
             ("cache", "/home/workspace/.cache", 12 * GIB),
-            ("config", "/home/workspace/.config/gascan", 2 * GIB),
+            ("config", "/home/workspace/.config", 2 * GIB),
         ],
         &capacities,
     )
@@ -192,10 +192,10 @@ fn validates_exact_managed_volume_labels_mounts_and_capacity_bounds() {
     let too_large = BTreeMap::from([
         ("/home/workspace/.cache".to_owned(), 12 * GIB),
         (
-            "/home/workspace/.config/gascan".to_owned(),
+            "/home/workspace/.config".to_owned(),
             2 * GIB + CAPACITY_ROUNDING_BYTES + 1,
         ),
-        ("/home/workspace/.local/share/mise".to_owned(), 11 * GIB),
+        ("/home/workspace/.local".to_owned(), 11 * GIB),
     ]);
     assert!(
         assert_managed_storage(
@@ -203,9 +203,9 @@ fn validates_exact_managed_volume_labels_mounts_and_capacity_bounds() {
             &inspect,
             id,
             &[
-                ("mise", "/home/workspace/.local/share/mise", 11 * GIB),
+                ("mise", "/home/workspace/.local", 11 * GIB),
                 ("cache", "/home/workspace/.cache", 12 * GIB),
-                ("config", "/home/workspace/.config/gascan", 2 * GIB),
+                ("config", "/home/workspace/.config", 2 * GIB),
             ],
             &too_large,
         )
@@ -363,7 +363,7 @@ async fn independently_sized_managed_volumes_are_exact_and_cleanup() -> Result<(
                     id.as_str(),
                     "sh",
                     "-c",
-                    "set -eu; for target in /home/workspace/.local/share/mise /home/workspace/.cache /home/workspace/.config/gascan; do source=$(df --output=source \"$target\" | tail -n 1 | tr -d ' '); device=${source##*/}; sectors=$(cat \"/sys/class/block/$device/size\"); printf '%s %s\\n' \"$((sectors * 512))\" \"$target\"; done",
+                    "set -eu; for target in /home/workspace/.local /home/workspace/.cache /home/workspace/.config; do source=$(df --output=source \"$target\" | tail -n 1 | tr -d ' '); device=${source##*/}; sectors=$(cat \"/sys/class/block/$device/size\"); printf '%s %s\\n' \"$((sectors * 512))\" \"$target\"; done",
                 ],
             ))
             .await?;
@@ -373,9 +373,9 @@ async fn independently_sized_managed_volumes_are_exact_and_cleanup() -> Result<(
             &serde_json::from_slice(&inspect.stdout)?,
             id.as_str(),
             &[
-                ("mise", "/home/workspace/.local/share/mise", 11 * GIB),
+                ("mise", "/home/workspace/.local", 11 * GIB),
                 ("cache", "/home/workspace/.cache", 12 * GIB),
-                ("config", "/home/workspace/.config/gascan", 2 * GIB),
+                ("config", "/home/workspace/.config", 2 * GIB),
             ],
             &capacities,
         )

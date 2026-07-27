@@ -44,6 +44,70 @@ grep -F 'MISE_OFFLINE=true mise --version' "$repo_root/packaging/macos/release-s
   exit 1
 }
 
+release_smoke=$repo_root/packaging/macos/release-smoke.sh
+for required in \
+  '/home/workspace/.local' \
+  '/home/workspace/.cache' \
+  '/home/workspace/.config' \
+  'CARGO_HOME=/home/workspace/.local/share/cargo' \
+  'RUSTUP_HOME=/home/workspace/.local/share/rustup' \
+  'cfg-if = \"=1.0.4\"' \
+  'cargo run --manifest-path "$fixture/rust-app/Cargo.toml"' \
+  'cargo install --path "$fixture/rust-bin"' \
+  'npm install --global "$fixture/npm-bin"' \
+  'go install ./go-bin' \
+  'python -m pip install --user --no-deps "$fixture/python-bin"' \
+  'gem install --local "$fixture/ruby-bin.gem"' \
+  '$XDG_CONFIG_HOME/gascan-release-smoke/config'
+do
+  grep -F "$required" "$release_smoke" >/dev/null || {
+    printf 'release smoke omits writable runtime-home proof: %s\n' "$required" >&2
+    exit 1
+  }
+done
+grep -F 'configuration.mounts' "$release_smoke" >/dev/null || {
+  printf 'release smoke does not inspect exact managed mount targets\n' >&2
+  exit 1
+}
+
+readme=$repo_root/README.md
+for required in \
+  'pre-0.1.10' \
+  'gascan destroy --yes' \
+  'gascan up .' \
+  'approximately 1.5 GiB' \
+  'tools = "20GiB"' \
+  'cache = "10GiB"' \
+  'config = "2GiB"' \
+  'cargo run' \
+  'rustup component add rust-src' \
+  'npm install -g typescript' \
+  'go install golang.org/x/tools/gopls@latest' \
+  'python -m pip install --user ruff' \
+  'gem install bundler'
+do
+  grep -F "$required" "$readme" >/dev/null || {
+    printf 'README omits writable storage migration guidance: %s\n' "$required" >&2
+    exit 1
+  }
+done
+
+checklist=$repo_root/docs/release/macos-checklist.md
+for required in \
+  'managed storage layout version 2' \
+  '/home/workspace/.local' \
+  '/home/workspace/.cache' \
+  '/home/workspace/.config' \
+  'crates.io dependency' \
+  'local Rust, npm, Go, Python, and Ruby installs' \
+  'XDG configuration'
+do
+  grep -F "$required" "$checklist" >/dev/null || {
+    printf 'release checklist omits installed writable-home verification: %s\n' "$required" >&2
+    exit 1
+  }
+done
+
 write_fake() {
   local name=$1 body=$2
   printf '#!/usr/bin/env bash\nset -euo pipefail\n%s\n' "$body" >"$fixture/bin/$name"
