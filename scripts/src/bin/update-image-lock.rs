@@ -397,7 +397,9 @@ fn main() -> Result<(), DynError> {
     let target_lock_bytes = fs::read(root.join("images/workspace/workstation-target-lock.toml"))?;
     let primary_lock = toml::to_string_pretty(&output)?.into_bytes();
     eprintln!("image-lock: writing {}", lock_path.display());
-    publish_generated_bundle_with(
+    verify_and_publish_generated_bundle_with(
+        &lock.workstation_artifacts,
+        |url, maximum| get_bounded(&client, url, maximum),
         &[
             (manifest_path.as_path(), workstation_manifest.as_slice()),
             (npm_lock_path.as_path(), workstation_npm_lock.as_slice()),
@@ -2037,7 +2039,10 @@ fn verify_existing_workstation_lock_files(
             let target = validate_workstation_target_lock_bytes(npm_lock_bytes, target_lock_bytes)?;
 
             let client = http_client()?;
-            verify_existing_workstation_artifacts(&client, &image_lock.workstation_artifacts)?;
+            verify_existing_workstation_artifacts(
+                &image_lock.workstation_artifacts,
+                |url, maximum| get_bounded(&client, url, maximum),
+            )?;
             let npm_lock: serde_json::Value = serde_json::from_slice(npm_lock_bytes)?;
             let packages = npm_lock["packages"]
                 .as_object()
@@ -2084,8 +2089,8 @@ fn read_existing_bundle_without_writes(
 }
 
 fn verify_existing_workstation_artifacts(
-    client: &Client,
     artifacts: &BTreeMap<String, WorkstationArtifact>,
+    mut fetch: impl FnMut(&str, usize) -> Result<Vec<u8>, DynError>,
 ) -> Result<(), DynError> {
     for (name, artifact) in artifacts {
         let maximum = match name.as_str() {
@@ -2093,7 +2098,7 @@ fn verify_existing_workstation_artifacts(
             "glab" | "neovim" => 128 * 1024 * 1024,
             _ => return Err(format!("unsupported workstation artifact {name}").into()),
         };
-        let bytes = get_bounded(client, &artifact.url, maximum)?;
+        let bytes = fetch(&artifact.url, maximum)?;
         if u64::try_from(bytes.len())? != artifact.size || sha256(&bytes) != artifact.sha256 {
             return Err(
                 format!("{name} workstation artifact bytes differ from reviewed lock").into(),
@@ -2303,6 +2308,17 @@ enum PublicationBoundary {
     DirectorySync,
 }
 
+fn verify_and_publish_generated_bundle_with(
+    artifacts: &BTreeMap<String, WorkstationArtifact>,
+    fetch: impl FnMut(&str, usize) -> Result<Vec<u8>, DynError>,
+    outputs: &[(&Path, &[u8])],
+    validate: impl FnOnce(&[PathBuf]) -> Result<(), DynError>,
+    before: impl FnMut(PublicationBoundary) -> std::io::Result<()>,
+) -> Result<(), DynError> {
+    verify_existing_workstation_artifacts(artifacts, fetch)?;
+    publish_generated_bundle_with(outputs, validate, before)
+}
+
 fn publish_generated_bundle_with(
     outputs: &[(&Path, &[u8])],
     validate: impl FnOnce(&[PathBuf]) -> Result<(), DynError>,
@@ -2401,12 +2417,14 @@ mod tests {
         checksum_for, chromium_from_manifest, configured_npm_command, merge_workstation_sections,
         next_npm_download_limit, npm_metadata_url, preserve_reviewed_workstation_artifacts,
         publish_generated_bundle_with, read_existing_bundle_without_writes,
-        rust_version_from_channel, validate_claude_elf, verify_npm_closure_tarballs_with,
+        rust_version_from_channel, sha256, validate_claude_elf,
+        verify_and_publish_generated_bundle_with, verify_npm_closure_tarballs_with,
         verify_npm_closure_tarballs_with_limits,
     };
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use sha2::{Digest, Sha512};
     use std::{
+        collections::BTreeMap,
         io::{Read as _, Write as _},
         net::TcpListener,
         thread,
@@ -2726,6 +2744,88 @@ scripts = "old"
         .unwrap();
         for (path, bytes) in paths.iter().zip(exact) {
             assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn artifact_byte_mismatch_prevents_generated_output_staging_and_publication() {
+        for mismatch in ["size", "digest"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let paths = ["manifest.json", "package-lock.json", "versions.lock"]
+                .map(|name| temporary.path().join(name));
+            let old = [b"old manifest".as_slice(), b"old npm lock", b"old primary"];
+            let new = [b"new manifest".as_slice(), b"new npm lock", b"new primary"];
+            for (path, bytes) in paths.iter().zip(old) {
+                std::fs::write(path, bytes).unwrap();
+            }
+            let outputs = [
+                (paths[0].as_path(), new[0]),
+                (paths[1].as_path(), new[1]),
+                (paths[2].as_path(), new[2]),
+            ];
+
+            let mut artifacts = BTreeMap::new();
+            let mut bodies = BTreeMap::new();
+            for name in [
+                "claude", "codex", "pi", "herdr", "glab", "neovim", "starship",
+            ] {
+                let url = format!("https://example.invalid/{name}");
+                let bytes = format!("{name} reviewed bytes").into_bytes();
+                artifacts.insert(
+                    name.to_owned(),
+                    super::WorkstationArtifact {
+                        version: "1.2.3".to_owned(),
+                        url: url.clone(),
+                        sha256: sha256(&bytes),
+                        platform: "linux-arm64".to_owned(),
+                        kind: "tar_gz".to_owned(),
+                        size: u64::try_from(bytes.len()).unwrap(),
+                    },
+                );
+                bodies.insert(url, bytes);
+            }
+            let starship = artifacts.get_mut("starship").unwrap();
+            if mismatch == "size" {
+                starship.size += 1;
+            } else {
+                starship.sha256 = "0".repeat(64);
+            }
+
+            let mut boundaries = Vec::new();
+            let result = verify_and_publish_generated_bundle_with(
+                &artifacts,
+                |url, maximum| {
+                    let bytes = bodies.get(url).unwrap().clone();
+                    assert!(bytes.len() <= maximum);
+                    Ok(bytes)
+                },
+                &outputs,
+                |_| Ok(()),
+                |boundary| {
+                    boundaries.push(boundary);
+                    Ok(())
+                },
+            );
+
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("starship workstation artifact bytes differ from reviewed lock"),
+                "{mismatch} mismatch was not rejected"
+            );
+            assert!(
+                boundaries.is_empty(),
+                "{mismatch} mismatch reached generated output staging"
+            );
+            for (path, expected) in paths.iter().zip(old) {
+                assert_eq!(
+                    std::fs::read(path).unwrap(),
+                    expected,
+                    "{mismatch} mismatch changed {}",
+                    path.display()
+                );
+            }
         }
     }
 
