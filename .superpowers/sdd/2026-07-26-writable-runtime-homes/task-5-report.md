@@ -166,6 +166,41 @@ rtk git diff --check
 PASS
 ```
 
+## Reviewer README Table Contract Follow-up
+
+A minor review found that the contract pinned the manifest reference's quoted
+defaults but not the README table's actual unquoted-default format. The gap was
+proved structurally by temporarily restoring the README's obsolete
+tools/config leaf rows:
+
+```text
+rtk bash tests/release/smoke-contract.sh
+PASS: Gas Can release smoke command contract
+```
+
+That incorrect PASS demonstrated the existing contract could not detect the
+README regression. Exact required assertions for all three README version-2
+rows and explicit rejection of both obsolete unquoted leaf rows were then
+added. With the temporary mutation still present, the strengthened contract
+was RED:
+
+```text
+README omits exact version-2 storage row: | `tools` | `10GiB` | `/home/workspace/.local` |
+```
+
+After restoring the correct README rows:
+
+```text
+rtk bash -n tests/release/smoke-contract.sh
+PASS
+
+rtk bash tests/release/smoke-contract.sh
+PASS: Gas Can release smoke command contract
+
+rtk git diff --check
+PASS
+```
+
 The plan's Swift path `helpers/attach` does not exist in this checkout. The
 tracked package is `helpers/apple-attach`, which is the path verified above.
 Its first sandboxed attempt could not write SwiftPM/Clang user caches; the

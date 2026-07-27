@@ -92,6 +92,17 @@ do
   }
 done
 
+for required in \
+  '| `tools` | `10GiB` | `/home/workspace/.local` |' \
+  '| `cache` | `10GiB` | `/home/workspace/.cache` |' \
+  '| `config` | `1GiB` | `/home/workspace/.config` |'
+do
+  grep -F "$required" "$readme" >/dev/null || {
+    printf 'README omits exact version-2 storage row: %s\n' "$required" >&2
+    exit 1
+  }
+done
+
 manifest_reference=$repo_root/docs/reference/manifest.md
 for required in \
   '| `tools` | `"10GiB"` | `/home/workspace/.local` |' \
@@ -104,6 +115,8 @@ do
   }
 done
 for obsolete in \
+  '| `tools` | `10GiB` | `/home/workspace/.local/share/mise` |' \
+  '| `config` | `1GiB` | `/home/workspace/.config/gascan` |' \
   '| `tools` | `"10GiB"` | `/home/workspace/.local/share/mise` |' \
   '| `config` | `"1GiB"` | `/home/workspace/.config/gascan` |' \
   '`/home/workspace/.local/share/mise` managed tools volume' \
