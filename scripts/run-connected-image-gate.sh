@@ -63,7 +63,7 @@ fi
 [[ "$owner_token" =~ ^[0-9a-f]{32}$ ]] || die 'invalid cleanup ownership token'
 
 names=("gascan-image-user-test-$owner_token" "gascan-image-polyglot-test-$owner_token" "gascan-image-gascamp-test-$owner_token" "gascan-image-workstation-test-$owner_token" "gascan-image-ws-network-test-$owner_token" "gascan-image-ssh-test-$owner_token")
-volume_names=("gascan-image-workstation-tools-$owner_token" "gascan-image-workstation-cache-$owner_token" "gascan-image-workstation-config-$owner_token")
+volume_names=("gascan-image-workstation-tools-$owner_token" "gascan-image-workstation-cache-$owner_token" "gascan-image-workstation-config-$owner_token" "gascan-image-polyglot-tools-$owner_token" "gascan-image-ssh-config-$owner_token")
 cleaning=false
 inventory_proves_absent() {
   local inventory

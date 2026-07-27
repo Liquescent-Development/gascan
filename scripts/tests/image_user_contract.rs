@@ -2,7 +2,7 @@
 use std::ffi::OsString;
 use std::{
     fs,
-    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
+    os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -172,6 +172,119 @@ fn rust_settings_staging_residue(destination_root: &Path) -> Vec<String> {
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
         .filter(|name| name.starts_with(".gascan-rust-settings."))
         .collect()
+}
+
+fn assert_rejected_update_hash_collision(case: &str) {
+    let script = root().join("images/workspace/bin/initialize-rust-home");
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let destination = temp.path().join(format!("destination-{case}"));
+    let bundled = "1.97.0-aarch64-unknown-linux-gnu";
+    write_test_toolchain(&source, bundled, "bundled cargo\n");
+    assert!(
+        rust_seed_command(&script, &source, &destination, temp.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let collision = destination.join("update-hashes").join(bundled);
+    fs::remove_file(&collision).unwrap();
+    let outside = temp.path().join(format!("outside-{case}"));
+    match case {
+        "symlink" => {
+            fs::write(&outside, "outside survives\n").unwrap();
+            symlink(&outside, &collision).unwrap();
+        }
+        "directory" => {
+            fs::create_dir(&collision).unwrap();
+            fs::write(collision.join("sentinel"), "directory survives\n").unwrap();
+        }
+        "fifo" => {
+            assert!(
+                Command::new("mkfifo")
+                    .arg(&collision)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        _ => unreachable!(),
+    }
+    let inode = fs::symlink_metadata(&collision).unwrap().ino();
+
+    let rejected = rust_seed_command(&script, &source, &destination, temp.path())
+        .status()
+        .unwrap();
+    assert!(
+        !rejected.success(),
+        "accepted {case} update-hash destination"
+    );
+    let metadata = fs::symlink_metadata(&collision).unwrap();
+    assert_eq!(metadata.ino(), inode, "mutated {case} collision");
+    match case {
+        "symlink" => {
+            assert_eq!(fs::read_link(&collision).unwrap(), outside);
+            assert_eq!(fs::read_to_string(&outside).unwrap(), "outside survives\n");
+        }
+        "directory" => {
+            assert_eq!(
+                fs::read_to_string(collision.join("sentinel")).unwrap(),
+                "directory survives\n"
+            );
+        }
+        "fifo" => assert!(metadata.file_type().is_fifo()),
+        _ => unreachable!(),
+    }
+    assert!(rust_staging_residue(&destination).is_empty());
+}
+
+#[test]
+fn writable_rust_bootstrap_rejects_symlink_update_hash_collision() {
+    assert_rejected_update_hash_collision("symlink");
+}
+
+#[test]
+fn writable_rust_bootstrap_rejects_directory_update_hash_collision() {
+    assert_rejected_update_hash_collision("directory");
+}
+
+#[test]
+fn writable_rust_bootstrap_rejects_fifo_update_hash_collision() {
+    assert_rejected_update_hash_collision("fifo");
+}
+
+#[test]
+fn writable_rust_bootstrap_preserves_regular_update_hash_collision() {
+    let script = root().join("images/workspace/bin/initialize-rust-home");
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let destination = temp.path().join("destination");
+    let bundled = "1.97.0-aarch64-unknown-linux-gnu";
+    write_test_toolchain(&source, bundled, "bundled cargo\n");
+    assert!(
+        rust_seed_command(&script, &source, &destination, temp.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let collision = destination.join("update-hashes").join(bundled);
+    fs::remove_file(&collision).unwrap();
+    fs::write(&collision, "user-owned hash\n").unwrap();
+    fs::set_permissions(&collision, fs::Permissions::from_mode(0o600)).unwrap();
+    let inode = fs::metadata(&collision).unwrap().ino();
+
+    assert!(
+        rust_seed_command(&script, &source, &destination, temp.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(fs::metadata(&collision).unwrap().ino(), inode);
+    assert_eq!(
+        fs::read_to_string(&collision).unwrap(),
+        "user-owned hash\n"
+    );
+    assert!(rust_staging_residue(&destination).is_empty());
 }
 
 #[test]

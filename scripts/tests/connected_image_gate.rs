@@ -183,7 +183,7 @@ exec "$executable" "$@"
     executable(
         &raw_container,
         &format!(
-            "#!/bin/sh\nset -eu\nprintf 'container:%s\\n' \"$*\" >>\"$CALLS\"\nif [ \"$1 ${{2:-}}\" = 'image inspect' ]; then [ $# -eq 3 ] || exit 93; expected=${{INSPECT_REFERENCE:-gascan-workspace:d4964500a3295a33}}; [ \"$3\" = \"$expected\" ] || {{ printf 'image not found\\n' >&2; exit 94; }}; [ \"${{IMAGE_AVAILABLE:-1}}\" = 1 ] || exit 94; platform=${{IMAGE_PLATFORM:-arm64}}; image_digest=${{IMAGE_DIGEST:-sha256:{DIGEST}}}; image_id=${{image_digest#sha256:}}; printf '[{{\"id\":\"%s\",\"configuration\":{{\"name\":\"%s\",\"descriptor\":{{\"digest\":\"%s\"}}}},\"variants\":[{{\"platform\":{{\"os\":\"linux\",\"architecture\":\"%s\"}},\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}]}}]\\n' \"$image_id\" \"$expected\" \"$image_digest\" \"$platform\"; exit 0; fi\nif [ \"$1\" = volume ]; then action=$2; shift 2; case \"$action\" in list) first=true; printf '['; for kind in tools cache config; do name=gascan-image-workstation-$kind-$OWNER; if [ -f \"$STATE/.volume-$name\" ]; then $first || printf ','; first=false; printf '{{\"id\":\"%s\"}}' \"$name\"; fi; done; printf ']\\n' ;; create) name=; for argument in \"$@\"; do name=$argument; done; touch \"$STATE/.volume-$name\" ;; inspect) name=$1; [ -f \"$STATE/.volume-$name\" ] || exit 1; count_file=\"$STATE/.volume-inspect-$name\"; count=0; [ ! -f \"$count_file\" ] || count=$(cat \"$count_file\"); count=$((count+1)); printf '%s' \"$count\" >\"$count_file\"; owner=$OWNER; [ \"${{FOREIGN_VOLUME:-}}\" = \"$name\" ] && owner=ffffffffffffffffffffffffffffffff; [ \"${{REPLACE_VOLUME_ON_SECOND_INSPECT:-}}\" = \"$name\" ] && [ \"$count\" -ge 2 ] && owner=ffffffffffffffffffffffffffffffff; printf '[{{\"id\":\"%s\",\"configuration\":{{\"name\":\"%s\",\"labels\":{{\"dev.gascan.test\":\"true\",\"dev.gascan.test.owner\":\"%s\"}}}}}}]\\n' \"$name\" \"$name\" \"$owner\" ;; delete) name=$1; [ \"${{FAIL_VOLUME_DELETE:-}}\" != \"$name\" ] || exit 1; rm -f \"$STATE/.volume-$name\" ;; esac; exit 0; fi\ncase \"$1\" in create) name=; image=; shift; while [ $# -gt 0 ]; do if [ \"$1\" = --name ]; then name=$2; shift 2; continue; fi; image=$1; shift; done; touch \"$STATE/$name\"; printf '%s' \"$image\" >\"$STATE/.image-$name\" ;; inspect) name=$2; [ \"${{RESIDUE:-}}\" = \"$name\" ] || [ -f \"$STATE/$name\" ] || exit 1; count_file=\"$STATE/.inspect-$name\"; count=0; [ ! -f \"$count_file\" ] || count=$(cat \"$count_file\"); count=$((count+1)); printf '%s' \"$count\" >\"$count_file\"; owner=$OWNER; [ \"${{FOREIGN:-}}\" = \"$name\" ] && owner=ffffffffffffffffffffffffffffffff; [ \"${{REPLACE_ON_SECOND_INSPECT:-}}\" = \"$name\" ] && [ \"$count\" -ge 2 ] && owner=ffffffffffffffffffffffffffffffff; image=${{CONTAINER_IMAGE_REFERENCE:-$(cat \"$STATE/.image-$name\" 2>/dev/null || printf 'gascan-workspace:d4964500a3295a33')}}; digest=${{CONTAINER_IMAGE_DIGEST:-sha256:{DIGEST}}}; printf '[{{\"id\":\"%s\",\"configuration\":{{\"id\":\"%s\",\"labels\":{{\"dev.gascan.test\":\"true\",\"dev.gascan.test.owner\":\"%s\"}},\"image\":{{\"descriptor\":{{\"digest\":\"%s\"}},\"reference\":\"%s\"}}}}}}]\\n' \"$name\" \"$name\" \"$owner\" \"$digest\" \"$image\" ;; exec) if [ \"${{FAIL_WORKSTATION_EXEC:-0}}\" = 1 ]; then case \"$*\" in *workstation-contract.sh*) exit 1 ;; esac; fi ;; stop) : ;; delete) name=${{@:$#}}; [ \"${{FAIL_DELETE:-}}\" != \"$name\" ] || exit 1; rm -f \"$STATE/$name\" \"$STATE/.image-$name\" ;; esac\n"
+            "#!/bin/sh\nset -eu\nprintf 'container:%s\\n' \"$*\" >>\"$CALLS\"\nif [ \"$1 ${{2:-}}\" = 'image inspect' ]; then [ $# -eq 3 ] || exit 93; expected=${{INSPECT_REFERENCE:-gascan-workspace:d4964500a3295a33}}; [ \"$3\" = \"$expected\" ] || {{ printf 'image not found\\n' >&2; exit 94; }}; [ \"${{IMAGE_AVAILABLE:-1}}\" = 1 ] || exit 94; platform=${{IMAGE_PLATFORM:-arm64}}; image_digest=${{IMAGE_DIGEST:-sha256:{DIGEST}}}; image_id=${{image_digest#sha256:}}; printf '[{{\"id\":\"%s\",\"configuration\":{{\"name\":\"%s\",\"descriptor\":{{\"digest\":\"%s\"}}}},\"variants\":[{{\"platform\":{{\"os\":\"linux\",\"architecture\":\"%s\"}},\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}]}}]\\n' \"$image_id\" \"$expected\" \"$image_digest\" \"$platform\"; exit 0; fi\nif [ \"$1\" = volume ]; then action=$2; shift 2; case \"$action\" in list) first=true; printf '['; for name in gascan-image-workstation-tools-$OWNER gascan-image-workstation-cache-$OWNER gascan-image-workstation-config-$OWNER gascan-image-polyglot-tools-$OWNER gascan-image-ssh-config-$OWNER; do if [ -f \"$STATE/.volume-$name\" ]; then $first || printf ','; first=false; printf '{{\"id\":\"%s\"}}' \"$name\"; fi; done; printf ']\\n' ;; create) name=; for argument in \"$@\"; do name=$argument; done; touch \"$STATE/.volume-$name\" ;; inspect) name=$1; [ -f \"$STATE/.volume-$name\" ] || exit 1; count_file=\"$STATE/.volume-inspect-$name\"; count=0; [ ! -f \"$count_file\" ] || count=$(cat \"$count_file\"); count=$((count+1)); printf '%s' \"$count\" >\"$count_file\"; owner=$OWNER; [ \"${{FOREIGN_VOLUME:-}}\" = \"$name\" ] && owner=ffffffffffffffffffffffffffffffff; [ \"${{FAIL_VOLUME_ATTESTATION_TWICE:-}}\" = \"$name\" ] && [ \"$count\" -le 2 ] && owner=ffffffffffffffffffffffffffffffff; [ \"${{REPLACE_VOLUME_ON_SECOND_INSPECT:-}}\" = \"$name\" ] && [ \"$count\" -ge 2 ] && owner=ffffffffffffffffffffffffffffffff; printf '[{{\"id\":\"%s\",\"configuration\":{{\"name\":\"%s\",\"labels\":{{\"dev.gascan.test\":\"true\",\"dev.gascan.test.owner\":\"%s\"}}}}}}]\\n' \"$name\" \"$name\" \"$owner\" ;; delete) name=$1; if [ \"${{FAIL_VOLUME_DELETE_ONCE:-}}\" = \"$name\" ] && [ ! -f \"$STATE/.volume-delete-failed-$name\" ]; then touch \"$STATE/.volume-delete-failed-$name\"; exit 1; fi; [ \"${{FAIL_VOLUME_DELETE:-}}\" != \"$name\" ] || exit 1; rm -f \"$STATE/.volume-$name\" ;; esac; exit 0; fi\ncase \"$1\" in create) name=; image=; shift; while [ $# -gt 0 ]; do if [ \"$1\" = --name ]; then name=$2; shift 2; continue; fi; image=$1; shift; done; touch \"$STATE/$name\"; printf '%s' \"$image\" >\"$STATE/.image-$name\" ;; inspect) name=$2; [ \"${{RESIDUE:-}}\" = \"$name\" ] || [ -f \"$STATE/$name\" ] || exit 1; count_file=\"$STATE/.inspect-$name\"; count=0; [ ! -f \"$count_file\" ] || count=$(cat \"$count_file\"); count=$((count+1)); printf '%s' \"$count\" >\"$count_file\"; owner=$OWNER; [ \"${{FOREIGN:-}}\" = \"$name\" ] && owner=ffffffffffffffffffffffffffffffff; [ \"${{REPLACE_ON_SECOND_INSPECT:-}}\" = \"$name\" ] && [ \"$count\" -ge 2 ] && owner=ffffffffffffffffffffffffffffffff; image=${{CONTAINER_IMAGE_REFERENCE:-$(cat \"$STATE/.image-$name\" 2>/dev/null || printf 'gascan-workspace:d4964500a3295a33')}}; digest=${{CONTAINER_IMAGE_DIGEST:-sha256:{DIGEST}}}; printf '[{{\"id\":\"%s\",\"configuration\":{{\"id\":\"%s\",\"labels\":{{\"dev.gascan.test\":\"true\",\"dev.gascan.test.owner\":\"%s\"}},\"image\":{{\"descriptor\":{{\"digest\":\"%s\"}},\"reference\":\"%s\"}}}}}}]\\n' \"$name\" \"$name\" \"$owner\" \"$digest\" \"$image\" ;; exec) if [ \"${{FAIL_WORKSTATION_EXEC:-0}}\" = 1 ]; then case \"$*\" in *workstation-contract.sh*) exit 1 ;; esac; fi ;; stop) : ;; delete) name=${{@:$#}}; [ \"${{FAIL_DELETE:-}}\" != \"$name\" ] || exit 1; rm -f \"$STATE/$name\" \"$STATE/.image-$name\" ;; esac\n"
         ),
     );
     let container = temp.path().join("container");
@@ -1153,6 +1153,74 @@ fn workstation_volume_delete_failure_is_detected_by_exact_inventory_and_never_pu
     let calls = fs::read_to_string(&f.calls).unwrap();
     assert!(calls.contains(&format!("container:volume delete {name}")));
     assert!(calls.contains("container:volume list --format json"));
+    assert_no_publications(&f);
+}
+
+#[test]
+fn polyglot_volume_is_recovered_after_local_delete_failure() {
+    let mut f = fixture();
+    seed_valid_receipt(&f);
+    let name = format!("gascan-image-polyglot-tools-{TOKEN}");
+    let output = f
+        .command
+        .env("FAIL_VOLUME_DELETE_ONCE", &name)
+        .arg("--prebuilt")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let calls = fs::read_to_string(&f.calls).unwrap();
+    assert!(
+        calls
+            .matches(&format!("container:volume delete {name}"))
+            .count()
+            >= 2,
+        "outer cleanup did not retry the locally stranded polyglot volume"
+    );
+    assert!(!f.temp.path().join("state").join(format!(".volume-{name}")).exists());
+    assert_no_publications(&f);
+}
+
+#[test]
+fn polyglot_volume_is_recovered_after_local_attestation_failure() {
+    let mut f = fixture();
+    seed_valid_receipt(&f);
+    let name = format!("gascan-image-polyglot-tools-{TOKEN}");
+    let output = f
+        .command
+        .env("FAIL_VOLUME_ATTESTATION_TWICE", &name)
+        .arg("--prebuilt")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let calls = fs::read_to_string(&f.calls).unwrap();
+    assert!(calls.contains(&format!("container:volume delete {name}")));
+    assert!(!f.temp.path().join("state").join(format!(".volume-{name}")).exists());
+    assert_no_publications(&f);
+}
+
+#[test]
+fn ssh_volume_is_recovered_after_smoke_failure() {
+    let mut f = fixture();
+    seed_valid_receipt(&f);
+    let name = format!("gascan-image-ssh-config-{TOKEN}");
+    fs::write(
+        f.temp
+            .path()
+            .join("state")
+            .join(format!(".volume-{name}")),
+        "",
+    )
+    .unwrap();
+    let output = f
+        .command
+        .env("FAIL_SMOKE", "ssh-contract.sh")
+        .arg("--prebuilt")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let calls = fs::read_to_string(&f.calls).unwrap();
+    assert!(calls.contains(&format!("container:volume delete {name}")));
+    assert!(!f.temp.path().join("state").join(format!(".volume-{name}")).exists());
     assert_no_publications(&f);
 }
 

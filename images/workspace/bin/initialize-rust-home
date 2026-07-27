@@ -330,67 +330,76 @@ for source in "$source_root"/toolchains/*; do
         exit 1
     fi
     if [ -d "$destination" ]; then
-        continue
-    fi
-    if [ -e "$destination" ]; then
+        :
+    elif [ -e "$destination" ]; then
         printf '%s\n' "invalid Rust toolchain destination: $destination" >&2
         exit 1
-    fi
-
-    seed_stage="$destination_root/.gascan-rust-seed.$toolchain.$$"
-    mkdir -m 0700 "$seed_stage"
-    stage=$seed_stage
-    cp -R "$source/." "$stage/"
-    if [ -L "$stage" ] || [ ! -d "$stage" ]; then
-        printf '%s\n' "invalid Rust toolchain stage: $stage" >&2
-        exit 1
-    fi
-    find -P "$stage" -type d -exec chmod 0700 {} +
-    find -P "$stage" -type f -perm -0100 -exec chmod 0700 {} +
-    find -P "$stage" -type f ! -perm -0100 -exec chmod 0600 {} +
-    if [ ! -x "$stage/bin/cargo" ] || [ ! -x "$stage/bin/rustc" ]; then
-        printf '%s\n' "incomplete bundled Rust toolchain: $toolchain" >&2
-        exit 1
-    fi
-    if ! mv --no-clobber --no-target-directory "$stage" "$destination"; then
-        if [ -L "$destination" ] || [ ! -d "$destination" ]; then
-            printf '%s\n' "failed Rust toolchain publication: $destination" >&2
+    else
+        seed_stage="$destination_root/.gascan-rust-seed.$toolchain.$$"
+        mkdir -m 0700 "$seed_stage"
+        stage=$seed_stage
+        cp -R "$source/." "$stage/"
+        if [ -L "$stage" ] || [ ! -d "$stage" ]; then
+            printf '%s\n' "invalid Rust toolchain stage: $stage" >&2
             exit 1
         fi
-        for published_command in cargo rustc; do
-            published_path="$destination/bin/$published_command"
-            if [ -L "$published_path" ] ||
-                [ ! -f "$published_path" ] ||
-                [ ! -x "$published_path" ]
-            then
-                printf '%s\n' "invalid raced Rust toolchain: $destination" >&2
+        find -P "$stage" -type d -exec chmod 0700 {} +
+        find -P "$stage" -type f -perm -0100 -exec chmod 0700 {} +
+        find -P "$stage" -type f ! -perm -0100 -exec chmod 0600 {} +
+        if [ ! -x "$stage/bin/cargo" ] || [ ! -x "$stage/bin/rustc" ]; then
+            printf '%s\n' "incomplete bundled Rust toolchain: $toolchain" >&2
+            exit 1
+        fi
+        if ! mv --no-clobber --no-target-directory "$stage" "$destination"; then
+            if [ -L "$destination" ] || [ ! -d "$destination" ]; then
+                printf '%s\n' "failed Rust toolchain publication: $destination" >&2
                 exit 1
             fi
-        done
-        cleanup
-    else
-        stage=
+            for published_command in cargo rustc; do
+                published_path="$destination/bin/$published_command"
+                if [ -L "$published_path" ] ||
+                    [ ! -f "$published_path" ] ||
+                    [ ! -x "$published_path" ]
+                then
+                    printf '%s\n' "invalid raced Rust toolchain: $destination" >&2
+                    exit 1
+                fi
+            done
+            cleanup
+        else
+            stage=
+        fi
     fi
 
     source_hash="$source_root/update-hashes/$toolchain"
     destination_hash="$destination_root/update-hashes/$toolchain"
-    if [ ! -e "$destination_hash" ] && [ ! -L "$destination_hash" ] &&
-        [ -f "$source_hash" ] && [ ! -L "$source_hash" ]
+    if [ -L "$destination_hash" ] ||
+        { [ -e "$destination_hash" ] && [ ! -f "$destination_hash" ]; }
     then
-        hash_stage=$(mktemp "$destination_root/.gascan-rust-hash.$toolchain.XXXXXX")
-        stage=$hash_stage
-        chmod 0600 "$hash_stage"
-        cp "$source_hash" "$hash_stage"
-        if ! mv --no-clobber --no-target-directory "$hash_stage" "$destination_hash"; then
-            if [ -L "$destination_hash" ] ||
-                [ ! -f "$destination_hash" ] ||
-                ! cmp -s "$hash_stage" "$destination_hash"
-            then
-                printf '%s\n' "failed Rust update-hash publication: $destination_hash" >&2
-                exit 1
+        printf '%s\n' "invalid Rust update-hash destination: $destination_hash" >&2
+        exit 1
+    fi
+    if [ -f "$source_hash" ] && [ ! -L "$source_hash" ]; then
+        if [ ! -e "$destination_hash" ] && [ ! -L "$destination_hash" ]; then
+            hash_stage=$(mktemp "$destination_root/.gascan-rust-hash.$toolchain.XXXXXX")
+            stage=$hash_stage
+            chmod 0600 "$hash_stage"
+            cp "$source_hash" "$hash_stage"
+            if ! mv --no-clobber --no-target-directory "$hash_stage" "$destination_hash"; then
+                if [ -L "$destination_hash" ] ||
+                    [ ! -f "$destination_hash" ] ||
+                    ! cmp -s "$hash_stage" "$destination_hash"
+                then
+                    printf '%s\n' "failed Rust update-hash publication: $destination_hash" >&2
+                    exit 1
+                fi
             fi
+            cleanup
         fi
-        cleanup
+        if [ -L "$destination_hash" ] || [ ! -f "$destination_hash" ]; then
+            printf '%s\n' "invalid published Rust update hash: $destination_hash" >&2
+            exit 1
+        fi
     fi
 done
 
