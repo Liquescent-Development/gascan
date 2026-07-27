@@ -91,7 +91,7 @@ async fn image_replace_reuses_unchanged_persistent_tools_without_reinstalling() 
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (
-                br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
+                br#"{"node":[{"version":"24.18.0","installed":true,"active":true,"source":{"path":"/home/workspace/.config/gascan/mise.toml"}}]}"#.to_vec(),
                 Vec::new(),
                 0,
             ),
@@ -188,7 +188,7 @@ async fn apply_uses_literal_mise_argv_streams_steps_and_persists_exact_versions(
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (
-                br#"{"node":[{"version":"24.18.0","installed":true,"active":true}],"python":[{"version":"3.14.6","installed":true,"active":true}]}"#.to_vec(),
+                br#"{"node":[{"version":"24.18.0","installed":true,"active":true,"source":{"path":"/home/workspace/.config/gascan/mise.toml"}}],"python":[{"version":"3.14.6","installed":true,"active":true,"source":{"path":"/home/workspace/.config/gascan/mise.toml"}}]}"#.to_vec(),
                 Vec::new(),
                 0,
             ),
@@ -298,7 +298,7 @@ async fn apply_uses_literal_mise_argv_streams_steps_and_persists_exact_versions(
                 "MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
                 "MISE_RUSTUP_HOME=/home/workspace/.local/share/rustup",
                 "MISE_STATE_DIR=/home/workspace/.config/gascan/mise-state",
-                "MISE_SYSTEM_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
+                "MISE_SYSTEM_CONFIG_FILE=/etc/mise/config.toml",
                 "MISE_SYSTEM_DATA_DIR=/opt/gascan/mise",
                 "MIX_HOME=/home/workspace/.local/share/mix",
                 "NPM_CONFIG_CACHE=/home/workspace/.cache/npm",
@@ -335,7 +335,7 @@ async fn apply_uses_literal_mise_argv_streams_steps_and_persists_exact_versions(
                 "MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
                 "MISE_RUSTUP_HOME=/home/workspace/.local/share/rustup",
                 "MISE_STATE_DIR=/home/workspace/.config/gascan/mise-state",
-                "MISE_SYSTEM_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
+                "MISE_SYSTEM_CONFIG_FILE=/etc/mise/config.toml",
                 "MISE_SYSTEM_DATA_DIR=/opt/gascan/mise",
                 "MIX_HOME=/home/workspace/.local/share/mix",
                 "NPM_CONFIG_CACHE=/home/workspace/.cache/npm",
@@ -484,7 +484,7 @@ async fn failed_install_retains_applied_state_and_retry_can_succeed() -> TestRes
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (
-                br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
+                br#"{"node":[{"version":"24.18.0","installed":true,"active":true,"source":{"path":"/home/workspace/.config/gascan/mise.toml"}}]}"#.to_vec(),
                 Vec::new(),
                 0,
             ),
@@ -531,7 +531,7 @@ async fn verbose_stderr_does_not_fail_successful_tool_install() -> TestResult {
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), vec![b'x'; 2 * 1024 * 1024], 0),
             (
-                br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
+                br#"{"node":[{"version":"24.18.0","installed":true,"active":true,"source":{"path":"/home/workspace/.config/gascan/mise.toml"}}]}"#.to_vec(),
                 Vec::new(),
                 0,
             ),
@@ -862,7 +862,7 @@ async fn duplicate_mise_tool_keys_are_rejected_without_advancing_state() -> Test
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (
-                br#"{"node":[{"version":"24.18.0","installed":true,"active":true}],"node":[{"version":"attacker","installed":true,"active":true}]}"#.to_vec(),
+                br#"{"node":[{"version":"24.18.0","installed":true,"active":true,"source":{"path":"/home/workspace/.config/gascan/mise.toml"}}],"node":[{"version":"attacker","installed":true,"active":true,"source":{"path":"/home/workspace/.config/gascan/mise.toml"}}]}"#.to_vec(),
                 Vec::new(),
                 0,
             ),
@@ -903,7 +903,7 @@ async fn legacy_matching_fingerprint_without_tool_hash_requires_one_explicit_app
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (
-                br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
+                br#"{"node":[{"version":"24.18.0","installed":true,"active":true,"source":{"path":"/home/workspace/.config/gascan/mise.toml"}}]}"#.to_vec(),
                 Vec::new(),
                 0,
             ),
@@ -938,7 +938,7 @@ async fn legacy_matching_fingerprint_without_tool_hash_requires_one_explicit_app
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (
-                br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
+                br#"{"node":[{"version":"24.18.0","installed":true,"active":true,"source":{"path":"/home/workspace/.config/gascan/mise.toml"}}]}"#.to_vec(),
                 Vec::new(),
                 0,
             ),
@@ -978,7 +978,7 @@ async fn removing_last_tool_writes_empty_config_and_persists_empty_resolution() 
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (
-                br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
+                br#"{"node":[{"version":"24.18.0","installed":true,"active":true,"source":{"path":"/home/workspace/.config/gascan/mise.toml"}}]}"#.to_vec(),
                 Vec::new(),
                 0,
             ),
@@ -1056,7 +1056,7 @@ async fn removing_last_tool_writes_empty_config_and_persists_empty_resolution() 
             "MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
             "MISE_RUSTUP_HOME=/home/workspace/.local/share/rustup",
             "MISE_STATE_DIR=/home/workspace/.config/gascan/mise-state",
-            "MISE_SYSTEM_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
+            "MISE_SYSTEM_CONFIG_FILE=/etc/mise/config.toml",
             "MISE_SYSTEM_DATA_DIR=/opt/gascan/mise",
             "MIX_HOME=/home/workspace/.local/share/mix",
             "NPM_CONFIG_CACHE=/home/workspace/.cache/npm",
@@ -1108,7 +1108,7 @@ async fn missing_container_forces_tool_install_even_when_durable_hash_matches() 
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (
-                br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
+                br#"{"node":[{"version":"24.18.0","installed":true,"active":true,"source":{"path":"/home/workspace/.config/gascan/mise.toml"}}]}"#.to_vec(),
                 Vec::new(),
                 0,
             ),
@@ -1143,7 +1143,7 @@ async fn missing_container_forces_tool_install_even_when_durable_hash_matches() 
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (
-                br#"{"node":[{"version":"24.18.0","installed":true,"active":true}]}"#.to_vec(),
+                br#"{"node":[{"version":"24.18.0","installed":true,"active":true,"source":{"path":"/home/workspace/.config/gascan/mise.toml"}}]}"#.to_vec(),
                 Vec::new(),
                 0,
             ),

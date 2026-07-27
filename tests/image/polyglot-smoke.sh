@@ -4,6 +4,8 @@ set -euo pipefail
 inside_image() {
 
 mise --version
+test "$MISE_SYSTEM_CONFIG_FILE" = /etc/mise/config.toml
+test "$(mise current node)" = 24.18.0
 for tool in node python go rust java ruby elixir; do
   mise ls --installed "$tool"
 done

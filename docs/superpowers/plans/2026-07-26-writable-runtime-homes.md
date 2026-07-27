@@ -496,7 +496,12 @@ command.
 Add `CARGO_HOME`, `RUSTUP_HOME`, `MISE_CARGO_HOME`,
 `MISE_RUSTUP_HOME`, XDG variables, package-manager variables, and exact
 `PATH` to the `/usr/bin/env` argv. Assert provisioning and normal runtime maps
-are identical for each shared key.
+are identical for each shared key. Keep `MISE_GLOBAL_CONFIG_FILE` at the
+generated writable config and `MISE_SYSTEM_CONFIG_FILE` at the immutable
+`/etc/mise/config.toml`. When parsing mise inventory, retain requested tools
+from the generated global config and allow additional bundled defaults only
+when each is a singleton, active, installed record whose source path is
+exactly `/etc/mise/config.toml`.
 
 - [ ] **Step 8: Run focused tests**
 
@@ -527,12 +532,16 @@ Include generated protobuf outputs only if this repository tracks them.
 
 **Files:**
 - Modify: `images/workspace/Dockerfile`
+- Modify: `images/workspace/bin/start-gascan-sshd`
 - Modify: `images/workspace/bin/configure-workstation-home`
 - Modify: `images/workspace/etc/profile.d/mise.sh`
+- Modify: `images/workspace/tests/ssh-contract.sh`
 - Modify: `images/workspace/tests/workstation-contract.sh`
+- Modify: `tests/image/polyglot-smoke.sh`
 - Modify: `tests/image/workstation-smoke.sh`
 - Modify: `scripts/tests/connected_dockerfile.rs`
 - Modify: `scripts/tests/image_user_contract.rs`
+- Modify: `scripts/tests/polyglot_image_contract.rs`
 - Modify: `scripts/tests/connected_image_gate.rs`
 
 **Interfaces:**

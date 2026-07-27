@@ -305,7 +305,7 @@ fn ssh_guest_initialization_is_behavioral_atomic_and_idempotent() {
         "MISE_CACHE_DIR=/home/workspace/.cache/mise",
         "MISE_DATA_DIR=/home/workspace/.local/share/mise",
         "MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
-        "MISE_SYSTEM_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
+        "MISE_SYSTEM_CONFIG_FILE=/etc/mise/config.toml",
         "MISE_STATE_DIR=/home/workspace/.config/gascan/mise-state",
         "MISE_SYSTEM_DATA_DIR=/opt/gascan/mise",
     ] {
@@ -1231,7 +1231,7 @@ fn dockerfile_final_stage_matches_writable_runtime_policy() {
         ),
         (
             "MISE_SYSTEM_CONFIG_FILE",
-            "/home/workspace/.config/gascan/mise.toml",
+            "/etc/mise/config.toml",
         ),
         (
             "MISE_STATE_DIR",

@@ -19,7 +19,8 @@ use gascan_core::doctor::{DoctorFact, DoctorFacts, DoctorReport, DoctorStatus};
 use gascan_core::manifest::ManifestError;
 use gascan_core::policy::{
     CACHE_ROOT, CARGO_HOME, CONFIG_ROOT, ControlPlanePolicy, MISE_GLOBAL_CONFIG_FILE,
-    PolicyCompiler, PolicyError, RUSTUP_HOME, TOOLS_ROOT, WORKSPACE_HOME, workspace_environment,
+    MISE_SYSTEM_CONFIG_FILE, PolicyCompiler, PolicyError, RUSTUP_HOME, TOOLS_ROOT, WORKSPACE_HOME,
+    workspace_environment,
 };
 use gascan_core::provision::{
     AppliedState, ProvisionPlan, ProvisionStep, ProvisioningPlanner, SetupScript,
@@ -161,6 +162,12 @@ struct MiseToolRecord {
     version: String,
     installed: bool,
     active: bool,
+    source: MiseToolSource,
+}
+
+#[derive(Deserialize)]
+struct MiseToolSource {
+    path: String,
 }
 
 struct MiseInventory(BTreeMap<String, Vec<MiseToolRecord>>);
@@ -4003,31 +4010,41 @@ fn parse_mise_versions(
 ) -> Result<BTreeMap<String, String>, ServiceError> {
     let MiseInventory(records) = serde_json::from_slice(output)
         .map_err(|_| ServiceError::Provision("invalid mise tool inventory".to_owned()))?;
-    if !records.keys().eq(desired.keys()) {
+    let mut resolved = BTreeMap::new();
+    for (tool, records) in records {
+        let [record] = records.as_slice() else {
+            return Err(ServiceError::Provision(
+                "mise returned an invalid tool record".to_owned(),
+            ));
+        };
+        if !record.installed
+            || !record.active
+            || record.version.trim().is_empty()
+            || record.version.chars().any(char::is_control)
+        {
+            return Err(ServiceError::Provision(
+                "mise returned an invalid tool record".to_owned(),
+            ));
+        }
+        if desired.contains_key(&tool) {
+            if record.source.path != MISE_GLOBAL_CONFIG_FILE {
+                return Err(ServiceError::Provision(
+                    "mise returned an unexpected tool set".to_owned(),
+                ));
+            }
+            resolved.insert(tool, record.version.clone());
+        } else if record.source.path != MISE_SYSTEM_CONFIG_FILE {
+            return Err(ServiceError::Provision(
+                "mise returned an unexpected tool set".to_owned(),
+            ));
+        }
+    }
+    if !resolved.keys().eq(desired.keys()) {
         return Err(ServiceError::Provision(
             "mise returned an unexpected tool set".to_owned(),
         ));
     }
-    records
-        .into_iter()
-        .map(|(tool, records)| {
-            let [record] = records.as_slice() else {
-                return Err(ServiceError::Provision(
-                    "mise returned an invalid tool record".to_owned(),
-                ));
-            };
-            if !record.installed
-                || !record.active
-                || record.version.trim().is_empty()
-                || record.version.chars().any(char::is_control)
-            {
-                return Err(ServiceError::Provision(
-                    "mise returned an invalid tool record".to_owned(),
-                ));
-            }
-            Ok((tool, record.version.clone()))
-        })
-        .collect()
+    Ok(resolved)
 }
 
 fn resolution_matches(record: &SandboxRecord, fingerprint: &str) -> bool {
@@ -4110,7 +4127,7 @@ async fn desired_fingerprint(spec: &SandboxSpec) -> Result<String, ServiceError>
 mod storage_tests {
     use super::{
         BoundedTail, NoopProvisioner, SandboxService, ServiceError, Store,
-        image_replacement_failure_details, requested_storage_from_volumes,
+        image_replacement_failure_details, parse_mise_versions, requested_storage_from_volumes,
     };
     use camino::Utf8Path;
     use gascan_core::fake_runtime::FakeRuntime;
@@ -4118,6 +4135,7 @@ mod storage_tests {
     use gascan_core::policy::PolicyCompiler;
     use gascan_core::runtime::{RuntimeBackend, RuntimeCall};
     use gascan_core::sandbox::SandboxSpec;
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     #[test]
@@ -4166,6 +4184,66 @@ mod storage_tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn mise_inventory_retains_requested_tools_and_accepts_only_immutable_system_defaults()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let desired = BTreeMap::from([("node".to_owned(), "25.0.0".to_owned())]);
+        let output = br#"{
+            "node":[{
+                "version":"25.0.0",
+                "installed":true,
+                "active":true,
+                "source":{"path":"/home/workspace/.config/gascan/mise.toml"}
+            }],
+            "python":[{
+                "version":"3.14.6",
+                "installed":true,
+                "active":true,
+                "source":{"path":"/etc/mise/config.toml"}
+            }]
+        }"#;
+
+        assert_eq!(
+            parse_mise_versions(output, &desired)?,
+            BTreeMap::from([("node".to_owned(), "25.0.0".to_owned())])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mise_inventory_rejects_unrequested_tools_from_noncanonical_system_sources() {
+        let desired = BTreeMap::from([("node".to_owned(), "25.0.0".to_owned())]);
+        for source in [
+            "/home/workspace/.config/gascan/unmanaged.toml",
+            "etc/mise/config.toml",
+            "/etc/../etc/mise/config.toml",
+            "/tmp/system-config-link",
+        ] {
+            let output = format!(
+                r#"{{
+                    "node":[{{
+                        "version":"25.0.0",
+                        "installed":true,
+                        "active":true,
+                        "source":{{"path":"/home/workspace/.config/gascan/mise.toml"}}
+                    }}],
+                    "python":[{{
+                        "version":"3.14.6",
+                        "installed":true,
+                        "active":true,
+                        "source":{{"path":"{source}"}}
+                    }}]
+                }}"#
+            );
+
+            assert!(matches!(
+                parse_mise_versions(output.as_bytes(), &desired),
+                Err(ServiceError::Provision(message))
+                    if message == "mise returned an unexpected tool set"
+            ));
+        }
     }
 
     #[tokio::test]

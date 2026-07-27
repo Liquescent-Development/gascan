@@ -93,6 +93,7 @@ provisioning commands, SSH sessions, and image contract tests.
 | `MISE_DATA_DIR` | `/home/workspace/.local/share/mise` |
 | `MISE_CACHE_DIR` | `/home/workspace/.cache/mise` |
 | `MISE_GLOBAL_CONFIG_FILE` | `/home/workspace/.config/gascan/mise.toml` |
+| `MISE_SYSTEM_CONFIG_FILE` | `/etc/mise/config.toml` |
 | `MISE_STATE_DIR` | `/home/workspace/.config/gascan/mise-state` |
 | `CARGO_HOME`, `MISE_CARGO_HOME` | `/home/workspace/.local/share/cargo` |
 | `RUSTUP_HOME`, `MISE_RUSTUP_HOME` | `/home/workspace/.local/share/rustup` |
@@ -110,6 +111,14 @@ provisioning commands, SSH sessions, and image contract tests.
 The existing Claude, Codex, Pi, Herdr, GitHub CLI, and GitLab CLI variables
 remain below the expanded config or cache roots. Git and XDG-aware editors
 can use conventional paths below `/home/workspace/.config`.
+
+The generated global mise config has higher precedence than the immutable
+system config, so manifest tools override bundled defaults while undeclared
+bundled tools remain available as reviewed fallbacks. Provisioning uses the
+same environment as normal runtime commands. Its resolution parser retains
+requested records sourced from the generated global config and permits
+additional records only when they are singleton, active, installed records
+sourced from the exact immutable `/etc/mise/config.toml` path.
 
 `PATH` begins with user-controlled executable locations, followed by
 user-mise shims, immutable system-mise shims, reviewed workstation commands,

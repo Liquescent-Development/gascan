@@ -142,6 +142,10 @@ test "$MISE_CACHE_DIR" = /home/workspace/.cache/mise ||
     die 'mise cache root differs from production policy'
 test "$MISE_GLOBAL_CONFIG_FILE" = /home/workspace/.config/gascan/mise.toml ||
     die 'mise config root differs from production policy'
+test "$MISE_SYSTEM_CONFIG_FILE" = /etc/mise/config.toml ||
+    die 'immutable mise config differs from production policy'
+test -r "$MISE_SYSTEM_CONFIG_FILE" ||
+    die 'immutable mise config is unavailable'
 test "$PATH" = /home/workspace/.local/bin:/home/workspace/.local/share/cargo/bin:/home/workspace/.local/share/go/bin:/home/workspace/.local/share/gem/bin:/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/opt/gascan/workstation/bin:/usr/sbin:/usr/bin:/sbin:/bin ||
     die 'PATH differs from production policy'
 test -r /opt/gascan/image-tool-versions.json ||
@@ -164,7 +168,6 @@ for mapping in \
     "$MISE_DATA_DIR:/home/workspace/.local" \
     "$MISE_CACHE_DIR:/home/workspace/.cache" \
     "$MISE_GLOBAL_CONFIG_FILE:/home/workspace/.config" \
-    "$MISE_SYSTEM_CONFIG_FILE:/home/workspace/.config" \
     "$MISE_STATE_DIR:/home/workspace/.config" \
     "$CARGO_HOME:/home/workspace/.local" \
     "$MISE_CARGO_HOME:/home/workspace/.local" \

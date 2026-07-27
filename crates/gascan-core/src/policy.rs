@@ -33,6 +33,7 @@ pub const MISE_DATA_DIR: &str = "/home/workspace/.local/share/mise";
 pub const MISE_CACHE_DIR: &str = "/home/workspace/.cache/mise";
 pub const MISE_GLOBAL_CONFIG_FILE: &str = "/home/workspace/.config/gascan/mise.toml";
 pub const MISE_STATE_DIR: &str = "/home/workspace/.config/gascan/mise-state";
+pub const MISE_SYSTEM_CONFIG_FILE: &str = "/etc/mise/config.toml";
 pub const MISE_SYSTEM_DATA_DIR: &str = "/opt/gascan/mise";
 pub const CONTAINER_PATH: &str = concat!(
     "/home/workspace/.local/bin:",
@@ -303,7 +304,7 @@ pub fn workspace_environment() -> BTreeMap<String, String> {
         ("MISE_STATE_DIR".to_owned(), MISE_STATE_DIR.to_owned()),
         (
             "MISE_SYSTEM_CONFIG_FILE".to_owned(),
-            MISE_GLOBAL_CONFIG_FILE.to_owned(),
+            MISE_SYSTEM_CONFIG_FILE.to_owned(),
         ),
         (
             "MISE_SYSTEM_DATA_DIR".to_owned(),

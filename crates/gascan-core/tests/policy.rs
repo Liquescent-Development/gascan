@@ -542,7 +542,7 @@ fn canonical_request_has_one_root_mount_owned_volumes_loopback_ports_and_init() 
             ),
             (
                 "MISE_SYSTEM_CONFIG_FILE".to_owned(),
-                "/home/workspace/.config/gascan/mise.toml".to_owned(),
+                "/etc/mise/config.toml".to_owned(),
             ),
             (
                 "MISE_SYSTEM_DATA_DIR".to_owned(),

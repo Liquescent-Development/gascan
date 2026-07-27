@@ -499,7 +499,7 @@ fn profile_defaults_are_exact_and_idempotent() {
         ),
         (
             "MISE_SYSTEM_CONFIG_FILE",
-            "/home/workspace/.config/gascan/mise.toml",
+            "/etc/mise/config.toml",
         ),
         (
             "MISE_STATE_DIR",

@@ -257,6 +257,8 @@ fn smoke_covers_every_runtime_native_tools_and_browser() {
     let smoke = fs::read_to_string(root().join("tests/image/polyglot-smoke.sh")).unwrap();
     for required in [
         "mise --version",
+        "test \"$MISE_SYSTEM_CONFIG_FILE\" = /etc/mise/config.toml",
+        "test \"$(mise current node)\" = 24.18.0",
         "node -e",
         "python -c",
         "go run",
