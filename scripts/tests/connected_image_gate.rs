@@ -625,13 +625,19 @@ fn workstation_contract_is_wired_into_the_release_blocking_gate() {
         "--volume \"$config_volume:/home/workspace/.config\"",
         "--env CARGO_HOME=/home/workspace/.local/share/cargo",
         "--env RUSTUP_HOME=/home/workspace/.local/share/rustup",
+        "--env GOBIN=/home/workspace/.local/bin",
         "--env MISE_DATA_DIR=/home/workspace/.local/share/mise",
         "--env MISE_SYSTEM_DATA_DIR=/opt/gascan/mise",
         "--env MISE_CACHE_DIR=/home/workspace/.cache/mise",
         "--env MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
         "--bin validate-owned-volume",
+        "--bin validate-container-inventory",
         "bounded_container volume inspect \"$volume\" |\n    cargo run --quiet --locked --offline",
         "bounded_container volume delete \"$volume\"",
+        "offline_verified=false",
+        "network_verified=false",
+        "container_inventory_proves_absent",
+        "refusing cleanup of never-verified container",
     ] {
         assert!(
             smoke.contains(required),
@@ -641,10 +647,13 @@ fn workstation_contract_is_wired_into_the_release_blocking_gate() {
     for command in [
         "cargo run --manifest-path \"$fixture/rust-app/Cargo.toml\"",
         "cargo install --path \"$fixture/rust-bin\"",
-        "npm install --global \"$fixture/npm-bin\"",
+        "npm pack \"$fixture/npm-bin\" --pack-destination \"$fixture\"",
+        "npm install --global \"$fixture/gascan-npm-local-1.0.0.tgz\"",
         "\"$fixture/go.mod\"",
         "cd \"$fixture\" && go install ./go-bin",
-        "python -m pip install --user --no-deps \"$fixture/python-bin\"",
+        "python -m zipfile -c ../gascan_python_local-0.1.0-py3-none-any.whl",
+        "\"$fixture/gascan_python_local-0.1.0-py3-none-any.whl\"",
+        "gem build gascan-ruby-local.gemspec --output ../ruby-bin.gem",
         "gem install --local \"$fixture/ruby-bin.gem\"",
         "cfg-if = \\\"=1.0.4\\\"",
         "rustup component add rust-src",
@@ -655,6 +664,10 @@ fn workstation_contract_is_wired_into_the_release_blocking_gate() {
             "workstation smoke omitted writable package-manager proof: {command}"
         );
     }
+    assert!(
+        smoke.contains("network_name=\"gascan-image-ws-network-test-$owner_token\""),
+        "workstation network name must remain within Apple container's 64-character limit"
+    );
     assert!(
         !smoke.contains("type=bind"),
         "credential-free workstation smoke must not mount the host checkout"

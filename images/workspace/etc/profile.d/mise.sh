@@ -14,6 +14,7 @@ export MISE_RUSTUP_HOME=${MISE_RUSTUP_HOME:-/home/workspace/.local/share/rustup}
 export NPM_CONFIG_PREFIX=${NPM_CONFIG_PREFIX:-/home/workspace/.local}
 export NPM_CONFIG_CACHE=${NPM_CONFIG_CACHE:-/home/workspace/.cache/npm}
 export GOPATH=${GOPATH:-/home/workspace/.local/share/go}
+export GOBIN=${GOBIN:-/home/workspace/.local/bin}
 export GOCACHE=${GOCACHE:-/home/workspace/.cache/go-build}
 export GOMODCACHE=${GOMODCACHE:-/home/workspace/.cache/go-mod}
 export PYTHONUSERBASE=${PYTHONUSERBASE:-/home/workspace/.local}

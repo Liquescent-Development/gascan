@@ -155,6 +155,7 @@ test "$(rustup show home)" = "$RUSTUP_HOME" || die 'rustup home differs from run
 test "$(npm config get prefix)" = "$NPM_CONFIG_PREFIX" || die 'npm prefix differs from runtime policy'
 test "$(npm config get cache)" = "$NPM_CONFIG_CACHE" || die 'npm cache differs from runtime policy'
 test "$(go env GOPATH)" = "$GOPATH" || die 'Go path differs from runtime policy'
+test "$(go env GOBIN)" = "$GOBIN" || die 'Go install bin differs from runtime policy'
 test "$(go env GOCACHE)" = "$GOCACHE" || die 'Go build cache differs from runtime policy'
 test "$(go env GOMODCACHE)" = "$GOMODCACHE" || die 'Go module cache differs from runtime policy'
 test "$(python -m site --user-base)" = "$PYTHONUSERBASE" ||
@@ -176,6 +177,7 @@ for mapping in \
     "$NPM_CONFIG_PREFIX:/home/workspace/.local" \
     "$NPM_CONFIG_CACHE:/home/workspace/.cache" \
     "$GOPATH:/home/workspace/.local" \
+    "$GOBIN:/home/workspace/.local" \
     "$GOCACHE:/home/workspace/.cache" \
     "$GOMODCACHE:/home/workspace/.cache" \
     "$PYTHONUSERBASE:/home/workspace/.local" \

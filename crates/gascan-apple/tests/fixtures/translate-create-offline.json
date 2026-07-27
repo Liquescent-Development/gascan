@@ -21,6 +21,8 @@
   "--env",
   "GEM_HOME=/home/workspace/.local/share/gem",
   "--env",
+  "GOBIN=/home/workspace/.local/bin",
+  "--env",
   "GOCACHE=/home/workspace/.cache/go-build",
   "--env",
   "GOMODCACHE=/home/workspace/.cache/go-mod",

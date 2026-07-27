@@ -341,6 +341,13 @@ for source in "$source_root"/toolchains/*; do
     mkdir -m 0700 "$seed_stage"
     stage=$seed_stage
     cp -R "$source/." "$stage/"
+    if [ -L "$stage" ] || [ ! -d "$stage" ]; then
+        printf '%s\n' "invalid Rust toolchain stage: $stage" >&2
+        exit 1
+    fi
+    find -P "$stage" -type d -exec chmod 0700 {} +
+    find -P "$stage" -type f -perm -0100 -exec chmod 0700 {} +
+    find -P "$stage" -type f ! -perm -0100 -exec chmod 0600 {} +
     if [ ! -x "$stage/bin/cargo" ] || [ ! -x "$stage/bin/rustc" ]; then
         printf '%s\n' "incomplete bundled Rust toolchain: $toolchain" >&2
         exit 1
@@ -444,30 +451,77 @@ if [ -L "$destination_settings" ] || [ ! -f "$destination_settings" ]; then
 fi
 
 marker="$destination_root/.gascan-bundled-toolchains-v1"
-if [ -L "$marker" ] || { [ -e "$marker" ] && [ ! -f "$marker" ]; }; then
-    printf '%s\n' "invalid Rust toolchain marker: $marker" >&2
-    exit 1
-fi
-marker_directory=$(mktemp -d "$destination_root/.gascan-rust-marker.XXXXXX")
-stage=$marker_directory
-marker_stage="$stage/marker"
-: >"$marker_stage"
-chmod 0600 "$marker_stage"
-for source in "$source_root"/toolchains/*; do
-    if [ ! -e "$source" ] && [ ! -L "$source" ]; then
-        continue
+validate_marker() {
+    candidate=$1
+    if [ -L "$candidate" ] || [ ! -f "$candidate" ]; then
+        return 1
     fi
-    if [ -L "$source" ] || [ ! -d "$source" ]; then
-        printf '%s\n' "invalid bundled Rust toolchain: $source" >&2
+    if [ "$(find "$candidate" -prune -type f -perm 0600 -print)" != "$candidate" ]; then
+        return 1
+    fi
+    candidate_size=$(wc -c <"$candidate" | tr -d '[:space:]')
+    case "$candidate_size" in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    if [ "$candidate_size" -gt 4096 ]; then
+        return 1
+    fi
+    if ! LC_ALL=C awk '
+        BEGIN { count = 0; previous = "" }
+        $0 !~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/ { exit 1 }
+        count > 0 && $0 <= previous { exit 1 }
+        { previous = $0; count++ }
+        END { if (count == 0) exit 1 }
+    ' "$candidate"
+    then
+        return 1
+    fi
+    while IFS= read -r marked_toolchain; do
+        marked_destination="$destination_root/toolchains/$marked_toolchain"
+        if [ -L "$marked_destination" ] || [ ! -d "$marked_destination" ]; then
+            return 1
+        fi
+        for marked_command in cargo rustc; do
+            marked_path="$marked_destination/bin/$marked_command"
+            if [ -L "$marked_path" ] || [ ! -f "$marked_path" ] || [ ! -x "$marked_path" ]; then
+                return 1
+            fi
+        done
+    done <"$candidate"
+}
+
+if [ -e "$marker" ] || [ -L "$marker" ]; then
+    if ! validate_marker "$marker"; then
+        printf '%s\n' "invalid Rust toolchain marker: $marker" >&2
         exit 1
     fi
-    printf '%s\n' "${source##*/}" >>"$marker_stage"
-done
-LC_ALL=C sort -o "$marker_stage" "$marker_stage"
-chmod 0600 "$marker_stage"
-mv --no-clobber --no-target-directory "$marker_stage" "$marker"
-cleanup
-if [ -L "$marker" ] || [ ! -f "$marker" ]; then
-    printf '%s\n' "invalid Rust toolchain marker: $marker" >&2
-    exit 1
+else
+    marker_directory=$(mktemp -d "$destination_root/.gascan-rust-marker.XXXXXX")
+    stage=$marker_directory
+    marker_stage="$stage/marker"
+    : >"$marker_stage"
+    chmod 0600 "$marker_stage"
+    for source in "$source_root"/toolchains/*; do
+        if [ ! -e "$source" ] && [ ! -L "$source" ]; then
+            continue
+        fi
+        if [ -L "$source" ] || [ ! -d "$source" ]; then
+            printf '%s\n' "invalid bundled Rust toolchain: $source" >&2
+            exit 1
+        fi
+        printf '%s\n' "${source##*/}" >>"$marker_stage"
+    done
+    LC_ALL=C sort -o "$marker_stage" "$marker_stage"
+    chmod 0600 "$marker_stage"
+    if ! mv --no-clobber --no-target-directory "$marker_stage" "$marker"; then
+        if ! validate_marker "$marker"; then
+            printf '%s\n' "failed Rust toolchain marker publication: $marker" >&2
+            exit 1
+        fi
+    fi
+    cleanup
+    if ! validate_marker "$marker"; then
+        printf '%s\n' "invalid Rust toolchain marker: $marker" >&2
+        exit 1
+    fi
 fi

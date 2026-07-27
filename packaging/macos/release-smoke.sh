@@ -134,6 +134,8 @@ jq -e '
   test "$XDG_CONFIG_HOME" = /home/workspace/.config
   test "$NPM_CONFIG_PREFIX" = /home/workspace/.local
   test "$GOPATH" = /home/workspace/.local/share/go
+  test "$GOBIN" = /home/workspace/.local/bin
+  test "$(go env GOBIN)" = "$GOBIN"
   test "$PYTHONUSERBASE" = /home/workspace/.local
   test "$GEM_HOME" = /home/workspace/.local/share/gem
   test -w /home/workspace/.local
@@ -147,7 +149,7 @@ jq -e '
     "$fixture/rust-bin/src" \
     "$fixture/npm-bin" \
     "$fixture/go-bin" \
-    "$fixture/python-bin" \
+    "$fixture/python-wheel/gascan_release_python_local-0.1.0.dist-info" \
     "$fixture/ruby-bin/bin" \
     "$XDG_CONFIG_HOME/gascan-release-smoke"
 
@@ -185,7 +187,8 @@ jq -e '
   printf "%s\n" "#!/usr/bin/env node" "console.log(\"release-npm-local-ok\")" \
     >"$fixture/npm-bin/cli.js"
   chmod 0755 "$fixture/npm-bin/cli.js"
-  npm install --global "$fixture/npm-bin" >/dev/null
+  npm pack "$fixture/npm-bin" --pack-destination "$fixture" >/dev/null
+  npm install --global "$fixture/gascan-release-npm-local-1.0.0.tgz" >/dev/null
 
   printf "%s\n" "module example.com/gascan/release-local" "go 1.26" \
     >"$fixture/go.mod"
@@ -197,15 +200,36 @@ jq -e '
   (cd "$fixture" && go install ./go-bin)
 
   printf "%s\n" \
-    "from setuptools import setup" \
-    "setup(name=\"gascan-release-python-local\", version=\"0.1.0\", scripts=[\"gascan-release-python-local\"])" \
-    >"$fixture/python-bin/setup.py"
+    "def main():" \
+    "    print(\"release-python-local-ok\")" \
+    >"$fixture/python-wheel/gascan_release_python_local.py"
   printf "%s\n" \
-    "#!/usr/bin/env python" \
-    "print(\"release-python-local-ok\")" \
-    >"$fixture/python-bin/gascan-release-python-local"
-  chmod 0755 "$fixture/python-bin/gascan-release-python-local"
-  python -m pip install --user --no-deps "$fixture/python-bin" >/dev/null
+    "Metadata-Version: 2.1" \
+    "Name: gascan-release-python-local" \
+    "Version: 0.1.0" \
+    >"$fixture/python-wheel/gascan_release_python_local-0.1.0.dist-info/METADATA"
+  printf "%s\n" \
+    "Wheel-Version: 1.0" \
+    "Generator: gascan-release-smoke" \
+    "Root-Is-Purelib: true" \
+    "Tag: py3-none-any" \
+    >"$fixture/python-wheel/gascan_release_python_local-0.1.0.dist-info/WHEEL"
+  printf "%s\n" \
+    "[console_scripts]" \
+    "gascan-release-python-local = gascan_release_python_local:main" \
+    >"$fixture/python-wheel/gascan_release_python_local-0.1.0.dist-info/entry_points.txt"
+  printf "%s\n" \
+    "gascan_release_python_local.py,," \
+    "gascan_release_python_local-0.1.0.dist-info/METADATA,," \
+    "gascan_release_python_local-0.1.0.dist-info/WHEEL,," \
+    "gascan_release_python_local-0.1.0.dist-info/entry_points.txt,," \
+    "gascan_release_python_local-0.1.0.dist-info/RECORD,," \
+    >"$fixture/python-wheel/gascan_release_python_local-0.1.0.dist-info/RECORD"
+  (cd "$fixture/python-wheel" &&
+    python -m zipfile -c ../gascan_release_python_local-0.1.0-py3-none-any.whl \
+      gascan_release_python_local.py gascan_release_python_local-0.1.0.dist-info)
+  python -m pip install --user --no-deps \
+    "$fixture/gascan_release_python_local-0.1.0-py3-none-any.whl" >/dev/null
 
   printf "%s\n" \
     "Gem::Specification.new do |spec|" \
@@ -220,8 +244,8 @@ jq -e '
   printf "%s\n" "#!/usr/bin/env ruby" "puts \"release-ruby-local-ok\"" \
     >"$fixture/ruby-bin/bin/gascan-release-ruby-local"
   chmod 0755 "$fixture/ruby-bin/bin/gascan-release-ruby-local"
-  gem build "$fixture/ruby-bin/gascan-release-ruby-local.gemspec" \
-    --output "$fixture/ruby-bin.gem" >/dev/null
+  (cd "$fixture/ruby-bin" &&
+    gem build gascan-release-ruby-local.gemspec --output ../ruby-bin.gem >/dev/null)
   gem install --local "$fixture/ruby-bin.gem" >/dev/null
 
   assert_local_command()

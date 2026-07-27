@@ -507,6 +507,7 @@ fn canonical_request_has_one_root_mount_owned_volumes_loopback_ports_and_init() 
                 "GOCACHE".to_owned(),
                 "/home/workspace/.cache/go-build".to_owned(),
             ),
+            ("GOBIN".to_owned(), "/home/workspace/.local/bin".to_owned(),),
             (
                 "GOMODCACHE".to_owned(),
                 "/home/workspace/.cache/go-mod".to_owned(),
@@ -622,6 +623,7 @@ fn canonical_request_has_one_root_mount_owned_volumes_loopback_ports_and_init() 
         ("NPM_CONFIG_PREFIX", "/home/workspace/.local"),
         ("NPM_CONFIG_CACHE", "/home/workspace/.cache/npm"),
         ("GOPATH", "/home/workspace/.local/share/go"),
+        ("GOBIN", "/home/workspace/.local/bin"),
         ("GOCACHE", "/home/workspace/.cache/go-build"),
         ("GOMODCACHE", "/home/workspace/.cache/go-mod"),
         ("PYTHONUSERBASE", "/home/workspace/.local"),
@@ -877,7 +879,7 @@ fn approved_json_shape_exposes_no_unsafe_backend_surface() {
             "snapshot contains {forbidden}: {snapshot}"
         );
     }
-    assert_eq!(request.environment().len(), 26);
+    assert_eq!(request.environment().len(), 27);
     assert_eq!(
         request
             .environment()

@@ -295,6 +295,7 @@ fn ssh_guest_initialization_is_behavioral_atomic_and_idempotent() {
         "NPM_CONFIG_PREFIX=/home/workspace/.local",
         "NPM_CONFIG_CACHE=/home/workspace/.cache/npm",
         "GOPATH=/home/workspace/.local/share/go",
+        "GOBIN=/home/workspace/.local/bin",
         "GOCACHE=/home/workspace/.cache/go-build",
         "GOMODCACHE=/home/workspace/.cache/go-mod",
         "PYTHONUSERBASE=/home/workspace/.local",
@@ -1229,10 +1230,7 @@ fn dockerfile_final_stage_matches_writable_runtime_policy() {
             "MISE_GLOBAL_CONFIG_FILE",
             "/home/workspace/.config/gascan/mise.toml",
         ),
-        (
-            "MISE_SYSTEM_CONFIG_FILE",
-            "/etc/mise/config.toml",
-        ),
+        ("MISE_SYSTEM_CONFIG_FILE", "/etc/mise/config.toml"),
         (
             "MISE_STATE_DIR",
             "/home/workspace/.config/gascan/mise-state",
@@ -1245,6 +1243,7 @@ fn dockerfile_final_stage_matches_writable_runtime_policy() {
         ("NPM_CONFIG_PREFIX", "/home/workspace/.local"),
         ("NPM_CONFIG_CACHE", "/home/workspace/.cache/npm"),
         ("GOPATH", "/home/workspace/.local/share/go"),
+        ("GOBIN", "/home/workspace/.local/bin"),
         ("GOCACHE", "/home/workspace/.cache/go-build"),
         ("GOMODCACHE", "/home/workspace/.cache/go-mod"),
         ("PYTHONUSERBASE", "/home/workspace/.local"),

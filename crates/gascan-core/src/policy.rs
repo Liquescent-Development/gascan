@@ -29,6 +29,7 @@ pub const CARGO_HOME: &str = "/home/workspace/.local/share/cargo";
 pub const RUSTUP_HOME: &str = "/home/workspace/.local/share/rustup";
 pub const NPM_CACHE_DIR: &str = "/home/workspace/.cache/npm";
 pub const GO_PATH: &str = "/home/workspace/.local/share/go";
+pub const GO_BIN: &str = "/home/workspace/.local/bin";
 pub const MISE_DATA_DIR: &str = "/home/workspace/.local/share/mise";
 pub const MISE_CACHE_DIR: &str = "/home/workspace/.cache/mise";
 pub const MISE_GLOBAL_CONFIG_FILE: &str = "/home/workspace/.config/gascan/mise.toml";
@@ -284,6 +285,7 @@ pub fn workspace_environment() -> BTreeMap<String, String> {
             "GOCACHE".to_owned(),
             "/home/workspace/.cache/go-build".to_owned(),
         ),
+        ("GOBIN".to_owned(), GO_BIN.to_owned()),
         (
             "GOMODCACHE".to_owned(),
             "/home/workspace/.cache/go-mod".to_owned(),

@@ -166,6 +166,7 @@ ENV MISE_RUSTUP_HOME=/home/workspace/.local/share/rustup
 ENV NPM_CONFIG_PREFIX=/home/workspace/.local
 ENV NPM_CONFIG_CACHE=/home/workspace/.cache/npm
 ENV GOPATH=/home/workspace/.local/share/go
+ENV GOBIN=/home/workspace/.local/bin
 ENV GOCACHE=/home/workspace/.cache/go-build
 ENV GOMODCACHE=/home/workspace/.cache/go-mod
 ENV PYTHONUSERBASE=/home/workspace/.local

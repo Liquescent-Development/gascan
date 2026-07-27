@@ -51,12 +51,16 @@ for required in \
   '/home/workspace/.config' \
   'CARGO_HOME=/home/workspace/.local/share/cargo' \
   'RUSTUP_HOME=/home/workspace/.local/share/rustup' \
+  'test "$GOBIN" = /home/workspace/.local/bin' \
   'cfg-if = \"=1.0.4\"' \
   'cargo run --manifest-path "$fixture/rust-app/Cargo.toml"' \
   'cargo install --path "$fixture/rust-bin"' \
-  'npm install --global "$fixture/npm-bin"' \
+  'npm pack "$fixture/npm-bin" --pack-destination "$fixture"' \
+  'npm install --global "$fixture/gascan-release-npm-local-1.0.0.tgz"' \
   'go install ./go-bin' \
-  'python -m pip install --user --no-deps "$fixture/python-bin"' \
+  'python -m zipfile -c ../gascan_release_python_local-0.1.0-py3-none-any.whl' \
+  '"$fixture/gascan_release_python_local-0.1.0-py3-none-any.whl"' \
+  'gem build gascan-release-ruby-local.gemspec --output ../ruby-bin.gem' \
   'gem install --local "$fixture/ruby-bin.gem"' \
   '$XDG_CONFIG_HOME/gascan-release-smoke/config'
 do

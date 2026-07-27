@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::{
     fs,
     os::unix::fs::{MetadataExt, PermissionsExt, symlink},
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
 };
 
@@ -60,6 +60,20 @@ fn rust_seed_command(
         std::env::join_paths(path).unwrap_or(OsString::new()),
     );
     command
+}
+
+fn gnu_mv_path() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        return std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|directory| directory.join("gmv"))
+            .find(|candidate| candidate.is_file())
+            .expect("GNU mv is required to exercise Linux publication semantics on macOS");
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Path::new("/bin/mv").to_path_buf()
+    }
 }
 
 const RUST_PROXIES: [&str; 14] = [
@@ -186,6 +200,26 @@ fn writable_rust_bootstrap_is_idempotent_fail_closed_and_never_mutates_source() 
     let source_settings = source.join("settings.toml");
     let source_settings_inode = fs::metadata(&source_settings).unwrap().ino();
     let source_settings_contents = fs::read(&source_settings).unwrap();
+    let immutable_data_directory = source
+        .join("toolchains")
+        .join(bundled)
+        .join("lib/rustlib/src");
+    fs::create_dir_all(&immutable_data_directory).unwrap();
+    let immutable_data = immutable_data_directory.join("library.txt");
+    fs::write(&immutable_data, "immutable library source\n").unwrap();
+    fs::set_permissions(&immutable_data, fs::Permissions::from_mode(0o444)).unwrap();
+    fs::set_permissions(&immutable_data_directory, fs::Permissions::from_mode(0o555)).unwrap();
+    let immutable_data_inode = fs::metadata(&immutable_data).unwrap().ino();
+    let immutable_data_contents = fs::read(&immutable_data).unwrap();
+    let outside_target = temp.path().join("outside-toolchain-target");
+    fs::write(&outside_target, "outside target\n").unwrap();
+    fs::set_permissions(&outside_target, fs::Permissions::from_mode(0o444)).unwrap();
+    let outside_mode = fs::metadata(&outside_target).unwrap().permissions().mode() & 0o777;
+    symlink(
+        &outside_target,
+        source.join("toolchains").join(bundled).join("outside-link"),
+    )
+    .unwrap();
 
     let run = || rust_seed_command(&script, &source, &destination, temp.path()).status();
     assert!(run().unwrap().success());
@@ -196,6 +230,42 @@ fn writable_rust_bootstrap_is_idempotent_fail_closed_and_never_mutates_source() 
     let first_inode = fs::metadata(&published).unwrap().ino();
     let first_contents = fs::read(&published).unwrap();
     assert_eq!(first_contents, b"bundled cargo\n");
+    let copied_data_directory = destination
+        .join("toolchains")
+        .join(bundled)
+        .join("lib/rustlib/src");
+    let copied_data = copied_data_directory.join("library.txt");
+    assert_eq!(
+        fs::metadata(&copied_data_directory)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(&copied_data).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(&published).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::read_link(
+            destination
+                .join("toolchains")
+                .join(bundled)
+                .join("outside-link")
+        )
+        .unwrap(),
+        outside_target
+    );
+    assert_eq!(
+        fs::metadata(&outside_target).unwrap().permissions().mode() & 0o777,
+        outside_mode,
+        "stage normalization followed an internal symlink"
+    );
     assert_eq!(
         fs::metadata(&published).unwrap().uid(),
         fs::metadata(&destination).unwrap().uid(),
@@ -321,6 +391,23 @@ fn writable_rust_bootstrap_is_idempotent_fail_closed_and_never_mutates_source() 
     assert_eq!(fs::metadata(&source_cargo).unwrap().ino(), source_inode);
     assert_eq!(fs::read(&source_cargo).unwrap(), source_contents);
     assert_eq!(
+        fs::metadata(&immutable_data).unwrap().ino(),
+        immutable_data_inode
+    );
+    assert_eq!(fs::read(&immutable_data).unwrap(), immutable_data_contents);
+    assert_eq!(
+        fs::metadata(&immutable_data).unwrap().permissions().mode() & 0o777,
+        0o444
+    );
+    assert_eq!(
+        fs::metadata(&immutable_data_directory)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o555
+    );
+    assert_eq!(
         fs::metadata(&source_rustup).unwrap().ino(),
         source_rustup_inode
     );
@@ -344,6 +431,139 @@ fn writable_rust_bootstrap_is_idempotent_fail_closed_and_never_mutates_source() 
     );
     assert!(rust_proxy_staging_residue(&destination).is_empty());
     assert!(rust_settings_staging_residue(&destination).is_empty());
+}
+
+#[test]
+fn writable_rust_bootstrap_rerun_does_not_move_over_an_existing_marker() {
+    let script = root().join("images/workspace/bin/initialize-rust-home");
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let destination = temp.path().join("destination");
+    write_test_toolchain(
+        &source,
+        "1.97.0-aarch64-unknown-linux-gnu",
+        "bundled cargo\n",
+    );
+    assert!(
+        rust_seed_command(&script, &source, &destination, temp.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let marker = destination.join(".gascan-bundled-toolchains-v1");
+    let marker_inode = fs::metadata(&marker).unwrap().ino();
+    let marker_contents = fs::read(&marker).unwrap();
+    let fake_mv = temp.path().join("test-bin/mv");
+    fs::write(
+        &fake_mv,
+        "#!/bin/sh\nlast=\nfor argument in \"$@\"; do last=$argument; done\ncase \"$last\" in */.gascan-bundled-toolchains-v1) printf 'existing marker move attempted\\n' >&2; exit 91 ;; esac\nexec \"$GASCAN_TEST_REAL_MV\" \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_mv, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let rerun = rust_seed_command(&script, &source, &destination, temp.path())
+        .env("GASCAN_TEST_REAL_MV", gnu_mv_path())
+        .status()
+        .unwrap();
+    assert!(
+        rerun.success(),
+        "rerun attempted Linux no-clobber marker move"
+    );
+    assert_eq!(fs::metadata(&marker).unwrap().ino(), marker_inode);
+    assert_eq!(fs::read(&marker).unwrap(), marker_contents);
+    assert!(rust_staging_residue(&destination).is_empty());
+}
+
+#[test]
+fn writable_rust_bootstrap_revalidates_a_marker_publication_race() {
+    for collision in ["safe-subset", "wrong-content"] {
+        let script = root().join("images/workspace/bin/initialize-rust-home");
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        write_test_toolchain(
+            &source,
+            "1.97.0-aarch64-unknown-linux-gnu",
+            "bundled cargo\n",
+        );
+        write_test_toolchain(
+            &source,
+            "1.98.0-aarch64-unknown-linux-gnu",
+            "future bundled cargo\n",
+        );
+        let fake_mv = temp.path().join("test-bin/mv");
+        fs::create_dir_all(fake_mv.parent().unwrap()).unwrap();
+        fs::write(
+            &fake_mv,
+            format!(
+                "#!/bin/sh\nprevious=\nlast=\nfor argument in \"$@\"; do previous=$last; last=$argument; done\ncase \"$last\" in\n  */.gascan-bundled-toolchains-v1)\n    case {collision} in\n      safe-subset) printf '1.97.0-aarch64-unknown-linux-gnu\\n' >\"$last\" ;;\n      wrong-content) printf 'attacker-controlled\\n' >\"$last\" ;;\n    esac\n    chmod 0600 \"$last\"\n    printf 'mv: not replacing existing marker\\n' >&2\n    exit 1\n    ;;\nesac\nexec \"$GASCAN_TEST_REAL_MV\" \"$@\"\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fake_mv, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let result = rust_seed_command(&script, &source, &destination, temp.path())
+            .env("GASCAN_TEST_REAL_MV", gnu_mv_path())
+            .status()
+            .unwrap();
+        assert_eq!(
+            result.success(),
+            collision == "safe-subset",
+            "unexpected marker race result for {collision}"
+        );
+        assert!(rust_staging_residue(&destination).is_empty());
+    }
+}
+
+#[test]
+fn writable_rust_bootstrap_rejects_an_unsafe_existing_marker() {
+    for case in [
+        "unknown",
+        "unsorted",
+        "duplicate",
+        "writable-mode",
+        "symlink",
+    ] {
+        let script = root().join("images/workspace/bin/initialize-rust-home");
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join(format!("destination-{case}"));
+        let bundled = "1.97.0-aarch64-unknown-linux-gnu";
+        write_test_toolchain(&source, bundled, "bundled cargo\n");
+        if case == "unsorted" {
+            write_test_toolchain(&source, "0.0.1-older", "older cargo\n");
+        }
+        fs::create_dir_all(&destination).unwrap();
+        let marker = destination.join(".gascan-bundled-toolchains-v1");
+        match case {
+            "unknown" => {
+                fs::write(&marker, "9.99.0-unknown\n").unwrap();
+                fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            "unsorted" => {
+                fs::write(&marker, format!("{bundled}\n0.0.1-older\n")).unwrap();
+                fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            "duplicate" => {
+                fs::write(&marker, format!("{bundled}\n{bundled}\n")).unwrap();
+                fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            "writable-mode" => {
+                fs::write(&marker, format!("{bundled}\n")).unwrap();
+                fs::set_permissions(&marker, fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            "symlink" => symlink(source.join("settings.toml"), &marker).unwrap(),
+            _ => unreachable!(),
+        }
+        let inode = fs::symlink_metadata(&marker).unwrap().ino();
+
+        let rejected = rust_seed_command(&script, &source, &destination, temp.path())
+            .status()
+            .unwrap();
+        assert!(!rejected.success(), "accepted unsafe marker: {case}");
+        assert_eq!(fs::symlink_metadata(&marker).unwrap().ino(), inode);
+    }
 }
 
 #[test]
@@ -1330,6 +1550,7 @@ fn profile_defaults_are_exact_and_idempotent() {
         ("NPM_CONFIG_PREFIX", "/home/workspace/.local"),
         ("NPM_CONFIG_CACHE", "/home/workspace/.cache/npm"),
         ("GOPATH", "/home/workspace/.local/share/go"),
+        ("GOBIN", "/home/workspace/.local/bin"),
         ("GOCACHE", "/home/workspace/.cache/go-build"),
         ("GOMODCACHE", "/home/workspace/.cache/go-mod"),
         ("PYTHONUSERBASE", "/home/workspace/.local"),
@@ -1441,6 +1662,7 @@ fn workstation_contract_audits_reported_writable_destinations() {
         "npm config get prefix",
         "npm config get cache",
         "go env GOPATH",
+        "go env GOBIN",
         "go env GOCACHE",
         "go env GOMODCACHE",
         "python -m site --user-base",
