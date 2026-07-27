@@ -11,9 +11,9 @@ use std::os::unix::fs::MetadataExt as _;
 use std::process::{Command, Stdio};
 
 const PERSISTENT_WORKSTATION_SENTINELS: [&str; 3] = [
-    "/home/workspace/.local/share/mise/image-replace-sentinel",
-    "/home/workspace/.cache/mise/image-replace-sentinel",
-    "/home/workspace/.config/gascan/image-replace-sentinel",
+    "/home/workspace/.local/image-replace-sentinel",
+    "/home/workspace/.cache/image-replace-sentinel",
+    "/home/workspace/.config/image-replace-sentinel",
 ];
 
 #[test]
@@ -648,13 +648,13 @@ fn assert_compatible_fixture(env: &AppleE2e, commands_available: bool) -> TestRe
 }
 
 #[test]
-fn explicit_sentinels_are_limited_to_non_tool_managed_volume_roots() {
+fn explicit_sentinels_target_the_three_managed_volume_roots() {
     assert_eq!(
         PERSISTENT_WORKSTATION_SENTINELS,
         [
-            "/home/workspace/.local/share/mise/image-replace-sentinel",
-            "/home/workspace/.cache/mise/image-replace-sentinel",
-            "/home/workspace/.config/gascan/image-replace-sentinel",
+            "/home/workspace/.local/image-replace-sentinel",
+            "/home/workspace/.cache/image-replace-sentinel",
+            "/home/workspace/.config/image-replace-sentinel",
         ]
     );
 }
