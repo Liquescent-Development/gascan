@@ -665,9 +665,24 @@ The sandboxed workspace and scripts attempts encountered only their known PTY
 and loopback fixture-server permission denials. Both authoritative
 host-permission reruns passed.
 
+## Final Independent Review
+
+The first closure review found no code issues and no Critical findings, but
+withheld handoff for two Important report contradictions and one Minor stale
+test name. Commit `68a0e6f` corrected the report's current outcome, historical
+publication boundary, exact publication-versus-approval mutation provenance,
+and executable sentinel test name.
+
+Focused re-review closed every finding:
+
+```text
+Critical: none
+Important: none
+Minor: none
+Task 6 ready for Task 7
+```
+
 ## Remaining Work
 
-1. Obtain final independent read-only review of the two closure commits and
-   Task 6 evidence.
-2. Hand the completed branch back for Task 7 integration; do not start a PR or
+1. Hand the completed branch back for Task 7 integration; do not start a PR or
    release from this task.
