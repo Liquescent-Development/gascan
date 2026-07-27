@@ -39,6 +39,8 @@ const REPOSITORY_FILES: [&str; 11] = [
 ];
 const CACHE_FILES: [&str; 2] = ["mise-linux-arm64", "expected-tool-versions.json"];
 const RECORDS: [&str; 3] = ["ubuntu_packages", "mise_runtimes", "gascamp_source_vendor"];
+const REVIEWED_STARSHIP_VERSION: &str = "1.25.1";
+const REVIEWED_STARSHIP_URL: &str = "https://github.com/starship/starship/releases/download/v1.25.1/starship-aarch64-unknown-linux-musl.tar.gz";
 const REVIEWED_EXCLUDED_NPM_PATHS: [&str; 12] = [
     "node_modules/@anthropic-ai/claude-code-darwin-arm64",
     "node_modules/@anthropic-ai/claude-code-darwin-x64",
@@ -102,6 +104,7 @@ struct ConnectedBundles {
 
 #[derive(Deserialize)]
 struct WorkstationArtifact {
+    version: String,
     url: String,
     sha256: String,
     size: u64,
@@ -526,6 +529,9 @@ fn parse_connected_lock(contents: &str) -> Result<ConnectedLock, DynError> {
             || artifact.size == 0
             || artifact.size > maximum
             || !lower_hex(&artifact.sha256, 64)
+            || (name == "starship"
+                && (artifact.version != REVIEWED_STARSHIP_VERSION
+                    || artifact.url != REVIEWED_STARSHIP_URL))
         {
             return Err(format!("workstation artifact {name} has invalid bounds").into());
         }

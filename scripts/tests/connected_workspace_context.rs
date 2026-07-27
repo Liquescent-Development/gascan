@@ -495,8 +495,16 @@ fn connected_lock(mode: &str, package: &[u8], package_lock: &[u8]) -> String {
             )
         } else {
             let key = name.split('.').next().unwrap();
+            let (version, url) = if key == "starship" {
+                (
+                    "1.25.1",
+                    "https://github.com/starship/starship/releases/download/v1.25.1/starship-aarch64-unknown-linux-musl.tar.gz".to_owned(),
+                )
+            } else {
+                ("1.0.0", format!("https://{host}/fixture/{name}"))
+            };
             format!(
-                "\n[workstation_artifacts.{key}]\nversion = \"1.0.0\"\nurl = \"https://{host}/fixture/{name}\"\nsha256 = \"{:x}\"\nsize = {}\nplatform = \"linux-arm64\"\nkind = \"{kind}\"\n",
+                "\n[workstation_artifacts.{key}]\nversion = \"{version}\"\nurl = \"{url}\"\nsha256 = \"{:x}\"\nsize = {}\nplatform = \"linux-arm64\"\nkind = \"{kind}\"\n",
                 Sha256::digest(bytes),
                 bytes.len(),
             )
@@ -1234,6 +1242,24 @@ fn connected_gascamp_revision_must_match_the_reviewed_revision() {
     let output = changed.run();
     assert!(!output.status.success());
     assert!(!changed.context.exists());
+}
+
+#[test]
+fn connected_starship_lock_requires_the_exact_reviewed_release_path() {
+    let fixture = Fixture::new();
+    let exact = "https://github.com/starship/starship/releases/download/v1.25.1/starship-aarch64-unknown-linux-musl.tar.gz";
+    let changed = fs::read_to_string(&fixture.lock).unwrap().replace(
+        exact,
+        "https://github.com/unreviewed/repository/releases/tool",
+    );
+    fs::write(&fixture.lock, changed).unwrap();
+    fixture.refresh_lock_receipt();
+    let output = fixture.run();
+    assert!(
+        !output.status.success(),
+        "accepted an unreviewed Starship URL"
+    );
+    assert!(!fixture.context.exists());
 }
 
 #[test]
