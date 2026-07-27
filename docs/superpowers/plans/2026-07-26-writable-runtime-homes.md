@@ -389,11 +389,17 @@ assert:
 - unsafe Cargo-bin destinations fail without replacing user entries;
 - partial proxy publication is cleaned and succeeds on retry;
 - immutable settings must be regular, non-symlink, size-bounded, and contain
-  exactly one canonical safe default that identifies a validated toolchain;
-- missing, malformed, duplicate, unknown, and unsafe defaults fail nonzero;
+  the complete canonical rustup subset with exactly one safe default that
+  identifies a validated toolchain and at most one terminal empty
+  `[overrides]` table;
+- missing, malformed, duplicate, unknown, nested, noncanonical, and unsafe
+  settings fail nonzero;
 - a minimal rustup-compatible mode-0600 writable settings file is published
   atomically only when absent, preserving regular user settings unchanged;
 - interrupted settings publication is cleaned and succeeds on retry;
+- exact reserved toolchain/hash/proxy/settings/marker crash stages are safely
+  reclaimed on retry, while symlinks/type mismatches fail closed and unrelated
+  user files remain untouched;
 - a newly bundled future toolchain does not change the immutable-source
   default;
 - no source file is changed.
@@ -475,13 +481,23 @@ arbitrary source symlink or copy Cargo cache/state.
 
 Treat the regular, non-symlink, strictly size-bounded immutable
 `$source_root/settings.toml` as the only bundled-default source of truth.
-Parse exactly one canonical `default_toolchain` without shell evaluation,
-require a safe basename, and require matching regular executable `cargo` and
-`rustc` in the validated bundled and copied toolchains. If the writable
-settings path is absent, generate only rustup's minimal version/default/profile
-and empty-overrides structure in a mode-0600 temporary file and publish it
+Validate the whole actual rustup subset without shell evaluation: exact
+canonical version/default/profile records in order, then at most one exact
+terminal `[overrides]` header with no nonblank entries. Require the default to
+be a safe basename and require matching regular executable `cargo` and `rustc`
+in the validated bundled and copied toolchains. If the writable settings path
+is absent, generate only rustup's minimal version/default/profile and
+empty-overrides structure in a mode-0600 temporary file and publish it
 atomically without clobbering. Preserve an existing regular user settings file
 unchanged and reject symlink or non-regular collisions.
+
+Before publication, scan only the exact `.gascan-rust-seed.`,
+`.gascan-rust-hash.`, `.gascan-rust-settings.`, and
+`.gascan-rust-marker.` prefixes in the writable Rust root and
+`.gascan-rust-proxy.` in the writable Cargo bin. Reclaim only basename-safe
+entries of each prefix's known file/directory type. Reject symlinks and type
+mismatches, never follow nested links, and leave final paths, near-match names,
+and unrelated user files untouched.
 
 - [ ] **Step 5: Add progress step 6 without renumbering existing values**
 

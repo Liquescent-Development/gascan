@@ -182,15 +182,25 @@ renames. Existing executable user commands and already-correct proxy symlinks
 are preserved; unsafe destination collisions are never overwritten.
 
 The immutable, strictly size-bounded rustup `settings.toml` is the sole source
-of truth for the bundled default. Gas Can parses exactly one canonical, safe
-`default_toolchain` without shell evaluation and requires it to identify a
-validated bundled toolchain with executable Cargo and Rust commands. When the
-user has no rustup settings, Gas Can generates a minimal mode-0600
-rustup-compatible settings file through restrictive staging and atomic
-no-clobber publication. Existing regular user settings are preserved
-unchanged; symlink and non-regular collisions fail closed. This lets direct
-`rustc`, `cargo`, and `rustup` calls use the bundled version from a neutral
-directory without downloads.
+of truth for the bundled default. Gas Can validates the entire actual rustup
+subset without shell evaluation: exact canonical `version`,
+`default_toolchain`, and `profile` records in order, followed only by the
+optional exact empty `[overrides]` table. Unknown keys, malformed or duplicate
+records, nested tables, and nonblank override entries fail closed. The one safe
+default must identify a validated bundled toolchain with executable Cargo and
+Rust commands. When the user has no rustup settings, Gas Can generates a
+minimal mode-0600 rustup-compatible settings file through restrictive staging
+and atomic no-clobber publication. Existing regular user settings are
+preserved unchanged; symlink and non-regular collisions fail closed. This lets
+direct `rustc`, `cargo`, and `rustup` calls use the bundled version from a
+neutral directory without downloads.
+
+On retry after a crash or SIGKILL, the bootstrap reclaims only its exact
+reserved staging prefixes in the Rust-home and Cargo-bin directories. Each
+prefix has a fixed allowed artifact type; symlinks, unsafe basenames, and type
+mismatches fail closed. Removing a valid staging directory never follows a
+nested symlink. Final paths, similarly named files outside the exact prefixes,
+and unrelated user dotfiles are untouched.
 
 The current bundled Rust home is approximately 1.5 GiB. This per-sandbox cost
 is intentional and is charged to the configurable `tools` volume, whose

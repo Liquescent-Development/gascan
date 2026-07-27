@@ -53,21 +53,64 @@ fi
 if ! default_toolchain=$(
     LC_ALL=C awk '
         BEGIN {
-            count = 0
+            state = 0
+            default_count = 0
             invalid = 0
         }
-        /^[[:space:]]*default_toolchain[[:space:]]*=/ {
-            count++
+        state == 0 {
+            if ($0 != "version = \"12\"") {
+                invalid = 1
+            } else {
+                state = 1
+            }
+            next
+        }
+        state == 1 {
             if ($0 !~ /^default_toolchain = "[A-Za-z0-9][A-Za-z0-9._-]*"$/) {
                 invalid = 1
                 next
             }
+            default_count++
             value = $0
             sub(/^default_toolchain = "/, "", value)
             sub(/"$/, "", value)
+            state = 2
+            next
+        }
+        state == 2 {
+            if ($0 != "profile = \"default\"") {
+                invalid = 1
+            } else {
+                state = 3
+            }
+            next
+        }
+        state == 3 {
+            if ($0 == "") {
+                state = 4
+            } else if ($0 == "[overrides]") {
+                state = 5
+            } else {
+                invalid = 1
+            }
+            next
+        }
+        state == 4 {
+            if ($0 == "[overrides]") {
+                state = 5
+            } else {
+                invalid = 1
+            }
+            next
+        }
+        state == 5 {
+            if ($0 != "") {
+                invalid = 1
+            }
+            next
         }
         END {
-            if (count != 1 || invalid) {
+            if (state < 3 || default_count != 1 || invalid) {
                 exit 1
             }
             print value
@@ -172,6 +215,76 @@ for directory in "$destination_root/toolchains" "$destination_root/update-hashes
     install -d -m 0700 "$directory"
 done
 install -d -m 0700 "$cargo_destination_bin"
+
+reclaim_stale_stages() {
+    stale_parent=$1
+    stale_prefix=$2
+    stale_kind=$3
+    for stale in "$stale_parent/$stale_prefix"*; do
+        if [ ! -e "$stale" ] && [ ! -L "$stale" ]; then
+            continue
+        fi
+        stale_name=${stale##*/}
+        stale_suffix=${stale_name#"$stale_prefix"}
+        case "$stale_name" in
+            "$stale_prefix"?*) ;;
+            *)
+                printf '%s\n' "invalid Rust crash-stage name: $stale" >&2
+                exit 1
+                ;;
+        esac
+        case "$stale_suffix" in
+            '' | *[!A-Za-z0-9._-]*)
+                printf '%s\n' "unsafe Rust crash-stage name: $stale" >&2
+                exit 1
+                ;;
+        esac
+        if [ -L "$stale" ]; then
+            printf '%s\n' "unsafe Rust crash-stage symlink: $stale" >&2
+            exit 1
+        fi
+        case "$stale_kind" in
+            directory)
+                if [ ! -d "$stale" ]; then
+                    printf '%s\n' "invalid Rust crash-stage type: $stale" >&2
+                    exit 1
+                fi
+                rm -rf -- "$stale"
+                ;;
+            file)
+                if [ ! -f "$stale" ]; then
+                    printf '%s\n' "invalid Rust crash-stage type: $stale" >&2
+                    exit 1
+                fi
+                rm -f -- "$stale"
+                ;;
+            file-or-directory)
+                if [ -d "$stale" ]; then
+                    rm -rf -- "$stale"
+                elif [ -f "$stale" ]; then
+                    rm -f -- "$stale"
+                else
+                    printf '%s\n' "invalid Rust crash-stage type: $stale" >&2
+                    exit 1
+                fi
+                ;;
+            *)
+                printf '%s\n' "invalid Rust crash-stage policy" >&2
+                exit 1
+                ;;
+        esac
+        if [ -e "$stale" ] || [ -L "$stale" ]; then
+            printf '%s\n' "failed to reclaim Rust crash stage: $stale" >&2
+            exit 1
+        fi
+    done
+}
+
+reclaim_stale_stages "$destination_root" .gascan-rust-seed. directory
+reclaim_stale_stages "$destination_root" .gascan-rust-hash. file
+reclaim_stale_stages "$destination_root" .gascan-rust-settings. file
+reclaim_stale_stages "$destination_root" .gascan-rust-marker. directory
+reclaim_stale_stages "$cargo_destination_bin" .gascan-rust-proxy. file-or-directory
 
 destination_rustup="$cargo_destination_bin/rustup"
 if [ -L "$destination_rustup" ] ||

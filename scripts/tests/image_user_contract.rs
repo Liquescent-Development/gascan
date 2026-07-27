@@ -603,10 +603,23 @@ fn writable_rust_bootstrap_rejects_unsafe_or_ambiguous_default_toolchain_setting
         "directory",
         "oversized",
         "missing-default",
+        "missing-version",
+        "missing-profile",
         "duplicate-default",
+        "duplicate-version",
+        "duplicate-profile",
         "unsafe-default",
         "unknown-default",
         "malformed-default",
+        "trailing-default-junk",
+        "unterminated-default",
+        "unknown-key",
+        "overrides-entry",
+        "repeated-overrides-table",
+        "nested-table",
+        "key-after-overrides",
+        "noncanonical-version",
+        "noncanonical-profile",
         "selected-cargo-symlink",
         "selected-rustc-directory",
         "selected-rustc-nonexecutable",
@@ -628,26 +641,129 @@ fn writable_rust_bootstrap_rejects_unsafe_or_ambiguous_default_toolchain_setting
             "directory" => fs::create_dir(&settings).unwrap(),
             "oversized" => fs::write(&settings, vec![b'x'; 4097]).unwrap(),
             "missing-default" => fs::write(&settings, "version = \"12\"\n").unwrap(),
+            "missing-version" => fs::write(
+                &settings,
+                format!("default_toolchain = \"{bundled}\"\nprofile = \"default\"\n"),
+            )
+            .unwrap(),
+            "missing-profile" => fs::write(
+                &settings,
+                format!("version = \"12\"\ndefault_toolchain = \"{bundled}\"\n"),
+            )
+            .unwrap(),
             "duplicate-default" => fs::write(
                 &settings,
-                format!("default_toolchain = \"{bundled}\"\ndefault_toolchain = \"{bundled}\"\n"),
+                format!(
+                    "version = \"12\"\ndefault_toolchain = \"{bundled}\"\ndefault_toolchain = \"{bundled}\"\nprofile = \"default\"\n"
+                ),
+            )
+            .unwrap(),
+            "duplicate-version" => fs::write(
+                &settings,
+                format!(
+                    "version = \"12\"\nversion = \"12\"\ndefault_toolchain = \"{bundled}\"\nprofile = \"default\"\n"
+                ),
+            )
+            .unwrap(),
+            "duplicate-profile" => fs::write(
+                &settings,
+                format!(
+                    "version = \"12\"\ndefault_toolchain = \"{bundled}\"\nprofile = \"default\"\nprofile = \"default\"\n"
+                ),
             )
             .unwrap(),
             "unsafe-default" => {
-                fs::write(&settings, "default_toolchain = \"../outside\"\n").unwrap()
+                fs::write(
+                    &settings,
+                    "version = \"12\"\ndefault_toolchain = \"../outside\"\nprofile = \"default\"\n",
+                )
+                .unwrap()
             }
             "unknown-default" => fs::write(
                 &settings,
-                "default_toolchain = \"1.98.0-aarch64-unknown-linux-gnu\"\n",
+                "version = \"12\"\ndefault_toolchain = \"1.98.0-aarch64-unknown-linux-gnu\"\nprofile = \"default\"\n",
             )
             .unwrap(),
-            "malformed-default" => {
-                fs::write(&settings, format!("default_toolchain=\"{bundled}\"\n")).unwrap()
-            }
+            "malformed-default" => fs::write(
+                &settings,
+                format!(
+                    "version = \"12\"\ndefault_toolchain=\"{bundled}\"\nprofile = \"default\"\n"
+                ),
+            )
+            .unwrap(),
+            "trailing-default-junk" => fs::write(
+                &settings,
+                format!(
+                    "version = \"12\"\ndefault_toolchain = \"{bundled}\" # junk\nprofile = \"default\"\n"
+                ),
+            )
+            .unwrap(),
+            "unterminated-default" => fs::write(
+                &settings,
+                format!(
+                    "version = \"12\"\ndefault_toolchain = \"{bundled}\nprofile = \"default\"\n"
+                ),
+            )
+            .unwrap(),
+            "unknown-key" => fs::write(
+                &settings,
+                format!(
+                    "version = \"12\"\ndefault_toolchain = \"{bundled}\"\nprofile = \"default\"\ntelemetry = true\n"
+                ),
+            )
+            .unwrap(),
+            "overrides-entry" => fs::write(
+                &settings,
+                format!(
+                    "version = \"12\"\ndefault_toolchain = \"{bundled}\"\nprofile = \"default\"\n\n[overrides]\n\"/workspace\" = \"nightly\"\n"
+                ),
+            )
+            .unwrap(),
+            "repeated-overrides-table" => fs::write(
+                &settings,
+                format!(
+                    "version = \"12\"\ndefault_toolchain = \"{bundled}\"\nprofile = \"default\"\n\n[overrides]\n[overrides]\n"
+                ),
+            )
+            .unwrap(),
+            "nested-table" => fs::write(
+                &settings,
+                format!(
+                    "version = \"12\"\n[nested]\ndefault_toolchain = \"{bundled}\"\nprofile = \"default\"\n"
+                ),
+            )
+            .unwrap(),
+            "key-after-overrides" => fs::write(
+                &settings,
+                format!(
+                    "version = \"12\"\nprofile = \"default\"\n[overrides]\ndefault_toolchain = \"{bundled}\"\n"
+                ),
+            )
+            .unwrap(),
+            "noncanonical-version" => fs::write(
+                &settings,
+                format!(
+                    "version = \"11\"\ndefault_toolchain = \"{bundled}\"\nprofile = \"default\"\n"
+                ),
+            )
+            .unwrap(),
+            "noncanonical-profile" => fs::write(
+                &settings,
+                format!(
+                    "version = \"12\"\ndefault_toolchain = \"{bundled}\"\nprofile = \"minimal\"\n"
+                ),
+            )
+            .unwrap(),
             "selected-cargo-symlink"
             | "selected-rustc-directory"
             | "selected-rustc-nonexecutable" => {
-                fs::write(&settings, format!("default_toolchain = \"{bundled}\"\n")).unwrap();
+                fs::write(
+                    &settings,
+                    format!(
+                        "version = \"12\"\ndefault_toolchain = \"{bundled}\"\nprofile = \"default\"\n\n[overrides]\n"
+                    ),
+                )
+                .unwrap();
                 let selected = source.join("toolchains").join(bundled).join("bin");
                 match case {
                     "selected-cargo-symlink" => {
@@ -766,6 +882,140 @@ fn writable_rust_bootstrap_cleans_interrupted_settings_publication_and_retries()
     );
     assert!(destination.join("settings.toml").is_file());
     assert!(rust_settings_staging_residue(&destination).is_empty());
+}
+
+#[test]
+fn writable_rust_bootstrap_reclaims_only_confined_crash_staging_and_retries() {
+    let script = root().join("images/workspace/bin/initialize-rust-home");
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let destination = temp.path().join("destination");
+    let cargo_bin = destination.join("cargo-bin");
+    write_test_toolchain(&source, "1.97.0-aarch64-unknown-linux-gnu", "cargo\n");
+    fs::create_dir_all(&cargo_bin).unwrap();
+
+    let unrelated_target = temp.path().join("unrelated-target");
+    fs::create_dir(&unrelated_target).unwrap();
+    fs::write(unrelated_target.join("sentinel"), "outside survives\n").unwrap();
+    let seed_stage = destination.join(".gascan-rust-seed.crash");
+    fs::create_dir(&seed_stage).unwrap();
+    fs::write(seed_stage.join("partial"), "partial\n").unwrap();
+    symlink(&unrelated_target, seed_stage.join("outside-link")).unwrap();
+    fs::write(destination.join(".gascan-rust-hash.crash"), "partial\n").unwrap();
+    fs::write(destination.join(".gascan-rust-settings.crash"), "partial\n").unwrap();
+    fs::create_dir(destination.join(".gascan-rust-marker.crash")).unwrap();
+    fs::write(
+        cargo_bin.join(".gascan-rust-proxy.rustup.crash"),
+        "partial\n",
+    )
+    .unwrap();
+    fs::create_dir(cargo_bin.join(".gascan-rust-proxy.rustc.crash")).unwrap();
+
+    let unrelated_root = destination.join(".user-bootstrap-state");
+    let unrelated_cargo = cargo_bin.join(".user-command-state");
+    let similar_reserved = destination.join(".gascan-rust-seed-user");
+    fs::write(&unrelated_root, "keep root\n").unwrap();
+    fs::write(&unrelated_cargo, "keep cargo\n").unwrap();
+    fs::write(&similar_reserved, "keep similar\n").unwrap();
+
+    assert!(
+        rust_seed_command(&script, &source, &destination, temp.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    for reclaimed in [
+        destination.join(".gascan-rust-seed.crash"),
+        destination.join(".gascan-rust-hash.crash"),
+        destination.join(".gascan-rust-settings.crash"),
+        destination.join(".gascan-rust-marker.crash"),
+        cargo_bin.join(".gascan-rust-proxy.rustup.crash"),
+        cargo_bin.join(".gascan-rust-proxy.rustc.crash"),
+    ] {
+        assert!(
+            !reclaimed.symlink_metadata().is_ok(),
+            "stale crash stage survived: {}",
+            reclaimed.display()
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(unrelated_target.join("sentinel")).unwrap(),
+        "outside survives\n"
+    );
+    assert_eq!(fs::read_to_string(unrelated_root).unwrap(), "keep root\n");
+    assert_eq!(fs::read_to_string(unrelated_cargo).unwrap(), "keep cargo\n");
+    assert_eq!(
+        fs::read_to_string(similar_reserved).unwrap(),
+        "keep similar\n"
+    );
+}
+
+#[test]
+fn writable_rust_bootstrap_rejects_unsafe_crash_staging_without_following_or_removing_it() {
+    let script = root().join("images/workspace/bin/initialize-rust-home");
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    write_test_toolchain(&source, "1.97.0-aarch64-unknown-linux-gnu", "cargo\n");
+    let target_file = temp.path().join("outside-file");
+    let target_directory = temp.path().join("outside-directory");
+    fs::write(&target_file, "outside file survives\n").unwrap();
+    fs::create_dir(&target_directory).unwrap();
+    fs::write(target_directory.join("sentinel"), "outside dir survives\n").unwrap();
+
+    for case in [
+        "seed-symlink",
+        "hash-symlink",
+        "settings-symlink",
+        "marker-symlink",
+        "proxy-symlink",
+        "seed-file",
+        "hash-directory",
+        "settings-directory",
+        "marker-file",
+    ] {
+        let destination = temp.path().join(format!("unsafe-crash-{case}"));
+        let cargo_bin = destination.join("cargo-bin");
+        fs::create_dir_all(&cargo_bin).unwrap();
+        let collision = match case {
+            "seed-symlink" => destination.join(".gascan-rust-seed.crash"),
+            "hash-symlink" => destination.join(".gascan-rust-hash.crash"),
+            "settings-symlink" => destination.join(".gascan-rust-settings.crash"),
+            "marker-symlink" => destination.join(".gascan-rust-marker.crash"),
+            "proxy-symlink" => cargo_bin.join(".gascan-rust-proxy.rustc.crash"),
+            "seed-file" => destination.join(".gascan-rust-seed.crash"),
+            "hash-directory" => destination.join(".gascan-rust-hash.crash"),
+            "settings-directory" => destination.join(".gascan-rust-settings.crash"),
+            "marker-file" => destination.join(".gascan-rust-marker.crash"),
+            _ => unreachable!(),
+        };
+        match case {
+            "seed-symlink" | "marker-symlink" | "proxy-symlink" => {
+                symlink(&target_directory, &collision).unwrap()
+            }
+            "hash-symlink" | "settings-symlink" => symlink(&target_file, &collision).unwrap(),
+            "seed-file" | "marker-file" => fs::write(&collision, "wrong type\n").unwrap(),
+            "hash-directory" | "settings-directory" => fs::create_dir(&collision).unwrap(),
+            _ => unreachable!(),
+        }
+        let collision_inode = fs::symlink_metadata(&collision).unwrap().ino();
+        let rejected = rust_seed_command(&script, &source, &destination, temp.path())
+            .status()
+            .unwrap();
+        assert!(!rejected.success(), "accepted unsafe crash stage: {case}");
+        assert_eq!(
+            fs::symlink_metadata(&collision).unwrap().ino(),
+            collision_inode,
+            "mutated unsafe crash stage: {case}"
+        );
+        assert_eq!(
+            fs::read_to_string(&target_file).unwrap(),
+            "outside file survives\n"
+        );
+        assert_eq!(
+            fs::read_to_string(target_directory.join("sentinel")).unwrap(),
+            "outside dir survives\n"
+        );
+    }
 }
 
 #[test]
