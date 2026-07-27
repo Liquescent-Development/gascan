@@ -1,7 +1,7 @@
 use camino::Utf8Path;
 use gascan_core::manifest::{
     DEFAULT_CACHE_STORAGE_BYTES, DEFAULT_CONFIG_STORAGE_BYTES, DEFAULT_TOOLS_STORAGE_BYTES,
-    Manifest, NetworkMode, Ssh, UserMode,
+    Manifest, NetworkMode, ShellPrompt, Ssh, UserMode,
 };
 use std::collections::BTreeMap;
 
@@ -17,6 +17,34 @@ fn unknown_manifest_key_is_rejected() {
     let error = load("version = 1\nnetwork = 'offline'\nssh_agent = true\n")
         .expect_err("unknown keys must fail closed");
     assert!(error.to_string().contains("unknown field `ssh_agent`"));
+}
+
+#[test]
+fn shell_prompt_defaults_accepts_supported_values_and_rejects_invalid_configuration()
+-> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(load("version = 1\n")?.shell().prompt(), ShellPrompt::Standard);
+    assert_eq!(
+        load("version = 1\n[shell]\n")?.shell().prompt(),
+        ShellPrompt::Standard
+    );
+    for (value, expected) in [
+        ("standard", ShellPrompt::Standard),
+        ("starship", ShellPrompt::Starship),
+        ("starship-nerd-font", ShellPrompt::StarshipNerdFont),
+    ] {
+        let manifest = load(&format!("version = 1\n[shell]\nprompt = '{value}'\n"))?;
+        assert_eq!(manifest.shell().prompt(), expected);
+        assert_eq!(expected.as_str(), value);
+    }
+    assert!(load("version = 1\n[shell]\nprompt = 'spaceship'\n")
+        .unwrap_err()
+        .to_string()
+        .contains("unknown variant"));
+    assert!(load("version = 1\n[shell]\ncommand = 'bash'\n")
+        .unwrap_err()
+        .to_string()
+        .contains("unknown field `command`"));
+    Ok(())
 }
 
 #[test]

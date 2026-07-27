@@ -24,6 +24,7 @@ pub struct Manifest {
     tools: BTreeMap<String, String>,
     ports: BTreeMap<String, u16>,
     ssh: Ssh,
+    shell: Shell,
     #[serde(skip)]
     canonical_root: Utf8PathBuf,
 }
@@ -67,6 +68,7 @@ impl Manifest {
             tools: BTreeMap::new(),
             ports: BTreeMap::new(),
             ssh: Ssh::default(),
+            shell: Shell::default(),
             canonical_root,
         }
     }
@@ -127,6 +129,10 @@ impl Manifest {
     pub const fn ssh(&self) -> &Ssh {
         &self.ssh
     }
+
+    pub const fn shell(&self) -> &Shell {
+        &self.shell
+    }
 }
 
 /// Validated SSH policy loaded as part of a [`Manifest`].
@@ -145,6 +151,36 @@ impl Ssh {
 
     pub const fn host_port(&self) -> Option<u16> {
         self.host_port
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShellPrompt {
+    #[default]
+    Standard,
+    Starship,
+    StarshipNerdFont,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct Shell {
+    prompt: ShellPrompt,
+}
+
+impl Shell {
+    pub const fn prompt(&self) -> ShellPrompt {
+        self.prompt
+    }
+}
+
+impl ShellPrompt {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Starship => "starship",
+            Self::StarshipNerdFont => "starship-nerd-font",
+        }
     }
 }
 
@@ -408,6 +444,8 @@ struct RawManifest {
     ports: BTreeMap<String, u16>,
     #[serde(default)]
     ssh: RawSsh,
+    #[serde(default)]
+    shell: RawShell,
 }
 
 #[derive(Default, Deserialize)]
@@ -415,6 +453,13 @@ struct RawManifest {
 struct RawSsh {
     enabled: Option<bool>,
     host_port: Option<u16>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawShell {
+    #[serde(default)]
+    prompt: ShellPrompt,
 }
 
 impl RawManifest {
@@ -506,6 +551,9 @@ impl RawManifest {
             ssh: Ssh {
                 enabled: ssh_enabled,
                 host_port: self.ssh.host_port,
+            },
+            shell: Shell {
+                prompt: self.shell.prompt,
             },
             canonical_root: canonical_root.to_owned(),
         })
