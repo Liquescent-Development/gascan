@@ -682,7 +682,76 @@ Minor: none
 Task 6 ready for Task 7
 ```
 
+## Task 7 Reopen After Source-Changing Review Fix
+
+Task 7's whole-branch review found two Important issues. The single allowed fix
+wave closed both in `d4e56fc`, and its scoped re-review was clean. Because the
+fix changes the embedded `initialize-rust-home` script, the previously approved
+`7f77de...` image is no longer sufficient evidence for the reviewed source.
+
+The first exact-head rebuild failed before any layer executed. The connected
+context independently reverified at
+`85c1aba482774e54db8aa6fafbc5b527de3ab872c996e6f690ac03cfcb810e46`;
+BuildKit logs showed repeated `demux channel full` followed by
+`archive/tar: invalid tar header` on the reused 2-CPU/2-GiB builder. This
+matches the documented stale-builder transport failure and did not publish a
+new receipt.
+
+Replacing only the disposable builder cache with a fresh 4-CPU/4-GiB builder
+produced the same context digest and passed the full no-cache connected-image
+gate:
+
+```text
+local reference:
+gascan-workspace:0cda90a4b7ac4969@sha256:a9145b1e77224a5d302439ddebb9d2b488caaabad8974a3ece0b9fb256a194f5
+
+workstation-contract-ok
+ssh-contract-inside-ok
+ssh-contract-ok
+exit: 0
+```
+
+The successful receipt records Apple Container `26.5.1`, lock digest
+`87865990...`, exact context digest `85c1aba...`, and build interval
+`2026-07-27T16:11:20Z` through `2026-07-27T16:23:39Z`.
+
+The unique intended public tag is:
+
+```text
+ghcr.io/liquescent-development/gascan/workspace:0cda90a4b7ac4969-a9145b1e77224a5d302439ddebb9d2b488caaabad8974a3ece0b9fb256a194f5
+```
+
+The unauthenticated pull-token manifest query returned `404`. The temporary
+OCI archive has SHA-256 `ef34d186...`; hashing its raw top-level index produces
+exactly `a9145b1e...`, and platform-aware inspection reports the intended
+Linux/ARM64 digest.
+
+After authorized publication, the GHCR descriptor, digest-qualified pull,
+canonical Apple structured inspection, and receipt validator all agreed on:
+
+```text
+ghcr.io/liquescent-development/gascan/workspace:0cda90a4b7ac4969-a9145b1e77224a5d302439ddebb9d2b488caaabad8974a3ece0b9fb256a194f5@sha256:a9145b1e77224a5d302439ddebb9d2b488caaabad8974a3ece0b9fb256a194f5
+```
+
+The public prebuilt connected-image gate passed every workstation,
+package-manager, and SSH contract, then published the matching candidate only
+after proving zero owned residue.
+
+The full Apple apply suite used the explicit compatible v2 predecessor
+`5f49a38a...` and passed:
+
+```text
+apple_apply: 6 passed, 0 failed, 54 filtered out, 167.12s
+```
+
+Afterward, the candidate, Apple-live receipt, public reference file, build
+receipt reference, and independent receipt validator were byte-identical.
+The cleanup root was empty, and Apple inventories contained zero test-owned
+containers, volumes, or networks. The approval helper atomically updated only
+`images/workspace/approved-image.txt` and
+`docs/evidence/connected-workspace-image.md` to a914.
+
 ## Remaining Work
 
-1. Hand the completed branch back for Task 7 integration; do not start a PR or
-   release from this task.
+1. Run final post-approval verification and bounded review.
+2. Complete Task 7 PR/check/squash integration without starting a release.
