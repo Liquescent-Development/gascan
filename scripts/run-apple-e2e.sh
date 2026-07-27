@@ -20,8 +20,39 @@ if test -n "${GASCAN_E2E_CANDIDATE_IMAGE_FILE:-}"; then
     grep -Eq '^[a-z0-9][a-z0-9._/-]*:[a-zA-Z0-9._-]+@sha256:[0-9a-f]{64}$' || {
       printf 'apple e2e: candidate receipt is not immutable\n' >&2
       exit 1
-    }
+  }
   export GASCAN_E2E_CANDIDATE_IMAGE=$candidate_image
+  if test "${GASCAN_E2E_PREDECESSOR_IMAGE+x}" = x; then
+    predecessor_image=$GASCAN_E2E_PREDECESSOR_IMAGE
+  else
+    predecessor_file=$root/images/workspace/approved-image.txt
+    test ! -L "$predecessor_file" && test -f "$predecessor_file" || {
+      printf 'apple e2e: predecessor receipt is unavailable\n' >&2
+      exit 1
+    }
+    if ! predecessor_image=$(
+      awk '
+        NR == 1 { value = $0; next }
+        { exit 1 }
+        END {
+          if (NR != 1) {
+            exit 1
+          }
+          printf "%s", value
+        }
+      ' "$predecessor_file"
+    ); then
+      printf 'apple e2e: predecessor receipt must contain exactly one line\n' >&2
+      exit 1
+    fi
+  fi
+  test "$(printf '%s' "$predecessor_image" | wc -l | tr -d ' ')" = 0 &&
+    printf '%s\n' "$predecessor_image" |
+      grep -Eq '^[a-z0-9][a-z0-9._/-]*:[a-zA-Z0-9._-]+@sha256:[0-9a-f]{64}$' || {
+        printf 'apple e2e: predecessor image is not immutable\n' >&2
+        exit 1
+      }
+  export GASCAN_E2E_PREDECESSOR_IMAGE=$predecessor_image
   live_acceptance_file=${GASCAN_E2E_LIVE_ACCEPTANCE_FILE:-"$root/.artifacts/connected-workspace-image-apple-live.txt"}
   rm -f "$live_acceptance_file"
 fi

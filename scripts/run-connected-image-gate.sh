@@ -62,7 +62,8 @@ else
 fi
 [[ "$owner_token" =~ ^[0-9a-f]{32}$ ]] || die 'invalid cleanup ownership token'
 
-names=("gascan-image-user-test-$owner_token" "gascan-image-polyglot-test-$owner_token" "gascan-image-gascamp-test-$owner_token" "gascan-image-workstation-test-$owner_token" "gascan-image-ssh-test-$owner_token")
+names=("gascan-image-user-test-$owner_token" "gascan-image-polyglot-test-$owner_token" "gascan-image-gascamp-test-$owner_token" "gascan-image-workstation-test-$owner_token" "gascan-image-ws-network-test-$owner_token" "gascan-image-ssh-test-$owner_token")
+volume_names=("gascan-image-workstation-tools-$owner_token" "gascan-image-workstation-cache-$owner_token" "gascan-image-workstation-config-$owner_token" "gascan-image-polyglot-tools-$owner_token" "gascan-image-ssh-config-$owner_token")
 cleaning=false
 inventory_proves_absent() {
   local inventory
@@ -92,15 +93,43 @@ cleanup_name() {
   controller delete "$name" >/dev/null 2>&1 || true
   inventory_proves_absent "$name"
 }
+volume_inventory_proves_absent() {
+  local inventory
+  inventory=$(controller volume list --format json 2>/dev/null) || return 1
+  printf '%s' "$inventory" | run_tool validate-container-inventory "$@" >/dev/null
+}
+classify_volume() {
+  local name=$1 inspect
+  if inspect=$(controller volume inspect "$name" 2>/dev/null); then
+    if printf '%s' "$inspect" | run_tool validate-owned-volume "$name" "$owner_token" >/dev/null; then printf 'owned\n'; return 0; fi
+    printf 'foreign\n'; return 2
+  fi
+  if volume_inventory_proves_absent "$name"; then printf 'absent\n'; return 0; fi
+  printf 'indeterminate\n'; return 3
+}
+owned_volume() {
+  test "$(classify_volume "$1")" = owned
+}
+cleanup_volume() {
+  local name=$1 state
+  state=$(classify_volume "$name") || return 1
+  test "$state" = absent && return 0
+  test "$state" = owned || return 1
+  owned_volume "$name" && owned_volume "$name" || return 1
+  controller volume delete "$name" >/dev/null 2>&1 || true
+  volume_inventory_proves_absent "$name"
+}
 cleanup() {
   $cleaning && return
   cleaning=true
   local name result=0
   for name in "${names[@]}"; do cleanup_name "$name" || result=1; done
+  for name in "${volume_names[@]}"; do cleanup_volume "$name" || result=1; done
   return "$result"
 }
 assert_absent() {
-  inventory_proves_absent "${names[@]}"
+  inventory_proves_absent "${names[@]}" &&
+    volume_inventory_proves_absent "${volume_names[@]}"
 }
 candidate_tmp=''
 rollback_candidate() {

@@ -423,14 +423,37 @@ volume:
 
 | Key | Default | Guest mount |
 | --- | --- | --- |
-| `tools` | `10GiB` | `/home/workspace/.local/share/mise` |
+| `tools` | `10GiB` | `/home/workspace/.local` |
 | `cache` | `10GiB` | `/home/workspace/.cache` |
-| `config` | `1GiB` | `/home/workspace/.config/gascan` |
+| `config` | `1GiB` | `/home/workspace/.config` |
 
 Storage sizes use the same binary units as memory: a positive integer followed
 by `KiB`, `MiB`, `GiB`, or `TiB`. Each volume has a maximum requested capacity
 of `512GiB`; decimal units, bare numbers, zero, and larger values are rejected.
 Omitted keys retain their defaults independently.
+
+Gas Can stores user-installed executables, language toolchains, and application
+data in the `tools` volume; download and build caches in `cache`; and
+conventional XDG application configuration in `config`. A new sandbox receives
+an approximately 1.5 GiB local copy of the bundled Rust toolchain in `tools`.
+The copy uses no network access, but its capacity is charged to that volume.
+Increase the three capacities independently when a workload needs more room:
+
+```toml
+[storage]
+tools = "20GiB"
+cache = "10GiB"
+config = "2GiB"
+```
+
+The version-2 mount layout introduced in Gas Can 0.1.10 is not compatible with
+volumes created by a pre-0.1.10 release. Back up anything you need, then perform
+this one-time recreation from the project root:
+
+```bash
+gascan destroy --yes
+gascan up .
+```
 
 Apple volumes cannot be resized in place. If any effective `[storage]` value
 changes after a sandbox has been created, `gascan up` and `gascan apply` refuse
@@ -445,6 +468,22 @@ Destroying removes the sandbox and all three managed volumes, including their
 contents. Back up anything you need before recreating. `[resources].disk` is
 not an alternative capacity control; it remains rejected because the Apple
 runtime cannot enforce a ceiling on the container root filesystem.
+
+Inside a networked sandbox, conventional package-manager workflows write to
+the managed volumes and place user-installed commands on `PATH`:
+
+```bash
+cargo run
+rustup component add rust-src
+npm install -g typescript
+go install golang.org/x/tools/gopls@latest
+python -m pip install --user ruff
+gem install bundler
+```
+
+Declare project-specific dependency versions in the project's dependency
+files or in `[tools]`; global installs are user-managed conveniences, not
+dependency declarations made automatically by Gas Can.
 
 ### `[tools]`
 
@@ -516,16 +555,18 @@ startup. Diagnostic packages do not grant the sandbox extra Linux
 capabilities, devices, or host access.
 
 Image-owned workstation files under `/opt/gascan/workstation` are immutable.
-An explicit `[tools]` entry is installed into the sandbox's writable
-`/home/workspace/.local/share/mise` managed tools volume; its mise shim is
-first in `PATH`, ahead of the reviewed defaults in the immutable
-`/opt/gascan/mise` system data tree. The requested version therefore overrides
-an image default without changing the immutable workstation tree.
+An explicit `[tools]` entry is installed below
+`/home/workspace/.local/share/mise`, within the managed tools volume mounted at
+`/home/workspace/.local`. Its mise shim is first in `PATH`, ahead of the
+reviewed defaults in the immutable `/opt/gascan/mise` system data tree. The
+requested version therefore overrides an image default without changing the
+immutable workstation tree.
 
 Native Claude Code, Codex, Pi, GitHub CLI, and GitLab CLI configuration is
-sandbox-local under the managed `/home/workspace/.config/gascan` volume. Mise
-caches and Pi session data are kept separately under the managed
-`/home/workspace/.cache` volume. Herdr is configured to read
+sandbox-local below `/home/workspace/.config/gascan`, within the managed config
+volume mounted at `/home/workspace/.config`. Mise caches and Pi session data
+are kept separately in the managed cache volume mounted at
+`/home/workspace/.cache`. Herdr is configured to read
 `/home/workspace/.config/gascan/herdr/config.toml` and place its logs beside
 that file, but Gas Can does not create a Herdr configuration or login. Gas Can
 never imports the host home directory, SSH material, agent/forge tokens,

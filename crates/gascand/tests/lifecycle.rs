@@ -14,7 +14,7 @@ use gascan_proto::v1::gas_can_server::GasCan;
 use gascand::{
     ActivityTracker, ActualState, DesiredState, NoopProvisioner, OperationKind, OperationStatus,
     PortReservation, SandboxApi, SandboxRecord, SandboxService, SshConfigCommitFault, SshManager,
-    SshPaths, SshResolution, Store, UpRequest, ensure_host_identity,
+    SshPaths, SshResolution, StorageResolution, Store, UpRequest, ensure_host_identity,
 };
 use gascand::{ProvisionRequest, ProvisionResolution, Provisioner, ServiceError};
 use serde_json::json;
@@ -1788,26 +1788,59 @@ async fn apply_rejects_changed_storage_without_runtime_calls() -> TestResult {
 async fn apply_rejects_legacy_storage_resolution_without_runtime_calls() -> TestResult {
     let root = tempfile::tempdir()?;
     let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
-    let runtime = FakeRuntime::default();
-    let service = SandboxService::new(
-        runtime.clone(),
-        gascand::Store::open(root.join("state.db"))?,
-        Arc::new(NoopProvisioner),
-    );
-    let desired = spec("legacy-storage", root)?;
-    service.up(UpRequest::new(desired.clone())).await?;
-    let mut record = service.status(desired.id())?.ok_or("sandbox record")?;
-    record.storage_resolution = None;
-    service.store().put_sandbox(&record)?;
+    for (name, resolution) in [
+        (
+            "legacy-storage-v1",
+            Some(StorageResolution::new(
+                1,
+                json!({
+                    "tools_bytes": 10 * 1024_u64.pow(3),
+                    "cache_bytes": 10 * 1024_u64.pow(3),
+                    "config_bytes": 10 * 1024_u64.pow(3),
+                }),
+            )),
+        ),
+        ("legacy-storage-unknown", None),
+    ] {
+        let case_root = root.join(name);
+        std::fs::create_dir(&case_root)?;
+        let runtime = FakeRuntime::default();
+        let service = SandboxService::new(
+            runtime.clone(),
+            gascand::Store::open(case_root.join("state.db"))?,
+            Arc::new(NoopProvisioner),
+        );
+        let desired = spec(name, &case_root)?;
+        let volumes = volume_names(&runtime, desired.clone()).await?;
+        service.up(UpRequest::new(desired.clone())).await?;
+        let mut record = service.status(desired.id())?.ok_or("sandbox record")?;
+        record.storage_resolution = resolution;
+        service.store().put_sandbox(&record)?;
 
-    let before = runtime.calls().await.len();
-    let error = match service.apply(UpRequest::new(desired)).await {
-        Ok(_) => return Err("legacy storage resolution unexpectedly applied".into()),
-        Err(error) => error,
-    };
+        let before = runtime.calls().await.len();
+        for operation in ["up", "apply"] {
+            let result = match operation {
+                "up" => service.up(UpRequest::new(desired.clone())).await,
+                "apply" => service.apply(UpRequest::new(desired.clone())).await,
+                _ => unreachable!(),
+            };
+            let error = match result {
+                Ok(_) => return Err("legacy storage resolution unexpectedly succeeded".into()),
+                Err(error) => error,
+            };
+            assert_eq!(error.code(), "storage_layout_requires_recreate");
+            assert_eq!(
+                error.to_string(),
+                "managed storage layout changed; run `gascan destroy --yes` and then `gascan up`"
+            );
+            assert_eq!(runtime.calls().await.len(), before);
+        }
 
-    assert_eq!(error.code(), "storage_change_requires_recreate");
-    assert_eq!(runtime.calls().await.len(), before);
+        service.destroy(desired.id()).await?;
+        for volume in volumes {
+            assert!(!runtime.volume_exists(&volume).await);
+        }
+    }
     Ok(())
 }
 
@@ -1974,6 +2007,7 @@ async fn retained_setup_failure_persists_storage_and_up_retries_setup() -> TestR
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (digest.clone(), Vec::new(), 0),
             (Vec::new(), b"No space left on device".to_vec(), 28),
         ])
@@ -1998,6 +2032,7 @@ async fn retained_setup_failure_persists_storage_and_up_retries_setup() -> TestR
 
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
@@ -2045,6 +2080,7 @@ async fn retained_setup_failure_preserves_created_ssh_policy_for_changed_up() ->
     let digest = format!("{:x}  /workspace/setup.sh\n", Sha256::digest(setup)).into_bytes();
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
@@ -2114,6 +2150,7 @@ async fn retained_setup_failure_with_unchanged_ssh_retries_setup() -> TestResult
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
             (digest.clone(), Vec::new(), 0),
             (Vec::new(), b"No space left on device".to_vec(), 28),
         ])
@@ -2133,6 +2170,7 @@ async fn retained_setup_failure_with_unchanged_ssh_retries_setup() -> TestResult
         .await;
     runtime
         .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),
             (Vec::new(), Vec::new(), 0),

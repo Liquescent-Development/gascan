@@ -1,9 +1,10 @@
 use sha2::{Digest, Sha256};
 use std::{
     fs,
+    io::Write,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     time::{Duration, Instant},
 };
 
@@ -27,10 +28,39 @@ fn file_digest(path: &Path) -> String {
     format!("{:x}", Sha256::digest(fs::read(path).unwrap()))
 }
 
+fn configure_validator_dispatcher(command: &mut Command, fixture_manifest: &Path) {
+    let fixture_manifest = fs::canonicalize(fixture_manifest.parent().unwrap())
+        .unwrap()
+        .join(fixture_manifest.file_name().unwrap());
+    command
+        .env(
+            "GASCAN_GATE_TEST_CARGO_MANIFEST",
+            repository_root().join("scripts/Cargo.toml"),
+        )
+        .env("GASCAN_GATE_TEST_FIXTURE_CARGO_MANIFEST", fixture_manifest)
+        .env(
+            "GASCAN_GATE_TEST_VALIDATE_CONNECTED_BUILD",
+            env!("CARGO_BIN_EXE_validate-connected-build"),
+        )
+        .env(
+            "GASCAN_GATE_TEST_VALIDATE_CONTAINER_INVENTORY",
+            env!("CARGO_BIN_EXE_validate-container-inventory"),
+        )
+        .env(
+            "GASCAN_GATE_TEST_VALIDATE_OWNED_CONTAINER",
+            env!("CARGO_BIN_EXE_validate-owned-container"),
+        )
+        .env(
+            "GASCAN_GATE_TEST_VALIDATE_OWNED_VOLUME",
+            env!("CARGO_BIN_EXE_validate-owned-volume"),
+        );
+}
+
 struct Fixture {
     temp: tempfile::TempDir,
     root: PathBuf,
     calls: PathBuf,
+    path: std::ffi::OsString,
     command: Command,
 }
 
@@ -84,6 +114,34 @@ fn fixture() -> Fixture {
     .unwrap();
     let calls = temp.path().join("calls");
     executable(
+        &temp.path().join("cargo"),
+        r#"#!/bin/sh
+set -eu
+test "$#" -ge 9 || exit 64
+test "$1" = run || exit 64
+test "$2" = --quiet || exit 64
+test "$3" = --locked || exit 64
+test "$4" = --offline || exit 64
+test "$5" = --manifest-path || exit 64
+case "$6" in
+  "$GASCAN_GATE_TEST_CARGO_MANIFEST"|"$GASCAN_GATE_TEST_FIXTURE_CARGO_MANIFEST") ;;
+  *) exit 64 ;;
+esac
+test "$7" = --bin || exit 64
+bin=$8
+test "$9" = -- || exit 64
+shift 9
+case "$bin" in
+  validate-connected-build) executable=$GASCAN_GATE_TEST_VALIDATE_CONNECTED_BUILD ;;
+  validate-container-inventory) executable=$GASCAN_GATE_TEST_VALIDATE_CONTAINER_INVENTORY ;;
+  validate-owned-container) executable=$GASCAN_GATE_TEST_VALIDATE_OWNED_CONTAINER ;;
+  validate-owned-volume) executable=$GASCAN_GATE_TEST_VALIDATE_OWNED_VOLUME ;;
+  *) exit 64 ;;
+esac
+exec "$executable" "$@"
+"#,
+    );
+    executable(
         &root.join("scripts/prefetch-connected-workspace-image.sh"),
         "#!/bin/sh\nset -eu\nprintf 'prefetch\\n' >>\"$CALLS\"\n",
     );
@@ -125,20 +183,25 @@ fn fixture() -> Fixture {
     executable(
         &raw_container,
         &format!(
-            "#!/bin/sh\nset -eu\nprintf 'container:%s\\n' \"$*\" >>\"$CALLS\"\nif [ \"$1 ${{2:-}}\" = 'image inspect' ]; then [ $# -eq 3 ] || exit 93; expected=${{INSPECT_REFERENCE:-gascan-workspace:d4964500a3295a33}}; [ \"$3\" = \"$expected\" ] || {{ printf 'image not found\\n' >&2; exit 94; }}; [ \"${{IMAGE_AVAILABLE:-1}}\" = 1 ] || exit 94; platform=${{IMAGE_PLATFORM:-arm64}}; image_digest=${{IMAGE_DIGEST:-sha256:{DIGEST}}}; image_id=${{image_digest#sha256:}}; printf '[{{\"id\":\"%s\",\"configuration\":{{\"name\":\"%s\",\"descriptor\":{{\"digest\":\"%s\"}}}},\"variants\":[{{\"platform\":{{\"os\":\"linux\",\"architecture\":\"%s\"}},\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}]}}]\\n' \"$image_id\" \"$expected\" \"$image_digest\" \"$platform\"; exit 0; fi\nif [ \"$1\" = volume ]; then action=$2; shift 2; case \"$action\" in list) first=true; printf '['; for kind in tools cache config; do name=gascan-image-workstation-$kind-$OWNER; if [ -f \"$STATE/.volume-$name\" ]; then $first || printf ','; first=false; printf '{{\"id\":\"%s\"}}' \"$name\"; fi; done; printf ']\\n' ;; create) name=; for argument in \"$@\"; do name=$argument; done; touch \"$STATE/.volume-$name\" ;; inspect) name=$1; [ -f \"$STATE/.volume-$name\" ] || exit 1; count_file=\"$STATE/.volume-inspect-$name\"; count=0; [ ! -f \"$count_file\" ] || count=$(cat \"$count_file\"); count=$((count+1)); printf '%s' \"$count\" >\"$count_file\"; owner=$OWNER; [ \"${{FOREIGN_VOLUME:-}}\" = \"$name\" ] && owner=ffffffffffffffffffffffffffffffff; [ \"${{REPLACE_VOLUME_ON_SECOND_INSPECT:-}}\" = \"$name\" ] && [ \"$count\" -ge 2 ] && owner=ffffffffffffffffffffffffffffffff; printf '[{{\"id\":\"%s\",\"configuration\":{{\"name\":\"%s\",\"labels\":{{\"dev.gascan.test\":\"true\",\"dev.gascan.test.owner\":\"%s\"}}}}}}]\\n' \"$name\" \"$name\" \"$owner\" ;; delete) name=$1; [ \"${{FAIL_VOLUME_DELETE:-}}\" != \"$name\" ] || exit 1; rm -f \"$STATE/.volume-$name\" ;; esac; exit 0; fi\ncase \"$1\" in create) name=; image=; shift; while [ $# -gt 0 ]; do if [ \"$1\" = --name ]; then name=$2; shift 2; continue; fi; image=$1; shift; done; touch \"$STATE/$name\"; printf '%s' \"$image\" >\"$STATE/.image-$name\" ;; inspect) name=$2; [ \"${{RESIDUE:-}}\" = \"$name\" ] || [ -f \"$STATE/$name\" ] || exit 1; count_file=\"$STATE/.inspect-$name\"; count=0; [ ! -f \"$count_file\" ] || count=$(cat \"$count_file\"); count=$((count+1)); printf '%s' \"$count\" >\"$count_file\"; owner=$OWNER; [ \"${{FOREIGN:-}}\" = \"$name\" ] && owner=ffffffffffffffffffffffffffffffff; [ \"${{REPLACE_ON_SECOND_INSPECT:-}}\" = \"$name\" ] && [ \"$count\" -ge 2 ] && owner=ffffffffffffffffffffffffffffffff; image=${{CONTAINER_IMAGE_REFERENCE:-$(cat \"$STATE/.image-$name\" 2>/dev/null || printf 'gascan-workspace:d4964500a3295a33')}}; digest=${{CONTAINER_IMAGE_DIGEST:-sha256:{DIGEST}}}; printf '[{{\"id\":\"%s\",\"configuration\":{{\"id\":\"%s\",\"labels\":{{\"dev.gascan.test\":\"true\",\"dev.gascan.test.owner\":\"%s\"}},\"image\":{{\"descriptor\":{{\"digest\":\"%s\"}},\"reference\":\"%s\"}}}}}}]\\n' \"$name\" \"$name\" \"$owner\" \"$digest\" \"$image\" ;; exec) if [ \"${{FAIL_WORKSTATION_EXEC:-0}}\" = 1 ]; then case \"$*\" in *workstation-contract.sh*) exit 1 ;; esac; fi ;; stop) : ;; delete) name=${{@:$#}}; [ \"${{FAIL_DELETE:-}}\" != \"$name\" ] || exit 1; rm -f \"$STATE/$name\" \"$STATE/.image-$name\" ;; esac\n"
+            "#!/bin/sh\nset -eu\nprintf 'container:%s\\n' \"$*\" >>\"$CALLS\"\nif [ \"$1 ${{2:-}}\" = 'image inspect' ]; then [ $# -eq 3 ] || exit 93; expected=${{INSPECT_REFERENCE:-gascan-workspace:d4964500a3295a33}}; [ \"$3\" = \"$expected\" ] || {{ printf 'image not found\\n' >&2; exit 94; }}; [ \"${{IMAGE_AVAILABLE:-1}}\" = 1 ] || exit 94; platform=${{IMAGE_PLATFORM:-arm64}}; image_digest=${{IMAGE_DIGEST:-sha256:{DIGEST}}}; image_id=${{image_digest#sha256:}}; printf '[{{\"id\":\"%s\",\"configuration\":{{\"name\":\"%s\",\"descriptor\":{{\"digest\":\"%s\"}}}},\"variants\":[{{\"platform\":{{\"os\":\"linux\",\"architecture\":\"%s\"}},\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}]}}]\\n' \"$image_id\" \"$expected\" \"$image_digest\" \"$platform\"; exit 0; fi\nif [ \"$1\" = volume ]; then action=$2; shift 2; case \"$action\" in list) first=true; printf '['; for name in gascan-image-workstation-tools-$OWNER gascan-image-workstation-cache-$OWNER gascan-image-workstation-config-$OWNER gascan-image-polyglot-tools-$OWNER gascan-image-ssh-config-$OWNER; do if [ -f \"$STATE/.volume-$name\" ]; then $first || printf ','; first=false; printf '{{\"id\":\"%s\"}}' \"$name\"; fi; done; printf ']\\n' ;; create) name=; for argument in \"$@\"; do name=$argument; done; touch \"$STATE/.volume-$name\" ;; inspect) name=$1; [ -f \"$STATE/.volume-$name\" ] || exit 1; count_file=\"$STATE/.volume-inspect-$name\"; count=0; [ ! -f \"$count_file\" ] || count=$(cat \"$count_file\"); count=$((count+1)); printf '%s' \"$count\" >\"$count_file\"; owner=$OWNER; [ \"${{FOREIGN_VOLUME:-}}\" = \"$name\" ] && owner=ffffffffffffffffffffffffffffffff; [ \"${{FAIL_VOLUME_ATTESTATION_TWICE:-}}\" = \"$name\" ] && [ \"$count\" -le 2 ] && owner=ffffffffffffffffffffffffffffffff; [ \"${{REPLACE_VOLUME_ON_SECOND_INSPECT:-}}\" = \"$name\" ] && [ \"$count\" -ge 2 ] && owner=ffffffffffffffffffffffffffffffff; printf '[{{\"id\":\"%s\",\"configuration\":{{\"name\":\"%s\",\"labels\":{{\"dev.gascan.test\":\"true\",\"dev.gascan.test.owner\":\"%s\"}}}}}}]\\n' \"$name\" \"$name\" \"$owner\" ;; delete) name=$1; if [ \"${{FAIL_VOLUME_DELETE_ONCE:-}}\" = \"$name\" ] && [ ! -f \"$STATE/.volume-delete-failed-$name\" ]; then touch \"$STATE/.volume-delete-failed-$name\"; exit 1; fi; [ \"${{FAIL_VOLUME_DELETE:-}}\" != \"$name\" ] || exit 1; rm -f \"$STATE/.volume-$name\" ;; esac; exit 0; fi\ncase \"$1\" in create) name=; image=; shift; while [ $# -gt 0 ]; do if [ \"$1\" = --name ]; then name=$2; shift 2; continue; fi; image=$1; shift; done; touch \"$STATE/$name\"; printf '%s' \"$image\" >\"$STATE/.image-$name\" ;; inspect) name=$2; [ \"${{RESIDUE:-}}\" = \"$name\" ] || [ -f \"$STATE/$name\" ] || exit 1; count_file=\"$STATE/.inspect-$name\"; count=0; [ ! -f \"$count_file\" ] || count=$(cat \"$count_file\"); count=$((count+1)); printf '%s' \"$count\" >\"$count_file\"; owner=$OWNER; [ \"${{FOREIGN:-}}\" = \"$name\" ] && owner=ffffffffffffffffffffffffffffffff; [ \"${{REPLACE_ON_SECOND_INSPECT:-}}\" = \"$name\" ] && [ \"$count\" -ge 2 ] && owner=ffffffffffffffffffffffffffffffff; image=${{CONTAINER_IMAGE_REFERENCE:-$(cat \"$STATE/.image-$name\" 2>/dev/null || printf 'gascan-workspace:d4964500a3295a33')}}; digest=${{CONTAINER_IMAGE_DIGEST:-sha256:{DIGEST}}}; printf '[{{\"id\":\"%s\",\"configuration\":{{\"id\":\"%s\",\"labels\":{{\"dev.gascan.test\":\"true\",\"dev.gascan.test.owner\":\"%s\"}},\"image\":{{\"descriptor\":{{\"digest\":\"%s\"}},\"reference\":\"%s\"}}}}}}]\\n' \"$name\" \"$name\" \"$owner\" \"$digest\" \"$image\" ;; exec) if [ \"${{FAIL_WORKSTATION_EXEC:-0}}\" = 1 ]; then case \"$*\" in *workstation-contract.sh*) exit 1 ;; esac; fi ;; stop) : ;; delete) name=${{@:$#}}; [ \"${{FAIL_DELETE:-}}\" != \"$name\" ] || exit 1; rm -f \"$STATE/$name\" \"$STATE/.image-$name\" ;; esac\n"
         ),
     );
     let container = temp.path().join("container");
     executable(
         &container,
-        "#!/bin/sh\nset -eu\nif [ \"$1\" = list ]; then first=true; printf '['; for name in gascan-image-user-test-$OWNER gascan-image-polyglot-test-$OWNER gascan-image-gascamp-test-$OWNER; do if [ \"${RESIDUE:-}\" = \"$name\" ] || [ -f \"$STATE/$name\" ]; then $first || printf ','; first=false; printf '{\"id\":\"%s\",\"configuration\":{\"id\":\"%s\",\"labels\":{}}}' \"$name\" \"$name\"; fi; done; printf ']\\n'; exit 0; fi\nexec \"$RAW_CONTAINER\" \"$@\"\n",
+        "#!/bin/sh\nset -eu\nif [ \"$1\" = list ]; then first=true; printf '['; for name in gascan-image-user-test-$OWNER gascan-image-polyglot-test-$OWNER gascan-image-gascamp-test-$OWNER gascan-image-workstation-test-$OWNER gascan-image-ws-network-test-$OWNER gascan-image-ssh-test-$OWNER; do if [ \"${RESIDUE:-}\" = \"$name\" ] || [ -f \"$STATE/$name\" ]; then $first || printf ','; first=false; printf '{\"id\":\"%s\",\"configuration\":{\"id\":\"%s\",\"labels\":{}}}' \"$name\" \"$name\"; fi; done; printf ']\\n'; exit 0; fi\nexec \"$RAW_CONTAINER\" \"$@\"\n",
     );
     let state = temp.path().join("state");
     fs::create_dir(&state).unwrap();
     fs::write(state.join("unrelated-resource"), "foreign").unwrap();
     let mut command = Command::new("bash");
+    let path = std::env::join_paths(std::iter::once(temp.path().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
     command
         .arg(repository_root().join("scripts/run-connected-image-gate.sh"))
+        .env("PATH", &path)
         .env("GASCAN_GATE_TEST_ROOT", &root)
         .env("GASCAN_GATE_ARTIFACTS", root.join(".artifacts"))
         .env("GASCAN_TEST_OWNER_TOKEN", TOKEN)
@@ -146,14 +209,83 @@ fn fixture() -> Fixture {
         .env("CALLS", &calls)
         .env("STATE", &state)
         .env("OWNER", TOKEN)
-        .env("RAW_CONTAINER", &raw_container)
-        .env("CARGO_TARGET_DIR", repository_root().join("scripts/target"));
+        .env("RAW_CONTAINER", &raw_container);
+    configure_validator_dispatcher(&mut command, &root.join("scripts/Cargo.toml"));
     Fixture {
         temp,
         root,
         calls,
+        path,
         command,
     }
+}
+
+#[test]
+fn fixture_cargo_dispatcher_is_strict_and_preserves_validator_io() {
+    let f = fixture();
+    let cargo = f.temp.path().join("cargo");
+    let manifest = repository_root().join("scripts/Cargo.toml");
+    let name = "gascan-image-user-test-owner";
+    let token = TOKEN;
+    let inventory = format!(
+        r#"[{{"id":"{name}","configuration":{{"id":"{name}","labels":{{"dev.gascan.test":"true","dev.gascan.test.owner":"{token}"}}}}}}]"#
+    );
+    let mut valid = Command::new(&cargo);
+    valid
+        .args(["run", "--quiet", "--locked", "--offline", "--manifest-path"])
+        .arg(&manifest)
+        .args(["--bin", "validate-owned-container", "--", name, token])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_validator_dispatcher(&mut valid, &f.root.join("scripts/Cargo.toml"));
+    let mut child = valid.spawn().unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(inventory.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+
+    for invalid in [
+        &["check", "--quiet"][..],
+        &["run", "--verbose"][..],
+        &["run", "--quiet", "--locked"][..],
+    ] {
+        let mut command = Command::new(&cargo);
+        command.args(invalid);
+        configure_validator_dispatcher(&mut command, &f.root.join("scripts/Cargo.toml"));
+        assert_eq!(command.status().unwrap().code(), Some(64));
+    }
+    let mut unknown_bin = Command::new(&cargo);
+    unknown_bin
+        .args(["run", "--quiet", "--locked", "--offline", "--manifest-path"])
+        .arg(manifest)
+        .args(["--bin", "unknown-validator", "--"]);
+    configure_validator_dispatcher(&mut unknown_bin, &f.root.join("scripts/Cargo.toml"));
+    assert_eq!(unknown_bin.status().unwrap().code(), Some(64));
+
+    let mut unknown_manifest = Command::new(&cargo);
+    unknown_manifest.args([
+        "run",
+        "--quiet",
+        "--locked",
+        "--offline",
+        "--manifest-path",
+        "/tmp/foreign/Cargo.toml",
+        "--bin",
+        "validate-owned-container",
+        "--",
+    ]);
+    configure_validator_dispatcher(&mut unknown_manifest, &f.root.join("scripts/Cargo.toml"));
+    assert_eq!(unknown_manifest.status().unwrap().code(), Some(64));
 }
 
 fn seed_valid_receipt(f: &Fixture) {
@@ -175,6 +307,28 @@ fn seed_valid_receipt(f: &Fixture) {
         ),
     )
     .unwrap();
+}
+
+#[test]
+fn fixture_cargo_dispatcher_accepts_the_canonical_fixture_manifest() {
+    let f = fixture();
+    seed_valid_receipt(&f);
+    let artifacts = f.root.join(".artifacts");
+    let mut command = Command::new(f.root.join("scripts/validate-connected-image-receipt.sh"));
+    command
+        .args([
+            artifacts.join("workspace-image-ref"),
+            artifacts.join("workspace-image-build.json"),
+        ])
+        .env("PATH", &f.path)
+        .env("GASCAN_IMAGE_ARTIFACTS", &artifacts);
+    configure_validator_dispatcher(&mut command, &f.root.join("scripts/Cargo.toml"));
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn seed_valid_ghcr_receipt(f: &Fixture) -> String {
@@ -244,16 +398,25 @@ fn repository_receipt_validator_is_executable() {
 fn workstation_smoke_initializes_the_mounted_home_before_contract_checks() {
     let smoke =
         fs::read_to_string(repository_root().join("tests/image/workstation-smoke.sh")).unwrap();
-    let initialize = smoke
+    let initialize_rust = smoke
+        .find("/usr/local/bin/initialize-rust-home")
+        .expect("workstation smoke must seed the mounted Rust home");
+    let initialize_workstation = smoke
         .find("/usr/local/bin/configure-workstation-home")
         .expect("workstation smoke must initialize image-owned home defaults");
     let contract = smoke
         .find("/opt/gascan/tests/workstation-contract.sh")
         .expect("workstation smoke must run the image contract");
     assert!(
-        initialize < contract,
+        initialize_rust < initialize_workstation && initialize_workstation < contract,
         "mounted workstation home must be initialized before its contract is checked"
     );
+    for rust_command in ["cargo run --manifest-path", "cargo install --path"] {
+        assert!(
+            initialize_rust < smoke.find(rust_command).expect("missing Rust write smoke"),
+            "Rust command ran before the writable Rust home was seeded: {rust_command}"
+        );
+    }
 }
 
 #[test]
@@ -457,25 +620,67 @@ fn workstation_contract_is_wired_into_the_release_blocking_gate() {
         "host smoke must invoke the immutable guest contract"
     );
     for required in [
-        "--volume \"$tools_volume:/home/workspace/.local/share/mise\"",
+        "--volume \"$tools_volume:/home/workspace/.local\"",
         "--volume \"$cache_volume:/home/workspace/.cache\"",
-        "--volume \"$config_volume:/home/workspace/.config/gascan\"",
+        "--volume \"$config_volume:/home/workspace/.config\"",
+        "--env CARGO_HOME=/home/workspace/.local/share/cargo",
+        "--env RUSTUP_HOME=/home/workspace/.local/share/rustup",
+        "--env GOBIN=/home/workspace/.local/bin",
         "--env MISE_DATA_DIR=/home/workspace/.local/share/mise",
         "--env MISE_SYSTEM_DATA_DIR=/opt/gascan/mise",
         "--env MISE_CACHE_DIR=/home/workspace/.cache/mise",
         "--env MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
         "--bin validate-owned-volume",
+        "--bin validate-container-inventory",
+        "bounded_container volume inspect \"$volume\" |\n    cargo run --quiet --locked --offline",
         "bounded_container volume delete \"$volume\"",
+        "offline_verified=false",
+        "network_verified=false",
+        "container_inventory_proves_absent",
+        "refusing cleanup of unattested container",
     ] {
         assert!(
             smoke.contains(required),
             "workstation smoke omitted production topology or owner-scoped cleanup: {required}"
         );
     }
+    for command in [
+        "cargo run --manifest-path \"$fixture/rust-app/Cargo.toml\"",
+        "cargo install --path \"$fixture/rust-bin\"",
+        "npm pack \"$fixture/npm-bin\" --pack-destination \"$fixture\"",
+        "npm install --global \"$fixture/gascan-npm-local-1.0.0.tgz\"",
+        "\"$fixture/go.mod\"",
+        "cd \"$fixture\" && go install ./go-bin",
+        "python -m zipfile -c ../gascan_python_local-0.1.0-py3-none-any.whl",
+        "\"$fixture/gascan_python_local-0.1.0-py3-none-any.whl\"",
+        "gem build gascan-ruby-local.gemspec --output ../ruby-bin.gem",
+        "gem install --local \"$fixture/ruby-bin.gem\"",
+        "cfg-if = \\\"=1.0.4\\\"",
+        "rustup component add rust-src",
+        "rustup component list --installed",
+    ] {
+        assert!(
+            smoke.contains(command),
+            "workstation smoke omitted writable package-manager proof: {command}"
+        );
+    }
+    assert!(
+        smoke.contains("network_name=\"gascan-image-ws-network-test-$owner_token\""),
+        "workstation network name must remain within Apple container's 64-character limit"
+    );
     assert!(
         !smoke.contains("type=bind"),
         "credential-free workstation smoke must not mount the host checkout"
     );
+    for forbidden in [
+        "inspect=$(bounded_container volume inspect",
+        "\"$fixture/go-bin/go.mod\"",
+    ] {
+        assert!(
+            !smoke.contains(forbidden),
+            "workstation smoke retained unsafe or invalid fixture wiring: {forbidden}"
+        );
+    }
     for command in [
         "vim --version",
         "nvim --version",
@@ -530,8 +735,8 @@ fn workstation_contract_is_wired_into_the_release_blocking_gate() {
     }
     for boundary in [
         "--network none",
-        "/home/workspace/.local/share/mise",
-        "/home/workspace/.config/gascan",
+        "/home/workspace/.local",
+        "/home/workspace/.config",
         "/home/workspace/.cache",
         "/var/run/docker.sock",
         "/Library/Keychains",
@@ -948,6 +1153,123 @@ fn workstation_volume_delete_failure_is_detected_by_exact_inventory_and_never_pu
     let calls = fs::read_to_string(&f.calls).unwrap();
     assert!(calls.contains(&format!("container:volume delete {name}")));
     assert!(calls.contains("container:volume list --format json"));
+    assert_no_publications(&f);
+}
+
+#[test]
+fn polyglot_volume_is_recovered_after_local_delete_failure() {
+    let mut f = fixture();
+    seed_valid_receipt(&f);
+    let name = format!("gascan-image-polyglot-tools-{TOKEN}");
+    let output = f
+        .command
+        .env("FAIL_VOLUME_DELETE_ONCE", &name)
+        .arg("--prebuilt")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let calls = fs::read_to_string(&f.calls).unwrap();
+    assert!(
+        calls
+            .matches(&format!("container:volume delete {name}"))
+            .count()
+            >= 2,
+        "outer cleanup did not retry the locally stranded polyglot volume"
+    );
+    assert!(!f.temp.path().join("state").join(format!(".volume-{name}")).exists());
+    assert_no_publications(&f);
+}
+
+#[test]
+fn polyglot_volume_is_recovered_after_local_attestation_failure() {
+    let mut f = fixture();
+    seed_valid_receipt(&f);
+    let name = format!("gascan-image-polyglot-tools-{TOKEN}");
+    let output = f
+        .command
+        .env("FAIL_VOLUME_ATTESTATION_TWICE", &name)
+        .arg("--prebuilt")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let calls = fs::read_to_string(&f.calls).unwrap();
+    assert!(calls.contains(&format!("container:volume delete {name}")));
+    assert!(!f.temp.path().join("state").join(format!(".volume-{name}")).exists());
+    assert_no_publications(&f);
+}
+
+#[test]
+fn ssh_volume_is_recovered_after_smoke_failure() {
+    let mut f = fixture();
+    seed_valid_receipt(&f);
+    let name = format!("gascan-image-ssh-config-{TOKEN}");
+    fs::write(
+        f.temp
+            .path()
+            .join("state")
+            .join(format!(".volume-{name}")),
+        "",
+    )
+    .unwrap();
+    let output = f
+        .command
+        .env("FAIL_SMOKE", "ssh-contract.sh")
+        .arg("--prebuilt")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let calls = fs::read_to_string(&f.calls).unwrap();
+    assert!(calls.contains(&format!("container:volume delete {name}")));
+    assert!(!f.temp.path().join("state").join(format!(".volume-{name}")).exists());
+    assert_no_publications(&f);
+}
+
+#[test]
+fn network_image_attestation_failure_is_recovered_without_silent_residue() {
+    let mut f = fixture();
+    seed_valid_receipt(&f);
+    let name = format!("gascan-image-ws-network-test-{TOKEN}");
+    let real_raw = f.temp.path().join("container-raw");
+    let mismatch = f.temp.path().join("container-network-image-mismatch");
+    executable(
+        &mismatch,
+        "#!/bin/sh\nset -eu\nif [ \"$1\" = inspect ] && [ \"$2\" = \"gascan-image-ws-network-test-$OWNER\" ]; then\n  \"$REAL_RAW_CONTAINER\" \"$@\" | sed 's/sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc/g'\n  exit 0\nfi\nexec \"$REAL_RAW_CONTAINER\" \"$@\"\n",
+    );
+    let output = f
+        .command
+        .env("RAW_CONTAINER", &mismatch)
+        .env("REAL_RAW_CONTAINER", &real_raw)
+        .arg("--prebuilt")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let calls = fs::read_to_string(&f.calls).unwrap();
+    assert!(calls.contains(&format!("create --name {name} ")));
+    assert!(calls.contains(&format!("stop --time 5 {name}")));
+    assert!(calls.contains(&format!("delete {name}")));
+    assert!(!f.temp.path().join("state").join(&name).exists());
+    assert_no_publications(&f);
+}
+
+#[test]
+fn foreign_network_attestation_failure_is_visible_and_never_deleted() {
+    let mut f = fixture();
+    seed_valid_receipt(&f);
+    let name = format!("gascan-image-ws-network-test-{TOKEN}");
+    assert!(
+        !f.command
+            .env("FOREIGN", &name)
+            .arg("--prebuilt")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let calls = fs::read_to_string(&f.calls).unwrap();
+    assert!(calls.contains(&format!("create --name {name} ")));
+    assert!(calls.contains(&format!("inspect {name}")));
+    assert!(!calls.contains(&format!("stop --time 5 {name}")));
+    assert!(!calls.contains(&format!("delete {name}")));
+    assert!(f.temp.path().join("state").join(&name).exists());
     assert_no_publications(&f);
 }
 

@@ -3,6 +3,8 @@ use std::{
     process::{Command, Stdio},
 };
 
+const MAX_VOLUME_INSPECT_BYTES: usize = 64 * 1024;
+
 fn validate(json: &str, name: &str, token: &str) -> std::process::Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_validate-owned-volume"))
         .args([name, token])
@@ -36,4 +38,28 @@ fn exact_volume_identity_and_owner_labels_are_required() {
     ] {
         assert!(!validate(&malformed, name, token).status.success());
     }
+}
+
+#[test]
+fn oversized_inspect_output_is_rejected_before_json_parsing() {
+    let name = "gascan-image-workstation-tools-00112233445566778899aabbccddeeff";
+    let token = "00112233445566778899aabbccddeeff";
+    let exact = format!(
+        r#"[{{"id":"{name}","configuration":{{"name":"{name}","labels":{{"dev.gascan.test":"true","dev.gascan.test.owner":"{token}"}}}}}}]"#
+    );
+    let oversized = format!(
+        "{exact}{}",
+        " ".repeat(MAX_VOLUME_INSPECT_BYTES + 1 - exact.len())
+    );
+
+    let output = validate(&oversized, name, token);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "oversized inspect output unexpectedly passed validation"
+    );
+    assert!(
+        stderr.contains("volume inspect exceeds 65536-byte limit"),
+        "oversized inspect output was not rejected by the byte limit: {stderr}"
+    );
 }

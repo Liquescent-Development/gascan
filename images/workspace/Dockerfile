@@ -84,6 +84,7 @@ COPY --chmod=0555 images/workspace/tests/ssh-contract.sh /opt/gascan/tests/ssh-c
 COPY --chmod=0555 images/workspace/bin/install-workstation-artifacts /usr/local/bin/install-workstation-artifacts
 COPY --chmod=0555 images/workspace/bin/run-workstation-step /usr/local/bin/run-workstation-step
 COPY --chmod=0555 images/workspace/bin/configure-workstation-home /usr/local/bin/configure-workstation-home
+COPY --chmod=0555 images/workspace/bin/initialize-rust-home /usr/local/bin/initialize-rust-home
 COPY --chmod=0444 images/workspace/versions.lock /tmp/versions.lock
 COPY workstation /tmp/workstation
 
@@ -92,7 +93,8 @@ RUN --network=none test -x /opt/gascan/gascamp/bin/camp \
     && test -L /opt/gascan/gascamp/bin/campd \
     && test "$(cat /opt/gascan/gascamp/REVISION)" = "$GASCAMP_REVISION" \
     && /usr/local/bin/migrate-workspace-identity \
-    && chown workspace:workspace /opt/gascan/mise \
+    && chown -R root:root /opt/gascan/mise \
+    && chmod -R a-w /opt/gascan/mise \
     && /usr/local/bin/run-workstation-step test-directory-mode \
        chmod 0555 /opt/gascan/tests \
     && PATH="/opt/gascan/mise/shims:$PATH" /usr/local/bin/run-workstation-step installer \
@@ -107,16 +109,20 @@ RUN --network=none test -x /opt/gascan/gascamp/bin/camp \
     && /usr/local/bin/run-workstation-step immutable-ownership \
        sh -c 'test -z "$(find /opt/gascan/workstation \( ! -user root -o ! -group root \) -print -quit)"' \
     && /usr/local/bin/run-workstation-step home-directories \
-       install -d -o workspace -g workspace \
-       /workspace \
-       /home/workspace/.local/share/mise \
-       /home/workspace/.local/state \
-       /home/workspace/.cache \
-       /home/workspace/.config/gascan \
+       sh -c 'install -d -o workspace -g workspace /workspace; \
+       install -d -o workspace -g workspace -m 0700 \
+       /home/workspace/.local /home/workspace/.cache; \
+       install -d -o root -g workspace -m 1770 /home/workspace/.config' \
     && /usr/local/bin/run-workstation-step home-configuration \
-       env HOME=/home/workspace /usr/local/bin/configure-workstation-home \
-    && /usr/local/bin/run-workstation-step home-owner \
-       chown -R workspace:workspace /home/workspace/.cache /home/workspace/.config/gascan \
+       sudo -n -u workspace env HOME=/home/workspace /usr/local/bin/configure-workstation-home \
+    && /usr/local/bin/run-workstation-step gascan-config-boundary \
+       sh -c 'chown root:workspace /home/workspace/.config/gascan; \
+       chmod 1770 /home/workspace/.config/gascan; \
+       sudo -n -u workspace install -d -m 0700 /home/workspace/.config/.workspace-probe; \
+       test -d /home/workspace/.config/.workspace-probe; \
+       if sudo -n -u workspace mv /home/workspace/.config/gascan \
+         /home/workspace/.config/gascan.moved 2>/dev/null; then exit 1; fi; \
+       rm -rf /home/workspace/.config/.workspace-probe' \
     && /usr/local/bin/run-workstation-step home-link-owner \
        chown -h workspace:workspace \
        /home/workspace/.claude \
@@ -144,7 +150,30 @@ RUN --network=none test -x /opt/gascan/gascamp/bin/camp \
        sh -c 'rm -rf /tmp/workstation /tmp/versions.lock; rm -f /usr/local/bin/run-workstation-step'
 
 ENV HOME=/home/workspace
+ENV XDG_DATA_HOME=/home/workspace/.local/share
+ENV XDG_CACHE_HOME=/home/workspace/.cache
+ENV XDG_CONFIG_HOME=/home/workspace/.config
+ENV MISE_DATA_DIR=/home/workspace/.local/share/mise
 ENV MISE_CACHE_DIR=/home/workspace/.cache/mise
+ENV MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml
+ENV MISE_SYSTEM_CONFIG_FILE=/etc/mise/config.toml
+ENV MISE_STATE_DIR=/home/workspace/.config/gascan/mise-state
+ENV MISE_SYSTEM_DATA_DIR=/opt/gascan/mise
+ENV CARGO_HOME=/home/workspace/.local/share/cargo
+ENV MISE_CARGO_HOME=/home/workspace/.local/share/cargo
+ENV RUSTUP_HOME=/home/workspace/.local/share/rustup
+ENV MISE_RUSTUP_HOME=/home/workspace/.local/share/rustup
+ENV NPM_CONFIG_PREFIX=/home/workspace/.local
+ENV NPM_CONFIG_CACHE=/home/workspace/.cache/npm
+ENV GOPATH=/home/workspace/.local/share/go
+ENV GOBIN=/home/workspace/.local/bin
+ENV GOCACHE=/home/workspace/.cache/go-build
+ENV GOMODCACHE=/home/workspace/.cache/go-mod
+ENV PYTHONUSERBASE=/home/workspace/.local
+ENV GEM_HOME=/home/workspace/.local/share/gem
+ENV MIX_HOME=/home/workspace/.local/share/mix
+ENV HEX_HOME=/home/workspace/.local/share/hex
+ENV REBAR_CACHE_DIR=/home/workspace/.cache/rebar3
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/opt/gascan/chromium/chrome-linux/chrome
 ENV CLAUDE_CONFIG_DIR=/home/workspace/.config/gascan/agents/claude
 ENV CODEX_HOME=/home/workspace/.config/gascan/agents/codex
@@ -153,8 +182,8 @@ ENV PI_CODING_AGENT_SESSION_DIR=/home/workspace/.cache/pi
 ENV HERDR_CONFIG_PATH=/home/workspace/.config/gascan/herdr/config.toml
 ENV GH_CONFIG_DIR=/home/workspace/.config/gascan/gh
 ENV GLAB_CONFIG_DIR=/home/workspace/.config/gascan/glab
-ENV PATH=/opt/gascan/mise/shims:/usr/local/bin:/opt/gascan/workstation/bin:${PATH}
+ENV PATH=/home/workspace/.local/bin:/home/workspace/.local/share/cargo/bin:/home/workspace/.local/share/go/bin:/home/workspace/.local/share/gem/bin:/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/opt/gascan/workstation/bin:/usr/sbin:/usr/bin:/sbin:/bin
 USER workspace:workspace
 WORKDIR /workspace
-VOLUME ["/home/workspace/.local/share/mise", "/home/workspace/.cache", "/home/workspace/.config/gascan"]
+VOLUME ["/home/workspace/.local", "/home/workspace/.cache", "/home/workspace/.config"]
 ENTRYPOINT ["/usr/local/bin/gascan-entrypoint"]

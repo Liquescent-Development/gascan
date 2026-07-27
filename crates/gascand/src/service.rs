@@ -18,8 +18,9 @@ use camino::{Utf8Path, Utf8PathBuf};
 use gascan_core::doctor::{DoctorFact, DoctorFacts, DoctorReport, DoctorStatus};
 use gascan_core::manifest::ManifestError;
 use gascan_core::policy::{
-    CONTAINER_PATH, ControlPlanePolicy, MISE_CACHE_DIR, MISE_DATA_DIR, MISE_GLOBAL_CONFIG_FILE,
-    MISE_SYSTEM_DATA_DIR, PolicyCompiler, PolicyError, WORKSPACE_HOME,
+    CACHE_ROOT, CARGO_HOME, CONFIG_ROOT, ControlPlanePolicy, MISE_GLOBAL_CONFIG_FILE,
+    MISE_SYSTEM_CONFIG_FILE, PolicyCompiler, PolicyError, RUSTUP_HOME, TOOLS_ROOT, WORKSPACE_HOME,
+    workspace_environment,
 };
 use gascan_core::provision::{
     AppliedState, ProvisionPlan, ProvisionStep, ProvisioningPlanner, SetupScript,
@@ -44,6 +45,7 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc};
 const SAFE_MISE_WORKDIR: &str = "/home/workspace/.config/gascan/mise-workdir";
 const MAX_PROVISION_STDOUT_BYTES: usize = 1024 * 1024;
 const MAX_PROVISION_STDERR_TAIL_BYTES: usize = 64 * 1024;
+const STORAGE_LAYOUT_VERSION: u32 = 2;
 
 struct GuestExecOutcome {
     stdout: Vec<u8>,
@@ -160,6 +162,12 @@ struct MiseToolRecord {
     version: String,
     installed: bool,
     active: bool,
+    source: MiseToolSource,
+}
+
+#[derive(Deserialize)]
+struct MiseToolSource {
+    path: String,
 }
 
 struct MiseInventory(BTreeMap<String, Vec<MiseToolRecord>>);
@@ -338,6 +346,8 @@ pub enum ServiceError {
     Missing(SandboxId),
     #[error("sandbox {0} is not owned by gascan")]
     Ownership(SandboxId),
+    #[error("managed storage layout changed; run `gascan destroy --yes` and then `gascan up`")]
+    StorageLayoutRequiresRecreate { recorded: Option<u32> },
     #[error("{}", format_storage_change_message(changes))]
     StorageChangeRequiresRecreate { changes: Vec<StorageCapacityChange> },
     #[error(
@@ -1046,16 +1056,22 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let id = request.spec.id().clone();
         let lock = self.keyed_lock(&id)?;
         let _guard = lock.lock().await;
-        let capabilities = self.runtime_capabilities().await?;
-        let create = self.compile_policy(request.spec.clone(), capabilities, None)?;
-        let requested_ssh_transport = requested_ssh_transport(&request.spec);
-        let requested_storage = requested_storage(&create)?;
         let existing = self
             .database({
                 let id = id.clone();
                 move |store| store.sandbox(&id)
             })
             .await?;
+        if let Some(prior) = existing
+            .as_ref()
+            .filter(|record| record.actual_state != ActualState::Absent)
+        {
+            validate_storage_layout(prior)?;
+        }
+        let capabilities = self.runtime_capabilities().await?;
+        let create = self.compile_policy(request.spec.clone(), capabilities, None)?;
+        let requested_ssh_transport = requested_ssh_transport(&request.spec);
+        let requested_storage = requested_storage(&create)?;
         let prior_ssh_transport = self
             .database({
                 let id = id.clone();
@@ -1480,10 +1496,11 @@ impl<B: RuntimeBackend> SandboxService<B> {
         operation_id: OperationId,
         sender: &mpsc::Sender<OperationEvent>,
     ) -> Result<ProvisionedResolution, ServiceError> {
+        self.initialize_managed_volume_roots(spec, operation_id, sender)
+            .await?;
         let plan =
             ProvisioningPlanner::plan_for_root(spec.canonical_root(), spec.manifest(), &applied)
                 .map_err(|_| ServiceError::Provision("could not plan provisioning".to_owned()))?;
-        self.initialize_managed_volume_roots(spec).await?;
         let resolved_tools = if plan.tools_changed() {
             Some(
                 self.install_tools(spec, &plan, operation_id, sender)
@@ -2038,6 +2055,8 @@ impl<B: RuntimeBackend> SandboxService<B> {
     async fn initialize_managed_volume_roots(
         &self,
         spec: &SandboxSpec,
+        operation_id: OperationId,
+        sender: &mpsc::Sender<OperationEvent>,
     ) -> Result<(), ServiceError> {
         self.exec_guest(
             spec.id(),
@@ -2054,8 +2073,8 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 "workspace",
                 "-m",
                 "0700",
-                MISE_DATA_DIR,
-                "/home/workspace/.cache",
+                TOOLS_ROOT,
+                CACHE_ROOT,
             ],
             Vec::new(),
         )
@@ -2075,7 +2094,23 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 "workspace",
                 "-m",
                 "1770",
-                "/home/workspace/.config/gascan",
+                CONFIG_ROOT,
+            ],
+            Vec::new(),
+        )
+        .await?;
+        self.emit_provision_step(operation_id, ProvisionStep::InitializeRuntimeHome, sender)
+            .await?;
+        self.exec_guest(
+            spec.id(),
+            ProvisionStep::InitializeRuntimeHome,
+            "initialize_rust_home",
+            [
+                "/usr/bin/env".to_owned(),
+                format!("HOME={WORKSPACE_HOME}"),
+                format!("CARGO_HOME={CARGO_HOME}"),
+                format!("RUSTUP_HOME={RUSTUP_HOME}"),
+                "/usr/local/bin/initialize-rust-home".to_owned(),
             ],
             Vec::new(),
         )
@@ -2471,12 +2506,6 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let id = request.spec.id().clone();
         let lock = self.keyed_lock(&id)?;
         let _guard = lock.lock().await;
-        let capabilities = self.runtime_capabilities().await?;
-        let prepared_ssh = self.prepare_ssh_create(&request.spec).await?;
-        let create =
-            self.compile_policy(request.spec.clone(), capabilities, prepared_ssh.as_ref())?;
-        let requested_ssh_transport = requested_ssh_transport(&request.spec);
-        let requested_storage = requested_storage(&create)?;
         let mut record = self
             .database({
                 let id = id.clone();
@@ -2484,13 +2513,24 @@ impl<B: RuntimeBackend> SandboxService<B> {
             })
             .await?
             .ok_or_else(|| ServiceError::Missing(id.clone()))?;
+        if record.actual_state != ActualState::Absent {
+            validate_storage_layout(&record)?;
+        }
+        let capabilities = self.runtime_capabilities().await?;
+        let prepared_ssh = self.prepare_ssh_create(&request.spec).await?;
+        let create =
+            self.compile_policy(request.spec.clone(), capabilities, prepared_ssh.as_ref())?;
+        let requested_ssh_transport = requested_ssh_transport(&request.spec);
+        let requested_storage = requested_storage(&create)?;
         let prior_ssh_transport = self
             .database({
                 let id = id.clone();
                 move |store| store.ssh_transport_policy(&id)
             })
             .await?;
-        validate_storage_capacities(&record, requested_storage)?;
+        if record.actual_state != ActualState::Absent {
+            validate_storage_capacities(&record, requested_storage)?;
+        }
         let desired_fingerprint = desired_fingerprint(&request.spec).await?;
         let desired_plan = ProvisioningPlanner::plan_for_root(
             request.spec.canonical_root(),
@@ -3382,6 +3422,9 @@ impl ServiceError {
             Self::Policy(error) => error.code(),
             Self::Missing(_) => "not_found",
             Self::Ownership(_) => "ownership_mismatch",
+            Self::StorageLayoutRequiresRecreate { .. } => {
+                gascan_proto::error_code::STORAGE_LAYOUT_REQUIRES_RECREATE
+            }
             Self::StorageChangeRequiresRecreate { .. } => "storage_change_requires_recreate",
             Self::ImageUpgradeRequired { .. } => gascan_proto::error_code::IMAGE_UPGRADE_REQUIRED,
             Self::StorageInvariant(_) => "storage_invariant_failed",
@@ -3469,6 +3512,14 @@ impl ServiceError {
 }
 
 pub(crate) fn failure_details(error: &ServiceError) -> Value {
+    if let ServiceError::StorageLayoutRequiresRecreate { recorded } = error {
+        return json!({
+            "reason": "storage_layout_changed",
+            "recorded_layout": recorded,
+            "requested_layout": STORAGE_LAYOUT_VERSION,
+            "recovery": "run `gascan destroy --yes` and then `gascan up`",
+        });
+    }
     if let ServiceError::StorageChangeRequiresRecreate { changes } = error {
         json!({
             "message": error.to_string(),
@@ -3565,7 +3616,7 @@ type StorageCapacities = [(&'static str, u64); 3];
 
 fn storage_resolution(requested: StorageCapacities) -> StorageResolution {
     StorageResolution::new(
-        1,
+        STORAGE_LAYOUT_VERSION,
         json!({
             "tools_bytes": requested[0].1,
             "cache_bytes": requested[1].1,
@@ -3578,15 +3629,16 @@ fn validate_storage_capacities(
     record: &SandboxRecord,
     requested: StorageCapacities,
 ) -> Result<(), ServiceError> {
-    let recorded = record
-        .storage_resolution
-        .as_ref()
-        .filter(|resolution| resolution.version == 1);
+    validate_storage_layout(record)?;
+    let Some(recorded) = record.storage_resolution.as_ref() else {
+        return Err(ServiceError::StorageLayoutRequiresRecreate { recorded: None });
+    };
     let changes = requested
         .into_iter()
         .filter_map(|(volume, requested_bytes)| {
             let recorded_bytes = recorded
-                .and_then(|resolution| resolution.details.get(format!("{volume}_bytes")))
+                .details
+                .get(format!("{volume}_bytes"))
                 .and_then(Value::as_u64);
             (recorded_bytes != Some(requested_bytes)).then_some(StorageCapacityChange {
                 volume,
@@ -3602,6 +3654,18 @@ fn validate_storage_capacities(
     }
 }
 
+fn validate_storage_layout(record: &SandboxRecord) -> Result<(), ServiceError> {
+    let recorded = record
+        .storage_resolution
+        .as_ref()
+        .map(|resolution| resolution.version);
+    if recorded == Some(STORAGE_LAYOUT_VERSION) {
+        Ok(())
+    } else {
+        Err(ServiceError::StorageLayoutRequiresRecreate { recorded })
+    }
+}
+
 fn requested_storage(create: &CreateRequest) -> Result<StorageCapacities, ServiceError> {
     requested_storage_from_volumes(create.volumes())
 }
@@ -3610,9 +3674,9 @@ fn requested_storage_from_volumes(
     volumes: &[gascan_core::runtime::RuntimeVolume],
 ) -> Result<StorageCapacities, ServiceError> {
     [
-        ("tools", "/home/workspace/.local/share/mise"),
-        ("cache", "/home/workspace/.cache"),
-        ("config", "/home/workspace/.config/gascan"),
+        ("tools", TOOLS_ROOT),
+        ("cache", CACHE_ROOT),
+        ("config", CONFIG_ROOT),
     ]
     .into_iter()
     .map(|(volume, target)| {
@@ -3897,22 +3961,27 @@ fn sanitize_provision_stderr(bytes: &[u8]) -> String {
 }
 
 fn mise_command(args: &[&str]) -> Vec<String> {
-    let mut argv = vec![
-        "/usr/bin/env".to_owned(),
-        format!("HOME={WORKSPACE_HOME}"),
-        format!("MISE_CACHE_DIR={MISE_CACHE_DIR}"),
-        format!("MISE_CEILING_PATHS={SAFE_MISE_WORKDIR}"),
-        format!("MISE_DATA_DIR={MISE_DATA_DIR}"),
-        format!("MISE_GLOBAL_CONFIG_FILE={MISE_GLOBAL_CONFIG_FILE}"),
-        format!("MISE_SYSTEM_CONFIG_FILE={MISE_GLOBAL_CONFIG_FILE}"),
-        format!("MISE_SYSTEM_DATA_DIR={MISE_SYSTEM_DATA_DIR}"),
-        format!("PATH={CONTAINER_PATH}"),
+    let mut environment = workspace_environment();
+    let home = environment
+        .remove("HOME")
+        .unwrap_or_else(|| WORKSPACE_HOME.to_owned());
+    environment.insert(
+        "MISE_CEILING_PATHS".to_owned(),
+        SAFE_MISE_WORKDIR.to_owned(),
+    );
+    let mut argv = vec!["/usr/bin/env".to_owned(), format!("HOME={home}")];
+    argv.extend(
+        environment
+            .into_iter()
+            .map(|(name, value)| format!("{name}={value}")),
+    );
+    argv.extend([
         "/usr/local/bin/mise".to_owned(),
         "--cd".to_owned(),
         SAFE_MISE_WORKDIR.to_owned(),
         "--no-env".to_owned(),
         "--no-hooks".to_owned(),
-    ];
+    ]);
     argv.extend(args.iter().map(|arg| (*arg).to_owned()));
     argv
 }
@@ -3941,31 +4010,41 @@ fn parse_mise_versions(
 ) -> Result<BTreeMap<String, String>, ServiceError> {
     let MiseInventory(records) = serde_json::from_slice(output)
         .map_err(|_| ServiceError::Provision("invalid mise tool inventory".to_owned()))?;
-    if !records.keys().eq(desired.keys()) {
+    let mut resolved = BTreeMap::new();
+    for (tool, records) in records {
+        let [record] = records.as_slice() else {
+            return Err(ServiceError::Provision(
+                "mise returned an invalid tool record".to_owned(),
+            ));
+        };
+        if !record.installed
+            || !record.active
+            || record.version.trim().is_empty()
+            || record.version.chars().any(char::is_control)
+        {
+            return Err(ServiceError::Provision(
+                "mise returned an invalid tool record".to_owned(),
+            ));
+        }
+        if desired.contains_key(&tool) {
+            if record.source.path != MISE_GLOBAL_CONFIG_FILE {
+                return Err(ServiceError::Provision(
+                    "mise returned an unexpected tool set".to_owned(),
+                ));
+            }
+            resolved.insert(tool, record.version.clone());
+        } else if record.source.path != MISE_SYSTEM_CONFIG_FILE {
+            return Err(ServiceError::Provision(
+                "mise returned an unexpected tool set".to_owned(),
+            ));
+        }
+    }
+    if !resolved.keys().eq(desired.keys()) {
         return Err(ServiceError::Provision(
             "mise returned an unexpected tool set".to_owned(),
         ));
     }
-    records
-        .into_iter()
-        .map(|(tool, records)| {
-            let [record] = records.as_slice() else {
-                return Err(ServiceError::Provision(
-                    "mise returned an invalid tool record".to_owned(),
-                ));
-            };
-            if !record.installed
-                || !record.active
-                || record.version.trim().is_empty()
-                || record.version.chars().any(char::is_control)
-            {
-                return Err(ServiceError::Provision(
-                    "mise returned an invalid tool record".to_owned(),
-                ));
-            }
-            Ok((tool, record.version.clone()))
-        })
-        .collect()
+    Ok(resolved)
 }
 
 fn resolution_matches(record: &SandboxRecord, fingerprint: &str) -> bool {
@@ -4048,7 +4127,7 @@ async fn desired_fingerprint(spec: &SandboxSpec) -> Result<String, ServiceError>
 mod storage_tests {
     use super::{
         BoundedTail, NoopProvisioner, SandboxService, ServiceError, Store,
-        image_replacement_failure_details, requested_storage_from_volumes,
+        image_replacement_failure_details, parse_mise_versions, requested_storage_from_volumes,
     };
     use camino::Utf8Path;
     use gascan_core::fake_runtime::FakeRuntime;
@@ -4056,6 +4135,7 @@ mod storage_tests {
     use gascan_core::policy::PolicyCompiler;
     use gascan_core::runtime::{RuntimeBackend, RuntimeCall};
     use gascan_core::sandbox::SandboxSpec;
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     #[test]
@@ -4104,6 +4184,66 @@ mod storage_tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn mise_inventory_retains_requested_tools_and_accepts_only_immutable_system_defaults()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let desired = BTreeMap::from([("node".to_owned(), "25.0.0".to_owned())]);
+        let output = br#"{
+            "node":[{
+                "version":"25.0.0",
+                "installed":true,
+                "active":true,
+                "source":{"path":"/home/workspace/.config/gascan/mise.toml"}
+            }],
+            "python":[{
+                "version":"3.14.6",
+                "installed":true,
+                "active":true,
+                "source":{"path":"/etc/mise/config.toml"}
+            }]
+        }"#;
+
+        assert_eq!(
+            parse_mise_versions(output, &desired)?,
+            BTreeMap::from([("node".to_owned(), "25.0.0".to_owned())])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mise_inventory_rejects_unrequested_tools_from_noncanonical_system_sources() {
+        let desired = BTreeMap::from([("node".to_owned(), "25.0.0".to_owned())]);
+        for source in [
+            "/home/workspace/.config/gascan/unmanaged.toml",
+            "etc/mise/config.toml",
+            "/etc/../etc/mise/config.toml",
+            "/tmp/system-config-link",
+        ] {
+            let output = format!(
+                r#"{{
+                    "node":[{{
+                        "version":"25.0.0",
+                        "installed":true,
+                        "active":true,
+                        "source":{{"path":"/home/workspace/.config/gascan/mise.toml"}}
+                    }}],
+                    "python":[{{
+                        "version":"3.14.6",
+                        "installed":true,
+                        "active":true,
+                        "source":{{"path":"{source}"}}
+                    }}]
+                }}"#
+            );
+
+            assert!(matches!(
+                parse_mise_versions(output.as_bytes(), &desired),
+                Err(ServiceError::Provision(message))
+                    if message == "mise returned an unexpected tool set"
+            ));
+        }
     }
 
     #[tokio::test]

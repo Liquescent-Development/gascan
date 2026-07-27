@@ -102,6 +102,14 @@ host_url="http://$dns_domain:$port"
 "$gascan_bin" up "$root"
 sandbox_id=$("$gascan_bin" list --json | jq -er --arg name "$name" \
   '[.[] | select(.sandbox_id | startswith($name + "-"))] | if length == 1 then .[0].sandbox_id else error("release sandbox identity is ambiguous") end')
+inspect=$(container inspect "$sandbox_id")
+jq -e '
+  type == "array" and length == 1 and
+  ([.[0].configuration.mounts[]
+    | select(.type.volume? != null)
+    | .destination] | sort) ==
+  ["/home/workspace/.cache", "/home/workspace/.config", "/home/workspace/.local"]
+' <<<"$inspect" >/dev/null
 
 "$gascan_bin" --sandbox "$sandbox_id" run -- bash -lc '
   test "$(id -u)" = 1000
@@ -116,6 +124,144 @@ sandbox_id=$("$gascan_bin" list --json | jq -er --arg name "$name" \
   elixir --version
   /opt/gascan/gascamp/bin/camp --version
   test "$(cat /workspace/.gascan/setup-result)" = initial
+'
+"$gascan_bin" --sandbox "$sandbox_id" run -- bash -lc '
+  set -euo pipefail
+  test "CARGO_HOME=$CARGO_HOME" = CARGO_HOME=/home/workspace/.local/share/cargo
+  test "RUSTUP_HOME=$RUSTUP_HOME" = RUSTUP_HOME=/home/workspace/.local/share/rustup
+  test "$XDG_DATA_HOME" = /home/workspace/.local/share
+  test "$XDG_CACHE_HOME" = /home/workspace/.cache
+  test "$XDG_CONFIG_HOME" = /home/workspace/.config
+  test "$NPM_CONFIG_PREFIX" = /home/workspace/.local
+  test "$GOPATH" = /home/workspace/.local/share/go
+  test "$GOBIN" = /home/workspace/.local/bin
+  test "$(go env GOBIN)" = "$GOBIN"
+  test "$PYTHONUSERBASE" = /home/workspace/.local
+  test "$GEM_HOME" = /home/workspace/.local/share/gem
+  test -w /home/workspace/.local
+  test -w /home/workspace/.cache
+  test -w /home/workspace/.config
+
+  fixture=/workspace/.gascan/release-write-smoke
+  rm -rf "$fixture"
+  mkdir -p \
+    "$fixture/rust-app/src" \
+    "$fixture/rust-bin/src" \
+    "$fixture/npm-bin" \
+    "$fixture/go-bin" \
+    "$fixture/python-wheel/gascan_release_python_local-0.1.0.dist-info" \
+    "$fixture/ruby-bin/bin" \
+    "$XDG_CONFIG_HOME/gascan-release-smoke"
+
+  printf "%s\n" \
+    "[package]" \
+    "name = \"gascan-release-rust-app\"" \
+    "version = \"0.1.0\"" \
+    "edition = \"2024\"" \
+    "" \
+    "[dependencies]" \
+    "cfg-if = \"=1.0.4\"" >"$fixture/rust-app/Cargo.toml"
+  printf "%s\n" \
+    "fn main() {" \
+    "    cfg_if::cfg_if! {" \
+    "        if #[cfg(unix)] { println!(\"release-cargo-network-ok\"); }" \
+    "        else { compile_error!(\"release smoke requires Unix\"); }" \
+    "    }" \
+    "}" >"$fixture/rust-app/src/main.rs"
+  test "$(cargo run --manifest-path "$fixture/rust-app/Cargo.toml")" = release-cargo-network-ok
+  test -d "$CARGO_HOME/registry"
+
+  printf "%s\n" \
+    "[package]" \
+    "name = \"gascan-release-rust-local\"" \
+    "version = \"0.1.0\"" \
+    "edition = \"2024\"" >"$fixture/rust-bin/Cargo.toml"
+  printf "%s\n" \
+    "fn main() { println!(\"release-rust-local-ok\"); }" \
+    >"$fixture/rust-bin/src/main.rs"
+  cargo install --path "$fixture/rust-bin"
+
+  printf "%s\n" \
+    "{\"name\":\"gascan-release-npm-local\",\"version\":\"1.0.0\",\"bin\":{\"gascan-release-npm-local\":\"cli.js\"}}" \
+    >"$fixture/npm-bin/package.json"
+  printf "%s\n" "#!/usr/bin/env node" "console.log(\"release-npm-local-ok\")" \
+    >"$fixture/npm-bin/cli.js"
+  chmod 0755 "$fixture/npm-bin/cli.js"
+  npm pack "$fixture/npm-bin" --pack-destination "$fixture" >/dev/null
+  npm install --global "$fixture/gascan-release-npm-local-1.0.0.tgz" >/dev/null
+
+  printf "%s\n" "module example.com/gascan/release-local" "go 1.26" \
+    >"$fixture/go.mod"
+  printf "%s\n" \
+    "package main" \
+    "import \"fmt\"" \
+    "func main() { fmt.Println(\"release-go-local-ok\") }" \
+    >"$fixture/go-bin/main.go"
+  (cd "$fixture" && go install ./go-bin)
+
+  printf "%s\n" \
+    "def main():" \
+    "    print(\"release-python-local-ok\")" \
+    >"$fixture/python-wheel/gascan_release_python_local.py"
+  printf "%s\n" \
+    "Metadata-Version: 2.1" \
+    "Name: gascan-release-python-local" \
+    "Version: 0.1.0" \
+    >"$fixture/python-wheel/gascan_release_python_local-0.1.0.dist-info/METADATA"
+  printf "%s\n" \
+    "Wheel-Version: 1.0" \
+    "Generator: gascan-release-smoke" \
+    "Root-Is-Purelib: true" \
+    "Tag: py3-none-any" \
+    >"$fixture/python-wheel/gascan_release_python_local-0.1.0.dist-info/WHEEL"
+  printf "%s\n" \
+    "[console_scripts]" \
+    "gascan-release-python-local = gascan_release_python_local:main" \
+    >"$fixture/python-wheel/gascan_release_python_local-0.1.0.dist-info/entry_points.txt"
+  printf "%s\n" \
+    "gascan_release_python_local.py,," \
+    "gascan_release_python_local-0.1.0.dist-info/METADATA,," \
+    "gascan_release_python_local-0.1.0.dist-info/WHEEL,," \
+    "gascan_release_python_local-0.1.0.dist-info/entry_points.txt,," \
+    "gascan_release_python_local-0.1.0.dist-info/RECORD,," \
+    >"$fixture/python-wheel/gascan_release_python_local-0.1.0.dist-info/RECORD"
+  (cd "$fixture/python-wheel" &&
+    python -m zipfile -c ../gascan_release_python_local-0.1.0-py3-none-any.whl \
+      gascan_release_python_local.py gascan_release_python_local-0.1.0.dist-info)
+  python -m pip install --user --no-deps \
+    "$fixture/gascan_release_python_local-0.1.0-py3-none-any.whl" >/dev/null
+
+  printf "%s\n" \
+    "Gem::Specification.new do |spec|" \
+    "  spec.name = \"gascan-release-ruby-local\"" \
+    "  spec.version = \"0.1.0\"" \
+    "  spec.summary = \"Gas Can release smoke\"" \
+    "  spec.authors = [\"Gas Can\"]" \
+    "  spec.files = [\"bin/gascan-release-ruby-local\"]" \
+    "  spec.bindir = \"bin\"" \
+    "  spec.executables = [\"gascan-release-ruby-local\"]" \
+    "end" >"$fixture/ruby-bin/gascan-release-ruby-local.gemspec"
+  printf "%s\n" "#!/usr/bin/env ruby" "puts \"release-ruby-local-ok\"" \
+    >"$fixture/ruby-bin/bin/gascan-release-ruby-local"
+  chmod 0755 "$fixture/ruby-bin/bin/gascan-release-ruby-local"
+  (cd "$fixture/ruby-bin" &&
+    gem build gascan-release-ruby-local.gemspec --output ../ruby-bin.gem >/dev/null)
+  gem install --local "$fixture/ruby-bin.gem" >/dev/null
+
+  assert_local_command()
+  {
+    command_path=$(realpath -m "$(command -v "$1")")
+    case "$command_path" in /home/workspace/.local/*) ;; *) return 1 ;; esac
+    test "$("$1")" = "$2"
+  }
+  assert_local_command gascan-release-rust-local release-rust-local-ok
+  assert_local_command gascan-release-npm-local release-npm-local-ok
+  assert_local_command go-bin release-go-local-ok
+  assert_local_command gascan-release-python-local release-python-local-ok
+  assert_local_command gascan-release-ruby-local release-ruby-local-ok
+
+  printf "release-xdg-config-ok\n" >"$XDG_CONFIG_HOME/gascan-release-smoke/config"
+  test "$(cat "$XDG_CONFIG_HOME/gascan-release-smoke/config")" = release-xdg-config-ok
 '
 "$gascan_bin" --sandbox "$sandbox_id" run -- curl --fail --silent --show-error --max-time 4 "$host_url" >/dev/null
 version_check=$(cat <<'VERSION_CHECK'

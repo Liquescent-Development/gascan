@@ -113,9 +113,9 @@ Optional independent capacities for Gas Can-managed volumes:
 
 | Key | Default | Guest mount |
 | --- | --- | --- |
-| `tools` | `"10GiB"` | `/home/workspace/.local/share/mise` |
+| `tools` | `"10GiB"` | `/home/workspace/.local` |
 | `cache` | `"10GiB"` | `/home/workspace/.cache` |
-| `config` | `"1GiB"` | `/home/workspace/.config/gascan` |
+| `config` | `"1GiB"` | `/home/workspace/.config` |
 
 Each value uses the binary-size format above and may not exceed `512GiB`.
 Omitted values retain their defaults independently.

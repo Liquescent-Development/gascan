@@ -2,7 +2,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use gascan_core::manifest::Manifest;
 use gascan_core::policy::{
     ControlPlanePolicy, DEFAULT_CPUS, DEFAULT_MEMORY_BYTES, MAX_CPUS, MAX_MEMORY_BYTES,
-    PolicyCompiler, filtered_host_environment,
+    PolicyCompiler, filtered_host_environment, workspace_environment,
 };
 use gascan_core::runtime::{
     NetworkIsolation, ResourceKind, RuntimeCapabilities, RuntimeNetwork, RuntimeUser,
@@ -164,6 +164,16 @@ fn ssh_control_plane_appends_one_loopback_native_port_after_application_ports() 
             .map(String::as_str),
         Some("1")
     );
+    let mut shared_environment = request.environment().clone();
+    assert_eq!(
+        shared_environment.remove("GASCAN_SSH_ENABLED"),
+        Some("1".to_owned())
+    );
+    assert_eq!(
+        shared_environment.remove("GASCAN_SSH_AUTHORIZED_KEY"),
+        Some(SSH_PUBLIC_KEY.to_owned())
+    );
+    assert_eq!(shared_environment, workspace_environment());
     assert!(
         request.environment().values().all(|value| {
             !value.contains(private_key) && !value.contains("22222") && !value.contains(&host_path)
@@ -463,9 +473,9 @@ fn canonical_request_has_one_root_mount_owned_volumes_loopback_ports_and_init() 
             .map(|volume| volume.target.as_str())
             .collect::<Vec<_>>(),
         [
-            "/home/workspace/.local/share/mise",
+            "/home/workspace/.local",
             "/home/workspace/.cache",
-            "/home/workspace/.config/gascan",
+            "/home/workspace/.config",
         ]
     );
     assert!(request.volumes().iter().all(|volume| {
@@ -478,20 +488,43 @@ fn canonical_request_has_one_root_mount_owned_volumes_loopback_ports_and_init() 
         .iter()
         .map(|volume| (volume.target.as_str(), volume.capacity_bytes))
         .collect::<BTreeMap<_, _>>();
-    assert_eq!(
-        capacities["/home/workspace/.local/share/mise"],
-        11 * 1024_u64.pow(3)
-    );
+    assert_eq!(capacities["/home/workspace/.local"], 11 * 1024_u64.pow(3));
     assert_eq!(capacities["/home/workspace/.cache"], 12 * 1024_u64.pow(3));
-    assert_eq!(
-        capacities["/home/workspace/.config/gascan"],
-        2 * 1024_u64.pow(3)
-    );
+    assert_eq!(capacities["/home/workspace/.config"], 2 * 1024_u64.pow(3));
     assert_eq!(
         request.environment(),
         &BTreeMap::from([
+            (
+                "CARGO_HOME".to_owned(),
+                "/home/workspace/.local/share/cargo".to_owned(),
+            ),
+            (
+                "GEM_HOME".to_owned(),
+                "/home/workspace/.local/share/gem".to_owned(),
+            ),
             ("GASCAN_SSH_ENABLED".to_owned(), "0".to_owned()),
+            (
+                "GOCACHE".to_owned(),
+                "/home/workspace/.cache/go-build".to_owned(),
+            ),
+            ("GOBIN".to_owned(), "/home/workspace/.local/bin".to_owned(),),
+            (
+                "GOMODCACHE".to_owned(),
+                "/home/workspace/.cache/go-mod".to_owned(),
+            ),
+            (
+                "GOPATH".to_owned(),
+                "/home/workspace/.local/share/go".to_owned(),
+            ),
+            (
+                "HEX_HOME".to_owned(),
+                "/home/workspace/.local/share/hex".to_owned(),
+            ),
             ("HOME".to_owned(), "/home/workspace".to_owned()),
+            (
+                "MISE_CARGO_HOME".to_owned(),
+                "/home/workspace/.local/share/cargo".to_owned(),
+            ),
             (
                 "MISE_CACHE_DIR".to_owned(),
                 "/home/workspace/.cache/mise".to_owned(),
@@ -509,14 +542,115 @@ fn canonical_request_has_one_root_mount_owned_volumes_loopback_ports_and_init() 
                 "/home/workspace/.config/gascan/mise-state".to_owned(),
             ),
             (
+                "MISE_SYSTEM_CONFIG_FILE".to_owned(),
+                "/etc/mise/config.toml".to_owned(),
+            ),
+            (
                 "MISE_SYSTEM_DATA_DIR".to_owned(),
                 "/opt/gascan/mise".to_owned(),
             ),
             (
+                "MISE_RUSTUP_HOME".to_owned(),
+                "/home/workspace/.local/share/rustup".to_owned(),
+            ),
+            (
+                "MIX_HOME".to_owned(),
+                "/home/workspace/.local/share/mix".to_owned(),
+            ),
+            (
+                "NPM_CONFIG_CACHE".to_owned(),
+                "/home/workspace/.cache/npm".to_owned(),
+            ),
+            (
+                "NPM_CONFIG_PREFIX".to_owned(),
+                "/home/workspace/.local".to_owned(),
+            ),
+            (
                 "PATH".to_owned(),
-                "/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned(),
+                concat!(
+                    "/home/workspace/.local/bin:",
+                    "/home/workspace/.local/share/cargo/bin:",
+                    "/home/workspace/.local/share/go/bin:",
+                    "/home/workspace/.local/share/gem/bin:",
+                    "/home/workspace/.local/share/mise/shims:",
+                    "/opt/gascan/mise/shims:",
+                    "/usr/local/sbin:/usr/local/bin:",
+                    "/opt/gascan/workstation/bin:",
+                    "/usr/sbin:/usr/bin:/sbin:/bin"
+                )
+                .to_owned(),
+            ),
+            (
+                "PYTHONUSERBASE".to_owned(),
+                "/home/workspace/.local".to_owned(),
+            ),
+            (
+                "REBAR_CACHE_DIR".to_owned(),
+                "/home/workspace/.cache/rebar3".to_owned(),
+            ),
+            (
+                "RUSTUP_HOME".to_owned(),
+                "/home/workspace/.local/share/rustup".to_owned(),
+            ),
+            (
+                "XDG_CACHE_HOME".to_owned(),
+                "/home/workspace/.cache".to_owned(),
+            ),
+            (
+                "XDG_CONFIG_HOME".to_owned(),
+                "/home/workspace/.config".to_owned(),
+            ),
+            (
+                "XDG_DATA_HOME".to_owned(),
+                "/home/workspace/.local/share".to_owned(),
             ),
         ])
+    );
+    let mut shared_environment = request.environment().clone();
+    assert_eq!(
+        shared_environment.remove("GASCAN_SSH_ENABLED"),
+        Some("0".to_owned())
+    );
+    assert_eq!(shared_environment, workspace_environment());
+    let expected = [
+        ("XDG_DATA_HOME", "/home/workspace/.local/share"),
+        ("XDG_CACHE_HOME", "/home/workspace/.cache"),
+        ("XDG_CONFIG_HOME", "/home/workspace/.config"),
+        ("CARGO_HOME", "/home/workspace/.local/share/cargo"),
+        ("MISE_CARGO_HOME", "/home/workspace/.local/share/cargo"),
+        ("RUSTUP_HOME", "/home/workspace/.local/share/rustup"),
+        ("MISE_RUSTUP_HOME", "/home/workspace/.local/share/rustup"),
+        ("NPM_CONFIG_PREFIX", "/home/workspace/.local"),
+        ("NPM_CONFIG_CACHE", "/home/workspace/.cache/npm"),
+        ("GOPATH", "/home/workspace/.local/share/go"),
+        ("GOBIN", "/home/workspace/.local/bin"),
+        ("GOCACHE", "/home/workspace/.cache/go-build"),
+        ("GOMODCACHE", "/home/workspace/.cache/go-mod"),
+        ("PYTHONUSERBASE", "/home/workspace/.local"),
+        ("GEM_HOME", "/home/workspace/.local/share/gem"),
+        ("MIX_HOME", "/home/workspace/.local/share/mix"),
+        ("HEX_HOME", "/home/workspace/.local/share/hex"),
+        ("REBAR_CACHE_DIR", "/home/workspace/.cache/rebar3"),
+    ];
+    for (name, value) in expected {
+        assert_eq!(
+            request.environment().get(name).map(String::as_str),
+            Some(value)
+        );
+    }
+    assert_eq!(
+        request.environment().get("PATH").map(String::as_str),
+        Some(concat!(
+            "/home/workspace/.local/bin:",
+            "/home/workspace/.local/share/cargo/bin:",
+            "/home/workspace/.local/share/go/bin:",
+            "/home/workspace/.local/share/gem/bin:",
+            "/home/workspace/.local/share/mise/shims:",
+            "/opt/gascan/mise/shims:",
+            "/usr/local/sbin:/usr/local/bin:",
+            "/opt/gascan/workstation/bin:",
+            "/usr/sbin:/usr/bin:/sbin:/bin"
+        ))
     );
     assert_eq!(request.ports().len(), 2);
     assert!(request.ports().iter().all(|port| {
@@ -745,7 +879,7 @@ fn approved_json_shape_exposes_no_unsafe_backend_surface() {
             "snapshot contains {forbidden}: {snapshot}"
         );
     }
-    assert_eq!(request.environment().len(), 8);
+    assert_eq!(request.environment().len(), 27);
     assert_eq!(
         request
             .environment()
@@ -768,7 +902,8 @@ fn approved_json_shape_exposes_no_unsafe_backend_surface() {
         Some("/home/workspace/.config/gascan/mise-state")
     );
     assert!(request.environment().get("PATH").is_some_and(|path| {
-        path.starts_with("/home/workspace/.local/share/mise/shims:")
+        path.starts_with("/home/workspace/.local/bin:")
+            && path.contains(":/home/workspace/.local/share/cargo/bin:")
             && path.contains(":/opt/gascan/mise/shims:")
     }));
 }

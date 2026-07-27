@@ -67,6 +67,7 @@ pub enum ProvisionStep {
     RunSetup,
     VerifyGascamp,
     HealthCheck,
+    InitializeRuntimeHome,
 }
 
 impl ProvisionStep {
@@ -77,6 +78,7 @@ impl ProvisionStep {
             Self::RunSetup => "run_setup",
             Self::VerifyGascamp => "verify_gascamp",
             Self::HealthCheck => "health_check",
+            Self::InitializeRuntimeHome => "initialize_runtime_home",
         }
     }
 }

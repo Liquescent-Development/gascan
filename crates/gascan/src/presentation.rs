@@ -193,6 +193,22 @@ pub(crate) fn render_status(
         SshState::Unhealthy => output.push_str("SSH     Unhealthy\n"),
         SshState::Unavailable => output.push_str("SSH     Unavailable\n"),
     }
+    let storage_layout_changes = status
+        .apply_requirements
+        .iter()
+        .filter(|requirement| requirement.reason == "storage_layout_changed")
+        .collect::<Vec<_>>();
+    if !storage_layout_changes.is_empty() {
+        output.push_str("\nRecreation required\n");
+        for requirement in storage_layout_changes {
+            let _ = writeln!(
+                output,
+                "  Managed storage layout  {} → {}",
+                requirement.current, requirement.requested
+            );
+        }
+        output.push_str("  Run gascan destroy --yes, then gascan up\n");
+    }
     let image_changes = status
         .apply_requirements
         .iter()
@@ -392,6 +408,9 @@ impl OperationProgress {
             ("provision_step", Some(v1::ProvisionStep::VerifyGascamp)) => Some("Verifying Gascamp"),
             ("provision_step", Some(v1::ProvisionStep::HealthCheck)) => {
                 Some("Checking sandbox health")
+            }
+            ("provision_step", Some(v1::ProvisionStep::InitializeRuntimeHome)) => {
+                Some("Preparing writable tool storage")
             }
             _ => None,
         }?;
@@ -661,6 +680,21 @@ mod tests {
     }
 
     #[test]
+    fn status_reports_storage_layout_recreation_requirement() {
+        let mut status = status("code-123", v1::ActualState::Running);
+        status.apply_requirements.push(v1::ApplyRequirement {
+            reason: "storage_layout_changed".to_owned(),
+            current: "1".to_owned(),
+            requested: "2".to_owned(),
+        });
+
+        assert_eq!(
+            render_status(&status, OutputCapabilities::plain()),
+            "Sandbox: code-123\nState:   Running\nSSH     Unavailable\n\nRecreation required\n  Managed storage layout  1 → 2\n  Run gascan destroy --yes, then gascan up\n"
+        );
+    }
+
+    #[test]
     fn status_reports_the_active_native_ssh_alias_and_endpoint() {
         let mut status = status("code-123", v1::ActualState::Running);
         status.ssh = Some(v1::SshStatus {
@@ -810,6 +844,12 @@ mod tests {
     fn provision_steps_are_typed_human_copy_and_deduplicated() {
         let (mut progress, _) =
             OperationProgress::new(OperationKind::Apply, None, OutputCapabilities::plain());
+        assert_eq!(
+            progress
+                .update(&provision_event(v1::ProvisionStep::InitializeRuntimeHome))
+                .as_deref(),
+            Some("Preparing writable tool storage")
+        );
         let install = provision_event(v1::ProvisionStep::InstallTools);
         assert_eq!(
             progress.update(&install).as_deref(),
