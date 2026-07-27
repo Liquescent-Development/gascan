@@ -256,11 +256,24 @@ fn guest_environment(
     ssh_enabled: bool,
     control: ControlPlanePolicy<'_>,
 ) -> BTreeMap<String, String> {
-    let mut environment = BTreeMap::from([
-        (
-            "GASCAN_SSH_ENABLED".to_owned(),
-            if ssh_enabled { "1" } else { "0" }.to_owned(),
-        ),
+    let mut environment = workspace_environment();
+    environment.insert(
+        "GASCAN_SSH_ENABLED".to_owned(),
+        if ssh_enabled { "1" } else { "0" }.to_owned(),
+    );
+    if ssh_enabled {
+        if let Some(authorized_key) = control.ssh_authorized_key {
+            environment.insert(
+                "GASCAN_SSH_AUTHORIZED_KEY".to_owned(),
+                authorized_key.to_owned(),
+            );
+        }
+    }
+    environment
+}
+
+pub fn workspace_environment() -> BTreeMap<String, String> {
+    BTreeMap::from([
         ("CARGO_HOME".to_owned(), CARGO_HOME.to_owned()),
         (
             "GEM_HOME".to_owned(),
@@ -289,6 +302,10 @@ fn guest_environment(
         ),
         ("MISE_STATE_DIR".to_owned(), MISE_STATE_DIR.to_owned()),
         (
+            "MISE_SYSTEM_CONFIG_FILE".to_owned(),
+            MISE_GLOBAL_CONFIG_FILE.to_owned(),
+        ),
+        (
             "MISE_SYSTEM_DATA_DIR".to_owned(),
             MISE_SYSTEM_DATA_DIR.to_owned(),
         ),
@@ -312,16 +329,7 @@ fn guest_environment(
             "XDG_DATA_HOME".to_owned(),
             "/home/workspace/.local/share".to_owned(),
         ),
-    ]);
-    if ssh_enabled {
-        if let Some(authorized_key) = control.ssh_authorized_key {
-            environment.insert(
-                "GASCAN_SSH_AUTHORIZED_KEY".to_owned(),
-                authorized_key.to_owned(),
-            );
-        }
-    }
-    environment
+    ])
 }
 
 fn is_ssh_public_key(key: &str) -> bool {

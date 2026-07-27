@@ -98,10 +98,15 @@ fn writable_rust_bootstrap_is_idempotent_fail_closed_and_never_mutates_source() 
         fs::read_to_string(destination.join("update-hashes").join(bundled)).unwrap(),
         "hash for 1.97.0-aarch64-unknown-linux-gnu\n"
     );
+    let marker = destination.join(".gascan-bundled-toolchains-v1");
+    let marker_inode = fs::metadata(&marker).unwrap().ino();
+    let marker_contents = fs::read(&marker).unwrap();
 
     assert!(run().unwrap().success());
     assert_eq!(fs::metadata(&published).unwrap().ino(), first_inode);
     assert_eq!(fs::read(&published).unwrap(), first_contents);
+    assert_eq!(fs::metadata(&marker).unwrap().ino(), marker_inode);
+    assert_eq!(fs::read(&marker).unwrap(), marker_contents);
     assert_eq!(
         fs::read_to_string(user_toolchain.join("sentinel")).unwrap(),
         "keep me\n"
@@ -122,14 +127,91 @@ fn writable_rust_bootstrap_is_idempotent_fail_closed_and_never_mutates_source() 
         .unwrap(),
         "new cargo\n"
     );
-    let marker = destination.join(".gascan-bundled-toolchains-v1");
+    assert_eq!(fs::metadata(&marker).unwrap().ino(), marker_inode);
     assert_eq!(
         fs::read_to_string(&marker).unwrap(),
-        "1.97.0-aarch64-unknown-linux-gnu\n1.98.0-aarch64-unknown-linux-gnu\n"
+        "1.97.0-aarch64-unknown-linux-gnu\n"
     );
     assert_eq!(fs::metadata(&marker).unwrap().permissions().mode() & 0o777, 0o600);
     assert_eq!(fs::metadata(&source_cargo).unwrap().ino(), source_inode);
     assert_eq!(fs::read(&source_cargo).unwrap(), source_contents);
+}
+
+#[test]
+fn writable_rust_bootstrap_rejects_unsafe_source_root_components() {
+    let script = root().join("images/workspace/bin/initialize-rust-home");
+    let temp = tempfile::tempdir().unwrap();
+    let valid_source = temp.path().join("valid-source");
+    write_test_toolchain(
+        &valid_source,
+        "1.97.0-aarch64-unknown-linux-gnu",
+        "cargo\n",
+    );
+
+    let source_link = temp.path().join("source-link");
+    symlink(&valid_source, &source_link).unwrap();
+    let rejected = rust_seed_command(
+        &script,
+        &source_link,
+        &temp.path().join("source-link-destination"),
+        temp.path(),
+    )
+    .status()
+    .unwrap();
+    assert!(!rejected.success(), "accepted symlink source root");
+
+    let source_file = temp.path().join("source-file");
+    fs::write(&source_file, "not a directory").unwrap();
+    let rejected = rust_seed_command(
+        &script,
+        &source_file,
+        &temp.path().join("source-file-destination"),
+        temp.path(),
+    )
+    .status()
+    .unwrap();
+    assert!(!rejected.success(), "accepted non-directory source root");
+
+    for collision in ["symlink", "file"] {
+        let unsafe_source = temp.path().join(format!("update-hashes-{collision}"));
+        fs::create_dir_all(unsafe_source.join("toolchains")).unwrap();
+        fs::create_dir_all(
+            unsafe_source
+                .join("toolchains")
+                .join("1.97.0-aarch64-unknown-linux-gnu")
+                .join("bin"),
+        )
+        .unwrap();
+        for command in ["cargo", "rustc"] {
+            let path = unsafe_source
+                .join("toolchains")
+                .join("1.97.0-aarch64-unknown-linux-gnu")
+                .join("bin")
+                .join(command);
+            fs::write(&path, command).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let update_hashes = unsafe_source.join("update-hashes");
+        if collision == "symlink" {
+            symlink(valid_source.join("update-hashes"), &update_hashes).unwrap();
+        } else {
+            fs::write(&update_hashes, "not a directory").unwrap();
+        }
+        let rejected = rust_seed_command(
+            &script,
+            &unsafe_source,
+            &temp
+                .path()
+                .join(format!("update-hashes-{collision}-destination")),
+            temp.path(),
+        )
+        .status()
+        .unwrap();
+        assert!(
+            !rejected.success(),
+            "accepted {collision} update-hashes root"
+        );
+    }
 }
 
 #[test]

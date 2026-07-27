@@ -18,9 +18,8 @@ use camino::{Utf8Path, Utf8PathBuf};
 use gascan_core::doctor::{DoctorFact, DoctorFacts, DoctorReport, DoctorStatus};
 use gascan_core::manifest::ManifestError;
 use gascan_core::policy::{
-    CACHE_ROOT, CARGO_HOME, CONFIG_ROOT, CONTAINER_PATH, ControlPlanePolicy, GO_PATH,
-    MISE_CACHE_DIR, MISE_DATA_DIR, MISE_GLOBAL_CONFIG_FILE, MISE_STATE_DIR, MISE_SYSTEM_DATA_DIR,
-    NPM_CACHE_DIR, PolicyCompiler, PolicyError, RUSTUP_HOME, TOOLS_ROOT, WORKSPACE_HOME,
+    CACHE_ROOT, CARGO_HOME, CONFIG_ROOT, ControlPlanePolicy, MISE_GLOBAL_CONFIG_FILE,
+    PolicyCompiler, PolicyError, RUSTUP_HOME, TOOLS_ROOT, WORKSPACE_HOME, workspace_environment,
 };
 use gascan_core::provision::{
     AppliedState, ProvisionPlan, ProvisionStep, ProvisioningPlanner, SetupScript,
@@ -3956,40 +3955,27 @@ fn sanitize_provision_stderr(bytes: &[u8]) -> String {
 }
 
 fn mise_command(args: &[&str]) -> Vec<String> {
-    let mut argv = vec![
-        "/usr/bin/env".to_owned(),
-        format!("HOME={WORKSPACE_HOME}"),
-        format!("CARGO_HOME={CARGO_HOME}"),
-        "GEM_HOME=/home/workspace/.local/share/gem".to_owned(),
-        "GOCACHE=/home/workspace/.cache/go-build".to_owned(),
-        "GOMODCACHE=/home/workspace/.cache/go-mod".to_owned(),
-        format!("GOPATH={GO_PATH}"),
-        "HEX_HOME=/home/workspace/.local/share/hex".to_owned(),
-        format!("MISE_CARGO_HOME={CARGO_HOME}"),
-        format!("MISE_CACHE_DIR={MISE_CACHE_DIR}"),
-        format!("MISE_CEILING_PATHS={SAFE_MISE_WORKDIR}"),
-        format!("MISE_DATA_DIR={MISE_DATA_DIR}"),
-        format!("MISE_GLOBAL_CONFIG_FILE={MISE_GLOBAL_CONFIG_FILE}"),
-        format!("MISE_RUSTUP_HOME={RUSTUP_HOME}"),
-        format!("MISE_STATE_DIR={MISE_STATE_DIR}"),
-        format!("MISE_SYSTEM_CONFIG_FILE={MISE_GLOBAL_CONFIG_FILE}"),
-        format!("MISE_SYSTEM_DATA_DIR={MISE_SYSTEM_DATA_DIR}"),
-        "MIX_HOME=/home/workspace/.local/share/mix".to_owned(),
-        format!("NPM_CONFIG_CACHE={NPM_CACHE_DIR}"),
-        format!("NPM_CONFIG_PREFIX={TOOLS_ROOT}"),
-        format!("PATH={CONTAINER_PATH}"),
-        format!("PYTHONUSERBASE={TOOLS_ROOT}"),
-        "REBAR_CACHE_DIR=/home/workspace/.cache/rebar3".to_owned(),
-        format!("RUSTUP_HOME={RUSTUP_HOME}"),
-        format!("XDG_CACHE_HOME={CACHE_ROOT}"),
-        format!("XDG_CONFIG_HOME={CONFIG_ROOT}"),
-        format!("XDG_DATA_HOME={TOOLS_ROOT}/share"),
+    let mut environment = workspace_environment();
+    let home = environment
+        .remove("HOME")
+        .unwrap_or_else(|| WORKSPACE_HOME.to_owned());
+    environment.insert(
+        "MISE_CEILING_PATHS".to_owned(),
+        SAFE_MISE_WORKDIR.to_owned(),
+    );
+    let mut argv = vec!["/usr/bin/env".to_owned(), format!("HOME={home}")];
+    argv.extend(
+        environment
+            .into_iter()
+            .map(|(name, value)| format!("{name}={value}")),
+    );
+    argv.extend([
         "/usr/local/bin/mise".to_owned(),
         "--cd".to_owned(),
         SAFE_MISE_WORKDIR.to_owned(),
         "--no-env".to_owned(),
         "--no-hooks".to_owned(),
-    ];
+    ]);
     argv.extend(args.iter().map(|arg| (*arg).to_owned()));
     argv
 }

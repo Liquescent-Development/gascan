@@ -1,6 +1,7 @@
 use camino::Utf8Path;
 use gascan_core::fake_runtime::FakeRuntime;
 use gascan_core::manifest::Manifest;
+use gascan_core::policy::workspace_environment;
 use gascan_core::runtime::{
     RemoveRequest, ResourceKind, RuntimeBackend, RuntimeCall, RuntimeError,
 };
@@ -290,8 +291,8 @@ async fn apply_uses_literal_mise_argv_streams_steps_and_persists_exact_versions(
                 "GOMODCACHE=/home/workspace/.cache/go-mod",
                 "GOPATH=/home/workspace/.local/share/go",
                 "HEX_HOME=/home/workspace/.local/share/hex",
-                "MISE_CARGO_HOME=/home/workspace/.local/share/cargo",
                 "MISE_CACHE_DIR=/home/workspace/.cache/mise",
+                "MISE_CARGO_HOME=/home/workspace/.local/share/cargo",
                 "MISE_CEILING_PATHS=/home/workspace/.config/gascan/mise-workdir",
                 "MISE_DATA_DIR=/home/workspace/.local/share/mise",
                 "MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
@@ -327,8 +328,8 @@ async fn apply_uses_literal_mise_argv_streams_steps_and_persists_exact_versions(
                 "GOMODCACHE=/home/workspace/.cache/go-mod",
                 "GOPATH=/home/workspace/.local/share/go",
                 "HEX_HOME=/home/workspace/.local/share/hex",
-                "MISE_CARGO_HOME=/home/workspace/.local/share/cargo",
                 "MISE_CACHE_DIR=/home/workspace/.cache/mise",
+                "MISE_CARGO_HOME=/home/workspace/.local/share/cargo",
                 "MISE_CEILING_PATHS=/home/workspace/.config/gascan/mise-workdir",
                 "MISE_DATA_DIR=/home/workspace/.local/share/mise",
                 "MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
@@ -368,43 +369,27 @@ async fn apply_uses_literal_mise_argv_streams_steps_and_persists_exact_versions(
             _ => None,
         })
         .ok_or("create request")?;
-    let mise_environment = execs[8].argv[1..]
+    let mut mise_environment = execs[8].argv[1..]
         .iter()
         .take_while(|arg| arg.as_str() != "/usr/local/bin/mise")
-        .map(|entry| entry.split_once('=').ok_or("mise environment entry"))
+        .map(|entry| {
+            entry
+                .split_once('=')
+                .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                .ok_or("mise environment entry")
+        })
         .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
-    for key in [
-        "CARGO_HOME",
-        "GEM_HOME",
-        "GOCACHE",
-        "GOMODCACHE",
-        "GOPATH",
-        "HEX_HOME",
-        "HOME",
-        "MISE_CARGO_HOME",
-        "MISE_CACHE_DIR",
-        "MISE_DATA_DIR",
-        "MISE_GLOBAL_CONFIG_FILE",
-        "MISE_RUSTUP_HOME",
-        "MISE_STATE_DIR",
-        "MISE_SYSTEM_DATA_DIR",
-        "MIX_HOME",
-        "NPM_CONFIG_CACHE",
-        "NPM_CONFIG_PREFIX",
-        "PATH",
-        "PYTHONUSERBASE",
-        "REBAR_CACHE_DIR",
-        "RUSTUP_HOME",
-        "XDG_CACHE_HOME",
-        "XDG_CONFIG_HOME",
-        "XDG_DATA_HOME",
-    ] {
-        assert_eq!(
-            mise_environment.get(key).copied(),
-            create_environment.get(key).map(String::as_str),
-            "{key} differs between runtime and provisioning"
-        );
-    }
+    assert_eq!(
+        mise_environment.remove("MISE_CEILING_PATHS"),
+        Some("/home/workspace/.config/gascan/mise-workdir".to_owned())
+    );
+    assert_eq!(mise_environment, workspace_environment());
+    let mut runtime_environment = create_environment.clone();
+    assert_eq!(
+        runtime_environment.remove("GASCAN_SSH_ENABLED"),
+        Some("0".to_owned())
+    );
+    assert_eq!(runtime_environment, workspace_environment());
     assert!(
         details
             .iter()
@@ -1064,8 +1049,8 @@ async fn removing_last_tool_writes_empty_config_and_persists_empty_resolution() 
             "GOMODCACHE=/home/workspace/.cache/go-mod",
             "GOPATH=/home/workspace/.local/share/go",
             "HEX_HOME=/home/workspace/.local/share/hex",
-            "MISE_CARGO_HOME=/home/workspace/.local/share/cargo",
             "MISE_CACHE_DIR=/home/workspace/.cache/mise",
+            "MISE_CARGO_HOME=/home/workspace/.local/share/cargo",
             "MISE_CEILING_PATHS=/home/workspace/.config/gascan/mise-workdir",
             "MISE_DATA_DIR=/home/workspace/.local/share/mise",
             "MISE_GLOBAL_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",

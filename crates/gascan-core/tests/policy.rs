@@ -2,7 +2,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use gascan_core::manifest::Manifest;
 use gascan_core::policy::{
     ControlPlanePolicy, DEFAULT_CPUS, DEFAULT_MEMORY_BYTES, MAX_CPUS, MAX_MEMORY_BYTES,
-    PolicyCompiler, filtered_host_environment,
+    PolicyCompiler, filtered_host_environment, workspace_environment,
 };
 use gascan_core::runtime::{
     NetworkIsolation, ResourceKind, RuntimeCapabilities, RuntimeNetwork, RuntimeUser,
@@ -164,6 +164,16 @@ fn ssh_control_plane_appends_one_loopback_native_port_after_application_ports() 
             .map(String::as_str),
         Some("1")
     );
+    let mut shared_environment = request.environment().clone();
+    assert_eq!(
+        shared_environment.remove("GASCAN_SSH_ENABLED"),
+        Some("1".to_owned())
+    );
+    assert_eq!(
+        shared_environment.remove("GASCAN_SSH_AUTHORIZED_KEY"),
+        Some(SSH_PUBLIC_KEY.to_owned())
+    );
+    assert_eq!(shared_environment, workspace_environment());
     assert!(
         request.environment().values().all(|value| {
             !value.contains(private_key) && !value.contains("22222") && !value.contains(&host_path)
@@ -531,6 +541,10 @@ fn canonical_request_has_one_root_mount_owned_volumes_loopback_ports_and_init() 
                 "/home/workspace/.config/gascan/mise-state".to_owned(),
             ),
             (
+                "MISE_SYSTEM_CONFIG_FILE".to_owned(),
+                "/home/workspace/.config/gascan/mise.toml".to_owned(),
+            ),
+            (
                 "MISE_SYSTEM_DATA_DIR".to_owned(),
                 "/opt/gascan/mise".to_owned(),
             ),
@@ -591,6 +605,12 @@ fn canonical_request_has_one_root_mount_owned_volumes_loopback_ports_and_init() 
             ),
         ])
     );
+    let mut shared_environment = request.environment().clone();
+    assert_eq!(
+        shared_environment.remove("GASCAN_SSH_ENABLED"),
+        Some("0".to_owned())
+    );
+    assert_eq!(shared_environment, workspace_environment());
     let expected = [
         ("XDG_DATA_HOME", "/home/workspace/.local/share"),
         ("XDG_CACHE_HOME", "/home/workspace/.cache"),
@@ -857,7 +877,7 @@ fn approved_json_shape_exposes_no_unsafe_backend_surface() {
             "snapshot contains {forbidden}: {snapshot}"
         );
     }
-    assert_eq!(request.environment().len(), 25);
+    assert_eq!(request.environment().len(), 26);
     assert_eq!(
         request
             .environment()

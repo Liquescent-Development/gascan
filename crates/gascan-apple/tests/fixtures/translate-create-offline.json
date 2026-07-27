@@ -43,6 +43,8 @@
   "--env",
   "MISE_STATE_DIR=/home/workspace/.config/gascan/mise-state",
   "--env",
+  "MISE_SYSTEM_CONFIG_FILE=/home/workspace/.config/gascan/mise.toml",
+  "--env",
   "MISE_SYSTEM_DATA_DIR=/opt/gascan/mise",
   "--env",
   "MIX_HOME=/home/workspace/.local/share/mix",

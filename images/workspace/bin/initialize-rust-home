@@ -15,8 +15,16 @@ trap cleanup EXIT
 trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
 
+if [ -L "$source_root" ] || [ ! -d "$source_root" ]; then
+    printf '%s\n' "invalid Rust source root: $source_root" >&2
+    exit 1
+fi
 if [ -L "$source_root/toolchains" ] || [ ! -d "$source_root/toolchains" ]; then
     printf '%s\n' "invalid Rust toolchain source: $source_root/toolchains" >&2
+    exit 1
+fi
+if [ -L "$source_root/update-hashes" ] || [ ! -d "$source_root/update-hashes" ]; then
+    printf '%s\n' "invalid Rust update-hash source: $source_root/update-hashes" >&2
     exit 1
 fi
 if [ -L "$destination_root" ] ||
@@ -87,8 +95,13 @@ for source in "$source_root"/toolchains/*; do
 done
 
 marker="$destination_root/.gascan-bundled-toolchains-v1"
-marker_stage="$destination_root/.gascan-rust-marker.$$"
-stage=$marker_stage
+if [ -L "$marker" ] || { [ -e "$marker" ] && [ ! -f "$marker" ]; }; then
+    printf '%s\n' "invalid Rust toolchain marker: $marker" >&2
+    exit 1
+fi
+stage="$destination_root/.gascan-rust-marker.$$"
+mkdir -m 0700 "$stage"
+marker_stage="$stage/marker"
 : >"$marker_stage"
 chmod 0600 "$marker_stage"
 for source in "$source_root"/toolchains/*; do
@@ -103,5 +116,9 @@ for source in "$source_root"/toolchains/*; do
 done
 LC_ALL=C sort -o "$marker_stage" "$marker_stage"
 chmod 0600 "$marker_stage"
-mv --force --no-target-directory "$marker_stage" "$marker"
-stage=
+mv --no-clobber --no-target-directory "$marker_stage" "$marker"
+cleanup
+if [ -L "$marker" ] || [ ! -f "$marker" ]; then
+    printf '%s\n' "invalid Rust toolchain marker: $marker" >&2
+    exit 1
+fi
