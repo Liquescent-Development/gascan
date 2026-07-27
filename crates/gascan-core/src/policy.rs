@@ -22,12 +22,29 @@ pub const DEFAULT_PROCESS_COUNT: u32 = 1_024;
 const MANAGED_BY: &str = "gascan";
 const WORKSPACE_IMAGE: &str = include_str!("../../../images/workspace/approved-image.txt");
 pub const WORKSPACE_HOME: &str = "/home/workspace";
+pub const TOOLS_ROOT: &str = "/home/workspace/.local";
+pub const CACHE_ROOT: &str = "/home/workspace/.cache";
+pub const CONFIG_ROOT: &str = "/home/workspace/.config";
+pub const CARGO_HOME: &str = "/home/workspace/.local/share/cargo";
+pub const RUSTUP_HOME: &str = "/home/workspace/.local/share/rustup";
+pub const NPM_CACHE_DIR: &str = "/home/workspace/.cache/npm";
+pub const GO_PATH: &str = "/home/workspace/.local/share/go";
 pub const MISE_DATA_DIR: &str = "/home/workspace/.local/share/mise";
 pub const MISE_CACHE_DIR: &str = "/home/workspace/.cache/mise";
 pub const MISE_GLOBAL_CONFIG_FILE: &str = "/home/workspace/.config/gascan/mise.toml";
 pub const MISE_STATE_DIR: &str = "/home/workspace/.config/gascan/mise-state";
 pub const MISE_SYSTEM_DATA_DIR: &str = "/opt/gascan/mise";
-pub const CONTAINER_PATH: &str = "/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+pub const CONTAINER_PATH: &str = concat!(
+    "/home/workspace/.local/bin:",
+    "/home/workspace/.local/share/cargo/bin:",
+    "/home/workspace/.local/share/go/bin:",
+    "/home/workspace/.local/share/gem/bin:",
+    "/home/workspace/.local/share/mise/shims:",
+    "/opt/gascan/mise/shims:",
+    "/usr/local/sbin:/usr/local/bin:",
+    "/opt/gascan/workstation/bin:",
+    "/usr/sbin:/usr/bin:/sbin:/bin"
+);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ControlPlanePolicy<'a> {
@@ -244,7 +261,26 @@ fn guest_environment(
             "GASCAN_SSH_ENABLED".to_owned(),
             if ssh_enabled { "1" } else { "0" }.to_owned(),
         ),
+        ("CARGO_HOME".to_owned(), CARGO_HOME.to_owned()),
+        (
+            "GEM_HOME".to_owned(),
+            "/home/workspace/.local/share/gem".to_owned(),
+        ),
+        (
+            "GOCACHE".to_owned(),
+            "/home/workspace/.cache/go-build".to_owned(),
+        ),
+        (
+            "GOMODCACHE".to_owned(),
+            "/home/workspace/.cache/go-mod".to_owned(),
+        ),
+        ("GOPATH".to_owned(), GO_PATH.to_owned()),
+        (
+            "HEX_HOME".to_owned(),
+            "/home/workspace/.local/share/hex".to_owned(),
+        ),
         ("HOME".to_owned(), WORKSPACE_HOME.to_owned()),
+        ("MISE_CARGO_HOME".to_owned(), CARGO_HOME.to_owned()),
         ("MISE_CACHE_DIR".to_owned(), MISE_CACHE_DIR.to_owned()),
         ("MISE_DATA_DIR".to_owned(), MISE_DATA_DIR.to_owned()),
         (
@@ -256,7 +292,26 @@ fn guest_environment(
             "MISE_SYSTEM_DATA_DIR".to_owned(),
             MISE_SYSTEM_DATA_DIR.to_owned(),
         ),
+        ("MISE_RUSTUP_HOME".to_owned(), RUSTUP_HOME.to_owned()),
+        (
+            "MIX_HOME".to_owned(),
+            "/home/workspace/.local/share/mix".to_owned(),
+        ),
+        ("NPM_CONFIG_CACHE".to_owned(), NPM_CACHE_DIR.to_owned()),
+        ("NPM_CONFIG_PREFIX".to_owned(), TOOLS_ROOT.to_owned()),
         ("PATH".to_owned(), CONTAINER_PATH.to_owned()),
+        ("PYTHONUSERBASE".to_owned(), TOOLS_ROOT.to_owned()),
+        (
+            "REBAR_CACHE_DIR".to_owned(),
+            "/home/workspace/.cache/rebar3".to_owned(),
+        ),
+        ("RUSTUP_HOME".to_owned(), RUSTUP_HOME.to_owned()),
+        ("XDG_CACHE_HOME".to_owned(), CACHE_ROOT.to_owned()),
+        ("XDG_CONFIG_HOME".to_owned(), CONFIG_ROOT.to_owned()),
+        (
+            "XDG_DATA_HOME".to_owned(),
+            "/home/workspace/.local/share".to_owned(),
+        ),
     ]);
     if ssh_enabled {
         if let Some(authorized_key) = control.ssh_authorized_key {
@@ -427,9 +482,9 @@ fn managed_volumes(
     managed_volume_names(sandbox_id)
         .into_iter()
         .zip([
-            ("/home/workspace/.local/share/mise", storage.tools().bytes()),
-            ("/home/workspace/.cache", storage.cache().bytes()),
-            ("/home/workspace/.config/gascan", storage.config().bytes()),
+            (TOOLS_ROOT, storage.tools().bytes()),
+            (CACHE_ROOT, storage.cache().bytes()),
+            (CONFIG_ROOT, storage.config().bytes()),
         ])
         .map(|(name, (target, capacity_bytes))| RuntimeVolume {
             name,

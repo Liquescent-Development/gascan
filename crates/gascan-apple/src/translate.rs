@@ -189,15 +189,9 @@ fn validate_view(view: &CreateView) -> Result<(), TranslationError> {
     }
 
     let expected_volumes = [
-        (
-            format!("gascan-mise-{id}"),
-            "/home/workspace/.local/share/mise",
-        ),
+        (format!("gascan-mise-{id}"), "/home/workspace/.local"),
         (format!("gascan-cache-{id}"), "/home/workspace/.cache"),
-        (
-            format!("gascan-config-{id}"),
-            "/home/workspace/.config/gascan",
-        ),
+        (format!("gascan-config-{id}"), "/home/workspace/.config"),
     ];
     if view.volumes.len() != expected_volumes.len() {
         return Err(TranslationError::InvalidOwnedVolume);
