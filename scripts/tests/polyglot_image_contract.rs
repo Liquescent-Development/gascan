@@ -287,6 +287,57 @@ fn smoke_covers_every_runtime_native_tools_and_browser() {
 }
 
 #[test]
+fn polyglot_smoke_seeds_an_owned_tools_volume_before_rust_commands() {
+    let smoke = fs::read_to_string(root().join("tests/image/polyglot-smoke.sh")).unwrap();
+    for required in [
+        r#"tools_volume="gascan-image-polyglot-tools-$owner_token""#,
+        r#"--volume "$tools_volume:/home/workspace/.local""#,
+        "--env HOME=/home/workspace",
+        "--env CARGO_HOME=/home/workspace/.local/share/cargo",
+        "--env RUSTUP_HOME=/home/workspace/.local/share/rustup",
+        "--bin validate-owned-volume",
+        r#"owned_volume "$tools_volume" && owned_volume "$tools_volume""#,
+        r#"bounded_container volume delete "$tools_volume""#,
+        "volume_inventory_proves_absent",
+    ] {
+        assert!(
+            smoke.contains(required),
+            "missing polyglot Rust-home topology contract: {required}"
+        );
+    }
+    let initialize = smoke
+        .find(
+            r#""$container_bin" exec "$name" env HOME=/home/workspace CARGO_HOME=/home/workspace/.local/share/cargo RUSTUP_HOME=/home/workspace/.local/share/rustup /usr/local/bin/initialize-rust-home"#,
+        )
+        .expect("polyglot smoke must seed the mounted Rust home with exact runtime homes");
+    let inside = smoke
+        .find(
+            r#""$container_bin" exec "$name" bash /workspace/tests/image/polyglot-smoke.sh --inside"#,
+        )
+        .expect("polyglot smoke must run the guest assertions");
+    assert!(
+        initialize < inside,
+        "polyglot smoke ran Rust commands before seeding the mounted Rust home"
+    );
+    let neutral_directory = smoke
+        .find("cd /tmp")
+        .expect("polyglot smoke must avoid repository toolchain overrides");
+    let direct_rust = smoke
+        .find("rustc --version | awk")
+        .expect("polyglot smoke must compare direct rustup dispatch with the mise default");
+    let compile = smoke
+        .find("rustc /tmp/main.rs")
+        .expect("polyglot smoke must compile Rust after selecting a neutral directory");
+    assert!(neutral_directory < direct_rust && direct_rust < compile);
+    assert!(
+        smoke.contains(r#"test "$(rustc --version | awk '{print $2}')" = "$(mise current rust)""#)
+    );
+    assert!(
+        smoke.contains(r#"test "$(cargo --version | awk '{print $2}')" = "$(mise current rust)""#)
+    );
+}
+
+#[test]
 fn polyglot_smoke_fails_closed_without_exact_built_reference() {
     let missing = root().join(".artifacts/definitely-missing-polyglot-image-ref");
     let output = Command::new("bash")

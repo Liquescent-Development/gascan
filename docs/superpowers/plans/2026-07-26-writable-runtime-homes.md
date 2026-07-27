@@ -370,6 +370,8 @@ Create fixtures with a source Rust home containing:
 ```text
 toolchains/1.97.0-aarch64-unknown-linux-gnu/bin/cargo
 update-hashes/1.97.0-aarch64-unknown-linux-gnu
+cargo-bin/rustup
+cargo-bin/{cargo,rustc,...} -> rustup
 ```
 
 Run the script with test-only positional source and destination roots and
@@ -381,6 +383,19 @@ assert:
 - a newly added source toolchain is added without replacing the first;
 - `.gascan-rust-seed.*` staging residue is removed on retry;
 - symlink/non-directory destination collisions fail nonzero;
+- the exact reviewed proxy allowlist is seeded into the writable Cargo bin;
+- missing, unexpected, alternate-target, or alternate-type proxy sources fail
+  nonzero;
+- unsafe Cargo-bin destinations fail without replacing user entries;
+- partial proxy publication is cleaned and succeeds on retry;
+- immutable settings must be regular, non-symlink, size-bounded, and contain
+  exactly one canonical safe default that identifies a validated toolchain;
+- missing, malformed, duplicate, unknown, and unsafe defaults fail nonzero;
+- a minimal rustup-compatible mode-0600 writable settings file is published
+  atomically only when absent, preserving regular user settings unchanged;
+- interrupted settings publication is cleaned and succeeds on retry;
+- a newly bundled future toolchain does not change the immutable-source
+  default;
 - no source file is changed.
 
 - [ ] **Step 2: Write failing provisioning argv and progress tests**
@@ -422,6 +437,8 @@ Use POSIX shell with `set -eu`. Defaults:
 ```sh
 source_root=${1:-/opt/gascan/mise/rustup}
 destination_root=${2:-/home/workspace/.local/share/rustup}
+cargo_source_bin=${3:-/opt/gascan/mise/cargo/bin}
+cargo_destination_bin=${4:-/home/workspace/.local/share/cargo/bin}
 ```
 
 For each direct child of `"$source_root/toolchains"`:
@@ -444,6 +461,27 @@ Write a regular mode-0600
 `$destination_root/.gascan-bundled-toolchains-v1` marker containing sorted
 toolchain names. Trap EXIT/INT/TERM to remove only the script's recorded
 staging path.
+
+Before publication, require `cargo_source_bin` to contain exactly the locked
+allowlist: regular executable `rustup`, plus `cargo`, `cargo-clippy`,
+`cargo-fmt`, `cargo-miri`, `clippy-driver`, `rls`, `rust-analyzer`,
+`rust-gdb`, `rust-gdbgui`, `rust-lldb`, `rustc`, `rustdoc`, and `rustfmt` as
+symlinks whose raw target is exactly `rustup`. Publish a user-owned regular
+`rustup`, then recreate the proxy symlinks using restrictive staging and
+atomic no-clobber renames. Preserve existing executable user entries and
+already-correct proxy symlinks; reject unsafe source or destination types,
+alternate targets, missing names, and unexpected names. Never follow an
+arbitrary source symlink or copy Cargo cache/state.
+
+Treat the regular, non-symlink, strictly size-bounded immutable
+`$source_root/settings.toml` as the only bundled-default source of truth.
+Parse exactly one canonical `default_toolchain` without shell evaluation,
+require a safe basename, and require matching regular executable `cargo` and
+`rustc` in the validated bundled and copied toolchains. If the writable
+settings path is absent, generate only rustup's minimal version/default/profile
+and empty-overrides structure in a mode-0600 temporary file and publish it
+atomically without clobbering. Preserve an existing regular user settings file
+unchanged and reject symlink or non-regular collisions.
 
 - [ ] **Step 5: Add progress step 6 without renumbering existing values**
 

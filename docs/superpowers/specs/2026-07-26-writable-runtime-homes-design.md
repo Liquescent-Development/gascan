@@ -157,7 +157,10 @@ shim.
 
 During first provisioning, Gas Can copies the bundled toolchain from
 `/opt/gascan/mise/rustup` into
-`/home/workspace/.local/share/rustup`. The copy:
+`/home/workspace/.local/share/rustup`. It also seeds the reviewed rustup
+command layout from `/opt/gascan/mise/cargo/bin` into the writable
+`/home/workspace/.local/share/cargo/bin`; otherwise mise selects the copied
+toolchain but its shims cannot find `rustc`, `cargo`, or `rustup`. The copy:
 
 - runs only after the tools volume is mounted and owned by `workspace`;
 - copies as `workspace` without preserving root ownership;
@@ -169,6 +172,25 @@ During first provisioning, Gas Can copies the bundled toolchain from
 - reconciles a newly bundled toolchain after an image update while preserving
   user-installed toolchains, targets, components, and settings;
 - cleans incomplete staging directories after interruption.
+
+The command seed accepts only the locked image layout: a regular executable
+`rustup` and the static allowlist of proxy symlinks whose raw target is exactly
+`rustup`. Missing, unexpected, alternate-target, and alternate-type entries
+fail closed. Gas Can publishes a user-owned regular `rustup` and recreates the
+reviewed proxy symlinks through restrictive staging and atomic no-clobber
+renames. Existing executable user commands and already-correct proxy symlinks
+are preserved; unsafe destination collisions are never overwritten.
+
+The immutable, strictly size-bounded rustup `settings.toml` is the sole source
+of truth for the bundled default. Gas Can parses exactly one canonical, safe
+`default_toolchain` without shell evaluation and requires it to identify a
+validated bundled toolchain with executable Cargo and Rust commands. When the
+user has no rustup settings, Gas Can generates a minimal mode-0600
+rustup-compatible settings file through restrictive staging and atomic
+no-clobber publication. Existing regular user settings are preserved
+unchanged; symlink and non-regular collisions fail closed. This lets direct
+`rustc`, `cargo`, and `rustup` calls use the bundled version from a neutral
+directory without downloads.
 
 The current bundled Rust home is approximately 1.5 GiB. This per-sandbox cost
 is intentional and is charged to the configurable `tools` volume, whose

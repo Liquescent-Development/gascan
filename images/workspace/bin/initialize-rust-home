@@ -3,6 +3,10 @@ set -eu
 
 source_root=${1:-/opt/gascan/mise/rustup}
 destination_root=${2:-/home/workspace/.local/share/rustup}
+cargo_source_bin=${3:-/opt/gascan/mise/cargo/bin}
+cargo_destination_bin=${4:-/home/workspace/.local/share/cargo/bin}
+source_settings=${5:-$source_root/settings.toml}
+destination_settings=${6:-$destination_root/settings.toml}
 stage=
 
 cleanup() {
@@ -27,10 +31,134 @@ if [ -L "$source_root/update-hashes" ] || [ ! -d "$source_root/update-hashes" ];
     printf '%s\n' "invalid Rust update-hash source: $source_root/update-hashes" >&2
     exit 1
 fi
+if [ -L "$cargo_source_bin" ] || [ ! -d "$cargo_source_bin" ]; then
+    printf '%s\n' "invalid Rust proxy source: $cargo_source_bin" >&2
+    exit 1
+fi
+if [ -L "$source_settings" ] || [ ! -f "$source_settings" ]; then
+    printf '%s\n' "invalid immutable rustup settings: $source_settings" >&2
+    exit 1
+fi
+settings_size=$(wc -c <"$source_settings" | tr -d '[:space:]')
+case "$settings_size" in
+    '' | *[!0-9]*)
+        printf '%s\n' "invalid immutable rustup settings size: $source_settings" >&2
+        exit 1
+        ;;
+esac
+if [ "$settings_size" -gt 4096 ]; then
+    printf '%s\n' "oversized immutable rustup settings: $source_settings" >&2
+    exit 1
+fi
+if ! default_toolchain=$(
+    LC_ALL=C awk '
+        BEGIN {
+            count = 0
+            invalid = 0
+        }
+        /^[[:space:]]*default_toolchain[[:space:]]*=/ {
+            count++
+            if ($0 !~ /^default_toolchain = "[A-Za-z0-9][A-Za-z0-9._-]*"$/) {
+                invalid = 1
+                next
+            }
+            value = $0
+            sub(/^default_toolchain = "/, "", value)
+            sub(/"$/, "", value)
+        }
+        END {
+            if (count != 1 || invalid) {
+                exit 1
+            }
+            print value
+        }
+    ' "$source_settings"
+); then
+    printf '%s\n' "invalid default toolchain in immutable rustup settings" >&2
+    exit 1
+fi
+case "$default_toolchain" in
+    '' | .* | *[!A-Za-z0-9._-]*)
+        printf '%s\n' "unsafe default toolchain in immutable rustup settings" >&2
+        exit 1
+        ;;
+esac
+default_source="$source_root/toolchains/$default_toolchain"
+if [ -L "$default_source" ] || [ ! -d "$default_source" ]; then
+    printf '%s\n' "unknown default bundled Rust toolchain: $default_toolchain" >&2
+    exit 1
+fi
+for command in cargo rustc; do
+    selected_command="$default_source/bin/$command"
+    if [ -L "$selected_command" ] ||
+        [ ! -f "$selected_command" ] ||
+        [ ! -x "$selected_command" ]
+    then
+        printf '%s\n' "invalid default bundled Rust command: $selected_command" >&2
+        exit 1
+    fi
+done
+
+is_reviewed_proxy() {
+    case "$1" in
+        cargo | cargo-clippy | cargo-fmt | cargo-miri | clippy-driver | rls | \
+            rust-analyzer | rust-gdb | rust-gdbgui | rust-lldb | rustc | rustdoc | \
+            rustfmt | rustup)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+for source_proxy in \
+    "$cargo_source_bin"/* \
+    "$cargo_source_bin"/.[!.]* \
+    "$cargo_source_bin"/..?*
+do
+    if [ ! -e "$source_proxy" ] && [ ! -L "$source_proxy" ]; then
+        continue
+    fi
+    proxy=${source_proxy##*/}
+    if ! is_reviewed_proxy "$proxy"; then
+        printf '%s\n' "unexpected Rust proxy source: $source_proxy" >&2
+        exit 1
+    fi
+done
+
+source_rustup="$cargo_source_bin/rustup"
+if [ -L "$source_rustup" ] || [ ! -f "$source_rustup" ] || [ ! -x "$source_rustup" ]; then
+    printf '%s\n' "invalid rustup proxy source: $source_rustup" >&2
+    exit 1
+fi
+for proxy in \
+    cargo cargo-clippy cargo-fmt cargo-miri clippy-driver rls rust-analyzer \
+    rust-gdb rust-gdbgui rust-lldb rustc rustdoc rustfmt
+do
+    source_proxy="$cargo_source_bin/$proxy"
+    if [ ! -L "$source_proxy" ] || [ "$(readlink "$source_proxy")" != rustup ]; then
+        printf '%s\n' "invalid Rust proxy source: $source_proxy" >&2
+        exit 1
+    fi
+done
+
 if [ -L "$destination_root" ] ||
     { [ -e "$destination_root" ] && [ ! -d "$destination_root" ]; }
 then
     printf '%s\n' "invalid Rust destination: $destination_root" >&2
+    exit 1
+fi
+if [ -L "$cargo_destination_bin" ] ||
+    { [ -e "$cargo_destination_bin" ] && [ ! -d "$cargo_destination_bin" ]; }
+then
+    printf '%s\n' "invalid Rust proxy destination: $cargo_destination_bin" >&2
+    exit 1
+fi
+if [ -L "$destination_settings" ] ||
+    { [ -e "$destination_settings" ] && [ ! -f "$destination_settings" ]; }
+then
+    printf '%s\n' "invalid writable rustup settings: $destination_settings" >&2
     exit 1
 fi
 
@@ -42,6 +170,35 @@ for directory in "$destination_root/toolchains" "$destination_root/update-hashes
         exit 1
     fi
     install -d -m 0700 "$directory"
+done
+install -d -m 0700 "$cargo_destination_bin"
+
+destination_rustup="$cargo_destination_bin/rustup"
+if [ -L "$destination_rustup" ] ||
+    { [ -e "$destination_rustup" ] &&
+        { [ ! -f "$destination_rustup" ] || [ ! -x "$destination_rustup" ]; }; }
+then
+    printf '%s\n' "invalid rustup proxy destination: $destination_rustup" >&2
+    exit 1
+fi
+for proxy in \
+    cargo cargo-clippy cargo-fmt cargo-miri clippy-driver rls rust-analyzer \
+    rust-gdb rust-gdbgui rust-lldb rustc rustdoc rustfmt
+do
+    destination_proxy="$cargo_destination_bin/$proxy"
+    if [ -L "$destination_proxy" ]; then
+        if [ "$(readlink "$destination_proxy")" != rustup ] ||
+            [ ! -x "$destination_proxy" ]
+        then
+            printf '%s\n' "invalid Rust proxy destination: $destination_proxy" >&2
+            exit 1
+        fi
+    elif [ -e "$destination_proxy" ] &&
+        { [ ! -f "$destination_proxy" ] || [ ! -x "$destination_proxy" ]; }
+    then
+        printf '%s\n' "invalid Rust proxy destination: $destination_proxy" >&2
+        exit 1
+    fi
 done
 
 for source in "$source_root"/toolchains/*; do
@@ -67,8 +224,9 @@ for source in "$source_root"/toolchains/*; do
         exit 1
     fi
 
-    stage="$destination_root/.gascan-rust-seed.$toolchain.$$"
-    mkdir -m 0700 "$stage"
+    seed_stage="$destination_root/.gascan-rust-seed.$toolchain.$$"
+    mkdir -m 0700 "$seed_stage"
+    stage=$seed_stage
     cp -R "$source/." "$stage/"
     if [ ! -x "$stage/bin/cargo" ] || [ ! -x "$stage/bin/rustc" ]; then
         printf '%s\n' "incomplete bundled Rust toolchain: $toolchain" >&2
@@ -86,21 +244,99 @@ for source in "$source_root"/toolchains/*; do
     if [ ! -e "$destination_hash" ] && [ ! -L "$destination_hash" ] &&
         [ -f "$source_hash" ] && [ ! -L "$source_hash" ]
     then
-        hash_stage="$destination_root/.gascan-rust-hash.$toolchain.$$"
+        hash_stage=$(mktemp "$destination_root/.gascan-rust-hash.$toolchain.XXXXXX")
         stage=$hash_stage
-        install -m 0600 "$source_hash" "$hash_stage"
+        chmod 0600 "$hash_stage"
+        cp "$source_hash" "$hash_stage"
         mv --no-clobber --no-target-directory "$hash_stage" "$destination_hash"
         cleanup
     fi
 done
+
+default_destination="$destination_root/toolchains/$default_toolchain"
+for command in cargo rustc; do
+    selected_command="$default_destination/bin/$command"
+    if [ -L "$selected_command" ] ||
+        [ ! -f "$selected_command" ] ||
+        [ ! -x "$selected_command" ]
+    then
+        printf '%s\n' "invalid copied default Rust command: $selected_command" >&2
+        exit 1
+    fi
+done
+
+if [ ! -e "$destination_rustup" ] && [ ! -L "$destination_rustup" ]; then
+    rustup_stage=$(mktemp "$cargo_destination_bin/.gascan-rust-proxy.rustup.XXXXXX")
+    stage=$rustup_stage
+    chmod 0600 "$rustup_stage"
+    cp "$source_rustup" "$rustup_stage"
+    chmod 0700 "$rustup_stage"
+    if [ -L "$rustup_stage" ] || [ ! -f "$rustup_stage" ] || [ ! -x "$rustup_stage" ]; then
+        printf '%s\n' "incomplete rustup proxy publication" >&2
+        exit 1
+    fi
+    mv --no-clobber --no-target-directory "$rustup_stage" "$destination_rustup"
+    cleanup
+fi
+if [ -L "$destination_rustup" ] ||
+    [ ! -f "$destination_rustup" ] ||
+    [ ! -x "$destination_rustup" ]
+then
+    printf '%s\n' "invalid published rustup proxy: $destination_rustup" >&2
+    exit 1
+fi
+
+for proxy in \
+    cargo cargo-clippy cargo-fmt cargo-miri clippy-driver rls rust-analyzer \
+    rust-gdb rust-gdbgui rust-lldb rustc rustdoc rustfmt
+do
+    destination_proxy="$cargo_destination_bin/$proxy"
+    if [ ! -e "$destination_proxy" ] && [ ! -L "$destination_proxy" ]; then
+        proxy_stage=$(mktemp -d "$cargo_destination_bin/.gascan-rust-proxy.$proxy.XXXXXX")
+        stage=$proxy_stage
+        ln -s rustup "$proxy_stage/proxy"
+        mv --no-clobber --no-target-directory "$proxy_stage/proxy" "$destination_proxy"
+        cleanup
+    fi
+    if [ -L "$destination_proxy" ]; then
+        if [ "$(readlink "$destination_proxy")" != rustup ] ||
+            [ ! -x "$destination_proxy" ]
+        then
+            printf '%s\n' "invalid published Rust proxy: $destination_proxy" >&2
+            exit 1
+        fi
+    elif [ ! -f "$destination_proxy" ] || [ ! -x "$destination_proxy" ]; then
+        printf '%s\n' "invalid published Rust proxy: $destination_proxy" >&2
+        exit 1
+    fi
+done
+
+if [ ! -e "$destination_settings" ] && [ ! -L "$destination_settings" ]; then
+    settings_stage=$(mktemp "$destination_root/.gascan-rust-settings.XXXXXX")
+    stage=$settings_stage
+    chmod 0600 "$settings_stage"
+    {
+        printf '%s\n' 'version = "12"'
+        printf 'default_toolchain = "%s"\n' "$default_toolchain"
+        printf '%s\n' 'profile = "default"'
+        printf '\n%s\n' '[overrides]'
+    } >"$settings_stage"
+    chmod 0600 "$settings_stage"
+    mv --no-clobber --no-target-directory "$settings_stage" "$destination_settings"
+    cleanup
+fi
+if [ -L "$destination_settings" ] || [ ! -f "$destination_settings" ]; then
+    printf '%s\n' "invalid published writable rustup settings: $destination_settings" >&2
+    exit 1
+fi
 
 marker="$destination_root/.gascan-bundled-toolchains-v1"
 if [ -L "$marker" ] || { [ -e "$marker" ] && [ ! -f "$marker" ]; }; then
     printf '%s\n' "invalid Rust toolchain marker: $marker" >&2
     exit 1
 fi
-stage="$destination_root/.gascan-rust-marker.$$"
-mkdir -m 0700 "$stage"
+marker_directory=$(mktemp -d "$destination_root/.gascan-rust-marker.XXXXXX")
+stage=$marker_directory
 marker_stage="$stage/marker"
 : >"$marker_stage"
 chmod 0600 "$marker_stage"

@@ -30,7 +30,14 @@ fn rust_seed_command(
     test_root: &Path,
 ) -> Command {
     let mut command = Command::new(script);
-    command.arg(source).arg(destination);
+    command
+        .arg(source)
+        .arg(destination)
+        .arg(source.join("cargo-bin"))
+        .arg(destination.join("cargo-bin"));
+    let test_bin = test_root.join("test-bin");
+    fs::create_dir_all(&test_bin).unwrap();
+    let mut path = vec![test_bin];
     #[cfg(target_os = "macos")]
     {
         let bin = test_root.join("gnu-bin");
@@ -43,19 +50,56 @@ fn rust_seed_command(
                 .expect("GNU mv is required to exercise Linux publication semantics on macOS");
             symlink(gmv, &mv).unwrap();
         }
-        let mut path = vec![bin];
-        path.extend(std::env::split_paths(
-            &std::env::var_os("PATH").unwrap_or_default(),
-        ));
-        command.env(
-            "PATH",
-            std::env::join_paths(path).unwrap_or(OsString::new()),
-        );
+        path.push(bin);
     }
+    path.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    command.env(
+        "PATH",
+        std::env::join_paths(path).unwrap_or(OsString::new()),
+    );
     command
 }
 
+const RUST_PROXIES: [&str; 14] = [
+    "cargo",
+    "cargo-clippy",
+    "cargo-fmt",
+    "cargo-miri",
+    "clippy-driver",
+    "rls",
+    "rust-analyzer",
+    "rust-gdb",
+    "rust-gdbgui",
+    "rust-lldb",
+    "rustc",
+    "rustdoc",
+    "rustfmt",
+    "rustup",
+];
+
+fn write_test_rust_proxies(source_root: &Path) {
+    let bin = source_root.join("cargo-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let rustup = bin.join("rustup");
+    if !rustup.exists() {
+        fs::write(&rustup, "#!/bin/sh\nprintf 'rustup proxy\\n'\n").unwrap();
+        fs::set_permissions(&rustup, fs::Permissions::from_mode(0o555)).unwrap();
+    }
+    for proxy in RUST_PROXIES {
+        if proxy == "rustup" {
+            continue;
+        }
+        let path = bin.join(proxy);
+        if !path.symlink_metadata().is_ok() {
+            symlink("rustup", path).unwrap();
+        }
+    }
+}
+
 fn write_test_toolchain(source_root: &Path, name: &str, cargo: &str) {
+    write_test_rust_proxies(source_root);
     let bin = source_root.join("toolchains").join(name).join("bin");
     fs::create_dir_all(&bin).unwrap();
     fs::write(bin.join("cargo"), cargo).unwrap();
@@ -69,13 +113,50 @@ fn write_test_toolchain(source_root: &Path, name: &str, cargo: &str) {
         format!("hash for {name}\n"),
     )
     .unwrap();
+    let settings = source_root.join("settings.toml");
+    if !settings.exists() {
+        fs::write(
+            &settings,
+            format!(
+                "version = \"12\"\ndefault_toolchain = \"{name}\"\nprofile = \"default\"\n\n[overrides]\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&settings, fs::Permissions::from_mode(0o444)).unwrap();
+    }
 }
 
 fn rust_staging_residue(destination_root: &Path) -> Vec<String> {
+    if !destination_root.is_dir() {
+        return Vec::new();
+    }
     fs::read_dir(destination_root)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
         .filter(|name| name.starts_with(".gascan-rust-"))
+        .collect()
+}
+
+fn rust_proxy_staging_residue(destination_root: &Path) -> Vec<String> {
+    let bin = destination_root.join("cargo-bin");
+    if !bin.is_dir() {
+        return Vec::new();
+    }
+    fs::read_dir(bin)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with(".gascan-rust-proxy."))
+        .collect()
+}
+
+fn rust_settings_staging_residue(destination_root: &Path) -> Vec<String> {
+    if !destination_root.is_dir() {
+        return Vec::new();
+    }
+    fs::read_dir(destination_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with(".gascan-rust-settings."))
         .collect()
 }
 
@@ -94,6 +175,17 @@ fn writable_rust_bootstrap_is_idempotent_fail_closed_and_never_mutates_source() 
     let user_toolchain = destination.join("toolchains/user-installed");
     fs::create_dir_all(&user_toolchain).unwrap();
     fs::write(user_toolchain.join("sentinel"), "keep me\n").unwrap();
+    let user_cargo = destination.join("cargo-bin/cargo");
+    fs::create_dir_all(user_cargo.parent().unwrap()).unwrap();
+    fs::write(&user_cargo, "user cargo\n").unwrap();
+    fs::set_permissions(&user_cargo, fs::Permissions::from_mode(0o700)).unwrap();
+    let user_cargo_inode = fs::metadata(&user_cargo).unwrap().ino();
+    let source_rustup = source.join("cargo-bin/rustup");
+    let source_rustup_inode = fs::metadata(&source_rustup).unwrap().ino();
+    let source_rustup_contents = fs::read(&source_rustup).unwrap();
+    let source_settings = source.join("settings.toml");
+    let source_settings_inode = fs::metadata(&source_settings).unwrap().ino();
+    let source_settings_contents = fs::read(&source_settings).unwrap();
 
     let run = || rust_seed_command(&script, &source, &destination, temp.path()).status();
     assert!(run().unwrap().success());
@@ -116,12 +208,87 @@ fn writable_rust_bootstrap_is_idempotent_fail_closed_and_never_mutates_source() 
     let marker = destination.join(".gascan-bundled-toolchains-v1");
     let marker_inode = fs::metadata(&marker).unwrap().ino();
     let marker_contents = fs::read(&marker).unwrap();
+    let published_rustup = destination.join("cargo-bin/rustup");
+    assert!(published_rustup.is_file());
+    assert!(
+        !published_rustup
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        fs::metadata(&published_rustup)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(fs::read(&published_rustup).unwrap(), source_rustup_contents);
+    for proxy in RUST_PROXIES {
+        let published = destination.join("cargo-bin").join(proxy);
+        if proxy == "rustup" || proxy == "cargo" {
+            continue;
+        }
+        assert!(
+            published
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "{proxy} was not published as an exact rustup proxy"
+        );
+        assert_eq!(fs::read_link(&published).unwrap(), Path::new("rustup"));
+    }
+    assert_eq!(fs::metadata(&user_cargo).unwrap().ino(), user_cargo_inode);
+    assert_eq!(fs::read(&user_cargo).unwrap(), b"user cargo\n");
+    let rustup_inode = fs::metadata(&published_rustup).unwrap().ino();
+    let published_settings = destination.join("settings.toml");
+    let expected_settings = "version = \"12\"\ndefault_toolchain = \"1.97.0-aarch64-unknown-linux-gnu\"\nprofile = \"default\"\n\n[overrides]\n";
+    assert_eq!(
+        fs::read_to_string(&published_settings).unwrap(),
+        expected_settings
+    );
+    assert_eq!(
+        fs::metadata(&published_settings)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let settings_inode = fs::metadata(&published_settings).unwrap().ino();
+    let rustc_inode = published_rustup
+        .parent()
+        .unwrap()
+        .join("rustc")
+        .symlink_metadata()
+        .unwrap()
+        .ino();
 
     assert!(run().unwrap().success());
     assert_eq!(fs::metadata(&published).unwrap().ino(), first_inode);
     assert_eq!(fs::read(&published).unwrap(), first_contents);
     assert_eq!(fs::metadata(&marker).unwrap().ino(), marker_inode);
     assert_eq!(fs::read(&marker).unwrap(), marker_contents);
+    assert_eq!(fs::metadata(&published_rustup).unwrap().ino(), rustup_inode);
+    assert_eq!(
+        fs::metadata(&published_settings).unwrap().ino(),
+        settings_inode
+    );
+    assert_eq!(
+        published_rustup
+            .parent()
+            .unwrap()
+            .join("rustc")
+            .symlink_metadata()
+            .unwrap()
+            .ino(),
+        rustc_inode
+    );
+    assert_eq!(fs::metadata(&user_cargo).unwrap().ino(), user_cargo_inode);
+    assert_eq!(fs::read(&user_cargo).unwrap(), b"user cargo\n");
     assert_eq!(
         fs::read_to_string(user_toolchain.join("sentinel")).unwrap(),
         "keep me\n"
@@ -153,6 +320,30 @@ fn writable_rust_bootstrap_is_idempotent_fail_closed_and_never_mutates_source() 
     );
     assert_eq!(fs::metadata(&source_cargo).unwrap().ino(), source_inode);
     assert_eq!(fs::read(&source_cargo).unwrap(), source_contents);
+    assert_eq!(
+        fs::metadata(&source_rustup).unwrap().ino(),
+        source_rustup_inode
+    );
+    assert_eq!(fs::read(&source_rustup).unwrap(), source_rustup_contents);
+    assert_eq!(
+        fs::metadata(&source_settings).unwrap().ino(),
+        source_settings_inode
+    );
+    assert_eq!(
+        fs::read(&source_settings).unwrap(),
+        source_settings_contents
+    );
+    assert_eq!(
+        fs::metadata(&published_settings).unwrap().ino(),
+        settings_inode
+    );
+    assert_eq!(
+        fs::read_to_string(&published_settings).unwrap(),
+        expected_settings,
+        "adding a future bundled toolchain changed the immutable-source default"
+    );
+    assert!(rust_proxy_staging_residue(&destination).is_empty());
+    assert!(rust_settings_staging_residue(&destination).is_empty());
 }
 
 #[test]
@@ -226,6 +417,355 @@ fn writable_rust_bootstrap_rejects_unsafe_source_root_components() {
             "accepted {collision} update-hashes root"
         );
     }
+}
+
+#[test]
+fn writable_rust_bootstrap_requires_the_exact_reviewed_proxy_source_layout() {
+    let script = root().join("images/workspace/bin/initialize-rust-home");
+    let temp = tempfile::tempdir().unwrap();
+    let bundled = "1.97.0-aarch64-unknown-linux-gnu";
+
+    for case in [
+        "cargo-bin-symlink",
+        "cargo-bin-file",
+        "rustup-symlink",
+        "missing-proxy",
+        "regular-proxy",
+        "alternate-target",
+        "unexpected-entry",
+    ] {
+        let source = temp.path().join(format!("source-{case}"));
+        let destination = temp.path().join(format!("destination-{case}"));
+        write_test_toolchain(&source, bundled, "cargo\n");
+        let cargo_bin = source.join("cargo-bin");
+        match case {
+            "cargo-bin-symlink" => {
+                fs::remove_dir_all(&cargo_bin).unwrap();
+                symlink(
+                    temp.path().join("source-missing-proxy/cargo-bin"),
+                    &cargo_bin,
+                )
+                .unwrap();
+            }
+            "cargo-bin-file" => {
+                fs::remove_dir_all(&cargo_bin).unwrap();
+                fs::write(&cargo_bin, "not a directory\n").unwrap();
+            }
+            "rustup-symlink" => {
+                fs::remove_file(cargo_bin.join("rustup")).unwrap();
+                symlink("/bin/true", cargo_bin.join("rustup")).unwrap();
+            }
+            "missing-proxy" => fs::remove_file(cargo_bin.join("rustc")).unwrap(),
+            "regular-proxy" => {
+                fs::remove_file(cargo_bin.join("rustc")).unwrap();
+                fs::write(cargo_bin.join("rustc"), "not the reviewed symlink\n").unwrap();
+                fs::set_permissions(cargo_bin.join("rustc"), fs::Permissions::from_mode(0o755))
+                    .unwrap();
+            }
+            "alternate-target" => {
+                fs::remove_file(cargo_bin.join("rustc")).unwrap();
+                symlink("./rustup", cargo_bin.join("rustc")).unwrap();
+            }
+            "unexpected-entry" => fs::write(cargo_bin.join("rustup-init"), "unexpected\n").unwrap(),
+            _ => unreachable!(),
+        }
+        let rejected = rust_seed_command(&script, &source, &destination, temp.path())
+            .status()
+            .unwrap();
+        assert!(!rejected.success(), "accepted unsafe proxy source: {case}");
+        assert!(
+            rust_proxy_staging_residue(&destination).is_empty(),
+            "left proxy staging residue for {case}"
+        );
+    }
+}
+
+#[test]
+fn writable_rust_bootstrap_rejects_unsafe_proxy_destinations_without_overwriting_them() {
+    let script = root().join("images/workspace/bin/initialize-rust-home");
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    write_test_toolchain(&source, "1.97.0-aarch64-unknown-linux-gnu", "cargo\n");
+
+    for case in [
+        "cargo-bin-symlink",
+        "cargo-bin-file",
+        "rustup-symlink",
+        "proxy-alternate-target",
+        "proxy-directory",
+        "proxy-nonexecutable-file",
+    ] {
+        let destination = temp.path().join(format!("destination-{case}"));
+        fs::create_dir_all(&destination).unwrap();
+        let cargo_bin = destination.join("cargo-bin");
+        match case {
+            "cargo-bin-symlink" => symlink(temp.path(), &cargo_bin).unwrap(),
+            "cargo-bin-file" => fs::write(&cargo_bin, "not a directory\n").unwrap(),
+            _ => {
+                fs::create_dir(&cargo_bin).unwrap();
+                match case {
+                    "rustup-symlink" => symlink("/bin/true", cargo_bin.join("rustup")).unwrap(),
+                    "proxy-alternate-target" => {
+                        symlink("./rustup", cargo_bin.join("rustc")).unwrap()
+                    }
+                    "proxy-directory" => fs::create_dir(cargo_bin.join("rustc")).unwrap(),
+                    "proxy-nonexecutable-file" => {
+                        fs::write(cargo_bin.join("rustc"), "user rustc\n").unwrap();
+                        fs::set_permissions(
+                            cargo_bin.join("rustc"),
+                            fs::Permissions::from_mode(0o600),
+                        )
+                        .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        let before = fs::symlink_metadata(if case.starts_with("cargo-bin") {
+            cargo_bin.clone()
+        } else if case == "rustup-symlink" {
+            cargo_bin.join("rustup")
+        } else {
+            cargo_bin.join("rustc")
+        })
+        .unwrap()
+        .ino();
+        let rejected = rust_seed_command(&script, &source, &destination, temp.path())
+            .status()
+            .unwrap();
+        assert!(
+            !rejected.success(),
+            "accepted unsafe proxy destination: {case}"
+        );
+        let collision = if case.starts_with("cargo-bin") {
+            cargo_bin
+        } else if case == "rustup-symlink" {
+            cargo_bin.join("rustup")
+        } else {
+            cargo_bin.join("rustc")
+        };
+        assert_eq!(
+            fs::symlink_metadata(collision).unwrap().ino(),
+            before,
+            "overwrote user entry for {case}"
+        );
+        assert!(rust_proxy_staging_residue(&destination).is_empty());
+    }
+}
+
+#[test]
+fn writable_rust_bootstrap_cleans_an_incomplete_proxy_publication_and_retries() {
+    let script = root().join("images/workspace/bin/initialize-rust-home");
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let destination = temp.path().join("destination");
+    write_test_toolchain(&source, "1.97.0-aarch64-unknown-linux-gnu", "cargo\n");
+    let test_bin = temp.path().join("test-bin");
+    fs::create_dir(&test_bin).unwrap();
+    let fake_cp = test_bin.join("cp");
+    fs::write(
+        &fake_cp,
+        "#!/bin/sh\ncase \"$1\" in\n  */cargo-bin/rustup) : >\"$2\"; exit 23 ;;\nesac\nexec /bin/cp \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_cp, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let failed = rust_seed_command(&script, &source, &destination, temp.path())
+        .status()
+        .unwrap();
+    assert!(!failed.success());
+    assert!(rust_proxy_staging_residue(&destination).is_empty());
+    assert!(
+        !destination.join("cargo-bin/rustup").exists(),
+        "published an incomplete rustup"
+    );
+
+    fs::remove_file(fake_cp).unwrap();
+    assert!(
+        rust_seed_command(&script, &source, &destination, temp.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(destination.join("cargo-bin/rustup").is_file());
+    assert!(rust_proxy_staging_residue(&destination).is_empty());
+}
+
+#[test]
+fn writable_rust_bootstrap_rejects_unsafe_or_ambiguous_default_toolchain_settings() {
+    let script = root().join("images/workspace/bin/initialize-rust-home");
+    let temp = tempfile::tempdir().unwrap();
+    let bundled = "1.97.0-aarch64-unknown-linux-gnu";
+
+    for case in [
+        "missing",
+        "symlink",
+        "directory",
+        "oversized",
+        "missing-default",
+        "duplicate-default",
+        "unsafe-default",
+        "unknown-default",
+        "malformed-default",
+        "selected-cargo-symlink",
+        "selected-rustc-directory",
+        "selected-rustc-nonexecutable",
+    ] {
+        let source = temp.path().join(format!("settings-source-{case}"));
+        let destination = temp.path().join(format!("settings-destination-{case}"));
+        write_test_toolchain(&source, bundled, "cargo\n");
+        let settings = source.join("settings.toml");
+        fs::remove_file(&settings).unwrap();
+        match case {
+            "missing" => {}
+            "symlink" => {
+                let target = temp.path().join("settings-target.toml");
+                if !target.exists() {
+                    fs::write(&target, format!("default_toolchain = \"{bundled}\"\n")).unwrap();
+                }
+                symlink(target, &settings).unwrap();
+            }
+            "directory" => fs::create_dir(&settings).unwrap(),
+            "oversized" => fs::write(&settings, vec![b'x'; 4097]).unwrap(),
+            "missing-default" => fs::write(&settings, "version = \"12\"\n").unwrap(),
+            "duplicate-default" => fs::write(
+                &settings,
+                format!("default_toolchain = \"{bundled}\"\ndefault_toolchain = \"{bundled}\"\n"),
+            )
+            .unwrap(),
+            "unsafe-default" => {
+                fs::write(&settings, "default_toolchain = \"../outside\"\n").unwrap()
+            }
+            "unknown-default" => fs::write(
+                &settings,
+                "default_toolchain = \"1.98.0-aarch64-unknown-linux-gnu\"\n",
+            )
+            .unwrap(),
+            "malformed-default" => {
+                fs::write(&settings, format!("default_toolchain=\"{bundled}\"\n")).unwrap()
+            }
+            "selected-cargo-symlink"
+            | "selected-rustc-directory"
+            | "selected-rustc-nonexecutable" => {
+                fs::write(&settings, format!("default_toolchain = \"{bundled}\"\n")).unwrap();
+                let selected = source.join("toolchains").join(bundled).join("bin");
+                match case {
+                    "selected-cargo-symlink" => {
+                        fs::remove_file(selected.join("cargo")).unwrap();
+                        symlink("/bin/true", selected.join("cargo")).unwrap();
+                    }
+                    "selected-rustc-directory" => {
+                        fs::remove_file(selected.join("rustc")).unwrap();
+                        fs::create_dir(selected.join("rustc")).unwrap();
+                    }
+                    "selected-rustc-nonexecutable" => {
+                        fs::set_permissions(
+                            selected.join("rustc"),
+                            fs::Permissions::from_mode(0o644),
+                        )
+                        .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            _ => unreachable!(),
+        }
+        let rejected = rust_seed_command(&script, &source, &destination, temp.path())
+            .status()
+            .unwrap();
+        assert!(
+            !rejected.success(),
+            "accepted unsafe immutable settings: {case}"
+        );
+        assert!(rust_settings_staging_residue(&destination).is_empty());
+    }
+}
+
+#[test]
+fn writable_rust_bootstrap_preserves_user_settings_and_rejects_unsafe_collisions() {
+    let script = root().join("images/workspace/bin/initialize-rust-home");
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    write_test_toolchain(&source, "1.97.0-aarch64-unknown-linux-gnu", "cargo\n");
+
+    let user_destination = temp.path().join("user-destination");
+    fs::create_dir(&user_destination).unwrap();
+    let user_settings = user_destination.join("settings.toml");
+    fs::write(&user_settings, "user-owned settings\n").unwrap();
+    fs::set_permissions(&user_settings, fs::Permissions::from_mode(0o600)).unwrap();
+    let user_inode = fs::metadata(&user_settings).unwrap().ino();
+    assert!(
+        rust_seed_command(&script, &source, &user_destination, temp.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(fs::metadata(&user_settings).unwrap().ino(), user_inode);
+    assert_eq!(
+        fs::read_to_string(&user_settings).unwrap(),
+        "user-owned settings\n"
+    );
+
+    for case in ["symlink", "directory"] {
+        let destination = temp.path().join(format!("unsafe-settings-{case}"));
+        fs::create_dir(&destination).unwrap();
+        let settings = destination.join("settings.toml");
+        if case == "symlink" {
+            symlink(&user_settings, &settings).unwrap();
+        } else {
+            fs::create_dir(&settings).unwrap();
+        }
+        let inode = fs::symlink_metadata(&settings).unwrap().ino();
+        let rejected = rust_seed_command(&script, &source, &destination, temp.path())
+            .status()
+            .unwrap();
+        assert!(!rejected.success(), "accepted {case} user settings");
+        assert_eq!(fs::symlink_metadata(&settings).unwrap().ino(), inode);
+        assert!(rust_settings_staging_residue(&destination).is_empty());
+    }
+}
+
+#[test]
+fn writable_rust_bootstrap_cleans_interrupted_settings_publication_and_retries() {
+    let script = root().join("images/workspace/bin/initialize-rust-home");
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let destination = temp.path().join("destination");
+    write_test_toolchain(&source, "1.97.0-aarch64-unknown-linux-gnu", "cargo\n");
+    let test_bin = temp.path().join("test-bin");
+    fs::create_dir(&test_bin).unwrap();
+    let fake_mv = test_bin.join("mv");
+    fs::write(
+        &fake_mv,
+        "#!/bin/sh\nfor arg in \"$@\"; do\n  case \"$arg\" in */.gascan-rust-settings.*) exit 23 ;; esac\ndone\nexec \"$GASCAN_TEST_REAL_MV\" \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_mv, fs::Permissions::from_mode(0o700)).unwrap();
+    #[cfg(target_os = "macos")]
+    let real_mv = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|directory| directory.join("gmv"))
+        .find(|candidate| candidate.is_file())
+        .unwrap();
+    #[cfg(not(target_os = "macos"))]
+    let real_mv = Path::new("/bin/mv").to_path_buf();
+
+    let failed = rust_seed_command(&script, &source, &destination, temp.path())
+        .env("GASCAN_TEST_REAL_MV", real_mv)
+        .status()
+        .unwrap();
+    assert!(!failed.success());
+    assert!(!destination.join("settings.toml").exists());
+    assert!(rust_settings_staging_residue(&destination).is_empty());
+
+    fs::remove_file(fake_mv).unwrap();
+    assert!(
+        rust_seed_command(&script, &source, &destination, temp.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(destination.join("settings.toml").is_file());
+    assert!(rust_settings_staging_residue(&destination).is_empty());
 }
 
 #[test]
@@ -497,10 +1037,7 @@ fn profile_defaults_are_exact_and_idempotent() {
             "MISE_GLOBAL_CONFIG_FILE",
             "/home/workspace/.config/gascan/mise.toml",
         ),
-        (
-            "MISE_SYSTEM_CONFIG_FILE",
-            "/etc/mise/config.toml",
-        ),
+        ("MISE_SYSTEM_CONFIG_FILE", "/etc/mise/config.toml"),
         (
             "MISE_STATE_DIR",
             "/home/workspace/.config/gascan/mise-state",
