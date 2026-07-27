@@ -18,9 +18,9 @@ Its live gate exposed three stale or incomplete assumptions:
    proxies and default settings behind in the immutable Cargo/Rust homes.
 
 The first two fixes are committed as `01b4663` and `991715a`. The third fix is
-committed as `ba938ea`; the independent review fixes described below are
-implemented and verified locally but not yet committed at the time of this
-report update.
+committed as `ba938ea`, with the independent review fixes committed as
+`de2f07d`. The refreshed review approved rebuilding with one minor positive
+test note, closed below.
 
 No remote candidate has been published. The approval candidate file remains
 absent, and neither `images/workspace/approved-image.txt` nor connected-image
@@ -201,6 +201,31 @@ shell syntax, focused rustfmt, and git diff checks
 PASS
 ```
 
+## Refreshed Review and Minor Closure
+
+The read-only package
+`.superpowers/sdd/2026-07-26-writable-runtime-homes/review-ba938ea-de2f07d.diff`
+contained the one focused review-fix commit and 38,060 bytes of plan, diff, and
+status context. The independent re-review closed both Important findings and
+approved rebuilding.
+
+Its one Minor note was that the parser's optional no-`[overrides]` branch had
+no positive fixture. A test-only fixture now supplies exact canonical
+version/default/profile records with no table, proves bootstrap success, and
+proves the generated writable settings remain rustup's minimal empty-overrides
+shape:
+
+```text
+writable_rust_bootstrap_accepts_canonical_settings_without_overrides_table
+PASS
+
+rtk cargo test --manifest-path scripts/Cargo.toml --test image_user_contract
+29 passed
+
+rtk git diff --check
+PASS
+```
+
 ## External-State Safety
 
 - All diagnostic and live-proof containers and volumes used unique random
@@ -214,12 +239,11 @@ PASS
 
 ## Remaining Work
 
-1. Commit the strict-parser/crash-retry review fixes.
-2. Regenerate the read-only review package and receive independent approval.
-3. Run a fresh no-cache connected build and the complete live gate.
-4. Publish one unique digest-derived immutable GHCR candidate.
-5. Pull and inspect the exact remote digest, run remote digest-pinned smokes,
+1. Commit the minor positive parser fixture.
+2. Run a fresh no-cache connected build and the complete live gate.
+3. Publish one unique digest-derived immutable GHCR candidate.
+4. Pull and inspect the exact remote digest, run remote digest-pinned smokes,
    and record immutable evidence.
-6. Use only the approval script to update approval/evidence.
-7. Finish this report with final digests, timestamps, gate results, publication
+5. Use only the approval script to update approval/evidence.
+6. Finish this report with final digests, timestamps, gate results, publication
    evidence, cleanup proof, and approval commit.

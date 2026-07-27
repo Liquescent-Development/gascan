@@ -798,6 +798,37 @@ fn writable_rust_bootstrap_rejects_unsafe_or_ambiguous_default_toolchain_setting
 }
 
 #[test]
+fn writable_rust_bootstrap_accepts_canonical_settings_without_overrides_table() {
+    let script = root().join("images/workspace/bin/initialize-rust-home");
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let destination = temp.path().join("destination");
+    let bundled = "1.97.0-aarch64-unknown-linux-gnu";
+    write_test_toolchain(&source, bundled, "cargo\n");
+    let source_settings = source.join("settings.toml");
+    fs::remove_file(&source_settings).unwrap();
+    fs::write(
+        &source_settings,
+        format!("version = \"12\"\ndefault_toolchain = \"{bundled}\"\nprofile = \"default\"\n"),
+    )
+    .unwrap();
+    fs::set_permissions(&source_settings, fs::Permissions::from_mode(0o444)).unwrap();
+
+    assert!(
+        rust_seed_command(&script, &source, &destination, temp.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        fs::read_to_string(destination.join("settings.toml")).unwrap(),
+        format!(
+            "version = \"12\"\ndefault_toolchain = \"{bundled}\"\nprofile = \"default\"\n\n[overrides]\n"
+        )
+    );
+}
+
+#[test]
 fn writable_rust_bootstrap_preserves_user_settings_and_rejects_unsafe_collisions() {
     let script = root().join("images/workspace/bin/initialize-rust-home");
     let temp = tempfile::tempdir().unwrap();
