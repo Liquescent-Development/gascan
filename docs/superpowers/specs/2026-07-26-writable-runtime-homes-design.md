@@ -68,9 +68,12 @@ metadata, and independent lifecycle, but their mount targets become:
 | `cache` | `/home/workspace/.cache` | disposable but persistent download, registry, module, and build caches |
 | `config` | `/home/workspace/.config` | Gas Can state, agent credentials/configuration, CLI configuration, and XDG application configuration |
 
-The daemon initializes all three mounted roots as directories owned by
-`workspace:workspace` with mode `0700`. Image assembly creates the same root
-shape so direct image checks and production containers agree.
+The daemon initializes the tools and cache roots as
+`workspace:workspace` mode `0700`. It initializes the config root as
+`root:workspace` mode `1770`: the workspace group can create conventional XDG
+configuration, while the sticky bit prevents the workspace user from
+renaming or deleting Gas Can's root-owned SSH entries. Image assembly creates
+the same root shape so direct image checks and production containers agree.
 
 The image `VOLUME` declaration, policy compiler, storage-capacity extraction,
 runtime inspection expectations, workstation contract, and documentation all
