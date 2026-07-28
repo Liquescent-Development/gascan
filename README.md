@@ -128,8 +128,15 @@ gascan up .
 gascan shell
 ```
 
-The shell opens at `/workspace`, backed by the project directory on the Mac.
-Claude Code and Herdr are ready to launch inside it:
+`gascan shell` opens interactive login Bash with colors and completion. It
+starts at `/workspace`, backed by the project directory on the Mac, so it is
+immediately ready for normal project commands:
+
+```sh
+git status
+```
+
+Claude Code and Herdr are also ready to launch inside it:
 
 ```sh
 claude --version
@@ -317,6 +324,11 @@ tools = "10GiB"
 cache = "10GiB"
 config = "1GiB"
 
+[shell]
+prompt = "standard"
+# prompt = "starship"
+# prompt = "starship-nerd-font"
+
 [tools]                         # mise tool name = version
 node = "lts"
 python = "3.13"
@@ -367,6 +379,37 @@ stable. An explicit port is used exactly, and a collision fails with
 `host_port` is invalid when `enabled = false`, and it cannot collide with a
 port declared in `[ports]`. Unknown SSH keys are rejected. Gas Can never
 silently changes `network` to satisfy an SSH setting.
+
+### `[shell]`
+
+Controls the prompt for interactive Bash login sessions:
+
+| Value | Behavior |
+| --- | --- |
+| `standard` | Native colored Bash prompt with Bash completion. |
+| `starship` | Managed Starship preset that works with ordinary terminal fonts. |
+| `starship-nerd-font` | Richer managed Starship preset with Nerd Font icons and separators. |
+
+`standard` is the default, backward-compatible prompt.
+It does not activate Starship.
+Both Starship modes use Gas Can's pinned, offline-capable Starship binary.
+`starship` requires no special font.
+`starship-nerd-font` requires a Nerd Font installed and selected in the host
+macOS terminal.
+Gas Can does not install fonts on the host.
+
+The same prompt choice applies to both `gascan shell` and SSH.
+Run `gascan apply` after changing the prompt. The new selection takes effect
+in the next interactive login session.
+
+`gascan shell -- <argv>` preserves the explicit-command escape hatch: Gas Can
+forwards the arguments unchanged and does not substitute its managed default
+login Bash. The explicit command controls its own shell startup behavior.
+
+Gas Can protects its pinned binary and root-managed prompt files from
+workspace-user mutation.
+Pre-existing same-user interactive shell customization is trusted caller
+state; it is not a same-shell isolation boundary.
 
 ### `user`
 

@@ -8,6 +8,11 @@ gascamp = "bundled"
 cpus = 2
 memory = "4GiB"
 
+[shell]
+prompt = "standard"
+# prompt = "starship"
+# prompt = "starship-nerd-font"
+
 [tools]
 node = "24.18.0"
 python = "3.14.6"
