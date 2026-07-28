@@ -469,22 +469,7 @@ async fn production_doctor_report() -> DoctorReport {
         }
         Err(error) => facts.service = service_error_fact(&error),
     }
-    if [
-        &facts.cli,
-        &facts.version,
-        &facts.service,
-        &facts.schema,
-        &facts.offline,
-    ]
-    .into_iter()
-    .all(|fact| fact.status == gascan_core::doctor::DoctorStatus::Pass)
-    {
-        facts.workspace = workspace_fact(&std::env::current_dir());
-    } else {
-        facts.workspace = DoctorFact::unknown(
-            "workspace was not accessed because an earlier runtime prerequisite failed",
-        );
-    }
+    facts.workspace = DoctorFact::unknown("workspace access is evaluated for each Doctor request");
     facts.into_report()
 }
 
@@ -567,21 +552,6 @@ fn macos_fact_at(path: &std::path::Path) -> DoctorFact {
             "SystemVersion.plist ProductVersion is {version}; macOS 26+ required"
         )),
         None => DoctorFact::fail("could not parse ProductVersion from SystemVersion.plist"),
-    }
-}
-
-fn workspace_fact(result: &std::io::Result<std::path::PathBuf>) -> DoctorFact {
-    let metadata = result
-        .as_ref()
-        .map_err(ToString::to_string)
-        .and_then(|path| path.canonicalize().map_err(|error| error.to_string()))
-        .and_then(|path| std::fs::metadata(path).map_err(|error| error.to_string()));
-    match metadata {
-        Ok(metadata) if metadata.is_dir() => {
-            DoctorFact::pass("current canonical workspace directory is accessible")
-        }
-        Ok(_) => DoctorFact::fail("current workspace is not a directory"),
-        Err(error) => DoctorFact::fail(format!("current workspace is inaccessible: {error}")),
     }
 }
 
@@ -813,14 +783,10 @@ mod doctor_tests {
     }
 
     #[test]
-    fn missing_storage_and_workspace_evidence_fail() {
+    fn missing_storage_evidence_fails() {
         let missing = std::path::PathBuf::from("/definitely/not/a/gascan/path");
         assert_eq!(
             storage_fact(&missing, "test").status,
-            gascan_core::doctor::DoctorStatus::Fail
-        );
-        assert_eq!(
-            workspace_fact(&Ok(missing)).status,
             gascan_core::doctor::DoctorStatus::Fail
         );
     }

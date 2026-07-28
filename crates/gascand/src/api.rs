@@ -3,7 +3,7 @@ use crate::{
     SandboxService, ServiceError, SocketPaths, UpRequest as ServiceUpRequest,
 };
 use camino::Utf8PathBuf;
-use gascan_core::doctor::DoctorStatus;
+use gascan_core::doctor::{DoctorCheckId, DoctorFact, DoctorStatus};
 use gascan_core::manifest::Manifest;
 use gascan_core::runtime::{RuntimeBackend, immutable_image_reference};
 use gascan_core::sandbox::{SandboxError, SandboxId, SandboxSpec};
@@ -1656,11 +1656,38 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
     }
     async fn doctor(
         &self,
-        _: tonic::Request<v1::DoctorRequest>,
+        request: tonic::Request<v1::DoctorRequest>,
     ) -> Result<tonic::Response<v1::DoctorResponse>, tonic::Status> {
         self.activity.ensure_accepting().map_err(admission_status)?;
         let _lease = self.activity.lease();
-        let report = self.service.doctor_report().await;
+        let workspace = match request.into_inner().workspace_result {
+            Some(v1::doctor_request::WorkspaceResult::Workspace(path))
+                if !path.is_empty()
+                    && !path.contains('\0')
+                    && camino::Utf8Path::new(&path).is_absolute() =>
+            {
+                crate::doctor::workspace_fact(camino::Utf8Path::new(&path))
+            }
+            Some(v1::doctor_request::WorkspaceResult::Workspace(_)) => {
+                return Err(tonic::Status::invalid_argument(error_code::INVALID_REQUEST));
+            }
+            Some(v1::doctor_request::WorkspaceResult::WorkspaceError(error)) => {
+                DoctorFact::unknown(format!(
+                    "caller could not determine workspace access: {error}"
+                ))
+            }
+            None => DoctorFact::unknown("workspace was not provided by the caller"),
+        };
+        let mut report = self.service.doctor_report().await;
+        let workspace_check = report
+            .checks
+            .iter_mut()
+            .find(|check| check.id == DoctorCheckId::WorkspaceAccess.as_str())
+            .ok_or_else(|| {
+                tonic::Status::internal("workspace check is missing from Doctor report")
+            })?;
+        workspace_check.status = workspace.status;
+        workspace_check.detail = workspace.detail;
         let capabilities = report
             .checks
             .iter()

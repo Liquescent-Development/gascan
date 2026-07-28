@@ -262,6 +262,27 @@ fn resolve_project_root(project_root: &str) -> Result<String, CliError> {
         })
 }
 
+fn doctor_request(current_directory: std::io::Result<PathBuf>) -> v1::DoctorRequest {
+    let workspace_result = match current_directory {
+        Ok(path) if path.is_absolute() => match path.to_str() {
+            Some(path) => v1::doctor_request::WorkspaceResult::Workspace(path.to_owned()),
+            None => v1::doctor_request::WorkspaceResult::WorkspaceError(
+                "caller directory is not valid UTF-8".to_owned(),
+            ),
+        },
+        Ok(path) => v1::doctor_request::WorkspaceResult::WorkspaceError(format!(
+            "caller directory is not absolute: {}",
+            path.display()
+        )),
+        Err(error) => v1::doctor_request::WorkspaceResult::WorkspaceError(format!(
+            "could not resolve caller directory: {error}"
+        )),
+    };
+    v1::DoctorRequest {
+        workspace_result: Some(workspace_result),
+    }
+}
+
 pub async fn execute() -> Result<i32, CliError> {
     let arguments = match Arguments::try_parse() {
         Ok(arguments) => arguments,
@@ -292,6 +313,8 @@ pub async fn execute() -> Result<i32, CliError> {
     if let Command::SshConfig { command } = arguments.command {
         return execute_ssh_config(command);
     }
+    let doctor_request = matches!(&arguments.command, Command::Doctor { .. })
+        .then(|| doctor_request(std::env::current_dir()));
     let mut client = Client::connect_or_start().await?;
     match arguments.command {
         Command::DaemonAttest => Ok(0),
@@ -384,7 +407,10 @@ pub async fn execute() -> Result<i32, CliError> {
             Ok(0)
         }
         Command::Doctor { json } => {
-            let doctor = client.api.doctor(v1::DoctorRequest {}).await?.into_inner();
+            let request = doctor_request.ok_or_else(|| {
+                CliError::Runtime("Doctor request was not prepared before connecting".to_owned())
+            })?;
+            let doctor = client.api.doctor(request).await?.into_inner();
             let checks = doctor
                 .capabilities
                 .iter()
@@ -1458,6 +1484,32 @@ mod tests {
         );
         assert!(std::path::Path::new(&resolved).is_absolute());
         Ok(())
+    }
+
+    #[test]
+    fn doctor_request_carries_the_callers_absolute_workspace()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?.path().canonicalize()?;
+        let request = doctor_request(Ok(directory.clone()));
+
+        assert_eq!(
+            request.workspace_result,
+            Some(v1::doctor_request::WorkspaceResult::Workspace(
+                directory.to_str().ok_or("UTF-8 workspace")?.to_owned(),
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_request_reports_caller_directory_errors() {
+        let request = doctor_request(Err(std::io::Error::other("launch directory was removed")));
+
+        assert!(matches!(
+            request.workspace_result,
+            Some(v1::doctor_request::WorkspaceResult::WorkspaceError(error))
+                if error.contains("launch directory was removed")
+        ));
     }
 
     #[test]

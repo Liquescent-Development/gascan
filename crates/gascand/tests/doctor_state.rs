@@ -1,10 +1,12 @@
 use gascan_core::doctor::DoctorFacts;
 use gascan_core::fake_runtime::FakeRuntime;
 use gascan_core::sandbox::SandboxId;
+use gascan_proto::v1;
+use gascan_proto::v1::gas_can_server::GasCan;
 use gascand::{
-    ActiveSsh, ActualState, DesiredState, DoctorState, ManagedSshHost, NoopProvisioner,
-    OperationKind, SandboxRecord, SandboxService, SshPaths, SshResolution, Store,
-    ensure_host_identity, publish_openssh_files,
+    ActiveSsh, ActivityTracker, ActualState, DesiredState, DoctorState, ManagedSshHost,
+    NoopProvisioner, OperationKind, SandboxApi, SandboxRecord, SandboxService, SshPaths,
+    SshResolution, Store, ensure_host_identity, publish_openssh_files,
 };
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::unix::fs::PermissionsExt as _;
@@ -12,6 +14,120 @@ use std::sync::Arc;
 use std::time::Duration;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+fn doctor_api(
+    root: &camino::Utf8Path,
+) -> Result<SandboxApi<FakeRuntime>, Box<dyn std::error::Error>> {
+    let service = SandboxService::new_with_doctor(
+        FakeRuntime::default(),
+        Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+        DoctorFacts::all_supported_for_tests().into_report(),
+    );
+    Ok(SandboxApi::new(Arc::new(service), ActivityTracker::new()))
+}
+
+fn doctor_workspace(
+    path: &std::path::Path,
+) -> Result<v1::DoctorRequest, Box<dyn std::error::Error>> {
+    Ok(v1::DoctorRequest {
+        workspace_result: Some(v1::doctor_request::WorkspaceResult::Workspace(
+            path.to_str().ok_or("UTF-8 workspace")?.to_owned(),
+        )),
+    })
+}
+
+#[tokio::test]
+async fn doctor_workspace_access_is_scoped_to_each_request() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = camino::Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    let existing = root.join("existing");
+    std::fs::create_dir(&existing)?;
+    let missing = root.join("missing");
+    let api = doctor_api(root)?;
+
+    let existing = GasCan::doctor(
+        &api,
+        tonic::Request::new(doctor_workspace(existing.as_std_path())?),
+    )
+    .await?
+    .into_inner();
+    let missing = GasCan::doctor(
+        &api,
+        tonic::Request::new(doctor_workspace(missing.as_std_path())?),
+    )
+    .await?
+    .into_inner();
+
+    let existing_workspace = existing
+        .capabilities
+        .iter()
+        .find(|capability| capability.name == "workspace.access")
+        .ok_or("workspace capability missing")?;
+    let missing_workspace = missing
+        .capabilities
+        .iter()
+        .find(|capability| capability.name == "workspace.access")
+        .ok_or("workspace capability missing")?;
+    assert!(existing_workspace.available);
+    assert!(!missing_workspace.available);
+    assert!(missing_workspace.detail.contains("inaccessible"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn doctor_workspace_reports_an_unknown_check_when_the_caller_omits_it() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = camino::Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    let api = doctor_api(root)?;
+
+    let response = GasCan::doctor(
+        &api,
+        tonic::Request::new(v1::DoctorRequest {
+            workspace_result: None,
+        }),
+    )
+    .await?
+    .into_inner();
+    let workspace = response
+        .capabilities
+        .iter()
+        .find(|capability| capability.name == "workspace.access")
+        .ok_or("workspace capability missing")?;
+    assert!(!workspace.available);
+    assert!(workspace.detail.contains("not provided"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn doctor_workspace_rejects_relative_or_malformed_requests() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = camino::Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    let api = doctor_api(root)?;
+    for request in [
+        v1::DoctorRequest {
+            workspace_result: Some(v1::doctor_request::WorkspaceResult::Workspace(
+                "relative".to_owned(),
+            )),
+        },
+        v1::DoctorRequest {
+            workspace_result: Some(v1::doctor_request::WorkspaceResult::Workspace(String::new())),
+        },
+        v1::DoctorRequest {
+            workspace_result: Some(v1::doctor_request::WorkspaceResult::Workspace(
+                "/valid\0suffix".to_owned(),
+            )),
+        },
+    ] {
+        let error = GasCan::doctor(&api, tonic::Request::new(request))
+            .await
+            .err()
+            .ok_or("invalid doctor request unexpectedly succeeded")?;
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(error.message(), gascan_proto::error_code::INVALID_REQUEST);
+    }
+    Ok(())
+}
 
 fn sandbox_record(
     id: SandboxId,
