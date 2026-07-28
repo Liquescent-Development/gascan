@@ -226,10 +226,26 @@ pub fn validate_distinct_image_fixtures(predecessor: &str, approved: &str) -> Te
     Ok(())
 }
 
-fn image_reference(value: &Value) -> Option<&str> {
-    value
-        .as_str()
-        .or_else(|| value.as_object()?.get("reference")?.as_str())
+fn image_reference(value: &Value, candidate: &CandidateImageMapping) -> Option<String> {
+    if let Some(reference) = value.as_str() {
+        return Some(reference.to_owned());
+    }
+    let image = value.as_object()?;
+    let reference = image.get("reference")?.as_str()?;
+    let expected_digest = candidate
+        .immutable
+        .rsplit_once('@')
+        .map(|(_, digest)| digest)?;
+    let observed_digest = image
+        .get("descriptor")
+        .and_then(Value::as_object)
+        .and_then(|descriptor| descriptor.get("digest"))
+        .and_then(Value::as_str);
+    if reference == candidate.runtime && observed_digest == Some(expected_digest) {
+        Some(candidate.immutable.clone())
+    } else {
+        Some(reference.to_owned())
+    }
 }
 
 pub struct AppleE2e {
@@ -856,6 +872,7 @@ impl AppleE2e {
     }
 
     pub fn owned_runtime_snapshot(&self) -> TestResult<OwnedRuntimeSnapshot> {
+        let candidate = CandidateImageMapping::from_environment()?;
         let inspect = self.container_json(["inspect", self.id()])?;
         let record = inspect
             .as_array()
@@ -870,7 +887,7 @@ impl AppleE2e {
             .ok_or("owned container inspect lacks id")?;
         let container_image = configuration
             .get("image")
-            .and_then(image_reference)
+            .and_then(|image| image_reference(image, &candidate))
             .ok_or("owned container inspect lacks image")?;
         if container_id != self.id()
             || configuration["labels"]["dev.gascan.managed-by"] != "gascan"
@@ -905,7 +922,7 @@ impl AppleE2e {
             .into());
         }
         Ok(OwnedRuntimeSnapshot {
-            container_image: container_image.to_owned(),
+            container_image,
             volumes,
             networks,
         })
@@ -3004,15 +3021,23 @@ mod tests {
     }
 
     #[test]
-    fn apple_image_object_and_canonical_ghcr_reference_preserve_exact_digest_identity() {
+    fn apple_image_object_and_canonical_ghcr_reference_preserve_exact_digest_identity() -> TestResult
+    {
         let digest = format!("sha256:{}", "a".repeat(64));
         let tagged = format!("ghcr.io/liquescent-development/gascan/workspace:v1.2.3@{digest}");
         let canonical = format!("ghcr.io/liquescent-development/gascan/workspace@{digest}");
+        let candidate = CandidateImageMapping::new(
+            format!("gascan-workspace:candidate@{digest}"),
+            "gascan-workspace:candidate".to_owned(),
+        )?;
         let object = serde_json::json!({
             "descriptor": {"digest": digest},
             "reference": canonical
         });
-        assert_eq!(image_reference(&object), Some(canonical.as_str()));
+        assert_eq!(
+            image_reference(&object, &candidate),
+            Some(canonical.clone())
+        );
         assert!(gascan_core::runtime::same_immutable_image(
             &canonical, &tagged
         ));
@@ -3027,6 +3052,34 @@ mod tests {
             &format!("ghcr.io/other/workspace@{digest}"),
             &tagged
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn local_candidate_snapshot_restores_exact_immutable_identity() -> TestResult {
+        let immutable = format!("gascan-workspace:candidate@sha256:{}", "a".repeat(64));
+        let candidate =
+            CandidateImageMapping::new(immutable.clone(), "gascan-workspace:candidate".to_owned())?;
+        let object = serde_json::json!({
+            "descriptor": {
+                "digest": format!("sha256:{}", "a".repeat(64))
+            },
+            "reference": "gascan-workspace:candidate"
+        });
+
+        assert_eq!(image_reference(&object, &candidate), Some(immutable));
+
+        let wrong_digest = serde_json::json!({
+            "descriptor": {
+                "digest": format!("sha256:{}", "b".repeat(64))
+            },
+            "reference": "gascan-workspace:candidate"
+        });
+        assert_eq!(
+            image_reference(&wrong_digest, &candidate),
+            Some("gascan-workspace:candidate".to_owned())
+        );
+        Ok(())
     }
 
     #[test]

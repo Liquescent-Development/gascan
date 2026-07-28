@@ -719,10 +719,11 @@ fn image_replace_preserves_durable_resources_and_rolls_back_failure() -> TestRes
     }
     assert_eq!(std::fs::read_to_string(root.join("setup-count"))?, "2\n");
     let approved_snapshot = env.owned_runtime_snapshot()?;
-    assert!(gascan_core::runtime::same_immutable_image(
-        approved_snapshot.container_image(),
-        &approved
-    ));
+    assert!(
+        gascan_core::runtime::same_immutable_image(approved_snapshot.container_image(), &approved),
+        "approved snapshot image mismatch: observed={} expected={approved}",
+        approved_snapshot.container_image()
+    );
     predecessor_snapshot.assert_retained_identities_equal(&approved_snapshot)?;
     assert_compatible_fixture(&env, true)?;
     env.assert_image_replace_root_sentinel(false)?;
