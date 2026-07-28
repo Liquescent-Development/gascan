@@ -2,12 +2,14 @@ use camino::Utf8Path;
 use gascan_core::fake_runtime::FakeRuntime;
 use gascan_core::manifest::Manifest;
 use gascan_core::policy::workspace_environment;
+use gascan_core::provision::{AppliedState, ProvisioningPlanner};
 use gascan_core::runtime::{
     RemoveRequest, ResourceKind, RuntimeBackend, RuntimeCall, RuntimeError,
 };
 use gascan_core::sandbox::SandboxSpec;
 use gascand::{NoopProvisioner, OperationStatus, SandboxService, UpRequest};
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use std::error::Error;
 use std::sync::Arc;
 
@@ -26,6 +28,34 @@ fn spec(root: &Utf8Path, name: &str) -> Result<SandboxSpec, Box<dyn Error>> {
     Ok(SandboxSpec::from_root(name, root, Manifest::load(root)?)?)
 }
 
+fn write_shell_manifest(root: &Utf8Path, prompt: &str, setup: Option<&str>) -> TestResult {
+    let setup = setup.map_or_else(String::new, |path| format!("setup = '{path}'\n"));
+    std::fs::write(
+        root.join("gascan.toml"),
+        format!("version = 1\n{setup}[shell]\nprompt = '{prompt}'\n"),
+    )?;
+    Ok(())
+}
+
+fn desired_shell_hash(spec: &SandboxSpec) -> Result<String, Box<dyn Error>> {
+    Ok(ProvisioningPlanner::plan_for_root(
+        spec.canonical_root(),
+        spec.manifest(),
+        &AppliedState::empty(),
+    )?
+    .desired_shell_hash()
+    .to_owned())
+}
+
+fn stored_shell_hash(record: &gascand::SandboxRecord) -> Option<&str> {
+    record
+        .tool_resolution
+        .as_ref()?
+        .details
+        .get("shell_hash")?
+        .as_str()
+}
+
 async fn event_details(
     service: &SandboxService<FakeRuntime>,
     operation_id: gascand::OperationId,
@@ -36,6 +66,113 @@ async fn event_details(
         .into_iter()
         .filter_map(|event| event.details)
         .collect())
+}
+
+#[tokio::test]
+async fn shell_only_apply_configures_exact_prompt_without_tools_or_setup_and_then_is_noop()
+-> TestResult {
+    let root = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
+    let setup = b"printf shell-only\n";
+    std::fs::write(root.join("setup.sh"), setup)?;
+    write_shell_manifest(root, "standard", Some("setup.sh"))?;
+    let runtime = FakeRuntime::default();
+    runtime
+        .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (
+                format!("{:x}  /workspace/setup.sh\n", Sha256::digest(setup)).into_bytes(),
+                Vec::new(),
+                0,
+            ),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+        ])
+        .await;
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    );
+    service
+        .up(UpRequest::new(spec(root, "shell-only")?))
+        .await?;
+
+    write_shell_manifest(root, "starship", Some("setup.sh"))?;
+    let desired = spec(root, "shell-only")?;
+    let expected_hash = desired_shell_hash(&desired)?;
+    let before_up = runtime.calls().await.len();
+    let up = service.up(UpRequest::new(desired.clone())).await?;
+    assert!(event_details(&service, up.id).await?.iter().any(|event| {
+        event.get("phase").and_then(Value::as_str) == Some("apply_required")
+            && event.get("reason").and_then(Value::as_str) == Some("shell_changed")
+    }));
+    assert!(
+        runtime.calls().await[before_up..]
+            .iter()
+            .all(|call| !matches!(call, RuntimeCall::Exec(_)))
+    );
+    let before_apply = runtime.calls().await.len();
+    let operation = service.apply(UpRequest::new(desired.clone())).await?;
+    let calls = runtime.calls().await;
+    let apply_execs = calls[before_apply..]
+        .iter()
+        .filter_map(|call| match call {
+            RuntimeCall::Exec(request) => Some(request),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        apply_execs
+            .iter()
+            .filter(|request| {
+                request.argv.first().map(String::as_str) == Some("/usr/bin/sudo")
+                    && request.argv.get(2).map(String::as_str)
+                        == Some("/usr/local/bin/configure-shell-home")
+            })
+            .map(|request| request.argv.as_slice())
+            .collect::<Vec<_>>(),
+        vec![
+            [
+                "/usr/bin/sudo",
+                "-n",
+                "/usr/local/bin/configure-shell-home",
+                "starship",
+            ]
+            .as_slice()
+        ]
+    );
+    assert!(apply_execs.iter().all(|request| {
+        !request.argv.iter().any(|arg| arg == "/usr/local/bin/mise")
+            && request.argv.first().map(String::as_str) != Some("/bin/bash")
+    }));
+    assert!(
+        event_details(&service, operation.id)
+            .await?
+            .iter()
+            .any(|event| event.get("step").and_then(Value::as_str) == Some("configure_shell"))
+    );
+    assert_eq!(
+        stored_shell_hash(&service.status(desired.id())?.ok_or("record")?),
+        Some(expected_hash.as_str())
+    );
+
+    let before_noop = runtime.calls().await.len();
+    service.apply(UpRequest::new(desired.clone())).await?;
+    assert!(
+        runtime.calls().await[before_noop..]
+            .iter()
+            .all(|call| !matches!(call, RuntimeCall::Exec(_)))
+    );
+    assert_eq!(
+        stored_shell_hash(&service.status(desired.id())?.ok_or("record")?),
+        Some(expected_hash.as_str())
+    );
+    Ok(())
 }
 
 #[tokio::test]

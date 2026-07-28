@@ -98,6 +98,7 @@ struct FakeState {
     image_change_on_prepare: Option<String>,
     exec_result: (Vec<u8>, Vec<u8>, i32, i32),
     exec_results: VecDeque<(Vec<u8>, Vec<u8>, i32, i32)>,
+    exec_results_by_argv: HashMap<Vec<String>, VecDeque<(Vec<u8>, Vec<u8>, i32, i32)>>,
     exec_errors: VecDeque<RuntimeError>,
     create_errors: VecDeque<RuntimeError>,
     ssh_port_collisions: usize,
@@ -124,6 +125,7 @@ impl FakeRuntime {
                 image_change_on_prepare: None,
                 exec_result: (Vec::new(), Vec::new(), 0, 0),
                 exec_results: VecDeque::new(),
+                exec_results_by_argv: HashMap::new(),
                 exec_errors: VecDeque::new(),
                 create_errors: VecDeque::new(),
                 ssh_port_collisions: 0,
@@ -231,6 +233,25 @@ impl FakeRuntime {
         I: IntoIterator<Item = (Vec<u8>, Vec<u8>, i32, i32)>,
     {
         self.inner.lock().await.exec_results.extend(results);
+    }
+
+    pub async fn queue_exec_result_for_argv<I, S>(
+        &self,
+        argv: I,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        exit_code: i32,
+    ) where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.inner
+            .lock()
+            .await
+            .exec_results_by_argv
+            .entry(argv.into_iter().map(Into::into).collect())
+            .or_default()
+            .push_back((stdout, stderr, exit_code, 0));
     }
 
     pub async fn queue_exec_error(&self, error: RuntimeError) {
@@ -512,6 +533,7 @@ fn load_state(capabilities: RuntimeCapabilities, path: &Path) -> Result<FakeStat
         image_change_on_prepare: None,
         exec_result: (Vec::new(), Vec::new(), 0, 0),
         exec_results: VecDeque::new(),
+        exec_results_by_argv: HashMap::new(),
         exec_errors: VecDeque::new(),
         create_errors: VecDeque::new(),
         ssh_port_collisions: 0,
@@ -609,6 +631,20 @@ fn interpret_fake_command(
         Some("true") | Some("sh") => (Vec::new(), Vec::new(), 0),
         _ => configured,
     }
+}
+
+fn is_managed_shell_configurator(argv: &[String]) -> bool {
+    matches!(
+        argv,
+        [sudo, non_interactive, configurator, prompt]
+            if sudo == "/usr/bin/sudo"
+                && non_interactive == "-n"
+                && configurator == "/usr/local/bin/configure-shell-home"
+                && matches!(
+                    prompt.as_str(),
+                    "standard" | "starship" | "starship-nerd-font"
+                )
+    )
 }
 
 #[async_trait]
@@ -1001,8 +1037,13 @@ impl RuntimeBackend for FakeRuntime {
             return Ok(ExecSession::live(input, output));
         }
         let configured = state
-            .exec_results
-            .pop_front()
+            .exec_results_by_argv
+            .get_mut(&request.argv)
+            .and_then(VecDeque::pop_front)
+            .or_else(|| {
+                is_managed_shell_configurator(&request.argv).then(|| state.exec_result.clone())
+            })
+            .or_else(|| state.exec_results.pop_front())
             .unwrap_or_else(|| state.exec_result.clone());
         let runtime = self.clone();
         let (input, mut inputs) = tokio::sync::mpsc::channel(16);
