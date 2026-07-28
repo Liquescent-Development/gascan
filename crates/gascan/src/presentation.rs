@@ -12,6 +12,7 @@ pub(crate) enum OperationKind {
     Apply,
     Down,
     Destroy,
+    DaemonRecovery,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -292,14 +293,13 @@ pub(crate) fn daemon_lifecycle_json(
     now_millis: i64,
 ) -> serde_json::Value {
     let mut value = daemon_status_json(&outcome.status, now_millis);
-    let object = value
-        .as_object_mut()
-        .expect("daemon presentation is always a JSON object");
-    object.insert(
-        "transition".to_owned(),
-        serde_json::Value::String(daemon_transition_name(outcome.transition).to_owned()),
-    );
-    object.insert("forced".to_owned(), serde_json::Value::Bool(outcome.forced));
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "transition".to_owned(),
+            serde_json::Value::String(daemon_transition_name(outcome.transition).to_owned()),
+        );
+        object.insert("forced".to_owned(), serde_json::Value::Bool(outcome.forced));
+    }
     value
 }
 
@@ -357,10 +357,6 @@ pub(crate) fn render_daemon_lifecycle(
 
 pub(crate) const fn daemon_force_warning() -> &'static str {
     "Warning: forcing daemon shutdown may interrupt active sandbox operations and attachments.\n"
-}
-
-pub(crate) fn daemon_recovery_progress(json: bool) -> Option<&'static str> {
-    (!json).then_some("Restarting outdated Gascan daemon…")
 }
 
 fn daemon_state_and_health(state: DaemonState) -> (&'static str, &'static str) {
@@ -490,6 +486,7 @@ impl OperationProgress {
             OperationKind::Apply => "Applying configuration",
             OperationKind::Down => "Stopping sandbox",
             OperationKind::Destroy => "Destroying sandbox",
+            OperationKind::DaemonRecovery => "Restarting outdated Gascan daemon…",
         };
         let progress_bar = draw_target.map(|draw_target| {
             let progress_bar = ProgressBar::with_draw_target(None, draw_target);
@@ -570,6 +567,10 @@ impl OperationProgress {
     }
 
     pub(crate) fn finish_success(mut self) -> Option<String> {
+        if self.kind == OperationKind::DaemonRecovery {
+            self.clear();
+            return None;
+        }
         let completion = match (self.kind, self.sandbox_id.as_deref()) {
             (OperationKind::Up, None) => "Sandbox is running".to_owned(),
             (OperationKind::Up, Some(id)) => format!("Sandbox {id} is running"),
@@ -581,6 +582,7 @@ impl OperationProgress {
             (OperationKind::Down, Some(id)) => format!("Sandbox {id} is stopped"),
             (OperationKind::Destroy, None) => "Sandbox is destroyed".to_owned(),
             (OperationKind::Destroy, Some(id)) => format!("Sandbox {id} is destroyed"),
+            (OperationKind::DaemonRecovery, _) => unreachable!("returned above"),
         };
 
         if let Some(progress_bar) = self.progress_bar.take() {
@@ -817,7 +819,6 @@ mod tests {
                 "forced": true,
             })
         );
-        assert_eq!(daemon_recovery_progress(true), None);
     }
 
     #[test]
@@ -1188,6 +1189,21 @@ mod tests {
             progress.finish_success().as_deref(),
             Some("Sandbox code-123 is stopped")
         );
+    }
+
+    #[test]
+    fn daemon_recovery_progress_is_one_human_line_and_has_no_completion_line() {
+        let (progress, initial) = OperationProgress::new(
+            OperationKind::DaemonRecovery,
+            None,
+            OutputCapabilities::plain(),
+        );
+
+        assert_eq!(
+            initial.as_deref(),
+            Some("Restarting outdated Gascan daemon…")
+        );
+        assert_eq!(progress.finish_success(), None);
     }
 
     #[test]

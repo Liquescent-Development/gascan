@@ -1,8 +1,8 @@
 use crate::client::{Client, ClientError};
 use crate::presentation::{
     DoctorCheck, OperationKind, OperationProgress, OutputCapabilities, daemon_force_warning,
-    daemon_lifecycle_json, daemon_recovery_progress, daemon_status_json, render_daemon_lifecycle,
-    render_daemon_status, render_doctor as render_human_doctor, render_error as render_human_error,
+    daemon_lifecycle_json, daemon_status_json, render_daemon_lifecycle, render_daemon_status,
+    render_doctor as render_human_doctor, render_error as render_human_error,
     render_list as render_human_list, render_status as render_human_status,
 };
 use crate::ssh_config::{
@@ -372,14 +372,7 @@ pub async fn execute() -> Result<i32, CliError> {
     }
     let doctor_request = matches!(&arguments.command, Command::Doctor { .. })
         .then(|| doctor_request(std::env::current_dir()));
-    let connected = crate::daemon::connect_current_or_recover()
-        .await
-        .map_err(supervisor_error)?;
-    if connected.transition == crate::daemon::DaemonTransition::Recovered {
-        if let Some(progress) = daemon_recovery_progress(command_uses_json(&arguments.command)) {
-            eprintln!("{progress}");
-        }
-    }
+    let connected = connect_with_recovery_progress(command_uses_json(&arguments.command)).await?;
     let mut client = connected.daemon.connection;
     match arguments.command {
         Command::DaemonAttest => Ok(0),
@@ -630,6 +623,125 @@ fn command_uses_json(command: &Command) -> bool {
         | Command::Ssh { .. }
         | Command::SshConfig { .. } => false,
     }
+}
+
+#[derive(Clone, Copy)]
+enum RecoveryOutputStream {
+    #[allow(
+        dead_code,
+        reason = "the JSON regression sink records accidental stdout writes even though recovery uses stderr only"
+    )]
+    Stdout,
+    Stderr,
+}
+
+trait RecoveryOutputSink {
+    fn write(&mut self, stream: RecoveryOutputStream, line: &str);
+}
+
+struct TerminalRecoveryOutput;
+
+impl RecoveryOutputSink for TerminalRecoveryOutput {
+    fn write(&mut self, stream: RecoveryOutputStream, line: &str) {
+        match stream {
+            RecoveryOutputStream::Stdout => {
+                let _ = writeln!(std::io::stdout(), "{line}");
+            }
+            RecoveryOutputStream::Stderr => {
+                let _ = writeln!(std::io::stderr(), "{line}");
+            }
+        }
+    }
+}
+
+struct CliRecoveryObserver<Output> {
+    mode: CliRecoveryProgressMode,
+    output: Output,
+}
+
+enum CliRecoveryProgressMode {
+    Human {
+        capabilities: OutputCapabilities,
+        progress: Option<OperationProgress>,
+    },
+    Suppressed,
+}
+
+impl<Output: RecoveryOutputSink> CliRecoveryObserver<Output> {
+    fn new(json: bool, capabilities: OutputCapabilities, output: Output) -> Self {
+        Self {
+            mode: if json {
+                CliRecoveryProgressMode::Suppressed
+            } else {
+                CliRecoveryProgressMode::Human {
+                    capabilities,
+                    progress: None,
+                }
+            },
+            output,
+        }
+    }
+
+    fn finish(&mut self) {
+        let CliRecoveryProgressMode::Human { progress, .. } = &mut self.mode else {
+            return;
+        };
+        if let Some(progress) = progress.take() {
+            if let Some(line) = progress.finish_success() {
+                self.output.write(RecoveryOutputStream::Stderr, &line);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn is_presenting(&self) -> bool {
+        matches!(
+            self.mode,
+            CliRecoveryProgressMode::Human {
+                progress: Some(_),
+                ..
+            }
+        )
+    }
+}
+
+#[tonic::async_trait]
+impl<Output: RecoveryOutputSink + Send> crate::daemon::DaemonLifecycleObserver
+    for CliRecoveryObserver<Output>
+{
+    async fn transition_started(&mut self, transition: crate::daemon::DaemonTransition) {
+        if transition != crate::daemon::DaemonTransition::Recovered {
+            return;
+        }
+        let CliRecoveryProgressMode::Human {
+            capabilities,
+            progress,
+        } = &mut self.mode
+        else {
+            return;
+        };
+        let (next, initial) =
+            OperationProgress::new(OperationKind::DaemonRecovery, None, *capabilities);
+        if let Some(line) = initial {
+            self.output.write(RecoveryOutputStream::Stderr, &line);
+        }
+        *progress = Some(next);
+    }
+}
+
+async fn connect_with_recovery_progress(
+    json: bool,
+) -> Result<crate::daemon::ConnectionOutcome<Client>, CliError> {
+    let mut observer = CliRecoveryObserver::new(
+        json,
+        OutputCapabilities::for_stderr(),
+        TerminalRecoveryOutput,
+    );
+    let connected = crate::daemon::connect_current_or_recover_observing(&mut observer)
+        .await
+        .map_err(supervisor_error)?;
+    observer.finish();
+    Ok(connected)
 }
 
 fn supervisor_error(error: crate::daemon::SupervisorError) -> CliError {
@@ -1369,9 +1481,8 @@ mod tests {
     }
 
     #[test]
-    fn daemon_parses_the_public_management_commands() {
-        let status = Arguments::try_parse_from(["gascan", "daemon", "status", "--json"])
-            .expect("status command should parse");
+    fn daemon_parses_the_public_management_commands() -> Result<(), Box<dyn std::error::Error>> {
+        let status = Arguments::try_parse_from(["gascan", "daemon", "status", "--json"])?;
         assert!(matches!(
             status.command,
             Command::Daemon {
@@ -1379,8 +1490,7 @@ mod tests {
             }
         ));
 
-        let start = Arguments::try_parse_from(["gascan", "daemon", "start", "--json"])
-            .expect("start command should parse");
+        let start = Arguments::try_parse_from(["gascan", "daemon", "start", "--json"])?;
         assert!(matches!(
             start.command,
             Command::Daemon {
@@ -1388,8 +1498,7 @@ mod tests {
             }
         ));
 
-        let stop = Arguments::try_parse_from(["gascan", "daemon", "stop", "--force", "--json"])
-            .expect("stop command should parse");
+        let stop = Arguments::try_parse_from(["gascan", "daemon", "stop", "--force", "--json"])?;
         assert!(matches!(
             stop.command,
             Command::Daemon {
@@ -1401,8 +1510,7 @@ mod tests {
         ));
 
         let restart =
-            Arguments::try_parse_from(["gascan", "daemon", "restart", "--force", "--json"])
-                .expect("restart command should parse");
+            Arguments::try_parse_from(["gascan", "daemon", "restart", "--force", "--json"])?;
         assert!(matches!(
             restart.command,
             Command::Daemon {
@@ -1412,17 +1520,16 @@ mod tests {
                 }
             }
         ));
+        Ok(())
     }
 
     #[test]
     fn daemon_rejects_force_for_status_and_start() {
         for subcommand in ["status", "start"] {
-            let error = match Arguments::try_parse_from(["gascan", "daemon", subcommand, "--force"])
-            {
-                Ok(_) => panic!("--force must not be accepted"),
-                Err(error) => error,
-            };
-            assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+            assert!(matches!(
+                Arguments::try_parse_from(["gascan", "daemon", subcommand, "--force"]),
+                Err(error) if error.kind() == ErrorKind::UnknownArgument
+            ));
         }
     }
 
@@ -1447,6 +1554,56 @@ mod tests {
             error.suggestion(),
             Some("run `gascan daemon status` after checking the local runtime directory")
         );
+    }
+
+    #[tokio::test]
+    async fn daemon_json_recovery_observer_writes_no_progress_to_either_output_stream()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::daemon::DaemonLifecycleObserver as _;
+
+        let sink = CapturingRecoveryOutput::default();
+        let mut observer =
+            CliRecoveryObserver::new(true, OutputCapabilities::for_stderr(), sink.clone());
+        observer
+            .transition_started(crate::daemon::DaemonTransition::Recovered)
+            .await;
+
+        assert!(!observer.is_presenting());
+        let stderr_is_empty = {
+            let stderr = sink
+                .stderr
+                .lock()
+                .map_err(|_| std::io::Error::other("captured stderr was poisoned"))?;
+            stderr.is_empty()
+        };
+        let stdout_is_empty = {
+            let stdout = sink
+                .stdout
+                .lock()
+                .map_err(|_| std::io::Error::other("captured stdout was poisoned"))?;
+            stdout.is_empty()
+        };
+        assert!(stderr_is_empty);
+        assert!(stdout_is_empty);
+        Ok(())
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturingRecoveryOutput {
+        stderr: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        stdout: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl RecoveryOutputSink for CapturingRecoveryOutput {
+        fn write(&mut self, stream: RecoveryOutputStream, line: &str) {
+            let output = match stream {
+                RecoveryOutputStream::Stdout => &self.stdout,
+                RecoveryOutputStream::Stderr => &self.stderr,
+            };
+            if let Ok(mut output) = output.lock() {
+                output.push(line.to_owned());
+            }
+        }
     }
 
     #[test]

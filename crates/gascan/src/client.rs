@@ -104,13 +104,6 @@ impl Client {
             .await?
             .into_inner())
     }
-
-    pub async fn connect_or_start() -> Result<Self, ClientError> {
-        crate::daemon::connect_current_or_recover()
-            .await
-            .map(|outcome| outcome.daemon.connection)
-            .map_err(ClientError::from)
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]

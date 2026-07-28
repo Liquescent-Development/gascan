@@ -462,6 +462,19 @@ pub(crate) enum DaemonTransition {
     Recovered,
 }
 
+#[tonic::async_trait]
+pub(crate) trait DaemonLifecycleObserver: Send {
+    async fn transition_started(&mut self, transition: DaemonTransition);
+}
+
+#[derive(Default)]
+pub(crate) struct NoopDaemonLifecycleObserver;
+
+#[tonic::async_trait]
+impl DaemonLifecycleObserver for NoopDaemonLifecycleObserver {
+    async fn transition_started(&mut self, _transition: DaemonTransition) {}
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StopMode {
     Automatic,
@@ -1535,6 +1548,41 @@ where
     Spawn: DaemonSpawner,
     Signal: AttestedProcessSignaler,
 {
+    let mut observer = NoopDaemonLifecycleObserver;
+    connect_current_or_recover_with_observer(
+        paths,
+        expected_executable,
+        endpoint,
+        inspector,
+        spawner,
+        signaler,
+        timeouts,
+        &mut observer,
+    )
+    .await
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the observer extends the existing testable supervisor boundary without hiding its lifecycle dependencies"
+)]
+pub(crate) async fn connect_current_or_recover_with_observer<E, P, Spawn, Signal, Observer>(
+    paths: &DaemonPaths,
+    expected_executable: &Path,
+    endpoint: &E,
+    inspector: &P,
+    spawner: &Spawn,
+    signaler: &Signal,
+    timeouts: SupervisorTimeouts,
+    observer: &mut Observer,
+) -> Result<ConnectionOutcome<E::Connection>, SupervisorError>
+where
+    E: DaemonEndpoint,
+    P: ProcessInspector,
+    Spawn: DaemonSpawner,
+    Signal: AttestedProcessSignaler,
+    Observer: DaemonLifecycleObserver,
+{
     let initial = inspect_with(paths, expected_executable, endpoint, inspector).await?;
     if initial.status.state == DaemonState::Current {
         return connected_outcome(initial, DaemonTransition::None);
@@ -1585,6 +1633,9 @@ where
             (current, DaemonTransition::Started)
         }
         DaemonState::Outdated => {
+            observer
+                .transition_started(DaemonTransition::Recovered)
+                .await;
             stop_inspected_locked(
                 paths,
                 expected_executable,
@@ -1682,6 +1733,26 @@ pub(crate) async fn connect_current_or_recover()
         &crate::client::TokioDaemonSpawner,
         &OsAttestedProcessSignaler,
         SupervisorTimeouts::default(),
+    )
+    .await
+}
+
+pub(crate) async fn connect_current_or_recover_observing<Observer>(
+    observer: &mut Observer,
+) -> Result<ConnectionOutcome<crate::client::Client>, SupervisorError>
+where
+    Observer: DaemonLifecycleObserver,
+{
+    let (paths, executable) = supervisor_context()?;
+    connect_current_or_recover_with_observer(
+        &paths,
+        &executable,
+        &crate::client::TonicEndpoint,
+        &OsProcessInspector,
+        &crate::client::TokioDaemonSpawner,
+        &OsAttestedProcessSignaler,
+        SupervisorTimeouts::default(),
+        observer,
     )
     .await
 }
@@ -3005,12 +3076,12 @@ fn errno(error: rustix::io::Errno) -> io::Error {
 mod tests {
     use super::{
         AttestedProcessSignaler, ConnectionOutcome, DaemonEndpoint, DaemonIdentity,
-        DaemonInstanceRecord, DaemonLaunch, DaemonPaths, DaemonSpawner, DaemonState,
-        DaemonTransition, EndpointProbe, EndpointSession, InstanceTimestamp, OsProcessInspector,
-        ProcessIdentity, ProcessInspector, ProcessSignaler, ShutdownPolicy, StopMode,
-        SupervisorError, SupervisorTimeouts, checked_pid, coherent_process_identity,
-        connect_current_or_recover_with, inspect_with, read_attested_instance,
-        read_instance_record_with_hook, restart_with, signal_attested_with,
+        DaemonInstanceRecord, DaemonLaunch, DaemonLifecycleObserver, DaemonPaths, DaemonSpawner,
+        DaemonState, DaemonTransition, EndpointProbe, EndpointSession, InstanceTimestamp,
+        OsProcessInspector, ProcessIdentity, ProcessInspector, ProcessSignaler, ShutdownPolicy,
+        StopMode, SupervisorError, SupervisorTimeouts, checked_pid, coherent_process_identity,
+        connect_current_or_recover_with, connect_current_or_recover_with_observer, inspect_with,
+        read_attested_instance, read_instance_record_with_hook, restart_with, signal_attested_with,
         signal_attested_with_deadline, signal_identity, start_with, stop_with, wait_for_exit_until,
     };
     #[cfg(target_os = "macos")]
@@ -3024,6 +3095,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
+    use tokio::sync::Notify;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -5481,6 +5553,23 @@ mod tests {
         }
     }
 
+    struct GatedRecoveryObserver {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+        transitions: Arc<Mutex<Vec<DaemonTransition>>>,
+    }
+
+    #[tonic::async_trait]
+    impl DaemonLifecycleObserver for GatedRecoveryObserver {
+        async fn transition_started(&mut self, transition: DaemonTransition) {
+            if let Ok(mut transitions) = self.transitions.lock() {
+                transitions.push(transition);
+            }
+            self.started.notify_waiters();
+            self.release.notified().await;
+        }
+    }
+
     #[tokio::test]
     async fn restart_stopped_starts_the_installed_daemon() -> TestResult {
         let temp = tempfile::tempdir()?;
@@ -5636,6 +5725,69 @@ mod tests {
         );
         assert_eq!(spawner.launch_count()?, 1);
         assert!(!signaler.signals()?.contains(&rustix::process::Signal::KILL));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_observer_starts_before_gated_outdated_shutdown() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        let mut expected = record(&executable);
+        expected.release_version = "0.1.10".to_owned();
+        write_record(&paths, &expected)?;
+        let inspector = MutableInspector::new(Some(process_for(&endpoint_identity(&expected))));
+        let endpoint = StopEndpoint::new(
+            connected(endpoint_identity(&expected)),
+            inspector.clone(),
+            true,
+        );
+        endpoint.retire_on_exit(paths.instance())?;
+        let spawner = StopSpawner::new(endpoint.clone(), inspector.clone());
+        let signaler = RecordingAttestedSignaler::new(inspector.clone(), endpoint.clone(), true);
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let transitions = Arc::new(Mutex::new(Vec::new()));
+        let started_wait = started.notified();
+        let task_paths = paths.clone();
+        let task_executable = executable.clone();
+        let task_endpoint = endpoint.clone();
+        let task_inspector = inspector.clone();
+        let task_spawner = spawner.clone();
+        let task_signaler = signaler.clone();
+        let mut observer = GatedRecoveryObserver {
+            started: started.clone(),
+            release: release.clone(),
+            transitions: transitions.clone(),
+        };
+
+        let task = tokio::spawn(async move {
+            connect_current_or_recover_with_observer(
+                &task_paths,
+                &task_executable,
+                &task_endpoint,
+                &task_inspector,
+                &task_spawner,
+                &task_signaler,
+                test_timeouts(),
+                &mut observer,
+            )
+            .await
+        });
+
+        started_wait.await;
+        assert_eq!(endpoint.shutdown_tokens()?, Vec::<String>::new());
+        assert_eq!(spawner.launch_count()?, 0);
+        assert_eq!(
+            *transitions
+                .lock()
+                .map_err(|_| io::Error::other("recovery transitions were poisoned"))?,
+            vec![DaemonTransition::Recovered]
+        );
+
+        release.notify_one();
+        let outcome = task.await??;
+        assert_eq!(outcome.transition, DaemonTransition::Recovered);
         Ok(())
     }
 
