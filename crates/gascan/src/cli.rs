@@ -1,7 +1,8 @@
 use crate::client::{Client, ClientError};
 use crate::presentation::{
-    DoctorCheck, OperationKind, OperationProgress, OutputCapabilities,
-    render_doctor as render_human_doctor, render_error as render_human_error,
+    DoctorCheck, OperationKind, OperationProgress, OutputCapabilities, daemon_force_warning,
+    daemon_lifecycle_json, daemon_recovery_progress, daemon_status_json, render_daemon_lifecycle,
+    render_daemon_status, render_doctor as render_human_doctor, render_error as render_human_error,
     render_list as render_human_list, render_status as render_human_status,
 };
 use crate::ssh_config::{
@@ -15,6 +16,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{IsTerminal, Write};
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const EXIT_USAGE: i32 = 64;
 const EXIT_DAEMON: i32 = 69;
@@ -34,6 +36,10 @@ struct Arguments {
 enum Command {
     #[command(hide = true)]
     DaemonAttest,
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
     Up {
         project_root: String,
         #[arg(long)]
@@ -87,6 +93,36 @@ enum Command {
     SshConfig {
         #[command(subcommand)]
         command: SshConfigCommand,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum DaemonCommand {
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Start {
+        #[arg(long)]
+        json: bool,
+    },
+    Stop {
+        #[arg(
+            long,
+            help = "Force shutdown if graceful shutdown times out; may interrupt active sandbox operations and attachments"
+        )]
+        force: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Restart {
+        #[arg(
+            long,
+            help = "Force shutdown if graceful shutdown times out; may interrupt active sandbox operations and attachments"
+        )]
+        force: bool,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -193,6 +229,24 @@ impl CliError {
             | Self::Runtime(_)
             | Self::Io(_) => None,
         }
+        .or_else(|| match self.stable_code() {
+            Some("daemon_outdated") => Some("run `gascan daemon restart` to replace it"),
+            Some("daemon_io") => {
+                Some("run `gascan daemon status` after checking the local runtime directory")
+            }
+            Some("daemon_graceful_shutdown_timeout") => Some(
+                "retry with `gascan daemon restart --force` if it is safe to interrupt active work",
+            ),
+            Some("daemon_invalid_state")
+            | Some("daemon_readiness_failed")
+            | Some("daemon_identity_changed")
+            | Some("daemon_exit_timeout")
+            | Some("daemon_lifecycle_busy")
+            | Some("daemon_lifecycle_changed") => {
+                Some("run `gascan daemon status` for the current daemon state")
+            }
+            _ => None,
+        })
     }
 }
 impl std::fmt::Display for CliError {
@@ -310,14 +364,26 @@ pub async fn execute() -> Result<i32, CliError> {
         );
         return Ok(0);
     }
+    if let Command::Daemon { command } = &arguments.command {
+        return execute_daemon(command.clone()).await;
+    }
     if let Command::SshConfig { command } = arguments.command {
         return execute_ssh_config(command);
     }
     let doctor_request = matches!(&arguments.command, Command::Doctor { .. })
         .then(|| doctor_request(std::env::current_dir()));
-    let mut client = Client::connect_or_start().await?;
+    let connected = crate::daemon::connect_current_or_recover()
+        .await
+        .map_err(supervisor_error)?;
+    if connected.transition == crate::daemon::DaemonTransition::Recovered {
+        if let Some(progress) = daemon_recovery_progress(command_uses_json(&arguments.command)) {
+            eprintln!("{progress}");
+        }
+    }
+    let mut client = connected.daemon.connection;
     match arguments.command {
         Command::DaemonAttest => Ok(0),
+        Command::Daemon { .. } => Ok(0),
         Command::Up { project_root, json } => {
             let project_root = resolve_project_root(&project_root)?;
             match client.api.up(v1::UpRequest { project_root }).await {
@@ -472,6 +538,121 @@ pub async fn execute() -> Result<i32, CliError> {
         } => logs(&mut client, arguments.sandbox, follow, since_millis).await,
         Command::Ssh { argv } => ssh(&mut client, arguments.sandbox, argv).await,
         Command::SshConfig { .. } => Ok(0),
+    }
+}
+
+async fn execute_daemon(command: DaemonCommand) -> Result<i32, CliError> {
+    let json = daemon_command_uses_json(&command);
+    match command {
+        DaemonCommand::Status { .. } => {
+            let status = crate::daemon::inspect().await.map_err(supervisor_error)?;
+            let now_millis = daemon_now_millis()?;
+            if json {
+                println!("{}", daemon_status_json(&status, now_millis));
+            } else {
+                print!(
+                    "{}",
+                    render_daemon_status(&status, now_millis, OutputCapabilities::for_stdout())
+                );
+            }
+        }
+        DaemonCommand::Start { .. } => {
+            let outcome = crate::daemon::start().await.map_err(supervisor_error)?;
+            let now_millis = daemon_now_millis()?;
+            render_daemon_outcome(&outcome, now_millis, json);
+        }
+        DaemonCommand::Stop { force, .. } => {
+            if force && !json {
+                eprint!("{}", daemon_force_warning());
+            }
+            let outcome = crate::daemon::stop(force).await.map_err(supervisor_error)?;
+            let now_millis = daemon_now_millis()?;
+            render_daemon_outcome(&outcome, now_millis, json);
+        }
+        DaemonCommand::Restart { force, .. } => {
+            if force && !json {
+                eprint!("{}", daemon_force_warning());
+            }
+            let outcome = crate::daemon::restart(force)
+                .await
+                .map_err(supervisor_error)?;
+            let now_millis = daemon_now_millis()?;
+            render_daemon_outcome(&outcome, now_millis, json);
+        }
+    }
+    Ok(0)
+}
+
+fn render_daemon_outcome(outcome: &crate::daemon::LifecycleOutcome, now_millis: i64, json: bool) {
+    if json {
+        println!("{}", daemon_lifecycle_json(outcome, now_millis));
+    } else {
+        print!(
+            "{}",
+            render_daemon_lifecycle(outcome, now_millis, OutputCapabilities::for_stdout())
+        );
+    }
+}
+
+fn daemon_now_millis() -> Result<i64, CliError> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            CliError::Runtime(format!("system clock is before Unix epoch: {error}"))
+        })?;
+    i64::try_from(elapsed.as_millis())
+        .map_err(|_| CliError::Runtime("system clock exceeds supported timestamp range".to_owned()))
+}
+
+fn daemon_command_uses_json(command: &DaemonCommand) -> bool {
+    match command {
+        DaemonCommand::Status { json }
+        | DaemonCommand::Start { json }
+        | DaemonCommand::Stop { json, .. }
+        | DaemonCommand::Restart { json, .. } => *json,
+    }
+}
+
+fn command_uses_json(command: &Command) -> bool {
+    match command {
+        Command::Up { json, .. }
+        | Command::Apply { json, .. }
+        | Command::Down { json }
+        | Command::Destroy { json, .. }
+        | Command::List { json }
+        | Command::Status { json }
+        | Command::Doctor { json } => *json,
+        Command::Daemon { command } => daemon_command_uses_json(command),
+        Command::DaemonAttest
+        | Command::Shell { .. }
+        | Command::Run { .. }
+        | Command::Logs { .. }
+        | Command::Ssh { .. }
+        | Command::SshConfig { .. } => false,
+    }
+}
+
+fn supervisor_error(error: crate::daemon::SupervisorError) -> CliError {
+    if let crate::daemon::SupervisorError::Client(error) = error {
+        return CliError::Client(error);
+    }
+    let code = match &error {
+        crate::daemon::SupervisorError::Client(_) => unreachable!("client errors returned above"),
+        crate::daemon::SupervisorError::Io(_) => "daemon_io",
+        crate::daemon::SupervisorError::Outdated { .. } => "daemon_outdated",
+        crate::daemon::SupervisorError::InvalidState { .. } => "daemon_invalid_state",
+        crate::daemon::SupervisorError::Readiness { .. } => "daemon_readiness_failed",
+        crate::daemon::SupervisorError::GracefulTimeout { .. } => {
+            "daemon_graceful_shutdown_timeout"
+        }
+        crate::daemon::SupervisorError::IdentityChanged { .. } => "daemon_identity_changed",
+        crate::daemon::SupervisorError::ExitTimeout { .. } => "daemon_exit_timeout",
+        crate::daemon::SupervisorError::TombstoneBusy { .. } => "daemon_lifecycle_busy",
+        crate::daemon::SupervisorError::TombstoneChanged { .. } => "daemon_lifecycle_changed",
+    };
+    CliError::Operation {
+        code: code.to_owned(),
+        message: error.to_string(),
     }
 }
 
@@ -1184,6 +1365,87 @@ mod tests {
         assert!(
             help.contains("-V, --version"),
             "version option missing: {help}"
+        );
+    }
+
+    #[test]
+    fn daemon_parses_the_public_management_commands() {
+        let status = Arguments::try_parse_from(["gascan", "daemon", "status", "--json"])
+            .expect("status command should parse");
+        assert!(matches!(
+            status.command,
+            Command::Daemon {
+                command: DaemonCommand::Status { json: true }
+            }
+        ));
+
+        let start = Arguments::try_parse_from(["gascan", "daemon", "start", "--json"])
+            .expect("start command should parse");
+        assert!(matches!(
+            start.command,
+            Command::Daemon {
+                command: DaemonCommand::Start { json: true }
+            }
+        ));
+
+        let stop = Arguments::try_parse_from(["gascan", "daemon", "stop", "--force", "--json"])
+            .expect("stop command should parse");
+        assert!(matches!(
+            stop.command,
+            Command::Daemon {
+                command: DaemonCommand::Stop {
+                    force: true,
+                    json: true,
+                }
+            }
+        ));
+
+        let restart =
+            Arguments::try_parse_from(["gascan", "daemon", "restart", "--force", "--json"])
+                .expect("restart command should parse");
+        assert!(matches!(
+            restart.command,
+            Command::Daemon {
+                command: DaemonCommand::Restart {
+                    force: true,
+                    json: true,
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn daemon_rejects_force_for_status_and_start() {
+        for subcommand in ["status", "start"] {
+            let error = match Arguments::try_parse_from(["gascan", "daemon", subcommand, "--force"])
+            {
+                Ok(_) => panic!("--force must not be accepted"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+        }
+    }
+
+    #[test]
+    fn daemon_attest_remains_hidden_from_public_help() {
+        let help = Arguments::command().render_long_help().to_string();
+        assert!(help.contains("daemon"), "daemon command missing: {help}");
+        assert!(
+            !help.contains("daemon-attest"),
+            "internal daemon command leaked into help: {help}"
+        );
+    }
+
+    #[test]
+    fn daemon_supervisor_io_errors_have_a_stable_actionable_cli_contract() {
+        let error = supervisor_error(crate::daemon::SupervisorError::Io(std::io::Error::other(
+            "runtime directory is unavailable",
+        )));
+
+        assert_eq!(error.stable_code(), Some("daemon_io"));
+        assert_eq!(
+            error.suggestion(),
+            Some("run `gascan daemon status` after checking the local runtime directory")
         );
     }
 
