@@ -1069,6 +1069,14 @@ fn workstation_installer_enforces_file_npm_version_and_mode_boundaries_behaviora
             .success(),
         "version verification did not provide a safe private home"
     );
+    let oversized_starship_metadata = format!(
+        "starship 1.25.1\n\
+         branch:master\n\
+         commit_hash:8758daa\n\
+         build_time:2026-04-30 19:35:31 +00:00\n\
+         build_env:{}\n",
+        "x".repeat(513)
+    );
     for (tool, expected, output) in [
         ("claude", "2.1.218", "2.1.218 (Claude Code)\n"),
         ("codex", "0.145.0", "codex-cli 0.145.0\n"),
@@ -1081,6 +1089,15 @@ fn workstation_installer_enforces_file_npm_version_and_mode_boundaries_behaviora
             "NVIM v0.11.7\nBuild type: Release\nLuaJIT 2.1\n",
         ),
         ("starship", "1.25.1", "starship 1.25.1\n"),
+        (
+            "starship",
+            "1.25.1",
+            "starship 1.25.1\n\
+             branch:master\n\
+             commit_hash:8758daa\n\
+             build_time:2026-04-30 19:35:31 +00:00\n\
+             build_env:rustc 1.95.0 (59807616e 2026-04-14),\n",
+        ),
     ] {
         assert!(
             version_status(tool, expected, output).success(),
@@ -1096,6 +1113,24 @@ fn workstation_installer_enforces_file_npm_version_and_mode_boundaries_behaviora
         ("glab", "1.109.0", "glab 1.109.0beta (abcdef)\n"),
         ("nvim", "0.11.7", "NVIM v0.11.70\n"),
         ("starship", "1.25.1", "starship 1.25.10\n"),
+        ("starship", "1.25.1", "leading junk\nstarship 1.25.1\n"),
+        ("starship", "1.25.1", "\nstarship 1.25.1\n"),
+        (
+            "starship",
+            "1.25.1",
+            "diagnostic\nstarship 1.25.1\nbranch:master\n",
+        ),
+        (
+            "starship",
+            "1.25.1",
+            "starship 1.25.1\n\
+             branch:master\n\
+             commit_hash:8758daa\n\
+             build_time:2026-04-30 19:35:31 +00:00\n\
+             build_env:rustc 1.95.0 (59807616e 2026-04-14),\n\
+             unexpected:metadata\n",
+        ),
+        ("starship", "1.25.1", oversized_starship_metadata.as_str()),
     ] {
         assert!(
             !version_status(tool, expected, output).success(),
