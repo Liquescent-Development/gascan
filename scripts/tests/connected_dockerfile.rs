@@ -1587,12 +1587,31 @@ fn shell_assets_are_immutable_and_wired_after_identity_migration() {
     }
 }
 
+fn migration_execution_position(dockerfile: &str) -> usize {
+    dockerfile
+        .find("&& /usr/local/bin/migrate-workspace-identity")
+        .unwrap()
+}
+
+#[test]
+fn workspace_home_order_uses_migration_execution_not_copy_destination() {
+    let dockerfile = "\
+COPY helper /usr/local/bin/migrate-workspace-identity
+chown workspace:workspace /home/workspace
+&& /usr/local/bin/migrate-workspace-identity
+";
+    assert!(
+        migration_execution_position(dockerfile)
+            > dockerfile
+                .find("chown workspace:workspace /home/workspace")
+                .unwrap()
+    );
+}
+
 #[test]
 fn workspace_home_is_normalized_without_weakening_private_directories() {
     let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
-    let migration = dockerfile
-        .find("/usr/local/bin/migrate-workspace-identity")
-        .unwrap();
+    let migration = migration_execution_position(&dockerfile);
     let home_owner = dockerfile
         .find("chown workspace:workspace /home/workspace")
         .unwrap();

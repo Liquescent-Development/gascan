@@ -387,6 +387,27 @@ fn managed_shell_directory_creation_precedes_the_sealed_hook_copy() {
     );
 }
 
+fn migration_execution_position(dockerfile: &str) -> usize {
+    dockerfile
+        .find("&& /usr/local/bin/migrate-workspace-identity")
+        .unwrap()
+}
+
+#[test]
+fn connected_context_home_order_uses_migration_execution() {
+    let dockerfile = "\
+COPY helper /usr/local/bin/migrate-workspace-identity
+chown workspace:workspace /home/workspace
+&& /usr/local/bin/migrate-workspace-identity
+";
+    assert!(
+        migration_execution_position(dockerfile)
+            > dockerfile
+                .find("chown workspace:workspace /home/workspace")
+                .unwrap()
+    );
+}
+
 #[test]
 fn connected_context_preserves_workspace_home_normalization() {
     let fixture = Fixture::new();
@@ -397,9 +418,7 @@ fn connected_context_preserves_workspace_home_normalization() {
         String::from_utf8_lossy(&output.stderr)
     );
     let dockerfile = fs::read_to_string(fixture.context.join("Dockerfile")).unwrap();
-    let migration = dockerfile
-        .find("/usr/local/bin/migrate-workspace-identity")
-        .unwrap();
+    let migration = migration_execution_position(&dockerfile);
     let owner = dockerfile
         .find("chown workspace:workspace /home/workspace")
         .unwrap();
