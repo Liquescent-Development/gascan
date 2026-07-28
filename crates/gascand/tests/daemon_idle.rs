@@ -1,6 +1,10 @@
-use gascan_proto::v1::{
-    ApplyRequest, HandshakeRequest, ListRequest, SandboxSelector, StatusRequest, UpRequest,
-    gas_can_client::GasCanClient,
+use gascan_proto::{
+    API_MINOR,
+    v1::{
+        ApplyRequest, DaemonHealth, DaemonStatusRequest, HandshakeRequest, ListRequest,
+        SandboxSelector, ShutdownDaemonRequest, StatusRequest, UpRequest,
+        gas_can_client::GasCanClient,
+    },
 };
 use gascand::{ActivityTracker, Daemon, DaemonConfig, SocketPaths};
 use std::time::Duration;
@@ -123,7 +127,7 @@ async fn raw_liveness_probe_disconnect_does_not_end_server() -> TestResult {
             .into_inner();
         assert!(response.rejection.is_none());
         assert_eq!(response.api_major, 1);
-        assert_eq!(response.api_minor, 3);
+        assert_eq!(response.api_minor, API_MINOR);
         assert_eq!(response.daemon_instance_token.len(), 64);
         assert_eq!(
             response.daemon_pid,
@@ -142,6 +146,163 @@ async fn raw_liveness_probe_disconnect_does_not_end_server() -> TestResult {
         );
         assert!(!socket.exists());
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_metadata_reports_handshake_identity_and_healthy_status() -> TestResult {
+    let temp = TempDir::new()?;
+    let runtime_root = temp.path().canonicalize()?;
+    let socket = runtime_root.join("gascan/gascand.sock");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_gascand"))
+        .env("GASCAN_TEST_FAKE_BACKEND", "1")
+        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .env("GASCAN_STATE_PATH", runtime_root.join("state.sqlite3"))
+        .env("GASCAN_IDLE_TIMEOUT_MS", "30000")
+        .spawn()?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !socket.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    let endpoint = tonic::transport::Endpoint::try_from("http://[::]:50051")?;
+    let connect_path = socket.clone();
+    let channel = endpoint
+        .connect_with_connector(service_fn(move |_| {
+            let path = connect_path.clone();
+            async move {
+                tokio::net::UnixStream::connect(path)
+                    .await
+                    .map(hyper_util::rt::TokioIo::new)
+            }
+        }))
+        .await?;
+    let mut client = GasCanClient::new(channel);
+    let handshake = client
+        .handshake(HandshakeRequest {
+            api_major: 1,
+            api_minor: 0,
+            requested_capabilities: Vec::new(),
+        })
+        .await?
+        .into_inner();
+    let handshake_started_at = handshake
+        .daemon_started_at
+        .as_ref()
+        .ok_or("handshake lacks start timestamp")?;
+    let status = client
+        .daemon_status(DaemonStatusRequest {})
+        .await?
+        .into_inner();
+    assert_eq!(handshake.release_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(status.release_version, handshake.release_version);
+    assert_eq!(status.daemon_pid, handshake.daemon_pid);
+    assert_eq!(status.daemon_executable, handshake.daemon_executable);
+    assert_eq!(
+        status.daemon_start_identity,
+        handshake.daemon_start_identity
+    );
+    assert_eq!(
+        status.daemon_instance_token,
+        handshake.daemon_instance_token
+    );
+    let started_at = status
+        .daemon_started_at
+        .ok_or("status lacks start timestamp")?;
+    assert_eq!(started_at, *handshake_started_at);
+    assert!(started_at.seconds > 0);
+    assert!((0..1_000_000_000).contains(&started_at.nanos));
+    assert_eq!(status.health, DaemonHealth::Healthy as i32);
+    let pid = rustix::process::Pid::from_raw(child.id().ok_or("daemon has no process id")? as i32)
+        .ok_or("daemon process id is zero")?;
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM)?;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await??
+            .success()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_rpc_requires_token_and_closes_durable_operation_admission() -> TestResult {
+    let temp = TempDir::new()?;
+    let runtime_root = temp.path().canonicalize()?;
+    let project = runtime_root.join("project");
+    std::fs::create_dir(&project)?;
+    let socket = runtime_root.join("gascan/gascand.sock");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_gascand"))
+        .env("GASCAN_TEST_FAKE_BACKEND", "1")
+        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .env("GASCAN_STATE_PATH", runtime_root.join("state.sqlite3"))
+        .env("GASCAN_IDLE_TIMEOUT_MS", "30000")
+        .env("GASCAN_FAKE_PROVISION_DELAY_MS", "2500")
+        .spawn()?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !socket.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    let endpoint = tonic::transport::Endpoint::try_from("http://[::]:50051")?;
+    let connect_path = socket.clone();
+    let channel = endpoint
+        .connect_with_connector(service_fn(move |_| {
+            let path = connect_path.clone();
+            async move {
+                tokio::net::UnixStream::connect(path)
+                    .await
+                    .map(hyper_util::rt::TokioIo::new)
+            }
+        }))
+        .await?;
+    let mut client = GasCanClient::new(channel);
+    let handshake = client
+        .handshake(HandshakeRequest {
+            api_major: 1,
+            api_minor: 0,
+            requested_capabilities: Vec::new(),
+        })
+        .await?
+        .into_inner();
+    for token in [String::new(), "not-the-daemon-token".to_owned()] {
+        let error = client
+            .shutdown_daemon(ShutdownDaemonRequest {
+                daemon_instance_token: token,
+            })
+            .await
+            .expect_err("an unattested shutdown request must be rejected");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+    assert!(
+        client
+            .shutdown_daemon(ShutdownDaemonRequest {
+                daemon_instance_token: handshake.daemon_instance_token,
+            })
+            .await?
+            .into_inner()
+            .accepted
+    );
+    let error = client
+        .up(UpRequest {
+            project_root: project.to_string_lossy().into_owned(),
+        })
+        .await
+        .expect_err("shutdown must close durable-operation admission");
+    assert!(
+        matches!(
+            error.code(),
+            tonic::Code::Unavailable | tonic::Code::Cancelled | tonic::Code::Unknown
+        ),
+        "shutdown must prevent a new durable operation from being admitted: {error}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await??
+            .success()
+    );
+    assert!(!socket.exists());
     Ok(())
 }
 
@@ -629,7 +790,7 @@ async fn image_upgrade_errors_are_structured_across_real_transport() -> TestResu
 }
 
 #[tokio::test]
-async fn sigterm_waits_for_active_durable_operation_then_closes_connection() -> TestResult {
+async fn shutdown_rpc_waits_for_active_durable_operation_then_closes_connection() -> TestResult {
     let temp = TempDir::new()?;
     let runtime_root = temp.path().canonicalize()?;
     let project = runtime_root.join("project");
@@ -660,6 +821,16 @@ async fn sigterm_waits_for_active_durable_operation_then_closes_connection() -> 
             }
         }))
         .await?;
+    let mut control = GasCanClient::new(channel.clone());
+    let token = control
+        .handshake(HandshakeRequest {
+            api_major: 1,
+            api_minor: 0,
+            requested_capabilities: Vec::new(),
+        })
+        .await?
+        .into_inner()
+        .daemon_instance_token;
     let root = project
         .to_str()
         .ok_or("project path is not UTF-8")?
@@ -673,9 +844,15 @@ async fn sigterm_waits_for_active_durable_operation_then_closes_connection() -> 
         Ok::<(), tonic::Status>(())
     });
     tokio::time::sleep(Duration::from_millis(75)).await;
-    let pid = rustix::process::Pid::from_raw(child.id().ok_or("daemon has no process id")? as i32)
-        .ok_or("daemon process id is zero")?;
-    rustix::process::kill_process(pid, rustix::process::Signal::TERM)?;
+    assert!(
+        control
+            .shutdown_daemon(ShutdownDaemonRequest {
+                daemon_instance_token: token,
+            })
+            .await?
+            .into_inner()
+            .accepted
+    );
     tokio::time::sleep(Duration::from_millis(2100)).await;
     assert!(
         child.try_wait()?.is_none(),

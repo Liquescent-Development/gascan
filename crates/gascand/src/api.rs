@@ -68,6 +68,8 @@ struct DaemonIdentity {
     executable: std::path::PathBuf,
     start_identity: String,
     instance_token: String,
+    release_version: String,
+    started_at: prost_types::Timestamp,
 }
 
 impl DaemonIdentity {
@@ -76,11 +78,19 @@ impl DaemonIdentity {
         let mut random = [0_u8; 32];
         getrandom::fill(&mut random).map_err(io::Error::other)?;
         let instance_token = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?;
         Ok(Self {
             pid,
             executable: std::env::current_exe()?.canonicalize()?,
             start_identity: process_start_identity(pid)?,
             instance_token,
+            release_version: env!("CARGO_PKG_VERSION").to_owned(),
+            started_at: prost_types::Timestamp {
+                seconds: i64::try_from(started_at.as_secs()).map_err(io::Error::other)?,
+                nanos: started_at.subsec_nanos() as i32,
+            },
         })
     }
 }
@@ -117,6 +127,7 @@ struct ActivityInner {
     shutting_down: AtomicBool,
     shutdown: Notify,
     accepting: AtomicBool,
+    termination_requested: tokio::sync::watch::Sender<bool>,
 }
 #[derive(Clone, Copy)]
 struct AdmissionClosed;
@@ -136,6 +147,7 @@ impl ActivityTracker {
             eprintln!("daemon identity creation failed: {error}");
             std::process::abort()
         });
+        let (termination_requested, _) = tokio::sync::watch::channel(false);
         Self {
             inner: Arc::new(ActivityInner {
                 identity,
@@ -146,6 +158,7 @@ impl ActivityTracker {
                 shutting_down: AtomicBool::new(false),
                 shutdown: Notify::new(),
                 accepting: AtomicBool::new(true),
+                termination_requested,
             }),
         }
     }
@@ -207,6 +220,17 @@ impl ActivityTracker {
     }
     fn begin_shutdown(&self) {
         self.inner.accepting.store(false, Ordering::Release);
+    }
+    fn request_termination(&self) {
+        self.begin_shutdown();
+        self.inner.termination_requested.send_replace(true);
+    }
+    async fn wait_for_termination_request(&self) {
+        let mut requested = self.inner.termination_requested.subscribe();
+        if *requested.borrow_and_update() {
+            return;
+        }
+        let _ = requested.changed().await;
     }
     fn ensure_accepting(&self) -> Result<(), AdmissionClosed> {
         if self.inner.accepting.load(Ordering::Acquire) {
@@ -353,6 +377,7 @@ impl Daemon {
             let reason = tokio::select! {
                 result = idle => { let _ = result; "idle" }
                 result = terminated => { let _ = result; "terminated" }
+                () = shutdown_tracker.wait_for_termination_request() => "rpc"
             };
             if std::env::var_os("GASCAN_DAEMON_STDERR_PATH").is_some() {
                 eprintln!("daemon shutdown began: {reason}");
@@ -1522,6 +1547,40 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
                 .to_string_lossy()
                 .into_owned(),
             daemon_start_identity: self.activity.inner.identity.start_identity.clone(),
+            release_version: self.activity.inner.identity.release_version.clone(),
+            daemon_started_at: Some(self.activity.inner.identity.started_at.clone()),
+        }))
+    }
+    async fn daemon_status(
+        &self,
+        _: tonic::Request<v1::DaemonStatusRequest>,
+    ) -> Result<tonic::Response<v1::DaemonStatusResponse>, tonic::Status> {
+        self.activity.ensure_accepting().map_err(admission_status)?;
+        let _lease = self.activity.lease();
+        let identity = &self.activity.inner.identity;
+        Ok(tonic::Response::new(v1::DaemonStatusResponse {
+            release_version: identity.release_version.clone(),
+            daemon_pid: identity.pid,
+            daemon_executable: identity.executable.to_string_lossy().into_owned(),
+            daemon_start_identity: identity.start_identity.clone(),
+            daemon_instance_token: identity.instance_token.clone(),
+            daemon_started_at: Some(identity.started_at.clone()),
+            health: v1::DaemonHealth::Healthy as i32,
+        }))
+    }
+    async fn shutdown_daemon(
+        &self,
+        request: tonic::Request<v1::ShutdownDaemonRequest>,
+    ) -> Result<tonic::Response<v1::ShutdownDaemonResponse>, tonic::Status> {
+        if request.into_inner().daemon_instance_token != self.activity.inner.identity.instance_token
+        {
+            return Err(tonic::Status::permission_denied(
+                "daemon instance token does not match",
+            ));
+        }
+        self.activity.request_termination();
+        Ok(tonic::Response::new(v1::ShutdownDaemonResponse {
+            accepted: true,
         }))
     }
     async fn status(
