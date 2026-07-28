@@ -28,21 +28,75 @@ __gascan_starship_restore()
     PS1=$__gascan_starship_old_ps1
     PATH=$__gascan_starship_old_path
     export PATH
-    if [ "$__gascan_starship_euid" = 0 ]; then
-        unset STARSHIP_CONFIG STARSHIP_EXECUTABLE
+    if [ "$__gascan_starship_config_was_set" = 1 ]; then
+        STARSHIP_CONFIG=$__gascan_starship_old_config
+        export STARSHIP_CONFIG
     else
-        if [ "$__gascan_starship_config_was_set" = 1 ]; then
-            STARSHIP_CONFIG=$__gascan_starship_old_config
-            export STARSHIP_CONFIG
+        unset STARSHIP_CONFIG
+    fi
+    if [ "$__gascan_starship_executable_was_set" = 1 ]; then
+        STARSHIP_EXECUTABLE=$__gascan_starship_old_executable
+        export STARSHIP_EXECUTABLE
+    else
+        unset STARSHIP_EXECUTABLE
+    fi
+}
+
+__gascan_starship_emit_variable()
+{
+    local declaration attributes
+    if declaration=$(declare -p "$1" 2>/dev/null); then
+        attributes=${declaration#declare -}
+        attributes=${attributes%% *}
+        case "$attributes" in
+            *r*) return 0 ;;
+        esac
+        declaration=${declaration#declare }
+        declaration=${declaration#* }
+        printf '%s\n' "$declaration"
+    else
+        printf 'unset %q\n' "$1"
+    fi
+}
+
+__gascan_starship_build_commit()
+{
+    local initialization=$1 inherited_debug_trap=$2 name
+    local -a commit_functions=(
+        _starship_set_return starship_preexec starship_precmd
+        starship_preexec_all starship_preexec_ps0
+    )
+    local -a commit_variables=(
+        PS0 PS1 PS2 PROMPT_COMMAND preexec_functions precmd_functions
+        STARSHIP_CONFIG STARSHIP_EXECUTABLE STARSHIP_PREEXEC_READY
+        STARSHIP_START_TIME STARSHIP_PROMPT_COMMAND STARSHIP_DEBUG_TRAP
+        STARSHIP_SHELL STARSHIP_SESSION_KEY
+    )
+
+    # The immutable full init executes exactly once and only in this inherited
+    # subshell. A nonzero result cannot mutate the interactive parent shell.
+    if [ -n "$inherited_debug_trap" ]; then
+        eval "$inherited_debug_trap"
+    fi
+    if ! eval "$initialization" >/dev/null 2>&1; then
+        return 1
+    fi
+
+    for name in "${commit_functions[@]}"; do
+        if declare -F "$name" >/dev/null; then
+            declare -f "$name"
         else
-            unset STARSHIP_CONFIG
+            printf 'unset -f %q\n' "$name"
         fi
-        if [ "$__gascan_starship_executable_was_set" = 1 ]; then
-            STARSHIP_EXECUTABLE=$__gascan_starship_old_executable
-            export STARSHIP_EXECUTABLE
-        else
-            unset STARSHIP_EXECUTABLE
-        fi
+    done
+    for name in "${commit_variables[@]}"; do
+        __gascan_starship_emit_variable "$name"
+    done
+    shopt -p checkwinsize
+    if ! trap -p DEBUG; then
+        printf '%s\n' 'trap - DEBUG'
+    elif [ -z "$(trap -p DEBUG)" ]; then
+        printf '%s\n' 'trap - DEBUG'
     fi
 }
 
@@ -51,11 +105,14 @@ __gascan_starship_main()
     local selector=/home/workspace/.config/gascan/shell/prompt
     local config=/home/workspace/.config/gascan/shell/starship.toml
     local binary=/opt/gascan/shell/bin/starship
+    local binary_target=/opt/gascan/workstation/bin/starship
+    local binary_link=../../workstation/bin/starship
     local immutable_path=/opt/gascan/shell/bin:/usr/bin:/bin
     local managed_owner=0 workspace_uid=1000 workspace_gid=1000
-    local immutable_owner=0 immutable_gid=0
-    local prompt preset selected_config initialization
-    local selector_metadata config_metadata preset_metadata binary_metadata
+    local immutable_owner=0 immutable_gid=0 immutable_link_mode=777
+    local prompt preset selected_config initialization commit debug_trap
+    local selector_metadata config_metadata preset_metadata
+    local binary_metadata binary_target_metadata
 
     selector_metadata=$(__gascan_shell_metadata "$selector")
     if [ ! -f "$selector" ] || [ -L "$selector" ] ||
@@ -90,16 +147,25 @@ __gascan_starship_main()
             return 0
             ;;
     esac
+    if [ -n "${BLE_VERSION-}" ]; then
+        __gascan_starship_warn
+        return 0
+    fi
 
     config_metadata=$(__gascan_shell_metadata "$config")
     preset_metadata=$(__gascan_shell_metadata "$preset")
     binary_metadata=$(__gascan_shell_metadata "$binary")
+    binary_target_metadata=$(__gascan_shell_metadata "$binary_target")
     if [ ! -f "$config" ] || [ -L "$config" ] ||
         [ "$config_metadata" != "$managed_owner:$workspace_gid:640:1" ] ||
         [ ! -f "$preset" ] || [ -L "$preset" ] ||
         [ "$preset_metadata" != "$immutable_owner:$immutable_gid:444:1" ] ||
-        [ ! -f "$binary" ] || [ -L "$binary" ] ||
-        [ "$binary_metadata" != "$immutable_owner:$immutable_gid:555:1" ] ||
+        [ ! -L "$binary" ] ||
+        [ "$binary_metadata" != \
+            "$immutable_owner:$immutable_gid:$immutable_link_mode:1" ] ||
+        [ "$(/usr/bin/readlink "$binary" 2>/dev/null)" != "$binary_link" ] ||
+        [ ! -f "$binary_target" ] || [ -L "$binary_target" ] ||
+        [ "$binary_target_metadata" != "$immutable_owner:$immutable_gid:555:1" ] ||
         ! /usr/bin/cmp -s "$config" "$preset"; then
         __gascan_starship_warn
         return 0
@@ -131,10 +197,34 @@ __gascan_starship_main()
         __gascan_starship_warn
         return 0
     fi
-    if ! eval "$initialization"; then
+    debug_trap=$(trap -p DEBUG)
+    if ! commit=$(
+        __gascan_starship_build_commit "$initialization" "$debug_trap"
+    ); then
         __gascan_starship_restore
         __gascan_starship_warn
         return 0
+    fi
+    if ! /bin/bash -n <<<"$commit" >/dev/null 2>&1; then
+        __gascan_starship_restore
+        __gascan_starship_warn
+        return 0
+    fi
+    trap - DEBUG
+    if ! eval "$commit"; then
+        if [ -n "$debug_trap" ]; then
+            eval "$debug_trap"
+        fi
+        __gascan_starship_restore
+        __gascan_starship_warn
+        return 0
+    fi
+    export STARSHIP_CONFIG STARSHIP_EXECUTABLE
+    if [ "${STARSHIP_SHELL+x}" = x ]; then
+        export STARSHIP_SHELL
+    fi
+    if [ "${STARSHIP_SESSION_KEY+x}" = x ]; then
+        export STARSHIP_SESSION_KEY
     fi
     PATH=$__gascan_starship_old_path
     export PATH
@@ -147,5 +237,6 @@ __gascan_starship_main()
 
 __gascan_starship_main
 unset -f __gascan_starship_main __gascan_starship_restore \
+    __gascan_starship_build_commit __gascan_starship_emit_variable \
     __gascan_starship_warn __gascan_shell_metadata
 return 0 2>/dev/null || exit 0

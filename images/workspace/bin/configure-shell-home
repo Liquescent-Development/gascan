@@ -5,9 +5,8 @@ if [ "$#" -ne 1 ]; then
     printf '%s\n' 'usage: configure-shell-home PROMPT' >&2
     exit 2
 fi
-: "${HOME:?HOME must be set}"
 
-exec /usr/bin/python3 - "$0" "$HOME" "$1" <<'PY'
+exec /usr/bin/python3 - "$0" "$1" <<'PY'
 import fcntl
 import grp
 import os
@@ -313,11 +312,9 @@ def apply_transaction(shell_fd, prompt, presets, workspace_gid):
     os.fsync(shell_fd)
 
 
-def run(script_path, home, prompt):
+def run(script_path, prompt):
     if os.geteuid() != 0:
         raise Refusal("configurator must run as root")
-    if home != FIXED_HOME:
-        raise Refusal(f"HOME must be {FIXED_HOME}")
     if prompt not in PROMPTS:
         accepted = ", ".join(PROMPTS)
         raise Refusal(f"unknown prompt {prompt!r}; expected one of: {accepted}")
@@ -333,9 +330,9 @@ def run(script_path, home, prompt):
     presets = load_presets(script_path)
 
     try:
-        home_fd = os.open(home, DIRECTORY_FLAGS)
+        home_fd = os.open(FIXED_HOME, DIRECTORY_FLAGS)
     except OSError as error:
-        raise Refusal("HOME is not a safe directory") from error
+        raise Refusal("fixed workspace home is not a safe directory") from error
     try:
         require_directory(
             home_fd, workspace.pw_uid, workspace_gid, 0o755, "workspace HOME"
@@ -367,7 +364,7 @@ def run(script_path, home, prompt):
 def main():
     os.umask(0o077)
     try:
-        run(sys.argv[1], sys.argv[2], sys.argv[3])
+        run(sys.argv[1], sys.argv[2])
     except (KeyError, OSError, Refusal) as error:
         print(f"configure-shell-home: {error}", file=sys.stderr)
         return 1

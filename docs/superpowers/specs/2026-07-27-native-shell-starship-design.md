@@ -160,11 +160,25 @@ matching immutable preset directly and never retains the generated home
 configuration. The hook invokes the pinned binary directly with
 `init bash --print-full-init` under an immutable-only `PATH`, exports the
 pinned `STARSHIP_EXECUTABLE` for prompt runtime, and evaluates the resulting
-full initialization. It restores the original prompt and environment and
-warns once if generation or evaluation fails. Switching back to `standard`
+full initialization exactly once in an inherited subshell. Only after that
+evaluation succeeds does the hook apply a declaration-only commit of the
+reviewed Starship 1.25.1 Bash state (Starship functions and variables, prompt
+variables, `PROMPT_COMMAND`, supported preexec arrays, the DEBUG trap, and
+`checkwinsize`) to the interactive parent. Thus a partially failing full init
+cannot mutate live prompt, function, variable, trap, or hook state and no
+second full-init evaluation is needed. Unsupported BLE integration fails
+closed to standard Bash. The hook restores pre-existing
+`STARSHIP_CONFIG`/`STARSHIP_EXECUTABLE` exactly and warns once if generation
+or isolated evaluation fails. Switching back to `standard`
 disables Starship on the next interactive login. Obsolete generated preset
 state may be removed only after its exact managed identity and type have been
 verified.
+
+The stable executable path is the image-created, root-owned relative symlink
+`/opt/gascan/shell/bin/starship -> ../../workstation/bin/starship`. The hook
+validates that exact link identity and validates the resolved
+`/opt/gascan/workstation/bin/starship` as a non-symlinked, root-owned mode
+`0555` regular file before execution. It never searches `PATH`.
 
 Both default `gascan shell` and SSH login sessions reach the same final hook.
 Gas Can does not edit user-created shell files at runtime. A user who
@@ -202,9 +216,11 @@ During initial provisioning or apply, the daemon invokes exactly:
 /usr/bin/sudo -n /usr/local/bin/configure-shell-home <validated-prompt>
 ```
 
-The configurator accepts only effective root, the fixed
-`HOME=/home/workspace`, and the fixed workspace identity. It never derives
-authority or a writable path from the invoking user. It then:
+The configurator accepts only effective root, one validated prompt argument,
+and the fixed workspace identity. Its target home is compiled as
+`/home/workspace`; inherited `HOME` is ignored because production `sudo`
+resets it to `/root`. It never derives authority or a writable path from the
+invoking user or environment. It then:
 
 1. Validate the managed configuration root without following links.
 2. Open and exclusively lock the root-owned transaction lock.

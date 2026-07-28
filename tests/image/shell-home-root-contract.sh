@@ -19,6 +19,7 @@ lock=$gascan_root/.shell.lock
 immutable_root=/opt/gascan/shell
 
 test "$(/usr/bin/id -u)" = 0 || die 'contract must run as real root'
+printf '127.0.0.1 %s\n' "$(/bin/hostname)" >>/etc/hosts
 test "$(/usr/bin/id -u workspace)" = 1000 || die 'workspace uid changed'
 workspace_gid=$(/usr/bin/id -g workspace)
 test "$workspace_gid" = 1000 || die 'workspace gid changed'
@@ -43,7 +44,8 @@ rm -f "$lock"
 
 run_configurator()
 {
-    HOME=$home "$configurator" "$1"
+    /usr/sbin/runuser -u workspace -- env HOME=/tmp/hostile-home \
+        /usr/bin/sudo -n /usr/local/bin/configure-shell-home "$1"
 }
 
 assert_metadata()
@@ -72,22 +74,29 @@ assert_selected_config()
     esac
 }
 
-# Root and fixed HOME are production preconditions, not fixture overrides.
+# Effective root is required, while the target home is compiled in and does
+# not depend on sudo's reset environment or caller-controlled HOME.
 if /usr/sbin/runuser -u workspace -- env HOME="$home" "$configurator" standard; then
     die 'non-root configurator invocation succeeded'
 fi
 test ! -e "$shell_dir" && test ! -e "$lock" ||
     die 'non-root rejection mutated managed state'
-wrong_home=/tmp/gascan-shell-wrong-home
-rm -rf "$wrong_home"
-install -d -o workspace -g workspace -m 0755 "$wrong_home"
-if HOME=$wrong_home "$configurator" standard; then
-    die 'root configurator accepted a non-workspace HOME'
+if /usr/sbin/runuser -u workspace -- \
+    /usr/bin/sudo -n /usr/local/bin/configure-shell-home standard ignored; then
+    die 'configurator accepted untrusted extra input'
 fi
-test ! -e "$wrong_home/.config" || die 'wrong-HOME rejection mutated state'
-rm -rf "$wrong_home"
+test ! -e "$shell_dir" && test ! -e "$lock" ||
+    die 'extra-input rejection mutated managed state'
+sudo_home=$(
+    /usr/sbin/runuser -u workspace -- env HOME=/tmp/hostile-home \
+        /usr/bin/sudo -n /bin/sh -c 'printf %s "$HOME"'
+)
+test "$sudo_home" = /root ||
+    die "sudo did not reset HOME to /root (got $sudo_home)"
 
 run_configurator standard
+test ! -e /tmp/hostile-home ||
+    die 'caller-controlled HOME was used as the managed target'
 assert_metadata "$shell_dir" root:workspace:750
 assert_metadata "$selector" root:workspace:640
 assert_metadata "$lock" root:root:600
@@ -183,14 +192,17 @@ wait "$first_pid"
 wait "$second_pid"
 assert_selected_config
 
-# Install a realistic two-phase Starship double and a PATH attacker.
-install -d -o root -g root -m 0755 "$immutable_root/bin"
+# Install the production relative symlink topology, a realistic two-phase
+# Starship double at its immutable target, and a PATH attacker.
+install -d -o root -g root -m 0555 "$immutable_root/bin"
+stable_target=/opt/gascan/workstation/bin/starship
+install -d -o root -g root -m 0555 /opt/gascan/workstation/bin
 stable_log=/tmp/gascan-stable-starship.log
 path_log=/tmp/gascan-path-starship.log
 : >"$stable_log"
 : >"$path_log"
 chmod 0666 "$stable_log" "$path_log"
-cat >"$immutable_root/bin/starship" <<'STARSHIP'
+cat >"$stable_target" <<'STARSHIP'
 #!/bin/sh
 printf '%s|%s|%s\n' "$*" "${STARSHIP_CONFIG-}" "${STARSHIP_EXECUTABLE-}" \
     >>"${GASCAN_TEST_STABLE_LOG:?}"
@@ -201,10 +213,21 @@ case "$*" in
     'init bash --print-full-init')
         test "${GASCAN_TEST_GENERATION_FAIL:-0}" != 1 || exit 23
         if test "${GASCAN_TEST_EVAL_FAIL:-0}" = 1; then
-            printf '%s\n' "PS1='broken-starship'; false"
+            cat <<'PARTIAL_INIT'
+PS1='broken-starship'
+PS2='broken-continuation'
+PROMPT_COMMAND='broken-prompt-command'
+STARSHIP_PARTIAL='leaked-variable'
+starship_partial_leak()
+{
+    printf leaked
+}
+trap 'STARSHIP_TRAP_LEAK=1' DEBUG
+false
+PARTIAL_INIT
         else
             cat <<'FULL_INIT'
-__gascan_test_starship_runtime()
+starship_precmd()
 {
     "$STARSHIP_EXECUTABLE" prompt
 }
@@ -220,8 +243,14 @@ FULL_INIT
         ;;
 esac
 STARSHIP
-chmod 0555 "$immutable_root/bin/starship"
+chown root:root "$stable_target"
+chmod 0555 "$stable_target"
+ln -s ../../workstation/bin/starship "$immutable_root/bin/starship"
+chown -h root:root "$immutable_root/bin/starship"
 chmod 0555 "$immutable_root/bin" "$immutable_root"
+test "$(readlink "$immutable_root/bin/starship")" = ../../workstation/bin/starship ||
+    die 'stable Starship link topology differs from production'
+assert_metadata "$stable_target" root:root:555
 
 attacker_bin=$home/.local/bin
 install -d -o workspace -g workspace -m 0755 "$attacker_bin"
@@ -237,9 +266,23 @@ export GASCAN_TEST_STABLE_LOG=$stable_log
 export GASCAN_TEST_PATH_LOG=$path_log
 run_configurator starship
 
+chmod 0755 "$stable_target"
+unsafe_target_output=$(
+    PATH="$attacker_bin:/usr/bin:/bin" /bin/bash --noprofile --norc -i -c \
+        "PS1='native-root'; . '$hook'; printf 'PS1=%s\n' \"\$PS1\"" 2>&1
+)
+printf '%s\n' "$unsafe_target_output" | grep -Fqx PS1=native-root ||
+    die 'unsafe stable-link target changed the root prompt'
+printf '%s\n' "$unsafe_target_output" |
+    grep -Fq 'gascan: Starship prompt unavailable; using standard Bash prompt.' ||
+    die 'unsafe stable-link target did not fail closed'
+test ! -s "$stable_log" ||
+    die 'hook executed a stable-link target with the wrong mode'
+chmod 0555 "$stable_target"
+
 root_output=$(
     PATH="$attacker_bin:/usr/bin:/bin" /bin/bash --noprofile --norc -i -c \
-        "PS1='native-root'; . '$hook'; __gascan_test_starship_runtime; \
+        "PS1='native-root'; . '$hook'; starship_precmd; \
          printf 'PS1=%s\nCONFIG=%s\nEXEC=%s\n' \
          \"\$PS1\" \"\$STARSHIP_CONFIG\" \"\$STARSHIP_EXECUTABLE\""
 )
@@ -260,6 +303,8 @@ grep -Fqx \
 grep -Fqx \
     "prompt|$immutable_root/presets/starship.toml|$immutable_root/bin/starship" \
     "$stable_log" || die 'prompt runtime did not use the immutable command/config'
+test "$(grep -Fc 'init bash --print-full-init' "$stable_log")" = 1 ||
+    die 'root full init executed more than once'
 
 : >"$stable_log"
 workspace_output=$(
@@ -268,7 +313,7 @@ workspace_output=$(
         GASCAN_TEST_STABLE_LOG="$stable_log" \
         GASCAN_TEST_PATH_LOG="$path_log" \
         /bin/bash --noprofile --norc -i -c \
-        "PS1='native-workspace'; . '$hook'; __gascan_test_starship_runtime; \
+        "PS1='native-workspace'; . '$hook'; starship_precmd; \
          printf 'PS1=%s\nCONFIG=%s\nEXEC=%s\n' \
          \"\$PS1\" \"\$STARSHIP_CONFIG\" \"\$STARSHIP_EXECUTABLE\""
 )
@@ -278,11 +323,18 @@ printf '%s\n' "$workspace_output" |
     grep -Fqx "CONFIG=$config" ||
     die 'workspace prompt did not use managed root-owned config'
 test ! -s "$path_log" || die 'workspace prompt resolved Starship through user PATH'
+test "$(grep -Fc 'init bash --print-full-init' "$stable_log")" = 1 ||
+    die 'workspace full init executed more than once'
 
 failure_output=$(
     GASCAN_TEST_GENERATION_FAIL=1 PATH="$attacker_bin:/usr/bin:/bin" \
         /bin/bash --noprofile --norc -i -c \
-        "PS1='native-root'; . '$hook'; . '$hook'; printf 'PS1=%s\n' \"\$PS1\"" \
+        "PS1='native-root'; \
+         STARSHIP_CONFIG='preexisting-config'; \
+         STARSHIP_EXECUTABLE='preexisting-executable'; \
+         . '$hook'; . '$hook'; \
+         printf 'PS1=%s\nCONFIG=%s\nEXEC=%s\n' \
+         \"\$PS1\" \"\$STARSHIP_CONFIG\" \"\$STARSHIP_EXECUTABLE\"" \
         2>&1
 )
 test "$(printf '%s\n' "$failure_output" |
@@ -290,17 +342,50 @@ test "$(printf '%s\n' "$failure_output" |
     die 'full-init generation failure did not warn exactly once'
 printf '%s\n' "$failure_output" | grep -Fqx PS1=native-root ||
     die 'generation failure did not restore Bash prompt'
+printf '%s\n' "$failure_output" | grep -Fqx CONFIG=preexisting-config ||
+    die 'generation failure did not restore pre-existing STARSHIP_CONFIG'
+printf '%s\n' "$failure_output" | grep -Fqx EXEC=preexisting-executable ||
+    die 'generation failure did not restore pre-existing STARSHIP_EXECUTABLE'
 
 eval_failure_output=$(
     GASCAN_TEST_EVAL_FAIL=1 PATH="$attacker_bin:/usr/bin:/bin" \
         /bin/bash --noprofile --norc -i -c \
-        "PS1='native-root'; . '$hook'; printf 'PS1=%s\n' \"\$PS1\"" 2>&1
+        "PS1='native-root'; PS2='native-continuation'; \
+         PROMPT_COMMAND='native-prompt-command'; \
+         STARSHIP_CONFIG='preexisting-config'; \
+         STARSHIP_EXECUTABLE='preexisting-executable'; \
+         trap 'STARSHIP_NATIVE_TRAP=1' DEBUG; \
+         . '$hook'; \
+         declare -F starship_partial_leak >/dev/null && printf 'FUNCTION=leaked\n'; \
+         printf 'PS1=%s\nPS2=%s\nPROMPT=%s\nCONFIG=%s\nEXEC=%s\nPARTIAL=%s\nTRAP=%s\n' \
+         \"\$PS1\" \"\$PS2\" \"\$PROMPT_COMMAND\" \
+         \"\$STARSHIP_CONFIG\" \"\$STARSHIP_EXECUTABLE\" \
+         \"\${STARSHIP_PARTIAL-unset}\" \"\$(trap -p DEBUG)\"" 2>&1
 )
 printf '%s\n' "$eval_failure_output" |
     grep -Fq 'gascan: Starship prompt unavailable; using standard Bash prompt.' ||
     die 'full-init eval failure did not warn'
 printf '%s\n' "$eval_failure_output" | grep -Fqx PS1=native-root ||
     die 'full-init eval failure did not restore Bash prompt'
+printf '%s\n' "$eval_failure_output" | grep -Fqx PS2=native-continuation ||
+    die 'partial init leaked continuation prompt state'
+printf '%s\n' "$eval_failure_output" |
+    grep -Fqx PROMPT=native-prompt-command ||
+    die 'partial init leaked PROMPT_COMMAND state'
+printf '%s\n' "$eval_failure_output" | grep -Fqx CONFIG=preexisting-config ||
+    die 'eval failure did not restore pre-existing STARSHIP_CONFIG'
+printf '%s\n' "$eval_failure_output" | grep -Fqx EXEC=preexisting-executable ||
+    die 'eval failure did not restore pre-existing STARSHIP_EXECUTABLE'
+printf '%s\n' "$eval_failure_output" | grep -Fqx PARTIAL=unset ||
+    die 'partial init leaked a Starship variable'
+test "$(printf '%s\n' "$eval_failure_output" | grep -Fc FUNCTION=leaked)" = 0 ||
+    die 'partial init leaked a Starship function'
+printf '%s\n' "$eval_failure_output" |
+    grep -Fq "trap -- 'STARSHIP_NATIVE_TRAP=1' DEBUG" ||
+    die 'partial init replaced the existing DEBUG trap'
+full_init_count=$(grep -Fc 'init bash --print-full-init' "$stable_log")
+test "$full_init_count" = 4 ||
+    die "full init invocation count is $full_init_count, expected 4"
 
 # Bash strings cannot preserve NUL, so selector validation must compare bytes.
 printf 'starship\0\n' >"$selector"

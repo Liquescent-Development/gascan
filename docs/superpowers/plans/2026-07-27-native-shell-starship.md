@@ -441,7 +441,12 @@ FIFOs, wrong owners, permissive modes, and unexpected files. Add shell-hook
 tests proving non-interactive no-op, standard no-op, exact binary invocation,
 root-vs-workspace `STARSHIP_CONFIG` selection, byte-exact selector validation,
 direct full-init generation, immutable runtime executable selection, and
-one-warning restoration after generation or evaluation failure. Prove the
+one-warning restoration after generation or partial evaluation failure.
+Use the production relative symlink topology and prove its exact target,
+ownership, and mode are validated while hostile `PATH` remains unused. Prove
+full init executes exactly once, a partial failure leaks no prompt,
+`PROMPT_COMMAND`, function, variable, or DEBUG-trap state, and pre-existing
+Starship environment is restored exactly. Prove the
 root-owned mode `0600` advisory lock serializes concurrent writers and that the
 workspace account can read but cannot mutate or race managed state.
 
@@ -468,8 +473,10 @@ PROMPTS = {
 }
 ```
 
-Require effective root, fixed `HOME=/home/workspace`, and the fixed workspace
-identity. Use directory file descriptors, `lstat`, `O_NOFOLLOW`, exact
+Require effective root, exactly one prompt argument, and the fixed workspace
+identity. Compile the target home as `/home/workspace` and ignore inherited
+`HOME`, since the exact production sudo invocation resets it to `/root`. Use
+directory file descriptors, `lstat`, `O_NOFOLLOW`, exact
 UID/GID/mode/link checks, a root-owned transaction lock, reserved
 same-directory staging names, parent-directory `fsync`, and atomic `rename`.
 The shell directory is `root:workspace` mode `0750`; selector, generated
@@ -493,9 +500,13 @@ Under an immutable-only `PATH`, it exports the pinned
 /opt/gascan/shell/bin/starship init bash --print-full-init
 ```
 
-Evaluate that captured output and restore the caller's `PATH`. If validation,
-generation, or evaluation fails, restore the native prompt and environment,
-print
+The stable path is the exact root-owned relative symlink to the immutable
+root-owned workstation binary; validate both the link and its target. Evaluate
+the captured full init exactly once in an inherited subshell. On success,
+serialize and apply only the reviewed declaration-only Starship Bash state to
+the parent; do not evaluate full init a second time. If validation, generation,
+or isolated evaluation fails, restore the native prompt and pre-existing
+Starship environment exactly, print
 `gascan: Starship prompt unavailable; using standard Bash prompt.` once and
 return success.
 
@@ -528,6 +539,10 @@ rtk bash -n images/workspace/bin/configure-shell-home
 rtk container run --rm --network none --user root ... \
   /source/tests/image/shell-home-root-contract.sh /source
 ```
+
+The Linux contract must invoke the configurator from the workspace account
+through the exact Task 6 argv, assert sudo actually resets `HOME` to `/root`,
+and prove the fixed `/home/workspace` target still succeeds.
 
 Expected: PASS.
 

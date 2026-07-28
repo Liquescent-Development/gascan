@@ -66,21 +66,35 @@ fn write_mode(path: &Path, contents: &str, mode: u32) {
 
 fn hook_fixture(temporary: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     let shell_dir = temporary.path().join("managed-shell");
-    let starship = temporary.path().join("immutable-starship");
-    let presets = temporary.path().join("immutable-presets");
+    let immutable_root = temporary.path().join("opt/gascan/shell");
+    let starship = immutable_root.join("bin/starship");
+    let starship_target = temporary.path().join("opt/gascan/workstation/bin/starship");
+    let presets = immutable_root.join("presets");
     let log = temporary.path().join("starship.log");
     fs::create_dir(&shell_dir).unwrap();
+    fs::create_dir_all(starship.parent().unwrap()).unwrap();
+    fs::create_dir_all(starship_target.parent().unwrap()).unwrap();
     fs::create_dir(&presets).unwrap();
+    symlink("../../workstation/bin/starship", &starship).unwrap();
     for name in ["starship.toml", "starship-nerd-font.toml"] {
         write_mode(&presets.join(name), "format = \"$character\"\n", 0o444);
     }
     let source = fs::read_to_string(root().join("images/workspace/etc/gascan/bashrc")).unwrap();
     let fixture_uid = fs::metadata(temporary.path()).unwrap().uid();
     let fixture_gid = fs::metadata(temporary.path()).unwrap().gid();
+    let fixture_link_mode = fs::symlink_metadata(&starship)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777;
     let rebound = source
         .replace(
             "/home/workspace/.config/gascan/shell",
             shell_dir.to_str().unwrap(),
+        )
+        .replace(
+            "/opt/gascan/workstation/bin/starship",
+            starship_target.to_str().unwrap(),
         )
         .replace("/opt/gascan/shell/bin/starship", starship.to_str().unwrap())
         .replace("/opt/gascan/shell/presets", presets.to_str().unwrap())
@@ -97,7 +111,11 @@ fn hook_fixture(temporary: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf, Pa
             "immutable_owner=0",
             &format!("immutable_owner={fixture_uid}"),
         )
-        .replace("immutable_gid=0", &format!("immutable_gid={fixture_gid}"));
+        .replace("immutable_gid=0", &format!("immutable_gid={fixture_gid}"))
+        .replace(
+            "immutable_link_mode=777",
+            &format!("immutable_link_mode={fixture_link_mode:o}"),
+        );
     assert_ne!(
         source, rebound,
         "fixture did not rebind managed shell paths"
@@ -105,7 +123,7 @@ fn hook_fixture(temporary: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf, Pa
     let hook = temporary.path().join("gascan-bashrc");
     fs::write(&hook, rebound).unwrap();
     fs::write(
-        &starship,
+        &starship_target,
         "#!/bin/sh\n\
          printf '%s|%s|%s\\n' \"$*\" \"${STARSHIP_CONFIG-}\" \"${STARSHIP_EXECUTABLE-}\" >>\"$GASCAN_TEST_LOG\"\n\
          if [ \"$*\" = 'init bash' ]; then\n\
@@ -113,9 +131,16 @@ fn hook_fixture(temporary: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf, Pa
          elif [ \"$*\" = 'init bash --print-full-init' ]; then\n\
            test \"${GASCAN_TEST_GENERATION_FAIL-0}\" != 1 || exit 23\n\
            if [ \"${GASCAN_TEST_EVAL_FAIL-0}\" = 1 ]; then\n\
-             printf '%s\\n' 'PS1=broken; false'\n\
+             printf '%s\\n' \
+               'PS1=broken' \
+               'PS2=broken-continuation' \
+               'PROMPT_COMMAND=broken-prompt-command' \
+               'STARSHIP_PARTIAL=leaked-variable' \
+               'starship_partial_leak() { printf leaked; }' \
+               \"trap 'STARSHIP_TRAP_LEAK=1' DEBUG\" \
+               'false'\n\
            else\n\
-             printf '%s\\n' 'PS1=managed-starship' '__gascan_test_prompt() { \"$STARSHIP_EXECUTABLE\" prompt; }'\n\
+             printf '%s\\n' 'PS1=managed-starship' 'starship_precmd() { \"$STARSHIP_EXECUTABLE\" prompt; }'\n\
            fi\n\
          elif [ \"$*\" = prompt ]; then\n\
            printf '%s\\n' stable-runtime-prompt\n\
@@ -124,7 +149,7 @@ fn hook_fixture(temporary: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf, Pa
          fi\n",
     )
     .unwrap();
-    fs::set_permissions(&starship, fs::Permissions::from_mode(0o555)).unwrap();
+    fs::set_permissions(&starship_target, fs::Permissions::from_mode(0o555)).unwrap();
     (hook, shell_dir, starship, log)
 }
 
@@ -1890,7 +1915,7 @@ fn workstation_home_configuration_contains_no_credentials() {
 }
 
 #[test]
-fn shell_configurator_rejects_non_root_and_nonfixed_home_without_mutation() {
+fn shell_configurator_rejects_non_root_and_extra_input_without_mutation() {
     let fixture = ShellFixture::new();
     for prompt in ["standard", "starship", "starship-nerd-font"] {
         let output = fixture.run(prompt);
@@ -1899,6 +1924,12 @@ fn shell_configurator_rejects_non_root_and_nonfixed_home_without_mutation() {
             "non-root configurator accepted {prompt}"
         );
     }
+    let extra = Command::new(&fixture.script)
+        .args(["standard", "ignored"])
+        .env_clear()
+        .output()
+        .unwrap();
+    assert!(!extra.status.success(), "configurator accepted extra input");
     assert!(
         !fixture.home.join(".config/gascan/shell").exists(),
         "rejected invocation mutated managed state"
@@ -1974,7 +2005,7 @@ fn shell_hook_uses_only_the_pinned_binary_and_managed_config() {
             "--norc",
             "-i",
             "-c",
-            r#"PS1='native-prompt'; . "$GASCAN_TEST_HOOK"; printf '%s|' "$PS1"; __gascan_test_prompt"#,
+            r#"PS1='native-prompt'; . "$GASCAN_TEST_HOOK"; printf '%s|' "$PS1"; starship_precmd"#,
         ])
         .env("PATH", &fake_path)
         .env("GASCAN_TEST_HOOK", &hook)
@@ -2039,6 +2070,26 @@ fn shell_hook_warns_once_and_returns_success_when_starship_is_unavailable() {
         "stderr: {}\nlog: {}",
         String::from_utf8_lossy(&output.stderr),
         fs::read_to_string(&log).unwrap_or_default()
+    );
+
+    let partial = run_hook(
+        &hook,
+        r#"PS1='native-prompt'; PS2='native-continuation'; PROMPT_COMMAND='native-command'; STARSHIP_CONFIG='old-config'; STARSHIP_EXECUTABLE='old-executable'; trap 'STARSHIP_NATIVE_TRAP=1' DEBUG; . "$GASCAN_TEST_HOOK"; declare -F starship_partial_leak >/dev/null && printf 'function=leaked\n'; printf '%s|%s|%s|%s|%s|%s|%s\n' "$PS1" "$PS2" "$PROMPT_COMMAND" "$STARSHIP_CONFIG" "$STARSHIP_EXECUTABLE" "${STARSHIP_PARTIAL-unset}" "$(trap -p DEBUG)""#,
+        &log,
+        false,
+        true,
+        true,
+    );
+    assert!(partial.status.success());
+    assert_eq!(
+        partial.stdout,
+        b"native-prompt|native-continuation|native-command|old-config|old-executable|unset|trap -- 'STARSHIP_NATIVE_TRAP=1' DEBUG\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&partial.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&partial.stdout).contains("function=leaked"),
+        "partial full init leaked a function"
     );
 
     fs::write(shell_dir.join("prompt"), "starship\nextra\n").unwrap();
