@@ -23,8 +23,8 @@ if test -n "${GASCAN_E2E_CANDIDATE_IMAGE_FILE:-}"; then
       exit 1
   }
   candidate_runtime_image=${candidate_image%%@sha256:*}
-  export GASCAN_E2E_CANDIDATE_RECEIPT_IMAGE=$candidate_image
-  export GASCAN_E2E_CANDIDATE_IMAGE=$candidate_runtime_image
+  export GASCAN_E2E_CANDIDATE_IMAGE=$candidate_image
+  export GASCAN_E2E_CANDIDATE_RUNTIME_IMAGE=$candidate_runtime_image
   if test "${GASCAN_E2E_PREDECESSOR_IMAGE+x}" = x; then
     predecessor_image=$GASCAN_E2E_PREDECESSOR_IMAGE
   else

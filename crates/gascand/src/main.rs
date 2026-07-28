@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-use gascan_apple::{AppleBackend, AppleProbe, ProcessRunner};
+use gascan_apple::{AppleBackend, AppleProbe, CommandRunner, CommandSpec, ProcessRunner};
 use gascan_core::doctor::{DoctorFact, DoctorFacts, DoctorReport};
 use gascan_core::fake_runtime::FakeRuntime;
 use gascan_core::runtime::RuntimeBackend;
@@ -21,6 +21,76 @@ struct ConfiguredProvisioner {
 struct DaemonSshConfig {
     e2e_paths: Option<SshPaths>,
     refresh_doctor: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct E2eCandidateMapping {
+    immutable: String,
+    runtime: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct E2eProcessRunner {
+    candidate: Option<E2eCandidateMapping>,
+}
+
+impl E2eProcessRunner {
+    fn configured_from_environment() -> Result<Self, Box<dyn std::error::Error>> {
+        if option_env!("CARGO_BIN_NAME") != Some("gascan-e2e-daemon") {
+            return Ok(Self::default());
+        }
+        let immutable = std::env::var("GASCAN_E2E_CANDIDATE_IMAGE").ok();
+        let runtime = std::env::var("GASCAN_E2E_CANDIDATE_RUNTIME_IMAGE").ok();
+        let candidate = match (immutable, runtime) {
+            (None, None) => None,
+            (Some(immutable), Some(runtime)) => {
+                Some(validate_e2e_candidate_mapping(immutable, runtime)?)
+            }
+            _ => return Err("incomplete E2E candidate image mapping".into()),
+        };
+        Ok(Self { candidate })
+    }
+
+    fn rewrite(&self, mut spec: CommandSpec) -> CommandSpec {
+        let Some(candidate) = &self.candidate else {
+            return spec;
+        };
+        if spec.program == "container"
+            && spec.args.first().map(String::as_str) == Some("run")
+            && spec.args.last() == Some(&candidate.immutable)
+        {
+            if let Some(image) = spec.args.last_mut() {
+                *image = candidate.runtime.clone();
+            }
+        }
+        spec
+    }
+}
+
+fn validate_e2e_candidate_mapping(
+    immutable: String,
+    runtime: String,
+) -> Result<E2eCandidateMapping, Box<dyn std::error::Error>> {
+    if !gascan_core::runtime::immutable_image_reference(&immutable)
+        || !runtime.starts_with("gascan-workspace:")
+        || runtime.contains('/')
+        || immutable
+            .strip_prefix(&runtime)
+            .is_none_or(|suffix| !suffix.starts_with("@sha256:"))
+    {
+        return Err("invalid E2E candidate image mapping".into());
+    }
+    Ok(E2eCandidateMapping { immutable, runtime })
+}
+
+#[async_trait::async_trait]
+impl CommandRunner for E2eProcessRunner {
+    async fn run(
+        &self,
+        spec: CommandSpec,
+    ) -> Result<gascan_apple::CommandOutput, gascan_core::runtime::RuntimeError> {
+        ProcessRunner.run(self.rewrite(spec)).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -78,8 +148,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         BackendSelection::Apple => {
             let doctor = DoctorState::collect(Duration::from_secs(60), production_doctor_report());
             let attach = gascan_apple::AppleAttach::configured_from_environment()?;
+            let runner = E2eProcessRunner::configured_from_environment()?;
             run_daemon(
-                AppleBackend::with_attach(ProcessRunner, attach),
+                AppleBackend::with_attach(runner, attach),
                 store,
                 paths,
                 idle_timeout,
@@ -441,6 +512,53 @@ fn storage_fact(path: &std::path::Path, label: &str) -> DoctorFact {
             "cannot inspect {label} filesystem at {}: {error}",
             path.display()
         )),
+    }
+}
+
+#[cfg(test)]
+mod e2e_candidate_tests {
+    use super::*;
+
+    const IMMUTABLE: &str = "gascan-workspace:candidate@sha256:\
+        aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const RUNTIME: &str = "gascan-workspace:candidate";
+
+    fn runner() -> Result<E2eProcessRunner, Box<dyn std::error::Error>> {
+        Ok(E2eProcessRunner {
+            candidate: Some(validate_e2e_candidate_mapping(
+                IMMUTABLE.to_owned(),
+                RUNTIME.to_owned(),
+            )?),
+        })
+    }
+
+    #[test]
+    fn rewrites_only_the_matching_final_container_run_image(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let create = CommandSpec::new("container", ["run", "--detach", IMMUTABLE]);
+        assert_eq!(runner()?.rewrite(create).args, ["run", "--detach", RUNTIME]);
+
+        for untouched in [
+            CommandSpec::new("container", ["image", "pull", IMMUTABLE]),
+            CommandSpec::new("container", ["run", "--env", IMMUTABLE, "other:image"]),
+            CommandSpec::new("other", ["run", IMMUTABLE]),
+        ] {
+            assert_eq!(runner()?.rewrite(untouched.clone()), untouched);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_mismatched_or_nonlocal_runtime_images() {
+        for runtime in [
+            "gascan-workspace:other",
+            "ghcr.io/example/gascan-workspace:candidate",
+            "example/gascan-workspace:candidate",
+        ] {
+            assert!(
+                validate_e2e_candidate_mapping(IMMUTABLE.to_owned(), runtime.to_owned()).is_err()
+            );
+        }
     }
 }
 

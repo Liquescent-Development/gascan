@@ -46,7 +46,7 @@ fn runner_fixture(build_helper: &str) -> tempfile::TempDir {
     );
     write_executable(
         &root.join("bin/cargo"),
-        "#!/bin/sh\nset -eu\nprintf 'cargo:%s:%s\\n' \"$*\" \"${GASCAN_APPLE_ATTACH_HELPER-unset}\" >>\"$RUNNER_FIXTURE_LOG\"\nif test -n \"${GASCAN_E2E_CANDIDATE_IMAGE:-}\"; then printf 'candidate:%s\\n' \"$GASCAN_E2E_CANDIDATE_IMAGE\" >>\"$RUNNER_FIXTURE_LOG\"; fi\nif test -n \"${GASCAN_E2E_CANDIDATE_RECEIPT_IMAGE:-}\"; then printf 'candidate-receipt:%s\\n' \"$GASCAN_E2E_CANDIDATE_RECEIPT_IMAGE\" >>\"$RUNNER_FIXTURE_LOG\"; fi\nif test -n \"${GASCAN_E2E_PREDECESSOR_IMAGE:-}\"; then printf 'predecessor:%s\\n' \"$GASCAN_E2E_PREDECESSOR_IMAGE\" >>\"$RUNNER_FIXTURE_LOG\"; fi\ncase \" $* \" in\n  *' build '*) mkdir -p \"$RUNNER_FIXTURE_ROOT/target/debug\"; printf '#!/bin/sh\\n' >\"$RUNNER_FIXTURE_ROOT/target/debug/gascan-e2e-cli\"; chmod 755 \"$RUNNER_FIXTURE_ROOT/target/debug/gascan-e2e-cli\";;\nesac\n",
+        "#!/bin/sh\nset -eu\nprintf 'cargo:%s:%s\\n' \"$*\" \"${GASCAN_APPLE_ATTACH_HELPER-unset}\" >>\"$RUNNER_FIXTURE_LOG\"\nif test -n \"${GASCAN_E2E_CANDIDATE_IMAGE:-}\"; then printf 'candidate:%s\\n' \"$GASCAN_E2E_CANDIDATE_IMAGE\" >>\"$RUNNER_FIXTURE_LOG\"; fi\nif test -n \"${GASCAN_E2E_CANDIDATE_RUNTIME_IMAGE:-}\"; then printf 'candidate-runtime:%s\\n' \"$GASCAN_E2E_CANDIDATE_RUNTIME_IMAGE\" >>\"$RUNNER_FIXTURE_LOG\"; fi\nif test -n \"${GASCAN_E2E_PREDECESSOR_IMAGE:-}\"; then printf 'predecessor:%s\\n' \"$GASCAN_E2E_PREDECESSOR_IMAGE\" >>\"$RUNNER_FIXTURE_LOG\"; fi\ncase \" $* \" in\n  *' build '*) mkdir -p \"$RUNNER_FIXTURE_ROOT/target/debug\"; printf '#!/bin/sh\\n' >\"$RUNNER_FIXTURE_ROOT/target/debug/gascan-e2e-cli\"; chmod 755 \"$RUNNER_FIXTURE_ROOT/target/debug/gascan-e2e-cli\";;\nesac\n",
     );
     fs::create_dir_all(root.join("images/workspace")).unwrap();
     fs::write(
@@ -171,8 +171,8 @@ fn successful_apple_apply_targets_candidate_and_publishes_matching_live_receipt(
         String::from_utf8_lossy(&output.stderr)
     );
     let records = fs::read_to_string(log).unwrap();
-    assert!(records.contains("candidate:gascan-workspace:candidate\n"));
-    assert!(records.contains(&format!("candidate-receipt:{candidate}\n")));
+    assert!(records.contains(&format!("candidate:{candidate}\n")));
+    assert!(records.contains("candidate-runtime:gascan-workspace:candidate\n"));
     assert!(records.contains(&format!("predecessor:{predecessor}\n")));
     assert_eq!(
         fs::read_to_string(live_file).unwrap(),
