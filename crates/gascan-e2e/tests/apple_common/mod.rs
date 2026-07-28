@@ -68,11 +68,13 @@ impl OwnedRuntimeSnapshot {
 }
 
 pub fn approved_workspace_image() -> TestResult<String> {
-    let image = std::env::var("GASCAN_E2E_CANDIDATE_IMAGE").unwrap_or_else(|_| {
-        include_str!("../../../../images/workspace/approved-image.txt")
-            .trim()
-            .to_owned()
-    });
+    let image = std::env::var("GASCAN_E2E_CANDIDATE_RECEIPT_IMAGE")
+        .or_else(|_| std::env::var("GASCAN_E2E_CANDIDATE_IMAGE"))
+        .unwrap_or_else(|_| {
+            include_str!("../../../../images/workspace/approved-image.txt")
+                .trim()
+                .to_owned()
+        });
     if image.trim() != image || !gascan_core::runtime::immutable_image_reference(&image) {
         return Err("approved workspace image is not digest-qualified".into());
     }

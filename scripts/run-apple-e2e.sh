@@ -5,6 +5,7 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 
 candidate_image=
+candidate_runtime_image=
 live_acceptance_file=
 if test -n "${GASCAN_E2E_CANDIDATE_IMAGE_FILE:-}"; then
   test -f "$GASCAN_E2E_CANDIDATE_IMAGE_FILE" || {
@@ -17,11 +18,13 @@ if test -n "${GASCAN_E2E_CANDIDATE_IMAGE_FILE:-}"; then
   }
   IFS= read -r candidate_image <"$GASCAN_E2E_CANDIDATE_IMAGE_FILE"
   printf '%s\n' "$candidate_image" |
-    grep -Eq '^[a-z0-9][a-z0-9._/-]*:[a-zA-Z0-9._-]+@sha256:[0-9a-f]{64}$' || {
-      printf 'apple e2e: candidate receipt is not immutable\n' >&2
+    grep -Eq '^gascan-workspace:[a-zA-Z0-9._-]+@sha256:[0-9a-f]{64}$' || {
+      printf 'apple e2e: candidate receipt is not a local immutable image\n' >&2
       exit 1
   }
-  export GASCAN_E2E_CANDIDATE_IMAGE=$candidate_image
+  candidate_runtime_image=${candidate_image%%@sha256:*}
+  export GASCAN_E2E_CANDIDATE_RECEIPT_IMAGE=$candidate_image
+  export GASCAN_E2E_CANDIDATE_IMAGE=$candidate_runtime_image
   if test "${GASCAN_E2E_PREDECESSOR_IMAGE+x}" = x; then
     predecessor_image=$GASCAN_E2E_PREDECESSOR_IMAGE
   else
