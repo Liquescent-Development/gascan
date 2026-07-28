@@ -15,6 +15,8 @@ use tokio::sync::{Mutex, Semaphore};
 const FAKE_WORKSPACE_IMAGE: &str = "ghcr.io/liquescent-development/gascan/workspace:fake@sha256:\
      aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
+type FakeExecResult = (Vec<u8>, Vec<u8>, i32, i32);
+
 #[derive(Clone)]
 pub struct FakeRuntime {
     inner: Arc<Mutex<FakeState>>,
@@ -96,9 +98,9 @@ struct FakeState {
     failures: HashSet<FailureBoundary>,
     create_failure_after_mutations: Option<usize>,
     image_change_on_prepare: Option<String>,
-    exec_result: (Vec<u8>, Vec<u8>, i32, i32),
-    exec_results: VecDeque<(Vec<u8>, Vec<u8>, i32, i32)>,
-    exec_results_by_argv: HashMap<Vec<String>, VecDeque<(Vec<u8>, Vec<u8>, i32, i32)>>,
+    exec_result: FakeExecResult,
+    exec_results: VecDeque<FakeExecResult>,
+    exec_results_by_argv: HashMap<Vec<String>, VecDeque<FakeExecResult>>,
     exec_errors: VecDeque<RuntimeError>,
     create_errors: VecDeque<RuntimeError>,
     ssh_port_collisions: usize,
@@ -1041,7 +1043,7 @@ impl RuntimeBackend for FakeRuntime {
             .get_mut(&request.argv)
             .and_then(VecDeque::pop_front)
             .or_else(|| {
-                is_managed_shell_configurator(&request.argv).then(|| state.exec_result.clone())
+                is_managed_shell_configurator(&request.argv).then(|| (Vec::new(), Vec::new(), 0, 0))
             })
             .or_else(|| state.exec_results.pop_front())
             .unwrap_or_else(|| state.exec_result.clone());

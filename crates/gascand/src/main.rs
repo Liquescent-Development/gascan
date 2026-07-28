@@ -594,8 +594,8 @@ mod e2e_candidate_tests {
     }
 
     #[test]
-    fn rewrites_only_the_matching_final_container_run_image(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn rewrites_only_the_matching_final_container_run_image()
+    -> Result<(), Box<dyn std::error::Error>> {
         let create = CommandSpec::new("container", ["run", "--detach", IMMUTABLE]);
         assert_eq!(runner()?.rewrite(create).args, ["run", "--detach", RUNTIME]);
 
@@ -623,8 +623,8 @@ mod e2e_candidate_tests {
     }
 
     #[test]
-    fn rehydrates_only_the_matching_structured_inspect_image(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn rehydrates_only_the_matching_structured_inspect_image()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mapping = validate_e2e_candidate_mapping(IMMUTABLE.to_owned(), RUNTIME.to_owned())?;
         let matching = serde_json::to_vec(&serde_json::json!([{
             "configuration": {
