@@ -7,6 +7,118 @@ source "$repo_root/packaging/macos/release-common.sh"
 gascan_bin=${GASCAN_RELEASE_GASCAN:-/usr/local/bin/gascan}
 [[ -x $gascan_bin ]] || { printf 'installed gascan is unavailable\n' >&2; exit 69; }
 
+gascan_default_shell_probe() {
+  python3 - "$gascan_bin" "$sandbox_id" <<'PY'
+import errno
+import os
+import pty
+import select
+import subprocess
+import sys
+import time
+
+gascan, sandbox_id = sys.argv[1:]
+controller, user = pty.openpty()
+environment = os.environ.copy()
+environment["TERM"] = "gascan-release-term"
+command = [gascan, "--sandbox", sandbox_id, "shell"]
+process = subprocess.Popen(
+    command,
+    stdin=user,
+    stdout=user,
+    stderr=user,
+    close_fds=True,
+    env=environment,
+)
+os.close(user)
+captured = bytearray()
+
+
+def read_until(marker, deadline):
+    while marker not in captured:
+        if process.poll() is not None:
+            raise SystemExit(
+                "default shell exited before marker: "
+                + captured[-4096:].decode("utf-8", "backslashreplace")
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            process.kill()
+            process.wait()
+            raise SystemExit(
+                "default shell marker timed out: "
+                + captured[-4096:].decode("utf-8", "backslashreplace")
+            )
+        readable, _, _ = select.select([controller], [], [], min(remaining, 0.1))
+        if not readable:
+            continue
+        try:
+            chunk = os.read(controller, 16384)
+        except OSError as error:
+            if error.errno == errno.EIO:
+                chunk = b""
+            else:
+                raise
+        if not chunk:
+            continue
+        captured.extend(chunk)
+        if len(captured) > 1024 * 1024:
+            raise SystemExit("default shell output exceeded its limit")
+
+
+try:
+    os.write(
+        controller,
+        b"stty -echo; printf 'GASCAN_%s\\n' SHELL_INPUT_READY\n",
+    )
+    read_until(b"GASCAN_SHELL_INPUT_READY", time.monotonic() + 15)
+    os.write(
+        controller,
+        b"""printf 'GASCAN_RELEASE_SHELL_BEGIN\\n'
+printf 'BASH_VERSION=%s\\n' "${BASH_VERSION:-}"
+case $- in *i*) printf 'INTERACTIVE=yes\\n';; *) printf 'INTERACTIVE=no\\n';; esac
+if shopt -q login_shell; then printf 'LOGIN=yes\\n'; else printf 'LOGIN=no\\n'; fi
+printf 'SHELL=%s\\n' "${SHELL:-}"
+if test -r /usr/share/bash-completion/bash_completion; then
+    printf 'COMPLETION=/usr/share/bash-completion/bash_completion\\n'
+else
+    printf 'COMPLETION=missing\\n'
+fi
+printf 'TERM=%s\\n' "${TERM:-}"
+printf 'SELECTOR=%s\\n' "$(< /home/workspace/.config/gascan/shell/prompt)"
+printf 'STARSHIP_CONFIG=%s\\n' "${STARSHIP_CONFIG:-}"
+printf 'STARSHIP_EXECUTABLE=%s\\n' "${STARSHIP_EXECUTABLE:-}"
+printf 'STARSHIP_FUNCTION=%s\\n' "$(type -t starship_precmd || true)"
+printf 'GASCAN_RELEASE_SHELL_END\\n'
+exit 0
+""",
+    )
+    read_until(b"GASCAN_RELEASE_SHELL_END", time.monotonic() + 30)
+    try:
+        status = process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        raise SystemExit("default shell did not exit cleanly")
+    if status != 0:
+        raise SystemExit(f"default shell exited with {status}")
+finally:
+    os.close(controller)
+
+normalized = bytes(captured).replace(b"\r", b"")
+begin = b"GASCAN_RELEASE_SHELL_BEGIN\n"
+end = b"GASCAN_RELEASE_SHELL_END\n"
+start = normalized.find(begin)
+if start < 0:
+    raise SystemExit("default shell output omitted begin marker")
+start += len(begin)
+finish = normalized.find(end, start)
+if finish < 0:
+    raise SystemExit("default shell output omitted end marker")
+sys.stdout.buffer.write(normalized[start:finish])
+PY
+}
+
 root=$(mktemp -d "${TMPDIR:-/tmp}/gascan-release-root.XXXXXX")
 name="gate5-release-$PPID-$$"
 sandbox_id=
@@ -83,6 +195,10 @@ EOF_MANIFEST
 
 expected_versions=$(gascan_lock_section_json "$repo_root/images/workspace/versions.lock" tools)
 expected_gascamp=$(gascan_lock_section_json "$repo_root/images/workspace/versions.lock" gascamp | jq -er '.revision')
+expected_starship=$(
+  gascan_lock_section_json "$repo_root/images/workspace/versions.lock" workstation_artifacts.starship |
+    jq -er '.version'
+)
 
 port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
 python3 -m http.server "$port" --bind 127.0.0.1 --directory "$root" >/dev/null 2>&1 &
@@ -263,6 +379,24 @@ jq -e '
   printf "release-xdg-config-ok\n" >"$XDG_CONFIG_HOME/gascan-release-smoke/config"
   test "$(cat "$XDG_CONFIG_HOME/gascan-release-smoke/config")" = release-xdg-config-ok
 '
+"$gascan_bin" --sandbox "$sandbox_id" run -- \
+  /opt/gascan/shell/bin/starship --version |
+  grep -Fx "starship $expected_starship"
+standard_shell=$(gascan_default_shell_probe)
+for required in \
+  'INTERACTIVE=yes' \
+  'LOGIN=yes' \
+  'SHELL=/bin/bash' \
+  'COMPLETION=/usr/share/bash-completion/bash_completion' \
+  'TERM=gascan-release-term' \
+  'SELECTOR=standard' \
+  'STARSHIP_CONFIG=' \
+  'STARSHIP_EXECUTABLE=' \
+  'STARSHIP_FUNCTION='
+do
+  grep -Fx "$required" <<<"$standard_shell" >/dev/null
+done
+grep -E '^BASH_VERSION=.+$' <<<"$standard_shell" >/dev/null
 "$gascan_bin" --sandbox "$sandbox_id" run -- curl --fail --silent --show-error --max-time 4 "$host_url" >/dev/null
 version_check=$(cat <<'VERSION_CHECK'
   actual=/tmp/gascan-release-versions.json
@@ -309,6 +443,9 @@ version = 1
 name = "$name"
 network = "offline"
 user = "workspace"
+
+[shell]
+prompt = "starship"
 EOF_OFFLINE
 "$gascan_bin" up "$root"
 sandbox_id=$("$gascan_bin" list --json | jq -er --arg name "$name" \
@@ -320,6 +457,20 @@ jq -e --arg id "$sandbox_id" '
   .[0].configuration.labels."dev.gascan.sandbox-id" == $id and
   .[0].configuration.networks == []
 ' <<<"$inspect" >/dev/null
+starship_shell=$(gascan_default_shell_probe)
+for required in \
+  'INTERACTIVE=yes' \
+  'LOGIN=yes' \
+  'SHELL=/bin/bash' \
+  'COMPLETION=/usr/share/bash-completion/bash_completion' \
+  'TERM=gascan-release-term' \
+  'SELECTOR=starship' \
+  'STARSHIP_CONFIG=/home/workspace/.config/gascan/shell/starship.toml' \
+  'STARSHIP_EXECUTABLE=/opt/gascan/shell/bin/starship' \
+  'STARSHIP_FUNCTION=function'
+do
+  grep -Fx "$required" <<<"$starship_shell" >/dev/null
+done
 if "$gascan_bin" --sandbox "$sandbox_id" run -- curl --fail --silent --show-error --max-time 3 "$host_url"; then
   printf 'offline sandbox reached the test-owned endpoint\n' >&2
   exit 1
@@ -344,6 +495,17 @@ if "$gascan_bin" --sandbox "$sandbox_id" run -- sudo -n getent hosts example.com
   printf 'offline guest root resolved public DNS\n' >&2
   exit 1
 fi
+sed -i '' 's/prompt = "starship"/prompt = "starship-nerd-font"/' "$root/gascan.toml"
+"$gascan_bin" apply "$root"
+nerd_shell=$(gascan_default_shell_probe)
+for required in \
+  'SELECTOR=starship-nerd-font' \
+  'STARSHIP_CONFIG=/home/workspace/.config/gascan/shell/starship.toml' \
+  'STARSHIP_EXECUTABLE=/opt/gascan/shell/bin/starship' \
+  'STARSHIP_FUNCTION=function'
+do
+  grep -Fx "$required" <<<"$nerd_shell" >/dev/null
+done
 destroyed_sandbox_id=$sandbox_id
 "$gascan_bin" --sandbox "$destroyed_sandbox_id" destroy --yes
 sandbox_id=

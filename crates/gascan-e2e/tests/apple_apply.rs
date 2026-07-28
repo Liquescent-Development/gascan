@@ -3,7 +3,7 @@
 
 mod apple_common;
 
-use apple_common::{AppleE2e, TestResult};
+use apple_common::{AppleE2e, TestResult, marker_payload};
 use serde::de::{Error as _, MapAccess, Visitor};
 use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
@@ -15,6 +15,29 @@ const PERSISTENT_WORKSTATION_SENTINELS: [&str; 3] = [
     "/home/workspace/.cache/image-replace-sentinel",
     "/home/workspace/.config/image-replace-sentinel",
 ];
+
+const SHELL_PROMPT_PROBE: &str = r#"#!/usr/bin/env bash
+set -u
+printf 'GASCAN_PROMPT_IDENTITY_BEGIN\n'
+selector=$(< /home/workspace/.config/gascan/shell/prompt)
+printf 'SELECTOR=%s\n' "$selector"
+printf 'CONFIG=%s\n' "${STARSHIP_CONFIG:-}"
+case "$selector" in
+    starship) preset=/opt/gascan/shell/presets/starship.toml ;;
+    starship-nerd-font) preset=/opt/gascan/shell/presets/starship-nerd-font.toml ;;
+    *) preset=invalid ;;
+esac
+if test "$preset" != invalid &&
+    test -r "${STARSHIP_CONFIG:-}" &&
+    cmp -s "$STARSHIP_CONFIG" "$preset"; then
+    printf 'CONFIG_IDENTITY=matching\n'
+else
+    printf 'CONFIG_IDENTITY=mismatch\n'
+fi
+printf 'STARSHIP_EXECUTABLE=%s\n' "${STARSHIP_EXECUTABLE:-}"
+printf 'STARSHIP_FUNCTION=%s\n' "$(type -t starship_precmd || true)"
+printf 'GASCAN_PROMPT_IDENTITY_END\n'
+"#;
 
 #[test]
 #[ignore = "requires supported Apple runtime, candidate and predecessor workspace images, network access, and OpenSSH"]
@@ -279,6 +302,128 @@ fn native_ssh_is_loopback_only_durable_reconciled_and_cleaned() -> TestResult {
         return Err("destroy retained the native SSH listener".into());
     }
     Ok(())
+}
+
+#[test]
+#[ignore = "requires supported Apple runtime, the locked workspace image, and OpenSSH"]
+fn managed_shell_prompts_match_ssh_and_activate_offline() -> TestResult {
+    let networked = AppleE2e::new_networked("shell-prompt-parity")?;
+    install_shell_prompt_probe(&networked)?;
+    networked.write_manifest(
+        "version = 1\nname = 'shell-prompt-parity'\nnetwork = 'networked'\n\
+         [shell]\nprompt = 'starship'\n\
+         [ssh]\nenabled = true\n",
+    )?;
+    networked.success_with_timeout(
+        ["up", networked.root().to_str().ok_or("non-UTF-8 root")?],
+        std::time::Duration::from_secs(10 * 60),
+    )?;
+    assert_shell_and_ssh_prompt_identity(&networked, "starship")?;
+
+    networked.write_manifest(
+        "version = 1\nname = 'shell-prompt-parity'\nnetwork = 'networked'\n\
+         [shell]\nprompt = 'starship-nerd-font'\n\
+         [ssh]\nenabled = true\n",
+    )?;
+    networked.success_with_timeout(
+        [
+            "--sandbox",
+            networked.id(),
+            "apply",
+            networked.root().to_str().ok_or("non-UTF-8 root")?,
+        ],
+        std::time::Duration::from_secs(10 * 60),
+    )?;
+    assert_shell_and_ssh_prompt_identity(&networked, "starship-nerd-font")?;
+    networked.success(["--sandbox", networked.id(), "destroy", "--yes"])?;
+    networked.assert_no_owned_resources()?;
+
+    let offline = AppleE2e::new("shell-prompt-offline")?;
+    install_shell_prompt_probe(&offline)?;
+    offline.write_manifest(
+        "version = 1\nname = 'shell-prompt-offline'\nnetwork = 'offline'\n\
+         [shell]\nprompt = 'starship'\n",
+    )?;
+    offline.success_with_timeout(
+        ["up", offline.root().to_str().ok_or("non-UTF-8 root")?],
+        std::time::Duration::from_secs(10 * 60),
+    )?;
+    offline.assert_no_network_attachments()?;
+    let identity = default_shell_prompt_identity(&offline)?;
+    assert_eq!(identity, expected_prompt_identity("starship"));
+    offline.success(["--sandbox", offline.id(), "destroy", "--yes"])?;
+    offline.assert_no_owned_resources()
+}
+
+fn install_shell_prompt_probe(env: &AppleE2e) -> TestResult {
+    let root = std::path::Path::new(env.root());
+    std::fs::create_dir(root.join(".gascan"))?;
+    std::fs::write(
+        root.join(".gascan/shell-prompt-probe.sh"),
+        SHELL_PROMPT_PROBE,
+    )?;
+    Ok(())
+}
+
+fn assert_shell_and_ssh_prompt_identity(env: &AppleE2e, selector: &str) -> TestResult {
+    let shell = default_shell_prompt_identity(env)?;
+    let ssh = env.success_with_timeout(
+        [
+            "--sandbox",
+            env.id(),
+            "ssh",
+            "--",
+            "/bin/bash",
+            "--login",
+            "-i",
+            "/workspace/.gascan/shell-prompt-probe.sh",
+        ],
+        std::time::Duration::from_secs(90),
+    )?;
+    let ssh = marker_payload(
+        &ssh.stdout,
+        "GASCAN_PROMPT_IDENTITY_BEGIN",
+        "GASCAN_PROMPT_IDENTITY_END",
+    )?;
+    let expected = expected_prompt_identity(selector);
+    if shell != expected || ssh != expected {
+        return Err(format!(
+            "managed prompt identity differs: expected={expected:?} shell={shell:?} ssh={ssh:?}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn default_shell_prompt_identity(env: &AppleE2e) -> TestResult<String> {
+    let output = env.run_default_shell_pty_script(
+        ". /workspace/.gascan/shell-prompt-probe.sh\nexit 0\n",
+        b"GASCAN_PROMPT_IDENTITY_END",
+        "gascan-apple-e2e-term",
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "default shell prompt probe failed with {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout)
+        )
+        .into());
+    }
+    marker_payload(
+        &output.stdout,
+        "GASCAN_PROMPT_IDENTITY_BEGIN",
+        "GASCAN_PROMPT_IDENTITY_END",
+    )
+}
+
+fn expected_prompt_identity(selector: &str) -> String {
+    format!(
+        "SELECTOR={selector}\n\
+         CONFIG=/home/workspace/.config/gascan/shell/starship.toml\n\
+         CONFIG_IDENTITY=matching\n\
+         STARSHIP_EXECUTABLE=/opt/gascan/shell/bin/starship\n\
+         STARSHIP_FUNCTION=function\n"
+    )
 }
 
 #[derive(Clone)]

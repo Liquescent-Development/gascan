@@ -4,7 +4,7 @@ use gascan_core::sandbox::SandboxId;
 use serde_json::Value;
 use std::collections::{BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
-use std::io::{Read as _, Seek as _};
+use std::io::{Read as _, Seek as _, Write as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::process::{Command, ExitStatus, Output, Stdio};
 
@@ -1206,6 +1206,17 @@ impl AppleE2e {
         wait_with_output_bounded(child, std::time::Duration::from_secs(30))
     }
 
+    pub fn run_default_shell_pty_script(
+        &self,
+        script: &str,
+        completion_marker: &[u8],
+        term: &str,
+    ) -> TestResult<PtySignalOutput> {
+        let mut command = self.command(["--sandbox", self.id(), "shell"]);
+        command.env("TERM", term);
+        run_pty_script_command(command, script, completion_marker)
+    }
+
     pub fn run_pty_resize(
         &self,
         argv: &[&str],
@@ -1809,6 +1820,127 @@ fn run_pty_signal_command(
     signal: rustix_openpty::rustix::process::Signal,
 ) -> TestResult<PtySignalOutput> {
     run_pty_signal_command_after_spawn(command, ready_marker, signal, |_| Ok(()))
+}
+
+pub fn marker_payload(output: &[u8], begin: &str, end: &str) -> TestResult<String> {
+    let normalized = String::from_utf8(output.to_vec())?.replace('\r', "");
+    let begin = format!("{begin}\n");
+    let start = normalized
+        .find(&begin)
+        .ok_or_else(|| format!("PTY output omitted marker {begin:?}"))?
+        + begin.len();
+    let remainder = &normalized[start..];
+    let end = format!("{end}\n");
+    let finish = remainder
+        .find(&end)
+        .ok_or_else(|| format!("PTY output omitted marker {end:?}"))?;
+    Ok(remainder[..finish].to_owned())
+}
+
+fn run_pty_script_command(
+    mut command: Command,
+    script: &str,
+    completion_marker: &[u8],
+) -> TestResult<PtySignalOutput> {
+    const INPUT_READY: &[u8] = b"GASCAN_SHELL_INPUT_READY";
+
+    let pty = rustix_openpty::openpty(None, None)?;
+    let stdin = std::fs::File::from(rustix_openpty::rustix::io::dup(&pty.user)?);
+    let stdout = std::fs::File::from(rustix_openpty::rustix::io::dup(&pty.user)?);
+    let stderr = std::fs::File::from(rustix_openpty::rustix::io::dup(&pty.user)?);
+    let mut controller = std::fs::File::from(rustix_openpty::rustix::io::dup(&pty.controller)?);
+    let flags = rustix_openpty::rustix::fs::fcntl_getfl(&controller)?;
+    rustix_openpty::rustix::fs::fcntl_setfl(
+        &controller,
+        flags | rustix_openpty::rustix::fs::OFlags::NONBLOCK,
+    )?;
+    let mut child = command.stdin(stdin).stdout(stdout).stderr(stderr).spawn()?;
+    drop(pty.user);
+    drop(pty.controller);
+
+    let result = (|| -> TestResult<PtySignalOutput> {
+        controller.write_all(b"stty -echo; printf 'GASCAN_%s\\n' SHELL_INPUT_READY\n")?;
+        let started = std::time::Instant::now();
+        let input_deadline = started + std::time::Duration::from_secs(10);
+        let completion_deadline = started + std::time::Duration::from_secs(30);
+        let mut captured = Vec::new();
+        let mut input_sent = false;
+        let mut completed = false;
+        let status = loop {
+            let read_bytes = read_available_pty_batch(&mut controller, &mut captured, false)?;
+
+            if !input_sent
+                && captured
+                    .windows(INPUT_READY.len())
+                    .any(|window| window == INPUT_READY)
+            {
+                controller.write_all(script.as_bytes())?;
+                if !script.ends_with('\n') {
+                    controller.write_all(b"\n")?;
+                }
+                input_sent = true;
+            }
+            if input_sent
+                && captured
+                    .windows(completion_marker.len())
+                    .any(|window| window == completion_marker)
+            {
+                completed = true;
+            }
+
+            if let Some(status) = child.try_wait()? {
+                if !completed {
+                    return Err(format!(
+                        "default shell exited before completion marker; captured PTY output: {}",
+                        bounded_escaped_pty_output(&captured)
+                    )
+                    .into());
+                }
+                break status;
+            }
+
+            let now = std::time::Instant::now();
+            if !input_sent && now >= input_deadline {
+                return Err(format!(
+                    "default shell did not report input readiness; captured PTY output: {}",
+                    bounded_escaped_pty_output(&captured)
+                )
+                .into());
+            }
+            if now >= completion_deadline {
+                return Err(format!(
+                    "default shell did not exit after completion marker; captured PTY output: {}",
+                    bounded_escaped_pty_output(&captured)
+                )
+                .into());
+            }
+            if read_bytes == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+
+        drain_pty_after_exit(&mut controller, &mut captured)?;
+        Ok(PtySignalOutput {
+            status,
+            stdout: captured,
+            stderr: Vec::new(),
+        })
+    })();
+
+    match result {
+        Ok(output) => Ok(output),
+        Err(error) => {
+            let cleanup = match child.try_wait()? {
+                Some(_) => Ok(()),
+                None => {
+                    child.kill()?;
+                    child.wait()?;
+                    Ok(())
+                }
+            };
+            return_after_cleanup(error, cleanup)
+        }
+    }
 }
 
 fn run_pty_signal_command_after_spawn(
