@@ -47,8 +47,8 @@ existing Gas Can presentation helpers, and the fake-backend E2E binaries.
 
 Update `api_compatibility.rs` first to require:
 
-- `HandshakeResponse.release_version` at field 10;
-- `HandshakeResponse.daemon_started_at` at field 11 as
+- `HandshakeResponse.release_version` at field 11;
+- `HandshakeResponse.daemon_started_at` at field 12 as
   `google.protobuf.Timestamp`;
 - `DoctorRequest.workspace` at field 2 and
   `DoctorRequest.workspace_error` at field 3 while field 1 remains reserved;

@@ -513,8 +513,8 @@ fn v1_descriptor_keeps_handshake_transport_and_enum_numbers_stable() {
     assert_field(response, "daemon_pid", 7, Uint32, None);
     assert_field(response, "daemon_executable", 8, String, None);
     assert_field(response, "daemon_start_identity", 9, String, None);
-    assert_field(response, "release_version", 10, String, None);
-    assert_field(response, "daemon_started_at", 11, Message, None);
+    assert_field(response, "release_version", 11, String, None);
+    assert_field(response, "daemon_started_at", 12, Message, None);
     assert_type_name(response, "capabilities", ".gascan.v1.Capability");
     assert_type_name(
         response,
@@ -664,10 +664,10 @@ fn v1_descriptor_exactly_covers_every_exported_message_enum_and_rpc() {
                 f!("daemon_pid", 7, Uint32),
                 f!("daemon_executable", 8, String),
                 f!("daemon_start_identity", 9, String),
-                f!("release_version", 10, String),
+                f!("release_version", 11, String),
                 f!(
                     "daemon_started_at",
-                    11,
+                    12,
                     Message,
                     O,
                     None,
@@ -675,7 +675,7 @@ fn v1_descriptor_exactly_covers_every_exported_message_enum_and_rpc() {
                 ),
             ],
             &[],
-            &[(12, 13)],
+            &[(10, 11), (13, 14)],
         ),
         (
             "SandboxSelector",
@@ -995,10 +995,10 @@ fn v1_descriptor_exactly_covers_every_exported_message_enum_and_rpc() {
         (
             "DoctorRequest",
             &[
-                f!("workspace", 2, String),
-                f!("workspace_error", 3, String),
+                f!("workspace", 2, String, O, Some(0), None),
+                f!("workspace_error", 3, String, O, Some(0), None),
             ],
-            &[],
+            &["workspace_result"],
             &[(1, 2)],
         ),
         (
