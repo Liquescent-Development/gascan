@@ -125,6 +125,8 @@ RUN --network=none test -x /opt/gascan/gascamp/bin/camp \
        sh -c 'test -z "$(find /opt/gascan/workstation \( ! -user root -o ! -group root \) -print -quit)"' \
     && /usr/local/bin/run-workstation-step home-directories \
        sh -c 'install -d -o workspace -g workspace /workspace; \
+       chown workspace:workspace /home/workspace; \
+       chmod 0755 /home/workspace; \
        install -d -o workspace -g workspace -m 0700 \
        /home/workspace/.local /home/workspace/.cache; \
        install -d -o root -g workspace -m 1770 /home/workspace/.config' \

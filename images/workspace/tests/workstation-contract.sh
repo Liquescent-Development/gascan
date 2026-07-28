@@ -138,6 +138,14 @@ expect_exact "$(locked_version tmux)" tmux -V
 
 test "$MISE_DATA_DIR" = /home/workspace/.local/share/mise ||
     die 'writable mise data root differs from production policy'
+test "$(stat -c %U:%G:%a /home/workspace)" = workspace:workspace:755 ||
+    die 'workspace HOME metadata differs from provisioning policy'
+test "$(stat -c %U:%G:%a /home/workspace/.local)" = workspace:workspace:700 ||
+    die 'workspace private data root metadata differs from provisioning policy'
+test "$(stat -c %U:%G:%a /home/workspace/.cache)" = workspace:workspace:700 ||
+    die 'workspace private cache root metadata differs from provisioning policy'
+test "$(stat -c %U:%G:%a /home/workspace/.config)" = root:workspace:1770 ||
+    die 'workspace managed configuration boundary metadata changed'
 test "$SHELL" = /bin/bash || die 'interactive shell environment differs from image policy'
 test -r /usr/share/bash-completion/bash_completion ||
     die 'Bash completion framework is unavailable'

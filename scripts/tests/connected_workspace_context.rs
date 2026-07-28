@@ -388,6 +388,32 @@ fn managed_shell_directory_creation_precedes_the_sealed_hook_copy() {
 }
 
 #[test]
+fn connected_context_preserves_workspace_home_normalization() {
+    let fixture = Fixture::new();
+    let output = fixture.run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dockerfile = fs::read_to_string(fixture.context.join("Dockerfile")).unwrap();
+    let migration = dockerfile
+        .find("/usr/local/bin/migrate-workspace-identity")
+        .unwrap();
+    let owner = dockerfile
+        .find("chown workspace:workspace /home/workspace")
+        .unwrap();
+    let mode = dockerfile.find("chmod 0755 /home/workspace").unwrap();
+    let private = dockerfile
+        .find("install -d -o workspace -g workspace -m 0700")
+        .unwrap();
+    let config = dockerfile
+        .find("install -d -o root -g workspace -m 1770 /home/workspace/.config")
+        .unwrap();
+    assert!(migration < owner && owner < mode && mode < private && private < config);
+}
+
+#[test]
 fn docker_copy_parser_is_structural_and_fail_closed() {
     let parsed = parse_dockerfile_copies("  copy --chmod=0555 a b /dest\nCOPY --from=builder /out /dest\nCOPY name--from=value /dest\n").unwrap();
     assert_eq!(parsed[0].sources, ["a", "b"]);

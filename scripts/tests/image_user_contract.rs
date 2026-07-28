@@ -1769,6 +1769,23 @@ fn workstation_contract_requires_a_traversable_managed_hook_directory() {
 }
 
 #[test]
+fn workstation_contract_pins_workspace_home_and_private_child_metadata() {
+    let contract =
+        fs::read_to_string(root().join("images/workspace/tests/workstation-contract.sh")).unwrap();
+    for required in [
+        r#"test "$(stat -c %U:%G:%a /home/workspace)" = workspace:workspace:755"#,
+        r#"test "$(stat -c %U:%G:%a /home/workspace/.local)" = workspace:workspace:700"#,
+        r#"test "$(stat -c %U:%G:%a /home/workspace/.cache)" = workspace:workspace:700"#,
+        r#"test "$(stat -c %U:%G:%a /home/workspace/.config)" = root:workspace:1770"#,
+    ] {
+        assert!(
+            contract.contains(required),
+            "workstation smoke omits HOME metadata boundary: {required}"
+        );
+    }
+}
+
+#[test]
 fn workstation_contract_accepts_only_the_locked_starship_first_line_behaviorally() {
     let contract =
         fs::read_to_string(root().join("images/workspace/tests/workstation-contract.sh")).unwrap();

@@ -1588,6 +1588,28 @@ fn shell_assets_are_immutable_and_wired_after_identity_migration() {
 }
 
 #[test]
+fn workspace_home_is_normalized_without_weakening_private_directories() {
+    let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
+    let migration = dockerfile
+        .find("/usr/local/bin/migrate-workspace-identity")
+        .unwrap();
+    let home_owner = dockerfile
+        .find("chown workspace:workspace /home/workspace")
+        .unwrap();
+    let home_mode = dockerfile.find("chmod 0755 /home/workspace").unwrap();
+    let private = dockerfile
+        .find("install -d -o workspace -g workspace -m 0700")
+        .unwrap();
+    let config = dockerfile
+        .find("install -d -o root -g workspace -m 1770 /home/workspace/.config")
+        .unwrap();
+    assert!(
+        migration < home_owner && home_owner < home_mode && home_mode < private && private < config,
+        "workspace HOME normalization is not post-migration or weakens private children"
+    );
+}
+
+#[test]
 fn mise_comparison_is_quiet_on_match_and_emits_only_both_json_documents_on_mismatch() {
     let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
     let block = dockerfile
