@@ -143,18 +143,28 @@ Provisioning atomically maintains prompt state below:
 
 The state includes a closed prompt selector and, for a Starship mode, the
 corresponding generated Starship configuration. It contains no shell text
-copied from the manifest. Files are regular, non-symlinked files owned by the
-workspace account with conventional restrictive permissions; a root-mode
-interactive shell may read the same state. Staging names are reserved and
-bounded; unsafe types, links, ownership, or modes fail provisioning rather
+copied from the manifest. The shell directory is `root:workspace` mode `0750`;
+the selector, generated configuration, and staging files are regular,
+non-symlinked `root:workspace` mode `0640` files. A root-owned mode `0600`
+advisory lock serializes the complete transaction. This lets the workspace
+account read applied state but prevents it from mutating or racing the
+configurator. Staging names are reserved and bounded; unsafe types, links,
+ownership, modes, link counts, or unexpected entries fail provisioning rather
 than being followed or overwritten.
 
 On an applied `standard` selection, the hook leaves the existing Bash prompt
-unchanged. On either Starship selection, it exports the exact managed
-configuration path and evaluates Bash initialization emitted by the pinned
-Starship binary. Switching back to `standard` disables Starship on the next
-interactive login. Obsolete generated preset state may be removed only after
-its exact managed identity and type have been verified.
+unchanged. Selector validation compares exact bytes, including rejecting
+embedded NUL bytes. On either Starship selection, a workspace shell exports
+the exact root-owned managed configuration path, while a root shell uses the
+matching immutable preset directly and never retains the generated home
+configuration. The hook invokes the pinned binary directly with
+`init bash --print-full-init` under an immutable-only `PATH`, exports the
+pinned `STARSHIP_EXECUTABLE` for prompt runtime, and evaluates the resulting
+full initialization. It restores the original prompt and environment and
+warns once if generation or evaluation fails. Switching back to `standard`
+disables Starship on the next interactive login. Obsolete generated preset
+state may be removed only after its exact managed identity and type have been
+verified.
 
 Both default `gascan shell` and SSH login sessions reach the same final hook.
 Gas Can does not edit user-created shell files at runtime. A user who
@@ -186,17 +196,26 @@ The manifest prompt selection is carried through the validated sandbox spec
 and provisioning plan. It is included in the plan fingerprint used to
 determine whether an apply is required.
 
-During initial provisioning or apply:
+During initial provisioning or apply, the daemon invokes exactly:
 
-1. Validate the managed configuration root and shell directory without
-   following links.
-2. Validate that the pinned Starship executable and selected immutable preset
-   input match the reviewed image contract when a Starship mode is requested.
-3. Generate the exact selector and selected preset into restrictive staging
-   files.
-4. Publish them atomically without replacing unsafe collisions.
-5. Remove only verified obsolete Gas Can prompt artifacts.
-6. Record successful provisioning through the existing apply lifecycle.
+```text
+/usr/bin/sudo -n /usr/local/bin/configure-shell-home <validated-prompt>
+```
+
+The configurator accepts only effective root, the fixed
+`HOME=/home/workspace`, and the fixed workspace identity. It never derives
+authority or a writable path from the invoking user. It then:
+
+1. Validate the managed configuration root without following links.
+2. Open and exclusively lock the root-owned transaction lock.
+3. Validate or create the root-owned shell directory and `fsync` each newly
+   created directory's parent.
+4. Validate the pinned Starship executable and immutable preset inputs.
+5. Generate the exact selector and selected preset into restrictive,
+   root-owned staging files.
+6. Publish them atomically and durably without replacing unsafe collisions.
+7. Remove only verified obsolete Gas Can prompt artifacts.
+8. Record successful provisioning through the existing apply lifecycle.
 
 No prompt initialization runs as part of provisioning. The new selection takes
 effect when the user opens the next interactive shell or SSH session.

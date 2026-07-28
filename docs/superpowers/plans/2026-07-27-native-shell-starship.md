@@ -415,7 +415,7 @@ rtk git commit -m "build: bundle bash completion and starship"
 - Modify: `tests/image/workstation-contract.sh`
 
 **Interfaces:**
-- Produces: `/usr/local/bin/configure-shell-home PROMPT`
+- Produces: root-only `/usr/local/bin/configure-shell-home PROMPT`
 - Produces: `/etc/gascan/bashrc`
 - Produces: `/opt/gascan/shell/presets/{starship,starship-nerd-font}.toml`
 - Produces: `/opt/gascan/shell/bin/starship`
@@ -423,12 +423,14 @@ rtk git commit -m "build: bundle bash completion and starship"
 
 - [ ] **Step 1: Write failing behavioral contracts**
 
-Create fixtures that run the configurator under a temporary fake home and
-immutable preset root. Assert:
+Create a disposable real-Linux root-container contract and host hook fixtures.
+Assert:
 
 ```rust
-assert_eq!(mode(shell_dir), 0o700);
-assert_eq!(mode(selector), 0o600);
+assert_eq!(owner(shell_dir), "root:workspace");
+assert_eq!(mode(shell_dir), 0o750);
+assert_eq!(owner(selector), "root:workspace");
+assert_eq!(mode(selector), 0o640);
 assert_eq!(read(selector), "starship-nerd-font\n");
 assert_eq!(read(config), read(immutable_nerd_preset));
 ```
@@ -437,7 +439,11 @@ Exercise initial standard configuration, enable, switch, disable, retry after
 an exact staging file, and rejection of selector/config/directory symlinks,
 FIFOs, wrong owners, permissive modes, and unexpected files. Add shell-hook
 tests proving non-interactive no-op, standard no-op, exact binary invocation,
-`STARSHIP_CONFIG` selection, and one-warning fallback.
+root-vs-workspace `STARSHIP_CONFIG` selection, byte-exact selector validation,
+direct full-init generation, immutable runtime executable selection, and
+one-warning restoration after generation or evaluation failure. Prove the
+root-owned mode `0600` advisory lock serializes concurrent writers and that the
+workspace account can read but cannot mutate or race managed state.
 
 - [ ] **Step 2: Run focused contracts and confirm RED**
 
@@ -462,8 +468,12 @@ PROMPTS = {
 }
 ```
 
-Use directory file descriptors, `lstat`, `O_NOFOLLOW`, mode/UID checks,
-reserved same-directory staging names, `fsync`, and atomic `rename`. Copy only
+Require effective root, fixed `HOME=/home/workspace`, and the fixed workspace
+identity. Use directory file descriptors, `lstat`, `O_NOFOLLOW`, exact
+UID/GID/mode/link checks, a root-owned transaction lock, reserved
+same-directory staging names, parent-directory `fsync`, and atomic `rename`.
+The shell directory is `root:workspace` mode `0750`; selector, generated
+configuration, and staging files are `root:workspace` mode `0640`. Copy only
 the selected immutable preset; standard removes only a verified managed config
 and publishes `standard\n`.
 
@@ -473,14 +483,19 @@ The Bash hook begins with:
 case $- in *i*) ;; *) return 0 2>/dev/null || exit 0;; esac
 ```
 
-It validates the one-line selector, leaves standard untouched, and for either
-Starship mode sets `STARSHIP_CONFIG` to the managed regular file before:
+It validates the selector byte-for-byte, leaves standard untouched, sets a
+workspace shell's `STARSHIP_CONFIG` to the root-owned managed regular file,
+and sets a root shell's `STARSHIP_CONFIG` to the immutable preset directly.
+Under an immutable-only `PATH`, it exports the pinned
+`STARSHIP_EXECUTABLE` and obtains the complete initialization with:
 
 ```bash
-eval "$(/opt/gascan/shell/bin/starship init bash)"
+/opt/gascan/shell/bin/starship init bash --print-full-init
 ```
 
-If validation or initialization fails, print
+Evaluate that captured output and restore the caller's `PATH`. If validation,
+generation, or evaluation fails, restore the native prompt and environment,
+print
 `gascan: Starship prompt unavailable; using standard Bash prompt.` once and
 return success.
 
@@ -510,6 +525,8 @@ rtk cargo test --manifest-path scripts/Cargo.toml --test image_user_contract
 rtk cargo test --manifest-path scripts/Cargo.toml --test connected_dockerfile
 rtk cargo test --manifest-path scripts/Cargo.toml --test connected_workspace_context
 rtk bash -n images/workspace/bin/configure-shell-home
+rtk container run --rm --network none --user root ... \
+  /source/tests/image/shell-home-root-contract.sh /source
 ```
 
 Expected: PASS.
@@ -534,7 +551,7 @@ rtk git commit -m "feat: add managed bash and starship experience"
 
 **Interfaces:**
 - Consumes: `ProvisionPlan::{shell_changed, shell_prompt, desired_shell_hash}`
-- Invokes: `/usr/local/bin/configure-shell-home <validated-prompt>`
+- Invokes: `/usr/bin/sudo -n /usr/local/bin/configure-shell-home <validated-prompt>`
 - Persists: `shell_hash` beside existing durable provisioning resolution
 - Produces: apply-required reason `shell_changed`
 
@@ -546,7 +563,12 @@ Nerd Font switch, disable, and retry:
 ```rust
 assert_exec(
     &calls,
-    ["/usr/local/bin/configure-shell-home", "starship"]
+    [
+        "/usr/bin/sudo",
+        "-n",
+        "/usr/local/bin/configure-shell-home",
+        "starship",
+    ]
 );
 assert_eq!(after["shell_hash"], desired_shell_hash);
 assert!(events.iter().any(|event|
@@ -587,6 +609,8 @@ if plan.shell_changed() {
         ProvisionStep::ConfigureShell,
         "configure_shell",
         [
+            "/usr/bin/sudo",
+            "-n",
             "/usr/local/bin/configure-shell-home",
             plan.shell_prompt().as_str(),
         ],

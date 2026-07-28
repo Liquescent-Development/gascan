@@ -9,29 +9,41 @@ __gascan_starship_warn()
     return 0
 }
 
-__gascan_starship_restore_config()
-{
-    if [ "$__gascan_starship_config_was_set" = 1 ]; then
-        STARSHIP_CONFIG=$__gascan_starship_old_config
-        export STARSHIP_CONFIG
-    else
-        unset STARSHIP_CONFIG
-    fi
-    unset __gascan_starship_config_was_set __gascan_starship_old_config
-}
-
 __gascan_shell_metadata()
 {
     local metadata
-    metadata=$(/usr/bin/stat -c '%u:%a:%h' -- "$1" 2>/dev/null)
+    metadata=$(/usr/bin/stat -c '%u:%g:%a:%h' -- "$1" 2>/dev/null)
     case "$metadata" in
-        *:*:*)
+        *:*:*:*)
             ;;
         *)
-            metadata=$(/usr/bin/stat -f '%u:%Lp:%l' "$1" 2>/dev/null)
+            metadata=$(/usr/bin/stat -f '%u:%g:%Lp:%l' "$1" 2>/dev/null)
             ;;
     esac
     printf '%s\n' "$metadata"
+}
+
+__gascan_starship_restore()
+{
+    PS1=$__gascan_starship_old_ps1
+    PATH=$__gascan_starship_old_path
+    export PATH
+    if [ "$__gascan_starship_euid" = 0 ]; then
+        unset STARSHIP_CONFIG STARSHIP_EXECUTABLE
+    else
+        if [ "$__gascan_starship_config_was_set" = 1 ]; then
+            STARSHIP_CONFIG=$__gascan_starship_old_config
+            export STARSHIP_CONFIG
+        else
+            unset STARSHIP_CONFIG
+        fi
+        if [ "$__gascan_starship_executable_was_set" = 1 ]; then
+            STARSHIP_EXECUTABLE=$__gascan_starship_old_executable
+            export STARSHIP_EXECUTABLE
+        else
+            unset STARSHIP_EXECUTABLE
+        fi
+    fi
 }
 
 __gascan_starship_main()
@@ -39,27 +51,39 @@ __gascan_starship_main()
     local selector=/home/workspace/.config/gascan/shell/prompt
     local config=/home/workspace/.config/gascan/shell/starship.toml
     local binary=/opt/gascan/shell/bin/starship
-    local prompt preset selector_contents initialization
-    local old_ps1 selector_metadata config_metadata preset_metadata
+    local immutable_path=/opt/gascan/shell/bin:/usr/bin:/bin
+    local managed_owner=0 workspace_uid=1000 workspace_gid=1000
+    local immutable_owner=0 immutable_gid=0
+    local prompt preset selected_config initialization
+    local selector_metadata config_metadata preset_metadata binary_metadata
 
     selector_metadata=$(__gascan_shell_metadata "$selector")
     if [ ! -f "$selector" ] || [ -L "$selector" ] ||
-        [ "$selector_metadata" != 1000:600:1 ]; then
+        [ "$selector_metadata" != "$managed_owner:$workspace_gid:640:1" ]; then
         __gascan_starship_warn
         return 0
     fi
-    selector_contents=$(/bin/cat -- "$selector" 2>/dev/null; printf '\034')
-    case "$selector_contents" in
-        $'standard\n\034')
-            return 0
+    if /usr/bin/cmp -s "$selector" <(/usr/bin/printf '%s\n' standard); then
+        return 0
+    elif /usr/bin/cmp -s "$selector" <(/usr/bin/printf '%s\n' starship); then
+        prompt=starship
+        preset=/opt/gascan/shell/presets/starship.toml
+    elif /usr/bin/cmp -s "$selector" \
+        <(/usr/bin/printf '%s\n' starship-nerd-font); then
+        prompt=starship-nerd-font
+        preset=/opt/gascan/shell/presets/starship-nerd-font.toml
+    else
+        __gascan_starship_warn
+        return 0
+    fi
+
+    __gascan_starship_euid=$(/usr/bin/id -u)
+    case "$__gascan_starship_euid" in
+        0)
+            selected_config=$preset
             ;;
-        $'starship\n\034')
-            prompt=starship
-            preset=/opt/gascan/shell/presets/starship.toml
-            ;;
-        $'starship-nerd-font\n\034')
-            prompt=starship-nerd-font
-            preset=/opt/gascan/shell/presets/starship-nerd-font.toml
+        "$workspace_uid")
+            selected_config=$config
             ;;
         *)
             __gascan_starship_warn
@@ -69,16 +93,20 @@ __gascan_starship_main()
 
     config_metadata=$(__gascan_shell_metadata "$config")
     preset_metadata=$(__gascan_shell_metadata "$preset")
+    binary_metadata=$(__gascan_shell_metadata "$binary")
     if [ ! -f "$config" ] || [ -L "$config" ] ||
-        [ "$config_metadata" != 1000:600:1 ] ||
+        [ "$config_metadata" != "$managed_owner:$workspace_gid:640:1" ] ||
         [ ! -f "$preset" ] || [ -L "$preset" ] ||
-        [ "$preset_metadata" != 0:444:1 ] ||
-        ! /usr/bin/cmp -s "$config" "$preset" ||
-        [ ! -x "$binary" ]; then
+        [ "$preset_metadata" != "$immutable_owner:$immutable_gid:444:1" ] ||
+        [ ! -f "$binary" ] || [ -L "$binary" ] ||
+        [ "$binary_metadata" != "$immutable_owner:$immutable_gid:555:1" ] ||
+        ! /usr/bin/cmp -s "$config" "$preset"; then
         __gascan_starship_warn
         return 0
     fi
 
+    __gascan_starship_old_ps1=${PS1-}
+    __gascan_starship_old_path=$PATH
     if [ "${STARSHIP_CONFIG+x}" = x ]; then
         __gascan_starship_config_was_set=1
         __gascan_starship_old_config=$STARSHIP_CONFIG
@@ -86,26 +114,38 @@ __gascan_starship_main()
         __gascan_starship_config_was_set=0
         __gascan_starship_old_config=
     fi
-    old_ps1=${PS1-}
-    STARSHIP_CONFIG=$config
-    export STARSHIP_CONFIG
-    if ! initialization=$("$binary" init bash); then
-        PS1=$old_ps1
-        __gascan_starship_restore_config
+    if [ "${STARSHIP_EXECUTABLE+x}" = x ]; then
+        __gascan_starship_executable_was_set=1
+        __gascan_starship_old_executable=$STARSHIP_EXECUTABLE
+    else
+        __gascan_starship_executable_was_set=0
+        __gascan_starship_old_executable=
+    fi
+
+    STARSHIP_CONFIG=$selected_config
+    STARSHIP_EXECUTABLE=$binary
+    PATH=$immutable_path
+    export STARSHIP_CONFIG STARSHIP_EXECUTABLE PATH
+    if ! initialization=$("$binary" init bash --print-full-init); then
+        __gascan_starship_restore
         __gascan_starship_warn
         return 0
     fi
     if ! eval "$initialization"; then
-        PS1=$old_ps1
-        __gascan_starship_restore_config
+        __gascan_starship_restore
         __gascan_starship_warn
         return 0
     fi
-    unset __gascan_starship_config_was_set __gascan_starship_old_config
+    PATH=$__gascan_starship_old_path
+    export PATH
+    unset __gascan_starship_old_ps1 __gascan_starship_old_path \
+        __gascan_starship_config_was_set __gascan_starship_old_config \
+        __gascan_starship_executable_was_set __gascan_starship_old_executable \
+        __gascan_starship_euid
     return 0
 }
 
 __gascan_starship_main
-unset -f __gascan_starship_main __gascan_starship_restore_config __gascan_starship_warn \
-    __gascan_shell_metadata
+unset -f __gascan_starship_main __gascan_starship_restore \
+    __gascan_starship_warn __gascan_shell_metadata
 return 0 2>/dev/null || exit 0

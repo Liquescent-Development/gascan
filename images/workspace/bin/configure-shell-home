@@ -8,20 +8,25 @@ fi
 : "${HOME:?HOME must be set}"
 
 exec /usr/bin/python3 - "$0" "$HOME" "$1" <<'PY'
+import fcntl
+import grp
 import os
+import pwd
 import stat
 import sys
 
+FIXED_HOME = "/home/workspace"
+PRESET_ROOT = "/opt/gascan/shell/presets"
 PROMPTS = {
     "standard": None,
     "starship": "starship.toml",
     "starship-nerd-font": "starship-nerd-font.toml",
 }
-PRESET_ROOT = "/opt/gascan/shell/presets"
 SELECTOR = "prompt"
 CONFIG = "starship.toml"
 SELECTOR_STAGE = ".prompt.gascan-stage"
 CONFIG_STAGE = ".starship.toml.gascan-stage"
+LOCK = ".shell.lock"
 ALLOWED_ENTRIES = {SELECTOR, CONFIG, SELECTOR_STAGE, CONFIG_STAGE}
 MAX_FILE_SIZE = 1024 * 1024
 DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
@@ -34,6 +39,30 @@ class Refusal(Exception):
 
 def mode(info):
     return stat.S_IMODE(info.st_mode)
+
+
+def open_directory_at(parent_fd, name):
+    try:
+        fd = os.open(name, DIRECTORY_FLAGS, dir_fd=parent_fd)
+    except OSError as error:
+        raise Refusal(f"unsafe managed directory: {name}") from error
+    if not stat.S_ISDIR(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise Refusal(f"unsafe managed directory: {name}")
+    return fd
+
+
+def require_directory(fd, uid, gid, expected_mode, description):
+    info = os.fstat(fd)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != uid
+        or info.st_gid != gid
+        or mode(info) != expected_mode
+    ):
+        raise Refusal(
+            f"{description} must be owned by {uid}:{gid} with mode {expected_mode:04o}"
+        )
 
 
 def read_bounded(fd):
@@ -49,80 +78,40 @@ def read_bounded(fd):
             raise Refusal("managed shell file exceeds the size limit")
 
 
-def open_directory_at(parent_fd, name):
-    try:
-        fd = os.open(name, DIRECTORY_FLAGS, dir_fd=parent_fd)
-    except OSError as error:
-        raise Refusal(f"unsafe managed directory: {name}") from error
-    info = os.fstat(fd)
-    if not stat.S_ISDIR(info.st_mode):
-        os.close(fd)
-        raise Refusal(f"unsafe managed directory: {name}")
-    return fd
-
-
-def ensure_directory_at(parent_fd, name, create_mode):
-    try:
-        os.mkdir(name, create_mode, dir_fd=parent_fd)
-    except FileExistsError:
-        pass
-    except OSError as error:
-        raise Refusal(f"cannot create managed directory: {name}") from error
-    return open_directory_at(parent_fd, name)
-
-
-def require_managed_directory(fd, managed_uid):
-    info = os.fstat(fd)
-    if (
-        not stat.S_ISDIR(info.st_mode)
-        or info.st_uid != managed_uid
-        or mode(info) != 0o700
-    ):
-        raise Refusal("managed shell directory must be owned by the caller with mode 0700")
-
-
-def open_checked_file(directory_fd, name, expected_uid, expected_mode, owner_kind):
+def open_checked_file(directory_fd, name, uid, gid, expected_mode, description):
     try:
         fd = os.open(name, READ_FLAGS, dir_fd=directory_fd)
     except OSError as error:
-        raise Refusal(f"unsafe {owner_kind} file: {name}") from error
+        raise Refusal(f"unsafe {description} file: {name}") from error
     info = os.fstat(fd)
     if (
         not stat.S_ISREG(info.st_mode)
         or info.st_nlink != 1
+        or info.st_uid != uid
+        or info.st_gid != gid
         or mode(info) != expected_mode
     ):
         os.close(fd)
-        raise Refusal(f"unsafe {owner_kind} file: {name}")
-    if owner_kind == "managed":
-        managed_uid = expected_uid
-        if info.st_uid != managed_uid:
-            os.close(fd)
-            raise Refusal(f"unsafe managed file owner: {name}")
-    else:
-        immutable_uid = expected_uid
-        if info.st_uid != immutable_uid:
-            os.close(fd)
-            raise Refusal(f"unsafe immutable file owner: {name}")
+        raise Refusal(f"unsafe {description} file: {name}")
     return fd
 
 
-def read_checked_file(directory_fd, name, expected_uid, expected_mode, owner_kind):
-    fd = open_checked_file(directory_fd, name, expected_uid, expected_mode, owner_kind)
+def read_checked_file(directory_fd, name, uid, gid, expected_mode, description):
+    fd = open_checked_file(directory_fd, name, uid, gid, expected_mode, description)
     try:
         return read_bounded(fd)
     finally:
         os.close(fd)
 
 
-def optional_managed_file(directory_fd, name, managed_uid):
+def optional_managed_file(directory_fd, name, workspace_gid):
     try:
         os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
     except FileNotFoundError:
         return None
     except OSError as error:
         raise Refusal(f"cannot inspect managed file: {name}") from error
-    return read_checked_file(directory_fd, name, managed_uid, 0o600, "managed")
+    return read_checked_file(directory_fd, name, 0, workspace_gid, 0o640, "managed")
 
 
 def load_presets(script_path):
@@ -130,24 +119,19 @@ def load_presets(script_path):
     if (
         not stat.S_ISREG(script_info.st_mode)
         or script_info.st_nlink != 1
+        or script_info.st_uid != 0
+        or script_info.st_gid != 0
         or mode(script_info) != 0o555
     ):
-        raise Refusal("configurator is not an immutable regular executable")
-    immutable_uid = script_info.st_uid
+        raise Refusal("configurator is not an immutable root-owned executable")
     try:
         root_fd = os.open(PRESET_ROOT, DIRECTORY_FLAGS)
     except OSError as error:
         raise Refusal("immutable preset directory is unavailable") from error
     try:
-        info = os.fstat(root_fd)
-        if (
-            not stat.S_ISDIR(info.st_mode)
-            or info.st_uid != immutable_uid
-            or mode(info) != 0o555
-        ):
-            raise Refusal("immutable preset directory metadata changed")
+        require_directory(root_fd, 0, 0, 0o555, "immutable preset directory")
         return {
-            name: read_checked_file(root_fd, name, immutable_uid, 0o444, "immutable")
+            name: read_checked_file(root_fd, name, 0, 0, 0o444, "immutable")
             for name in ("starship.toml", "starship-nerd-font.toml")
         }
     finally:
@@ -173,18 +157,19 @@ def write_all(fd, contents):
         offset += written
 
 
-def stage_file(directory_fd, name, contents):
+def stage_file(directory_fd, name, contents, workspace_gid):
     try:
         fd = os.open(
             name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-            0o600,
+            0o640,
             dir_fd=directory_fd,
         )
     except OSError as error:
         raise Refusal(f"cannot create managed staging file: {name}") from error
     try:
-        os.fchmod(fd, 0o600)
+        os.fchown(fd, 0, workspace_gid)
+        os.fchmod(fd, 0o640)
         write_all(fd, contents)
         os.fsync(fd)
     except Exception:
@@ -193,8 +178,8 @@ def stage_file(directory_fd, name, contents):
     os.close(fd)
 
 
-def publish_file(directory_fd, stage, destination, contents):
-    stage_file(directory_fd, stage, contents)
+def publish_file(directory_fd, stage, destination, contents, workspace_gid):
+    stage_file(directory_fd, stage, contents, workspace_gid)
     try:
         os.replace(
             stage,
@@ -215,88 +200,166 @@ def remove_file(directory_fd, name):
     os.fsync(directory_fd)
 
 
+def open_lock(gascan_fd):
+    created = False
+    try:
+        fd = os.open(
+            LOCK,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=gascan_fd,
+        )
+        created = True
+    except FileExistsError:
+        try:
+            fd = os.open(
+                LOCK,
+                os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=gascan_fd,
+            )
+        except OSError as error:
+            raise Refusal("unsafe managed shell transaction lock") from error
+    except OSError as error:
+        raise Refusal("cannot create managed shell transaction lock") from error
+    try:
+        if created:
+            os.fchown(fd, 0, 0)
+            os.fchmod(fd, 0o600)
+            os.fsync(fd)
+            os.fsync(gascan_fd)
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != 0
+            or info.st_gid != 0
+            or mode(info) != 0o600
+        ):
+            raise Refusal("unsafe managed shell transaction lock")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def open_or_create_shell(gascan_fd, workspace_gid):
+    try:
+        os.mkdir("shell", 0o750, dir_fd=gascan_fd)
+        created = True
+    except FileExistsError:
+        created = False
+    except OSError as error:
+        raise Refusal("cannot create managed shell directory") from error
+    shell_fd = open_directory_at(gascan_fd, "shell")
+    try:
+        if created:
+            os.fchown(shell_fd, 0, workspace_gid)
+            os.fchmod(shell_fd, 0o750)
+            os.fsync(shell_fd)
+            os.fsync(gascan_fd)
+        require_directory(
+            shell_fd, 0, workspace_gid, 0o750, "managed shell directory"
+        )
+        return shell_fd
+    except Exception:
+        os.close(shell_fd)
+        raise
+
+
+def apply_transaction(shell_fd, prompt, presets, workspace_gid):
+    entries = set(os.listdir(shell_fd))
+    unexpected = entries - ALLOWED_ENTRIES
+    if unexpected:
+        raise Refusal(f"unexpected managed shell entry: {sorted(unexpected)[0]}")
+
+    selector = optional_managed_file(shell_fd, SELECTOR, workspace_gid)
+    if selector is not None:
+        validate_selector(selector)
+    config = optional_managed_file(shell_fd, CONFIG, workspace_gid)
+    selector_stage = optional_managed_file(shell_fd, SELECTOR_STAGE, workspace_gid)
+    if selector_stage is not None:
+        validate_selector(selector_stage)
+    config_stage = optional_managed_file(shell_fd, CONFIG_STAGE, workspace_gid)
+    if config is not None:
+        validate_config(config, presets)
+    if config_stage is not None:
+        validate_config(config_stage, presets)
+
+    if selector_stage is not None:
+        remove_file(shell_fd, SELECTOR_STAGE)
+    if config_stage is not None:
+        remove_file(shell_fd, CONFIG_STAGE)
+
+    selected_name = PROMPTS[prompt]
+    selector_contents = f"{prompt}\n".encode()
+    if selected_name is None:
+        publish_file(
+            shell_fd, SELECTOR_STAGE, SELECTOR, selector_contents, workspace_gid
+        )
+        if config is not None:
+            remove_file(shell_fd, CONFIG)
+    else:
+        publish_file(
+            shell_fd,
+            CONFIG_STAGE,
+            CONFIG,
+            presets[selected_name],
+            workspace_gid,
+        )
+        publish_file(
+            shell_fd, SELECTOR_STAGE, SELECTOR, selector_contents, workspace_gid
+        )
+    os.fsync(shell_fd)
+
+
 def run(script_path, home, prompt):
+    if os.geteuid() != 0:
+        raise Refusal("configurator must run as root")
+    if home != FIXED_HOME:
+        raise Refusal(f"HOME must be {FIXED_HOME}")
     if prompt not in PROMPTS:
         accepted = ", ".join(PROMPTS)
         raise Refusal(f"unknown prompt {prompt!r}; expected one of: {accepted}")
 
-    selected_name = PROMPTS[prompt]
-    presets = load_presets(script_path) if selected_name is not None else None
-    managed_uid = os.geteuid()
+    workspace = pwd.getpwnam("workspace")
+    workspace_gid = grp.getgrnam("workspace").gr_gid
+    if (
+        workspace.pw_uid != 1000
+        or workspace_gid != 1000
+        or workspace.pw_gid != workspace_gid
+    ):
+        raise Refusal("workspace identity changed")
+    presets = load_presets(script_path)
+
     try:
         home_fd = os.open(home, DIRECTORY_FLAGS)
     except OSError as error:
         raise Refusal("HOME is not a safe directory") from error
     try:
-        config_fd = ensure_directory_at(home_fd, ".config", 0o700)
+        require_directory(
+            home_fd, workspace.pw_uid, workspace_gid, 0o755, "workspace HOME"
+        )
+        config_root_fd = open_directory_at(home_fd, ".config")
         try:
-            gascan_fd = ensure_directory_at(config_fd, "gascan", 0o700)
+            gascan_fd = open_directory_at(config_root_fd, "gascan")
             try:
-                shell_fd = ensure_directory_at(gascan_fd, "shell", 0o700)
+                require_directory(
+                    gascan_fd, 0, workspace_gid, 0o1770, "managed gascan directory"
+                )
+                lock_fd = open_lock(gascan_fd)
                 try:
-                    require_managed_directory(shell_fd, managed_uid)
-                    entries = set(os.listdir(shell_fd))
-                    unexpected = entries - ALLOWED_ENTRIES
-                    if unexpected:
-                        raise Refusal(
-                            f"unexpected managed shell entry: {sorted(unexpected)[0]}"
-                        )
-
-                    selector = optional_managed_file(shell_fd, SELECTOR, managed_uid)
-                    if selector is not None:
-                        validate_selector(selector)
-                    config = optional_managed_file(shell_fd, CONFIG, managed_uid)
-                    selector_stage = optional_managed_file(
-                        shell_fd, SELECTOR_STAGE, managed_uid
-                    )
-                    if selector_stage is not None:
-                        validate_selector(selector_stage)
-                    config_stage = optional_managed_file(
-                        shell_fd, CONFIG_STAGE, managed_uid
-                    )
-                    if config is not None or config_stage is not None:
-                        if presets is None:
-                            presets = load_presets(script_path)
-                        if config is not None:
-                            validate_config(config, presets)
-                        if config_stage is not None:
-                            validate_config(config_stage, presets)
-
-                    if selector_stage is not None:
-                        remove_file(shell_fd, SELECTOR_STAGE)
-                    if config_stage is not None:
-                        remove_file(shell_fd, CONFIG_STAGE)
-
-                    selector_contents = f"{prompt}\n".encode()
-                    if selected_name is None:
-                        publish_file(
-                            shell_fd,
-                            SELECTOR_STAGE,
-                            SELECTOR,
-                            selector_contents,
-                        )
-                        if config is not None:
-                            remove_file(shell_fd, CONFIG)
-                    else:
-                        publish_file(
-                            shell_fd,
-                            CONFIG_STAGE,
-                            CONFIG,
-                            presets[selected_name],
-                        )
-                        publish_file(
-                            shell_fd,
-                            SELECTOR_STAGE,
-                            SELECTOR,
-                            selector_contents,
-                        )
-                    os.fsync(shell_fd)
+                    shell_fd = open_or_create_shell(gascan_fd, workspace_gid)
+                    try:
+                        apply_transaction(shell_fd, prompt, presets, workspace_gid)
+                    finally:
+                        os.close(shell_fd)
                 finally:
-                    os.close(shell_fd)
+                    os.close(lock_fd)
             finally:
                 os.close(gascan_fd)
         finally:
-            os.close(config_fd)
+            os.close(config_root_fd)
     finally:
         os.close(home_fd)
 
@@ -305,7 +368,7 @@ def main():
     os.umask(0o077)
     try:
         run(sys.argv[1], sys.argv[2], sys.argv[3])
-    except (OSError, Refusal) as error:
+    except (KeyError, OSError, Refusal) as error:
         print(f"configure-shell-home: {error}", file=sys.stderr)
         return 1
     return 0
