@@ -1837,6 +1837,18 @@ pub fn marker_payload(output: &[u8], begin: &str, end: &str) -> TestResult<Strin
     Ok(remainder[..finish].to_owned())
 }
 
+pub fn inline_marker_value(output: &str, begin: &str, end: &str) -> TestResult<String> {
+    let start = output
+        .find(begin)
+        .ok_or_else(|| format!("PTY output omitted inline marker {begin:?}: {output:?}"))?
+        + begin.len();
+    let remainder = &output[start..];
+    let finish = remainder
+        .find(end)
+        .ok_or_else(|| format!("PTY output omitted inline marker {end:?}: {output:?}"))?;
+    Ok(remainder[..finish].to_owned())
+}
+
 fn run_pty_script_command(
     mut command: Command,
     script: &str,
@@ -2607,6 +2619,24 @@ fn cleanup_resource_identities(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_marker_value_ignores_interactive_prompt_prefix() -> TestResult {
+        let output = concat!(
+            "workspace@sandbox:/workspace$ ",
+            "GASCAN_BASH_VERSION_BEGIN5.2.37GASCAN_BASH_VERSION_END\n",
+        );
+
+        assert_eq!(
+            inline_marker_value(
+                output,
+                "GASCAN_BASH_VERSION_BEGIN",
+                "GASCAN_BASH_VERSION_END",
+            )?,
+            "5.2.37"
+        );
+        Ok(())
+    }
 
     #[test]
     fn current_thread_timeout_is_constructed_inside_its_runtime() -> TestResult {

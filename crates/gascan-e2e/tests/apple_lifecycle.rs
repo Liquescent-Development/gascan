@@ -3,7 +3,7 @@
 
 mod apple_common;
 
-use apple_common::{AppleE2e, TestResult, marker_payload};
+use apple_common::{AppleE2e, TestResult, inline_marker_value, marker_payload};
 
 #[test]
 #[ignore = "requires supported Apple runtime and the locked workspace image"]
@@ -15,7 +15,7 @@ fn cli_lifecycle_survives_daemon_and_host_state_changes() -> TestResult {
 
     let native_shell = env.run_default_shell_pty_script(
         r#"printf 'GASCAN_STANDARD_SHELL_BEGIN\n'
-printf 'BASH_VERSION=%s\n' "${BASH_VERSION:-}"
+printf 'GASCAN_BASH_%s%sGASCAN_BASH_%s\n' 'VERSION_BEGIN' "${BASH_VERSION:-}" 'VERSION_END'
 case $- in *i*) printf 'INTERACTIVE=yes\n';; *) printf 'INTERACTIVE=no\n';; esac
 if shopt -q login_shell; then printf 'LOGIN=yes\n'; else printf 'LOGIN=no\n'; fi
 printf 'SHELL=%s\n' "${SHELL:-}"
@@ -59,10 +59,11 @@ exit 0
             );
         }
     }
-    let bash_version = native_shell
-        .lines()
-        .find_map(|line| line.strip_prefix("BASH_VERSION="))
-        .ok_or("default native shell omitted BASH_VERSION")?;
+    let bash_version = inline_marker_value(
+        &native_shell,
+        "GASCAN_BASH_VERSION_BEGIN",
+        "GASCAN_BASH_VERSION_END",
+    )?;
     if bash_version.is_empty() {
         return Err("default native shell did not run Bash".into());
     }
