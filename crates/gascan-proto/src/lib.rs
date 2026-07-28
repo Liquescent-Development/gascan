@@ -5,7 +5,7 @@
 /// Supported API major version.
 pub const API_MAJOR: u32 = 1;
 /// Current backwards-compatible API minor version.
-pub const API_MINOR: u32 = 3;
+pub const API_MINOR: u32 = 4;
 /// Required POSIX permission bits for the local socket directory (`0700`).
 pub const SOCKET_DIRECTORY_MODE: u32 = 0o700;
 /// Required POSIX permission bits for the local socket (`0600`).

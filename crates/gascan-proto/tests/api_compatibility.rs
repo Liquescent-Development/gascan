@@ -132,7 +132,9 @@ fn v1_descriptor_contains_required_rpc_surface() {
     for method in &service.method {
         let name = method.name.as_deref().expect("method name");
         let expected = match name {
-            "Handshake" | "Status" | "List" | "Doctor" => (false, false),
+            "Handshake" | "Status" | "List" | "Doctor" | "DaemonStatus" | "ShutdownDaemon" => {
+                (false, false)
+            }
             "Up" | "Apply" | "Run" | "Shell" | "Down" | "Destroy" | "Logs" => (false, true),
             "Attach" => (true, true),
             other => panic!("unexpected RPC {other}"),
@@ -143,7 +145,7 @@ fn v1_descriptor_contains_required_rpc_surface() {
             "wrong streaming shape for {name}"
         );
     }
-    assert_eq!(service.method.len(), 12);
+    assert_eq!(service.method.len(), 14);
 }
 
 #[test]
@@ -243,7 +245,7 @@ fn public_error_codes_are_stable_and_unique() {
 #[test]
 fn ssh_status_is_an_additive_api_minor_change() {
     assert_eq!(API_MAJOR, 1);
-    assert_eq!(API_MINOR, 3);
+    assert_eq!(API_MINOR, 4);
 
     let descriptor =
         FileDescriptorSet::decode(FILE_DESCRIPTOR_SET).expect("descriptor must decode");
@@ -501,7 +503,7 @@ fn v1_descriptor_keeps_handshake_transport_and_enum_numbers_stable() {
     assert_field(request, "api_minor", 2, Uint32, None);
     assert_field(request, "requested_capabilities", 3, String, None);
     let response = message(file, "HandshakeResponse");
-    assert_eq!(response.field.len(), 9);
+    assert_eq!(response.field.len(), 11);
     assert_field(response, "api_major", 1, Uint32, None);
     assert_field(response, "api_minor", 2, Uint32, None);
     assert_field(response, "capabilities", 3, Message, None);
@@ -511,6 +513,8 @@ fn v1_descriptor_keeps_handshake_transport_and_enum_numbers_stable() {
     assert_field(response, "daemon_pid", 7, Uint32, None);
     assert_field(response, "daemon_executable", 8, String, None);
     assert_field(response, "daemon_start_identity", 9, String, None);
+    assert_field(response, "release_version", 10, String, None);
+    assert_field(response, "daemon_started_at", 11, Message, None);
     assert_type_name(response, "capabilities", ".gascan.v1.Capability");
     assert_type_name(
         response,
@@ -518,6 +522,7 @@ fn v1_descriptor_keeps_handshake_transport_and_enum_numbers_stable() {
         ".gascan.v1.TransportSecurity",
     );
     assert_type_name(response, "rejection", ".gascan.v1.Error");
+    assert_type_name(response, "daemon_started_at", ".google.protobuf.Timestamp");
     let security = message(file, "TransportSecurity");
     assert_eq!(security.field.len(), 4);
     assert_field(security, "local_only", 1, Bool, None);
@@ -659,9 +664,18 @@ fn v1_descriptor_exactly_covers_every_exported_message_enum_and_rpc() {
                 f!("daemon_pid", 7, Uint32),
                 f!("daemon_executable", 8, String),
                 f!("daemon_start_identity", 9, String),
+                f!("release_version", 10, String),
+                f!(
+                    "daemon_started_at",
+                    11,
+                    Message,
+                    O,
+                    None,
+                    Some(".google.protobuf.Timestamp")
+                ),
             ],
             &[],
-            &[(10, 11)],
+            &[(12, 13)],
         ),
         (
             "SandboxSelector",
@@ -978,7 +992,15 @@ fn v1_descriptor_exactly_covers_every_exported_message_enum_and_rpc() {
             &[],
             &[(2, 3)],
         ),
-        ("DoctorRequest", &[], &[], &[(1, 2)]),
+        (
+            "DoctorRequest",
+            &[
+                f!("workspace", 2, String),
+                f!("workspace_error", 3, String),
+            ],
+            &[],
+            &[(1, 2)],
+        ),
         (
             "DoctorResponse",
             &[
@@ -994,6 +1016,47 @@ fn v1_descriptor_exactly_covers_every_exported_message_enum_and_rpc() {
             ],
             &[],
             &[(3, 4)],
+        ),
+        ("DaemonStatusRequest", &[], &[], &[(1, 2)]),
+        (
+            "DaemonStatusResponse",
+            &[
+                f!("release_version", 1, String),
+                f!("daemon_pid", 2, Uint32),
+                f!("daemon_executable", 3, String),
+                f!("daemon_start_identity", 4, String),
+                f!("daemon_instance_token", 5, String),
+                f!(
+                    "daemon_started_at",
+                    6,
+                    Message,
+                    O,
+                    None,
+                    Some(".google.protobuf.Timestamp")
+                ),
+                f!(
+                    "health",
+                    7,
+                    Enum,
+                    O,
+                    None,
+                    Some(".gascan.v1.DaemonHealth")
+                ),
+            ],
+            &[],
+            &[(8, 9)],
+        ),
+        (
+            "ShutdownDaemonRequest",
+            &[f!("daemon_instance_token", 1, String)],
+            &[],
+            &[(2, 3)],
+        ),
+        (
+            "ShutdownDaemonResponse",
+            &[f!("accepted", 1, Bool)],
+            &[],
+            &[(2, 3)],
         ),
         (
             "Resize",
@@ -1082,6 +1145,14 @@ fn v1_descriptor_exactly_covers_every_exported_message_enum_and_rpc() {
                 ("PROVISION_STEP_CONFIGURE_SHELL", 7),
             ],
         ),
+        (
+            "DaemonHealth",
+            &[
+                ("DAEMON_HEALTH_UNKNOWN", 0),
+                ("DAEMON_HEALTH_HEALTHY", 1),
+                ("DAEMON_HEALTH_UNHEALTHY", 2),
+            ],
+        ),
     ];
     assert_eq!(file.enum_type.len(), enums.len());
     for (name, expected) in enums {
@@ -1124,6 +1195,20 @@ fn v1_descriptor_exactly_covers_every_exported_message_enum_and_rpc() {
             "Doctor",
             ".gascan.v1.DoctorRequest",
             ".gascan.v1.DoctorResponse",
+            false,
+            false,
+        ),
+        (
+            "DaemonStatus",
+            ".gascan.v1.DaemonStatusRequest",
+            ".gascan.v1.DaemonStatusResponse",
+            false,
+            false,
+        ),
+        (
+            "ShutdownDaemon",
+            ".gascan.v1.ShutdownDaemonRequest",
+            ".gascan.v1.ShutdownDaemonResponse",
             false,
             false,
         ),
