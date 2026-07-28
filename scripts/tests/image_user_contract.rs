@@ -4,7 +4,7 @@ use std::{
     fs,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output},
 };
 
 const RUNTIME_PATH: &str = concat!(
@@ -21,6 +21,183 @@ const RUNTIME_PATH: &str = concat!(
 
 fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
+}
+
+struct ShellFixture {
+    _temporary: tempfile::TempDir,
+    home: PathBuf,
+    script: PathBuf,
+}
+
+impl ShellFixture {
+    fn new() -> Self {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let script = temporary.path().join("configure-shell-home");
+        fs::copy(
+            root().join("images/workspace/bin/configure-shell-home"),
+            &script,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::create_dir_all(home.join(".config/gascan")).unwrap();
+        Self {
+            _temporary: temporary,
+            home,
+            script,
+        }
+    }
+
+    fn run(&self, prompt: &str) -> Output {
+        Command::new(&self.script)
+            .arg(prompt)
+            .env_clear()
+            .env("HOME", &self.home)
+            .output()
+            .unwrap()
+    }
+}
+
+fn write_mode(path: &Path, contents: &str, mode: u32) {
+    fs::write(path, contents).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+fn hook_fixture(temporary: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let shell_dir = temporary.path().join("managed-shell");
+    let immutable_root = temporary.path().join("opt/gascan/shell");
+    let starship = immutable_root.join("bin/starship");
+    let starship_target = temporary.path().join("opt/gascan/workstation/bin/starship");
+    let presets = immutable_root.join("presets");
+    let log = temporary.path().join("starship.log");
+    fs::create_dir(&shell_dir).unwrap();
+    fs::create_dir_all(starship.parent().unwrap()).unwrap();
+    fs::create_dir_all(starship_target.parent().unwrap()).unwrap();
+    fs::create_dir(&presets).unwrap();
+    symlink("../../workstation/bin/starship", &starship).unwrap();
+    for name in ["starship.toml", "starship-nerd-font.toml"] {
+        write_mode(&presets.join(name), "format = \"$character\"\n", 0o444);
+    }
+    let source = fs::read_to_string(root().join("images/workspace/etc/gascan/bashrc")).unwrap();
+    let fixture_uid = fs::metadata(temporary.path()).unwrap().uid();
+    let fixture_gid = fs::metadata(temporary.path()).unwrap().gid();
+    let fixture_link_mode = fs::symlink_metadata(&starship)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777;
+    let rebound = source
+        .replace(
+            "/home/workspace/.config/gascan/shell",
+            shell_dir.to_str().unwrap(),
+        )
+        .replace(
+            "/opt/gascan/workstation/bin/starship",
+            starship_target.to_str().unwrap(),
+        )
+        .replace("/opt/gascan/shell/bin/starship", starship.to_str().unwrap())
+        .replace("/opt/gascan/shell/presets", presets.to_str().unwrap())
+        .replace("managed_owner=0", &format!("managed_owner={fixture_uid}"))
+        .replace(
+            "workspace_uid=1000",
+            &format!("workspace_uid={fixture_uid}"),
+        )
+        .replace(
+            "workspace_gid=1000",
+            &format!("workspace_gid={fixture_gid}"),
+        )
+        .replace(
+            "immutable_owner=0",
+            &format!("immutable_owner={fixture_uid}"),
+        )
+        .replace("immutable_gid=0", &format!("immutable_gid={fixture_gid}"))
+        .replace(
+            "immutable_link_mode=777",
+            &format!("immutable_link_mode={fixture_link_mode:o}"),
+        );
+    assert_ne!(
+        source, rebound,
+        "fixture did not rebind managed shell paths"
+    );
+    let hook = temporary.path().join("gascan-bashrc");
+    fs::write(&hook, rebound).unwrap();
+    fs::write(
+        &starship_target,
+        "#!/bin/sh\n\
+         printf '%s|%s|%s\\n' \"$*\" \"${STARSHIP_CONFIG-}\" \"${STARSHIP_EXECUTABLE-}\" >>\"$GASCAN_TEST_LOG\"\n\
+         if [ \"$*\" = 'init bash' ]; then\n\
+           printf '%s\\n' 'eval \"$(starship init bash --print-full-init)\"'\n\
+         elif [ \"$*\" = 'init bash --print-full-init' ]; then\n\
+           test \"${GASCAN_TEST_GENERATION_FAIL-0}\" != 1 || exit 23\n\
+           if [ \"${GASCAN_TEST_EVAL_FAIL-0}\" = 1 ]; then\n\
+             printf '%s\\n' \
+               'PS1=broken' \
+               'PS2=broken-continuation' \
+               'PROMPT_COMMAND=broken-prompt-command' \
+               'STARSHIP_PARTIAL=leaked-variable' \
+               'starship_partial_leak() { printf leaked; }' \
+               \"trap 'STARSHIP_TRAP_LEAK=1' DEBUG\" \
+               'false' \
+               'true'\n\
+           else\n\
+             if [ \"${GASCAN_TEST_SIGNAL_COLLISION-0}\" = 1 ]; then\n\
+               printf '%s\\n' 'kill -USR1 \"$GASCAN_TEST_PARENT_PID\"'\n\
+             fi\n\
+             printf '%s\\n' \
+               '_starship_set_return() { return \"${1:-0}\"; }' \
+               'starship_preexec() { :; }' \
+               'starship_preexec_all() { :; }' \
+               'starship_preexec_ps0() { :; }' \
+               'starship_precmd() { if [ -n \"${STARSHIP_PROMPT_COMMAND-}\" ]; then eval \"$STARSHIP_PROMPT_COMMAND\"; fi; \"$STARSHIP_EXECUTABLE\" prompt; }' \
+               'STARSHIP_START_TIME=1' \
+               'STARSHIP_SHELL=bash' \
+               'STARSHIP_SESSION_KEY=1234567890123456' \
+               'PS0=managed-ps0' \
+               'PS1=managed-starship' \
+               'PS2=managed-continuation' \
+               'if [ -n \"${PROMPT_COMMAND-}\" ] && [[ \"$PROMPT_COMMAND\" != *\"starship_precmd\"* ]]; then STARSHIP_PROMPT_COMMAND=$PROMPT_COMMAND; fi' \
+               'PROMPT_COMMAND=starship_precmd' \
+               'shopt -s checkwinsize' \
+               \"trap ':' DEBUG\"\n\
+           fi\n\
+         elif [ \"$*\" = prompt ]; then\n\
+           printf '%s\\n' stable-runtime-prompt\n\
+         else\n\
+           exit 24\n\
+         fi\n",
+    )
+    .unwrap();
+    fs::set_permissions(&starship_target, fs::Permissions::from_mode(0o555)).unwrap();
+    (hook, shell_dir, starship, log)
+}
+
+fn run_hook(
+    hook: &Path,
+    command: &str,
+    log: &Path,
+    generation_fail: bool,
+    eval_fail: bool,
+    interactive: bool,
+) -> Output {
+    let mut process = Command::new("/bin/bash");
+    process.args(["--noprofile", "--norc"]);
+    if interactive {
+        process.arg("-i");
+    }
+    process
+        .args(["-c", command])
+        .env("GASCAN_TEST_LOG", log)
+        .env(
+            "GASCAN_TEST_GENERATION_FAIL",
+            if generation_fail { "1" } else { "0" },
+        )
+        .env("GASCAN_TEST_EVAL_FAIL", if eval_fail { "1" } else { "0" })
+        .env("GASCAN_TEST_HOOK", hook)
+        .env_remove("STARSHIP_SHELL")
+        .env_remove("STARSHIP_SESSION_KEY")
+        .output()
+        .unwrap()
 }
 
 fn rust_seed_command(
@@ -280,10 +457,7 @@ fn writable_rust_bootstrap_preserves_regular_update_hash_collision() {
             .success()
     );
     assert_eq!(fs::metadata(&collision).unwrap().ino(), inode);
-    assert_eq!(
-        fs::read_to_string(&collision).unwrap(),
-        "user-owned hash\n"
-    );
+    assert_eq!(fs::read_to_string(&collision).unwrap(), "user-owned hash\n");
     assert!(rust_staging_residue(&destination).is_empty());
 }
 
@@ -1577,6 +1751,106 @@ fn workstation_contract_uses_exact_locked_command_versions() {
 }
 
 #[test]
+fn workstation_contract_requires_a_traversable_managed_hook_directory() {
+    let contract =
+        fs::read_to_string(root().join("images/workspace/tests/workstation-contract.sh")).unwrap();
+    assert!(
+        contract.contains(r#"test "$(stat -c %U:%G:%a /etc/gascan)" = root:root:555"#),
+        "workstation smoke does not pin the managed hook directory boundary"
+    );
+    assert!(
+        contract.contains("test -x /etc/gascan"),
+        "workspace smoke does not prove it can traverse the managed hook directory"
+    );
+    assert!(
+        contract.contains("test -r /etc/gascan/bashrc"),
+        "workspace smoke does not prove it can read the immutable hook"
+    );
+}
+
+#[test]
+fn workstation_contract_pins_workspace_home_and_private_child_metadata() {
+    let contract =
+        fs::read_to_string(root().join("images/workspace/tests/workstation-contract.sh")).unwrap();
+    for required in [
+        r#"test "$(stat -c %U:%G:%a /home/workspace)" = workspace:workspace:755"#,
+        r#"test "$(stat -c %U:%G:%a /home/workspace/.local)" = workspace:workspace:700"#,
+        r#"test "$(stat -c %U:%G:%a /home/workspace/.cache)" = workspace:workspace:700"#,
+        r#"test "$(stat -c %U:%G:%a /home/workspace/.config)" = root:workspace:1770"#,
+    ] {
+        assert!(
+            contract.contains(required),
+            "workstation smoke omits HOME metadata boundary: {required}"
+        );
+    }
+}
+
+#[test]
+fn workstation_contract_accepts_only_the_locked_starship_first_line_behaviorally() {
+    let contract =
+        fs::read_to_string(root().join("images/workspace/tests/workstation-contract.sh")).unwrap();
+    let helper_prefix = contract
+        .split_once("locked=/opt/gascan/workstation/versions.json")
+        .unwrap()
+        .0;
+    let lines = contract.lines().collect::<Vec<_>>();
+    let check_index = lines
+        .iter()
+        .position(|line| line.contains("/opt/gascan/shell/bin/starship --version"))
+        .unwrap();
+    let mut check = lines[check_index].to_owned();
+    if check.ends_with("||") {
+        check.push('\n');
+        check.push_str(lines[check_index + 1]);
+    }
+    let check = check.replace("/opt/gascan/shell/bin/starship", "\"$1\"");
+
+    let temporary = tempfile::tempdir().unwrap();
+    let starship = temporary.path().join("starship");
+    fs::write(
+        &starship,
+        "#!/bin/sh\nset -eu\ntest \"$1\" = --version\nprintf '%s' \"$STARSHIP_VERSION_OUTPUT\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&starship, fs::Permissions::from_mode(0o755)).unwrap();
+    let probe = format!(
+        "{helper_prefix}\n\
+         locked_version()\n\
+         {{\n\
+             test \"$1\" = starship\n\
+             printf '%s\\n' 1.25.1\n\
+         }}\n\
+         {check}\n"
+    );
+    let run = |output: &str| {
+        Command::new("sh")
+            .args(["-c", &probe, "sh", starship.to_str().unwrap()])
+            .env("STARSHIP_VERSION_OUTPUT", output)
+            .status()
+            .unwrap()
+    };
+
+    assert!(
+        run("starship 1.25.1\n\
+             branch:master\n\
+             commit_hash:8758daa\n\
+             build_time:2026-04-30 19:35:31 +00:00\n\
+             build_env:rustc 1.95.0 (59807616e 2026-04-14),\n")
+        .success(),
+        "real trailing Starship build metadata was rejected"
+    );
+    assert!(
+        !run("starship 1.25.10\n\
+              branch:master\n\
+              commit_hash:8758daa\n\
+              build_time:2026-04-30 19:35:31 +00:00\n\
+              build_env:rustc 1.95.0 (59807616e 2026-04-14),\n")
+        .success(),
+        "wrong first-line Starship version was accepted"
+    );
+}
+
+#[test]
 fn workstation_home_configuration_is_idempotent_and_refuses_unmanaged_paths() {
     let script = root().join("images/workspace/bin/configure-workstation-home");
     let temp = tempfile::tempdir().unwrap();
@@ -1759,6 +2033,685 @@ fn workstation_home_configuration_contains_no_credentials() {
             "home setup must not materialize credentials: {forbidden}"
         );
     }
+}
+
+#[test]
+fn shell_configurator_rejects_non_root_and_extra_input_without_mutation() {
+    let fixture = ShellFixture::new();
+    for prompt in ["standard", "starship", "starship-nerd-font"] {
+        let output = fixture.run(prompt);
+        assert!(
+            !output.status.success(),
+            "non-root configurator accepted {prompt}"
+        );
+    }
+    let extra = Command::new(&fixture.script)
+        .args(["standard", "ignored"])
+        .env_clear()
+        .output()
+        .unwrap();
+    assert!(!extra.status.success(), "configurator accepted extra input");
+    assert!(
+        !fixture.home.join(".config/gascan/shell").exists(),
+        "rejected invocation mutated managed state"
+    );
+}
+
+#[test]
+fn shell_hook_is_interactive_only_and_standard_is_a_true_prompt_no_op() {
+    let temporary = tempfile::tempdir().unwrap();
+    let (hook, shell_dir, _starship, log) = hook_fixture(&temporary);
+
+    let noninteractive = run_hook(
+        &hook,
+        r#". "$GASCAN_TEST_HOOK"; printf 'noninteractive-ok\n'"#,
+        &log,
+        false,
+        false,
+        false,
+    );
+    assert!(noninteractive.status.success());
+    assert_eq!(noninteractive.stdout, b"noninteractive-ok\n");
+    assert!(!log.exists(), "non-interactive hook invoked Starship");
+
+    write_mode(&shell_dir.join("prompt"), "standard\n", 0o640);
+    let standard = run_hook(
+        &hook,
+        r#"PS1='native-prompt'; STARSHIP_CONFIG='user-value'; . "$GASCAN_TEST_HOOK"; printf '%s|%s\n' "$PS1" "$STARSHIP_CONFIG""#,
+        &log,
+        false,
+        false,
+        true,
+    );
+    assert!(
+        standard.status.success(),
+        "{}",
+        String::from_utf8_lossy(&standard.stderr)
+    );
+    assert_eq!(standard.stdout, b"native-prompt|user-value\n");
+    assert!(
+        !String::from_utf8_lossy(&standard.stderr).contains("gascan:"),
+        "{}",
+        String::from_utf8_lossy(&standard.stderr)
+    );
+    assert!(!log.exists(), "standard mode invoked Starship");
+}
+
+#[test]
+fn shell_hook_uses_only_the_pinned_binary_and_managed_config() {
+    let temporary = tempfile::tempdir().unwrap();
+    let (hook, shell_dir, _starship, log) = hook_fixture(&temporary);
+    write_mode(&shell_dir.join("prompt"), "starship-nerd-font\n", 0o640);
+    write_mode(
+        &shell_dir.join("starship.toml"),
+        "format = \"$character\"\n",
+        0o640,
+    );
+    let fake_path = temporary.path().join("path");
+    fs::create_dir(&fake_path).unwrap();
+    fs::write(
+        fake_path.join("starship"),
+        "#!/bin/sh\nprintf 'PATH starship invoked\\n' >&2\nexit 99\n",
+    )
+    .unwrap();
+    fs::set_permissions(
+        fake_path.join("starship"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    let output = Command::new("/bin/bash")
+        .args([
+            "--noprofile",
+            "--norc",
+            "-i",
+            "-c",
+            r#"PS1='native-prompt'; . "$GASCAN_TEST_HOOK"; printf '%s|' "$PS1"; starship_precmd"#,
+        ])
+        .env("PATH", &fake_path)
+        .env("GASCAN_TEST_HOOK", &hook)
+        .env("GASCAN_TEST_LOG", &log)
+        .env("GASCAN_TEST_GENERATION_FAIL", "0")
+        .env("GASCAN_TEST_EVAL_FAIL", "0")
+        .env_remove("STARSHIP_SHELL")
+        .env_remove("STARSHIP_SESSION_KEY")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        b"managed-starship|stable-runtime-prompt\n",
+        "stderr: {}\nlog: {}",
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        format!(
+            "init bash --print-full-init|{}|{}\nprompt|{}|{}\n",
+            shell_dir.join("starship.toml").display(),
+            _starship.display(),
+            shell_dir.join("starship.toml").display(),
+            _starship.display(),
+        )
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("PATH starship"),
+        "hook resolved Starship through PATH"
+    );
+}
+
+#[test]
+fn shell_hook_preserves_supported_prompt_command_customization() {
+    let temporary = tempfile::tempdir().unwrap();
+    let (hook, shell_dir, _starship, log) = hook_fixture(&temporary);
+    write_mode(&shell_dir.join("prompt"), "starship\n", 0o640);
+    write_mode(
+        &shell_dir.join("starship.toml"),
+        "format = \"$character\"\n",
+        0o640,
+    );
+
+    let output = run_hook(
+        &hook,
+        r#"PS1=native-prompt; caller_prompt_command() { printf 'caller-customization\n'; }; PROMPT_COMMAND=caller_prompt_command; . "$GASCAN_TEST_HOOK"; printf 'COMMAND=%s\nPRESERVED=%s\n' "$PROMPT_COMMAND" "$STARSHIP_PROMPT_COMMAND"; starship_precmd"#,
+        &log,
+        false,
+        false,
+        true,
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        b"COMMAND=starship_precmd\nPRESERVED=caller_prompt_command\ncaller-customization\nstable-runtime-prompt\n"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("gascan:"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn shell_hook_warns_once_and_returns_success_when_starship_is_unavailable() {
+    let temporary = tempfile::tempdir().unwrap();
+    let (hook, shell_dir, _starship, log) = hook_fixture(&temporary);
+    write_mode(&shell_dir.join("prompt"), "starship\n", 0o640);
+    write_mode(
+        &shell_dir.join("starship.toml"),
+        "format = \"$character\"\n",
+        0o640,
+    );
+    let output = run_hook(
+        &hook,
+        r#"PS1='native-prompt'; . "$GASCAN_TEST_HOOK"; . "$GASCAN_TEST_HOOK"; if declare -p __gascan_starship_euid >/dev/null 2>&1; then helper=set; else helper=unset; fi; printf '%s|%s\n' "$PS1" "$helper""#,
+        &log,
+        true,
+        false,
+        true,
+    );
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"native-prompt|unset\n");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr)
+            .matches("gascan: Starship prompt unavailable; using standard Bash prompt.")
+            .count(),
+        1,
+        "stderr: {}\nlog: {}",
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+
+    let before = fs::read_to_string(&log).unwrap_or_default();
+    let debug_trap = run_hook(
+        &hook,
+        r#"PS1=native-prompt; set -T; trap 'if [ "$BASH_SUBSHELL" -gt 0 ]; then starship_precmd() { printf attacker; }; STARSHIP_START_TIME=attacker; fi' DEBUG; before=$(trap -p DEBUG); . "$GASCAN_TEST_HOOK"; after=$(trap -p DEBUG); if declare -F starship_precmd >/dev/null; then function=present; else function=absent; fi; printf 'PS1=%s\nFUNCTION=%s\nSTART=%s\nBEFORE=%s\nAFTER=%s\n' "$PS1" "$function" "${STARSHIP_START_TIME-unset}" "$before" "$after""#,
+        &log,
+        false,
+        false,
+        true,
+    );
+    assert!(debug_trap.status.success());
+    let debug_stdout = String::from_utf8_lossy(&debug_trap.stdout);
+    assert!(
+        debug_stdout.contains("PS1=native-prompt\n"),
+        "{debug_stdout}"
+    );
+    assert!(debug_stdout.contains("FUNCTION=absent\n"), "{debug_stdout}");
+    assert!(debug_stdout.contains("START=unset\n"), "{debug_stdout}");
+    let trap_line = "trap -- 'if [ \"$BASH_SUBSHELL\" -gt 0 ]; then starship_precmd() { printf attacker; }; STARSHIP_START_TIME=attacker; fi' DEBUG";
+    assert!(
+        debug_stdout.contains(&format!("BEFORE={trap_line}\nAFTER={trap_line}\n")),
+        "{debug_stdout}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&debug_trap.stderr)
+            .matches("gascan: Starship prompt unavailable; using standard Bash prompt.")
+            .count(),
+        1,
+        "{}",
+        String::from_utf8_lossy(&debug_trap.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&log).unwrap_or_default(),
+        before,
+        "inherited DEBUG trap reached Starship"
+    );
+
+    let before = fs::read_to_string(&log).unwrap_or_default();
+    let spoofed_debug_trap = run_hook(
+        &hook,
+        r#"PS1=native-prompt; set -T; builtin trap 'trap() { :; }' DEBUG; before=$(builtin trap -p DEBUG); . "$GASCAN_TEST_HOOK"; after=$(builtin trap -p DEBUG); if declare -F trap >/dev/null; then spoof=present; else spoof=absent; fi; printf 'PS1=%s\nSPOOF=%s\nBEFORE=%s\nAFTER=%s\n' "$PS1" "$spoof" "$before" "$after""#,
+        &log,
+        false,
+        false,
+        true,
+    );
+    assert!(spoofed_debug_trap.status.success());
+    let spoofed_stdout = String::from_utf8_lossy(&spoofed_debug_trap.stdout);
+    assert!(
+        spoofed_stdout.contains("PS1=native-prompt\n"),
+        "{spoofed_stdout}"
+    );
+    assert!(
+        spoofed_stdout.contains("SPOOF=present\n"),
+        "{spoofed_stdout}"
+    );
+    let spoofed_trap_line = "trap -- 'trap() { :; }' DEBUG";
+    assert!(
+        spoofed_stdout.contains(&format!(
+            "BEFORE={spoofed_trap_line}\nAFTER={spoofed_trap_line}\n"
+        )),
+        "{spoofed_stdout}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&spoofed_debug_trap.stderr)
+            .matches("gascan: Starship prompt unavailable; using standard Bash prompt.")
+            .count(),
+        1,
+        "{}",
+        String::from_utf8_lossy(&spoofed_debug_trap.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&log).unwrap_or_default(),
+        before,
+        "spoofed DEBUG trap reached Starship"
+    );
+
+    let before = fs::read_to_string(&log).unwrap_or_default();
+    let self_clearing_debug_trap = run_hook(
+        &hook,
+        r#"PS1=native-prompt; set -T; builtin trap 'builtin trap - DEBUG; STARSHIP_START_TIME=attacker' DEBUG; . "$GASCAN_TEST_HOOK"; printf 'PS1=%s\nSTART=%s\nTRAP=%s\n' "$PS1" "${STARSHIP_START_TIME-unset}" "$(builtin trap -p DEBUG)""#,
+        &log,
+        false,
+        false,
+        true,
+    );
+    assert!(self_clearing_debug_trap.status.success());
+    assert_eq!(
+        self_clearing_debug_trap.stdout,
+        b"PS1=native-prompt\nSTART=attacker\nTRAP=\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&self_clearing_debug_trap.stderr)
+            .matches("gascan: Starship prompt unavailable; using standard Bash prompt.")
+            .count(),
+        1,
+        "{}",
+        String::from_utf8_lossy(&self_clearing_debug_trap.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&log).unwrap_or_default(),
+        before,
+        "self-clearing DEBUG mutation reached Starship"
+    );
+
+    let before = fs::read_to_string(&log).unwrap_or_default();
+    let signal_collision = Command::new("/bin/bash")
+        .args([
+            "--noprofile",
+            "--norc",
+            "-i",
+            "-c",
+            r#"PS1=native-prompt; trap 'starship_precmd() { printf attacker; }; readonly -f starship_precmd' USR1; export GASCAN_TEST_PARENT_PID=$$; . "$GASCAN_TEST_HOOK"; printf 'PS1=%s\nFUNCTION=' "$PS1"; starship_precmd; printf '\n'"#,
+        ])
+        .env("GASCAN_TEST_HOOK", &hook)
+        .env("GASCAN_TEST_LOG", &log)
+        .env("GASCAN_TEST_GENERATION_FAIL", "0")
+        .env("GASCAN_TEST_EVAL_FAIL", "0")
+        .env("GASCAN_TEST_SIGNAL_COLLISION", "1")
+        .env_remove("STARSHIP_SHELL")
+        .env_remove("STARSHIP_SESSION_KEY")
+        .output()
+        .unwrap();
+    assert!(signal_collision.status.success());
+    assert_eq!(
+        signal_collision.stdout,
+        b"PS1=native-prompt\nFUNCTION=attacker\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&signal_collision.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&signal_collision.stderr)
+            .matches("gascan: Starship prompt unavailable; using standard Bash prompt.")
+            .count(),
+        1,
+        "{}",
+        String::from_utf8_lossy(&signal_collision.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .matches("init bash --print-full-init")
+            .count(),
+        before.matches("init bash --print-full-init").count() + 1,
+        "readonly function race did not stop after one generated init"
+    );
+
+    let before = fs::read_to_string(&log).unwrap_or_default();
+    let writable_signal_collision = Command::new("/bin/bash")
+        .args([
+            "--noprofile",
+            "--norc",
+            "-i",
+            "-c",
+            r#"PS1=native-prompt; trap 'starship_precmd() { printf attacker; }' USR1; export GASCAN_TEST_PARENT_PID=$$; . "$GASCAN_TEST_HOOK"; printf 'PS1=%s\nFUNCTION=' "$PS1"; starship_precmd; printf '\n'"#,
+        ])
+        .env("GASCAN_TEST_HOOK", &hook)
+        .env("GASCAN_TEST_LOG", &log)
+        .env("GASCAN_TEST_GENERATION_FAIL", "0")
+        .env("GASCAN_TEST_EVAL_FAIL", "0")
+        .env("GASCAN_TEST_SIGNAL_COLLISION", "1")
+        .env_remove("STARSHIP_SHELL")
+        .env_remove("STARSHIP_SESSION_KEY")
+        .output()
+        .unwrap();
+    assert!(writable_signal_collision.status.success());
+    assert_eq!(
+        writable_signal_collision.stdout,
+        b"PS1=native-prompt\nFUNCTION=attacker\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&writable_signal_collision.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&writable_signal_collision.stderr)
+            .matches("gascan: Starship prompt unavailable; using standard Bash prompt.")
+            .count(),
+        1,
+        "{}",
+        String::from_utf8_lossy(&writable_signal_collision.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .matches("init bash --print-full-init")
+            .count(),
+        before.matches("init bash --print-full-init").count() + 1,
+        "writable function race did not stop after one generated init"
+    );
+
+    for (name, setup) in [
+        (
+            "STARSHIP_CONFIG",
+            "readonly STARSHIP_CONFIG=readonly-config",
+        ),
+        (
+            "STARSHIP_EXECUTABLE",
+            "readonly STARSHIP_EXECUTABLE=readonly-executable",
+        ),
+        ("PATH", "readonly PATH"),
+    ] {
+        let before = fs::read_to_string(&log).unwrap_or_default();
+        let command = format!(
+            "PS1=native-prompt; {setup}; . \"$GASCAN_TEST_HOOK\"; \
+             printf 'survived|%s\\n' \"$PS1\""
+        );
+        let readonly = run_hook(&hook, &command, &log, false, false, true);
+        assert!(
+            readonly.status.success(),
+            "readonly {name} aborted startup: {}",
+            String::from_utf8_lossy(&readonly.stderr)
+        );
+        assert_eq!(readonly.stdout, b"survived|native-prompt\n");
+        assert_eq!(
+            String::from_utf8_lossy(&readonly.stderr)
+                .matches("gascan: Starship prompt unavailable; using standard Bash prompt.")
+                .count(),
+            1,
+            "readonly {name}: {}",
+            String::from_utf8_lossy(&readonly.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(&log).unwrap_or_default(),
+            before,
+            "readonly {name} reached Starship"
+        );
+    }
+
+    for (name, setup, expected) in [
+        (
+            "_starship_set_return function",
+            "_starship_set_return() { printf attacker; }",
+            "function=attacker",
+        ),
+        (
+            "starship_preexec function",
+            "starship_preexec() { printf attacker; }",
+            "function=attacker",
+        ),
+        (
+            "starship_preexec_all function",
+            "starship_preexec_all() { printf attacker; }",
+            "function=attacker",
+        ),
+        (
+            "starship_preexec_ps0 function",
+            "starship_preexec_ps0() { printf attacker; }",
+            "function=attacker",
+        ),
+        (
+            "starship_precmd function",
+            "starship_precmd() { printf attacker; }",
+            "function=attacker",
+        ),
+        (
+            "readonly function",
+            "starship_precmd() { printf attacker; }; readonly -f starship_precmd",
+            "function=attacker",
+        ),
+        (
+            "STARSHIP_PREEXEC_READY variable",
+            "STARSHIP_PREEXEC_READY=attacker",
+            "variable=attacker",
+        ),
+        (
+            "STARSHIP_START_TIME variable",
+            "STARSHIP_START_TIME=attacker",
+            "variable=attacker",
+        ),
+        (
+            "STARSHIP_CMD_STATUS variable",
+            "STARSHIP_CMD_STATUS=attacker",
+            "variable=attacker",
+        ),
+        (
+            "STARSHIP_PIPE_STATUS variable",
+            "STARSHIP_PIPE_STATUS=attacker",
+            "variable=attacker",
+        ),
+        (
+            "STARSHIP_END_TIME variable",
+            "STARSHIP_END_TIME=attacker",
+            "variable=attacker",
+        ),
+        (
+            "STARSHIP_DURATION variable",
+            "STARSHIP_DURATION=attacker",
+            "variable=attacker",
+        ),
+        (
+            "STARSHIP_PROMPT_COMMAND variable",
+            "STARSHIP_PROMPT_COMMAND=attacker",
+            "variable=attacker",
+        ),
+        (
+            "STARSHIP_DEBUG_TRAP variable",
+            "STARSHIP_DEBUG_TRAP=attacker",
+            "variable=attacker",
+        ),
+        (
+            "STARSHIP_SHELL variable",
+            "STARSHIP_SHELL=attacker",
+            "variable=attacker",
+        ),
+        (
+            "STARSHIP_SESSION_KEY variable",
+            "STARSHIP_SESSION_KEY=attacker",
+            "variable=attacker",
+        ),
+    ] {
+        let before = fs::read_to_string(&log).unwrap_or_default();
+        let variable_name = setup.split('=').next().unwrap();
+        let inspection = if name.contains("variable") {
+            format!("printf 'variable=%s\\n' \"${{{variable_name}}}\"")
+        } else if name.starts_with("_starship_set_return") {
+            "printf 'function='; _starship_set_return; printf '\\n'".to_owned()
+        } else if name.starts_with("starship_preexec_all") {
+            "printf 'function='; starship_preexec_all; printf '\\n'".to_owned()
+        } else if name.starts_with("starship_preexec_ps0") {
+            "printf 'function='; starship_preexec_ps0; printf '\\n'".to_owned()
+        } else if name.starts_with("starship_preexec ") {
+            "printf 'function='; starship_preexec; printf '\\n'".to_owned()
+        } else {
+            "printf 'function='; starship_precmd; printf '\\n'".to_owned()
+        };
+        let command = format!(
+            "PS1=native-prompt; {setup}; . \"$GASCAN_TEST_HOOK\"; \
+             {inspection}; printf 'PS1=%s\\n' \"$PS1\""
+        );
+        let collision = run_hook(&hook, &command, &log, false, false, true);
+        assert!(
+            collision.status.success(),
+            "{name} collision aborted startup: {}",
+            String::from_utf8_lossy(&collision.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&collision.stdout).contains(expected),
+            "{name}: {}",
+            String::from_utf8_lossy(&collision.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&collision.stdout).contains("PS1=native-prompt"),
+            "{name}: {}",
+            String::from_utf8_lossy(&collision.stdout)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&collision.stderr)
+                .matches("gascan: Starship prompt unavailable; using standard Bash prompt.")
+                .count(),
+            1,
+            "{name}: {}",
+            String::from_utf8_lossy(&collision.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(&log).unwrap_or_default(),
+            before,
+            "{name} collision reached Starship"
+        );
+    }
+
+    let partial = run_hook(
+        &hook,
+        r#"PS1='native-prompt'; PS2='native-continuation'; PROMPT_COMMAND='native-command'; STARSHIP_CONFIG='old-config'; STARSHIP_EXECUTABLE='old-executable'; trap 'STARSHIP_NATIVE_TRAP=1' DEBUG; . "$GASCAN_TEST_HOOK"; declare -F starship_partial_leak >/dev/null && printf 'function=leaked\n'; if declare -p __gascan_starship_euid >/dev/null 2>&1; then helper=set; else helper=unset; fi; printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$PS1" "$PS2" "$PROMPT_COMMAND" "$STARSHIP_CONFIG" "$STARSHIP_EXECUTABLE" "${STARSHIP_PARTIAL-unset}" "$(trap -p DEBUG)" "$(declare -p STARSHIP_CONFIG)" "$(declare -p STARSHIP_EXECUTABLE)" "$helper""#,
+        &log,
+        false,
+        true,
+        true,
+    );
+    assert!(partial.status.success());
+    assert_eq!(
+        partial.stdout,
+        b"native-prompt|native-continuation|native-command|old-config|old-executable|unset|trap -- 'STARSHIP_NATIVE_TRAP=1' DEBUG|declare -- STARSHIP_CONFIG=\"old-config\"|declare -- STARSHIP_EXECUTABLE=\"old-executable\"|unset\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&partial.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&partial.stdout).contains("function=leaked"),
+        "partial full init leaked a function"
+    );
+
+    fs::write(shell_dir.join("prompt"), "starship\nextra\n").unwrap();
+    let malformed = run_hook(
+        &hook,
+        r#"PS1='native-prompt'; . "$GASCAN_TEST_HOOK"; printf '%s\n' "$PS1""#,
+        &log,
+        false,
+        false,
+        true,
+    );
+    assert!(malformed.status.success());
+    assert_eq!(malformed.stdout, b"native-prompt\n");
+    assert_eq!(
+        String::from_utf8_lossy(&malformed.stderr)
+            .matches("gascan: Starship prompt unavailable; using standard Bash prompt.")
+            .count(),
+        1
+    );
+
+    write_mode(&shell_dir.join("prompt"), "starship\n", 0o640);
+    write_mode(
+        &shell_dir.join("starship.toml"),
+        "format = \"tampered\"\n",
+        0o640,
+    );
+    let log_before = fs::read_to_string(&log).unwrap();
+    let changed_config = run_hook(
+        &hook,
+        r#"PS1='native-prompt'; . "$GASCAN_TEST_HOOK"; if declare -p __gascan_starship_euid >/dev/null 2>&1; then helper=set; else helper=unset; fi; printf '%s|%s\n' "$PS1" "$helper""#,
+        &log,
+        false,
+        false,
+        true,
+    );
+    assert!(changed_config.status.success());
+    assert_eq!(changed_config.stdout, b"native-prompt|unset\n");
+    assert_eq!(
+        String::from_utf8_lossy(&changed_config.stderr)
+            .matches("gascan: Starship prompt unavailable; using standard Bash prompt.")
+            .count(),
+        1
+    );
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        log_before,
+        "hook invoked Starship with a config that differs from the immutable preset"
+    );
+}
+
+#[test]
+fn managed_starship_presets_have_exact_order_and_font_boundaries() {
+    let compatible =
+        fs::read_to_string(root().join("images/workspace/etc/gascan/starship.toml")).unwrap();
+    let nerd =
+        fs::read_to_string(root().join("images/workspace/etc/gascan/starship-nerd-font.toml"))
+            .unwrap();
+    let expected_order = concat!(
+        "$username",
+        "$hostname",
+        "$directory",
+        "$git_branch",
+        "$git_status",
+        "$elixir",
+        "$erlang",
+        "$golang",
+        "$java",
+        "$nodejs",
+        "$python",
+        "$ruby",
+        "$rust",
+        "$status",
+        "$cmd_duration",
+        "$line_break",
+        "$character"
+    );
+    for (name, source) in [("compatible", &compatible), ("nerd", &nerd)] {
+        let preset: toml::Value = toml::from_str(source).unwrap();
+        assert_eq!(preset["format"].as_str(), Some(expected_order), "{name}");
+        for module in [
+            "username",
+            "hostname",
+            "directory",
+            "git_branch",
+            "git_status",
+            "elixir",
+            "erlang",
+            "golang",
+            "java",
+            "nodejs",
+            "python",
+            "ruby",
+            "rust",
+            "status",
+            "cmd_duration",
+            "character",
+        ] {
+            assert!(preset.get(module).is_some(), "{name} omits {module}");
+        }
+    }
+    assert!(
+        !compatible
+            .chars()
+            .any(|c| ('\u{e000}'..='\u{f8ff}').contains(&c))
+    );
+    assert!(nerd.chars().any(|c| ('\u{e000}'..='\u{f8ff}').contains(&c)));
 }
 
 #[test]

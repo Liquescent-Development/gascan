@@ -15,7 +15,7 @@ use tempfile::TempDir;
 
 const REVIEWED_GASCAMP_REVISION: &str = "f6b248c5926240856dbea83d1d2c5c90ea1c1456";
 
-const REQUIRED: [&str; 19] = [
+const REQUIRED: [&str; 20] = [
     "Dockerfile",
     ".artifacts/mise-linux-arm64",
     ".artifacts/playwright-chromium-reviewed",
@@ -33,11 +33,12 @@ const REQUIRED: [&str; 19] = [
     "workstation/npm-cache",
     "workstation/package-lock.json",
     "workstation/package.json",
+    "workstation/starship.tar.gz",
     "workstation/target-lock.toml",
     "tests/image/system-tools.txt",
 ];
 
-const NATIVE_FIXTURES: [(&str, &[u8], &str, &str); 4] = [
+const NATIVE_FIXTURES: [(&str, &[u8], &str, &str); 5] = [
     (
         "claude-native.tgz",
         b"claude native fixture\n",
@@ -47,6 +48,12 @@ const NATIVE_FIXTURES: [(&str, &[u8], &str, &str); 4] = [
     ("glab.tar.gz", b"glab fixture\n", "tar_gz", "gitlab.com"),
     ("herdr", b"herdr fixture\n", "raw_binary", "github.com"),
     ("neovim.tar.gz", b"neovim fixture\n", "tar_gz", "github.com"),
+    (
+        "starship.tar.gz",
+        b"starship fixture\n",
+        "tar_gz",
+        "github.com",
+    ),
 ];
 const NPM_FIXTURES: [(&str, &[u8]); 5] = [
     ("claude", b"claude npm fixture\n"),
@@ -333,6 +340,99 @@ fn every_local_dockerfile_copy_source_is_sealed_with_exact_bytes_and_mode() {
 }
 
 #[test]
+fn managed_shell_inputs_are_sealed_into_the_connected_context() {
+    let fixture = Fixture::new();
+    let output = fixture.run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for (path, mode) in [
+        ("images/workspace/bin/configure-shell-home", 0o555),
+        ("images/workspace/etc/gascan/bashrc", 0o444),
+        ("images/workspace/etc/gascan/starship.toml", 0o444),
+        ("images/workspace/etc/gascan/starship-nerd-font.toml", 0o444),
+    ] {
+        let original = fixture.repository.join(path);
+        let sealed = fixture.context.join(path);
+        assert_eq!(fs::read(&sealed).unwrap(), fs::read(&original).unwrap());
+        assert_eq!(
+            fs::metadata(&sealed).unwrap().permissions().mode() & 0o777,
+            mode,
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn managed_shell_directory_creation_precedes_the_sealed_hook_copy() {
+    let fixture = Fixture::new();
+    let output = fixture.run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dockerfile = fs::read_to_string(fixture.context.join("Dockerfile")).unwrap();
+    let directory = dockerfile
+        .find("RUN install -d -o root -g root -m 0555 /etc/gascan")
+        .unwrap();
+    let hook = dockerfile
+        .find("COPY --chmod=0444 images/workspace/etc/gascan/bashrc /etc/gascan/bashrc")
+        .unwrap();
+    assert!(
+        directory < hook,
+        "connected context can reproduce an untraversable implicit /etc/gascan"
+    );
+}
+
+fn migration_execution_position(dockerfile: &str) -> usize {
+    dockerfile
+        .find("&& /usr/local/bin/migrate-workspace-identity")
+        .unwrap()
+}
+
+#[test]
+fn connected_context_home_order_uses_migration_execution() {
+    let dockerfile = "\
+COPY helper /usr/local/bin/migrate-workspace-identity
+chown workspace:workspace /home/workspace
+&& /usr/local/bin/migrate-workspace-identity
+";
+    assert!(
+        migration_execution_position(dockerfile)
+            > dockerfile
+                .find("chown workspace:workspace /home/workspace")
+                .unwrap()
+    );
+}
+
+#[test]
+fn connected_context_preserves_workspace_home_normalization() {
+    let fixture = Fixture::new();
+    let output = fixture.run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dockerfile = fs::read_to_string(fixture.context.join("Dockerfile")).unwrap();
+    let migration = migration_execution_position(&dockerfile);
+    let owner = dockerfile
+        .find("chown workspace:workspace /home/workspace")
+        .unwrap();
+    let mode = dockerfile.find("chmod 0755 /home/workspace").unwrap();
+    let private = dockerfile
+        .find("install -d -o workspace -g workspace -m 0700")
+        .unwrap();
+    let config = dockerfile
+        .find("install -d -o root -g workspace -m 1770 /home/workspace/.config")
+        .unwrap();
+    assert!(migration < owner && owner < mode && mode < private && private < config);
+}
+
+#[test]
 fn docker_copy_parser_is_structural_and_fail_closed() {
     let parsed = parse_dockerfile_copies("  copy --chmod=0555 a b /dest\nCOPY --from=builder /out /dest\nCOPY name--from=value /dest\n").unwrap();
     assert_eq!(parsed[0].sources, ["a", "b"]);
@@ -488,8 +588,16 @@ fn connected_lock(mode: &str, package: &[u8], package_lock: &[u8]) -> String {
             )
         } else {
             let key = name.split('.').next().unwrap();
+            let (version, url) = if key == "starship" {
+                (
+                    "1.25.1",
+                    "https://github.com/starship/starship/releases/download/v1.25.1/starship-aarch64-unknown-linux-musl.tar.gz".to_owned(),
+                )
+            } else {
+                ("1.0.0", format!("https://{host}/fixture/{name}"))
+            };
             format!(
-                "\n[workstation_artifacts.{key}]\nversion = \"1.0.0\"\nurl = \"https://{host}/fixture/{name}\"\nsha256 = \"{:x}\"\nsize = {}\nplatform = \"linux-arm64\"\nkind = \"{kind}\"\n",
+                "\n[workstation_artifacts.{key}]\nversion = \"{version}\"\nurl = \"{url}\"\nsha256 = \"{:x}\"\nsize = {}\nplatform = \"linux-arm64\"\nkind = \"{kind}\"\n",
                 Sha256::digest(bytes),
                 bytes.len(),
             )
@@ -1230,6 +1338,24 @@ fn connected_gascamp_revision_must_match_the_reviewed_revision() {
 }
 
 #[test]
+fn connected_starship_lock_requires_the_exact_reviewed_release_path() {
+    let fixture = Fixture::new();
+    let exact = "https://github.com/starship/starship/releases/download/v1.25.1/starship-aarch64-unknown-linux-musl.tar.gz";
+    let changed = fs::read_to_string(&fixture.lock).unwrap().replace(
+        exact,
+        "https://github.com/unreviewed/repository/releases/tool",
+    );
+    fs::write(&fixture.lock, changed).unwrap();
+    fixture.refresh_lock_receipt();
+    let output = fixture.run();
+    assert!(
+        !output.status.success(),
+        "accepted an unreviewed Starship URL"
+    );
+    assert!(!fixture.context.exists());
+}
+
+#[test]
 fn published_tree_is_read_only() {
     let fixture = Fixture::new();
     assert!(fixture.run().status.success());
@@ -1418,9 +1544,10 @@ case "$*" in
   *'prepare-workspace-context -- --connected-lock'*)
     printf '%s\n%s\n%s\n%s\n%s\n' 'ubuntu@sha256:{digest}' 'https://example.invalid/mise' '{mise}' 'https://example.invalid/chromium' '{chromium}' ;;
   *'prepare-workspace-context -- --workstation-lock'*)
-    printf '%s\n%s\n%s\n' \
+    printf '%s\n%s\n%s\n%s\n' \
       'receipt	prefetch-lock.sha256	{receipt}' \
       'native	herdr	workstation-github	https://github.com/example/herdr	{native}	1' \
+      'native	starship.tar.gz	workstation-github	https://github.com/example/starship	{native}	1' \
       'npm	npm-cache/_cacache/content-v2/sha512/aa/bb/cc	workstation-npm	https://registry.npmjs.org/example/-/example.tgz	sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==	209715200' ;;
   *'prepare-workspace-context -- --publish-workstation-cache'*)
     mv "$previous/workstation" "$last" ;;
@@ -1484,4 +1611,8 @@ esac
         "a".repeat(64)
     )));
     assert!(calls.contains(&format!("image inspect ubuntu@sha256:{}\n", "a".repeat(64))));
+    assert!(
+        root.join(".artifacts/workstation/starship.tar.gz")
+            .is_file()
+    );
 }

@@ -41,6 +41,23 @@ fn write_setup(root: &Utf8Path, relative: &str, bytes: &[u8]) -> TestResult {
     Ok(())
 }
 
+fn write_setup_and_shell(
+    root: &Utf8Path,
+    relative: &str,
+    bytes: &[u8],
+    prompt: &str,
+) -> TestResult {
+    if let Some(parent) = root.join(relative).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(root.join(relative), bytes)?;
+    std::fs::write(
+        root.join("gascan.toml"),
+        format!("version = 1\nsetup = {relative:?}\n[shell]\nprompt = {prompt:?}\n"),
+    )?;
+    Ok(())
+}
+
 fn spec(root: &Utf8Path, name: &str) -> TestResult<SandboxSpec> {
     Ok(SandboxSpec::from_root(name, root, Manifest::load(root)?)?)
 }
@@ -78,6 +95,147 @@ async fn queue_successful_setup(runtime: &FakeRuntime, bytes: &[u8], relative: &
             (Vec::new(), Vec::new(), 0),
         ])
         .await;
+}
+
+#[tokio::test]
+async fn failed_shell_configuration_preserves_state_skips_later_work_and_retries() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    std::fs::write(root.join("gascan.toml"), "version = 1\n")?;
+    let runtime = FakeRuntime::default();
+    let service = SandboxService::new(
+        runtime.clone(),
+        gascand::Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    );
+    let initial = spec(root, "shell-retry")?;
+    service.up(UpRequest::new(initial.clone())).await?;
+    let prior_shell_hash = service
+        .status(initial.id())?
+        .ok_or("initial record")?
+        .tool_resolution
+        .and_then(|resolution| resolution.details.get("shell_hash").cloned());
+
+    let setup = b"printf configured\n";
+    write_setup_and_shell(root, "setup.sh", setup, "starship")?;
+    let desired = spec(root, "shell-retry")?;
+    let shell_argv = [
+        "/usr/bin/sudo",
+        "-n",
+        "/usr/local/bin/configure-shell-home",
+        "starship",
+    ];
+    runtime
+        .queue_exec_result_for_argv(
+            shell_argv,
+            Vec::new(),
+            b"managed shell rejected".to_vec(),
+            23,
+        )
+        .await;
+    let before_failure = runtime.calls().await.len();
+
+    assert!(
+        service
+            .apply(UpRequest::new(desired.clone()))
+            .await
+            .is_err()
+    );
+    let failed_calls = runtime.calls().await;
+    let failed_execs = failed_calls[before_failure..]
+        .iter()
+        .filter_map(|call| match call {
+            RuntimeCall::Exec(request) => Some(request),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        failed_execs
+            .iter()
+            .filter(|request| request.argv == shell_argv)
+            .count(),
+        1
+    );
+    assert!(failed_execs.iter().all(|request| {
+        request.argv.first().map(String::as_str) != Some("/bin/bash")
+            && request.argv.first().map(String::as_str) != Some("/usr/local/bin/select-gascamp")
+    }));
+    let failure_events = service
+        .store()
+        .operation_events(service.latest_operation()?.ok_or("failed operation")?.id)?;
+    assert!(failure_events.iter().all(|event| {
+        event
+            .details
+            .as_ref()
+            .and_then(|details| details.get("phase"))
+            .and_then(Value::as_str)
+            != Some("before_health")
+    }));
+    assert_eq!(
+        service
+            .status(desired.id())?
+            .ok_or("failed record")?
+            .tool_resolution
+            .and_then(|resolution| resolution.details.get("shell_hash").cloned()),
+        prior_shell_hash
+    );
+
+    runtime
+        .queue_exec_results([
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (digest_stdout(setup, "setup.sh"), Vec::new(), 0),
+            (Vec::new(), Vec::new(), 0),
+            (
+                br#"{"source":"bundled","revision":"shell-retry"}"#.to_vec(),
+                Vec::new(),
+                0,
+            ),
+        ])
+        .await;
+    let before_retry = runtime.calls().await.len();
+    let operation = service.apply(UpRequest::new(desired.clone())).await?;
+    let retry_calls = runtime.calls().await;
+    let retry_execs = retry_calls[before_retry..]
+        .iter()
+        .filter_map(|call| match call {
+            RuntimeCall::Exec(request) => Some(request),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        retry_execs
+            .iter()
+            .filter(|request| request.argv == shell_argv)
+            .count(),
+        1
+    );
+    assert!(
+        retry_execs
+            .iter()
+            .any(|request| { request.argv == ["/bin/bash", "/workspace/setup.sh"] })
+    );
+    assert!(
+        service
+            .store()
+            .operation_events(operation.id)?
+            .iter()
+            .filter_map(|event| event.details.as_ref())
+            .any(|details| {
+                details.get("step").and_then(Value::as_str) == Some("configure_shell")
+            })
+    );
+    assert_ne!(
+        service
+            .status(desired.id())?
+            .ok_or("retried record")?
+            .tool_resolution
+            .and_then(|resolution| resolution.details.get("shell_hash").cloned()),
+        prior_shell_hash
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -174,11 +332,20 @@ async fn setup_uses_literal_guest_argv_empty_environments_and_refreshes_moved_pa
     );
     assert_eq!(
         execs[4].argv,
+        [
+            "/usr/bin/sudo",
+            "-n",
+            "/usr/local/bin/configure-shell-home",
+            "standard",
+        ]
+    );
+    assert_eq!(
+        execs[5].argv,
         ["/usr/bin/sha256sum", "/workspace/.gascan/first.sh"]
     );
-    assert_eq!(execs[5].argv, ["/bin/bash", "/workspace/.gascan/first.sh"]);
-    assert!(execs[4].environment.is_empty());
+    assert_eq!(execs[6].argv, ["/bin/bash", "/workspace/.gascan/first.sh"]);
     assert!(execs[5].environment.is_empty());
+    assert!(execs[6].environment.is_empty());
 
     let before_apply = calls.len();
     write_setup(root, ".gascan/moved.sh", bytes)?;

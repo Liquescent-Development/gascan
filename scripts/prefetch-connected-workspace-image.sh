@@ -53,9 +53,15 @@ while IFS=$'\t' read -r kind relative class url digest bound; do
       case "$relative" in
         ""|/*|*../*|../*|*/../*|*/..) die "unsafe workstation artifact path" ;;
       esac
-      case "$class" in
-        workstation-github|workstation-gitlab|workstation-npm|workstation-npm-native) ;;
-        *) die "invalid workstation artifact class" ;;
+      case "$kind:$class:$relative" in
+        native:workstation-github:herdr|\
+        native:workstation-github:neovim.tar.gz|\
+        native:workstation-github:starship.tar.gz|\
+        native:workstation-gitlab:glab.tar.gz|\
+        native:workstation-npm-native:claude-native.tgz|\
+        native:workstation-npm-native:npm-cli.tgz|\
+        npm:workstation-npm:npm-cache/_cacache/content-v2/sha512/*) ;;
+        *) die "invalid workstation artifact record" ;;
       esac
       mkdir -p "$(dirname "$workstation/$relative")"
       run_tool fetch-image-artifact "$class" "$url" "$digest" \

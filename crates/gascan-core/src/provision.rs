@@ -1,4 +1,4 @@
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, ShellPrompt};
 use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
 use rustix::fd::OwnedFd;
 use rustix::fs::{FileType, Mode, OFlags};
@@ -12,6 +12,7 @@ use thiserror::Error;
 pub struct AppliedState {
     tool_hash: Option<String>,
     setup_sha256: Option<String>,
+    shell_hash: Option<String>,
 }
 
 impl AppliedState {
@@ -19,6 +20,7 @@ impl AppliedState {
         Self {
             tool_hash: None,
             setup_sha256: None,
+            shell_hash: None,
         }
     }
 
@@ -26,6 +28,7 @@ impl AppliedState {
         Self {
             tool_hash: Some(hash.into()),
             setup_sha256: None,
+            shell_hash: None,
         }
     }
 
@@ -33,13 +36,19 @@ impl AppliedState {
         Self {
             tool_hash: None,
             setup_sha256: Some(sha256.into()),
+            shell_hash: None,
         }
     }
 
-    pub fn with_hashes(tool_hash: Option<String>, setup_sha256: Option<String>) -> Self {
+    pub fn with_hashes(
+        tool_hash: Option<String>,
+        setup_sha256: Option<String>,
+        shell_hash: Option<String>,
+    ) -> Self {
         Self {
             tool_hash,
             setup_sha256,
+            shell_hash,
         }
     }
 }
@@ -64,6 +73,7 @@ impl SetupScript {
 pub enum ProvisionStep {
     WriteSafeMiseConfig,
     InstallTools,
+    ConfigureShell,
     RunSetup,
     VerifyGascamp,
     HealthCheck,
@@ -75,6 +85,7 @@ impl ProvisionStep {
         match self {
             Self::WriteSafeMiseConfig => "write_safe_mise_config",
             Self::InstallTools => "install_tools",
+            Self::ConfigureShell => "configure_shell",
             Self::RunSetup => "run_setup",
             Self::VerifyGascamp => "verify_gascamp",
             Self::HealthCheck => "health_check",
@@ -89,6 +100,9 @@ pub struct ProvisionPlan {
     desired_tools: BTreeMap<String, String>,
     desired_tool_hash: String,
     tools_changed: bool,
+    desired_shell_hash: String,
+    shell_prompt: ShellPrompt,
+    shell_changed: bool,
     setup_script: Option<SetupScript>,
     setup_changed: bool,
 }
@@ -104,6 +118,18 @@ impl ProvisionPlan {
 
     pub const fn tools_changed(&self) -> bool {
         self.tools_changed
+    }
+
+    pub fn desired_shell_hash(&self) -> &str {
+        &self.desired_shell_hash
+    }
+
+    pub const fn shell_prompt(&self) -> ShellPrompt {
+        self.shell_prompt
+    }
+
+    pub const fn shell_changed(&self) -> bool {
+        self.shell_changed
     }
 
     pub const fn setup_script(&self) -> Option<&SetupScript> {
@@ -144,10 +170,16 @@ impl ProvisioningPlanner {
             Some(applied_hash) => applied_hash != desired_tool_hash,
             None => !desired_tools.is_empty(),
         };
+        let shell_prompt = manifest.shell().prompt();
+        let desired_shell_hash = desired_shell_hash(shell_prompt);
+        let shell_changed = applied.shell_hash.as_deref() != Some(&desired_shell_hash);
         let mut steps = Vec::new();
         if tools_changed {
             steps.push(ProvisionStep::WriteSafeMiseConfig);
             steps.push(ProvisionStep::InstallTools);
+        }
+        if shell_changed {
+            steps.push(ProvisionStep::ConfigureShell);
         }
         if manifest.setup().is_some() {
             steps.push(ProvisionStep::RunSetup);
@@ -159,6 +191,9 @@ impl ProvisioningPlanner {
             desired_tools,
             desired_tool_hash,
             tools_changed,
+            desired_shell_hash,
+            shell_prompt,
+            shell_changed,
             setup_script: None,
             setup_changed: false,
         })
@@ -190,6 +225,20 @@ impl ProvisioningPlanner {
         plan.setup_changed = setup_changed;
         Ok(plan)
     }
+}
+
+const MANAGED_SHELL_CONFIG_VERSION: &str = "gascan-managed-shell-v1";
+
+fn desired_shell_hash(prompt: ShellPrompt) -> String {
+    let mut hash = Sha256::new();
+    hash.update(MANAGED_SHELL_CONFIG_VERSION.as_bytes());
+    hash.update([0]);
+    hash.update(match prompt {
+        ShellPrompt::Standard => b"standard".as_slice(),
+        ShellPrompt::Starship => b"starship".as_slice(),
+        ShellPrompt::StarshipNerdFont => b"starship-nerd-font".as_slice(),
+    });
+    format!("sha256:{:x}", hash.finalize())
 }
 
 fn resolve_setup(

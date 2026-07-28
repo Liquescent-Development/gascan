@@ -142,7 +142,13 @@ fn populate_minimal_workstation(repository: &Path, cache: &Path) {
     let native = b"native\n";
     let npm_bootstrap = b"npm bootstrap\n";
     fs::create_dir_all(cache.join("workstation")).unwrap();
-    for name in ["claude-native.tgz", "glab.tar.gz", "herdr", "neovim.tar.gz"] {
+    for name in [
+        "claude-native.tgz",
+        "glab.tar.gz",
+        "herdr",
+        "neovim.tar.gz",
+        "starship.tar.gz",
+    ] {
         fs::write(cache.join("workstation").join(name), native).unwrap();
     }
     fs::write(cache.join("workstation/npm-cli.tgz"), npm_bootstrap).unwrap();
@@ -154,8 +160,9 @@ fn populate_minimal_workstation(repository: &Path, cache: &Path) {
         ("herdr", "raw_binary", "github.com"),
         ("neovim", "tar_gz", "github.com"),
         ("pi", "npm_tgz", "registry.npmjs.org"),
+        ("starship", "tar_gz", "github.com"),
     ] {
-        let bytes: &[u8] = if matches!(name, "glab" | "herdr" | "neovim") {
+        let bytes: &[u8] = if matches!(name, "glab" | "herdr" | "neovim" | "starship") {
             native
         } else {
             npm_fixtures
@@ -163,8 +170,16 @@ fn populate_minimal_workstation(repository: &Path, cache: &Path) {
                 .find_map(|(candidate, bytes)| (*candidate == name).then_some(*bytes))
                 .unwrap()
         };
+        let (version, url) = if name == "starship" {
+            (
+                "1.25.1",
+                "https://github.com/starship/starship/releases/download/v1.25.1/starship-aarch64-unknown-linux-musl.tar.gz".to_owned(),
+            )
+        } else {
+            ("1.0.0", format!("https://{host}/fixture/{name}"))
+        };
         artifacts.push_str(&format!(
-            "\n[workstation_artifacts.{name}]\nversion = \"1.0.0\"\nurl = \"https://{host}/fixture/{name}\"\nsha256 = \"{:x}\"\nsize = {}\nplatform = \"linux-arm64\"\nkind = \"{kind}\"\n",
+            "\n[workstation_artifacts.{name}]\nversion = \"{version}\"\nurl = \"{url}\"\nsha256 = \"{:x}\"\nsize = {}\nplatform = \"linux-arm64\"\nkind = \"{kind}\"\n",
             Sha256::digest(bytes),
             bytes.len(),
         ));

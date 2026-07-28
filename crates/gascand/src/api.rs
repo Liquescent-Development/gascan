@@ -561,6 +561,7 @@ fn wire_event(event: StoredEvent) -> v1::OperationEvent {
     let provision_step = match details.get("step").and_then(serde_json::Value::as_str) {
         Some("write_safe_mise_config") => v1::ProvisionStep::WriteSafeMiseConfig,
         Some("install_tools") => v1::ProvisionStep::InstallTools,
+        Some("configure_shell") => v1::ProvisionStep::ConfigureShell,
         Some("run_setup") => v1::ProvisionStep::RunSetup,
         Some("verify_gascamp") => v1::ProvisionStep::VerifyGascamp,
         Some("health_check") => v1::ProvisionStep::HealthCheck,
@@ -1743,7 +1744,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             tty: true,
         });
         let argv = if command.argv.is_empty() {
-            vec!["sh".to_owned()]
+            vec!["/bin/bash".to_owned(), "--login".to_owned()]
         } else {
             argv_from_wire(command.argv).map_err(ApiInputError::status)?
         };
@@ -2876,6 +2877,24 @@ mod tests {
                 .updated_at
                 .map(|timestamp| (timestamp.seconds, timestamp.nanos)),
             Some((1_725_000_001, 456_000_000))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wire_metadata_maps_configure_shell_step() -> Result<(), Box<dyn std::error::Error>> {
+        let event = wire_event(OperationEvent {
+            sequence: 2,
+            operation_id: OperationId::new(17)?,
+            status: OperationStatus::Completed,
+            details: Some(json!({"step":"configure_shell"})),
+            error_code: None,
+            timestamp_millis: 1_725_000_000_123,
+        });
+
+        assert_eq!(
+            event.provision_step,
+            v1::ProvisionStep::ConfigureShell as i32
         );
         Ok(())
     }

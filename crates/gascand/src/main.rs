@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-use gascan_apple::{AppleBackend, AppleProbe, ProcessRunner};
+use gascan_apple::{AppleBackend, AppleProbe, CommandRunner, CommandSpec, ProcessRunner};
 use gascan_core::doctor::{DoctorFact, DoctorFacts, DoctorReport};
 use gascan_core::fake_runtime::FakeRuntime;
 use gascan_core::runtime::RuntimeBackend;
@@ -21,6 +21,166 @@ struct ConfiguredProvisioner {
 struct DaemonSshConfig {
     e2e_paths: Option<SshPaths>,
     refresh_doctor: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct E2eCandidateMapping {
+    immutable: String,
+    runtime: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct E2eProcessRunner<R = ProcessRunner> {
+    candidate: Option<E2eCandidateMapping>,
+    runner: R,
+}
+
+impl E2eProcessRunner<ProcessRunner> {
+    fn configured_from_environment() -> Result<Self, Box<dyn std::error::Error>> {
+        if option_env!("CARGO_BIN_NAME") != Some("gascan-e2e-daemon") {
+            return Ok(Self::default());
+        }
+        let immutable = std::env::var("GASCAN_E2E_CANDIDATE_IMAGE").ok();
+        let runtime = std::env::var("GASCAN_E2E_CANDIDATE_RUNTIME_IMAGE").ok();
+        let candidate = match (immutable, runtime) {
+            (None, None) => None,
+            (Some(immutable), Some(runtime)) => {
+                Some(validate_e2e_candidate_mapping(immutable, runtime)?)
+            }
+            _ => return Err("incomplete E2E candidate image mapping".into()),
+        };
+        Ok(Self {
+            candidate,
+            runner: ProcessRunner,
+        })
+    }
+}
+
+impl<R> E2eProcessRunner<R> {
+    #[cfg(test)]
+    fn with_candidate_runner(candidate: E2eCandidateMapping, runner: R) -> Self {
+        Self {
+            candidate: Some(candidate),
+            runner,
+        }
+    }
+
+    fn rewrite(&self, mut spec: CommandSpec) -> CommandSpec {
+        let Some(candidate) = &self.candidate else {
+            return spec;
+        };
+        if spec.program == "container"
+            && spec.args.first().map(String::as_str) == Some("run")
+            && spec.args.last() == Some(&candidate.immutable)
+        {
+            if let Some(image) = spec.args.last_mut() {
+                *image = candidate.runtime.clone();
+            }
+        }
+        spec
+    }
+
+    fn is_local_candidate_pull(&self, spec: &CommandSpec) -> bool {
+        self.candidate.as_ref().is_some_and(|candidate| {
+            spec.program == "container"
+                && spec.args == ["image", "pull", candidate.immutable.as_str()]
+                && spec.stdin.is_empty()
+        })
+    }
+
+    fn should_rehydrate_inspect(&self, spec: &CommandSpec) -> bool {
+        self.candidate.is_some()
+            && spec.program == "container"
+            && spec.args.len() == 2
+            && spec.args.first().map(String::as_str) == Some("inspect")
+    }
+}
+
+fn validate_e2e_candidate_mapping(
+    immutable: String,
+    runtime: String,
+) -> Result<E2eCandidateMapping, Box<dyn std::error::Error>> {
+    if !gascan_core::runtime::immutable_image_reference(&immutable)
+        || !runtime.starts_with("gascan-workspace:")
+        || runtime.contains('/')
+        || immutable
+            .strip_prefix(&runtime)
+            .is_none_or(|suffix| !suffix.starts_with("@sha256:"))
+    {
+        return Err("invalid E2E candidate image mapping".into());
+    }
+    Ok(E2eCandidateMapping { immutable, runtime })
+}
+
+#[async_trait::async_trait]
+impl<R: CommandRunner> CommandRunner for E2eProcessRunner<R> {
+    async fn run(
+        &self,
+        spec: CommandSpec,
+    ) -> Result<gascan_apple::CommandOutput, gascan_core::runtime::RuntimeError> {
+        if self.is_local_candidate_pull(&spec) {
+            return Ok(gascan_apple::CommandOutput {
+                status: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            });
+        }
+        let rehydrate_inspect = self.should_rehydrate_inspect(&spec);
+        let mut output = self.runner.run(self.rewrite(spec)).await?;
+        if rehydrate_inspect {
+            if let Some(candidate) = &self.candidate {
+                output.stdout = rehydrate_e2e_inspect(output.stdout, candidate);
+            }
+        }
+        Ok(output)
+    }
+}
+
+fn rehydrate_e2e_inspect(bytes: Vec<u8>, candidate: &E2eCandidateMapping) -> Vec<u8> {
+    let Some(expected_digest) = candidate
+        .immutable
+        .rsplit_once('@')
+        .map(|(_, digest)| digest)
+    else {
+        return bytes;
+    };
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return bytes;
+    };
+    let Some(records) = value.as_array_mut() else {
+        return bytes;
+    };
+    let mut changed = false;
+    for record in records {
+        let Some(image) = record
+            .as_object_mut()
+            .and_then(|record| record.get_mut("configuration"))
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|configuration| configuration.get_mut("image"))
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        let exact_reference = image.get("reference").and_then(serde_json::Value::as_str)
+            == Some(candidate.runtime.as_str());
+        let exact_digest = image
+            .get("descriptor")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|descriptor| descriptor.get("digest"))
+            .and_then(serde_json::Value::as_str)
+            == Some(expected_digest);
+        if exact_reference && exact_digest {
+            image.insert(
+                "reference".to_owned(),
+                serde_json::Value::String(candidate.immutable.clone()),
+            );
+            changed = true;
+        }
+    }
+    if !changed {
+        return bytes;
+    }
+    serde_json::to_vec(&value).unwrap_or(bytes)
 }
 
 #[async_trait::async_trait]
@@ -78,8 +238,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         BackendSelection::Apple => {
             let doctor = DoctorState::collect(Duration::from_secs(60), production_doctor_report());
             let attach = gascan_apple::AppleAttach::configured_from_environment()?;
+            let runner = E2eProcessRunner::configured_from_environment()?;
             run_daemon(
-                AppleBackend::with_attach(ProcessRunner, attach),
+                AppleBackend::with_attach(runner, attach),
                 store,
                 paths,
                 idle_timeout,
@@ -441,6 +602,183 @@ fn storage_fact(path: &std::path::Path, label: &str) -> DoctorFact {
             "cannot inspect {label} filesystem at {}: {error}",
             path.display()
         )),
+    }
+}
+
+#[cfg(test)]
+mod e2e_candidate_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    const IMMUTABLE: &str = "gascan-workspace:candidate@sha256:\
+        aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const RUNTIME: &str = "gascan-workspace:candidate";
+
+    fn runner() -> Result<E2eProcessRunner, Box<dyn std::error::Error>> {
+        Ok(E2eProcessRunner {
+            candidate: Some(validate_e2e_candidate_mapping(
+                IMMUTABLE.to_owned(),
+                RUNTIME.to_owned(),
+            )?),
+            runner: ProcessRunner,
+        })
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingRunner {
+        commands: Arc<Mutex<Vec<CommandSpec>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CommandRunner for RecordingRunner {
+        async fn run(
+            &self,
+            spec: CommandSpec,
+        ) -> Result<gascan_apple::CommandOutput, gascan_core::runtime::RuntimeError> {
+            self.commands
+                .lock()
+                .map_err(|_| gascan_core::runtime::RuntimeError::CommandIo {
+                    operation: "record E2E command".to_owned(),
+                    message: "lock poisoned".to_owned(),
+                })?
+                .push(spec);
+            Ok(gascan_apple::CommandOutput {
+                status: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn candidate_prepare_is_satisfied_by_the_verified_local_image()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let inner = RecordingRunner::default();
+        let commands = inner.commands.clone();
+        let runner = E2eProcessRunner::with_candidate_runner(
+            validate_e2e_candidate_mapping(IMMUTABLE.to_owned(), RUNTIME.to_owned())?,
+            inner,
+        );
+
+        let output = runner
+            .run(CommandSpec::new("container", ["image", "pull", IMMUTABLE]))
+            .await?;
+        assert_eq!(output.status, 0);
+        assert!(
+            commands
+                .lock()
+                .map_err(|_| "recording lock poisoned")?
+                .is_empty(),
+            "verified local candidate pull reached Apple container"
+        );
+
+        let foreign = CommandSpec::new(
+            "container",
+            [
+                "image",
+                "pull",
+                "ghcr.io/example/workspace@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ],
+        );
+        runner.run(foreign.clone()).await?;
+        assert_eq!(
+            *commands.lock().map_err(|_| "recording lock poisoned")?,
+            [foreign],
+            "non-candidate image preparation must reach Apple container"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rewrites_only_the_matching_final_container_run_image()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let create = CommandSpec::new("container", ["run", "--detach", IMMUTABLE]);
+        assert_eq!(runner()?.rewrite(create).args, ["run", "--detach", RUNTIME]);
+
+        for untouched in [
+            CommandSpec::new("container", ["image", "pull", IMMUTABLE]),
+            CommandSpec::new("container", ["run", "--env", IMMUTABLE, "other:image"]),
+            CommandSpec::new("other", ["run", IMMUTABLE]),
+        ] {
+            assert_eq!(runner()?.rewrite(untouched.clone()), untouched);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_mismatched_or_nonlocal_runtime_images() {
+        for runtime in [
+            "gascan-workspace:other",
+            "ghcr.io/example/gascan-workspace:candidate",
+            "example/gascan-workspace:candidate",
+        ] {
+            assert!(
+                validate_e2e_candidate_mapping(IMMUTABLE.to_owned(), runtime.to_owned()).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn rehydrates_only_the_matching_structured_inspect_image()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mapping = validate_e2e_candidate_mapping(IMMUTABLE.to_owned(), RUNTIME.to_owned())?;
+        let matching = serde_json::to_vec(&serde_json::json!([{
+            "configuration": {
+                "id": "sandbox",
+                "image": {
+                    "reference": RUNTIME,
+                    "descriptor": {
+                        "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    }
+                }
+            }
+        }]))?;
+        let rehydrated: serde_json::Value =
+            serde_json::from_slice(&rehydrate_e2e_inspect(matching, &mapping))?;
+        assert_eq!(
+            rehydrated[0]["configuration"]["image"]["reference"],
+            IMMUTABLE
+        );
+
+        for unchanged in [
+            b"not-json".to_vec(),
+            serde_json::to_vec(&serde_json::json!([{
+                "configuration": {
+                    "image": {
+                        "reference": "gascan-workspace:foreign",
+                        "descriptor": {
+                            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        }
+                    }
+                }
+            }]))?,
+            serde_json::to_vec(&serde_json::json!([{
+                "configuration": {
+                    "image": {
+                        "reference": RUNTIME,
+                        "descriptor": {
+                            "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        }
+                    }
+                }
+            }]))?,
+            serde_json::to_vec(&serde_json::json!([{
+                "other": {
+                    "image": {
+                        "reference": RUNTIME,
+                        "descriptor": {
+                            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        }
+                    }
+                }
+            }]))?,
+        ] {
+            assert_eq!(
+                rehydrate_e2e_inspect(unchanged.clone(), &mapping),
+                unchanged
+            );
+        }
+        Ok(())
     }
 }
 

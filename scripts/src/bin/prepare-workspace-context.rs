@@ -39,6 +39,8 @@ const REPOSITORY_FILES: [&str; 11] = [
 ];
 const CACHE_FILES: [&str; 2] = ["mise-linux-arm64", "expected-tool-versions.json"];
 const RECORDS: [&str; 3] = ["ubuntu_packages", "mise_runtimes", "gascamp_source_vendor"];
+const REVIEWED_STARSHIP_VERSION: &str = "1.25.1";
+const REVIEWED_STARSHIP_URL: &str = "https://github.com/starship/starship/releases/download/v1.25.1/starship-aarch64-unknown-linux-musl.tar.gz";
 const REVIEWED_EXCLUDED_NPM_PATHS: [&str; 12] = [
     "node_modules/@anthropic-ai/claude-code-darwin-arm64",
     "node_modules/@anthropic-ai/claude-code-darwin-x64",
@@ -102,6 +104,7 @@ struct ConnectedBundles {
 
 #[derive(Deserialize)]
 struct WorkstationArtifact {
+    version: String,
     url: String,
     sha256: String,
     size: u64,
@@ -508,23 +511,33 @@ fn parse_connected_lock(contents: &str) -> Result<ConnectedLock, DynError> {
         .map(String::as_str)
         .collect();
     if names
-        != ["claude", "codex", "glab", "herdr", "neovim", "pi"]
-            .into_iter()
-            .collect()
+        != [
+            "claude", "codex", "glab", "herdr", "neovim", "pi", "starship",
+        ]
+        .into_iter()
+        .collect()
     {
         return Err("workstation artifact lock has an unexpected key set".into());
     }
     for (name, artifact) in &lock.workstation_artifacts {
+        let maximum = match name.as_str() {
+            "claude" | "codex" | "herdr" | "pi" | "starship" => 64 * 1024 * 1024,
+            "glab" | "neovim" => 128 * 1024 * 1024,
+            _ => 0,
+        };
         if artifact.platform != "linux-arm64"
             || artifact.size == 0
-            || artifact.size > 200 * 1024 * 1024
+            || artifact.size > maximum
             || !lower_hex(&artifact.sha256, 64)
+            || (name == "starship"
+                && (artifact.version != REVIEWED_STARSHIP_VERSION
+                    || artifact.url != REVIEWED_STARSHIP_URL))
         {
             return Err(format!("workstation artifact {name} has invalid bounds").into());
         }
         let expected_kind = match name.as_str() {
             "claude" | "codex" | "pi" => "npm_tgz",
-            "glab" | "neovim" => "tar_gz",
+            "glab" | "neovim" | "starship" => "tar_gz",
             "herdr" => "raw_binary",
             _ => unreachable!(),
         };
@@ -570,7 +583,7 @@ fn approved_workstation_url(url: &str, name: &str) -> Result<bool, DynError> {
     let expected = match name {
         "claude" | "codex" | "pi" | "claude-native" | "npm-bootstrap" => "registry.npmjs.org",
         "glab" => "gitlab.com",
-        "herdr" | "neovim" => "github.com",
+        "herdr" | "neovim" | "starship" => "github.com",
         _ => return Ok(false),
     };
     Ok(parsed.host_str() == Some(expected)
@@ -751,6 +764,7 @@ fn workstation_inputs(
         ("glab.tar.gz", "glab", "workstation-gitlab"),
         ("herdr", "herdr", "workstation-github"),
         ("neovim.tar.gz", "neovim", "workstation-github"),
+        ("starship.tar.gz", "starship", "workstation-github"),
     ] {
         let artifact = lock
             .workstation_artifacts
@@ -1061,6 +1075,7 @@ fn verify_context(root: &Path, mode: Mode) -> Result<Vec<u8>, DynError> {
             "workstation/herdr",
             "workstation/neovim.tar.gz",
             "workstation/npm-cli.tgz",
+            "workstation/starship.tar.gz",
             "workstation/package.json",
             "workstation/package-lock.json",
             "workstation/target-lock.toml",
@@ -1275,6 +1290,7 @@ fn assemble_connected(
         ("workstation/herdr", "workstation/herdr"),
         ("workstation/neovim.tar.gz", "workstation/neovim.tar.gz"),
         ("workstation/npm-cli.tgz", "workstation/npm-cli.tgz"),
+        ("workstation/starship.tar.gz", "workstation/starship.tar.gz"),
     ] {
         copy_regular(&cache, Path::new(source), staging.join(destination))?;
     }
@@ -1451,6 +1467,7 @@ fn validate_workstation_cache_with_inputs(
         "npm-cli.tgz",
         "npm-cache",
         "prefetch-lock.sha256",
+        "starship.tar.gz",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -1571,6 +1588,7 @@ fn validate_connected_context_inputs(
         "npm-cache",
         "package-lock.json",
         "package.json",
+        "starship.tar.gz",
         "target-lock.toml",
     ]
     .into_iter()

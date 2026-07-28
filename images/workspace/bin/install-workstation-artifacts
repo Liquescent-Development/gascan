@@ -118,10 +118,57 @@ def sole_candidate(root, endings):
     return candidates[0]
 
 
+def install_starship(archive, destination, expected_size, expected_digest):
+    validate_file(archive, expected_size, expected_digest)
+    with tempfile.TemporaryDirectory(
+        prefix=".starship-", dir=destination.parent
+    ) as temporary:
+        extracted = Path(temporary) / "archive"
+        extract_reviewed(archive, extracted)
+        candidates = [
+            path
+            for path in extracted.rglob("*")
+            if path.is_file()
+            and not path.is_symlink()
+            and path.stat().st_mode & 0o111
+        ]
+        if len(candidates) != 1 or candidates[0].name != "starship":
+            die(
+                "Starship archive must contain exactly one executable command named starship"
+            )
+        validate_arm64_elf(candidates[0])
+        if destination.exists() or destination.is_symlink():
+            die(f"refusing to replace command path: {destination}")
+        shutil.copyfile(candidates[0], destination)
+        destination.chmod(0o700)
+
+
 def checked_link(link, target):
     if link.exists() or link.is_symlink():
         die(f"refusing to replace command path: {link}")
     link.symlink_to(target)
+
+
+def valid_starship_version_output(output, version):
+    if len(output.encode()) > 512 or "\r" in output:
+        return False
+    if output.endswith("\n"):
+        output = output[:-1]
+    header = f"starship {version}"
+    if output == header:
+        return True
+    return (
+        re.fullmatch(
+            rf"{re.escape(header)}\n"
+            r"branch:[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\n"
+            r"commit_hash:[0-9a-f]{7,64}\n"
+            r"build_time:[0-9]{4}-[0-9]{2}-[0-9]{2} "
+            r"[0-9]{2}:[0-9]{2}:[0-9]{2} [+-][0-9]{2}:[0-9]{2}\n"
+            r"build_env:rustc [ -~]{1,192}",
+            output,
+        )
+        is not None
+    )
 
 
 def exact_version(command, tool, version):
@@ -151,6 +198,7 @@ def exact_version(command, tool, version):
         "glab": re.fullmatch(rf"glab {re.escape(version)} \([^()\n]*\)", output)
         is not None,
         "nvim": bool(lines) and lines[0] == f"NVIM v{version}",
+        "starship": valid_starship_version_output(result.stdout, version),
     }.get(tool)
     if result.returncode != 0 or valid is not True:
         die(f"unexpected {command.name} version output: {output!r}")
@@ -406,6 +454,18 @@ if len(sys.argv) == 5 and sys.argv[1] == "verify-inventory":
 if len(sys.argv) == 5 and sys.argv[1] == "verify-version":
     exact_version(Path(sys.argv[2]), sys.argv[3], sys.argv[4])
     raise SystemExit(0)
+if len(sys.argv) == 6 and sys.argv[1] == "install-starship":
+    try:
+        expected_size = int(sys.argv[4])
+    except ValueError:
+        die("expected size is not an integer")
+    install_starship(
+        Path(sys.argv[2]),
+        Path(sys.argv[3]),
+        expected_size,
+        sys.argv[5],
+    )
+    raise SystemExit(0)
 if len(sys.argv) == 3 and sys.argv[1] == "seal-tree":
     immutable_tree(Path(sys.argv[2]))
     raise SystemExit(0)
@@ -426,6 +486,7 @@ for filename, key in [
     ("glab.tar.gz", "glab"),
     ("herdr", "herdr"),
     ("neovim.tar.gz", "neovim"),
+    ("starship.tar.gz", "starship"),
 ]:
     record = artifacts[key]
     validate_file(source / filename, record["size"], record["sha256"])
@@ -497,6 +558,13 @@ try:
     relative_nvim = nvim.relative_to(neovim_tree)
     checked_link(bin_dir / "nvim", Path("..") / "neovim" / relative_nvim)
 
+    install_starship(
+        source / "starship.tar.gz",
+        bin_dir / "starship",
+        artifacts["starship"]["size"],
+        artifacts["starship"]["sha256"],
+    )
+
     for name in ["codex", "pi"]:
         npm_command = npm_root / "node_modules" / ".bin" / name
         if not npm_command.is_symlink():
@@ -510,6 +578,7 @@ try:
         "herdr": artifacts["herdr"]["version"],
         "glab": artifacts["glab"]["version"],
         "nvim": artifacts["neovim"]["version"],
+        "starship": artifacts["starship"]["version"],
     }
     for name, version in expected.items():
         exact_version(bin_dir / name, name, version)
@@ -533,7 +602,7 @@ finally:
         shutil.rmtree(staging)
 
 command_dir.mkdir(parents=True, exist_ok=True)
-for name in ["claude", "codex", "pi", "herdr", "glab", "nvim"]:
+for name in ["claude", "codex", "pi", "herdr", "glab", "nvim", "starship"]:
     checked_link(command_dir / name, prefix / "bin" / name)
 checked_link(command_dir / "fd", Path("/usr/bin/fdfind"))
 checked_link(command_dir / "pico", Path("/usr/bin/nano"))

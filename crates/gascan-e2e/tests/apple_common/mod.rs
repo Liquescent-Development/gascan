@@ -4,7 +4,8 @@ use gascan_core::sandbox::SandboxId;
 use serde_json::Value;
 use std::collections::{BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
-use std::io::{Read as _, Seek as _};
+use std::fmt::Write as _;
+use std::io::{Read as _, Seek as _, Write as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::process::{Command, ExitStatus, Output, Stdio};
 
@@ -35,6 +36,130 @@ pub type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 const IMAGE_REPLACE_ROOT_SENTINEL_PREFIX: &str =
     "/home/workspace/.gascan-image-replace-root-sentinel-";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CandidateImageMapping {
+    immutable: String,
+    runtime: String,
+}
+
+impl CandidateImageMapping {
+    fn from_environment() -> TestResult<Self> {
+        let immutable = std::env::var("GASCAN_E2E_CANDIDATE_IMAGE")
+            .map_err(|_| "GASCAN_E2E_CANDIDATE_IMAGE is required")?;
+        let runtime = std::env::var("GASCAN_E2E_CANDIDATE_RUNTIME_IMAGE")
+            .map_err(|_| "GASCAN_E2E_CANDIDATE_RUNTIME_IMAGE is required")?;
+        Self::new(immutable, runtime)
+    }
+
+    fn new(immutable: String, runtime: String) -> TestResult<Self> {
+        if !gascan_core::runtime::immutable_image_reference(&immutable)
+            || !runtime.starts_with("gascan-workspace:")
+            || runtime.contains('/')
+            || immutable
+                .strip_prefix(&runtime)
+                .is_none_or(|suffix| !suffix.starts_with("@sha256:"))
+        {
+            return Err("invalid E2E candidate image mapping".into());
+        }
+        Ok(Self { immutable, runtime })
+    }
+
+    fn runtime(&self) -> &str {
+        &self.runtime
+    }
+
+    fn rewrite_candidate_run(
+        &self,
+        mut spec: gascan_apple::CommandSpec,
+    ) -> gascan_apple::CommandSpec {
+        if spec.program == "container"
+            && spec.args.first().map(String::as_str) == Some("run")
+            && spec.args.last() == Some(&self.immutable)
+        {
+            if let Some(image) = spec.args.last_mut() {
+                *image = self.runtime.clone();
+            }
+        }
+        spec
+    }
+
+    fn rehydrate_candidate_inspect(&self, bytes: Vec<u8>) -> Vec<u8> {
+        let Some(expected_digest) = self.immutable.rsplit_once('@').map(|(_, digest)| digest)
+        else {
+            return bytes;
+        };
+        let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) else {
+            return bytes;
+        };
+        let Some(records) = value.as_array_mut() else {
+            return bytes;
+        };
+        let mut changed = false;
+        for record in records {
+            let Some(image) = record
+                .as_object_mut()
+                .and_then(|record| record.get_mut("configuration"))
+                .and_then(Value::as_object_mut)
+                .and_then(|configuration| configuration.get_mut("image"))
+                .and_then(Value::as_object_mut)
+            else {
+                continue;
+            };
+            let exact_reference =
+                image.get("reference").and_then(Value::as_str) == Some(self.runtime.as_str());
+            let exact_digest = image
+                .get("descriptor")
+                .and_then(Value::as_object)
+                .and_then(|descriptor| descriptor.get("digest"))
+                .and_then(Value::as_str)
+                == Some(expected_digest);
+            if exact_reference && exact_digest {
+                image.insert(
+                    "reference".to_owned(),
+                    Value::String(self.immutable.clone()),
+                );
+                changed = true;
+            }
+        }
+        if !changed {
+            return bytes;
+        }
+        serde_json::to_vec(&value).unwrap_or(bytes)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CandidateProcessRunner {
+    mapping: CandidateImageMapping,
+}
+
+impl CandidateProcessRunner {
+    fn from_environment() -> TestResult<Self> {
+        Ok(Self {
+            mapping: CandidateImageMapping::from_environment()?,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl gascan_apple::CommandRunner for CandidateProcessRunner {
+    async fn run(
+        &self,
+        spec: gascan_apple::CommandSpec,
+    ) -> Result<gascan_apple::CommandOutput, gascan_core::runtime::RuntimeError> {
+        let rehydrate_inspect = spec.program == "container"
+            && spec.args.len() == 2
+            && spec.args.first().map(String::as_str) == Some("inspect");
+        let spec = self.mapping.rewrite_candidate_run(spec);
+        let mut output =
+            gascan_apple::CommandRunner::run(&gascan_apple::ProcessRunner, spec).await?;
+        if rehydrate_inspect {
+            output.stdout = self.mapping.rehydrate_candidate_inspect(output.stdout);
+        }
+        Ok(output)
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnedRuntimeSnapshot {
@@ -101,10 +226,26 @@ pub fn validate_distinct_image_fixtures(predecessor: &str, approved: &str) -> Te
     Ok(())
 }
 
-fn image_reference(value: &Value) -> Option<&str> {
-    value
-        .as_str()
-        .or_else(|| value.as_object()?.get("reference")?.as_str())
+fn image_reference(value: &Value, candidate: &CandidateImageMapping) -> Option<String> {
+    if let Some(reference) = value.as_str() {
+        return Some(reference.to_owned());
+    }
+    let image = value.as_object()?;
+    let reference = image.get("reference")?.as_str()?;
+    let expected_digest = candidate
+        .immutable
+        .rsplit_once('@')
+        .map(|(_, digest)| digest)?;
+    let observed_digest = image
+        .get("descriptor")
+        .and_then(Value::as_object)
+        .and_then(|descriptor| descriptor.get("digest"))
+        .and_then(Value::as_str);
+    if reference == candidate.runtime && observed_digest == Some(expected_digest) {
+        Some(candidate.immutable.clone())
+    } else {
+        Some(reference.to_owned())
+    }
 }
 
 pub struct AppleE2e {
@@ -281,8 +422,7 @@ impl AppleE2e {
     }
 
     pub fn start_default_network_probe(&self) -> TestResult<DefaultNetworkProbe> {
-        let image = std::env::var("GASCAN_E2E_CANDIDATE_IMAGE")
-            .map_err(|_| "GASCAN_E2E_CANDIDATE_IMAGE is required")?;
+        let candidate = CandidateImageMapping::from_environment()?;
         let name = format!("gascan-ssh-isolation-{}", self.owner_token);
         assert_container_id_absent(&name)?;
         let rendezvous = tempfile::Builder::new()
@@ -323,7 +463,7 @@ impl AppleE2e {
                 "root",
                 "--mount",
                 mount.as_str(),
-                image.as_str(),
+                candidate.runtime(),
                 "python3",
                 "-c",
                 DEFAULT_NETWORK_PROBE,
@@ -732,6 +872,7 @@ impl AppleE2e {
     }
 
     pub fn owned_runtime_snapshot(&self) -> TestResult<OwnedRuntimeSnapshot> {
+        let candidate = CandidateImageMapping::from_environment()?;
         let inspect = self.container_json(["inspect", self.id()])?;
         let record = inspect
             .as_array()
@@ -746,7 +887,7 @@ impl AppleE2e {
             .ok_or("owned container inspect lacks id")?;
         let container_image = configuration
             .get("image")
-            .and_then(image_reference)
+            .and_then(|image| image_reference(image, &candidate))
             .ok_or("owned container inspect lacks image")?;
         if container_id != self.id()
             || configuration["labels"]["dev.gascan.managed-by"] != "gascan"
@@ -781,7 +922,7 @@ impl AppleE2e {
             .into());
         }
         Ok(OwnedRuntimeSnapshot {
-            container_image: container_image.to_owned(),
+            container_image,
             volumes,
             networks,
         })
@@ -858,12 +999,7 @@ impl AppleE2e {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let child = self
-            .command(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        wait_with_output_bounded(child, std::time::Duration::from_secs(90))
+        run_command_bounded(self.command(args), std::time::Duration::from_secs(90))
     }
 
     pub fn invoke_with_timeout<I, S>(
@@ -875,12 +1011,7 @@ impl AppleE2e {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let child = self
-            .command(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        wait_with_output_bounded(child, timeout)
+        run_command_bounded(self.command(args), timeout)
     }
 
     pub fn invoke_with_env<I, S>(&self, args: I, key: &str, value: &str) -> TestResult<Output>
@@ -888,13 +1019,9 @@ impl AppleE2e {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let child = self
-            .command(args)
-            .env(key, value)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        wait_with_output_bounded(child, std::time::Duration::from_secs(90))
+        let mut command = self.command(args);
+        command.env(key, value);
+        run_command_bounded(command, std::time::Duration::from_secs(90))
     }
 
     pub fn success<I, S>(&self, args: I) -> TestResult<Output>
@@ -1190,20 +1317,20 @@ impl AppleE2e {
     }
 
     pub fn run_pty(&self, argv: &[&str]) -> TestResult<Output> {
-        let pty = rustix_openpty::openpty(None, None)?;
-        let stdin = std::fs::File::from(rustix::io::dup(&pty.user)?);
-        let stdout = std::fs::File::from(rustix::io::dup(&pty.user)?);
         let mut args = vec!["--sandbox", self.id(), "shell", "--"];
         args.extend(argv);
-        let child = self
-            .command(args)
-            .stdin(stdin)
-            .stdout(stdout)
-            .stderr(Stdio::piped())
-            .spawn()?;
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        drop(pty.controller);
-        wait_with_output_bounded(child, std::time::Duration::from_secs(30))
+        run_pty_command(self.command(args), std::time::Duration::from_secs(30))
+    }
+
+    pub fn run_default_shell_pty_script(
+        &self,
+        script: &str,
+        completion_marker: &[u8],
+        term: &str,
+    ) -> TestResult<PtySignalOutput> {
+        let mut command = self.command(["--sandbox", self.id(), "shell"]);
+        command.env("TERM", term);
+        run_pty_script_command(command, script, completion_marker)
     }
 
     pub fn run_pty_resize(
@@ -1305,7 +1432,7 @@ async fn recreate_owned_container(
 ) -> TestResult {
     use gascan_core::runtime::RuntimeBackend as _;
 
-    let backend = gascan_apple::AppleBackend::new(gascan_apple::ProcessRunner);
+    let backend = gascan_apple::AppleBackend::new(CandidateProcessRunner::from_environment()?);
     backend.prepare_image(image).await?;
     let capabilities = backend.capabilities().await?;
     let create = match ssh_control.as_ref() {
@@ -1703,7 +1830,8 @@ fn wait_with_output_bounded(
             stderr,
         }),
         Err(_status) => Err(format!(
-            "child exceeded {timeout:?} and was killed/reaped: stderr={}",
+            "child exceeded {timeout:?} and was killed/reaped: stdout={} stderr={}",
+            String::from_utf8_lossy(&stdout),
             String::from_utf8_lossy(&stderr)
         )
         .into()),
@@ -1714,11 +1842,57 @@ pub fn run_command_bounded(
     mut command: Command,
     timeout: std::time::Duration,
 ) -> TestResult<Output> {
+    let command_context = bounded_command_context(&command);
     let child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
     wait_with_output_bounded(child, timeout)
+        .map_err(|error| format!("command {command_context} failed: {error}").into())
+}
+
+fn bounded_command_context(command: &Command) -> String {
+    const MAXIMUM_BYTES: usize = 4 * 1024;
+    const TRUNCATED: &str = "<command context truncated>";
+
+    struct BoundedFormat {
+        value: String,
+        maximum_bytes: usize,
+    }
+
+    impl std::fmt::Write for BoundedFormat {
+        fn write_str(&mut self, value: &str) -> std::fmt::Result {
+            let remaining = self.maximum_bytes.saturating_sub(self.value.len());
+            if value.len() <= remaining {
+                self.value.push_str(value);
+                return Ok(());
+            }
+            let mut boundary = remaining;
+            while !value.is_char_boundary(boundary) {
+                boundary = boundary.saturating_sub(1);
+            }
+            self.value.push_str(&value[..boundary]);
+            Err(std::fmt::Error)
+        }
+    }
+
+    let mut output = BoundedFormat {
+        value: String::with_capacity(MAXIMUM_BYTES),
+        maximum_bytes: MAXIMUM_BYTES - TRUNCATED.len(),
+    };
+    let arguments = std::iter::once(command.get_program()).chain(command.get_args());
+    for (index, argument) in arguments.enumerate() {
+        let result = if index == 0 {
+            write!(output, "{argument:?}")
+        } else {
+            write!(output, " {argument:?}")
+        };
+        if result.is_err() {
+            output.value.push_str(TRUNCATED);
+            break;
+        }
+    }
+    output.value
 }
 
 fn drain_child_pipes(
@@ -1809,6 +1983,191 @@ fn run_pty_signal_command(
     signal: rustix_openpty::rustix::process::Signal,
 ) -> TestResult<PtySignalOutput> {
     run_pty_signal_command_after_spawn(command, ready_marker, signal, |_| Ok(()))
+}
+
+fn run_pty_command(mut command: Command, timeout: std::time::Duration) -> TestResult<Output> {
+    let pty = rustix_openpty::openpty(None, None)?;
+    let stdin = std::fs::File::from(rustix::io::dup(&pty.user)?);
+    let stdout = std::fs::File::from(rustix::io::dup(&pty.user)?);
+    let stderr = std::fs::File::from(rustix::io::dup(&pty.user)?);
+    let mut controller = std::fs::File::from(rustix::io::dup(&pty.controller)?);
+    let flags = rustix::fs::fcntl_getfl(&controller)?;
+    rustix::fs::fcntl_setfl(&controller, flags | rustix::fs::OFlags::NONBLOCK)?;
+    let mut child = command.stdin(stdin).stdout(stdout).stderr(stderr).spawn()?;
+    drop(pty.user);
+    drop(pty.controller);
+
+    let result = (|| -> TestResult<Output> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut captured = Vec::new();
+        let status = loop {
+            let read_bytes = read_available_pty_batch(&mut controller, &mut captured, false)?;
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "PTY child exceeded {timeout:?}: {}",
+                    bounded_escaped_pty_output(&captured)
+                )
+                .into());
+            }
+            if read_bytes == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        drain_pty_after_exit(&mut controller, &mut captured)?;
+        Ok(Output {
+            status,
+            stdout: captured,
+            stderr: Vec::new(),
+        })
+    })();
+
+    match result {
+        Ok(output) => Ok(output),
+        Err(error) => return_after_cleanup(
+            error,
+            kill_and_reap_pty_child(
+                &mut child,
+                &mut |child| Ok(child.try_wait()?),
+                &mut std::process::Child::kill,
+            ),
+        ),
+    }
+}
+
+pub fn marker_payload(output: &[u8], begin: &str, end: &str) -> TestResult<String> {
+    let normalized = String::from_utf8(output.to_vec())?.replace('\r', "");
+    let begin = format!("{begin}\n");
+    let start = normalized
+        .find(&begin)
+        .ok_or_else(|| format!("PTY output omitted marker {begin:?}"))?
+        + begin.len();
+    let remainder = &normalized[start..];
+    let end = format!("{end}\n");
+    let finish = remainder
+        .find(&end)
+        .ok_or_else(|| format!("PTY output omitted marker {end:?}"))?;
+    Ok(remainder[..finish].to_owned())
+}
+
+pub fn inline_marker_value(output: &str, begin: &str, end: &str) -> TestResult<String> {
+    let start = output
+        .find(begin)
+        .ok_or_else(|| format!("PTY output omitted inline marker {begin:?}: {output:?}"))?
+        + begin.len();
+    let remainder = &output[start..];
+    let finish = remainder
+        .find(end)
+        .ok_or_else(|| format!("PTY output omitted inline marker {end:?}: {output:?}"))?;
+    Ok(remainder[..finish].to_owned())
+}
+
+fn run_pty_script_command(
+    mut command: Command,
+    script: &str,
+    completion_marker: &[u8],
+) -> TestResult<PtySignalOutput> {
+    const INPUT_READY: &[u8] = b"GASCAN_SHELL_INPUT_READY";
+
+    let pty = rustix_openpty::openpty(None, None)?;
+    let stdin = std::fs::File::from(rustix_openpty::rustix::io::dup(&pty.user)?);
+    let stdout = std::fs::File::from(rustix_openpty::rustix::io::dup(&pty.user)?);
+    let stderr = std::fs::File::from(rustix_openpty::rustix::io::dup(&pty.user)?);
+    let mut controller = std::fs::File::from(rustix_openpty::rustix::io::dup(&pty.controller)?);
+    let flags = rustix_openpty::rustix::fs::fcntl_getfl(&controller)?;
+    rustix_openpty::rustix::fs::fcntl_setfl(
+        &controller,
+        flags | rustix_openpty::rustix::fs::OFlags::NONBLOCK,
+    )?;
+    let mut child = command.stdin(stdin).stdout(stdout).stderr(stderr).spawn()?;
+    drop(pty.user);
+    drop(pty.controller);
+
+    let result = (|| -> TestResult<PtySignalOutput> {
+        controller.write_all(b"stty -echo; printf 'GASCAN_%s\\n' SHELL_INPUT_READY\n")?;
+        let started = std::time::Instant::now();
+        let input_deadline = started + std::time::Duration::from_secs(10);
+        let completion_deadline = started + std::time::Duration::from_secs(30);
+        let mut captured = Vec::new();
+        let mut input_sent = false;
+        let mut completed = false;
+        let status = loop {
+            let read_bytes = read_available_pty_batch(&mut controller, &mut captured, false)?;
+
+            if !input_sent
+                && captured
+                    .windows(INPUT_READY.len())
+                    .any(|window| window == INPUT_READY)
+            {
+                controller.write_all(script.as_bytes())?;
+                if !script.ends_with('\n') {
+                    controller.write_all(b"\n")?;
+                }
+                input_sent = true;
+            }
+            if input_sent
+                && captured
+                    .windows(completion_marker.len())
+                    .any(|window| window == completion_marker)
+            {
+                completed = true;
+            }
+
+            if let Some(status) = child.try_wait()? {
+                if !completed {
+                    return Err(format!(
+                        "default shell exited before completion marker; captured PTY output: {}",
+                        bounded_escaped_pty_output(&captured)
+                    )
+                    .into());
+                }
+                break status;
+            }
+
+            let now = std::time::Instant::now();
+            if !input_sent && now >= input_deadline {
+                return Err(format!(
+                    "default shell did not report input readiness; captured PTY output: {}",
+                    bounded_escaped_pty_output(&captured)
+                )
+                .into());
+            }
+            if now >= completion_deadline {
+                return Err(format!(
+                    "default shell did not exit after completion marker; captured PTY output: {}",
+                    bounded_escaped_pty_output(&captured)
+                )
+                .into());
+            }
+            if read_bytes == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+
+        drain_pty_after_exit(&mut controller, &mut captured)?;
+        Ok(PtySignalOutput {
+            status,
+            stdout: captured,
+            stderr: Vec::new(),
+        })
+    })();
+
+    match result {
+        Ok(output) => Ok(output),
+        Err(error) => {
+            let cleanup = match child.try_wait()? {
+                Some(_) => Ok(()),
+                None => {
+                    child.kill()?;
+                    child.wait()?;
+                    Ok(())
+                }
+            };
+            return_after_cleanup(error, cleanup)
+        }
+    }
 }
 
 fn run_pty_signal_command_after_spawn(
@@ -2477,6 +2836,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn inline_marker_value_ignores_interactive_prompt_prefix() -> TestResult {
+        let output = concat!(
+            "workspace@sandbox:/workspace$ ",
+            "GASCAN_BASH_VERSION_BEGIN5.2.37GASCAN_BASH_VERSION_END\n",
+        );
+
+        assert_eq!(
+            inline_marker_value(
+                output,
+                "GASCAN_BASH_VERSION_BEGIN",
+                "GASCAN_BASH_VERSION_END",
+            )?,
+            "5.2.37"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn current_thread_timeout_is_constructed_inside_its_runtime() -> TestResult {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2509,15 +2886,158 @@ mod tests {
     }
 
     #[test]
-    fn apple_image_object_and_canonical_ghcr_reference_preserve_exact_digest_identity() {
+    fn local_candidate_mapping_runs_raw_container_commands_by_runtime_tag() -> TestResult {
+        let immutable = format!("gascan-workspace:candidate@sha256:{}", "a".repeat(64));
+        let mapping =
+            CandidateImageMapping::new(immutable.clone(), "gascan-workspace:candidate".to_owned())?;
+        let command =
+            gascan_apple::CommandSpec::new("container", ["run", "--detach", immutable.as_str()]);
+
+        assert_eq!(
+            mapping.rewrite_candidate_run(command).args,
+            ["run", "--detach", "gascan-workspace:candidate"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn local_candidate_mapping_rehydrates_only_exact_candidate_inspection() -> TestResult {
+        let immutable = format!("gascan-workspace:candidate@sha256:{}", "a".repeat(64));
+        let mapping =
+            CandidateImageMapping::new(immutable.clone(), "gascan-workspace:candidate".to_owned())?;
+        let matching = serde_json::to_vec(&serde_json::json!([{
+            "configuration": {
+                "id": "sandbox",
+                "image": {
+                    "reference": "gascan-workspace:candidate",
+                    "descriptor": {
+                        "digest": format!("sha256:{}", "a".repeat(64))
+                    }
+                }
+            }
+        }]))?;
+
+        let rehydrated: Value =
+            serde_json::from_slice(&mapping.rehydrate_candidate_inspect(matching))?;
+        assert_eq!(
+            rehydrated[0]["configuration"]["image"]["reference"],
+            immutable
+        );
+
+        let foreign = serde_json::to_vec(&serde_json::json!([{
+            "configuration": {
+                "image": {
+                    "reference": "gascan-workspace:foreign",
+                    "descriptor": {
+                        "digest": format!("sha256:{}", "a".repeat(64))
+                    }
+                }
+            }
+        }]))?;
+        assert_eq!(
+            mapping.rehydrate_candidate_inspect(foreign.clone()),
+            foreign
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_runtime_wiring_is_used_by_default_probe_and_replacement_backend() {
+        let source = include_str!("mod.rs");
+        assert!(
+            source.contains(
+                "let candidate = CandidateImageMapping::from_environment()?;\n\
+                 \u{20}       let name = format!(\"gascan-ssh-isolation-{}\", self.owner_token);"
+            ),
+            "default-network probe must validate the candidate mapping"
+        );
+        assert!(
+            source.contains(
+                "candidate.runtime(),\n\
+                 \u{20}               \"python3\",\n\
+                 \u{20}               \"-c\",\n\
+                 \u{20}               DEFAULT_NETWORK_PROBE,"
+            ),
+            "default-network probe must run the validated local candidate tag"
+        );
+        assert!(
+            source.contains(
+                "let backend = gascan_apple::AppleBackend::new(\
+                 CandidateProcessRunner::from_environment()?);"
+            ),
+            "image replacement must use the candidate-aware process runner"
+        );
+    }
+
+    #[test]
+    fn local_candidate_mapping_rejects_invalid_immutable_runtime_pairs() {
+        let digest = "a".repeat(64);
+        for (immutable, runtime) in [
+            (
+                "gascan-workspace:candidate".to_owned(),
+                "gascan-workspace:candidate".to_owned(),
+            ),
+            (
+                format!("gascan-workspace:candidate@sha256:{digest}"),
+                "ghcr.io/gascan-workspace:candidate".to_owned(),
+            ),
+            (
+                format!("gascan-workspace:candidate@sha256:{digest}"),
+                "gascan-workspace:other".to_owned(),
+            ),
+            (
+                format!("gascan-workspace:candidate@sha256:{digest}"),
+                format!("gascan-workspace:candidate@sha256:{digest}"),
+            ),
+        ] {
+            assert!(
+                CandidateImageMapping::new(immutable, runtime).is_err(),
+                "invalid immutable/runtime pair was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn local_candidate_mapping_does_not_rehydrate_wrong_digest_for_exact_runtime() -> TestResult {
+        let immutable = format!("gascan-workspace:candidate@sha256:{}", "a".repeat(64));
+        let mapping =
+            CandidateImageMapping::new(immutable, "gascan-workspace:candidate".to_owned())?;
+        let wrong_digest = serde_json::to_vec(&serde_json::json!([{
+            "configuration": {
+                "image": {
+                    "reference": "gascan-workspace:candidate",
+                    "descriptor": {
+                        "digest": format!("sha256:{}", "b".repeat(64))
+                    }
+                }
+            }
+        }]))?;
+
+        assert_eq!(
+            mapping.rehydrate_candidate_inspect(wrong_digest.clone()),
+            wrong_digest
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn apple_image_object_and_canonical_ghcr_reference_preserve_exact_digest_identity() -> TestResult
+    {
         let digest = format!("sha256:{}", "a".repeat(64));
         let tagged = format!("ghcr.io/liquescent-development/gascan/workspace:v1.2.3@{digest}");
         let canonical = format!("ghcr.io/liquescent-development/gascan/workspace@{digest}");
+        let candidate = CandidateImageMapping::new(
+            format!("gascan-workspace:candidate@{digest}"),
+            "gascan-workspace:candidate".to_owned(),
+        )?;
         let object = serde_json::json!({
             "descriptor": {"digest": digest},
             "reference": canonical
         });
-        assert_eq!(image_reference(&object), Some(canonical.as_str()));
+        assert_eq!(
+            image_reference(&object, &candidate),
+            Some(canonical.clone())
+        );
         assert!(gascan_core::runtime::same_immutable_image(
             &canonical, &tagged
         ));
@@ -2532,6 +3052,34 @@ mod tests {
             &format!("ghcr.io/other/workspace@{digest}"),
             &tagged
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn local_candidate_snapshot_restores_exact_immutable_identity() -> TestResult {
+        let immutable = format!("gascan-workspace:candidate@sha256:{}", "a".repeat(64));
+        let candidate =
+            CandidateImageMapping::new(immutable.clone(), "gascan-workspace:candidate".to_owned())?;
+        let object = serde_json::json!({
+            "descriptor": {
+                "digest": format!("sha256:{}", "a".repeat(64))
+            },
+            "reference": "gascan-workspace:candidate"
+        });
+
+        assert_eq!(image_reference(&object, &candidate), Some(immutable));
+
+        let wrong_digest = serde_json::json!({
+            "descriptor": {
+                "digest": format!("sha256:{}", "b".repeat(64))
+            },
+            "reference": "gascan-workspace:candidate"
+        });
+        assert_eq!(
+            image_reference(&wrong_digest, &candidate),
+            Some("gascan-workspace:candidate".to_owned())
+        );
+        Ok(())
     }
 
     #[test]
@@ -3384,6 +3932,42 @@ mod tests {
     }
 
     #[test]
+    fn bounded_command_timeout_reports_argv_and_stdout() -> TestResult {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "printf timeout-stdout; sleep 10"])
+            .env("GASCAN_TEST_SECRET", "must-not-appear");
+
+        let error = match run_command_bounded(command, std::time::Duration::from_secs(1)) {
+            Ok(_) => return Err("child did not reach the timeout".into()),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+
+        assert!(message.contains("printf timeout-stdout; sleep 10"));
+        assert!(message.contains("stdout=timeout-stdout"));
+        assert!(!message.contains("must-not-appear"));
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_command_timeout_caps_argv_context() -> TestResult {
+        let oversized_argument = "x".repeat(64 * 1024);
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 10", &oversized_argument]);
+
+        let error = match run_command_bounded(command, std::time::Duration::from_millis(20)) {
+            Ok(_) => return Err("child did not reach the timeout".into()),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+
+        assert!(message.contains("<command context truncated>"));
+        assert!(message.len() <= 8 * 1024);
+        Ok(())
+    }
+
+    #[test]
     fn bounded_wait_drains_chatty_stdout_and_stderr_without_unbounded_capture() -> TestResult {
         let child = Command::new("sh")
             .args([
@@ -3426,7 +4010,76 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         let message = error.to_string();
         assert!(message.contains("was killed/reaped"));
-        assert!(message.len() <= MAX_CAPTURED_PIPE_BYTES + 256);
+        assert!(message.len() <= (2 * MAX_CAPTURED_PIPE_BYTES) + 256);
+        Ok(())
+    }
+
+    #[test]
+    fn pty_command_waiter_drains_terminal_output_without_child_stdout_pipe() -> TestResult {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "test -t 0 && test -t 1 && test -t 2 && printf GASCAN_PTY_OK",
+        ]);
+
+        let output = run_pty_command(command, std::time::Duration::from_secs(2))?;
+
+        assert!(output.status.success());
+        assert!(
+            output
+                .stdout
+                .windows(b"GASCAN_PTY_OK".len())
+                .any(|window| window == b"GASCAN_PTY_OK")
+        );
+        assert!(output.stderr.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn pty_command_waiter_times_out_kills_and_reaps_child() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let pid_path = temp.path().join("pid");
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "printf '%s' \"$$\" > \"$1\"; printf GASCAN_PTY_TIMEOUT_READY; while :; do :; done",
+            "sh",
+            pid_path.to_str().ok_or("non-UTF-8 pid path")?,
+        ]);
+
+        let started = std::time::Instant::now();
+        let error = match run_pty_command(command, std::time::Duration::from_secs(1)) {
+            Ok(_) => return Err("PTY child did not reach the timeout".into()),
+            Err(error) => error,
+        };
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(error.to_string().contains("GASCAN_PTY_TIMEOUT_READY"));
+        let raw_pid = std::fs::read_to_string(pid_path)?.parse::<i32>()?;
+        let pid = rustix::process::Pid::from_raw(raw_pid).ok_or("invalid child pid")?;
+        assert_eq!(
+            rustix::process::test_kill_process(pid),
+            Err(rustix::io::Errno::SRCH)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pty_command_waiter_does_not_wait_for_descendant_pty_eof() -> TestResult {
+        let mut command = Command::new("sh");
+        command.args(["-c", "(sleep 3) & printf GASCAN_PTY_PARENT_EXITED"]);
+
+        let started = std::time::Instant::now();
+        let output = run_pty_command(command, std::time::Duration::from_secs(2))?;
+
+        assert!(output.status.success());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(
+            output
+                .stdout
+                .windows(b"GASCAN_PTY_PARENT_EXITED".len())
+                .any(|window| window == b"GASCAN_PTY_PARENT_EXITED")
+        );
         Ok(())
     }
 

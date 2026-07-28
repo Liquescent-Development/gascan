@@ -578,10 +578,10 @@ fn daemon_kill_and_restart_preserve_runtime_truth() -> TestResult {
 }
 
 #[test]
-fn inspection_confirmation_and_remaining_commands_are_stable() -> TestResult {
+fn default_shell_and_inspection_confirmation_are_stable() -> TestResult {
     let env = Environment::new()?;
     assert!(env.invoke(&["up", env.root()?])?.status.success());
-    assert!(env.invoke(&["shell", "--", "sh"])?.status.success());
+    assert!(env.invoke(&["shell"])?.status.success());
     assert!(env.invoke(&["logs"])?.status.success());
     assert!(env.invoke(&["doctor", "--json"])?.status.success());
     let status = String::from_utf8(env.invoke(&["status"])?.stdout)?;

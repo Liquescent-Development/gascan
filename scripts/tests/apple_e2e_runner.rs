@@ -46,7 +46,7 @@ fn runner_fixture(build_helper: &str) -> tempfile::TempDir {
     );
     write_executable(
         &root.join("bin/cargo"),
-        "#!/bin/sh\nset -eu\nprintf 'cargo:%s:%s\\n' \"$*\" \"${GASCAN_APPLE_ATTACH_HELPER-unset}\" >>\"$RUNNER_FIXTURE_LOG\"\nif test -n \"${GASCAN_E2E_CANDIDATE_IMAGE:-}\"; then printf 'candidate:%s\\n' \"$GASCAN_E2E_CANDIDATE_IMAGE\" >>\"$RUNNER_FIXTURE_LOG\"; fi\nif test -n \"${GASCAN_E2E_PREDECESSOR_IMAGE:-}\"; then printf 'predecessor:%s\\n' \"$GASCAN_E2E_PREDECESSOR_IMAGE\" >>\"$RUNNER_FIXTURE_LOG\"; fi\ncase \" $* \" in\n  *' build '*) mkdir -p \"$RUNNER_FIXTURE_ROOT/target/debug\"; printf '#!/bin/sh\\n' >\"$RUNNER_FIXTURE_ROOT/target/debug/gascan-e2e-cli\"; chmod 755 \"$RUNNER_FIXTURE_ROOT/target/debug/gascan-e2e-cli\";;\nesac\n",
+        "#!/bin/sh\nset -eu\nprintf 'cargo:%s:%s\\n' \"$*\" \"${GASCAN_APPLE_ATTACH_HELPER-unset}\" >>\"$RUNNER_FIXTURE_LOG\"\nif test -n \"${GASCAN_E2E_CANDIDATE_IMAGE:-}\"; then printf 'candidate:%s\\n' \"$GASCAN_E2E_CANDIDATE_IMAGE\" >>\"$RUNNER_FIXTURE_LOG\"; fi\nif test -n \"${GASCAN_E2E_CANDIDATE_RUNTIME_IMAGE:-}\"; then printf 'candidate-runtime:%s\\n' \"$GASCAN_E2E_CANDIDATE_RUNTIME_IMAGE\" >>\"$RUNNER_FIXTURE_LOG\"; fi\nif test -n \"${GASCAN_E2E_PREDECESSOR_IMAGE:-}\"; then printf 'predecessor:%s\\n' \"$GASCAN_E2E_PREDECESSOR_IMAGE\" >>\"$RUNNER_FIXTURE_LOG\"; fi\ncase \" $* \" in\n  *' build '*) mkdir -p \"$RUNNER_FIXTURE_ROOT/target/debug\"; printf '#!/bin/sh\\n' >\"$RUNNER_FIXTURE_ROOT/target/debug/gascan-e2e-cli\"; chmod 755 \"$RUNNER_FIXTURE_ROOT/target/debug/gascan-e2e-cli\";;\nesac\n",
     );
     fs::create_dir_all(root.join("images/workspace")).unwrap();
     fs::write(
@@ -139,7 +139,7 @@ fn successful_apple_apply_targets_candidate_and_publishes_matching_live_receipt(
     let log = root.join("runner.log");
     let artifacts = root.join(".artifacts");
     fs::create_dir(&artifacts).unwrap();
-    let candidate = "ghcr.io/liquescent-development/gascan/workspace:candidate@sha256:\
+    let candidate = "gascan-workspace:candidate@sha256:\
                      aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let candidate_file = artifacts.join("connected-workspace-image-candidate.txt");
     let live_file = artifacts.join("connected-workspace-image-apple-live.txt");
@@ -172,11 +172,64 @@ fn successful_apple_apply_targets_candidate_and_publishes_matching_live_receipt(
     );
     let records = fs::read_to_string(log).unwrap();
     assert!(records.contains(&format!("candidate:{candidate}\n")));
+    assert!(records.contains("candidate-runtime:gascan-workspace:candidate\n"));
     assert!(records.contains(&format!("predecessor:{predecessor}\n")));
     assert_eq!(
         fs::read_to_string(live_file).unwrap(),
         format!("{candidate}\n")
     );
+}
+
+#[test]
+fn candidate_flow_rejects_malformed_or_nonlocal_candidate_receipts() {
+    for (case, candidate) in [
+        ("malformed", "not-an-immutable-image"),
+        (
+            "registry-qualified",
+            "ghcr.io/liquescent-development/gascan/workspace:candidate@sha256:\
+             aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+        (
+            "repository-qualified",
+            "example/gascan-workspace:candidate@sha256:\
+             aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+    ] {
+        let fixture = runner_fixture(
+            "#!/bin/sh\nset -eu\nmkdir -p \"$RUNNER_FIXTURE_ROOT/target\"\nprintf '#!/bin/sh\\n' >\"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\nchmod 755 \"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\n",
+        );
+        let root = fixture.path();
+        let log = root.join("runner.log");
+        let artifacts = root.join(".artifacts");
+        fs::create_dir(&artifacts).unwrap();
+        let candidate_file = artifacts.join("connected-workspace-image-candidate.txt");
+        fs::write(&candidate_file, format!("{candidate}\n")).unwrap();
+
+        let output = Command::new(root.join("scripts/run-apple-e2e.sh"))
+            .arg("apple_apply")
+            .env("RUNNER_FIXTURE_ROOT", root)
+            .env("RUNNER_FIXTURE_LOG", &log)
+            .env("GASCAN_E2E_CANDIDATE_IMAGE_FILE", &candidate_file)
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", root.join("bin").display()),
+            )
+            .output()
+            .unwrap();
+
+        assert!(
+            !output.status.success(),
+            "{case} unexpectedly succeeded: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("candidate receipt is not a local immutable image"),
+            "{case}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!log.exists(), "{case} reached build or live execution");
+    }
 }
 
 #[test]
@@ -188,7 +241,7 @@ fn candidate_flow_preserves_a_valid_explicit_predecessor_override() {
     let log = root.join("runner.log");
     let artifacts = root.join(".artifacts");
     fs::create_dir(&artifacts).unwrap();
-    let candidate = "ghcr.io/liquescent-development/gascan/workspace:candidate@sha256:\
+    let candidate = "gascan-workspace:candidate@sha256:\
                      aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let predecessor = "ghcr.io/liquescent-development/gascan/workspace:override@sha256:\
                        cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
@@ -243,7 +296,7 @@ fn candidate_flow_rejects_malformed_default_and_explicit_predecessors() {
         let log = root.join("runner.log");
         let artifacts = root.join(".artifacts");
         fs::create_dir(&artifacts).unwrap();
-        let candidate = "ghcr.io/liquescent-development/gascan/workspace:candidate@sha256:\
+        let candidate = "gascan-workspace:candidate@sha256:\
                          aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let candidate_file = artifacts.join("connected-workspace-image-candidate.txt");
         let live_file = artifacts.join("connected-workspace-image-apple-live.txt");
@@ -290,7 +343,7 @@ fn nonempty_scoped_session_root_fails_without_publishing_live_receipt() {
     let log = root.join("runner.log");
     let artifacts = root.join(".artifacts");
     fs::create_dir(&artifacts).unwrap();
-    let candidate = "ghcr.io/liquescent-development/gascan/workspace:candidate@sha256:\
+    let candidate = "gascan-workspace:candidate@sha256:\
                      aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let candidate_file = artifacts.join("connected-workspace-image-candidate.txt");
     let live_file = artifacts.join("connected-workspace-image-apple-live.txt");
@@ -326,7 +379,7 @@ fn interrupted_apple_apply_does_not_publish_live_receipt() {
     let log = root.join("runner.log");
     let artifacts = root.join(".artifacts");
     fs::create_dir(&artifacts).unwrap();
-    let candidate = "ghcr.io/liquescent-development/gascan/workspace:candidate@sha256:\
+    let candidate = "gascan-workspace:candidate@sha256:\
                      aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let candidate_file = artifacts.join("connected-workspace-image-candidate.txt");
     let live_file = artifacts.join("connected-workspace-image-apple-live.txt");

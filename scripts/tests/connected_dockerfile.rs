@@ -19,6 +19,7 @@ const RUNTIME_PATH: &str = concat!(
 );
 const EXPECTED_SYSTEM_TOOLS: &str = "\
 autoconf
+bash-completion
 bind9-dnsutils
 bison
 build-essential
@@ -755,6 +756,109 @@ fn workstation_installer_rejects_unsafe_archives_behaviorally() {
 }
 
 #[test]
+fn workstation_installer_accepts_only_the_reviewed_starship_archive_behaviorally() {
+    let installer = root().join("images/workspace/bin/install-workstation-artifacts");
+    let temporary = tempfile::tempdir().unwrap();
+    let make_archive = |name: &str, scenario: &str| {
+        let archive = temporary.path().join(name);
+        let status = Command::new("python3")
+            .args([
+                "-c",
+                r#"import io,sys,tarfile
+archive,scenario=sys.argv[1:]
+elf=bytearray(20)
+elf[:6]=b'\x7fELF\x02\x01'
+elf[18:20]=(183).to_bytes(2,'little')
+def add_file(t,name,data,mode=0o755):
+ i=tarfile.TarInfo(name); i.mode=mode; i.size=len(data); t.addfile(i,io.BytesIO(data))
+with tarfile.open(archive,'w:gz') as t:
+ if scenario == 'duplicate':
+  add_file(t,'starship',elf); add_file(t,'starship',elf)
+ elif scenario == 'escaping-link':
+  add_file(t,'starship',elf)
+  i=tarfile.TarInfo('escape'); i.type=tarfile.SYMTYPE; i.linkname='../escape'; t.addfile(i)
+ elif scenario == 'wrong-arch':
+  elf[18:20]=(62).to_bytes(2,'little'); add_file(t,'starship',elf)
+ elif scenario == 'extra-executable':
+  add_file(t,'starship',elf); add_file(t,'helper',elf)
+ else:
+  add_file(t,'starship',elf)
+"#,
+            ])
+            .args([archive.to_str().unwrap(), scenario])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        archive
+    };
+    let install = |archive: &Path, destination: &Path, size: u64, digest: &str| {
+        Command::new(&installer)
+            .args([
+                "install-starship",
+                archive.to_str().unwrap(),
+                destination.to_str().unwrap(),
+                &size.to_string(),
+                digest,
+            ])
+            .status()
+            .unwrap()
+    };
+
+    let valid = make_archive("valid-starship.tar.gz", "valid");
+    let valid_bytes = fs::read(&valid).unwrap();
+    let valid_size = u64::try_from(valid_bytes.len()).unwrap();
+    let valid_sha = format!("{:x}", Sha256::digest(&valid_bytes));
+    assert!(
+        !install(
+            &valid,
+            &temporary.path().join("wrong-size"),
+            valid_size - 1,
+            &valid_sha
+        )
+        .success(),
+        "Starship archive size mismatch was accepted"
+    );
+    assert!(
+        !install(
+            &valid,
+            &temporary.path().join("wrong-digest"),
+            valid_size,
+            &"0".repeat(64)
+        )
+        .success(),
+        "Starship archive digest mismatch was accepted"
+    );
+    let installed = temporary.path().join("installed-starship");
+    assert!(
+        install(&valid, &installed, valid_size, &valid_sha).success(),
+        "reviewed Starship archive was rejected"
+    );
+    assert_eq!(fs::read(&installed).unwrap()[..6], *b"\x7fELF\x02\x01");
+
+    for (name, scenario) in [
+        ("duplicate-starship.tar.gz", "duplicate"),
+        ("escaping-starship.tar.gz", "escaping-link"),
+        ("wrong-arch-starship.tar.gz", "wrong-arch"),
+        ("extra-executable-starship.tar.gz", "extra-executable"),
+    ] {
+        let archive = make_archive(name, scenario);
+        let bytes = fs::read(&archive).unwrap();
+        let size = u64::try_from(bytes.len()).unwrap();
+        let sha = format!("{:x}", Sha256::digest(&bytes));
+        assert!(
+            !install(
+                &archive,
+                &temporary.path().join(format!("installed-{scenario}")),
+                size,
+                &sha
+            )
+            .success(),
+            "invalid Starship archive was accepted: {scenario}"
+        );
+    }
+}
+
+#[test]
 fn workstation_installer_enforces_exact_target_npm_inventory_behaviorally() {
     let installer = root().join("images/workspace/bin/install-workstation-artifacts");
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
@@ -965,6 +1069,14 @@ fn workstation_installer_enforces_file_npm_version_and_mode_boundaries_behaviora
             .success(),
         "version verification did not provide a safe private home"
     );
+    let oversized_starship_metadata = format!(
+        "starship 1.25.1\n\
+         branch:master\n\
+         commit_hash:8758daa\n\
+         build_time:2026-04-30 19:35:31 +00:00\n\
+         build_env:{}\n",
+        "x".repeat(513)
+    );
     for (tool, expected, output) in [
         ("claude", "2.1.218", "2.1.218 (Claude Code)\n"),
         ("codex", "0.145.0", "codex-cli 0.145.0\n"),
@@ -975,6 +1087,16 @@ fn workstation_installer_enforces_file_npm_version_and_mode_boundaries_behaviora
             "nvim",
             "0.11.7",
             "NVIM v0.11.7\nBuild type: Release\nLuaJIT 2.1\n",
+        ),
+        ("starship", "1.25.1", "starship 1.25.1\n"),
+        (
+            "starship",
+            "1.25.1",
+            "starship 1.25.1\n\
+             branch:master\n\
+             commit_hash:8758daa\n\
+             build_time:2026-04-30 19:35:31 +00:00\n\
+             build_env:rustc 1.95.0 (59807616e 2026-04-14),\n",
         ),
     ] {
         assert!(
@@ -990,6 +1112,25 @@ fn workstation_installer_enforces_file_npm_version_and_mode_boundaries_behaviora
         ("herdr", "0.7.5", "other 0.7.5\n"),
         ("glab", "1.109.0", "glab 1.109.0beta (abcdef)\n"),
         ("nvim", "0.11.7", "NVIM v0.11.70\n"),
+        ("starship", "1.25.1", "starship 1.25.10\n"),
+        ("starship", "1.25.1", "leading junk\nstarship 1.25.1\n"),
+        ("starship", "1.25.1", "\nstarship 1.25.1\n"),
+        (
+            "starship",
+            "1.25.1",
+            "diagnostic\nstarship 1.25.1\nbranch:master\n",
+        ),
+        (
+            "starship",
+            "1.25.1",
+            "starship 1.25.1\n\
+             branch:master\n\
+             commit_hash:8758daa\n\
+             build_time:2026-04-30 19:35:31 +00:00\n\
+             build_env:rustc 1.95.0 (59807616e 2026-04-14),\n\
+             unexpected:metadata\n",
+        ),
+        ("starship", "1.25.1", oversized_starship_metadata.as_str()),
     ] {
         assert!(
             !version_status(tool, expected, output).success(),
@@ -1393,6 +1534,101 @@ fn dockerfile_prints_safe_mise_version_metadata_only_when_the_lock_comparison_fa
 }
 
 #[test]
+fn shell_assets_are_immutable_and_wired_after_identity_migration() {
+    let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
+    for required in [
+        "RUN install -d -o root -g root -m 0555 /etc/gascan",
+        "COPY --chmod=0444 images/workspace/etc/gascan/bashrc /etc/gascan/bashrc",
+        "COPY --chmod=0444 images/workspace/etc/gascan/starship.toml /opt/gascan/shell/presets/starship.toml",
+        "COPY --chmod=0444 images/workspace/etc/gascan/starship-nerd-font.toml /opt/gascan/shell/presets/starship-nerd-font.toml",
+        "COPY --chmod=0555 images/workspace/bin/configure-shell-home /usr/local/bin/configure-shell-home",
+        "ln -s ../../workstation/bin/starship /opt/gascan/shell/bin/starship",
+        ". /etc/gascan/bashrc",
+        "ENV SHELL=/bin/bash",
+    ] {
+        assert!(
+            dockerfile.contains(required),
+            "missing managed shell image boundary: {required}"
+        );
+    }
+    let gascan_directory = dockerfile
+        .find("RUN install -d -o root -g root -m 0555 /etc/gascan")
+        .unwrap();
+    let bashrc_copy = dockerfile
+        .find("COPY --chmod=0444 images/workspace/etc/gascan/bashrc /etc/gascan/bashrc")
+        .unwrap();
+    assert!(
+        gascan_directory < bashrc_copy,
+        "the traversable root-owned directory must exist before its immutable hook"
+    );
+    let migration = dockerfile
+        .find("/usr/local/bin/migrate-workspace-identity")
+        .unwrap();
+    let startup = dockerfile.find(". /etc/gascan/bashrc").unwrap();
+    assert!(
+        migration < startup,
+        "workspace startup was changed before identity migration"
+    );
+    assert_eq!(
+        dockerfile.matches(". /etc/gascan/bashrc").count(),
+        1,
+        "the shared hook source command must be emitted by one bounded startup step"
+    );
+    for unsafe_writable in [
+        "chmod 0775 /opt/gascan",
+        "chmod 0777 /opt/gascan",
+        "chown workspace:workspace /opt/gascan",
+        "chown -R workspace:workspace /opt/gascan",
+    ] {
+        assert!(
+            !dockerfile.contains(unsafe_writable),
+            "shell wiring weakens immutable root: {unsafe_writable}"
+        );
+    }
+}
+
+fn migration_execution_position(dockerfile: &str) -> usize {
+    dockerfile
+        .find("&& /usr/local/bin/migrate-workspace-identity")
+        .unwrap()
+}
+
+#[test]
+fn workspace_home_order_uses_migration_execution_not_copy_destination() {
+    let dockerfile = "\
+COPY helper /usr/local/bin/migrate-workspace-identity
+chown workspace:workspace /home/workspace
+&& /usr/local/bin/migrate-workspace-identity
+";
+    assert!(
+        migration_execution_position(dockerfile)
+            > dockerfile
+                .find("chown workspace:workspace /home/workspace")
+                .unwrap()
+    );
+}
+
+#[test]
+fn workspace_home_is_normalized_without_weakening_private_directories() {
+    let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
+    let migration = migration_execution_position(&dockerfile);
+    let home_owner = dockerfile
+        .find("chown workspace:workspace /home/workspace")
+        .unwrap();
+    let home_mode = dockerfile.find("chmod 0755 /home/workspace").unwrap();
+    let private = dockerfile
+        .find("install -d -o workspace -g workspace -m 0700")
+        .unwrap();
+    let config = dockerfile
+        .find("install -d -o root -g workspace -m 1770 /home/workspace/.config")
+        .unwrap();
+    assert!(
+        migration < home_owner && home_owner < home_mode && home_mode < private && private < config,
+        "workspace HOME normalization is not post-migration or weakens private children"
+    );
+}
+
+#[test]
 fn mise_comparison_is_quiet_on_match_and_emits_only_both_json_documents_on_mismatch() {
     let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
     let block = dockerfile
@@ -1452,6 +1688,19 @@ fn dockerfile_installs_exactly_the_sorted_unique_reviewed_package_list() {
         );
     }
     assert_sole_reviewed_package_install(&dockerfile).unwrap();
+}
+
+#[test]
+fn workstation_package_inputs_include_bash_completion_exactly_once() {
+    let package_text = fs::read_to_string(root().join("tests/image/system-tools.txt")).unwrap();
+    assert_eq!(
+        package_text
+            .lines()
+            .filter(|package| *package == "bash-completion")
+            .count(),
+        1
+    );
+    assert_exact_system_tools(&package_text).unwrap();
 }
 
 #[test]

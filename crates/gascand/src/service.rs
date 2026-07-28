@@ -43,6 +43,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
 const SAFE_MISE_WORKDIR: &str = "/home/workspace/.config/gascan/mise-workdir";
+const MANAGED_CONFIG_ROOT: &str = "/home/workspace/.config/gascan";
 const MAX_PROVISION_STDOUT_BYTES: usize = 1024 * 1024;
 const MAX_PROVISION_STDERR_TAIL_BYTES: usize = 64 * 1024;
 const STORAGE_LAYOUT_VERSION: u32 = 2;
@@ -155,6 +156,7 @@ pub struct StorageCapacityChange {
 struct ProvisionedResolution {
     resolution: ProvisionResolution,
     tool_hash: String,
+    shell_hash: String,
 }
 
 #[derive(Deserialize)]
@@ -1150,7 +1152,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
                     ));
                     record.tool_resolution = Some(ToolResolution::new(
                         1,
-                        json!({"desired_fingerprint":desired_fingerprint,"tool_hash":provisioned.tool_hash,"resolution":resolution.tools}),
+                        json!({"desired_fingerprint":desired_fingerprint,"tool_hash":provisioned.tool_hash,"shell_hash":provisioned.shell_hash,"resolution":resolution.tools}),
                     ));
                 }
                 record.storage_resolution = Some(storage_resolution(requested_storage));
@@ -1372,6 +1374,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             let durable_match = if let Some(record) = prior.filter(|_| inspected.is_some()) {
                 resolution_matches(record, desired_fingerprint)
                     && tool_state_matches(record, spec.canonical_root(), spec.manifest())?
+                    && shell_state_matches(record, spec.canonical_root(), spec.manifest())?
                     && !image_state.change_required()
             } else {
                 false
@@ -1394,6 +1397,8 @@ impl<B: RuntimeBackend> SandboxService<B> {
                     "setup_changed"
                 } else if plan.tools_changed() {
                     "tools_changed"
+                } else if plan.shell_changed() {
+                    "shell_changed"
                 } else {
                     "desired_content_changed"
                 };
@@ -1411,7 +1416,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
                         sender,
                     )
                     .await?;
-                self.emit(operation_id, json!({"phase":"after_provision","resolution_version":1,"desired_fingerprint":desired_fingerprint,"setup":provisioned.resolution.setup,"tools":provisioned.resolution.tools,"tool_hash":provisioned.tool_hash}), sender).await?;
+                self.emit(operation_id, json!({"phase":"after_provision","resolution_version":1,"desired_fingerprint":desired_fingerprint,"setup":provisioned.resolution.setup,"tools":provisioned.resolution.tools,"tool_hash":provisioned.tool_hash,"shell_hash":provisioned.shell_hash}), sender).await?;
                 Some(provisioned)
             } else {
                 None
@@ -1509,6 +1514,23 @@ impl<B: RuntimeBackend> SandboxService<B> {
         } else {
             prior.and_then(stored_tool_resolution)
         };
+        if plan.shell_changed() {
+            self.emit_provision_step(operation_id, ProvisionStep::ConfigureShell, sender)
+                .await?;
+            self.exec_guest(
+                spec.id(),
+                ProvisionStep::ConfigureShell,
+                "configure_shell",
+                [
+                    "/usr/bin/sudo",
+                    "-n",
+                    "/usr/local/bin/configure-shell-home",
+                    plan.shell_prompt().as_str(),
+                ],
+                Vec::new(),
+            )
+            .await?;
+        }
         if plan.steps().contains(&ProvisionStep::RunSetup) {
             self.emit_provision_step(operation_id, ProvisionStep::RunSetup, sender)
                 .await?;
@@ -1543,6 +1565,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
         Ok(ProvisionedResolution {
             resolution,
             tool_hash: plan.desired_tool_hash().to_owned(),
+            shell_hash: plan.desired_shell_hash().to_owned(),
         })
     }
 
@@ -1771,6 +1794,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
                     "setup":provisioned.resolution.setup,
                     "tools":provisioned.resolution.tools,
                     "tool_hash":provisioned.tool_hash,
+                    "shell_hash":provisioned.shell_hash,
                 }),
                 sender,
             )
@@ -2095,6 +2119,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 "-m",
                 "1770",
                 CONFIG_ROOT,
+                MANAGED_CONFIG_ROOT,
             ],
             Vec::new(),
         )
@@ -2671,7 +2696,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             ));
             record.tool_resolution = Some(ToolResolution::new(
                 1,
-                json!({"desired_fingerprint":desired_fingerprint,"tool_hash":provisioned.tool_hash,"resolution":provisioned.resolution.tools}),
+                json!({"desired_fingerprint":desired_fingerprint,"tool_hash":provisioned.tool_hash,"shell_hash":provisioned.shell_hash,"resolution":provisioned.resolution.tools}),
             ));
             record.image_resolution =
                 Some(ImageResolution::new(1, json!({"digest": create.image()})));
@@ -2799,7 +2824,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             let provisioned = self
                 .provision_explicit(&request.spec, &create, Some(&record), operation.id, &sender)
                 .await?;
-            self.emit(operation.id, json!({"phase":"after_provision","resolution_version":1,"desired_fingerprint":desired_fingerprint,"setup":provisioned.resolution.setup,"tools":provisioned.resolution.tools,"tool_hash":provisioned.tool_hash}), &sender).await?;
+            self.emit(operation.id, json!({"phase":"after_provision","resolution_version":1,"desired_fingerprint":desired_fingerprint,"setup":provisioned.resolution.setup,"tools":provisioned.resolution.tools,"tool_hash":provisioned.tool_hash,"shell_hash":provisioned.shell_hash}), &sender).await?;
             self.emit(operation.id, json!({"phase":"before_health","step":ProvisionStep::HealthCheck.as_str()}), &sender).await?;
             self.provisioner.health_check(&id).await?;
             self.emit(operation.id, json!({"phase":"after_health","desired_fingerprint":desired_fingerprint}), &sender).await?;
@@ -2836,7 +2861,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
         ));
         record.tool_resolution = Some(ToolResolution::new(
             1,
-            json!({"desired_fingerprint":desired_fingerprint,"tool_hash":provisioned.tool_hash,"resolution":provisioned.resolution.tools}),
+            json!({"desired_fingerprint":desired_fingerprint,"tool_hash":provisioned.tool_hash,"shell_hash":provisioned.shell_hash,"resolution":provisioned.resolution.tools}),
         ));
         record.ssh_resolution = Some(ssh_resolution);
         record.actual_state = ActualState::Running;
@@ -3283,7 +3308,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
                         ));
                         record.tool_resolution = Some(ToolResolution::new(
                             1,
-                            json!({"desired_fingerprint":fingerprint,"tool_hash":details.get("tool_hash").cloned().unwrap_or(Value::Null),"resolution":details.get("tools").cloned().unwrap_or(Value::Null)}),
+                            json!({"desired_fingerprint":fingerprint,"tool_hash":details.get("tool_hash").cloned().unwrap_or(Value::Null),"shell_hash":details.get("shell_hash").cloned().unwrap_or(Value::Null),"resolution":details.get("tools").cloned().unwrap_or(Value::Null)}),
                         ));
                         record.actual_state = actual;
                         self.database({
@@ -3747,7 +3772,12 @@ fn applied_state(record: Option<&SandboxRecord>) -> AppliedState {
         .and_then(|resolution| resolution.get("sha256"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    AppliedState::with_hashes(tool_hash, setup_sha256)
+    let shell_hash = record
+        .and_then(|record| record.tool_resolution.as_ref())
+        .and_then(|resolution| resolution.details.get("shell_hash"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    AppliedState::with_hashes(tool_hash, setup_sha256, shell_hash)
 }
 
 fn replacement_applied_state(record: &SandboxRecord) -> AppliedState {
@@ -3757,7 +3787,13 @@ fn replacement_applied_state(record: &SandboxRecord) -> AppliedState {
         .and_then(|resolution| resolution.details.get("tool_hash"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    AppliedState::with_hashes(tool_hash, None)
+    let shell_hash = record
+        .tool_resolution
+        .as_ref()
+        .and_then(|resolution| resolution.details.get("shell_hash"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    AppliedState::with_hashes(tool_hash, None, shell_hash)
 }
 
 fn exact_owned_container(
@@ -4004,6 +4040,16 @@ fn tool_state_matches(
         .map_err(|_| ServiceError::Provision("could not plan provisioning".to_owned()))
 }
 
+fn shell_state_matches(
+    record: &SandboxRecord,
+    canonical_root: &camino::Utf8Path,
+    manifest: &gascan_core::manifest::Manifest,
+) -> Result<bool, ServiceError> {
+    ProvisioningPlanner::plan_for_root(canonical_root, manifest, &applied_state(Some(record)))
+        .map(|plan| !plan.shell_changed())
+        .map_err(|_| ServiceError::Provision("could not plan provisioning".to_owned()))
+}
+
 fn parse_mise_versions(
     output: &[u8],
     desired: &BTreeMap<String, String>,
@@ -4113,6 +4159,7 @@ async fn desired_fingerprint(spec: &SandboxSpec) -> Result<String, ServiceError>
             })?;
         let mut hash = Sha256::new();
         hash.update(plan.desired_tool_hash().as_bytes());
+        hash.update(plan.desired_shell_hash().as_bytes());
         if let Some(setup) = plan.setup_script() {
             hash.update(setup.canonical_relative_path().as_str().as_bytes());
             hash.update(setup.sha256().as_bytes());

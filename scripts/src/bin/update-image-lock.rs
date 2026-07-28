@@ -266,6 +266,7 @@ struct ExistingImageLock {
     playwright_chromium: VersionedArtifact,
     gascamp: GascampLock,
     tools: BTreeMap<String, String>,
+    workstation_artifacts: BTreeMap<String, WorkstationArtifact>,
 }
 
 #[derive(Serialize)]
@@ -341,7 +342,11 @@ fn main() -> Result<(), DynError> {
         &resolved_chromium,
         &existing.playwright_chromium,
     );
-    let workstation_artifacts = resolve_workstation(&client, &inputs.workstation)?;
+    let resolved_workstation_artifacts = resolve_workstation(&client, &inputs.workstation)?;
+    let workstation_artifacts = preserve_reviewed_workstation_artifacts(
+        &resolved_workstation_artifacts,
+        &existing.workstation_artifacts,
+    )?;
     let (workstation_manifest, workstation_npm_lock) =
         generate_workstation_npm_lock(&client, &workstation_artifacts)?;
     let workstation_npm = resolve_workstation_npm(
@@ -392,7 +397,9 @@ fn main() -> Result<(), DynError> {
     let target_lock_bytes = fs::read(root.join("images/workspace/workstation-target-lock.toml"))?;
     let primary_lock = toml::to_string_pretty(&output)?.into_bytes();
     eprintln!("image-lock: writing {}", lock_path.display());
-    publish_generated_bundle_with(
+    verify_and_publish_generated_bundle_with(
+        &lock.workstation_artifacts,
+        |url, maximum| get_bounded(&client, url, maximum),
         &[
             (manifest_path.as_path(), workstation_manifest.as_slice()),
             (npm_lock_path.as_path(), workstation_npm_lock.as_slice()),
@@ -430,6 +437,43 @@ fn report_preserved_drift<T: std::fmt::Debug + PartialEq>(name: &str, resolved: 
     }
 }
 
+fn preserve_reviewed_workstation_artifacts(
+    resolved: &BTreeMap<String, WorkstationArtifact>,
+    existing: &BTreeMap<String, WorkstationArtifact>,
+) -> Result<BTreeMap<String, WorkstationArtifact>, DynError> {
+    let legacy = ["claude", "codex", "glab", "herdr", "neovim", "pi"];
+    let existing_names: BTreeSet<_> = existing.keys().map(String::as_str).collect();
+    let legacy_names: BTreeSet<_> = legacy.into_iter().collect();
+    let complete_names: BTreeSet<_> = legacy.into_iter().chain(["starship"]).collect();
+    if existing_names != legacy_names && existing_names != complete_names {
+        return Err("existing workstation artifact set differs from reviewed transition".into());
+    }
+    validate_workstation_artifacts(resolved)?;
+
+    let mut selected = BTreeMap::new();
+    for name in legacy {
+        let reviewed = existing
+            .get(name)
+            .ok_or("existing workstation lock omitted a reviewed artifact")?;
+        let current = resolved
+            .get(name)
+            .ok_or("workstation resolver omitted a reviewed artifact")?;
+        report_preserved_drift(&format!("workstation_artifacts.{name}"), current, reviewed);
+        selected.insert(name.to_owned(), reviewed.clone());
+    }
+    let starship = resolved
+        .get("starship")
+        .ok_or("workstation resolver omitted Starship")?;
+    if let Some(reviewed) = existing.get("starship")
+        && reviewed != starship
+    {
+        return Err("immutable Starship 1.25.1 release metadata changed".into());
+    }
+    selected.insert("starship".to_owned(), starship.clone());
+    validate_workstation_artifacts(&selected)?;
+    Ok(selected)
+}
+
 fn repository_root() -> Result<PathBuf, DynError> {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -457,6 +501,7 @@ fn validate_inputs(inputs: &Inputs) -> Result<(), DynError> {
         ("herdr".to_owned(), "latest".to_owned()),
         ("neovim".to_owned(), "0.11".to_owned()),
         ("pi".to_owned(), "latest".to_owned()),
+        ("starship".to_owned(), "1.25.1".to_owned()),
     ]);
     if inputs.workstation != expected {
         return Err("workstation resolver intent differs from the reviewed inputs".into());
@@ -760,6 +805,17 @@ fn resolve_workstation(
             |name| name == "nvim-linux-arm64.tar.gz",
         )?,
     );
+    artifacts.insert(
+        "starship".to_owned(),
+        resolve_github_artifact(
+            client,
+            "starship/starship",
+            intent
+                .get("starship")
+                .ok_or("workstation intent omitted starship")?,
+            |name| name == "starship-aarch64-unknown-linux-musl.tar.gz",
+        )?,
+    );
     validate_workstation_artifacts(&artifacts)?;
     Ok(artifacts)
 }
@@ -799,7 +855,16 @@ fn resolve_github_artifact(
     intent: &str,
     matches_asset: impl Fn(&str) -> bool,
 ) -> Result<WorkstationArtifact, DynError> {
-    let release = if intent == "latest" {
+    let release = if repository == "starship/starship" {
+        if intent != "1.25.1" {
+            return Err(format!("unsupported Starship resolver intent: {intent}").into());
+        }
+        get(
+            client,
+            "https://api.github.com/repos/starship/starship/releases/tags/v1.25.1",
+        )?
+        .json::<GithubRelease>()?
+    } else if intent == "latest" {
         get(
             client,
             &format!("https://api.github.com/repos/{repository}/releases/latest"),
@@ -826,6 +891,9 @@ fn resolve_github_artifact(
     if release.draft || release.prerelease {
         return Err(format!("{repository} resolved to a non-stable release").into());
     }
+    if repository == "starship/starship" && release.tag_name != "v1.25.1" {
+        return Err("Starship release tag differs from reviewed v1.25.1".into());
+    }
     let mut candidates = release
         .assets
         .iter()
@@ -841,10 +909,10 @@ fn resolve_github_artifact(
         .strip_prefix('v')
         .ok_or_else(|| format!("{repository} release tag is malformed"))?
         .to_owned();
-    let maximum = if repository == "ogulcancelik/herdr" {
-        64 * 1024 * 1024
-    } else {
-        128 * 1024 * 1024
+    let maximum = match repository {
+        "ogulcancelik/herdr" | "starship/starship" => 64 * 1024 * 1024,
+        "neovim/neovim" => 128 * 1024 * 1024,
+        _ => return Err(format!("unsupported GitHub workstation repository: {repository}").into()),
     };
     let bytes = get_bounded(client, &asset.browser_download_url, maximum)?;
     let size = u64::try_from(bytes.len())?;
@@ -852,8 +920,15 @@ fn resolve_github_artifact(
         return Err(format!("{repository} asset size differs from release metadata").into());
     }
     let digest = sha256(&bytes);
-    if let Some(published) = &asset.digest
-        && published != &format!("sha256:{digest}")
+    let published_digest = format!("sha256:{digest}");
+    if repository == "starship/starship" {
+        if asset.digest.as_deref() != Some(&published_digest) {
+            return Err(
+                "Starship asset omitted or differs from its release-provided SHA-256".into(),
+            );
+        }
+    } else if let Some(published) = &asset.digest
+        && published != &published_digest
     {
         return Err(format!("{repository} asset digest differs from release metadata").into());
     }
@@ -1964,7 +2039,10 @@ fn verify_existing_workstation_lock_files(
             let target = validate_workstation_target_lock_bytes(npm_lock_bytes, target_lock_bytes)?;
 
             let client = http_client()?;
-            verify_existing_workstation_artifacts(&client, &image_lock.workstation_artifacts)?;
+            verify_existing_workstation_artifacts(
+                &image_lock.workstation_artifacts,
+                |url, maximum| get_bounded(&client, url, maximum),
+            )?;
             let npm_lock: serde_json::Value = serde_json::from_slice(npm_lock_bytes)?;
             let packages = npm_lock["packages"]
                 .as_object()
@@ -2011,16 +2089,16 @@ fn read_existing_bundle_without_writes(
 }
 
 fn verify_existing_workstation_artifacts(
-    client: &Client,
     artifacts: &BTreeMap<String, WorkstationArtifact>,
+    mut fetch: impl FnMut(&str, usize) -> Result<Vec<u8>, DynError>,
 ) -> Result<(), DynError> {
     for (name, artifact) in artifacts {
         let maximum = match name.as_str() {
-            "claude" | "codex" | "pi" | "herdr" => 64 * 1024 * 1024,
+            "claude" | "codex" | "pi" | "herdr" | "starship" => 64 * 1024 * 1024,
             "glab" | "neovim" => 128 * 1024 * 1024,
             _ => return Err(format!("unsupported workstation artifact {name}").into()),
         };
-        let bytes = get_bounded(client, &artifact.url, maximum)?;
+        let bytes = fetch(&artifact.url, maximum)?;
         if u64::try_from(bytes.len())? != artifact.size || sha256(&bytes) != artifact.sha256 {
             return Err(
                 format!("{name} workstation artifact bytes differ from reviewed lock").into(),
@@ -2033,7 +2111,9 @@ fn verify_existing_workstation_artifacts(
 fn validate_workstation_artifacts(
     artifacts: &BTreeMap<String, WorkstationArtifact>,
 ) -> Result<(), DynError> {
-    let required = ["claude", "codex", "pi", "herdr", "glab", "neovim"];
+    let required = [
+        "claude", "codex", "pi", "herdr", "glab", "neovim", "starship",
+    ];
     if artifacts.len() != required.len()
         || required.iter().any(|name| !artifacts.contains_key(*name))
     {
@@ -2060,7 +2140,7 @@ fn validate_workstation_artifacts(
             return Err(format!("{name} has an empty artifact").into());
         }
         let maximum = match name.as_str() {
-            "claude" | "codex" | "pi" | "herdr" => 64 * 1024 * 1024,
+            "claude" | "codex" | "pi" | "herdr" | "starship" => 64 * 1024 * 1024,
             "glab" | "neovim" => 128 * 1024 * 1024,
             _ => 0,
         };
@@ -2121,6 +2201,16 @@ fn validate_workstation_url(name: &str, artifact: &WorkstationArtifact) -> Resul
                 && url.path()
                     == format!(
                         "/neovim/neovim/releases/download/v{version}/nvim-linux-arm64.tar.gz"
+                    )
+        }
+        "starship" => {
+            artifact.kind == "tar_gz"
+                && artifact.size <= 64 * 1024 * 1024
+                && version == "1.25.1"
+                && url.host_str() == Some("github.com")
+                && url.path()
+                    == format!(
+                        "/starship/starship/releases/download/v{version}/starship-aarch64-unknown-linux-musl.tar.gz"
                     )
         }
         _ => false,
@@ -2216,6 +2306,17 @@ enum PublicationBoundary {
     BackupDirectorySync,
     PublishRename(usize),
     DirectorySync,
+}
+
+fn verify_and_publish_generated_bundle_with(
+    artifacts: &BTreeMap<String, WorkstationArtifact>,
+    fetch: impl FnMut(&str, usize) -> Result<Vec<u8>, DynError>,
+    outputs: &[(&Path, &[u8])],
+    validate: impl FnOnce(&[PathBuf]) -> Result<(), DynError>,
+    before: impl FnMut(PublicationBoundary) -> std::io::Result<()>,
+) -> Result<(), DynError> {
+    verify_existing_workstation_artifacts(artifacts, fetch)?;
+    publish_generated_bundle_with(outputs, validate, before)
 }
 
 fn publish_generated_bundle_with(
@@ -2314,13 +2415,15 @@ mod tests {
     use super::{
         BrowserManifest, NPM_CLOSURE_MAX_BYTES, NPM_TARBALL_MAX_BYTES, PublicationBoundary,
         checksum_for, chromium_from_manifest, configured_npm_command, merge_workstation_sections,
-        next_npm_download_limit, npm_metadata_url, publish_generated_bundle_with,
-        read_existing_bundle_without_writes, rust_version_from_channel, validate_claude_elf,
+        next_npm_download_limit, npm_metadata_url, preserve_reviewed_workstation_artifacts,
+        publish_generated_bundle_with, read_existing_bundle_without_writes,
+        rust_version_from_channel, validate_claude_elf, verify_and_publish_generated_bundle_with,
         verify_npm_closure_tarballs_with, verify_npm_closure_tarballs_with_limits,
     };
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use sha2::{Digest, Sha512};
     use std::{
+        collections::BTreeMap,
         io::{Read as _, Write as _},
         net::TcpListener,
         thread,
@@ -2411,6 +2514,47 @@ scripts = "old"
             merged["workstation_npm"]["scripts"].as_str(),
             Some("disabled")
         );
+    }
+
+    #[test]
+    fn workstation_resolution_preserves_reviewed_tools_and_adds_only_starship() {
+        let parsed: super::WorkstationValidationLock =
+            toml::from_str(include_str!("../../../images/workspace/versions.lock")).unwrap();
+        let mut existing = parsed.workstation_artifacts;
+        existing.remove("starship");
+        let mut resolved = existing.clone();
+        let mut drifted_claude = resolved["claude"].clone();
+        drifted_claude.version = "9.9.9".to_owned();
+        drifted_claude.url =
+            "https://registry.npmjs.org/@anthropic-ai/claude-code/-/claude-code-9.9.9.tgz"
+                .to_owned();
+        resolved.insert("claude".to_owned(), drifted_claude);
+        resolved.insert(
+            "starship".to_owned(),
+            super::WorkstationArtifact {
+                version: "1.25.1".to_owned(),
+                url: "https://github.com/starship/starship/releases/download/v1.25.1/starship-aarch64-unknown-linux-musl.tar.gz".to_owned(),
+                sha256: "0".repeat(64),
+                platform: "linux-arm64".to_owned(),
+                kind: "tar_gz".to_owned(),
+                size: 1,
+            },
+        );
+
+        let selected = preserve_reviewed_workstation_artifacts(&resolved, &existing).unwrap();
+        assert_eq!(selected["claude"], existing["claude"]);
+        assert_eq!(selected["starship"], resolved["starship"]);
+        assert_eq!(selected.len(), existing.len() + 1);
+
+        let mut unexpected = existing.clone();
+        unexpected.insert("unreviewed".to_owned(), resolved["starship"].clone());
+        assert!(preserve_reviewed_workstation_artifacts(&resolved, &unexpected).is_err());
+
+        let mut changed_starship = existing;
+        let mut reviewed_starship = resolved["starship"].clone();
+        reviewed_starship.sha256 = "1".repeat(64);
+        changed_starship.insert("starship".to_owned(), reviewed_starship);
+        assert!(preserve_reviewed_workstation_artifacts(&resolved, &changed_starship).is_err());
     }
 
     #[test]
@@ -2599,6 +2743,91 @@ scripts = "old"
         .unwrap();
         for (path, bytes) in paths.iter().zip(exact) {
             assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn preserved_legacy_artifact_byte_mismatch_prevents_staging_and_publication() {
+        for mismatch in ["size", "digest"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let paths = ["manifest.json", "package-lock.json", "versions.lock"]
+                .map(|name| temporary.path().join(name));
+            let old = [b"old manifest".as_slice(), b"old npm lock", b"old primary"];
+            let new = [b"new manifest".as_slice(), b"new npm lock", b"new primary"];
+            for (path, bytes) in paths.iter().zip(old) {
+                std::fs::write(path, bytes).unwrap();
+            }
+            let outputs = [
+                (paths[0].as_path(), new[0]),
+                (paths[1].as_path(), new[1]),
+                (paths[2].as_path(), new[2]),
+            ];
+
+            let parsed: super::WorkstationValidationLock =
+                toml::from_str(include_str!("../../../images/workspace/versions.lock")).unwrap();
+            let mut resolved = parsed.workstation_artifacts;
+            let claude_bytes = b"claude resolved bytes".to_vec();
+            let claude = resolved.get_mut("claude").unwrap();
+            claude.sha256 =
+                "03dd245e065fcd87e2b5fc079b3ff4144962f9f9427d9a762b55c27ffc9157ae".to_owned();
+            claude.size = u64::try_from(claude_bytes.len()).unwrap();
+            let claude_url = claude.url.clone();
+            let starship_bytes = b"starship resolved bytes".to_vec();
+            let starship = resolved.get_mut("starship").unwrap();
+            starship.sha256 =
+                "d92613055916f08c1f04989d90b2caf2e31aa1c553eece916e7d8b591be283b9".to_owned();
+            starship.size = u64::try_from(starship_bytes.len()).unwrap();
+            let starship_url = starship.url.clone();
+            let bodies =
+                BTreeMap::from([(claude_url, claude_bytes), (starship_url, starship_bytes)]);
+            let mut existing = resolved.clone();
+            existing.remove("starship");
+            let reviewed_claude = existing.get_mut("claude").unwrap();
+            if mismatch == "size" {
+                reviewed_claude.size += 1;
+            } else {
+                reviewed_claude.sha256 = "0".repeat(64);
+            }
+            let selected = preserve_reviewed_workstation_artifacts(&resolved, &existing).unwrap();
+            assert_eq!(selected["claude"], existing["claude"]);
+            assert_ne!(selected["claude"], resolved["claude"]);
+            assert_eq!(selected["starship"], resolved["starship"]);
+
+            let mut boundaries = Vec::new();
+            let result = verify_and_publish_generated_bundle_with(
+                &selected,
+                |url, maximum| {
+                    let bytes = bodies.get(url).unwrap().clone();
+                    assert!(bytes.len() <= maximum);
+                    Ok(bytes)
+                },
+                &outputs,
+                |_| Ok(()),
+                |boundary| {
+                    boundaries.push(boundary);
+                    Ok(())
+                },
+            );
+
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("claude workstation artifact bytes differ from reviewed lock"),
+                "{mismatch} mismatch was not rejected"
+            );
+            assert!(
+                boundaries.is_empty(),
+                "{mismatch} mismatch reached generated output staging"
+            );
+            for (path, expected) in paths.iter().zip(old) {
+                assert_eq!(
+                    std::fs::read(path).unwrap(),
+                    expected,
+                    "{mismatch} mismatch changed {}",
+                    path.display()
+                );
+            }
         }
     }
 

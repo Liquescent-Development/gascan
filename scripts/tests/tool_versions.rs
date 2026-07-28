@@ -79,11 +79,12 @@ fn workstation_source_contains_only_reviewed_resolver_intent() {
     let source = fs::read_to_string(root().join("images/workspace/versions.toml")).unwrap();
     let source: toml::Value = toml::from_str(&source).unwrap();
     let workstation = source["workstation"].as_table().unwrap();
-    assert_eq!(workstation.len(), 6);
+    assert_eq!(workstation.len(), 7);
     for tool in ["claude", "codex", "pi", "herdr", "glab"] {
         assert_eq!(workstation[tool].as_str(), Some("latest"));
     }
     assert_eq!(workstation["neovim"].as_str(), Some("0.11"));
+    assert_eq!(workstation["starship"].as_str(), Some("1.25.1"));
 }
 
 #[test]

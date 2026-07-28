@@ -3,7 +3,7 @@
 
 mod apple_common;
 
-use apple_common::{AppleE2e, TestResult};
+use apple_common::{AppleE2e, TestResult, inline_marker_value, marker_payload};
 
 #[test]
 #[ignore = "requires supported Apple runtime and the locked workspace image"]
@@ -12,6 +12,61 @@ fn cli_lifecycle_survives_daemon_and_host_state_changes() -> TestResult {
     env.install_noop_setup()?;
     env.success(["up", env.root().to_str().ok_or("non-UTF-8 root")?])?;
     env.assert_managed_network_attachment()?;
+
+    let native_shell = env.run_default_shell_pty_script(
+        r#"printf 'GASCAN_STANDARD_SHELL_BEGIN\n'
+printf 'GASCAN_BASH_%s%sGASCAN_BASH_%s\n' 'VERSION_BEGIN' "${BASH_VERSION:-}" 'VERSION_END'
+case $- in *i*) printf 'INTERACTIVE=yes\n';; *) printf 'INTERACTIVE=no\n';; esac
+if shopt -q login_shell; then printf 'LOGIN=yes\n'; else printf 'LOGIN=no\n'; fi
+printf 'SHELL=%s\n' "${SHELL:-}"
+if test -r /usr/share/bash-completion/bash_completion; then
+    printf 'COMPLETION=readable\n'
+else
+    printf 'COMPLETION=missing\n'
+fi
+printf 'TERM=%s\n' "${TERM:-}"
+printf 'SELECTOR=%s\n' "$(< /home/workspace/.config/gascan/shell/prompt)"
+printf 'GASCAN_STANDARD_SHELL_END\n'
+exit 0
+"#,
+        b"GASCAN_STANDARD_SHELL_END",
+        "gascan-apple-e2e-term",
+    )?;
+    if !native_shell.status.success() {
+        return Err(format!(
+            "default native shell failed with {:?}: {}",
+            native_shell.status.code(),
+            String::from_utf8_lossy(&native_shell.stdout)
+        )
+        .into());
+    }
+    let native_shell = marker_payload(
+        &native_shell.stdout,
+        "GASCAN_STANDARD_SHELL_BEGIN",
+        "GASCAN_STANDARD_SHELL_END",
+    )?;
+    for required in [
+        "INTERACTIVE=yes\n",
+        "LOGIN=yes\n",
+        "SHELL=/bin/bash\n",
+        "COMPLETION=readable\n",
+        "TERM=gascan-apple-e2e-term\n",
+        "SELECTOR=standard\n",
+    ] {
+        if !native_shell.contains(required) {
+            return Err(
+                format!("default native shell omitted {required:?}: {native_shell:?}").into(),
+            );
+        }
+    }
+    let bash_version = inline_marker_value(
+        &native_shell,
+        "GASCAN_BASH_VERSION_BEGIN",
+        "GASCAN_BASH_VERSION_END",
+    )?;
+    if bash_version.is_empty() {
+        return Err("default native shell did not run Bash".into());
+    }
 
     let dns = env.success([
         "--sandbox",
@@ -47,14 +102,22 @@ fn cli_lifecycle_survives_daemon_and_host_state_changes() -> TestResult {
     let exit = env.invoke(["--sandbox", env.id(), "run", "--", "sh", "-c", "exit 42"])?;
     env.assert_exit_code(&exit, 42)?;
 
-    let shell = env.success(["--sandbox", env.id(), "shell", "--", "sh", "-c", "id -u"])?;
-    assert_eq!(shell.stdout, b"1000\r\n");
+    let shell = env.success([
+        "--sandbox",
+        env.id(),
+        "shell",
+        "--",
+        "printf",
+        "[%s]",
+        "gascan explicit argv",
+    ])?;
+    assert_eq!(shell.stdout, b"[gascan explicit argv]");
 
     let tty = env.run_pty(&["sh", "-c", "test -t 0 && test -t 1"])?;
     assert!(
         tty.status.success(),
         "TTY shell failed: {}",
-        String::from_utf8_lossy(&tty.stderr)
+        String::from_utf8_lossy(&tty.stdout)
     );
 
     let resized = env.run_pty_resize(

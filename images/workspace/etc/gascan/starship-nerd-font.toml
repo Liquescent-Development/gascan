@@ -1,0 +1,73 @@
+format = "$username$hostname$directory$git_branch$git_status$elixir$erlang$golang$java$nodejs$python$ruby$rust$status$cmd_duration$line_break$character"
+add_newline = false
+
+[username]
+show_always = true
+format = "[ $user]($style)"
+style_user = "bold blue"
+style_root = "bold red"
+
+[hostname]
+ssh_only = false
+format = "[@$hostname]($style) "
+style = "bold cyan"
+
+[directory]
+format = "[  $path]($style) "
+style = "bold blue"
+truncation_length = 4
+truncate_to_repo = true
+
+[git_branch]
+format = "[ $branch]($style) "
+style = "bold purple"
+
+[git_status]
+format = "([$all_status$ahead_behind]($style) )"
+style = "bold yellow"
+
+[elixir]
+format = "[ $version]($style) "
+style = "purple"
+
+[erlang]
+format = "[ $version]($style) "
+style = "red"
+
+[golang]
+format = "[ $version]($style) "
+style = "cyan"
+
+[java]
+format = "[ $version]($style) "
+style = "red"
+
+[nodejs]
+format = "[ $version]($style) "
+style = "green"
+
+[python]
+format = "[ $version]($style) "
+style = "yellow"
+
+[ruby]
+format = "[ $version]($style) "
+style = "red"
+
+[rust]
+format = "[ $version]($style) "
+style = "red"
+
+[status]
+disabled = false
+format = "[ $status]($style) "
+style = "bold red"
+
+[cmd_duration]
+min_time = 2000
+format = "[󱎫 $duration]($style) "
+style = "yellow"
+
+[character]
+success_symbol = "[❯](bold green)"
+error_symbol = "[❯](bold red)"

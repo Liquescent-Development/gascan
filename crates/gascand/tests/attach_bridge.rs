@@ -1,7 +1,9 @@
 use std::{error::Error, sync::Arc, time::Duration};
 
 use camino::Utf8Path;
-use gascan_core::{fake_runtime::FakeRuntime, manifest::Manifest, sandbox::SandboxSpec};
+use gascan_core::{
+    fake_runtime::FakeRuntime, manifest::Manifest, runtime::RuntimeCall, sandbox::SandboxSpec,
+};
 use gascan_proto::v1::{self, gas_can_server::GasCan};
 use gascand::{ActivityTracker, NoopProvisioner, SandboxApi, SandboxService, Store, UpRequest};
 use prost::Message;
@@ -91,5 +93,94 @@ async fn bridge_preserves_binary_streams_and_exact_exit() -> TestResult {
         }))
     );
     assert!(attached.next().await.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn shell_defaults_to_login_bash_and_preserves_explicit_argv() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let root_path = Utf8Path::from_path(root.path()).ok_or("temporary path is not UTF-8")?;
+    let spec = SandboxSpec::from_root("shell-default", root_path, Manifest::load(root_path)?)?;
+    let id = spec.id().to_string();
+    let runtime = FakeRuntime::default();
+    let service = Arc::new(SandboxService::new(
+        runtime.clone(),
+        Store::open(root_path.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    ));
+    service.up(UpRequest::new(spec)).await?;
+
+    let api = SandboxApi::new(service, ActivityTracker::new());
+    for command in [
+        v1::CommandPayload {
+            argv: Vec::new(),
+            environment: Vec::new(),
+            tty: false,
+        },
+        v1::CommandPayload {
+            argv: ["bash", "--noprofile", "--norc", "-c", "printf explicit"]
+                .into_iter()
+                .map(|argument| argument.as_bytes().to_vec())
+                .collect(),
+            environment: Vec::new(),
+            tty: false,
+        },
+    ] {
+        let mut events = api
+            .shell(tonic::Request::new(v1::ShellRequest {
+                sandbox: Some(v1::SandboxSelector {
+                    sandbox_id: id.clone(),
+                }),
+                command: Some(command),
+            }))
+            .await?
+            .into_inner();
+        let token = events
+            .next()
+            .await
+            .ok_or("session token missing")??
+            .session_token;
+        let close = v1::ClientFrame {
+            frame: Some(v1::client_frame::Frame::Close(v1::Close {})),
+            session_token: token,
+        };
+        let mut attached = api
+            .attach(tonic::Request::new(tonic::Streaming::new_request(
+                tonic::codec::ProstCodec::<v1::ServerFrame, v1::ClientFrame>::raw_decoder(
+                    tonic::codec::BufferSettings::default(),
+                ),
+                http_body_util::Full::new(prost::bytes::Bytes::from({
+                    let mut encoded = Vec::with_capacity(close.encoded_len() + 5);
+                    encoded.push(0);
+                    encoded.extend_from_slice(&u32::try_from(close.encoded_len())?.to_be_bytes());
+                    close.encode(&mut encoded)?;
+                    encoded
+                })),
+                None,
+                None,
+            )))
+            .await?
+            .into_inner();
+        while attached.next().await.is_some() {}
+    }
+
+    let execs = runtime
+        .calls()
+        .await
+        .into_iter()
+        .filter_map(|call| match call {
+            RuntimeCall::Exec(request) => Some(request),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [default_exec, explicit_exec] = &execs[execs.len() - 2..] else {
+        return Err("shell exec requests missing".into());
+    };
+    assert_eq!(default_exec.argv, ["/bin/bash", "--login"]);
+    assert!(default_exec.tty);
+    assert_eq!(
+        explicit_exec.argv,
+        ["bash", "--noprofile", "--norc", "-c", "printf explicit"]
+    );
     Ok(())
 }

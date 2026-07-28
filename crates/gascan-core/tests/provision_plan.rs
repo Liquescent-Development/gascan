@@ -1,5 +1,5 @@
 use camino::Utf8Path;
-use gascan_core::manifest::Manifest;
+use gascan_core::manifest::{Manifest, ShellPrompt};
 use gascan_core::provision::{AppliedState, ProvisionStep, ProvisioningPlanner};
 use std::error::Error;
 
@@ -19,6 +19,7 @@ fn tool_change_requires_apply_and_emits_plain_mise_config() -> TestResult {
 
     assert_eq!(plan.steps()[0], ProvisionStep::WriteSafeMiseConfig);
     assert_eq!(plan.steps()[1], ProvisionStep::InstallTools);
+    assert_eq!(plan.steps()[2], ProvisionStep::ConfigureShell);
     let config = plan.safe_mise_toml()?.ok_or("safe config")?;
     assert!(config.contains("[tools]"));
     assert!(config.contains("node = \"lts\""));
@@ -72,9 +73,36 @@ fn empty_tool_plan_still_contains_create_verification_boundaries() -> TestResult
 
     assert_eq!(
         plan.steps(),
-        [ProvisionStep::VerifyGascamp, ProvisionStep::HealthCheck]
+        [
+            ProvisionStep::ConfigureShell,
+            ProvisionStep::VerifyGascamp,
+            ProvisionStep::HealthCheck,
+        ]
     );
     assert_eq!(plan.safe_mise_toml()?, None);
+    Ok(())
+}
+
+#[test]
+fn shell_prompt_is_versioned_state_independent_of_tool_state() -> TestResult {
+    let standard = ProvisioningPlanner::plan(&manifest("version = 1\n")?, &AppliedState::empty())?;
+    assert!(standard.shell_changed());
+    assert!(standard.steps().contains(&ProvisionStep::ConfigureShell));
+
+    let applied = AppliedState::with_hashes(
+        Some(standard.desired_tool_hash().to_owned()),
+        None,
+        Some(standard.desired_shell_hash().to_owned()),
+    );
+    let unchanged = ProvisioningPlanner::plan(&manifest("version = 1\n")?, &applied)?;
+    assert!(!unchanged.shell_changed());
+
+    let nerd = ProvisioningPlanner::plan(
+        &manifest("version = 1\n[shell]\nprompt = 'starship-nerd-font'\n")?,
+        &AppliedState::empty(),
+    )?;
+    assert_ne!(standard.desired_shell_hash(), nerd.desired_shell_hash());
+    assert_eq!(nerd.shell_prompt(), ShellPrompt::StarshipNerdFont);
     Ok(())
 }
 

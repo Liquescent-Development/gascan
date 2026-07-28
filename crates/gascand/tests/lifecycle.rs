@@ -4,6 +4,7 @@ use gascan_core::doctor::{DoctorFacts, DoctorStatus};
 use gascan_core::fake_runtime::{FailureBoundary, FakeRuntime};
 use gascan_core::manifest::Manifest;
 use gascan_core::policy::PolicyCompiler;
+use gascan_core::provision::{AppliedState, ProvisioningPlanner};
 use gascan_core::runtime::{
     ContainerState, RemoveRequest, ResourceIdentity, ResourceKind, ResourceOwnership,
     RuntimeBackend, RuntimeCall, RuntimeError,
@@ -185,6 +186,33 @@ fn spec(name: &str, root: &Utf8Path) -> Result<SandboxSpec, Box<dyn Error>> {
     Ok(SandboxSpec::from_root(name, root, Manifest::load(root)?)?)
 }
 
+fn write_shell_manifest(root: &Utf8Path, prompt: &str) -> TestResult {
+    std::fs::write(
+        root.join("gascan.toml"),
+        format!("version = 1\n[shell]\nprompt = '{prompt}'\n"),
+    )?;
+    Ok(())
+}
+
+fn desired_shell_hash(spec: &SandboxSpec) -> Result<String, Box<dyn Error>> {
+    Ok(ProvisioningPlanner::plan_for_root(
+        spec.canonical_root(),
+        spec.manifest(),
+        &AppliedState::empty(),
+    )?
+    .desired_shell_hash()
+    .to_owned())
+}
+
+fn stored_shell_hash(record: &SandboxRecord) -> Option<&str> {
+    record
+        .tool_resolution
+        .as_ref()?
+        .details
+        .get("shell_hash")?
+        .as_str()
+}
+
 fn rewrite_runtime_image(path: &Utf8Path, image: &str) -> TestResult {
     let mut snapshot: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
     let sandboxes = snapshot["sandboxes"]
@@ -234,6 +262,80 @@ fn apple_bootstrap_port_collision() -> RuntimeError {
                  bind(descriptor:ptr:bytes:): Address already in use) (errno: 48)\n"
             .to_owned(),
     }
+}
+
+#[tokio::test]
+async fn initial_standard_nerd_switch_and_disable_configure_and_persist_exact_shell_state()
+-> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    write_shell_manifest(root, "standard")?;
+    let runtime = FakeRuntime::default();
+    let service = SandboxService::new(
+        runtime.clone(),
+        Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+    );
+
+    let initial = spec("shell-lifecycle", root)?;
+    let initial_hash = desired_shell_hash(&initial)?;
+    let before_initial = runtime.calls().await.len();
+    service.up(UpRequest::new(initial.clone())).await?;
+    let calls = runtime.calls().await;
+    assert!(calls[before_initial..].iter().any(|call| {
+        matches!(call, RuntimeCall::Exec(request)
+        if request.argv == [
+            "/usr/bin/sudo",
+            "-n",
+            "/usr/local/bin/configure-shell-home",
+            "standard",
+        ])
+    }));
+    assert_eq!(
+        stored_shell_hash(&service.status(initial.id())?.ok_or("initial record")?),
+        Some(initial_hash.as_str())
+    );
+
+    write_shell_manifest(root, "starship-nerd-font")?;
+    let nerd = spec("shell-lifecycle", root)?;
+    let nerd_hash = desired_shell_hash(&nerd)?;
+    let before_nerd = runtime.calls().await.len();
+    service.apply(UpRequest::new(nerd.clone())).await?;
+    let calls = runtime.calls().await;
+    assert!(calls[before_nerd..].iter().any(|call| {
+        matches!(call, RuntimeCall::Exec(request)
+        if request.argv == [
+            "/usr/bin/sudo",
+            "-n",
+            "/usr/local/bin/configure-shell-home",
+            "starship-nerd-font",
+        ])
+    }));
+    assert_eq!(
+        stored_shell_hash(&service.status(nerd.id())?.ok_or("nerd record")?),
+        Some(nerd_hash.as_str())
+    );
+
+    write_shell_manifest(root, "standard")?;
+    let standard = spec("shell-lifecycle", root)?;
+    let standard_hash = desired_shell_hash(&standard)?;
+    let before_disable = runtime.calls().await.len();
+    service.apply(UpRequest::new(standard.clone())).await?;
+    let calls = runtime.calls().await;
+    assert!(calls[before_disable..].iter().any(|call| {
+        matches!(call, RuntimeCall::Exec(request)
+        if request.argv == [
+            "/usr/bin/sudo",
+            "-n",
+            "/usr/local/bin/configure-shell-home",
+            "standard",
+        ])
+    }));
+    assert_eq!(
+        stored_shell_hash(&service.status(standard.id())?.ok_or("standard record")?),
+        Some(standard_hash.as_str())
+    );
+    Ok(())
 }
 
 #[test]

@@ -112,6 +112,8 @@ test "$(first_line pico --version | awk '{print $1, $2, $3, $4}')" = "$(locked_v
 test "$(first_line gh --version | awk '{print $1, $2, $3}')" = "$(locked_version gh)" ||
     die 'gh normalized version differs from the workstation lock'
 expect_exact "$(locked_version git)" git --version
+test "$(first_line /opt/gascan/shell/bin/starship --version)" = "starship $(locked_version starship)" ||
+    die 'starship version differs from the workstation lock'
 test "$(first_line ip -Version | cut -d, -f1,2)" = "$(locked_version ip)" ||
     die 'ip normalized version differs from the workstation lock'
 expect_exact "$(locked_version ss)" ss --version
@@ -136,6 +138,35 @@ expect_exact "$(locked_version tmux)" tmux -V
 
 test "$MISE_DATA_DIR" = /home/workspace/.local/share/mise ||
     die 'writable mise data root differs from production policy'
+test "$(stat -c %U:%G:%a /home/workspace)" = workspace:workspace:755 ||
+    die 'workspace HOME metadata differs from provisioning policy'
+test "$(stat -c %U:%G:%a /home/workspace/.local)" = workspace:workspace:700 ||
+    die 'workspace private data root metadata differs from provisioning policy'
+test "$(stat -c %U:%G:%a /home/workspace/.cache)" = workspace:workspace:700 ||
+    die 'workspace private cache root metadata differs from provisioning policy'
+test "$(stat -c %U:%G:%a /home/workspace/.config)" = root:workspace:1770 ||
+    die 'workspace managed configuration boundary metadata changed'
+test "$SHELL" = /bin/bash || die 'interactive shell environment differs from image policy'
+test -r /usr/share/bash-completion/bash_completion ||
+    die 'Bash completion framework is unavailable'
+test "$(stat -c %U:%G:%a /etc/gascan)" = root:root:555 ||
+    die 'immutable Gas Can configuration directory metadata changed'
+test -x /etc/gascan ||
+    die 'immutable Gas Can configuration directory is not traversable'
+test -r /etc/gascan/bashrc || die 'immutable Bash hook is unavailable'
+test "$(stat -c %U:%G:%a /etc/gascan/bashrc)" = root:root:444 ||
+    die 'immutable Bash hook metadata changed'
+test -L /opt/gascan/shell/bin/starship ||
+    die 'stable Starship path is not a link'
+test "$(readlink /opt/gascan/shell/bin/starship)" = ../../workstation/bin/starship ||
+    die 'stable Starship link target changed'
+for preset in \
+    /opt/gascan/shell/presets/starship.toml \
+    /opt/gascan/shell/presets/starship-nerd-font.toml
+do
+    test "$(stat -c %U:%G:%a "$preset")" = root:root:444 ||
+        die "immutable Starship preset metadata changed: $preset"
+done
 test "$MISE_SYSTEM_DATA_DIR" = /opt/gascan/mise ||
     die 'immutable mise system root differs from production policy'
 test "$MISE_CACHE_DIR" = /home/workspace/.cache/mise ||
