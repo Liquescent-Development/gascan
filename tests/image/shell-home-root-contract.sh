@@ -532,10 +532,11 @@ failure_output=$(
          STARSHIP_CONFIG='preexisting-config'; \
          STARSHIP_EXECUTABLE='preexisting-executable'; \
          . '$hook'; . '$hook'; \
-         printf 'PS1=%s\nCONFIG=%s\nEXEC=%s\nCONFIG_DECL=%s\nEXEC_DECL=%s\n' \
+         declare -p __gascan_starship_euid >/dev/null 2>&1 && helper=set || helper=unset; \
+         printf 'PS1=%s\nCONFIG=%s\nEXEC=%s\nCONFIG_DECL=%s\nEXEC_DECL=%s\nHELPER=%s\n' \
          \"\$PS1\" \"\$STARSHIP_CONFIG\" \"\$STARSHIP_EXECUTABLE\" \
          \"\$(declare -p STARSHIP_CONFIG)\" \
-         \"\$(declare -p STARSHIP_EXECUTABLE)\"" \
+         \"\$(declare -p STARSHIP_EXECUTABLE)\" \"\$helper\"" \
         2>&1
 )
 test "$(printf '%s\n' "$failure_output" |
@@ -553,6 +554,8 @@ printf '%s\n' "$failure_output" |
 printf '%s\n' "$failure_output" |
     grep -Fqx 'EXEC_DECL=declare -- STARSHIP_EXECUTABLE="preexisting-executable"' ||
     die 'generation failure changed STARSHIP_EXECUTABLE export state'
+printf '%s\n' "$failure_output" | grep -Fqx HELPER=unset ||
+    die 'generation failure leaked the Gas Can EUID helper'
 
 eval_failure_output=$(
     GASCAN_TEST_EVAL_FAIL=1 PATH="$attacker_bin:/usr/bin:/bin" \
@@ -564,12 +567,13 @@ eval_failure_output=$(
          trap 'STARSHIP_NATIVE_TRAP=1' DEBUG; \
          . '$hook'; \
          declare -F starship_partial_leak >/dev/null && printf 'FUNCTION=leaked\n'; \
-         printf 'PS1=%s\nPS2=%s\nPROMPT=%s\nCONFIG=%s\nEXEC=%s\nPARTIAL=%s\nTRAP=%s\nCONFIG_DECL=%s\nEXEC_DECL=%s\n' \
+         declare -p __gascan_starship_euid >/dev/null 2>&1 && helper=set || helper=unset; \
+         printf 'PS1=%s\nPS2=%s\nPROMPT=%s\nCONFIG=%s\nEXEC=%s\nPARTIAL=%s\nTRAP=%s\nCONFIG_DECL=%s\nEXEC_DECL=%s\nHELPER=%s\n' \
          \"\$PS1\" \"\$PS2\" \"\$PROMPT_COMMAND\" \
          \"\$STARSHIP_CONFIG\" \"\$STARSHIP_EXECUTABLE\" \
          \"\${STARSHIP_PARTIAL-unset}\" \"\$(trap -p DEBUG)\" \
          \"\$(declare -p STARSHIP_CONFIG)\" \
-         \"\$(declare -p STARSHIP_EXECUTABLE)\"" 2>&1
+         \"\$(declare -p STARSHIP_EXECUTABLE)\" \"\$helper\"" 2>&1
 )
 printf '%s\n' "$eval_failure_output" |
     grep -Fq 'gascan: Starship prompt unavailable; using standard Bash prompt.' ||
@@ -598,6 +602,8 @@ test "$(printf '%s\n' "$eval_failure_output" | grep -Fc FUNCTION=leaked)" = 0 ||
 printf '%s\n' "$eval_failure_output" |
     grep -Fq "trap -- 'STARSHIP_NATIVE_TRAP=1' DEBUG" ||
     die 'partial init replaced the existing DEBUG trap'
+printf '%s\n' "$eval_failure_output" | grep -Fqx HELPER=unset ||
+    die 'eval failure leaked the Gas Can EUID helper'
 full_init_count=$(grep -Fc 'init bash --print-full-init' "$stable_log")
 test "$full_init_count" = 6 ||
     die "full init invocation count is $full_init_count, expected 6"

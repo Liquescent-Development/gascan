@@ -2112,14 +2112,14 @@ fn shell_hook_warns_once_and_returns_success_when_starship_is_unavailable() {
     );
     let output = run_hook(
         &hook,
-        r#"PS1='native-prompt'; . "$GASCAN_TEST_HOOK"; . "$GASCAN_TEST_HOOK"; printf '%s\n' "$PS1""#,
+        r#"PS1='native-prompt'; . "$GASCAN_TEST_HOOK"; . "$GASCAN_TEST_HOOK"; if declare -p __gascan_starship_euid >/dev/null 2>&1; then helper=set; else helper=unset; fi; printf '%s|%s\n' "$PS1" "$helper""#,
         &log,
         true,
         false,
         true,
     );
     assert!(output.status.success());
-    assert_eq!(output.stdout, b"native-prompt\n");
+    assert_eq!(output.stdout, b"native-prompt|unset\n");
     assert_eq!(
         String::from_utf8_lossy(&output.stderr)
             .matches("gascan: Starship prompt unavailable; using standard Bash prompt.")
@@ -2490,7 +2490,7 @@ fn shell_hook_warns_once_and_returns_success_when_starship_is_unavailable() {
 
     let partial = run_hook(
         &hook,
-        r#"PS1='native-prompt'; PS2='native-continuation'; PROMPT_COMMAND='native-command'; STARSHIP_CONFIG='old-config'; STARSHIP_EXECUTABLE='old-executable'; trap 'STARSHIP_NATIVE_TRAP=1' DEBUG; . "$GASCAN_TEST_HOOK"; declare -F starship_partial_leak >/dev/null && printf 'function=leaked\n'; printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$PS1" "$PS2" "$PROMPT_COMMAND" "$STARSHIP_CONFIG" "$STARSHIP_EXECUTABLE" "${STARSHIP_PARTIAL-unset}" "$(trap -p DEBUG)" "$(declare -p STARSHIP_CONFIG)" "$(declare -p STARSHIP_EXECUTABLE)""#,
+        r#"PS1='native-prompt'; PS2='native-continuation'; PROMPT_COMMAND='native-command'; STARSHIP_CONFIG='old-config'; STARSHIP_EXECUTABLE='old-executable'; trap 'STARSHIP_NATIVE_TRAP=1' DEBUG; . "$GASCAN_TEST_HOOK"; declare -F starship_partial_leak >/dev/null && printf 'function=leaked\n'; if declare -p __gascan_starship_euid >/dev/null 2>&1; then helper=set; else helper=unset; fi; printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$PS1" "$PS2" "$PROMPT_COMMAND" "$STARSHIP_CONFIG" "$STARSHIP_EXECUTABLE" "${STARSHIP_PARTIAL-unset}" "$(trap -p DEBUG)" "$(declare -p STARSHIP_CONFIG)" "$(declare -p STARSHIP_EXECUTABLE)" "$helper""#,
         &log,
         false,
         true,
@@ -2499,7 +2499,7 @@ fn shell_hook_warns_once_and_returns_success_when_starship_is_unavailable() {
     assert!(partial.status.success());
     assert_eq!(
         partial.stdout,
-        b"native-prompt|native-continuation|native-command|old-config|old-executable|unset|trap -- 'STARSHIP_NATIVE_TRAP=1' DEBUG|declare -- STARSHIP_CONFIG=\"old-config\"|declare -- STARSHIP_EXECUTABLE=\"old-executable\"\n",
+        b"native-prompt|native-continuation|native-command|old-config|old-executable|unset|trap -- 'STARSHIP_NATIVE_TRAP=1' DEBUG|declare -- STARSHIP_CONFIG=\"old-config\"|declare -- STARSHIP_EXECUTABLE=\"old-executable\"|unset\n",
         "stderr: {}",
         String::from_utf8_lossy(&partial.stderr)
     );
@@ -2535,14 +2535,14 @@ fn shell_hook_warns_once_and_returns_success_when_starship_is_unavailable() {
     let log_before = fs::read_to_string(&log).unwrap();
     let changed_config = run_hook(
         &hook,
-        r#"PS1='native-prompt'; . "$GASCAN_TEST_HOOK"; printf '%s\n' "$PS1""#,
+        r#"PS1='native-prompt'; . "$GASCAN_TEST_HOOK"; if declare -p __gascan_starship_euid >/dev/null 2>&1; then helper=set; else helper=unset; fi; printf '%s|%s\n' "$PS1" "$helper""#,
         &log,
         false,
         false,
         true,
     );
     assert!(changed_config.status.success());
-    assert_eq!(changed_config.stdout, b"native-prompt\n");
+    assert_eq!(changed_config.stdout, b"native-prompt|unset\n");
     assert_eq!(
         String::from_utf8_lossy(&changed_config.stderr)
             .matches("gascan: Starship prompt unavailable; using standard Bash prompt.")

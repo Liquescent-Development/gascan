@@ -204,7 +204,7 @@ __gascan_starship_main()
     local immutable_path=/opt/gascan/shell/bin:/usr/bin:/bin
     local managed_owner=0 workspace_uid=1000 workspace_gid=1000
     local immutable_owner=0 immutable_gid=0 immutable_link_mode=777
-    local prompt preset selected_config initialization
+    local prompt preset selected_config initialization euid
     local commit rollback expectations
     local build_status=0 errexit_was_set=0
     local selector_metadata config_metadata preset_metadata
@@ -230,8 +230,8 @@ __gascan_starship_main()
         return 0
     fi
 
-    __gascan_starship_euid=$(/usr/bin/id -u)
-    case "$__gascan_starship_euid" in
+    euid=$(/usr/bin/id -u)
+    case "$euid" in
         0)
             selected_config=$preset
             ;;
@@ -320,7 +320,6 @@ __gascan_starship_main()
         __gascan_starship_warn
         return 0
     fi
-    unset __gascan_starship_euid
     return 0
 }
 
