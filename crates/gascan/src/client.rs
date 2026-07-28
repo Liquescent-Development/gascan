@@ -1,7 +1,11 @@
-use crate::daemon::DaemonPaths;
+use crate::daemon::{
+    DaemonEndpoint, DaemonIdentity, DaemonLaunch, DaemonPaths, DaemonSpawner, EndpointProbe,
+    EndpointSession, InstanceTimestamp, SupervisorError,
+};
 use gascan_proto::v1::gas_can_client::GasCanClient;
 use gascan_proto::{API_MAJOR, API_MINOR, validate_transport_security};
 use hyper_util::rt::TokioIo;
+#[cfg(test)]
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -9,7 +13,7 @@ use std::time::Duration;
 use tonic::transport::{Channel, Endpoint};
 use tower::service_fn;
 
-const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(15);
+const ENDPOINT_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -73,6 +77,15 @@ impl From<tonic::Status> for ClientError {
         Self::Rpc(Box::new(value))
     }
 }
+impl From<SupervisorError> for ClientError {
+    fn from(value: SupervisorError) -> Self {
+        match value {
+            SupervisorError::Client(error) => error,
+            SupervisorError::Io(error) => Self::Io(error),
+            error => Self::Io(std::io::Error::other(error.to_string())),
+        }
+    }
+}
 
 pub struct Client {
     pub api: GasCanClient<Channel>,
@@ -93,30 +106,162 @@ impl Client {
     }
 
     pub async fn connect_or_start() -> Result<Self, ClientError> {
-        let paths = DaemonPaths::for_user()?;
-        let socket = paths.socket().to_owned();
-        let initial = tokio::time::timeout(Duration::from_millis(250), async {
-            negotiate(connect(&socket).await?).await
-        })
-        .await;
-        match initial {
-            Ok(Ok(client)) => return Ok(client),
-            Ok(Err(error @ ClientError::Api(_))) => return Err(error),
-            Ok(Err(_)) | Err(_) => {}
+        crate::daemon::connect_current_or_recover()
+            .await
+            .map(|outcome| outcome.daemon.connection)
+            .map_err(ClientError::from)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TonicEndpoint;
+
+#[tonic::async_trait]
+impl DaemonEndpoint for TonicEndpoint {
+    type Connection = Client;
+
+    async fn probe(&self, path: &Path) -> Result<EndpointProbe<Self::Connection>, ClientError> {
+        let mut api = match tokio::time::timeout(ENDPOINT_PROBE_TIMEOUT, connect(path)).await {
+            Err(_) => return Ok(EndpointProbe::Unreachable),
+            Ok(Err(error)) if startup_transient(&error) => {
+                return Ok(EndpointProbe::Unreachable);
+            }
+            Ok(Err(error)) => return Ok(EndpointProbe::Unsafe(error.to_string())),
+            Ok(Ok(api)) => api,
+        };
+        let handshake = match tokio::time::timeout(
+            ENDPOINT_PROBE_TIMEOUT,
+            api.handshake(gascan_proto::v1::HandshakeRequest {
+                api_major: requested_api_major(),
+                api_minor: API_MINOR,
+                requested_capabilities: Vec::new(),
+            }),
+        )
+        .await
+        {
+            Err(_) => return Ok(EndpointProbe::Unreachable),
+            Ok(Err(status)) => {
+                let error = ClientError::from(status);
+                if startup_transient(&error) {
+                    return Ok(EndpointProbe::Unreachable);
+                }
+                return Ok(EndpointProbe::Unsafe(error.to_string()));
+            }
+            Ok(Ok(response)) => response.into_inner(),
+        };
+        let identity = match identity_from_handshake(&handshake) {
+            Ok(identity) => identity,
+            Err(error) => return Ok(EndpointProbe::Unsafe(error.to_string())),
+        };
+        if identity.release_version.as_deref() == Some(env!("CARGO_PKG_VERSION")) {
+            if let Some(rejection) = &handshake.rejection {
+                return Err(ClientError::Api(rejection.code.clone()));
+            }
+            if handshake.api_major != API_MAJOR {
+                return Err(ClientError::Api("incompatible_api_major".to_owned()));
+            }
         }
-        let daemon = daemon_path()?;
-        let (instance_path, owner_token) = daemon_launch_environment(
-            &paths,
-            std::env::var_os("GASCAN_DAEMON_INSTANCE_PATH").as_deref(),
-            std::env::var_os("GASCAN_DAEMON_OWNER_TOKEN").as_deref(),
-        )?;
-        let mut command = tokio::process::Command::new(daemon);
+        let safe_transport = handshake
+            .transport_security
+            .as_ref()
+            .is_some_and(|security| validate_transport_security(security).is_ok());
+        let compatible_api = handshake.rejection.is_none() && handshake.api_major == API_MAJOR;
+        let healthy = if identity.release_version.is_none() {
+            true
+        } else {
+            match tokio::time::timeout(
+                ENDPOINT_PROBE_TIMEOUT,
+                api.daemon_status(gascan_proto::v1::DaemonStatusRequest {}),
+            )
+            .await
+            {
+                Ok(Ok(response)) => status_confirms_handshake(&handshake, &response.into_inner()),
+                Err(_) | Ok(Err(_)) => false,
+            }
+        };
+        Ok(EndpointProbe::Connected(EndpointSession {
+            connection: Client { api },
+            identity,
+            compatible_api,
+            safe_transport,
+            healthy,
+        }))
+    }
+
+    async fn graceful_shutdown(
+        &self,
+        connection: &mut Self::Connection,
+        instance_token: &str,
+    ) -> Result<(), ClientError> {
+        let response = connection
+            .api
+            .shutdown_daemon(gascan_proto::v1::ShutdownDaemonRequest {
+                daemon_instance_token: instance_token.to_owned(),
+            })
+            .await?
+            .into_inner();
+        if !response.accepted {
+            return Err(ClientError::Api("daemon_shutdown_not_accepted".to_owned()));
+        }
+        Ok(())
+    }
+}
+
+fn requested_api_major() -> u32 {
+    std::env::var("GASCAN_API_MAJOR")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(API_MAJOR)
+}
+
+fn identity_from_handshake(
+    handshake: &gascan_proto::v1::HandshakeResponse,
+) -> Result<DaemonIdentity, ClientError> {
+    let release_version =
+        (!handshake.release_version.is_empty()).then(|| handshake.release_version.clone());
+    let started_at = handshake
+        .daemon_started_at
+        .filter(|_| release_version.is_some())
+        .map(|timestamp| InstanceTimestamp {
+            seconds: timestamp.seconds,
+            nanos: timestamp.nanos,
+        });
+    Ok(DaemonIdentity {
+        pid: handshake.daemon_pid,
+        executable: PathBuf::from(&handshake.daemon_executable),
+        start_identity: handshake.daemon_start_identity.clone(),
+        instance_token: handshake.daemon_instance_token.clone(),
+        release_version,
+        started_at,
+    })
+}
+
+fn status_confirms_handshake(
+    handshake: &gascan_proto::v1::HandshakeResponse,
+    status: &gascan_proto::v1::DaemonStatusResponse,
+) -> bool {
+    status.health == gascan_proto::v1::DaemonHealth::Healthy as i32
+        && status.release_version == handshake.release_version
+        && status.daemon_pid == handshake.daemon_pid
+        && status.daemon_executable == handshake.daemon_executable
+        && status.daemon_start_identity == handshake.daemon_start_identity
+        && status.daemon_instance_token == handshake.daemon_instance_token
+        && status.daemon_started_at == handshake.daemon_started_at
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TokioDaemonSpawner;
+
+impl DaemonSpawner for TokioDaemonSpawner {
+    fn spawn(&self, launch: &DaemonLaunch) -> std::io::Result<()> {
+        let mut command = tokio::process::Command::new(&launch.executable);
         command
+            .current_dir(&launch.current_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .env("GASCAN_DAEMON_INSTANCE_PATH", instance_path)
-            .env("GASCAN_DAEMON_OWNER_TOKEN", owner_token);
-        if let Some(path) = std::env::var_os("GASCAN_DAEMON_STDERR_PATH") {
+            .env("GASCAN_DAEMON_INSTANCE_PATH", &launch.instance_path)
+            .env("GASCAN_DAEMON_OWNER_TOKEN", &launch.owner_token);
+        if let Some(path) = &launch.stderr_path {
             command.stderr(
                 std::fs::OpenOptions::new()
                     .create(true)
@@ -127,37 +272,7 @@ impl Client {
             command.stderr(Stdio::null());
         }
         let _child = command.spawn()?;
-        let started_at = tokio::time::Instant::now();
-        let deadline = tokio::time::Instant::now() + DAEMON_READY_TIMEOUT;
-        let mut probes = 0_u64;
-        loop {
-            probes = probes.saturating_add(1);
-            let result = tokio::time::timeout(Duration::from_millis(250), async {
-                negotiate(connect(&socket).await?).await
-            })
-            .await
-            .unwrap_or_else(|_| {
-                Err(ClientError::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "daemon readiness probe timed out",
-                )))
-            });
-            match result {
-                Ok(client) => return Ok(client),
-                Err(error @ ClientError::Api(_)) => return Err(error),
-                Err(error) if !startup_transient(&error) => return Err(error),
-                Err(error) if tokio::time::Instant::now() >= deadline => {
-                    return Err(ClientError::Io(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!(
-                            "daemon readiness exhausted after {probes} probes in {:?}; last error: {error}",
-                            started_at.elapsed()
-                        ),
-                    )));
-                }
-                Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
-            }
-        }
+        Ok(())
     }
 }
 
@@ -173,6 +288,7 @@ fn startup_transient(error: &ClientError) -> bool {
     }
 }
 
+#[cfg(test)]
 fn daemon_launch_environment(
     paths: &DaemonPaths,
     instance_override: Option<&OsStr>,
@@ -204,7 +320,7 @@ fn daemon_launch_environment(
     Ok((instance, owner))
 }
 
-fn daemon_path() -> Result<PathBuf, ClientError> {
+pub(crate) fn daemon_path() -> Result<PathBuf, ClientError> {
     if let Some(path) = std::env::var_os("GASCAN_DAEMON") {
         return Ok(path.into());
     }
@@ -228,36 +344,11 @@ async fn connect(path: &Path) -> Result<GasCanClient<Channel>, ClientError> {
     Ok(GasCanClient::new(channel))
 }
 
-async fn negotiate(mut api: GasCanClient<Channel>) -> Result<Client, ClientError> {
-    let requested_major = std::env::var("GASCAN_API_MAJOR")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(API_MAJOR);
-    let response = api
-        .handshake(gascan_proto::v1::HandshakeRequest {
-            api_major: requested_major,
-            api_minor: API_MINOR,
-            requested_capabilities: Vec::new(),
-        })
-        .await?
-        .into_inner();
-    if let Some(rejection) = response.rejection {
-        return Err(ClientError::Api(rejection.code));
-    }
-    if response.api_major != API_MAJOR {
-        return Err(ClientError::Api("incompatible_api_major".to_owned()));
-    }
-    let security = response
-        .transport_security
-        .ok_or_else(|| ClientError::Api("missing_transport_security".to_owned()))?;
-    validate_transport_security(&security)
-        .map_err(|_| ClientError::Api("unsafe_transport_security".to_owned()))?;
-    Ok(Client { api })
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::daemon::DaemonPaths;
+    use super::TokioDaemonSpawner;
+    use crate::daemon::{DaemonLaunch, DaemonPaths, DaemonSpawner};
+    use std::os::unix::fs::PermissionsExt as _;
 
     #[test]
     fn daemon_launch_environment_sets_normal_paths_and_fresh_owner_token()
@@ -292,6 +383,127 @@ mod tests {
             super::daemon_launch_environment(&paths, None, Some(std::ffi::OsStr::new("")),)
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn endpoint_wire_identity_preserves_legacy_and_exact_release_versions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let base = gascan_proto::v1::HandshakeResponse {
+            api_major: gascan_proto::API_MAJOR,
+            api_minor: gascan_proto::API_MINOR,
+            transport_security: Some(gascan_proto::local_transport_security()),
+            daemon_instance_token: "11".repeat(32),
+            daemon_pid: 42,
+            daemon_executable: "/trusted/gascand".to_owned(),
+            daemon_start_identity: "start:42".to_owned(),
+            ..Default::default()
+        };
+        let legacy = super::identity_from_handshake(&base)?;
+        assert_eq!(legacy.release_version, None);
+        assert_eq!(legacy.started_at, None);
+
+        let current = gascan_proto::v1::HandshakeResponse {
+            release_version: env!("CARGO_PKG_VERSION").to_owned(),
+            daemon_started_at: Some(prost_types::Timestamp {
+                seconds: 1_785_264_100,
+                nanos: 123_000_000,
+            }),
+            ..base.clone()
+        };
+        assert_eq!(
+            super::identity_from_handshake(&current)?
+                .release_version
+                .as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+
+        let outdated = gascan_proto::v1::HandshakeResponse {
+            release_version: "0.1.10".to_owned(),
+            ..current
+        };
+        assert_eq!(
+            super::identity_from_handshake(&outdated)?
+                .release_version
+                .as_deref(),
+            Some("0.1.10")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn endpoint_status_must_repeat_the_handshake_identity_exactly()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let handshake = gascan_proto::v1::HandshakeResponse {
+            api_major: gascan_proto::API_MAJOR,
+            api_minor: gascan_proto::API_MINOR,
+            transport_security: Some(gascan_proto::local_transport_security()),
+            daemon_instance_token: "11".repeat(32),
+            daemon_pid: 42,
+            daemon_executable: "/trusted/gascand".to_owned(),
+            daemon_start_identity: "start:42".to_owned(),
+            release_version: env!("CARGO_PKG_VERSION").to_owned(),
+            daemon_started_at: Some(prost_types::Timestamp {
+                seconds: 1_785_264_100,
+                nanos: 123_000_000,
+            }),
+            ..Default::default()
+        };
+        let mut status = gascan_proto::v1::DaemonStatusResponse {
+            release_version: handshake.release_version.clone(),
+            daemon_pid: handshake.daemon_pid,
+            daemon_executable: handshake.daemon_executable.clone(),
+            daemon_start_identity: handshake.daemon_start_identity.clone(),
+            daemon_instance_token: handshake.daemon_instance_token.clone(),
+            daemon_started_at: handshake.daemon_started_at,
+            health: gascan_proto::v1::DaemonHealth::Healthy as i32,
+        };
+        assert!(super::status_confirms_handshake(&handshake, &status));
+        status.daemon_instance_token = "22".repeat(32);
+        assert!(!super::status_confirms_handshake(&handshake, &status));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn daemon_spawner_uses_protected_cwd_environment_and_detached_stdin()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let runtime = root.join("runtime");
+        std::fs::create_dir(&runtime)?;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))?;
+        let script = root.join("fixture-gascand");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nif IFS= read -r ignored; then stdin_state=data; else stdin_state=eof; fi\nprintf '%s\\n%s\\n%s\\n%s\\n' \"$PWD\" \"$GASCAN_DAEMON_INSTANCE_PATH\" \"$GASCAN_DAEMON_OWNER_TOKEN\" \"$stdin_state\" >&2\nprintf 'stdout-must-be-null\\n'\n",
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
+        let diagnostic = root.join("daemon.stderr");
+        let launch = DaemonLaunch {
+            executable: script,
+            current_dir: runtime.clone(),
+            instance_path: runtime.join("daemon-instance.json"),
+            owner_token: "test-owner".to_owned(),
+            stderr_path: Some(diagnostic.clone()),
+        };
+
+        DaemonSpawner::spawn(&TokioDaemonSpawner, &launch)?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let output = loop {
+            let output = std::fs::read_to_string(&diagnostic).unwrap_or_default();
+            if output.lines().count() >= 4 {
+                break output;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("fixture daemon did not write diagnostics".into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        let lines = output.lines().collect::<Vec<_>>();
+        assert_eq!(lines[0], runtime.to_string_lossy());
+        assert_eq!(lines[1], launch.instance_path.to_string_lossy());
+        assert_eq!(lines[2], "test-owner");
+        assert_eq!(lines[3], "eof");
         Ok(())
     }
 
