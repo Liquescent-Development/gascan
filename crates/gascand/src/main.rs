@@ -30,11 +30,12 @@ struct E2eCandidateMapping {
 }
 
 #[derive(Clone, Debug, Default)]
-struct E2eProcessRunner {
+struct E2eProcessRunner<R = ProcessRunner> {
     candidate: Option<E2eCandidateMapping>,
+    runner: R,
 }
 
-impl E2eProcessRunner {
+impl E2eProcessRunner<ProcessRunner> {
     fn configured_from_environment() -> Result<Self, Box<dyn std::error::Error>> {
         if option_env!("CARGO_BIN_NAME") != Some("gascan-e2e-daemon") {
             return Ok(Self::default());
@@ -48,7 +49,20 @@ impl E2eProcessRunner {
             }
             _ => return Err("incomplete E2E candidate image mapping".into()),
         };
-        Ok(Self { candidate })
+        Ok(Self {
+            candidate,
+            runner: ProcessRunner,
+        })
+    }
+}
+
+impl<R> E2eProcessRunner<R> {
+    #[cfg(test)]
+    fn with_candidate_runner(candidate: E2eCandidateMapping, runner: R) -> Self {
+        Self {
+            candidate: Some(candidate),
+            runner,
+        }
     }
 
     fn rewrite(&self, mut spec: CommandSpec) -> CommandSpec {
@@ -64,6 +78,14 @@ impl E2eProcessRunner {
             }
         }
         spec
+    }
+
+    fn is_local_candidate_pull(&self, spec: &CommandSpec) -> bool {
+        self.candidate.as_ref().is_some_and(|candidate| {
+            spec.program == "container"
+                && spec.args == ["image", "pull", candidate.immutable.as_str()]
+                && spec.stdin.is_empty()
+        })
     }
 
     fn should_rehydrate_inspect(&self, spec: &CommandSpec) -> bool {
@@ -91,13 +113,20 @@ fn validate_e2e_candidate_mapping(
 }
 
 #[async_trait::async_trait]
-impl CommandRunner for E2eProcessRunner {
+impl<R: CommandRunner> CommandRunner for E2eProcessRunner<R> {
     async fn run(
         &self,
         spec: CommandSpec,
     ) -> Result<gascan_apple::CommandOutput, gascan_core::runtime::RuntimeError> {
+        if self.is_local_candidate_pull(&spec) {
+            return Ok(gascan_apple::CommandOutput {
+                status: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            });
+        }
         let rehydrate_inspect = self.should_rehydrate_inspect(&spec);
-        let mut output = ProcessRunner.run(self.rewrite(spec)).await?;
+        let mut output = self.runner.run(self.rewrite(spec)).await?;
         if rehydrate_inspect {
             if let Some(candidate) = &self.candidate {
                 output.stdout = rehydrate_e2e_inspect(output.stdout, candidate);
@@ -579,6 +608,7 @@ fn storage_fact(path: &std::path::Path, label: &str) -> DoctorFact {
 #[cfg(test)]
 mod e2e_candidate_tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     const IMMUTABLE: &str = "gascan-workspace:candidate@sha256:\
         aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -590,7 +620,73 @@ mod e2e_candidate_tests {
                 IMMUTABLE.to_owned(),
                 RUNTIME.to_owned(),
             )?),
+            runner: ProcessRunner,
         })
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingRunner {
+        commands: Arc<Mutex<Vec<CommandSpec>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CommandRunner for RecordingRunner {
+        async fn run(
+            &self,
+            spec: CommandSpec,
+        ) -> Result<gascan_apple::CommandOutput, gascan_core::runtime::RuntimeError> {
+            self.commands
+                .lock()
+                .map_err(|_| gascan_core::runtime::RuntimeError::CommandIo {
+                    operation: "record E2E command".to_owned(),
+                    message: "lock poisoned".to_owned(),
+                })?
+                .push(spec);
+            Ok(gascan_apple::CommandOutput {
+                status: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn candidate_prepare_is_satisfied_by_the_verified_local_image()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let inner = RecordingRunner::default();
+        let commands = inner.commands.clone();
+        let runner = E2eProcessRunner::with_candidate_runner(
+            validate_e2e_candidate_mapping(IMMUTABLE.to_owned(), RUNTIME.to_owned())?,
+            inner,
+        );
+
+        let output = runner
+            .run(CommandSpec::new("container", ["image", "pull", IMMUTABLE]))
+            .await?;
+        assert_eq!(output.status, 0);
+        assert!(
+            commands
+                .lock()
+                .map_err(|_| "recording lock poisoned")?
+                .is_empty(),
+            "verified local candidate pull reached Apple container"
+        );
+
+        let foreign = CommandSpec::new(
+            "container",
+            [
+                "image",
+                "pull",
+                "ghcr.io/example/workspace@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ],
+        );
+        runner.run(foreign.clone()).await?;
+        assert_eq!(
+            *commands.lock().map_err(|_| "recording lock poisoned")?,
+            [foreign],
+            "non-candidate image preparation must reach Apple container"
+        );
+        Ok(())
     }
 
     #[test]
