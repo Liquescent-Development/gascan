@@ -4,7 +4,7 @@ use std::{
     fs,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output},
 };
 
 const RUNTIME_PATH: &str = concat!(
@@ -21,6 +21,147 @@ const RUNTIME_PATH: &str = concat!(
 
 fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
+}
+
+const SHELL_STAGE_SELECTOR: &str = ".prompt.gascan-stage";
+const SHELL_STAGE_CONFIG: &str = ".starship.toml.gascan-stage";
+
+struct ShellFixture {
+    _temporary: tempfile::TempDir,
+    home: PathBuf,
+    script: PathBuf,
+    presets: PathBuf,
+}
+
+impl ShellFixture {
+    fn new() -> Self {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().join("home");
+        let presets = temporary.path().join("immutable-presets");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&presets).unwrap();
+        for name in ["starship.toml", "starship-nerd-font.toml"] {
+            fs::copy(
+                root().join("images/workspace/etc/gascan").join(name),
+                presets.join(name),
+            )
+            .unwrap();
+            fs::set_permissions(presets.join(name), fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        fs::set_permissions(&presets, fs::Permissions::from_mode(0o555)).unwrap();
+        let source =
+            fs::read_to_string(root().join("images/workspace/bin/configure-shell-home")).unwrap();
+        let rebound = source.replace(
+            r#"PRESET_ROOT = "/opt/gascan/shell/presets""#,
+            &format!(r#"PRESET_ROOT = "{}""#, presets.display()),
+        );
+        assert_ne!(
+            source, rebound,
+            "fixture did not rebind immutable preset root"
+        );
+        let script = temporary.path().join("configure-shell-home");
+        fs::write(&script, rebound).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::create_dir_all(home.join(".config/gascan")).unwrap();
+        Self {
+            _temporary: temporary,
+            home,
+            script,
+            presets,
+        }
+    }
+
+    fn run(&self, prompt: &str) -> Output {
+        Command::new(&self.script)
+            .arg(prompt)
+            .env_clear()
+            .env("HOME", &self.home)
+            .output()
+            .unwrap()
+    }
+
+    fn shell_dir(&self) -> PathBuf {
+        self.home.join(".config/gascan/shell")
+    }
+}
+
+fn file_mode(path: &Path) -> u32 {
+    fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+fn write_mode(path: &Path, contents: &str, mode: u32) {
+    fs::write(path, contents).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+fn configured_shell_fixture() -> ShellFixture {
+    let fixture = ShellFixture::new();
+    let output = fixture.run("starship");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fixture
+}
+
+fn hook_fixture(temporary: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let shell_dir = temporary.path().join("managed-shell");
+    let starship = temporary.path().join("immutable-starship");
+    let presets = temporary.path().join("immutable-presets");
+    let log = temporary.path().join("starship.log");
+    fs::create_dir(&shell_dir).unwrap();
+    fs::create_dir(&presets).unwrap();
+    for name in ["starship.toml", "starship-nerd-font.toml"] {
+        write_mode(&presets.join(name), "format = \"$character\"\n", 0o444);
+    }
+    let source = fs::read_to_string(root().join("images/workspace/etc/gascan/bashrc")).unwrap();
+    let rebound = source
+        .replace(
+            "/home/workspace/.config/gascan/shell",
+            shell_dir.to_str().unwrap(),
+        )
+        .replace("/opt/gascan/shell/bin/starship", starship.to_str().unwrap())
+        .replace("/opt/gascan/shell/presets", presets.to_str().unwrap())
+        .replace(
+            "1000:600:1",
+            &format!("{}:600:1", fs::metadata(temporary.path()).unwrap().uid()),
+        )
+        .replace(
+            "0:444:1",
+            &format!("{}:444:1", fs::metadata(temporary.path()).unwrap().uid()),
+        );
+    assert_ne!(
+        source, rebound,
+        "fixture did not rebind managed shell paths"
+    );
+    let hook = temporary.path().join("gascan-bashrc");
+    fs::write(&hook, rebound).unwrap();
+    fs::write(
+        &starship,
+        "#!/bin/sh\n\
+         printf '%s|%s\\n' \"$*\" \"${STARSHIP_CONFIG-}\" >>\"$GASCAN_TEST_LOG\"\n\
+         test \"${GASCAN_TEST_FAIL-0}\" != 1 || exit 23\n\
+         printf '%s\\n' 'PS1=managed-starship'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&starship, fs::Permissions::from_mode(0o555)).unwrap();
+    (hook, shell_dir, starship, log)
+}
+
+fn run_hook(hook: &Path, command: &str, log: &Path, fail: bool, interactive: bool) -> Output {
+    let mut process = Command::new("/bin/bash");
+    process.args(["--noprofile", "--norc"]);
+    if interactive {
+        process.arg("-i");
+    }
+    process
+        .args(["-c", command])
+        .env("GASCAN_TEST_LOG", log)
+        .env("GASCAN_TEST_FAIL", if fail { "1" } else { "0" })
+        .env("GASCAN_TEST_HOOK", hook)
+        .output()
+        .unwrap()
 }
 
 fn rust_seed_command(
@@ -280,10 +421,7 @@ fn writable_rust_bootstrap_preserves_regular_update_hash_collision() {
             .success()
     );
     assert_eq!(fs::metadata(&collision).unwrap().ino(), inode);
-    assert_eq!(
-        fs::read_to_string(&collision).unwrap(),
-        "user-owned hash\n"
-    );
+    assert_eq!(fs::read_to_string(&collision).unwrap(), "user-owned hash\n");
     assert!(rust_staging_residue(&destination).is_empty());
 }
 
@@ -1759,6 +1897,449 @@ fn workstation_home_configuration_contains_no_credentials() {
             "home setup must not materialize credentials: {forbidden}"
         );
     }
+}
+
+#[test]
+fn shell_configuration_lifecycle_is_atomic_restrictive_and_idempotent() {
+    let fixture = ShellFixture::new();
+    assert!(!fixture.run("unknown").status.success());
+    assert!(
+        !fixture.shell_dir().exists(),
+        "invalid prompt created managed state"
+    );
+
+    for prompt in ["standard", "standard"] {
+        let output = fixture.run(prompt);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let shell_dir = fixture.shell_dir();
+    let selector = shell_dir.join("prompt");
+    let config = shell_dir.join("starship.toml");
+    assert_eq!(file_mode(&shell_dir), 0o700);
+    assert_eq!(file_mode(&selector), 0o600);
+    assert_eq!(fs::read_to_string(&selector).unwrap(), "standard\n");
+    assert!(!config.exists());
+
+    assert!(fixture.run("starship").status.success());
+    assert_eq!(fs::read_to_string(&selector).unwrap(), "starship\n");
+    assert_eq!(file_mode(&config), 0o600);
+    assert_eq!(
+        fs::read(&config).unwrap(),
+        fs::read(fixture.presets.join("starship.toml")).unwrap()
+    );
+
+    assert!(fixture.run("starship-nerd-font").status.success());
+    assert_eq!(
+        fs::read_to_string(&selector).unwrap(),
+        "starship-nerd-font\n"
+    );
+    assert_eq!(
+        fs::read(&config).unwrap(),
+        fs::read(fixture.presets.join("starship-nerd-font.toml")).unwrap()
+    );
+
+    assert!(fixture.run("standard").status.success());
+    assert_eq!(fs::read_to_string(&selector).unwrap(), "standard\n");
+    assert!(!config.exists());
+
+    write_mode(
+        &shell_dir.join(SHELL_STAGE_SELECTOR),
+        "starship-nerd-font\n",
+        0o600,
+    );
+    write_mode(
+        &shell_dir.join(SHELL_STAGE_CONFIG),
+        &fs::read_to_string(fixture.presets.join("starship-nerd-font.toml")).unwrap(),
+        0o600,
+    );
+    let retried = fixture.run("starship-nerd-font");
+    assert!(
+        retried.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retried.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&selector).unwrap(),
+        "starship-nerd-font\n"
+    );
+    assert_eq!(
+        fs::read(&config).unwrap(),
+        fs::read(fixture.presets.join("starship-nerd-font.toml")).unwrap()
+    );
+    assert!(!shell_dir.join(SHELL_STAGE_SELECTOR).exists());
+    assert!(!shell_dir.join(SHELL_STAGE_CONFIG).exists());
+}
+
+#[test]
+fn shell_configurator_rejects_unsafe_types_modes_and_unexpected_state() {
+    for case in [
+        "shell-symlink",
+        "shell-fifo",
+        "shell-mode",
+        "selector-symlink",
+        "selector-fifo",
+        "selector-mode",
+        "config-symlink",
+        "config-fifo",
+        "config-mode",
+        "unexpected",
+        "unsafe-stage",
+    ] {
+        let fixture = if case.starts_with("shell-") {
+            ShellFixture::new()
+        } else {
+            configured_shell_fixture()
+        };
+        let shell_dir = fixture.shell_dir();
+        let outside = fixture.home.join(format!("outside-{case}"));
+        match case {
+            "shell-symlink" => {
+                fs::create_dir(&outside).unwrap();
+                symlink(&outside, &shell_dir).unwrap();
+            }
+            "shell-fifo" => {
+                assert!(
+                    Command::new("mkfifo")
+                        .arg(&shell_dir)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+            "shell-mode" => {
+                fs::create_dir(&shell_dir).unwrap();
+                fs::set_permissions(&shell_dir, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            "selector-symlink" => {
+                fs::write(&outside, "outside survives\n").unwrap();
+                fs::remove_file(shell_dir.join("prompt")).unwrap();
+                symlink(&outside, shell_dir.join("prompt")).unwrap();
+            }
+            "selector-fifo" => {
+                fs::remove_file(shell_dir.join("prompt")).unwrap();
+                assert!(
+                    Command::new("mkfifo")
+                        .arg(shell_dir.join("prompt"))
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+            "selector-mode" => {
+                fs::set_permissions(shell_dir.join("prompt"), fs::Permissions::from_mode(0o644))
+                    .unwrap();
+            }
+            "config-symlink" => {
+                fs::write(&outside, "outside survives\n").unwrap();
+                fs::remove_file(shell_dir.join("starship.toml")).unwrap();
+                symlink(&outside, shell_dir.join("starship.toml")).unwrap();
+            }
+            "config-fifo" => {
+                fs::remove_file(shell_dir.join("starship.toml")).unwrap();
+                assert!(
+                    Command::new("mkfifo")
+                        .arg(shell_dir.join("starship.toml"))
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+            "config-mode" => {
+                fs::set_permissions(
+                    shell_dir.join("starship.toml"),
+                    fs::Permissions::from_mode(0o644),
+                )
+                .unwrap();
+            }
+            "unexpected" => fs::write(shell_dir.join("notes"), "user data\n").unwrap(),
+            "unsafe-stage" => symlink(&outside, shell_dir.join(SHELL_STAGE_SELECTOR)).unwrap(),
+            _ => unreachable!(),
+        }
+        let before_selector = fs::symlink_metadata(shell_dir.join("prompt")).ok();
+        let rejected = fixture.run("starship-nerd-font");
+        assert!(!rejected.status.success(), "accepted unsafe {case}");
+        if let Some(before) = before_selector {
+            let after = fs::symlink_metadata(shell_dir.join("prompt")).unwrap();
+            assert_eq!(
+                after.ino(),
+                before.ino(),
+                "rejection mutated selector for {case}"
+            );
+        }
+        if matches!(case, "selector-symlink" | "config-symlink") {
+            assert_eq!(
+                fs::read_to_string(&outside).unwrap_or_default(),
+                "outside survives\n",
+                "rejection modified symlink target for {case}"
+            );
+        }
+    }
+}
+
+#[test]
+fn shell_configurator_validates_managed_and_immutable_ownership() {
+    let script =
+        fs::read_to_string(root().join("images/workspace/bin/configure-shell-home")).unwrap();
+    for required in [
+        "info.st_uid != managed_uid",
+        "info.st_uid != immutable_uid",
+        "os.geteuid()",
+        "os.fstat",
+    ] {
+        assert!(
+            script.contains(required),
+            "missing ownership boundary: {required}"
+        );
+    }
+
+    let fixture = ShellFixture::new();
+    let source = fs::read_to_string(&fixture.script).unwrap();
+    let rebound = source.replace(
+        &format!(r#"PRESET_ROOT = "{}""#, fixture.presets.display()),
+        r#"PRESET_ROOT = "/private/tmp""#,
+    );
+    assert_ne!(source, rebound);
+    fs::set_permissions(&fixture.script, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(&fixture.script, rebound).unwrap();
+    fs::set_permissions(&fixture.script, fs::Permissions::from_mode(0o555)).unwrap();
+    assert!(
+        !fixture.run("starship").status.success(),
+        "accepted immutable preset root with a foreign owner and permissive mode"
+    );
+}
+
+#[test]
+fn shell_hook_is_interactive_only_and_standard_is_a_true_prompt_no_op() {
+    let temporary = tempfile::tempdir().unwrap();
+    let (hook, shell_dir, _starship, log) = hook_fixture(&temporary);
+
+    let noninteractive = run_hook(
+        &hook,
+        r#". "$GASCAN_TEST_HOOK"; printf 'noninteractive-ok\n'"#,
+        &log,
+        false,
+        false,
+    );
+    assert!(noninteractive.status.success());
+    assert_eq!(noninteractive.stdout, b"noninteractive-ok\n");
+    assert!(!log.exists(), "non-interactive hook invoked Starship");
+
+    write_mode(&shell_dir.join("prompt"), "standard\n", 0o600);
+    let standard = run_hook(
+        &hook,
+        r#"PS1='native-prompt'; STARSHIP_CONFIG='user-value'; . "$GASCAN_TEST_HOOK"; printf '%s|%s\n' "$PS1" "$STARSHIP_CONFIG""#,
+        &log,
+        false,
+        true,
+    );
+    assert!(
+        standard.status.success(),
+        "{}",
+        String::from_utf8_lossy(&standard.stderr)
+    );
+    assert_eq!(standard.stdout, b"native-prompt|user-value\n");
+    assert!(
+        !String::from_utf8_lossy(&standard.stderr).contains("gascan:"),
+        "{}",
+        String::from_utf8_lossy(&standard.stderr)
+    );
+    assert!(!log.exists(), "standard mode invoked Starship");
+}
+
+#[test]
+fn shell_hook_uses_only_the_pinned_binary_and_managed_config() {
+    let temporary = tempfile::tempdir().unwrap();
+    let (hook, shell_dir, _starship, log) = hook_fixture(&temporary);
+    write_mode(&shell_dir.join("prompt"), "starship-nerd-font\n", 0o600);
+    write_mode(
+        &shell_dir.join("starship.toml"),
+        "format = \"$character\"\n",
+        0o600,
+    );
+    let fake_path = temporary.path().join("path");
+    fs::create_dir(&fake_path).unwrap();
+    fs::write(
+        fake_path.join("starship"),
+        "#!/bin/sh\nprintf 'PATH starship invoked\\n' >&2\nexit 99\n",
+    )
+    .unwrap();
+    fs::set_permissions(
+        fake_path.join("starship"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    let output = Command::new("/bin/bash")
+        .args([
+            "--noprofile",
+            "--norc",
+            "-i",
+            "-c",
+            r#"PS1='native-prompt'; . "$GASCAN_TEST_HOOK"; printf '%s\n' "$PS1""#,
+        ])
+        .env("PATH", &fake_path)
+        .env("GASCAN_TEST_HOOK", &hook)
+        .env("GASCAN_TEST_LOG", &log)
+        .env("GASCAN_TEST_FAIL", "0")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        b"managed-starship\n",
+        "stderr: {}\nlog: {}",
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        format!("init bash|{}\n", shell_dir.join("starship.toml").display())
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("PATH starship"),
+        "hook resolved Starship through PATH"
+    );
+}
+
+#[test]
+fn shell_hook_warns_once_and_returns_success_when_starship_is_unavailable() {
+    let temporary = tempfile::tempdir().unwrap();
+    let (hook, shell_dir, _starship, log) = hook_fixture(&temporary);
+    write_mode(&shell_dir.join("prompt"), "starship\n", 0o600);
+    write_mode(
+        &shell_dir.join("starship.toml"),
+        "format = \"$character\"\n",
+        0o600,
+    );
+    let output = run_hook(
+        &hook,
+        r#"PS1='native-prompt'; . "$GASCAN_TEST_HOOK"; . "$GASCAN_TEST_HOOK"; printf '%s\n' "$PS1""#,
+        &log,
+        true,
+        true,
+    );
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"native-prompt\n");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr)
+            .matches("gascan: Starship prompt unavailable; using standard Bash prompt.")
+            .count(),
+        1,
+        "stderr: {}\nlog: {}",
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+
+    fs::write(shell_dir.join("prompt"), "starship\nextra\n").unwrap();
+    let malformed = run_hook(
+        &hook,
+        r#"PS1='native-prompt'; . "$GASCAN_TEST_HOOK"; printf '%s\n' "$PS1""#,
+        &log,
+        false,
+        true,
+    );
+    assert!(malformed.status.success());
+    assert_eq!(malformed.stdout, b"native-prompt\n");
+    assert_eq!(
+        String::from_utf8_lossy(&malformed.stderr)
+            .matches("gascan: Starship prompt unavailable; using standard Bash prompt.")
+            .count(),
+        1
+    );
+
+    write_mode(&shell_dir.join("prompt"), "starship\n", 0o600);
+    write_mode(
+        &shell_dir.join("starship.toml"),
+        "format = \"tampered\"\n",
+        0o600,
+    );
+    let log_before = fs::read_to_string(&log).unwrap();
+    let changed_config = run_hook(
+        &hook,
+        r#"PS1='native-prompt'; . "$GASCAN_TEST_HOOK"; printf '%s\n' "$PS1""#,
+        &log,
+        false,
+        true,
+    );
+    assert!(changed_config.status.success());
+    assert_eq!(changed_config.stdout, b"native-prompt\n");
+    assert_eq!(
+        String::from_utf8_lossy(&changed_config.stderr)
+            .matches("gascan: Starship prompt unavailable; using standard Bash prompt.")
+            .count(),
+        1
+    );
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        log_before,
+        "hook invoked Starship with a config that differs from the immutable preset"
+    );
+}
+
+#[test]
+fn managed_starship_presets_have_exact_order_and_font_boundaries() {
+    let compatible =
+        fs::read_to_string(root().join("images/workspace/etc/gascan/starship.toml")).unwrap();
+    let nerd =
+        fs::read_to_string(root().join("images/workspace/etc/gascan/starship-nerd-font.toml"))
+            .unwrap();
+    let expected_order = concat!(
+        "$username",
+        "$hostname",
+        "$directory",
+        "$git_branch",
+        "$git_status",
+        "$elixir",
+        "$erlang",
+        "$golang",
+        "$java",
+        "$nodejs",
+        "$python",
+        "$ruby",
+        "$rust",
+        "$status",
+        "$cmd_duration",
+        "$line_break",
+        "$character"
+    );
+    for (name, source) in [("compatible", &compatible), ("nerd", &nerd)] {
+        let preset: toml::Value = toml::from_str(source).unwrap();
+        assert_eq!(preset["format"].as_str(), Some(expected_order), "{name}");
+        for module in [
+            "username",
+            "hostname",
+            "directory",
+            "git_branch",
+            "git_status",
+            "elixir",
+            "erlang",
+            "golang",
+            "java",
+            "nodejs",
+            "python",
+            "ruby",
+            "rust",
+            "status",
+            "cmd_duration",
+            "character",
+        ] {
+            assert!(preset.get(module).is_some(), "{name} omits {module}");
+        }
+    }
+    assert!(
+        !compatible
+            .chars()
+            .any(|c| ('\u{e000}'..='\u{f8ff}').contains(&c))
+    );
+    assert!(nerd.chars().any(|c| ('\u{e000}'..='\u{f8ff}').contains(&c)));
 }
 
 #[test]

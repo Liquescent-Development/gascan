@@ -1,0 +1,315 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 1 ]; then
+    printf '%s\n' 'usage: configure-shell-home PROMPT' >&2
+    exit 2
+fi
+: "${HOME:?HOME must be set}"
+
+exec /usr/bin/python3 - "$0" "$HOME" "$1" <<'PY'
+import os
+import stat
+import sys
+
+PROMPTS = {
+    "standard": None,
+    "starship": "starship.toml",
+    "starship-nerd-font": "starship-nerd-font.toml",
+}
+PRESET_ROOT = "/opt/gascan/shell/presets"
+SELECTOR = "prompt"
+CONFIG = "starship.toml"
+SELECTOR_STAGE = ".prompt.gascan-stage"
+CONFIG_STAGE = ".starship.toml.gascan-stage"
+ALLOWED_ENTRIES = {SELECTOR, CONFIG, SELECTOR_STAGE, CONFIG_STAGE}
+MAX_FILE_SIZE = 1024 * 1024
+DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+READ_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+
+
+class Refusal(Exception):
+    pass
+
+
+def mode(info):
+    return stat.S_IMODE(info.st_mode)
+
+
+def read_bounded(fd):
+    chunks = []
+    size = 0
+    while True:
+        chunk = os.read(fd, min(65536, MAX_FILE_SIZE + 1 - size))
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        size += len(chunk)
+        if size > MAX_FILE_SIZE:
+            raise Refusal("managed shell file exceeds the size limit")
+
+
+def open_directory_at(parent_fd, name):
+    try:
+        fd = os.open(name, DIRECTORY_FLAGS, dir_fd=parent_fd)
+    except OSError as error:
+        raise Refusal(f"unsafe managed directory: {name}") from error
+    info = os.fstat(fd)
+    if not stat.S_ISDIR(info.st_mode):
+        os.close(fd)
+        raise Refusal(f"unsafe managed directory: {name}")
+    return fd
+
+
+def ensure_directory_at(parent_fd, name, create_mode):
+    try:
+        os.mkdir(name, create_mode, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    except OSError as error:
+        raise Refusal(f"cannot create managed directory: {name}") from error
+    return open_directory_at(parent_fd, name)
+
+
+def require_managed_directory(fd, managed_uid):
+    info = os.fstat(fd)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != managed_uid
+        or mode(info) != 0o700
+    ):
+        raise Refusal("managed shell directory must be owned by the caller with mode 0700")
+
+
+def open_checked_file(directory_fd, name, expected_uid, expected_mode, owner_kind):
+    try:
+        fd = os.open(name, READ_FLAGS, dir_fd=directory_fd)
+    except OSError as error:
+        raise Refusal(f"unsafe {owner_kind} file: {name}") from error
+    info = os.fstat(fd)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or mode(info) != expected_mode
+    ):
+        os.close(fd)
+        raise Refusal(f"unsafe {owner_kind} file: {name}")
+    if owner_kind == "managed":
+        managed_uid = expected_uid
+        if info.st_uid != managed_uid:
+            os.close(fd)
+            raise Refusal(f"unsafe managed file owner: {name}")
+    else:
+        immutable_uid = expected_uid
+        if info.st_uid != immutable_uid:
+            os.close(fd)
+            raise Refusal(f"unsafe immutable file owner: {name}")
+    return fd
+
+
+def read_checked_file(directory_fd, name, expected_uid, expected_mode, owner_kind):
+    fd = open_checked_file(directory_fd, name, expected_uid, expected_mode, owner_kind)
+    try:
+        return read_bounded(fd)
+    finally:
+        os.close(fd)
+
+
+def optional_managed_file(directory_fd, name, managed_uid):
+    try:
+        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise Refusal(f"cannot inspect managed file: {name}") from error
+    return read_checked_file(directory_fd, name, managed_uid, 0o600, "managed")
+
+
+def load_presets(script_path):
+    script_info = os.lstat(script_path)
+    if (
+        not stat.S_ISREG(script_info.st_mode)
+        or script_info.st_nlink != 1
+        or mode(script_info) != 0o555
+    ):
+        raise Refusal("configurator is not an immutable regular executable")
+    immutable_uid = script_info.st_uid
+    try:
+        root_fd = os.open(PRESET_ROOT, DIRECTORY_FLAGS)
+    except OSError as error:
+        raise Refusal("immutable preset directory is unavailable") from error
+    try:
+        info = os.fstat(root_fd)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != immutable_uid
+            or mode(info) != 0o555
+        ):
+            raise Refusal("immutable preset directory metadata changed")
+        return {
+            name: read_checked_file(root_fd, name, immutable_uid, 0o444, "immutable")
+            for name in ("starship.toml", "starship-nerd-font.toml")
+        }
+    finally:
+        os.close(root_fd)
+
+
+def validate_selector(contents):
+    if contents not in {f"{prompt}\n".encode() for prompt in PROMPTS}:
+        raise Refusal("managed prompt selector is invalid")
+
+
+def validate_config(contents, presets):
+    if contents not in presets.values():
+        raise Refusal("managed Starship configuration identity changed")
+
+
+def write_all(fd, contents):
+    offset = 0
+    while offset < len(contents):
+        written = os.write(fd, contents[offset:])
+        if written <= 0:
+            raise Refusal("short write while staging managed shell state")
+        offset += written
+
+
+def stage_file(directory_fd, name, contents):
+    try:
+        fd = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+    except OSError as error:
+        raise Refusal(f"cannot create managed staging file: {name}") from error
+    try:
+        os.fchmod(fd, 0o600)
+        write_all(fd, contents)
+        os.fsync(fd)
+    except Exception:
+        os.close(fd)
+        raise
+    os.close(fd)
+
+
+def publish_file(directory_fd, stage, destination, contents):
+    stage_file(directory_fd, stage, contents)
+    try:
+        os.replace(
+            stage,
+            destination,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+    except OSError as error:
+        raise Refusal(f"cannot publish managed file: {destination}") from error
+    os.fsync(directory_fd)
+
+
+def remove_file(directory_fd, name):
+    try:
+        os.unlink(name, dir_fd=directory_fd)
+    except OSError as error:
+        raise Refusal(f"cannot remove verified managed file: {name}") from error
+    os.fsync(directory_fd)
+
+
+def run(script_path, home, prompt):
+    if prompt not in PROMPTS:
+        accepted = ", ".join(PROMPTS)
+        raise Refusal(f"unknown prompt {prompt!r}; expected one of: {accepted}")
+
+    selected_name = PROMPTS[prompt]
+    presets = load_presets(script_path) if selected_name is not None else None
+    managed_uid = os.geteuid()
+    try:
+        home_fd = os.open(home, DIRECTORY_FLAGS)
+    except OSError as error:
+        raise Refusal("HOME is not a safe directory") from error
+    try:
+        config_fd = ensure_directory_at(home_fd, ".config", 0o700)
+        try:
+            gascan_fd = ensure_directory_at(config_fd, "gascan", 0o700)
+            try:
+                shell_fd = ensure_directory_at(gascan_fd, "shell", 0o700)
+                try:
+                    require_managed_directory(shell_fd, managed_uid)
+                    entries = set(os.listdir(shell_fd))
+                    unexpected = entries - ALLOWED_ENTRIES
+                    if unexpected:
+                        raise Refusal(
+                            f"unexpected managed shell entry: {sorted(unexpected)[0]}"
+                        )
+
+                    selector = optional_managed_file(shell_fd, SELECTOR, managed_uid)
+                    if selector is not None:
+                        validate_selector(selector)
+                    config = optional_managed_file(shell_fd, CONFIG, managed_uid)
+                    selector_stage = optional_managed_file(
+                        shell_fd, SELECTOR_STAGE, managed_uid
+                    )
+                    if selector_stage is not None:
+                        validate_selector(selector_stage)
+                    config_stage = optional_managed_file(
+                        shell_fd, CONFIG_STAGE, managed_uid
+                    )
+                    if config is not None or config_stage is not None:
+                        if presets is None:
+                            presets = load_presets(script_path)
+                        if config is not None:
+                            validate_config(config, presets)
+                        if config_stage is not None:
+                            validate_config(config_stage, presets)
+
+                    if selector_stage is not None:
+                        remove_file(shell_fd, SELECTOR_STAGE)
+                    if config_stage is not None:
+                        remove_file(shell_fd, CONFIG_STAGE)
+
+                    selector_contents = f"{prompt}\n".encode()
+                    if selected_name is None:
+                        publish_file(
+                            shell_fd,
+                            SELECTOR_STAGE,
+                            SELECTOR,
+                            selector_contents,
+                        )
+                        if config is not None:
+                            remove_file(shell_fd, CONFIG)
+                    else:
+                        publish_file(
+                            shell_fd,
+                            CONFIG_STAGE,
+                            CONFIG,
+                            presets[selected_name],
+                        )
+                        publish_file(
+                            shell_fd,
+                            SELECTOR_STAGE,
+                            SELECTOR,
+                            selector_contents,
+                        )
+                    os.fsync(shell_fd)
+                finally:
+                    os.close(shell_fd)
+            finally:
+                os.close(gascan_fd)
+        finally:
+            os.close(config_fd)
+    finally:
+        os.close(home_fd)
+
+
+def main():
+    os.umask(0o077)
+    try:
+        run(sys.argv[1], sys.argv[2], sys.argv[3])
+    except (OSError, Refusal) as error:
+        print(f"configure-shell-home: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+sys.exit(main())
+PY

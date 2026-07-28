@@ -84,7 +84,11 @@ COPY --chmod=0555 images/workspace/tests/ssh-contract.sh /opt/gascan/tests/ssh-c
 COPY --chmod=0555 images/workspace/bin/install-workstation-artifacts /usr/local/bin/install-workstation-artifacts
 COPY --chmod=0555 images/workspace/bin/run-workstation-step /usr/local/bin/run-workstation-step
 COPY --chmod=0555 images/workspace/bin/configure-workstation-home /usr/local/bin/configure-workstation-home
+COPY --chmod=0555 images/workspace/bin/configure-shell-home /usr/local/bin/configure-shell-home
 COPY --chmod=0555 images/workspace/bin/initialize-rust-home /usr/local/bin/initialize-rust-home
+COPY --chmod=0444 images/workspace/etc/gascan/bashrc /etc/gascan/bashrc
+COPY --chmod=0444 images/workspace/etc/gascan/starship.toml /opt/gascan/shell/presets/starship.toml
+COPY --chmod=0444 images/workspace/etc/gascan/starship-nerd-font.toml /opt/gascan/shell/presets/starship-nerd-font.toml
 COPY --chmod=0444 images/workspace/versions.lock /tmp/versions.lock
 COPY workstation /tmp/workstation
 
@@ -102,6 +106,16 @@ RUN --network=none test -x /opt/gascan/gascamp/bin/camp \
        install /tmp/workstation /opt/gascan/workstation /usr/local/bin /tmp/versions.lock \
        /tmp/workstation/target-lock.toml \
     && printf 'workstation assembly: installer complete\n' >&2 \
+    && /usr/local/bin/run-workstation-step shell-layout \
+       sh -c 'install -d -o root -g root -m 0555 /opt/gascan/shell/bin; \
+       test -x /opt/gascan/workstation/bin/starship; \
+       ln -s ../../workstation/bin/starship /opt/gascan/shell/bin/starship; \
+       chown -R root:root /opt/gascan/shell; \
+       chown -h root:root /opt/gascan/shell/bin/starship; \
+       chmod 0555 /opt/gascan/shell /opt/gascan/shell/bin /opt/gascan/shell/presets; \
+       chmod 0444 /opt/gascan/shell/presets/starship.toml \
+         /opt/gascan/shell/presets/starship-nerd-font.toml; \
+       test "$(readlink /opt/gascan/shell/bin/starship)" = ../../workstation/bin/starship' \
     && /usr/local/bin/run-workstation-step immutable-owner \
        chown -R root:root /opt/gascan/workstation \
     && /usr/local/bin/run-workstation-step immutable-mode \
@@ -115,6 +129,21 @@ RUN --network=none test -x /opt/gascan/gascamp/bin/camp \
        install -d -o root -g workspace -m 1770 /home/workspace/.config' \
     && /usr/local/bin/run-workstation-step home-configuration \
        sudo -n -u workspace env HOME=/home/workspace /usr/local/bin/configure-workstation-home \
+    && /usr/local/bin/run-workstation-step shell-startup \
+       sh -c 'hook_line=". /etc/gascan/bashrc"; \
+       test -f /etc/gascan/bashrc && test ! -L /etc/gascan/bashrc; \
+       test "$(stat -c %U:%G:%a /etc/gascan/bashrc)" = root:root:444; \
+       for startup in /home/workspace/.bashrc /root/.bashrc; do \
+         test -f "$startup" && test ! -L "$startup"; \
+         case "$startup" in \
+           /home/workspace/.bashrc) expected=workspace:workspace ;; \
+           /root/.bashrc) expected=root:root ;; \
+           *) exit 1 ;; \
+         esac; \
+         test "$(stat -c %U:%G "$startup")" = "$expected"; \
+         printf "\n%s\n" "$hook_line" >>"$startup"; \
+         test "$(tail -n 1 "$startup")" = "$hook_line"; \
+       done' \
     && /usr/local/bin/run-workstation-step gascan-config-boundary \
        sh -c 'chown root:workspace /home/workspace/.config/gascan; \
        chmod 1770 /home/workspace/.config/gascan; \
@@ -150,6 +179,7 @@ RUN --network=none test -x /opt/gascan/gascamp/bin/camp \
        sh -c 'rm -rf /tmp/workstation /tmp/versions.lock; rm -f /usr/local/bin/run-workstation-step'
 
 ENV HOME=/home/workspace
+ENV SHELL=/bin/bash
 ENV XDG_DATA_HOME=/home/workspace/.local/share
 ENV XDG_CACHE_HOME=/home/workspace/.cache
 ENV XDG_CONFIG_HOME=/home/workspace/.config

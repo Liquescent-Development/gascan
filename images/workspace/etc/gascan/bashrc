@@ -1,0 +1,111 @@
+case $- in *i*) ;; *) return 0 2>/dev/null || exit 0;; esac
+
+__gascan_starship_warn()
+{
+    if [ "${__gascan_starship_warning_shown:-0}" != 1 ]; then
+        printf '%s\n' 'gascan: Starship prompt unavailable; using standard Bash prompt.' >&2
+        __gascan_starship_warning_shown=1
+    fi
+    return 0
+}
+
+__gascan_starship_restore_config()
+{
+    if [ "$__gascan_starship_config_was_set" = 1 ]; then
+        STARSHIP_CONFIG=$__gascan_starship_old_config
+        export STARSHIP_CONFIG
+    else
+        unset STARSHIP_CONFIG
+    fi
+    unset __gascan_starship_config_was_set __gascan_starship_old_config
+}
+
+__gascan_shell_metadata()
+{
+    local metadata
+    metadata=$(/usr/bin/stat -c '%u:%a:%h' -- "$1" 2>/dev/null)
+    case "$metadata" in
+        *:*:*)
+            ;;
+        *)
+            metadata=$(/usr/bin/stat -f '%u:%Lp:%l' "$1" 2>/dev/null)
+            ;;
+    esac
+    printf '%s\n' "$metadata"
+}
+
+__gascan_starship_main()
+{
+    local selector=/home/workspace/.config/gascan/shell/prompt
+    local config=/home/workspace/.config/gascan/shell/starship.toml
+    local binary=/opt/gascan/shell/bin/starship
+    local prompt preset selector_contents initialization
+    local old_ps1 selector_metadata config_metadata preset_metadata
+
+    selector_metadata=$(__gascan_shell_metadata "$selector")
+    if [ ! -f "$selector" ] || [ -L "$selector" ] ||
+        [ "$selector_metadata" != 1000:600:1 ]; then
+        __gascan_starship_warn
+        return 0
+    fi
+    selector_contents=$(/bin/cat -- "$selector" 2>/dev/null; printf '\034')
+    case "$selector_contents" in
+        $'standard\n\034')
+            return 0
+            ;;
+        $'starship\n\034')
+            prompt=starship
+            preset=/opt/gascan/shell/presets/starship.toml
+            ;;
+        $'starship-nerd-font\n\034')
+            prompt=starship-nerd-font
+            preset=/opt/gascan/shell/presets/starship-nerd-font.toml
+            ;;
+        *)
+            __gascan_starship_warn
+            return 0
+            ;;
+    esac
+
+    config_metadata=$(__gascan_shell_metadata "$config")
+    preset_metadata=$(__gascan_shell_metadata "$preset")
+    if [ ! -f "$config" ] || [ -L "$config" ] ||
+        [ "$config_metadata" != 1000:600:1 ] ||
+        [ ! -f "$preset" ] || [ -L "$preset" ] ||
+        [ "$preset_metadata" != 0:444:1 ] ||
+        ! /usr/bin/cmp -s "$config" "$preset" ||
+        [ ! -x "$binary" ]; then
+        __gascan_starship_warn
+        return 0
+    fi
+
+    if [ "${STARSHIP_CONFIG+x}" = x ]; then
+        __gascan_starship_config_was_set=1
+        __gascan_starship_old_config=$STARSHIP_CONFIG
+    else
+        __gascan_starship_config_was_set=0
+        __gascan_starship_old_config=
+    fi
+    old_ps1=${PS1-}
+    STARSHIP_CONFIG=$config
+    export STARSHIP_CONFIG
+    if ! initialization=$("$binary" init bash); then
+        PS1=$old_ps1
+        __gascan_starship_restore_config
+        __gascan_starship_warn
+        return 0
+    fi
+    if ! eval "$initialization"; then
+        PS1=$old_ps1
+        __gascan_starship_restore_config
+        __gascan_starship_warn
+        return 0
+    fi
+    unset __gascan_starship_config_was_set __gascan_starship_old_config
+    return 0
+}
+
+__gascan_starship_main
+unset -f __gascan_starship_main __gascan_starship_restore_config __gascan_starship_warn \
+    __gascan_shell_metadata
+return 0 2>/dev/null || exit 0

@@ -340,6 +340,32 @@ fn every_local_dockerfile_copy_source_is_sealed_with_exact_bytes_and_mode() {
 }
 
 #[test]
+fn managed_shell_inputs_are_sealed_into_the_connected_context() {
+    let fixture = Fixture::new();
+    let output = fixture.run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for (path, mode) in [
+        ("images/workspace/bin/configure-shell-home", 0o555),
+        ("images/workspace/etc/gascan/bashrc", 0o444),
+        ("images/workspace/etc/gascan/starship.toml", 0o444),
+        ("images/workspace/etc/gascan/starship-nerd-font.toml", 0o444),
+    ] {
+        let original = fixture.repository.join(path);
+        let sealed = fixture.context.join(path);
+        assert_eq!(fs::read(&sealed).unwrap(), fs::read(&original).unwrap());
+        assert_eq!(
+            fs::metadata(&sealed).unwrap().permissions().mode() & 0o777,
+            mode,
+            "{path}"
+        );
+    }
+}
+
+#[test]
 fn docker_copy_parser_is_structural_and_fail_closed() {
     let parsed = parse_dockerfile_copies("  copy --chmod=0555 a b /dest\nCOPY --from=builder /out /dest\nCOPY name--from=value /dest\n").unwrap();
     assert_eq!(parsed[0].sources, ["a", "b"]);

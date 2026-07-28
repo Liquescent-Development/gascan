@@ -1499,6 +1499,49 @@ fn dockerfile_prints_safe_mise_version_metadata_only_when_the_lock_comparison_fa
 }
 
 #[test]
+fn shell_assets_are_immutable_and_wired_after_identity_migration() {
+    let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
+    for required in [
+        "COPY --chmod=0444 images/workspace/etc/gascan/bashrc /etc/gascan/bashrc",
+        "COPY --chmod=0444 images/workspace/etc/gascan/starship.toml /opt/gascan/shell/presets/starship.toml",
+        "COPY --chmod=0444 images/workspace/etc/gascan/starship-nerd-font.toml /opt/gascan/shell/presets/starship-nerd-font.toml",
+        "COPY --chmod=0555 images/workspace/bin/configure-shell-home /usr/local/bin/configure-shell-home",
+        "ln -s ../../workstation/bin/starship /opt/gascan/shell/bin/starship",
+        ". /etc/gascan/bashrc",
+        "ENV SHELL=/bin/bash",
+    ] {
+        assert!(
+            dockerfile.contains(required),
+            "missing managed shell image boundary: {required}"
+        );
+    }
+    let migration = dockerfile
+        .find("/usr/local/bin/migrate-workspace-identity")
+        .unwrap();
+    let startup = dockerfile.find(". /etc/gascan/bashrc").unwrap();
+    assert!(
+        migration < startup,
+        "workspace startup was changed before identity migration"
+    );
+    assert_eq!(
+        dockerfile.matches(". /etc/gascan/bashrc").count(),
+        1,
+        "the shared hook source command must be emitted by one bounded startup step"
+    );
+    for unsafe_writable in [
+        "chmod 0775 /opt/gascan",
+        "chmod 0777 /opt/gascan",
+        "chown workspace:workspace /opt/gascan",
+        "chown -R workspace:workspace /opt/gascan",
+    ] {
+        assert!(
+            !dockerfile.contains(unsafe_writable),
+            "shell wiring weakens immutable root: {unsafe_writable}"
+        );
+    }
+}
+
+#[test]
 fn mise_comparison_is_quiet_on_match_and_emits_only_both_json_documents_on_mismatch() {
     let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
     let block = dockerfile
