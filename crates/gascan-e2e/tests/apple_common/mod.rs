@@ -3725,6 +3725,54 @@ mod tests {
     }
 
     #[test]
+    fn pty_command_waiter_times_out_kills_and_reaps_child() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let pid_path = temp.path().join("pid");
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "printf '%s' \"$$\" > \"$1\"; printf GASCAN_PTY_TIMEOUT_READY; while :; do :; done",
+            "sh",
+            pid_path.to_str().ok_or("non-UTF-8 pid path")?,
+        ]);
+
+        let started = std::time::Instant::now();
+        let error = match run_pty_command(command, std::time::Duration::from_secs(1)) {
+            Ok(_) => return Err("PTY child did not reach the timeout".into()),
+            Err(error) => error,
+        };
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(error.to_string().contains("GASCAN_PTY_TIMEOUT_READY"));
+        let raw_pid = std::fs::read_to_string(pid_path)?.parse::<i32>()?;
+        let pid = rustix::process::Pid::from_raw(raw_pid).ok_or("invalid child pid")?;
+        assert_eq!(
+            rustix::process::test_kill_process(pid),
+            Err(rustix::io::Errno::SRCH)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pty_command_waiter_does_not_wait_for_descendant_pty_eof() -> TestResult {
+        let mut command = Command::new("sh");
+        command.args(["-c", "(sleep 3) & printf GASCAN_PTY_PARENT_EXITED"]);
+
+        let started = std::time::Instant::now();
+        let output = run_pty_command(command, std::time::Duration::from_secs(2))?;
+
+        assert!(output.status.success());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(
+            output
+                .stdout
+                .windows(b"GASCAN_PTY_PARENT_EXITED".len())
+                .any(|window| window == b"GASCAN_PTY_PARENT_EXITED")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn pty_resize_driver_delivers_exact_dimensions_to_child() -> TestResult {
         let mut command = Command::new("sh");
         command.args([

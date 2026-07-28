@@ -117,7 +117,7 @@ exit 0
     assert!(
         tty.status.success(),
         "TTY shell failed: {}",
-        String::from_utf8_lossy(&tty.stderr)
+        String::from_utf8_lossy(&tty.stdout)
     );
 
     let resized = env.run_pty_resize(
