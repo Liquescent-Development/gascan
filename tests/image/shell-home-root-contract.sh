@@ -249,6 +249,9 @@ starship_preexec_ps0()
 }
 starship_precmd()
 {
+    if test -n "${STARSHIP_PROMPT_COMMAND:-}"; then
+        eval "$STARSHIP_PROMPT_COMMAND"
+    fi
     "$STARSHIP_EXECUTABLE" prompt
 }
 STARSHIP_START_TIME=1
@@ -257,6 +260,10 @@ STARSHIP_SESSION_KEY=1234567890123456
 PS0='managed-ps0'
 PS1='managed-starship'
 PS2='managed-continuation'
+if test -n "${PROMPT_COMMAND:-}" &&
+    [[ "$PROMPT_COMMAND" != *"starship_precmd"* ]]; then
+    STARSHIP_PROMPT_COMMAND=$PROMPT_COMMAND
+fi
 PROMPT_COMMAND=starship_precmd
 shopt -s checkwinsize
 trap ':' DEBUG
@@ -353,6 +360,30 @@ printf '%s\n' "$workspace_output" |
 test ! -s "$path_log" || die 'workspace prompt resolved Starship through user PATH'
 test "$(grep -Fc 'init bash --print-full-init' "$stable_log")" = 1 ||
     die 'workspace full init executed more than once'
+
+custom_log=/tmp/gascan-prompt-customization.log
+custom_output=$(
+    GASCAN_TEST_STABLE_LOG="$custom_log" \
+        PATH="$attacker_bin:/usr/bin:/bin" \
+        /bin/bash --noprofile --norc -i -c \
+        "PS1='native-root'; \
+         caller_prompt_command() { printf 'caller-customization\n'; }; \
+         PROMPT_COMMAND=caller_prompt_command; . '$hook'; \
+         printf 'COMMAND=%s\nPRESERVED=%s\n' \
+         \"\$PROMPT_COMMAND\" \"\$STARSHIP_PROMPT_COMMAND\"; \
+         starship_precmd"
+)
+printf '%s\n' "$custom_output" | grep -Fqx COMMAND=starship_precmd ||
+    die 'managed prompt did not install its prompt command'
+printf '%s\n' "$custom_output" |
+    grep -Fqx PRESERVED=caller_prompt_command ||
+    die 'managed prompt did not preserve supported prompt customization'
+printf '%s\n' "$custom_output" | grep -Fqx caller-customization ||
+    die 'managed prompt did not execute supported prompt customization'
+printf '%s\n' "$custom_output" | grep -Fqx stable-runtime ||
+    die 'prompt customization prevented managed prompt runtime'
+test "$(grep -Fc 'init bash --print-full-init' "$custom_log")" = 1 ||
+    die 'customized prompt full init executed more than once'
 
 debug_output=$(
     PATH="$attacker_bin:/usr/bin:/bin" /bin/bash --noprofile --norc -i -c \

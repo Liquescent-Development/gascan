@@ -17,6 +17,12 @@
 - Managed Starship activation performs no network access and does not run in `gascan run`, setup, health, or other non-interactive sessions.
 - Gas Can never edits host dotfiles, installs host fonts, or claims to detect the host terminal font.
 - Unsafe links, file types, ownership, or modes in managed shell state fail closed; an unavailable Starship at interactive startup warns once and falls back to Bash.
+- The security boundary covers root-managed files, immutable pinned inputs and
+  paths, provisioning authority, and Gas Can's own initialization failures.
+  Existing and concurrently same-user-mutated interactive Bash state is
+  trusted caller state, not an isolation boundary.
+- Preserve compatible caller prompt customization supported by pinned
+  Starship, including an existing writable `PROMPT_COMMAND`.
 - The compatible preset must not require a Nerd Font; the Nerd Font preset requires an already configured host terminal font.
 - Preserve the user-owned changes in the primary checkout; all work stays in `.worktrees/native-shell-starship`.
 - Every shell command in this repository environment is prefixed with `rtk`.
@@ -447,19 +453,22 @@ ownership, and mode are validated while hostile `PATH` remains unused. Prove
 full init executes exactly once, a partial failure leaks no prompt,
 `PROMPT_COMMAND`, function, variable, or DEBUG-trap state, and pre-existing
 Starship environment is restored exactly, including set/unset and
-exported/unexported attributes. Add collisions for every managed function and
+exported/unexported attributes. Add defense-in-depth collisions for every
+managed function and
 internal variable, readonly config/executable/PATH and prompt-hook variables,
 an inherited DEBUG trap that mutates evaluator state, a readonly managed
 function introduced after preflight, a writable managed function introduced
 after preflight, a DEBUG trap that creates a spoofing `trap()` function, a
 self-clearing DEBUG trap that leaves a managed-state collision, and a failed
-init command followed by a successful final command. Prove the inherited trap
-is captured and manipulated through `builtin trap`, preserved exactly, and
-never evaluated by Starship setup. Prove each managed function remains absent
-and each managed variable retains its exact declaration immediately before its
-write; any mismatch must roll back the full live snapshot. Prove all such
-cases warn once, execute no Starship command when rejected before generation,
-and leave subsequent Bash commands usable. Prove the
+init command followed by a successful final command. Prove an inherited trap
+visible to the hook is captured and manipulated through `builtin trap` and
+preserved exactly on fallback. Acknowledge that a sourced hook cannot
+authenticate a self-clearing trap that mutates the shell before its first
+instruction. Verify the defense-in-depth function and variable comparisons and
+rollback behavior without treating them as isolation from adversarial
+same-shell state. Prove supported existing `PROMPT_COMMAND` customization is
+preserved through pinned Starship's `STARSHIP_PROMPT_COMMAND` path. Prove
+rejected cases warn once and leave subsequent Bash commands usable. Prove the
 root-owned mode `0600` advisory lock serializes concurrent writers and that the
 workspace account can read but cannot mutate or race managed state.
 
@@ -516,12 +525,13 @@ Under an immutable-only `PATH`, it exports the pinned
 The stable path is the exact root-owned relative symlink to the immutable
 root-owned workstation binary; validate both the link and its target. Evaluate
 the captured full init exactly once in an inherited subshell with effective
-`errexit`. At hook entry, capture the inherited DEBUG trap through
+`errexit`. At hook entry, capture any visible inherited DEBUG trap through
 `builtin trap`; if one is visible, fail closed before validation or
-initialization, preserve it exactly, and never evaluate it as Starship
-provenance. Use `builtin trap` for every later trap read or manipulation. If a
-trap clears itself before capture, preflight must still reject any managed
-state it changed. Before generation, reject readonly live state and every
+initialization and preserve it exactly. This is a defense-in-depth
+compatibility check: the sourced hook cannot authenticate a self-clearing
+DEBUG trap or other same-authority mutation that runs before its first
+instruction. Use `builtin trap` for every later trap read or manipulation.
+Before generation, reject readonly live state and every
 pre-existing managed function/internal-variable collision on the exact pinned
 1.25.1 surface. Pass config, executable, and immutable `PATH` only through
 child environments until validation succeeds. On success, serialize only the
@@ -531,9 +541,12 @@ each managed function declaration, compare that it remains absent; immediately
 before each managed variable write, compare its exact preflight declaration,
 including set/unset and attributes. Never serialize inherited user Starship
 definitions and never evaluate full init a second time. Roll back the snapshot
-if parent apply unexpectedly fails. If validation, inherited DEBUG state,
-collision preflight, generation, isolated evaluation, compare-before-write, or
-guarded apply fails, leave the live shell untouched, print
+if parent apply unexpectedly fails. Preserve compatible caller customization
+that pinned Starship supports: a writable existing `PROMPT_COMMAND` is stored
+as `STARSHIP_PROMPT_COMMAND` and executed by `starship_precmd`. If validation,
+visible inherited DEBUG state, collision preflight, generation, isolated
+evaluation, compare-before-write, or guarded apply fails, do not leave partial
+Gas Can initialization state, print
 `gascan: Starship prompt unavailable; using standard Bash prompt.` once and
 return success.
 

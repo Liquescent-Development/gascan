@@ -53,6 +53,8 @@ SSH will use the same selected prompt.
 - No automatic modification of host shell files.
 - No persistence guarantee for arbitrary home-directory files or shell
   history.
+- No isolation from code or state already running in the same interactive
+  Bash process.
 - No change to explicit shell commands such as
   `gascan shell -- zsh` or `gascan shell -- bash --noprofile --norc`.
 
@@ -129,6 +131,27 @@ the default `standard` mode. This makes either opt-in preset available without
 a network download, including in an offline sandbox, and updates it only
 through a reviewed Gas Can image release.
 
+## Trust Boundary
+
+Gas Can's security boundary covers the inputs and state it owns: the
+release-pinned Starship binary and presets, their exact root-owned immutable
+paths, the root/workspace provisioning boundary, managed selector and
+configuration ownership and modes, and failure handling for Gas Can's own
+initialization transaction. User-controlled `PATH` cannot replace the managed
+binary, and the workspace account cannot publish or race root-managed prompt
+configuration.
+
+The existing interactive Bash process is the trusted caller, not a security
+isolation boundary. Its pre-existing or concurrently same-user-mutated
+functions, variables, traps, signals, and prompt customization are caller
+state. A sourced hook cannot authenticate shell mutations that occur before
+its first instruction; in particular, a self-clearing DEBUG trap can run
+before the hook can observe it. Collision checks, authoritative builtin use,
+compare-before-write checks, isolated evaluation, and rollback remain useful
+defense in depth against accidental incompatibility and failures in Gas Can's
+own initialization, but they do not protect against adversarial code already
+executing with equal authority in the same shell.
+
 ## Managed Shell Files
 
 The image-provided Bash startup files for the supported workspace and root
@@ -161,14 +184,11 @@ configuration. The hook invokes the pinned binary directly with
 `init bash --print-full-init` under an immutable-only `PATH`, exports the
 pinned `STARSHIP_EXECUTABLE` for prompt runtime, and evaluates the resulting
 full initialization exactly once in an inherited subshell. Before generation,
-the hook records the DEBUG trap visible at hook entry with the authoritative
-`builtin trap`, so a trap-created shell function cannot spoof capture. It
-fails closed if a trap remains inherited, preserving it byte-for-byte and
-never evaluating it as part of Starship initialization. A trap that clears
-itself before capture is no longer active provenance; preflight still rejects
-any managed state it mutated. The hook also rejects readonly live variables
-and any pre-existing function or internal-variable collision on the reviewed
-Starship 1.25.1 mutation surface.
+the hook records any DEBUG trap visible at hook entry with `builtin trap` and
+fails closed if one remains visible, preserving it byte-for-byte. This is a
+compatibility check, not authentication of prior same-shell activity. The hook
+also rejects readonly live variables and pre-existing function or
+internal-variable collisions on the reviewed Starship 1.25.1 mutation surface.
 Generation and isolated evaluation receive config, executable, and
 immutable-only `PATH` through their child environment; no live shell variable
 is changed before success.
@@ -186,12 +206,16 @@ each managed variable write it compares the exact set/unset declaration and
 attributes captured at preflight. All DEBUG-trap reads and manipulation use
 `builtin trap`. Any unexpected apply failure is reported and rolls back the
 snapshot, including set/unset and exported/unexported variable attributes.
-Thus a partially failing full init, or a writable or readonly collision
-introduced after preflight, cannot mutate live prompt, function, variable,
-trap, or hook state, and no second full-init evaluation is needed. Unsupported
-BLE integration fails closed to standard Bash. The hook warns once on
-inherited DEBUG state, collision, readonly state, generation failure, isolated
-evaluation failure, or guarded apply failure. Switching back to `standard`
+These checks keep a partially failing managed init or an observed writable or
+readonly collision from leaving partial managed prompt state; they do not
+isolate the shell from same-user code running concurrently. No second
+full-init evaluation is needed. The pinned Starship Bash initialization
+preserves a normal existing `PROMPT_COMMAND` in `STARSHIP_PROMPT_COMMAND` and
+executes it from `starship_precmd`, so compatible caller customization remains
+active. Unsupported BLE integration fails closed to standard Bash. The hook
+warns once on visible inherited DEBUG state, collision, readonly state,
+generation failure, isolated evaluation failure, or guarded apply failure.
+Switching back to `standard`
 disables Starship on the next interactive login. Obsolete generated preset
 state may be removed only after its exact managed identity and type have been
 verified.
@@ -271,7 +295,9 @@ Interactive shell access must remain available if the applied Starship binary
 or generated configuration is unexpectedly missing or unreadable. The startup
 hook prints one concise warning for that session and falls back to the
 standard Bash prompt. It does not retry installation, access the network, or
-abort the shell.
+abort the shell. This fallback covers Gas Can-owned inputs and initialization
+failures; it is not a containment guarantee for arbitrary code already
+executing in the interactive shell.
 
 Starship initialization errors cannot affect non-interactive commands.
 `gascan run`, explicit non-interactive shell argv, setup scripts, health
@@ -310,6 +336,8 @@ Automated coverage includes:
   for the pinned Starship binary;
 - Bash startup contract tests proving interactive-only loading and standard
   fallback;
+- Bash startup contracts proving pinned Starship-compatible caller
+  `PROMPT_COMMAND` customization remains active;
 - preset snapshots for compatible and Nerd Font modes;
 - unsafe-file, symlink, interrupted-publication, retry, enable, switch, and
   disable provisioning tests;

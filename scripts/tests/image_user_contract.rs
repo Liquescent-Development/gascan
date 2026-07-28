@@ -149,13 +149,14 @@ fn hook_fixture(temporary: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf, Pa
                'starship_preexec() { :; }' \
                'starship_preexec_all() { :; }' \
                'starship_preexec_ps0() { :; }' \
-               'starship_precmd() { \"$STARSHIP_EXECUTABLE\" prompt; }' \
+               'starship_precmd() { if [ -n \"${STARSHIP_PROMPT_COMMAND-}\" ]; then eval \"$STARSHIP_PROMPT_COMMAND\"; fi; \"$STARSHIP_EXECUTABLE\" prompt; }' \
                'STARSHIP_START_TIME=1' \
                'STARSHIP_SHELL=bash' \
                'STARSHIP_SESSION_KEY=1234567890123456' \
                'PS0=managed-ps0' \
                'PS1=managed-starship' \
                'PS2=managed-continuation' \
+               'if [ -n \"${PROMPT_COMMAND-}\" ] && [[ \"$PROMPT_COMMAND\" != *\"starship_precmd\"* ]]; then STARSHIP_PROMPT_COMMAND=$PROMPT_COMMAND; fi' \
                'PROMPT_COMMAND=starship_precmd' \
                'shopt -s checkwinsize' \
                \"trap ':' DEBUG\"\n\
@@ -2061,6 +2062,41 @@ fn shell_hook_uses_only_the_pinned_binary_and_managed_config() {
     assert!(
         !String::from_utf8_lossy(&output.stderr).contains("PATH starship"),
         "hook resolved Starship through PATH"
+    );
+}
+
+#[test]
+fn shell_hook_preserves_supported_prompt_command_customization() {
+    let temporary = tempfile::tempdir().unwrap();
+    let (hook, shell_dir, _starship, log) = hook_fixture(&temporary);
+    write_mode(&shell_dir.join("prompt"), "starship\n", 0o640);
+    write_mode(
+        &shell_dir.join("starship.toml"),
+        "format = \"$character\"\n",
+        0o640,
+    );
+
+    let output = run_hook(
+        &hook,
+        r#"PS1=native-prompt; caller_prompt_command() { printf 'caller-customization\n'; }; PROMPT_COMMAND=caller_prompt_command; . "$GASCAN_TEST_HOOK"; printf 'COMMAND=%s\nPRESERVED=%s\n' "$PROMPT_COMMAND" "$STARSHIP_PROMPT_COMMAND"; starship_precmd"#,
+        &log,
+        false,
+        false,
+        true,
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        b"COMMAND=starship_precmd\nPRESERVED=caller_prompt_command\ncaller-customization\nstable-runtime-prompt\n"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("gascan:"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
