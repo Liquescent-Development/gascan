@@ -141,6 +141,9 @@ fn hook_fixture(temporary: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf, Pa
                'false' \
                'true'\n\
            else\n\
+             if [ \"${GASCAN_TEST_SIGNAL_COLLISION-0}\" = 1 ]; then\n\
+               printf '%s\\n' 'kill -USR1 \"$GASCAN_TEST_PARENT_PID\"'\n\
+             fi\n\
              printf '%s\\n' \
                '_starship_set_return() { return \"${1:-0}\"; }' \
                'starship_preexec() { :; }' \
@@ -2089,6 +2092,84 @@ fn shell_hook_warns_once_and_returns_success_when_starship_is_unavailable() {
         "stderr: {}\nlog: {}",
         String::from_utf8_lossy(&output.stderr),
         fs::read_to_string(&log).unwrap_or_default()
+    );
+
+    let before = fs::read_to_string(&log).unwrap_or_default();
+    let debug_trap = run_hook(
+        &hook,
+        r#"PS1=native-prompt; set -T; trap 'if [ "$BASH_SUBSHELL" -gt 0 ]; then starship_precmd() { printf attacker; }; STARSHIP_START_TIME=attacker; fi' DEBUG; before=$(trap -p DEBUG); . "$GASCAN_TEST_HOOK"; after=$(trap -p DEBUG); if declare -F starship_precmd >/dev/null; then function=present; else function=absent; fi; printf 'PS1=%s\nFUNCTION=%s\nSTART=%s\nBEFORE=%s\nAFTER=%s\n' "$PS1" "$function" "${STARSHIP_START_TIME-unset}" "$before" "$after""#,
+        &log,
+        false,
+        false,
+        true,
+    );
+    assert!(debug_trap.status.success());
+    let debug_stdout = String::from_utf8_lossy(&debug_trap.stdout);
+    assert!(
+        debug_stdout.contains("PS1=native-prompt\n"),
+        "{debug_stdout}"
+    );
+    assert!(debug_stdout.contains("FUNCTION=absent\n"), "{debug_stdout}");
+    assert!(debug_stdout.contains("START=unset\n"), "{debug_stdout}");
+    let trap_line = "trap -- 'if [ \"$BASH_SUBSHELL\" -gt 0 ]; then starship_precmd() { printf attacker; }; STARSHIP_START_TIME=attacker; fi' DEBUG";
+    assert!(
+        debug_stdout.contains(&format!("BEFORE={trap_line}\nAFTER={trap_line}\n")),
+        "{debug_stdout}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&debug_trap.stderr)
+            .matches("gascan: Starship prompt unavailable; using standard Bash prompt.")
+            .count(),
+        1,
+        "{}",
+        String::from_utf8_lossy(&debug_trap.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&log).unwrap_or_default(),
+        before,
+        "inherited DEBUG trap reached Starship"
+    );
+
+    let before = fs::read_to_string(&log).unwrap_or_default();
+    let signal_collision = Command::new("/bin/bash")
+        .args([
+            "--noprofile",
+            "--norc",
+            "-i",
+            "-c",
+            r#"PS1=native-prompt; trap 'starship_precmd() { printf attacker; }; readonly -f starship_precmd' USR1; export GASCAN_TEST_PARENT_PID=$$; . "$GASCAN_TEST_HOOK"; printf 'PS1=%s\nFUNCTION=' "$PS1"; starship_precmd; printf '\n'"#,
+        ])
+        .env("GASCAN_TEST_HOOK", &hook)
+        .env("GASCAN_TEST_LOG", &log)
+        .env("GASCAN_TEST_GENERATION_FAIL", "0")
+        .env("GASCAN_TEST_EVAL_FAIL", "0")
+        .env("GASCAN_TEST_SIGNAL_COLLISION", "1")
+        .env_remove("STARSHIP_SHELL")
+        .env_remove("STARSHIP_SESSION_KEY")
+        .output()
+        .unwrap();
+    assert!(signal_collision.status.success());
+    assert_eq!(
+        signal_collision.stdout,
+        b"PS1=native-prompt\nFUNCTION=attacker\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&signal_collision.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&signal_collision.stderr)
+            .matches("gascan: Starship prompt unavailable; using standard Bash prompt.")
+            .count(),
+        1,
+        "{}",
+        String::from_utf8_lossy(&signal_collision.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .matches("init bash --print-full-init")
+            .count(),
+        before.matches("init bash --print-full-init").count() + 1,
+        "readonly function race did not stop after one generated init"
     );
 
     for (name, setup) in [

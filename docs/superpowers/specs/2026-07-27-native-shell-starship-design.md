@@ -161,8 +161,11 @@ configuration. The hook invokes the pinned binary directly with
 `init bash --print-full-init` under an immutable-only `PATH`, exports the
 pinned `STARSHIP_EXECUTABLE` for prompt runtime, and evaluates the resulting
 full initialization exactly once in an inherited subshell. Before generation,
-the hook rejects readonly live variables and any pre-existing function or
-internal-variable collision on the reviewed Starship 1.25.1 mutation surface.
+the hook records the DEBUG trap visible at hook entry and fails closed if one
+is inherited, preserving it byte-for-byte and never evaluating it as part of
+Starship initialization. It also rejects readonly live variables and any
+pre-existing function or internal-variable collision on the reviewed
+Starship 1.25.1 mutation surface.
 Generation and isolated evaluation receive config, executable, and
 immutable-only `PATH` through their child environment; no live shell variable
 is changed before success.
@@ -174,13 +177,15 @@ of the reviewed Bash state (managed Starship functions and variables, prompt
 variables, `PROMPT_COMMAND`, supported preexec arrays, the DEBUG trap, and
 `checkwinsize`). It cannot serialize an inherited user Starship definition.
 The hook snapshots that same surface, syntax-checks and dry-runs the commit,
-then applies guarded operations. Any unexpected apply failure is reported and
-rolls back the snapshot, including set/unset and exported/unexported variable
-attributes. Thus a partially failing full init cannot mutate live prompt,
-function, variable, trap, or hook state, and no second full-init evaluation is
-needed. Unsupported BLE integration fails closed to standard Bash. The hook
-warns once on collision, readonly state, generation failure, or isolated
-evaluation failure. Switching back to `standard`
+then applies guarded operations, including each function declaration. Any
+unexpected apply failure is reported and rolls back the snapshot, including
+set/unset and exported/unexported variable attributes. Thus a partially
+failing full init, or a readonly function introduced after preflight, cannot
+mutate live prompt, function, variable, trap, or hook state, and no second
+full-init evaluation is needed. Unsupported BLE integration fails closed to
+standard Bash. The hook warns once on inherited DEBUG state, collision,
+readonly state, generation failure, isolated evaluation failure, or guarded
+apply failure. Switching back to `standard`
 disables Starship on the next interactive login. Obsolete generated preset
 state may be removed only after its exact managed identity and type have been
 verified.

@@ -449,9 +449,13 @@ full init executes exactly once, a partial failure leaks no prompt,
 Starship environment is restored exactly, including set/unset and
 exported/unexported attributes. Add collisions for every managed function and
 internal variable, readonly config/executable/PATH and prompt-hook variables,
-and a failed init command followed by a successful final command. Prove all
-such cases warn once, execute no Starship command when rejected before
-generation, and leave subsequent Bash commands usable. Prove the
+an inherited DEBUG trap that mutates evaluator state, a readonly managed
+function introduced after preflight, and a failed init command followed by a
+successful final command. Prove the inherited trap is preserved exactly and
+never evaluated by Starship setup; prove each guarded function declaration
+failure rolls back the full live snapshot. Prove all such cases warn once,
+execute no Starship command when rejected before generation, and leave
+subsequent Bash commands usable. Prove the
 root-owned mode `0600` advisory lock serializes concurrent writers and that the
 workspace account can read but cannot mutate or race managed state.
 
@@ -508,17 +512,20 @@ Under an immutable-only `PATH`, it exports the pinned
 The stable path is the exact root-owned relative symlink to the immutable
 root-owned workstation binary; validate both the link and its target. Evaluate
 the captured full init exactly once in an inherited subshell with effective
-`errexit`. Before generation, reject readonly live state and every
-pre-existing managed function/internal-variable collision on the exact pinned
-1.25.1 surface. Pass config, executable, and immutable `PATH` only through
-child environments until validation succeeds. On success, serialize only the
-explicit allowlist, snapshot the same live surface, syntax-check and dry-run
-the declaration commit, and apply guarded operations. Never serialize
-inherited user Starship definitions and never evaluate full init a second
-time. Roll back the snapshot if parent apply unexpectedly fails, preserving
-set/unset and exported/unexported attributes. If validation, collision
-preflight, generation, or isolated evaluation fails, leave the live shell
-untouched, print
+`errexit`. At hook entry, capture the inherited DEBUG trap; if one is visible,
+fail closed before validation or initialization, preserve it exactly, and
+never evaluate it as Starship provenance. Before generation, reject readonly
+live state and every pre-existing managed function/internal-variable collision
+on the exact pinned 1.25.1 surface. Pass config, executable, and immutable
+`PATH` only through child environments until validation succeeds. On success,
+serialize only the explicit allowlist, snapshot the same live surface,
+syntax-check and dry-run the declaration commit, and guard every applied
+operation, including function declarations. Never serialize inherited user
+Starship definitions and never evaluate full init a second time. Roll back the
+snapshot if parent apply unexpectedly fails, preserving set/unset and
+exported/unexported attributes. If validation, inherited DEBUG state,
+collision preflight, generation, isolated evaluation, or guarded apply fails,
+leave the live shell untouched, print
 `gascan: Starship prompt unavailable; using standard Bash prompt.` once and
 return success.
 
