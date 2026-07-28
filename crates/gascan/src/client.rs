@@ -1,6 +1,8 @@
+use crate::daemon::DaemonPaths;
 use gascan_proto::v1::gas_can_client::GasCanClient;
 use gascan_proto::{API_MAJOR, API_MINOR, validate_transport_security};
 use hyper_util::rt::TokioIo;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -78,7 +80,8 @@ pub struct Client {
 
 impl Client {
     pub async fn daemon_attestation() -> Result<gascan_proto::v1::HandshakeResponse, ClientError> {
-        let mut api = connect(&socket_path()).await?;
+        let paths = DaemonPaths::for_user()?;
+        let mut api = connect(paths.socket()).await?;
         Ok(api
             .handshake(gascan_proto::v1::HandshakeRequest {
                 api_major: API_MAJOR,
@@ -90,7 +93,8 @@ impl Client {
     }
 
     pub async fn connect_or_start() -> Result<Self, ClientError> {
-        let socket = socket_path();
+        let paths = DaemonPaths::for_user()?;
+        let socket = paths.socket().to_owned();
         let initial = tokio::time::timeout(Duration::from_millis(250), async {
             negotiate(connect(&socket).await?).await
         })
@@ -101,8 +105,17 @@ impl Client {
             Ok(Err(_)) | Err(_) => {}
         }
         let daemon = daemon_path()?;
+        let (instance_path, owner_token) = daemon_launch_environment(
+            &paths,
+            std::env::var_os("GASCAN_DAEMON_INSTANCE_PATH").as_deref(),
+            std::env::var_os("GASCAN_DAEMON_OWNER_TOKEN").as_deref(),
+        )?;
         let mut command = tokio::process::Command::new(daemon);
-        command.stdin(Stdio::null()).stdout(Stdio::null());
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .env("GASCAN_DAEMON_INSTANCE_PATH", instance_path)
+            .env("GASCAN_DAEMON_OWNER_TOKEN", owner_token);
         if let Some(path) = std::env::var_os("GASCAN_DAEMON_STDERR_PATH") {
             command.stderr(
                 std::fs::OpenOptions::new()
@@ -160,22 +173,35 @@ fn startup_transient(error: &ClientError) -> bool {
     }
 }
 
-fn socket_path() -> PathBuf {
-    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime).join("gascan/gascand.sock");
+fn daemon_launch_environment(
+    paths: &DaemonPaths,
+    instance_override: Option<&OsStr>,
+    owner_override: Option<&OsStr>,
+) -> Result<(PathBuf, String), ClientError> {
+    let instance = instance_override.map_or_else(|| paths.instance().to_owned(), PathBuf::from);
+    let owner = match owner_override {
+        Some(value) => value
+            .to_str()
+            .ok_or_else(|| {
+                ClientError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "daemon owner token must be valid UTF-8",
+                ))
+            })?
+            .to_owned(),
+        None => {
+            let mut random = [0_u8; 32];
+            getrandom::fill(&mut random).map_err(std::io::Error::other)?;
+            random.iter().map(|byte| format!("{byte:02x}")).collect()
+        }
+    };
+    if owner.is_empty() {
+        return Err(ClientError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "daemon owner token must not be empty",
+        )));
     }
-    let uid = rustix::process::geteuid().as_raw();
-    default_runtime_base().join(format!("gascan-{uid}/gascand.sock"))
-}
-
-#[cfg(target_os = "macos")]
-fn default_runtime_base() -> PathBuf {
-    PathBuf::from("/private/tmp")
-}
-
-#[cfg(not(target_os = "macos"))]
-fn default_runtime_base() -> PathBuf {
-    PathBuf::from("/tmp")
+    Ok((instance, owner))
 }
 
 fn daemon_path() -> Result<PathBuf, ClientError> {
@@ -231,11 +257,49 @@ async fn negotiate(mut api: GasCanClient<Channel>) -> Result<Client, ClientError
 
 #[cfg(test)]
 mod tests {
+    use crate::daemon::DaemonPaths;
+
+    #[test]
+    fn daemon_launch_environment_sets_normal_paths_and_fresh_owner_token()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let paths =
+            DaemonPaths::from_runtime_root(temp.path().canonicalize()?.join("gascan-runtime"));
+        let (instance, first) = super::daemon_launch_environment(&paths, None, None)?;
+        let (_, second) = super::daemon_launch_environment(&paths, None, None)?;
+        assert_eq!(instance, paths.instance());
+        assert_eq!(first.len(), 64);
+        assert_eq!(second.len(), 64);
+        assert_ne!(first, second);
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_launch_environment_preserves_e2e_overrides() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let paths = DaemonPaths::from_runtime_root(root.join("gascan-runtime"));
+        let override_path = root.join("e2e-instance.json");
+        let (instance, owner) = super::daemon_launch_environment(
+            &paths,
+            Some(override_path.as_os_str()),
+            Some(std::ffi::OsStr::new("e2e-owner")),
+        )?;
+        assert_eq!(instance, override_path);
+        assert_eq!(owner, "e2e-owner");
+        assert!(
+            super::daemon_launch_environment(&paths, None, Some(std::ffi::OsStr::new("")),)
+                .is_err()
+        );
+        Ok(())
+    }
+
     #[test]
     #[cfg(target_os = "macos")]
     fn default_runtime_base_avoids_the_tmp_symlink() {
         assert_eq!(
-            super::default_runtime_base(),
+            crate::daemon::default_runtime_base(),
             std::path::PathBuf::from("/private/tmp")
         );
     }

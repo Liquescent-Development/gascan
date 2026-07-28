@@ -31,35 +31,53 @@ struct DaemonInstanceRecord {
     executable: std::path::PathBuf,
     start_identity: String,
     instance_token: String,
+    release_version: String,
+    started_at: DaemonInstanceTimestamp,
 }
 
-fn write_daemon_instance_record(identity: &DaemonIdentity) -> io::Result<()> {
-    let Some(path) = std::env::var_os("GASCAN_DAEMON_INSTANCE_PATH").map(std::path::PathBuf::from)
-    else {
-        return Ok(());
+#[derive(serde::Serialize)]
+struct DaemonInstanceTimestamp {
+    seconds: i64,
+    nanos: i32,
+}
+
+fn write_daemon_instance_record(
+    paths: &SocketPaths,
+    identity: &DaemonIdentity,
+) -> io::Result<Option<crate::socket::OwnedInstanceRecord>> {
+    let configured_path =
+        std::env::var_os("GASCAN_DAEMON_INSTANCE_PATH").map(std::path::PathBuf::from);
+    let owner_token = match std::env::var("GASCAN_DAEMON_OWNER_TOKEN") {
+        Ok(value) if !value.is_empty() => value,
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "daemon owner token must not be empty",
+            ));
+        }
+        Err(_) if configured_path.is_none() => return Ok(None),
+        Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "daemon owner token is required",
+            ));
+        }
     };
-    let owner_token = std::env::var("GASCAN_DAEMON_OWNER_TOKEN").map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "daemon owner token is required",
-        )
-    })?;
+    let path = configured_path.unwrap_or_else(|| paths.instance().to_owned());
     let record = DaemonInstanceRecord {
         pid: identity.pid,
         owner_token,
         executable: identity.executable.clone(),
         start_identity: identity.start_identity.clone(),
         instance_token: identity.instance_token.clone(),
+        release_version: identity.release_version.clone(),
+        started_at: DaemonInstanceTimestamp {
+            seconds: identity.started_at.seconds,
+            nanos: identity.started_at.nanos,
+        },
     };
     let bytes = serde_json::to_vec(&record).map_err(io::Error::other)?;
-    let temporary = path.with_extension(format!("tmp-{}", identity.pid));
-    std::fs::write(&temporary, bytes)?;
-    #[cfg(unix)]
-    std::fs::set_permissions(
-        &temporary,
-        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
-    )?;
-    std::fs::rename(temporary, path)
+    crate::socket::write_instance_record(&path, &bytes).map(Some)
 }
 
 #[derive(Clone, Debug)]
@@ -95,21 +113,59 @@ impl DaemonIdentity {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn process_start_identity(pid: u32) -> io::Result<String> {
-    let output = std::process::Command::new("ps")
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let remainder = stat
+        .rsplit_once(") ")
+        .map(|(_, value)| value)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "malformed daemon process stat")
+        })?;
+    let start = remainder.split_whitespace().nth(19).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "daemon process stat lacks start identity",
+        )
+    })?;
+    Ok(format!("linux:{start}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_start_identity(pid: u32) -> io::Result<String> {
+    use std::process::Stdio;
+    let mut child = std::process::Command::new("/bin/ps")
         .args(["-p", &pid.to_string(), "-o", "lstart="])
-        .output()?;
-    if !output.status.success() {
-        return Err(io::Error::other(
-            "could not read daemon process start identity",
-        ));
-    }
-    let value = String::from_utf8(output.stdout).map_err(io::Error::other)?;
-    let value = value.trim().to_owned();
-    if value.is_empty() {
-        Err(io::Error::other("empty daemon process start identity"))
-    } else {
-        Ok(value)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let output = child.wait_with_output()?;
+            if !status.success() {
+                return Err(io::Error::other(
+                    "could not read daemon process start identity",
+                ));
+            }
+            let value = String::from_utf8(output.stdout).map_err(io::Error::other)?;
+            let value = value.trim().to_owned();
+            return if value.is_empty() {
+                Err(io::Error::other("empty daemon process start identity"))
+            } else {
+                Ok(value)
+            };
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill()?;
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "daemon process inspection timed out",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -349,7 +405,8 @@ impl Daemon {
         if let Some(pid_path) = std::env::var_os("GASCAN_PID_PATH") {
             std::fs::write(pid_path, std::process::id().to_string())?;
         }
-        write_daemon_instance_record(&config.activity().inner.identity)?;
+        let instance_record =
+            write_daemon_instance_record(&config.paths, &config.activity().inner.identity)?;
         owned.set_nonblocking(true)?;
         let listener = tokio::net::UnixListener::from_std(owned.try_clone()?)?;
         let expected_uid = crate::PeerUid::current();
@@ -403,6 +460,7 @@ impl Daemon {
             }
         }
         drop(owned);
+        drop(instance_record);
         Ok(())
     }
 }
@@ -1548,7 +1606,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
                 .into_owned(),
             daemon_start_identity: self.activity.inner.identity.start_identity.clone(),
             release_version: self.activity.inner.identity.release_version.clone(),
-            daemon_started_at: Some(self.activity.inner.identity.started_at.clone()),
+            daemon_started_at: Some(self.activity.inner.identity.started_at),
         }))
     }
     async fn daemon_status(
@@ -1564,7 +1622,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             daemon_executable: identity.executable.to_string_lossy().into_owned(),
             daemon_start_identity: identity.start_identity.clone(),
             daemon_instance_token: identity.instance_token.clone(),
-            daemon_started_at: Some(identity.started_at.clone()),
+            daemon_started_at: Some(identity.started_at),
             health: v1::DaemonHealth::Healthy as i32,
         }))
     }
@@ -2050,7 +2108,8 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
 mod tests {
     use super::{
         ActivityTracker, ApiEventStream, AttachBridgeControl, AttachStream, AttachTerminal,
-        ErrorDiagnostics, PendingSession, SessionRegistry, attach_shutdown_requested_with,
+        DaemonInstanceRecord, DaemonInstanceTimestamp, ErrorDiagnostics, PendingSession,
+        SessionRegistry, attach_shutdown_requested_with,
         run_attach_bridge as run_attach_bridge_impl, service_status,
         service_status_with_diagnostics, spec_for_root, wire_event, wire_ssh_status, wire_status,
     };
@@ -2067,6 +2126,26 @@ mod tests {
     use gascan_proto::{error_code, v1};
     use serde_json::json;
     use tokio_stream::StreamExt;
+
+    #[test]
+    fn daemon_instance_record_serializes_release_and_start_timestamp() {
+        let value = serde_json::to_value(DaemonInstanceRecord {
+            pid: 7,
+            owner_token: "owner".to_owned(),
+            executable: "/trusted/gascand".into(),
+            start_identity: "start".to_owned(),
+            instance_token: "instance".to_owned(),
+            release_version: "0.1.11".to_owned(),
+            started_at: DaemonInstanceTimestamp {
+                seconds: 1_785_263_800,
+                nanos: 123_000_000,
+            },
+        })
+        .unwrap_or_default();
+        assert_eq!(value["release_version"], "0.1.11");
+        assert_eq!(value["started_at"]["seconds"], 1_785_263_800_i64);
+        assert_eq!(value["started_at"]["nanos"], 123_000_000);
+    }
 
     async fn run_attach_bridge<S>(
         session: ExecSession,

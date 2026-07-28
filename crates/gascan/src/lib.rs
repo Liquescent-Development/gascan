@@ -3,6 +3,7 @@
 
 pub mod cli;
 mod client;
+pub(crate) mod daemon;
 mod presentation;
 pub mod ssh_config;
 mod terminal;
