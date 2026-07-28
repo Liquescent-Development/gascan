@@ -103,7 +103,24 @@ exit 0
     if status != 0:
         raise SystemExit(f"default shell exited with {status}")
 finally:
-    os.close(controller)
+    try:
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                process.wait()
+        else:
+            process.wait()
+    finally:
+        os.close(controller)
 
 normalized = bytes(captured).replace(b"\r", b"")
 begin = b"GASCAN_RELEASE_SHELL_BEGIN\n"
