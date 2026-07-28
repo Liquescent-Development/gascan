@@ -4,6 +4,7 @@ use gascan_core::sandbox::SandboxId;
 use serde_json::Value;
 use std::collections::{BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
+use std::fmt::Write as _;
 use std::io::{Read as _, Seek as _, Write as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::process::{Command, ExitStatus, Output, Stdio};
@@ -1712,17 +1713,57 @@ pub fn run_command_bounded(
     mut command: Command,
     timeout: std::time::Duration,
 ) -> TestResult<Output> {
-    let command_context = std::iter::once(command.get_program())
-        .chain(command.get_args())
-        .map(|argument| format!("{argument:?}"))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let command_context = bounded_command_context(&command);
     let child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
     wait_with_output_bounded(child, timeout)
         .map_err(|error| format!("command {command_context} failed: {error}").into())
+}
+
+fn bounded_command_context(command: &Command) -> String {
+    const MAXIMUM_BYTES: usize = 4 * 1024;
+    const TRUNCATED: &str = "<command context truncated>";
+
+    struct BoundedFormat {
+        value: String,
+        maximum_bytes: usize,
+    }
+
+    impl std::fmt::Write for BoundedFormat {
+        fn write_str(&mut self, value: &str) -> std::fmt::Result {
+            let remaining = self.maximum_bytes.saturating_sub(self.value.len());
+            if value.len() <= remaining {
+                self.value.push_str(value);
+                return Ok(());
+            }
+            let mut boundary = remaining;
+            while !value.is_char_boundary(boundary) {
+                boundary = boundary.saturating_sub(1);
+            }
+            self.value.push_str(&value[..boundary]);
+            Err(std::fmt::Error)
+        }
+    }
+
+    let mut output = BoundedFormat {
+        value: String::with_capacity(MAXIMUM_BYTES),
+        maximum_bytes: MAXIMUM_BYTES - TRUNCATED.len(),
+    };
+    let arguments = std::iter::once(command.get_program()).chain(command.get_args());
+    for (index, argument) in arguments.enumerate() {
+        let result = if index == 0 {
+            write!(output, "{argument:?}")
+        } else {
+            write!(output, " {argument:?}")
+        };
+        if result.is_err() {
+            output.value.push_str(TRUNCATED);
+            break;
+        }
+    }
+    output.value
 }
 
 fn drain_child_pipes(
@@ -3545,7 +3586,7 @@ mod tests {
             .args(["-c", "printf timeout-stdout; sleep 10"])
             .env("GASCAN_TEST_SECRET", "must-not-appear");
 
-        let error = match run_command_bounded(command, std::time::Duration::from_millis(20)) {
+        let error = match run_command_bounded(command, std::time::Duration::from_secs(1)) {
             Ok(_) => return Err("child did not reach the timeout".into()),
             Err(error) => error,
         };
@@ -3554,6 +3595,23 @@ mod tests {
         assert!(message.contains("printf timeout-stdout; sleep 10"));
         assert!(message.contains("stdout=timeout-stdout"));
         assert!(!message.contains("must-not-appear"));
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_command_timeout_caps_argv_context() -> TestResult {
+        let oversized_argument = "x".repeat(64 * 1024);
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 10", &oversized_argument]);
+
+        let error = match run_command_bounded(command, std::time::Duration::from_millis(20)) {
+            Ok(_) => return Err("child did not reach the timeout".into()),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+
+        assert!(message.contains("<command context truncated>"));
+        assert!(message.len() <= 8 * 1024);
         Ok(())
     }
 
