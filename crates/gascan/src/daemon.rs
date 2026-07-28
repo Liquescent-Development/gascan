@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 const DIRECTORY_MODE: u16 = 0o700;
 const FILE_MODE: u16 = 0o600;
+const INSTANCE_TOMBSTONE_MODE: u16 = 0o200;
 const SOCKET_NAME: &str = "gascand.sock";
 const INSTANCE_NAME: &str = "daemon-instance.json";
 const LIFECYCLE_LOCK_NAME: &str = "daemon-lifecycle.lock";
@@ -289,11 +290,16 @@ where
 {
     let (parent, name) = instance_parent_and_name(paths.instance())?;
     let directory = open_private_directory(parent, paths.expected_uid)?;
-    let expected = match file_identity_at(&directory, name, paths.expected_uid) {
-        Ok(identity) => identity,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+    let initial_stat = match rustix::fs::statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
+        Err(error) => return Err(errno(error)),
     };
+    if is_instance_tombstone(&initial_stat, paths.expected_uid) {
+        validate_instance_tombstone(&directory, name, &initial_stat, paths.expected_uid)?;
+        return Ok(None);
+    }
+    let expected = file_identity_at(&directory, name, paths.expected_uid)?;
     between_identity_and_open()?;
     let fd = rustix::fs::openat(
         &directory,
@@ -329,6 +335,59 @@ where
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     validate_record(&record)?;
     Ok(Some(record))
+}
+
+fn is_instance_tombstone(stat: &rustix::fs::Stat, expected_uid: u32) -> bool {
+    FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
+        && stat.st_uid == expected_uid
+        && stat.st_nlink == 1
+        && Mode::from_raw_mode(stat.st_mode).bits() & 0o777 == INSTANCE_TOMBSTONE_MODE
+        && stat.st_size == 0
+}
+
+fn validate_instance_tombstone(
+    directory: &OwnedFd,
+    name: &OsStr,
+    initial_stat: &rustix::fs::Stat,
+    expected_uid: u32,
+) -> io::Result<()> {
+    let expected = FileIdentity {
+        device: initial_stat.st_dev as u64,
+        inode: initial_stat.st_ino,
+    };
+    let fd = rustix::fs::openat(
+        directory,
+        name,
+        OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(errno)?;
+    let opened = rustix::fs::fstat(&fd).map_err(errno)?;
+    if !is_instance_tombstone(&opened, expected_uid)
+        || (FileIdentity {
+            device: opened.st_dev as u64,
+            inode: opened.st_ino,
+        }) != expected
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "daemon instance tombstone changed while opening it",
+        ));
+    }
+    let rechecked =
+        rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW).map_err(errno)?;
+    if !is_instance_tombstone(&rechecked, expected_uid)
+        || (FileIdentity {
+            device: rechecked.st_dev as u64,
+            inode: rechecked.st_ino,
+        }) != expected
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "daemon instance tombstone changed while validating it",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_record(record: &DaemonInstanceRecord) -> io::Result<()> {
@@ -1022,6 +1081,34 @@ mod tests {
         )?;
         fs::set_permissions(wrong_owner.instance(), fs::Permissions::from_mode(0o600))?;
         assert!(read_attested_instance(&wrong_owner, &inspector).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn attestation_treats_exact_empty_write_only_tombstone_as_absent() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        paths.prepare_directory()?;
+        fs::write(paths.instance(), b"")?;
+        fs::set_permissions(paths.instance(), fs::Permissions::from_mode(0o200))?;
+        assert_eq!(
+            read_attested_instance(&paths, &FakeInspector { identity: None })?,
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn attestation_rejects_nonempty_write_only_publication_residue() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        paths.prepare_directory()?;
+        fs::write(paths.instance(), b"partial")?;
+        fs::set_permissions(paths.instance(), fs::Permissions::from_mode(0o200))?;
+        assert!(
+            read_attested_instance(&paths, &FakeInspector { identity: None }).is_err(),
+            "nonempty unpublished bytes were treated as an absent record"
+        );
         Ok(())
     }
 
