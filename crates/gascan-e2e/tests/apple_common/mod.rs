@@ -38,6 +38,130 @@ const IMAGE_REPLACE_ROOT_SENTINEL_PREFIX: &str =
     "/home/workspace/.gascan-image-replace-root-sentinel-";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct CandidateImageMapping {
+    immutable: String,
+    runtime: String,
+}
+
+impl CandidateImageMapping {
+    fn from_environment() -> TestResult<Self> {
+        let immutable = std::env::var("GASCAN_E2E_CANDIDATE_IMAGE")
+            .map_err(|_| "GASCAN_E2E_CANDIDATE_IMAGE is required")?;
+        let runtime = std::env::var("GASCAN_E2E_CANDIDATE_RUNTIME_IMAGE")
+            .map_err(|_| "GASCAN_E2E_CANDIDATE_RUNTIME_IMAGE is required")?;
+        Self::new(immutable, runtime)
+    }
+
+    fn new(immutable: String, runtime: String) -> TestResult<Self> {
+        if !gascan_core::runtime::immutable_image_reference(&immutable)
+            || !runtime.starts_with("gascan-workspace:")
+            || runtime.contains('/')
+            || immutable
+                .strip_prefix(&runtime)
+                .is_none_or(|suffix| !suffix.starts_with("@sha256:"))
+        {
+            return Err("invalid E2E candidate image mapping".into());
+        }
+        Ok(Self { immutable, runtime })
+    }
+
+    fn runtime(&self) -> &str {
+        &self.runtime
+    }
+
+    fn rewrite_candidate_run(
+        &self,
+        mut spec: gascan_apple::CommandSpec,
+    ) -> gascan_apple::CommandSpec {
+        if spec.program == "container"
+            && spec.args.first().map(String::as_str) == Some("run")
+            && spec.args.last() == Some(&self.immutable)
+        {
+            if let Some(image) = spec.args.last_mut() {
+                *image = self.runtime.clone();
+            }
+        }
+        spec
+    }
+
+    fn rehydrate_candidate_inspect(&self, bytes: Vec<u8>) -> Vec<u8> {
+        let Some(expected_digest) = self.immutable.rsplit_once('@').map(|(_, digest)| digest)
+        else {
+            return bytes;
+        };
+        let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) else {
+            return bytes;
+        };
+        let Some(records) = value.as_array_mut() else {
+            return bytes;
+        };
+        let mut changed = false;
+        for record in records {
+            let Some(image) = record
+                .as_object_mut()
+                .and_then(|record| record.get_mut("configuration"))
+                .and_then(Value::as_object_mut)
+                .and_then(|configuration| configuration.get_mut("image"))
+                .and_then(Value::as_object_mut)
+            else {
+                continue;
+            };
+            let exact_reference =
+                image.get("reference").and_then(Value::as_str) == Some(self.runtime.as_str());
+            let exact_digest = image
+                .get("descriptor")
+                .and_then(Value::as_object)
+                .and_then(|descriptor| descriptor.get("digest"))
+                .and_then(Value::as_str)
+                == Some(expected_digest);
+            if exact_reference && exact_digest {
+                image.insert(
+                    "reference".to_owned(),
+                    Value::String(self.immutable.clone()),
+                );
+                changed = true;
+            }
+        }
+        if !changed {
+            return bytes;
+        }
+        serde_json::to_vec(&value).unwrap_or(bytes)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CandidateProcessRunner {
+    mapping: CandidateImageMapping,
+}
+
+impl CandidateProcessRunner {
+    fn from_environment() -> TestResult<Self> {
+        Ok(Self {
+            mapping: CandidateImageMapping::from_environment()?,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl gascan_apple::CommandRunner for CandidateProcessRunner {
+    async fn run(
+        &self,
+        spec: gascan_apple::CommandSpec,
+    ) -> Result<gascan_apple::CommandOutput, gascan_core::runtime::RuntimeError> {
+        let rehydrate_inspect = spec.program == "container"
+            && spec.args.len() == 2
+            && spec.args.first().map(String::as_str) == Some("inspect");
+        let spec = self.mapping.rewrite_candidate_run(spec);
+        let mut output =
+            gascan_apple::CommandRunner::run(&gascan_apple::ProcessRunner, spec).await?;
+        if rehydrate_inspect {
+            output.stdout = self.mapping.rehydrate_candidate_inspect(output.stdout);
+        }
+        Ok(output)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnedRuntimeSnapshot {
     container_image: String,
     volumes: BTreeSet<(String, String)>,
@@ -282,8 +406,7 @@ impl AppleE2e {
     }
 
     pub fn start_default_network_probe(&self) -> TestResult<DefaultNetworkProbe> {
-        let image = std::env::var("GASCAN_E2E_CANDIDATE_IMAGE")
-            .map_err(|_| "GASCAN_E2E_CANDIDATE_IMAGE is required")?;
+        let candidate = CandidateImageMapping::from_environment()?;
         let name = format!("gascan-ssh-isolation-{}", self.owner_token);
         assert_container_id_absent(&name)?;
         let rendezvous = tempfile::Builder::new()
@@ -324,7 +447,7 @@ impl AppleE2e {
                 "root",
                 "--mount",
                 mount.as_str(),
-                image.as_str(),
+                candidate.runtime(),
                 "python3",
                 "-c",
                 DEFAULT_NETWORK_PROBE,
@@ -1292,7 +1415,7 @@ async fn recreate_owned_container(
 ) -> TestResult {
     use gascan_core::runtime::RuntimeBackend as _;
 
-    let backend = gascan_apple::AppleBackend::new(gascan_apple::ProcessRunner);
+    let backend = gascan_apple::AppleBackend::new(CandidateProcessRunner::from_environment()?);
     backend.prepare_image(image).await?;
     let capabilities = backend.capabilities().await?;
     let create = match ssh_control.as_ref() {
@@ -2742,6 +2865,62 @@ mod tests {
             validate_distinct_image_fixtures("registry.example/workspace:first", &second).is_err()
         );
         assert!(validate_distinct_image_fixtures(&format!(" {first}"), &second).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn local_candidate_mapping_runs_raw_container_commands_by_runtime_tag() -> TestResult {
+        let immutable = format!("gascan-workspace:candidate@sha256:{}", "a".repeat(64));
+        let mapping =
+            CandidateImageMapping::new(immutable.clone(), "gascan-workspace:candidate".to_owned())?;
+        let command =
+            gascan_apple::CommandSpec::new("container", ["run", "--detach", immutable.as_str()]);
+
+        assert_eq!(
+            mapping.rewrite_candidate_run(command).args,
+            ["run", "--detach", "gascan-workspace:candidate"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn local_candidate_mapping_rehydrates_only_exact_candidate_inspection() -> TestResult {
+        let immutable = format!("gascan-workspace:candidate@sha256:{}", "a".repeat(64));
+        let mapping =
+            CandidateImageMapping::new(immutable.clone(), "gascan-workspace:candidate".to_owned())?;
+        let matching = serde_json::to_vec(&serde_json::json!([{
+            "configuration": {
+                "id": "sandbox",
+                "image": {
+                    "reference": "gascan-workspace:candidate",
+                    "descriptor": {
+                        "digest": format!("sha256:{}", "a".repeat(64))
+                    }
+                }
+            }
+        }]))?;
+
+        let rehydrated: Value =
+            serde_json::from_slice(&mapping.rehydrate_candidate_inspect(matching))?;
+        assert_eq!(
+            rehydrated[0]["configuration"]["image"]["reference"],
+            immutable
+        );
+
+        let foreign = serde_json::to_vec(&serde_json::json!([{
+            "configuration": {
+                "image": {
+                    "reference": "gascan-workspace:foreign",
+                    "descriptor": {
+                        "digest": format!("sha256:{}", "a".repeat(64))
+                    }
+                }
+            }
+        }]))?;
+        assert_eq!(
+            mapping.rehydrate_candidate_inspect(foreign.clone()),
+            foreign
+        );
         Ok(())
     }
 

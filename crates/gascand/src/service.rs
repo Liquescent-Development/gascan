@@ -43,6 +43,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
 const SAFE_MISE_WORKDIR: &str = "/home/workspace/.config/gascan/mise-workdir";
+const MANAGED_CONFIG_ROOT: &str = "/home/workspace/.config/gascan";
 const MAX_PROVISION_STDOUT_BYTES: usize = 1024 * 1024;
 const MAX_PROVISION_STDERR_TAIL_BYTES: usize = 64 * 1024;
 const STORAGE_LAYOUT_VERSION: u32 = 2;
@@ -2118,6 +2119,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 "-m",
                 "1770",
                 CONFIG_ROOT,
+                MANAGED_CONFIG_ROOT,
             ],
             Vec::new(),
         )

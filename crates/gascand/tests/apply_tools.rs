@@ -379,6 +379,7 @@ async fn apply_uses_literal_mise_argv_streams_steps_and_persists_exact_versions(
                 "-m",
                 "1770",
                 "/home/workspace/.config",
+                "/home/workspace/.config/gascan",
             ]
             .as_slice(),
             [
@@ -895,7 +896,7 @@ async fn empty_noop_apply_executes_no_guest_commands() -> TestResult {
 }
 
 #[tokio::test]
-async fn managed_config_root_remains_writable_but_protects_root_owned_entries() -> TestResult {
+async fn managed_config_roots_are_secured_before_workstation_initialization() -> TestResult {
     let root = tempfile::tempdir()?;
     let root = Utf8Path::from_path(root.path()).ok_or("utf8 root")?;
     write_manifest(root, &[])?;
@@ -950,6 +951,7 @@ async fn managed_config_root_remains_writable_but_protects_root_owned_entries() 
             "-m",
             "1770",
             "/home/workspace/.config",
+            "/home/workspace/.config/gascan",
         ]
     );
     assert_eq!(
