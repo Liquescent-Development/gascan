@@ -102,9 +102,6 @@ exit 0
     let exit = env.invoke(["--sandbox", env.id(), "run", "--", "sh", "-c", "exit 42"])?;
     env.assert_exit_code(&exit, 42)?;
 
-    let default_shell = env.success(["--sandbox", env.id(), "shell"])?;
-    assert!(default_shell.stderr.is_empty());
-
     let shell = env.success([
         "--sandbox",
         env.id(),

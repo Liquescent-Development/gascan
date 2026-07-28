@@ -858,12 +858,7 @@ impl AppleE2e {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let child = self
-            .command(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        wait_with_output_bounded(child, std::time::Duration::from_secs(90))
+        run_command_bounded(self.command(args), std::time::Duration::from_secs(90))
     }
 
     pub fn invoke_with_timeout<I, S>(
@@ -875,12 +870,7 @@ impl AppleE2e {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let child = self
-            .command(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        wait_with_output_bounded(child, timeout)
+        run_command_bounded(self.command(args), timeout)
     }
 
     pub fn invoke_with_env<I, S>(&self, args: I, key: &str, value: &str) -> TestResult<Output>
@@ -888,13 +878,9 @@ impl AppleE2e {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let child = self
-            .command(args)
-            .env(key, value)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        wait_with_output_bounded(child, std::time::Duration::from_secs(90))
+        let mut command = self.command(args);
+        command.env(key, value);
+        run_command_bounded(command, std::time::Duration::from_secs(90))
     }
 
     pub fn success<I, S>(&self, args: I) -> TestResult<Output>
@@ -1714,7 +1700,8 @@ fn wait_with_output_bounded(
             stderr,
         }),
         Err(_status) => Err(format!(
-            "child exceeded {timeout:?} and was killed/reaped: stderr={}",
+            "child exceeded {timeout:?} and was killed/reaped: stdout={} stderr={}",
+            String::from_utf8_lossy(&stdout),
             String::from_utf8_lossy(&stderr)
         )
         .into()),
@@ -1725,11 +1712,17 @@ pub fn run_command_bounded(
     mut command: Command,
     timeout: std::time::Duration,
 ) -> TestResult<Output> {
+    let command_context = std::iter::once(command.get_program())
+        .chain(command.get_args())
+        .map(|argument| format!("{argument:?}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     let child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
     wait_with_output_bounded(child, timeout)
+        .map_err(|error| format!("command {command_context} failed: {error}").into())
 }
 
 fn drain_child_pipes(
@@ -3546,6 +3539,25 @@ mod tests {
     }
 
     #[test]
+    fn bounded_command_timeout_reports_argv_and_stdout() -> TestResult {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "printf timeout-stdout; sleep 10"])
+            .env("GASCAN_TEST_SECRET", "must-not-appear");
+
+        let error = match run_command_bounded(command, std::time::Duration::from_millis(20)) {
+            Ok(_) => return Err("child did not reach the timeout".into()),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+
+        assert!(message.contains("printf timeout-stdout; sleep 10"));
+        assert!(message.contains("stdout=timeout-stdout"));
+        assert!(!message.contains("must-not-appear"));
+        Ok(())
+    }
+
+    #[test]
     fn bounded_wait_drains_chatty_stdout_and_stderr_without_unbounded_capture() -> TestResult {
         let child = Command::new("sh")
             .args([
@@ -3588,7 +3600,7 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         let message = error.to_string();
         assert!(message.contains("was killed/reaped"));
-        assert!(message.len() <= MAX_CAPTURED_PIPE_BYTES + 256);
+        assert!(message.len() <= (2 * MAX_CAPTURED_PIPE_BYTES) + 256);
         Ok(())
     }
 
