@@ -23,23 +23,52 @@ __gascan_shell_metadata()
     printf '%s\n' "$metadata"
 }
 
-__gascan_starship_restore()
+__gascan_starship_variable_readonly()
 {
-    PS1=$__gascan_starship_old_ps1
-    PATH=$__gascan_starship_old_path
-    export PATH
-    if [ "$__gascan_starship_config_was_set" = 1 ]; then
-        STARSHIP_CONFIG=$__gascan_starship_old_config
-        export STARSHIP_CONFIG
-    else
-        unset STARSHIP_CONFIG
-    fi
-    if [ "$__gascan_starship_executable_was_set" = 1 ]; then
-        STARSHIP_EXECUTABLE=$__gascan_starship_old_executable
-        export STARSHIP_EXECUTABLE
-    else
-        unset STARSHIP_EXECUTABLE
-    fi
+    local declaration attributes
+    declaration=$(declare -p "$1" 2>/dev/null) || return 1
+    attributes=${declaration#declare -}
+    attributes=${attributes%% *}
+    case "$attributes" in
+        *r*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+__gascan_starship_preflight()
+{
+    local name
+    local -a managed_functions=(
+        _starship_set_return starship_preexec starship_precmd
+        starship_preexec_all starship_preexec_ps0
+    )
+    local -a writable_variables=(
+        PATH PS0 PS1 PS2 PROMPT_COMMAND preexec_functions precmd_functions
+        STARSHIP_CONFIG STARSHIP_EXECUTABLE
+    )
+    local -a reserved_variables=(
+        STARSHIP_PREEXEC_READY STARSHIP_START_TIME STARSHIP_CMD_STATUS
+        STARSHIP_PIPE_STATUS STARSHIP_END_TIME STARSHIP_DURATION
+        STARSHIP_PROMPT_COMMAND STARSHIP_DEBUG_TRAP STARSHIP_SHELL
+        STARSHIP_SESSION_KEY
+    )
+
+    for name in "${managed_functions[@]}"; do
+        if declare -F "$name" >/dev/null; then
+            return 1
+        fi
+    done
+    for name in "${writable_variables[@]}"; do
+        if __gascan_starship_variable_readonly "$name"; then
+            return 1
+        fi
+    done
+    for name in "${reserved_variables[@]}"; do
+        if declare -p "$name" >/dev/null 2>&1; then
+            return 1
+        fi
+    done
+    return 0
 }
 
 __gascan_starship_emit_variable()
@@ -48,20 +77,21 @@ __gascan_starship_emit_variable()
     if declaration=$(declare -p "$1" 2>/dev/null); then
         attributes=${declaration#declare -}
         attributes=${attributes%% *}
-        case "$attributes" in
-            *r*) return 0 ;;
-        esac
         declaration=${declaration#declare }
         declaration=${declaration#* }
-        printf '%s\n' "$declaration"
+        printf '%s || return 1\n' "$declaration"
+        case "$attributes" in
+            *x*) printf 'export %q || return 1\n' "$1" ;;
+            *) printf 'export -n %q || return 1\n' "$1" ;;
+        esac
     else
-        printf 'unset %q\n' "$1"
+        printf 'unset %q || return 1\n' "$1"
     fi
 }
 
-__gascan_starship_build_commit()
+__gascan_starship_emit_commit()
 {
-    local initialization=$1 inherited_debug_trap=$2 name
+    local name trap_command shopt_command
     local -a commit_functions=(
         _starship_set_return starship_preexec starship_precmd
         starship_preexec_all starship_preexec_ps0
@@ -73,31 +103,51 @@ __gascan_starship_build_commit()
         STARSHIP_SHELL STARSHIP_SESSION_KEY
     )
 
-    # The immutable full init executes exactly once and only in this inherited
-    # subshell. A nonzero result cannot mutate the interactive parent shell.
-    if [ -n "$inherited_debug_trap" ]; then
-        eval "$inherited_debug_trap"
-    fi
-    if ! eval "$initialization" >/dev/null 2>&1; then
-        return 1
-    fi
-
     for name in "${commit_functions[@]}"; do
         if declare -F "$name" >/dev/null; then
             declare -f "$name"
         else
-            printf 'unset -f %q\n' "$name"
+            printf 'unset -f %q || return 1\n' "$name"
         fi
     done
     for name in "${commit_variables[@]}"; do
         __gascan_starship_emit_variable "$name"
     done
-    shopt -p checkwinsize
-    if ! trap -p DEBUG; then
-        printf '%s\n' 'trap - DEBUG'
-    elif [ -z "$(trap -p DEBUG)" ]; then
-        printf '%s\n' 'trap - DEBUG'
+    shopt_command=$(shopt -p checkwinsize)
+    printf '%s || return 1\n' "$shopt_command"
+    trap_command=$(trap -p DEBUG)
+    if [ -n "$trap_command" ]; then
+        printf '%s || return 1\n' "$trap_command"
+    else
+        printf '%s\n' 'trap - DEBUG || return 1'
     fi
+}
+
+__gascan_starship_build_commit()
+{
+    local initialization=$1 inherited_debug_trap=$2
+    local selected_config=$3 binary=$4 immutable_path=$5
+
+    STARSHIP_CONFIG=$selected_config
+    STARSHIP_EXECUTABLE=$binary
+    PATH=$immutable_path
+    export STARSHIP_CONFIG STARSHIP_EXECUTABLE PATH
+    if [ -n "$inherited_debug_trap" ]; then
+        eval "$inherited_debug_trap"
+    fi
+
+    # This function runs in a command-substitution subshell outside a
+    # conditional context. Explicit errexit makes any full-init command
+    # failure abort before a commit can be emitted, even if later commands
+    # would otherwise return success.
+    set -e
+    eval "$initialization" >/dev/null 2>&1
+    __gascan_starship_emit_commit
+}
+
+__gascan_starship_apply_commit()
+{
+    eval "$1"
 }
 
 __gascan_starship_main()
@@ -110,7 +160,9 @@ __gascan_starship_main()
     local immutable_path=/opt/gascan/shell/bin:/usr/bin:/bin
     local managed_owner=0 workspace_uid=1000 workspace_gid=1000
     local immutable_owner=0 immutable_gid=0 immutable_link_mode=777
-    local prompt preset selected_config initialization commit debug_trap
+    local prompt preset selected_config initialization
+    local commit rollback debug_trap
+    local build_status=0 errexit_was_set=0
     local selector_metadata config_metadata preset_metadata
     local binary_metadata binary_target_metadata
 
@@ -151,6 +203,11 @@ __gascan_starship_main()
         __gascan_starship_warn
         return 0
     fi
+    if ! __gascan_starship_preflight; then
+        __gascan_starship_warn
+        return 0
+    fi
+    rollback=$(__gascan_starship_emit_commit)
 
     config_metadata=$(__gascan_shell_metadata "$config")
     preset_metadata=$(__gascan_shell_metadata "$preset")
@@ -171,72 +228,58 @@ __gascan_starship_main()
         return 0
     fi
 
-    __gascan_starship_old_ps1=${PS1-}
-    __gascan_starship_old_path=$PATH
-    if [ "${STARSHIP_CONFIG+x}" = x ]; then
-        __gascan_starship_config_was_set=1
-        __gascan_starship_old_config=$STARSHIP_CONFIG
-    else
-        __gascan_starship_config_was_set=0
-        __gascan_starship_old_config=
-    fi
-    if [ "${STARSHIP_EXECUTABLE+x}" = x ]; then
-        __gascan_starship_executable_was_set=1
-        __gascan_starship_old_executable=$STARSHIP_EXECUTABLE
-    else
-        __gascan_starship_executable_was_set=0
-        __gascan_starship_old_executable=
-    fi
-
-    STARSHIP_CONFIG=$selected_config
-    STARSHIP_EXECUTABLE=$binary
-    PATH=$immutable_path
-    export STARSHIP_CONFIG STARSHIP_EXECUTABLE PATH
-    if ! initialization=$("$binary" init bash --print-full-init); then
-        __gascan_starship_restore
+    if ! initialization=$(
+        STARSHIP_CONFIG=$selected_config \
+        STARSHIP_EXECUTABLE=$binary \
+        PATH=$immutable_path \
+        "$binary" init bash --print-full-init
+    ); then
         __gascan_starship_warn
         return 0
     fi
     debug_trap=$(trap -p DEBUG)
-    if ! commit=$(
-        __gascan_starship_build_commit "$initialization" "$debug_trap"
-    ); then
-        __gascan_starship_restore
+    case $- in
+        *e*)
+            errexit_was_set=1
+            set +e
+            ;;
+    esac
+    commit=$(
+        __gascan_starship_build_commit \
+            "$initialization" "$debug_trap" \
+            "$selected_config" "$binary" "$immutable_path"
+    )
+    build_status=$?
+    if [ "$errexit_was_set" = 1 ]; then
+        set -e
+    fi
+    if [ "$build_status" -ne 0 ]; then
         __gascan_starship_warn
         return 0
     fi
     if ! /bin/bash -n <<<"$commit" >/dev/null 2>&1; then
-        __gascan_starship_restore
+        __gascan_starship_warn
+        return 0
+    fi
+    if ! (trap - DEBUG; __gascan_starship_apply_commit "$commit") \
+        >/dev/null 2>&1; then
         __gascan_starship_warn
         return 0
     fi
     trap - DEBUG
-    if ! eval "$commit"; then
-        if [ -n "$debug_trap" ]; then
-            eval "$debug_trap"
-        fi
-        __gascan_starship_restore
+    if ! __gascan_starship_apply_commit "$commit"; then
+        __gascan_starship_apply_commit "$rollback" >/dev/null 2>&1 || true
         __gascan_starship_warn
         return 0
     fi
-    export STARSHIP_CONFIG STARSHIP_EXECUTABLE
-    if [ "${STARSHIP_SHELL+x}" = x ]; then
-        export STARSHIP_SHELL
-    fi
-    if [ "${STARSHIP_SESSION_KEY+x}" = x ]; then
-        export STARSHIP_SESSION_KEY
-    fi
-    PATH=$__gascan_starship_old_path
-    export PATH
-    unset __gascan_starship_old_ps1 __gascan_starship_old_path \
-        __gascan_starship_config_was_set __gascan_starship_old_config \
-        __gascan_starship_executable_was_set __gascan_starship_old_executable \
-        __gascan_starship_euid
+    unset __gascan_starship_euid
     return 0
 }
 
 __gascan_starship_main
-unset -f __gascan_starship_main __gascan_starship_restore \
-    __gascan_starship_build_commit __gascan_starship_emit_variable \
+unset -f __gascan_starship_main __gascan_starship_preflight \
+    __gascan_starship_variable_readonly \
+    __gascan_starship_apply_commit __gascan_starship_build_commit \
+    __gascan_starship_emit_commit __gascan_starship_emit_variable \
     __gascan_starship_warn __gascan_shell_metadata
 return 0 2>/dev/null || exit 0

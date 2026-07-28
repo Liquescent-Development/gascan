@@ -224,14 +224,39 @@ starship_partial_leak()
 }
 trap 'STARSHIP_TRAP_LEAK=1' DEBUG
 false
+true
 PARTIAL_INIT
         else
             cat <<'FULL_INIT'
+_starship_set_return()
+{
+    return "${1:-0}"
+}
+starship_preexec()
+{
+    :
+}
+starship_preexec_all()
+{
+    :
+}
+starship_preexec_ps0()
+{
+    :
+}
 starship_precmd()
 {
     "$STARSHIP_EXECUTABLE" prompt
 }
+STARSHIP_START_TIME=1
+STARSHIP_SHELL=bash
+STARSHIP_SESSION_KEY=1234567890123456
+PS0='managed-ps0'
 PS1='managed-starship'
+PS2='managed-continuation'
+PROMPT_COMMAND=starship_precmd
+shopt -s checkwinsize
+trap ':' DEBUG
 FULL_INIT
         fi
         ;;
@@ -326,6 +351,40 @@ test ! -s "$path_log" || die 'workspace prompt resolved Starship through user PA
 test "$(grep -Fc 'init bash --print-full-init' "$stable_log")" = 1 ||
     die 'workspace full init executed more than once'
 
+readonly_output=$(
+    PATH="$attacker_bin:/usr/bin:/bin" /bin/bash --noprofile --norc -i -c \
+        "PS1='native-root'; \
+         STARSHIP_CONFIG='readonly-config'; readonly STARSHIP_CONFIG; \
+         STARSHIP_EXECUTABLE='readonly-executable'; readonly STARSHIP_EXECUTABLE; \
+         readonly PATH; . '$hook'; \
+         printf 'SURVIVED=%s\nPS1=%s\n' yes \"\$PS1\"" 2>&1
+)
+printf '%s\n' "$readonly_output" | grep -Fqx SURVIVED=yes ||
+    die 'readonly managed variables aborted shell startup'
+printf '%s\n' "$readonly_output" | grep -Fqx PS1=native-root ||
+    die 'readonly managed variables changed the native prompt'
+test "$(printf '%s\n' "$readonly_output" |
+    grep -Fc 'gascan: Starship prompt unavailable; using standard Bash prompt.')" = 1 ||
+    die 'readonly managed variables did not warn exactly once'
+test "$(grep -Fc 'init bash --print-full-init' "$stable_log")" = 1 ||
+    die 'readonly managed variables reached Starship'
+
+collision_output=$(
+    PATH="$attacker_bin:/usr/bin:/bin" /bin/bash --noprofile --norc -i -c \
+        "PS1='native-root'; STARSHIP_SHELL=attacker; \
+         starship_precmd() { printf attacker; }; \
+         . '$hook'; printf 'FUNCTION='; starship_precmd; \
+         printf '\nVARIABLE=%s\nPS1=%s\n' \"\$STARSHIP_SHELL\" \"\$PS1\"" 2>&1
+)
+printf '%s\n' "$collision_output" | grep -Fqx FUNCTION=attacker ||
+    die 'managed function collision was replaced'
+printf '%s\n' "$collision_output" | grep -Fqx VARIABLE=attacker ||
+    die 'managed internal-variable collision was replaced'
+printf '%s\n' "$collision_output" | grep -Fqx PS1=native-root ||
+    die 'managed provenance collision changed the native prompt'
+test "$(grep -Fc 'init bash --print-full-init' "$stable_log")" = 1 ||
+    die 'managed provenance collision reached Starship'
+
 failure_output=$(
     GASCAN_TEST_GENERATION_FAIL=1 PATH="$attacker_bin:/usr/bin:/bin" \
         /bin/bash --noprofile --norc -i -c \
@@ -333,8 +392,10 @@ failure_output=$(
          STARSHIP_CONFIG='preexisting-config'; \
          STARSHIP_EXECUTABLE='preexisting-executable'; \
          . '$hook'; . '$hook'; \
-         printf 'PS1=%s\nCONFIG=%s\nEXEC=%s\n' \
-         \"\$PS1\" \"\$STARSHIP_CONFIG\" \"\$STARSHIP_EXECUTABLE\"" \
+         printf 'PS1=%s\nCONFIG=%s\nEXEC=%s\nCONFIG_DECL=%s\nEXEC_DECL=%s\n' \
+         \"\$PS1\" \"\$STARSHIP_CONFIG\" \"\$STARSHIP_EXECUTABLE\" \
+         \"\$(declare -p STARSHIP_CONFIG)\" \
+         \"\$(declare -p STARSHIP_EXECUTABLE)\"" \
         2>&1
 )
 test "$(printf '%s\n' "$failure_output" |
@@ -346,6 +407,12 @@ printf '%s\n' "$failure_output" | grep -Fqx CONFIG=preexisting-config ||
     die 'generation failure did not restore pre-existing STARSHIP_CONFIG'
 printf '%s\n' "$failure_output" | grep -Fqx EXEC=preexisting-executable ||
     die 'generation failure did not restore pre-existing STARSHIP_EXECUTABLE'
+printf '%s\n' "$failure_output" |
+    grep -Fqx 'CONFIG_DECL=declare -- STARSHIP_CONFIG="preexisting-config"' ||
+    die 'generation failure changed STARSHIP_CONFIG export state'
+printf '%s\n' "$failure_output" |
+    grep -Fqx 'EXEC_DECL=declare -- STARSHIP_EXECUTABLE="preexisting-executable"' ||
+    die 'generation failure changed STARSHIP_EXECUTABLE export state'
 
 eval_failure_output=$(
     GASCAN_TEST_EVAL_FAIL=1 PATH="$attacker_bin:/usr/bin:/bin" \
@@ -357,10 +424,12 @@ eval_failure_output=$(
          trap 'STARSHIP_NATIVE_TRAP=1' DEBUG; \
          . '$hook'; \
          declare -F starship_partial_leak >/dev/null && printf 'FUNCTION=leaked\n'; \
-         printf 'PS1=%s\nPS2=%s\nPROMPT=%s\nCONFIG=%s\nEXEC=%s\nPARTIAL=%s\nTRAP=%s\n' \
+         printf 'PS1=%s\nPS2=%s\nPROMPT=%s\nCONFIG=%s\nEXEC=%s\nPARTIAL=%s\nTRAP=%s\nCONFIG_DECL=%s\nEXEC_DECL=%s\n' \
          \"\$PS1\" \"\$PS2\" \"\$PROMPT_COMMAND\" \
          \"\$STARSHIP_CONFIG\" \"\$STARSHIP_EXECUTABLE\" \
-         \"\${STARSHIP_PARTIAL-unset}\" \"\$(trap -p DEBUG)\"" 2>&1
+         \"\${STARSHIP_PARTIAL-unset}\" \"\$(trap -p DEBUG)\" \
+         \"\$(declare -p STARSHIP_CONFIG)\" \
+         \"\$(declare -p STARSHIP_EXECUTABLE)\"" 2>&1
 )
 printf '%s\n' "$eval_failure_output" |
     grep -Fq 'gascan: Starship prompt unavailable; using standard Bash prompt.' ||
@@ -376,6 +445,12 @@ printf '%s\n' "$eval_failure_output" | grep -Fqx CONFIG=preexisting-config ||
     die 'eval failure did not restore pre-existing STARSHIP_CONFIG'
 printf '%s\n' "$eval_failure_output" | grep -Fqx EXEC=preexisting-executable ||
     die 'eval failure did not restore pre-existing STARSHIP_EXECUTABLE'
+printf '%s\n' "$eval_failure_output" |
+    grep -Fqx 'CONFIG_DECL=declare -- STARSHIP_CONFIG="preexisting-config"' ||
+    die 'eval failure changed STARSHIP_CONFIG export state'
+printf '%s\n' "$eval_failure_output" |
+    grep -Fqx 'EXEC_DECL=declare -- STARSHIP_EXECUTABLE="preexisting-executable"' ||
+    die 'eval failure changed STARSHIP_EXECUTABLE export state'
 printf '%s\n' "$eval_failure_output" | grep -Fqx PARTIAL=unset ||
     die 'partial init leaked a Starship variable'
 test "$(printf '%s\n' "$eval_failure_output" | grep -Fc FUNCTION=leaked)" = 0 ||

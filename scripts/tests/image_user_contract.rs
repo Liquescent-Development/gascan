@@ -138,9 +138,24 @@ fn hook_fixture(temporary: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf, Pa
                'STARSHIP_PARTIAL=leaked-variable' \
                'starship_partial_leak() { printf leaked; }' \
                \"trap 'STARSHIP_TRAP_LEAK=1' DEBUG\" \
-               'false'\n\
+               'false' \
+               'true'\n\
            else\n\
-             printf '%s\\n' 'PS1=managed-starship' 'starship_precmd() { \"$STARSHIP_EXECUTABLE\" prompt; }'\n\
+             printf '%s\\n' \
+               '_starship_set_return() { return \"${1:-0}\"; }' \
+               'starship_preexec() { :; }' \
+               'starship_preexec_all() { :; }' \
+               'starship_preexec_ps0() { :; }' \
+               'starship_precmd() { \"$STARSHIP_EXECUTABLE\" prompt; }' \
+               'STARSHIP_START_TIME=1' \
+               'STARSHIP_SHELL=bash' \
+               'STARSHIP_SESSION_KEY=1234567890123456' \
+               'PS0=managed-ps0' \
+               'PS1=managed-starship' \
+               'PS2=managed-continuation' \
+               'PROMPT_COMMAND=starship_precmd' \
+               'shopt -s checkwinsize' \
+               \"trap ':' DEBUG\"\n\
            fi\n\
          elif [ \"$*\" = prompt ]; then\n\
            printf '%s\\n' stable-runtime-prompt\n\
@@ -175,6 +190,8 @@ fn run_hook(
         )
         .env("GASCAN_TEST_EVAL_FAIL", if eval_fail { "1" } else { "0" })
         .env("GASCAN_TEST_HOOK", hook)
+        .env_remove("STARSHIP_SHELL")
+        .env_remove("STARSHIP_SESSION_KEY")
         .output()
         .unwrap()
 }
@@ -2012,6 +2029,8 @@ fn shell_hook_uses_only_the_pinned_binary_and_managed_config() {
         .env("GASCAN_TEST_LOG", &log)
         .env("GASCAN_TEST_GENERATION_FAIL", "0")
         .env("GASCAN_TEST_EVAL_FAIL", "0")
+        .env_remove("STARSHIP_SHELL")
+        .env_remove("STARSHIP_SESSION_KEY")
         .output()
         .unwrap();
     assert!(
@@ -2072,9 +2091,179 @@ fn shell_hook_warns_once_and_returns_success_when_starship_is_unavailable() {
         fs::read_to_string(&log).unwrap_or_default()
     );
 
+    for (name, setup) in [
+        (
+            "STARSHIP_CONFIG",
+            "readonly STARSHIP_CONFIG=readonly-config",
+        ),
+        (
+            "STARSHIP_EXECUTABLE",
+            "readonly STARSHIP_EXECUTABLE=readonly-executable",
+        ),
+        ("PATH", "readonly PATH"),
+    ] {
+        let before = fs::read_to_string(&log).unwrap_or_default();
+        let command = format!(
+            "PS1=native-prompt; {setup}; . \"$GASCAN_TEST_HOOK\"; \
+             printf 'survived|%s\\n' \"$PS1\""
+        );
+        let readonly = run_hook(&hook, &command, &log, false, false, true);
+        assert!(
+            readonly.status.success(),
+            "readonly {name} aborted startup: {}",
+            String::from_utf8_lossy(&readonly.stderr)
+        );
+        assert_eq!(readonly.stdout, b"survived|native-prompt\n");
+        assert_eq!(
+            String::from_utf8_lossy(&readonly.stderr)
+                .matches("gascan: Starship prompt unavailable; using standard Bash prompt.")
+                .count(),
+            1,
+            "readonly {name}: {}",
+            String::from_utf8_lossy(&readonly.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(&log).unwrap_or_default(),
+            before,
+            "readonly {name} reached Starship"
+        );
+    }
+
+    for (name, setup, expected) in [
+        (
+            "_starship_set_return function",
+            "_starship_set_return() { printf attacker; }",
+            "function=attacker",
+        ),
+        (
+            "starship_preexec function",
+            "starship_preexec() { printf attacker; }",
+            "function=attacker",
+        ),
+        (
+            "starship_preexec_all function",
+            "starship_preexec_all() { printf attacker; }",
+            "function=attacker",
+        ),
+        (
+            "starship_preexec_ps0 function",
+            "starship_preexec_ps0() { printf attacker; }",
+            "function=attacker",
+        ),
+        (
+            "starship_precmd function",
+            "starship_precmd() { printf attacker; }",
+            "function=attacker",
+        ),
+        (
+            "readonly function",
+            "starship_precmd() { printf attacker; }; readonly -f starship_precmd",
+            "function=attacker",
+        ),
+        (
+            "STARSHIP_PREEXEC_READY variable",
+            "STARSHIP_PREEXEC_READY=attacker",
+            "variable=attacker",
+        ),
+        (
+            "STARSHIP_START_TIME variable",
+            "STARSHIP_START_TIME=attacker",
+            "variable=attacker",
+        ),
+        (
+            "STARSHIP_CMD_STATUS variable",
+            "STARSHIP_CMD_STATUS=attacker",
+            "variable=attacker",
+        ),
+        (
+            "STARSHIP_PIPE_STATUS variable",
+            "STARSHIP_PIPE_STATUS=attacker",
+            "variable=attacker",
+        ),
+        (
+            "STARSHIP_END_TIME variable",
+            "STARSHIP_END_TIME=attacker",
+            "variable=attacker",
+        ),
+        (
+            "STARSHIP_DURATION variable",
+            "STARSHIP_DURATION=attacker",
+            "variable=attacker",
+        ),
+        (
+            "STARSHIP_PROMPT_COMMAND variable",
+            "STARSHIP_PROMPT_COMMAND=attacker",
+            "variable=attacker",
+        ),
+        (
+            "STARSHIP_DEBUG_TRAP variable",
+            "STARSHIP_DEBUG_TRAP=attacker",
+            "variable=attacker",
+        ),
+        (
+            "STARSHIP_SHELL variable",
+            "STARSHIP_SHELL=attacker",
+            "variable=attacker",
+        ),
+        (
+            "STARSHIP_SESSION_KEY variable",
+            "STARSHIP_SESSION_KEY=attacker",
+            "variable=attacker",
+        ),
+    ] {
+        let before = fs::read_to_string(&log).unwrap_or_default();
+        let variable_name = setup.split('=').next().unwrap();
+        let inspection = if name.contains("variable") {
+            format!("printf 'variable=%s\\n' \"${{{variable_name}}}\"")
+        } else if name.starts_with("_starship_set_return") {
+            "printf 'function='; _starship_set_return; printf '\\n'".to_owned()
+        } else if name.starts_with("starship_preexec_all") {
+            "printf 'function='; starship_preexec_all; printf '\\n'".to_owned()
+        } else if name.starts_with("starship_preexec_ps0") {
+            "printf 'function='; starship_preexec_ps0; printf '\\n'".to_owned()
+        } else if name.starts_with("starship_preexec ") {
+            "printf 'function='; starship_preexec; printf '\\n'".to_owned()
+        } else {
+            "printf 'function='; starship_precmd; printf '\\n'".to_owned()
+        };
+        let command = format!(
+            "PS1=native-prompt; {setup}; . \"$GASCAN_TEST_HOOK\"; \
+             {inspection}; printf 'PS1=%s\\n' \"$PS1\""
+        );
+        let collision = run_hook(&hook, &command, &log, false, false, true);
+        assert!(
+            collision.status.success(),
+            "{name} collision aborted startup: {}",
+            String::from_utf8_lossy(&collision.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&collision.stdout).contains(expected),
+            "{name}: {}",
+            String::from_utf8_lossy(&collision.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&collision.stdout).contains("PS1=native-prompt"),
+            "{name}: {}",
+            String::from_utf8_lossy(&collision.stdout)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&collision.stderr)
+                .matches("gascan: Starship prompt unavailable; using standard Bash prompt.")
+                .count(),
+            1,
+            "{name}: {}",
+            String::from_utf8_lossy(&collision.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(&log).unwrap_or_default(),
+            before,
+            "{name} collision reached Starship"
+        );
+    }
+
     let partial = run_hook(
         &hook,
-        r#"PS1='native-prompt'; PS2='native-continuation'; PROMPT_COMMAND='native-command'; STARSHIP_CONFIG='old-config'; STARSHIP_EXECUTABLE='old-executable'; trap 'STARSHIP_NATIVE_TRAP=1' DEBUG; . "$GASCAN_TEST_HOOK"; declare -F starship_partial_leak >/dev/null && printf 'function=leaked\n'; printf '%s|%s|%s|%s|%s|%s|%s\n' "$PS1" "$PS2" "$PROMPT_COMMAND" "$STARSHIP_CONFIG" "$STARSHIP_EXECUTABLE" "${STARSHIP_PARTIAL-unset}" "$(trap -p DEBUG)""#,
+        r#"PS1='native-prompt'; PS2='native-continuation'; PROMPT_COMMAND='native-command'; STARSHIP_CONFIG='old-config'; STARSHIP_EXECUTABLE='old-executable'; trap 'STARSHIP_NATIVE_TRAP=1' DEBUG; . "$GASCAN_TEST_HOOK"; declare -F starship_partial_leak >/dev/null && printf 'function=leaked\n'; printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$PS1" "$PS2" "$PROMPT_COMMAND" "$STARSHIP_CONFIG" "$STARSHIP_EXECUTABLE" "${STARSHIP_PARTIAL-unset}" "$(trap -p DEBUG)" "$(declare -p STARSHIP_CONFIG)" "$(declare -p STARSHIP_EXECUTABLE)""#,
         &log,
         false,
         true,
@@ -2083,7 +2272,7 @@ fn shell_hook_warns_once_and_returns_success_when_starship_is_unavailable() {
     assert!(partial.status.success());
     assert_eq!(
         partial.stdout,
-        b"native-prompt|native-continuation|native-command|old-config|old-executable|unset|trap -- 'STARSHIP_NATIVE_TRAP=1' DEBUG\n",
+        b"native-prompt|native-continuation|native-command|old-config|old-executable|unset|trap -- 'STARSHIP_NATIVE_TRAP=1' DEBUG|declare -- STARSHIP_CONFIG=\"old-config\"|declare -- STARSHIP_EXECUTABLE=\"old-executable\"\n",
         "stderr: {}",
         String::from_utf8_lossy(&partial.stderr)
     );
