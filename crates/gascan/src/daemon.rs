@@ -257,7 +257,8 @@ pub(crate) struct EndpointSession<C> {
 
 #[derive(Clone, Debug)]
 pub(crate) enum EndpointProbe<C> {
-    Unreachable,
+    AbsentOrInert,
+    Unresponsive(String),
     Connected(EndpointSession<C>),
     Unsafe(String),
 }
@@ -504,7 +505,7 @@ pub(crate) struct ConnectionOutcome<C> {
     pub(crate) transition: DaemonTransition,
 }
 
-pub(crate) trait ProcessInspector {
+pub(crate) trait ProcessInspector: Clone + Send + Sync + 'static {
     fn inspect(&self, pid: u32, expected_executable: &Path) -> io::Result<Option<ProcessIdentity>>;
 }
 
@@ -521,12 +522,22 @@ pub(crate) trait ProcessSignaler {
     fn signal(&self, pid: u32, signal: rustix::process::Signal) -> io::Result<()>;
 }
 
-pub(crate) trait AttestedProcessSignaler: Send + Sync {
+pub(crate) trait AttestedProcessSignaler: Clone + Send + Sync + 'static {
     fn signal_attested(
         &self,
         identity: &DaemonIdentity,
         signal: rustix::process::Signal,
     ) -> io::Result<()>;
+
+    fn signal_attested_until(
+        &self,
+        identity: &DaemonIdentity,
+        signal: rustix::process::Signal,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        require_deadline(deadline, "daemon signaling deadline elapsed")?;
+        self.signal_attested(identity, signal)
+    }
 }
 
 struct OsProcessSignaler;
@@ -548,6 +559,15 @@ impl AttestedProcessSignaler for OsAttestedProcessSignaler {
         signal: rustix::process::Signal,
     ) -> io::Result<()> {
         signal_attested(&signaling_record(identity), signal)
+    }
+
+    fn signal_attested_until(
+        &self,
+        identity: &DaemonIdentity,
+        signal: rustix::process::Signal,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        signal_attested_until(&signaling_record(identity), signal, deadline)
     }
 }
 
@@ -578,11 +598,44 @@ pub(crate) fn signal_attested(
     signal_attested_with(record, &OsProcessInspector, &OsProcessSignaler, signal)
 }
 
+#[cfg(not(target_os = "linux"))]
+fn signal_attested_until(
+    record: &DaemonInstanceRecord,
+    signal: rustix::process::Signal,
+    deadline: Instant,
+) -> io::Result<()> {
+    signal_attested_with_deadline(
+        record,
+        &OsProcessInspector,
+        &OsProcessSignaler,
+        signal,
+        Some(deadline),
+    )
+}
+
 #[allow(dead_code)]
 #[cfg(target_os = "linux")]
 pub(crate) fn signal_attested(
     record: &DaemonInstanceRecord,
     signal: rustix::process::Signal,
+) -> io::Result<()> {
+    signal_attested_linux(record, signal, None)
+}
+
+#[cfg(target_os = "linux")]
+fn signal_attested_until(
+    record: &DaemonInstanceRecord,
+    signal: rustix::process::Signal,
+    deadline: Instant,
+) -> io::Result<()> {
+    signal_attested_linux(record, signal, Some(deadline))
+}
+
+#[cfg(target_os = "linux")]
+fn signal_attested_linux(
+    record: &DaemonInstanceRecord,
+    signal: rustix::process::Signal,
+    deadline: Option<Instant>,
 ) -> io::Result<()> {
     let pid = checked_pid(record.pid)?;
     let pidfd =
@@ -596,6 +649,9 @@ pub(crate) fn signal_attested(
             )
         })?;
     require_identity_match(record, &identity)?;
+    if let Some(deadline) = deadline {
+        require_deadline(deadline, "daemon signaling deadline elapsed")?;
+    }
     rustix::process::pidfd_send_signal(&pidfd, signal).map_err(errno)
 }
 
@@ -616,6 +672,16 @@ fn signal_attested_with<P: ProcessInspector, S: ProcessSignaler>(
     signaler: &S,
     signal: rustix::process::Signal,
 ) -> io::Result<()> {
+    signal_attested_with_deadline(record, inspector, signaler, signal, None)
+}
+
+fn signal_attested_with_deadline<P: ProcessInspector, S: ProcessSignaler>(
+    record: &DaemonInstanceRecord,
+    inspector: &P,
+    signaler: &S,
+    signal: rustix::process::Signal,
+    deadline: Option<Instant>,
+) -> io::Result<()> {
     let identity = inspector
         .inspect(record.pid, &record.executable)?
         .ok_or_else(|| {
@@ -625,7 +691,30 @@ fn signal_attested_with<P: ProcessInspector, S: ProcessSignaler>(
             )
         })?;
     require_identity_match(record, &identity)?;
+    if let Some(deadline) = deadline {
+        require_deadline(deadline, "daemon signaling deadline elapsed")?;
+    }
     signaler.signal(record.pid, signal)
+}
+
+fn require_deadline(deadline: Instant, detail: &str) -> io::Result<()> {
+    if Instant::now() >= deadline {
+        Err(io::Error::new(io::ErrorKind::TimedOut, detail))
+    } else {
+        Ok(())
+    }
+}
+
+async fn inspect_process_supervised<P: ProcessInspector>(
+    inspector: &P,
+    pid: u32,
+    expected_executable: &Path,
+) -> io::Result<Option<ProcessIdentity>> {
+    let inspector = inspector.clone();
+    let expected_executable = expected_executable.to_owned();
+    tokio::task::spawn_blocking(move || inspector.inspect(pid, &expected_executable))
+        .await
+        .map_err(|error| io::Error::other(format!("process inspection task failed: {error}")))?
 }
 
 pub(crate) fn read_attested_instance<P: ProcessInspector>(
@@ -687,7 +776,7 @@ where
     let probe = endpoint.probe(paths.socket()).await?;
     if let Some(tombstone) = interrupted_tombstone {
         return Ok(match probe {
-            EndpointProbe::Unreachable => Inspection {
+            EndpointProbe::AbsentOrInert => Inspection {
                 status: DaemonStatus {
                     state: DaemonState::Unsafe,
                     identity: None,
@@ -697,6 +786,20 @@ where
                 session: None,
                 record: None,
                 interrupted_tombstone: Some(tombstone),
+                published_record: None,
+            },
+            EndpointProbe::Unresponsive(detail) => Inspection {
+                status: DaemonStatus {
+                    state: DaemonState::Unsafe,
+                    identity: None,
+                    legacy: false,
+                    detail: Some(format!(
+                        "daemon record publication was interrupted beside an unresponsive endpoint: {detail}"
+                    )),
+                },
+                session: None,
+                record: None,
+                interrupted_tombstone: None,
                 published_record: None,
             },
             EndpointProbe::Connected(session) => Inspection {
@@ -710,7 +813,7 @@ where
                 },
                 session: Some(session),
                 record: None,
-                interrupted_tombstone: None,
+                interrupted_tombstone: Some(tombstone),
                 published_record: None,
             },
             EndpointProbe::Unsafe(detail) => Inspection {
@@ -748,7 +851,7 @@ where
         Ok(published_record) => published_record,
         Err(error) => {
             return Ok(match probe {
-                EndpointProbe::Unreachable => Inspection {
+                EndpointProbe::AbsentOrInert | EndpointProbe::Unresponsive(_) => Inspection {
                     status: DaemonStatus {
                         state: DaemonState::Unsafe,
                         identity: record.as_ref().map(DaemonIdentity::from),
@@ -801,9 +904,12 @@ where
             interrupted_tombstone: None,
             published_record: None,
         },
-        EndpointProbe::Unreachable => classify_unreachable(paths, record, inspector)?,
+        EndpointProbe::AbsentOrInert => classify_unreachable(paths, record, inspector).await?,
+        EndpointProbe::Unresponsive(detail) => {
+            classify_unresponsive(paths, record, inspector, detail).await?
+        }
         EndpointProbe::Connected(session) => {
-            classify_connected(expected_executable, record, session, inspector)?
+            classify_connected(expected_executable, record, session, inspector).await?
         }
     };
     inspection.published_record = published_record;
@@ -860,7 +966,7 @@ where
     P: ProcessInspector,
     S: DaemonSpawner,
 {
-    if inspected.status.state == DaemonState::Unsafe {
+    if inspected.status.state == DaemonState::Unsafe && inspected.session.is_none() {
         if let Some(tombstone) = inspected.interrupted_tombstone.take() {
             recover_interrupted_tombstone(paths, endpoint, tombstone, timeouts).await?;
             inspected = Inspection {
@@ -914,13 +1020,43 @@ where
     spawner.spawn(&launch)?;
     let deadline = tokio::time::Instant::now() + timeouts.readiness;
     loop {
-        let inspected = inspect_with(paths, expected_executable, endpoint, inspector).await?;
+        let inspected = match tokio::time::timeout_at(
+            deadline,
+            inspect_with(paths, expected_executable, endpoint, inspector),
+        )
+        .await
+        {
+            Ok(inspected) => inspected?,
+            Err(_) => {
+                return Err(SupervisorError::Readiness {
+                    state: DaemonState::Unreachable,
+                    detail: Some(
+                        "daemon readiness deadline elapsed during state inspection".to_owned(),
+                    ),
+                });
+            }
+        };
         match inspected.status.state {
             DaemonState::Current => return Ok((inspected, true)),
             DaemonState::Stopped | DaemonState::Unreachable
                 if tokio::time::Instant::now() < deadline =>
             {
-                tokio::time::sleep(timeouts.poll).await;
+                tokio::time::sleep_until(std::cmp::min(
+                    deadline,
+                    tokio::time::Instant::now() + timeouts.poll,
+                ))
+                .await;
+            }
+            DaemonState::Unsafe
+                if inspected.session.is_some()
+                    && inspected.interrupted_tombstone.is_some()
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep_until(std::cmp::min(
+                    deadline,
+                    tokio::time::Instant::now() + timeouts.poll,
+                ))
+                .await;
             }
             state => {
                 return Err(SupervisorError::Readiness {
@@ -943,17 +1079,7 @@ async fn recover_interrupted_tombstone<E: DaemonEndpoint>(
             tokio::time::sleep(timeouts.poll).await;
         }
         validate_held_interrupted_tombstone(&tombstone)?;
-        match endpoint.probe(paths.socket()).await? {
-            EndpointProbe::Unreachable => {}
-            EndpointProbe::Connected(_) => {
-                return Err(SupervisorError::TombstoneBusy {
-                    detail: "a daemon endpoint appeared during recovery".to_owned(),
-                });
-            }
-            EndpointProbe::Unsafe(detail) => {
-                return Err(SupervisorError::TombstoneBusy { detail });
-            }
-        }
+        prove_endpoint_absent_or_inert(paths, endpoint, "interrupted publication").await?;
         validate_held_interrupted_tombstone(&tombstone)?;
     }
 
@@ -977,7 +1103,7 @@ where
             tokio::time::sleep(timeouts.poll).await;
         }
         validate_held_published_record(&published_record, record)?;
-        match inspector.inspect(record.pid, &record.executable) {
+        match inspect_process_supervised(inspector, record.pid, &record.executable).await {
             Ok(None) => {}
             Ok(Some(_)) => {
                 return Err(SupervisorError::TombstoneBusy {
@@ -992,21 +1118,50 @@ where
                 });
             }
         }
-        match endpoint.probe(paths.socket()).await? {
-            EndpointProbe::Unreachable => {}
-            EndpointProbe::Connected(_) => {
-                return Err(SupervisorError::TombstoneBusy {
-                    detail: "a daemon endpoint appeared during stale-record recovery".to_owned(),
-                });
-            }
-            EndpointProbe::Unsafe(detail) => {
-                return Err(SupervisorError::TombstoneBusy { detail });
-            }
-        }
+        prove_endpoint_absent_or_inert(paths, endpoint, "stale-record recovery").await?;
         validate_held_published_record(&published_record, record)?;
     }
 
     retire_held_record(&published_record)
+}
+
+async fn prove_endpoint_absent_or_inert<E: DaemonEndpoint>(
+    paths: &DaemonPaths,
+    endpoint: &E,
+    context: &str,
+) -> Result<(), SupervisorError> {
+    let before = inspect_endpoint_path(paths).map_err(|error| SupervisorError::TombstoneBusy {
+        detail: format!("{context} found an unsafe endpoint path: {error}"),
+    })?;
+    let probe = endpoint.probe(paths.socket()).await?;
+    let after = inspect_endpoint_path(paths).map_err(|error| SupervisorError::TombstoneBusy {
+        detail: format!("{context} found an unsafe endpoint path after probing: {error}"),
+    })?;
+
+    let stable_or_removed = match (before, after) {
+        (EndpointPathState::Absent, EndpointPathState::Absent)
+        | (EndpointPathState::SafeSocket(_), EndpointPathState::Absent) => true,
+        (EndpointPathState::SafeSocket(before), EndpointPathState::SafeSocket(after)) => {
+            before == after
+        }
+        (EndpointPathState::Absent, EndpointPathState::SafeSocket(_)) => false,
+    };
+    if !stable_or_removed {
+        return Err(SupervisorError::TombstoneBusy {
+            detail: format!("{context} endpoint pathname changed while proving absence"),
+        });
+    }
+
+    match probe {
+        EndpointProbe::AbsentOrInert => Ok(()),
+        EndpointProbe::Unresponsive(detail) => Err(SupervisorError::TombstoneBusy {
+            detail: format!("{context} found a live but unresponsive endpoint: {detail}"),
+        }),
+        EndpointProbe::Connected(_) => Err(SupervisorError::TombstoneBusy {
+            detail: format!("{context} found a connected daemon endpoint"),
+        }),
+        EndpointProbe::Unsafe(detail) => Err(SupervisorError::TombstoneBusy { detail }),
+    }
 }
 
 fn retire_held_record(record: &InterruptedTombstone) -> Result<(), SupervisorError> {
@@ -1207,7 +1362,11 @@ where
     let graceful_deadline = tokio::time::Instant::now() + policy.timeouts.shutdown;
 
     if inspected.status.legacy {
-        let second = endpoint.probe(paths.socket()).await?;
+        let second = tokio::time::timeout_at(graceful_deadline, endpoint.probe(paths.socket()))
+            .await
+            .map_err(|_| SupervisorError::IdentityChanged {
+                detail: "legacy endpoint re-attestation timed out".to_owned(),
+            })??;
         let EndpointProbe::Connected(second) = second else {
             return Err(SupervisorError::IdentityChanged {
                 detail: "legacy endpoint disappeared before signaling".to_owned(),
@@ -1225,7 +1384,13 @@ where
                 detail: "legacy endpoint attestations were not identical".to_owned(),
             });
         }
-        signal_identity(signaler, &identity, rustix::process::Signal::TERM)?;
+        signal_identity(
+            signaler,
+            &identity,
+            rustix::process::Signal::TERM,
+            graceful_deadline,
+        )
+        .await?;
     } else {
         let session =
             inspected
@@ -1252,7 +1417,15 @@ where
     )
     .await?
     {
-        let stopped = confirm_stopped(paths, expected_executable, endpoint, inspector).await?;
+        let stopped = confirm_stopped(
+            paths,
+            expected_executable,
+            endpoint,
+            inspector,
+            graceful_deadline,
+            "graceful shutdown",
+        )
+        .await?;
         return Ok(LifecycleOutcome {
             status: stopped,
             transition: DaemonTransition::Stopped,
@@ -1265,21 +1438,29 @@ where
         });
     }
 
-    signal_identity(signaler, &identity, rustix::process::Signal::KILL)?;
-    if !wait_for_exit_until(
+    let force_deadline = tokio::time::Instant::now() + policy.timeouts.shutdown;
+    signal_identity(
+        signaler,
         &identity,
-        inspector,
-        tokio::time::Instant::now() + policy.timeouts.shutdown,
-        policy.timeouts.poll,
+        rustix::process::Signal::KILL,
+        force_deadline,
     )
-    .await?
-    {
+    .await?;
+    if !wait_for_exit_until(&identity, inspector, force_deadline, policy.timeouts.poll).await? {
         return Err(SupervisorError::ExitTimeout {
             identity: Box::new(identity),
             forced: true,
         });
     }
-    let stopped = confirm_stopped(paths, expected_executable, endpoint, inspector).await?;
+    let stopped = confirm_stopped(
+        paths,
+        expected_executable,
+        endpoint,
+        inspector,
+        force_deadline,
+        "forced shutdown",
+    )
+    .await?;
     Ok(LifecycleOutcome {
         status: stopped,
         transition: DaemonTransition::Stopped,
@@ -1304,7 +1485,8 @@ where
 {
     let _lock = paths.lock_async().await?;
     let inspected = inspect_with(paths, expected_executable, endpoint, inspector).await?;
-    let recoverable_tombstone = inspected.interrupted_tombstone.is_some();
+    let recoverable_tombstone =
+        inspected.interrupted_tombstone.is_some() && inspected.session.is_none();
     let forced = if inspected.status.state == DaemonState::Stopped || recoverable_tombstone {
         false
     } else {
@@ -1357,7 +1539,8 @@ where
     if initial.status.state == DaemonState::Current {
         return connected_outcome(initial, DaemonTransition::None);
     }
-    let recoverable_tombstone = initial.interrupted_tombstone.is_some();
+    let recoverable_tombstone =
+        initial.interrupted_tombstone.is_some() && initial.session.is_none();
     if !matches!(
         initial.status.state,
         DaemonState::Stopped | DaemonState::Outdated
@@ -1386,7 +1569,9 @@ where
             .await?;
             (current, DaemonTransition::Started)
         }
-        DaemonState::Unsafe if inspected.interrupted_tombstone.is_some() => {
+        DaemonState::Unsafe
+            if inspected.interrupted_tombstone.is_some() && inspected.session.is_none() =>
+        {
             let (current, _) = ensure_started_locked(
                 paths,
                 expected_executable,
@@ -1555,14 +1740,30 @@ fn connected_outcome<C>(
     })
 }
 
-fn signal_identity<S: AttestedProcessSignaler>(
+async fn signal_identity<S: AttestedProcessSignaler>(
     signaler: &S,
     identity: &DaemonIdentity,
     signal: rustix::process::Signal,
+    deadline: tokio::time::Instant,
 ) -> Result<(), SupervisorError> {
-    match signaler.signal_attested(identity, signal) {
+    if tokio::time::Instant::now() >= deadline {
+        return Ok(());
+    }
+    let signaler = signaler.clone();
+    let identity = identity.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        signaler.signal_attested_until(&identity, signal, deadline.into_std())
+    });
+    let result = match tokio::time::timeout_at(deadline, task).await {
+        Ok(result) => result.map_err(|error| SupervisorError::IdentityChanged {
+            detail: format!("attested signaling task failed: {error}"),
+        })?,
+        Err(_) => return Ok(()),
+    };
+    match result {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => Ok(()),
         Err(error) => Err(SupervisorError::IdentityChanged {
             detail: error.to_string(),
         }),
@@ -1576,7 +1777,19 @@ async fn wait_for_exit_until<P: ProcessInspector>(
     poll: Duration,
 ) -> Result<bool, SupervisorError> {
     loop {
-        match inspector.inspect(identity.pid, &identity.executable) {
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        let inspection = match tokio::time::timeout_at(
+            deadline,
+            inspect_process_supervised(inspector, identity.pid, &identity.executable),
+        )
+        .await
+        {
+            Ok(inspection) => inspection,
+            Err(_) => return Ok(false),
+        };
+        match inspection {
             Ok(None) => return Ok(true),
             Ok(Some(process)) => {
                 require_endpoint_process_match(identity, &process).map_err(|error| {
@@ -1594,7 +1807,7 @@ async fn wait_for_exit_until<P: ProcessInspector>(
         if tokio::time::Instant::now() >= deadline {
             return Ok(false);
         }
-        tokio::time::sleep(poll).await;
+        tokio::time::sleep_until(std::cmp::min(deadline, tokio::time::Instant::now() + poll)).await;
     }
 }
 
@@ -1603,12 +1816,21 @@ async fn confirm_stopped<E, P>(
     expected_executable: &Path,
     endpoint: &E,
     inspector: &P,
+    deadline: tokio::time::Instant,
+    context: &str,
 ) -> Result<DaemonStatus, SupervisorError>
 where
     E: DaemonEndpoint,
     P: ProcessInspector,
 {
-    let inspected = inspect_with(paths, expected_executable, endpoint, inspector).await?;
+    let inspected = tokio::time::timeout_at(
+        deadline,
+        inspect_with(paths, expected_executable, endpoint, inspector),
+    )
+    .await
+    .map_err(|_| SupervisorError::IdentityChanged {
+        detail: format!("{context} stopped-state confirmation timed out"),
+    })??;
     if inspected.status.state != DaemonState::Stopped {
         return Err(SupervisorError::InvalidState {
             state: inspected.status.state,
@@ -1673,7 +1895,7 @@ fn random_token() -> io::Result<String> {
     Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-fn classify_connected<C, P: ProcessInspector>(
+async fn classify_connected<C, P: ProcessInspector>(
     expected_executable: &Path,
     record: Option<DaemonInstanceRecord>,
     session: EndpointSession<C>,
@@ -1722,17 +1944,18 @@ fn classify_connected<C, P: ProcessInspector>(
         ));
     }
 
-    let process = match inspector.inspect(identity.pid, &identity.executable) {
-        Ok(Some(process)) => process,
-        Ok(None) => {
-            return Ok(unhealthy(
-                "daemon endpoint process is not live".to_owned(),
-                record,
-                session,
-            ));
-        }
-        Err(error) => return Ok(unhealthy(error.to_string(), record, session)),
-    };
+    let process =
+        match inspect_process_supervised(inspector, identity.pid, &identity.executable).await {
+            Ok(Some(process)) => process,
+            Ok(None) => {
+                return Ok(unhealthy(
+                    "daemon endpoint process is not live".to_owned(),
+                    record,
+                    session,
+                ));
+            }
+            Err(error) => return Ok(unhealthy(error.to_string(), record, session)),
+        };
     if let Err(error) = require_endpoint_process_match(identity, &process) {
         return Ok(unhealthy(error.to_string(), record, session));
     }
@@ -1770,7 +1993,7 @@ fn classify_connected<C, P: ProcessInspector>(
     })
 }
 
-fn classify_unreachable<C, P: ProcessInspector>(
+async fn classify_unreachable<C, P: ProcessInspector>(
     paths: &DaemonPaths,
     record: Option<DaemonInstanceRecord>,
     inspector: &P,
@@ -1799,7 +2022,7 @@ fn classify_unreachable<C, P: ProcessInspector>(
         });
     };
     let identity = DaemonIdentity::from(&record);
-    match inspector.inspect(record.pid, &record.executable) {
+    match inspect_process_supervised(inspector, record.pid, &record.executable).await {
         Ok(None) => Ok(Inspection {
             status: DaemonStatus::new(DaemonState::Stopped),
             session: None,
@@ -1845,6 +2068,43 @@ fn classify_unreachable<C, P: ProcessInspector>(
             },
             session: None,
             record: Some(record),
+            interrupted_tombstone: None,
+            published_record: None,
+        }),
+    }
+}
+
+async fn classify_unresponsive<C, P: ProcessInspector>(
+    paths: &DaemonPaths,
+    record: Option<DaemonInstanceRecord>,
+    inspector: &P,
+    detail: String,
+) -> Result<Inspection<C>, SupervisorError> {
+    match inspect_endpoint_path(paths) {
+        Ok(EndpointPathState::Absent) if record.is_none() => {
+            classify_unreachable(paths, record, inspector).await
+        }
+        Ok(EndpointPathState::Absent | EndpointPathState::SafeSocket(_)) => Ok(Inspection {
+            status: DaemonStatus {
+                state: DaemonState::Unreachable,
+                identity: record.as_ref().map(DaemonIdentity::from),
+                legacy: false,
+                detail: Some(detail),
+            },
+            session: None,
+            record,
+            interrupted_tombstone: None,
+            published_record: None,
+        }),
+        Err(error) => Ok(Inspection {
+            status: DaemonStatus {
+                state: DaemonState::Unsafe,
+                identity: record.as_ref().map(DaemonIdentity::from),
+                legacy: false,
+                detail: Some(error.to_string()),
+            },
+            session: None,
+            record,
             interrupted_tombstone: None,
             published_record: None,
         }),
@@ -2230,11 +2490,19 @@ fn validate_record(record: &DaemonInstanceRecord) -> io::Result<()> {
     Ok(())
 }
 
-fn validate_inert_endpoint(paths: &DaemonPaths) -> io::Result<()> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EndpointPathState {
+    Absent,
+    SafeSocket(FileIdentity),
+}
+
+fn inspect_endpoint_path(paths: &DaemonPaths) -> io::Result<EndpointPathState> {
     let directory =
         match open_private_directory_with_mode(paths.directory(), paths.expected_uid, false) {
             Ok(directory) => directory,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(EndpointPathState::Absent);
+            }
             Err(error) => return Err(error),
         };
     let stat = match rustix::fs::statat(
@@ -2243,7 +2511,9 @@ fn validate_inert_endpoint(paths: &DaemonPaths) -> io::Result<()> {
         AtFlags::SYMLINK_NOFOLLOW,
     ) {
         Ok(stat) => stat,
-        Err(error) if error == rustix::io::Errno::NOENT => return Ok(()),
+        Err(error) if error == rustix::io::Errno::NOENT => {
+            return Ok(EndpointPathState::Absent);
+        }
         Err(error) => return Err(errno(error)),
     };
     if FileType::from_raw_mode(stat.st_mode) != FileType::Socket
@@ -2256,7 +2526,14 @@ fn validate_inert_endpoint(paths: &DaemonPaths) -> io::Result<()> {
             "daemon endpoint ownership, type, links, or mode is unsafe",
         ));
     }
-    Ok(())
+    Ok(EndpointPathState::SafeSocket(FileIdentity {
+        device: stat.st_dev as u64,
+        inode: stat.st_ino,
+    }))
+}
+
+fn validate_inert_endpoint(paths: &DaemonPaths) -> io::Result<()> {
+    inspect_endpoint_path(paths).map(drop)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2733,7 +3010,8 @@ mod tests {
         ProcessIdentity, ProcessInspector, ProcessSignaler, ShutdownPolicy, StopMode,
         SupervisorError, SupervisorTimeouts, checked_pid, coherent_process_identity,
         connect_current_or_recover_with, inspect_with, read_attested_instance,
-        read_instance_record_with_hook, restart_with, signal_attested_with, start_with, stop_with,
+        read_instance_record_with_hook, restart_with, signal_attested_with,
+        signal_attested_with_deadline, signal_identity, start_with, stop_with, wait_for_exit_until,
     };
     #[cfg(target_os = "macos")]
     use super::{inspect_process_with, parse_lsof_executable};
@@ -2952,6 +3230,91 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct StallingInspector {
+        identity: Option<ProcessIdentity>,
+        delay: Duration,
+        timer_progressed: Arc<AtomicBool>,
+    }
+
+    impl ProcessInspector for StallingInspector {
+        fn inspect(
+            &self,
+            _pid: u32,
+            _expected_executable: &Path,
+        ) -> io::Result<Option<ProcessIdentity>> {
+            std::thread::sleep(self.delay);
+            assert!(
+                self.timer_progressed.load(Ordering::Acquire),
+                "a synchronous process inspection blocked current-thread timer/lock progress"
+            );
+            Ok(self.identity.clone())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_inspection_does_not_block_current_thread_timer_or_lock_progress() -> TestResult
+    {
+        let temp = tempfile::tempdir()?;
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        let independent_paths =
+            DaemonPaths::from_runtime_root(root(&temp)?.join("independent-runtime"));
+        let expected = record(&executable);
+        write_record(&paths, &expected)?;
+        let timer_progressed = Arc::new(AtomicBool::new(false));
+        let inspector = StallingInspector {
+            identity: Some(process_for(&endpoint_identity(&expected))),
+            delay: Duration::from_millis(100),
+            timer_progressed: Arc::clone(&timer_progressed),
+        };
+        let endpoint = FakeEndpoint::new(EndpointProbe::AbsentOrInert);
+
+        let inspection = inspect_with(&paths, &executable, &endpoint, &inspector);
+        let runtime_progress = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let lock = independent_paths
+                .lock_async_with_timeout(Duration::from_millis(50))
+                .await?;
+            timer_progressed.store(true, Ordering::Release);
+            drop(lock);
+            Ok::<(), io::Error>(())
+        };
+        let (inspection, runtime_progress) = tokio::join!(inspection, runtime_progress);
+
+        runtime_progress?;
+        assert_eq!(inspection?.status.state, DaemonState::Unreachable);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_exit_does_not_overrun_a_stalled_inspection_deadline() -> TestResult {
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let expected = record(&executable);
+        let identity = endpoint_identity(&expected);
+        let inspector = StallingInspector {
+            identity: Some(process_for(&identity)),
+            delay: Duration::from_millis(200),
+            timer_progressed: Arc::new(AtomicBool::new(true)),
+        };
+        let started = std::time::Instant::now();
+
+        let exited = wait_for_exit_until(
+            &identity,
+            &inspector,
+            tokio::time::Instant::now() + Duration::from_millis(20),
+            Duration::from_millis(1),
+        )
+        .await?;
+
+        assert!(!exited);
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "wait_for_exit overran its deadline by waiting for a stalled inspector"
+        );
+        Ok(())
+    }
+
+    #[derive(Clone)]
     struct FakeEndpoint {
         probe: EndpointProbe<()>,
         probes: Arc<AtomicUsize>,
@@ -3025,7 +3388,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
         let executable = std::env::current_exe()?.canonicalize()?;
-        let endpoint = FakeEndpoint::new(EndpointProbe::Unreachable);
+        let endpoint = FakeEndpoint::new(EndpointProbe::AbsentOrInert);
 
         let inspected = inspect_with(
             &paths,
@@ -3152,7 +3515,7 @@ mod tests {
         let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
         let expected = record(&executable);
         write_record(&paths, &expected)?;
-        let endpoint = FakeEndpoint::new(EndpointProbe::Unreachable);
+        let endpoint = FakeEndpoint::new(EndpointProbe::AbsentOrInert);
 
         let inspected = inspect_with(
             &paths,
@@ -3179,7 +3542,7 @@ mod tests {
         paths.prepare_directory()?;
         fs::write(paths.instance(), b"{")?;
         fs::set_permissions(paths.instance(), fs::Permissions::from_mode(0o600))?;
-        let endpoint = FakeEndpoint::new(EndpointProbe::Unreachable);
+        let endpoint = FakeEndpoint::new(EndpointProbe::AbsentOrInert);
 
         let inspected = inspect_with(
             &paths,
@@ -3204,7 +3567,7 @@ mod tests {
         write_record(&paths, &expected)?;
         fs::write(paths.socket(), b"not a socket")?;
         fs::set_permissions(paths.socket(), fs::Permissions::from_mode(0o600))?;
-        let endpoint = FakeEndpoint::new(EndpointProbe::Unreachable);
+        let endpoint = FakeEndpoint::new(EndpointProbe::AbsentOrInert);
 
         let inspected = inspect_with(
             &paths,
@@ -3277,10 +3640,81 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct PublicationProbeGate {
+        connected_probe_observed: Mutex<bool>,
+        changed: Condvar,
+    }
+
+    impl PublicationProbeGate {
+        fn observe_connected_probe(&self) -> io::Result<()> {
+            *self
+                .connected_probe_observed
+                .lock()
+                .map_err(|_| io::Error::other("publication probe gate was poisoned"))? = true;
+            self.changed.notify_all();
+            Ok(())
+        }
+
+        fn wait_for_connected_probe(&self) -> io::Result<()> {
+            let observed = self
+                .connected_probe_observed
+                .lock()
+                .map_err(|_| io::Error::other("publication probe gate was poisoned"))?;
+            let (observed, timeout) = self
+                .changed
+                .wait_timeout_while(observed, Duration::from_secs(1), |observed| !*observed)
+                .map_err(|_| io::Error::other("publication probe gate was poisoned"))?;
+            if !*observed && timeout.timed_out() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "connected endpoint probe was not observed",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct PublicationEndpoint {
+        endpoint: MutableEndpoint,
+        gate: Arc<PublicationProbeGate>,
+    }
+
+    #[tonic::async_trait]
+    impl DaemonEndpoint for PublicationEndpoint {
+        type Connection = ();
+
+        async fn probe(
+            &self,
+            path: &Path,
+        ) -> Result<EndpointProbe<Self::Connection>, crate::client::ClientError> {
+            let probe = self.endpoint.probe(path).await?;
+            if matches!(&probe, EndpointProbe::Connected(_)) {
+                self.gate
+                    .observe_connected_probe()
+                    .map_err(crate::client::ClientError::Io)?;
+            }
+            Ok(probe)
+        }
+
+        async fn graceful_shutdown(
+            &self,
+            connection: &mut Self::Connection,
+            instance_token: &str,
+        ) -> Result<(), crate::client::ClientError> {
+            self.endpoint
+                .graceful_shutdown(connection, instance_token)
+                .await
+        }
+    }
+
     #[derive(Clone)]
     struct MutableInspector {
         identity: Arc<Mutex<Option<ProcessIdentity>>>,
         inspections: Arc<AtomicUsize>,
+        absent_inspections: Arc<AtomicUsize>,
+        stall_on_absent: Arc<Mutex<Option<(usize, Duration)>>>,
     }
 
     impl MutableInspector {
@@ -3288,6 +3722,8 @@ mod tests {
             Self {
                 identity: Arc::new(Mutex::new(identity)),
                 inspections: Arc::new(AtomicUsize::new(0)),
+                absent_inspections: Arc::new(AtomicUsize::new(0)),
+                stall_on_absent: Arc::new(Mutex::new(None)),
             }
         }
 
@@ -3296,6 +3732,15 @@ mod tests {
                 .identity
                 .lock()
                 .map_err(|_| io::Error::other("fake process state was poisoned"))? = identity;
+            Ok(())
+        }
+
+        fn stall_on_absent_inspection(&self, inspection: usize, delay: Duration) -> io::Result<()> {
+            *self
+                .stall_on_absent
+                .lock()
+                .map_err(|_| io::Error::other("fake absent-inspection stall was poisoned"))? =
+                Some((inspection, delay));
             Ok(())
         }
     }
@@ -3307,10 +3752,22 @@ mod tests {
             _expected_executable: &Path,
         ) -> io::Result<Option<ProcessIdentity>> {
             self.inspections.fetch_add(1, AtomicOrdering::AcqRel);
-            self.identity
+            let identity = self
+                .identity
                 .lock()
                 .map_err(|_| io::Error::other("fake process state was poisoned"))
-                .map(|identity| identity.clone())
+                .map(|identity| identity.clone())?;
+            if identity.is_none() {
+                let absent = self.absent_inspections.fetch_add(1, AtomicOrdering::AcqRel) + 1;
+                let stall = *self
+                    .stall_on_absent
+                    .lock()
+                    .map_err(|_| io::Error::other("fake absent-inspection stall was poisoned"))?;
+                if stall.is_some_and(|(inspection, _)| inspection == absent) {
+                    std::thread::sleep(stall.map_or(Duration::ZERO, |(_, delay)| delay));
+                }
+            }
+            Ok(identity)
         }
     }
 
@@ -3414,6 +3871,67 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct DelayedPublicationSpawner {
+        endpoint: MutableEndpoint,
+        inspector: MutableInspector,
+        gate: Arc<PublicationProbeGate>,
+        publisher: Arc<Mutex<Option<std::thread::JoinHandle<io::Result<()>>>>>,
+    }
+
+    impl DelayedPublicationSpawner {
+        fn finish(&self) -> io::Result<()> {
+            let publisher = self
+                .publisher
+                .lock()
+                .map_err(|_| io::Error::other("delayed publisher was poisoned"))?
+                .take()
+                .ok_or_else(|| io::Error::other("delayed publisher was not started"))?;
+            publisher
+                .join()
+                .map_err(|_| io::Error::other("delayed publisher panicked"))?
+        }
+    }
+
+    impl DaemonSpawner for DelayedPublicationSpawner {
+        fn spawn(&self, launch: &DaemonLaunch) -> io::Result<()> {
+            let published = DaemonInstanceRecord {
+                pid: std::process::id(),
+                owner_token: launch.owner_token.clone(),
+                executable: launch.executable.clone(),
+                start_identity: "delayed-publication-start".to_owned(),
+                instance_token: "45".repeat(32),
+                release_version: env!("CARGO_PKG_VERSION").to_owned(),
+                started_at: InstanceTimestamp {
+                    seconds: 1_785_263_901,
+                    nanos: 456_000_000,
+                },
+            };
+            fs::write(&launch.instance_path, b"publication-in-progress")?;
+            fs::set_permissions(&launch.instance_path, fs::Permissions::from_mode(0o200))?;
+            self.inspector.set(Some(ProcessIdentity {
+                pid: published.pid,
+                executable: published.executable.clone(),
+                start_identity: published.start_identity.clone(),
+            }))?;
+            self.endpoint
+                .set(connected(endpoint_identity(&published)))?;
+
+            let instance_path = launch.instance_path.clone();
+            let gate = self.gate.clone();
+            let publisher = std::thread::spawn(move || -> io::Result<()> {
+                gate.wait_for_connected_probe()?;
+                fs::write(&instance_path, serde_json::to_vec(&published)?)?;
+                fs::set_permissions(&instance_path, fs::Permissions::from_mode(0o600))
+            });
+            *self
+                .publisher
+                .lock()
+                .map_err(|_| io::Error::other("delayed publisher was poisoned"))? = Some(publisher);
+            Ok(())
+        }
+    }
+
     fn test_timeouts() -> SupervisorTimeouts {
         SupervisorTimeouts {
             readiness: Duration::from_millis(100),
@@ -3427,7 +3945,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
         let executable = std::env::current_exe()?.canonicalize()?;
-        let endpoint = MutableEndpoint::new(EndpointProbe::Unreachable);
+        let endpoint = MutableEndpoint::new(EndpointProbe::AbsentOrInert);
         let inspector = MutableInspector::new(None);
         let spawner = FakeSpawner::current(endpoint.clone(), inspector.clone());
 
@@ -3444,6 +3962,46 @@ mod tests {
         assert_eq!(outcome.transition, DaemonTransition::Started);
         assert_eq!(outcome.status.state, DaemonState::Current);
         assert_eq!(spawner.launches()?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn start_readiness_waits_for_its_own_connected_publication_to_finish() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let endpoint = MutableEndpoint::new(EndpointProbe::AbsentOrInert);
+        let inspector = MutableInspector::new(None);
+        let gate = Arc::new(PublicationProbeGate::default());
+        let publication_endpoint = PublicationEndpoint {
+            endpoint: endpoint.clone(),
+            gate: gate.clone(),
+        };
+        let spawner = DelayedPublicationSpawner {
+            endpoint,
+            inspector: inspector.clone(),
+            gate,
+            publisher: Arc::new(Mutex::new(None)),
+        };
+
+        let outcome = start_with(
+            &paths,
+            &executable,
+            &publication_endpoint,
+            &inspector,
+            &spawner,
+            SupervisorTimeouts {
+                readiness: Duration::from_millis(200),
+                shutdown: Duration::from_millis(25),
+                poll: Duration::from_millis(1),
+            },
+        )
+        .await;
+        spawner.finish()?;
+        let outcome = outcome?;
+
+        assert_eq!(outcome.status.state, DaemonState::Current);
+        assert_eq!(outcome.transition, DaemonTransition::Started);
         Ok(())
     }
 
@@ -3506,7 +4064,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let paths = Arc::new(DaemonPaths::from_runtime_root(root(&temp)?.join("runtime")));
         let executable = Arc::new(std::env::current_exe()?.canonicalize()?);
-        let endpoint = Arc::new(MutableEndpoint::new(EndpointProbe::Unreachable));
+        let endpoint = Arc::new(MutableEndpoint::new(EndpointProbe::AbsentOrInert));
         let inspector = Arc::new(MutableInspector::new(None));
         let gate = Arc::new(SpawnGate::default());
         let mut configured =
@@ -3579,7 +4137,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
         let executable = std::env::current_exe()?.canonicalize()?;
-        let endpoint = MutableEndpoint::new(EndpointProbe::Unreachable);
+        let endpoint = MutableEndpoint::new(EndpointProbe::AbsentOrInert);
         let inspector = MutableInspector::new(None);
         let spawner = FakeSpawner::current(endpoint.clone(), inspector.clone());
 
@@ -3610,7 +4168,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
         let executable = std::env::current_exe()?.canonicalize()?;
-        let endpoint = MutableEndpoint::new(EndpointProbe::Unreachable);
+        let endpoint = MutableEndpoint::new(EndpointProbe::AbsentOrInert);
         let inspector = MutableInspector::new(None);
         let mut configured = FakeSpawner::current(endpoint.clone(), inspector.clone());
         configured.release_version = "0.1.10".to_owned();
@@ -3640,7 +4198,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
         let executable = std::env::current_exe()?.canonicalize()?;
-        let endpoint = MutableEndpoint::new(EndpointProbe::Unreachable);
+        let endpoint = MutableEndpoint::new(EndpointProbe::AbsentOrInert);
         let inspector = MutableInspector::new(None);
         let mut configured = FakeSpawner::current(endpoint.clone(), inspector.clone());
         configured.endpoint_token = Some("55".repeat(32));
@@ -3697,7 +4255,7 @@ mod tests {
         let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
         let stale = record(&executable);
         write_record(&paths, &stale)?;
-        let endpoint = MutableEndpoint::new(EndpointProbe::Unreachable);
+        let endpoint = MutableEndpoint::new(EndpointProbe::AbsentOrInert);
         let inspector = MutableInspector::new(None);
         let inner = FakeSpawner::current(endpoint.clone(), inspector.clone());
         let spawner = TombstoneOnlySpawner {
@@ -3752,7 +4310,55 @@ mod tests {
                 fs::write(&self.instance_path, &self.replacement)?;
                 fs::set_permissions(&self.instance_path, fs::Permissions::from_mode(0o200))?;
             }
-            Ok(EndpointProbe::Unreachable)
+            Ok(EndpointProbe::AbsentOrInert)
+        }
+
+        async fn graceful_shutdown(
+            &self,
+            _connection: &mut Self::Connection,
+            _instance_token: &str,
+        ) -> Result<(), crate::client::ClientError> {
+            Err(crate::client::ClientError::Api(
+                "unexpected_shutdown".to_owned(),
+            ))
+        }
+    }
+
+    #[derive(Clone)]
+    enum UnsafeEndpointReplacement {
+        RegularFile,
+        Symlink(PathBuf),
+    }
+
+    #[derive(Clone)]
+    struct ReplacingSocketEndpoint {
+        socket_path: PathBuf,
+        replacement: UnsafeEndpointReplacement,
+        replace_on_probe: usize,
+        probes: Arc<AtomicUsize>,
+    }
+
+    #[tonic::async_trait]
+    impl DaemonEndpoint for ReplacingSocketEndpoint {
+        type Connection = ();
+
+        async fn probe(
+            &self,
+            _path: &Path,
+        ) -> Result<EndpointProbe<Self::Connection>, crate::client::ClientError> {
+            let probe = self.probes.fetch_add(1, AtomicOrdering::AcqRel) + 1;
+            if probe == self.replace_on_probe {
+                match &self.replacement {
+                    UnsafeEndpointReplacement::RegularFile => {
+                        fs::write(&self.socket_path, b"foreign-endpoint")?;
+                        fs::set_permissions(&self.socket_path, fs::Permissions::from_mode(0o600))?;
+                    }
+                    UnsafeEndpointReplacement::Symlink(target) => {
+                        std::os::unix::fs::symlink(target, &self.socket_path)?;
+                    }
+                }
+            }
+            Ok(EndpointProbe::AbsentOrInert)
         }
 
         async fn graceful_shutdown(
@@ -3767,6 +4373,203 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tombstone_recovery_refuses_a_non_socket_replacement_between_probes() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        let executable = std::env::current_exe()?.canonicalize()?;
+        paths.prepare_directory()?;
+        fs::write(paths.instance(), b"partial-publication")?;
+        fs::set_permissions(paths.instance(), fs::Permissions::from_mode(0o200))?;
+        let endpoint = ReplacingSocketEndpoint {
+            socket_path: paths.socket().to_owned(),
+            replacement: UnsafeEndpointReplacement::RegularFile,
+            replace_on_probe: 2,
+            probes: Arc::new(AtomicUsize::new(0)),
+        };
+        let spawner = CountingNoopSpawner::default();
+
+        let result = start_with(
+            &paths,
+            &executable,
+            &endpoint,
+            &FakeInspector { identity: None },
+            &spawner,
+            test_timeouts(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(SupervisorError::TombstoneBusy { .. })));
+        fs::set_permissions(paths.instance(), fs::Permissions::from_mode(0o600))?;
+        assert_eq!(fs::read(paths.instance())?, b"partial-publication");
+        assert_eq!(fs::read(paths.socket())?, b"foreign-endpoint");
+        assert_eq!(spawner.0.load(AtomicOrdering::Acquire), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_record_recovery_refuses_a_symlink_replacement_between_probes() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let base = root(&temp)?;
+        let paths = DaemonPaths::from_runtime_root(base.join("runtime"));
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let stale = record(&executable);
+        let stale_bytes = serde_json::to_vec(&stale)?;
+        write_record(&paths, &stale)?;
+        let target = base.join("foreign-endpoint");
+        fs::write(&target, b"retain")?;
+        let endpoint = ReplacingSocketEndpoint {
+            socket_path: paths.socket().to_owned(),
+            replacement: UnsafeEndpointReplacement::Symlink(target.clone()),
+            replace_on_probe: 2,
+            probes: Arc::new(AtomicUsize::new(0)),
+        };
+        let spawner = CountingNoopSpawner::default();
+
+        let result = start_with(
+            &paths,
+            &executable,
+            &endpoint,
+            &FakeInspector { identity: None },
+            &spawner,
+            test_timeouts(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(SupervisorError::TombstoneBusy { .. })));
+        fs::set_permissions(paths.instance(), fs::Permissions::from_mode(0o600))?;
+        assert_eq!(fs::read(paths.instance())?, stale_bytes);
+        assert!(
+            fs::symlink_metadata(paths.socket())?
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(target)?, b"retain");
+        assert_eq!(spawner.0.load(AtomicOrdering::Acquire), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_record_recovery_refuses_unresponsive_transport_after_path_absence() -> TestResult
+    {
+        let temp = tempfile::tempdir()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let stale = record(&executable);
+        let stale_bytes = serde_json::to_vec(&stale)?;
+        write_record(&paths, &stale)?;
+        let endpoint = FakeEndpoint::new(EndpointProbe::Unresponsive(
+            "accepted transport did not complete its handshake".to_owned(),
+        ));
+        let spawner = CountingNoopSpawner::default();
+
+        let result = start_with(
+            &paths,
+            &executable,
+            &endpoint,
+            &FakeInspector { identity: None },
+            &spawner,
+            test_timeouts(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(SupervisorError::InvalidState {
+                state: DaemonState::Unreachable,
+                ..
+            })
+        ));
+        assert_eq!(fs::read(paths.instance())?, stale_bytes);
+        assert_eq!(spawner.0.load(AtomicOrdering::Acquire), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tombstone_recovery_refuses_an_accepted_stalled_listener_timeout() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        let executable = std::env::current_exe()?.canonicalize()?;
+        paths.prepare_directory()?;
+        fs::write(paths.instance(), b"partial-publication")?;
+        fs::set_permissions(paths.instance(), fs::Permissions::from_mode(0o200))?;
+        let listener = std::os::unix::net::UnixListener::bind(paths.socket())?;
+        fs::set_permissions(paths.socket(), fs::Permissions::from_mode(0o600))?;
+        listener.set_nonblocking(true)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let holder = {
+            let stop = Arc::clone(&stop);
+            let accepted = Arc::clone(&accepted);
+            let socket = paths.socket().to_owned();
+            std::thread::spawn(move || -> io::Result<()> {
+                let mut held = Vec::new();
+                while !stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            if accepted.load(AtomicOrdering::Acquire) == 0 {
+                                fs::remove_file(&socket)?;
+                            }
+                            held.push(stream);
+                            accepted.fetch_add(1, AtomicOrdering::AcqRel);
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok(())
+            })
+        };
+        let spawner = CountingNoopSpawner::default();
+
+        let result = start_with(
+            &paths,
+            &executable,
+            &crate::client::TonicEndpoint,
+            &FakeInspector { identity: None },
+            &spawner,
+            test_timeouts(),
+        )
+        .await;
+
+        stop.store(true, Ordering::Release);
+        holder
+            .join()
+            .map_err(|_| io::Error::other("stalled listener holder panicked"))??;
+        assert!(
+            matches!(
+                &result,
+                Err(SupervisorError::InvalidState {
+                    state: DaemonState::Unsafe,
+                    ..
+                })
+            ),
+            "unexpected stalled-listener result: {result:?}"
+        );
+        assert!(accepted.load(AtomicOrdering::Acquire) > 0);
+        fs::set_permissions(paths.instance(), fs::Permissions::from_mode(0o600))?;
+        assert_eq!(fs::read(paths.instance())?, b"partial-publication");
+        assert_eq!(spawner.0.load(AtomicOrdering::Acquire), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn endpoint_probe_distinguishes_an_orphaned_socket_as_inert() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        paths.prepare_directory()?;
+        let listener = std::os::unix::net::UnixListener::bind(paths.socket())?;
+        fs::set_permissions(paths.socket(), fs::Permissions::from_mode(0o600))?;
+        drop(listener);
+
+        let probe = crate::client::TonicEndpoint.probe(paths.socket()).await?;
+
+        assert!(matches!(probe, EndpointProbe::AbsentOrInert));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn tombstone_recovery_retires_held_residue_after_bounded_endpoint_reinspection()
     -> TestResult {
         let temp = tempfile::tempdir()?;
@@ -3775,7 +4578,7 @@ mod tests {
         paths.prepare_directory()?;
         fs::write(paths.instance(), b"partial-publication")?;
         fs::set_permissions(paths.instance(), fs::Permissions::from_mode(0o200))?;
-        let endpoint = MutableEndpoint::new(EndpointProbe::Unreachable);
+        let endpoint = MutableEndpoint::new(EndpointProbe::AbsentOrInert);
         let inspector = MutableInspector::new(None);
         let spawner = FakeSpawner::current(endpoint.clone(), inspector.clone());
 
@@ -3808,8 +4611,8 @@ mod tests {
         let inspector = MutableInspector::new(Some(process_for(&identity)));
         let endpoint = StopEndpoint::with_probes(
             vec![
-                EndpointProbe::Unreachable,
-                EndpointProbe::Unreachable,
+                EndpointProbe::AbsentOrInert,
+                EndpointProbe::AbsentOrInert,
                 connected(identity),
             ],
             inspector.clone(),
@@ -3879,6 +4682,7 @@ mod tests {
         retire_path: Arc<Mutex<Option<PathBuf>>>,
         exit_on_shutdown: bool,
         stall_shutdown: bool,
+        stall_second_probe: bool,
         probes: Arc<AtomicUsize>,
     }
 
@@ -3896,6 +4700,7 @@ mod tests {
                 retire_path: Arc::new(Mutex::new(None)),
                 exit_on_shutdown,
                 stall_shutdown: false,
+                stall_second_probe: false,
                 probes: Arc::new(AtomicUsize::new(0)),
             }
         }
@@ -3916,12 +4721,18 @@ mod tests {
                 retire_path: Arc::new(Mutex::new(None)),
                 exit_on_shutdown: false,
                 stall_shutdown: false,
+                stall_second_probe: false,
                 probes: Arc::new(AtomicUsize::new(0)),
             })
         }
 
         fn with_stalled_shutdown(mut self) -> Self {
             self.stall_shutdown = true;
+            self
+        }
+
+        fn with_stalled_second_probe(mut self) -> Self {
+            self.stall_second_probe = true;
             self
         }
 
@@ -3951,7 +4762,7 @@ mod tests {
 
         fn simulate_exit(&self) -> io::Result<()> {
             self.inspector.set(None)?;
-            self.set(EndpointProbe::Unreachable)?;
+            self.set(EndpointProbe::AbsentOrInert)?;
             let path = self
                 .retire_path
                 .lock()
@@ -3973,7 +4784,10 @@ mod tests {
             &self,
             _path: &Path,
         ) -> Result<EndpointProbe<Self::Connection>, crate::client::ClientError> {
-            self.probes.fetch_add(1, AtomicOrdering::AcqRel);
+            let probe = self.probes.fetch_add(1, AtomicOrdering::AcqRel) + 1;
+            if self.stall_second_probe && probe == 2 {
+                return std::future::pending().await;
+            }
             if let Some(probe) = self
                 .queued
                 .lock()
@@ -4108,6 +4922,56 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct StallingAttestedSignaler {
+        delay: Duration,
+        timer_progressed: Arc<AtomicBool>,
+    }
+
+    impl AttestedProcessSignaler for StallingAttestedSignaler {
+        fn signal_attested(
+            &self,
+            _identity: &DaemonIdentity,
+            _signal: rustix::process::Signal,
+        ) -> io::Result<()> {
+            std::thread::sleep(self.delay);
+            assert!(
+                self.timer_progressed.load(Ordering::Acquire),
+                "synchronous attested signaling blocked the current-thread Tokio executor"
+            );
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn attested_signaling_does_not_block_current_thread_timer_progress() -> TestResult {
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let identity = endpoint_identity(&record(&executable));
+        let timer_progressed = Arc::new(AtomicBool::new(false));
+        let signaler = StallingAttestedSignaler {
+            delay: Duration::from_millis(100),
+            timer_progressed: Arc::clone(&timer_progressed),
+        };
+
+        let signal = async {
+            signal_identity(
+                &signaler,
+                &identity,
+                rustix::process::Signal::TERM,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+        };
+        let timer = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            timer_progressed.store(true, Ordering::Release);
+        };
+        let (signal, ()) = tokio::join!(signal, timer);
+
+        signal?;
+        Ok(())
+    }
+
     fn legacy_identity(executable: &Path) -> DaemonIdentity {
         DaemonIdentity {
             pid: std::process::id(),
@@ -4133,7 +4997,7 @@ mod tests {
         let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
         let executable = std::env::current_exe()?.canonicalize()?;
         let inspector = MutableInspector::new(None);
-        let endpoint = StopEndpoint::new(EndpointProbe::Unreachable, inspector.clone(), false);
+        let endpoint = StopEndpoint::new(EndpointProbe::AbsentOrInert, inspector.clone(), false);
         let signaler = RecordingAttestedSignaler::new(inspector.clone(), endpoint.clone(), true);
 
         let outcome = stop_with(
@@ -4260,6 +5124,50 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn graceful_stop_confirmation_cannot_overrun_its_absolute_deadline() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        let expected = record(&executable);
+        write_record(&paths, &expected)?;
+        let inspector = MutableInspector::new(Some(process_for(&endpoint_identity(&expected))));
+        inspector.stall_on_absent_inspection(2, Duration::from_millis(200))?;
+        let endpoint = StopEndpoint::new(
+            connected(endpoint_identity(&expected)),
+            inspector.clone(),
+            true,
+        );
+        let signaler = RecordingAttestedSignaler::new(inspector.clone(), endpoint.clone(), true);
+        let started = std::time::Instant::now();
+
+        let result = stop_with(
+            &paths,
+            &executable,
+            &endpoint,
+            &inspector,
+            &signaler,
+            StopMode::Explicit { force: false },
+            SupervisorTimeouts {
+                readiness: Duration::from_millis(100),
+                shutdown: Duration::from_millis(40),
+                poll: Duration::from_millis(1),
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(SupervisorError::IdentityChanged { .. })
+        ));
+        assert!(
+            started.elapsed() < Duration::from_millis(120),
+            "graceful stopped-state confirmation overran its deadline"
+        );
+        assert!(signaler.signals()?.is_empty());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn stop_legacy_double_attests_then_verifies_process_before_sigterm() -> TestResult {
         let temp = tempfile::tempdir()?;
@@ -4295,6 +5203,36 @@ mod tests {
                 .unwrap_or_default()
                 >= 2
         );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_legacy_second_attestation_timeout_never_force_signals() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        let identity = legacy_identity(&executable);
+        let inspector = MutableInspector::new(Some(process_for(&identity)));
+        let endpoint = StopEndpoint::new(connected(identity), inspector.clone(), false)
+            .with_stalled_second_probe();
+        let signaler = RecordingAttestedSignaler::new(inspector.clone(), endpoint.clone(), true);
+
+        let result = stop_with(
+            &paths,
+            &executable,
+            &endpoint,
+            &inspector,
+            &signaler,
+            StopMode::Explicit { force: true },
+            test_timeouts(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(SupervisorError::IdentityChanged { .. })
+        ));
+        assert!(signaler.signals()?.is_empty());
         Ok(())
     }
 
@@ -4434,9 +5372,50 @@ mod tests {
         Ok(())
     }
 
-    #[derive(Default)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn forced_stop_confirmation_cannot_overrun_its_absolute_deadline() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        let expected = record(&executable);
+        write_record(&paths, &expected)?;
+        let identity = endpoint_identity(&expected);
+        let inspector = MutableInspector::new(Some(process_for(&identity)));
+        inspector.stall_on_absent_inspection(2, Duration::from_millis(200))?;
+        let endpoint = StopEndpoint::new(connected(identity), inspector.clone(), false);
+        let signaler = RecordingAttestedSignaler::new(inspector.clone(), endpoint.clone(), true);
+        let started = std::time::Instant::now();
+
+        let result = stop_with(
+            &paths,
+            &executable,
+            &endpoint,
+            &inspector,
+            &signaler,
+            StopMode::Explicit { force: true },
+            SupervisorTimeouts {
+                readiness: Duration::from_millis(100),
+                shutdown: Duration::from_millis(40),
+                poll: Duration::from_millis(1),
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(SupervisorError::IdentityChanged { .. })
+        ));
+        assert!(
+            started.elapsed() < Duration::from_millis(120),
+            "forced stopped-state confirmation overran its deadline"
+        );
+        assert_eq!(signaler.signals()?, vec![rustix::process::Signal::KILL]);
+        Ok(())
+    }
+
+    #[derive(Clone, Default)]
     struct NeverSignaler {
-        signals: AtomicUsize,
+        signals: Arc<AtomicUsize>,
     }
 
     impl AttestedProcessSignaler for NeverSignaler {
@@ -4508,7 +5487,7 @@ mod tests {
         let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
         let executable = std::env::current_exe()?.canonicalize()?;
         let inspector = MutableInspector::new(None);
-        let endpoint = StopEndpoint::new(EndpointProbe::Unreachable, inspector.clone(), false);
+        let endpoint = StopEndpoint::new(EndpointProbe::AbsentOrInert, inspector.clone(), false);
         let spawner = StopSpawner::new(endpoint.clone(), inspector.clone());
 
         let outcome = restart_with(
@@ -4598,7 +5577,7 @@ mod tests {
         let executable = std::env::current_exe()?.canonicalize()?;
         let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
         let inspector = MutableInspector::new(None);
-        let endpoint = MutableEndpoint::new(EndpointProbe::Unreachable);
+        let endpoint = MutableEndpoint::new(EndpointProbe::AbsentOrInert);
         let spawner = FakeSpawner::current(endpoint.clone(), inspector.clone());
 
         let outcome = connect_current_or_recover_with(
@@ -5028,6 +6007,33 @@ mod tests {
             signal_attested_with(&expected, &reused, &signaler, rustix::process::Signal::TERM,)
                 .is_err()
         );
+        assert_eq!(signaler.0.load(Ordering::Acquire), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn attestation_signal_rechecks_deadline_immediately_before_signaling() -> TestResult {
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let expected = record(&executable);
+        let inspector = StallingInspector {
+            identity: Some(process_for(&endpoint_identity(&expected))),
+            delay: Duration::from_millis(30),
+            timer_progressed: Arc::new(AtomicBool::new(true)),
+        };
+        let signaler = CountingSignaler::default();
+
+        let error = match signal_attested_with_deadline(
+            &expected,
+            &inspector,
+            &signaler,
+            rustix::process::Signal::TERM,
+            Some(std::time::Instant::now() + Duration::from_millis(5)),
+        ) {
+            Err(error) => error,
+            Ok(()) => return Err("an expired transition deadline allowed signaling".into()),
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert_eq!(signaler.0.load(Ordering::Acquire), 0);
         Ok(())
     }

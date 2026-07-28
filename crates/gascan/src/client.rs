@@ -122,9 +122,16 @@ impl DaemonEndpoint for TonicEndpoint {
 
     async fn probe(&self, path: &Path) -> Result<EndpointProbe<Self::Connection>, ClientError> {
         let mut api = match tokio::time::timeout(ENDPOINT_PROBE_TIMEOUT, connect(path)).await {
-            Err(_) => return Ok(EndpointProbe::Unreachable),
+            Err(_) => {
+                return Ok(EndpointProbe::Unresponsive(
+                    "daemon endpoint connection timed out".to_owned(),
+                ));
+            }
+            Ok(Err(error)) if definitely_inert_connect_error(&error) => {
+                return Ok(EndpointProbe::AbsentOrInert);
+            }
             Ok(Err(error)) if startup_transient(&error) => {
-                return Ok(EndpointProbe::Unreachable);
+                return Ok(EndpointProbe::Unresponsive(error.to_string()));
             }
             Ok(Err(error)) => return Ok(EndpointProbe::Unsafe(error.to_string())),
             Ok(Ok(api)) => api,
@@ -139,11 +146,15 @@ impl DaemonEndpoint for TonicEndpoint {
         )
         .await
         {
-            Err(_) => return Ok(EndpointProbe::Unreachable),
+            Err(_) => {
+                return Ok(EndpointProbe::Unresponsive(
+                    "daemon endpoint handshake timed out".to_owned(),
+                ));
+            }
             Ok(Err(status)) => {
                 let error = ClientError::from(status);
                 if startup_transient(&error) {
-                    return Ok(EndpointProbe::Unreachable);
+                    return Ok(EndpointProbe::Unresponsive(error.to_string()));
                 }
                 return Ok(EndpointProbe::Unsafe(error.to_string()));
             }
@@ -288,6 +299,30 @@ fn startup_transient(error: &ClientError) -> bool {
     }
 }
 
+fn definitely_inert_connect_error(error: &ClientError) -> bool {
+    fn inert(kind: std::io::ErrorKind) -> bool {
+        matches!(
+            kind,
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+        )
+    }
+
+    match error {
+        ClientError::Io(error) => inert(error.kind()),
+        ClientError::Transport(error) => {
+            let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+            while let Some(error) = source {
+                if let Some(error) = error.downcast_ref::<std::io::Error>() {
+                    return inert(error.kind());
+                }
+                source = error.source();
+            }
+            false
+        }
+        ClientError::Rpc(_) | ClientError::Api(_) => false,
+    }
+}
+
 #[cfg(test)]
 fn daemon_launch_environment(
     paths: &DaemonPaths,
@@ -346,9 +381,30 @@ async fn connect(path: &Path) -> Result<GasCanClient<Channel>, ClientError> {
 
 #[cfg(test)]
 mod tests {
-    use super::TokioDaemonSpawner;
+    use super::{ClientError, TokioDaemonSpawner, definitely_inert_connect_error};
     use crate::daemon::{DaemonLaunch, DaemonPaths, DaemonSpawner};
     use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn endpoint_absence_requires_a_definite_connect_error() {
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::ConnectionRefused,
+        ] {
+            assert!(definitely_inert_connect_error(&ClientError::Io(
+                std::io::Error::from(kind)
+            )));
+        }
+        for kind in [
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Other,
+        ] {
+            assert!(!definitely_inert_connect_error(&ClientError::Io(
+                std::io::Error::from(kind)
+            )));
+        }
+    }
 
     #[test]
     fn daemon_launch_environment_sets_normal_paths_and_fresh_owner_token()
