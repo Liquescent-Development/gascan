@@ -1177,20 +1177,9 @@ impl AppleE2e {
     }
 
     pub fn run_pty(&self, argv: &[&str]) -> TestResult<Output> {
-        let pty = rustix_openpty::openpty(None, None)?;
-        let stdin = std::fs::File::from(rustix::io::dup(&pty.user)?);
-        let stdout = std::fs::File::from(rustix::io::dup(&pty.user)?);
         let mut args = vec!["--sandbox", self.id(), "shell", "--"];
         args.extend(argv);
-        let child = self
-            .command(args)
-            .stdin(stdin)
-            .stdout(stdout)
-            .stderr(Stdio::piped())
-            .spawn()?;
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        drop(pty.controller);
-        wait_with_output_bounded(child, std::time::Duration::from_secs(30))
+        run_pty_command(self.command(args), std::time::Duration::from_secs(30))
     }
 
     pub fn run_default_shell_pty_script(
@@ -1854,6 +1843,58 @@ fn run_pty_signal_command(
     signal: rustix_openpty::rustix::process::Signal,
 ) -> TestResult<PtySignalOutput> {
     run_pty_signal_command_after_spawn(command, ready_marker, signal, |_| Ok(()))
+}
+
+fn run_pty_command(mut command: Command, timeout: std::time::Duration) -> TestResult<Output> {
+    let pty = rustix_openpty::openpty(None, None)?;
+    let stdin = std::fs::File::from(rustix::io::dup(&pty.user)?);
+    let stdout = std::fs::File::from(rustix::io::dup(&pty.user)?);
+    let stderr = std::fs::File::from(rustix::io::dup(&pty.user)?);
+    let mut controller = std::fs::File::from(rustix::io::dup(&pty.controller)?);
+    let flags = rustix::fs::fcntl_getfl(&controller)?;
+    rustix::fs::fcntl_setfl(&controller, flags | rustix::fs::OFlags::NONBLOCK)?;
+    let mut child = command.stdin(stdin).stdout(stdout).stderr(stderr).spawn()?;
+    drop(pty.user);
+    drop(pty.controller);
+
+    let result = (|| -> TestResult<Output> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut captured = Vec::new();
+        let status = loop {
+            let read_bytes = read_available_pty_batch(&mut controller, &mut captured, false)?;
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "PTY child exceeded {timeout:?}: {}",
+                    bounded_escaped_pty_output(&captured)
+                )
+                .into());
+            }
+            if read_bytes == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        drain_pty_after_exit(&mut controller, &mut captured)?;
+        Ok(Output {
+            status,
+            stdout: captured,
+            stderr: Vec::new(),
+        })
+    })();
+
+    match result {
+        Ok(output) => Ok(output),
+        Err(error) => return_after_cleanup(
+            error,
+            kill_and_reap_pty_child(
+                &mut child,
+                &mut |child| Ok(child.try_wait()?),
+                &mut std::process::Child::kill,
+            ),
+        ),
+    }
 }
 
 pub fn marker_payload(output: &[u8], begin: &str, end: &str) -> TestResult<String> {
@@ -3659,6 +3700,27 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("was killed/reaped"));
         assert!(message.len() <= (2 * MAX_CAPTURED_PIPE_BYTES) + 256);
+        Ok(())
+    }
+
+    #[test]
+    fn pty_command_waiter_drains_terminal_output_without_child_stdout_pipe() -> TestResult {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "test -t 0 && test -t 1 && test -t 2 && printf GASCAN_PTY_OK",
+        ]);
+
+        let output = run_pty_command(command, std::time::Duration::from_secs(2))?;
+
+        assert!(output.status.success());
+        assert!(
+            output
+                .stdout
+                .windows(b"GASCAN_PTY_OK".len())
+                .any(|window| window == b"GASCAN_PTY_OK")
+        );
+        assert!(output.stderr.is_empty());
         Ok(())
     }
 
