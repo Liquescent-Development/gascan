@@ -36,11 +36,6 @@ captured = bytearray()
 
 def read_until(marker, deadline):
     while marker not in captured:
-        if process.poll() is not None:
-            raise SystemExit(
-                "default shell exited before marker: "
-                + captured[-4096:].decode("utf-8", "backslashreplace")
-            )
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             process.kill()
@@ -51,6 +46,11 @@ def read_until(marker, deadline):
             )
         readable, _, _ = select.select([controller], [], [], min(remaining, 0.1))
         if not readable:
+            if process.poll() is not None:
+                raise SystemExit(
+                    "default shell exited before marker: "
+                    + captured[-4096:].decode("utf-8", "backslashreplace")
+                )
             continue
         try:
             chunk = os.read(controller, 16384)
@@ -60,6 +60,11 @@ def read_until(marker, deadline):
             else:
                 raise
         if not chunk:
+            if process.poll() is not None:
+                raise SystemExit(
+                    "default shell exited before marker: "
+                    + captured[-4096:].decode("utf-8", "backslashreplace")
+                )
             continue
         captured.extend(chunk)
         if len(captured) > 1024 * 1024:

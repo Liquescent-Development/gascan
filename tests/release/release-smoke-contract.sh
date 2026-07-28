@@ -55,6 +55,55 @@ test -s "$probe" || {
   exit 1
 }
 
+python3 - "$probe" <<'PY'
+import ast
+import errno
+import os
+import pty
+import select
+import sys
+import time
+
+source = open(sys.argv[1], encoding="utf-8").read()
+module = ast.parse(source)
+read_until = next(
+    node
+    for node in module.body
+    if isinstance(node, ast.FunctionDef) and node.name == "read_until"
+)
+namespace = {
+    "errno": errno,
+    "os": os,
+    "select": select,
+    "sys": sys,
+    "time": time,
+}
+exec(compile(ast.Module(body=[read_until], type_ignores=[]), sys.argv[1], "exec"), namespace)
+
+
+class ExitedProcess:
+    @staticmethod
+    def poll():
+        return 0
+
+
+controller, user = pty.openpty()
+try:
+    os.write(user, b"GASCAN_RELEASE_SHELL_END\n")
+    namespace.update(
+        controller=controller,
+        captured=bytearray(),
+        process=ExitedProcess(),
+    )
+    namespace["read_until"](
+        b"GASCAN_RELEASE_SHELL_END",
+        time.monotonic() + 1,
+    )
+finally:
+    os.close(user)
+    os.close(controller)
+PY
+
 fake_gascan=$fixture/fake-gascan
 cat >"$fake_gascan" <<'FAKE'
 #!/usr/bin/env bash
