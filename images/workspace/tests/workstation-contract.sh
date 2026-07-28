@@ -112,7 +112,8 @@ test "$(first_line pico --version | awk '{print $1, $2, $3, $4}')" = "$(locked_v
 test "$(first_line gh --version | awk '{print $1, $2, $3}')" = "$(locked_version gh)" ||
     die 'gh normalized version differs from the workstation lock'
 expect_exact "$(locked_version git)" git --version
-expect_exact "starship $(locked_version starship)" /opt/gascan/shell/bin/starship --version
+test "$(first_line /opt/gascan/shell/bin/starship --version)" = "starship $(locked_version starship)" ||
+    die 'starship version differs from the workstation lock'
 test "$(first_line ip -Version | cut -d, -f1,2)" = "$(locked_version ip)" ||
     die 'ip normalized version differs from the workstation lock'
 expect_exact "$(locked_version ss)" ss --version

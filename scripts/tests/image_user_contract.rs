@@ -1751,6 +1751,71 @@ fn workstation_contract_uses_exact_locked_command_versions() {
 }
 
 #[test]
+fn workstation_contract_accepts_only_the_locked_starship_first_line_behaviorally() {
+    let contract =
+        fs::read_to_string(root().join("images/workspace/tests/workstation-contract.sh")).unwrap();
+    let helper_prefix = contract
+        .split_once("locked=/opt/gascan/workstation/versions.json")
+        .unwrap()
+        .0;
+    let lines = contract.lines().collect::<Vec<_>>();
+    let check_index = lines
+        .iter()
+        .position(|line| line.contains("/opt/gascan/shell/bin/starship --version"))
+        .unwrap();
+    let mut check = lines[check_index].to_owned();
+    if check.ends_with("||") {
+        check.push('\n');
+        check.push_str(lines[check_index + 1]);
+    }
+    let check = check.replace("/opt/gascan/shell/bin/starship", "\"$1\"");
+
+    let temporary = tempfile::tempdir().unwrap();
+    let starship = temporary.path().join("starship");
+    fs::write(
+        &starship,
+        "#!/bin/sh\nset -eu\ntest \"$1\" = --version\nprintf '%s' \"$STARSHIP_VERSION_OUTPUT\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&starship, fs::Permissions::from_mode(0o755)).unwrap();
+    let probe = format!(
+        "{helper_prefix}\n\
+         locked_version()\n\
+         {{\n\
+             test \"$1\" = starship\n\
+             printf '%s\\n' 1.25.1\n\
+         }}\n\
+         {check}\n"
+    );
+    let run = |output: &str| {
+        Command::new("sh")
+            .args(["-c", &probe, "sh", starship.to_str().unwrap()])
+            .env("STARSHIP_VERSION_OUTPUT", output)
+            .status()
+            .unwrap()
+    };
+
+    assert!(
+        run("starship 1.25.1\n\
+             branch:master\n\
+             commit_hash:8758daa\n\
+             build_time:2026-04-30 19:35:31 +00:00\n\
+             build_env:rustc 1.95.0 (59807616e 2026-04-14),\n")
+        .success(),
+        "real trailing Starship build metadata was rejected"
+    );
+    assert!(
+        !run("starship 1.25.10\n\
+              branch:master\n\
+              commit_hash:8758daa\n\
+              build_time:2026-04-30 19:35:31 +00:00\n\
+              build_env:rustc 1.95.0 (59807616e 2026-04-14),\n")
+        .success(),
+        "wrong first-line Starship version was accepted"
+    );
+}
+
+#[test]
 fn workstation_home_configuration_is_idempotent_and_refuses_unmanaged_paths() {
     let script = root().join("images/workspace/bin/configure-workstation-home");
     let temp = tempfile::tempdir().unwrap();
