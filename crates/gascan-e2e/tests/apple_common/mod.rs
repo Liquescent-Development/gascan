@@ -2925,6 +2925,85 @@ mod tests {
     }
 
     #[test]
+    fn candidate_runtime_wiring_is_used_by_default_probe_and_replacement_backend() {
+        let source = include_str!("mod.rs");
+        assert!(
+            source.contains(
+                "let candidate = CandidateImageMapping::from_environment()?;\n\
+                 \u{20}       let name = format!(\"gascan-ssh-isolation-{}\", self.owner_token);"
+            ),
+            "default-network probe must validate the candidate mapping"
+        );
+        assert!(
+            source.contains(
+                "candidate.runtime(),\n\
+                 \u{20}               \"python3\",\n\
+                 \u{20}               \"-c\",\n\
+                 \u{20}               DEFAULT_NETWORK_PROBE,"
+            ),
+            "default-network probe must run the validated local candidate tag"
+        );
+        assert!(
+            source.contains(
+                "let backend = gascan_apple::AppleBackend::new(\
+                 CandidateProcessRunner::from_environment()?);"
+            ),
+            "image replacement must use the candidate-aware process runner"
+        );
+    }
+
+    #[test]
+    fn local_candidate_mapping_rejects_invalid_immutable_runtime_pairs() {
+        let digest = "a".repeat(64);
+        for (immutable, runtime) in [
+            (
+                "gascan-workspace:candidate".to_owned(),
+                "gascan-workspace:candidate".to_owned(),
+            ),
+            (
+                format!("gascan-workspace:candidate@sha256:{digest}"),
+                "ghcr.io/gascan-workspace:candidate".to_owned(),
+            ),
+            (
+                format!("gascan-workspace:candidate@sha256:{digest}"),
+                "gascan-workspace:other".to_owned(),
+            ),
+            (
+                format!("gascan-workspace:candidate@sha256:{digest}"),
+                format!("gascan-workspace:candidate@sha256:{digest}"),
+            ),
+        ] {
+            assert!(
+                CandidateImageMapping::new(immutable, runtime).is_err(),
+                "invalid immutable/runtime pair was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn local_candidate_mapping_does_not_rehydrate_wrong_digest_for_exact_runtime() -> TestResult {
+        let immutable = format!("gascan-workspace:candidate@sha256:{}", "a".repeat(64));
+        let mapping =
+            CandidateImageMapping::new(immutable, "gascan-workspace:candidate".to_owned())?;
+        let wrong_digest = serde_json::to_vec(&serde_json::json!([{
+            "configuration": {
+                "image": {
+                    "reference": "gascan-workspace:candidate",
+                    "descriptor": {
+                        "digest": format!("sha256:{}", "b".repeat(64))
+                    }
+                }
+            }
+        }]))?;
+
+        assert_eq!(
+            mapping.rehydrate_candidate_inspect(wrong_digest.clone()),
+            wrong_digest
+        );
+        Ok(())
+    }
+
+    #[test]
     fn apple_image_object_and_canonical_ghcr_reference_preserve_exact_digest_identity() {
         let digest = format!("sha256:{}", "a".repeat(64));
         let tagged = format!("ghcr.io/liquescent-development/gascan/workspace:v1.2.3@{digest}");
