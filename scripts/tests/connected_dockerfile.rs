@@ -1537,6 +1537,7 @@ fn dockerfile_prints_safe_mise_version_metadata_only_when_the_lock_comparison_fa
 fn shell_assets_are_immutable_and_wired_after_identity_migration() {
     let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
     for required in [
+        "RUN install -d -o root -g root -m 0555 /etc/gascan",
         "COPY --chmod=0444 images/workspace/etc/gascan/bashrc /etc/gascan/bashrc",
         "COPY --chmod=0444 images/workspace/etc/gascan/starship.toml /opt/gascan/shell/presets/starship.toml",
         "COPY --chmod=0444 images/workspace/etc/gascan/starship-nerd-font.toml /opt/gascan/shell/presets/starship-nerd-font.toml",
@@ -1550,6 +1551,16 @@ fn shell_assets_are_immutable_and_wired_after_identity_migration() {
             "missing managed shell image boundary: {required}"
         );
     }
+    let gascan_directory = dockerfile
+        .find("RUN install -d -o root -g root -m 0555 /etc/gascan")
+        .unwrap();
+    let bashrc_copy = dockerfile
+        .find("COPY --chmod=0444 images/workspace/etc/gascan/bashrc /etc/gascan/bashrc")
+        .unwrap();
+    assert!(
+        gascan_directory < bashrc_copy,
+        "the traversable root-owned directory must exist before its immutable hook"
+    );
     let migration = dockerfile
         .find("/usr/local/bin/migrate-workspace-identity")
         .unwrap();

@@ -86,6 +86,7 @@ COPY --chmod=0555 images/workspace/bin/run-workstation-step /usr/local/bin/run-w
 COPY --chmod=0555 images/workspace/bin/configure-workstation-home /usr/local/bin/configure-workstation-home
 COPY --chmod=0555 images/workspace/bin/configure-shell-home /usr/local/bin/configure-shell-home
 COPY --chmod=0555 images/workspace/bin/initialize-rust-home /usr/local/bin/initialize-rust-home
+RUN install -d -o root -g root -m 0555 /etc/gascan
 COPY --chmod=0444 images/workspace/etc/gascan/bashrc /etc/gascan/bashrc
 COPY --chmod=0444 images/workspace/etc/gascan/starship.toml /opt/gascan/shell/presets/starship.toml
 COPY --chmod=0444 images/workspace/etc/gascan/starship-nerd-font.toml /opt/gascan/shell/presets/starship-nerd-font.toml

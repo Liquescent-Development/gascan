@@ -366,6 +366,28 @@ fn managed_shell_inputs_are_sealed_into_the_connected_context() {
 }
 
 #[test]
+fn managed_shell_directory_creation_precedes_the_sealed_hook_copy() {
+    let fixture = Fixture::new();
+    let output = fixture.run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dockerfile = fs::read_to_string(fixture.context.join("Dockerfile")).unwrap();
+    let directory = dockerfile
+        .find("RUN install -d -o root -g root -m 0555 /etc/gascan")
+        .unwrap();
+    let hook = dockerfile
+        .find("COPY --chmod=0444 images/workspace/etc/gascan/bashrc /etc/gascan/bashrc")
+        .unwrap();
+    assert!(
+        directory < hook,
+        "connected context can reproduce an untraversable implicit /etc/gascan"
+    );
+}
+
+#[test]
 fn docker_copy_parser_is_structural_and_fail_closed() {
     let parsed = parse_dockerfile_copies("  copy --chmod=0555 a b /dest\nCOPY --from=builder /out /dest\nCOPY name--from=value /dest\n").unwrap();
     assert_eq!(parsed[0].sources, ["a", "b"]);

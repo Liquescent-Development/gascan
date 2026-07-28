@@ -141,6 +141,10 @@ test "$MISE_DATA_DIR" = /home/workspace/.local/share/mise ||
 test "$SHELL" = /bin/bash || die 'interactive shell environment differs from image policy'
 test -r /usr/share/bash-completion/bash_completion ||
     die 'Bash completion framework is unavailable'
+test "$(stat -c %U:%G:%a /etc/gascan)" = root:root:555 ||
+    die 'immutable Gas Can configuration directory metadata changed'
+test -x /etc/gascan ||
+    die 'immutable Gas Can configuration directory is not traversable'
 test -r /etc/gascan/bashrc || die 'immutable Bash hook is unavailable'
 test "$(stat -c %U:%G:%a /etc/gascan/bashrc)" = root:root:444 ||
     die 'immutable Bash hook metadata changed'

@@ -1751,6 +1751,24 @@ fn workstation_contract_uses_exact_locked_command_versions() {
 }
 
 #[test]
+fn workstation_contract_requires_a_traversable_managed_hook_directory() {
+    let contract =
+        fs::read_to_string(root().join("images/workspace/tests/workstation-contract.sh")).unwrap();
+    assert!(
+        contract.contains(r#"test "$(stat -c %U:%G:%a /etc/gascan)" = root:root:555"#),
+        "workstation smoke does not pin the managed hook directory boundary"
+    );
+    assert!(
+        contract.contains("test -x /etc/gascan"),
+        "workspace smoke does not prove it can traverse the managed hook directory"
+    );
+    assert!(
+        contract.contains("test -r /etc/gascan/bashrc"),
+        "workspace smoke does not prove it can read the immutable hook"
+    );
+}
+
+#[test]
 fn workstation_contract_accepts_only_the_locked_starship_first_line_behaviorally() {
     let contract =
         fs::read_to_string(root().join("images/workspace/tests/workstation-contract.sh")).unwrap();
