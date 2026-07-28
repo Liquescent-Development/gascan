@@ -19,7 +19,7 @@ const INSTANCE_NAME: &str = "daemon-instance.json";
 const LIFECYCLE_LOCK_NAME: &str = "daemon-lifecycle.lock";
 const MAX_INSTANCE_BYTES: u64 = 64 * 1024;
 const LIFECYCLE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 const PROCESS_INSPECTION_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -525,11 +525,34 @@ fn validate_file_stat(stat: &rustix::fs::Stat, expected_uid: u32) -> io::Result<
 }
 
 #[cfg(target_os = "linux")]
-fn inspect_process(pid: u32, _expected_executable: &Path) -> io::Result<Option<ProcessIdentity>> {
+fn inspect_process(pid: u32, expected_executable: &Path) -> io::Result<Option<ProcessIdentity>> {
     if pid == 0 {
         return Ok(None);
     }
     let process = PathBuf::from("/proc").join(pid.to_string());
+    let Some(start_identity) = linux_start_identity(&process)? else {
+        return Ok(None);
+    };
+    let executable = match std::fs::read_link(process.join("exe")) {
+        Ok(value) => value.canonicalize()?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let Some(rechecked_start) = linux_start_identity(&process)? else {
+        return Ok(None);
+    };
+    coherent_process_identity(
+        pid,
+        expected_executable,
+        start_identity,
+        executable,
+        rechecked_start,
+    )
+    .map(Some)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_start_identity(process: &Path) -> io::Result<Option<String>> {
     let stat = match std::fs::read_to_string(process.join("stat")) {
         Ok(value) => value,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -550,85 +573,157 @@ fn inspect_process(pid: u32, _expected_executable: &Path) -> io::Result<Option<P
             "process stat lacks start identity",
         )
     })?;
-    let executable = match std::fs::read_link(process.join("exe")) {
-        Ok(value) => value.canonicalize()?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    Ok(Some(ProcessIdentity {
-        pid,
-        executable,
-        start_identity: format!("linux:{start}"),
-    }))
+    Ok(Some(format!("linux:{start}")))
 }
 
-#[cfg(not(target_os = "linux"))]
-fn inspect_process(pid: u32, expected_executable: &Path) -> io::Result<Option<ProcessIdentity>> {
-    inspect_process_with(pid, expected_executable, |field| ps_field(pid, field))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn inspect_process_with<F>(
+fn coherent_process_identity(
     pid: u32,
     expected_executable: &Path,
-    mut field: F,
-) -> io::Result<Option<ProcessIdentity>>
-where
-    F: FnMut(&str) -> io::Result<Option<String>>,
-{
-    if pid == 0 {
-        return Ok(None);
-    }
-    let Some(start_identity) = field("lstart=")? else {
-        return Ok(None);
-    };
-    let Some(command) = field("command=")? else {
-        return Ok(None);
-    };
-    let Some(rechecked_start) = field("lstart=")? else {
-        return Ok(None);
-    };
+    start_identity: String,
+    executable: PathBuf,
+    rechecked_start: String,
+) -> io::Result<ProcessIdentity> {
     if start_identity != rechecked_start {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "process identity changed during inspection",
         ));
     }
-    require_expected_command(&command, expected_executable)?;
-    Ok(Some(ProcessIdentity {
-        pid,
-        executable: expected_executable.to_owned(),
-        start_identity,
-    }))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn require_expected_command(command: &str, expected_executable: &Path) -> io::Result<()> {
-    let expected = expected_executable.to_str().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "expected daemon executable path is not UTF-8",
-        )
-    })?;
-    let exact_prefix = command.strip_prefix(expected).is_some_and(|suffix| {
-        suffix.is_empty() || suffix.chars().next().is_some_and(char::is_whitespace)
-    });
-    let first_word_matches = command
-        .split_whitespace()
-        .next()
-        .and_then(|candidate| Path::new(candidate).canonicalize().ok())
-        .is_some_and(|candidate| candidate == expected_executable);
-    if exact_prefix || first_word_matches {
-        Ok(())
-    } else {
-        Err(io::Error::new(
+    if executable != expected_executable {
+        return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "live process executable does not match daemon attestation",
+        ));
+    }
+    Ok(ProcessIdentity {
+        pid,
+        executable,
+        start_identity,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn inspect_process(pid: u32, expected_executable: &Path) -> io::Result<Option<ProcessIdentity>> {
+    inspect_process_with(
+        pid,
+        expected_executable,
+        || ps_field(pid, "lstart="),
+        || lsof_executable(pid),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn inspect_process_with<S, E>(
+    pid: u32,
+    expected_executable: &Path,
+    mut start: S,
+    mut executable: E,
+) -> io::Result<Option<ProcessIdentity>>
+where
+    S: FnMut() -> io::Result<Option<String>>,
+    E: FnMut() -> io::Result<Option<PathBuf>>,
+{
+    if pid == 0 {
+        return Ok(None);
+    }
+    let Some(start_identity) = start()? else {
+        return Ok(None);
+    };
+    let Some(executable) = executable()? else {
+        return Ok(None);
+    };
+    let Some(rechecked_start) = start()? else {
+        return Ok(None);
+    };
+    coherent_process_identity(
+        pid,
+        expected_executable,
+        start_identity,
+        executable,
+        rechecked_start,
+    )
+    .map(Some)
+}
+
+#[cfg(target_os = "macos")]
+fn lsof_executable(pid: u32) -> io::Result<Option<PathBuf>> {
+    use std::process::Stdio;
+    let mut child = std::process::Command::new("/usr/sbin/lsof")
+        .args(["-a", "-p", &pid.to_string(), "-d", "txt", "-F0fn"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = Instant::now() + PROCESS_INSPECTION_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let output = child.wait_with_output()?;
+            if !status.success() {
+                return Ok(None);
+            }
+            return parse_lsof_executable(&output.stdout, pid);
+        }
+        if Instant::now() >= deadline {
+            child.kill()?;
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "process executable inspection timed out",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn parse_lsof_executable(output: &[u8], pid: u32) -> io::Result<Option<PathBuf>> {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let mut matched_process = false;
+    let mut awaiting_text_name = false;
+    for raw_field in output.split(|byte| *byte == 0) {
+        let field = raw_field.strip_prefix(b"\n").unwrap_or(raw_field);
+        let field = field.strip_prefix(b"\r").unwrap_or(field);
+        if let Some(value) = field.strip_prefix(b"p") {
+            let observed = std::str::from_utf8(value)
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok());
+            if observed != Some(pid) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "process executable inspection returned a different process",
+                ));
+            }
+            matched_process = true;
+            awaiting_text_name = false;
+        } else if field == b"ftxt" && matched_process {
+            awaiting_text_name = true;
+        } else if awaiting_text_name {
+            let Some(path) = field.strip_prefix(b"n") else {
+                continue;
+            };
+            let path = PathBuf::from(OsString::from_vec(path.to_vec()));
+            if !path.is_absolute() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "process executable inspection returned a relative path",
+                ));
+            }
+            return Ok(Some(path));
+        }
+    }
+    if matched_process {
+        Ok(None)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process executable inspection omitted the process record",
         ))
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn ps_field(pid: u32, field: &str) -> io::Result<Option<String>> {
     use std::process::Stdio;
     let mut child = std::process::Command::new("/bin/ps")
@@ -665,6 +760,14 @@ fn ps_field(pid: u32, field: &str) -> io::Result<Option<String>> {
     }
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn inspect_process(_pid: u32, _expected_executable: &Path) -> io::Result<Option<ProcessIdentity>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "daemon process attestation is supported only on Linux and macOS",
+    ))
+}
+
 fn errno(error: rustix::io::Errno) -> io::Error {
     io::Error::from_raw_os_error(error.raw_os_error())
 }
@@ -673,9 +776,11 @@ fn errno(error: rustix::io::Errno) -> io::Error {
 mod tests {
     use super::{
         DaemonInstanceRecord, DaemonPaths, InstanceTimestamp, OsProcessInspector, ProcessIdentity,
-        ProcessInspector, ProcessSignaler, checked_pid, inspect_process_with,
+        ProcessInspector, ProcessSignaler, checked_pid, coherent_process_identity,
         read_attested_instance, read_instance_record_with_hook, signal_attested_with,
     };
+    #[cfg(target_os = "macos")]
+    use super::{inspect_process_with, parse_lsof_executable};
     use std::fs;
     use std::io;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -1025,40 +1130,93 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(not(target_os = "linux"))]
     #[test]
     fn attestation_process_snapshot_rejects_changed_start_identity() -> TestResult {
-        let expected = Path::new("/trusted/gascand");
-        let mut values = [
-            Some("Mon Jul 28 12:00:00 2026".to_owned()),
-            Some("/trusted/gascand --flag".to_owned()),
-            Some("Mon Jul 28 12:00:01 2026".to_owned()),
-        ]
-        .into_iter();
-        let result = inspect_process_with(7, expected, |_| {
-            values
-                .next()
-                .ok_or_else(|| io::Error::other("unexpected process field request"))
-        });
+        let result = coherent_process_identity(
+            7,
+            Path::new("/trusted/gascand"),
+            "start:one".to_owned(),
+            PathBuf::from("/trusted/gascand"),
+            "start:two".to_owned(),
+        );
         assert!(result.is_err());
         Ok(())
     }
 
-    #[cfg(not(target_os = "linux"))]
     #[test]
-    fn attestation_process_snapshot_handles_executable_paths_with_spaces() -> TestResult {
-        let expected = Path::new("/trusted/path with spaces/gascand");
-        let mut values = [
+    fn attestation_process_snapshot_rejects_different_executable() -> TestResult {
+        let result = coherent_process_identity(
+            7,
+            Path::new("/trusted/gascand"),
+            "start:one".to_owned(),
+            PathBuf::from("/attacker/gascand"),
+            "start:one".to_owned(),
+        );
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn attestation_macos_snapshot_uses_observed_executable_not_argv() -> TestResult {
+        let expected = Path::new("/trusted/gascand");
+        let mut starts = [
             Some("Mon Jul 28 12:00:00 2026".to_owned()),
-            Some("/trusted/path with spaces/gascand --flag".to_owned()),
             Some("Mon Jul 28 12:00:00 2026".to_owned()),
         ]
         .into_iter();
-        let identity = inspect_process_with(7, expected, |_| {
-            values
-                .next()
-                .ok_or_else(|| io::Error::other("unexpected process field request"))
-        })?
+        let result = inspect_process_with(
+            7,
+            expected,
+            || {
+                starts
+                    .next()
+                    .ok_or_else(|| io::Error::other("unexpected start identity request"))
+            },
+            || Ok(Some(PathBuf::from("/attacker/gascand"))),
+        );
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn attestation_macos_parser_selects_first_kernel_text_vnode() -> TestResult {
+        let output = b"p7\0\nftxt\0n/trusted/path with spaces/gascand\0\nftxt\0n/usr/lib/dyld\0\n";
+        assert_eq!(
+            parse_lsof_executable(output, 7)?,
+            Some(PathBuf::from("/trusted/path with spaces/gascand"))
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn attestation_macos_parser_rejects_wrong_process_record() -> TestResult {
+        let output = b"p8\0\nftxt\0n/trusted/gascand\0\n";
+        assert!(parse_lsof_executable(output, 7).is_err());
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn attestation_process_snapshot_handles_executable_paths_with_spaces() -> TestResult {
+        let expected = Path::new("/trusted/path with spaces/gascand");
+        let mut starts = [
+            Some("Mon Jul 28 12:00:00 2026".to_owned()),
+            Some("Mon Jul 28 12:00:00 2026".to_owned()),
+        ]
+        .into_iter();
+        let identity = inspect_process_with(
+            7,
+            expected,
+            || {
+                starts
+                    .next()
+                    .ok_or_else(|| io::Error::other("unexpected start identity request"))
+            },
+            || Ok(Some(expected.to_owned())),
+        )?
         .ok_or("snapshot was unexpectedly absent")?;
         assert_eq!(identity.executable, expected);
         Ok(())

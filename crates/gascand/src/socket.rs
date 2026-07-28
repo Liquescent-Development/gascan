@@ -2,6 +2,7 @@ use base64::Engine as _;
 use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::process::geteuid;
+use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::io::{self, Write as _};
 #[cfg(target_os = "linux")]
@@ -186,6 +187,19 @@ pub(crate) fn write_instance_record(
     path: &Path,
     contents: &[u8],
 ) -> io::Result<OwnedInstanceRecord> {
+    write_instance_record_with_hooks(path, contents, |_, _| Ok(()), |_, _| Ok(()))
+}
+
+fn write_instance_record_with_hooks<B, A>(
+    path: &Path,
+    contents: &[u8],
+    before_publish: B,
+    after_publish: A,
+) -> io::Result<OwnedInstanceRecord>
+where
+    B: FnOnce(&OwnedFd, &str) -> io::Result<()>,
+    A: FnOnce(&OwnedFd, &OsStr) -> io::Result<()>,
+{
     if !path.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -237,6 +251,16 @@ pub(crate) fn write_instance_record(
     let mut file = std::fs::File::from(fd);
     file.write_all(contents)?;
     file.sync_all()?;
+    before_publish(&directory, &staging)?;
+    let staging_stat = rustix::fs::statat(&directory, staging.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(errno)?;
+    validate_regular_file(&staging_stat)?;
+    if identity_at(&directory, &staging)? != identity {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "daemon instance staging file changed before publication",
+        ));
+    }
     rustix::fs::renameat_with(
         &directory,
         staging.as_str(),
@@ -245,26 +269,28 @@ pub(crate) fn write_instance_record(
         rustix::fs::RenameFlags::NOREPLACE,
     )
     .map_err(errno)?;
-    staging_guard.disarm();
-    drop(staging_guard);
-    let published = OwnedInstanceRecord {
-        directory,
-        name: name.to_owned(),
-        identity,
-    };
-    if identity_at(&published.directory, &published.name)? != identity {
+    staging_guard.retarget(name);
+    after_publish(&directory, name)?;
+    if identity_at(&directory, name)? != identity {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "daemon instance record changed while publishing it",
         ));
     }
-    Ok(published)
+    staging_guard.disarm();
+    drop(staging_guard);
+    Ok(OwnedInstanceRecord {
+        directory,
+        name: name.to_owned(),
+        identity,
+    })
 }
 
 struct RegularStagingGuard<'a> {
     directory: &'a OwnedFd,
-    name: &'a str,
+    name: Cow<'a, OsStr>,
     identity: Identity,
+    published: bool,
     armed: bool,
 }
 
@@ -276,10 +302,16 @@ impl RegularStagingGuard<'_> {
     ) -> RegularStagingGuard<'a> {
         RegularStagingGuard {
             directory,
-            name,
+            name: Cow::Borrowed(OsStr::new(name)),
             identity,
+            published: false,
             armed: true,
         }
+    }
+
+    fn retarget(&mut self, name: &OsStr) {
+        self.name = Cow::Owned(name.to_owned());
+        self.published = true;
     }
 
     fn disarm(&mut self) {
@@ -290,7 +322,15 @@ impl RegularStagingGuard<'_> {
 impl Drop for RegularStagingGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            let _ = remove_regular_identity(self.directory, OsStr::new(self.name), self.identity);
+            if self.published {
+                let _ = quarantine_rejected_publication(
+                    self.directory,
+                    self.name.as_ref(),
+                    self.identity,
+                );
+            } else {
+                let _ = remove_regular_identity(self.directory, self.name.as_ref(), self.identity);
+            }
         }
     }
 }
@@ -314,25 +354,22 @@ fn remove_regular_identity(
     source: &OsStr,
     expected: Identity,
 ) -> io::Result<()> {
-    remove_regular_identity_with_hook(directory, source, expected, || Ok(()))
+    remove_regular_identity_with_hooks(directory, source, expected, || Ok(()), |_| Ok(()))
 }
 
-fn remove_regular_identity_with_hook<F>(
+fn remove_regular_identity_with_hooks<R, D>(
     directory: &OwnedFd,
     source: &OsStr,
     expected: Identity,
-    before_restore: F,
+    before_restore: R,
+    before_delete_requarantine: D,
 ) -> io::Result<()>
 where
-    F: FnOnce() -> io::Result<()>,
+    R: FnOnce() -> io::Result<()>,
+    D: FnOnce(&str) -> io::Result<()>,
 {
     let quarantine = loop {
-        let sequence = QUARANTINE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let candidate = format!(
-            ".instance-cleanup-{}-{}-{sequence}",
-            std::process::id(),
-            expected.inode
-        );
+        let candidate = quarantine_name("instance-cleanup", expected);
         match rustix::fs::renameat_with(
             directory,
             source,
@@ -350,7 +387,44 @@ where
     let stat = rustix::fs::statat(directory, quarantine.as_str(), AtFlags::SYMLINK_NOFOLLOW)
         .map_err(errno)?;
     if moved == expected && FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile {
-        rustix::fs::unlinkat(directory, quarantine.as_str(), AtFlags::empty()).map_err(errno)
+        before_delete_requarantine(&quarantine)?;
+        let deletion = loop {
+            let candidate = quarantine_name("instance-delete", expected);
+            match rustix::fs::renameat_with(
+                directory,
+                quarantine.as_str(),
+                directory,
+                candidate.as_str(),
+                rustix::fs::RenameFlags::NOREPLACE,
+            ) {
+                Ok(()) => break candidate,
+                Err(error) if error == rustix::io::Errno::EXIST => continue,
+                Err(error) if error == rustix::io::Errno::NOENT => return Ok(()),
+                Err(error) => return Err(errno(error)),
+            }
+        };
+        let deletion_identity = identity_at(directory, &deletion)?;
+        let deletion_stat =
+            rustix::fs::statat(directory, deletion.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(errno)?;
+        if deletion_identity == expected
+            && FileType::from_raw_mode(deletion_stat.st_mode) == FileType::RegularFile
+        {
+            rustix::fs::unlinkat(directory, deletion.as_str(), AtFlags::empty()).map_err(errno)
+        } else {
+            before_restore()?;
+            let _ = rustix::fs::renameat_with(
+                directory,
+                deletion.as_str(),
+                directory,
+                source,
+                rustix::fs::RenameFlags::NOREPLACE,
+            );
+            Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "daemon instance record changed at the cleanup boundary",
+            ))
+        }
     } else {
         before_restore()?;
         let _ = rustix::fs::renameat_with(
@@ -363,6 +437,48 @@ where
         Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             "daemon instance record changed during cleanup",
+        ))
+    }
+}
+
+fn quarantine_name(purpose: &str, expected: Identity) -> String {
+    let sequence = QUARANTINE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        ".{purpose}-{}-{}-{sequence}",
+        std::process::id(),
+        expected.inode
+    )
+}
+
+fn quarantine_rejected_publication(
+    directory: &OwnedFd,
+    source: &OsStr,
+    expected: Identity,
+) -> io::Result<()> {
+    let quarantine = loop {
+        let candidate = quarantine_name("instance-rejected", expected);
+        match rustix::fs::renameat_with(
+            directory,
+            source,
+            directory,
+            candidate.as_str(),
+            rustix::fs::RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => break candidate,
+            Err(error) if error == rustix::io::Errno::EXIST => continue,
+            Err(error) if error == rustix::io::Errno::NOENT => return Ok(()),
+            Err(error) => return Err(errno(error)),
+        }
+    };
+    let moved = identity_at(directory, &quarantine)?;
+    let stat = rustix::fs::statat(directory, quarantine.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(errno)?;
+    if moved == expected && FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile {
+        remove_regular_identity(directory, OsStr::new(&quarantine), expected)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "replacement was quarantined after rejected instance publication",
         ))
     }
 }
@@ -683,6 +799,7 @@ mod tests {
         resolved_path,
     };
     use std::fs;
+    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
     use std::os::unix::net::UnixListener;
 
@@ -747,6 +864,72 @@ mod tests {
     }
 
     #[test]
+    fn instance_record_revalidates_staging_at_publication_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?.join("runtime");
+        let path = root.join("daemon-instance.json");
+        let result = super::write_instance_record_with_hooks(
+            &path,
+            b"managed",
+            |directory, name| {
+                rustix::fs::unlinkat(directory, name, rustix::fs::AtFlags::empty())?;
+                let replacement = rustix::fs::openat(
+                    directory,
+                    name,
+                    rustix::fs::OFlags::WRONLY
+                        | rustix::fs::OFlags::CREATE
+                        | rustix::fs::OFlags::EXCL
+                        | rustix::fs::OFlags::NOFOLLOW,
+                    rustix::fs::Mode::from_raw_mode(0o600),
+                )?;
+                std::fs::File::from(replacement).write_all(b"replacement")?;
+                Ok(())
+            },
+            |_, _| Ok(()),
+        );
+        assert!(result.is_err());
+        assert!(!path.exists(), "replacement staging file was published");
+        Ok(())
+    }
+
+    #[test]
+    fn instance_record_quarantines_replacement_detected_after_publication()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?.join("runtime");
+        let path = root.join("daemon-instance.json");
+        let result = super::write_instance_record_with_hooks(
+            &path,
+            b"managed",
+            |_, _| Ok(()),
+            |directory, name| {
+                rustix::fs::unlinkat(directory, name, rustix::fs::AtFlags::empty())?;
+                let replacement = rustix::fs::openat(
+                    directory,
+                    name,
+                    rustix::fs::OFlags::WRONLY
+                        | rustix::fs::OFlags::CREATE
+                        | rustix::fs::OFlags::EXCL
+                        | rustix::fs::OFlags::NOFOLLOW,
+                    rustix::fs::Mode::from_raw_mode(0o600),
+                )?;
+                std::fs::File::from(replacement).write_all(b"replacement")?;
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!path.exists(), "replacement remained at the managed path");
+        assert!(
+            fs::read_dir(&root)?.any(|entry| entry.is_ok_and(|entry| {
+                fs::read(entry.path()).is_ok_and(|contents| contents == b"replacement")
+            })),
+            "replacement was deleted instead of quarantined"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn instance_staging_cleanup_preserves_replacement() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
         let root = temp.path().canonicalize()?.join("runtime");
@@ -778,7 +961,7 @@ mod tests {
         fs::write(root.join(name), b"replacement")?;
         fs::set_permissions(root.join(name), fs::Permissions::from_mode(0o600))?;
 
-        let result = super::remove_regular_identity_with_hook(
+        let result = super::remove_regular_identity_with_hooks(
             &directory,
             std::ffi::OsStr::new(name),
             original,
@@ -786,9 +969,42 @@ mod tests {
                 fs::write(root.join(name), b"successor")?;
                 fs::set_permissions(root.join(name), fs::Permissions::from_mode(0o600))
             },
+            |_| Ok(()),
         );
         assert!(result.is_err());
         assert_eq!(fs::read(root.join(name))?, b"successor");
+        Ok(())
+    }
+
+    #[test]
+    fn instance_cleanup_revalidates_quarantine_at_unlink_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?.join("runtime");
+        let directory = super::open_private_directory(&root)?;
+        let name = "daemon-instance.json";
+        fs::write(root.join(name), b"original")?;
+        fs::set_permissions(root.join(name), fs::Permissions::from_mode(0o600))?;
+        let original = super::identity_at(&directory, name)?;
+
+        let result = super::remove_regular_identity_with_hooks(
+            &directory,
+            std::ffi::OsStr::new(name),
+            original,
+            || Ok(()),
+            |quarantine| {
+                fs::remove_file(root.join(quarantine))?;
+                fs::write(root.join(quarantine), b"replacement")?;
+                fs::set_permissions(root.join(quarantine), fs::Permissions::from_mode(0o600))
+            },
+        );
+        assert!(result.is_err());
+        assert!(
+            fs::read_dir(&root)?.any(|entry| entry.is_ok_and(|entry| {
+                fs::read(entry.path()).is_ok_and(|contents| contents == b"replacement")
+            })),
+            "replacement at the quarantine name was unlinked"
+        );
         Ok(())
     }
 
