@@ -65,6 +65,13 @@ impl E2eProcessRunner {
         }
         spec
     }
+
+    fn should_rehydrate_inspect(&self, spec: &CommandSpec) -> bool {
+        self.candidate.is_some()
+            && spec.program == "container"
+            && spec.args.len() == 2
+            && spec.args.first().map(String::as_str) == Some("inspect")
+    }
 }
 
 fn validate_e2e_candidate_mapping(
@@ -89,8 +96,62 @@ impl CommandRunner for E2eProcessRunner {
         &self,
         spec: CommandSpec,
     ) -> Result<gascan_apple::CommandOutput, gascan_core::runtime::RuntimeError> {
-        ProcessRunner.run(self.rewrite(spec)).await
+        let rehydrate_inspect = self.should_rehydrate_inspect(&spec);
+        let mut output = ProcessRunner.run(self.rewrite(spec)).await?;
+        if rehydrate_inspect {
+            if let Some(candidate) = &self.candidate {
+                output.stdout = rehydrate_e2e_inspect(output.stdout, candidate);
+            }
+        }
+        Ok(output)
     }
+}
+
+fn rehydrate_e2e_inspect(bytes: Vec<u8>, candidate: &E2eCandidateMapping) -> Vec<u8> {
+    let Some(expected_digest) = candidate
+        .immutable
+        .rsplit_once('@')
+        .map(|(_, digest)| digest)
+    else {
+        return bytes;
+    };
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return bytes;
+    };
+    let Some(records) = value.as_array_mut() else {
+        return bytes;
+    };
+    let mut changed = false;
+    for record in records {
+        let Some(image) = record
+            .as_object_mut()
+            .and_then(|record| record.get_mut("configuration"))
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|configuration| configuration.get_mut("image"))
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        let exact_reference = image.get("reference").and_then(serde_json::Value::as_str)
+            == Some(candidate.runtime.as_str());
+        let exact_digest = image
+            .get("descriptor")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|descriptor| descriptor.get("digest"))
+            .and_then(serde_json::Value::as_str)
+            == Some(expected_digest);
+        if exact_reference && exact_digest {
+            image.insert(
+                "reference".to_owned(),
+                serde_json::Value::String(candidate.immutable.clone()),
+            );
+            changed = true;
+        }
+    }
+    if !changed {
+        return bytes;
+    }
+    serde_json::to_vec(&value).unwrap_or(bytes)
 }
 
 #[async_trait::async_trait]
@@ -559,6 +620,69 @@ mod e2e_candidate_tests {
                 validate_e2e_candidate_mapping(IMMUTABLE.to_owned(), runtime.to_owned()).is_err()
             );
         }
+    }
+
+    #[test]
+    fn rehydrates_only_the_matching_structured_inspect_image(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mapping = validate_e2e_candidate_mapping(IMMUTABLE.to_owned(), RUNTIME.to_owned())?;
+        let matching = serde_json::to_vec(&serde_json::json!([{
+            "configuration": {
+                "id": "sandbox",
+                "image": {
+                    "reference": RUNTIME,
+                    "descriptor": {
+                        "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    }
+                }
+            }
+        }]))?;
+        let rehydrated: serde_json::Value =
+            serde_json::from_slice(&rehydrate_e2e_inspect(matching, &mapping))?;
+        assert_eq!(
+            rehydrated[0]["configuration"]["image"]["reference"],
+            IMMUTABLE
+        );
+
+        for unchanged in [
+            b"not-json".to_vec(),
+            serde_json::to_vec(&serde_json::json!([{
+                "configuration": {
+                    "image": {
+                        "reference": "gascan-workspace:foreign",
+                        "descriptor": {
+                            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        }
+                    }
+                }
+            }]))?,
+            serde_json::to_vec(&serde_json::json!([{
+                "configuration": {
+                    "image": {
+                        "reference": RUNTIME,
+                        "descriptor": {
+                            "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        }
+                    }
+                }
+            }]))?,
+            serde_json::to_vec(&serde_json::json!([{
+                "other": {
+                    "image": {
+                        "reference": RUNTIME,
+                        "descriptor": {
+                            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        }
+                    }
+                }
+            }]))?,
+        ] {
+            assert_eq!(
+                rehydrate_e2e_inspect(unchanged.clone(), &mapping),
+                unchanged
+            );
+        }
+        Ok(())
     }
 }
 
