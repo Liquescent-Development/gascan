@@ -1,6 +1,6 @@
 case $- in *i*) ;; *) return 0 2>/dev/null || exit 0;; esac
 
-__gascan_inherited_debug_trap=$(trap -p DEBUG)
+__gascan_inherited_debug_trap=$(builtin trap -p DEBUG)
 
 __gascan_starship_warn()
 {
@@ -91,9 +91,32 @@ __gascan_starship_emit_variable()
     fi
 }
 
+__gascan_starship_capture_expectations()
+{
+    local name declaration index=0
+    local -a commit_variables=(
+        PS0 PS1 PS2 PROMPT_COMMAND preexec_functions precmd_functions
+        STARSHIP_CONFIG STARSHIP_EXECUTABLE STARSHIP_PREEXEC_READY
+        STARSHIP_START_TIME STARSHIP_PROMPT_COMMAND STARSHIP_DEBUG_TRAP
+        STARSHIP_SHELL STARSHIP_SESSION_KEY
+    )
+
+    for name in "${commit_variables[@]}"; do
+        if declaration=$(builtin declare -p "$name" 2>/dev/null); then
+            printf '__gascan_expected_variable_set[%d]=1\n' "$index"
+            printf '__gascan_expected_variable_declaration[%d]=%q\n' \
+                "$index" "$declaration"
+        else
+            printf '__gascan_expected_variable_set[%d]=0\n' "$index"
+        fi
+        index=$((index + 1))
+    done
+}
+
 __gascan_starship_emit_commit()
 {
-    local name trap_command shopt_command function_declaration
+    local guarded=${1:-0}
+    local name trap_command shopt_command function_declaration index=0
     local -a commit_functions=(
         _starship_set_return starship_preexec starship_precmd
         starship_preexec_all starship_preexec_ps0
@@ -106,6 +129,10 @@ __gascan_starship_emit_commit()
     )
 
     for name in "${commit_functions[@]}"; do
+        if [ "$guarded" = 1 ]; then
+            printf 'if builtin declare -F %q >/dev/null; then return 1; fi\n' \
+                "$name"
+        fi
         if declare -F "$name" >/dev/null; then
             function_declaration=$(declare -f "$name")
             printf '%s || return 1\n' "$function_declaration"
@@ -114,22 +141,38 @@ __gascan_starship_emit_commit()
         fi
     done
     for name in "${commit_variables[@]}"; do
+        if [ "$guarded" = 1 ]; then
+            if [ "${__gascan_expected_variable_set[$index]}" = 1 ]; then
+                printf 'if [ "$(builtin declare -p %q 2>/dev/null)" != %q ]; then return 1; fi\n' \
+                    "$name" \
+                    "${__gascan_expected_variable_declaration[$index]}"
+            else
+                printf 'if builtin declare -p %q >/dev/null 2>&1; then return 1; fi\n' \
+                    "$name"
+            fi
+        fi
         __gascan_starship_emit_variable "$name"
+        index=$((index + 1))
     done
     shopt_command=$(shopt -p checkwinsize)
     printf '%s || return 1\n' "$shopt_command"
-    trap_command=$(trap -p DEBUG)
+    trap_command=$(builtin trap -p DEBUG)
     if [ -n "$trap_command" ]; then
+        trap_command="builtin $trap_command"
         printf '%s || return 1\n' "$trap_command"
     else
-        printf '%s\n' 'trap - DEBUG || return 1'
+        printf '%s\n' 'builtin trap - DEBUG || return 1'
     fi
 }
 
 __gascan_starship_build_commit()
 {
     local initialization=$1 selected_config=$2
-    local binary=$3 immutable_path=$4
+    local binary=$3 immutable_path=$4 expectations=$5
+    local -a __gascan_expected_variable_set=()
+    local -a __gascan_expected_variable_declaration=()
+
+    eval "$expectations"
 
     STARSHIP_CONFIG=$selected_config
     STARSHIP_EXECUTABLE=$binary
@@ -142,7 +185,7 @@ __gascan_starship_build_commit()
     # would otherwise return success.
     set -e
     eval "$initialization" >/dev/null 2>&1
-    __gascan_starship_emit_commit
+    __gascan_starship_emit_commit 1
 }
 
 __gascan_starship_apply_commit()
@@ -162,7 +205,7 @@ __gascan_starship_main()
     local managed_owner=0 workspace_uid=1000 workspace_gid=1000
     local immutable_owner=0 immutable_gid=0 immutable_link_mode=777
     local prompt preset selected_config initialization
-    local commit rollback
+    local commit rollback expectations
     local build_status=0 errexit_was_set=0
     local selector_metadata config_metadata preset_metadata
     local binary_metadata binary_target_metadata
@@ -212,7 +255,8 @@ __gascan_starship_main()
         __gascan_starship_warn
         return 0
     fi
-    rollback=$(__gascan_starship_emit_commit)
+    rollback=$(__gascan_starship_emit_commit 0)
+    expectations=$(__gascan_starship_capture_expectations)
 
     config_metadata=$(__gascan_shell_metadata "$config")
     preset_metadata=$(__gascan_shell_metadata "$preset")
@@ -250,7 +294,8 @@ __gascan_starship_main()
     esac
     commit=$(
         __gascan_starship_build_commit \
-            "$initialization" "$selected_config" "$binary" "$immutable_path"
+            "$initialization" "$selected_config" "$binary" "$immutable_path" \
+            "$expectations"
     )
     build_status=$?
     if [ "$errexit_was_set" = 1 ]; then
@@ -264,12 +309,12 @@ __gascan_starship_main()
         __gascan_starship_warn
         return 0
     fi
-    if ! (trap - DEBUG; __gascan_starship_apply_commit "$commit") \
+    if ! (builtin trap - DEBUG; __gascan_starship_apply_commit "$commit") \
         >/dev/null 2>&1; then
         __gascan_starship_warn
         return 0
     fi
-    trap - DEBUG
+    builtin trap - DEBUG
     if ! __gascan_starship_apply_commit "$commit"; then
         __gascan_starship_apply_commit "$rollback" >/dev/null 2>&1 || true
         __gascan_starship_warn
@@ -284,6 +329,7 @@ unset __gascan_inherited_debug_trap
 unset -f __gascan_starship_main __gascan_starship_preflight \
     __gascan_starship_variable_readonly \
     __gascan_starship_apply_commit __gascan_starship_build_commit \
+    __gascan_starship_capture_expectations \
     __gascan_starship_emit_commit __gascan_starship_emit_variable \
     __gascan_starship_warn __gascan_shell_metadata
 return 0 2>/dev/null || exit 0

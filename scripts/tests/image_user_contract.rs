@@ -2131,6 +2131,74 @@ fn shell_hook_warns_once_and_returns_success_when_starship_is_unavailable() {
     );
 
     let before = fs::read_to_string(&log).unwrap_or_default();
+    let spoofed_debug_trap = run_hook(
+        &hook,
+        r#"PS1=native-prompt; set -T; builtin trap 'trap() { :; }' DEBUG; before=$(builtin trap -p DEBUG); . "$GASCAN_TEST_HOOK"; after=$(builtin trap -p DEBUG); if declare -F trap >/dev/null; then spoof=present; else spoof=absent; fi; printf 'PS1=%s\nSPOOF=%s\nBEFORE=%s\nAFTER=%s\n' "$PS1" "$spoof" "$before" "$after""#,
+        &log,
+        false,
+        false,
+        true,
+    );
+    assert!(spoofed_debug_trap.status.success());
+    let spoofed_stdout = String::from_utf8_lossy(&spoofed_debug_trap.stdout);
+    assert!(
+        spoofed_stdout.contains("PS1=native-prompt\n"),
+        "{spoofed_stdout}"
+    );
+    assert!(
+        spoofed_stdout.contains("SPOOF=present\n"),
+        "{spoofed_stdout}"
+    );
+    let spoofed_trap_line = "trap -- 'trap() { :; }' DEBUG";
+    assert!(
+        spoofed_stdout.contains(&format!(
+            "BEFORE={spoofed_trap_line}\nAFTER={spoofed_trap_line}\n"
+        )),
+        "{spoofed_stdout}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&spoofed_debug_trap.stderr)
+            .matches("gascan: Starship prompt unavailable; using standard Bash prompt.")
+            .count(),
+        1,
+        "{}",
+        String::from_utf8_lossy(&spoofed_debug_trap.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&log).unwrap_or_default(),
+        before,
+        "spoofed DEBUG trap reached Starship"
+    );
+
+    let before = fs::read_to_string(&log).unwrap_or_default();
+    let self_clearing_debug_trap = run_hook(
+        &hook,
+        r#"PS1=native-prompt; set -T; builtin trap 'builtin trap - DEBUG; STARSHIP_START_TIME=attacker' DEBUG; . "$GASCAN_TEST_HOOK"; printf 'PS1=%s\nSTART=%s\nTRAP=%s\n' "$PS1" "${STARSHIP_START_TIME-unset}" "$(builtin trap -p DEBUG)""#,
+        &log,
+        false,
+        false,
+        true,
+    );
+    assert!(self_clearing_debug_trap.status.success());
+    assert_eq!(
+        self_clearing_debug_trap.stdout,
+        b"PS1=native-prompt\nSTART=attacker\nTRAP=\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&self_clearing_debug_trap.stderr)
+            .matches("gascan: Starship prompt unavailable; using standard Bash prompt.")
+            .count(),
+        1,
+        "{}",
+        String::from_utf8_lossy(&self_clearing_debug_trap.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&log).unwrap_or_default(),
+        before,
+        "self-clearing DEBUG mutation reached Starship"
+    );
+
+    let before = fs::read_to_string(&log).unwrap_or_default();
     let signal_collision = Command::new("/bin/bash")
         .args([
             "--noprofile",
@@ -2170,6 +2238,48 @@ fn shell_hook_warns_once_and_returns_success_when_starship_is_unavailable() {
             .count(),
         before.matches("init bash --print-full-init").count() + 1,
         "readonly function race did not stop after one generated init"
+    );
+
+    let before = fs::read_to_string(&log).unwrap_or_default();
+    let writable_signal_collision = Command::new("/bin/bash")
+        .args([
+            "--noprofile",
+            "--norc",
+            "-i",
+            "-c",
+            r#"PS1=native-prompt; trap 'starship_precmd() { printf attacker; }' USR1; export GASCAN_TEST_PARENT_PID=$$; . "$GASCAN_TEST_HOOK"; printf 'PS1=%s\nFUNCTION=' "$PS1"; starship_precmd; printf '\n'"#,
+        ])
+        .env("GASCAN_TEST_HOOK", &hook)
+        .env("GASCAN_TEST_LOG", &log)
+        .env("GASCAN_TEST_GENERATION_FAIL", "0")
+        .env("GASCAN_TEST_EVAL_FAIL", "0")
+        .env("GASCAN_TEST_SIGNAL_COLLISION", "1")
+        .env_remove("STARSHIP_SHELL")
+        .env_remove("STARSHIP_SESSION_KEY")
+        .output()
+        .unwrap();
+    assert!(writable_signal_collision.status.success());
+    assert_eq!(
+        writable_signal_collision.stdout,
+        b"PS1=native-prompt\nFUNCTION=attacker\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&writable_signal_collision.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&writable_signal_collision.stderr)
+            .matches("gascan: Starship prompt unavailable; using standard Bash prompt.")
+            .count(),
+        1,
+        "{}",
+        String::from_utf8_lossy(&writable_signal_collision.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .matches("init bash --print-full-init")
+            .count(),
+        before.matches("init bash --print-full-init").count() + 1,
+        "writable function race did not stop after one generated init"
     );
 
     for (name, setup) in [

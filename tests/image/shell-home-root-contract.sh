@@ -379,6 +379,49 @@ test "$(printf '%s\n' "$debug_output" |
 test "$(grep -Fc 'init bash --print-full-init' "$stable_log")" = 1 ||
     die 'inherited DEBUG trap reached Starship'
 
+spoofed_debug_output=$(
+    PATH="$attacker_bin:/usr/bin:/bin" /bin/bash --noprofile --norc -i -c \
+        "PS1='native-root'; set -T; \
+         builtin trap 'trap() { :; }' DEBUG; \
+         before=\$(builtin trap -p DEBUG); . '$hook'; \
+         after=\$(builtin trap -p DEBUG); \
+         declare -F trap >/dev/null && spoof=present || spoof=absent; \
+         printf 'PS1=%s\nSPOOF=%s\nBEFORE=%s\nAFTER=%s\n' \
+         \"\$PS1\" \"\$spoof\" \"\$before\" \"\$after\"" 2>&1
+)
+printf '%s\n' "$spoofed_debug_output" | grep -Fqx PS1=native-root ||
+    die 'spoofed inherited DEBUG trap changed the native prompt'
+printf '%s\n' "$spoofed_debug_output" | grep -Fqx SPOOF=present ||
+    die 'spoofed inherited DEBUG trap did not shadow trap'
+test "$(printf '%s\n' "$spoofed_debug_output" |
+    grep -Fc "trap -- 'trap() { :; }' DEBUG")" = 2 ||
+    die 'spoofed inherited DEBUG trap was not preserved exactly'
+test "$(printf '%s\n' "$spoofed_debug_output" |
+    grep -Fc 'gascan: Starship prompt unavailable; using standard Bash prompt.')" = 1 ||
+    die 'spoofed inherited DEBUG trap did not warn exactly once'
+test "$(grep -Fc 'init bash --print-full-init' "$stable_log")" = 1 ||
+    die 'spoofed inherited DEBUG trap reached Starship'
+
+self_clearing_debug_output=$(
+    PATH="$attacker_bin:/usr/bin:/bin" /bin/bash --noprofile --norc -i -c \
+        "PS1='native-root'; set -T; \
+         builtin trap 'builtin trap - DEBUG; STARSHIP_START_TIME=attacker' DEBUG; \
+         . '$hook'; printf 'PS1=%s\nSTART=%s\nTRAP=%s\n' \
+         \"\$PS1\" \"\${STARSHIP_START_TIME-unset}\" \
+         \"\$(builtin trap -p DEBUG)\"" 2>&1
+)
+printf '%s\n' "$self_clearing_debug_output" | grep -Fqx PS1=native-root ||
+    die 'self-clearing DEBUG trap changed the native prompt'
+printf '%s\n' "$self_clearing_debug_output" | grep -Fqx START=attacker ||
+    die 'self-clearing DEBUG trap mutation was not preserved'
+printf '%s\n' "$self_clearing_debug_output" | grep -Fqx TRAP= ||
+    die 'self-clearing DEBUG trap remained active'
+test "$(printf '%s\n' "$self_clearing_debug_output" |
+    grep -Fc 'gascan: Starship prompt unavailable; using standard Bash prompt.')" = 1 ||
+    die 'self-clearing DEBUG mutation did not warn exactly once'
+test "$(grep -Fc 'init bash --print-full-init' "$stable_log")" = 1 ||
+    die 'self-clearing DEBUG mutation reached Starship'
+
 signal_output=$(
     GASCAN_TEST_SIGNAL_COLLISION=1 \
         PATH="$attacker_bin:/usr/bin:/bin" \
@@ -398,6 +441,25 @@ test "$(printf '%s\n' "$signal_output" |
 test "$(grep -Fc 'init bash --print-full-init' "$stable_log")" = 2 ||
     die 'readonly function race did not stop after one generated init'
 
+writable_signal_output=$(
+    GASCAN_TEST_SIGNAL_COLLISION=1 \
+        PATH="$attacker_bin:/usr/bin:/bin" \
+        /bin/bash --noprofile --norc -i -c \
+        "PS1='native-root'; \
+         trap 'starship_precmd() { printf attacker; }' USR1; \
+         export GASCAN_TEST_PARENT_PID=\$\$; . '$hook'; \
+         printf 'PS1=%s\nFUNCTION=' \"\$PS1\"; starship_precmd; printf '\n'" 2>&1
+)
+printf '%s\n' "$writable_signal_output" | grep -Fqx PS1=native-root ||
+    die 'writable post-preflight function changed the native prompt'
+printf '%s\n' "$writable_signal_output" | grep -Fqx FUNCTION=attacker ||
+    die 'writable post-preflight function was replaced'
+test "$(printf '%s\n' "$writable_signal_output" |
+    grep -Fc 'gascan: Starship prompt unavailable; using standard Bash prompt.')" = 1 ||
+    die 'writable function apply collision did not warn exactly once'
+test "$(grep -Fc 'init bash --print-full-init' "$stable_log")" = 3 ||
+    die 'writable function race did not stop after one generated init'
+
 readonly_output=$(
     PATH="$attacker_bin:/usr/bin:/bin" /bin/bash --noprofile --norc -i -c \
         "PS1='native-root'; \
@@ -413,7 +475,7 @@ printf '%s\n' "$readonly_output" | grep -Fqx PS1=native-root ||
 test "$(printf '%s\n' "$readonly_output" |
     grep -Fc 'gascan: Starship prompt unavailable; using standard Bash prompt.')" = 1 ||
     die 'readonly managed variables did not warn exactly once'
-test "$(grep -Fc 'init bash --print-full-init' "$stable_log")" = 2 ||
+test "$(grep -Fc 'init bash --print-full-init' "$stable_log")" = 3 ||
     die 'readonly managed variables reached Starship'
 
 collision_output=$(
@@ -429,7 +491,7 @@ printf '%s\n' "$collision_output" | grep -Fqx VARIABLE=attacker ||
     die 'managed internal-variable collision was replaced'
 printf '%s\n' "$collision_output" | grep -Fqx PS1=native-root ||
     die 'managed provenance collision changed the native prompt'
-test "$(grep -Fc 'init bash --print-full-init' "$stable_log")" = 2 ||
+test "$(grep -Fc 'init bash --print-full-init' "$stable_log")" = 3 ||
     die 'managed provenance collision reached Starship'
 
 failure_output=$(
@@ -506,8 +568,8 @@ printf '%s\n' "$eval_failure_output" |
     grep -Fq "trap -- 'STARSHIP_NATIVE_TRAP=1' DEBUG" ||
     die 'partial init replaced the existing DEBUG trap'
 full_init_count=$(grep -Fc 'init bash --print-full-init' "$stable_log")
-test "$full_init_count" = 5 ||
-    die "full init invocation count is $full_init_count, expected 5"
+test "$full_init_count" = 6 ||
+    die "full init invocation count is $full_init_count, expected 6"
 
 # Bash strings cannot preserve NUL, so selector validation must compare bytes.
 printf 'starship\0\n' >"$selector"
