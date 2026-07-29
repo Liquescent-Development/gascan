@@ -452,7 +452,7 @@ dependencies = [
 
 [[package]]
 name = "gascan"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "clap",
  "console",
@@ -477,7 +477,7 @@ dependencies = [
 
 [[package]]
 name = "gascan-apple"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "async-trait",
  "base64",
@@ -494,7 +494,7 @@ dependencies = [
 
 [[package]]
 name = "gascan-core"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "async-trait",
  "base64",
@@ -512,7 +512,7 @@ dependencies = [
 
 [[package]]
 name = "gascan-e2e"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "async-trait",
  "camino",
@@ -540,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "gascan-proto"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "prost",
  "prost-build",
@@ -552,7 +552,7 @@ dependencies = [
 
 [[package]]
 name = "gascand"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "async-trait",
  "base64",
