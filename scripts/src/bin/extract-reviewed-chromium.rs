@@ -1,10 +1,11 @@
 use std::{
     collections::HashSet,
     error::Error,
-    fs, io,
+    fs::{self, File},
+    io,
     os::fd::AsFd,
     os::unix::ffi::OsStrExt,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
 };
 
@@ -92,10 +93,9 @@ fn extract_atomically(
         .parent()
         .ok_or("Chromium output has no parent directory")?;
     fs::create_dir_all(parent)?;
-    let staging_prefix = format!(
-        ".chromium-staging-{:x}-",
-        Sha256::digest(output.as_os_str().as_bytes())
-    );
+    let output_digest = format!("{:x}", Sha256::digest(output.as_os_str().as_bytes()));
+    let _output_lock = lock_output(parent, &output_digest)?;
+    let staging_prefix = format!(".chromium-staging-{output_digest}-");
     recover_stale(parent, &staging_prefix);
     let staging = tempfile::Builder::new()
         .prefix(&staging_prefix)
@@ -167,6 +167,38 @@ fn extract_atomically(
         Err(error) => return Err(error.into()),
     }
     Ok(())
+}
+
+fn lock_output(parent: &Path, output_digest: &str) -> Result<File, DynError> {
+    let lock_path = parent.join(format!(".chromium-extraction-{output_digest}.lock"));
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&lock_path)?;
+    let metadata = lock.metadata()?;
+    if !metadata.is_file()
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.nlink() != 1
+    {
+        return Err("Chromium output lock is not a safely permissioned regular file".into());
+    }
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)?;
+    let path_metadata = fs::symlink_metadata(&lock_path)?;
+    if path_metadata.file_type().is_symlink()
+        || !path_metadata.is_file()
+        || path_metadata.mode() & 0o777 != 0o600
+        || path_metadata.uid() != rustix::process::geteuid().as_raw()
+        || path_metadata.nlink() != 1
+        || path_metadata.dev() != metadata.dev()
+        || path_metadata.ino() != metadata.ino()
+    {
+        return Err("Chromium output lock path changed while acquiring the lock".into());
+    }
+    Ok(lock)
 }
 
 fn recover_stale(parent: &Path, staging_prefix: &str) {
