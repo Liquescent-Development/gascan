@@ -30,6 +30,42 @@ require_shell_example() {
   }
 }
 
+require_daemon_status_json() {
+  local json
+  json=$(awk '
+    $0 == "`gascan daemon status --json` reports the same status in machine-readable" {
+      found_description = 1
+      next
+    }
+    found_description && $0 == "```json" {
+      in_block = 1
+      next
+    }
+    in_block && $0 == "```" { exit }
+    in_block { print }
+  ' "$readme")
+
+  if [[ -z "$json" ]] || ! printf '%s\n' "$json" | jq -e '
+    type == "object"
+    and ([
+      "state", "health", "installed_version", "running_version", "pid",
+      "started_at_millis", "uptime_millis", "executable", "legacy"
+    ] - keys | length == 0)
+    and (.state | type == "string")
+    and (.health | type == "string")
+    and (.installed_version | type == "string")
+    and (.running_version | type == "string")
+    and (.pid | type == "number")
+    and (.started_at_millis | type == "number")
+    and (.uptime_millis | type == "number")
+    and (.executable | type == "string")
+    and (.legacy | type == "boolean")
+  ' >/dev/null; then
+    printf 'missing valid daemon-status JSON example in %s\n' "${readme#"$repo_root"/}" >&2
+    exit 1
+  fi
+}
+
 require_shell_example "$readme"
 require_shell_example "$default_manifest"
 
@@ -64,15 +100,7 @@ require_text "$readme" 'Uptime             <duration>'
 require_text "$readme" 'Installed version  <installed-version>'
 require_text "$readme" 'Running version    <running-version>'
 require_text "$readme" 'Executable         <path-to-gascand>'
-require_text "$readme" '"state": "running"'
-require_text "$readme" '"health": "healthy"'
-require_text "$readme" '"installed_version": "<installed-version>"'
-require_text "$readme" '"running_version": "<running-version>"'
-require_text "$readme" '"pid": 12345'
-require_text "$readme" '"started_at_millis": 1722297600000'
-require_text "$readme" '"uptime_millis": 92345'
-require_text "$readme" '"executable": "<path-to-gascand>"'
-require_text "$readme" '"legacy": false'
+require_daemon_status_json
 require_text "$readme" '○ Gascan daemon is stopped'
 require_text "$readme" 'checks the workspace from which you run `gascan doctor`'
 require_text "$readme" "the daemon's working directory."
