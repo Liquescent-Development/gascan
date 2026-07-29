@@ -159,6 +159,16 @@ set -e
 grep -Fq 'rebuild, live-test, and approve' <<<"$extra_line_source" || {
   printf 'extra-line source fingerprint lacks remediation: %s\n' "$extra_line_source" >&2; exit 1; }
 
+printf '%064d\0' 0 >"$fixture/images/workspace/approved-source.sha256"
+set +e
+nul_suffix_source=$(gascan_gate_workspace_image_source "$fixture" 2>&1 >/dev/null)
+nul_suffix_source_code=$?
+set -e
+[[ $nul_suffix_source_code -eq 65 ]] || {
+  printf 'NUL-suffix workspace image source fingerprint passed\n' >&2; exit 1; }
+grep -Fq 'rebuild, live-test, and approve' <<<"$nul_suffix_source" || {
+  printf 'NUL-suffix source fingerprint lacks remediation: %s\n' "$nul_suffix_source" >&2; exit 1; }
+
 printf '%064d\n' 1 >"$fixture/images/workspace/approved-source.sha256"
 set +e
 stale_source=$(gascan_gate_workspace_image_source "$fixture" 2>&1 >/dev/null)

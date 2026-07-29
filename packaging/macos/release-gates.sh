@@ -29,20 +29,31 @@ gascan_gate_version() {
 }
 
 gascan_gate_workspace_image_source() {
-  local repo=$1 expected observed expected_bytes
-  expected=$(<"$repo/images/workspace/approved-source.sha256") || {
-    printf 'approved workspace image source fingerprint is missing; rebuild, live-test, and approve the current image\n' >&2
-    return 65
-  }
-  expected_bytes=$(wc -c <"$repo/images/workspace/approved-source.sha256") || {
+  local repo=$1 approval expected observed expected_bytes expected_hex_bytes
+  approval="$repo/images/workspace/approved-source.sha256"
+  expected_bytes=$(wc -c <"$approval") || {
     printf 'approved workspace image source fingerprint is missing; rebuild, live-test, and approve the current image\n' >&2
     return 65
   }
   expected_bytes=${expected_bytes//[[:space:]]/}
-  [[ $expected_bytes == 64 || $expected_bytes == 65 ]] && [[ $expected =~ ^[0-9a-f]{64}$ ]] || {
+  if [[ $expected_bytes == 65 ]]; then
+    tail -c 1 "$approval" | cmp -s - <(printf '\n') || {
+      printf 'approved workspace image source fingerprint is invalid; rebuild, live-test, and approve the current image\n' >&2
+      return 65
+    }
+  elif [[ $expected_bytes != 64 ]]; then
+    printf 'approved workspace image source fingerprint is invalid; rebuild, live-test, and approve the current image\n' >&2
+    return 65
+  fi
+  expected_hex_bytes=$(LC_ALL=C tr -cd '0-9a-f' <"$approval" | wc -c) || return 65
+  expected_hex_bytes=${expected_hex_bytes//[[:space:]]/}
+  [[ $expected_hex_bytes == 64 ]] || {
     printf 'approved workspace image source fingerprint is invalid; rebuild, live-test, and approve the current image\n' >&2
     return 65
   }
+  # The raw file has been checked byte-for-byte above, so the command
+  # substitution cannot discard or normalize untrusted binary content.
+  expected=$(<"$approval") || return 65
   observed=$("$repo/scripts/workspace-image-source-digest.sh" "$repo") || {
     printf 'workspace image source fingerprint could not be calculated; rebuild, live-test, and approve the current image\n' >&2
     return 65
