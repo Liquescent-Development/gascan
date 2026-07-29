@@ -13,124 +13,49 @@ struct Environment {
     account_home: std::path::PathBuf,
 }
 
-#[derive(Clone)]
-struct ProcessIdentity {
-    pid: u64,
-    executable: std::path::PathBuf,
-    started: String,
-}
+struct OwnedChild(Option<std::process::Child>);
 
-impl ProcessIdentity {
-    fn capture(pid: u64, expected_executable: &std::path::Path) -> TestResult<Self> {
-        let executable = expected_executable.canonicalize()?;
-        let observed_command =
-            process_field(pid, "command=")?.ok_or("old daemon process disappeared")?;
-        let observed_executable = observed_command
-            .split_whitespace()
-            .next()
-            .ok_or("old daemon command is empty")?;
-        if std::path::Path::new(observed_executable).canonicalize()? != executable {
-            return Err("old daemon executable did not match the test fixture".into());
-        }
-        let started = process_field(pid, "lstart=")?.ok_or("old daemon start time missing")?;
-        Ok(Self {
-            pid,
-            executable,
-            started,
-        })
+impl OwnedChild {
+    fn spawn(command: &mut Command) -> TestResult<Self> {
+        Ok(Self(Some(command.spawn()?)))
     }
 
-    fn is_running(&self) -> TestResult<bool> {
-        let Some(state) = process_field(self.pid, "state=")? else {
-            return Ok(false);
-        };
-        if state.starts_with('Z') {
-            return Ok(false);
-        }
-        let Some(command) = process_field(self.pid, "command=")? else {
-            return Ok(false);
-        };
-        let Some(observed_executable) = command.split_whitespace().next() else {
-            return Ok(false);
-        };
-        let Ok(observed_executable) = std::path::Path::new(observed_executable).canonicalize()
-        else {
-            return Ok(false);
-        };
-        if observed_executable != self.executable {
-            return Ok(false);
-        }
-        Ok(process_field(self.pid, "lstart=")?.as_deref() == Some(self.started.as_str()))
-    }
-}
-
-fn process_field(pid: u64, field: &str) -> TestResult<Option<String>> {
-    let output = Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", field])
-        .output()?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let field = String::from_utf8(output.stdout)?.trim().to_owned();
-    Ok((!field.is_empty()).then_some(field))
-}
-
-struct OwnedPid {
-    identity: Option<ProcessIdentity>,
-}
-
-impl OwnedPid {
-    fn capture(pid: u64, executable: &std::path::Path) -> TestResult<Self> {
-        Ok(Self {
-            identity: Some(ProcessIdentity::capture(pid, executable)?),
-        })
+    fn id(&self) -> TestResult<u32> {
+        Ok(self.0.as_ref().ok_or("owned daemon child missing")?.id())
     }
 
-    fn disarm(&mut self) {
-        self.identity = None;
+    fn try_wait(&mut self) -> TestResult<Option<std::process::ExitStatus>> {
+        Ok(self
+            .0
+            .as_mut()
+            .ok_or("owned daemon child missing")?
+            .try_wait()?)
     }
 
-    fn wait_for_exit(&self) -> TestResult {
-        let identity = self.identity.as_ref().ok_or("old daemon guard disarmed")?;
+    fn wait_for_exit(&mut self) -> TestResult {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while identity.is_running()? {
+        loop {
+            let child = self.0.as_mut().ok_or("owned daemon child missing")?;
+            if child.try_wait()?.is_some() {
+                self.0 = None;
+                return Ok(());
+            }
             if std::time::Instant::now() >= deadline {
-                return Err(format!("replaced daemon PID {} remained live", identity.pid).into());
+                return Err(
+                    format!("replaced daemon child PID {} remained live", child.id()).into(),
+                );
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        Ok(())
     }
 }
 
-impl Drop for OwnedPid {
+impl Drop for OwnedChild {
     fn drop(&mut self) {
-        let Some(identity) = self.identity.as_ref() else {
-            return;
-        };
-        if !identity.is_running().unwrap_or(false) {
-            return;
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
-        let _ = Command::new("kill")
-            .args(["-TERM", &identity.pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
-        while std::time::Instant::now() < deadline {
-            if !identity.is_running().unwrap_or(false) {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        if !identity.is_running().unwrap_or(false) {
-            return;
-        }
-        let _ = Command::new("kill")
-            .args(["-KILL", &identity.pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
     }
 }
 
@@ -152,10 +77,8 @@ impl Environment {
         })
     }
 
-    fn command_for(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(&self.gascan);
+    fn configure_command<'a>(&self, command: &'a mut Command) -> &'a mut Command {
         command
-            .args(args)
             .env("XDG_RUNTIME_DIR", &self.runtime_root)
             .env("GASCAN_STATE_PATH", self.runtime_root.join("state.sqlite3"))
             .env(
@@ -170,6 +93,13 @@ impl Environment {
             .env("GASCAN_E2E_ACCOUNT_HOME", &self.account_home)
             .env("GASCAN_DAEMON", &self.gascand);
         command.env("GASCAN_TEST_FAKE_BACKEND", "1");
+        command
+    }
+
+    fn command_for(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(&self.gascan);
+        command.args(args);
+        self.configure_command(&mut command);
         command
     }
 
@@ -198,27 +128,65 @@ impl Environment {
         Ok(serde_json::from_slice(&output.stdout)?)
     }
 
-    fn shutdown_daemon(&self) -> TestResult {
-        let socket = self.runtime_root.join("gascan/gascand.sock");
-        if std::os::unix::net::UnixStream::connect(&socket).is_err() {
-            return Ok(());
-        }
-        let raw_pid = std::fs::read_to_string(self.runtime_root.join("daemon.pid"))?;
-        let pid = raw_pid.parse::<i32>()?;
-        let pid =
-            rustix_openpty::rustix::process::Pid::from_raw(pid).ok_or("invalid daemon pid")?;
-        rustix_openpty::rustix::process::kill_process(
-            pid,
-            rustix_openpty::rustix::process::Signal::TERM,
-        )?;
+    fn spawn_owned_daemon(&self) -> TestResult<OwnedChild> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = self.runtime_root.join("gascan");
+        std::fs::create_dir(&directory)?;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+        let stderr = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.runtime_root.join("daemon.stderr"))?;
+        let mut command = Command::new(&self.gascand);
+        self.configure_command(&mut command);
+        command
+            .current_dir(&directory)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(stderr)
+            .env(
+                "GASCAN_DAEMON_INSTANCE_PATH",
+                directory.join("daemon-instance.json"),
+            )
+            .env("GASCAN_DAEMON_OWNER_TOKEN", "owned-restart-e2e");
+        let mut child = OwnedChild::spawn(&mut command)?;
+        let pid = u64::from(child.id()?);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+        loop {
+            if let Some(status) = child.try_wait()? {
+                child.0 = None;
+                return Err(format!("owned daemon exited before readiness: {status}").into());
+            }
+            let output = self.command_for(&["daemon", "status", "--json"]).output()?;
+            if output.status.success() {
+                let status: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+                if status["state"] == "running" && status["pid"].as_u64() == Some(pid) {
+                    return Ok(child);
+                }
+            }
             if std::time::Instant::now() >= deadline {
-                return Err("daemon did not remove its socket during teardown".into());
+                return Err("owned daemon did not become ready".into());
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        Ok(())
+    }
+
+    fn shutdown_daemon(&self) -> TestResult {
+        let output = self
+            .command_for(&["daemon", "stop", "--force", "--json"])
+            .output()?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "public daemon cleanup failed: status={:?}, stdout={}, stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into())
+        }
     }
 }
 
@@ -266,11 +234,8 @@ fn daemon_start_and_stop_are_idempotent() -> TestResult {
 #[test]
 fn daemon_restart_replaces_pid_and_returns_healthy() -> TestResult {
     let env = Environment::new()?;
-    let started = env.daemon_json("start")?;
-    let old_pid = started["pid"]
-        .as_u64()
-        .ok_or("started daemon PID missing")?;
-    let mut old_process = OwnedPid::capture(old_pid, std::path::Path::new(&env.gascand))?;
+    let mut old_process = env.spawn_owned_daemon()?;
+    let old_pid = u64::from(old_process.id()?);
 
     let restarted = env.daemon_json("restart")?;
     assert_eq!(restarted["state"], "running");
@@ -281,7 +246,24 @@ fn daemon_restart_replaces_pid_and_returns_healthy() -> TestResult {
         .ok_or("restarted daemon PID missing")?;
     assert_ne!(current_pid, old_pid);
     old_process.wait_for_exit()?;
-    old_process.disarm();
+    Ok(())
+}
+
+#[test]
+fn owned_child_cleanup_is_scoped_to_its_process_handle() -> TestResult {
+    let mut first = Command::new("/bin/sleep");
+    first.arg("30");
+    let owned = OwnedChild::spawn(&mut first)?;
+    let mut second = Command::new("/bin/sleep");
+    second.arg("30");
+    let mut neighbor = OwnedChild::spawn(&mut second)?;
+
+    drop(owned);
+
+    assert!(
+        neighbor.try_wait()?.is_none(),
+        "dropping one child guard affected a different owned child"
+    );
     Ok(())
 }
 
