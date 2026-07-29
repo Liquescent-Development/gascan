@@ -29,12 +29,17 @@ gascan_gate_version() {
 }
 
 gascan_gate_workspace_image_source() {
-  local repo=$1 expected observed
-  expected=$(tr -d '\n' <"$repo/images/workspace/approved-source.sha256") || {
+  local repo=$1 expected observed expected_bytes
+  expected=$(<"$repo/images/workspace/approved-source.sha256") || {
     printf 'approved workspace image source fingerprint is missing; rebuild, live-test, and approve the current image\n' >&2
     return 65
   }
-  [[ $expected =~ ^[0-9a-f]{64}$ ]] || {
+  expected_bytes=$(wc -c <"$repo/images/workspace/approved-source.sha256") || {
+    printf 'approved workspace image source fingerprint is missing; rebuild, live-test, and approve the current image\n' >&2
+    return 65
+  }
+  expected_bytes=${expected_bytes//[[:space:]]/}
+  [[ $expected_bytes == 64 || $expected_bytes == 65 ]] && [[ $expected =~ ^[0-9a-f]{64}$ ]] || {
     printf 'approved workspace image source fingerprint is invalid; rebuild, live-test, and approve the current image\n' >&2
     return 65
   }

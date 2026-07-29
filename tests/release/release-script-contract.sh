@@ -137,6 +137,28 @@ set -e
 grep -Fq 'rebuild, live-test, and approve' <<<"$nonhex_source" || {
   printf 'non-hex source fingerprint lacks remediation: %s\n' "$nonhex_source" >&2; exit 1; }
 
+# A fingerprint is one canonical line. Removing embedded or trailing newlines
+# before validation makes both of these malformed approvals look valid.
+printf '%032d\n%032d\n' 0 0 >"$fixture/images/workspace/approved-source.sha256"
+set +e
+split_source=$(gascan_gate_workspace_image_source "$fixture" 2>&1 >/dev/null)
+split_source_code=$?
+set -e
+[[ $split_source_code -eq 65 ]] || {
+  printf 'split-line workspace image source fingerprint passed\n' >&2; exit 1; }
+grep -Fq 'rebuild, live-test, and approve' <<<"$split_source" || {
+  printf 'split-line source fingerprint lacks remediation: %s\n' "$split_source" >&2; exit 1; }
+
+printf '%064d\n\n' 0 >"$fixture/images/workspace/approved-source.sha256"
+set +e
+extra_line_source=$(gascan_gate_workspace_image_source "$fixture" 2>&1 >/dev/null)
+extra_line_source_code=$?
+set -e
+[[ $extra_line_source_code -eq 65 ]] || {
+  printf 'extra-line workspace image source fingerprint passed\n' >&2; exit 1; }
+grep -Fq 'rebuild, live-test, and approve' <<<"$extra_line_source" || {
+  printf 'extra-line source fingerprint lacks remediation: %s\n' "$extra_line_source" >&2; exit 1; }
+
 printf '%064d\n' 1 >"$fixture/images/workspace/approved-source.sha256"
 set +e
 stale_source=$(gascan_gate_workspace_image_source "$fixture" 2>&1 >/dev/null)
