@@ -3,6 +3,7 @@ use std::{
     error::Error,
     fs, io,
     os::fd::AsFd,
+    os::unix::ffi::OsStrExt,
     os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
 };
@@ -91,9 +92,13 @@ fn extract_atomically(
         .parent()
         .ok_or("Chromium output has no parent directory")?;
     fs::create_dir_all(parent)?;
-    recover_stale(parent);
+    let staging_prefix = format!(
+        ".chromium-staging-{:x}-",
+        Sha256::digest(output.as_os_str().as_bytes())
+    );
+    recover_stale(parent, &staging_prefix);
     let staging = tempfile::Builder::new()
-        .prefix(".chromium-staging-")
+        .prefix(&staging_prefix)
         .tempdir_in(parent)?;
     let file = fs::File::open(archive_path)?;
     let mut archive = ZipArchive::new(file)?;
@@ -164,7 +169,7 @@ fn extract_atomically(
     Ok(())
 }
 
-fn recover_stale(parent: &Path) {
+fn recover_stale(parent: &Path, staging_prefix: &str) {
     let Ok(entries) = fs::read_dir(parent) else {
         return;
     };
@@ -175,7 +180,7 @@ fn recover_stale(parent: &Path) {
         let Some(staging_name) = name.strip_suffix(".receipt") else {
             continue;
         };
-        if !staging_name.starts_with(".chromium-staging-") {
+        if !staging_name.starts_with(staging_prefix) {
             continue;
         }
         let Ok(receipt) = fs::read_to_string(entry.path()) else {

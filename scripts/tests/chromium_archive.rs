@@ -108,3 +108,42 @@ fn refresh_atomically_replaces_valid_tree_and_preserves_it_on_failure() {
     );
     drop((first_temp, second_temp, bad_temp));
 }
+
+#[test]
+fn extraction_preserves_a_foreign_live_transaction_in_the_same_parent() {
+    let parent = tempfile::tempdir().unwrap();
+    let output = parent.path().join("target-output");
+    let foreign_staging = parent.path().join(".chromium-staging-foreign-output");
+    let foreign_receipt = parent
+        .path()
+        .join(".chromium-staging-foreign-output.receipt");
+    fs::create_dir(&foreign_staging).unwrap();
+    fs::write(
+        &foreign_receipt,
+        concat!(
+            "chromium exchange receipt v1\t.chromium-staging-foreign-output\t-\t",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+        ),
+    )
+    .unwrap();
+
+    let (_archive_temp, archive) = archive(&[("chrome-linux/chrome", Entry::File(b"browser"))]);
+    let extraction = Command::new(env!("CARGO_BIN_EXE_extract-reviewed-chromium"))
+        .args([archive.as_os_str(), output.as_os_str()])
+        .output()
+        .unwrap();
+
+    assert!(
+        extraction.status.success(),
+        "target extraction failed: {}",
+        String::from_utf8_lossy(&extraction.stderr)
+    );
+    assert!(
+        foreign_staging.is_dir(),
+        "target extraction removed another output's live staging tree"
+    );
+    assert!(
+        foreign_receipt.is_file(),
+        "target extraction removed another output's live receipt"
+    );
+}
