@@ -290,11 +290,11 @@ gascan daemon restart
 ```
 
 For a running, healthy daemon, `gascan daemon status` renders these stable
-labels; the placeholder values are representative and vary by installation:
+labels; the values are illustrative and vary by installation:
 
 ```text
 ✓ Gascan daemon is running
-  Health             healthy
+  Health             Healthy
   PID                <pid>
   Uptime             <duration>
   Installed version  <installed-version>
@@ -311,9 +311,9 @@ form:
   "health": "healthy",
   "installed_version": "<installed-version>",
   "running_version": "<running-version>",
-  "pid": <pid>,
-  "started_at_millis": <epoch-milliseconds>,
-  "uptime_millis": <milliseconds>,
+  "pid": 12345,
+  "started_at_millis": 1722297600000,
+  "uptime_millis": 92345,
   "executable": "<path-to-gascand>",
   "legacy": false
 }
