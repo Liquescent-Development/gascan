@@ -155,8 +155,19 @@ pub enum UsageKind {
 #[derive(Debug)]
 pub enum CliError {
     Client(ClientError),
-    Usage { kind: UsageKind, message: String },
-    Operation { code: String, message: String },
+    Usage {
+        kind: UsageKind,
+        message: String,
+    },
+    Operation {
+        code: String,
+        message: String,
+    },
+    DaemonOperation {
+        code: String,
+        message: String,
+        suggestion: Option<&'static str>,
+    },
     Runtime(String),
     Io(std::io::Error),
 }
@@ -167,14 +178,17 @@ impl CliError {
             Self::Client(ClientError::Api(_)) => EXIT_API,
             Self::Client(ClientError::Rpc(_)) => EXIT_RUNTIME,
             Self::Client(_) => EXIT_DAEMON,
-            Self::Operation { .. } | Self::Runtime(_) | Self::Io(_) => EXIT_RUNTIME,
+            Self::Operation { .. }
+            | Self::DaemonOperation { .. }
+            | Self::Runtime(_)
+            | Self::Io(_) => EXIT_RUNTIME,
         }
     }
 
     pub fn stable_code(&self) -> Option<&str> {
         match self {
             Self::Client(error) => error.stable_code(),
-            Self::Operation { code, .. } => Some(code),
+            Self::Operation { code, .. } | Self::DaemonOperation { code, .. } => Some(code),
             Self::Usage { .. } | Self::Runtime(_) | Self::Io(_) => None,
         }
     }
@@ -190,6 +204,7 @@ impl CliError {
             }),
             Self::Usage { message, .. }
             | Self::Operation { message, .. }
+            | Self::DaemonOperation { message, .. }
             | Self::Runtime(message) => message.clone(),
             Self::Io(error) => error.to_string(),
         };
@@ -203,7 +218,11 @@ impl CliError {
     }
 
     pub fn suggestion(&self) -> Option<&'static str> {
-        match self {
+        let contextual = match self {
+            Self::DaemonOperation {
+                suggestion: Some(suggestion),
+                ..
+            } => Some(*suggestion),
             Self::Usage {
                 kind: UsageKind::NoSandbox,
                 ..
@@ -212,7 +231,7 @@ impl CliError {
                 kind: UsageKind::MultipleSandboxes,
                 ..
             } => Some("run `gascan list`, then pass `--sandbox <sandbox-id>`"),
-            Self::Client(_) | Self::Operation { .. }
+            Self::Client(_) | Self::Operation { .. } | Self::DaemonOperation { .. }
                 if matches!(
                     self.stable_code(),
                     Some(gascan_proto::error_code::SANDBOX_NOT_FOUND)
@@ -226,10 +245,11 @@ impl CliError {
                 ..
             }
             | Self::Operation { .. }
+            | Self::DaemonOperation { .. }
             | Self::Runtime(_)
             | Self::Io(_) => None,
-        }
-        .or_else(|| match self.stable_code() {
+        };
+        contextual.or_else(|| match self.stable_code() {
             Some("daemon_outdated") => Some("run `gascan daemon restart` to replace it"),
             Some("daemon_io") => {
                 Some("run `gascan daemon status` after checking the local runtime directory")
@@ -558,7 +578,9 @@ async fn execute_daemon(command: DaemonCommand) -> Result<i32, CliError> {
             if force && !json {
                 eprint!("{}", daemon_force_warning());
             }
-            let outcome = crate::daemon::stop(force).await.map_err(supervisor_error)?;
+            let outcome = crate::daemon::stop(force)
+                .await
+                .map_err(|error| supervisor_error_for_action(error, DaemonErrorContext::Stop))?;
             let now_millis = daemon_now_millis()?;
             render_daemon_outcome(&outcome, now_millis, json);
         }
@@ -568,7 +590,7 @@ async fn execute_daemon(command: DaemonCommand) -> Result<i32, CliError> {
             }
             let outcome = crate::daemon::restart(force)
                 .await
-                .map_err(supervisor_error)?;
+                .map_err(|error| supervisor_error_for_action(error, DaemonErrorContext::Restart))?;
             let now_millis = daemon_now_millis()?;
             render_daemon_outcome(&outcome, now_millis, json);
         }
@@ -745,9 +767,44 @@ async fn connect_with_recovery_progress(
 }
 
 fn supervisor_error(error: crate::daemon::SupervisorError) -> CliError {
+    supervisor_error_for_action(error, DaemonErrorContext::Automatic)
+}
+
+#[derive(Clone, Copy)]
+enum DaemonErrorContext {
+    Automatic,
+    Stop,
+    Restart,
+}
+
+impl DaemonErrorContext {
+    const fn graceful_timeout_suggestion(self) -> &'static str {
+        match self {
+            Self::Automatic => {
+                "run `gascan daemon restart --force` if it is safe to interrupt active work"
+            }
+            Self::Stop => {
+                "retry with `gascan daemon stop --force` if it is safe to interrupt active work"
+            }
+            Self::Restart => {
+                "retry with `gascan daemon restart --force` if it is safe to interrupt active work"
+            }
+        }
+    }
+}
+
+fn supervisor_error_for_action(
+    error: crate::daemon::SupervisorError,
+    context: DaemonErrorContext,
+) -> CliError {
     if let crate::daemon::SupervisorError::Client(error) = error {
         return CliError::Client(error);
     }
+    let suggestion = matches!(
+        error,
+        crate::daemon::SupervisorError::GracefulTimeout { .. }
+    )
+    .then(|| context.graceful_timeout_suggestion());
     let code = match &error {
         crate::daemon::SupervisorError::Client(_) => unreachable!("client errors returned above"),
         crate::daemon::SupervisorError::Io(_) => "daemon_io",
@@ -762,9 +819,10 @@ fn supervisor_error(error: crate::daemon::SupervisorError) -> CliError {
         crate::daemon::SupervisorError::TombstoneBusy { .. } => "daemon_lifecycle_busy",
         crate::daemon::SupervisorError::TombstoneChanged { .. } => "daemon_lifecycle_changed",
     };
-    CliError::Operation {
+    CliError::DaemonOperation {
         code: code.to_owned(),
         message: error.to_string(),
+        suggestion,
     }
 }
 
@@ -1553,6 +1611,48 @@ mod tests {
         assert_eq!(
             error.suggestion(),
             Some("run `gascan daemon status` after checking the local runtime directory")
+        );
+    }
+
+    #[test]
+    fn daemon_graceful_timeout_guidance_preserves_the_requested_command() {
+        let timeout = || crate::daemon::SupervisorError::GracefulTimeout {
+            identity: Box::new(crate::daemon::DaemonIdentity {
+                pid: 42,
+                executable: "/trusted/gascand".into(),
+                start_identity: "start:42".to_owned(),
+                instance_token: "11".repeat(32),
+                release_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+                started_at: Some(crate::daemon::InstanceTimestamp {
+                    seconds: 1_785_264_100,
+                    nanos: 0,
+                }),
+            }),
+        };
+
+        let stop = supervisor_error_for_action(timeout(), DaemonErrorContext::Stop);
+        assert_eq!(stop.stable_code(), Some("daemon_graceful_shutdown_timeout"));
+        assert_eq!(
+            stop.suggestion(),
+            Some("retry with `gascan daemon stop --force` if it is safe to interrupt active work")
+        );
+
+        let restart = supervisor_error_for_action(timeout(), DaemonErrorContext::Restart);
+        assert_eq!(
+            restart.stable_code(),
+            Some("daemon_graceful_shutdown_timeout")
+        );
+        assert_eq!(
+            restart.suggestion(),
+            Some(
+                "retry with `gascan daemon restart --force` if it is safe to interrupt active work"
+            )
+        );
+
+        let automatic = supervisor_error_for_action(timeout(), DaemonErrorContext::Automatic);
+        assert_eq!(
+            automatic.suggestion(),
+            Some("run `gascan daemon restart --force` if it is safe to interrupt active work")
         );
     }
 

@@ -52,6 +52,9 @@ fn process_start_identity(pid: u32) -> TestResult<String> {
     {
         let output = Command::new("/bin/ps")
             .args(["-p", &pid.to_string(), "-o", "lstart="])
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
+            .env("TZ", "UTC")
             .output()?;
         if !output.status.success() {
             return Err("could not inspect fixture process start identity".into());
@@ -65,12 +68,62 @@ fn process_start_identity(pid: u32) -> TestResult<String> {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn process_matches(
+    pid: u32,
+    expected_start_identity: &str,
+    expected_executable: &std::path::Path,
+) -> TestResult<bool> {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let Ok(first_start) = process_start_identity(pid) else {
+        return Ok(false);
+    };
+    if first_start != expected_start_identity {
+        return Ok(false);
+    }
+    let output = Command::new("/usr/sbin/lsof")
+        .args(["-a", "-p", &pid.to_string(), "-d", "txt", "-F0pfn"])
+        .output()?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    let mut matched_process = false;
+    let mut awaiting_text_name = false;
+    let mut executable = None;
+    for raw_field in output.stdout.split(|byte| *byte == 0) {
+        let field = raw_field.strip_prefix(b"\n").unwrap_or(raw_field);
+        let field = field.strip_prefix(b"\r").unwrap_or(field);
+        if let Some(value) = field.strip_prefix(b"p") {
+            matched_process = std::str::from_utf8(value)
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                == Some(pid);
+            awaiting_text_name = false;
+        } else if field == b"ftxt" && matched_process {
+            awaiting_text_name = true;
+        } else if awaiting_text_name {
+            if let Some(path) = field.strip_prefix(b"n") {
+                executable = Some(std::path::PathBuf::from(OsString::from_vec(path.to_vec())));
+                break;
+            }
+        }
+    }
+    if executable.as_deref() != Some(expected_executable) {
+        return Ok(false);
+    }
+    Ok(process_start_identity(pid)
+        .is_ok_and(|second_start| second_start == expected_start_identity))
+}
+
 struct UpgradeEnvironment {
     cli: std::ffi::OsString,
     daemon: std::ffi::OsString,
     runtime: tempfile::TempDir,
     root: std::path::PathBuf,
     account_home: std::path::PathBuf,
+    cleanup_daemon: std::path::PathBuf,
     fixture: Option<std::process::Child>,
 }
 
@@ -83,12 +136,14 @@ impl UpgradeEnvironment {
         let root = runtime.path().canonicalize()?;
         let account_home = root.join("account-home");
         std::fs::create_dir(&account_home)?;
+        let cleanup_daemon = std::path::PathBuf::from(&daemon);
         Ok(Self {
             cli,
             daemon,
             runtime,
             root,
             account_home,
+            cleanup_daemon,
             fixture: None,
         })
     }
@@ -109,6 +164,12 @@ impl UpgradeEnvironment {
         let mut command = Command::new(&self.cli);
         command.args(args);
         self.configure(&mut command);
+        command
+    }
+
+    fn cli_with_daemon(&self, args: &[&str], daemon: &std::path::Path) -> Command {
+        let mut command = self.cli(args);
+        command.env("GASCAN_DAEMON", daemon);
         command
     }
 
@@ -135,6 +196,32 @@ impl UpgradeEnvironment {
         }
         self.fixture = Some(command.spawn()?);
         self.wait_for_running_release(OUTDATED_RELEASE)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn spawn_installed_outdated(&mut self, installed_daemon: &std::path::Path) -> TestResult {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        self.cleanup_daemon = installed_daemon.to_owned();
+        let directory = self.root.join("gascan");
+        std::fs::create_dir(&directory)?;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+        let mut command = Command::new(installed_daemon);
+        self.configure(&mut command);
+        command
+            .env("GASCAN_DAEMON", installed_daemon)
+            .current_dir(&directory)
+            .env(
+                "GASCAN_DAEMON_INSTANCE_PATH",
+                directory.join("daemon-instance.json"),
+            )
+            .env("GASCAN_DAEMON_OWNER_TOKEN", "installed-predecessor-owner")
+            .env("GASCAN_E2E_RELEASE_VERSION", OUTDATED_RELEASE)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::fs::File::create(self.root.join("fixture.stderr"))?);
+        self.fixture = Some(command.spawn()?);
+        self.wait_for_running_release_at(OUTDATED_RELEASE, installed_daemon)
     }
 
     fn spawn_legacy(
@@ -210,9 +297,20 @@ impl UpgradeEnvironment {
     }
 
     fn wait_for_running_release(&mut self, expected: &str) -> TestResult {
+        let daemon = std::path::PathBuf::from(self.daemon.clone());
+        self.wait_for_running_release_at(expected, &daemon)
+    }
+
+    fn wait_for_running_release_at(
+        &mut self,
+        expected: &str,
+        daemon: &std::path::Path,
+    ) -> TestResult {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            let output = self.cli(&["daemon", "status", "--json"]).output()?;
+            let output = self
+                .cli_with_daemon(&["daemon", "status", "--json"], daemon)
+                .output()?;
             let last_status = format!(
                 "status={:?}, stdout={}, stderr={}",
                 output.status,
@@ -288,7 +386,10 @@ impl UpgradeEnvironment {
 
 impl Drop for UpgradeEnvironment {
     fn drop(&mut self) {
-        let _ = self.cli(&["daemon", "stop", "--force", "--json"]).output();
+        let cleanup_daemon = self.cleanup_daemon.clone();
+        let _ = self
+            .cli_with_daemon(&["daemon", "stop", "--force", "--json"], &cleanup_daemon)
+            .output();
         if let Some(child) = &mut self.fixture {
             let _ = child.kill();
             let _ = child.wait();
@@ -371,6 +472,102 @@ fn doctor_json_recovers_an_outdated_compatible_daemon() -> TestResult {
             .success(),
         "current daemon is not live"
     );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn doctor_recovers_after_atomic_installed_daemon_replacement() -> TestResult {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let mut env = UpgradeEnvironment::new()?;
+    let installed_fixture = tempfile::tempdir()?;
+    let installed_directory = installed_fixture.path().canonicalize()?;
+    let installed_daemon = installed_directory.join("gascand");
+    std::fs::copy(&env.daemon, &installed_daemon)?;
+    std::fs::set_permissions(&installed_daemon, std::fs::Permissions::from_mode(0o755))?;
+    env.spawn_installed_outdated(&installed_daemon)?;
+    let predecessor_pid = env.pid()?;
+    let predecessor_vnode = std::fs::metadata(&installed_daemon)?.ino();
+
+    let staged = installed_directory.join("gascand.current");
+    std::fs::copy(&env.daemon, &staged)?;
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
+    std::fs::rename(&staged, &installed_daemon)?;
+    assert_ne!(
+        std::fs::metadata(&installed_daemon)?.ino(),
+        predecessor_vnode,
+        "test fixture did not atomically replace the installed executable vnode"
+    );
+
+    let output = env
+        .cli_with_daemon(&["doctor", "--json"], &installed_daemon)
+        .output()?;
+    assert!(
+        output.status.success(),
+        "upgrade recovery failed: status={:?}, stdout={}, stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert!(report["checks"].is_array());
+    env.reap_fixture()?;
+
+    let status = env
+        .cli_with_daemon(&["daemon", "status", "--json"], &installed_daemon)
+        .output()?;
+    assert!(
+        status.status.success(),
+        "replacement status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
+    let current_pid = status["pid"]
+        .as_u64()
+        .ok_or("replacement daemon PID missing")?;
+    assert_eq!(status["state"], "running");
+    assert_eq!(status["health"], "healthy");
+    assert_eq!(status["running_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        status["executable"].as_str(),
+        installed_daemon.to_str(),
+        "replacement did not attest the stable installed pathname"
+    );
+    assert_ne!(current_pid, u64::from(predecessor_pid));
+    assert!(
+        !Command::new("/bin/kill")
+            .args(["-0", &predecessor_pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?
+            .success(),
+        "predecessor remained live after replacement"
+    );
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-0", &current_pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?
+            .success(),
+        "current replacement is not live"
+    );
+    let current_pid = u32::try_from(current_pid)?;
+    let current_start_identity = process_start_identity(current_pid)?;
+    drop(env);
+    let replacement_survived_cleanup =
+        process_matches(current_pid, &current_start_identity, &installed_daemon)?;
+    if replacement_survived_cleanup {
+        let _ = Command::new("/bin/kill")
+            .args(["-KILL", &current_pid.to_string()])
+            .status();
+    }
+    assert!(
+        !replacement_survived_cleanup,
+        "failure-safe environment cleanup left the replacement daemon live"
+    );
+    let _keep_installed_fixture_alive = installed_fixture;
     Ok(())
 }
 

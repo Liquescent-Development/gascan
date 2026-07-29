@@ -327,8 +327,8 @@ When no daemon is running, human status is:
 
 JSON reports `state` and `health` as `stopped`.
 
-By default, stop and restart wait for active sandbox operations and attachments
-to finish gracefully. Use `--force` only when necessary: `--force` may
+By default, stop and restart wait for active sandbox operations to finish, then cancel
+active attachment streams. Use `--force` only when necessary: `--force` may
 interrupt active sandbox operations and attachments.
 
 `gascan doctor` checks the workspace from which you run `gascan doctor`, not

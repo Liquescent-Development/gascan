@@ -47,21 +47,34 @@ fn write_daemon_instance_record(
 ) -> io::Result<Option<crate::socket::OwnedInstanceRecord>> {
     let configured_path =
         std::env::var_os("GASCAN_DAEMON_INSTANCE_PATH").map(std::path::PathBuf::from);
-    let owner_token = match std::env::var("GASCAN_DAEMON_OWNER_TOKEN") {
-        Ok(value) if !value.is_empty() => value,
-        Ok(_) => {
+    let configured_owner = std::env::var_os("GASCAN_DAEMON_OWNER_TOKEN");
+    #[cfg(debug_assertions)]
+    if configured_path.is_none()
+        && configured_owner.is_none()
+        && std::env::var_os("GASCAN_E2E_LEGACY_WIRE_IDENTITY").is_some()
+    {
+        return Ok(None);
+    }
+    let owner_token = match configured_owner {
+        Some(value) if value.is_empty() => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "daemon owner token must not be empty",
             ));
         }
-        Err(_) if configured_path.is_none() => return Ok(None),
-        Err(_) => {
+        Some(value) => value.into_string().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "daemon owner token must be valid UTF-8",
+            )
+        })?,
+        None if configured_path.is_some() => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "daemon owner token is required",
             ));
         }
+        None => fresh_token()?,
     };
     let path = configured_path.unwrap_or_else(|| paths.instance().to_owned());
     let record = DaemonInstanceRecord {
@@ -93,9 +106,7 @@ struct DaemonIdentity {
 impl DaemonIdentity {
     fn current() -> io::Result<Self> {
         let pid = std::process::id();
-        let mut random = [0_u8; 32];
-        getrandom::fill(&mut random).map_err(io::Error::other)?;
-        let instance_token = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let instance_token = fresh_token()?;
         let started_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(io::Error::other)?;
@@ -111,6 +122,12 @@ impl DaemonIdentity {
             },
         })
     }
+}
+
+fn fresh_token() -> io::Result<String> {
+    let mut random = [0_u8; 32];
+    getrandom::fill(&mut random).map_err(io::Error::other)?;
+    Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 #[cfg(target_os = "linux")]
@@ -136,6 +153,9 @@ fn process_start_identity(pid: u32) -> io::Result<String> {
     use std::process::Stdio;
     let mut child = std::process::Command::new("/bin/ps")
         .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .env("TZ", "UTC")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

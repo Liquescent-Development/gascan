@@ -21,6 +21,8 @@ const INSTANCE_NAME: &str = "daemon-instance.json";
 const LIFECYCLE_LOCK_NAME: &str = "daemon-lifecycle.lock";
 const MAX_INSTANCE_BYTES: u64 = 64 * 1024;
 const LIFECYCLE_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
+const ENDPOINT_CHANGED_DURING_PROBE: &str =
+    "daemon endpoint pathname changed during the successful probe";
 #[cfg(target_os = "macos")]
 const PROCESS_INSPECTION_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -269,7 +271,8 @@ pub(crate) trait DaemonEndpoint: Send + Sync {
 
     async fn probe(
         &self,
-        path: &Path,
+        paths: &DaemonPaths,
+        expected_path: EndpointPathState,
     ) -> Result<EndpointProbe<Self::Connection>, crate::client::ClientError>;
 
     async fn graceful_shutdown(
@@ -749,6 +752,32 @@ pub(crate) fn read_attested_instance<P: ProcessInspector>(
     Ok(Some(record))
 }
 
+async fn probe_authenticated<E: DaemonEndpoint>(
+    paths: &DaemonPaths,
+    endpoint: &E,
+) -> Result<EndpointProbe<E::Connection>, crate::client::ClientError> {
+    let before = match inspect_endpoint_path(paths) {
+        Ok(state) => state,
+        Err(error) => return Ok(EndpointProbe::Unsafe(error.to_string())),
+    };
+    let probe = endpoint.probe(paths, before).await?;
+    let after = match inspect_endpoint_path(paths) {
+        Ok(state) => state,
+        Err(error) => return Ok(EndpointProbe::Unsafe(error.to_string())),
+    };
+    match (before, after) {
+        (EndpointPathState::Absent, EndpointPathState::Absent) => Ok(probe),
+        (EndpointPathState::SafeSocket(before), EndpointPathState::SafeSocket(after))
+            if before == after =>
+        {
+            Ok(probe)
+        }
+        _ => Ok(EndpointProbe::Unsafe(
+            ENDPOINT_CHANGED_DURING_PROBE.to_owned(),
+        )),
+    }
+}
+
 pub(crate) async fn inspect_with<E, P>(
     paths: &DaemonPaths,
     expected_executable: &Path,
@@ -764,7 +793,7 @@ where
         match open_interrupted_tombstone(paths) {
             Ok(tombstone) => tombstone,
             Err(error) => {
-                let _ = endpoint.probe(paths.socket()).await?;
+                let _ = probe_authenticated(paths, endpoint).await?;
                 return Ok(Inspection {
                     status: DaemonStatus {
                         state: DaemonState::Unsafe,
@@ -786,7 +815,7 @@ where
         Ok(Some(record)) => open_published_record(paths, record).map(Some),
         Ok(None) | Err(_) => Ok(None),
     };
-    let probe = endpoint.probe(paths.socket()).await?;
+    let probe = probe_authenticated(paths, endpoint).await?;
     if let Some(tombstone) = interrupted_tombstone {
         return Ok(match probe {
             EndpointProbe::AbsentOrInert => Inspection {
@@ -1031,6 +1060,7 @@ where
     }
     let launch = daemon_launch(paths, expected_executable)?;
     spawner.spawn(&launch)?;
+    let expected_owner_token = launch.owner_token;
     let deadline = tokio::time::Instant::now() + timeouts.readiness;
     loop {
         let inspected = match tokio::time::timeout_at(
@@ -1050,7 +1080,32 @@ where
             }
         };
         match inspected.status.state {
-            DaemonState::Current => return Ok((inspected, true)),
+            DaemonState::Current
+                if inspected
+                    .record
+                    .as_ref()
+                    .is_some_and(|record| record.owner_token == expected_owner_token) =>
+            {
+                return Ok((inspected, true));
+            }
+            DaemonState::Current
+                if inspected.record.is_none() && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep_until(std::cmp::min(
+                    deadline,
+                    tokio::time::Instant::now() + timeouts.poll,
+                ))
+                .await;
+            }
+            DaemonState::Current => {
+                return Err(SupervisorError::Readiness {
+                    state: DaemonState::Unhealthy,
+                    detail: Some(
+                        "started daemon record does not carry this launch's fresh owner token"
+                            .to_owned(),
+                    ),
+                });
+            }
             DaemonState::Stopped | DaemonState::Unreachable
                 if tokio::time::Instant::now() < deadline =>
             {
@@ -1063,6 +1118,16 @@ where
             DaemonState::Unsafe
                 if inspected.session.is_some()
                     && inspected.interrupted_tombstone.is_some()
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep_until(std::cmp::min(
+                    deadline,
+                    tokio::time::Instant::now() + timeouts.poll,
+                ))
+                .await;
+            }
+            DaemonState::Unsafe
+                if inspected.status.detail.as_deref() == Some(ENDPOINT_CHANGED_DURING_PROBE)
                     && tokio::time::Instant::now() < deadline =>
             {
                 tokio::time::sleep_until(std::cmp::min(
@@ -1146,7 +1211,7 @@ async fn prove_endpoint_absent_or_inert<E: DaemonEndpoint>(
     let before = inspect_endpoint_path(paths).map_err(|error| SupervisorError::TombstoneBusy {
         detail: format!("{context} found an unsafe endpoint path: {error}"),
     })?;
-    let probe = endpoint.probe(paths.socket()).await?;
+    let probe = endpoint.probe(paths, before).await?;
     let after = inspect_endpoint_path(paths).map_err(|error| SupervisorError::TombstoneBusy {
         detail: format!("{context} found an unsafe endpoint path after probing: {error}"),
     })?;
@@ -1384,11 +1449,14 @@ where
                 detail: "legacy endpoint path disappeared before re-attestation".to_owned(),
             });
         }
-        let second = tokio::time::timeout_at(graceful_deadline, endpoint.probe(paths.socket()))
-            .await
-            .map_err(|_| SupervisorError::IdentityChanged {
-                detail: "legacy endpoint re-attestation timed out".to_owned(),
-            })??;
+        let second = tokio::time::timeout_at(
+            graceful_deadline,
+            endpoint.probe(paths, endpoint_path_before),
+        )
+        .await
+        .map_err(|_| SupervisorError::IdentityChanged {
+            detail: "legacy endpoint re-attestation timed out".to_owned(),
+        })??;
         let endpoint_path_after =
             inspect_endpoint_path(paths).map_err(|error| SupervisorError::IdentityChanged {
                 detail: format!("legacy endpoint path changed during re-attestation: {error}"),
@@ -1430,13 +1498,15 @@ where
                 .ok_or_else(|| SupervisorError::IdentityChanged {
                     detail: "running daemon lost its connected session".to_owned(),
                 })?;
-        if let Ok(result) = tokio::time::timeout_at(
+        if let Ok(Err(error)) = tokio::time::timeout_at(
             graceful_deadline,
             endpoint.graceful_shutdown(&mut session.connection, &identity.instance_token),
         )
         .await
         {
-            result?;
+            if !policy.mode.allows_force() || graceful_error_forbids_force(&error) {
+                return Err(error.into());
+            }
         }
     }
 
@@ -1497,6 +1567,17 @@ where
         transition: DaemonTransition::Stopped,
         forced: true,
     })
+}
+
+fn graceful_error_forbids_force(error: &crate::client::ClientError) -> bool {
+    match error {
+        crate::client::ClientError::Rpc(status) => matches!(
+            status.code(),
+            tonic::Code::PermissionDenied | tonic::Code::Unauthenticated
+        ),
+        crate::client::ClientError::Api(_) => true,
+        crate::client::ClientError::Io(_) | crate::client::ClientError::Transport(_) => false,
+    }
 }
 
 pub(crate) async fn restart_with<E, P, Spawn, Signal>(
@@ -1604,18 +1685,6 @@ where
     let initial = inspect_with(paths, expected_executable, endpoint, inspector).await?;
     if initial.status.state == DaemonState::Current {
         return connected_outcome(initial, DaemonTransition::None);
-    }
-    let recoverable_tombstone =
-        initial.interrupted_tombstone.is_some() && initial.session.is_none();
-    if !matches!(
-        initial.status.state,
-        DaemonState::Stopped | DaemonState::Outdated
-    ) && !recoverable_tombstone
-    {
-        return Err(SupervisorError::InvalidState {
-            state: initial.status.state,
-            detail: initial.status.detail,
-        });
     }
 
     let _lock = paths.lock_async().await?;
@@ -2017,6 +2086,13 @@ async fn classify_connected<C, P: ProcessInspector>(
             session,
         ));
     }
+    if identity.executable != expected_executable {
+        return Ok(unhealthy(
+            "daemon endpoint is not the trusted installed executable".to_owned(),
+            record,
+            session,
+        ));
+    }
     if let Some(published) = &record {
         if !record_matches_endpoint(published, identity) {
             return Ok(unhealthy(
@@ -2025,16 +2101,10 @@ async fn classify_connected<C, P: ProcessInspector>(
                 session,
             ));
         }
-    } else if identity.executable != expected_executable {
-        return Ok(unhealthy(
-            "daemon without a protected record is not the installed executable".to_owned(),
-            record,
-            session,
-        ));
     }
 
     let process =
-        match inspect_process_supervised(inspector, identity.pid, &identity.executable).await {
+        match inspect_process_supervised(inspector, identity.pid, expected_executable).await {
             Ok(Some(process)) => process,
             Ok(None) => {
                 return Ok(unhealthy(
@@ -2201,6 +2271,14 @@ async fn classify_unresponsive<C, P: ProcessInspector>(
 }
 
 fn validate_endpoint_identity(identity: &DaemonIdentity) -> io::Result<()> {
+    if let Some(release_version) = &identity.release_version {
+        semver::Version::parse(release_version).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("daemon endpoint release version is not valid SemVer: {error}"),
+            )
+        })?;
+    }
     if identity.pid == 0
         || !identity.executable.is_absolute()
         || identity.start_identity.is_empty()
@@ -2209,10 +2287,6 @@ fn validate_endpoint_identity(identity: &DaemonIdentity) -> io::Result<()> {
             .instance_token
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        || identity
-            .release_version
-            .as_ref()
-            .is_some_and(String::is_empty)
         || identity.started_at.as_ref().is_some_and(|timestamp| {
             timestamp.seconds <= 0 || !(0..1_000_000_000).contains(&timestamp.nanos)
         })
@@ -2558,6 +2632,12 @@ fn validate_instance_tombstone(
 }
 
 fn validate_record(record: &DaemonInstanceRecord) -> io::Result<()> {
+    semver::Version::parse(&record.release_version).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("daemon record release version is not valid SemVer: {error}"),
+        )
+    })?;
     if record.pid == 0
         || record.owner_token.is_empty()
         || !record.executable.is_absolute()
@@ -2567,7 +2647,6 @@ fn validate_record(record: &DaemonInstanceRecord) -> io::Result<()> {
             .instance_token
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        || record.release_version.is_empty()
         || record.started_at.seconds <= 0
         || !(0..1_000_000_000).contains(&record.started_at.nanos)
     {
@@ -2580,7 +2659,7 @@ fn validate_record(record: &DaemonInstanceRecord) -> io::Result<()> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EndpointPathState {
+pub(crate) enum EndpointPathState {
     Absent,
     SafeSocket(FileIdentity),
 }
@@ -2621,12 +2700,25 @@ fn inspect_endpoint_path(paths: &DaemonPaths) -> io::Result<EndpointPathState> {
     }))
 }
 
+pub(crate) fn validate_endpoint_path_identity(
+    paths: &DaemonPaths,
+    expected: FileIdentity,
+) -> io::Result<()> {
+    match inspect_endpoint_path(paths)? {
+        EndpointPathState::SafeSocket(observed) if observed == expected => Ok(()),
+        EndpointPathState::Absent | EndpointPathState::SafeSocket(_) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "daemon endpoint pathname changed before transport authentication completed",
+        )),
+    }
+}
+
 fn validate_inert_endpoint(paths: &DaemonPaths) -> io::Result<()> {
     inspect_endpoint_path(paths).map(drop)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FileIdentity {
+pub(crate) struct FileIdentity {
     device: u64,
     inode: u64,
 }
@@ -3052,6 +3144,9 @@ fn ps_field(pid: u32, field: &str) -> io::Result<Option<String>> {
     use std::process::Stdio;
     let mut child = std::process::Command::new("/bin/ps")
         .args(["-ww", "-p", &pid.to_string(), "-o", field])
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .env("TZ", "UTC")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -3101,11 +3196,12 @@ mod tests {
     use super::{
         AttestedProcessSignaler, ConnectionOutcome, DaemonEndpoint, DaemonIdentity,
         DaemonInstanceRecord, DaemonLaunch, DaemonLifecycleObserver, DaemonPaths, DaemonSpawner,
-        DaemonState, DaemonTransition, EndpointProbe, EndpointSession, InstanceTimestamp,
-        OsProcessInspector, ProcessIdentity, ProcessInspector, ProcessSignaler, ShutdownPolicy,
-        StopMode, SupervisorError, SupervisorTimeouts, checked_pid, coherent_process_identity,
-        connect_current_or_recover_with, connect_current_or_recover_with_observer, inspect_with,
-        read_attested_instance, read_instance_record_with_hook, restart_with, signal_attested_with,
+        DaemonState, DaemonTransition, EndpointPathState, EndpointProbe, EndpointSession,
+        InstanceTimestamp, OsProcessInspector, ProcessIdentity, ProcessInspector, ProcessSignaler,
+        ShutdownPolicy, StopMode, SupervisorError, SupervisorTimeouts, checked_pid,
+        coherent_process_identity, connect_current_or_recover_with,
+        connect_current_or_recover_with_observer, inspect_with, read_attested_instance,
+        read_instance_record_with_hook, restart_with, signal_attested_with,
         signal_attested_with_deadline, signal_identity, start_with, stop_with, wait_for_exit_until,
     };
     #[cfg(target_os = "macos")]
@@ -3410,6 +3506,29 @@ mod tests {
         Ok(())
     }
 
+    fn publish_fake_socket_for_connected_probe(
+        path: &Path,
+        probe: &EndpointProbe<()>,
+    ) -> io::Result<()> {
+        if !matches!(probe, EndpointProbe::Connected(_)) {
+            return Ok(());
+        }
+        match fs::symlink_metadata(path) {
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::other("fake endpoint socket has no parent"))?;
+        fs::create_dir_all(parent)?;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        let listener = std::os::unix::net::UnixListener::bind(path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        drop(listener);
+        Ok(())
+    }
+
     #[derive(Clone)]
     struct FakeEndpoint {
         probe: EndpointProbe<()>,
@@ -3431,9 +3550,12 @@ mod tests {
 
         async fn probe(
             &self,
-            _path: &Path,
+            paths: &DaemonPaths,
+            _expected_path: EndpointPathState,
         ) -> Result<EndpointProbe<Self::Connection>, crate::client::ClientError> {
             self.probes.fetch_add(1, AtomicOrdering::AcqRel);
+            publish_fake_socket_for_connected_probe(paths.socket(), &self.probe)
+                .map_err(crate::client::ClientError::Io)?;
             Ok(self.probe.clone())
         }
 
@@ -3445,6 +3567,46 @@ mod tests {
             Err(crate::client::ClientError::Api(
                 "unexpected_shutdown".to_owned(),
             ))
+        }
+    }
+
+    #[derive(Clone)]
+    struct SocketReplacingEndpoint {
+        paths: DaemonPaths,
+        identity: DaemonIdentity,
+        replaced: Arc<AtomicBool>,
+        shutdowns: Arc<AtomicUsize>,
+    }
+
+    #[tonic::async_trait]
+    impl DaemonEndpoint for SocketReplacingEndpoint {
+        type Connection = ();
+
+        async fn probe(
+            &self,
+            _paths: &DaemonPaths,
+            _expected_path: EndpointPathState,
+        ) -> Result<EndpointProbe<Self::Connection>, crate::client::ClientError> {
+            if !self.replaced.swap(true, Ordering::AcqRel) {
+                let original = self.paths.directory().join("original.sock");
+                fs::rename(self.paths.socket(), original)
+                    .map_err(crate::client::ClientError::Io)?;
+                let replacement = std::os::unix::net::UnixListener::bind(self.paths.socket())
+                    .map_err(crate::client::ClientError::Io)?;
+                fs::set_permissions(self.paths.socket(), fs::Permissions::from_mode(0o600))
+                    .map_err(crate::client::ClientError::Io)?;
+                drop(replacement);
+            }
+            Ok(connected(self.identity.clone()))
+        }
+
+        async fn graceful_shutdown(
+            &self,
+            _connection: &mut Self::Connection,
+            _instance_token: &str,
+        ) -> Result<(), crate::client::ClientError> {
+            self.shutdowns.fetch_add(1, AtomicOrdering::AcqRel);
+            Ok(())
         }
     }
 
@@ -3508,6 +3670,7 @@ mod tests {
         let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
         let expected = record(&executable);
         write_record(&paths, &expected)?;
+        let _listener = bind_safe_test_socket(&paths)?;
         let endpoint = FakeEndpoint::new(connected(endpoint_identity(&expected)));
 
         let inspected = inspect_with(
@@ -3528,6 +3691,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn classification_rejects_a_responding_endpoint_reached_through_a_symlink() -> TestResult
+    {
+        let temp = tempfile::tempdir()?;
+        let root = root(&temp)?;
+        let paths = DaemonPaths::from_runtime_root(root.join("runtime"));
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let expected = record(&executable);
+        let foreign_directory = root.join("foreign");
+        fs::create_dir(&foreign_directory)?;
+        let foreign_socket = foreign_directory.join("foreign.sock");
+        let _foreign = std::os::unix::net::UnixListener::bind(&foreign_socket)?;
+        paths.prepare_directory()?;
+        std::os::unix::fs::symlink(&foreign_socket, paths.socket())?;
+        let endpoint = FakeEndpoint::new(connected(endpoint_identity(&expected)));
+
+        let inspected = inspect_with(
+            &paths,
+            &executable,
+            &endpoint,
+            &matching_inspector(&expected),
+        )
+        .await?;
+
+        assert_eq!(inspected.status().state, DaemonState::Unsafe);
+        assert!(
+            inspected.session.is_none(),
+            "an unauthenticated symlink endpoint retained a usable session"
+        );
+        assert_eq!(
+            endpoint.probes.load(AtomicOrdering::Acquire),
+            0,
+            "the foreign endpoint received a probe before pathname authentication"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stop_rejects_a_safe_socket_replaced_during_probe_without_rpc_or_signal() -> TestResult
+    {
+        let temp = tempfile::tempdir()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let expected = record(&executable);
+        write_record(&paths, &expected)?;
+        let _original = bind_safe_test_socket(&paths)?;
+        let endpoint = SocketReplacingEndpoint {
+            paths: paths.clone(),
+            identity: endpoint_identity(&expected),
+            replaced: Arc::new(AtomicBool::new(false)),
+            shutdowns: Arc::new(AtomicUsize::new(0)),
+        };
+        let signaler = NeverSignaler::default();
+
+        let result = stop_with(
+            &paths,
+            &executable,
+            &endpoint,
+            &matching_inspector(&expected),
+            &signaler,
+            StopMode::Explicit { force: true },
+            test_timeouts(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(SupervisorError::InvalidState {
+                state: DaemonState::Unsafe,
+                ..
+            })
+        ));
+        assert_eq!(
+            endpoint.shutdowns.load(AtomicOrdering::Acquire),
+            0,
+            "a replacement endpoint received the shutdown RPC"
+        );
+        assert_eq!(
+            signaler.signals.load(AtomicOrdering::Acquire),
+            0,
+            "a process was signaled after endpoint replacement"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tonic_probe_sends_no_protocol_bytes_after_the_socket_precheck_is_invalidated()
+    -> TestResult {
+        use std::io::Read as _;
+
+        let temp = tempfile::tempdir()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        let original = bind_safe_test_socket(&paths)?;
+        let before = super::inspect_endpoint_path(&paths)?;
+        let retired = paths.directory().join("retired.sock");
+        fs::rename(paths.socket(), &retired)?;
+        let foreign = std::os::unix::net::UnixListener::bind(paths.socket())?;
+        fs::set_permissions(paths.socket(), fs::Permissions::from_mode(0o600))?;
+        foreign.set_nonblocking(true)?;
+        let reader = std::thread::spawn(move || -> io::Result<Vec<u8>> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            let (mut stream, _) = loop {
+                match foreign.accept() {
+                    Ok(accepted) => break accepted,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return Ok(Vec::new());
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            stream.set_nonblocking(true)?;
+            let mut bytes = vec![0_u8; 64];
+            let read_deadline = std::time::Instant::now() + Duration::from_secs(1);
+            let read = loop {
+                match stream.read(&mut bytes) {
+                    Ok(read) => break read,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= read_deadline {
+                            break 0;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            bytes.truncate(read);
+            Ok(bytes)
+        });
+
+        let _probe = crate::client::TonicEndpoint.probe(&paths, before).await?;
+        let observed = reader
+            .join()
+            .map_err(|_| io::Error::other("foreign endpoint reader panicked"))??;
+        assert!(
+            observed.is_empty(),
+            "a socket substituted after the precheck received protocol bytes: {observed:?}"
+        );
+        drop(original);
+        assert_ne!(before, super::inspect_endpoint_path(&paths)?);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn classification_running_outdated_uses_exact_release_comparison() -> TestResult {
         let temp = tempfile::tempdir()?;
         let executable = std::env::current_exe()?.canonicalize()?;
@@ -3535,6 +3843,7 @@ mod tests {
         let mut expected = record(&executable);
         expected.release_version = "0.1.10".to_owned();
         write_record(&paths, &expected)?;
+        let _listener = bind_safe_test_socket(&paths)?;
         let endpoint = FakeEndpoint::new(connected(endpoint_identity(&expected)));
 
         let inspected = inspect_with(
@@ -3547,6 +3856,98 @@ mod tests {
 
         assert_eq!(inspected.status().state, DaemonState::Outdated);
         assert!(!inspected.status().legacy);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn classification_malformed_endpoint_release_is_unhealthy_not_outdated() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        let mut identity = endpoint_identity(&record(&executable));
+        identity.release_version = Some("definitely not semver".to_owned());
+        let inspector = FakeInspector {
+            identity: Some(process_for(&identity)),
+        };
+        let _listener = bind_safe_test_socket(&paths)?;
+        let endpoint = FakeEndpoint::new(connected(identity));
+
+        let inspected = inspect_with(&paths, &executable, &endpoint, &inspector).await?;
+
+        assert_eq!(inspected.status().state, DaemonState::Unhealthy);
+        assert!(
+            inspected
+                .status()
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("release version"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn classification_malformed_record_release_is_unsafe_not_outdated() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        let mut expected = record(&executable);
+        expected.release_version = "not@semver".to_owned();
+        write_record(&paths, &expected)?;
+        let _listener = bind_safe_test_socket(&paths)?;
+        let endpoint = FakeEndpoint::new(connected(endpoint_identity(&expected)));
+
+        let inspected = inspect_with(
+            &paths,
+            &executable,
+            &endpoint,
+            &matching_inspector(&expected),
+        )
+        .await?;
+
+        assert_eq!(inspected.status().state, DaemonState::Unsafe);
+        assert!(
+            inspected
+                .status()
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("release version"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn classification_protected_record_cannot_bypass_the_installed_executable() -> TestResult
+    {
+        let temp = tempfile::tempdir()?;
+        let root = root(&temp)?;
+        let installed = root.join("installed/gascand");
+        let unrelated = root.join("unrelated/gascand");
+        fs::create_dir_all(installed.parent().ok_or("installed parent missing")?)?;
+        fs::create_dir_all(unrelated.parent().ok_or("unrelated parent missing")?)?;
+        fs::write(&installed, b"installed")?;
+        fs::write(&unrelated, b"unrelated")?;
+        let paths = DaemonPaths::from_runtime_root(root.join("runtime"));
+        let expected = record(&unrelated);
+        write_record(&paths, &expected)?;
+        let _listener = bind_safe_test_socket(&paths)?;
+        let endpoint = FakeEndpoint::new(connected(endpoint_identity(&expected)));
+
+        let inspected = inspect_with(
+            &paths,
+            &installed,
+            &endpoint,
+            &matching_inspector(&expected),
+        )
+        .await?;
+
+        assert_eq!(inspected.status().state, DaemonState::Unhealthy);
+        assert!(
+            inspected
+                .status()
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("installed executable"))
+        );
         Ok(())
     }
 
@@ -3570,13 +3971,13 @@ mod tests {
                 start_identity: identity.start_identity.clone(),
             }),
         };
+        let _listener = bind_safe_test_socket(&paths)?;
         let endpoint = FakeEndpoint::new(connected(identity));
 
         let inspected = inspect_with(&paths, &executable, &endpoint, &inspector).await?;
 
         assert_eq!(inspected.status().state, DaemonState::Outdated);
         assert!(inspected.status().legacy);
-        assert!(!paths.directory().exists());
         Ok(())
     }
 
@@ -3587,6 +3988,7 @@ mod tests {
         let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
         let expected = record(&executable);
         write_record(&paths, &expected)?;
+        let _listener = bind_safe_test_socket(&paths)?;
         let mut contradictory = endpoint_identity(&expected);
         contradictory.instance_token = "33".repeat(32);
         let endpoint = FakeEndpoint::new(connected(contradictory));
@@ -3712,17 +4114,22 @@ mod tests {
 
         async fn probe(
             &self,
-            _path: &Path,
+            paths: &DaemonPaths,
+            _expected_path: EndpointPathState,
         ) -> Result<EndpointProbe<Self::Connection>, crate::client::ClientError> {
             self.probes.fetch_add(1, AtomicOrdering::AcqRel);
-            self.probe
+            let probe = self
+                .probe
                 .lock()
                 .map_err(|_| {
                     crate::client::ClientError::Io(io::Error::other(
                         "fake endpoint state was poisoned",
                     ))
                 })
-                .map(|probe| probe.clone())
+                .map(|probe| probe.clone())?;
+            publish_fake_socket_for_connected_probe(paths.socket(), &probe)
+                .map_err(crate::client::ClientError::Io)?;
+            Ok(probe)
         }
 
         async fn graceful_shutdown(
@@ -3783,9 +4190,10 @@ mod tests {
 
         async fn probe(
             &self,
-            path: &Path,
+            paths: &DaemonPaths,
+            expected_path: EndpointPathState,
         ) -> Result<EndpointProbe<Self::Connection>, crate::client::ClientError> {
-            let probe = self.endpoint.probe(path).await?;
+            let probe = self.endpoint.probe(paths, expected_path).await?;
             if matches!(&probe, EndpointProbe::Connected(_)) {
                 self.gate
                     .observe_connected_probe()
@@ -3907,6 +4315,7 @@ mod tests {
         launches: Arc<Mutex<Vec<DaemonLaunch>>>,
         release_version: String,
         endpoint_token: Option<String>,
+        owner_token: Option<String>,
         gate: Option<Arc<SpawnGate>>,
     }
 
@@ -3918,6 +4327,7 @@ mod tests {
                 launches: Arc::new(Mutex::new(Vec::new())),
                 release_version: env!("CARGO_PKG_VERSION").to_owned(),
                 endpoint_token: None,
+                owner_token: None,
                 gate: None,
             }
         }
@@ -3938,7 +4348,10 @@ mod tests {
                 .push(launch.clone());
             let published = DaemonInstanceRecord {
                 pid: std::process::id(),
-                owner_token: launch.owner_token.clone(),
+                owner_token: self
+                    .owner_token
+                    .clone()
+                    .unwrap_or_else(|| launch.owner_token.clone()),
                 executable: launch.executable.clone(),
                 start_identity: "spawned-start".to_owned(),
                 instance_token: "44".repeat(32),
@@ -3973,6 +4386,7 @@ mod tests {
         inspector: MutableInspector,
         gate: Arc<PublicationProbeGate>,
         publisher: Arc<Mutex<Option<std::thread::JoinHandle<io::Result<()>>>>>,
+        initial_tombstone: bool,
     }
 
     impl DelayedPublicationSpawner {
@@ -4003,8 +4417,15 @@ mod tests {
                     nanos: 456_000_000,
                 },
             };
-            fs::write(&launch.instance_path, b"publication-in-progress")?;
-            fs::set_permissions(&launch.instance_path, fs::Permissions::from_mode(0o200))?;
+            if self.initial_tombstone {
+                fs::write(&launch.instance_path, b"publication-in-progress")?;
+                fs::set_permissions(&launch.instance_path, fs::Permissions::from_mode(0o200))?;
+            } else {
+                let socket = launch.current_dir.join(super::SOCKET_NAME);
+                let listener = std::os::unix::net::UnixListener::bind(&socket)?;
+                fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
+                drop(listener);
+            }
             self.inspector.set(Some(ProcessIdentity {
                 pid: published.pid,
                 executable: published.executable.clone(),
@@ -4062,6 +4483,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_readiness_rejects_a_record_with_the_wrong_launch_owner_token() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let endpoint = MutableEndpoint::new(EndpointProbe::AbsentOrInert);
+        let inspector = MutableInspector::new(None);
+        let mut configured = FakeSpawner::current(endpoint.clone(), inspector.clone());
+        configured.owner_token = Some("not-this-launch".to_owned());
+
+        let result = start_with(
+            &paths,
+            &executable,
+            &endpoint,
+            &inspector,
+            &configured,
+            test_timeouts(),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                &result,
+                Err(SupervisorError::Readiness {
+                    state: DaemonState::Unhealthy,
+                    ..
+                })
+            ),
+            "unexpected readiness result: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn start_readiness_waits_for_its_own_connected_publication_to_finish() -> TestResult {
         let temp = tempfile::tempdir()?;
         let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
@@ -4078,6 +4532,48 @@ mod tests {
             inspector: inspector.clone(),
             gate,
             publisher: Arc::new(Mutex::new(None)),
+            initial_tombstone: true,
+        };
+
+        let outcome = start_with(
+            &paths,
+            &executable,
+            &publication_endpoint,
+            &inspector,
+            &spawner,
+            SupervisorTimeouts {
+                readiness: Duration::from_millis(200),
+                shutdown: Duration::from_millis(25),
+                poll: Duration::from_millis(1),
+            },
+        )
+        .await;
+        spawner.finish()?;
+        let outcome = outcome?;
+
+        assert_eq!(outcome.status.state, DaemonState::Current);
+        assert_eq!(outcome.transition, DaemonTransition::Started);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn start_readiness_waits_when_the_endpoint_precedes_its_record() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let endpoint = MutableEndpoint::new(EndpointProbe::AbsentOrInert);
+        let inspector = MutableInspector::new(None);
+        let gate = Arc::new(PublicationProbeGate::default());
+        let publication_endpoint = PublicationEndpoint {
+            endpoint: endpoint.clone(),
+            gate: gate.clone(),
+        };
+        let spawner = DelayedPublicationSpawner {
+            endpoint,
+            inspector: inspector.clone(),
+            gate,
+            publisher: Arc::new(Mutex::new(None)),
+            initial_tombstone: false,
         };
 
         let outcome = start_with(
@@ -4108,6 +4604,7 @@ mod tests {
         let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
         let expected = record(&executable);
         write_record(&paths, &expected)?;
+        let _listener = bind_safe_test_socket(&paths)?;
         let endpoint = MutableEndpoint::new(connected(endpoint_identity(&expected)));
         let inspector = MutableInspector::new(matching_inspector(&expected).identity);
         let spawner = FakeSpawner::current(endpoint.clone(), inspector.clone());
@@ -4136,6 +4633,7 @@ mod tests {
         let mut expected = record(&executable);
         expected.release_version = "0.1.10".to_owned();
         write_record(&paths, &expected)?;
+        let _listener = bind_safe_test_socket(&paths)?;
         let endpoint = MutableEndpoint::new(connected(endpoint_identity(&expected)));
         let inspector = MutableInspector::new(matching_inspector(&expected).identity);
         let spawner = FakeSpawner::current(endpoint.clone(), inspector.clone());
@@ -4398,7 +4896,8 @@ mod tests {
 
         async fn probe(
             &self,
-            _path: &Path,
+            _paths: &DaemonPaths,
+            _expected_path: EndpointPathState,
         ) -> Result<EndpointProbe<Self::Connection>, crate::client::ClientError> {
             let probe = self.probes.fetch_add(1, AtomicOrdering::AcqRel) + 1;
             if probe == self.replace_on_probe {
@@ -4440,7 +4939,8 @@ mod tests {
 
         async fn probe(
             &self,
-            _path: &Path,
+            _paths: &DaemonPaths,
+            _expected_path: EndpointPathState,
         ) -> Result<EndpointProbe<Self::Connection>, crate::client::ClientError> {
             let probe = self.probes.fetch_add(1, AtomicOrdering::AcqRel) + 1;
             if probe == self.replace_on_probe {
@@ -4659,7 +5159,8 @@ mod tests {
         fs::set_permissions(paths.socket(), fs::Permissions::from_mode(0o600))?;
         drop(listener);
 
-        let probe = crate::client::TonicEndpoint.probe(paths.socket()).await?;
+        let before = super::inspect_endpoint_path(&paths)?;
+        let probe = crate::client::TonicEndpoint.probe(&paths, before).await?;
 
         assert!(matches!(probe, EndpointProbe::AbsentOrInert));
         Ok(())
@@ -4769,6 +5270,13 @@ mod tests {
         Ok(())
     }
 
+    #[derive(Clone, Copy)]
+    enum ShutdownFailure {
+        Transport,
+        Internal,
+        PermissionDenied,
+    }
+
     #[derive(Clone)]
     struct StopEndpoint {
         state: Arc<Mutex<EndpointProbe<()>>>,
@@ -4778,6 +5286,7 @@ mod tests {
         retire_path: Arc<Mutex<Option<PathBuf>>>,
         exit_on_shutdown: bool,
         stall_shutdown: bool,
+        shutdown_failure: Option<ShutdownFailure>,
         stall_second_probe: bool,
         probes: Arc<AtomicUsize>,
     }
@@ -4796,6 +5305,7 @@ mod tests {
                 retire_path: Arc::new(Mutex::new(None)),
                 exit_on_shutdown,
                 stall_shutdown: false,
+                shutdown_failure: None,
                 stall_second_probe: false,
                 probes: Arc::new(AtomicUsize::new(0)),
             }
@@ -4817,6 +5327,7 @@ mod tests {
                 retire_path: Arc::new(Mutex::new(None)),
                 exit_on_shutdown: false,
                 stall_shutdown: false,
+                shutdown_failure: None,
                 stall_second_probe: false,
                 probes: Arc::new(AtomicUsize::new(0)),
             })
@@ -4824,6 +5335,11 @@ mod tests {
 
         fn with_stalled_shutdown(mut self) -> Self {
             self.stall_shutdown = true;
+            self
+        }
+
+        fn with_shutdown_failure(mut self, failure: ShutdownFailure) -> Self {
+            self.shutdown_failure = Some(failure);
             self
         }
 
@@ -4878,13 +5394,14 @@ mod tests {
 
         async fn probe(
             &self,
-            _path: &Path,
+            paths: &DaemonPaths,
+            _expected_path: EndpointPathState,
         ) -> Result<EndpointProbe<Self::Connection>, crate::client::ClientError> {
             let probe = self.probes.fetch_add(1, AtomicOrdering::AcqRel) + 1;
             if self.stall_second_probe && probe == 2 {
                 return std::future::pending().await;
             }
-            if let Some(probe) = self
+            let state = if let Some(probe) = self
                 .queued
                 .lock()
                 .map_err(|_| {
@@ -4894,16 +5411,20 @@ mod tests {
                 })?
                 .pop_front()
             {
-                return Ok(probe);
-            }
-            self.state
-                .lock()
-                .map_err(|_| {
-                    crate::client::ClientError::Io(io::Error::other(
-                        "stop endpoint state was poisoned",
-                    ))
-                })
-                .map(|state| state.clone())
+                probe
+            } else {
+                self.state
+                    .lock()
+                    .map_err(|_| {
+                        crate::client::ClientError::Io(io::Error::other(
+                            "stop endpoint state was poisoned",
+                        ))
+                    })?
+                    .clone()
+            };
+            publish_fake_socket_for_connected_probe(paths.socket(), &state)
+                .map_err(crate::client::ClientError::Io)?;
+            Ok(state)
         }
 
         async fn graceful_shutdown(
@@ -4921,6 +5442,20 @@ mod tests {
                 .push(instance_token.to_owned());
             if self.stall_shutdown {
                 return std::future::pending().await;
+            }
+            if let Some(failure) = self.shutdown_failure {
+                return Err(match failure {
+                    ShutdownFailure::Transport => crate::client::ClientError::Io(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "connection reset",
+                    )),
+                    ShutdownFailure::Internal => crate::client::ClientError::Rpc(Box::new(
+                        tonic::Status::internal("daemon shutdown internal failure"),
+                    )),
+                    ShutdownFailure::PermissionDenied => crate::client::ClientError::Rpc(Box::new(
+                        tonic::Status::permission_denied("daemon instance token does not match"),
+                    )),
+                });
             }
             if self.exit_on_shutdown {
                 self.simulate_exit()?;
@@ -5129,6 +5664,7 @@ mod tests {
         let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
         let expected = record(&executable);
         write_record(&paths, &expected)?;
+        let _listener = bind_safe_test_socket(&paths)?;
         let inspector = MutableInspector::new(Some(process_for(&endpoint_identity(&expected))));
         let endpoint = StopEndpoint::new(
             connected(endpoint_identity(&expected)),
@@ -5161,6 +5697,7 @@ mod tests {
         let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
         let expected = record(&executable);
         write_record(&paths, &expected)?;
+        let _listener = bind_safe_test_socket(&paths)?;
         let inspector = MutableInspector::new(Some(process_for(&endpoint_identity(&expected))));
         let endpoint = StopEndpoint::new(
             connected(endpoint_identity(&expected)),
@@ -5195,6 +5732,7 @@ mod tests {
         let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
         let expected = record(&executable);
         write_record(&paths, &expected)?;
+        let _listener = bind_safe_test_socket(&paths)?;
         let inspector = MutableInspector::new(Some(process_for(&endpoint_identity(&expected))));
         let endpoint = StopEndpoint::new(
             connected(endpoint_identity(&expected)),
@@ -5235,6 +5773,7 @@ mod tests {
         let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
         let expected = record(&executable);
         write_record(&paths, &expected)?;
+        let _listener = bind_safe_test_socket(&paths)?;
         let inspector = MutableInspector::new(Some(process_for(&endpoint_identity(&expected))));
         inspector.stall_on_absent_inspection(2, Duration::from_millis(200))?;
         let endpoint = StopEndpoint::new(
@@ -5431,6 +5970,7 @@ mod tests {
         let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
         let expected = record(&executable);
         write_record(&paths, &expected)?;
+        let _listener = bind_safe_test_socket(&paths)?;
         let inspector = MutableInspector::new(Some(process_for(&endpoint_identity(&expected))));
         let endpoint = StopEndpoint::new(
             connected(endpoint_identity(&expected)),
@@ -5465,6 +6005,7 @@ mod tests {
         let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
         let expected = record(&executable);
         write_record(&paths, &expected)?;
+        let _listener = bind_safe_test_socket(&paths)?;
         let identity = endpoint_identity(&expected);
         let inspector = MutableInspector::new(Some(process_for(&identity)));
         let endpoint = StopEndpoint::new(connected(identity), inspector.clone(), false);
@@ -5500,6 +6041,85 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn stop_explicit_force_survives_attested_transport_and_internal_rpc_errors() -> TestResult
+    {
+        for (name, failure) in [
+            ("transport", ShutdownFailure::Transport),
+            ("internal", ShutdownFailure::Internal),
+        ] {
+            let temp = tempfile::tempdir()?;
+            let executable = std::env::current_exe()?.canonicalize()?;
+            let paths =
+                DaemonPaths::from_runtime_root(root(&temp)?.join(format!("runtime-{name}")));
+            let expected = record(&executable);
+            write_record(&paths, &expected)?;
+            let _listener = bind_safe_test_socket(&paths)?;
+            let identity = endpoint_identity(&expected);
+            let inspector = MutableInspector::new(Some(process_for(&identity)));
+            let endpoint = StopEndpoint::new(connected(identity), inspector.clone(), false)
+                .with_shutdown_failure(failure);
+            let signaler =
+                RecordingAttestedSignaler::new(inspector.clone(), endpoint.clone(), true);
+
+            let outcome = stop_with(
+                &paths,
+                &executable,
+                &endpoint,
+                &inspector,
+                &signaler,
+                StopMode::Explicit { force: true },
+                test_timeouts(),
+            )
+            .await?;
+
+            assert!(outcome.forced, "{name} failure did not reach force");
+            assert_eq!(
+                signaler.signals()?,
+                vec![rustix::process::Signal::KILL],
+                "{name} failure did not use the attested force path"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stop_explicit_force_never_bypasses_shutdown_token_authentication() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        let expected = record(&executable);
+        write_record(&paths, &expected)?;
+        let _listener = bind_safe_test_socket(&paths)?;
+        let identity = endpoint_identity(&expected);
+        let inspector = MutableInspector::new(Some(process_for(&identity)));
+        let endpoint = StopEndpoint::new(connected(identity), inspector.clone(), false)
+            .with_shutdown_failure(ShutdownFailure::PermissionDenied);
+        let signaler = RecordingAttestedSignaler::new(inspector.clone(), endpoint.clone(), true);
+
+        let result = stop_with(
+            &paths,
+            &executable,
+            &endpoint,
+            &inspector,
+            &signaler,
+            StopMode::Explicit { force: true },
+            test_timeouts(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(SupervisorError::Client(crate::client::ClientError::Rpc(status)))
+                if status.code() == tonic::Code::PermissionDenied
+        ));
+        assert!(
+            signaler.signals()?.is_empty(),
+            "token authentication failure reached an OS signal"
+        );
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn forced_stop_confirmation_cannot_overrun_its_absolute_deadline() -> TestResult {
         let temp = tempfile::tempdir()?;
@@ -5507,6 +6127,7 @@ mod tests {
         let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
         let expected = record(&executable);
         write_record(&paths, &expected)?;
+        let _listener = bind_safe_test_socket(&paths)?;
         let identity = endpoint_identity(&expected);
         let inspector = MutableInspector::new(Some(process_for(&identity)));
         inspector.stall_on_absent_inspection(2, Duration::from_millis(200))?;
@@ -5659,6 +6280,7 @@ mod tests {
         let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
         let expected = record(&executable);
         write_record(&paths, &expected)?;
+        let _listener = bind_safe_test_socket(&paths)?;
         let inspector = MutableInspector::new(Some(process_for(&endpoint_identity(&expected))));
         let endpoint = StopEndpoint::new(
             connected(endpoint_identity(&expected)),
@@ -5713,6 +6335,129 @@ mod tests {
         assert_eq!(outcome.daemon.identity, endpoint_identity(&expected));
         assert!(spawner.launches()?.is_empty());
         assert_eq!(signaler.signals.load(AtomicOrdering::Acquire), 0);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connect_waits_for_gated_publication_then_converges_on_current() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let paths = Arc::new(DaemonPaths::from_runtime_root(root(&temp)?.join("runtime")));
+        let executable = Arc::new(std::env::current_exe()?.canonicalize()?);
+        let endpoint = Arc::new(MutableEndpoint::new(EndpointProbe::Unsafe(
+            "daemon publication is in progress".to_owned(),
+        )));
+        let inspector = Arc::new(MutableInspector::new(None));
+        let spawner = Arc::new(FakeSpawner::current(
+            endpoint.as_ref().clone(),
+            inspector.as_ref().clone(),
+        ));
+        let signaler = Arc::new(NeverSignaler::default());
+        let lifecycle = paths.lock()?;
+        let contender = {
+            let paths = Arc::clone(&paths);
+            let executable = Arc::clone(&executable);
+            let endpoint = Arc::clone(&endpoint);
+            let inspector = Arc::clone(&inspector);
+            let spawner = Arc::clone(&spawner);
+            let signaler = Arc::clone(&signaler);
+            tokio::spawn(async move {
+                connect_current_or_recover_with(
+                    &paths,
+                    &executable,
+                    endpoint.as_ref(),
+                    inspector.as_ref(),
+                    spawner.as_ref(),
+                    signaler.as_ref(),
+                    test_timeouts(),
+                )
+                .await
+            })
+        };
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while endpoint.probes.load(AtomicOrdering::Acquire) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(
+            !contender.is_finished(),
+            "a transient unsafe publication was rejected before lifecycle serialization"
+        );
+
+        let expected = record(&executable);
+        write_record(&paths, &expected)?;
+        let _listener = bind_safe_test_socket(&paths)?;
+        inspector.set(matching_inspector(&expected).identity)?;
+        endpoint.set(connected(endpoint_identity(&expected)))?;
+        drop(lifecycle);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), contender).await???;
+        assert_eq!(outcome.transition, DaemonTransition::None);
+        assert_eq!(outcome.daemon.identity, endpoint_identity(&expected));
+        assert!(spawner.launches()?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connect_waits_for_shutdown_contender_then_converges_on_current() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let paths = Arc::new(DaemonPaths::from_runtime_root(root(&temp)?.join("runtime")));
+        let executable = Arc::new(std::env::current_exe()?.canonicalize()?);
+        let expected = record(&executable);
+        write_record(&paths, &expected)?;
+        let _listener = bind_safe_test_socket(&paths)?;
+        let endpoint = Arc::new(MutableEndpoint::new(EndpointProbe::Unresponsive(
+            "daemon is closing its listener".to_owned(),
+        )));
+        let inspector = Arc::new(MutableInspector::new(
+            matching_inspector(&expected).identity,
+        ));
+        let spawner = Arc::new(FakeSpawner::current(
+            endpoint.as_ref().clone(),
+            inspector.as_ref().clone(),
+        ));
+        let signaler = Arc::new(NeverSignaler::default());
+        let lifecycle = paths.lock()?;
+        let contender = {
+            let paths = Arc::clone(&paths);
+            let executable = Arc::clone(&executable);
+            let endpoint = Arc::clone(&endpoint);
+            let inspector = Arc::clone(&inspector);
+            let spawner = Arc::clone(&spawner);
+            let signaler = Arc::clone(&signaler);
+            tokio::spawn(async move {
+                connect_current_or_recover_with(
+                    &paths,
+                    &executable,
+                    endpoint.as_ref(),
+                    inspector.as_ref(),
+                    spawner.as_ref(),
+                    signaler.as_ref(),
+                    test_timeouts(),
+                )
+                .await
+            })
+        };
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while endpoint.probes.load(AtomicOrdering::Acquire) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(
+            !contender.is_finished(),
+            "a transient unreachable shutdown state was rejected before lifecycle serialization"
+        );
+
+        endpoint.set(connected(endpoint_identity(&expected)))?;
+        drop(lifecycle);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), contender).await???;
+        assert_eq!(outcome.transition, DaemonTransition::None);
+        assert_eq!(outcome.daemon.identity, endpoint_identity(&expected));
+        assert!(spawner.launches()?.is_empty());
         Ok(())
     }
 

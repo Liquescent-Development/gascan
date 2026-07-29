@@ -274,7 +274,8 @@ pub(crate) fn daemon_status_json(status: &DaemonStatus, now_millis: i64) -> serd
     let started_at_millis = identity
         .and_then(|identity| identity.started_at.as_ref())
         .and_then(timestamp_millis);
-    let uptime_millis = started_at_millis.map(|started_at| now_millis.saturating_sub(started_at));
+    let uptime_millis =
+        started_at_millis.map(|started_at| now_millis.saturating_sub(started_at).max(0));
     serde_json::json!({
         "state": state,
         "health": health,
@@ -765,6 +766,24 @@ mod tests {
                 env!("CARGO_PKG_VERSION"),
             )
         );
+    }
+
+    #[test]
+    fn daemon_json_uptime_clamps_future_start_timestamps_to_zero() {
+        let mut status = daemon_status(DaemonState::Current);
+        status.identity = Some(DaemonIdentity {
+            pid: 40_382,
+            executable: PathBuf::from("/usr/local/bin/gascand"),
+            start_identity: "start-identity".to_owned(),
+            instance_token: "instance-token".to_owned(),
+            release_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            started_at: Some(InstanceTimestamp {
+                seconds: 2,
+                nanos: 0,
+            }),
+        });
+
+        assert_eq!(daemon_status_json(&status, 1_000)["uptime_millis"], 0);
     }
 
     #[test]

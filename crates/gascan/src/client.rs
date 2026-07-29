@@ -1,13 +1,14 @@
 use crate::daemon::{
-    DaemonEndpoint, DaemonIdentity, DaemonLaunch, DaemonPaths, DaemonSpawner, EndpointProbe,
-    EndpointSession, InstanceTimestamp, SupervisorError,
+    DaemonEndpoint, DaemonIdentity, DaemonLaunch, DaemonPaths, DaemonSpawner, DaemonState,
+    EndpointPathState, EndpointProbe, EndpointSession, FileIdentity, InstanceTimestamp,
+    SupervisorError,
 };
 use gascan_proto::v1::gas_can_client::GasCanClient;
 use gascan_proto::{API_MAJOR, API_MINOR, validate_transport_security};
 use hyper_util::rt::TokioIo;
 #[cfg(test)]
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 use tonic::transport::{Channel, Endpoint};
@@ -93,16 +94,47 @@ pub struct Client {
 
 impl Client {
     pub async fn daemon_attestation() -> Result<gascan_proto::v1::HandshakeResponse, ClientError> {
-        let paths = DaemonPaths::for_user()?;
-        let mut api = connect(paths.socket()).await?;
-        Ok(api
-            .handshake(gascan_proto::v1::HandshakeRequest {
-                api_major: API_MAJOR,
-                api_minor: API_MINOR,
-                requested_capabilities: Vec::new(),
-            })
-            .await?
-            .into_inner())
+        let status = crate::daemon::inspect().await?;
+        if !matches!(status.state, DaemonState::Current | DaemonState::Outdated) {
+            return Err(ClientError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                status
+                    .detail
+                    .unwrap_or_else(|| "daemon attestation is not trusted".to_owned()),
+            )));
+        }
+        let identity = status.identity.ok_or_else(|| {
+            ClientError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "daemon attestation did not identify a live endpoint",
+            ))
+        })?;
+        let daemon_executable =
+            identity
+                .executable
+                .into_os_string()
+                .into_string()
+                .map_err(|_| {
+                    ClientError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "daemon executable path is not valid UTF-8",
+                    ))
+                })?;
+        Ok(gascan_proto::v1::HandshakeResponse {
+            api_major: API_MAJOR,
+            api_minor: API_MINOR,
+            transport_security: Some(gascan_proto::local_transport_security()),
+            daemon_pid: identity.pid,
+            daemon_executable,
+            daemon_start_identity: identity.start_identity,
+            daemon_instance_token: identity.instance_token,
+            release_version: identity.release_version.unwrap_or_default(),
+            daemon_started_at: identity.started_at.map(|timestamp| prost_types::Timestamp {
+                seconds: timestamp.seconds,
+                nanos: timestamp.nanos,
+            }),
+            ..Default::default()
+        })
     }
 }
 
@@ -113,22 +145,32 @@ pub(crate) struct TonicEndpoint;
 impl DaemonEndpoint for TonicEndpoint {
     type Connection = Client;
 
-    async fn probe(&self, path: &Path) -> Result<EndpointProbe<Self::Connection>, ClientError> {
-        let mut api = match tokio::time::timeout(ENDPOINT_PROBE_TIMEOUT, connect(path)).await {
-            Err(_) => {
-                return Ok(EndpointProbe::Unresponsive(
-                    "daemon endpoint connection timed out".to_owned(),
-                ));
-            }
-            Ok(Err(error)) if definitely_inert_connect_error(&error) => {
-                return Ok(EndpointProbe::AbsentOrInert);
-            }
-            Ok(Err(error)) if startup_transient(&error) => {
-                return Ok(EndpointProbe::Unresponsive(error.to_string()));
-            }
-            Ok(Err(error)) => return Ok(EndpointProbe::Unsafe(error.to_string())),
-            Ok(Ok(api)) => api,
+    async fn probe(
+        &self,
+        paths: &DaemonPaths,
+        expected_path: EndpointPathState,
+    ) -> Result<EndpointProbe<Self::Connection>, ClientError> {
+        let EndpointPathState::SafeSocket(expected_path) = expected_path else {
+            return Ok(EndpointProbe::AbsentOrInert);
         };
+        let connected =
+            match tokio::time::timeout(ENDPOINT_PROBE_TIMEOUT, connect(paths, expected_path)).await
+            {
+                Err(_) => {
+                    return Ok(EndpointProbe::Unresponsive(
+                        "daemon endpoint connection timed out".to_owned(),
+                    ));
+                }
+                Ok(Err(error)) if definitely_inert_connect_error(&error) => {
+                    return Ok(EndpointProbe::AbsentOrInert);
+                }
+                Ok(Err(error)) if startup_transient(&error) => {
+                    return Ok(EndpointProbe::Unresponsive(error.to_string()));
+                }
+                Ok(Err(error)) => return Ok(EndpointProbe::Unsafe(error.to_string())),
+                Ok(Ok(api)) => api,
+            };
+        let ConnectedApi { mut api, peer_pid } = connected;
         let handshake = match tokio::time::timeout(
             ENDPOINT_PROBE_TIMEOUT,
             api.handshake(gascan_proto::v1::HandshakeRequest {
@@ -157,6 +199,11 @@ impl DaemonEndpoint for TonicEndpoint {
             Ok(identity) => identity,
             Err(error) => return Ok(EndpointProbe::Unsafe(error.to_string())),
         };
+        if peer_pid.is_some_and(|peer_pid| peer_pid != identity.pid) {
+            return Ok(EndpointProbe::Unsafe(
+                "daemon endpoint peer PID contradicts the handshake identity".to_owned(),
+            ));
+        }
         if identity.release_version.as_deref() == Some(env!("CARGO_PKG_VERSION")) {
             if let Some(rejection) = &handshake.rejection {
                 return Err(ClientError::Api(rejection.code.clone()));
@@ -225,7 +272,6 @@ fn identity_from_handshake(
         (!handshake.release_version.is_empty()).then(|| handshake.release_version.clone());
     let started_at = handshake
         .daemon_started_at
-        .filter(|_| release_version.is_some())
         .map(|timestamp| InstanceTimestamp {
             seconds: timestamp.seconds,
             nanos: timestamp.nanos,
@@ -357,19 +403,56 @@ pub(crate) fn daemon_path() -> Result<PathBuf, ClientError> {
     Ok(path)
 }
 
-async fn connect(path: &Path) -> Result<GasCanClient<Channel>, ClientError> {
-    let path = path.to_owned();
+struct ConnectedApi {
+    api: GasCanClient<Channel>,
+    peer_pid: Option<u32>,
+}
+
+async fn connect(
+    paths: &DaemonPaths,
+    expected_path: FileIdentity,
+) -> Result<ConnectedApi, ClientError> {
+    let observed_peer_pid = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let connector_peer_pid = std::sync::Arc::clone(&observed_peer_pid);
+    let paths = paths.clone();
     let channel = Endpoint::from_static("http://[::]:50051")
         .connect_with_connector(service_fn(move |_| {
-            let path = path.clone();
+            let paths = paths.clone();
+            let connector_peer_pid = std::sync::Arc::clone(&connector_peer_pid);
             async move {
-                tokio::net::UnixStream::connect(path)
-                    .await
-                    .map(TokioIo::new)
+                let stream = tokio::net::UnixStream::connect(paths.socket()).await?;
+                crate::daemon::validate_endpoint_path_identity(&paths, expected_path)?;
+                let credentials = stream.peer_cred()?;
+                if credentials.uid() != rustix::process::geteuid().as_raw() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "daemon endpoint peer UID does not match the effective user",
+                    ));
+                }
+                let peer_pid = credentials
+                    .pid()
+                    .map(u32::try_from)
+                    .transpose()
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "daemon endpoint peer PID is invalid",
+                        )
+                    })?;
+                *connector_peer_pid.lock().map_err(|_| {
+                    std::io::Error::other("daemon endpoint peer credentials were poisoned")
+                })? = peer_pid;
+                Ok(TokioIo::new(stream))
             }
         }))
         .await?;
-    Ok(GasCanClient::new(channel))
+    let peer_pid = *observed_peer_pid
+        .lock()
+        .map_err(|_| std::io::Error::other("daemon endpoint peer credentials were poisoned"))?;
+    Ok(ConnectedApi {
+        api: GasCanClient::new(channel),
+        peer_pid,
+    })
 }
 
 #[cfg(test)]
@@ -451,6 +534,24 @@ mod tests {
         let legacy = super::identity_from_handshake(&base)?;
         assert_eq!(legacy.release_version, None);
         assert_eq!(legacy.started_at, None);
+
+        let timestamp_without_release = gascan_proto::v1::HandshakeResponse {
+            daemon_started_at: Some(prost_types::Timestamp {
+                seconds: 1_785_264_099,
+                nanos: 456_000_000,
+            }),
+            ..base.clone()
+        };
+        let contradictory = super::identity_from_handshake(&timestamp_without_release)?;
+        assert_eq!(contradictory.release_version, None);
+        assert_eq!(
+            contradictory.started_at,
+            Some(crate::daemon::InstanceTimestamp {
+                seconds: 1_785_264_099,
+                nanos: 456_000_000,
+            }),
+            "wire conversion erased a timestamp-without-release contradiction"
+        );
 
         let current = gascan_proto::v1::HandshakeResponse {
             release_version: env!("CARGO_PKG_VERSION").to_owned(),

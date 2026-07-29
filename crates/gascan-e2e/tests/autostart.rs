@@ -172,6 +172,47 @@ impl Environment {
         }
     }
 
+    fn spawn_direct_daemon_without_launcher_record_environment(&self) -> TestResult<OwnedChild> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = self.runtime_root.join("gascan");
+        std::fs::create_dir(&directory)?;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+        let stderr = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.runtime_root.join("daemon.stderr"))?;
+        let mut command = Command::new(&self.gascand);
+        self.configure_command(&mut command);
+        command
+            .current_dir(&directory)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(stderr)
+            .env_remove("GASCAN_DAEMON_INSTANCE_PATH")
+            .env_remove("GASCAN_DAEMON_OWNER_TOKEN");
+        let mut child = OwnedChild::spawn(&mut command)?;
+        let pid = u64::from(child.id()?);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Some(status) = child.try_wait()? {
+                child.0 = None;
+                return Err(format!("direct daemon exited before readiness: {status}").into());
+            }
+            let output = self.command_for(&["daemon", "status", "--json"]).output()?;
+            if output.status.success() {
+                let status: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+                if status["state"] == "running" && status["pid"].as_u64() == Some(pid) {
+                    return Ok(child);
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("direct daemon did not become ready".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     fn shutdown_daemon(&self) -> TestResult {
         let output = self
             .command_for(&["daemon", "stop", "--force", "--json"])
@@ -228,6 +269,71 @@ fn daemon_start_and_stop_are_idempotent() -> TestResult {
     assert_eq!(still_stopped["state"], "stopped");
     assert_eq!(still_stopped["transition"], "none");
     assert_eq!(still_stopped["forced"], false);
+    Ok(())
+}
+
+#[test]
+fn direct_daemon_startup_publishes_the_standard_protected_record() -> TestResult {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let env = Environment::new()?;
+    let mut daemon = env.spawn_direct_daemon_without_launcher_record_environment()?;
+    let record_path = env.runtime_root.join("gascan/daemon-instance.json");
+    let metadata = std::fs::symlink_metadata(&record_path)?;
+    assert!(metadata.file_type().is_file());
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    let record: serde_json::Value = serde_json::from_slice(&std::fs::read(&record_path)?)?;
+    assert_eq!(record["pid"].as_u64(), Some(u64::from(daemon.id()?)));
+    assert_eq!(
+        record["owner_token"].as_str().map(str::len),
+        Some(64),
+        "direct startup did not generate a fresh owner token"
+    );
+    assert_eq!(record["release_version"], env!("CARGO_PKG_VERSION"));
+
+    env.shutdown_daemon()?;
+    daemon.wait_for_exit()?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn daemon_start_identity_is_stable_across_caller_locale_and_timezone() -> TestResult {
+    let env = Environment::new()?;
+    let started = env
+        .command_for(&["daemon", "start", "--json"])
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .env("TZ", "America/Phoenix")
+        .env("GASCAN_DAEMON_OWNER_TOKEN", "locale-start-owner")
+        .output()?;
+    assert!(
+        started.status.success(),
+        "daemon start failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&started.stdout),
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let started: serde_json::Value = serde_json::from_slice(&started.stdout)?;
+    let pid = started["pid"].as_u64().ok_or("started PID missing")?;
+
+    for (locale, timezone) in [("en_US.UTF-8", "UTC"), ("fr_FR.UTF-8", "Asia/Tokyo")] {
+        let status = env
+            .command_for(&["daemon", "status", "--json"])
+            .env("LC_ALL", locale)
+            .env("LANG", locale)
+            .env("TZ", timezone)
+            .output()?;
+        assert!(
+            status.status.success(),
+            "status under {locale}/{timezone} failed: stdout={}, stderr={}",
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr)
+        );
+        let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
+        assert_eq!(status["state"], "running");
+        assert_eq!(status["health"], "healthy");
+        assert_eq!(status["pid"].as_u64(), Some(pid));
+    }
     Ok(())
 }
 
@@ -337,6 +443,7 @@ fn accepted_socket_without_http2_cannot_block_initial_probe() -> TestResult {
     std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
     let socket = directory.join("gascand.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket)?;
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
     let held_socket = socket.clone();
     let holder = std::thread::spawn(move || -> std::io::Result<()> {
         let (stream, _) = listener.accept()?;
@@ -368,6 +475,65 @@ fn accepted_socket_without_http2_cannot_block_initial_probe() -> TestResult {
     holder
         .join()
         .map_err(|_| "withholding socket thread panicked")??;
+    Ok(())
+}
+
+#[test]
+fn daemon_attest_rejects_a_symlink_without_sending_protocol_bytes() -> TestResult {
+    use std::io::Read as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let env = Environment::new()?;
+    let runtime_directory = env.runtime_root.join("gascan");
+    std::fs::create_dir(&runtime_directory)?;
+    std::fs::set_permissions(&runtime_directory, std::fs::Permissions::from_mode(0o700))?;
+    let foreign_socket = env.runtime_root.join("foreign.sock");
+    let foreign = std::os::unix::net::UnixListener::bind(&foreign_socket)?;
+    std::fs::set_permissions(&foreign_socket, std::fs::Permissions::from_mode(0o600))?;
+    std::os::unix::fs::symlink(&foreign_socket, runtime_directory.join("gascand.sock"))?;
+    foreign.set_nonblocking(true)?;
+    let reader = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let (mut stream, _) = loop {
+            match foreign.accept() {
+                Ok(accepted) => break accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return Ok(Vec::new());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        stream.set_nonblocking(true)?;
+        let mut bytes = vec![0_u8; 64];
+        let read_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let read = loop {
+            match stream.read(&mut bytes) {
+                Ok(read) => break read,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= read_deadline {
+                        break 0;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        bytes.truncate(read);
+        Ok(bytes)
+    });
+
+    let output = env.command_for(&["daemon-attest"]).output()?;
+    let observed = reader
+        .join()
+        .map_err(|_| "foreign daemon-attest reader panicked")??;
+    assert!(!output.status.success());
+    assert!(
+        observed.is_empty(),
+        "daemon-attest sent protocol bytes through an unauthenticated symlink: {observed:?}"
+    );
     Ok(())
 }
 
