@@ -1205,7 +1205,13 @@ fn polyglot_volume_is_recovered_after_local_delete_failure() {
             >= 2,
         "outer cleanup did not retry the locally stranded polyglot volume"
     );
-    assert!(!f.temp.path().join("state").join(format!(".volume-{name}")).exists());
+    assert!(
+        !f.temp
+            .path()
+            .join("state")
+            .join(format!(".volume-{name}"))
+            .exists()
+    );
     assert_no_publications(&f);
 }
 
@@ -1223,7 +1229,13 @@ fn polyglot_volume_is_recovered_after_local_attestation_failure() {
     assert!(!output.status.success());
     let calls = fs::read_to_string(&f.calls).unwrap();
     assert!(calls.contains(&format!("container:volume delete {name}")));
-    assert!(!f.temp.path().join("state").join(format!(".volume-{name}")).exists());
+    assert!(
+        !f.temp
+            .path()
+            .join("state")
+            .join(format!(".volume-{name}"))
+            .exists()
+    );
     assert_no_publications(&f);
 }
 
@@ -1233,10 +1245,7 @@ fn ssh_volume_is_recovered_after_smoke_failure() {
     seed_valid_receipt(&f);
     let name = format!("gascan-image-ssh-config-{TOKEN}");
     fs::write(
-        f.temp
-            .path()
-            .join("state")
-            .join(format!(".volume-{name}")),
+        f.temp.path().join("state").join(format!(".volume-{name}")),
         "",
     )
     .unwrap();
@@ -1249,7 +1258,13 @@ fn ssh_volume_is_recovered_after_smoke_failure() {
     assert!(!output.status.success());
     let calls = fs::read_to_string(&f.calls).unwrap();
     assert!(calls.contains(&format!("container:volume delete {name}")));
-    assert!(!f.temp.path().join("state").join(format!(".volume-{name}")).exists());
+    assert!(
+        !f.temp
+            .path()
+            .join("state")
+            .join(format!(".volume-{name}"))
+            .exists()
+    );
     assert_no_publications(&f);
 }
 

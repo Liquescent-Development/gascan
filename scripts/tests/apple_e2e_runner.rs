@@ -213,9 +213,11 @@ fn candidate_flow_accepts_public_immutable_candidate_and_exports_exact_runtime_p
     );
     let records = fs::read_to_string(log).unwrap();
     assert!(records.contains(&format!("candidate:{candidate}\n")));
-    assert!(records.contains(
-        "candidate-runtime:ghcr.io/liquescent-development/gascan/workspace:candidate\n"
-    ));
+    assert!(
+        records.contains(
+            "candidate-runtime:ghcr.io/liquescent-development/gascan/workspace:candidate\n"
+        )
+    );
 }
 
 #[test]

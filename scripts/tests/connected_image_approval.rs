@@ -157,14 +157,16 @@ fn invalid_source_digest_is_rejected_before_publication() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("source digest is invalid"));
     assert!(!f.root.join("images/workspace/approved-image.txt").exists());
-    assert!(!f
-        .root
-        .join("images/workspace/approved-source.sha256")
-        .exists());
-    assert!(!f
-        .root
-        .join("docs/evidence/connected-workspace-image.md")
-        .exists());
+    assert!(
+        !f.root
+            .join("images/workspace/approved-source.sha256")
+            .exists()
+    );
+    assert!(
+        !f.root
+            .join("docs/evidence/connected-workspace-image.md")
+            .exists()
+    );
 }
 
 #[test]
@@ -198,20 +200,24 @@ fn interruption_after_evidence_publication_restores_the_previous_pair() {
             fs::read_to_string(f.root.join("docs/evidence/connected-workspace-image.md")).unwrap(),
             "previous-evidence\n"
         );
-        assert!(!fs::read_dir(f.root.join("docs/evidence"))
-            .unwrap()
-            .any(|entry| entry
+        assert!(
+            !fs::read_dir(f.root.join("docs/evidence"))
                 .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".connected-workspace-image.")));
-        assert!(!fs::read_dir(f.root.join("images/workspace"))
-            .unwrap()
-            .any(|entry| {
-                let name = entry.unwrap().file_name();
-                let name = name.to_string_lossy();
-                name.starts_with(".approved-image.") || name.starts_with(".approved-source.")
-            }));
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".connected-workspace-image."))
+        );
+        assert!(
+            !fs::read_dir(f.root.join("images/workspace"))
+                .unwrap()
+                .any(|entry| {
+                    let name = entry.unwrap().file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with(".approved-image.") || name.starts_with(".approved-source.")
+                })
+        );
     }
 }
 
