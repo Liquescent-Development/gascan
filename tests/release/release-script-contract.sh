@@ -962,8 +962,10 @@ sync_release_fixture_sources "$authcheck_clone"
 authcheck_source_digest=$("$authcheck_clone/scripts/workspace-image-source-digest.sh" "$authcheck_clone")
 printf '%s\n' "$authcheck_source_digest" >"$authcheck_clone/images/workspace/approved-source.sha256"
 git -C "$authcheck_clone" add images/workspace/approved-source.sha256
-git -C "$authcheck_clone" -c commit.gpgsign=false -c user.name=release \
-  -c user.email=release@example.invalid commit --quiet -m 'fixture workspace image source approval'
+if ! git -C "$authcheck_clone" diff --cached --quiet; then
+  git -C "$authcheck_clone" -c commit.gpgsign=false -c user.name=release \
+    -c user.email=release@example.invalid commit --quiet -m 'fixture workspace image source approval'
+fi
 ssh-keygen -q -t ed25519 -N '' -C release@example.invalid -f "$fixture/authcheck-key"
 printf 'release@example.invalid %s\n' "$(cat "$fixture/authcheck-key.pub")" \
   >"$fixture/authcheck-allowed-signers"
@@ -1040,8 +1042,10 @@ sync_release_fixture_sources "$probecheck_clone"
 probecheck_source_digest=$("$probecheck_clone/scripts/workspace-image-source-digest.sh" "$probecheck_clone")
 printf '%s\n' "$probecheck_source_digest" >"$probecheck_clone/images/workspace/approved-source.sha256"
 git -C "$probecheck_clone" add images/workspace/approved-source.sha256
-git -C "$probecheck_clone" -c commit.gpgsign=false -c user.name=release \
-  -c user.email=release@example.invalid commit --quiet -m 'fixture workspace image source approval'
+if ! git -C "$probecheck_clone" diff --cached --quiet; then
+  git -C "$probecheck_clone" -c commit.gpgsign=false -c user.name=release \
+    -c user.email=release@example.invalid commit --quiet -m 'fixture workspace image source approval'
+fi
 ssh-keygen -q -t ed25519 -N '' -C release@example.invalid -f "$fixture/probecheck-key"
 printf 'release@example.invalid %s\n' "$(cat "$fixture/probecheck-key.pub")" \
   >"$fixture/probecheck-allowed-signers"
