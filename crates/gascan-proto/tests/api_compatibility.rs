@@ -1034,14 +1034,7 @@ fn v1_descriptor_exactly_covers_every_exported_message_enum_and_rpc() {
                     None,
                     Some(".google.protobuf.Timestamp")
                 ),
-                f!(
-                    "health",
-                    7,
-                    Enum,
-                    O,
-                    None,
-                    Some(".gascan.v1.DaemonHealth")
-                ),
+                f!("health", 7, Enum, O, None, Some(".gascan.v1.DaemonHealth")),
             ],
             &[],
             &[(8, 9)],
