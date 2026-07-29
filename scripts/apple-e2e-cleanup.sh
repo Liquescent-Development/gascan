@@ -276,7 +276,7 @@ if test -f "$instance"; then
   record_start=$(jq -er '.start_identity' "$instance")
   record_instance=$(jq -er '.instance_token' "$instance")
   observed_command=$(ps -p "$pid" -o command= 2>/dev/null || true)
-  observed_start=$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^ *//;s/ *$//' || true)
+  observed_start=$(LC_ALL=C LANG=C TZ=UTC ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^ *//;s/ *$//' || true)
   observed_executable=${observed_command%% *}
   if test -n "$observed_executable"; then observed_executable=$(realpath "$observed_executable" 2>/dev/null || true); fi
   if test "$observed_executable" = "$daemon_executable"; then command_matches=true; else command_matches=false; fi
@@ -291,11 +291,11 @@ if test -f "$instance"; then
      test "$record_executable" = "$attested_executable" && test "$record_start" = "$attested_start"; then
     env kill -TERM "$pid"
     deadline=50
-    while test "$deadline" -gt 0 && test "$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^ *//;s/ *$//' || true)" = "$record_start"; do
+    while test "$deadline" -gt 0 && test "$(LC_ALL=C LANG=C TZ=UTC ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^ *//;s/ *$//' || true)" = "$record_start"; do
       sleep 0.1
       deadline=$((deadline - 1))
     done
-    if test "$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^ *//;s/ *$//' || true)" = "$record_start"; then
+    if test "$(LC_ALL=C LANG=C TZ=UTC ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^ *//;s/ *$//' || true)" = "$record_start"; then
       observed_command=$(ps -p "$pid" -o command= 2>/dev/null || true)
       observed_executable=${observed_command%% *}
       if test -n "$observed_executable"; then observed_executable=$(realpath "$observed_executable" 2>/dev/null || true); fi
@@ -306,12 +306,12 @@ if test -f "$instance"; then
         { printf 'refusing KILL after identity changed\n' >&2; exit 1; }
       env kill -KILL "$pid"
       deadline=50
-      while test "$deadline" -gt 0 && test "$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^ *//;s/ *$//' || true)" = "$record_start"; do
+      while test "$deadline" -gt 0 && test "$(LC_ALL=C LANG=C TZ=UTC ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^ *//;s/ *$//' || true)" = "$record_start"; do
         sleep 0.1
         deadline=$((deadline - 1))
       done
     fi
-    if test "$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^ *//;s/ *$//' || true)" = "$record_start"; then
+    if test "$(LC_ALL=C LANG=C TZ=UTC ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^ *//;s/ *$//' || true)" = "$record_start"; then
       printf 'validated daemon instance survived TERM and KILL\n' >&2
       residue=true
     else

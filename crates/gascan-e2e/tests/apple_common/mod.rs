@@ -1765,6 +1765,9 @@ fn process_identity_has_exited_with(
 fn process_field(pid: u32, field: &str) -> TestResult<String> {
     let output = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", field])
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .env("TZ", "UTC")
         .output()?;
     if !output.status.success() {
         return Err("daemon process identity is unavailable".into());
@@ -2833,6 +2836,47 @@ fn cleanup_resource_identities(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_field_normalizes_start_identity_under_non_utc_parent() -> TestResult {
+        const CHILD: &str = "GASCAN_PROCESS_FIELD_TIMEZONE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let pid = std::process::id();
+            let actual = process_field(pid, "lstart=")?;
+            let expected = Command::new("/bin/ps")
+                .args(["-p", &pid.to_string(), "-o", "lstart="])
+                .env("LC_ALL", "C")
+                .env("LANG", "C")
+                .env("TZ", "UTC")
+                .output()?;
+            assert!(expected.status.success());
+            assert_eq!(
+                actual,
+                String::from_utf8(expected.stdout)?.trim(),
+                "process_field must use the daemon recorder's deterministic environment"
+            );
+            return Ok(());
+        }
+
+        let output = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "apple_common::tests::process_field_normalizes_start_identity_under_non_utc_parent",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
+            .env("TZ", "America/Phoenix")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "non-UTC subprocess failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
 
     #[test]
     fn inline_marker_value_ignores_interactive_prompt_prefix() -> TestResult {
