@@ -2,12 +2,8 @@
 
 - status: `PASS`
 - platform: `linux/arm64`
-- runtime helper contract: PASS
-- local connected-image gate: PASS
-- public/prebuilt connected-image gate: PASS
-- Apple apply: 7 passed, 0 failed
-- image: `ghcr.io/liquescent-development/gascan/workspace:da2ca49349e9be1b-88aaab3ad93600b820d694fa8a741c1de786d29b66410437acd666b0ffeccd9d@sha256:88aaab3ad93600b820d694fa8a741c1de786d29b66410437acd666b0ffeccd9d`
+- image: `ghcr.io/liquescent-development/gascan/workspace:da2ca49349e9be1b-8d2d831a2c22092cf466d6338b3678bf53ea6f841e73bf25d24e0d2b36e1f2b7@sha256:8d2d831a2c22092cf466d6338b3678bf53ea6f841e73bf25d24e0d2b36e1f2b7`
 - versions lock SHA-256: `55d8ed537682d67f188d7a661ede342fc3f14fdf11bf161eeb6468515c6fbbdc`
-- build receipt SHA-256: `01dac23d19530c8d3ee8e389d69f622ace7d91ae85e32f222ae525fb611b3fb0`
+- build receipt SHA-256: `0c4ab7c49d3b73cf8acc60f7f9a37853e3db630e0d8ec69cd30f2f20899219cb`
 - source SHA-256: `b0bd9c30c2338589d8bd33eb0db89c0b0a44401bb61a80fd22377c7302365b0f`
 - final current-token residue: `absent`
