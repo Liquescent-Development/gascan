@@ -289,6 +289,44 @@ gascan daemon stop
 gascan daemon restart
 ```
 
+For a running, healthy daemon, `gascan daemon status` renders these stable
+labels; the placeholder values are representative and vary by installation:
+
+```text
+✓ Gascan daemon is running
+  Health             healthy
+  PID                <pid>
+  Uptime             <duration>
+  Installed version  <installed-version>
+  Running version    <running-version>
+  Executable         <path-to-gascand>
+```
+
+`gascan daemon status --json` reports the same status in machine-readable
+form:
+
+```json
+{
+  "state": "running",
+  "health": "healthy",
+  "installed_version": "<installed-version>",
+  "running_version": "<running-version>",
+  "pid": <pid>,
+  "started_at_millis": <epoch-milliseconds>,
+  "uptime_millis": <milliseconds>,
+  "executable": "<path-to-gascand>",
+  "legacy": false
+}
+```
+
+When no daemon is running, human status is:
+
+```text
+○ Gascan daemon is stopped
+```
+
+JSON reports `state` and `health` as `stopped`.
+
 By default, stop and restart wait for active sandbox operations and attachments
 to finish gracefully. Use `--force` only when necessary: `--force` may
 interrupt active sandbox operations and attachments.
