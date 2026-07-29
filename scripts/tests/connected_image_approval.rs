@@ -76,16 +76,45 @@ fn fixture() -> Fixture {
         .env("GASCAN_APPROVAL_TEST_ROOT", &root)
         .env("GASCAN_GATE_ARTIFACTS", root.join(".artifacts"))
         .env("GASCAN_APPROVAL_RECEIPT_VALIDATOR", validator)
-        .env("GASCAN_APPROVAL_SOURCE_DIGEST_COMMAND", source_digest)
-        .env(
-            "GASCAN_APPROVAL_LOCK_COMMAND",
-            env!("CARGO_BIN_EXE_run-with-safe-lock"),
-        );
+        .env("GASCAN_APPROVAL_SOURCE_DIGEST_COMMAND", source_digest);
     Fixture {
         _temp: temp,
         root,
         command,
         reference,
+    }
+}
+
+#[test]
+fn caller_environment_cannot_bypass_or_replace_the_real_approval_lock() {
+    for bypass in ["held", "command"] {
+        let mut f = fixture();
+        let lock = f.root.join(".artifacts/workspace-image-approval.lock");
+        fs::write(&lock, "").unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
+        let calls = f.root.join("calls");
+        f.command.env("CALLS", &calls);
+        match bypass {
+            "held" => {
+                f.command.env("GASCAN_APPROVAL_LOCK_HELD", &f.root);
+            }
+            "command" => {
+                f.command
+                    .env("GASCAN_APPROVAL_LOCK_COMMAND", "/usr/bin/true");
+            }
+            _ => unreachable!(),
+        }
+
+        let output = f.command.output().unwrap();
+        assert!(
+            !output.status.success(),
+            "{bypass} caller environment bypassed the unsafe real lock"
+        );
+        assert!(!calls.exists(), "{bypass} bypass allowed validation");
+        assert!(
+            !f.root.join("images/workspace/approved-image.txt").exists(),
+            "{bypass} bypass allowed publication"
+        );
     }
 }
 
@@ -175,14 +204,11 @@ fn concurrent_approval_waits_before_validation_and_publication() {
         .env(
             "GASCAN_APPROVAL_SOURCE_DIGEST_COMMAND",
             first.root.join("scripts/test-source-digest"),
-        )
-        .env(
-            "GASCAN_APPROVAL_LOCK_COMMAND",
-            env!("CARGO_BIN_EXE_run-with-safe-lock"),
         );
     let calls = first.root.join("calls");
     let ready = first.root.join("first-ready");
     let release = first.root.join("release-first");
+    let waiting = first.root.join("second-waiting-for-lock");
     let blocking_digest = first.root.join("scripts/blocking-source-digest");
     executable(
         &blocking_digest,
@@ -197,7 +223,9 @@ fn concurrent_approval_waits_before_validation_and_publication() {
         .command
         .env("GASCAN_APPROVAL_SOURCE_DIGEST_COMMAND", blocking_digest)
         .env("CALLS", &calls);
-    second.env("CALLS", &calls);
+    second
+        .env("CALLS", &calls)
+        .env("GASCAN_SAFE_LOCK_TEST_WAITING_FILE", &waiting);
     fs::write(
         first.root.join("images/workspace/approved-image.txt"),
         "previous-approval",
@@ -205,7 +233,7 @@ fn concurrent_approval_waits_before_validation_and_publication() {
     .unwrap();
 
     let mut first_child = first.command.spawn().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while !ready.exists() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
@@ -214,7 +242,11 @@ fn concurrent_approval_waits_before_validation_and_publication() {
         "first approval never reached source validation"
     );
     let mut second_child = second.spawn().unwrap();
-    thread::sleep(Duration::from_millis(250));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !waiting.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let reached_contention = waiting.exists();
     let second_waited = second_child.try_wait().unwrap().is_none();
     let validation_count = fs::read_to_string(&calls)
         .unwrap_or_default()
@@ -228,6 +260,10 @@ fn concurrent_approval_waits_before_validation_and_publication() {
     let first_status = first_child.wait().unwrap();
     let second_status = second_child.wait().unwrap();
 
+    assert!(
+        reached_contention,
+        "second approval never reached lock contention"
+    );
     assert!(
         second_waited,
         "second approval did not wait for the repository lock"
@@ -246,7 +282,7 @@ fn concurrent_approval_waits_before_validation_and_publication() {
 
 #[test]
 fn unsafe_existing_approval_locks_are_rejected_before_validation() {
-    for kind in ["symlink", "permissive", "hardlink"] {
+    for kind in ["symlink", "permissive"] {
         let mut f = fixture();
         let lock = f.root.join(".artifacts/workspace-image-approval.lock");
         let other = f.root.join(format!("{kind}-target"));
@@ -257,7 +293,6 @@ fn unsafe_existing_approval_locks_are_rejected_before_validation() {
                 fs::write(&lock, "").unwrap();
                 fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
             }
-            "hardlink" => fs::hard_link(&other, &lock).unwrap(),
             _ => unreachable!(),
         }
         let calls = f.root.join("calls");
@@ -268,6 +303,27 @@ fn unsafe_existing_approval_locks_are_rejected_before_validation() {
         assert!(!calls.exists(), "{kind} lock allowed validation");
         assert_eq!(fs::read_to_string(&other).unwrap(), "unchanged");
     }
+}
+
+#[test]
+fn otherwise_safe_hardlinked_approval_lock_is_rejected_before_validation() {
+    let mut f = fixture();
+    let lock = f.root.join(".artifacts/workspace-image-approval.lock");
+    let target = f.root.join("hardlink-target");
+    fs::write(&target, "unchanged").unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::hard_link(&target, &lock).unwrap();
+    let calls = f.root.join("calls");
+    f.command.env("CALLS", &calls);
+
+    let output = f.command.output().unwrap();
+    assert!(!output.status.success());
+    assert!(!calls.exists(), "hardlinked lock allowed validation");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "unchanged");
+    assert_eq!(
+        fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 }
 
 fn digest(path: &Path) -> String {

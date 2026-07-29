@@ -42,7 +42,19 @@ fn open_lock(path: &Path) -> Result<fs::File, DynError> {
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(path)?;
     validate_metadata(&lock.metadata()?)?;
-    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)?;
+    match rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => {}
+        Err(error) if error == rustix::io::Errno::WOULDBLOCK => {
+            if let Some(marker) = std::env::var_os("GASCAN_SAFE_LOCK_TEST_WAITING_FILE") {
+                let marker = Path::new(&marker);
+                let mut options = fs::OpenOptions::new();
+                options.write(true).create_new(true).mode(0o600);
+                options.open(marker)?.sync_all()?;
+            }
+            rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
     let descriptor_metadata = lock.metadata()?;
     validate_metadata(&descriptor_metadata)?;
     let path_metadata = fs::symlink_metadata(path)?;

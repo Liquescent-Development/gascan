@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-tool_root=$(cd "$(dirname "$0")/.." && pwd -P)
+approval_worker() {
+tool_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 configured_root=${GASCAN_APPROVAL_TEST_ROOT:-$tool_root}
 root=$(cd "$configured_root" 2>/dev/null && pwd -P) || {
   printf 'connected image approval: configured root is unavailable\n' >&2
@@ -9,17 +10,6 @@ root=$(cd "$configured_root" 2>/dev/null && pwd -P) || {
 }
 artifacts=${GASCAN_GATE_ARTIFACTS:-"$root/.artifacts"}
 mkdir -p "$artifacts"
-mkdir -p "$root/.artifacts"
-lock_file="$root/.artifacts/workspace-image-approval.lock"
-if test "${GASCAN_APPROVAL_LOCK_HELD:-}" != "$root"; then
-  if test -n "${GASCAN_APPROVAL_LOCK_COMMAND:-}"; then
-    exec "$GASCAN_APPROVAL_LOCK_COMMAND" "$lock_file" -- \
-      env GASCAN_APPROVAL_LOCK_HELD="$root" bash "$0" "$@"
-  fi
-  exec cargo run --quiet --locked --offline --manifest-path "$root/scripts/Cargo.toml" \
-    --bin run-with-safe-lock -- "$lock_file" -- \
-    env GASCAN_APPROVAL_LOCK_HELD="$root" bash "$0" "$@"
-fi
 candidate_file="$artifacts/connected-workspace-image-candidate.txt"
 live_file="$artifacts/connected-workspace-image-apple-live.txt"
 reference_file="$artifacts/workspace-image-ref"
@@ -155,3 +145,24 @@ source_tmp=''
 trap - EXIT INT TERM
 rm -f "$evidence_backup" "$approved_backup" "$source_backup"
 printf '%s\n' "$candidate"
+}
+
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0
+fi
+
+test "$#" -eq 0 || {
+  printf 'connected image approval: unexpected argument\n' >&2
+  exit 1
+}
+tool_root=$(cd "$(dirname "$0")/.." && pwd -P)
+configured_root=${GASCAN_APPROVAL_TEST_ROOT:-$tool_root}
+root=$(cd "$configured_root" 2>/dev/null && pwd -P) || {
+  printf 'connected image approval: configured root is unavailable\n' >&2
+  exit 1
+}
+mkdir -p "$root/.artifacts"
+lock_file="$root/.artifacts/workspace-image-approval.lock"
+exec cargo run --quiet --locked --offline --manifest-path "$tool_root/scripts/Cargo.toml" \
+  --bin run-with-safe-lock -- "$lock_file" -- \
+  bash -c 'source "$1"; approval_worker' gascan-approval-worker "$0"

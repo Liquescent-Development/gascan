@@ -362,6 +362,11 @@ fn cargo_reported_target_triple_artifact_wins_over_stale_host_binary() {
         &format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", "e".repeat(64)),
     );
     fs::write(context.join("Dockerfile"), "FROM scratch\n").unwrap();
+    fs::write(
+        context.join("workspace-source.sha256"),
+        format!("{}\n", "d".repeat(64)),
+    )
+    .unwrap();
     fs::write(context.join("context-manifest.tsv"), "fixture\n").unwrap();
     let manifest = format!("{:x}", Sha256::digest(b"fixture\n"));
     executable(&stale, "#!/bin/sh\ntouch \"$STALE_MARKER\"\nexit 74\n");
@@ -441,6 +446,11 @@ fn replacing_shared_artifact_after_private_staging_cannot_replace_consumer() {
         &format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", "e".repeat(64)),
     );
     fs::write(context.join("Dockerfile"), "FROM scratch\n").unwrap();
+    fs::write(
+        context.join("workspace-source.sha256"),
+        format!("{}\n", "d".repeat(64)),
+    )
+    .unwrap();
     fs::write(context.join("context-manifest.tsv"), "fixture\n").unwrap();
     let manifest = format!("{:x}", Sha256::digest(b"fixture\n"));
     executable(
@@ -597,6 +607,11 @@ fn fake_runner_builds_the_exact_verified_context_and_publishes_reference_last() 
         &format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", "e".repeat(64)),
     );
     fs::write(context.join("Dockerfile"), "FROM scratch\n").unwrap();
+    fs::write(
+        context.join("workspace-source.sha256"),
+        format!("{}\n", "d".repeat(64)),
+    )
+    .unwrap();
     fs::write(context.join("context-manifest.tsv"), "fixture\n").unwrap();
     let manifest = format!("{:x}", Sha256::digest(b"fixture\n"));
     executable(
@@ -668,7 +683,10 @@ esac
         format!("gascan-workspace:fixture@sha256:{}\n", "0".repeat(63) + "9")
     );
     let receipt = fs::read_to_string(repo.join(".artifacts/workspace-image-build.json")).unwrap();
-    assert!(receipt.contains(&format!("\"source_digest\":\"{}\"", "e".repeat(64))));
+    assert!(
+        receipt.contains(&format!("\"source_digest\":\"{}\"", "d".repeat(64))),
+        "receipt sampled post-seal live source bytes: {receipt}"
+    );
 }
 
 #[test]
@@ -692,6 +710,22 @@ fn persistent_direct_context_mutation_during_build_blocks_receipt_publication() 
     )
     .unwrap();
     populate_minimal_workstation(&repo, &source_artifacts);
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args(["add", "images/workspace"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
     fs::copy(
         root().join("scripts/build-connected-workspace-image.sh"),
         repo.join("scripts/build-connected-workspace-image.sh"),
@@ -1202,6 +1236,11 @@ fn fake_runner_failure_matrix_detects_context_mutation_and_never_commits_an_inva
             &format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", "e".repeat(64)),
         );
         fs::write(context.join("Dockerfile"), "FROM scratch\n").unwrap();
+        fs::write(
+            context.join("workspace-source.sha256"),
+            format!("{}\n", "e".repeat(64)),
+        )
+        .unwrap();
         fs::write(context.join("context-manifest.tsv"), "fixture\n").unwrap();
         let manifest = format!("{:x}", Sha256::digest(b"fixture\n"));
         executable(

@@ -8,7 +8,7 @@ use std::{
     os::fd::AsFd,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Component, Path, PathBuf},
-    process::ExitCode,
+    process::{Command, ExitCode},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -411,6 +411,7 @@ fn run() -> Result<(), DynError> {
         validate_connected_lock(&repository, &lock)?;
         replace_context(&repository, &cache, &context, Mode::Connected)?;
         let manifest = verify_context(&context, Mode::Connected)?;
+        validate_connected_context_inputs(&repository, &cache, &context)?;
         println!("{:x}", Sha256::digest(&manifest));
         return Ok(());
     }
@@ -1019,6 +1020,7 @@ fn verify_context(root: &Path, mode: Mode) -> Result<Vec<u8>, DynError> {
             "images",
             "tests",
             "workstation",
+            "workspace-source.sha256",
         ]
         .into_iter()
         .collect()
@@ -1069,6 +1071,7 @@ fn verify_context(root: &Path, mode: Mode) -> Result<Vec<u8>, DynError> {
         }
     }
     if mode == Mode::Connected {
+        validate_source_fingerprint_bytes(&fs::read(root.join("workspace-source.sha256"))?)?;
         for required in [
             "workstation/claude-native.tgz",
             "workstation/glab.tar.gz",
@@ -1228,6 +1231,7 @@ fn assemble_connected(
         fs::read(repository_path.join("images/workspace/workstation-package-lock.json"))?;
     let target_lock =
         fs::read(repository_path.join("images/workspace/workstation-target-lock.toml"))?;
+    let source_fingerprint = canonical_source_fingerprint(repository_path)?;
     let inputs = workstation_inputs(
         lock_contents,
         &package_manifest,
@@ -1305,6 +1309,13 @@ fn assemble_connected(
         &package_lock,
     )?;
     write_validated_bytes(&staging.join("workstation/target-lock.toml"), &target_lock)?;
+    write_validated_bytes(
+        &staging.join("workspace-source.sha256"),
+        &source_fingerprint,
+    )?;
+    if canonical_source_fingerprint(repository_path)? != source_fingerprint {
+        return Err("workspace image source changed while assembling connected context".into());
+    }
     validate_dockerfile_copy_sources(staging)?;
     make_tree_read_only(staging)?;
     write_manifest(staging)?;
@@ -1557,6 +1568,12 @@ fn validate_connected_context_inputs(
     _cache: &Path,
     context: &Path,
 ) -> Result<(), DynError> {
+    let sealed_source = fs::read(context.join("workspace-source.sha256"))?;
+    validate_source_fingerprint_bytes(&sealed_source)?;
+    let current_source = canonical_source_fingerprint(repository)?;
+    if sealed_source != current_source {
+        return Err("connected context source fingerprint differs from the repository".into());
+    }
     let repository_lock = fs::read(repository.join("images/workspace/versions.lock"))?;
     if fs::read(context.join("images/workspace/versions.lock"))? != repository_lock {
         return Err("connected context lock differs from the repository lock".into());
@@ -1598,6 +1615,31 @@ fn validate_connected_context_inputs(
         return Err("workstation context top-level allowlist does not match".into());
     }
     validate_workstation_payload(&root, &inputs, &inputs.npm, true)
+}
+
+fn canonical_source_fingerprint(repository: &Path) -> Result<Vec<u8>, DynError> {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or("scripts manifest has no repository parent")?
+        .join("scripts/workspace-image-source-digest.sh");
+    let output = Command::new("bash").arg(script).arg(repository).output()?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err("canonical workspace source fingerprint command failed".into());
+    }
+    validate_source_fingerprint_bytes(&output.stdout)?;
+    Ok(output.stdout)
+}
+
+fn validate_source_fingerprint_bytes(bytes: &[u8]) -> Result<(), DynError> {
+    if bytes.len() != 65
+        || bytes[64] != b'\n'
+        || !bytes[..64]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        return Err("connected context source fingerprint is malformed".into());
+    }
+    Ok(())
 }
 
 fn validate_workstation_payload(
