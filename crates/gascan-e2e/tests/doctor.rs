@@ -258,6 +258,15 @@ impl UpgradeEnvironment {
             .parse()?)
     }
 
+    fn fixture_is_running(&mut self) -> TestResult<bool> {
+        Ok(self
+            .fixture
+            .as_mut()
+            .ok_or("fixture process missing")?
+            .try_wait()?
+            .is_none())
+    }
+
     fn reap_fixture(&mut self) -> TestResult {
         let mut child = self.fixture.take().ok_or("fixture process missing")?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -422,12 +431,7 @@ fn doctor_recovery_does_not_force_a_held_durable_operation() -> TestResult {
     assert!(started.elapsed() < std::time::Duration::from_secs(20));
     assert_eq!(env.pid()?, old_pid, "a replacement daemon was spawned");
     assert!(
-        Command::new("kill")
-            .args(["-0", &old_pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()?
-            .success(),
+        env.fixture_is_running()?,
         "automatic recovery force-killed held work"
     );
     Ok(())
@@ -478,17 +482,11 @@ fn forged_instance_record_never_signals_an_unrelated_process() -> TestResult {
 fn changing_instance_token_between_attestations_aborts_shutdown() -> TestResult {
     let mut env = UpgradeEnvironment::new()?;
     env.spawn_legacy(true, None)?;
-    let pid = env.pid()?;
 
     let output = env.cli(&["daemon", "stop", "--force", "--json"]).output()?;
     assert!(!output.status.success(), "changed token was accepted");
     assert!(
-        Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()?
-            .success(),
+        env.fixture_is_running()?,
         "daemon was signaled after its token changed"
     );
     Ok(())
@@ -496,23 +494,27 @@ fn changing_instance_token_between_attestations_aborts_shutdown() -> TestResult 
 
 #[test]
 fn replacing_endpoint_after_inspection_aborts_shutdown() -> TestResult {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
     let mut env = UpgradeEnvironment::new()?;
     let marker = env.root.join("second-handshake.started");
     let release = env.root.join("second-handshake.release");
     env.spawn_legacy(false, Some((&marker, &release)))?;
-    let pid = env.pid()?;
     let socket = env.root.join("gascan/gascand.sock");
     let original_socket = env.root.join("gascan/original.sock");
-    let foreign = env.root.join("foreign-endpoint");
-    std::fs::write(&foreign, b"retain")?;
     let mut stopping = env.cli(&["daemon", "stop", "--force", "--json"]);
     stopping
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let mut stopping = OwnedChild::new(stopping.spawn()?);
     env.wait_for_path(&marker)?;
+    let runtime_uid = std::fs::metadata(env.root.join("gascan"))?.uid();
+    let original = std::fs::symlink_metadata(&socket)?;
+    assert!(original.file_type().is_socket());
+    assert_eq!(original.permissions().mode() & 0o777, 0o600);
+    assert_eq!(original.uid(), runtime_uid);
     std::fs::rename(&socket, &original_socket)?;
-    std::os::unix::fs::symlink(&foreign, &socket)?;
+    let _replacement_listener = std::os::unix::net::UnixListener::bind(&socket)?;
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
     std::fs::write(&release, b"continue")?;
 
     let output = stopping.wait_with_output()?;
@@ -520,14 +522,17 @@ fn replacing_endpoint_after_inspection_aborts_shutdown() -> TestResult {
         !output.status.success(),
         "replacement endpoint was accepted"
     );
-    assert_eq!(std::fs::read(&foreign)?, b"retain");
+    let replacement = std::fs::symlink_metadata(&socket)?;
+    assert!(replacement.file_type().is_socket());
+    assert_eq!(replacement.permissions().mode() & 0o777, 0o600);
+    assert_eq!(replacement.uid(), runtime_uid);
+    assert_ne!(
+        replacement.ino(),
+        original.ino(),
+        "replacement socket reused the inspected endpoint inode"
+    );
     assert!(
-        Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()?
-            .success(),
+        env.fixture_is_running()?,
         "daemon was signaled after endpoint replacement"
     );
     Ok(())

@@ -13,6 +13,127 @@ struct Environment {
     account_home: std::path::PathBuf,
 }
 
+#[derive(Clone)]
+struct ProcessIdentity {
+    pid: u64,
+    executable: std::path::PathBuf,
+    started: String,
+}
+
+impl ProcessIdentity {
+    fn capture(pid: u64, expected_executable: &std::path::Path) -> TestResult<Self> {
+        let executable = expected_executable.canonicalize()?;
+        let observed_command =
+            process_field(pid, "command=")?.ok_or("old daemon process disappeared")?;
+        let observed_executable = observed_command
+            .split_whitespace()
+            .next()
+            .ok_or("old daemon command is empty")?;
+        if std::path::Path::new(observed_executable).canonicalize()? != executable {
+            return Err("old daemon executable did not match the test fixture".into());
+        }
+        let started = process_field(pid, "lstart=")?.ok_or("old daemon start time missing")?;
+        Ok(Self {
+            pid,
+            executable,
+            started,
+        })
+    }
+
+    fn is_running(&self) -> TestResult<bool> {
+        let Some(state) = process_field(self.pid, "state=")? else {
+            return Ok(false);
+        };
+        if state.starts_with('Z') {
+            return Ok(false);
+        }
+        let Some(command) = process_field(self.pid, "command=")? else {
+            return Ok(false);
+        };
+        let Some(observed_executable) = command.split_whitespace().next() else {
+            return Ok(false);
+        };
+        let Ok(observed_executable) = std::path::Path::new(observed_executable).canonicalize()
+        else {
+            return Ok(false);
+        };
+        if observed_executable != self.executable {
+            return Ok(false);
+        }
+        Ok(process_field(self.pid, "lstart=")?.as_deref() == Some(self.started.as_str()))
+    }
+}
+
+fn process_field(pid: u64, field: &str) -> TestResult<Option<String>> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", field])
+        .output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let field = String::from_utf8(output.stdout)?.trim().to_owned();
+    Ok((!field.is_empty()).then_some(field))
+}
+
+struct OwnedPid {
+    identity: Option<ProcessIdentity>,
+}
+
+impl OwnedPid {
+    fn capture(pid: u64, executable: &std::path::Path) -> TestResult<Self> {
+        Ok(Self {
+            identity: Some(ProcessIdentity::capture(pid, executable)?),
+        })
+    }
+
+    fn disarm(&mut self) {
+        self.identity = None;
+    }
+
+    fn wait_for_exit(&self) -> TestResult {
+        let identity = self.identity.as_ref().ok_or("old daemon guard disarmed")?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while identity.is_running()? {
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("replaced daemon PID {} remained live", identity.pid).into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for OwnedPid {
+    fn drop(&mut self) {
+        let Some(identity) = self.identity.as_ref() else {
+            return;
+        };
+        if !identity.is_running().unwrap_or(false) {
+            return;
+        }
+        let _ = Command::new("kill")
+            .args(["-TERM", &identity.pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        while std::time::Instant::now() < deadline {
+            if !identity.is_running().unwrap_or(false) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !identity.is_running().unwrap_or(false) {
+            return;
+        }
+        let _ = Command::new("kill")
+            .args(["-KILL", &identity.pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
 impl Environment {
     fn new() -> TestResult<Self> {
         let gascan = std::env::var_os("CARGO_BIN_EXE_gascan-e2e-cli").ok_or("gascan missing")?;
@@ -149,12 +270,18 @@ fn daemon_restart_replaces_pid_and_returns_healthy() -> TestResult {
     let old_pid = started["pid"]
         .as_u64()
         .ok_or("started daemon PID missing")?;
+    let mut old_process = OwnedPid::capture(old_pid, std::path::Path::new(&env.gascand))?;
 
     let restarted = env.daemon_json("restart")?;
     assert_eq!(restarted["state"], "running");
     assert_eq!(restarted["health"], "healthy");
     assert_eq!(restarted["transition"], "restarted");
-    assert_ne!(restarted["pid"].as_u64(), Some(old_pid));
+    let current_pid = restarted["pid"]
+        .as_u64()
+        .ok_or("restarted daemon PID missing")?;
+    assert_ne!(current_pid, old_pid);
+    old_process.wait_for_exit()?;
+    old_process.disarm();
     Ok(())
 }
 

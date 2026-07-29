@@ -5087,6 +5087,14 @@ mod tests {
         }
     }
 
+    fn bind_safe_test_socket(paths: &DaemonPaths) -> io::Result<std::os::unix::net::UnixListener> {
+        use std::os::unix::fs::PermissionsExt as _;
+        paths.prepare_directory()?;
+        let listener = std::os::unix::net::UnixListener::bind(paths.socket())?;
+        fs::set_permissions(paths.socket(), fs::Permissions::from_mode(0o600))?;
+        Ok(listener)
+    }
+
     #[tokio::test]
     async fn stop_stopped_is_a_successful_noop() -> TestResult {
         let temp = tempfile::tempdir()?;
@@ -5266,13 +5274,10 @@ mod tests {
 
     #[tokio::test]
     async fn stop_legacy_double_attests_then_verifies_process_before_sigterm() -> TestResult {
-        use std::os::unix::fs::PermissionsExt as _;
         let temp = tempfile::tempdir()?;
         let executable = std::env::current_exe()?.canonicalize()?;
         let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
-        paths.prepare_directory()?;
-        let _listener = std::os::unix::net::UnixListener::bind(paths.socket())?;
-        fs::set_permissions(paths.socket(), fs::Permissions::from_mode(0o600))?;
+        let _listener = bind_safe_test_socket(&paths)?;
         let identity = legacy_identity(&executable);
         let inspector = MutableInspector::new(Some(process_for(&identity)));
         let endpoint = StopEndpoint::with_probes(
@@ -5311,6 +5316,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let executable = std::env::current_exe()?.canonicalize()?;
         let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        let _listener = bind_safe_test_socket(&paths)?;
         let identity = legacy_identity(&executable);
         let inspector = MutableInspector::new(Some(process_for(&identity)));
         let endpoint = StopEndpoint::new(connected(identity), inspector.clone(), false)
@@ -5328,10 +5334,18 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(
-            result,
-            Err(SupervisorError::IdentityChanged { .. })
-        ));
+        let detail = match result {
+            Err(SupervisorError::IdentityChanged { detail }) => detail,
+            other => return Err(format!("unexpected legacy stop result: {other:?}").into()),
+        };
+        assert!(
+            detail.contains("legacy endpoint re-attestation timed out"),
+            "stalled second attestation failed for the wrong reason: {detail}"
+        );
+        assert!(
+            endpoint.probes.load(AtomicOrdering::Acquire) >= 2,
+            "stalled second attestation was never attempted"
+        );
         assert!(signaler.signals()?.is_empty());
         Ok(())
     }
@@ -5364,6 +5378,7 @@ mod tests {
             let temp = tempfile::tempdir()?;
             let paths =
                 DaemonPaths::from_runtime_root(root(&temp)?.join(format!("runtime-{name}")));
+            let _listener = bind_safe_test_socket(&paths)?;
             let original = legacy_identity(&executable);
             let inspector = MutableInspector::new(Some(process_for(&original)));
             let endpoint = StopEndpoint::with_probes(
@@ -5384,9 +5399,22 @@ mod tests {
             )
             .await;
 
+            let detail = match result {
+                Err(SupervisorError::IdentityChanged { detail }) => detail,
+                other => {
+                    return Err(format!(
+                        "changed {name} identity returned an unexpected result: {other:?}"
+                    )
+                    .into());
+                }
+            };
             assert!(
-                matches!(result, Err(SupervisorError::IdentityChanged { .. })),
-                "changed {name} identity did not fail closed"
+                detail.contains("legacy endpoint attestations were not identical"),
+                "changed {name} identity failed for the wrong reason: {detail}"
+            );
+            assert!(
+                endpoint.probes.load(AtomicOrdering::Acquire) >= 2,
+                "changed {name} second attestation was never attempted"
             );
             assert!(
                 signaler.signals()?.is_empty(),
