@@ -511,6 +511,11 @@ fn fake_runner_cannot_start_container_build_until_sanitizer_is_ready() {
     let base = "ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab";
     fs::write(repo.join("images/workspace/versions.lock"), format!("workspace_build_mode = \"connected\"\nbase_image = \"{base}\"\nworkspace_tag = \"gascan-workspace:fixture\"\n[gascamp]\nrevision = \"f6b248c5926240856dbea83d1d2c5c90ea1c1456\"\n")).unwrap();
     fs::write(context.join("Dockerfile"), "FROM scratch\n").unwrap();
+    fs::write(
+        context.join("workspace-source.sha256"),
+        format!("{}\n", "d".repeat(64)),
+    )
+    .unwrap();
     fs::write(context.join("context-manifest.tsv"), "fixture\n").unwrap();
     let manifest = format!("{:x}", Sha256::digest(b"fixture\n"));
     executable(
@@ -586,7 +591,8 @@ esac
 }
 
 #[test]
-fn fake_runner_builds_the_exact_verified_context_and_publishes_reference_last() {
+fn fake_runner_retains_prebuild_fingerprint_when_context_file_is_replaced_after_final_verification()
+{
     let temp = tempfile::tempdir_in("/tmp").unwrap();
     let repo = temp.path().join("repo");
     let bin = temp.path().join("bin");
@@ -640,7 +646,7 @@ esac
     { printf 'container'; printf '\t%s' "$@"; printf '\n'; } >>"$CALLS"
 case "$*" in
  'image inspect ubuntu@sha256:'*) printf '[]\n';;
- 'image inspect gascan-workspace:fixture') printf '[{"id":"%064d","configuration":{"name":"gascan-workspace:fixture","descriptor":{"digest":"sha256:%064d"}},"variants":[{"platform":{"os":"linux","architecture":"arm64"},"digest":"sha256:%064d"}]}]\n' 9 9 8;;
+ 'image inspect gascan-workspace:fixture') printf '%064d\n' 0 >"$FINGERPRINT"; printf '[{"id":"%064d","configuration":{"name":"gascan-workspace:fixture","descriptor":{"digest":"sha256:%064d"}},"variants":[{"platform":{"os":"linux","architecture":"arm64"},"digest":"sha256:%064d"}]}]\n' 9 9 8;;
  build*) exit 0;;
  *) exit 92;;
 esac
@@ -660,6 +666,7 @@ esac
         .env("ARTIFACTS", repo.join(".artifacts"))
         .env("VALIDATOR", env!("CARGO_BIN_EXE_validate-connected-build"))
         .env("SANITIZER", env!("CARGO_BIN_EXE_sanitize-build-output"))
+        .env("FINGERPRINT", context.join("workspace-source.sha256"))
         .env("BENIGN_BUILD_LABEL", "public-build")
         .env("BUILD_PASSWORD_POLICY", "minimum-length-20")
         .env("BUILD_SECRETARY", "release-coordinator")
