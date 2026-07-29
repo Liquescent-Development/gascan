@@ -94,6 +94,7 @@ printf 'checking release preconditions for %s\n' "$version" >&2
 gascan_gate_tools
 gascan_gate_version "$repo_root" "$version"
 gascan_assert_release_inputs_clean "$repo_root" "release $version"
+gascan_gate_workspace_image_source "$repo_root"
 gascan_gate_tag "$repo_root" "$version"
 gascan_gate_github
 gascan_gate_no_release "$version"

@@ -20,15 +20,15 @@ gascan_assert_release_inputs_clean() {
   local repo=$1 label=$2 path ignored_source
   local -a inputs=(
     Cargo.toml Cargo.lock rust-toolchain.toml crates helpers proto
-    scripts/build-apple-attach-helper.sh packaging/macos LICENSE
-    images/workspace/approved-image.txt images/workspace/versions.lock
+    scripts/build-apple-attach-helper.sh scripts/workspace-image-source-digest.sh
+    packaging/macos LICENSE images/workspace
   )
   if [[ -n $(git -C "$repo" status --porcelain --untracked-files=all -- "${inputs[@]}") ]]; then
     printf 'release source inputs are not clean (%s)\n' "$label" >&2
     return 65
   fi
-  for path in Cargo.toml Cargo.lock rust-toolchain.toml scripts/build-apple-attach-helper.sh LICENSE \
-    images/workspace/approved-image.txt images/workspace/versions.lock; do
+  for path in Cargo.toml Cargo.lock rust-toolchain.toml scripts/build-apple-attach-helper.sh \
+    scripts/workspace-image-source-digest.sh LICENSE images/workspace; do
     git -C "$repo" ls-files --error-unmatch -- "$path" >/dev/null 2>&1 || {
       printf 'release source input is not tracked (%s): %s\n' "$label" "$path" >&2
       return 65
@@ -37,8 +37,8 @@ gascan_assert_release_inputs_clean() {
   ignored_source=$(
     git -C "$repo" ls-files --others --ignored --exclude-standard -- \
       crates helpers proto packaging/macos scripts/build-apple-attach-helper.sh \
-      ':(exclude)helpers/apple-attach/.build/**' |
-      awk '/\.(rs|swift|toml|proto|sh)$/ || /(^|\/)Package\.swift$/ { print; exit }'
+      images/workspace ':(exclude)helpers/apple-attach/.build/**' |
+      awk '/^images\/workspace\// || /\.(rs|swift|toml|proto|sh)$/ || /(^|\/)Package\.swift$/ { print; exit }'
   )
   if [[ -n $ignored_source ]]; then
     printf 'ignored release source input exists (%s): %s\n' "$label" "$ignored_source" >&2
