@@ -1375,11 +1375,29 @@ where
     let graceful_deadline = tokio::time::Instant::now() + policy.timeouts.shutdown;
 
     if inspected.status.legacy {
+        let endpoint_path_before =
+            inspect_endpoint_path(paths).map_err(|error| SupervisorError::IdentityChanged {
+                detail: format!("legacy endpoint path was unsafe before re-attestation: {error}"),
+            })?;
+        if !matches!(endpoint_path_before, EndpointPathState::SafeSocket(_)) {
+            return Err(SupervisorError::IdentityChanged {
+                detail: "legacy endpoint path disappeared before re-attestation".to_owned(),
+            });
+        }
         let second = tokio::time::timeout_at(graceful_deadline, endpoint.probe(paths.socket()))
             .await
             .map_err(|_| SupervisorError::IdentityChanged {
                 detail: "legacy endpoint re-attestation timed out".to_owned(),
             })??;
+        let endpoint_path_after =
+            inspect_endpoint_path(paths).map_err(|error| SupervisorError::IdentityChanged {
+                detail: format!("legacy endpoint path changed during re-attestation: {error}"),
+            })?;
+        if endpoint_path_after != endpoint_path_before {
+            return Err(SupervisorError::IdentityChanged {
+                detail: "legacy endpoint pathname changed during re-attestation".to_owned(),
+            });
+        }
         let EndpointProbe::Connected(second) = second else {
             return Err(SupervisorError::IdentityChanged {
                 detail: "legacy endpoint disappeared before signaling".to_owned(),
@@ -2980,6 +2998,12 @@ fn parse_lsof_executable(output: &[u8], pid: u32) -> io::Result<Option<PathBuf>>
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt as _;
 
+    if output
+        .iter()
+        .all(|byte| *byte == 0 || byte.is_ascii_whitespace())
+    {
+        return Ok(None);
+    }
     let mut matched_process = false;
     let mut awaiting_text_name = false;
     for raw_field in output.split(|byte| *byte == 0) {
@@ -5242,9 +5266,13 @@ mod tests {
 
     #[tokio::test]
     async fn stop_legacy_double_attests_then_verifies_process_before_sigterm() -> TestResult {
+        use std::os::unix::fs::PermissionsExt as _;
         let temp = tempfile::tempdir()?;
         let executable = std::env::current_exe()?.canonicalize()?;
         let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        paths.prepare_directory()?;
+        let _listener = std::os::unix::net::UnixListener::bind(paths.socket())?;
+        fs::set_permissions(paths.socket(), fs::Permissions::from_mode(0o600))?;
         let identity = legacy_identity(&executable);
         let inspector = MutableInspector::new(Some(process_for(&identity)));
         let endpoint = StopEndpoint::with_probes(
@@ -6106,6 +6134,13 @@ mod tests {
     fn attestation_macos_parser_rejects_wrong_process_record() -> TestResult {
         let output = b"p8\0\nftxt\0n/trusted/gascand\0\n";
         assert!(parse_lsof_executable(output, 7).is_err());
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn attestation_macos_parser_treats_empty_exit_race_as_absent() -> TestResult {
+        assert_eq!(parse_lsof_executable(b"", 7)?, None);
         Ok(())
     }
 

@@ -184,6 +184,16 @@ struct ActivityInner {
     shutdown: Notify,
     accepting: AtomicBool,
     termination_requested: tokio::sync::watch::Sender<bool>,
+    #[cfg(debug_assertions)]
+    e2e_legacy_wire_identity: Option<E2eLegacyWireIdentity>,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Debug)]
+struct E2eLegacyWireIdentity {
+    flip_token_on_reattestation: bool,
+    handshake_count: AtomicUsize,
+    reattestation_gate: Option<(std::path::PathBuf, std::path::PathBuf)>,
 }
 #[derive(Clone, Copy)]
 struct AdmissionClosed;
@@ -215,6 +225,8 @@ impl ActivityTracker {
                 shutdown: Notify::new(),
                 accepting: AtomicBool::new(true),
                 termination_requested,
+                #[cfg(debug_assertions)]
+                e2e_legacy_wire_identity: None,
             }),
         }
     }
@@ -362,6 +374,47 @@ impl DaemonConfig {
     #[must_use]
     pub fn activity(&self) -> ActivityTracker {
         self.activity.clone()
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn with_release_version_for_e2e(mut self, release_version: String) -> io::Result<Self> {
+        if release_version.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "E2E daemon release version must not be empty",
+            ));
+        }
+        let inner = Arc::get_mut(&mut self.activity.inner).ok_or_else(|| {
+            io::Error::other("E2E daemon identity was shared before release injection")
+        })?;
+        inner.identity.release_version = release_version;
+        Ok(self)
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn with_legacy_wire_identity_for_e2e(
+        mut self,
+        flip_token_on_reattestation: bool,
+        reattestation_gate: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    ) -> io::Result<Self> {
+        if reattestation_gate
+            .as_ref()
+            .is_some_and(|(marker, release)| !marker.is_absolute() || !release.is_absolute())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "E2E re-attestation gate paths must be absolute",
+            ));
+        }
+        let inner = Arc::get_mut(&mut self.activity.inner).ok_or_else(|| {
+            io::Error::other("E2E daemon identity was shared before legacy injection")
+        })?;
+        inner.e2e_legacy_wire_identity = Some(E2eLegacyWireIdentity {
+            flip_token_on_reattestation,
+            handshake_count: AtomicUsize::new(0),
+            reattestation_gate,
+        });
+        Ok(self)
     }
 }
 
@@ -1589,13 +1642,58 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
                 ),
                 details: Vec::new(),
             });
+        #[cfg(not(debug_assertions))]
+        let wire_identity = (
+            self.activity.inner.identity.instance_token.clone(),
+            self.activity.inner.identity.release_version.clone(),
+            Some(self.activity.inner.identity.started_at),
+        );
+        #[cfg(debug_assertions)]
+        let wire_identity = {
+            let mut daemon_instance_token = self.activity.inner.identity.instance_token.clone();
+            let mut release_version = self.activity.inner.identity.release_version.clone();
+            let mut daemon_started_at = Some(self.activity.inner.identity.started_at);
+            if let Some(legacy) = &self.activity.inner.e2e_legacy_wire_identity {
+                let handshake = legacy.handshake_count.fetch_add(1, Ordering::AcqRel) + 1;
+                if handshake == 2 {
+                    if let Some((marker, release)) = &legacy.reattestation_gate {
+                        std::fs::write(marker, b"ready").map_err(|error| {
+                            tonic::Status::internal(format!(
+                                "could not publish E2E re-attestation marker: {error}"
+                            ))
+                        })?;
+                        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                        while !release.exists() {
+                            if tokio::time::Instant::now() >= deadline {
+                                return Err(tonic::Status::deadline_exceeded(
+                                    "E2E re-attestation release timed out",
+                                ));
+                            }
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    }
+                    if legacy.flip_token_on_reattestation {
+                        let replacement = if daemon_instance_token.starts_with('0') {
+                            "1"
+                        } else {
+                            "0"
+                        };
+                        daemon_instance_token.replace_range(..1, replacement);
+                    }
+                }
+                release_version.clear();
+                daemon_started_at = None;
+            }
+            (daemon_instance_token, release_version, daemon_started_at)
+        };
+        let (daemon_instance_token, release_version, daemon_started_at) = wire_identity;
         Ok(tonic::Response::new(v1::HandshakeResponse {
             api_major: API_MAJOR,
             api_minor: API_MINOR,
             capabilities: Vec::new(),
             transport_security: Some(local_transport_security()),
             rejection,
-            daemon_instance_token: self.activity.inner.identity.instance_token.clone(),
+            daemon_instance_token,
             daemon_pid: self.activity.inner.identity.pid,
             daemon_executable: self
                 .activity
@@ -1605,8 +1703,8 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
                 .to_string_lossy()
                 .into_owned(),
             daemon_start_identity: self.activity.inner.identity.start_identity.clone(),
-            release_version: self.activity.inner.identity.release_version.clone(),
-            daemon_started_at: Some(self.activity.inner.identity.started_at),
+            release_version,
+            daemon_started_at,
         }))
     }
     async fn daemon_status(
@@ -1630,6 +1728,12 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         &self,
         request: tonic::Request<v1::ShutdownDaemonRequest>,
     ) -> Result<tonic::Response<v1::ShutdownDaemonResponse>, tonic::Status> {
+        #[cfg(debug_assertions)]
+        if self.activity.inner.e2e_legacy_wire_identity.is_some() {
+            return Err(tonic::Status::unimplemented(
+                "legacy fixture has no shutdown RPC",
+            ));
+        }
         if request.into_inner().daemon_instance_token != self.activity.inner.identity.instance_token
         {
             return Err(tonic::Status::permission_denied(

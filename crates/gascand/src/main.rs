@@ -349,6 +349,8 @@ async fn run_daemon<B: RuntimeBackend + 'static>(
     let service = Arc::new(service);
     let _ = service.reconcile().await?;
     let config = DaemonConfig::new(paths, idle_timeout);
+    #[cfg(debug_assertions)]
+    let config = configure_e2e_daemon(config)?;
     let error_diagnostics = if std::env::var_os(gascand::TEST_ERROR_DIAGNOSTICS_ENV).is_some() {
         ErrorDiagnostics::enabled_for_tests()
     } else {
@@ -357,6 +359,35 @@ async fn run_daemon<B: RuntimeBackend + 'static>(
     let api = SandboxApi::new_with_error_diagnostics(service, config.activity(), error_diagnostics);
     Daemon::serve(config, api).await?;
     Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn configure_e2e_daemon(
+    mut config: DaemonConfig,
+) -> Result<DaemonConfig, Box<dyn std::error::Error>> {
+    if option_env!("CARGO_BIN_NAME") != Some("gascan-e2e-daemon") {
+        return Ok(config);
+    }
+    if let Ok(release_version) = std::env::var("GASCAN_E2E_RELEASE_VERSION") {
+        config = config.with_release_version_for_e2e(release_version)?;
+    }
+    if std::env::var_os("GASCAN_E2E_LEGACY_WIRE_IDENTITY").is_some() {
+        let marker = std::env::var_os("GASCAN_E2E_REATTESTATION_MARKER");
+        let release = std::env::var_os("GASCAN_E2E_REATTESTATION_RELEASE");
+        let gate = match (marker, release) {
+            (None, None) => None,
+            (Some(marker), Some(release)) => Some((marker.into(), release.into())),
+            _ => return Err("incomplete E2E re-attestation gate".into()),
+        };
+        config = config.with_legacy_wire_identity_for_e2e(
+            std::env::var_os("GASCAN_E2E_FLIP_TOKEN_ON_REATTESTATION").is_some(),
+            gate,
+        )?;
+    }
+    if std::env::var_os("GASCAN_E2E_HOLD_OPERATION").is_some() {
+        config.activity().operation_started();
+    }
+    Ok(config)
 }
 
 fn e2e_ssh_paths() -> Result<Option<SshPaths>, Box<dyn std::error::Error>> {

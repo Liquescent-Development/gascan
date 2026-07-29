@@ -31,10 +31,10 @@ impl Environment {
         })
     }
 
-    fn command(&self) -> Command {
+    fn command_for(&self, args: &[&str]) -> Command {
         let mut command = Command::new(&self.gascan);
         command
-            .args(["doctor", "--json"])
+            .args(args)
             .env("XDG_RUNTIME_DIR", &self.runtime_root)
             .env("GASCAN_STATE_PATH", self.runtime_root.join("state.sqlite3"))
             .env(
@@ -52,8 +52,29 @@ impl Environment {
         command
     }
 
+    fn command(&self) -> Command {
+        self.command_for(&["doctor", "--json"])
+    }
+
     fn invoke(&self) -> Result<std::process::Output, std::io::Error> {
         self.command().output()
+    }
+
+    fn daemon_json(&self, action: &str) -> TestResult<serde_json::Value> {
+        let output = self.command_for(&["daemon", action, "--json"]).output()?;
+        if !output.status.success() {
+            let daemon_stderr = std::fs::read_to_string(self.runtime_root.join("daemon.stderr"))
+                .unwrap_or_else(|error| format!("<unavailable: {error}>"));
+            return Err(format!(
+                "daemon {action} failed: status={:?}, stdout={}, stderr={}, daemon_stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+                daemon_stderr
+            )
+            .into());
+        }
+        Ok(serde_json::from_slice(&output.stdout)?)
     }
 
     fn shutdown_daemon(&self) -> TestResult {
@@ -78,6 +99,124 @@ impl Environment {
         }
         Ok(())
     }
+}
+
+#[test]
+fn daemon_status_reports_stopped_without_autostart() -> TestResult {
+    let env = Environment::new()?;
+    let status = env.daemon_json("status")?;
+    assert_eq!(status["state"], "stopped");
+    assert_eq!(status["health"], "stopped");
+    assert!(status["pid"].is_null());
+    assert!(!env.runtime_root.join("daemon.pid").exists());
+    assert!(!env.runtime_root.join("gascan/gascand.sock").exists());
+    Ok(())
+}
+
+#[test]
+fn daemon_start_and_stop_are_idempotent() -> TestResult {
+    let env = Environment::new()?;
+    let started = env.daemon_json("start")?;
+    assert_eq!(started["state"], "running");
+    assert_eq!(started["health"], "healthy");
+    assert_eq!(started["transition"], "started");
+    let pid = started["pid"]
+        .as_u64()
+        .ok_or("started daemon PID missing")?;
+
+    let unchanged = env.daemon_json("start")?;
+    assert_eq!(unchanged["state"], "running");
+    assert_eq!(unchanged["health"], "healthy");
+    assert_eq!(unchanged["transition"], "none");
+    assert_eq!(unchanged["pid"].as_u64(), Some(pid));
+
+    let stopped = env.daemon_json("stop")?;
+    assert_eq!(stopped["state"], "stopped");
+    assert_eq!(stopped["transition"], "stopped");
+    assert_eq!(stopped["forced"], false);
+
+    let still_stopped = env.daemon_json("stop")?;
+    assert_eq!(still_stopped["state"], "stopped");
+    assert_eq!(still_stopped["transition"], "none");
+    assert_eq!(still_stopped["forced"], false);
+    Ok(())
+}
+
+#[test]
+fn daemon_restart_replaces_pid_and_returns_healthy() -> TestResult {
+    let env = Environment::new()?;
+    let started = env.daemon_json("start")?;
+    let old_pid = started["pid"]
+        .as_u64()
+        .ok_or("started daemon PID missing")?;
+
+    let restarted = env.daemon_json("restart")?;
+    assert_eq!(restarted["state"], "running");
+    assert_eq!(restarted["health"], "healthy");
+    assert_eq!(restarted["transition"], "restarted");
+    assert_ne!(restarted["pid"].as_u64(), Some(old_pid));
+    Ok(())
+}
+
+#[test]
+fn daemon_status_works_outside_a_project() -> TestResult {
+    let env = Environment::new()?;
+    let unrelated = tempfile::tempdir()?;
+    let output = env
+        .command_for(&["daemon", "status", "--json"])
+        .current_dir(unrelated.path())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(status["state"], "stopped");
+    Ok(())
+}
+
+#[test]
+fn daemon_status_and_stop_survive_deleted_launch_directory() -> TestResult {
+    let env = Environment::new()?;
+    let launch = tempfile::tempdir()?;
+    let caller = tempfile::tempdir()?;
+    let started = env
+        .command_for(&["daemon", "start", "--json"])
+        .current_dir(launch.path())
+        .output()?;
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    std::fs::remove_dir_all(launch.path())?;
+
+    let status = env
+        .command_for(&["daemon", "status", "--json"])
+        .current_dir(caller.path())
+        .output()?;
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
+    assert_eq!(status["state"], "running");
+    assert_eq!(status["health"], "healthy");
+
+    let stopped = env
+        .command_for(&["daemon", "stop", "--json"])
+        .current_dir(caller.path())
+        .output()?;
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    let stopped: serde_json::Value = serde_json::from_slice(&stopped.stdout)?;
+    assert_eq!(stopped["state"], "stopped");
+    Ok(())
 }
 
 #[test]
