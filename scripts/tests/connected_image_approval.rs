@@ -7,6 +7,7 @@ use std::{
 };
 
 const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const SOURCE_DIGEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -62,12 +63,18 @@ fn fixture() -> Fixture {
         &validator,
         "#!/bin/sh\nset -eu\ntest $# -eq 2\ncat \"$1\"\n",
     );
+    let source_digest = root.join("scripts/test-source-digest");
+    executable(
+        &source_digest,
+        &format!("#!/bin/sh\nset -eu\ntest $# -eq 1\nprintf '%s\\n' '{SOURCE_DIGEST}'\n"),
+    );
     let mut command = Command::new("bash");
     command
         .arg(repository_root().join("scripts/approve-connected-workspace-image.sh"))
         .env("GASCAN_APPROVAL_TEST_ROOT", &root)
         .env("GASCAN_GATE_ARTIFACTS", root.join(".artifacts"))
-        .env("GASCAN_APPROVAL_RECEIPT_VALIDATOR", validator);
+        .env("GASCAN_APPROVAL_RECEIPT_VALIDATOR", validator)
+        .env("GASCAN_APPROVAL_SOURCE_DIGEST_COMMAND", source_digest);
     Fixture {
         _temp: temp,
         root,
@@ -97,6 +104,11 @@ fn matching_candidate_and_live_acceptance_publish_exact_approval_and_evidence() 
         "previous-evidence\n",
     )
     .unwrap();
+    fs::write(
+        f.root.join("images/workspace/approved-source.sha256"),
+        "previous-source\n",
+    )
+    .unwrap();
 
     let output = f.command.output().unwrap();
     assert!(
@@ -108,6 +120,10 @@ fn matching_candidate_and_live_acceptance_publish_exact_approval_and_evidence() 
     assert_eq!(
         fs::read(f.root.join("images/workspace/approved-image.txt")).unwrap(),
         f.reference.as_bytes()
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join("images/workspace/approved-source.sha256")).unwrap(),
+        format!("{SOURCE_DIGEST}\n")
     );
     let evidence =
         fs::read_to_string(f.root.join("docs/evidence/connected-workspace-image.md")).unwrap();
@@ -121,6 +137,34 @@ fn matching_candidate_and_live_acceptance_publish_exact_approval_and_evidence() 
         "- build receipt SHA-256: `{}`",
         digest(&f.root.join(".artifacts/workspace-image-build.json"))
     )));
+    assert!(evidence.contains(&format!("- source SHA-256: `{SOURCE_DIGEST}`")));
+}
+
+#[test]
+fn invalid_source_digest_is_rejected_before_publication() {
+    let mut f = fixture();
+    let invalid_source_digest = f.root.join("scripts/invalid-source-digest");
+    executable(
+        &invalid_source_digest,
+        "#!/bin/sh\nprintf 'not-a-digest\\n'\n",
+    );
+    f.command.env(
+        "GASCAN_APPROVAL_SOURCE_DIGEST_COMMAND",
+        invalid_source_digest,
+    );
+
+    let output = f.command.output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("source digest is invalid"));
+    assert!(!f.root.join("images/workspace/approved-image.txt").exists());
+    assert!(!f
+        .root
+        .join("images/workspace/approved-source.sha256")
+        .exists());
+    assert!(!f
+        .root
+        .join("docs/evidence/connected-workspace-image.md")
+        .exists());
 }
 
 #[test]
@@ -154,24 +198,20 @@ fn interruption_after_evidence_publication_restores_the_previous_pair() {
             fs::read_to_string(f.root.join("docs/evidence/connected-workspace-image.md")).unwrap(),
             "previous-evidence\n"
         );
-        assert!(
-            !fs::read_dir(f.root.join("docs/evidence"))
+        assert!(!fs::read_dir(f.root.join("docs/evidence"))
+            .unwrap()
+            .any(|entry| entry
                 .unwrap()
-                .any(|entry| entry
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".connected-workspace-image."))
-        );
-        assert!(
-            !fs::read_dir(f.root.join("images/workspace"))
-                .unwrap()
-                .any(|entry| entry
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".approved-image."))
-        );
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".connected-workspace-image.")));
+        assert!(!fs::read_dir(f.root.join("images/workspace"))
+            .unwrap()
+            .any(|entry| {
+                let name = entry.unwrap().file_name();
+                let name = name.to_string_lossy();
+                name.starts_with(".approved-image.") || name.starts_with(".approved-source.")
+            }));
     }
 }
 
@@ -208,14 +248,17 @@ fn interruption_immediately_before_evidence_replacement_restores_the_previous_pa
 }
 
 #[test]
-fn successful_replacement_preserves_the_prior_pair_modes() {
+fn successful_replacement_preserves_the_prior_triple_modes() {
     let mut f = fixture();
     let approval = f.root.join("images/workspace/approved-image.txt");
     let evidence = f.root.join("docs/evidence/connected-workspace-image.md");
+    let source = f.root.join("images/workspace/approved-source.sha256");
     fs::write(&approval, "previous-approval").unwrap();
     fs::write(&evidence, "previous-evidence\n").unwrap();
+    fs::write(&source, "previous-source\n").unwrap();
     fs::set_permissions(&approval, fs::Permissions::from_mode(0o640)).unwrap();
     fs::set_permissions(&evidence, fs::Permissions::from_mode(0o604)).unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
     let approval_identity = (
         fs::metadata(&approval).unwrap().uid(),
         fs::metadata(&approval).unwrap().gid(),
@@ -223,6 +266,10 @@ fn successful_replacement_preserves_the_prior_pair_modes() {
     let evidence_identity = (
         fs::metadata(&evidence).unwrap().uid(),
         fs::metadata(&evidence).unwrap().gid(),
+    );
+    let source_identity = (
+        fs::metadata(&source).unwrap().uid(),
+        fs::metadata(&source).unwrap().gid(),
     );
 
     let output = f.command.output().unwrap();
@@ -233,6 +280,7 @@ fn successful_replacement_preserves_the_prior_pair_modes() {
     );
     assert_eq!(mode(&approval), 0o640);
     assert_eq!(mode(&evidence), 0o604);
+    assert_eq!(mode(&source), 0o600);
     assert_eq!(
         (
             fs::metadata(&approval).unwrap().uid(),
@@ -247,49 +295,70 @@ fn successful_replacement_preserves_the_prior_pair_modes() {
         ),
         evidence_identity
     );
+    assert_eq!(
+        (
+            fs::metadata(&source).unwrap().uid(),
+            fs::metadata(&source).unwrap().gid(),
+        ),
+        source_identity
+    );
 }
 
 #[test]
-fn signals_at_every_replacement_boundary_restore_exact_prior_pair_or_absence() {
+fn failures_and_signals_at_every_replacement_boundary_restore_exact_prior_triple_or_absence() {
     for boundary in [
         "before-evidence-replacement",
         "after-evidence-replacement",
         "before-approval-replacement",
         "after-approval-replacement",
+        "before-source-replacement",
+        "after-source-replacement",
     ] {
-        for (action, code) in [("INT", 130), ("TERM", 143)] {
+        for (action, code) in [("FAIL", None), ("INT", Some(130)), ("TERM", Some(143))] {
             for prior_exists in [false, true] {
                 let mut f = fixture();
                 let approval = f.root.join("images/workspace/approved-image.txt");
                 let evidence = f.root.join("docs/evidence/connected-workspace-image.md");
+                let source = f.root.join("images/workspace/approved-source.sha256");
                 if prior_exists {
                     fs::write(&approval, "previous-approval").unwrap();
                     fs::write(&evidence, "previous-evidence\n").unwrap();
+                    fs::write(&source, "previous-source\n").unwrap();
                     fs::set_permissions(&approval, fs::Permissions::from_mode(0o640)).unwrap();
                     fs::set_permissions(&evidence, fs::Permissions::from_mode(0o604)).unwrap();
+                    fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
                 }
                 f.command
                     .env("GASCAN_APPROVAL_TEST_BOUNDARY", boundary)
                     .env("GASCAN_APPROVAL_TEST_ACTION", action);
 
                 let output = f.command.output().unwrap();
-                assert_eq!(
-                    output.status.code(),
-                    Some(code),
-                    "{boundary} {action} prior={prior_exists}: {}",
-                    String::from_utf8_lossy(&output.stderr)
+                assert!(
+                    !output.status.success(),
+                    "{boundary} {action} prior={prior_exists}"
                 );
+                if let Some(code) = code {
+                    assert_eq!(
+                        output.status.code(),
+                        Some(code),
+                        "{boundary} {action} prior={prior_exists}: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
                 if prior_exists {
                     assert_eq!(fs::read_to_string(&approval).unwrap(), "previous-approval");
                     assert_eq!(
                         fs::read_to_string(&evidence).unwrap(),
                         "previous-evidence\n"
                     );
+                    assert_eq!(fs::read_to_string(&source).unwrap(), "previous-source\n");
                     assert_eq!(mode(&approval), 0o640);
                     assert_eq!(mode(&evidence), 0o604);
+                    assert_eq!(mode(&source), 0o600);
                 } else {
                     assert!(!approval.exists(), "{boundary} {action}");
                     assert!(!evidence.exists(), "{boundary} {action}");
+                    assert!(!source.exists(), "{boundary} {action}");
                 }
             }
         }
