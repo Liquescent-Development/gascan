@@ -1,9 +1,11 @@
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
     process::Command,
+    thread,
+    time::{Duration, Instant},
 };
 
 const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -40,7 +42,7 @@ fn fixture() -> Fixture {
     fs::write(root.join("images/workspace/versions.lock"), "locked\n").unwrap();
     fs::write(
         root.join(".artifacts/workspace-image-build.json"),
-        "{\"status\":\"succeeded\"}\n",
+        format!("{{\"status\":\"succeeded\",\"source_digest\":\"{SOURCE_DIGEST}\"}}\n"),
     )
     .unwrap();
     fs::write(
@@ -61,7 +63,7 @@ fn fixture() -> Fixture {
     let validator = root.join("scripts/test-receipt-validator");
     executable(
         &validator,
-        "#!/bin/sh\nset -eu\ntest $# -eq 2\ncat \"$1\"\n",
+        "#!/bin/sh\nset -eu\ntest $# -eq 2\ntest -z \"${CALLS:-}\" || printf 'validator\\n' >>\"$CALLS\"\ncat \"$1\"\n",
     );
     let source_digest = root.join("scripts/test-source-digest");
     executable(
@@ -74,12 +76,197 @@ fn fixture() -> Fixture {
         .env("GASCAN_APPROVAL_TEST_ROOT", &root)
         .env("GASCAN_GATE_ARTIFACTS", root.join(".artifacts"))
         .env("GASCAN_APPROVAL_RECEIPT_VALIDATOR", validator)
-        .env("GASCAN_APPROVAL_SOURCE_DIGEST_COMMAND", source_digest);
+        .env("GASCAN_APPROVAL_SOURCE_DIGEST_COMMAND", source_digest)
+        .env(
+            "GASCAN_APPROVAL_LOCK_COMMAND",
+            env!("CARGO_BIN_EXE_run-with-safe-lock"),
+        );
     Fixture {
         _temp: temp,
         root,
         command,
         reference,
+    }
+}
+
+#[test]
+fn source_drift_after_build_receipt_is_rejected_before_publication() {
+    let mut f = fixture();
+    let source = f.root.join("images/workspace/helper");
+    fs::write(&source, "built\n").unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&f.root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args(["add", "images/workspace"])
+            .current_dir(&f.root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let digest_command = repository_root().join("scripts/workspace-image-source-digest.sh");
+    let built_digest = Command::new("bash")
+        .arg(&digest_command)
+        .arg(&f.root)
+        .output()
+        .unwrap();
+    assert!(built_digest.status.success());
+    let built_digest = String::from_utf8(built_digest.stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    fs::write(
+        f.root.join(".artifacts/workspace-image-build.json"),
+        format!("{{\"status\":\"succeeded\",\"source_digest\":\"{built_digest}\"}}\n"),
+    )
+    .unwrap();
+    fs::write(&source, "drifted\n").unwrap();
+    for (path, contents) in [
+        ("images/workspace/approved-image.txt", "previous-approval"),
+        (
+            "images/workspace/approved-source.sha256",
+            "previous-source\n",
+        ),
+        (
+            "docs/evidence/connected-workspace-image.md",
+            "previous-evidence\n",
+        ),
+    ] {
+        fs::write(f.root.join(path), contents).unwrap();
+    }
+    f.command
+        .env("GASCAN_APPROVAL_SOURCE_DIGEST_COMMAND", digest_command);
+
+    let output = f.command.output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("source changed after build"));
+    assert_eq!(
+        fs::read_to_string(f.root.join("images/workspace/approved-image.txt")).unwrap(),
+        "previous-approval"
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join("images/workspace/approved-source.sha256")).unwrap(),
+        "previous-source\n"
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join("docs/evidence/connected-workspace-image.md")).unwrap(),
+        "previous-evidence\n"
+    );
+}
+
+#[test]
+fn concurrent_approval_waits_before_validation_and_publication() {
+    let mut first = fixture();
+    let mut second = Command::new("bash");
+    second
+        .arg(repository_root().join("scripts/approve-connected-workspace-image.sh"))
+        .env("GASCAN_APPROVAL_TEST_ROOT", &first.root)
+        .env("GASCAN_GATE_ARTIFACTS", first.root.join(".artifacts"))
+        .env(
+            "GASCAN_APPROVAL_RECEIPT_VALIDATOR",
+            first.root.join("scripts/test-receipt-validator"),
+        )
+        .env(
+            "GASCAN_APPROVAL_SOURCE_DIGEST_COMMAND",
+            first.root.join("scripts/test-source-digest"),
+        )
+        .env(
+            "GASCAN_APPROVAL_LOCK_COMMAND",
+            env!("CARGO_BIN_EXE_run-with-safe-lock"),
+        );
+    let calls = first.root.join("calls");
+    let ready = first.root.join("first-ready");
+    let release = first.root.join("release-first");
+    let blocking_digest = first.root.join("scripts/blocking-source-digest");
+    executable(
+        &blocking_digest,
+        &format!(
+            "#!/bin/sh\nset -eu\n: >'{}'\nwhile ! test -e '{}'; do sleep 0.01; done\nprintf '%s\\n' '{}'\n",
+            ready.display(),
+            release.display(),
+            SOURCE_DIGEST
+        ),
+    );
+    first
+        .command
+        .env("GASCAN_APPROVAL_SOURCE_DIGEST_COMMAND", blocking_digest)
+        .env("CALLS", &calls);
+    second.env("CALLS", &calls);
+    fs::write(
+        first.root.join("images/workspace/approved-image.txt"),
+        "previous-approval",
+    )
+    .unwrap();
+
+    let mut first_child = first.command.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        ready.exists(),
+        "first approval never reached source validation"
+    );
+    let mut second_child = second.spawn().unwrap();
+    thread::sleep(Duration::from_millis(250));
+    let second_waited = second_child.try_wait().unwrap().is_none();
+    let validation_count = fs::read_to_string(&calls)
+        .unwrap_or_default()
+        .lines()
+        .count();
+    let publication_unchanged =
+        fs::read_to_string(first.root.join("images/workspace/approved-image.txt")).unwrap()
+            == "previous-approval";
+
+    fs::write(&release, "").unwrap();
+    let first_status = first_child.wait().unwrap();
+    let second_status = second_child.wait().unwrap();
+
+    assert!(
+        second_waited,
+        "second approval did not wait for the repository lock"
+    );
+    assert_eq!(
+        validation_count, 1,
+        "second approval validated while the first owned the repository lock"
+    );
+    assert!(
+        publication_unchanged,
+        "second approval published while the first owned the repository lock"
+    );
+    assert!(first_status.success());
+    assert!(second_status.success());
+}
+
+#[test]
+fn unsafe_existing_approval_locks_are_rejected_before_validation() {
+    for kind in ["symlink", "permissive", "hardlink"] {
+        let mut f = fixture();
+        let lock = f.root.join(".artifacts/workspace-image-approval.lock");
+        let other = f.root.join(format!("{kind}-target"));
+        fs::write(&other, "unchanged").unwrap();
+        match kind {
+            "symlink" => symlink(&other, &lock).unwrap(),
+            "permissive" => {
+                fs::write(&lock, "").unwrap();
+                fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            "hardlink" => fs::hard_link(&other, &lock).unwrap(),
+            _ => unreachable!(),
+        }
+        let calls = f.root.join("calls");
+        f.command.env("CALLS", &calls);
+
+        let output = f.command.output().unwrap();
+        assert!(!output.status.success(), "{kind}");
+        assert!(!calls.exists(), "{kind} lock allowed validation");
+        assert_eq!(fs::read_to_string(&other).unwrap(), "unchanged");
     }
 }
 

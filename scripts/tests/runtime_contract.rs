@@ -77,3 +77,20 @@ fn missing_exact_copy_or_service_reference_is_rejected() {
         assert!(String::from_utf8_lossy(&output.stderr).contains("/usr/local/bin/helper"));
     }
 }
+
+#[test]
+fn extra_provisioning_helper_absent_from_contract_is_rejected() {
+    let fixture = fixture(true, true);
+    fs::write(
+        fixture.root.join("crates/gascand/src/service.rs"),
+        concat!(
+            "const HELPER: &str = \"/usr/local/bin/helper\";\n",
+            "const UNDECLARED: &str = \"/usr/local/bin/undeclared\";\n"
+        ),
+    )
+    .unwrap();
+
+    let output = validate(&fixture.root);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("/usr/local/bin/undeclared"));
+}

@@ -8,6 +8,18 @@ root=$(cd "$configured_root" 2>/dev/null && pwd -P) || {
   exit 1
 }
 artifacts=${GASCAN_GATE_ARTIFACTS:-"$root/.artifacts"}
+mkdir -p "$artifacts"
+mkdir -p "$root/.artifacts"
+lock_file="$root/.artifacts/workspace-image-approval.lock"
+if test "${GASCAN_APPROVAL_LOCK_HELD:-}" != "$root"; then
+  if test -n "${GASCAN_APPROVAL_LOCK_COMMAND:-}"; then
+    exec "$GASCAN_APPROVAL_LOCK_COMMAND" "$lock_file" -- \
+      env GASCAN_APPROVAL_LOCK_HELD="$root" bash "$0" "$@"
+  fi
+  exec cargo run --quiet --locked --offline --manifest-path "$root/scripts/Cargo.toml" \
+    --bin run-with-safe-lock -- "$lock_file" -- \
+    env GASCAN_APPROVAL_LOCK_HELD="$root" bash "$0" "$@"
+fi
 candidate_file="$artifacts/connected-workspace-image-candidate.txt"
 live_file="$artifacts/connected-workspace-image-apple-live.txt"
 reference_file="$artifacts/workspace-image-ref"
@@ -39,10 +51,17 @@ validated=$("$validator" "$reference_file" "$receipt_file") ||
   die 'build receipt pair is invalid'
 test "$candidate" = "$validated" || die 'candidate differs from the validated build receipt'
 test "$live" = "$candidate" || die 'Apple live acceptance differs from the candidate'
+receipt_source_digest=$(jq -er '
+  .source_digest
+  | if type == "string" and test("^[0-9a-f]{64}$") then .
+    else error("invalid build-bound source digest") end
+' "$receipt_file") || die 'build-bound workspace image source digest is invalid'
 source_digest=$("$source_digest_command" "$root") ||
   die 'workspace image source digest is unavailable'
 [[ "$source_digest" =~ ^[0-9a-f]{64}$ ]] ||
   die 'workspace image source digest is invalid'
+test "$source_digest" = "$receipt_source_digest" ||
+  die 'workspace image source changed after build evidence was produced'
 
 mkdir -p "$(dirname "$evidence_file")" "$(dirname "$approved_file")"
 evidence_tmp=$(mktemp "$(dirname "$evidence_file")/.connected-workspace-image.XXXXXX")

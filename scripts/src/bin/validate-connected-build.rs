@@ -41,6 +41,7 @@ struct BuildReceipt {
     platform: String,
     lock_digest: String,
     context_digest: String,
+    source_digest: String,
     image_digest: String,
     status: String,
 }
@@ -140,6 +141,7 @@ fn validate_receipt_pair(
         || receipt.platform != "linux/arm64"
         || receipt.lock_digest != expected_lock
         || receipt.context_digest != expected_context
+        || !valid_sha256(&receipt.source_digest)
         || receipt.image_digest != image_digest
         || receipt.status != "succeeded"
     {
@@ -148,13 +150,17 @@ fn validate_receipt_pair(
     Ok(())
 }
 
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn valid_digest(value: &str) -> bool {
-    value.strip_prefix("sha256:").is_some_and(|hex| {
-        hex.len() == 64
-            && hex
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    })
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(|hex| valid_sha256(hex))
 }
 
 fn valid_tag(value: &str) -> bool {

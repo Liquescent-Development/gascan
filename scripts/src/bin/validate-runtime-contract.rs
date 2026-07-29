@@ -89,7 +89,46 @@ fn validate(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("helper source is not a regular file: {}", helper.source).into());
         }
     }
+    let invoked_helpers = provisioning_helpers(&service)?;
+    let declared_helpers: HashSet<_> = paths.into_iter().map(String::as_str).collect();
+    if invoked_helpers != declared_helpers {
+        let mut undeclared: Vec<_> = invoked_helpers
+            .difference(&declared_helpers)
+            .copied()
+            .collect();
+        undeclared.sort_unstable();
+        let mut unreferenced: Vec<_> = declared_helpers
+            .difference(&invoked_helpers)
+            .copied()
+            .collect();
+        unreferenced.sort_unstable();
+        return Err(format!(
+            "runtime helper contract differs from provisioning; undeclared: {}; unreferenced: {}",
+            undeclared.join(", "),
+            unreferenced.join(", ")
+        )
+        .into());
+    }
     Ok(())
+}
+
+fn provisioning_helpers(service: &str) -> Result<HashSet<&str>, Box<dyn std::error::Error>> {
+    const PREFIX: &str = "\"/usr/local/bin/";
+    let mut helpers = HashSet::new();
+    let mut remainder = service;
+    while let Some(start) = remainder.find(PREFIX) {
+        let path = &remainder[start + 1..];
+        let end = path
+            .find('"')
+            .ok_or("unterminated /usr/local/bin provisioning helper")?;
+        let path = &path[..end];
+        if path.contains('\\') || !Path::new(path).is_absolute() {
+            return Err(format!("invalid provisioning helper path: {path}").into());
+        }
+        helpers.insert(path);
+        remainder = &remainder[start + 1 + end + 1..];
+    }
+    Ok(helpers)
 }
 
 fn safe_relative_source(source: &str) -> bool {

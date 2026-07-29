@@ -133,8 +133,12 @@ cleanup_publication() { status=$?; rm -f "$ref_tmp" "$json_tmp" || status=1; cle
 trap cleanup_publication EXIT
 printf '%s\n' "$reference" >"$ref_tmp"
 lock_digest=$(shasum -a 256 "$lock" | cut -d' ' -f1)
-printf '{"reference":"%s","tag":"%s","platform":"linux/arm64","lock_digest":"%s","context_digest":"%s","image_digest":"%s","apple_version":"%s","started_at":"%s","finished_at":"%s","status":"succeeded"}\n' \
-  "$reference" "$tag" "$lock_digest" "$context_manifest" "$image_digest" "$(sw_vers -productVersion)" "$started_at" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >"$json_tmp"
+source_digest=$("$root/scripts/workspace-image-source-digest.sh" "$root") ||
+  die 'workspace image source digest is unavailable'
+[[ "$source_digest" =~ ^[0-9a-f]{64}$ ]] ||
+  die 'workspace image source digest is invalid'
+printf '{"reference":"%s","tag":"%s","platform":"linux/arm64","lock_digest":"%s","context_digest":"%s","source_digest":"%s","image_digest":"%s","apple_version":"%s","started_at":"%s","finished_at":"%s","status":"succeeded"}\n' \
+  "$reference" "$tag" "$lock_digest" "$context_manifest" "$source_digest" "$image_digest" "$(sw_vers -productVersion)" "$started_at" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >"$json_tmp"
 run_tool validate-connected-build validate-receipt "$ref_tmp" "$json_tmp" "$lock_digest" "$context_manifest" || die 'build receipt pair is invalid'
 mv -f "$json_tmp" "$artifacts/workspace-image-build.json"
 mv -f "$ref_tmp" "$artifacts/workspace-image-ref"

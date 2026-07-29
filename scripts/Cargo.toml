@@ -11,6 +11,10 @@ publish = false
 name = "validate-runtime-contract"
 path = "src/bin/validate-runtime-contract.rs"
 
+[[bin]]
+name = "run-with-safe-lock"
+path = "src/bin/run-with-safe-lock.rs"
+
 [dependencies]
 libc = "0.2"
 cap-std = "4"

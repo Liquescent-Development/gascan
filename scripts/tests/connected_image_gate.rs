@@ -177,7 +177,7 @@ exec "$executable" "$@"
     executable(
         &root.join("scripts/build-connected-workspace-image.sh"),
         &format!(
-            "#!/bin/sh\nset -eu\nprintf 'build\\n' >>\"$CALLS\"\n[ \"${{GASCAN_GATE_TEST_BUILD_FAILURE:-}}\" != 1 ]\nmkdir -p \"$GASCAN_GATE_ARTIFACTS\"\nref='gascan-workspace:d4964500a3295a33@sha256:{DIGEST}'\n[ \"${{REFERENCE_KIND:-}}\" != mutable ] || ref=gascan-workspace:d4964500a3295a33\nprintf '%s\\n' \"$ref\" >\"$GASCAN_GATE_ARTIFACTS/workspace-image-ref\"\nprintf '{{\"reference\":\"%s\",\"tag\":\"gascan-workspace:d4964500a3295a33\",\"platform\":\"linux/arm64\",\"lock_digest\":\"{lock_digest}\",\"context_digest\":\"{context_digest}\",\"image_digest\":\"sha256:{DIGEST}\",\"status\":\"succeeded\"}}\\n' \"$ref\" >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\"\ncase \"${{RECEIPT_KIND:-}}\" in missing) rm -f \"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; malformed) printf '{{bad\\n' >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; mismatched) printf '{{\"reference\":\"wrong\"}}\\n' >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; esac\nprintf '%s\\n' \"$ref\"\n"
+            "#!/bin/sh\nset -eu\nprintf 'build\\n' >>\"$CALLS\"\n[ \"${{GASCAN_GATE_TEST_BUILD_FAILURE:-}}\" != 1 ]\nmkdir -p \"$GASCAN_GATE_ARTIFACTS\"\nref='gascan-workspace:d4964500a3295a33@sha256:{DIGEST}'\n[ \"${{REFERENCE_KIND:-}}\" != mutable ] || ref=gascan-workspace:d4964500a3295a33\nprintf '%s\\n' \"$ref\" >\"$GASCAN_GATE_ARTIFACTS/workspace-image-ref\"\nprintf '{{\"reference\":\"%s\",\"tag\":\"gascan-workspace:d4964500a3295a33\",\"platform\":\"linux/arm64\",\"lock_digest\":\"{lock_digest}\",\"context_digest\":\"{context_digest}\",\"source_digest\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"image_digest\":\"sha256:{DIGEST}\",\"status\":\"succeeded\"}}\\n' \"$ref\" >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\"\ncase \"${{RECEIPT_KIND:-}}\" in missing) rm -f \"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; malformed) printf '{{bad\\n' >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; mismatched) printf '{{\"reference\":\"wrong\"}}\\n' >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; esac\nprintf '%s\\n' \"$ref\"\n"
         ),
     );
     fs::copy(
@@ -332,7 +332,8 @@ fn seed_valid_receipt(f: &Fixture) {
     fs::write(
         artifacts.join("workspace-image-build.json"),
         format!(
-            "{{\"reference\":\"{reference}\",\"tag\":\"gascan-workspace:d4964500a3295a33\",\"platform\":\"linux/arm64\",\"lock_digest\":\"{lock_digest}\",\"context_digest\":\"{context_digest}\",\"image_digest\":\"sha256:{DIGEST}\",\"status\":\"succeeded\"}}\n"
+            "{{\"reference\":\"{reference}\",\"tag\":\"gascan-workspace:d4964500a3295a33\",\"platform\":\"linux/arm64\",\"lock_digest\":\"{lock_digest}\",\"context_digest\":\"{context_digest}\",\"source_digest\":\"{}\",\"image_digest\":\"sha256:{DIGEST}\",\"status\":\"succeeded\"}}\n",
+            "e".repeat(64)
         ),
     )
     .unwrap();
@@ -376,7 +377,8 @@ fn seed_valid_ghcr_receipt(f: &Fixture) -> String {
     fs::write(
         artifacts.join("workspace-image-build.json"),
         format!(
-            "{{\"reference\":\"{reference}\",\"tag\":\"{tag}\",\"platform\":\"linux/arm64\",\"lock_digest\":\"{lock_digest}\",\"context_digest\":\"{context_digest}\",\"image_digest\":\"sha256:{DIGEST}\",\"status\":\"succeeded\"}}\n"
+            "{{\"reference\":\"{reference}\",\"tag\":\"{tag}\",\"platform\":\"linux/arm64\",\"lock_digest\":\"{lock_digest}\",\"context_digest\":\"{context_digest}\",\"source_digest\":\"{}\",\"image_digest\":\"sha256:{DIGEST}\",\"status\":\"succeeded\"}}\n",
+            "e".repeat(64)
         ),
     )
     .unwrap();
