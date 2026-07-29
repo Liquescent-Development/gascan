@@ -1,3 +1,4 @@
+use crate::daemon::{DaemonState, DaemonStatus, DaemonTransition, LifecycleOutcome};
 use console::{Style, Term};
 use gascan_proto::ssh_status::{SshState, classify as classify_ssh};
 use gascan_proto::v1;
@@ -11,6 +12,7 @@ pub(crate) enum OperationKind {
     Apply,
     Down,
     Destroy,
+    DaemonRecovery,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -266,6 +268,140 @@ pub(crate) fn render_list(
     output
 }
 
+pub(crate) fn daemon_status_json(status: &DaemonStatus, now_millis: i64) -> serde_json::Value {
+    let (state, health) = daemon_state_and_health(status.state);
+    let identity = status.identity.as_ref();
+    let started_at_millis = identity
+        .and_then(|identity| identity.started_at.as_ref())
+        .and_then(timestamp_millis);
+    let uptime_millis =
+        started_at_millis.map(|started_at| now_millis.saturating_sub(started_at).max(0));
+    serde_json::json!({
+        "state": state,
+        "health": health,
+        "installed_version": env!("CARGO_PKG_VERSION"),
+        "running_version": identity.and_then(|identity| identity.release_version.as_deref()),
+        "pid": identity.map(|identity| identity.pid),
+        "started_at_millis": started_at_millis,
+        "uptime_millis": uptime_millis,
+        "executable": identity.map(|identity| identity.executable.display().to_string()),
+        "legacy": status.legacy,
+    })
+}
+
+pub(crate) fn daemon_lifecycle_json(
+    outcome: &LifecycleOutcome,
+    now_millis: i64,
+) -> serde_json::Value {
+    let mut value = daemon_status_json(&outcome.status, now_millis);
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "transition".to_owned(),
+            serde_json::Value::String(daemon_transition_name(outcome.transition).to_owned()),
+        );
+        object.insert("forced".to_owned(), serde_json::Value::Bool(outcome.forced));
+    }
+    value
+}
+
+pub(crate) fn render_daemon_status(
+    status: &DaemonStatus,
+    now_millis: i64,
+    capabilities: OutputCapabilities,
+) -> String {
+    if status.state == DaemonState::Stopped {
+        return "○ Gascan daemon is stopped\n".to_owned();
+    }
+
+    let (_, health) = daemon_state_and_health(status.state);
+    let heading = match status.state {
+        DaemonState::Current => "✓ Gascan daemon is running",
+        DaemonState::Outdated => "! Gascan daemon is outdated",
+        DaemonState::Unhealthy => "! Gascan daemon is unhealthy",
+        DaemonState::Unreachable => "! Gascan daemon is unreachable",
+        DaemonState::Unsafe => "! Gascan daemon is unsafe",
+        DaemonState::Stopped => unreachable!("stopped was returned above"),
+    };
+    let mut output = format!("{heading}\n  Health             {}\n", humanize(health));
+    let identity = status.identity.as_ref();
+    if let Some(identity) = identity {
+        let _ = writeln!(output, "  PID                {}", identity.pid);
+        if let Some(started_at) = identity.started_at.as_ref().and_then(timestamp_millis) {
+            let _ = writeln!(
+                output,
+                "  Uptime             {}",
+                format_duration(now_millis.saturating_sub(started_at))
+            );
+        }
+    }
+    let _ = writeln!(output, "  Installed version  {}", env!("CARGO_PKG_VERSION"));
+    if let Some(identity) = identity {
+        let running_version = identity.release_version.as_deref().unwrap_or("legacy");
+        let _ = writeln!(output, "  Running version    {running_version}");
+        let _ = writeln!(
+            output,
+            "  Executable         {}",
+            identity.executable.display()
+        );
+    }
+    let _ = capabilities;
+    output
+}
+
+pub(crate) fn render_daemon_lifecycle(
+    outcome: &LifecycleOutcome,
+    now_millis: i64,
+    capabilities: OutputCapabilities,
+) -> String {
+    render_daemon_status(&outcome.status, now_millis, capabilities)
+}
+
+pub(crate) const fn daemon_force_warning() -> &'static str {
+    "Warning: forcing daemon shutdown may interrupt active sandbox operations and attachments.\n"
+}
+
+fn daemon_state_and_health(state: DaemonState) -> (&'static str, &'static str) {
+    match state {
+        DaemonState::Stopped => ("stopped", "stopped"),
+        DaemonState::Current => ("running", "healthy"),
+        DaemonState::Outdated => ("running", "outdated"),
+        DaemonState::Unhealthy => ("running", "unhealthy"),
+        DaemonState::Unreachable => ("unreachable", "unreachable"),
+        DaemonState::Unsafe => ("unsafe", "unsafe"),
+    }
+}
+
+fn daemon_transition_name(transition: DaemonTransition) -> &'static str {
+    match transition {
+        DaemonTransition::None => "none",
+        DaemonTransition::Started => "started",
+        DaemonTransition::Stopped => "stopped",
+        DaemonTransition::Restarted => "restarted",
+        DaemonTransition::Recovered => "recovered",
+    }
+}
+
+fn timestamp_millis(timestamp: &crate::daemon::InstanceTimestamp) -> Option<i64> {
+    timestamp
+        .seconds
+        .checked_mul(1_000)
+        .and_then(|millis| millis.checked_add(i64::from(timestamp.nanos) / 1_000_000))
+}
+
+fn format_duration(millis: i64) -> String {
+    let seconds = millis.max(0) / 1_000;
+    let hours = seconds / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 fn styled_heading(
     heading: &str,
     symbol: &str,
@@ -351,6 +487,7 @@ impl OperationProgress {
             OperationKind::Apply => "Applying configuration",
             OperationKind::Down => "Stopping sandbox",
             OperationKind::Destroy => "Destroying sandbox",
+            OperationKind::DaemonRecovery => "Restarting outdated Gascan daemon…",
         };
         let progress_bar = draw_target.map(|draw_target| {
             let progress_bar = ProgressBar::with_draw_target(None, draw_target);
@@ -431,6 +568,10 @@ impl OperationProgress {
     }
 
     pub(crate) fn finish_success(mut self) -> Option<String> {
+        if self.kind == OperationKind::DaemonRecovery {
+            self.clear();
+            return None;
+        }
         let completion = match (self.kind, self.sandbox_id.as_deref()) {
             (OperationKind::Up, None) => "Sandbox is running".to_owned(),
             (OperationKind::Up, Some(id)) => format!("Sandbox {id} is running"),
@@ -442,6 +583,7 @@ impl OperationProgress {
             (OperationKind::Down, Some(id)) => format!("Sandbox {id} is stopped"),
             (OperationKind::Destroy, None) => "Sandbox is destroyed".to_owned(),
             (OperationKind::Destroy, Some(id)) => format!("Sandbox {id} is destroyed"),
+            (OperationKind::DaemonRecovery, _) => unreachable!("returned above"),
         };
 
         if let Some(progress_bar) = self.progress_bar.take() {
@@ -479,6 +621,11 @@ impl Drop for OperationProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::{
+        DaemonIdentity, DaemonState, DaemonStatus, DaemonTransition, InstanceTimestamp,
+        LifecycleOutcome,
+    };
+    use std::path::PathBuf;
 
     #[test]
     fn error_without_a_sandbox_is_actionable_in_plain_mode() {
@@ -561,6 +708,144 @@ mod tests {
             actual_state: state as i32,
             ..Default::default()
         }
+    }
+
+    fn daemon_status(state: DaemonState) -> DaemonStatus {
+        DaemonStatus {
+            state,
+            identity: None,
+            legacy: false,
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn daemon_stopped_output_keeps_runtime_fields_null_in_json() {
+        let status = daemon_status(DaemonState::Stopped);
+
+        assert_eq!(
+            render_daemon_status(&status, 1_000_000, OutputCapabilities::plain()),
+            "○ Gascan daemon is stopped\n"
+        );
+        assert_eq!(
+            daemon_status_json(&status, 1_000_000),
+            serde_json::json!({
+                "state": "stopped",
+                "health": "stopped",
+                "installed_version": env!("CARGO_PKG_VERSION"),
+                "running_version": null,
+                "pid": null,
+                "started_at_millis": null,
+                "uptime_millis": null,
+                "executable": null,
+                "legacy": false,
+            })
+        );
+    }
+
+    #[test]
+    fn daemon_healthy_output_includes_identity_and_version_fields() {
+        let mut status = daemon_status(DaemonState::Current);
+        status.identity = Some(DaemonIdentity {
+            pid: 40_382,
+            executable: PathBuf::from("/usr/local/bin/gascand"),
+            start_identity: "start-identity".to_owned(),
+            instance_token: "instance-token".to_owned(),
+            release_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            started_at: Some(InstanceTimestamp {
+                seconds: 900,
+                nanos: 0,
+            }),
+        });
+
+        assert_eq!(
+            render_daemon_status(&status, 1_000_000, OutputCapabilities::plain()),
+            format!(
+                "✓ Gascan daemon is running\n  Health             Healthy\n  PID                40382\n  Uptime             1m 40s\n  Installed version  {}\n  Running version    {}\n  Executable         /usr/local/bin/gascand\n",
+                env!("CARGO_PKG_VERSION"),
+                env!("CARGO_PKG_VERSION"),
+            )
+        );
+    }
+
+    #[test]
+    fn daemon_json_uptime_clamps_future_start_timestamps_to_zero() {
+        let mut status = daemon_status(DaemonState::Current);
+        status.identity = Some(DaemonIdentity {
+            pid: 40_382,
+            executable: PathBuf::from("/usr/local/bin/gascand"),
+            start_identity: "start-identity".to_owned(),
+            instance_token: "instance-token".to_owned(),
+            release_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            started_at: Some(InstanceTimestamp {
+                seconds: 2,
+                nanos: 0,
+            }),
+        });
+
+        assert_eq!(daemon_status_json(&status, 1_000)["uptime_millis"], 0);
+    }
+
+    #[test]
+    fn daemon_outdated_and_unreachable_states_remain_distinct() {
+        let mut outdated = daemon_status(DaemonState::Outdated);
+        outdated.legacy = true;
+        assert_eq!(daemon_status_json(&outdated, 1_000_000)["state"], "running");
+        assert_eq!(
+            daemon_status_json(&outdated, 1_000_000)["health"],
+            "outdated"
+        );
+        assert_eq!(daemon_status_json(&outdated, 1_000_000)["legacy"], true);
+
+        let unhealthy = daemon_status(DaemonState::Unhealthy);
+        assert_eq!(
+            daemon_status_json(&unhealthy, 1_000_000)["health"],
+            "unhealthy"
+        );
+
+        let unreachable = daemon_status(DaemonState::Unreachable);
+        assert_eq!(
+            daemon_status_json(&unreachable, 1_000_000)["state"],
+            "unreachable"
+        );
+        assert_eq!(
+            daemon_status_json(&unreachable, 1_000_000)["health"],
+            "unreachable"
+        );
+    }
+
+    #[test]
+    fn daemon_lifecycle_json_reports_transition_and_force_without_progress_bytes() {
+        let outcome = LifecycleOutcome {
+            status: daemon_status(DaemonState::Stopped),
+            transition: DaemonTransition::Stopped,
+            forced: true,
+        };
+
+        assert_eq!(
+            daemon_lifecycle_json(&outcome, 1_000_000),
+            serde_json::json!({
+                "state": "stopped",
+                "health": "stopped",
+                "installed_version": env!("CARGO_PKG_VERSION"),
+                "running_version": null,
+                "pid": null,
+                "started_at_millis": null,
+                "uptime_millis": null,
+                "executable": null,
+                "legacy": false,
+                "transition": "stopped",
+                "forced": true,
+            })
+        );
+    }
+
+    #[test]
+    fn daemon_force_warning_is_clear_about_interruption_risk() {
+        assert_eq!(
+            daemon_force_warning(),
+            "Warning: forcing daemon shutdown may interrupt active sandbox operations and attachments.\n"
+        );
     }
 
     #[test]
@@ -923,6 +1208,21 @@ mod tests {
             progress.finish_success().as_deref(),
             Some("Sandbox code-123 is stopped")
         );
+    }
+
+    #[test]
+    fn daemon_recovery_progress_is_one_human_line_and_has_no_completion_line() {
+        let (progress, initial) = OperationProgress::new(
+            OperationKind::DaemonRecovery,
+            None,
+            OutputCapabilities::plain(),
+        );
+
+        assert_eq!(
+            initial.as_deref(),
+            Some("Restarting outdated Gascan daemon…")
+        );
+        assert_eq!(progress.finish_success(), None);
     }
 
     #[test]

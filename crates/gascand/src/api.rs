@@ -3,7 +3,7 @@ use crate::{
     SandboxService, ServiceError, SocketPaths, UpRequest as ServiceUpRequest,
 };
 use camino::Utf8PathBuf;
-use gascan_core::doctor::DoctorStatus;
+use gascan_core::doctor::{DoctorCheckId, DoctorFact, DoctorStatus};
 use gascan_core::manifest::Manifest;
 use gascan_core::runtime::{RuntimeBackend, immutable_image_reference};
 use gascan_core::sandbox::{SandboxError, SandboxId, SandboxSpec};
@@ -31,35 +31,66 @@ struct DaemonInstanceRecord {
     executable: std::path::PathBuf,
     start_identity: String,
     instance_token: String,
+    release_version: String,
+    started_at: DaemonInstanceTimestamp,
 }
 
-fn write_daemon_instance_record(identity: &DaemonIdentity) -> io::Result<()> {
-    let Some(path) = std::env::var_os("GASCAN_DAEMON_INSTANCE_PATH").map(std::path::PathBuf::from)
-    else {
-        return Ok(());
+#[derive(serde::Serialize)]
+struct DaemonInstanceTimestamp {
+    seconds: i64,
+    nanos: i32,
+}
+
+fn write_daemon_instance_record(
+    paths: &SocketPaths,
+    identity: &DaemonIdentity,
+) -> io::Result<Option<crate::socket::OwnedInstanceRecord>> {
+    let configured_path =
+        std::env::var_os("GASCAN_DAEMON_INSTANCE_PATH").map(std::path::PathBuf::from);
+    let configured_owner = std::env::var_os("GASCAN_DAEMON_OWNER_TOKEN");
+    #[cfg(debug_assertions)]
+    if configured_path.is_none()
+        && configured_owner.is_none()
+        && std::env::var_os("GASCAN_E2E_LEGACY_WIRE_IDENTITY").is_some()
+    {
+        return Ok(None);
+    }
+    let owner_token = match configured_owner {
+        Some(value) if value.is_empty() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "daemon owner token must not be empty",
+            ));
+        }
+        Some(value) => value.into_string().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "daemon owner token must be valid UTF-8",
+            )
+        })?,
+        None if configured_path.is_some() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "daemon owner token is required",
+            ));
+        }
+        None => fresh_token()?,
     };
-    let owner_token = std::env::var("GASCAN_DAEMON_OWNER_TOKEN").map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "daemon owner token is required",
-        )
-    })?;
+    let path = configured_path.unwrap_or_else(|| paths.instance().to_owned());
     let record = DaemonInstanceRecord {
         pid: identity.pid,
         owner_token,
         executable: identity.executable.clone(),
         start_identity: identity.start_identity.clone(),
         instance_token: identity.instance_token.clone(),
+        release_version: identity.release_version.clone(),
+        started_at: DaemonInstanceTimestamp {
+            seconds: identity.started_at.seconds,
+            nanos: identity.started_at.nanos,
+        },
     };
     let bytes = serde_json::to_vec(&record).map_err(io::Error::other)?;
-    let temporary = path.with_extension(format!("tmp-{}", identity.pid));
-    std::fs::write(&temporary, bytes)?;
-    #[cfg(unix)]
-    std::fs::set_permissions(
-        &temporary,
-        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
-    )?;
-    std::fs::rename(temporary, path)
+    crate::socket::write_instance_record(&path, &bytes).map(Some)
 }
 
 #[derive(Clone, Debug)]
@@ -68,38 +99,93 @@ struct DaemonIdentity {
     executable: std::path::PathBuf,
     start_identity: String,
     instance_token: String,
+    release_version: String,
+    started_at: prost_types::Timestamp,
 }
 
 impl DaemonIdentity {
     fn current() -> io::Result<Self> {
         let pid = std::process::id();
-        let mut random = [0_u8; 32];
-        getrandom::fill(&mut random).map_err(io::Error::other)?;
-        let instance_token = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let instance_token = fresh_token()?;
+        let started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?;
         Ok(Self {
             pid,
             executable: std::env::current_exe()?.canonicalize()?,
             start_identity: process_start_identity(pid)?,
             instance_token,
+            release_version: env!("CARGO_PKG_VERSION").to_owned(),
+            started_at: prost_types::Timestamp {
+                seconds: i64::try_from(started_at.as_secs()).map_err(io::Error::other)?,
+                nanos: started_at.subsec_nanos() as i32,
+            },
         })
     }
 }
 
+fn fresh_token() -> io::Result<String> {
+    let mut random = [0_u8; 32];
+    getrandom::fill(&mut random).map_err(io::Error::other)?;
+    Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+#[cfg(target_os = "linux")]
 fn process_start_identity(pid: u32) -> io::Result<String> {
-    let output = std::process::Command::new("ps")
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let remainder = stat
+        .rsplit_once(") ")
+        .map(|(_, value)| value)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "malformed daemon process stat")
+        })?;
+    let start = remainder.split_whitespace().nth(19).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "daemon process stat lacks start identity",
+        )
+    })?;
+    Ok(format!("linux:{start}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_start_identity(pid: u32) -> io::Result<String> {
+    use std::process::Stdio;
+    let mut child = std::process::Command::new("/bin/ps")
         .args(["-p", &pid.to_string(), "-o", "lstart="])
-        .output()?;
-    if !output.status.success() {
-        return Err(io::Error::other(
-            "could not read daemon process start identity",
-        ));
-    }
-    let value = String::from_utf8(output.stdout).map_err(io::Error::other)?;
-    let value = value.trim().to_owned();
-    if value.is_empty() {
-        Err(io::Error::other("empty daemon process start identity"))
-    } else {
-        Ok(value)
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .env("TZ", "UTC")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let output = child.wait_with_output()?;
+            if !status.success() {
+                return Err(io::Error::other(
+                    "could not read daemon process start identity",
+                ));
+            }
+            let value = String::from_utf8(output.stdout).map_err(io::Error::other)?;
+            let value = value.trim().to_owned();
+            return if value.is_empty() {
+                Err(io::Error::other("empty daemon process start identity"))
+            } else {
+                Ok(value)
+            };
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill()?;
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "daemon process inspection timed out",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -117,6 +203,17 @@ struct ActivityInner {
     shutting_down: AtomicBool,
     shutdown: Notify,
     accepting: AtomicBool,
+    termination_requested: tokio::sync::watch::Sender<bool>,
+    #[cfg(debug_assertions)]
+    e2e_legacy_wire_identity: Option<E2eLegacyWireIdentity>,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Debug)]
+struct E2eLegacyWireIdentity {
+    flip_token_on_reattestation: bool,
+    handshake_count: AtomicUsize,
+    reattestation_gate: Option<(std::path::PathBuf, std::path::PathBuf)>,
 }
 #[derive(Clone, Copy)]
 struct AdmissionClosed;
@@ -136,6 +233,7 @@ impl ActivityTracker {
             eprintln!("daemon identity creation failed: {error}");
             std::process::abort()
         });
+        let (termination_requested, _) = tokio::sync::watch::channel(false);
         Self {
             inner: Arc::new(ActivityInner {
                 identity,
@@ -146,6 +244,9 @@ impl ActivityTracker {
                 shutting_down: AtomicBool::new(false),
                 shutdown: Notify::new(),
                 accepting: AtomicBool::new(true),
+                termination_requested,
+                #[cfg(debug_assertions)]
+                e2e_legacy_wire_identity: None,
             }),
         }
     }
@@ -207,6 +308,17 @@ impl ActivityTracker {
     }
     fn begin_shutdown(&self) {
         self.inner.accepting.store(false, Ordering::Release);
+    }
+    fn request_termination(&self) {
+        self.begin_shutdown();
+        self.inner.termination_requested.send_replace(true);
+    }
+    async fn wait_for_termination_request(&self) {
+        let mut requested = self.inner.termination_requested.subscribe();
+        if *requested.borrow_and_update() {
+            return;
+        }
+        let _ = requested.changed().await;
     }
     fn ensure_accepting(&self) -> Result<(), AdmissionClosed> {
         if self.inner.accepting.load(Ordering::Acquire) {
@@ -283,6 +395,47 @@ impl DaemonConfig {
     pub fn activity(&self) -> ActivityTracker {
         self.activity.clone()
     }
+
+    #[cfg(debug_assertions)]
+    pub fn with_release_version_for_e2e(mut self, release_version: String) -> io::Result<Self> {
+        if release_version.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "E2E daemon release version must not be empty",
+            ));
+        }
+        let inner = Arc::get_mut(&mut self.activity.inner).ok_or_else(|| {
+            io::Error::other("E2E daemon identity was shared before release injection")
+        })?;
+        inner.identity.release_version = release_version;
+        Ok(self)
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn with_legacy_wire_identity_for_e2e(
+        mut self,
+        flip_token_on_reattestation: bool,
+        reattestation_gate: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    ) -> io::Result<Self> {
+        if reattestation_gate
+            .as_ref()
+            .is_some_and(|(marker, release)| !marker.is_absolute() || !release.is_absolute())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "E2E re-attestation gate paths must be absolute",
+            ));
+        }
+        let inner = Arc::get_mut(&mut self.activity.inner).ok_or_else(|| {
+            io::Error::other("E2E daemon identity was shared before legacy injection")
+        })?;
+        inner.e2e_legacy_wire_identity = Some(E2eLegacyWireIdentity {
+            flip_token_on_reattestation,
+            handshake_count: AtomicUsize::new(0),
+            reattestation_gate,
+        });
+        Ok(self)
+    }
 }
 
 pub struct Daemon;
@@ -325,7 +478,8 @@ impl Daemon {
         if let Some(pid_path) = std::env::var_os("GASCAN_PID_PATH") {
             std::fs::write(pid_path, std::process::id().to_string())?;
         }
-        write_daemon_instance_record(&config.activity().inner.identity)?;
+        let instance_record =
+            write_daemon_instance_record(&config.paths, &config.activity().inner.identity)?;
         owned.set_nonblocking(true)?;
         let listener = tokio::net::UnixListener::from_std(owned.try_clone()?)?;
         let expected_uid = crate::PeerUid::current();
@@ -353,6 +507,7 @@ impl Daemon {
             let reason = tokio::select! {
                 result = idle => { let _ = result; "idle" }
                 result = terminated => { let _ = result; "terminated" }
+                () = shutdown_tracker.wait_for_termination_request() => "rpc"
             };
             if std::env::var_os("GASCAN_DAEMON_STDERR_PATH").is_some() {
                 eprintln!("daemon shutdown began: {reason}");
@@ -378,6 +533,7 @@ impl Daemon {
             }
         }
         drop(owned);
+        drop(instance_record);
         Ok(())
     }
 }
@@ -1506,13 +1662,58 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
                 ),
                 details: Vec::new(),
             });
+        #[cfg(not(debug_assertions))]
+        let wire_identity = (
+            self.activity.inner.identity.instance_token.clone(),
+            self.activity.inner.identity.release_version.clone(),
+            Some(self.activity.inner.identity.started_at),
+        );
+        #[cfg(debug_assertions)]
+        let wire_identity = {
+            let mut daemon_instance_token = self.activity.inner.identity.instance_token.clone();
+            let mut release_version = self.activity.inner.identity.release_version.clone();
+            let mut daemon_started_at = Some(self.activity.inner.identity.started_at);
+            if let Some(legacy) = &self.activity.inner.e2e_legacy_wire_identity {
+                let handshake = legacy.handshake_count.fetch_add(1, Ordering::AcqRel) + 1;
+                if handshake == 2 {
+                    if let Some((marker, release)) = &legacy.reattestation_gate {
+                        std::fs::write(marker, b"ready").map_err(|error| {
+                            tonic::Status::internal(format!(
+                                "could not publish E2E re-attestation marker: {error}"
+                            ))
+                        })?;
+                        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                        while !release.exists() {
+                            if tokio::time::Instant::now() >= deadline {
+                                return Err(tonic::Status::deadline_exceeded(
+                                    "E2E re-attestation release timed out",
+                                ));
+                            }
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    }
+                    if legacy.flip_token_on_reattestation {
+                        let replacement = if daemon_instance_token.starts_with('0') {
+                            "1"
+                        } else {
+                            "0"
+                        };
+                        daemon_instance_token.replace_range(..1, replacement);
+                    }
+                }
+                release_version.clear();
+                daemon_started_at = None;
+            }
+            (daemon_instance_token, release_version, daemon_started_at)
+        };
+        let (daemon_instance_token, release_version, daemon_started_at) = wire_identity;
         Ok(tonic::Response::new(v1::HandshakeResponse {
             api_major: API_MAJOR,
             api_minor: API_MINOR,
             capabilities: Vec::new(),
             transport_security: Some(local_transport_security()),
             rejection,
-            daemon_instance_token: self.activity.inner.identity.instance_token.clone(),
+            daemon_instance_token,
             daemon_pid: self.activity.inner.identity.pid,
             daemon_executable: self
                 .activity
@@ -1522,6 +1723,46 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
                 .to_string_lossy()
                 .into_owned(),
             daemon_start_identity: self.activity.inner.identity.start_identity.clone(),
+            release_version,
+            daemon_started_at,
+        }))
+    }
+    async fn daemon_status(
+        &self,
+        _: tonic::Request<v1::DaemonStatusRequest>,
+    ) -> Result<tonic::Response<v1::DaemonStatusResponse>, tonic::Status> {
+        self.activity.ensure_accepting().map_err(admission_status)?;
+        let _lease = self.activity.lease();
+        let identity = &self.activity.inner.identity;
+        Ok(tonic::Response::new(v1::DaemonStatusResponse {
+            release_version: identity.release_version.clone(),
+            daemon_pid: identity.pid,
+            daemon_executable: identity.executable.to_string_lossy().into_owned(),
+            daemon_start_identity: identity.start_identity.clone(),
+            daemon_instance_token: identity.instance_token.clone(),
+            daemon_started_at: Some(identity.started_at),
+            health: v1::DaemonHealth::Healthy as i32,
+        }))
+    }
+    async fn shutdown_daemon(
+        &self,
+        request: tonic::Request<v1::ShutdownDaemonRequest>,
+    ) -> Result<tonic::Response<v1::ShutdownDaemonResponse>, tonic::Status> {
+        #[cfg(debug_assertions)]
+        if self.activity.inner.e2e_legacy_wire_identity.is_some() {
+            return Err(tonic::Status::unimplemented(
+                "legacy fixture has no shutdown RPC",
+            ));
+        }
+        if request.into_inner().daemon_instance_token != self.activity.inner.identity.instance_token
+        {
+            return Err(tonic::Status::permission_denied(
+                "daemon instance token does not match",
+            ));
+        }
+        self.activity.request_termination();
+        Ok(tonic::Response::new(v1::ShutdownDaemonResponse {
+            accepted: true,
         }))
     }
     async fn status(
@@ -1597,11 +1838,38 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
     }
     async fn doctor(
         &self,
-        _: tonic::Request<v1::DoctorRequest>,
+        request: tonic::Request<v1::DoctorRequest>,
     ) -> Result<tonic::Response<v1::DoctorResponse>, tonic::Status> {
         self.activity.ensure_accepting().map_err(admission_status)?;
         let _lease = self.activity.lease();
-        let report = self.service.doctor_report().await;
+        let workspace = match request.into_inner().workspace_result {
+            Some(v1::doctor_request::WorkspaceResult::Workspace(path))
+                if !path.is_empty()
+                    && !path.contains('\0')
+                    && camino::Utf8Path::new(&path).is_absolute() =>
+            {
+                crate::doctor::workspace_fact(camino::Utf8Path::new(&path))
+            }
+            Some(v1::doctor_request::WorkspaceResult::Workspace(_)) => {
+                return Err(tonic::Status::invalid_argument(error_code::INVALID_REQUEST));
+            }
+            Some(v1::doctor_request::WorkspaceResult::WorkspaceError(error)) => {
+                DoctorFact::unknown(format!(
+                    "caller could not determine workspace access: {error}"
+                ))
+            }
+            None => DoctorFact::unknown("workspace was not provided by the caller"),
+        };
+        let mut report = self.service.doctor_report().await;
+        let workspace_check = report
+            .checks
+            .iter_mut()
+            .find(|check| check.id == DoctorCheckId::WorkspaceAccess.as_str())
+            .ok_or_else(|| {
+                tonic::Status::internal("workspace check is missing from Doctor report")
+            })?;
+        workspace_check.status = workspace.status;
+        workspace_check.detail = workspace.detail;
         let capabilities = report
             .checks
             .iter()
@@ -1964,7 +2232,8 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
 mod tests {
     use super::{
         ActivityTracker, ApiEventStream, AttachBridgeControl, AttachStream, AttachTerminal,
-        ErrorDiagnostics, PendingSession, SessionRegistry, attach_shutdown_requested_with,
+        DaemonInstanceRecord, DaemonInstanceTimestamp, ErrorDiagnostics, PendingSession,
+        SessionRegistry, attach_shutdown_requested_with,
         run_attach_bridge as run_attach_bridge_impl, service_status,
         service_status_with_diagnostics, spec_for_root, wire_event, wire_ssh_status, wire_status,
     };
@@ -1981,6 +2250,26 @@ mod tests {
     use gascan_proto::{error_code, v1};
     use serde_json::json;
     use tokio_stream::StreamExt;
+
+    #[test]
+    fn daemon_instance_record_serializes_release_and_start_timestamp() {
+        let value = serde_json::to_value(DaemonInstanceRecord {
+            pid: 7,
+            owner_token: "owner".to_owned(),
+            executable: "/trusted/gascand".into(),
+            start_identity: "start".to_owned(),
+            instance_token: "instance".to_owned(),
+            release_version: "0.1.11".to_owned(),
+            started_at: DaemonInstanceTimestamp {
+                seconds: 1_785_263_800,
+                nanos: 123_000_000,
+            },
+        })
+        .unwrap_or_default();
+        assert_eq!(value["release_version"], "0.1.11");
+        assert_eq!(value["started_at"]["seconds"], 1_785_263_800_i64);
+        assert_eq!(value["started_at"]["nanos"], 123_000_000);
+    }
 
     async fn run_attach_bridge<S>(
         session: ExecSession,

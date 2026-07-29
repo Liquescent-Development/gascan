@@ -1,6 +1,7 @@
 use crate::client::{Client, ClientError};
 use crate::presentation::{
-    DoctorCheck, OperationKind, OperationProgress, OutputCapabilities,
+    DoctorCheck, OperationKind, OperationProgress, OutputCapabilities, daemon_force_warning,
+    daemon_lifecycle_json, daemon_status_json, render_daemon_lifecycle, render_daemon_status,
     render_doctor as render_human_doctor, render_error as render_human_error,
     render_list as render_human_list, render_status as render_human_status,
 };
@@ -15,6 +16,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{IsTerminal, Write};
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const EXIT_USAGE: i32 = 64;
 const EXIT_DAEMON: i32 = 69;
@@ -34,6 +36,10 @@ struct Arguments {
 enum Command {
     #[command(hide = true)]
     DaemonAttest,
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
     Up {
         project_root: String,
         #[arg(long)]
@@ -90,6 +96,36 @@ enum Command {
     },
 }
 
+#[derive(Subcommand, Clone)]
+enum DaemonCommand {
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Start {
+        #[arg(long)]
+        json: bool,
+    },
+    Stop {
+        #[arg(
+            long,
+            help = "Force shutdown if graceful shutdown times out; may interrupt active sandbox operations and attachments"
+        )]
+        force: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Restart {
+        #[arg(
+            long,
+            help = "Force shutdown if graceful shutdown times out; may interrupt active sandbox operations and attachments"
+        )]
+        force: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum SshConfigCommand {
     Install,
@@ -119,8 +155,19 @@ pub enum UsageKind {
 #[derive(Debug)]
 pub enum CliError {
     Client(ClientError),
-    Usage { kind: UsageKind, message: String },
-    Operation { code: String, message: String },
+    Usage {
+        kind: UsageKind,
+        message: String,
+    },
+    Operation {
+        code: String,
+        message: String,
+    },
+    DaemonOperation {
+        code: String,
+        message: String,
+        suggestion: Option<&'static str>,
+    },
     Runtime(String),
     Io(std::io::Error),
 }
@@ -131,14 +178,17 @@ impl CliError {
             Self::Client(ClientError::Api(_)) => EXIT_API,
             Self::Client(ClientError::Rpc(_)) => EXIT_RUNTIME,
             Self::Client(_) => EXIT_DAEMON,
-            Self::Operation { .. } | Self::Runtime(_) | Self::Io(_) => EXIT_RUNTIME,
+            Self::Operation { .. }
+            | Self::DaemonOperation { .. }
+            | Self::Runtime(_)
+            | Self::Io(_) => EXIT_RUNTIME,
         }
     }
 
     pub fn stable_code(&self) -> Option<&str> {
         match self {
             Self::Client(error) => error.stable_code(),
-            Self::Operation { code, .. } => Some(code),
+            Self::Operation { code, .. } | Self::DaemonOperation { code, .. } => Some(code),
             Self::Usage { .. } | Self::Runtime(_) | Self::Io(_) => None,
         }
     }
@@ -154,6 +204,7 @@ impl CliError {
             }),
             Self::Usage { message, .. }
             | Self::Operation { message, .. }
+            | Self::DaemonOperation { message, .. }
             | Self::Runtime(message) => message.clone(),
             Self::Io(error) => error.to_string(),
         };
@@ -167,7 +218,11 @@ impl CliError {
     }
 
     pub fn suggestion(&self) -> Option<&'static str> {
-        match self {
+        let contextual = match self {
+            Self::DaemonOperation {
+                suggestion: Some(suggestion),
+                ..
+            } => Some(*suggestion),
             Self::Usage {
                 kind: UsageKind::NoSandbox,
                 ..
@@ -176,7 +231,7 @@ impl CliError {
                 kind: UsageKind::MultipleSandboxes,
                 ..
             } => Some("run `gascan list`, then pass `--sandbox <sandbox-id>`"),
-            Self::Client(_) | Self::Operation { .. }
+            Self::Client(_) | Self::Operation { .. } | Self::DaemonOperation { .. }
                 if matches!(
                     self.stable_code(),
                     Some(gascan_proto::error_code::SANDBOX_NOT_FOUND)
@@ -190,9 +245,28 @@ impl CliError {
                 ..
             }
             | Self::Operation { .. }
+            | Self::DaemonOperation { .. }
             | Self::Runtime(_)
             | Self::Io(_) => None,
-        }
+        };
+        contextual.or_else(|| match self.stable_code() {
+            Some("daemon_outdated") => Some("run `gascan daemon restart` to replace it"),
+            Some("daemon_io") => {
+                Some("run `gascan daemon status` after checking the local runtime directory")
+            }
+            Some("daemon_graceful_shutdown_timeout") => Some(
+                "retry with `gascan daemon restart --force` if it is safe to interrupt active work",
+            ),
+            Some("daemon_invalid_state")
+            | Some("daemon_readiness_failed")
+            | Some("daemon_identity_changed")
+            | Some("daemon_exit_timeout")
+            | Some("daemon_lifecycle_busy")
+            | Some("daemon_lifecycle_changed") => {
+                Some("run `gascan daemon status` for the current daemon state")
+            }
+            _ => None,
+        })
     }
 }
 impl std::fmt::Display for CliError {
@@ -262,6 +336,27 @@ fn resolve_project_root(project_root: &str) -> Result<String, CliError> {
         })
 }
 
+fn doctor_request(current_directory: std::io::Result<PathBuf>) -> v1::DoctorRequest {
+    let workspace_result = match current_directory {
+        Ok(path) if path.is_absolute() => match path.to_str() {
+            Some(path) => v1::doctor_request::WorkspaceResult::Workspace(path.to_owned()),
+            None => v1::doctor_request::WorkspaceResult::WorkspaceError(
+                "caller directory is not valid UTF-8".to_owned(),
+            ),
+        },
+        Ok(path) => v1::doctor_request::WorkspaceResult::WorkspaceError(format!(
+            "caller directory is not absolute: {}",
+            path.display()
+        )),
+        Err(error) => v1::doctor_request::WorkspaceResult::WorkspaceError(format!(
+            "could not resolve caller directory: {error}"
+        )),
+    };
+    v1::DoctorRequest {
+        workspace_result: Some(workspace_result),
+    }
+}
+
 pub async fn execute() -> Result<i32, CliError> {
     let arguments = match Arguments::try_parse() {
         Ok(arguments) => arguments,
@@ -289,12 +384,19 @@ pub async fn execute() -> Result<i32, CliError> {
         );
         return Ok(0);
     }
+    if let Command::Daemon { command } = &arguments.command {
+        return execute_daemon(command.clone()).await;
+    }
     if let Command::SshConfig { command } = arguments.command {
         return execute_ssh_config(command);
     }
-    let mut client = Client::connect_or_start().await?;
+    let doctor_request = matches!(&arguments.command, Command::Doctor { .. })
+        .then(|| doctor_request(std::env::current_dir()));
+    let connected = connect_with_recovery_progress(command_uses_json(&arguments.command)).await?;
+    let mut client = connected.daemon.connection;
     match arguments.command {
         Command::DaemonAttest => Ok(0),
+        Command::Daemon { .. } => Ok(0),
         Command::Up { project_root, json } => {
             let project_root = resolve_project_root(&project_root)?;
             match client.api.up(v1::UpRequest { project_root }).await {
@@ -384,7 +486,10 @@ pub async fn execute() -> Result<i32, CliError> {
             Ok(0)
         }
         Command::Doctor { json } => {
-            let doctor = client.api.doctor(v1::DoctorRequest {}).await?.into_inner();
+            let request = doctor_request.ok_or_else(|| {
+                CliError::Runtime("Doctor request was not prepared before connecting".to_owned())
+            })?;
+            let doctor = client.api.doctor(request).await?.into_inner();
             let checks = doctor
                 .capabilities
                 .iter()
@@ -446,6 +551,278 @@ pub async fn execute() -> Result<i32, CliError> {
         } => logs(&mut client, arguments.sandbox, follow, since_millis).await,
         Command::Ssh { argv } => ssh(&mut client, arguments.sandbox, argv).await,
         Command::SshConfig { .. } => Ok(0),
+    }
+}
+
+async fn execute_daemon(command: DaemonCommand) -> Result<i32, CliError> {
+    let json = daemon_command_uses_json(&command);
+    match command {
+        DaemonCommand::Status { .. } => {
+            let status = crate::daemon::inspect().await.map_err(supervisor_error)?;
+            let now_millis = daemon_now_millis()?;
+            if json {
+                println!("{}", daemon_status_json(&status, now_millis));
+            } else {
+                print!(
+                    "{}",
+                    render_daemon_status(&status, now_millis, OutputCapabilities::for_stdout())
+                );
+            }
+        }
+        DaemonCommand::Start { .. } => {
+            let outcome = crate::daemon::start().await.map_err(supervisor_error)?;
+            let now_millis = daemon_now_millis()?;
+            render_daemon_outcome(&outcome, now_millis, json);
+        }
+        DaemonCommand::Stop { force, .. } => {
+            if force && !json {
+                eprint!("{}", daemon_force_warning());
+            }
+            let outcome = crate::daemon::stop(force)
+                .await
+                .map_err(|error| supervisor_error_for_action(error, DaemonErrorContext::Stop))?;
+            let now_millis = daemon_now_millis()?;
+            render_daemon_outcome(&outcome, now_millis, json);
+        }
+        DaemonCommand::Restart { force, .. } => {
+            if force && !json {
+                eprint!("{}", daemon_force_warning());
+            }
+            let outcome = crate::daemon::restart(force)
+                .await
+                .map_err(|error| supervisor_error_for_action(error, DaemonErrorContext::Restart))?;
+            let now_millis = daemon_now_millis()?;
+            render_daemon_outcome(&outcome, now_millis, json);
+        }
+    }
+    Ok(0)
+}
+
+fn render_daemon_outcome(outcome: &crate::daemon::LifecycleOutcome, now_millis: i64, json: bool) {
+    if json {
+        println!("{}", daemon_lifecycle_json(outcome, now_millis));
+    } else {
+        print!(
+            "{}",
+            render_daemon_lifecycle(outcome, now_millis, OutputCapabilities::for_stdout())
+        );
+    }
+}
+
+fn daemon_now_millis() -> Result<i64, CliError> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            CliError::Runtime(format!("system clock is before Unix epoch: {error}"))
+        })?;
+    i64::try_from(elapsed.as_millis())
+        .map_err(|_| CliError::Runtime("system clock exceeds supported timestamp range".to_owned()))
+}
+
+fn daemon_command_uses_json(command: &DaemonCommand) -> bool {
+    match command {
+        DaemonCommand::Status { json }
+        | DaemonCommand::Start { json }
+        | DaemonCommand::Stop { json, .. }
+        | DaemonCommand::Restart { json, .. } => *json,
+    }
+}
+
+fn command_uses_json(command: &Command) -> bool {
+    match command {
+        Command::Up { json, .. }
+        | Command::Apply { json, .. }
+        | Command::Down { json }
+        | Command::Destroy { json, .. }
+        | Command::List { json }
+        | Command::Status { json }
+        | Command::Doctor { json } => *json,
+        Command::Daemon { command } => daemon_command_uses_json(command),
+        Command::DaemonAttest
+        | Command::Shell { .. }
+        | Command::Run { .. }
+        | Command::Logs { .. }
+        | Command::Ssh { .. }
+        | Command::SshConfig { .. } => false,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RecoveryOutputStream {
+    #[allow(
+        dead_code,
+        reason = "the JSON regression sink records accidental stdout writes even though recovery uses stderr only"
+    )]
+    Stdout,
+    Stderr,
+}
+
+trait RecoveryOutputSink {
+    fn write(&mut self, stream: RecoveryOutputStream, line: &str);
+}
+
+struct TerminalRecoveryOutput;
+
+impl RecoveryOutputSink for TerminalRecoveryOutput {
+    fn write(&mut self, stream: RecoveryOutputStream, line: &str) {
+        match stream {
+            RecoveryOutputStream::Stdout => {
+                let _ = writeln!(std::io::stdout(), "{line}");
+            }
+            RecoveryOutputStream::Stderr => {
+                let _ = writeln!(std::io::stderr(), "{line}");
+            }
+        }
+    }
+}
+
+struct CliRecoveryObserver<Output> {
+    mode: CliRecoveryProgressMode,
+    output: Output,
+}
+
+enum CliRecoveryProgressMode {
+    Human {
+        capabilities: OutputCapabilities,
+        progress: Option<OperationProgress>,
+    },
+    Suppressed,
+}
+
+impl<Output: RecoveryOutputSink> CliRecoveryObserver<Output> {
+    fn new(json: bool, capabilities: OutputCapabilities, output: Output) -> Self {
+        Self {
+            mode: if json {
+                CliRecoveryProgressMode::Suppressed
+            } else {
+                CliRecoveryProgressMode::Human {
+                    capabilities,
+                    progress: None,
+                }
+            },
+            output,
+        }
+    }
+
+    fn finish(&mut self) {
+        let CliRecoveryProgressMode::Human { progress, .. } = &mut self.mode else {
+            return;
+        };
+        if let Some(progress) = progress.take() {
+            if let Some(line) = progress.finish_success() {
+                self.output.write(RecoveryOutputStream::Stderr, &line);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn is_presenting(&self) -> bool {
+        matches!(
+            self.mode,
+            CliRecoveryProgressMode::Human {
+                progress: Some(_),
+                ..
+            }
+        )
+    }
+}
+
+#[tonic::async_trait]
+impl<Output: RecoveryOutputSink + Send> crate::daemon::DaemonLifecycleObserver
+    for CliRecoveryObserver<Output>
+{
+    async fn transition_started(&mut self, transition: crate::daemon::DaemonTransition) {
+        if transition != crate::daemon::DaemonTransition::Recovered {
+            return;
+        }
+        let CliRecoveryProgressMode::Human {
+            capabilities,
+            progress,
+        } = &mut self.mode
+        else {
+            return;
+        };
+        let (next, initial) =
+            OperationProgress::new(OperationKind::DaemonRecovery, None, *capabilities);
+        if let Some(line) = initial {
+            self.output.write(RecoveryOutputStream::Stderr, &line);
+        }
+        *progress = Some(next);
+    }
+}
+
+async fn connect_with_recovery_progress(
+    json: bool,
+) -> Result<crate::daemon::ConnectionOutcome<Client>, CliError> {
+    let mut observer = CliRecoveryObserver::new(
+        json,
+        OutputCapabilities::for_stderr(),
+        TerminalRecoveryOutput,
+    );
+    let connected = crate::daemon::connect_current_or_recover_observing(&mut observer)
+        .await
+        .map_err(supervisor_error)?;
+    observer.finish();
+    Ok(connected)
+}
+
+fn supervisor_error(error: crate::daemon::SupervisorError) -> CliError {
+    supervisor_error_for_action(error, DaemonErrorContext::Automatic)
+}
+
+#[derive(Clone, Copy)]
+enum DaemonErrorContext {
+    Automatic,
+    Stop,
+    Restart,
+}
+
+impl DaemonErrorContext {
+    const fn graceful_timeout_suggestion(self) -> &'static str {
+        match self {
+            Self::Automatic => {
+                "run `gascan daemon restart --force` if it is safe to interrupt active work"
+            }
+            Self::Stop => {
+                "retry with `gascan daemon stop --force` if it is safe to interrupt active work"
+            }
+            Self::Restart => {
+                "retry with `gascan daemon restart --force` if it is safe to interrupt active work"
+            }
+        }
+    }
+}
+
+fn supervisor_error_for_action(
+    error: crate::daemon::SupervisorError,
+    context: DaemonErrorContext,
+) -> CliError {
+    if let crate::daemon::SupervisorError::Client(error) = error {
+        return CliError::Client(error);
+    }
+    let suggestion = matches!(
+        error,
+        crate::daemon::SupervisorError::GracefulTimeout { .. }
+    )
+    .then(|| context.graceful_timeout_suggestion());
+    let code = match &error {
+        crate::daemon::SupervisorError::Client(_) => unreachable!("client errors returned above"),
+        crate::daemon::SupervisorError::Io(_) => "daemon_io",
+        crate::daemon::SupervisorError::Outdated { .. } => "daemon_outdated",
+        crate::daemon::SupervisorError::InvalidState { .. } => "daemon_invalid_state",
+        crate::daemon::SupervisorError::Readiness { .. } => "daemon_readiness_failed",
+        crate::daemon::SupervisorError::GracefulTimeout { .. } => {
+            "daemon_graceful_shutdown_timeout"
+        }
+        crate::daemon::SupervisorError::IdentityChanged { .. } => "daemon_identity_changed",
+        crate::daemon::SupervisorError::ExitTimeout { .. } => "daemon_exit_timeout",
+        crate::daemon::SupervisorError::TombstoneBusy { .. } => "daemon_lifecycle_busy",
+        crate::daemon::SupervisorError::TombstoneChanged { .. } => "daemon_lifecycle_changed",
+    };
+    CliError::DaemonOperation {
+        code: code.to_owned(),
+        message: error.to_string(),
+        suggestion,
     }
 }
 
@@ -1162,6 +1539,174 @@ mod tests {
     }
 
     #[test]
+    fn daemon_parses_the_public_management_commands() -> Result<(), Box<dyn std::error::Error>> {
+        let status = Arguments::try_parse_from(["gascan", "daemon", "status", "--json"])?;
+        assert!(matches!(
+            status.command,
+            Command::Daemon {
+                command: DaemonCommand::Status { json: true }
+            }
+        ));
+
+        let start = Arguments::try_parse_from(["gascan", "daemon", "start", "--json"])?;
+        assert!(matches!(
+            start.command,
+            Command::Daemon {
+                command: DaemonCommand::Start { json: true }
+            }
+        ));
+
+        let stop = Arguments::try_parse_from(["gascan", "daemon", "stop", "--force", "--json"])?;
+        assert!(matches!(
+            stop.command,
+            Command::Daemon {
+                command: DaemonCommand::Stop {
+                    force: true,
+                    json: true,
+                }
+            }
+        ));
+
+        let restart =
+            Arguments::try_parse_from(["gascan", "daemon", "restart", "--force", "--json"])?;
+        assert!(matches!(
+            restart.command,
+            Command::Daemon {
+                command: DaemonCommand::Restart {
+                    force: true,
+                    json: true,
+                }
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_rejects_force_for_status_and_start() {
+        for subcommand in ["status", "start"] {
+            assert!(matches!(
+                Arguments::try_parse_from(["gascan", "daemon", subcommand, "--force"]),
+                Err(error) if error.kind() == ErrorKind::UnknownArgument
+            ));
+        }
+    }
+
+    #[test]
+    fn daemon_attest_remains_hidden_from_public_help() {
+        let help = Arguments::command().render_long_help().to_string();
+        assert!(help.contains("daemon"), "daemon command missing: {help}");
+        assert!(
+            !help.contains("daemon-attest"),
+            "internal daemon command leaked into help: {help}"
+        );
+    }
+
+    #[test]
+    fn daemon_supervisor_io_errors_have_a_stable_actionable_cli_contract() {
+        let error = supervisor_error(crate::daemon::SupervisorError::Io(std::io::Error::other(
+            "runtime directory is unavailable",
+        )));
+
+        assert_eq!(error.stable_code(), Some("daemon_io"));
+        assert_eq!(
+            error.suggestion(),
+            Some("run `gascan daemon status` after checking the local runtime directory")
+        );
+    }
+
+    #[test]
+    fn daemon_graceful_timeout_guidance_preserves_the_requested_command() {
+        let timeout = || crate::daemon::SupervisorError::GracefulTimeout {
+            identity: Box::new(crate::daemon::DaemonIdentity {
+                pid: 42,
+                executable: "/trusted/gascand".into(),
+                start_identity: "start:42".to_owned(),
+                instance_token: "11".repeat(32),
+                release_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+                started_at: Some(crate::daemon::InstanceTimestamp {
+                    seconds: 1_785_264_100,
+                    nanos: 0,
+                }),
+            }),
+        };
+
+        let stop = supervisor_error_for_action(timeout(), DaemonErrorContext::Stop);
+        assert_eq!(stop.stable_code(), Some("daemon_graceful_shutdown_timeout"));
+        assert_eq!(
+            stop.suggestion(),
+            Some("retry with `gascan daemon stop --force` if it is safe to interrupt active work")
+        );
+
+        let restart = supervisor_error_for_action(timeout(), DaemonErrorContext::Restart);
+        assert_eq!(
+            restart.stable_code(),
+            Some("daemon_graceful_shutdown_timeout")
+        );
+        assert_eq!(
+            restart.suggestion(),
+            Some(
+                "retry with `gascan daemon restart --force` if it is safe to interrupt active work"
+            )
+        );
+
+        let automatic = supervisor_error_for_action(timeout(), DaemonErrorContext::Automatic);
+        assert_eq!(
+            automatic.suggestion(),
+            Some("run `gascan daemon restart --force` if it is safe to interrupt active work")
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_json_recovery_observer_writes_no_progress_to_either_output_stream()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::daemon::DaemonLifecycleObserver as _;
+
+        let sink = CapturingRecoveryOutput::default();
+        let mut observer =
+            CliRecoveryObserver::new(true, OutputCapabilities::for_stderr(), sink.clone());
+        observer
+            .transition_started(crate::daemon::DaemonTransition::Recovered)
+            .await;
+
+        assert!(!observer.is_presenting());
+        let stderr_is_empty = {
+            let stderr = sink
+                .stderr
+                .lock()
+                .map_err(|_| std::io::Error::other("captured stderr was poisoned"))?;
+            stderr.is_empty()
+        };
+        let stdout_is_empty = {
+            let stdout = sink
+                .stdout
+                .lock()
+                .map_err(|_| std::io::Error::other("captured stdout was poisoned"))?;
+            stdout.is_empty()
+        };
+        assert!(stderr_is_empty);
+        assert!(stdout_is_empty);
+        Ok(())
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturingRecoveryOutput {
+        stderr: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        stdout: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl RecoveryOutputSink for CapturingRecoveryOutput {
+        fn write(&mut self, stream: RecoveryOutputStream, line: &str) {
+            let output = match stream {
+                RecoveryOutputStream::Stdout => &self.stdout,
+                RecoveryOutputStream::Stderr => &self.stderr,
+            };
+            if let Ok(mut output) = output.lock() {
+                output.push(line.to_owned());
+            }
+        }
+    }
+
+    #[test]
     fn status_json_preserves_exact_image_references() {
         let current = "registry.example/workspace:old@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let requested = "registry.example/workspace:new@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -1458,6 +2003,32 @@ mod tests {
         );
         assert!(std::path::Path::new(&resolved).is_absolute());
         Ok(())
+    }
+
+    #[test]
+    fn doctor_request_carries_the_callers_absolute_workspace()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?.path().canonicalize()?;
+        let request = doctor_request(Ok(directory.clone()));
+
+        assert_eq!(
+            request.workspace_result,
+            Some(v1::doctor_request::WorkspaceResult::Workspace(
+                directory.to_str().ok_or("UTF-8 workspace")?.to_owned(),
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_request_reports_caller_directory_errors() {
+        let request = doctor_request(Err(std::io::Error::other("launch directory was removed")));
+
+        assert!(matches!(
+            request.workspace_result,
+            Some(v1::doctor_request::WorkspaceResult::WorkspaceError(error))
+                if error.contains("launch directory was removed")
+        ));
     }
 
     #[test]

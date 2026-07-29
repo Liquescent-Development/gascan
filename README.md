@@ -61,16 +61,16 @@ be either a trusted signed commit or the exact signed release tag. Build from
 the tag rather than from `main`, which moves ahead between releases:
 
 ```sh
-git checkout v0.1.11
+git checkout v0.1.12
 package=$(./packaging/macos/package.sh)
 GASCAN_EXPECTED_SOURCE_REVISION=$(git rev-parse HEAD) \
-GASCAN_EXPECTED_VERSION=0.1.11 \
+GASCAN_EXPECTED_VERSION=0.1.12 \
   ./packaging/macos/install.sh "$package"
 ```
 
 Skipping the checkout leaves `HEAD` on a commit the release tag does not
 attest, and `package.sh` exits 65 with `release source HEAD needs a trusted
-commit signature or exact signed v0.1.11 tag`.
+commit signature or exact signed v0.1.12 tag`.
 
 Verification runs through Git's own trust policy, so the tag's signing key must
 be one you have chosen to trust. Releases are signed with this SSH key:
@@ -89,7 +89,7 @@ key='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHyTKmfAwcJcdfKXmj2h3mwfgPaelE6gSMrquAc
 printf '%s %s\n' "$signer" "$key" \
   >> ~/.config/git/allowed_signers
 git config --global gpg.ssh.allowedSignersFile ~/.config/git/allowed_signers
-git verify-tag v0.1.11
+git verify-tag v0.1.12
 ```
 
 ## Quickstart
@@ -181,6 +181,9 @@ stable plain text without animation or color. Set `NO_COLOR=1` to disable color
 while keeping interactive progress. Use `--json` on supported commands for
 machine-readable output.
 
+Ordinary Gas Can commands normally start the on-demand daemon when needed and
+automatically replace it after an upgrade.
+
 Workspace image updates are reported by `gascan status`. Run `gascan apply` to
 replace only the container while preserving the workspace and managed tools,
 cache, and configuration volumes. Changes made directly to the container root
@@ -271,6 +274,66 @@ The SSH facts are `ssh.client`, `ssh.identity`, `ssh.config`, and
 `Unavailable` means `gascan ssh` will refuse the connection until a successful
 `gascan up` verifies and publishes the alias.
 
+### Daemon management
+
+Gas Can uses an on-demand, per-user daemon for local operations. Ordinary Gas
+Can commands normally start it when needed and automatically replace it after
+an upgrade. Use the lifecycle commands when diagnosing or deliberately
+controlling that process:
+
+```sh
+gascan daemon status
+gascan daemon status --json | jq
+gascan daemon start
+gascan daemon stop
+gascan daemon restart
+```
+
+For a running, healthy daemon, `gascan daemon status` renders these stable
+labels; the values are illustrative and vary by installation:
+
+```text
+✓ Gascan daemon is running
+  Health             Healthy
+  PID                <pid>
+  Uptime             <duration>
+  Installed version  <installed-version>
+  Running version    <running-version>
+  Executable         <path-to-gascand>
+```
+
+`gascan daemon status --json` reports the same status in machine-readable
+form:
+
+```json
+{
+  "state": "running",
+  "health": "healthy",
+  "installed_version": "<installed-version>",
+  "running_version": "<running-version>",
+  "pid": 12345,
+  "started_at_millis": 1722297600000,
+  "uptime_millis": 92345,
+  "executable": "<path-to-gascand>",
+  "legacy": false
+}
+```
+
+When no daemon is running, human status is:
+
+```text
+○ Gascan daemon is stopped
+```
+
+JSON reports `state` and `health` as `stopped`.
+
+By default, stop and restart wait for active sandbox operations to finish, then cancel
+active attachment streams. Use `--force` only when necessary: `--force` may
+interrupt active sandbox operations and attachments.
+
+`gascan doctor` checks the workspace from which you run `gascan doctor`, not
+the daemon's working directory.
+
 ### Commands
 
 | Command | Purpose |
@@ -283,6 +346,10 @@ The SSH facts are `ssh.client`, `ssh.identity`, `ssh.config`, and
 | `gascan ssh-config install` | Install the managed SSH include. |
 | `gascan ssh-config remove` | Remove the managed SSH include. |
 | `gascan ssh-config path` | Print the absolute generated OpenSSH config path. |
+| `gascan daemon status [--json]` | Inspect the per-user daemon. |
+| `gascan daemon start [--json]` | Start the per-user daemon. |
+| `gascan daemon stop [--force] [--json]` | Stop the daemon, gracefully unless forced. |
+| `gascan daemon restart [--force] [--json]` | Restart the daemon, gracefully unless forced. |
 | `gascan status [--json]` | Show desired and actual state for one sandbox. |
 | `gascan list [--json]` | List all sandboxes. |
 | `gascan logs [--follow] [--since-millis <n>]` | Stream sandbox logs. |

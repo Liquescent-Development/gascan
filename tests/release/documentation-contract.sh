@@ -30,6 +30,42 @@ require_shell_example() {
   }
 }
 
+require_daemon_status_json() {
+  local json
+  json=$(awk '
+    $0 == "`gascan daemon status --json` reports the same status in machine-readable" {
+      found_description = 1
+      next
+    }
+    found_description && $0 == "```json" {
+      in_block = 1
+      next
+    }
+    in_block && $0 == "```" { exit }
+    in_block { print }
+  ' "$readme")
+
+  if [[ -z "$json" ]] || ! printf '%s\n' "$json" | jq -e '
+    type == "object"
+    and ([
+      "state", "health", "installed_version", "running_version", "pid",
+      "started_at_millis", "uptime_millis", "executable", "legacy"
+    ] - keys | length == 0)
+    and (.state | type == "string")
+    and (.health | type == "string")
+    and (.installed_version | type == "string")
+    and (.running_version | type == "string")
+    and (.pid | type == "number")
+    and (.started_at_millis | type == "number")
+    and (.uptime_millis | type == "number")
+    and (.executable | type == "string")
+    and (.legacy | type == "boolean")
+  ' >/dev/null; then
+    printf 'missing valid daemon-status JSON example in %s\n' "${readme#"$repo_root"/}" >&2
+    exit 1
+  fi
+}
+
 require_shell_example "$readme"
 require_shell_example "$default_manifest"
 
@@ -46,5 +82,27 @@ require_text "$readme" 'The same prompt choice applies to both `gascan shell` an
 require_text "$readme" 'Run `gascan apply` after changing the prompt.'
 require_text "$readme" 'Pre-existing same-user interactive shell customization is trusted caller'
 require_text "$readme" 'state; it is not a same-shell isolation boundary.'
+require_text "$readme" 'on-demand, per-user daemon'
+require_text "$readme" 'start the on-demand daemon when needed'
+require_text "$readme" 'automatically replace it after an upgrade.'
+require_text "$readme" '`gascan daemon start [--json]`'
+require_text "$readme" '`gascan daemon stop [--force] [--json]`'
+require_text "$readme" '`gascan daemon restart [--force] [--json]`'
+require_text "$readme" '`gascan daemon status [--json]`'
+require_text "$readme" 'stop and restart wait for active sandbox operations to finish, then cancel'
+require_text "$readme" 'active attachment streams.'
+require_text "$readme" 'Use `--force` only when necessary:'
+require_text "$readme" 'interrupt active sandbox operations and attachments.'
+require_text "$readme" 'gascan daemon status --json | jq'
+require_text "$readme" 'Health             Healthy'
+require_text "$readme" 'PID                <pid>'
+require_text "$readme" 'Uptime             <duration>'
+require_text "$readme" 'Installed version  <installed-version>'
+require_text "$readme" 'Running version    <running-version>'
+require_text "$readme" 'Executable         <path-to-gascand>'
+require_daemon_status_json
+require_text "$readme" '○ Gascan daemon is stopped'
+require_text "$readme" 'checks the workspace from which you run `gascan doctor`'
+require_text "$readme" "the daemon's working directory."
 
-printf 'PASS: native shell and managed prompt documentation contract\n'
+printf 'PASS: native shell, managed prompt, and daemon lifecycle documentation contract\n'

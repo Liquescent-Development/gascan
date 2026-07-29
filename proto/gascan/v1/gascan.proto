@@ -9,6 +9,8 @@ service GasCan {
   rpc Status(StatusRequest) returns (StatusResponse);
   rpc List(ListRequest) returns (ListResponse);
   rpc Doctor(DoctorRequest) returns (DoctorResponse);
+  rpc DaemonStatus(DaemonStatusRequest) returns (DaemonStatusResponse);
+  rpc ShutdownDaemon(ShutdownDaemonRequest) returns (ShutdownDaemonResponse);
   rpc Up(UpRequest) returns (stream OperationEvent);
   rpc Apply(ApplyRequest) returns (stream OperationEvent);
   rpc Run(RunRequest) returns (stream OperationEvent);
@@ -36,6 +38,13 @@ enum ActualState {
   ACTUAL_STATE_ABSENT = 4;
   ACTUAL_STATE_FAILED = 5;
   ACTUAL_STATE_UNKNOWN = 6;
+}
+
+// Health of the daemon endpoint and the identity it reports.
+enum DaemonHealth {
+  DAEMON_HEALTH_UNKNOWN = 0;
+  DAEMON_HEALTH_HEALTHY = 1;
+  DAEMON_HEALTH_UNHEALTHY = 2;
 }
 
 // Stable durable operation status values. Numeric values must never change.
@@ -102,6 +111,9 @@ message HandshakeResponse {
   string daemon_executable = 8;
   string daemon_start_identity = 9;
   reserved 10;
+  string release_version = 11;
+  google.protobuf.Timestamp daemon_started_at = 12;
+  reserved 13;
 }
 
 message SandboxSelector { string sandbox_id = 1; reserved 2; }
@@ -175,8 +187,29 @@ message SandboxStatus {
 message StatusResponse { SandboxStatus sandbox = 1; reserved 2; }
 message ListRequest { reserved 1; }
 message ListResponse { repeated SandboxStatus sandboxes = 1; reserved 2; }
-message DoctorRequest { reserved 1; }
+message DoctorRequest {
+  reserved 1;
+  // Exactly one of workspace and workspace_error is populated by the caller.
+  oneof workspace_result {
+    string workspace = 2;
+    string workspace_error = 3;
+  }
+}
 message DoctorResponse { repeated Capability capabilities = 1; repeated Error findings = 2; reserved 3; }
+
+message DaemonStatusRequest { reserved 1; }
+message DaemonStatusResponse {
+  string release_version = 1;
+  uint32 daemon_pid = 2;
+  string daemon_executable = 3;
+  string daemon_start_identity = 4;
+  string daemon_instance_token = 5;
+  google.protobuf.Timestamp daemon_started_at = 6;
+  DaemonHealth health = 7;
+  reserved 8;
+}
+message ShutdownDaemonRequest { string daemon_instance_token = 1; reserved 2; }
+message ShutdownDaemonResponse { bool accepted = 1; reserved 2; }
 
 message Resize { uint32 columns = 1; uint32 rows = 2; reserved 3; }
 message Signal { int32 number = 1; reserved 2; }

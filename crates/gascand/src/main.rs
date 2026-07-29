@@ -349,6 +349,8 @@ async fn run_daemon<B: RuntimeBackend + 'static>(
     let service = Arc::new(service);
     let _ = service.reconcile().await?;
     let config = DaemonConfig::new(paths, idle_timeout);
+    #[cfg(debug_assertions)]
+    let config = configure_e2e_daemon(config)?;
     let error_diagnostics = if std::env::var_os(gascand::TEST_ERROR_DIAGNOSTICS_ENV).is_some() {
         ErrorDiagnostics::enabled_for_tests()
     } else {
@@ -357,6 +359,35 @@ async fn run_daemon<B: RuntimeBackend + 'static>(
     let api = SandboxApi::new_with_error_diagnostics(service, config.activity(), error_diagnostics);
     Daemon::serve(config, api).await?;
     Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn configure_e2e_daemon(
+    mut config: DaemonConfig,
+) -> Result<DaemonConfig, Box<dyn std::error::Error>> {
+    if option_env!("CARGO_BIN_NAME") != Some("gascan-e2e-daemon") {
+        return Ok(config);
+    }
+    if let Ok(release_version) = std::env::var("GASCAN_E2E_RELEASE_VERSION") {
+        config = config.with_release_version_for_e2e(release_version)?;
+    }
+    if std::env::var_os("GASCAN_E2E_LEGACY_WIRE_IDENTITY").is_some() {
+        let marker = std::env::var_os("GASCAN_E2E_REATTESTATION_MARKER");
+        let release = std::env::var_os("GASCAN_E2E_REATTESTATION_RELEASE");
+        let gate = match (marker, release) {
+            (None, None) => None,
+            (Some(marker), Some(release)) => Some((marker.into(), release.into())),
+            _ => return Err("incomplete E2E re-attestation gate".into()),
+        };
+        config = config.with_legacy_wire_identity_for_e2e(
+            std::env::var_os("GASCAN_E2E_FLIP_TOKEN_ON_REATTESTATION").is_some(),
+            gate,
+        )?;
+    }
+    if std::env::var_os("GASCAN_E2E_HOLD_OPERATION").is_some() {
+        config.activity().operation_started();
+    }
+    Ok(config)
 }
 
 fn e2e_ssh_paths() -> Result<Option<SshPaths>, Box<dyn std::error::Error>> {
@@ -469,22 +500,7 @@ async fn production_doctor_report() -> DoctorReport {
         }
         Err(error) => facts.service = service_error_fact(&error),
     }
-    if [
-        &facts.cli,
-        &facts.version,
-        &facts.service,
-        &facts.schema,
-        &facts.offline,
-    ]
-    .into_iter()
-    .all(|fact| fact.status == gascan_core::doctor::DoctorStatus::Pass)
-    {
-        facts.workspace = workspace_fact(&std::env::current_dir());
-    } else {
-        facts.workspace = DoctorFact::unknown(
-            "workspace was not accessed because an earlier runtime prerequisite failed",
-        );
-    }
+    facts.workspace = DoctorFact::unknown("workspace access is evaluated for each Doctor request");
     facts.into_report()
 }
 
@@ -567,21 +583,6 @@ fn macos_fact_at(path: &std::path::Path) -> DoctorFact {
             "SystemVersion.plist ProductVersion is {version}; macOS 26+ required"
         )),
         None => DoctorFact::fail("could not parse ProductVersion from SystemVersion.plist"),
-    }
-}
-
-fn workspace_fact(result: &std::io::Result<std::path::PathBuf>) -> DoctorFact {
-    let metadata = result
-        .as_ref()
-        .map_err(ToString::to_string)
-        .and_then(|path| path.canonicalize().map_err(|error| error.to_string()))
-        .and_then(|path| std::fs::metadata(path).map_err(|error| error.to_string()));
-    match metadata {
-        Ok(metadata) if metadata.is_dir() => {
-            DoctorFact::pass("current canonical workspace directory is accessible")
-        }
-        Ok(_) => DoctorFact::fail("current workspace is not a directory"),
-        Err(error) => DoctorFact::fail(format!("current workspace is inaccessible: {error}")),
     }
 }
 
@@ -813,14 +814,10 @@ mod doctor_tests {
     }
 
     #[test]
-    fn missing_storage_and_workspace_evidence_fail() {
+    fn missing_storage_evidence_fails() {
         let missing = std::path::PathBuf::from("/definitely/not/a/gascan/path");
         assert_eq!(
             storage_fact(&missing, "test").status,
-            gascan_core::doctor::DoctorStatus::Fail
-        );
-        assert_eq!(
-            workspace_fact(&Ok(missing)).status,
             gascan_core::doctor::DoctorStatus::Fail
         );
     }

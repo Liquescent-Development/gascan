@@ -542,17 +542,29 @@ fn two_unrelated_sandboxes_require_explicit_selection() -> TestResult {
 #[test]
 fn daemon_idle_restart_uses_independent_fake_runtime_truth() -> TestResult {
     let env = Environment::new()?;
+    let idle_timeout = "2000";
+    let first = env
+        .command(&["up", env.root()?])
+        .env("GASCAN_IDLE_TIMEOUT_MS", idle_timeout)
+        .output()?;
     assert!(
-        env.command(&["up", env.root()?])
-            .env("GASCAN_IDLE_TIMEOUT_MS", "50")
-            .output()?
-            .status
-            .success()
+        first.status.success(),
+        "initial up failed: status={:?}, stdout={}, stderr={}",
+        first.status,
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
     );
-    std::thread::sleep(std::time::Duration::from_millis(250));
+    let socket = env.runtime_root.join("gascan/gascand.sock");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while socket.exists() {
+        if std::time::Instant::now() >= deadline {
+            return Err("daemon did not exit after its idle timeout".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     let output = env
         .command(&["run", "--", "fake-exit", "23"])
-        .env("GASCAN_IDLE_TIMEOUT_MS", "50")
+        .env("GASCAN_IDLE_TIMEOUT_MS", idle_timeout)
         .output()?;
     assert_eq!(output.status.code(), Some(23));
     Ok(())

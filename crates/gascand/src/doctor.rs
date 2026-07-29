@@ -5,6 +5,7 @@ use crate::ssh::{
     validate_managed_config_if_present,
 };
 use crate::store::{ActualState, SshResolution, Store};
+use camino::Utf8Path;
 use gascan_core::doctor::DoctorFact;
 use gascan_core::sandbox::SandboxId;
 use std::os::unix::fs::PermissionsExt as _;
@@ -18,6 +19,19 @@ pub struct SshDoctorFacts {
     pub identity: DoctorFact,
     pub config: DoctorFact,
     pub native_publish: DoctorFact,
+}
+
+/// Inspect the caller-provided workspace for a single Doctor request.
+pub(crate) fn workspace_fact(path: &Utf8Path) -> DoctorFact {
+    let metadata = path
+        .canonicalize()
+        .map_err(|error| error.to_string())
+        .and_then(|path| std::fs::metadata(path).map_err(|error| error.to_string()));
+    match metadata {
+        Ok(metadata) if metadata.is_dir() => DoctorFact::pass("workspace directory is accessible"),
+        Ok(_) => DoctorFact::fail("workspace is not a directory"),
+        Err(error) => DoctorFact::fail(format!("workspace is inaccessible: {error}")),
+    }
 }
 
 pub async fn ssh_doctor_facts(store: &Store, native_publish: bool) -> SshDoctorFacts {

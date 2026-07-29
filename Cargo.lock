@@ -452,7 +452,7 @@ dependencies = [
 
 [[package]]
 name = "gascan"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "clap",
  "console",
@@ -464,6 +464,8 @@ dependencies = [
  "prost-types",
  "rustix",
  "rustix-openpty",
+ "semver",
+ "serde",
  "serde_json",
  "signal-hook",
  "tempfile",
@@ -475,7 +477,7 @@ dependencies = [
 
 [[package]]
 name = "gascan-apple"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "async-trait",
  "base64",
@@ -492,7 +494,7 @@ dependencies = [
 
 [[package]]
 name = "gascan-core"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "async-trait",
  "base64",
@@ -510,7 +512,7 @@ dependencies = [
 
 [[package]]
 name = "gascan-e2e"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "async-trait",
  "camino",
@@ -538,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "gascan-proto"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "prost",
  "prost-build",
@@ -550,7 +552,7 @@ dependencies = [
 
 [[package]]
 name = "gascand"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "async-trait",
  "base64",
@@ -1268,6 +1270,12 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "semver"
+version = "1.0.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "serde"
