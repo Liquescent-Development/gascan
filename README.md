@@ -181,6 +181,9 @@ stable plain text without animation or color. Set `NO_COLOR=1` to disable color
 while keeping interactive progress. Use `--json` on supported commands for
 machine-readable output.
 
+Ordinary Gas Can commands normally start the on-demand daemon when needed and
+automatically replace it after an upgrade.
+
 Workspace image updates are reported by `gascan status`. Run `gascan apply` to
 replace only the container while preserving the workspace and managed tools,
 cache, and configuration volumes. Changes made directly to the container root
@@ -271,6 +274,28 @@ The SSH facts are `ssh.client`, `ssh.identity`, `ssh.config`, and
 `Unavailable` means `gascan ssh` will refuse the connection until a successful
 `gascan up` verifies and publishes the alias.
 
+### Daemon management
+
+Gas Can uses an on-demand, per-user daemon for local operations. Ordinary Gas
+Can commands normally start it when needed and automatically replace it after
+an upgrade. Use the lifecycle commands when diagnosing or deliberately
+controlling that process:
+
+```sh
+gascan daemon status
+gascan daemon status --json | jq
+gascan daemon start
+gascan daemon stop
+gascan daemon restart
+```
+
+By default, stop and restart wait for active sandbox operations and attachments
+to finish gracefully. Use `--force` only when necessary: `--force` may
+interrupt active sandbox operations and attachments.
+
+`gascan doctor` checks the workspace from which you run `gascan doctor`, not
+the daemon's working directory.
+
 ### Commands
 
 | Command | Purpose |
@@ -283,6 +308,10 @@ The SSH facts are `ssh.client`, `ssh.identity`, `ssh.config`, and
 | `gascan ssh-config install` | Install the managed SSH include. |
 | `gascan ssh-config remove` | Remove the managed SSH include. |
 | `gascan ssh-config path` | Print the absolute generated OpenSSH config path. |
+| `gascan daemon status [--json]` | Inspect the per-user daemon. |
+| `gascan daemon start [--json]` | Start the per-user daemon. |
+| `gascan daemon stop [--force] [--json]` | Stop the daemon, gracefully unless forced. |
+| `gascan daemon restart [--force] [--json]` | Restart the daemon, gracefully unless forced. |
 | `gascan status [--json]` | Show desired and actual state for one sandbox. |
 | `gascan list [--json]` | List all sandboxes. |
 | `gascan logs [--follow] [--since-millis <n>]` | Stream sandbox logs. |
