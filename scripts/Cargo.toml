@@ -7,6 +7,10 @@ publish = false
 
 [workspace]
 
+[[bin]]
+name = "validate-runtime-contract"
+path = "src/bin/validate-runtime-contract.rs"
+
 [dependencies]
 libc = "0.2"
 cap-std = "4"

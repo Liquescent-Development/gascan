@@ -1,0 +1,21 @@
+version = 1
+
+[[helpers]]
+path = "/usr/local/bin/configure-shell-home"
+source = "images/workspace/bin/configure-shell-home"
+
+[[helpers]]
+path = "/usr/local/bin/initialize-rust-home"
+source = "images/workspace/bin/initialize-rust-home"
+
+[[helpers]]
+path = "/usr/local/bin/configure-workstation-home"
+source = "images/workspace/bin/configure-workstation-home"
+
+[[helpers]]
+path = "/usr/local/bin/select-gascamp"
+source = "images/workspace/bin/select-gascamp"
+
+[[helpers]]
+path = "/usr/local/bin/mise"
+source = ".artifacts/mise-linux-arm64"

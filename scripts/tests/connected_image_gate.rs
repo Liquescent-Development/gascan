@@ -53,6 +53,10 @@ fn configure_validator_dispatcher(command: &mut Command, fixture_manifest: &Path
         .env(
             "GASCAN_GATE_TEST_VALIDATE_OWNED_VOLUME",
             env!("CARGO_BIN_EXE_validate-owned-volume"),
+        )
+        .env(
+            "GASCAN_GATE_TEST_VALIDATE_RUNTIME_CONTRACT",
+            env!("CARGO_BIN_EXE_validate-runtime-contract"),
         );
 }
 
@@ -71,6 +75,8 @@ fn fixture() -> Fixture {
         "scripts",
         "tests/image",
         "images/workspace",
+        "images/workspace/bin",
+        "crates/gascand/src",
         "docs/evidence",
         ".artifacts/connected-workspace-context",
     ] {
@@ -106,10 +112,32 @@ fn fixture() -> Fixture {
         root.join("images/workspace/Dockerfile"),
     )
     .unwrap();
-    fs::create_dir_all(root.join("images/workspace/bin")).unwrap();
     fs::copy(
-        repository_root().join("images/workspace/bin/select-gascamp"),
-        root.join("images/workspace/bin/select-gascamp"),
+        repository_root().join("images/workspace/runtime-contract.toml"),
+        root.join("images/workspace/runtime-contract.toml"),
+    )
+    .unwrap();
+    for helper in [
+        "configure-shell-home",
+        "configure-workstation-home",
+        "initialize-rust-home",
+        "select-gascamp",
+    ] {
+        fs::copy(
+            repository_root().join("images/workspace/bin").join(helper),
+            root.join("images/workspace/bin").join(helper),
+        )
+        .unwrap();
+    }
+    fs::write(
+        root.join("crates/gascand/src/service.rs"),
+        r#"
+            const CONFIGURE_SHELL_HOME: &str = "/usr/local/bin/configure-shell-home";
+            const INITIALIZE_RUST_HOME: &str = "/usr/local/bin/initialize-rust-home";
+            const CONFIGURE_WORKSTATION_HOME: &str = "/usr/local/bin/configure-workstation-home";
+            const SELECT_GASCAMP: &str = "/usr/local/bin/select-gascamp";
+            const MISE: &str = "/usr/local/bin/mise";
+        "#,
     )
     .unwrap();
     let calls = temp.path().join("calls");
@@ -136,6 +164,7 @@ case "$bin" in
   validate-container-inventory) executable=$GASCAN_GATE_TEST_VALIDATE_CONTAINER_INVENTORY ;;
   validate-owned-container) executable=$GASCAN_GATE_TEST_VALIDATE_OWNED_CONTAINER ;;
   validate-owned-volume) executable=$GASCAN_GATE_TEST_VALIDATE_OWNED_VOLUME ;;
+  validate-runtime-contract) executable=$GASCAN_GATE_TEST_VALIDATE_RUNTIME_CONTRACT ;;
   *) exit 64 ;;
 esac
 exec "$executable" "$@"

@@ -147,6 +147,7 @@ if test -n "${GASCAN_GATE_TEST_SIGNAL:-}"; then
 fi
 
 build_output=''
+run_tool validate-runtime-contract "$root"
 if ! $prebuilt; then
   GASCAN_GATE_ARTIFACTS="$artifacts" "$root/scripts/prefetch-connected-workspace-image.sh"
   build_output=$(GASCAN_GATE_ARTIFACTS="$artifacts" "$root/scripts/build-connected-workspace-image.sh")
