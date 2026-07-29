@@ -95,7 +95,9 @@ impl DoctorCheckId {
 
     pub const fn role(self) -> DoctorCheckRole {
         match self {
-            Self::SshIdentity | Self::SshConfig => DoctorCheckRole::OperationalDiagnostic,
+            Self::WorkspaceAccess | Self::SshIdentity | Self::SshConfig => {
+                DoctorCheckRole::OperationalDiagnostic
+            }
             _ => DoctorCheckRole::ReadinessPrerequisite,
         }
     }

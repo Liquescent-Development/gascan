@@ -89,3 +89,13 @@ fn doctor_json_preserves_unknown_status() {
         "unknown"
     );
 }
+
+#[test]
+fn request_scoped_workspace_unknown_does_not_block_runtime_readiness() {
+    let mut facts = ready_facts();
+    facts.workspace = DoctorFact::unknown("workspace access is evaluated for each Doctor request");
+    let report = facts.into_report();
+
+    assert!(!report.is_ready());
+    assert_eq!(report.runtime_readiness_failure(), None);
+}
