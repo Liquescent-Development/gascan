@@ -2,8 +2,7 @@ use crate::SshPaths;
 use crate::ssh::manager::resolution_enabled;
 use crate::ssh::{
     ManagedSshDiagnostic, ManagedSshDiagnosticKind, PublishedSshSnapshot, SshManager,
-    inspect_host_identity_if_present, inspect_managed_config_if_present,
-    inspect_managed_ssh_artifacts,
+    inspect_host_identity_if_present, inspect_managed_ssh_artifacts,
 };
 use crate::store::{ActualState, SshResolution, Store};
 use camino::Utf8Path;
@@ -329,13 +328,13 @@ pub async fn ssh_doctor_facts_for_paths(
             };
         }
     }
-    let config_inspection = inspect_managed_config_if_present(paths);
-    if let Err(diagnostic) = &config_inspection {
+    let publication_inspection = SshManager.inspect_publication_for_paths(paths);
+    if let Err(diagnostic) = &publication_inspection {
         if matches!(
             diagnostic.kind(),
             ManagedSshDiagnosticKind::Unsafe | ManagedSshDiagnosticKind::Internal
         ) {
-            let config = diagnostic_fact(diagnostic, "generated SSH config");
+            let config = snapshot_diagnostic_fact(paths, diagnostic);
             let identity = ready_or_diagnostic_identity_fact(paths, &identity_inspection);
             return SshDoctorFacts {
                 client: client_fact,
@@ -345,9 +344,9 @@ pub async fn ssh_doctor_facts_for_paths(
             };
         }
     }
-    let snapshot_inspection = match (&identity_inspection, &config_inspection) {
-        (Ok(Some(identity)), Ok(true)) => {
-            Some(SshManager.inspect_published_snapshot_for_paths(paths, identity))
+    let snapshot_inspection = match (&identity_inspection, &publication_inspection) {
+        (Ok(Some(identity)), Ok(publication)) if publication.config_present() => {
+            Some(SshManager.snapshot_from_inspected_publication(paths, identity, publication))
         }
         _ => None,
     };
@@ -377,19 +376,51 @@ pub async fn ssh_doctor_facts_for_paths(
             identity_inspection,
             Err(ref diagnostic) if diagnostic.kind() == ManagedSshDiagnosticKind::Missing
         );
-    let config_partial = matches!(config_inspection, Ok(false))
-        || matches!(
-            config_inspection,
-            Err(ref diagnostic) if diagnostic.kind() == ManagedSshDiagnosticKind::Missing
-        );
+    let config_partial = matches!(
+        publication_inspection,
+        Ok(ref publication) if !publication.config_present()
+    ) || matches!(
+        publication_inspection,
+        Err(ref diagnostic) if diagnostic.kind() == ManagedSshDiagnosticKind::Missing
+    );
+    let semantic_failure = matches!(
+        identity_inspection,
+        Err(ref diagnostic)
+            if matches!(
+                diagnostic.kind(),
+                ManagedSshDiagnosticKind::Inconsistent
+                    | ManagedSshDiagnosticKind::Unsafe
+                    | ManagedSshDiagnosticKind::Internal
+            )
+    ) || matches!(
+        publication_inspection,
+        Err(ref diagnostic)
+            if matches!(
+                diagnostic.kind(),
+                ManagedSshDiagnosticKind::Inconsistent
+                    | ManagedSshDiagnosticKind::Unsafe
+                    | ManagedSshDiagnosticKind::Internal
+            )
+    ) || matches!(
+        snapshot_inspection,
+        Some(Err(ref diagnostic))
+            if matches!(
+                diagnostic.kind(),
+                ManagedSshDiagnosticKind::Inconsistent
+                    | ManagedSshDiagnosticKind::Unsafe
+                    | ManagedSshDiagnosticKind::Internal
+            )
+    );
     let snapshot_partial = matches!(
         snapshot_inspection,
         Some(Err(ref diagnostic))
             if diagnostic.kind() == ManagedSshDiagnosticKind::Missing
     );
-    let safe_partial = identity_partial || config_partial || snapshot_partial;
+    let safe_partial =
+        (identity_partial || config_partial || snapshot_partial) && !semantic_failure;
     let transition_pending = durable.as_ref().is_ok_and(|durable| {
         durable.operation_pending
+            && durable.consistent
             && safe_partial
             && (durable.expects_managed_state || !matches!(&artifacts, Ok(false)))
     });
@@ -429,10 +460,12 @@ pub async fn ssh_doctor_facts_for_paths(
                         identity.fingerprint()
                     ),
                 );
-                let config_fact = match config_inspection {
-                    Ok(false) => SshDoctorCondition::Missing.fact(paths),
-                    Err(diagnostic) => diagnostic_fact(&diagnostic, "generated SSH config"),
-                    Ok(true) => match snapshot_inspection {
+                let config_fact = match publication_inspection {
+                    Ok(publication) if !publication.config_present() => {
+                        SshDoctorCondition::Missing.fact(paths)
+                    }
+                    Err(diagnostic) => snapshot_diagnostic_fact(paths, &diagnostic),
+                    Ok(_) => match snapshot_inspection {
                         Some(Ok(snapshot)) => {
                             validate_complete_publication(
                                 paths,
@@ -443,40 +476,51 @@ pub async fn ssh_doctor_facts_for_paths(
                             )
                             .await
                         }
-                        Some(Err(diagnostic)) => {
-                            snapshot_diagnostic_fact(paths, &diagnostic)
-                        }
+                        Some(Err(diagnostic)) => snapshot_diagnostic_fact(paths, &diagnostic),
                         None => SshDoctorCondition::Missing.fact(paths),
                     },
                 };
                 (identity_fact, config_fact)
             }
-            Ok(None) => (
-                identity_fact(
+            Ok(None) => {
+                let identity = identity_fact(
                     SshDoctorCondition::Missing,
                     paths,
                     format!(
                         "managed SSH identity at {} is missing while durable or generated SSH state exists",
                         paths.private_key()
                     ),
-                ),
-                SshDoctorCondition::Inconsistent.fact_with_detail(
-                    paths,
-                    format!(
-                        "generated SSH config at {} cannot be validated without the complete managed identity",
-                        paths.config()
+                );
+                let config = match publication_inspection {
+                    Err(diagnostic) => snapshot_diagnostic_fact(paths, &diagnostic),
+                    Ok(publication) if !publication.config_present() => {
+                        SshDoctorCondition::Missing.fact(paths)
+                    }
+                    Ok(_) => SshDoctorCondition::Inconsistent.fact_with_detail(
+                        paths,
+                        format!(
+                            "generated SSH config at {} cannot be validated without the complete managed identity",
+                            paths.config()
+                        ),
                     ),
-                ),
-            ),
+                };
+                (identity, config)
+            }
             Err(diagnostic) => {
                 let identity = diagnostic_fact(&diagnostic, "managed SSH identity");
-                let config = SshDoctorCondition::Inconsistent.fact_with_detail(
-                    paths,
-                    format!(
-                        "generated SSH config at {} cannot be validated without the complete managed identity",
-                        paths.config()
+                let config = match publication_inspection {
+                    Err(diagnostic) => snapshot_diagnostic_fact(paths, &diagnostic),
+                    Ok(publication) if !publication.config_present() => {
+                        SshDoctorCondition::Missing.fact(paths)
+                    }
+                    Ok(_) => SshDoctorCondition::Inconsistent.fact_with_detail(
+                        paths,
+                        format!(
+                            "generated SSH config at {} cannot be validated without the complete managed identity",
+                            paths.config()
+                        ),
                     ),
-                );
+                };
                 (identity, config)
             }
         }
@@ -517,8 +561,12 @@ fn durable_ssh_state(store: &Store) -> Result<DurableSshState, crate::StoreError
         if transport_enabled != resolution_enabled {
             state.consistent = false;
         }
+        let publication_expected = transport_enabled
+            && resolution_enabled
+            && (record.actual_state == ActualState::Running
+                || (record.actual_state == ActualState::Creating && snapshot.operation_pending));
         match record.actual_state {
-            ActualState::Running if transport_enabled && resolution_enabled => {
+            ActualState::Running | ActualState::Creating if publication_expected => {
                 if let Some(resolution) = record.ssh_resolution {
                     state.expected.push((
                         record.id,

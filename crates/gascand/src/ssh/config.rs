@@ -2,8 +2,8 @@ use super::identity::{
     HostIdentity, open_revalidated_identity, open_revalidated_identity_async, parse_public_key,
 };
 use super::{
-    ManagedSshDiagnostic, ManagedSshDiagnosticKind, ManagedSshHost, PUBLIC_MODE, SshError,
-    SshPaths, StateDirectory, maximum_managed_file_bytes, random_staging_name,
+    ManagedSshHost, PUBLIC_MODE, SshError, SshPaths, StateDirectory, maximum_managed_file_bytes,
+    random_staging_name,
 };
 use camino::{Utf8Path, Utf8PathBuf};
 use sha2::{Digest, Sha256};
@@ -40,34 +40,6 @@ impl From<SshError> for SshConfigCommitError {
     fn from(error: SshError) -> Self {
         Self::Unpublished(error)
     }
-}
-
-pub(crate) fn inspect_managed_config_if_present(
-    paths: &SshPaths,
-) -> Result<bool, ManagedSshDiagnostic<SshError>> {
-    let Some(directory) = StateDirectory::open_existing_inspected(paths)? else {
-        return Ok(false);
-    };
-    let Some(_) = directory.metadata_inspected(CONFIG_NAME, PUBLIC_MODE)? else {
-        return Ok(false);
-    };
-    let (contents, _) =
-        directory.read_file_inspected(CONFIG_NAME, PUBLIC_MODE, maximum_managed_file_bytes())?;
-    let text = std::str::from_utf8(&contents).map_err(|_| {
-        ManagedSshDiagnostic::new(
-            ManagedSshDiagnosticKind::Inconsistent,
-            paths.config.clone(),
-            SshError::InvalidState("managed SSH config is not UTF-8"),
-        )
-    })?;
-    if text.contains('\0') {
-        return Err(ManagedSshDiagnostic::new(
-            ManagedSshDiagnosticKind::Inconsistent,
-            paths.config.clone(),
-            SshError::InvalidState("managed SSH config contains a null byte"),
-        ));
-    }
-    Ok(true)
 }
 
 pub struct PreparedSshFiles {

@@ -15,7 +15,6 @@ use std::net::IpAddr;
 use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 
-pub(crate) use config::inspect_managed_config_if_present;
 pub use config::{
     PreparedSshFiles, SshConfigCommitError, SshConfigCommitFault, commit_openssh_files,
     prepare_openssh_files, publish_openssh_files, readiness_ssh_args,
@@ -215,6 +214,11 @@ impl<E> ManagedSshDiagnostic<E> {
             source: Box::new(map(*self.source)),
         }
     }
+
+    pub(crate) fn with_kind(mut self, kind: ManagedSshDiagnosticKind) -> Self {
+        self.kind = kind;
+        self
+    }
 }
 
 fn inspected_directory_error(
@@ -391,7 +395,28 @@ impl StateDirectory {
         maximum: u64,
     ) -> Result<(Vec<u8>, FileIdentity), ManagedSshDiagnostic<SshError>> {
         let path = self.path.join(name);
-        let (file, identity) = self.open_file_inspected(name, required_mode)?;
+        let expected_identity = self
+            .metadata_inspected(name, required_mode)?
+            .ok_or_else(|| {
+                ManagedSshDiagnostic::new(
+                    ManagedSshDiagnosticKind::Missing,
+                    path.clone(),
+                    SshError::io(
+                        "open managed SSH file",
+                        io::Error::from(io::ErrorKind::NotFound),
+                    ),
+                )
+            })?;
+        let (file, identity) = self
+            .open_file_inspected(name, required_mode)
+            .map_err(|diagnostic| diagnostic.with_kind(ManagedSshDiagnosticKind::Unsafe))?;
+        if identity != expected_identity {
+            return Err(ManagedSshDiagnostic::new(
+                ManagedSshDiagnosticKind::Unsafe,
+                path,
+                SshError::InvalidState("managed SSH file changed during validation"),
+            ));
+        }
         let mut bytes = Vec::new();
         file.take(maximum.saturating_add(1))
             .read_to_end(&mut bytes)

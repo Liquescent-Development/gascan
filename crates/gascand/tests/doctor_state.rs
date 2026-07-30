@@ -874,6 +874,93 @@ async fn ssh_doctor_unsafe_referenced_generation_names_the_generation_path() -> 
 }
 
 #[tokio::test]
+async fn ssh_doctor_symlinked_referenced_generation_is_unsafe_at_the_generation_path() -> TestResult
+{
+    let temp = tempfile::tempdir()?;
+    let root = camino::Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    let home = root.join("home");
+    std::fs::create_dir(&home)?;
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
+    let home = home.canonicalize()?;
+    let paths = SshPaths::for_environment(None, Some(home.as_os_str()))?;
+    let identity = ensure_host_identity(&paths).await?;
+    let id = SandboxId::test("doctor-symlink-generation");
+    let host = managed_host(&id, 24_008, &identity);
+    publish_openssh_files(&paths, &identity, std::slice::from_ref(&host))?;
+    let generation = configured_generation_path(&std::fs::read_to_string(paths.config())?)?;
+    let victim = root.join("generation-victim");
+    std::fs::write(&victim, "do not trust")?;
+    std::fs::remove_file(&generation)?;
+    std::os::unix::fs::symlink(&victim, &generation)?;
+    let state_path = root.join("state.db");
+    let store = Store::open(&state_path)?;
+    store.put_sandbox(&sandbox_record(
+        id.clone(),
+        root,
+        ActualState::Running,
+        Some(enabled_resolution(&host)),
+    ))?;
+    enable_transport(state_path.as_std_path(), &id, host.active.port)?;
+    let client = root.join("ssh");
+    std::fs::write(&client, "#!/bin/sh\nexit 0\n")?;
+    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755))?;
+
+    let facts =
+        gascand::ssh_doctor_facts_for_paths(&paths, client.as_std_path(), &store, true).await;
+
+    assert_eq!(facts.config.status, gascan_core::doctor::DoctorStatus::Fail);
+    assert!(facts.config.detail.contains("unsafe"));
+    let expected_remedy = format!("repair or remove the unsafe managed SSH path {generation}");
+    assert_eq!(
+        facts.config.remedy.as_deref(),
+        Some(expected_remedy.as_str())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ssh_doctor_missing_identity_does_not_mask_unsafe_referenced_generation() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = camino::Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    let home = root.join("home");
+    std::fs::create_dir(&home)?;
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
+    let home = home.canonicalize()?;
+    let paths = SshPaths::for_environment(None, Some(home.as_os_str()))?;
+    let identity = ensure_host_identity(&paths).await?;
+    let id = SandboxId::test("doctor-missing-identity-unsafe-generation");
+    let host = managed_host(&id, 24_009, &identity);
+    publish_openssh_files(&paths, &identity, std::slice::from_ref(&host))?;
+    let generation = configured_generation_path(&std::fs::read_to_string(paths.config())?)?;
+    std::fs::set_permissions(&generation, std::fs::Permissions::from_mode(0o666))?;
+    std::fs::remove_file(paths.private_key())?;
+    std::fs::remove_file(paths.public_key())?;
+    let state_path = root.join("state.db");
+    let store = Store::open(&state_path)?;
+    store.put_sandbox(&sandbox_record(
+        id.clone(),
+        root,
+        ActualState::Running,
+        Some(enabled_resolution(&host)),
+    ))?;
+    enable_transport(state_path.as_std_path(), &id, host.active.port)?;
+    let client = root.join("ssh");
+    std::fs::write(&client, "#!/bin/sh\nexit 0\n")?;
+    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755))?;
+
+    let facts =
+        gascand::ssh_doctor_facts_for_paths(&paths, client.as_std_path(), &store, true).await;
+
+    assert!(facts.config.detail.contains("unsafe"));
+    let expected_remedy = format!("repair or remove the unsafe managed SSH path {generation}");
+    assert_eq!(
+        facts.config.remedy.as_deref(),
+        Some(expected_remedy.as_str())
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn ssh_doctor_unsafe_public_key_names_the_public_key_path() -> TestResult {
     let temp = tempfile::tempdir()?;
     let root = camino::Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
@@ -1005,6 +1092,39 @@ async fn ssh_doctor_pending_operation_only_defers_safe_partial_state() -> TestRe
         gascand::ssh_doctor_facts_for_paths(&paths, client.as_std_path(), &store, true).await;
 
     assert_eq!(facts.config.status, gascan_core::doctor::DoctorStatus::Fail);
+    assert!(facts.config.detail.contains("inconsistent"));
+    assert!(!facts.config.detail.contains("lifecycle transition"));
+    assert_eq!(facts.config.remedy.as_deref(), Some("run `gascan up`"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn ssh_doctor_pending_missing_identity_does_not_mask_inconsistent_config() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = camino::Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    let home = root.join("home");
+    std::fs::create_dir(&home)?;
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
+    let home = home.canonicalize()?;
+    let paths = SshPaths::for_environment(None, Some(home.as_os_str()))?;
+    ensure_host_identity(&paths).await?;
+    std::fs::remove_file(paths.public_key())?;
+    std::fs::write(paths.config(), b"Host gascan-doctor\0\n")?;
+    std::fs::set_permissions(paths.config(), std::fs::Permissions::from_mode(0o644))?;
+    let store = Store::open(root.join("state.db"))?;
+    let id = SandboxId::test("doctor-pending-missing-and-inconsistent");
+    store.begin_operation(
+        &sandbox_record(id, root, ActualState::Creating, None),
+        OperationKind::Create,
+    )?;
+    let client = root.join("ssh");
+    std::fs::write(&client, "#!/bin/sh\nexit 0\n")?;
+    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755))?;
+
+    let facts =
+        gascand::ssh_doctor_facts_for_paths(&paths, client.as_std_path(), &store, true).await;
+
+    assert!(facts.identity.detail.contains("missing"));
     assert!(facts.config.detail.contains("inconsistent"));
     assert!(!facts.config.detail.contains("lifecycle transition"));
     assert_eq!(facts.config.remedy.as_deref(), Some("run `gascan up`"));

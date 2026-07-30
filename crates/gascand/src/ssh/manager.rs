@@ -122,6 +122,17 @@ pub struct PublishedSshSnapshot {
     hosts: BTreeMap<String, ActiveSsh>,
 }
 
+pub(crate) struct InspectedSshPublication {
+    config: Option<Vec<u8>>,
+    generation: Option<(Utf8PathBuf, Vec<u8>)>,
+}
+
+impl InspectedSshPublication {
+    pub(crate) const fn config_present(&self) -> bool {
+        self.config.is_some()
+    }
+}
+
 impl PublishedSshSnapshot {
     pub fn for_sandbox(
         &self,
@@ -402,12 +413,20 @@ impl SshManager {
         })
     }
 
-    pub(crate) fn inspect_published_snapshot_for_paths(
+    pub(crate) fn inspect_publication_for_paths(
+        &self,
+        paths: &SshPaths,
+    ) -> Result<InspectedSshPublication, ManagedSshDiagnostic<ServiceError>> {
+        inspect_publication_files(paths)
+    }
+
+    pub(crate) fn snapshot_from_inspected_publication(
         &self,
         paths: &SshPaths,
         identity: &HostIdentity,
+        publication: &InspectedSshPublication,
     ) -> Result<PublishedSshSnapshot, ManagedSshDiagnostic<ServiceError>> {
-        let hosts = load_active_hosts_inspected(paths, identity)?
+        let hosts = load_active_hosts_from_inspection(paths, identity, publication)?
             .into_iter()
             .map(|host| (host.active.alias.clone(), host.active))
             .collect();
@@ -790,14 +809,30 @@ fn load_active_hosts_inspected(
     paths: &SshPaths,
     identity: &HostIdentity,
 ) -> Result<Vec<ManagedSshHost>, ManagedSshDiagnostic<ServiceError>> {
-    let directory = StateDirectory::open_inspected(paths)
-        .map_err(|error| error.map_source(ServiceError::SshConfigUnsafe))?;
+    let publication = inspect_publication_files(paths)?;
+    load_active_hosts_from_inspection(paths, identity, &publication)
+}
+
+fn inspect_publication_files(
+    paths: &SshPaths,
+) -> Result<InspectedSshPublication, ManagedSshDiagnostic<ServiceError>> {
+    let Some(directory) = StateDirectory::open_existing_inspected(paths)
+        .map_err(|error| error.map_source(ServiceError::SshConfigUnsafe))?
+    else {
+        return Ok(InspectedSshPublication {
+            config: None,
+            generation: None,
+        });
+    };
     if directory
         .metadata_inspected(CONFIG_NAME, PUBLIC_MODE)
         .map_err(|error| error.map_source(ServiceError::SshConfigUnsafe))?
         .is_none()
     {
-        return Ok(Vec::new());
+        return Ok(InspectedSshPublication {
+            config: None,
+            generation: None,
+        });
     }
     let (config, _) = directory
         .read_file_inspected(CONFIG_NAME, PUBLIC_MODE, maximum_managed_file_bytes())
@@ -809,6 +844,13 @@ fn load_active_hosts_inspected(
             "managed SSH config is not UTF-8",
         )
     })?;
+    if text.contains('\0') {
+        return Err(inspected_config_state(
+            ManagedSshDiagnosticKind::Inconsistent,
+            paths.config(),
+            "managed SSH config contains a null byte",
+        ));
+    }
     let references = text
         .lines()
         .filter_map(|line| line.strip_prefix("    UserKnownHostsFile "))
@@ -822,22 +864,10 @@ fn load_active_hosts_inspected(
             )
         })?;
     if references.is_empty() {
-        drop(directory);
-        let prepared = prepare_openssh_files(paths, identity, &[]).map_err(|error| {
-            ManagedSshDiagnostic::new(
-                ManagedSshDiagnosticKind::Inconsistent,
-                paths.config().to_owned(),
-                ServiceError::SshConfigUnsafe(error),
-            )
-        })?;
-        if prepared.config_bytes() != config {
-            return Err(inspected_config_state(
-                ManagedSshDiagnosticKind::Inconsistent,
-                paths.config(),
-                "managed SSH config is inconsistent",
-            ));
-        }
-        return Ok(Vec::new());
+        return Ok(InspectedSshPublication {
+            config: Some(config),
+            generation: None,
+        });
     }
     let mut references = references.into_iter();
     let Some(known_hosts_path) = references.next() else {
@@ -872,8 +902,38 @@ fn load_active_hosts_inspected(
     let (known_hosts, _) = directory
         .read_file_inspected(generation, PUBLIC_MODE, maximum_managed_file_bytes())
         .map_err(|error| error.map_source(ServiceError::SshConfigUnsafe))?;
-    drop(directory);
-    let hosts = parse_known_hosts(&known_hosts, identity).map_err(|error| {
+    Ok(InspectedSshPublication {
+        config: Some(config),
+        generation: Some((known_hosts_path, known_hosts)),
+    })
+}
+
+fn load_active_hosts_from_inspection(
+    paths: &SshPaths,
+    identity: &HostIdentity,
+    publication: &InspectedSshPublication,
+) -> Result<Vec<ManagedSshHost>, ManagedSshDiagnostic<ServiceError>> {
+    let Some(config) = publication.config.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let Some((known_hosts_path, known_hosts)) = publication.generation.as_ref() else {
+        let prepared = prepare_openssh_files(paths, identity, &[]).map_err(|error| {
+            ManagedSshDiagnostic::new(
+                ManagedSshDiagnosticKind::Inconsistent,
+                paths.config().to_owned(),
+                ServiceError::SshConfigUnsafe(error),
+            )
+        })?;
+        if prepared.config_bytes() != config {
+            return Err(inspected_config_state(
+                ManagedSshDiagnosticKind::Inconsistent,
+                paths.config(),
+                "managed SSH config is inconsistent",
+            ));
+        }
+        return Ok(Vec::new());
+    };
+    let hosts = parse_known_hosts(known_hosts, identity).map_err(|error| {
         ManagedSshDiagnostic::new(
             ManagedSshDiagnosticKind::Inconsistent,
             known_hosts_path.clone(),
