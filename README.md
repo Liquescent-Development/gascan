@@ -12,11 +12,12 @@ sandbox is fail-closed offline unless the project opts into networking.
 
 - Apple-silicon Mac running macOS 26 or newer.
 - Apple `container` `>=1.1.0, <2.0.0`, installed and started first. Gas Can
-  does not bundle it. Version 1.1.0 is the certified release. Newer 1.x
-  releases remain usable for networked sandboxes, but `gascan doctor` reports
-  warnings; offline sandboxes require the certified release. Gas Can refreshes
-  Apple Container compatibility for each request, so changing Apple Container
-  is detected without restarting Gas Can.
+  does not bundle it. The sole certified CLI/service identity is version 1.1.0
+  at commit `5973b9cc626a3e7a499bb316a958237ebe14e2ed`. Newer 1.x releases
+  remain usable for networked sandboxes, but `gascan doctor` reports warnings;
+  offline sandboxes require the certified release. Gas Can refreshes Apple
+  Container compatibility for each request, so changing Apple Container is
+  detected without restarting Gas Can.
 
 ## Install
 
