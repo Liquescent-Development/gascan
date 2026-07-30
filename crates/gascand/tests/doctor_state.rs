@@ -10,7 +10,10 @@ use gascand::{
 };
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::unix::fs::PermissionsExt as _;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -335,6 +338,29 @@ async fn producer_timeout_is_cached_for_late_and_concurrent_callers() {
     tokio::time::advance(Duration::from_secs(2)).await;
     let late = state.report().await;
     assert_eq!(late.checks, left.checks);
+}
+
+#[tokio::test]
+async fn refreshing_doctor_state_collects_fresh_evidence_for_each_report() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let state = DoctorState::refreshing(Duration::from_secs(1), {
+        let calls = Arc::clone(&calls);
+        move || {
+            let calls = Arc::clone(&calls);
+            async move {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                let mut facts = DoctorFacts::all_supported_for_tests();
+                facts.version = DoctorFact::pass(if call == 0 { "1.2.0" } else { "1.1.0" });
+                facts.into_report()
+            }
+        }
+    });
+
+    let first = state.report().await;
+    let second = state.report().await;
+
+    assert_ne!(first, second);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 #[test]
