@@ -214,11 +214,6 @@ impl<E> ManagedSshDiagnostic<E> {
             source: Box::new(map(*self.source)),
         }
     }
-
-    pub(crate) fn with_kind(mut self, kind: ManagedSshDiagnosticKind) -> Self {
-        self.kind = kind;
-        self
-    }
 }
 
 fn inspected_directory_error(
@@ -231,6 +226,14 @@ fn inspected_directory_error(
         ManagedSshDiagnosticKind::Internal
     };
     ManagedSshDiagnostic::new(kind, path, source)
+}
+
+fn inspected_open_file_error_kind(error: rustix::io::Errno) -> ManagedSshDiagnosticKind {
+    match error {
+        rustix::io::Errno::NOENT => ManagedSshDiagnosticKind::Missing,
+        rustix::io::Errno::LOOP => ManagedSshDiagnosticKind::Unsafe,
+        _ => ManagedSshDiagnosticKind::Internal,
+    }
 }
 
 pub(crate) struct StateDirectory {
@@ -354,13 +357,8 @@ impl StateDirectory {
             Mode::empty(),
         )
         .map_err(|error| {
-            let kind = if error == rustix::io::Errno::NOENT {
-                ManagedSshDiagnosticKind::Missing
-            } else {
-                ManagedSshDiagnosticKind::Internal
-            };
             ManagedSshDiagnostic::new(
-                kind,
+                inspected_open_file_error_kind(error),
                 path.clone(),
                 SshError::io("open managed SSH file", error),
             )
@@ -407,9 +405,7 @@ impl StateDirectory {
                     ),
                 )
             })?;
-        let (file, identity) = self
-            .open_file_inspected(name, required_mode)
-            .map_err(|diagnostic| diagnostic.with_kind(ManagedSshDiagnosticKind::Unsafe))?;
+        let (file, identity) = self.open_file_inspected(name, required_mode)?;
         if identity != expected_identity {
             return Err(ManagedSshDiagnostic::new(
                 ManagedSshDiagnosticKind::Unsafe,
@@ -835,11 +831,38 @@ fn utf8_path(path: PathBuf) -> Result<Utf8PathBuf, SshError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PUBLIC_MODE, SshError, StateDirectory};
+    use super::{
+        ManagedSshDiagnosticKind, PUBLIC_MODE, SshError, StateDirectory,
+        inspected_open_file_error_kind,
+    };
     use camino::Utf8PathBuf;
     use rustix::fs::{Mode, OFlags};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn nofollow_symlink_open_error_is_unsafe() {
+        assert_eq!(
+            inspected_open_file_error_kind(rustix::io::Errno::LOOP),
+            ManagedSshDiagnosticKind::Unsafe
+        );
+    }
+
+    #[test]
+    fn missing_open_error_is_missing() {
+        assert_eq!(
+            inspected_open_file_error_kind(rustix::io::Errno::NOENT),
+            ManagedSshDiagnosticKind::Missing
+        );
+    }
+
+    #[test]
+    fn resource_exhaustion_open_error_is_internal() {
+        assert_eq!(
+            inspected_open_file_error_kind(rustix::io::Errno::MFILE),
+            ManagedSshDiagnosticKind::Internal
+        );
+    }
 
     #[test]
     fn regular_file_validation_rejects_a_foreign_owner() -> Result<(), Box<dyn std::error::Error>> {
