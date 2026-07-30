@@ -892,7 +892,16 @@ fn daemon_cleanup_fixture(
         format!(
             r#"#!/bin/sh
 test ! -f "$STATE" || exit 1
-case "$*" in *command=*) printf '%s\n' '{}' ;; *) printf '%s\n' START ;; esac
+case "$*" in
+  *command=*) printf '%s\n' '{}' ;;
+  *)
+    if test "${{LC_ALL:-}}" = C && test "${{LANG:-}}" = C && test "${{TZ:-}}" = UTC; then
+      printf '%s\n' START
+    else
+      printf '%s\n' LOCAL_START
+    fi
+    ;;
+esac
 "#,
             daemon.display()
         ),
@@ -940,8 +949,27 @@ fn run_daemon_cleanup(
         .env("PATH", format!("{}:{inherited}", temp.path().display()))
         .env("STATE", temp.path().join("dead"))
         .env("KILL_CALLS", calls)
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .env("TZ", "America/Phoenix")
         .output()
         .unwrap()
+}
+
+#[test]
+fn daemon_cleanup_normalizes_start_identity_under_non_utc_parent() {
+    let temp = tempfile::tempdir().unwrap();
+    let (path, calls) = daemon_cleanup_fixture(&temp, false, false);
+
+    let output = run_daemon_cleanup(&temp, &path, &calls);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read_to_string(&calls).unwrap(), "-TERM 4242\n");
+    assert!(!path.exists());
 }
 
 #[test]

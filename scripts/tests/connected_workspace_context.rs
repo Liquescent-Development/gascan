@@ -15,8 +15,9 @@ use tempfile::TempDir;
 
 const REVIEWED_GASCAMP_REVISION: &str = "f6b248c5926240856dbea83d1d2c5c90ea1c1456";
 
-const REQUIRED: [&str; 20] = [
+const REQUIRED: [&str; 21] = [
     "Dockerfile",
+    "workspace-source.sha256",
     ".artifacts/mise-linux-arm64",
     ".artifacts/playwright-chromium-reviewed",
     ".artifacts/expected-tool-versions.json",
@@ -161,6 +162,27 @@ impl Fixture {
             ),
         )
         .unwrap();
+        fs::write(
+            repository.join("images/workspace/fingerprint-only-fixture"),
+            "sealed\n",
+        )
+        .unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&repository)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["add", "images/workspace"])
+                .current_dir(&repository)
+                .status()
+                .unwrap()
+                .success()
+        );
         let staging = temporary.path().join("fixture-prefetch");
         fs::create_dir(&staging).unwrap();
         fs::rename(cache.join("workstation"), staging.join("workstation")).unwrap();
@@ -768,6 +790,19 @@ fn make_tree_writable(root: &Path) {
     fs::set_permissions(root, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+fn make_tree_read_only(root: &Path) {
+    for relative in paths(root) {
+        let path = root.join(relative);
+        let metadata = fs::metadata(&path).unwrap();
+        fs::set_permissions(
+            &path,
+            fs::Permissions::from_mode(if metadata.is_dir() { 0o555 } else { 0o444 }),
+        )
+        .unwrap();
+    }
+    fs::set_permissions(root, fs::Permissions::from_mode(0o555)).unwrap();
+}
+
 #[test]
 fn connected_context_is_the_exact_public_allowlist_and_prints_digest() {
     let fixture = Fixture::new();
@@ -777,8 +812,7 @@ fn connected_context_is_the_exact_public_allowlist_and_prints_digest() {
         "private",
     )
     .unwrap();
-    fs::create_dir(fixture.repository.join(".git")).unwrap();
-    fs::write(fixture.repository.join(".git/config"), "secret").unwrap();
+    fs::write(fixture.repository.join(".git/private-secret"), "secret").unwrap();
     fs::write(fixture.repository.join("GASCAMP_READ_TOKEN_FILE"), "secret").unwrap();
     fs::write(fixture.repository.join("outside-allowlist"), "nope").unwrap();
 
@@ -834,6 +868,79 @@ fn connected_context_can_be_reverified_with_its_pending_lock() {
         String::from_utf8_lossy(&verified.stderr)
     );
     assert_eq!(created.stdout, verified.stdout);
+}
+
+#[test]
+fn connected_context_seals_the_canonical_workspace_source_digest() {
+    let fixture = Fixture::new();
+    assert!(fixture.run().status.success());
+    let expected = Command::new("bash")
+        .arg(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("scripts/workspace-image-source-digest.sh"),
+        )
+        .arg(&fixture.repository)
+        .output()
+        .unwrap();
+    assert!(expected.status.success());
+    assert_eq!(
+        fs::read(fixture.context.join("workspace-source.sha256")).unwrap(),
+        expected.stdout
+    );
+    let sealed = expected.stdout;
+
+    fs::write(
+        fixture
+            .repository
+            .join("images/workspace/fingerprint-only-fixture"),
+        "post-seal mutation\n",
+    )
+    .unwrap();
+    let changed = Command::new("bash")
+        .arg(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("scripts/workspace-image-source-digest.sh"),
+        )
+        .arg(&fixture.repository)
+        .output()
+        .unwrap();
+    assert!(changed.status.success());
+    assert_ne!(
+        changed.stdout, sealed,
+        "fixture mutation did not change source"
+    );
+    let stale = fixture.verify();
+    assert!(!stale.status.success());
+    assert!(
+        String::from_utf8_lossy(&stale.stderr).contains("source fingerprint"),
+        "{}",
+        String::from_utf8_lossy(&stale.stderr)
+    );
+}
+
+#[test]
+fn connected_context_rejects_missing_malformed_and_mismatched_source_fingerprints() {
+    for mutation in ["missing", "malformed", "mismatch"] {
+        let fixture = Fixture::new();
+        assert!(fixture.run().status.success());
+        make_tree_writable(&fixture.context);
+        let fingerprint = fixture.context.join("workspace-source.sha256");
+        match mutation {
+            "missing" => fs::remove_file(fingerprint).unwrap(),
+            "malformed" => fs::write(fingerprint, "not-a-digest\n").unwrap(),
+            "mismatch" => fs::write(fingerprint, format!("{}\n", "0".repeat(64))).unwrap(),
+            _ => unreachable!(),
+        }
+        make_tree_read_only(&fixture.context);
+        assert!(
+            !fixture.verify().status.success(),
+            "accepted {mutation} sealed source fingerprint"
+        );
+    }
 }
 
 #[test]
@@ -1028,11 +1135,17 @@ fn repository_npm_bytes_changed_after_validation_cannot_be_published() {
     .unwrap();
     let status = child.wait().unwrap();
     assert!(
-        status.success(),
-        "assembler did not preserve validated bytes"
+        !status.success(),
+        "assembler published context after tracked source changed"
     );
-    assert_eq!(
-        fs::read(fixture.context.join("workstation/package.json")).unwrap(),
+    assert!(!fixture.context.exists());
+    assert_ne!(
+        fs::read(
+            fixture
+                .repository
+                .join("images/workspace/workstation-package.json")
+        )
+        .unwrap(),
         validated
     );
 }

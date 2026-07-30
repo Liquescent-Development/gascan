@@ -181,20 +181,48 @@ fn successful_apple_apply_targets_candidate_and_publishes_matching_live_receipt(
 }
 
 #[test]
-fn candidate_flow_rejects_malformed_or_nonlocal_candidate_receipts() {
-    for (case, candidate) in [
-        ("malformed", "not-an-immutable-image"),
-        (
-            "registry-qualified",
-            "ghcr.io/liquescent-development/gascan/workspace:candidate@sha256:\
-             aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        ),
-        (
-            "repository-qualified",
-            "example/gascan-workspace:candidate@sha256:\
-             aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        ),
-    ] {
+fn candidate_flow_accepts_public_immutable_candidate_and_exports_exact_runtime_prefix() {
+    let fixture = runner_fixture(
+        "#!/bin/sh\nset -eu\nmkdir -p \"$RUNNER_FIXTURE_ROOT/target\"\nprintf '#!/bin/sh\\n' >\"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\nchmod 755 \"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\n",
+    );
+    let root = fixture.path();
+    let log = root.join("runner.log");
+    let artifacts = root.join(".artifacts");
+    fs::create_dir(&artifacts).unwrap();
+    let candidate = "ghcr.io/liquescent-development/gascan/workspace:candidate@sha256:\
+                     aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let candidate_file = artifacts.join("connected-workspace-image-candidate.txt");
+    fs::write(&candidate_file, format!("{candidate}\n")).unwrap();
+
+    let output = Command::new(root.join("scripts/run-apple-e2e.sh"))
+        .arg("apple_apply")
+        .env("RUNNER_FIXTURE_ROOT", root)
+        .env("RUNNER_FIXTURE_LOG", &log)
+        .env("GASCAN_E2E_CANDIDATE_IMAGE_FILE", &candidate_file)
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", root.join("bin").display()),
+        )
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let records = fs::read_to_string(log).unwrap();
+    assert!(records.contains(&format!("candidate:{candidate}\n")));
+    assert!(
+        records.contains(
+            "candidate-runtime:ghcr.io/liquescent-development/gascan/workspace:candidate\n"
+        )
+    );
+}
+
+#[test]
+fn candidate_flow_rejects_malformed_candidate_receipt() {
+    for (case, candidate) in [("malformed", "not-an-immutable-image")] {
         let fixture = runner_fixture(
             "#!/bin/sh\nset -eu\nmkdir -p \"$RUNNER_FIXTURE_ROOT/target\"\nprintf '#!/bin/sh\\n' >\"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\nchmod 755 \"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\n",
         );
@@ -224,7 +252,7 @@ fn candidate_flow_rejects_malformed_or_nonlocal_candidate_receipts() {
         );
         assert!(
             String::from_utf8_lossy(&output.stderr)
-                .contains("candidate receipt is not a local immutable image"),
+                .contains("candidate receipt is not an immutable image"),
             "{case}: {}",
             String::from_utf8_lossy(&output.stderr)
         );

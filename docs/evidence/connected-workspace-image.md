@@ -2,7 +2,8 @@
 
 - status: `PASS`
 - platform: `linux/arm64`
-- image: `ghcr.io/liquescent-development/gascan/workspace:0cda90a4b7ac4969-a9145b1e77224a5d302439ddebb9d2b488caaabad8974a3ece0b9fb256a194f5@sha256:a9145b1e77224a5d302439ddebb9d2b488caaabad8974a3ece0b9fb256a194f5`
-- versions lock SHA-256: `87865990df33f1524b0bf1f5efc0a066c23fe5813433ce4d2829c554c06b9471`
-- build receipt SHA-256: `0a6fbca78b9f301fc11fd93a24d61b9e2917472496ee61c22ab817571d8ec2f4`
+- image: `ghcr.io/liquescent-development/gascan/workspace:da2ca49349e9be1b-8d2d831a2c22092cf466d6338b3678bf53ea6f841e73bf25d24e0d2b36e1f2b7@sha256:8d2d831a2c22092cf466d6338b3678bf53ea6f841e73bf25d24e0d2b36e1f2b7`
+- versions lock SHA-256: `55d8ed537682d67f188d7a661ede342fc3f14fdf11bf161eeb6468515c6fbbdc`
+- build receipt SHA-256: `0c4ab7c49d3b73cf8acc60f7f9a37853e3db630e0d8ec69cd30f2f20899219cb`
+- source SHA-256: `b0bd9c30c2338589d8bd33eb0db89c0b0a44401bb61a80fd22377c7302365b0f`
 - final current-token residue: `absent`

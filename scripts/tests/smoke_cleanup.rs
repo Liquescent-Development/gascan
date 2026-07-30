@@ -58,7 +58,7 @@ esac
     let context_digest = format!("{:x}", Sha256::digest(b"fixture\n"));
     fs::write(
         temp.path().join("workspace-image-build.json"),
-        format!("{{\"reference\":\"{reference}\",\"tag\":\"gascan-workspace:d4964500a3295a33\",\"platform\":\"linux/arm64\",\"lock_digest\":\"{lock_digest}\",\"context_digest\":\"{context_digest}\",\"image_digest\":\"{image_digest}\",\"status\":\"succeeded\"}}\n"),
+        format!("{{\"reference\":\"{reference}\",\"tag\":\"gascan-workspace:d4964500a3295a33\",\"platform\":\"linux/arm64\",\"lock_digest\":\"{lock_digest}\",\"context_digest\":\"{context_digest}\",\"source_digest\":\"{}\",\"image_digest\":\"{image_digest}\",\"status\":\"succeeded\"}}\n", "e".repeat(64)),
     ).unwrap();
     let _ = mode;
     (temp, bin, log)

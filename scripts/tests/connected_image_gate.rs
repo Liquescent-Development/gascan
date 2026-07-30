@@ -53,6 +53,10 @@ fn configure_validator_dispatcher(command: &mut Command, fixture_manifest: &Path
         .env(
             "GASCAN_GATE_TEST_VALIDATE_OWNED_VOLUME",
             env!("CARGO_BIN_EXE_validate-owned-volume"),
+        )
+        .env(
+            "GASCAN_GATE_TEST_VALIDATE_RUNTIME_CONTRACT",
+            env!("CARGO_BIN_EXE_validate-runtime-contract"),
         );
 }
 
@@ -71,6 +75,8 @@ fn fixture() -> Fixture {
         "scripts",
         "tests/image",
         "images/workspace",
+        "images/workspace/bin",
+        "crates/gascand/src",
         "docs/evidence",
         ".artifacts/connected-workspace-context",
     ] {
@@ -106,10 +112,32 @@ fn fixture() -> Fixture {
         root.join("images/workspace/Dockerfile"),
     )
     .unwrap();
-    fs::create_dir_all(root.join("images/workspace/bin")).unwrap();
     fs::copy(
-        repository_root().join("images/workspace/bin/select-gascamp"),
-        root.join("images/workspace/bin/select-gascamp"),
+        repository_root().join("images/workspace/runtime-contract.toml"),
+        root.join("images/workspace/runtime-contract.toml"),
+    )
+    .unwrap();
+    for helper in [
+        "configure-shell-home",
+        "configure-workstation-home",
+        "initialize-rust-home",
+        "select-gascamp",
+    ] {
+        fs::copy(
+            repository_root().join("images/workspace/bin").join(helper),
+            root.join("images/workspace/bin").join(helper),
+        )
+        .unwrap();
+    }
+    fs::write(
+        root.join("crates/gascand/src/service.rs"),
+        r#"
+            const CONFIGURE_SHELL_HOME: &str = "/usr/local/bin/configure-shell-home";
+            const INITIALIZE_RUST_HOME: &str = "/usr/local/bin/initialize-rust-home";
+            const CONFIGURE_WORKSTATION_HOME: &str = "/usr/local/bin/configure-workstation-home";
+            const SELECT_GASCAMP: &str = "/usr/local/bin/select-gascamp";
+            const MISE: &str = "/usr/local/bin/mise";
+        "#,
     )
     .unwrap();
     let calls = temp.path().join("calls");
@@ -136,6 +164,7 @@ case "$bin" in
   validate-container-inventory) executable=$GASCAN_GATE_TEST_VALIDATE_CONTAINER_INVENTORY ;;
   validate-owned-container) executable=$GASCAN_GATE_TEST_VALIDATE_OWNED_CONTAINER ;;
   validate-owned-volume) executable=$GASCAN_GATE_TEST_VALIDATE_OWNED_VOLUME ;;
+  validate-runtime-contract) executable=$GASCAN_GATE_TEST_VALIDATE_RUNTIME_CONTRACT ;;
   *) exit 64 ;;
 esac
 exec "$executable" "$@"
@@ -148,7 +177,7 @@ exec "$executable" "$@"
     executable(
         &root.join("scripts/build-connected-workspace-image.sh"),
         &format!(
-            "#!/bin/sh\nset -eu\nprintf 'build\\n' >>\"$CALLS\"\n[ \"${{GASCAN_GATE_TEST_BUILD_FAILURE:-}}\" != 1 ]\nmkdir -p \"$GASCAN_GATE_ARTIFACTS\"\nref='gascan-workspace:d4964500a3295a33@sha256:{DIGEST}'\n[ \"${{REFERENCE_KIND:-}}\" != mutable ] || ref=gascan-workspace:d4964500a3295a33\nprintf '%s\\n' \"$ref\" >\"$GASCAN_GATE_ARTIFACTS/workspace-image-ref\"\nprintf '{{\"reference\":\"%s\",\"tag\":\"gascan-workspace:d4964500a3295a33\",\"platform\":\"linux/arm64\",\"lock_digest\":\"{lock_digest}\",\"context_digest\":\"{context_digest}\",\"image_digest\":\"sha256:{DIGEST}\",\"status\":\"succeeded\"}}\\n' \"$ref\" >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\"\ncase \"${{RECEIPT_KIND:-}}\" in missing) rm -f \"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; malformed) printf '{{bad\\n' >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; mismatched) printf '{{\"reference\":\"wrong\"}}\\n' >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; esac\nprintf '%s\\n' \"$ref\"\n"
+            "#!/bin/sh\nset -eu\nprintf 'build\\n' >>\"$CALLS\"\n[ \"${{GASCAN_GATE_TEST_BUILD_FAILURE:-}}\" != 1 ]\nmkdir -p \"$GASCAN_GATE_ARTIFACTS\"\nref='gascan-workspace:d4964500a3295a33@sha256:{DIGEST}'\n[ \"${{REFERENCE_KIND:-}}\" != mutable ] || ref=gascan-workspace:d4964500a3295a33\nprintf '%s\\n' \"$ref\" >\"$GASCAN_GATE_ARTIFACTS/workspace-image-ref\"\nprintf '{{\"reference\":\"%s\",\"tag\":\"gascan-workspace:d4964500a3295a33\",\"platform\":\"linux/arm64\",\"lock_digest\":\"{lock_digest}\",\"context_digest\":\"{context_digest}\",\"source_digest\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"image_digest\":\"sha256:{DIGEST}\",\"status\":\"succeeded\"}}\\n' \"$ref\" >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\"\ncase \"${{RECEIPT_KIND:-}}\" in missing) rm -f \"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; malformed) printf '{{bad\\n' >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; mismatched) printf '{{\"reference\":\"wrong\"}}\\n' >\"$GASCAN_GATE_ARTIFACTS/workspace-image-build.json\" ;; esac\nprintf '%s\\n' \"$ref\"\n"
         ),
     );
     fs::copy(
@@ -303,7 +332,8 @@ fn seed_valid_receipt(f: &Fixture) {
     fs::write(
         artifacts.join("workspace-image-build.json"),
         format!(
-            "{{\"reference\":\"{reference}\",\"tag\":\"gascan-workspace:d4964500a3295a33\",\"platform\":\"linux/arm64\",\"lock_digest\":\"{lock_digest}\",\"context_digest\":\"{context_digest}\",\"image_digest\":\"sha256:{DIGEST}\",\"status\":\"succeeded\"}}\n"
+            "{{\"reference\":\"{reference}\",\"tag\":\"gascan-workspace:d4964500a3295a33\",\"platform\":\"linux/arm64\",\"lock_digest\":\"{lock_digest}\",\"context_digest\":\"{context_digest}\",\"source_digest\":\"{}\",\"image_digest\":\"sha256:{DIGEST}\",\"status\":\"succeeded\"}}\n",
+            "e".repeat(64)
         ),
     )
     .unwrap();
@@ -347,7 +377,8 @@ fn seed_valid_ghcr_receipt(f: &Fixture) -> String {
     fs::write(
         artifacts.join("workspace-image-build.json"),
         format!(
-            "{{\"reference\":\"{reference}\",\"tag\":\"{tag}\",\"platform\":\"linux/arm64\",\"lock_digest\":\"{lock_digest}\",\"context_digest\":\"{context_digest}\",\"image_digest\":\"sha256:{DIGEST}\",\"status\":\"succeeded\"}}\n"
+            "{{\"reference\":\"{reference}\",\"tag\":\"{tag}\",\"platform\":\"linux/arm64\",\"lock_digest\":\"{lock_digest}\",\"context_digest\":\"{context_digest}\",\"source_digest\":\"{}\",\"image_digest\":\"sha256:{DIGEST}\",\"status\":\"succeeded\"}}\n",
+            "e".repeat(64)
         ),
     )
     .unwrap();
@@ -1176,7 +1207,13 @@ fn polyglot_volume_is_recovered_after_local_delete_failure() {
             >= 2,
         "outer cleanup did not retry the locally stranded polyglot volume"
     );
-    assert!(!f.temp.path().join("state").join(format!(".volume-{name}")).exists());
+    assert!(
+        !f.temp
+            .path()
+            .join("state")
+            .join(format!(".volume-{name}"))
+            .exists()
+    );
     assert_no_publications(&f);
 }
 
@@ -1194,7 +1231,13 @@ fn polyglot_volume_is_recovered_after_local_attestation_failure() {
     assert!(!output.status.success());
     let calls = fs::read_to_string(&f.calls).unwrap();
     assert!(calls.contains(&format!("container:volume delete {name}")));
-    assert!(!f.temp.path().join("state").join(format!(".volume-{name}")).exists());
+    assert!(
+        !f.temp
+            .path()
+            .join("state")
+            .join(format!(".volume-{name}"))
+            .exists()
+    );
     assert_no_publications(&f);
 }
 
@@ -1204,10 +1247,7 @@ fn ssh_volume_is_recovered_after_smoke_failure() {
     seed_valid_receipt(&f);
     let name = format!("gascan-image-ssh-config-{TOKEN}");
     fs::write(
-        f.temp
-            .path()
-            .join("state")
-            .join(format!(".volume-{name}")),
+        f.temp.path().join("state").join(format!(".volume-{name}")),
         "",
     )
     .unwrap();
@@ -1220,7 +1260,13 @@ fn ssh_volume_is_recovered_after_smoke_failure() {
     assert!(!output.status.success());
     let calls = fs::read_to_string(&f.calls).unwrap();
     assert!(calls.contains(&format!("container:volume delete {name}")));
-    assert!(!f.temp.path().join("state").join(format!(".volume-{name}")).exists());
+    assert!(
+        !f.temp
+            .path()
+            .join("state")
+            .join(format!(".volume-{name}"))
+            .exists()
+    );
     assert_no_publications(&f);
 }
 

@@ -357,7 +357,16 @@ fn cargo_reported_target_triple_artifact_wins_over_stale_host_binary() {
     .unwrap();
     let base = "ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab";
     fs::write(repo.join("images/workspace/versions.lock"), format!("workspace_build_mode = \"connected\"\nbase_image = \"{base}\"\nworkspace_tag = \"gascan-workspace:fixture\"\n[gascamp]\nrevision = \"f6b248c5926240856dbea83d1d2c5c90ea1c1456\"\n")).unwrap();
+    executable(
+        &repo.join("scripts/workspace-image-source-digest.sh"),
+        &format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", "e".repeat(64)),
+    );
     fs::write(context.join("Dockerfile"), "FROM scratch\n").unwrap();
+    fs::write(
+        context.join("workspace-source.sha256"),
+        format!("{}\n", "d".repeat(64)),
+    )
+    .unwrap();
     fs::write(context.join("context-manifest.tsv"), "fixture\n").unwrap();
     let manifest = format!("{:x}", Sha256::digest(b"fixture\n"));
     executable(&stale, "#!/bin/sh\ntouch \"$STALE_MARKER\"\nexit 74\n");
@@ -432,7 +441,16 @@ fn replacing_shared_artifact_after_private_staging_cannot_replace_consumer() {
     .unwrap();
     let base = "ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab";
     fs::write(repo.join("images/workspace/versions.lock"), format!("workspace_build_mode = \"connected\"\nbase_image = \"{base}\"\nworkspace_tag = \"gascan-workspace:fixture\"\n[gascamp]\nrevision = \"f6b248c5926240856dbea83d1d2c5c90ea1c1456\"\n")).unwrap();
+    executable(
+        &repo.join("scripts/workspace-image-source-digest.sh"),
+        &format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", "e".repeat(64)),
+    );
     fs::write(context.join("Dockerfile"), "FROM scratch\n").unwrap();
+    fs::write(
+        context.join("workspace-source.sha256"),
+        format!("{}\n", "d".repeat(64)),
+    )
+    .unwrap();
     fs::write(context.join("context-manifest.tsv"), "fixture\n").unwrap();
     let manifest = format!("{:x}", Sha256::digest(b"fixture\n"));
     executable(
@@ -493,6 +511,11 @@ fn fake_runner_cannot_start_container_build_until_sanitizer_is_ready() {
     let base = "ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab";
     fs::write(repo.join("images/workspace/versions.lock"), format!("workspace_build_mode = \"connected\"\nbase_image = \"{base}\"\nworkspace_tag = \"gascan-workspace:fixture\"\n[gascamp]\nrevision = \"f6b248c5926240856dbea83d1d2c5c90ea1c1456\"\n")).unwrap();
     fs::write(context.join("Dockerfile"), "FROM scratch\n").unwrap();
+    fs::write(
+        context.join("workspace-source.sha256"),
+        format!("{}\n", "d".repeat(64)),
+    )
+    .unwrap();
     fs::write(context.join("context-manifest.tsv"), "fixture\n").unwrap();
     let manifest = format!("{:x}", Sha256::digest(b"fixture\n"));
     executable(
@@ -568,7 +591,8 @@ esac
 }
 
 #[test]
-fn fake_runner_builds_the_exact_verified_context_and_publishes_reference_last() {
+fn fake_runner_retains_prebuild_fingerprint_when_context_file_is_replaced_after_final_verification()
+{
     let temp = tempfile::tempdir_in("/tmp").unwrap();
     let repo = temp.path().join("repo");
     let bin = temp.path().join("bin");
@@ -584,7 +608,16 @@ fn fake_runner_builds_the_exact_verified_context_and_publishes_reference_last() 
     .unwrap();
     let base = "ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab";
     fs::write(repo.join("images/workspace/versions.lock"), format!("workspace_build_mode = \"connected\"\nbase_image = \"{base}\"\nworkspace_tag = \"gascan-workspace:fixture\"\n[gascamp]\nrevision = \"f6b248c5926240856dbea83d1d2c5c90ea1c1456\"\n")).unwrap();
+    executable(
+        &repo.join("scripts/workspace-image-source-digest.sh"),
+        &format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", "e".repeat(64)),
+    );
     fs::write(context.join("Dockerfile"), "FROM scratch\n").unwrap();
+    fs::write(
+        context.join("workspace-source.sha256"),
+        format!("{}\n", "d".repeat(64)),
+    )
+    .unwrap();
     fs::write(context.join("context-manifest.tsv"), "fixture\n").unwrap();
     let manifest = format!("{:x}", Sha256::digest(b"fixture\n"));
     executable(
@@ -613,7 +646,7 @@ esac
     { printf 'container'; printf '\t%s' "$@"; printf '\n'; } >>"$CALLS"
 case "$*" in
  'image inspect ubuntu@sha256:'*) printf '[]\n';;
- 'image inspect gascan-workspace:fixture') printf '[{"id":"%064d","configuration":{"name":"gascan-workspace:fixture","descriptor":{"digest":"sha256:%064d"}},"variants":[{"platform":{"os":"linux","architecture":"arm64"},"digest":"sha256:%064d"}]}]\n' 9 9 8;;
+ 'image inspect gascan-workspace:fixture') printf '%064d\n' 0 >"$FINGERPRINT"; printf '[{"id":"%064d","configuration":{"name":"gascan-workspace:fixture","descriptor":{"digest":"sha256:%064d"}},"variants":[{"platform":{"os":"linux","architecture":"arm64"},"digest":"sha256:%064d"}]}]\n' 9 9 8;;
  build*) exit 0;;
  *) exit 92;;
 esac
@@ -633,6 +666,7 @@ esac
         .env("ARTIFACTS", repo.join(".artifacts"))
         .env("VALIDATOR", env!("CARGO_BIN_EXE_validate-connected-build"))
         .env("SANITIZER", env!("CARGO_BIN_EXE_sanitize-build-output"))
+        .env("FINGERPRINT", context.join("workspace-source.sha256"))
         .env("BENIGN_BUILD_LABEL", "public-build")
         .env("BUILD_PASSWORD_POLICY", "minimum-length-20")
         .env("BUILD_SECRETARY", "release-coordinator")
@@ -655,7 +689,11 @@ esac
         reference,
         format!("gascan-workspace:fixture@sha256:{}\n", "0".repeat(63) + "9")
     );
-    assert!(repo.join(".artifacts/workspace-image-build.json").exists());
+    let receipt = fs::read_to_string(repo.join(".artifacts/workspace-image-build.json")).unwrap();
+    assert!(
+        receipt.contains(&format!("\"source_digest\":\"{}\"", "d".repeat(64))),
+        "receipt sampled post-seal live source bytes: {receipt}"
+    );
 }
 
 #[test]
@@ -679,6 +717,22 @@ fn persistent_direct_context_mutation_during_build_blocks_receipt_publication() 
     )
     .unwrap();
     populate_minimal_workstation(&repo, &source_artifacts);
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args(["add", "images/workspace"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
     fs::copy(
         root().join("scripts/build-connected-workspace-image.sh"),
         repo.join("scripts/build-connected-workspace-image.sh"),
@@ -955,9 +1009,10 @@ fn receipt_pair_validator_rejects_cross_file_identity_mismatch() {
     let exact = format!("gascan-workspace:locked@{image}");
     fs::write(&reference, format!("{exact}\n")).unwrap();
     let valid = format!(
-        r#"{{"reference":"{exact}","tag":"gascan-workspace:locked","platform":"linux/arm64","lock_digest":"{}","context_digest":"{}","image_digest":"{image}","status":"succeeded"}}"#,
+        r#"{{"reference":"{exact}","tag":"gascan-workspace:locked","platform":"linux/arm64","lock_digest":"{}","context_digest":"{}","source_digest":"{}","image_digest":"{image}","status":"succeeded"}}"#,
         "b".repeat(64),
-        "c".repeat(64)
+        "c".repeat(64),
+        "e".repeat(64)
     );
     let run = |body: &str| {
         fs::write(&json, body).unwrap();
@@ -972,6 +1027,8 @@ fn receipt_pair_validator_rejects_cross_file_identity_mismatch() {
     };
     assert!(run(&valid).success());
     assert!(!run(&valid.replace(&"c".repeat(64), &"d".repeat(64))).success());
+    assert!(!run(&valid.replace(&"e".repeat(64), &"E".repeat(64))).success());
+    assert!(!run(&valid.replace(&"e".repeat(64), &format!("{}\\n", "e".repeat(64)))).success());
 }
 
 #[test]
@@ -988,7 +1045,8 @@ fn receipt_pair_validator_accepts_only_the_approved_ghcr_namespace() {
         fs::write(
             &receipt_file,
             format!(
-                r#"{{"reference":"{reference}","tag":"{tag}","platform":"linux/arm64","lock_digest":"{lock_digest}","context_digest":"{context_digest}","image_digest":"{image_digest}","status":"succeeded"}}"#
+                r#"{{"reference":"{reference}","tag":"{tag}","platform":"linux/arm64","lock_digest":"{lock_digest}","context_digest":"{context_digest}","source_digest":"{}","image_digest":"{image_digest}","status":"succeeded"}}"#,
+                "e".repeat(64)
             ),
         )
         .unwrap();
@@ -1107,13 +1165,15 @@ fn every_image_consumer_rejects_each_receipt_identity_mismatch_before_container_
     );
     let context_digest = format!("{:x}", Sha256::digest(b"consumer-fixture\n"));
     let valid = format!(
-        r#"{{"reference":"{reference}","tag":"{tag}","platform":"linux/arm64","lock_digest":"{lock_digest}","context_digest":"{context_digest}","image_digest":"{image}","status":"succeeded"}}"#
+        r#"{{"reference":"{reference}","tag":"{tag}","platform":"linux/arm64","lock_digest":"{lock_digest}","context_digest":"{context_digest}","source_digest":"{}","image_digest":"{image}","status":"succeeded"}}"#,
+        "e".repeat(64)
     );
     let mismatches = [
         valid.replacen(tag, "gascan-workspace:wrong", 1),
         valid.replacen(&image, &format!("sha256:{}", "b".repeat(64)), 1),
         valid.replacen(&context_digest, &"c".repeat(64), 1),
         valid.replacen(&lock_digest, &"d".repeat(64), 1),
+        valid.replacen(&"e".repeat(64), &"E".repeat(64), 1),
     ];
     let container = temp.path().join("container");
     let called = temp.path().join("called");
@@ -1178,7 +1238,16 @@ fn fake_runner_failure_matrix_detects_context_mutation_and_never_commits_an_inva
         .unwrap();
         let base = "ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab";
         fs::write(repo.join("images/workspace/versions.lock"), format!("workspace_build_mode = \"connected\"\nbase_image = \"{base}\"\nworkspace_tag = \"gascan-workspace:fixture\"\n[gascamp]\nrevision = \"f6b248c5926240856dbea83d1d2c5c90ea1c1456\"\n")).unwrap();
+        executable(
+            &repo.join("scripts/workspace-image-source-digest.sh"),
+            &format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", "e".repeat(64)),
+        );
         fs::write(context.join("Dockerfile"), "FROM scratch\n").unwrap();
+        fs::write(
+            context.join("workspace-source.sha256"),
+            format!("{}\n", "e".repeat(64)),
+        )
+        .unwrap();
         fs::write(context.join("context-manifest.tsv"), "fixture\n").unwrap();
         let manifest = format!("{:x}", Sha256::digest(b"fixture\n"));
         executable(
@@ -1260,7 +1329,7 @@ destination=${@: -1}; case "$FAULT:$destination" in fail_json:*/workspace-image-
                 format!("{old_reference}\n"),
             )
             .unwrap();
-            fs::write(repo.join(".artifacts/workspace-image-build.json"), format!(r#"{{"reference":"{old_reference}","tag":"gascan-workspace:fixture","platform":"linux/arm64","lock_digest":"{lock_digest}","context_digest":"{manifest}","image_digest":"{old_image}","status":"succeeded"}}"#)).unwrap();
+            fs::write(repo.join(".artifacts/workspace-image-build.json"), format!(r#"{{"reference":"{old_reference}","tag":"gascan-workspace:fixture","platform":"linux/arm64","lock_digest":"{lock_digest}","context_digest":"{manifest}","source_digest":"{}","image_digest":"{old_image}","status":"succeeded"}}"#, "e".repeat(64))).unwrap();
             assert!(
                 Command::new(validator)
                     .arg("validate-receipt")

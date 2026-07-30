@@ -18,8 +18,8 @@ if test -n "${GASCAN_E2E_CANDIDATE_IMAGE_FILE:-}"; then
   }
   IFS= read -r candidate_image <"$GASCAN_E2E_CANDIDATE_IMAGE_FILE"
   printf '%s\n' "$candidate_image" |
-    grep -Eq '^gascan-workspace:[a-zA-Z0-9._-]+@sha256:[0-9a-f]{64}$' || {
-      printf 'apple e2e: candidate receipt is not a local immutable image\n' >&2
+    grep -Eq '^[a-z0-9]([a-z0-9._-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)*:[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}@sha256:[0-9a-f]{64}$' || {
+      printf 'apple e2e: candidate receipt is not an immutable image\n' >&2
       exit 1
   }
   candidate_runtime_image=${candidate_image%%@sha256:*}

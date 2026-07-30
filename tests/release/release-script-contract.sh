@@ -102,6 +102,83 @@ grep -Fq "$workspace_version" <<<"$mismatch" || {
 gascan_gate_version "$repo_root" "$workspace_version" >/dev/null || {
   printf 'the workspace version was rejected\n' >&2; exit 1; }
 
+# The image approval is valid only for the exact source tree it records. These
+# fixtures run the gate itself; changing the comparison, validation, or error
+# branch makes one of the checks below fail.
+mkdir -p "$fixture/images/workspace" "$fixture/scripts"
+printf '%064d\n' 0 >"$fixture/images/workspace/approved-source.sha256"
+source_digest="$fixture/scripts/workspace-image-source-digest.sh"
+cat >"$source_digest" <<'EOF_DIGEST'
+#!/bin/sh
+printf '%064d\n' 0
+EOF_DIGEST
+chmod 0755 "$source_digest"
+gascan_gate_workspace_image_source "$fixture"
+
+rm "$fixture/images/workspace/approved-source.sha256"
+set +e
+missing_source=$(gascan_gate_workspace_image_source "$fixture" 2>&1 >/dev/null)
+missing_source_code=$?
+set -e
+[[ $missing_source_code -eq 65 ]] || {
+  printf 'missing workspace image source fingerprint exited %s, not 65\n' \
+    "$missing_source_code" >&2; exit 1; }
+grep -Fq 'rebuild, live-test, and approve' <<<"$missing_source" || {
+  printf 'missing source fingerprint lacks remediation: %s\n' "$missing_source" >&2; exit 1; }
+
+printf 'not-a-source-fingerprint\n' >"$fixture/images/workspace/approved-source.sha256"
+set +e
+nonhex_source=$(gascan_gate_workspace_image_source "$fixture" 2>&1 >/dev/null)
+nonhex_source_code=$?
+set -e
+[[ $nonhex_source_code -eq 65 ]] || {
+  printf 'non-hex workspace image source fingerprint exited %s, not 65\n' \
+    "$nonhex_source_code" >&2; exit 1; }
+grep -Fq 'rebuild, live-test, and approve' <<<"$nonhex_source" || {
+  printf 'non-hex source fingerprint lacks remediation: %s\n' "$nonhex_source" >&2; exit 1; }
+
+# A fingerprint is one canonical line. Removing embedded or trailing newlines
+# before validation makes both of these malformed approvals look valid.
+printf '%032d\n%032d\n' 0 0 >"$fixture/images/workspace/approved-source.sha256"
+set +e
+split_source=$(gascan_gate_workspace_image_source "$fixture" 2>&1 >/dev/null)
+split_source_code=$?
+set -e
+[[ $split_source_code -eq 65 ]] || {
+  printf 'split-line workspace image source fingerprint passed\n' >&2; exit 1; }
+grep -Fq 'rebuild, live-test, and approve' <<<"$split_source" || {
+  printf 'split-line source fingerprint lacks remediation: %s\n' "$split_source" >&2; exit 1; }
+
+printf '%064d\n\n' 0 >"$fixture/images/workspace/approved-source.sha256"
+set +e
+extra_line_source=$(gascan_gate_workspace_image_source "$fixture" 2>&1 >/dev/null)
+extra_line_source_code=$?
+set -e
+[[ $extra_line_source_code -eq 65 ]] || {
+  printf 'extra-line workspace image source fingerprint passed\n' >&2; exit 1; }
+grep -Fq 'rebuild, live-test, and approve' <<<"$extra_line_source" || {
+  printf 'extra-line source fingerprint lacks remediation: %s\n' "$extra_line_source" >&2; exit 1; }
+
+printf '%064d\0' 0 >"$fixture/images/workspace/approved-source.sha256"
+set +e
+nul_suffix_source=$(gascan_gate_workspace_image_source "$fixture" 2>&1 >/dev/null)
+nul_suffix_source_code=$?
+set -e
+[[ $nul_suffix_source_code -eq 65 ]] || {
+  printf 'NUL-suffix workspace image source fingerprint passed\n' >&2; exit 1; }
+grep -Fq 'rebuild, live-test, and approve' <<<"$nul_suffix_source" || {
+  printf 'NUL-suffix source fingerprint lacks remediation: %s\n' "$nul_suffix_source" >&2; exit 1; }
+
+printf '%064d\n' 1 >"$fixture/images/workspace/approved-source.sha256"
+set +e
+stale_source=$(gascan_gate_workspace_image_source "$fixture" 2>&1 >/dev/null)
+stale_source_code=$?
+set -e
+[[ $stale_source_code -eq 65 ]] || {
+  printf 'stale workspace image source fingerprint passed\n' >&2; exit 1; }
+grep -Fq 'rebuild, live-test, and approve' <<<"$stale_source" || {
+  printf 'stale source fingerprint lacks remediation: %s\n' "$stale_source" >&2; exit 1; }
+
 # gascan_gate_github and the discrimination gascan_gate_no_release now does:
 # a gh that cannot answer -- auth failure, rate limit, network outage -- must
 # never be read as "no release exists". Exercised with a stub gh rather than a
@@ -860,11 +937,35 @@ publish_call_line=$(grep -Fn 'packaging/macos/publish.sh" "$package"' "$release"
 # current workspace version, so it never reaches gascan_gate_github either.
 # Reach it with a disposable clone that DOES carry a valid signed tag, pushed
 # to a throwaway bare remote so this never touches the real repository's refs.
+sync_release_fixture_sources() {
+  local root=$1 source
+  for source in release-common.sh release-gates.sh release.sh; do
+    cp "$repo_root/packaging/macos/$source" "$root/packaging/macos/$source"
+  done
+  git -C "$root" add packaging/macos/release-common.sh packaging/macos/release-gates.sh \
+    packaging/macos/release.sh
+  if ! git -C "$root" diff --cached --quiet; then
+    git -C "$root" -c commit.gpgsign=false -c user.name=release \
+      -c user.email=release@example.invalid commit --quiet -m 'fixture release gates'
+  fi
+}
+
 authcheck_origin=$fixture/authcheck-origin.git
 authcheck_clone=$fixture/authcheck-clone
 git init --quiet --bare --initial-branch=main "$authcheck_origin"
 git clone --quiet "$repo_root" "$authcheck_clone"
 git -C "$authcheck_clone" remote set-url origin "$authcheck_origin"
+sync_release_fixture_sources "$authcheck_clone"
+# The release fixture must carry the same source fingerprint the production
+# gate requires. It is committed before tagging so source-cleanliness and tag
+# checks reach the GitHub gate that this fixture is otherwise about.
+authcheck_source_digest=$("$authcheck_clone/scripts/workspace-image-source-digest.sh" "$authcheck_clone")
+printf '%s\n' "$authcheck_source_digest" >"$authcheck_clone/images/workspace/approved-source.sha256"
+git -C "$authcheck_clone" add images/workspace/approved-source.sha256
+if ! git -C "$authcheck_clone" diff --cached --quiet; then
+  git -C "$authcheck_clone" -c commit.gpgsign=false -c user.name=release \
+    -c user.email=release@example.invalid commit --quiet -m 'fixture workspace image source approval'
+fi
 ssh-keygen -q -t ed25519 -N '' -C release@example.invalid -f "$fixture/authcheck-key"
 printf 'release@example.invalid %s\n' "$(cat "$fixture/authcheck-key.pub")" \
   >"$fixture/authcheck-allowed-signers"
@@ -881,6 +982,8 @@ git -C "$authcheck_clone" push --quiet origin "refs/tags/v$workspace_version"
 
 authcheck_bin=$fixture/authcheck-bin
 mkdir -p "$authcheck_bin"
+authcheck_log=$fixture/authcheck-commands.log
+: >"$authcheck_log"
 cat >"$authcheck_bin/gh" <<'STUB_GH_AUTHCHECK'
 #!/usr/bin/env bash
 case "${1:-} ${2:-}" in
@@ -890,10 +993,17 @@ esac
 exit 0
 STUB_GH_AUTHCHECK
 chmod +x "$authcheck_bin/gh"
+cat >"$authcheck_bin/git" <<'STUB_GIT_AUTHCHECK'
+#!/usr/bin/env bash
+printf 'git %s\n' "$*" >>"${GASCAN_AUTHCHECK_LOG:?}"
+exec /usr/bin/git "$@"
+STUB_GIT_AUTHCHECK
+chmod +x "$authcheck_bin/git"
 
 set +e
 # shellcheck disable=SC2031 # this PATH override is its own command prefix, independent of the earlier subshell's
 authcheck_out=$(PATH=$authcheck_bin:$PATH \
+  GASCAN_AUTHCHECK_LOG="$authcheck_log" \
   GASCAN_CODESIGN_IDENTITY=x GASCAN_INSTALLER_SIGNING_IDENTITY=x \
   GASCAN_NOTARYTOOL_PROFILE=x GASCAN_TAP_PATH="$fixture" \
   GASCAN_STUB_GH_AUTH_CODE=1 \
@@ -905,6 +1015,14 @@ set -e
 grep -Fq 'gh auth login' <<<"$authcheck_out" || {
   printf 'release.sh --check did not name gh auth login when unauthenticated: %s\n' \
     "$authcheck_out" >&2
+  exit 1; }
+# This is the release-driver mutation check for the freshness gate. The
+# digest command's `git ls-files -z -- images/workspace` is unique to that
+# gate; deleting the release.sh call leaves the GitHub refusal intact but
+# removes this recorded observation.
+grep -Fq 'ls-files -z -- images/workspace' "$authcheck_log" || {
+  printf 'release.sh --check never ran the workspace image freshness gate: %s\n' \
+    "$(cat "$authcheck_log")" >&2
   exit 1; }
 
 # `--check` renders the cask with a placeholder digest and runs `ruby -c` and
@@ -920,6 +1038,14 @@ probecheck_clone=$fixture/probecheck-clone
 git init --quiet --bare --initial-branch=main "$probecheck_origin"
 git clone --quiet "$repo_root" "$probecheck_clone"
 git -C "$probecheck_clone" remote set-url origin "$probecheck_origin"
+sync_release_fixture_sources "$probecheck_clone"
+probecheck_source_digest=$("$probecheck_clone/scripts/workspace-image-source-digest.sh" "$probecheck_clone")
+printf '%s\n' "$probecheck_source_digest" >"$probecheck_clone/images/workspace/approved-source.sha256"
+git -C "$probecheck_clone" add images/workspace/approved-source.sha256
+if ! git -C "$probecheck_clone" diff --cached --quiet; then
+  git -C "$probecheck_clone" -c commit.gpgsign=false -c user.name=release \
+    -c user.email=release@example.invalid commit --quiet -m 'fixture workspace image source approval'
+fi
 ssh-keygen -q -t ed25519 -N '' -C release@example.invalid -f "$fixture/probecheck-key"
 printf 'release@example.invalid %s\n' "$(cat "$fixture/probecheck-key.pub")" \
   >"$fixture/probecheck-allowed-signers"

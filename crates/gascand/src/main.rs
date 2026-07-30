@@ -100,12 +100,11 @@ fn validate_e2e_candidate_mapping(
     immutable: String,
     runtime: String,
 ) -> Result<E2eCandidateMapping, Box<dyn std::error::Error>> {
+    let exact_runtime = immutable
+        .rsplit_once("@sha256:")
+        .map(|(runtime, _)| runtime);
     if !gascan_core::runtime::immutable_image_reference(&immutable)
-        || !runtime.starts_with("gascan-workspace:")
-        || runtime.contains('/')
-        || immutable
-            .strip_prefix(&runtime)
-            .is_none_or(|suffix| !suffix.starts_with("@sha256:"))
+        || exact_runtime != Some(runtime.as_str())
     {
         return Err("invalid E2E candidate image mapping".into());
     }
@@ -614,6 +613,9 @@ mod e2e_candidate_tests {
     const IMMUTABLE: &str = "gascan-workspace:candidate@sha256:\
         aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const RUNTIME: &str = "gascan-workspace:candidate";
+    const PUBLIC_IMMUTABLE: &str = "ghcr.io/liquescent-development/gascan/workspace:candidate@sha256:\
+         aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const PUBLIC_RUNTIME: &str = "ghcr.io/liquescent-development/gascan/workspace:candidate";
 
     fn runner() -> Result<E2eProcessRunner, Box<dyn std::error::Error>> {
         Ok(E2eProcessRunner {
@@ -707,16 +709,87 @@ mod e2e_candidate_tests {
     }
 
     #[test]
-    fn rejects_mismatched_or_nonlocal_runtime_images() {
-        for runtime in [
-            "gascan-workspace:other",
-            "ghcr.io/example/gascan-workspace:candidate",
-            "example/gascan-workspace:candidate",
-        ] {
-            assert!(
-                validate_e2e_candidate_mapping(IMMUTABLE.to_owned(), runtime.to_owned()).is_err()
-            );
-        }
+    fn public_candidate_rewrites_only_the_exact_matching_run_image()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mapping =
+            validate_e2e_candidate_mapping(PUBLIC_IMMUTABLE.to_owned(), PUBLIC_RUNTIME.to_owned())?;
+        let runner = E2eProcessRunner::with_candidate_runner(mapping, ProcessRunner);
+        let create = CommandSpec::new("container", ["run", "--detach", PUBLIC_IMMUTABLE]);
+
+        assert_eq!(
+            runner.rewrite(create).args,
+            ["run", "--detach", PUBLIC_RUNTIME]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn public_candidate_rehydrates_exact_runtime_and_digest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mapping =
+            validate_e2e_candidate_mapping(PUBLIC_IMMUTABLE.to_owned(), PUBLIC_RUNTIME.to_owned())?;
+        let matching = serde_json::to_vec(&serde_json::json!([{
+            "configuration": {
+                "image": {
+                    "reference": PUBLIC_RUNTIME,
+                    "descriptor": {
+                        "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    }
+                }
+            }
+        }]))?;
+
+        let rehydrated: serde_json::Value =
+            serde_json::from_slice(&rehydrate_e2e_inspect(matching, &mapping))?;
+        assert_eq!(
+            rehydrated[0]["configuration"]["image"]["reference"],
+            PUBLIC_IMMUTABLE
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn public_candidate_wrong_digest_remains_unchanged() -> Result<(), Box<dyn std::error::Error>> {
+        let mapping =
+            validate_e2e_candidate_mapping(PUBLIC_IMMUTABLE.to_owned(), PUBLIC_RUNTIME.to_owned())?;
+        let wrong_digest = serde_json::to_vec(&serde_json::json!([{
+            "configuration": {
+                "image": {
+                    "reference": PUBLIC_RUNTIME,
+                    "descriptor": {
+                        "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    }
+                }
+            }
+        }]))?;
+
+        assert_eq!(
+            rehydrate_e2e_inspect(wrong_digest.clone(), &mapping),
+            wrong_digest
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn public_candidate_rejects_mismatched_runtime_identity() {
+        assert!(
+            validate_e2e_candidate_mapping(
+                PUBLIC_IMMUTABLE.to_owned(),
+                "ghcr.io/liquescent-development/gascan/workspace:other".to_owned(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_mismatched_runtime_image() {
+        assert!(
+            validate_e2e_candidate_mapping(
+                IMMUTABLE.to_owned(),
+                "gascan-workspace:other".to_owned(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
