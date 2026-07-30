@@ -43,8 +43,8 @@ pub use socket::{OwnedSocket, PeerUid, PeerUidMismatch, SocketPaths, validate_pe
 pub use ssh::{
     ActiveSsh, HostIdentity, ManagedSshHost, PortReservation, PreparedSshCreate, PreparedSshFiles,
     PublishedSshSnapshot, SshConfigCommitError, SshConfigCommitFault, SshError, SshManager,
-    SshPaths, commit_openssh_files, ensure_host_identity, prepare_openssh_files,
-    publish_openssh_files, readiness_ssh_args,
+    SshPaths, SshReadinessPolicy, commit_openssh_files, ensure_host_identity,
+    prepare_openssh_files, publish_openssh_files, readiness_ssh_args,
 };
 
 pub use reconcile::{ReconcileFinding, ReconcileReport};

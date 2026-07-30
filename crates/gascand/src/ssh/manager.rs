@@ -22,13 +22,13 @@ use std::ffi::OsStr;
 use std::net::{IpAddr, Ipv4Addr};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::sync::OwnedMutexGuard;
+use tokio::time::sleep;
 
 const CONFIG_NAME: &str = "config";
 const SSH_CLIENT: &str = "/usr/bin/ssh";
-const READINESS_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const HOST_KEY_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_HOST_KEY_OUTPUT: usize = 16 * 1024;
 const HOST_KEY_PATH: &str = "/home/workspace/.config/gascan/ssh/host/ssh_host_ed25519_key.pub";
@@ -97,6 +97,24 @@ impl PreparedSshActivation {
 }
 
 pub struct SshManager;
+
+#[derive(Clone, Copy)]
+#[doc(hidden)]
+pub struct SshReadinessPolicy {
+    pub deadline: Duration,
+    pub retry_delay: Duration,
+    pub maximum_stderr: usize,
+}
+
+impl Default for SshReadinessPolicy {
+    fn default() -> Self {
+        Self {
+            deadline: Duration::from_secs(15),
+            retry_delay: Duration::from_millis(100),
+            maximum_stderr: 4096,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct PublishedSshSnapshot {
@@ -230,6 +248,53 @@ impl SshManager {
         readiness_program: &Utf8Path,
         host_key_timeout: Duration,
     ) -> Result<Option<PreparedSshActivation>, ServiceError> {
+        self.prepare_activation_for_paths_with_policy_inner(
+            id,
+            runtime,
+            expected,
+            paths,
+            readiness_program,
+            host_key_timeout,
+            SshReadinessPolicy::default(),
+        )
+        .await
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn prepare_activation_for_paths_with_policy(
+        &self,
+        id: &SandboxId,
+        runtime: &impl RuntimeBackend,
+        expected: Option<&SshResolution>,
+        paths: &SshPaths,
+        readiness_program: &Utf8Path,
+        host_key_timeout: Duration,
+        policy: SshReadinessPolicy,
+    ) -> Result<bool, ServiceError> {
+        self.prepare_activation_for_paths_with_policy_inner(
+            id,
+            runtime,
+            expected,
+            paths,
+            readiness_program,
+            host_key_timeout,
+            policy,
+        )
+        .await
+        .map(|activation| activation.is_some())
+    }
+
+    async fn prepare_activation_for_paths_with_policy_inner(
+        &self,
+        id: &SandboxId,
+        runtime: &impl RuntimeBackend,
+        expected: Option<&SshResolution>,
+        paths: &SshPaths,
+        readiness_program: &Utf8Path,
+        host_key_timeout: Duration,
+        policy: SshReadinessPolicy,
+    ) -> Result<Option<PreparedSshActivation>, ServiceError> {
         if expected.is_some_and(|resolution| !resolution_enabled(resolution)) {
             return Ok(None);
         }
@@ -244,11 +309,15 @@ impl SshManager {
         hosts.push(managed.clone());
         let prepared = prepare_openssh_files(paths, &identity, &hosts)
             .map_err(ServiceError::SshConfigUnsafe)?;
+        let endpoint = format!("{}:{}", managed.active.host, managed.active.port);
+        let args = readiness_ssh_args(paths, &identity, &managed, prepared.known_hosts())
+            .await
+            .map_err(ServiceError::SshConfigUnsafe)?;
         run_readiness(
             readiness_program.as_std_path().as_os_str(),
-            readiness_ssh_args(paths, &identity, &managed, prepared.known_hosts())
-                .await
-                .map_err(ServiceError::SshConfigUnsafe)?,
+            &args,
+            &endpoint,
+            policy,
         )
         .await?;
         Ok(Some(PreparedSshActivation {
@@ -278,11 +347,15 @@ impl SshManager {
             verified_managed_host(id, runtime, Some(expected), &identity, host_key_timeout).await?;
         let prepared = prepare_openssh_files(paths, &identity, std::slice::from_ref(&managed))
             .map_err(ServiceError::SshConfigUnsafe)?;
+        let endpoint = format!("{}:{}", managed.active.host, managed.active.port);
+        let args = readiness_ssh_args(paths, &identity, &managed, prepared.known_hosts())
+            .await
+            .map_err(ServiceError::SshConfigUnsafe)?;
         run_readiness(
             readiness_program.as_std_path().as_os_str(),
-            readiness_ssh_args(paths, &identity, &managed, prepared.known_hosts())
-                .await
-                .map_err(ServiceError::SshConfigUnsafe)?,
+            &args,
+            &endpoint,
+            SshReadinessPolicy::default(),
         )
         .await?;
         Ok(Some(managed))
@@ -498,7 +571,7 @@ async fn verified_managed_host(
         return Err(ServiceError::Ownership(id.clone()));
     }
     if inspected.state != ContainerState::Running {
-        return Err(ServiceError::SshNotReady(
+        return Err(ServiceError::ssh_not_ready(
             "SSH activation requires a running sandbox",
         ));
     }
@@ -506,14 +579,14 @@ async fn verified_managed_host(
         .ports()
         .iter()
         .filter(|mapping| mapping.guest_port == 22);
-    let mapping = mappings.next().ok_or(ServiceError::SshNotReady(
+    let mapping = mappings.next().ok_or(ServiceError::ssh_not_ready(
         "runtime inspection is missing the native SSH mapping",
     ))?;
     if mappings.next().is_some()
         || mapping.host_address != IpAddr::V4(Ipv4Addr::LOCALHOST)
         || mapping.host_port < 1024
     {
-        return Err(ServiceError::SshNotReady(
+        return Err(ServiceError::ssh_not_ready(
             "runtime inspection has an invalid native SSH mapping",
         ));
     }
@@ -601,25 +674,93 @@ async fn read_host_public_key_inner(
     ))
 }
 
-async fn run_readiness(program: &OsStr, args: Vec<std::ffi::OsString>) -> Result<(), ServiceError> {
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let status = tokio::time::timeout(READINESS_TIMEOUT, command.status())
-        .await
-        .map_err(|_| ServiceError::SshNotReady("strict SSH readiness timed out"))?
-        .map_err(|_| ServiceError::SshNotReady("strict SSH readiness could not start"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(ServiceError::SshNotReady(
-            "strict SSH readiness command failed",
-        ))
+async fn run_readiness(
+    program: &OsStr,
+    args: &[std::ffi::OsString],
+    endpoint: &str,
+    policy: SshReadinessPolicy,
+) -> Result<(), ServiceError> {
+    let deadline = Instant::now() + policy.deadline;
+    let mut last_detail = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        match tokio::time::timeout(remaining, command.output()).await {
+            Ok(Ok(output)) if output.status.success() => return Ok(()),
+            Ok(Ok(output)) => {
+                let detail = bounded_stderr_tail(&output.stderr, policy.maximum_stderr);
+                if !detail.is_empty() {
+                    last_detail = Some(detail);
+                }
+            }
+            Ok(Err(error)) => {
+                return Err(readiness_error(
+                    endpoint,
+                    policy.deadline,
+                    None,
+                    format!("could not start strict SSH readiness: {error}"),
+                ));
+            }
+            Err(_) => {
+                return Err(readiness_error(
+                    endpoint,
+                    policy.deadline,
+                    last_detail,
+                    "strict SSH readiness timed out".to_owned(),
+                ));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(readiness_error(
+                endpoint,
+                policy.deadline,
+                last_detail,
+                "strict SSH readiness did not succeed before its deadline".to_owned(),
+            ));
+        }
+        sleep(
+            policy
+                .retry_delay
+                .min(deadline.saturating_duration_since(Instant::now())),
+        )
+        .await;
+    }
+}
+
+fn bounded_stderr_tail(stderr: &[u8], maximum: usize) -> String {
+    if maximum == 0 {
+        return String::new();
+    }
+    let decoded = String::from_utf8_lossy(stderr);
+    if decoded.len() <= maximum {
+        return decoded.into_owned();
+    }
+    let mut start = decoded.len() - maximum;
+    while !decoded.is_char_boundary(start) {
+        start += 1;
+    }
+    decoded[start..].to_owned()
+}
+
+fn readiness_error(
+    endpoint: &str,
+    deadline: Duration,
+    last_detail: Option<String>,
+    reason: String,
+) -> ServiceError {
+    let stderr_tail = last_detail.unwrap_or_else(|| "no OpenSSH stderr was captured".to_owned());
+    ServiceError::SshNotReady {
+        endpoint: Some(endpoint.to_owned()),
+        detail: format!(
+            "strict SSH readiness for {endpoint} failed within {deadline:?}: {reason}; last OpenSSH stderr tail: {stderr_tail}\nRun `gascan doctor` for managed SSH configuration details."
+        ),
     }
 }
 

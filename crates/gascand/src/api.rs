@@ -1121,7 +1121,7 @@ fn service_error_diagnostic(error: &ServiceError) -> String {
         ServiceError::IncompleteDestroy(_) => "service_kind=incomplete_destroy".to_owned(),
         ServiceError::SshPortUnavailable(_)
         | ServiceError::SshHostKeyMismatch(_)
-        | ServiceError::SshNotReady(_)
+        | ServiceError::SshNotReady { .. }
         | ServiceError::SshConfigUnsafe(_)
         | ServiceError::SshConfigUpdateFailed(_)
         | ServiceError::SshConfigPublicationUncertain(_)

@@ -1,14 +1,21 @@
-use gascan_core::sandbox::SandboxId;
+use camino::Utf8Path;
+use gascan_core::fake_runtime::FakeRuntime;
+use gascan_core::manifest::Manifest;
+use gascan_core::sandbox::{SandboxId, SandboxSpec};
 use gascand::{
-    ActiveSsh, ManagedSshHost, SshManager, SshPaths, SshResolution, ensure_host_identity,
+    ActiveSsh, ManagedSshHost, NoopProvisioner, SandboxService, SshManager, SshPaths,
+    SshReadinessPolicy, SshResolution, Store, UpRequest, ensure_host_identity,
     prepare_openssh_files, publish_openssh_files, readiness_ssh_args,
 };
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::process::Command;
+use std::sync::Arc;
+use std::time::Duration;
 use tempfile::TempDir;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -20,6 +27,89 @@ fn root(temp: &TempDir) -> Result<std::path::PathBuf, std::io::Error> {
 fn paths(temp: &TempDir) -> Result<SshPaths, Box<dyn std::error::Error>> {
     let home = root(temp)?;
     Ok(SshPaths::for_environment(None, Some(home.as_os_str()))?)
+}
+
+async fn booted_readiness_context(
+    temp: &TempDir,
+) -> Result<(FakeRuntime, SandboxId, SshResolution, SshPaths), Box<dyn std::error::Error>> {
+    let root = Utf8Path::from_path(temp.path()).ok_or("temporary root is not UTF-8")?;
+    fs::write(
+        root.join("gascan.toml"),
+        "version = 1\nnetwork = 'networked'\n[ssh]\nhost_port = 24242\n",
+    )?;
+    let spec = SandboxSpec::from_root("readiness", root, Manifest::load(root)?)?;
+    let ssh_paths = paths(temp)?;
+    let host = TempDir::new()?;
+    let host_key = ensure_host_identity(&paths(&host)?)
+        .await?
+        .public_key()
+        .to_owned();
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    runtime.queue_created_ssh_host_port(24_242).await;
+    let service = SandboxService::new_with_ssh_for_tests(
+        runtime.clone(),
+        Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+        ssh_paths.clone(),
+        "/usr/bin/true".into(),
+    );
+    service.up(UpRequest::new(spec.clone())).await?;
+    let resolution = service
+        .status(spec.id())?
+        .and_then(|record| record.ssh_resolution)
+        .ok_or("booted sandbox has no SSH resolution")?;
+    Ok((runtime, spec.id().clone(), resolution, ssh_paths))
+}
+
+fn executable_script(
+    root: &Utf8Path,
+    name: &str,
+    body: &str,
+) -> Result<camino::Utf8PathBuf, Box<dyn std::error::Error>> {
+    let path = root.join(name);
+    fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}\n"))?;
+    fs::set_permissions(path.as_std_path(), fs::Permissions::from_mode(0o755))?;
+    Ok(path)
+}
+
+fn strict_readiness_argv(paths: &SshPaths, id: &SandboxId, known_hosts: &str) -> Vec<OsString> {
+    vec![
+        "-F".into(),
+        "/dev/null".into(),
+        "-o".into(),
+        "HostName=127.0.0.1".into(),
+        "-o".into(),
+        "Port=24242".into(),
+        "-o".into(),
+        "User=workspace".into(),
+        "-o".into(),
+        format!("IdentityFile={}", paths.private_key()).into(),
+        "-o".into(),
+        format!("HostKeyAlias=gascan-{id}").into(),
+        "-o".into(),
+        format!("UserKnownHostsFile={known_hosts}").into(),
+        "-o".into(),
+        "StrictHostKeyChecking=yes".into(),
+        "-o".into(),
+        "IdentitiesOnly=yes".into(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "ForwardAgent=no".into(),
+        "-o".into(),
+        "ClearAllForwardings=yes".into(),
+        "127.0.0.1".into(),
+        "/usr/bin/true".into(),
+    ]
+}
+
+fn nul_terminated_args(args: &[OsString]) -> Vec<u8> {
+    args.iter()
+        .flat_map(|argument| argument.as_os_str().as_bytes().iter().copied().chain([0]))
+        .collect()
 }
 
 fn host(alias: &str, port: u16, identity: &gascand::HostIdentity) -> ManagedSshHost {
@@ -318,6 +408,115 @@ async fn readiness_args_are_discrete_and_do_not_weaken_reusable_config() -> Test
         );
     }
     assert!(!paths.config().exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn readiness_retries_transient_failure_with_identical_strict_argv() -> TestResult {
+    let temp = TempDir::new()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("temporary root is not UTF-8")?;
+    let (runtime, id, resolution, paths) = booted_readiness_context(&temp).await?;
+    let counter = root.join("readiness-counter");
+    let capture = root.join("readiness-argv");
+    let program = executable_script(
+        root,
+        "transient-readiness",
+        &format!(
+            "count=0\n\
+             if [ -f '{}' ]; then read -r count < '{}'; fi\n\
+             count=$((count + 1))\n\
+             printf '%s\\n' \"$count\" > '{}'\n\
+             printf '%s\\0' \"$@\" >> '{}'\n\
+             if [ \"$count\" -lt 3 ]; then\n\
+                 printf 'connection refused\\n' >&2\n\
+                 exit 255\n\
+             fi",
+            counter, counter, counter, capture
+        ),
+    )?;
+    let config = fs::read_to_string(paths.config())?;
+    let known_hosts = configured_known_hosts(&config)?.to_owned();
+    let expected = strict_readiness_argv(&paths, &id, &known_hosts);
+
+    let activated = SshManager
+        .prepare_activation_for_paths_with_policy(
+            &id,
+            &runtime,
+            Some(&resolution),
+            &paths,
+            &program,
+            Duration::from_secs(1),
+            SshReadinessPolicy {
+                deadline: Duration::from_millis(500),
+                retry_delay: Duration::from_millis(10),
+                maximum_stderr: 128,
+            },
+        )
+        .await?;
+
+    assert!(activated);
+    assert_eq!(fs::read_to_string(counter)?.trim(), "3");
+    assert_eq!(
+        fs::read(&capture)?,
+        nul_terminated_args(&expected).repeat(3)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn readiness_reports_bounded_lossy_final_stderr_tail_after_deadline() -> TestResult {
+    let temp = TempDir::new()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("temporary root is not UTF-8")?;
+    let (runtime, id, resolution, paths) = booted_readiness_context(&temp).await?;
+    let program = executable_script(
+        root,
+        "failing-readiness",
+        "printf '%096d' 0 >&2\nprintf '\\377Host key verification failed.\\n' >&2\nexit 255",
+    )?;
+
+    let error = SshManager
+        .prepare_activation_for_paths_with_policy(
+            &id,
+            &runtime,
+            Some(&resolution),
+            &paths,
+            &program,
+            Duration::from_secs(1),
+            SshReadinessPolicy {
+                deadline: Duration::from_millis(500),
+                retry_delay: Duration::from_millis(10),
+                maximum_stderr: 64,
+            },
+        )
+        .await
+        .expect_err("permanent readiness failure must not activate SSH");
+    let detail = error.to_string();
+
+    assert_eq!(error.code(), "ssh_not_ready");
+    assert!(
+        detail.contains("127.0.0.1:24242"),
+        "missing endpoint: {detail}"
+    );
+    assert!(detail.contains("500ms"), "missing deadline: {detail}");
+    assert!(
+        detail.contains("Host key verification failed."),
+        "missing final OpenSSH detail: {detail}"
+    );
+    assert!(
+        detail.contains('\u{fffd}'),
+        "stderr was not lossy-decoded: {detail}"
+    );
+    assert!(
+        detail.contains("Run `gascan doctor` for managed SSH configuration details."),
+        "missing recovery instruction: {detail}"
+    );
+    let tail = detail
+        .split("last OpenSSH stderr tail: ")
+        .nth(1)
+        .and_then(|value| value.split("\nRun `gascan doctor`").next())
+        .ok_or("readiness error did not label the stderr tail")?;
+    assert!(tail.len() <= 64, "stderr tail exceeded its bound: {tail:?}");
+    assert!(tail.is_char_boundary(tail.len()));
     Ok(())
 }
 

@@ -22,7 +22,7 @@ pub use config::{
 };
 pub(crate) use identity::validate_host_identity_if_present;
 pub use identity::{HostIdentity, ensure_host_identity};
-pub use manager::{PreparedSshCreate, PublishedSshSnapshot, SshManager};
+pub use manager::{PreparedSshCreate, PublishedSshSnapshot, SshManager, SshReadinessPolicy};
 pub use port::PortReservation;
 
 const DIRECTORY_MODE: u16 = 0o700;

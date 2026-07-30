@@ -457,8 +457,11 @@ pub enum ServiceError {
     SshPortUnavailable(String),
     #[error("SSH host key verification failed: {0}")]
     SshHostKeyMismatch(&'static str),
-    #[error("SSH is not ready: {0}")]
-    SshNotReady(&'static str),
+    #[error("SSH is not ready: {detail}")]
+    SshNotReady {
+        endpoint: Option<String>,
+        detail: String,
+    },
     #[error("SSH configuration is unsafe: {0}")]
     SshConfigUnsafe(crate::SshError),
     #[error("SSH configuration update failed: {0}")]
@@ -691,7 +694,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let prepared =
             self.prepare_ssh_activation(id, expected)
                 .await?
-                .ok_or(ServiceError::SshNotReady(
+                .ok_or(ServiceError::ssh_not_ready(
                     "enabled SSH did not produce activation evidence",
                 ))?;
         let resolution = prepared.resolution();
@@ -756,7 +759,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             return Err(ServiceError::Ownership(id.clone()));
         }
         if runtime.state != ContainerState::Running {
-            return Err(ServiceError::SshNotReady(
+            return Err(ServiceError::ssh_not_ready(
                 "SSH recovery requires a running sandbox",
             ));
         }
@@ -799,7 +802,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             validate_inspected_ssh_policy(policy, port)?;
             expected.push((
                 record.id,
-                record.ssh_resolution.ok_or(ServiceError::SshNotReady(
+                record.ssh_resolution.ok_or(ServiceError::ssh_not_ready(
                     "durable SSH resolution is missing",
                 ))?,
                 Some(port),
@@ -866,12 +869,12 @@ impl<B: RuntimeBackend> SandboxService<B> {
             return PolicyCompiler::restore_ssh_transport(create, None).map_err(Into::into);
         }
         let [mapping] = mappings.as_slice() else {
-            return Err(ServiceError::SshNotReady(
+            return Err(ServiceError::ssh_not_ready(
                 "prior native SSH transport is not uniquely observable",
             ));
         };
         if !mapping.host_address.is_loopback() || mapping.host_port < 1024 {
-            return Err(ServiceError::SshNotReady(
+            return Err(ServiceError::ssh_not_ready(
                 "prior native SSH transport is not uniquely observable",
             ));
         }
@@ -2403,7 +2406,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
                     if ssh_resolution_enabled(record.ssh_resolution.as_ref()) {
                         self.prepare_ssh_activation(id, record.ssh_resolution.as_ref())
                             .await?
-                            .ok_or(ServiceError::SshNotReady(
+                            .ok_or(ServiceError::ssh_not_ready(
                                 "verified SSH resolution did not produce activation evidence",
                             ))?
                             .commit()?;
@@ -3120,7 +3123,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
         if !marked {
             let version = resolution
                 .as_ref()
-                .ok_or(ServiceError::SshNotReady(
+                .ok_or(ServiceError::ssh_not_ready(
                     "recovered SSH resolution is missing",
                 ))?
                 .version;
@@ -3483,6 +3486,13 @@ fn default_doctor_report() -> DoctorReport {
 }
 
 impl ServiceError {
+    pub(crate) fn ssh_not_ready(detail: impl Into<String>) -> Self {
+        Self::SshNotReady {
+            endpoint: None,
+            detail: detail.into(),
+        }
+    }
+
     pub fn code(&self) -> &'static str {
         match self {
             Self::Runtime(error) => error.code(),
@@ -3512,7 +3522,7 @@ impl ServiceError {
             Self::IncompleteDestroy(_) => "incomplete_destroy",
             Self::SshPortUnavailable(_) => "ssh_port_unavailable",
             Self::SshHostKeyMismatch(_) => "ssh_host_key_mismatch",
-            Self::SshNotReady(_) => "ssh_not_ready",
+            Self::SshNotReady { .. } => "ssh_not_ready",
             Self::SshConfigUnsafe(_) => "ssh_config_unsafe",
             Self::SshConfigUpdateFailed(_) => "ssh_config_update_failed",
             Self::SshConfigPublicationUncertain(_) => "ssh_config_publication_uncertain",
@@ -3917,14 +3927,14 @@ fn inspected_native_ssh_port(
         .ports()
         .iter()
         .filter(|mapping| mapping.guest_port == 22);
-    let mapping = mappings.next().ok_or(ServiceError::SshNotReady(
+    let mapping = mappings.next().ok_or(ServiceError::ssh_not_ready(
         "runtime inspection is missing the native SSH mapping",
     ))?;
     if mappings.next().is_some()
         || mapping.host_address != IpAddr::V4(Ipv4Addr::LOCALHOST)
         || mapping.host_port < 1024
     {
-        return Err(ServiceError::SshNotReady(
+        return Err(ServiceError::ssh_not_ready(
             "runtime inspection has an invalid native SSH mapping",
         ));
     }
@@ -3936,7 +3946,7 @@ fn validate_inspected_ssh_policy(
     inspected_port: u16,
 ) -> Result<(), ServiceError> {
     match policy {
-        Some(policy) if !policy.is_enabled() => Err(ServiceError::SshNotReady(
+        Some(policy) if !policy.is_enabled() => Err(ServiceError::ssh_not_ready(
             "durable SSH transport policy is disabled",
         )),
         Some(policy)
@@ -3944,7 +3954,7 @@ fn validate_inspected_ssh_policy(
                 .host_port()
                 .is_some_and(|port| port != inspected_port) =>
         {
-            Err(ServiceError::SshNotReady(
+            Err(ServiceError::ssh_not_ready(
                 "runtime SSH mapping differs from durable explicit port",
             ))
         }
