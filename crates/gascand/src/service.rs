@@ -3472,6 +3472,9 @@ fn replace_doctor_fact(report: &mut DoctorReport, id: &str, fact: DoctorFact) {
     if let Some(check) = report.checks.iter_mut().find(|check| check.id == id) {
         check.status = fact.status;
         check.detail = fact.detail;
+        if let Some(remedy) = fact.remedy {
+            check.remedy = remedy;
+        }
     }
 }
 

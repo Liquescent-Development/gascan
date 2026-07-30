@@ -169,7 +169,7 @@ pub(crate) fn render_doctor(checks: &[DoctorCheck], capabilities: OutputCapabili
                 styled_heading(&humanize(check_id), "✗", false, capabilities)
             };
             let _ = writeln!(output, "    {check_heading}");
-            let detail = human_doctor_detail(check);
+            let detail = &check.detail;
             if !detail.is_empty() {
                 let _ = writeln!(output, "      {detail}");
             }
@@ -179,14 +179,6 @@ pub(crate) fn render_doctor(checks: &[DoctorCheck], capabilities: OutputCapabili
         }
     }
     output
-}
-
-fn human_doctor_detail(check: &DoctorCheck) -> &str {
-    match check.id.as_str() {
-        "ssh.identity" => "Managed SSH identity is missing, incomplete, or unsafe",
-        "ssh.config" => "Managed SSH configuration is missing, inconsistent, or unsafe",
-        _ => &check.detail,
-    }
 }
 
 pub(crate) fn render_status(
@@ -994,29 +986,44 @@ mod tests {
     }
 
     #[test]
-    fn failed_ssh_checks_hide_managed_paths_and_raw_errors() {
+    fn doctor_failed_ssh_checks_preserve_exact_daemon_details_and_remedies() {
         let checks = vec![
             check(
-                "ssh.identity",
+                "ssh.config",
                 "fail",
-                "managed SSH identity at /Users/example/.config/gascan/ssh/identity_ed25519 is unsafe: private-key-sentinel",
-                "restore the managed identity",
+                "generated SSH config at /Users/test/.config/gascan/ssh/config is missing while durable or generated SSH state exists",
+                "run `gascan up`",
             ),
             check(
                 "ssh.config",
                 "fail",
-                "generated SSH config at /Users/example/.config/gascan/ssh/config was rejected: raw-openssh-error",
-                "regenerate the managed config",
+                "generated SSH config at /Users/test/.config/gascan/ssh/config is unsafe: permissions 0666 allow access outside the owner",
+                "repair or remove the unsafe managed SSH path /Users/test/.config/gascan/ssh/config",
+            ),
+            check(
+                "ssh.config",
+                "fail",
+                "generated SSH config at /Users/test/.config/gascan/ssh/config differs from durable SSH state",
+                "run `gascan up`",
             ),
         ];
 
         let output = render_doctor(&checks, OutputCapabilities::plain());
 
-        assert!(output.contains("Managed SSH identity is missing, incomplete, or unsafe"));
-        assert!(output.contains("Managed SSH configuration is missing, inconsistent, or unsafe"));
-        assert!(!output.contains("/Users/example"));
-        assert!(!output.contains("private-key-sentinel"));
-        assert!(!output.contains("raw-openssh-error"));
+        assert!(output.contains(
+            "generated SSH config at /Users/test/.config/gascan/ssh/config is missing while durable or generated SSH state exists"
+        ));
+        assert!(output.contains(
+            "generated SSH config at /Users/test/.config/gascan/ssh/config is unsafe: permissions 0666 allow access outside the owner"
+        ));
+        assert!(output.contains(
+            "generated SSH config at /Users/test/.config/gascan/ssh/config differs from durable SSH state"
+        ));
+        assert!(output.contains("Fix: run `gascan up`"));
+        assert!(output.contains(
+            "Fix: repair or remove the unsafe managed SSH path /Users/test/.config/gascan/ssh/config"
+        ));
+        assert!(!output.contains("Managed SSH configuration is missing, inconsistent, or unsafe"));
     }
 
     #[test]

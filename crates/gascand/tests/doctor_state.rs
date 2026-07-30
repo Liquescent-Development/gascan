@@ -77,6 +77,53 @@ async fn doctor_warning_capability_is_available_and_has_no_finding() -> TestResu
 }
 
 #[tokio::test]
+async fn ssh_doctor_capability_and_json_preserve_exact_detail_and_selected_remedy() -> TestResult {
+    const DETAIL: &str = "generated SSH config at /Users/test/.config/gascan/ssh/config is missing while durable or generated SSH state exists";
+    const REMEDY: &str = "run `gascan up`";
+    let temp = tempfile::tempdir()?;
+    let root = camino::Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    let mut facts = DoctorFacts::all_supported_for_tests();
+    facts.ssh_config = DoctorFact::fail(DETAIL).with_remedy(REMEDY);
+    let report = facts.into_report();
+    let structured = report.check("ssh.config").ok_or("ssh.config")?;
+    assert_eq!(structured.detail, DETAIL);
+    assert_eq!(structured.remedy, REMEDY);
+    let serialized = serde_json::to_value(&report)?;
+    let serialized = serialized["checks"]
+        .as_array()
+        .ok_or("serialized checks")?
+        .iter()
+        .find(|check| check["id"] == "ssh.config")
+        .ok_or("serialized ssh.config")?;
+    assert_eq!(serialized["detail"], DETAIL);
+    assert_eq!(serialized["remedy"], REMEDY);
+    let api = doctor_api_with_report(root, report)?;
+
+    let response = GasCan::doctor(
+        &api,
+        tonic::Request::new(doctor_workspace(root.as_std_path())?),
+    )
+    .await?
+    .into_inner();
+    let capability = response
+        .capabilities
+        .iter()
+        .find(|capability| capability.name == "ssh.config")
+        .ok_or("ssh.config capability missing")?;
+    let decoded: serde_json::Value = serde_json::from_str(&capability.detail)?;
+    assert_eq!(decoded["detail"], DETAIL);
+    assert_eq!(decoded["remedy"], REMEDY);
+    let finding = response
+        .findings
+        .iter()
+        .find(|finding| finding.code == "ssh.config")
+        .ok_or("ssh.config finding missing")?;
+    assert_eq!(finding.message, DETAIL);
+    assert_eq!(finding.details, REMEDY.as_bytes());
+    Ok(())
+}
+
+#[tokio::test]
 async fn refreshed_ssh_doctor_keeps_warning_loopback_publish_nonblocking() -> TestResult {
     let temp = tempfile::tempdir()?;
     let root = camino::Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
@@ -413,13 +460,15 @@ async fn service_doctor_refreshes_managed_ssh_state_after_startup() -> TestResul
         refreshed.check("ssh.config").ok_or("ssh.config")?.status,
         gascan_core::doctor::DoctorStatus::Fail
     );
-    assert!(
-        refreshed
-            .check("ssh.config")
-            .ok_or("ssh.config")?
-            .detail
-            .contains("missing")
+    let config = refreshed.check("ssh.config").ok_or("ssh.config")?;
+    assert_eq!(
+        config.detail,
+        format!(
+            "generated SSH config at {} is missing while durable or generated SSH state exists",
+            paths.config()
+        )
     );
+    assert_eq!(config.remedy, "run `gascan up`");
     Ok(())
 }
 
@@ -448,13 +497,11 @@ async fn ssh_doctor_defers_partial_artifacts_during_first_pending_create() -> Te
 
     assert_eq!(
         facts.identity.status,
-        gascan_core::doctor::DoctorStatus::Unknown
+        gascan_core::doctor::DoctorStatus::Fail
     );
-    assert_eq!(
-        facts.config.status,
-        gascan_core::doctor::DoctorStatus::Unknown
-    );
+    assert_eq!(facts.config.status, gascan_core::doctor::DoctorStatus::Fail);
     assert!(facts.config.detail.contains("lifecycle transition"));
+    assert_eq!(facts.config.remedy.as_deref(), Some("run `gascan up`"));
     Ok(())
 }
 
@@ -487,6 +534,8 @@ async fn ssh_doctor_accepts_absent_managed_state_without_creating_it()
         "{}",
         facts.config.detail
     );
+    assert_eq!(facts.identity.remedy.as_deref(), Some(""));
+    assert_eq!(facts.config.remedy.as_deref(), Some(""));
     assert_eq!(
         facts.native_publish.status,
         gascan_core::doctor::DoctorStatus::Pass
@@ -660,6 +709,8 @@ async fn ssh_doctor_rejects_expected_publication_with_missing_generation() -> Te
         gascan_core::doctor::DoctorStatus::Pass
     );
     assert_eq!(facts.config.status, gascan_core::doctor::DoctorStatus::Fail);
+    assert!(facts.config.detail.contains(paths.config().as_str()));
+    assert_eq!(facts.config.remedy.as_deref(), Some("run `gascan up`"));
     Ok(())
 }
 
@@ -738,6 +789,40 @@ async fn ssh_doctor_rejects_stale_durable_expectation_for_absent_sandbox() -> Te
     );
     assert_eq!(facts.config.status, gascan_core::doctor::DoctorStatus::Fail);
     assert!(facts.config.detail.contains("durable"));
+    assert_eq!(facts.config.remedy.as_deref(), Some("run `gascan up`"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn ssh_doctor_unsafe_config_names_the_exact_path_to_repair_or_remove() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = camino::Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    let home = root.join("home");
+    std::fs::create_dir(&home)?;
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
+    let home = home.canonicalize()?;
+    let paths = SshPaths::for_environment(None, Some(home.as_os_str()))?;
+    let identity = ensure_host_identity(&paths).await?;
+    publish_openssh_files(&paths, &identity, &[])?;
+    std::fs::set_permissions(paths.config(), std::fs::Permissions::from_mode(0o666))?;
+    let store = Store::open(root.join("state.db"))?;
+    let client = root.join("ssh");
+    std::fs::write(&client, "#!/bin/sh\nexit 0\n")?;
+    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755))?;
+
+    let facts =
+        gascand::ssh_doctor_facts_for_paths(&paths, client.as_std_path(), &store, true).await;
+
+    assert_eq!(facts.config.status, gascan_core::doctor::DoctorStatus::Fail);
+    assert!(facts.config.detail.contains(paths.config().as_str()));
+    let expected_remedy = format!(
+        "repair or remove the unsafe managed SSH path {}",
+        paths.config()
+    );
+    assert_eq!(
+        facts.config.remedy.as_deref(),
+        Some(expected_remedy.as_str())
+    );
     Ok(())
 }
 

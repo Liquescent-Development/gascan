@@ -1,12 +1,13 @@
 use crate::SshPaths;
+use crate::service::ServiceError;
 use crate::ssh::manager::resolution_enabled;
 use crate::ssh::{
-    SshManager, managed_ssh_artifacts_present, validate_host_identity_if_present,
+    SshError, SshManager, managed_ssh_artifacts_present, validate_host_identity_if_present,
     validate_managed_config_if_present,
 };
 use crate::store::{ActualState, SshResolution, Store};
 use camino::Utf8Path;
-use gascan_core::doctor::DoctorFact;
+use gascan_core::doctor::{DoctorFact, DoctorStatus};
 use gascan_core::sandbox::SandboxId;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
@@ -19,6 +20,98 @@ pub struct SshDoctorFacts {
     pub identity: DoctorFact,
     pub config: DoctorFact,
     pub native_publish: DoctorFact,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SshDoctorCondition {
+    Ready,
+    NotCreated,
+    Missing,
+    Inconsistent,
+    Unsafe,
+    TransitionPending,
+}
+
+impl SshDoctorCondition {
+    const fn status(self) -> DoctorStatus {
+        match self {
+            Self::Ready | Self::NotCreated => DoctorStatus::Pass,
+            Self::Missing | Self::Inconsistent | Self::Unsafe | Self::TransitionPending => {
+                DoctorStatus::Fail
+            }
+        }
+    }
+
+    fn detail(self, paths: &SshPaths) -> String {
+        match self {
+            Self::Ready => "generated SSH config is accepted by OpenSSH".to_owned(),
+            Self::NotCreated => "generated SSH config has not been published yet".to_owned(),
+            Self::Missing => format!(
+                "generated SSH config at {} is missing while durable or generated SSH state exists",
+                paths.config()
+            ),
+            Self::Inconsistent => format!(
+                "generated SSH config at {} differs from durable SSH state",
+                paths.config()
+            ),
+            Self::Unsafe => {
+                format!("generated SSH config at {} is unsafe", paths.config())
+            }
+            Self::TransitionPending => {
+                "generated SSH config validation is waiting for an active lifecycle transition"
+                    .to_owned()
+            }
+        }
+    }
+
+    fn remedy(self, paths: &SshPaths) -> String {
+        match self {
+            Self::Ready | Self::NotCreated => String::new(),
+            Self::Missing | Self::Inconsistent | Self::TransitionPending => {
+                "run `gascan up`".to_owned()
+            }
+            Self::Unsafe => format!(
+                "repair or remove the unsafe managed SSH path {}",
+                paths.config()
+            ),
+        }
+    }
+
+    fn fact(self, paths: &SshPaths) -> DoctorFact {
+        DoctorFact {
+            status: self.status(),
+            detail: self.detail(paths),
+            remedy: Some(self.remedy(paths)),
+        }
+    }
+
+    fn fact_with_detail(self, paths: &SshPaths, detail: impl Into<String>) -> DoctorFact {
+        DoctorFact {
+            status: self.status(),
+            detail: detail.into(),
+            remedy: Some(self.remedy(paths)),
+        }
+    }
+}
+
+fn identity_fact(
+    condition: SshDoctorCondition,
+    paths: &SshPaths,
+    detail: impl Into<String>,
+) -> DoctorFact {
+    let remedy = if condition == SshDoctorCondition::Unsafe {
+        format!(
+            "repair or remove the unsafe managed SSH path {}",
+            paths.private_key()
+        )
+    } else {
+        condition.remedy(paths)
+    };
+    DoctorFact {
+        status: condition.status(),
+        detail: detail.into(),
+        remedy: Some(remedy),
+    }
 }
 
 /// Inspect the caller-provided workspace for a single Doctor request.
@@ -45,6 +138,7 @@ pub async fn ssh_doctor_facts(store: &Store, native_publish: bool) -> SshDoctorF
                 DoctorFact::fail(format!(
                     "managed SSH state path is unavailable or unsafe: {error}"
                 ))
+                .with_remedy("repair or remove the unsafe managed SSH state path")
             };
             SshDoctorFacts {
                 client: ssh_client_fact(Path::new(SSH_CLIENT)),
@@ -71,6 +165,10 @@ pub async fn ssh_doctor_facts_for_paths(
                 DoctorFact::fail(format!(
                     "managed SSH publication could not be inspected safely: {error}"
                 ))
+                .with_remedy(format!(
+                    "repair or remove the unsafe managed SSH path {}",
+                    paths.directory()
+                ))
             };
             return SshDoctorFacts {
                 client: client_fact,
@@ -89,12 +187,12 @@ pub async fn ssh_doctor_facts_for_paths(
     if transition_pending {
         return SshDoctorFacts {
             client: client_fact,
-            identity: DoctorFact::unknown(
+            identity: identity_fact(
+                SshDoctorCondition::TransitionPending,
+                paths,
                 "managed SSH identity validation is waiting for an active lifecycle transition",
             ),
-            config: DoctorFact::unknown(
-                "generated SSH config validation is waiting for an active lifecycle transition",
-            ),
+            config: SshDoctorCondition::TransitionPending.fact(paths),
             native_publish: native_publish_fact(native_publish),
         };
     }
@@ -104,40 +202,67 @@ pub async fn ssh_doctor_facts_for_paths(
     };
     let (identity, config) = if !requires_complete_state {
         (
-            DoctorFact::pass("managed SSH identity has not been created yet"),
-            DoctorFact::pass("generated SSH config has not been published yet"),
+            identity_fact(
+                SshDoctorCondition::NotCreated,
+                paths,
+                "managed SSH identity has not been created yet",
+            ),
+            SshDoctorCondition::NotCreated.fact(paths),
         )
     } else {
         match validate_host_identity_if_present(paths).await {
             Ok(Some(identity)) => {
-                let identity_fact = DoctorFact::pass(format!(
-                    "managed Ed25519 identity is valid ({})",
-                    identity.fingerprint()
-                ));
+                let identity_fact = identity_fact(
+                    SshDoctorCondition::Ready,
+                    paths,
+                    format!(
+                        "managed Ed25519 identity is valid ({})",
+                        identity.fingerprint()
+                    ),
+                );
                 let config_fact =
                     validate_complete_publication(paths, client, &client_fact, durable, artifacts)
                         .await;
                 (identity_fact, config_fact)
             }
             Ok(None) => (
-                DoctorFact::fail(format!(
-                    "managed SSH identity at {} is missing while durable or generated SSH state exists",
-                    paths.private_key()
-                )),
-                DoctorFact::fail(format!(
-                    "generated SSH config at {} cannot be validated without the complete managed identity",
-                    paths.config()
-                )),
+                identity_fact(
+                    SshDoctorCondition::Missing,
+                    paths,
+                    format!(
+                        "managed SSH identity at {} is missing while durable or generated SSH state exists",
+                        paths.private_key()
+                    ),
+                ),
+                SshDoctorCondition::Inconsistent.fact_with_detail(
+                    paths,
+                    format!(
+                        "generated SSH config at {} cannot be validated without the complete managed identity",
+                        paths.config()
+                    ),
+                ),
             ),
             Err(error) => (
-                DoctorFact::fail(format!(
-                    "managed SSH identity at {} is unsafe: {error}",
-                    paths.private_key()
-                )),
-                DoctorFact::fail(format!(
-                    "generated SSH config at {} cannot be validated because the managed identity is unsafe",
-                    paths.config()
-                )),
+                identity_fact(
+                    SshDoctorCondition::Unsafe,
+                    paths,
+                    format!(
+                        "managed SSH identity at {} is unsafe: {error}",
+                        paths.private_key()
+                    ),
+                ),
+                SshDoctorCondition::Unsafe
+                    .fact_with_detail(
+                        paths,
+                        format!(
+                            "generated SSH config at {} cannot be validated because the managed identity is unsafe",
+                            paths.config()
+                        ),
+                    )
+                    .with_remedy(format!(
+                        "repair or remove the unsafe managed SSH path {}",
+                        paths.private_key()
+                    )),
             ),
         }
     };
@@ -207,46 +332,52 @@ async fn validate_complete_publication(
     let durable = match durable {
         Ok(durable) if durable.consistent => durable,
         Ok(_) => {
-            return DoctorFact::fail(format!(
-                "generated SSH config at {} differs from durable SSH state",
-                paths.config()
-            ));
+            return SshDoctorCondition::Inconsistent.fact(paths);
         }
         Err(error) => {
-            return DoctorFact::fail(format!(
-                "generated SSH config at {} could not be compared with durable SSH state: {error}",
-                paths.config()
-            ));
+            return SshDoctorCondition::Inconsistent.fact_with_detail(
+                paths,
+                format!(
+                    "generated SSH config at {} could not be compared with durable SSH state: {error}",
+                    paths.config()
+                ),
+            );
         }
     };
     if let Err(error) = artifacts {
-        return DoctorFact::fail(format!(
-            "generated SSH config at {} is unsafe: {error}",
-            paths.config()
-        ));
+        return SshDoctorCondition::Unsafe.fact_with_detail(
+            paths,
+            format!(
+                "generated SSH config at {} is unsafe: {error}",
+                paths.config()
+            ),
+        );
     }
     match validate_managed_config_if_present(paths) {
         Ok(false) => {
-            return DoctorFact::fail(format!(
-                "generated SSH config at {} is missing while durable or generated SSH state exists",
-                paths.config()
-            ));
+            return SshDoctorCondition::Missing.fact(paths);
         }
         Err(error) => {
-            return DoctorFact::fail(format!(
-                "generated SSH config at {} is unsafe: {error}",
-                paths.config()
-            ));
+            return SshDoctorCondition::Unsafe.fact_with_detail(
+                paths,
+                format!(
+                    "generated SSH config at {} is unsafe: {error}",
+                    paths.config()
+                ),
+            );
         }
         Ok(true) => {}
     }
     let snapshot = match SshManager.published_snapshot_for_paths(paths).await {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            return DoctorFact::fail(format!(
-                "generated SSH config at {} is unsafe or inconsistent: {error}",
-                paths.config()
-            ));
+            return publication_error_condition(&error).fact_with_detail(
+                paths,
+                format!(
+                    "generated SSH config at {} is unsafe or inconsistent: {error}",
+                    paths.config()
+                ),
+            );
         }
     };
     let expected = durable
@@ -255,18 +386,38 @@ async fn validate_complete_publication(
         .map(|(id, resolution, port)| (id, resolution, *port))
         .collect::<Vec<_>>();
     if let Err(error) = snapshot.validate_exact(&expected) {
-        return DoctorFact::fail(format!(
-            "generated SSH config at {} differs from durable SSH state: {error}",
-            paths.config()
-        ));
+        return SshDoctorCondition::Inconsistent.fact_with_detail(
+            paths,
+            format!(
+                "generated SSH config at {} differs from durable SSH state: {error}",
+                paths.config()
+            ),
+        );
     }
-    if client_fact.status != gascan_core::doctor::DoctorStatus::Pass {
-        return DoctorFact::fail(format!(
-            "generated SSH config at {} cannot be validated without the system OpenSSH client",
-            paths.config()
-        ));
+    if !client_fact.status.is_available() {
+        return SshDoctorCondition::Inconsistent.fact_with_detail(
+            paths,
+            format!(
+                "generated SSH config at {} cannot be validated without the system OpenSSH client",
+                paths.config()
+            ),
+        );
     }
-    validate_openssh_config(client, paths.config()).await
+    validate_openssh_config(client, paths).await
+}
+
+fn publication_error_condition(error: &ServiceError) -> SshDoctorCondition {
+    match error {
+        ServiceError::SshConfigUnsafe(SshError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            SshDoctorCondition::Missing
+        }
+        ServiceError::SshConfigUnsafe(SshError::InvalidState(_)) => {
+            SshDoctorCondition::Inconsistent
+        }
+        _ => SshDoctorCondition::Unsafe,
+    }
 }
 
 fn native_publish_fact(native_publish: bool) -> DoctorFact {
@@ -295,7 +446,8 @@ fn ssh_client_fact(client: &Path) -> DoctorFact {
     }
 }
 
-async fn validate_openssh_config(client: &Path, config: &camino::Utf8Path) -> DoctorFact {
+async fn validate_openssh_config(client: &Path, paths: &SshPaths) -> DoctorFact {
+    let config = paths.config();
     let mut command = tokio::process::Command::new(client);
     command
         .arg("-G")
@@ -309,18 +461,20 @@ async fn validate_openssh_config(client: &Path, config: &camino::Utf8Path) -> Do
     let output = match tokio::time::timeout(Duration::from_secs(10), command.output()).await {
         Ok(Ok(output)) => output,
         Ok(Err(error)) => {
-            return DoctorFact::fail(format!(
-                "generated SSH config at {config} could not be checked: {error}"
-            ));
+            return SshDoctorCondition::Inconsistent.fact_with_detail(
+                paths,
+                format!("generated SSH config at {config} could not be checked: {error}"),
+            );
         }
         Err(_) => {
-            return DoctorFact::fail(format!(
-                "generated SSH config at {config} exceeded its 10 second validation bound"
-            ));
+            return SshDoctorCondition::Inconsistent.fact_with_detail(
+                paths,
+                format!("generated SSH config at {config} exceeded its 10 second validation bound"),
+            );
         }
     };
     if output.status.success() {
-        DoctorFact::pass("generated SSH config is accepted by OpenSSH")
+        SshDoctorCondition::Ready.fact(paths)
     } else {
         let mut detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         const MAX_DETAIL: usize = 4096;
@@ -332,13 +486,53 @@ async fn validate_openssh_config(client: &Path, config: &camino::Utf8Path) -> Do
             detail.truncate(boundary);
             detail.push('…');
         }
-        DoctorFact::fail(format!(
-            "generated SSH config at {config} was rejected by OpenSSH{}",
-            if detail.is_empty() {
-                String::new()
-            } else {
-                format!(": {detail}")
-            }
-        ))
+        SshDoctorCondition::Inconsistent.fact_with_detail(
+            paths,
+            format!(
+                "generated SSH config at {config} was rejected by OpenSSH{}",
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                }
+            ),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ensure_host_identity, publish_openssh_files};
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[tokio::test]
+    async fn warning_ssh_client_remains_available_for_config_validation() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().join("home");
+        std::fs::create_dir(&home)?;
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
+        let home = home.canonicalize()?;
+        let paths = SshPaths::for_environment(None, Some(home.as_os_str()))?;
+        let identity = ensure_host_identity(&paths).await?;
+        publish_openssh_files(&paths, &identity, &[])?;
+        let client = temp.path().join("ssh");
+        std::fs::write(&client, "#!/bin/sh\nexit 0\n")?;
+        std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755))?;
+        let client_fact = DoctorFact::warning("OpenSSH client is usable but untested");
+        let durable = DurableSshState {
+            expected: Vec::new(),
+            expects_managed_state: false,
+            consistent: true,
+            operation_pending: false,
+        };
+
+        let fact =
+            validate_complete_publication(&paths, &client, &client_fact, Ok(durable), Ok(true))
+                .await;
+
+        assert_eq!(fact.status, DoctorStatus::Pass, "{}", fact.detail);
+        Ok(())
     }
 }

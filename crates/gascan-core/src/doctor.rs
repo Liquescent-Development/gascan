@@ -114,6 +114,7 @@ impl DoctorCheckId {
 pub struct DoctorFact {
     pub status: DoctorStatus,
     pub detail: String,
+    pub remedy: Option<String>,
 }
 
 impl DoctorFact {
@@ -121,25 +122,33 @@ impl DoctorFact {
         Self {
             status: DoctorStatus::Pass,
             detail: detail.into(),
+            remedy: None,
         }
     }
     pub fn warning(detail: impl Into<String>) -> Self {
         Self {
             status: DoctorStatus::Warning,
             detail: detail.into(),
+            remedy: None,
         }
     }
     pub fn fail(detail: impl Into<String>) -> Self {
         Self {
             status: DoctorStatus::Fail,
             detail: detail.into(),
+            remedy: None,
         }
     }
     pub fn unknown(detail: impl Into<String>) -> Self {
         Self {
             status: DoctorStatus::Unknown,
             detail: detail.into(),
+            remedy: None,
         }
+    }
+    pub fn with_remedy(mut self, remedy: impl Into<String>) -> Self {
+        self.remedy = Some(remedy.into());
+        self
     }
 }
 
@@ -336,11 +345,11 @@ impl DoctorFacts {
         DoctorReport {
             checks: entries
                 .into_iter()
-                .map(|(id, fact, remedy)| DoctorCheck {
+                .map(|(id, fact, default_remedy)| DoctorCheck {
                     id: id.as_str().to_owned(),
                     status: fact.status,
                     detail: fact.detail,
-                    remedy: remedy.to_owned(),
+                    remedy: fact.remedy.unwrap_or_else(|| default_remedy.to_owned()),
                 })
                 .collect(),
         }
