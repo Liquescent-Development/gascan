@@ -5,8 +5,8 @@ use super::config::{
 use super::identity::{load_host_identity, parse_public_key};
 use super::port::PortReservation;
 use super::{
-    ActiveSsh, HostIdentity, ManagedSshHost, PUBLIC_MODE, SshPaths, StateDirectory,
-    ensure_host_identity, maximum_managed_file_bytes,
+    ActiveSsh, HostIdentity, ManagedSshDiagnostic, ManagedSshDiagnosticKind, ManagedSshHost,
+    PUBLIC_MODE, SshPaths, StateDirectory, ensure_host_identity, maximum_managed_file_bytes,
 };
 use crate::service::ServiceError;
 use crate::store::SshResolution;
@@ -402,6 +402,21 @@ impl SshManager {
         })
     }
 
+    pub(crate) fn inspect_published_snapshot_for_paths(
+        &self,
+        paths: &SshPaths,
+        identity: &HostIdentity,
+    ) -> Result<PublishedSshSnapshot, ManagedSshDiagnostic<ServiceError>> {
+        let hosts = load_active_hosts_inspected(paths, identity)?
+            .into_iter()
+            .map(|host| (host.active.alias.clone(), host.active))
+            .collect();
+        Ok(PublishedSshSnapshot {
+            client_key_fingerprint: identity.fingerprint().to_owned(),
+            hosts,
+        })
+    }
+
     pub(crate) async fn inspection_guard_for_paths(
         &self,
         paths: &SshPaths,
@@ -768,73 +783,130 @@ fn load_active_hosts(
     paths: &SshPaths,
     identity: &HostIdentity,
 ) -> Result<Vec<ManagedSshHost>, ServiceError> {
-    let directory = StateDirectory::open(paths).map_err(ServiceError::SshConfigUnsafe)?;
+    load_active_hosts_inspected(paths, identity).map_err(ManagedSshDiagnostic::into_source)
+}
+
+fn load_active_hosts_inspected(
+    paths: &SshPaths,
+    identity: &HostIdentity,
+) -> Result<Vec<ManagedSshHost>, ManagedSshDiagnostic<ServiceError>> {
+    let directory = StateDirectory::open_inspected(paths)
+        .map_err(|error| error.map_source(ServiceError::SshConfigUnsafe))?;
     if directory
-        .metadata(CONFIG_NAME, PUBLIC_MODE)
-        .map_err(ServiceError::SshConfigUnsafe)?
+        .metadata_inspected(CONFIG_NAME, PUBLIC_MODE)
+        .map_err(|error| error.map_source(ServiceError::SshConfigUnsafe))?
         .is_none()
     {
         return Ok(Vec::new());
     }
     let (config, _) = directory
-        .read_file(CONFIG_NAME, PUBLIC_MODE, maximum_managed_file_bytes())
-        .map_err(ServiceError::SshConfigUnsafe)?;
+        .read_file_inspected(CONFIG_NAME, PUBLIC_MODE, maximum_managed_file_bytes())
+        .map_err(|error| error.map_source(ServiceError::SshConfigUnsafe))?;
     let text = std::str::from_utf8(&config).map_err(|_| {
-        ServiceError::SshConfigUnsafe(super::SshError::InvalidState(
+        inspected_config_state(
+            ManagedSshDiagnosticKind::Inconsistent,
+            paths.config(),
             "managed SSH config is not UTF-8",
-        ))
+        )
     })?;
     let references = text
         .lines()
         .filter_map(|line| line.strip_prefix("    UserKnownHostsFile "))
         .map(parse_rendered_path)
-        .collect::<Result<BTreeSet<_>, _>>()?;
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(|error| {
+            ManagedSshDiagnostic::new(
+                ManagedSshDiagnosticKind::Inconsistent,
+                paths.config().to_owned(),
+                error,
+            )
+        })?;
     if references.is_empty() {
         drop(directory);
-        let prepared =
-            prepare_openssh_files(paths, identity, &[]).map_err(ServiceError::SshConfigUnsafe)?;
+        let prepared = prepare_openssh_files(paths, identity, &[]).map_err(|error| {
+            ManagedSshDiagnostic::new(
+                ManagedSshDiagnosticKind::Inconsistent,
+                paths.config().to_owned(),
+                ServiceError::SshConfigUnsafe(error),
+            )
+        })?;
         if prepared.config_bytes() != config {
-            return Err(ServiceError::SshConfigUnsafe(
-                super::SshError::InvalidState("managed SSH config is inconsistent"),
+            return Err(inspected_config_state(
+                ManagedSshDiagnosticKind::Inconsistent,
+                paths.config(),
+                "managed SSH config is inconsistent",
             ));
         }
         return Ok(Vec::new());
     }
     let mut references = references.into_iter();
     let Some(known_hosts_path) = references.next() else {
-        return Err(ServiceError::SshConfigUnsafe(
-            super::SshError::InvalidState("managed SSH config generation is missing"),
+        return Err(inspected_config_state(
+            ManagedSshDiagnosticKind::Missing,
+            paths.config(),
+            "managed SSH config generation is missing",
         ));
     };
     if references.next().is_some() {
-        return Err(ServiceError::SshConfigUnsafe(
-            super::SshError::InvalidState("managed SSH config generations are inconsistent"),
+        return Err(inspected_config_state(
+            ManagedSshDiagnosticKind::Inconsistent,
+            paths.config(),
+            "managed SSH config generations are inconsistent",
         ));
     }
     let known_hosts_path = Utf8PathBuf::from(known_hosts_path);
     if known_hosts_path.parent() != Some(paths.directory()) {
-        return Err(ServiceError::SshConfigUnsafe(
-            super::SshError::InvalidState("managed SSH config generation is outside state"),
+        return Err(inspected_config_state(
+            ManagedSshDiagnosticKind::Inconsistent,
+            paths.config(),
+            "managed SSH config generation is outside state",
         ));
     }
     let generation = known_hosts_path.file_name().ok_or_else(|| {
-        ServiceError::SshConfigUnsafe(super::SshError::InvalidState(
+        inspected_config_state(
+            ManagedSshDiagnosticKind::Inconsistent,
+            paths.config(),
             "managed SSH config generation is invalid",
-        ))
+        )
     })?;
     let (known_hosts, _) = directory
-        .read_file(generation, PUBLIC_MODE, maximum_managed_file_bytes())
-        .map_err(ServiceError::SshConfigUnsafe)?;
+        .read_file_inspected(generation, PUBLIC_MODE, maximum_managed_file_bytes())
+        .map_err(|error| error.map_source(ServiceError::SshConfigUnsafe))?;
     drop(directory);
-    let hosts = parse_known_hosts(&known_hosts, identity)?;
-    let prepared =
-        prepare_openssh_files(paths, identity, &hosts).map_err(ServiceError::SshConfigUnsafe)?;
+    let hosts = parse_known_hosts(&known_hosts, identity).map_err(|error| {
+        ManagedSshDiagnostic::new(
+            ManagedSshDiagnosticKind::Inconsistent,
+            known_hosts_path.clone(),
+            error,
+        )
+    })?;
+    let prepared = prepare_openssh_files(paths, identity, &hosts).map_err(|error| {
+        ManagedSshDiagnostic::new(
+            ManagedSshDiagnosticKind::Inconsistent,
+            paths.config().to_owned(),
+            ServiceError::SshConfigUnsafe(error),
+        )
+    })?;
     if prepared.known_hosts() != known_hosts_path || prepared.config_bytes() != config {
-        return Err(ServiceError::SshConfigUnsafe(
-            super::SshError::InvalidState("managed SSH config is inconsistent"),
+        return Err(inspected_config_state(
+            ManagedSshDiagnosticKind::Inconsistent,
+            paths.config(),
+            "managed SSH config is inconsistent",
         ));
     }
     Ok(hosts)
+}
+
+fn inspected_config_state(
+    kind: ManagedSshDiagnosticKind,
+    path: &Utf8Path,
+    message: &'static str,
+) -> ManagedSshDiagnostic<ServiceError> {
+    ManagedSshDiagnostic::new(
+        kind,
+        path.to_owned(),
+        ServiceError::SshConfigUnsafe(super::SshError::InvalidState(message)),
+    )
 }
 
 fn parse_known_hosts(

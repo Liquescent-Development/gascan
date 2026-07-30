@@ -314,12 +314,18 @@ fn managed_host(id: &SandboxId, port: u16, identity: &gascand::HostIdentity) -> 
 }
 
 fn configured_generation(config: &str) -> TestResult {
+    std::fs::remove_file(configured_generation_path(config)?)?;
+    Ok(())
+}
+
+fn configured_generation_path(
+    config: &str,
+) -> Result<camino::Utf8PathBuf, Box<dyn std::error::Error>> {
     let path = config
         .lines()
         .find_map(|line| line.trim().strip_prefix("UserKnownHostsFile "))
         .ok_or("generated config did not reference known-hosts")?;
-    std::fs::remove_file(path)?;
-    Ok(())
+    Ok(camino::Utf8PathBuf::from(path))
 }
 
 #[tokio::test]
@@ -815,6 +821,229 @@ async fn ssh_doctor_unsafe_config_names_the_exact_path_to_repair_or_remove() -> 
 
     assert_eq!(facts.config.status, gascan_core::doctor::DoctorStatus::Fail);
     assert!(facts.config.detail.contains(paths.config().as_str()));
+    let expected_remedy = format!(
+        "repair or remove the unsafe managed SSH path {}",
+        paths.config()
+    );
+    assert_eq!(
+        facts.config.remedy.as_deref(),
+        Some(expected_remedy.as_str())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ssh_doctor_unsafe_referenced_generation_names_the_generation_path() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = camino::Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    let home = root.join("home");
+    std::fs::create_dir(&home)?;
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
+    let home = home.canonicalize()?;
+    let paths = SshPaths::for_environment(None, Some(home.as_os_str()))?;
+    let identity = ensure_host_identity(&paths).await?;
+    let id = SandboxId::test("doctor-unsafe-generation");
+    let host = managed_host(&id, 24_006, &identity);
+    publish_openssh_files(&paths, &identity, std::slice::from_ref(&host))?;
+    let generation = configured_generation_path(&std::fs::read_to_string(paths.config())?)?;
+    std::fs::set_permissions(&generation, std::fs::Permissions::from_mode(0o666))?;
+    let state_path = root.join("state.db");
+    let store = Store::open(&state_path)?;
+    store.put_sandbox(&sandbox_record(
+        id.clone(),
+        root,
+        ActualState::Running,
+        Some(enabled_resolution(&host)),
+    ))?;
+    enable_transport(state_path.as_std_path(), &id, host.active.port)?;
+    let client = root.join("ssh");
+    std::fs::write(&client, "#!/bin/sh\nexit 0\n")?;
+    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755))?;
+
+    let facts =
+        gascand::ssh_doctor_facts_for_paths(&paths, client.as_std_path(), &store, true).await;
+
+    assert_eq!(facts.config.status, gascan_core::doctor::DoctorStatus::Fail);
+    assert!(facts.config.detail.contains("unsafe"));
+    let expected_remedy = format!("repair or remove the unsafe managed SSH path {generation}");
+    assert_eq!(
+        facts.config.remedy.as_deref(),
+        Some(expected_remedy.as_str())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ssh_doctor_unsafe_public_key_names_the_public_key_path() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = camino::Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    let home = root.join("home");
+    std::fs::create_dir(&home)?;
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
+    let home = home.canonicalize()?;
+    let paths = SshPaths::for_environment(None, Some(home.as_os_str()))?;
+    let identity = ensure_host_identity(&paths).await?;
+    publish_openssh_files(&paths, &identity, &[])?;
+    std::fs::set_permissions(paths.public_key(), std::fs::Permissions::from_mode(0o666))?;
+    let store = Store::open(root.join("state.db"))?;
+    let client = root.join("ssh");
+    std::fs::write(&client, "#!/bin/sh\nexit 0\n")?;
+    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755))?;
+
+    let facts =
+        gascand::ssh_doctor_facts_for_paths(&paths, client.as_std_path(), &store, true).await;
+
+    assert_eq!(
+        facts.identity.status,
+        gascan_core::doctor::DoctorStatus::Fail
+    );
+    let expected_remedy = format!(
+        "repair or remove the unsafe managed SSH path {}",
+        paths.public_key()
+    );
+    assert_eq!(
+        facts.identity.remedy.as_deref(),
+        Some(expected_remedy.as_str())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ssh_doctor_unsafe_managed_parent_names_the_parent_path() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = camino::Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    let home = root.join("home");
+    std::fs::create_dir(&home)?;
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
+    let home = home.canonicalize()?;
+    let paths = SshPaths::for_environment(None, Some(home.as_os_str()))?;
+    let identity = ensure_host_identity(&paths).await?;
+    publish_openssh_files(&paths, &identity, &[])?;
+    let managed_parent = paths.directory().parent().ok_or("managed parent")?;
+    std::fs::set_permissions(managed_parent, std::fs::Permissions::from_mode(0o777))?;
+    let store = Store::open(root.join("state.db"))?;
+    let client = root.join("ssh");
+    std::fs::write(&client, "#!/bin/sh\nexit 0\n")?;
+    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755))?;
+
+    let facts =
+        gascand::ssh_doctor_facts_for_paths(&paths, client.as_std_path(), &store, true).await;
+
+    let expected_remedy = format!("repair or remove the unsafe managed SSH path {managed_parent}");
+    assert_eq!(
+        facts.identity.remedy.as_deref(),
+        Some(expected_remedy.as_str())
+    );
+    assert_eq!(facts.config.remedy, facts.identity.remedy);
+    Ok(())
+}
+
+#[tokio::test]
+async fn ssh_doctor_pending_operation_does_not_mask_unsafe_public_key() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = camino::Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    let home = root.join("home");
+    std::fs::create_dir(&home)?;
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
+    let home = home.canonicalize()?;
+    let paths = SshPaths::for_environment(None, Some(home.as_os_str()))?;
+    ensure_host_identity(&paths).await?;
+    std::fs::set_permissions(paths.public_key(), std::fs::Permissions::from_mode(0o666))?;
+    let store = Store::open(root.join("state.db"))?;
+    let id = SandboxId::test("doctor-pending-unsafe");
+    store.begin_operation(
+        &sandbox_record(id, root, ActualState::Creating, None),
+        OperationKind::Create,
+    )?;
+    let client = root.join("ssh");
+    std::fs::write(&client, "#!/bin/sh\nexit 0\n")?;
+    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755))?;
+
+    let facts =
+        gascand::ssh_doctor_facts_for_paths(&paths, client.as_std_path(), &store, true).await;
+
+    assert_eq!(
+        facts.identity.status,
+        gascan_core::doctor::DoctorStatus::Fail
+    );
+    assert!(facts.identity.detail.contains("unsafe"));
+    assert!(!facts.identity.detail.contains("lifecycle transition"));
+    let expected_remedy = format!(
+        "repair or remove the unsafe managed SSH path {}",
+        paths.public_key()
+    );
+    assert_eq!(
+        facts.identity.remedy.as_deref(),
+        Some(expected_remedy.as_str())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ssh_doctor_pending_operation_only_defers_safe_partial_state() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = camino::Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    let home = root.join("home");
+    std::fs::create_dir(&home)?;
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
+    let home = home.canonicalize()?;
+    let paths = SshPaths::for_environment(None, Some(home.as_os_str()))?;
+    let identity = ensure_host_identity(&paths).await?;
+    publish_openssh_files(&paths, &identity, &[])?;
+    std::fs::write(paths.config(), b"Host gascan-doctor\0\n")?;
+    let store = Store::open(root.join("state.db"))?;
+    let id = SandboxId::test("doctor-pending-inconsistent");
+    store.begin_operation(
+        &sandbox_record(id, root, ActualState::Creating, None),
+        OperationKind::Create,
+    )?;
+    let client = root.join("ssh");
+    std::fs::write(&client, "#!/bin/sh\nexit 0\n")?;
+    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755))?;
+
+    let facts =
+        gascand::ssh_doctor_facts_for_paths(&paths, client.as_std_path(), &store, true).await;
+
+    assert_eq!(facts.config.status, gascan_core::doctor::DoctorStatus::Fail);
+    assert!(facts.config.detail.contains("inconsistent"));
+    assert!(!facts.config.detail.contains("lifecycle transition"));
+    assert_eq!(facts.config.remedy.as_deref(), Some("run `gascan up`"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn ssh_doctor_durable_mismatch_does_not_mask_unsafe_config() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = camino::Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    let home = root.join("home");
+    std::fs::create_dir(&home)?;
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
+    let home = home.canonicalize()?;
+    let paths = SshPaths::for_environment(None, Some(home.as_os_str()))?;
+    let identity = ensure_host_identity(&paths).await?;
+    let id = SandboxId::test("doctor-mismatch-unsafe");
+    let host = managed_host(&id, 24_007, &identity);
+    publish_openssh_files(&paths, &identity, std::slice::from_ref(&host))?;
+    std::fs::set_permissions(paths.config(), std::fs::Permissions::from_mode(0o666))?;
+    let state_path = root.join("state.db");
+    let store = Store::open(&state_path)?;
+    store.put_sandbox(&sandbox_record(
+        id.clone(),
+        root,
+        ActualState::Absent,
+        Some(enabled_resolution(&host)),
+    ))?;
+    enable_transport(state_path.as_std_path(), &id, host.active.port)?;
+    let client = root.join("ssh");
+    std::fs::write(&client, "#!/bin/sh\nexit 0\n")?;
+    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755))?;
+
+    let facts =
+        gascand::ssh_doctor_facts_for_paths(&paths, client.as_std_path(), &store, true).await;
+
+    assert_eq!(facts.config.status, gascan_core::doctor::DoctorStatus::Fail);
+    assert!(facts.config.detail.contains("unsafe"));
+    assert!(!facts.config.detail.contains("differs from durable"));
     let expected_remedy = format!(
         "repair or remove the unsafe managed SSH path {}",
         paths.config()
