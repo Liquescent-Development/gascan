@@ -5,7 +5,9 @@ use std::{
 
 use async_trait::async_trait;
 use camino::Utf8Path;
-use gascan_apple::{AppleBackend, CommandOutput, CommandRunner, CommandSpec};
+use gascan_apple::{
+    AppleBackend, AppleCompatibility, AppleProbe, CommandOutput, CommandRunner, CommandSpec,
+};
 use gascan_core::{
     manifest::Manifest,
     policy::PolicyCompiler,
@@ -22,6 +24,33 @@ mod support;
 
 #[derive(Clone, Default)]
 struct StatefulAppleRunner(Arc<Mutex<State>>);
+
+#[derive(Clone)]
+struct SequencedIdentityRunner(Arc<Mutex<VecDeque<(CommandSpec, serde_json::Value)>>>);
+
+impl SequencedIdentityRunner {
+    fn new(responses: impl IntoIterator<Item = (CommandSpec, serde_json::Value)>) -> Self {
+        Self(Arc::new(Mutex::new(responses.into_iter().collect())))
+    }
+}
+
+#[async_trait]
+impl CommandRunner for SequencedIdentityRunner {
+    async fn run(&self, spec: CommandSpec) -> Result<CommandOutput, RuntimeError> {
+        let (expected, value) = self
+            .0
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("unexpected identity probe command");
+        assert_eq!(spec, expected);
+        Ok(CommandOutput {
+            status: 0,
+            stdout: serde_json::to_vec(&value).unwrap(),
+            stderr: Vec::new(),
+        })
+    }
+}
 
 #[derive(Default)]
 struct State {
@@ -68,6 +97,18 @@ impl CommandRunner for StatefulAppleRunner {
         let value = match args.as_slice() {
             ["system", "version", "--format", "json"] => {
                 json!([{"appName":"container","buildType":"release","commit":"5973b9cc626a3e7a499bb316a958237ebe14e2ed","version":"1.1.0"}])
+            }
+            ["system", "status", "--format", "json"] => {
+                json!({
+                    "apiServerAppName": "container-apiserver",
+                    "apiServerBuild": "release",
+                    "apiServerCommit": "5973b9cc626a3e7a499bb316a958237ebe14e2ed",
+                    "apiServerVersion":
+                        "container-apiserver version 1.1.0 (build: release, commit: 5973b9c)",
+                    "appRoot": "/tmp/apple-container",
+                    "installRoot": "/usr/local/",
+                    "status": "running"
+                })
             }
             ["image", "pull", _] => json!(null),
             ["list", "--all", "--format", "json"] => {
@@ -395,6 +436,158 @@ fn assert_only_faulted_command(runner: &StatefulAppleRunner, expected: &[&str]) 
     let state = runner.0.lock().unwrap();
     assert_eq!(state.faulted_inventory_commands.len(), 1);
     assert_eq!(state.faulted_inventory_commands[0], expected);
+}
+
+#[tokio::test]
+async fn backend_capabilities_reject_identity_change_after_readiness_observation() {
+    let version_command = CommandSpec::new("container", ["system", "version", "--format", "json"]);
+    let status_command = CommandSpec::new("container", ["system", "status", "--format", "json"]);
+    let compatible_commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let runner = SequencedIdentityRunner::new([
+        (
+            version_command.clone(),
+            json!([{
+                "appName": "container",
+                "buildType": "release",
+                "commit": compatible_commit,
+                "version": "1.2.0"
+            }]),
+        ),
+        (
+            status_command.clone(),
+            json!({
+                "apiServerAppName": "container-apiserver",
+                "apiServerBuild": "release",
+                "apiServerCommit": compatible_commit,
+                "apiServerVersion":
+                    "container-apiserver version 1.2.0 (build: release, commit: aaaaaaa)",
+                "appRoot": "/tmp/apple-container",
+                "installRoot": "/usr/local/",
+                "status": "running"
+            }),
+        ),
+        (
+            version_command,
+            json!([{
+                "appName": "container",
+                "buildType": "release",
+                "commit": gascan_apple::APPLE_1_1_COMMIT,
+                "version": "1.1.0"
+            }]),
+        ),
+        (
+            status_command,
+            json!({
+                "apiServerAppName": "container-apiserver",
+                "apiServerBuild": "release",
+                "apiServerCommit": compatible_commit,
+                "apiServerVersion":
+                    "container-apiserver version 1.2.0 (build: release, commit: aaaaaaa)",
+                "appRoot": "/tmp/apple-container",
+                "installRoot": "/usr/local/",
+                "status": "running"
+            }),
+        ),
+        (
+            CommandSpec::new("container", ["system", "version", "--format", "json"]),
+            json!([{
+                "appName": "container",
+                "buildType": "release",
+                "commit": gascan_apple::APPLE_1_1_COMMIT,
+                "version": "1.1.0"
+            }]),
+        ),
+        (
+            CommandSpec::new("container", ["system", "status", "--format", "json"]),
+            json!({
+                "apiServerAppName": "container-apiserver",
+                "apiServerBuild": "release",
+                "apiServerCommit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "apiServerVersion":
+                    "container-apiserver version 1.1.0 (build: release, commit: bbbbbbb)",
+                "appRoot": "/tmp/apple-container",
+                "installRoot": "/usr/local/",
+                "status": "running"
+            }),
+        ),
+        (
+            CommandSpec::new("container", ["system", "version", "--format", "json"]),
+            json!([{
+                "appName": "container",
+                "buildType": "release",
+                "commit": gascan_apple::APPLE_1_1_COMMIT,
+                "version": "1.1.0"
+            }]),
+        ),
+        (
+            CommandSpec::new("container", ["system", "status", "--format", "json"]),
+            json!({
+                "apiServerAppName": "container-apiserver",
+                "apiServerBuild": "release",
+                "apiServerCommit": gascan_apple::APPLE_1_1_COMMIT,
+                "apiServerVersion":
+                    "container-apiserver version 1.2.0 (build: release, commit: 5973b9c)",
+                "appRoot": "/tmp/apple-container",
+                "installRoot": "/usr/local/",
+                "status": "running"
+            }),
+        ),
+    ]);
+
+    let readiness_probe = AppleProbe::new(runner.clone());
+    let readiness_cli = readiness_probe.release_evidence().await.unwrap();
+    let readiness_service = readiness_probe.status().await.unwrap();
+    assert_eq!(
+        readiness_cli.compatibility().unwrap(),
+        AppleCompatibility::CompatibleUntested
+    );
+    assert_eq!(readiness_cli.version, readiness_service.api_server_version);
+    assert_eq!(readiness_cli.commit, readiness_service.api_server_commit);
+
+    let backend = AppleBackend::new(runner);
+    let error = backend
+        .capabilities()
+        .await
+        .expect_err("a split CLI/service identity must not produce policy capabilities");
+    match error {
+        RuntimeError::InvalidState { resource, message } => {
+            assert_eq!(resource, "Apple Container runtime identity");
+            assert!(message.contains(gascan_apple::APPLE_1_1_COMMIT));
+            assert!(message.contains(compatible_commit));
+            assert!(message.contains("CLI 1.1.0"));
+            assert!(message.contains("running service 1.2.0"));
+        }
+        other => panic!("expected typed identity mismatch, got {other:?}"),
+    }
+
+    let error = backend
+        .capabilities()
+        .await
+        .expect_err("a full-commit mismatch must not produce policy capabilities");
+    match error {
+        RuntimeError::InvalidState { resource, message } => {
+            assert_eq!(resource, "Apple Container runtime identity");
+            assert!(message.contains(gascan_apple::APPLE_1_1_COMMIT));
+            assert!(message.contains("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+            assert!(message.contains("CLI 1.1.0"));
+            assert!(message.contains("running service 1.1.0"));
+        }
+        other => panic!("expected typed full-commit mismatch, got {other:?}"),
+    }
+
+    let error = backend
+        .capabilities()
+        .await
+        .expect_err("a semantic-version mismatch must not produce policy capabilities");
+    match error {
+        RuntimeError::InvalidState { resource, message } => {
+            assert_eq!(resource, "Apple Container runtime identity");
+            assert!(message.contains(gascan_apple::APPLE_1_1_COMMIT));
+            assert!(message.contains("CLI 1.1.0"));
+            assert!(message.contains("running service 1.2.0"));
+        }
+        other => panic!("expected typed semantic-version mismatch, got {other:?}"),
+    }
 }
 
 #[tokio::test]

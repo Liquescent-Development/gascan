@@ -26,6 +26,36 @@ fn probe_with_output(output: &'static [u8]) -> AppleProbe<FixtureRunner> {
     AppleProbe::new(FixtureRunner(output))
 }
 
+struct CapabilityRunner {
+    version: &'static [u8],
+    status: &'static [u8],
+}
+
+#[async_trait]
+impl CommandRunner for CapabilityRunner {
+    async fn run(&self, spec: CommandSpec) -> Result<CommandOutput, RuntimeError> {
+        let stdout =
+            if spec == CommandSpec::new("container", ["system", "version", "--format", "json"]) {
+                self.version
+            } else {
+                assert_eq!(
+                    spec,
+                    CommandSpec::new("container", ["system", "status", "--format", "json"])
+                );
+                self.status
+            };
+        Ok(CommandOutput {
+            status: 0,
+            stdout: stdout.to_vec(),
+            stderr: Vec::new(),
+        })
+    }
+}
+
+fn capability_probe(version: &'static [u8], status: &'static [u8]) -> AppleProbe<CapabilityRunner> {
+    AppleProbe::new(CapabilityRunner { version, status })
+}
+
 struct StatusRunner(&'static [u8]);
 
 #[async_trait]
@@ -134,10 +164,13 @@ async fn distinguishes_certified_and_compatible_untested_release_evidence() {
 
 #[tokio::test]
 async fn compatible_untested_releases_enable_ordinary_capabilities_but_not_offline() {
-    let capabilities = probe_with_output(include_bytes!("fixtures/system-version-1.2.0.json"))
-        .base_capabilities()
-        .await
-        .unwrap();
+    let capabilities = capability_probe(
+        include_bytes!("fixtures/system-version-1.2.0.json"),
+        include_bytes!("fixtures/system-status-1.2.0.json"),
+    )
+    .base_capabilities()
+    .await
+    .unwrap();
 
     assert!(capabilities.bind_mounts);
     assert!(capabilities.named_volumes);
@@ -152,7 +185,10 @@ async fn compatible_untested_releases_enable_ordinary_capabilities_but_not_offli
         br#"[{"appName":"helper","version":"9.0.0"},{"appName":"container","buildType":"release","commit":"5973b9cc626a3e7a499bb316a958237ebe14e2ed","version":"1.1.0","future":true}]"#.as_slice(),
     ] {
         assert_eq!(
-            probe_with_output(output)
+            capability_probe(
+                output,
+                include_bytes!("fixtures/system-status-1.1.0.json"),
+            )
                 .base_capabilities()
                 .await
                 .unwrap()
@@ -164,8 +200,9 @@ async fn compatible_untested_releases_enable_ordinary_capabilities_but_not_offli
 
 #[tokio::test]
 async fn offline_request_is_rejected_before_mount_construction_without_proof() {
-    let capability = probe_with_output(
+    let capability = capability_probe(
         br#"[{"appName":"container","buildType":"release","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","version":"1.1.1"}]"#,
+        br#"{"apiServerAppName":"container-apiserver","apiServerBuild":"release","apiServerCommit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","apiServerVersion":"container-apiserver version 1.1.1 (build: release, commit: aaaaaaa)","appRoot":"/tmp/","status":"running"}"#,
     )
     .base_capabilities()
     .await

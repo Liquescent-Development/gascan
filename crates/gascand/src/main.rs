@@ -5,7 +5,7 @@ use gascan_apple::{
     AppleBackend, AppleCompatibility, AppleProbe, AppleReleaseEvidence, AppleSystemStatus,
     CommandRunner, CommandSpec, ProcessRunner,
 };
-use gascan_core::doctor::{DoctorFact, DoctorFacts, DoctorReport};
+use gascan_core::doctor::{DoctorFact, DoctorFacts, DoctorReport, DoctorStatus};
 use gascan_core::fake_runtime::FakeRuntime;
 use gascan_core::runtime::{RuntimeBackend, RuntimeError};
 use gascand::{
@@ -439,6 +439,14 @@ fn apply_runtime_evidence(
             return;
         }
     };
+    let compatibility = match cli.compatibility() {
+        Ok(compatibility) => compatibility,
+        Err(error) => {
+            apply_cli_error(facts, &error);
+            return;
+        }
+    };
+    apply_cli_identity_facts(facts, &cli, compatibility);
     let service = match service {
         Ok(service) => service,
         Err(error) => {
@@ -447,13 +455,6 @@ fn apply_runtime_evidence(
                 facts.schema =
                     DoctorFact::fail(format!("malformed structured system status: {error}"));
             }
-            return;
-        }
-    };
-    let compatibility = match cli.compatibility() {
-        Ok(compatibility) => compatibility,
-        Err(error) => {
-            apply_cli_error(facts, &error);
             return;
         }
     };
@@ -488,9 +489,10 @@ fn apply_certified_facts(
     facts.schema = DoctorFact::pass(gate2_evidence(
         "CLI and API server structured schemas match",
     ));
-    facts.kernel = DoctorFact::pass(gate2_evidence(
-        "current exact running service establishes MVP kernel readiness",
-    ));
+    facts.kernel = coherent_kernel_fact(
+        facts,
+        gate2_evidence("current exact running service establishes MVP kernel readiness"),
+    );
     apply_certified_capability_facts(facts);
 }
 
@@ -512,9 +514,39 @@ fn apply_compatible_facts(
         )
     ));
     facts.schema = DoctorFact::pass("CLI and API server structured schemas match");
-    facts.kernel =
-        DoctorFact::pass("matching running API server establishes runtime kernel readiness");
+    facts.kernel = coherent_kernel_fact(
+        facts,
+        "matching running API server establishes runtime kernel readiness",
+    );
     apply_compatible_capability_facts(facts, cli);
+}
+
+fn apply_cli_identity_facts(
+    facts: &mut DoctorFacts,
+    cli: &AppleReleaseEvidence,
+    compatibility: AppleCompatibility,
+) {
+    facts.cli = DoctorFact::pass("container executable returned structured JSON");
+    facts.version = match compatibility {
+        AppleCompatibility::Certified => DoctorFact::pass(format!(
+            "certified Apple Container CLI identity {} is installed",
+            release_identity(cli.version.clone(), &cli.commit)
+        )),
+        AppleCompatibility::CompatibleUntested => DoctorFact::warning(format!(
+            "installed {} is compatible but untested; tested 1.1.0 is the certified Apple Container release",
+            release_version(cli)
+        )),
+    };
+}
+
+fn coherent_kernel_fact(facts: &DoctorFacts, detail: impl Into<String>) -> DoctorFact {
+    if facts.architecture.status == DoctorStatus::Pass && facts.macos.status == DoctorStatus::Pass {
+        DoctorFact::pass(detail)
+    } else {
+        DoctorFact::unknown(
+            "kernel readiness requires the supported Apple silicon architecture and macOS 26+",
+        )
+    }
 }
 
 fn apply_mismatched_facts(
@@ -969,6 +1001,9 @@ mod e2e_candidate_tests {
 mod doctor_tests {
     use super::*;
 
+    const COMPATIBLE_COMMIT_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const COMPATIBLE_COMMIT_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
     fn release(version: (u64, u64, u64), commit: &str) -> gascan_apple::AppleReleaseEvidence {
         gascan_apple::AppleReleaseEvidence {
             version: gascan_core::runtime::RuntimeVersion::new(version.0, version.1, version.2),
@@ -986,12 +1021,19 @@ mod doctor_tests {
         }
     }
 
+    fn host_ready_facts() -> DoctorFacts {
+        let mut facts = DoctorFacts::unavailable("test");
+        facts.architecture = DoctorFact::pass("test host is Apple silicon");
+        facts.macos = DoctorFact::pass("test host is running macOS 26");
+        facts
+    }
+
     #[test]
     fn runtime_evidence_matrix_distinguishes_certified_compatible_and_blocking_states() {
         let certified = release((1, 1, 0), gascan_apple::APPLE_1_1_COMMIT);
-        let compatible = release((1, 2, 0), "commit-a");
+        let compatible = release((1, 2, 0), COMPATIBLE_COMMIT_A);
 
-        let mut certified_facts = DoctorFacts::unavailable("test");
+        let mut certified_facts = host_ready_facts();
         apply_runtime_evidence(
             &mut certified_facts,
             Ok(certified.clone()),
@@ -1014,11 +1056,11 @@ mod doctor_tests {
             assert_eq!(fact.status, gascan_core::doctor::DoctorStatus::Pass);
         }
 
-        let mut certified_mismatch_facts = DoctorFacts::unavailable("test");
+        let mut certified_mismatch_facts = host_ready_facts();
         apply_runtime_evidence(
             &mut certified_mismatch_facts,
             Ok(certified.clone()),
-            Ok(service((1, 1, 0), "different-certified-service-commit")),
+            Ok(service((1, 1, 0), COMPATIBLE_COMMIT_B)),
         );
         for fact in [
             &certified_mismatch_facts.bind_mounts,
@@ -1033,11 +1075,11 @@ mod doctor_tests {
             assert!(!fact.detail.contains("Gate 2"));
         }
 
-        let mut compatible_facts = DoctorFacts::unavailable("test");
+        let mut compatible_facts = host_ready_facts();
         apply_runtime_evidence(
             &mut compatible_facts,
             Ok(compatible.clone()),
-            Ok(service((1, 2, 0), "commit-a")),
+            Ok(service((1, 2, 0), COMPATIBLE_COMMIT_A)),
         );
         assert_eq!(
             compatible_facts.version.status,
@@ -1067,25 +1109,32 @@ mod doctor_tests {
         }
 
         for (cli, running) in [
-            (compatible.clone(), service((1, 2, 0), "commit-b")),
-            (compatible.clone(), service((1, 1, 0), "commit-a")),
+            (compatible.clone(), service((1, 2, 0), COMPATIBLE_COMMIT_B)),
+            (compatible.clone(), service((1, 1, 0), COMPATIBLE_COMMIT_A)),
         ] {
-            let mut facts = DoctorFacts::unavailable("test");
+            let cli_identity = release_identity(cli.version.clone(), &cli.commit);
+            let service_identity = release_identity(
+                running.api_server_version.clone(),
+                &running.api_server_commit,
+            );
+            let mut facts = host_ready_facts();
             apply_runtime_evidence(&mut facts, Ok(cli), Ok(running));
             assert_eq!(
                 facts.service.status,
                 gascan_core::doctor::DoctorStatus::Fail
             );
             assert_eq!(facts.schema.status, gascan_core::doctor::DoctorStatus::Fail);
-            assert!(facts.service.detail.contains("CLI 1.2.0"));
-            assert!(facts.schema.detail.contains("service"));
+            assert!(facts.service.detail.contains(&cli_identity));
+            assert!(facts.service.detail.contains(&service_identity));
+            assert!(facts.schema.detail.contains(&cli_identity));
+            assert!(facts.schema.detail.contains(&service_identity));
         }
 
         for unsupported in [
-            release((1, 0, 9), "commit-a"),
-            release((2, 0, 0), "commit-a"),
+            release((1, 0, 9), COMPATIBLE_COMMIT_A),
+            release((2, 0, 0), COMPATIBLE_COMMIT_A),
         ] {
-            let mut facts = DoctorFacts::unavailable("test");
+            let mut facts = host_ready_facts();
             apply_runtime_evidence(
                 &mut facts,
                 Ok(unsupported.clone()),
@@ -1102,6 +1151,93 @@ mod doctor_tests {
                 facts.version.status,
                 gascan_core::doctor::DoctorStatus::Fail
             );
+        }
+    }
+
+    #[test]
+    fn coherent_runtime_kernel_requires_each_host_prerequisite() {
+        let coherent_releases = [
+            (
+                "certified",
+                release((1, 1, 0), gascan_apple::APPLE_1_1_COMMIT),
+                service((1, 1, 0), gascan_apple::APPLE_1_1_COMMIT),
+            ),
+            (
+                "compatible",
+                release((1, 2, 0), COMPATIBLE_COMMIT_A),
+                service((1, 2, 0), COMPATIBLE_COMMIT_A),
+            ),
+        ];
+
+        for (tier, cli, running) in coherent_releases {
+            for failed_prerequisite in ["architecture", "macOS"] {
+                let mut facts = host_ready_facts();
+                match failed_prerequisite {
+                    "architecture" => {
+                        facts.architecture = DoctorFact::fail("test host is not Apple silicon")
+                    }
+                    "macOS" => facts.macos = DoctorFact::fail("test host is older than macOS 26"),
+                    _ => unreachable!(),
+                }
+
+                apply_runtime_evidence(&mut facts, Ok(cli.clone()), Ok(running.clone()));
+
+                assert_eq!(
+                    facts.kernel.status,
+                    gascan_core::doctor::DoctorStatus::Unknown,
+                    "{tier} runtime with failed {failed_prerequisite} prerequisite"
+                );
+                assert!(facts.kernel.detail.contains("architecture"));
+                assert!(facts.kernel.detail.contains("macOS"));
+            }
+        }
+    }
+
+    #[test]
+    fn service_failure_preserves_successful_cli_identity_and_version_classification() {
+        for (cli, expected_version_status, expected_version_detail) in [
+            (
+                release((1, 1, 0), gascan_apple::APPLE_1_1_COMMIT),
+                gascan_core::doctor::DoctorStatus::Pass,
+                gascan_apple::APPLE_1_1_COMMIT,
+            ),
+            (
+                release((1, 2, 0), COMPATIBLE_COMMIT_A),
+                gascan_core::doctor::DoctorStatus::Warning,
+                "installed 1.2.0",
+            ),
+        ] {
+            let mut facts = host_ready_facts();
+            apply_runtime_evidence(
+                &mut facts,
+                Ok(cli),
+                Err(gascan_core::runtime::RuntimeError::CommandFailed {
+                    operation: "container system status".to_owned(),
+                    exit_code: Some(1),
+                    stderr: "service unavailable".to_owned(),
+                }),
+            );
+
+            assert_eq!(facts.cli.status, gascan_core::doctor::DoctorStatus::Pass);
+            assert_eq!(facts.version.status, expected_version_status);
+            assert!(facts.version.detail.contains(expected_version_detail));
+            assert_eq!(
+                facts.service.status,
+                gascan_core::doctor::DoctorStatus::Fail
+            );
+            for blocking in [
+                &facts.kernel,
+                &facts.schema,
+                &facts.bind_mounts,
+                &facts.named_volumes,
+                &facts.tty,
+                &facts.signals,
+                &facts.loopback_publish,
+                &facts.resource_limits,
+                &facts.offline,
+            ] {
+                assert!(!blocking.status.is_available());
+            }
         }
     }
 

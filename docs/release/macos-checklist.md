@@ -5,10 +5,11 @@ Apple `container` `>=1.1.0, <2.0.0` and a running API service whose release
 version and full commit match the CLI. The sole certified CLI/service identity
 is version 1.1.0 at commit `5973b9cc626a3e7a499bb316a958237ebe14e2ed`. Newer
 1.x releases remain usable for networked sandboxes, but `gascan doctor` reports
-warnings and offline sandboxes require the certified release. Gas Can refreshes
-Apple Container compatibility for each request, so changing Apple Container is
-detected without restarting Gas Can. The Gas Can package does not redistribute
-`container`,
+warnings. Warning-only reports remain ready and `gascan doctor` exits
+successfully; offline sandboxes require the certified release. Gas Can
+refreshes Apple Container compatibility for each request, so changing Apple
+Container is detected without restarting Gas Can. The Gas Can package does not
+redistribute `container`,
 `container-apiserver`, an Apple kernel, or the workspace image. The daemon
 starts per user, on demand, when the CLI first connects; the package installs
 no launch daemon or login item.

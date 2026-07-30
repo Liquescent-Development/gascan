@@ -196,9 +196,28 @@ impl<R: CommandRunner> AppleProbe<R> {
         })
     }
 
-    /// Returns the conservative capability baseline for a supported runtime.
+    /// Returns conservative capabilities for one coherent CLI/service observation.
     pub async fn base_capabilities(&self) -> Result<RuntimeCapabilities, RuntimeError> {
         let evidence = self.release_evidence().await?;
+        let service = self.status().await?;
+        if evidence.version != service.api_server_version
+            || evidence.commit != service.api_server_commit
+        {
+            return Err(RuntimeError::InvalidState {
+                resource: "Apple Container runtime identity".to_owned(),
+                message: format!(
+                    "CLI {}.{}.{} commit {} does not match running service {}.{}.{} commit {}",
+                    evidence.version.major,
+                    evidence.version.minor,
+                    evidence.version.patch,
+                    evidence.commit,
+                    service.api_server_version.major,
+                    service.api_server_version.minor,
+                    service.api_server_version.patch,
+                    service.api_server_commit,
+                ),
+            });
+        }
         let compatibility = evidence.compatibility()?;
         let certified = compatibility == AppleCompatibility::Certified;
         Ok(RuntimeCapabilities {
