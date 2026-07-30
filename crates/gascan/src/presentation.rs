@@ -1027,6 +1027,23 @@ mod tests {
     }
 
     #[test]
+    fn doctor_native_publish_failure_renders_actionable_fix() {
+        let checks = vec![check(
+            "ssh.native_publish",
+            "fail",
+            "Apple runtime does not support native IPv4 loopback publication",
+            "install a supported Apple container release with loopback publication support",
+        )];
+
+        let output = render_doctor(&checks, OutputCapabilities::plain());
+
+        assert!(output.contains("Apple runtime does not support native IPv4 loopback publication"));
+        assert!(output.contains(
+            "Fix: install a supported Apple container release with loopback publication support"
+        ));
+    }
+
+    #[test]
     fn doctor_humanizes_unknown_groups_and_checks() {
         let checks = vec![check(
             "future_runtime.secret_probe",

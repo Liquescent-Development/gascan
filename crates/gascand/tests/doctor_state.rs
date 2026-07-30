@@ -164,6 +164,71 @@ async fn refreshed_ssh_doctor_keeps_warning_loopback_publish_nonblocking() -> Te
 }
 
 #[tokio::test]
+async fn refreshed_native_publish_failure_preserves_actionable_remedy_in_report_and_api()
+-> TestResult {
+    const DETAIL: &str = "Apple runtime does not support native IPv4 loopback publication";
+    const REMEDY: &str =
+        "install a supported Apple container release with loopback publication support";
+    let temp = tempfile::tempdir()?;
+    let root = camino::Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    let home = root.join("home");
+    std::fs::create_dir(&home)?;
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
+    let home = home.canonicalize()?;
+    let paths = SshPaths::for_environment(None, Some(home.as_os_str()))?;
+    let mut facts = DoctorFacts::all_supported_for_tests();
+    facts.loopback_publish = DoctorFact::fail("loopback publication is unavailable");
+    facts.ssh_native_publish =
+        DoctorFact::pass("native publication was not refreshed").with_remedy("");
+    let service = Arc::new(
+        SandboxService::new_with_doctor(
+            FakeRuntime::default(),
+            Store::open(root.join("state.db"))?,
+            Arc::new(NoopProvisioner),
+            facts.into_report(),
+        )
+        .with_ssh_paths_for_e2e(paths)
+        .with_ssh_doctor_refresh(true),
+    );
+
+    let report = service.doctor_report().await;
+    let native_publish = report
+        .check("ssh.native_publish")
+        .ok_or("ssh.native_publish report check missing")?;
+    assert_eq!(
+        native_publish.status,
+        gascan_core::doctor::DoctorStatus::Fail
+    );
+    assert_eq!(native_publish.detail, DETAIL);
+    assert_eq!(native_publish.remedy, REMEDY);
+
+    let api = SandboxApi::new(service, ActivityTracker::new());
+    let response = GasCan::doctor(
+        &api,
+        tonic::Request::new(doctor_workspace(root.as_std_path())?),
+    )
+    .await?
+    .into_inner();
+    let capability = response
+        .capabilities
+        .iter()
+        .find(|capability| capability.name == "ssh.native_publish")
+        .ok_or("ssh.native_publish capability missing")?;
+    let decoded: serde_json::Value = serde_json::from_str(&capability.detail)?;
+    assert_eq!(decoded["status"], "fail");
+    assert_eq!(decoded["detail"], DETAIL);
+    assert_eq!(decoded["remedy"], REMEDY);
+    let finding = response
+        .findings
+        .iter()
+        .find(|finding| finding.code == "ssh.native_publish")
+        .ok_or("ssh.native_publish finding missing")?;
+    assert_eq!(finding.message, DETAIL);
+    assert_eq!(finding.details, REMEDY.as_bytes());
+    Ok(())
+}
+
+#[tokio::test]
 async fn doctor_workspace_access_is_scoped_to_each_request() -> TestResult {
     let temp = tempfile::tempdir()?;
     let root = camino::Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;

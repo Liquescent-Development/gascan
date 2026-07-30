@@ -679,6 +679,9 @@ fn native_publish_fact(native_publish: bool) -> DoctorFact {
         DoctorFact::pass("Apple runtime supports native IPv4 loopback publication")
     } else {
         DoctorFact::fail("Apple runtime does not support native IPv4 loopback publication")
+            .with_remedy(
+                "install a supported Apple container release with loopback publication support",
+            )
     }
 }
 
