@@ -111,18 +111,22 @@ pub(crate) fn render_doctor(checks: &[DoctorCheck], capabilities: OutputCapabili
         }
     }
 
-    let ready = checks.iter().all(|check| check.status == "pass");
-    let heading = if ready {
-        styled_heading("Gascan is ready", "✓", true, capabilities)
-    } else {
+    let warnings = checks.iter().any(|check| check.status == "warning");
+    let blocking = checks
+        .iter()
+        .any(|check| check.status != "pass" && check.status != "warning");
+    let heading = if blocking {
         styled_heading("Gascan needs attention", "✗", false, capabilities)
+    } else if warnings {
+        styled_warning_heading("Gascan is ready with warnings", "⚠", capabilities)
+    } else {
+        styled_heading("Gascan is ready", "✓", true, capabilities)
     };
     let group_width = groups
         .iter()
         .map(|group| humanize(group.id).len())
         .max()
-        .unwrap_or(0)
-        .max("Workspace".len());
+        .unwrap_or(0);
     let mut output = format!("{heading}\n");
     for group in groups {
         let title = humanize(group.id);
@@ -131,12 +135,25 @@ pub(crate) fn render_doctor(checks: &[DoctorCheck], capabilities: OutputCapabili
             .iter()
             .filter(|check| check.status == "pass")
             .count();
+        let warnings = group
+            .checks
+            .iter()
+            .filter(|check| check.status == "warning")
+            .count();
         let total = group.checks.len();
         let noun = if total == 1 { "check" } else { "checks" };
-        let _ = writeln!(
-            output,
-            "  {title:<group_width$}  {passing}/{total} {noun} passed"
-        );
+        if warnings == 0 {
+            let _ = writeln!(
+                output,
+                "  {title:<group_width$}  {passing}/{total} {noun} passed"
+            );
+        } else {
+            let warning_noun = if warnings == 1 { "warning" } else { "warnings" };
+            let _ = writeln!(
+                output,
+                "  {title:<group_width$}  {passing}/{total} {noun} passed, {warnings} {warning_noun}"
+            );
+        }
         for check in group
             .checks
             .into_iter()
@@ -146,7 +163,11 @@ pub(crate) fn render_doctor(checks: &[DoctorCheck], capabilities: OutputCapabili
                 .id
                 .split_once('.')
                 .map_or(check.id.as_str(), |(_, id)| id);
-            let check_heading = styled_heading(&humanize(check_id), "✗", false, capabilities);
+            let check_heading = if check.status == "warning" {
+                styled_warning_heading(&humanize(check_id), "⚠", capabilities)
+            } else {
+                styled_heading(&humanize(check_id), "✗", false, capabilities)
+            };
             let _ = writeln!(output, "    {check_heading}");
             let detail = human_doctor_detail(check);
             if !detail.is_empty() {
@@ -422,6 +443,18 @@ fn styled_heading(
         Style::new().red()
     };
     style.apply_to(heading).to_string()
+}
+
+fn styled_warning_heading(heading: &str, symbol: &str, capabilities: OutputCapabilities) -> String {
+    let heading = if capabilities.unicode {
+        format!("{symbol} {heading}")
+    } else {
+        heading.to_owned()
+    };
+    if !capabilities.color {
+        return heading;
+    }
+    Style::new().yellow().apply_to(heading).to_string()
 }
 
 fn humanize(identifier: &str) -> String {
@@ -852,8 +885,68 @@ mod tests {
     fn passing_doctor_report_is_compact_and_uses_one_many_grammar() {
         assert_eq!(
             render_doctor(&passing_checks(), OutputCapabilities::plain()),
-            "Gascan is ready\n  Host       2/2 checks passed\n  Runtime    1/1 check passed\n"
+            "Gascan is ready\n  Host     2/2 checks passed\n  Runtime  1/1 check passed\n"
         );
+    }
+
+    #[test]
+    fn warning_only_doctor_report_is_ready_with_warning_summary_and_details() {
+        let mut checks = (1..=10)
+            .map(|index| check(&format!("runtime.probe_{index}"), "pass", "verified", ""))
+            .collect::<Vec<_>>();
+        checks.push(check(
+            "runtime.version",
+            "warning",
+            "untested 1.2.0",
+            "install the certified release",
+        ));
+        checks.push(check(
+            "runtime.offline",
+            "warning",
+            "offline support is untested",
+            "use a certified release for offline sandboxes",
+        ));
+
+        assert_eq!(
+            render_doctor(
+                &checks,
+                OutputCapabilities {
+                    interactive: false,
+                    color: false,
+                    unicode: true,
+                },
+            ),
+            concat!(
+                "⚠ Gascan is ready with warnings\n",
+                "  Runtime  10/12 checks passed, 2 warnings\n",
+                "    ⚠ Version\n",
+                "      untested 1.2.0\n",
+                "      Fix: install the certified release\n",
+                "    ⚠ Offline\n",
+                "      offline support is untested\n",
+                "      Fix: use a certified release for offline sandboxes\n",
+            )
+        );
+    }
+
+    #[test]
+    fn warning_and_failure_doctor_checks_keep_distinct_headings() {
+        let checks = vec![
+            check("runtime.version", "warning", "untested 1.2.0", ""),
+            check("runtime.offline", "fail", "offline unsupported", ""),
+        ];
+
+        let output = render_doctor(
+            &checks,
+            OutputCapabilities {
+                interactive: false,
+                color: false,
+                unicode: true,
+            },
+        );
+
+        assert!(output.contains("    ⚠ Version\n"));
+        assert!(output.contains("    ✗ Offline\n"));
     }
 
     #[test]

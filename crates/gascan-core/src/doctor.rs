@@ -4,8 +4,15 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum DoctorStatus {
     Pass,
+    Warning,
     Fail,
     Unknown,
+}
+
+impl DoctorStatus {
+    pub const fn is_available(self) -> bool {
+        matches!(self, Self::Pass | Self::Warning)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,6 +120,12 @@ impl DoctorFact {
     pub fn pass(detail: impl Into<String>) -> Self {
         Self {
             status: DoctorStatus::Pass,
+            detail: detail.into(),
+        }
+    }
+    pub fn warning(detail: impl Into<String>) -> Self {
+        Self {
+            status: DoctorStatus::Warning,
             detail: detail.into(),
         }
     }
@@ -352,14 +365,12 @@ impl DoctorReport {
         self.checks.iter().find(|check| check.id == id)
     }
     pub fn is_ready(&self) -> bool {
-        self.checks
-            .iter()
-            .all(|check| check.status == DoctorStatus::Pass)
+        self.checks.iter().all(|check| check.status.is_available())
     }
 
     pub fn runtime_readiness_failure(&self) -> Option<&DoctorCheck> {
         self.checks.iter().find(|check| {
-            check.status != DoctorStatus::Pass
+            matches!(check.status, DoctorStatus::Fail | DoctorStatus::Unknown)
                 && DoctorCheckId::from_name(&check.id)
                     .is_none_or(|id| id.role() == DoctorCheckRole::ReadinessPrerequisite)
         })

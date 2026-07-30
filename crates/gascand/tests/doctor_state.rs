@@ -1,4 +1,4 @@
-use gascan_core::doctor::DoctorFacts;
+use gascan_core::doctor::{DoctorFact, DoctorFacts};
 use gascan_core::fake_runtime::FakeRuntime;
 use gascan_core::sandbox::SandboxId;
 use gascan_proto::v1;
@@ -18,11 +18,18 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 fn doctor_api(
     root: &camino::Utf8Path,
 ) -> Result<SandboxApi<FakeRuntime>, Box<dyn std::error::Error>> {
+    doctor_api_with_report(root, DoctorFacts::all_supported_for_tests().into_report())
+}
+
+fn doctor_api_with_report(
+    root: &camino::Utf8Path,
+    report: gascan_core::doctor::DoctorReport,
+) -> Result<SandboxApi<FakeRuntime>, Box<dyn std::error::Error>> {
     let service = SandboxService::new_with_doctor(
         FakeRuntime::default(),
         Store::open(root.join("state.db"))?,
         Arc::new(NoopProvisioner),
-        DoctorFacts::all_supported_for_tests().into_report(),
+        report,
     );
     Ok(SandboxApi::new(Arc::new(service), ActivityTracker::new()))
 }
@@ -35,6 +42,35 @@ fn doctor_workspace(
             path.to_str().ok_or("UTF-8 workspace")?.to_owned(),
         )),
     })
+}
+
+#[tokio::test]
+async fn doctor_warning_capability_is_available_and_has_no_finding() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = camino::Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    let mut facts = DoctorFacts::all_supported_for_tests();
+    facts.version = DoctorFact::warning("untested 1.2.0");
+    let api = doctor_api_with_report(root, facts.into_report())?;
+
+    let response = GasCan::doctor(
+        &api,
+        tonic::Request::new(doctor_workspace(root.as_std_path())?),
+    )
+    .await?
+    .into_inner();
+    let version = response
+        .capabilities
+        .iter()
+        .find(|capability| capability.name == "runtime.version")
+        .ok_or("runtime.version capability missing")?;
+
+    assert!(version.available);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&version.detail)?["status"],
+        "warning"
+    );
+    assert!(response.findings.is_empty());
+    Ok(())
 }
 
 #[tokio::test]

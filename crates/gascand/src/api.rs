@@ -1875,7 +1875,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             .iter()
             .map(|check| v1::Capability {
                 name: check.id.clone(),
-                available: check.status == DoctorStatus::Pass,
+                available: check.status.is_available(),
                 detail: serde_json::json!({
                     "detail": check.detail,
                     "remedy": check.remedy,
@@ -1887,7 +1887,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         let findings = report
             .checks
             .iter()
-            .filter(|check| check.status != DoctorStatus::Pass)
+            .filter(|check| matches!(check.status, DoctorStatus::Fail | DoctorStatus::Unknown))
             .map(|check| v1::Error {
                 code: check.id.clone(),
                 message: check.detail.clone(),

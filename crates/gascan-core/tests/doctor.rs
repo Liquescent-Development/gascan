@@ -91,6 +91,20 @@ fn doctor_json_preserves_unknown_status() {
 }
 
 #[test]
+fn warning_status_keeps_runtime_ready_and_is_not_a_readiness_failure() {
+    let mut facts = ready_facts();
+    facts.version = DoctorFact::warning("untested 1.2.0");
+    let report = facts.into_report();
+
+    assert!(report.is_ready());
+    assert!(report.runtime_readiness_failure().is_none());
+    assert_eq!(
+        report.check("runtime.version").unwrap().status,
+        DoctorStatus::Warning
+    );
+}
+
+#[test]
 fn request_scoped_workspace_unknown_does_not_block_runtime_readiness() {
     let mut facts = ready_facts();
     facts.workspace = DoctorFact::unknown("workspace access is evaluated for each Doctor request");
