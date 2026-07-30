@@ -1,0 +1,14 @@
+[
+  {
+    "appName": "container",
+    "buildType": "release",
+    "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "version": "1.2.0"
+  },
+  {
+    "appName": "container-apiserver",
+    "buildType": "release",
+    "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "version": "container-apiserver version 1.2.0 (build: release, commit: aaaaaaa)"
+  }
+]

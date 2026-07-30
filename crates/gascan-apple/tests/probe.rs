@@ -1,5 +1,8 @@
 use async_trait::async_trait;
-use gascan_apple::{AppleProbe, CommandOutput, CommandRunner, CommandSpec};
+use gascan_apple::{
+    APPLE_1_1_COMMIT, AppleCompatibility, AppleProbe, AppleReleaseEvidence, CommandOutput,
+    CommandRunner, CommandSpec,
+};
 use gascan_core::runtime::{NetworkIsolation, RuntimeError, RuntimeVersion};
 
 struct FixtureRunner(&'static [u8]);
@@ -78,35 +81,69 @@ async fn status_rejects_trailing_version_garbage_and_commit_mismatch() {
     }
 }
 
-#[tokio::test]
-async fn accepts_supported_major_and_rejects_future_major() {
-    let supported = probe_with_output(include_bytes!("fixtures/system-version-1.0.0.json"))
-        .base_capabilities()
-        .await;
-    assert_eq!(supported.unwrap().version, RuntimeVersion::new(1, 0, 0));
+fn classifies_only_apple_container_1_1_through_1_x_releases() {
+    let cases = [
+        ("1.0.9", false),
+        ("1.1.0", true),
+        ("1.1.1", true),
+        ("1.2.0", true),
+        ("1.99.99", true),
+        ("2.0.0", false),
+    ];
 
-    let future = probe_with_output(include_bytes!("fixtures/system-version-unsupported.json"))
-        .version()
-        .await;
-    assert!(matches!(
-        future,
-        Err(RuntimeError::UnsupportedVersion { .. })
-    ));
+    for (raw_version, accepted) in cases {
+        let parts: Vec<_> = raw_version
+            .split('.')
+            .map(|part| part.parse::<u64>().unwrap())
+            .collect();
+        let evidence = AppleReleaseEvidence {
+            version: RuntimeVersion::new(parts[0], parts[1], parts[2]),
+            commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        };
+
+        assert_eq!(
+            evidence.compatibility().is_ok(),
+            accepted,
+            "{raw_version} acceptance"
+        );
+    }
 }
 
 #[tokio::test]
-async fn promotes_only_the_live_verified_apple_1_1_0_offline_mechanism() {
-    let capabilities = probe_with_output(include_bytes!("fixtures/system-version-1.0.0.json"))
+async fn distinguishes_certified_and_compatible_untested_release_evidence() {
+    let certified = AppleReleaseEvidence {
+        version: RuntimeVersion::new(1, 1, 0),
+        commit: APPLE_1_1_COMMIT.to_owned(),
+    };
+    assert_eq!(
+        certified.compatibility().unwrap(),
+        AppleCompatibility::Certified
+    );
+
+    let untested = probe_with_output(include_bytes!("fixtures/system-version-1.2.0.json"))
+        .release_evidence()
+        .await
+        .unwrap();
+    assert_eq!(untested.version, RuntimeVersion::new(1, 2, 0));
+    assert_eq!(
+        untested.compatibility().unwrap(),
+        AppleCompatibility::CompatibleUntested
+    );
+}
+
+#[tokio::test]
+async fn compatible_untested_releases_enable_ordinary_capabilities_but_not_offline() {
+    let capabilities = probe_with_output(include_bytes!("fixtures/system-version-1.2.0.json"))
         .base_capabilities()
         .await
         .unwrap();
 
-    assert!(!capabilities.bind_mounts);
-    assert!(!capabilities.named_volumes);
-    assert!(!capabilities.tty);
-    assert!(!capabilities.signals);
-    assert!(!capabilities.loopback_publish);
-    assert!(!capabilities.resource_limits);
+    assert!(capabilities.bind_mounts);
+    assert!(capabilities.named_volumes);
+    assert!(capabilities.tty);
+    assert!(capabilities.signals);
+    assert!(capabilities.loopback_publish);
+    assert!(capabilities.resource_limits);
     assert_eq!(capabilities.offline, NetworkIsolation::Unsupported);
 
     for output in [
@@ -120,22 +157,6 @@ async fn promotes_only_the_live_verified_apple_1_1_0_offline_mechanism() {
                 .unwrap()
                 .offline,
             NetworkIsolation::Proven
-        );
-    }
-
-    for output in [
-        br#"[{"appName":"container","buildType":"release","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","version":"1.1.1"}]"#
-            .as_slice(),
-        br#"[{"appName":"container","buildType":"release","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","version":"1.9.3"}]"#
-            .as_slice(),
-    ] {
-        assert_eq!(
-            probe_with_output(output)
-                .base_capabilities()
-                .await
-                .unwrap()
-                .offline,
-            NetworkIsolation::Unsupported
         );
     }
 }

@@ -19,6 +19,40 @@ pub struct AppleSystemStatus {
     pub api_server_commit: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AppleCompatibility {
+    Certified,
+    CompatibleUntested,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppleReleaseEvidence {
+    pub version: RuntimeVersion,
+    pub commit: String,
+}
+
+impl AppleReleaseEvidence {
+    pub fn compatibility(&self) -> Result<AppleCompatibility, RuntimeError> {
+        let minimum = RuntimeVersion::new(1, 1, 0);
+        if self.version.major != 1
+            || (self.version.major, self.version.minor, self.version.patch)
+                < (minimum.major, minimum.minor, minimum.patch)
+        {
+            return Err(RuntimeError::UnsupportedVersion {
+                found: self.version.clone(),
+                supported: ">=1.1.0, <2.0.0".to_owned(),
+            });
+        }
+        Ok(
+            if self.version == minimum && self.commit == APPLE_1_1_COMMIT {
+                AppleCompatibility::Certified
+            } else {
+                AppleCompatibility::CompatibleUntested
+            },
+        )
+    }
+}
+
 /// Probes the installed Apple Container runtime through its structured CLI output.
 pub struct AppleProbe<R> {
     runner: R,
@@ -108,10 +142,13 @@ impl<R: CommandRunner> AppleProbe<R> {
 
     /// Returns the supported Apple Container application version.
     pub async fn version(&self) -> Result<RuntimeVersion, RuntimeError> {
-        self.version_evidence().await.map(|(version, _)| version)
+        let evidence = self.release_evidence().await?;
+        evidence.compatibility()?;
+        Ok(evidence.version)
     }
 
-    async fn version_evidence(&self) -> Result<(RuntimeVersion, String), RuntimeError> {
+    /// Returns structured release evidence from the Apple Container CLI.
+    pub async fn release_evidence(&self) -> Result<AppleReleaseEvidence, RuntimeError> {
         let output = self
             .runner
             .run(CommandSpec::new(
@@ -153,33 +190,30 @@ impl<R: CommandRunner> AppleProbe<R> {
                     .to_owned(),
             });
         }
-        let version = parse_version(version_value)?;
-        if version.major != 1 {
-            return Err(RuntimeError::UnsupportedVersion {
-                found: version,
-                supported: "major version 1".to_owned(),
-            });
-        }
-        Ok((version, commit.unwrap_or_default().to_owned()))
+        Ok(AppleReleaseEvidence {
+            version: parse_version(version_value)?,
+            commit: commit.unwrap_or_default().to_owned(),
+        })
     }
 
     /// Returns the conservative capability baseline for a supported runtime.
     pub async fn base_capabilities(&self) -> Result<RuntimeCapabilities, RuntimeError> {
-        let (version, commit) = self.version_evidence().await?;
-        let supported = version == RuntimeVersion::new(1, 1, 0) && commit == APPLE_1_1_COMMIT;
+        let evidence = self.release_evidence().await?;
+        let compatibility = evidence.compatibility()?;
+        let certified = compatibility == AppleCompatibility::Certified;
         Ok(RuntimeCapabilities {
-            offline: if supported {
+            offline: if certified {
                 NetworkIsolation::Proven
             } else {
                 NetworkIsolation::Unsupported
             },
-            version,
-            bind_mounts: supported,
-            named_volumes: supported,
-            tty: supported,
-            signals: supported,
-            loopback_publish: supported,
-            resource_limits: supported,
+            version: evidence.version,
+            bind_mounts: true,
+            named_volumes: true,
+            tty: true,
+            signals: true,
+            loopback_publish: true,
+            resource_limits: true,
         })
     }
 }
