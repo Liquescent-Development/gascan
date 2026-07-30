@@ -3,7 +3,12 @@ ARG GASCAMP_REVISION=f6b248c5926240856dbea83d1d2c5c90ea1c1456
 
 FROM ${BASE_IMAGE} AS workspace-base
 
-RUN yes | DEBIAN_FRONTEND=noninteractive unminimize \
+RUN if ! yes | DEBIAN_FRONTEND=noninteractive unminimize \
+        >/tmp/unminimize.log 2>&1; then \
+      tail -n 200 /tmp/unminimize.log >&2; \
+      exit 1; \
+    fi \
+    && rm -f /tmp/unminimize.log \
     && test ! -e /etc/update-motd.d/60-unminimize \
     && test ! -e /etc/dpkg/dpkg.cfg.d/excludes \
     && test ! -e /etc/dpkg/dpkg.cfg.d/excludes.dpkg-tmp
