@@ -415,10 +415,16 @@ fn validate_capabilities(
     if (!spec.manifest().ports().is_empty() || ssh_enabled) && !capabilities.loopback_publish {
         return Err(PolicyError::LoopbackPublishUnavailable);
     }
-    if spec.manifest().network() == NetworkMode::Offline
-        && capabilities.offline != NetworkIsolation::Proven
-    {
-        return Err(PolicyError::OfflineUnavailable);
+    if spec.manifest().network() == NetworkMode::Offline {
+        match capabilities.offline {
+            NetworkIsolation::Proven => {}
+            NetworkIsolation::Unsupported => {
+                return Err(PolicyError::OfflineUnsupported {
+                    version: capabilities.version.clone(),
+                });
+            }
+            NetworkIsolation::Unverified => return Err(PolicyError::OfflineUnavailable),
+        }
     }
     Ok(())
 }
@@ -540,6 +546,15 @@ pub enum PolicyError {
     LoopbackPublishUnavailable,
     #[error("runtime cannot prove offline network isolation")]
     OfflineUnavailable,
+    #[error(
+        "hard offline isolation has not been verified with Apple Container {version_major}.{version_minor}.{version_patch}; use networked mode or install the certified 1.1.0 release",
+        version_major = .version.major,
+        version_minor = .version.minor,
+        version_patch = .version.patch,
+    )]
+    OfflineUnsupported {
+        version: crate::runtime::RuntimeVersion,
+    },
     #[error("offline sandboxes cannot publish ports")]
     OfflinePortsForbidden,
     #[error("published ports must be nonzero")]
@@ -570,7 +585,7 @@ impl PolicyError {
             Self::NamedVolumesUnavailable => "named_volumes_unavailable",
             Self::ResourceLimitsUnavailable => "resource_limits_unavailable",
             Self::LoopbackPublishUnavailable => "loopback_publish_unavailable",
-            Self::OfflineUnavailable => "offline_unavailable",
+            Self::OfflineUnavailable | Self::OfflineUnsupported { .. } => "offline_unavailable",
             Self::OfflinePortsForbidden => "offline_ports_forbidden",
             Self::InvalidPort => "invalid_port",
             Self::DuplicatePort(_) => "duplicate_port",

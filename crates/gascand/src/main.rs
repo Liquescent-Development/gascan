@@ -1,10 +1,13 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-use gascan_apple::{AppleBackend, AppleProbe, CommandRunner, CommandSpec, ProcessRunner};
+use gascan_apple::{
+    AppleBackend, AppleCompatibility, AppleProbe, AppleReleaseEvidence, AppleSystemStatus,
+    CommandRunner, CommandSpec, ProcessRunner,
+};
 use gascan_core::doctor::{DoctorFact, DoctorFacts, DoctorReport};
 use gascan_core::fake_runtime::FakeRuntime;
-use gascan_core::runtime::RuntimeBackend;
+use gascan_core::runtime::{RuntimeBackend, RuntimeError};
 use gascand::{
     BackendSelection, Daemon, DaemonConfig, DoctorState, ErrorDiagnostics, ProvisionRequest,
     ProvisionResolution, Provisioner, SandboxApi, SandboxService, ServiceError, SocketPaths,
@@ -408,109 +411,204 @@ async fn production_doctor_report() -> DoctorReport {
     facts.macos = macos_fact();
 
     let probe = AppleProbe::new(ProcessRunner);
-    match probe.base_capabilities().await {
-        Ok(capabilities) => {
-            facts.cli = DoctorFact::pass("container executable returned structured JSON");
-            let exact = capabilities.version == gascan_core::runtime::RuntimeVersion::new(1, 1, 0);
-            let matrix = capabilities.bind_mounts
-                && capabilities.named_volumes
-                && capabilities.tty
-                && capabilities.signals
-                && capabilities.loopback_publish
-                && capabilities.resource_limits
-                && capabilities.offline == gascan_core::runtime::NetworkIsolation::Proven;
-            facts.version = if exact && matrix {
-                DoctorFact::pass(gate2_evidence(
-                    "exact release client 1.1.0 revision matched",
-                ))
-            } else {
-                DoctorFact::fail(format!(
-                    "unsupported Apple container CLI/revision {}.{}.{}; Gate 2 requires exact 1.1.0 at {}",
-                    capabilities.version.major,
-                    capabilities.version.minor,
-                    capabilities.version.patch,
-                    gascan_apple::APPLE_1_1_COMMIT,
-                ))
-            };
-            facts.schema = if exact && matrix {
-                DoctorFact::pass(gate2_evidence("client version schema matched"))
-            } else {
-                DoctorFact::fail("capability schema is not signed off for this CLI version")
-            };
-            facts.bind_mounts = capability_fact(capabilities.bind_mounts, "bind mounts");
-            facts.named_volumes = capability_fact(capabilities.named_volumes, "named volumes");
-            facts.tty = capability_fact(capabilities.tty, "TTY attachment");
-            facts.signals = capability_fact(capabilities.signals, "signal forwarding");
-            facts.loopback_publish =
-                capability_fact(capabilities.loopback_publish, "loopback publication");
-            facts.resource_limits =
-                capability_fact(capabilities.resource_limits, "resource limits");
-            facts.offline = capability_fact(
-                capabilities.offline == gascan_core::runtime::NetworkIsolation::Proven,
-                "hard offline isolation",
-            );
-        }
-        Err(error) => apply_cli_error(&mut facts, &error),
+    let cli = probe.release_evidence().await;
+    let service = probe.status().await;
+    if let Ok(status) = &service {
+        facts.state_storage =
+            storage_fact(std::path::Path::new(&status.app_root), "application root");
+        facts.image_storage = storage_fact(
+            std::path::Path::new(&status.app_root),
+            "shared Apple application/state/image",
+        );
     }
-
-    match probe.status().await {
-        Ok(status) => {
-            let exact_service = status.api_server_version
-                == gascan_core::runtime::RuntimeVersion::new(1, 1, 0)
-                && status.api_server_commit == gascan_apple::APPLE_1_1_COMMIT;
-            facts.service = if exact_service {
-                DoctorFact::pass(gate2_evidence(
-                    "structured system status reports the exact running API server",
-                ))
-            } else {
-                DoctorFact::fail(format!(
-                    "running API server identity/revision is not exact Gate 2 revision {}",
-                    gascan_apple::APPLE_1_1_COMMIT
-                ))
-            };
-            if status.api_server_version == gascan_core::runtime::RuntimeVersion::new(1, 1, 0)
-                && exact_service
-                && facts.schema.status == gascan_core::doctor::DoctorStatus::Pass
-            {
-                facts.schema =
-                    DoctorFact::pass("CLI and API server match the Apple 1.1 structured schemas");
-            } else {
-                facts.schema =
-                    DoctorFact::fail("API server version does not match Apple container 1.1.0");
-            }
-            facts.kernel = if exact_service
-                && facts.architecture.status == gascan_core::doctor::DoctorStatus::Pass
-                && facts.macos.status == gascan_core::doctor::DoctorStatus::Pass
-            {
-                DoctorFact::pass(gate2_evidence(
-                    "Gate 2 kernel/live lifecycle proof plus current exact running service establishes MVP kernel readiness",
-                ))
-            } else {
-                DoctorFact::unknown(
-                    "kernel readiness requires the supported host and exact running Gate 2 API server revision",
-                )
-            };
-            facts.state_storage =
-                storage_fact(std::path::Path::new(&status.app_root), "application root");
-            facts.image_storage = storage_fact(
-                std::path::Path::new(&status.app_root),
-                "shared Apple application/state/image",
-            );
-        }
-        Err(error) => facts.service = service_error_fact(&error),
-    }
+    apply_runtime_evidence(&mut facts, cli, service);
     facts.workspace = DoctorFact::unknown("workspace access is evaluated for each Doctor request");
     facts.into_report()
 }
 
-fn capability_fact(supported: bool, name: &str) -> DoctorFact {
-    if supported {
-        DoctorFact::pass(gate2_evidence(&format!(
-            "signed-off live matrix proves {name}"
-        )))
-    } else {
-        DoctorFact::fail(format!("{name} is unsupported"))
+fn apply_runtime_evidence(
+    facts: &mut DoctorFacts,
+    cli: Result<AppleReleaseEvidence, RuntimeError>,
+    service: Result<AppleSystemStatus, RuntimeError>,
+) {
+    let cli = match cli {
+        Ok(cli) => cli,
+        Err(error) => {
+            apply_cli_error(facts, &error);
+            return;
+        }
+    };
+    let service = match service {
+        Ok(service) => service,
+        Err(error) => {
+            facts.service = service_error_fact(&error);
+            if matches!(error, RuntimeError::InvalidOutput { .. }) {
+                facts.schema =
+                    DoctorFact::fail(format!("malformed structured system status: {error}"));
+            }
+            return;
+        }
+    };
+    let compatibility = match cli.compatibility() {
+        Ok(compatibility) => compatibility,
+        Err(error) => {
+            apply_cli_error(facts, &error);
+            return;
+        }
+    };
+    let versions_match = cli.version == service.api_server_version;
+    let commits_match = cli.commit == service.api_server_commit;
+    match (compatibility, versions_match, commits_match) {
+        (AppleCompatibility::Certified, true, true) => apply_certified_facts(facts, &cli, &service),
+        (AppleCompatibility::CompatibleUntested, true, true) => {
+            apply_compatible_facts(facts, &cli, &service)
+        }
+        (_, false, _) | (_, _, false) => apply_mismatched_facts(facts, &cli, &service),
     }
+}
+
+fn apply_certified_facts(
+    facts: &mut DoctorFacts,
+    cli: &AppleReleaseEvidence,
+    service: &AppleSystemStatus,
+) {
+    facts.cli = DoctorFact::pass("container executable returned structured JSON");
+    facts.version = DoctorFact::pass(gate2_evidence(&format!(
+        "exact release client {} revision matched",
+        release_version(cli)
+    )));
+    facts.service = DoctorFact::pass(gate2_evidence(&format!(
+        "structured system status matches CLI identity {}",
+        release_identity(
+            service.api_server_version.clone(),
+            &service.api_server_commit
+        )
+    )));
+    facts.schema = DoctorFact::pass(gate2_evidence(
+        "CLI and API server structured schemas match",
+    ));
+    facts.kernel = DoctorFact::pass(gate2_evidence(
+        "current exact running service establishes MVP kernel readiness",
+    ));
+    apply_certified_capability_facts(facts);
+}
+
+fn apply_compatible_facts(
+    facts: &mut DoctorFacts,
+    cli: &AppleReleaseEvidence,
+    service: &AppleSystemStatus,
+) {
+    facts.cli = DoctorFact::pass("container executable returned structured JSON");
+    facts.version = DoctorFact::warning(format!(
+        "installed {} is compatible but untested; tested 1.1.0 is the certified Apple Container release",
+        release_version(cli)
+    ));
+    facts.service = DoctorFact::pass(format!(
+        "structured system status matches CLI identity {}",
+        release_identity(
+            service.api_server_version.clone(),
+            &service.api_server_commit
+        )
+    ));
+    facts.schema = DoctorFact::pass("CLI and API server structured schemas match");
+    facts.kernel =
+        DoctorFact::pass("matching running API server establishes runtime kernel readiness");
+    apply_compatible_capability_facts(facts, cli);
+}
+
+fn apply_mismatched_facts(
+    facts: &mut DoctorFacts,
+    cli: &AppleReleaseEvidence,
+    service: &AppleSystemStatus,
+) {
+    facts.cli = DoctorFact::pass("container executable returned structured JSON");
+    match cli.compatibility() {
+        Ok(AppleCompatibility::Certified) => {
+            facts.version = DoctorFact::pass("certified Apple Container CLI release is installed");
+            apply_certified_capability_facts(facts);
+        }
+        Ok(AppleCompatibility::CompatibleUntested) => {
+            facts.version = DoctorFact::warning(format!(
+                "installed {} is compatible but untested; tested 1.1.0 is the certified Apple Container release",
+                release_version(cli)
+            ));
+            apply_compatible_capability_facts(facts, cli);
+        }
+        Err(error) => {
+            apply_cli_error(facts, &error);
+        }
+    }
+    let cli_identity = release_identity(cli.version.clone(), &cli.commit);
+    let service_identity = release_identity(
+        service.api_server_version.clone(),
+        &service.api_server_commit,
+    );
+    facts.service = DoctorFact::fail(format!(
+        "CLI {cli_identity} does not match running service {service_identity}"
+    ));
+    facts.schema = DoctorFact::fail(format!(
+        "CLI {cli_identity} and service {service_identity} cannot share a trusted schema"
+    ));
+    facts.kernel = DoctorFact::unknown(
+        "kernel readiness requires matching CLI and running service identities",
+    );
+}
+
+fn apply_certified_capability_facts(facts: &mut DoctorFacts) {
+    facts.bind_mounts =
+        DoctorFact::pass(gate2_evidence("signed-off live matrix proves bind mounts"));
+    facts.named_volumes = DoctorFact::pass(gate2_evidence(
+        "signed-off live matrix proves named volumes",
+    ));
+    facts.tty = DoctorFact::pass(gate2_evidence(
+        "signed-off live matrix proves TTY attachment",
+    ));
+    facts.signals = DoctorFact::pass(gate2_evidence(
+        "signed-off live matrix proves signal forwarding",
+    ));
+    facts.loopback_publish = DoctorFact::pass(gate2_evidence(
+        "signed-off live matrix proves loopback publication",
+    ));
+    facts.resource_limits = DoctorFact::pass(gate2_evidence(
+        "signed-off live matrix proves resource limits",
+    ));
+    facts.offline = DoctorFact::pass(gate2_evidence(
+        "signed-off live matrix proves hard offline isolation",
+    ));
+}
+
+fn apply_compatible_capability_facts(facts: &mut DoctorFacts, cli: &AppleReleaseEvidence) {
+    let version = release_version(cli);
+    facts.bind_mounts = DoctorFact::pass(format!("Apple Container {version} supports bind mounts"));
+    facts.named_volumes =
+        DoctorFact::pass(format!("Apple Container {version} supports named volumes"));
+    facts.tty = DoctorFact::pass(format!("Apple Container {version} supports TTY attachment"));
+    facts.signals = DoctorFact::pass(format!(
+        "Apple Container {version} supports signal forwarding"
+    ));
+    facts.loopback_publish = DoctorFact::pass(format!(
+        "Apple Container {version} supports loopback publication"
+    ));
+    facts.resource_limits = DoctorFact::pass(format!(
+        "Apple Container {version} supports resource limits"
+    ));
+    facts.offline = DoctorFact::warning(format!(
+        "hard offline isolation is unverified for installed {version}; tested 1.1.0 is the certified Apple Container release"
+    ));
+}
+
+fn release_version(release: &AppleReleaseEvidence) -> String {
+    format!(
+        "{}.{}.{}",
+        release.version.major, release.version.minor, release.version.patch
+    )
+}
+
+fn release_identity(version: gascan_core::runtime::RuntimeVersion, commit: &str) -> String {
+    format!(
+        "{}.{}.{} commit {commit}",
+        version.major, version.minor, version.patch
+    )
 }
 
 fn gate2_evidence(evidence: &str) -> String {
@@ -859,6 +957,123 @@ mod e2e_candidate_tests {
 #[cfg(test)]
 mod doctor_tests {
     use super::*;
+
+    fn release(version: (u64, u64, u64), commit: &str) -> gascan_apple::AppleReleaseEvidence {
+        gascan_apple::AppleReleaseEvidence {
+            version: gascan_core::runtime::RuntimeVersion::new(version.0, version.1, version.2),
+            commit: commit.to_owned(),
+        }
+    }
+
+    fn service(version: (u64, u64, u64), commit: &str) -> gascan_apple::AppleSystemStatus {
+        gascan_apple::AppleSystemStatus {
+            app_root: "/tmp/gascan-test-root".to_owned(),
+            api_server_version: gascan_core::runtime::RuntimeVersion::new(
+                version.0, version.1, version.2,
+            ),
+            api_server_commit: commit.to_owned(),
+        }
+    }
+
+    #[test]
+    fn runtime_evidence_matrix_distinguishes_certified_compatible_and_blocking_states() {
+        let certified = release((1, 1, 0), gascan_apple::APPLE_1_1_COMMIT);
+        let compatible = release((1, 2, 0), "commit-a");
+
+        let mut certified_facts = DoctorFacts::unavailable("test");
+        apply_runtime_evidence(
+            &mut certified_facts,
+            Ok(certified.clone()),
+            Ok(service((1, 1, 0), gascan_apple::APPLE_1_1_COMMIT)),
+        );
+        for fact in [
+            &certified_facts.cli,
+            &certified_facts.version,
+            &certified_facts.service,
+            &certified_facts.kernel,
+            &certified_facts.schema,
+            &certified_facts.bind_mounts,
+            &certified_facts.named_volumes,
+            &certified_facts.tty,
+            &certified_facts.signals,
+            &certified_facts.loopback_publish,
+            &certified_facts.resource_limits,
+            &certified_facts.offline,
+        ] {
+            assert_eq!(fact.status, gascan_core::doctor::DoctorStatus::Pass);
+        }
+
+        let mut compatible_facts = DoctorFacts::unavailable("test");
+        apply_runtime_evidence(
+            &mut compatible_facts,
+            Ok(compatible.clone()),
+            Ok(service((1, 2, 0), "commit-a")),
+        );
+        assert_eq!(
+            compatible_facts.version.status,
+            gascan_core::doctor::DoctorStatus::Warning
+        );
+        assert_eq!(
+            compatible_facts.offline.status,
+            gascan_core::doctor::DoctorStatus::Warning
+        );
+        assert!(compatible_facts.version.detail.contains("installed 1.2.0"));
+        assert!(compatible_facts.version.detail.contains("tested 1.1.0"));
+        assert!(compatible_facts.offline.detail.contains("installed 1.2.0"));
+        assert!(compatible_facts.offline.detail.contains("tested 1.1.0"));
+        for fact in [
+            &compatible_facts.service,
+            &compatible_facts.schema,
+            &compatible_facts.kernel,
+            &compatible_facts.bind_mounts,
+            &compatible_facts.named_volumes,
+            &compatible_facts.tty,
+            &compatible_facts.signals,
+            &compatible_facts.loopback_publish,
+            &compatible_facts.resource_limits,
+        ] {
+            assert_eq!(fact.status, gascan_core::doctor::DoctorStatus::Pass);
+            assert!(!fact.detail.contains("Gate 2"));
+        }
+
+        for (cli, running) in [
+            (compatible.clone(), service((1, 2, 0), "commit-b")),
+            (compatible.clone(), service((1, 1, 0), "commit-a")),
+        ] {
+            let mut facts = DoctorFacts::unavailable("test");
+            apply_runtime_evidence(&mut facts, Ok(cli), Ok(running));
+            assert_eq!(
+                facts.service.status,
+                gascan_core::doctor::DoctorStatus::Fail
+            );
+            assert_eq!(facts.schema.status, gascan_core::doctor::DoctorStatus::Fail);
+            assert!(facts.service.detail.contains("CLI 1.2.0"));
+            assert!(facts.schema.detail.contains("service"));
+        }
+
+        for unsupported in [
+            release((1, 0, 9), "commit-a"),
+            release((2, 0, 0), "commit-a"),
+        ] {
+            let mut facts = DoctorFacts::unavailable("test");
+            apply_runtime_evidence(
+                &mut facts,
+                Ok(unsupported.clone()),
+                Ok(service(
+                    (
+                        unsupported.version.major,
+                        unsupported.version.minor,
+                        unsupported.version.patch,
+                    ),
+                    &unsupported.commit,
+                )),
+            );
+            assert_eq!(
+                facts.version.status,
+                gascan_core::doctor::DoctorStatus::Fail
+            );
+        }
+    }
 
     #[test]
     fn host_architecture_mismatch_fails() {
