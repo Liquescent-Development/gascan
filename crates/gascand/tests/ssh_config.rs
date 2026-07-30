@@ -479,7 +479,7 @@ async fn readiness_retries_transient_failure_with_identical_strict_argv() -> Tes
 
 #[cfg(debug_assertions)]
 #[tokio::test]
-async fn readiness_reports_bounded_lossy_final_stderr_tail_after_deadline() -> TestResult {
+async fn permanent_readiness_failure_reports_bounded_lossy_final_stderr_tail() -> TestResult {
     let temp = TempDir::new()?;
     let root = Utf8Path::from_path(temp.path()).ok_or("temporary root is not UTF-8")?;
     let (runtime, id, resolution, paths) = booted_readiness_context(&temp).await?;
@@ -505,9 +505,12 @@ async fn readiness_reports_bounded_lossy_final_stderr_tail_after_deadline() -> T
         )
         .await
         .expect_err("permanent readiness failure must not activate SSH");
-    let detail = error.to_string();
-
     assert_eq!(error.code(), "ssh_not_ready");
+    let (endpoint, detail) = match error {
+        gascand::ServiceError::SshNotReady { endpoint, detail } => (endpoint, detail),
+        other => return Err(format!("expected SSH readiness error, got {other:?}").into()),
+    };
+    assert_eq!(endpoint.as_deref(), Some("127.0.0.1:24242"));
     assert!(
         detail.contains("127.0.0.1:24242"),
         "missing endpoint: {detail}"

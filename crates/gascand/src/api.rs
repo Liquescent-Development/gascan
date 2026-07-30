@@ -988,6 +988,15 @@ fn service_status(error: ServiceError) -> tonic::Status {
                 )),
             )
         }
+        error @ ServiceError::SshNotReady { .. } => {
+            let code = error_code::SSH_NOT_READY;
+            let cause = error.to_string();
+            tonic::Status::with_details(
+                tonic::Code::FailedPrecondition,
+                code,
+                tonic::codegen::Bytes::from(gascan_proto::error_detail::encode(code, &cause)),
+            )
+        }
         _ => tonic::Status::internal(error_code::INTERNAL),
     }
 }
@@ -3564,6 +3573,36 @@ mod tests {
                 "requested_layout": 2,
                 "recovery": "run `gascan destroy --yes` and then `gascan up`",
             })
+        );
+    }
+
+    #[test]
+    fn ssh_readiness_status_preserves_the_actionable_cause() {
+        let status = service_status(ServiceError::SshNotReady {
+            endpoint: Some("127.0.0.1:2222".to_owned()),
+            detail: concat!(
+                "strict SSH readiness for 127.0.0.1:2222 failed; ",
+                "last OpenSSH stderr tail: Host key verification failed\n",
+                "Run `gascan doctor` for managed SSH configuration details."
+            )
+            .to_owned(),
+        });
+
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(status.message(), gascan_proto::error_code::SSH_NOT_READY);
+        let cause = gascan_proto::error_detail::decode_message(status.details())
+            .expect("SSH readiness status must carry its actionable cause");
+        assert!(
+            cause.contains("127.0.0.1:2222"),
+            "missing endpoint: {cause}"
+        );
+        assert!(
+            cause.contains("Host key verification failed"),
+            "missing OpenSSH cause: {cause}"
+        );
+        assert!(
+            cause.contains("gascan doctor"),
+            "missing recovery instruction: {cause}"
         );
     }
 
