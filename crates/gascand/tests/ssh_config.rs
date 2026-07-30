@@ -1,20 +1,29 @@
+#[cfg(debug_assertions)]
 use camino::Utf8Path;
+#[cfg(debug_assertions)]
 use gascan_core::fake_runtime::FakeRuntime;
+#[cfg(debug_assertions)]
 use gascan_core::manifest::Manifest;
-use gascan_core::sandbox::{SandboxId, SandboxSpec};
+use gascan_core::sandbox::SandboxId;
+#[cfg(debug_assertions)]
+use gascan_core::sandbox::SandboxSpec;
 use gascand::{
-    ActiveSsh, ManagedSshHost, NoopProvisioner, SandboxService, SshManager, SshPaths,
-    SshReadinessPolicy, SshResolution, Store, UpRequest, ensure_host_identity,
+    ActiveSsh, ManagedSshHost, SshManager, SshPaths, SshResolution, ensure_host_identity,
     prepare_openssh_files, publish_openssh_files, readiness_ssh_args,
 };
+#[cfg(debug_assertions)]
+use gascand::{NoopProvisioner, SandboxService, SshReadinessPolicy, Store, UpRequest};
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
+#[cfg(debug_assertions)]
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::process::Command;
+#[cfg(debug_assertions)]
 use std::sync::Arc;
+#[cfg(debug_assertions)]
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -29,6 +38,7 @@ fn paths(temp: &TempDir) -> Result<SshPaths, Box<dyn std::error::Error>> {
     Ok(SshPaths::for_environment(None, Some(home.as_os_str()))?)
 }
 
+#[cfg(debug_assertions)]
 async fn booted_readiness_context(
     temp: &TempDir,
 ) -> Result<(FakeRuntime, SandboxId, SshResolution, SshPaths), Box<dyn std::error::Error>> {
@@ -64,6 +74,7 @@ async fn booted_readiness_context(
     Ok((runtime, spec.id().clone(), resolution, ssh_paths))
 }
 
+#[cfg(debug_assertions)]
 fn executable_script(
     root: &Utf8Path,
     name: &str,
@@ -75,6 +86,7 @@ fn executable_script(
     Ok(path)
 }
 
+#[cfg(debug_assertions)]
 fn strict_readiness_argv(paths: &SshPaths, id: &SandboxId, known_hosts: &str) -> Vec<OsString> {
     vec![
         "-F".into(),
@@ -106,6 +118,7 @@ fn strict_readiness_argv(paths: &SshPaths, id: &SandboxId, known_hosts: &str) ->
     ]
 }
 
+#[cfg(debug_assertions)]
 fn nul_terminated_args(args: &[OsString]) -> Vec<u8> {
     args.iter()
         .flat_map(|argument| argument.as_os_str().as_bytes().iter().copied().chain([0]))
@@ -411,6 +424,7 @@ async fn readiness_args_are_discrete_and_do_not_weaken_reusable_config() -> Test
     Ok(())
 }
 
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn readiness_retries_transient_failure_with_identical_strict_argv() -> TestResult {
     let temp = TempDir::new()?;
@@ -463,6 +477,7 @@ async fn readiness_retries_transient_failure_with_identical_strict_argv() -> Tes
     Ok(())
 }
 
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn readiness_reports_bounded_lossy_final_stderr_tail_after_deadline() -> TestResult {
     let temp = TempDir::new()?;
