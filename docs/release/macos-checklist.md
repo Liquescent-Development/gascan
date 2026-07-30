@@ -1,10 +1,15 @@
 # Gas Can macOS MVP release checklist
 
-Gas Can 0.1 targets Apple-silicon Macs running macOS 26 or newer. It requires
-Apple `container` 1.1.0 and its matching running service. The Gas Can package
-does not redistribute `container`, `container-apiserver`, an Apple kernel, or
-the workspace image. The daemon starts per user, on demand, when the CLI first
-connects; the package installs no launch daemon or login item.
+Gas Can 0.1 targets Apple-silicon Macs running macOS 26 or newer. It accepts
+Apple `container` `>=1.1.0, <2.0.0` and its matching running service. Version
+1.1.0 is the certified release. Newer 1.x releases remain usable for networked
+sandboxes, but `gascan doctor` reports warnings and offline sandboxes require
+the certified release. Gas Can refreshes Apple Container compatibility for
+each request, so changing Apple Container is detected without restarting Gas
+Can. The Gas Can package does not redistribute `container`,
+`container-apiserver`, an Apple kernel, or the workspace image. The daemon
+starts per user, on demand, when the CLI first connects; the package installs
+no launch daemon or login item.
 
 ## Security and runtime contract
 
@@ -162,7 +167,7 @@ Recreating it produces a different tag object.
 
 ## Install and verify
 
-Install Apple `container` 1.1.0, start its service, then run:
+Install an accepted Apple `container` release, start its service, then run:
 
 ```sh
 GASCAN_EXPECTED_SOURCE_REVISION=<signed-release-commit> \
