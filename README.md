@@ -211,10 +211,14 @@ project root, so the same project always maps to the same sandbox.
 
 A networked sandbox enables SSH by default. Apple Container publishes guest
 port 22 on a host IPv4 loopback port, so SSH is reachable from the Mac but is
-not exposed to the LAN. Inside the sandbox, `sshd` listens on its isolated
-Gas Can network so Apple's native publisher can reach it; containers on the
-Apple default network or another sandbox network cannot. Gas Can creates a
-stable `gascan-<sandbox-id>` alias after strict host-key verification succeeds:
+not exposed to the LAN. This remains true when `[ssh].host_port = 2222`:
+`127.0.0.1:2222` can be reached only on the Mac, and direct SSH to
+`<mac-address>:2222` from another machine is intentionally unavailable. Inside
+the sandbox, `sshd` listens on its isolated Gas Can network so Apple's native
+publisher can reach it; containers on the Apple default network or another
+sandbox network cannot. Gas Can does not publish a remotely reachable SSH
+port. It creates a stable `gascan-<sandbox-id>` alias after strict host-key
+verification succeeds:
 
 ```sh
 gascan status
@@ -225,6 +229,11 @@ gascan ssh -- git status
 Gas Can preserves each argument after `--` as a discrete local OpenSSH
 argument and never invokes a local shell. Standard OpenSSH remote-command and
 remote-shell semantics still apply inside the sandbox.
+
+`gascan ssh` also works after first using SSH to sign in to the Mac. Run it in
+that remote Mac shell exactly as in a local Terminal session; it connects from
+the Mac to the sandbox's loopback-only publisher. A non-GUI login session does
+not require `DISPLAY`, agent forwarding, or a second remotely published port.
 
 The host port is selected automatically unless `[ssh].host_port` requests a
 specific port. An unavailable explicit port fails with
@@ -258,12 +267,18 @@ changes.
 
 A host or client fingerprint mismatch fails closed with
 `ssh_host_key_mismatch`: Gas Can does not publish or use an unverified alias.
-Run `gascan doctor` and inspect the sandbox before retrying. Destroy and
-recreate only when intentionally resetting trust, because
+Readiness failures retain the final bounded OpenSSH error detail—such as a
+connection or host-key verification error—and direct you to run
+`gascan doctor`. Doctor reports the exact failing managed path and remedy for
+the identity, generated config, referenced `known_hosts.<sha256>` generation,
+or native publisher instead of reducing it to a generic SSH failure. Inspect
+that path and the sandbox before retrying. Destroy and recreate only when
+intentionally resetting trust, because
 `gascan destroy --yes` removes the alias, active sandbox trust, sandbox host
-key, and all managed volumes. Retired immutable known-host generations can
-remain unreferenced so concurrent OpenSSH readers keep a consistent snapshot;
-the current managed config does not load them. Destroy retains the
+key, and all managed volumes. After a durable publication, Gas Can prunes
+obsolete safe `known_hosts.<sha256>` generations; the one exact generation
+referenced by `~/.config/gascan/ssh/config` remains. Unsafe entries are left
+untouched and reported by doctor for explicit repair. Destroy retains the
 installation-wide client identity and does not remove the optional
 `~/.ssh/config` include.
 

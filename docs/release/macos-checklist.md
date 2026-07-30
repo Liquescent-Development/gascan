@@ -24,6 +24,12 @@ no launch daemon or login item.
 - `networked` uses Apple networking. `offline` uses Apple's no-network
   configuration and is a release-blocking promise. Published ports bind only
   to host loopback.
+- Native sandbox SSH publishes guest port 22 only on host IPv4 loopback. Even
+  when the requested host port is 2222, direct access to
+  `<mac-address>:2222` from another machine is intentionally unavailable;
+  Gas Can makes no direct remote SSH publication claim. An operator who first
+  signs in to the Mac with SSH can run `gascan ssh` from that non-GUI Mac
+  session, which connects locally through the loopback-only publisher.
 - CPU and memory limits are supported. Explicit disk limits fail closed with
   `disk_control_unsupported`; process-count input is rejected. Gas Can makes no
   disk- or process-ceiling claim on Apple `container` 1.1.0.
@@ -211,6 +217,32 @@ symlink because the daemon deliberately rejects symlinked runtime-directory
 components. Persistent tool, cache, and Gas Can configuration
 live in Apple named volumes; the canonical project remains at its selected host
 path. Apple owns its runtime/image storage locations.
+
+## Native SSH connected acceptance
+
+Run the connected image gate and the ignored Apple native-SSH scenario against
+the approved immutable workspace image; do not rebuild or republish an
+unrelated image for this check. Acceptance requires all of the following:
+
+- readiness retries an injected transient failure and ultimately runs real
+  OpenSSH with byte-for-byte identical arguments on every attempt, including
+  `StrictHostKeyChecking=yes`, `IdentitiesOnly=yes`, the exact managed
+  `IdentityFile`, and the exact referenced `UserKnownHostsFile`;
+- the client and host-key fingerprints do not change across retry, restart,
+  image apply, or daemon reconciliation, and final structured status is
+  `ssh.state == "ready"`;
+- `gascan ssh` succeeds in an SSH-like non-GUI login environment on the Mac,
+  while another machine still cannot connect directly to the Mac's port 2222;
+- the final managed directory contains only the
+  `known_hosts.<sha256>` generation referenced by
+  `~/.config/gascan/ssh/config`.
+
+If readiness fails, preserve its bounded final OpenSSH detail and run
+`gascan doctor`. The SSH facts must name the exact managed identity, config, or
+referenced generation path that is missing, unsafe, or inconsistent, or name
+the native publisher problem with its direct remedy. A generic “SSH failed”
+message, a path-free repair instruction, or a successful connection obtained
+by disabling strict host-key verification is release-blocking evidence.
 
 ## Clean-host Gate 5
 
