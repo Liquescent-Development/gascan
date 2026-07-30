@@ -314,6 +314,11 @@ owned_image
   pstree -p $$ | grep -Fq "sh("
   tree --version | sed -n "1p" | grep -Eq "^tree v[0-9]"
   test "$(printf gascan-less | less -F -X)" = gascan-less
+  test ! -e /etc/update-motd.d/60-unminimize
+  test ! -e /etc/dpkg/dpkg.cfg.d/excludes
+  test ! -e /etc/dpkg/dpkg.cfg.d/excludes.dpkg-tmp
+  test "$(dpkg-divert --truename /usr/bin/man)" = /usr/bin/man
+  test -s /usr/share/man/man1/bash.1.gz
 '
 owned_image
 cleanup_container "$offline_name" "$offline_created" "$offline_verified"

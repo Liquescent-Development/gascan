@@ -3,6 +3,16 @@ ARG GASCAMP_REVISION=f6b248c5926240856dbea83d1d2c5c90ea1c1456
 
 FROM ${BASE_IMAGE} AS workspace-base
 
+RUN if ! yes | DEBIAN_FRONTEND=noninteractive unminimize \
+        >/tmp/unminimize.log 2>&1; then \
+      tail -n 200 /tmp/unminimize.log >&2; \
+      exit 1; \
+    fi \
+    && rm -f /tmp/unminimize.log \
+    && test ! -e /etc/update-motd.d/60-unminimize \
+    && test ! -e /etc/dpkg/dpkg.cfg.d/excludes \
+    && test ! -e /etc/dpkg/dpkg.cfg.d/excludes.dpkg-tmp
+
 COPY --chmod=0444 tests/image/system-tools.txt /tmp/system-tools.txt
 RUN test "$(LC_ALL=C sort -u /tmp/system-tools.txt | wc -l | tr -d ' ')" = "$(wc -l < /tmp/system-tools.txt | tr -d ' ')" \
     && apt-get -o Acquire::Retries=0 update \

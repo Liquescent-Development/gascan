@@ -42,6 +42,23 @@ install -d -o root -g workspace -m 1770 "$home/.config" "$gascan_root"
 rm -rf "$shell_dir"
 rm -f "$lock"
 
+interactive_directory()
+{
+    ssh_connection=$1
+    starting_directory=$2
+    /usr/sbin/runuser -u workspace -- env \
+        HOME="$home" SSH_CONNECTION="$ssh_connection" \
+        /bin/bash --noprofile --norc -i -c \
+        "cd '$starting_directory'; . '$hook'; /bin/pwd" 2>/dev/null
+}
+
+test "$(interactive_directory 'client 10000 server 22' "$home")" = /workspace ||
+    die 'interactive SSH shell did not enter /workspace from home'
+test "$(interactive_directory '' "$home")" = "$home" ||
+    die 'local interactive shell was redirected from home'
+test "$(interactive_directory 'client 10000 server 22' /tmp)" = /tmp ||
+    die 'interactive SSH shell outside home was redirected'
+
 run_configurator()
 {
     /usr/sbin/runuser -u workspace -- env HOME=/tmp/hostile-home \
