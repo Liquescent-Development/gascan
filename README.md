@@ -276,11 +276,13 @@ that path and the sandbox before retrying. Destroy and recreate only when
 intentionally resetting trust, because
 `gascan destroy --yes` removes the alias, active sandbox trust, sandbox host
 key, and all managed volumes. After a durable publication, Gas Can prunes
-obsolete safe `known_hosts.<sha256>` generations; the one exact generation
-referenced by `~/.config/gascan/ssh/config` remains. Unsafe entries are left
-untouched and reported by doctor for explicit repair. Destroy retains the
-installation-wide client identity and does not remove the optional
-`~/.ssh/config` include.
+obsolete safe `known_hosts.<sha256>` generations. Normal successful cleanup
+leaves only the one exact generation referenced by
+`~/.config/gascan/ssh/config`. If cleanup fails after publication, the active
+publication remains usable, doctor warns about the obsolete generation, and
+daemon reconciliation retries cleanup. Unsafe entries are left untouched and
+reported by doctor for explicit repair. Destroy retains the installation-wide
+client identity and does not remove the optional `~/.ssh/config` include.
 
 For SSH diagnostics, human output gives a compact summary; JSON includes the
 exact fact details and remedies:

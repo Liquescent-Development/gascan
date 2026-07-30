@@ -1,10 +1,10 @@
-use crate::SshPaths;
 use crate::ssh::manager::resolution_enabled;
 use crate::ssh::{
     ManagedSshDiagnostic, ManagedSshDiagnosticKind, PublishedSshSnapshot, SshManager,
     inspect_host_identity_if_present, inspect_managed_ssh_artifacts,
 };
 use crate::store::{ActualState, SshResolution, Store};
+use crate::{ServiceError, SshPaths};
 use camino::Utf8Path;
 use gascan_core::doctor::{DoctorFact, DoctorStatus};
 use gascan_core::sandbox::SandboxId;
@@ -305,15 +305,7 @@ pub async fn ssh_doctor_facts_for_paths(
     let _publication = match SshManager.inspection_guard_for_paths(paths).await {
         Ok(publication) => publication,
         Err(error) => {
-            let unavailable = || {
-                DoctorFact::fail(format!(
-                    "managed SSH publication could not be inspected safely: {error}"
-                ))
-                .with_remedy(format!(
-                    "repair or remove the unsafe managed SSH path {}",
-                    paths.directory()
-                ))
-            };
+            let unavailable = || publication_inspection_failure_fact(&error);
             return SshDoctorFacts {
                 client: client_fact,
                 identity: unavailable(),
@@ -574,6 +566,13 @@ pub async fn ssh_doctor_facts_for_paths(
     }
 }
 
+fn publication_inspection_failure_fact(error: &ServiceError) -> DoctorFact {
+    DoctorFact::fail(format!(
+        "managed SSH publication could not be inspected safely: {error}"
+    ))
+    .with_remedy("run `gascan daemon restart`; if the error persists, report an internal error")
+}
+
 struct DurableSshState {
     expected: Vec<(SandboxId, SshResolution, Option<u16>)>,
     expects_managed_state: bool,
@@ -760,9 +759,34 @@ async fn validate_openssh_config(client: &Path, paths: &SshPaths) -> DoctorFact 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ensure_host_identity, publish_openssh_files};
+    use crate::{ServiceError, SshError, ensure_host_identity, publish_openssh_files};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn poisoned_publication_registry_recommends_daemon_restart_not_filesystem_repair() -> TestResult
+    {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().canonicalize()?;
+        let paths = SshPaths::for_environment(None, Some(home.as_os_str()))?;
+        let error = ServiceError::SshConfigUnsafe(SshError::InvalidState(
+            "managed SSH publication lock registry was poisoned",
+        ));
+
+        let fact = publication_inspection_failure_fact(&error);
+
+        assert_eq!(
+            fact.remedy.as_deref(),
+            Some("run `gascan daemon restart`; if the error persists, report an internal error")
+        );
+        assert!(
+            !fact
+                .remedy
+                .as_deref()
+                .is_some_and(|remedy| remedy.contains(paths.directory().as_str()))
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn warning_ssh_client_remains_available_for_config_validation() -> TestResult {

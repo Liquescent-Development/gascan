@@ -43,7 +43,7 @@ pub use socket::{OwnedSocket, PeerUid, PeerUidMismatch, SocketPaths, validate_pe
 pub use ssh::{
     ActiveSsh, GenerationCleanup, HostIdentity, ManagedSshHost, PortReservation, PreparedSshCreate,
     PreparedSshFiles, PublishedSshSnapshot, SshConfigCommitError, SshConfigCommitFault, SshError,
-    SshManager, SshPaths, SshReadinessPolicy, commit_openssh_files,
+    SshManager, SshPaths, SshReadinessOptions, SshReadinessPolicy, commit_openssh_files,
     commit_openssh_files_with_cleanup_fault, commit_openssh_files_with_fault, ensure_host_identity,
     prepare_openssh_files, prune_known_hosts_generations, publish_openssh_files,
     readiness_ssh_args,

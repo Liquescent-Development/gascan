@@ -3577,7 +3577,8 @@ mod tests {
     }
 
     #[test]
-    fn ssh_readiness_status_preserves_the_actionable_cause() {
+    fn ssh_readiness_status_preserves_the_actionable_cause()
+    -> Result<(), Box<dyn std::error::Error>> {
         let status = service_status(ServiceError::SshNotReady {
             endpoint: Some("127.0.0.1:2222".to_owned()),
             detail: concat!(
@@ -3591,7 +3592,7 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
         assert_eq!(status.message(), gascan_proto::error_code::SSH_NOT_READY);
         let cause = gascan_proto::error_detail::decode_message(status.details())
-            .expect("SSH readiness status must carry its actionable cause");
+            .ok_or("SSH readiness status must carry its actionable cause")?;
         assert!(
             cause.contains("127.0.0.1:2222"),
             "missing endpoint: {cause}"
@@ -3604,6 +3605,7 @@ mod tests {
             cause.contains("gascan doctor"),
             "missing recovery instruction: {cause}"
         );
+        Ok(())
     }
 
     #[test]

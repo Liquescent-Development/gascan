@@ -114,6 +114,14 @@ pub struct SshReadinessPolicy {
     pub maximum_stderr: usize,
 }
 
+#[derive(Clone, Copy)]
+#[doc(hidden)]
+pub struct SshReadinessOptions<'a> {
+    pub program: &'a Utf8Path,
+    pub host_key_timeout: Duration,
+    pub policy: SshReadinessPolicy,
+}
+
 impl Default for SshReadinessPolicy {
     fn default() -> Self {
         Self {
@@ -282,9 +290,11 @@ impl SshManager {
             runtime,
             expected,
             paths,
-            readiness_program,
-            host_key_timeout,
-            SshReadinessPolicy::default(),
+            SshReadinessOptions {
+                program: readiness_program,
+                host_key_timeout,
+                policy: SshReadinessPolicy::default(),
+            },
         )
         .await
     }
@@ -297,21 +307,11 @@ impl SshManager {
         runtime: &impl RuntimeBackend,
         expected: Option<&SshResolution>,
         paths: &SshPaths,
-        readiness_program: &Utf8Path,
-        host_key_timeout: Duration,
-        policy: SshReadinessPolicy,
+        options: SshReadinessOptions<'_>,
     ) -> Result<bool, ServiceError> {
-        self.prepare_activation_for_paths_with_policy_inner(
-            id,
-            runtime,
-            expected,
-            paths,
-            readiness_program,
-            host_key_timeout,
-            policy,
-        )
-        .await
-        .map(|activation| activation.is_some())
+        self.prepare_activation_for_paths_with_policy_inner(id, runtime, expected, paths, options)
+            .await
+            .map(|activation| activation.is_some())
     }
 
     async fn prepare_activation_for_paths_with_policy_inner(
@@ -320,9 +320,7 @@ impl SshManager {
         runtime: &impl RuntimeBackend,
         expected: Option<&SshResolution>,
         paths: &SshPaths,
-        readiness_program: &Utf8Path,
-        host_key_timeout: Duration,
-        policy: SshReadinessPolicy,
+        options: SshReadinessOptions<'_>,
     ) -> Result<Option<PreparedSshActivation>, ServiceError> {
         if expected.is_some_and(|resolution| !resolution_enabled(resolution)) {
             return Ok(None);
@@ -332,7 +330,8 @@ impl SshManager {
             .await
             .map_err(ServiceError::SshConfigUnsafe)?;
         let managed =
-            verified_managed_host(id, runtime, expected, &identity, host_key_timeout).await?;
+            verified_managed_host(id, runtime, expected, &identity, options.host_key_timeout)
+                .await?;
         let mut hosts = load_active_hosts(paths, &identity)?;
         hosts.retain(|host| host.active.alias != managed.active.alias);
         hosts.push(managed.clone());
@@ -343,10 +342,10 @@ impl SshManager {
             .await
             .map_err(ServiceError::SshConfigUnsafe)?;
         run_readiness(
-            readiness_program.as_std_path().as_os_str(),
+            options.program.as_std_path().as_os_str(),
             &args,
             &endpoint,
-            policy,
+            options.policy,
         )
         .await?;
         Ok(Some(PreparedSshActivation {

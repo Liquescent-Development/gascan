@@ -14,7 +14,9 @@ use gascand::{
     readiness_ssh_args,
 };
 #[cfg(debug_assertions)]
-use gascand::{NoopProvisioner, SandboxService, SshReadinessPolicy, Store, UpRequest};
+use gascand::{
+    NoopProvisioner, SandboxService, SshReadinessOptions, SshReadinessPolicy, Store, UpRequest,
+};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -360,6 +362,11 @@ async fn generation_cleanup_retains_every_explicit_generation() -> TestResult {
         .to_owned();
     let rollback = write_generation(&paths, "rollback\n")?;
     let obsolete = write_generation(&paths, "obsolete\n")?;
+    let uppercase = paths
+        .directory()
+        .join(format!("known_hosts.{}", "A".repeat(64)));
+    fs::write(&uppercase, b"retain\n")?;
+    fs::set_permissions(&uppercase, fs::Permissions::from_mode(0o644))?;
     let mut retained = BTreeSet::from([active]);
     retained.insert(
         rollback
@@ -372,9 +379,10 @@ async fn generation_cleanup_retains_every_explicit_generation() -> TestResult {
 
     assert_eq!(cleanup.removed, 1);
     assert_eq!(cleanup.stale, 0);
-    assert_eq!(cleanup.unsafe_entries, 0);
+    assert_eq!(cleanup.unsafe_entries, 1);
     assert!(rollback.exists());
     assert!(!obsolete.exists());
+    assert!(uppercase.exists());
     Ok(())
 }
 
@@ -564,12 +572,14 @@ async fn readiness_retries_transient_failure_with_identical_strict_argv() -> Tes
             &runtime,
             Some(&resolution),
             &paths,
-            &program,
-            Duration::from_secs(1),
-            SshReadinessPolicy {
-                deadline: Duration::from_millis(500),
-                retry_delay: Duration::from_millis(10),
-                maximum_stderr: 128,
+            SshReadinessOptions {
+                program: &program,
+                host_key_timeout: Duration::from_secs(1),
+                policy: SshReadinessPolicy {
+                    deadline: Duration::from_millis(500),
+                    retry_delay: Duration::from_millis(10),
+                    maximum_stderr: 128,
+                },
             },
         )
         .await?;
@@ -601,12 +611,14 @@ async fn permanent_readiness_failure_reports_bounded_lossy_final_stderr_tail() -
             &runtime,
             Some(&resolution),
             &paths,
-            &program,
-            Duration::from_secs(1),
-            SshReadinessPolicy {
-                deadline: Duration::from_millis(500),
-                retry_delay: Duration::from_millis(10),
-                maximum_stderr: 64,
+            SshReadinessOptions {
+                program: &program,
+                host_key_timeout: Duration::from_secs(1),
+                policy: SshReadinessPolicy {
+                    deadline: Duration::from_millis(500),
+                    retry_delay: Duration::from_millis(10),
+                    maximum_stderr: 64,
+                },
             },
         )
         .await
@@ -641,6 +653,52 @@ async fn permanent_readiness_failure_reports_bounded_lossy_final_stderr_tail() -
         .ok_or("readiness error did not label the stderr tail")?;
     assert!(tail.len() <= 64, "stderr tail exceeded its bound: {tail:?}");
     assert!(tail.is_char_boundary(tail.len()));
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn readiness_timeout_kills_hanging_child_before_it_can_complete_later() -> TestResult {
+    let temp = TempDir::new()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("temporary root is not UTF-8")?;
+    let (runtime, id, resolution, paths) = booted_readiness_context(&temp).await?;
+    let started = root.join("hanging-readiness-started");
+    let completed = root.join("hanging-readiness-completed");
+    let program = executable_script(
+        root,
+        "hanging-readiness",
+        &format!(
+            "printf started > '{}'\nsleep 1\nprintf completed > '{}'",
+            started, completed
+        ),
+    )?;
+
+    let error = SshManager
+        .prepare_activation_for_paths_with_policy(
+            &id,
+            &runtime,
+            Some(&resolution),
+            &paths,
+            SshReadinessOptions {
+                program: &program,
+                host_key_timeout: Duration::from_secs(1),
+                policy: SshReadinessPolicy {
+                    deadline: Duration::from_millis(500),
+                    retry_delay: Duration::from_millis(10),
+                    maximum_stderr: 128,
+                },
+            },
+        )
+        .await
+        .expect_err("hanging readiness must time out");
+    assert_eq!(error.code(), "ssh_not_ready");
+    assert!(started.exists(), "readiness child never started");
+
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert!(
+        !completed.exists(),
+        "timed-out readiness child completed after the caller returned"
+    );
     Ok(())
 }
 

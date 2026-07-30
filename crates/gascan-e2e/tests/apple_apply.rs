@@ -87,6 +87,7 @@ fn native_ssh_is_loopback_only_durable_reconciled_and_cleaned() -> TestResult {
         .env("SSH_CONNECTION", "192.0.2.10 54321 192.0.2.20 22")
         .env("SSH_CLIENT", "192.0.2.10 54321 22")
         .env("SSH_TTY", "/dev/ttys999")
+        .env_remove("SSH_AUTH_SOCK")
         .env_remove("DISPLAY");
     let nested = apple_common::run_command_bounded(nested, std::time::Duration::from_secs(90))
         .map_err(|error| format!("nested SSH-like invocation failed: {error}"))?;
@@ -560,12 +561,14 @@ exec /usr/bin/ssh "$@"
                 &runtime,
                 None,
                 &ssh_paths,
-                readiness,
-                std::time::Duration::from_secs(10),
-                gascand::SshReadinessPolicy {
-                    deadline: std::time::Duration::from_secs(15),
-                    retry_delay: std::time::Duration::from_millis(25),
-                    maximum_stderr: 4096,
+                gascand::SshReadinessOptions {
+                    program: readiness,
+                    host_key_timeout: std::time::Duration::from_secs(10),
+                    policy: gascand::SshReadinessPolicy {
+                        deadline: std::time::Duration::from_secs(15),
+                        retry_delay: std::time::Duration::from_millis(25),
+                        maximum_stderr: 4096,
+                    },
                 },
             ),
         )?;
@@ -645,7 +648,7 @@ exec /usr/bin/ssh "$@"
             &env.status_json()
                 .map_err(|error| format!("post-transient SSH status failed: {error}"))?,
         )?)?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(debug_assertions))]

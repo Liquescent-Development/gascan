@@ -238,8 +238,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fake_requested = false;
     match backend_selection(fake_requested) {
         BackendSelection::Apple => {
-            let doctor =
-                DoctorState::refreshing(Duration::from_secs(60), || production_doctor_report());
+            let doctor = DoctorState::refreshing(Duration::from_secs(60), production_doctor_report);
             let attach = gascan_apple::AppleAttach::configured_from_environment()?;
             let runner = E2eProcessRunner::configured_from_environment()?;
             run_daemon(

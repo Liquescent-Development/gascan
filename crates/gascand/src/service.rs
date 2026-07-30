@@ -2607,22 +2607,22 @@ impl<B: RuntimeBackend> SandboxService<B> {
             .ok_or_else(|| ServiceError::Missing(id.clone()))?;
         if record.actual_state != ActualState::Absent {
             validate_storage_layout(&record)?;
+            validate_storage_capacities(
+                &record,
+                requested_storage_from_manifest(request.spec.manifest().storage()),
+            )?;
         }
         let capabilities = self.runtime_capabilities().await?;
         let prepared_ssh = self.prepare_ssh_create(&request.spec).await?;
         let create =
             self.compile_policy(request.spec.clone(), &capabilities, prepared_ssh.as_ref())?;
         let requested_ssh_transport = requested_ssh_transport(&request.spec);
-        let requested_storage = requested_storage(&create)?;
         let prior_ssh_transport = self
             .database({
                 let id = id.clone();
                 move |store| store.ssh_transport_policy(&id)
             })
             .await?;
-        if record.actual_state != ActualState::Absent {
-            validate_storage_capacities(&record, requested_storage)?;
-        }
         let desired_fingerprint = desired_fingerprint(&request.spec).await?;
         let desired_plan = ProvisioningPlanner::plan_for_root(
             request.spec.canonical_root(),
@@ -3770,6 +3770,14 @@ fn validate_storage_layout(record: &SandboxRecord) -> Result<(), ServiceError> {
 
 fn requested_storage(create: &CreateRequest) -> Result<StorageCapacities, ServiceError> {
     requested_storage_from_volumes(create.volumes())
+}
+
+fn requested_storage_from_manifest(storage: &gascan_core::manifest::Storage) -> StorageCapacities {
+    [
+        ("tools", storage.tools().bytes()),
+        ("cache", storage.cache().bytes()),
+        ("config", storage.config().bytes()),
+    ]
 }
 
 fn requested_storage_from_volumes(
