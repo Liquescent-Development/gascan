@@ -1,5 +1,11 @@
 case $- in *i*) ;; *) return 0 2>/dev/null || exit 0;; esac
 
+if [ -n "${SSH_CONNECTION:-}" ] &&
+    [ "$PWD" = "${HOME:-}" ] &&
+    [ -d /workspace ]; then
+    builtin cd -- /workspace || true
+fi
+
 __gascan_inherited_debug_trap=$(builtin trap -p DEBUG)
 
 __gascan_starship_warn()

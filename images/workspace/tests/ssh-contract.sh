@@ -263,6 +263,15 @@ ssh_options=(
   -i "$private_key"
 )
 "${ssh_options[@]}" workspace@127.0.0.1 true
+test "$("${ssh_options[@]}" workspace@127.0.0.1 /bin/pwd)" = /home/workspace ||
+  { printf 'ssh contract: noninteractive command directory changed\n' >&2; exit 1; }
+interactive_directory=$(
+  printf 'pwd\nexit\n' |
+    "${ssh_options[@]}" -tt workspace@127.0.0.1 2>/dev/null |
+    tr -d '\r'
+)
+printf '%s\n' "$interactive_directory" | grep -Fqx /workspace ||
+  { printf 'ssh contract: interactive login did not enter /workspace\n' >&2; exit 1; }
 remote_environment=$("${ssh_options[@]}" workspace@127.0.0.1 /usr/bin/env)
 for variable in \
   'HOME=/home/workspace' \
