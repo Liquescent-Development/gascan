@@ -40,6 +40,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
@@ -268,6 +269,7 @@ pub struct SandboxService<B: RuntimeBackend> {
     ssh_readiness_program: Option<Utf8PathBuf>,
     ssh_host_key_timeout: std::time::Duration,
     ssh_config_commit_fault: Option<SshConfigCommitFault>,
+    ssh_generation_cleanup_fault: AtomicBool,
     refresh_ssh_doctor: bool,
 }
 
@@ -521,6 +523,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             ssh_readiness_program: None,
             ssh_host_key_timeout: HOST_KEY_READ_TIMEOUT,
             ssh_config_commit_fault: None,
+            ssh_generation_cleanup_fault: AtomicBool::new(false),
             refresh_ssh_doctor: true,
         }
     }
@@ -546,6 +549,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             ssh_readiness_program: None,
             ssh_host_key_timeout: HOST_KEY_READ_TIMEOUT,
             ssh_config_commit_fault: None,
+            ssh_generation_cleanup_fault: AtomicBool::new(false),
             refresh_ssh_doctor: true,
         })
     }
@@ -587,6 +591,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             ssh_readiness_program: Some(readiness_program),
             ssh_host_key_timeout: HOST_KEY_READ_TIMEOUT,
             ssh_config_commit_fault: None,
+            ssh_generation_cleanup_fault: AtomicBool::new(false),
             refresh_ssh_doctor: true,
         }
     }
@@ -612,6 +617,13 @@ impl<B: RuntimeBackend> SandboxService<B> {
     }
 
     #[doc(hidden)]
+    pub fn with_ssh_generation_cleanup_fault_for_tests(self) -> Self {
+        self.ssh_generation_cleanup_fault
+            .store(true, Ordering::Release);
+        self
+    }
+
+    #[doc(hidden)]
     pub fn new_with_ssh_timeouts_for_tests(
         runtime: B,
         store: Store,
@@ -631,6 +643,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             ssh_readiness_program: Some(readiness_program),
             ssh_host_key_timeout: host_key_timeout,
             ssh_config_commit_fault: None,
+            ssh_generation_cleanup_fault: AtomicBool::new(false),
             refresh_ssh_doctor: true,
         }
     }
@@ -719,7 +732,15 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 return Err(self.restore_prior_ssh_resolution(id, prior, original).await);
             }
         }
-        if let Err(original) = prepared.commit_with_fault(self.ssh_config_commit_fault) {
+        let committed = if self
+            .ssh_generation_cleanup_fault
+            .swap(false, Ordering::AcqRel)
+        {
+            prepared.commit_with_cleanup_fault()
+        } else {
+            prepared.commit_with_fault(self.ssh_config_commit_fault)
+        };
+        if let Err(original) = committed {
             if original.is_ssh_publication_uncertain() {
                 return Err(original);
             }

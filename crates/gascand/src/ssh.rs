@@ -16,8 +16,10 @@ use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 
 pub use config::{
-    PreparedSshFiles, SshConfigCommitError, SshConfigCommitFault, commit_openssh_files,
-    prepare_openssh_files, publish_openssh_files, readiness_ssh_args,
+    GenerationCleanup, PreparedSshFiles, SshConfigCommitError, SshConfigCommitFault,
+    commit_openssh_files, commit_openssh_files_with_cleanup_fault, commit_openssh_files_with_fault,
+    prepare_openssh_files, prune_known_hosts_generations, publish_openssh_files,
+    readiness_ssh_args,
 };
 pub(crate) use identity::inspect_host_identity_if_present;
 pub use identity::{HostIdentity, ensure_host_identity};
@@ -456,6 +458,30 @@ impl StateDirectory {
         Ok(false)
     }
 
+    pub(crate) fn entry_names(&self) -> Result<Vec<Vec<u8>>, ManagedSshDiagnostic<SshError>> {
+        let mut directory = rustix::fs::Dir::read_from(&self.fd).map_err(|error| {
+            ManagedSshDiagnostic::new(
+                ManagedSshDiagnosticKind::Internal,
+                self.path.clone(),
+                SshError::io("read managed SSH directory", error),
+            )
+        })?;
+        let mut names = Vec::new();
+        while let Some(entry) = directory.read() {
+            let entry = entry.map_err(|error| {
+                ManagedSshDiagnostic::new(
+                    ManagedSshDiagnosticKind::Internal,
+                    self.path.clone(),
+                    SshError::io("read managed SSH directory", error),
+                )
+            })?;
+            if !matches!(entry.file_name().to_bytes(), b"." | b"..") {
+                names.push(entry.file_name().to_bytes().to_vec());
+            }
+        }
+        Ok(names)
+    }
+
     pub(crate) fn create_staging(&self, name: &str, mode: u16) -> Result<File, SshError> {
         let fd = rustix::fs::openat(
             &self.fd,
@@ -526,6 +552,30 @@ impl StateDirectory {
             .map_err(|error| SshError::io("remove managed SSH file", error))
     }
 
+    pub(crate) fn remove_identity_checked(
+        &self,
+        name: &str,
+        expected: FileIdentity,
+        required_mode: u16,
+    ) -> Result<(), ManagedSshDiagnostic<SshError>> {
+        let path = self.path.join(name);
+        let (_file, opened) = self.open_file_inspected(name, required_mode)?;
+        if opened != expected || self.metadata_inspected(name, required_mode)? != Some(expected) {
+            return Err(ManagedSshDiagnostic::new(
+                ManagedSshDiagnosticKind::Unsafe,
+                path,
+                SshError::InvalidState("managed SSH file changed before removal"),
+            ));
+        }
+        rustix::fs::unlinkat(&self.fd, name, AtFlags::empty()).map_err(|error| {
+            ManagedSshDiagnostic::new(
+                ManagedSshDiagnosticKind::Internal,
+                path,
+                SshError::io("remove obsolete managed known-hosts generation", error),
+            )
+        })
+    }
+
     pub(crate) fn sync(&self) -> Result<(), SshError> {
         rustix::fs::fsync(&self.fd)
             .map_err(|error| SshError::io("sync managed SSH directory", error))
@@ -550,6 +600,10 @@ impl StateDirectory {
                 })?);
             Ok(path.join(name))
         }
+    }
+
+    pub(crate) fn path(&self) -> &Utf8Path {
+        &self.path
     }
 }
 

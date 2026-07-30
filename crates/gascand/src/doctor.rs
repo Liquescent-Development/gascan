@@ -195,6 +195,44 @@ fn snapshot_diagnostic_fact<E: std::fmt::Display>(
     fact
 }
 
+fn generation_cleanup_fact(
+    paths: &SshPaths,
+    publication: &crate::ssh::manager::InspectedSshPublication,
+    active: DoctorFact,
+) -> DoctorFact {
+    if active.status != DoctorStatus::Pass {
+        return active;
+    }
+    if let Some(diagnostic) = publication.unsafe_generation() {
+        return diagnostic_fact(diagnostic, "managed known-hosts generation");
+    }
+    let cleanup = publication.generation_cleanup();
+    if cleanup.unsafe_entries > 0 {
+        return DoctorFact::fail(format!(
+            "managed known-hosts generations in {} contain unsafe entries",
+            paths.directory()
+        ))
+        .with_remedy(format!(
+            "repair or remove the unsafe managed SSH path {}",
+            paths.directory()
+        ));
+    }
+    if cleanup.stale == 0 {
+        return active;
+    }
+    let suffix = if cleanup.stale == 1 { "" } else { "s" };
+    let verb = if cleanup.stale == 1 {
+        "remains"
+    } else {
+        "remain"
+    };
+    DoctorFact::warning(format!(
+        "{} obsolete managed known-hosts generation{suffix} {verb} in {}",
+        cleanup.stale,
+        paths.directory()
+    ))
+}
+
 fn ready_or_diagnostic_identity_fact<E: std::fmt::Display>(
     paths: &SshPaths,
     inspection: &Result<Option<crate::HostIdentity>, ManagedSshDiagnostic<E>>,
@@ -465,20 +503,23 @@ pub async fn ssh_doctor_facts_for_paths(
                         SshDoctorCondition::Missing.fact(paths)
                     }
                     Err(diagnostic) => snapshot_diagnostic_fact(paths, &diagnostic),
-                    Ok(_) => match snapshot_inspection {
-                        Some(Ok(snapshot)) => {
-                            validate_complete_publication(
-                                paths,
-                                client,
-                                &client_fact,
-                                durable,
-                                snapshot,
-                            )
-                            .await
-                        }
-                        Some(Err(diagnostic)) => snapshot_diagnostic_fact(paths, &diagnostic),
-                        None => SshDoctorCondition::Missing.fact(paths),
-                    },
+                    Ok(publication) => {
+                        let active = match snapshot_inspection {
+                            Some(Ok(snapshot)) => {
+                                validate_complete_publication(
+                                    paths,
+                                    client,
+                                    &client_fact,
+                                    durable,
+                                    snapshot,
+                                )
+                                .await
+                            }
+                            Some(Err(diagnostic)) => snapshot_diagnostic_fact(paths, &diagnostic),
+                            None => SshDoctorCondition::Missing.fact(paths),
+                        };
+                        generation_cleanup_fact(paths, &publication, active)
+                    }
                 };
                 (identity_fact, config_fact)
             }

@@ -2,12 +2,12 @@ use super::identity::{
     HostIdentity, open_revalidated_identity, open_revalidated_identity_async, parse_public_key,
 };
 use super::{
-    ManagedSshHost, PUBLIC_MODE, SshError, SshPaths, StateDirectory, maximum_managed_file_bytes,
-    random_staging_name,
+    ManagedSshDiagnostic, ManagedSshDiagnosticKind, ManagedSshHost, PUBLIC_MODE, SshError,
+    SshPaths, StateDirectory, maximum_managed_file_bytes, random_staging_name,
 };
 use camino::{Utf8Path, Utf8PathBuf};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -46,6 +46,18 @@ pub struct PreparedSshFiles {
     generation: String,
     known_hosts: Utf8PathBuf,
     config: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GenerationCleanup {
+    pub removed: usize,
+    pub stale: usize,
+    pub unsafe_entries: usize,
+}
+
+pub(crate) struct GenerationInspection {
+    pub(crate) cleanup: GenerationCleanup,
+    pub(crate) unsafe_entry: Option<ManagedSshDiagnostic<SshError>>,
 }
 
 impl PreparedSshFiles {
@@ -111,9 +123,19 @@ pub fn commit_openssh_files_with_fault(
         prepared,
         || Ok(()),
         move |point| match point {
-            AtomicReplacePoint::AfterRenameBeforeDirectorySync if fault.is_some() => Err(
-                SshError::InvalidState("injected post-rename config publication failure"),
-            ),
+            AtomicReplacePoint::AfterRenameBeforeDirectorySync
+                if matches!(
+                    fault,
+                    Some(
+                        SshConfigCommitFault::AfterRename
+                            | SshConfigCommitFault::AfterRenameAndRestore
+                    )
+                ) =>
+            {
+                Err(SshError::InvalidState(
+                    "injected post-rename config publication failure",
+                ))
+            }
             AtomicReplacePoint::BeforeRestore
                 if fault == Some(SshConfigCommitFault::AfterRenameAndRestore) =>
             {
@@ -122,6 +144,27 @@ pub fn commit_openssh_files_with_fault(
                 ))
             }
             _ => Ok(()),
+        },
+    )
+}
+
+#[doc(hidden)]
+pub fn commit_openssh_files_with_cleanup_fault(
+    paths: &SshPaths,
+    prepared: PreparedSshFiles,
+) -> Result<(), SshConfigCommitError> {
+    commit_openssh_files_with_points(
+        paths,
+        prepared,
+        || Ok(()),
+        |point| {
+            if point == AtomicReplacePoint::BeforeGenerationCleanup {
+                Err(SshError::InvalidState(
+                    "injected known-hosts generation cleanup failure",
+                ))
+            } else {
+                Ok(())
+            }
         },
     )
 }
@@ -142,13 +185,14 @@ fn commit_openssh_files_with_points<F, G>(
     paths: &SshPaths,
     prepared: PreparedSshFiles,
     before_config_commit: F,
-    at_point: G,
+    mut at_point: G,
 ) -> Result<(), SshConfigCommitError>
 where
     F: FnOnce() -> Result<(), SshError>,
     G: FnMut(AtomicReplacePoint) -> Result<(), SshError>,
 {
     validate_generation_reference(paths, &prepared)?;
+    let generation = prepared.generation.clone();
     let directory = StateDirectory::open(paths)?;
     verify_generation(&directory, &prepared.generation)?;
     atomic_replace_with_faults(
@@ -156,8 +200,16 @@ where
         CONFIG_NAME,
         &prepared.config,
         before_config_commit,
-        at_point,
-    )
+        &mut at_point,
+    )?;
+
+    let retained = BTreeSet::from([generation]);
+    let _ = at_point(AtomicReplacePoint::BeforeGenerationCleanup).and_then(|()| {
+        inspect_known_hosts_generations_in(&directory, &retained, true)
+            .map(|_| ())
+            .map_err(ManagedSshDiagnostic::into_source)
+    });
+    Ok(())
 }
 
 pub async fn readiness_ssh_args(
@@ -299,7 +351,7 @@ fn render_known_hosts(hosts: &[(&ManagedSshHost, String)]) -> Result<String, Ssh
     Ok(known_hosts)
 }
 
-fn generation_name(contents: &[u8]) -> String {
+pub(crate) fn generation_name(contents: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let digest = Sha256::digest(contents);
     let mut name = String::with_capacity(KNOWN_HOSTS_PREFIX.len() + digest.len() * 2);
@@ -309,6 +361,145 @@ fn generation_name(contents: &[u8]) -> String {
         name.push(HEX[usize::from(byte & 0x0f)] as char);
     }
     name
+}
+
+pub fn prune_known_hosts_generations(
+    paths: &SshPaths,
+    retained: &BTreeSet<String>,
+) -> Result<GenerationCleanup, SshError> {
+    let directory = StateDirectory::open(paths)?;
+    inspect_known_hosts_generations_in(&directory, retained, true)
+        .map(|inspection| inspection.cleanup)
+        .map_err(ManagedSshDiagnostic::into_source)
+}
+
+pub(crate) fn inspect_known_hosts_generations_in(
+    directory: &StateDirectory,
+    retained: &BTreeSet<String>,
+    remove: bool,
+) -> Result<GenerationInspection, ManagedSshDiagnostic<SshError>> {
+    inspect_known_hosts_generations_with_points(directory, retained, remove, |_| Ok(()))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GenerationCleanupPoint {
+    BeforeMetadata,
+    BeforeDirectorySync,
+}
+
+fn inspect_known_hosts_generations_with_points<F>(
+    directory: &StateDirectory,
+    retained: &BTreeSet<String>,
+    remove: bool,
+    mut at_point: F,
+) -> Result<GenerationInspection, ManagedSshDiagnostic<SshError>>
+where
+    F: FnMut(GenerationCleanupPoint) -> Result<(), SshError>,
+{
+    let mut cleanup = GenerationCleanup::default();
+    let mut unsafe_entry = None;
+    let mut cleanup_error = None;
+
+    for bytes in directory.entry_names()? {
+        if !bytes.starts_with(KNOWN_HOSTS_PREFIX.as_bytes()) {
+            continue;
+        }
+        let Some(name) = std::str::from_utf8(&bytes)
+            .ok()
+            .filter(|name| valid_generation_name(name))
+        else {
+            cleanup.unsafe_entries += 1;
+            if unsafe_entry.is_none() {
+                let path = std::str::from_utf8(&bytes).ok().map_or_else(
+                    || directory.path().to_owned(),
+                    |name| directory.path().join(name),
+                );
+                unsafe_entry = Some(ManagedSshDiagnostic::new(
+                    ManagedSshDiagnosticKind::Unsafe,
+                    path,
+                    SshError::InvalidState("managed known-hosts generation name is unsafe"),
+                ));
+            }
+            continue;
+        };
+
+        if let Err(error) = at_point(GenerationCleanupPoint::BeforeMetadata) {
+            cleanup_error = Some(ManagedSshDiagnostic::new(
+                ManagedSshDiagnosticKind::Internal,
+                directory.path().join(name),
+                error,
+            ));
+            break;
+        }
+        let identity = match directory.metadata_inspected(name, PUBLIC_MODE) {
+            Ok(Some(identity)) => identity,
+            Ok(None) => continue,
+            Err(diagnostic) if diagnostic.kind() == ManagedSshDiagnosticKind::Unsafe => {
+                cleanup.unsafe_entries += 1;
+                if unsafe_entry.is_none() {
+                    unsafe_entry = Some(diagnostic);
+                }
+                continue;
+            }
+            Err(diagnostic) => {
+                cleanup_error = Some(diagnostic);
+                break;
+            }
+        };
+        if retained.contains(name) {
+            continue;
+        }
+        if !remove {
+            cleanup.stale += 1;
+            continue;
+        }
+        match directory.remove_identity_checked(name, identity, PUBLIC_MODE) {
+            Ok(()) => cleanup.removed += 1,
+            Err(diagnostic) if diagnostic.kind() == ManagedSshDiagnosticKind::Unsafe => {
+                cleanup.unsafe_entries += 1;
+                if unsafe_entry.is_none() {
+                    unsafe_entry = Some(diagnostic);
+                }
+            }
+            Err(diagnostic) => {
+                cleanup_error = Some(diagnostic);
+                break;
+            }
+        }
+    }
+
+    if cleanup.removed > 0 {
+        at_point(GenerationCleanupPoint::BeforeDirectorySync).map_err(|error| {
+            ManagedSshDiagnostic::new(
+                ManagedSshDiagnosticKind::Internal,
+                directory.path().to_owned(),
+                error,
+            )
+        })?;
+        directory.sync().map_err(|error| {
+            ManagedSshDiagnostic::new(
+                ManagedSshDiagnosticKind::Internal,
+                directory.path().to_owned(),
+                error,
+            )
+        })?;
+    }
+    if let Some(error) = cleanup_error {
+        return Err(error);
+    }
+    Ok(GenerationInspection {
+        cleanup,
+        unsafe_entry,
+    })
+}
+
+fn valid_generation_name(name: &str) -> bool {
+    name.strip_prefix(KNOWN_HOSTS_PREFIX).is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 fn validate_generation_reference(
@@ -329,13 +520,7 @@ fn validate_generation_path(paths: &SshPaths, path: &Utf8Path) -> Result<(), Ssh
             "managed known-hosts generation is invalid",
         ));
     };
-    let valid_name = name.strip_prefix(KNOWN_HOSTS_PREFIX).is_some_and(|digest| {
-        digest.len() == 64
-            && digest
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    });
-    if path.parent() != Some(paths.directory()) || !valid_name {
+    if path.parent() != Some(paths.directory()) || !valid_generation_name(name) {
         return Err(SshError::InvalidState(
             "managed known-hosts generation is invalid",
         ));
@@ -526,6 +711,7 @@ enum AtomicReplacePoint {
     AfterRenameBeforeDirectorySync,
     AfterDirectorySyncBeforeMetadata,
     BeforeRestore,
+    BeforeGenerationCleanup,
 }
 
 fn atomic_replace_with_faults<F, G>(
@@ -702,13 +888,16 @@ impl Drop for StagingGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AtomicReplacePoint, PUBLIC_MODE, SshConfigCommitError, SshError, SshPaths, StateDirectory,
-        atomic_replace, atomic_replace_with, atomic_replace_with_faults, commit_openssh_files_with,
-        prepare_openssh_files, publish_openssh_files,
+        AtomicReplacePoint, GenerationCleanupPoint, PUBLIC_MODE, SshConfigCommitError, SshError,
+        SshPaths, StateDirectory, atomic_replace, atomic_replace_with, atomic_replace_with_faults,
+        commit_openssh_files, commit_openssh_files_with, commit_openssh_files_with_points,
+        generation_name, inspect_known_hosts_generations_with_points, prepare_openssh_files,
+        publish_openssh_files,
     };
     use crate::ssh::{ActiveSsh, HostIdentity, ManagedSshHost, ensure_host_identity};
     use std::fs;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::os::unix::fs::PermissionsExt as _;
 
     fn host(alias: &str, port: u16, identity: &HostIdentity) -> ManagedSshHost {
         ManagedSshHost {
@@ -754,6 +943,131 @@ mod tests {
             config_before
         );
         assert_eq!(fs::read(known_hosts_before)?, trusted_bytes_before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn generation_cleanup_keeps_the_publication_lock_until_pruning_finishes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().canonicalize()?;
+        let paths = SshPaths::for_environment(None, Some(home.as_os_str()))?;
+        let identity = ensure_host_identity(&paths).await?;
+        let first =
+            prepare_openssh_files(&paths, &identity, &[host("gascan-first", 2222, &identity)])?;
+        let second_host = host("gascan-second", 2223, &identity);
+        let second_identity = identity.clone();
+        let second_paths = paths.clone();
+        let (cleanup_reached_tx, cleanup_reached_rx) = std::sync::mpsc::sync_channel(0);
+        let (continue_cleanup_tx, continue_cleanup_rx) = std::sync::mpsc::sync_channel(0);
+        let first_paths = paths.clone();
+        let first_publication = std::thread::spawn(move || {
+            commit_openssh_files_with_points(
+                &first_paths,
+                first,
+                || Ok(()),
+                |point| {
+                    if point == AtomicReplacePoint::BeforeGenerationCleanup {
+                        cleanup_reached_tx.send(()).map_err(|_| {
+                            SshError::InvalidState("cleanup test coordination failed")
+                        })?;
+                        continue_cleanup_rx.recv().map_err(|_| {
+                            SshError::InvalidState("cleanup test coordination failed")
+                        })?;
+                    }
+                    Ok(())
+                },
+            )
+        });
+        cleanup_reached_rx.recv()?;
+
+        let (second_started_tx, second_started_rx) = std::sync::mpsc::sync_channel(0);
+        let (second_prepared_tx, second_prepared_rx) = std::sync::mpsc::sync_channel(1);
+        let second_publication = std::thread::spawn(move || {
+            second_started_tx
+                .send(())
+                .map_err(|_| SshError::InvalidState("cleanup test coordination failed"))?;
+            let second = prepare_openssh_files(&second_paths, &second_identity, &[second_host])?;
+            second_prepared_tx
+                .send(())
+                .map_err(|_| SshError::InvalidState("cleanup test coordination failed"))?;
+            commit_openssh_files(&second_paths, second)
+        });
+        second_started_rx.recv()?;
+        let prepared_while_cleanup_paused = second_prepared_rx
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .is_ok();
+        continue_cleanup_tx.send(())?;
+
+        first_publication
+            .join()
+            .map_err(|_| std::io::Error::other("first publication thread panicked"))??;
+        second_publication
+            .join()
+            .map_err(|_| std::io::Error::other("second publication thread panicked"))??;
+
+        assert!(
+            !prepared_while_cleanup_paused,
+            "a second publisher acquired the directory lock before cleanup finished"
+        );
+        let config = fs::read_to_string(paths.config())?;
+        assert!(config.contains("Host gascan-second"));
+        let active = configured_known_hosts(&config)?;
+        assert!(std::path::Path::new(active).exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partial_generation_cleanup_syncs_before_returning_a_later_inspection_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().canonicalize()?;
+        let paths = SshPaths::for_environment(None, Some(home.as_os_str()))?;
+        ensure_host_identity(&paths).await?;
+        let first = paths.directory().join(generation_name(b"first stale\n"));
+        let second = paths.directory().join(generation_name(b"second stale\n"));
+        for (path, contents) in [
+            (&first, b"first stale\n".as_slice()),
+            (&second, b"second stale\n".as_slice()),
+        ] {
+            fs::write(path, contents)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(u32::from(PUBLIC_MODE)))?;
+        }
+        let directory = StateDirectory::open(&paths)?;
+        let mut metadata_inspections = 0_usize;
+
+        let result = inspect_known_hosts_generations_with_points(
+            &directory,
+            &std::collections::BTreeSet::new(),
+            true,
+            |point| match point {
+                GenerationCleanupPoint::BeforeMetadata => {
+                    metadata_inspections += 1;
+                    if metadata_inspections == 2 {
+                        Err(SshError::InvalidState(
+                            "injected later generation inspection failure",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
+                GenerationCleanupPoint::BeforeDirectorySync => Err(SshError::InvalidState(
+                    "injected generation cleanup directory sync failure",
+                )),
+            },
+        );
+
+        let error = result
+            .err()
+            .ok_or("generation cleanup unexpectedly passed")?;
+        assert!(matches!(
+            error.source(),
+            SshError::InvalidState("injected generation cleanup directory sync failure")
+        ));
+        assert_eq!(
+            usize::from(first.exists()) + usize::from(second.exists()),
+            1
+        );
         Ok(())
     }
 
@@ -887,7 +1201,8 @@ mod tests {
                 AtomicReplacePoint::BeforeRestore => {
                     Err(SshError::InvalidState("injected restoration failure"))
                 }
-                AtomicReplacePoint::AfterDirectorySyncBeforeMetadata => Ok(()),
+                AtomicReplacePoint::AfterDirectorySyncBeforeMetadata
+                | AtomicReplacePoint::BeforeGenerationCleanup => Ok(()),
             },
         );
 

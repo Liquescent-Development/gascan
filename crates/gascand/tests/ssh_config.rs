@@ -8,12 +8,15 @@ use gascan_core::sandbox::SandboxId;
 #[cfg(debug_assertions)]
 use gascan_core::sandbox::SandboxSpec;
 use gascand::{
-    ActiveSsh, ManagedSshHost, SshManager, SshPaths, SshResolution, ensure_host_identity,
-    prepare_openssh_files, publish_openssh_files, readiness_ssh_args,
+    ActiveSsh, ManagedSshHost, SshConfigCommitFault, SshManager, SshPaths, SshResolution,
+    commit_openssh_files_with_cleanup_fault, commit_openssh_files_with_fault, ensure_host_identity,
+    prepare_openssh_files, prune_known_hosts_generations, publish_openssh_files,
+    readiness_ssh_args,
 };
 #[cfg(debug_assertions)]
 use gascand::{NoopProvisioner, SandboxService, SshReadinessPolicy, Store, UpRequest};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
@@ -296,16 +299,36 @@ async fn publishes_stable_sorted_strict_openssh_files() -> TestResult {
 }
 
 #[tokio::test]
-async fn successful_publication_preserves_the_previous_known_hosts_generation_for_readers()
--> TestResult {
+async fn successful_publication_prunes_only_safe_obsolete_known_hosts_generations() -> TestResult {
     let temp = TempDir::new()?;
     let paths = paths(&temp)?;
     let identity = ensure_host_identity(&paths).await?;
     publish_openssh_files(&paths, &identity, &[host("gascan-before", 2222, &identity)])?;
     let previous_config = fs::read_to_string(paths.config().as_std_path())?;
     let previous_generation = std::path::PathBuf::from(configured_known_hosts(&previous_config)?);
-    let previous_contents = fs::read(&previous_generation)?;
     assert!(previous_generation.exists());
+    let obsolete = write_generation(&paths, "obsolete\n")?;
+    let malformed = paths.directory().join("known_hosts.not-a-generation");
+    fs::write(&malformed, b"malformed")?;
+    fs::set_permissions(&malformed, fs::Permissions::from_mode(0o644))?;
+    let victim = root(&temp)?.join("generation-victim");
+    fs::write(&victim, b"retain")?;
+    let symlink = paths
+        .directory()
+        .join(format!("known_hosts.{}", "a".repeat(64)));
+    std::os::unix::fs::symlink(&victim, &symlink)?;
+    let hard_link_backing = root(&temp)?.join("hard-link-backing");
+    fs::write(&hard_link_backing, b"retain")?;
+    fs::set_permissions(&hard_link_backing, fs::Permissions::from_mode(0o644))?;
+    let hard_link = paths
+        .directory()
+        .join(format!("known_hosts.{}", "b".repeat(64)));
+    fs::hard_link(&hard_link_backing, &hard_link)?;
+    let unsafe_mode = paths
+        .directory()
+        .join(format!("known_hosts.{}", "c".repeat(64)));
+    fs::write(&unsafe_mode, b"retain")?;
+    fs::set_permissions(&unsafe_mode, fs::Permissions::from_mode(0o600))?;
 
     publish_openssh_files(&paths, &identity, &[host("gascan-after", 2223, &identity)])?;
     let current_config = fs::read_to_string(paths.config().as_std_path())?;
@@ -313,7 +336,90 @@ async fn successful_publication_preserves_the_previous_known_hosts_generation_fo
 
     assert_ne!(current_generation, previous_generation);
     assert!(current_generation.exists());
-    assert_eq!(fs::read(previous_generation)?, previous_contents);
+    assert!(!previous_generation.exists());
+    assert!(!obsolete.exists());
+    assert!(malformed.exists());
+    assert_eq!(fs::read(&victim)?, b"retain");
+    assert!(fs::symlink_metadata(&symlink)?.file_type().is_symlink());
+    assert_eq!(fs::symlink_metadata(&hard_link)?.nlink(), 2);
+    assert!(unsafe_mode.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn generation_cleanup_retains_every_explicit_generation() -> TestResult {
+    let temp = TempDir::new()?;
+    let paths = paths(&temp)?;
+    let identity = ensure_host_identity(&paths).await?;
+    publish_openssh_files(&paths, &identity, &[host("gascan-active", 2222, &identity)])?;
+    let active_config = fs::read_to_string(paths.config())?;
+    let active = std::path::Path::new(configured_known_hosts(&active_config)?)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or("active generation name is not UTF-8")?
+        .to_owned();
+    let rollback = write_generation(&paths, "rollback\n")?;
+    let obsolete = write_generation(&paths, "obsolete\n")?;
+    let mut retained = BTreeSet::from([active]);
+    retained.insert(
+        rollback
+            .file_name()
+            .ok_or("rollback generation has no name")?
+            .to_owned(),
+    );
+
+    let cleanup = prune_known_hosts_generations(&paths, &retained)?;
+
+    assert_eq!(cleanup.removed, 1);
+    assert_eq!(cleanup.stale, 0);
+    assert_eq!(cleanup.unsafe_entries, 0);
+    assert!(rollback.exists());
+    assert!(!obsolete.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_generation_publication_does_not_prune_obsolete_generations() -> TestResult {
+    let temp = TempDir::new()?;
+    let paths = paths(&temp)?;
+    let identity = ensure_host_identity(&paths).await?;
+    publish_openssh_files(&paths, &identity, &[host("gascan-before", 2222, &identity)])?;
+    let active_before = fs::read_to_string(paths.config())?;
+    let active_generation = configured_known_hosts(&active_before)?.to_owned();
+    let obsolete = write_generation(&paths, "obsolete-before-durability\n")?;
+    let prepared =
+        prepare_openssh_files(&paths, &identity, &[host("gascan-after", 2223, &identity)])?;
+
+    let result =
+        commit_openssh_files_with_fault(&paths, prepared, Some(SshConfigCommitFault::AfterRename));
+
+    assert!(result.is_err());
+    assert_eq!(fs::read_to_string(paths.config())?, active_before);
+    assert!(std::path::Path::new(&active_generation).exists());
+    assert!(obsolete.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn generation_cleanup_failure_does_not_fail_publication_and_retries() -> TestResult {
+    let temp = TempDir::new()?;
+    let paths = paths(&temp)?;
+    let identity = ensure_host_identity(&paths).await?;
+    publish_openssh_files(&paths, &identity, &[host("gascan-before", 2222, &identity)])?;
+    let previous_config = fs::read_to_string(paths.config())?;
+    let previous_generation = std::path::PathBuf::from(configured_known_hosts(&previous_config)?);
+    let after = [host("gascan-after", 2223, &identity)];
+    let prepared = prepare_openssh_files(&paths, &identity, &after)?;
+
+    commit_openssh_files_with_cleanup_fault(&paths, prepared)?;
+
+    let current_config = fs::read_to_string(paths.config())?;
+    assert!(current_config.contains("Host gascan-after"));
+    assert!(previous_generation.exists());
+
+    let retry = prepare_openssh_files(&paths, &identity, &after)?;
+    commit_openssh_files_with_fault(&paths, retry, None)?;
+    assert!(!previous_generation.exists());
     Ok(())
 }
 

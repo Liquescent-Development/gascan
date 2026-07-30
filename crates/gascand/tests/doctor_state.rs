@@ -1,13 +1,16 @@
 use gascan_core::doctor::{DoctorFact, DoctorFacts};
 use gascan_core::fake_runtime::FakeRuntime;
+use gascan_core::manifest::Manifest;
 use gascan_core::sandbox::SandboxId;
+use gascan_core::sandbox::SandboxSpec;
 use gascan_proto::v1;
 use gascan_proto::v1::gas_can_server::GasCan;
 use gascand::{
     ActiveSsh, ActivityTracker, ActualState, DesiredState, DoctorState, ManagedSshHost,
     NoopProvisioner, OperationKind, SandboxApi, SandboxRecord, SandboxService, SshPaths,
-    SshResolution, Store, ensure_host_identity, publish_openssh_files,
+    SshResolution, Store, UpRequest, ensure_host_identity, publish_openssh_files,
 };
+use sha2::{Digest, Sha256};
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::unix::fs::PermissionsExt as _;
 use std::sync::{
@@ -328,6 +331,20 @@ fn configured_generation_path(
     Ok(camino::Utf8PathBuf::from(path))
 }
 
+fn write_obsolete_generation(
+    paths: &SshPaths,
+    contents: &str,
+) -> Result<camino::Utf8PathBuf, Box<dyn std::error::Error>> {
+    let digest = Sha256::digest(contents.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let path = paths.directory().join(format!("known_hosts.{digest}"));
+    std::fs::write(&path, contents)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+    Ok(path)
+}
+
 #[tokio::test]
 async fn pending_doctor_callers_converge_on_one_completed_report() {
     let (state, completer) = DoctorState::pending();
@@ -496,7 +513,9 @@ async fn ssh_doctor_defers_partial_artifacts_during_first_pending_create() -> Te
         &sandbox_record(id, root, ActualState::Creating, None),
         OperationKind::Create,
     )?;
-    ensure_host_identity(&paths).await?;
+    ensure_host_identity(&paths)
+        .await
+        .map_err(|error| std::io::Error::other(format!("create client identity: {error}")))?;
 
     let facts =
         gascand::ssh_doctor_facts_for_paths(&paths, client.as_std_path(), &store, true).await;
@@ -1209,6 +1228,169 @@ async fn ssh_doctor_accepts_complete_exact_expected_publication() -> TestResult 
         gascan_core::doctor::DoctorStatus::Pass
     );
     assert_eq!(facts.config.status, gascan_core::doctor::DoctorStatus::Pass);
+    Ok(())
+}
+
+#[tokio::test]
+async fn ssh_doctor_warns_for_one_obsolete_known_hosts_generation() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = camino::Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    let home = root.join("home");
+    std::fs::create_dir(&home)?;
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
+    let home = home.canonicalize()?;
+    let paths = SshPaths::for_environment(None, Some(home.as_os_str()))?;
+    let identity = ensure_host_identity(&paths).await?;
+    let id = SandboxId::test("doctor-obsolete");
+    let host = managed_host(&id, 24_008, &identity);
+    publish_openssh_files(&paths, &identity, std::slice::from_ref(&host))?;
+    let _obsolete = write_obsolete_generation(&paths, "obsolete\n")?;
+    let state_path = root.join("state.db");
+    let store = Store::open(&state_path)?;
+    store.put_sandbox(&sandbox_record(
+        id.clone(),
+        root,
+        ActualState::Running,
+        Some(enabled_resolution(&host)),
+    ))?;
+    enable_transport(state_path.as_std_path(), &id, host.active.port)?;
+    let client = root.join("ssh");
+    std::fs::write(&client, "#!/bin/sh\nexit 0\n")?;
+    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755))?;
+
+    let facts =
+        gascand::ssh_doctor_facts_for_paths(&paths, client.as_std_path(), &store, true).await;
+
+    assert_eq!(
+        facts.config.status,
+        gascan_core::doctor::DoctorStatus::Warning
+    );
+    assert!(
+        facts
+            .config
+            .detail
+            .contains("1 obsolete managed known-hosts generation")
+    );
+    assert!(facts.config.detail.contains(paths.directory().as_str()));
+    assert_eq!(facts.config.remedy, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cleanup_fault_warns_for_obsolete_generation_until_service_reconciliation() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = camino::Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    std::fs::write(
+        root.join("gascan.toml"),
+        "version = 1\nnetwork = 'networked'\n[ssh]\nhost_port = 24010\n",
+    )?;
+    let spec = SandboxSpec::from_root("cleanup-retry", root, Manifest::load(root)?)?;
+    let home = root.join("home");
+    std::fs::create_dir(&home)?;
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
+    let home = home.canonicalize()?;
+    let paths = SshPaths::for_environment(None, Some(home.as_os_str()))?;
+    ensure_host_identity(&paths).await?;
+    let obsolete = write_obsolete_generation(&paths, "retry-obsolete\n")?;
+
+    let host_home = tempfile::tempdir()?;
+    let canonical_host_home = host_home.path().canonicalize()?;
+    let host_paths = SshPaths::for_environment(None, Some(canonical_host_home.as_os_str()))?;
+    let host_public_key = ensure_host_identity(&host_paths)
+        .await
+        .map_err(|error| std::io::Error::other(format!("create host identity: {error}")))?
+        .public_key()
+        .to_owned();
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_public_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    runtime.queue_created_ssh_host_port(24_010).await;
+    let state_path = root.join("state.db");
+    let service = SandboxService::new_with_ssh_for_tests(
+        runtime,
+        Store::open(&state_path)?,
+        Arc::new(NoopProvisioner),
+        paths.clone(),
+        camino::Utf8PathBuf::from("/usr/bin/true"),
+    )
+    .with_ssh_generation_cleanup_fault_for_tests();
+
+    service
+        .up(UpRequest::new(spec))
+        .await
+        .map_err(|error| std::io::Error::other(format!("publish with cleanup fault: {error}")))?;
+
+    assert!(paths.config().exists());
+    assert!(obsolete.exists());
+    let client = root.join("ssh");
+    std::fs::write(&client, "#!/bin/sh\nexit 0\n")?;
+    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755))?;
+    let store = Store::open(&state_path)?;
+    let warning =
+        gascand::ssh_doctor_facts_for_paths(&paths, client.as_std_path(), &store, true).await;
+    assert_eq!(
+        warning.config.status,
+        gascan_core::doctor::DoctorStatus::Warning
+    );
+    assert!(
+        warning
+            .config
+            .detail
+            .contains("1 obsolete managed known-hosts generation")
+    );
+    assert!(warning.config.detail.contains(paths.directory().as_str()));
+
+    service
+        .reconcile()
+        .await
+        .map_err(|error| std::io::Error::other(format!("reconcile cleanup retry: {error}")))?;
+
+    assert!(!obsolete.exists());
+    let repaired =
+        gascand::ssh_doctor_facts_for_paths(&paths, client.as_std_path(), &store, true).await;
+    assert_eq!(
+        repaired.config.status,
+        gascan_core::doctor::DoctorStatus::Pass
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ssh_doctor_rejects_malformed_obsolete_known_hosts_generation() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = camino::Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    let home = root.join("home");
+    std::fs::create_dir(&home)?;
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
+    let home = home.canonicalize()?;
+    let paths = SshPaths::for_environment(None, Some(home.as_os_str()))?;
+    let identity = ensure_host_identity(&paths).await?;
+    let id = SandboxId::test("doctor-obsolete-unsafe");
+    let host = managed_host(&id, 24_009, &identity);
+    publish_openssh_files(&paths, &identity, std::slice::from_ref(&host))?;
+    let malformed = paths.directory().join("known_hosts.not-a-generation");
+    std::fs::write(&malformed, b"retain")?;
+    std::fs::set_permissions(&malformed, std::fs::Permissions::from_mode(0o644))?;
+    let state_path = root.join("state.db");
+    let store = Store::open(&state_path)?;
+    store.put_sandbox(&sandbox_record(
+        id.clone(),
+        root,
+        ActualState::Running,
+        Some(enabled_resolution(&host)),
+    ))?;
+    enable_transport(state_path.as_std_path(), &id, host.active.port)?;
+    let client = root.join("ssh");
+    std::fs::write(&client, "#!/bin/sh\nexit 0\n")?;
+    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755))?;
+
+    let facts =
+        gascand::ssh_doctor_facts_for_paths(&paths, client.as_std_path(), &store, true).await;
+
+    assert_eq!(facts.config.status, gascan_core::doctor::DoctorStatus::Fail);
+    assert!(facts.config.detail.contains(malformed.as_str()));
+    assert!(malformed.exists());
     Ok(())
 }
 

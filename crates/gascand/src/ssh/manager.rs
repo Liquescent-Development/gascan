@@ -1,6 +1,7 @@
 use super::config::{
-    PreparedSshFiles, SshConfigCommitError, SshConfigCommitFault, commit_openssh_files,
-    commit_openssh_files_with_fault, prepare_openssh_files, readiness_ssh_args,
+    GenerationCleanup, PreparedSshFiles, SshConfigCommitError, SshConfigCommitFault,
+    commit_openssh_files, commit_openssh_files_with_cleanup_fault, commit_openssh_files_with_fault,
+    generation_name, inspect_known_hosts_generations_in, prepare_openssh_files, readiness_ssh_args,
 };
 use super::identity::{load_host_identity, parse_public_key};
 use super::port::PortReservation;
@@ -94,6 +95,13 @@ impl PreparedSshActivation {
             .map_err(config_commit_error)?;
         Ok(active)
     }
+
+    pub(crate) fn commit_with_cleanup_fault(self) -> Result<ActiveSsh, ServiceError> {
+        let active = self.managed.active;
+        commit_openssh_files_with_cleanup_fault(&self.paths, self.prepared)
+            .map_err(config_commit_error)?;
+        Ok(active)
+    }
 }
 
 pub struct SshManager;
@@ -125,11 +133,21 @@ pub struct PublishedSshSnapshot {
 pub(crate) struct InspectedSshPublication {
     config: Option<Vec<u8>>,
     generation: Option<(Utf8PathBuf, Vec<u8>)>,
+    generation_cleanup: GenerationCleanup,
+    unsafe_generation: Option<ManagedSshDiagnostic<ServiceError>>,
 }
 
 impl InspectedSshPublication {
     pub(crate) const fn config_present(&self) -> bool {
         self.config.is_some()
+    }
+
+    pub(crate) const fn generation_cleanup(&self) -> GenerationCleanup {
+        self.generation_cleanup
+    }
+
+    pub(crate) fn unsafe_generation(&self) -> Option<&ManagedSshDiagnostic<ServiceError>> {
+        self.unsafe_generation.as_ref()
     }
 }
 
@@ -822,6 +840,8 @@ fn inspect_publication_files(
         return Ok(InspectedSshPublication {
             config: None,
             generation: None,
+            generation_cleanup: GenerationCleanup::default(),
+            unsafe_generation: None,
         });
     };
     if directory
@@ -829,10 +849,7 @@ fn inspect_publication_files(
         .map_err(|error| error.map_source(ServiceError::SshConfigUnsafe))?
         .is_none()
     {
-        return Ok(InspectedSshPublication {
-            config: None,
-            generation: None,
-        });
+        return inspected_publication_with_generations(&directory, BTreeSet::new(), None, None);
     }
     let (config, _) = directory
         .read_file_inspected(CONFIG_NAME, PUBLIC_MODE, maximum_managed_file_bytes())
@@ -864,10 +881,12 @@ fn inspect_publication_files(
             )
         })?;
     if references.is_empty() {
-        return Ok(InspectedSshPublication {
-            config: Some(config),
-            generation: None,
-        });
+        return inspected_publication_with_generations(
+            &directory,
+            BTreeSet::from([generation_name(b"")]),
+            Some(config),
+            None,
+        );
     }
     let mut references = references.into_iter();
     let Some(known_hosts_path) = references.next() else {
@@ -902,9 +921,29 @@ fn inspect_publication_files(
     let (known_hosts, _) = directory
         .read_file_inspected(generation, PUBLIC_MODE, maximum_managed_file_bytes())
         .map_err(|error| error.map_source(ServiceError::SshConfigUnsafe))?;
+    inspected_publication_with_generations(
+        &directory,
+        BTreeSet::from([generation.to_owned()]),
+        Some(config),
+        Some((known_hosts_path, known_hosts)),
+    )
+}
+
+fn inspected_publication_with_generations(
+    directory: &StateDirectory,
+    retained: BTreeSet<String>,
+    config: Option<Vec<u8>>,
+    generation: Option<(Utf8PathBuf, Vec<u8>)>,
+) -> Result<InspectedSshPublication, ManagedSshDiagnostic<ServiceError>> {
+    let inspection = inspect_known_hosts_generations_in(directory, &retained, false)
+        .map_err(|diagnostic| diagnostic.map_source(ServiceError::SshConfigUnsafe))?;
     Ok(InspectedSshPublication {
-        config: Some(config),
-        generation: Some((known_hosts_path, known_hosts)),
+        config,
+        generation,
+        generation_cleanup: inspection.cleanup,
+        unsafe_generation: inspection
+            .unsafe_entry
+            .map(|diagnostic| diagnostic.map_source(ServiceError::SshConfigUnsafe)),
     })
 }
 
