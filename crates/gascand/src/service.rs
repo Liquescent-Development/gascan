@@ -15,7 +15,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
-use gascan_core::doctor::{DoctorFact, DoctorFacts, DoctorReport, DoctorStatus};
+use gascan_core::doctor::{DoctorFact, DoctorFacts, DoctorReport};
 use gascan_core::manifest::ManifestError;
 use gascan_core::policy::{
     CACHE_ROOT, CARGO_HOME, CONFIG_ROOT, ControlPlanePolicy, MISE_GLOBAL_CONFIG_FILE,
@@ -969,7 +969,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
         }
         let native_publish = report
             .check("runtime.loopback_publish")
-            .is_some_and(|check| check.status == DoctorStatus::Pass);
+            .is_some_and(|check| check.status.is_available());
         let ssh = match self.ssh_paths.as_ref() {
             Some(paths) => {
                 crate::ssh_doctor_facts_for_paths(

@@ -74,6 +74,43 @@ async fn doctor_warning_capability_is_available_and_has_no_finding() -> TestResu
 }
 
 #[tokio::test]
+async fn refreshed_ssh_doctor_keeps_warning_loopback_publish_nonblocking() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = camino::Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+    let home = root.join("home");
+    std::fs::create_dir(&home)?;
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
+    let home = home.canonicalize()?;
+    let paths = SshPaths::for_environment(None, Some(home.as_os_str()))?;
+    let mut facts = DoctorFacts::all_supported_for_tests();
+    facts.loopback_publish = DoctorFact::warning("loopback publication is untested");
+    let service = SandboxService::new_with_doctor(
+        FakeRuntime::default(),
+        Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+        facts.into_report(),
+    )
+    .with_ssh_paths_for_e2e(paths);
+    let api = SandboxApi::new(Arc::new(service), ActivityTracker::new());
+
+    let response = GasCan::doctor(
+        &api,
+        tonic::Request::new(doctor_workspace(root.as_std_path())?),
+    )
+    .await?
+    .into_inner();
+    let native_publish = response
+        .capabilities
+        .iter()
+        .find(|capability| capability.name == "ssh.native_publish")
+        .ok_or("ssh.native_publish capability missing")?;
+
+    assert!(native_publish.available);
+    assert!(response.findings.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn doctor_workspace_access_is_scoped_to_each_request() -> TestResult {
     let temp = tempfile::tempdir()?;
     let root = camino::Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
