@@ -81,6 +81,7 @@ async fn status_rejects_trailing_version_garbage_and_commit_mismatch() {
     }
 }
 
+#[test]
 fn classifies_only_apple_container_1_1_through_1_x_releases() {
     let cases = [
         ("1.0.9", false),
