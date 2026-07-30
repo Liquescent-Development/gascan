@@ -525,19 +525,18 @@ fn apply_mismatched_facts(
     match cli.compatibility() {
         Ok(AppleCompatibility::Certified) => {
             facts.version = DoctorFact::pass("certified Apple Container CLI release is installed");
-            apply_certified_capability_facts(facts);
         }
         Ok(AppleCompatibility::CompatibleUntested) => {
             facts.version = DoctorFact::warning(format!(
                 "installed {} is compatible but untested; tested 1.1.0 is the certified Apple Container release",
                 release_version(cli)
             ));
-            apply_compatible_capability_facts(facts, cli);
         }
         Err(error) => {
             apply_cli_error(facts, &error);
         }
     }
+    apply_mismatched_capability_facts(facts);
     let cli_identity = release_identity(cli.version.clone(), &cli.commit);
     let service_identity = release_identity(
         service.api_server_version.clone(),
@@ -552,6 +551,17 @@ fn apply_mismatched_facts(
     facts.kernel = DoctorFact::unknown(
         "kernel readiness requires matching CLI and running service identities",
     );
+}
+
+fn apply_mismatched_capability_facts(facts: &mut DoctorFacts) {
+    let detail = "runtime capabilities require matching CLI and running service identities";
+    facts.bind_mounts = DoctorFact::unknown(detail);
+    facts.named_volumes = DoctorFact::unknown(detail);
+    facts.tty = DoctorFact::unknown(detail);
+    facts.signals = DoctorFact::unknown(detail);
+    facts.loopback_publish = DoctorFact::unknown(detail);
+    facts.resource_limits = DoctorFact::unknown(detail);
+    facts.offline = DoctorFact::unknown(detail);
 }
 
 fn apply_certified_capability_facts(facts: &mut DoctorFacts) {
@@ -1001,6 +1011,25 @@ mod doctor_tests {
             &certified_facts.offline,
         ] {
             assert_eq!(fact.status, gascan_core::doctor::DoctorStatus::Pass);
+        }
+
+        let mut certified_mismatch_facts = DoctorFacts::unavailable("test");
+        apply_runtime_evidence(
+            &mut certified_mismatch_facts,
+            Ok(certified.clone()),
+            Ok(service((1, 1, 0), "different-certified-service-commit")),
+        );
+        for fact in [
+            &certified_mismatch_facts.bind_mounts,
+            &certified_mismatch_facts.named_volumes,
+            &certified_mismatch_facts.tty,
+            &certified_mismatch_facts.signals,
+            &certified_mismatch_facts.loopback_publish,
+            &certified_mismatch_facts.resource_limits,
+            &certified_mismatch_facts.offline,
+        ] {
+            assert_ne!(fact.status, gascan_core::doctor::DoctorStatus::Pass);
+            assert!(!fact.detail.contains("Gate 2"));
         }
 
         let mut compatible_facts = DoctorFacts::unavailable("test");
