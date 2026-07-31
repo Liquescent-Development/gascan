@@ -3,6 +3,7 @@
 
 pub mod cli;
 mod client;
+pub(crate) mod configure;
 pub(crate) mod daemon;
 pub(crate) mod guest;
 mod presentation;
