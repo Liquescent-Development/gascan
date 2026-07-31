@@ -7,9 +7,9 @@ is version 1.1.0 at commit `5973b9cc626a3e7a499bb316a958237ebe14e2ed`. Newer
 1.x releases remain usable for networked sandboxes, but `gascan doctor` reports
 warnings. Warning-only reports remain ready and `gascan doctor` exits
 successfully; offline sandboxes require the certified release. Gas Can
-refreshes Apple Container compatibility for each request, so changing Apple
-Container is detected without restarting Gas Can. The Gas Can package does not
-redistribute `container`,
+refreshes Apple Container compatibility for each relevant request, so changing
+Apple Container is detected without restarting Gas Can. The Gas Can package
+does not redistribute `container`,
 `container-apiserver`, an Apple kernel, or the workspace image. The daemon
 starts per user, on demand, when the CLI first connects; the package installs
 no launch daemon or login item.

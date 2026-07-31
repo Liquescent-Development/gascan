@@ -747,9 +747,7 @@ async fn run_readiness(
             Ok(Ok(output)) if output.status.success() => return Ok(()),
             Ok(Ok(output)) => {
                 let detail = bounded_stderr_tail(&output.stderr, policy.maximum_stderr);
-                if !detail.is_empty() {
-                    last_detail = Some(detail);
-                }
+                retain_useful_detail(&mut last_detail, detail);
             }
             Ok(Err(error)) => {
                 return Err(readiness_error(
@@ -798,6 +796,12 @@ fn bounded_stderr_tail(stderr: &[u8], maximum: usize) -> String {
         start += 1;
     }
     decoded[start..].to_owned()
+}
+
+fn retain_useful_detail(last_detail: &mut Option<String>, detail: String) {
+    if !detail.trim().is_empty() {
+        *last_detail = Some(detail);
+    }
 }
 
 fn readiness_error(
@@ -1115,4 +1119,26 @@ fn config_state(message: &'static str) -> ServiceError {
 
 fn alias(id: &SandboxId) -> String {
     format!("gascan-{id}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retain_useful_detail;
+
+    #[test]
+    fn whitespace_only_retry_stderr_does_not_replace_actionable_detail() {
+        let mut last_detail = None;
+
+        retain_useful_detail(
+            &mut last_detail,
+            "Host key verification failed.\n".to_owned(),
+        );
+        retain_useful_detail(&mut last_detail, "\n".to_owned());
+        retain_useful_detail(&mut last_detail, " \n\t".to_owned());
+
+        assert_eq!(
+            last_detail.as_deref(),
+            Some("Host key verification failed.\n")
+        );
+    }
 }

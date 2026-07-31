@@ -946,6 +946,17 @@ fn service_status(error: ServiceError) -> tonic::Status {
         ServiceError::Policy(gascan_core::policy::PolicyError::DiskControlUnsupported) => {
             tonic::Status::invalid_argument(error_code::DISK_CONTROL_UNSUPPORTED)
         }
+        ServiceError::Policy(
+            error @ gascan_core::policy::PolicyError::OfflineUnsupported { .. },
+        ) => {
+            let code = error.code();
+            let cause = error.to_string();
+            tonic::Status::with_details(
+                tonic::Code::InvalidArgument,
+                code,
+                tonic::codegen::Bytes::from(gascan_proto::error_detail::encode(code, &cause)),
+            )
+        }
         ServiceError::Policy(_) | ServiceError::Sandbox(_) | ServiceError::Manifest(_) => {
             tonic::Status::invalid_argument(error_code::INVALID_REQUEST)
         }
@@ -2253,7 +2264,7 @@ mod tests {
     use camino::Utf8PathBuf;
     use gascan_core::{
         policy::PolicyError,
-        runtime::{ExecInput, ExecOutput, ExecSession},
+        runtime::{ExecInput, ExecOutput, ExecSession, RuntimeVersion},
         sandbox::SandboxId,
     };
     use gascan_proto::{error_code, v1};
@@ -3509,6 +3520,25 @@ mod tests {
         let direct = service_status(ServiceError::Policy(PolicyError::DiskControlUnsupported));
         assert_eq!(direct.code(), tonic::Code::InvalidArgument);
         assert_eq!(direct.message(), error_code::DISK_CONTROL_UNSUPPORTED);
+    }
+
+    #[test]
+    fn unverified_offline_policy_rejection_preserves_its_code_and_cause()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let status = service_status(ServiceError::Policy(PolicyError::OfflineUnsupported {
+            version: RuntimeVersion::new(1, 2, 0),
+        }));
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(status.message(), "offline_unavailable");
+        assert_eq!(
+            gascan_proto::error_detail::decode_message(status.details()).as_deref(),
+            Some(
+                "hard offline isolation has not been verified with Apple Container 1.2.0; \
+                 use networked mode or install the certified 1.1.0 release"
+            )
+        );
+        Ok(())
     }
 
     #[test]

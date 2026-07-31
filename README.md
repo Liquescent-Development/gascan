@@ -17,8 +17,8 @@ sandbox is fail-closed offline unless the project opts into networking.
   remain usable for networked sandboxes, but `gascan doctor` reports warnings.
   Warning-only reports remain ready and `gascan doctor` exits successfully;
   offline sandboxes require the certified release. Gas Can refreshes Apple
-  Container compatibility for each request, so changing Apple Container is
-  detected without restarting Gas Can.
+  Container compatibility for each relevant request, so changing Apple
+  Container is detected without restarting Gas Can.
 
 ## Install
 

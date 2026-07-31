@@ -1998,6 +1998,44 @@ mod tests {
     }
 
     #[test]
+    fn offline_unavailable_human_and_json_errors_keep_the_cause_and_stable_code()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let message = concat!(
+            "hard offline isolation has not been verified with Apple Container 1.2.0; ",
+            "use networked mode or install the certified 1.1.0 release"
+        );
+        let details = gascan_proto::error_detail::encode("offline_unavailable", message);
+        let status = || {
+            tonic::Status::with_details(
+                tonic::Code::InvalidArgument,
+                "offline_unavailable",
+                tonic::codegen::Bytes::from(details.clone()),
+            )
+        };
+
+        let human = render_error(&CliError::Client(ClientError::from(status())));
+        assert!(
+            human.contains(message),
+            "human error did not preserve the offline cause: {human}"
+        );
+        assert!(
+            !human.contains("offline_unavailable"),
+            "human error showed the stable code instead of the cause: {human}"
+        );
+
+        let json = super::render_pre_stream_client_error(ClientError::from(status()), true)?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json)?,
+            serde_json::json!({"error": {
+                "code": "offline_unavailable",
+                "message": message,
+                "details": null,
+            }})
+        );
+        Ok(())
+    }
+
+    #[test]
     fn pre_stream_client_error_renders_structured_json_when_requested()
     -> Result<(), Box<dyn std::error::Error>> {
         let message = "storage settings changed for tools (10GiB → 20GiB); run `gascan destroy --yes` and `gascan up` to recreate the sandbox";
