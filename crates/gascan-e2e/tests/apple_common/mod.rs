@@ -129,12 +129,12 @@ impl CandidateImageMapping {
 }
 
 #[derive(Clone, Debug)]
-struct CandidateProcessRunner {
+pub(super) struct CandidateProcessRunner {
     mapping: CandidateImageMapping,
 }
 
 impl CandidateProcessRunner {
-    fn from_environment() -> TestResult<Self> {
+    pub(super) fn from_environment() -> TestResult<Self> {
         Ok(Self {
             mapping: CandidateImageMapping::from_environment()?,
         })

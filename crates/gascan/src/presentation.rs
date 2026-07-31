@@ -111,18 +111,22 @@ pub(crate) fn render_doctor(checks: &[DoctorCheck], capabilities: OutputCapabili
         }
     }
 
-    let ready = checks.iter().all(|check| check.status == "pass");
-    let heading = if ready {
-        styled_heading("Gascan is ready", "✓", true, capabilities)
-    } else {
+    let warnings = checks.iter().any(|check| check.status == "warning");
+    let blocking = checks
+        .iter()
+        .any(|check| check.status != "pass" && check.status != "warning");
+    let heading = if blocking {
         styled_heading("Gascan needs attention", "✗", false, capabilities)
+    } else if warnings {
+        styled_warning_heading("Gascan is ready with warnings", "⚠", capabilities)
+    } else {
+        styled_heading("Gascan is ready", "✓", true, capabilities)
     };
     let group_width = groups
         .iter()
         .map(|group| humanize(group.id).len())
         .max()
-        .unwrap_or(0)
-        .max("Workspace".len());
+        .unwrap_or(0);
     let mut output = format!("{heading}\n");
     for group in groups {
         let title = humanize(group.id);
@@ -131,12 +135,25 @@ pub(crate) fn render_doctor(checks: &[DoctorCheck], capabilities: OutputCapabili
             .iter()
             .filter(|check| check.status == "pass")
             .count();
+        let warnings = group
+            .checks
+            .iter()
+            .filter(|check| check.status == "warning")
+            .count();
         let total = group.checks.len();
         let noun = if total == 1 { "check" } else { "checks" };
-        let _ = writeln!(
-            output,
-            "  {title:<group_width$}  {passing}/{total} {noun} passed"
-        );
+        if warnings == 0 {
+            let _ = writeln!(
+                output,
+                "  {title:<group_width$}  {passing}/{total} {noun} passed"
+            );
+        } else {
+            let warning_noun = if warnings == 1 { "warning" } else { "warnings" };
+            let _ = writeln!(
+                output,
+                "  {title:<group_width$}  {passing}/{total} {noun} passed, {warnings} {warning_noun}"
+            );
+        }
         for check in group
             .checks
             .into_iter()
@@ -146,9 +163,13 @@ pub(crate) fn render_doctor(checks: &[DoctorCheck], capabilities: OutputCapabili
                 .id
                 .split_once('.')
                 .map_or(check.id.as_str(), |(_, id)| id);
-            let check_heading = styled_heading(&humanize(check_id), "✗", false, capabilities);
+            let check_heading = if check.status == "warning" {
+                styled_warning_heading(&humanize(check_id), "⚠", capabilities)
+            } else {
+                styled_heading(&humanize(check_id), "✗", false, capabilities)
+            };
             let _ = writeln!(output, "    {check_heading}");
-            let detail = human_doctor_detail(check);
+            let detail = &check.detail;
             if !detail.is_empty() {
                 let _ = writeln!(output, "      {detail}");
             }
@@ -158,14 +179,6 @@ pub(crate) fn render_doctor(checks: &[DoctorCheck], capabilities: OutputCapabili
         }
     }
     output
-}
-
-fn human_doctor_detail(check: &DoctorCheck) -> &str {
-    match check.id.as_str() {
-        "ssh.identity" => "Managed SSH identity is missing, incomplete, or unsafe",
-        "ssh.config" => "Managed SSH configuration is missing, inconsistent, or unsafe",
-        _ => &check.detail,
-    }
 }
 
 pub(crate) fn render_status(
@@ -422,6 +435,18 @@ fn styled_heading(
         Style::new().red()
     };
     style.apply_to(heading).to_string()
+}
+
+fn styled_warning_heading(heading: &str, symbol: &str, capabilities: OutputCapabilities) -> String {
+    let heading = if capabilities.unicode {
+        format!("{symbol} {heading}")
+    } else {
+        heading.to_owned()
+    };
+    if !capabilities.color {
+        return heading;
+    }
+    Style::new().yellow().apply_to(heading).to_string()
 }
 
 fn humanize(identifier: &str) -> String {
@@ -852,8 +877,68 @@ mod tests {
     fn passing_doctor_report_is_compact_and_uses_one_many_grammar() {
         assert_eq!(
             render_doctor(&passing_checks(), OutputCapabilities::plain()),
-            "Gascan is ready\n  Host       2/2 checks passed\n  Runtime    1/1 check passed\n"
+            "Gascan is ready\n  Host     2/2 checks passed\n  Runtime  1/1 check passed\n"
         );
+    }
+
+    #[test]
+    fn warning_only_doctor_report_is_ready_with_warning_summary_and_details() {
+        let mut checks = (1..=10)
+            .map(|index| check(&format!("runtime.probe_{index}"), "pass", "verified", ""))
+            .collect::<Vec<_>>();
+        checks.push(check(
+            "runtime.version",
+            "warning",
+            "untested 1.2.0",
+            "install the certified release",
+        ));
+        checks.push(check(
+            "runtime.offline",
+            "warning",
+            "offline support is untested",
+            "use a certified release for offline sandboxes",
+        ));
+
+        assert_eq!(
+            render_doctor(
+                &checks,
+                OutputCapabilities {
+                    interactive: false,
+                    color: false,
+                    unicode: true,
+                },
+            ),
+            concat!(
+                "⚠ Gascan is ready with warnings\n",
+                "  Runtime  10/12 checks passed, 2 warnings\n",
+                "    ⚠ Version\n",
+                "      untested 1.2.0\n",
+                "      Fix: install the certified release\n",
+                "    ⚠ Offline\n",
+                "      offline support is untested\n",
+                "      Fix: use a certified release for offline sandboxes\n",
+            )
+        );
+    }
+
+    #[test]
+    fn warning_and_failure_doctor_checks_keep_distinct_headings() {
+        let checks = vec![
+            check("runtime.version", "warning", "untested 1.2.0", ""),
+            check("runtime.offline", "fail", "offline unsupported", ""),
+        ];
+
+        let output = render_doctor(
+            &checks,
+            OutputCapabilities {
+                interactive: false,
+                color: false,
+                unicode: true,
+            },
+        );
+
+        assert!(output.contains("    ⚠ Version\n"));
+        assert!(output.contains("    ✗ Offline\n"));
     }
 
     #[test]
@@ -901,29 +986,61 @@ mod tests {
     }
 
     #[test]
-    fn failed_ssh_checks_hide_managed_paths_and_raw_errors() {
+    fn doctor_failed_ssh_checks_preserve_exact_daemon_details_and_remedies() {
         let checks = vec![
             check(
-                "ssh.identity",
+                "ssh.config",
                 "fail",
-                "managed SSH identity at /Users/example/.config/gascan/ssh/identity_ed25519 is unsafe: private-key-sentinel",
-                "restore the managed identity",
+                "generated SSH config at /Users/test/.config/gascan/ssh/config is missing while durable or generated SSH state exists",
+                "run `gascan up`",
             ),
             check(
                 "ssh.config",
                 "fail",
-                "generated SSH config at /Users/example/.config/gascan/ssh/config was rejected: raw-openssh-error",
-                "regenerate the managed config",
+                "generated SSH config at /Users/test/.config/gascan/ssh/config is unsafe: permissions 0666 allow access outside the owner",
+                "repair or remove the unsafe managed SSH path /Users/test/.config/gascan/ssh/config",
+            ),
+            check(
+                "ssh.config",
+                "fail",
+                "generated SSH config at /Users/test/.config/gascan/ssh/config differs from durable SSH state",
+                "run `gascan up`",
             ),
         ];
 
         let output = render_doctor(&checks, OutputCapabilities::plain());
 
-        assert!(output.contains("Managed SSH identity is missing, incomplete, or unsafe"));
-        assert!(output.contains("Managed SSH configuration is missing, inconsistent, or unsafe"));
-        assert!(!output.contains("/Users/example"));
-        assert!(!output.contains("private-key-sentinel"));
-        assert!(!output.contains("raw-openssh-error"));
+        assert!(output.contains(
+            "generated SSH config at /Users/test/.config/gascan/ssh/config is missing while durable or generated SSH state exists"
+        ));
+        assert!(output.contains(
+            "generated SSH config at /Users/test/.config/gascan/ssh/config is unsafe: permissions 0666 allow access outside the owner"
+        ));
+        assert!(output.contains(
+            "generated SSH config at /Users/test/.config/gascan/ssh/config differs from durable SSH state"
+        ));
+        assert!(output.contains("Fix: run `gascan up`"));
+        assert!(output.contains(
+            "Fix: repair or remove the unsafe managed SSH path /Users/test/.config/gascan/ssh/config"
+        ));
+        assert!(!output.contains("Managed SSH configuration is missing, inconsistent, or unsafe"));
+    }
+
+    #[test]
+    fn doctor_native_publish_failure_renders_actionable_fix() {
+        let checks = vec![check(
+            "ssh.native_publish",
+            "fail",
+            "Apple runtime does not support native IPv4 loopback publication",
+            "install a supported Apple container release with loopback publication support",
+        )];
+
+        let output = render_doctor(&checks, OutputCapabilities::plain());
+
+        assert!(output.contains("Apple runtime does not support native IPv4 loopback publication"));
+        assert!(output.contains(
+            "Fix: install a supported Apple container release with loopback publication support"
+        ));
     }
 
     #[test]

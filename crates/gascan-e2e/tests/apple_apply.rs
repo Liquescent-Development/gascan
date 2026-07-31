@@ -73,6 +73,34 @@ fn native_ssh_is_loopback_only_durable_reconciled_and_cleaned() -> TestResult {
         )
         .into());
     }
+    let nested_argument = "gascan-native-ssh-from-remote-mac-session";
+    let mut nested = env.command([
+        "--sandbox",
+        env.id(),
+        "ssh",
+        "--",
+        "printf",
+        "%s",
+        nested_argument,
+    ]);
+    nested
+        .env("SSH_CONNECTION", "192.0.2.10 54321 192.0.2.20 22")
+        .env("SSH_CLIENT", "192.0.2.10 54321 22")
+        .env("SSH_TTY", "/dev/ttys999")
+        .env_remove("SSH_AUTH_SOCK")
+        .env_remove("DISPLAY");
+    let nested = apple_common::run_command_bounded(nested, std::time::Duration::from_secs(90))
+        .map_err(|error| format!("nested SSH-like invocation failed: {error}"))?;
+    if !nested.status.success() || nested.stdout != nested_argument.as_bytes() {
+        return Err(format!(
+            "gascan ssh failed from an SSH-like non-GUI environment: status={:?} stdout={} \
+             stderr={}",
+            nested.status.code(),
+            String::from_utf8_lossy(&nested.stdout),
+            String::from_utf8_lossy(&nested.stderr),
+        )
+        .into());
+    }
     env.assert_default_network_cannot_reach_native_ssh(&default_network_probe)?;
 
     let alias = before.alias.as_str();
@@ -245,6 +273,13 @@ fn native_ssh_is_loopback_only_durable_reconciled_and_cleaned() -> TestResult {
     if reconciled.stdout != b"reconciled" {
         return Err("daemon restart did not reconstruct a working SSH alias".into());
     }
+    assert_transient_strict_readiness_preserves_evidence(&env, &before)?;
+    let final_status = ssh_status(
+        &env.status_json()
+            .map_err(|error| format!("final SSH status failed: {error}"))?,
+    )?;
+    before.assert_same_fingerprints(&final_status)?;
+    assert_only_active_known_hosts_generation(&env)?;
 
     let collision_listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
     let collision_port = collision_listener.local_addr()?.port();
@@ -470,6 +505,184 @@ fn ssh_status(status: &serde_json::Value) -> TestResult<LiveSshStatus> {
             .ok_or("SSH status omitted client fingerprint")?
             .to_owned(),
     })
+}
+
+fn assert_transient_strict_readiness_preserves_evidence(
+    env: &AppleE2e,
+    before: &LiveSshStatus,
+) -> TestResult {
+    #[cfg(debug_assertions)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir()?;
+        let readiness = fixture.path().join("ssh-readiness");
+        std::fs::write(
+            &readiness,
+            r#"#!/bin/sh
+set -eu
+state=${0%/*}
+attempt=0
+if test -f "$state/counter"; then
+    attempt=$(cat "$state/counter")
+fi
+attempt=$((attempt + 1))
+printf '%s\n' "$attempt" >"$state/counter"
+capture="$state/argv.$attempt"
+: >"$capture"
+for argument in "$@"; do
+    printf '%s\0' "$argument" >>"$capture"
+done
+if test "$attempt" -lt 3; then
+    printf 'injected transient readiness failure\n' >&2
+    exit 255
+fi
+exec /usr/bin/ssh "$@"
+"#,
+        )?;
+        std::fs::set_permissions(&readiness, std::fs::Permissions::from_mode(0o755))?;
+        let readiness = camino::Utf8Path::from_path(&readiness)
+            .ok_or("transient readiness program path is not UTF-8")?;
+        let ssh_paths =
+            gascand::SshPaths::for_environment(None, Some(env.account_home().as_os_str()))?;
+        let attach = gascan_apple::AppleAttach::configured_from_environment()?;
+        let runtime = gascan_apple::AppleBackend::with_attach(
+            apple_common::CandidateProcessRunner::from_environment()?,
+            attach,
+        );
+        let id = gascan_core::sandbox::SandboxId::try_from(env.id().to_owned())?;
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let ready = executor.block_on(
+            gascand::SshManager.prepare_activation_for_paths_with_policy(
+                &id,
+                &runtime,
+                None,
+                &ssh_paths,
+                gascand::SshReadinessOptions {
+                    program: readiness,
+                    host_key_timeout: std::time::Duration::from_secs(10),
+                    policy: gascand::SshReadinessPolicy {
+                        deadline: std::time::Duration::from_secs(15),
+                        retry_delay: std::time::Duration::from_millis(25),
+                        maximum_stderr: 4096,
+                    },
+                },
+            ),
+        )?;
+        if !ready {
+            return Err("transient strict SSH readiness unexpectedly disabled SSH".into());
+        }
+
+        let directory = env.account_home().join(".config/gascan/ssh");
+        let config = std::fs::read_to_string(directory.join("config"))?;
+        let generations = active_known_hosts_paths(&directory, &config)?;
+        let [generation] = generations.as_slice() else {
+            return Err(
+                "strict readiness did not use exactly one active host-key generation".into(),
+            );
+        };
+        let (_, port) = env.native_ssh_endpoint()?;
+        let identity = directory.join("identity_ed25519");
+        let expected = vec![
+            b"-F".to_vec(),
+            b"/dev/null".to_vec(),
+            b"-o".to_vec(),
+            b"HostName=127.0.0.1".to_vec(),
+            b"-o".to_vec(),
+            format!("Port={port}").into_bytes(),
+            b"-o".to_vec(),
+            b"User=workspace".to_vec(),
+            b"-o".to_vec(),
+            format!("IdentityFile={}", identity.display()).into_bytes(),
+            b"-o".to_vec(),
+            format!("HostKeyAlias={}", before.alias).into_bytes(),
+            b"-o".to_vec(),
+            format!("UserKnownHostsFile={}", generation.display()).into_bytes(),
+            b"-o".to_vec(),
+            b"StrictHostKeyChecking=yes".to_vec(),
+            b"-o".to_vec(),
+            b"IdentitiesOnly=yes".to_vec(),
+            b"-o".to_vec(),
+            b"BatchMode=yes".to_vec(),
+            b"-o".to_vec(),
+            b"ForwardAgent=no".to_vec(),
+            b"-o".to_vec(),
+            b"ClearAllForwardings=yes".to_vec(),
+            b"127.0.0.1".to_vec(),
+            b"/usr/bin/true".to_vec(),
+        ];
+        let mut expected_capture = Vec::new();
+        for argument in &expected {
+            expected_capture.extend_from_slice(argument);
+            expected_capture.push(0);
+        }
+        for attempt in 1..=3 {
+            let capture = std::fs::read(fixture.path().join(format!("argv.{attempt}")))?;
+            if capture != expected_capture {
+                return Err(format!(
+                    "strict readiness attempt {attempt} changed exact identity or host-key \
+                     arguments: expected={:?} actual={:?}",
+                    expected_capture
+                        .split(|byte| *byte == 0)
+                        .filter(|argument| !argument.is_empty())
+                        .map(|argument| std::ffi::OsStr::from_bytes(argument).to_string_lossy())
+                        .collect::<Vec<_>>(),
+                    capture
+                        .split(|byte| *byte == 0)
+                        .filter(|argument| !argument.is_empty())
+                        .map(|argument| std::ffi::OsStr::from_bytes(argument).to_string_lossy())
+                        .collect::<Vec<_>>(),
+                )
+                .into());
+            }
+        }
+        if std::fs::read_to_string(fixture.path().join("counter"))?.trim() != "3" {
+            return Err(
+                "transient strict SSH readiness did not succeed on its third attempt".into(),
+            );
+        }
+        before.assert_same_fingerprints(&ssh_status(
+            &env.status_json()
+                .map_err(|error| format!("post-transient SSH status failed: {error}"))?,
+        )?)?;
+        Ok(())
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = (env, before);
+        Err("transient readiness E2E requires the approved debug-only readiness seam".into())
+    }
+}
+
+fn assert_only_active_known_hosts_generation(env: &AppleE2e) -> TestResult {
+    let directory = env.account_home().join(".config/gascan/ssh");
+    let config = std::fs::read_to_string(directory.join("config"))?;
+    let active = active_known_hosts_paths(&directory, &config)?;
+    let [active] = active.as_slice() else {
+        return Err("final SSH config did not reference exactly one host-key generation".into());
+    };
+    let mut present = std::fs::read_dir(&directory)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|name| name.starts_with("known_hosts."))
+        })
+        .collect::<Vec<_>>();
+    present.sort();
+    if present != [active.clone()] {
+        return Err(format!(
+            "obsolete managed SSH host-key generations remain: active={} present={present:?}",
+            active.display()
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn reserve_loopback_port() -> TestResult<u16> {

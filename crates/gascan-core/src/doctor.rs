@@ -4,8 +4,15 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum DoctorStatus {
     Pass,
+    Warning,
     Fail,
     Unknown,
+}
+
+impl DoctorStatus {
+    pub const fn is_available(self) -> bool {
+        matches!(self, Self::Pass | Self::Warning)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -107,6 +114,7 @@ impl DoctorCheckId {
 pub struct DoctorFact {
     pub status: DoctorStatus,
     pub detail: String,
+    pub remedy: Option<String>,
 }
 
 impl DoctorFact {
@@ -114,19 +122,33 @@ impl DoctorFact {
         Self {
             status: DoctorStatus::Pass,
             detail: detail.into(),
+            remedy: None,
+        }
+    }
+    pub fn warning(detail: impl Into<String>) -> Self {
+        Self {
+            status: DoctorStatus::Warning,
+            detail: detail.into(),
+            remedy: None,
         }
     }
     pub fn fail(detail: impl Into<String>) -> Self {
         Self {
             status: DoctorStatus::Fail,
             detail: detail.into(),
+            remedy: None,
         }
     }
     pub fn unknown(detail: impl Into<String>) -> Self {
         Self {
             status: DoctorStatus::Unknown,
             detail: detail.into(),
+            remedy: None,
         }
+    }
+    pub fn with_remedy(mut self, remedy: impl Into<String>) -> Self {
+        self.remedy = Some(remedy.into());
+        self
     }
 }
 
@@ -323,11 +345,11 @@ impl DoctorFacts {
         DoctorReport {
             checks: entries
                 .into_iter()
-                .map(|(id, fact, remedy)| DoctorCheck {
+                .map(|(id, fact, default_remedy)| DoctorCheck {
                     id: id.as_str().to_owned(),
                     status: fact.status,
                     detail: fact.detail,
-                    remedy: remedy.to_owned(),
+                    remedy: fact.remedy.unwrap_or_else(|| default_remedy.to_owned()),
                 })
                 .collect(),
         }
@@ -352,14 +374,12 @@ impl DoctorReport {
         self.checks.iter().find(|check| check.id == id)
     }
     pub fn is_ready(&self) -> bool {
-        self.checks
-            .iter()
-            .all(|check| check.status == DoctorStatus::Pass)
+        self.checks.iter().all(|check| check.status.is_available())
     }
 
     pub fn runtime_readiness_failure(&self) -> Option<&DoctorCheck> {
         self.checks.iter().find(|check| {
-            check.status != DoctorStatus::Pass
+            matches!(check.status, DoctorStatus::Fail | DoctorStatus::Unknown)
                 && DoctorCheckId::from_name(&check.id)
                     .is_none_or(|id| id.role() == DoctorCheckRole::ReadinessPrerequisite)
         })

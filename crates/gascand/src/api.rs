@@ -946,6 +946,17 @@ fn service_status(error: ServiceError) -> tonic::Status {
         ServiceError::Policy(gascan_core::policy::PolicyError::DiskControlUnsupported) => {
             tonic::Status::invalid_argument(error_code::DISK_CONTROL_UNSUPPORTED)
         }
+        ServiceError::Policy(
+            error @ gascan_core::policy::PolicyError::OfflineUnsupported { .. },
+        ) => {
+            let code = error.code();
+            let cause = error.to_string();
+            tonic::Status::with_details(
+                tonic::Code::InvalidArgument,
+                code,
+                tonic::codegen::Bytes::from(gascan_proto::error_detail::encode(code, &cause)),
+            )
+        }
         ServiceError::Policy(_) | ServiceError::Sandbox(_) | ServiceError::Manifest(_) => {
             tonic::Status::invalid_argument(error_code::INVALID_REQUEST)
         }
@@ -986,6 +997,15 @@ fn service_status(error: ServiceError) -> tonic::Status {
                 tonic::codegen::Bytes::from(gascan_proto::error_detail::encode_with_details(
                     code, &message, &details,
                 )),
+            )
+        }
+        error @ ServiceError::SshNotReady { .. } => {
+            let code = error_code::SSH_NOT_READY;
+            let cause = error.to_string();
+            tonic::Status::with_details(
+                tonic::Code::FailedPrecondition,
+                code,
+                tonic::codegen::Bytes::from(gascan_proto::error_detail::encode(code, &cause)),
             )
         }
         _ => tonic::Status::internal(error_code::INTERNAL),
@@ -1121,7 +1141,7 @@ fn service_error_diagnostic(error: &ServiceError) -> String {
         ServiceError::IncompleteDestroy(_) => "service_kind=incomplete_destroy".to_owned(),
         ServiceError::SshPortUnavailable(_)
         | ServiceError::SshHostKeyMismatch(_)
-        | ServiceError::SshNotReady(_)
+        | ServiceError::SshNotReady { .. }
         | ServiceError::SshConfigUnsafe(_)
         | ServiceError::SshConfigUpdateFailed(_)
         | ServiceError::SshConfigPublicationUncertain(_)
@@ -1875,7 +1895,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
             .iter()
             .map(|check| v1::Capability {
                 name: check.id.clone(),
-                available: check.status == DoctorStatus::Pass,
+                available: check.status.is_available(),
                 detail: serde_json::json!({
                     "detail": check.detail,
                     "remedy": check.remedy,
@@ -1887,7 +1907,7 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
         let findings = report
             .checks
             .iter()
-            .filter(|check| check.status != DoctorStatus::Pass)
+            .filter(|check| matches!(check.status, DoctorStatus::Fail | DoctorStatus::Unknown))
             .map(|check| v1::Error {
                 code: check.id.clone(),
                 message: check.detail.clone(),
@@ -2244,7 +2264,7 @@ mod tests {
     use camino::Utf8PathBuf;
     use gascan_core::{
         policy::PolicyError,
-        runtime::{ExecInput, ExecOutput, ExecSession},
+        runtime::{ExecInput, ExecOutput, ExecSession, RuntimeVersion},
         sandbox::SandboxId,
     };
     use gascan_proto::{error_code, v1};
@@ -3503,6 +3523,25 @@ mod tests {
     }
 
     #[test]
+    fn unverified_offline_policy_rejection_preserves_its_code_and_cause()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let status = service_status(ServiceError::Policy(PolicyError::OfflineUnsupported {
+            version: RuntimeVersion::new(1, 2, 0),
+        }));
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(status.message(), "offline_unavailable");
+        assert_eq!(
+            gascan_proto::error_detail::decode_message(status.details()).as_deref(),
+            Some(
+                "hard offline isolation has not been verified with Apple Container 1.2.0; \
+                 use networked mode or install the certified 1.1.0 release"
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
     fn replacement_error_wrappers_preserve_primary_public_status() {
         let unavailable = service_status(ServiceError::ImageRollback {
             original: Box::new(ServiceError::Runtime(
@@ -3565,6 +3604,38 @@ mod tests {
                 "recovery": "run `gascan destroy --yes` and then `gascan up`",
             })
         );
+    }
+
+    #[test]
+    fn ssh_readiness_status_preserves_the_actionable_cause()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let status = service_status(ServiceError::SshNotReady {
+            endpoint: Some("127.0.0.1:2222".to_owned()),
+            detail: concat!(
+                "strict SSH readiness for 127.0.0.1:2222 failed; ",
+                "last OpenSSH stderr tail: Host key verification failed\n",
+                "Run `gascan doctor` for managed SSH configuration details."
+            )
+            .to_owned(),
+        });
+
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(status.message(), gascan_proto::error_code::SSH_NOT_READY);
+        let cause = gascan_proto::error_detail::decode_message(status.details())
+            .ok_or("SSH readiness status must carry its actionable cause")?;
+        assert!(
+            cause.contains("127.0.0.1:2222"),
+            "missing endpoint: {cause}"
+        );
+        assert!(
+            cause.contains("Host key verification failed"),
+            "missing OpenSSH cause: {cause}"
+        );
+        assert!(
+            cause.contains("gascan doctor"),
+            "missing recovery instruction: {cause}"
+        );
+        Ok(())
     }
 
     #[test]

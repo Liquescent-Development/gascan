@@ -15,14 +15,17 @@ use std::net::IpAddr;
 use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 
-pub(crate) use config::validate_managed_config_if_present;
 pub use config::{
-    PreparedSshFiles, SshConfigCommitError, SshConfigCommitFault, commit_openssh_files,
-    prepare_openssh_files, publish_openssh_files, readiness_ssh_args,
+    GenerationCleanup, PreparedSshFiles, SshConfigCommitError, SshConfigCommitFault,
+    commit_openssh_files, commit_openssh_files_with_cleanup_fault, commit_openssh_files_with_fault,
+    prepare_openssh_files, prune_known_hosts_generations, publish_openssh_files,
+    readiness_ssh_args,
 };
-pub(crate) use identity::validate_host_identity_if_present;
+pub(crate) use identity::inspect_host_identity_if_present;
 pub use identity::{HostIdentity, ensure_host_identity};
-pub use manager::{PreparedSshCreate, PublishedSshSnapshot, SshManager};
+pub use manager::{
+    PreparedSshCreate, PublishedSshSnapshot, SshManager, SshReadinessOptions, SshReadinessPolicy,
+};
 pub use port::PortReservation;
 
 const DIRECTORY_MODE: u16 = 0o700;
@@ -164,43 +167,143 @@ impl SshError {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedSshDiagnosticKind {
+    Missing,
+    Inconsistent,
+    Unsafe,
+    Internal,
+}
+
+#[derive(Debug)]
+pub(crate) struct ManagedSshDiagnostic<E> {
+    kind: ManagedSshDiagnosticKind,
+    path: Utf8PathBuf,
+    source: Box<E>,
+}
+
+impl<E> ManagedSshDiagnostic<E> {
+    pub(crate) fn new(
+        kind: ManagedSshDiagnosticKind,
+        path: impl Into<Utf8PathBuf>,
+        source: E,
+    ) -> Self {
+        Self {
+            kind,
+            path: path.into(),
+            source: Box::new(source),
+        }
+    }
+
+    pub(crate) const fn kind(&self) -> ManagedSshDiagnosticKind {
+        self.kind
+    }
+
+    pub(crate) fn path(&self) -> &Utf8Path {
+        &self.path
+    }
+
+    pub(crate) fn source(&self) -> &E {
+        &self.source
+    }
+
+    pub(crate) fn into_source(self) -> E {
+        *self.source
+    }
+
+    pub(crate) fn map_source<F>(self, map: impl FnOnce(E) -> F) -> ManagedSshDiagnostic<F> {
+        ManagedSshDiagnostic {
+            kind: self.kind,
+            path: self.path,
+            source: Box::new(map(*self.source)),
+        }
+    }
+}
+
+fn inspected_directory_error(
+    path: impl Into<Utf8PathBuf>,
+    source: SshError,
+) -> ManagedSshDiagnostic<SshError> {
+    let kind = if matches!(source, SshError::InvalidState(_)) {
+        ManagedSshDiagnosticKind::Unsafe
+    } else {
+        ManagedSshDiagnosticKind::Internal
+    };
+    ManagedSshDiagnostic::new(kind, path, source)
+}
+
+fn inspected_open_file_error_kind(error: rustix::io::Errno) -> ManagedSshDiagnosticKind {
+    match error {
+        rustix::io::Errno::NOENT => ManagedSshDiagnosticKind::Missing,
+        rustix::io::Errno::LOOP => ManagedSshDiagnosticKind::Unsafe,
+        _ => ManagedSshDiagnosticKind::Internal,
+    }
+}
+
 pub(crate) struct StateDirectory {
     fd: OwnedFd,
     expected_uid: u32,
+    path: Utf8PathBuf,
 }
 
 impl StateDirectory {
     pub(crate) fn open(paths: &SshPaths) -> Result<Self, SshError> {
-        let config_home = open_config_home(paths.config_home.as_std_path(), paths.expected_uid)?;
-        let gascan = open_managed_directory(&config_home, "gascan", paths.expected_uid)?;
-        let fd = open_managed_directory(&gascan, "ssh", paths.expected_uid)?;
-        rustix::fs::flock(&fd, FlockOperation::LockExclusive)
-            .map_err(|error| SshError::io("lock managed SSH directory", error))?;
+        Self::open_inspected(paths).map_err(ManagedSshDiagnostic::into_source)
+    }
+
+    pub(crate) fn open_inspected(paths: &SshPaths) -> Result<Self, ManagedSshDiagnostic<SshError>> {
+        let config_home = open_config_home(paths.config_home.as_std_path(), paths.expected_uid)
+            .map_err(|error| inspected_directory_error(paths.config_home.clone(), error))?;
+        let gascan = open_managed_directory(&config_home, "gascan", paths.expected_uid)
+            .map_err(|error| inspected_directory_error(paths.gascan_directory.clone(), error))?;
+        let fd = open_managed_directory(&gascan, "ssh", paths.expected_uid)
+            .map_err(|error| inspected_directory_error(paths.directory.clone(), error))?;
+        rustix::fs::flock(&fd, FlockOperation::LockExclusive).map_err(|error| {
+            ManagedSshDiagnostic::new(
+                ManagedSshDiagnosticKind::Internal,
+                paths.directory.clone(),
+                SshError::io("lock managed SSH directory", error),
+            )
+        })?;
         Ok(Self {
             fd,
             expected_uid: paths.expected_uid,
+            path: paths.directory.clone(),
         })
     }
 
-    pub(crate) fn open_existing(paths: &SshPaths) -> Result<Option<Self>, SshError> {
+    pub(crate) fn open_existing_inspected(
+        paths: &SshPaths,
+    ) -> Result<Option<Self>, ManagedSshDiagnostic<SshError>> {
         let Some(config_home) =
-            open_existing_config_home(paths.config_home.as_std_path(), paths.expected_uid)?
+            open_existing_config_home(paths.config_home.as_std_path(), paths.expected_uid)
+                .map_err(|error| inspected_directory_error(paths.config_home.clone(), error))?
         else {
             return Ok(None);
         };
         let Some(gascan) =
-            open_existing_managed_directory(&config_home, "gascan", paths.expected_uid)?
+            open_existing_managed_directory(&config_home, "gascan", paths.expected_uid).map_err(
+                |error| inspected_directory_error(paths.gascan_directory.clone(), error),
+            )?
         else {
             return Ok(None);
         };
-        let Some(fd) = open_existing_managed_directory(&gascan, "ssh", paths.expected_uid)? else {
+        let Some(fd) = open_existing_managed_directory(&gascan, "ssh", paths.expected_uid)
+            .map_err(|error| inspected_directory_error(paths.directory.clone(), error))?
+        else {
             return Ok(None);
         };
-        rustix::fs::flock(&fd, FlockOperation::LockExclusive)
-            .map_err(|error| SshError::io("lock managed SSH directory", error))?;
+        rustix::fs::flock(&fd, FlockOperation::LockExclusive).map_err(|error| {
+            ManagedSshDiagnostic::new(
+                ManagedSshDiagnosticKind::Internal,
+                paths.directory.clone(),
+                SshError::io("lock managed SSH directory", error),
+            )
+        })?;
         Ok(Some(Self {
             fd,
             expected_uid: paths.expected_uid,
+            path: paths.directory.clone(),
         }))
     }
 
@@ -209,12 +312,30 @@ impl StateDirectory {
         name: &str,
         required_mode: u16,
     ) -> Result<Option<FileIdentity>, SshError> {
+        self.metadata_inspected(name, required_mode)
+            .map_err(ManagedSshDiagnostic::into_source)
+    }
+
+    pub(crate) fn metadata_inspected(
+        &self,
+        name: &str,
+        required_mode: u16,
+    ) -> Result<Option<FileIdentity>, ManagedSshDiagnostic<SshError>> {
+        let path = self.path.join(name);
         let stat = match rustix::fs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(stat) => stat,
             Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
-            Err(error) => return Err(SshError::io("inspect managed SSH file", error)),
+            Err(error) => {
+                return Err(ManagedSshDiagnostic::new(
+                    ManagedSshDiagnosticKind::Internal,
+                    path,
+                    SshError::io("inspect managed SSH file", error),
+                ));
+            }
         };
-        validate_regular_stat(&stat, self.expected_uid, required_mode)?;
+        validate_regular_stat(&stat, self.expected_uid, required_mode).map_err(|error| {
+            ManagedSshDiagnostic::new(ManagedSshDiagnosticKind::Unsafe, path, error)
+        })?;
         Ok(Some(FileIdentity::from_stat(&stat)))
     }
 
@@ -223,16 +344,39 @@ impl StateDirectory {
         name: &str,
         required_mode: u16,
     ) -> Result<(File, FileIdentity), SshError> {
+        self.open_file_inspected(name, required_mode)
+            .map_err(ManagedSshDiagnostic::into_source)
+    }
+
+    pub(crate) fn open_file_inspected(
+        &self,
+        name: &str,
+        required_mode: u16,
+    ) -> Result<(File, FileIdentity), ManagedSshDiagnostic<SshError>> {
+        let path = self.path.join(name);
         let fd = rustix::fs::openat(
             &self.fd,
             name,
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )
-        .map_err(|error| SshError::io("open managed SSH file", error))?;
-        let stat = rustix::fs::fstat(&fd)
-            .map_err(|error| SshError::io("inspect open managed SSH file", error))?;
-        validate_regular_stat(&stat, self.expected_uid, required_mode)?;
+        .map_err(|error| {
+            ManagedSshDiagnostic::new(
+                inspected_open_file_error_kind(error),
+                path.clone(),
+                SshError::io("open managed SSH file", error),
+            )
+        })?;
+        let stat = rustix::fs::fstat(&fd).map_err(|error| {
+            ManagedSshDiagnostic::new(
+                ManagedSshDiagnosticKind::Internal,
+                path.clone(),
+                SshError::io("inspect open managed SSH file", error),
+            )
+        })?;
+        validate_regular_stat(&stat, self.expected_uid, required_mode).map_err(|error| {
+            ManagedSshDiagnostic::new(ManagedSshDiagnosticKind::Unsafe, path, error)
+        })?;
         Ok((File::from(fd), FileIdentity::from_stat(&stat)))
     }
 
@@ -242,27 +386,102 @@ impl StateDirectory {
         required_mode: u16,
         maximum: u64,
     ) -> Result<(Vec<u8>, FileIdentity), SshError> {
-        let (file, identity) = self.open_file(name, required_mode)?;
+        self.read_file_inspected(name, required_mode, maximum)
+            .map_err(ManagedSshDiagnostic::into_source)
+    }
+
+    pub(crate) fn read_file_inspected(
+        &self,
+        name: &str,
+        required_mode: u16,
+        maximum: u64,
+    ) -> Result<(Vec<u8>, FileIdentity), ManagedSshDiagnostic<SshError>> {
+        let path = self.path.join(name);
+        let expected_identity = self
+            .metadata_inspected(name, required_mode)?
+            .ok_or_else(|| {
+                ManagedSshDiagnostic::new(
+                    ManagedSshDiagnosticKind::Missing,
+                    path.clone(),
+                    SshError::io(
+                        "open managed SSH file",
+                        io::Error::from(io::ErrorKind::NotFound),
+                    ),
+                )
+            })?;
+        let (file, identity) = self.open_file_inspected(name, required_mode)?;
+        if identity != expected_identity {
+            return Err(ManagedSshDiagnostic::new(
+                ManagedSshDiagnosticKind::Unsafe,
+                path,
+                SshError::InvalidState("managed SSH file changed during validation"),
+            ));
+        }
         let mut bytes = Vec::new();
         file.take(maximum.saturating_add(1))
             .read_to_end(&mut bytes)
-            .map_err(|error| SshError::io("read managed SSH file", error))?;
+            .map_err(|error| {
+                ManagedSshDiagnostic::new(
+                    ManagedSshDiagnosticKind::Internal,
+                    path.clone(),
+                    SshError::io("read managed SSH file", error),
+                )
+            })?;
         if bytes.len() as u64 > maximum {
-            return Err(SshError::InvalidState("managed SSH file is too large"));
+            return Err(ManagedSshDiagnostic::new(
+                ManagedSshDiagnosticKind::Inconsistent,
+                path,
+                SshError::InvalidState("managed SSH file is too large"),
+            ));
         }
         Ok((bytes, identity))
     }
 
-    pub(crate) fn has_entries(&self) -> Result<bool, SshError> {
-        let mut directory = rustix::fs::Dir::read_from(&self.fd)
-            .map_err(|error| SshError::io("read managed SSH directory", error))?;
+    pub(crate) fn has_entries_inspected(&self) -> Result<bool, ManagedSshDiagnostic<SshError>> {
+        let mut directory = rustix::fs::Dir::read_from(&self.fd).map_err(|error| {
+            ManagedSshDiagnostic::new(
+                ManagedSshDiagnosticKind::Internal,
+                self.path.clone(),
+                SshError::io("read managed SSH directory", error),
+            )
+        })?;
         while let Some(entry) = directory.read() {
-            let entry = entry.map_err(|error| SshError::io("read managed SSH directory", error))?;
+            let entry = entry.map_err(|error| {
+                ManagedSshDiagnostic::new(
+                    ManagedSshDiagnosticKind::Internal,
+                    self.path.clone(),
+                    SshError::io("read managed SSH directory", error),
+                )
+            })?;
             if !matches!(entry.file_name().to_bytes(), b"." | b"..") {
                 return Ok(true);
             }
         }
         Ok(false)
+    }
+
+    pub(crate) fn entry_names(&self) -> Result<Vec<Vec<u8>>, ManagedSshDiagnostic<SshError>> {
+        let mut directory = rustix::fs::Dir::read_from(&self.fd).map_err(|error| {
+            ManagedSshDiagnostic::new(
+                ManagedSshDiagnosticKind::Internal,
+                self.path.clone(),
+                SshError::io("read managed SSH directory", error),
+            )
+        })?;
+        let mut names = Vec::new();
+        while let Some(entry) = directory.read() {
+            let entry = entry.map_err(|error| {
+                ManagedSshDiagnostic::new(
+                    ManagedSshDiagnosticKind::Internal,
+                    self.path.clone(),
+                    SshError::io("read managed SSH directory", error),
+                )
+            })?;
+            if !matches!(entry.file_name().to_bytes(), b"." | b"..") {
+                names.push(entry.file_name().to_bytes().to_vec());
+            }
+        }
+        Ok(names)
     }
 
     pub(crate) fn create_staging(&self, name: &str, mode: u16) -> Result<File, SshError> {
@@ -335,6 +554,30 @@ impl StateDirectory {
             .map_err(|error| SshError::io("remove managed SSH file", error))
     }
 
+    pub(crate) fn remove_identity_checked(
+        &self,
+        name: &str,
+        expected: FileIdentity,
+        required_mode: u16,
+    ) -> Result<(), ManagedSshDiagnostic<SshError>> {
+        let path = self.path.join(name);
+        let (_file, opened) = self.open_file_inspected(name, required_mode)?;
+        if opened != expected || self.metadata_inspected(name, required_mode)? != Some(expected) {
+            return Err(ManagedSshDiagnostic::new(
+                ManagedSshDiagnosticKind::Unsafe,
+                path,
+                SshError::InvalidState("managed SSH file changed before removal"),
+            ));
+        }
+        rustix::fs::unlinkat(&self.fd, name, AtFlags::empty()).map_err(|error| {
+            ManagedSshDiagnostic::new(
+                ManagedSshDiagnosticKind::Internal,
+                path,
+                SshError::io("remove obsolete managed known-hosts generation", error),
+            )
+        })
+    }
+
     pub(crate) fn sync(&self) -> Result<(), SshError> {
         rustix::fs::fsync(&self.fd)
             .map_err(|error| SshError::io("sync managed SSH directory", error))
@@ -360,11 +603,17 @@ impl StateDirectory {
             Ok(path.join(name))
         }
     }
+
+    pub(crate) fn path(&self) -> &Utf8Path {
+        &self.path
+    }
 }
 
-pub(crate) fn managed_ssh_artifacts_present(paths: &SshPaths) -> Result<bool, SshError> {
-    StateDirectory::open_existing(paths)?
-        .map(|directory| directory.has_entries())
+pub(crate) fn inspect_managed_ssh_artifacts(
+    paths: &SshPaths,
+) -> Result<bool, ManagedSshDiagnostic<SshError>> {
+    StateDirectory::open_existing_inspected(paths)?
+        .map(|directory| directory.has_entries_inspected())
         .transpose()
         .map(Option::unwrap_or_default)
 }
@@ -638,10 +887,38 @@ fn utf8_path(path: PathBuf) -> Result<Utf8PathBuf, SshError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PUBLIC_MODE, SshError, StateDirectory};
+    use super::{
+        ManagedSshDiagnosticKind, PUBLIC_MODE, SshError, StateDirectory,
+        inspected_open_file_error_kind,
+    };
+    use camino::Utf8PathBuf;
     use rustix::fs::{Mode, OFlags};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn nofollow_symlink_open_error_is_unsafe() {
+        assert_eq!(
+            inspected_open_file_error_kind(rustix::io::Errno::LOOP),
+            ManagedSshDiagnosticKind::Unsafe
+        );
+    }
+
+    #[test]
+    fn missing_open_error_is_missing() {
+        assert_eq!(
+            inspected_open_file_error_kind(rustix::io::Errno::NOENT),
+            ManagedSshDiagnosticKind::Missing
+        );
+    }
+
+    #[test]
+    fn resource_exhaustion_open_error_is_internal() {
+        assert_eq!(
+            inspected_open_file_error_kind(rustix::io::Errno::MFILE),
+            ManagedSshDiagnosticKind::Internal
+        );
+    }
 
     #[test]
     fn regular_file_validation_rejects_a_foreign_owner() -> Result<(), Box<dyn std::error::Error>> {
@@ -660,6 +937,8 @@ mod tests {
         let directory = StateDirectory {
             fd,
             expected_uid: rustix::process::geteuid().as_raw().wrapping_add(1),
+            path: Utf8PathBuf::from_path_buf(temp.path().to_owned())
+                .map_err(|_| "temporary path is not UTF-8")?,
         };
         assert!(matches!(
             directory.metadata("candidate", PUBLIC_MODE),

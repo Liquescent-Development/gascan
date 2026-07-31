@@ -1,12 +1,13 @@
 use super::config::{
-    PreparedSshFiles, SshConfigCommitError, SshConfigCommitFault, commit_openssh_files,
-    commit_openssh_files_with_fault, prepare_openssh_files, readiness_ssh_args,
+    GenerationCleanup, PreparedSshFiles, SshConfigCommitError, SshConfigCommitFault,
+    commit_openssh_files, commit_openssh_files_with_cleanup_fault, commit_openssh_files_with_fault,
+    generation_name, inspect_known_hosts_generations_in, prepare_openssh_files, readiness_ssh_args,
 };
 use super::identity::{load_host_identity, parse_public_key};
 use super::port::PortReservation;
 use super::{
-    ActiveSsh, HostIdentity, ManagedSshHost, PUBLIC_MODE, SshPaths, StateDirectory,
-    ensure_host_identity, maximum_managed_file_bytes,
+    ActiveSsh, HostIdentity, ManagedSshDiagnostic, ManagedSshDiagnosticKind, ManagedSshHost,
+    PUBLIC_MODE, SshPaths, StateDirectory, ensure_host_identity, maximum_managed_file_bytes,
 };
 use crate::service::ServiceError;
 use crate::store::SshResolution;
@@ -22,13 +23,13 @@ use std::ffi::OsStr;
 use std::net::{IpAddr, Ipv4Addr};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::sync::OwnedMutexGuard;
+use tokio::time::sleep;
 
 const CONFIG_NAME: &str = "config";
 const SSH_CLIENT: &str = "/usr/bin/ssh";
-const READINESS_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const HOST_KEY_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_HOST_KEY_OUTPUT: usize = 16 * 1024;
 const HOST_KEY_PATH: &str = "/home/workspace/.config/gascan/ssh/host/ssh_host_ed25519_key.pub";
@@ -94,14 +95,68 @@ impl PreparedSshActivation {
             .map_err(config_commit_error)?;
         Ok(active)
     }
+
+    pub(crate) fn commit_with_cleanup_fault(self) -> Result<ActiveSsh, ServiceError> {
+        let active = self.managed.active;
+        commit_openssh_files_with_cleanup_fault(&self.paths, self.prepared)
+            .map_err(config_commit_error)?;
+        Ok(active)
+    }
 }
 
 pub struct SshManager;
+
+#[derive(Clone, Copy)]
+#[doc(hidden)]
+pub struct SshReadinessPolicy {
+    pub deadline: Duration,
+    pub retry_delay: Duration,
+    pub maximum_stderr: usize,
+}
+
+#[derive(Clone, Copy)]
+#[doc(hidden)]
+pub struct SshReadinessOptions<'a> {
+    pub program: &'a Utf8Path,
+    pub host_key_timeout: Duration,
+    pub policy: SshReadinessPolicy,
+}
+
+impl Default for SshReadinessPolicy {
+    fn default() -> Self {
+        Self {
+            deadline: Duration::from_secs(15),
+            retry_delay: Duration::from_millis(100),
+            maximum_stderr: 4096,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct PublishedSshSnapshot {
     client_key_fingerprint: String,
     hosts: BTreeMap<String, ActiveSsh>,
+}
+
+pub(crate) struct InspectedSshPublication {
+    config: Option<Vec<u8>>,
+    generation: Option<(Utf8PathBuf, Vec<u8>)>,
+    generation_cleanup: GenerationCleanup,
+    unsafe_generation: Option<ManagedSshDiagnostic<ServiceError>>,
+}
+
+impl InspectedSshPublication {
+    pub(crate) const fn config_present(&self) -> bool {
+        self.config.is_some()
+    }
+
+    pub(crate) const fn generation_cleanup(&self) -> GenerationCleanup {
+        self.generation_cleanup
+    }
+
+    pub(crate) fn unsafe_generation(&self) -> Option<&ManagedSshDiagnostic<ServiceError>> {
+        self.unsafe_generation.as_ref()
+    }
 }
 
 impl PublishedSshSnapshot {
@@ -230,6 +285,43 @@ impl SshManager {
         readiness_program: &Utf8Path,
         host_key_timeout: Duration,
     ) -> Result<Option<PreparedSshActivation>, ServiceError> {
+        self.prepare_activation_for_paths_with_policy_inner(
+            id,
+            runtime,
+            expected,
+            paths,
+            SshReadinessOptions {
+                program: readiness_program,
+                host_key_timeout,
+                policy: SshReadinessPolicy::default(),
+            },
+        )
+        .await
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn prepare_activation_for_paths_with_policy(
+        &self,
+        id: &SandboxId,
+        runtime: &impl RuntimeBackend,
+        expected: Option<&SshResolution>,
+        paths: &SshPaths,
+        options: SshReadinessOptions<'_>,
+    ) -> Result<bool, ServiceError> {
+        self.prepare_activation_for_paths_with_policy_inner(id, runtime, expected, paths, options)
+            .await
+            .map(|activation| activation.is_some())
+    }
+
+    async fn prepare_activation_for_paths_with_policy_inner(
+        &self,
+        id: &SandboxId,
+        runtime: &impl RuntimeBackend,
+        expected: Option<&SshResolution>,
+        paths: &SshPaths,
+        options: SshReadinessOptions<'_>,
+    ) -> Result<Option<PreparedSshActivation>, ServiceError> {
         if expected.is_some_and(|resolution| !resolution_enabled(resolution)) {
             return Ok(None);
         }
@@ -238,17 +330,22 @@ impl SshManager {
             .await
             .map_err(ServiceError::SshConfigUnsafe)?;
         let managed =
-            verified_managed_host(id, runtime, expected, &identity, host_key_timeout).await?;
+            verified_managed_host(id, runtime, expected, &identity, options.host_key_timeout)
+                .await?;
         let mut hosts = load_active_hosts(paths, &identity)?;
         hosts.retain(|host| host.active.alias != managed.active.alias);
         hosts.push(managed.clone());
         let prepared = prepare_openssh_files(paths, &identity, &hosts)
             .map_err(ServiceError::SshConfigUnsafe)?;
+        let endpoint = format!("{}:{}", managed.active.host, managed.active.port);
+        let args = readiness_ssh_args(paths, &identity, &managed, prepared.known_hosts())
+            .await
+            .map_err(ServiceError::SshConfigUnsafe)?;
         run_readiness(
-            readiness_program.as_std_path().as_os_str(),
-            readiness_ssh_args(paths, &identity, &managed, prepared.known_hosts())
-                .await
-                .map_err(ServiceError::SshConfigUnsafe)?,
+            options.program.as_std_path().as_os_str(),
+            &args,
+            &endpoint,
+            options.policy,
         )
         .await?;
         Ok(Some(PreparedSshActivation {
@@ -278,11 +375,15 @@ impl SshManager {
             verified_managed_host(id, runtime, Some(expected), &identity, host_key_timeout).await?;
         let prepared = prepare_openssh_files(paths, &identity, std::slice::from_ref(&managed))
             .map_err(ServiceError::SshConfigUnsafe)?;
+        let endpoint = format!("{}:{}", managed.active.host, managed.active.port);
+        let args = readiness_ssh_args(paths, &identity, &managed, prepared.known_hosts())
+            .await
+            .map_err(ServiceError::SshConfigUnsafe)?;
         run_readiness(
             readiness_program.as_std_path().as_os_str(),
-            readiness_ssh_args(paths, &identity, &managed, prepared.known_hosts())
-                .await
-                .map_err(ServiceError::SshConfigUnsafe)?,
+            &args,
+            &endpoint,
+            SshReadinessPolicy::default(),
         )
         .await?;
         Ok(Some(managed))
@@ -320,6 +421,29 @@ impl SshManager {
             .await
             .map_err(ServiceError::SshConfigUnsafe)?;
         let hosts = load_active_hosts(paths, &identity)?
+            .into_iter()
+            .map(|host| (host.active.alias.clone(), host.active))
+            .collect();
+        Ok(PublishedSshSnapshot {
+            client_key_fingerprint: identity.fingerprint().to_owned(),
+            hosts,
+        })
+    }
+
+    pub(crate) fn inspect_publication_for_paths(
+        &self,
+        paths: &SshPaths,
+    ) -> Result<InspectedSshPublication, ManagedSshDiagnostic<ServiceError>> {
+        inspect_publication_files(paths)
+    }
+
+    pub(crate) fn snapshot_from_inspected_publication(
+        &self,
+        paths: &SshPaths,
+        identity: &HostIdentity,
+        publication: &InspectedSshPublication,
+    ) -> Result<PublishedSshSnapshot, ManagedSshDiagnostic<ServiceError>> {
+        let hosts = load_active_hosts_from_inspection(paths, identity, publication)?
             .into_iter()
             .map(|host| (host.active.alias.clone(), host.active))
             .collect();
@@ -498,7 +622,7 @@ async fn verified_managed_host(
         return Err(ServiceError::Ownership(id.clone()));
     }
     if inspected.state != ContainerState::Running {
-        return Err(ServiceError::SshNotReady(
+        return Err(ServiceError::ssh_not_ready(
             "SSH activation requires a running sandbox",
         ));
     }
@@ -506,14 +630,14 @@ async fn verified_managed_host(
         .ports()
         .iter()
         .filter(|mapping| mapping.guest_port == 22);
-    let mapping = mappings.next().ok_or(ServiceError::SshNotReady(
+    let mapping = mappings.next().ok_or(ServiceError::ssh_not_ready(
         "runtime inspection is missing the native SSH mapping",
     ))?;
     if mappings.next().is_some()
         || mapping.host_address != IpAddr::V4(Ipv4Addr::LOCALHOST)
         || mapping.host_port < 1024
     {
-        return Err(ServiceError::SshNotReady(
+        return Err(ServiceError::ssh_not_ready(
             "runtime inspection has an invalid native SSH mapping",
         ));
     }
@@ -601,25 +725,97 @@ async fn read_host_public_key_inner(
     ))
 }
 
-async fn run_readiness(program: &OsStr, args: Vec<std::ffi::OsString>) -> Result<(), ServiceError> {
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let status = tokio::time::timeout(READINESS_TIMEOUT, command.status())
-        .await
-        .map_err(|_| ServiceError::SshNotReady("strict SSH readiness timed out"))?
-        .map_err(|_| ServiceError::SshNotReady("strict SSH readiness could not start"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(ServiceError::SshNotReady(
-            "strict SSH readiness command failed",
-        ))
+async fn run_readiness(
+    program: &OsStr,
+    args: &[std::ffi::OsString],
+    endpoint: &str,
+    policy: SshReadinessPolicy,
+) -> Result<(), ServiceError> {
+    let deadline = Instant::now() + policy.deadline;
+    let mut last_detail = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        match tokio::time::timeout(remaining, command.output()).await {
+            Ok(Ok(output)) if output.status.success() => return Ok(()),
+            Ok(Ok(output)) => {
+                let detail = bounded_stderr_tail(&output.stderr, policy.maximum_stderr);
+                retain_useful_detail(&mut last_detail, detail);
+            }
+            Ok(Err(error)) => {
+                return Err(readiness_error(
+                    endpoint,
+                    policy.deadline,
+                    None,
+                    format!("could not start strict SSH readiness: {error}"),
+                ));
+            }
+            Err(_) => {
+                return Err(readiness_error(
+                    endpoint,
+                    policy.deadline,
+                    last_detail,
+                    "strict SSH readiness timed out".to_owned(),
+                ));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(readiness_error(
+                endpoint,
+                policy.deadline,
+                last_detail,
+                "strict SSH readiness did not succeed before its deadline".to_owned(),
+            ));
+        }
+        sleep(
+            policy
+                .retry_delay
+                .min(deadline.saturating_duration_since(Instant::now())),
+        )
+        .await;
+    }
+}
+
+fn bounded_stderr_tail(stderr: &[u8], maximum: usize) -> String {
+    if maximum == 0 {
+        return String::new();
+    }
+    let decoded = String::from_utf8_lossy(stderr);
+    if decoded.len() <= maximum {
+        return decoded.into_owned();
+    }
+    let mut start = decoded.len() - maximum;
+    while !decoded.is_char_boundary(start) {
+        start += 1;
+    }
+    decoded[start..].to_owned()
+}
+
+fn retain_useful_detail(last_detail: &mut Option<String>, detail: String) {
+    if !detail.trim().is_empty() {
+        *last_detail = Some(detail);
+    }
+}
+
+fn readiness_error(
+    endpoint: &str,
+    deadline: Duration,
+    last_detail: Option<String>,
+    reason: String,
+) -> ServiceError {
+    let stderr_tail = last_detail.unwrap_or_else(|| "no OpenSSH stderr was captured".to_owned());
+    ServiceError::SshNotReady {
+        endpoint: Some(endpoint.to_owned()),
+        detail: format!(
+            "strict SSH readiness for {endpoint} failed within {deadline:?}: {reason}; last OpenSSH stderr tail: {stderr_tail}\nRun `gascan doctor` for managed SSH configuration details."
+        ),
     }
 }
 
@@ -627,73 +823,192 @@ fn load_active_hosts(
     paths: &SshPaths,
     identity: &HostIdentity,
 ) -> Result<Vec<ManagedSshHost>, ServiceError> {
-    let directory = StateDirectory::open(paths).map_err(ServiceError::SshConfigUnsafe)?;
+    load_active_hosts_inspected(paths, identity).map_err(ManagedSshDiagnostic::into_source)
+}
+
+fn load_active_hosts_inspected(
+    paths: &SshPaths,
+    identity: &HostIdentity,
+) -> Result<Vec<ManagedSshHost>, ManagedSshDiagnostic<ServiceError>> {
+    let publication = inspect_publication_files(paths)?;
+    load_active_hosts_from_inspection(paths, identity, &publication)
+}
+
+fn inspect_publication_files(
+    paths: &SshPaths,
+) -> Result<InspectedSshPublication, ManagedSshDiagnostic<ServiceError>> {
+    let Some(directory) = StateDirectory::open_existing_inspected(paths)
+        .map_err(|error| error.map_source(ServiceError::SshConfigUnsafe))?
+    else {
+        return Ok(InspectedSshPublication {
+            config: None,
+            generation: None,
+            generation_cleanup: GenerationCleanup::default(),
+            unsafe_generation: None,
+        });
+    };
     if directory
-        .metadata(CONFIG_NAME, PUBLIC_MODE)
-        .map_err(ServiceError::SshConfigUnsafe)?
+        .metadata_inspected(CONFIG_NAME, PUBLIC_MODE)
+        .map_err(|error| error.map_source(ServiceError::SshConfigUnsafe))?
         .is_none()
     {
-        return Ok(Vec::new());
+        return inspected_publication_with_generations(&directory, BTreeSet::new(), None, None);
     }
     let (config, _) = directory
-        .read_file(CONFIG_NAME, PUBLIC_MODE, maximum_managed_file_bytes())
-        .map_err(ServiceError::SshConfigUnsafe)?;
+        .read_file_inspected(CONFIG_NAME, PUBLIC_MODE, maximum_managed_file_bytes())
+        .map_err(|error| error.map_source(ServiceError::SshConfigUnsafe))?;
     let text = std::str::from_utf8(&config).map_err(|_| {
-        ServiceError::SshConfigUnsafe(super::SshError::InvalidState(
+        inspected_config_state(
+            ManagedSshDiagnosticKind::Inconsistent,
+            paths.config(),
             "managed SSH config is not UTF-8",
-        ))
+        )
     })?;
+    if text.contains('\0') {
+        return Err(inspected_config_state(
+            ManagedSshDiagnosticKind::Inconsistent,
+            paths.config(),
+            "managed SSH config contains a null byte",
+        ));
+    }
     let references = text
         .lines()
         .filter_map(|line| line.strip_prefix("    UserKnownHostsFile "))
         .map(parse_rendered_path)
-        .collect::<Result<BTreeSet<_>, _>>()?;
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(|error| {
+            ManagedSshDiagnostic::new(
+                ManagedSshDiagnosticKind::Inconsistent,
+                paths.config().to_owned(),
+                error,
+            )
+        })?;
     if references.is_empty() {
-        drop(directory);
-        let prepared =
-            prepare_openssh_files(paths, identity, &[]).map_err(ServiceError::SshConfigUnsafe)?;
-        if prepared.config_bytes() != config {
-            return Err(ServiceError::SshConfigUnsafe(
-                super::SshError::InvalidState("managed SSH config is inconsistent"),
-            ));
-        }
-        return Ok(Vec::new());
+        return inspected_publication_with_generations(
+            &directory,
+            BTreeSet::from([generation_name(b"")]),
+            Some(config),
+            None,
+        );
     }
     let mut references = references.into_iter();
     let Some(known_hosts_path) = references.next() else {
-        return Err(ServiceError::SshConfigUnsafe(
-            super::SshError::InvalidState("managed SSH config generation is missing"),
+        return Err(inspected_config_state(
+            ManagedSshDiagnosticKind::Missing,
+            paths.config(),
+            "managed SSH config generation is missing",
         ));
     };
     if references.next().is_some() {
-        return Err(ServiceError::SshConfigUnsafe(
-            super::SshError::InvalidState("managed SSH config generations are inconsistent"),
+        return Err(inspected_config_state(
+            ManagedSshDiagnosticKind::Inconsistent,
+            paths.config(),
+            "managed SSH config generations are inconsistent",
         ));
     }
     let known_hosts_path = Utf8PathBuf::from(known_hosts_path);
     if known_hosts_path.parent() != Some(paths.directory()) {
-        return Err(ServiceError::SshConfigUnsafe(
-            super::SshError::InvalidState("managed SSH config generation is outside state"),
+        return Err(inspected_config_state(
+            ManagedSshDiagnosticKind::Inconsistent,
+            paths.config(),
+            "managed SSH config generation is outside state",
         ));
     }
     let generation = known_hosts_path.file_name().ok_or_else(|| {
-        ServiceError::SshConfigUnsafe(super::SshError::InvalidState(
+        inspected_config_state(
+            ManagedSshDiagnosticKind::Inconsistent,
+            paths.config(),
             "managed SSH config generation is invalid",
-        ))
+        )
     })?;
     let (known_hosts, _) = directory
-        .read_file(generation, PUBLIC_MODE, maximum_managed_file_bytes())
-        .map_err(ServiceError::SshConfigUnsafe)?;
-    drop(directory);
-    let hosts = parse_known_hosts(&known_hosts, identity)?;
-    let prepared =
-        prepare_openssh_files(paths, identity, &hosts).map_err(ServiceError::SshConfigUnsafe)?;
+        .read_file_inspected(generation, PUBLIC_MODE, maximum_managed_file_bytes())
+        .map_err(|error| error.map_source(ServiceError::SshConfigUnsafe))?;
+    inspected_publication_with_generations(
+        &directory,
+        BTreeSet::from([generation.to_owned()]),
+        Some(config),
+        Some((known_hosts_path, known_hosts)),
+    )
+}
+
+fn inspected_publication_with_generations(
+    directory: &StateDirectory,
+    retained: BTreeSet<String>,
+    config: Option<Vec<u8>>,
+    generation: Option<(Utf8PathBuf, Vec<u8>)>,
+) -> Result<InspectedSshPublication, ManagedSshDiagnostic<ServiceError>> {
+    let inspection = inspect_known_hosts_generations_in(directory, &retained, false)
+        .map_err(|diagnostic| diagnostic.map_source(ServiceError::SshConfigUnsafe))?;
+    Ok(InspectedSshPublication {
+        config,
+        generation,
+        generation_cleanup: inspection.cleanup,
+        unsafe_generation: inspection
+            .unsafe_entry
+            .map(|diagnostic| diagnostic.map_source(ServiceError::SshConfigUnsafe)),
+    })
+}
+
+fn load_active_hosts_from_inspection(
+    paths: &SshPaths,
+    identity: &HostIdentity,
+    publication: &InspectedSshPublication,
+) -> Result<Vec<ManagedSshHost>, ManagedSshDiagnostic<ServiceError>> {
+    let Some(config) = publication.config.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let Some((known_hosts_path, known_hosts)) = publication.generation.as_ref() else {
+        let prepared = prepare_openssh_files(paths, identity, &[]).map_err(|error| {
+            ManagedSshDiagnostic::new(
+                ManagedSshDiagnosticKind::Inconsistent,
+                paths.config().to_owned(),
+                ServiceError::SshConfigUnsafe(error),
+            )
+        })?;
+        if prepared.config_bytes() != config {
+            return Err(inspected_config_state(
+                ManagedSshDiagnosticKind::Inconsistent,
+                paths.config(),
+                "managed SSH config is inconsistent",
+            ));
+        }
+        return Ok(Vec::new());
+    };
+    let hosts = parse_known_hosts(known_hosts, identity).map_err(|error| {
+        ManagedSshDiagnostic::new(
+            ManagedSshDiagnosticKind::Inconsistent,
+            known_hosts_path.clone(),
+            error,
+        )
+    })?;
+    let prepared = prepare_openssh_files(paths, identity, &hosts).map_err(|error| {
+        ManagedSshDiagnostic::new(
+            ManagedSshDiagnosticKind::Inconsistent,
+            paths.config().to_owned(),
+            ServiceError::SshConfigUnsafe(error),
+        )
+    })?;
     if prepared.known_hosts() != known_hosts_path || prepared.config_bytes() != config {
-        return Err(ServiceError::SshConfigUnsafe(
-            super::SshError::InvalidState("managed SSH config is inconsistent"),
+        return Err(inspected_config_state(
+            ManagedSshDiagnosticKind::Inconsistent,
+            paths.config(),
+            "managed SSH config is inconsistent",
         ));
     }
     Ok(hosts)
+}
+
+fn inspected_config_state(
+    kind: ManagedSshDiagnosticKind,
+    path: &Utf8Path,
+    message: &'static str,
+) -> ManagedSshDiagnostic<ServiceError> {
+    ManagedSshDiagnostic::new(
+        kind,
+        path.to_owned(),
+        ServiceError::SshConfigUnsafe(super::SshError::InvalidState(message)),
+    )
 }
 
 fn parse_known_hosts(
@@ -804,4 +1119,26 @@ fn config_state(message: &'static str) -> ServiceError {
 
 fn alias(id: &SandboxId) -> String {
     format!("gascan-{id}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retain_useful_detail;
+
+    #[test]
+    fn whitespace_only_retry_stderr_does_not_replace_actionable_detail() {
+        let mut last_detail = None;
+
+        retain_useful_detail(
+            &mut last_detail,
+            "Host key verification failed.\n".to_owned(),
+        );
+        retain_useful_detail(&mut last_detail, "\n".to_owned());
+        retain_useful_detail(&mut last_detail, " \n\t".to_owned());
+
+        assert_eq!(
+            last_detail.as_deref(),
+            Some("Host key verification failed.\n")
+        );
+    }
 }

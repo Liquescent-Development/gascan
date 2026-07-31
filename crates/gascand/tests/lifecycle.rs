@@ -1882,7 +1882,13 @@ async fn apply_rejects_changed_storage_without_runtime_calls() -> TestResult {
     assert!(error.to_string().contains("tools"));
     assert!(error.to_string().contains("10GiB"));
     assert!(error.to_string().contains("20GiB"));
-    assert_eq!(runtime.calls().await.len(), before);
+    let after = runtime.calls().await;
+    assert_eq!(
+        after.len(),
+        before,
+        "runtime calls after storage rejection: {:?}",
+        &after[before..]
+    );
     Ok(())
 }
 

@@ -1,6 +1,6 @@
 use super::{
-    FileIdentity, PRIVATE_MODE, PUBLIC_MODE, SshError, SshPaths, StateDirectory,
-    maximum_managed_file_bytes, random_staging_name,
+    FileIdentity, ManagedSshDiagnostic, ManagedSshDiagnosticKind, PRIVATE_MODE, PUBLIC_MODE,
+    SshError, SshPaths, StateDirectory, maximum_managed_file_bytes, random_staging_name,
 };
 use base64::Engine as _;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -84,19 +84,37 @@ pub(crate) async fn load_host_identity(paths: &SshPaths) -> Result<HostIdentity,
     }
 }
 
-pub(crate) async fn validate_host_identity_if_present(
+pub(crate) async fn inspect_host_identity_if_present(
     paths: &SshPaths,
-) -> Result<Option<HostIdentity>, SshError> {
-    let Some(directory) = StateDirectory::open_existing(paths)? else {
+) -> Result<Option<HostIdentity>, ManagedSshDiagnostic<SshError>> {
+    let Some(directory) = StateDirectory::open_existing_inspected(paths)? else {
         return Ok(None);
     };
-    match (
-        directory.metadata(PRIVATE_KEY_NAME, PRIVATE_MODE)?,
-        directory.metadata(PUBLIC_KEY_NAME, PUBLIC_MODE)?,
-    ) {
-        (Some(_), Some(_)) => load_existing(&directory, paths).await.map(Some),
+    let private = directory.metadata_inspected(PRIVATE_KEY_NAME, PRIVATE_MODE)?;
+    let public = directory.metadata_inspected(PUBLIC_KEY_NAME, PUBLIC_MODE)?;
+    match (private, public) {
+        (Some(_), Some(_)) => load_existing(&directory, paths)
+            .await
+            .map(Some)
+            .map_err(|error| {
+                let kind = if matches!(error, SshError::Io { .. }) {
+                    ManagedSshDiagnosticKind::Internal
+                } else {
+                    ManagedSshDiagnosticKind::Inconsistent
+                };
+                ManagedSshDiagnostic::new(kind, paths.public_key.clone(), error)
+            }),
         (None, None) => Ok(None),
-        _ => Err(SshError::InvalidState("managed SSH identity is incomplete")),
+        (None, Some(_)) => Err(ManagedSshDiagnostic::new(
+            ManagedSshDiagnosticKind::Missing,
+            paths.private_key.clone(),
+            SshError::InvalidState("managed SSH identity is incomplete"),
+        )),
+        (Some(_), None) => Err(ManagedSshDiagnostic::new(
+            ManagedSshDiagnosticKind::Missing,
+            paths.public_key.clone(),
+            SshError::InvalidState("managed SSH identity is incomplete"),
+        )),
     }
 }
 

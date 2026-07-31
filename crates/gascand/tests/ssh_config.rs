@@ -1,14 +1,35 @@
+#[cfg(debug_assertions)]
+use camino::Utf8Path;
+#[cfg(debug_assertions)]
+use gascan_core::fake_runtime::FakeRuntime;
+#[cfg(debug_assertions)]
+use gascan_core::manifest::Manifest;
 use gascan_core::sandbox::SandboxId;
+#[cfg(debug_assertions)]
+use gascan_core::sandbox::SandboxSpec;
 use gascand::{
-    ActiveSsh, ManagedSshHost, SshManager, SshPaths, SshResolution, ensure_host_identity,
-    prepare_openssh_files, publish_openssh_files, readiness_ssh_args,
+    ActiveSsh, ManagedSshHost, SshConfigCommitFault, SshManager, SshPaths, SshResolution,
+    commit_openssh_files_with_cleanup_fault, commit_openssh_files_with_fault, ensure_host_identity,
+    prepare_openssh_files, prune_known_hosts_generations, publish_openssh_files,
+    readiness_ssh_args,
+};
+#[cfg(debug_assertions)]
+use gascand::{
+    NoopProvisioner, SandboxService, SshReadinessOptions, SshReadinessPolicy, Store, UpRequest,
 };
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
+#[cfg(debug_assertions)]
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::process::Command;
+#[cfg(debug_assertions)]
+use std::sync::Arc;
+#[cfg(debug_assertions)]
+use std::time::Duration;
 use tempfile::TempDir;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -20,6 +41,93 @@ fn root(temp: &TempDir) -> Result<std::path::PathBuf, std::io::Error> {
 fn paths(temp: &TempDir) -> Result<SshPaths, Box<dyn std::error::Error>> {
     let home = root(temp)?;
     Ok(SshPaths::for_environment(None, Some(home.as_os_str()))?)
+}
+
+#[cfg(debug_assertions)]
+async fn booted_readiness_context(
+    temp: &TempDir,
+) -> Result<(FakeRuntime, SandboxId, SshResolution, SshPaths), Box<dyn std::error::Error>> {
+    let root = Utf8Path::from_path(temp.path()).ok_or("temporary root is not UTF-8")?;
+    fs::write(
+        root.join("gascan.toml"),
+        "version = 1\nnetwork = 'networked'\n[ssh]\nhost_port = 24242\n",
+    )?;
+    let spec = SandboxSpec::from_root("readiness", root, Manifest::load(root)?)?;
+    let ssh_paths = paths(temp)?;
+    let host = TempDir::new()?;
+    let host_key = ensure_host_identity(&paths(&host)?)
+        .await?
+        .public_key()
+        .to_owned();
+    let runtime = FakeRuntime::default();
+    runtime
+        .set_exec_result(format!("{host_key}\n").into_bytes(), Vec::new(), 0)
+        .await;
+    runtime.queue_created_ssh_host_port(24_242).await;
+    let service = SandboxService::new_with_ssh_for_tests(
+        runtime.clone(),
+        Store::open(root.join("state.db"))?,
+        Arc::new(NoopProvisioner),
+        ssh_paths.clone(),
+        "/usr/bin/true".into(),
+    );
+    service.up(UpRequest::new(spec.clone())).await?;
+    let resolution = service
+        .status(spec.id())?
+        .and_then(|record| record.ssh_resolution)
+        .ok_or("booted sandbox has no SSH resolution")?;
+    Ok((runtime, spec.id().clone(), resolution, ssh_paths))
+}
+
+#[cfg(debug_assertions)]
+fn executable_script(
+    root: &Utf8Path,
+    name: &str,
+    body: &str,
+) -> Result<camino::Utf8PathBuf, Box<dyn std::error::Error>> {
+    let path = root.join(name);
+    fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}\n"))?;
+    fs::set_permissions(path.as_std_path(), fs::Permissions::from_mode(0o755))?;
+    Ok(path)
+}
+
+#[cfg(debug_assertions)]
+fn strict_readiness_argv(paths: &SshPaths, id: &SandboxId, known_hosts: &str) -> Vec<OsString> {
+    vec![
+        "-F".into(),
+        "/dev/null".into(),
+        "-o".into(),
+        "HostName=127.0.0.1".into(),
+        "-o".into(),
+        "Port=24242".into(),
+        "-o".into(),
+        "User=workspace".into(),
+        "-o".into(),
+        format!("IdentityFile={}", paths.private_key()).into(),
+        "-o".into(),
+        format!("HostKeyAlias=gascan-{id}").into(),
+        "-o".into(),
+        format!("UserKnownHostsFile={known_hosts}").into(),
+        "-o".into(),
+        "StrictHostKeyChecking=yes".into(),
+        "-o".into(),
+        "IdentitiesOnly=yes".into(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "ForwardAgent=no".into(),
+        "-o".into(),
+        "ClearAllForwardings=yes".into(),
+        "127.0.0.1".into(),
+        "/usr/bin/true".into(),
+    ]
+}
+
+#[cfg(debug_assertions)]
+fn nul_terminated_args(args: &[OsString]) -> Vec<u8> {
+    args.iter()
+        .flat_map(|argument| argument.as_os_str().as_bytes().iter().copied().chain([0]))
+        .collect()
 }
 
 fn host(alias: &str, port: u16, identity: &gascand::HostIdentity) -> ManagedSshHost {
@@ -193,16 +301,36 @@ async fn publishes_stable_sorted_strict_openssh_files() -> TestResult {
 }
 
 #[tokio::test]
-async fn successful_publication_preserves_the_previous_known_hosts_generation_for_readers()
--> TestResult {
+async fn successful_publication_prunes_only_safe_obsolete_known_hosts_generations() -> TestResult {
     let temp = TempDir::new()?;
     let paths = paths(&temp)?;
     let identity = ensure_host_identity(&paths).await?;
     publish_openssh_files(&paths, &identity, &[host("gascan-before", 2222, &identity)])?;
     let previous_config = fs::read_to_string(paths.config().as_std_path())?;
     let previous_generation = std::path::PathBuf::from(configured_known_hosts(&previous_config)?);
-    let previous_contents = fs::read(&previous_generation)?;
     assert!(previous_generation.exists());
+    let obsolete = write_generation(&paths, "obsolete\n")?;
+    let malformed = paths.directory().join("known_hosts.not-a-generation");
+    fs::write(&malformed, b"malformed")?;
+    fs::set_permissions(&malformed, fs::Permissions::from_mode(0o644))?;
+    let victim = root(&temp)?.join("generation-victim");
+    fs::write(&victim, b"retain")?;
+    let symlink = paths
+        .directory()
+        .join(format!("known_hosts.{}", "a".repeat(64)));
+    std::os::unix::fs::symlink(&victim, &symlink)?;
+    let hard_link_backing = root(&temp)?.join("hard-link-backing");
+    fs::write(&hard_link_backing, b"retain")?;
+    fs::set_permissions(&hard_link_backing, fs::Permissions::from_mode(0o644))?;
+    let hard_link = paths
+        .directory()
+        .join(format!("known_hosts.{}", "b".repeat(64)));
+    fs::hard_link(&hard_link_backing, &hard_link)?;
+    let unsafe_mode = paths
+        .directory()
+        .join(format!("known_hosts.{}", "c".repeat(64)));
+    fs::write(&unsafe_mode, b"retain")?;
+    fs::set_permissions(&unsafe_mode, fs::Permissions::from_mode(0o600))?;
 
     publish_openssh_files(&paths, &identity, &[host("gascan-after", 2223, &identity)])?;
     let current_config = fs::read_to_string(paths.config().as_std_path())?;
@@ -210,7 +338,96 @@ async fn successful_publication_preserves_the_previous_known_hosts_generation_fo
 
     assert_ne!(current_generation, previous_generation);
     assert!(current_generation.exists());
-    assert_eq!(fs::read(previous_generation)?, previous_contents);
+    assert!(!previous_generation.exists());
+    assert!(!obsolete.exists());
+    assert!(malformed.exists());
+    assert_eq!(fs::read(&victim)?, b"retain");
+    assert!(fs::symlink_metadata(&symlink)?.file_type().is_symlink());
+    assert_eq!(fs::symlink_metadata(&hard_link)?.nlink(), 2);
+    assert!(unsafe_mode.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn generation_cleanup_retains_every_explicit_generation() -> TestResult {
+    let temp = TempDir::new()?;
+    let paths = paths(&temp)?;
+    let identity = ensure_host_identity(&paths).await?;
+    publish_openssh_files(&paths, &identity, &[host("gascan-active", 2222, &identity)])?;
+    let active_config = fs::read_to_string(paths.config())?;
+    let active = std::path::Path::new(configured_known_hosts(&active_config)?)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or("active generation name is not UTF-8")?
+        .to_owned();
+    let rollback = write_generation(&paths, "rollback\n")?;
+    let obsolete = write_generation(&paths, "obsolete\n")?;
+    let uppercase = paths
+        .directory()
+        .join(format!("known_hosts.{}", "A".repeat(64)));
+    fs::write(&uppercase, b"retain\n")?;
+    fs::set_permissions(&uppercase, fs::Permissions::from_mode(0o644))?;
+    let mut retained = BTreeSet::from([active]);
+    retained.insert(
+        rollback
+            .file_name()
+            .ok_or("rollback generation has no name")?
+            .to_owned(),
+    );
+
+    let cleanup = prune_known_hosts_generations(&paths, &retained)?;
+
+    assert_eq!(cleanup.removed, 1);
+    assert_eq!(cleanup.stale, 0);
+    assert_eq!(cleanup.unsafe_entries, 1);
+    assert!(rollback.exists());
+    assert!(!obsolete.exists());
+    assert!(uppercase.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_generation_publication_does_not_prune_obsolete_generations() -> TestResult {
+    let temp = TempDir::new()?;
+    let paths = paths(&temp)?;
+    let identity = ensure_host_identity(&paths).await?;
+    publish_openssh_files(&paths, &identity, &[host("gascan-before", 2222, &identity)])?;
+    let active_before = fs::read_to_string(paths.config())?;
+    let active_generation = configured_known_hosts(&active_before)?.to_owned();
+    let obsolete = write_generation(&paths, "obsolete-before-durability\n")?;
+    let prepared =
+        prepare_openssh_files(&paths, &identity, &[host("gascan-after", 2223, &identity)])?;
+
+    let result =
+        commit_openssh_files_with_fault(&paths, prepared, Some(SshConfigCommitFault::AfterRename));
+
+    assert!(result.is_err());
+    assert_eq!(fs::read_to_string(paths.config())?, active_before);
+    assert!(std::path::Path::new(&active_generation).exists());
+    assert!(obsolete.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn generation_cleanup_failure_does_not_fail_publication_and_retries() -> TestResult {
+    let temp = TempDir::new()?;
+    let paths = paths(&temp)?;
+    let identity = ensure_host_identity(&paths).await?;
+    publish_openssh_files(&paths, &identity, &[host("gascan-before", 2222, &identity)])?;
+    let previous_config = fs::read_to_string(paths.config())?;
+    let previous_generation = std::path::PathBuf::from(configured_known_hosts(&previous_config)?);
+    let after = [host("gascan-after", 2223, &identity)];
+    let prepared = prepare_openssh_files(&paths, &identity, &after)?;
+
+    commit_openssh_files_with_cleanup_fault(&paths, prepared)?;
+
+    let current_config = fs::read_to_string(paths.config())?;
+    assert!(current_config.contains("Host gascan-after"));
+    assert!(previous_generation.exists());
+
+    let retry = prepare_openssh_files(&paths, &identity, &after)?;
+    commit_openssh_files_with_fault(&paths, retry, None)?;
+    assert!(!previous_generation.exists());
     Ok(())
 }
 
@@ -318,6 +535,170 @@ async fn readiness_args_are_discrete_and_do_not_weaken_reusable_config() -> Test
         );
     }
     assert!(!paths.config().exists());
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn readiness_retries_transient_failure_with_identical_strict_argv() -> TestResult {
+    let temp = TempDir::new()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("temporary root is not UTF-8")?;
+    let (runtime, id, resolution, paths) = booted_readiness_context(&temp).await?;
+    let counter = root.join("readiness-counter");
+    let capture = root.join("readiness-argv");
+    let program = executable_script(
+        root,
+        "transient-readiness",
+        &format!(
+            "count=0\n\
+             if [ -f '{}' ]; then read -r count < '{}'; fi\n\
+             count=$((count + 1))\n\
+             printf '%s\\n' \"$count\" > '{}'\n\
+             printf '%s\\0' \"$@\" >> '{}'\n\
+             if [ \"$count\" -lt 3 ]; then\n\
+                 printf 'connection refused\\n' >&2\n\
+                 exit 255\n\
+             fi",
+            counter, counter, counter, capture
+        ),
+    )?;
+    let config = fs::read_to_string(paths.config())?;
+    let known_hosts = configured_known_hosts(&config)?.to_owned();
+    let expected = strict_readiness_argv(&paths, &id, &known_hosts);
+
+    let activated = SshManager
+        .prepare_activation_for_paths_with_policy(
+            &id,
+            &runtime,
+            Some(&resolution),
+            &paths,
+            SshReadinessOptions {
+                program: &program,
+                host_key_timeout: Duration::from_secs(1),
+                policy: SshReadinessPolicy {
+                    deadline: Duration::from_millis(500),
+                    retry_delay: Duration::from_millis(10),
+                    maximum_stderr: 128,
+                },
+            },
+        )
+        .await?;
+
+    assert!(activated);
+    assert_eq!(fs::read_to_string(counter)?.trim(), "3");
+    assert_eq!(
+        fs::read(&capture)?,
+        nul_terminated_args(&expected).repeat(3)
+    );
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn permanent_readiness_failure_reports_bounded_lossy_final_stderr_tail() -> TestResult {
+    let temp = TempDir::new()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("temporary root is not UTF-8")?;
+    let (runtime, id, resolution, paths) = booted_readiness_context(&temp).await?;
+    let program = executable_script(
+        root,
+        "failing-readiness",
+        "printf '%096d' 0 >&2\nprintf '\\377Host key verification failed.\\n' >&2\nexit 255",
+    )?;
+
+    let error = SshManager
+        .prepare_activation_for_paths_with_policy(
+            &id,
+            &runtime,
+            Some(&resolution),
+            &paths,
+            SshReadinessOptions {
+                program: &program,
+                host_key_timeout: Duration::from_secs(1),
+                policy: SshReadinessPolicy {
+                    deadline: Duration::from_millis(500),
+                    retry_delay: Duration::from_millis(10),
+                    maximum_stderr: 64,
+                },
+            },
+        )
+        .await
+        .expect_err("permanent readiness failure must not activate SSH");
+    assert_eq!(error.code(), "ssh_not_ready");
+    let (endpoint, detail) = match error {
+        gascand::ServiceError::SshNotReady { endpoint, detail } => (endpoint, detail),
+        other => return Err(format!("expected SSH readiness error, got {other:?}").into()),
+    };
+    assert_eq!(endpoint.as_deref(), Some("127.0.0.1:24242"));
+    assert!(
+        detail.contains("127.0.0.1:24242"),
+        "missing endpoint: {detail}"
+    );
+    assert!(detail.contains("500ms"), "missing deadline: {detail}");
+    assert!(
+        detail.contains("Host key verification failed."),
+        "missing final OpenSSH detail: {detail}"
+    );
+    assert!(
+        detail.contains('\u{fffd}'),
+        "stderr was not lossy-decoded: {detail}"
+    );
+    assert!(
+        detail.contains("Run `gascan doctor` for managed SSH configuration details."),
+        "missing recovery instruction: {detail}"
+    );
+    let tail = detail
+        .split("last OpenSSH stderr tail: ")
+        .nth(1)
+        .and_then(|value| value.split("\nRun `gascan doctor`").next())
+        .ok_or("readiness error did not label the stderr tail")?;
+    assert!(tail.len() <= 64, "stderr tail exceeded its bound: {tail:?}");
+    assert!(tail.is_char_boundary(tail.len()));
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn readiness_timeout_kills_hanging_child_before_it_can_complete_later() -> TestResult {
+    let temp = TempDir::new()?;
+    let root = Utf8Path::from_path(temp.path()).ok_or("temporary root is not UTF-8")?;
+    let (runtime, id, resolution, paths) = booted_readiness_context(&temp).await?;
+    let started = root.join("hanging-readiness-started");
+    let completed = root.join("hanging-readiness-completed");
+    let program = executable_script(
+        root,
+        "hanging-readiness",
+        &format!(
+            "printf started > '{}'\nsleep 1\nprintf completed > '{}'",
+            started, completed
+        ),
+    )?;
+
+    let error = SshManager
+        .prepare_activation_for_paths_with_policy(
+            &id,
+            &runtime,
+            Some(&resolution),
+            &paths,
+            SshReadinessOptions {
+                program: &program,
+                host_key_timeout: Duration::from_secs(1),
+                policy: SshReadinessPolicy {
+                    deadline: Duration::from_millis(500),
+                    retry_delay: Duration::from_millis(10),
+                    maximum_stderr: 128,
+                },
+            },
+        )
+        .await
+        .expect_err("hanging readiness must time out");
+    assert_eq!(error.code(), "ssh_not_ready");
+    assert!(started.exists(), "readiness child never started");
+
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert!(
+        !completed.exists(),
+        "timed-out readiness child completed after the caller returned"
+    );
     Ok(())
 }
 

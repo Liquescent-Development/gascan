@@ -15,7 +15,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
-use gascan_core::doctor::{DoctorFact, DoctorFacts, DoctorReport, DoctorStatus};
+use gascan_core::doctor::{DoctorFact, DoctorFacts, DoctorReport};
 use gascan_core::manifest::ManifestError;
 use gascan_core::policy::{
     CACHE_ROOT, CARGO_HOME, CONFIG_ROOT, ControlPlanePolicy, MISE_GLOBAL_CONFIG_FILE,
@@ -37,7 +37,10 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
@@ -262,32 +265,59 @@ pub struct SandboxService<B: RuntimeBackend> {
     workspace_image: Option<String>,
     locks: Mutex<HashMap<SandboxId, Weak<AsyncMutex<()>>>>,
     doctor: DoctorState,
-    capabilities: tokio::sync::OnceCell<RuntimeCapabilities>,
     ssh_paths: Option<SshPaths>,
     ssh_readiness_program: Option<Utf8PathBuf>,
     ssh_host_key_timeout: std::time::Duration,
     ssh_config_commit_fault: Option<SshConfigCommitFault>,
+    ssh_generation_cleanup_fault: AtomicBool,
     refresh_ssh_doctor: bool,
+}
+
+type DoctorFuture = Pin<Box<dyn Future<Output = DoctorReport> + Send>>;
+type DoctorCollector = dyn Fn() -> DoctorFuture + Send + Sync;
+
+#[derive(Clone)]
+enum DoctorSource {
+    Fixed(DoctorReport),
+    Pending(tokio::sync::watch::Receiver<Option<DoctorReport>>),
+    Refreshing {
+        timeout: std::time::Duration,
+        collector: Arc<DoctorCollector>,
+    },
 }
 
 #[derive(Clone)]
 pub struct DoctorState {
-    receiver: tokio::sync::watch::Receiver<Option<DoctorReport>>,
+    source: DoctorSource,
 }
 
 pub struct DoctorCompleter {
     sender: tokio::sync::watch::Sender<Option<DoctorReport>>,
 }
 
+fn doctor_timeout_report(timeout: std::time::Duration) -> DoctorReport {
+    DoctorFacts::unavailable(format!(
+        "runtime evidence collector exceeded its {} second bound",
+        timeout.as_secs()
+    ))
+    .into_report()
+}
+
 impl DoctorState {
     pub fn ready(report: DoctorReport) -> Self {
-        let (_sender, receiver) = tokio::sync::watch::channel(Some(report));
-        Self { receiver }
+        Self {
+            source: DoctorSource::Fixed(report),
+        }
     }
 
     pub fn pending() -> (Self, DoctorCompleter) {
         let (sender, receiver) = tokio::sync::watch::channel(None);
-        (Self { receiver }, DoctorCompleter { sender })
+        (
+            Self {
+                source: DoctorSource::Pending(receiver),
+            },
+            DoctorCompleter { sender },
+        )
     }
 
     pub fn collect<F>(timeout: std::time::Duration, collector: F) -> Self
@@ -298,27 +328,46 @@ impl DoctorState {
         tokio::spawn(async move {
             let report = tokio::time::timeout(timeout, collector)
                 .await
-                .unwrap_or_else(|_| {
-                    DoctorFacts::unavailable(format!(
-                        "runtime evidence collector exceeded its {} second bound",
-                        timeout.as_secs()
-                    ))
-                    .into_report()
-                });
+                .unwrap_or_else(|_| doctor_timeout_report(timeout));
             completer.complete(report);
         });
         state
     }
 
+    pub fn refreshing<C, F>(timeout: std::time::Duration, collector: C) -> Self
+    where
+        C: Fn() -> F + Send + Sync + 'static,
+        F: Future<Output = DoctorReport> + Send + 'static,
+    {
+        Self {
+            source: DoctorSource::Refreshing {
+                timeout,
+                collector: Arc::new(move || Box::pin(collector())),
+            },
+        }
+    }
+
     pub async fn report(&self) -> DoctorReport {
-        let mut receiver = self.receiver.clone();
-        loop {
-            if let Some(report) = receiver.borrow().clone() {
-                return report;
+        match &self.source {
+            DoctorSource::Fixed(report) => report.clone(),
+            DoctorSource::Pending(receiver) => {
+                let mut receiver = receiver.clone();
+                loop {
+                    if let Some(report) = receiver.borrow().clone() {
+                        return report;
+                    }
+                    if receiver.changed().await.is_err() {
+                        return DoctorFacts::unavailable(
+                            "runtime evidence collection was abandoned",
+                        )
+                        .into_report();
+                    }
+                }
             }
-            if receiver.changed().await.is_err() {
-                return DoctorFacts::unavailable("runtime evidence collection was abandoned")
-                    .into_report();
+            DoctorSource::Refreshing { timeout, collector } => {
+                tokio::time::timeout(*timeout, collector())
+                    .await
+                    .unwrap_or_else(|_| doctor_timeout_report(*timeout))
             }
         }
     }
@@ -410,8 +459,11 @@ pub enum ServiceError {
     SshPortUnavailable(String),
     #[error("SSH host key verification failed: {0}")]
     SshHostKeyMismatch(&'static str),
-    #[error("SSH is not ready: {0}")]
-    SshNotReady(&'static str),
+    #[error("SSH is not ready: {detail}")]
+    SshNotReady {
+        endpoint: Option<String>,
+        detail: String,
+    },
     #[error("SSH configuration is unsafe: {0}")]
     SshConfigUnsafe(crate::SshError),
     #[error("SSH configuration update failed: {0}")]
@@ -467,11 +519,11 @@ impl<B: RuntimeBackend> SandboxService<B> {
             workspace_image: None,
             locks: Mutex::new(HashMap::new()),
             doctor,
-            capabilities: tokio::sync::OnceCell::new(),
             ssh_paths: None,
             ssh_readiness_program: None,
             ssh_host_key_timeout: HOST_KEY_READ_TIMEOUT,
             ssh_config_commit_fault: None,
+            ssh_generation_cleanup_fault: AtomicBool::new(false),
             refresh_ssh_doctor: true,
         }
     }
@@ -493,11 +545,11 @@ impl<B: RuntimeBackend> SandboxService<B> {
             workspace_image: Some(workspace_image),
             locks: Mutex::new(HashMap::new()),
             doctor,
-            capabilities: tokio::sync::OnceCell::new(),
             ssh_paths: None,
             ssh_readiness_program: None,
             ssh_host_key_timeout: HOST_KEY_READ_TIMEOUT,
             ssh_config_commit_fault: None,
+            ssh_generation_cleanup_fault: AtomicBool::new(false),
             refresh_ssh_doctor: true,
         })
     }
@@ -535,11 +587,11 @@ impl<B: RuntimeBackend> SandboxService<B> {
             workspace_image: None,
             locks: Mutex::new(HashMap::new()),
             doctor: DoctorState::ready(default_doctor_report()),
-            capabilities: tokio::sync::OnceCell::new(),
             ssh_paths: Some(ssh_paths),
             ssh_readiness_program: Some(readiness_program),
             ssh_host_key_timeout: HOST_KEY_READ_TIMEOUT,
             ssh_config_commit_fault: None,
+            ssh_generation_cleanup_fault: AtomicBool::new(false),
             refresh_ssh_doctor: true,
         }
     }
@@ -565,6 +617,13 @@ impl<B: RuntimeBackend> SandboxService<B> {
     }
 
     #[doc(hidden)]
+    pub fn with_ssh_generation_cleanup_fault_for_tests(self) -> Self {
+        self.ssh_generation_cleanup_fault
+            .store(true, Ordering::Release);
+        self
+    }
+
+    #[doc(hidden)]
     pub fn new_with_ssh_timeouts_for_tests(
         runtime: B,
         store: Store,
@@ -580,11 +639,11 @@ impl<B: RuntimeBackend> SandboxService<B> {
             workspace_image: None,
             locks: Mutex::new(HashMap::new()),
             doctor: DoctorState::ready(default_doctor_report()),
-            capabilities: tokio::sync::OnceCell::new(),
             ssh_paths: Some(ssh_paths),
             ssh_readiness_program: Some(readiness_program),
             ssh_host_key_timeout: host_key_timeout,
             ssh_config_commit_fault: None,
+            ssh_generation_cleanup_fault: AtomicBool::new(false),
             refresh_ssh_doctor: true,
         }
     }
@@ -648,7 +707,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
         let prepared =
             self.prepare_ssh_activation(id, expected)
                 .await?
-                .ok_or(ServiceError::SshNotReady(
+                .ok_or(ServiceError::ssh_not_ready(
                     "enabled SSH did not produce activation evidence",
                 ))?;
         let resolution = prepared.resolution();
@@ -673,7 +732,15 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 return Err(self.restore_prior_ssh_resolution(id, prior, original).await);
             }
         }
-        if let Err(original) = prepared.commit_with_fault(self.ssh_config_commit_fault) {
+        let committed = if self
+            .ssh_generation_cleanup_fault
+            .swap(false, Ordering::AcqRel)
+        {
+            prepared.commit_with_cleanup_fault()
+        } else {
+            prepared.commit_with_fault(self.ssh_config_commit_fault)
+        };
+        if let Err(original) = committed {
             if original.is_ssh_publication_uncertain() {
                 return Err(original);
             }
@@ -713,7 +780,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             return Err(ServiceError::Ownership(id.clone()));
         }
         if runtime.state != ContainerState::Running {
-            return Err(ServiceError::SshNotReady(
+            return Err(ServiceError::ssh_not_ready(
                 "SSH recovery requires a running sandbox",
             ));
         }
@@ -756,7 +823,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             validate_inspected_ssh_policy(policy, port)?;
             expected.push((
                 record.id,
-                record.ssh_resolution.ok_or(ServiceError::SshNotReady(
+                record.ssh_resolution.ok_or(ServiceError::ssh_not_ready(
                     "durable SSH resolution is missing",
                 ))?,
                 Some(port),
@@ -823,12 +890,12 @@ impl<B: RuntimeBackend> SandboxService<B> {
             return PolicyCompiler::restore_ssh_transport(create, None).map_err(Into::into);
         }
         let [mapping] = mappings.as_slice() else {
-            return Err(ServiceError::SshNotReady(
+            return Err(ServiceError::ssh_not_ready(
                 "prior native SSH transport is not uniquely observable",
             ));
         };
         if !mapping.host_address.is_loopback() || mapping.host_port < 1024 {
-            return Err(ServiceError::SshNotReady(
+            return Err(ServiceError::ssh_not_ready(
                 "prior native SSH transport is not uniquely observable",
             ));
         }
@@ -969,7 +1036,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
         }
         let native_publish = report
             .check("runtime.loopback_publish")
-            .is_some_and(|check| check.status == DoctorStatus::Pass);
+            .is_some_and(|check| check.status.is_available());
         let ssh = match self.ssh_paths.as_ref() {
             Some(paths) => {
                 crate::ssh_doctor_facts_for_paths(
@@ -1011,9 +1078,9 @@ impl<B: RuntimeBackend> SandboxService<B> {
             .map_err(ServiceError::Store)
     }
 
-    async fn runtime_capabilities(&self) -> Result<&RuntimeCapabilities, ServiceError> {
-        self.capabilities
-            .get_or_try_init(|| async { self.runtime.capabilities().await })
+    async fn runtime_capabilities(&self) -> Result<RuntimeCapabilities, ServiceError> {
+        self.runtime
+            .capabilities()
             .await
             .map_err(ServiceError::Runtime)
     }
@@ -1071,7 +1138,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             validate_storage_layout(prior)?;
         }
         let capabilities = self.runtime_capabilities().await?;
-        let create = self.compile_policy(request.spec.clone(), capabilities, None)?;
+        let create = self.compile_policy(request.spec.clone(), &capabilities, None)?;
         let requested_ssh_transport = requested_ssh_transport(&request.spec);
         let requested_storage = requested_storage(&create)?;
         let prior_ssh_transport = self
@@ -1131,7 +1198,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
             .up_runtime(
                 &request.spec,
                 create,
-                capabilities,
+                &capabilities,
                 prior.as_ref(),
                 prior_ssh_transport,
                 UpRuntimeContext {
@@ -2360,7 +2427,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
                     if ssh_resolution_enabled(record.ssh_resolution.as_ref()) {
                         self.prepare_ssh_activation(id, record.ssh_resolution.as_ref())
                             .await?
-                            .ok_or(ServiceError::SshNotReady(
+                            .ok_or(ServiceError::ssh_not_ready(
                                 "verified SSH resolution did not produce activation evidence",
                             ))?
                             .commit()?;
@@ -2540,22 +2607,22 @@ impl<B: RuntimeBackend> SandboxService<B> {
             .ok_or_else(|| ServiceError::Missing(id.clone()))?;
         if record.actual_state != ActualState::Absent {
             validate_storage_layout(&record)?;
+            validate_storage_capacities(
+                &record,
+                requested_storage_from_manifest(request.spec.manifest().storage()),
+            )?;
         }
         let capabilities = self.runtime_capabilities().await?;
         let prepared_ssh = self.prepare_ssh_create(&request.spec).await?;
         let create =
-            self.compile_policy(request.spec.clone(), capabilities, prepared_ssh.as_ref())?;
+            self.compile_policy(request.spec.clone(), &capabilities, prepared_ssh.as_ref())?;
         let requested_ssh_transport = requested_ssh_transport(&request.spec);
-        let requested_storage = requested_storage(&create)?;
         let prior_ssh_transport = self
             .database({
                 let id = id.clone();
                 move |store| store.ssh_transport_policy(&id)
             })
             .await?;
-        if record.actual_state != ActualState::Absent {
-            validate_storage_capacities(&record, requested_storage)?;
-        }
         let desired_fingerprint = desired_fingerprint(&request.spec).await?;
         let desired_plan = ProvisioningPlanner::plan_for_root(
             request.spec.canonical_root(),
@@ -2648,7 +2715,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
                     &request.spec,
                     create.clone(),
                     prepared_ssh,
-                    capabilities,
+                    &capabilities,
                     prior_ssh_transport,
                     ImageReplaceContext {
                         previous_image: &runtime.image,
@@ -3077,7 +3144,7 @@ impl<B: RuntimeBackend> SandboxService<B> {
         if !marked {
             let version = resolution
                 .as_ref()
-                .ok_or(ServiceError::SshNotReady(
+                .ok_or(ServiceError::ssh_not_ready(
                     "recovered SSH resolution is missing",
                 ))?
                 .version;
@@ -3426,6 +3493,9 @@ fn replace_doctor_fact(report: &mut DoctorReport, id: &str, fact: DoctorFact) {
     if let Some(check) = report.checks.iter_mut().find(|check| check.id == id) {
         check.status = fact.status;
         check.detail = fact.detail;
+        if let Some(remedy) = fact.remedy {
+            check.remedy = remedy;
+        }
     }
 }
 
@@ -3440,6 +3510,13 @@ fn default_doctor_report() -> DoctorReport {
 }
 
 impl ServiceError {
+    pub(crate) fn ssh_not_ready(detail: impl Into<String>) -> Self {
+        Self::SshNotReady {
+            endpoint: None,
+            detail: detail.into(),
+        }
+    }
+
     pub fn code(&self) -> &'static str {
         match self {
             Self::Runtime(error) => error.code(),
@@ -3469,7 +3546,7 @@ impl ServiceError {
             Self::IncompleteDestroy(_) => "incomplete_destroy",
             Self::SshPortUnavailable(_) => "ssh_port_unavailable",
             Self::SshHostKeyMismatch(_) => "ssh_host_key_mismatch",
-            Self::SshNotReady(_) => "ssh_not_ready",
+            Self::SshNotReady { .. } => "ssh_not_ready",
             Self::SshConfigUnsafe(_) => "ssh_config_unsafe",
             Self::SshConfigUpdateFailed(_) => "ssh_config_update_failed",
             Self::SshConfigPublicationUncertain(_) => "ssh_config_publication_uncertain",
@@ -3695,6 +3772,14 @@ fn requested_storage(create: &CreateRequest) -> Result<StorageCapacities, Servic
     requested_storage_from_volumes(create.volumes())
 }
 
+fn requested_storage_from_manifest(storage: &gascan_core::manifest::Storage) -> StorageCapacities {
+    [
+        ("tools", storage.tools().bytes()),
+        ("cache", storage.cache().bytes()),
+        ("config", storage.config().bytes()),
+    ]
+}
+
 fn requested_storage_from_volumes(
     volumes: &[gascan_core::runtime::RuntimeVolume],
 ) -> Result<StorageCapacities, ServiceError> {
@@ -3874,14 +3959,14 @@ fn inspected_native_ssh_port(
         .ports()
         .iter()
         .filter(|mapping| mapping.guest_port == 22);
-    let mapping = mappings.next().ok_or(ServiceError::SshNotReady(
+    let mapping = mappings.next().ok_or(ServiceError::ssh_not_ready(
         "runtime inspection is missing the native SSH mapping",
     ))?;
     if mappings.next().is_some()
         || mapping.host_address != IpAddr::V4(Ipv4Addr::LOCALHOST)
         || mapping.host_port < 1024
     {
-        return Err(ServiceError::SshNotReady(
+        return Err(ServiceError::ssh_not_ready(
             "runtime inspection has an invalid native SSH mapping",
         ));
     }
@@ -3893,7 +3978,7 @@ fn validate_inspected_ssh_policy(
     inspected_port: u16,
 ) -> Result<(), ServiceError> {
     match policy {
-        Some(policy) if !policy.is_enabled() => Err(ServiceError::SshNotReady(
+        Some(policy) if !policy.is_enabled() => Err(ServiceError::ssh_not_ready(
             "durable SSH transport policy is disabled",
         )),
         Some(policy)
@@ -3901,7 +3986,7 @@ fn validate_inspected_ssh_policy(
                 .host_port()
                 .is_some_and(|port| port != inspected_port) =>
         {
-            Err(ServiceError::SshNotReady(
+            Err(ServiceError::ssh_not_ready(
                 "runtime SSH mapping differs from durable explicit port",
             ))
         }
@@ -4173,17 +4258,96 @@ async fn desired_fingerprint(spec: &SandboxSpec) -> Result<String, ServiceError>
 #[cfg(test)]
 mod storage_tests {
     use super::{
-        BoundedTail, NoopProvisioner, SandboxService, ServiceError, Store,
+        BoundedTail, NoopProvisioner, SandboxService, ServiceError, Store, UpRequest,
         image_replacement_failure_details, parse_mise_versions, requested_storage_from_volumes,
     };
     use camino::Utf8Path;
     use gascan_core::fake_runtime::FakeRuntime;
     use gascan_core::manifest::Manifest;
-    use gascan_core::policy::PolicyCompiler;
-    use gascan_core::runtime::{RuntimeBackend, RuntimeCall};
+    use gascan_core::policy::{PolicyCompiler, PolicyError};
+    use gascan_core::runtime::{
+        CreateFailure, CreateOutcome, CreateRequest, ExecRequest, ExecSession, RecreateRequest,
+        RemoveRequest, RuntimeBackend, RuntimeCall, RuntimeCapabilities, RuntimeError,
+        RuntimeResource, RuntimeSandbox, RuntimeVersion,
+    };
+    use gascan_core::sandbox::SandboxId;
     use gascan_core::sandbox::SandboxSpec;
     use std::collections::BTreeMap;
     use std::sync::Arc;
+    use tokio::sync::Mutex as AsyncMutex;
+
+    #[derive(Clone)]
+    struct MutableCapabilitiesRuntime {
+        runtime: FakeRuntime,
+        capabilities: Arc<AsyncMutex<RuntimeCapabilities>>,
+    }
+
+    impl MutableCapabilitiesRuntime {
+        fn new(capabilities: RuntimeCapabilities) -> Self {
+            Self {
+                runtime: FakeRuntime::new(capabilities.clone()),
+                capabilities: Arc::new(AsyncMutex::new(capabilities)),
+            }
+        }
+
+        async fn set_capabilities(&self, capabilities: RuntimeCapabilities) {
+            *self.capabilities.lock().await = capabilities;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeBackend for MutableCapabilitiesRuntime {
+        async fn capabilities(&self) -> Result<RuntimeCapabilities, RuntimeError> {
+            Ok(self.capabilities.lock().await.clone())
+        }
+
+        async fn inspect(&self, id: &SandboxId) -> Result<Option<RuntimeSandbox>, RuntimeError> {
+            self.runtime.inspect(id).await
+        }
+
+        async fn create(&self, request: CreateRequest) -> Result<CreateOutcome, CreateFailure> {
+            self.runtime.create(request).await
+        }
+
+        async fn prepare_image(&self, image: &str) -> Result<(), RuntimeError> {
+            self.runtime.prepare_image(image).await
+        }
+
+        async fn create_container(
+            &self,
+            request: RecreateRequest,
+        ) -> Result<CreateOutcome, CreateFailure> {
+            self.runtime.create_container(request).await
+        }
+
+        async fn start(&self, id: &SandboxId) -> Result<(), RuntimeError> {
+            self.runtime.start(id).await
+        }
+
+        async fn stop(&self, id: &SandboxId) -> Result<(), RuntimeError> {
+            self.runtime.stop(id).await
+        }
+
+        async fn remove(&self, request: RemoveRequest) -> Result<(), RuntimeError> {
+            self.runtime.remove(request).await
+        }
+
+        async fn exec(&self, request: ExecRequest) -> Result<ExecSession, RuntimeError> {
+            self.runtime.exec(request).await
+        }
+
+        async fn logs(
+            &self,
+            id: &SandboxId,
+            since_millis: Option<i64>,
+        ) -> Result<Vec<u8>, RuntimeError> {
+            self.runtime.logs(id, since_millis).await
+        }
+
+        async fn list_resources(&self) -> Result<Vec<RuntimeResource>, RuntimeError> {
+            self.runtime.list_resources().await
+        }
+    }
 
     #[test]
     fn bounded_tail_keeps_exact_suffix_across_chunks() {
@@ -4208,6 +4372,39 @@ mod storage_tests {
                 "managed volume is missing from compiled create request"
             ))
         ));
+    }
+
+    #[tokio::test]
+    async fn runtime_capabilities_are_refreshed_for_sequential_lifecycle_requests()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(temp.path()).ok_or("UTF-8 root")?;
+        let mut initial = gascan_core::fake_runtime::fixture_capabilities();
+        initial.version = RuntimeVersion::new(1, 2, 0);
+        let runtime = MutableCapabilitiesRuntime::new(initial.clone());
+        let service = SandboxService::new(
+            runtime.clone(),
+            Store::open(root.join("state.db"))?,
+            Arc::new(NoopProvisioner),
+        );
+        let spec = SandboxSpec::from_root("capability-refresh", root, Manifest::load(root)?)?;
+
+        service.up(UpRequest::new(spec.clone())).await?;
+        let mut replacement = initial;
+        replacement.version = RuntimeVersion::new(1, 1, 0);
+        replacement.bind_mounts = false;
+        runtime.set_capabilities(replacement).await;
+        let error = service
+            .up(UpRequest::new(spec))
+            .await
+            .err()
+            .ok_or("second lifecycle request unexpectedly reused cached capabilities")?;
+
+        assert!(matches!(
+            error,
+            ServiceError::Policy(PolicyError::BindMountsUnavailable)
+        ));
+        Ok(())
     }
 
     #[test]

@@ -56,6 +56,23 @@ fn offline_requires_proven_isolation_before_compilation() {
 }
 
 #[test]
+fn untested_apple_runtime_names_the_installed_and_certified_releases_for_offline_policy() {
+    let (_temp, spec) = spec("version = 1\nnetwork = 'offline'\n");
+    let mut capabilities = capabilities();
+    capabilities.version = RuntimeVersion::new(1, 2, 0);
+    capabilities.offline = NetworkIsolation::Unsupported;
+
+    let error = PolicyCompiler::compile(spec, &capabilities)
+        .expect_err("untested runtime must reject offline policy");
+
+    assert_eq!(error.code(), "offline_unavailable");
+    assert_eq!(
+        error.to_string(),
+        "hard offline isolation has not been verified with Apple Container 1.2.0; use networked mode or install the certified 1.1.0 release"
+    );
+}
+
+#[test]
 fn every_mandatory_request_capability_fails_closed() {
     let (_temp, offline) = spec("version = 1\n");
     let (_temp_networked, networked) = spec("version = 1\nnetwork = 'networked'\n");
