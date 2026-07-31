@@ -358,6 +358,26 @@ grep -Fqx \
 test "$(grep -Fc 'init bash --print-full-init' "$stable_log")" = 1 ||
     die 'root full init executed more than once'
 
+nested_log=/tmp/gascan-nested-starship.log
+: >"$nested_log"
+chmod 0666 "$nested_log"
+nested_output=$(
+    GASCAN_TEST_STABLE_LOG="$nested_log" \
+        PATH="$attacker_bin:/usr/bin:/bin" \
+        /bin/bash --noprofile --norc -i -c \
+        ". '$hook'; \
+         export STARSHIP_CONFIG STARSHIP_EXECUTABLE STARSHIP_SHELL STARSHIP_SESSION_KEY; \
+         /bin/bash --noprofile --norc -i -c \
+           '. \"$hook\"; printf \"PS1=%s\\n\" \"\$PS1\"'" 2>&1
+)
+test "$(printf '%s\n' "$nested_output" |
+    grep -Fc 'gascan: Starship prompt unavailable; using standard Bash prompt.')" = 0 ||
+    die 'nested interactive Bash emitted a fallback warning'
+printf '%s\n' "$nested_output" | grep -Fqx PS1=managed-starship ||
+    die 'nested interactive Bash did not evaluate a fresh full init'
+test "$(grep -Fc 'init bash --print-full-init' "$nested_log")" = 2 ||
+    die 'nested interactive Bash did not run two full initializations'
+
 : >"$stable_log"
 workspace_output=$(
     /usr/sbin/runuser -u workspace -- env \
@@ -453,7 +473,7 @@ test "$(grep -Fc 'init bash --print-full-init' "$stable_log")" = 1 ||
 self_clearing_debug_output=$(
     PATH="$attacker_bin:/usr/bin:/bin" /bin/bash --noprofile --norc -i -c \
         "PS1='native-root'; set -T; \
-         builtin trap 'builtin trap - DEBUG; STARSHIP_START_TIME=attacker' DEBUG; \
+         builtin trap 'builtin trap - DEBUG; readonly STARSHIP_START_TIME=attacker' DEBUG; \
          . '$hook'; printf 'PS1=%s\nSTART=%s\nTRAP=%s\n' \
          \"\$PS1\" \"\${STARSHIP_START_TIME-unset}\" \
          \"\$(builtin trap -p DEBUG)\"" 2>&1
@@ -528,7 +548,7 @@ test "$(grep -Fc 'init bash --print-full-init' "$stable_log")" = 3 ||
 
 collision_output=$(
     PATH="$attacker_bin:/usr/bin:/bin" /bin/bash --noprofile --norc -i -c \
-        "PS1='native-root'; STARSHIP_SHELL=attacker; \
+        "PS1='native-root'; readonly STARSHIP_SHELL=attacker; \
          starship_precmd() { printf attacker; }; \
          . '$hook'; printf 'FUNCTION='; starship_precmd; \
          printf '\nVARIABLE=%s\nPS1=%s\n' \"\$STARSHIP_SHELL\" \"\$PS1\"" 2>&1

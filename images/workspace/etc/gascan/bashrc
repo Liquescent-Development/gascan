@@ -53,8 +53,6 @@ __gascan_starship_preflight()
     local -a writable_variables=(
         PATH PS0 PS1 PS2 PROMPT_COMMAND preexec_functions precmd_functions
         STARSHIP_CONFIG STARSHIP_EXECUTABLE
-    )
-    local -a reserved_variables=(
         STARSHIP_PREEXEC_READY STARSHIP_START_TIME STARSHIP_CMD_STATUS
         STARSHIP_PIPE_STATUS STARSHIP_END_TIME STARSHIP_DURATION
         STARSHIP_PROMPT_COMMAND STARSHIP_DEBUG_TRAP STARSHIP_SHELL
@@ -71,12 +69,15 @@ __gascan_starship_preflight()
             return 1
         fi
     done
-    for name in "${reserved_variables[@]}"; do
-        if declare -p "$name" >/dev/null 2>&1; then
-            return 1
-        fi
-    done
     return 0
+}
+
+__gascan_starship_clear_runtime()
+{
+    unset STARSHIP_PREEXEC_READY STARSHIP_START_TIME STARSHIP_CMD_STATUS \
+        STARSHIP_PIPE_STATUS STARSHIP_END_TIME STARSHIP_DURATION \
+        STARSHIP_PROMPT_COMMAND STARSHIP_DEBUG_TRAP STARSHIP_SHELL \
+        STARSHIP_SESSION_KEY
 }
 
 __gascan_starship_emit_variable()
@@ -179,6 +180,7 @@ __gascan_starship_build_commit()
     local -a __gascan_expected_variable_declaration=()
 
     eval "$expectations"
+    __gascan_starship_clear_runtime || return 1
 
     STARSHIP_CONFIG=$selected_config
     STARSHIP_EXECUTABLE=$binary
@@ -333,6 +335,7 @@ __gascan_starship_main "$__gascan_inherited_debug_trap"
 unset __gascan_inherited_debug_trap
 unset -f __gascan_starship_main __gascan_starship_preflight \
     __gascan_starship_variable_readonly \
+    __gascan_starship_clear_runtime \
     __gascan_starship_apply_commit __gascan_starship_build_commit \
     __gascan_starship_capture_expectations \
     __gascan_starship_emit_commit __gascan_starship_emit_variable \

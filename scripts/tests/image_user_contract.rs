@@ -2166,6 +2166,38 @@ fn shell_hook_uses_only_the_pinned_binary_and_managed_config() {
 }
 
 #[test]
+fn nested_interactive_bash_reinitializes_inherited_starship_state() {
+    let temporary = tempfile::tempdir().unwrap();
+    let (hook, shell_dir, _starship, log) = hook_fixture(&temporary);
+    write_mode(&shell_dir.join("prompt"), "starship\n", 0o640);
+    write_mode(
+        &shell_dir.join("starship.toml"),
+        "format = \"$character\"\n",
+        0o640,
+    );
+    let command = r#"
+        . "$GASCAN_TEST_HOOK"
+        export STARSHIP_CONFIG STARSHIP_EXECUTABLE STARSHIP_SHELL STARSHIP_SESSION_KEY
+        GASCAN_TEST_HOOK="$GASCAN_TEST_HOOK" GASCAN_TEST_LOG="$GASCAN_TEST_LOG" \
+          /bin/bash --noprofile --norc -ic \
+          '. "$GASCAN_TEST_HOOK"; printf "PS1=%s\n" "$PS1"'
+    "#;
+    let output = run_hook(&hook, command, &log, false, false, true);
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("PS1=managed-starship"),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("Starship prompt unavailable"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn shell_hook_preserves_supported_prompt_command_customization() {
     let temporary = tempfile::tempdir().unwrap();
     let (hook, shell_dir, _starship, log) = hook_fixture(&temporary);
@@ -2309,7 +2341,7 @@ fn shell_hook_warns_once_and_returns_success_when_starship_is_unavailable() {
     let before = fs::read_to_string(&log).unwrap_or_default();
     let self_clearing_debug_trap = run_hook(
         &hook,
-        r#"PS1=native-prompt; set -T; builtin trap 'builtin trap - DEBUG; STARSHIP_START_TIME=attacker' DEBUG; . "$GASCAN_TEST_HOOK"; printf 'PS1=%s\nSTART=%s\nTRAP=%s\n' "$PS1" "${STARSHIP_START_TIME-unset}" "$(builtin trap -p DEBUG)""#,
+        r#"PS1=native-prompt; set -T; builtin trap 'builtin trap - DEBUG; readonly STARSHIP_START_TIME=attacker' DEBUG; . "$GASCAN_TEST_HOOK"; printf 'PS1=%s\nSTART=%s\nTRAP=%s\n' "$PS1" "${STARSHIP_START_TIME-unset}" "$(builtin trap -p DEBUG)""#,
         &log,
         false,
         false,
@@ -2489,57 +2521,62 @@ fn shell_hook_warns_once_and_returns_success_when_starship_is_unavailable() {
         ),
         (
             "STARSHIP_PREEXEC_READY variable",
-            "STARSHIP_PREEXEC_READY=attacker",
+            "readonly STARSHIP_PREEXEC_READY=attacker",
             "variable=attacker",
         ),
         (
             "STARSHIP_START_TIME variable",
-            "STARSHIP_START_TIME=attacker",
+            "readonly STARSHIP_START_TIME=attacker",
             "variable=attacker",
         ),
         (
             "STARSHIP_CMD_STATUS variable",
-            "STARSHIP_CMD_STATUS=attacker",
+            "readonly STARSHIP_CMD_STATUS=attacker",
             "variable=attacker",
         ),
         (
             "STARSHIP_PIPE_STATUS variable",
-            "STARSHIP_PIPE_STATUS=attacker",
+            "readonly STARSHIP_PIPE_STATUS=attacker",
             "variable=attacker",
         ),
         (
             "STARSHIP_END_TIME variable",
-            "STARSHIP_END_TIME=attacker",
+            "readonly STARSHIP_END_TIME=attacker",
             "variable=attacker",
         ),
         (
             "STARSHIP_DURATION variable",
-            "STARSHIP_DURATION=attacker",
+            "readonly STARSHIP_DURATION=attacker",
             "variable=attacker",
         ),
         (
             "STARSHIP_PROMPT_COMMAND variable",
-            "STARSHIP_PROMPT_COMMAND=attacker",
+            "readonly STARSHIP_PROMPT_COMMAND=attacker",
             "variable=attacker",
         ),
         (
             "STARSHIP_DEBUG_TRAP variable",
-            "STARSHIP_DEBUG_TRAP=attacker",
+            "readonly STARSHIP_DEBUG_TRAP=attacker",
             "variable=attacker",
         ),
         (
             "STARSHIP_SHELL variable",
-            "STARSHIP_SHELL=attacker",
+            "readonly STARSHIP_SHELL=attacker",
             "variable=attacker",
         ),
         (
             "STARSHIP_SESSION_KEY variable",
-            "STARSHIP_SESSION_KEY=attacker",
+            "readonly STARSHIP_SESSION_KEY=attacker",
             "variable=attacker",
         ),
     ] {
         let before = fs::read_to_string(&log).unwrap_or_default();
-        let variable_name = setup.split('=').next().unwrap();
+        let variable_name = setup
+            .strip_prefix("readonly ")
+            .unwrap_or(setup)
+            .split('=')
+            .next()
+            .unwrap();
         let inspection = if name.contains("variable") {
             format!("printf 'variable=%s\\n' \"${{{variable_name}}}\"")
         } else if name.starts_with("_starship_set_return") {
