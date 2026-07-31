@@ -826,8 +826,11 @@ fn validate_owned_publication_file(path: &std::path::Path) -> TestResult {
 struct DeveloperConfigurationSnapshot {
     auth_config_mode: String,
     auth_config_sha256: String,
+    derived_fingerprint: String,
     private_key_mode: String,
     private_key_sha256: String,
+    public_key_file: String,
+    public_key_line_count: usize,
     status: serde_json::Value,
 }
 
@@ -846,20 +849,23 @@ fn developer_configuration_persists_across_restart_and_image_replacement() -> Te
          [shell]\nprompt = 'starship'\n",
     )?;
     let root = std::path::Path::new(env.root());
-    env.success_with_timeout(
+    let _initial_up = secret_free_gascan(
+        &env,
         ["up", root.to_str().ok_or("non-UTF-8 root")?],
         std::time::Duration::from_secs(10 * 60),
     )?;
 
-    let configured = env.success([
-        "--sandbox",
-        env.id(),
-        "run",
-        "--",
-        "sh",
-        "-c",
-        &format!(
-            "set -eu; \
+    let _configured = secret_free_gascan(
+        &env,
+        [
+            "--sandbox",
+            env.id(),
+            "run",
+            "--",
+            "sh",
+            "-c",
+            &format!(
+                "set -eu; \
              /usr/local/bin/configure-developer-home git \
                --sandbox-id {} --name 'Ada Lovelace' \
                --email ada@example.test --protocol ssh; \
@@ -873,24 +879,34 @@ fn developer_configuration_persists_across_restart_and_image_replacement() -> Te
                '    git_protocol: ssh' \
                >\"$GH_CONFIG_DIR/hosts.yml\"; \
              chmod 600 \"$GH_CONFIG_DIR/hosts.yml\"",
-            shell_quote(env.id()),
-            NATIVE_AUTH_SENTINEL,
-        ),
-    ])?;
-    assert_secret_free_output(&configured.stdout, &configured.stderr)?;
+                shell_quote(env.id()),
+                NATIVE_AUTH_SENTINEL,
+            ),
+        ],
+        std::time::Duration::from_secs(90),
+    )?;
 
     let initial = developer_configuration_snapshot(&env)?;
-    assert_developer_configuration(&initial)?;
+    assert_developer_configuration(&initial, env.id())?;
 
-    env.success(["--sandbox", env.id(), "down"])?;
+    let _down = secret_free_gascan(
+        &env,
+        ["--sandbox", env.id(), "down"],
+        std::time::Duration::from_secs(90),
+    )?;
     std::thread::sleep(std::time::Duration::from_secs(6));
-    env.success(["up", root.to_str().ok_or("non-UTF-8 root")?])?;
+    let _restart_up = secret_free_gascan(
+        &env,
+        ["up", root.to_str().ok_or("non-UTF-8 root")?],
+        std::time::Duration::from_secs(90),
+    )?;
     let restarted = developer_configuration_snapshot(&env)?;
     assert_eq!(restarted, initial);
 
     env.replace_owned_container_image(&predecessor, std::time::Duration::from_secs(10 * 60))?;
     env.seed_stored_image_resolution(&predecessor)?;
-    let apply = env.success_with_timeout(
+    let apply = secret_free_gascan(
+        &env,
         [
             "--sandbox",
             env.id(),
@@ -901,58 +917,118 @@ fn developer_configuration_persists_across_restart_and_image_replacement() -> Te
         std::time::Duration::from_secs(10 * 60),
     )?;
     assert_json_phase(&apply.stdout, "image_replaced")?;
-    assert_secret_free_output(&apply.stdout, &apply.stderr)?;
 
     let replaced = developer_configuration_snapshot(&env)?;
     assert_eq!(replaced, initial);
     assert_nested_shell_prompt_identity(&env, "starship")?;
 
-    env.success(["--sandbox", env.id(), "destroy", "--yes"])?;
+    let _destroy = secret_free_gascan(
+        &env,
+        ["--sandbox", env.id(), "destroy", "--yes"],
+        std::time::Duration::from_secs(90),
+    )?;
     env.assert_no_owned_resources()
 }
 
+fn secret_free_gascan<I, S>(
+    env: &AppleE2e,
+    args: I,
+    timeout: std::time::Duration,
+) -> TestResult<std::process::Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let output = apple_common::run_command_bounded_with_output_guard(
+        env.command(args),
+        timeout,
+        assert_secret_free_output,
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "Gas Can command failed with {:?}; captured output omitted after credential scan",
+            output.status.code()
+        )
+        .into());
+    }
+    Ok(output)
+}
+
 fn developer_configuration_snapshot(env: &AppleE2e) -> TestResult<DeveloperConfigurationSnapshot> {
-    let output = env.success([
-        "--sandbox",
-        env.id(),
-        "run",
-        "--",
-        "sh",
-        "-c",
-        r#"set -eu; \
+    let output = secret_free_gascan(
+        env,
+        [
+            "--sandbox",
+            env.id(),
+            "run",
+            "--",
+            "sh",
+            "-c",
+            r#"set -eu; \
          status=$(/usr/local/bin/configure-developer-home status); \
          private_key=/home/workspace/.config/gascan/git/ssh/id_ed25519; \
+         public_key=${private_key}.pub; \
          auth_config=${GH_CONFIG_DIR:?}/hosts.yml; \
-         printf '{"status":%s,"private_key_sha256":"%s","private_key_mode":"%s","auth_config_sha256":"%s","auth_config_mode":"%s"}\n' \
+         public_key_file=$(cat "$public_key"); \
+         public_key_line_count=$(awk 'END { print NR }' "$public_key"); \
+         derived_fingerprint=$(ssh-keygen -lf "$public_key" -E sha256 | awk 'NR == 1 { print $2 }'); \
+         printf '{"status":%s,"public_key_file":"%s","public_key_line_count":%s,"derived_fingerprint":"%s","private_key_sha256":"%s","private_key_mode":"%s","auth_config_sha256":"%s","auth_config_mode":"%s"}\n' \
            "$status" \
+           "$public_key_file" \
+           "$public_key_line_count" \
+           "$derived_fingerprint" \
            "$(sha256sum "$private_key" | cut -d ' ' -f 1)" \
            "$(stat -c %a "$private_key")" \
            "$(sha256sum "$auth_config" | cut -d ' ' -f 1)" \
            "$(stat -c %a "$auth_config")""#,
-    ])?;
-    assert_secret_free_output(&output.stdout, &output.stderr)?;
+        ],
+        std::time::Duration::from_secs(90),
+    )?;
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
-fn assert_developer_configuration(snapshot: &DeveloperConfigurationSnapshot) -> TestResult {
+fn assert_developer_configuration(
+    snapshot: &DeveloperConfigurationSnapshot,
+    sandbox_id: &str,
+) -> TestResult {
     if snapshot.private_key_mode != "600" || snapshot.auth_config_mode != "600" {
         return Err(format!("developer credential modes changed: {snapshot:?}").into());
     }
     if snapshot.private_key_sha256.len() != 64 || snapshot.auth_config_sha256.len() != 64 {
         return Err("developer credential hashes are malformed".into());
     }
+    let mut public_key_fields = snapshot.public_key_file.split_ascii_whitespace();
+    let algorithm = public_key_fields.next();
+    let encoded_key = public_key_fields.next();
+    let comment = public_key_fields.next();
+    if snapshot.public_key_line_count != 1
+        || algorithm != Some("ssh-ed25519")
+        || encoded_key.is_none_or(str::is_empty)
+        || comment != Some(format!("gascan-{sandbox_id}").as_str())
+        || public_key_fields.next().is_some()
+        || snapshot
+            .public_key_file
+            .bytes()
+            .any(|byte| matches!(byte, b'\r' | b'\n'))
+    {
+        return Err("developer SSH public key is malformed or not sandbox-bound".into());
+    }
+    if snapshot
+        .derived_fingerprint
+        .strip_prefix("SHA256:")
+        .is_none_or(str::is_empty)
+    {
+        return Err("developer SSH fingerprint is malformed".into());
+    }
     let expected = serde_json::json!({
         "email": "ada@example.test",
-        "fingerprint": snapshot.status["fingerprint"].clone(),
+        "fingerprint": snapshot.derived_fingerprint,
         "name": "Ada Lovelace",
         "protocol": "ssh",
-        "public_key": snapshot.status["public_key"].clone(),
+        "public_key": snapshot.public_key_file,
         "receipt": "complete",
     });
-    if snapshot.status != expected
-        || snapshot.status["fingerprint"].as_str().is_none()
-        || snapshot.status["public_key"].as_str().is_none()
-    {
+    if snapshot.status != expected {
         return Err(format!(
             "developer configuration status changed: {:?}",
             snapshot.status
@@ -960,6 +1036,101 @@ fn assert_developer_configuration(snapshot: &DeveloperConfigurationSnapshot) -> 
         .into());
     }
     Ok(())
+}
+
+#[test]
+fn developer_configuration_requires_independently_derived_fingerprint() {
+    let public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGood gascan-sandbox-id";
+    let snapshot = DeveloperConfigurationSnapshot {
+        auth_config_mode: "600".into(),
+        auth_config_sha256: "a".repeat(64),
+        derived_fingerprint: "SHA256:independently-derived".into(),
+        private_key_mode: "600".into(),
+        private_key_sha256: "b".repeat(64),
+        public_key_file: public_key.into(),
+        public_key_line_count: 1,
+        status: serde_json::json!({
+            "email": "ada@example.test",
+            "fingerprint": "SHA256:self-reported",
+            "name": "Ada Lovelace",
+            "protocol": "ssh",
+            "public_key": public_key,
+            "receipt": "complete",
+        }),
+    };
+
+    assert!(assert_developer_configuration(&snapshot, "sandbox-id").is_err());
+}
+
+#[test]
+fn developer_configuration_requires_status_public_key_to_match_disk() {
+    let snapshot = DeveloperConfigurationSnapshot {
+        auth_config_mode: "600".into(),
+        auth_config_sha256: "a".repeat(64),
+        derived_fingerprint: "SHA256:independently-derived".into(),
+        private_key_mode: "600".into(),
+        private_key_sha256: "b".repeat(64),
+        public_key_file: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGood gascan-sandbox-id".into(),
+        public_key_line_count: 1,
+        status: serde_json::json!({
+            "email": "ada@example.test",
+            "fingerprint": "SHA256:independently-derived",
+            "name": "Ada Lovelace",
+            "protocol": "ssh",
+            "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBad gascan-sandbox-id",
+            "receipt": "complete",
+        }),
+    };
+
+    assert!(assert_developer_configuration(&snapshot, "sandbox-id").is_err());
+}
+
+#[test]
+fn developer_configuration_requires_sandbox_bound_ed25519_public_key() {
+    let public_key = "ssh-rsa AAAAB3NzaBad developer@example.test";
+    let snapshot = DeveloperConfigurationSnapshot {
+        auth_config_mode: "600".into(),
+        auth_config_sha256: "a".repeat(64),
+        derived_fingerprint: "SHA256:independently-derived".into(),
+        private_key_mode: "600".into(),
+        private_key_sha256: "b".repeat(64),
+        public_key_file: public_key.into(),
+        public_key_line_count: 1,
+        status: serde_json::json!({
+            "email": "ada@example.test",
+            "fingerprint": "SHA256:independently-derived",
+            "name": "Ada Lovelace",
+            "protocol": "ssh",
+            "public_key": public_key,
+            "receipt": "complete",
+        }),
+    };
+
+    assert!(assert_developer_configuration(&snapshot, "sandbox-id").is_err());
+}
+
+#[test]
+fn developer_configuration_rejects_extra_public_key_file_records() {
+    let public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGood gascan-sandbox-id";
+    let snapshot = DeveloperConfigurationSnapshot {
+        auth_config_mode: "600".into(),
+        auth_config_sha256: "a".repeat(64),
+        derived_fingerprint: "SHA256:independently-derived".into(),
+        private_key_mode: "600".into(),
+        private_key_sha256: "b".repeat(64),
+        public_key_file: public_key.into(),
+        public_key_line_count: 2,
+        status: serde_json::json!({
+            "email": "ada@example.test",
+            "fingerprint": "SHA256:independently-derived",
+            "name": "Ada Lovelace",
+            "protocol": "ssh",
+            "public_key": public_key,
+            "receipt": "complete",
+        }),
+    };
+
+    assert!(assert_developer_configuration(&snapshot, "sandbox-id").is_err());
 }
 
 fn assert_secret_free_output(stdout: &[u8], stderr: &[u8]) -> TestResult {
@@ -978,10 +1149,11 @@ fn assert_secret_free_output(stdout: &[u8], stderr: &[u8]) -> TestResult {
 }
 
 fn assert_nested_shell_prompt_identity(env: &AppleE2e, selector: &str) -> TestResult {
-    let output = env.run_default_shell_pty_script(
+    let output = env.run_default_shell_pty_script_with_output_guard(
         "/bin/bash --login -i /workspace/.gascan/shell-prompt-probe.sh\nexit 0\n",
         b"GASCAN_PROMPT_IDENTITY_END",
         "gascan-apple-e2e-term",
+        assert_secret_free_output,
     )?;
     if !output.status.success() {
         return Err(format!(

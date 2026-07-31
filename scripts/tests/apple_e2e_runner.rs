@@ -739,6 +739,61 @@ fn runner_recreates_private_session_root_after_per_target_cleanup() {
 }
 
 #[test]
+fn runner_rejects_unsafe_recreated_session_root_before_second_target() {
+    for (case, expected_error) in [
+        ("symlink", "scoped session root is unsafe"),
+        ("mode", "scoped session root metadata changed"),
+        ("owner", "scoped session root metadata changed"),
+    ] {
+        let fixture = runner_fixture(
+            "#!/bin/sh\nset -eu\nmkdir -p \"$RUNNER_FIXTURE_ROOT/target\"\nprintf '#!/bin/sh\\n' >\"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\nchmod 755 \"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\n",
+        );
+        let root = fixture.path();
+        let log = root.join("runner.log");
+        let uid = fs::metadata(root).unwrap().uid();
+        let foreign_uid = if uid == 99_999 { 99_998 } else { 99_999 };
+        write_executable(
+            &root.join("bin/cargo"),
+            "#!/bin/sh\nset -eu\ncase \" $* \" in\n *' build '*) mkdir -p \"$RUNNER_FIXTURE_ROOT/target/debug\"; printf '#!/bin/sh\\n' >\"$RUNNER_FIXTURE_ROOT/target/debug/gascan-e2e-cli\"; chmod 755 \"$RUNNER_FIXTURE_ROOT/target/debug/gascan-e2e-cli\";;\n *' test '*) printf 'target:%s\\n' \"$5\" >>\"$RUNNER_FIXTURE_LOG\"; printf '{}\\n' >\"$GASCAN_E2E_CLEANUP_MANIFEST\"; chmod 600 \"$GASCAN_E2E_CLEANUP_MANIFEST\";;\nesac\n",
+        );
+        write_executable(
+            &root.join("scripts/apple-e2e-cleanup.sh"),
+            "#!/bin/sh\nset -eu\nrm -f \"$1\"\nif ! test -f \"$RUNNER_FIXTURE_ROOT/session-root-mutated\"; then\n  : >\"$RUNNER_FIXTURE_ROOT/session-root-mutated\"\n  case \"$RUNNER_FIXTURE_CASE\" in\n    symlink) rmdir \"$GASCAN_E2E_SESSION_ROOT\"; mkdir -m 700 \"$RUNNER_FIXTURE_ROOT/symlink-target\"; ln -s \"$RUNNER_FIXTURE_ROOT/symlink-target\" \"$GASCAN_E2E_SESSION_ROOT\";;\n    mode) chmod 755 \"$GASCAN_E2E_SESSION_ROOT\";;\n    owner) :;;\n  esac\nfi\n",
+        );
+        write_executable(
+            &root.join("bin/id"),
+            "#!/bin/sh\nset -eu\ntest \"$#\" -eq 1\ntest \"$1\" = -u\nif test \"$RUNNER_FIXTURE_CASE\" = owner && test -f \"$RUNNER_FIXTURE_ROOT/session-root-mutated\"; then\n  printf '%s\\n' \"$RUNNER_FIXTURE_FOREIGN_UID\"\nelse\n  printf '%s\\n' \"$RUNNER_FIXTURE_UID\"\nfi\n",
+        );
+
+        let output = Command::new(root.join("scripts/run-apple-e2e.sh"))
+            .env("RUNNER_FIXTURE_ROOT", root)
+            .env("RUNNER_FIXTURE_LOG", &log)
+            .env("RUNNER_FIXTURE_CASE", case)
+            .env("RUNNER_FIXTURE_UID", uid.to_string())
+            .env("RUNNER_FIXTURE_FOREIGN_UID", foreign_uid.to_string())
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", root.join("bin").display()),
+            )
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success(), "{case} unexpectedly succeeded");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected_error), "{case}: {stderr}");
+        let records = fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            records
+                .lines()
+                .filter(|line| line.starts_with("target:"))
+                .collect::<Vec<_>>(),
+            ["target:apple_lifecycle"],
+            "{case} reached the second target: {records}"
+        );
+    }
+}
+
+#[test]
 fn unusable_attach_helper_stops_before_preflight_and_live_test() {
     let fixture = runner_fixture(
         "#!/bin/sh\nset -eu\nprintf 'helper-build\\n' >>\"$RUNNER_FIXTURE_LOG\"\nmkdir -p \"$RUNNER_FIXTURE_ROOT/target\"\nprintf 'not executable\\n' >\"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\nchmod 644 \"$RUNNER_FIXTURE_ROOT/target/gascan-apple-attach\"\n",

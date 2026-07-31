@@ -141,9 +141,69 @@ an inherited `redundant_closure` diagnostic in
 E2E target has zero clippy issues, and all changed runner tests compile and
 pass.
 
+## Independent review repair (2026-07-31)
+
+The developer-persistence acceptance now captures and checks both output
+streams from every user-observable Gas Can command in its lifecycle: initial
+`up`, developer configuration and each snapshot `run`, `down`, restart `up`,
+`apply`, and `destroy`. The nested PTY output is checked before status,
+warning, or prompt-marker parsing. Capture-first bounded-command and PTY
+guards also scan output before nonzero-exit or timeout diagnostics are built;
+secret-bearing failures therefore return only a sanitized error.
+`replace_owned_container_image` directly
+drives the Apple runtime and `seed_stored_image_resolution` directly prepares
+the test database; neither returns user-observable Gas Can command output, so
+their APIs were intentionally left unchanged.
+
+The identity snapshot now reads the public key from `id_ed25519.pub` and asks
+`ssh-keygen -lf ... -E sha256` to derive its fingerprint independently of
+`configure-developer-home status`. An independent physical-record count keeps
+shell command substitution from hiding trailing blank lines. The assertion
+requires exactly one nonempty
+`ssh-ed25519` line with the exact `gascan-<sandbox-id>` comment, a nonempty
+`SHA256:` fingerprint, exact public-key equality with the file, and exact
+fingerprint equality with the independent derivation. Only public material,
+file modes, and credential hashes enter diagnostics; private-key and fake
+native-auth contents remain excluded.
+
+The multi-target runner fixture now corrupts the recreated session-root
+boundary three ways after lifecycle cleanup: a symlink, mode `0755`, and a
+foreign-owner observation simulated by a scoped `id -u` shim. Each case proves
+the runner rejects the root before invoking recovery, without `sudo` or
+`chown`. Mutation testing removed the runner's symlink and metadata checks;
+the fixture failed, then passed when the fail-closed checks were restored.
+
+Repair verification:
+
+- Identity RED: 0 passed, 2 failed against the self-copying status assertion.
+- Identity GREEN: focused assertions passed; final non-live `apple_apply`
+  target passed 76 tests with 8 live tests ignored.
+- Capture-first command/PTY RED: three tests failed on the absent guarded APIs;
+  GREEN: ordinary failure, timeout, and PTY early-exit regressions all passed.
+- Physical-record RED: 0 passed, 1 failed when an extra public-key record was
+  normalized away; GREEN: 1 passed with exact record-count validation.
+- Runner mutation RED: 0 passed, 1 failed with symlink/metadata validation
+  removed.
+- Runner GREEN: 22 passed, including all three adversarial root cases.
+- Full non-live `gascan-e2e`: 347 passed with 11 live tests ignored across 12
+  suites. The first run hit one transient, unrelated daemon-restart descriptor
+  race; its focused rerun passed, followed by the complete green rerun.
+- Full scripts suite: 502 passed across 52 suites with host process access.
+- `cargo clippy -p gascan-e2e --test apple_apply -- -D warnings`: pass.
+- Runner clippy passed with only the pre-existing
+  `clippy::single-element-loop` at `apple_e2e_runner.rs:225` allowed; the
+  unmodified strict invocation reports that inherited diagnostic.
+- `cargo fmt --all`, `bash -n scripts/run-apple-e2e.sh`, and
+  `git diff --check`: pass.
+- The live Apple suite was not rerun because this repair changes acceptance
+  and fixture code only, not production or live-runtime behavior.
+- Independent repair re-review found no remaining Critical, Important, or
+  Minor issues and returned a ready-to-merge verdict.
+
 ## Files
 
 - `crates/gascan-e2e/tests/apple_apply.rs`
+- `crates/gascan-e2e/tests/apple_common/mod.rs`
 - `scripts/run-apple-e2e.sh`
 - `scripts/tests/apple_e2e_runner.rs`
 - `images/workspace/approved-image.txt`
