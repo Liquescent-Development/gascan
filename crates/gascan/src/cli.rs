@@ -452,8 +452,8 @@ pub async fn execute() -> Result<i32, CliError> {
         Command::Up { project_root, json } => {
             let project_root = resolve_project_root(&project_root)?;
             let developer_offer_ci = continuous_integration();
-            let developer_selector =
-                (!json && !developer_offer_ci).then(|| selector_for_project_root(&project_root));
+            let developer_stdin_is_terminal = std::io::stdin().is_terminal();
+            let developer_stderr_is_terminal = std::io::stderr().is_terminal();
             match client
                 .api
                 .up(v1::UpRequest {
@@ -471,16 +471,17 @@ pub async fn execute() -> Result<i32, CliError> {
                         try_offer_ssh_config_include,
                     );
                     let mut warning = std::io::stderr();
-                    preserve_up_result_with_developer_offer(
+                    preserve_up_result_with_developer_offer_gate(
                         result,
-                        json,
-                        developer_offer_ci,
+                        DeveloperOfferEligibility {
+                            json,
+                            continuous_integration: developer_offer_ci,
+                            stdin_is_terminal: developer_stdin_is_terminal,
+                            stderr_is_terminal: developer_stderr_is_terminal,
+                        },
                         &mut warning,
-                        || async {
-                            let Some(selector) = developer_selector else {
-                                return Ok(OfferResult::Suppressed);
-                            };
-                            let selector = selector?;
+                        || selector_for_project_root(&project_root),
+                        |selector| async {
                             let mut io = TerminalPrompter::new()?;
                             offer_after_up(&mut client, selector, &mut io).await
                         },
@@ -1208,6 +1209,42 @@ where
     result
 }
 
+#[derive(Clone, Copy)]
+struct DeveloperOfferEligibility {
+    json: bool,
+    continuous_integration: bool,
+    stdin_is_terminal: bool,
+    stderr_is_terminal: bool,
+}
+
+async fn preserve_up_result_with_developer_offer_gate<Prepare, Offer, Future, W>(
+    result: Result<i32, CliError>,
+    eligibility: DeveloperOfferEligibility,
+    warning: &mut W,
+    prepare_selector: Prepare,
+    offer: Offer,
+) -> Result<i32, CliError>
+where
+    Prepare: FnOnce() -> Result<v1::SandboxSelector, ConfigureError>,
+    Offer: FnOnce(v1::SandboxSelector) -> Future,
+    Future: std::future::Future<Output = Result<OfferResult, ConfigureError>>,
+    W: Write,
+{
+    if !matches!(result, Ok(0))
+        || eligibility.json
+        || eligibility.continuous_integration
+        || !eligibility.stdin_is_terminal
+        || !eligibility.stderr_is_terminal
+    {
+        return result;
+    }
+    let selector = prepare_selector();
+    preserve_up_result_with_developer_offer(result, false, false, warning, || async move {
+        offer(selector?).await
+    })
+    .await
+}
+
 fn selector_for_project_root(project_root: &str) -> Result<v1::SandboxSelector, ConfigureError> {
     let manifest = gascan_core::manifest::Manifest::load(project_root.as_ref()).map_err(|_| {
         ConfigureError::HostCommand {
@@ -1745,20 +1782,39 @@ mod tests {
             result: Result<i32, CliError>,
             json: bool,
             ci: bool,
-        ) -> Result<(Result<i32, CliError>, u32, Vec<u8>), Box<dyn std::error::Error>> {
+        ) -> Result<(Result<i32, CliError>, u32, u32, Vec<u8>), Box<dyn std::error::Error>>
+        {
+            let selector_preparations = std::cell::Cell::new(0_u32);
             let calls = std::cell::Cell::new(0_u32);
             let mut warning = Vec::new();
-            let result =
-                preserve_up_result_with_developer_offer(result, json, ci, &mut warning, || async {
+            let result = preserve_up_result_with_developer_offer_gate(
+                result,
+                DeveloperOfferEligibility {
+                    json,
+                    continuous_integration: ci,
+                    stdin_is_terminal: true,
+                    stderr_is_terminal: true,
+                },
+                &mut warning,
+                || {
+                    selector_preparations.set(selector_preparations.get() + 1);
+                    Ok(v1::SandboxSelector {
+                        sandbox_id: "selected-0123456789ab".to_owned(),
+                    })
+                },
+                |_| async {
                     calls.set(calls.get() + 1);
                     Ok(OfferResult::Completed)
-                })
-                .await;
-            Ok((result, calls.get(), warning))
+                },
+            )
+            .await;
+            Ok((result, selector_preparations.get(), calls.get(), warning))
         }
 
-        let (success, calls, warning) = exercise(Ok(0), false, false).await?;
+        let (success, selector_preparations, calls, warning) =
+            exercise(Ok(0), false, false).await?;
         assert_eq!(success?, 0);
+        assert_eq!(selector_preparations, 1);
         assert_eq!(calls, 1);
         assert!(warning.is_empty());
 
@@ -1767,21 +1823,64 @@ mod tests {
             (Ok(0), false, true),
             (Ok(EXIT_RUNTIME), false, false),
         ] {
-            let (result, calls, warning) = exercise(result, json, ci).await?;
+            let (result, selector_preparations, calls, warning) =
+                exercise(result, json, ci).await?;
             assert!(result.is_ok());
+            assert_eq!(selector_preparations, 0);
             assert_eq!(calls, 0);
             assert!(warning.is_empty());
         }
 
         let original = CliError::Runtime("injected up failure".to_owned());
-        let (failed, calls, warning) = exercise(Err(original), false, false).await?;
+        let (failed, selector_preparations, calls, warning) =
+            exercise(Err(original), false, false).await?;
         let failed = match failed {
             Err(error) => error,
             Ok(_) => return Err("failed up unexpectedly succeeded".into()),
         };
         assert_eq!(failed.message(), "injected up failure");
+        assert_eq!(selector_preparations, 0);
         assert_eq!(calls, 0);
         assert!(warning.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn first_up_redirected_io_suppresses_before_selector_preparation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (stdin_is_terminal, stderr_is_terminal) in [(false, true), (true, false)] {
+            let selector_preparations = std::cell::Cell::new(0_u32);
+            let offer_calls = std::cell::Cell::new(0_u32);
+            let mut warning = Vec::new();
+
+            let result = preserve_up_result_with_developer_offer_gate(
+                Ok(0),
+                DeveloperOfferEligibility {
+                    json: false,
+                    continuous_integration: false,
+                    stdin_is_terminal,
+                    stderr_is_terminal,
+                },
+                &mut warning,
+                || {
+                    selector_preparations.set(selector_preparations.get() + 1);
+                    Err(ConfigureError::HostCommand {
+                        category: "developer onboarding selector",
+                        message: "injected selector failure".to_owned(),
+                    })
+                },
+                |_| async {
+                    offer_calls.set(offer_calls.get() + 1);
+                    Ok(OfferResult::Completed)
+                },
+            )
+            .await;
+
+            assert_eq!(result?, 0);
+            assert_eq!(selector_preparations.get(), 0);
+            assert_eq!(offer_calls.get(), 0);
+            assert!(warning.is_empty());
+        }
         Ok(())
     }
 

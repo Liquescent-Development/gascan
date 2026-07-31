@@ -129,3 +129,42 @@ allowance and avoids adding a public test seam or new daemon architecture.
 - `crates/gascan/src/configure/onboarding_tests.rs`
 - `crates/gascan/tests/configure_cli.rs`
 - `.superpowers/sdd/2026-07-30-developer-onboarding/task-8-implementer-report.md`
+
+## Controller review repair: terminal suppression before selector preparation
+
+The controller review found that non-TTY suppression occurred only inside
+`offer_after_up_with`, after `execute` had already prepared and stored the
+project-derived selector result. A successful redirected `up` could therefore
+unwrap a failed selector preparation in the outer wrapper and print the
+developer retry warning even though onboarding was supposed to be fully
+suppressed.
+
+The repair adds a composed private production gate containing JSON, CI, stdin
+terminal, and stderr terminal eligibility. It returns the original `up` result
+before invoking the selector-preparation closure or the offer closure. Only an
+eligible successful human `up` derives `SandboxSpec` and reaches the existing
+receipt-aware offer. The inner terminal check remains as defense in depth.
+
+### Repair TDD evidence
+
+- RED: `rtk cargo test -p gascan
+  first_up_redirected_io_suppresses_before_selector_preparation` failed because
+  the composed production gate did not exist.
+- GREEN: the same regression passed for `(stdin redirected, stderr terminal)`
+  and `(stdin terminal, stderr redirected)`, proving zero selector preparations,
+  zero offer calls, no developer warning, and the original zero result.
+- Existing JSON, CI, failed, and nonzero cases were moved onto the composed gate
+  and additionally assert zero selector preparations.
+
+### Repair verification
+
+- `rtk cargo test -p gascan first_up_` — 15 passed.
+- `rtk cargo test -p gascan --test configure_cli first_up_` — 1 passed.
+- `rtk cargo test -p gascan optional_include_offer` — 2 passed.
+- `rtk cargo test -p gascan --test ssh_config` — 18 passed.
+- `rtk cargo clippy -p gascan --all-targets -- -D warnings` — pass with zero
+  issues.
+- `rtk cargo fmt --all -- --check` — pass.
+- `rtk git diff --check` — pass.
+- `rtk cargo test -p gascan` with host process access — 300 passed across 7
+  suites in 4.72 seconds.
