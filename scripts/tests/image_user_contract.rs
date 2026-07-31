@@ -2025,6 +2025,140 @@ fn configure_workstation_home_is_idempotent_and_refuses_unmanaged_paths() {
     }
 }
 
+fn write_managed_home_directory(directory: &Path, mode: u32) {
+    fs::create_dir_all(directory).unwrap();
+    fs::set_permissions(directory, fs::Permissions::from_mode(mode)).unwrap();
+    let marker = directory.join(".gascan-managed");
+    fs::write(&marker, "gascan-workstation-home-v1\n").unwrap();
+    fs::set_permissions(marker, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn assert_configure_workstation_home_rejects_git_metadata(case: &str) {
+    let script = root().join("images/workspace/bin/configure-workstation-home");
+    let temporary = tempfile::tempdir().unwrap();
+    let test_home = temporary.path().join("home");
+    fs::create_dir(&test_home).unwrap();
+    let git = test_home.join(".config/gascan/git");
+    let ssh = git.join("ssh");
+    let invalid_directory = match case {
+        "git-wrong-mode" => {
+            write_managed_home_directory(&git, 0o755);
+            &git
+        }
+        "ssh-wrong-mode" => {
+            write_managed_home_directory(&git, 0o700);
+            write_managed_home_directory(&ssh, 0o755);
+            &ssh
+        }
+        "git-wrong-owner" => {
+            write_managed_home_directory(&git, 0o700);
+            &git
+        }
+        "ssh-wrong-owner" => {
+            write_managed_home_directory(&git, 0o700);
+            write_managed_home_directory(&ssh, 0o700);
+            &ssh
+        }
+        _ => unreachable!(),
+    };
+    let invalid_inode = fs::symlink_metadata(invalid_directory).unwrap().ino();
+    let invalid_mode = fs::metadata(invalid_directory)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+
+    let mut command = Command::new(&script);
+    command.env("HOME", &test_home);
+    if case.ends_with("wrong-owner") {
+        let fake_bin = temporary.path().join("fake-bin");
+        fs::create_dir(&fake_bin).unwrap();
+        let id = fake_bin.join("id");
+        fs::write(
+            &id,
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               -u) printf '%s\\n' \"$GASCAN_TEST_UID\" ;;\n\
+               -g) printf '%s\\n' \"$GASCAN_TEST_GID\" ;;\n\
+               *) exec /usr/bin/id \"$@\" ;;\n\
+             esac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&id, fs::Permissions::from_mode(0o555)).unwrap();
+        let stat = fake_bin.join("stat");
+        fs::write(
+            &stat,
+            "#!/bin/sh\n\
+             last=\n\
+             for argument do last=$argument; done\n\
+             if test -n \"${GASCAN_TEST_MATCH-}\" && { test \"$last\" = \"$GASCAN_TEST_MATCH\" || test \"$last\" = \"$GASCAN_TEST_MATCH/.gascan-managed\"; }; then\n\
+               case \"$last\" in */.gascan-managed) mode=600 ;; *) mode=700 ;; esac\n\
+               printf '%s:%s:%s\\n' \"$GASCAN_TEST_UID\" \"$GASCAN_TEST_GID\" \"$mode\"\n\
+               exit 0\n\
+             fi\n\
+             exec /usr/bin/stat \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&stat, fs::Permissions::from_mode(0o555)).unwrap();
+        let metadata = fs::metadata(temporary.path()).unwrap();
+        let modeled_uid = metadata.uid() + 1;
+        let system_path = std::env::var_os("PATH").unwrap_or_default();
+        command
+            .env(
+                "PATH",
+                format!("{}:{}", fake_bin.display(), system_path.to_string_lossy()),
+            )
+            .env("GASCAN_TEST_UID", modeled_uid.to_string())
+            .env("GASCAN_TEST_GID", metadata.gid().to_string());
+        if case == "ssh-wrong-owner" {
+            command.env("GASCAN_TEST_MATCH", &git);
+        }
+    }
+
+    let rejected = command.status().unwrap();
+    assert!(!rejected.success(), "accepted {case}");
+    assert!(
+        !test_home.join(".config/gascan/agents").exists(),
+        "rejection for {case} occurred after earlier managed-directory mutation"
+    );
+    assert!(
+        !test_home.join(".ssh").exists(),
+        "rejection for {case} occurred after link publication"
+    );
+    let metadata = fs::symlink_metadata(invalid_directory).unwrap();
+    assert_eq!(metadata.ino(), invalid_inode, "replaced {case} directory");
+    assert_eq!(
+        metadata.permissions().mode() & 0o777,
+        invalid_mode,
+        "changed {case} mode"
+    );
+    assert_eq!(
+        fs::read_to_string(invalid_directory.join(".gascan-managed")).unwrap(),
+        "gascan-workstation-home-v1\n",
+        "changed {case} marker"
+    );
+}
+
+#[test]
+fn configure_workstation_home_rejects_marked_git_directory_with_wrong_mode() {
+    assert_configure_workstation_home_rejects_git_metadata("git-wrong-mode");
+}
+
+#[test]
+fn configure_workstation_home_rejects_marked_ssh_directory_with_wrong_mode() {
+    assert_configure_workstation_home_rejects_git_metadata("ssh-wrong-mode");
+}
+
+#[test]
+fn configure_workstation_home_rejects_marked_git_directory_with_wrong_owner() {
+    assert_configure_workstation_home_rejects_git_metadata("git-wrong-owner");
+}
+
+#[test]
+fn configure_workstation_home_rejects_marked_ssh_directory_with_wrong_owner() {
+    assert_configure_workstation_home_rejects_git_metadata("ssh-wrong-owner");
+}
+
 #[test]
 fn profile_defaults_are_exact_and_idempotent() {
     let profile = root().join("images/workspace/etc/profile.d/mise.sh");

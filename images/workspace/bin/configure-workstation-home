@@ -12,6 +12,8 @@ git_root=$gascan_root/git
 ssh_root=$git_root/ssh
 herdr_link=$HOME/.config/herdr
 herdr_expected=../.cache/herdr
+managed_uid=$(id -u)
+managed_gid=$(id -g)
 
 refuse()
 {
@@ -38,6 +40,16 @@ preflight_link()
     fi
 }
 
+path_metadata()
+{
+    path=$1
+    if metadata=$(stat -c '%u:%g:%a' "$path" 2>/dev/null); then
+        printf '%s\n' "$metadata"
+    else
+        stat -f '%u:%g:%Lp' "$path"
+    fi
+}
+
 preflight_managed_dir()
 {
     directory=$1
@@ -45,9 +57,11 @@ preflight_managed_dir()
         refuse "$directory"
     fi
     if [ -d "$directory" ]; then
+        test "$(path_metadata "$directory")" = "$managed_uid:$managed_gid:700" || refuse "$directory"
         marker=$directory/$marker_name
         test ! -L "$marker" || refuse "$directory"
         test -f "$marker" || refuse "$directory"
+        test "$(path_metadata "$marker")" = "$managed_uid:$managed_gid:600" || refuse "$directory"
         test "$(cat "$marker")" = "$marker_value" || refuse "$directory"
     fi
 }
