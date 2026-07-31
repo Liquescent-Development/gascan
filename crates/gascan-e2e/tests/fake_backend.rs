@@ -80,6 +80,19 @@ impl Environment {
     fn invoke(&self, arguments: &[&str]) -> Result<std::process::Output, std::io::Error> {
         self.command(arguments).output()
     }
+    fn start_daemon_without_capture(&self) -> TestResult {
+        let status = self
+            .command(&["daemon", "start"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("daemon start failed with {status}").into())
+        }
+    }
     fn root(&self) -> Result<&str, &'static str> {
         self.root.path().to_str().ok_or("non UTF-8 root")
     }
@@ -642,6 +655,93 @@ fn no_sandbox_status_error_is_actionable_and_keeps_usage_exit() -> TestResult {
     let stderr = String::from_utf8(output.stderr)?;
     assert!(stderr.starts_with("Error: no sandbox is available\n"));
     assert!(stderr.contains("Try: gascan up <project-root>\n"));
+    Ok(())
+}
+
+#[test]
+fn configure_with_no_sandbox_stops_before_piped_token_read() -> TestResult {
+    let env = Environment::new()?;
+    env.start_daemon_without_capture()?;
+    let output = env
+        .command(&[
+            "configure",
+            "gh",
+            "--token-stdin",
+            "--git-protocol",
+            "https",
+        ])
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert_eq!(output.status.code(), Some(64), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.starts_with("Error: no sandbox is available\n"));
+    assert!(stderr.contains("Try: gascan up <project-root>\n"));
+    assert!(!stderr.contains("piped token must not be empty"));
+    Ok(())
+}
+
+#[test]
+fn configure_with_multiple_sandboxes_stops_before_piped_token_read() -> TestResult {
+    let env = Environment::new()?;
+    env.start_daemon_without_capture()?;
+    let second = tempfile::tempdir()?;
+    let second_root = second.path().to_str().ok_or("non UTF-8 root")?;
+    assert!(env.invoke(&["up", env.root()?])?.status.success());
+    assert!(env.invoke(&["up", second_root])?.status.success());
+
+    let output = env
+        .command(&[
+            "configure",
+            "gh",
+            "--token-stdin",
+            "--git-protocol",
+            "https",
+        ])
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert_eq!(output.status.code(), Some(64), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.starts_with("Error: multiple sandboxes are available\n"));
+    assert!(stderr.contains("pass `--sandbox <sandbox-id>`"));
+    assert!(!stderr.contains("piped token must not be empty"));
+    Ok(())
+}
+
+#[test]
+fn configure_with_stopped_sandbox_stops_before_piped_token_read() -> TestResult {
+    let env = Environment::new()?;
+    env.start_daemon_without_capture()?;
+    assert!(env.invoke(&["up", env.root()?])?.status.success());
+    let status = env.invoke(&["status", "--json"])?;
+    let sandbox_id = serde_json::from_slice::<serde_json::Value>(&status.stdout)?["sandbox_id"]
+        .as_str()
+        .ok_or("sandbox id missing")?
+        .to_owned();
+    assert!(env.invoke(&["down"])?.status.success());
+
+    let output = env
+        .command(&[
+            "--sandbox",
+            &sandbox_id,
+            "configure",
+            "gh",
+            "--token-stdin",
+            "--git-protocol",
+            "https",
+        ])
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert_eq!(output.status.code(), Some(64), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.starts_with(&format!("Error: sandbox `{sandbox_id}` is not running;")));
+    assert!(stderr.contains("run `gascan up <project-root>`"));
+    assert!(!stderr.contains("piped token must not be empty"));
     Ok(())
 }
 

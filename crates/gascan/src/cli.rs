@@ -667,29 +667,11 @@ async fn execute_configure(
         .into_inner()
         .sandbox
         .ok_or_else(|| CliError::Runtime("daemon returned no sandbox status".to_owned()))?;
-    require_running_sandbox(status)?;
-
-    let piped_token = match &command {
-        Some(
-            ConfigureCommand::Gh {
-                token_stdin: true, ..
-            }
-            | ConfigureCommand::Glab {
-                token_stdin: true, ..
-            },
-        ) => Some(read_token_stdin()?),
-        None
-        | Some(ConfigureCommand::Git)
-        | Some(ConfigureCommand::Gh {
-            token_stdin: false, ..
-        })
-        | Some(ConfigureCommand::Glab {
-            token_stdin: false, ..
-        }) => None,
-    };
-
+    let (piped_token, mut runner) =
+        prepare_configure_dispatch(&selector, &status, &command, read_token_stdin, move || {
+            ClientGuestRunner::new(client)
+        })?;
     let discovery = SystemHostDiscovery::new();
-    let mut runner = ClientGuestRunner::new(client);
     let outcome = match command {
         None => configure_all(&mut runner, selector, &discovery, &mut io).await,
         Some(ConfigureCommand::Git) => {
@@ -776,7 +758,44 @@ fn read_token_stdin_from(reader: &mut impl std::io::Read) -> Result<Secret, CliE
     Ok(Secret::from_sensitive(token))
 }
 
-fn require_running_sandbox(status: v1::SandboxStatus) -> Result<(), CliError> {
+fn prepare_configure_dispatch<R>(
+    selector: &v1::SandboxSelector,
+    status: &v1::SandboxStatus,
+    command: &Option<ConfigureCommand>,
+    read_token: impl FnOnce() -> Result<Secret, CliError>,
+    make_runner: impl FnOnce() -> R,
+) -> Result<(Option<Secret>, R), CliError> {
+    require_running_sandbox(&selector.sandbox_id, status)?;
+    let piped_token = match command {
+        Some(
+            ConfigureCommand::Gh {
+                token_stdin: true, ..
+            }
+            | ConfigureCommand::Glab {
+                token_stdin: true, ..
+            },
+        ) => Some(read_token()?),
+        None
+        | Some(ConfigureCommand::Git)
+        | Some(ConfigureCommand::Gh {
+            token_stdin: false, ..
+        })
+        | Some(ConfigureCommand::Glab {
+            token_stdin: false, ..
+        }) => None,
+    };
+    Ok((piped_token, make_runner()))
+}
+
+fn require_running_sandbox(
+    expected_sandbox_id: &str,
+    status: &v1::SandboxStatus,
+) -> Result<(), CliError> {
+    if status.sandbox_id != expected_sandbox_id {
+        return Err(CliError::Runtime(format!(
+            "daemon returned status for a different sandbox than selected `{expected_sandbox_id}`; retry the command, then run `gascan daemon restart` if the mismatch persists"
+        )));
+    }
     if status.actual_state == v1::ActualState::Running as i32 {
         return Ok(());
     }
@@ -784,7 +803,7 @@ fn require_running_sandbox(status: v1::SandboxStatus) -> Result<(), CliError> {
         kind: UsageKind::Other,
         message: format!(
             "sandbox `{}` is not running; run `gascan up <project-root>`",
-            status.sandbox_id
+            expected_sandbox_id
         ),
     })
 }
@@ -1734,7 +1753,7 @@ mod tests {
             actual_state: v1::ActualState::Stopped as i32,
             ..Default::default()
         };
-        let error = match require_running_sandbox(stopped) {
+        let error = match require_running_sandbox("demo-0123456789ab", &stopped) {
             Err(error) => error,
             Ok(()) => return Err("stopped sandbox accepted configuration".into()),
         };
@@ -1742,6 +1761,102 @@ mod tests {
             error.message(),
             "sandbox `demo-0123456789ab` is not running; run `gascan up <project-root>`"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn mismatched_running_status_stops_before_token_read_or_runner_creation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const TOKEN_SENTINEL: &str = "configure-dispatch-token-never-read-42a7";
+
+        let selector = v1::SandboxSelector {
+            sandbox_id: "selected-0123456789ab".to_owned(),
+        };
+        let status = v1::SandboxStatus {
+            sandbox_id: "different-0123456789ab".to_owned(),
+            actual_state: v1::ActualState::Running as i32,
+            ..Default::default()
+        };
+        let command = Some(ConfigureCommand::Gh {
+            hostname: None,
+            token_stdin: true,
+            git_protocol: GitProtocol::Https,
+        });
+        let token_reads = std::cell::Cell::new(0_u32);
+        let runner_constructions = std::cell::Cell::new(0_u32);
+
+        let prepared: Result<(Option<Secret>, ()), CliError> = prepare_configure_dispatch(
+            &selector,
+            &status,
+            &command,
+            || {
+                token_reads.set(token_reads.get() + 1);
+                Ok(Secret::new(TOKEN_SENTINEL.as_bytes().to_vec()))
+            },
+            || {
+                runner_constructions.set(runner_constructions.get() + 1);
+            },
+        );
+
+        let error = match prepared {
+            Err(error) => error,
+            Ok(_) => return Err("mismatched running status reached configure dispatch".into()),
+        };
+        assert_eq!(
+            error.message(),
+            "daemon returned status for a different sandbox than selected `selected-0123456789ab`; retry the command, then run `gascan daemon restart` if the mismatch persists"
+        );
+        assert_eq!(token_reads.get(), 0);
+        assert_eq!(runner_constructions.get(), 0);
+        assert!(!error.message().contains(TOKEN_SENTINEL));
+        Ok(())
+    }
+
+    #[test]
+    fn stopped_status_stops_before_token_read_or_runner_creation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const TOKEN_SENTINEL: &str = "configure-dispatch-token-never-read-42a7";
+
+        let selector = v1::SandboxSelector {
+            sandbox_id: "selected-0123456789ab".to_owned(),
+        };
+        let status = v1::SandboxStatus {
+            sandbox_id: selector.sandbox_id.clone(),
+            actual_state: v1::ActualState::Stopped as i32,
+            ..Default::default()
+        };
+        let command = Some(ConfigureCommand::Glab {
+            hostname: None,
+            token_stdin: true,
+            git_protocol: GitProtocol::Https,
+        });
+        let token_reads = std::cell::Cell::new(0_u32);
+        let runner_constructions = std::cell::Cell::new(0_u32);
+
+        let prepared: Result<(Option<Secret>, ()), CliError> = prepare_configure_dispatch(
+            &selector,
+            &status,
+            &command,
+            || {
+                token_reads.set(token_reads.get() + 1);
+                Ok(Secret::new(TOKEN_SENTINEL.as_bytes().to_vec()))
+            },
+            || {
+                runner_constructions.set(runner_constructions.get() + 1);
+            },
+        );
+
+        let error = match prepared {
+            Err(error) => error,
+            Ok(_) => return Err("stopped status reached configure dispatch".into()),
+        };
+        assert_eq!(
+            error.message(),
+            "sandbox `selected-0123456789ab` is not running; run `gascan up <project-root>`"
+        );
+        assert_eq!(token_reads.get(), 0);
+        assert_eq!(runner_constructions.get(), 0);
+        assert!(!error.message().contains(TOKEN_SENTINEL));
         Ok(())
     }
 

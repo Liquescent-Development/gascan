@@ -400,6 +400,15 @@ async fn aggregate_accepts_and_edits_host_defaults_with_ssh_default_and_explicit
     assert!(io.stdout.contains(FINGERPRINT));
     assert!(io.stdout.contains("GitHub: skipped"));
     assert!(io.stdout.contains("GitLab: skipped"));
+    assert_eq!(
+        io.stdout,
+        format!(
+            "Summary\nGit: Ada Lovelace <ada@example.test>; protocol ssh; fingerprint {FINGERPRINT}\nGitHub: skipped\nGitLab: skipped\n"
+        )
+    );
+    assert!(io.stderr.lines().any(|line| line == "Git"));
+    assert!(io.stderr.lines().any(|line| line == "GitHub"));
+    assert!(io.stderr.lines().any(|line| line == "GitLab"));
     assert!(!io.stdout.contains(PUBLIC_KEY));
     assert!(!io.stdout.contains(SENTINEL));
     assert!(!io.stderr.contains(SENTINEL));
@@ -883,6 +892,13 @@ async fn focused_git_has_no_host_defaults_and_accepts_explicit_https_values() ->
     assert!(argv(&runner.commands[1]).ends_with(&["--protocol".to_owned(), "https".to_owned()]));
     assert!(io.stdout.contains("Grace Hopper"));
     assert!(io.stdout.contains(FINGERPRINT));
+    assert_eq!(
+        io.stdout,
+        format!(
+            "Git: Grace Hopper <grace@example.test>; protocol https; fingerprint {FINGERPRINT}\n"
+        )
+    );
+    assert!(io.stderr.lines().any(|line| line == "Git"));
     Ok(())
 }
 

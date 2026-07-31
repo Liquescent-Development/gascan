@@ -154,3 +154,76 @@ selector and running-state regressions are nevertheless tested.
 - `crates/gascan/src/configure/prompt.rs`
 - `crates/gascan/tests/configure_cli.rs`
 - `.superpowers/sdd/2026-07-30-developer-onboarding/task-7-implementer-report.md`
+
+## Controller review repair (2026-07-31)
+
+This append-only section supersedes the process-coverage limitation recorded
+above. The original observation was accurate for the `gascan` crate itself;
+the follow-up review found a reusable spawned-binary fake-daemon harness in the
+sibling `gascan-e2e` package.
+
+### Findings repaired
+
+- The status gate now requires the daemon response sandbox ID to equal the
+  selected sandbox ID before evaluating running state, reading piped token
+  input, or constructing the guest runner.
+- A mismatched response returns a stable actionable error containing only the
+  trusted selected ID and restart guidance; it does not echo the returned ID
+  or token material.
+- The aggregate and focused Git/GitHub/GitLab section headings now use stderr.
+  Exact aggregate and focused-Git assertions keep redirected stdout limited to
+  the final summary.
+- Dispatch regressions inject token-reader and runner-factory closures and
+  prove both remain untouched for mismatched-running and stopped responses.
+- Public spawned-binary coverage now exercises no sandbox, multiple sandboxes,
+  and an explicitly selected stopped sandbox before piped-token input.
+
+### Repair TDD evidence
+
+- The mismatched-running regression first failed to compile because the safe
+  dispatch preparation seam did not exist. After the test-local sentinel was
+  corrected, the only RED diagnostic was the missing seam.
+- The aggregate stdout regression failed with `Git`, `GitHub`, and `GitLab`
+  headings before `Summary`; the focused Git regression failed with `Git`
+  before its result line.
+- After the identity gate and stderr routing were implemented, both dispatch
+  regressions passed, and all 12 onboarding coordinator tests passed.
+
+### Process-harness evidence and limitation
+
+The three public cases reuse `gascan-e2e/tests/fake_backend.rs::Environment`.
+An initial bounded run exposed a harness-only descriptor issue: when the first
+captured CLI invocation auto-started the fake daemon, that detached daemon
+retained the test's `Command::output` pipes on file descriptors 10 and 11.
+The CLI process itself had exited, but the readers could not observe EOF. The
+tests now pre-start each isolated daemon with null stdio before capturing the
+configure command. This preserves production behavior and the harness's
+existing bounded teardown; all three cases complete together in under two
+seconds.
+
+The real daemon always resolves and serializes the status record requested by
+the selector, so the existing process harness cannot synthesize a mismatched
+status ID without new response-override architecture. That incoherent-response
+case remains covered at the dispatch boundary, where the regression directly
+proves zero token reads and zero runner constructions.
+
+### Repair verification
+
+- `rtk cargo fmt --all -- --check` — pass after formatting.
+- `rtk git diff --check` — pass.
+- `rtk cargo test -p gascan --lib --locked --offline configure::` — 61 passed.
+- `rtk cargo test -p gascan --test configure_cli --locked --offline` — 6 passed.
+- `rtk cargo test -p gascan-e2e --test fake_backend --locked --offline
+  configure_with_ -- --test-threads=1` with host process/socket access — 3
+  passed.
+- `rtk cargo clippy -p gascan -p gascan-e2e --all-targets --locked --offline
+  -- -D warnings` — pass with zero warnings.
+- `rtk cargo test -p gascan --locked --offline` with host process/socket access
+  — 285 passed across 7 suites.
+
+### Repair review
+
+The final independent read-only review found no Critical, Important, or Minor
+issues and returned `Ready to merge: Yes`. Its optional non-blocking suggestion
+was a successful dispatch-helper unit case; the existing workflow tests and
+the negative ordering regressions provide sufficient coverage for this repair.

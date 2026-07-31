@@ -42,7 +42,7 @@ async fn configure_all_inner<R: GuestRunner, H: HostDiscovery + ?Sized>(
     discovery: &H,
     io: &mut dyn ConfigureIo,
 ) -> Result<ConfigureOutcome, ConfigureError> {
-    io.write_out("Git\n")?;
+    io.write_err("Git\n")?;
     let current = current_git_setup(runner, selector.clone()).await?;
     let defaults = match discovery.git_defaults() {
         Ok(defaults) => defaults,
@@ -111,7 +111,7 @@ pub(crate) async fn configure_git_interactive<R: GuestRunner, H: HostDiscovery +
     io: &mut dyn ConfigureIo,
 ) -> Result<ConfigureOutcome, ConfigureError> {
     let result = async {
-        io.write_out("Git\n")?;
+        io.write_err("Git\n")?;
         let current = current_git_setup(runner, selector.clone()).await?;
         let defaults = discovery.git_defaults().unwrap_or(GitDefaults {
             name: None,
@@ -336,7 +336,7 @@ async fn configure_remote_section<R: GuestRunner, H: HostDiscovery + ?Sized>(
     git: &GitSetup,
 ) -> Result<(RemoteSummary, bool), ConfigureError> {
     let name = forge_name(forge);
-    io.write_out(&format!("{name}\n"))?;
+    io.write_err(&format!("{name}\n"))?;
     if !io.confirm(&format!("Configure {name}? [Y/n] "), true)? {
         return Ok((RemoteSummary::Skipped(""), false));
     }
