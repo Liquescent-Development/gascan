@@ -1,5 +1,7 @@
 use super::{ConfigureError, Forge, GitDefaults, HostAccount, HostDiscovery};
-use crate::guest::Secret;
+use crate::guest::{Secret, SensitiveBytes};
+#[cfg(test)]
+use crate::guest::{SensitiveDropKind, SensitiveDropObserver};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -20,6 +22,7 @@ const FORGE_TOKEN_ENVIRONMENT: [&str; 7] = [
 #[derive(Default)]
 pub(crate) struct SystemHostDiscovery {
     program_directory: Option<PathBuf>,
+    sensitive_capture: SensitiveCaptureConfig,
 }
 
 impl SystemHostDiscovery {
@@ -31,6 +34,20 @@ impl SystemHostDiscovery {
     pub(super) fn with_program_directory(program_directory: PathBuf) -> Self {
         Self {
             program_directory: Some(program_directory),
+            sensitive_capture: SensitiveCaptureConfig::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_program_directory_and_sensitive_observer(
+        program_directory: PathBuf,
+        observer: SensitiveDropObserver,
+    ) -> Self {
+        Self {
+            program_directory: Some(program_directory),
+            sensitive_capture: SensitiveCaptureConfig {
+                observer: Some(observer),
+            },
         }
     }
 
@@ -47,6 +64,20 @@ impl SystemHostDiscovery {
         category: &'static str,
     ) -> Result<CommandOutput, ConfigureError> {
         run_bounded(&self.program(program), arguments, category)
+    }
+
+    fn run_sensitive(
+        &self,
+        program: &'static str,
+        arguments: &[&OsStr],
+        category: &'static str,
+    ) -> Result<SensitiveCommandOutput, ConfigureError> {
+        run_sensitive_bounded(
+            &self.program(program),
+            arguments,
+            category,
+            self.sensitive_capture.clone(),
+        )
     }
 }
 
@@ -91,7 +122,7 @@ impl HostDiscovery for SystemHostDiscovery {
         }
         let hostname = OsStr::new(&account.hostname);
         let output = match forge {
-            Forge::GitHub => self.run(
+            Forge::GitHub => self.run_sensitive(
                 "gh",
                 &[
                     OsStr::new("auth"),
@@ -101,7 +132,7 @@ impl HostDiscovery for SystemHostDiscovery {
                 ],
                 "GitHub token retrieval",
             )?,
-            Forge::GitLab => self.run(
+            Forge::GitLab => self.run_sensitive(
                 "glab",
                 &[
                     OsStr::new("config"),
@@ -121,13 +152,13 @@ impl HostDiscovery for SystemHostDiscovery {
             }));
         }
         let mut token = output.stdout;
-        trim_one_line_ending(&mut token);
+        token.trim_one_line_ending();
         if token.is_empty() {
             return Err(ConfigureError::InvalidOutput {
                 category: "forge token",
             });
         }
-        Ok(Secret::new(token))
+        Ok(Secret::from_sensitive(token))
     }
 }
 
@@ -253,6 +284,143 @@ fn capture_bounded(mut reader: impl std::io::Read) -> std::io::Result<Capture> {
     Ok(Capture { bytes, exceeded })
 }
 
+#[derive(Clone, Default)]
+struct SensitiveCaptureConfig {
+    #[cfg(test)]
+    observer: Option<SensitiveDropObserver>,
+}
+
+#[derive(Clone, Copy)]
+enum SensitiveStream {
+    Stdout,
+    Stderr,
+}
+
+impl SensitiveCaptureConfig {
+    fn buffer(&self, capacity: usize, stream: SensitiveStream, scratch: bool) -> SensitiveBytes {
+        let mut bytes = SensitiveBytes::zeroed(capacity);
+        #[cfg(test)]
+        if let Some(observer) = &self.observer {
+            let kind = match (stream, scratch) {
+                (SensitiveStream::Stdout, true) => SensitiveDropKind::StdoutScratch,
+                (SensitiveStream::Stderr, true) => SensitiveDropKind::StderrScratch,
+                (SensitiveStream::Stdout, false) => SensitiveDropKind::StdoutAccumulation,
+                (SensitiveStream::Stderr, false) => SensitiveDropKind::StderrAccumulation,
+            };
+            bytes.observe_drop(observer.clone(), kind);
+        }
+        #[cfg(not(test))]
+        let _ = (stream, scratch);
+        bytes
+    }
+}
+
+struct SensitiveCommandOutput {
+    status: ExitStatus,
+    stdout: SensitiveBytes,
+}
+
+impl std::fmt::Debug for SensitiveCommandOutput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SensitiveCommandOutput")
+            .field("status", &self.status)
+            .field("stdout", &"[REDACTED]")
+            .finish()
+    }
+}
+
+struct SensitiveCapture {
+    bytes: SensitiveBytes,
+    exceeded: bool,
+}
+
+fn run_sensitive_bounded(
+    program: &Path,
+    arguments: &[&OsStr],
+    category: &'static str,
+    capture_config: SensitiveCaptureConfig,
+) -> Result<SensitiveCommandOutput, ConfigureError> {
+    let mut command = std::process::Command::new(program);
+    command
+        .args(arguments)
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for name in FORGE_TOKEN_ENVIRONMENT {
+        command.env_remove(name);
+    }
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ConfigureError::HostCommand {
+                category,
+                message: "command is not available".to_owned(),
+            }
+        } else {
+            ConfigureError::Io(error)
+        }
+    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ConfigureError::HostCommand {
+            category,
+            message: "stdout capture was unavailable".to_owned(),
+        })?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| ConfigureError::HostCommand {
+            category,
+            message: "stderr capture was unavailable".to_owned(),
+        })?;
+    let stdout_config = capture_config.clone();
+    let stdout_reader = std::thread::spawn(move || {
+        capture_sensitive(stdout, stdout_config, SensitiveStream::Stdout)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        capture_sensitive(stderr, capture_config, SensitiveStream::Stderr)
+    });
+
+    let status = child.wait();
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| std::io::Error::other("sensitive stdout reader stopped"));
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| std::io::Error::other("sensitive stderr reader stopped"));
+    let status = status?;
+    let stdout = stdout??;
+    let stderr = stderr??;
+    if stdout.exceeded || stderr.exceeded {
+        return Err(ConfigureError::InvalidOutput { category });
+    }
+    Ok(SensitiveCommandOutput {
+        status,
+        stdout: stdout.bytes,
+    })
+}
+
+fn capture_sensitive(
+    mut reader: impl std::io::Read,
+    config: SensitiveCaptureConfig,
+    stream: SensitiveStream,
+) -> std::io::Result<SensitiveCapture> {
+    let mut bytes = config.buffer(MAX_HOST_OUTPUT_BYTES, stream, false);
+    let mut scratch = config.buffer(16 * 1024, stream, true);
+    let mut exceeded = false;
+    loop {
+        let count = reader.read(scratch.storage_mut())?;
+        if count == 0 {
+            break;
+        }
+        exceeded |= bytes.append_bounded(&scratch.storage()[..count]);
+        scratch.clear_storage();
+    }
+    Ok(SensitiveCapture { bytes, exceeded })
+}
+
 #[derive(Deserialize)]
 struct GitHubStatus {
     hosts: BTreeMap<String, Vec<GitHubAccount>>,
@@ -366,8 +534,13 @@ fn parse_gitlab_accounts(
             category: "GitLab account discovery",
         });
     }
-    if unauthenticated && accounts.is_empty() {
-        return Ok(Vec::new());
+    if unauthenticated {
+        if accounts.is_empty() && current_host.is_none() {
+            return Ok(Vec::new());
+        }
+        return Err(ConfigureError::InvalidOutput {
+            category: "GitLab account discovery",
+        });
     }
     if !command_succeeded {
         return Err(host_failure("GitLab account discovery"));

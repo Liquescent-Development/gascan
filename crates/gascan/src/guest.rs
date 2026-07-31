@@ -13,15 +13,122 @@ const PIPED_INPUT_FRAME_BYTES: usize = 16 * 1024;
 const TERMINAL_INPUT_FRAME_BYTES: usize = 4096;
 const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 
-pub(crate) struct Secret(Vec<u8>);
+struct ZeroizingVec(Vec<u8>);
 
-impl Secret {
-    pub(crate) fn new(bytes: Vec<u8>) -> Self {
-        Self(bytes)
+impl Drop for ZeroizingVec {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
+
+pub(crate) struct SensitiveBytes {
+    storage: Box<[u8]>,
+    len: usize,
+    #[cfg(test)]
+    drop_observation: Option<(SensitiveDropObserver, SensitiveDropKind)>,
+}
+
+impl SensitiveBytes {
+    pub(crate) fn zeroed(capacity: usize) -> Self {
+        Self {
+            storage: vec![0; capacity].into_boxed_slice(),
+            len: 0,
+            #[cfg(test)]
+            drop_observation: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_drop(
+        &mut self,
+        observer: SensitiveDropObserver,
+        kind: SensitiveDropKind,
+    ) {
+        self.drop_observation = Some((observer, kind));
+    }
+
+    pub(crate) fn storage_mut(&mut self) -> &mut [u8] {
+        &mut self.storage
+    }
+
+    pub(crate) fn storage(&self) -> &[u8] {
+        &self.storage
+    }
+
+    pub(crate) fn append_bounded(&mut self, bytes: &[u8]) -> bool {
+        let retained = bytes.len().min(self.storage.len().saturating_sub(self.len));
+        self.storage[self.len..self.len + retained].copy_from_slice(&bytes[..retained]);
+        self.len += retained;
+        retained < bytes.len()
+    }
+
+    pub(crate) fn clear_storage(&mut self) {
+        self.storage.fill(0);
+    }
+
+    pub(crate) fn trim_one_line_ending(&mut self) {
+        if self.len > 0 && self.storage[self.len - 1] == b'\n' {
+            self.len -= 1;
+            self.storage[self.len] = 0;
+            if self.len > 0 && self.storage[self.len - 1] == b'\r' {
+                self.len -= 1;
+                self.storage[self.len] = 0;
+            }
+        } else if self.len > 0 && self.storage[self.len - 1] == b'\r' {
+            self.len -= 1;
+            self.storage[self.len] = 0;
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     pub(crate) fn expose(&self) -> &[u8] {
-        &self.0
+        &self.storage[..self.len]
+    }
+}
+
+impl fmt::Debug for SensitiveBytes {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SensitiveBytes([REDACTED])")
+    }
+}
+
+impl Drop for SensitiveBytes {
+    fn drop(&mut self) {
+        self.storage.fill(0);
+        #[cfg(test)]
+        if let Some((observer, kind)) = &self.drop_observation {
+            observer.record(SensitiveDropEvent {
+                kind: *kind,
+                zeroized: self.storage.iter().all(|byte| *byte == 0),
+            });
+        }
+    }
+}
+
+enum SecretStorage {
+    Ordinary(ZeroizingVec),
+    Sensitive(SensitiveBytes),
+}
+
+pub(crate) struct Secret(SecretStorage);
+
+impl Secret {
+    pub(crate) fn new(bytes: Vec<u8>) -> Self {
+        Self(SecretStorage::Ordinary(ZeroizingVec(bytes)))
+    }
+
+    pub(crate) fn from_sensitive(bytes: SensitiveBytes) -> Self {
+        Self(SecretStorage::Sensitive(bytes))
+    }
+
+    pub(crate) fn expose(&self) -> &[u8] {
+        match &self.0 {
+            SecretStorage::Ordinary(bytes) => &bytes.0,
+            SecretStorage::Sensitive(bytes) => bytes.expose(),
+        }
     }
 }
 
@@ -31,9 +138,40 @@ impl fmt::Debug for Secret {
     }
 }
 
-impl Drop for Secret {
-    fn drop(&mut self) {
-        self.0.fill(0);
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SensitiveDropKind {
+    StdoutScratch,
+    StderrScratch,
+    StdoutAccumulation,
+    StderrAccumulation,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SensitiveDropEvent {
+    pub(crate) kind: SensitiveDropKind,
+    pub(crate) zeroized: bool,
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct SensitiveDropObserver(std::sync::Arc<std::sync::Mutex<Vec<SensitiveDropEvent>>>);
+
+#[cfg(test)]
+impl SensitiveDropObserver {
+    fn record(&self, event: SensitiveDropEvent) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(event);
+    }
+
+    pub(crate) fn events(&self) -> Vec<SensitiveDropEvent> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 

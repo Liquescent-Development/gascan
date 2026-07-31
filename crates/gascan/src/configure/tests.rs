@@ -2,6 +2,7 @@ use super::{
     ConfigureError, Forge, HostAccount, HostDiscovery, Prompter, SystemHostDiscovery,
     TerminalPrompter,
 };
+use crate::guest::{SensitiveDropKind, SensitiveDropObserver};
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
@@ -37,6 +38,16 @@ impl FakePrograms {
 
     fn discovery(&self) -> SystemHostDiscovery {
         SystemHostDiscovery::with_program_directory(self.bin.clone())
+    }
+
+    fn discovery_with_sensitive_observer(
+        &self,
+        observer: SensitiveDropObserver,
+    ) -> SystemHostDiscovery {
+        SystemHostDiscovery::with_program_directory_and_sensitive_observer(
+            self.bin.clone(),
+            observer,
+        )
     }
 
     fn install(&self, name: &str, body: &str) -> TestResult {
@@ -86,6 +97,28 @@ fn assert_scrubbed(record: &[String]) {
 fn assert_error_redacted(error: &ConfigureError) {
     assert!(!error.to_string().contains(SENTINEL));
     assert!(!format!("{error:?}").contains(SENTINEL));
+}
+
+fn assert_sensitive_drop_counts(
+    observer: &SensitiveDropObserver,
+    stdout_accumulation: usize,
+    total: usize,
+) {
+    let events = observer.events();
+    assert_eq!(events.len(), total);
+    assert!(events.iter().all(|event| event.zeroized));
+    for (kind, expected) in [
+        (SensitiveDropKind::StdoutScratch, 1),
+        (SensitiveDropKind::StderrScratch, 1),
+        (SensitiveDropKind::StdoutAccumulation, stdout_accumulation),
+        (SensitiveDropKind::StderrAccumulation, 1),
+    ] {
+        assert_eq!(
+            events.iter().filter(|event| event.kind == kind).count(),
+            expected,
+            "unexpected drop count for {kind:?}",
+        );
+    }
 }
 
 #[test]
@@ -262,6 +295,23 @@ fn gitlab_unauthenticated_is_empty_and_ambiguous_status_fails_closed() -> TestRe
             1,
             true,
         ),
+        (
+            concat!(
+                "You are not logged into any GitLab hosts. Run glab auth login to authenticate.\n",
+                "gitlab.com\n",
+                "  ✓ Logged in to gitlab.com as ada (/tmp/config.yml)\n",
+            ),
+            0,
+            false,
+        ),
+        (
+            concat!(
+                "You are not logged into any GitLab hosts. Run glab auth login to authenticate.\n",
+                "gitlab.com\n",
+            ),
+            0,
+            false,
+        ),
         ("", 0, false),
         ("gitlab.com\n  Logged in somehow as ada\n", 0, false),
         (
@@ -362,6 +412,97 @@ fn token_retrieval_uses_exact_host_arguments_and_keeps_secret_off_observable_sur
         .err()
         .ok_or("failed token command succeeded")?;
     assert_error_redacted(&error);
+    Ok(())
+}
+
+#[test]
+fn token_capture_is_sensitive_from_read_through_secret_drop() -> TestResult {
+    let fake = FakePrograms::new()?;
+    fake.install(
+        "gh",
+        &format!(
+            concat!(
+                "if [ \"$*\" = \"auth status --json hosts\" ]; then ",
+                "/usr/bin/printf '{{\"hosts\":{{}}}}'; exit 0; fi\n",
+                "if [ \"$*\" = \"auth token --hostname github.com\" ]; then ",
+                "/usr/bin/printf '{}\\n'; exit 0; fi\n",
+                "exit 97",
+            ),
+            SENTINEL,
+        ),
+    )?;
+    let observer = SensitiveDropObserver::default();
+    let discovery = fake.discovery_with_sensitive_observer(observer.clone());
+
+    assert!(discovery.accounts(Forge::GitHub)?.is_empty());
+    assert!(
+        observer.events().is_empty(),
+        "ordinary discovery must stay on the generic capture path",
+    );
+
+    let account = HostAccount {
+        hostname: "github.com".to_owned(),
+        login: Some("ada".to_owned()),
+    };
+    let secret = discovery.token(Forge::GitHub, &account)?;
+    assert_eq!(secret.expose(), SENTINEL.as_bytes());
+    assert_sensitive_drop_counts(&observer, 0, 3);
+    drop(secret);
+    assert_sensitive_drop_counts(&observer, 1, 4);
+    Ok(())
+}
+
+#[test]
+fn sensitive_token_buffers_zeroize_on_every_rejection_and_non_utf8_success() -> TestResult {
+    let account = HostAccount {
+        hostname: "github.com".to_owned(),
+        login: Some("ada".to_owned()),
+    };
+
+    for body in [
+        format!("/usr/bin/printf '{SENTINEL}' >&2; exit 4"),
+        "/usr/bin/printf '\\n'; exit 0".to_owned(),
+    ] {
+        let fake = FakePrograms::new()?;
+        fake.install("gh", &body)?;
+        let observer = SensitiveDropObserver::default();
+        let error = fake
+            .discovery_with_sensitive_observer(observer.clone())
+            .token(Forge::GitHub, &account)
+            .err()
+            .ok_or("invalid token output succeeded")?;
+        assert_error_redacted(&error);
+        assert_sensitive_drop_counts(&observer, 1, 4);
+    }
+
+    for redirect in ["", " >&2"] {
+        let bounded = FakePrograms::new()?;
+        fs::write(bounded.bin.join("large"), vec![b'x'; 1024 * 1024 + 1])?;
+        bounded.install(
+            "gh",
+            &format!("/bin/cat \"$(dirname \"$0\")/large\"{redirect}; exit 0"),
+        )?;
+        let bounded_observer = SensitiveDropObserver::default();
+        let error = bounded
+            .discovery_with_sensitive_observer(bounded_observer.clone())
+            .token(Forge::GitHub, &account)
+            .err()
+            .ok_or("oversized token output succeeded")?;
+        assert_error_redacted(&error);
+        assert_sensitive_drop_counts(&bounded_observer, 1, 4);
+    }
+
+    let non_utf8 = FakePrograms::new()?;
+    fs::write(non_utf8.bin.join("token"), [0xff, b'\n'])?;
+    non_utf8.install("gh", "/bin/cat \"$(dirname \"$0\")/token\"; exit 0")?;
+    let non_utf8_observer = SensitiveDropObserver::default();
+    let secret = non_utf8
+        .discovery_with_sensitive_observer(non_utf8_observer.clone())
+        .token(Forge::GitHub, &account)?;
+    assert_eq!(secret.expose(), &[0xff]);
+    assert_sensitive_drop_counts(&non_utf8_observer, 0, 3);
+    drop(secret);
+    assert_sensitive_drop_counts(&non_utf8_observer, 1, 4);
     Ok(())
 }
 
