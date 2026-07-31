@@ -170,6 +170,7 @@ RUN --network=none test -x /opt/gascan/gascamp/bin/camp \
        /home/workspace/.claude \
        /home/workspace/.codex \
        /home/workspace/.pi \
+       /home/workspace/.ssh \
        /home/workspace/.config/herdr \
     && /usr/local/bin/run-workstation-step sudoers-mode \
        chmod 0440 /etc/sudoers.d/workspace \
@@ -225,6 +226,7 @@ ENV PI_CODING_AGENT_SESSION_DIR=/home/workspace/.cache/pi
 ENV HERDR_CONFIG_PATH=/home/workspace/.config/gascan/herdr/config.toml
 ENV GH_CONFIG_DIR=/home/workspace/.config/gascan/gh
 ENV GLAB_CONFIG_DIR=/home/workspace/.config/gascan/glab
+ENV GIT_CONFIG_GLOBAL=/home/workspace/.config/gascan/git/config
 ENV PATH=/home/workspace/.local/bin:/home/workspace/.local/share/cargo/bin:/home/workspace/.local/share/go/bin:/home/workspace/.local/share/gem/bin:/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/opt/gascan/workstation/bin:/usr/sbin:/usr/bin:/sbin:/bin
 USER workspace:workspace
 WORKDIR /workspace

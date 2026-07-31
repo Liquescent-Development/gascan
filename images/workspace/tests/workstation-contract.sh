@@ -146,6 +146,24 @@ test "$(stat -c %U:%G:%a /home/workspace/.cache)" = workspace:workspace:700 ||
     die 'workspace private cache root metadata differs from provisioning policy'
 test "$(stat -c %U:%G:%a /home/workspace/.config)" = root:workspace:1770 ||
     die 'workspace managed configuration boundary metadata changed'
+test "$GIT_CONFIG_GLOBAL" = /home/workspace/.config/gascan/git/config ||
+    die 'global Git config differs from persistent workspace policy'
+for directory in \
+    /home/workspace/.config/gascan/git \
+    /home/workspace/.config/gascan/git/ssh
+do
+    test "$(stat -c %U:%G:%a "$directory")" = workspace:workspace:700 ||
+        die "managed Git directory metadata changed: $directory"
+done
+test -L /home/workspace/.ssh || die 'workspace SSH path is not a link'
+test "$(readlink /home/workspace/.ssh)" = .config/gascan/git/ssh ||
+    die 'workspace SSH link target changed'
+ssh_directory=$(realpath -e /home/workspace/.ssh) ||
+    die 'workspace SSH link does not resolve'
+case "$ssh_directory" in
+    /home/workspace/.config/*) ;;
+    *) die "workspace SSH link escaped config volume: $ssh_directory" ;;
+esac
 test "$SHELL" = /bin/bash || die 'interactive shell environment differs from image policy'
 test -r /usr/share/bash-completion/bash_completion ||
     die 'Bash completion framework is unavailable'
@@ -222,6 +240,7 @@ for mapping in \
     "$HERDR_CONFIG_PATH:/home/workspace/.config/gascan" \
     "$GH_CONFIG_DIR:/home/workspace/.config/gascan" \
     "$GLAB_CONFIG_DIR:/home/workspace/.config/gascan" \
+    "$GIT_CONFIG_GLOBAL:/home/workspace/.config/gascan" \
     "$PI_CODING_AGENT_SESSION_DIR:/home/workspace/.cache"
 do
     path=${mapping%%:*}
@@ -268,7 +287,6 @@ test "$(awk '$1 == "CapEff:" {print $2}' /proc/self/status)" = 0000000000000000 
 for forbidden in \
     /run/host-services/ssh-auth.sock \
     /var/run/docker.sock \
-    /home/workspace/.ssh \
     /root/.ssh \
     /Users \
     /Library/Keychains \

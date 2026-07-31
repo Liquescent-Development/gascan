@@ -1852,7 +1852,7 @@ fn workstation_contract_accepts_only_the_locked_starship_first_line_behaviorally
 }
 
 #[test]
-fn workstation_home_configuration_is_idempotent_and_refuses_unmanaged_paths() {
+fn configure_workstation_home_is_idempotent_and_refuses_unmanaged_paths() {
     let script = root().join("images/workspace/bin/configure-workstation-home");
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
@@ -1863,6 +1863,34 @@ fn workstation_home_configuration_is_idempotent_and_refuses_unmanaged_paths() {
     assert!(
         !home.join(".config/gascan/.gascan-managed").exists(),
         "broad Gas Can config boundary must not be claimed as an application directory"
+    );
+    for directory in [
+        home.join(".config/gascan/git"),
+        home.join(".config/gascan/git/ssh"),
+    ] {
+        assert!(
+            directory.is_dir(),
+            "missing managed directory: {}",
+            directory.display()
+        );
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "managed directory has the wrong mode: {}",
+            directory.display()
+        );
+        assert_eq!(
+            fs::read_to_string(directory.join(".gascan-managed")).unwrap(),
+            "gascan-workstation-home-v1\n",
+            "managed directory has no valid marker: {}",
+            directory.display()
+        );
+    }
+    let ssh = home.join(".ssh");
+    assert!(ssh.symlink_metadata().unwrap().file_type().is_symlink());
+    assert_eq!(
+        fs::read_link(ssh).unwrap(),
+        Path::new(".config/gascan/git/ssh")
     );
     for agent in ["claude", "codex", "pi"] {
         let link = home.join(format!(".{agent}"));
@@ -1925,6 +1953,10 @@ fn workstation_home_configuration_is_idempotent_and_refuses_unmanaged_paths() {
         "cache-mise",
         "cache-file",
         "cache-link",
+        "ssh-file",
+        "ssh-wrong-link",
+        "git-unmarked",
+        "git-ssh-link",
     ] {
         let adversarial_home = temp.path().join(case);
         fs::create_dir(&adversarial_home).unwrap();
@@ -1949,6 +1981,23 @@ fn workstation_home_configuration_is_idempotent_and_refuses_unmanaged_paths() {
                 fs::create_dir_all(adversarial_home.join(".cache")).unwrap();
                 symlink(temp.path(), adversarial_home.join(".cache/gh")).unwrap();
             }
+            "ssh-file" => fs::write(adversarial_home.join(".ssh"), "unmanaged").unwrap(),
+            "ssh-wrong-link" => {
+                symlink(
+                    ".config/gascan/agents/claude",
+                    adversarial_home.join(".ssh"),
+                )
+                .unwrap();
+            }
+            "git-unmarked" => {
+                fs::create_dir_all(adversarial_home.join(".config/gascan/git")).unwrap();
+            }
+            "git-ssh-link" => {
+                let git = adversarial_home.join(".config/gascan/git");
+                fs::create_dir_all(&git).unwrap();
+                fs::write(git.join(".gascan-managed"), "gascan-workstation-home-v1\n").unwrap();
+                symlink(temp.path(), git.join("ssh")).unwrap();
+            }
             _ => unreachable!(),
         }
         let rejected = Command::new(&script)
@@ -1963,6 +2012,16 @@ fn workstation_home_configuration_is_idempotent_and_refuses_unmanaged_paths() {
                     .exists(),
             "preflight rejection for {case} left partial Claude state"
         );
+        let git_ssh = adversarial_home.join(".config/gascan/git/ssh");
+        if case == "git-ssh-link" {
+            assert!(git_ssh.symlink_metadata().unwrap().file_type().is_symlink());
+            assert_eq!(fs::read_link(git_ssh).unwrap(), temp.path());
+        } else {
+            assert!(
+                !git_ssh.exists(),
+                "preflight rejection for {case} created the Git SSH directory"
+            );
+        }
     }
 }
 
