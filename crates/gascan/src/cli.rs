@@ -1,4 +1,5 @@
 use crate::client::{Client, ClientError};
+use crate::guest::{allowed_environment, attach_to_stdio, first_session_token};
 use crate::presentation::{
     DoctorCheck, OperationKind, OperationProgress, OutputCapabilities, daemon_force_warning,
     daemon_lifecycle_json, daemon_status_json, render_daemon_lifecycle, render_daemon_status,
@@ -8,13 +9,11 @@ use crate::presentation::{
 use crate::ssh_config::{
     IncludeChange, OfferAnswer, SshConfig, answer_first_use_offer, first_use_offer,
 };
-use crate::terminal::RawTerminal;
 use clap::{CommandFactory as _, Parser, Subcommand, error::ErrorKind};
 use gascan_proto::ssh_status::{SshState, classify as classify_ssh};
 use gascan_proto::v1;
 use std::ffi::{OsStr, OsString};
 use std::io::{IsTerminal, Write};
-use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1164,188 +1163,8 @@ async fn run(
             .await?
             .into_inner()
     };
-    let event = events
-        .message()
-        .await?
-        .ok_or_else(|| CliError::Runtime("daemon returned no session".to_owned()))?;
-    if event.session_token.is_empty() {
-        return Err(CliError::Runtime(
-            "daemon returned an empty session token".to_owned(),
-        ));
-    }
-    let _terminal = if shell {
-        Some(RawTerminal::acquire()?)
-    } else {
-        None
-    };
-    let token = event.session_token;
-    let (input_sender, input_receiver) = tokio::sync::mpsc::channel(16);
-    if shell && stdin_is_tty {
-        let producer = input_sender.clone();
-        let producer_token = token.clone();
-        let restore = _terminal.as_ref().map(RawTerminal::restore_handle);
-        tokio::spawn(async move {
-            forward_terminal_input(producer, producer_token, restore).await;
-        });
-    } else if !stdin_is_tty {
-        let producer = input_sender.clone();
-        let producer_token = token.clone();
-        tokio::spawn(async move {
-            forward_piped_input(producer, producer_token).await;
-        });
-    } else {
-        input_sender
-            .send(v1::ClientFrame {
-                frame: Some(v1::client_frame::Frame::Close(v1::Close {})),
-                session_token: token,
-            })
-            .await
-            .map_err(|_| CliError::Runtime("attach input closed".to_owned()))?;
-    }
-    drop(input_sender);
-    let mut attached = client
-        .api
-        .attach(tokio_stream::wrappers::ReceiverStream::new(input_receiver))
-        .await?
-        .into_inner();
-    while let Some(frame) = attached.message().await? {
-        match frame.frame {
-            Some(v1::server_frame::Frame::Stdout(bytes)) => {
-                std::io::stdout().write_all(&bytes)?;
-                std::io::stdout().flush()?;
-            }
-            Some(v1::server_frame::Frame::Stderr(bytes)) => {
-                std::io::stderr().write_all(&bytes)?;
-                std::io::stderr().flush()?;
-            }
-            Some(v1::server_frame::Frame::Exit(exit)) => return Ok(exit.code),
-            Some(v1::server_frame::Frame::Error(error)) => {
-                return Err(attach_frame_error(error));
-            }
-            None => {}
-        }
-    }
-    Err(CliError::Runtime(
-        "attach ended without exit status".to_owned(),
-    ))
-}
-
-fn attach_frame_error(error: v1::Error) -> CliError {
-    CliError::Runtime(format!("{}: {}", error.code, error.message))
-}
-
-async fn forward_piped_input(sender: tokio::sync::mpsc::Sender<v1::ClientFrame>, token: Vec<u8>) {
-    use tokio::io::AsyncReadExt as _;
-    let mut stdin = tokio::io::stdin();
-    let mut bytes = vec![0_u8; 16 * 1024];
-    loop {
-        let frame = match stdin.read(&mut bytes).await {
-            Ok(0) | Err(_) => v1::client_frame::Frame::Close(v1::Close {}),
-            Ok(count) => v1::client_frame::Frame::Stdin(bytes[..count].to_vec()),
-        };
-        let terminal = matches!(frame, v1::client_frame::Frame::Close(_));
-        if sender
-            .send(v1::ClientFrame {
-                frame: Some(frame),
-                session_token: token.clone(),
-            })
-            .await
-            .is_err()
-        {
-            return;
-        }
-        if terminal {
-            return;
-        }
-    }
-}
-
-async fn forward_terminal_input(
-    sender: tokio::sync::mpsc::Sender<v1::ClientFrame>,
-    token: Vec<u8>,
-    restore: Option<crate::terminal::TerminalRestore>,
-) {
-    use tokio::io::AsyncReadExt;
-    let size = rustix::termios::tcgetwinsize(std::io::stdin().as_fd()).ok();
-    if let Some(size) = size {
-        if sender
-            .send(v1::ClientFrame {
-                frame: Some(v1::client_frame::Frame::Resize(v1::Resize {
-                    columns: u32::from(size.ws_col),
-                    rows: u32::from(size.ws_row),
-                })),
-                session_token: token.clone(),
-            })
-            .await
-            .is_err()
-        {
-            return;
-        }
-    }
-    let mut interrupt =
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
-            Ok(signal) => signal,
-            Err(_) => return,
-        };
-    let mut terminate =
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(signal) => signal,
-            Err(_) => return,
-        };
-    let mut resize =
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()) {
-            Ok(signal) => signal,
-            Err(_) => return,
-        };
-    let mut stdin = tokio::io::stdin();
-    let mut bytes = vec![0_u8; 4096];
-    loop {
-        let frame = tokio::select! {
-            read = stdin.read(&mut bytes) => match read { Ok(0) | Err(_) => v1::client_frame::Frame::Close(v1::Close {}), Ok(count) => v1::client_frame::Frame::Stdin(bytes[..count].to_vec()) },
-            _ = interrupt.recv() => v1::client_frame::Frame::Signal(v1::Signal { number: 2 }),
-            _ = terminate.recv() => v1::client_frame::Frame::Signal(v1::Signal { number: 15 }),
-            _ = resize.recv() => {
-                let size = rustix::termios::tcgetwinsize(std::io::stdin().as_fd()).ok();
-                let Some(size) = size else { continue; };
-                v1::client_frame::Frame::Resize(v1::Resize { columns: u32::from(size.ws_col), rows: u32::from(size.ws_row) })
-            }
-        };
-        let terminal = matches!(
-            frame,
-            v1::client_frame::Frame::Close(_) | v1::client_frame::Frame::Signal(_)
-        );
-        if matches!(frame, v1::client_frame::Frame::Signal(_)) {
-            if let Some(restore) = &restore {
-                restore.restore();
-            }
-        }
-        if sender
-            .send(v1::ClientFrame {
-                frame: Some(frame),
-                session_token: token.clone(),
-            })
-            .await
-            .is_err()
-        {
-            return;
-        }
-        if terminal {
-            let _ = sender
-                .send(v1::ClientFrame {
-                    frame: Some(v1::client_frame::Frame::Close(v1::Close {})),
-                    session_token: token.clone(),
-                })
-                .await;
-            return;
-        }
-    }
-}
-
-fn allowed_environment() -> Vec<v1::EnvironmentVariable> {
-    gascan_core::policy::filtered_host_environment(std::env::vars())
-        .into_iter()
-        .map(|(name, value)| v1::EnvironmentVariable { name, value })
-        .collect()
+    let token = first_session_token(&mut events).await?;
+    attach_to_stdio(client, token, shell, stdin_is_tty).await
 }
 
 async fn logs(
@@ -1895,7 +1714,7 @@ mod tests {
 
     #[test]
     fn attach_frame_error_retains_code_and_message_on_runtime_path() {
-        let error = attach_frame_error(v1::Error {
+        let error = crate::guest::attach_frame_error(v1::Error {
             code: "process_failed".to_owned(),
             message: "command exited before setup completed".to_owned(),
             ..Default::default()
