@@ -1,7 +1,9 @@
+mod forge;
 mod git;
 mod host;
 mod prompt;
 
+pub(crate) use forge::{ForgeRequest, ForgeSetup, RegistrationState, configure_forge};
 pub(crate) use git::{GitProtocol, GitRequest, GitSetup, configure_git, configure_ssh_host};
 pub(crate) use host::SystemHostDiscovery;
 pub(crate) use prompt::TerminalPrompter;
@@ -57,6 +59,13 @@ pub(crate) enum ConfigureError {
     InvalidOutput {
         category: &'static str,
     },
+    Forge {
+        setup: Box<ForgeSetup>,
+        category: &'static str,
+        hostname: String,
+        message: &'static str,
+        retry: &'static str,
+    },
     UnsafeState {
         path: String,
         remedy: String,
@@ -77,6 +86,16 @@ impl std::fmt::Display for ConfigureError {
             Self::InvalidOutput { category } => {
                 write!(formatter, "{category} returned invalid output")
             }
+            Self::Forge {
+                category,
+                hostname,
+                message,
+                retry,
+                ..
+            } => write!(
+                formatter,
+                "{category} for {hostname} failed: {message}; retry with `{retry}`"
+            ),
             Self::UnsafeState { path, remedy } => {
                 write!(formatter, "unsafe state at {path}: {remedy}")
             }
@@ -92,5 +111,7 @@ impl From<std::io::Error> for ConfigureError {
     }
 }
 
+#[cfg(test)]
+mod forge_tests;
 #[cfg(test)]
 mod tests;
