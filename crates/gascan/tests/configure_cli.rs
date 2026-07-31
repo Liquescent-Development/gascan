@@ -212,3 +212,26 @@ fn token_stdin_with_default_ssh_refuses_before_daemon_or_secret_forwarding() -> 
     );
     Ok(())
 }
+
+#[test]
+fn first_up_failed_operation_never_prints_or_runs_the_developer_offer() -> TestResult {
+    let fixture = ProcessFixture::new()?;
+    let root = fixture._temporary.path().join("failed-up-project");
+    fs::create_dir(&root)?;
+    fs::write(root.join("gascan.toml"), "version = 1\n")?;
+    let root = root.to_str().ok_or("project root was not UTF-8")?;
+
+    for arguments in [vec!["up", root], vec!["up", root, "--json"]] {
+        let output = fixture
+            .command()
+            .args(arguments)
+            .stdin(Stdio::null())
+            .output()?;
+
+        assert!(!output.status.success(), "{output:?}");
+        let rendered = String::from_utf8([output.stdout, output.stderr].concat())?;
+        assert!(!rendered.contains("Set up Git, GitHub, and GitLab"));
+        assert!(!rendered.contains("developer setup was not completed"));
+    }
+    Ok(())
+}

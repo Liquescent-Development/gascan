@@ -6,12 +6,13 @@ mod prompt;
 
 pub(crate) use forge::{ForgeRequest, ForgeSetup, RegistrationState, configure_forge};
 pub(crate) use git::{
-    GitProtocol, GitRequest, GitSetup, complete_receipt, configure_git, configure_ssh_host,
-    current_git_setup,
+    GitProtocol, GitRequest, GitSetup, ReceiptState, complete_receipt, configure_git,
+    configure_ssh_host, current_git_setup, decline_receipt, receipt_state,
 };
 pub(crate) use host::SystemHostDiscovery;
 pub(crate) use onboarding::{
-    ConfigureOutcome, configure_all, configure_forge_interactive, configure_git_interactive,
+    ConfigureOutcome, OfferResult, configure_all, configure_forge_interactive,
+    configure_git_interactive, offer_after_up,
 };
 pub(crate) use prompt::TerminalPrompter;
 

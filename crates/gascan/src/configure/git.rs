@@ -52,9 +52,9 @@ struct DeveloperStatus {
     _receipt: ReceiptState,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
-enum ReceiptState {
+pub(crate) enum ReceiptState {
     Pending,
     Complete,
     Declined,
@@ -170,6 +170,34 @@ pub(crate) async fn complete_receipt<R: GuestRunner>(
     require_silent_success(output, "developer-home receipt")
 }
 
+pub(crate) async fn receipt_state<R: GuestRunner>(
+    runner: &mut R,
+    selector: v1::SandboxSelector,
+) -> Result<ReceiptState, ConfigureError> {
+    let output = execute(
+        runner,
+        selector,
+        vec![HELPER.to_vec(), b"receipt".to_vec(), b"status".to_vec()],
+        "developer-home receipt",
+    )
+    .await?;
+    parse_receipt_state(output)
+}
+
+pub(crate) async fn decline_receipt<R: GuestRunner>(
+    runner: &mut R,
+    selector: v1::SandboxSelector,
+) -> Result<(), ConfigureError> {
+    let output = execute(
+        runner,
+        selector,
+        vec![HELPER.to_vec(), b"receipt".to_vec(), b"decline".to_vec()],
+        "developer-home receipt",
+    )
+    .await?;
+    require_silent_success(output, "developer-home receipt")
+}
+
 pub(crate) async fn configure_ssh_host<R: GuestRunner>(
     runner: &mut R,
     selector: v1::SandboxSelector,
@@ -242,6 +270,28 @@ fn parse_status(output: GuestOutput) -> Result<DeveloperStatus, ConfigureError> 
         return Err(invalid_status());
     }
     serde_json::from_slice(&output.stdout).map_err(|_| invalid_status())
+}
+
+fn parse_receipt_state(output: GuestOutput) -> Result<ReceiptState, ConfigureError> {
+    if output.code != 0 {
+        return Err(ConfigureError::GuestCommand {
+            category: "developer-home receipt",
+            message: "helper did not complete successfully".to_owned(),
+        });
+    }
+    if !output.stderr.is_empty() || output.stdout.len() > MAX_STATUS_BYTES {
+        return Err(ConfigureError::InvalidOutput {
+            category: "developer-home receipt",
+        });
+    }
+    match output.stdout.as_slice() {
+        b"pending\n" => Ok(ReceiptState::Pending),
+        b"complete\n" => Ok(ReceiptState::Complete),
+        b"declined\n" => Ok(ReceiptState::Declined),
+        _ => Err(ConfigureError::InvalidOutput {
+            category: "developer-home receipt",
+        }),
+    }
 }
 
 fn invalid_status() -> ConfigureError {

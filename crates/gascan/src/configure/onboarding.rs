@@ -1,9 +1,11 @@
 use super::{
     ConfigureError, ConfigureIo, Forge, ForgeRequest, ForgeSetup, GitDefaults, GitProtocol,
-    GitRequest, GitSetup, HostDiscovery, RegistrationState, complete_receipt, configure_forge,
-    configure_git, current_git_setup,
+    GitRequest, GitSetup, HostDiscovery, ReceiptState, RegistrationState, SystemHostDiscovery,
+    complete_receipt, configure_forge, configure_git, current_git_setup, decline_receipt,
+    receipt_state,
 };
-use crate::guest::{GuestCommand, GuestRunner, Secret};
+use crate::client::Client;
+use crate::guest::{ClientGuestRunner, GuestCommand, GuestRunner, Secret};
 use gascan_proto::v1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -11,6 +13,61 @@ pub(crate) enum ConfigureOutcome {
     Completed,
     Cancelled,
     Partial,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OfferResult {
+    Suppressed,
+    Pending,
+    Declined,
+    Completed,
+    Cancelled,
+}
+
+pub(crate) async fn offer_after_up(
+    client: &mut Client,
+    selector: v1::SandboxSelector,
+    io: &mut dyn ConfigureIo,
+) -> Result<OfferResult, ConfigureError> {
+    let discovery = SystemHostDiscovery::new();
+    let mut runner = ClientGuestRunner::new(client);
+    offer_after_up_with(&mut runner, selector, &discovery, io).await
+}
+
+pub(super) async fn offer_after_up_with<R: GuestRunner, H: HostDiscovery + ?Sized>(
+    runner: &mut R,
+    selector: v1::SandboxSelector,
+    discovery: &H,
+    io: &mut dyn ConfigureIo,
+) -> Result<OfferResult, ConfigureError> {
+    if !io.stdin_is_terminal() || !io.stderr_is_terminal() {
+        return Ok(OfferResult::Suppressed);
+    }
+    match receipt_state(runner, selector.clone()).await? {
+        ReceiptState::Complete => return Ok(OfferResult::Completed),
+        ReceiptState::Declined => return Ok(OfferResult::Declined),
+        ReceiptState::Pending => {}
+    }
+    let accepted = match io.confirm(
+        "Set up Git, GitHub, and GitLab for this sandbox now? [Y/n] ",
+        true,
+    ) {
+        Ok(accepted) => accepted,
+        Err(ConfigureError::Cancelled) => return Ok(OfferResult::Cancelled),
+        Err(error) => return Err(error),
+    };
+    if !accepted {
+        decline_receipt(runner, selector).await?;
+        io.write_err("Run 'gascan configure' whenever you are ready.\n")?;
+        return Ok(OfferResult::Declined);
+    }
+    Ok(
+        match configure_all(runner, selector, discovery, io).await? {
+            ConfigureOutcome::Completed => OfferResult::Completed,
+            ConfigureOutcome::Cancelled => OfferResult::Cancelled,
+            ConfigureOutcome::Partial => OfferResult::Pending,
+        },
+    )
 }
 
 enum RemoteSummary {

@@ -1,7 +1,8 @@
 use crate::client::{Client, ClientError};
 use crate::configure::{
-    ConfigureError, ConfigureIo, ConfigureOutcome, Forge, GitProtocol, SystemHostDiscovery,
-    TerminalPrompter, configure_all, configure_forge_interactive, configure_git_interactive,
+    ConfigureError, ConfigureIo, ConfigureOutcome, Forge, GitProtocol, OfferResult,
+    SystemHostDiscovery, TerminalPrompter, configure_all, configure_forge_interactive,
+    configure_git_interactive, offer_after_up,
 };
 use crate::guest::{
     ClientGuestRunner, Secret, SensitiveBytes, allowed_environment, attach_to_stdio,
@@ -450,16 +451,41 @@ pub async fn execute() -> Result<i32, CliError> {
         }
         Command::Up { project_root, json } => {
             let project_root = resolve_project_root(&project_root)?;
-            match client.api.up(v1::UpRequest { project_root }).await {
+            let developer_offer_ci = continuous_integration();
+            let developer_selector =
+                (!json && !developer_offer_ci).then(|| selector_for_project_root(&project_root));
+            match client
+                .api
+                .up(v1::UpRequest {
+                    project_root: project_root.clone(),
+                })
+                .await
+            {
                 Ok(response) => {
                     let result =
                         operation(response.into_inner(), json, OperationKind::Up, None).await;
-                    preserve_up_result_with_optional_offer(
+                    let result = preserve_up_result_with_optional_offer(
                         result,
                         json,
                         &mut std::io::stderr(),
                         try_offer_ssh_config_include,
+                    );
+                    let mut warning = std::io::stderr();
+                    preserve_up_result_with_developer_offer(
+                        result,
+                        json,
+                        developer_offer_ci,
+                        &mut warning,
+                        || async {
+                            let Some(selector) = developer_selector else {
+                                return Ok(OfferResult::Suppressed);
+                            };
+                            let selector = selector?;
+                            let mut io = TerminalPrompter::new()?;
+                            offer_after_up(&mut client, selector, &mut io).await
+                        },
                     )
+                    .await
                 }
                 Err(status) => pre_stream_operation_failure(status.into(), json),
             }
@@ -1158,6 +1184,60 @@ where
     })
 }
 
+async fn preserve_up_result_with_developer_offer<F, Future, W>(
+    result: Result<i32, CliError>,
+    json: bool,
+    continuous_integration: bool,
+    warning: &mut W,
+    offer: F,
+) -> Result<i32, CliError>
+where
+    F: FnOnce() -> Future,
+    Future: std::future::Future<Output = Result<OfferResult, ConfigureError>>,
+    W: Write,
+{
+    if !matches!(result, Ok(0)) || json || continuous_integration {
+        return result;
+    }
+    if matches!(offer().await, Err(_) | Ok(OfferResult::Pending)) {
+        let _ = writeln!(
+            warning,
+            "Warning: developer setup was not completed; run `gascan configure` to try again."
+        );
+    }
+    result
+}
+
+fn selector_for_project_root(project_root: &str) -> Result<v1::SandboxSelector, ConfigureError> {
+    let manifest = gascan_core::manifest::Manifest::load(project_root.as_ref()).map_err(|_| {
+        ConfigureError::HostCommand {
+            category: "developer onboarding selector",
+            message: "the project manifest could not be loaded for developer onboarding".to_owned(),
+        }
+    })?;
+    let name = manifest
+        .name()
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            Path::new(project_root)
+                .file_name()
+                .and_then(OsStr::to_str)
+                .map(ToOwned::to_owned)
+        })
+        .ok_or_else(|| ConfigureError::HostCommand {
+            category: "developer onboarding selector",
+            message: "the successful project sandbox name could not be resolved".to_owned(),
+        })?;
+    let spec = gascan_core::sandbox::SandboxSpec::from_root(&name, project_root.as_ref(), manifest)
+        .map_err(|_| ConfigureError::HostCommand {
+            category: "developer onboarding selector",
+            message: "the successful project sandbox could not be resolved".to_owned(),
+        })?;
+    Ok(v1::SandboxSelector {
+        sandbox_id: spec.id().as_str().to_owned(),
+    })
+}
+
 fn try_offer_ssh_config_include() -> Result<(), CliError> {
     if !std::io::stdin().is_terminal()
         || !std::io::stderr().is_terminal()
@@ -1181,9 +1261,13 @@ fn try_offer_ssh_config_include() -> Result<(), CliError> {
 }
 
 fn continuous_integration() -> bool {
+    continuous_integration_from(|name| std::env::var_os(name))
+}
+
+fn continuous_integration_from(mut environment: impl FnMut(&str) -> Option<OsString>) -> bool {
     ["CI", "GITHUB_ACTIONS", "BUILD_BUILDID"]
         .into_iter()
-        .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+        .any(|name| environment(name).is_some_and(|value| !value.is_empty()))
 }
 
 pub fn ssh_invocation<I>(
@@ -1607,6 +1691,137 @@ mod tests {
 
         assert_eq!(result?, 0);
         assert!(warning.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn first_up_developer_offer_error_warns_once_and_preserves_success()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let calls = std::cell::Cell::new(0_u32);
+        let mut warning = Vec::new();
+
+        let result =
+            preserve_up_result_with_developer_offer(Ok(0), false, false, &mut warning, || async {
+                calls.set(calls.get() + 1);
+                Err(ConfigureError::GuestCommand {
+                    category: "developer-home receipt",
+                    message: "injected failure".to_owned(),
+                })
+            })
+            .await;
+
+        assert_eq!(result?, 0);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            String::from_utf8(warning)?,
+            "Warning: developer setup was not completed; run `gascan configure` to try again.\n"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn first_up_pending_setup_warns_once_and_preserves_success()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut warning = Vec::new();
+
+        let result =
+            preserve_up_result_with_developer_offer(Ok(0), false, false, &mut warning, || async {
+                Ok(OfferResult::Pending)
+            })
+            .await;
+
+        assert_eq!(result?, 0);
+        assert_eq!(
+            String::from_utf8(warning)?,
+            "Warning: developer setup was not completed; run `gascan configure` to try again.\n"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn first_up_offer_runs_once_only_for_successful_human_non_ci_up()
+    -> Result<(), Box<dyn std::error::Error>> {
+        async fn exercise(
+            result: Result<i32, CliError>,
+            json: bool,
+            ci: bool,
+        ) -> Result<(Result<i32, CliError>, u32, Vec<u8>), Box<dyn std::error::Error>> {
+            let calls = std::cell::Cell::new(0_u32);
+            let mut warning = Vec::new();
+            let result =
+                preserve_up_result_with_developer_offer(result, json, ci, &mut warning, || async {
+                    calls.set(calls.get() + 1);
+                    Ok(OfferResult::Completed)
+                })
+                .await;
+            Ok((result, calls.get(), warning))
+        }
+
+        let (success, calls, warning) = exercise(Ok(0), false, false).await?;
+        assert_eq!(success?, 0);
+        assert_eq!(calls, 1);
+        assert!(warning.is_empty());
+
+        for (result, json, ci) in [
+            (Ok(0), true, false),
+            (Ok(0), false, true),
+            (Ok(EXIT_RUNTIME), false, false),
+        ] {
+            let (result, calls, warning) = exercise(result, json, ci).await?;
+            assert!(result.is_ok());
+            assert_eq!(calls, 0);
+            assert!(warning.is_empty());
+        }
+
+        let original = CliError::Runtime("injected up failure".to_owned());
+        let (failed, calls, warning) = exercise(Err(original), false, false).await?;
+        let failed = match failed {
+            Err(error) => error,
+            Ok(_) => return Err("failed up unexpectedly succeeded".into()),
+        };
+        assert_eq!(failed.message(), "injected up failure");
+        assert_eq!(calls, 0);
+        assert!(warning.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn first_up_ci_suppression_recognizes_each_supported_environment() {
+        for active in ["CI", "GITHUB_ACTIONS", "BUILD_BUILDID"] {
+            assert!(continuous_integration_from(|name| {
+                (name == active).then(|| OsString::from("1"))
+            }));
+        }
+        assert!(!continuous_integration_from(|_| None));
+        assert!(!continuous_integration_from(|_| Some(OsString::new())));
+    }
+
+    #[test]
+    fn first_up_selector_is_derived_from_the_resolved_project_not_sandbox_count()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let selected = temporary.path().join("selected");
+        let unrelated = temporary.path().join("unrelated");
+        std::fs::create_dir(&selected)?;
+        std::fs::create_dir(&unrelated)?;
+        std::fs::write(
+            selected.join("gascan.toml"),
+            "version = 1\nname = 'selected-project'\n",
+        )?;
+        std::fs::write(
+            unrelated.join("gascan.toml"),
+            "version = 1\nname = 'unrelated-project'\n",
+        )?;
+        let selected = std::fs::canonicalize(selected)?;
+        let unrelated = std::fs::canonicalize(unrelated)?;
+
+        let selector =
+            selector_for_project_root(selected.to_str().ok_or("selected root was not UTF-8")?)?;
+        let unrelated_selector =
+            selector_for_project_root(unrelated.to_str().ok_or("unrelated root was not UTF-8")?)?;
+
+        assert_ne!(selector.sandbox_id, unrelated_selector.sandbox_id);
+        assert!(selector.sandbox_id.starts_with("selected-project-"));
         Ok(())
     }
 

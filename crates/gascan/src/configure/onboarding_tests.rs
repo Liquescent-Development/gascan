@@ -1,6 +1,8 @@
+use super::onboarding::offer_after_up_with;
 use super::{
     ConfigureError, ConfigureIo, ConfigureOutcome, Forge, GitDefaults, GitProtocol, HostAccount,
-    HostDiscovery, Prompter, configure_all, configure_forge_interactive, configure_git_interactive,
+    HostDiscovery, OfferResult, Prompter, configure_all, configure_forge_interactive,
+    configure_git_interactive,
 };
 use crate::cli::CliError;
 use crate::guest::{GuestCommand, GuestOutput, GuestRunner, Secret};
@@ -256,6 +258,10 @@ fn empty_status() -> GuestOutput {
     )
 }
 
+fn receipt_status(state: &str) -> GuestOutput {
+    output(0, format!("{state}\n"), [])
+}
+
 fn configured_status(protocol: GitProtocol) -> GuestOutput {
     let protocol = match protocol {
         GitProtocol::Ssh => "ssh",
@@ -330,6 +336,286 @@ fn argv(command: &RecordedCommand) -> Vec<String> {
         .iter()
         .map(|argument| String::from_utf8_lossy(argument).into_owned())
         .collect()
+}
+
+#[tokio::test]
+async fn first_up_pending_receipt_decline_is_recorded_without_setup_values() -> TestResult {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let discovery = FakeDiscovery::new(
+        GitDefaults {
+            name: None,
+            email: None,
+        },
+        Arc::clone(&events),
+    );
+    let mut io = FakeIo::interactive(events);
+    io.push_confirm(false);
+    let mut runner = FakeRunner::with_outputs([receipt_status("pending"), output(0, [], [])]);
+
+    let result = offer_after_up_with(&mut runner, selector(), &discovery, &mut io).await?;
+
+    assert_eq!(result, OfferResult::Declined);
+    assert_eq!(runner.commands.len(), 2);
+    assert_eq!(
+        argv(&runner.commands[0]),
+        [
+            "/usr/local/bin/configure-developer-home",
+            "receipt",
+            "status",
+        ]
+    );
+    assert_eq!(
+        argv(&runner.commands[1]),
+        [
+            "/usr/local/bin/configure-developer-home",
+            "receipt",
+            "decline",
+        ]
+    );
+    assert!(runner.commands.iter().all(|command| {
+        command.environment.is_empty() && command.stdin.is_none() && argv(command).len() == 3
+    }));
+    assert_eq!(
+        io.stderr,
+        "Run 'gascan configure' whenever you are ready.\n"
+    );
+    let recorded = io
+        .events
+        .lock()
+        .map_err(|_| "test event log was poisoned")?;
+    assert_eq!(
+        recorded
+            .iter()
+            .filter(|event| {
+                event.as_str()
+                    == "confirm:Set up Git, GitHub, and GitLab for this sandbox now? [Y/n] "
+            })
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn first_up_complete_and_declined_receipts_suppress_the_prompt() -> TestResult {
+    for (state, expected) in [
+        ("complete", OfferResult::Completed),
+        ("declined", OfferResult::Declined),
+    ] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let discovery = FakeDiscovery::new(
+            GitDefaults {
+                name: None,
+                email: None,
+            },
+            Arc::clone(&events),
+        );
+        let mut io = FakeIo::interactive(events);
+        let mut runner = FakeRunner::with_outputs([receipt_status(state)]);
+
+        let result = offer_after_up_with(&mut runner, selector(), &discovery, &mut io).await?;
+
+        assert_eq!(result, expected);
+        assert_eq!(runner.commands.len(), 1);
+        assert!(io.stdout.is_empty());
+        assert!(io.stderr.is_empty());
+        assert!(
+            io.events
+                .lock()
+                .map_err(|_| "test event log was poisoned")?
+                .iter()
+                .all(|event| !event.starts_with("confirm:"))
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn first_up_cancelled_prompt_keeps_the_receipt_pending() -> TestResult {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let discovery = FakeDiscovery::new(
+        GitDefaults {
+            name: None,
+            email: None,
+        },
+        Arc::clone(&events),
+    );
+    let mut io = FakeIo::interactive(events);
+    io.confirms.push_back(Err(ConfigureError::Cancelled));
+    let mut runner = FakeRunner::with_outputs([receipt_status("pending")]);
+
+    let result = offer_after_up_with(&mut runner, selector(), &discovery, &mut io).await?;
+
+    assert_eq!(result, OfferResult::Cancelled);
+    assert_eq!(runner.commands.len(), 1);
+    assert!(io.stdout.is_empty());
+    assert!(io.stderr.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn first_up_accepted_guide_completes_the_receipt_once() -> TestResult {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let discovery = FakeDiscovery::new(
+        GitDefaults {
+            name: None,
+            email: None,
+        },
+        Arc::clone(&events),
+    );
+    let mut io = FakeIo::interactive(events);
+    for answer in [true, false, false, false] {
+        io.push_confirm(answer);
+    }
+    let mut runner = FakeRunner::with_outputs([
+        receipt_status("pending"),
+        configured_status(GitProtocol::Ssh),
+        online_route(),
+        output(0, [], []),
+    ]);
+
+    let result = offer_after_up_with(&mut runner, selector(), &discovery, &mut io).await?;
+
+    assert_eq!(result, OfferResult::Completed);
+    assert_eq!(
+        runner
+            .commands
+            .iter()
+            .filter(|command| {
+                argv(command).ends_with(&["receipt".to_owned(), "complete".to_owned()])
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        io.events
+            .lock()
+            .map_err(|_| "test event log was poisoned")?
+            .iter()
+            .filter(|event| {
+                event.as_str()
+                    == "confirm:Set up Git, GitHub, and GitLab for this sandbox now? [Y/n] "
+            })
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn first_up_partial_guide_leaves_the_receipt_pending() -> TestResult {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let discovery = FakeDiscovery::new(
+        GitDefaults {
+            name: None,
+            email: None,
+        },
+        Arc::clone(&events),
+    );
+    let mut io = FakeIo::interactive(events);
+    io.push_confirm(true);
+    io.push_confirm(false);
+    let mut runner = FakeRunner::with_outputs([receipt_status("pending"), empty_status()]);
+
+    let result = offer_after_up_with(&mut runner, selector(), &discovery, &mut io).await?;
+
+    assert_eq!(result, OfferResult::Pending);
+    assert!(runner
+        .commands
+        .iter()
+        .all(|command| !argv(command).ends_with(&["receipt".to_owned(), "complete".to_owned()])));
+    Ok(())
+}
+
+#[tokio::test]
+async fn first_up_non_tty_is_suppressed_before_receipt_access() -> TestResult {
+    for redirected in ["stdin", "stderr"] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let discovery = FakeDiscovery::new(
+            GitDefaults {
+                name: None,
+                email: None,
+            },
+            Arc::clone(&events),
+        );
+        let mut io = FakeIo::interactive(events);
+        if redirected == "stdin" {
+            io.stdin_terminal = false;
+        } else {
+            io.stderr_terminal = false;
+        }
+        let mut runner = FakeRunner::default();
+
+        let result = offer_after_up_with(&mut runner, selector(), &discovery, &mut io).await?;
+
+        assert_eq!(result, OfferResult::Suppressed);
+        assert!(runner.commands.is_empty());
+        assert!(io.stdout.is_empty());
+        assert!(io.stderr.is_empty());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn first_up_receipt_status_and_decline_write_errors_are_returned() -> TestResult {
+    for outputs in [
+        vec![output(1, [], [])],
+        vec![receipt_status("pending"), output(1, [], [])],
+    ] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let discovery = FakeDiscovery::new(
+            GitDefaults {
+                name: None,
+                email: None,
+            },
+            Arc::clone(&events),
+        );
+        let mut io = FakeIo::interactive(events);
+        io.push_confirm(false);
+        let mut runner = FakeRunner::with_outputs(outputs);
+
+        let error = match offer_after_up_with(&mut runner, selector(), &discovery, &mut io).await {
+            Err(error) => error,
+            Ok(_) => return Err("receipt failure unexpectedly completed the offer".into()),
+        };
+
+        assert!(error.to_string().contains("developer-home receipt"));
+        assert!(!io.stderr.contains(SENTINEL));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn first_up_setup_error_is_returned_without_writing_a_receipt() -> TestResult {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let discovery = FakeDiscovery::new(
+        GitDefaults {
+            name: None,
+            email: None,
+        },
+        Arc::clone(&events),
+    );
+    let mut io = FakeIo::interactive(events);
+    io.push_confirm(true);
+    let mut runner = FakeRunner::with_outputs([
+        receipt_status("pending"),
+        output(1, SENTINEL.as_bytes(), SENTINEL.as_bytes()),
+    ]);
+
+    let error = match offer_after_up_with(&mut runner, selector(), &discovery, &mut io).await {
+        Err(error) => error,
+        Ok(_) => return Err("setup failure unexpectedly completed the offer".into()),
+    };
+
+    assert!(error.to_string().contains("developer-home status"));
+    assert!(runner
+        .commands
+        .iter()
+        .all(|command| !argv(command).ends_with(&["receipt".to_owned(), "complete".to_owned()])));
+    assert!(!error.to_string().contains(SENTINEL));
+    assert!(!io.stdout.contains(SENTINEL));
+    assert!(!io.stderr.contains(SENTINEL));
+    Ok(())
 }
 
 #[tokio::test]
