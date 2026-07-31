@@ -1,5 +1,12 @@
 use crate::client::{Client, ClientError};
-use crate::guest::{allowed_environment, attach_to_stdio, first_session_token};
+use crate::configure::{
+    ConfigureError, ConfigureIo, ConfigureOutcome, Forge, GitProtocol, SystemHostDiscovery,
+    TerminalPrompter, configure_all, configure_forge_interactive, configure_git_interactive,
+};
+use crate::guest::{
+    ClientGuestRunner, Secret, SensitiveBytes, allowed_environment, attach_to_stdio,
+    first_session_token,
+};
 use crate::presentation::{
     DoctorCheck, OperationKind, OperationProgress, OutputCapabilities, daemon_force_warning,
     daemon_lifecycle_json, daemon_status_json, render_daemon_lifecycle, render_daemon_status,
@@ -13,7 +20,7 @@ use clap::{CommandFactory as _, Parser, Subcommand, error::ErrorKind};
 use gascan_proto::ssh_status::{SshState, classify as classify_ssh};
 use gascan_proto::v1;
 use std::ffi::{OsStr, OsString};
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal as _, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -21,6 +28,8 @@ const EXIT_USAGE: i32 = 64;
 const EXIT_DAEMON: i32 = 69;
 const EXIT_RUNTIME: i32 = 70;
 const EXIT_API: i32 = 76;
+const MAX_CONFIGURE_TOKEN_BYTES: usize = 1024 * 1024;
+const CONFIGURE_TOKEN_SCRATCH_BYTES: usize = 16 * 1024;
 
 #[derive(Parser)]
 #[command(name = "gascan", version, disable_help_subcommand = true)]
@@ -92,6 +101,31 @@ enum Command {
     SshConfig {
         #[command(subcommand)]
         command: SshConfigCommand,
+    },
+    Configure {
+        #[command(subcommand)]
+        command: Option<ConfigureCommand>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigureCommand {
+    Git,
+    Gh {
+        #[arg(long)]
+        hostname: Option<String>,
+        #[arg(long)]
+        token_stdin: bool,
+        #[arg(long, value_enum, default_value_t = GitProtocol::Ssh)]
+        git_protocol: GitProtocol,
+    },
+    Glab {
+        #[arg(long)]
+        hostname: Option<String>,
+        #[arg(long)]
+        token_stdin: bool,
+        #[arg(long, value_enum, default_value_t = GitProtocol::Ssh)]
+        git_protocol: GitProtocol,
     },
 }
 
@@ -359,7 +393,12 @@ fn doctor_request(current_directory: std::io::Result<PathBuf>) -> v1::DoctorRequ
 pub async fn execute() -> Result<i32, CliError> {
     let arguments = match Arguments::try_parse() {
         Ok(arguments) => arguments,
-        Err(error) if error.kind() == ErrorKind::DisplayVersion => {
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayVersion | ErrorKind::DisplayHelp
+            ) =>
+        {
             print!("{error}");
             return Ok(0);
         }
@@ -389,6 +428,13 @@ pub async fn execute() -> Result<i32, CliError> {
     if let Command::SshConfig { command } = arguments.command {
         return execute_ssh_config(command);
     }
+    let configure_io = if let Command::Configure { command } = &arguments.command {
+        let io = TerminalPrompter::new().map_err(configure_cli_error)?;
+        preflight_configure(command, io.stdin_is_terminal(), io.stderr_is_terminal())?;
+        Some(io)
+    } else {
+        None
+    };
     let doctor_request = matches!(&arguments.command, Command::Doctor { .. })
         .then(|| doctor_request(std::env::current_dir()));
     let connected = connect_with_recovery_progress(command_uses_json(&arguments.command)).await?;
@@ -396,6 +442,12 @@ pub async fn execute() -> Result<i32, CliError> {
     match arguments.command {
         Command::DaemonAttest => Ok(0),
         Command::Daemon { .. } => Ok(0),
+        Command::Configure { command } => {
+            let io = configure_io.ok_or_else(|| {
+                CliError::Runtime("configuration terminal was not initialized".to_owned())
+            })?;
+            execute_configure(&mut client, arguments.sandbox, command, io).await
+        }
         Command::Up { project_root, json } => {
             let project_root = resolve_project_root(&project_root)?;
             match client.api.up(v1::UpRequest { project_root }).await {
@@ -553,6 +605,190 @@ pub async fn execute() -> Result<i32, CliError> {
     }
 }
 
+fn preflight_configure(
+    command: &Option<ConfigureCommand>,
+    stdin_is_terminal: bool,
+    stderr_is_terminal: bool,
+) -> Result<(), CliError> {
+    let token_stdin_protocol = match command {
+        Some(
+            ConfigureCommand::Gh {
+                token_stdin: true,
+                git_protocol,
+                ..
+            }
+            | ConfigureCommand::Glab {
+                token_stdin: true,
+                git_protocol,
+                ..
+            },
+        ) => Some(*git_protocol),
+        _ => None,
+    };
+    if let Some(protocol) = token_stdin_protocol {
+        if stdin_is_terminal {
+            return Err(CliError::Usage {
+                kind: UsageKind::Other,
+                message:
+                    "--token-stdin requires piped stdin; omit --token-stdin for hidden token entry"
+                        .to_owned(),
+            });
+        }
+        if protocol == GitProtocol::Ssh {
+            return Err(CliError::Usage {
+                kind: UsageKind::Other,
+                message: "--token-stdin cannot perform SSH first-use verification; rerun interactively without --token-stdin, or pass --git-protocol https".to_owned(),
+            });
+        }
+        return Ok(());
+    }
+    if !stdin_is_terminal || !stderr_is_terminal {
+        return Err(CliError::Usage {
+            kind: UsageKind::Other,
+            message: "interactive configuration requires an interactive terminal".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+async fn execute_configure(
+    client: &mut Client,
+    explicit_sandbox: Option<String>,
+    command: Option<ConfigureCommand>,
+    mut io: TerminalPrompter,
+) -> Result<i32, CliError> {
+    let selector = selector(client, explicit_sandbox).await?;
+    let status = client
+        .api
+        .status(v1::StatusRequest {
+            sandbox: Some(selector.clone()),
+        })
+        .await?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| CliError::Runtime("daemon returned no sandbox status".to_owned()))?;
+    require_running_sandbox(status)?;
+
+    let piped_token = match &command {
+        Some(
+            ConfigureCommand::Gh {
+                token_stdin: true, ..
+            }
+            | ConfigureCommand::Glab {
+                token_stdin: true, ..
+            },
+        ) => Some(read_token_stdin()?),
+        None
+        | Some(ConfigureCommand::Git)
+        | Some(ConfigureCommand::Gh {
+            token_stdin: false, ..
+        })
+        | Some(ConfigureCommand::Glab {
+            token_stdin: false, ..
+        }) => None,
+    };
+
+    let discovery = SystemHostDiscovery::new();
+    let mut runner = ClientGuestRunner::new(client);
+    let outcome = match command {
+        None => configure_all(&mut runner, selector, &discovery, &mut io).await,
+        Some(ConfigureCommand::Git) => {
+            configure_git_interactive(&mut runner, selector, &discovery, &mut io).await
+        }
+        Some(ConfigureCommand::Gh {
+            hostname,
+            git_protocol,
+            ..
+        }) => {
+            configure_forge_interactive(
+                &mut runner,
+                selector,
+                Forge::GitHub,
+                hostname.unwrap_or_else(|| "github.com".to_owned()),
+                git_protocol,
+                piped_token,
+                &mut io,
+            )
+            .await
+        }
+        Some(ConfigureCommand::Glab {
+            hostname,
+            git_protocol,
+            ..
+        }) => {
+            configure_forge_interactive(
+                &mut runner,
+                selector,
+                Forge::GitLab,
+                hostname.unwrap_or_else(|| "gitlab.com".to_owned()),
+                git_protocol,
+                piped_token,
+                &mut io,
+            )
+            .await
+        }
+    }
+    .map_err(configure_cli_error)?;
+    Ok(match outcome {
+        ConfigureOutcome::Completed | ConfigureOutcome::Cancelled => 0,
+        ConfigureOutcome::Partial => EXIT_RUNTIME,
+    })
+}
+
+fn configure_cli_error(error: ConfigureError) -> CliError {
+    match error {
+        ConfigureError::Io(error) => CliError::Io(error),
+        error => CliError::Runtime(error.to_string()),
+    }
+}
+
+fn read_token_stdin() -> Result<Secret, CliError> {
+    read_token_stdin_from(&mut std::io::stdin().lock())
+}
+
+fn read_token_stdin_from(reader: &mut impl std::io::Read) -> Result<Secret, CliError> {
+    let mut token = SensitiveBytes::zeroed(MAX_CONFIGURE_TOKEN_BYTES);
+    let mut scratch = SensitiveBytes::zeroed(CONFIGURE_TOKEN_SCRATCH_BYTES);
+    loop {
+        let count = match reader.read(scratch.storage_mut()) {
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(CliError::Io(error)),
+        };
+        if count == 0 {
+            break;
+        }
+        let exceeded = token.append_bounded(&scratch.storage()[..count]);
+        scratch.clear_storage();
+        if exceeded {
+            return Err(CliError::Usage {
+                kind: UsageKind::Other,
+                message: format!("piped token exceeds the {MAX_CONFIGURE_TOKEN_BYTES}-byte limit"),
+            });
+        }
+    }
+    if token.is_empty() {
+        return Err(CliError::Usage {
+            kind: UsageKind::Other,
+            message: "piped token must not be empty".to_owned(),
+        });
+    }
+    Ok(Secret::from_sensitive(token))
+}
+
+fn require_running_sandbox(status: v1::SandboxStatus) -> Result<(), CliError> {
+    if status.actual_state == v1::ActualState::Running as i32 {
+        return Ok(());
+    }
+    Err(CliError::Usage {
+        kind: UsageKind::Other,
+        message: format!(
+            "sandbox `{}` is not running; run `gascan up <project-root>`",
+            status.sandbox_id
+        ),
+    })
+}
+
 async fn execute_daemon(command: DaemonCommand) -> Result<i32, CliError> {
     let json = daemon_command_uses_json(&command);
     match command {
@@ -642,7 +878,8 @@ fn command_uses_json(command: &Command) -> bool {
         | Command::Run { .. }
         | Command::Logs { .. }
         | Command::Ssh { .. }
-        | Command::SshConfig { .. } => false,
+        | Command::SshConfig { .. }
+        | Command::Configure { .. } => false,
     }
 }
 
@@ -1037,6 +1274,12 @@ async fn selector(
         .into_iter()
         .filter(|sandbox| sandbox.actual_state != v1::ActualState::Absent as i32)
         .collect::<Vec<_>>();
+    selector_from_sandboxes(sandboxes)
+}
+
+fn selector_from_sandboxes(
+    sandboxes: Vec<v1::SandboxStatus>,
+) -> Result<v1::SandboxSelector, CliError> {
     match sandboxes.as_slice() {
         [sandbox] => Ok(v1::SandboxSelector {
             sandbox_id: sandbox.sandbox_id.clone(),
@@ -1355,6 +1598,170 @@ mod tests {
             help.contains("-V, --version"),
             "version option missing: {help}"
         );
+    }
+
+    #[test]
+    fn configure_clap_accepts_all_forms_global_selector_and_protocol_default()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let aggregate =
+            Arguments::try_parse_from(["gascan", "--sandbox", "demo-0123456789ab", "configure"])?;
+        assert_eq!(aggregate.sandbox.as_deref(), Some("demo-0123456789ab"));
+        assert!(matches!(
+            aggregate.command,
+            Command::Configure { command: None }
+        ));
+
+        let git = Arguments::try_parse_from(["gascan", "configure", "git"])?;
+        assert!(matches!(
+            git.command,
+            Command::Configure {
+                command: Some(ConfigureCommand::Git)
+            }
+        ));
+
+        let github = Arguments::try_parse_from(["gascan", "configure", "gh"])?;
+        assert!(matches!(
+            github.command,
+            Command::Configure {
+                command: Some(ConfigureCommand::Gh {
+                    hostname: None,
+                    token_stdin: false,
+                    git_protocol: GitProtocol::Ssh,
+                })
+            }
+        ));
+
+        let gitlab = Arguments::try_parse_from([
+            "gascan",
+            "configure",
+            "glab",
+            "--hostname",
+            "gitlab.enterprise.test",
+            "--token-stdin",
+            "--git-protocol",
+            "https",
+        ])?;
+        assert!(matches!(
+            gitlab.command,
+            Command::Configure {
+                command: Some(ConfigureCommand::Glab {
+                    hostname: Some(hostname),
+                    token_stdin: true,
+                    git_protocol: GitProtocol::Https,
+                })
+            } if hostname == "gitlab.enterprise.test"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn configure_preflight_enforces_interactive_and_token_stdin_modes() {
+        let aggregate = None;
+        assert!(preflight_configure(&aggregate, true, true).is_ok());
+        assert!(preflight_configure(&aggregate, false, true).is_err());
+        assert!(preflight_configure(&aggregate, true, false).is_err());
+
+        let git = Some(ConfigureCommand::Git);
+        assert!(preflight_configure(&git, true, true).is_ok());
+        assert!(preflight_configure(&git, false, true).is_err());
+
+        let piped_ssh = Some(ConfigureCommand::Gh {
+            hostname: None,
+            token_stdin: true,
+            git_protocol: GitProtocol::Ssh,
+        });
+        let ssh_error = preflight_configure(&piped_ssh, false, false)
+            .err()
+            .map(|error| error.message().to_owned());
+        assert_eq!(
+            ssh_error.as_deref(),
+            Some(
+                "--token-stdin cannot perform SSH first-use verification; rerun interactively without --token-stdin, or pass --git-protocol https"
+            )
+        );
+        assert!(preflight_configure(&piped_ssh, true, true).is_err());
+
+        let piped_https = Some(ConfigureCommand::Gh {
+            hostname: None,
+            token_stdin: true,
+            git_protocol: GitProtocol::Https,
+        });
+        assert!(preflight_configure(&piped_https, false, false).is_ok());
+
+        let hidden = Some(ConfigureCommand::Glab {
+            hostname: None,
+            token_stdin: false,
+            git_protocol: GitProtocol::Ssh,
+        });
+        assert!(preflight_configure(&hidden, true, true).is_ok());
+        assert!(preflight_configure(&hidden, false, true).is_err());
+    }
+
+    #[test]
+    fn configure_selector_and_running_state_fail_with_existing_guidance()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let none = match selector_from_sandboxes(Vec::new()) {
+            Err(error) => error,
+            Ok(_) => return Err("no sandbox unexpectedly selected".into()),
+        };
+        assert!(matches!(
+            none,
+            CliError::Usage {
+                kind: UsageKind::NoSandbox,
+                ..
+            }
+        ));
+
+        let statuses = ["one", "two"].map(|sandbox_id| v1::SandboxStatus {
+            sandbox_id: sandbox_id.to_owned(),
+            actual_state: v1::ActualState::Running as i32,
+            ..Default::default()
+        });
+        let multiple = match selector_from_sandboxes(statuses.to_vec()) {
+            Err(error) => error,
+            Ok(_) => return Err("multiple sandboxes unexpectedly selected".into()),
+        };
+        assert!(matches!(
+            multiple,
+            CliError::Usage {
+                kind: UsageKind::MultipleSandboxes,
+                ..
+            }
+        ));
+
+        let stopped = v1::SandboxStatus {
+            sandbox_id: "demo-0123456789ab".to_owned(),
+            actual_state: v1::ActualState::Stopped as i32,
+            ..Default::default()
+        };
+        let error = match require_running_sandbox(stopped) {
+            Err(error) => error,
+            Ok(()) => return Err("stopped sandbox accepted configuration".into()),
+        };
+        assert_eq!(
+            error.message(),
+            "sandbox `demo-0123456789ab` is not running; run `gascan up <project-root>`"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn piped_token_capture_is_exact_bounded_and_redacted() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let token = read_token_stdin_from(&mut std::io::Cursor::new(b"token-bytes\n"))
+            .map_err(|error| format!("valid token was rejected: {error}"))?;
+        assert_eq!(token.expose(), b"token-bytes\n");
+        assert!(!format!("{token:?}").contains("token-bytes"));
+
+        assert!(read_token_stdin_from(&mut std::io::Cursor::new(Vec::<u8>::new())).is_err());
+        assert!(
+            read_token_stdin_from(&mut std::io::Cursor::new(vec![
+                b'x';
+                MAX_CONFIGURE_TOKEN_BYTES + 1
+            ]))
+            .is_err()
+        );
+        Ok(())
     }
 
     #[test]

@@ -31,7 +31,7 @@ pub(crate) struct GitRequest {
     pub(crate) protocol: GitProtocol,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GitSetup {
     pub(crate) name: String,
     pub(crate) email: String,
@@ -118,6 +118,56 @@ pub(crate) async fn configure_git<R: GuestRunner>(
         public_key,
         fingerprint,
     })
+}
+
+pub(crate) async fn current_git_setup<R: GuestRunner>(
+    runner: &mut R,
+    selector: v1::SandboxSelector,
+) -> Result<Option<GitSetup>, ConfigureError> {
+    let sandbox_id = selector.sandbox_id.clone();
+    let status = execute(
+        runner,
+        selector,
+        vec![HELPER.to_vec(), b"status".to_vec()],
+        "developer-home status",
+    )
+    .await?;
+    let parsed = parse_status(status)?;
+    match (
+        parsed.name,
+        parsed.email,
+        parsed.protocol,
+        parsed.public_key,
+        parsed.fingerprint,
+    ) {
+        (None, None, None, None, None) => Ok(None),
+        (Some(name), Some(email), Some(protocol), Some(public_key), Some(fingerprint))
+            if valid_public_key(&public_key, &sandbox_id) && valid_fingerprint(&fingerprint) =>
+        {
+            Ok(Some(GitSetup {
+                name,
+                email,
+                protocol,
+                public_key,
+                fingerprint,
+            }))
+        }
+        _ => Err(invalid_status()),
+    }
+}
+
+pub(crate) async fn complete_receipt<R: GuestRunner>(
+    runner: &mut R,
+    selector: v1::SandboxSelector,
+) -> Result<(), ConfigureError> {
+    let output = execute(
+        runner,
+        selector,
+        vec![HELPER.to_vec(), b"receipt".to_vec(), b"complete".to_vec()],
+        "developer-home receipt",
+    )
+    .await?;
+    require_silent_success(output, "developer-home receipt")
 }
 
 pub(crate) async fn configure_ssh_host<R: GuestRunner>(

@@ -298,7 +298,9 @@ enum SensitiveStream {
 
 impl SensitiveCaptureConfig {
     fn buffer(&self, capacity: usize, stream: SensitiveStream, scratch: bool) -> SensitiveBytes {
-        let mut bytes = SensitiveBytes::zeroed(capacity);
+        let bytes = SensitiveBytes::zeroed(capacity);
+        #[cfg(test)]
+        let mut bytes = bytes;
         #[cfg(test)]
         if let Some(observer) = &self.observer {
             let kind = match (stream, scratch) {

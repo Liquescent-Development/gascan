@@ -1,6 +1,6 @@
 use super::{
-    ConfigureError, Forge, GitProtocol, GitRequest, HostAccount, HostDiscovery, Prompter,
-    SystemHostDiscovery, TerminalPrompter, configure_git, configure_ssh_host,
+    ConfigureError, ConfigureIo, Forge, GitProtocol, GitRequest, HostAccount, HostDiscovery,
+    Prompter, SystemHostDiscovery, TerminalPrompter, configure_git, configure_ssh_host,
 };
 use crate::{
     cli::CliError,
@@ -640,8 +640,34 @@ fn read_available(controller: &mut fs::File) -> std::io::Result<Vec<u8>> {
 fn pty_prompter(pty: &rustix_openpty::Pty) -> std::io::Result<(TerminalPrompter, fs::File)> {
     let input = duplicate_file(&pty.user)?;
     let output = duplicate_file(&pty.user)?;
+    let error = duplicate_file(&pty.user)?;
     let controller = duplicate_file(&pty.controller)?;
-    Ok((TerminalPrompter::from_files(input, output), controller))
+    Ok((
+        TerminalPrompter::from_files(input, output, error),
+        controller,
+    ))
+}
+
+#[test]
+fn prompts_use_stderr_while_summaries_use_stdout() -> TestResult {
+    let temporary = tempfile::tempdir()?;
+    let input_path = temporary.path().join("input");
+    let output_path = temporary.path().join("stdout");
+    let error_path = temporary.path().join("stderr");
+    fs::write(&input_path, b"\n")?;
+    let input = fs::File::open(input_path)?;
+    let output = fs::File::create(&output_path)?;
+    let error = fs::File::create(&error_path)?;
+    let mut prompt = TerminalPrompter::from_files(input, output, error);
+
+    assert_eq!(prompt.line("Prompt: ", None)?.as_deref(), Some(""));
+    prompt.write_out("Summary\n")?;
+    prompt.write_err("Warning\n")?;
+    drop(prompt);
+
+    assert_eq!(fs::read_to_string(output_path)?, "Summary\n");
+    assert_eq!(fs::read_to_string(error_path)?, "Prompt: Warning\n");
+    Ok(())
 }
 
 #[test]
@@ -790,6 +816,72 @@ fn actual_sigint_child() -> TestResult {
     assert!(matches!(result, Err(ConfigureError::Cancelled)));
     assert_termios_equal(&normalized_termios(&pty.user)?, &saved);
     Ok(())
+}
+
+#[test]
+fn actual_sigint_cancels_ordinary_line_input() -> TestResult {
+    let output = std::process::Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "configure::tests::actual_line_sigint_child",
+            "--nocapture",
+        ])
+        .env("GASCAN_CONFIGURE_LINE_SIGINT_CHILD", "1")
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    Ok(())
+}
+
+#[test]
+fn actual_line_sigint_child() -> TestResult {
+    if std::env::var_os("GASCAN_CONFIGURE_LINE_SIGINT_CHILD").is_none() {
+        return Ok(());
+    }
+    let pty = rustix_openpty::openpty(None, None)?;
+    let (mut prompt, _controller) = pty_prompter(&pty)?;
+    let reader = std::thread::spawn(move || prompt.line("Name: ", None));
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::INT)?;
+    let result = reader.join().map_err(|_| "line reader panicked")?;
+    assert!(matches!(result, Err(ConfigureError::Cancelled)));
+    Ok(())
+}
+
+#[test]
+fn sigint_after_a_completed_prompt_uses_the_default_disposition() -> TestResult {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let output = std::process::Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "configure::tests::post_prompt_sigint_child",
+            "--nocapture",
+        ])
+        .env("GASCAN_CONFIGURE_POST_PROMPT_SIGINT_CHILD", "1")
+        .output()?;
+    assert_eq!(
+        output.status.signal(),
+        Some(signal_hook::consts::SIGINT),
+        "SIGINT did not retain its default disposition: {output:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn post_prompt_sigint_child() -> TestResult {
+    if std::env::var_os("GASCAN_CONFIGURE_POST_PROMPT_SIGINT_CHILD").is_none() {
+        return Ok(());
+    }
+    let pty = rustix_openpty::openpty(None, None)?;
+    let (mut prompt, mut controller) = pty_prompter(&pty)?;
+    let reader = std::thread::spawn(move || prompt.line("Name: ", None));
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    controller.write_all(b"Ada\n")?;
+    let result = reader.join().map_err(|_| "line reader panicked")??;
+    assert_eq!(result.as_deref(), Some("Ada"));
+    rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::INT)?;
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    Err("SIGINT was ignored after the prompt completed".into())
 }
 
 const TEST_PUBLIC_KEY: &str = concat!(

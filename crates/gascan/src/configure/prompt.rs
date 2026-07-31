@@ -1,14 +1,15 @@
-use super::{ConfigureError, Prompter};
+use super::{ConfigureError, ConfigureIo, Prompter};
 use crate::guest::Secret;
-use std::io::{Read as _, Write as _};
-use std::sync::Arc;
+use std::io::{IsTerminal as _, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 const MAX_PROMPT_BYTES: usize = 1024 * 1024;
 
 pub(crate) struct TerminalPrompter {
     input: std::fs::File,
     output: std::fs::File,
+    error: std::fs::File,
 }
 
 impl TerminalPrompter {
@@ -20,17 +21,28 @@ impl TerminalPrompter {
             output: std::fs::File::from(
                 rustix::io::dup(std::io::stdout()).map_err(std::io::Error::from)?,
             ),
+            error: std::fs::File::from(
+                rustix::io::dup(std::io::stderr()).map_err(std::io::Error::from)?,
+            ),
         })
     }
 
     #[cfg(test)]
-    pub(super) fn from_files(input: std::fs::File, output: std::fs::File) -> Self {
-        Self { input, output }
+    pub(super) fn from_files(
+        input: std::fs::File,
+        output: std::fs::File,
+        error: std::fs::File,
+    ) -> Self {
+        Self {
+            input,
+            output,
+            error,
+        }
     }
 
     fn write_prompt(&mut self, prompt: &str) -> Result<(), ConfigureError> {
-        self.output.write_all(prompt.as_bytes())?;
-        self.output.flush()?;
+        self.error.write_all(prompt.as_bytes())?;
+        self.error.flush()?;
         Ok(())
     }
 }
@@ -55,8 +67,10 @@ impl Prompter for TerminalPrompter {
         prompt: &str,
         default: Option<&str>,
     ) -> Result<Option<String>, ConfigureError> {
+        let interrupt = PromptInterrupt::acquire()?;
+        let input = NonblockingInput::acquire(&self.input)?;
         self.write_prompt(prompt)?;
-        let Some(bytes) = read_line(&mut self.input)? else {
+        let Some(bytes) = read_line(&input.fd, &interrupt)? else {
             return Ok(None);
         };
         let value = String::from_utf8(bytes)
@@ -68,12 +82,13 @@ impl Prompter for TerminalPrompter {
     }
 
     fn secret(&mut self, prompt: &str) -> Result<Option<Secret>, ConfigureError> {
+        let interrupt = PromptInterrupt::acquire()?;
         let mut hidden = HiddenInput::acquire(&self.input)?;
         self.write_prompt(prompt)?;
-        let result = hidden.read_secret();
+        let result = hidden.read_secret(&interrupt);
         drop(hidden);
-        self.output.write_all(b"\n")?;
-        self.output.flush()?;
+        self.error.write_all(b"\n")?;
+        self.error.flush()?;
         let bytes = result?;
         if bytes.is_empty() {
             return Err(ConfigureError::Cancelled);
@@ -82,11 +97,39 @@ impl Prompter for TerminalPrompter {
     }
 }
 
-fn read_line(input: &mut std::fs::File) -> Result<Option<Vec<u8>>, ConfigureError> {
+impl ConfigureIo for TerminalPrompter {
+    fn write_out(&mut self, text: &str) -> Result<(), ConfigureError> {
+        self.output.write_all(text.as_bytes())?;
+        self.output.flush()?;
+        Ok(())
+    }
+
+    fn write_err(&mut self, text: &str) -> Result<(), ConfigureError> {
+        self.error.write_all(text.as_bytes())?;
+        self.error.flush()?;
+        Ok(())
+    }
+
+    fn stdin_is_terminal(&self) -> bool {
+        std::io::stdin().is_terminal()
+    }
+
+    fn stderr_is_terminal(&self) -> bool {
+        std::io::stderr().is_terminal()
+    }
+}
+
+fn read_line(
+    input: impl std::os::fd::AsFd,
+    interrupt: &PromptInterrupt<'_>,
+) -> Result<Option<Vec<u8>>, ConfigureError> {
     let mut bytes = Vec::new();
     let mut byte = [0_u8; 1];
     loop {
-        match input.read(&mut byte) {
+        if interrupt.was_triggered() {
+            return Err(ConfigureError::Cancelled);
+        }
+        match rustix::io::read(&input, &mut byte) {
             Ok(0) if bytes.is_empty() => return Ok(None),
             Ok(0) => break,
             Ok(_) if byte[0] == b'\n' => break,
@@ -97,14 +140,37 @@ fn read_line(input: &mut std::fs::File) -> Result<Option<Vec<u8>>, ConfigureErro
                 }
                 bytes.push(byte[0]);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(ConfigureError::Io(error)),
+            Err(rustix::io::Errno::AGAIN) | Err(rustix::io::Errno::INTR) => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => return Err(ConfigureError::Io(std::io::Error::from(error))),
         }
     }
     if bytes.last() == Some(&b'\r') {
         bytes.pop();
     }
     Ok(Some(bytes))
+}
+
+struct NonblockingInput {
+    fd: std::os::fd::OwnedFd,
+    saved_flags: rustix::fs::OFlags,
+}
+
+impl NonblockingInput {
+    fn acquire(fd: impl std::os::fd::AsFd) -> std::io::Result<Self> {
+        let fd = rustix::io::dup(fd)?;
+        let saved_flags = rustix::fs::fcntl_getfl(&fd)?;
+        let input = Self { fd, saved_flags };
+        rustix::fs::fcntl_setfl(&input.fd, input.saved_flags | rustix::fs::OFlags::NONBLOCK)?;
+        Ok(input)
+    }
+}
+
+impl Drop for NonblockingInput {
+    fn drop(&mut self) {
+        let _ = rustix::fs::fcntl_setfl(&self.fd, self.saved_flags);
+    }
 }
 
 pub(super) struct HiddenInput {
@@ -135,15 +201,11 @@ impl HiddenInput {
         Ok(hidden)
     }
 
-    fn read_secret(&mut self) -> Result<Vec<u8>, ConfigureError> {
-        let interrupted = Arc::new(AtomicBool::new(false));
-        let registration =
-            signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&interrupted))?;
-        let _registration = InterruptRegistration(registration);
+    fn read_secret(&mut self, interrupt: &PromptInterrupt<'_>) -> Result<Vec<u8>, ConfigureError> {
         let mut bytes = Vec::new();
         let mut byte = [0_u8; 1];
         loop {
-            if interrupted.load(Ordering::Relaxed) {
+            if interrupt.was_triggered() {
                 return Err(ConfigureError::Cancelled);
             }
             match rustix::io::read(&self.fd, &mut byte) {
@@ -180,10 +242,85 @@ impl Drop for HiddenInput {
     }
 }
 
-struct InterruptRegistration(signal_hook::SigId);
+struct PromptSignal {
+    _default_registration: signal_hook::SigId,
+    _interrupt_registration: signal_hook::SigId,
+    default_when_inactive: Arc<AtomicBool>,
+    triggered: Arc<AtomicBool>,
+    prompt_gate: Mutex<()>,
+}
 
-impl Drop for InterruptRegistration {
+impl PromptSignal {
+    fn register() -> std::io::Result<Self> {
+        let default_when_inactive = Arc::new(AtomicBool::new(true));
+        let triggered = Arc::new(AtomicBool::new(false));
+        let default_registration = signal_hook::flag::register_conditional_default(
+            signal_hook::consts::SIGINT,
+            Arc::clone(&default_when_inactive),
+        )?;
+        let interrupt_registration =
+            signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&triggered))?;
+        Ok(Self {
+            _default_registration: default_registration,
+            _interrupt_registration: interrupt_registration,
+            default_when_inactive,
+            triggered,
+            prompt_gate: Mutex::new(()),
+        })
+    }
+
+    fn begin(&'static self) -> PromptInterrupt<'static> {
+        let prompt_gate = match self.prompt_gate.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.triggered.store(false, Ordering::SeqCst);
+        self.default_when_inactive.store(false, Ordering::SeqCst);
+        PromptInterrupt {
+            signal: self,
+            _prompt_gate: prompt_gate,
+        }
+    }
+}
+
+enum PromptSignalState {
+    Ready(PromptSignal),
+    Failed(std::io::ErrorKind),
+}
+
+static PROMPT_SIGNAL: OnceLock<PromptSignalState> = OnceLock::new();
+
+struct PromptInterrupt<'a> {
+    signal: &'a PromptSignal,
+    _prompt_gate: MutexGuard<'a, ()>,
+}
+
+impl PromptInterrupt<'static> {
+    fn acquire() -> std::io::Result<Self> {
+        match PROMPT_SIGNAL.get_or_init(|| match PromptSignal::register() {
+            Ok(signal) => PromptSignalState::Ready(signal),
+            Err(error) => PromptSignalState::Failed(error.kind()),
+        }) {
+            PromptSignalState::Ready(signal) => Ok(signal.begin()),
+            PromptSignalState::Failed(kind) => Err(std::io::Error::new(
+                *kind,
+                "SIGINT prompt handler could not be installed",
+            )),
+        }
+    }
+}
+
+impl PromptInterrupt<'_> {
+    fn was_triggered(&self) -> bool {
+        self.signal.triggered.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for PromptInterrupt<'_> {
     fn drop(&mut self) {
-        signal_hook::low_level::unregister(self.0);
+        self.signal
+            .default_when_inactive
+            .store(true, Ordering::SeqCst);
+        self.signal.triggered.store(false, Ordering::SeqCst);
     }
 }

@@ -1,22 +1,29 @@
 mod forge;
 mod git;
 mod host;
+mod onboarding;
 mod prompt;
 
 pub(crate) use forge::{ForgeRequest, ForgeSetup, RegistrationState, configure_forge};
-pub(crate) use git::{GitProtocol, GitRequest, GitSetup, configure_git, configure_ssh_host};
+pub(crate) use git::{
+    GitProtocol, GitRequest, GitSetup, complete_receipt, configure_git, configure_ssh_host,
+    current_git_setup,
+};
 pub(crate) use host::SystemHostDiscovery;
+pub(crate) use onboarding::{
+    ConfigureOutcome, configure_all, configure_forge_interactive, configure_git_interactive,
+};
 pub(crate) use prompt::TerminalPrompter;
 
 use crate::guest::Secret;
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GitDefaults {
     pub(crate) name: Option<String>,
     pub(crate) email: Option<String>,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HostAccount {
     pub(crate) hostname: String,
     pub(crate) login: Option<String>,
@@ -44,6 +51,13 @@ pub(crate) trait Prompter {
     fn secret(&mut self, prompt: &str) -> Result<Option<Secret>, ConfigureError>;
 }
 
+pub(crate) trait ConfigureIo: Prompter {
+    fn write_out(&mut self, text: &str) -> Result<(), ConfigureError>;
+    fn write_err(&mut self, text: &str) -> Result<(), ConfigureError>;
+    fn stdin_is_terminal(&self) -> bool;
+    fn stderr_is_terminal(&self) -> bool;
+}
+
 #[derive(Debug)]
 pub(crate) enum ConfigureError {
     Cancelled,
@@ -66,6 +80,10 @@ pub(crate) enum ConfigureError {
         message: &'static str,
         retry: &'static str,
     },
+    #[allow(
+        dead_code,
+        reason = "the approved configure error contract reserves this variant for managed-state adapters"
+    )]
     UnsafeState {
         path: String,
         remedy: String,
@@ -113,5 +131,7 @@ impl From<std::io::Error> for ConfigureError {
 
 #[cfg(test)]
 mod forge_tests;
+#[cfg(test)]
+mod onboarding_tests;
 #[cfg(test)]
 mod tests;
