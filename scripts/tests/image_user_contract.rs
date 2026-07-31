@@ -145,6 +145,7 @@ fn hook_fixture(temporary: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf, Pa
                printf '%s\\n' 'kill -USR1 \"$GASCAN_TEST_PARENT_PID\"'\n\
              fi\n\
              printf '%s\\n' \
+               'if [ \"${GASCAN_TEST_EXPECT_CLEAR_RUNTIME-0}\" = 1 ]; then for name in STARSHIP_PREEXEC_READY STARSHIP_START_TIME STARSHIP_CMD_STATUS STARSHIP_PIPE_STATUS STARSHIP_END_TIME STARSHIP_DURATION STARSHIP_PROMPT_COMMAND STARSHIP_DEBUG_TRAP STARSHIP_SHELL STARSHIP_SESSION_KEY; do if declare -p \"$name\" >/dev/null 2>&1; then return 31; fi; done; [ \"${GASCAN_TEST_UNRELATED_SENTINEL-}\" = preserved ] || return 32; fi' \
                '_starship_set_return() { return \"${1:-0}\"; }' \
                'starship_preexec() { :; }' \
                'starship_preexec_all() { :; }' \
@@ -2177,10 +2178,26 @@ fn nested_interactive_bash_reinitializes_inherited_starship_state() {
     );
     let command = r#"
         . "$GASCAN_TEST_HOOK"
-        export STARSHIP_CONFIG STARSHIP_EXECUTABLE STARSHIP_SHELL STARSHIP_SESSION_KEY
+        STARSHIP_PREEXEC_READY=attacker
+        STARSHIP_START_TIME=attacker
+        STARSHIP_CMD_STATUS=attacker
+        STARSHIP_PIPE_STATUS=attacker
+        STARSHIP_END_TIME=attacker
+        STARSHIP_DURATION=attacker
+        STARSHIP_PROMPT_COMMAND=attacker
+        STARSHIP_DEBUG_TRAP=attacker
+        STARSHIP_SHELL=attacker
+        STARSHIP_SESSION_KEY=attacker
+        GASCAN_TEST_EXPECT_CLEAR_RUNTIME=1
+        GASCAN_TEST_UNRELATED_SENTINEL=preserved
+        export STARSHIP_CONFIG STARSHIP_EXECUTABLE STARSHIP_PREEXEC_READY
+        export STARSHIP_START_TIME STARSHIP_CMD_STATUS STARSHIP_PIPE_STATUS
+        export STARSHIP_END_TIME STARSHIP_DURATION STARSHIP_PROMPT_COMMAND
+        export STARSHIP_DEBUG_TRAP STARSHIP_SHELL STARSHIP_SESSION_KEY
+        export GASCAN_TEST_EXPECT_CLEAR_RUNTIME GASCAN_TEST_UNRELATED_SENTINEL
         GASCAN_TEST_HOOK="$GASCAN_TEST_HOOK" GASCAN_TEST_LOG="$GASCAN_TEST_LOG" \
           /bin/bash --noprofile --norc -ic \
-          '. "$GASCAN_TEST_HOOK"; printf "PS1=%s\n" "$PS1"'
+          '. "$GASCAN_TEST_HOOK"; printf "PS1=%s\nSENTINEL=%s\n" "$PS1" "$GASCAN_TEST_UNRELATED_SENTINEL"'
     "#;
     let output = run_hook(&hook, command, &log, false, false, true);
     assert!(output.status.success());
@@ -2194,6 +2211,11 @@ fn nested_interactive_bash_reinitializes_inherited_starship_state() {
         !String::from_utf8_lossy(&output.stderr).contains("Starship prompt unavailable"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("SENTINEL=preserved"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
     );
 }
 

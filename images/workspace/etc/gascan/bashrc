@@ -31,14 +31,14 @@ __gascan_shell_metadata()
     printf '%s\n' "$metadata"
 }
 
-__gascan_starship_variable_readonly()
+__gascan_starship_variable_unsafe()
 {
     local declaration attributes
     declaration=$(declare -p "$1" 2>/dev/null) || return 1
     attributes=${declaration#declare -}
     attributes=${attributes%% *}
     case "$attributes" in
-        *r*) return 0 ;;
+        *r*|*n*) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -65,7 +65,7 @@ __gascan_starship_preflight()
         fi
     done
     for name in "${writable_variables[@]}"; do
-        if __gascan_starship_variable_readonly "$name"; then
+        if __gascan_starship_variable_unsafe "$name"; then
             return 1
         fi
     done
@@ -334,7 +334,7 @@ __gascan_starship_main()
 __gascan_starship_main "$__gascan_inherited_debug_trap"
 unset __gascan_inherited_debug_trap
 unset -f __gascan_starship_main __gascan_starship_preflight \
-    __gascan_starship_variable_readonly \
+    __gascan_starship_variable_unsafe \
     __gascan_starship_clear_runtime \
     __gascan_starship_apply_commit __gascan_starship_build_commit \
     __gascan_starship_capture_expectations \
