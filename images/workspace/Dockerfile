@@ -94,6 +94,7 @@ COPY --chmod=0555 images/workspace/tests/ssh-contract.sh /opt/gascan/tests/ssh-c
 COPY --chmod=0555 images/workspace/bin/install-workstation-artifacts /usr/local/bin/install-workstation-artifacts
 COPY --chmod=0555 images/workspace/bin/run-workstation-step /usr/local/bin/run-workstation-step
 COPY --chmod=0555 images/workspace/bin/configure-workstation-home /usr/local/bin/configure-workstation-home
+COPY --chmod=0555 images/workspace/bin/configure-developer-home /usr/local/bin/configure-developer-home
 COPY --chmod=0555 images/workspace/bin/configure-shell-home /usr/local/bin/configure-shell-home
 COPY --chmod=0555 images/workspace/bin/initialize-rust-home /usr/local/bin/initialize-rust-home
 RUN install -d -o root -g root -m 0555 /etc/gascan

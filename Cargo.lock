@@ -454,6 +454,7 @@ dependencies = [
 name = "gascan"
 version = "0.1.16"
 dependencies = [
+ "base64",
  "clap",
  "console",
  "gascan-core",

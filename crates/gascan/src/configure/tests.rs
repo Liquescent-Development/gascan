@@ -1,8 +1,13 @@
 use super::{
-    ConfigureError, Forge, HostAccount, HostDiscovery, Prompter, SystemHostDiscovery,
-    TerminalPrompter,
+    ConfigureError, Forge, GitProtocol, GitRequest, HostAccount, HostDiscovery, Prompter,
+    SystemHostDiscovery, TerminalPrompter, configure_git, configure_ssh_host,
 };
-use crate::guest::{SensitiveDropKind, SensitiveDropObserver};
+use crate::{
+    cli::CliError,
+    guest::{GuestCommand, GuestOutput, GuestRunner, SensitiveDropKind, SensitiveDropObserver},
+};
+use gascan_proto::v1;
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
@@ -784,5 +789,279 @@ fn actual_sigint_child() -> TestResult {
     let result = reader.join().map_err(|_| "secret reader panicked")?;
     assert!(matches!(result, Err(ConfigureError::Cancelled)));
     assert_termios_equal(&normalized_termios(&pty.user)?, &saved);
+    Ok(())
+}
+
+const TEST_PUBLIC_KEY: &str = concat!(
+    "ssh-ed25519 ",
+    "AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB",
+    " gascan-demo-0123456789ab"
+);
+const TEST_PADDED_PUBLIC_KEY: &str = concat!(
+    "ssh-ed25519 ",
+    "AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+    " gascan-demo-0123456789ab"
+);
+const TEST_FINGERPRINT: &str = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+#[derive(Debug, PartialEq)]
+struct RecordedGuestCommand {
+    selector: v1::SandboxSelector,
+    argv: Vec<Vec<u8>>,
+    environment: Vec<v1::EnvironmentVariable>,
+    has_stdin: bool,
+}
+
+#[derive(Default)]
+struct FakeGuestRunner {
+    outputs: VecDeque<Result<GuestOutput, CliError>>,
+    commands: Vec<RecordedGuestCommand>,
+    interactive_calls: usize,
+}
+
+impl FakeGuestRunner {
+    fn with_outputs(outputs: impl IntoIterator<Item = GuestOutput>) -> Self {
+        Self {
+            outputs: outputs.into_iter().map(Ok).collect(),
+            ..Self::default()
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl GuestRunner for FakeGuestRunner {
+    async fn execute(
+        &mut self,
+        selector: v1::SandboxSelector,
+        command: GuestCommand,
+    ) -> Result<GuestOutput, CliError> {
+        self.commands.push(RecordedGuestCommand {
+            selector,
+            argv: command.argv,
+            environment: command.environment,
+            has_stdin: command.stdin.is_some(),
+        });
+        self.outputs
+            .pop_front()
+            .unwrap_or_else(|| Err(CliError::Runtime("unexpected helper call".to_owned())))
+    }
+
+    async fn execute_interactive(
+        &mut self,
+        _selector: v1::SandboxSelector,
+        _argv: Vec<Vec<u8>>,
+    ) -> Result<i32, CliError> {
+        self.interactive_calls += 1;
+        Ok(97)
+    }
+}
+
+fn git_selector() -> v1::SandboxSelector {
+    v1::SandboxSelector {
+        sandbox_id: "demo-0123456789ab".to_owned(),
+    }
+}
+
+fn git_request(protocol: GitProtocol) -> GitRequest {
+    GitRequest {
+        sandbox_id: "demo-0123456789ab".to_owned(),
+        name: "Ada Lovelace".to_owned(),
+        email: "ada@example.test".to_owned(),
+        protocol,
+    }
+}
+
+fn guest_output(code: i32, stdout: impl Into<Vec<u8>>, stderr: impl Into<Vec<u8>>) -> GuestOutput {
+    GuestOutput {
+        code,
+        stdout: stdout.into(),
+        stderr: stderr.into(),
+    }
+}
+
+fn configured_status(protocol: &str) -> Vec<u8> {
+    format!(
+        "{{\"email\":\"ada@example.test\",\"fingerprint\":\"{TEST_FINGERPRINT}\",\"name\":\"Ada Lovelace\",\"protocol\":\"{protocol}\",\"public_key\":\"{TEST_PUBLIC_KEY}\",\"receipt\":\"pending\"}}\n"
+    )
+    .into_bytes()
+}
+
+#[tokio::test]
+async fn configure_git_uses_exact_no_secret_helper_argv_and_parses_status() -> TestResult {
+    let mut runner = FakeGuestRunner::with_outputs([
+        guest_output(0, [], []),
+        guest_output(0, configured_status("ssh"), []),
+    ]);
+    let setup = configure_git(&mut runner, git_selector(), git_request(GitProtocol::Ssh)).await?;
+    assert_eq!(setup.name, "Ada Lovelace");
+    assert_eq!(setup.email, "ada@example.test");
+    assert_eq!(setup.protocol, GitProtocol::Ssh);
+    assert_eq!(setup.public_key, TEST_PUBLIC_KEY);
+    assert_eq!(setup.fingerprint, TEST_FINGERPRINT);
+    assert_eq!(runner.commands.len(), 2);
+    assert_eq!(
+        runner.commands[0].argv,
+        [
+            b"/usr/local/bin/configure-developer-home".to_vec(),
+            b"git".to_vec(),
+            b"--sandbox-id".to_vec(),
+            b"demo-0123456789ab".to_vec(),
+            b"--name".to_vec(),
+            b"Ada Lovelace".to_vec(),
+            b"--email".to_vec(),
+            b"ada@example.test".to_vec(),
+            b"--protocol".to_vec(),
+            b"ssh".to_vec(),
+        ]
+    );
+    assert_eq!(
+        runner.commands[1].argv,
+        [
+            b"/usr/local/bin/configure-developer-home".to_vec(),
+            b"status".to_vec(),
+        ]
+    );
+    assert!(
+        runner
+            .commands
+            .iter()
+            .all(|command| command.environment.is_empty() && !command.has_stdin)
+    );
+    assert!(
+        runner
+            .commands
+            .iter()
+            .all(|command| command.selector == git_selector())
+    );
+    assert_eq!(runner.interactive_calls, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn configure_git_uses_explicit_https_protocol_without_secret_fields() -> TestResult {
+    let mut runner = FakeGuestRunner::with_outputs([
+        guest_output(0, [], []),
+        guest_output(0, configured_status("https"), []),
+    ]);
+    let setup = configure_git(&mut runner, git_selector(), git_request(GitProtocol::Https)).await?;
+    assert_eq!(setup.protocol, GitProtocol::Https);
+    assert_eq!(runner.commands[0].argv.last(), Some(&b"https".to_vec()));
+    let observable = format!("{:?}", runner.commands);
+    assert!(!observable.contains(SENTINEL));
+    assert!(!observable.to_ascii_lowercase().contains("token"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn configure_git_rejects_mismatched_selector_before_guest_mutation() {
+    let mut runner = FakeGuestRunner::default();
+    let mut request = git_request(GitProtocol::Ssh);
+    request.sandbox_id = "other-abcdef012345".to_owned();
+    let result = configure_git(&mut runner, git_selector(), request).await;
+    assert!(matches!(&result, Err(ConfigureError::GuestCommand { .. })));
+    if let Err(error) = &result {
+        assert_error_redacted(error);
+    }
+    assert!(runner.commands.is_empty());
+    assert_eq!(runner.interactive_calls, 0);
+}
+
+#[tokio::test]
+async fn configure_git_rejects_unbounded_malformed_or_inconsistent_status() -> TestResult {
+    let malformed_outputs = [
+        b"not-json\n".to_vec(),
+        vec![b'a'; 64 * 1024 + 1],
+        configured_status("https"),
+        configured_status("SSH"),
+        format!(
+            "{{\"email\":\"ada@example.test\",\"fingerprint\":\"bad\",\"name\":\"Ada Lovelace\",\"protocol\":\"ssh\",\"public_key\":\"{TEST_PUBLIC_KEY}\",\"receipt\":\"pending\"}}"
+        )
+        .into_bytes(),
+        format!(
+            "{{\"email\":\"ada@example.test\",\"fingerprint\":\"{TEST_FINGERPRINT}\",\"name\":\"Ada Lovelace\",\"protocol\":\"ssh\",\"public_key\":\"ssh-rsa AAAA bad\",\"receipt\":\"pending\"}}"
+        )
+        .into_bytes(),
+        format!(
+            "{{\"email\":\"ada@example.test\",\"fingerprint\":\"{TEST_FINGERPRINT}\",\"name\":\"Ada Lovelace\",\"protocol\":\"ssh\",\"public_key\":\"{TEST_PADDED_PUBLIC_KEY}\",\"receipt\":\"pending\"}}"
+        )
+        .into_bytes(),
+        format!(
+            "{{\"email\":\"ada@example.test\",\"fingerprint\":\"{TEST_FINGERPRINT}\",\"name\":\"Ada Lovelace\",\"protocol\":\"ssh\",\"public_key\":\"{TEST_PUBLIC_KEY}\",\"receipt\":\"unknown\"}}"
+        )
+        .into_bytes(),
+        format!(
+            "{{\"email\":\"ada@example.test\",\"fingerprint\":\"{TEST_FINGERPRINT}\",\"name\":\"Ada Lovelace\",\"private_key\":\"{SENTINEL}\",\"protocol\":\"ssh\",\"public_key\":\"{TEST_PUBLIC_KEY}\",\"receipt\":\"pending\"}}"
+        )
+        .into_bytes(),
+    ];
+    for status in malformed_outputs {
+        let mut runner =
+            FakeGuestRunner::with_outputs([guest_output(0, [], []), guest_output(0, status, [])]);
+        let error = configure_git(&mut runner, git_selector(), git_request(GitProtocol::Ssh))
+            .await
+            .err()
+            .ok_or("malformed helper status succeeded")?;
+        assert!(matches!(error, ConfigureError::InvalidOutput { .. }));
+        assert_error_redacted(&error);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn configure_git_maps_guest_failures_to_stable_redacted_errors() -> TestResult {
+    let mut nonzero =
+        FakeGuestRunner::with_outputs([guest_output(97, SENTINEL.as_bytes(), SENTINEL.as_bytes())]);
+    let error = configure_git(&mut nonzero, git_selector(), git_request(GitProtocol::Ssh))
+        .await
+        .err()
+        .ok_or("failing helper succeeded")?;
+    assert!(matches!(error, ConfigureError::GuestCommand { .. }));
+    assert_error_redacted(&error);
+
+    let mut unavailable = FakeGuestRunner::default();
+    unavailable
+        .outputs
+        .push_back(Err(CliError::Runtime(SENTINEL.to_owned())));
+    let error = configure_git(
+        &mut unavailable,
+        git_selector(),
+        git_request(GitProtocol::Ssh),
+    )
+    .await
+    .err()
+    .ok_or("unavailable helper succeeded")?;
+    assert!(matches!(error, ConfigureError::GuestCommand { .. }));
+    assert_error_redacted(&error);
+    Ok(())
+}
+
+#[tokio::test]
+async fn configure_ssh_host_uses_exact_argv_and_rejects_output_or_failure() -> TestResult {
+    let mut runner = FakeGuestRunner::with_outputs([guest_output(0, [], [])]);
+    configure_ssh_host(&mut runner, git_selector(), "git.enterprise.test").await?;
+    assert_eq!(
+        runner.commands[0].argv,
+        [
+            b"/usr/local/bin/configure-developer-home".to_vec(),
+            b"ssh-host".to_vec(),
+            b"--hostname".to_vec(),
+            b"git.enterprise.test".to_vec(),
+        ]
+    );
+    assert!(runner.commands[0].environment.is_empty());
+    assert!(!runner.commands[0].has_stdin);
+
+    for output in [
+        guest_output(0, b"unexpected".to_vec(), []),
+        guest_output(0, [], b"unexpected".to_vec()),
+        guest_output(1, [], SENTINEL.as_bytes()),
+    ] {
+        let mut runner = FakeGuestRunner::with_outputs([output]);
+        let error = configure_ssh_host(&mut runner, git_selector(), "git.enterprise.test")
+            .await
+            .err()
+            .ok_or("invalid ssh-host result succeeded")?;
+        assert_error_redacted(&error);
+    }
     Ok(())
 }

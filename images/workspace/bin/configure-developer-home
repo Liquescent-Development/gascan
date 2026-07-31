@@ -1,0 +1,840 @@
+#!/usr/bin/python3
+"""Configure persistent, non-secret developer state inside a Gas Can workspace."""
+
+import base64
+import binascii
+import fcntl
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import selectors
+import stat
+import subprocess
+import sys
+import time
+
+
+GIT = "/usr/bin/git"
+SSH_KEYGEN = "/usr/bin/ssh-keygen"
+MARKER = b"gascan-workstation-home-v1\n"
+RECEIPT_PREFIX = "gascan-developer-onboarding-v1"
+MAX_FILE_BYTES = 64 * 1024
+MAX_PROCESS_BYTES = 64 * 1024
+PROCESS_TIMEOUT_SECONDS = 15
+LOCK_TIMEOUT_SECONDS = 5
+PRIVATE_KEY = "id_ed25519"
+PUBLIC_KEY = "id_ed25519.pub"
+GIT_CONFIG = "config"
+RECEIPT = "developer-onboarding"
+SSH_CONFIG = "config"
+KEY_STAGE = ".id_ed25519.gascan-stage"
+GIT_CONFIG_STAGE = ".config.gascan-stage"
+RECEIPT_STAGE = ".developer-onboarding.gascan-stage"
+SSH_CONFIG_STAGE = ".config.gascan-stage"
+
+
+class Refusal(Exception):
+    """A fail-closed validation or bounded-operation failure."""
+
+
+def refuse(category):
+    raise Refusal(category)
+
+
+def safe_environment(home):
+    return {
+        "HOME": home,
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+    }
+
+
+def run_bounded(argv, home, pass_fds=()):
+    try:
+        process = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=safe_environment(home),
+            close_fds=True,
+            pass_fds=pass_fds,
+        )
+    except OSError:
+        refuse("required tool unavailable")
+
+    selector = selectors.DefaultSelector()
+    stdout_fd = process.stdout.fileno()
+    stderr_fd = process.stderr.fileno()
+    streams = {stdout_fd: bytearray(), stderr_fd: bytearray()}
+    for stream in (process.stdout, process.stderr):
+        os.set_blocking(stream.fileno(), False)
+        selector.register(stream, selectors.EVENT_READ)
+    deadline = time.monotonic() + PROCESS_TIMEOUT_SECONDS
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                process.wait()
+                refuse("required tool timed out")
+            events = selector.select(remaining)
+            if not events and process.poll() is not None:
+                continue
+            for key, _ in events:
+                try:
+                    chunk = os.read(key.fd, 8192)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                retained = streams[key.fd]
+                retained.extend(chunk)
+                if len(retained) > MAX_PROCESS_BYTES:
+                    process.kill()
+                    process.wait()
+                    refuse("required tool output exceeded limit")
+        return_code = process.wait()
+    finally:
+        selector.close()
+        process.stdout.close()
+        process.stderr.close()
+    return return_code, bytes(streams[stdout_fd]), bytes(streams[stderr_fd])
+
+
+def read_bounded(fd, size):
+    if size > MAX_FILE_BYTES:
+        refuse("managed file exceeds limit")
+    result = bytearray()
+    while True:
+        try:
+            chunk = os.read(fd, min(8192, MAX_FILE_BYTES + 1 - len(result)))
+        except BlockingIOError:
+            refuse("managed path is not a regular file")
+        if not chunk:
+            break
+        result.extend(chunk)
+        if len(result) > MAX_FILE_BYTES:
+            refuse("managed file exceeds limit")
+    return bytes(result)
+
+
+def write_all(fd, contents):
+    position = 0
+    while position < len(contents):
+        written = os.write(fd, contents[position:])
+        if written <= 0:
+            refuse("managed write failed")
+        position += written
+
+
+def decode_ssh_blob(encoded, expected_algorithms):
+    try:
+        blob = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        refuse("invalid SSH public key")
+    if len(blob) < 8 or len(blob) > 16 * 1024:
+        refuse("invalid SSH public key")
+    algorithm_length = int.from_bytes(blob[0:4], "big")
+    if algorithm_length < 1 or algorithm_length > 128:
+        refuse("invalid SSH public key")
+    algorithm_end = 4 + algorithm_length
+    if algorithm_end + 4 > len(blob):
+        refuse("invalid SSH public key")
+    try:
+        algorithm = blob[4:algorithm_end].decode("ascii")
+    except UnicodeDecodeError:
+        refuse("invalid SSH public key")
+    if algorithm not in expected_algorithms:
+        refuse("invalid SSH public key")
+    if algorithm == "ssh-ed25519":
+        key_length = int.from_bytes(blob[algorithm_end : algorithm_end + 4], "big")
+        if key_length != 32 or algorithm_end + 4 + key_length != len(blob):
+            refuse("invalid SSH public key")
+    return algorithm, blob
+
+
+def parse_auth_public_key(contents):
+    if not contents.endswith(b"\n") or contents.count(b"\n") != 1:
+        refuse("invalid SSH public key")
+    try:
+        fields = contents[:-1].decode("ascii").split(" ")
+    except UnicodeDecodeError:
+        refuse("invalid SSH public key")
+    if len(fields) != 3 or not fields[2] or any(not field for field in fields):
+        refuse("invalid SSH public key")
+    algorithm, blob = decode_ssh_blob(fields[1], {"ssh-ed25519"})
+    if algorithm != fields[0] or not fields[2].startswith("gascan-"):
+        refuse("invalid SSH public key")
+    fingerprint = "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode(
+        "ascii"
+    ).rstrip("=")
+    return contents[:-1].decode("ascii"), fields[2], fingerprint
+
+
+def validate_hostname(hostname):
+    if len(hostname) > 253 or len(hostname) < 3 or hostname != hostname.lower():
+        refuse("invalid SSH hostname")
+    if any(ord(character) > 127 for character in hostname):
+        refuse("invalid SSH hostname")
+    labels = hostname.split(".")
+    if len(labels) < 2:
+        refuse("invalid SSH hostname")
+    for label in labels:
+        if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label):
+            refuse("invalid SSH hostname")
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        return
+    refuse("invalid SSH hostname")
+
+
+def validate_sandbox_id(sandbox_id):
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*-[0-9a-f]{12}", sandbox_id):
+        refuse("invalid sandbox ID")
+    slug = sandbox_id[:-13]
+    if not slug or "--" in slug:
+        refuse("invalid sandbox ID")
+
+
+def validate_identity(name, email):
+    for value in (name, email):
+        if not value or len(value.encode("utf-8")) > 512:
+            refuse("invalid Git identity")
+        if any(ord(character) < 32 or ord(character) == 127 for character in value):
+            refuse("invalid Git identity")
+    if "@" not in email or email.startswith("@") or email.endswith("@"):
+        refuse("invalid Git identity")
+
+
+class ManagedHome:
+    def __init__(self):
+        home = os.environ.get("HOME")
+        if (
+            not home
+            or not os.path.isabs(home)
+            or os.path.normpath(home) != home
+            or any(character.isspace() or ord(character) < 32 for character in home)
+        ):
+            refuse("invalid HOME")
+        self.home = home
+        self.managed_uid = os.getuid()
+        self.managed_gid = os.getgid()
+        self.fds = []
+        self.home_fd = self.open_directory_path(home)
+        self.config_fd = self.open_component(self.home_fd, ".config")
+        self.gascan_fd = self.open_component(self.config_fd, "gascan")
+        self.git_fd = self.open_component(self.gascan_fd, "git")
+        self.validate_managed_directory(self.git_fd)
+        self.acquire_operation_lock()
+        self.ssh_fd = self.open_component(self.git_fd, "ssh")
+        self.validate_managed_directory(self.ssh_fd)
+        self.git_path = os.path.join(home, ".config", "gascan", "git")
+        self.ssh_path = os.path.join(self.git_path, "ssh")
+
+    def close(self):
+        while self.fds:
+            os.close(self.fds.pop())
+
+    def open_directory_path(self, path):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError:
+            refuse("managed directory is unavailable")
+        metadata = os.fstat(fd)
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != self.managed_uid:
+            os.close(fd)
+            refuse("unsafe managed directory")
+        self.fds.append(fd)
+        return fd
+
+    def acquire_operation_lock(self):
+        deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(self.git_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    refuse("another developer-home operation is still running")
+                time.sleep(0.01)
+            except OSError:
+                refuse("developer-home operation lock is unavailable")
+
+    def open_component(self, parent_fd, name):
+        try:
+            fd = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=parent_fd,
+            )
+        except OSError:
+            refuse("managed directory is unavailable")
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            os.close(fd)
+            refuse("unsafe managed directory")
+        self.fds.append(fd)
+        return fd
+
+    def open_regular(self, directory_fd, name, mode):
+        try:
+            fd = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                dir_fd=directory_fd,
+            )
+        except FileNotFoundError:
+            return None
+        except OSError:
+            refuse("unsafe managed file")
+        metadata = os.fstat(fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != self.managed_uid
+            or metadata.st_gid != self.managed_gid
+            or stat.S_IMODE(metadata.st_mode) != mode
+            or metadata.st_nlink != 1
+        ):
+            os.close(fd)
+            refuse("unsafe managed file")
+        return fd
+
+    def read_regular(self, directory_fd, name, mode):
+        fd = self.open_regular(directory_fd, name, mode)
+        if fd is None:
+            return None
+        try:
+            metadata = os.fstat(fd)
+            return read_bounded(fd, metadata.st_size)
+        finally:
+            os.close(fd)
+
+    def validate_managed_directory(self, directory_fd):
+        metadata = os.fstat(directory_fd)
+        if (
+            metadata.st_uid != self.managed_uid
+            or metadata.st_gid != self.managed_gid
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            refuse("unsafe managed directory")
+        marker = self.read_regular(directory_fd, ".gascan-managed", 0o600)
+        if marker != MARKER:
+            refuse("invalid managed directory marker")
+
+    def any_path(self, directory_fd, name):
+        try:
+            os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError:
+            refuse("unsafe staging path")
+
+    def validate_stages_absent(self):
+        for name in [
+            GIT_CONFIG_STAGE,
+            GIT_CONFIG_STAGE + ".lock",
+            RECEIPT_STAGE,
+        ]:
+            if self.any_path(self.git_fd, name):
+                refuse("staging path already exists")
+        for name in [
+            KEY_STAGE,
+            KEY_STAGE + ".pub",
+            SSH_CONFIG_STAGE,
+        ]:
+            if self.any_path(self.ssh_fd, name):
+                refuse("staging path already exists")
+
+    def validate_private_key(self, directory_fd, name, public_text):
+        fd = self.open_regular(directory_fd, name, 0o600)
+        if fd is None:
+            refuse("partial SSH key pair")
+        try:
+            if os.fstat(fd).st_size > MAX_FILE_BYTES:
+                refuse("managed file exceeds limit")
+            descriptor_path = f"/dev/fd/{fd}"
+            status, stdout, _ = run_bounded(
+                [SSH_KEYGEN, "-y", "-P", "", "-f", descriptor_path],
+                self.home,
+                pass_fds=(fd,),
+            )
+        finally:
+            os.close(fd)
+        if status != 0:
+            refuse("invalid passwordless private key")
+        derived = stdout.rstrip(b"\r\n").split()
+        actual = public_text.encode("ascii").split(b" ")
+        if len(derived) not in (2, 3) or derived[:2] != actual[:2]:
+            refuse("SSH key pair does not match")
+
+    def parse_git_config(self, name):
+        fd = self.open_regular(self.git_fd, name, 0o600)
+        if fd is None:
+            return None
+        try:
+            metadata = os.fstat(fd)
+            contents = read_bounded(fd, metadata.st_size)
+            try:
+                marker, _ = contents.split(b"\n", 1)
+            except ValueError:
+                refuse("invalid managed Git config")
+            if marker == b"# gascan-protocol ssh":
+                protocol = "ssh"
+            elif marker == b"# gascan-protocol https":
+                protocol = "https"
+            else:
+                refuse("invalid managed Git protocol")
+            os.lseek(fd, 0, os.SEEK_SET)
+            status, stdout, _ = run_bounded(
+                [GIT, "config", "--null", "--file", f"/dev/fd/{fd}", "--list"],
+                self.home,
+                pass_fds=(fd,),
+            )
+        finally:
+            os.close(fd)
+        if status != 0 or not stdout.endswith(b"\0"):
+            refuse("invalid managed Git config")
+        values = {}
+        try:
+            entries = stdout[:-1].split(b"\0")
+            for entry in entries:
+                key, value = entry.split(b"\n", 1)
+                key = key.decode("ascii")
+                value = value.decode("utf-8")
+                if key in values:
+                    refuse("duplicate managed Git config key")
+                values[key] = value
+        except (ValueError, UnicodeDecodeError):
+            refuse("invalid managed Git config")
+        expected = {
+            "user.name",
+            "user.email",
+            "gpg.format",
+            "user.signingkey",
+            "commit.gpgsign",
+            "tag.gpgsign",
+        }
+        if set(values) != expected:
+            refuse("unexpected managed Git config key")
+        validate_identity(values["user.name"], values["user.email"])
+        if (
+            values["gpg.format"] != "ssh"
+            or values["user.signingkey"]
+            != os.path.join(self.ssh_path, PUBLIC_KEY)
+            or values["commit.gpgsign"] != "true"
+            or values["tag.gpgsign"] != "true"
+        ):
+            refuse("invalid managed Git config value")
+        return values, protocol
+
+    def render_ssh_config(self, hostnames):
+        identity = os.path.join(self.ssh_path, PRIVATE_KEY)
+        stanzas = []
+        for hostname in sorted(hostnames):
+            stanzas.append(
+                f"Host {hostname}\n"
+                f"    HostName {hostname}\n"
+                f"    IdentityFile {identity}\n"
+                "    IdentitiesOnly yes\n"
+            )
+        return "\n".join(stanzas).encode("ascii")
+
+    def parse_ssh_config(self):
+        contents = self.read_regular(self.ssh_fd, SSH_CONFIG, 0o600)
+        if contents is None:
+            return None
+        try:
+            text = contents.decode("ascii")
+        except UnicodeDecodeError:
+            refuse("invalid managed SSH config")
+        if not text.endswith("\n"):
+            refuse("invalid managed SSH config")
+        identity = os.path.join(self.ssh_path, PRIVATE_KEY)
+        hostnames = set()
+        for stanza in text[:-1].split("\n\n"):
+            lines = stanza.split("\n")
+            if len(lines) != 4 or not lines[0].startswith("Host "):
+                refuse("invalid managed SSH config")
+            hostname = lines[0][len("Host ") :]
+            validate_hostname(hostname)
+            if hostname in hostnames or lines != [
+                f"Host {hostname}",
+                f"    HostName {hostname}",
+                f"    IdentityFile {identity}",
+                "    IdentitiesOnly yes",
+            ]:
+                refuse("invalid managed SSH config")
+            hostnames.add(hostname)
+        if contents != self.render_ssh_config(hostnames):
+            refuse("invalid managed SSH config")
+        return hostnames
+
+    def validate_state(self):
+        self.validate_stages_absent()
+
+        private_exists = self.any_path(self.ssh_fd, PRIVATE_KEY)
+        public_contents = self.read_regular(self.ssh_fd, PUBLIC_KEY, 0o644)
+        public_exists = public_contents is not None
+        public_key = None
+        key_comment = None
+        fingerprint = None
+        if private_exists != public_exists:
+            refuse("partial SSH key pair")
+        if private_exists:
+            private_probe = self.open_regular(self.ssh_fd, PRIVATE_KEY, 0o600)
+            if private_probe is None:
+                refuse("partial SSH key pair")
+            os.close(private_probe)
+            public_key, key_comment, fingerprint = parse_auth_public_key(public_contents)
+            self.validate_private_key(self.ssh_fd, PRIVATE_KEY, public_key)
+
+        parsed_git = self.parse_git_config(GIT_CONFIG)
+        git_config = None
+        protocol = None
+        if parsed_git is not None:
+            git_config, protocol = parsed_git
+            if public_key is None:
+                refuse("managed Git config has no signing key")
+
+        receipt_contents = self.read_regular(self.git_fd, RECEIPT, 0o600)
+        receipt = "pending"
+        if receipt_contents is not None:
+            if receipt_contents == (RECEIPT_PREFIX + " complete\n").encode("ascii"):
+                receipt = "complete"
+            elif receipt_contents == (RECEIPT_PREFIX + " declined\n").encode("ascii"):
+                receipt = "declined"
+            else:
+                refuse("invalid onboarding receipt")
+
+        ssh_hosts = self.parse_ssh_config()
+
+        return {
+            "git": git_config,
+            "protocol": protocol,
+            "public_key": public_key,
+            "key_comment": key_comment,
+            "fingerprint": fingerprint,
+            "receipt": receipt,
+            "ssh_hosts": ssh_hosts,
+        }
+
+    def publish_bytes(self, directory_fd, stage, destination, mode, contents):
+        try:
+            fd = os.open(
+                stage,
+                os.O_RDWR
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_NOFOLLOW
+                | os.O_CLOEXEC,
+                mode,
+                dir_fd=directory_fd,
+            )
+        except OSError:
+            refuse("could not create exclusive staging file")
+        try:
+            os.fchmod(fd, mode)
+            write_all(fd, contents)
+            os.fsync(fd)
+            metadata = os.fstat(fd)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != self.managed_uid
+                or metadata.st_gid != self.managed_gid
+                or stat.S_IMODE(metadata.st_mode) != mode
+                or metadata.st_nlink != 1
+            ):
+                refuse("staged file validation failed")
+            os.lseek(fd, 0, os.SEEK_SET)
+            if read_bounded(fd, metadata.st_size) != contents:
+                refuse("staged file validation failed")
+            named = os.stat(stage, dir_fd=directory_fd, follow_symlinks=False)
+            if named.st_dev != metadata.st_dev or named.st_ino != metadata.st_ino:
+                refuse("staging file changed during publication")
+            os.replace(
+                stage,
+                destination,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            os.fsync(directory_fd)
+        except OSError:
+            refuse("atomic publication failed")
+        finally:
+            os.close(fd)
+
+    def run_in_directory(self, directory_fd, argv):
+        try:
+            previous = os.open(
+                ".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            )
+        except OSError:
+            refuse("working directory is unavailable")
+        try:
+            os.fchdir(directory_fd)
+            return run_bounded(argv, self.home)
+        except OSError:
+            refuse("managed directory became unavailable")
+        finally:
+            try:
+                os.fchdir(previous)
+            finally:
+                os.close(previous)
+
+    def generate_key(self, sandbox_id):
+        try:
+            os.mkdir(KEY_STAGE, 0o700, dir_fd=self.ssh_fd)
+        except OSError:
+            refuse("could not reserve SSH key staging directory")
+        try:
+            stage_fd = os.open(
+                KEY_STAGE,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=self.ssh_fd,
+            )
+        except OSError:
+            refuse("could not open SSH key staging directory")
+        try:
+            stage_metadata = os.fstat(stage_fd)
+            if (
+                stage_metadata.st_uid != self.managed_uid
+                or stage_metadata.st_gid != self.managed_gid
+                or stat.S_IMODE(stage_metadata.st_mode) != 0o700
+            ):
+                refuse("unsafe SSH key staging directory")
+            status, stdout, stderr = self.run_in_directory(
+                stage_fd,
+                [
+                    SSH_KEYGEN,
+                    "-q",
+                    "-t",
+                    "ed25519",
+                    "-N",
+                    "",
+                    "-C",
+                    f"gascan-{sandbox_id}",
+                    "-f",
+                    PRIVATE_KEY,
+                ],
+            )
+            if status != 0 or stdout or stderr:
+                refuse("SSH key generation failed")
+            private_fd = self.open_regular(stage_fd, PRIVATE_KEY, 0o600)
+            if private_fd is None:
+                refuse("SSH key generation was incomplete")
+            try:
+                os.fsync(private_fd)
+            finally:
+                os.close(private_fd)
+            public_contents = self.read_regular(stage_fd, PUBLIC_KEY, 0o644)
+            if public_contents is None:
+                refuse("SSH key generation was incomplete")
+            public_key, comment, _ = parse_auth_public_key(public_contents)
+            if comment != f"gascan-{sandbox_id}":
+                refuse("generated SSH key has wrong scope")
+            self.validate_private_key(stage_fd, PRIVATE_KEY, public_key)
+            public_fd = self.open_regular(stage_fd, PUBLIC_KEY, 0o644)
+            try:
+                os.fsync(public_fd)
+            finally:
+                os.close(public_fd)
+            os.fsync(stage_fd)
+            os.replace(
+                PUBLIC_KEY,
+                PUBLIC_KEY,
+                src_dir_fd=stage_fd,
+                dst_dir_fd=self.ssh_fd,
+            )
+            os.replace(
+                PRIVATE_KEY,
+                PRIVATE_KEY,
+                src_dir_fd=stage_fd,
+                dst_dir_fd=self.ssh_fd,
+            )
+            os.fsync(self.ssh_fd)
+            current_stage = os.stat(
+                KEY_STAGE, dir_fd=self.ssh_fd, follow_symlinks=False
+            )
+            if (
+                current_stage.st_dev != stage_metadata.st_dev
+                or current_stage.st_ino != stage_metadata.st_ino
+            ):
+                refuse("SSH key staging directory changed during generation")
+            os.rmdir(KEY_STAGE, dir_fd=self.ssh_fd)
+            os.fsync(self.ssh_fd)
+        except OSError:
+            refuse("SSH key publication failed")
+        finally:
+            os.close(stage_fd)
+
+    def write_git_config(self, name, email, protocol):
+        try:
+            stage_fd = os.open(
+                GIT_CONFIG_STAGE,
+                os.O_RDWR
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_NOFOLLOW
+                | os.O_CLOEXEC,
+                0o600,
+                dir_fd=self.git_fd,
+            )
+        except OSError:
+            refuse("could not create Git config staging file")
+        try:
+            os.fchmod(stage_fd, 0o600)
+            write_all(stage_fd, f"# gascan-protocol {protocol}\n".encode("ascii"))
+            os.fsync(stage_fd)
+        finally:
+            os.close(stage_fd)
+        values = [
+            ("user.name", name),
+            ("user.email", email),
+            ("gpg.format", "ssh"),
+            ("user.signingkey", os.path.join(self.ssh_path, PUBLIC_KEY)),
+            ("commit.gpgsign", "true"),
+            ("tag.gpgsign", "true"),
+        ]
+        for key, value in values:
+            status, stdout, stderr = self.run_in_directory(
+                self.git_fd,
+                [GIT, "config", "--file", GIT_CONFIG_STAGE, key, value],
+            )
+            if status != 0 or stdout or stderr:
+                refuse("Git config generation failed")
+        staged = self.parse_git_config(GIT_CONFIG_STAGE)
+        if (
+            staged is None
+            or staged[0]["user.name"] != name
+            or staged[0]["user.email"] != email
+            or staged[1] != protocol
+        ):
+            refuse("staged Git config validation failed")
+        stage_fd = self.open_regular(self.git_fd, GIT_CONFIG_STAGE, 0o600)
+        try:
+            os.fsync(stage_fd)
+        finally:
+            os.close(stage_fd)
+        self.publish_existing(self.git_fd, GIT_CONFIG_STAGE, GIT_CONFIG)
+
+    def publish_existing(self, directory_fd, stage, destination):
+        try:
+            os.replace(
+                stage,
+                destination,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            os.fsync(directory_fd)
+        except OSError:
+            refuse("atomic publication failed")
+
+    def add_ssh_host(self, state, hostname):
+        if state["public_key"] is None or state["git"] is None:
+            refuse("Git signing key is not configured")
+        if state["protocol"] != "ssh":
+            refuse("SSH host setup requires SSH Git protocol")
+        hostnames = set(state["ssh_hosts"] or set())
+        if hostname in hostnames:
+            return
+        hostnames.add(hostname)
+        self.publish_bytes(
+            self.ssh_fd,
+            SSH_CONFIG_STAGE,
+            SSH_CONFIG,
+            0o600,
+            self.render_ssh_config(hostnames),
+        )
+
+
+def status_output(state):
+    git_config = state["git"]
+    payload = {
+        "email": None if git_config is None else git_config["user.email"],
+        "fingerprint": state["fingerprint"],
+        "name": None if git_config is None else git_config["user.name"],
+        "protocol": state["protocol"],
+        "public_key": state["public_key"],
+        "receipt": state["receipt"],
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+    if len(encoded.encode("utf-8")) > MAX_FILE_BYTES:
+        refuse("status output exceeded limit")
+    sys.stdout.write(encoded)
+
+
+def parse_command(arguments):
+    if arguments == ["status"]:
+        return ("status",)
+    if len(arguments) == 9 and arguments[0] == "git" and arguments[1::2] == [
+        "--sandbox-id",
+        "--name",
+        "--email",
+        "--protocol",
+    ]:
+        sandbox_id, name, email, protocol = arguments[2::2]
+        validate_sandbox_id(sandbox_id)
+        validate_identity(name, email)
+        if protocol not in ("ssh", "https"):
+            refuse("invalid Git protocol")
+        return ("git", sandbox_id, name, email, protocol)
+    if len(arguments) == 3 and arguments[:2] == ["ssh-host", "--hostname"]:
+        validate_hostname(arguments[2])
+        return ("ssh-host", arguments[2])
+    if len(arguments) == 2 and arguments[0] == "receipt" and arguments[1] in (
+        "status",
+        "complete",
+        "decline",
+    ):
+        return ("receipt", arguments[1])
+    refuse("invalid arguments")
+
+
+def main(arguments):
+    command = parse_command(arguments)
+    managed = ManagedHome()
+    try:
+        state = managed.validate_state()
+        if command[0] == "status":
+            status_output(state)
+        elif command[0] == "git":
+            _, sandbox_id, name, email, protocol = command
+            if state["public_key"] is None:
+                managed.generate_key(sandbox_id)
+            elif state["key_comment"] != f"gascan-{sandbox_id}":
+                refuse("existing SSH key belongs to another sandbox")
+            managed.write_git_config(name, email, protocol)
+        elif command[0] == "ssh-host":
+            managed.add_ssh_host(state, command[1])
+        else:
+            operation = command[1]
+            if operation == "status":
+                sys.stdout.write(state["receipt"] + "\n")
+            else:
+                receipt_state = "complete" if operation == "complete" else "declined"
+                managed.publish_bytes(
+                    managed.git_fd,
+                    RECEIPT_STAGE,
+                    RECEIPT,
+                    0o600,
+                    f"{RECEIPT_PREFIX} {receipt_state}\n".encode("ascii"),
+                )
+    finally:
+        managed.close()
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except Refusal as error:
+        print(f"configure-developer-home: {error}", file=sys.stderr)
+        sys.exit(1)
+    except Exception:
+        print("configure-developer-home: managed operation failed", file=sys.stderr)
+        sys.exit(1)

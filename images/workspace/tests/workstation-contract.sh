@@ -148,6 +148,12 @@ test "$(stat -c %U:%G:%a /home/workspace/.config)" = root:workspace:1770 ||
     die 'workspace managed configuration boundary metadata changed'
 test "$GIT_CONFIG_GLOBAL" = /home/workspace/.config/gascan/git/config ||
     die 'global Git config differs from persistent workspace policy'
+test "$(stat -c %U:%G:%a /usr/local/bin/configure-developer-home)" = root:root:555 ||
+    die 'developer-home helper metadata changed'
+developer_status=$(/usr/local/bin/configure-developer-home status) ||
+    die 'developer-home helper rejected the clean persistent home'
+test "$developer_status" = '{"email":null,"fingerprint":null,"name":null,"protocol":null,"public_key":null,"receipt":"pending"}' ||
+    die 'developer-home helper clean status changed'
 for directory in \
     /home/workspace/.config/gascan/git \
     /home/workspace/.config/gascan/git/ssh

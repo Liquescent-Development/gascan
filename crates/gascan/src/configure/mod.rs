@@ -1,6 +1,8 @@
+mod git;
 mod host;
 mod prompt;
 
+pub(crate) use git::{GitProtocol, GitRequest, GitSetup, configure_git, configure_ssh_host};
 pub(crate) use host::SystemHostDiscovery;
 pub(crate) use prompt::TerminalPrompter;
 
