@@ -82,6 +82,24 @@ export GASCAN_APPLE_ATTACH_HELPER=$trusted_helper
 session_root=$(mktemp -d "$cleanup_root/session-XXXXXXXXXXXX")
 chmod 700 "$session_root"
 export GASCAN_E2E_SESSION_ROOT=$session_root
+prepare_scoped_session_root() {
+  if ! test -e "$session_root" && ! test -L "$session_root"; then
+    mkdir -m 700 "$session_root"
+  fi
+  test -d "$session_root" && test ! -L "$session_root" || {
+    printf 'apple e2e: scoped session root is unsafe: %s\n' "$session_root" >&2
+    return 1
+  }
+  if metadata=$(stat -f '%Lp %u' "$session_root" 2>/dev/null); then
+    :
+  else
+    metadata=$(stat -c '%a %u' "$session_root")
+  fi
+  test "$metadata" = "700 $(id -u)" || {
+    printf 'apple e2e: scoped session root metadata changed: %s\n' "$session_root" >&2
+    return 1
+  }
+}
 manifest=
 cleanup_scoped() {
   result=0
@@ -134,6 +152,7 @@ esac
 
 accepted_candidate=false
 for test_name in $tests; do
+  prepare_scoped_session_root
   manifest="$cleanup_root/$test_name-$$.json"
   export GASCAN_E2E_CLEANUP_MANIFEST=$manifest
   cargo test -p gascan-e2e --test "$test_name" -- --ignored --test-threads=1 --nocapture

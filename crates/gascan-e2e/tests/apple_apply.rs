@@ -39,6 +39,8 @@ printf 'STARSHIP_FUNCTION=%s\n' "$(type -t starship_precmd || true)"
 printf 'GASCAN_PROMPT_IDENTITY_END\n'
 "#;
 
+const NATIVE_AUTH_SENTINEL: &str = "gascan-live-native-auth-sentinel";
+
 #[test]
 #[ignore = "requires supported Apple runtime, candidate and predecessor workspace images, network access, and OpenSSH"]
 fn native_ssh_is_loopback_only_durable_reconciled_and_cleaned() -> TestResult {
@@ -814,6 +816,195 @@ fn validate_owned_publication_file(path: &std::path::Path) -> TestResult {
         return Err(format!(
             "refusing unsafe managed SSH publication: {}",
             path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[derive(Debug, Eq, PartialEq, serde::Deserialize)]
+struct DeveloperConfigurationSnapshot {
+    auth_config_mode: String,
+    auth_config_sha256: String,
+    private_key_mode: String,
+    private_key_sha256: String,
+    status: serde_json::Value,
+}
+
+#[test]
+#[ignore = "requires supported Apple runtime, candidate and predecessor workspace images, network access, and OpenSSH"]
+fn developer_configuration_persists_across_restart_and_image_replacement() -> TestResult {
+    let predecessor = std::env::var("GASCAN_E2E_PREDECESSOR_IMAGE")
+        .map_err(|_| "GASCAN_E2E_PREDECESSOR_IMAGE must name the compatible predecessor fixture")?;
+    let approved = apple_common::approved_workspace_image()?;
+    apple_common::validate_distinct_image_fixtures(&predecessor, &approved)?;
+
+    let env = AppleE2e::new_networked("developer-persistence")?;
+    install_shell_prompt_probe(&env)?;
+    env.write_manifest(
+        "version = 1\nname = 'developer-persistence'\nnetwork = 'networked'\n\
+         [shell]\nprompt = 'starship'\n",
+    )?;
+    let root = std::path::Path::new(env.root());
+    env.success_with_timeout(
+        ["up", root.to_str().ok_or("non-UTF-8 root")?],
+        std::time::Duration::from_secs(10 * 60),
+    )?;
+
+    let configured = env.success([
+        "--sandbox",
+        env.id(),
+        "run",
+        "--",
+        "sh",
+        "-c",
+        &format!(
+            "set -eu; \
+             /usr/local/bin/configure-developer-home git \
+               --sandbox-id {} --name 'Ada Lovelace' \
+               --email ada@example.test --protocol ssh; \
+             /usr/local/bin/configure-developer-home receipt complete; \
+             umask 077; \
+             mkdir -p \"$GH_CONFIG_DIR\"; \
+             printf '%s\\n' \
+               'github.com:' \
+               '    user: gascan-live' \
+               '    oauth_token: {}' \
+               '    git_protocol: ssh' \
+               >\"$GH_CONFIG_DIR/hosts.yml\"; \
+             chmod 600 \"$GH_CONFIG_DIR/hosts.yml\"",
+            shell_quote(env.id()),
+            NATIVE_AUTH_SENTINEL,
+        ),
+    ])?;
+    assert_secret_free_output(&configured.stdout, &configured.stderr)?;
+
+    let initial = developer_configuration_snapshot(&env)?;
+    assert_developer_configuration(&initial)?;
+
+    env.success(["--sandbox", env.id(), "down"])?;
+    std::thread::sleep(std::time::Duration::from_secs(6));
+    env.success(["up", root.to_str().ok_or("non-UTF-8 root")?])?;
+    let restarted = developer_configuration_snapshot(&env)?;
+    assert_eq!(restarted, initial);
+
+    env.replace_owned_container_image(&predecessor, std::time::Duration::from_secs(10 * 60))?;
+    env.seed_stored_image_resolution(&predecessor)?;
+    let apply = env.success_with_timeout(
+        [
+            "--sandbox",
+            env.id(),
+            "apply",
+            root.to_str().ok_or("non-UTF-8 root")?,
+            "--json",
+        ],
+        std::time::Duration::from_secs(10 * 60),
+    )?;
+    assert_json_phase(&apply.stdout, "image_replaced")?;
+    assert_secret_free_output(&apply.stdout, &apply.stderr)?;
+
+    let replaced = developer_configuration_snapshot(&env)?;
+    assert_eq!(replaced, initial);
+    assert_nested_shell_prompt_identity(&env, "starship")?;
+
+    env.success(["--sandbox", env.id(), "destroy", "--yes"])?;
+    env.assert_no_owned_resources()
+}
+
+fn developer_configuration_snapshot(env: &AppleE2e) -> TestResult<DeveloperConfigurationSnapshot> {
+    let output = env.success([
+        "--sandbox",
+        env.id(),
+        "run",
+        "--",
+        "sh",
+        "-c",
+        r#"set -eu; \
+         status=$(/usr/local/bin/configure-developer-home status); \
+         private_key=/home/workspace/.config/gascan/git/ssh/id_ed25519; \
+         auth_config=${GH_CONFIG_DIR:?}/hosts.yml; \
+         printf '{"status":%s,"private_key_sha256":"%s","private_key_mode":"%s","auth_config_sha256":"%s","auth_config_mode":"%s"}\n' \
+           "$status" \
+           "$(sha256sum "$private_key" | cut -d ' ' -f 1)" \
+           "$(stat -c %a "$private_key")" \
+           "$(sha256sum "$auth_config" | cut -d ' ' -f 1)" \
+           "$(stat -c %a "$auth_config")""#,
+    ])?;
+    assert_secret_free_output(&output.stdout, &output.stderr)?;
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+fn assert_developer_configuration(snapshot: &DeveloperConfigurationSnapshot) -> TestResult {
+    if snapshot.private_key_mode != "600" || snapshot.auth_config_mode != "600" {
+        return Err(format!("developer credential modes changed: {snapshot:?}").into());
+    }
+    if snapshot.private_key_sha256.len() != 64 || snapshot.auth_config_sha256.len() != 64 {
+        return Err("developer credential hashes are malformed".into());
+    }
+    let expected = serde_json::json!({
+        "email": "ada@example.test",
+        "fingerprint": snapshot.status["fingerprint"].clone(),
+        "name": "Ada Lovelace",
+        "protocol": "ssh",
+        "public_key": snapshot.status["public_key"].clone(),
+        "receipt": "complete",
+    });
+    if snapshot.status != expected
+        || snapshot.status["fingerprint"].as_str().is_none()
+        || snapshot.status["public_key"].as_str().is_none()
+    {
+        return Err(format!(
+            "developer configuration status changed: {:?}",
+            snapshot.status
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn assert_secret_free_output(stdout: &[u8], stderr: &[u8]) -> TestResult {
+    for output in [stdout, stderr] {
+        if output
+            .windows(b"OPENSSH PRIVATE KEY".len())
+            .any(|window| window == b"OPENSSH PRIVATE KEY")
+            || output
+                .windows(NATIVE_AUTH_SENTINEL.len())
+                .any(|window| window == NATIVE_AUTH_SENTINEL.as_bytes())
+        {
+            return Err("developer credential material appeared in command output".into());
+        }
+    }
+    Ok(())
+}
+
+fn assert_nested_shell_prompt_identity(env: &AppleE2e, selector: &str) -> TestResult {
+    let output = env.run_default_shell_pty_script(
+        "/bin/bash --login -i /workspace/.gascan/shell-prompt-probe.sh\nexit 0\n",
+        b"GASCAN_PROMPT_IDENTITY_END",
+        "gascan-apple-e2e-term",
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "nested Bash prompt probe failed with {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+        )
+        .into());
+    }
+    let combined = [output.stdout.as_slice(), output.stderr.as_slice()].concat();
+    let rendered = String::from_utf8_lossy(&combined);
+    if rendered.to_ascii_lowercase().contains("warning") {
+        return Err(format!("nested Bash emitted a warning: {rendered}").into());
+    }
+    let identity = marker_payload(
+        &output.stdout,
+        "GASCAN_PROMPT_IDENTITY_BEGIN",
+        "GASCAN_PROMPT_IDENTITY_END",
+    )?;
+    let expected = expected_prompt_identity(selector);
+    if identity != expected {
+        return Err(format!(
+            "nested Bash prompt identity differs: expected={expected:?} actual={identity:?}"
         )
         .into());
     }
