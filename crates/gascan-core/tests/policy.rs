@@ -137,6 +137,25 @@ fn host_environment_has_a_fixed_allowlist() {
 }
 
 #[test]
+fn host_environment_allows_only_non_secret_forge_process_controls() {
+    let environment = filtered_host_environment([
+        ("GH_NO_UPDATE_NOTIFIER", "1"),
+        ("GLAB_CHECK_UPDATE", "0"),
+        ("NO_COLOR", "1"),
+        ("GH_TOKEN", "github-secret"),
+        ("GITHUB_TOKEN", "github-secret"),
+        ("GLAB_TOKEN", "gitlab-secret"),
+        ("GITLAB_TOKEN", "gitlab-secret"),
+    ]);
+
+    assert_eq!(
+        environment.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["GH_NO_UPDATE_NOTIFIER", "GLAB_CHECK_UPDATE", "NO_COLOR"]
+    );
+    assert!(!environment.values().any(|value| value.contains("secret")));
+}
+
+#[test]
 fn ssh_control_plane_appends_one_loopback_native_port_after_application_ports() {
     let private_key = "-----BEGIN OPENSSH PRIVATE KEY-----";
     let (_temp, spec) = spec("version = 1\nnetwork = 'networked'\n[ports]\nweb = 3000\n");

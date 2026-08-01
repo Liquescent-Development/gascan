@@ -155,6 +155,8 @@ func validateEnvironment(_ environment: [EnvironmentVariable]) throws {
         let name = variable.name
         let allowed =
             name == "TERM" || name == "COLORTERM" || name == "LANG"
+            || name == "GH_NO_UPDATE_NOTIFIER" || name == "GLAB_CHECK_UPDATE"
+            || name == "NO_COLOR"
             || (name.hasPrefix("LC_") && name.count > 3)
         guard allowed,
             !name.contains("="),

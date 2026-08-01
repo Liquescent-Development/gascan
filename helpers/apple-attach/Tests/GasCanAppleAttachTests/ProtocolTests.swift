@@ -28,6 +28,10 @@ import Testing
 @Test func malformedStartEnvironmentIsRejected() throws {
     let invalidFrames = [
         #"{"version":2,"type":"start","container":"id","argv":["true"],"tty":false,"environment":[{"name":"PATH","value":"/host/bin"}]}"#,
+        #"{"version":2,"type":"start","container":"id","argv":["true"],"tty":false,"environment":[{"name":"GH_TOKEN","value":"secret"}]}"#,
+        #"{"version":2,"type":"start","container":"id","argv":["true"],"tty":false,"environment":[{"name":"GITHUB_TOKEN","value":"secret"}]}"#,
+        #"{"version":2,"type":"start","container":"id","argv":["true"],"tty":false,"environment":[{"name":"GLAB_TOKEN","value":"secret"}]}"#,
+        #"{"version":2,"type":"start","container":"id","argv":["true"],"tty":false,"environment":[{"name":"GITLAB_TOKEN","value":"secret"}]}"#,
         #"{"version":2,"type":"start","container":"id","argv":["true"],"tty":false,"environment":[{"name":"LC_","value":"C"}]}"#,
         #"{"version":2,"type":"start","container":"id","argv":["true"],"tty":false,"environment":[{"name":"LC_\u0080","value":"C"}]}"#,
         #"{"version":2,"type":"start","container":"id","argv":["true"],"tty":false,"environment":[{"name":"LANG","value":"C\u0000UTF-8"}]}"#,
@@ -60,6 +64,9 @@ import Testing
     let requested = [
         EnvironmentVariable(name: "LANG", value: "C.UTF-8"),
         EnvironmentVariable(name: "TERM", value: "xterm-256color"),
+        EnvironmentVariable(name: "GH_NO_UPDATE_NOTIFIER", value: "1"),
+        EnvironmentVariable(name: "GLAB_CHECK_UPDATE", value: "0"),
+        EnvironmentVariable(name: "NO_COLOR", value: "1"),
     ]
 
     #expect(
@@ -69,6 +76,9 @@ import Testing
             "TOOL_CONFIG=a=b",
             "LANG=C.UTF-8",
             "TERM=xterm-256color",
+            "GH_NO_UPDATE_NOTIFIER=1",
+            "GLAB_CHECK_UPDATE=0",
+            "NO_COLOR=1",
         ])
 }
 

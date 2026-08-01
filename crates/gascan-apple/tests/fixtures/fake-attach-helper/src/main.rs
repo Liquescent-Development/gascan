@@ -22,7 +22,7 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
     if start.contains("apple-attach-environment") {
-        if start.contains(r#""environment":[{"name":"LANG","value":"C.UTF-8"},{"name":"TERM","value":"xterm-256color"}]"#) {
+        if start.contains(r#""environment":[{"name":"GH_NO_UPDATE_NOTIFIER","value":"1"},{"name":"GLAB_CHECK_UPDATE","value":"0"},{"name":"LANG","value":"C.UTF-8"},{"name":"NO_COLOR","value":"1"},{"name":"TERM","value":"xterm-256color"}]"#) {
             output(r#"{"version":2,"type":"exit","code":42}"#)?;
         } else {
             output(r#"{"version":2,"type":"error","code":"protocol","message":"missing environment"}"#)?;

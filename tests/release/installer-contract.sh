@@ -45,6 +45,7 @@ write_fake sudo 'printf "sudo:%s\\n" "$*" >>"$FIXTURE_LOG"'
 write_fake realpath 'printf "%s\\n" "$1"'
 write_fake ps '
 pid=$2; /bin/kill -0 "$pid" 2>/dev/null || exit 1
+printf "ps-env:%s:%s:%s\n" "${LC_ALL:-}" "${LANG:-}" "${TZ:-}" >>"$FIXTURE_LOG"
 case "$4" in command=) echo "$FIXTURE_OBSERVED_EXECUTABLE";; lstart=) echo " $FIXTURE_OBSERVED_START ";; *) exit 64;; esac'
 write_fake gascan '
 printf "gascan:%s\\n" "$*" >>"$FIXTURE_LOG"
@@ -93,6 +94,7 @@ export FIXTURE_VERSION_JSON=$good_version FIXTURE_STATUS_JSON=$good_status
 grep -qx "sudo:installer -pkg $fixture/test.pkg -target /" "$log"
 
 : >"$log"; sleep 1000 & daemon_pid=$!; export FIXTURE_DAEMON_PID=$daemon_pid FIXTURE_SANDBOX_JSON='[]'
+export LC_ALL=C LANG=C TZ=America/Phoenix
 for condition in attested-start observed-start executable empty-token; do
   export FIXTURE_ATTESTED_START=START FIXTURE_OBSERVED_START=START FIXTURE_ATTESTED_EXECUTABLE=/usr/local/bin/gascand FIXTURE_ATTESTED_TOKEN=TOKEN
   case $condition in
@@ -109,6 +111,10 @@ export FIXTURE_ATTESTED_START=START FIXTURE_OBSERVED_START=START FIXTURE_ATTESTE
 "$repo_root/packaging/macos/uninstall.sh" --remove-data >/dev/null
 ! /bin/kill -0 "$daemon_pid" 2>/dev/null; daemon_pid=
 grep -qx 'gascan:list --json' "$log"
+if grep '^ps-env:' "$log" | grep -vx 'ps-env:C:C:UTC'; then
+  printf 'daemon stop inspected process identity without deterministic UTC environment\n' >&2
+  exit 1
+fi
 
 : >"$log"; export FIXTURE_DAEMON_PID=999999 FIXTURE_SANDBOX_JSON='[{"sandbox_id":"one"},{"sandbox_id":"two"}]'
 "$repo_root/packaging/macos/uninstall.sh" --remove-data >/dev/null

@@ -25,6 +25,10 @@ async fn exec_rejects_unapproved_or_malformed_environment_before_spawn() {
         ("MISE_SYSTEM_CONFIG_FILE", "/config/mise.toml"),
         ("MISE_SYSTEM_DATA_DIR", "/opt/gascan/mise"),
         ("MISE_CEILING_PATHS", "/config/workdir"),
+        ("GH_TOKEN", "github-secret"),
+        ("GITHUB_TOKEN", "github-secret"),
+        ("GLAB_TOKEN", "gitlab-secret"),
+        ("GITLAB_TOKEN", "gitlab-secret"),
         ("LC_", "C"),
         ("LANG", "C\0UTF-8"),
     ] {

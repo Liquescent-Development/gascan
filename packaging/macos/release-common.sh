@@ -109,9 +109,9 @@ gascan_stop_attested_daemon() {
   expected=$(realpath "$expected") || return 1
   [[ $(realpath "$executable") == "$expected" ]] || return 1
   local observed_command observed_executable observed_start second
-  observed_command=$(ps -p "$pid" -o command= 2>/dev/null) || return 1
+  observed_command=$(env LC_ALL=C LANG=C TZ=UTC ps -p "$pid" -o command= 2>/dev/null) || return 1
   observed_executable=$(realpath "${observed_command%% *}") || return 1
-  observed_start=$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^ *//;s/ *$//') || return 1
+  observed_start=$(env LC_ALL=C LANG=C TZ=UTC ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^ *//;s/ *$//') || return 1
   [[ $observed_executable == "$expected" && $observed_start == "$start" ]] || return 1
   second=$($gascan_bin daemon-attest 2>/dev/null) || return 1
   jq -e --argjson pid "$pid" --arg exe "$executable" --arg start "$start" --arg token "$token" '
@@ -119,7 +119,7 @@ gascan_stop_attested_daemon() {
   ' <<<"$second" >/dev/null || return 1
   env kill -TERM "$pid"
   for _ in {1..100}; do
-    observed_start=$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^ *//;s/ *$//' || true)
+    observed_start=$(env LC_ALL=C LANG=C TZ=UTC ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^ *//;s/ *$//' || true)
     [[ $observed_start == "$start" ]] || return 0
     sleep 0.05
   done

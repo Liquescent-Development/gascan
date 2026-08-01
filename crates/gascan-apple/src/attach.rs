@@ -409,10 +409,12 @@ fn validate_environment(environment: &BTreeMap<String, String>) -> Result<(), Ru
 }
 
 fn is_allowed_environment_name(name: &str) -> bool {
-    matches!(name, "TERM" | "COLORTERM" | "LANG")
-        || name
-            .strip_prefix("LC_")
-            .is_some_and(|suffix| !suffix.is_empty())
+    matches!(
+        name,
+        "TERM" | "COLORTERM" | "LANG" | "GH_NO_UPDATE_NOTIFIER" | "GLAB_CHECK_UPDATE" | "NO_COLOR"
+    ) || name
+        .strip_prefix("LC_")
+        .is_some_and(|suffix| !suffix.is_empty())
 }
 
 fn missing_pipe(stream: &str) -> RuntimeError {

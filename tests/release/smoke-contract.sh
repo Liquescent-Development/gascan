@@ -180,6 +180,7 @@ case "$*" in
   *) exit 64;;
 esac'
 write_fake gascan 'exit 42'
+write_fake gascan-apple-attach 'exit 0'
 
 run_smoke() {
   PATH="$fixture/bin:$PATH" \
@@ -187,6 +188,8 @@ run_smoke() {
   FIXTURE_DNS_STATE="$dns_state" \
   FIXTURE_SUDO_LOG="$log" \
   FIXTURE_CREATE_STATUS="${FIXTURE_CREATE_STATUS:-0}" \
+  GASCAN_RELEASE_TESTING=YES \
+  GASCAN_RELEASE_APPLE_ATTACH_HELPER="$fixture/bin/gascan-apple-attach" \
   GASCAN_RELEASE_GASCAN="$fixture/bin/gascan" \
     "$repo_root/packaging/macos/release-smoke.sh" 2>&1
 }

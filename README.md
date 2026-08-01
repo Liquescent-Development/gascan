@@ -131,7 +131,20 @@ From the project root, check the host and create the sandbox:
 ```sh
 gascan doctor
 gascan up .
+# accept the optional developer setup when offered
 gascan shell
+```
+
+The first successful interactive `gascan up .` offers to configure Git,
+GitHub, and GitLab for this sandbox. You can accept the walkthrough, decline
+it without affecting the successful `up`, or run the complete or focused
+commands later:
+
+```sh
+gascan configure
+gascan configure git
+gascan configure gh
+gascan configure glab
 ```
 
 `gascan shell` opens interactive login Bash with colors and completion. It
@@ -206,6 +219,91 @@ Commands other than `up` resolve the sandbox implicitly when exactly one
 exists. With more than one, pass `--sandbox <id>`; `gascan list` prints the
 ids. A sandbox id is the slugified `name` plus a short digest of the canonical
 project root, so the same project always maps to the same sandbox.
+
+### Developer onboarding: Git, forges, and signing
+
+`gascan configure` is an optional interactive guide for one selected running
+sandbox. It configures Git identity and a sandbox key first, then offers
+GitHub and GitLab setup. The focused commands repair or change one component
+without repeating the rest:
+
+```sh
+gascan configure
+gascan configure git
+gascan configure gh
+gascan configure glab
+```
+
+Pass the existing global `--sandbox <id>` option when more than one sandbox
+exists. A stopped sandbox asks you to run `gascan up`; every focused command
+is safe to rerun. The first-`up` offer appears only on an interactive terminal.
+It is suppressed for redirected or JSON output and in CI, and a cancelled or
+failed guide never turns a successful `up` into a failure. Explicit
+`gascan configure` remains available even after completing or declining the
+offer.
+
+For Git identity, Gas Can reads editable defaults only from
+`git config --global` on the Mac. It never imports repository or worktree
+configuration, host private keys, or arbitrary Git files. Confirmed values are
+written to the sandbox-global Git configuration. The guide creates one
+passwordless Ed25519 key for this sandbox and configures it for SSH transport
+plus SSH commit and tag signing by default. The key is reused on focused
+retries; unsafe managed paths, links, owners, or permissions fail closed.
+
+Interactive GitHub and GitLab setup can import a credential from an
+authenticated host CLI account after showing the account and asking for
+confirmation. Otherwise it reads a token through hidden terminal input.
+Noninteractive automation accepts a token only on stdin—never in an argument
+or environment field sent to Gas Can:
+
+```text
+gascan configure gh --hostname HOST --token-stdin --git-protocol https
+gascan configure glab --hostname HOST --token-stdin --git-protocol https
+```
+
+`--git-protocol ssh|https` defaults to SSH. SSH gives Git a revocable,
+per-sandbox authentication key and keeps OpenSSH host-key checking enabled;
+the interactive guide visibly verifies a newly selected host. HTTPS uses the
+native forge credential for Git transport and is the choice supported with
+redirected `--token-stdin`, because SSH first-use verification requires an
+interactive terminal. To use the default SSH flow, omit `--token-stdin` and
+run the focused command interactively.
+
+`--hostname HOST` supports `github.com`, GitHub Enterprise, `gitlab.com`,
+GitLab Dedicated, and self-managed GitLab installations. With SSH transport,
+GitHub receives the same public key twice, once as an authentication key and a
+signing key. GitLab receives one key with `usage_type = auth_and_signing`.
+Existing matching registrations are reused. If authentication succeeds but
+registration lacks permission, the native login is retained and the summary
+names the focused retry command.
+
+Credentials remain in the native sandbox files—GitHub CLI uses
+`$GH_CONFIG_DIR/hosts.yml`, GitLab CLI uses `$GLAB_CONFIG_DIR/config.yml`, and
+Git and OpenSSH use the persistent managed configuration below
+`/home/workspace/.config/gascan/git`. These files are protected by restrictive
+Unix permissions and the Mac's underlying storage encryption. Gas Can does
+not provide a credential vault: it never stores tokens in its daemon state,
+manifest, onboarding receipt, logs, or command arguments. The receipt records
+only completion or decline state.
+
+Git identity, the private key, native credentials, and the non-secret receipt
+survive `gascan down`, the next `gascan up .`, and workspace-image replacement
+with `gascan apply`. An offline sandbox can configure identity, generate the
+key, and create signed commits and tags, but forge authentication is skipped
+until the manifest uses `network = "networked"`; retry with
+`gascan configure gh` or `gascan configure glab` after applying that change.
+
+Verify the latest commit and an annotated signed tag inside the sandbox:
+
+```sh
+git log --show-signature -1
+git verify-tag <tag>
+```
+
+`gascan destroy --yes` removes the sandbox's config volume, onboarding
+receipt, private key, and native credentials. Removing that per-sandbox public
+key from each forge independently revokes access if the sandbox is no longer
+trusted; destroying one sandbox does not remove another sandbox's key.
 
 ### SSH and VS Code Remote SSH
 
