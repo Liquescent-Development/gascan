@@ -5,7 +5,7 @@
 The primary Task 10 implementation was committed as `c846404` (`docs: explain
 developer onboarding`), and the first independent review fixes were committed
 separately as `5317fac` (`fix: harden developer onboarding smoke`). A focused
-sanitizer follow-up is being recorded in another separate commit. The
+sanitizer follow-up is contained in a second separate changeset. The
 branch-built live release smoke has not passed after the latest fixes and
 remains pending; this report does not claim a live PASS.
 
