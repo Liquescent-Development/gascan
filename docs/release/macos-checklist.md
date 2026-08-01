@@ -180,8 +180,8 @@ Install an accepted Apple `container` release, start its service, then run:
 
 ```sh
 GASCAN_EXPECTED_SOURCE_REVISION=<signed-release-commit> \
-GASCAN_EXPECTED_VERSION=0.1.16 \
-  ./packaging/macos/install.sh .artifacts/release/gascan-0.1.16-macos-arm64.pkg
+GASCAN_EXPECTED_VERSION=0.1.17 \
+  ./packaging/macos/install.sh .artifacts/release/gascan-0.1.17-macos-arm64.pkg
 gascan doctor --json | jq
 ```
 
