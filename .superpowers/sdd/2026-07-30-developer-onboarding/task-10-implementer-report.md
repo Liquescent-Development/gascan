@@ -8,8 +8,8 @@ separately as `5317fac` (`fix: harden developer onboarding smoke`). A focused
 sanitizer follow-up was committed separately as `a4bb0b9` (`fix: reject
 exported release smoke functions`), followed by report clarification
 `db52919`. The latest probe-only work is contained in a separate follow-up
-changeset. The branch-built live release smoke has not passed after the
-latest fixes and remains pending; this report does not claim a live PASS.
+changeset. The final branch-built live release smoke passed after the review
+and probe fixes with exit status 0.
 
 ## Implementation
 
@@ -302,9 +302,9 @@ Step 4:
   because `/opt/homebrew/tmp` was denied.
 - `rtk cargo build -p gascan -p gascand` — pass; both crates compiled.
 - `rtk env GASCAN_RELEASE_GASCAN="$PWD/target/debug/gascan" GASCAN_RELEASE_GASCAND="$PWD/target/debug/gascand" GASCAN_RELEASE_APPLE_ATTACH_HELPER="$PWD/target/gascan-apple-attach" ./packaging/macos/release-smoke.sh`
-  — blocked before `gascan up` at the pre-existing
-  `sudo -n container system dns create` call with
-  `sudo: a password is required`.
+  — final authorized rerun passed with
+  `PASS: installed Gas Can release smoke` and exit status 0 after an
+  interactive `sudo -v` primed the host credential.
 
 `rtk sudo -n true` independently returns the same password-required result.
 `git show HEAD:packaging/macos/release-smoke.sh` proves the sudo DNS create and
@@ -321,8 +321,7 @@ touched.
 
 ## Final handoff state
 
-After an authorized user primes the host credential with interactive
-`sudo -v`, rerun from the developer-onboarding worktree:
+The authorized final rerun from the developer-onboarding worktree used:
 
 ```sh
 rtk env GASCAN_RELEASE_GASCAN="$PWD/target/debug/gascan" \
@@ -332,9 +331,12 @@ rtk env GASCAN_RELEASE_GASCAN="$PWD/target/debug/gascan" \
 ```
 
 The final workspace, scripts, Swift helper, clippy, release-contract, formatting,
-syntax, and diff checks passed before staging. The live smoke itself was not
-rerun after the UTC attestation correction; the command above is the next
-end-to-end confirmation.
+syntax, and diff checks passed before staging. The live smoke completed the
+networked onboarding, forge authentication and key registration, signed Git
+commit and tag verification, Starship and Nerd Font shell probes, apply and
+daemon restart persistence, offline isolation, cleanup, and host audit before
+printing `PASS: installed Gas Can release smoke`; the enclosing command
+returned 0.
 
 The separate review-fix changeset contains only:
 
