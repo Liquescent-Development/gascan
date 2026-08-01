@@ -1,7 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ ${GASCAN_RELEASE_ENV_SANITIZED:-} != 1 ]]; then
+gascan_release_environment_is_sanitized() {
+  local name
+  [[ ${GASCAN_RELEASE_ENV_SANITIZED:-} == 1 ]] || return 1
+  while IFS= read -r name; do
+    case $name in
+      FIXTURE_CREATE_STATUS|FIXTURE_DNS_STATE|FIXTURE_SUDO_LOG|\
+      GASCAN_RELEASE_APPLE_ATTACH_HELPER|GASCAN_RELEASE_ENV_SANITIZED|\
+      GASCAN_RELEASE_GASCAN|GASCAN_RELEASE_GASCAND|GASCAN_RELEASE_TESTING|\
+      GASCAN_RELEASE_TEST_SIGNAL_AFTER_TRAPS|HOME|LOGNAME|PATH|TMPDIR|USER|\
+      PWD|SHLVL) ;;
+      *) return 1 ;;
+    esac
+  done < <(compgen -e)
+}
+
+if ! gascan_release_environment_is_sanitized; then
   release_path=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
   if [[ ${GASCAN_RELEASE_TESTING:-} == YES ]]; then
     release_path=$PATH
@@ -35,7 +50,24 @@ apple_attach_bin=${GASCAN_RELEASE_APPLE_ATTACH_HELPER:-/usr/local/bin/gascan-app
 [[ -x $apple_attach_bin ]] || { printf 'installed attach helper is unavailable\n' >&2; exit 69; }
 apple_attach_bin=$(realpath "$apple_attach_bin") || { printf 'attach helper path is unavailable\n' >&2; exit 69; }
 export GASCAN_DAEMON=$gascand_bin
-export GASCAN_APPLE_ATTACH_HELPER=$apple_attach_bin
+
+gascan_release_preflight_daemon() {
+  local status
+  if "$gascan_bin" daemon-attest >/dev/null 2>&1; then
+    if ! gascan_stop_attested_daemon "$gascan_bin" "$gascand_bin"; then
+      printf 'release smoke refused unsafe or mismatched pre-existing Gas Can daemon\n' >&2
+      return 1
+    fi
+  fi
+  status=$("$gascan_bin" daemon status --json 2>/dev/null) || {
+    printf 'release smoke could not prove the selected daemon is stopped\n' >&2
+    return 1
+  }
+  if ! jq -e '.state == "stopped" and .health == "stopped"' <<<"$status" >/dev/null; then
+    printf 'release smoke could not prove the selected daemon is stopped\n' >&2
+    return 1
+  fi
+}
 
 gascan_release_up() {
   "$gascan_bin" up "$root" </dev/null
@@ -349,6 +381,8 @@ on_exit() {
 trap on_exit EXIT
 trap 'exit 130' INT TERM
 gascan_release_test_signal
+gascan_release_preflight_daemon
+export GASCAN_APPLE_ATTACH_HELPER=$apple_attach_bin
 
 mkdir -p "$root/.gascan"
 cat >"$root/.gascan/setup.sh" <<'SETUP'
@@ -428,6 +462,7 @@ case "${1:-} ${2:-}" in
     done
     if [[ $method == POST ]]; then
       [[ -n $endpoint && -n $key ]]
+      [[ $key == "$(< /home/workspace/.config/gascan/git/ssh/id_ed25519.pub)" ]]
       jq -nc --arg key "$key" \
         '{id:17,key:$key,title:"Gas Can release",created_at:"2026-07-31T00:00:00Z",verified:true,read_only:false}'
     else
@@ -478,6 +513,7 @@ case "${1:-} ${2:-}" in
     done
     if [[ $method == POST ]]; then
       [[ -n $key && $usage == auth_and_signing ]]
+      [[ $key == "$(< /home/workspace/.config/gascan/git/ssh/id_ed25519.pub)" ]]
       jq -nc --arg key "$key" \
         '{id:23,title:"Gas Can release",key:$key,created_at:"2026-07-31T00:00:00Z",usage_type:"auth_and_signing"}'
     else

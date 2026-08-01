@@ -198,3 +198,50 @@ fn release_smoke_persistence_checks_name_fields_and_never_print_fixture_token() 
         );
     }
 }
+
+#[test]
+fn release_smoke_rejects_spoofed_sanitizer_markers_and_preflights_daemon() {
+    let smoke =
+        fs::read_to_string(repository_root().join("packaging/macos/release-smoke.sh")).unwrap();
+
+    for required in [
+        "gascan_release_environment_is_sanitized()",
+        "compgen -e",
+        "GASCAN_RELEASE_ENV_SANITIZED|",
+        "PWD|SHLVL)",
+        "if ! gascan_release_environment_is_sanitized; then",
+        "gascan_release_preflight_daemon()",
+        "release smoke refused unsafe or mismatched pre-existing Gas Can daemon",
+        "release smoke could not prove the selected daemon is stopped",
+    ] {
+        assert!(
+            smoke.contains(required),
+            "release smoke omits sanitizer/preflight contract {required:?}"
+        );
+    }
+
+    assert!(!smoke.contains("if [[ ${GASCAN_RELEASE_ENV_SANITIZED:-} != 1 ]]; then"));
+    let daemon_export = smoke.find("export GASCAN_DAEMON=$gascand_bin").unwrap();
+    let preflight = smoke
+        .find("\ngascan_release_preflight_daemon\n")
+        .expect("release smoke omits daemon preflight call");
+    let helper_export = smoke
+        .find("export GASCAN_APPLE_ATTACH_HELPER=$apple_attach_bin")
+        .unwrap();
+    assert!(daemon_export < preflight);
+    assert!(preflight < helper_export);
+}
+
+#[test]
+fn release_smoke_fake_forges_require_the_managed_public_key() {
+    let smoke =
+        fs::read_to_string(repository_root().join("packaging/macos/release-smoke.sh")).unwrap();
+    let key_check =
+        r#"[[ $key == "$(< /home/workspace/.config/gascan/git/ssh/id_ed25519.pub)" ]]"#;
+
+    assert_eq!(
+        smoke.matches(key_check).count(),
+        2,
+        "GitHub and GitLab fake registration must both require the managed public key"
+    );
+}

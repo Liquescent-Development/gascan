@@ -157,7 +157,17 @@ write_fake() {
 write_fake python3 '
 if [[ ${1:-} == -c ]]; then printf "54321\n"; exit 0; fi
 exec /bin/sleep 300'
-write_fake ps 'printf "Mon Jan  1 00:00:00 2024\n"'
+write_fake ps '
+if [[ ${2:-} == 4242 ]]; then
+  [[ -f $FIXTURE_SUDO_LOG.daemon ]] || exit 1
+  case "${4:-}" in
+    command=) cat "$FIXTURE_SUDO_LOG.gascand" ;;
+    lstart=) printf "Mon Jan  1 00:00:00 2024\n" ;;
+    *) exit 64 ;;
+  esac
+else
+  printf "Mon Jan  1 00:00:00 2024\n"
+fi'
 write_fake container '
 case "$*" in
   "system dns list --format json")
@@ -179,8 +189,38 @@ case "$*" in
   "-n container system dns delete "*) rm -f "$FIXTURE_DNS_STATE";;
   *) exit 64;;
 esac'
-write_fake gascan 'exit 42'
+write_fake kill '
+if [[ $* == "-TERM 4242" ]]; then
+  rm -f "$FIXTURE_SUDO_LOG.daemon"
+  printf "kill:%s\n" "$*" >>"$FIXTURE_SUDO_LOG.daemon-log"
+else
+  exec /bin/kill "$@"
+fi'
+write_fake gascan '
+[[ -z ${GASCAN_RELEASE_SENTINEL_SECRET+x} ]] || exit 88
+case "$*" in
+  daemon-attest)
+    [[ -z ${GASCAN_APPLE_ATTACH_HELPER+x} ]] || exit 87
+    [[ -f $FIXTURE_SUDO_LOG.daemon ]] || exit 1
+    jq -nc --arg executable "$(cat "$FIXTURE_SUDO_LOG.gascand")" \
+      "{\"pid\":4242,\"executable\":\$executable,\"start_identity\":\"Mon Jan  1 00:00:00 2024\",\"instance_token\":\"fixture-instance-token\"}"
+    ;;
+  "daemon status --json")
+    [[ -z ${GASCAN_APPLE_ATTACH_HELPER+x} ]] || exit 87
+    if [[ -f $FIXTURE_SUDO_LOG.daemon ]]; then
+      printf "{\"state\":\"running\",\"health\":\"healthy\"}\n"
+    else
+      printf "{\"state\":\"stopped\",\"health\":\"stopped\"}\n"
+    fi
+    ;;
+  *)
+    [[ ${GASCAN_APPLE_ATTACH_HELPER:-} == "$(cat "$FIXTURE_SUDO_LOG.attach-helper")" ]] || exit 86
+    [[ ! -f $FIXTURE_SUDO_LOG.daemon ]] || exit 89
+    exit 42
+    ;;
+esac'
 write_fake gascan-apple-attach 'exit 0'
+write_fake gascand 'exit 0'
 
 run_smoke() {
   PATH="$fixture/bin:$PATH" \
@@ -191,8 +231,12 @@ run_smoke() {
   GASCAN_RELEASE_TESTING=YES \
   GASCAN_RELEASE_APPLE_ATTACH_HELPER="$fixture/bin/gascan-apple-attach" \
   GASCAN_RELEASE_GASCAN="$fixture/bin/gascan" \
+  GASCAN_RELEASE_GASCAND="$fixture/bin/gascand" \
     "$repo_root/packaging/macos/release-smoke.sh" 2>&1
 }
+
+realpath "$fixture/bin/gascan-apple-attach" >"$log.attach-helper"
+realpath "$fixture/bin/gascand" >"$log.gascand"
 
 status=0
 output=$(run_smoke) || status=$?
@@ -223,5 +267,33 @@ delete_argv=$(sed -n '2p' "$log")
 [[ ${create_argv##* } == "${delete_argv##* }" ]] || { printf 'DNS cleanup used a different identity\n' >&2; exit 1; }
 [[ ! -e $dns_state ]] || { printf 'ambiguous DNS create fixture state remains\n' >&2; exit 1; }
 ! compgen -G "$fixture/tmp/gascan-release-root.*" >/dev/null
+
+: >"$log"
+status=0
+output=$(GASCAN_RELEASE_ENV_SANITIZED=1 \
+  GASCAN_RELEASE_SENTINEL_SECRET=must-not-reach-child run_smoke) || status=$?
+[[ $status -eq 42 ]] || {
+  printf 'spoofed sanitizer marker exposed sentinel to child: status=%s\n%s\n' \
+    "$status" "$output" >&2
+  exit 1
+}
+[[ $(wc -l <"$log" | tr -d ' ') -eq 2 ]]
+[[ ! -e $dns_state ]]
+
+: >"$log"
+: >"$log.daemon-log"
+printf 'different-helper\n' >"$log.daemon"
+[[ $(< "$log.daemon") != "$(< "$log.attach-helper")" ]]
+status=0
+output=$(run_smoke) || status=$?
+[[ $status -eq 42 ]] || {
+  printf 'release smoke reused pre-existing same-path daemon: status=%s\n%s\n' \
+    "$status" "$output" >&2
+  exit 1
+}
+[[ ! -e $log.daemon ]]
+grep -qx 'kill:-TERM 4242' "$log.daemon-log"
+[[ $(wc -l <"$log" | tr -d ' ') -eq 2 ]]
+[[ ! -e $dns_state ]]
 
 printf 'PASS: Gas Can release smoke command contract\n'

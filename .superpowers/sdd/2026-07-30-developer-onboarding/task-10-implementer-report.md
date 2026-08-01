@@ -2,10 +2,11 @@
 
 ## Status
 
-Implementation and every non-privileged Task 10 gate are complete. The required
-branch-built live release smoke is blocked before product execution because the
-host has no current noninteractive sudo credential. Per the controller boundary,
-the Task 10 commit has not been created while that required gate remains pending.
+The primary Task 10 implementation was committed as `c846404` (`docs: explain
+developer onboarding`). Independent review fixes are being recorded in a
+separate follow-up commit. The branch-built live release smoke has not passed
+after the latest fixes and remains pending; this report does not claim a live
+PASS.
 
 ## Implementation
 
@@ -26,10 +27,12 @@ the Task 10 commit has not been created while that required gate remains pending
   login Bash. Starship modes require the expected executable, config, and hook
   with no warning.
 - A security self-review found that the PTY initially copied the complete host
-  environment. The smoke now re-executes once through `env -i` with a minimal
-  allowlist for paths, user identity, test controls, and the two branch-binary
-  overrides. Real host forge credential variables are neither named nor made
-  available to the smoke or its child processes.
+  environment. The smoke re-executes through `env -i` with a minimal allowlist
+  for paths, user identity, test controls, and the branch-binary overrides. Its
+  re-entry marker is accepted only when every exported name belongs to the exact
+  environment produced by that launch; a spoofed marker with any sentinel or
+  secret is sanitized again without recursion. Real host forge credential
+  variables are neither named nor made available to the smoke or its children.
 - The existing smoke command fixture now opts into `GASCAN_RELEASE_TESTING=YES`
   so the clean-environment prelude retains only its fake-command PATH and
   non-secret DNS bookkeeping. Production execution still uses the fixed PATH.
@@ -191,6 +194,26 @@ the `else` branch; that focused contract also began RED and returned GREEN.
 All seven macOS release-smoke contract tests and the full scripts suite then
 passed.
 
+Independent review found that a caller could spoof the old sanitizer marker,
+that a same-path branch daemon could retain a helper chosen by an earlier run,
+and that the fake forge APIs accepted any nonempty posted key. The sanitizer
+runtime contract began RED at sentinel-detected exit 88; after exact exported-
+name validation it advanced to the next deliberate RED, stale-daemon exit 89.
+The preflight now exports only the selected daemon path, attested-stops an
+existing matching process with the existing PID/executable/start/token checks,
+requires stopped status, and only then exports the selected helper. The runtime
+contract records exactly one `kill:-TERM 4242` for a same-path daemon whose
+fixture records a different helper. Both fake forge POST handlers now require
+the submitted key to equal the managed sandbox public key; GitHub applies the
+check to both auth and signing endpoints, and GitLab retains the
+`auth_and_signing` requirement. Focused sanitizer/preflight and managed-key
+contracts both pass. Final review-fix verification passed all nine macOS
+release-smoke tests, all 510 scripts tests across 52 suites in 159.32 seconds,
+the complete release-contract loop, locked workspace clippy, formatting, Bash
+syntax, and diff checks. Standalone scripts clippy also found an unrelated
+pre-existing redundant closure in `validate-connected-build.rs`, which is not
+part of this changeset. The live smoke remains pending after these review fixes.
+
 All disposable forge sandboxes were destroyed. The final inventory contains
 only `code-3fd063e3b68e`, `buildkit`, and the three volumes belonging to the
 pre-existing code sandbox; DNS is empty and all temporary roots are absent.
@@ -207,8 +230,8 @@ Step 3:
 - `rtk cargo test -p gascan` — 300 passed, 264 filtered out across 7 suites in
   4.05 seconds. The first restricted run was interrupted after its process
   fixtures stalled silently; the authoritative permitted rerun passed.
-- `rtk cargo test --manifest-path scripts/Cargo.toml` — 508 passed across 52
-  suites in 178.41 seconds with local process access. The restricted first run
+- `rtk cargo test --manifest-path scripts/Cargo.toml` — 510 passed across 52
+  suites in 159.32 seconds with local process access. The restricted first run
   reached only the expected `Operation not permitted` denial in two loopback
   HTTP fixtures.
 - `rtk bash tests/image/shell-home-root-contract.sh` — direct macOS invocation
@@ -269,23 +292,12 @@ syntax, and diff checks passed before staging. The live smoke itself was not
 rerun after the UTC attestation correction; the command above is the next
 end-to-end confirmation.
 
-Current changed files are:
+The separate review-fix changeset contains only:
 
-- `README.md`
-- `crates/gascan-core/src/policy.rs`
-- `crates/gascan-core/tests/policy.rs`
-- `crates/gascan-apple/src/attach.rs`
-- `crates/gascan-apple/tests/attach_configuration.rs`
-- `crates/gascan-apple/tests/backend_fake_runner.rs`
-- `crates/gascan-apple/tests/fixtures/fake-attach-helper/src/main.rs`
-- `helpers/apple-attach/Sources/GasCanAppleAttach/Protocol.swift`
-- `helpers/apple-attach/Tests/GasCanAppleAttachTests/ProtocolTests.swift`
-- `packaging/macos/release-common.sh`
 - `packaging/macos/release-smoke.sh`
 - `scripts/tests/macos_release_smoke.rs`
-- `tests/release/installer-contract.sh`
 - `tests/release/smoke-contract.sh`
 - `.superpowers/sdd/2026-07-30-developer-onboarding/task-10-implementer-report.md`
 
-The report is ignored by repository policy and therefore requires explicit
-force-add at commit time.
+The report is already tracked by `c846404`; no force-add is required for the
+follow-up commit.
