@@ -1,11 +1,79 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash -p
+
+gascan_release_environment_is_sanitized() {
+  builtin local name
+  [[ -z $(builtin export -pf) ]] || return 1
+  [[ ${GASCAN_RELEASE_ENV_SANITIZED:-} == 1 ]] || return 1
+  while IFS= builtin read -r name; do
+    case $name in
+      FIXTURE_CREATE_STATUS|FIXTURE_DNS_STATE|FIXTURE_SUDO_LOG|\
+      GASCAN_RELEASE_APPLE_ATTACH_HELPER|GASCAN_RELEASE_ENV_SANITIZED|\
+      GASCAN_RELEASE_GASCAN|GASCAN_RELEASE_GASCAND|GASCAN_RELEASE_TESTING|\
+      GASCAN_RELEASE_TEST_SIGNAL_AFTER_TRAPS|HOME|LOGNAME|PATH|TMPDIR|USER|\
+      PWD|SHLVL) ;;
+      *) return 1 ;;
+    esac
+  done < <(builtin compgen -e)
+}
+
+if [[ $- != *p* ]] || ! gascan_release_environment_is_sanitized; then
+  release_path=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+  if [[ ${GASCAN_RELEASE_TESTING:-} == YES ]]; then
+    release_path=$PATH
+  fi
+  /usr/bin/env -i \
+    FIXTURE_CREATE_STATUS="${FIXTURE_CREATE_STATUS:-}" \
+    FIXTURE_DNS_STATE="${FIXTURE_DNS_STATE:-}" \
+    FIXTURE_SUDO_LOG="${FIXTURE_SUDO_LOG:-}" \
+    GASCAN_RELEASE_ENV_SANITIZED=1 \
+    GASCAN_RELEASE_APPLE_ATTACH_HELPER="${GASCAN_RELEASE_APPLE_ATTACH_HELPER:-}" \
+    GASCAN_RELEASE_GASCAN="${GASCAN_RELEASE_GASCAN:-}" \
+    GASCAN_RELEASE_GASCAND="${GASCAN_RELEASE_GASCAND:-}" \
+    GASCAN_RELEASE_TESTING="${GASCAN_RELEASE_TESTING:-}" \
+    GASCAN_RELEASE_TEST_SIGNAL_AFTER_TRAPS="${GASCAN_RELEASE_TEST_SIGNAL_AFTER_TRAPS:-}" \
+    HOME="$HOME" \
+    LOGNAME="${LOGNAME:-}" \
+    PATH="$release_path" \
+    TMPDIR="${TMPDIR:-/tmp}" \
+    USER="${USER:-}" \
+    /bin/bash --noprofile --norc -p "$0" "$@"
+else
+  builtin set -euo pipefail
+  builtin set +p
 
 repo_root=$(cd "$(dirname "$0")/../.." && pwd -P)
 source "$repo_root/packaging/macos/release-common.sh"
 
 gascan_bin=${GASCAN_RELEASE_GASCAN:-/usr/local/bin/gascan}
+gascand_bin=${GASCAN_RELEASE_GASCAND:-/usr/local/bin/gascand}
+apple_attach_bin=${GASCAN_RELEASE_APPLE_ATTACH_HELPER:-/usr/local/bin/gascan-apple-attach}
 [[ -x $gascan_bin ]] || { printf 'installed gascan is unavailable\n' >&2; exit 69; }
+[[ -x $gascand_bin ]] || { printf 'installed gascand is unavailable\n' >&2; exit 69; }
+[[ -x $apple_attach_bin ]] || { printf 'installed attach helper is unavailable\n' >&2; exit 69; }
+apple_attach_bin=$(realpath "$apple_attach_bin") || { printf 'attach helper path is unavailable\n' >&2; exit 69; }
+export GASCAN_DAEMON=$gascand_bin
+
+gascan_release_preflight_daemon() {
+  local status
+  if "$gascan_bin" daemon-attest >/dev/null 2>&1; then
+    if ! gascan_stop_attested_daemon "$gascan_bin" "$gascand_bin"; then
+      printf 'release smoke refused unsafe or mismatched pre-existing Gas Can daemon\n' >&2
+      return 1
+    fi
+  fi
+  status=$("$gascan_bin" daemon status --json 2>/dev/null) || {
+    printf 'release smoke could not prove the selected daemon is stopped\n' >&2
+    return 1
+  }
+  if ! jq -e '.state == "stopped" and .health == "stopped"' <<<"$status" >/dev/null; then
+    printf 'release smoke could not prove the selected daemon is stopped\n' >&2
+    return 1
+  fi
+}
+
+gascan_release_up() {
+  "$gascan_bin" up "$root" </dev/null
+}
 
 gascan_default_shell_probe() {
   python3 - "$gascan_bin" "$sandbox_id" <<'PY'
@@ -79,7 +147,8 @@ try:
     read_until(b"GASCAN_SHELL_INPUT_READY", time.monotonic() + 15)
     os.write(
         controller,
-        b"""printf 'GASCAN_RELEASE_SHELL_BEGIN\\n'
+        b"""PROMPT_COMMAND=; PS1= PS2=
+printf 'GASCAN_RELEASE_SHELL_BEGIN\\n'
 printf 'BASH_VERSION=%s\\n' "${BASH_VERSION:-}"
 case $- in *i*) printf 'INTERACTIVE=yes\\n';; *) printf 'INTERACTIVE=no\\n';; esac
 if shopt -q login_shell; then printf 'LOGIN=yes\\n'; else printf 'LOGIN=no\\n'; fi
@@ -94,6 +163,7 @@ printf 'SELECTOR=%s\\n' "$(< /home/workspace/.config/gascan/shell/prompt)"
 printf 'STARSHIP_CONFIG=%s\\n' "${STARSHIP_CONFIG:-}"
 printf 'STARSHIP_EXECUTABLE=%s\\n' "${STARSHIP_EXECUTABLE:-}"
 printf 'STARSHIP_FUNCTION=%s\\n' "$(type -t starship_precmd || true)"
+/bin/bash --login -i -c 'printf "NESTED_STARSHIP_CONFIG=%s\\n" "${STARSHIP_CONFIG:-}"; printf "NESTED_STARSHIP_EXECUTABLE=%s\\n" "${STARSHIP_EXECUTABLE:-}"; printf "NESTED_STARSHIP_FUNCTION=%s\\n" "$(type -t starship_precmd || true)"'
 printf 'GASCAN_RELEASE_SHELL_END\\n'
 exit 0
 """,
@@ -141,6 +211,135 @@ sys.stdout.buffer.write(normalized[start:finish])
 PY
 }
 
+gascan_assert_shell_field() {
+  local selector=$1 required=$2 captured=$3 field
+  field=${required%%=*}
+  if grep -Fx -- "$required" <<<"$captured" >/dev/null; then
+    return 0
+  fi
+  printf 'shell probe field mismatch: selector=%s field=%s expected=%s\n' \
+    "$selector" "$field" "$required" >&2
+  printf 'captured shell output (last 4096 characters):\n%s\n' \
+    "${captured: -4096}" >&2
+  return 1
+}
+
+gascan_assert_shell_pattern() {
+  local selector=$1 field=$2 pattern=$3 captured=$4
+  if grep -E -- "$pattern" <<<"$captured" >/dev/null; then
+    return 0
+  fi
+  printf 'shell probe pattern mismatch: selector=%s field=%s expected=%s\n' \
+    "$selector" "$field" "$pattern" >&2
+  printf 'captured shell output (last 4096 characters):\n%s\n' \
+    "${captured: -4096}" >&2
+  return 1
+}
+
+gascan_configure_git_from_host_fixture() {
+  python3 - "$gascan_bin" "$sandbox_id" "$host_git_config" <<'PY'
+import errno
+import os
+import pty
+import select
+import subprocess
+import sys
+import time
+
+gascan, sandbox_id, host_git_config = sys.argv[1:]
+controller, user = pty.openpty()
+environment = os.environ.copy()
+environment["TERM"] = "gascan-release-term"
+environment["GIT_CONFIG_GLOBAL"] = host_git_config
+process = subprocess.Popen(
+    [gascan, "--sandbox", sandbox_id, "configure", "git"],
+    stdin=user,
+    stdout=user,
+    stderr=user,
+    close_fds=True,
+    env=environment,
+)
+os.close(user)
+captured = bytearray()
+
+
+def read_once(timeout):
+    readable, _, _ = select.select([controller], [], [], timeout)
+    if not readable:
+        return False
+    try:
+        chunk = os.read(controller, 16384)
+    except OSError as error:
+        if error.errno == errno.EIO:
+            return False
+        raise
+    if not chunk:
+        return False
+    captured.extend(chunk)
+    if len(captured) > 1024 * 1024:
+        raise SystemExit("developer configuration output exceeded its limit")
+    return True
+
+
+def answer_prompt(marker):
+    deadline = time.monotonic() + 30
+    while marker not in captured:
+        if time.monotonic() >= deadline:
+            raise SystemExit(
+                "developer configuration prompt timed out: "
+                + captured[-4096:].decode("utf-8", "backslashreplace")
+            )
+        if not read_once(0.1) and process.poll() is not None:
+            raise SystemExit(
+                "developer configuration exited before prompt: "
+                + captured[-4096:].decode("utf-8", "backslashreplace")
+            )
+    os.write(controller, b"\n")
+
+
+try:
+    for marker in [
+        b"Git name: ",
+        b"Git email: ",
+        b"Git protocol (ssh or https): ",
+    ]:
+        answer_prompt(marker)
+    deadline = time.monotonic() + 120
+    while process.poll() is None:
+        if time.monotonic() >= deadline:
+            process.kill()
+            process.wait()
+            raise SystemExit("developer configuration did not exit")
+        read_once(0.1)
+    while read_once(0):
+        pass
+    status = process.wait()
+    if status != 0:
+        raise SystemExit(
+            f"developer configuration exited with {status}: "
+            + captured[-4096:].decode("utf-8", "backslashreplace")
+        )
+finally:
+    try:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+    finally:
+        os.close(controller)
+
+normalized = bytes(captured).replace(b"\r", b"")
+for expected in [
+    b"Host defaults: Gas Can Release <release-smoke@example.test>",
+    b"Git: Gas Can Release <release-smoke@example.test>; protocol ssh;",
+]:
+    if expected not in normalized:
+        raise SystemExit(
+            "developer configuration omitted imported identity evidence: "
+            + normalized[-4096:].decode("utf-8", "backslashreplace")
+        )
+PY
+}
+
 root=$(mktemp -d "${TMPDIR:-/tmp}/gascan-release-root.XXXXXX")
 name="gate5-release-$PPID-$$"
 sandbox_id=
@@ -184,6 +383,8 @@ on_exit() {
 trap on_exit EXIT
 trap 'exit 130' INT TERM
 gascan_release_test_signal
+gascan_release_preflight_daemon
+export GASCAN_APPLE_ATTACH_HELPER=$apple_attach_bin
 
 mkdir -p "$root/.gascan"
 cat >"$root/.gascan/setup.sh" <<'SETUP'
@@ -215,6 +416,117 @@ ruby = "3.4.10"
 rust = "1.97.0"
 EOF_MANIFEST
 
+host_git_config=$root/.gascan/release-host-gitconfig
+cat >"$host_git_config" <<'HOST_GIT_CONFIG'
+[user]
+	name = Gas Can Release
+	email = release-smoke@example.test
+HOST_GIT_CONFIG
+chmod 0600 "$host_git_config"
+
+mkdir -p "$root/.gascan/fake-forges"
+cat >"$root/.gascan/fake-forges/gh" <<'FAKE_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+log=${XDG_CONFIG_HOME:?}/gascan/release-forge.log
+mkdir -p "$(dirname "$log")"
+printf 'gh:%s\n' "$*" >>"$log"
+case "${1:-} ${2:-}" in
+  'auth login')
+    token=$(cat)
+    [[ $token == gascan-release-fake-token ]]
+    mkdir -p "${GH_CONFIG_DIR:?}"
+    printf '%s\n' \
+      'github.enterprise.test:' \
+      '    user: gascan-release-fake-gh' \
+      '    git_protocol: https' >"$GH_CONFIG_DIR/hosts.yml"
+    chmod 0600 "$GH_CONFIG_DIR/hosts.yml"
+    ;;
+  'auth status')
+    [[ -f ${GH_CONFIG_DIR:?}/hosts.yml ]]
+    printf '%s\n' \
+      'github.enterprise.test' \
+      '  ✓ Logged in to github.enterprise.test account gascan-release-fake-gh (/home/workspace/.config/gh/hosts.yml)' \
+      '  - Active account: true' \
+      '  - Git operations protocol: https' >&2
+    ;;
+  'api --hostname')
+    method=GET
+    endpoint=
+    key=
+    while (($#)); do
+      case $1 in
+        --method) shift; method=${1:-} ;;
+        user/keys|user/ssh_signing_keys) endpoint=$1 ;;
+        key=*) key=${1#key=} ;;
+      esac
+      shift
+    done
+    if [[ $method == POST ]]; then
+      [[ -n $endpoint && -n $key ]]
+      [[ $key == "$(< /home/workspace/.config/gascan/git/ssh/id_ed25519.pub)" ]]
+      jq -nc --arg key "$key" \
+        '{id:17,key:$key,title:"Gas Can release",created_at:"2026-07-31T00:00:00Z",verified:true,read_only:false}'
+    else
+      printf '[]\n'
+    fi
+    ;;
+  *) exit 64 ;;
+esac
+FAKE_GH
+chmod 0755 "$root/.gascan/fake-forges/gh"
+
+cat >"$root/.gascan/fake-forges/glab" <<'FAKE_GLAB'
+#!/usr/bin/env bash
+set -euo pipefail
+log=${XDG_CONFIG_HOME:?}/gascan/release-forge.log
+mkdir -p "$(dirname "$log")"
+printf 'glab:%s\n' "$*" >>"$log"
+case "${1:-} ${2:-}" in
+  'auth login')
+    token=$(cat)
+    [[ $token == gascan-release-fake-token ]]
+    mkdir -p "${GLAB_CONFIG_DIR:?}"
+    printf '%s\n' \
+      'hosts:' \
+      '  gitlab.enterprise.test:' \
+      '    user: gascan-release-fake-glab' \
+      '    git_protocol: https' >"$GLAB_CONFIG_DIR/config.yml"
+    chmod 0600 "$GLAB_CONFIG_DIR/config.yml"
+    ;;
+  'auth status')
+    [[ -f ${GLAB_CONFIG_DIR:?}/config.yml ]]
+    printf '%s\n' \
+      'gitlab.enterprise.test' \
+      '  ✓ Logged in to gitlab.enterprise.test as gascan-release-fake-glab (/home/workspace/.config/glab-cli/config.yml)' \
+      '  ✓ Git operations for gitlab.enterprise.test configured to use https protocol.'
+    ;;
+  'api --hostname')
+    method=GET
+    key=
+    usage=
+    while (($#)); do
+      case $1 in
+        --method) shift; method=${1:-} ;;
+        key=*) key=${1#key=} ;;
+        usage_type=*) usage=${1#usage_type=} ;;
+      esac
+      shift
+    done
+    if [[ $method == POST ]]; then
+      [[ -n $key && $usage == auth_and_signing ]]
+      [[ $key == "$(< /home/workspace/.config/gascan/git/ssh/id_ed25519.pub)" ]]
+      jq -nc --arg key "$key" \
+        '{id:23,title:"Gas Can release",key:$key,created_at:"2026-07-31T00:00:00Z",usage_type:"auth_and_signing"}'
+    else
+      printf '[]\n'
+    fi
+    ;;
+  *) exit 64 ;;
+esac
+FAKE_GLAB
+chmod 0755 "$root/.gascan/fake-forges/glab"
+
 expected_versions=$(gascan_lock_section_json "$repo_root/images/workspace/versions.lock" tools)
 expected_gascamp=$(gascan_lock_section_json "$repo_root/images/workspace/versions.lock" gascamp | jq -er '.revision')
 expected_starship=$(
@@ -237,7 +549,7 @@ jq -e --arg domain "$dns_domain" 'type == "array" and ([.[] | select(. == $domai
   <<<"$dns_inventory" >/dev/null
 host_url="http://$dns_domain:$port"
 
-"$gascan_bin" up "$root"
+gascan_release_up
 sandbox_id=$("$gascan_bin" list --json | jq -er --arg name "$name" \
   '[.[] | select(.sandbox_id | startswith($name + "-"))] | if length == 1 then .[0].sandbox_id else error("release sandbox identity is ambiguous") end')
 inspect=$(container inspect "$sandbox_id")
@@ -401,6 +713,60 @@ jq -e '
   printf "release-xdg-config-ok\n" >"$XDG_CONFIG_HOME/gascan-release-smoke/config"
   test "$(cat "$XDG_CONFIG_HOME/gascan-release-smoke/config")" = release-xdg-config-ok
 '
+"$gascan_bin" --sandbox "$sandbox_id" run -- bash -lc '
+  install -m 0755 /workspace/.gascan/fake-forges/gh "$HOME/.local/bin/gh"
+  install -m 0755 /workspace/.gascan/fake-forges/glab "$HOME/.local/bin/glab"
+  test "$(command -v gh)" = "$HOME/.local/bin/gh"
+  test "$(command -v glab)" = "$HOME/.local/bin/glab"
+'
+gascan_configure_git_from_host_fixture
+fake_forge_token=gascan-release-fake-token
+printf '%s' "$fake_forge_token" |
+  "$gascan_bin" --sandbox "$sandbox_id" configure gh --hostname github.enterprise.test --token-stdin --git-protocol https
+printf '%s' "$fake_forge_token" |
+  "$gascan_bin" --sandbox "$sandbox_id" configure glab --hostname gitlab.enterprise.test --token-stdin --git-protocol https
+unset fake_forge_token
+"$gascan_bin" --sandbox "$sandbox_id" run -- bash -lc '
+  set -euo pipefail
+  test "$(git config --global user.name)" = "Gas Can Release"
+  test "$(git config --global user.email)" = release-smoke@example.test
+  test "$(git config --global gpg.format)" = ssh
+  test "$(git config --global commit.gpgsign)" = true
+  test "$(git config --global tag.gpgsign)" = true
+  public_key=/home/workspace/.config/gascan/git/ssh/id_ed25519.pub
+  private_key=/home/workspace/.config/gascan/git/ssh/id_ed25519
+  test -s "$public_key"
+  test "$(stat -c %a "$private_key")" = 600
+  allowed_signers=$XDG_CONFIG_HOME/gascan/git/allowed_signers
+  printf "%s %s\n" release-smoke@example.test "$(cat "$public_key")" >"$allowed_signers"
+  chmod 0600 "$allowed_signers"
+  git config --global gpg.ssh.allowedSignersFile "$allowed_signers"
+  sha256sum "$private_key" | cut -d " " -f 1 >"$XDG_CONFIG_HOME/gascan/developer-key.sha256"
+
+  signed_repo=/workspace/.gascan/release-signed-repo
+  rm -rf "$signed_repo"
+  git init -q "$signed_repo"
+  printf "signed release smoke\n" >"$signed_repo/evidence.txt"
+  (
+    cd "$signed_repo"
+    git add evidence.txt
+    git commit -q -m "Verify Gas Can release signing"
+    git tag -s -m "Verify Gas Can release tag" gascan-release-signed
+    git verify-commit HEAD
+    git verify-tag gascan-release-signed
+    git cat-file commit HEAD | grep -F "gpgsig -----BEGIN SSH SIGNATURE-----" >/dev/null
+    git cat-file tag gascan-release-signed | grep -F -- "-----BEGIN SSH SIGNATURE-----" >/dev/null
+  )
+
+  test "$(stat -c %a "$GH_CONFIG_DIR/hosts.yml")" = 600
+  test "$(stat -c %a "$GLAB_CONFIG_DIR/config.yml")" = 600
+  ! grep -R -F gascan-release-fake-token "$GH_CONFIG_DIR" "$GLAB_CONFIG_DIR"
+  log=$XDG_CONFIG_HOME/gascan/release-forge.log
+  grep -F "gh:api --hostname github.enterprise.test --method POST user/keys" "$log" >/dev/null
+  grep -F "gh:api --hostname github.enterprise.test --method POST user/ssh_signing_keys" "$log" >/dev/null
+  grep -F "glab:api --hostname gitlab.enterprise.test --method POST /user/keys" "$log" |
+    grep -F "usage_type=auth_and_signing" >/dev/null
+'
 "$gascan_bin" --sandbox "$sandbox_id" run -- \
   /opt/gascan/shell/bin/starship --version |
   grep -Fx "starship $expected_starship"
@@ -414,11 +780,14 @@ for required in \
   'SELECTOR=standard' \
   'STARSHIP_CONFIG=' \
   'STARSHIP_EXECUTABLE=' \
-  'STARSHIP_FUNCTION='
+  'STARSHIP_FUNCTION=' \
+  'NESTED_STARSHIP_CONFIG=' \
+  'NESTED_STARSHIP_EXECUTABLE=' \
+  'NESTED_STARSHIP_FUNCTION='
 do
-  grep -Fx "$required" <<<"$standard_shell" >/dev/null
+  gascan_assert_shell_field standard "$required" "$standard_shell"
 done
-grep -E '^BASH_VERSION=.+$' <<<"$standard_shell" >/dev/null
+gascan_assert_shell_pattern standard BASH_VERSION '^BASH_VERSION=.+$' "$standard_shell"
 "$gascan_bin" --sandbox "$sandbox_id" run -- curl --fail --silent --show-error --max-time 4 "$host_url" >/dev/null
 version_check=$(cat <<'VERSION_CHECK'
   actual=/tmp/gascan-release-versions.json
@@ -440,7 +809,7 @@ LOCAL_CAMP
 chmod 0755 "$root/gascamp/bin/camp"
 sed -i '' 's/gascamp = "bundled"/gascamp = "\/workspace\/gascamp"/' "$root/gascan.toml"
 sed -i '' 's/GASCAN_RELEASE_SETUP_VALUE:-initial/GASCAN_RELEASE_SETUP_VALUE:-applied/' "$root/.gascan/setup.sh"
-"$gascan_bin" up "$root"
+gascan_release_up
 "$gascan_bin" --sandbox "$sandbox_id" run -- test "$(cat "$root/.gascan/setup-result")" = initial
 "$gascan_bin" apply "$root"
 "$gascan_bin" --sandbox "$sandbox_id" run -- bash -lc '
@@ -450,10 +819,71 @@ sed -i '' 's/GASCAN_RELEASE_SETUP_VALUE:-initial/GASCAN_RELEASE_SETUP_VALUE:-app
 '
 
 "$gascan_bin" --sandbox "$sandbox_id" down
-"$gascan_bin" up "$root"
-"$gascan_bin" --sandbox "$sandbox_id" run -- test -f /workspace/.gascan/setup-result
+gascan_release_up
+"$gascan_bin" --sandbox "$sandbox_id" run -- bash -lc '
+  set -euo pipefail
+  credential_persistence_fail()
+  {
+    local field=$1 status=$2 output=${3:-}
+    output=${output//gascan-release-fake-token/[REDACTED]}
+    printf "credential persistence check failed: field=%s exit=%s\n" \
+      "$field" "$status" >&2
+    printf "credential persistence safe output (last 4096 characters):\n%s\n" \
+      "${output: -4096}" >&2
+    return "$status"
+  }
+  persistence_check()
+  {
+    local field=$1 output status
+    shift
+    if output=$("$@" 2>&1); then
+      return 0
+    else
+      status=$?
+    fi
+    credential_persistence_fail "$field" "$status" "$output"
+  }
 
-gascan_stop_attested_daemon "$gascan_bin" /usr/local/bin/gascand
+  persistence_check setup.result test -f /workspace/.gascan/setup-result
+  persistence_check git.private_key_checksum bash -c '\''
+    private_key=/home/workspace/.config/gascan/git/ssh/id_ed25519
+    test "$(sha256sum "$private_key" | cut -d " " -f 1)" = \
+      "$(< "$XDG_CONFIG_HOME/gascan/developer-key.sha256")"
+  '\''
+  persistence_check git.user_name bash -c '\''
+    test "$(git config --global user.name)" = "Gas Can Release"
+  '\''
+  persistence_check git.user_email bash -c '\''
+    test "$(git config --global user.email)" = release-smoke@example.test
+  '\''
+  persistence_check git.verify_commit \
+    git -C /workspace/.gascan/release-signed-repo verify-commit HEAD
+  persistence_check git.verify_tag \
+    git -C /workspace/.gascan/release-signed-repo verify-tag gascan-release-signed
+  persistence_check forge.github.config_mode bash -c '\''
+    test "$(stat -c %a "$GH_CONFIG_DIR/hosts.yml")" = 600
+  '\''
+  persistence_check forge.gitlab.config_mode bash -c '\''
+    test "$(stat -c %a "$GLAB_CONFIG_DIR/config.yml")" = 600
+  '\''
+  persistence_check forge.github.auth_status \
+    gh auth status --hostname github.enterprise.test
+  persistence_check forge.gitlab.auth_status \
+    glab auth status --hostname gitlab.enterprise.test
+
+  token_scan_status=0
+  grep -R -F gascan-release-fake-token "$GH_CONFIG_DIR" "$GLAB_CONFIG_DIR" >/dev/null 2>&1 || \
+    token_scan_status=$?
+  case $token_scan_status in
+    1) ;;
+    0) credential_persistence_fail forge.config_token_absence 1 \
+         "fixture token found in forge configuration" ;;
+    *) credential_persistence_fail forge.config_token_absence "$token_scan_status" \
+         "forge configuration token scan failed" ;;
+  esac
+'
+
+gascan_stop_attested_daemon "$gascan_bin" "$gascand_bin"
 "$gascan_bin" --sandbox "$sandbox_id" status --json >/dev/null
 "$gascan_bin" --sandbox "$sandbox_id" run -- true
 
@@ -469,7 +899,7 @@ user = "workspace"
 [shell]
 prompt = "starship"
 EOF_OFFLINE
-"$gascan_bin" up "$root"
+gascan_release_up
 sandbox_id=$("$gascan_bin" list --json | jq -er --arg name "$name" \
   '[.[] | select(.sandbox_id | startswith($name + "-"))] | if length == 1 then .[0].sandbox_id else error("offline sandbox identity is ambiguous") end')
 inspect=$(container inspect "$sandbox_id")
@@ -489,10 +919,17 @@ for required in \
   'SELECTOR=starship' \
   'STARSHIP_CONFIG=/home/workspace/.config/gascan/shell/starship.toml' \
   'STARSHIP_EXECUTABLE=/opt/gascan/shell/bin/starship' \
-  'STARSHIP_FUNCTION=function'
+  'STARSHIP_FUNCTION=function' \
+  'NESTED_STARSHIP_CONFIG=/home/workspace/.config/gascan/shell/starship.toml' \
+  'NESTED_STARSHIP_EXECUTABLE=/opt/gascan/shell/bin/starship' \
+  'NESTED_STARSHIP_FUNCTION=function'
 do
-  grep -Fx "$required" <<<"$starship_shell" >/dev/null
+  gascan_assert_shell_field starship "$required" "$starship_shell"
 done
+if grep -i 'warning' <<<"$starship_shell" >/dev/null; then
+  printf 'nested Starship shell emitted a warning\n' >&2
+  exit 1
+fi
 if "$gascan_bin" --sandbox "$sandbox_id" run -- curl --fail --silent --show-error --max-time 3 "$host_url"; then
   printf 'offline sandbox reached the test-owned endpoint\n' >&2
   exit 1
@@ -524,10 +961,17 @@ for required in \
   'SELECTOR=starship-nerd-font' \
   'STARSHIP_CONFIG=/home/workspace/.config/gascan/shell/starship.toml' \
   'STARSHIP_EXECUTABLE=/opt/gascan/shell/bin/starship' \
-  'STARSHIP_FUNCTION=function'
+  'STARSHIP_FUNCTION=function' \
+  'NESTED_STARSHIP_CONFIG=/home/workspace/.config/gascan/shell/starship.toml' \
+  'NESTED_STARSHIP_EXECUTABLE=/opt/gascan/shell/bin/starship' \
+  'NESTED_STARSHIP_FUNCTION=function'
 do
-  grep -Fx "$required" <<<"$nerd_shell" >/dev/null
+  gascan_assert_shell_field starship-nerd-font "$required" "$nerd_shell"
 done
+if grep -i 'warning' <<<"$nerd_shell" >/dev/null; then
+  printf 'nested Nerd Font Starship shell emitted a warning\n' >&2
+  exit 1
+fi
 destroyed_sandbox_id=$sandbox_id
 "$gascan_bin" --sandbox "$destroyed_sandbox_id" destroy --yes
 sandbox_id=
@@ -547,3 +991,4 @@ if ! gascan_assert_destroyed_controller_record "$controller_inventory" "$destroy
 fi
 
 printf 'PASS: installed Gas Can release smoke\n'
+fi

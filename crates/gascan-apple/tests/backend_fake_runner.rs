@@ -1140,7 +1140,10 @@ async fn exec_bridge_forwards_allowed_environment_in_start_frame() {
             argv: vec!["guest".to_owned()],
             stdin: Vec::new(),
             environment: BTreeMap::from([
+                ("GH_NO_UPDATE_NOTIFIER".to_owned(), "1".to_owned()),
+                ("GLAB_CHECK_UPDATE".to_owned(), "0".to_owned()),
                 ("LANG".to_owned(), "C.UTF-8".to_owned()),
+                ("NO_COLOR".to_owned(), "1".to_owned()),
                 ("TERM".to_owned(), "xterm-256color".to_owned()),
             ]),
             tty: false,

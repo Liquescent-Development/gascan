@@ -4,7 +4,7 @@ use std::{
     fs,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
 };
 
 const RUNTIME_PATH: &str = concat!(
@@ -145,6 +145,7 @@ fn hook_fixture(temporary: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf, Pa
                printf '%s\\n' 'kill -USR1 \"$GASCAN_TEST_PARENT_PID\"'\n\
              fi\n\
              printf '%s\\n' \
+               'if [ \"${GASCAN_TEST_EXPECT_CLEAR_RUNTIME-0}\" = 1 ]; then for name in STARSHIP_PREEXEC_READY STARSHIP_START_TIME STARSHIP_CMD_STATUS STARSHIP_PIPE_STATUS STARSHIP_END_TIME STARSHIP_DURATION STARSHIP_PROMPT_COMMAND STARSHIP_DEBUG_TRAP STARSHIP_SHELL STARSHIP_SESSION_KEY; do if declare -p \"$name\" >/dev/null 2>&1; then return 31; fi; done; [ \"${GASCAN_TEST_UNRELATED_SENTINEL-}\" = preserved ] || return 32; fi' \
                '_starship_set_return() { return \"${1:-0}\"; }' \
                'starship_preexec() { :; }' \
                'starship_preexec_all() { :; }' \
@@ -1851,7 +1852,7 @@ fn workstation_contract_accepts_only_the_locked_starship_first_line_behaviorally
 }
 
 #[test]
-fn workstation_home_configuration_is_idempotent_and_refuses_unmanaged_paths() {
+fn configure_workstation_home_is_idempotent_and_refuses_unmanaged_paths() {
     let script = root().join("images/workspace/bin/configure-workstation-home");
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
@@ -1862,6 +1863,34 @@ fn workstation_home_configuration_is_idempotent_and_refuses_unmanaged_paths() {
     assert!(
         !home.join(".config/gascan/.gascan-managed").exists(),
         "broad Gas Can config boundary must not be claimed as an application directory"
+    );
+    for directory in [
+        home.join(".config/gascan/git"),
+        home.join(".config/gascan/git/ssh"),
+    ] {
+        assert!(
+            directory.is_dir(),
+            "missing managed directory: {}",
+            directory.display()
+        );
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "managed directory has the wrong mode: {}",
+            directory.display()
+        );
+        assert_eq!(
+            fs::read_to_string(directory.join(".gascan-managed")).unwrap(),
+            "gascan-workstation-home-v1\n",
+            "managed directory has no valid marker: {}",
+            directory.display()
+        );
+    }
+    let ssh = home.join(".ssh");
+    assert!(ssh.symlink_metadata().unwrap().file_type().is_symlink());
+    assert_eq!(
+        fs::read_link(ssh).unwrap(),
+        Path::new(".config/gascan/git/ssh")
     );
     for agent in ["claude", "codex", "pi"] {
         let link = home.join(format!(".{agent}"));
@@ -1924,6 +1953,10 @@ fn workstation_home_configuration_is_idempotent_and_refuses_unmanaged_paths() {
         "cache-mise",
         "cache-file",
         "cache-link",
+        "ssh-file",
+        "ssh-wrong-link",
+        "git-unmarked",
+        "git-ssh-link",
     ] {
         let adversarial_home = temp.path().join(case);
         fs::create_dir(&adversarial_home).unwrap();
@@ -1948,6 +1981,23 @@ fn workstation_home_configuration_is_idempotent_and_refuses_unmanaged_paths() {
                 fs::create_dir_all(adversarial_home.join(".cache")).unwrap();
                 symlink(temp.path(), adversarial_home.join(".cache/gh")).unwrap();
             }
+            "ssh-file" => fs::write(adversarial_home.join(".ssh"), "unmanaged").unwrap(),
+            "ssh-wrong-link" => {
+                symlink(
+                    ".config/gascan/agents/claude",
+                    adversarial_home.join(".ssh"),
+                )
+                .unwrap();
+            }
+            "git-unmarked" => {
+                fs::create_dir_all(adversarial_home.join(".config/gascan/git")).unwrap();
+            }
+            "git-ssh-link" => {
+                let git = adversarial_home.join(".config/gascan/git");
+                fs::create_dir_all(&git).unwrap();
+                fs::write(git.join(".gascan-managed"), "gascan-workstation-home-v1\n").unwrap();
+                symlink(temp.path(), git.join("ssh")).unwrap();
+            }
             _ => unreachable!(),
         }
         let rejected = Command::new(&script)
@@ -1962,7 +2012,766 @@ fn workstation_home_configuration_is_idempotent_and_refuses_unmanaged_paths() {
                     .exists(),
             "preflight rejection for {case} left partial Claude state"
         );
+        let git_ssh = adversarial_home.join(".config/gascan/git/ssh");
+        if case == "git-ssh-link" {
+            assert!(git_ssh.symlink_metadata().unwrap().file_type().is_symlink());
+            assert_eq!(fs::read_link(git_ssh).unwrap(), temp.path());
+        } else {
+            assert!(
+                !git_ssh.exists(),
+                "preflight rejection for {case} created the Git SSH directory"
+            );
+        }
     }
+}
+
+struct DeveloperHomeFixture {
+    _temporary: tempfile::TempDir,
+    home: PathBuf,
+    helper: PathBuf,
+    keygen_log: PathBuf,
+}
+
+impl DeveloperHomeFixture {
+    fn new() -> Self {
+        Self::build(false, false)
+    }
+
+    fn with_uid_rewrite(wrong_uid: bool) -> Self {
+        Self::build(wrong_uid, false)
+    }
+
+    fn with_barrier() -> Self {
+        Self::build(false, true)
+    }
+
+    fn build(wrong_uid: bool, barrier: bool) -> Self {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().join("home");
+        fs::create_dir(&home).unwrap();
+        assert!(
+            Command::new(root().join("images/workspace/bin/configure-workstation-home"))
+                .env("HOME", &home)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let keygen_log = temporary.path().join("ssh-keygen.log");
+        let keygen = temporary.path().join("ssh-keygen");
+        write_mode(
+            &keygen,
+            &format!(
+                "#!/bin/sh\nset -eu\nif test \"${{1-}}\" = -q; then printf 'cwd=%s\\n' \"$PWD\" >>{}; printf '%s\\n' \"$@\" >>{}; fi\nexec /usr/bin/ssh-keygen \"$@\"\n",
+                keygen_log.display(),
+                keygen_log.display()
+            ),
+            0o755,
+        );
+        let source_path = root().join("images/workspace/bin/configure-developer-home");
+        let mut source = fs::read_to_string(&source_path).unwrap_or_else(|error| {
+            panic!("developer-home helper is unavailable at {}: {error}", source_path.display())
+        });
+        source = source.replace("/usr/bin/ssh-keygen", keygen.to_str().unwrap());
+        if cfg!(target_os = "macos") {
+            source = source.replace("/usr/bin/git", "/opt/homebrew/bin/git");
+            source = source.replace("#!/usr/bin/python3", "#!/opt/homebrew/bin/python3");
+        }
+        if wrong_uid {
+            source = source.replace("managed_uid = os.getuid()", "managed_uid = os.getuid() + 1");
+        }
+        if barrier {
+            let barrier_directory = temporary.path().join("barrier");
+            fs::create_dir(&barrier_directory).unwrap();
+            source = source.replace(
+                "        state = managed.validate_state()\n",
+                &format!(
+                    "        state = managed.validate_state()\n\
+                     \x20       if command[0] in (\"git\", \"ssh-host\"):\n\
+                     \x20           barrier_prefix = command[0] + \"-\"\n\
+                     \x20           barrier_path = os.path.join(\"{}\", barrier_prefix + str(os.getpid()))\n\
+                     \x20           barrier_fd = os.open(barrier_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)\n\
+                     \x20           os.close(barrier_fd)\n\
+                     \x20           barrier_deadline = time.monotonic() + 0.25\n\
+                     \x20           while len([name for name in os.listdir(\"{}\") if name.startswith(barrier_prefix)]) < 2 and time.monotonic() < barrier_deadline:\n\
+                     \x20               time.sleep(0.01)\n",
+                    barrier_directory.display(),
+                    barrier_directory.display(),
+                ),
+            );
+        }
+        let helper = temporary.path().join("configure-developer-home");
+        write_mode(&helper, &source, 0o555);
+        Self {
+            _temporary: temporary,
+            home,
+            helper,
+            keygen_log,
+        }
+    }
+
+    fn command(&self, arguments: &[&str]) -> Command {
+        let mut command = Command::new(&self.helper);
+        command
+            .args(arguments)
+            .env_clear()
+            .env("HOME", &self.home)
+            .env("LANG", "C")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    fn run(&self, arguments: &[&str]) -> Output {
+        self.command(arguments).output().unwrap()
+    }
+
+    fn git_root(&self) -> PathBuf {
+        self.home.join(".config/gascan/git")
+    }
+
+    fn ssh_root(&self) -> PathBuf {
+        self.git_root().join("ssh")
+    }
+
+    fn configure_git(&self, protocol: &str) -> Output {
+        self.run(&[
+            "git",
+            "--sandbox-id",
+            "demo-0123456789ab",
+            "--name",
+            "Ada Lovelace",
+            "--email",
+            "ada@example.test",
+            "--protocol",
+            protocol,
+        ])
+    }
+}
+
+fn assert_success(output: &Output) {
+    assert!(
+        output.status.success(),
+        "command failed: stdout={:?}, stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty(), "successful helper wrote stderr");
+}
+
+fn assert_rejected(output: &Output) {
+    assert!(!output.status.success(), "unsafe state was accepted");
+    assert!(output.stdout.is_empty(), "rejection wrote status data");
+}
+
+#[test]
+fn configure_developer_home_generates_one_signing_key_and_exact_git_state() {
+    let fixture = DeveloperHomeFixture::new();
+    let clean = fixture.run(&["status"]);
+    assert_success(&clean);
+    assert_eq!(
+        String::from_utf8(clean.stdout).unwrap(),
+        "{\"email\":null,\"fingerprint\":null,\"name\":null,\"protocol\":null,\"public_key\":null,\"receipt\":\"pending\"}\n"
+    );
+
+    let configured = fixture.configure_git("ssh");
+    assert_success(&configured);
+    assert!(configured.stdout.is_empty());
+    let private_key = fixture.ssh_root().join("id_ed25519");
+    let public_key = fixture.ssh_root().join("id_ed25519.pub");
+    assert_eq!(
+        fs::metadata(&fixture.ssh_root()).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(&private_key).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(&public_key).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    let original_private = fs::read(&private_key).unwrap();
+    let original_inode = fs::metadata(&private_key).unwrap().ino();
+    assert_success(&fixture.configure_git("ssh"));
+    assert_eq!(fs::read(&private_key).unwrap(), original_private);
+    assert_eq!(fs::metadata(&private_key).unwrap().ino(), original_inode);
+
+    let keygen_arguments = fs::read_to_string(&fixture.keygen_log).unwrap();
+    let keygen_arguments = keygen_arguments.lines().collect::<Vec<_>>();
+    assert_eq!(
+        keygen_arguments[1..9],
+        [
+            "-q",
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-C",
+            "gascan-demo-0123456789ab",
+            "-f",
+        ]
+    );
+    assert_eq!(keygen_arguments.len(), 10);
+    assert_eq!(keygen_arguments[9], "id_ed25519");
+    assert_eq!(
+        keygen_arguments[0],
+        format!(
+            "cwd={}/.id_ed25519.gascan-stage",
+            fs::canonicalize(fixture.ssh_root()).unwrap().display(),
+        ),
+        "key generation did not run inside its exclusively reserved staging directory"
+    );
+    assert!(
+        !fixture
+            .ssh_root()
+            .join(".id_ed25519.gascan-stage")
+            .exists(),
+        "completed key generation left its private staging directory"
+    );
+    let git_config = fixture.git_root().join("config");
+    assert!(
+        fs::read_to_string(&git_config)
+            .unwrap()
+            .starts_with("# gascan-protocol ssh\n"),
+        "protocol was not committed atomically with Git config"
+    );
+    assert!(
+        !fixture.git_root().join("protocol").exists(),
+        "protocol was split into a crash-prone second state file"
+    );
+    let get = |key: &str| {
+        let output = Command::new(if cfg!(target_os = "macos") {
+            "/opt/homebrew/bin/git"
+        } else {
+            "/usr/bin/git"
+        })
+        .args(["config", "--file", git_config.to_str().unwrap(), "--get", key])
+        .output()
+        .unwrap();
+        assert!(output.status.success(), "missing Git key {key}");
+        String::from_utf8(output.stdout).unwrap().trim_end().to_owned()
+    };
+    assert_eq!(get("user.name"), "Ada Lovelace");
+    assert_eq!(get("user.email"), "ada@example.test");
+    assert_eq!(get("gpg.format"), "ssh");
+    assert_eq!(get("user.signingkey"), public_key.to_str().unwrap());
+    assert_eq!(get("commit.gpgsign"), "true");
+    assert_eq!(get("tag.gpgsign"), "true");
+    let listed = Command::new(if cfg!(target_os = "macos") {
+        "/opt/homebrew/bin/git"
+    } else {
+        "/usr/bin/git"
+    })
+    .args([
+        "config",
+        "--file",
+        git_config.to_str().unwrap(),
+        "--name-only",
+        "--list",
+    ])
+    .output()
+    .unwrap();
+    assert!(listed.status.success());
+    let listed = String::from_utf8(listed.stdout).unwrap();
+    let mut listed = listed.lines().collect::<Vec<_>>();
+    listed.sort_unstable();
+    assert_eq!(
+        listed,
+        [
+            "commit.gpgsign",
+            "gpg.format",
+            "tag.gpgsign",
+            "user.email",
+            "user.name",
+            "user.signingkey",
+        ]
+    );
+
+    let public = fs::read_to_string(&public_key).unwrap();
+    let public = public.trim_end();
+    let status = fixture.run(&["status"]);
+    assert_success(&status);
+    let value: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(value["name"], "Ada Lovelace");
+    assert_eq!(value["email"], "ada@example.test");
+    assert_eq!(value["protocol"], "ssh");
+    assert_eq!(value["public_key"], public);
+    assert!(value["fingerprint"]
+        .as_str()
+        .unwrap()
+        .starts_with("SHA256:"));
+    assert_eq!(value["receipt"], "pending");
+    assert!(!String::from_utf8(status.stdout).unwrap().contains("PRIVATE"));
+}
+
+#[test]
+fn configure_developer_home_signs_commits_and_annotated_tags() {
+    let fixture = DeveloperHomeFixture::new();
+    assert_success(&fixture.configure_git("ssh"));
+    let repository = fixture._temporary.path().join("repository");
+    fs::create_dir(&repository).unwrap();
+    let public_key = fs::read_to_string(fixture.ssh_root().join("id_ed25519.pub")).unwrap();
+    let allowed_signers = fixture._temporary.path().join("allowed-signers");
+    fs::write(
+        &allowed_signers,
+        format!("ada@example.test {}\n", public_key.trim_end()),
+    )
+    .unwrap();
+    let git = if cfg!(target_os = "macos") {
+        "/opt/homebrew/bin/git"
+    } else {
+        "/usr/bin/git"
+    };
+    let run_git = |arguments: &[&str]| {
+        Command::new(git)
+            .arg("-C")
+            .arg(&repository)
+            .args(arguments)
+            .env("HOME", &fixture.home)
+            .env("GIT_CONFIG_GLOBAL", fixture.git_root().join("config"))
+            .output()
+            .unwrap()
+    };
+    assert_success(&run_git(&["init", "--quiet"]));
+    fs::write(repository.join("README.md"), "signed\n").unwrap();
+    assert_success(&run_git(&["add", "README.md"]));
+    assert_success(&run_git(&["commit", "--quiet", "-m", "signed commit"]));
+    assert_success(&run_git(&["tag", "-a", "v1", "-m", "signed tag"]));
+    let allowed = allowed_signers.to_str().unwrap();
+    let verified_commit = run_git(&[
+        "-c",
+        &format!("gpg.ssh.allowedSignersFile={allowed}"),
+        "verify-commit",
+        "HEAD",
+    ]);
+    assert!(
+        verified_commit.status.success(),
+        "commit signature verification failed: {}",
+        String::from_utf8_lossy(&verified_commit.stderr)
+    );
+    let verified_tag = run_git(&[
+        "-c",
+        &format!("gpg.ssh.allowedSignersFile={allowed}"),
+        "verify-tag",
+        "v1",
+    ]);
+    assert!(
+        verified_tag.status.success(),
+        "tag signature verification failed: {}",
+        String::from_utf8_lossy(&verified_tag.stderr)
+    );
+}
+
+#[test]
+fn configure_developer_home_rejects_hostile_key_config_receipt_and_stage_paths() {
+    for case in [
+        "fifo",
+        "symlink",
+        "permissive",
+        "hard-link",
+        "invalid-private",
+        "partial-pair",
+        "unsafe-config",
+        "unsafe-config-content",
+        "unsafe-receipt",
+        "staging-file",
+    ] {
+        let fixture = DeveloperHomeFixture::new();
+        let ssh = fixture.ssh_root();
+        let git = fixture.git_root();
+        let target = match case {
+            "fifo" => {
+                assert_success(&fixture.configure_git("ssh"));
+                let path = ssh.join("id_ed25519");
+                fs::remove_file(&path).unwrap();
+                assert!(Command::new("mkfifo").arg(&path).status().unwrap().success());
+                path
+            }
+            "symlink" => {
+                assert_success(&fixture.configure_git("ssh"));
+                let outside = fixture._temporary.path().join("outside");
+                fs::write(&outside, "outside data").unwrap();
+                let path = ssh.join("id_ed25519");
+                fs::remove_file(&path).unwrap();
+                symlink(&outside, &path).unwrap();
+                path
+            }
+            "permissive" => {
+                assert_success(&fixture.configure_git("ssh"));
+                let path = ssh.join("id_ed25519");
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+                path
+            }
+            "hard-link" => {
+                assert_success(&fixture.configure_git("ssh"));
+                let path = ssh.join("id_ed25519");
+                fs::hard_link(&path, fixture._temporary.path().join("second-link")).unwrap();
+                path
+            }
+            "invalid-private" => {
+                assert_success(&fixture.configure_git("ssh"));
+                let path = ssh.join("id_ed25519");
+                write_mode(&path, "not a private key\n", 0o600);
+                path
+            }
+            "partial-pair" => {
+                let path = ssh.join("id_ed25519");
+                write_mode(&path, "partial private key\n", 0o600);
+                path
+            }
+            "unsafe-config" => {
+                let path = git.join("config");
+                write_mode(&path, "[user]\n\tname = preserve\n", 0o644);
+                path
+            }
+            "unsafe-config-content" => {
+                assert_success(&fixture.configure_git("ssh"));
+                let path = git.join("config");
+                let output = Command::new(if cfg!(target_os = "macos") {
+                    "/opt/homebrew/bin/git"
+                } else {
+                    "/usr/bin/git"
+                })
+                .args([
+                    "config",
+                    "--file",
+                    path.to_str().unwrap(),
+                    "user.name",
+                    &"a".repeat(513),
+                ])
+                .output()
+                .unwrap();
+                assert!(output.status.success());
+                path
+            }
+            "unsafe-receipt" => {
+                let path = git.join("developer-onboarding");
+                write_mode(&path, "preserve unsafe receipt\n", 0o644);
+                path
+            }
+            "staging-file" => {
+                let path = ssh.join(".id_ed25519.gascan-stage");
+                write_mode(&path, "preserve stage\n", 0o600);
+                path
+            }
+            _ => unreachable!(),
+        };
+        let before = fs::symlink_metadata(&target).unwrap();
+        let before_contents = if before.file_type().is_file() {
+            Some(fs::read(&target).unwrap())
+        } else {
+            None
+        };
+        let rejected = fixture.configure_git("ssh");
+        assert_rejected(&rejected);
+        let after = fs::symlink_metadata(&target).unwrap();
+        assert_eq!(after.ino(), before.ino(), "{case} inode was replaced");
+        assert_eq!(after.file_type(), before.file_type(), "{case} type changed");
+        if let Some(contents) = before_contents {
+            assert_eq!(fs::read(&target).unwrap(), contents, "{case} was modified");
+        }
+        if matches!(
+            case,
+            "partial-pair" | "unsafe-config" | "unsafe-receipt" | "staging-file"
+        ) {
+            assert!(
+                !ssh.join("id_ed25519.pub").exists(),
+                "{case} left partial generated key material"
+            );
+        }
+    }
+
+    let wrong_owner = DeveloperHomeFixture::with_uid_rewrite(true);
+    let rejected = wrong_owner.configure_git("ssh");
+    assert_rejected(&rejected);
+    assert!(!wrong_owner.ssh_root().join("id_ed25519").exists());
+}
+
+#[test]
+fn configure_developer_home_manages_verified_sorted_ssh_hosts_without_disabling_checks() {
+    let fixture = DeveloperHomeFixture::new();
+    assert_success(&fixture.configure_git("ssh"));
+    assert_success(&fixture.run(&["ssh-host", "--hostname", "z.example.test"]));
+    assert_success(&fixture.run(&["ssh-host", "--hostname", "a.example.test"]));
+    let config = fs::read_to_string(fixture.ssh_root().join("config")).unwrap();
+    let identity = fixture.ssh_root().join("id_ed25519");
+    assert_eq!(
+        config,
+        format!(
+            "Host a.example.test\n    HostName a.example.test\n    IdentityFile {}\n    IdentitiesOnly yes\n\nHost z.example.test\n    HostName z.example.test\n    IdentityFile {}\n    IdentitiesOnly yes\n",
+            identity.display(),
+            identity.display(),
+        )
+    );
+    assert!(
+        !fixture.ssh_root().join("known_hosts").exists(),
+        "ssh-host prepopulated trust before Task 6's visible first-use verification"
+    );
+    let config_before = fs::read(fixture.ssh_root().join("config")).unwrap();
+    let config_inode = fs::metadata(fixture.ssh_root().join("config"))
+        .unwrap()
+        .ino();
+    assert_success(&fixture.run(&["ssh-host", "--hostname", "a.example.test"]));
+    assert_eq!(
+        fs::read(fixture.ssh_root().join("config")).unwrap(),
+        config_before,
+        "repeating a host changed SSH config"
+    );
+    assert_eq!(
+        fs::metadata(fixture.ssh_root().join("config"))
+            .unwrap()
+            .ino(),
+        config_inode,
+        "idempotent host setup replaced SSH config"
+    );
+
+    for hostname in [
+        "-oProxyCommand=bad",
+        "example.test/path",
+        "EXAMPLE.test",
+        "127.0.0.1",
+        "bad..example",
+        "bad\nexample.test",
+    ] {
+        assert_rejected(&fixture.run(&["ssh-host", "--hostname", hostname]));
+        assert_eq!(
+            fs::read(fixture.ssh_root().join("config")).unwrap(),
+            config_before
+        );
+    }
+
+    let https = DeveloperHomeFixture::new();
+    assert_success(&https.configure_git("https"));
+    assert!(!https.ssh_root().join("config").exists());
+    assert!(!https.ssh_root().join("known_hosts").exists());
+    assert_rejected(&https.run(&[
+        "ssh-host",
+        "--hostname",
+        "git.enterprise.test",
+    ]));
+    assert!(
+        !https.ssh_root().join("config").exists(),
+        "explicit HTTPS state accepted an SSH host mutation"
+    );
+}
+
+#[test]
+fn configure_developer_home_serializes_concurrent_git_and_ssh_host_mutations() {
+    let git_fixture = DeveloperHomeFixture::with_barrier();
+    let git_arguments = [
+        "git",
+        "--sandbox-id",
+        "demo-0123456789ab",
+        "--name",
+        "Ada Lovelace",
+        "--email",
+        "ada@example.test",
+        "--protocol",
+        "ssh",
+    ];
+    let first = git_fixture.command(&git_arguments).spawn().unwrap();
+    let second = git_fixture.command(&git_arguments).spawn().unwrap();
+    assert_success(&first.wait_with_output().unwrap());
+    assert_success(&second.wait_with_output().unwrap());
+    assert_eq!(
+        fs::read_to_string(&git_fixture.keygen_log)
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with("cwd="))
+            .count(),
+        1,
+        "concurrent Git setup generated more than one sandbox key"
+    );
+
+    let host_fixture = DeveloperHomeFixture::with_barrier();
+    assert_success(&host_fixture.configure_git("ssh"));
+    let first = host_fixture
+        .command(&["ssh-host", "--hostname", "a.example.test"])
+        .spawn()
+        .unwrap();
+    let second = host_fixture
+        .command(&["ssh-host", "--hostname", "z.example.test"])
+        .spawn()
+        .unwrap();
+    assert_success(&first.wait_with_output().unwrap());
+    assert_success(&second.wait_with_output().unwrap());
+    let config = fs::read_to_string(host_fixture.ssh_root().join("config")).unwrap();
+    assert!(config.contains("Host a.example.test\n"));
+    assert!(config.contains("Host z.example.test\n"));
+    assert!(!host_fixture.ssh_root().join("known_hosts").exists());
+}
+
+#[test]
+fn configure_developer_home_receipt_is_versioned_atomic_and_contains_no_setup_data() {
+    let fixture = DeveloperHomeFixture::new();
+    for (operation, state, contents) in [
+        ("complete", "complete", "gascan-developer-onboarding-v1 complete\n"),
+        ("decline", "declined", "gascan-developer-onboarding-v1 declined\n"),
+    ] {
+        let output = fixture.run(&["receipt", operation]);
+        assert_success(&output);
+        assert!(output.stdout.is_empty());
+        let status = fixture.run(&["receipt", "status"]);
+        assert_success(&status);
+        assert_eq!(String::from_utf8(status.stdout).unwrap(), format!("{state}\n"));
+        let receipt = fixture.git_root().join("developer-onboarding");
+        assert_eq!(fs::read_to_string(&receipt).unwrap(), contents);
+        assert_eq!(fs::metadata(receipt).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(!contents.contains("Ada"));
+        assert!(!contents.contains("token"));
+    }
+    let secret = "gascan-test-secret-7d9f3a";
+    let rejected = fixture.run(&["git", "--token", secret]);
+    assert_rejected(&rejected);
+    assert!(!String::from_utf8_lossy(&rejected.stderr).contains(secret));
+    assert!(!String::from_utf8_lossy(&rejected.stdout).contains(secret));
+}
+
+#[test]
+fn configure_developer_home_is_installed_immutably_in_the_workspace_image() {
+    let dockerfile = fs::read_to_string(root().join("images/workspace/Dockerfile")).unwrap();
+    assert!(dockerfile.contains(
+        "COPY --chmod=0555 images/workspace/bin/configure-developer-home /usr/local/bin/configure-developer-home"
+    ));
+    let contract = fs::read_to_string(root().join("images/workspace/tests/workstation-contract.sh"))
+        .unwrap();
+    assert!(contract.contains("/usr/local/bin/configure-developer-home"));
+    assert!(contract.contains("root:root:555"));
+}
+
+fn write_managed_home_directory(directory: &Path, mode: u32) {
+    fs::create_dir_all(directory).unwrap();
+    fs::set_permissions(directory, fs::Permissions::from_mode(mode)).unwrap();
+    let marker = directory.join(".gascan-managed");
+    fs::write(&marker, "gascan-workstation-home-v1\n").unwrap();
+    fs::set_permissions(marker, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn assert_configure_workstation_home_rejects_git_metadata(case: &str) {
+    let script = root().join("images/workspace/bin/configure-workstation-home");
+    let temporary = tempfile::tempdir().unwrap();
+    let test_home = temporary.path().join("home");
+    fs::create_dir(&test_home).unwrap();
+    let git = test_home.join(".config/gascan/git");
+    let ssh = git.join("ssh");
+    let invalid_directory = match case {
+        "git-wrong-mode" => {
+            write_managed_home_directory(&git, 0o755);
+            &git
+        }
+        "ssh-wrong-mode" => {
+            write_managed_home_directory(&git, 0o700);
+            write_managed_home_directory(&ssh, 0o755);
+            &ssh
+        }
+        "git-wrong-owner" => {
+            write_managed_home_directory(&git, 0o700);
+            &git
+        }
+        "ssh-wrong-owner" => {
+            write_managed_home_directory(&git, 0o700);
+            write_managed_home_directory(&ssh, 0o700);
+            &ssh
+        }
+        _ => unreachable!(),
+    };
+    let invalid_inode = fs::symlink_metadata(invalid_directory).unwrap().ino();
+    let invalid_mode = fs::metadata(invalid_directory)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+
+    let mut command = Command::new(&script);
+    command.env("HOME", &test_home);
+    if case.ends_with("wrong-owner") {
+        let fake_bin = temporary.path().join("fake-bin");
+        fs::create_dir(&fake_bin).unwrap();
+        let id = fake_bin.join("id");
+        fs::write(
+            &id,
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               -u) printf '%s\\n' \"$GASCAN_TEST_UID\" ;;\n\
+               -g) printf '%s\\n' \"$GASCAN_TEST_GID\" ;;\n\
+               *) exec /usr/bin/id \"$@\" ;;\n\
+             esac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&id, fs::Permissions::from_mode(0o555)).unwrap();
+        let stat = fake_bin.join("stat");
+        fs::write(
+            &stat,
+            "#!/bin/sh\n\
+             last=\n\
+             for argument do last=$argument; done\n\
+             if test -n \"${GASCAN_TEST_MATCH-}\" && { test \"$last\" = \"$GASCAN_TEST_MATCH\" || test \"$last\" = \"$GASCAN_TEST_MATCH/.gascan-managed\"; }; then\n\
+               case \"$last\" in */.gascan-managed) mode=600 ;; *) mode=700 ;; esac\n\
+               printf '%s:%s:%s\\n' \"$GASCAN_TEST_UID\" \"$GASCAN_TEST_GID\" \"$mode\"\n\
+               exit 0\n\
+             fi\n\
+             exec /usr/bin/stat \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&stat, fs::Permissions::from_mode(0o555)).unwrap();
+        let metadata = fs::metadata(temporary.path()).unwrap();
+        let modeled_uid = metadata.uid() + 1;
+        let system_path = std::env::var_os("PATH").unwrap_or_default();
+        command
+            .env(
+                "PATH",
+                format!("{}:{}", fake_bin.display(), system_path.to_string_lossy()),
+            )
+            .env("GASCAN_TEST_UID", modeled_uid.to_string())
+            .env("GASCAN_TEST_GID", metadata.gid().to_string());
+        if case == "ssh-wrong-owner" {
+            command.env("GASCAN_TEST_MATCH", &git);
+        }
+    }
+
+    let rejected = command.status().unwrap();
+    assert!(!rejected.success(), "accepted {case}");
+    assert!(
+        !test_home.join(".config/gascan/agents").exists(),
+        "rejection for {case} occurred after earlier managed-directory mutation"
+    );
+    assert!(
+        !test_home.join(".ssh").exists(),
+        "rejection for {case} occurred after link publication"
+    );
+    let metadata = fs::symlink_metadata(invalid_directory).unwrap();
+    assert_eq!(metadata.ino(), invalid_inode, "replaced {case} directory");
+    assert_eq!(
+        metadata.permissions().mode() & 0o777,
+        invalid_mode,
+        "changed {case} mode"
+    );
+    assert_eq!(
+        fs::read_to_string(invalid_directory.join(".gascan-managed")).unwrap(),
+        "gascan-workstation-home-v1\n",
+        "changed {case} marker"
+    );
+}
+
+#[test]
+fn configure_workstation_home_rejects_marked_git_directory_with_wrong_mode() {
+    assert_configure_workstation_home_rejects_git_metadata("git-wrong-mode");
+}
+
+#[test]
+fn configure_workstation_home_rejects_marked_ssh_directory_with_wrong_mode() {
+    assert_configure_workstation_home_rejects_git_metadata("ssh-wrong-mode");
+}
+
+#[test]
+fn configure_workstation_home_rejects_marked_git_directory_with_wrong_owner() {
+    assert_configure_workstation_home_rejects_git_metadata("git-wrong-owner");
+}
+
+#[test]
+fn configure_workstation_home_rejects_marked_ssh_directory_with_wrong_owner() {
+    assert_configure_workstation_home_rejects_git_metadata("ssh-wrong-owner");
 }
 
 #[test]
@@ -2166,6 +2975,59 @@ fn shell_hook_uses_only_the_pinned_binary_and_managed_config() {
 }
 
 #[test]
+fn nested_interactive_bash_reinitializes_inherited_starship_state() {
+    let temporary = tempfile::tempdir().unwrap();
+    let (hook, shell_dir, _starship, log) = hook_fixture(&temporary);
+    write_mode(&shell_dir.join("prompt"), "starship\n", 0o640);
+    write_mode(
+        &shell_dir.join("starship.toml"),
+        "format = \"$character\"\n",
+        0o640,
+    );
+    let command = r#"
+        . "$GASCAN_TEST_HOOK"
+        STARSHIP_PREEXEC_READY=attacker
+        STARSHIP_START_TIME=attacker
+        STARSHIP_CMD_STATUS=attacker
+        STARSHIP_PIPE_STATUS=attacker
+        STARSHIP_END_TIME=attacker
+        STARSHIP_DURATION=attacker
+        STARSHIP_PROMPT_COMMAND=attacker
+        STARSHIP_DEBUG_TRAP=attacker
+        STARSHIP_SHELL=attacker
+        STARSHIP_SESSION_KEY=attacker
+        GASCAN_TEST_EXPECT_CLEAR_RUNTIME=1
+        GASCAN_TEST_UNRELATED_SENTINEL=preserved
+        export STARSHIP_CONFIG STARSHIP_EXECUTABLE STARSHIP_PREEXEC_READY
+        export STARSHIP_START_TIME STARSHIP_CMD_STATUS STARSHIP_PIPE_STATUS
+        export STARSHIP_END_TIME STARSHIP_DURATION STARSHIP_PROMPT_COMMAND
+        export STARSHIP_DEBUG_TRAP STARSHIP_SHELL STARSHIP_SESSION_KEY
+        export GASCAN_TEST_EXPECT_CLEAR_RUNTIME GASCAN_TEST_UNRELATED_SENTINEL
+        GASCAN_TEST_HOOK="$GASCAN_TEST_HOOK" GASCAN_TEST_LOG="$GASCAN_TEST_LOG" \
+          /bin/bash --noprofile --norc -ic \
+          '. "$GASCAN_TEST_HOOK"; printf "PS1=%s\nSENTINEL=%s\n" "$PS1" "$GASCAN_TEST_UNRELATED_SENTINEL"'
+    "#;
+    let output = run_hook(&hook, command, &log, false, false, true);
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("PS1=managed-starship"),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("Starship prompt unavailable"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("SENTINEL=preserved"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
 fn shell_hook_preserves_supported_prompt_command_customization() {
     let temporary = tempfile::tempdir().unwrap();
     let (hook, shell_dir, _starship, log) = hook_fixture(&temporary);
@@ -2309,7 +3171,7 @@ fn shell_hook_warns_once_and_returns_success_when_starship_is_unavailable() {
     let before = fs::read_to_string(&log).unwrap_or_default();
     let self_clearing_debug_trap = run_hook(
         &hook,
-        r#"PS1=native-prompt; set -T; builtin trap 'builtin trap - DEBUG; STARSHIP_START_TIME=attacker' DEBUG; . "$GASCAN_TEST_HOOK"; printf 'PS1=%s\nSTART=%s\nTRAP=%s\n' "$PS1" "${STARSHIP_START_TIME-unset}" "$(builtin trap -p DEBUG)""#,
+        r#"PS1=native-prompt; set -T; builtin trap 'builtin trap - DEBUG; readonly STARSHIP_START_TIME=attacker' DEBUG; . "$GASCAN_TEST_HOOK"; printf 'PS1=%s\nSTART=%s\nTRAP=%s\n' "$PS1" "${STARSHIP_START_TIME-unset}" "$(builtin trap -p DEBUG)""#,
         &log,
         false,
         false,
@@ -2489,57 +3351,62 @@ fn shell_hook_warns_once_and_returns_success_when_starship_is_unavailable() {
         ),
         (
             "STARSHIP_PREEXEC_READY variable",
-            "STARSHIP_PREEXEC_READY=attacker",
+            "readonly STARSHIP_PREEXEC_READY=attacker",
             "variable=attacker",
         ),
         (
             "STARSHIP_START_TIME variable",
-            "STARSHIP_START_TIME=attacker",
+            "readonly STARSHIP_START_TIME=attacker",
             "variable=attacker",
         ),
         (
             "STARSHIP_CMD_STATUS variable",
-            "STARSHIP_CMD_STATUS=attacker",
+            "readonly STARSHIP_CMD_STATUS=attacker",
             "variable=attacker",
         ),
         (
             "STARSHIP_PIPE_STATUS variable",
-            "STARSHIP_PIPE_STATUS=attacker",
+            "readonly STARSHIP_PIPE_STATUS=attacker",
             "variable=attacker",
         ),
         (
             "STARSHIP_END_TIME variable",
-            "STARSHIP_END_TIME=attacker",
+            "readonly STARSHIP_END_TIME=attacker",
             "variable=attacker",
         ),
         (
             "STARSHIP_DURATION variable",
-            "STARSHIP_DURATION=attacker",
+            "readonly STARSHIP_DURATION=attacker",
             "variable=attacker",
         ),
         (
             "STARSHIP_PROMPT_COMMAND variable",
-            "STARSHIP_PROMPT_COMMAND=attacker",
+            "readonly STARSHIP_PROMPT_COMMAND=attacker",
             "variable=attacker",
         ),
         (
             "STARSHIP_DEBUG_TRAP variable",
-            "STARSHIP_DEBUG_TRAP=attacker",
+            "readonly STARSHIP_DEBUG_TRAP=attacker",
             "variable=attacker",
         ),
         (
             "STARSHIP_SHELL variable",
-            "STARSHIP_SHELL=attacker",
+            "readonly STARSHIP_SHELL=attacker",
             "variable=attacker",
         ),
         (
             "STARSHIP_SESSION_KEY variable",
-            "STARSHIP_SESSION_KEY=attacker",
+            "readonly STARSHIP_SESSION_KEY=attacker",
             "variable=attacker",
         ),
     ] {
         let before = fs::read_to_string(&log).unwrap_or_default();
-        let variable_name = setup.split('=').next().unwrap();
+        let variable_name = setup
+            .strip_prefix("readonly ")
+            .unwrap_or(setup)
+            .split('=')
+            .next()
+            .unwrap();
         let inspection = if name.contains("variable") {
             format!("printf 'variable=%s\\n' \"${{{variable_name}}}\"")
         } else if name.starts_with("_starship_set_return") {

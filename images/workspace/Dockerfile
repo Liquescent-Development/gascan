@@ -94,6 +94,7 @@ COPY --chmod=0555 images/workspace/tests/ssh-contract.sh /opt/gascan/tests/ssh-c
 COPY --chmod=0555 images/workspace/bin/install-workstation-artifacts /usr/local/bin/install-workstation-artifacts
 COPY --chmod=0555 images/workspace/bin/run-workstation-step /usr/local/bin/run-workstation-step
 COPY --chmod=0555 images/workspace/bin/configure-workstation-home /usr/local/bin/configure-workstation-home
+COPY --chmod=0555 images/workspace/bin/configure-developer-home /usr/local/bin/configure-developer-home
 COPY --chmod=0555 images/workspace/bin/configure-shell-home /usr/local/bin/configure-shell-home
 COPY --chmod=0555 images/workspace/bin/initialize-rust-home /usr/local/bin/initialize-rust-home
 RUN install -d -o root -g root -m 0555 /etc/gascan
@@ -170,6 +171,7 @@ RUN --network=none test -x /opt/gascan/gascamp/bin/camp \
        /home/workspace/.claude \
        /home/workspace/.codex \
        /home/workspace/.pi \
+       /home/workspace/.ssh \
        /home/workspace/.config/herdr \
     && /usr/local/bin/run-workstation-step sudoers-mode \
        chmod 0440 /etc/sudoers.d/workspace \
@@ -225,6 +227,7 @@ ENV PI_CODING_AGENT_SESSION_DIR=/home/workspace/.cache/pi
 ENV HERDR_CONFIG_PATH=/home/workspace/.config/gascan/herdr/config.toml
 ENV GH_CONFIG_DIR=/home/workspace/.config/gascan/gh
 ENV GLAB_CONFIG_DIR=/home/workspace/.config/gascan/glab
+ENV GIT_CONFIG_GLOBAL=/home/workspace/.config/gascan/git/config
 ENV PATH=/home/workspace/.local/bin:/home/workspace/.local/share/cargo/bin:/home/workspace/.local/share/go/bin:/home/workspace/.local/share/gem/bin:/home/workspace/.local/share/mise/shims:/opt/gascan/mise/shims:/usr/local/sbin:/usr/local/bin:/opt/gascan/workstation/bin:/usr/sbin:/usr/bin:/sbin:/bin
 USER workspace:workspace
 WORKDIR /workspace

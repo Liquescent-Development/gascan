@@ -248,6 +248,17 @@ PARTIAL_INIT
                 printf '%s\n' 'kill -USR1 "$GASCAN_TEST_PARENT_PID"'
             fi
             cat <<'FULL_INIT'
+if test "${GASCAN_TEST_EXPECT_CLEAR_RUNTIME:-0}" = 1; then
+    for name in STARSHIP_PREEXEC_READY STARSHIP_START_TIME \
+        STARSHIP_CMD_STATUS STARSHIP_PIPE_STATUS STARSHIP_END_TIME \
+        STARSHIP_DURATION STARSHIP_PROMPT_COMMAND STARSHIP_DEBUG_TRAP \
+        STARSHIP_SHELL STARSHIP_SESSION_KEY; do
+        if declare -p "$name" >/dev/null 2>&1; then
+            return 31
+        fi
+    done
+    test "${GASCAN_TEST_UNRELATED_SENTINEL:-}" = preserved || return 32
+fi
 _starship_set_return()
 {
     return "${1:-0}"
@@ -358,6 +369,65 @@ grep -Fqx \
 test "$(grep -Fc 'init bash --print-full-init' "$stable_log")" = 1 ||
     die 'root full init executed more than once'
 
+nested_log=/tmp/gascan-nested-starship.log
+: >"$nested_log"
+chmod 0666 "$nested_log"
+nested_output=$(
+    GASCAN_TEST_STABLE_LOG="$nested_log" \
+        PATH="$attacker_bin:/usr/bin:/bin" \
+        /bin/bash --noprofile --norc -i -c \
+        ". '$hook'; \
+         STARSHIP_PREEXEC_READY=attacker; STARSHIP_START_TIME=attacker; \
+         STARSHIP_CMD_STATUS=attacker; STARSHIP_PIPE_STATUS=attacker; \
+         STARSHIP_END_TIME=attacker; STARSHIP_DURATION=attacker; \
+         STARSHIP_PROMPT_COMMAND=attacker; STARSHIP_DEBUG_TRAP=attacker; \
+         STARSHIP_SHELL=attacker; STARSHIP_SESSION_KEY=attacker; \
+         GASCAN_TEST_EXPECT_CLEAR_RUNTIME=1; \
+         GASCAN_TEST_UNRELATED_SENTINEL=preserved; \
+         export STARSHIP_CONFIG STARSHIP_EXECUTABLE STARSHIP_PREEXEC_READY \
+           STARSHIP_START_TIME STARSHIP_CMD_STATUS STARSHIP_PIPE_STATUS \
+           STARSHIP_END_TIME STARSHIP_DURATION STARSHIP_PROMPT_COMMAND \
+           STARSHIP_DEBUG_TRAP STARSHIP_SHELL STARSHIP_SESSION_KEY \
+           GASCAN_TEST_EXPECT_CLEAR_RUNTIME GASCAN_TEST_UNRELATED_SENTINEL; \
+         /bin/bash --noprofile --norc -i -c \
+           '. \"$hook\"; printf \"PS1=%s\\nSENTINEL=%s\\n\" \
+             \"\$PS1\" \"\$GASCAN_TEST_UNRELATED_SENTINEL\"'" 2>&1
+)
+test "$(printf '%s\n' "$nested_output" |
+    grep -Fc 'gascan: Starship prompt unavailable; using standard Bash prompt.')" = 0 ||
+    die 'nested interactive Bash emitted a fallback warning'
+printf '%s\n' "$nested_output" | grep -Fqx PS1=managed-starship ||
+    die 'nested interactive Bash did not evaluate a fresh full init'
+printf '%s\n' "$nested_output" | grep -Fqx SENTINEL=preserved ||
+    die 'nested interactive Bash did not preserve unrelated state'
+test "$(grep -Fc 'init bash --print-full-init' "$nested_log")" = 2 ||
+    die 'nested interactive Bash did not run two full initializations'
+
+nameref_log=/tmp/gascan-nameref-starship.log
+: >"$nameref_log"
+chmod 0666 "$nameref_log"
+nameref_output=$(
+    GASCAN_TEST_STABLE_LOG="$nameref_log" \
+        PATH="$attacker_bin:/usr/bin:/bin" \
+        /bin/bash --noprofile --norc -i -c \
+        "PS1='native-root'; initialization=attacker; \
+         declare -n STARSHIP_SHELL=initialization; \
+         printf 'BEFORE='; declare -p STARSHIP_SHELL; . '$hook'; \
+         printf 'PS1=%s\nTARGET=%s\nAFTER=' \
+           \"\$PS1\" \"\$initialization\"; declare -p STARSHIP_SHELL" 2>&1
+)
+test "$(printf '%s\n' "$nameref_output" |
+    grep -Fc 'gascan: Starship prompt unavailable; using standard Bash prompt.')" = 1 ||
+    die 'writable nameref collision did not warn exactly once'
+printf '%s\n' "$nameref_output" | grep -Fqx PS1=native-root ||
+    die 'writable nameref collision changed the native prompt'
+printf '%s\n' "$nameref_output" | grep -Fqx TARGET=attacker ||
+    die 'writable nameref collision changed its target'
+test "$(printf '%s\n' "$nameref_output" |
+    grep -Fc 'declare -n STARSHIP_SHELL="initialization"')" = 2 ||
+    die 'writable nameref collision changed its declaration'
+test ! -s "$nameref_log" || die 'writable nameref collision reached Starship'
+
 : >"$stable_log"
 workspace_output=$(
     /usr/sbin/runuser -u workspace -- env \
@@ -453,7 +523,7 @@ test "$(grep -Fc 'init bash --print-full-init' "$stable_log")" = 1 ||
 self_clearing_debug_output=$(
     PATH="$attacker_bin:/usr/bin:/bin" /bin/bash --noprofile --norc -i -c \
         "PS1='native-root'; set -T; \
-         builtin trap 'builtin trap - DEBUG; STARSHIP_START_TIME=attacker' DEBUG; \
+         builtin trap 'builtin trap - DEBUG; readonly STARSHIP_START_TIME=attacker' DEBUG; \
          . '$hook'; printf 'PS1=%s\nSTART=%s\nTRAP=%s\n' \
          \"\$PS1\" \"\${STARSHIP_START_TIME-unset}\" \
          \"\$(builtin trap -p DEBUG)\"" 2>&1
@@ -528,7 +598,7 @@ test "$(grep -Fc 'init bash --print-full-init' "$stable_log")" = 3 ||
 
 collision_output=$(
     PATH="$attacker_bin:/usr/bin:/bin" /bin/bash --noprofile --norc -i -c \
-        "PS1='native-root'; STARSHIP_SHELL=attacker; \
+        "PS1='native-root'; readonly STARSHIP_SHELL=attacker; \
          starship_precmd() { printf attacker; }; \
          . '$hook'; printf 'FUNCTION='; starship_precmd; \
          printf '\nVARIABLE=%s\nPS1=%s\n' \"\$STARSHIP_SHELL\" \"\$PS1\"" 2>&1

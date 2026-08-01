@@ -379,10 +379,12 @@ where
 }
 
 fn is_allowed_environment_key(key: &str) -> bool {
-    matches!(key, "TERM" | "COLORTERM" | "LANG")
-        || key
-            .strip_prefix("LC_")
-            .is_some_and(|suffix| !suffix.is_empty())
+    matches!(
+        key,
+        "TERM" | "COLORTERM" | "LANG" | "GH_NO_UPDATE_NOTIFIER" | "GLAB_CHECK_UPDATE" | "NO_COLOR"
+    ) || key
+        .strip_prefix("LC_")
+        .is_some_and(|suffix| !suffix.is_empty())
 }
 
 fn validate_spec(spec: &SandboxSpec) -> Result<(), PolicyError> {

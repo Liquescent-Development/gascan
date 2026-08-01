@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+base64.workspace = true
 clap.workspace = true
 console.workspace = true
 gascan-proto = { path = "../gascan-proto" }

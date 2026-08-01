@@ -8,8 +8,12 @@ marker_value=gascan-workstation-home-v1
 config_root=$HOME/.config
 gascan_root=$config_root/gascan
 agents_root=$gascan_root/agents
+git_root=$gascan_root/git
+ssh_root=$git_root/ssh
 herdr_link=$HOME/.config/herdr
 herdr_expected=../.cache/herdr
+managed_uid=$(id -u)
+managed_gid=$(id -g)
 
 refuse()
 {
@@ -36,6 +40,16 @@ preflight_link()
     fi
 }
 
+path_metadata()
+{
+    path=$1
+    if metadata=$(stat -c '%u:%g:%a' "$path" 2>/dev/null); then
+        printf '%s\n' "$metadata"
+    else
+        stat -f '%u:%g:%Lp' "$path"
+    fi
+}
+
 preflight_managed_dir()
 {
     directory=$1
@@ -43,9 +57,11 @@ preflight_managed_dir()
         refuse "$directory"
     fi
     if [ -d "$directory" ]; then
+        test "$(path_metadata "$directory")" = "$managed_uid:$managed_gid:700" || refuse "$directory"
         marker=$directory/$marker_name
         test ! -L "$marker" || refuse "$directory"
         test -f "$marker" || refuse "$directory"
+        test "$(path_metadata "$marker")" = "$managed_uid:$managed_gid:600" || refuse "$directory"
         test "$(cat "$marker")" = "$marker_value" || refuse "$directory"
     fi
 }
@@ -66,6 +82,7 @@ preflight_parent "$HOME/.cache"
 for agent in claude codex pi; do
     preflight_link "$HOME/.$agent" ".config/gascan/agents/$agent"
 done
+preflight_link "$HOME/.ssh" ".config/gascan/git/ssh"
 preflight_link "$herdr_link" "$herdr_expected"
 
 preflight_managed_dir "$agents_root"
@@ -73,6 +90,8 @@ for directory in \
     "$agents_root/claude" \
     "$agents_root/codex" \
     "$agents_root/pi" \
+    "$git_root" \
+    "$ssh_root" \
     "$gascan_root/herdr" \
     "$gascan_root/gh" \
     "$gascan_root/glab" \
@@ -92,6 +111,8 @@ for directory in \
     "$agents_root/claude" \
     "$agents_root/codex" \
     "$agents_root/pi" \
+    "$git_root" \
+    "$ssh_root" \
     "$gascan_root/herdr" \
     "$gascan_root/gh" \
     "$gascan_root/glab" \
@@ -112,6 +133,9 @@ for agent in claude codex pi; do
         ln -s ".config/gascan/agents/$agent" "$link"
     fi
 done
+if [ ! -L "$HOME/.ssh" ]; then
+    ln -s ".config/gascan/git/ssh" "$HOME/.ssh"
+fi
 if [ ! -L "$herdr_link" ]; then
     ln -s "$herdr_expected" "$herdr_link"
 fi

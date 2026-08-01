@@ -1332,6 +1332,18 @@ impl AppleE2e {
         run_pty_script_command(command, script, completion_marker)
     }
 
+    pub fn run_default_shell_pty_script_with_output_guard(
+        &self,
+        script: &str,
+        completion_marker: &[u8],
+        term: &str,
+        guard: impl Fn(&[u8], &[u8]) -> TestResult,
+    ) -> TestResult<PtySignalOutput> {
+        let mut command = self.command(["--sandbox", self.id(), "shell"]);
+        command.env("TERM", term);
+        run_pty_script_command_with_output_guard(command, script, completion_marker, guard)
+    }
+
     pub fn run_pty_resize(
         &self,
         argv: &[&str],
@@ -1782,10 +1794,15 @@ fn process_field(pid: u32, field: &str) -> TestResult<String> {
 
 const MAX_CAPTURED_PIPE_BYTES: usize = 64 * 1024;
 
-fn wait_with_output_bounded(
+enum BoundedChildOutput {
+    Exited(Output),
+    TimedOut(Output),
+}
+
+fn capture_child_output_bounded(
     mut child: std::process::Child,
     timeout: std::time::Duration,
-) -> TestResult<Output> {
+) -> TestResult<BoundedChildOutput> {
     let mut stdout = child.stdout.take().ok_or("child stdout is not piped")?;
     let mut stderr = child.stderr.take().ok_or("child stderr is not piped")?;
     for pipe in [&stdout as &dyn std::os::fd::AsFd, &stderr] {
@@ -1825,19 +1842,58 @@ fn wait_with_output_bounded(
     )?;
     let stdout = captured_stdout.into_iter().collect::<Vec<_>>();
     let stderr = captured_stderr.into_iter().collect::<Vec<_>>();
-    match status {
-        Ok(status) => Ok(Output {
-            status,
+    let output = |status| Output {
+        status,
+        stdout,
+        stderr,
+    };
+    Ok(match status {
+        Ok(status) => BoundedChildOutput::Exited(output(status)),
+        Err(status) => BoundedChildOutput::TimedOut(output(status)),
+    })
+}
+
+fn wait_with_output_bounded(
+    child: std::process::Child,
+    timeout: std::time::Duration,
+) -> TestResult<Output> {
+    match capture_child_output_bounded(child, timeout)? {
+        BoundedChildOutput::Exited(output) => Ok(output),
+        BoundedChildOutput::TimedOut(Output {
+            status: _,
             stdout,
             stderr,
-        }),
-        Err(_status) => Err(format!(
+        }) => Err(format!(
             "child exceeded {timeout:?} and was killed/reaped: stdout={} stderr={}",
             String::from_utf8_lossy(&stdout),
             String::from_utf8_lossy(&stderr)
         )
         .into()),
     }
+}
+
+pub fn run_command_bounded_with_output_guard(
+    mut command: Command,
+    timeout: std::time::Duration,
+    guard: impl FnOnce(&[u8], &[u8]) -> TestResult,
+) -> TestResult<Output> {
+    let child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let result = capture_child_output_bounded(child, timeout)?;
+    let output = match result {
+        BoundedChildOutput::Exited(output) => output,
+        BoundedChildOutput::TimedOut(output) => {
+            guard(&output.stdout, &output.stderr)?;
+            return Err(format!(
+                "guarded command exceeded {timeout:?} and was killed/reaped; captured output omitted"
+            )
+            .into());
+        }
+    };
+    guard(&output.stdout, &output.stderr)?;
+    Ok(output)
 }
 
 pub fn run_command_bounded(
@@ -2067,9 +2123,18 @@ pub fn inline_marker_value(output: &str, begin: &str, end: &str) -> TestResult<S
 }
 
 fn run_pty_script_command(
+    command: Command,
+    script: &str,
+    completion_marker: &[u8],
+) -> TestResult<PtySignalOutput> {
+    run_pty_script_command_with_output_guard(command, script, completion_marker, |_, _| Ok(()))
+}
+
+fn run_pty_script_command_with_output_guard(
     mut command: Command,
     script: &str,
     completion_marker: &[u8],
+    guard: impl Fn(&[u8], &[u8]) -> TestResult,
 ) -> TestResult<PtySignalOutput> {
     const INPUT_READY: &[u8] = b"GASCAN_SHELL_INPUT_READY";
 
@@ -2119,6 +2184,7 @@ fn run_pty_script_command(
 
             if let Some(status) = child.try_wait()? {
                 if !completed {
+                    guard(&captured, &[])?;
                     return Err(format!(
                         "default shell exited before completion marker; captured PTY output: {}",
                         bounded_escaped_pty_output(&captured)
@@ -2130,6 +2196,7 @@ fn run_pty_script_command(
 
             let now = std::time::Instant::now();
             if !input_sent && now >= input_deadline {
+                guard(&captured, &[])?;
                 return Err(format!(
                     "default shell did not report input readiness; captured PTY output: {}",
                     bounded_escaped_pty_output(&captured)
@@ -2137,6 +2204,7 @@ fn run_pty_script_command(
                 .into());
             }
             if now >= completion_deadline {
+                guard(&captured, &[])?;
                 return Err(format!(
                     "default shell did not exit after completion marker; captured PTY output: {}",
                     bounded_escaped_pty_output(&captured)
@@ -2149,6 +2217,7 @@ fn run_pty_script_command(
         };
 
         drain_pty_after_exit(&mut controller, &mut captured)?;
+        guard(&captured, &[])?;
         Ok(PtySignalOutput {
             status,
             stdout: captured,
@@ -4038,6 +4107,76 @@ mod tests {
         assert!(message.contains("printf timeout-stdout; sleep 10"));
         assert!(message.contains("stdout=timeout-stdout"));
         assert!(!message.contains("must-not-appear"));
+        Ok(())
+    }
+
+    fn reject_fixture_secret(stdout: &[u8], stderr: &[u8]) -> TestResult {
+        if [stdout, stderr].into_iter().any(|output| {
+            output
+                .windows(b"fixture-secret".len())
+                .any(|window| window == b"fixture-secret")
+        }) {
+            Err("sensitive command output was redacted".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn guarded_bounded_command_scans_nonzero_output_before_returning() -> TestResult {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf fixture-secret >&2; exit 23"]);
+
+        let error = match run_command_bounded_with_output_guard(
+            command,
+            std::time::Duration::from_secs(2),
+            reject_fixture_secret,
+        ) {
+            Ok(_) => return Err("secret-bearing command unexpectedly returned output".into()),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.to_string(), "sensitive command output was redacted");
+        assert!(!error.to_string().contains("fixture-secret"));
+        Ok(())
+    }
+
+    #[test]
+    fn guarded_bounded_command_scans_timed_out_output_before_diagnostic() -> TestResult {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf fixture-secret; sleep 10"]);
+
+        let error = match run_command_bounded_with_output_guard(
+            command,
+            std::time::Duration::from_millis(50),
+            reject_fixture_secret,
+        ) {
+            Ok(_) => return Err("secret-bearing command unexpectedly avoided timeout".into()),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.to_string(), "sensitive command output was redacted");
+        assert!(!error.to_string().contains("fixture-secret"));
+        Ok(())
+    }
+
+    #[test]
+    fn guarded_pty_script_scans_output_before_early_exit_diagnostic() -> TestResult {
+        let mut command = Command::new("sh");
+        command.arg("-i");
+
+        let error = match run_pty_script_command_with_output_guard(
+            command,
+            "printf fixture-secret; exit 23\n",
+            b"fixture-completion-marker",
+            reject_fixture_secret,
+        ) {
+            Ok(_) => return Err("secret-bearing PTY unexpectedly returned output".into()),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.to_string(), "sensitive command output was redacted");
+        assert!(!error.to_string().contains("fixture-secret"));
         Ok(())
     }
 

@@ -1,4 +1,13 @@
 use crate::client::{Client, ClientError};
+use crate::configure::{
+    ConfigureError, ConfigureIo, ConfigureOutcome, Forge, GitProtocol, OfferResult,
+    SystemHostDiscovery, TerminalPrompter, configure_all, configure_forge_interactive,
+    configure_git_interactive, offer_after_up,
+};
+use crate::guest::{
+    ClientGuestRunner, Secret, SensitiveBytes, allowed_environment, attach_to_stdio,
+    first_session_token,
+};
 use crate::presentation::{
     DoctorCheck, OperationKind, OperationProgress, OutputCapabilities, daemon_force_warning,
     daemon_lifecycle_json, daemon_status_json, render_daemon_lifecycle, render_daemon_status,
@@ -8,13 +17,11 @@ use crate::presentation::{
 use crate::ssh_config::{
     IncludeChange, OfferAnswer, SshConfig, answer_first_use_offer, first_use_offer,
 };
-use crate::terminal::RawTerminal;
 use clap::{CommandFactory as _, Parser, Subcommand, error::ErrorKind};
 use gascan_proto::ssh_status::{SshState, classify as classify_ssh};
 use gascan_proto::v1;
 use std::ffi::{OsStr, OsString};
-use std::io::{IsTerminal, Write};
-use std::os::fd::AsFd;
+use std::io::{IsTerminal as _, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,6 +29,8 @@ const EXIT_USAGE: i32 = 64;
 const EXIT_DAEMON: i32 = 69;
 const EXIT_RUNTIME: i32 = 70;
 const EXIT_API: i32 = 76;
+const MAX_CONFIGURE_TOKEN_BYTES: usize = 1024 * 1024;
+const CONFIGURE_TOKEN_SCRATCH_BYTES: usize = 16 * 1024;
 
 #[derive(Parser)]
 #[command(name = "gascan", version, disable_help_subcommand = true)]
@@ -93,6 +102,31 @@ enum Command {
     SshConfig {
         #[command(subcommand)]
         command: SshConfigCommand,
+    },
+    Configure {
+        #[command(subcommand)]
+        command: Option<ConfigureCommand>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigureCommand {
+    Git,
+    Gh {
+        #[arg(long)]
+        hostname: Option<String>,
+        #[arg(long)]
+        token_stdin: bool,
+        #[arg(long, value_enum, default_value_t = GitProtocol::Ssh)]
+        git_protocol: GitProtocol,
+    },
+    Glab {
+        #[arg(long)]
+        hostname: Option<String>,
+        #[arg(long)]
+        token_stdin: bool,
+        #[arg(long, value_enum, default_value_t = GitProtocol::Ssh)]
+        git_protocol: GitProtocol,
     },
 }
 
@@ -360,7 +394,12 @@ fn doctor_request(current_directory: std::io::Result<PathBuf>) -> v1::DoctorRequ
 pub async fn execute() -> Result<i32, CliError> {
     let arguments = match Arguments::try_parse() {
         Ok(arguments) => arguments,
-        Err(error) if error.kind() == ErrorKind::DisplayVersion => {
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayVersion | ErrorKind::DisplayHelp
+            ) =>
+        {
             print!("{error}");
             return Ok(0);
         }
@@ -390,6 +429,13 @@ pub async fn execute() -> Result<i32, CliError> {
     if let Command::SshConfig { command } = arguments.command {
         return execute_ssh_config(command);
     }
+    let configure_io = if let Command::Configure { command } = &arguments.command {
+        let io = TerminalPrompter::new().map_err(configure_cli_error)?;
+        preflight_configure(command, io.stdin_is_terminal(), io.stderr_is_terminal())?;
+        Some(io)
+    } else {
+        None
+    };
     let doctor_request = matches!(&arguments.command, Command::Doctor { .. })
         .then(|| doctor_request(std::env::current_dir()));
     let connected = connect_with_recovery_progress(command_uses_json(&arguments.command)).await?;
@@ -397,18 +443,50 @@ pub async fn execute() -> Result<i32, CliError> {
     match arguments.command {
         Command::DaemonAttest => Ok(0),
         Command::Daemon { .. } => Ok(0),
+        Command::Configure { command } => {
+            let io = configure_io.ok_or_else(|| {
+                CliError::Runtime("configuration terminal was not initialized".to_owned())
+            })?;
+            execute_configure(&mut client, arguments.sandbox, command, io).await
+        }
         Command::Up { project_root, json } => {
             let project_root = resolve_project_root(&project_root)?;
-            match client.api.up(v1::UpRequest { project_root }).await {
+            let developer_offer_ci = continuous_integration();
+            let developer_stdin_is_terminal = std::io::stdin().is_terminal();
+            let developer_stderr_is_terminal = std::io::stderr().is_terminal();
+            match client
+                .api
+                .up(v1::UpRequest {
+                    project_root: project_root.clone(),
+                })
+                .await
+            {
                 Ok(response) => {
                     let result =
                         operation(response.into_inner(), json, OperationKind::Up, None).await;
-                    preserve_up_result_with_optional_offer(
+                    let result = preserve_up_result_with_optional_offer(
                         result,
                         json,
                         &mut std::io::stderr(),
                         try_offer_ssh_config_include,
+                    );
+                    let mut warning = std::io::stderr();
+                    preserve_up_result_with_developer_offer_gate(
+                        result,
+                        DeveloperOfferEligibility {
+                            json,
+                            continuous_integration: developer_offer_ci,
+                            stdin_is_terminal: developer_stdin_is_terminal,
+                            stderr_is_terminal: developer_stderr_is_terminal,
+                        },
+                        &mut warning,
+                        || selector_for_project_root(&project_root),
+                        |selector| async {
+                            let mut io = TerminalPrompter::new()?;
+                            offer_after_up(&mut client, selector, &mut io).await
+                        },
                     )
+                    .await
                 }
                 Err(status) => pre_stream_operation_failure(status.into(), json),
             }
@@ -554,6 +632,209 @@ pub async fn execute() -> Result<i32, CliError> {
     }
 }
 
+fn preflight_configure(
+    command: &Option<ConfigureCommand>,
+    stdin_is_terminal: bool,
+    stderr_is_terminal: bool,
+) -> Result<(), CliError> {
+    let token_stdin_protocol = match command {
+        Some(
+            ConfigureCommand::Gh {
+                token_stdin: true,
+                git_protocol,
+                ..
+            }
+            | ConfigureCommand::Glab {
+                token_stdin: true,
+                git_protocol,
+                ..
+            },
+        ) => Some(*git_protocol),
+        _ => None,
+    };
+    if let Some(protocol) = token_stdin_protocol {
+        if stdin_is_terminal {
+            return Err(CliError::Usage {
+                kind: UsageKind::Other,
+                message:
+                    "--token-stdin requires piped stdin; omit --token-stdin for hidden token entry"
+                        .to_owned(),
+            });
+        }
+        if protocol == GitProtocol::Ssh {
+            return Err(CliError::Usage {
+                kind: UsageKind::Other,
+                message: "--token-stdin cannot perform SSH first-use verification; rerun interactively without --token-stdin, or pass --git-protocol https".to_owned(),
+            });
+        }
+        return Ok(());
+    }
+    if !stdin_is_terminal || !stderr_is_terminal {
+        return Err(CliError::Usage {
+            kind: UsageKind::Other,
+            message: "interactive configuration requires an interactive terminal".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+async fn execute_configure(
+    client: &mut Client,
+    explicit_sandbox: Option<String>,
+    command: Option<ConfigureCommand>,
+    mut io: TerminalPrompter,
+) -> Result<i32, CliError> {
+    let selector = selector(client, explicit_sandbox).await?;
+    let status = client
+        .api
+        .status(v1::StatusRequest {
+            sandbox: Some(selector.clone()),
+        })
+        .await?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| CliError::Runtime("daemon returned no sandbox status".to_owned()))?;
+    let (piped_token, mut runner) =
+        prepare_configure_dispatch(&selector, &status, &command, read_token_stdin, move || {
+            ClientGuestRunner::new(client)
+        })?;
+    let discovery = SystemHostDiscovery::new();
+    let outcome = match command {
+        None => configure_all(&mut runner, selector, &discovery, &mut io).await,
+        Some(ConfigureCommand::Git) => {
+            configure_git_interactive(&mut runner, selector, &discovery, &mut io).await
+        }
+        Some(ConfigureCommand::Gh {
+            hostname,
+            git_protocol,
+            ..
+        }) => {
+            configure_forge_interactive(
+                &mut runner,
+                selector,
+                Forge::GitHub,
+                hostname.unwrap_or_else(|| "github.com".to_owned()),
+                git_protocol,
+                piped_token,
+                &mut io,
+            )
+            .await
+        }
+        Some(ConfigureCommand::Glab {
+            hostname,
+            git_protocol,
+            ..
+        }) => {
+            configure_forge_interactive(
+                &mut runner,
+                selector,
+                Forge::GitLab,
+                hostname.unwrap_or_else(|| "gitlab.com".to_owned()),
+                git_protocol,
+                piped_token,
+                &mut io,
+            )
+            .await
+        }
+    }
+    .map_err(configure_cli_error)?;
+    Ok(match outcome {
+        ConfigureOutcome::Completed | ConfigureOutcome::Cancelled => 0,
+        ConfigureOutcome::Partial => EXIT_RUNTIME,
+    })
+}
+
+fn configure_cli_error(error: ConfigureError) -> CliError {
+    match error {
+        ConfigureError::Io(error) => CliError::Io(error),
+        error => CliError::Runtime(error.to_string()),
+    }
+}
+
+fn read_token_stdin() -> Result<Secret, CliError> {
+    read_token_stdin_from(&mut std::io::stdin().lock())
+}
+
+fn read_token_stdin_from(reader: &mut impl std::io::Read) -> Result<Secret, CliError> {
+    let mut token = SensitiveBytes::zeroed(MAX_CONFIGURE_TOKEN_BYTES);
+    let mut scratch = SensitiveBytes::zeroed(CONFIGURE_TOKEN_SCRATCH_BYTES);
+    loop {
+        let count = match reader.read(scratch.storage_mut()) {
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(CliError::Io(error)),
+        };
+        if count == 0 {
+            break;
+        }
+        let exceeded = token.append_bounded(&scratch.storage()[..count]);
+        scratch.clear_storage();
+        if exceeded {
+            return Err(CliError::Usage {
+                kind: UsageKind::Other,
+                message: format!("piped token exceeds the {MAX_CONFIGURE_TOKEN_BYTES}-byte limit"),
+            });
+        }
+    }
+    if token.is_empty() {
+        return Err(CliError::Usage {
+            kind: UsageKind::Other,
+            message: "piped token must not be empty".to_owned(),
+        });
+    }
+    Ok(Secret::from_sensitive(token))
+}
+
+fn prepare_configure_dispatch<R>(
+    selector: &v1::SandboxSelector,
+    status: &v1::SandboxStatus,
+    command: &Option<ConfigureCommand>,
+    read_token: impl FnOnce() -> Result<Secret, CliError>,
+    make_runner: impl FnOnce() -> R,
+) -> Result<(Option<Secret>, R), CliError> {
+    require_running_sandbox(&selector.sandbox_id, status)?;
+    let piped_token = match command {
+        Some(
+            ConfigureCommand::Gh {
+                token_stdin: true, ..
+            }
+            | ConfigureCommand::Glab {
+                token_stdin: true, ..
+            },
+        ) => Some(read_token()?),
+        None
+        | Some(ConfigureCommand::Git)
+        | Some(ConfigureCommand::Gh {
+            token_stdin: false, ..
+        })
+        | Some(ConfigureCommand::Glab {
+            token_stdin: false, ..
+        }) => None,
+    };
+    Ok((piped_token, make_runner()))
+}
+
+fn require_running_sandbox(
+    expected_sandbox_id: &str,
+    status: &v1::SandboxStatus,
+) -> Result<(), CliError> {
+    if status.sandbox_id != expected_sandbox_id {
+        return Err(CliError::Runtime(format!(
+            "daemon returned status for a different sandbox than selected `{expected_sandbox_id}`; retry the command, then run `gascan daemon restart` if the mismatch persists"
+        )));
+    }
+    if status.actual_state == v1::ActualState::Running as i32 {
+        return Ok(());
+    }
+    Err(CliError::Usage {
+        kind: UsageKind::Other,
+        message: format!(
+            "sandbox `{}` is not running; run `gascan up <project-root>`",
+            expected_sandbox_id
+        ),
+    })
+}
+
 async fn execute_daemon(command: DaemonCommand) -> Result<i32, CliError> {
     let json = daemon_command_uses_json(&command);
     match command {
@@ -643,7 +924,8 @@ fn command_uses_json(command: &Command) -> bool {
         | Command::Run { .. }
         | Command::Logs { .. }
         | Command::Ssh { .. }
-        | Command::SshConfig { .. } => false,
+        | Command::SshConfig { .. }
+        | Command::Configure { .. } => false,
     }
 }
 
@@ -903,6 +1185,96 @@ where
     })
 }
 
+async fn preserve_up_result_with_developer_offer<F, Future, W>(
+    result: Result<i32, CliError>,
+    json: bool,
+    continuous_integration: bool,
+    warning: &mut W,
+    offer: F,
+) -> Result<i32, CliError>
+where
+    F: FnOnce() -> Future,
+    Future: std::future::Future<Output = Result<OfferResult, ConfigureError>>,
+    W: Write,
+{
+    if !matches!(result, Ok(0)) || json || continuous_integration {
+        return result;
+    }
+    if matches!(offer().await, Err(_) | Ok(OfferResult::Pending)) {
+        let _ = writeln!(
+            warning,
+            "Warning: developer setup was not completed; run `gascan configure` to try again."
+        );
+    }
+    result
+}
+
+#[derive(Clone, Copy)]
+struct DeveloperOfferEligibility {
+    json: bool,
+    continuous_integration: bool,
+    stdin_is_terminal: bool,
+    stderr_is_terminal: bool,
+}
+
+async fn preserve_up_result_with_developer_offer_gate<Prepare, Offer, Future, W>(
+    result: Result<i32, CliError>,
+    eligibility: DeveloperOfferEligibility,
+    warning: &mut W,
+    prepare_selector: Prepare,
+    offer: Offer,
+) -> Result<i32, CliError>
+where
+    Prepare: FnOnce() -> Result<v1::SandboxSelector, ConfigureError>,
+    Offer: FnOnce(v1::SandboxSelector) -> Future,
+    Future: std::future::Future<Output = Result<OfferResult, ConfigureError>>,
+    W: Write,
+{
+    if !matches!(result, Ok(0))
+        || eligibility.json
+        || eligibility.continuous_integration
+        || !eligibility.stdin_is_terminal
+        || !eligibility.stderr_is_terminal
+    {
+        return result;
+    }
+    let selector = prepare_selector();
+    preserve_up_result_with_developer_offer(result, false, false, warning, || async move {
+        offer(selector?).await
+    })
+    .await
+}
+
+fn selector_for_project_root(project_root: &str) -> Result<v1::SandboxSelector, ConfigureError> {
+    let manifest = gascan_core::manifest::Manifest::load(project_root.as_ref()).map_err(|_| {
+        ConfigureError::HostCommand {
+            category: "developer onboarding selector",
+            message: "the project manifest could not be loaded for developer onboarding".to_owned(),
+        }
+    })?;
+    let name = manifest
+        .name()
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            Path::new(project_root)
+                .file_name()
+                .and_then(OsStr::to_str)
+                .map(ToOwned::to_owned)
+        })
+        .ok_or_else(|| ConfigureError::HostCommand {
+            category: "developer onboarding selector",
+            message: "the successful project sandbox name could not be resolved".to_owned(),
+        })?;
+    let spec = gascan_core::sandbox::SandboxSpec::from_root(&name, project_root.as_ref(), manifest)
+        .map_err(|_| ConfigureError::HostCommand {
+            category: "developer onboarding selector",
+            message: "the successful project sandbox could not be resolved".to_owned(),
+        })?;
+    Ok(v1::SandboxSelector {
+        sandbox_id: spec.id().as_str().to_owned(),
+    })
+}
+
 fn try_offer_ssh_config_include() -> Result<(), CliError> {
     if !std::io::stdin().is_terminal()
         || !std::io::stderr().is_terminal()
@@ -926,9 +1298,13 @@ fn try_offer_ssh_config_include() -> Result<(), CliError> {
 }
 
 fn continuous_integration() -> bool {
+    continuous_integration_from(|name| std::env::var_os(name))
+}
+
+fn continuous_integration_from(mut environment: impl FnMut(&str) -> Option<OsString>) -> bool {
     ["CI", "GITHUB_ACTIONS", "BUILD_BUILDID"]
         .into_iter()
-        .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+        .any(|name| environment(name).is_some_and(|value| !value.is_empty()))
 }
 
 pub fn ssh_invocation<I>(
@@ -1038,6 +1414,12 @@ async fn selector(
         .into_iter()
         .filter(|sandbox| sandbox.actual_state != v1::ActualState::Absent as i32)
         .collect::<Vec<_>>();
+    selector_from_sandboxes(sandboxes)
+}
+
+fn selector_from_sandboxes(
+    sandboxes: Vec<v1::SandboxStatus>,
+) -> Result<v1::SandboxSelector, CliError> {
     match sandboxes.as_slice() {
         [sandbox] => Ok(v1::SandboxSelector {
             sandbox_id: sandbox.sandbox_id.clone(),
@@ -1164,188 +1546,8 @@ async fn run(
             .await?
             .into_inner()
     };
-    let event = events
-        .message()
-        .await?
-        .ok_or_else(|| CliError::Runtime("daemon returned no session".to_owned()))?;
-    if event.session_token.is_empty() {
-        return Err(CliError::Runtime(
-            "daemon returned an empty session token".to_owned(),
-        ));
-    }
-    let _terminal = if shell {
-        Some(RawTerminal::acquire()?)
-    } else {
-        None
-    };
-    let token = event.session_token;
-    let (input_sender, input_receiver) = tokio::sync::mpsc::channel(16);
-    if shell && stdin_is_tty {
-        let producer = input_sender.clone();
-        let producer_token = token.clone();
-        let restore = _terminal.as_ref().map(RawTerminal::restore_handle);
-        tokio::spawn(async move {
-            forward_terminal_input(producer, producer_token, restore).await;
-        });
-    } else if !stdin_is_tty {
-        let producer = input_sender.clone();
-        let producer_token = token.clone();
-        tokio::spawn(async move {
-            forward_piped_input(producer, producer_token).await;
-        });
-    } else {
-        input_sender
-            .send(v1::ClientFrame {
-                frame: Some(v1::client_frame::Frame::Close(v1::Close {})),
-                session_token: token,
-            })
-            .await
-            .map_err(|_| CliError::Runtime("attach input closed".to_owned()))?;
-    }
-    drop(input_sender);
-    let mut attached = client
-        .api
-        .attach(tokio_stream::wrappers::ReceiverStream::new(input_receiver))
-        .await?
-        .into_inner();
-    while let Some(frame) = attached.message().await? {
-        match frame.frame {
-            Some(v1::server_frame::Frame::Stdout(bytes)) => {
-                std::io::stdout().write_all(&bytes)?;
-                std::io::stdout().flush()?;
-            }
-            Some(v1::server_frame::Frame::Stderr(bytes)) => {
-                std::io::stderr().write_all(&bytes)?;
-                std::io::stderr().flush()?;
-            }
-            Some(v1::server_frame::Frame::Exit(exit)) => return Ok(exit.code),
-            Some(v1::server_frame::Frame::Error(error)) => {
-                return Err(attach_frame_error(error));
-            }
-            None => {}
-        }
-    }
-    Err(CliError::Runtime(
-        "attach ended without exit status".to_owned(),
-    ))
-}
-
-fn attach_frame_error(error: v1::Error) -> CliError {
-    CliError::Runtime(format!("{}: {}", error.code, error.message))
-}
-
-async fn forward_piped_input(sender: tokio::sync::mpsc::Sender<v1::ClientFrame>, token: Vec<u8>) {
-    use tokio::io::AsyncReadExt as _;
-    let mut stdin = tokio::io::stdin();
-    let mut bytes = vec![0_u8; 16 * 1024];
-    loop {
-        let frame = match stdin.read(&mut bytes).await {
-            Ok(0) | Err(_) => v1::client_frame::Frame::Close(v1::Close {}),
-            Ok(count) => v1::client_frame::Frame::Stdin(bytes[..count].to_vec()),
-        };
-        let terminal = matches!(frame, v1::client_frame::Frame::Close(_));
-        if sender
-            .send(v1::ClientFrame {
-                frame: Some(frame),
-                session_token: token.clone(),
-            })
-            .await
-            .is_err()
-        {
-            return;
-        }
-        if terminal {
-            return;
-        }
-    }
-}
-
-async fn forward_terminal_input(
-    sender: tokio::sync::mpsc::Sender<v1::ClientFrame>,
-    token: Vec<u8>,
-    restore: Option<crate::terminal::TerminalRestore>,
-) {
-    use tokio::io::AsyncReadExt;
-    let size = rustix::termios::tcgetwinsize(std::io::stdin().as_fd()).ok();
-    if let Some(size) = size {
-        if sender
-            .send(v1::ClientFrame {
-                frame: Some(v1::client_frame::Frame::Resize(v1::Resize {
-                    columns: u32::from(size.ws_col),
-                    rows: u32::from(size.ws_row),
-                })),
-                session_token: token.clone(),
-            })
-            .await
-            .is_err()
-        {
-            return;
-        }
-    }
-    let mut interrupt =
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
-            Ok(signal) => signal,
-            Err(_) => return,
-        };
-    let mut terminate =
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(signal) => signal,
-            Err(_) => return,
-        };
-    let mut resize =
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()) {
-            Ok(signal) => signal,
-            Err(_) => return,
-        };
-    let mut stdin = tokio::io::stdin();
-    let mut bytes = vec![0_u8; 4096];
-    loop {
-        let frame = tokio::select! {
-            read = stdin.read(&mut bytes) => match read { Ok(0) | Err(_) => v1::client_frame::Frame::Close(v1::Close {}), Ok(count) => v1::client_frame::Frame::Stdin(bytes[..count].to_vec()) },
-            _ = interrupt.recv() => v1::client_frame::Frame::Signal(v1::Signal { number: 2 }),
-            _ = terminate.recv() => v1::client_frame::Frame::Signal(v1::Signal { number: 15 }),
-            _ = resize.recv() => {
-                let size = rustix::termios::tcgetwinsize(std::io::stdin().as_fd()).ok();
-                let Some(size) = size else { continue; };
-                v1::client_frame::Frame::Resize(v1::Resize { columns: u32::from(size.ws_col), rows: u32::from(size.ws_row) })
-            }
-        };
-        let terminal = matches!(
-            frame,
-            v1::client_frame::Frame::Close(_) | v1::client_frame::Frame::Signal(_)
-        );
-        if matches!(frame, v1::client_frame::Frame::Signal(_)) {
-            if let Some(restore) = &restore {
-                restore.restore();
-            }
-        }
-        if sender
-            .send(v1::ClientFrame {
-                frame: Some(frame),
-                session_token: token.clone(),
-            })
-            .await
-            .is_err()
-        {
-            return;
-        }
-        if terminal {
-            let _ = sender
-                .send(v1::ClientFrame {
-                    frame: Some(v1::client_frame::Frame::Close(v1::Close {})),
-                    session_token: token.clone(),
-                })
-                .await;
-            return;
-        }
-    }
-}
-
-fn allowed_environment() -> Vec<v1::EnvironmentVariable> {
-    gascan_core::policy::filtered_host_environment(std::env::vars())
-        .into_iter()
-        .map(|(name, value)| v1::EnvironmentVariable { name, value })
-        .collect()
+    let token = first_session_token(&mut events).await?;
+    attach_to_stdio(client, token, shell, stdin_is_tty).await
 }
 
 async fn logs(
@@ -1529,6 +1731,199 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn first_up_developer_offer_error_warns_once_and_preserves_success()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let calls = std::cell::Cell::new(0_u32);
+        let mut warning = Vec::new();
+
+        let result =
+            preserve_up_result_with_developer_offer(Ok(0), false, false, &mut warning, || async {
+                calls.set(calls.get() + 1);
+                Err(ConfigureError::GuestCommand {
+                    category: "developer-home receipt",
+                    message: "injected failure".to_owned(),
+                })
+            })
+            .await;
+
+        assert_eq!(result?, 0);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            String::from_utf8(warning)?,
+            "Warning: developer setup was not completed; run `gascan configure` to try again.\n"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn first_up_pending_setup_warns_once_and_preserves_success()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut warning = Vec::new();
+
+        let result =
+            preserve_up_result_with_developer_offer(Ok(0), false, false, &mut warning, || async {
+                Ok(OfferResult::Pending)
+            })
+            .await;
+
+        assert_eq!(result?, 0);
+        assert_eq!(
+            String::from_utf8(warning)?,
+            "Warning: developer setup was not completed; run `gascan configure` to try again.\n"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn first_up_offer_runs_once_only_for_successful_human_non_ci_up()
+    -> Result<(), Box<dyn std::error::Error>> {
+        async fn exercise(
+            result: Result<i32, CliError>,
+            json: bool,
+            ci: bool,
+        ) -> Result<(Result<i32, CliError>, u32, u32, Vec<u8>), Box<dyn std::error::Error>>
+        {
+            let selector_preparations = std::cell::Cell::new(0_u32);
+            let calls = std::cell::Cell::new(0_u32);
+            let mut warning = Vec::new();
+            let result = preserve_up_result_with_developer_offer_gate(
+                result,
+                DeveloperOfferEligibility {
+                    json,
+                    continuous_integration: ci,
+                    stdin_is_terminal: true,
+                    stderr_is_terminal: true,
+                },
+                &mut warning,
+                || {
+                    selector_preparations.set(selector_preparations.get() + 1);
+                    Ok(v1::SandboxSelector {
+                        sandbox_id: "selected-0123456789ab".to_owned(),
+                    })
+                },
+                |_| async {
+                    calls.set(calls.get() + 1);
+                    Ok(OfferResult::Completed)
+                },
+            )
+            .await;
+            Ok((result, selector_preparations.get(), calls.get(), warning))
+        }
+
+        let (success, selector_preparations, calls, warning) =
+            exercise(Ok(0), false, false).await?;
+        assert_eq!(success?, 0);
+        assert_eq!(selector_preparations, 1);
+        assert_eq!(calls, 1);
+        assert!(warning.is_empty());
+
+        for (result, json, ci) in [
+            (Ok(0), true, false),
+            (Ok(0), false, true),
+            (Ok(EXIT_RUNTIME), false, false),
+        ] {
+            let (result, selector_preparations, calls, warning) =
+                exercise(result, json, ci).await?;
+            assert!(result.is_ok());
+            assert_eq!(selector_preparations, 0);
+            assert_eq!(calls, 0);
+            assert!(warning.is_empty());
+        }
+
+        let original = CliError::Runtime("injected up failure".to_owned());
+        let (failed, selector_preparations, calls, warning) =
+            exercise(Err(original), false, false).await?;
+        let failed = match failed {
+            Err(error) => error,
+            Ok(_) => return Err("failed up unexpectedly succeeded".into()),
+        };
+        assert_eq!(failed.message(), "injected up failure");
+        assert_eq!(selector_preparations, 0);
+        assert_eq!(calls, 0);
+        assert!(warning.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn first_up_redirected_io_suppresses_before_selector_preparation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (stdin_is_terminal, stderr_is_terminal) in [(false, true), (true, false)] {
+            let selector_preparations = std::cell::Cell::new(0_u32);
+            let offer_calls = std::cell::Cell::new(0_u32);
+            let mut warning = Vec::new();
+
+            let result = preserve_up_result_with_developer_offer_gate(
+                Ok(0),
+                DeveloperOfferEligibility {
+                    json: false,
+                    continuous_integration: false,
+                    stdin_is_terminal,
+                    stderr_is_terminal,
+                },
+                &mut warning,
+                || {
+                    selector_preparations.set(selector_preparations.get() + 1);
+                    Err(ConfigureError::HostCommand {
+                        category: "developer onboarding selector",
+                        message: "injected selector failure".to_owned(),
+                    })
+                },
+                |_| async {
+                    offer_calls.set(offer_calls.get() + 1);
+                    Ok(OfferResult::Completed)
+                },
+            )
+            .await;
+
+            assert_eq!(result?, 0);
+            assert_eq!(selector_preparations.get(), 0);
+            assert_eq!(offer_calls.get(), 0);
+            assert!(warning.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn first_up_ci_suppression_recognizes_each_supported_environment() {
+        for active in ["CI", "GITHUB_ACTIONS", "BUILD_BUILDID"] {
+            assert!(continuous_integration_from(|name| {
+                (name == active).then(|| OsString::from("1"))
+            }));
+        }
+        assert!(!continuous_integration_from(|_| None));
+        assert!(!continuous_integration_from(|_| Some(OsString::new())));
+    }
+
+    #[test]
+    fn first_up_selector_is_derived_from_the_resolved_project_not_sandbox_count()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let selected = temporary.path().join("selected");
+        let unrelated = temporary.path().join("unrelated");
+        std::fs::create_dir(&selected)?;
+        std::fs::create_dir(&unrelated)?;
+        std::fs::write(
+            selected.join("gascan.toml"),
+            "version = 1\nname = 'selected-project'\n",
+        )?;
+        std::fs::write(
+            unrelated.join("gascan.toml"),
+            "version = 1\nname = 'unrelated-project'\n",
+        )?;
+        let selected = std::fs::canonicalize(selected)?;
+        let unrelated = std::fs::canonicalize(unrelated)?;
+
+        let selector =
+            selector_for_project_root(selected.to_str().ok_or("selected root was not UTF-8")?)?;
+        let unrelated_selector =
+            selector_for_project_root(unrelated.to_str().ok_or("unrelated root was not UTF-8")?)?;
+
+        assert_ne!(selector.sandbox_id, unrelated_selector.sandbox_id);
+        assert!(selector.sandbox_id.starts_with("selected-project-"));
+        Ok(())
+    }
+
     #[test]
     fn root_help_advertises_the_standard_version_flags() {
         let help = Arguments::command().render_help().to_string();
@@ -1536,6 +1931,266 @@ mod tests {
             help.contains("-V, --version"),
             "version option missing: {help}"
         );
+    }
+
+    #[test]
+    fn configure_clap_accepts_all_forms_global_selector_and_protocol_default()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let aggregate =
+            Arguments::try_parse_from(["gascan", "--sandbox", "demo-0123456789ab", "configure"])?;
+        assert_eq!(aggregate.sandbox.as_deref(), Some("demo-0123456789ab"));
+        assert!(matches!(
+            aggregate.command,
+            Command::Configure { command: None }
+        ));
+
+        let git = Arguments::try_parse_from(["gascan", "configure", "git"])?;
+        assert!(matches!(
+            git.command,
+            Command::Configure {
+                command: Some(ConfigureCommand::Git)
+            }
+        ));
+
+        let github = Arguments::try_parse_from(["gascan", "configure", "gh"])?;
+        assert!(matches!(
+            github.command,
+            Command::Configure {
+                command: Some(ConfigureCommand::Gh {
+                    hostname: None,
+                    token_stdin: false,
+                    git_protocol: GitProtocol::Ssh,
+                })
+            }
+        ));
+
+        let gitlab = Arguments::try_parse_from([
+            "gascan",
+            "configure",
+            "glab",
+            "--hostname",
+            "gitlab.enterprise.test",
+            "--token-stdin",
+            "--git-protocol",
+            "https",
+        ])?;
+        assert!(matches!(
+            gitlab.command,
+            Command::Configure {
+                command: Some(ConfigureCommand::Glab {
+                    hostname: Some(hostname),
+                    token_stdin: true,
+                    git_protocol: GitProtocol::Https,
+                })
+            } if hostname == "gitlab.enterprise.test"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn configure_preflight_enforces_interactive_and_token_stdin_modes() {
+        let aggregate = None;
+        assert!(preflight_configure(&aggregate, true, true).is_ok());
+        assert!(preflight_configure(&aggregate, false, true).is_err());
+        assert!(preflight_configure(&aggregate, true, false).is_err());
+
+        let git = Some(ConfigureCommand::Git);
+        assert!(preflight_configure(&git, true, true).is_ok());
+        assert!(preflight_configure(&git, false, true).is_err());
+
+        let piped_ssh = Some(ConfigureCommand::Gh {
+            hostname: None,
+            token_stdin: true,
+            git_protocol: GitProtocol::Ssh,
+        });
+        let ssh_error = preflight_configure(&piped_ssh, false, false)
+            .err()
+            .map(|error| error.message().to_owned());
+        assert_eq!(
+            ssh_error.as_deref(),
+            Some(
+                "--token-stdin cannot perform SSH first-use verification; rerun interactively without --token-stdin, or pass --git-protocol https"
+            )
+        );
+        assert!(preflight_configure(&piped_ssh, true, true).is_err());
+
+        let piped_https = Some(ConfigureCommand::Gh {
+            hostname: None,
+            token_stdin: true,
+            git_protocol: GitProtocol::Https,
+        });
+        assert!(preflight_configure(&piped_https, false, false).is_ok());
+
+        let hidden = Some(ConfigureCommand::Glab {
+            hostname: None,
+            token_stdin: false,
+            git_protocol: GitProtocol::Ssh,
+        });
+        assert!(preflight_configure(&hidden, true, true).is_ok());
+        assert!(preflight_configure(&hidden, false, true).is_err());
+    }
+
+    #[test]
+    fn configure_selector_and_running_state_fail_with_existing_guidance()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let none = match selector_from_sandboxes(Vec::new()) {
+            Err(error) => error,
+            Ok(_) => return Err("no sandbox unexpectedly selected".into()),
+        };
+        assert!(matches!(
+            none,
+            CliError::Usage {
+                kind: UsageKind::NoSandbox,
+                ..
+            }
+        ));
+
+        let statuses = ["one", "two"].map(|sandbox_id| v1::SandboxStatus {
+            sandbox_id: sandbox_id.to_owned(),
+            actual_state: v1::ActualState::Running as i32,
+            ..Default::default()
+        });
+        let multiple = match selector_from_sandboxes(statuses.to_vec()) {
+            Err(error) => error,
+            Ok(_) => return Err("multiple sandboxes unexpectedly selected".into()),
+        };
+        assert!(matches!(
+            multiple,
+            CliError::Usage {
+                kind: UsageKind::MultipleSandboxes,
+                ..
+            }
+        ));
+
+        let stopped = v1::SandboxStatus {
+            sandbox_id: "demo-0123456789ab".to_owned(),
+            actual_state: v1::ActualState::Stopped as i32,
+            ..Default::default()
+        };
+        let error = match require_running_sandbox("demo-0123456789ab", &stopped) {
+            Err(error) => error,
+            Ok(()) => return Err("stopped sandbox accepted configuration".into()),
+        };
+        assert_eq!(
+            error.message(),
+            "sandbox `demo-0123456789ab` is not running; run `gascan up <project-root>`"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mismatched_running_status_stops_before_token_read_or_runner_creation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const TOKEN_SENTINEL: &str = "configure-dispatch-token-never-read-42a7";
+
+        let selector = v1::SandboxSelector {
+            sandbox_id: "selected-0123456789ab".to_owned(),
+        };
+        let status = v1::SandboxStatus {
+            sandbox_id: "different-0123456789ab".to_owned(),
+            actual_state: v1::ActualState::Running as i32,
+            ..Default::default()
+        };
+        let command = Some(ConfigureCommand::Gh {
+            hostname: None,
+            token_stdin: true,
+            git_protocol: GitProtocol::Https,
+        });
+        let token_reads = std::cell::Cell::new(0_u32);
+        let runner_constructions = std::cell::Cell::new(0_u32);
+
+        let prepared: Result<(Option<Secret>, ()), CliError> = prepare_configure_dispatch(
+            &selector,
+            &status,
+            &command,
+            || {
+                token_reads.set(token_reads.get() + 1);
+                Ok(Secret::new(TOKEN_SENTINEL.as_bytes().to_vec()))
+            },
+            || {
+                runner_constructions.set(runner_constructions.get() + 1);
+            },
+        );
+
+        let error = match prepared {
+            Err(error) => error,
+            Ok(_) => return Err("mismatched running status reached configure dispatch".into()),
+        };
+        assert_eq!(
+            error.message(),
+            "daemon returned status for a different sandbox than selected `selected-0123456789ab`; retry the command, then run `gascan daemon restart` if the mismatch persists"
+        );
+        assert_eq!(token_reads.get(), 0);
+        assert_eq!(runner_constructions.get(), 0);
+        assert!(!error.message().contains(TOKEN_SENTINEL));
+        Ok(())
+    }
+
+    #[test]
+    fn stopped_status_stops_before_token_read_or_runner_creation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const TOKEN_SENTINEL: &str = "configure-dispatch-token-never-read-42a7";
+
+        let selector = v1::SandboxSelector {
+            sandbox_id: "selected-0123456789ab".to_owned(),
+        };
+        let status = v1::SandboxStatus {
+            sandbox_id: selector.sandbox_id.clone(),
+            actual_state: v1::ActualState::Stopped as i32,
+            ..Default::default()
+        };
+        let command = Some(ConfigureCommand::Glab {
+            hostname: None,
+            token_stdin: true,
+            git_protocol: GitProtocol::Https,
+        });
+        let token_reads = std::cell::Cell::new(0_u32);
+        let runner_constructions = std::cell::Cell::new(0_u32);
+
+        let prepared: Result<(Option<Secret>, ()), CliError> = prepare_configure_dispatch(
+            &selector,
+            &status,
+            &command,
+            || {
+                token_reads.set(token_reads.get() + 1);
+                Ok(Secret::new(TOKEN_SENTINEL.as_bytes().to_vec()))
+            },
+            || {
+                runner_constructions.set(runner_constructions.get() + 1);
+            },
+        );
+
+        let error = match prepared {
+            Err(error) => error,
+            Ok(_) => return Err("stopped status reached configure dispatch".into()),
+        };
+        assert_eq!(
+            error.message(),
+            "sandbox `selected-0123456789ab` is not running; run `gascan up <project-root>`"
+        );
+        assert_eq!(token_reads.get(), 0);
+        assert_eq!(runner_constructions.get(), 0);
+        assert!(!error.message().contains(TOKEN_SENTINEL));
+        Ok(())
+    }
+
+    #[test]
+    fn piped_token_capture_is_exact_bounded_and_redacted() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let token = read_token_stdin_from(&mut std::io::Cursor::new(b"token-bytes\n"))
+            .map_err(|error| format!("valid token was rejected: {error}"))?;
+        assert_eq!(token.expose(), b"token-bytes\n");
+        assert!(!format!("{token:?}").contains("token-bytes"));
+
+        assert!(read_token_stdin_from(&mut std::io::Cursor::new(Vec::<u8>::new())).is_err());
+        assert!(
+            read_token_stdin_from(&mut std::io::Cursor::new(vec![
+                b'x';
+                MAX_CONFIGURE_TOKEN_BYTES + 1
+            ]))
+            .is_err()
+        );
+        Ok(())
     }
 
     #[test]
@@ -1895,7 +2550,7 @@ mod tests {
 
     #[test]
     fn attach_frame_error_retains_code_and_message_on_runtime_path() {
-        let error = attach_frame_error(v1::Error {
+        let error = crate::guest::attach_frame_error(v1::Error {
             code: "process_failed".to_owned(),
             message: "command exited before setup completed".to_owned(),
             ..Default::default()
