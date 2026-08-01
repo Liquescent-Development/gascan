@@ -7,8 +7,8 @@ developer onboarding`), and the first independent review fixes were committed
 separately as `5317fac` (`fix: harden developer onboarding smoke`). A focused
 sanitizer follow-up was committed separately as `a4bb0b9` (`fix: reject
 exported release smoke functions`), followed by report clarification
-`db52919`. The latest probe-only follow-up is being recorded in another
-separate commit. The branch-built live release smoke has not passed after the
+`db52919`. The latest probe-only work is contained in a separate follow-up
+changeset. The branch-built live release smoke has not passed after the
 latest fixes and remains pending; this report does not claim a live PASS.
 
 ## Implementation
