@@ -147,7 +147,7 @@ try:
     read_until(b"GASCAN_SHELL_INPUT_READY", time.monotonic() + 15)
     os.write(
         controller,
-        b"""PS1= PS2=
+        b"""PROMPT_COMMAND=; PS1= PS2=
 printf 'GASCAN_RELEASE_SHELL_BEGIN\\n'
 printf 'BASH_VERSION=%s\\n' "${BASH_VERSION:-}"
 case $- in *i*) printf 'INTERACTIVE=yes\\n';; *) printf 'INTERACTIVE=no\\n';; esac

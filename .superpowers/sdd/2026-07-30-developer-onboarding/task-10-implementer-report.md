@@ -5,9 +5,11 @@
 The primary Task 10 implementation was committed as `c846404` (`docs: explain
 developer onboarding`), and the first independent review fixes were committed
 separately as `5317fac` (`fix: harden developer onboarding smoke`). A focused
-sanitizer follow-up is contained in a second separate changeset. The
-branch-built live release smoke has not passed after the latest fixes and
-remains pending; this report does not claim a live PASS.
+sanitizer follow-up was committed separately as `a4bb0b9` (`fix: reject
+exported release smoke functions`), followed by report clarification
+`db52919`. The latest probe-only follow-up is being recorded in another
+separate commit. The branch-built live release smoke has not passed after the
+latest fixes and remains pending; this report does not claim a live PASS.
 
 ## Implementation
 
@@ -26,7 +28,9 @@ remains pending; this report does not claim a live PASS.
   after apply and down/up.
 - Standard, Starship, and Nerd Font shell probes now cover a nested interactive
   login Bash. Starship modes require the expected executable, config, and hook
-  with no warning.
+  with no warning. The outer probe clears its prompt command before framing
+  fields so Starship cannot prefix each result; the nested login shell still
+  initializes and verifies the real Starship integration.
 - A security self-review found that the PTY initially copied the complete host
   environment. The smoke re-executes through `env -i` with a minimal allowlist
   for paths, user identity, test controls, and the branch-binary overrides. Its
@@ -234,6 +238,25 @@ and the release signal contract. Follow-up verification also passed all 510
 scripts tests across 52 suites in 191.64 seconds, the complete release-contract
 loop, locked workspace clippy, formatting, Bash syntax, and diff checks. The
 live smoke was not rerun.
+
+The next live smoke reached the offline Starship sandbox, then failed its first
+exact field check even though the shell process exited zero. A disposable
+approved-image offline sandbox compared the same PTY command with only the
+selector changed. Standard produced 305 clean extracted bytes between
+normalized marker positions 226 and 558. Starship produced 1,717 bytes between
+positions 385 and 2,129, but its precmd hook recomputed the colored prompt
+before every command in the multiline batch, prefixing every top-level field.
+The READY marker came from command output, not echoed input. A causal control
+that changed only the first line to `PROMPT_COMMAND=; PS1= PS2=` produced 481
+clean Starship bytes between positions 282 and 790 while retaining the correct
+Starship config, executable, function, and nested login-shell fields. The
+focused framing regression began RED with `0 passed, 1 failed, 9 filtered out`
+because the quiescence line omitted `PROMPT_COMMAND`; the one-line probe-only
+change made it GREEN with `1 passed, 9 filtered out`. No Starship or nested
+assertion was removed. Follow-up verification passed all ten macOS
+release-smoke tests, all 511 scripts tests across 52 suites in 151.34 seconds,
+the complete release-contract loop, locked workspace clippy, formatting, Bash
+syntax, and diff checks. The live smoke was not rerun after this fix.
 
 All disposable forge sandboxes were destroyed. The final inventory contains
 only `code-3fd063e3b68e`, `buildkit`, and the three volumes belonging to the

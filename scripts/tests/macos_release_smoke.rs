@@ -169,6 +169,29 @@ fn release_smoke_shell_assertions_name_failed_fields_and_bound_diagnostics() {
 }
 
 #[test]
+fn release_smoke_quiesces_outer_prompt_before_framing_shell_fields() {
+    let smoke =
+        fs::read_to_string(repository_root().join("packaging/macos/release-smoke.sh")).unwrap();
+
+    assert!(
+        smoke.contains(
+            "PROMPT_COMMAND=; PS1= PS2=\nprintf 'GASCAN_RELEASE_SHELL_BEGIN\\\\n'"
+        ),
+        "outer PTY probe must stop precmd from prefixing framed field output"
+    );
+    for required in [
+        "printf 'STARSHIP_FUNCTION=%s\\\\n' \"$(type -t starship_precmd || true)\"",
+        "/bin/bash --login -i -c 'printf \"NESTED_STARSHIP_CONFIG=%s\\\\n\"",
+        "'NESTED_STARSHIP_FUNCTION=function'",
+    ] {
+        assert!(
+            smoke.contains(required),
+            "probe-only framing change must retain Starship assertion {required:?}"
+        );
+    }
+}
+
+#[test]
 fn release_smoke_persistence_checks_name_fields_and_never_print_fixture_token() {
     let smoke =
         fs::read_to_string(repository_root().join("packaging/macos/release-smoke.sh")).unwrap();
