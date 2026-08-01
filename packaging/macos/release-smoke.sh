@@ -1,10 +1,10 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash -p
 
 gascan_release_environment_is_sanitized() {
-  local name
+  builtin local name
+  [[ -z $(builtin export -pf) ]] || return 1
   [[ ${GASCAN_RELEASE_ENV_SANITIZED:-} == 1 ]] || return 1
-  while IFS= read -r name; do
+  while IFS= builtin read -r name; do
     case $name in
       FIXTURE_CREATE_STATUS|FIXTURE_DNS_STATE|FIXTURE_SUDO_LOG|\
       GASCAN_RELEASE_APPLE_ATTACH_HELPER|GASCAN_RELEASE_ENV_SANITIZED|\
@@ -13,15 +13,15 @@ gascan_release_environment_is_sanitized() {
       PWD|SHLVL) ;;
       *) return 1 ;;
     esac
-  done < <(compgen -e)
+  done < <(builtin compgen -e)
 }
 
-if ! gascan_release_environment_is_sanitized; then
+if [[ $- != *p* ]] || ! gascan_release_environment_is_sanitized; then
   release_path=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
   if [[ ${GASCAN_RELEASE_TESTING:-} == YES ]]; then
     release_path=$PATH
   fi
-  exec env -i \
+  /usr/bin/env -i \
     FIXTURE_CREATE_STATUS="${FIXTURE_CREATE_STATUS:-}" \
     FIXTURE_DNS_STATE="${FIXTURE_DNS_STATE:-}" \
     FIXTURE_SUDO_LOG="${FIXTURE_SUDO_LOG:-}" \
@@ -36,8 +36,10 @@ if ! gascan_release_environment_is_sanitized; then
     PATH="$release_path" \
     TMPDIR="${TMPDIR:-/tmp}" \
     USER="${USER:-}" \
-    "$0" "$@"
-fi
+    /bin/bash --noprofile --norc -p "$0" "$@"
+else
+  builtin set -euo pipefail
+  builtin set +p
 
 repo_root=$(cd "$(dirname "$0")/../.." && pwd -P)
 source "$repo_root/packaging/macos/release-common.sh"
@@ -989,3 +991,4 @@ if ! gascan_assert_destroyed_controller_record "$controller_inventory" "$destroy
 fi
 
 printf 'PASS: installed Gas Can release smoke\n'
+fi

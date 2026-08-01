@@ -101,7 +101,7 @@ fn release_smoke_proves_fake_forge_signed_git_and_persistence_without_host_token
         fs::read_to_string(repository_root().join("packaging/macos/release-smoke.sh")).unwrap();
 
     for required in [
-        "exec env -i",
+        "/usr/bin/env -i",
         "GASCAN_RELEASE_ENV_SANITIZED=1",
         "GIT_CONFIG_GLOBAL",
         "configure\", \"git",
@@ -206,10 +206,13 @@ fn release_smoke_rejects_spoofed_sanitizer_markers_and_preflights_daemon() {
 
     for required in [
         "gascan_release_environment_is_sanitized()",
-        "compgen -e",
+        "#!/bin/bash -p",
+        "builtin export -pf",
+        "builtin compgen -e",
         "GASCAN_RELEASE_ENV_SANITIZED|",
         "PWD|SHLVL)",
-        "if ! gascan_release_environment_is_sanitized; then",
+        "if [[ $- != *p* ]] || ! gascan_release_environment_is_sanitized; then",
+        "/bin/bash --noprofile --norc -p \"$0\" \"$@\"",
         "gascan_release_preflight_daemon()",
         "release smoke refused unsafe or mismatched pre-existing Gas Can daemon",
         "release smoke could not prove the selected daemon is stopped",
@@ -220,7 +223,7 @@ fn release_smoke_rejects_spoofed_sanitizer_markers_and_preflights_daemon() {
         );
     }
 
-    assert!(!smoke.contains("if [[ ${GASCAN_RELEASE_ENV_SANITIZED:-} != 1 ]]; then"));
+    assert!(!smoke.contains("exec env -i"));
     let daemon_export = smoke.find("export GASCAN_DAEMON=$gascand_bin").unwrap();
     let preflight = smoke
         .find("\ngascan_release_preflight_daemon\n")

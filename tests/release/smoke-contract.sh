@@ -198,6 +198,10 @@ else
 fi'
 write_fake gascan '
 [[ -z ${GASCAN_RELEASE_SENTINEL_SECRET+x} ]] || exit 88
+if declare -F compgen >/dev/null; then
+  compgen -e >/dev/null
+  exit 90
+fi
 case "$*" in
   daemon-attest)
     [[ -z ${GASCAN_APPLE_ATTACH_HELPER+x} ]] || exit 87
@@ -233,6 +237,31 @@ run_smoke() {
   GASCAN_RELEASE_GASCAN="$fixture/bin/gascan" \
   GASCAN_RELEASE_GASCAND="$fixture/bin/gascand" \
     "$repo_root/packaging/macos/release-smoke.sh" 2>&1
+}
+
+run_smoke_with_exported_compgen() {
+  /usr/bin/env -i \
+    PATH="$fixture/bin:$PATH" \
+    TMPDIR="$fixture/tmp" \
+    FIXTURE_DNS_STATE="$dns_state" \
+    FIXTURE_SUDO_LOG="$log" \
+    FIXTURE_CREATE_STATUS=0 \
+    GASCAN_RELEASE_ENV_SANITIZED=1 \
+    GASCAN_RELEASE_TESTING=YES \
+    GASCAN_RELEASE_APPLE_ATTACH_HELPER="$fixture/bin/gascan-apple-attach" \
+    GASCAN_RELEASE_GASCAN="$fixture/bin/gascan" \
+    GASCAN_RELEASE_GASCAND="$fixture/bin/gascand" \
+    HOME="$HOME" \
+    LOGNAME="${LOGNAME:-}" \
+    USER="${USER:-}" \
+    /bin/bash --noprofile --norc -c '
+      compgen() {
+        printf "invoked\n" >"$FIXTURE_SUDO_LOG.function-invoked"
+        builtin compgen "$@"
+      }
+      export -f compgen
+      exec /bin/bash "$@"
+    ' bash "$repo_root/packaging/macos/release-smoke.sh" 2>&1
 }
 
 realpath "$fixture/bin/gascan-apple-attach" >"$log.attach-helper"
@@ -273,8 +302,23 @@ status=0
 output=$(GASCAN_RELEASE_ENV_SANITIZED=1 \
   GASCAN_RELEASE_SENTINEL_SECRET=must-not-reach-child run_smoke) || status=$?
 [[ $status -eq 42 ]] || {
-  printf 'spoofed sanitizer marker exposed sentinel to child: status=%s\n%s\n' \
+  printf 'spoofed sanitizer marker exposed caller state to child: status=%s\n%s\n' \
     "$status" "$output" >&2
+  exit 1
+}
+[[ $(wc -l <"$log" | tr -d ' ') -eq 2 ]]
+[[ ! -e $dns_state ]]
+
+: >"$log"
+status=0
+output=$(run_smoke_with_exported_compgen) || status=$?
+[[ $status -eq 42 ]] || {
+  printf 'spoofed sanitizer marker exposed exported function to child: status=%s\n%s\n' \
+    "$status" "$output" >&2
+  exit 1
+}
+[[ ! -e $log.function-invoked ]] || {
+  printf 'spoofed exported function was invoked by release smoke\n' >&2
   exit 1
 }
 [[ $(wc -l <"$log" | tr -d ' ') -eq 2 ]]

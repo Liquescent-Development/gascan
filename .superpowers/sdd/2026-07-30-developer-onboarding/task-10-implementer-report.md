@@ -3,10 +3,11 @@
 ## Status
 
 The primary Task 10 implementation was committed as `c846404` (`docs: explain
-developer onboarding`). Independent review fixes are being recorded in a
-separate follow-up commit. The branch-built live release smoke has not passed
-after the latest fixes and remains pending; this report does not claim a live
-PASS.
+developer onboarding`), and the first independent review fixes were committed
+separately as `5317fac` (`fix: harden developer onboarding smoke`). A focused
+sanitizer follow-up is being recorded in another separate commit. The
+branch-built live release smoke has not passed after the latest fixes and
+remains pending; this report does not claim a live PASS.
 
 ## Implementation
 
@@ -29,10 +30,14 @@ PASS.
 - A security self-review found that the PTY initially copied the complete host
   environment. The smoke re-executes through `env -i` with a minimal allowlist
   for paths, user identity, test controls, and the branch-binary overrides. Its
-  re-entry marker is accepted only when every exported name belongs to the exact
-  environment produced by that launch; a spoofed marker with any sentinel or
-  secret is sanitized again without recursion. Real host forge credential
-  variables are neither named nor made available to the smoke or its children.
+  re-entry marker is accepted only in a privileged Bash that did not import
+  caller functions, has no exported functions, and exposes exactly the exported
+  names produced by that launch. Non-privileged entry and any invalid marker
+  state re-sanitize through absolute `/usr/bin/env -i` and `/bin/bash -p`
+  without recursion. A spoofed marker with any sentinel, secret, or exported
+  function is removed before the smoke or its children can observe it. Real
+  host forge credential variables are neither named nor made available to the
+  smoke or its children.
 - The existing smoke command fixture now opts into `GASCAN_RELEASE_TESTING=YES`
   so the clean-environment prelude retains only its fake-command PATH and
   non-secret DNS bookkeeping. Production execution still uses the fixed PATH.
@@ -213,6 +218,22 @@ the complete release-contract loop, locked workspace clippy, formatting, Bash
 syntax, and diff checks. Standalone scripts clippy also found an unrelated
 pre-existing redundant closure in `validate-connected-build.rs`, which is not
 part of this changeset. The live smoke remains pending after these review fixes.
+
+Focused re-review proved that `compgen -e` omits imported/exported Bash
+functions even though `export -pf` reports them, and that imported functions
+can override ordinary invocations of sanitizer builtins. The isolated runtime
+regression began RED with a clean environment, marker `1`, and an exported
+hostile `compgen`; it failed with `spoofed sanitizer marker exposed exported
+function to child` because the child imported that function. The hardened entry
+uses only shell syntax before the trust decision, short-circuits non-privileged
+callers directly to an absolute clean-environment launch, rejects any
+`builtin export -pf` output before accepting the marker, enumerates names with
+`builtin compgen`, and drops privileged mode only after validation. The same
+runtime regression then passed, as did the nine-test macOS release-smoke target
+and the release signal contract. Follow-up verification also passed all 510
+scripts tests across 52 suites in 191.64 seconds, the complete release-contract
+loop, locked workspace clippy, formatting, Bash syntax, and diff checks. The
+live smoke was not rerun.
 
 All disposable forge sandboxes were destroyed. The final inventory contains
 only `code-3fd063e3b68e`, `buildkit`, and the three volumes belonging to the
