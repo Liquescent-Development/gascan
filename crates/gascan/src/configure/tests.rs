@@ -4,7 +4,9 @@ use super::{
 };
 use crate::{
     cli::CliError,
-    guest::{GuestCommand, GuestOutput, GuestRunner, SensitiveDropKind, SensitiveDropObserver},
+    guest::{
+        GuestCommand, GuestOutput, GuestRunner, Secret, SensitiveDropKind, SensitiveDropObserver,
+    },
 };
 use gascan_proto::v1;
 use std::collections::VecDeque;
@@ -454,6 +456,26 @@ fn token_capture_is_sensitive_from_read_through_secret_drop() -> TestResult {
     assert_sensitive_drop_counts(&observer, 0, 3);
     drop(secret);
     assert_sensitive_drop_counts(&observer, 1, 4);
+    Ok(())
+}
+
+#[test]
+fn secret_redaction_copy_zeroizes_on_drop() -> TestResult {
+    let secret = Secret::new(SENTINEL.as_bytes().to_vec());
+    let observer = SensitiveDropObserver::default();
+    let mut redaction = secret.redaction_copy();
+    assert_eq!(redaction.expose(), SENTINEL.as_bytes());
+    redaction.observe_drop(observer.clone(), SensitiveDropKind::RedactionCopy);
+
+    drop(redaction);
+
+    assert_eq!(
+        observer.events(),
+        vec![crate::guest::SensitiveDropEvent {
+            kind: SensitiveDropKind::RedactionCopy,
+            zeroized: true,
+        }]
+    );
     Ok(())
 }
 

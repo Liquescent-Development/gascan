@@ -130,6 +130,14 @@ impl Secret {
             SecretStorage::Sensitive(bytes) => bytes.expose(),
         }
     }
+
+    pub(crate) fn redaction_copy(&self) -> SensitiveBytes {
+        let bytes = self.expose();
+        let mut copy = SensitiveBytes::zeroed(bytes.len());
+        let exceeded = copy.append_bounded(bytes);
+        debug_assert!(!exceeded);
+        copy
+    }
 }
 
 impl fmt::Debug for Secret {
@@ -145,6 +153,7 @@ pub(crate) enum SensitiveDropKind {
     StderrScratch,
     StdoutAccumulation,
     StderrAccumulation,
+    RedactionCopy,
 }
 
 #[cfg(test)]

@@ -101,10 +101,7 @@ impl ForgeClient {
             protocol_name(protocol).as_bytes().to_vec(),
         ];
         match self.forge {
-            Forge::GitHub => {
-                argv.push(b"--skip-ssh-key".to_vec());
-                argv.push(b"--with-token".to_vec());
-            }
+            Forge::GitHub => argv.push(b"--with-token".to_vec()),
             Forge::GitLab => argv.push(b"--stdin".to_vec()),
         }
         argv
@@ -196,7 +193,7 @@ pub(crate) async fn configure_forge<R: GuestRunner>(
             setup,
             client,
             client.authentication_category(),
-            "request validation did not complete",
+            "request validation did not complete".to_owned(),
         ));
     };
     if key.protocol != protocol {
@@ -204,25 +201,43 @@ pub(crate) async fn configure_forge<R: GuestRunner>(
             setup,
             client,
             client.authentication_category(),
-            "request validation did not complete",
+            "request validation did not complete".to_owned(),
         ));
     }
 
-    let login = execute(
-        runner,
-        selector.clone(),
-        client.login_argv(&hostname, protocol),
-        client.environment(),
-        Some(token),
-    )
-    .await;
-    if !matches!(login, Some(GuestOutput { code: 0, .. })) {
-        return Err(forge_error(
-            setup,
-            client,
-            client.authentication_category(),
-            "native authentication did not complete",
-        ));
+    let redaction = token.redaction_copy();
+    let login = runner
+        .execute(
+            selector.clone(),
+            GuestCommand {
+                argv: client.login_argv(&hostname, protocol),
+                environment: client.environment(),
+                stdin: Some(token),
+            },
+        )
+        .await;
+    match login {
+        Ok(GuestOutput { code: 0, .. }) => drop(redaction),
+        Ok(output) => {
+            let message =
+                safe_native_diagnostic(&output, redaction.expose()).unwrap_or_else(|| {
+                    format!("native authentication exited with status {}", output.code)
+                });
+            return Err(forge_error(
+                setup,
+                client,
+                client.authentication_category(),
+                message,
+            ));
+        }
+        Err(_) => {
+            return Err(forge_error(
+                setup,
+                client,
+                client.authentication_category(),
+                "authentication command could not be executed".to_owned(),
+            ));
+        }
     }
 
     let status = execute(
@@ -239,7 +254,7 @@ pub(crate) async fn configure_forge<R: GuestRunner>(
             setup,
             client,
             client.authentication_category(),
-            "native authentication could not be verified",
+            "native authentication could not be verified".to_owned(),
         ));
     };
     setup.login = login;
@@ -283,14 +298,14 @@ pub(crate) async fn configure_forge<R: GuestRunner>(
             setup,
             client,
             client.registration_category(),
-            "one or more key registrations did not complete",
+            "one or more key registrations did not complete".to_owned(),
         ))
     } else if ssh_failed {
         Err(forge_error(
             setup,
             client,
             client.ssh_category(),
-            "SSH authentication could not be verified",
+            "SSH authentication could not be verified".to_owned(),
         ))
     } else {
         Ok(setup)
@@ -778,6 +793,51 @@ fn bounded_text(output: &GuestOutput) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+fn safe_native_diagnostic(output: &GuestOutput, secret: &[u8]) -> Option<String> {
+    for stream in [&output.stderr, &output.stdout] {
+        let candidate = &stream[..stream.len().min(MAX_RESPONSE_BYTES)];
+        let redacted = redact_secret(candidate, secret);
+        let Some(line) = redacted
+            .split(|byte| matches!(byte, b'\n' | b'\r'))
+            .find(|line| !line.is_empty())
+        else {
+            continue;
+        };
+        let diagnostic: String = String::from_utf8_lossy(line)
+            .chars()
+            .filter_map(|character| match character {
+                '\t' => Some(' '),
+                character if character.is_control() => None,
+                character => Some(character),
+            })
+            .take(240)
+            .collect();
+        if !diagnostic.is_empty() {
+            return Some(diagnostic);
+        }
+    }
+    None
+}
+
+fn redact_secret(input: &[u8], secret: &[u8]) -> Vec<u8> {
+    if secret.is_empty() {
+        return input.to_vec();
+    }
+
+    let mut redacted = Vec::with_capacity(input.len());
+    let mut remaining = input;
+    while let Some(offset) = remaining
+        .windows(secret.len())
+        .position(|candidate| candidate == secret)
+    {
+        redacted.extend_from_slice(&remaining[..offset]);
+        redacted.extend_from_slice(b"[REDACTED]");
+        remaining = &remaining[offset + secret.len()..];
+    }
+    redacted.extend_from_slice(remaining);
+    redacted
+}
+
 fn valid_ssh_response(forge: Forge, expected_login: &str, output: GuestOutput) -> bool {
     let expected_code = match forge {
         Forge::GitHub => 1,
@@ -891,7 +951,7 @@ fn forge_error(
     setup: ForgeSetup,
     client: ForgeClient,
     category: &'static str,
-    message: &'static str,
+    message: String,
 ) -> ConfigureError {
     ConfigureError::Forge {
         hostname: setup.hostname.clone(),

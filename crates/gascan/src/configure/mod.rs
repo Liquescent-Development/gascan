@@ -78,7 +78,7 @@ pub(crate) enum ConfigureError {
         setup: Box<ForgeSetup>,
         category: &'static str,
         hostname: String,
-        message: &'static str,
+        message: String,
         retry: &'static str,
     },
     #[allow(
