@@ -13,6 +13,137 @@ struct Environment {
     account_home: std::path::PathBuf,
 }
 
+struct ExplicitStateEnvironment {
+    gascan: std::ffi::OsString,
+    gascand: std::ffi::OsString,
+    runtime: tempfile::TempDir,
+    runtime_root: std::path::PathBuf,
+    _account_home: tempfile::TempDir,
+    account_home: std::path::PathBuf,
+    explicit_root: tempfile::TempDir,
+}
+
+struct ControllerErrorEnvironment {
+    gascan: std::ffi::OsString,
+    gascand: std::ffi::OsString,
+    _runtime: tempfile::TempDir,
+    runtime_root: std::path::PathBuf,
+    _account_home: tempfile::TempDir,
+    account_home: std::path::PathBuf,
+    fake_resources: tempfile::TempDir,
+}
+
+impl ControllerErrorEnvironment {
+    fn new() -> TestResult<Self> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let gascan = std::env::var_os("CARGO_BIN_EXE_gascan-e2e-cli").ok_or("gascan missing")?;
+        let gascand =
+            std::env::var_os("CARGO_BIN_EXE_gascan-e2e-daemon").ok_or("gascand missing")?;
+        let runtime = tempfile::tempdir()?;
+        let runtime_root = runtime.path().canonicalize()?;
+        let account_home = tempfile::tempdir()?;
+        let account_home_path = account_home.path().canonicalize()?;
+        std::fs::create_dir(account_home_path.join("Library"))?;
+        std::fs::create_dir(account_home_path.join("Library/Application Support"))?;
+        let unsafe_application = account_home_path.join("Library/Application Support/dev.gascan");
+        std::fs::create_dir(&unsafe_application)?;
+        std::fs::set_permissions(unsafe_application, std::fs::Permissions::from_mode(0o755))?;
+        Ok(Self {
+            gascan,
+            gascand,
+            _runtime: runtime,
+            runtime_root,
+            _account_home: account_home,
+            account_home: account_home_path,
+            fake_resources: tempfile::tempdir()?,
+        })
+    }
+
+    fn command(&self, arguments: &[&str]) -> Command {
+        let mut command = Command::new(&self.gascan);
+        command
+            .args(arguments)
+            .env("XDG_RUNTIME_DIR", &self.runtime_root)
+            .env_remove("GASCAN_STATE_PATH")
+            .env(
+                "GASCAN_FAKE_STATE_PATH",
+                self.fake_resources.path().join("runtime.json"),
+            )
+            .env("GASCAN_PID_PATH", self.runtime_root.join("daemon.pid"))
+            .env("GASCAN_E2E_ACCOUNT_HOME", &self.account_home)
+            .env("GASCAN_DAEMON", &self.gascand)
+            .env("GASCAN_TEST_FAKE_BACKEND", "1");
+        command
+    }
+}
+
+impl ExplicitStateEnvironment {
+    fn new() -> TestResult<Self> {
+        let gascan = std::env::var_os("CARGO_BIN_EXE_gascan-e2e-cli").ok_or("gascan missing")?;
+        let gascand =
+            std::env::var_os("CARGO_BIN_EXE_gascan-e2e-daemon").ok_or("gascand missing")?;
+        let runtime = tempfile::tempdir()?;
+        let runtime_root = runtime.path().canonicalize()?;
+        let account_home = tempfile::tempdir()?;
+        let account_home_path = account_home.path().canonicalize()?;
+        std::fs::create_dir(account_home_path.join("Library"))?;
+        std::fs::create_dir(account_home_path.join("Library/Application Support"))?;
+        let explicit_root = tempfile::tempdir()?;
+        Ok(Self {
+            gascan,
+            gascand,
+            runtime,
+            runtime_root,
+            _account_home: account_home,
+            account_home: account_home_path,
+            explicit_root,
+        })
+    }
+
+    fn explicit_database(&self) -> std::path::PathBuf {
+        self.explicit_root.path().join("chosen-controller.sqlite3")
+    }
+
+    fn default_database(&self) -> std::path::PathBuf {
+        self.account_home
+            .join("Library/Application Support/dev.gascan/controller/state.sqlite3")
+    }
+
+    fn command(&self, arguments: &[&str]) -> Command {
+        let mut command = Command::new(&self.gascan);
+        command
+            .args(arguments)
+            .env("XDG_RUNTIME_DIR", &self.runtime_root)
+            .env("GASCAN_STATE_PATH", self.explicit_database())
+            .env(
+                "GASCAN_FAKE_STATE_PATH",
+                self.explicit_root.path().join("fake-runtime.json"),
+            )
+            .env("GASCAN_PID_PATH", self.runtime_root.join("daemon.pid"))
+            .env(
+                "GASCAN_DAEMON_STDERR_PATH",
+                self.runtime_root.join("daemon.stderr"),
+            )
+            .env("GASCAN_E2E_ACCOUNT_HOME", &self.account_home)
+            .env(
+                "HOME",
+                self.runtime_root.join("mutable-home-must-be-ignored"),
+            )
+            .env("GASCAN_DAEMON", &self.gascand)
+            .env("GASCAN_TEST_FAKE_BACKEND", "1");
+        command
+    }
+}
+
+impl Drop for ExplicitStateEnvironment {
+    fn drop(&mut self) {
+        let _ = self
+            .command(&["daemon", "stop", "--force", "--json"])
+            .output();
+    }
+}
+
 struct OwnedChild(Option<std::process::Child>);
 
 impl OwnedChild {
@@ -240,6 +371,56 @@ fn daemon_status_reports_stopped_without_autostart() -> TestResult {
     assert!(status["pid"].is_null());
     assert!(!env.runtime_root.join("daemon.pid").exists());
     assert!(!env.runtime_root.join("gascan/gascand.sock").exists());
+    Ok(())
+}
+
+#[test]
+fn explicit_state_path_bypasses_default_migration() -> TestResult {
+    let env = ExplicitStateEnvironment::new()?;
+    let output = env.command(&["daemon", "start", "--json"]).output()?;
+    assert!(
+        output.status.success(),
+        "explicit state startup failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(env.explicit_database().is_file());
+    assert!(
+        !env.default_database().exists(),
+        "explicit state selection unexpectedly created the default database"
+    );
+    assert!(
+        !env.runtime_root.join("gascan/state.sqlite3").exists(),
+        "explicit state selection unexpectedly created the legacy database"
+    );
+    let _keep_runtime_alive = &env.runtime;
+    Ok(())
+}
+
+#[test]
+fn controller_state_errors_survive_all_daemon_start_paths() -> TestResult {
+    let env = ControllerErrorEnvironment::new()?;
+    for arguments in [
+        &["doctor", "--json"][..],
+        &["daemon", "start", "--json"][..],
+        &["daemon", "restart", "--force", "--json"][..],
+    ] {
+        let output = env.command(arguments).output()?;
+        assert!(
+            !output.status.success(),
+            "unsafe controller state was accepted"
+        );
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(
+            stderr.contains("controller_state_unsafe"),
+            "controller error code was lost for {arguments:?}: {stderr}"
+        );
+        assert!(
+            stderr.contains("application directory") && stderr.contains("mode is unsafe"),
+            "actionable controller error was lost for {arguments:?}: {stderr}"
+        );
+        assert!(!stderr.contains("backend_unavailable"));
+    }
     Ok(())
 }
 

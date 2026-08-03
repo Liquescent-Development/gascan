@@ -9,9 +9,10 @@ use gascan_core::doctor::{DoctorFact, DoctorFacts, DoctorReport, DoctorStatus};
 use gascan_core::fake_runtime::FakeRuntime;
 use gascan_core::runtime::{RuntimeBackend, RuntimeError};
 use gascand::{
-    BackendSelection, Daemon, DaemonConfig, DoctorState, ErrorDiagnostics, ProvisionRequest,
-    ProvisionResolution, Provisioner, SandboxApi, SandboxService, ServiceError, SocketPaths,
-    SshPaths, Store, backend_selection,
+    BackendSelection, ControllerStateError, ControllerStatePaths, Daemon, DaemonConfig,
+    DoctorState, ErrorDiagnostics, ProvisionRequest, ProvisionResolution, Provisioner, SandboxApi,
+    SandboxService, ServiceError, SocketPaths, SshPaths, Store, backend_selection,
+    open_controller_store,
 };
 use std::{sync::Arc, time::Duration};
 
@@ -227,10 +228,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_or(Duration::from_secs(300), Duration::from_millis);
     let paths = SocketPaths::for_user()?;
     paths.prepare_directory()?;
-    let state_path = std::env::var_os("GASCAN_STATE_PATH")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| paths.directory().join("state.sqlite3"));
-    let store = Store::open(state_path)?;
+    let store = match std::env::var_os("GASCAN_STATE_PATH") {
+        Some(path) => Store::open(std::path::PathBuf::from(path))?,
+        None => {
+            let state = controller_state_paths(&paths).map_err(controller_startup_error)?;
+            open_controller_store(&state).map_err(controller_startup_error)?
+        }
+    };
     let e2e_ssh_paths = e2e_ssh_paths()?;
     #[cfg(debug_assertions)]
     let fake_requested = std::env::var_os(gascand::TEST_FAKE_BACKEND_ENV).is_some();
@@ -313,6 +317,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
         }
     }
+}
+
+fn report_controller_startup_error(error: &ControllerStateError) {
+    eprintln!(
+        "GASCAN_CONTROLLER_STARTUP_ERROR {}",
+        serde_json::json!({
+            "code": error.code(),
+            "message": error.to_string(),
+        })
+    );
+}
+
+fn controller_startup_error(source: ControllerStateError) -> ControllerStartupError {
+    report_controller_startup_error(&source);
+    ControllerStartupError::from(source)
+}
+
+#[derive(Debug)]
+struct ControllerStartupError {
+    code: &'static str,
+    source: ControllerStateError,
+}
+
+impl std::fmt::Display for ControllerStartupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.source)
+    }
+}
+
+impl std::error::Error for ControllerStartupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+impl From<ControllerStateError> for ControllerStartupError {
+    fn from(source: ControllerStateError) -> Self {
+        Self {
+            code: source.code(),
+            source,
+        }
+    }
+}
+
+fn controller_state_paths(
+    paths: &SocketPaths,
+) -> Result<ControllerStatePaths, ControllerStateError> {
+    #[cfg(debug_assertions)]
+    if option_env!("CARGO_BIN_NAME") == Some("gascan-e2e-daemon") {
+        let home = std::env::var_os("GASCAN_E2E_ACCOUNT_HOME").ok_or_else(|| {
+            ControllerStateError::Invalid("GASCAN_E2E_ACCOUNT_HOME is required".to_owned())
+        })?;
+        return ControllerStatePaths::for_home_and_runtime(
+            std::path::Path::new(&home),
+            paths.directory(),
+            rustix::process::geteuid().as_raw(),
+        );
+    }
+    ControllerStatePaths::for_user(paths.directory())
 }
 
 async fn run_daemon<B: RuntimeBackend + 'static>(

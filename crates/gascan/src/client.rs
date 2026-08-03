@@ -1,7 +1,7 @@
 use crate::daemon::{
-    DaemonEndpoint, DaemonIdentity, DaemonLaunch, DaemonPaths, DaemonSpawner, DaemonState,
-    EndpointPathState, EndpointProbe, EndpointSession, FileIdentity, InstanceTimestamp,
-    SupervisorError,
+    DaemonEndpoint, DaemonIdentity, DaemonLaunch, DaemonPaths, DaemonSpawner, DaemonStartupMonitor,
+    DaemonState, EndpointPathState, EndpointProbe, EndpointSession, FileIdentity,
+    InstanceTimestamp, SupervisorError,
 };
 use gascan_proto::v1::gas_can_client::GasCanClient;
 use gascan_proto::{API_MAJOR, API_MINOR, validate_transport_security};
@@ -303,26 +303,49 @@ fn status_confirms_handshake(
 pub(crate) struct TokioDaemonSpawner;
 
 impl DaemonSpawner for TokioDaemonSpawner {
-    fn spawn(&self, launch: &DaemonLaunch) -> std::io::Result<()> {
+    fn spawn(&self, launch: &DaemonLaunch) -> std::io::Result<DaemonStartupMonitor> {
+        use tokio::io::AsyncReadExt as _;
+
+        let monitor = DaemonStartupMonitor::capturing();
         let mut command = tokio::process::Command::new(&launch.executable);
         command
             .current_dir(&launch.current_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
+            .stderr(Stdio::piped())
             .env("GASCAN_DAEMON_INSTANCE_PATH", &launch.instance_path)
             .env("GASCAN_DAEMON_OWNER_TOKEN", &launch.owner_token);
-        if let Some(path) = &launch.stderr_path {
-            command.stderr(
+        let mut diagnostic_file = launch
+            .stderr_path
+            .as_ref()
+            .map(|path| {
                 std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open(path)?,
-            );
-        } else {
-            command.stderr(Stdio::null());
-        }
-        let _child = command.spawn()?;
-        Ok(())
+                    .open(path)
+            })
+            .transpose()?;
+        let mut child = command.spawn()?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| std::io::Error::other("daemon stderr pipe was not created"))?;
+        let reader = monitor.clone();
+        tokio::spawn(async move {
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = match stderr.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => read,
+                };
+                let _ = reader.record(&buffer[..read]);
+                if let Some(file) = diagnostic_file.as_mut() {
+                    let _ = std::io::Write::write_all(file, &buffer[..read]);
+                }
+            }
+        });
+        drop(child);
+        Ok(monitor)
     }
 }
 
