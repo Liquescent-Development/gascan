@@ -287,18 +287,20 @@ fn resolve_dual_store(
     legacy: &LegacyState,
     fault: Option<MigrationFault>,
 ) -> Result<Store, ControllerStateError> {
-    resolve_dual_store_with_before_archive(paths, controller, legacy, fault, || Ok(()))
+    resolve_dual_store_with_hooks(paths, controller, legacy, fault, || Ok(()), || Ok(()))
 }
 
-fn resolve_dual_store_with_before_archive<F>(
+fn resolve_dual_store_with_hooks<F, G>(
     paths: &ControllerStatePaths,
     controller: &ControllerDirectory,
     legacy: &LegacyState,
     fault: Option<MigrationFault>,
     before_archive: F,
+    final_unlink_window: G,
 ) -> Result<Store, ControllerStateError>
 where
     F: FnOnce() -> Result<(), ControllerStateError>,
+    G: FnOnce() -> Result<(), ControllerStateError>,
 {
     let durable = open_named_private_database(
         &controller.descriptor,
@@ -309,20 +311,42 @@ where
     )?;
     let durable_sidecars =
         open_private_sidecars(&controller.descriptor, DATABASE_NAME, paths.expected_uid)?;
-    let durable_monitor = DatabaseMutationMonitor::new(controller, &durable)?;
+    let durable_monitor = DatabaseMutationMonitor::new_for_controller_family(
+        controller,
+        &durable,
+        &durable_sidecars,
+    )?;
     let legacy_monitor = DatabaseMutationMonitor::new_for_legacy(legacy)?;
     let durable_snapshot = make_snapshot(paths, controller, &durable, &durable_sidecars, None)?;
     let legacy_snapshot =
         make_snapshot(paths, controller, &legacy.database, &legacy.sidecars, fault)?;
     durable_monitor.ensure_unchanged()?;
     legacy_monitor.ensure_unchanged()?;
-    validate_named_database_binding(paths, controller, &durable, DATABASE_NAME)?;
+    validate_database_family_binding(
+        paths,
+        controller,
+        &durable,
+        &durable_sidecars,
+        DATABASE_NAME,
+    )?;
     validate_legacy_binding(paths, legacy)?;
     let identical = logical_databases_match(
         &controller_path(paths, &durable_snapshot),
         &controller_path(paths, &legacy_snapshot),
     )?;
     cleanup_migration_temps(controller, paths.expected_uid)?;
+    let durable_monitor = DatabaseMutationMonitor::new_for_controller_family(
+        controller,
+        &durable,
+        &durable_sidecars,
+    )?;
+    validate_database_family_binding(
+        paths,
+        controller,
+        &durable,
+        &durable_sidecars,
+        DATABASE_NAME,
+    )?;
     if !identical {
         return Err(ControllerStateError::Conflict {
             durable: paths.durable_database().to_path_buf(),
@@ -331,16 +355,39 @@ where
     }
     before_archive()?;
     durable_monitor.ensure_unchanged()?;
-    validate_named_database_binding(paths, controller, &durable, DATABASE_NAME)?;
-    archive_legacy_state_with_guard(paths, controller, legacy, fault, || {
-        durable_monitor.ensure_unchanged()?;
-        validate_named_database_binding(paths, controller, &durable, DATABASE_NAME)
-    })?;
+    validate_database_family_binding(
+        paths,
+        controller,
+        &durable,
+        &durable_sidecars,
+        DATABASE_NAME,
+    )?;
+    archive_legacy_state_with_guard(
+        paths,
+        controller,
+        legacy,
+        fault,
+        final_unlink_window,
+        || {
+            durable_monitor.ensure_unchanged()?;
+            validate_database_family_binding(
+                paths,
+                controller,
+                &durable,
+                &durable_sidecars,
+                DATABASE_NAME,
+            )
+        },
+    )?;
     durable_monitor.ensure_unchanged()?;
-    validate_named_database_binding(paths, controller, &durable, DATABASE_NAME)?;
+    validate_database_family_binding(
+        paths,
+        controller,
+        &durable,
+        &durable_sidecars,
+        DATABASE_NAME,
+    )?;
     let store = open_existing_controller_store(paths)?;
-    durable_monitor.ensure_unchanged()?;
-    validate_named_database_binding(paths, controller, &durable, DATABASE_NAME)?;
     Ok(store)
 }
 
@@ -357,7 +404,30 @@ where
     let legacy = open_legacy_state(paths)?.ok_or_else(|| {
         ControllerStateError::Migration("dual-state test has no legacy database".to_owned())
     })?;
-    resolve_dual_store_with_before_archive(paths, &controller, &legacy, None, before_archive)
+    resolve_dual_store_with_hooks(paths, &controller, &legacy, None, before_archive, || Ok(()))
+}
+
+#[cfg(test)]
+fn open_controller_store_with_final_dual_unlink_hook<F>(
+    paths: &ControllerStatePaths,
+    final_unlink_window: F,
+) -> Result<Store, ControllerStateError>
+where
+    F: FnOnce() -> Result<(), ControllerStateError>,
+{
+    let controller = open_controller_directory(paths)?;
+    cleanup_migration_temps(&controller, paths.expected_uid)?;
+    let legacy = open_legacy_state(paths)?.ok_or_else(|| {
+        ControllerStateError::Migration("dual-state test has no legacy database".to_owned())
+    })?;
+    resolve_dual_store_with_hooks(
+        paths,
+        &controller,
+        &legacy,
+        None,
+        || Ok(()),
+        final_unlink_window,
+    )
 }
 
 fn make_snapshot(
@@ -495,18 +565,20 @@ fn archive_legacy_state(
     legacy: &LegacyState,
     fault: Option<MigrationFault>,
 ) -> Result<(), ControllerStateError> {
-    archive_legacy_state_with_guard(paths, controller, legacy, fault, || Ok(()))
+    archive_legacy_state_with_guard(paths, controller, legacy, fault, || Ok(()), || Ok(()))
 }
 
-fn archive_legacy_state_with_guard<F>(
+fn archive_legacy_state_with_guard<F, G>(
     paths: &ControllerStatePaths,
     controller: &ControllerDirectory,
     legacy: &LegacyState,
     fault: Option<MigrationFault>,
-    before_destructive_archive: F,
+    final_unlink_window: F,
+    mut before_destructive_archive: G,
 ) -> Result<(), ControllerStateError>
 where
     F: FnOnce() -> Result<(), ControllerStateError>,
+    G: FnMut() -> Result<(), ControllerStateError>,
 {
     let monitor = DatabaseMutationMonitor::new_for_legacy(legacy)?;
     let backup_name = collision_free_backup_name(&controller.descriptor, paths.expected_uid)?;
@@ -528,6 +600,8 @@ where
         .map_err(|error| migration_fs_error("syncing the legacy archive", error))?;
     monitor.ensure_unchanged()?;
     validate_legacy_binding(paths, legacy)?;
+    before_destructive_archive()?;
+    final_unlink_window()?;
     before_destructive_archive()?;
     let runtime = legacy.directories.last().ok_or_else(|| {
         ControllerStateError::Invalid("legacy database has no parent descriptor".to_owned())
@@ -876,16 +950,38 @@ fn cleanup_migration_temps(
     controller: &ControllerDirectory,
     expected_uid: u32,
 ) -> Result<(), ControllerStateError> {
-    cleanup_migration_temps_with_hook(controller, expected_uid, |_| Ok(()))
+    cleanup_migration_temps_with_hooks(controller, expected_uid, |_| Ok(()), |_| Ok(()), |_| Ok(()))
 }
 
+#[cfg(test)]
 fn cleanup_migration_temps_with_hook<F>(
     controller: &ControllerDirectory,
     expected_uid: u32,
-    mut before_unlink: F,
+    before_unlink: F,
 ) -> Result<(), ControllerStateError>
 where
     F: FnMut(&str) -> Result<(), ControllerStateError>,
+{
+    cleanup_migration_temps_with_hooks(
+        controller,
+        expected_uid,
+        before_unlink,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+}
+
+fn cleanup_migration_temps_with_hooks<F, G, H>(
+    controller: &ControllerDirectory,
+    expected_uid: u32,
+    mut before_unlink: F,
+    mut before_quarantine_create: G,
+    mut after_identity_check: H,
+) -> Result<(), ControllerStateError>
+where
+    F: FnMut(&str) -> Result<(), ControllerStateError>,
+    G: FnMut(&str) -> Result<(), ControllerStateError>,
+    H: FnMut(&str) -> Result<(), ControllerStateError>,
 {
     let mut directory = rustix::fs::Dir::read_from(&controller.descriptor)
         .map_err(|error| unsafe_error("controller directory", error))?;
@@ -914,17 +1010,18 @@ where
     }
     for (name, candidate) in candidates {
         before_unlink(&name)?;
-        let quarantine = cleanup_quarantine_name(&controller.descriptor, &candidate.identity)?;
+        let (quarantine, quarantine_directory) =
+            create_cleanup_quarantine(&controller.descriptor, &mut before_quarantine_create)?;
         rustix::fs::renameat(
             &controller.descriptor,
             &name,
-            &controller.descriptor,
-            &quarantine,
+            &quarantine_directory,
+            "candidate",
         )
         .map_err(|error| unsafe_error("quarantining a migration temporary file", error))?;
         let quarantined_stat = rustix::fs::statat(
-            &controller.descriptor,
-            &quarantine,
+            &quarantine_directory,
+            "candidate",
             AtFlags::SYMLINK_NOFOLLOW,
         )
         .map_err(|error| unsafe_error("quarantined migration temporary file", error))?;
@@ -935,35 +1032,106 @@ where
         ) {
             Ok(identity) => identity,
             Err(error) => {
-                restore_quarantined_file(&controller.descriptor, &quarantine, &name)?;
+                restore_quarantined_file(
+                    &controller.descriptor,
+                    &quarantine_directory,
+                    &quarantine,
+                    &name,
+                )?;
                 return Err(error);
             }
         };
         if quarantined_identity != candidate.identity {
-            restore_quarantined_file(&controller.descriptor, &quarantine, &name)?;
+            restore_quarantined_file(
+                &controller.descriptor,
+                &quarantine_directory,
+                &quarantine,
+                &name,
+            )?;
             return Err(ControllerStateError::Unsafe(
                 "migration temporary file changed during cleanup".to_owned(),
             ));
         }
-        rustix::fs::unlinkat(&controller.descriptor, &quarantine, AtFlags::empty())
+        rustix::fs::fchmod(&quarantine_directory, Mode::from_raw_mode(0o100))
+            .map_err(|error| unsafe_error("locking cleanup quarantine", error))?;
+        after_identity_check(&quarantine)?;
+        rustix::fs::fchmod(&quarantine_directory, Mode::from_raw_mode(0o100))
+            .map_err(|error| unsafe_error("relocking cleanup quarantine", error))?;
+        let final_stat = rustix::fs::statat(
+            &quarantine_directory,
+            "candidate",
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|error| unsafe_error("quarantined migration temporary file", error))?;
+        let final_identity = match validate_private_file_stat(
+            &final_stat,
+            expected_uid,
+            "quarantined migration temporary file",
+        ) {
+            Ok(identity) => identity,
+            Err(error) => {
+                restore_quarantined_file(
+                    &controller.descriptor,
+                    &quarantine_directory,
+                    &quarantine,
+                    &name,
+                )?;
+                return Err(error);
+            }
+        };
+        if final_identity != candidate.identity {
+            restore_quarantined_file(
+                &controller.descriptor,
+                &quarantine_directory,
+                &quarantine,
+                &name,
+            )?;
+            return Err(ControllerStateError::Unsafe(
+                "migration temporary file changed after quarantine validation".to_owned(),
+            ));
+        }
+        rustix::fs::fchmod(&quarantine_directory, Mode::from_raw_mode(0o300))
+            .map_err(|error| unsafe_error("opening cleanup quarantine for removal", error))?;
+        rustix::fs::unlinkat(&quarantine_directory, "candidate", AtFlags::empty())
             .map_err(|error| unsafe_error("quarantined migration temporary file", error))?;
+        remove_cleanup_quarantine(&controller.descriptor, &quarantine_directory, &quarantine)?;
     }
     rustix::fs::fsync(&controller.descriptor)
         .map_err(|error| migration_fs_error("syncing migration cleanup", error))?;
     Ok(())
 }
 
-fn cleanup_quarantine_name(
+fn create_cleanup_quarantine<F>(
     directory: &OwnedFd,
-    identity: &DatabaseIdentity,
-) -> Result<String, ControllerStateError> {
-    for sequence in 0..u32::MAX {
-        let name = format!(
-            ".state.sqlite3.cleanup-quarantine-{:x}-{:x}-{sequence}",
-            identity.device, identity.inode
-        );
-        if !entry_exists(directory, &name)? {
-            return Ok(name);
+    before_create: &mut F,
+) -> Result<(String, OwnedFd), ControllerStateError>
+where
+    F: FnMut(&str) -> Result<(), ControllerStateError>,
+{
+    for _ in 0..128 {
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random).map_err(|error| {
+            ControllerStateError::Unsafe(format!("generating a cleanup quarantine name: {error}"))
+        })?;
+        let token = random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let name = format!(".state.sqlite3.cleanup-quarantine-{token}");
+        before_create(&name)?;
+        match rustix::fs::mkdirat(directory, &name, Mode::from_raw_mode(DIRECTORY_MODE as u16)) {
+            Ok(()) => {
+                let quarantine = open_existing_child_directory(
+                    directory,
+                    OsStr::new(&name),
+                    "cleanup quarantine",
+                )?;
+                rustix::fs::fchmod(&quarantine, Mode::from_raw_mode(DIRECTORY_MODE as u16))
+                    .map_err(|error| unsafe_error("cleanup quarantine", error))?;
+                return Ok((name, quarantine));
+            }
+            Err(error) if error == rustix::io::Errno::EXIST => continue,
+            Err(error) => return Err(unsafe_error("creating a cleanup quarantine", error)),
         }
     }
     Err(ControllerStateError::Unsafe(
@@ -973,13 +1141,41 @@ fn cleanup_quarantine_name(
 
 fn restore_quarantined_file(
     directory: &OwnedFd,
+    quarantine_directory: &OwnedFd,
     quarantine: &str,
     original: &str,
 ) -> Result<(), ControllerStateError> {
-    rustix::fs::linkat(directory, quarantine, directory, original, AtFlags::empty())
+    rustix::fs::fchmod(
+        quarantine_directory,
+        Mode::from_raw_mode(DIRECTORY_MODE as u16),
+    )
+    .map_err(|error| unsafe_error("unlocking cleanup quarantine", error))?;
+    rustix::fs::linkat(
+        quarantine_directory,
+        "candidate",
+        directory,
+        original,
+        AtFlags::empty(),
+    )
+    .map_err(|error| unsafe_error("restoring a substituted migration temporary file", error))?;
+    rustix::fs::unlinkat(quarantine_directory, "candidate", AtFlags::empty())
         .map_err(|error| unsafe_error("restoring a substituted migration temporary file", error))?;
-    rustix::fs::unlinkat(directory, quarantine, AtFlags::empty())
-        .map_err(|error| unsafe_error("restoring a substituted migration temporary file", error))?;
+    remove_cleanup_quarantine(directory, quarantine_directory, quarantine)?;
+    Ok(())
+}
+
+fn remove_cleanup_quarantine(
+    directory: &OwnedFd,
+    quarantine_directory: &OwnedFd,
+    quarantine: &str,
+) -> Result<(), ControllerStateError> {
+    rustix::fs::fchmod(
+        quarantine_directory,
+        Mode::from_raw_mode(DIRECTORY_MODE as u16),
+    )
+    .map_err(|error| unsafe_error("unlocking cleanup quarantine", error))?;
+    rustix::fs::unlinkat(directory, quarantine, AtFlags::REMOVEDIR)
+        .map_err(|error| unsafe_error("removing cleanup quarantine", error))?;
     Ok(())
 }
 
@@ -1080,6 +1276,25 @@ fn validate_named_database_binding(
         return Err(ControllerStateError::Unsafe(
             "controller directory identity changed during migration".to_owned(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_database_family_binding(
+    paths: &ControllerStatePaths,
+    directory: &ControllerDirectory,
+    database: &PrivateDatabase,
+    sidecars: &BTreeMap<String, PrivateDatabase>,
+    database_name: &str,
+) -> Result<(), ControllerStateError> {
+    validate_named_database_binding(paths, directory, database, database_name)?;
+    for (suffix, sidecar) in sidecars {
+        validate_named_database_binding(
+            paths,
+            directory,
+            sidecar,
+            &format!("{database_name}{suffix}"),
+        )?;
     }
     Ok(())
 }
@@ -1391,6 +1606,17 @@ impl DatabaseMutationMonitor {
         Self::from_descriptors(&descriptors)
     }
 
+    fn new_for_controller_family(
+        directory: &ControllerDirectory,
+        database: &PrivateDatabase,
+        sidecars: &BTreeMap<String, PrivateDatabase>,
+    ) -> Result<Self, ControllerStateError> {
+        let mut descriptors = directory.descriptors().to_vec();
+        descriptors.push(&database.descriptor);
+        descriptors.extend(sidecars.values().map(|sidecar| &sidecar.descriptor));
+        Self::from_descriptors(&descriptors)
+    }
+
     fn new_for_legacy(legacy: &LegacyState) -> Result<Self, ControllerStateError> {
         let mut descriptors = legacy.directories.last().into_iter().collect::<Vec<_>>();
         descriptors.push(&legacy.database.descriptor);
@@ -1496,6 +1722,14 @@ impl DatabaseMutationMonitor {
     const fn new_for_controller_files(
         _directory: &ControllerDirectory,
         _databases: &[&PrivateDatabase],
+    ) -> Result<Self, ControllerStateError> {
+        Ok(Self)
+    }
+
+    const fn new_for_controller_family(
+        _directory: &ControllerDirectory,
+        _database: &PrivateDatabase,
+        _sidecars: &BTreeMap<String, PrivateDatabase>,
     ) -> Result<Self, ControllerStateError> {
         Ok(Self)
     }
@@ -1645,6 +1879,7 @@ fn unsafe_error(context: &str, error: rustix::io::Errno) -> ControllerStateError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
@@ -1668,6 +1903,91 @@ mod tests {
         )?;
         drop(connection);
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+
+    fn seeded_dual_paths(root: &Path) -> Result<ControllerStatePaths, Box<dyn std::error::Error>> {
+        let home = root.join("home");
+        let library = home.join("Library");
+        let application_support = library.join("Application Support");
+        for directory in [&home, &library, &application_support] {
+            fs::create_dir(directory)?;
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+        }
+        let runtime = root.join("runtime");
+        fs::create_dir(&runtime)?;
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))?;
+        let paths =
+            ControllerStatePaths::for_home_and_runtime(&home, &runtime, geteuid().as_raw())?;
+        let application = application_support.join(APPLICATION_ID);
+        let controller = application.join(CONTROLLER_DIRECTORY);
+        fs::create_dir(&application)?;
+        fs::set_permissions(&application, fs::Permissions::from_mode(0o700))?;
+        fs::create_dir(&controller)?;
+        fs::set_permissions(&controller, fs::Permissions::from_mode(0o700))?;
+        seed_test_store(paths.durable_database(), "same")?;
+        seed_test_store(paths.legacy_database(), "same")?;
+        Ok(paths)
+    }
+
+    #[test]
+    fn dual_state_refuses_durable_replacement_in_final_unlink_window()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let root = temp.path().canonicalize()?;
+        let paths = seeded_dual_paths(&root)?;
+        let legacy_before = fs::read(paths.legacy_database())?;
+        let replacement = root.join("final-window-replacement.sqlite3");
+        let replacement_store = Store::open(&replacement)?;
+        drop(replacement_store);
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600))?;
+        let displaced = root.join("final-window-displaced.sqlite3");
+
+        let result = open_controller_store_with_final_dual_unlink_hook(&paths, || {
+            fs::rename(paths.durable_database(), &displaced)
+                .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+            fs::rename(&replacement, paths.durable_database())
+                .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+            Ok(())
+        });
+        assert!(matches!(result, Err(ControllerStateError::Unsafe(_))));
+        assert_eq!(fs::read(paths.legacy_database())?, legacy_before);
+        Ok(())
+    }
+
+    #[test]
+    fn dual_state_refuses_durable_sidecar_substitution_before_archival()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let root = temp.path().canonicalize()?;
+        let paths = seeded_dual_paths(&root)?;
+        let durable_connection = Connection::open(paths.durable_database())?;
+        durable_connection.pragma_update(None, "journal_mode", "WAL")?;
+        durable_connection.pragma_update(None, "wal_autocheckpoint", 0)?;
+        durable_connection.execute("UPDATE sandboxes SET updated_at_millis = 8", [])?;
+        let legacy_connection = Connection::open(paths.legacy_database())?;
+        legacy_connection.execute("UPDATE sandboxes SET updated_at_millis = 8", [])?;
+        drop(legacy_connection);
+        let durable_wal = PathBuf::from(format!("{}-wal", paths.durable_database().display()));
+        let durable_shm = PathBuf::from(format!("{}-shm", paths.durable_database().display()));
+        for sidecar in [&durable_wal, &durable_shm] {
+            fs::set_permissions(sidecar, fs::Permissions::from_mode(0o600))?;
+        }
+        let legacy_before = fs::read(paths.legacy_database())?;
+        let displaced = root.join("displaced-durable-wal");
+
+        let result = open_controller_store_with_before_dual_archive(&paths, || {
+            fs::rename(&durable_wal, &displaced)
+                .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+            fs::write(&durable_wal, b"replacement WAL")
+                .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+            fs::set_permissions(&durable_wal, fs::Permissions::from_mode(0o600))
+                .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+            Ok(())
+        });
+        assert!(matches!(result, Err(ControllerStateError::Unsafe(_))));
+        assert_eq!(fs::read(paths.legacy_database())?, legacy_before);
+        drop(durable_connection);
         Ok(())
     }
 
@@ -1753,6 +2073,108 @@ mod tests {
                 Ok(())
             });
         assert!(result.is_err());
+        assert_eq!(fs::read(&abandoned)?, b"replacement");
+        assert_eq!(fs::read(&displaced)?, b"abandoned");
+        Ok(())
+    }
+
+    #[test]
+    fn abandoned_temp_cleanup_does_not_clobber_a_raced_quarantine_destination()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let root = temp.path().canonicalize()?;
+        let home = root.join("home");
+        let library = home.join("Library");
+        let application_support = library.join("Application Support");
+        for directory in [&home, &library, &application_support] {
+            fs::create_dir(directory)?;
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+        }
+        let paths = ControllerStatePaths::for_home_and_runtime(
+            &home,
+            &root.join("runtime"),
+            geteuid().as_raw(),
+        )?;
+        let controller = open_controller_directory(&paths)?;
+        let abandoned = controller_path(&paths, ".state.sqlite3.migration-source-51");
+        fs::write(&abandoned, b"abandoned")?;
+        fs::set_permissions(&abandoned, fs::Permissions::from_mode(0o600))?;
+        let inserted = RefCell::new(None);
+
+        cleanup_migration_temps_with_hooks(
+            &controller,
+            paths.expected_uid,
+            |_| Ok(()),
+            |quarantine| {
+                if inserted.borrow().is_none() {
+                    let path = controller_path(&paths, quarantine);
+                    fs::write(&path, b"raced destination")
+                        .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                        .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+                    *inserted.borrow_mut() = Some(path);
+                }
+                Ok(())
+            },
+            |_| Ok(()),
+        )?;
+        let inserted = inserted
+            .into_inner()
+            .ok_or_else(|| std::io::Error::other("destination hook did not run"))?;
+        assert_eq!(fs::read(inserted)?, b"raced destination");
+        assert!(!abandoned.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn abandoned_temp_cleanup_does_not_delete_a_post_check_substitution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let root = temp.path().canonicalize()?;
+        let home = root.join("home");
+        let library = home.join("Library");
+        let application_support = library.join("Application Support");
+        for directory in [&home, &library, &application_support] {
+            fs::create_dir(directory)?;
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+        }
+        let paths = ControllerStatePaths::for_home_and_runtime(
+            &home,
+            &root.join("runtime"),
+            geteuid().as_raw(),
+        )?;
+        let controller = open_controller_directory(&paths)?;
+        let name = ".state.sqlite3.migration-source-52";
+        let abandoned = controller_path(&paths, name);
+        let replacement = root.join("replacement-after-check");
+        let displaced = root.join("displaced-after-check");
+        fs::write(&abandoned, b"abandoned")?;
+        fs::set_permissions(&abandoned, fs::Permissions::from_mode(0o600))?;
+        fs::write(&replacement, b"replacement")?;
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600))?;
+
+        let result = cleanup_migration_temps_with_hooks(
+            &controller,
+            paths.expected_uid,
+            |_| Ok(()),
+            |_| Ok(()),
+            |quarantine| {
+                let quarantine = controller_path(&paths, quarantine);
+                let isolated = if quarantine.is_dir() {
+                    fs::set_permissions(&quarantine, fs::Permissions::from_mode(0o700))
+                        .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+                    quarantine.join("candidate")
+                } else {
+                    quarantine
+                };
+                fs::rename(&isolated, &displaced)
+                    .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+                fs::rename(&replacement, &isolated)
+                    .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(ControllerStateError::Unsafe(_))));
         assert_eq!(fs::read(&abandoned)?, b"replacement");
         assert_eq!(fs::read(&displaced)?, b"abandoned");
         Ok(())
