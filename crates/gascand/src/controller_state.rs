@@ -79,9 +79,28 @@ impl ControllerStatePaths {
 }
 
 pub fn open_controller_store(paths: &ControllerStatePaths) -> Result<Store, ControllerStateError> {
+    open_controller_store_with_before_store(paths, || Ok(()))
+}
+
+fn open_controller_store_with_before_store<F>(
+    paths: &ControllerStatePaths,
+    before_store: F,
+) -> Result<Store, ControllerStateError>
+where
+    F: FnOnce() -> Result<(), ControllerStateError>,
+{
     let controller_directory = open_controller_directory(paths)?;
-    open_private_database(&controller_directory, paths.expected_uid)?;
-    Store::open(paths.durable_database()).map_err(ControllerStateError::from)
+    let database = open_private_database(&controller_directory, paths.expected_uid)?;
+    before_store()?;
+    let store = match Store::open_no_follow(paths.durable_database()) {
+        Ok(store) => store,
+        Err(error) => {
+            validate_database_binding(paths, &controller_directory, &database)?;
+            return Err(ControllerStateError::Store(error));
+        }
+    };
+    validate_database_binding(paths, &controller_directory, &database)?;
+    Ok(store)
 }
 
 fn validate_absolute_normal_path(path: &Path, label: &str) -> Result<(), ControllerStateError> {
@@ -112,6 +131,53 @@ fn validate_absolute_normal_path(path: &Path, label: &str) -> Result<(), Control
 fn open_controller_directory(
     paths: &ControllerStatePaths,
 ) -> Result<OwnedFd, ControllerStateError> {
+    let application_support = open_state_ancestor_directory(paths)?;
+    let application_directory = ensure_private_child_directory(
+        &application_support,
+        APPLICATION_ID,
+        paths.expected_uid,
+        "application directory",
+    )?;
+    ensure_private_child_directory(
+        &application_directory,
+        CONTROLLER_DIRECTORY,
+        paths.expected_uid,
+        "controller directory",
+    )
+}
+
+fn open_existing_controller_directory(
+    paths: &ControllerStatePaths,
+) -> Result<OwnedFd, ControllerStateError> {
+    let application_support = open_state_ancestor_directory(paths)?;
+    let application_directory = open_existing_child_directory(
+        &application_support,
+        OsStr::new(APPLICATION_ID),
+        "application directory",
+    )?;
+    validate_directory(
+        &application_directory,
+        paths.expected_uid,
+        true,
+        "application directory",
+    )?;
+    let controller_directory = open_existing_child_directory(
+        &application_directory,
+        OsStr::new(CONTROLLER_DIRECTORY),
+        "controller directory",
+    )?;
+    validate_directory(
+        &controller_directory,
+        paths.expected_uid,
+        true,
+        "controller directory",
+    )?;
+    Ok(controller_directory)
+}
+
+fn open_state_ancestor_directory(
+    paths: &ControllerStatePaths,
+) -> Result<OwnedFd, ControllerStateError> {
     let home = paths.durable_database.ancestors().nth(5).ok_or_else(|| {
         ControllerStateError::Invalid("durable database has no account home".to_owned())
     })?;
@@ -133,18 +199,7 @@ fn open_controller_directory(
         "Application Support",
     )?;
 
-    let application_directory = ensure_private_child_directory(
-        &home_directory,
-        APPLICATION_ID,
-        paths.expected_uid,
-        "application directory",
-    )?;
-    ensure_private_child_directory(
-        &application_directory,
-        CONTROLLER_DIRECTORY,
-        paths.expected_uid,
-        "controller directory",
-    )
+    Ok(home_directory)
 }
 
 fn open_existing_directory(path: &Path, label: &str) -> Result<OwnedFd, ControllerStateError> {
@@ -220,10 +275,21 @@ fn ensure_private_child_directory(
     Ok(directory)
 }
 
+struct PrivateDatabase {
+    descriptor: OwnedFd,
+    identity: DatabaseIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DatabaseIdentity {
+    device: u64,
+    inode: u64,
+}
+
 fn open_private_database(
     directory: &OwnedFd,
     expected_uid: u32,
-) -> Result<(), ControllerStateError> {
+) -> Result<PrivateDatabase, ControllerStateError> {
     let created = match rustix::fs::statat(directory, DATABASE_NAME, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(_) => false,
         Err(error) if error == rustix::io::Errno::NOENT => true,
@@ -249,7 +315,10 @@ fn open_private_database(
         rustix::fs::fchmod(&database, Mode::from_raw_mode(FILE_MODE as u16))
             .map_err(|error| unsafe_error("controller database", error))?;
     }
-    validate_database(&database, expected_uid)
+    Ok(PrivateDatabase {
+        identity: validate_database(&database, expected_uid)?,
+        descriptor: database,
+    })
 }
 
 fn open_existing_database(directory: &OwnedFd) -> Result<OwnedFd, ControllerStateError> {
@@ -270,8 +339,12 @@ fn validate_directory(
 ) -> Result<(), ControllerStateError> {
     let stat = rustix::fs::fstat(directory).map_err(|error| unsafe_error(label, error))?;
     let type_is_directory = FileType::from_raw_mode(stat.st_mode) == FileType::Directory;
-    let mode_is_safe = !private_mode
-        || u32::from(Mode::from_raw_mode(stat.st_mode).bits() & 0o777) == DIRECTORY_MODE;
+    let mode = u32::from(Mode::from_raw_mode(stat.st_mode).bits() & 0o7777);
+    let mode_is_safe = if private_mode {
+        mode == DIRECTORY_MODE
+    } else {
+        mode & 0o022 == 0
+    };
     if !type_is_directory || stat.st_uid != expected_uid || !mode_is_safe {
         return Err(ControllerStateError::Unsafe(format!(
             "{label} ownership, type, or mode is unsafe"
@@ -280,21 +353,151 @@ fn validate_directory(
     Ok(())
 }
 
-fn validate_database(database: &OwnedFd, expected_uid: u32) -> Result<(), ControllerStateError> {
+fn validate_database(
+    database: &OwnedFd,
+    expected_uid: u32,
+) -> Result<DatabaseIdentity, ControllerStateError> {
     let stat =
         rustix::fs::fstat(database).map_err(|error| unsafe_error("controller database", error))?;
-    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
-        || stat.st_uid != expected_uid
-        || stat.st_nlink != 1
-        || u32::from(Mode::from_raw_mode(stat.st_mode).bits() & 0o777) != FILE_MODE
-    {
+    validate_database_stat(&stat, expected_uid)
+}
+
+fn validate_database_binding(
+    paths: &ControllerStatePaths,
+    directory: &OwnedFd,
+    database: &PrivateDatabase,
+) -> Result<(), ControllerStateError> {
+    if validate_database(&database.descriptor, paths.expected_uid)? != database.identity {
         return Err(ControllerStateError::Unsafe(
-            "controller database ownership, type, links, or mode is unsafe".to_owned(),
+            "controller database descriptor changed while opening the store".to_owned(),
+        ));
+    }
+    let stat = rustix::fs::statat(directory, DATABASE_NAME, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| unsafe_error("controller database", error))?;
+    if validate_database_stat(&stat, paths.expected_uid)? != database.identity {
+        return Err(ControllerStateError::Unsafe(
+            "controller database path changed while opening the store".to_owned(),
+        ));
+    }
+    let current_directory = open_existing_controller_directory(paths)?;
+    let stat = rustix::fs::statat(&current_directory, DATABASE_NAME, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| unsafe_error("controller database", error))?;
+    if validate_database_stat(&stat, paths.expected_uid)? != database.identity {
+        return Err(ControllerStateError::Unsafe(
+            "controller database path changed while opening the store".to_owned(),
         ));
     }
     Ok(())
 }
 
+fn validate_database_stat(
+    stat: &rustix::fs::Stat,
+    expected_uid: u32,
+) -> Result<DatabaseIdentity, ControllerStateError> {
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+        || stat.st_uid != expected_uid
+        || stat.st_nlink != 1
+        || u32::from(Mode::from_raw_mode(stat.st_mode).bits() & 0o7777) != FILE_MODE
+    {
+        return Err(ControllerStateError::Unsafe(
+            "controller database ownership, type, links, or mode is unsafe".to_owned(),
+        ));
+    }
+    Ok(DatabaseIdentity {
+        device: stat.st_dev as u64,
+        inode: stat.st_ino,
+    })
+}
+
 fn unsafe_error(context: &str, error: rustix::io::Errno) -> ControllerStateError {
     ControllerStateError::Unsafe(format!("{context}: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::TempDir;
+
+    #[test]
+    fn rejects_a_database_path_replaced_after_descriptor_validation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let root = temp.path().canonicalize()?;
+        let home = root.join("home");
+        let library = home.join("Library");
+        let application_support = library.join("Application Support");
+        for directory in [&home, &library, &application_support] {
+            fs::create_dir(directory)?;
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+        }
+        let paths = ControllerStatePaths::for_home_and_runtime(
+            &home,
+            &root.join("runtime"),
+            geteuid().as_raw(),
+        )?;
+        let replacement = root.join("replacement.sqlite3");
+        fs::write(&replacement, b"")?;
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600))?;
+        let displaced = root.join("displaced.sqlite3");
+
+        let error = match open_controller_store_with_before_store(&paths, || {
+            fs::rename(paths.durable_database(), &displaced)
+                .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+            std::os::unix::fs::symlink(&replacement, paths.durable_database())
+                .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+            Ok(())
+        }) {
+            Ok(_) => {
+                return Err(std::io::Error::other("replaced database path was accepted").into());
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), "controller_state_unsafe");
+        assert_eq!(fs::metadata(&replacement)?.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_a_controller_path_replaced_after_descriptor_validation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let root = temp.path().canonicalize()?;
+        let home = root.join("home");
+        let library = home.join("Library");
+        let application_support = library.join("Application Support");
+        for directory in [&home, &library, &application_support] {
+            fs::create_dir(directory)?;
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+        }
+        let paths = ControllerStatePaths::for_home_and_runtime(
+            &home,
+            &root.join("runtime"),
+            geteuid().as_raw(),
+        )?;
+        let controller = paths
+            .durable_database()
+            .parent()
+            .ok_or_else(|| std::io::Error::other("controller database has no parent"))?
+            .to_path_buf();
+        let displaced = root.join("displaced-controller");
+
+        let error = match open_controller_store_with_before_store(&paths, || {
+            fs::rename(&controller, &displaced)
+                .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+            fs::create_dir(&controller)
+                .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+            fs::set_permissions(&controller, fs::Permissions::from_mode(0o700))
+                .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+            Ok(())
+        }) {
+            Ok(_) => {
+                return Err(std::io::Error::other("replaced controller path was accepted").into());
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), "controller_state_unsafe");
+        Ok(())
+    }
 }

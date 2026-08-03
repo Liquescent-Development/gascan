@@ -147,6 +147,60 @@ fn open_rejects_unsafe_managed_directory_and_database_modes() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn open_rejects_writable_home_library_and_application_support_ancestors() -> TestResult {
+    for ancestor in ["", "Library", "Library/Application Support"] {
+        let fixture = ControllerFixture::new()?;
+        let path = if ancestor.is_empty() {
+            fixture.home.clone()
+        } else {
+            fixture.home.join(ancestor)
+        };
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o722))?;
+
+        let error = failed_open(&fixture.paths)?;
+        assert_eq!(error.code(), "controller_state_unsafe");
+    }
+    Ok(())
+}
+
+#[test]
+fn open_accepts_non_writable_ancestor_modes() -> TestResult {
+    let fixture = ControllerFixture::new()?;
+    for ancestor in [
+        fixture.home.clone(),
+        fixture.home.join("Library"),
+        fixture.home.join("Library/Application Support"),
+    ] {
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o755))?;
+    }
+
+    let store = open_controller_store(&fixture.paths)?;
+    assert!(store.list_sandboxes()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn open_rejects_special_bits_on_managed_paths() -> TestResult {
+    let fixture = ControllerFixture::new()?;
+    let application_directory = fixture.home.join("Library/Application Support/dev.gascan");
+    create_private_directory(&application_directory)?;
+    fs::set_permissions(&application_directory, fs::Permissions::from_mode(0o1700))?;
+    let error = failed_open(&fixture.paths)?;
+    assert_eq!(error.code(), "controller_state_unsafe");
+
+    fs::set_permissions(&application_directory, fs::Permissions::from_mode(0o700))?;
+    create_private_directory(&fixture.controller_directory())?;
+    fs::write(fixture.paths.durable_database(), b"not a database")?;
+    fs::set_permissions(
+        fixture.paths.durable_database(),
+        fs::Permissions::from_mode(0o1600),
+    )?;
+    let error = failed_open(&fixture.paths)?;
+    assert_eq!(error.code(), "controller_state_unsafe");
+    Ok(())
+}
+
 fn create_private_directory(path: &Path) -> std::io::Result<()> {
     fs::create_dir(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
