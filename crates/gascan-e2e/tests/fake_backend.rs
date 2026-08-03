@@ -442,6 +442,110 @@ fn complete_cli_lifecycle_uses_daemon_api() -> TestResult {
 }
 
 #[test]
+fn destroyed_tombstones_require_list_all() -> TestResult {
+    let env = Environment::new()?;
+    let first_root = env.root()?.to_owned();
+    let second = tempfile::tempdir()?;
+    let second_root = second
+        .path()
+        .to_str()
+        .ok_or("non UTF-8 second root")?
+        .to_owned();
+
+    assert!(env.invoke(&["up", &first_root])?.status.success());
+    let first_status = env.invoke(&["status", "--json"])?;
+    let first_id = serde_json::from_slice::<serde_json::Value>(&first_status.stdout)?["sandbox_id"]
+        .as_str()
+        .ok_or("first sandbox id missing")?
+        .to_owned();
+    assert!(env.invoke(&["up", &second_root])?.status.success());
+
+    let initial = env.invoke(&["list", "--json"])?;
+    let initial = serde_json::from_slice::<Vec<serde_json::Value>>(&initial.stdout)?;
+    assert_eq!(initial.len(), 2);
+    let initial_ids = initial
+        .iter()
+        .map(|sandbox| {
+            sandbox["sandbox_id"]
+                .as_str()
+                .ok_or("initial sandbox id missing")
+                .map(str::to_owned)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let second_id = initial_ids
+        .iter()
+        .find(|sandbox_id| *sandbox_id != &first_id)
+        .cloned()
+        .ok_or("second sandbox id missing")?;
+
+    assert!(
+        env.invoke(&["--sandbox", &first_id, "destroy", "--yes"])?
+            .status
+            .success()
+    );
+
+    let ordinary_human = env.invoke(&["list"])?;
+    assert!(ordinary_human.status.success());
+    let ordinary_human = String::from_utf8(ordinary_human.stdout)?;
+    assert!(ordinary_human.contains(&second_id));
+    assert!(!ordinary_human.contains(&first_id));
+    assert!(!ordinary_human.contains("Destroyed"));
+    assert!(!ordinary_human.contains("Absent"));
+
+    let ordinary_json = env.invoke(&["list", "--json"])?;
+    assert!(ordinary_json.status.success());
+    let ordinary_json = serde_json::from_slice::<Vec<serde_json::Value>>(&ordinary_json.stdout)?;
+    assert_eq!(ordinary_json.len(), 1);
+    assert_eq!(ordinary_json[0]["sandbox_id"], second_id);
+
+    let all_human = env.invoke(&["list", "--all"])?;
+    assert!(all_human.status.success());
+    let all_human = String::from_utf8(all_human.stdout)?;
+    assert!(all_human.contains(&first_id));
+    assert!(all_human.contains(&second_id));
+    assert!(all_human.contains("Destroyed"));
+    assert!(!all_human.contains("Absent"));
+
+    let all_json = env.invoke(&["list", "--all", "--json"])?;
+    assert!(all_json.status.success());
+    let all_json = serde_json::from_slice::<Vec<serde_json::Value>>(&all_json.stdout)?;
+    assert_eq!(
+        all_json
+            .iter()
+            .map(|sandbox| sandbox["sandbox_id"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        initial_ids.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    let first = all_json
+        .iter()
+        .find(|sandbox| sandbox["sandbox_id"] == first_id)
+        .ok_or("destroyed sandbox missing from --all JSON")?;
+    assert_eq!(first["actual_state"], "absent");
+
+    assert!(
+        env.invoke(&["--sandbox", &second_id, "destroy", "--yes"])?
+            .status
+            .success()
+    );
+    let empty_human = env.invoke(&["list"])?;
+    assert!(empty_human.status.success());
+    assert_eq!(empty_human.stdout, b"No sandboxes found.\n");
+    let empty_json = env.invoke(&["list", "--json"])?;
+    assert!(empty_json.status.success());
+    assert!(serde_json::from_slice::<Vec<serde_json::Value>>(&empty_json.stdout)?.is_empty());
+    assert_eq!(env.invoke(&["status"])?.status.code(), Some(64));
+
+    assert!(env.invoke(&["up", &first_root])?.status.success());
+    let recreated = env.invoke(&["status", "--json"])?;
+    assert!(recreated.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&recreated.stdout)?["sandbox_id"],
+        first_id
+    );
+    Ok(())
+}
+
+#[test]
 fn progress_stderr_pty_child_has_non_tty_stdin_and_tty_stderr() -> TestResult {
     const CHILD: &str = "GASCAN_PROGRESS_PTY_CONTRACT_CHILD";
     if std::env::var_os(CHILD).is_some() {

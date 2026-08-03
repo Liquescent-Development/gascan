@@ -292,7 +292,7 @@ pub(crate) fn render_list(
             output,
             "{:<sandbox_width$}  {}",
             sandbox.sandbox_id,
-            human_state(sandbox.actual_state)
+            list_human_state(sandbox.actual_state)
         );
     }
     output
@@ -482,6 +482,13 @@ fn human_state(value: i32) -> &'static str {
         v1::ActualState::Absent => "Absent",
         v1::ActualState::Failed => "Failed",
         _ => "Unknown",
+    }
+}
+
+fn list_human_state(value: i32) -> &'static str {
+    match v1::ActualState::try_from(value).unwrap_or(v1::ActualState::Unknown) {
+        v1::ActualState::Absent => "Destroyed",
+        _ => human_state(value),
     }
 }
 
@@ -1205,6 +1212,16 @@ mod tests {
         assert_eq!(
             render_list(&sandboxes, OutputCapabilities::plain()),
             "SANDBOX      STATE\ncode-1       Running\ncode-longer  Stopped\n"
+        );
+    }
+
+    #[test]
+    fn list_calls_absent_records_destroyed() {
+        let sandboxes = vec![status("old", v1::ActualState::Absent)];
+
+        assert_eq!(
+            render_list(&sandboxes, OutputCapabilities::plain()),
+            "SANDBOX  STATE\nold      Destroyed\n"
         );
     }
 
