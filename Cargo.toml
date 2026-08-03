@@ -19,7 +19,7 @@ tokio-stream = { version = "0.1", features = ["net"] }
 rustix = { version = "1", features = ["fs", "process"] }
 semver = "1"
 signal-hook = "0.3"
-nix = { version = "0.31.3", features = ["user"] }
+nix = { version = "0.31.3", features = ["event", "user"] }
 camino = { version = "1", features = ["serde1"] }
 sha2 = "0.10"
 toml = "0.8"

@@ -565,6 +565,7 @@ dependencies = [
  "getrandom 0.4.3",
  "http-body-util",
  "hyper-util",
+ "nix",
  "plist",
  "prost",
  "prost-types",
