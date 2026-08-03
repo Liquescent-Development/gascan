@@ -35,6 +35,7 @@ struct FakeRunner {
     interactive: VecDeque<Result<i32, CliError>>,
     commands: Vec<RecordedCommand>,
     interactive_commands: Vec<Vec<Vec<u8>>>,
+    events: Option<Arc<Mutex<Vec<String>>>>,
 }
 
 impl FakeRunner {
@@ -43,6 +44,10 @@ impl FakeRunner {
             outputs: outputs.into_iter().map(Ok).collect(),
             ..Self::default()
         }
+    }
+
+    fn record_events(&mut self, events: Arc<Mutex<Vec<String>>>) {
+        self.events = Some(events);
     }
 }
 
@@ -54,6 +59,18 @@ impl GuestRunner for FakeRunner {
         command: GuestCommand,
     ) -> Result<GuestOutput, CliError> {
         assert_eq!(selector.sandbox_id, SANDBOX_ID);
+        if let Some(events) = &self.events {
+            let command_name = command
+                .argv
+                .iter()
+                .take(3)
+                .map(|argument| String::from_utf8_lossy(argument))
+                .collect::<Vec<_>>()
+                .join(" ");
+            if let Ok(mut events) = events.lock() {
+                events.push(format!("guest:{command_name}"));
+            }
+        }
         self.commands.push(RecordedCommand {
             argv: command.argv,
             environment: command.environment,
@@ -108,6 +125,12 @@ impl HostDiscovery for FakeDiscovery {
     }
 
     fn accounts(&self, forge: Forge) -> Result<Vec<HostAccount>, ConfigureError> {
+        self.events
+            .lock()
+            .map_err(|_| ConfigureError::InvalidOutput {
+                category: "test event log",
+            })?
+            .push(format!("accounts:{forge:?}"));
         self.account_calls.borrow_mut().push(forge);
         Ok(self
             .accounts
@@ -330,6 +353,19 @@ fn gitlab_keys(existing: bool) -> GuestOutput {
     output(0, format!("[{key}]"), [])
 }
 
+fn successful_github_setup_outputs(
+    hostname: &str,
+    login: &str,
+    protocol: GitProtocol,
+) -> Vec<GuestOutput> {
+    vec![
+        output(0, [], []),
+        github_status(hostname, login, protocol),
+        github_keys(true),
+        github_keys(true),
+    ]
+}
+
 fn argv(command: &RecordedCommand) -> Vec<String> {
     command
         .argv
@@ -464,7 +500,7 @@ async fn first_up_accepted_guide_completes_the_receipt_once() -> TestResult {
         Arc::clone(&events),
     );
     let mut io = FakeIo::interactive(events);
-    for answer in [true, false, false, false] {
+    for answer in [true, true, false, false] {
         io.push_confirm(answer);
     }
     let mut runner = FakeRunner::with_outputs([
@@ -514,8 +550,16 @@ async fn first_up_partial_guide_leaves_the_receipt_pending() -> TestResult {
     );
     let mut io = FakeIo::interactive(events);
     io.push_confirm(true);
-    io.push_confirm(false);
-    let mut runner = FakeRunner::with_outputs([receipt_status("pending"), empty_status()]);
+    for value in ["Ada Lovelace", "ada@example.test", "https"] {
+        io.push_line(value);
+    }
+    let mut runner = FakeRunner::with_outputs([
+        receipt_status("pending"),
+        empty_status(),
+        output(0, [], []),
+        configured_status(GitProtocol::Https),
+        output(0, [], []),
+    ]);
 
     let result = offer_after_up_with(&mut runner, selector(), &discovery, &mut io).await?;
 
@@ -630,7 +674,7 @@ async fn aggregate_accepts_and_edits_host_defaults_with_ssh_default_and_explicit
         Arc::clone(&events),
     );
     let mut io = FakeIo::interactive(events);
-    io.push_confirm(true);
+    io.push_confirm(false);
     io.push_line("Ada Lovelace");
     io.push_line("ada@example.test");
     io.push_line("ssh");
@@ -702,8 +746,7 @@ async fn aggregate_accepts_and_edits_host_defaults_with_ssh_default_and_explicit
 }
 
 #[tokio::test]
-async fn declining_unconfigured_git_leaves_dependent_sections_pending_without_receipt() -> TestResult
-{
+async fn cancelling_unconfigured_git_leaves_dependent_sections_without_receipt() -> TestResult {
     let events = Arc::new(Mutex::new(Vec::new()));
     let discovery = FakeDiscovery::new(
         GitDefaults {
@@ -713,16 +756,14 @@ async fn declining_unconfigured_git_leaves_dependent_sections_pending_without_re
         Arc::clone(&events),
     );
     let mut io = FakeIo::interactive(events);
-    io.push_confirm(false);
+    io.lines.push_back(Err(ConfigureError::Cancelled));
     let mut runner = FakeRunner::with_outputs([empty_status()]);
 
     let outcome = configure_all(&mut runner, selector(), &discovery, &mut io).await?;
 
-    assert_eq!(outcome, ConfigureOutcome::Partial);
+    assert_eq!(outcome, ConfigureOutcome::Cancelled);
     assert_eq!(runner.commands.len(), 1);
-    assert!(io.stdout.contains("Git: skipped"));
-    assert!(io.stdout.contains("GitHub: skipped (Git/key unavailable)"));
-    assert!(io.stdout.contains("GitLab: skipped (Git/key unavailable)"));
+    assert!(io.stdout.contains("Configuration cancelled"));
     assert!(
         runner
             .commands
@@ -746,14 +787,7 @@ async fn aggregate_hidden_entry_prompts_for_an_enterprise_hostname() -> TestResu
     for answer in [true, true, false] {
         io.push_confirm(answer);
     }
-    for answer in [
-        "Ada Lovelace",
-        "ada@example.test",
-        "https",
-        "github.enterprise.test",
-    ] {
-        io.push_line(answer);
-    }
+    io.push_line("github.enterprise.test");
     io.push_secret();
     let mut runner = FakeRunner::with_outputs([
         configured_status(GitProtocol::Https),
@@ -804,9 +838,6 @@ async fn route_probe_failure_reports_retained_git_and_focused_retries_without_re
     );
     let mut io = FakeIo::interactive(events);
     io.push_confirm(true);
-    for answer in ["Ada Lovelace", "ada@example.test", "https"] {
-        io.push_line(answer);
-    }
     let mut runner = FakeRunner::with_outputs([configured_status(GitProtocol::Https)]);
     runner.outputs.push_back(Err(CliError::Runtime(
         "injected route probe transport failure".to_owned(),
@@ -862,12 +893,10 @@ async fn aggregate_reuses_existing_https_setup_and_imports_selected_enterprise_a
         ),
     ];
     let mut io = FakeIo::interactive(Arc::clone(&events));
-    for answer in [true, true, true, true, true] {
+    for answer in [true, true] {
         io.push_confirm(answer);
     }
-    for answer in ["Ada Lovelace", "ada@example.test", "https", "2", "1"] {
-        io.push_line(answer);
-    }
+    io.push_line("2");
     let key = github_key();
     let mut runner = FakeRunner::with_outputs([
         configured_status(GitProtocol::Https),
@@ -913,8 +942,8 @@ async fn aggregate_reuses_existing_https_setup_and_imports_selected_enterprise_a
         assert!(
             recorded[..token]
                 .iter()
-                .any(|event| event.starts_with("confirm:Import token for")),
-            "token was retrieved before confirmation: {recorded:?}"
+                .any(|event| event.starts_with("accounts:")),
+            "token was retrieved before account discovery: {recorded:?}"
         );
     }
     assert!(io.stdout.contains("enterprise-user"));
@@ -922,7 +951,11 @@ async fn aggregate_reuses_existing_https_setup_and_imports_selected_enterprise_a
     assert!(io.stdout.contains("tanuki"));
     assert!(io.stdout.contains("gitlab.self-managed.test"));
     assert!(io.stderr.contains("Available GitHub accounts"));
-    assert!(io.stderr.contains("Available GitLab accounts"));
+    assert!(
+        recorded
+            .iter()
+            .any(|event| event == "confirm:Import tanuki at gitlab.self-managed.test? [Y/n] ")
+    );
     assert!(io.stdout.contains("https"));
     assert!(!io.stdout.contains(PUBLIC_KEY));
     assert!(!io.stdout.contains(SENTINEL));
@@ -1006,11 +1039,8 @@ async fn declined_enterprise_import_keeps_the_selected_hostname_for_hidden_entry
         }],
     )];
     let mut io = FakeIo::interactive(Arc::clone(&events));
-    for answer in [true, true, false, false] {
+    for answer in [true, false, true, false] {
         io.push_confirm(answer);
-    }
-    for answer in ["Ada Lovelace", "ada@example.test", "https", "1"] {
-        io.push_line(answer);
     }
     io.push_secret();
     let mut runner = FakeRunner::with_outputs([
@@ -1084,9 +1114,6 @@ async fn offline_route_skips_remote_sections_without_changing_protocol_or_receip
     );
     let mut io = FakeIo::interactive(events);
     io.push_confirm(true);
-    for answer in ["Ada Lovelace", "ada@example.test", "https"] {
-        io.push_line(answer);
-    }
     let mut runner =
         FakeRunner::with_outputs([configured_status(GitProtocol::Https), output(0, [], [])]);
 
@@ -1120,9 +1147,7 @@ async fn registration_partial_success_is_retained_and_summarized_with_focused_re
     for answer in [true, true, false] {
         io.push_confirm(answer);
     }
-    for answer in ["Ada Lovelace", "ada@example.test", "https", "github.com"] {
-        io.push_line(answer);
-    }
+    io.push_line("github.com");
     io.push_secret();
     let created = github_key();
     let mut runner = FakeRunner::with_outputs([
@@ -1185,6 +1210,362 @@ async fn focused_git_has_no_host_defaults_and_accepts_explicit_https_values() ->
         )
     );
     assert!(io.stderr.lines().any(|line| line == "Git"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn complete_host_git_defaults_configure_with_one_confirmation() -> TestResult {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let discovery = FakeDiscovery::new(
+        GitDefaults {
+            name: Some("Ada Lovelace".to_owned()),
+            email: Some("ada@example.test".to_owned()),
+        },
+        Arc::clone(&events),
+    );
+    let mut io = FakeIo::interactive(Arc::clone(&events));
+    io.push_confirm(true);
+    let mut runner = FakeRunner::with_outputs([
+        empty_status(),
+        output(0, [], []),
+        configured_status(GitProtocol::Ssh),
+    ]);
+
+    let outcome = configure_git_interactive(&mut runner, selector(), &discovery, &mut io).await?;
+
+    assert_eq!(outcome, ConfigureOutcome::Completed);
+    let events = events.lock().map_err(|_| "event log poisoned")?;
+    assert!(events.iter().any(|event| event.contains(
+        "Use this identity with SSH transport and signed commits?"
+    )));
+    assert!(!events.iter().any(|event| event.contains("Git name:")));
+    assert!(!events.iter().any(|event| event.contains("Git email:")));
+    assert!(!events.iter().any(|event| event.contains("Git protocol")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn declined_host_git_defaults_edit_prefilled_values() -> TestResult {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let discovery = FakeDiscovery::new(
+        GitDefaults {
+            name: Some("Ada Lovelace".to_owned()),
+            email: Some("ada@old.test".to_owned()),
+        },
+        Arc::clone(&events),
+    );
+    let mut io = FakeIo::interactive(Arc::clone(&events));
+    io.push_confirm(false);
+    for value in ["Ada Lovelace", "ada@example.test", "https"] {
+        io.push_line(value);
+    }
+    let mut runner = FakeRunner::with_outputs([
+        empty_status(),
+        output(0, [], []),
+        configured_status(GitProtocol::Https),
+    ]);
+
+    let outcome = configure_git_interactive(&mut runner, selector(), &discovery, &mut io).await?;
+
+    assert_eq!(outcome, ConfigureOutcome::Completed);
+    let events = events.lock().map_err(|_| "event log poisoned")?;
+    assert!(events.iter().any(|event| event == "line:Git name: "));
+    assert!(events.iter().any(|event| event == "line:Git email: "));
+    assert!(
+        events
+            .iter()
+            .any(|event| event == "line:Git protocol (ssh or https): ")
+    );
+    assert!(argv(&runner.commands[1]).ends_with(&["--protocol".to_owned(), "https".to_owned()]));
+    Ok(())
+}
+
+#[tokio::test]
+async fn existing_git_configuration_is_kept_without_mutation() -> TestResult {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let discovery = FakeDiscovery::new(
+        GitDefaults {
+            name: Some("Grace Hopper".to_owned()),
+            email: Some("grace@example.test".to_owned()),
+        },
+        Arc::clone(&events),
+    );
+    let mut io = FakeIo::interactive(Arc::clone(&events));
+    io.push_confirm(true);
+    let mut runner = FakeRunner::with_outputs([configured_status(GitProtocol::Ssh)]);
+
+    let outcome = configure_git_interactive(&mut runner, selector(), &discovery, &mut io).await?;
+
+    assert_eq!(outcome, ConfigureOutcome::Completed);
+    assert_eq!(runner.commands.len(), 1);
+    let events = events.lock().map_err(|_| "event log poisoned")?;
+    assert!(
+        events
+            .iter()
+            .any(|event| event == "confirm:Keep this Git configuration? [Y/n] ")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn one_detected_forge_account_imports_without_a_secret_prompt() -> TestResult {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut discovery = FakeDiscovery::new(
+        GitDefaults {
+            name: None,
+            email: None,
+        },
+        Arc::clone(&events),
+    );
+    discovery.accounts = vec![(
+        Forge::GitHub,
+        vec![HostAccount {
+            hostname: "github.com".to_owned(),
+            login: Some("richardkiene".to_owned()),
+        }],
+    )];
+    let mut io = FakeIo::interactive(Arc::clone(&events));
+    for answer in [true, true, false] {
+        io.push_confirm(answer);
+    }
+    let mut outputs = vec![configured_status(GitProtocol::Https), online_route()];
+    outputs.extend(successful_github_setup_outputs(
+        "github.com",
+        "richardkiene",
+        GitProtocol::Https,
+    ));
+    outputs.push(output(0, [], []));
+    let mut runner = FakeRunner::with_outputs(outputs);
+    runner.record_events(Arc::clone(&events));
+
+    let outcome = configure_all(&mut runner, selector(), &discovery, &mut io).await?;
+
+    assert_eq!(outcome, ConfigureOutcome::Completed);
+    let events = events.lock().map_err(|_| "event log poisoned")?;
+    let accounts = events
+        .iter()
+        .position(|event| event == "accounts:GitHub")
+        .ok_or("GitHub accounts were not requested")?;
+    let selection = events
+        .iter()
+        .position(|event| event == "confirm:Import richardkiene at github.com? [Y/n] ")
+        .ok_or("direct import prompt was not shown")?;
+    let token = events
+        .iter()
+        .position(|event| event == "token:github.com")
+        .ok_or("host token was not requested")?;
+    let guest = events
+        .iter()
+        .position(|event| event == "guest:gh auth login")
+        .ok_or("GitHub authentication command was not run")?;
+    assert!(
+        accounts < selection && selection < token && token < guest,
+        "{events:?}"
+    );
+    assert!(events.iter().all(|event| event != "secret:GitHub token: "));
+    for legacy in ["Configure GitHub?", "Configure GitLab?"] {
+        assert!(
+            events.iter().all(|event| !event.contains(legacy)),
+            "{events:?}"
+        );
+    }
+    assert!(!io.stdout.contains(SENTINEL));
+    assert!(!io.stderr.contains(SENTINEL));
+    Ok(())
+}
+
+#[tokio::test]
+async fn declining_one_detected_forge_account_offers_hidden_manual_entry() -> TestResult {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut discovery = FakeDiscovery::new(
+        GitDefaults {
+            name: None,
+            email: None,
+        },
+        Arc::clone(&events),
+    );
+    discovery.accounts = vec![(
+        Forge::GitHub,
+        vec![HostAccount {
+            hostname: "github.enterprise.test".to_owned(),
+            login: Some("richardkiene".to_owned()),
+        }],
+    )];
+    let mut io = FakeIo::interactive(Arc::clone(&events));
+    for answer in [true, false, true, false] {
+        io.push_confirm(answer);
+    }
+    io.push_secret();
+    let mut outputs = vec![configured_status(GitProtocol::Https), online_route()];
+    outputs.extend(successful_github_setup_outputs(
+        "github.enterprise.test",
+        "richardkiene",
+        GitProtocol::Https,
+    ));
+    outputs.push(output(0, [], []));
+    let mut runner = FakeRunner::with_outputs(outputs);
+
+    let outcome = configure_all(&mut runner, selector(), &discovery, &mut io).await?;
+
+    assert_eq!(outcome, ConfigureOutcome::Completed);
+    let events = events.lock().map_err(|_| "event log poisoned")?;
+    assert!(
+        events
+            .iter()
+            .any(|event| event == "confirm:Enter a token manually? [y/N] ")
+    );
+    assert!(events.iter().any(|event| event == "secret:GitHub token: "));
+    assert!(events.iter().all(|event| !event.starts_with("token:")));
+    assert!(argv(&runner.commands[2]).contains(&"github.enterprise.test".to_owned()));
+    assert!(!io.stdout.contains(SENTINEL));
+    assert!(!io.stderr.contains(SENTINEL));
+    Ok(())
+}
+
+#[tokio::test]
+async fn multiple_forge_accounts_select_and_import_without_followup_confirmation() -> TestResult {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut discovery = FakeDiscovery::new(
+        GitDefaults {
+            name: None,
+            email: None,
+        },
+        Arc::clone(&events),
+    );
+    discovery.accounts = vec![(
+        Forge::GitHub,
+        vec![
+            HostAccount {
+                hostname: "github.com".to_owned(),
+                login: Some("octocat".to_owned()),
+            },
+            HostAccount {
+                hostname: "github.enterprise.test".to_owned(),
+                login: Some("richardkiene".to_owned()),
+            },
+        ],
+    )];
+    let mut io = FakeIo::interactive(Arc::clone(&events));
+    for answer in [true, false] {
+        io.push_confirm(answer);
+    }
+    io.push_line("2");
+    let mut outputs = vec![configured_status(GitProtocol::Https), online_route()];
+    outputs.extend(successful_github_setup_outputs(
+        "github.enterprise.test",
+        "richardkiene",
+        GitProtocol::Https,
+    ));
+    outputs.push(output(0, [], []));
+    let mut runner = FakeRunner::with_outputs(outputs);
+
+    let outcome = configure_all(&mut runner, selector(), &discovery, &mut io).await?;
+
+    assert_eq!(outcome, ConfigureOutcome::Completed);
+    let events = events.lock().map_err(|_| "event log poisoned")?;
+    assert!(
+        events.iter().any(
+            |event| event == "line:Select an account (1-2), m for manual token, or s to skip: "
+        )
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| !event.starts_with("confirm:Import token for"))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event == "token:github.enterprise.test")
+    );
+    assert!(!io.stdout.contains(SENTINEL));
+    assert!(!io.stderr.contains(SENTINEL));
+    Ok(())
+}
+
+#[tokio::test]
+async fn no_forge_account_offers_default_no_manual_configuration() -> TestResult {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let discovery = FakeDiscovery::new(
+        GitDefaults {
+            name: None,
+            email: None,
+        },
+        Arc::clone(&events),
+    );
+    let mut io = FakeIo::interactive(Arc::clone(&events));
+    for answer in [true, false, false] {
+        io.push_confirm(answer);
+    }
+    let mut runner = FakeRunner::with_outputs([
+        configured_status(GitProtocol::Https),
+        online_route(),
+        output(0, [], []),
+    ]);
+
+    let outcome = configure_all(&mut runner, selector(), &discovery, &mut io).await?;
+
+    assert_eq!(outcome, ConfigureOutcome::Completed);
+    let events = events.lock().map_err(|_| "event log poisoned")?;
+    assert!(
+        events
+            .iter()
+            .any(|event| event == "confirm:Configure GitHub with a token? [y/N] ")
+    );
+    assert!(events.iter().all(|event| event != "secret:GitHub token: "));
+    assert_eq!(runner.commands.len(), 3);
+    assert!(io.stdout.contains("GitHub: skipped"));
+    assert!(io.stdout.contains("GitLab: skipped"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_selected_forge_token_import_offers_manual_fallback() -> TestResult {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut discovery = FakeDiscovery::new(
+        GitDefaults {
+            name: None,
+            email: None,
+        },
+        Arc::clone(&events),
+    );
+    discovery.accounts = vec![(
+        Forge::GitHub,
+        vec![HostAccount {
+            hostname: "github.enterprise.test".to_owned(),
+            login: Some("richardkiene".to_owned()),
+        }],
+    )];
+    discovery
+        .failing_tokens
+        .push("github.enterprise.test".to_owned());
+    let mut io = FakeIo::interactive(Arc::clone(&events));
+    for answer in [true, true, true, false] {
+        io.push_confirm(answer);
+    }
+    io.push_secret();
+    let mut outputs = vec![configured_status(GitProtocol::Https), online_route()];
+    outputs.extend(successful_github_setup_outputs(
+        "github.enterprise.test",
+        "richardkiene",
+        GitProtocol::Https,
+    ));
+    outputs.push(output(0, [], []));
+    let mut runner = FakeRunner::with_outputs(outputs);
+
+    let outcome = configure_all(&mut runner, selector(), &discovery, &mut io).await?;
+
+    assert_eq!(outcome, ConfigureOutcome::Completed);
+    assert!(io.stderr.contains("Host token import was unavailable"));
+    let events = events.lock().map_err(|_| "event log poisoned")?;
+    assert!(
+        events
+            .iter()
+            .any(|event| event == "confirm:Enter a token manually? [y/N] ")
+    );
+    assert!(events.iter().any(|event| event == "secret:GitHub token: "));
+    assert!(!io.stdout.contains(SENTINEL));
+    assert!(!io.stderr.contains(SENTINEL));
     Ok(())
 }
 

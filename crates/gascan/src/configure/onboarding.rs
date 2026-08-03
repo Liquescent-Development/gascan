@@ -78,6 +78,18 @@ enum RemoteSummary {
     Skipped(&'static str),
 }
 
+enum GitChoice {
+    Keep(GitSetup),
+    UseHostDefaults { name: String, email: String },
+    Edit,
+}
+
+enum ForgeCredentialChoice {
+    Imported { hostname: String, token: Secret },
+    Manual { hostname: String, token: Secret },
+    Skipped,
+}
+
 pub(crate) async fn configure_all<R: GuestRunner, H: HostDiscovery + ?Sized>(
     runner: &mut R,
     selector: v1::SandboxSelector,
@@ -112,19 +124,7 @@ async fn configure_all_inner<R: GuestRunner, H: HostDiscovery + ?Sized>(
         }
     };
     show_git_state(io, current.as_ref(), &defaults)?;
-    let configure = io.confirm("Configure Git identity and signing? [Y/n] ", true)?;
-    let git = if configure {
-        Some(configure_git_values(runner, selector.clone(), current, defaults, io).await?)
-    } else {
-        current
-    };
-
-    let Some(git) = git else {
-        let github = RemoteSummary::Skipped(" (Git/key unavailable)");
-        let gitlab = RemoteSummary::Skipped(" (Git/key unavailable)");
-        write_summary(io, None, &github, &gitlab)?;
-        return Ok(ConfigureOutcome::Partial);
-    };
+    let git = configure_git_setup(runner, selector.clone(), current, defaults, io).await?;
 
     match has_default_route(runner, selector.clone()).await {
         Ok(true) => {}
@@ -175,12 +175,68 @@ pub(crate) async fn configure_git_interactive<R: GuestRunner, H: HostDiscovery +
             email: None,
         });
         show_git_state(io, current.as_ref(), &defaults)?;
-        let setup = configure_git_values(runner, selector, current, defaults, io).await?;
+        let setup = configure_git_setup(runner, selector, current, defaults, io).await?;
         write_git_summary(io, &setup)?;
         Ok(ConfigureOutcome::Completed)
     }
     .await;
     clean_cancellation(result, io)
+}
+
+async fn configure_git_setup<R: GuestRunner>(
+    runner: &mut R,
+    selector: v1::SandboxSelector,
+    current: Option<GitSetup>,
+    defaults: GitDefaults,
+    io: &mut dyn ConfigureIo,
+) -> Result<GitSetup, ConfigureError> {
+    match choose_git_setup(current.as_ref(), &defaults, io)? {
+        GitChoice::Keep(setup) => Ok(setup),
+        GitChoice::UseHostDefaults { name, email } => {
+            configure_git(
+                runner,
+                selector.clone(),
+                GitRequest {
+                    sandbox_id: selector.sandbox_id,
+                    name,
+                    email,
+                    protocol: GitProtocol::Ssh,
+                },
+            )
+            .await
+        }
+        GitChoice::Edit => configure_git_values(runner, selector, current, defaults, io).await,
+    }
+}
+
+fn choose_git_setup(
+    current: Option<&GitSetup>,
+    defaults: &GitDefaults,
+    io: &mut dyn ConfigureIo,
+) -> Result<GitChoice, ConfigureError> {
+    if let Some(current) = current {
+        return if io.confirm("Keep this Git configuration? [Y/n] ", true)? {
+            Ok(GitChoice::Keep(current.clone()))
+        } else {
+            Ok(GitChoice::Edit)
+        };
+    }
+    match (&defaults.name, &defaults.email) {
+        (Some(name), Some(email)) => {
+            if io.confirm(
+                "Use this identity with SSH transport and signed commits? [Y/n] ",
+                true,
+            )? {
+                Ok(GitChoice::UseHostDefaults {
+                    name: name.clone(),
+                    email: email.clone(),
+                })
+            } else {
+                Ok(GitChoice::Edit)
+            }
+        }
+        _ => Ok(GitChoice::Edit),
+    }
 }
 
 pub(crate) async fn configure_forge_interactive<R: GuestRunner>(
@@ -394,10 +450,12 @@ async fn configure_remote_section<R: GuestRunner, H: HostDiscovery + ?Sized>(
 ) -> Result<(RemoteSummary, bool), ConfigureError> {
     let name = forge_name(forge);
     io.write_err(&format!("{name}\n"))?;
-    if !io.confirm(&format!("Configure {name}? [Y/n] "), true)? {
-        return Ok((RemoteSummary::Skipped(""), false));
-    }
-    let (hostname, token) = choose_forge_token(discovery, io, forge)?;
+    let credential = choose_forge_credential(discovery, io, forge)?;
+    let (hostname, token) = match credential {
+        ForgeCredentialChoice::Imported { hostname, token }
+        | ForgeCredentialChoice::Manual { hostname, token } => (hostname, token),
+        ForgeCredentialChoice::Skipped => return Ok((RemoteSummary::Skipped(""), false)),
+    };
     let result = configure_forge(
         runner,
         selector.clone(),
@@ -413,70 +471,125 @@ async fn configure_remote_section<R: GuestRunner, H: HostDiscovery + ?Sized>(
     remote_result(result, git.protocol, io)
 }
 
-fn choose_forge_token<H: HostDiscovery + ?Sized>(
+fn choose_forge_credential<H: HostDiscovery + ?Sized>(
     discovery: &H,
     io: &mut dyn ConfigureIo,
     forge: Forge,
-) -> Result<(String, Secret), ConfigureError> {
+) -> Result<ForgeCredentialChoice, ConfigureError> {
     let accounts = match discovery.accounts(forge) {
         Ok(accounts) => accounts,
         Err(_) => {
-            io.write_err("Host account import was unavailable; enter a token manually.\n")?;
+            io.write_err("Host account import was unavailable.\n")?;
             Vec::new()
         }
     };
-    if !accounts.is_empty() {
-        io.write_err(&format!("Available {} accounts:\n", forge_name(forge)))?;
-        for (index, account) in accounts.iter().enumerate() {
-            io.write_err(&format!(
-                "  {}. {} at {}\n",
-                index + 1,
-                account.login.as_deref().unwrap_or("unknown account"),
-                account.hostname
-            ))?;
-        }
-        let selection = io
-            .line(
-                "Import account number, or press Enter for hidden token entry: ",
-                None,
-            )?
-            .ok_or(ConfigureError::Cancelled)?;
-        if !selection.is_empty() {
-            let index = selection
-                .parse::<usize>()
-                .ok()
-                .and_then(|index| index.checked_sub(1))
-                .filter(|index| *index < accounts.len())
-                .ok_or(ConfigureError::InvalidOutput { category: "prompt" })?;
-            let account = &accounts[index];
-            let label = account.login.as_deref().unwrap_or("unknown account");
+    match accounts.len() {
+        0 => {
             if io.confirm(
-                &format!("Import token for {label} at {}? [y/N] ", account.hostname),
+                &format!("Configure {} with a token? [y/N] ", forge_name(forge)),
                 false,
             )? {
-                match discovery.token(forge, account) {
-                    Ok(token) => return Ok((account.hostname.clone(), token)),
-                    Err(_) => {
-                        io.write_err(
-                            "Host token import was unavailable; enter the token instead.\n",
-                        )?;
-                        let token = hidden_token(io, forge)?;
-                        return Ok((account.hostname.clone(), token));
-                    }
-                }
+                manual_credential(io, forge, None)
+            } else {
+                Ok(ForgeCredentialChoice::Skipped)
             }
-            return Ok((account.hostname.clone(), hidden_token(io, forge)?));
+        }
+        1 => {
+            let account = &accounts[0];
+            let label = account.login.as_deref().unwrap_or("unknown account");
+            if io.confirm(
+                &format!("Import {label} at {}? [Y/n] ", account.hostname),
+                true,
+            )? {
+                import_credential(discovery, io, forge, account)
+            } else {
+                offer_manual_credential(io, forge, account.hostname.clone())
+            }
+        }
+        count => {
+            io.write_err(&format!("Available {} accounts:\n", forge_name(forge)))?;
+            for (index, account) in accounts.iter().enumerate() {
+                io.write_err(&format!(
+                    "  {}. {} at {}\n",
+                    index + 1,
+                    account.login.as_deref().unwrap_or("unknown account"),
+                    account.hostname
+                ))?;
+            }
+            let selection = io
+                .line(
+                    &format!("Select an account (1-{count}), m for manual token, or s to skip: "),
+                    None,
+                )?
+                .ok_or(ConfigureError::Cancelled)?;
+            if selection == "m" {
+                manual_credential(io, forge, None)
+            } else if selection == "s" {
+                Ok(ForgeCredentialChoice::Skipped)
+            } else {
+                let index = selection
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|index| index.checked_sub(1))
+                    .filter(|index| *index < count)
+                    .ok_or(ConfigureError::InvalidOutput { category: "prompt" })?;
+                import_credential(discovery, io, forge, &accounts[index])
+            }
         }
     }
-    let hostname = required_line(
-        io,
-        match forge {
-            Forge::GitHub => "GitHub hostname: ",
-            Forge::GitLab => "GitLab hostname: ",
-        },
-        Some(default_hostname(forge)),
-    )?;
-    Ok((hostname, hidden_token(io, forge)?))
+}
+
+fn import_credential<H: HostDiscovery + ?Sized>(
+    discovery: &H,
+    io: &mut dyn ConfigureIo,
+    forge: Forge,
+    account: &super::HostAccount,
+) -> Result<ForgeCredentialChoice, ConfigureError> {
+    match discovery.token(forge, account) {
+        Ok(token) => Ok(ForgeCredentialChoice::Imported {
+            hostname: account.hostname.clone(),
+            token,
+        }),
+        Err(_) => {
+            io.write_err("Host token import was unavailable; enter a token manually instead.\n")?;
+            offer_manual_credential(io, forge, account.hostname.clone())
+        }
+    }
+}
+
+fn offer_manual_credential(
+    io: &mut dyn ConfigureIo,
+    forge: Forge,
+    hostname: String,
+) -> Result<ForgeCredentialChoice, ConfigureError> {
+    if io.confirm("Enter a token manually? [y/N] ", false)? {
+        let token = hidden_token(io, forge)?;
+        Ok(ForgeCredentialChoice::Manual { hostname, token })
+    } else {
+        Ok(ForgeCredentialChoice::Skipped)
+    }
+}
+
+fn manual_credential(
+    io: &mut dyn ConfigureIo,
+    forge: Forge,
+    hostname: Option<String>,
+) -> Result<ForgeCredentialChoice, ConfigureError> {
+    let hostname = match hostname {
+        Some(hostname) => hostname,
+        None => required_line(
+            io,
+            match forge {
+                Forge::GitHub => "GitHub hostname: ",
+                Forge::GitLab => "GitLab hostname: ",
+            },
+            Some(default_hostname(forge)),
+        )?,
+    };
+    Ok(ForgeCredentialChoice::Manual {
+        hostname,
+        token: hidden_token(io, forge)?,
+    })
 }
 
 fn hidden_token(io: &mut dyn ConfigureIo, forge: Forge) -> Result<Secret, ConfigureError> {
