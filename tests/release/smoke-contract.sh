@@ -219,6 +219,9 @@ case "$*" in
     ;;
   "up "*)
     [[ ${CI:-} == 1 ]] || exit 91
+    [[ ${GASCAN_APPLE_ATTACH_HELPER:-} == "$(cat "$FIXTURE_SUDO_LOG.attach-helper")" ]] || exit 86
+    [[ ! -f $FIXTURE_SUDO_LOG.daemon ]] || exit 89
+    printf "verified\n" >"$FIXTURE_SUDO_LOG.up-contract"
     exit 42
     ;;
   *)
@@ -309,6 +312,7 @@ realpath "$fixture/bin/gascand" >"$log.gascand"
 status=0
 output=$(run_smoke) || status=$?
 [[ $status -eq 42 ]] || { printf 'release smoke returned %s, expected 42\n%s\n' "$status" "$output" >&2; exit 1; }
+grep -qx 'verified' "$log.up-contract"
 [[ $(wc -l <"$log" | tr -d ' ') -eq 2 ]] || { printf 'unexpected sudo invocation count\n' >&2; exit 1; }
 create_argv=$(sed -n '1p' "$log")
 delete_argv=$(sed -n '2p' "$log")

@@ -75,6 +75,10 @@ enum RemoteSummary {
         setup: ForgeSetup,
         protocol: GitProtocol,
     },
+    Failed {
+        setup: ForgeSetup,
+        protocol: GitProtocol,
+    },
     Skipped(&'static str),
 }
 
@@ -618,7 +622,7 @@ fn remote_result(
                 "{category} for {hostname} failed: {message}; retry with `{retry}`\n"
             ))?;
             Ok((
-                RemoteSummary::Setup {
+                RemoteSummary::Failed {
                     setup: *setup,
                     protocol,
                 },
@@ -663,16 +667,40 @@ fn write_remote_summary(
     let name = forge_name(forge);
     match summary {
         RemoteSummary::Skipped(reason) => io.write_warning(&format!("{name}: skipped{reason}\n")),
-        RemoteSummary::Setup { setup, protocol } => io.write_success(&format!(
-            "{name}: {} at {}; protocol {}; authentication {}; authentication key {}; signing key {}\n",
-            setup.login,
-            setup.hostname,
-            protocol_name(*protocol),
-            if setup.authenticated { "configured" } else { "failed" },
-            registration_name(setup.authentication_key),
-            registration_name(setup.signing_key),
-        )),
+        RemoteSummary::Setup { setup, protocol } => {
+            io.write_success(&remote_summary_text(name, setup, *protocol, false))
+        }
+        RemoteSummary::Failed { setup, protocol } => {
+            io.write_failure(&remote_summary_text(name, setup, *protocol, true))
+        }
     }
+}
+
+fn remote_summary_text(
+    name: &str,
+    setup: &ForgeSetup,
+    protocol: GitProtocol,
+    failed: bool,
+) -> String {
+    let login = if setup.login.is_empty() && failed {
+        "authentication failed"
+    } else if setup.login.is_empty() {
+        "unknown account"
+    } else {
+        &setup.login
+    };
+    format!(
+        "{name}: {login} at {}; protocol {}; authentication {}; authentication key {}; signing key {}\n",
+        setup.hostname,
+        protocol_name(protocol),
+        if setup.authenticated {
+            "configured"
+        } else {
+            "failed"
+        },
+        registration_name(setup.authentication_key),
+        registration_name(setup.signing_key),
+    )
 }
 
 const fn registration_name(state: RegistrationState) -> &'static str {

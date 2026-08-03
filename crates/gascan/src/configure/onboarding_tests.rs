@@ -253,6 +253,16 @@ impl ConfigureIo for FakeIo {
         self.event(format!("err:{text}"))
     }
 
+    fn write_success(&mut self, text: &str) -> Result<(), ConfigureError> {
+        self.stdout.push_str(text);
+        self.event(format!("success:{text}"))
+    }
+
+    fn write_failure(&mut self, text: &str) -> Result<(), ConfigureError> {
+        self.stderr.push_str(text);
+        self.event(format!("failure:{text}"))
+    }
+
     fn stdin_is_terminal(&self) -> bool {
         self.stdin_terminal
     }
@@ -571,6 +581,60 @@ async fn first_up_partial_guide_leaves_the_receipt_pending() -> TestResult {
         .commands
         .iter()
         .all(|command| !argv(command).ends_with(&["receipt".to_owned(), "complete".to_owned()])));
+    Ok(())
+}
+
+#[tokio::test]
+async fn first_up_authentication_failure_uses_failure_summary_and_keeps_receipt_pending()
+-> TestResult {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let discovery = FakeDiscovery::new(
+        GitDefaults {
+            name: None,
+            email: None,
+        },
+        Arc::clone(&events),
+    );
+    let mut io = FakeIo::interactive(Arc::clone(&events));
+    for answer in [true, true, true, false] {
+        io.push_confirm(answer);
+    }
+    io.push_line("github.com");
+    io.push_secret();
+    let mut runner = FakeRunner::with_outputs([
+        receipt_status("pending"),
+        configured_status(GitProtocol::Https),
+        online_route(),
+        output(1, [], "HTTP 401: bad credentials\n"),
+    ]);
+
+    let result = offer_after_up_with(&mut runner, selector(), &discovery, &mut io).await?;
+
+    assert_eq!(result, OfferResult::Pending);
+    assert!(runner
+        .commands
+        .iter()
+        .all(|command| !argv(command).ends_with(&["receipt".to_owned(), "complete".to_owned()])));
+    assert!(
+        io.stderr
+            .contains("GitHub: authentication failed at github.com")
+    );
+    assert!(!io.stdout.contains("GitHub:"));
+    assert!(!io.stdout.contains("GitHub:  at"));
+    assert!(!io.stderr.contains("GitHub:  at"));
+    assert!(!io.stdout.contains(SENTINEL));
+    assert!(!io.stderr.contains(SENTINEL));
+    let events = events.lock().map_err(|_| "event log poisoned")?;
+    assert!(
+        events.iter().any(|event| {
+            event.starts_with("failure:GitHub: authentication failed at github.com")
+        })
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| !event.starts_with("success:GitHub:"))
+    );
     Ok(())
 }
 
@@ -1015,6 +1079,7 @@ async fn failed_host_token_import_falls_back_to_hidden_entry_without_native_outp
     let outcome = configure_all(&mut runner, selector(), &discovery, &mut io).await?;
 
     assert_eq!(outcome, ConfigureOutcome::Completed);
+    assert_eq!(io.confirm_defaults, [true, true, false, false]);
     assert!(io.stderr.contains("Host token import was unavailable"));
     assert!(!io.stderr.contains("command did not complete"));
     assert!(
@@ -1067,6 +1132,7 @@ async fn declined_enterprise_import_keeps_the_selected_hostname_for_hidden_entry
     let outcome = configure_all(&mut runner, selector(), &discovery, &mut io).await?;
 
     assert_eq!(outcome, ConfigureOutcome::Completed);
+    assert_eq!(io.confirm_defaults, [true, true, false, false]);
     assert!(argv(&runner.commands[2]).contains(&"github.enterprise.test".to_owned()));
     assert_eq!(
         runner
@@ -1171,10 +1237,18 @@ async fn registration_partial_success_is_retained_and_summarized_with_focused_re
     let outcome = configure_all(&mut runner, selector(), &discovery, &mut io).await?;
 
     assert_eq!(outcome, ConfigureOutcome::Partial);
-    assert!(io.stdout.contains("GitHub: octocat at github.com"));
-    assert!(io.stdout.contains("authentication key added"));
-    assert!(io.stdout.contains("signing key failed"));
+    assert!(!io.stdout.contains("GitHub:"));
+    assert!(io.stderr.contains("GitHub: octocat at github.com"));
+    assert!(io.stderr.contains("authentication key added"));
+    assert!(io.stderr.contains("signing key failed"));
     assert!(io.stderr.contains("gascan configure gh"));
+    assert!(
+        io.events
+            .lock()
+            .map_err(|_| "test event log was poisoned")?
+            .iter()
+            .any(|event| event.starts_with("failure:GitHub: octocat at github.com"))
+    );
     assert!(!io.stdout.contains(PUBLIC_KEY));
     assert!(!io.stdout.contains(SENTINEL));
     assert!(!io.stderr.contains(SENTINEL));
@@ -1349,6 +1423,7 @@ async fn one_detected_forge_account_imports_without_a_secret_prompt() -> TestRes
     let outcome = configure_all(&mut runner, selector(), &discovery, &mut io).await?;
 
     assert_eq!(outcome, ConfigureOutcome::Completed);
+    assert_eq!(io.confirm_defaults, [true, true, false]);
     let events = events.lock().map_err(|_| "event log poisoned")?;
     let accounts = events
         .iter()
@@ -1416,6 +1491,7 @@ async fn declining_one_detected_forge_account_offers_hidden_manual_entry() -> Te
     let outcome = configure_all(&mut runner, selector(), &discovery, &mut io).await?;
 
     assert_eq!(outcome, ConfigureOutcome::Completed);
+    assert_eq!(io.confirm_defaults, [true, true, false, false]);
     let events = events.lock().map_err(|_| "event log poisoned")?;
     assert!(
         events
@@ -1628,6 +1704,7 @@ async fn no_forge_account_offers_default_no_manual_configuration() -> TestResult
     let outcome = configure_all(&mut runner, selector(), &discovery, &mut io).await?;
 
     assert_eq!(outcome, ConfigureOutcome::Completed);
+    assert_eq!(io.confirm_defaults, [true, false, false]);
     let events = events.lock().map_err(|_| "event log poisoned")?;
     assert!(
         events
@@ -1678,6 +1755,7 @@ async fn failed_selected_forge_token_import_offers_manual_fallback() -> TestResu
     let outcome = configure_all(&mut runner, selector(), &discovery, &mut io).await?;
 
     assert_eq!(outcome, ConfigureOutcome::Completed);
+    assert_eq!(io.confirm_defaults, [true, true, false, false]);
     assert!(io.stderr.contains("Host token import was unavailable"));
     let events = events.lock().map_err(|_| "event log poisoned")?;
     assert!(

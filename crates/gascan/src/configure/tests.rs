@@ -13,7 +13,7 @@ use crate::{
 use gascan_proto::v1;
 use std::collections::VecDeque;
 use std::fs;
-use std::io::{Read as _, Write as _};
+use std::io::{IsTerminal as _, Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 
@@ -667,6 +667,10 @@ fn configure_palette_styles_semantic_messages() {
     assert!(palette.heading("Git").contains("\x1b["));
     assert!(palette.success("Git configured").contains("✓"));
     assert!(palette.warning("GitLab skipped").contains("\x1b["));
+    let failure = palette.failure("Authentication failed");
+    assert!(failure.contains("\x1b[31m"));
+    assert!(failure.contains('✗'));
+    assert!(!failure.contains('✓'));
 }
 
 #[test]
@@ -723,22 +727,44 @@ fn no_color_disables_configure_palette() -> TestResult {
     const CHILD_MARKER: &str = "GASCAN_CONFIGURE_NO_COLOR_CHILD";
 
     if std::env::var_os(CHILD_MARKER).is_some() {
+        assert!(std::io::stderr().is_terminal());
         let palette = ConfigurePalette::new(OutputCapabilities::for_stderr());
-        assert!(!palette.prompt("Name: ").contains("\x1b["));
+        eprintln!("GASCAN_CONFIGURE_PALETTE={}", palette.prompt("Name: "));
         return Ok(());
     }
 
-    let status = std::process::Command::new(std::env::current_exe()?)
-        .args([
-            "--exact",
-            "configure::tests::no_color_disables_configure_palette",
-            "--nocapture",
-        ])
-        .env(CHILD_MARKER, "1")
-        .env("NO_COLOR", "1")
-        .env("CLICOLOR_FORCE", "1")
-        .status()?;
-    assert!(status.success());
+    let run_child = |no_color: bool| -> TestResult<String> {
+        let pty = rustix_openpty::openpty(None, None)?;
+        let error = duplicate_file(&pty.user)?;
+        let mut controller = duplicate_file(&pty.controller)?;
+        let mut command = std::process::Command::new(std::env::current_exe()?);
+        command
+            .args([
+                "--exact",
+                "configure::tests::no_color_disables_configure_palette",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .env("CLICOLOR_FORCE", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(error));
+        if no_color {
+            command.env("NO_COLOR", "1");
+        } else {
+            command.env_remove("NO_COLOR");
+        }
+        let status = command.status()?;
+        let rendered = String::from_utf8(read_available(&mut controller)?)?;
+        assert!(status.success(), "child failed: {rendered}");
+        assert!(rendered.contains("GASCAN_CONFIGURE_PALETTE="));
+        assert!(rendered.contains("Name: "));
+        Ok(rendered)
+    };
+
+    let capable = run_child(false)?;
+    assert!(capable.contains("\x1b[36m"), "{capable:?}");
+    let no_color = run_child(true)?;
+    assert!(!no_color.contains("\x1b["), "{no_color:?}");
     Ok(())
 }
 
