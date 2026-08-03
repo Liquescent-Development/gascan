@@ -50,6 +50,7 @@ case "$4" in command=) echo "$FIXTURE_OBSERVED_EXECUTABLE";; lstart=) echo " $FI
 write_fake gascan '
 printf "gascan:%s\\n" "$*" >>"$FIXTURE_LOG"
 if [[ $1 == daemon-attest ]]; then [[ $FIXTURE_DAEMON_PID != 999999 ]] || exit 1; printf "{\\\"pid\\\":%s,\\\"executable\\\":\\\"%s\\\",\\\"start_identity\\\":\\\"%s\\\",\\\"instance_token\\\":\\\"%s\\\"}\\n" "$FIXTURE_DAEMON_PID" "$FIXTURE_ATTESTED_EXECUTABLE" "$FIXTURE_ATTESTED_START" "$FIXTURE_ATTESTED_TOKEN";
+elif [[ $1 == list && ${2:-} == --all ]]; then printf "%s\\n" "$FIXTURE_ALL_SANDBOX_JSON";
 elif [[ $1 == list ]]; then printf "%s\\n" "$FIXTURE_SANDBOX_JSON"; fi'
 
 export PATH="$fixture/bin:/usr/bin:/bin:/usr/sbin:/sbin" FIXTURE_LOG=$log FIXTURE_REVISION=$revision FIXTURE_HASH=$hash
@@ -93,7 +94,7 @@ export FIXTURE_VERSION_JSON=$good_version FIXTURE_STATUS_JSON=$good_status
 "$repo_root/packaging/macos/install.sh" "$fixture/test.pkg" >/dev/null
 grep -qx "sudo:installer -pkg $fixture/test.pkg -target /" "$log"
 
-: >"$log"; sleep 1000 & daemon_pid=$!; export FIXTURE_DAEMON_PID=$daemon_pid FIXTURE_SANDBOX_JSON='[]'
+: >"$log"; sleep 1000 & daemon_pid=$!; export FIXTURE_DAEMON_PID=$daemon_pid FIXTURE_SANDBOX_JSON='[]' FIXTURE_ALL_SANDBOX_JSON='[]'
 export LC_ALL=C LANG=C TZ=America/Phoenix
 for condition in attested-start observed-start executable empty-token; do
   export FIXTURE_ATTESTED_START=START FIXTURE_OBSERVED_START=START FIXTURE_ATTESTED_EXECUTABLE=/usr/local/bin/gascand FIXTURE_ATTESTED_TOKEN=TOKEN
@@ -111,15 +112,19 @@ export FIXTURE_ATTESTED_START=START FIXTURE_OBSERVED_START=START FIXTURE_ATTESTE
 "$repo_root/packaging/macos/uninstall.sh" --remove-data >/dev/null
 ! /bin/kill -0 "$daemon_pid" 2>/dev/null; daemon_pid=
 grep -qx 'gascan:list --json' "$log"
+grep -qx 'gascan:list --all --json' "$log"
 if grep '^ps-env:' "$log" | grep -vx 'ps-env:C:C:UTC'; then
   printf 'daemon stop inspected process identity without deterministic UTC environment\n' >&2
   exit 1
 fi
 
-: >"$log"; export FIXTURE_DAEMON_PID=999999 FIXTURE_SANDBOX_JSON='[{"sandbox_id":"one"},{"sandbox_id":"two"}]'
+: >"$log"; export FIXTURE_DAEMON_PID=999999 FIXTURE_SANDBOX_JSON='[{"sandbox_id":"one"},{"sandbox_id":"two"}]' FIXTURE_ALL_SANDBOX_JSON='[{"sandbox_id":"one","actual_state":"absent"},{"sandbox_id":"two","actual_state":"absent"}]'
 "$repo_root/packaging/macos/uninstall.sh" --remove-data >/dev/null
 grep -qx 'gascan:--sandbox one destroy --yes' "$log"
 grep -qx 'gascan:--sandbox two destroy --yes' "$log"
+grep -qx 'gascan:list --all --json' "$log"
+export FIXTURE_ALL_SANDBOX_JSON='[{"sandbox_id":"one","actual_state":"running"}]'
+"$repo_root/packaging/macos/uninstall.sh" --remove-data >/dev/null 2>&1 && { echo 'active retained inventory accepted' >&2; exit 1; }
 for invalid in '[{"sandbox_id":"same"},{"sandbox_id":"same"}]' '[{"sandbox_id":""}]' '{}'; do
   export FIXTURE_SANDBOX_JSON=$invalid
   "$repo_root/packaging/macos/uninstall.sh" --remove-data >/dev/null 2>&1 && { echo 'invalid sandbox inventory accepted' >&2; exit 1; }

@@ -210,13 +210,24 @@ also verify local Rust, npm, Go, Python, and Ruby installs and XDG configuration
 fixture and sandbox created for these checks remains release-smoke-owned and
 must be removed by its recorded cleanup path.
 
-Host controller state and the on-demand socket live under
-`${XDG_RUNTIME_DIR}/gascan` when `XDG_RUNTIME_DIR` is set, otherwise under
-`/private/tmp/gascan-UID` on macOS. The canonical path avoids the `/tmp`
-symlink because the daemon deliberately rejects symlinked runtime-directory
-components. Persistent tool, cache, and Gas Can configuration
-live in Apple named volumes; the canonical project remains at its selected host
-path. Apple owns its runtime/image storage locations.
+The durable host controller database is exactly
+`~/Library/Application Support/dev.gascan/controller/state.sqlite3`. On first
+startup, Gas Can automatically migrates a safe legacy runtime database there.
+If both active databases differ, it refuses to choose or merge them and leaves
+both unchanged for explicit recovery. The on-demand socket and daemon lifecycle
+files live under `${XDG_RUNTIME_DIR}/gascan` when `XDG_RUNTIME_DIR` is set,
+otherwise under `/private/tmp/gascan-UID` on macOS. The canonical path avoids
+the `/tmp` symlink because the daemon deliberately rejects symlinked
+runtime-directory components. Persistent tool, cache, and Gas Can
+configuration live in Apple named volumes; the canonical project remains at its
+selected host path. Apple owns its runtime/image storage locations.
+
+During upgrade verification, create a sandbox and write a managed-volume marker,
+replace the on-demand daemon (and package when exercising an installed upgrade),
+then recreate the runtime directory and verify both the inventory and marker
+survive. After the final `gascan destroy --yes`, require `gascan list` to print
+`No sandboxes found.` and `gascan list --json` to return `[]`; use
+`gascan list --all --json` only to confirm the retained `absent` tombstone.
 
 ## Native SSH connected acceptance
 
@@ -254,8 +265,8 @@ sudo -v
 GASCAN_RELEASE_CLEAN_HOST_CONFIRM=YES ./tests/release/clean-host.sh
 ```
 
-Before mutation, the gate rejects an existing receipt, installed path,
-controller/socket root, Gas Can-owned Apple resource, or test DNS route. It
+Before mutation, the gate rejects an existing receipt, installed path, durable
+controller-state root, runtime socket root, Gas Can-owned Apple resource, or test DNS route. It
 builds and inspects the package, installs it, requires `doctor` to
 pass, checks every pinned language and both Gascamp sources, confirms setup
 apply semantics, restarts the workspace and identity-bound on-demand daemon,
@@ -263,8 +274,9 @@ then proves an owned endpoint works in networked mode and that the same
 endpoint, public DNS, and literal IP fail in offline mode as workspace and
 guest root. Structured inspection must also show no network attachment. It
 destroys exact sandboxes, uninstalls with explicit test-data removal, and
-requires the receipt, installed paths, controller/socket root, DNS route, and
-Gas Can-owned Apple container/volume inventories to return to empty. Its
+requires the receipt, installed paths, durable controller-state and runtime
+socket roots, DNS route, and Gas Can-owned Apple container/volume inventories
+to return to empty. Its
 required final line is `PASS: Gas Can macOS MVP release gate`. INT or TERM
 preserves a nonzero signal status, performs recorded cleanup, and can never
 produce that PASS line; phase failures likewise preserve the original error
@@ -281,14 +293,18 @@ host, or partial output.
 
 The default removes only package-owned binaries, documentation, and the
 package receipt. It deliberately preserves every sandbox, Apple volume, cache,
-and controller-state file.
+and durable controller-state file, including
+`~/Library/Application Support/dev.gascan/controller/state.sqlite3`.
 
 ```sh
 ./packaging/macos/uninstall.sh --remove-data
 ```
 
-The explicit flag first asks the installed CLI for its owned sandbox IDs and
-destroys each through the authenticated daemon API before removing package
-files and its private controller/socket directory. Zero sandboxes is valid;
-malformed or duplicate controller inventory fails closed. It never selects
-resources by a broad substring and never removes foreign Apple resources.
+The explicit flag first asks the installed CLI for its active sandbox IDs and
+destroys each through the authenticated daemon API. It then checks
+`gascan list --all --json` and proceeds only when every retained record is
+`absent`, stops the attested daemon, and removes only safely validated private
+runtime and `dev.gascan/controller` roots before removing package files. Zero
+sandboxes is valid; malformed, duplicate, or non-destroyed controller inventory
+fails closed. It never selects resources by a broad substring and never removes
+foreign Apple resources.

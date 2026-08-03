@@ -33,6 +33,20 @@ else
     [[ -n $sandbox_id ]] || continue
     gascan --sandbox "$sandbox_id" destroy --yes
   done <<<"$sandbox_ids"
+
+  all_sandbox_json=$(gascan list --all --json)
+  jq -e '
+    type == "array" and
+    all(.[];
+      type == "object" and
+      (.sandbox_id | type == "string" and length > 0) and
+      .actual_state == "absent"
+    ) and
+    ([.[].sandbox_id] | length == (unique | length))
+  ' <<<"$all_sandbox_json" >/dev/null || {
+    printf 'owned sandbox inventory did not reach the destroyed state\n' >&2
+    exit 65
+  }
 fi
 
 gascan_stop_attested_daemon gascan /usr/local/bin/gascand
@@ -51,6 +65,24 @@ if [[ $remove_data == true ]]; then
       exit 65
     }
     rm -rf "$runtime_root"
+  fi
+
+  controller_root=$(gascan_user_controller_root)
+  controller_parent=${controller_root%/controller}
+  if [[ -e $controller_root || -L $controller_root ]]; then
+    for private_root in "$controller_parent" "$controller_root"; do
+      [[ -d $private_root && ! -L $private_root ]] || {
+        printf 'refusing unsafe controller-state path: %s\n' "$private_root" >&2
+        exit 65
+      }
+      owner=$(stat -f '%u' "$private_root")
+      mode=$(stat -f '%Lp' "$private_root")
+      [[ $owner == "$(id -u)" && $mode == 700 ]] || {
+        printf 'refusing controller-state directory with unsafe ownership or mode\n' >&2
+        exit 65
+      }
+    done
+    rm -rf "$controller_root"
   fi
 fi
 sudo rm -f \

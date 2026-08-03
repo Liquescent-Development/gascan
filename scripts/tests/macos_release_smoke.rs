@@ -75,6 +75,54 @@ fn release_smoke_uses_matching_branch_daemon_for_launch_and_shutdown() {
 }
 
 #[test]
+fn release_smoke_isolates_durable_controller_state_and_checks_destroyed_tombstones() {
+    let smoke =
+        fs::read_to_string(repository_root().join("packaging/macos/release-smoke.sh")).unwrap();
+
+    for required in [
+        "GASCAN_STATE_PATH|",
+        "GASCAN_STATE_PATH=\"${GASCAN_STATE_PATH:-}\"",
+        "state_path=$root/controller-state/state.sqlite3",
+        "export GASCAN_STATE_PATH=$state_path",
+        "rm -rf \"$root\"",
+        "gascan_release_volume_marker=durable-controller-marker",
+        "persistence_check controller.volume_marker",
+        "gascan_release_recreate_runtime_root()",
+        "runtime_root=$(gascan_user_runtime_root)",
+        "gascan_release_recreate_runtime_root\n\"$gascan_bin\" --sandbox \"$sandbox_id\" status --json",
+        "normal_controller_inventory=$(\"$gascan_bin\" list --json)",
+        "No sandboxes found.",
+        "controller_inventory=$(\"$gascan_bin\" list --all --json)",
+    ] {
+        assert!(
+            smoke.contains(required),
+            "release smoke omits durable controller-state contract {required:?}"
+        );
+    }
+
+    assert!(
+        !smoke.contains("\ncontroller_inventory=$(\"$gascan_bin\" list --json)"),
+        "retained tombstone assertions must use list --all --json"
+    );
+}
+
+#[test]
+fn readme_documents_durable_controller_recovery_contract() {
+    let readme = fs::read_to_string(repository_root().join("README.md")).unwrap();
+
+    for required in [
+        "~/Library/Application Support/dev.gascan/controller/state.sqlite3",
+        "automatically migrates",
+        "refuses to choose",
+        "Package upgrades and ordinary uninstalls preserve this durable controller state.",
+        "./packaging/macos/uninstall.sh --remove-data",
+        "gascan list --all",
+    ] {
+        assert!(readme.contains(required), "README omits {required:?}");
+    }
+}
+
+#[test]
 fn release_smoke_runs_every_up_without_interactive_stdin() {
     let smoke =
         fs::read_to_string(repository_root().join("packaging/macos/release-smoke.sh")).unwrap();
