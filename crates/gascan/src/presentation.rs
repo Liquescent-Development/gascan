@@ -37,6 +37,14 @@ impl OutputCapabilities {
         )
     }
 
+    pub(crate) const fn color_enabled(self) -> bool {
+        self.color
+    }
+
+    pub(crate) const fn unicode_enabled(self) -> bool {
+        self.unicode
+    }
+
     fn for_term(term: Term, color: bool) -> Self {
         let interactive = term.is_term();
         Self {
@@ -52,6 +60,15 @@ impl OutputCapabilities {
             interactive: false,
             color: false,
             unicode: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn test(interactive: bool, color: bool, unicode: bool) -> Self {
+        Self {
+            interactive,
+            color,
+            unicode,
         }
     }
 }

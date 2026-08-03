@@ -222,10 +222,11 @@ project root, so the same project always maps to the same sandbox.
 
 ### Developer onboarding: Git, forges, and signing
 
-`gascan configure` is an optional interactive guide for one selected running
-sandbox. It configures Git identity and a sandbox key first, then offers
-GitHub and GitLab setup. The focused commands repair or change one component
-without repeating the rest:
+The first successful interactive `gascan up .` offers this optional, compact
+setup. It never changes whether `up` succeeds: you can decline and run it
+later with `gascan configure`. The guide configures Git and the sandbox key
+first, then GitHub and GitLab. The focused commands repair or change one
+component without repeating the rest:
 
 ```sh
 gascan configure
@@ -234,25 +235,26 @@ gascan configure gh
 gascan configure glab
 ```
 
-Pass the existing global `--sandbox <id>` option when more than one sandbox
-exists. A stopped sandbox asks you to run `gascan up`; every focused command
-is safe to rerun. The first-`up` offer appears only on an interactive terminal.
-It is suppressed for redirected or JSON output and in CI, and a cancelled or
-failed guide never turns a successful `up` into a failure. Explicit
-`gascan configure` remains available even after completing or declining the
-offer.
+For the Git shortcut, the guide shows the name and email from the Mac's
+`git config --global` (never repository, worktree, private-key, or arbitrary
+Git-file data) and asks:
 
-For Git identity, Gas Can reads editable defaults only from
-`git config --global` on the Mac. It never imports repository or worktree
-configuration, host private keys, or arbitrary Git files. Confirmed values are
-written to the sandbox-global Git configuration. The guide creates one
-passwordless Ed25519 key for this sandbox and configures it for SSH transport
-plus SSH commit and tag signing by default. The key is reused on focused
-retries; unsafe managed paths, links, owners, or permissions fail closed.
+```text
+Use this identity with SSH transport and signed commits? [Y/n]
+```
 
-Interactive GitHub and GitLab setup can import a credential from an
-authenticated host CLI account after showing the account and asking for
-confirmation. Otherwise it reads a token through hidden terminal input.
+Press Enter to accept. That one choice applies the shown name and email, SSH
+transport, SSH commit and tag signing, and a passwordless per-sandbox Ed25519
+key. Choose manual entry to edit those values instead. The key is reused on
+focused retries; unsafe managed paths, links, owners, or permissions fail
+closed.
+
+For GitHub and GitLab, detected host CLI accounts are shown before credentials
+are copied. The account prompt is `Import <account> at <hostname>? [Y/n]`.
+Selecting it, or pressing Enter to accept it, immediately imports that account
+into the sandbox. With several accounts, the menu offers m for manual token, or s to skip.
+You can also decline a detected account and then choose a hidden manual token
+or skip it. A manual token is read through hidden terminal input.
 Noninteractive automation accepts a token only on stdin—never in an argument
 or environment field sent to Gas Can:
 
@@ -276,6 +278,12 @@ signing key. GitLab receives one key with `usage_type = auth_and_signing`.
 Existing matching registrations are reused. If authentication succeeds but
 registration lacks permission, the native login is retained and the summary
 names the focused retry command.
+
+Gas Can is compatible with the `gh` and `glab` tools shipped in the workspace image;
+it does not upgrade `gh` or `glab`. Setup output uses automatic color and falls back when `NO_COLOR` is set
+(or output is not a terminal). A partial failure means completed work is retained,
+prints the real safe cause, and names the focused retry command. Retry only the affected component with
+`gascan configure git`, `gascan configure gh`, or `gascan configure glab`.
 
 Credentials remain in the native sandbox files—GitHub CLI uses
 `$GH_CONFIG_DIR/hosts.yml`, GitLab CLI uses `$GLAB_CONFIG_DIR/config.yml`, and

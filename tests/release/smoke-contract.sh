@@ -217,6 +217,13 @@ case "$*" in
       printf "{\"state\":\"stopped\",\"health\":\"stopped\"}\n"
     fi
     ;;
+  "up "*)
+    [[ ${CI:-} == 1 ]] || exit 91
+    [[ ${GASCAN_APPLE_ATTACH_HELPER:-} == "$(cat "$FIXTURE_SUDO_LOG.attach-helper")" ]] || exit 86
+    [[ ! -f $FIXTURE_SUDO_LOG.daemon ]] || exit 89
+    printf "verified\n" >"$FIXTURE_SUDO_LOG.up-contract"
+    exit 42
+    ;;
   *)
     [[ ${GASCAN_APPLE_ATTACH_HELPER:-} == "$(cat "$FIXTURE_SUDO_LOG.attach-helper")" ]] || exit 86
     [[ ! -f $FIXTURE_SUDO_LOG.daemon ]] || exit 89
@@ -225,6 +232,41 @@ case "$*" in
 esac'
 write_fake gascan-apple-attach 'exit 0'
 write_fake gascand 'exit 0'
+
+/usr/bin/python3 - "$release_smoke" "$fixture/configure-git-driver.py" <<'PY'
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_text()
+prefix = "gascan_configure_git_from_host_fixture() {\n  python3 - \"$gascan_bin\" \"$sandbox_id\" \"$host_git_config\" <<'PY'\n"
+start = source.index(prefix) + len(prefix)
+end = source.index("\nPY\n}", start)
+pathlib.Path(sys.argv[2]).write_text(source[start:end])
+PY
+write_fake current-configure-gascan '
+[[ $* == "--sandbox fixture-sandbox configure git" ]] || exit 64
+printf "Host defaults: Gas Can Release <release-smoke@example.test>\\n"
+printf "Use this identity with SSH transport and signed commits? [Y/n] "
+if ! IFS= read -r -t 2 answer; then
+  exit 75
+fi
+[[ -z $answer ]] || exit 76
+printf "Git: Gas Can Release <release-smoke@example.test>; protocol ssh;\\n"
+'
+cat >"$fixture/release-host-gitconfig" <<'HOST_GIT_CONFIG'
+[user]
+	name = Gas Can Release
+	email = release-smoke@example.test
+HOST_GIT_CONFIG
+status=0
+output=$(/usr/bin/python3 "$fixture/configure-git-driver.py" \
+  "$fixture/bin/current-configure-gascan" fixture-sandbox "$fixture/release-host-gitconfig" 2>&1) || status=$?
+[[ $status -eq 0 ]] || {
+  printf 'release smoke current host-default configure-git driver failed: status=%s\n%s\n' \
+    "$status" "$output" >&2
+  exit 1
+}
+
 
 run_smoke() {
   PATH="$fixture/bin:$PATH" \
@@ -270,6 +312,7 @@ realpath "$fixture/bin/gascand" >"$log.gascand"
 status=0
 output=$(run_smoke) || status=$?
 [[ $status -eq 42 ]] || { printf 'release smoke returned %s, expected 42\n%s\n' "$status" "$output" >&2; exit 1; }
+grep -qx 'verified' "$log.up-contract"
 [[ $(wc -l <"$log" | tr -d ' ') -eq 2 ]] || { printf 'unexpected sudo invocation count\n' >&2; exit 1; }
 create_argv=$(sed -n '1p' "$log")
 delete_argv=$(sed -n '2p' "$log")

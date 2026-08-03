@@ -81,7 +81,7 @@ fn release_smoke_runs_every_up_without_interactive_stdin() {
 
     let direct_up = "\"$gascan_bin\" up \"$root\"";
     assert!(smoke.contains(
-        "gascan_release_up() {\n  \"$gascan_bin\" up \"$root\" </dev/null\n}"
+        "gascan_release_up() {\n  CI=1 \"$gascan_bin\" up \"$root\" </dev/null\n}"
     ));
     assert_eq!(
         smoke.matches(direct_up).count(),
@@ -270,4 +270,55 @@ fn release_smoke_fake_forges_require_the_managed_public_key() {
         2,
         "GitHub and GitLab fake registration must both require the managed public key"
     );
+}
+
+#[test]
+fn macos_release_smoke_proves_portable_github_token_login_and_safe_compact_summaries() {
+    let smoke =
+        fs::read_to_string(repository_root().join("packaging/macos/release-smoke.sh")).unwrap();
+
+    for required in [
+        "gh auth login rejected unsupported --skip-ssh-key",
+        "gh argv:",
+        "--with-token",
+        "gh argv: <auth> <login> <--hostname> <github.enterprise.test> <--git-protocol> <https> <--with-token>",
+        "github_configure_output=$(printf '%s' \"$fake_forge_token\" |",
+        "github_configure_retry_output=$(printf '%s' \"$fake_forge_token\" |",
+        "GitHub: gascan-release-fake-gh at github.enterprise.test; protocol https; authentication configured; authentication key added; signing key added",
+        "GitHub: gascan-release-fake-gh at github.enterprise.test; protocol https; authentication configured; authentication key existing; signing key existing",
+        "! grep -F -- \"$fake_forge_token\" <<<\"$transcript\" >/dev/null",
+        "! grep -F gascan-release-fake-token \"$log\" >/dev/null",
+        "release smoke GitHub configure transcript leaked fixture token",
+        "release smoke fake forge log leaked fixture token",
+    ] {
+        assert!(
+            smoke.contains(required),
+            "release smoke omits portable GitHub login contract {required:?}"
+        );
+    }
+
+    assert!(
+        !smoke.contains("--skip-ssh-key --with-token"),
+        "release smoke must not invoke GitHub CLI with its unsupported skip-key flag"
+    );
+}
+
+#[test]
+fn macos_release_smoke_readme_documents_the_compact_first_run_flow() {
+    let readme = fs::read_to_string(repository_root().join("README.md")).unwrap();
+
+    for required in [
+        "Use this identity with SSH transport and signed commits? [Y/n]",
+        "Import <account> at <hostname>? [Y/n]",
+        "m for manual token, or s to skip",
+        "automatic color and falls back when `NO_COLOR` is set",
+        "completed work is retained",
+        "gascan configure git",
+        "gascan configure gh",
+        "gascan configure glab",
+        "does not upgrade `gh` or `glab`",
+        "tools shipped in the workspace image",
+    ] {
+        assert!(readme.contains(required), "README omits {required:?}");
+    }
 }

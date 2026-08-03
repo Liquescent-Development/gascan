@@ -72,7 +72,7 @@ gascan_release_preflight_daemon() {
 }
 
 gascan_release_up() {
-  "$gascan_bin" up "$root" </dev/null
+  CI=1 "$gascan_bin" up "$root" </dev/null
 }
 
 gascan_default_shell_probe() {
@@ -299,9 +299,7 @@ def answer_prompt(marker):
 
 try:
     for marker in [
-        b"Git name: ",
-        b"Git email: ",
-        b"Git protocol (ssh or https): ",
+        b"Use this identity with SSH transport and signed commits? [Y/n] ",
     ]:
         answer_prompt(marker)
     deadline = time.monotonic() + 120
@@ -430,11 +428,30 @@ cat >"$root/.gascan/fake-forges/gh" <<'FAKE_GH'
 set -euo pipefail
 log=${XDG_CONFIG_HOME:?}/gascan/release-forge.log
 mkdir -p "$(dirname "$log")"
-printf 'gh:%s\n' "$*" >>"$log"
+printf 'gh argv:' >>"$log"
+printf ' <%s>' "$@" >>"$log"
+printf '\n' >>"$log"
 case "${1:-} ${2:-}" in
   'auth login')
     token=$(cat)
     [[ $token == gascan-release-fake-token ]]
+    unset token
+    with_token=
+    hostname=
+    protocol=
+    while (($#)); do
+      case $1 in
+        --skip-ssh-key)
+          printf 'gh auth login rejected unsupported --skip-ssh-key\n' >&2
+          exit 64
+          ;;
+        --with-token) with_token=1 ;;
+        --hostname) shift; hostname=${1:-} ;;
+        --git-protocol) shift; protocol=${1:-} ;;
+      esac
+      shift
+    done
+    [[ -n $with_token && $hostname == github.enterprise.test && $protocol == https ]]
     mkdir -p "${GH_CONFIG_DIR:?}"
     printf '%s\n' \
       'github.enterprise.test:' \
@@ -465,8 +482,13 @@ case "${1:-} ${2:-}" in
     if [[ $method == POST ]]; then
       [[ -n $endpoint && -n $key ]]
       [[ $key == "$(< /home/workspace/.config/gascan/git/ssh/id_ed25519.pub)" ]]
+      touch "$XDG_CONFIG_HOME/gascan/release-gh-key-${endpoint//\//_}"
       jq -nc --arg key "$key" \
         '{id:17,key:$key,title:"Gas Can release",created_at:"2026-07-31T00:00:00Z",verified:true,read_only:false}'
+    elif [[ -f $XDG_CONFIG_HOME/gascan/release-gh-key-${endpoint//\//_} ]]; then
+      key=$(< /home/workspace/.config/gascan/git/ssh/id_ed25519.pub)
+      jq -nc --arg key "$key" \
+        '[{id:17,key:$key,title:"Gas Can release",created_at:"2026-07-31T00:00:00Z",verified:true,read_only:false}]'
     else
       printf '[]\n'
     fi
@@ -721,8 +743,28 @@ jq -e '
 '
 gascan_configure_git_from_host_fixture
 fake_forge_token=gascan-release-fake-token
-printf '%s' "$fake_forge_token" |
-  "$gascan_bin" --sandbox "$sandbox_id" configure gh --hostname github.enterprise.test --token-stdin --git-protocol https
+github_configure_output=$(printf '%s' "$fake_forge_token" |
+  "$gascan_bin" --sandbox "$sandbox_id" configure gh --hostname github.enterprise.test --token-stdin --git-protocol https)
+grep -Fx \
+  'GitHub: gascan-release-fake-gh at github.enterprise.test; protocol https; authentication configured; authentication key added; signing key added' \
+  <<<"$github_configure_output" >/dev/null || {
+  printf 'release smoke GitHub configure summary omitted added key results\n' >&2
+  exit 1
+}
+github_configure_retry_output=$(printf '%s' "$fake_forge_token" |
+  "$gascan_bin" --sandbox "$sandbox_id" configure gh --hostname github.enterprise.test --token-stdin --git-protocol https)
+grep -Fx \
+  'GitHub: gascan-release-fake-gh at github.enterprise.test; protocol https; authentication configured; authentication key existing; signing key existing' \
+  <<<"$github_configure_retry_output" >/dev/null || {
+  printf 'release smoke GitHub configure summary omitted existing key results\n' >&2
+  exit 1
+}
+for transcript in "$github_configure_output" "$github_configure_retry_output"; do
+  ! grep -F -- "$fake_forge_token" <<<"$transcript" >/dev/null || {
+    printf 'release smoke GitHub configure transcript leaked fixture token\n' >&2
+    exit 1
+  }
+done
 printf '%s' "$fake_forge_token" |
   "$gascan_bin" --sandbox "$sandbox_id" configure glab --hostname gitlab.enterprise.test --token-stdin --git-protocol https
 unset fake_forge_token
@@ -762,10 +804,15 @@ unset fake_forge_token
   test "$(stat -c %a "$GLAB_CONFIG_DIR/config.yml")" = 600
   ! grep -R -F gascan-release-fake-token "$GH_CONFIG_DIR" "$GLAB_CONFIG_DIR"
   log=$XDG_CONFIG_HOME/gascan/release-forge.log
-  grep -F "gh:api --hostname github.enterprise.test --method POST user/keys" "$log" >/dev/null
-  grep -F "gh:api --hostname github.enterprise.test --method POST user/ssh_signing_keys" "$log" >/dev/null
+  grep -Fx "gh argv: <auth> <login> <--hostname> <github.enterprise.test> <--git-protocol> <https> <--with-token>" "$log" >/dev/null
+  grep -F "gh argv: <api> <--hostname> <github.enterprise.test> <--method> <POST> <user/keys>" "$log" >/dev/null
+  grep -F "gh argv: <api> <--hostname> <github.enterprise.test> <--method> <POST> <user/ssh_signing_keys>" "$log" >/dev/null
   grep -F "glab:api --hostname gitlab.enterprise.test --method POST /user/keys" "$log" |
     grep -F "usage_type=auth_and_signing" >/dev/null
+  ! grep -F gascan-release-fake-token "$log" >/dev/null || {
+    printf "release smoke fake forge log leaked fixture token\\n" >&2
+    exit 1
+  }
 '
 "$gascan_bin" --sandbox "$sandbox_id" run -- \
   /opt/gascan/shell/bin/starship --version |
