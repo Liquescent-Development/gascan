@@ -304,6 +304,8 @@ pub(crate) struct TokioDaemonSpawner;
 
 impl DaemonSpawner for TokioDaemonSpawner {
     fn spawn(&self, launch: &DaemonLaunch) -> std::io::Result<DaemonStartupMonitor> {
+        use command_fds::{CommandFdExt as _, FdMapping};
+        use std::os::fd::AsRawFd as _;
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
         let flags =
@@ -334,6 +336,15 @@ impl DaemonSpawner for TokioDaemonSpawner {
             ));
         }
         startup_file.set_len(0)?;
+        std::fs::remove_file(&launch.startup_diagnostic_path)?;
+        if startup_file.metadata()?.nlink() != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "daemon startup diagnostic file remained linked after unlink",
+            ));
+        }
+        let inherited = rustix::io::fcntl_dupfd_cloexec(&startup_file, 3)?;
+        let child_diagnostic_fd = inherited.as_raw_fd();
         let mut command = tokio::process::Command::new(&launch.executable);
         command
             .current_dir(&launch.current_dir)
@@ -342,9 +353,16 @@ impl DaemonSpawner for TokioDaemonSpawner {
             .env("GASCAN_DAEMON_INSTANCE_PATH", &launch.instance_path)
             .env("GASCAN_DAEMON_OWNER_TOKEN", &launch.owner_token)
             .env(
-                "GASCAN_CONTROLLER_STARTUP_PATH",
-                &launch.startup_diagnostic_path,
+                "GASCAN_CONTROLLER_STARTUP_FD",
+                child_diagnostic_fd.to_string(),
             );
+        command
+            .as_std_mut()
+            .fd_mappings(vec![FdMapping {
+                parent_fd: inherited,
+                child_fd: child_diagnostic_fd,
+            }])
+            .map_err(std::io::Error::other)?;
         if let Some(path) = &launch.stderr_path {
             command.stderr(
                 std::fs::OpenOptions::new()
@@ -662,7 +680,7 @@ mod tests {
         let script = root.join("fixture-gascand");
         std::fs::write(
             &script,
-            "#!/bin/sh\nif IFS= read -r ignored; then stdin_state=data; else stdin_state=eof; fi\nprintf '%s\\n%s\\n%s\\n%s\\n%s\\n' \"$PWD\" \"$GASCAN_DAEMON_INSTANCE_PATH\" \"$GASCAN_DAEMON_OWNER_TOKEN\" \"$GASCAN_CONTROLLER_STARTUP_PATH\" \"$stdin_state\" >&2\nprintf 'stdout-must-be-null\\n'\n",
+            "#!/bin/sh\nif IFS= read -r ignored; then stdin_state=data; else stdin_state=eof; fi\nprintf '%s\\n%s\\n%s\\n%s\\n%s\\n' \"$PWD\" \"$GASCAN_DAEMON_INSTANCE_PATH\" \"$GASCAN_DAEMON_OWNER_TOKEN\" \"$GASCAN_CONTROLLER_STARTUP_FD\" \"$stdin_state\" >&2\nprintf 'stdout-must-be-null\\n'\n",
         )?;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
         let diagnostic = root.join("daemon.stderr");
@@ -691,8 +709,13 @@ mod tests {
         assert_eq!(lines[0], runtime.to_string_lossy());
         assert_eq!(lines[1], launch.instance_path.to_string_lossy());
         assert_eq!(lines[2], "test-owner");
-        assert_eq!(lines[3], launch.startup_diagnostic_path.to_string_lossy());
+        assert!(
+            lines[3]
+                .parse::<i32>()
+                .is_ok_and(|descriptor| descriptor >= 3)
+        );
         assert_eq!(lines[4], "eof");
+        assert!(!launch.startup_diagnostic_path.exists());
 
         std::fs::write(&launch.startup_diagnostic_path, b"do-not-truncate")?;
         std::fs::set_permissions(

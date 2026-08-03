@@ -350,27 +350,28 @@ fn write_controller_startup_diagnostic(diagnostic: &[u8]) {
     if diagnostic_len > MAX_STARTUP_DIAGNOSTIC_BYTES {
         return;
     }
-    let Some(path) = std::env::var_os("GASCAN_CONTROLLER_STARTUP_PATH") else {
+    let Ok(raw_descriptor) = std::env::var("GASCAN_CONTROLLER_STARTUP_FD") else {
         return;
     };
-    let Ok(descriptor) = rustix::fs::open(
-        path,
-        rustix::fs::OFlags::WRONLY
-            | rustix::fs::OFlags::APPEND
-            | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::empty(),
-    ) else {
+    let Ok(raw_descriptor) = raw_descriptor.parse::<i32>() else {
         return;
     };
-    let mut file = std::fs::File::from(descriptor);
+    if raw_descriptor < 3 {
+        return;
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .append(true)
+        .open(format!("/dev/fd/{raw_descriptor}"))
+    else {
+        return;
+    };
     let Ok(metadata) = file.metadata() else {
         return;
     };
     if !metadata.file_type().is_file()
         || metadata.uid() != rustix::process::geteuid().as_raw()
         || metadata.permissions().mode() & 0o777 != 0o600
-        || metadata.nlink() != 1
+        || metadata.nlink() != 0
         || metadata
             .len()
             .checked_add(diagnostic_len)

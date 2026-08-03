@@ -420,6 +420,12 @@ fn controller_state_errors_survive_all_daemon_start_paths() -> TestResult {
             "actionable controller error was lost for {arguments:?}: {stderr}"
         );
         assert!(!stderr.contains("backend_unavailable"));
+        assert!(
+            !env.runtime_root
+                .join("gascan/daemon-startup-error.json")
+                .exists(),
+            "controller startup diagnostic path remained after {arguments:?}"
+        );
     }
     Ok(())
 }
@@ -462,6 +468,12 @@ fn daemon_stderr_sink_survives_the_launching_cli() -> TestResult {
         "daemon start failed: stdout={}, stderr={}",
         String::from_utf8_lossy(&started.stdout),
         String::from_utf8_lossy(&started.stderr)
+    );
+    assert!(
+        !env.runtime_root
+            .join("gascan/daemon-startup-error.json")
+            .exists(),
+        "successful startup left a token-bearing diagnostic path"
     );
 
     let stopped = env.command_for(&["daemon", "stop", "--json"]).output()?;

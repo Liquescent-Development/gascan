@@ -473,7 +473,7 @@ impl DaemonStartupMonitor {
         if !metadata.file_type().is_file()
             || metadata.uid() != rustix::process::geteuid().as_raw()
             || metadata.permissions().mode() & 0o777 != u32::from(FILE_MODE)
-            || metadata.nlink() != 1
+            || metadata.nlink() != 0
             || metadata.len() > MAX_STARTUP_DIAGNOSTIC_BYTES as u64
         {
             return Ok(None);
@@ -3361,16 +3361,17 @@ mod tests {
             b"noise\nGASCAN_CONTROLLER_STARTUP_ERROR {\"code\":\"arbitrary_code\",\"message\":\"forged\",\"owner_token\":\"owner\"}\nGASCAN_CONTROLLER_STARTUP_ERROR {\"code\":\"controller_state_unsafe\",\"message\":\"wrong launch\",\"owner_token\":\"other\"}\n",
         )?;
         fs::set_permissions(&diagnostic, fs::Permissions::from_mode(0o600))?;
-        let monitor =
-            DaemonStartupMonitor::from_file(fs::File::open(&diagnostic)?, "owner".to_owned());
+        let mut writer = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&diagnostic)?;
+        let monitor = DaemonStartupMonitor::from_file(writer.try_clone()?, "owner".to_owned());
+        fs::remove_file(&diagnostic)?;
         assert!(monitor.controller_error()?.is_none());
 
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&diagnostic)?
-            .write_all(
-                b"GASCAN_CONTROLLER_STARTUP_ERROR {\"code\":\"controller_state_unsafe\",\"message\":\"application directory mode is unsafe\",\"owner_token\":\"owner\"}\n",
-            )?;
+        writer.write_all(
+            b"GASCAN_CONTROLLER_STARTUP_ERROR {\"code\":\"controller_state_unsafe\",\"message\":\"application directory mode is unsafe\",\"owner_token\":\"owner\"}\n",
+        )?;
         let error = monitor
             .controller_error()?
             .ok_or("controller diagnostic missing")?;
@@ -3381,8 +3382,64 @@ mod tests {
                     && message == "application directory mode is unsafe"
         ));
 
-        fs::write(&diagnostic, vec![b'x'; MAX_STARTUP_DIAGNOSTIC_BYTES + 1])?;
+        writer.set_len(u64::try_from(MAX_STARTUP_DIAGNOSTIC_BYTES + 1)?)?;
         assert!(monitor.controller_error()?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inherited_startup_diagnostic_survives_path_replacement() -> TestResult {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let runtime = root.join("runtime");
+        fs::create_dir(&runtime)?;
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))?;
+        let startup_path = runtime.join("daemon-startup-error.json");
+        let script = root.join("fixture-gascand");
+        fs::write(
+            &script,
+            "#!/bin/sh\nreplacement_path=\"$PWD/daemon-startup-error.json\"\nif [ -e \"$replacement_path\" ]; then path_state=present; else path_state=missing; fi\nprintf 'replacement-path' > \"$replacement_path\"\nprintf '%s\\n' 'GASCAN_CONTROLLER_STARTUP_ERROR {\"code\":\"controller_state_unsafe\",\"message\":\"trusted inherited descriptor\",\"owner_token\":\"test-owner\"}' >> \"/dev/fd/$GASCAN_CONTROLLER_STARTUP_FD\"\nprintf '%s\\n%s\\n' \"$path_state\" \"$GASCAN_CONTROLLER_STARTUP_FD\" >&2\n",
+        )?;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
+        let stderr_path = root.join("daemon.stderr");
+        let launch = DaemonLaunch {
+            executable: script,
+            current_dir: runtime.clone(),
+            instance_path: runtime.join("daemon-instance.json"),
+            owner_token: "test-owner".to_owned(),
+            stderr_path: Some(stderr_path.clone()),
+            startup_diagnostic_path: startup_path.clone(),
+        };
+
+        let monitor = DaemonSpawner::spawn(&crate::client::TokioDaemonSpawner, &launch)?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let error = loop {
+            if let Some(error) = monitor.controller_error()? {
+                break error;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("fixture daemon did not write its inherited diagnostic".into());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert!(matches!(
+            error,
+            SupervisorError::ControllerStartup { ref code, ref message }
+                if code == "controller_state_unsafe"
+                    && message == "trusted inherited descriptor"
+        ));
+        assert_eq!(fs::read(&startup_path)?, b"replacement-path");
+        let stderr = fs::read_to_string(stderr_path)?;
+        let mut lines = stderr.lines();
+        assert_eq!(lines.next(), Some("missing"));
+        assert!(
+            lines
+                .next()
+                .and_then(|fd| fd.parse::<i32>().ok())
+                .is_some_and(|fd| fd >= 3)
+        );
         Ok(())
     }
 
