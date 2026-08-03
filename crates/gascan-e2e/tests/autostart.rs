@@ -492,6 +492,93 @@ fn daemon_stderr_sink_survives_the_launching_cli() -> TestResult {
 }
 
 #[test]
+fn successful_daemon_closes_inherited_startup_diagnostic_descriptor() -> TestResult {
+    use command_fds::{CommandFdExt as _, FdMapping};
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let env = Environment::new()?;
+    let directory = env.runtime_root.join("gascan");
+    std::fs::create_dir(&directory)?;
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+    let stderr = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(env.runtime_root.join("daemon.stderr"))?;
+    let (reader, writer) = rustix::pipe::pipe()?;
+    rustix::io::fcntl_setfd(&reader, rustix::io::FdFlags::CLOEXEC)?;
+    rustix::io::fcntl_setfd(&writer, rustix::io::FdFlags::CLOEXEC)?;
+    rustix::fs::fcntl_setfl(
+        &reader,
+        rustix::fs::fcntl_getfl(&reader)? | rustix::fs::OFlags::NONBLOCK,
+    )?;
+    let child_descriptor = writer.as_raw_fd();
+    let mut command = Command::new(&env.gascand);
+    env.configure_command(&mut command);
+    command
+        .current_dir(&directory)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(stderr)
+        .env(
+            "GASCAN_DAEMON_INSTANCE_PATH",
+            directory.join("daemon-instance.json"),
+        )
+        .env("GASCAN_DAEMON_OWNER_TOKEN", "startup-fd-lifetime-e2e")
+        .env("GASCAN_CONTROLLER_STARTUP_FD", child_descriptor.to_string())
+        .fd_mappings(vec![FdMapping {
+            parent_fd: writer,
+            child_fd: child_descriptor,
+        }])?;
+    let mut daemon = OwnedChild::spawn(&mut command)?;
+    drop(command);
+    let daemon_pid = u64::from(daemon.id()?);
+    let readiness_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let output = env.command_for(&["daemon", "status", "--json"]).output()?;
+        if output.status.success() {
+            let status: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+            if status["state"] == "running" && status["pid"].as_u64() == Some(daemon_pid) {
+                break;
+            }
+        }
+        if std::time::Instant::now() >= readiness_deadline {
+            return Err("daemon did not become ready for startup-fd audit".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let close_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        let mut byte = [0_u8; 1];
+        match rustix::io::read(&reader, &mut byte) {
+            Ok(0) => break,
+            Err(rustix::io::Errno::AGAIN) if std::time::Instant::now() < close_deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Ok(read) => {
+                return Err(
+                    format!("unexpected startup diagnostic pipe payload: {read} byte").into(),
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
+        if std::time::Instant::now() >= close_deadline {
+            return Err(
+                "healthy daemon retained its inherited startup diagnostic descriptor".into(),
+            );
+        }
+    }
+    assert!(
+        daemon.try_wait()?.is_none(),
+        "daemon exited before fd audit"
+    );
+    env.shutdown_daemon()?;
+    daemon.wait_for_exit()?;
+    Ok(())
+}
+
+#[test]
 fn direct_daemon_startup_publishes_the_standard_protected_record() -> TestResult {
     use std::os::unix::fs::PermissionsExt as _;
 

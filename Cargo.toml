@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/gascan", "crates/gascan-apple", "crates/gascan-core", "crates/gascan-e2e", "crates/gascan-proto", "crates/gascand"]
+members = ["crates/gascan", "crates/gascan-apple", "crates/gascan-core", "crates/gascan-e2e", "crates/gascan-inherited-fd", "crates/gascan-proto", "crates/gascand"]
 resolver = "3"
 
 [workspace.package]
@@ -14,6 +14,7 @@ thiserror = "2"
 async-trait = "0.1"
 base64 = "0.22"
 command-fds = "0.3.3"
+gascan-inherited-fd = { path = "crates/gascan-inherited-fd" }
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "net", "process", "rt", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 rustix = { version = "1", features = ["fs", "process"] }

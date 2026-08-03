@@ -21,12 +21,13 @@ gascan-core = { path = "../gascan-core" }
 gascan-apple = { path = "../gascan-apple" }
 gascan-proto = { path = "../gascan-proto" }
 gascan = { path = "../gascan" }
+gascan-inherited-fd.workspace = true
 gascand = { path = "../gascand" }
 hyper-util.workspace = true
 indicatif.workspace = true
 prost-types.workspace = true
 plist.workspace = true
-rustix = { workspace = true, features = ["termios"] }
+rustix = { workspace = true, features = ["pipe", "termios"] }
 serde_json.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
@@ -35,6 +36,7 @@ tower.workspace = true
 
 [dev-dependencies]
 camino.workspace = true
+command-fds.workspace = true
 serde.workspace = true
 tempfile = "3"
 rustix-openpty = "0.2"

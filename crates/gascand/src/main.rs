@@ -211,8 +211,18 @@ impl Provisioner for ConfiguredProvisioner {
     }
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let startup_diagnostic = StartupDiagnostic::from_environment()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    runtime.block_on(run(startup_diagnostic))
+}
+
+async fn run(
+    mut startup_diagnostic: Option<StartupDiagnostic>,
+) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(debug_assertions)]
     if option_env!("CARGO_BIN_NAME") == Some("gascan-e2e-daemon") {
         if let Some(delay) = std::env::var("GASCAN_E2E_DAEMON_START_DELAY_MS")
@@ -231,10 +241,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = match std::env::var_os("GASCAN_STATE_PATH") {
         Some(path) => Store::open(std::path::PathBuf::from(path))?,
         None => {
-            let state = controller_state_paths(&paths).map_err(controller_startup_error)?;
-            open_controller_store(&state).map_err(controller_startup_error)?
+            let state = controller_state_paths(&paths)
+                .map_err(|error| controller_startup_error(error, startup_diagnostic.as_mut()))?;
+            open_controller_store(&state)
+                .map_err(|error| controller_startup_error(error, startup_diagnostic.as_mut()))?
         }
     };
+    drop(startup_diagnostic);
     let e2e_ssh_paths = e2e_ssh_paths()?;
     #[cfg(debug_assertions)]
     let fake_requested = std::env::var_os(gascand::TEST_FAKE_BACKEND_ENV).is_some();
@@ -319,7 +332,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn report_controller_startup_error(error: &ControllerStateError) {
+struct StartupDiagnostic {
+    file: std::fs::File,
+}
+
+impl StartupDiagnostic {
+    fn from_environment() -> std::io::Result<Option<Self>> {
+        Ok(
+            gascan_inherited_fd::take_startup_diagnostic()?.map(|owned| Self {
+                file: std::fs::File::from(owned),
+            }),
+        )
+    }
+
+    fn write(&mut self, diagnostic: &[u8]) {
+        use std::io::Write as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        const MAX_STARTUP_DIAGNOSTIC_BYTES: u64 = 64 * 1024;
+        let Ok(diagnostic_len) = u64::try_from(diagnostic.len()) else {
+            return;
+        };
+        if diagnostic_len > MAX_STARTUP_DIAGNOSTIC_BYTES {
+            return;
+        }
+        let Ok(metadata) = self.file.metadata() else {
+            return;
+        };
+        if !metadata.file_type().is_file()
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.permissions().mode() & 0o777 != 0o600
+            || metadata.nlink() != 0
+            || metadata
+                .len()
+                .checked_add(diagnostic_len)
+                .is_none_or(|size| size > MAX_STARTUP_DIAGNOSTIC_BYTES)
+        {
+            return;
+        }
+        let _ = self.file.write_all(diagnostic);
+    }
+}
+
+fn report_controller_startup_error(
+    error: &ControllerStateError,
+    startup_diagnostic: Option<&mut StartupDiagnostic>,
+) {
     let owner_token = std::env::var("GASCAN_DAEMON_OWNER_TOKEN").ok();
     let diagnostic = owner_token.as_ref().map(|owner_token| {
         format!(
@@ -332,58 +390,20 @@ fn report_controller_startup_error(error: &ControllerStateError) {
         )
     });
     if let Some(diagnostic) = diagnostic {
-        write_controller_startup_diagnostic(diagnostic.as_bytes());
+        if let Some(startup_diagnostic) = startup_diagnostic {
+            startup_diagnostic.write(diagnostic.as_bytes());
+        }
         eprint!("{diagnostic}");
     } else {
         eprintln!("{}: {}", error.code(), error);
     }
 }
 
-fn write_controller_startup_diagnostic(diagnostic: &[u8]) {
-    use std::io::Write as _;
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-
-    const MAX_STARTUP_DIAGNOSTIC_BYTES: u64 = 64 * 1024;
-    let Ok(diagnostic_len) = u64::try_from(diagnostic.len()) else {
-        return;
-    };
-    if diagnostic_len > MAX_STARTUP_DIAGNOSTIC_BYTES {
-        return;
-    }
-    let Ok(raw_descriptor) = std::env::var("GASCAN_CONTROLLER_STARTUP_FD") else {
-        return;
-    };
-    let Ok(raw_descriptor) = raw_descriptor.parse::<i32>() else {
-        return;
-    };
-    if raw_descriptor < 3 {
-        return;
-    }
-    let Ok(mut file) = std::fs::OpenOptions::new()
-        .append(true)
-        .open(format!("/dev/fd/{raw_descriptor}"))
-    else {
-        return;
-    };
-    let Ok(metadata) = file.metadata() else {
-        return;
-    };
-    if !metadata.file_type().is_file()
-        || metadata.uid() != rustix::process::geteuid().as_raw()
-        || metadata.permissions().mode() & 0o777 != 0o600
-        || metadata.nlink() != 0
-        || metadata
-            .len()
-            .checked_add(diagnostic_len)
-            .is_none_or(|size| size > MAX_STARTUP_DIAGNOSTIC_BYTES)
-    {
-        return;
-    }
-    let _ = file.write_all(diagnostic);
-}
-
-fn controller_startup_error(source: ControllerStateError) -> ControllerStartupError {
-    report_controller_startup_error(&source);
+fn controller_startup_error(
+    source: ControllerStateError,
+    startup_diagnostic: Option<&mut StartupDiagnostic>,
+) -> ControllerStartupError {
+    report_controller_startup_error(&source, startup_diagnostic);
     ControllerStartupError::from(source)
 }
 
