@@ -360,8 +360,12 @@ async fn github_login_uses_gh_2_45_compatible_arguments() -> TestResult {
 
 #[tokio::test]
 async fn native_login_failure_is_useful_bounded_and_secret_free() -> TestResult {
-    let stderr =
-        format!("HTTP 401: bad credentials\n{SENTINEL}\n\x1b]8;;https://evil.test\x07click\n");
+    let mut stderr = format!(
+        "HTTP 401: bad credentials\t{SENTINEL}\x1b]8;;https://evil.test\x07click{}",
+        "界".repeat(300),
+    )
+    .into_bytes();
+    stderr.extend(vec![b'\x01'; 65_537 - stderr.len()]);
     let mut runner = FakeGuestRunner::with_outputs([output(1, [], stderr)]);
     let error = match configure_forge(
         &mut runner,
@@ -374,10 +378,38 @@ async fn native_login_failure_is_useful_bounded_and_secret_free() -> TestResult 
         Ok(setup) => return Err(format!("expected failure, got {setup:?}").into()),
     };
     let rendered = format!("{error}");
+    let message = match &error {
+        ConfigureError::Forge { message, .. } => message,
+        other => return Err(format!("expected structured forge error, got {other:?}").into()),
+    };
     assert!(rendered.contains("HTTP 401: bad credentials"));
     assert!(!rendered.contains(SENTINEL));
     assert!(!rendered.contains('\x1b'));
     assert!(rendered.contains("gascan configure gh"));
+    assert!(message.chars().count() <= 240);
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_login_failure_never_leaks_a_secret_prefix_at_the_diagnostic_bound() -> TestResult {
+    let secret_prefix_length = SENTINEL.len() / 2;
+    let mut stderr = vec![b'\x01'; 65_536 - secret_prefix_length];
+    stderr.extend_from_slice(SENTINEL.as_bytes());
+    stderr.push(b'\n');
+    let mut runner = FakeGuestRunner::with_outputs([output(1, [], stderr)]);
+    let error = match configure_forge(
+        &mut runner,
+        selector(),
+        request(Forge::GitHub, "github.com", GitProtocol::Ssh),
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(setup) => return Err(format!("expected failure, got {setup:?}").into()),
+    };
+    let rendered = format!("{error}");
+    assert!(!rendered.contains(SENTINEL));
+    assert!(!rendered.contains(&SENTINEL[..secret_prefix_length]));
     Ok(())
 }
 

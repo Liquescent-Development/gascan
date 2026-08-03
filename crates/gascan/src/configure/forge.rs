@@ -796,6 +796,7 @@ fn bounded_text(output: &GuestOutput) -> Option<String> {
 fn safe_native_diagnostic(output: &GuestOutput, secret: &[u8]) -> Option<String> {
     for stream in [&output.stderr, &output.stdout] {
         let candidate = &stream[..stream.len().min(MAX_RESPONSE_BYTES)];
+        let candidate = suppress_trailing_secret_prefix(candidate, secret);
         let redacted = redact_secret(candidate, secret);
         let Some(line) = redacted
             .split(|byte| matches!(byte, b'\n' | b'\r'))
@@ -817,6 +818,20 @@ fn safe_native_diagnostic(output: &GuestOutput, secret: &[u8]) -> Option<String>
         }
     }
     None
+}
+
+fn suppress_trailing_secret_prefix<'a>(input: &'a [u8], secret: &[u8]) -> &'a [u8] {
+    if secret.len() <= 1 {
+        return input;
+    }
+
+    let maximum = input.len().min(secret.len() - 1);
+    for length in (1..=maximum).rev() {
+        if input.ends_with(&secret[..length]) {
+            return &input[..input.len() - length];
+        }
+    }
+    input
 }
 
 fn redact_secret(input: &[u8], secret: &[u8]) -> Vec<u8> {
