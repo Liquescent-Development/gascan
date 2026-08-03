@@ -36,5 +36,5 @@ hyper-util.workspace = true
 http-body-util = "0.1"
 prost.workspace = true
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "deny"

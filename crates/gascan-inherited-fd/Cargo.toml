@@ -6,7 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+libc = "0.2"
 rustix.workspace = true
 
 [lints.rust]
+unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"

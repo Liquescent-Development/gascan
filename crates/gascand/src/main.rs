@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use gascan_apple::{
@@ -212,7 +212,14 @@ impl Provisioner for ConfiguredProvisioner {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let startup_diagnostic = StartupDiagnostic::from_environment()?;
+    // SAFETY: This is the first application operation at synchronous process
+    // entry, before the Tokio runtime or any application thread exists. The
+    // trusted launcher maps the exact unowned descriptor named by the env var.
+    #[allow(unsafe_code)]
+    let startup_diagnostic =
+        unsafe { gascan_inherited_fd::take_startup_diagnostic()? }.map(|owned| StartupDiagnostic {
+            file: std::fs::File::from(owned),
+        });
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -337,14 +344,6 @@ struct StartupDiagnostic {
 }
 
 impl StartupDiagnostic {
-    fn from_environment() -> std::io::Result<Option<Self>> {
-        Ok(
-            gascan_inherited_fd::take_startup_diagnostic()?.map(|owned| Self {
-                file: std::fs::File::from(owned),
-            }),
-        )
-    }
-
     fn write(&mut self, diagnostic: &[u8]) {
         use std::io::Write as _;
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};

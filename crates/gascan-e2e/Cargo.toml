@@ -41,5 +41,5 @@ serde.workspace = true
 tempfile = "3"
 rustix-openpty = "0.2"
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "deny"
