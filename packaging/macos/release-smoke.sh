@@ -299,9 +299,7 @@ def answer_prompt(marker):
 
 try:
     for marker in [
-        b"Git name: ",
-        b"Git email: ",
-        b"Git protocol (ssh or https): ",
+        b"Use this identity with SSH transport and signed commits? [Y/n] ",
     ]:
         answer_prompt(marker)
     deadline = time.monotonic() + 120
