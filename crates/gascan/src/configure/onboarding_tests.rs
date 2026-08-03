@@ -1484,6 +1484,120 @@ async fn multiple_forge_accounts_select_and_import_without_followup_confirmation
 }
 
 #[tokio::test]
+async fn multiple_forge_accounts_manual_selection_prompts_for_hostname_and_hidden_token()
+-> TestResult {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut discovery = FakeDiscovery::new(
+        GitDefaults {
+            name: None,
+            email: None,
+        },
+        Arc::clone(&events),
+    );
+    discovery.accounts = vec![(
+        Forge::GitHub,
+        vec![
+            HostAccount {
+                hostname: "github.com".to_owned(),
+                login: Some("octocat".to_owned()),
+            },
+            HostAccount {
+                hostname: "github.enterprise.test".to_owned(),
+                login: Some("richardkiene".to_owned()),
+            },
+        ],
+    )];
+    let mut io = FakeIo::interactive(Arc::clone(&events));
+    for answer in [true, false] {
+        io.push_confirm(answer);
+    }
+    io.push_line("m");
+    io.push_line("github.manual.test");
+    io.push_secret();
+    let mut outputs = vec![configured_status(GitProtocol::Https), online_route()];
+    outputs.extend(successful_github_setup_outputs(
+        "github.manual.test",
+        "manual-user",
+        GitProtocol::Https,
+    ));
+    outputs.push(output(0, [], []));
+    let mut runner = FakeRunner::with_outputs(outputs);
+
+    let outcome = configure_all(&mut runner, selector(), &discovery, &mut io).await?;
+
+    assert_eq!(outcome, ConfigureOutcome::Completed);
+    let events = events.lock().map_err(|_| "event log poisoned")?;
+    assert!(
+        events.iter().any(
+            |event| event == "line:Select an account (1-2), m for manual token, or s to skip: "
+        )
+    );
+    assert!(events.iter().any(|event| event == "line:GitHub hostname: "));
+    assert!(events.iter().any(|event| event == "secret:GitHub token: "));
+    assert!(events.iter().all(|event| !event.starts_with("token:")));
+    assert!(argv(&runner.commands[2]).contains(&"github.manual.test".to_owned()));
+    assert!(!io.stdout.contains(SENTINEL));
+    assert!(!io.stderr.contains(SENTINEL));
+    Ok(())
+}
+
+#[tokio::test]
+async fn multiple_forge_accounts_skip_selection_avoids_forge_commands_and_completes_receipt()
+-> TestResult {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut discovery = FakeDiscovery::new(
+        GitDefaults {
+            name: None,
+            email: None,
+        },
+        Arc::clone(&events),
+    );
+    discovery.accounts = vec![(
+        Forge::GitHub,
+        vec![
+            HostAccount {
+                hostname: "github.com".to_owned(),
+                login: Some("octocat".to_owned()),
+            },
+            HostAccount {
+                hostname: "github.enterprise.test".to_owned(),
+                login: Some("richardkiene".to_owned()),
+            },
+        ],
+    )];
+    let mut io = FakeIo::interactive(Arc::clone(&events));
+    for answer in [true, false] {
+        io.push_confirm(answer);
+    }
+    io.push_line("s");
+    let mut runner = FakeRunner::with_outputs([
+        configured_status(GitProtocol::Https),
+        online_route(),
+        output(0, [], []),
+    ]);
+    runner.record_events(Arc::clone(&events));
+
+    let outcome = configure_all(&mut runner, selector(), &discovery, &mut io).await?;
+
+    assert_eq!(outcome, ConfigureOutcome::Completed);
+    assert_eq!(runner.commands.len(), 3);
+    assert!(runner.commands.iter().all(|command| {
+        !argv(command)
+            .iter()
+            .any(|argument| argument == "gh" || argument == "glab")
+    }));
+    assert!(runner.commands.iter().any(|command| {
+        argv(command).ends_with(&["receipt".to_owned(), "complete".to_owned()])
+    }));
+    let events = events.lock().map_err(|_| "event log poisoned")?;
+    assert!(events.iter().all(|event| !event.starts_with("token:")));
+    assert!(events.iter().all(|event| event != "secret:GitHub token: "));
+    assert!(io.stdout.contains("GitHub: skipped"));
+    assert!(io.stdout.contains("GitLab: skipped"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn no_forge_account_offers_default_no_manual_configuration() -> TestResult {
     let events = Arc::new(Mutex::new(Vec::new()));
     let discovery = FakeDiscovery::new(
