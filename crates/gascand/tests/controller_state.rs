@@ -263,6 +263,12 @@ fn migration_legacy_only_preserves_logical_content() -> TestResult {
         path.file_name()
             .is_some_and(|name| name.to_string_lossy().contains("legacy-backup"))
     }));
+    drop(store);
+    let reopened = open_controller_store(&fixture.paths)?;
+    assert_eq!(
+        reopened.list_sandboxes()?[0].id.as_str(),
+        "legacy-aaaaaaaaaaaa"
+    );
     Ok(())
 }
 
@@ -617,6 +623,7 @@ fn migration_fault_boundaries_recover_without_losing_legacy_content() -> TestRes
         MigrationFault::BeforeDurableRename,
         MigrationFault::AfterDurableRename,
         MigrationFault::DuringLegacyArchive,
+        MigrationFault::AfterLegacyMoveBeforeValidation,
     ] {
         let fixture = ControllerFixture::new()?;
         fixture.seed_store(fixture.paths.legacy_database(), "legacy")?;
@@ -633,6 +640,117 @@ fn migration_fault_boundaries_recover_without_losing_legacy_content() -> TestRes
         );
         assert!(!fixture.paths.legacy_database().exists());
     }
+    Ok(())
+}
+
+#[test]
+fn interrupted_post_move_archive_is_recovered_before_state_selection() -> TestResult {
+    let fixture = ControllerFixture::new()?;
+    fixture.seed_store(fixture.paths.legacy_database(), "legacy")?;
+    let legacy_before = fs::read(fixture.paths.legacy_database())?;
+    let status = Command::new(std::env::current_exe()?)
+        .arg("--exact")
+        .arg("archive_transaction_crash_helper")
+        .arg("--nocapture")
+        .env("GASCAN_TEST_ARCHIVE_HOME", &fixture.home)
+        .env("GASCAN_TEST_ARCHIVE_RUNTIME", &fixture.runtime)
+        .status()?;
+    assert!(!status.success());
+    assert!(!fixture.paths.legacy_database().exists());
+
+    let durable = Connection::open(fixture.paths.durable_database())?;
+    durable.execute(
+        "UPDATE sandboxes SET canonical_root = '/workspace/conflicting-durable'",
+        [],
+    )?;
+    drop(durable);
+    fs::set_permissions(
+        fixture.paths.durable_database(),
+        fs::Permissions::from_mode(0o600),
+    )?;
+
+    let error = failed_open(&fixture.paths)?;
+    assert_eq!(
+        error.code(),
+        "controller_state_conflict",
+        "unexpected recovery error: {error:?}"
+    );
+    assert_eq!(fs::read(fixture.paths.legacy_database())?, legacy_before);
+    let repeated = failed_open(&fixture.paths)?;
+    assert_eq!(repeated.code(), "controller_state_conflict");
+    Ok(())
+}
+
+#[test]
+fn archive_transaction_crash_helper() {
+    let (Some(home), Some(runtime)) = (
+        std::env::var_os("GASCAN_TEST_ARCHIVE_HOME"),
+        std::env::var_os("GASCAN_TEST_ARCHIVE_RUNTIME"),
+    ) else {
+        return;
+    };
+    let Ok(paths) = ControllerStatePaths::for_home_and_runtime(
+        Path::new(&home),
+        Path::new(&runtime),
+        rustix::process::geteuid().as_raw(),
+    ) else {
+        std::process::exit(2);
+    };
+    match open_controller_store_with_fault(&paths, MigrationFault::AfterLegacyMoveBeforeValidation)
+    {
+        Err(_) => std::process::abort(),
+        Ok(_) => std::process::exit(2),
+    }
+}
+
+#[test]
+fn malformed_archive_transaction_is_refused_without_mutation() -> TestResult {
+    let fixture = ControllerFixture::new()?;
+    fixture.seed_store(fixture.paths.durable_database(), "durable")?;
+    fs::create_dir_all(&fixture.runtime)?;
+    fs::set_permissions(&fixture.runtime, fs::Permissions::from_mode(0o700))?;
+    let quarantine = fixture
+        .runtime
+        .join(".state.sqlite3.archive-quarantine-00000000000000000000000000000000");
+    create_private_directory(&quarantine)?;
+    let unexpected = quarantine.join("unexpected");
+    fs::write(&unexpected, b"do not touch")?;
+    fs::set_permissions(&unexpected, fs::Permissions::from_mode(0o600))?;
+
+    let error = failed_open(&fixture.paths)?;
+    assert_eq!(error.code(), "controller_state_unsafe");
+    assert_eq!(fs::read(unexpected)?, b"do not touch");
+    Ok(())
+}
+
+#[test]
+fn ambiguous_archive_transactions_are_refused_without_mutation() -> TestResult {
+    let fixture = ControllerFixture::new()?;
+    fixture.seed_store(fixture.paths.durable_database(), "same")?;
+    fixture.seed_store(fixture.paths.legacy_database(), "same")?;
+    let before = fixture.capture_active_files()?;
+    let metadata = fs::symlink_metadata(fixture.paths.legacy_database())?;
+    let marker = format!(
+        "GASCAN_LEGACY_ARCHIVE_V1\nstate.sqlite3\t{}\t{}\n",
+        metadata.dev(),
+        metadata.ino()
+    );
+    for token in [
+        "11111111111111111111111111111111",
+        "22222222222222222222222222222222",
+    ] {
+        let quarantine = fixture
+            .runtime
+            .join(format!(".state.sqlite3.archive-quarantine-{token}"));
+        create_private_directory(&quarantine)?;
+        let prepared = quarantine.join("prepared");
+        fs::write(&prepared, &marker)?;
+        fs::set_permissions(&prepared, fs::Permissions::from_mode(0o600))?;
+    }
+
+    let error = failed_open(&fixture.paths)?;
+    assert_eq!(error.code(), "controller_state_unsafe");
+    assert_eq!(fixture.capture_active_files()?, before);
     Ok(())
 }
 

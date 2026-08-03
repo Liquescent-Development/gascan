@@ -5,10 +5,10 @@ use rusqlite::{Connection, OpenFlags, backup::Backup};
 use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::process::geteuid;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 #[cfg(target_os = "macos")]
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -25,6 +25,11 @@ const FILE_MODE: u32 = 0o600;
 const SQLITE_SIDECAR_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
 const TEMP_PREFIX: &str = ".state.sqlite3.migration-";
 const LEGACY_BACKUP_NAME: &str = "state.sqlite3.legacy-backup";
+const ARCHIVE_QUARANTINE_PREFIX: &str = ".state.sqlite3.archive-quarantine-";
+const ARCHIVE_MARKER_HEADER: &str = "GASCAN_LEGACY_ARCHIVE_V1";
+const ARCHIVE_PREPARED_MARKER: &str = "prepared";
+const ARCHIVE_COMMITTED_MARKER: &str = "committed";
+const ARCHIVE_RESTORED_MARKER: &str = "restored";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MigrationFault {
@@ -32,6 +37,7 @@ pub enum MigrationFault {
     BeforeDurableRename,
     AfterDurableRename,
     DuringLegacyArchive,
+    AfterLegacyMoveBeforeValidation,
 }
 
 #[derive(Debug, Error)]
@@ -122,6 +128,7 @@ fn open_controller_store_with_optional_fault(
     paths: &ControllerStatePaths,
     fault: Option<MigrationFault>,
 ) -> Result<Store, ControllerStateError> {
+    recover_legacy_archive_transactions(paths)?;
     let controller = open_controller_directory(paths)?;
     cleanup_migration_temps(&controller, paths.expected_uid)?;
     let durable_exists = private_regular_file_exists(
@@ -276,9 +283,20 @@ fn migrate_legacy_store(
         ControllerStateError::Unsafe(format!("legacy database changed before archival: {error}"))
     })?;
     validate_legacy_binding(paths, legacy)?;
-    archive_legacy_state(paths, controller, legacy, fault)?;
-    cleanup_migration_temps(controller, paths.expected_uid)?;
-    open_existing_controller_store(paths)
+    let transaction = archive_legacy_state(paths, controller, legacy, fault)?;
+    if let Err(error) = cleanup_migration_temps(controller, paths.expected_uid) {
+        transaction.restore()?;
+        return Err(error);
+    }
+    let store = match open_existing_controller_store(paths) {
+        Ok(store) => store,
+        Err(error) => {
+            transaction.restore()?;
+            return Err(error);
+        }
+    };
+    transaction.commit()?;
+    Ok(store)
 }
 
 fn resolve_dual_store(
@@ -287,20 +305,30 @@ fn resolve_dual_store(
     legacy: &LegacyState,
     fault: Option<MigrationFault>,
 ) -> Result<Store, ControllerStateError> {
-    resolve_dual_store_with_hooks(paths, controller, legacy, fault, || Ok(()), || Ok(()))
+    resolve_dual_store_with_hooks(
+        paths,
+        controller,
+        legacy,
+        fault,
+        || Ok(()),
+        || Ok(()),
+        || Ok(()),
+    )
 }
 
-fn resolve_dual_store_with_hooks<F, G>(
+fn resolve_dual_store_with_hooks<F, G, H>(
     paths: &ControllerStatePaths,
     controller: &ControllerDirectory,
     legacy: &LegacyState,
     fault: Option<MigrationFault>,
     before_archive: F,
     final_unlink_window: G,
+    after_archive: H,
 ) -> Result<Store, ControllerStateError>
 where
     F: FnOnce() -> Result<(), ControllerStateError>,
     G: FnOnce() -> Result<(), ControllerStateError>,
+    H: FnOnce() -> Result<(), ControllerStateError>,
 {
     let durable = open_named_private_database(
         &controller.descriptor,
@@ -362,7 +390,7 @@ where
         &durable_sidecars,
         DATABASE_NAME,
     )?;
-    archive_legacy_state_with_guard(
+    let transaction = archive_legacy_state_with_guard(
         paths,
         controller,
         legacy,
@@ -394,14 +422,28 @@ where
             )
         },
     )?;
-    validate_database_family_binding(
+    if let Err(error) = after_archive() {
+        transaction.restore()?;
+        return Err(error);
+    }
+    if let Err(error) = validate_database_family_binding(
         paths,
         controller,
         &durable,
         &durable_sidecars,
         DATABASE_NAME,
-    )?;
-    let store = open_existing_controller_store(paths)?;
+    ) {
+        transaction.restore()?;
+        return Err(error);
+    }
+    let store = match open_existing_controller_store(paths) {
+        Ok(store) => store,
+        Err(error) => {
+            transaction.restore()?;
+            return Err(error);
+        }
+    };
+    transaction.commit()?;
     Ok(store)
 }
 
@@ -418,7 +460,15 @@ where
     let legacy = open_legacy_state(paths)?.ok_or_else(|| {
         ControllerStateError::Migration("dual-state test has no legacy database".to_owned())
     })?;
-    resolve_dual_store_with_hooks(paths, &controller, &legacy, None, before_archive, || Ok(()))
+    resolve_dual_store_with_hooks(
+        paths,
+        &controller,
+        &legacy,
+        None,
+        before_archive,
+        || Ok(()),
+        || Ok(()),
+    )
 }
 
 #[cfg(test)]
@@ -441,6 +491,31 @@ where
         None,
         || Ok(()),
         final_unlink_window,
+        || Ok(()),
+    )
+}
+
+#[cfg(test)]
+fn open_controller_store_with_after_dual_archive_hook<F>(
+    paths: &ControllerStatePaths,
+    after_archive: F,
+) -> Result<Store, ControllerStateError>
+where
+    F: FnOnce() -> Result<(), ControllerStateError>,
+{
+    let controller = open_controller_directory(paths)?;
+    cleanup_migration_temps(&controller, paths.expected_uid)?;
+    let legacy = open_legacy_state(paths)?.ok_or_else(|| {
+        ControllerStateError::Migration("dual-state test has no legacy database".to_owned())
+    })?;
+    resolve_dual_store_with_hooks(
+        paths,
+        &controller,
+        &legacy,
+        None,
+        || Ok(()),
+        || Ok(()),
+        after_archive,
     )
 }
 
@@ -578,7 +653,7 @@ fn archive_legacy_state(
     controller: &ControllerDirectory,
     legacy: &LegacyState,
     fault: Option<MigrationFault>,
-) -> Result<(), ControllerStateError> {
+) -> Result<LegacyArchiveTransaction, ControllerStateError> {
     archive_legacy_state_with_guard(
         paths,
         controller,
@@ -598,7 +673,7 @@ fn archive_legacy_state_with_guard<F, G, H, T>(
     final_unlink_window: F,
     arm_durable_guard: G,
     validate_durable_guard: H,
-) -> Result<(), ControllerStateError>
+) -> Result<LegacyArchiveTransaction, ControllerStateError>
 where
     F: FnOnce() -> Result<(), ControllerStateError>,
     G: FnOnce() -> Result<T, ControllerStateError>,
@@ -633,6 +708,10 @@ where
     // durable family has been revalidated. This makes the active legacy names
     // recoverable without copying if the destructive decision becomes stale.
     let (_quarantine_name, quarantine) = create_legacy_archive_quarantine(runtime)?;
+    let identities = legacy_archive_identities(legacy);
+    write_archive_prepared_marker(&quarantine, &identities)?;
+    rustix::fs::fsync(runtime)
+        .map_err(|error| migration_fs_error("syncing prepared archive transaction", error))?;
     let names = std::iter::once(DATABASE_NAME.to_owned())
         .chain(
             legacy
@@ -652,26 +731,47 @@ where
         }
         moved.push(name.clone());
         if name == DATABASE_NAME && fault == Some(MigrationFault::DuringLegacyArchive) {
+            rustix::fs::fsync(&legacy.database.descriptor)
+                .map_err(|error| migration_fs_error("syncing interrupted legacy archive", error))?;
+            rustix::fs::fsync(&quarantine).map_err(|error| {
+                migration_fs_error("syncing interrupted archive quarantine", error)
+            })?;
             rustix::fs::fsync(runtime).map_err(|error| {
                 migration_fs_error("syncing the legacy runtime directory", error)
             })?;
             return Err(injected_fault(MigrationFault::DuringLegacyArchive));
         }
     }
-    rustix::fs::fchmod(&quarantine, Mode::from_raw_mode(0o100))
-        .map_err(|error| unsafe_error("locking legacy archive quarantine", error))?;
+    rustix::fs::fsync(&legacy.database.descriptor)
+        .map_err(|error| migration_fs_error("syncing quarantined legacy database", error))?;
+    for sidecar in legacy.sidecars.values() {
+        rustix::fs::fsync(&sidecar.descriptor)
+            .map_err(|error| migration_fs_error("syncing quarantined legacy sidecar", error))?;
+    }
+    rustix::fs::fsync(&quarantine)
+        .map_err(|error| migration_fs_error("syncing legacy archive quarantine", error))?;
     rustix::fs::fsync(runtime)
         .map_err(|error| migration_fs_error("syncing the legacy runtime directory", error))?;
+    if fault == Some(MigrationFault::AfterLegacyMoveBeforeValidation) {
+        return Err(injected_fault(
+            MigrationFault::AfterLegacyMoveBeforeValidation,
+        ));
+    }
+    let transaction = LegacyArchiveTransaction {
+        runtime: rustix::io::dup(runtime)
+            .map_err(|error| unsafe_error("retaining legacy runtime directory", error))?,
+        quarantine,
+        identities,
+        moved,
+        expected_uid: paths.expected_uid,
+    };
     if let Err(error) = validate_durable_guard(&durable_guard) {
-        restore_legacy_archive_quarantine(runtime, &quarantine, &moved)?;
-        rustix::fs::fsync(runtime).map_err(|sync_error| {
-            migration_fs_error("syncing restored legacy state", sync_error)
-        })?;
+        transaction.restore()?;
         return Err(error);
     }
     rustix::fs::fsync(&controller.descriptor)
         .map_err(|error| migration_fs_error("syncing the durable archive directory", error))?;
-    Ok(())
+    Ok(transaction)
 }
 
 fn create_legacy_archive_quarantine(
@@ -688,7 +788,7 @@ fn create_legacy_archive_quarantine(
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        let name = format!(".state.sqlite3.archive-quarantine-{token}");
+        let name = format!("{ARCHIVE_QUARANTINE_PREFIX}{token}");
         match rustix::fs::mkdirat(directory, &name, Mode::from_raw_mode(DIRECTORY_MODE as u16)) {
             Ok(()) => {
                 let quarantine = open_existing_child_directory(
@@ -709,6 +809,486 @@ fn create_legacy_archive_quarantine(
     ))
 }
 
+fn legacy_archive_identities(legacy: &LegacyState) -> BTreeMap<String, DatabaseIdentity> {
+    std::iter::once((DATABASE_NAME.to_owned(), legacy.database.identity))
+        .chain(
+            legacy
+                .sidecars
+                .iter()
+                .map(|(suffix, sidecar)| (format!("{DATABASE_NAME}{suffix}"), sidecar.identity)),
+        )
+        .collect()
+}
+
+fn write_archive_prepared_marker(
+    quarantine: &OwnedFd,
+    identities: &BTreeMap<String, DatabaseIdentity>,
+) -> Result<(), ControllerStateError> {
+    let descriptor = create_private_file(
+        quarantine,
+        ARCHIVE_PREPARED_MARKER,
+        "legacy archive transaction marker",
+    )?;
+    let mut marker = File::from(descriptor);
+    writeln!(marker, "{ARCHIVE_MARKER_HEADER}")
+        .map_err(|error| ControllerStateError::Migration(error.to_string()))?;
+    for (name, identity) in identities {
+        writeln!(marker, "{name}\t{}\t{}", identity.device, identity.inode)
+            .map_err(|error| ControllerStateError::Migration(error.to_string()))?;
+    }
+    marker
+        .sync_all()
+        .map_err(|error| ControllerStateError::Migration(error.to_string()))?;
+    rustix::fs::fsync(quarantine)
+        .map_err(|error| migration_fs_error("syncing the archive transaction marker", error))?;
+    Ok(())
+}
+
+struct LegacyArchiveTransaction {
+    runtime: OwnedFd,
+    quarantine: OwnedFd,
+    identities: BTreeMap<String, DatabaseIdentity>,
+    moved: Vec<String>,
+    expected_uid: u32,
+}
+
+impl LegacyArchiveTransaction {
+    fn restore(self) -> Result<(), ControllerStateError> {
+        validate_live_archive_transaction_layout(&self)?;
+        validate_archive_files(
+            &self.quarantine,
+            &self.identities,
+            self.moved.iter().map(String::as_str),
+            self.expected_uid,
+        )?;
+        restore_legacy_archive_quarantine(&self.runtime, &self.quarantine, &self.moved)?;
+        rustix::fs::fsync(&self.quarantine)
+            .map_err(|error| migration_fs_error("syncing restored archive quarantine", error))?;
+        rustix::fs::fsync(&self.runtime)
+            .map_err(|error| migration_fs_error("syncing restored legacy state", error))?;
+        transition_archive_marker(
+            &self.quarantine,
+            ARCHIVE_PREPARED_MARKER,
+            ARCHIVE_RESTORED_MARKER,
+        )?;
+        rustix::fs::fsync(&self.quarantine)
+            .map_err(|error| migration_fs_error("syncing restored archive marker", error))?;
+        rustix::fs::fsync(&self.runtime)
+            .map_err(|error| migration_fs_error("syncing restored archive transaction", error))?;
+        Ok(())
+    }
+
+    fn commit(self) -> Result<(), ControllerStateError> {
+        validate_live_archive_transaction_layout(&self)?;
+        validate_archive_files(
+            &self.quarantine,
+            &self.identities,
+            self.moved.iter().map(String::as_str),
+            self.expected_uid,
+        )?;
+        transition_archive_marker(
+            &self.quarantine,
+            ARCHIVE_PREPARED_MARKER,
+            ARCHIVE_COMMITTED_MARKER,
+        )?;
+        rustix::fs::fsync(&self.quarantine)
+            .map_err(|error| migration_fs_error("syncing committed archive marker", error))?;
+        rustix::fs::fsync(&self.runtime)
+            .map_err(|error| migration_fs_error("syncing committed archive transaction", error))?;
+        Ok(())
+    }
+}
+
+fn validate_live_archive_transaction_layout(
+    transaction: &LegacyArchiveTransaction,
+) -> Result<(), ControllerStateError> {
+    let mut expected = transaction.moved.iter().cloned().collect::<BTreeSet<_>>();
+    expected.insert(ARCHIVE_PREPARED_MARKER.to_owned());
+    if archive_quarantine_entries(&transaction.quarantine)? != expected {
+        return Err(ControllerStateError::Unsafe(
+            "legacy archive transaction layout changed".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn transition_archive_marker(
+    quarantine: &OwnedFd,
+    from: &str,
+    to: &str,
+) -> Result<(), ControllerStateError> {
+    if entry_exists(quarantine, to)? {
+        return Err(ControllerStateError::Unsafe(
+            "legacy archive transaction has ambiguous phase markers".to_owned(),
+        ));
+    }
+    rustix::fs::renameat(quarantine, from, quarantine, to)
+        .map_err(|error| unsafe_error("transitioning legacy archive transaction", error))
+}
+
+fn validate_archive_files<'a>(
+    quarantine: &OwnedFd,
+    identities: &BTreeMap<String, DatabaseIdentity>,
+    names: impl Iterator<Item = &'a str>,
+    expected_uid: u32,
+) -> Result<(), ControllerStateError> {
+    for name in names {
+        let expected = identities.get(name).ok_or_else(|| {
+            ControllerStateError::Unsafe(
+                "legacy archive transaction contains an unexpected file".to_owned(),
+            )
+        })?;
+        let stat = rustix::fs::statat(quarantine, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| unsafe_error("legacy archive transaction file", error))?;
+        if validate_private_file_stat(&stat, expected_uid, "legacy archive transaction file")?
+            != *expected
+        {
+            return Err(ControllerStateError::Unsafe(
+                "legacy archive transaction file identity changed".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ArchiveTransactionPhase {
+    Prepared,
+    Committed,
+    Restored,
+}
+
+struct RecoveredArchiveTransaction {
+    quarantine: OwnedFd,
+    phase: ArchiveTransactionPhase,
+    quarantined_names: BTreeSet<String>,
+}
+
+fn recover_legacy_archive_transactions(
+    paths: &ControllerStatePaths,
+) -> Result<(), ControllerStateError> {
+    let parent = paths.legacy_database().parent().ok_or_else(|| {
+        ControllerStateError::Invalid("legacy database has no parent directory".to_owned())
+    })?;
+    let Some(directories) = open_existing_directory_chain(parent)? else {
+        return Ok(());
+    };
+    let runtime = directories.last().ok_or_else(|| {
+        ControllerStateError::Invalid("legacy database has no parent descriptor".to_owned())
+    })?;
+    validate_directory(
+        runtime,
+        paths.expected_uid,
+        true,
+        "legacy runtime directory",
+    )?;
+    let mut transactions = Vec::new();
+    let mut directory = rustix::fs::Dir::read_from(runtime)
+        .map_err(|error| unsafe_error("legacy runtime directory", error))?;
+    for entry in &mut directory {
+        let entry = entry.map_err(|error| unsafe_error("legacy runtime directory entry", error))?;
+        let name = OsStr::from_bytes(entry.file_name().to_bytes());
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(ARCHIVE_QUARANTINE_PREFIX) {
+            continue;
+        }
+        if !exact_archive_quarantine_name(name) {
+            return Err(ControllerStateError::Unsafe(
+                "legacy archive quarantine has a malformed name".to_owned(),
+            ));
+        }
+        transactions.push(open_recovered_archive_transaction(
+            runtime,
+            name,
+            paths.expected_uid,
+        )?);
+    }
+    if transactions
+        .iter()
+        .filter(|transaction| transaction.phase == ArchiveTransactionPhase::Prepared)
+        .count()
+        > 1
+    {
+        return Err(ControllerStateError::Unsafe(
+            "multiple prepared legacy archive transactions are ambiguous".to_owned(),
+        ));
+    }
+    if let Some(transaction) = transactions
+        .into_iter()
+        .find(|transaction| transaction.phase == ArchiveTransactionPhase::Prepared)
+    {
+        restore_recovered_archive_transaction(runtime, transaction)?;
+    }
+    Ok(())
+}
+
+fn exact_archive_quarantine_name(name: &str) -> bool {
+    name.strip_prefix(ARCHIVE_QUARANTINE_PREFIX)
+        .is_some_and(|token| {
+            token.len() == 32
+                && token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
+fn open_recovered_archive_transaction(
+    runtime: &OwnedFd,
+    name: &str,
+    expected_uid: u32,
+) -> Result<RecoveredArchiveTransaction, ControllerStateError> {
+    let quarantine =
+        open_existing_child_directory(runtime, OsStr::new(name), "legacy archive quarantine")?;
+    validate_directory(&quarantine, expected_uid, true, "legacy archive quarantine")?;
+    let phases = [
+        (ARCHIVE_PREPARED_MARKER, ArchiveTransactionPhase::Prepared),
+        (ARCHIVE_COMMITTED_MARKER, ArchiveTransactionPhase::Committed),
+        (ARCHIVE_RESTORED_MARKER, ArchiveTransactionPhase::Restored),
+    ]
+    .into_iter()
+    .filter_map(|(marker, phase)| match entry_exists(&quarantine, marker) {
+        Ok(true) => Some(Ok((marker, phase))),
+        Ok(false) => None,
+        Err(error) => Some(Err(error)),
+    })
+    .collect::<Result<Vec<_>, ControllerStateError>>()?;
+    if phases.len() != 1 {
+        return Err(ControllerStateError::Unsafe(
+            "legacy archive transaction must have exactly one phase marker".to_owned(),
+        ));
+    }
+    let (marker_name, phase) = phases[0];
+    let marker = open_named_private_database(
+        &quarantine,
+        marker_name,
+        expected_uid,
+        false,
+        "legacy archive transaction marker",
+    )?;
+    let identities = read_archive_marker(&marker)?;
+    let mut entries = archive_quarantine_entries(&quarantine)?;
+    if !entries.remove(marker_name) {
+        return Err(ControllerStateError::Unsafe(
+            "legacy archive transaction marker disappeared".to_owned(),
+        ));
+    }
+    if entries.iter().any(|name| !identities.contains_key(name)) {
+        return Err(ControllerStateError::Unsafe(
+            "legacy archive quarantine contains unexpected entries".to_owned(),
+        ));
+    }
+
+    match phase {
+        ArchiveTransactionPhase::Committed => {
+            if entries.len() != identities.len() {
+                return Err(ControllerStateError::Unsafe(
+                    "committed legacy archive transaction is incomplete".to_owned(),
+                ));
+            }
+            validate_archive_files(
+                &quarantine,
+                &identities,
+                entries.iter().map(String::as_str),
+                expected_uid,
+            )?;
+        }
+        ArchiveTransactionPhase::Restored => {
+            if !entries.is_empty() {
+                return Err(ControllerStateError::Unsafe(
+                    "restored legacy archive transaction is not empty".to_owned(),
+                ));
+            }
+        }
+        ArchiveTransactionPhase::Prepared => {
+            validate_prepared_archive_layout(
+                runtime,
+                &quarantine,
+                &identities,
+                &entries,
+                expected_uid,
+            )?;
+        }
+    }
+    Ok(RecoveredArchiveTransaction {
+        quarantine,
+        phase,
+        quarantined_names: entries,
+    })
+}
+
+fn read_archive_marker(
+    marker: &PrivateDatabase,
+) -> Result<BTreeMap<String, DatabaseIdentity>, ControllerStateError> {
+    let stat = rustix::fs::fstat(&marker.descriptor)
+        .map_err(|error| unsafe_error("legacy archive transaction marker", error))?;
+    if stat.st_size > 4096 {
+        return Err(ControllerStateError::Unsafe(
+            "legacy archive transaction marker is too large".to_owned(),
+        ));
+    }
+    let descriptor = rustix::io::dup(&marker.descriptor)
+        .map_err(|error| unsafe_error("reading legacy archive transaction marker", error))?;
+    let mut contents = String::new();
+    File::from(descriptor)
+        .read_to_string(&mut contents)
+        .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+    if !contents.ends_with('\n') {
+        return Err(ControllerStateError::Unsafe(
+            "legacy archive transaction marker is truncated".to_owned(),
+        ));
+    }
+    let mut lines = contents.lines();
+    if lines.next() != Some(ARCHIVE_MARKER_HEADER) {
+        return Err(ControllerStateError::Unsafe(
+            "legacy archive transaction marker has an unknown version".to_owned(),
+        ));
+    }
+    let mut identities = BTreeMap::new();
+    for line in lines {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 3 || !exact_database_family_name(fields[0]) {
+            return Err(ControllerStateError::Unsafe(
+                "legacy archive transaction marker is malformed".to_owned(),
+            ));
+        }
+        let identity = DatabaseIdentity {
+            device: fields[1].parse().map_err(|_| {
+                ControllerStateError::Unsafe(
+                    "legacy archive transaction marker is malformed".to_owned(),
+                )
+            })?,
+            inode: fields[2].parse().map_err(|_| {
+                ControllerStateError::Unsafe(
+                    "legacy archive transaction marker is malformed".to_owned(),
+                )
+            })?,
+        };
+        if identities.insert(fields[0].to_owned(), identity).is_some() {
+            return Err(ControllerStateError::Unsafe(
+                "legacy archive transaction marker contains duplicate files".to_owned(),
+            ));
+        }
+    }
+    if !identities.contains_key(DATABASE_NAME) {
+        return Err(ControllerStateError::Unsafe(
+            "legacy archive transaction marker omits the database".to_owned(),
+        ));
+    }
+    Ok(identities)
+}
+
+fn exact_database_family_name(name: &str) -> bool {
+    name == DATABASE_NAME
+        || SQLITE_SIDECAR_SUFFIXES
+            .iter()
+            .any(|suffix| name == format!("{DATABASE_NAME}{suffix}"))
+}
+
+fn archive_quarantine_entries(
+    quarantine: &OwnedFd,
+) -> Result<BTreeSet<String>, ControllerStateError> {
+    let mut directory = rustix::fs::Dir::read_from(quarantine)
+        .map_err(|error| unsafe_error("legacy archive quarantine", error))?;
+    let mut entries = BTreeSet::new();
+    for entry in &mut directory {
+        let entry =
+            entry.map_err(|error| unsafe_error("legacy archive quarantine entry", error))?;
+        let name = OsStr::from_bytes(entry.file_name().to_bytes())
+            .to_str()
+            .ok_or_else(|| {
+                ControllerStateError::Unsafe(
+                    "legacy archive quarantine contains a non-UTF-8 entry".to_owned(),
+                )
+            })?
+            .to_owned();
+        if name == "." || name == ".." {
+            continue;
+        }
+        entries.insert(name);
+    }
+    Ok(entries)
+}
+
+fn validate_prepared_archive_layout(
+    runtime: &OwnedFd,
+    quarantine: &OwnedFd,
+    identities: &BTreeMap<String, DatabaseIdentity>,
+    quarantined_names: &BTreeSet<String>,
+    expected_uid: u32,
+) -> Result<(), ControllerStateError> {
+    for (name, expected) in identities {
+        let active = entry_exists(runtime, name)?;
+        let quarantined = quarantined_names.contains(name);
+        if active == quarantined {
+            return Err(ControllerStateError::Unsafe(
+                "prepared legacy archive transaction has an ambiguous file layout".to_owned(),
+            ));
+        }
+        let directory = if active { runtime } else { quarantine };
+        let stat = rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| unsafe_error("prepared legacy archive transaction file", error))?;
+        if validate_private_file_stat(
+            &stat,
+            expected_uid,
+            "prepared legacy archive transaction file",
+        )? != *expected
+        {
+            return Err(ControllerStateError::Unsafe(
+                "prepared legacy archive transaction file identity changed".to_owned(),
+            ));
+        }
+    }
+    for suffix in SQLITE_SIDECAR_SUFFIXES {
+        let name = format!("{DATABASE_NAME}{suffix}");
+        if !identities.contains_key(&name) && entry_exists(runtime, &name)? {
+            return Err(ControllerStateError::Unsafe(
+                "prepared legacy archive transaction has an unexpected active sidecar".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn restore_recovered_archive_transaction(
+    runtime: &OwnedFd,
+    transaction: RecoveredArchiveTransaction,
+) -> Result<(), ControllerStateError> {
+    for name in transaction
+        .quarantined_names
+        .iter()
+        .filter(|name| name.as_str() != DATABASE_NAME)
+        .rev()
+    {
+        rustix::fs::renameat(&transaction.quarantine, name, runtime, name)
+            .map_err(|error| unsafe_error("recovering a legacy SQLite sidecar", error))?;
+    }
+    if transaction.quarantined_names.contains(DATABASE_NAME) {
+        rustix::fs::renameat(
+            &transaction.quarantine,
+            DATABASE_NAME,
+            runtime,
+            DATABASE_NAME,
+        )
+        .map_err(|error| unsafe_error("recovering the legacy database", error))?;
+    }
+    rustix::fs::fsync(&transaction.quarantine)
+        .map_err(|error| migration_fs_error("syncing recovered archive quarantine", error))?;
+    rustix::fs::fsync(runtime)
+        .map_err(|error| migration_fs_error("syncing recovered legacy state", error))?;
+    transition_archive_marker(
+        &transaction.quarantine,
+        ARCHIVE_PREPARED_MARKER,
+        ARCHIVE_RESTORED_MARKER,
+    )?;
+    rustix::fs::fsync(&transaction.quarantine)
+        .map_err(|error| migration_fs_error("syncing recovered archive marker", error))?;
+    rustix::fs::fsync(runtime)
+        .map_err(|error| migration_fs_error("syncing recovered archive transaction", error))?;
+    Ok(())
+}
+
 fn restore_legacy_archive_quarantine(
     runtime: &OwnedFd,
     quarantine: &OwnedFd,
@@ -724,8 +1304,6 @@ fn restore_legacy_archive_quarantine(
         rustix::fs::renameat(quarantine, database, runtime, database)
             .map_err(|error| unsafe_error("restoring the legacy database", error))?;
     }
-    rustix::fs::fchmod(quarantine, Mode::from_raw_mode(0o100))
-        .map_err(|error| unsafe_error("locking retained legacy archive quarantine", error))?;
     Ok(())
 }
 
@@ -2161,6 +2739,32 @@ mod tests {
             assert!(matches!(result, Err(ControllerStateError::Unsafe(_))));
             assert_eq!(fs::read(paths.legacy_database())?, legacy_before);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn dual_state_restores_legacy_after_outer_post_archive_validation_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let root = temp.path().canonicalize()?;
+        let paths = seeded_dual_paths(&root)?;
+        let legacy_before = fs::read(paths.legacy_database())?;
+        let replacement = root.join("outer-validation-replacement.sqlite3");
+        let replacement_store = Store::open(&replacement)?;
+        drop(replacement_store);
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600))?;
+        let displaced = root.join("outer-validation-displaced.sqlite3");
+
+        let result = open_controller_store_with_after_dual_archive_hook(&paths, || {
+            fs::rename(paths.durable_database(), &displaced)
+                .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+            fs::rename(&replacement, paths.durable_database())
+                .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+            Ok(())
+        });
+
+        assert!(matches!(result, Err(ControllerStateError::Unsafe(_))));
+        assert_eq!(fs::read(paths.legacy_database())?, legacy_before);
         Ok(())
     }
 
