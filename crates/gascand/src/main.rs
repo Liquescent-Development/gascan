@@ -320,13 +320,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn report_controller_startup_error(error: &ControllerStateError) {
-    eprintln!(
-        "GASCAN_CONTROLLER_STARTUP_ERROR {}",
-        serde_json::json!({
-            "code": error.code(),
-            "message": error.to_string(),
-        })
-    );
+    let owner_token = std::env::var("GASCAN_DAEMON_OWNER_TOKEN").ok();
+    let diagnostic = owner_token.as_ref().map(|owner_token| {
+        format!(
+            "GASCAN_CONTROLLER_STARTUP_ERROR {}\n",
+            serde_json::json!({
+                "code": error.code(),
+                "message": error.to_string(),
+                "owner_token": owner_token,
+            })
+        )
+    });
+    if let Some(diagnostic) = diagnostic {
+        write_controller_startup_diagnostic(diagnostic.as_bytes());
+        eprint!("{diagnostic}");
+    } else {
+        eprintln!("{}: {}", error.code(), error);
+    }
+}
+
+fn write_controller_startup_diagnostic(diagnostic: &[u8]) {
+    use std::io::Write as _;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    const MAX_STARTUP_DIAGNOSTIC_BYTES: u64 = 64 * 1024;
+    let Ok(diagnostic_len) = u64::try_from(diagnostic.len()) else {
+        return;
+    };
+    if diagnostic_len > MAX_STARTUP_DIAGNOSTIC_BYTES {
+        return;
+    }
+    let Some(path) = std::env::var_os("GASCAN_CONTROLLER_STARTUP_PATH") else {
+        return;
+    };
+    let Ok(descriptor) = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::WRONLY
+            | rustix::fs::OFlags::APPEND
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    ) else {
+        return;
+    };
+    let mut file = std::fs::File::from(descriptor);
+    let Ok(metadata) = file.metadata() else {
+        return;
+    };
+    if !metadata.file_type().is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.permissions().mode() & 0o777 != 0o600
+        || metadata.nlink() != 1
+        || metadata
+            .len()
+            .checked_add(diagnostic_len)
+            .is_none_or(|size| size > MAX_STARTUP_DIAGNOSTIC_BYTES)
+    {
+        return;
+    }
+    let _ = file.write_all(diagnostic);
 }
 
 fn controller_startup_error(source: ControllerStateError) -> ControllerStartupError {

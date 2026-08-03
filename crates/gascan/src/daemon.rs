@@ -19,6 +19,7 @@ const INSTANCE_TOMBSTONE_MODE: u16 = 0o200;
 const SOCKET_NAME: &str = "gascand.sock";
 const INSTANCE_NAME: &str = "daemon-instance.json";
 const LIFECYCLE_LOCK_NAME: &str = "daemon-lifecycle.lock";
+const STARTUP_DIAGNOSTIC_NAME: &str = "daemon-startup-error.json";
 const MAX_INSTANCE_BYTES: u64 = 64 * 1024;
 const LIFECYCLE_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 const ENDPOINT_CHANGED_DURING_PROBE: &str =
@@ -443,44 +444,52 @@ pub(crate) struct DaemonLaunch {
     pub(crate) instance_path: PathBuf,
     pub(crate) owner_token: String,
     pub(crate) stderr_path: Option<PathBuf>,
+    pub(crate) startup_diagnostic_path: PathBuf,
 }
 
 pub(crate) trait DaemonSpawner: Send + Sync {
     fn spawn(&self, launch: &DaemonLaunch) -> io::Result<DaemonStartupMonitor>;
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct DaemonStartupMonitor {
-    captured: Option<std::sync::Arc<std::sync::Mutex<Vec<u8>>>>,
+    source: Option<StartupDiagnosticSource>,
 }
 
 impl DaemonStartupMonitor {
-    pub(crate) fn capturing() -> Self {
+    pub(crate) fn from_file(file: File, owner_token: String) -> Self {
         Self {
-            captured: Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::new()))),
+            source: Some(StartupDiagnosticSource { file, owner_token }),
         }
     }
 
-    pub(crate) fn record(&self, bytes: &[u8]) -> io::Result<()> {
-        let Some(captured) = &self.captured else {
-            return Ok(());
-        };
-        let mut captured = captured
-            .lock()
-            .map_err(|_| io::Error::other("daemon startup diagnostics were poisoned"))?;
-        let remaining = MAX_STARTUP_DIAGNOSTIC_BYTES.saturating_sub(captured.len());
-        captured.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
-        Ok(())
-    }
-
     fn controller_error(&self) -> io::Result<Option<SupervisorError>> {
-        let Some(captured) = &self.captured else {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let Some(source) = &self.source else {
             return Ok(None);
         };
-        let captured = captured
-            .lock()
-            .map_err(|_| io::Error::other("daemon startup diagnostics were poisoned"))?;
-        let Ok(captured) = std::str::from_utf8(&captured) else {
+        let metadata = source.file.metadata()?;
+        if !metadata.file_type().is_file()
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.permissions().mode() & 0o777 != u32::from(FILE_MODE)
+            || metadata.nlink() != 1
+            || metadata.len() > MAX_STARTUP_DIAGNOSTIC_BYTES as u64
+        {
+            return Ok(None);
+        }
+        let size = usize::try_from(metadata.len())
+            .map_err(|_| io::Error::other("daemon startup diagnostic size overflow"))?;
+        let mut bytes = vec![0_u8; size];
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let read = source.file.read_at(&mut bytes[offset..], offset as u64)?;
+            if read == 0 {
+                return Ok(None);
+            }
+            offset += read;
+        }
+        let Ok(captured) = std::str::from_utf8(&bytes) else {
             return Ok(None);
         };
         for line in captured.lines() {
@@ -498,6 +507,7 @@ impl DaemonStartupMonitor {
                     | "controller_state_invalid"
                     | "controller_state_migration_failed"
             ) || diagnostic.message.trim().is_empty()
+                || diagnostic.owner_token != source.owner_token
             {
                 continue;
             }
@@ -510,10 +520,17 @@ impl DaemonStartupMonitor {
     }
 }
 
+#[derive(Debug)]
+struct StartupDiagnosticSource {
+    file: File,
+    owner_token: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct ControllerStartupDiagnostic {
     code: String,
     message: String,
+    owner_token: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2131,6 +2148,7 @@ fn daemon_launch(
         instance_path,
         owner_token,
         stderr_path: std::env::var_os("GASCAN_DAEMON_STDERR_PATH").map(PathBuf::from),
+        startup_diagnostic_path: paths.directory().join(STARTUP_DIAGNOSTIC_NAME),
     })
 }
 
@@ -3284,11 +3302,11 @@ mod tests {
         AttestedProcessSignaler, ConnectionOutcome, DaemonEndpoint, DaemonIdentity,
         DaemonInstanceRecord, DaemonLaunch, DaemonLifecycleObserver, DaemonPaths, DaemonSpawner,
         DaemonStartupMonitor, DaemonState, DaemonTransition, EndpointPathState, EndpointProbe,
-        EndpointSession, InstanceTimestamp, OsProcessInspector, ProcessIdentity, ProcessInspector,
-        ProcessSignaler, ShutdownPolicy, StopMode, SupervisorError, SupervisorTimeouts,
-        checked_pid, coherent_process_identity, connect_current_or_recover_with,
-        connect_current_or_recover_with_observer, inspect_with, read_attested_instance,
-        read_instance_record_with_hook, restart_with, signal_attested_with,
+        EndpointSession, InstanceTimestamp, MAX_STARTUP_DIAGNOSTIC_BYTES, OsProcessInspector,
+        ProcessIdentity, ProcessInspector, ProcessSignaler, ShutdownPolicy, StopMode,
+        SupervisorError, SupervisorTimeouts, checked_pid, coherent_process_identity,
+        connect_current_or_recover_with, connect_current_or_recover_with_observer, inspect_with,
+        read_attested_instance, read_instance_record_with_hook, restart_with, signal_attested_with,
         signal_attested_with_deadline, signal_identity, start_with, stop_with, wait_for_exit_until,
     };
     #[cfg(target_os = "macos")]
@@ -3334,15 +3352,25 @@ mod tests {
 
     #[test]
     fn startup_diagnostics_accept_only_known_controller_codes() -> TestResult {
-        let monitor = DaemonStartupMonitor::capturing();
-        monitor.record(
-            b"noise\nGASCAN_CONTROLLER_STARTUP_ERROR {\"code\":\"arbitrary_code\",\"message\":\"forged\"}\n",
+        use std::io::Write as _;
+
+        let temp = tempfile::tempdir()?;
+        let diagnostic = temp.path().join("startup.json");
+        fs::write(
+            &diagnostic,
+            b"noise\nGASCAN_CONTROLLER_STARTUP_ERROR {\"code\":\"arbitrary_code\",\"message\":\"forged\",\"owner_token\":\"owner\"}\nGASCAN_CONTROLLER_STARTUP_ERROR {\"code\":\"controller_state_unsafe\",\"message\":\"wrong launch\",\"owner_token\":\"other\"}\n",
         )?;
+        fs::set_permissions(&diagnostic, fs::Permissions::from_mode(0o600))?;
+        let monitor =
+            DaemonStartupMonitor::from_file(fs::File::open(&diagnostic)?, "owner".to_owned());
         assert!(monitor.controller_error()?.is_none());
 
-        monitor.record(
-            b"GASCAN_CONTROLLER_STARTUP_ERROR {\"code\":\"controller_state_unsafe\",\"message\":\"application directory mode is unsafe\"}\n",
-        )?;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&diagnostic)?
+            .write_all(
+                b"GASCAN_CONTROLLER_STARTUP_ERROR {\"code\":\"controller_state_unsafe\",\"message\":\"application directory mode is unsafe\",\"owner_token\":\"owner\"}\n",
+            )?;
         let error = monitor
             .controller_error()?
             .ok_or("controller diagnostic missing")?;
@@ -3352,6 +3380,9 @@ mod tests {
                 if code == "controller_state_unsafe"
                     && message == "application directory mode is unsafe"
         ));
+
+        fs::write(&diagnostic, vec![b'x'; MAX_STARTUP_DIAGNOSTIC_BYTES + 1])?;
+        assert!(monitor.controller_error()?.is_none());
         Ok(())
     }
 

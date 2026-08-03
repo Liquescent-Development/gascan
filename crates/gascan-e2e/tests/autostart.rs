@@ -454,6 +454,32 @@ fn daemon_start_and_stop_are_idempotent() -> TestResult {
 }
 
 #[test]
+fn daemon_stderr_sink_survives_the_launching_cli() -> TestResult {
+    let env = Environment::new()?;
+    let started = env.command_for(&["daemon", "start", "--json"]).output()?;
+    assert!(
+        started.status.success(),
+        "daemon start failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&started.stdout),
+        String::from_utf8_lossy(&started.stderr)
+    );
+
+    let stopped = env.command_for(&["daemon", "stop", "--json"]).output()?;
+    assert!(
+        stopped.status.success(),
+        "daemon stop failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&stopped.stdout),
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    let daemon_stderr = std::fs::read_to_string(env.runtime_root.join("daemon.stderr"))?;
+    assert!(
+        daemon_stderr.contains("daemon shutdown began: rpc"),
+        "daemon lifetime diagnostic was lost after launcher exit: {daemon_stderr:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn direct_daemon_startup_publishes_the_standard_protected_record() -> TestResult {
     use std::os::unix::fs::PermissionsExt as _;
 
