@@ -72,7 +72,7 @@ gascan_release_preflight_daemon() {
 }
 
 gascan_release_up() {
-  "$gascan_bin" up "$root" </dev/null
+  CI=1 "$gascan_bin" up "$root" </dev/null
 }
 
 gascan_default_shell_probe() {

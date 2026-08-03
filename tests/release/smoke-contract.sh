@@ -217,6 +217,10 @@ case "$*" in
       printf "{\"state\":\"stopped\",\"health\":\"stopped\"}\n"
     fi
     ;;
+  "up "*)
+    [[ ${CI:-} == 1 ]] || exit 91
+    exit 42
+    ;;
   *)
     [[ ${GASCAN_APPLE_ATTACH_HELPER:-} == "$(cat "$FIXTURE_SUDO_LOG.attach-helper")" ]] || exit 86
     [[ ! -f $FIXTURE_SUDO_LOG.daemon ]] || exit 89

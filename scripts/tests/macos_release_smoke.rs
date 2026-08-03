@@ -81,7 +81,7 @@ fn release_smoke_runs_every_up_without_interactive_stdin() {
 
     let direct_up = "\"$gascan_bin\" up \"$root\"";
     assert!(smoke.contains(
-        "gascan_release_up() {\n  \"$gascan_bin\" up \"$root\" </dev/null\n}"
+        "gascan_release_up() {\n  CI=1 \"$gascan_bin\" up \"$root\" </dev/null\n}"
     ));
     assert_eq!(
         smoke.matches(direct_up).count(),
