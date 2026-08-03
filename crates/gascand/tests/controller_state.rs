@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use tempfile::TempDir;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -266,6 +267,21 @@ fn migration_legacy_only_preserves_logical_content() -> TestResult {
 }
 
 #[test]
+fn migration_backup_remains_recoverable_after_staging_reads_the_source() -> TestResult {
+    let fixture = ControllerFixture::new()?;
+    fixture.seed_store(fixture.paths.legacy_database(), "recoverable")?;
+
+    open_controller_store(&fixture.paths)?;
+    let backup = migration_backup_database(&fixture)?;
+    let recovered = Store::open(backup)?;
+    assert_eq!(
+        recovered.list_sandboxes()?[0].id.as_str(),
+        "recoverable-aaaaaaaaaaaa"
+    );
+    Ok(())
+}
+
+#[test]
 fn migration_includes_committed_uncheckpointed_wal_content() -> TestResult {
     let fixture = ControllerFixture::new()?;
     fs::create_dir(&fixture.runtime)?;
@@ -307,6 +323,76 @@ fn migration_includes_committed_uncheckpointed_wal_content() -> TestResult {
     );
     drop(connection);
     Ok(())
+}
+
+#[test]
+fn migration_recovers_and_archives_a_hot_rollback_journal() -> TestResult {
+    let fixture = ControllerFixture::new()?;
+    fixture.seed_store(fixture.paths.legacy_database(), "journal")?;
+    let status = Command::new(std::env::current_exe()?)
+        .arg("--exact")
+        .arg("hot_journal_crash_helper")
+        .arg("--nocapture")
+        .env(
+            "GASCAN_TEST_HOT_JOURNAL_PATH",
+            fixture.paths.legacy_database(),
+        )
+        .status()?;
+    assert!(!status.success());
+    let journal = PathBuf::from(format!(
+        "{}-journal",
+        fixture.paths.legacy_database().display()
+    ));
+    assert!(journal.exists());
+    for path in active_database_files(fixture.paths.legacy_database()) {
+        if path.exists() {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        }
+    }
+
+    let migrated = open_controller_store(&fixture.paths)?;
+    assert_eq!(
+        migrated.list_sandboxes()?[0].canonical_root.as_str(),
+        "/workspace/journal"
+    );
+    assert!(!journal.exists());
+    assert!(migration_backups(&fixture)?.iter().any(|path| {
+        path.file_name()
+            .is_some_and(|name| name.to_string_lossy().ends_with("-journal"))
+    }));
+    let recovered_backup = Store::open(migration_backup_database(&fixture)?)?;
+    assert_eq!(
+        recovered_backup.list_sandboxes()?[0]
+            .canonical_root
+            .as_str(),
+        "/workspace/journal"
+    );
+    Ok(())
+}
+
+#[test]
+fn hot_journal_crash_helper() {
+    let Some(path) = std::env::var_os("GASCAN_TEST_HOT_JOURNAL_PATH") else {
+        return;
+    };
+    let Ok(connection) = Connection::open(path) else {
+        std::process::exit(2);
+    };
+    if connection
+        .pragma_update(None, "journal_mode", "DELETE")
+        .is_err()
+        || connection
+            .pragma_update(None, "synchronous", "FULL")
+            .is_err()
+        || connection
+            .execute_batch(
+                "BEGIN IMMEDIATE; UPDATE sandboxes SET canonical_root = '/workspace/uncommitted';",
+            )
+            .is_err()
+    {
+        std::process::exit(2);
+    }
+    std::process::abort();
 }
 
 #[test]
@@ -519,6 +605,8 @@ fn migration_archives_legacy_sidecars() -> TestResult {
     assert!(names.iter().any(|name| name.ends_with("-wal")));
     assert!(names.iter().any(|name| name.ends_with("-shm")));
     drop(connection);
+    let recovered_backup = Store::open(migration_backup_database(&fixture)?)?;
+    assert_eq!(recovered_backup.list_sandboxes()?[0].updated_at_millis, 11);
     Ok(())
 }
 
@@ -548,11 +636,12 @@ fn migration_fault_boundaries_recover_without_losing_legacy_content() -> TestRes
     Ok(())
 }
 
-fn active_database_files(database: &Path) -> [PathBuf; 3] {
+fn active_database_files(database: &Path) -> [PathBuf; 4] {
     [
         database.to_path_buf(),
         PathBuf::from(format!("{}-wal", database.display())),
         PathBuf::from(format!("{}-shm", database.display())),
+        PathBuf::from(format!("{}-journal", database.display())),
     ]
 }
 
@@ -574,6 +663,21 @@ fn migration_backups(fixture: &ControllerFixture) -> Result<Vec<PathBuf>, std::i
             Err(error) => Some(Err(error)),
         })
         .collect()
+}
+
+fn migration_backup_database(fixture: &ControllerFixture) -> Result<PathBuf, std::io::Error> {
+    migration_backups(fixture)?
+        .into_iter()
+        .find(|path| {
+            path.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with("state.sqlite3.legacy-backup")
+                    && !name.ends_with("-wal")
+                    && !name.ends_with("-shm")
+                    && !name.ends_with("-journal")
+            })
+        })
+        .ok_or_else(|| std::io::Error::other("legacy backup database is missing"))
 }
 
 fn create_private_directory(path: &Path) -> std::io::Result<()> {
