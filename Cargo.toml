@@ -23,7 +23,7 @@ nix = { version = "0.31.3", features = ["event", "user"] }
 camino = { version = "1", features = ["serde1"] }
 sha2 = "0.10"
 toml = "0.8"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["backup", "bundled"] }
 plist = "1"
 prost = "0.13"
 prost-types = "0.13"

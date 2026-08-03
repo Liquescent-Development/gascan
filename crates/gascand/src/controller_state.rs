@@ -1,13 +1,19 @@
 use crate::{Store, StoreError};
 #[cfg(target_os = "macos")]
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+use rusqlite::{Connection, OpenFlags, backup::Backup};
 use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::process::geteuid;
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
+use std::fs::File;
+use std::io;
 #[cfg(target_os = "macos")]
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 use thiserror::Error;
 
 const APPLICATION_ID: &str = "dev.gascan";
@@ -15,6 +21,16 @@ const CONTROLLER_DIRECTORY: &str = "controller";
 const DATABASE_NAME: &str = "state.sqlite3";
 const DIRECTORY_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
+const TEMP_PREFIX: &str = ".state.sqlite3.migration-";
+const LEGACY_BACKUP_NAME: &str = "state.sqlite3.legacy-backup";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MigrationFault {
+    BeforeSnapshotComplete,
+    BeforeDurableRename,
+    AfterDurableRename,
+    DuringLegacyArchive,
+}
 
 #[derive(Debug, Error)]
 pub enum ControllerStateError {
@@ -22,6 +38,12 @@ pub enum ControllerStateError {
     Invalid(String),
     #[error("controller state path is unsafe: {0}")]
     Unsafe(String),
+    #[error(
+        "Gascan found conflicting controller databases and will not choose one automatically.\n\nDurable: {durable}\nLegacy: {legacy}\n\nNo data was changed. Back up both files, then select the database to preserve."
+    )]
+    Conflict { durable: PathBuf, legacy: PathBuf },
+    #[error("controller state migration failed: {0}")]
+    Migration(String),
     #[error("controller state store could not be opened: {0}")]
     Store(#[from] StoreError),
 }
@@ -32,7 +54,8 @@ impl ControllerStateError {
         match self {
             Self::Invalid(_) => "controller_state_invalid",
             Self::Unsafe(_) => "controller_state_unsafe",
-            Self::Store(_) => "controller_state_migration_failed",
+            Self::Conflict { .. } => "controller_state_conflict",
+            Self::Migration(_) | Self::Store(_) => "controller_state_migration_failed",
         }
     }
 }
@@ -83,7 +106,440 @@ impl ControllerStatePaths {
 }
 
 pub fn open_controller_store(paths: &ControllerStatePaths) -> Result<Store, ControllerStateError> {
-    open_controller_store_with_hooks(paths, || Ok(()), || Ok(()))
+    open_controller_store_with_optional_fault(paths, None)
+}
+
+pub fn open_controller_store_with_fault(
+    paths: &ControllerStatePaths,
+    fault: MigrationFault,
+) -> Result<Store, ControllerStateError> {
+    open_controller_store_with_optional_fault(paths, Some(fault))
+}
+
+fn open_controller_store_with_optional_fault(
+    paths: &ControllerStatePaths,
+    fault: Option<MigrationFault>,
+) -> Result<Store, ControllerStateError> {
+    let controller = open_controller_directory(paths)?;
+    cleanup_migration_temps(&controller, paths.expected_uid)?;
+    let durable_exists = private_regular_file_exists(
+        &controller.descriptor,
+        DATABASE_NAME,
+        paths.expected_uid,
+        "durable controller database",
+    )?;
+    let legacy = open_legacy_state(paths)?;
+
+    match (durable_exists, legacy) {
+        (false, None) => {
+            if open_legacy_orphans(paths)?.is_some() {
+                return Err(ControllerStateError::Unsafe(
+                    "legacy SQLite sidecars exist without either active database".to_owned(),
+                ));
+            }
+            open_controller_store_with_hooks(paths, || Ok(()), || Ok(()))
+        }
+        (true, None) => {
+            if let Some(orphans) = open_legacy_orphans(paths)? {
+                archive_legacy_orphans(paths, &controller, &orphans)?;
+            }
+            open_existing_controller_store(paths)
+        }
+        (false, Some(legacy)) => migrate_legacy_store(paths, &controller, &legacy, fault),
+        (true, Some(legacy)) => resolve_dual_store(paths, &controller, &legacy, fault),
+    }
+}
+
+struct LegacyState {
+    directories: Vec<OwnedFd>,
+    database: PrivateDatabase,
+    sidecars: BTreeMap<String, PrivateDatabase>,
+}
+
+struct LegacyOrphans {
+    directories: Vec<OwnedFd>,
+    sidecars: BTreeMap<String, PrivateDatabase>,
+}
+
+fn open_legacy_state(
+    paths: &ControllerStatePaths,
+) -> Result<Option<LegacyState>, ControllerStateError> {
+    let parent = paths.legacy_database().parent().ok_or_else(|| {
+        ControllerStateError::Invalid("legacy database has no parent directory".to_owned())
+    })?;
+    let Some(directories) = open_existing_directory_chain(parent)? else {
+        return Ok(None);
+    };
+    let directory = directories.last().ok_or_else(|| {
+        ControllerStateError::Invalid("legacy database has no parent descriptor".to_owned())
+    })?;
+    validate_directory(
+        directory,
+        paths.expected_uid,
+        true,
+        "legacy runtime directory",
+    )?;
+    if !private_regular_file_exists(
+        directory,
+        DATABASE_NAME,
+        paths.expected_uid,
+        "legacy controller database",
+    )? {
+        return Ok(None);
+    }
+    let database = open_named_private_database(
+        directory,
+        DATABASE_NAME,
+        paths.expected_uid,
+        false,
+        "legacy controller database",
+    )?;
+    let sidecars = open_private_sidecars(directory, DATABASE_NAME, paths.expected_uid)?;
+    Ok(Some(LegacyState {
+        directories,
+        database,
+        sidecars,
+    }))
+}
+
+fn open_legacy_orphans(
+    paths: &ControllerStatePaths,
+) -> Result<Option<LegacyOrphans>, ControllerStateError> {
+    let parent = paths.legacy_database().parent().ok_or_else(|| {
+        ControllerStateError::Invalid("legacy database has no parent directory".to_owned())
+    })?;
+    let Some(directories) = open_existing_directory_chain(parent)? else {
+        return Ok(None);
+    };
+    let directory = directories.last().ok_or_else(|| {
+        ControllerStateError::Invalid("legacy database has no parent descriptor".to_owned())
+    })?;
+    validate_directory(
+        directory,
+        paths.expected_uid,
+        true,
+        "legacy runtime directory",
+    )?;
+    if entry_exists(directory, DATABASE_NAME)? {
+        return Ok(None);
+    }
+    let sidecars = open_private_sidecars(directory, DATABASE_NAME, paths.expected_uid)?;
+    if sidecars.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(LegacyOrphans {
+            directories,
+            sidecars,
+        }))
+    }
+}
+
+fn migrate_legacy_store(
+    paths: &ControllerStatePaths,
+    controller: &ControllerDirectory,
+    legacy: &LegacyState,
+    fault: Option<MigrationFault>,
+) -> Result<Store, ControllerStateError> {
+    let monitor = DatabaseMutationMonitor::new_for_legacy(legacy)?;
+    let snapshot_name =
+        make_snapshot(paths, controller, &legacy.database, &legacy.sidecars, fault)?;
+    monitor.ensure_unchanged().map_err(|error| {
+        ControllerStateError::Unsafe(format!(
+            "legacy database changed while creating its snapshot: {error}"
+        ))
+    })?;
+    validate_legacy_binding(paths, legacy)?;
+    if fault == Some(MigrationFault::BeforeDurableRename) {
+        return Err(injected_fault(MigrationFault::BeforeDurableRename));
+    }
+    if entry_exists(&controller.descriptor, DATABASE_NAME)? {
+        return Err(ControllerStateError::Conflict {
+            durable: paths.durable_database().to_path_buf(),
+            legacy: paths.legacy_database().to_path_buf(),
+        });
+    }
+    rustix::fs::renameat(
+        &controller.descriptor,
+        snapshot_name.as_str(),
+        &controller.descriptor,
+        DATABASE_NAME,
+    )
+    .map_err(|error| migration_fs_error("publishing the durable database", error))?;
+    rustix::fs::fsync(&controller.descriptor)
+        .map_err(|error| migration_fs_error("syncing the durable controller directory", error))?;
+    if fault == Some(MigrationFault::AfterDurableRename) {
+        return Err(injected_fault(MigrationFault::AfterDurableRename));
+    }
+    monitor.ensure_unchanged().map_err(|error| {
+        ControllerStateError::Unsafe(format!("legacy database changed before archival: {error}"))
+    })?;
+    validate_legacy_binding(paths, legacy)?;
+    archive_legacy_state(paths, controller, legacy, fault)?;
+    cleanup_migration_temps(controller, paths.expected_uid)?;
+    open_existing_controller_store(paths)
+}
+
+fn resolve_dual_store(
+    paths: &ControllerStatePaths,
+    controller: &ControllerDirectory,
+    legacy: &LegacyState,
+    fault: Option<MigrationFault>,
+) -> Result<Store, ControllerStateError> {
+    let durable = open_named_private_database(
+        &controller.descriptor,
+        DATABASE_NAME,
+        paths.expected_uid,
+        false,
+        "durable controller database",
+    )?;
+    let durable_sidecars =
+        open_private_sidecars(&controller.descriptor, DATABASE_NAME, paths.expected_uid)?;
+    let durable_monitor = DatabaseMutationMonitor::new(controller, &durable)?;
+    let legacy_monitor = DatabaseMutationMonitor::new_for_legacy(legacy)?;
+    let durable_snapshot = make_snapshot(paths, controller, &durable, &durable_sidecars, None)?;
+    let legacy_snapshot =
+        make_snapshot(paths, controller, &legacy.database, &legacy.sidecars, fault)?;
+    durable_monitor.ensure_unchanged()?;
+    legacy_monitor.ensure_unchanged()?;
+    validate_named_database_binding(paths, controller, &durable, DATABASE_NAME)?;
+    validate_legacy_binding(paths, legacy)?;
+    let identical = logical_databases_match(
+        &controller_path(paths, &durable_snapshot),
+        &controller_path(paths, &legacy_snapshot),
+    )?;
+    cleanup_migration_temps(controller, paths.expected_uid)?;
+    if !identical {
+        return Err(ControllerStateError::Conflict {
+            durable: paths.durable_database().to_path_buf(),
+            legacy: paths.legacy_database().to_path_buf(),
+        });
+    }
+    archive_legacy_state(paths, controller, legacy, fault)?;
+    open_existing_controller_store(paths)
+}
+
+fn make_snapshot(
+    paths: &ControllerStatePaths,
+    controller: &ControllerDirectory,
+    source: &PrivateDatabase,
+    sidecars: &BTreeMap<String, PrivateDatabase>,
+    fault: Option<MigrationFault>,
+) -> Result<String, ControllerStateError> {
+    let sequence = next_temp_sequence(&controller.descriptor)?;
+    let staged_name = format!("{TEMP_PREFIX}source-{sequence}");
+    copy_private_file(
+        &source.descriptor,
+        &controller.descriptor,
+        &staged_name,
+        "staging controller database",
+    )?;
+    for (suffix, sidecar) in sidecars {
+        copy_private_file(
+            &sidecar.descriptor,
+            &controller.descriptor,
+            &format!("{staged_name}{suffix}"),
+            "staging SQLite sidecar",
+        )?;
+    }
+    rustix::fs::fsync(&controller.descriptor)
+        .map_err(|error| migration_fs_error("syncing staged controller state", error))?;
+    if fault == Some(MigrationFault::BeforeSnapshotComplete) {
+        return Err(injected_fault(MigrationFault::BeforeSnapshotComplete));
+    }
+
+    let snapshot_sequence = next_temp_sequence(&controller.descriptor)?;
+    let snapshot_name = format!("{TEMP_PREFIX}snapshot-{snapshot_sequence}");
+    let snapshot_descriptor =
+        create_private_file(&controller.descriptor, &snapshot_name, "migration snapshot")?;
+    let snapshot_stat = rustix::fs::fstat(&snapshot_descriptor)
+        .map_err(|error| unsafe_error("migration snapshot", error))?;
+    let snapshot = PrivateDatabase {
+        identity: validate_private_file_stat(
+            &snapshot_stat,
+            paths.expected_uid,
+            "migration snapshot",
+        )?,
+        descriptor: snapshot_descriptor,
+    };
+    let staged = open_named_private_database(
+        &controller.descriptor,
+        &staged_name,
+        paths.expected_uid,
+        false,
+        "staged controller database",
+    )?;
+    let monitor =
+        DatabaseMutationMonitor::new_for_controller_files(controller, &[&staged, &snapshot])?;
+    let source_path = controller_path(paths, &staged_name);
+    let snapshot_path = controller_path(paths, &snapshot_name);
+    let source_connection = Connection::open_with_flags(
+        source_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| migration_sql_error("opening the staged source", error))?;
+    let mut destination_connection = Connection::open_with_flags(
+        &snapshot_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| migration_sql_error("opening the migration snapshot", error))?;
+    let backup = Backup::new(&source_connection, &mut destination_connection)
+        .map_err(|error| migration_sql_error("starting the SQLite backup", error))?;
+    backup
+        .run_to_completion(128, Duration::from_millis(1), None)
+        .map_err(|error| migration_sql_error("copying the SQLite snapshot", error))?;
+    drop(backup);
+    drop(destination_connection);
+    drop(source_connection);
+
+    monitor.ensure_unchanged()?;
+    validate_named_database_binding(paths, controller, &staged, &staged_name)?;
+    validate_named_database_binding(paths, controller, &snapshot, &snapshot_name)?;
+    let validated = Store::open_no_follow(&snapshot_path).map_err(ControllerStateError::Store)?;
+    validated
+        .list_sandboxes()
+        .map_err(ControllerStateError::Store)?;
+    drop(validated);
+    monitor.ensure_unchanged()?;
+    rustix::fs::fsync(&snapshot.descriptor)
+        .map_err(|error| migration_fs_error("syncing the migration snapshot", error))?;
+    validate_named_database_binding(paths, controller, &snapshot, &snapshot_name)?;
+    rustix::fs::fsync(&controller.descriptor)
+        .map_err(|error| migration_fs_error("syncing the migration snapshot directory", error))?;
+    remove_temp_family(&controller.descriptor, &staged_name)?;
+    Ok(snapshot_name)
+}
+
+fn logical_databases_match(left: &Path, right: &Path) -> Result<bool, ControllerStateError> {
+    let connection = Connection::open_with_flags(
+        left,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| migration_sql_error("opening a comparison snapshot", error))?;
+    connection
+        .execute(
+            "ATTACH DATABASE ?1 AS other",
+            [right.to_string_lossy().as_ref()],
+        )
+        .map_err(|error| migration_sql_error("attaching a comparison snapshot", error))?;
+    for table in [
+        "schema_version",
+        "sandboxes",
+        "operations",
+        "operation_events",
+    ] {
+        let sql = format!(
+            "SELECT EXISTS(SELECT * FROM main.{table} EXCEPT SELECT * FROM other.{table}) \
+             OR EXISTS(SELECT * FROM other.{table} EXCEPT SELECT * FROM main.{table})"
+        );
+        let differs: bool = connection
+            .query_row(&sql, [], |row| row.get(0))
+            .map_err(|error| migration_sql_error("comparing controller snapshots", error))?;
+        if differs {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn archive_legacy_state(
+    paths: &ControllerStatePaths,
+    controller: &ControllerDirectory,
+    legacy: &LegacyState,
+    fault: Option<MigrationFault>,
+) -> Result<(), ControllerStateError> {
+    let monitor = DatabaseMutationMonitor::new_for_legacy(legacy)?;
+    let backup_name = collision_free_backup_name(&controller.descriptor, paths.expected_uid)?;
+    copy_private_file(
+        &legacy.database.descriptor,
+        &controller.descriptor,
+        &backup_name,
+        "archiving the legacy database",
+    )?;
+    for (suffix, sidecar) in &legacy.sidecars {
+        copy_private_file(
+            &sidecar.descriptor,
+            &controller.descriptor,
+            &format!("{backup_name}{suffix}"),
+            "archiving a legacy SQLite sidecar",
+        )?;
+    }
+    rustix::fs::fsync(&controller.descriptor)
+        .map_err(|error| migration_fs_error("syncing the legacy archive", error))?;
+    monitor.ensure_unchanged()?;
+    validate_legacy_binding(paths, legacy)?;
+    let runtime = legacy.directories.last().ok_or_else(|| {
+        ControllerStateError::Invalid("legacy database has no parent descriptor".to_owned())
+    })?;
+    rustix::fs::unlinkat(runtime, DATABASE_NAME, AtFlags::empty())
+        .map_err(|error| migration_fs_error("removing the archived legacy database", error))?;
+    if fault == Some(MigrationFault::DuringLegacyArchive) {
+        rustix::fs::fsync(runtime)
+            .map_err(|error| migration_fs_error("syncing the legacy runtime directory", error))?;
+        return Err(injected_fault(MigrationFault::DuringLegacyArchive));
+    }
+    for suffix in legacy.sidecars.keys() {
+        rustix::fs::unlinkat(
+            runtime,
+            format!("{DATABASE_NAME}{suffix}"),
+            AtFlags::empty(),
+        )
+        .map_err(|error| migration_fs_error("removing an archived SQLite sidecar", error))?;
+    }
+    rustix::fs::fsync(runtime)
+        .map_err(|error| migration_fs_error("syncing the legacy runtime directory", error))?;
+    rustix::fs::fsync(&controller.descriptor)
+        .map_err(|error| migration_fs_error("syncing the durable archive directory", error))?;
+    Ok(())
+}
+
+fn archive_legacy_orphans(
+    paths: &ControllerStatePaths,
+    controller: &ControllerDirectory,
+    orphans: &LegacyOrphans,
+) -> Result<(), ControllerStateError> {
+    let monitor = DatabaseMutationMonitor::new_for_orphans(orphans)?;
+    let backup_name = collision_free_backup_name(&controller.descriptor, paths.expected_uid)?;
+    for (suffix, sidecar) in &orphans.sidecars {
+        copy_private_file(
+            &sidecar.descriptor,
+            &controller.descriptor,
+            &format!("{backup_name}{suffix}"),
+            "archiving an orphaned legacy SQLite sidecar",
+        )?;
+    }
+    rustix::fs::fsync(&controller.descriptor)
+        .map_err(|error| migration_fs_error("syncing orphaned legacy sidecars", error))?;
+    monitor.ensure_unchanged()?;
+    let runtime = orphans.directories.last().ok_or_else(|| {
+        ControllerStateError::Invalid("legacy database has no parent descriptor".to_owned())
+    })?;
+    for (suffix, sidecar) in &orphans.sidecars {
+        let name = format!("{DATABASE_NAME}{suffix}");
+        let stat = rustix::fs::statat(runtime, &name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| unsafe_error("orphaned legacy SQLite sidecar", error))?;
+        if validate_private_file_stat(&stat, paths.expected_uid, "orphaned legacy SQLite sidecar")?
+            != sidecar.identity
+        {
+            return Err(ControllerStateError::Unsafe(
+                "orphaned legacy SQLite sidecar changed during archival".to_owned(),
+            ));
+        }
+        rustix::fs::unlinkat(
+            runtime,
+            format!("{DATABASE_NAME}{suffix}"),
+            AtFlags::empty(),
+        )
+        .map_err(|error| migration_fs_error("removing an orphaned legacy SQLite sidecar", error))?;
+    }
+    rustix::fs::fsync(runtime)
+        .map_err(|error| migration_fs_error("syncing the legacy runtime directory", error))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -121,6 +577,409 @@ where
     mutation_monitor.ensure_unchanged()?;
     validate_database_binding(paths, &controller_directory, &database)?;
     Ok(store)
+}
+
+fn open_existing_controller_store(
+    paths: &ControllerStatePaths,
+) -> Result<Store, ControllerStateError> {
+    let controller_directory = open_existing_controller_directory(paths)?;
+    let database = open_named_private_database(
+        &controller_directory.descriptor,
+        DATABASE_NAME,
+        paths.expected_uid,
+        true,
+        "controller database",
+    )?;
+    let mutation_monitor = DatabaseMutationMonitor::new(&controller_directory, &database)?;
+    let store = match Store::open_no_follow(paths.durable_database()) {
+        Ok(store) => store,
+        Err(error) => {
+            mutation_monitor.ensure_unchanged()?;
+            validate_database_binding(paths, &controller_directory, &database)?;
+            return Err(error.into());
+        }
+    };
+    mutation_monitor.ensure_unchanged()?;
+    validate_database_binding(paths, &controller_directory, &database)?;
+    Ok(store)
+}
+
+fn open_existing_directory_chain(
+    path: &Path,
+) -> Result<Option<Vec<OwnedFd>>, ControllerStateError> {
+    let mut components = path.components();
+    if components.next() != Some(Component::RootDir) {
+        return Err(ControllerStateError::Invalid(
+            "directory path must be absolute".to_owned(),
+        ));
+    }
+    let root = rustix::fs::open(
+        "/",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| unsafe_error("root directory", error))?;
+    let mut directories = vec![root];
+    for component in components {
+        let Component::Normal(name) = component else {
+            return Err(ControllerStateError::Invalid(
+                "directory path contains a non-normal component".to_owned(),
+            ));
+        };
+        let parent = directories.last().ok_or_else(|| {
+            ControllerStateError::Invalid("directory traversal lost its parent".to_owned())
+        })?;
+        let directory = match rustix::fs::openat(
+            parent,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(directory) => directory,
+            Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
+            Err(error) => return Err(unsafe_error("directory path", error)),
+        };
+        directories.push(directory);
+    }
+    Ok(Some(directories))
+}
+
+fn private_regular_file_exists(
+    directory: &OwnedFd,
+    name: &str,
+    expected_uid: u32,
+    label: &str,
+) -> Result<bool, ControllerStateError> {
+    let stat = match rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(error) if error == rustix::io::Errno::NOENT => return Ok(false),
+        Err(error) => return Err(unsafe_error(label, error)),
+    };
+    validate_private_file_stat(&stat, expected_uid, label)?;
+    Ok(true)
+}
+
+fn entry_exists(directory: &OwnedFd, name: &str) -> Result<bool, ControllerStateError> {
+    match rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(_) => Ok(true),
+        Err(error) if error == rustix::io::Errno::NOENT => Ok(false),
+        Err(error) => Err(unsafe_error(name, error)),
+    }
+}
+
+fn open_named_private_database(
+    directory: &OwnedFd,
+    name: &str,
+    expected_uid: u32,
+    writable: bool,
+    label: &str,
+) -> Result<PrivateDatabase, ControllerStateError> {
+    let access = if writable {
+        OFlags::RDWR
+    } else {
+        OFlags::RDONLY
+    };
+    let descriptor = rustix::fs::openat(
+        directory,
+        name,
+        access | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| unsafe_error(label, error))?;
+    let stat = rustix::fs::fstat(&descriptor).map_err(|error| unsafe_error(label, error))?;
+    let identity = validate_private_file_stat(&stat, expected_uid, label)?;
+    Ok(PrivateDatabase {
+        descriptor,
+        identity,
+    })
+}
+
+fn open_private_sidecars(
+    directory: &OwnedFd,
+    database_name: &str,
+    expected_uid: u32,
+) -> Result<BTreeMap<String, PrivateDatabase>, ControllerStateError> {
+    let mut sidecars = BTreeMap::new();
+    for suffix in ["-wal", "-shm"] {
+        let name = format!("{database_name}{suffix}");
+        if private_regular_file_exists(directory, &name, expected_uid, "SQLite sidecar")? {
+            sidecars.insert(
+                suffix.to_owned(),
+                open_named_private_database(
+                    directory,
+                    &name,
+                    expected_uid,
+                    false,
+                    "SQLite sidecar",
+                )?,
+            );
+        }
+    }
+    Ok(sidecars)
+}
+
+fn validate_private_file_stat(
+    stat: &rustix::fs::Stat,
+    expected_uid: u32,
+    label: &str,
+) -> Result<DatabaseIdentity, ControllerStateError> {
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+        || stat.st_uid != expected_uid
+        || stat.st_nlink != 1
+        || u32::from(Mode::from_raw_mode(stat.st_mode).bits() & 0o7777) != FILE_MODE
+    {
+        return Err(ControllerStateError::Unsafe(format!(
+            "{label} ownership, type, links, or mode is unsafe"
+        )));
+    }
+    Ok(DatabaseIdentity {
+        device: stat.st_dev as u64,
+        inode: stat.st_ino,
+    })
+}
+
+fn copy_private_file(
+    source: &OwnedFd,
+    destination_directory: &OwnedFd,
+    destination_name: &str,
+    context: &str,
+) -> Result<(), ControllerStateError> {
+    let destination = create_private_file(destination_directory, destination_name, context)?;
+    let source_copy = rustix::io::dup(source)
+        .map_err(|error| migration_fs_error("duplicating a migration source descriptor", error))?;
+    let mut source_file = File::from(source_copy);
+    let mut destination_file = File::from(destination);
+    io::copy(&mut source_file, &mut destination_file)
+        .map_err(|error| ControllerStateError::Migration(format!("{context}: {error}")))?;
+    destination_file
+        .sync_all()
+        .map_err(|error| ControllerStateError::Migration(format!("{context}: {error}")))?;
+    Ok(())
+}
+
+fn create_private_file(
+    directory: &OwnedFd,
+    name: &str,
+    context: &str,
+) -> Result<OwnedFd, ControllerStateError> {
+    let file = rustix::fs::openat(
+        directory,
+        name,
+        OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(FILE_MODE as u16),
+    )
+    .map_err(|error| migration_fs_error(context, error))?;
+    rustix::fs::fchmod(&file, Mode::from_raw_mode(FILE_MODE as u16))
+        .map_err(|error| migration_fs_error(context, error))?;
+    Ok(file)
+}
+
+fn next_temp_sequence(directory: &OwnedFd) -> Result<u32, ControllerStateError> {
+    for sequence in 0..u32::MAX {
+        let source = format!("{TEMP_PREFIX}source-{sequence}");
+        let snapshot = format!("{TEMP_PREFIX}snapshot-{sequence}");
+        if !entry_exists(directory, &source)?
+            && !entry_exists(directory, &format!("{source}-wal"))?
+            && !entry_exists(directory, &format!("{source}-shm"))?
+            && !entry_exists(directory, &snapshot)?
+            && !entry_exists(directory, &format!("{snapshot}-wal"))?
+            && !entry_exists(directory, &format!("{snapshot}-shm"))?
+        {
+            return Ok(sequence);
+        }
+    }
+    Err(ControllerStateError::Migration(
+        "no collision-free migration temporary name is available".to_owned(),
+    ))
+}
+
+fn cleanup_migration_temps(
+    controller: &ControllerDirectory,
+    expected_uid: u32,
+) -> Result<(), ControllerStateError> {
+    let mut directory = rustix::fs::Dir::read_from(&controller.descriptor)
+        .map_err(|error| unsafe_error("controller directory", error))?;
+    let mut names = Vec::new();
+    for entry in &mut directory {
+        let entry = entry.map_err(|error| unsafe_error("controller directory entry", error))?;
+        let name = OsStr::from_bytes(entry.file_name().to_bytes());
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if exact_migration_temp_name(name) {
+            let stat = rustix::fs::statat(&controller.descriptor, name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|error| unsafe_error("migration temporary file", error))?;
+            validate_private_file_stat(&stat, expected_uid, "migration temporary file")?;
+            names.push(name.to_owned());
+        }
+    }
+    for name in names {
+        rustix::fs::unlinkat(&controller.descriptor, name, AtFlags::empty())
+            .map_err(|error| unsafe_error("migration temporary file", error))?;
+    }
+    rustix::fs::fsync(&controller.descriptor)
+        .map_err(|error| migration_fs_error("syncing migration cleanup", error))?;
+    Ok(())
+}
+
+fn exact_migration_temp_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(TEMP_PREFIX) else {
+        return false;
+    };
+    let rest = rest
+        .strip_suffix("-wal")
+        .or_else(|| rest.strip_suffix("-shm"))
+        .unwrap_or(rest);
+    ["source-", "snapshot-"].iter().any(|prefix| {
+        rest.strip_prefix(prefix).is_some_and(|number| {
+            !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    })
+}
+
+fn remove_temp_family(directory: &OwnedFd, base: &str) -> Result<(), ControllerStateError> {
+    for name in [
+        base.to_owned(),
+        format!("{base}-wal"),
+        format!("{base}-shm"),
+    ] {
+        match rustix::fs::unlinkat(directory, &name, AtFlags::empty()) {
+            Ok(()) => {}
+            Err(error) if error == rustix::io::Errno::NOENT => {}
+            Err(error) => return Err(migration_fs_error("removing staged state", error)),
+        }
+    }
+    Ok(())
+}
+
+fn collision_free_backup_name(
+    directory: &OwnedFd,
+    expected_uid: u32,
+) -> Result<String, ControllerStateError> {
+    for sequence in 0..u32::MAX {
+        let name = if sequence == 0 {
+            LEGACY_BACKUP_NAME.to_owned()
+        } else {
+            format!("{LEGACY_BACKUP_NAME}.{sequence}")
+        };
+        let mut collision = false;
+        for candidate in [name.clone(), format!("{name}-wal"), format!("{name}-shm")] {
+            if private_regular_file_exists(
+                directory,
+                &candidate,
+                expected_uid,
+                "legacy migration backup",
+            )? {
+                collision = true;
+            }
+        }
+        if !collision {
+            return Ok(name);
+        }
+    }
+    Err(ControllerStateError::Migration(
+        "no collision-free legacy backup name is available".to_owned(),
+    ))
+}
+
+fn controller_path(paths: &ControllerStatePaths, name: &str) -> PathBuf {
+    paths
+        .durable_database()
+        .parent()
+        .unwrap_or_else(|| Path::new("/"))
+        .join(name)
+}
+
+fn validate_named_database_binding(
+    paths: &ControllerStatePaths,
+    directory: &ControllerDirectory,
+    database: &PrivateDatabase,
+    name: &str,
+) -> Result<(), ControllerStateError> {
+    let stat = rustix::fs::statat(&directory.descriptor, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| unsafe_error("controller database", error))?;
+    if validate_private_file_stat(&stat, paths.expected_uid, "controller database")?
+        != database.identity
+    {
+        return Err(ControllerStateError::Unsafe(
+            "controller database path changed during migration".to_owned(),
+        ));
+    }
+    let current = open_existing_controller_directory(paths)?;
+    let stat = rustix::fs::statat(&current.descriptor, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| unsafe_error("controller database", error))?;
+    if validate_private_file_stat(&stat, paths.expected_uid, "controller database")?
+        != database.identity
+    {
+        return Err(ControllerStateError::Unsafe(
+            "controller directory identity changed during migration".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_legacy_binding(
+    paths: &ControllerStatePaths,
+    legacy: &LegacyState,
+) -> Result<(), ControllerStateError> {
+    let current =
+        open_existing_directory_chain(paths.legacy_database().parent().ok_or_else(|| {
+            ControllerStateError::Invalid("legacy database has no parent".to_owned())
+        })?)?
+        .ok_or_else(|| {
+            ControllerStateError::Unsafe(
+                "legacy database directory changed during migration".to_owned(),
+            )
+        })?;
+    let current_parent = current.last().ok_or_else(|| {
+        ControllerStateError::Unsafe("legacy database directory is unavailable".to_owned())
+    })?;
+    let stat = rustix::fs::statat(current_parent, DATABASE_NAME, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| unsafe_error("legacy controller database", error))?;
+    if validate_private_file_stat(&stat, paths.expected_uid, "legacy controller database")?
+        != legacy.database.identity
+    {
+        return Err(ControllerStateError::Unsafe(
+            "legacy controller database identity changed during migration".to_owned(),
+        ));
+    }
+    for (suffix, sidecar) in &legacy.sidecars {
+        let name = format!("{DATABASE_NAME}{suffix}");
+        let descriptor_stat = rustix::fs::fstat(&sidecar.descriptor)
+            .map_err(|error| unsafe_error("legacy SQLite sidecar", error))?;
+        if validate_private_file_stat(
+            &descriptor_stat,
+            paths.expected_uid,
+            "legacy SQLite sidecar",
+        )? != sidecar.identity
+        {
+            return Err(ControllerStateError::Unsafe(
+                "legacy SQLite sidecar descriptor changed during migration".to_owned(),
+            ));
+        }
+        let path_stat = rustix::fs::statat(current_parent, &name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| unsafe_error("legacy SQLite sidecar", error))?;
+        if validate_private_file_stat(&path_stat, paths.expected_uid, "legacy SQLite sidecar")?
+            != sidecar.identity
+        {
+            return Err(ControllerStateError::Unsafe(
+                "legacy SQLite sidecar identity changed during migration".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn injected_fault(fault: MigrationFault) -> ControllerStateError {
+    ControllerStateError::Migration(format!("injected fault at {fault:?}"))
+}
+
+fn migration_fs_error(context: &str, error: rustix::io::Errno) -> ControllerStateError {
+    ControllerStateError::Migration(format!("{context}: {error}"))
+}
+
+fn migration_sql_error(context: &str, error: rusqlite::Error) -> ControllerStateError {
+    ControllerStateError::Migration(format!("{context}: {error}"))
 }
 
 fn validate_absolute_normal_path(path: &Path, label: &str) -> Result<(), ControllerStateError> {
@@ -354,6 +1213,32 @@ impl DatabaseMutationMonitor {
         directory: &ControllerDirectory,
         database: &PrivateDatabase,
     ) -> Result<Self, ControllerStateError> {
+        Self::new_for_controller_files(directory, &[database])
+    }
+
+    fn new_for_controller_files(
+        directory: &ControllerDirectory,
+        databases: &[&PrivateDatabase],
+    ) -> Result<Self, ControllerStateError> {
+        let mut descriptors = directory.descriptors().to_vec();
+        descriptors.extend(databases.iter().map(|database| &database.descriptor));
+        Self::from_descriptors(&descriptors)
+    }
+
+    fn new_for_legacy(legacy: &LegacyState) -> Result<Self, ControllerStateError> {
+        let mut descriptors = legacy.directories.last().into_iter().collect::<Vec<_>>();
+        descriptors.push(&legacy.database.descriptor);
+        descriptors.extend(legacy.sidecars.values().map(|sidecar| &sidecar.descriptor));
+        Self::from_descriptors(&descriptors)
+    }
+
+    fn new_for_orphans(orphans: &LegacyOrphans) -> Result<Self, ControllerStateError> {
+        let mut descriptors = orphans.directories.last().into_iter().collect::<Vec<_>>();
+        descriptors.extend(orphans.sidecars.values().map(|sidecar| &sidecar.descriptor));
+        Self::from_descriptors(&descriptors)
+    }
+
+    fn from_descriptors(descriptors: &[&OwnedFd]) -> Result<Self, ControllerStateError> {
         let queue = Kqueue::new().map_err(|error| {
             ControllerStateError::Unsafe(format!(
                 "controller database identity monitor could not be created: {error}"
@@ -363,8 +1248,8 @@ impl DatabaseMutationMonitor {
             | FilterFlag::NOTE_RENAME
             | FilterFlag::NOTE_LINK
             | FilterFlag::NOTE_REVOKE;
-        let mut changes = Vec::with_capacity(6);
-        for descriptor in directory.descriptors() {
+        let mut changes = Vec::with_capacity(descriptors.len());
+        for descriptor in descriptors {
             changes.push(KEvent::new(
                 descriptor.as_raw_fd() as usize,
                 EventFilter::EVFILT_VNODE,
@@ -374,14 +1259,6 @@ impl DatabaseMutationMonitor {
                 0,
             ));
         }
-        changes.push(KEvent::new(
-            database.descriptor.as_raw_fd() as usize,
-            EventFilter::EVFILT_VNODE,
-            EvFlags::EV_ADD | EvFlags::EV_ENABLE | EvFlags::EV_CLEAR,
-            identity_events,
-            0,
-            0,
-        ));
         let event_capacity = changes.len();
         let mut events = [];
         queue
@@ -447,6 +1324,21 @@ impl DatabaseMutationMonitor {
         _directory: &ControllerDirectory,
         _database: &PrivateDatabase,
     ) -> Result<Self, ControllerStateError> {
+        Ok(Self)
+    }
+
+    const fn new_for_controller_files(
+        _directory: &ControllerDirectory,
+        _databases: &[&PrivateDatabase],
+    ) -> Result<Self, ControllerStateError> {
+        Ok(Self)
+    }
+
+    const fn new_for_legacy(_legacy: &LegacyState) -> Result<Self, ControllerStateError> {
+        Ok(Self)
+    }
+
+    const fn new_for_orphans(_orphans: &LegacyOrphans) -> Result<Self, ControllerStateError> {
         Ok(Self)
     }
 
@@ -577,19 +1469,7 @@ fn validate_database_stat(
     stat: &rustix::fs::Stat,
     expected_uid: u32,
 ) -> Result<DatabaseIdentity, ControllerStateError> {
-    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
-        || stat.st_uid != expected_uid
-        || stat.st_nlink != 1
-        || u32::from(Mode::from_raw_mode(stat.st_mode).bits() & 0o7777) != FILE_MODE
-    {
-        return Err(ControllerStateError::Unsafe(
-            "controller database ownership, type, links, or mode is unsafe".to_owned(),
-        ));
-    }
-    Ok(DatabaseIdentity {
-        device: stat.st_dev as u64,
-        inode: stat.st_ino,
-    })
+    validate_private_file_stat(stat, expected_uid, "controller database")
 }
 
 fn unsafe_error(context: &str, error: rustix::io::Errno) -> ControllerStateError {

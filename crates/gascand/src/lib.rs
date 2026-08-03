@@ -39,7 +39,10 @@ pub use api::{
     ActivityLease, ActivityTracker, ApiEventStream, Daemon, DaemonConfig, ErrorDiagnostics,
     OperationLease, SandboxApi,
 };
-pub use controller_state::{ControllerStateError, ControllerStatePaths, open_controller_store};
+pub use controller_state::{
+    ControllerStateError, ControllerStatePaths, MigrationFault, open_controller_store,
+    open_controller_store_with_fault,
+};
 pub use doctor::{SshDoctorFacts, ssh_doctor_facts, ssh_doctor_facts_for_paths};
 pub use socket::{OwnedSocket, PeerUid, PeerUidMismatch, SocketPaths, validate_peer_uid};
 pub use ssh::{
