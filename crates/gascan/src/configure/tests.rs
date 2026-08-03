@@ -1,12 +1,14 @@
 use super::{
-    ConfigureError, ConfigureIo, Forge, GitProtocol, GitRequest, HostAccount, HostDiscovery,
-    Prompter, SystemHostDiscovery, TerminalPrompter, configure_git, configure_ssh_host,
+    ConfigureError, ConfigureIo, ConfigurePalette, Forge, GitProtocol, GitRequest, HostAccount,
+    HostDiscovery, Prompter, SystemHostDiscovery, TerminalPrompter, configure_git,
+    configure_ssh_host,
 };
 use crate::{
     cli::CliError,
     guest::{
         GuestCommand, GuestOutput, GuestRunner, Secret, SensitiveDropKind, SensitiveDropObserver,
     },
+    presentation::OutputCapabilities,
 };
 use gascan_proto::v1;
 use std::collections::VecDeque;
@@ -657,6 +659,87 @@ fn read_available(controller: &mut fs::File) -> std::io::Result<Vec<u8>> {
     }
     rustix::fs::fcntl_setfl(&*controller, original)?;
     Ok(output)
+}
+
+#[test]
+fn configure_palette_styles_semantic_messages() {
+    let palette = ConfigurePalette::new(OutputCapabilities::test(true, true, true));
+    assert!(palette.heading("Git").contains("\x1b["));
+    assert!(palette.success("Git configured").contains("✓"));
+    assert!(palette.warning("GitLab skipped").contains("\x1b["));
+}
+
+#[test]
+fn configure_palette_plain_mode_has_no_ansi_or_unicode_symbols() {
+    let palette = ConfigurePalette::new(OutputCapabilities::test(true, false, false));
+    for rendered in [
+        palette.heading("Git"),
+        palette.success("Git configured"),
+        palette.failure("Authentication failed"),
+    ] {
+        assert!(!rendered.contains("\x1b["));
+        assert!(!rendered.contains('✓'));
+        assert!(!rendered.contains('✗'));
+    }
+}
+
+#[test]
+fn terminal_prompter_styles_prompts() -> TestResult {
+    for (capabilities, styled) in [
+        (OutputCapabilities::test(true, false, true), false),
+        (OutputCapabilities::test(true, true, true), true),
+    ] {
+        let pty = rustix_openpty::openpty(None, None)?;
+        let input = duplicate_file(&pty.user)?;
+        let output = duplicate_file(&pty.user)?;
+        let error = duplicate_file(&pty.user)?;
+        let mut controller = duplicate_file(&pty.controller)?;
+        let mut prompt = TerminalPrompter::from_files_with_capabilities(
+            input,
+            output,
+            error,
+            OutputCapabilities::test(true, false, true),
+            capabilities,
+        );
+        let reader = std::thread::spawn(move || prompt.line("Name: ", None));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        controller.write_all(b"Ada\n")?;
+        assert_eq!(
+            reader
+                .join()
+                .map_err(|_| "line reader panicked")??
+                .as_deref(),
+            Some("Ada")
+        );
+        let rendered = String::from_utf8(read_available(&mut controller)?)?;
+        assert!(rendered.contains("Name: "));
+        assert_eq!(rendered.contains("\x1b[36m"), styled);
+    }
+    Ok(())
+}
+
+#[test]
+fn no_color_disables_configure_palette() -> TestResult {
+    const CHILD_MARKER: &str = "GASCAN_CONFIGURE_NO_COLOR_CHILD";
+
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        let palette = ConfigurePalette::new(OutputCapabilities::for_stderr());
+        assert!(!palette.prompt("Name: ").contains("\x1b["));
+        return Ok(());
+    }
+
+    let status = std::process::Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "configure::tests::no_color_disables_configure_palette",
+            "--nocapture",
+        ])
+        .env(CHILD_MARKER, "1")
+        .env("NO_COLOR", "1")
+        .env("CLICOLOR_FORCE", "1")
+        .status()?;
+    assert!(status.success());
+    Ok(())
 }
 
 fn pty_prompter(pty: &rustix_openpty::Pty) -> std::io::Result<(TerminalPrompter, fs::File)> {

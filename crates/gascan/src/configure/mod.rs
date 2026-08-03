@@ -14,6 +14,8 @@ pub(crate) use onboarding::{
     ConfigureOutcome, OfferResult, configure_all, configure_forge_interactive,
     configure_git_interactive, offer_after_up,
 };
+#[cfg(test)]
+pub(crate) use prompt::ConfigurePalette;
 pub(crate) use prompt::TerminalPrompter;
 
 use crate::guest::Secret;
@@ -55,6 +57,27 @@ pub(crate) trait Prompter {
 pub(crate) trait ConfigureIo: Prompter {
     fn write_out(&mut self, text: &str) -> Result<(), ConfigureError>;
     fn write_err(&mut self, text: &str) -> Result<(), ConfigureError>;
+
+    fn write_heading(&mut self, text: &str) -> Result<(), ConfigureError> {
+        self.write_err(text)
+    }
+
+    fn write_hint(&mut self, text: &str) -> Result<(), ConfigureError> {
+        self.write_err(text)
+    }
+
+    fn write_success(&mut self, text: &str) -> Result<(), ConfigureError> {
+        self.write_out(text)
+    }
+
+    fn write_warning(&mut self, text: &str) -> Result<(), ConfigureError> {
+        self.write_err(text)
+    }
+
+    fn write_failure(&mut self, text: &str) -> Result<(), ConfigureError> {
+        self.write_err(text)
+    }
+
     fn stdin_is_terminal(&self) -> bool;
     fn stderr_is_terminal(&self) -> bool;
 }

@@ -58,7 +58,7 @@ pub(super) async fn offer_after_up_with<R: GuestRunner, H: HostDiscovery + ?Size
     };
     if !accepted {
         decline_receipt(runner, selector).await?;
-        io.write_err("Run 'gascan configure' whenever you are ready.\n")?;
+        io.write_hint("Run 'gascan configure' whenever you are ready.\n")?;
         return Ok(OfferResult::Declined);
     }
     Ok(
@@ -111,12 +111,12 @@ async fn configure_all_inner<R: GuestRunner, H: HostDiscovery + ?Sized>(
     discovery: &H,
     io: &mut dyn ConfigureIo,
 ) -> Result<ConfigureOutcome, ConfigureError> {
-    io.write_err("Git\n")?;
+    io.write_heading("Git\n")?;
     let current = current_git_setup(runner, selector.clone()).await?;
     let defaults = match discovery.git_defaults() {
         Ok(defaults) => defaults,
         Err(_) => {
-            io.write_err("Host Git defaults were unavailable; enter values manually.\n")?;
+            io.write_hint("Host Git defaults were unavailable; enter values manually.\n")?;
             GitDefaults {
                 name: None,
                 email: None,
@@ -129,7 +129,7 @@ async fn configure_all_inner<R: GuestRunner, H: HostDiscovery + ?Sized>(
     match has_default_route(runner, selector.clone()).await {
         Ok(true) => {}
         Ok(false) => {
-            io.write_err(
+            io.write_warning(
                 "Remote setup skipped: this sandbox has no usable default route; set network = \"networked\" and retry.\n",
             )?;
             let github = RemoteSummary::Skipped(" (offline)");
@@ -138,7 +138,7 @@ async fn configure_all_inner<R: GuestRunner, H: HostDiscovery + ?Sized>(
             return Ok(ConfigureOutcome::Partial);
         }
         Err(_) => {
-            io.write_err(
+            io.write_warning(
                 "Remote setup paused because the default route probe failed; Git setup was retained. Retry with `gascan configure gh` and `gascan configure glab`.\n",
             )?;
             let github = RemoteSummary::Skipped(" (route probe failed; retry available)");
@@ -168,7 +168,7 @@ pub(crate) async fn configure_git_interactive<R: GuestRunner, H: HostDiscovery +
     io: &mut dyn ConfigureIo,
 ) -> Result<ConfigureOutcome, ConfigureError> {
     let result = async {
-        io.write_err("Git\n")?;
+        io.write_heading("Git\n")?;
         let current = current_git_setup(runner, selector.clone()).await?;
         let defaults = discovery.git_defaults().unwrap_or(GitDefaults {
             name: None,
@@ -388,7 +388,7 @@ fn show_git_state(
     defaults: &GitDefaults,
 ) -> Result<(), ConfigureError> {
     if let Some(current) = current {
-        io.write_err(&format!(
+        io.write_hint(&format!(
             "Current: {} <{}>; protocol {}; fingerprint {}\n",
             current.name,
             current.email,
@@ -396,10 +396,10 @@ fn show_git_state(
             current.fingerprint
         ))?;
     } else {
-        io.write_err("Current: not configured\n")?;
+        io.write_hint("Current: not configured\n")?;
     }
     if defaults.name.is_some() || defaults.email.is_some() {
-        io.write_err(&format!(
+        io.write_hint(&format!(
             "Host defaults: {} <{}>\n",
             defaults.name.as_deref().unwrap_or("not set"),
             defaults.email.as_deref().unwrap_or("not set")
@@ -449,7 +449,7 @@ async fn configure_remote_section<R: GuestRunner, H: HostDiscovery + ?Sized>(
     git: &GitSetup,
 ) -> Result<(RemoteSummary, bool), ConfigureError> {
     let name = forge_name(forge);
-    io.write_err(&format!("{name}\n"))?;
+    io.write_heading(&format!("{name}\n"))?;
     let credential = choose_forge_credential(discovery, io, forge)?;
     let (hostname, token) = match credential {
         ForgeCredentialChoice::Imported { hostname, token }
@@ -479,7 +479,7 @@ fn choose_forge_credential<H: HostDiscovery + ?Sized>(
     let accounts = match discovery.accounts(forge) {
         Ok(accounts) => accounts,
         Err(_) => {
-            io.write_err("Host account import was unavailable.\n")?;
+            io.write_hint("Host account import was unavailable.\n")?;
             Vec::new()
         }
     };
@@ -507,9 +507,9 @@ fn choose_forge_credential<H: HostDiscovery + ?Sized>(
             }
         }
         count => {
-            io.write_err(&format!("Available {} accounts:\n", forge_name(forge)))?;
+            io.write_hint(&format!("Available {} accounts:\n", forge_name(forge)))?;
             for (index, account) in accounts.iter().enumerate() {
-                io.write_err(&format!(
+                io.write_hint(&format!(
                     "  {}. {} at {}\n",
                     index + 1,
                     account.login.as_deref().unwrap_or("unknown account"),
@@ -551,7 +551,7 @@ fn import_credential<H: HostDiscovery + ?Sized>(
             token,
         }),
         Err(_) => {
-            io.write_err("Host token import was unavailable; enter a token manually instead.\n")?;
+            io.write_hint("Host token import was unavailable; enter a token manually instead.\n")?;
             offer_manual_credential(io, forge, account.hostname.clone())
         }
     }
@@ -614,7 +614,7 @@ fn remote_result(
             message,
             retry,
         }) => {
-            io.write_err(&format!(
+            io.write_failure(&format!(
                 "{category} for {hostname} failed: {message}; retry with `{retry}`\n"
             ))?;
             Ok((
@@ -635,18 +635,18 @@ fn write_summary(
     github: &RemoteSummary,
     gitlab: &RemoteSummary,
 ) -> Result<(), ConfigureError> {
-    io.write_out("Summary\n")?;
+    io.write_heading("Summary\n")?;
     if let Some(git) = git {
         write_git_summary(io, git)?;
     } else {
-        io.write_out("Git: skipped\n")?;
+        io.write_warning("Git: skipped\n")?;
     }
     write_remote_summary(io, Forge::GitHub, github)?;
     write_remote_summary(io, Forge::GitLab, gitlab)
 }
 
 fn write_git_summary(io: &mut dyn ConfigureIo, git: &GitSetup) -> Result<(), ConfigureError> {
-    io.write_out(&format!(
+    io.write_success(&format!(
         "Git: {} <{}>; protocol {}; fingerprint {}\n",
         git.name,
         git.email,
@@ -662,8 +662,8 @@ fn write_remote_summary(
 ) -> Result<(), ConfigureError> {
     let name = forge_name(forge);
     match summary {
-        RemoteSummary::Skipped(reason) => io.write_out(&format!("{name}: skipped{reason}\n")),
-        RemoteSummary::Setup { setup, protocol } => io.write_out(&format!(
+        RemoteSummary::Skipped(reason) => io.write_warning(&format!("{name}: skipped{reason}\n")),
+        RemoteSummary::Setup { setup, protocol } => io.write_success(&format!(
             "{name}: {} at {}; protocol {}; authentication {}; authentication key {}; signing key {}\n",
             setup.login,
             setup.hostname,

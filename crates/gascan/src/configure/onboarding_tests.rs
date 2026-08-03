@@ -158,6 +158,7 @@ impl HostDiscovery for FakeDiscovery {
 
 struct FakeIo {
     confirms: VecDeque<Result<bool, ConfigureError>>,
+    confirm_defaults: Vec<bool>,
     lines: VecDeque<Result<Option<String>, ConfigureError>>,
     secrets: VecDeque<Result<Option<Vec<u8>>, ConfigureError>>,
     stdout: String,
@@ -171,6 +172,7 @@ impl FakeIo {
     fn interactive(events: Arc<Mutex<Vec<String>>>) -> Self {
         Self {
             confirms: VecDeque::new(),
+            confirm_defaults: Vec::new(),
             lines: VecDeque::new(),
             secrets: VecDeque::new(),
             stdout: String::new(),
@@ -206,7 +208,8 @@ impl FakeIo {
 }
 
 impl Prompter for FakeIo {
-    fn confirm(&mut self, prompt: &str, _default: bool) -> Result<bool, ConfigureError> {
+    fn confirm(&mut self, prompt: &str, default: bool) -> Result<bool, ConfigureError> {
+        self.confirm_defaults.push(default);
         self.event(format!("confirm:{prompt}"))?;
         self.confirms
             .pop_front()
@@ -728,13 +731,15 @@ async fn aggregate_accepts_and_edits_host_defaults_with_ssh_default_and_explicit
     assert!(io.stdout.contains("Ada Lovelace"));
     assert!(io.stderr.contains("ada@old.test"));
     assert!(io.stdout.contains(FINGERPRINT));
-    assert!(io.stdout.contains("GitHub: skipped"));
-    assert!(io.stdout.contains("GitLab: skipped"));
+    assert!(io.stderr.contains("GitHub: skipped"));
+    assert!(io.stderr.contains("GitLab: skipped"));
     assert_eq!(
         io.stdout,
-        format!(
-            "Summary\nGit: Ada Lovelace <ada@example.test>; protocol ssh; fingerprint {FINGERPRINT}\nGitHub: skipped\nGitLab: skipped\n"
-        )
+        format!("Git: Ada Lovelace <ada@example.test>; protocol ssh; fingerprint {FINGERPRINT}\n")
+    );
+    assert!(
+        io.stderr
+            .contains("Summary\nGitHub: skipped\nGitLab: skipped\n")
     );
     assert!(io.stderr.lines().any(|line| line == "Git"));
     assert!(io.stderr.lines().any(|line| line == "GitHub"));
@@ -742,6 +747,8 @@ async fn aggregate_accepts_and_edits_host_defaults_with_ssh_default_and_explicit
     assert!(!io.stdout.contains(PUBLIC_KEY));
     assert!(!io.stdout.contains(SENTINEL));
     assert!(!io.stderr.contains(SENTINEL));
+    assert!(!io.stdout.contains("\x1b["));
+    assert!(!io.stderr.contains("\x1b["));
     Ok(())
 }
 
@@ -1127,8 +1134,8 @@ async fn offline_route_skips_remote_sections_without_changing_protocol_or_receip
     );
     assert!(discovery.account_calls.borrow().is_empty());
     assert!(io.stderr.contains("network = \"networked\""));
-    assert!(io.stdout.contains("GitHub: skipped (offline)"));
-    assert!(io.stdout.contains("GitLab: skipped (offline)"));
+    assert!(io.stderr.contains("GitHub: skipped (offline)"));
+    assert!(io.stderr.contains("GitLab: skipped (offline)"));
     Ok(())
 }
 
@@ -1298,6 +1305,7 @@ async fn existing_git_configuration_is_kept_without_mutation() -> TestResult {
 
     assert_eq!(outcome, ConfigureOutcome::Completed);
     assert_eq!(runner.commands.len(), 1);
+    assert_eq!(io.confirm_defaults, [true]);
     let events = events.lock().map_err(|_| "event log poisoned")?;
     assert!(
         events
@@ -1592,8 +1600,8 @@ async fn multiple_forge_accounts_skip_selection_avoids_forge_commands_and_comple
     let events = events.lock().map_err(|_| "event log poisoned")?;
     assert!(events.iter().all(|event| !event.starts_with("token:")));
     assert!(events.iter().all(|event| event != "secret:GitHub token: "));
-    assert!(io.stdout.contains("GitHub: skipped"));
-    assert!(io.stdout.contains("GitLab: skipped"));
+    assert!(io.stderr.contains("GitHub: skipped"));
+    assert!(io.stderr.contains("GitLab: skipped"));
     Ok(())
 }
 
@@ -1628,8 +1636,8 @@ async fn no_forge_account_offers_default_no_manual_configuration() -> TestResult
     );
     assert!(events.iter().all(|event| event != "secret:GitHub token: "));
     assert_eq!(runner.commands.len(), 3);
-    assert!(io.stdout.contains("GitHub: skipped"));
-    assert!(io.stdout.contains("GitLab: skipped"));
+    assert!(io.stderr.contains("GitHub: skipped"));
+    assert!(io.stderr.contains("GitLab: skipped"));
     Ok(())
 }
 
