@@ -3,8 +3,10 @@ use crate::client::Client;
 use crate::terminal::RawTerminal;
 use gascan_proto::v1;
 use std::fmt;
-use std::io::{IsTerminal as _, Write as _};
+use std::io::IsTerminal as _;
 use std::os::fd::AsFd as _;
+use std::os::unix::ffi::OsStrExt as _;
+use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio_stream::Stream;
@@ -438,6 +440,23 @@ impl CancellableInput {
         Self::from_fd(std::io::stdin())
     }
 
+    fn terminal() -> std::io::Result<Self> {
+        let stdin = std::io::stdin();
+        let name = rustix::termios::ttyname(stdin.as_fd(), Vec::new())?;
+        Self::from_terminal_path(Path::new(std::ffi::OsStr::from_bytes(name.to_bytes())))
+    }
+
+    fn from_terminal_path(path: &Path) -> std::io::Result<Self> {
+        let flags =
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC;
+        let fd = rustix::fs::open(path, flags, rustix::fs::Mode::empty())?;
+        let original_flags = rustix::fs::fcntl_getfl(&fd)?;
+        let fd = RestoringFd { fd, original_flags };
+        Ok(Self {
+            fd: tokio::io::unix::AsyncFd::new(fd)?,
+        })
+    }
+
     fn from_fd(fd: impl std::os::fd::AsFd) -> std::io::Result<Self> {
         let fd = rustix::io::dup(fd)?;
         let original_flags = rustix::fs::fcntl_getfl(&fd)?;
@@ -496,6 +515,37 @@ async fn drive_input_until_attach<T>(
     }
 }
 
+async fn write_host_output(fd: impl std::os::fd::AsFd, bytes: &[u8]) -> std::io::Result<()> {
+    let fd = rustix::io::dup(fd)?;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match rustix::io::write(&fd, &bytes[offset..]).map_err(std::io::Error::from) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(count) => offset += count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => return Err(error),
+        }
+    }
+    if offset == bytes.len() {
+        return Ok(());
+    }
+    let fd = tokio::io::unix::AsyncFd::new(fd)?;
+    while offset < bytes.len() {
+        let mut writable = fd.writable().await?;
+        match writable.try_io(|fd| {
+            rustix::io::write(fd.get_ref(), &bytes[offset..]).map_err(std::io::Error::from)
+        }) {
+            Ok(Ok(0)) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(Ok(count)) => offset += count,
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => continue,
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn attach_to_stdio(
     client: &mut Client,
     token: Vec<u8>,
@@ -507,14 +557,19 @@ pub(crate) async fn attach_to_stdio(
     } else {
         None
     };
+    let terminal_input = if raw_terminal && stdin_is_tty {
+        Some(CancellableInput::terminal()?)
+    } else {
+        None
+    };
     let (input_sender, input_receiver) = tokio::sync::mpsc::channel(16);
     let producer: Option<Pin<Box<dyn std::future::Future<Output = ()> + Send>>> =
-        if raw_terminal && stdin_is_tty {
+        if let Some(stdin) = terminal_input {
             let producer = input_sender.clone();
             let producer_token = token.clone();
             let restore = terminal.as_ref().map(RawTerminal::restore_handle);
             Some(Box::pin(async move {
-                forward_terminal_input(producer, producer_token, restore).await;
+                forward_terminal_input(stdin, producer, producer_token, restore).await;
             }))
         } else if !stdin_is_tty {
             let producer = input_sender.clone();
@@ -542,12 +597,10 @@ pub(crate) async fn attach_to_stdio(
         while let Some(frame) = attached.message().await? {
             match frame.frame {
                 Some(v1::server_frame::Frame::Stdout(bytes)) => {
-                    std::io::stdout().write_all(&bytes)?;
-                    std::io::stdout().flush()?;
+                    write_host_output(std::io::stdout(), &bytes).await?;
                 }
                 Some(v1::server_frame::Frame::Stderr(bytes)) => {
-                    std::io::stderr().write_all(&bytes)?;
-                    std::io::stderr().flush()?;
+                    write_host_output(std::io::stderr(), &bytes).await?;
                 }
                 Some(v1::server_frame::Frame::Exit(exit)) => return Ok(exit.code),
                 Some(v1::server_frame::Frame::Error(error)) => {
@@ -593,6 +646,7 @@ async fn forward_piped_input(sender: tokio::sync::mpsc::Sender<v1::ClientFrame>,
 }
 
 async fn forward_terminal_input(
+    stdin: CancellableInput,
     sender: tokio::sync::mpsc::Sender<v1::ClientFrame>,
     token: Vec<u8>,
     restore: Option<crate::terminal::TerminalRestore>,
@@ -628,18 +682,6 @@ async fn forward_terminal_input(
             Ok(signal) => signal,
             Err(_) => return,
         };
-    let stdin = match CancellableInput::stdin() {
-        Ok(stdin) => stdin,
-        Err(_) => {
-            let _ = sender
-                .send(v1::ClientFrame {
-                    frame: Some(v1::client_frame::Frame::Close(v1::Close {})),
-                    session_token: token,
-                })
-                .await;
-            return;
-        }
-    };
     let mut bytes = vec![0_u8; TERMINAL_INPUT_FRAME_BYTES];
     loop {
         let frame = tokio::select! {
@@ -687,7 +729,7 @@ async fn forward_terminal_input(
 mod tests {
     use super::{
         CancellableInput, ClientGuestRunner, GuestCommand, GuestRunner, Secret,
-        drive_input_until_attach,
+        drive_input_until_attach, write_host_output,
     };
     use crate::client::Client;
     use gascan_proto::v1;
@@ -710,6 +752,45 @@ mod tests {
         Pin<Box<dyn Stream<Item = Result<v1::OperationEvent, Status>> + Send + 'static>>;
     type FrameStream =
         Pin<Box<dyn Stream<Item = Result<v1::ServerFrame, Status>> + Send + 'static>>;
+
+    #[tokio::test]
+    async fn host_output_waits_for_nonblocking_capacity_without_losing_bytes() -> TestResult {
+        let (reader, writer) = rustix::pipe::pipe()?;
+        let flags = rustix::fs::fcntl_getfl(&writer)?;
+        rustix::fs::fcntl_setfl(&writer, flags | rustix::fs::OFlags::NONBLOCK)?;
+        let fill = vec![b'f'; 4096];
+        let mut filled = 0usize;
+        loop {
+            match rustix::io::write(&writer, &fill) {
+                Ok(count) => filled += count,
+                Err(rustix::io::Errno::AGAIN) => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let expected = vec![b'x'; 8192];
+        let task_writer = rustix::io::dup(&writer)?;
+        let task_payload = expected.clone();
+        let task = tokio::spawn(async move { write_host_output(task_writer, &task_payload).await });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+
+        let received = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+            let mut received = vec![0; filled + expected.len()];
+            let mut offset = 0;
+            while offset < received.len() {
+                let count = rustix::io::read(&reader, &mut received[offset..])?;
+                if count == 0 {
+                    return Err(std::io::ErrorKind::UnexpectedEof.into());
+                }
+                offset += count;
+            }
+            Ok(received)
+        });
+        task.await??;
+        let received = received.await??;
+        assert!(received[filled..].iter().all(|byte| *byte == b'x'));
+        Ok(())
+    }
 
     #[derive(Clone)]
     struct RpcFailure {
@@ -1002,6 +1083,22 @@ mod tests {
     fn assert_secret_absent(error: &crate::cli::CliError) {
         assert!(!error.to_string().contains(SENTINEL));
         assert!(!format!("{error:?}").contains(SENTINEL));
+    }
+
+    #[tokio::test]
+    async fn interactive_input_does_not_make_shared_pty_output_nonblocking() -> TestResult {
+        use std::os::unix::ffi::OsStrExt as _;
+        let pty = rustix_openpty::openpty(None, None)?;
+        let name = rustix::termios::ttyname(&pty.user, Vec::new())?;
+        let path = std::path::Path::new(std::ffi::OsStr::from_bytes(name.to_bytes()));
+        let output = rustix::io::dup(&pty.user)?;
+        let before = rustix::fs::fcntl_getfl(&output)?;
+
+        let _input = CancellableInput::from_terminal_path(path)?;
+
+        assert_eq!(rustix::fs::fcntl_getfl(&output)?, before);
+        assert!(!before.contains(rustix::fs::OFlags::NONBLOCK));
+        Ok(())
     }
 
     #[tokio::test]
