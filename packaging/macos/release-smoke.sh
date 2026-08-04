@@ -961,6 +961,12 @@ gascan_release_up
 gascan_stop_attested_daemon "$gascan_bin" "$gascand_bin"
 gascan_release_recreate_runtime_root
 "$gascan_bin" --sandbox "$sandbox_id" status --json >/dev/null
+post_recreation_marker=$("$gascan_bin" --sandbox "$sandbox_id" run -- \
+  bash -lc 'cat "$XDG_CONFIG_HOME/gascan-release-smoke/controller-state-marker"')
+[[ $post_recreation_marker == "$gascan_release_volume_marker" ]] || {
+  printf 'managed-volume marker did not survive daemon/runtime recreation\n' >&2
+  exit 1
+}
 "$gascan_bin" --sandbox "$sandbox_id" run -- true
 
 "$gascan_bin" --sandbox "$sandbox_id" destroy --yes

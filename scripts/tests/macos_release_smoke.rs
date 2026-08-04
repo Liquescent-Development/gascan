@@ -104,6 +104,28 @@ fn release_smoke_isolates_durable_controller_state_and_checks_destroyed_tombston
         !smoke.contains("\ncontroller_inventory=$(\"$gascan_bin\" list --json)"),
         "retained tombstone assertions must use list --all --json"
     );
+
+    let daemon_stop = smoke
+        .rfind("gascan_stop_attested_daemon \"$gascan_bin\" \"$gascand_bin\"")
+        .expect("release smoke omits tested daemon replacement");
+    let runtime_recreation = smoke[daemon_stop..]
+        .find("\ngascan_release_recreate_runtime_root\n")
+        .map(|index| daemon_stop + index)
+        .expect("release smoke omits runtime recreation after daemon stop");
+    let daemon_restart = smoke[runtime_recreation..]
+        .find("status --json >/dev/null")
+        .map(|index| runtime_recreation + index)
+        .expect("release smoke omits daemon restart after runtime recreation");
+    let marker_check = smoke[daemon_restart..]
+        .find("post_recreation_marker=")
+        .map(|index| daemon_restart + index)
+        .expect("release smoke omits marker check after runtime recreation");
+    assert!(daemon_stop < runtime_recreation);
+    assert!(runtime_recreation < daemon_restart);
+    assert!(daemon_restart < marker_check);
+    assert!(smoke[marker_check..].contains(
+        "[[ $post_recreation_marker == \"$gascan_release_volume_marker\" ]]"
+    ));
 }
 
 #[test]

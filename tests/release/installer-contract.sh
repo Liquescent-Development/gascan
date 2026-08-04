@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "$0")/../.." && pwd -P)
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/gascan-installer-contract.XXXXXX")
+fixture=$(cd "$fixture" && pwd -P)
 daemon_pid=
 cleanup() { if [[ -n $daemon_pid ]]; then /bin/kill "$daemon_pid" 2>/dev/null || true; fi; rm -rf "$fixture"; }
 trap cleanup EXIT
@@ -43,6 +44,22 @@ write_fake shasum 'printf "%s  %s\\n" "$FIXTURE_OBSERVED_HASH" "$3"'
 write_fake lipo 'echo "$FIXTURE_ARCHS"'
 write_fake sudo 'printf "sudo:%s\\n" "$*" >>"$FIXTURE_LOG"'
 write_fake realpath 'printf "%s\\n" "$1"'
+write_fake stat '
+[[ $1 == -f && $# == 3 ]]
+format=$2
+path=$3
+case $format in
+  %u)
+    if [[ -n ${FIXTURE_FOREIGN_STAT_PATH:-} && $path == "$FIXTURE_FOREIGN_STAT_PATH" ]]; then
+      printf "999999\\n"
+    else
+      /usr/bin/stat -f %u "$path"
+    fi
+    ;;
+  %Lp) /usr/bin/stat -f %Lp "$path";;
+  %d:%i) /usr/bin/stat -f %d:%i "$path";;
+  *) exit 64;;
+esac'
 write_fake ps '
 pid=$2; /bin/kill -0 "$pid" 2>/dev/null || exit 1
 printf "ps-env:%s:%s:%s\n" "${LC_ALL:-}" "${LANG:-}" "${TZ:-}" >>"$FIXTURE_LOG"
@@ -94,6 +111,57 @@ export FIXTURE_VERSION_JSON=$good_version FIXTURE_STATUS_JSON=$good_status
 "$repo_root/packaging/macos/install.sh" "$fixture/test.pkg" >/dev/null
 grep -qx "sudo:installer -pkg $fixture/test.pkg -target /" "$log"
 
+fixture_user_home=$fixture/uninstall-home
+fixture_runtime_base=$fixture/uninstall-runtime
+fixture_controller_root="$fixture_user_home/Library/Application Support/dev.gascan/controller"
+fixture_runtime_root=$fixture_runtime_base/gascan
+untargeted_user_home=$fixture/untargeted-home
+untargeted_runtime_base=$fixture/untargeted-runtime
+untargeted_controller_root="$untargeted_user_home/Library/Application Support/dev.gascan/controller"
+untargeted_runtime_root=$untargeted_runtime_base/gascan
+
+prepare_uninstall_roots() {
+  rm -rf "$fixture_user_home" "$fixture_runtime_base"
+  mkdir -p "$fixture_controller_root" "$fixture_runtime_root"
+  chmod 0700 \
+    "$fixture_user_home" \
+    "$fixture_user_home/Library" \
+    "$fixture_user_home/Library/Application Support" \
+    "$fixture_user_home/Library/Application Support/dev.gascan" \
+    "$fixture_controller_root" \
+    "$fixture_runtime_base" \
+    "$fixture_runtime_root"
+  printf 'fixture controller state\n' >"$fixture_controller_root/state.sqlite3"
+  printf 'fixture runtime state\n' >"$fixture_runtime_root/daemon-instance.json"
+}
+
+run_uninstall() {
+  env HOME="$fixture_user_home" XDG_RUNTIME_DIR="$fixture_runtime_base" \
+    "$repo_root/packaging/macos/uninstall.sh" "$@"
+}
+
+assert_untargeted_sentinels() {
+  [[ $(<"$untargeted_controller_root/developer-sentinel") == do-not-remove-controller ]]
+  [[ $(<"$untargeted_runtime_root/developer-sentinel") == do-not-remove-runtime ]]
+}
+
+prepare_uninstall_roots
+mkdir -p "$untargeted_controller_root" "$untargeted_runtime_root"
+printf 'do-not-remove-controller\n' >"$untargeted_controller_root/developer-sentinel"
+printf 'do-not-remove-runtime\n' >"$untargeted_runtime_root/developer-sentinel"
+# Even a future destructive invocation that bypasses run_uninstall remains
+# confined to test-owned roots rather than inheriting the developer's paths.
+export HOME=$untargeted_user_home XDG_RUNTIME_DIR=$untargeted_runtime_base
+
+export FIXTURE_DAEMON_PID=999999 FIXTURE_SANDBOX_JSON='[]' FIXTURE_ALL_SANDBOX_JSON='[]'
+preserve_output=$(run_uninstall)
+grep -Fqx "Preserved durable controller state: $fixture_controller_root/state.sqlite3" <<<"$preserve_output"
+grep -Fq 'Reinstall Gas Can to recover these sandboxes and volumes.' <<<"$preserve_output"
+grep -Fq './packaging/macos/uninstall.sh --remove-data' <<<"$preserve_output"
+[[ -f $fixture_controller_root/state.sqlite3 ]]
+[[ -f $fixture_runtime_root/daemon-instance.json ]]
+assert_untargeted_sentinels
+
 : >"$log"; sleep 1000 & daemon_pid=$!; export FIXTURE_DAEMON_PID=$daemon_pid FIXTURE_SANDBOX_JSON='[]' FIXTURE_ALL_SANDBOX_JSON='[]'
 export LC_ALL=C LANG=C TZ=America/Phoenix
 for condition in attested-start observed-start executable empty-token; do
@@ -104,30 +172,75 @@ for condition in attested-start observed-start executable empty-token; do
     executable) export FIXTURE_ATTESTED_EXECUTABLE=/tmp/foreign;;
     empty-token) export FIXTURE_ATTESTED_TOKEN='';;
   esac
-  "$repo_root/packaging/macos/uninstall.sh" >/dev/null 2>&1 && { echo "$condition mismatch accepted" >&2; exit 1; }
+  run_uninstall >/dev/null 2>&1 && { echo "$condition mismatch accepted" >&2; exit 1; }
   /bin/kill -0 "$daemon_pid"
   ! grep -q '^sudo:' "$log"
 done
 export FIXTURE_ATTESTED_START=START FIXTURE_OBSERVED_START=START FIXTURE_ATTESTED_EXECUTABLE=/usr/local/bin/gascand FIXTURE_ATTESTED_TOKEN=TOKEN
-"$repo_root/packaging/macos/uninstall.sh" --remove-data >/dev/null
+run_uninstall --remove-data >/dev/null
 ! /bin/kill -0 "$daemon_pid" 2>/dev/null; daemon_pid=
 grep -qx 'gascan:list --json' "$log"
 grep -qx 'gascan:list --all --json' "$log"
+[[ ! -e $fixture_controller_root && ! -L $fixture_controller_root ]]
+[[ ! -e $fixture_runtime_root && ! -L $fixture_runtime_root ]]
+assert_untargeted_sentinels
 if grep '^ps-env:' "$log" | grep -vx 'ps-env:C:C:UTC'; then
   printf 'daemon stop inspected process identity without deterministic UTC environment\n' >&2
   exit 1
 fi
 
 : >"$log"; export FIXTURE_DAEMON_PID=999999 FIXTURE_SANDBOX_JSON='[{"sandbox_id":"one"},{"sandbox_id":"two"}]' FIXTURE_ALL_SANDBOX_JSON='[{"sandbox_id":"one","actual_state":"absent"},{"sandbox_id":"two","actual_state":"absent"}]'
-"$repo_root/packaging/macos/uninstall.sh" --remove-data >/dev/null
+run_uninstall --remove-data >/dev/null
 grep -qx 'gascan:--sandbox one destroy --yes' "$log"
 grep -qx 'gascan:--sandbox two destroy --yes' "$log"
 grep -qx 'gascan:list --all --json' "$log"
 export FIXTURE_ALL_SANDBOX_JSON='[{"sandbox_id":"one","actual_state":"running"}]'
-"$repo_root/packaging/macos/uninstall.sh" --remove-data >/dev/null 2>&1 && { echo 'active retained inventory accepted' >&2; exit 1; }
+run_uninstall --remove-data >/dev/null 2>&1 && { echo 'active retained inventory accepted' >&2; exit 1; }
 for invalid in '[{"sandbox_id":"same"},{"sandbox_id":"same"}]' '[{"sandbox_id":""}]' '{}'; do
   export FIXTURE_SANDBOX_JSON=$invalid
-  "$repo_root/packaging/macos/uninstall.sh" --remove-data >/dev/null 2>&1 && { echo 'invalid sandbox inventory accepted' >&2; exit 1; }
+  run_uninstall --remove-data >/dev/null 2>&1 && { echo 'invalid sandbox inventory accepted' >&2; exit 1; }
 done
+
+export FIXTURE_SANDBOX_JSON='[]' FIXTURE_ALL_SANDBOX_JSON='[]' FIXTURE_FOREIGN_STAT_PATH=
+expect_unsafe_removal_refused() {
+  local label=$1
+  : >"$log"
+  run_uninstall --remove-data >/dev/null 2>&1 && {
+    printf 'unsafe uninstall path accepted: %s\n' "$label" >&2
+    exit 1
+  }
+  ! grep -q '^sudo:' "$log"
+  assert_untargeted_sentinels
+}
+
+prepare_uninstall_roots
+mv "$fixture_user_home/Library" "$fixture/symlink-library-target"
+ln -s "$fixture/symlink-library-target" "$fixture_user_home/Library"
+expect_unsafe_removal_refused 'symlinked Library'
+rm "$fixture_user_home/Library"
+rm -rf "$fixture/symlink-library-target"
+
+prepare_uninstall_roots
+rm -rf "$fixture_user_home/Library/Application Support"
+printf 'not a directory\n' >"$fixture_user_home/Library/Application Support"
+expect_unsafe_removal_refused 'non-directory Application Support'
+
+prepare_uninstall_roots
+chmod 0777 "$fixture_user_home/Library"
+expect_unsafe_removal_refused 'unsafe Library mode'
+
+prepare_uninstall_roots
+export FIXTURE_FOREIGN_STAT_PATH="$fixture_user_home/Library/Application Support"
+expect_unsafe_removal_refused 'foreign Application Support owner'
+export FIXTURE_FOREIGN_STAT_PATH=
+
+prepare_uninstall_roots
+chmod 0777 "$fixture_runtime_base"
+expect_unsafe_removal_refused 'unsafe XDG runtime base mode'
+
+prepare_uninstall_roots
+export FIXTURE_FOREIGN_STAT_PATH=$fixture_runtime_root
+expect_unsafe_removal_refused 'foreign runtime root owner'
+export FIXTURE_FOREIGN_STAT_PATH=
 
 printf 'PASS: Gas Can installer contract\n'
