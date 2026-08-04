@@ -1052,17 +1052,19 @@ impl RuntimeBackend for FakeRuntime {
         let (outputs, output) = tokio::sync::mpsc::channel(1);
         let (cancellation, mut cancelled) = ExecCancellation::channel();
         tokio::spawn(async move {
-            let ready_then_drain = request
-                .argv
-                .first()
-                .is_some_and(|arg| arg == "fake-ready-then-drain");
-            if ready_then_drain
-                && outputs
-                    .send(Ok(ExecOutput::Stdout(b"ready".to_vec())))
+            let ready_then_drain = match request.argv.first().map(String::as_str) {
+                Some("fake-ready-then-drain") => Some(b"ready".to_vec()),
+                Some("fake-large-ready-then-drain") => Some(vec![b'x'; 1024 * 1024]),
+                _ => None,
+            };
+            if let Some(output) = &ready_then_drain {
+                if outputs
+                    .send(Ok(ExecOutput::Stdout(output.clone())))
                     .await
                     .is_err()
-            {
-                return;
+                {
+                    return;
+                }
             }
             let mut stdin = request.stdin;
             let mut signal = configured.3;
@@ -1075,7 +1077,7 @@ impl RuntimeBackend for FakeRuntime {
                     ExecInput::Close => break,
                 }
             }
-            let (stdout, stderr, code) = if ready_then_drain {
+            let (stdout, stderr, code) = if ready_then_drain.is_some() {
                 (Vec::new(), Vec::new(), 0)
             } else {
                 interpret_fake_command(

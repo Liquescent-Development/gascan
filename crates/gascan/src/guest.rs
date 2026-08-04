@@ -5,6 +5,8 @@ use gascan_proto::v1;
 use std::fmt;
 use std::io::{IsTerminal as _, Write as _};
 use std::os::fd::AsFd as _;
+use std::os::unix::ffi::OsStrExt as _;
+use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio_stream::Stream;
@@ -438,6 +440,23 @@ impl CancellableInput {
         Self::from_fd(std::io::stdin())
     }
 
+    fn terminal() -> std::io::Result<Self> {
+        let stdin = std::io::stdin();
+        let name = rustix::termios::ttyname(stdin.as_fd(), Vec::new())?;
+        Self::from_terminal_path(Path::new(std::ffi::OsStr::from_bytes(name.to_bytes())))
+    }
+
+    fn from_terminal_path(path: &Path) -> std::io::Result<Self> {
+        let flags =
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC;
+        let fd = rustix::fs::open(path, flags, rustix::fs::Mode::empty())?;
+        let original_flags = rustix::fs::fcntl_getfl(&fd)?;
+        let fd = RestoringFd { fd, original_flags };
+        Ok(Self {
+            fd: tokio::io::unix::AsyncFd::new(fd)?,
+        })
+    }
+
     fn from_fd(fd: impl std::os::fd::AsFd) -> std::io::Result<Self> {
         let fd = rustix::io::dup(fd)?;
         let original_flags = rustix::fs::fcntl_getfl(&fd)?;
@@ -507,14 +526,19 @@ pub(crate) async fn attach_to_stdio(
     } else {
         None
     };
+    let terminal_input = if raw_terminal && stdin_is_tty {
+        Some(CancellableInput::terminal()?)
+    } else {
+        None
+    };
     let (input_sender, input_receiver) = tokio::sync::mpsc::channel(16);
     let producer: Option<Pin<Box<dyn std::future::Future<Output = ()> + Send>>> =
-        if raw_terminal && stdin_is_tty {
+        if let Some(stdin) = terminal_input {
             let producer = input_sender.clone();
             let producer_token = token.clone();
             let restore = terminal.as_ref().map(RawTerminal::restore_handle);
             Some(Box::pin(async move {
-                forward_terminal_input(producer, producer_token, restore).await;
+                forward_terminal_input(stdin, producer, producer_token, restore).await;
             }))
         } else if !stdin_is_tty {
             let producer = input_sender.clone();
@@ -593,6 +617,7 @@ async fn forward_piped_input(sender: tokio::sync::mpsc::Sender<v1::ClientFrame>,
 }
 
 async fn forward_terminal_input(
+    stdin: CancellableInput,
     sender: tokio::sync::mpsc::Sender<v1::ClientFrame>,
     token: Vec<u8>,
     restore: Option<crate::terminal::TerminalRestore>,
@@ -628,18 +653,6 @@ async fn forward_terminal_input(
             Ok(signal) => signal,
             Err(_) => return,
         };
-    let stdin = match CancellableInput::stdin() {
-        Ok(stdin) => stdin,
-        Err(_) => {
-            let _ = sender
-                .send(v1::ClientFrame {
-                    frame: Some(v1::client_frame::Frame::Close(v1::Close {})),
-                    session_token: token,
-                })
-                .await;
-            return;
-        }
-    };
     let mut bytes = vec![0_u8; TERMINAL_INPUT_FRAME_BYTES];
     loop {
         let frame = tokio::select! {
@@ -1002,6 +1015,22 @@ mod tests {
     fn assert_secret_absent(error: &crate::cli::CliError) {
         assert!(!error.to_string().contains(SENTINEL));
         assert!(!format!("{error:?}").contains(SENTINEL));
+    }
+
+    #[tokio::test]
+    async fn interactive_input_does_not_make_shared_pty_output_nonblocking() -> TestResult {
+        use std::os::unix::ffi::OsStrExt as _;
+        let pty = rustix_openpty::openpty(None, None)?;
+        let name = rustix::termios::ttyname(&pty.user, Vec::new())?;
+        let path = std::path::Path::new(std::ffi::OsStr::from_bytes(name.to_bytes()));
+        let output = rustix::io::dup(&pty.user)?;
+        let before = rustix::fs::fcntl_getfl(&output)?;
+
+        let _input = CancellableInput::from_terminal_path(path)?;
+
+        assert_eq!(rustix::fs::fcntl_getfl(&output)?, before);
+        assert!(!before.contains(rustix::fs::OFlags::NONBLOCK));
+        Ok(())
     }
 
     #[tokio::test]

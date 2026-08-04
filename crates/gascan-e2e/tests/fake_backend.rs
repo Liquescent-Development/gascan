@@ -1075,6 +1075,58 @@ fn configure_with_stopped_sandbox_stops_before_piped_token_read() -> TestResult 
 }
 
 #[test]
+fn real_pty_large_output_waits_for_capacity_without_exiting() -> TestResult {
+    use rustix_openpty::rustix;
+    let _signal_guard = signal_test_guard()?;
+    let env = Environment::new()?;
+    assert!(env.invoke(&["up", env.root()?])?.status.success());
+    let pty = rustix_openpty::openpty(None, None)?;
+    let saved = normalized_termios(&pty.user)?;
+    let stdin = std::fs::File::from(rustix::io::dup(&pty.user)?);
+    let stdout = std::fs::File::from(rustix::io::dup(&pty.user)?);
+    let stderr = std::fs::File::from(rustix::io::dup(&pty.user)?);
+    let mut child = env
+        .command(&["shell", "--", "fake-large-ready-then-drain"])
+        .stdin(stdin)
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()?;
+
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    assert!(
+        child.try_wait()?.is_none(),
+        "large output detached the PTY shell"
+    );
+
+    let controller = std::fs::File::from(pty.controller);
+    let mut reader_controller = std::fs::File::from(rustix::io::dup(&controller)?);
+    let reader = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+        use std::io::Read as _;
+        let mut output = Vec::new();
+        let mut chunk = [0_u8; 16 * 1024];
+        while output.iter().filter(|byte| **byte == b'x').count() < 1024 * 1024 {
+            match reader_controller.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => output.extend_from_slice(&chunk[..count]),
+                Err(error) if error.raw_os_error() == Some(5) => break,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(output)
+    });
+    let output = reader.join().map_err(|_| "PTY reader panicked")??;
+    assert!(output.iter().filter(|byte| **byte == b'x').count() >= 1024 * 1024);
+
+    let pid =
+        rustix::process::Pid::from_raw(i32::try_from(child.id())?).ok_or("invalid child pid")?;
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM)?;
+    assert_eq!(child.wait()?.code(), Some(143));
+    assert_termios_restored(&rustix::termios::tcgetattr(&pty.user)?, &saved);
+    drop(controller);
+    Ok(())
+}
+
+#[test]
 fn real_pty_resize_signals_and_terminal_restoration_are_exact() -> TestResult {
     use rustix_openpty::rustix;
     let _signal_guard = signal_test_guard()?;
