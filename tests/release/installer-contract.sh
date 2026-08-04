@@ -6,14 +6,97 @@ fixture=$(mktemp -d "${TMPDIR:-/tmp}/gascan-installer-contract.XXXXXX")
 fixture=$(cd "$fixture" && pwd -P)
 daemon_pid=
 default_runtime_fixture=
+default_runtime_fixture_identity=
+default_runtime_fixture_owner=
+default_runtime_fixture_mode=
+default_runtime_fixture_flags=
+
+remove_captured_directory() {
+  local path=$1 expected_identity=$2 expected_owner=$3 expected_mode=$4 expected_flags=$5
+  local parent child identity owner mode flags
+
+  [[ $path == /* && $path != / && $path != */../* && $path != */./* ]] || return 1
+  parent=${path%/*}
+  child=${path##*/}
+  [[ -n $parent && -n $child && $child != . && $child != .. ]] || return 1
+  [[ $expected_owner == "$(/usr/bin/id -u)" && $expected_mode == 700 && $expected_flags == 0 ]] || return 1
+
+  (
+    cd -P "$parent" || exit 1
+    [[ ! -L ./$child && -d ./$child ]] || exit 1
+    identity=$(/usr/bin/stat -f '%d:%i' "./$child") || exit 1
+    owner=$(/usr/bin/stat -f '%u' "./$child") || exit 1
+    mode=$(/usr/bin/stat -f '%Lp' "./$child") || exit 1
+    flags=$(/usr/bin/stat -f '%Mp' "./$child") || exit 1
+    [[ $identity == "$expected_identity" && \
+      $owner == "$expected_owner" && \
+      $mode == "$expected_mode" && \
+      $flags == "$expected_flags" ]] || exit 1
+    /bin/rm -rf -- "./$child"
+  )
+}
+
 cleanup() {
   if [[ -n $daemon_pid ]]; then /bin/kill "$daemon_pid" 2>/dev/null || true; fi
   if [[ -n $default_runtime_fixture ]]; then
-    /bin/rm -rf -- "$default_runtime_fixture"
+    remove_captured_directory \
+      "$default_runtime_fixture" \
+      "$default_runtime_fixture_identity" \
+      "$default_runtime_fixture_owner" \
+      "$default_runtime_fixture_mode" \
+      "$default_runtime_fixture_flags" || true
   fi
   rm -rf "$fixture"
 }
 trap cleanup EXIT
+
+cleanup_probe=$fixture/cleanup-identity-probe
+mkdir -p "$cleanup_probe/exact"
+chmod 0700 "$cleanup_probe/exact"
+probe_identity=$(/usr/bin/stat -f '%d:%i' "$cleanup_probe/exact")
+probe_owner=$(/usr/bin/stat -f '%u' "$cleanup_probe/exact")
+probe_mode=$(/usr/bin/stat -f '%Lp' "$cleanup_probe/exact")
+probe_flags=$(/usr/bin/stat -f '%Mp' "$cleanup_probe/exact")
+(
+  fixture=$cleanup_probe/unused-fixture
+  default_runtime_fixture=$cleanup_probe/exact
+  default_runtime_fixture_identity=$probe_identity
+  default_runtime_fixture_owner=$probe_owner
+  default_runtime_fixture_mode=$probe_mode
+  default_runtime_fixture_flags=$probe_flags
+  cleanup
+)
+[[ ! -e $cleanup_probe/exact && ! -L $cleanup_probe/exact ]] || {
+  printf 'cleanup did not remove the exact directory identity created by the test\n' >&2
+  exit 1
+}
+
+mkdir "$cleanup_probe/swapped"
+chmod 0700 "$cleanup_probe/swapped"
+probe_identity=$(/usr/bin/stat -f '%d:%i' "$cleanup_probe/swapped")
+probe_owner=$(/usr/bin/stat -f '%u' "$cleanup_probe/swapped")
+probe_mode=$(/usr/bin/stat -f '%Lp' "$cleanup_probe/swapped")
+probe_flags=$(/usr/bin/stat -f '%Mp' "$cleanup_probe/swapped")
+mv "$cleanup_probe/swapped" "$cleanup_probe/created"
+mkdir "$cleanup_probe/swapped"
+chmod 0700 "$cleanup_probe/swapped"
+(
+  fixture=$cleanup_probe/unused-fixture
+  default_runtime_fixture=$cleanup_probe/swapped
+  default_runtime_fixture_identity=$probe_identity
+  default_runtime_fixture_owner=$probe_owner
+  default_runtime_fixture_mode=$probe_mode
+  default_runtime_fixture_flags=$probe_flags
+  cleanup
+)
+replacement_preserved=0
+[[ -d $cleanup_probe/swapped ]] && replacement_preserved=1
+rm -rf "$cleanup_probe"
+[[ $replacement_preserved == 1 ]] || {
+  printf 'cleanup removed a replacement with a different directory identity\n' >&2
+  exit 1
+}
+
 mkdir -p "$fixture/bin"
 touch "$fixture/test.pkg"
 log=$fixture/log
@@ -238,11 +321,30 @@ done
 
 export FIXTURE_SANDBOX_JSON='[]' FIXTURE_ALL_SANDBOX_JSON='[]'
 prepare_uninstall_roots
-default_runtime_uid=$((3000000000 + $$))
-default_runtime_fixture=/private/tmp/gascan-$default_runtime_uid
-[[ ! -e $default_runtime_fixture && ! -L $default_runtime_fixture ]]
-mkdir "$default_runtime_fixture"
-chmod 0700 "$default_runtime_fixture"
+prepare_default_runtime_fixture() {
+  local random_value candidate identity owner mode flags
+
+  random_value=$(/usr/bin/od -An -N4 -tu4 /dev/urandom | /usr/bin/tr -d '[:space:]')
+  default_runtime_uid=$((3000000000 + random_value % 1000000000))
+  candidate=/private/tmp/gascan-$default_runtime_uid
+  (umask 077 && /bin/mkdir "$candidate") || {
+    printf 'could not atomically create default runtime fixture: %s\n' "$candidate" >&2
+    return 1
+  }
+  identity=$(/usr/bin/stat -f '%d:%i' "$candidate") || return 1
+  owner=$(/usr/bin/stat -f '%u' "$candidate") || return 1
+  mode=$(/usr/bin/stat -f '%Lp' "$candidate") || return 1
+  flags=$(/usr/bin/stat -f '%Mp' "$candidate") || return 1
+  [[ ! -L $candidate && -d $candidate && \
+    $owner == "$(/usr/bin/id -u)" && $mode == 700 && $flags == 0 ]] || return 1
+
+  default_runtime_fixture=$candidate
+  default_runtime_fixture_identity=$identity
+  default_runtime_fixture_owner=$owner
+  default_runtime_fixture_mode=$mode
+  default_runtime_fixture_flags=$flags
+}
+prepare_default_runtime_fixture
 printf 'default runtime sentinel\n' >"$default_runtime_fixture/daemon-instance.json"
 export FIXTURE_ID_UID=$default_runtime_uid
 export FIXTURE_STAT_OWNER_PATH=$default_runtime_fixture
@@ -253,6 +355,10 @@ env -u XDG_RUNTIME_DIR HOME="$fixture_user_home" \
   "$repo_root/packaging/macos/uninstall.sh" --remove-data >/dev/null
 [[ ! -e $default_runtime_fixture && ! -L $default_runtime_fixture ]]
 default_runtime_fixture=
+default_runtime_fixture_identity=
+default_runtime_fixture_owner=
+default_runtime_fixture_mode=
+default_runtime_fixture_flags=
 unset FIXTURE_ID_UID FIXTURE_STAT_OWNER_PATH FIXTURE_STAT_OWNER_PREFIX FIXTURE_STAT_OWNER_VALUE
 
 export FIXTURE_SANDBOX_JSON='[]' FIXTURE_ALL_SANDBOX_JSON='[]' FIXTURE_FOREIGN_STAT_PATH=
