@@ -59,6 +59,36 @@ gascan doctor
 Use `gascan doctor --json | jq` when you need the complete machine-readable
 report.
 
+### Controller-state recovery and upgrades
+
+Gas Can keeps its per-user controller inventory, operation history, and
+destroyed-sandbox tombstones at
+`~/Library/Application Support/dev.gascan/controller/state.sqlite3`. Socket and
+daemon-lifecycle files remain transient under the runtime directory. On the
+first startup after this layout change, Gas Can automatically migrates a safe
+legacy runtime database to the durable location. If both active databases
+contain different records, it refuses to choose or merge them; it leaves both
+unchanged so you can back them up and explicitly select the one to preserve.
+
+Package upgrades and ordinary uninstalls preserve this durable controller state.
+That preserves the inventory needed to reconnect to existing Gas Can-owned
+containers and managed volumes after the daemon, package, or runtime socket is
+recreated. Normal lists hide destroyed records: use `gascan list --all` (or
+`gascan list --all --json`) for retained tombstones and diagnostics.
+
+To intentionally remove all Gas Can-owned sandbox data, first back up anything
+you need, then use the opt-in cleanup command:
+
+```sh
+./packaging/macos/uninstall.sh --remove-data
+```
+
+It destroys each active sandbox through the installed CLI, verifies that every
+remaining inventory record is a destroyed tombstone, stops the attested daemon,
+and only then removes the private runtime root and
+`dev.gascan/controller` directory. It fails closed if the inventory or either
+directory is unsafe.
+
 ### Building from source
 
 Building is for contributors; installing a release does not require it.

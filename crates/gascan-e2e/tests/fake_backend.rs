@@ -42,6 +42,130 @@ struct Environment {
     account_home: std::path::PathBuf,
 }
 
+struct DurableEnvironment {
+    gascan: std::ffi::OsString,
+    gascand: std::ffi::OsString,
+    root: tempfile::TempDir,
+    _runtime: tempfile::TempDir,
+    runtime_root: std::path::PathBuf,
+    _account_home: tempfile::TempDir,
+    account_home: std::path::PathBuf,
+    fake_resources: tempfile::TempDir,
+}
+
+impl DurableEnvironment {
+    fn new() -> TestResult<Self> {
+        let gascan = std::env::var_os("CARGO_BIN_EXE_gascan-e2e-cli").ok_or("gascan missing")?;
+        let gascand =
+            std::env::var_os("CARGO_BIN_EXE_gascan-e2e-daemon").ok_or("gascand missing")?;
+        let root = tempfile::tempdir()?;
+        let runtime = tempfile::tempdir()?;
+        let runtime_root = runtime.path().canonicalize()?;
+        let account_home = tempfile::tempdir()?;
+        let account_home_path = account_home.path().canonicalize()?;
+        std::fs::create_dir(account_home_path.join("Library"))?;
+        std::fs::create_dir(account_home_path.join("Library/Application Support"))?;
+        let fake_resources = tempfile::tempdir()?;
+        Ok(Self {
+            gascan,
+            gascand,
+            root,
+            _runtime: runtime,
+            runtime_root,
+            _account_home: account_home,
+            account_home: account_home_path,
+            fake_resources,
+        })
+    }
+
+    fn command(&self, arguments: &[&str]) -> Command {
+        let mut command = Command::new(&self.gascan);
+        command
+            .args(arguments)
+            .env("XDG_RUNTIME_DIR", &self.runtime_root)
+            .env_remove("GASCAN_STATE_PATH")
+            .env(
+                "GASCAN_FAKE_STATE_PATH",
+                self.fake_resources.path().join("managed-resources.json"),
+            )
+            .env("GASCAN_PID_PATH", self.runtime_root.join("daemon.pid"))
+            .env(
+                "GASCAN_DAEMON_STDERR_PATH",
+                self.runtime_root.join("daemon.stderr"),
+            )
+            .env("GASCAN_E2E_ACCOUNT_HOME", &self.account_home)
+            .env(
+                "HOME",
+                self.runtime_root.join("mutable-home-must-be-ignored"),
+            )
+            .env("GASCAN_DAEMON", &self.gascand)
+            .env("GASCAN_TEST_FAKE_BACKEND", "1");
+        command
+    }
+
+    fn legacy_command(&self, arguments: &[&str]) -> Command {
+        let mut command = self.command(arguments);
+        command.env("GASCAN_STATE_PATH", self.legacy_database());
+        command
+    }
+
+    fn invoke(&self, arguments: &[&str]) -> Result<std::process::Output, std::io::Error> {
+        self.command(arguments).output()
+    }
+
+    fn legacy_database(&self) -> std::path::PathBuf {
+        self.runtime_root.join("gascan/state.sqlite3")
+    }
+
+    fn durable_database(&self) -> std::path::PathBuf {
+        self.account_home
+            .join("Library/Application Support/dev.gascan/controller/state.sqlite3")
+    }
+
+    fn fake_resource_state(&self) -> std::path::PathBuf {
+        self.fake_resources.path().join("managed-resources.json")
+    }
+
+    fn privatize_legacy_database_family(&self) -> TestResult {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for path in std::iter::once(self.legacy_database()).chain(
+            ["-wal", "-shm", "-journal"].into_iter().map(|suffix| {
+                self.legacy_database()
+                    .with_extension(format!("sqlite3{suffix}"))
+            }),
+        ) {
+            if path.exists() {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn shutdown_daemon(&self) -> TestResult {
+        let output = self
+            .command(&["daemon", "stop", "--force", "--json"])
+            .output()?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "public daemon cleanup failed: status={:?}, stdout={}, stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into())
+        }
+    }
+}
+
+impl Drop for DurableEnvironment {
+    fn drop(&mut self) {
+        let _ = self.shutdown_daemon();
+    }
+}
+
 impl Environment {
     fn new() -> TestResult<Self> {
         let gascan = std::env::var_os("CARGO_BIN_EXE_gascan-e2e-cli").ok_or("gascan missing")?;
@@ -318,6 +442,110 @@ fn complete_cli_lifecycle_uses_daemon_api() -> TestResult {
 }
 
 #[test]
+fn destroyed_tombstones_require_list_all() -> TestResult {
+    let env = Environment::new()?;
+    let first_root = env.root()?.to_owned();
+    let second = tempfile::tempdir()?;
+    let second_root = second
+        .path()
+        .to_str()
+        .ok_or("non UTF-8 second root")?
+        .to_owned();
+
+    assert!(env.invoke(&["up", &first_root])?.status.success());
+    let first_status = env.invoke(&["status", "--json"])?;
+    let first_id = serde_json::from_slice::<serde_json::Value>(&first_status.stdout)?["sandbox_id"]
+        .as_str()
+        .ok_or("first sandbox id missing")?
+        .to_owned();
+    assert!(env.invoke(&["up", &second_root])?.status.success());
+
+    let initial = env.invoke(&["list", "--json"])?;
+    let initial = serde_json::from_slice::<Vec<serde_json::Value>>(&initial.stdout)?;
+    assert_eq!(initial.len(), 2);
+    let initial_ids = initial
+        .iter()
+        .map(|sandbox| {
+            sandbox["sandbox_id"]
+                .as_str()
+                .ok_or("initial sandbox id missing")
+                .map(str::to_owned)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let second_id = initial_ids
+        .iter()
+        .find(|sandbox_id| *sandbox_id != &first_id)
+        .cloned()
+        .ok_or("second sandbox id missing")?;
+
+    assert!(
+        env.invoke(&["--sandbox", &first_id, "destroy", "--yes"])?
+            .status
+            .success()
+    );
+
+    let ordinary_human = env.invoke(&["list"])?;
+    assert!(ordinary_human.status.success());
+    let ordinary_human = String::from_utf8(ordinary_human.stdout)?;
+    assert!(ordinary_human.contains(&second_id));
+    assert!(!ordinary_human.contains(&first_id));
+    assert!(!ordinary_human.contains("Destroyed"));
+    assert!(!ordinary_human.contains("Absent"));
+
+    let ordinary_json = env.invoke(&["list", "--json"])?;
+    assert!(ordinary_json.status.success());
+    let ordinary_json = serde_json::from_slice::<Vec<serde_json::Value>>(&ordinary_json.stdout)?;
+    assert_eq!(ordinary_json.len(), 1);
+    assert_eq!(ordinary_json[0]["sandbox_id"], second_id);
+
+    let all_human = env.invoke(&["list", "--all"])?;
+    assert!(all_human.status.success());
+    let all_human = String::from_utf8(all_human.stdout)?;
+    assert!(all_human.contains(&first_id));
+    assert!(all_human.contains(&second_id));
+    assert!(all_human.contains("Destroyed"));
+    assert!(!all_human.contains("Absent"));
+
+    let all_json = env.invoke(&["list", "--all", "--json"])?;
+    assert!(all_json.status.success());
+    let all_json = serde_json::from_slice::<Vec<serde_json::Value>>(&all_json.stdout)?;
+    assert_eq!(
+        all_json
+            .iter()
+            .map(|sandbox| sandbox["sandbox_id"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        initial_ids.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    let first = all_json
+        .iter()
+        .find(|sandbox| sandbox["sandbox_id"] == first_id)
+        .ok_or("destroyed sandbox missing from --all JSON")?;
+    assert_eq!(first["actual_state"], "absent");
+
+    assert!(
+        env.invoke(&["--sandbox", &second_id, "destroy", "--yes"])?
+            .status
+            .success()
+    );
+    let empty_human = env.invoke(&["list"])?;
+    assert!(empty_human.status.success());
+    assert_eq!(empty_human.stdout, b"No sandboxes found.\n");
+    let empty_json = env.invoke(&["list", "--json"])?;
+    assert!(empty_json.status.success());
+    assert!(serde_json::from_slice::<Vec<serde_json::Value>>(&empty_json.stdout)?.is_empty());
+    assert_eq!(env.invoke(&["status"])?.status.code(), Some(64));
+
+    assert!(env.invoke(&["up", &first_root])?.status.success());
+    let recreated = env.invoke(&["status", "--json"])?;
+    assert!(recreated.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&recreated.stdout)?["sandbox_id"],
+        first_id
+    );
+    Ok(())
+}
+
+#[test]
 fn progress_stderr_pty_child_has_non_tty_stdin_and_tty_stderr() -> TestResult {
     const CHILD: &str = "GASCAN_PROGRESS_PTY_CONTRACT_CHILD";
     if std::env::var_os(CHILD).is_some() {
@@ -527,6 +755,107 @@ fn environment_teardown_terminates_its_exact_live_daemon() -> TestResult {
     assert!(std::os::unix::net::UnixStream::connect(&socket).is_ok());
     env.shutdown_daemon()?;
     assert!(std::os::unix::net::UnixStream::connect(socket).is_err());
+    Ok(())
+}
+
+#[test]
+fn durable_controller_state_survives_daemon_replacement() -> TestResult {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let env = DurableEnvironment::new()?;
+    let mut initial =
+        env.legacy_command(&["up", env.root.path().to_str().ok_or("non UTF-8 root")?]);
+    let initial = initial.output()?;
+    let daemon_stderr = std::fs::read_to_string(env.runtime_root.join("daemon.stderr"))
+        .unwrap_or_else(|error| format!("<unavailable: {error}>"));
+    assert!(
+        initial.status.success(),
+        "legacy startup failed: stdout={}, stderr={}, daemon_stderr={}",
+        String::from_utf8_lossy(&initial.stdout),
+        String::from_utf8_lossy(&initial.stderr),
+        daemon_stderr
+    );
+    let listed = env.legacy_command(&["list", "--json"]).output()?;
+    assert!(listed.status.success());
+    let records = serde_json::from_slice::<Vec<serde_json::Value>>(&listed.stdout)?;
+    let sandbox_id = records
+        .first()
+        .and_then(|record| record["sandbox_id"].as_str())
+        .ok_or("legacy sandbox record missing")?
+        .to_owned();
+    assert_eq!(records.len(), 1);
+
+    let fake_state =
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(env.fake_resource_state())?)?;
+    let managed_volume_marker = fake_state["resources"]
+        .as_array()
+        .ok_or("fake resource inventory missing")?
+        .iter()
+        .find(|resource| {
+            resource["kind"] == "volume"
+                && resource["sandbox_id"] == sandbox_id
+                && resource["ownership"] == "gas_can_owned"
+        })
+        .cloned()
+        .ok_or("fake managed-volume marker missing")?;
+
+    let stopped = env.legacy_command(&["daemon", "stop", "--json"]).output()?;
+    assert!(
+        stopped.status.success(),
+        "legacy daemon stop failed: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    env.privatize_legacy_database_family()?;
+    let started = env.command(&["daemon", "start", "--json"]).output()?;
+    let daemon_stderr = std::fs::read_to_string(env.runtime_root.join("daemon.stderr"))
+        .unwrap_or_else(|error| format!("<unavailable: {error}>"));
+    assert!(
+        started.status.success(),
+        "durable daemon start failed: stdout={}, stderr={}, daemon_stderr={}",
+        String::from_utf8_lossy(&started.stdout),
+        String::from_utf8_lossy(&started.stderr),
+        daemon_stderr
+    );
+    assert!(env.durable_database().is_file());
+    assert!(!env.legacy_database().exists());
+
+    let restarted = env.command(&["daemon", "restart", "--json"]).output()?;
+    assert!(
+        restarted.status.success(),
+        "daemon replacement failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&restarted.stdout),
+        String::from_utf8_lossy(&restarted.stderr)
+    );
+    let restarted: serde_json::Value = serde_json::from_slice(&restarted.stdout)?;
+    assert_eq!(restarted["transition"], "restarted");
+
+    env.shutdown_daemon()?;
+    std::fs::remove_dir_all(env.runtime_root.join("gascan"))?;
+    std::fs::create_dir(env.runtime_root.join("gascan"))?;
+    std::fs::set_permissions(
+        env.runtime_root.join("gascan"),
+        std::fs::Permissions::from_mode(0o700),
+    )?;
+    let status = env.invoke(&["--sandbox", &sandbox_id, "status", "--json"])?;
+    assert!(
+        status.status.success(),
+        "runtime recreation lost controller state: stdout={}, stderr={}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
+    assert_eq!(status["sandbox_id"], sandbox_id);
+    assert_eq!(status["actual_state"], "running");
+
+    let recreated_fake_state =
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(env.fake_resource_state())?)?;
+    assert!(
+        recreated_fake_state["resources"]
+            .as_array()
+            .ok_or("recreated fake resource inventory missing")?
+            .contains(&managed_volume_marker),
+        "fake managed-volume marker changed across daemon and runtime replacement"
+    );
     Ok(())
 }
 

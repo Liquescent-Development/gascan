@@ -9,7 +9,7 @@ gascan_release_environment_is_sanitized() {
       FIXTURE_CREATE_STATUS|FIXTURE_DNS_STATE|FIXTURE_SUDO_LOG|\
       GASCAN_RELEASE_APPLE_ATTACH_HELPER|GASCAN_RELEASE_ENV_SANITIZED|\
       GASCAN_RELEASE_GASCAN|GASCAN_RELEASE_GASCAND|GASCAN_RELEASE_TESTING|\
-      GASCAN_RELEASE_TEST_SIGNAL_AFTER_TRAPS|HOME|LOGNAME|PATH|TMPDIR|USER|\
+      GASCAN_RELEASE_TEST_SIGNAL_AFTER_TRAPS|GASCAN_STATE_PATH|HOME|LOGNAME|PATH|TMPDIR|USER|\
       PWD|SHLVL) ;;
       *) return 1 ;;
     esac
@@ -31,6 +31,7 @@ if [[ $- != *p* ]] || ! gascan_release_environment_is_sanitized; then
     GASCAN_RELEASE_GASCAND="${GASCAN_RELEASE_GASCAND:-}" \
     GASCAN_RELEASE_TESTING="${GASCAN_RELEASE_TESTING:-}" \
     GASCAN_RELEASE_TEST_SIGNAL_AFTER_TRAPS="${GASCAN_RELEASE_TEST_SIGNAL_AFTER_TRAPS:-}" \
+    GASCAN_STATE_PATH="${GASCAN_STATE_PATH:-}" \
     HOME="$HOME" \
     LOGNAME="${LOGNAME:-}" \
     PATH="$release_path" \
@@ -73,6 +74,23 @@ gascan_release_preflight_daemon() {
 
 gascan_release_up() {
   CI=1 "$gascan_bin" up "$root" </dev/null
+}
+
+gascan_release_recreate_runtime_root() {
+  local runtime_root owner mode
+  runtime_root=$(gascan_user_runtime_root)
+  [[ -e $runtime_root || -L $runtime_root ]] || return 0
+  [[ -d $runtime_root && ! -L $runtime_root ]] || {
+    printf 'release smoke refused unsafe runtime root: %s\n' "$runtime_root" >&2
+    return 1
+  }
+  owner=$(stat -f '%u' "$runtime_root")
+  mode=$(stat -f '%Lp' "$runtime_root")
+  [[ $owner == "$(id -u)" && $mode == 700 ]] || {
+    printf 'release smoke refused runtime root with unsafe ownership or mode\n' >&2
+    return 1
+  }
+  rm -rf "$runtime_root"
 }
 
 gascan_default_shell_probe() {
@@ -339,6 +357,9 @@ PY
 }
 
 root=$(mktemp -d "${TMPDIR:-/tmp}/gascan-release-root.XXXXXX")
+state_path=$root/controller-state/state.sqlite3
+mkdir -p "$(dirname "$state_path")"
+export GASCAN_STATE_PATH=$state_path
 name="gate5-release-$PPID-$$"
 sandbox_id=
 destroyed_sandbox_id=
@@ -597,6 +618,10 @@ jq -e '
   /opt/gascan/gascamp/bin/camp --version
   test "$(cat /workspace/.gascan/setup-result)" = initial
 '
+gascan_release_volume_marker=durable-controller-marker
+"$gascan_bin" --sandbox "$sandbox_id" run -- bash -lc \
+  'mkdir -p "$XDG_CONFIG_HOME/gascan-release-smoke"; printf "%s\\n" "$1" >"$XDG_CONFIG_HOME/gascan-release-smoke/controller-state-marker"' \
+  _ "$gascan_release_volume_marker"
 "$gascan_bin" --sandbox "$sandbox_id" run -- bash -lc '
   set -euo pipefail
   test "CARGO_HOME=$CARGO_HOME" = CARGO_HOME=/home/workspace/.local/share/cargo
@@ -892,6 +917,9 @@ gascan_release_up
   }
 
   persistence_check setup.result test -f /workspace/.gascan/setup-result
+  persistence_check controller.volume_marker bash -c '\''
+    test "$(cat "$XDG_CONFIG_HOME/gascan-release-smoke/controller-state-marker")" = durable-controller-marker
+  '\''
   persistence_check git.private_key_checksum bash -c '\''
     private_key=/home/workspace/.config/gascan/git/ssh/id_ed25519
     test "$(sha256sum "$private_key" | cut -d " " -f 1)" = \
@@ -931,7 +959,14 @@ gascan_release_up
 '
 
 gascan_stop_attested_daemon "$gascan_bin" "$gascand_bin"
+gascan_release_recreate_runtime_root
 "$gascan_bin" --sandbox "$sandbox_id" status --json >/dev/null
+post_recreation_marker=$("$gascan_bin" --sandbox "$sandbox_id" run -- \
+  bash -lc 'cat "$XDG_CONFIG_HOME/gascan-release-smoke/controller-state-marker"')
+[[ $post_recreation_marker == "$gascan_release_volume_marker" ]] || {
+  printf 'managed-volume marker did not survive daemon/runtime recreation\n' >&2
+  exit 1
+}
 "$gascan_bin" --sandbox "$sandbox_id" run -- true
 
 "$gascan_bin" --sandbox "$sandbox_id" destroy --yes
@@ -1031,7 +1066,16 @@ kill "$server_pid"
 server_pid=
 server_start=
 
-controller_inventory=$("$gascan_bin" list --json)
+normal_controller_inventory=$("$gascan_bin" list --json)
+[[ $normal_controller_inventory == '[]' ]] || {
+  printf 'release smoke normal JSON list retained destroyed sandboxes\n' >&2
+  exit 1
+}
+[[ $("$gascan_bin" list) == 'No sandboxes found.' ]] || {
+  printf 'release smoke normal human list retained destroyed sandboxes\n' >&2
+  exit 1
+}
+controller_inventory=$("$gascan_bin" list --all --json)
 if ! gascan_assert_destroyed_controller_record "$controller_inventory" "$destroyed_sandbox_id"; then
   printf 'release smoke did not retain the exact destroyed controller record\n' >&2
   exit 1

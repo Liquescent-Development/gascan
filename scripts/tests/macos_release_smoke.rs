@@ -75,6 +75,87 @@ fn release_smoke_uses_matching_branch_daemon_for_launch_and_shutdown() {
 }
 
 #[test]
+fn release_smoke_isolates_durable_controller_state_and_checks_destroyed_tombstones() {
+    let smoke =
+        fs::read_to_string(repository_root().join("packaging/macos/release-smoke.sh")).unwrap();
+
+    for required in [
+        "GASCAN_STATE_PATH|",
+        "GASCAN_STATE_PATH=\"${GASCAN_STATE_PATH:-}\"",
+        "state_path=$root/controller-state/state.sqlite3",
+        "export GASCAN_STATE_PATH=$state_path",
+        "rm -rf \"$root\"",
+        "gascan_release_volume_marker=durable-controller-marker",
+        "persistence_check controller.volume_marker",
+        "gascan_release_recreate_runtime_root()",
+        "runtime_root=$(gascan_user_runtime_root)",
+        "gascan_release_recreate_runtime_root\n\"$gascan_bin\" --sandbox \"$sandbox_id\" status --json",
+        "normal_controller_inventory=$(\"$gascan_bin\" list --json)",
+        "No sandboxes found.",
+        "controller_inventory=$(\"$gascan_bin\" list --all --json)",
+    ] {
+        assert!(
+            smoke.contains(required),
+            "release smoke omits durable controller-state contract {required:?}"
+        );
+    }
+
+    assert!(
+        !smoke.contains("\ncontroller_inventory=$(\"$gascan_bin\" list --json)"),
+        "retained tombstone assertions must use list --all --json"
+    );
+
+    let daemon_stop = smoke
+        .rfind("gascan_stop_attested_daemon \"$gascan_bin\" \"$gascand_bin\"")
+        .expect("release smoke omits tested daemon replacement");
+    let runtime_recreation = smoke[daemon_stop..]
+        .find("\ngascan_release_recreate_runtime_root\n")
+        .map(|index| daemon_stop + index)
+        .expect("release smoke omits runtime recreation after daemon stop");
+    let daemon_restart = smoke[runtime_recreation..]
+        .find("status --json >/dev/null")
+        .map(|index| runtime_recreation + index)
+        .expect("release smoke omits daemon restart after runtime recreation");
+    let marker_check = smoke[daemon_restart..]
+        .find("post_recreation_marker=")
+        .map(|index| daemon_restart + index)
+        .expect("release smoke omits marker check after runtime recreation");
+    assert!(daemon_stop < runtime_recreation);
+    assert!(runtime_recreation < daemon_restart);
+    assert!(daemon_restart < marker_check);
+    assert!(smoke[marker_check..].contains(
+        "[[ $post_recreation_marker == \"$gascan_release_volume_marker\" ]]"
+    ));
+
+    let marker_directory = smoke
+        .find("mkdir -p \"$XDG_CONFIG_HOME/gascan-release-smoke\"")
+        .expect("release smoke must create the marker directory");
+    let marker_write = smoke
+        .find(">\"$XDG_CONFIG_HOME/gascan-release-smoke/controller-state-marker\"")
+        .expect("release smoke must write the persistence marker");
+    assert!(
+        marker_directory < marker_write,
+        "release smoke must create the marker directory before writing the marker"
+    );
+}
+
+#[test]
+fn readme_documents_durable_controller_recovery_contract() {
+    let readme = fs::read_to_string(repository_root().join("README.md")).unwrap();
+
+    for required in [
+        "~/Library/Application Support/dev.gascan/controller/state.sqlite3",
+        "automatically migrates",
+        "refuses to choose",
+        "Package upgrades and ordinary uninstalls preserve this durable controller state.",
+        "./packaging/macos/uninstall.sh --remove-data",
+        "gascan list --all",
+    ] {
+        assert!(readme.contains(required), "README omits {required:?}");
+    }
+}
+
+#[test]
 fn release_smoke_runs_every_up_without_interactive_stdin() {
     let smoke =
         fs::read_to_string(repository_root().join("packaging/macos/release-smoke.sh")).unwrap();

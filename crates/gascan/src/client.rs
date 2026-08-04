@@ -1,7 +1,7 @@
 use crate::daemon::{
-    DaemonEndpoint, DaemonIdentity, DaemonLaunch, DaemonPaths, DaemonSpawner, DaemonState,
-    EndpointPathState, EndpointProbe, EndpointSession, FileIdentity, InstanceTimestamp,
-    SupervisorError,
+    DaemonEndpoint, DaemonIdentity, DaemonLaunch, DaemonPaths, DaemonSpawner, DaemonStartupMonitor,
+    DaemonState, EndpointPathState, EndpointProbe, EndpointSession, FileIdentity,
+    InstanceTimestamp, SupervisorError,
 };
 use gascan_proto::v1::gas_can_client::GasCanClient;
 use gascan_proto::{API_MAJOR, API_MINOR, validate_transport_security};
@@ -15,6 +15,9 @@ use tonic::transport::{Channel, Endpoint};
 use tower::service_fn;
 
 const ENDPOINT_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
+#[cfg(test)]
+pub(crate) const FIXTURE_DAEMON_DIAGNOSTIC_DEADLINE: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -303,14 +306,66 @@ fn status_confirms_handshake(
 pub(crate) struct TokioDaemonSpawner;
 
 impl DaemonSpawner for TokioDaemonSpawner {
-    fn spawn(&self, launch: &DaemonLaunch) -> std::io::Result<()> {
+    fn spawn(&self, launch: &DaemonLaunch) -> std::io::Result<DaemonStartupMonitor> {
+        use command_fds::{CommandFdExt as _, FdMapping};
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let flags =
+            rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC;
+        let startup_descriptor = match rustix::fs::open(
+            &launch.startup_diagnostic_path,
+            flags | rustix::fs::OFlags::CREATE | rustix::fs::OFlags::EXCL,
+            rustix::fs::Mode::from_raw_mode(0o600),
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(rustix::io::Errno::EXIST) => rustix::fs::open(
+                &launch.startup_diagnostic_path,
+                flags,
+                rustix::fs::Mode::empty(),
+            )?,
+            Err(error) => return Err(error.into()),
+        };
+        let startup_file = std::fs::File::from(startup_descriptor);
+        let metadata = startup_file.metadata()?;
+        if !metadata.file_type().is_file()
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.permissions().mode() & 0o777 != 0o600
+            || metadata.nlink() != 1
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "daemon startup diagnostic file ownership, type, links, or mode is unsafe",
+            ));
+        }
+        startup_file.set_len(0)?;
+        std::fs::remove_file(&launch.startup_diagnostic_path)?;
+        if startup_file.metadata()?.nlink() != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "daemon startup diagnostic file remained linked after unlink",
+            ));
+        }
+        let inherited = rustix::io::fcntl_dupfd_cloexec(&startup_file, 3)?;
+        let child_diagnostic_fd = inherited.as_raw_fd();
         let mut command = tokio::process::Command::new(&launch.executable);
         command
             .current_dir(&launch.current_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .env("GASCAN_DAEMON_INSTANCE_PATH", &launch.instance_path)
-            .env("GASCAN_DAEMON_OWNER_TOKEN", &launch.owner_token);
+            .env("GASCAN_DAEMON_OWNER_TOKEN", &launch.owner_token)
+            .env(
+                "GASCAN_CONTROLLER_STARTUP_FD",
+                child_diagnostic_fd.to_string(),
+            );
+        command
+            .as_std_mut()
+            .fd_mappings(vec![FdMapping {
+                parent_fd: inherited,
+                child_fd: child_diagnostic_fd,
+            }])
+            .map_err(std::io::Error::other)?;
         if let Some(path) = &launch.stderr_path {
             command.stderr(
                 std::fs::OpenOptions::new()
@@ -322,7 +377,10 @@ impl DaemonSpawner for TokioDaemonSpawner {
             command.stderr(Stdio::null());
         }
         let _child = command.spawn()?;
-        Ok(())
+        Ok(DaemonStartupMonitor::from_file(
+            startup_file,
+            launch.owner_token.clone(),
+        ))
     }
 }
 
@@ -457,7 +515,10 @@ async fn connect(
 
 #[cfg(test)]
 mod tests {
-    use super::{ClientError, TokioDaemonSpawner, definitely_inert_connect_error};
+    use super::{
+        ClientError, FIXTURE_DAEMON_DIAGNOSTIC_DEADLINE, TokioDaemonSpawner,
+        definitely_inert_connect_error,
+    };
     use crate::daemon::{DaemonLaunch, DaemonPaths, DaemonSpawner};
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -625,7 +686,7 @@ mod tests {
         let script = root.join("fixture-gascand");
         std::fs::write(
             &script,
-            "#!/bin/sh\nif IFS= read -r ignored; then stdin_state=data; else stdin_state=eof; fi\nprintf '%s\\n%s\\n%s\\n%s\\n' \"$PWD\" \"$GASCAN_DAEMON_INSTANCE_PATH\" \"$GASCAN_DAEMON_OWNER_TOKEN\" \"$stdin_state\" >&2\nprintf 'stdout-must-be-null\\n'\n",
+            "#!/bin/sh\nif IFS= read -r ignored; then stdin_state=data; else stdin_state=eof; fi\nprintf '%s\\n%s\\n%s\\n%s\\n%s\\n' \"$PWD\" \"$GASCAN_DAEMON_INSTANCE_PATH\" \"$GASCAN_DAEMON_OWNER_TOKEN\" \"$GASCAN_CONTROLLER_STARTUP_FD\" \"$stdin_state\" >&2\nprintf 'stdout-must-be-null\\n'\n",
         )?;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
         let diagnostic = root.join("daemon.stderr");
@@ -635,17 +696,22 @@ mod tests {
             instance_path: runtime.join("daemon-instance.json"),
             owner_token: "test-owner".to_owned(),
             stderr_path: Some(diagnostic.clone()),
+            startup_diagnostic_path: runtime.join("daemon-startup-error.json"),
         };
 
         DaemonSpawner::spawn(&TokioDaemonSpawner, &launch)?;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let deadline = tokio::time::Instant::now() + FIXTURE_DAEMON_DIAGNOSTIC_DEADLINE;
         let output = loop {
             let output = std::fs::read_to_string(&diagnostic).unwrap_or_default();
-            if output.lines().count() >= 4 {
+            if output.lines().count() >= 5 {
                 break output;
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err("fixture daemon did not write diagnostics".into());
+                return Err(format!(
+                    "fixture daemon did not write diagnostics within {:?}: {output:?}",
+                    FIXTURE_DAEMON_DIAGNOSTIC_DEADLINE
+                )
+                .into());
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         };
@@ -653,7 +719,34 @@ mod tests {
         assert_eq!(lines[0], runtime.to_string_lossy());
         assert_eq!(lines[1], launch.instance_path.to_string_lossy());
         assert_eq!(lines[2], "test-owner");
-        assert_eq!(lines[3], "eof");
+        assert!(
+            lines[3]
+                .parse::<i32>()
+                .is_ok_and(|descriptor| descriptor >= 3)
+        );
+        assert_eq!(lines[4], "eof");
+        assert!(!launch.startup_diagnostic_path.exists());
+
+        std::fs::write(&launch.startup_diagnostic_path, b"do-not-truncate")?;
+        std::fs::set_permissions(
+            &launch.startup_diagnostic_path,
+            std::fs::Permissions::from_mode(0o644),
+        )?;
+        let error = DaemonSpawner::spawn(&TokioDaemonSpawner, &launch)
+            .err()
+            .ok_or("unsafe startup diagnostic was accepted")?;
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            std::fs::read(&launch.startup_diagnostic_path)?,
+            b"do-not-truncate"
+        );
+
+        std::fs::remove_file(&launch.startup_diagnostic_path)?;
+        let target = runtime.join("foreign-startup-target");
+        std::fs::write(&target, b"do-not-follow")?;
+        std::os::unix::fs::symlink(&target, &launch.startup_diagnostic_path)?;
+        assert!(DaemonSpawner::spawn(&TokioDaemonSpawner, &launch).is_err());
+        assert_eq!(std::fs::read(target)?, b"do-not-follow");
         Ok(())
     }
 

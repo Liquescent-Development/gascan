@@ -19,12 +19,15 @@ const INSTANCE_TOMBSTONE_MODE: u16 = 0o200;
 const SOCKET_NAME: &str = "gascand.sock";
 const INSTANCE_NAME: &str = "daemon-instance.json";
 const LIFECYCLE_LOCK_NAME: &str = "daemon-lifecycle.lock";
+const STARTUP_DIAGNOSTIC_NAME: &str = "daemon-startup-error.json";
 const MAX_INSTANCE_BYTES: u64 = 64 * 1024;
 const LIFECYCLE_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 const ENDPOINT_CHANGED_DURING_PROBE: &str =
     "daemon endpoint pathname changed during the successful probe";
 #[cfg(target_os = "macos")]
 const PROCESS_INSPECTION_TIMEOUT: Duration = Duration::from_millis(500);
+const STARTUP_DIAGNOSTIC_PREFIX: &str = "GASCAN_CONTROLLER_STARTUP_ERROR ";
+const MAX_STARTUP_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DaemonPaths {
@@ -298,6 +301,10 @@ pub(crate) enum SupervisorError {
         state: DaemonState,
         detail: Option<String>,
     },
+    ControllerStartup {
+        code: String,
+        message: String,
+    },
     GracefulTimeout {
         identity: Box<DaemonIdentity>,
     },
@@ -343,6 +350,9 @@ impl std::fmt::Display for SupervisorError {
                     .as_deref()
                     .map_or_else(String::new, |detail| format!(": {detail}"))
             ),
+            Self::ControllerStartup { code, message } => {
+                write!(formatter, "{code}: {message}")
+            }
             Self::GracefulTimeout { identity } => write!(
                 formatter,
                 "daemon {} did not exit after graceful shutdown; retry with --force to interrupt active work",
@@ -379,6 +389,7 @@ impl SupervisorError {
             | Self::Outdated { .. }
             | Self::InvalidState { .. }
             | Self::Readiness { .. }
+            | Self::ControllerStartup { .. }
             | Self::IdentityChanged { .. }
             | Self::ExitTimeout { .. }
             | Self::TombstoneBusy { .. }
@@ -433,10 +444,93 @@ pub(crate) struct DaemonLaunch {
     pub(crate) instance_path: PathBuf,
     pub(crate) owner_token: String,
     pub(crate) stderr_path: Option<PathBuf>,
+    pub(crate) startup_diagnostic_path: PathBuf,
 }
 
 pub(crate) trait DaemonSpawner: Send + Sync {
-    fn spawn(&self, launch: &DaemonLaunch) -> io::Result<()>;
+    fn spawn(&self, launch: &DaemonLaunch) -> io::Result<DaemonStartupMonitor>;
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct DaemonStartupMonitor {
+    source: Option<StartupDiagnosticSource>,
+}
+
+impl DaemonStartupMonitor {
+    pub(crate) fn from_file(file: File, owner_token: String) -> Self {
+        Self {
+            source: Some(StartupDiagnosticSource { file, owner_token }),
+        }
+    }
+
+    fn controller_error(&self) -> io::Result<Option<SupervisorError>> {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let Some(source) = &self.source else {
+            return Ok(None);
+        };
+        let metadata = source.file.metadata()?;
+        if !metadata.file_type().is_file()
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.permissions().mode() & 0o777 != u32::from(FILE_MODE)
+            || metadata.nlink() != 0
+            || metadata.len() > MAX_STARTUP_DIAGNOSTIC_BYTES as u64
+        {
+            return Ok(None);
+        }
+        let size = usize::try_from(metadata.len())
+            .map_err(|_| io::Error::other("daemon startup diagnostic size overflow"))?;
+        let mut bytes = vec![0_u8; size];
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let read = source.file.read_at(&mut bytes[offset..], offset as u64)?;
+            if read == 0 {
+                return Ok(None);
+            }
+            offset += read;
+        }
+        let Ok(captured) = std::str::from_utf8(&bytes) else {
+            return Ok(None);
+        };
+        for line in captured.lines() {
+            let Some(payload) = line.strip_prefix(STARTUP_DIAGNOSTIC_PREFIX) else {
+                continue;
+            };
+            let Ok(diagnostic) = serde_json::from_str::<ControllerStartupDiagnostic>(payload)
+            else {
+                continue;
+            };
+            if !matches!(
+                diagnostic.code.as_str(),
+                "controller_state_conflict"
+                    | "controller_state_unsafe"
+                    | "controller_state_invalid"
+                    | "controller_state_migration_failed"
+            ) || diagnostic.message.trim().is_empty()
+                || diagnostic.owner_token != source.owner_token
+            {
+                continue;
+            }
+            return Ok(Some(SupervisorError::ControllerStartup {
+                code: diagnostic.code,
+                message: diagnostic.message,
+            }));
+        }
+        Ok(None)
+    }
+}
+
+#[derive(Debug)]
+struct StartupDiagnosticSource {
+    file: File,
+    owner_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ControllerStartupDiagnostic {
+    code: String,
+    message: String,
+    owner_token: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1059,7 +1153,7 @@ where
         }
     }
     let launch = daemon_launch(paths, expected_executable)?;
-    spawner.spawn(&launch)?;
+    let startup = spawner.spawn(&launch)?;
     let expected_owner_token = launch.owner_token;
     let deadline = tokio::time::Instant::now() + timeouts.readiness;
     loop {
@@ -1071,6 +1165,9 @@ where
         {
             Ok(inspected) => inspected?,
             Err(_) => {
+                if let Some(error) = startup.controller_error()? {
+                    return Err(error);
+                }
                 return Err(SupervisorError::Readiness {
                     state: DaemonState::Unreachable,
                     detail: Some(
@@ -1079,6 +1176,13 @@ where
                 });
             }
         };
+        if matches!(
+            inspected.status.state,
+            DaemonState::Stopped | DaemonState::Unreachable
+        ) && let Some(error) = startup.controller_error()?
+        {
+            return Err(error);
+        }
         match inspected.status.state {
             DaemonState::Current
                 if inspected
@@ -2044,6 +2148,7 @@ fn daemon_launch(
         instance_path,
         owner_token,
         stderr_path: std::env::var_os("GASCAN_DAEMON_STDERR_PATH").map(PathBuf::from),
+        startup_diagnostic_path: paths.directory().join(STARTUP_DIAGNOSTIC_NAME),
     })
 }
 
@@ -3196,12 +3301,12 @@ mod tests {
     use super::{
         AttestedProcessSignaler, ConnectionOutcome, DaemonEndpoint, DaemonIdentity,
         DaemonInstanceRecord, DaemonLaunch, DaemonLifecycleObserver, DaemonPaths, DaemonSpawner,
-        DaemonState, DaemonTransition, EndpointPathState, EndpointProbe, EndpointSession,
-        InstanceTimestamp, OsProcessInspector, ProcessIdentity, ProcessInspector, ProcessSignaler,
-        ShutdownPolicy, StopMode, SupervisorError, SupervisorTimeouts, checked_pid,
-        coherent_process_identity, connect_current_or_recover_with,
-        connect_current_or_recover_with_observer, inspect_with, read_attested_instance,
-        read_instance_record_with_hook, restart_with, signal_attested_with,
+        DaemonStartupMonitor, DaemonState, DaemonTransition, EndpointPathState, EndpointProbe,
+        EndpointSession, InstanceTimestamp, MAX_STARTUP_DIAGNOSTIC_BYTES, OsProcessInspector,
+        ProcessIdentity, ProcessInspector, ProcessSignaler, ShutdownPolicy, StopMode,
+        SupervisorError, SupervisorTimeouts, checked_pid, coherent_process_identity,
+        connect_current_or_recover_with, connect_current_or_recover_with_observer, inspect_with,
+        read_attested_instance, read_instance_record_with_hook, restart_with, signal_attested_with,
         signal_attested_with_deadline, signal_identity, start_with, stop_with, wait_for_exit_until,
     };
     #[cfg(target_os = "macos")]
@@ -3242,6 +3347,106 @@ mod tests {
         paths.prepare_directory()?;
         fs::write(paths.instance(), serde_json::to_vec(record)?)?;
         fs::set_permissions(paths.instance(), fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+
+    #[test]
+    fn startup_diagnostics_accept_only_known_controller_codes() -> TestResult {
+        use std::io::Write as _;
+
+        let temp = tempfile::tempdir()?;
+        let diagnostic = temp.path().join("startup.json");
+        fs::write(
+            &diagnostic,
+            b"noise\nGASCAN_CONTROLLER_STARTUP_ERROR {\"code\":\"arbitrary_code\",\"message\":\"forged\",\"owner_token\":\"owner\"}\nGASCAN_CONTROLLER_STARTUP_ERROR {\"code\":\"controller_state_unsafe\",\"message\":\"wrong launch\",\"owner_token\":\"other\"}\n",
+        )?;
+        fs::set_permissions(&diagnostic, fs::Permissions::from_mode(0o600))?;
+        let mut writer = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&diagnostic)?;
+        let monitor = DaemonStartupMonitor::from_file(writer.try_clone()?, "owner".to_owned());
+        fs::remove_file(&diagnostic)?;
+        assert!(monitor.controller_error()?.is_none());
+
+        writer.write_all(
+            b"GASCAN_CONTROLLER_STARTUP_ERROR {\"code\":\"controller_state_unsafe\",\"message\":\"application directory mode is unsafe\",\"owner_token\":\"owner\"}\n",
+        )?;
+        let error = monitor
+            .controller_error()?
+            .ok_or("controller diagnostic missing")?;
+        assert!(matches!(
+            error,
+            SupervisorError::ControllerStartup { code, message }
+                if code == "controller_state_unsafe"
+                    && message == "application directory mode is unsafe"
+        ));
+
+        writer.set_len(u64::try_from(MAX_STARTUP_DIAGNOSTIC_BYTES + 1)?)?;
+        assert!(monitor.controller_error()?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inherited_startup_diagnostic_survives_path_replacement() -> TestResult {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let runtime = root.join("runtime");
+        fs::create_dir(&runtime)?;
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))?;
+        let startup_path = runtime.join("daemon-startup-error.json");
+        let script = root.join("fixture-gascand");
+        fs::write(
+            &script,
+            "#!/bin/sh\nreplacement_path=\"$PWD/daemon-startup-error.json\"\nif [ -e \"$replacement_path\" ]; then path_state=present; else path_state=missing; fi\nprintf 'replacement-path' > \"$replacement_path\"\nprintf '%s\\n' 'GASCAN_CONTROLLER_STARTUP_ERROR {\"code\":\"controller_state_unsafe\",\"message\":\"trusted inherited descriptor\",\"owner_token\":\"test-owner\"}' >> \"/dev/fd/$GASCAN_CONTROLLER_STARTUP_FD\"\nprintf '%s\\n%s\\n' \"$path_state\" \"$GASCAN_CONTROLLER_STARTUP_FD\" >&2\n",
+        )?;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
+        let stderr_path = root.join("daemon.stderr");
+        let launch = DaemonLaunch {
+            executable: script,
+            current_dir: runtime.clone(),
+            instance_path: runtime.join("daemon-instance.json"),
+            owner_token: "test-owner".to_owned(),
+            stderr_path: Some(stderr_path.clone()),
+            startup_diagnostic_path: startup_path.clone(),
+        };
+
+        let monitor = DaemonSpawner::spawn(&crate::client::TokioDaemonSpawner, &launch)?;
+        let deadline =
+            tokio::time::Instant::now() + crate::client::FIXTURE_DAEMON_DIAGNOSTIC_DEADLINE;
+        let error = loop {
+            if let Some(error) = monitor.controller_error()? {
+                break error;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+                let replacement = fs::read(&startup_path).unwrap_or_default();
+                return Err(format!(
+                    "fixture daemon did not write its inherited diagnostic within {:?}: stderr={stderr:?}, replacement={replacement:?}",
+                    crate::client::FIXTURE_DAEMON_DIAGNOSTIC_DEADLINE
+                )
+                .into());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert!(matches!(
+            error,
+            SupervisorError::ControllerStartup { ref code, ref message }
+                if code == "controller_state_unsafe"
+                    && message == "trusted inherited descriptor"
+        ));
+        assert_eq!(fs::read(&startup_path)?, b"replacement-path");
+        let stderr = fs::read_to_string(stderr_path)?;
+        let mut lines = stderr.lines();
+        assert_eq!(lines.next(), Some("missing"));
+        assert!(
+            lines
+                .next()
+                .and_then(|fd| fd.parse::<i32>().ok())
+                .is_some_and(|fd| fd >= 3)
+        );
         Ok(())
     }
 
@@ -4341,7 +4546,7 @@ mod tests {
     }
 
     impl DaemonSpawner for FakeSpawner {
-        fn spawn(&self, launch: &DaemonLaunch) -> io::Result<()> {
+        fn spawn(&self, launch: &DaemonLaunch) -> io::Result<DaemonStartupMonitor> {
             self.launches
                 .lock()
                 .map_err(|_| io::Error::other("fake launches were poisoned"))?
@@ -4376,7 +4581,7 @@ mod tests {
             if let Some(gate) = &self.gate {
                 gate.wait()?;
             }
-            Ok(())
+            Ok(DaemonStartupMonitor::default())
         }
     }
 
@@ -4404,7 +4609,7 @@ mod tests {
     }
 
     impl DaemonSpawner for DelayedPublicationSpawner {
-        fn spawn(&self, launch: &DaemonLaunch) -> io::Result<()> {
+        fn spawn(&self, launch: &DaemonLaunch) -> io::Result<DaemonStartupMonitor> {
             let published = DaemonInstanceRecord {
                 pid: std::process::id(),
                 owner_token: launch.owner_token.clone(),
@@ -4445,7 +4650,7 @@ mod tests {
                 .publisher
                 .lock()
                 .map_err(|_| io::Error::other("delayed publisher was poisoned"))? = Some(publisher);
-            Ok(())
+            Ok(DaemonStartupMonitor::default())
         }
     }
 
@@ -4823,7 +5028,7 @@ mod tests {
     }
 
     impl DaemonSpawner for TombstoneOnlySpawner {
-        fn spawn(&self, launch: &DaemonLaunch) -> io::Result<()> {
+        fn spawn(&self, launch: &DaemonLaunch) -> io::Result<DaemonStartupMonitor> {
             match fs::symlink_metadata(&launch.instance_path) {
                 Ok(metadata)
                     if metadata.file_type().is_file()
@@ -4876,9 +5081,9 @@ mod tests {
     struct CountingNoopSpawner(AtomicUsize);
 
     impl DaemonSpawner for CountingNoopSpawner {
-        fn spawn(&self, _launch: &DaemonLaunch) -> io::Result<()> {
+        fn spawn(&self, _launch: &DaemonLaunch) -> io::Result<DaemonStartupMonitor> {
             self.0.fetch_add(1, AtomicOrdering::AcqRel);
-            Ok(())
+            Ok(DaemonStartupMonitor::default())
         }
     }
 
@@ -6203,7 +6408,7 @@ mod tests {
     }
 
     impl DaemonSpawner for StopSpawner {
-        fn spawn(&self, launch: &DaemonLaunch) -> io::Result<()> {
+        fn spawn(&self, launch: &DaemonLaunch) -> io::Result<DaemonStartupMonitor> {
             self.launches
                 .lock()
                 .map_err(|_| io::Error::other("stop launches were poisoned"))?
@@ -6226,7 +6431,7 @@ mod tests {
                 .set(Some(process_for(&endpoint_identity(&published))))?;
             self.endpoint
                 .set(connected(endpoint_identity(&published)))?;
-            Ok(())
+            Ok(DaemonStartupMonitor::default())
         }
     }
 

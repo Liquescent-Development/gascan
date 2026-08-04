@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use gascan_apple::{
@@ -9,9 +9,10 @@ use gascan_core::doctor::{DoctorFact, DoctorFacts, DoctorReport, DoctorStatus};
 use gascan_core::fake_runtime::FakeRuntime;
 use gascan_core::runtime::{RuntimeBackend, RuntimeError};
 use gascand::{
-    BackendSelection, Daemon, DaemonConfig, DoctorState, ErrorDiagnostics, ProvisionRequest,
-    ProvisionResolution, Provisioner, SandboxApi, SandboxService, ServiceError, SocketPaths,
-    SshPaths, Store, backend_selection,
+    BackendSelection, ControllerStateError, ControllerStatePaths, Daemon, DaemonConfig,
+    DoctorState, ErrorDiagnostics, ProvisionRequest, ProvisionResolution, Provisioner, SandboxApi,
+    SandboxService, ServiceError, SocketPaths, SshPaths, Store, backend_selection,
+    open_controller_store,
 };
 use std::{sync::Arc, time::Duration};
 
@@ -210,8 +211,25 @@ impl Provisioner for ConfiguredProvisioner {
     }
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // SAFETY: This is the first application operation at synchronous process
+    // entry, before the Tokio runtime or any application thread exists. The
+    // trusted launcher maps the exact unowned descriptor named by the env var.
+    #[allow(unsafe_code)]
+    let startup_diagnostic =
+        unsafe { gascan_inherited_fd::take_startup_diagnostic()? }.map(|owned| StartupDiagnostic {
+            file: std::fs::File::from(owned),
+        });
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    runtime.block_on(run(startup_diagnostic))
+}
+
+async fn run(
+    mut startup_diagnostic: Option<StartupDiagnostic>,
+) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(debug_assertions)]
     if option_env!("CARGO_BIN_NAME") == Some("gascan-e2e-daemon") {
         if let Some(delay) = std::env::var("GASCAN_E2E_DAEMON_START_DELAY_MS")
@@ -227,10 +245,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_or(Duration::from_secs(300), Duration::from_millis);
     let paths = SocketPaths::for_user()?;
     paths.prepare_directory()?;
-    let state_path = std::env::var_os("GASCAN_STATE_PATH")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| paths.directory().join("state.sqlite3"));
-    let store = Store::open(state_path)?;
+    let store = match std::env::var_os("GASCAN_STATE_PATH") {
+        Some(path) => Store::open(std::path::PathBuf::from(path))?,
+        None => {
+            let state = controller_state_paths(&paths)
+                .map_err(|error| controller_startup_error(error, startup_diagnostic.as_mut()))?;
+            open_controller_store(&state)
+                .map_err(|error| controller_startup_error(error, startup_diagnostic.as_mut()))?
+        }
+    };
+    drop(startup_diagnostic);
     let e2e_ssh_paths = e2e_ssh_paths()?;
     #[cfg(debug_assertions)]
     let fake_requested = std::env::var_os(gascand::TEST_FAKE_BACKEND_ENV).is_some();
@@ -313,6 +337,117 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
         }
     }
+}
+
+struct StartupDiagnostic {
+    file: std::fs::File,
+}
+
+impl StartupDiagnostic {
+    fn write(&mut self, diagnostic: &[u8]) {
+        use std::io::Write as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        const MAX_STARTUP_DIAGNOSTIC_BYTES: u64 = 64 * 1024;
+        let Ok(diagnostic_len) = u64::try_from(diagnostic.len()) else {
+            return;
+        };
+        if diagnostic_len > MAX_STARTUP_DIAGNOSTIC_BYTES {
+            return;
+        }
+        let Ok(metadata) = self.file.metadata() else {
+            return;
+        };
+        if !metadata.file_type().is_file()
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.permissions().mode() & 0o777 != 0o600
+            || metadata.nlink() != 0
+            || metadata
+                .len()
+                .checked_add(diagnostic_len)
+                .is_none_or(|size| size > MAX_STARTUP_DIAGNOSTIC_BYTES)
+        {
+            return;
+        }
+        let _ = self.file.write_all(diagnostic);
+    }
+}
+
+fn report_controller_startup_error(
+    error: &ControllerStateError,
+    startup_diagnostic: Option<&mut StartupDiagnostic>,
+) {
+    let owner_token = std::env::var("GASCAN_DAEMON_OWNER_TOKEN").ok();
+    let diagnostic = owner_token.as_ref().map(|owner_token| {
+        format!(
+            "GASCAN_CONTROLLER_STARTUP_ERROR {}\n",
+            serde_json::json!({
+                "code": error.code(),
+                "message": error.to_string(),
+                "owner_token": owner_token,
+            })
+        )
+    });
+    if let Some(diagnostic) = diagnostic {
+        if let Some(startup_diagnostic) = startup_diagnostic {
+            startup_diagnostic.write(diagnostic.as_bytes());
+        }
+        eprint!("{diagnostic}");
+    } else {
+        eprintln!("{}: {}", error.code(), error);
+    }
+}
+
+fn controller_startup_error(
+    source: ControllerStateError,
+    startup_diagnostic: Option<&mut StartupDiagnostic>,
+) -> ControllerStartupError {
+    report_controller_startup_error(&source, startup_diagnostic);
+    ControllerStartupError::from(source)
+}
+
+#[derive(Debug)]
+struct ControllerStartupError {
+    code: &'static str,
+    source: ControllerStateError,
+}
+
+impl std::fmt::Display for ControllerStartupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.source)
+    }
+}
+
+impl std::error::Error for ControllerStartupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+impl From<ControllerStateError> for ControllerStartupError {
+    fn from(source: ControllerStateError) -> Self {
+        Self {
+            code: source.code(),
+            source,
+        }
+    }
+}
+
+fn controller_state_paths(
+    paths: &SocketPaths,
+) -> Result<ControllerStatePaths, ControllerStateError> {
+    #[cfg(debug_assertions)]
+    if option_env!("CARGO_BIN_NAME") == Some("gascan-e2e-daemon") {
+        let home = std::env::var_os("GASCAN_E2E_ACCOUNT_HOME").ok_or_else(|| {
+            ControllerStateError::Invalid("GASCAN_E2E_ACCOUNT_HOME is required".to_owned())
+        })?;
+        return ControllerStatePaths::for_home_and_runtime(
+            std::path::Path::new(&home),
+            paths.directory(),
+            rustix::process::geteuid().as_raw(),
+        );
+    }
+    ControllerStatePaths::for_user(paths.directory())
 }
 
 async fn run_daemon<B: RuntimeBackend + 'static>(

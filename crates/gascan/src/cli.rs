@@ -79,6 +79,8 @@ enum Command {
     },
     List {
         #[arg(long)]
+        all: bool,
+        #[arg(long)]
         json: bool,
     },
     Status {
@@ -558,9 +560,10 @@ pub async fn execute() -> Result<i32, CliError> {
             render_status(&status, json)?;
             Ok(0)
         }
-        Command::List { json } => {
+        Command::List { all, json } => {
             let list = client.api.list(v1::ListRequest {}).await?.into_inner();
-            render_list(&list.sandboxes, json)?;
+            let sandboxes = listed_sandboxes(list.sandboxes, all);
+            render_list(&sandboxes, json)?;
             Ok(0)
         }
         Command::Doctor { json } => {
@@ -915,7 +918,7 @@ fn command_uses_json(command: &Command) -> bool {
         | Command::Apply { json, .. }
         | Command::Down { json }
         | Command::Destroy { json, .. }
-        | Command::List { json }
+        | Command::List { json, .. }
         | Command::Status { json }
         | Command::Doctor { json } => *json,
         Command::Daemon { command } => daemon_command_uses_json(command),
@@ -1082,6 +1085,13 @@ fn supervisor_error_for_action(
     if let crate::daemon::SupervisorError::Client(error) = error {
         return CliError::Client(error);
     }
+    if let crate::daemon::SupervisorError::ControllerStartup { code, message } = error {
+        return CliError::DaemonOperation {
+            message: format!("{code}: {message}"),
+            code,
+            suggestion: None,
+        };
+    }
     let suggestion = matches!(
         error,
         crate::daemon::SupervisorError::GracefulTimeout { .. }
@@ -1093,6 +1103,9 @@ fn supervisor_error_for_action(
         crate::daemon::SupervisorError::Outdated { .. } => "daemon_outdated",
         crate::daemon::SupervisorError::InvalidState { .. } => "daemon_invalid_state",
         crate::daemon::SupervisorError::Readiness { .. } => "daemon_readiness_failed",
+        crate::daemon::SupervisorError::ControllerStartup { .. } => {
+            unreachable!("controller startup errors returned above")
+        }
         crate::daemon::SupervisorError::GracefulTimeout { .. } => {
             "daemon_graceful_shutdown_timeout"
         }
@@ -1611,6 +1624,14 @@ fn status_json(status: &v1::SandboxStatus) -> serde_json::Value {
         },
     })
 }
+
+fn listed_sandboxes(sandboxes: Vec<v1::SandboxStatus>, all: bool) -> Vec<v1::SandboxStatus> {
+    sandboxes
+        .into_iter()
+        .filter(|sandbox| all || sandbox.actual_state != v1::ActualState::Absent as i32)
+        .collect()
+}
+
 fn render_status(status: &v1::SandboxStatus, json: bool) -> Result<(), CliError> {
     if json {
         println!("{}", status_json(status));
@@ -1661,6 +1682,73 @@ fn confirm_destroy() -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_list_filters_absent_records() {
+        let listed = listed_sandboxes(
+            vec![
+                v1::SandboxStatus {
+                    sandbox_id: "running".to_owned(),
+                    actual_state: v1::ActualState::Running as i32,
+                    ..Default::default()
+                },
+                v1::SandboxStatus {
+                    sandbox_id: "old".to_owned(),
+                    actual_state: v1::ActualState::Absent as i32,
+                    ..Default::default()
+                },
+            ],
+            false,
+        );
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].sandbox_id, "running");
+    }
+
+    #[test]
+    fn list_all_retains_absent_records_in_source_order() {
+        let listed = listed_sandboxes(
+            vec![
+                v1::SandboxStatus {
+                    sandbox_id: "stopped".to_owned(),
+                    actual_state: v1::ActualState::Stopped as i32,
+                    ..Default::default()
+                },
+                v1::SandboxStatus {
+                    sandbox_id: "destroyed".to_owned(),
+                    actual_state: v1::ActualState::Absent as i32,
+                    ..Default::default()
+                },
+                v1::SandboxStatus {
+                    sandbox_id: "running".to_owned(),
+                    actual_state: v1::ActualState::Running as i32,
+                    ..Default::default()
+                },
+            ],
+            true,
+        );
+
+        assert_eq!(
+            listed
+                .iter()
+                .map(|sandbox| sandbox.sandbox_id.as_str())
+                .collect::<Vec<_>>(),
+            ["stopped", "destroyed", "running"]
+        );
+    }
+
+    #[test]
+    fn list_parses_all_with_json() -> Result<(), clap::Error> {
+        let arguments = Arguments::try_parse_from(["gascan", "list", "--all", "--json"])?;
+        assert!(matches!(
+            arguments.command,
+            Command::List {
+                all: true,
+                json: true,
+            }
+        ));
+        Ok(())
+    }
 
     #[test]
     fn optional_include_offer_failure_preserves_successful_up_result()

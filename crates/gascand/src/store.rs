@@ -1,6 +1,8 @@
 use camino::Utf8PathBuf;
 use gascan_core::sandbox::{SandboxId, SandboxIdError};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use serde::Serialize;
 use serde_json::Value;
 use std::fmt;
@@ -233,7 +235,28 @@ pub enum StoreError {
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let mut connection = Connection::open(path)?;
+        Self::open_with_flags(path, OpenFlags::default())
+    }
+
+    pub(crate) fn open_no_follow(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::open_with_flags(path, OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW)
+    }
+
+    pub(crate) fn open_no_follow_with_hook<E, F>(
+        path: impl AsRef<Path>,
+        after_open: F,
+    ) -> Result<Self, E>
+    where
+        E: From<StoreError>,
+        F: FnOnce() -> Result<(), E>,
+    {
+        let store = Self::open_no_follow(path).map_err(E::from)?;
+        after_open()?;
+        Ok(store)
+    }
+
+    fn open_with_flags(path: impl AsRef<Path>, flags: OpenFlags) -> Result<Self, StoreError> {
+        let mut connection = Connection::open_with_flags(path, flags)?;
         connection.busy_timeout(BUSY_TIMEOUT)?;
         connection.pragma_update(None, "foreign_keys", true)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;

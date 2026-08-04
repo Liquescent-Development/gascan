@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 base64.workspace = true
 clap.workspace = true
+command-fds.workspace = true
 console.workspace = true
 gascan-proto = { path = "../gascan-proto" }
 gascan-core = { path = "../gascan-core" }

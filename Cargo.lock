@@ -456,6 +456,7 @@ version = "0.1.18"
 dependencies = [
  "base64",
  "clap",
+ "command-fds",
  "console",
  "gascan-core",
  "gascan-proto",
@@ -518,10 +519,12 @@ dependencies = [
  "async-trait",
  "camino",
  "clap",
+ "command-fds",
  "console",
  "gascan",
  "gascan-apple",
  "gascan-core",
+ "gascan-inherited-fd",
  "gascan-proto",
  "gascand",
  "hyper-util",
@@ -537,6 +540,14 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tower 0.4.13",
+]
+
+[[package]]
+name = "gascan-inherited-fd"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rustix",
 ]
 
 [[package]]
@@ -561,10 +572,12 @@ dependencies = [
  "command-fds",
  "gascan-apple",
  "gascan-core",
+ "gascan-inherited-fd",
  "gascan-proto",
  "getrandom 0.4.3",
  "http-body-util",
  "hyper-util",
+ "nix",
  "plist",
  "prost",
  "prost-types",
