@@ -5,7 +5,14 @@ repo_root=$(cd "$(dirname "$0")/../.." && pwd -P)
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/gascan-installer-contract.XXXXXX")
 fixture=$(cd "$fixture" && pwd -P)
 daemon_pid=
-cleanup() { if [[ -n $daemon_pid ]]; then /bin/kill "$daemon_pid" 2>/dev/null || true; fi; rm -rf "$fixture"; }
+default_runtime_fixture=
+cleanup() {
+  if [[ -n $daemon_pid ]]; then /bin/kill "$daemon_pid" 2>/dev/null || true; fi
+  if [[ -n $default_runtime_fixture ]]; then
+    /bin/rm -rf -- "$default_runtime_fixture"
+  fi
+  rm -rf "$fixture"
+}
 trap cleanup EXIT
 mkdir -p "$fixture/bin"
 touch "$fixture/test.pkg"
@@ -44,19 +51,34 @@ write_fake shasum 'printf "%s  %s\\n" "$FIXTURE_OBSERVED_HASH" "$3"'
 write_fake lipo 'echo "$FIXTURE_ARCHS"'
 write_fake sudo 'printf "sudo:%s\\n" "$*" >>"$FIXTURE_LOG"'
 write_fake realpath 'printf "%s\\n" "$1"'
+write_fake id '
+[[ $1 == -u ]]
+printf "%s\\n" "${FIXTURE_ID_UID:-$(/usr/bin/id -u)}"'
 write_fake stat '
 [[ $1 == -f && $# == 3 ]]
 format=$2
 path=$3
+case $path in
+  .) absolute_path=$(/bin/pwd -P);;
+  ./*) absolute_path=$(/bin/pwd -P)/${path#./};;
+  *) absolute_path=$path;;
+esac
 case $format in
   %u)
-    if [[ -n ${FIXTURE_FOREIGN_STAT_PATH:-} && $path == "$FIXTURE_FOREIGN_STAT_PATH" ]]; then
+    if [[ -n ${FIXTURE_STAT_OWNER_PREFIX:-} && \
+      ($absolute_path == "$FIXTURE_STAT_OWNER_PREFIX" || \
+       $absolute_path == "$FIXTURE_STAT_OWNER_PREFIX/"*) ]]; then
+      printf "%s\\n" "$FIXTURE_STAT_OWNER_VALUE"
+    elif [[ -n ${FIXTURE_STAT_OWNER_PATH:-} && $absolute_path == "$FIXTURE_STAT_OWNER_PATH" ]]; then
+      printf "%s\\n" "$FIXTURE_STAT_OWNER_VALUE"
+    elif [[ -n ${FIXTURE_FOREIGN_STAT_PATH:-} && $absolute_path == "$FIXTURE_FOREIGN_STAT_PATH" ]]; then
       printf "999999\\n"
     else
       /usr/bin/stat -f %u "$path"
     fi
     ;;
   %Lp) /usr/bin/stat -f %Lp "$path";;
+  %Mp) /usr/bin/stat -f %Mp "$path";;
   %d:%i) /usr/bin/stat -f %d:%i "$path";;
   *) exit 64;;
 esac'
@@ -201,6 +223,38 @@ for invalid in '[{"sandbox_id":"same"},{"sandbox_id":"same"}]' '[{"sandbox_id":"
   run_uninstall --remove-data >/dev/null 2>&1 && { echo 'invalid sandbox inventory accepted' >&2; exit 1; }
 done
 
+uninstall_source=$repo_root/packaging/macos/uninstall.sh
+for required in \
+  'runtime_root=$(gascan_user_runtime_root)' \
+  'runtime_parent=${runtime_root%/*}' \
+  'runtime_child=${runtime_root##*/}' \
+  '[[ $runtime_parent == /private/tmp && $runtime_child == "gascan-$expected_uid" ]]'
+do
+  grep -Fq "$required" "$uninstall_source" || {
+    printf 'default runtime cleanup omits exact path contract: %s\n' "$required" >&2
+    exit 1
+  }
+done
+
+export FIXTURE_SANDBOX_JSON='[]' FIXTURE_ALL_SANDBOX_JSON='[]'
+prepare_uninstall_roots
+default_runtime_uid=$((3000000000 + $$))
+default_runtime_fixture=/private/tmp/gascan-$default_runtime_uid
+[[ ! -e $default_runtime_fixture && ! -L $default_runtime_fixture ]]
+mkdir "$default_runtime_fixture"
+chmod 0700 "$default_runtime_fixture"
+printf 'default runtime sentinel\n' >"$default_runtime_fixture/daemon-instance.json"
+export FIXTURE_ID_UID=$default_runtime_uid
+export FIXTURE_STAT_OWNER_PATH=$default_runtime_fixture
+FIXTURE_STAT_OWNER_PREFIX=$(dirname "$(dirname "$fixture")")
+export FIXTURE_STAT_OWNER_PREFIX
+export FIXTURE_STAT_OWNER_VALUE=$default_runtime_uid
+env -u XDG_RUNTIME_DIR HOME="$fixture_user_home" \
+  "$repo_root/packaging/macos/uninstall.sh" --remove-data >/dev/null
+[[ ! -e $default_runtime_fixture && ! -L $default_runtime_fixture ]]
+default_runtime_fixture=
+unset FIXTURE_ID_UID FIXTURE_STAT_OWNER_PATH FIXTURE_STAT_OWNER_PREFIX FIXTURE_STAT_OWNER_VALUE
+
 export FIXTURE_SANDBOX_JSON='[]' FIXTURE_ALL_SANDBOX_JSON='[]' FIXTURE_FOREIGN_STAT_PATH=
 expect_unsafe_removal_refused() {
   local label=$1
@@ -242,5 +296,27 @@ prepare_uninstall_roots
 export FIXTURE_FOREIGN_STAT_PATH=$fixture_runtime_root
 expect_unsafe_removal_refused 'foreign runtime root owner'
 export FIXTURE_FOREIGN_STAT_PATH=
+
+safe_fixture_user_home=$fixture_user_home
+safe_fixture_controller_root=$fixture_controller_root
+mkdir -p "$fixture/home-ancestor-target"
+ln -s "$fixture/home-ancestor-target" "$fixture/symlink-home-parent"
+fixture_user_home=$fixture/symlink-home-parent/uninstall-home
+fixture_controller_root="$fixture_user_home/Library/Application Support/dev.gascan/controller"
+prepare_uninstall_roots
+expect_unsafe_removal_refused 'symlinked ancestor above HOME'
+fixture_user_home=$safe_fixture_user_home
+fixture_controller_root=$safe_fixture_controller_root
+
+safe_fixture_runtime_base=$fixture_runtime_base
+safe_fixture_runtime_root=$fixture_runtime_root
+mkdir -p "$fixture/runtime-ancestor-target"
+ln -s "$fixture/runtime-ancestor-target" "$fixture/symlink-runtime-parent"
+fixture_runtime_base=$fixture/symlink-runtime-parent/runtime
+fixture_runtime_root=$fixture_runtime_base/gascan
+prepare_uninstall_roots
+expect_unsafe_removal_refused 'symlinked ancestor above XDG_RUNTIME_DIR'
+fixture_runtime_base=$safe_fixture_runtime_base
+fixture_runtime_root=$safe_fixture_runtime_root
 
 printf 'PASS: Gas Can installer contract\n'

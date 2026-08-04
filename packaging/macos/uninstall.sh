@@ -16,114 +16,146 @@ gascan_uninstall_validate_absolute_base() {
     { gascan_uninstall_refuse_path "$path"; return 65; }
 }
 
-gascan_uninstall_validate_owned_directory() {
-  local path=$1 expected_uid=$2 private=$3 owner mode mode_value
-  [[ -e $path || -L $path ]] || return 2
-  [[ -d $path && ! -L $path ]] ||
-    { gascan_uninstall_refuse_path "$path"; return 65; }
-  owner=$(stat -f '%u' "$path") ||
-    { gascan_uninstall_refuse_path "$path"; return 65; }
-  mode=$(stat -f '%Lp' "$path") ||
-    { gascan_uninstall_refuse_path "$path"; return 65; }
-  [[ $owner == "$expected_uid" && $mode =~ ^[0-7]{3,4}$ ]] ||
-    { gascan_uninstall_refuse_path "$path"; return 65; }
-  mode_value=$((8#$mode))
-  if [[ $private == true ]]; then
-    ((mode_value == 0700)) ||
-      { gascan_uninstall_refuse_path "$path"; return 65; }
+gascan_uninstall_validate_directory_entry() {
+  local entry=$1 display_path=$2 expected_uid=$3 require_user=$4 private=$5
+  local owner mode special mode_value
+  [[ -e $entry || -L $entry ]] || return 2
+  [[ -d $entry && ! -L $entry ]] ||
+    { gascan_uninstall_refuse_path "$display_path"; return 65; }
+  owner=$(stat -f '%u' "$entry") ||
+    { gascan_uninstall_refuse_path "$display_path"; return 65; }
+  mode=$(stat -f '%Lp' "$entry") ||
+    { gascan_uninstall_refuse_path "$display_path"; return 65; }
+  special=$(stat -f '%Mp' "$entry") ||
+    { gascan_uninstall_refuse_path "$display_path"; return 65; }
+  [[ $mode =~ ^[0-7]{3}$ && $special =~ ^[0-7]+$ ]] ||
+    { gascan_uninstall_refuse_path "$display_path"; return 65; }
+  if [[ $require_user == true ]]; then
+    [[ $owner == "$expected_uid" ]] ||
+      { gascan_uninstall_refuse_path "$display_path"; return 65; }
   else
-    (( (mode_value & 07022) == 0 )) ||
-      { gascan_uninstall_refuse_path "$path"; return 65; }
+    [[ $owner == 0 || $owner == "$expected_uid" ]] ||
+      { gascan_uninstall_refuse_path "$display_path"; return 65; }
+  fi
+  mode_value=$((8#$mode))
+  if [[ $owner == 0 && $display_path == /private/tmp ]]; then
+    [[ $special == 1 ]] && ((mode_value == 0777)) ||
+      { gascan_uninstall_refuse_path "$display_path"; return 65; }
+  elif [[ $private == true ]]; then
+    [[ $owner == "$expected_uid" && $special == 0 ]] &&
+      ((mode_value == 0700)) ||
+      { gascan_uninstall_refuse_path "$display_path"; return 65; }
+  else
+    [[ $special == 0 ]] && (( (mode_value & 0022) == 0 )) ||
+      { gascan_uninstall_refuse_path "$display_path"; return 65; }
   fi
 }
 
-gascan_uninstall_validate_system_directory() {
-  local path=$1 expected_mode=$2 owner mode
-  [[ -d $path && ! -L $path ]] ||
-    { gascan_uninstall_refuse_path "$path"; return 65; }
-  owner=$(stat -f '%u' "$path") ||
-    { gascan_uninstall_refuse_path "$path"; return 65; }
-  mode=$(stat -f '%Lp' "$path") ||
-    { gascan_uninstall_refuse_path "$path"; return 65; }
-  [[ $owner == 0 && $mode == "$expected_mode" ]] ||
-    { gascan_uninstall_refuse_path "$path"; return 65; }
-}
+gascan_uninstall_remove_absolute_private_child() {
+  local parent=$1 child=$2 expected_uid=$3 user_base=$4 parent_private=$5
+  local component current entry identity require_user private status
+  local -a components
+  gascan_uninstall_validate_absolute_base "$parent" || return $?
+  [[ $child != */* && $child != . && $child != .. && -n $child ]] || {
+    gascan_uninstall_refuse_path "$parent/$child"
+    return 65
+  }
+  if [[ -n $user_base ]]; then
+    gascan_uninstall_validate_absolute_base "$user_base" || return $?
+    [[ $parent == "$user_base" || $parent == "$user_base/"* ]] || {
+      gascan_uninstall_refuse_path "$parent"
+      return 65
+    }
+  fi
 
-gascan_uninstall_remove_bound_private_child() {
-  local parent=$1 child=$2 expected_uid=$3 parent_private=$4 parent_identity
-  parent_identity=$(stat -f '%d:%i' "$parent") ||
-    { gascan_uninstall_refuse_path "$parent"; return 65; }
+  IFS=/ read -r -a components <<<"${parent#/}"
   (
-    builtin cd -P -- "$parent" ||
-      { gascan_uninstall_refuse_path "$parent"; exit 65; }
-    [[ $(stat -f '%d:%i' .) == "$parent_identity" ]] ||
-      { gascan_uninstall_refuse_path "$parent"; exit 65; }
-    gascan_uninstall_validate_owned_directory \
-      . "$expected_uid" "$parent_private" || exit $?
-    gascan_uninstall_validate_owned_directory \
-      "./$child" "$expected_uid" true || exit $?
+    builtin cd -P / || exit 65
+    gascan_uninstall_validate_directory_entry . / "$expected_uid" false false || exit $?
+    current=
+    for component in "${components[@]}"; do
+      [[ -n $component && $component != . && $component != .. ]] || {
+        gascan_uninstall_refuse_path "$parent"
+        exit 65
+      }
+      current=$current/$component
+      entry=./$component
+      require_user=false
+      if [[ -n $user_base && \
+        ($current == "$user_base" || $current == "$user_base/"*) ]]; then
+        require_user=true
+      fi
+      private=false
+      [[ $current == "$parent" && $parent_private == true ]] && private=true
+      gascan_uninstall_validate_directory_entry \
+        "$entry" "$current" "$expected_uid" "$require_user" "$private" || {
+        status=$?
+        if [[ $status == 2 && -n $user_base && \
+          ($user_base == "$current" || $user_base == "$current/"*) ]]; then
+          gascan_uninstall_refuse_path "$current"
+          exit 65
+        fi
+        [[ $status == 2 && -z $user_base ]] && {
+          gascan_uninstall_refuse_path "$current"
+          exit 65
+        }
+        exit "$status"
+      }
+      identity=$(stat -f '%d:%i' "$entry") || {
+        gascan_uninstall_refuse_path "$current"
+        exit 65
+      }
+      builtin cd -P -- "$entry" || {
+        gascan_uninstall_refuse_path "$current"
+        exit 65
+      }
+      [[ $(stat -f '%d:%i' .) == "$identity" ]] || {
+        gascan_uninstall_refuse_path "$current"
+        exit 65
+      }
+    done
+    gascan_uninstall_validate_directory_entry \
+      "./$child" "$parent/$child" "$expected_uid" true true || exit $?
     /bin/rm -rf -- "./$child" || exit $?
   )
 }
 
 gascan_uninstall_remove_controller_data() {
-  local expected_uid=$1 component current controller_parent private status
-  local -a components=(Library 'Application Support' dev.gascan controller)
-  gascan_uninstall_validate_absolute_base "$HOME" || return $?
-  gascan_uninstall_validate_owned_directory "$HOME" "$expected_uid" false || {
-    status=$?
-    if [[ $status == 2 ]]; then
-      gascan_uninstall_refuse_path "$HOME"
-      return 65
-    fi
-    return "$status"
-  }
-  current=$HOME
-  for component in "${components[@]}"; do
-    current=$current/$component
-    private=false
-    [[ $component == dev.gascan || $component == controller ]] && private=true
-    gascan_uninstall_validate_owned_directory \
-      "$current" "$expected_uid" "$private" || {
-      status=$?
-      [[ $status == 2 ]] && return 0
-      return "$status"
-    }
-  done
-  controller_parent=${current%/controller}
-  gascan_uninstall_remove_bound_private_child \
-    "$controller_parent" controller "$expected_uid" true
-}
-
-gascan_uninstall_remove_runtime_data() {
-  local expected_uid=$1 runtime_parent runtime_root status
-  if [[ -n ${XDG_RUNTIME_DIR:-} ]]; then
-    runtime_parent=$XDG_RUNTIME_DIR
-    gascan_uninstall_validate_absolute_base "$runtime_parent" || return $?
-    gascan_uninstall_validate_owned_directory \
-      "$runtime_parent" "$expected_uid" true || {
-      status=$?
-      if [[ $status == 2 ]]; then
-        gascan_uninstall_refuse_path "$runtime_parent"
-        return 65
-      fi
-      return "$status"
-    }
-  else
-    runtime_parent=/private/tmp
-    gascan_uninstall_validate_system_directory /private 755 || return $?
-    gascan_uninstall_validate_system_directory "$runtime_parent" 1777 || return $?
-  fi
-  runtime_root=$runtime_parent/gascan
-  gascan_uninstall_validate_owned_directory \
-    "$runtime_root" "$expected_uid" true || {
+  local expected_uid=$1 controller_root controller_parent status
+  controller_root=$(gascan_user_controller_root)
+  controller_parent=${controller_root%/controller}
+  gascan_uninstall_remove_absolute_private_child \
+    "$controller_parent" controller "$expected_uid" "$HOME" true || {
     status=$?
     [[ $status == 2 ]] && return 0
     return "$status"
   }
-  gascan_uninstall_remove_bound_private_child \
-    "$runtime_parent" gascan "$expected_uid" \
-    "$([[ -n ${XDG_RUNTIME_DIR:-} ]] && printf true || printf false)"
+}
+
+gascan_uninstall_remove_runtime_data() {
+  local expected_uid=$1 runtime_parent runtime_root runtime_child user_base status
+  if [[ -n ${XDG_RUNTIME_DIR:-} ]]; then
+    runtime_parent=$XDG_RUNTIME_DIR
+    runtime_root=$runtime_parent/gascan
+    runtime_child=gascan
+    user_base=$runtime_parent
+  else
+    runtime_root=$(gascan_user_runtime_root)
+    runtime_parent=${runtime_root%/*}
+    runtime_child=${runtime_root##*/}
+    user_base=
+    [[ $runtime_parent == /private/tmp && $runtime_child == "gascan-$expected_uid" ]] || {
+      gascan_uninstall_refuse_path "$runtime_root"
+      return 65
+    }
+  fi
+  gascan_uninstall_remove_absolute_private_child \
+    "$runtime_parent" "$runtime_child" "$expected_uid" "$user_base" \
+    "$([[ -n $user_base ]] && printf true || printf false)" || {
+    status=$?
+    [[ $status == 2 ]] && return 0
+    return "$status"
+  }
 }
 
 remove_data=false
