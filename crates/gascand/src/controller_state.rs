@@ -263,14 +263,32 @@ fn migrate_legacy_store_with_after_stage_hook<F>(
 where
     F: FnOnce(&str) -> Result<(), ControllerStateError>,
 {
+    migrate_legacy_store_with_snapshot_hooks(paths, controller, legacy, fault, after_stage, |_| {
+        Ok(())
+    })
+}
+
+fn migrate_legacy_store_with_snapshot_hooks<F, G>(
+    paths: &ControllerStatePaths,
+    controller: &ControllerDirectory,
+    legacy: &LegacyState,
+    fault: Option<MigrationFault>,
+    after_stage: F,
+    after_consumption: G,
+) -> Result<Store, ControllerStateError>
+where
+    F: FnOnce(&str) -> Result<(), ControllerStateError>,
+    G: FnOnce(&str) -> Result<(), ControllerStateError>,
+{
     let monitor = DatabaseMutationMonitor::new_for_legacy(legacy)?;
-    let snapshot_name = make_snapshot_with_after_stage_hook(
+    let snapshot_name = make_snapshot_with_hooks(
         paths,
         controller,
         &legacy.database,
         &legacy.sidecars,
         fault,
         after_stage,
+        after_consumption,
     )?;
     monitor.ensure_unchanged().map_err(|error| {
         ControllerStateError::Unsafe(format!(
@@ -560,6 +578,30 @@ fn make_snapshot_with_after_stage_hook<F>(
 where
     F: FnOnce(&str) -> Result<(), ControllerStateError>,
 {
+    make_snapshot_with_hooks(
+        paths,
+        controller,
+        source,
+        sidecars,
+        fault,
+        after_stage,
+        |_| Ok(()),
+    )
+}
+
+fn make_snapshot_with_hooks<F, G>(
+    paths: &ControllerStatePaths,
+    controller: &ControllerDirectory,
+    source: &PrivateDatabase,
+    sidecars: &BTreeMap<String, PrivateDatabase>,
+    fault: Option<MigrationFault>,
+    after_stage: F,
+    after_consumption: G,
+) -> Result<String, ControllerStateError>
+where
+    F: FnOnce(&str) -> Result<(), ControllerStateError>,
+    G: FnOnce(&str) -> Result<(), ControllerStateError>,
+{
     let sequence = next_temp_sequence(&controller.descriptor)?;
     let staged_name = format!("{TEMP_PREFIX}source-{sequence}");
     copy_private_file(
@@ -590,12 +632,6 @@ where
     )?;
     let staged_sidecars =
         open_private_sidecars(&controller.descriptor, &staged_name, paths.expected_uid)?;
-    let staged_monitor =
-        DatabaseMutationMonitor::new_for_snapshot_input(controller, &staged, &staged_sidecars)?;
-    after_stage(&staged_name)?;
-    staged_monitor.ensure_unchanged()?;
-    validate_database_family_binding(paths, controller, &staged, &staged_sidecars, &staged_name)?;
-
     let snapshot_sequence = next_temp_sequence(&controller.descriptor)?;
     let snapshot_name = format!("{TEMP_PREFIX}snapshot-{snapshot_sequence}");
     let snapshot_descriptor =
@@ -610,6 +646,11 @@ where
         )?,
         descriptor: snapshot_descriptor,
     };
+    let staged_monitor =
+        DatabaseMutationMonitor::new_for_snapshot_input(controller, &staged, &staged_sidecars)?;
+    after_stage(&staged_name)?;
+    staged_monitor.ensure_unchanged()?;
+    validate_database_family_binding(paths, controller, &staged, &staged_sidecars, &staged_name)?;
     let monitor = DatabaseMutationMonitor::new_for_controller_files(controller, &[&snapshot])?;
     let source_path = controller_path(paths, &staged_name);
     let snapshot_path = controller_path(paths, &snapshot_name);
@@ -633,9 +674,28 @@ where
         .run_to_completion(128, Duration::from_millis(1), None)
         .map_err(|error| migration_sql_error("copying the SQLite snapshot", error))?;
     drop(backup);
+
+    after_consumption(&staged_name)?;
+    ensure_snapshot_monitor_safe(
+        &staged_monitor,
+        controller,
+        &staged,
+        &staged_sidecars,
+        &staged_name,
+        paths,
+        false,
+    )?;
     drop(destination_connection);
     drop(source_connection);
-
+    ensure_snapshot_monitor_safe(
+        &staged_monitor,
+        controller,
+        &staged,
+        &staged_sidecars,
+        &staged_name,
+        paths,
+        true,
+    )?;
     monitor.ensure_unchanged()?;
     validate_named_database_binding(paths, controller, &staged, &staged_name)?;
     validate_consumed_database_family_binding(
@@ -1367,17 +1427,19 @@ fn archive_legacy_orphans(
     controller: &ControllerDirectory,
     orphans: &LegacyOrphans,
 ) -> Result<(), ControllerStateError> {
-    archive_legacy_orphans_with_hook(paths, controller, orphans, |_| Ok(()))
+    archive_legacy_orphans_with_hooks(paths, controller, orphans, |_| Ok(()), |_, _| Ok(()))
 }
 
-fn archive_legacy_orphans_with_hook<F>(
+fn archive_legacy_orphans_with_hooks<F, G>(
     paths: &ControllerStatePaths,
     controller: &ControllerDirectory,
     orphans: &LegacyOrphans,
     mut final_unlink_window: F,
+    mut before_quarantine_move: G,
 ) -> Result<(), ControllerStateError>
 where
     F: FnMut(&str) -> Result<(), ControllerStateError>,
+    G: FnMut(&OwnedFd, &str) -> Result<(), ControllerStateError>,
 {
     let monitor = DatabaseMutationMonitor::new_for_orphans(orphans)?;
     let backup_name = collision_free_backup_name(&controller.descriptor, paths.expected_uid)?;
@@ -1412,8 +1474,15 @@ where
             ));
         }
         final_unlink_window(&name)?;
-        rustix::fs::renameat(runtime, &name, &quarantine, &name)
-            .map_err(|error| unsafe_error("quarantining an orphaned SQLite sidecar", error))?;
+        before_quarantine_move(&quarantine, &name)?;
+        rustix::fs::renameat_with(
+            runtime,
+            &name,
+            &quarantine,
+            &name,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(|error| unsafe_error("quarantining an orphaned SQLite sidecar", error))?;
         let quarantined_stat = rustix::fs::statat(&quarantine, &name, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|error| unsafe_error("quarantined orphaned SQLite sidecar", error))?;
         let quarantined_identity = validate_private_file_stat(
@@ -2105,6 +2174,30 @@ fn validate_consumed_database_family_binding(
     Ok(())
 }
 
+fn ensure_snapshot_monitor_safe(
+    monitor: &DatabaseMutationMonitor,
+    directory: &ControllerDirectory,
+    database: &PrivateDatabase,
+    sidecars: &BTreeMap<String, PrivateDatabase>,
+    database_name: &str,
+    paths: &ControllerStatePaths,
+    validate_binding: bool,
+) -> Result<(), ControllerStateError> {
+    let current_sidecars =
+        open_private_sidecars(&directory.descriptor, database_name, paths.expected_uid)?;
+    monitor.ensure_snapshot_consumption_safe(sidecars, &current_sidecars)?;
+    if validate_binding {
+        validate_consumed_database_family_binding(
+            paths,
+            directory,
+            database,
+            sidecars,
+            database_name,
+        )?;
+    }
+    Ok(())
+}
+
 fn validate_legacy_binding(
     paths: &ControllerStatePaths,
     legacy: &LegacyState,
@@ -2541,6 +2634,45 @@ impl DatabaseMutationMonitor {
     }
 
     fn ensure_unchanged(&self) -> Result<(), ControllerStateError> {
+        if !self.observed_events()?.is_empty() {
+            return Err(ControllerStateError::Unsafe(
+                "controller database identity changed while opening the store".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_snapshot_consumption_safe(
+        &self,
+        sidecars: &BTreeMap<String, PrivateDatabase>,
+        current_sidecars: &BTreeMap<String, PrivateDatabase>,
+    ) -> Result<(), ControllerStateError> {
+        let identity_events = FilterFlag::NOTE_DELETE
+            | FilterFlag::NOTE_RENAME
+            | FilterFlag::NOTE_LINK
+            | FilterFlag::NOTE_REVOKE;
+        for event in self.observed_events()? {
+            let flags = event.fflags();
+            if !flags.intersects(identity_events) {
+                continue;
+            }
+            let missing_consumed_sidecar = sidecars.iter().any(|(suffix, sidecar)| {
+                sidecar.descriptor.as_raw_fd() as usize == event.ident()
+                    && !current_sidecars.contains_key(suffix)
+            });
+            if missing_consumed_sidecar && !flags.intersects(FilterFlag::NOTE_REVOKE) {
+                continue;
+            }
+            return Err(ControllerStateError::Unsafe(format!(
+                "staged controller database identity changed during snapshot consumption: descriptor {}, flags {:?}",
+                event.ident(),
+                flags
+            )));
+        }
+        Ok(())
+    }
+
+    fn observed_events(&self) -> Result<Vec<KEvent>, ControllerStateError> {
         let placeholder = KEvent::new(
             0,
             EventFilter::EVFILT_VNODE,
@@ -2565,12 +2697,8 @@ impl DatabaseMutationMonitor {
                     "controller database identity monitor failed: {error}"
                 ))
             })?;
-        if count != 0 {
-            return Err(ControllerStateError::Unsafe(
-                "controller database identity changed while opening the store".to_owned(),
-            ));
-        }
-        Ok(())
+        events.truncate(count);
+        Ok(events)
     }
 }
 
@@ -2626,6 +2754,14 @@ impl DatabaseMutationMonitor {
     }
 
     const fn ensure_unchanged(&self) -> Result<(), ControllerStateError> {
+        Ok(())
+    }
+
+    fn ensure_snapshot_consumption_safe(
+        &self,
+        _sidecars: &BTreeMap<String, PrivateDatabase>,
+        _current_sidecars: &BTreeMap<String, PrivateDatabase>,
+    ) -> Result<(), ControllerStateError> {
         Ok(())
     }
 }
@@ -2762,7 +2898,7 @@ fn unsafe_error(context: &str, error: rustix::io::Errno) -> ControllerStateError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
@@ -2831,6 +2967,92 @@ mod tests {
         let _controller = open_controller_directory(&paths)?;
         seed_test_store(paths.legacy_database(), "legacy")?;
         Ok(paths)
+    }
+
+    fn assert_snapshot_post_consumption_aba_refused(
+        suffix: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let root = temp.path().canonicalize()?;
+        let paths = seeded_legacy_paths(&root)?;
+        let connection = if suffix == Some("-wal") {
+            let connection = Connection::open(paths.legacy_database())?;
+            connection.pragma_update(None, "journal_mode", "WAL")?;
+            connection.pragma_update(None, "wal_autocheckpoint", 0)?;
+            connection.execute("UPDATE sandboxes SET updated_at_millis = 9", [])?;
+            for sidecar_suffix in ["-wal", "-shm"] {
+                fs::set_permissions(
+                    PathBuf::from(format!(
+                        "{}{sidecar_suffix}",
+                        paths.legacy_database().display()
+                    )),
+                    fs::Permissions::from_mode(0o600),
+                )?;
+            }
+            Some(connection)
+        } else if suffix == Some("-journal") {
+            let connection = Connection::open(paths.legacy_database())?;
+            connection.pragma_update(None, "journal_mode", "PERSIST")?;
+            connection.execute("UPDATE sandboxes SET updated_at_millis = 9", [])?;
+            let journal = PathBuf::from(format!("{}-journal", paths.legacy_database().display()));
+            fs::set_permissions(&journal, fs::Permissions::from_mode(0o600))?;
+            Some(connection)
+        } else {
+            None
+        };
+        let controller = open_existing_controller_directory(&paths)?;
+        let legacy = open_legacy_state(&paths)?
+            .ok_or_else(|| std::io::Error::other("legacy state disappeared"))?;
+        let displaced = root.join(format!(
+            "post-consumption-displaced{}",
+            suffix.unwrap_or("-main")
+        ));
+        let aba_completed = Cell::new(false);
+
+        let result = migrate_legacy_store_with_snapshot_hooks(
+            &paths,
+            &controller,
+            &legacy,
+            None,
+            |_| Ok(()),
+            |staged_name| {
+                let target =
+                    controller_path(&paths, &format!("{staged_name}{}", suffix.unwrap_or("")));
+                fs::rename(&target, &displaced)
+                    .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+                fs::rename(&displaced, &target)
+                    .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+                aba_completed.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(
+            aba_completed.get(),
+            "post-consumption ABA hook did not complete"
+        );
+        assert!(matches!(result, Err(ControllerStateError::Unsafe(_))));
+        assert!(!paths.durable_database().exists());
+        drop(connection);
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_monitor_refuses_post_consumption_main_aba() -> Result<(), Box<dyn std::error::Error>>
+    {
+        assert_snapshot_post_consumption_aba_refused(None)
+    }
+
+    #[test]
+    fn snapshot_monitor_refuses_post_consumption_wal_aba() -> Result<(), Box<dyn std::error::Error>>
+    {
+        assert_snapshot_post_consumption_aba_refused(Some("-wal"))
+    }
+
+    #[test]
+    fn snapshot_monitor_refuses_post_consumption_journal_aba()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_snapshot_post_consumption_aba_refused(Some("-journal"))
     }
 
     #[test]
@@ -2928,17 +3150,79 @@ mod tests {
         let orphans = open_legacy_orphans(&paths)?
             .ok_or_else(|| std::io::Error::other("legacy orphan disappeared"))?;
 
-        let result = archive_legacy_orphans_with_hook(&paths, &controller, &orphans, |_| {
-            fs::rename(&orphan, &displaced)
-                .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
-            fs::rename(&replacement, &orphan)
-                .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
-            Ok(())
-        });
+        let result = archive_legacy_orphans_with_hooks(
+            &paths,
+            &controller,
+            &orphans,
+            |_| {
+                fs::rename(&orphan, &displaced)
+                    .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+                fs::rename(&replacement, &orphan)
+                    .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+                Ok(())
+            },
+            |_, _| Ok(()),
+        );
 
         assert!(matches!(result, Err(ControllerStateError::Unsafe(_))));
         assert_eq!(fs::read(&orphan)?, b"replacement orphan");
         assert_eq!(fs::read(&displaced)?, b"original orphan");
+        Ok(())
+    }
+
+    #[test]
+    fn orphan_archival_does_not_clobber_a_raced_quarantine_destination()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let root = temp.path().canonicalize()?;
+        let paths = seeded_legacy_paths(&root)?;
+        fs::remove_file(paths.legacy_database())?;
+        let orphan = PathBuf::from(format!("{}-wal", paths.legacy_database().display()));
+        fs::write(&orphan, b"original orphan")?;
+        fs::set_permissions(&orphan, fs::Permissions::from_mode(0o600))?;
+        let controller = open_existing_controller_directory(&paths)?;
+        let orphans = open_legacy_orphans(&paths)?
+            .ok_or_else(|| std::io::Error::other("legacy orphan disappeared"))?;
+
+        let result = archive_legacy_orphans_with_hooks(
+            &paths,
+            &controller,
+            &orphans,
+            |_| Ok(()),
+            |quarantine, name| {
+                let descriptor =
+                    create_private_file(quarantine, name, "raced orphan quarantine destination")?;
+                let mut destination = File::from(descriptor);
+                destination
+                    .write_all(b"raced destination")
+                    .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+                destination
+                    .sync_all()
+                    .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+                Ok(())
+            },
+        );
+
+        assert!(matches!(result, Err(ControllerStateError::Unsafe(_))));
+        assert_eq!(fs::read(&orphan)?, b"original orphan");
+        let quarantine = fs::read_dir(
+            paths
+                .legacy_database()
+                .parent()
+                .ok_or_else(|| std::io::Error::other("legacy database has no parent"))?,
+        )?
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(ORPHAN_QUARANTINE_PREFIX)
+        })
+        .ok_or_else(|| std::io::Error::other("orphan quarantine disappeared"))?;
+        assert_eq!(
+            fs::read(quarantine.path().join("state.sqlite3-wal"))?,
+            b"raced destination"
+        );
         Ok(())
     }
 
