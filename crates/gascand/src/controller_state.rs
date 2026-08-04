@@ -263,22 +263,30 @@ fn migrate_legacy_store_with_after_stage_hook<F>(
 where
     F: FnOnce(&str) -> Result<(), ControllerStateError>,
 {
-    migrate_legacy_store_with_snapshot_hooks(paths, controller, legacy, fault, after_stage, |_| {
-        Ok(())
-    })
+    migrate_legacy_store_with_snapshot_hooks(
+        paths,
+        controller,
+        legacy,
+        fault,
+        after_stage,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
 }
 
-fn migrate_legacy_store_with_snapshot_hooks<F, G>(
+fn migrate_legacy_store_with_snapshot_hooks<F, G, H>(
     paths: &ControllerStatePaths,
     controller: &ControllerDirectory,
     legacy: &LegacyState,
     fault: Option<MigrationFault>,
     after_stage: F,
-    after_consumption: G,
+    after_open: G,
+    after_consumption: H,
 ) -> Result<Store, ControllerStateError>
 where
     F: FnOnce(&str) -> Result<(), ControllerStateError>,
     G: FnOnce(&str) -> Result<(), ControllerStateError>,
+    H: FnOnce(&str) -> Result<(), ControllerStateError>,
 {
     let monitor = DatabaseMutationMonitor::new_for_legacy(legacy)?;
     let snapshot_name = make_snapshot_with_hooks(
@@ -287,8 +295,11 @@ where
         &legacy.database,
         &legacy.sidecars,
         fault,
-        after_stage,
-        after_consumption,
+        SnapshotHooks {
+            after_stage,
+            after_open,
+            after_consumption,
+        },
     )?;
     monitor.ensure_unchanged().map_err(|error| {
         ControllerStateError::Unsafe(format!(
@@ -584,24 +595,42 @@ where
         source,
         sidecars,
         fault,
-        after_stage,
-        |_| Ok(()),
+        SnapshotHooks {
+            after_stage,
+            after_open: no_snapshot_hook,
+            after_consumption: no_snapshot_hook,
+        },
     )
 }
 
-fn make_snapshot_with_hooks<F, G>(
+fn no_snapshot_hook(_staged_name: &str) -> Result<(), ControllerStateError> {
+    Ok(())
+}
+
+struct SnapshotHooks<F, G, H> {
+    after_stage: F,
+    after_open: G,
+    after_consumption: H,
+}
+
+fn make_snapshot_with_hooks<F, G, H>(
     paths: &ControllerStatePaths,
     controller: &ControllerDirectory,
     source: &PrivateDatabase,
     sidecars: &BTreeMap<String, PrivateDatabase>,
     fault: Option<MigrationFault>,
-    after_stage: F,
-    after_consumption: G,
+    hooks: SnapshotHooks<F, G, H>,
 ) -> Result<String, ControllerStateError>
 where
     F: FnOnce(&str) -> Result<(), ControllerStateError>,
     G: FnOnce(&str) -> Result<(), ControllerStateError>,
+    H: FnOnce(&str) -> Result<(), ControllerStateError>,
 {
+    let SnapshotHooks {
+        after_stage,
+        after_open,
+        after_consumption,
+    } = hooks;
     let sequence = next_temp_sequence(&controller.descriptor)?;
     let staged_name = format!("{TEMP_PREFIX}source-{sequence}");
     copy_private_file(
@@ -646,21 +675,7 @@ where
         )?,
         descriptor: snapshot_descriptor,
     };
-    let staged_monitor =
-        DatabaseMutationMonitor::new_for_snapshot_input(controller, &staged, &staged_sidecars)?;
-    after_stage(&staged_name)?;
-    staged_monitor.ensure_unchanged()?;
-    validate_database_family_binding(paths, controller, &staged, &staged_sidecars, &staged_name)?;
-    let monitor = DatabaseMutationMonitor::new_for_controller_files(controller, &[&snapshot])?;
-    let source_path = controller_path(paths, &staged_name);
     let snapshot_path = controller_path(paths, &snapshot_name);
-    let source_connection = Connection::open_with_flags(
-        source_path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_NOFOLLOW
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|error| migration_sql_error("opening the staged source", error))?;
     let mut destination_connection = Connection::open_with_flags(
         &snapshot_path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -668,6 +683,95 @@ where
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|error| migration_sql_error("opening the migration snapshot", error))?;
+    destination_connection
+        .pragma_update(None, "journal_mode", "OFF")
+        .map_err(|error| migration_sql_error("disabling snapshot journaling", error))?;
+    let preopen_monitor =
+        DatabaseMutationMonitor::new_for_snapshot_input(controller, &staged, &staged_sidecars)?;
+    after_stage(&staged_name)?;
+    preopen_monitor.ensure_unchanged()?;
+    validate_database_family_binding(paths, controller, &staged, &staged_sidecars, &staged_name)?;
+    let monitor = DatabaseMutationMonitor::new_for_controller_files(controller, &[&snapshot])?;
+    let source_path = controller_path(paths, &staged_name);
+    let source_connection = Connection::open_with_flags(
+        &source_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| migration_sql_error("opening the staged source", error))?;
+    // Opening a read-only SQLite connection can synchronously recover a copied hot journal or
+    // initialize WAL/SHM bookkeeping. The already-armed monitor permits only those exact
+    // lifecycle events, with no callback in the reconciliation window, and every resulting
+    // pathname is rebound below before it can become snapshot input.
+    let consumed_sidecars =
+        open_private_sidecars(&controller.descriptor, &staged_name, paths.expected_uid)?;
+    preopen_monitor.ensure_sqlite_source_open_safe(
+        controller,
+        &staged,
+        &staged_sidecars,
+        &consumed_sidecars,
+    )?;
+    validate_named_database_binding(paths, controller, &staged, &staged_name)?;
+    validate_sqlite_source_open_family_binding(
+        paths,
+        controller,
+        &staged,
+        &staged_sidecars,
+        &consumed_sidecars,
+        &staged_name,
+    )?;
+    let warmup_monitor =
+        DatabaseMutationMonitor::new_for_snapshot_input(controller, &staged, &consumed_sidecars)?;
+    // Drive SQLite's remaining lazy WAL/SHM read initialization into a disposable database.
+    // This result is never published. After the input family is rebound, the real backup runs
+    // under a fresh monitor whose policy rejects every write and unexplained directory event.
+    let mut warmup_connection = Connection::open_in_memory()
+        .map_err(|error| migration_sql_error("opening the disposable SQLite warm-up", error))?;
+    let warmup = Backup::new(&source_connection, &mut warmup_connection)
+        .map_err(|error| migration_sql_error("starting the disposable SQLite warm-up", error))?;
+    warmup
+        .run_to_completion(128, Duration::from_millis(1), None)
+        .map_err(|error| migration_sql_error("reading the disposable SQLite warm-up", error))?;
+    drop(warmup);
+    drop(warmup_connection);
+    let warmed_sidecars =
+        open_private_sidecars(&controller.descriptor, &staged_name, paths.expected_uid)?;
+    let consumption_monitor =
+        DatabaseMutationMonitor::new_for_snapshot_input(controller, &staged, &warmed_sidecars)?;
+    warmup_monitor.ensure_sqlite_source_open_safe(
+        controller,
+        &staged,
+        &consumed_sidecars,
+        &warmed_sidecars,
+    )?;
+    validate_sqlite_source_open_family_binding(
+        paths,
+        controller,
+        &staged,
+        &consumed_sidecars,
+        &warmed_sidecars,
+        &staged_name,
+    )?;
+    ensure_snapshot_monitor_safe(
+        &consumption_monitor,
+        controller,
+        &staged,
+        &warmed_sidecars,
+        &staged_name,
+        paths,
+        true,
+    )?;
+    after_open(&staged_name)?;
+    ensure_snapshot_monitor_safe(
+        &consumption_monitor,
+        controller,
+        &staged,
+        &warmed_sidecars,
+        &staged_name,
+        paths,
+        true,
+    )?;
     let backup = Backup::new(&source_connection, &mut destination_connection)
         .map_err(|error| migration_sql_error("starting the SQLite backup", error))?;
     backup
@@ -677,34 +781,18 @@ where
 
     after_consumption(&staged_name)?;
     ensure_snapshot_monitor_safe(
-        &staged_monitor,
+        &consumption_monitor,
         controller,
         &staged,
-        &staged_sidecars,
-        &staged_name,
-        paths,
-        false,
-    )?;
-    drop(destination_connection);
-    drop(source_connection);
-    ensure_snapshot_monitor_safe(
-        &staged_monitor,
-        controller,
-        &staged,
-        &staged_sidecars,
+        &warmed_sidecars,
         &staged_name,
         paths,
         true,
     )?;
+    drop(destination_connection);
+    drop(source_connection);
     monitor.ensure_unchanged()?;
     validate_named_database_binding(paths, controller, &staged, &staged_name)?;
-    validate_consumed_database_family_binding(
-        paths,
-        controller,
-        &staged,
-        &staged_sidecars,
-        &staged_name,
-    )?;
     validate_named_database_binding(paths, controller, &snapshot, &snapshot_name)?;
     let validated = Store::open_no_follow(&snapshot_path).map_err(ControllerStateError::Store)?;
     validated
@@ -2174,6 +2262,56 @@ fn validate_consumed_database_family_binding(
     Ok(())
 }
 
+fn validate_sqlite_source_open_family_binding(
+    paths: &ControllerStatePaths,
+    directory: &ControllerDirectory,
+    database: &PrivateDatabase,
+    original_sidecars: &BTreeMap<String, PrivateDatabase>,
+    current_sidecars: &BTreeMap<String, PrivateDatabase>,
+    database_name: &str,
+) -> Result<(), ControllerStateError> {
+    validate_named_database_binding(paths, directory, database, database_name)?;
+    for (suffix, sidecar) in original_sidecars {
+        let stat = rustix::fs::fstat(&sidecar.descriptor)
+            .map_err(|error| unsafe_error("retained staged SQLite sidecar", error))?;
+        if validate_retained_private_file_stat(
+            &stat,
+            paths.expected_uid,
+            "retained staged SQLite sidecar",
+        )? != sidecar.identity
+        {
+            return Err(ControllerStateError::Unsafe(
+                "retained staged SQLite sidecar identity changed while opening SQLite".to_owned(),
+            ));
+        }
+        match current_sidecars.get(suffix) {
+            Some(current) if current.identity == sidecar.identity => {}
+            None if suffix == "-journal" => {}
+            _ => {
+                return Err(ControllerStateError::Unsafe(
+                    "staged SQLite sidecar identity changed while opening SQLite".to_owned(),
+                ));
+            }
+        }
+    }
+    for suffix in current_sidecars.keys() {
+        if !original_sidecars.contains_key(suffix) && suffix != "-wal" && suffix != "-shm" {
+            return Err(ControllerStateError::Unsafe(
+                "SQLite created an unexpected staged sidecar while opening the source".to_owned(),
+            ));
+        }
+    }
+    for (suffix, sidecar) in current_sidecars {
+        validate_named_database_binding(
+            paths,
+            directory,
+            sidecar,
+            &format!("{database_name}{suffix}"),
+        )?;
+    }
+    Ok(())
+}
+
 fn ensure_snapshot_monitor_safe(
     monitor: &DatabaseMutationMonitor,
     directory: &ControllerDirectory,
@@ -2185,7 +2323,7 @@ fn ensure_snapshot_monitor_safe(
 ) -> Result<(), ControllerStateError> {
     let current_sidecars =
         open_private_sidecars(&directory.descriptor, database_name, paths.expected_uid)?;
-    monitor.ensure_snapshot_consumption_safe(sidecars, &current_sidecars)?;
+    monitor.ensure_snapshot_consumption_safe(directory, database, sidecars, &current_sidecars)?;
     if validate_binding {
         validate_consumed_database_family_binding(
             paths,
@@ -2644,6 +2782,8 @@ impl DatabaseMutationMonitor {
 
     fn ensure_snapshot_consumption_safe(
         &self,
+        directory: &ControllerDirectory,
+        database: &PrivateDatabase,
         sidecars: &BTreeMap<String, PrivateDatabase>,
         current_sidecars: &BTreeMap<String, PrivateDatabase>,
     ) -> Result<(), ControllerStateError> {
@@ -2651,23 +2791,89 @@ impl DatabaseMutationMonitor {
             | FilterFlag::NOTE_RENAME
             | FilterFlag::NOTE_LINK
             | FilterFlag::NOTE_REVOKE;
+        let identity_removal_events = FilterFlag::NOTE_DELETE | FilterFlag::NOTE_RENAME;
         for event in self.observed_events()? {
             let flags = event.fflags();
-            if !flags.intersects(identity_events) {
-                continue;
-            }
             let missing_consumed_sidecar = sidecars.iter().any(|(suffix, sidecar)| {
                 sidecar.descriptor.as_raw_fd() as usize == event.ident()
                     && !current_sidecars.contains_key(suffix)
             });
-            if missing_consumed_sidecar && !flags.intersects(FilterFlag::NOTE_REVOKE) {
+            if missing_consumed_sidecar
+                && flags.intersects(identity_removal_events)
+                && !flags.intersects(FilterFlag::NOTE_REVOKE)
+            {
                 continue;
             }
+            let descriptor = if event.ident() == database.descriptor.as_raw_fd() as usize {
+                "staged main".to_owned()
+            } else if event.ident() == directory.descriptor.as_raw_fd() as usize {
+                format!(
+                    "controller directory (captured sidecars {:?}, current sidecars {:?})",
+                    sidecars.keys().collect::<Vec<_>>(),
+                    current_sidecars.keys().collect::<Vec<_>>()
+                )
+            } else if let Some((suffix, _)) = sidecars
+                .iter()
+                .find(|(_, sidecar)| sidecar.descriptor.as_raw_fd() as usize == event.ident())
+            {
+                format!("staged sidecar {suffix}")
+            } else {
+                "controller ancestor".to_owned()
+            };
             return Err(ControllerStateError::Unsafe(format!(
-                "staged controller database identity changed during snapshot consumption: descriptor {}, flags {:?}",
+                "staged controller database changed during snapshot consumption: {descriptor}, descriptor {}, identity flags {:?}, all flags {:?}",
                 event.ident(),
-                flags
+                flags & identity_events,
+                flags,
             )));
+        }
+        Ok(())
+    }
+
+    fn ensure_sqlite_source_open_safe(
+        &self,
+        directory: &ControllerDirectory,
+        database: &PrivateDatabase,
+        original_sidecars: &BTreeMap<String, PrivateDatabase>,
+        current_sidecars: &BTreeMap<String, PrivateDatabase>,
+    ) -> Result<(), ControllerStateError> {
+        let identity_events = FilterFlag::NOTE_DELETE
+            | FilterFlag::NOTE_RENAME
+            | FilterFlag::NOTE_LINK
+            | FilterFlag::NOTE_REVOKE;
+        let pure_write = FilterFlag::NOTE_WRITE;
+        let journal_removed = original_sidecars.contains_key("-journal")
+            && !current_sidecars.contains_key("-journal");
+        let sidecar_set_changed = original_sidecars.keys().ne(current_sidecars.keys());
+        for event in self.observed_events()? {
+            let flags = event.fflags();
+            let allowed = if event.ident() == directory.descriptor.as_raw_fd() as usize {
+                sidecar_set_changed && flags == pure_write
+            } else if event.ident() == database.descriptor.as_raw_fd() as usize {
+                journal_removed && flags == pure_write
+            } else if let Some((suffix, _)) = original_sidecars
+                .iter()
+                .find(|(_, sidecar)| sidecar.descriptor.as_raw_fd() as usize == event.ident())
+            {
+                if suffix == "-shm" {
+                    flags == pure_write
+                } else if suffix == "-journal" && journal_removed {
+                    flags.intersects(FilterFlag::NOTE_DELETE | FilterFlag::NOTE_RENAME)
+                        && !flags.intersects(FilterFlag::NOTE_LINK | FilterFlag::NOTE_REVOKE)
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !allowed {
+                return Err(ControllerStateError::Unsafe(format!(
+                    "staged controller database changed unexpectedly while SQLite opened it: descriptor {}, identity flags {:?}, all flags {:?}",
+                    event.ident(),
+                    flags & identity_events,
+                    flags,
+                )));
+            }
         }
         Ok(())
     }
@@ -2759,7 +2965,19 @@ impl DatabaseMutationMonitor {
 
     fn ensure_snapshot_consumption_safe(
         &self,
+        _directory: &ControllerDirectory,
+        _database: &PrivateDatabase,
         _sidecars: &BTreeMap<String, PrivateDatabase>,
+        _current_sidecars: &BTreeMap<String, PrivateDatabase>,
+    ) -> Result<(), ControllerStateError> {
+        Ok(())
+    }
+
+    fn ensure_sqlite_source_open_safe(
+        &self,
+        _directory: &ControllerDirectory,
+        _database: &PrivateDatabase,
+        _original_sidecars: &BTreeMap<String, PrivateDatabase>,
         _current_sidecars: &BTreeMap<String, PrivateDatabase>,
     ) -> Result<(), ControllerStateError> {
         Ok(())
@@ -2975,31 +3193,7 @@ mod tests {
         let temp = TempDir::new()?;
         let root = temp.path().canonicalize()?;
         let paths = seeded_legacy_paths(&root)?;
-        let connection = if suffix == Some("-wal") {
-            let connection = Connection::open(paths.legacy_database())?;
-            connection.pragma_update(None, "journal_mode", "WAL")?;
-            connection.pragma_update(None, "wal_autocheckpoint", 0)?;
-            connection.execute("UPDATE sandboxes SET updated_at_millis = 9", [])?;
-            for sidecar_suffix in ["-wal", "-shm"] {
-                fs::set_permissions(
-                    PathBuf::from(format!(
-                        "{}{sidecar_suffix}",
-                        paths.legacy_database().display()
-                    )),
-                    fs::Permissions::from_mode(0o600),
-                )?;
-            }
-            Some(connection)
-        } else if suffix == Some("-journal") {
-            let connection = Connection::open(paths.legacy_database())?;
-            connection.pragma_update(None, "journal_mode", "PERSIST")?;
-            connection.execute("UPDATE sandboxes SET updated_at_millis = 9", [])?;
-            let journal = PathBuf::from(format!("{}-journal", paths.legacy_database().display()));
-            fs::set_permissions(&journal, fs::Permissions::from_mode(0o600))?;
-            Some(connection)
-        } else {
-            None
-        };
+        let connection = prepare_snapshot_sidecar(&paths, suffix)?;
         let controller = open_existing_controller_directory(&paths)?;
         let legacy = open_legacy_state(&paths)?
             .ok_or_else(|| std::io::Error::other("legacy state disappeared"))?;
@@ -3015,6 +3209,7 @@ mod tests {
             &legacy,
             None,
             |_| Ok(()),
+            |_| Ok(()),
             |staged_name| {
                 let target =
                     controller_path(&paths, &format!("{staged_name}{}", suffix.unwrap_or("")));
@@ -3029,12 +3224,44 @@ mod tests {
 
         assert!(
             aba_completed.get(),
-            "post-consumption ABA hook did not complete"
+            "post-consumption ABA hook did not complete: {:?}",
+            result.as_ref().err()
         );
         assert!(matches!(result, Err(ControllerStateError::Unsafe(_))));
         assert!(!paths.durable_database().exists());
         drop(connection);
         Ok(())
+    }
+
+    fn prepare_snapshot_sidecar(
+        paths: &ControllerStatePaths,
+        suffix: Option<&str>,
+    ) -> Result<Option<Connection>, Box<dyn std::error::Error>> {
+        if suffix == Some("-wal") {
+            let connection = Connection::open(paths.legacy_database())?;
+            connection.pragma_update(None, "journal_mode", "WAL")?;
+            connection.pragma_update(None, "wal_autocheckpoint", 0)?;
+            connection.execute("UPDATE sandboxes SET updated_at_millis = 9", [])?;
+            for sidecar_suffix in ["-wal", "-shm"] {
+                fs::set_permissions(
+                    PathBuf::from(format!(
+                        "{}{sidecar_suffix}",
+                        paths.legacy_database().display()
+                    )),
+                    fs::Permissions::from_mode(0o600),
+                )?;
+            }
+            Ok(Some(connection))
+        } else if suffix == Some("-journal") {
+            let connection = Connection::open(paths.legacy_database())?;
+            connection.pragma_update(None, "journal_mode", "PERSIST")?;
+            connection.execute("UPDATE sandboxes SET updated_at_millis = 9", [])?;
+            let journal = PathBuf::from(format!("{}-journal", paths.legacy_database().display()));
+            fs::set_permissions(&journal, fs::Permissions::from_mode(0o600))?;
+            Ok(Some(connection))
+        } else {
+            Ok(None)
+        }
     }
 
     #[test]
@@ -3053,6 +3280,109 @@ mod tests {
     fn snapshot_monitor_refuses_post_consumption_journal_aba()
     -> Result<(), Box<dyn std::error::Error>> {
         assert_snapshot_post_consumption_aba_refused(Some("-journal"))
+    }
+
+    fn assert_snapshot_post_open_write_refused(
+        suffix: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let root = temp.path().canonicalize()?;
+        let paths = seeded_legacy_paths(&root)?;
+        let connection = prepare_snapshot_sidecar(&paths, suffix)?;
+        let controller = open_existing_controller_directory(&paths)?;
+        let legacy = open_legacy_state(&paths)?
+            .ok_or_else(|| std::io::Error::other("legacy state disappeared"))?;
+        let mutation_completed = Cell::new(false);
+
+        let result = migrate_legacy_store_with_snapshot_hooks(
+            &paths,
+            &controller,
+            &legacy,
+            None,
+            |_| Ok(()),
+            |staged_name| {
+                let target =
+                    controller_path(&paths, &format!("{staged_name}{}", suffix.unwrap_or("")));
+                let mut file = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&target)
+                    .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+                file.write_all(b"post-consumption mutation")
+                    .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+                file.sync_all()
+                    .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+                mutation_completed.set(true);
+                Ok(())
+            },
+            |_| Ok(()),
+        );
+
+        assert!(
+            mutation_completed.get(),
+            "post-open write hook did not complete: {:?}",
+            result.as_ref().err()
+        );
+        assert!(matches!(result, Err(ControllerStateError::Unsafe(_))));
+        assert!(!paths.durable_database().exists());
+        drop(connection);
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_monitor_refuses_post_open_main_write() -> Result<(), Box<dyn std::error::Error>> {
+        assert_snapshot_post_open_write_refused(None)
+    }
+
+    #[test]
+    fn snapshot_monitor_refuses_post_open_wal_write() -> Result<(), Box<dyn std::error::Error>> {
+        assert_snapshot_post_open_write_refused(Some("-wal"))
+    }
+
+    #[test]
+    fn snapshot_monitor_refuses_post_open_journal_write() -> Result<(), Box<dyn std::error::Error>>
+    {
+        assert_snapshot_post_open_write_refused(Some("-journal"))
+    }
+
+    #[test]
+    fn snapshot_monitor_refuses_transient_new_sidecar_write()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let root = temp.path().canonicalize()?;
+        let paths = seeded_legacy_paths(&root)?;
+        let controller = open_existing_controller_directory(&paths)?;
+        let legacy = open_legacy_state(&paths)?
+            .ok_or_else(|| std::io::Error::other("legacy state disappeared"))?;
+        let mutation_completed = Cell::new(false);
+
+        let result = migrate_legacy_store_with_snapshot_hooks(
+            &paths,
+            &controller,
+            &legacy,
+            None,
+            |_| Ok(()),
+            |staged_name| {
+                let transient = controller_path(&paths, &format!("{staged_name}-wal"));
+                fs::write(&transient, b"transient injected sidecar")
+                    .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+                fs::set_permissions(&transient, fs::Permissions::from_mode(0o600))
+                    .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+                fs::remove_file(&transient)
+                    .map_err(|error| ControllerStateError::Unsafe(error.to_string()))?;
+                mutation_completed.set(true);
+                Ok(())
+            },
+            |_| Ok(()),
+        );
+
+        assert!(
+            mutation_completed.get(),
+            "transient sidecar hook did not complete: {:?}",
+            result.as_ref().err()
+        );
+        assert!(matches!(result, Err(ControllerStateError::Unsafe(_))));
+        assert!(!paths.durable_database().exists());
+        Ok(())
     }
 
     #[test]
