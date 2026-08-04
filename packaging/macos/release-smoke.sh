@@ -620,7 +620,7 @@ jq -e '
 '
 gascan_release_volume_marker=durable-controller-marker
 "$gascan_bin" --sandbox "$sandbox_id" run -- bash -lc \
-  'printf "%s\\n" "$1" >"$XDG_CONFIG_HOME/gascan-release-smoke/controller-state-marker"' \
+  'mkdir -p "$XDG_CONFIG_HOME/gascan-release-smoke"; printf "%s\\n" "$1" >"$XDG_CONFIG_HOME/gascan-release-smoke/controller-state-marker"' \
   _ "$gascan_release_volume_marker"
 "$gascan_bin" --sandbox "$sandbox_id" run -- bash -lc '
   set -euo pipefail

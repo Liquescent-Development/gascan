@@ -126,6 +126,17 @@ fn release_smoke_isolates_durable_controller_state_and_checks_destroyed_tombston
     assert!(smoke[marker_check..].contains(
         "[[ $post_recreation_marker == \"$gascan_release_volume_marker\" ]]"
     ));
+
+    let marker_directory = smoke
+        .find("mkdir -p \"$XDG_CONFIG_HOME/gascan-release-smoke\"")
+        .expect("release smoke must create the marker directory");
+    let marker_write = smoke
+        .find(">\"$XDG_CONFIG_HOME/gascan-release-smoke/controller-state-marker\"")
+        .expect("release smoke must write the persistence marker");
+    assert!(
+        marker_directory < marker_write,
+        "release smoke must create the marker directory before writing the marker"
+    );
 }
 
 #[test]
