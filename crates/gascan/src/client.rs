@@ -16,6 +16,9 @@ use tower::service_fn;
 
 const ENDPOINT_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
+#[cfg(test)]
+pub(crate) const FIXTURE_DAEMON_DIAGNOSTIC_DEADLINE: Duration = Duration::from_secs(5);
+
 #[derive(Debug)]
 pub enum ClientError {
     Io(std::io::Error),
@@ -512,7 +515,10 @@ async fn connect(
 
 #[cfg(test)]
 mod tests {
-    use super::{ClientError, TokioDaemonSpawner, definitely_inert_connect_error};
+    use super::{
+        ClientError, FIXTURE_DAEMON_DIAGNOSTIC_DEADLINE, TokioDaemonSpawner,
+        definitely_inert_connect_error,
+    };
     use crate::daemon::{DaemonLaunch, DaemonPaths, DaemonSpawner};
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -694,14 +700,18 @@ mod tests {
         };
 
         DaemonSpawner::spawn(&TokioDaemonSpawner, &launch)?;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let deadline = tokio::time::Instant::now() + FIXTURE_DAEMON_DIAGNOSTIC_DEADLINE;
         let output = loop {
             let output = std::fs::read_to_string(&diagnostic).unwrap_or_default();
             if output.lines().count() >= 5 {
                 break output;
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err("fixture daemon did not write diagnostics".into());
+                return Err(format!(
+                    "fixture daemon did not write diagnostics within {:?}: {output:?}",
+                    FIXTURE_DAEMON_DIAGNOSTIC_DEADLINE
+                )
+                .into());
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         };

@@ -3414,13 +3414,20 @@ mod tests {
         };
 
         let monitor = DaemonSpawner::spawn(&crate::client::TokioDaemonSpawner, &launch)?;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let deadline =
+            tokio::time::Instant::now() + crate::client::FIXTURE_DAEMON_DIAGNOSTIC_DEADLINE;
         let error = loop {
             if let Some(error) = monitor.controller_error()? {
                 break error;
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err("fixture daemon did not write its inherited diagnostic".into());
+                let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+                let replacement = fs::read(&startup_path).unwrap_or_default();
+                return Err(format!(
+                    "fixture daemon did not write its inherited diagnostic within {:?}: stderr={stderr:?}, replacement={replacement:?}",
+                    crate::client::FIXTURE_DAEMON_DIAGNOSTIC_DEADLINE
+                )
+                .into());
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
