@@ -3,7 +3,7 @@ use crate::client::Client;
 use crate::terminal::RawTerminal;
 use gascan_proto::v1;
 use std::fmt;
-use std::io::{IsTerminal as _, Write as _};
+use std::io::IsTerminal as _;
 use std::os::fd::AsFd as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
@@ -515,6 +515,37 @@ async fn drive_input_until_attach<T>(
     }
 }
 
+async fn write_host_output(fd: impl std::os::fd::AsFd, bytes: &[u8]) -> std::io::Result<()> {
+    let fd = rustix::io::dup(fd)?;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match rustix::io::write(&fd, &bytes[offset..]).map_err(std::io::Error::from) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(count) => offset += count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => return Err(error),
+        }
+    }
+    if offset == bytes.len() {
+        return Ok(());
+    }
+    let fd = tokio::io::unix::AsyncFd::new(fd)?;
+    while offset < bytes.len() {
+        let mut writable = fd.writable().await?;
+        match writable.try_io(|fd| {
+            rustix::io::write(fd.get_ref(), &bytes[offset..]).map_err(std::io::Error::from)
+        }) {
+            Ok(Ok(0)) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(Ok(count)) => offset += count,
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => continue,
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn attach_to_stdio(
     client: &mut Client,
     token: Vec<u8>,
@@ -566,12 +597,10 @@ pub(crate) async fn attach_to_stdio(
         while let Some(frame) = attached.message().await? {
             match frame.frame {
                 Some(v1::server_frame::Frame::Stdout(bytes)) => {
-                    std::io::stdout().write_all(&bytes)?;
-                    std::io::stdout().flush()?;
+                    write_host_output(std::io::stdout(), &bytes).await?;
                 }
                 Some(v1::server_frame::Frame::Stderr(bytes)) => {
-                    std::io::stderr().write_all(&bytes)?;
-                    std::io::stderr().flush()?;
+                    write_host_output(std::io::stderr(), &bytes).await?;
                 }
                 Some(v1::server_frame::Frame::Exit(exit)) => return Ok(exit.code),
                 Some(v1::server_frame::Frame::Error(error)) => {
@@ -700,7 +729,7 @@ async fn forward_terminal_input(
 mod tests {
     use super::{
         CancellableInput, ClientGuestRunner, GuestCommand, GuestRunner, Secret,
-        drive_input_until_attach,
+        drive_input_until_attach, write_host_output,
     };
     use crate::client::Client;
     use gascan_proto::v1;
@@ -723,6 +752,45 @@ mod tests {
         Pin<Box<dyn Stream<Item = Result<v1::OperationEvent, Status>> + Send + 'static>>;
     type FrameStream =
         Pin<Box<dyn Stream<Item = Result<v1::ServerFrame, Status>> + Send + 'static>>;
+
+    #[tokio::test]
+    async fn host_output_waits_for_nonblocking_capacity_without_losing_bytes() -> TestResult {
+        let (reader, writer) = rustix::pipe::pipe()?;
+        let flags = rustix::fs::fcntl_getfl(&writer)?;
+        rustix::fs::fcntl_setfl(&writer, flags | rustix::fs::OFlags::NONBLOCK)?;
+        let fill = vec![b'f'; 4096];
+        let mut filled = 0usize;
+        loop {
+            match rustix::io::write(&writer, &fill) {
+                Ok(count) => filled += count,
+                Err(rustix::io::Errno::AGAIN) => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let expected = vec![b'x'; 8192];
+        let task_writer = rustix::io::dup(&writer)?;
+        let task_payload = expected.clone();
+        let task = tokio::spawn(async move { write_host_output(task_writer, &task_payload).await });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+
+        let received = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+            let mut received = vec![0; filled + expected.len()];
+            let mut offset = 0;
+            while offset < received.len() {
+                let count = rustix::io::read(&reader, &mut received[offset..])?;
+                if count == 0 {
+                    return Err(std::io::ErrorKind::UnexpectedEof.into());
+                }
+                offset += count;
+            }
+            Ok(received)
+        });
+        task.await??;
+        let received = received.await??;
+        assert!(received[filled..].iter().all(|byte| *byte == b'x'));
+        Ok(())
+    }
 
     #[derive(Clone)]
     struct RpcFailure {
