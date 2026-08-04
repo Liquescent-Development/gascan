@@ -2791,7 +2791,8 @@ impl DatabaseMutationMonitor {
             | FilterFlag::NOTE_RENAME
             | FilterFlag::NOTE_LINK
             | FilterFlag::NOTE_REVOKE;
-        let identity_removal_events = FilterFlag::NOTE_DELETE | FilterFlag::NOTE_RENAME;
+        let permitted_removal_events =
+            FilterFlag::NOTE_DELETE | FilterFlag::NOTE_RENAME | FilterFlag::NOTE_LINK;
         for event in self.observed_events()? {
             let flags = event.fflags();
             let missing_consumed_sidecar = sidecars.iter().any(|(suffix, sidecar)| {
@@ -2799,8 +2800,8 @@ impl DatabaseMutationMonitor {
                     && !current_sidecars.contains_key(suffix)
             });
             if missing_consumed_sidecar
-                && flags.intersects(identity_removal_events)
-                && !flags.intersects(FilterFlag::NOTE_REVOKE)
+                && flags.intersects(permitted_removal_events)
+                && permitted_removal_events.contains(flags)
             {
                 continue;
             }
@@ -3280,6 +3281,60 @@ mod tests {
     fn snapshot_monitor_refuses_post_consumption_journal_aba()
     -> Result<(), Box<dyn std::error::Error>> {
         assert_snapshot_post_consumption_aba_refused(Some("-journal"))
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn snapshot_monitor_refuses_coalesced_write_and_remove_flags()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let root = temp.path().canonicalize()?;
+        let paths = seeded_legacy_paths(&root)?;
+        let controller = open_existing_controller_directory(&paths)?;
+        let staged_name = ".state.sqlite3.snapshot-monitor-coalesced";
+        let staged_path = controller_path(&paths, staged_name);
+        fs::write(&staged_path, b"staged main")?;
+        fs::set_permissions(&staged_path, fs::Permissions::from_mode(0o600))?;
+        let staged = open_named_private_database(
+            &controller.descriptor,
+            staged_name,
+            paths.expected_uid,
+            false,
+            "coalesced-event staged main",
+        )?;
+        let journal_name = format!("{staged_name}-journal");
+        let journal_path = controller_path(&paths, &journal_name);
+        fs::write(&journal_path, b"captured journal")?;
+        fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o600))?;
+        let journal = open_named_private_database(
+            &controller.descriptor,
+            &journal_name,
+            paths.expected_uid,
+            false,
+            "coalesced-event staged journal",
+        )?;
+        let journal_fd = journal.descriptor.as_raw_fd();
+        let monitor = DatabaseMutationMonitor::from_descriptors_with_write_events(
+            &[&journal.descriptor],
+            &[journal_fd],
+        )?;
+        let sidecars = BTreeMap::from([("-journal".to_owned(), journal)]);
+
+        let mut file = fs::OpenOptions::new().append(true).open(&journal_path)?;
+        file.write_all(b"write before unlink")?;
+        drop(file);
+        fs::remove_file(&journal_path)?;
+
+        assert!(matches!(
+            monitor.ensure_snapshot_consumption_safe(
+                &controller,
+                &staged,
+                &sidecars,
+                &BTreeMap::new(),
+            ),
+            Err(ControllerStateError::Unsafe(_))
+        ));
+        Ok(())
     }
 
     fn assert_snapshot_post_open_write_refused(
