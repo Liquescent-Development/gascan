@@ -178,8 +178,42 @@ helper does not need.
    deliberately *not* named `.artifacts/engine/` — `engine/` is the tracked
    directory holding the pin, and two paths differing only by prefix invite
    exactly the kind of misread this document exists to prevent.
-3. **Verify provenance** — `git verify-tag <tag>`, then assert
-   `git rev-parse refs/tags/<tag>^{}` equals `revision`.
+3. **Verify provenance** — `git -c gpg.ssh.allowedSignersFile=engine/allowed-signers
+   verify-tag <tag>`, then assert `git rev-parse refs/tags/<tag>^{}` equals
+   `revision`.
+
+**Added 2026-08-05 during planning.** `verify-tag` needs an explicit
+allowed-signers file. **VERIFIED:**
+`git -c gpg.ssh.allowedSignersFile=/dev/null verify-tag gascan-engine-baseline`
+exits 1 with `Good "git" signature with ED25519 key SHA256:3NWo… / No principal
+matched.` — the signature is valid but the principal is untrusted. The local
+machine only passes because `gpg.ssh.allowedSignersFile` is set globally to
+`~/.config/git/allowed_signers`, which CI does not have.
+
+Relying on ambient config would make the trust anchor vary per machine and fail
+in CI for a reason unrelated to the pin. So the anchor is tracked instead:
+
+### 4.2a `engine/allowed-signers`
+
+```
+richard@liquescent.dev ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHyTKmfAwcJcdfKXmj2h3mwfgPaelE6gSMrquAcPmW09
+```
+
+**VERIFIED** to be the key that signed the tag: `ssh-keygen -lf` over that public
+key yields `SHA256:3NWoJ1nmsLHxd8hAG/BnyriJJpIFXHaW3RtuPYANKc4`, matching
+`git tag -v gascan-engine-baseline`. The second key in the local file
+(`SHA256:MHX9nK/…`, "capsule-os commit signing") is a different key and is
+deliberately not included.
+
+**VERIFIED** end to end, both directions:
+
+| Command | Exit | Output |
+|---|---|---|
+| `verify-tag` with this file | 0 | `Good "git" signature for richard@liquescent.dev` |
+| `verify-tag` with only the capsule-os key | 1 | `No principal matched.` |
+
+The file is a tracked release input, so rotating the signing key is a reviewable
+commit rather than a silent environment change.
 4. `git checkout --detach <revision>` and `git submodule update --init --recursive`.
 5. `swift build --package-path <checkout> -c release --target ContainerBridge`.
 
@@ -240,8 +274,18 @@ Consumers requiring coordinated edits:
 Three edits in `packaging/macos/release-common.sh`:
 
 - add `engine` and `scripts/build-arca-engine.sh` to the `inputs` array (:27-31)
-- add `engine/arca-pin.json` and the script to the tracked-file loop (:36-37)
+- add `engine/arca-pin.json`, `engine/allowed-signers` and the script to the
+  tracked-file loop (:36-37)
 - add `engine` to the ignored-source scan (:43-48)
+
+**Knock-on, found during planning.** `tests/release/source-input-contract.sh:12`
+seeds a fixture repository from a hardcoded path list and then calls
+`gascan_assert_release_inputs_clean`. Adding entries to the tracked-file loop
+without seeding them there makes that existing test fail, because the fixture
+would lack the newly required files. `source-input-contract.sh:12` must gain
+`engine/arca-pin.json` and `engine/allowed-signers`, and `:20`'s `classes` array
+should gain `engine/arca-pin.json` so the new input is proven guarded rather than
+merely listed.
 
 **Guard, drawn from P0.2's `go.mod` incident:** verify
 `git check-ignore -v engine/arca-pin.json` is empty before committing. A global
