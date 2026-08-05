@@ -27,14 +27,19 @@ This is not a VMM project. No hypervisor is being written.
   container reaches. Secondary gaps: memory freed in-guest is never returned to
   the host (documented in Apple's own technical overview), no snapshot, macOS 26
   floor, no I/O rate limiting, no published threat model.
-- **Arca pivots from Docker-compatible runtime to Gas Can's sandbox engine.**
-  Docker compatibility is discontinued, not reduced.
-- **Gas Can absorbs Arca**, not the reverse. The deciding factor is which release
+- ~~**Arca pivots from Docker-compatible runtime to Gas Can's sandbox engine.**
+  Docker compatibility is discontinued, not reduced.~~
+  **SUPERSEDED 2026-08-05** — see "Decisions reversed 2026-08-05" below.
+- ~~**Gas Can absorbs Arca**, not the reverse. The deciding factor is which release
   pipeline survives: Gas Can's verifies signed tags and emits
-  `build-manifest.json`; Arca's builds a DMG.
-- **The Vas Solutus identity does not survive.** It existed for the
+  `build-manifest.json`; Arca's builds a DMG.~~
+  **SUPERSEDED 2026-08-05.** The release-pipeline reasoning still holds and is why
+  Gas Can builds the engine; it does not require absorbing the source.
+- ~~**The Vas Solutus identity does not survive.** It existed for the
   Docker-runtime positioning the pivot ends. "Arca" survives as the engine's name
-  inside the tree.
+  inside the tree.~~
+  **SUPERSEDED 2026-08-05.** Arca continues as its own project and keeps its
+  identity. Only Gas Can's naming is Gas Can's to decide.
 - **Sandboxes need peer channels.** Agent-to-agent collaboration is a real
   requirement, each agent in its own sandbox.
 - **Sidecars are not a networking feature.** A Postgres for the project under
@@ -43,8 +48,10 @@ This is not a VMM project. No hypervisor is being written.
 - **Arca owns the wire protocol; Gas Can owns the behavioural specification.**
   The engine decides what it can be asked; the product decides what a correct
   answer is.
-- **`Sources/DockerAPI/` is deleted early, not last.** `gascan-apple` is the
-  migration safety net, so retaining it buys nothing.
+- ~~**`Sources/DockerAPI/` is deleted early, not last.** `gascan-apple` is the
+  migration safety net, so retaining it buys nothing.~~
+  **SUPERSEDED 2026-08-05.** It is not deleted at all. It is an independent
+  SwiftPM target, so Gas Can's engine build simply excludes it.
 - **Peer channels are declared at create and immutable for the sandbox's
   lifetime.** No runtime grant RPC exists, and its absence is a security property:
   a compromised agent must have no path to request reach toward a neighbour.
@@ -201,6 +208,81 @@ Recorded so nobody re-derives them.
   a generated constant with no implementation. This was decisive in rejecting it.
 - **Hypervisor.framework exposes no dirty-page-tracking API.**
 
+## Decisions reversed 2026-08-05
+
+Four of the Authoritative Decisions above were reversed, deliberately, after P0
+finished. They are struck through in place. The reasoning is here so nobody
+restores them from the older text.
+
+**Arca survives as its own Docker-compatible project.** Gas Can takes what it
+needs; Arca is not converted into the sandbox engine and its Docker support is
+not discontinued.
+
+The decisive argument is not cost. Under the original plan P4 **permanently
+destroys** Arca's Docker compatibility — `Sources/DockerAPI/` deleted, then P4.3
+de-Dockers `ContainerManager.swift`. There is no second copy. Keeping Arca whole
+preserves the option to revisit Docker compatibility later, and it makes P4 stop
+being a one-way door. The cost is a divergence tax: two copies of the engine
+sources, fixes found in Gas Can not flowing back, and a merge to face if Arca is
+ever revived. Arca should be expected to freeze rather than be maintained in
+parallel.
+
+**Gas Can consumes Arca as a pinned source dependency, not by absorbing it.**
+The monorepo merge was never about source coupling — P3 always made the boundary
+a protocol. It was about shipping: Gas Can ships one signed package containing an
+engine it built itself, and `build-manifest.json` must attest every shipped
+executable. Building Arca from a pinned commit satisfies that. Gas Can's pipeline
+has to build Swift either way — P2.1 already commits to "one CI orchestrating
+Swift, Rust, Go, and protobuf codegen" — so this costs nothing P2 was not already
+paying, and the pin is the provenance.
+
+This also makes an existing correction cohere. Correction 3 below settled that
+Arca owns the wire protocol because "the engine is the server and versions
+independently; its wire behaviour cannot be defined in a repository it does not
+control." That reasoning sat awkwardly against co-locating the source. It no
+longer does.
+
+**Arca's contract to its consumers is the `.proto`, not a library.** Arca is
+Swift and cannot publish a Rust crate; `gascan-arca` is Gas Can's client and
+lives in Gas Can, as P5.2 already says. The versioned artifact Arca publishes is
+the engine proto. Both sides already have the machinery: Arca has
+`scripts/generate-grpc.sh` and protos under `Sources/ContainerBridge/proto/`, and
+Gas Can already has a `gascan-proto` crate.
+
+Rejected: exposing Arca through FFI. It would pull a daemon that needs
+virtualization entitlements and manages VMs into Gas Can's address space,
+inheriting its process lifecycle and crash behaviour. A socket is strictly better.
+
+**`Sources/DockerAPI/` is excluded by the engine build, not deleted.** It is
+already its own SwiftPM target, so target selection keeps it out of the shipped
+binary while Arca keeps it. This is the whole of P4.1 under the new plan.
+
+### The open question this creates
+
+P4's exit criterion — "the engine carries no concept the protocol cannot
+express" — is unachievable for Arca if Arca stays Docker-capable. It remains
+achievable for what Gas Can *ships*, but only partly by target selection:
+`DockerAPI` splits out cleanly; the Docker semantics inside `ContainerBridge` do
+not, because the engine needs that target.
+
+Decision taken 2026-08-05: **Arca grows a seam** (build flag or target split) so
+those concepts stay out of the engine build, rather than Gas Can shipping an
+engine carrying unreachable Docker code. The security property would otherwise
+have to rest entirely on the protocol boundary — defensible, since code no proto
+method reaches cannot be invoked, but it forces the threat model to argue from
+unreachability instead of absence, which is the weaker claim.
+
+Spot check on the size of that seam, 2026-08-05 — **not a full analysis, five
+greps against `Sources/ContainerBridge/ContainerManager.swift`:** `registry` and
+`pullImage` appear **zero** times (registry work lives in `ImageManager.swift`,
+a separate file); `healthCheck` 12 times, with `HealthChecker.swift` already
+separate; `restartPolicy` 9; `autoRemove` 1. The roadmap's "4,518 lines with
+Docker concepts woven through" overstates the interleaving of the three concerns
+P4.3 names. The file is genuinely 4,528 lines with 38 public entry points, so the
+size is real — but the seam is about which entry points the engine build exposes,
+not about untangling registry code. P4.3's estimate deserves re-deriving before
+it is scheduled.
+
 ## Corrections to Earlier Conclusions
 
 The previous session reached four conclusions it later reversed. Do not re-adopt
@@ -296,9 +378,76 @@ Full reasoning — every kept/dropped fork divergence and why — is in
 - Toolchain now matches upstream: Swift 6.3, static SDK `6.3-RELEASE_static-linux-0.1.0`.
   The SDK target is `make linux-sdk`; upstream renamed it from `cross-prep`.
 - **Green:** fork host build, guest build, `arca-vminit:latest` image.
-- **Not green:** superproject `swift build` — 109 errors of upstream API drift in
-  `ContainerBridge`. That is the next task and is larger than the merge was.
-- Still untouched: P0.4 functional pass. Nothing has been booted.
+- ~~**Not green:** superproject `swift build` — 109 errors.~~ Resolved 2026-08-05,
+  see below.
+- ~~Still untouched: P0.4 functional pass. Nothing has been booted.~~ Done
+  2026-08-05, see below.
+
+### P0.3 superproject adaptation and P0.4 functional pass — 2026-08-05
+
+Both PRs open, neither merged: `Vas-Solutus/arca-containerization#1` (fork) and
+`Vas-Solutus/arca#46` (superproject). Both fast-forward their `main`.
+
+**API drift adapted** (`b8903f7`). After `swift package clean`, 107 error lines
+across 11 unique sites in six categories, plus a seventh that only surfaced in
+`DockerAPI` once `ContainerBridge` compiled — the handoff's "109 is a floor"
+expectation held. `swift build` exit 0 at `-c debug` from clean,
+`--build-tests`, and `-c release`; 0 errors each.
+
+Two adaptations changed behaviour rather than only satisfying the compiler, both
+forced by the new types and both recorded in the commit:
+
+- `buildLinuxCapabilities` is now throwing. `CapabilityName(rawValue:)` rejects
+  names Linux does not define, so an unrecognised `--cap-add` fails container
+  creation instead of reaching the OCI spec verbatim.
+- A nil `ContainerStatistics` cpu/memory/pids category errors rather than
+  reporting a fabricated zero. Docker's `/stats` payload has no representation
+  for "unknown" in those objects.
+
+Upstream's new `defaultOCICapabilities` turned out to be exactly the 14 Docker
+defaults Arca already used, so the stricter default was not weakened.
+
+**P0.4 passed** on everything except the k3d case. A container boots — the first
+time anything has run on the post-merge tree. `waitForServicesReady` gates start
+on vsock 51819, which opens only after the wireguard, filesystem and process
+services initialise, so every successful `docker run` is also evidence the guest
+services came up. Verified: networking (address, default route, DNS, outbound
+HTTP), PTY (`/dev/pts/0`), `exec`, `logs`, volumes, file binds including `:ro`,
+capabilities, and `stats` including the streaming path.
+
+**k3d is out of scope, not deferred.** It is a Docker-compatibility concern, and
+under the 2026-08-05 reversals Docker compatibility lives in Arca rather than
+Gas Can. The rationale doc's open question — whether fork commit `502b715`'s
+motivating symptom returns now that upstream mounts at the resolved path instead
+of skipping — is Arca's question to answer if it revives Docker compatibility. It
+is not a Gas Can gate.
+
+**One merge regression found and fixed** (`9c2db5a`). `docker run -v vol:/data`
+failed with `errno 2`. Upstream's `LinuxContainer.start()` now ends with
+`cleanAndSortMounts`, sorting by destination path depth; at the merge base the
+same line preserved caller order verbatim (`git grep cleanAndSortMounts 27947cd
+-- Sources` finds nothing). Arca's bind read from the share's own in-container
+destination, so a container path shallower than the share sorted ahead of it.
+Depth was the discriminator: `/data` and `/opt/data` failed, `/a/b/c/d`
+succeeded, share at depth 3. Fixed by sourcing binds from `/run/virtiofs/<tag>`,
+which `create()` mounts before any container mount is applied and which
+upstream's own virtiofs-to-bind transform already uses.
+
+**Two pre-existing defects found, deliberately not fixed.** Both are Arca-internal
+Docker semantics the merge never touched:
+
+- `generateContainerName()` draws from 6 adjectives × 6 nouns with no uniqueness
+  check and no retry, and nothing acts on `HostConfig.autoRemove`, so
+  `docker run --rm` leaves the container behind. Names accumulate against a
+  36-name pool until `docker run` fails with `Conflict. The container name '<x>'
+  is already in use` — 2 of 6 identical runs failed with 17 distinct names
+  present. This briefly read as a mount bug; it is not.
+- `docker start` on a stopped container on a bridge network fails with
+  `already connected to network bridge`, then upstream's `invalidState` on
+  retry. `WireGuardNetworkBackend.cleanupStoppedContainer` is a deliberate no-op,
+  so the attachment is meant to survive a stop and the start path's re-attach
+  validation rejects it. The same sequence succeeds on `--network host`, which
+  localises it to the bridge backend.
 
 ### There is no CI
 

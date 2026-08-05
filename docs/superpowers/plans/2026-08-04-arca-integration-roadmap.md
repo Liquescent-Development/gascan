@@ -1,7 +1,16 @@
 # Arca Integration Roadmap
 
 Date: 2026-08-04
+Revised: 2026-08-05 — P0 complete; P1 and P4 restructured
 Status: Draft for review
+
+**Revision note (2026-08-05).** Arca is no longer absorbed into Gas Can. It
+survives as its own Docker-compatible project, and Gas Can consumes it as a
+pinned source dependency across a protocol boundary. The reasoning is in
+`docs/status/arca-integration-handoff.md` under "Decisions reversed 2026-08-05";
+do not restore the older shape from the source specs, which predate it. P1 and P4
+change substantially, P3 gains weight, and P2, P5, P6, P7 are unaffected in
+substance.
 
 Linearizes four specs into one dependency-ordered path. The specs say *what*; this
 says *in what order*, *what runs in parallel*, and *what is not yet known*.
@@ -41,32 +50,54 @@ A 267-commit upstream reconciliation and a repository merge in one change is
 unreviewable. If the reconciliation goes badly it must not also have destabilised
 the migration.
 
-| Step | Work |
-|---|---|
-| P0.1 | Move the superproject pin from `f48a6c7` to the fork's `origin/main` `502b715`. Picks up a rootfs-escape fix plus `CreateVolumeOverlay`, `CreateDirectMount`, `GenerateHostsFile`. |
-| P0.2 | Delete the committed `arca-services` ELF; build it in CI from `build.sh`. Must precede P1 so the blob never enters Gas Can's history. |
-| P0.3 | Merge `upstream/main` (267 commits, 6 minor releases). Resolve **U1** and **U2**. |
-| P0.4 | Functional pass: boot a sandbox, exercise WireGuard peers, filesystem, process, overlayfs. |
+| Step | Work | Status |
+|---|---|---|
+| P0.1 | Move the superproject pin off `f48a6c7`. | ✅ Superseded by P0.3, which pins `f02cdf9`. |
+| P0.2 | Delete the committed `arca-services` ELF; build it in CI from `build.sh`. | ⚠️ **Partial.** Blob out of the index and `go.mod` tracked. "Build it in CI" has no CI to run in — `gh run list` returns empty and there is no `.github/` in the tree or its history. Deferred to P2.1. |
+| P0.3 | Merge `upstream/main` (267 commits); resolve **U1** and **U2**; adapt the superproject to the resulting API drift. | ✅ `Vas-Solutus/arca-containerization#1`, `Vas-Solutus/arca#46`. Both open, both fast-forward. |
+| P0.4 | Functional pass. | ✅ except k3d, which is now out of scope — see below. |
 
 **Exit:** fork builds against current upstream, sandbox boots, all guest services
-respond, no binary in git.
+respond, no binary in git. **Met**, with P0.2's CI half carried to P2.1.
 
-P0.1 and P0.2 are independent of every decision in these specs and should not wait
-for roadmap approval.
+The blob's removal no longer needs to precede P1: under the 2026-08-05 revision
+Arca's history is never imported into Gas Can's, so nothing of Arca's can enter
+it. The reason to have done it stands on its own — the binary's provenance could
+not be verified against the source beside it.
+
+k3d was dropped rather than deferred. It is a Docker-compatibility concern, and
+Docker compatibility now lives in Arca. The open question about fork commit
+`502b715`'s motivating symptom belongs to Arca, not to a Gas Can gate.
 
 ---
 
-## P1 — Monorepo merge
+## P1 — Arca as a pinned dependency
 
-**Depends on:** P0.
+**Depends on:** P0. **Restructured 2026-08-05** — was "Monorepo merge".
+
+The merge was never about source coupling; P3 always made the boundary a
+protocol. It was about shipping: Gas Can ships one signed package containing an
+engine it built itself, and `build-manifest.json` must attest every shipped
+executable. A pinned source dependency satisfies that without importing anything.
 
 | Step | Work |
 |---|---|
-| P1.1 | `git subtree add` Arca into Gas Can, preserving history. |
-| P1.2 | Relocate to the layout in the merge spec §6. |
-| P1.3 | Carry the submodule across, still pointing at the fork. |
+| P1.1 | Add Arca to Gas Can as a source dependency pinned by commit. The pin is the provenance; record it in `build-manifest.json`. |
+| P1.2 | Teach Gas Can's build to build the engine targets only — `Sources/DockerAPI` excluded by target selection. |
+| P1.3 | Nothing to carry. Arca keeps its own containerization submodule; Gas Can has no relationship with the fork. |
 
-**Exit:** one repository, everything builds, history preserved.
+**Exit:** Gas Can's pipeline produces an engine binary from a pinned Arca commit,
+and the manifest attests it.
+
+The old shape — `git subtree add` preserving history, then relocation — was
+justified by Arca ceasing to exist, which made Gas Can the only place provenance
+could live. Arca now survives and stays reachable, so history lookups go there.
+A full-repo subtree would also have imported `Sources/DockerAPI/` into Gas Can's
+permanent history purely so P4.1 could delete it — the same mistake P0.2 avoided
+with the `arca-services` blob.
+
+Costs nothing extra in build capability: P2.1 already commits Gas Can's CI to
+orchestrating Swift.
 
 ---
 
@@ -92,8 +123,22 @@ payoff that justified merging.
 |---|---|
 | P3.1 | Define the engine proto. Derived from `RuntimeBackend`; constrained by contract §4 (what must be inexpressible) and §5 (what must be expressible). Resolve **U4**. |
 | P3.2 | Codegen wired both sides — Swift server, Rust client. |
+| P3.3 | **Added 2026-08-05.** Publish and version the proto as Arca's contract to its consumers. It lives in Arca, per "Arca owns the wire protocol". |
 
 **Exit:** proto exists, both sides generate, nothing implements it yet.
+
+**Weight increased 2026-08-05.** With Arca surviving as an independent project,
+the proto is a real published contract with more than one consumer over time —
+Gas Can now, a Docker-compatible Arca later — rather than an internal detail of a
+merged tree. It is the only thing holding the two together, so it carries the
+compatibility burden alone.
+
+Machinery already exists on both sides: Arca has `scripts/generate-grpc.sh` and
+protos under `Sources/ContainerBridge/proto/`; Gas Can has a `gascan-proto` crate.
+
+Arca cannot publish a Rust crate — it is Swift. `gascan-arca` (P5.2) is Gas Can's
+client and lives in Gas Can. FFI was rejected: it would pull a daemon needing
+virtualization entitlements and managing VMs into Gas Can's address space.
 
 Size gate: past roughly 400 lines, something Docker-shaped has crept back in.
 
@@ -103,16 +148,33 @@ Size gate: past roughly 400 lines, something Docker-shaped has crept back in.
 
 **Depends on:** P3. **Parallel with P5.**
 
+**Restructured 2026-08-05.** Nothing is deleted from Arca. Docker support stays
+there; the engine build excludes it.
+
 | Step | Work |
 |---|---|
-| P4.1 | Delete `Sources/DockerAPI/` and its target. |
-| P4.2 | Delete host-side buildx integration. Agents get `dockerd` in-guest. |
-| P4.3 | De-Docker `ContainerManager.swift`: restart policies, health checks, registry pull/push/auth. |
+| P4.1 | **Exclude**, do not delete, `Sources/DockerAPI/`. It is already its own SwiftPM target, so this is target selection in P1.2. |
+| P4.2 | Exclude host-side buildx integration. Agents get `dockerd` in-guest. |
+| P4.3 | Add a seam in Arca — build flag or target split — keeping restart policies, health checks and registry access out of the engine build. Requires a change **in Arca**, since these live inside `ContainerBridge`, the target the engine needs. |
 
-**Exit:** the engine carries no concept the protocol cannot express.
+**Exit:** the shipped engine carries no concept the protocol cannot express.
+Note the narrowing: this is now a property of Gas Can's build output, not of
+Arca. Arca deliberately retains all of it.
 
-P4.3 is the largest single work item in the roadmap — 4,518 lines with Docker
-concepts woven through.
+Without P4.3's seam, the security property would rest entirely on the protocol
+boundary — defensible, since code no proto method reaches cannot be invoked, but
+it forces the threat model to argue from unreachability rather than absence. The
+seam was chosen over accepting that.
+
+**P4.3's cost estimate needs re-deriving.** The original "4,518 lines with Docker
+concepts woven through" overstates the interleaving of the three concerns it
+names. Spot check 2026-08-05 against `Sources/ContainerBridge/ContainerManager.swift`
+— five greps, not a full analysis: `registry` and `pullImage` appear zero times
+(registry work lives in `ImageManager.swift`, already separate); `healthCheck` 12
+times with `HealthChecker.swift` already separate; `restartPolicy` 9;
+`autoRemove` 1. The file is genuinely 4,528 lines with 38 public entry points, so
+its size is real — but the seam is about which entry points the engine build
+exposes, not about untangling registry code.
 
 ---
 
@@ -169,6 +231,18 @@ P6.2 is the differentiator — the thing Apple's `container` structurally cannot
 ## P8 — Fork reduction
 
 **Continuous from P1.** Not on the critical path; unbounded cost if never started.
+
+**Revised 2026-08-05.** This is now Arca's work, not Gas Can's — Arca owns the
+containerization submodule and Gas Can has no relationship with the fork. Gas Can
+benefits indirectly, through the Arca commit it pins.
+
+One durability point survives the reversal and arguably matters more because of
+it. The fork's history — the 267-commit merge, `a1085d8`, `f02cdf9`, and every
+resolution the rationale doc justifies — exists in exactly one repository,
+`Vas-Solutus/arca-containerization`. Neither Arca nor Gas Can can reconstruct the
+guest without it. P8.3 ends that exposure by consuming `apple/containerization`
+as an ordinary dependency; until then, that repository is load-bearing for both
+projects. Tag it.
 
 | Step | Work |
 |---|---|
@@ -245,8 +319,10 @@ barrier in the threat model.
 
 ## Sequencing notes
 
-- **P0.1 and P0.2 are do-now.** They fix a missing security fix and an
-  unverifiable binary. Neither depends on any decision in these specs.
+- ~~**P0.1 and P0.2 are do-now.**~~ Done 2026-08-05, except P0.2's CI half, which
+  moved to P2.1 because no CI exists to run it in.
+- **P1 no longer gates on repository surgery.** It is a pin plus a build change,
+  so P3 can start as soon as P1.1 lands rather than waiting on a relocation.
 - **P3 is the fan-out.** Before it, work is serial. After it, Swift removal (P4)
   and the backend (P5) proceed independently.
 - **P5.1 must not wait on P4.** Implementing the engine service against existing
