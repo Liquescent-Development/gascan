@@ -548,6 +548,90 @@ Two calibrations from the 2026-08-05 session:
   `tail`'s status. Redirect to a file and read `$?`. Three "exit code 0" reports in
   the prior session were false for this reason.
 
+## Starting the next phase — P1.4, written 2026-08-05
+
+**P1.1 and P1.2 are complete and on PR #44** (`Liquescent-Development/gascan`),
+branch `arca-integration`. Not merged. The engine-pin CI gate is **red**, for a
+reason outside Gas Can's code.
+
+| Item | State |
+|---|---|
+| Pin, trust anchor, build script, contract test | landed, all 14 release contract tests exit 0 |
+| `build-manifest.json` | `schema: 2`, carries the `engine` pin object |
+| `.github/workflows/engine-pin.yml` | runs; **fails** in dependency resolution |
+| Arca | `main` `b20be7c`, tag `gascan-engine-baseline`, unchanged by this work |
+
+### What P1.2 could not deliver, and why it is not P4.3's fault
+
+VERIFIED by `swift package describe --type json` in `~/code/arca`, exit 0. Arca's
+only shippable executable reaches `DockerAPI` transitively —
+`Arca → ArcaDaemon → DockerAPI` — Arca publishes **no library products**, and
+`Sources/ArcaDaemon/` is entirely the Docker HTTP server. **No engine executable
+exists to build.** The blocking dependency is **P5.1, not P4.3**; moving P4.3
+earlier would not unblock it. P1.2 therefore landed partial by necessity: the
+pipeline builds the pinned source and the manifest attests the pin, while the
+binary half is booked against P5.1 and P4.3. Full design and evidence in
+`docs/superpowers/specs/2026-08-05-arca-engine-pin-design.md`.
+
+### The next task is P1.4
+
+Read the roadmap's "P1.4 — the pin is not cold-buildable" section first; it
+carries the measurements. In short: replace `swift-ip` with an internal
+IPv4/CIDR type in Arca, because Arca's `Package.resolved` pins two commits that
+no longer exist upstream. **Re-pinning to `swift-ip` 0.3.10 would work and was
+deliberately rejected** — it re-enters the same lottery and does nothing about
+the decay.
+
+**Do the preservation question first.** The vanished objects were mirrored to
+`~/code/vendor-mirrors/{swift-grammar-186ad640,swift-hash-c8396969}.git` on
+2026-08-05; both commits verified present with `git cat-file -t`. That is one
+machine. Until they exist off-machine, `gascan-engine-baseline` is one disk
+failure from being permanently unbuildable, and every document here cites it.
+Creating public mirrors is an outward-facing action needing the maintainer's
+decision — it was not taken.
+
+The replacement itself starts with a design decision, so **brainstorm before
+implementing**: whether the type lives inside `ContainerBridge` or as its own
+small target, and what its API is. The surface to satisfy is exactly
+`IP.V4(String)`, `IP.V4(value: UInt32)`, `.value`, `IP.Block<IP.V4>(String)` and
+`.base`, used in `Sources/ContainerBridge/StateStore.swift` and
+`WireGuardNetworkBackend.swift`.
+
+Sequence after that: implement with tests → build and functional pass → PR to
+Arca `main` (**merge commit, never squash**) → new signed tag → bump
+`engine/arca-pin.json` in Gas Can → watch PR #44's gate go green.
+
+### Two open items from P1, neither blocking
+
+- `--prune --prune-tags` in `scripts/build-arca-engine.sh` ships untested. The
+  contract test builds a fresh cache per case, so tag-revocation-against-a-warm-cache
+  needs a two-run case that does not exist.
+- Exit **75**, used by the new cache lock, is not in the documented taxonomy
+  (64 malformed pin, 65 provenance failure, 69 missing tool). The lock is
+  `mkdir`-based with an EXIT trap; every path except SIGKILL releases it, and a
+  SIGKILL strands it until someone runs `rmdir`. `flock` was rejected because it
+  is Homebrew-only on macOS, which would mean either a CI dependency or fallback
+  logic.
+
+### Calibrations earned this session
+
+- **The CI gate paid for itself on its first run.** It caught a supply-chain
+  defect that every local build hides behind a warm cache. Do not let it stay red.
+- **A final review caught a Critical the plan itself created.**
+  `git checkout --detach <rev>` on a cache already at that revision is a no-op,
+  so the script verified a tag and then compiled a worktree it never asserted
+  matched. Reproduced, fixed, and then found *still* partly open — top-level
+  `git clean` skips gitlink directories, so a file planted inside a submodule
+  survived. Closed with `submodule foreach --recursive git clean -qffdx`.
+  **Verify the reset, not just the signature.**
+- **Subagents reported reliably here, against the previous session's
+  experience** — but two returned their reports as plain text that never
+  arrived, and both had actually finished. If one goes idle without reporting,
+  ask it to resend before re-dispatching or assuming failure.
+- **Reviewers earned their keep by running mutations, not by reading.** The
+  useful findings came from neutering a check and confirming the suite went red.
+  A reviewer that only reads agrees with the code.
+
 ## Fresh-Session Restart Procedure
 
 From the Gas Can repository root:

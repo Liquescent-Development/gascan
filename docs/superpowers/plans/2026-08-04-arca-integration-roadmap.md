@@ -85,6 +85,7 @@ executable. A pinned source dependency satisfies that without importing anything
 | P1.1 | Add Arca to Gas Can as a source dependency pinned by commit. The pin is the provenance; record it in `build-manifest.json`. |
 | P1.2 | Teach Gas Can's build to build the engine targets only — `Sources/DockerAPI` excluded by target selection. **Amended 2026-08-05**, see below. |
 | P1.3 | Nothing to carry. Arca keeps its own containerization submodule; Gas Can has no relationship with the fork. |
+| P1.4 | **Added 2026-08-05.** Make the pinned Arca cold-buildable. Replace `swift-ip` with an internal IPv4/CIDR type in Arca, re-tag, bump the pin. **Blocks P2.** See below. |
 
 ~~**Exit:** Gas Can's pipeline produces an engine binary from a pinned Arca commit,
 and the manifest attests it.~~
@@ -110,11 +111,60 @@ with the `arca-services` blob.
 Costs nothing extra in build capability: P2.1 already commits Gas Can's CI to
 orchestrating Swift.
 
+### P1.4 — the pin is not cold-buildable (discovered 2026-08-05)
+
+Found by P1.2's own CI gate, on its first run. This is the argument for the gate,
+paid back immediately.
+
+**VERIFIED.** PR #44, run `31038778615`, conclusion `failure`. Arca's
+`Package.resolved` at `gascan-engine-baseline` pins `swift-grammar` at
+`0dac977b…` and `swift-hash` at `ea0b9fc3…`. In a **fresh clone** of either
+upstream, `git cat-file -t` returns `fatal: could not get object info` — the
+commits do not exist. A cold re-resolve of `swift-ip` at `exact: "0.3.3"` fails
+differently and explains why: `swift-json` 1.2.0 now resolves to `efeea1d4…`
+against SwiftPM's fingerprint record of `a3493697…`. The `tayloraswift` family
+rewrote history and migrated org mid-`0.3.x` — `tayloraswift/*` → `rarestype/*`,
+with `swift-grammar` → `gram` and `swift-hash` → `h`.
+
+**It is decaying, not merely broken.** VERIFIED 2026-08-05: the vanished objects
+existed in exactly one place, `~/Library/Caches/org.swift.swiftpm/repositories/swift-grammar-186ad640`.
+A cache clear would make `gascan-engine-baseline` permanently unbuildable by
+anyone — and that tag is the anchor every document in this corpus cites. Stopgap
+mirrors were taken to `~/code/vendor-mirrors/` the same day; both commits verified
+present there. **That is one machine, not durability.** Off-machine mirrors remain
+an open decision.
+
+**Decision: replace, do not re-pin.** `swift-ip` 0.3.10 does resolve cold
+(VERIFIED, exit 0 with isolated SwiftPM state), so a version bump would turn the
+gate green. It was rejected because it re-enters the same lottery and does
+nothing about the decay.
+
+The measurements that decided it:
+
+| | Re-pin to 0.3.10 | Replace |
+|---|---|---|
+| Arca's usage surface | — | 2 files; `IP.V4(String)`, `IP.V4(value:)`, `.value`, `IP.Block<IP.V4>(String)`, `.base` |
+| Churn to absorb | 46 insertions / 88 deletions in the two files Arca uses, across 7 pre-1.0 releases | ~150 lines of new pure-function code |
+| Pins removed from Arca's 38 | 0 | **6** — `swift-ip`, `swift-bson`, `swift-json`, `swift-grammar`, `swift-hash`, `swift-unixtime` |
+| Recurrence risk | unchanged | eliminated |
+
+`IP.V4`'s stored property is now `storage: UInt32` in 0.3.10 while Arca reads
+`.value` in 8 places, so even the cheap path is not free.
+
+Nothing else in Arca reaches those 6 packages — its direct dependencies are
+containerization, swift-nio, swift-log, swift-argument-parser, grpc-swift,
+SQLite.swift, SWCompression and swift-ip.
+
+**Blocks P2**, whose deliverable is a working pipeline: P2.1 cannot stand up CI
+around an engine build that fails on every runner, and P2.2 cannot attest a pin
+nobody can rebuild. Does **not** block P3's protocol work, nor Arca-side work
+like P4.3 and P5.1, which still build locally off the warm cache.
+
 ---
 
 ## P2 — Build consolidation
 
-**Depends on:** P1.
+**Depends on:** P1, **including P1.4** — see above.
 
 | Step | Work |
 |---|---|
