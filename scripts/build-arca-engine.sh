@@ -90,6 +90,13 @@ git -C "$checkout" clean -qffdx
 # and git rejects any fetched object that does not hash to it.
 git -C "$checkout" -c 'url.https://github.com/.insteadOf=git@github.com:' \
   submodule update --init --recursive --force --quiet
+# Neither line above reaches inside a submodule: the top-level clean skips gitlink
+# directories, and `submodule update --force` forces the checkout but leaves
+# untracked files where they are. containerization is a SwiftPM path dependency,
+# so a .swift left in its sources is compiled. Do not delete this as redundant.
+# --quiet suppresses foreach's "Entering ..." line, which would otherwise land on
+# stdout and corrupt the checkout path this script contracts to print there.
+git -C "$checkout" submodule foreach --quiet --recursive git clean -qffdx
 
 swift build --package-path "$checkout" --configuration release --target ContainerBridge >&2
 

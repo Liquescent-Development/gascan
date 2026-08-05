@@ -15,6 +15,28 @@ printf 'engine@example.invalid %s\n' "$(cat "$fixture/key.pub")" >"$fixture/allo
 # the anchor exists to enforce and which the unsigned-tag case does not reach.
 ssh-keygen -q -t ed25519 -N '' -C intruder@example.invalid -f "$fixture/intruder"
 
+# A nested repository standing in for Arca's containerization submodule. Arca
+# consumes that submodule as a SwiftPM path dependency, so this one is wired up
+# the same way: anything left in its sources reaches the compiler, which is what
+# makes contamination inside a submodule matter rather than merely be untidy.
+subupstream=$fixture/subupstream
+mkdir -p "$subupstream/Sources/EngineSupport"
+cat >"$subupstream/Package.swift" <<'PACKAGE'
+// swift-tools-version: 6.2
+import PackageDescription
+let package = Package(
+    name: "EngineSupport",
+    products: [.library(name: "EngineSupport", targets: ["EngineSupport"])],
+    targets: [.target(name: "EngineSupport")]
+)
+PACKAGE
+printf 'public let engineSupportFixture = 1\n' >"$subupstream/Sources/EngineSupport/Support.swift"
+git -C "$subupstream" init -q
+git -C "$subupstream" config user.name fixture
+git -C "$subupstream" config user.email engine@example.invalid
+git -C "$subupstream" add -A
+git -C "$subupstream" -c commit.gpgsign=false commit -qm seed
+
 # An upstream repository standing in for Arca. It carries a Package.swift with a
 # target named ContainerBridge so the build step has something real to compile.
 upstream=$fixture/upstream
@@ -24,7 +46,13 @@ cat >"$upstream/Package.swift" <<'PACKAGE'
 import PackageDescription
 let package = Package(
     name: "Arca",
-    targets: [.target(name: "ContainerBridge")]
+    dependencies: [.package(path: "containerization")],
+    targets: [
+        .target(
+            name: "ContainerBridge",
+            dependencies: [.product(name: "EngineSupport", package: "containerization")]
+        )
+    ]
 )
 PACKAGE
 printf 'public let engineFixture = 1\n' >"$upstream/Sources/ContainerBridge/Fixture.swift"
@@ -33,6 +61,11 @@ git -C "$upstream" config user.name fixture
 git -C "$upstream" config user.email engine@example.invalid
 git -C "$upstream" config gpg.format ssh
 git -C "$upstream" config user.signingKey "$fixture/key"
+# protocol.file.allow is scoped to this one command and belongs to the fixture,
+# not the contract: git refuses file-transport submodules by default since
+# CVE-2022-39253, and the fixture has nowhere but the filesystem to live.
+git -C "$upstream" -c protocol.file.allow=always \
+  submodule add -q "$subupstream" containerization
 git -C "$upstream" add -A
 git -C "$upstream" -c commit.gpgsign=false commit -qm seed
 pinned=$(git -C "$upstream" rev-parse --verify HEAD)
@@ -61,9 +94,14 @@ run_case() {
   # runs under `set -e`, so a non-zero exit would abort the test before the
   # status could be read, and every negative case would vanish silently.
   local label=$1 pin=$2 expected=$3 signers=${4:-$fixture/allowed-signers} actual=0
+  # GIT_CONFIG_* carries protocol.file.allow into the script's git calls, which
+  # need it to fetch the fixture's file-transport submodule. It is set here and
+  # not in the script on purpose: the relaxation exists because the fixture is on
+  # the filesystem, and the production pin fetches everything over https.
   GASCAN_ARCA_PIN_FILE=$pin \
   GASCAN_ARCA_ENGINE_CACHE=$fixture/cache-$label \
   GASCAN_ARCA_ALLOWED_SIGNERS=$signers \
+  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=protocol.file.allow GIT_CONFIG_VALUE_0=always \
     bash "$script" >"$fixture/$label.out" 2>&1 || actual=$?
   [[ $actual == "$expected" ]] || {
     printf 'case %s: expected exit %s, got %s\n' "$label" "$expected" "$actual" >&2
@@ -125,13 +163,24 @@ grep -q 'cache-good' "$fixture/good.out" || {
 # to be that tag's tree. Plant every kind of contamination a plain --detach onto
 # an already-current revision would preserve, then reuse the same cache label so
 # the second run sees the warm cache, and require all of it to be gone.
+#
+# The submodule is planted separately and deliberately. Nothing at the top level
+# reaches inside it: `clean` skips gitlink directories, and `submodule update
+# --force` restores tracked content but leaves untracked files. A submodule is
+# also the larger half of the real source tree, so a guard that stops at the top
+# level leaves most of the compiled bytes unproven.
 warm=$fixture/cache-good/arca
 printf 'public let planted = 3\n' >"$warm/Sources/ContainerBridge/Planted.swift"
 printf 'public let tampered = 4\n' >>"$warm/Sources/ContainerBridge/Fixture.swift"
 mkdir -p "$warm/.build"
 printf 'poisoned\n' >"$warm/.build/poison"
+printf 'public let submodulePlanted = 5\n' >"$warm/containerization/Sources/EngineSupport/Planted.swift"
+printf 'public let submoduleTampered = 6\n' >>"$warm/containerization/Sources/EngineSupport/Support.swift"
+mkdir -p "$warm/containerization/.build"
+printf 'poisoned\n' >"$warm/containerization/.build/poison"
 run_case good "$fixture/pin-good.json" 0
-for stale in Sources/ContainerBridge/Planted.swift .build/poison; do
+for stale in Sources/ContainerBridge/Planted.swift .build/poison \
+  containerization/Sources/EngineSupport/Planted.swift containerization/.build/poison; do
   [[ ! -e $warm/$stale ]] || {
     printf 'warm cache carried an unverified file into the build: %s\n' "$stale" >&2
     exit 1
@@ -139,6 +188,10 @@ for stale in Sources/ContainerBridge/Planted.swift .build/poison; do
 done
 git -C "$warm" diff --quiet || {
   printf 'warm cache carried a tracked modification into the build\n' >&2
+  exit 1
+}
+git -C "$warm" submodule foreach --quiet --recursive git diff --quiet || {
+  printf 'warm cache carried a tracked submodule modification into the build\n' >&2
   exit 1
 }
 
