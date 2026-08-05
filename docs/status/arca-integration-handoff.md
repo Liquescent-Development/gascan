@@ -551,8 +551,9 @@ Two calibrations from the 2026-08-05 session:
 ## Starting the next phase — P1.4, written 2026-08-05
 
 **P1.1 and P1.2 are complete and on PR #44** (`Liquescent-Development/gascan`),
-branch `arca-integration`. Not merged. The engine-pin CI gate is **red**, for a
-reason outside Gas Can's code.
+branch `arca-integration`. ~~Not merged. The engine-pin CI gate is **red**, for a
+reason outside Gas Can's code.~~ **Superseded 2026-08-05: the gate is green and
+PR #44 is merged** — see "P1.4 complete" and "PR #44 merged" below.
 
 | Item | State |
 |---|---|
@@ -806,6 +807,30 @@ severity belongs in the record.
   `cargo test --test '*'` for the release contract suite. Wrong — the suite is 14
   shell scripts at `tests/release/*-contract.sh`, and no cargo target runs them.
   It was found because the dispatch said to verify rather than assume.
+
+### PR #44 merged — 2026-08-05
+
+VERIFIED: PR #44 `MERGED` at `2026-08-05T23:51:51Z` as merge commit
+`52a6fa0d35c1e950cc86738c1ffd5a203590940a`, carrying P1.1, P1.2, P1.4 and all
+the documentation. `git rev-list --parents -n 1 52a6fa0` shows two parents
+(`f6356f9` + `abcc1fa`), so it is a genuine merge commit.
+
+**Merged with `--merge`, deliberately.** Gas Can has no branch protection ruleset
+and permits squash and rebase (`allow_squash_merge: true`,
+`allow_rebase_merge: true`), so the method was a choice, not a constraint. These
+documents cite Gas Can commit SHAs — `f562e6e` for the pin bump, `cdd85b5` for
+the design, and others — and a squash would have minted new SHAs and invalidated
+every one. VERIFIED after merging with `git merge-base --is-ancestor`: `f562e6e`,
+`cdd85b5`, `efde07d`, `4ef1f16`, `954f505` and `abcc1fa` are all still reachable
+from `main`. **Keep merging Gas Can this way for as long as these documents cite
+its SHAs** — the same reasoning that already applies to Arca.
+
+The engine-pin gate was green on four consecutive runs before the merge:
+`31055299650` (`f562e6e`, the pin bump), `31055959462` (`efde07d`),
+`31056660871` (`4ef1f16`), `31057240620` (`abcc1fa`).
+
+`delete_branch_on_merge` is `false`, so `arca-integration` still exists. New work
+should branch from `main`, not from it.
 
 ## Fresh-Session Restart Procedure
 
