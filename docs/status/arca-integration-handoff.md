@@ -665,11 +665,22 @@ plan: `docs/superpowers/specs/2026-08-05-arca-internal-ip-type-design.md` and
 
 | Item | Value |
 |---|---|
-| Arca `main` | `d66c320c09e1dfc4f37aafa1fb27e36aa5cabe5d` (merge commit, two parents: `b20be7c` + `9bb1a7e`) |
+| **Pinned revision** | `d66c320c09e1dfc4f37aafa1fb27e36aa5cabe5d` (merge commit, two parents: `b20be7c` + `9bb1a7e`) |
 | New pin tag | `gascan-engine-ip-internal` — signed, `verify-tag` exit 0 |
-| Arca PR | `#49`, merged with `--merge`, not squashed |
+| Arca PRs | `#49` (the replacement) and `#51` (comment-only follow-up), both merged with `--merge`, not squashed |
+| Arca `main` **now** | `7da8f77` — **ahead of the pin**, see below |
 | Gas Can pin bump | `f562e6e` on `arca-integration` |
 | Pins dropped | 6 of 38 — `swift-ip`, `swift-bson`, `swift-json`, `swift-grammar`, `swift-hash`, `swift-unixtime` |
+
+**Arca `main` is deliberately ahead of the pinned revision, and that is not
+drift.** `#51` was comment-only, so the pin was not moved and the tag was not
+re-cut: re-pinning would have invalidated the cold-build and functional evidence
+gathered against `d66c320` in exchange for nothing executable. VERIFIED after
+`#51` merged: `git rev-parse refs/tags/gascan-engine-ip-internal^{}` still
+returns `d66c320c…`, and `verify-tag` against `engine/allowed-signers` still
+exits 0. **The pin resolves through the tag, never through `main`** — which is
+exactly why `scripts/build-arca-engine.sh` asserts `refs/tags/<tag>^{}` equals
+the pinned revision rather than trusting a branch.
 
 ### Evidence, with anchors
 
@@ -731,16 +742,21 @@ Arca's allocator treats that bound as inclusive. **The behaviour was left exactl
 as it was**, because changing it would have made the differential equivalence test
 impossible to write. Filed as `Vas-Solutus/arca#50`.
 
-**Read the live path, not the comment.** VERIFIED by
+**Read the live path, not the dead one.** VERIFIED by
 `grep -rn "allocateIP" Sources/ Tests/` in `~/code/arca`, which returns only the
 definition at `WireGuardNetworkBackend.swift:1008` and a prose mention at `:223`:
-`allocateIP` **has no callers**. The corrected comment landed at `:1034-1037`,
+`allocateIP` **has no callers**. `#49`'s corrected comment landed at `:1034-1037`,
 inside that dead function. The live allocation path is
-`WireGuardNetworkBackend.swift:382-408` (`attachContainer`) → `:397`
+`WireGuardNetworkBackend.swift:382-408` (`attachContainer`) →
 `rangeEnd = Int64(block.range.upperBound.value)` →
-`StateStore.allocateAndReserveIP` (`StateStore.swift:964-1051`), and it carries no
-marker. Anyone fixing `#50` by following the comment will fix an uncalled function,
-watch the marker vanish, and ship believing it closed.
+`StateStore.allocateAndReserveIP` (`StateStore.swift:964-1051`).
+
+~~and it carries no marker.~~ **Closed by `#51` (merged, commit `74127f2`).** The
+live path and `allocateAndReserveIP`'s `rangeEnd` parameter doc now both carry the
+defect note, and both point explicitly away from `allocateIP`. Comment-only;
+`swift build --configuration release --target ContainerBridge` exits 0. The pin was
+deliberately not moved for it. Whoever fixes `#50` should fix `attachContainer` /
+`allocateAndReserveIP` — or delete `allocateIP`, which appears to be dead.
 
 ~~Reachability: ~65,533 containers on a `/16`, immediate on a `/30`.~~
 **Understated — corrected 2026-08-05 by the final review.** Both figures are
