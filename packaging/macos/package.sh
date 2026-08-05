@@ -80,6 +80,10 @@ for binary in gascan gascan-apple-attach gascand; do
   files_json=$(jq -cn --argjson files "$files_json" --arg path "$relative" --arg sha "$digest" \
     '$files + [{path: $path, sha256: $sha}]')
 done
+# The engine is a build gate, not a payload: build-arca-engine.sh above compiles
+# the pinned Arca tree and fails the release if it does not verify, but nothing
+# from that tree is installed. This block records which tree was compiled, so a
+# shipped package names its engine provenance even though it carries no engine.
 engine_json=$(jq -cS '{name, url, tag, revision}' "$repo_root/engine/arca-pin.json")
 jq -nS \
   --arg architecture arm64 \

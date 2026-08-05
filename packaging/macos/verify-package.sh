@@ -57,9 +57,9 @@ jq -e --arg revision "$expected_revision" --arg version "$expected_version" '
     version: $version
   } and
   (.engine | keys == ["name", "revision", "tag", "url"]) and
-  (.engine.name | length > 0) and
+  (.engine.name | type == "string" and length > 0) and
   (.engine.url | startswith("https://")) and
-  (.engine.tag | length > 0) and
+  (.engine.tag | type == "string" and length > 0) and
   (.engine.revision | test("^[0-9a-f]{40}$")) and
   (.files | map(.path) == ["usr/local/bin/gascan", "usr/local/bin/gascan-apple-attach", "usr/local/bin/gascand"]) and
   all(.files[]; (.sha256 | test("^[0-9a-f]{64}$")))
