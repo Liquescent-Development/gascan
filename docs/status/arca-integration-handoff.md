@@ -385,8 +385,32 @@ Full reasoning — every kept/dropped fork divergence and why — is in
 
 ### P0.3 superproject adaptation and P0.4 functional pass — 2026-08-05
 
-Both PRs open, neither merged: `Vas-Solutus/arca-containerization#1` (fork) and
-`Vas-Solutus/arca#46` (superproject). Both fast-forward their `main`.
+**P0 is complete and landed.** Both PRs merged as merge commits, deliberately not
+squashed, so every SHA cited in these documents stays reachable from `main`.
+
+| Repository | State |
+|---|---|
+| `Vas-Solutus/arca-containerization` | `#1` merged → `main` `9847c35`; tagged `upstream-merge-0.40.2` |
+| `Vas-Solutus/arca` | `#46` merged → `main` `b20be7c`; tagged `gascan-engine-baseline`; pins `f02cdf9` |
+
+Both tags are signed and pushed. `gascan-engine-baseline` is the commit Gas Can's
+engine pin should be based on.
+
+**Merge method matters here and is not incidental.** `Vas-Solutus/arca`'s ruleset
+`10300321` originally set `allowed_merge_methods: ["squash"]`. Squashing would
+have collapsed `b8903f7` (compile adaptation only) and `9c2db5a` (a behaviour
+change to mount plumbing) into one commit and minted a new SHA, invalidating every
+anchor in these documents and destroying the separation that keeps the merge
+reviewable. The ruleset was changed to `["merge","squash"]` on 2026-08-05;
+`deletion`, `non_fast_forward`, `required_signatures` and all review parameters
+were left untouched. **Keep merge commits allowed** — Gas Can pins Arca by commit,
+so a policy that rewrites SHAs on every merge works against what the repository is
+now for.
+
+The review requirement (`required_approving_review_count: 1`,
+`require_last_push_approval: true`) is unsatisfiable for a solo maintainer, so
+`#46` needed `--admin`. Expect that on every future merge until there is a second
+reviewer or the count is set to 0.
 
 **API drift adapted** (`b8903f7`). After `swift package clean`, 107 error lines
 across 11 unique sites in six categories, plus a seventh that only surfaced in
@@ -467,6 +491,36 @@ in; standing one up belongs with P2, not P0.
   from a single manifest. Both need design folded back into the contract.
 - ~~Roadmap steps P0.1 and P0.2 are do-now and depend on no decision here.~~ Done
   2026-08-04; see "Completed 2026-08-04" above.
+
+## Starting the next phase — 2026-08-05
+
+P0 is closed. The next work is **P1.1** (pin Arca in Gas Can) and **P1.2** (build
+the engine targets only), with P4.3's target split entangled — see the roadmap's
+"Sequencing: P1.2 partially depends on P4.3" before planning around the phase map.
+
+Three conventions in these documents are load-bearing. They are why this phase
+moved quickly, and they decay silently if dropped:
+
+- **Every claim is marked VERIFIED or PLAN**, and a PLAN is never promoted without
+  running something. The rationale doc states this; it applies to this document
+  too.
+- **Past-tense claims carry their anchor inline** — command, SHA, file:line, exit
+  code — or they come out. Rules can ship bare; events cannot.
+- **Corrections are recorded, not quietly edited.** Superseded conclusions stay
+  struck through in place with a pointer, because the next reader has no way to
+  tell which parts were verified unless it is written down.
+
+Two calibrations from the 2026-08-05 session:
+
+- **Use a fresh main session, not a subagent, for the target split.** It is a
+  whole-file boundary judgment needing one coherent view of how `ContainerBridge`
+  is used. The earlier calibration — subagents earn their keep on bounded,
+  read-only sweeps and not on adaptation work — held again: a code-reviewer agent
+  dispatched against the API-drift diff went idle without reporting, and its
+  claims had to be verified directly anyway.
+- **Capture exit codes directly, never through a pipe.** `cmd | tail` returns
+  `tail`'s status. Redirect to a file and read `$?`. Three "exit code 0" reports in
+  the prior session were false for this reason.
 
 ## Fresh-Session Restart Procedure
 

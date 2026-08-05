@@ -155,7 +155,7 @@ there; the engine build excludes it.
 |---|---|
 | P4.1 | **Exclude**, do not delete, `Sources/DockerAPI/`. It is already its own SwiftPM target, so this is target selection in P1.2. |
 | P4.2 | Exclude host-side buildx integration. Agents get `dockerd` in-guest. |
-| P4.3 | Add a seam in Arca — build flag or target split — keeping restart policies, health checks and registry access out of the engine build. Requires a change **in Arca**, since these live inside `ContainerBridge`, the target the engine needs. |
+| P4.3 | Add a seam in Arca — **target split**, decided 2026-08-05 — keeping restart policies, health checks and registry access out of the engine build. Requires a change **in Arca**, since these live inside `ContainerBridge`, the target the engine needs. |
 
 **Exit:** the shipped engine carries no concept the protocol cannot express.
 Note the narrowing: this is now a property of Gas Can's build output, not of
@@ -165,6 +165,46 @@ Without P4.3's seam, the security property would rest entirely on the protocol
 boundary — defensible, since code no proto method reaches cannot be invoked, but
 it forces the threat model to argue from unreachability rather than absence. The
 seam was chosen over accepting that.
+
+### Seam shape: target split, not a build flag (decided 2026-08-05)
+
+Move Docker semantics into a separate SwiftPM target depending on the engine
+target — `ContainerBridgeDocker → ContainerBridge`, arrow pointing at the engine.
+Gas Can depends only on `ContainerBridge`. Do it incrementally: create the target,
+move the clearly-Docker pieces first (restart policy, health-check wiring,
+`autoRemove`), and let the engine target stay temporarily fat.
+
+**A build flag was rejected primarily because Arca has no CI.** `gh run list`
+returns empty and there is no `.github/` in the tree or its history, so an
+engine-only `#if` configuration would be built for the first time by Gas Can's
+pipeline — a different repository, at pin-bump time, where the breakage presents
+as Gas Can's build failing. A target split has one configuration; both targets
+compile on every plain `swift build`.
+
+Secondary reasons:
+
+- The seam exists to support a **security** claim — the engine cannot be asked to
+  reach a registry. A compiler-enforced dependency edge supports that in a threat
+  model; a remembered `#if` does not, and nothing prevents future Docker code
+  being added outside a guard.
+- Swift `#if` around a declaration forces the same guard onto every caller, which
+  spreads through a file with 38 public entry points and heavy internal coupling.
+- The dependency direction encodes the right model: Docker becomes one front-end
+  *consuming* the engine, with Gas Can's proto as another. That extends the
+  existing grain — `DockerAPI` is already its own target, `ImageManager` and
+  `HealthChecker` already separate files.
+
+The hard part is unchanged either way: deciding the engine/Docker boundary inside
+`ContainerManager.swift`. A flag only defers that decision while accumulating
+conditionals.
+
+### Sequencing: P1.2 partially depends on P4.3
+
+P1.2 ("build the engine targets only") works **today** in partial form, because
+`Sources/DockerAPI` is already an independent target. A genuinely engine-only
+build additionally needs P4.3's split, which the phase map currently places after
+P3. So either P1.2 lands partial and tightens when P4.3 arrives, or P4.3 moves
+earlier. Do not plan around the current ordering without resolving this.
 
 **P4.3's cost estimate needs re-deriving.** The original "4,518 lines with Docker
 concepts woven through" overstates the interleaving of the three concerns it
