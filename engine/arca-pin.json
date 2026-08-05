@@ -2,6 +2,6 @@
   "schema": 1,
   "name": "arca",
   "url": "https://github.com/Vas-Solutus/arca.git",
-  "tag": "gascan-engine-baseline",
-  "revision": "b20be7c865978759026d233e2d012ec8dc393b27"
+  "tag": "gascan-engine-ip-internal",
+  "revision": "d66c320c09e1dfc4f37aafa1fb27e36aa5cabe5d"
 }
