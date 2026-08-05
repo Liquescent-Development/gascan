@@ -126,13 +126,19 @@ against SwiftPM's fingerprint record of `a3493697…`. The `tayloraswift` family
 rewrote history and migrated org mid-`0.3.x` — `tayloraswift/*` → `rarestype/*`,
 with `swift-grammar` → `gram` and `swift-hash` → `h`.
 
-**It is decaying, not merely broken.** VERIFIED 2026-08-05: the vanished objects
-existed in exactly one place, `~/Library/Caches/org.swift.swiftpm/repositories/swift-grammar-186ad640`.
-A cache clear would make `gascan-engine-baseline` permanently unbuildable by
-anyone — and that tag is the anchor every document in this corpus cites. Stopgap
-mirrors were taken to `~/code/vendor-mirrors/` the same day; both commits verified
-present there. **That is one machine, not durability.** Off-machine mirrors remain
-an open decision.
+**Where the objects survive.** VERIFIED 2026-08-05: the vanished commits existed
+only in `~/Library/Caches/org.swift.swiftpm/repositories/swift-grammar-186ad640`
+and were copied to `~/code/vendor-mirrors/` the same day, both verified present
+with `git cat-file -t`.
+
+~~This is decaying, not merely broken: a cache clear would make
+`gascan-engine-baseline` permanently unbuildable by anyone, and off-machine
+mirrors are needed.~~ **Overstated, corrected same day.** P1.4 removes these
+packages from Arca's graph, so the new tag is cold-buildable and the baseline is
+superseded rather than preserved; a mirror is inert without an explicit
+`swift package config set-mirror`, since `Package.resolved` records the upstream
+URL; and no release has shipped against this pin. The local copies are sufficient
+and no further durability work is warranted.
 
 **Decision: replace, do not re-pin.** `swift-ip` 0.3.10 does resolve cold
 (VERIFIED, exit 0 with isolated SwiftPM state), so a version bump would turn the

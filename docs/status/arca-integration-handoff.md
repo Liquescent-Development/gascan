@@ -582,13 +582,23 @@ no longer exist upstream. **Re-pinning to `swift-ip` 0.3.10 would work and was
 deliberately rejected** — it re-enters the same lottery and does nothing about
 the decay.
 
-**Do the preservation question first.** The vanished objects were mirrored to
-`~/code/vendor-mirrors/{swift-grammar-186ad640,swift-hash-c8396969}.git` on
-2026-08-05; both commits verified present with `git cat-file -t`. That is one
-machine. Until they exist off-machine, `gascan-engine-baseline` is one disk
-failure from being permanently unbuildable, and every document here cites it.
-Creating public mirrors is an outward-facing action needing the maintainer's
-decision — it was not taken.
+**On preserving the vanished objects — do not spend time on this.** They were
+mirrored to `~/code/vendor-mirrors/{swift-grammar-186ad640,swift-hash-c8396969}.git`
+on 2026-08-05, both commits verified present with `git cat-file -t`. That is
+enough, and no further durability work is warranted.
+
+~~Until they exist off-machine, `gascan-engine-baseline` is one disk failure from
+being permanently unbuildable.~~ **Overstated, corrected same day.** Three reasons
+it does not matter: P1.4 removes `swift-grammar` and `swift-hash` from Arca's
+graph entirely, so the new tag is cold-buildable and the baseline is superseded
+rather than preserved; a mirror is inert anyway, because `Package.resolved`
+records the upstream URL and SwiftPM will not consult another without an explicit
+`swift package config set-mirror` or a hand edit; and no release has ever shipped
+against this pin, so there is no artifact to reproduce.
+
+The only case that would revive the concern is someone needing to build Arca at
+`b20be7c` on a cold machine before P1.4 lands — a second developer, or a CI job
+stood up in the meantime.
 
 The replacement itself starts with a design decision, so **brainstorm before
 implementing**: whether the type lives inside `ContainerBridge` or as its own
