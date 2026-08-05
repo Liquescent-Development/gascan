@@ -49,12 +49,18 @@ manifest=$work/root/usr/local/share/gascan/build-manifest.json
 jq -e --arg revision "$expected_revision" --arg version "$expected_version" '
   . == {
     architecture: "arm64",
+    engine: .engine,
     files: .files,
     product: "Gas Can",
-    schema: 1,
+    schema: 2,
     source_revision: $revision,
     version: $version
   } and
+  (.engine | keys == ["name", "revision", "tag", "url"]) and
+  (.engine.name | length > 0) and
+  (.engine.url | startswith("https://")) and
+  (.engine.tag | length > 0) and
+  (.engine.revision | test("^[0-9a-f]{40}$")) and
   (.files | map(.path) == ["usr/local/bin/gascan", "usr/local/bin/gascan-apple-attach", "usr/local/bin/gascand"]) and
   all(.files[]; (.sha256 | test("^[0-9a-f]{64}$")))
 ' "$manifest" >/dev/null || { printf 'build manifest is invalid\n' >&2; exit 65; }

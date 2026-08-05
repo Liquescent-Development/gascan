@@ -206,13 +206,19 @@ jq -n --arg rev "$revision" --arg ver "$version" \
   --arg s1 "$sha_gascan" --arg s2 "$sha_attach" --arg s3 "$sha_gascand" '
 {
   architecture: "arm64",
+  engine: {
+    name: "arca",
+    revision: "b20be7c865978759026d233e2d012ec8dc393b27",
+    tag: "gascan-engine-baseline",
+    url: "https://github.com/Vas-Solutus/arca.git"
+  },
   files: [
     {path: "usr/local/bin/gascan", sha256: $s1},
     {path: "usr/local/bin/gascan-apple-attach", sha256: $s2},
     {path: "usr/local/bin/gascand", sha256: $s3}
   ],
   product: "Gas Can",
-  schema: 1,
+  schema: 2,
   source_revision: $rev,
   version: $ver
 }' >"$fixture_root/usr/local/share/gascan/build-manifest.json"

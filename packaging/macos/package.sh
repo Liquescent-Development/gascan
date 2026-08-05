@@ -48,6 +48,7 @@ install -d -m 0755 "$root/usr/local/bin" "$root/usr/local/share/gascan"
 
 cargo build --locked --release -p gascan -p gascand >&2
 "$repo_root/scripts/build-apple-attach-helper.sh" >&2
+"$repo_root/scripts/build-arca-engine.sh" >&2
 for binary in gascan gascand gascan-apple-attach; do
   source_path="$repo_root/target/release/$binary"
   if [[ $binary == gascan-apple-attach ]]; then
@@ -79,12 +80,14 @@ for binary in gascan gascan-apple-attach gascand; do
   files_json=$(jq -cn --argjson files "$files_json" --arg path "$relative" --arg sha "$digest" \
     '$files + [{path: $path, sha256: $sha}]')
 done
+engine_json=$(jq -cS '{name, url, tag, revision}' "$repo_root/engine/arca-pin.json")
 jq -nS \
   --arg architecture arm64 \
   --arg source_revision "$revision" \
   --arg version "$version" \
+  --argjson engine "$engine_json" \
   --argjson files "$files_json" \
-  '{schema: 1, product: "Gas Can", version: $version, architecture: $architecture, source_revision: $source_revision, files: $files}' \
+  '{schema: 2, product: "Gas Can", version: $version, architecture: $architecture, source_revision: $source_revision, engine: $engine, files: $files}' \
   >"$root/usr/local/share/gascan/build-manifest.json"
 chmod 0644 "$root/usr/local/share/gascan/build-manifest.json"
 
