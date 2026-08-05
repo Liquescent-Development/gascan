@@ -116,15 +116,18 @@ orchestrating Swift.
 **RESOLVED.** VERIFIED: engine-pin run
 `https://github.com/Liquescent-Development/gascan/actions/runs/31055299650`,
 `conclusion=success`, `headSha=f562e6e`, on a hosted `macos-26` runner — the
-gate's first green after two failures. Arca `main` is now
+gate's first green, after **four** consecutive failures (`31038778615` `12b4a91`,
+`31039127696` `afb04f2`, `31042100578` `8be4ec6`, `31042404662` `58ae69f`).
+Arca `main` is now
 `d66c320c09e1dfc4f37aafa1fb27e36aa5cabe5d`, tagged `gascan-engine-ip-internal`,
 and Gas Can's pin points at it. Six pins dropped from Arca's 38. Full record in
 `docs/status/arca-integration-handoff.md` under "P1.4 complete — 2026-08-05";
 design in `docs/superpowers/specs/2026-08-05-arca-internal-ip-type-design.md`.
 
-The replacement is VERIFIED bit-for-bit equivalent to `swift-ip` 0.3.3 across
-18,580,063 differential comparisons with 0 mismatches, the harness itself
-validated by two independent negative controls.
+The replacement is differentially VERIFIED against `swift-ip` 0.3.3 across
+18,580,063 vectors with 0 mismatches — a large sample, not an exhaustive proof —
+with the harness itself validated by two independent negative controls. Sampled
+domains and the thin spot are named in the handoff.
 
 **The measurement table below understated the surface.** It listed five call
 shapes; characterization found ten, the omissions being `Block.contains(_:)`,

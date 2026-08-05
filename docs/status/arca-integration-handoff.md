@@ -647,9 +647,17 @@ Arca `main` (**merge commit, never squash**) → new signed tag → bump
 **The engine-pin gate is green.** VERIFIED: run
 `https://github.com/Liquescent-Development/gascan/actions/runs/31055299650`,
 `status=completed`, `conclusion=success`, `headSha=f562e6e`, on a hosted
-`macos-26` runner. `gh pr checks 44` reports Passed: 1, Failed: 0. The two prior
-runs (`58ae69f`, `8be4ec6`) were both `failure`, so this is the gate's first
-green and it closes P1.4. **P2 is unblocked.**
+`macos-26` runner. `gh pr checks 44` reports Passed: 1, Failed: 0. The **four**
+preceding runs were all `failure` — `31038778615` (`12b4a91`), `31039127696`
+(`afb04f2`), `31042100578` (`8be4ec6`), `31042404662` (`58ae69f`) — so this is
+the gate's first green and it closes P1.4. **P2 is unblocked.**
+
+~~The two prior runs (`58ae69f`, `8be4ec6`) were both `failure`.~~ **Corrected
+2026-08-05**: that was written from `gh run list -L 3`, which showed only the two
+most recent. The gate was red for four runs.
+
+Two later runs also passed, confirming the pin holds across subsequent commits:
+`31055959462` (`efde07d`) `success`.
 
 `swift-ip` is gone from Arca, replaced by an internal `ArcaIP` target. Design and
 plan: `docs/superpowers/specs/2026-08-05-arca-internal-ip-type-design.md` and
@@ -665,10 +673,17 @@ plan: `docs/superpowers/specs/2026-08-05-arca-internal-ip-type-design.md` and
 
 ### Evidence, with anchors
 
-- **Bit-for-bit equivalence to `swift-ip` 0.3.3 is VERIFIED, not asserted.** A
-  differential harness compiled the real library (revision `ba4efb6`) as one
-  module and `ArcaIP` as another and ran identical vectors through both:
-  `checks=18580063 mismatches=0`, exit 0. The harness was itself validated by two
+- **Equivalence to `swift-ip` 0.3.3 is differentially VERIFIED, not asserted** —
+  across 18,580,063 vectors with 0 mismatches, which is a large sample and not an
+  exhaustive proof. A harness compiled the real library (revision `ba4efb6`) as
+  one module and `ArcaIP` as another and ran identical vectors through both:
+  `checks=18580063 mismatches=0`, exit 0. The four sampled domains, so a future
+  reader can see where the coverage is thin: 5,000,000 random `UInt32` values out
+  of 2³² for formatting and reparse; all 33 prefix lengths × 20,000 random bases
+  for `base`/`bits`/`range`; 8 boundary-weighted probes per block for `contains`;
+  and roughly **60 hand-written malformed strings** for parser rejection. That
+  last domain is the thinnest, and it is also the one the leniency decision was
+  made to protect, since it governs how existing SQLite rows re-parse. The harness was itself validated by two
   independent negative controls — breaking `IP.V4.description` produced
   10,418,664 mismatches, and breaking `IP.Block.mask` produced 2,921,191
   including `contains`-specific ones. Without the second control, the Block
