@@ -303,7 +303,67 @@ Without this job the gate fires only at release. "Breakage presents as Gas Can's
 build failing at pin-bump time" is the argument that chose a target split over a
 build flag (roadmap:180-182); a release-only gate does not deliver it.
 
-**PLAN — the runner is an open risk.** Every existing job runs on
+**RESOLVED 2026-08-05 by an actual run** — PR #44, run `31038778615`,
+conclusion `failure` after 1m12s. The runner question is answered; a different
+problem surfaced underneath it. Both results below.
+
+**VERIFIED — the runner and toolchain are correct.** The `macos-26` label
+resolved, and the "Report toolchain" step printed:
+
+```
+Apple Swift version 6.3.3 (swiftlang-6.3.3.1.3 clang-2100.1.1.101)
+Target: arm64-apple-macosx26.0
+ProductVersion: 26.5.2    BuildVersion: 25F84
+```
+
+Swift 6.3 was previously *inferred* from Xcode 26.6; it is now observed.
+
+**VERIFIED — the tracked trust anchor works in the environment it was added
+for.** On a runner with no ambient git configuration, §4.2a's
+`engine/allowed-signers` produced
+`Good "git" signature for richard@liquescent.dev with ED25519 key
+SHA256:3NWoJ1nmsLHxd8hAG/BnyriJJpIFXHaW3RtuPYANKc4`. The SSH-submodule transport
+rewrite also held — resolution proceeded past submodule init.
+
+**VERIFIED FAILURE — the pin is not buildable from a cold machine.** The build
+failed in SwiftPM dependency resolution:
+
+```
+error: 'swift-grammar': Couldn't check out revision '0dac977b50bf677b2c3adabd7d5586a7b6e09b17':
+    fatal: unable to read tree (0dac977b50bf677b2c3adabd7d5586a7b6e09b17)
+error: 'swift-hash': Couldn't check out revision 'ea0b9fc3152ed5941dd82e4a01e65f99fe1a75d2'
+```
+
+Root cause established, not inferred. In a **fresh clone** of
+`tayloraswift/swift-grammar`, `git cat-file -t 0dac977b…` returns
+`fatal: git cat-file: could not get object info` — the commit does not exist
+upstream at all. Same for `swift-hash` at `ea0b9fc3…`. A cold re-resolve of
+`swift-ip` at `exact: "0.3.3"` fails differently and explains why:
+
+```
+error: 'swift-json': Revision efeea1d46e72ab765be87be082dd217103c417cf for
+  swift-json ... version 1.2.0 does not match previously recorded value
+  a349369773603889a915c645cb7b0cf8de255181
+```
+
+SwiftPM's trust-on-first-use fingerprint database
+(`~/.swiftpm/security/fingerprints/`) recorded `swift-json` 1.2.0 as
+`a34936977…`; upstream's `1.2.0` tag now points at `efeea1d4…`. **The
+`tayloraswift` package family has rewritten history and re-pointed release
+tags.** Arca reaches all of it through one direct dependency,
+`.package(url: "https://github.com/tayloraswift/swift-ip.git", exact: "0.3.3")`.
+
+It builds on the maintainer's machine only because the local SwiftPM cache still
+holds the vanished objects. That is precisely the failure mode a pin-bump CI gate
+exists to expose, and it surfaced on the gate's first run.
+
+**This is Arca's defect, not Gas Can's**, and closing it needs an Arca-side
+re-resolve, a verified build, and a new signed tag, followed by a pin bump here.
+Out of scope for P1.1/P1.2. It also raises a policy question this design should
+not settle alone: a provenance boundary that depends on a repository family which
+force-pushes and re-tags cannot deliver reproducibility, whatever the pin says.
+
+~~**PLAN — the runner is an open risk.**~~ Superseded by the run above. Every existing job runs on
 `ubuntu-24.04-arm` (`.github/workflows/workspace-bundles.yml:20,147,187,266,302,346,392`).
 Gas Can has no macOS runner today, and Arca requires macOS 26
 (`Package.swift` `platforms: [.macOS("26.0")]`) and Swift 6.3. Whether a
