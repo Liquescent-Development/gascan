@@ -496,8 +496,33 @@ in; standing one up belongs with P2, not P0.
 ## Starting the next phase — 2026-08-05
 
 P0 is closed. The next work is **P1.1** (pin Arca in Gas Can) and **P1.2** (build
-the engine targets only), with P4.3's target split entangled — see the roadmap's
-"Sequencing: P1.2 partially depends on P4.3" before planning around the phase map.
+the engine targets only), ~~with P4.3's target split entangled — see the roadmap's
+"Sequencing: P1.2 partially depends on P4.3" before planning around the phase map.~~
+
+**Corrected 2026-08-05.** The entanglement is with **P5.1, not P4.3**. Design and
+evidence in `docs/superpowers/specs/2026-08-05-arca-engine-pin-design.md`;
+the roadmap section is struck through in place. In short, VERIFIED by
+`swift package describe --type json` in `~/code/arca` (exit 0): `DockerAPI` is its
+own target but the only shippable executable reaches it through
+`Arca → ArcaDaemon → DockerAPI`; Arca publishes **no library products**; and
+`Sources/ArcaDaemon/` is entirely the Docker HTTP server, so **no engine
+executable exists to build**. Moving P4.3 earlier would not unblock P1.2.
+
+Two further facts found while resolving it, both recorded because they cost real
+time to establish:
+
+- **The pinned commit is not maintainer-signed.** `git verify-commit b20be7c`
+  exits 1 (`Can't check signature: No public key`, RSA `B5690EEEBB952194` —
+  GitHub's web-flow key), and `%G?` reports `E` for `b20be7c` against `G` for
+  `9c2db5a` and below. `b20be7c` is GitHub's merge commit. The maintainer-signed
+  anchor is the annotated tag `gascan-engine-baseline`, so provenance must run
+  through the tag and assert `refs/tags/<tag>^{}` equals the pinned revision —
+  the idiom `packaging/macos/release-common.sh:17-22` already uses.
+- **`packaging/macos/package.sh:64-69` signs without `--entitlements`**, while
+  Arca's `Makefile:62` signs with them and `Arca.entitlements` declares
+  `com.apple.security.virtualization`. Nothing to fix in P1 — no engine binary
+  ships — but an engine signed the Gas Can way could not create a VM, so **P7.3
+  must not discover this late**.
 
 Three conventions in these documents are load-bearing. They are why this phase
 moved quickly, and they decay silently if dropped:

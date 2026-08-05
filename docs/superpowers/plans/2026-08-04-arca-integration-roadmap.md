@@ -83,11 +83,22 @@ executable. A pinned source dependency satisfies that without importing anything
 | Step | Work |
 |---|---|
 | P1.1 | Add Arca to Gas Can as a source dependency pinned by commit. The pin is the provenance; record it in `build-manifest.json`. |
-| P1.2 | Teach Gas Can's build to build the engine targets only — `Sources/DockerAPI` excluded by target selection. |
+| P1.2 | Teach Gas Can's build to build the engine targets only — `Sources/DockerAPI` excluded by target selection. **Amended 2026-08-05**, see below. |
 | P1.3 | Nothing to carry. Arca keeps its own containerization submodule; Gas Can has no relationship with the fork. |
 
-**Exit:** Gas Can's pipeline produces an engine binary from a pinned Arca commit,
-and the manifest attests it.
+~~**Exit:** Gas Can's pipeline produces an engine binary from a pinned Arca commit,
+and the manifest attests it.~~
+
+**Exit, amended 2026-08-05** — design in
+`docs/superpowers/specs/2026-08-05-arca-engine-pin-design.md` §3. The original
+exit conflated two claims that cannot land together yet:
+
+| Claim | P1 | Deferred to |
+|---|---|---|
+| Pipeline builds pinned Arca source | ✅ | |
+| Pin recorded as provenance | ✅ | |
+| Produces an engine **binary** | | **P5.1** — none exists |
+| That binary is Docker-free | | **P4.3** |
 
 The old shape — `git subtree add` preserving history, then relocation — was
 justified by Arca ceasing to exist, which made Gas Can the only place provenance
@@ -200,11 +211,35 @@ conditionals.
 
 ### Sequencing: P1.2 partially depends on P4.3
 
-P1.2 ("build the engine targets only") works **today** in partial form, because
+~~P1.2 ("build the engine targets only") works **today** in partial form, because
 `Sources/DockerAPI` is already an independent target. A genuinely engine-only
 build additionally needs P4.3's split, which the phase map currently places after
 P3. So either P1.2 lands partial and tightens when P4.3 arrives, or P4.3 moves
-earlier. Do not plan around the current ordering without resolving this.
+earlier. Do not plan around the current ordering without resolving this.~~
+
+**SUPERSEDED 2026-08-05** — resolved in
+`docs/superpowers/specs/2026-08-05-arca-engine-pin-design.md` §2.2, §2.3 and §7.
+The dependency is on **P5.1, not P4.3**, and moving P4.3 earlier would not
+unblock P1.2.
+
+VERIFIED by `swift package describe --type json` in `~/code/arca` (exit 0),
+anchored to the pin: `git rev-parse b20be7c^{tree} 9c2db5a^{tree}` both report
+`3139b8398f203c40d2fbe309ba7fb15d4c7094b0`.
+
+- `DockerAPI` is genuinely its own target, but the only shippable executable
+  reaches it transitively: `Arca → ArcaDaemon → DockerAPI`. Target selection buys
+  nothing at the executable level. The claim held only for a *library* build.
+- Arca exposes **no library products** — the only two products are the `Arca` and
+  `ArcaTestHelper` executables. So Gas Can also cannot consume `ContainerBridge`
+  as a SwiftPM dependency.
+- **There is no engine executable at all.** `Sources/ArcaDaemon/` is entirely the
+  Docker HTTP server, and the only protos under `Sources/ContainerBridge/proto/`
+  are `tapforwarder.proto` and `wireguard.proto`, both guest-facing. The engine
+  service is P5.1.
+
+P1.2 therefore lands **partial by necessity**: the pipeline builds the pinned
+source and the manifest attests the pin, while the binary half is booked against
+P5.1 (it must exist) and P4.3 (it must be Docker-free).
 
 **P4.3's cost estimate needs re-deriving.** The original "4,518 lines with Docker
 concepts woven through" overstates the interleaving of the three concerns it
