@@ -458,7 +458,8 @@ which `create()` mounts before any container mount is applied and which
 upstream's own virtiofs-to-bind transform already uses.
 
 **Two pre-existing defects found, deliberately not fixed.** Both are Arca-internal
-Docker semantics the merge never touched:
+Docker semantics the merge never touched, and both are now tracked as Arca's own
+backlog: `Vas-Solutus/arca#47` and `#48`.
 
 - `generateContainerName()` draws from 6 adjectives × 6 nouns with no uniqueness
   check and no retry, and nothing acts on `HostConfig.autoRemove`, so
