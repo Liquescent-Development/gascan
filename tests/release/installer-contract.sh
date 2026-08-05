@@ -129,7 +129,7 @@ write_fake cpio '
 mkdir -p usr/local/bin usr/local/share/gascan
 : >usr/local/bin/gascan; : >usr/local/bin/gascan-apple-attach; : >usr/local/bin/gascand
 printf license >usr/local/share/gascan/LICENSE; printf config >usr/local/share/gascan/default-gascan.toml
-printf "%s\\n" "{\"architecture\":\"arm64\",\"files\":[{\"path\":\"usr/local/bin/gascan\",\"sha256\":\"$FIXTURE_MANIFEST_HASH\"},{\"path\":\"usr/local/bin/gascan-apple-attach\",\"sha256\":\"$FIXTURE_MANIFEST_HASH\"},{\"path\":\"usr/local/bin/gascand\",\"sha256\":\"$FIXTURE_MANIFEST_HASH\"}],\"product\":\"Gas Can\",\"schema\":1,\"source_revision\":\"$FIXTURE_REVISION\",\"version\":\"0.1.0\"}" >usr/local/share/gascan/build-manifest.json'
+printf "%s\\n" "{\"architecture\":\"arm64\",\"engine\":{\"name\":\"arca\",\"revision\":\"b20be7c865978759026d233e2d012ec8dc393b27\",\"tag\":\"gascan-engine-baseline\",\"url\":\"https://github.com/Vas-Solutus/arca.git\"},\"files\":[{\"path\":\"usr/local/bin/gascan\",\"sha256\":\"$FIXTURE_MANIFEST_HASH\"},{\"path\":\"usr/local/bin/gascan-apple-attach\",\"sha256\":\"$FIXTURE_MANIFEST_HASH\"},{\"path\":\"usr/local/bin/gascand\",\"sha256\":\"$FIXTURE_MANIFEST_HASH\"}],\"product\":\"Gas Can\",\"schema\":2,\"source_revision\":\"$FIXTURE_REVISION\",\"version\":\"0.1.0\"}" >usr/local/share/gascan/build-manifest.json'
 write_fake shasum 'printf "%s  %s\\n" "$FIXTURE_OBSERVED_HASH" "$3"'
 write_fake lipo 'echo "$FIXTURE_ARCHS"'
 write_fake sudo 'printf "sudo:%s\\n" "$*" >>"$FIXTURE_LOG"'

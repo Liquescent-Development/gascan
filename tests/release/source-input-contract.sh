@@ -8,8 +8,8 @@ trap 'rm -rf "$fixture"' EXIT
 
 seed_repo() {
   local root=$1 omit=${2:-} seed_path
-  mkdir -p "$root/crates" "$root/helpers" "$root/scripts" "$root/packaging/macos" "$root/proto" "$root/images/workspace"
-  for seed_path in Cargo.toml Cargo.lock crates/lib.rs helpers/helper.swift scripts/build-apple-attach-helper.sh scripts/workspace-image-source-digest.sh packaging/macos/package.sh LICENSE rust-toolchain.toml proto/gascan.proto images/workspace/Dockerfile images/workspace/approved-image.txt images/workspace/approved-source.sha256 images/workspace/versions.lock; do
+  mkdir -p "$root/crates" "$root/helpers" "$root/scripts" "$root/packaging/macos" "$root/proto" "$root/images/workspace" "$root/engine"
+  for seed_path in Cargo.toml Cargo.lock crates/lib.rs helpers/helper.swift scripts/build-apple-attach-helper.sh scripts/workspace-image-source-digest.sh scripts/build-arca-engine.sh engine/arca-pin.json engine/allowed-signers packaging/macos/package.sh LICENSE rust-toolchain.toml proto/gascan.proto images/workspace/Dockerfile images/workspace/approved-image.txt images/workspace/approved-source.sha256 images/workspace/versions.lock; do
     [[ $seed_path == "$omit" ]] || { mkdir -p "$root/$(dirname "$seed_path")"; printf 'tracked\n' >"$root/$seed_path"; }
   done
   git -C "$root" init -q
@@ -17,7 +17,7 @@ seed_repo() {
   git -C "$root" -c commit.gpgsign=false -c user.name=fixture -c user.email=fixture@example.invalid commit -qm seed
 }
 
-classes=(rust-toolchain.toml proto/gascan.proto scripts/workspace-image-source-digest.sh images/workspace/Dockerfile images/workspace/approved-image.txt images/workspace/approved-source.sha256 images/workspace/versions.lock)
+classes=(rust-toolchain.toml proto/gascan.proto scripts/workspace-image-source-digest.sh engine/arca-pin.json images/workspace/Dockerfile images/workspace/approved-image.txt images/workspace/approved-source.sha256 images/workspace/versions.lock)
 for path in "${classes[@]}"; do
   tracked="$fixture/tracked-${path//\//-}"
   seed_repo "$tracked"
