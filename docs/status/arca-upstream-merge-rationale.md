@@ -11,6 +11,50 @@ this record regardless of how the merge ends.
 whose output was read. Entries marked PLAN are intended resolutions that nothing has yet
 compiled or executed. Do not promote a PLAN to VERIFIED without running something.
 
+## Resuming
+
+### Branch topology — two branches subsume the other four
+
+Do not try to land the superseded ones; they point at pre-merge state.
+
+```
+fork (Vas-Solutus/arca-containerization)
+  merge/upstream-main  f02cdf9   <- CONTAINS fix/track-go-mod-drop-prebuilt-binary (943d3b3, 5754902)
+                                    plus a1085d8 (merge) and f02cdf9 (guest fixes)
+
+superproject (Vas-Solutus/arca)
+  merge/upstream-containerization  4591a21  <- CONTAINS fix/swift-6.3-sending-closures (0910463)
+                                               plus 4e27394 (pin + packaging) and 4591a21
+  fix/submodule-currency  6829cdb  <- SUPERSEDED. Pins f48a6c7 -> 5754902, i.e. pre-merge.
+                                      merge/upstream-containerization pins f02cdf9 instead.
+```
+
+VERIFIED with `git merge-base --is-ancestor` in both repositories.
+
+### First commands
+
+```sh
+cd ~/code/arca
+git checkout merge/upstream-containerization
+git submodule update --init --recursive     # fork should land on f02cdf9
+swift package clean                          # MANDATORY — see the trap below
+swift build -c debug 2>&1 | grep -E "error:" # expect ~109
+```
+
+`swift package clean` is not optional. Without it a stale build plan referencing the
+now-removed `ContainerizationOS/Signals.swift` collapses all 109 errors into a single
+`missing inputs` failure, which looks like a broken checkout rather than API drift.
+
+### Machine state that is not in any repository
+
+- The Swift 6.3 static SDK is installed on this machine
+  (`swift-6.3-RELEASE_static-linux-0.1.0`). On a different machine, run
+  `make linux-sdk` from `containerization/vminitd`. Upstream renamed that target from
+  `cross-prep`; the old name no longer exists.
+- `~/.gitignore_global` had its `*.mod` line removed so Go module files are not ignored
+  globally. Backup at `~/.gitignore_global.bak-20260804`. On a different machine this must
+  be redone, or `go.mod` will appear ignored again in every Go project.
+
 ## Coordinates
 
 | | |
