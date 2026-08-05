@@ -85,7 +85,7 @@ executable. A pinned source dependency satisfies that without importing anything
 | P1.1 | Add Arca to Gas Can as a source dependency pinned by commit. The pin is the provenance; record it in `build-manifest.json`. |
 | P1.2 | Teach Gas Can's build to build the engine targets only — `Sources/DockerAPI` excluded by target selection. **Amended 2026-08-05**, see below. |
 | P1.3 | Nothing to carry. Arca keeps its own containerization submodule; Gas Can has no relationship with the fork. |
-| P1.4 | **Added 2026-08-05.** Make the pinned Arca cold-buildable. Replace `swift-ip` with an internal IPv4/CIDR type in Arca, re-tag, bump the pin. **Blocks P2.** See below. |
+| P1.4 | **Added 2026-08-05. DONE 2026-08-05.** Make the pinned Arca cold-buildable. Replace `swift-ip` with an internal IPv4/CIDR type in Arca, re-tag, bump the pin. ~~**Blocks P2.**~~ **P2 unblocked** — the gate is green. See below. |
 
 ~~**Exit:** Gas Can's pipeline produces an engine binary from a pinned Arca commit,
 and the manifest attests it.~~
@@ -111,7 +111,31 @@ with the `arca-services` blob.
 Costs nothing extra in build capability: P2.1 already commits Gas Can's CI to
 orchestrating Swift.
 
-### P1.4 — the pin is not cold-buildable (discovered 2026-08-05)
+### P1.4 — the pin is not cold-buildable (discovered 2026-08-05, **RESOLVED 2026-08-05**)
+
+**RESOLVED.** VERIFIED: engine-pin run
+`https://github.com/Liquescent-Development/gascan/actions/runs/31055299650`,
+`conclusion=success`, `headSha=f562e6e`, on a hosted `macos-26` runner — the
+gate's first green after two failures. Arca `main` is now
+`d66c320c09e1dfc4f37aafa1fb27e36aa5cabe5d`, tagged `gascan-engine-ip-internal`,
+and Gas Can's pin points at it. Six pins dropped from Arca's 38. Full record in
+`docs/status/arca-integration-handoff.md` under "P1.4 complete — 2026-08-05";
+design in `docs/superpowers/specs/2026-08-05-arca-internal-ip-type-design.md`.
+
+The replacement is VERIFIED bit-for-bit equivalent to `swift-ip` 0.3.3 across
+18,580,063 differential comparisons with 0 mismatches, the harness itself
+validated by two independent negative controls.
+
+**The measurement table below understated the surface.** It listed five call
+shapes; characterization found ten, the omissions being `Block.contains(_:)`,
+`Block.range`'s two bounds, `String(describing:)` and `Equatable`.
+`String(describing:)` mattered most — its output is persisted to SQLite and
+returned on the wire, so a divergence would have corrupted stored state silently
+rather than failing loudly. The "~150 lines" estimate held; the churn estimate
+was never tested, because the re-pin path was not taken.
+
+The rest of this section is preserved as written, for the reasoning that led to
+the decision.
 
 Found by P1.2's own CI gate, on its first run. This is the argument for the gate,
 paid back immediately.
@@ -170,7 +194,11 @@ like P4.3 and P5.1, which still build locally off the warm cache.
 
 ## P2 — Build consolidation
 
-**Depends on:** P1, **including P1.4** — see above.
+~~**Depends on:** P1, **including P1.4** — see above.~~
+**Dependency satisfied 2026-08-05.** P1.4 is done and the engine-pin gate is
+green, so P2 is unblocked. P1 remains partial by necessity — no engine *binary*
+is produced, because none exists to build; that half is booked against P5.1 and
+P4.3, per the amended exit table above.
 
 | Step | Work |
 |---|---|

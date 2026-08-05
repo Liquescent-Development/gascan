@@ -573,7 +573,7 @@ pipeline builds the pinned source and the manifest attests the pin, while the
 binary half is booked against P5.1 and P4.3. Full design and evidence in
 `docs/superpowers/specs/2026-08-05-arca-engine-pin-design.md`.
 
-### The next task is P1.4
+### ~~The next task is P1.4~~ — DONE 2026-08-05, see "P1.4 complete" below
 
 Read the roadmap's "P1.4 — the pin is not cold-buildable" section first; it
 carries the measurements. In short: replace `swift-ip` with an internal
@@ -641,6 +641,113 @@ Arca `main` (**merge commit, never squash**) → new signed tag → bump
 - **Reviewers earned their keep by running mutations, not by reading.** The
   useful findings came from neutering a check and confirming the suite went red.
   A reviewer that only reads agrees with the code.
+
+## P1.4 complete — 2026-08-05
+
+**The engine-pin gate is green.** VERIFIED: run
+`https://github.com/Liquescent-Development/gascan/actions/runs/31055299650`,
+`status=completed`, `conclusion=success`, `headSha=f562e6e`, on a hosted
+`macos-26` runner. `gh pr checks 44` reports Passed: 1, Failed: 0. The two prior
+runs (`58ae69f`, `8be4ec6`) were both `failure`, so this is the gate's first
+green and it closes P1.4. **P2 is unblocked.**
+
+`swift-ip` is gone from Arca, replaced by an internal `ArcaIP` target. Design and
+plan: `docs/superpowers/specs/2026-08-05-arca-internal-ip-type-design.md` and
+`docs/superpowers/plans/2026-08-05-arca-internal-ip-type.md`.
+
+| Item | Value |
+|---|---|
+| Arca `main` | `d66c320c09e1dfc4f37aafa1fb27e36aa5cabe5d` (merge commit, two parents: `b20be7c` + `9bb1a7e`) |
+| New pin tag | `gascan-engine-ip-internal` — signed, `verify-tag` exit 0 |
+| Arca PR | `#49`, merged with `--merge`, not squashed |
+| Gas Can pin bump | `f562e6e` on `arca-integration` |
+| Pins dropped | 6 of 38 — `swift-ip`, `swift-bson`, `swift-json`, `swift-grammar`, `swift-hash`, `swift-unixtime` |
+
+### Evidence, with anchors
+
+- **Bit-for-bit equivalence to `swift-ip` 0.3.3 is VERIFIED, not asserted.** A
+  differential harness compiled the real library (revision `ba4efb6`) as one
+  module and `ArcaIP` as another and ran identical vectors through both:
+  `checks=18580063 mismatches=0`, exit 0. The harness was itself validated by two
+  independent negative controls — breaking `IP.V4.description` produced
+  10,418,664 mismatches, and breaking `IP.Block.mask` produced 2,921,191
+  including `contains`-specific ones. Without the second control, the Block
+  comparisons could have been vacuous and nobody would have known.
+- **Cold build VERIFIED**: `COLD_BUILD_RC=0` from a fresh clone at `9bb1a7e` with
+  `HOME`, `--cache-path` and `--scratch-path` all redirected to a temp dir.
+  Isolation confirmed by inspection: the isolated cache held 423 MB of freshly
+  cloned dependency repositories, none from `tayloraswift`, and the isolated
+  `HOME` was empty because cache and scratch captured everything.
+- **Gas Can's own gate script VERIFIED cold**: `GATE_RC=0`, `ContainerBridge`
+  release build complete in 173.18s, zero `tayloraswift` mentions.
+- **Release contract suite**: 14/14 exit 0.
+- **Functional pass** against a daemon proven by `nm`/`strings` to carry 108
+  `ArcaIP` symbols and zero swift-ip module symbols: gateway `172.31.0.1` on
+  `172.31.0.0/16`; two auto-allocated addresses distinct and in-subnet;
+  `--ip 172.31.9.9` accepted; `--ip 10.9.9.9` rejected with rc=125,
+  `IP 10.9.9.9 not in subnet 172.31.0.0/16` — the `IP.Block.contains` path.
+- **Test baseline established, not assumed**: 125 distinct failing tests on both
+  the before and after trees, differing by 10 in each direction. All ten
+  after-only failures were individually traced to daemon-socket or `docker` CLI
+  causes; none is an assertion about an IP, subnet, gateway, CIDR or allocation.
+  `NetworkIPAMTests` behaves identically on both sides — same 14 failures, same
+  causes.
+
+### Corrections to this document's own earlier claims
+
+- ~~The surface to replace is exactly `IP.V4(String)`, `IP.V4(value:)`, `.value`,
+  `IP.Block<IP.V4>(String)` and `.base`.~~ **Understated.** Characterization
+  found ten shapes, not five: those plus `Block.contains(_:)`, `Block.range`
+  with both `.lowerBound` and `.upperBound`, `String(describing:)`, and
+  `Equatable`. `String(describing:)` was the dangerous omission — its output is
+  persisted to SQLite and returned on the wire, so a divergence there would have
+  corrupted stored state rather than failing loudly.
+- ~~The review requirement is unsatisfiable for a solo maintainer, so expect
+  `--admin` on every future merge.~~ **No longer true.** The user relaxed ruleset
+  `10300321` on 2026-08-05: `require_last_push_approval` is now `false`, as are
+  `require_code_owner_review` and `required_review_thread_resolution`. PR #49
+  merged with a plain `--merge`. `allowed_merge_methods` remains `["merge"]` and
+  `required_signatures` remains in force, so squash is still impossible.
+
+### Known defect, deliberately preserved
+
+`IP.Block.range.upperBound` is the **broadcast address**, not broadcast−1, and
+Arca's allocator treats that bound as inclusive — so a container can be allocated
+its subnet's broadcast address. `WireGuardNetworkBackend.swift:1034` claimed the
+bound was "broadcast - 1 already"; that comment was false and has been corrected,
+but **the behaviour was left exactly as it was**, because changing it would have
+made the differential equivalence test impossible to write. Filed as
+`Vas-Solutus/arca#50`. Reachability: ~65,533 containers on a `/16`, immediate on
+a `/30`.
+
+### What is still unverified
+
+- **`StateStore`'s SQLite round-trip through a daemon restart.** The functional
+  pass never restarted the daemon, so the `IP.V4(String)` → `Int64` → re-read
+  path was not exercised end to end. The harness proves the arithmetic, not the
+  persistence path.
+- **Octet-boundary and broadcast-adjacent allocation at runtime.** Allocated
+  addresses were `.2` and `.3`. The harness swept all 33 prefix lengths with
+  boundary probes, so the arithmetic at those edges is proven; the daemon's
+  allocator was simply never driven there.
+- **Daemon-dependent test suites** cannot run in the agent sandbox at all, so
+  they are unverified rather than proven equivalent.
+
+### Calibration earned
+
+- **A negative control is not optional for a differential test.** The first one
+  perturbed `IP.V4.description`, which cannot affect `contains` — it returns a
+  `Bool` computed independently on each side. A second control against the Block
+  mask was needed before "0 mismatches" meant anything about half the surface.
+- **`git rm --cached` beats deleting** when files are tracked but gitignored.
+  `.gitignore:1` had ignored `.superpowers/` all along; 43 files were tracked
+  from earlier merged PRs, and four earlier plans carried hand-written "do not
+  stage these" clauses to work around it. Untracked in `26c7995`; every file
+  stays on disk.
+- **The plan itself contained an error the implementer caught.** Task 7 specified
+  `cargo test --test '*'` for the release contract suite. Wrong — the suite is 14
+  shell scripts at `tests/release/*-contract.sh`, and no cargo target runs them.
+  It was found because the dispatch said to verify rather than assume.
 
 ## Fresh-Session Restart Procedure
 
