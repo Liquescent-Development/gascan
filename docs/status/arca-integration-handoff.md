@@ -709,16 +709,43 @@ plan: `docs/superpowers/specs/2026-08-05-arca-internal-ip-type-design.md` and
   merged with a plain `--merge`. `allowed_merge_methods` remains `["merge"]` and
   `required_signatures` remains in force, so squash is still impossible.
 
-### Known defect, deliberately preserved
+### Known defect, deliberately preserved — worse than first recorded
 
 `IP.Block.range.upperBound` is the **broadcast address**, not broadcast−1, and
-Arca's allocator treats that bound as inclusive — so a container can be allocated
-its subnet's broadcast address. `WireGuardNetworkBackend.swift:1034` claimed the
-bound was "broadcast - 1 already"; that comment was false and has been corrected,
-but **the behaviour was left exactly as it was**, because changing it would have
-made the differential equivalence test impossible to write. Filed as
-`Vas-Solutus/arca#50`. Reachability: ~65,533 containers on a `/16`, immediate on
-a `/30`.
+Arca's allocator treats that bound as inclusive. **The behaviour was left exactly
+as it was**, because changing it would have made the differential equivalence test
+impossible to write. Filed as `Vas-Solutus/arca#50`.
+
+**Read the live path, not the comment.** VERIFIED by
+`grep -rn "allocateIP" Sources/ Tests/` in `~/code/arca`, which returns only the
+definition at `WireGuardNetworkBackend.swift:1008` and a prose mention at `:223`:
+`allocateIP` **has no callers**. The corrected comment landed at `:1034-1037`,
+inside that dead function. The live allocation path is
+`WireGuardNetworkBackend.swift:382-408` (`attachContainer`) → `:397`
+`rangeEnd = Int64(block.range.upperBound.value)` →
+`StateStore.allocateAndReserveIP` (`StateStore.swift:964-1051`), and it carries no
+marker. Anyone fixing `#50` by following the comment will fix an uncalled function,
+watch the marker vanish, and ship believing it closed.
+
+~~Reachability: ~65,533 containers on a `/16`, immediate on a `/30`.~~
+**Understated — corrected 2026-08-05 by the final review.** Both figures are
+accurate for the wasted-address symptom, but the same expression is
+**daemon-fatal** on `/31` and `/32`. `docker network create --subnet` takes the
+string verbatim with no prefix-length validation
+(`WireGuardNetworkBackend.swift:178-179`). On `--subnet 10.0.0.0/31`:
+`rangeStart` becomes `10.0.0.2` and `rangeEnd` becomes `10.0.0.1`, so the first
+attach silently allocates an address **outside the network**, and the second
+reaches `StateStore.swift:1012`, `for ip in rangeStart...rangeEnd` — a closed
+range with `lowerBound > upperBound`. Swift traps and **the daemon process dies**,
+taking management of every running container with it. `/32` behaves the same way.
+A related trap sits at `WireGuardNetworkBackend.swift:1082` on the live
+network-create path: `--subnet 255.255.255.255/32` overflows `UInt32`.
+
+So the exposure is not a wasted address at extreme scale; it is an
+API-triggerable daemon crash on a two-character input, reachable on the second
+container. Entirely pre-existing — `swift-ip`'s `onesMasked` produced the identical
+bound and every arithmetic line involved is untouched by this change — but the
+severity belongs in the record.
 
 ### What is still unverified
 
