@@ -744,7 +744,7 @@ fn blocking_owned_volume(name: &str, prefix: &str, owner_token: &str) -> bool {
 pub fn random_owner_token() -> Result<String, TestError> {
     let mut bytes = [0_u8; 16];
     fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    Ok(gascan_core::hex::lower(&bytes))
 }
 
 pub fn publish_args(

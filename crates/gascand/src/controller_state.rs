@@ -990,10 +990,7 @@ fn create_private_quarantine(
                 "generating a legacy archive quarantine name: {error}"
             ))
         })?;
-        let token = random
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        let token = gascan_core::hex::lower(&random);
         let name = format!("{prefix}{token}");
         match rustix::fs::mkdirat(directory, &name, Mode::from_raw_mode(DIRECTORY_MODE as u16)) {
             Ok(()) => {
@@ -2056,10 +2053,7 @@ where
         getrandom::fill(&mut random).map_err(|error| {
             ControllerStateError::Unsafe(format!("generating a cleanup quarantine name: {error}"))
         })?;
-        let token = random
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        let token = gascan_core::hex::lower(&random);
         let name = format!(".state.sqlite3.cleanup-quarantine-{token}");
         before_create(&name)?;
         match rustix::fs::mkdirat(directory, &name, Mode::from_raw_mode(DIRECTORY_MODE as u16)) {

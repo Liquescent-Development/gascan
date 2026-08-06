@@ -25,10 +25,7 @@ impl SandboxId {
     pub fn from_root(name: &str, canonical_root: &Utf8Path) -> Self {
         let slug = slugify(name);
         let digest = Sha256::digest(canonical_root.as_str().as_bytes());
-        let suffix = digest[..6]
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        let suffix = crate::hex::lower(&digest[..6]);
         Self(format!("{slug}-{suffix}"))
     }
 

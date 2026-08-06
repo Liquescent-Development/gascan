@@ -154,10 +154,7 @@ fn write_generation(
     paths: &SshPaths,
     contents: &str,
 ) -> Result<camino::Utf8PathBuf, Box<dyn std::error::Error>> {
-    let digest = Sha256::digest(contents.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let digest = gascan_core::hex::lower(&Sha256::digest(contents.as_bytes()));
     let path = paths.directory().join(format!("known_hosts.{digest}"));
     fs::write(path.as_std_path(), contents)?;
     fs::set_permissions(path.as_std_path(), fs::Permissions::from_mode(0o644))?;
@@ -235,10 +232,8 @@ async fn publishes_stable_sorted_strict_openssh_files() -> TestResult {
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
         .ok_or("known-hosts generation is not UTF-8")?;
-    let expected_generation = Sha256::digest(known_hosts_before.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let expected_generation =
+        gascan_core::hex::lower(&Sha256::digest(known_hosts_before.as_bytes()));
     assert_eq!(generation, format!("known_hosts.{expected_generation}"));
 
     assert!(config_before.find("Host gascan-alpha") < config_before.find("Host gascan-zeta"));

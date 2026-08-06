@@ -400,10 +400,7 @@ fn write_obsolete_generation(
     paths: &SshPaths,
     contents: &str,
 ) -> Result<camino::Utf8PathBuf, Box<dyn std::error::Error>> {
-    let digest = Sha256::digest(contents.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let digest = gascan_core::hex::lower(&Sha256::digest(contents.as_bytes()));
     let path = paths.directory().join(format!("known_hosts.{digest}"));
     std::fs::write(&path, contents)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;

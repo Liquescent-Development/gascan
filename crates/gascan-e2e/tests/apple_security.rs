@@ -712,7 +712,7 @@ fn dns_domains() -> TestResult<Vec<String>> {
 fn owner_token() -> TestResult<String> {
     let mut bytes = [0_u8; 16];
     fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    Ok(gascan_core::hex::lower(&bytes))
 }
 
 fn owned_domain(domain: &str) -> bool {

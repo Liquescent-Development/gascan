@@ -440,7 +440,7 @@ fn daemon_launch_environment(
         None => {
             let mut random = [0_u8; 32];
             getrandom::fill(&mut random).map_err(std::io::Error::other)?;
-            random.iter().map(|byte| format!("{byte:02x}")).collect()
+            gascan_core::hex::lower(&random)
         }
     };
     if owner.is_empty() {

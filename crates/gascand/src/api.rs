@@ -127,7 +127,7 @@ impl DaemonIdentity {
 fn fresh_token() -> io::Result<String> {
     let mut random = [0_u8; 32];
     getrandom::fill(&mut random).map_err(io::Error::other)?;
-    Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
+    Ok(gascan_core::hex::lower(&random))
 }
 
 #[cfg(target_os = "linux")]

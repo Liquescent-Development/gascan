@@ -5,6 +5,7 @@ pub mod account;
 pub mod doctor;
 pub mod fake_runtime;
 pub mod gascamp;
+pub mod hex;
 pub mod manifest;
 pub mod policy;
 pub mod provision;
