@@ -65,7 +65,11 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 20
     steps:
+      # Full history: release-script-contract.sh resolves HEAD~1, and a default
+      # shallow checkout fails it with "Failed to resolve 'HEAD~1' as a valid ref".
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Release and CI contracts
         run: ./scripts/ci-run-release-contracts.sh
