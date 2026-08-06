@@ -877,3 +877,257 @@ git diff --name-status $BASE origin/main | awk '$1=="M"{print $2}'
   `~/code/firecracker/docs/superpowers/specs/2026-08-01-macos-microvm-backend-design.md`,
   uncommitted, in a repository unrelated to this work. Its §3 platform facts are
   reproduced above; the rest is superseded. Do not act on it.
+
+## P2.1 in flight — 2026-08-05/06
+
+**Path chosen: P2.1, not P5.1.** P5.1 turned out not to be unblocked in the way the
+prior handoff implied — the roadmap has `P5 — Depends on: P3` (`roadmap:345`) and
+P5.1 is "implement the engine **service**", which needs the proto that P3.1 has yet
+to design (U4). P2.1 had no design gap in front of it.
+
+Design: `docs/superpowers/specs/2026-08-05-gascan-ci-consolidation-design.md`.
+Plan: `docs/superpowers/plans/2026-08-05-gascan-ci-consolidation.md`.
+**Read §11 of the spec first** — it holds what the first real runs found, including a
+correction to the spec's own baseline.
+
+### State of the three open PRs
+
+| PR | Branch | Base | Contents |
+|---|---|---|---|
+| #46 | `ci/p2-1-consolidated-pipeline` | `main` | spec + plan, docs only |
+| #47 | `fix/pty-completion-line-assertion` | `main` | the born-red PTY test fix, `ba667f4` |
+| #48 | `ci/p2-1-pipeline` | **#47** | the pipeline, 8 commits |
+
+**#48 is stacked on #47 deliberately.** Without #47's fix, `cargo test --workspace`
+fails on a test that has never passed, so the `rust` job could not go green. GitHub
+retargets #48 to `main` once #47 merges. **Nothing is merged** — the Claude Code
+permission classifier refuses `gh pr merge`, and routing around it with
+`gh api --method PUT .../merge` is the same irreversible action and was not done.
+Merge each with `--merge`; never squash.
+
+### Why CI paid for itself twice on its first two runs
+
+Both are pre-existing defects that no human or agent had seen, because nothing ever
+ran this code.
+
+1. **A test red since birth.** `fake_backend.rs:589` searched the raw PTY transcript
+   for `"✓ Sandbox is running"` while `presentation.rs:636-642` emits the marker as
+   `"\u{1b}[32m✓\u{1b}[0m"`, so an SGR reset sits between glyph and text. `20de03d`
+   added the colored marker at 13:27:34 on 2026-07-22; `6d01465` added the assertion
+   at 13:31:53, **four minutes later**. `git merge-base --is-ancestor 20de03d 6d01465`
+   exits 0. Two weeks red, invisible.
+2. **The tree did not compile on its own pinned toolchain.**
+   `cargo build --workspace` under `RUSTUP_TOOLCHAIN=1.85.0` exits 101 with
+   `error[E0658]` — a let-chain at `crates/gascan/src/daemon.rs:1182`, unstable
+   before Rust 1.88, while `rust-toolchain.toml` pins 1.85.0 and `Cargo.toml:8`
+   declares `rust-version = "1.85"`. Then clippy failed at **eleven**
+   `format_collect` sites. Both fixed on #48.
+
+### The trap that hid both, and will hide the next one
+
+**`RUSTUP_TOOLCHAIN=1.95.0` is exported in the development environment, and it
+overrides `rust-toolchain.toml`.** `rustup toolchain list` reports `1.95.0 (active)`
+inside the repository. Every local Rust measurement is therefore about 1.95.0 while
+CI uses 1.85.0 — which is how a tree that cannot compile on its pinned toolchain
+went unnoticed.
+
+**Prefix Rust commands with `RUSTUP_TOOLCHAIN=1.85.0` until that export is removed**,
+or the numbers do not describe CI. This is the Rust equivalent of the warm-SwiftPM-cache
+trap, and it cost the same kind of time.
+
+### Open decision for the maintainer: MSRV
+
+The let-chain was rewritten as a nested `if` to honour the declared 1.85 floor,
+because that was the smaller, reversible choice. **Bumping `rust-toolchain.toml` and
+`Cargo.toml`'s `rust-version` to ≥1.88 is an equally valid answer and is a policy
+call.** If the pin moves, `9bee529` can be reverted.
+
+### BLOCKING: do not turn the ruleset on yet
+
+`cargo test --workspace` is flaky — 3 red / 1 green locally, **a different test each
+time**, all in the daemon-readiness family. Root-caused by measurement, not inference:
+cargo runs **6–8 test binaries concurrently** (sampled with `ps`), each independently
+defaulting to `--test-threads` = `num_cpus` = 10, so ~60–80 concurrent test threads on
+10 cores, against hard 5-second wall-clock deadlines
+(`FIXTURE_DAEMON_DIAGNOSTIC_DEADLINE`, `client.rs:20`). Isolated, the same binary is
+green 5/5. Pre-existing: red on a base branch that changes zero Rust.
+
+Two details that matter for whoever fixes it. The fixture "daemon" is a `#!/bin/sh`
+script (`daemon.rs:3390`), not the 41 MB binary — so Gatekeeper/`syspolicyd` does not
+explain it, and 5s is ~500× what the script needs. And the wait loop never checks
+whether the child is alive, so it cannot tell "slow" from "dead" and reports an empty
+`stderr` either way. Close that diagnostic gap before choosing a fix.
+
+**Reducing parallelism or adding retries would hide this, not fix it.** Task 8 of the
+plan (the ruleset) is explicitly gated on it.
+
+### Settled by measurement
+
+- **Hosted `macos-26` has no Apple container runtime.** The probe failed with
+  `container: command not found`, exit **127**, on `ProductVersion: 26.5.2`. The heavy
+  Apple e2e tier cannot run on hosted runners — independent of the candidate-image
+  problem. Promotes a PLAN claim; D4 stands on evidence.
+- **`gate` reddens correctly.** Run `31074653442`: `changes=success`,
+  `engine=success`, `rust=failure`, `contracts=failure`, **`gate=failure`**. The
+  aggregation propagates failure, so the required check would have blocked. The green
+  and `skipped` directions still need confirming.
+- **`changes` and `engine` work on real runners**, so the shell classifier is sound and
+  the folded-in engine-pin build survived the move into `ci.yml`.
+- **U3 answered: path filters are nice, not mandatory.** 1:00.07 for 902 tests and
+  1:57.82 to compile every test binary, both warm, against 7m21s–8m38s for the engine
+  build. They earn their keep on the `engine` job alone.
+- **`actions/checkout` defaults to `fetch-depth: 1`**, and
+  `release-script-contract.sh` resolves `HEAD~1`. Four contracts failed on it before
+  `fetch-depth: 0` was added to that job.
+
+### A pre-existing stash, untouched
+
+`git stash list` shows `stash@{0}: f6356f9 release: prepare Gas Can 0.1.20 (#43)`. It
+predates this session and was not created or dropped here. Someone should establish
+what it holds before it is lost.
+
+### Calibration earned
+
+- **A subagent challenged a claim in its own instructions and was right.** The commit
+  message it was handed said "the repository has no CI"; it checked, found two
+  workflows, and reworded to the accurate, anchored version. `workspace-bundles.yml:96`
+  does run `cargo test`, but against the produced gascamp bundle's vendored tree, not
+  this workspace. Instructions to subagents are not exempt from the anchor convention.
+- **Each clippy fix uncovered the next one.** Clippy stops at the first failing crate,
+  so "one lint site" became eleven across five crates, one crate at a time. Expect
+  excavation, not a single fix, the first time a linter runs over a codebase.
+- **`printf '--- ...'` aborts under `set -eu`** — `printf` parses `---` as an option
+  and exits 2. It was in the plan's contract-runner text and only fired on the failure
+  path, so the diagnostic branch had never worked. Use `printf --`.
+
+### Where PR #48 actually stands after two CI runs — start here
+
+`ci / gate` is **red**, and the remaining failures are understood, not mysterious.
+Run 2 (`06d4c67`): `changes=success`, `engine=success`, `rust=failure`,
+`contracts=failure`, `runtime-probe=failure` (expected, §11.5), `gate=failure`.
+
+**What the two fixes achieved.** Clippy now passes on the pinned toolchain — the
+`rust` job's failure moved from lint to tests. `release-script-contract.sh` now
+passes, and `publish-contract.sh` moved rc=128 → rc=1, so `fetch-depth: 0` was the
+right diagnosis for the `HEAD~1` family.
+
+**Task A — 14 tests need a binary path CI does not provide.**
+`cargo test --workspace` fails at `-p gascan-e2e --test apple_apply`:
+62 passed / **14 failed** / 8 ignored, every failure
+`Error: "workspace-built gascan binary is unavailable"` from
+`crates/gascan-e2e/tests/apple_common/mod.rs:503-506`. Those lines read
+`CARGO_BIN_EXE_gascan-e2e-cli` and `CARGO_BIN_EXE_gascan-e2e-daemon` with
+`std::env::var_os` — i.e. at **runtime**. Cargo documents `CARGO_BIN_EXE_<name>` as
+a **compile-time** variable for `env!()`, set while building an integration test.
+It is present in the local environment and absent on the runner, which is why these
+14 pass here and fail there. They carry no `#[ignore]`, so they are not part of the
+22-test heavy set — they were miscategorised as hermetic, including by this
+document's §3.3 baseline.
+
+*Do not guess the fix.* Establish first whether cargo sets these at runtime at all,
+or whether local runs inherit them from something ambient. `env!` at compile time is
+the documented mechanism and is probably the correct change, but that is a change to
+a pre-existing test helper and deserves its own diagnosis.
+
+**Task B — three release contracts still fail on a hosted runner.**
+`distributable-package rc=65`, `publish rc=1`, `signal rc=1`. Causes not yet
+established; the `HEAD~1` family is fixed, so these are different. They pass
+locally (15/15, `status=0`), so each is a local-versus-runner divergence like Task A.
+
+**Task C — the flaky suite**, §11.7 of the spec. Still gates the ruleset.
+
+Sequence: A and B make `ci / gate` green; C makes it trustworthy; only then the
+ruleset (plan Task 8).
+
+**A caution earned twice tonight.** Every remaining failure is a case of "green
+locally, red on the runner", and both already-diagnosed instances had the same
+shape: the local environment silently supplies something CI does not
+(`RUSTUP_TOOLCHAIN=1.95.0` overriding the pin; `CARGO_BIN_EXE_*` present in the
+shell). Suspect ambient environment first, and measure with the runner's assumptions
+rather than this machine's.
+
+### Amended after the toolchain bump — 2026-08-06
+
+Read this before acting on the three tasks above; one of them is gone and the
+toolchain situation is resolved.
+
+**The pin now tracks the compiler in use: 1.95.0** (`a335aad`), with
+`Cargo.toml`'s `rust-version` following. The maintainer chose this after the
+scaffolding history was traced: `d6978fa` (2026-07-13) set both files in one commit
+and neither was revisited, and 1.85.0 was there only because it is the floor for
+`edition = "2024"`. Pinning `rust-toolchain.toml` **to** an MSRV floor is what
+guaranteed the local-versus-CI split, since `RUSTUP_TOOLCHAIN` overrides the file.
+No crate sets `publish` and Gas Can ships as a signed `.pkg`, so the MSRV promise
+protected no consumer.
+
+Consequences, all VERIFIED:
+
+- **The let-chain rewrite was reverted** (`ceddd86`). `daemon.rs:1182` reads
+  naturally again; let-chains are stable from 1.88.
+- **The `hex::lower` refactor was kept** (`b2003df`). 1.95's clippy does not require
+  it, but eleven copies collapsed into one is worth having on its own merits.
+- **33 clippy findings were cleared to reach a green lint gate** — 11
+  `format_collect`, 26 `collapsible_if`, 1 `manual_is_multiple_of`, across 13 files,
+  with **zero `#[allow(...)]` added** (`2d4a15e`, `1f31836`, `8347b48`).
+  `cargo clippy --workspace --all-targets -- -D warnings` exits **0** with
+  `RUSTUP_TOOLCHAIN` unset, confirmed not cache-clean by touching every `.rs` and
+  re-running.
+
+**Two things from that sweep worth carrying forward.**
+`cargo clippy --fix` would not have been safe here: clippy's own suggestion at
+`service.rs:2694` emitted invalid Rust (a stray brace mid-condition), and three
+sites needed `||` parentheses it omitted — one of them `ssh/manager.rs:647`, an SSH
+host-key check where a wrong collapse would have weakened a security guard. Read
+every suggestion before applying it.
+
+And the warm-cache trap appeared a **third** time, in a new tool. An earlier
+`cargo clippy` reported exit 0 in 13.4 seconds by reusing cached lint results;
+touching `gascan-core` forced a real re-lint and 22 findings appeared that had been
+there all along. The pattern across this project is now: warm SwiftPM cache (P1.4),
+`RUSTUP_TOOLCHAIN` overriding the pin, and cached clippy results. **Before trusting
+any green from a tool, ask what it cached.**
+
+### CI run 3 — `31113833927`, and a correction
+
+`changes=success`, `engine=success`, `runtime-probe=failure` (expected, §11.5),
+`rust=failure`, `contracts=failure`, `gate=failure`. CI reports
+`rustc 1.95.0` and **clippy passed** — the first time the Rust workspace has cleared
+lints in CI.
+
+> ~~**Task A — 14 tests need a binary path CI does not provide.** …
+> `CARGO_BIN_EXE_gascan-e2e-cli` … read at **runtime** … present in the local
+> environment and absent on the runner.~~
+> **WRONG, and dissolved.** Those 14 failures do not appear in run 3 at all — zero
+> occurrences of `workspace-built gascan binary is unavailable`. They were an
+> artifact of the earlier run's build ordering, where clippy failed first, not an
+> env-var lifetime problem. The evidence that should have prompted a re-examination
+> was already in hand: a subagent could not reproduce them locally, and that was
+> read as *consistent with* the theory rather than as a reason to doubt it.
+> **A theory that explains a non-reproduction too comfortably deserves suspicion.**
+
+**What is actually left, in order:**
+
+1. **Task B — three release contracts fail only on the runner.**
+   `distributable-package rc=65`, `publish rc=1`, `signal rc=1`. Unchanged across all
+   three runs and **undiagnosed**. They pass 15/15 locally. Given that two of the
+   three local-versus-runner divergences this session were ambient environment,
+   suspect that first: compare what the contract scripts read from the environment
+   against what a fresh runner provides. Their logs are reachable per-job with
+   `gh api /repos/Liquescent-Development/gascan/actions/jobs/<id>/logs` even while a
+   run is in progress.
+2. **Task C — the flaky suite**, §11.7 of the spec. `rust` is now down to this alone:
+   run 3 failed only `logs_since_and_follow_emit_new_byte_exact_records_then_cancel`,
+   which passes locally. Root cause is recorded; the fix is not chosen.
+3. **Then the ruleset** — plan Task 8. Not before B and C.
+
+### PR state at handover
+
+| PR | State | Notes |
+|---|---|---|
+| #46 | **MERGED** `29318c3` | spec + plan |
+| #47 | **MERGED** `d5cb601` | the born-red PTY test fix |
+| #48 | **OPEN**, base `main`, 12 commits | the pipeline; red on Tasks B and C only |
+| #49 | **OPEN** | this handoff |
+
+`ci / gate` has never been green, so **do not add the ruleset yet** — never require a
+check that has not passed.
