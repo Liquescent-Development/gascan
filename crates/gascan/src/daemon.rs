@@ -454,12 +454,34 @@ pub(crate) trait DaemonSpawner: Send + Sync {
 #[derive(Debug, Default)]
 pub(crate) struct DaemonStartupMonitor {
     source: Option<StartupDiagnosticSource>,
+    child: Option<tokio::process::Child>,
 }
 
 impl DaemonStartupMonitor {
     pub(crate) fn from_file(file: File, owner_token: String) -> Self {
         Self {
             source: Some(StartupDiagnosticSource { file, owner_token }),
+            child: None,
+        }
+    }
+
+    /// Retain the spawned process so a caller waiting on the startup
+    /// diagnostic can tell a slow daemon from a dead one. This does not undo
+    /// detachment: the handle only lets the parent observe the child before it
+    /// exits, and dropping it still leaves the process running.
+    pub(crate) fn watching(mut self, child: tokio::process::Child) -> Self {
+        self.child = Some(child);
+        self
+    }
+
+    /// `Some(status)` once the daemon has exited, `None` while it is still
+    /// running or when no handle was retained. Without this a caller polling
+    /// for a diagnostic can only report "it never arrived", which is the same
+    /// message whether the daemon is merely slow or died before writing a byte.
+    pub(crate) fn exited(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        match &mut self.child {
+            Some(child) => child.try_wait(),
+            None => Ok(None),
         }
     }
 
@@ -3413,18 +3435,33 @@ mod tests {
             startup_diagnostic_path: startup_path.clone(),
         };
 
-        let monitor = DaemonSpawner::spawn(&crate::client::TokioDaemonSpawner, &launch)?;
+        let mut monitor = DaemonSpawner::spawn(&crate::client::TokioDaemonSpawner, &launch)?;
         let deadline =
             tokio::time::Instant::now() + crate::client::FIXTURE_DAEMON_DIAGNOSTIC_DEADLINE;
         let error = loop {
             if let Some(error) = monitor.controller_error()? {
                 break error;
             }
+            // Check the child before the clock, so a daemon that died is
+            // reported as dead rather than as a timeout it could never have met.
+            // Re-read the diagnostic first: this fixture writes and then exits,
+            // so it can complete both between the check above and this one.
+            if let Some(status) = monitor.exited()? {
+                if let Some(error) = monitor.controller_error()? {
+                    break error;
+                }
+                let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+                let replacement = fs::read(&startup_path).unwrap_or_default();
+                return Err(format!(
+                    "fixture daemon exited with {status} before writing its inherited diagnostic: stderr={stderr:?}, replacement={replacement:?}"
+                )
+                .into());
+            }
             if tokio::time::Instant::now() >= deadline {
                 let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
                 let replacement = fs::read(&startup_path).unwrap_or_default();
                 return Err(format!(
-                    "fixture daemon did not write its inherited diagnostic within {:?}: stderr={stderr:?}, replacement={replacement:?}",
+                    "fixture daemon was still running but had not written its inherited diagnostic within {:?}: stderr={stderr:?}, replacement={replacement:?}",
                     crate::client::FIXTURE_DAEMON_DIAGNOSTIC_DEADLINE
                 )
                 .into());
