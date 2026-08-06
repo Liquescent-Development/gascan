@@ -186,42 +186,47 @@ gascan_expected_release_assets() {
     '[$a, $b, $c] | sort | join(",")'
 }
 
-# Every path pkgutil reports for a Gas Can package payload. macOS 26's pkgbuild
-# serializes its protected com.apple.provenance xattr as paired AppleDouble
-# records, so those are part of the expected set. This is the single definition
-# of "the payload is exactly what we ship": both the build-time verifier and the
-# release gate compare against it.
+# Every path pkgutil reports for a Gas Can package payload, in its canonical
+# form: the twelve entries the package actually installs. This is the single
+# definition of "the payload is exactly what we ship": both the build-time
+# verifier and the release gate compare against it.
 gascan_expected_payload_files() {
   cat <<'EOF_PAYLOAD'
 .
-./._usr
 ./usr
-./usr/._local
 ./usr/local
-./usr/local/._bin
-./usr/local/._share
 ./usr/local/bin
-./usr/local/bin/._gascan
-./usr/local/bin/._gascan-apple-attach
-./usr/local/bin/._gascand
 ./usr/local/bin/gascan
 ./usr/local/bin/gascan-apple-attach
 ./usr/local/bin/gascand
 ./usr/local/share
-./usr/local/share/._gascan
 ./usr/local/share/gascan
-./usr/local/share/gascan/._LICENSE
-./usr/local/share/gascan/._build-manifest.json
-./usr/local/share/gascan/._default-gascan.toml
 ./usr/local/share/gascan/LICENSE
 ./usr/local/share/gascan/build-manifest.json
 ./usr/local/share/gascan/default-gascan.toml
 EOF_PAYLOAD
 }
 
+# The AppleDouble record pkgbuild pairs with each payload path when the build
+# host attaches xattrs. Derived from the canonical list rather than transcribed,
+# so the two cannot drift. `.` is the payload root and is never paired.
+gascan_expected_payload_appledouble() {
+  gascan_expected_payload_files | sed -n 's|^\(.*\)/\([^/]*\)$|\1/._\2|p'
+}
+
 # Compare the package's entire payload listing against that allowlist. Listing
 # rather than walking an extracted root is what makes symlinks, AppleDouble
 # records, nested directories and hostile filenames all visible.
+#
+# AppleDouble records are a property of the build host, not of Gas Can. macOS 26
+# attaches the protected com.apple.provenance xattr to every file it creates and
+# it cannot be removed -- `xattr -c` exits 0 and the attribute survives -- so
+# pkgbuild there serializes a paired `._` record for every path. A host that
+# attaches nothing produces the same twelve files with no records at all. Both
+# ship identical content, so the gate accepts either representation, but only in
+# full: a partial set, or a record with no payload file to pair with, is a
+# rejection. Pinning one host's shape is what made this gate pass on a developer
+# Mac and fail on a hosted runner.
 gascan_assert_exact_payload() {
   local package=$1 work
   work=$(mktemp -d "${TMPDIR:-/tmp}/gascan-payload.XXXXXX") || return 70
@@ -230,11 +235,24 @@ gascan_assert_exact_payload() {
     printf 'package payload could not be listed\n' >&2
     return 65
   fi
-  LC_ALL=C sort -o "$work/actual-payload" "$work/listing"
+  # Partition on the AppleDouble prefix in the final path component. grep is
+  # wrapped because an empty side is a legitimate result, not a pipeline failure.
+  { grep -v '/\._[^/]*$' "$work/listing" || true; } |
+    LC_ALL=C sort >"$work/actual-payload"
+  { grep '/\._[^/]*$' "$work/listing" || true; } |
+    LC_ALL=C sort >"$work/actual-appledouble"
   gascan_expected_payload_files | LC_ALL=C sort >"$work/expected-payload"
+  gascan_expected_payload_appledouble | LC_ALL=C sort >"$work/expected-appledouble"
   if ! cmp -s "$work/actual-payload" "$work/expected-payload"; then
     printf 'package payload differs from the exact allowlist\n' >&2
     diff -u "$work/expected-payload" "$work/actual-payload" >&2 || true
+    rm -rf "$work"
+    return 65
+  fi
+  if [[ -s $work/actual-appledouble ]] &&
+    ! cmp -s "$work/actual-appledouble" "$work/expected-appledouble"; then
+    printf 'package payload AppleDouble records are not the exact paired set\n' >&2
+    diff -u "$work/expected-appledouble" "$work/actual-appledouble" >&2 || true
     rm -rf "$work"
     return 65
   fi

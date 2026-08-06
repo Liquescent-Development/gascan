@@ -23,28 +23,33 @@ gascan_assert_exact_payload "$package" || exit $?
 
 mkdir "$work/root"
 (cd "$work/root" && gzip -dc "$work/pkg/Payload" | cpio -idm --quiet)
-# macOS 26's pkgbuild serializes its protected com.apple.provenance xattr as
-# paired AppleDouble payload records. They are not installed as `._*` files.
-# Require that exact representation and reject every other xattr.
+# Which xattrs the payload carries is a property of the build host, not of Gas
+# Can: macOS 26 attaches the protected com.apple.provenance to every file it
+# creates and it cannot be stripped, while a host that attaches nothing produces
+# the same payload carrying none. Either way they are not installed as `._*`
+# files. Accept exactly those two representations -- and require the whole
+# payload to agree on one of them, so a single file carrying a stray xattr is
+# still a rejection. The paths come from the shared allowlist rather than a
+# second copy of the list, so the two cannot drift.
+canonical_xattrs=
+first_path=true
 while IFS= read -r path; do
-  [[ $(xattr "$work/root/$path") == com.apple.provenance ]] || {
-    printf 'payload xattr set is not the canonical macOS provenance record: %s\n' "$path" >&2
+  observed=$(xattr "$work/root/$path" | LC_ALL=C sort | tr '\n' ',')
+  if [[ $first_path == true ]]; then
+    first_path=false
+    case $observed in
+      '' | com.apple.provenance,) canonical_xattrs=$observed ;;
+      *)
+        printf 'payload xattr set is not a canonical representation: %s\n' "$path" >&2
+        exit 65
+        ;;
+    esac
+  fi
+  [[ $observed == "$canonical_xattrs" ]] || {
+    printf 'payload xattr set is not uniform across the payload: %s\n' "$path" >&2
     exit 65
   }
-done <<'EOF_XATTR_PATHS'
-.
-usr
-usr/local
-usr/local/bin
-usr/local/bin/gascan
-usr/local/bin/gascan-apple-attach
-usr/local/bin/gascand
-usr/local/share
-usr/local/share/gascan
-usr/local/share/gascan/LICENSE
-usr/local/share/gascan/build-manifest.json
-usr/local/share/gascan/default-gascan.toml
-EOF_XATTR_PATHS
+done < <(gascan_expected_payload_files)
 manifest=$work/root/usr/local/share/gascan/build-manifest.json
 jq -e --arg revision "$expected_revision" --arg version "$expected_version" '
   . == {
