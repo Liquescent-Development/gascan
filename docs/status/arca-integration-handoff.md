@@ -1245,9 +1245,25 @@ instrument that was drifting. CI is the arbiter for whether the fixes moved the 
 wait loop's empty stderr, one message covering four file faults, and this. Each cost an
 investigation the message should have ended.
 
+### `ci.yml` is not on `main` yet, and that reorders the plan
+
+**VERIFIED.** `git ls-tree --name-only origin/main .github/workflows/` lists only
+`engine-pin.yml` and `workspace-bundles.yml`. `ci.yml` exists **only** on
+`ci/p2-1-pipeline`. Two consequences the plan did not account for:
+
+- **Task 6 Step 7 cannot run before #48 merges.** It asks for a docs-only PR to prove
+  `ci / gate` goes green with `rust` and `engine` **skipped** — the case that proves the
+  whole topology. PR #50 is exactly that PR, but it branches from `main`, so it carries
+  no `ci` workflow and reports no checks at all. That is correct behaviour, not a
+  failure. The step has to follow the merge, not precede it.
+- **Merging #48 deletes `engine-pin.yml` from `main`**, because the pipeline branch folds
+  that build in as the `engine` job. That is the design (spec §5.1) and the job has been
+  green on real runners, but it is worth knowing the standalone workflow disappears at
+  the same moment.
+
 ### GitHub Actions stopped triggering
 
-Runs for `bc89c56` and `83ee5bf` were **never created** — `gh pr view 48` shows the head
+Runs for `bc89c56`, `83ee5bf` and `8ded364` were **never created** — `gh pr view 48` shows the head
 moving and `statusCheckRollup` empty. Actions is enabled (`allowed_actions: all`) and the
 `ci` workflow is `active`; the repo is public and org-owned, so this is not minutes
 exhaustion. Earlier runs in the same window were queued and then cancelled without
@@ -1260,10 +1276,25 @@ retry; it is not a configuration fault in the tree.
 |---|---|---|
 | #46 | **MERGED** `29318c3` | spec + plan |
 | #47 | **MERGED** `d5cb601` | born-red PTY test fix |
-| #48 | **OPEN**, head `83ee5bf` | the pipeline, plus Tasks B and C |
+| #48 | **OPEN**, head `8ded364` | the pipeline, plus Tasks B and C; `origin/main` merged in |
 | #49 | **MERGED** `e6ef8c0` | the previous handoff |
+| #50 | **OPEN** | this record: roadmap + handoff, docs only. Doubles as Task 6 Step 7 **once `ci.yml` is on `main`** |
 
 **The ruleset is still off.** The gate has gone green once, so requiring it is now
 permitted — but the suite still fails intermittently, the third category of timing site
-has no answer, and the last two commits have no CI result at all. Decide it on CI's
+has no answer, and the last three commits have no CI result at all. Decide it on CI's
 observed rate, not on this machine's.
+
+### Order of operations for whoever picks this up
+
+1. Confirm `ci / gate` on `8ded364` once Actions is creating runs again. Anchor the claim
+   to that run ID; every push re-triggers CI, so a gate claim without a run ID is worth
+   nothing.
+2. Merge #48 with `--merge`. That puts `ci.yml` on `main` and removes `engine-pin.yml`.
+3. **Then** Task 6 Step 7 becomes possible: PR #50 should go green with `rust` and
+   `engine` reporting `skipped`. Until step 2, #50 legitimately has no checks.
+4. Merge #50.
+5. Only then the ruleset (plan Task 8), and only if CI's own flake rate justifies it.
+   Require `ci / gate`; set `allowed_merge_methods` to `["merge"]`; then confirm it
+   actually blocks by checking `mergeStateStatus` is `BLOCKED` on a red PR. A ruleset
+   that does not block is not enforcement.
