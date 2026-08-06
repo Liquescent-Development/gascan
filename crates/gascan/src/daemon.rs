@@ -1176,17 +1176,12 @@ where
                 });
             }
         };
-        // Written as a nested `if` rather than a let-chain: let-chains are
-        // unstable before Rust 1.88 and `rust-toolchain.toml` pins 1.85.0, which
-        // `Cargo.toml`'s `rust-version = "1.85"` also declares. The short-circuit
-        // is preserved — `controller_error()` is only called for the two states.
         if matches!(
             inspected.status.state,
             DaemonState::Stopped | DaemonState::Unreachable
-        ) {
-            if let Some(error) = startup.controller_error()? {
-                return Err(error);
-            }
+        ) && let Some(error) = startup.controller_error()?
+        {
+            return Err(error);
         }
         match inspected.status.state {
             DaemonState::Current
@@ -2160,7 +2155,7 @@ fn daemon_launch(
 fn random_token() -> io::Result<String> {
     let mut random = [0_u8; 32];
     getrandom::fill(&mut random).map_err(io::Error::other)?;
-    Ok(gascan_core::hex::lower(&random))
+    Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 async fn classify_connected<C, P: ProcessInspector>(
