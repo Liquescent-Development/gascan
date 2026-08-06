@@ -586,8 +586,13 @@ fn tty_stderr_lifecycle_progress_updates_in_place_and_finishes_cleanly() -> Test
         let (status, output) = invoke_with_stderr_pty(&env, &["up", env.root()?], no_color)?;
         assert!(status.success());
         let stderr = String::from_utf8(output)?;
+        // The success marker is emitted as "\u{1b}[32m✓\u{1b}[0m" when color is on
+        // (crates/gascan/src/presentation.rs:636-642), so an SGR reset sits between
+        // the glyph and the text and the raw transcript never contains the two
+        // adjacently. Match the uncolored tail here to locate the completion line;
+        // the glyph is asserted below against the ANSI-stripped transcript.
         let completion_offset = stderr
-            .find("✓ Sandbox is running")
+            .find("Sandbox is running")
             .ok_or("completion line missing from PTY transcript")?;
         assert!(
             stderr[..completion_offset].contains("\r\u{1b}[2K"),
