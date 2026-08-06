@@ -1459,3 +1459,44 @@ Not fixed here, and deliberately so: the fix belongs in a test file that #48 alr
 touches, and committing to `ci/p2-1-pipeline` right now would move the head off
 `8ded364` and destroy the anchor step 1 is waiting on. It is the first thing to do after
 #48 merges.
+
+### Task 8's plan is written against a repository state that no longer holds
+
+Two corrections, both found while preparing Task 8 read-only during the outage. Neither
+was applied — the ruleset is still step 5 and steps 1-4 are not done.
+
+**1. `rulesets` is not `[]`.** Task 8 Step 1 expects it to be, and Step 2 `POST`s a *new*
+ruleset. **VERIFIED** `gh api repos/:owner/:repo/rulesets/20492137`: a ruleset named
+**`main protection`** (id `20492137`) has been `active` since `2026-08-05T21:47:45-07:00`,
+carrying `deletion`, `non_fast_forward`, `required_signatures`, and a `pull_request` rule
+with `required_approving_review_count: 0` and
+`allowed_merge_methods: ["merge", "squash", "rebase"]`. It has **no**
+`required_status_checks`, so "the ruleset is still off" was right about the *gate* while
+protection itself was already on.
+
+`POST`ing a second ruleset over the same `~DEFAULT_BRANCH` would leave merge-method
+policy stated in two places and make the effective behaviour depend on how GitHub
+combines overlapping rulesets. **`PATCH` the existing one instead** — one ruleset, one
+place, no union semantics to reason about. `PATCH` replaces the `rules` array wholesale,
+so the payload must restate the three rules being kept.
+
+**2. The required context is `gate`, not `ci / gate`.** Task 8 Step 2 specifies
+`context=ci / gate`. **VERIFIED** `gh api repos/:owner/:repo/commits/64ee3ee/check-runs`:
+the check runs are named `gate`, `contracts`, `engine`, `rust`, `runtime-probe`,
+`changes` — **bare job names** — all from app `github-actions`, `id 15368`. `ci / gate`
+is the UI's *display* form, `workflow / job`. Requiring the literal string `ci / gate`
+would require a check that never reports, and GitHub would hold it pending forever. That
+is the same failure this project already documented for workflow-level `paths:` filters,
+arriving by a different door. Pin `integration_id: 15368` so the requirement cannot be
+satisfied by a same-named check from another app.
+
+The corrected payload is prepared but **not applied**.
+
+**3. A consequence worth weighing before step 5.** The existing ruleset has
+`bypass_actors: []` and reports `current_user_can_bypass: "never"`. Adding
+`required_status_checks` to it therefore creates enforcement with **no override for
+anyone, including the maintainer**. Given that the suite is still intermittently red and
+`autostart.rs`'s category-3 site has no answer, a flaky `gate` would not merely be noisy
+— it would be unbypassable. Either accept that, or add a deliberate `bypass_actors`
+entry as part of the same change rather than discovering the need during an incident.
+That is a maintainer's call and is recorded here rather than made.
