@@ -1131,3 +1131,139 @@ lints in CI.
 
 `ci / gate` has never been green, so **do not add the ruleset yet** — never require a
 check that has not passed.
+
+## Session of 2026-08-06 (later) — Task B closed, `ci / gate` green once, Task C partly
+
+> ~~`ci / gate` has never been green, so **do not add the ruleset yet**.~~
+> **Superseded.** `ci / gate` reported **success** on run `31121170624`, head `64ee3ee`:
+> `changes`, `rust`, `contracts` and `engine` all success. That is the first green gate,
+> so the "never require a check that has never passed" bar is now met. The ruleset is
+> still **off**, for the different reason recorded under Task C below.
+
+### Task B — closed, VERIFIED on a hosted runner
+
+Two distinct root causes, both the predicted ambient-environment shape.
+
+1. **`signal` rc=1 — the contract required Gas Can to be installed on the host.**
+   `signal-contract.sh` overrode only `GASCAN_RELEASE_GASCAN`, while
+   `release-smoke.sh:48-50` resolves three binaries and lines 51-54 exit **69** if any is
+   not executable. This Mac has all three under `/usr/local/bin` (4.9M / 8.2M / 28.4M,
+   mode 755), so the two unset ones silently resolved to a real install. Reproduced
+   exactly before changing anything: with `GASCAN_RELEASE_GASCAND=/nonexistent/gascand`,
+   `release-smoke.sh` exits **69** with `installed gascand is unavailable` — the runner's
+   output verbatim. Fixed by pinning all three seams the script already publishes and
+   already allowlists (`release-smoke.sh:10-12`); `/usr/bin/true` is faithful because
+   `gascan_release_test_signal` runs at line 404, after the traps at 402-403 and before
+   `gascan_release_preflight_daemon` at 405, so none of the three is ever executed
+   (`5564566`).
+
+2. **`distributable-package` rc=65 and `publish` rc=1 — one cause.** The allowlist
+   hardcoded 23 entries: twelve real paths plus eleven AppleDouble `._` records. Those
+   records belong to the **build host**. VERIFIED locally: a file created under `TMPDIR`
+   carries `com.apple.provenance` and `pkgbuild` emits the paired form; the xattr
+   **cannot be stripped** — `xattr -c` and `xattr -rc` both exit 0 and it survives — so
+   normalising at build time is not available. The runner's payload listed 12 entries
+   with no records. The gate now holds the twelve canonical paths, derives the pairing
+   from them with `sed` so the two cannot drift, and accepts either representation but
+   only in full: a partial set or an unpaired record is still a rejection (`64ee3ee`).
+   `verify-package.sh:29-33` carried the same host-dependence latently and would have
+   rejected any package built off a developer Mac; it now accepts either and requires the
+   whole payload to agree on one.
+
+VERIFIED on the runner: run `31121170624`, job `92688788633` —
+`ci-run-release-contracts: 15 contract(s), status=0`.
+
+Also fixed while in the file: `signal-contract.sh`'s two cleanup assertions **could not
+fail**. A `!`-prefixed command is exempt from errexit, so `! compgen -G ...` returned 1
+on leftovers and the script carried on to print PASS. Demonstrated with a planted
+leftover: the bare form exits 0, the replacement exits 1.
+
+### Task C — the diagnostic gap is closed; the suite is not fixed
+
+**Closed the gap first, as instructed.** `TokioDaemonSpawner::spawn` ended with
+`let _child = command.spawn()?` and `DaemonStartupMonitor` carried only a file and an
+owner token, so liveness was unobservable *by construction* — the gap was missing
+plumbing, not a bug in the loops. The monitor now optionally retains the child and
+exposes `exited()`; both wait loops check for death before the clock and report the exit
+status, each re-reading its diagnostic first because these fixtures write and then exit
+(`50029ae`). Mutation-verified: without the child retained the new test fails at 5.01s,
+with it 0.16s.
+
+`FIXTURE_DAEMON_DIAGNOSTIC_DEADLINE` became `FIXTURE_DAEMON_HANG_CEILING` at 60s
+(`e8519ea`), and the same treatment reached the rest of the family (`bc89c56`).
+
+**The family is three kinds of site, not one**, which is why "fix the flaky suite" kept
+sprawling:
+
+| Kind | Sites | Treatment |
+|---|---|---|
+| Incidental setup/teardown waits — the clock is not the property | 2 in `crates/gascan`; `autostart.rs` 167, 286, 327, 536 | liveness + hang-only ceiling |
+| Relational bounds — the *relation* is the property | `ssh_config.rs` readiness policy (3 uses) | name once, scale together |
+| **Absolute latency assertions — the elapsed time IS the property** | `autostart.rs:767` only | **unsolved** |
+
+The third kind is the open design question: `assert!(started.elapsed() < 2s)` cannot be
+relaxed without deleting the test, and a required check cannot host an absolute-latency
+assertion on a runner whose load is not ours. It needs an answer and does not have one.
+
+### The measurement lesson, which cost most of the session
+
+**Do not trust `ps -o pcpu` as a current CPU reading.** It is a decaying, lifetime-
+weighted average. It was read as live usage and produced a confident, wrong claim that
+two desktop applications were consuming ~190% CPU; an instantaneous `top -l 2` showed
+nothing of the sort.
+
+What *is* VERIFIED is that this machine's exec latency for a freshly written
+`#!/bin/sh` script moved across the session: **0.155s**, then **2.304s**, then
+**0.187s** — and earlier in the day, ~**30s** with a warm second exec of the same file
+at 0.015s. `explicit_state_path_bypasses_default_migration` failed **0/3** in isolation
+during the slow window and passed **5/5** once it cleared, and it failed identically at
+`64ee3ee`, before any of this branch's Rust changes, so it is the host and not a
+regression.
+
+**Consequence: the flake rates measured locally this session — 2/6, 4/6, 7/8 — are not
+comparable to each other** and no claim is made from them. They were taken on an
+instrument that was drifting. CI is the arbiter for whether the fixes moved the rate.
+
+### Two things still open, honestly
+
+- **The publish-window race is UNCONFIRMED.** Reading the code, `gascand` creates its
+  instance record inert at mode `0200`, writes it, and publishes by `fchmod`-ing to
+  `0600` (`gascand/src/socket.rs:246-305`), so the mode change *is* the commit. A reader
+  during that window sees `0200`, and `validate_file_stat` demands `0600`, and the
+  readiness loop (`daemon.rs:1244-1270`) treats that `Unsafe` as **terminal** although it
+  already retries two other transient `Unsafe` cases. That is a coherent story for the
+  one observed `state Unsafe` failure — but it did **not** reproduce in 6 full-workspace
+  runs, so it is a hypothesis. Per this project's own hard-won lesson, it was not fixed
+  on that evidence. `validate_file_stat` now names which of its four conditions fired and
+  carries the observed mode, links and uid, so the next occurrence answers the question.
+- **The `ssh-keygen` rejection**, seen once. `SshError::KeygenRejected` carried nothing
+  and the exit status lived only in a `#[cfg(test)]` `eprintln!` that cannot reach a
+  `gascand` spawned as a real binary by an e2e test. It now carries a `KeygenOutcome`
+  distinguishing an exit code, death by signal, and no status at all (`83ee5bf`).
+
+**Three diagnostics this session existed but could not reach the path that failed** — the
+wait loop's empty stderr, one message covering four file faults, and this. Each cost an
+investigation the message should have ended.
+
+### GitHub Actions stopped triggering
+
+Runs for `bc89c56` and `83ee5bf` were **never created** — `gh pr view 48` shows the head
+moving and `statusCheckRollup` empty. Actions is enabled (`allowed_actions: all`) and the
+`ci` workflow is `active`; the repo is public and org-owned, so this is not minutes
+exhaustion. Earlier runs in the same window were queued and then cancelled without
+runners ever being assigned (`31124221354`, `31124719097`). Treat as GitHub-side and
+retry; it is not a configuration fault in the tree.
+
+### PR state at handover
+
+| PR | State | Notes |
+|---|---|---|
+| #46 | **MERGED** `29318c3` | spec + plan |
+| #47 | **MERGED** `d5cb601` | born-red PTY test fix |
+| #48 | **OPEN**, head `83ee5bf` | the pipeline, plus Tasks B and C |
+| #49 | **MERGED** `e6ef8c0` | the previous handoff |
+
+**The ruleset is still off.** The gate has gone green once, so requiring it is now
+permitted — but the suite still fails intermittently, the third category of timing site
+has no answer, and the last two commits have no CI result at all. Decide it on CI's
+observed rate, not on this machine's.

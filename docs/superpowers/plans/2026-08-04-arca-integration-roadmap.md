@@ -205,8 +205,22 @@ P4.3, per the amended exit table above.
 
 | Step | Work |
 |---|---|
-| P2.1 | One CI orchestrating Swift, Rust, Go, protobuf codegen. Path-based triggers from the start — resolve **U3**. |
+| ~~P2.1~~ | ~~One CI orchestrating Swift, Rust, Go, protobuf codegen. Path-based triggers from the start — resolve **U3**.~~ **Done**, `2026-08-05-gascan-ci-consolidation-design.md`. Corrected in place: Go is not in Gas Can (`find . -name "*.go"` matches only `.artifacts/` build output) and protobuf codegen needs no step, because `crates/gascan-proto/build.rs:4` uses `protoc_bin_vendored`. So the pipeline orchestrates Swift and Rust, not four languages. U3 resolved below. |
 | P2.2 | Extend `build-manifest.json` to cover engine and guest binaries. |
+| P2.3 | Arca's own CI — spec §9. See below. |
+
+**P2 stays open** after P2.1. P2.2 cannot attest an engine binary until P5.1 produces
+one (`2026-08-05-arca-engine-pin-design.md` §2.3, §7).
+
+### P2.3 — Arca's CI, wanted before P4.3 and P5.1
+
+`swift build` and `swift test` against a **characterized baseline**, plus the Go
+`arca-services` cross-compile from `scripts/build-vminit.sh:54-80`. The baseline has to
+be pinned down first: Arca has 125 failing tests on both sides of P1.4
+(`arca-integration-handoff.md:716-721`), so "green" is not yet a meaningful word there.
+
+Wanted **before** P4.3 and P5.1 land, so that Arca-side changes stop getting their first
+build inside Gas Can's pipeline at pin-bump time.
 
 **Exit:** one pipeline; the manifest attests every shipped executable. This is the
 payoff that justified merging.
@@ -432,9 +446,20 @@ merge. *Blocks:* P0.3.
 Restructured upstream code may have removed the seam a modification depended on.
 *Resolve by:* falls out of P0.3. *Blocks:* P0 exit.
 
-**U3 — Consolidated CI wall time.**
-Determines whether path filters are mandatory or merely nice.
-*Resolve by:* measuring after P1.1. *Blocks:* P2.1 design.
+~~**U3 — Consolidated CI wall time.**~~
+~~Determines whether path filters are mandatory or merely nice.~~
+~~*Resolve by:* measuring after P1.1. *Blocks:* P2.1 design.~~
+
+**U3 — RESOLVED. Path filters are nice, not mandatory.** Measured during P2.1
+(`2026-08-05-gascan-ci-consolidation-design.md` §10): **1:00.07** to run 902 tests and
+**1:57.82** to compile every test binary, both warm, against **7m21s–8m38s** for the
+engine build. The Rust side is cheap enough that filtering it saves little; the filters
+earn their keep on the `engine` job alone, which is where nearly all the wall time is.
+
+A trap found while implementing them, worth more than the timing: a workflow-level
+`paths:` filter **cannot** back a required check. GitHub leaves the check Pending
+forever and the PR blocks. A *job* reporting `skipped` does satisfy it, which is why
+the design routes everything through one aggregate `ci / gate` job.
 
 **U4 — The engine protocol's actual shape.**
 P3 is design work, not transcription. `RuntimeBackend` gives the method list; the
