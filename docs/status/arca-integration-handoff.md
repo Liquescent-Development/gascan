@@ -1298,3 +1298,46 @@ observed rate, not on this machine's.
    Require `ci / gate`; set `allowed_merge_methods` to `["merge"]`; then confirm it
    actually blocks by checking `mergeStateStatus` is `BLOCKED` on a red PR. A ruleset
    that does not block is not enforcement.
+
+### Closing thoughts, 2026-08-06 (later)
+
+**The pipeline kept paying for itself.** Task B was two contracts that had never been
+run anywhere but a developer Mac, and both encoded that Mac's peculiarities as the
+definition of correctness: one required Gas Can to be *installed*, the other required
+the build host to attach `com.apple.provenance`. Neither is a subtle bug. Both were
+invisible because nothing had ever executed them elsewhere. That is now three
+categories of defect the gate has surfaced before it was ever required.
+
+**Diagnostics are the deliverable more often than fixes are.** Three separate times this
+session a diagnostic existed but could not reach the path that failed: a wait loop
+reporting an empty stderr whether the child was slow or dead; one message covering four
+distinct file faults; an `ssh-keygen` exit status locked behind `#[cfg(test)]` in a
+binary that end-to-end tests spawn for real. Each cost an investigation that the message
+itself should have ended in one line. When something is hard to diagnose, the first move
+is usually to make it say more, not to guess better.
+
+**My worst habit this session was trusting an instrument I had not checked.** I measured
+flake rates across three arms and reported them as if comparable, while the machine
+underneath moved by more than an order of magnitude — freshly-written-script exec
+latency went 0.155s, 2.304s, 0.187s, and ~30s earlier in the day. Then I explained the
+resulting numbers with a confident claim about two applications' CPU use that came from
+misreading `ps -o pcpu`, which is a lifetime-weighted average rather than a current
+sample; `top -l 2` showed neither process among the top eight. The lesson is the same one
+this project already learned three times with warm caches, wearing new clothes: **before
+trusting a number, ask what the tool was actually measuring.** Two of my conclusions had
+to be withdrawn for exactly this reason, and both withdrawals are recorded above rather
+than edited away.
+
+**What I deliberately did not do.** The publish-window race is a coherent, code-anchored
+story for a failure seen once, and it did not reproduce in six attempts, so it stays a
+hypothesis and the code stays unchanged. This project has been bitten before by a theory
+that explained a non-reproduction too comfortably. The sharpened `validate_file_stat`
+message means the next occurrence will simply say which condition fired, which is worth
+more than a fix aimed at a guess.
+
+**The one genuinely unsolved thing** is the third category of timing site:
+`autostart.rs:767`, where `assert!(started.elapsed() < 2s)` *is* the property under test.
+Condition-based waiting cannot help, because there is no condition to wait for — the
+claim is about elapsed time itself. A required check on a shared runner cannot host that
+assertion honestly, and neither relaxing it nor deleting it is obviously right. It wants
+a design decision, not a patch.
