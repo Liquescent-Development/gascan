@@ -3832,7 +3832,7 @@ fn format_binary_size(bytes: u64) -> String {
         ("MiB", 1024_u64.pow(2)),
         ("KiB", 1024_u64),
     ] {
-        if bytes % divisor == 0 {
+        if bytes.is_multiple_of(divisor) {
             return format!("{}{suffix}", bytes / divisor);
         }
     }
