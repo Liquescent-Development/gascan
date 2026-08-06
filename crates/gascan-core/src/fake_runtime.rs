@@ -447,10 +447,10 @@ impl FakeRuntime {
 
 async fn wait_gate(runtime: &FakeRuntime, boundary: FailureBoundary) {
     let gate = runtime.inner.lock().await.gates.get(&boundary).cloned();
-    if let Some(gate) = gate {
-        if let Ok(permit) = gate.acquire().await {
-            permit.forget();
-        }
+    if let Some(gate) = gate
+        && let Ok(permit) = gate.acquire().await
+    {
+        permit.forget();
     }
 }
 
@@ -940,10 +940,10 @@ impl RuntimeBackend for FakeRuntime {
         });
         for expected in &removal {
             state.resources.remove(expected.identity());
-            if expected.kind() == ResourceKind::Container {
-                if let Some(id) = expected.sandbox_id() {
-                    state.sandboxes.remove(id);
-                }
+            if expected.kind() == ResourceKind::Container
+                && let Some(id) = expected.sandbox_id()
+            {
+                state.sandboxes.remove(id);
             }
         }
         state
@@ -1057,14 +1057,13 @@ impl RuntimeBackend for FakeRuntime {
                 Some("fake-large-ready-then-drain") => Some(vec![b'x'; 1024 * 1024]),
                 _ => None,
             };
-            if let Some(output) = &ready_then_drain {
-                if outputs
+            if let Some(output) = &ready_then_drain
+                && outputs
                     .send(Ok(ExecOutput::Stdout(output.clone())))
                     .await
                     .is_err()
-                {
-                    return;
-                }
+            {
+                return;
             }
             let mut stdin = request.stdin;
             let mut signal = configured.3;
@@ -1196,10 +1195,10 @@ fn observed_created_ports(
     state: &mut FakeState,
 ) -> Vec<crate::runtime::RuntimePort> {
     let mut ports = request.ports().to_vec();
-    if let Some(host_port) = state.created_ssh_host_ports.pop_front() {
-        if let Some(mapping) = ports.iter_mut().find(|mapping| mapping.guest_port == 22) {
-            mapping.host_port = host_port;
-        }
+    if let Some(host_port) = state.created_ssh_host_ports.pop_front()
+        && let Some(mapping) = ports.iter_mut().find(|mapping| mapping.guest_port == 22)
+    {
+        mapping.host_port = host_port;
     }
     ports
 }

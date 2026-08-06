@@ -199,13 +199,13 @@ impl PolicyCompiler {
             if host_port < 1024 {
                 return Err(PolicyError::InvalidSshHostPort);
             }
-            if let Some(manifest_host_port) = manifest.ssh().host_port() {
-                if manifest_host_port != host_port {
-                    return Err(PolicyError::SshHostPortMismatch {
-                        manifest: manifest_host_port,
-                        control_plane: host_port,
-                    });
-                }
+            if let Some(manifest_host_port) = manifest.ssh().host_port()
+                && manifest_host_port != host_port
+            {
+                return Err(PolicyError::SshHostPortMismatch {
+                    manifest: manifest_host_port,
+                    control_plane: host_port,
+                });
             }
             Some(host_port)
         } else {
@@ -263,13 +263,11 @@ fn guest_environment(
         "GASCAN_SSH_ENABLED".to_owned(),
         if ssh_enabled { "1" } else { "0" }.to_owned(),
     );
-    if ssh_enabled {
-        if let Some(authorized_key) = control.ssh_authorized_key {
-            environment.insert(
-                "GASCAN_SSH_AUTHORIZED_KEY".to_owned(),
-                authorized_key.to_owned(),
-            );
-        }
+    if ssh_enabled && let Some(authorized_key) = control.ssh_authorized_key {
+        environment.insert(
+            "GASCAN_SSH_AUTHORIZED_KEY".to_owned(),
+            authorized_key.to_owned(),
+        );
     }
     environment
 }
