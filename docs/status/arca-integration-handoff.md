@@ -1045,3 +1045,89 @@ shape: the local environment silently supplies something CI does not
 (`RUSTUP_TOOLCHAIN=1.95.0` overriding the pin; `CARGO_BIN_EXE_*` present in the
 shell). Suspect ambient environment first, and measure with the runner's assumptions
 rather than this machine's.
+
+### Amended after the toolchain bump — 2026-08-06
+
+Read this before acting on the three tasks above; one of them is gone and the
+toolchain situation is resolved.
+
+**The pin now tracks the compiler in use: 1.95.0** (`a335aad`), with
+`Cargo.toml`'s `rust-version` following. The maintainer chose this after the
+scaffolding history was traced: `d6978fa` (2026-07-13) set both files in one commit
+and neither was revisited, and 1.85.0 was there only because it is the floor for
+`edition = "2024"`. Pinning `rust-toolchain.toml` **to** an MSRV floor is what
+guaranteed the local-versus-CI split, since `RUSTUP_TOOLCHAIN` overrides the file.
+No crate sets `publish` and Gas Can ships as a signed `.pkg`, so the MSRV promise
+protected no consumer.
+
+Consequences, all VERIFIED:
+
+- **The let-chain rewrite was reverted** (`ceddd86`). `daemon.rs:1182` reads
+  naturally again; let-chains are stable from 1.88.
+- **The `hex::lower` refactor was kept** (`b2003df`). 1.95's clippy does not require
+  it, but eleven copies collapsed into one is worth having on its own merits.
+- **33 clippy findings were cleared to reach a green lint gate** — 11
+  `format_collect`, 26 `collapsible_if`, 1 `manual_is_multiple_of`, across 13 files,
+  with **zero `#[allow(...)]` added** (`2d4a15e`, `1f31836`, `8347b48`).
+  `cargo clippy --workspace --all-targets -- -D warnings` exits **0** with
+  `RUSTUP_TOOLCHAIN` unset, confirmed not cache-clean by touching every `.rs` and
+  re-running.
+
+**Two things from that sweep worth carrying forward.**
+`cargo clippy --fix` would not have been safe here: clippy's own suggestion at
+`service.rs:2694` emitted invalid Rust (a stray brace mid-condition), and three
+sites needed `||` parentheses it omitted — one of them `ssh/manager.rs:647`, an SSH
+host-key check where a wrong collapse would have weakened a security guard. Read
+every suggestion before applying it.
+
+And the warm-cache trap appeared a **third** time, in a new tool. An earlier
+`cargo clippy` reported exit 0 in 13.4 seconds by reusing cached lint results;
+touching `gascan-core` forced a real re-lint and 22 findings appeared that had been
+there all along. The pattern across this project is now: warm SwiftPM cache (P1.4),
+`RUSTUP_TOOLCHAIN` overriding the pin, and cached clippy results. **Before trusting
+any green from a tool, ask what it cached.**
+
+### CI run 3 — `31113833927`, and a correction
+
+`changes=success`, `engine=success`, `runtime-probe=failure` (expected, §11.5),
+`rust=failure`, `contracts=failure`, `gate=failure`. CI reports
+`rustc 1.95.0` and **clippy passed** — the first time the Rust workspace has cleared
+lints in CI.
+
+> ~~**Task A — 14 tests need a binary path CI does not provide.** …
+> `CARGO_BIN_EXE_gascan-e2e-cli` … read at **runtime** … present in the local
+> environment and absent on the runner.~~
+> **WRONG, and dissolved.** Those 14 failures do not appear in run 3 at all — zero
+> occurrences of `workspace-built gascan binary is unavailable`. They were an
+> artifact of the earlier run's build ordering, where clippy failed first, not an
+> env-var lifetime problem. The evidence that should have prompted a re-examination
+> was already in hand: a subagent could not reproduce them locally, and that was
+> read as *consistent with* the theory rather than as a reason to doubt it.
+> **A theory that explains a non-reproduction too comfortably deserves suspicion.**
+
+**What is actually left, in order:**
+
+1. **Task B — three release contracts fail only on the runner.**
+   `distributable-package rc=65`, `publish rc=1`, `signal rc=1`. Unchanged across all
+   three runs and **undiagnosed**. They pass 15/15 locally. Given that two of the
+   three local-versus-runner divergences this session were ambient environment,
+   suspect that first: compare what the contract scripts read from the environment
+   against what a fresh runner provides. Their logs are reachable per-job with
+   `gh api /repos/Liquescent-Development/gascan/actions/jobs/<id>/logs` even while a
+   run is in progress.
+2. **Task C — the flaky suite**, §11.7 of the spec. `rust` is now down to this alone:
+   run 3 failed only `logs_since_and_follow_emit_new_byte_exact_records_then_cancel`,
+   which passes locally. Root cause is recorded; the fix is not chosen.
+3. **Then the ruleset** — plan Task 8. Not before B and C.
+
+### PR state at handover
+
+| PR | State | Notes |
+|---|---|---|
+| #46 | **MERGED** `29318c3` | spec + plan |
+| #47 | **MERGED** `d5cb601` | the born-red PTY test fix |
+| #48 | **OPEN**, base `main`, 12 commits | the pipeline; red on Tasks B and C only |
+| #49 | **OPEN** | this handoff |
+
+`ci / gate` has never been green, so **do not add the ruleset yet** — never require a
+check that has not passed.
