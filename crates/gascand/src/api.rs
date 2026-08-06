@@ -1526,12 +1526,10 @@ async fn finish_attach_session(
             server_error(error.code(), error.to_string())
         }
     };
-    if forward_terminal {
-        if let Some(sender) = terminal.take() {
-            let _ = sender.send(AttachTerminal {
-                frame: Ok(terminal_frame),
-            });
-        }
+    if forward_terminal && let Some(sender) = terminal.take() {
+        let _ = sender.send(AttachTerminal {
+            frame: Ok(terminal_frame),
+        });
     }
 }
 
@@ -2166,13 +2164,12 @@ impl<B: RuntimeBackend + 'static> GasCan for SandboxApi<B> {
                             let _ = sender.send(Ok(failed)).await;
                             break;
                         } };
-                        if let Some(appended) = current.strip_prefix(previous.as_slice()) {
-                            if !appended.is_empty() {
+                        if let Some(appended) = current.strip_prefix(previous.as_slice())
+                            && !appended.is_empty() {
                                 sequence = sequence.saturating_add(1);
                                 let event = v1::OperationEvent { operation_id: None, timestamp: None, phase: "logs".to_owned(), payload: appended.to_vec(), error: None, sequence, status: v1::OperationStatus::Pending as i32, content_type: "application/octet-stream".to_owned(), session_token: Vec::new(), provision_step: v1::ProvisionStep::Unspecified as i32 };
                                 if sender.send(Ok(event)).await.is_err() { break; }
                             }
-                        }
                         previous = current;
                     }
                 }

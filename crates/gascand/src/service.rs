@@ -717,8 +717,8 @@ impl<B: RuntimeBackend> SandboxService<B> {
             move |store| store.set_ssh_resolution(&id, Some(resolution))
         })
         .await?;
-        if let Some((operation_id, sender)) = publication {
-            if let Err(original) = self
+        if let Some((operation_id, sender)) = publication
+            && let Err(original) = self
                 .emit(
                     operation_id,
                     json!({
@@ -728,9 +728,8 @@ impl<B: RuntimeBackend> SandboxService<B> {
                     sender,
                 )
                 .await
-            {
-                return Err(self.restore_prior_ssh_resolution(id, prior, original).await);
-            }
+        {
+            return Err(self.restore_prior_ssh_resolution(id, prior, original).await);
         }
         let committed = if self
             .ssh_generation_cleanup_fault
@@ -1389,17 +1388,16 @@ impl<B: RuntimeBackend> SandboxService<B> {
                     }
                     Err(failure) => {
                         let partial = failure.created().to_vec();
-                        if !partial.is_empty() {
-                            if let Err(rollback) = self
+                        if !partial.is_empty()
+                            && let Err(rollback) = self
                                 .runtime
                                 .remove(RemoveRequest::from_resources(partial)?)
                                 .await
-                            {
-                                return Err(ServiceError::Rollback {
-                                    original: Box::new(ServiceError::Create(failure)),
-                                    rollback,
-                                });
-                            }
+                        {
+                            return Err(ServiceError::Rollback {
+                                original: Box::new(ServiceError::Create(failure)),
+                                rollback,
+                            });
                         }
                         let collision = prepared_ssh.as_ref().is_some_and(|ssh| {
                             is_native_port_collision(&failure, ssh.host_port(), &create)
@@ -1536,10 +1534,10 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 Err(error)
             }
             Err(error) => {
-                if self.deactivate_ssh(id).await.is_ok() {
-                    if let Ok(Some(_)) = self.runtime.inspect(id).await {
-                        let _ = self.runtime.stop(id).await;
-                    }
+                if self.deactivate_ssh(id).await.is_ok()
+                    && let Ok(Some(_)) = self.runtime.inspect(id).await
+                {
+                    let _ = self.runtime.stop(id).await;
                 }
                 Err(error)
             }
@@ -2691,21 +2689,18 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 return Err(error);
             }
         };
-        if image.change_required() || ssh_policy_changed {
-            if let Err(error) = self
+        if (image.change_required() || ssh_policy_changed)
+            && let Err(error) = self
                 .replacement_evidence(&create, &runtime, &runtime.image)
                 .await
-            {
-                let actual = self.runtime_actual(&id, prior_actual).await;
-                let code = error.code();
-                let details = failure_details(&error);
-                self.database(move |store| {
-                    store.fail_operation(operation.id, actual, code, details)
-                })
+        {
+            let actual = self.runtime_actual(&id, prior_actual).await;
+            let code = error.code();
+            let details = failure_details(&error);
+            self.database(move |store| store.fail_operation(operation.id, actual, code, details))
                 .await?;
-                self.send_terminal(operation.id, &sender).await?;
-                return Err(error);
-            }
+            self.send_terminal(operation.id, &sender).await?;
+            return Err(error);
         }
         let receiver = publish_operation(started, operation.id, receiver);
         if image.change_required() || ssh_policy_changed {
@@ -3357,33 +3352,32 @@ impl<B: RuntimeBackend> SandboxService<B> {
                 OperationKind::Reconcile => true,
             };
             if converged {
-                if matches!(operation.kind, OperationKind::Create | OperationKind::Apply) {
-                    if let Some(details) = events
+                if matches!(operation.kind, OperationKind::Create | OperationKind::Apply)
+                    && let Some(details) = events
                         .iter()
                         .filter_map(|event| event.details.as_ref())
                         .find(|details| {
                             details.get("phase").and_then(Value::as_str) == Some("after_provision")
                         })
-                    {
-                        let fingerprint = details
-                            .get("desired_fingerprint")
-                            .cloned()
-                            .unwrap_or(Value::Null);
-                        record.setup_resolution = Some(SetupResolution::new(
-                            1,
-                            json!({"desired_fingerprint":fingerprint,"resolution":details.get("setup").cloned().unwrap_or(Value::Null)}),
-                        ));
-                        record.tool_resolution = Some(ToolResolution::new(
-                            1,
-                            json!({"desired_fingerprint":fingerprint,"tool_hash":details.get("tool_hash").cloned().unwrap_or(Value::Null),"shell_hash":details.get("shell_hash").cloned().unwrap_or(Value::Null),"resolution":details.get("tools").cloned().unwrap_or(Value::Null)}),
-                        ));
-                        record.actual_state = actual;
-                        self.database({
-                            let record = record.clone();
-                            move |store| store.put_sandbox(&record)
-                        })
-                        .await?;
-                    }
+                {
+                    let fingerprint = details
+                        .get("desired_fingerprint")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    record.setup_resolution = Some(SetupResolution::new(
+                        1,
+                        json!({"desired_fingerprint":fingerprint,"resolution":details.get("setup").cloned().unwrap_or(Value::Null)}),
+                    ));
+                    record.tool_resolution = Some(ToolResolution::new(
+                        1,
+                        json!({"desired_fingerprint":fingerprint,"tool_hash":details.get("tool_hash").cloned().unwrap_or(Value::Null),"shell_hash":details.get("shell_hash").cloned().unwrap_or(Value::Null),"resolution":details.get("tools").cloned().unwrap_or(Value::Null)}),
+                    ));
+                    record.actual_state = actual;
+                    self.database({
+                        let record = record.clone();
+                        move |store| store.put_sandbox(&record)
+                    })
+                    .await?;
                 }
                 self.database(move |store| store.complete_operation(operation.id, actual))
                     .await?;
@@ -3431,10 +3425,10 @@ impl<B: RuntimeBackend> SandboxService<B> {
             .await?;
         let _ = sender.try_send(event);
         #[cfg(debug_assertions)]
-        if let Ok(target) = std::env::var("GASCAN_SSH_CRASH_PHASE") {
-            if durable_phase.as_deref() == Some(target.as_str()) {
-                std::process::abort();
-            }
+        if let Ok(target) = std::env::var("GASCAN_SSH_CRASH_PHASE")
+            && durable_phase.as_deref() == Some(target.as_str())
+        {
+            std::process::abort();
         }
         Ok(())
     }

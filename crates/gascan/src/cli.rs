@@ -993,10 +993,10 @@ impl<Output: RecoveryOutputSink> CliRecoveryObserver<Output> {
         let CliRecoveryProgressMode::Human { progress, .. } = &mut self.mode else {
             return;
         };
-        if let Some(progress) = progress.take() {
-            if let Some(line) = progress.finish_success() {
-                self.output.write(RecoveryOutputStream::Stderr, &line);
-            }
+        if let Some(progress) = progress.take()
+            && let Some(line) = progress.finish_success()
+        {
+            self.output.write(RecoveryOutputStream::Stderr, &line);
         }
     }
 

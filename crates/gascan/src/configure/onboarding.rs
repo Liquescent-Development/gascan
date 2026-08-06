@@ -340,10 +340,12 @@ async fn configure_git_values<R: GuestRunner>(
         .as_ref()
         .map_or(GitProtocol::Ssh, |setup| setup.protocol);
     let protocol = prompt_protocol(io, protocol_default)?;
-    if let Some(current) = current {
-        if current.name == name && current.email == email && current.protocol == protocol {
-            return Ok(current);
-        }
+    if let Some(current) = current
+        && current.name == name
+        && current.email == email
+        && current.protocol == protocol
+    {
+        return Ok(current);
     }
     configure_git(
         runner,

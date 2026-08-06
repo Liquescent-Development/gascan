@@ -103,11 +103,9 @@ fn process_matches(
             awaiting_text_name = false;
         } else if field == b"ftxt" && matched_process {
             awaiting_text_name = true;
-        } else if awaiting_text_name {
-            if let Some(path) = field.strip_prefix(b"n") {
-                executable = Some(std::path::PathBuf::from(OsString::from_vec(path.to_vec())));
-                break;
-            }
+        } else if awaiting_text_name && let Some(path) = field.strip_prefix(b"n") {
+            executable = Some(std::path::PathBuf::from(OsString::from_vec(path.to_vec())));
+            break;
         }
     }
     if executable.as_deref() != Some(expected_executable) {

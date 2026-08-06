@@ -652,8 +652,8 @@ async fn forward_terminal_input(
     restore: Option<crate::terminal::TerminalRestore>,
 ) {
     let size = rustix::termios::tcgetwinsize(std::io::stdin().as_fd()).ok();
-    if let Some(size) = size {
-        if sender
+    if let Some(size) = size
+        && sender
             .send(v1::ClientFrame {
                 frame: Some(v1::client_frame::Frame::Resize(v1::Resize {
                     columns: u32::from(size.ws_col),
@@ -663,9 +663,8 @@ async fn forward_terminal_input(
             })
             .await
             .is_err()
-        {
-            return;
-        }
+    {
+        return;
     }
     let mut interrupt =
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
@@ -698,10 +697,10 @@ async fn forward_terminal_input(
             frame,
             v1::client_frame::Frame::Close(_) | v1::client_frame::Frame::Signal(_)
         );
-        if matches!(frame, v1::client_frame::Frame::Signal(_)) {
-            if let Some(restore) = &restore {
-                restore.restore();
-            }
+        if matches!(frame, v1::client_frame::Frame::Signal(_))
+            && let Some(restore) = &restore
+        {
+            restore.restore();
         }
         if sender
             .send(v1::ClientFrame {

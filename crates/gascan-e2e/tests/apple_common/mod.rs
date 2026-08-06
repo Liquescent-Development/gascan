@@ -75,10 +75,9 @@ impl CandidateImageMapping {
         if spec.program == "container"
             && spec.args.first().map(String::as_str) == Some("run")
             && spec.args.last() == Some(&self.immutable)
+            && let Some(image) = spec.args.last_mut()
         {
-            if let Some(image) = spec.args.last_mut() {
-                *image = self.runtime.clone();
-            }
+            *image = self.runtime.clone();
         }
         spec
     }

@@ -1102,17 +1102,18 @@ where
     P: ProcessInspector,
     S: DaemonSpawner,
 {
-    if inspected.status.state == DaemonState::Unsafe && inspected.session.is_none() {
-        if let Some(tombstone) = inspected.interrupted_tombstone.take() {
-            recover_interrupted_tombstone(paths, endpoint, tombstone, timeouts).await?;
-            inspected = Inspection {
-                status: DaemonStatus::new(DaemonState::Stopped),
-                session: None,
-                record: None,
-                interrupted_tombstone: None,
-                published_record: None,
-            };
-        }
+    if inspected.status.state == DaemonState::Unsafe
+        && inspected.session.is_none()
+        && let Some(tombstone) = inspected.interrupted_tombstone.take()
+    {
+        recover_interrupted_tombstone(paths, endpoint, tombstone, timeouts).await?;
+        inspected = Inspection {
+            status: DaemonStatus::new(DaemonState::Stopped),
+            session: None,
+            record: None,
+            interrupted_tombstone: None,
+            published_record: None,
+        };
     }
     match inspected.status.state {
         DaemonState::Current => return Ok((inspected, false)),
@@ -1607,10 +1608,9 @@ where
             endpoint.graceful_shutdown(&mut session.connection, &identity.instance_token),
         )
         .await
+            && (!policy.mode.allows_force() || graceful_error_forbids_force(&error))
         {
-            if !policy.mode.allows_force() || graceful_error_forbids_force(&error) {
-                return Err(error.into());
-            }
+            return Err(error.into());
         }
     }
 
@@ -2198,14 +2198,14 @@ async fn classify_connected<C, P: ProcessInspector>(
             session,
         ));
     }
-    if let Some(published) = &record {
-        if !record_matches_endpoint(published, identity) {
-            return Ok(unhealthy(
-                "daemon endpoint identity contradicts its protected record".to_owned(),
-                record,
-                session,
-            ));
-        }
+    if let Some(published) = &record
+        && !record_matches_endpoint(published, identity)
+    {
+        return Ok(unhealthy(
+            "daemon endpoint identity contradicts its protected record".to_owned(),
+            record,
+            session,
+        ));
     }
 
     let process =

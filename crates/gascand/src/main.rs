@@ -76,10 +76,9 @@ impl<R> E2eProcessRunner<R> {
         if spec.program == "container"
             && spec.args.first().map(String::as_str) == Some("run")
             && spec.args.last() == Some(&candidate.immutable)
+            && let Some(image) = spec.args.last_mut()
         {
-            if let Some(image) = spec.args.last_mut() {
-                *image = candidate.runtime.clone();
-            }
+            *image = candidate.runtime.clone();
         }
         spec
     }
@@ -130,10 +129,8 @@ impl<R: CommandRunner> CommandRunner for E2eProcessRunner<R> {
         }
         let rehydrate_inspect = self.should_rehydrate_inspect(&spec);
         let mut output = self.runner.run(self.rewrite(spec)).await?;
-        if rehydrate_inspect {
-            if let Some(candidate) = &self.candidate {
-                output.stdout = rehydrate_e2e_inspect(output.stdout, candidate);
-            }
+        if rehydrate_inspect && let Some(candidate) = &self.candidate {
+            output.stdout = rehydrate_e2e_inspect(output.stdout, candidate);
         }
         Ok(output)
     }
@@ -231,13 +228,12 @@ async fn run(
     mut startup_diagnostic: Option<StartupDiagnostic>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(debug_assertions)]
-    if option_env!("CARGO_BIN_NAME") == Some("gascan-e2e-daemon") {
-        if let Some(delay) = std::env::var("GASCAN_E2E_DAEMON_START_DELAY_MS")
+    if option_env!("CARGO_BIN_NAME") == Some("gascan-e2e-daemon")
+        && let Some(delay) = std::env::var("GASCAN_E2E_DAEMON_START_DELAY_MS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
-        {
-            tokio::time::sleep(Duration::from_millis(delay)).await;
-        }
+    {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
     }
     let idle_timeout = std::env::var("GASCAN_IDLE_TIMEOUT_MS")
         .ok()
