@@ -1270,6 +1270,9 @@ exhaustion. Earlier runs in the same window were queued and then cancelled witho
 runners ever being assigned (`31124221354`, `31124719097`). Treat as GitHub-side and
 retry; it is not a configuration fault in the tree.
 
+> **Confirmed, not just suspected** — see "The Actions outage, named" in the next
+> session's section below. This diagnosis was right; it now has an anchor.
+
 ### PR state at handover
 
 | PR | State | Notes |
@@ -1341,3 +1344,118 @@ Condition-based waiting cannot help, because there is no condition to wait for �
 claim is about elapsed time itself. A required check on a shared runner cannot host that
 assertion honestly, and neither relaxing it nor deleting it is obviously right. It wants
 a design decision, not a patch.
+
+## Session of 2026-08-06 (evening) — blocked by a GitHub incident, not by the tree
+
+### The Actions outage, named
+
+**VERIFIED.** `githubstatus.com/api/v2/summary.json`, fetched `2026-08-06T21:36Z`:
+GitHub Actions is in `major_outage`. Incident "Incident with Actions", started
+**`2026-08-06T15:22:49Z`**, status `Investigating`, impact critical. Its own wording:
+*"Webhook triggers remain throttled, preventing many push and pull request events from
+triggering workflow runs"*, with **~15% of webhooks processing** and runners *"being
+assigned invalid jobs"*.
+
+Corroborated inside this repository:
+
+- `gh api repos/:owner/:repo/commits/8ded364/check-runs` → `total_count: 0`. The head of
+  #48 has **no checks at all**, so step 1 is not merely unconfirmed, it is unanswerable.
+- `gh api repos/:owner/:repo/actions/runs/31124719097` → `run_attempt: 2`,
+  `created_at 17:59:14Z`, `run_started_at 19:42:46Z`, `updated_at 20:42:53Z`. It was
+  picked up **1h43m** after creation and then burned exactly **60 minutes** to its
+  timeout with every job `cancelled`. That is the incident's "invalid jobs", not a fault
+  in `ci.yml`.
+- `gh api "repos/:owner/:repo/actions/runs?per_page=5"` at `21:36Z`: the newest run in
+  the repository is still `31124719097` from `17:59:14Z`. **No run of any workflow has
+  been created here in 3h37m.**
+
+The preceding section's call — GitHub-side, not a configuration fault in the tree — was
+correct, and now carries an anchor instead of an inference.
+
+**Trigger attempt.** #48 was closed and reopened at `21:37:57Z`. `ci.yml` declares a bare
+`on: pull_request`, so the default activity types apply and `reopened` is a valid
+trigger; a push would have worked too but would have moved the head and cost the
+`8ded364` anchor, which step 1 exists to establish. Head verified unchanged at
+`8ded364866f3b275fa7964219ed7e316c109a556` afterwards. Whether the webhook survives the
+throttle is the open question.
+
+**Nothing was merged.** The order of operations is load-bearing precisely because step 1
+gates it, and step 1 has no evidence. Merging #48 on the strength of run `31121170624`
+would be anchoring a green to a *different tree*: `64ee3ee` predates `3b04633`,
+`e8519ea`, `bc89c56`, `83ee5bf` and the `origin/main` merge, i.e. all of Task C's changes
+and the ssh-keygen diagnostic.
+
+### `autostart.rs:767` is misclassified, and that changes the answer
+
+Line numbers below are `git show ci/p2-1-pipeline:crates/gascan-e2e/tests/autostart.rs`.
+The taxonomy filed `accepted_socket_without_http2_cannot_block_initial_probe` (`762-803`)
+under *"absolute latency assertions — the elapsed time IS the property"*. Reading the
+whole test, that is not what the 2s is:
+
+- `775` — the holder thread accepts, unlinks the socket, then sleeps **3s** before
+  dropping the stream.
+- `785`, `798` — the deadline and the assertion are both **2s**.
+
+The 3s and the 2s are **coupled**. If the initial probe blocked on an accepted-but-mute
+socket it could not finish before the peer let go at 3s, so `< 2s` is a discriminator
+against the hold, not a performance budget. Had 2s been an absolute latency requirement,
+the holder's 3s would be arbitrary — it is not. **This is a category-2 relational bound
+with the relation left unnamed**, the same shape as the `ssh_config.rs` readiness policy
+that was already given the "name once, scale together" treatment.
+
+That reclassification is not the whole answer, because of a second defect that scaling
+alone does not fix:
+
+- `783-786` — `started` is taken **before** `spawn()`, so the measured interval
+  **includes process-spawn latency**. That is exactly the quantity this machine was
+  measured swinging `0.155s → 2.304s → 0.187s` within one session. Spawn alone can
+  exhaust the entire 2s budget while the probe behaves perfectly. **The clock starts on
+  the wrong event.**
+
+Three options, ranked, none of them applied — this is the design decision the previous
+session flagged and it is still the maintainer's:
+
+1. **Start the clock at the accept, inside the holder thread, and name the relation.**
+   The peer releases at `t_accept + HOLD`; assert the CLI finished before some fraction
+   of `HOLD` measured from `t_accept`. Spawn latency is excluded *by construction* rather
+   than by tolerance, and the two constants stop being able to drift apart. Residual
+   risk: whatever the CLI does *after* abandoning the probe (the socket has been
+   unlinked, so plausibly an autostart) is still inside the measured window.
+2. **Make the probe's outcome observable and drop the wall clock entirely.** If the CLI
+   emitted a structured event on abandoning the probe, the test could assert *ordering* —
+   abandoned before the peer released — with no duration in it at all. This is the
+   project's own "make it say more rather than guess better" principle applied to a
+   timing test, and it is the only option that a shared runner can host honestly.
+3. **Scale both constants together under one load multiplier.** Cheapest, preserves the
+   discriminator, but keeps spawn latency inside the measurement and so only widens the
+   window in which this machine can still lose.
+
+**PLAN, not VERIFIED**: options 1-3 are reasoning from the source, and nothing was run.
+The line citations and the two constants are facts of the file.
+
+### `autostart.rs` — the vacuous pass is a soundness bug with a mechanical fix
+
+`daemon_attest_rejects_a_symlink_without_sending_protocol_bytes` (`806-862`) fails
+**open**. Both of its reader-thread timeouts yield an empty buffer — `826` returns
+`Ok(Vec::new())` when nothing ever connects within 1s, and `841` breaks with `read = 0`
+when nothing is sent within 1s — and the assertion at `857-860` is that the buffer **is
+empty**. A machine slow enough that `daemon-attest` has not connected inside 1s makes the
+test pass **without ever observing the behaviour under test**.
+
+Unlike `762-803`, this needs no design decision, because a real condition is available.
+`852` calls `.output()`, which **waits for the CLI to exit**. Once it has exited it can
+no longer send bytes, so "no connection ever arrived" becomes *conclusive* rather than
+ambiguous. Waiting on process exit instead of a 1s wall clock separates the two cases the
+current code conflates:
+
+| Observation | Today | Should be |
+|---|---|---|
+| CLI exited, never connected | passes (empty) | **passes** — refusing to connect is the strongest possible correct behaviour |
+| CLI exited, connected, sent nothing | passes (empty) | passes |
+| CLI exited, connected, sent bytes | fails | fails |
+| CLI still running, deadline expired | **passes (vacuous)** | **cannot occur** — the wait is on exit |
+
+Not fixed here, and deliberately so: the fix belongs in a test file that #48 already
+touches, and committing to `ci/p2-1-pipeline` right now would move the head off
+`8ded364` and destroy the anchor step 1 is waiting on. It is the first thing to do after
+#48 merges.
