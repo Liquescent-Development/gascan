@@ -317,62 +317,62 @@ pub async fn ssh_doctor_facts_for_paths(
     let durable = durable_ssh_state(store);
     let artifacts = inspect_managed_ssh_artifacts(paths);
     let identity_inspection = inspect_host_identity_if_present(paths).await;
-    if let Err(diagnostic) = &identity_inspection {
-        if matches!(
+    if let Err(diagnostic) = &identity_inspection
+        && matches!(
             diagnostic.kind(),
             ManagedSshDiagnosticKind::Unsafe | ManagedSshDiagnosticKind::Internal
-        ) {
-            let identity = diagnostic_fact(diagnostic, "managed SSH identity");
-            let reason = if diagnostic.kind() == ManagedSshDiagnosticKind::Unsafe {
-                "unsafe"
-            } else {
-                "not inspectable"
-            };
-            let config = DoctorFact {
-                status: identity.status,
-                detail: format!(
-                    "generated SSH config at {} cannot be validated because the managed identity is {reason}",
-                    paths.config(),
-                ),
-                remedy: identity.remedy.clone(),
-            };
-            return SshDoctorFacts {
-                client: client_fact,
-                identity,
-                config,
-                native_publish: native_publish_fact(native_publish),
-            };
-        }
+        )
+    {
+        let identity = diagnostic_fact(diagnostic, "managed SSH identity");
+        let reason = if diagnostic.kind() == ManagedSshDiagnosticKind::Unsafe {
+            "unsafe"
+        } else {
+            "not inspectable"
+        };
+        let config = DoctorFact {
+            status: identity.status,
+            detail: format!(
+                "generated SSH config at {} cannot be validated because the managed identity is {reason}",
+                paths.config(),
+            ),
+            remedy: identity.remedy.clone(),
+        };
+        return SshDoctorFacts {
+            client: client_fact,
+            identity,
+            config,
+            native_publish: native_publish_fact(native_publish),
+        };
     }
-    if let Err(diagnostic) = &artifacts {
-        if matches!(
+    if let Err(diagnostic) = &artifacts
+        && matches!(
             diagnostic.kind(),
             ManagedSshDiagnosticKind::Unsafe | ManagedSshDiagnosticKind::Internal
-        ) {
-            let identity = diagnostic_fact(diagnostic, "managed SSH state");
-            return SshDoctorFacts {
-                client: client_fact,
-                config: identity.clone(),
-                identity,
-                native_publish: native_publish_fact(native_publish),
-            };
-        }
+        )
+    {
+        let identity = diagnostic_fact(diagnostic, "managed SSH state");
+        return SshDoctorFacts {
+            client: client_fact,
+            config: identity.clone(),
+            identity,
+            native_publish: native_publish_fact(native_publish),
+        };
     }
     let publication_inspection = SshManager.inspect_publication_for_paths(paths);
-    if let Err(diagnostic) = &publication_inspection {
-        if matches!(
+    if let Err(diagnostic) = &publication_inspection
+        && matches!(
             diagnostic.kind(),
             ManagedSshDiagnosticKind::Unsafe | ManagedSshDiagnosticKind::Internal
-        ) {
-            let config = snapshot_diagnostic_fact(paths, diagnostic);
-            let identity = ready_or_diagnostic_identity_fact(paths, &identity_inspection);
-            return SshDoctorFacts {
-                client: client_fact,
-                identity,
-                config,
-                native_publish: native_publish_fact(native_publish),
-            };
-        }
+        )
+    {
+        let config = snapshot_diagnostic_fact(paths, diagnostic);
+        let identity = ready_or_diagnostic_identity_fact(paths, &identity_inspection);
+        return SshDoctorFacts {
+            client: client_fact,
+            identity,
+            config,
+            native_publish: native_publish_fact(native_publish),
+        };
     }
     let snapshot_inspection = match (&identity_inspection, &publication_inspection) {
         (Ok(Some(identity)), Ok(publication)) if publication.config_present() => {
@@ -389,17 +389,16 @@ pub async fn ssh_doctor_facts_for_paths(
                 ManagedSshDiagnosticKind::Unsafe | ManagedSshDiagnosticKind::Internal
             )
         })
+        && let Some(Err(diagnostic)) = &snapshot_inspection
     {
-        if let Some(Err(diagnostic)) = &snapshot_inspection {
-            let config = snapshot_diagnostic_fact(paths, diagnostic);
-            let identity = ready_or_diagnostic_identity_fact(paths, &identity_inspection);
-            return SshDoctorFacts {
-                client: client_fact,
-                identity,
-                config,
-                native_publish: native_publish_fact(native_publish),
-            };
-        }
+        let config = snapshot_diagnostic_fact(paths, diagnostic);
+        let identity = ready_or_diagnostic_identity_fact(paths, &identity_inspection);
+        return SshDoctorFacts {
+            client: client_fact,
+            identity,
+            config,
+            native_publish: native_publish_fact(native_publish),
+        };
     }
     let identity_partial = matches!(identity_inspection, Ok(None))
         || matches!(

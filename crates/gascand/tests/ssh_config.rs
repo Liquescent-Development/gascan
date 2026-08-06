@@ -30,6 +30,19 @@ use std::process::Command;
 use std::sync::Arc;
 #[cfg(debug_assertions)]
 use std::time::Duration;
+
+/// What these readiness tests assert is relational, not absolute: that the
+/// deadline fires before a hanging child can finish, and that retries fit
+/// inside it. The absolute value is arbitrary, so it is named once and scaled
+/// with the things it is compared against.
+///
+/// It was 500ms, which is not enough time to be sure a spawned child has even
+/// been scheduled. `readiness_timeout_kills_hanging_child_before_it_can_complete_later`
+/// failed as "readiness child never started" during repeated full-workspace
+/// runs -- not because the timeout misbehaved, but because the child had not
+/// run yet, so the test's own precondition did not hold.
+#[cfg(debug_assertions)]
+const READINESS_DEADLINE: Duration = Duration::from_secs(2);
 use tempfile::TempDir;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -154,10 +167,7 @@ fn write_generation(
     paths: &SshPaths,
     contents: &str,
 ) -> Result<camino::Utf8PathBuf, Box<dyn std::error::Error>> {
-    let digest = Sha256::digest(contents.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let digest = gascan_core::hex::lower(&Sha256::digest(contents.as_bytes()));
     let path = paths.directory().join(format!("known_hosts.{digest}"));
     fs::write(path.as_std_path(), contents)?;
     fs::set_permissions(path.as_std_path(), fs::Permissions::from_mode(0o644))?;
@@ -235,10 +245,8 @@ async fn publishes_stable_sorted_strict_openssh_files() -> TestResult {
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
         .ok_or("known-hosts generation is not UTF-8")?;
-    let expected_generation = Sha256::digest(known_hosts_before.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let expected_generation =
+        gascan_core::hex::lower(&Sha256::digest(known_hosts_before.as_bytes()));
     assert_eq!(generation, format!("known_hosts.{expected_generation}"));
 
     assert!(config_before.find("Host gascan-alpha") < config_before.find("Host gascan-zeta"));
@@ -576,7 +584,7 @@ async fn readiness_retries_transient_failure_with_identical_strict_argv() -> Tes
                 program: &program,
                 host_key_timeout: Duration::from_secs(1),
                 policy: SshReadinessPolicy {
-                    deadline: Duration::from_millis(500),
+                    deadline: READINESS_DEADLINE,
                     retry_delay: Duration::from_millis(10),
                     maximum_stderr: 128,
                 },
@@ -615,7 +623,7 @@ async fn permanent_readiness_failure_reports_bounded_lossy_final_stderr_tail() -
                 program: &program,
                 host_key_timeout: Duration::from_secs(1),
                 policy: SshReadinessPolicy {
-                    deadline: Duration::from_millis(500),
+                    deadline: READINESS_DEADLINE,
                     retry_delay: Duration::from_millis(10),
                     maximum_stderr: 64,
                 },
@@ -633,7 +641,10 @@ async fn permanent_readiness_failure_reports_bounded_lossy_final_stderr_tail() -
         detail.contains("127.0.0.1:24242"),
         "missing endpoint: {detail}"
     );
-    assert!(detail.contains("500ms"), "missing deadline: {detail}");
+    assert!(
+        detail.contains(&format!("{READINESS_DEADLINE:?}")),
+        "missing deadline: {detail}"
+    );
     assert!(
         detail.contains("Host key verification failed."),
         "missing final OpenSSH detail: {detail}"
@@ -668,7 +679,7 @@ async fn readiness_timeout_kills_hanging_child_before_it_can_complete_later() ->
         root,
         "hanging-readiness",
         &format!(
-            "printf started > '{}'\nsleep 1\nprintf completed > '{}'",
+            "printf started > '{}'\nsleep 6\nprintf completed > '{}'",
             started, completed
         ),
     )?;
@@ -683,7 +694,7 @@ async fn readiness_timeout_kills_hanging_child_before_it_can_complete_later() ->
                 program: &program,
                 host_key_timeout: Duration::from_secs(1),
                 policy: SshReadinessPolicy {
-                    deadline: Duration::from_millis(500),
+                    deadline: READINESS_DEADLINE,
                     retry_delay: Duration::from_millis(10),
                     maximum_stderr: 128,
                 },
@@ -694,7 +705,7 @@ async fn readiness_timeout_kills_hanging_child_before_it_can_complete_later() ->
     assert_eq!(error.code(), "ssh_not_ready");
     assert!(started.exists(), "readiness child never started");
 
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    tokio::time::sleep(READINESS_DEADLINE + Duration::from_secs(5)).await;
     assert!(
         !completed.exists(),
         "timed-out readiness child completed after the caller returned"

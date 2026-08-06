@@ -140,6 +140,26 @@ impl SshPaths {
     }
 }
 
+/// How `ssh-keygen` ended, in the terms that distinguish a bad key from a
+/// process that never got to judge one. A signal means it was killed, and no
+/// code at all means it did not run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeygenOutcome {
+    Code(i32),
+    Signal(i32),
+    NoStatus,
+}
+
+impl std::fmt::Display for KeygenOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Code(code) => write!(formatter, "exit status {code}"),
+            Self::Signal(signal) => write!(formatter, "killed by signal {signal}"),
+            Self::NoStatus => formatter.write_str("no exit status"),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SshError {
     #[error("{0}")]
@@ -154,8 +174,13 @@ pub enum SshError {
     KeygenTimeout,
     #[error("ssh-keygen produced invalid or excessive output")]
     KeygenOutput,
-    #[error("ssh-keygen rejected the managed key")]
-    KeygenRejected,
+    /// Carries what `ssh-keygen` actually reported. The exit status used to be
+    /// available only through a `#[cfg(test)]` `eprintln!`, which never reaches
+    /// a `gascand` spawned by an end-to-end test -- so a real rejection was
+    /// observed once with no way to tell a key that is genuinely bad from a
+    /// `ssh-keygen` that was killed or never ran.
+    #[error("ssh-keygen rejected the managed key ({0})")]
+    KeygenRejected(KeygenOutcome),
 }
 
 impl SshError {

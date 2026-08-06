@@ -741,10 +741,7 @@ fn staging_name() -> Result<OsString, SshConfigError> {
             std::io::Error::other(error),
         )
     })?;
-    let suffix = random
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let suffix = gascan_core::hex::lower(&random);
     Ok(OsString::from(format!(".gascan-{suffix}")))
 }
 

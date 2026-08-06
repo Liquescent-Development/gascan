@@ -16,8 +16,26 @@ use tower::service_fn;
 
 const ENDPOINT_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// Bounds a hang, not load. Waits for a fixture daemon's startup diagnostic
+/// now succeed on evidence -- the diagnostic arrived, or the child exited -- so
+/// elapsed time is no longer the success criterion and a daemon that is merely
+/// slow under load is not a failure. This ceiling exists only so a genuinely
+/// stuck daemon fails the test instead of hanging it, which is why it is far
+/// above any legitimate startup.
+///
+/// It was five seconds, and was the criterion itself. `cargo test --workspace`
+/// runs 6-8 test binaries at once, each defaulting to `--test-threads` =
+/// `num_cpus`, so a ten-core machine can carry 60-80 test threads while these
+/// waits race a wall clock. That is what made the suite flaky, always in the
+/// daemon-readiness family and always a different test.
 #[cfg(test)]
-pub(crate) const FIXTURE_DAEMON_DIAGNOSTIC_DEADLINE: Duration = Duration::from_secs(5);
+pub(crate) const FIXTURE_DAEMON_HANG_CEILING: Duration = Duration::from_secs(60);
+
+/// A dead child is observed in milliseconds, so this is enormously generous.
+/// It is not a latency assertion: it exists so that if the liveness plumbing is
+/// ever removed, the test fails promptly instead of waiting out the ceiling.
+#[cfg(test)]
+pub(crate) const FIXTURE_DAEMON_DEATH_DETECTION_BOUND: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -376,11 +394,11 @@ impl DaemonSpawner for TokioDaemonSpawner {
         } else {
             command.stderr(Stdio::null());
         }
-        let _child = command.spawn()?;
-        Ok(DaemonStartupMonitor::from_file(
-            startup_file,
-            launch.owner_token.clone(),
-        ))
+        let child = command.spawn()?;
+        Ok(
+            DaemonStartupMonitor::from_file(startup_file, launch.owner_token.clone())
+                .watching(child),
+        )
     }
 }
 
@@ -440,7 +458,7 @@ fn daemon_launch_environment(
         None => {
             let mut random = [0_u8; 32];
             getrandom::fill(&mut random).map_err(std::io::Error::other)?;
-            random.iter().map(|byte| format!("{byte:02x}")).collect()
+            gascan_core::hex::lower(&random)
         }
     };
     if owner.is_empty() {
@@ -516,8 +534,8 @@ async fn connect(
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientError, FIXTURE_DAEMON_DIAGNOSTIC_DEADLINE, TokioDaemonSpawner,
-        definitely_inert_connect_error,
+        ClientError, FIXTURE_DAEMON_DEATH_DETECTION_BOUND, FIXTURE_DAEMON_HANG_CEILING,
+        TokioDaemonSpawner, definitely_inert_connect_error,
     };
     use crate::daemon::{DaemonLaunch, DaemonPaths, DaemonSpawner};
     use std::os::unix::fs::PermissionsExt as _;
@@ -675,6 +693,76 @@ mod tests {
         Ok(())
     }
 
+    /// A daemon that dies before writing must be reported as dead, naming its
+    /// exit status, rather than as a wall-clock deadline. The old wait loop
+    /// could not tell the two apart: it reported
+    /// `did not write diagnostics within 5s: ""` either way, so a daemon that
+    /// never started looked exactly like one that was merely slow under load.
+    /// The substance of the fix is that death is noticed on its own evidence,
+    /// so the second phase below is timed from the moment the child has
+    /// demonstrably run -- never from `spawn`, which would fold the machine's
+    /// exec latency into an assertion about this code.
+    #[tokio::test]
+    async fn fixture_daemon_that_dies_is_reported_as_dead_not_as_a_deadline()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let runtime = root.join("runtime");
+        std::fs::create_dir(&runtime)?;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))?;
+        let script = root.join("fixture-gascand");
+        let reached = root.join("fixture-reached-first-instruction");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf reached > '{}'\nexit 3\n",
+                reached.display()
+            ),
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
+        let diagnostic = root.join("daemon.stderr");
+        let launch = DaemonLaunch {
+            executable: script,
+            current_dir: runtime.clone(),
+            instance_path: runtime.join("daemon-instance.json"),
+            owner_token: "test-owner".to_owned(),
+            stderr_path: Some(diagnostic.clone()),
+            startup_diagnostic_path: runtime.join("daemon-startup-error.json"),
+        };
+
+        let mut monitor = DaemonSpawner::spawn(&TokioDaemonSpawner, &launch)?;
+
+        // How long the kernel takes to get a freshly written script as far as its
+        // first instruction is a property of the machine, not of this code, so it
+        // is bounded only against a hang. Timing the death detection from `spawn`
+        // instead conflated the two, and this test failed as
+        // "still unobserved after 5s" when the child had not yet run at all.
+        let execed = tokio::time::Instant::now() + FIXTURE_DAEMON_HANG_CEILING;
+        while !reached.exists() {
+            assert!(
+                tokio::time::Instant::now() < execed,
+                "fixture daemon never reached its first instruction within {FIXTURE_DAEMON_HANG_CEILING:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // From here the child has run and is exiting. Noticing that is this code's
+        // job, and it must not need the ceiling.
+        let running = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = monitor.exited()? {
+                break status;
+            }
+            assert!(
+                running.elapsed() < FIXTURE_DAEMON_DEATH_DETECTION_BOUND,
+                "a daemon that had already run was still unobserved as exited after {FIXTURE_DAEMON_DEATH_DETECTION_BOUND:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        assert_eq!(status.code(), Some(3));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn daemon_spawner_uses_protected_cwd_environment_and_detached_stdin()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -699,17 +787,34 @@ mod tests {
             startup_diagnostic_path: runtime.join("daemon-startup-error.json"),
         };
 
-        DaemonSpawner::spawn(&TokioDaemonSpawner, &launch)?;
-        let deadline = tokio::time::Instant::now() + FIXTURE_DAEMON_DIAGNOSTIC_DEADLINE;
+        let mut monitor = DaemonSpawner::spawn(&TokioDaemonSpawner, &launch)?;
+        let deadline = tokio::time::Instant::now() + FIXTURE_DAEMON_HANG_CEILING;
         let output = loop {
             let output = std::fs::read_to_string(&diagnostic).unwrap_or_default();
             if output.lines().count() >= 5 {
                 break output;
             }
+            // Check the child before the clock. A daemon that died has failed
+            // for a reason worth reporting now, and reporting it as a deadline
+            // would blame elapsed time for something that was never going to
+            // finish. Re-read first: this fixture writes its diagnostics and
+            // then exits, so it can finish both between the read above and this
+            // check, and calling that a failure would be a race of our own
+            // making.
+            if let Some(status) = monitor.exited()? {
+                let settled = std::fs::read_to_string(&diagnostic).unwrap_or_default();
+                if settled.lines().count() >= 5 {
+                    break settled;
+                }
+                return Err(format!(
+                    "fixture daemon exited with {status} before writing its diagnostics: {settled:?}"
+                )
+                .into());
+            }
             if tokio::time::Instant::now() >= deadline {
                 return Err(format!(
-                    "fixture daemon did not write diagnostics within {:?}: {output:?}",
-                    FIXTURE_DAEMON_DIAGNOSTIC_DEADLINE
+                    "fixture daemon was still running but had not written diagnostics within {:?}: {output:?}",
+                    FIXTURE_DAEMON_HANG_CEILING
                 )
                 .into());
             }

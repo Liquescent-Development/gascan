@@ -59,14 +59,14 @@ impl RawTerminal {
 
 impl TerminalRestore {
     pub fn restore(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            if let Some(state) = state.take() {
-                let _ = rustix::termios::tcsetattr(
-                    &state.fd,
-                    rustix::termios::OptionalActions::Now,
-                    &state.saved,
-                );
-            }
+        if let Ok(mut state) = self.state.lock()
+            && let Some(state) = state.take()
+        {
+            let _ = rustix::termios::tcsetattr(
+                &state.fd,
+                rustix::termios::OptionalActions::Now,
+                &state.saved,
+            );
         }
     }
 }

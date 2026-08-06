@@ -412,7 +412,16 @@ async fn run_configured_ssh_keygen(mut command: Command) -> Result<Vec<u8>, SshE
             stderr.len(),
             Sha256::digest(&stderr)
         );
-        return Err(SshError::KeygenRejected);
+        // The outcome travels with the error rather than only through the
+        // `#[cfg(test)]` line above, which cannot reach a `gascand` that an
+        // end-to-end test spawned as a real binary.
+        use std::os::unix::process::ExitStatusExt as _;
+        let outcome = match (status.code(), status.signal()) {
+            (Some(code), _) => crate::ssh::KeygenOutcome::Code(code),
+            (None, Some(signal)) => crate::ssh::KeygenOutcome::Signal(signal),
+            (None, None) => crate::ssh::KeygenOutcome::NoStatus,
+        };
+        return Err(SshError::KeygenRejected(outcome));
     }
     Ok(stdout)
 }

@@ -1,4 +1,16 @@
 [toolchain]
-channel = "1.85.0"
+# Development and CI build with the same compiler, deliberately.
+#
+# This previously pinned 1.85.0 — the minimum for edition 2024 — set when the
+# workspace was scaffolded in d6978fa and never revisited. Pinning the toolchain to
+# an MSRV floor made local measurements describe a different compiler than CI's,
+# because RUSTUP_TOOLCHAIN overrides this file. That divergence hid a tree which
+# could not compile on its own pin: a let-chain needs 1.88, and
+# clippy::format_collect failed at eleven sites under 1.85's clippy.
+#
+# Nothing consumes these crates as source — no crate sets `publish`, and Gas Can
+# ships as a signed .pkg — so an MSRV promise protects no consumer. Track the
+# compiler actually in use instead.
+channel = "1.95.0"
 components = ["clippy", "rustfmt"]
 profile = "minimal"

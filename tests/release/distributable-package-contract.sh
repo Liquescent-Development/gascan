@@ -52,6 +52,14 @@ mkdir "$stub_bin"
 cat >"$stub_bin/pkgutil" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
+# The payload listing is the one part of a package that differs between build
+# hosts, and a host cannot produce the other host's shape: com.apple.provenance
+# cannot be added or stripped on demand. So the listing is driven from a file
+# when the scenario asks. Unset means "ask the real pkgutil".
+if [[ ${1:-} == --payload-files && -n ${GASCAN_STUB_PAYLOAD:-} ]]; then
+  cat "$GASCAN_STUB_PAYLOAD"
+  exit 0
+fi
 if [[ ${1:-} != --check-signature ]]; then
   exec /usr/sbin/pkgutil "$@"
 fi
@@ -224,6 +232,35 @@ assert_status 'payload missing an executable' 65 \
   gascan_assert_distributable_package "$fixture/incomplete.pkg" "$team"
 assert_status 'payload carrying installer scripts' 65 \
   gascan_assert_distributable_package "$fixture/scripted.pkg" "$team"
+
+# Both build-host representations must be accepted, because the AppleDouble
+# records belong to the host rather than to Gas Can, and no host can produce the
+# other's shape on demand: com.apple.provenance can be neither added nor
+# stripped. This machine attaches it, so payload.pkg above already exercised the
+# paired shape against a real pkgbuild; driving the listing covers the shape this
+# host cannot produce, plus the two malformed sets no host produces at all.
+# Without these, a green run here and a green run on a hosted runner would each
+# still only test one half of the gate -- which is how this gate came to pass
+# locally and fail in CI.
+gascan_expected_payload_files >"$fixture/listing-unpaired"
+{ gascan_expected_payload_files; gascan_expected_payload_appledouble; } \
+  >"$fixture/listing-paired"
+grep -v '/\._gascand$' "$fixture/listing-paired" >"$fixture/listing-partial"
+{ cat "$fixture/listing-paired"; printf './usr/local/bin/._EVIL\n'; } \
+  >"$fixture/listing-orphan"
+
+assert_status 'payload with no AppleDouble records' 0 \
+  run_helper "$fixture/payload.pkg" "$team" \
+  GASCAN_STUB_PAYLOAD="$fixture/listing-unpaired"
+assert_status 'payload with the full AppleDouble set' 0 \
+  run_helper "$fixture/payload.pkg" "$team" \
+  GASCAN_STUB_PAYLOAD="$fixture/listing-paired"
+assert_status 'payload with a partial AppleDouble set' 65 \
+  run_helper "$fixture/payload.pkg" "$team" \
+  GASCAN_STUB_PAYLOAD="$fixture/listing-partial"
+assert_status 'payload with an unpaired AppleDouble record' 65 \
+  run_helper "$fixture/payload.pkg" "$team" \
+  GASCAN_STUB_PAYLOAD="$fixture/listing-orphan"
 
 # The requirement the helper hands codesign must be one macOS can actually
 # parse. A stub can only compare text; csreq is the real parser, and it needs no

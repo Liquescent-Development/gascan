@@ -5,6 +5,18 @@ use std::process::Command;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+/// Bounds a hang, not load. The waits below are fixture setup and teardown --
+/// "give me a daemon that is ready", "the replaced daemon should be gone" --
+/// where elapsed time is not the property under test, only a backstop against
+/// waiting forever. They were two seconds, which raced the machine: these tests
+/// spawn real daemons while `cargo test --workspace` runs several test binaries
+/// at once, and a child that has not been scheduled yet is not a failed child.
+///
+/// This does not apply to the deadline in
+/// `accepted_socket_without_http2_cannot_block_initial_probe`, where the elapsed
+/// time *is* the assertion.
+const CHILD_HANG_CEILING: std::time::Duration = std::time::Duration::from_secs(60);
+
 struct Environment {
     gascan: std::ffi::OsString,
     gascand: std::ffi::OsString,
@@ -164,7 +176,7 @@ impl OwnedChild {
     }
 
     fn wait_for_exit(&mut self) -> TestResult {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + CHILD_HANG_CEILING;
         loop {
             let child = self.0.as_mut().ok_or("owned daemon child missing")?;
             if child.try_wait()?.is_some() {
@@ -283,7 +295,7 @@ impl Environment {
             .env("GASCAN_DAEMON_OWNER_TOKEN", "owned-restart-e2e");
         let mut child = OwnedChild::spawn(&mut command)?;
         let pid = u64::from(child.id()?);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + CHILD_HANG_CEILING;
         loop {
             if let Some(status) = child.try_wait()? {
                 child.0 = None;
@@ -324,7 +336,7 @@ impl Environment {
             .env_remove("GASCAN_DAEMON_OWNER_TOKEN");
         let mut child = OwnedChild::spawn(&mut command)?;
         let pid = u64::from(child.id()?);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + CHILD_HANG_CEILING;
         loop {
             if let Some(status) = child.try_wait()? {
                 child.0 = None;
@@ -533,7 +545,7 @@ fn successful_daemon_closes_inherited_startup_diagnostic_descriptor() -> TestRes
     let mut daemon = OwnedChild::spawn(&mut command)?;
     drop(command);
     let daemon_pid = u64::from(daemon.id()?);
-    let readiness_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let readiness_deadline = std::time::Instant::now() + CHILD_HANG_CEILING;
     loop {
         let output = env.command_for(&["daemon", "status", "--json"]).output()?;
         if output.status.success() {
@@ -541,6 +553,12 @@ fn successful_daemon_closes_inherited_startup_diagnostic_descriptor() -> TestRes
             if status["state"] == "running" && status["pid"].as_u64() == Some(daemon_pid) {
                 break;
             }
+        }
+        // The sibling waits at the readiness helpers check this; this one did
+        // not, so a daemon that died on startup was reported only once the
+        // deadline elapsed, and as a readiness timeout rather than as a death.
+        if let Some(status) = daemon.try_wait()? {
+            return Err(format!("daemon exited before the startup-fd audit: {status}").into());
         }
         if std::time::Instant::now() >= readiness_deadline {
             return Err("daemon did not become ready for startup-fd audit".into());
