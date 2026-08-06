@@ -1,0 +1,134 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.detect.outputs.rust }}
+      contracts: ${{ steps.detect.outputs.contracts }}
+      engine: ${{ steps.detect.outputs.engine }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Classify the changed paths
+        id: detect
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: ./scripts/ci-detect-changes.sh
+
+  rust:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report toolchain
+        run: |
+          rustc --version
+          cargo --version
+          sw_vers
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Lints
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+      - name: Guard the ignored-test set
+        run: ./scripts/ci-check-ignored-tests.sh
+
+  contracts:
+    needs: changes
+    if: needs.changes.outputs.contracts == 'true'
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Release and CI contracts
+        run: ./scripts/ci-run-release-contracts.sh
+
+  engine:
+    needs: changes
+    if: needs.changes.outputs.engine == 'true'
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report toolchain
+        run: |
+          swift --version
+          sw_vers
+
+      - name: Build the pinned Arca engine
+        run: ./scripts/build-arca-engine.sh
+
+  # Temporary. Settles whether a hosted runner carries an Apple container runtime,
+  # replacing a PLAN claim in the design spec with a measurement. Deliberately
+  # outside gate's needs, so it can never block a merge. Removed once recorded.
+  runtime-probe:
+    if: github.event_name == 'pull_request'
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Probe for an Apple container runtime
+        run: |
+          set -eu
+          uname -s
+          uname -m
+          sw_vers
+          ./scripts/apple-test-preflight.sh
+
+  gate:
+    needs: [changes, rust, contracts, engine]
+    if: always()
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    steps:
+      - name: Require every job to have succeeded or been skipped
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          RUST: ${{ needs.rust.result }}
+          CONTRACTS: ${{ needs.contracts.result }}
+          ENGINE: ${{ needs.engine.result }}
+        run: |
+          set -eu
+          printf 'changes=%s rust=%s contracts=%s engine=%s\n' \
+            "$CHANGES" "$RUST" "$CONTRACTS" "$ENGINE"
+          test "$CHANGES" = success || {
+            printf 'gate: changes must succeed, was %s\n' "$CHANGES" >&2
+            exit 1
+          }
+          status=0
+          for result in "$RUST" "$CONTRACTS" "$ENGINE"; do
+            case "$result" in
+              success|skipped) ;;
+              *) printf 'gate: a job reported %s\n' "$result" >&2; status=1 ;;
+            esac
+          done
+          exit "$status"
