@@ -3047,18 +3047,33 @@ fn file_identity_at(
     })
 }
 
+/// Four distinct faults shared one message, so a report of "ownership, type,
+/// links, or mode is unsafe" could not say which had fired. That matters
+/// because they are not equally alarming: a link count of zero means the record
+/// was unlinked while it was open, and mode 0200 is the daemon's own
+/// not-yet-published record (`gascand` creates it inert and publishes by
+/// chmod-ing to 0600), whereas a foreign owner is a genuine tampering signal.
+/// Name the fault and carry the observed values.
 fn validate_file_stat(stat: &rustix::fs::Stat, expected_uid: u32) -> io::Result<()> {
-    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
-        || stat.st_uid != expected_uid
-        || stat.st_nlink != 1
-        || Mode::from_raw_mode(stat.st_mode).bits() & 0o777 != FILE_MODE
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "protected runtime file ownership, type, links, or mode is unsafe",
-        ));
-    }
-    Ok(())
+    let mode = Mode::from_raw_mode(stat.st_mode).bits() & 0o777;
+    let fault = if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        "not a regular file"
+    } else if stat.st_uid != expected_uid {
+        "owned by another user"
+    } else if stat.st_nlink != 1 {
+        "link count is not one"
+    } else if mode != FILE_MODE {
+        "mode is not 0600"
+    } else {
+        return Ok(());
+    };
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "protected runtime file is unsafe: {fault} (mode {mode:04o}, links {}, uid {}, expected uid {expected_uid})",
+            stat.st_nlink, stat.st_uid
+        ),
+    ))
 }
 
 #[cfg(target_os = "linux")]

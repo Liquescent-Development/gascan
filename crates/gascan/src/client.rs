@@ -698,8 +698,10 @@ mod tests {
     /// could not tell the two apart: it reported
     /// `did not write diagnostics within 5s: ""` either way, so a daemon that
     /// never started looked exactly like one that was merely slow under load.
-    /// The elapsed-time assertion is the substance of the fix -- without the
-    /// liveness check this fails only after the full deadline.
+    /// The substance of the fix is that death is noticed on its own evidence,
+    /// so the second phase below is timed from the moment the child has
+    /// demonstrably run -- never from `spawn`, which would fold the machine's
+    /// exec latency into an assertion about this code.
     #[tokio::test]
     async fn fixture_daemon_that_dies_is_reported_as_dead_not_as_a_deadline()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -709,7 +711,14 @@ mod tests {
         std::fs::create_dir(&runtime)?;
         std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))?;
         let script = root.join("fixture-gascand");
-        std::fs::write(&script, "#!/bin/sh\nexit 3\n")?;
+        let reached = root.join("fixture-reached-first-instruction");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf reached > '{}'\nexit 3\n",
+                reached.display()
+            ),
+        )?;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
         let diagnostic = root.join("daemon.stderr");
         let launch = DaemonLaunch {
@@ -722,14 +731,31 @@ mod tests {
         };
 
         let mut monitor = DaemonSpawner::spawn(&TokioDaemonSpawner, &launch)?;
-        let started = std::time::Instant::now();
+
+        // How long the kernel takes to get a freshly written script as far as its
+        // first instruction is a property of the machine, not of this code, so it
+        // is bounded only against a hang. Timing the death detection from `spawn`
+        // instead conflated the two, and this test failed as
+        // "still unobserved after 5s" when the child had not yet run at all.
+        let execed = tokio::time::Instant::now() + FIXTURE_DAEMON_HANG_CEILING;
+        while !reached.exists() {
+            assert!(
+                tokio::time::Instant::now() < execed,
+                "fixture daemon never reached its first instruction within {FIXTURE_DAEMON_HANG_CEILING:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // From here the child has run and is exiting. Noticing that is this code's
+        // job, and it must not need the ceiling.
+        let running = std::time::Instant::now();
         let status = loop {
             if let Some(status) = monitor.exited()? {
                 break status;
             }
             assert!(
-                started.elapsed() < FIXTURE_DAEMON_DEATH_DETECTION_BOUND,
-                "a daemon that exited immediately was still unobserved after {FIXTURE_DAEMON_DEATH_DETECTION_BOUND:?}"
+                running.elapsed() < FIXTURE_DAEMON_DEATH_DETECTION_BOUND,
+                "a daemon that had already run was still unobserved as exited after {FIXTURE_DAEMON_DEATH_DETECTION_BOUND:?}"
             );
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         };
