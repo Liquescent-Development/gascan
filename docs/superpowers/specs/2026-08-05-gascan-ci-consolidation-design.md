@@ -83,7 +83,7 @@ figure.
 | Command | Result | Anchor |
 |---|---|---|
 | `cargo fmt --all --check` | green | `FMT_RC=0`, zero output |
-| `cargo clippy --workspace --all-targets -- -D warnings` | green | `CLIPPY_RC=0`, 13.431s, 0 diagnostics |
+| `cargo clippy --workspace --all-targets -- -D warnings` | ~~green~~ **WRONG TOOLCHAIN — see §11.1** | `CLIPPY_RC=0`, 13.431s, 0 diagnostics, but on 1.95.0 not the pinned 1.85.0 |
 | `cargo test --workspace --no-run` | green | `NO_RUN_RC=0`, 1:57.82 |
 | `cargo test -p gascan-core -p gascan-proto -p gascan-inherited-fd -p gascan -p gascand` | green | `UNIT_RC=0`, 1:00.07, 43 binaries, 902 passed / 0 failed / 0 ignored |
 | `cargo test -p gascan-apple -p gascan-e2e` | **1 red** | `REST_RC=101`, 1:16.63, 464 passed / 1 failed / 22 ignored |
@@ -124,9 +124,13 @@ arm64, then runs `container system version --format json`;
 predecessor image receipt; the suite is driven by
 `cargo test -p gascan-e2e --test "$test_name" -- --ignored --test-threads=1 --nocapture`.
 
-**PLAN, explicitly not verified:** that a GitHub-hosted `macos-26` runner cannot run
+~~**PLAN, explicitly not verified:** that a GitHub-hosted `macos-26` runner cannot run
 these, because they need nested virtualization and the `container` tooling. §7.2
-settles this with a measurement instead of leaving it as a belief.
+settles this with a measurement instead of leaving it as a belief.~~
+**Settled — promoted to VERIFIED in §11.5.** The probe failed with
+`container: command not found`, exit 127. The reason differs from the guess: the
+tooling is simply absent, which is established without needing any claim about
+nested virtualization.
 
 ### 3.5 The release contracts are hermetic
 
@@ -352,7 +356,122 @@ what D2's topology provides. The numbers are warm-cache floors; cold runners wil
 slower, and the conclusion holds regardless because the ratio, not the absolute, is
 what decides it.
 
-## 11. Explicitly out of scope
+## 11. Findings from the first real runs — 2026-08-05/06
+
+The pipeline was landed on PR #48 (stacked on #47) and run against hosted runners
+before the ruleset. Everything below is VERIFIED from those runs.
+
+### 11.1 Correction: §3.3's local measurements were taken on the wrong toolchain
+
+> ~~`cargo clippy --workspace --all-targets -- -D warnings` | green | `CLIPPY_RC=0`, 13.431s, 0 diagnostics~~
+
+**Corrected.** That was measured with `rustc 1.95.0`, not the pinned 1.85.0.
+`RUSTUP_TOOLCHAIN=1.95.0` is exported in the development environment, and that
+variable **overrides `rust-toolchain.toml`**. VERIFIED: `rustup toolchain list`
+reports `1.95.0 (active)` inside the repository while `rust-toolchain.toml` pins
+`1.85.0`, and `env | grep RUSTUP` shows the override. CI honoured the pin correctly
+— its "Report toolchain" step printed `rustc 1.85.0 (4d91de4e4 2025-02-17)`.
+
+Every local Rust measurement in §3.3 is therefore about 1.95.0. The §3.3 claims
+about `fmt`, the release contracts and the ignored-test count are unaffected; the
+clippy claim was wrong for CI's purposes. **Measure with
+`RUSTUP_TOOLCHAIN=1.85.0` until the override is removed.**
+
+### 11.2 The tree did not compile on its own pinned toolchain
+
+**VERIFIED.** `cargo build --workspace` under `RUSTUP_TOOLCHAIN=1.85.0` exits 101:
+`error[E0658]: let expressions in this position are unstable` at
+`crates/gascan/src/daemon.rs:1182`. Let-chains stabilised in Rust 1.88, while
+`rust-toolchain.toml` pins 1.85.0 and `Cargo.toml:8` declares
+`rust-version = "1.85"`. It was the only let-chain in the tree.
+
+Fixed as a nested `if` (`9bee529`), preserving the short-circuit, because that
+honours the declared MSRV. **Raising the pin to ≥1.88 instead is a live
+alternative and is an MSRV policy decision for the maintainer**, not one this
+phase should make unilaterally.
+
+### 11.3 Clippy had never passed on the pinned toolchain
+
+**VERIFIED.** Once the tree compiled, `clippy::format_collect` fired at **eleven**
+call sites across `gascan-core`, `gascan`, `gascand`, `gascan-apple` and
+`gascan-e2e`. They surfaced one crate at a time, because clippy stops at the first
+failing crate — so the first CI run showed only one.
+
+All eleven were the same idiom, `bytes.iter().map(|b| format!("{b:02x}")).collect()`.
+Replaced by one `gascan_core::hex::lower` (`b2003df`), which is DRY and fixes the
+lint in a single place. `CLIPPY_185_RC` went 101 → **0**, the first time clippy has
+passed on the pinned toolchain. Equivalence is asserted over all 256 byte values,
+because these strings become filenames, owner tokens and persisted digests.
+
+### 11.4 The `contracts` job needed full history — a defect in §5.1
+
+**VERIFIED.** 4 of 15 contracts failed on the first run:
+`fatal: Failed to resolve 'HEAD~1' as a valid ref`, with
+`distributable-package rc=65`, `publish rc=128`, `release-script rc=128`,
+`signal rc=1`. `actions/checkout` defaults to `fetch-depth: 1`.
+`release-script-contract.sh` resolves `HEAD~1`. Fixed by `fetch-depth: 0` on that
+job (`06d4c67`). §5.1's table set it only on `changes`.
+
+### 11.5 The hosted runner has no Apple container runtime — §3.4's PLAN settled
+
+**VERIFIED**, replacing the PLAN in §3.4: the `runtime-probe` job failed with
+`./scripts/apple-test-preflight.sh: line 8: container: command not found`,
+exit **127**, on `macos-26` (`ProductVersion: 26.5.2`). **D4 stands on evidence.**
+The heavy Apple tier cannot run on hosted runners, independent of the
+candidate-image problem.
+
+### 11.6 `gate` reddens correctly — §7.1 satisfied without staging a break
+
+**VERIFIED** from run `31074653442`: `changes=success`, `engine=success`,
+`rust=failure`, `contracts=failure`, and **`gate=failure`**. The aggregation
+propagates failure, so the required check would have blocked. The green and
+`skipped` directions still need confirming (§7.3).
+
+`changes` and `engine` both succeeded on real runners, so the classifier works and
+the folded-in engine build is intact.
+
+### 11.7 BLOCKING: the test suite is flaky, and Task 8 must wait
+
+**VERIFIED and root-caused.** `cargo test --workspace` fails intermittently with a
+**different test each run** — 3 red / 1 green locally. Observed failures:
+`accepted_socket_without_http2_cannot_block_initial_probe`
+("initial readiness probe exceeded its bound"),
+`environment_teardown_terminates_its_exact_live_daemon`,
+`daemon::tests::inherited_startup_diagnostic_survives_path_replacement`,
+`client::tests::daemon_spawner_uses_protected_cwd_environment_and_detached_stdin`,
+and 4 in `gascan-e2e --test autostart`.
+
+Root cause, measured rather than inferred:
+
+- `cargo test --workspace` runs **6–8 test binaries concurrently** (sampled with
+  `ps` during a run).
+- Each binary independently defaults to `--test-threads` = `num_cpus` = 10 on this
+  machine, so ~60–80 concurrent test threads on 10 cores. Cargo's `-j` bounds build
+  jobs and binary launches, not threads *inside* each binary. Nothing enforces a
+  global budget.
+- The waits are hard wall-clock deadlines — `FIXTURE_DAEMON_DIAGNOSTIC_DEADLINE`
+  is `Duration::from_secs(5)` (`client.rs:20`) — on a spawned fixture, and every
+  failure message is such a deadline.
+- Isolated, the same binary is green **5/5** (`-p gascan --lib`, at both
+  `--test-threads=1` and the default), and each failing test passes 3/3 alone.
+- It is pre-existing: red on a base branch that changes zero Rust.
+
+Two things worth recording about the mechanism. The fixture "daemon" is a
+`#!/bin/sh` script (`daemon.rs:3390`), not the 41 MB binary, so an earlier
+Gatekeeper/`syspolicyd` hypothesis does not explain it — 5 s is ~500× what the
+script needs. And the wait loop never checks whether the child is still alive, so
+it cannot distinguish "slow" from "dead"; the failure reports an empty `stderr`
+either way. That diagnostic gap should be closed before or alongside any fix.
+
+**Consequence: §8 step 3 (the ruleset) must not proceed until this is fixed.** A
+required `ci / gate` over a suite with this failure rate would block merges for
+reasons unrelated to the change under review. Reducing parallelism or adding
+retries would hide it rather than fix it, which this project's conventions forbid,
+so the fix needs its own scoped task — most likely closing the child-death
+diagnostic gap, then deciding between a global test-parallelism budget and
+deadlines that bound hangs rather than racing load.
+
+## 12. Explicitly out of scope
 
 - **`workspace-bundles.yml`.** 459 lines that have never executed once, triggered
   only by pushes to `feature/provisioning` (§3.1). A latent liability deserving its
@@ -363,3 +482,4 @@ what decides it.
   cannot complete until P5.1 produces an engine binary
   (`arca-engine-pin-design.md` §2.3, §7). P2 therefore stays open after P2.1.
 - **Caching.** D8, deliberately.
+- **The flaky test suite.** §11.7 root-causes it; fixing it is its own task and gates the ruleset.
