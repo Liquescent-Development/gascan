@@ -3436,8 +3436,7 @@ mod tests {
         };
 
         let mut monitor = DaemonSpawner::spawn(&crate::client::TokioDaemonSpawner, &launch)?;
-        let deadline =
-            tokio::time::Instant::now() + crate::client::FIXTURE_DAEMON_DIAGNOSTIC_DEADLINE;
+        let deadline = tokio::time::Instant::now() + crate::client::FIXTURE_DAEMON_HANG_CEILING;
         let error = loop {
             if let Some(error) = monitor.controller_error()? {
                 break error;
@@ -3462,7 +3461,7 @@ mod tests {
                 let replacement = fs::read(&startup_path).unwrap_or_default();
                 return Err(format!(
                     "fixture daemon was still running but had not written its inherited diagnostic within {:?}: stderr={stderr:?}, replacement={replacement:?}",
-                    crate::client::FIXTURE_DAEMON_DIAGNOSTIC_DEADLINE
+                    crate::client::FIXTURE_DAEMON_HANG_CEILING
                 )
                 .into());
             }
