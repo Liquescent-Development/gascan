@@ -1131,3 +1131,372 @@ lints in CI.
 
 `ci / gate` has never been green, so **do not add the ruleset yet** — never require a
 check that has not passed.
+
+## Session of 2026-08-06 (later) — Task B closed, `ci / gate` green once, Task C partly
+
+> ~~`ci / gate` has never been green, so **do not add the ruleset yet**.~~
+> **Superseded.** `ci / gate` reported **success** on run `31121170624`, head `64ee3ee`:
+> `changes`, `rust`, `contracts` and `engine` all success. That is the first green gate,
+> so the "never require a check that has never passed" bar is now met. The ruleset is
+> still **off**, for the different reason recorded under Task C below.
+
+### Task B — closed, VERIFIED on a hosted runner
+
+Two distinct root causes, both the predicted ambient-environment shape.
+
+1. **`signal` rc=1 — the contract required Gas Can to be installed on the host.**
+   `signal-contract.sh` overrode only `GASCAN_RELEASE_GASCAN`, while
+   `release-smoke.sh:48-50` resolves three binaries and lines 51-54 exit **69** if any is
+   not executable. This Mac has all three under `/usr/local/bin` (4.9M / 8.2M / 28.4M,
+   mode 755), so the two unset ones silently resolved to a real install. Reproduced
+   exactly before changing anything: with `GASCAN_RELEASE_GASCAND=/nonexistent/gascand`,
+   `release-smoke.sh` exits **69** with `installed gascand is unavailable` — the runner's
+   output verbatim. Fixed by pinning all three seams the script already publishes and
+   already allowlists (`release-smoke.sh:10-12`); `/usr/bin/true` is faithful because
+   `gascan_release_test_signal` runs at line 404, after the traps at 402-403 and before
+   `gascan_release_preflight_daemon` at 405, so none of the three is ever executed
+   (`5564566`).
+
+2. **`distributable-package` rc=65 and `publish` rc=1 — one cause.** The allowlist
+   hardcoded 23 entries: twelve real paths plus eleven AppleDouble `._` records. Those
+   records belong to the **build host**. VERIFIED locally: a file created under `TMPDIR`
+   carries `com.apple.provenance` and `pkgbuild` emits the paired form; the xattr
+   **cannot be stripped** — `xattr -c` and `xattr -rc` both exit 0 and it survives — so
+   normalising at build time is not available. The runner's payload listed 12 entries
+   with no records. The gate now holds the twelve canonical paths, derives the pairing
+   from them with `sed` so the two cannot drift, and accepts either representation but
+   only in full: a partial set or an unpaired record is still a rejection (`64ee3ee`).
+   `verify-package.sh:29-33` carried the same host-dependence latently and would have
+   rejected any package built off a developer Mac; it now accepts either and requires the
+   whole payload to agree on one.
+
+VERIFIED on the runner: run `31121170624`, job `92688788633` —
+`ci-run-release-contracts: 15 contract(s), status=0`.
+
+Also fixed while in the file: `signal-contract.sh`'s two cleanup assertions **could not
+fail**. A `!`-prefixed command is exempt from errexit, so `! compgen -G ...` returned 1
+on leftovers and the script carried on to print PASS. Demonstrated with a planted
+leftover: the bare form exits 0, the replacement exits 1.
+
+### Task C — the diagnostic gap is closed; the suite is not fixed
+
+**Closed the gap first, as instructed.** `TokioDaemonSpawner::spawn` ended with
+`let _child = command.spawn()?` and `DaemonStartupMonitor` carried only a file and an
+owner token, so liveness was unobservable *by construction* — the gap was missing
+plumbing, not a bug in the loops. The monitor now optionally retains the child and
+exposes `exited()`; both wait loops check for death before the clock and report the exit
+status, each re-reading its diagnostic first because these fixtures write and then exit
+(`50029ae`). Mutation-verified: without the child retained the new test fails at 5.01s,
+with it 0.16s.
+
+`FIXTURE_DAEMON_DIAGNOSTIC_DEADLINE` became `FIXTURE_DAEMON_HANG_CEILING` at 60s
+(`e8519ea`), and the same treatment reached the rest of the family (`bc89c56`).
+
+**The family is three kinds of site, not one**, which is why "fix the flaky suite" kept
+sprawling:
+
+| Kind | Sites | Treatment |
+|---|---|---|
+| Incidental setup/teardown waits — the clock is not the property | 2 in `crates/gascan`; `autostart.rs` 167, 286, 327, 536 | liveness + hang-only ceiling |
+| Relational bounds — the *relation* is the property | `ssh_config.rs` readiness policy (3 uses) | name once, scale together |
+| **Absolute latency assertions — the elapsed time IS the property** | `autostart.rs:767` only | **unsolved** |
+
+The third kind is the open design question: `assert!(started.elapsed() < 2s)` cannot be
+relaxed without deleting the test, and a required check cannot host an absolute-latency
+assertion on a runner whose load is not ours. It needs an answer and does not have one.
+
+### The measurement lesson, which cost most of the session
+
+**Do not trust `ps -o pcpu` as a current CPU reading.** It is a decaying, lifetime-
+weighted average. It was read as live usage and produced a confident, wrong claim that
+two desktop applications were consuming ~190% CPU; an instantaneous `top -l 2` showed
+nothing of the sort.
+
+What *is* VERIFIED is that this machine's exec latency for a freshly written
+`#!/bin/sh` script moved across the session: **0.155s**, then **2.304s**, then
+**0.187s** — and earlier in the day, ~**30s** with a warm second exec of the same file
+at 0.015s. `explicit_state_path_bypasses_default_migration` failed **0/3** in isolation
+during the slow window and passed **5/5** once it cleared, and it failed identically at
+`64ee3ee`, before any of this branch's Rust changes, so it is the host and not a
+regression.
+
+**Consequence: the flake rates measured locally this session — 2/6, 4/6, 7/8 — are not
+comparable to each other** and no claim is made from them. They were taken on an
+instrument that was drifting. CI is the arbiter for whether the fixes moved the rate.
+
+### Two things still open, honestly
+
+- **The publish-window race is UNCONFIRMED.** Reading the code, `gascand` creates its
+  instance record inert at mode `0200`, writes it, and publishes by `fchmod`-ing to
+  `0600` (`gascand/src/socket.rs:246-305`), so the mode change *is* the commit. A reader
+  during that window sees `0200`, and `validate_file_stat` demands `0600`, and the
+  readiness loop (`daemon.rs:1244-1270`) treats that `Unsafe` as **terminal** although it
+  already retries two other transient `Unsafe` cases. That is a coherent story for the
+  one observed `state Unsafe` failure — but it did **not** reproduce in 6 full-workspace
+  runs, so it is a hypothesis. Per this project's own hard-won lesson, it was not fixed
+  on that evidence. `validate_file_stat` now names which of its four conditions fired and
+  carries the observed mode, links and uid, so the next occurrence answers the question.
+- **The `ssh-keygen` rejection**, seen once. `SshError::KeygenRejected` carried nothing
+  and the exit status lived only in a `#[cfg(test)]` `eprintln!` that cannot reach a
+  `gascand` spawned as a real binary by an e2e test. It now carries a `KeygenOutcome`
+  distinguishing an exit code, death by signal, and no status at all (`83ee5bf`).
+
+**Three diagnostics this session existed but could not reach the path that failed** — the
+wait loop's empty stderr, one message covering four file faults, and this. Each cost an
+investigation the message should have ended.
+
+### `ci.yml` is not on `main` yet, and that reorders the plan
+
+**VERIFIED.** `git ls-tree --name-only origin/main .github/workflows/` lists only
+`engine-pin.yml` and `workspace-bundles.yml`. `ci.yml` exists **only** on
+`ci/p2-1-pipeline`. Two consequences the plan did not account for:
+
+- **Task 6 Step 7 cannot run before #48 merges.** It asks for a docs-only PR to prove
+  `ci / gate` goes green with `rust` and `engine` **skipped** — the case that proves the
+  whole topology. PR #50 is exactly that PR, but it branches from `main`, so it carries
+  no `ci` workflow and reports no checks at all. That is correct behaviour, not a
+  failure. The step has to follow the merge, not precede it.
+- **Merging #48 deletes `engine-pin.yml` from `main`**, because the pipeline branch folds
+  that build in as the `engine` job. That is the design (spec §5.1) and the job has been
+  green on real runners, but it is worth knowing the standalone workflow disappears at
+  the same moment.
+
+### GitHub Actions stopped triggering
+
+Runs for `bc89c56`, `83ee5bf` and `8ded364` were **never created** — `gh pr view 48` shows the head
+moving and `statusCheckRollup` empty. Actions is enabled (`allowed_actions: all`) and the
+`ci` workflow is `active`; the repo is public and org-owned, so this is not minutes
+exhaustion. Earlier runs in the same window were queued and then cancelled without
+runners ever being assigned (`31124221354`, `31124719097`). Treat as GitHub-side and
+retry; it is not a configuration fault in the tree.
+
+> **Confirmed, not just suspected** — see "The Actions outage, named" in the next
+> session's section below. This diagnosis was right; it now has an anchor.
+
+### PR state at handover
+
+| PR | State | Notes |
+|---|---|---|
+| #46 | **MERGED** `29318c3` | spec + plan |
+| #47 | **MERGED** `d5cb601` | born-red PTY test fix |
+| #48 | **OPEN**, head `8ded364` | the pipeline, plus Tasks B and C; `origin/main` merged in |
+| #49 | **MERGED** `e6ef8c0` | the previous handoff |
+| #50 | **OPEN** | this record: roadmap + handoff, docs only. Doubles as Task 6 Step 7 **once `ci.yml` is on `main`** |
+
+**The ruleset is still off.** The gate has gone green once, so requiring it is now
+permitted — but the suite still fails intermittently, the third category of timing site
+has no answer, and the last three commits have no CI result at all. Decide it on CI's
+observed rate, not on this machine's.
+
+### Order of operations for whoever picks this up
+
+1. Confirm `ci / gate` on `8ded364` once Actions is creating runs again. Anchor the claim
+   to that run ID; every push re-triggers CI, so a gate claim without a run ID is worth
+   nothing.
+2. Merge #48 with `--merge`. That puts `ci.yml` on `main` and removes `engine-pin.yml`.
+3. **Then** Task 6 Step 7 becomes possible: PR #50 should go green with `rust` and
+   `engine` reporting `skipped`. Until step 2, #50 legitimately has no checks.
+4. Merge #50.
+5. Only then the ruleset (plan Task 8), and only if CI's own flake rate justifies it.
+   Require `ci / gate`; set `allowed_merge_methods` to `["merge"]`; then confirm it
+   actually blocks by checking `mergeStateStatus` is `BLOCKED` on a red PR. A ruleset
+   that does not block is not enforcement.
+
+### Closing thoughts, 2026-08-06 (later)
+
+**The pipeline kept paying for itself.** Task B was two contracts that had never been
+run anywhere but a developer Mac, and both encoded that Mac's peculiarities as the
+definition of correctness: one required Gas Can to be *installed*, the other required
+the build host to attach `com.apple.provenance`. Neither is a subtle bug. Both were
+invisible because nothing had ever executed them elsewhere. That is now three
+categories of defect the gate has surfaced before it was ever required.
+
+**Diagnostics are the deliverable more often than fixes are.** Three separate times this
+session a diagnostic existed but could not reach the path that failed: a wait loop
+reporting an empty stderr whether the child was slow or dead; one message covering four
+distinct file faults; an `ssh-keygen` exit status locked behind `#[cfg(test)]` in a
+binary that end-to-end tests spawn for real. Each cost an investigation that the message
+itself should have ended in one line. When something is hard to diagnose, the first move
+is usually to make it say more, not to guess better.
+
+**My worst habit this session was trusting an instrument I had not checked.** I measured
+flake rates across three arms and reported them as if comparable, while the machine
+underneath moved by more than an order of magnitude — freshly-written-script exec
+latency went 0.155s, 2.304s, 0.187s, and ~30s earlier in the day. Then I explained the
+resulting numbers with a confident claim about two applications' CPU use that came from
+misreading `ps -o pcpu`, which is a lifetime-weighted average rather than a current
+sample; `top -l 2` showed neither process among the top eight. The lesson is the same one
+this project already learned three times with warm caches, wearing new clothes: **before
+trusting a number, ask what the tool was actually measuring.** Two of my conclusions had
+to be withdrawn for exactly this reason, and both withdrawals are recorded above rather
+than edited away.
+
+**What I deliberately did not do.** The publish-window race is a coherent, code-anchored
+story for a failure seen once, and it did not reproduce in six attempts, so it stays a
+hypothesis and the code stays unchanged. This project has been bitten before by a theory
+that explained a non-reproduction too comfortably. The sharpened `validate_file_stat`
+message means the next occurrence will simply say which condition fired, which is worth
+more than a fix aimed at a guess.
+
+**The one genuinely unsolved thing** is the third category of timing site:
+`autostart.rs:767`, where `assert!(started.elapsed() < 2s)` *is* the property under test.
+Condition-based waiting cannot help, because there is no condition to wait for — the
+claim is about elapsed time itself. A required check on a shared runner cannot host that
+assertion honestly, and neither relaxing it nor deleting it is obviously right. It wants
+a design decision, not a patch.
+
+## Session of 2026-08-06 (evening) — blocked by a GitHub incident, not by the tree
+
+### The Actions outage, named
+
+**VERIFIED.** `githubstatus.com/api/v2/summary.json`, fetched `2026-08-06T21:36Z`:
+GitHub Actions is in `major_outage`. Incident "Incident with Actions", started
+**`2026-08-06T15:22:49Z`**, status `Investigating`, impact critical. Its own wording:
+*"Webhook triggers remain throttled, preventing many push and pull request events from
+triggering workflow runs"*, with **~15% of webhooks processing** and runners *"being
+assigned invalid jobs"*.
+
+Corroborated inside this repository:
+
+- `gh api repos/:owner/:repo/commits/8ded364/check-runs` → `total_count: 0`. The head of
+  #48 has **no checks at all**, so step 1 is not merely unconfirmed, it is unanswerable.
+- `gh api repos/:owner/:repo/actions/runs/31124719097` → `run_attempt: 2`,
+  `created_at 17:59:14Z`, `run_started_at 19:42:46Z`, `updated_at 20:42:53Z`. It was
+  picked up **1h43m** after creation and then burned exactly **60 minutes** to its
+  timeout with every job `cancelled`. That is the incident's "invalid jobs", not a fault
+  in `ci.yml`.
+- `gh api "repos/:owner/:repo/actions/runs?per_page=5"` at `21:36Z`: the newest run in
+  the repository is still `31124719097` from `17:59:14Z`. **No run of any workflow has
+  been created here in 3h37m.**
+
+The preceding section's call — GitHub-side, not a configuration fault in the tree — was
+correct, and now carries an anchor instead of an inference.
+
+**Trigger attempt.** #48 was closed and reopened at `21:37:57Z`. `ci.yml` declares a bare
+`on: pull_request`, so the default activity types apply and `reopened` is a valid
+trigger; a push would have worked too but would have moved the head and cost the
+`8ded364` anchor, which step 1 exists to establish. Head verified unchanged at
+`8ded364866f3b275fa7964219ed7e316c109a556` afterwards. Whether the webhook survives the
+throttle is the open question.
+
+**Nothing was merged.** The order of operations is load-bearing precisely because step 1
+gates it, and step 1 has no evidence. Merging #48 on the strength of run `31121170624`
+would be anchoring a green to a *different tree*: `64ee3ee` predates `3b04633`,
+`e8519ea`, `bc89c56`, `83ee5bf` and the `origin/main` merge, i.e. all of Task C's changes
+and the ssh-keygen diagnostic.
+
+### `autostart.rs:767` is misclassified, and that changes the answer
+
+Line numbers below are `git show ci/p2-1-pipeline:crates/gascan-e2e/tests/autostart.rs`.
+The taxonomy filed `accepted_socket_without_http2_cannot_block_initial_probe` (`762-803`)
+under *"absolute latency assertions — the elapsed time IS the property"*. Reading the
+whole test, that is not what the 2s is:
+
+- `775` — the holder thread accepts, unlinks the socket, then sleeps **3s** before
+  dropping the stream.
+- `785`, `798` — the deadline and the assertion are both **2s**.
+
+The 3s and the 2s are **coupled**. If the initial probe blocked on an accepted-but-mute
+socket it could not finish before the peer let go at 3s, so `< 2s` is a discriminator
+against the hold, not a performance budget. Had 2s been an absolute latency requirement,
+the holder's 3s would be arbitrary — it is not. **This is a category-2 relational bound
+with the relation left unnamed**, the same shape as the `ssh_config.rs` readiness policy
+that was already given the "name once, scale together" treatment.
+
+That reclassification is not the whole answer, because of a second defect that scaling
+alone does not fix:
+
+- `783-786` — `started` is taken **before** `spawn()`, so the measured interval
+  **includes process-spawn latency**. That is exactly the quantity this machine was
+  measured swinging `0.155s → 2.304s → 0.187s` within one session. Spawn alone can
+  exhaust the entire 2s budget while the probe behaves perfectly. **The clock starts on
+  the wrong event.**
+
+Three options, ranked, none of them applied — this is the design decision the previous
+session flagged and it is still the maintainer's:
+
+1. **Start the clock at the accept, inside the holder thread, and name the relation.**
+   The peer releases at `t_accept + HOLD`; assert the CLI finished before some fraction
+   of `HOLD` measured from `t_accept`. Spawn latency is excluded *by construction* rather
+   than by tolerance, and the two constants stop being able to drift apart. Residual
+   risk: whatever the CLI does *after* abandoning the probe (the socket has been
+   unlinked, so plausibly an autostart) is still inside the measured window.
+2. **Make the probe's outcome observable and drop the wall clock entirely.** If the CLI
+   emitted a structured event on abandoning the probe, the test could assert *ordering* —
+   abandoned before the peer released — with no duration in it at all. This is the
+   project's own "make it say more rather than guess better" principle applied to a
+   timing test, and it is the only option that a shared runner can host honestly.
+3. **Scale both constants together under one load multiplier.** Cheapest, preserves the
+   discriminator, but keeps spawn latency inside the measurement and so only widens the
+   window in which this machine can still lose.
+
+**PLAN, not VERIFIED**: options 1-3 are reasoning from the source, and nothing was run.
+The line citations and the two constants are facts of the file.
+
+### `autostart.rs` — the vacuous pass is a soundness bug with a mechanical fix
+
+`daemon_attest_rejects_a_symlink_without_sending_protocol_bytes` (`806-862`) fails
+**open**. Both of its reader-thread timeouts yield an empty buffer — `826` returns
+`Ok(Vec::new())` when nothing ever connects within 1s, and `841` breaks with `read = 0`
+when nothing is sent within 1s — and the assertion at `857-860` is that the buffer **is
+empty**. A machine slow enough that `daemon-attest` has not connected inside 1s makes the
+test pass **without ever observing the behaviour under test**.
+
+Unlike `762-803`, this needs no design decision, because a real condition is available.
+`852` calls `.output()`, which **waits for the CLI to exit**. Once it has exited it can
+no longer send bytes, so "no connection ever arrived" becomes *conclusive* rather than
+ambiguous. Waiting on process exit instead of a 1s wall clock separates the two cases the
+current code conflates:
+
+| Observation | Today | Should be |
+|---|---|---|
+| CLI exited, never connected | passes (empty) | **passes** — refusing to connect is the strongest possible correct behaviour |
+| CLI exited, connected, sent nothing | passes (empty) | passes |
+| CLI exited, connected, sent bytes | fails | fails |
+| CLI still running, deadline expired | **passes (vacuous)** | **cannot occur** — the wait is on exit |
+
+Not fixed here, and deliberately so: the fix belongs in a test file that #48 already
+touches, and committing to `ci/p2-1-pipeline` right now would move the head off
+`8ded364` and destroy the anchor step 1 is waiting on. It is the first thing to do after
+#48 merges.
+
+### Task 8's plan is written against a repository state that no longer holds
+
+Two corrections, both found while preparing Task 8 read-only during the outage. Neither
+was applied — the ruleset is still step 5 and steps 1-4 are not done.
+
+**1. `rulesets` is not `[]`.** Task 8 Step 1 expects it to be, and Step 2 `POST`s a *new*
+ruleset. **VERIFIED** `gh api repos/:owner/:repo/rulesets/20492137`: a ruleset named
+**`main protection`** (id `20492137`) has been `active` since `2026-08-05T21:47:45-07:00`,
+carrying `deletion`, `non_fast_forward`, `required_signatures`, and a `pull_request` rule
+with `required_approving_review_count: 0` and
+`allowed_merge_methods: ["merge", "squash", "rebase"]`. It has **no**
+`required_status_checks`, so "the ruleset is still off" was right about the *gate* while
+protection itself was already on.
+
+`POST`ing a second ruleset over the same `~DEFAULT_BRANCH` would leave merge-method
+policy stated in two places and make the effective behaviour depend on how GitHub
+combines overlapping rulesets. **`PATCH` the existing one instead** — one ruleset, one
+place, no union semantics to reason about. `PATCH` replaces the `rules` array wholesale,
+so the payload must restate the three rules being kept.
+
+**2. The required context is `gate`, not `ci / gate`.** Task 8 Step 2 specifies
+`context=ci / gate`. **VERIFIED** `gh api repos/:owner/:repo/commits/64ee3ee/check-runs`:
+the check runs are named `gate`, `contracts`, `engine`, `rust`, `runtime-probe`,
+`changes` — **bare job names** — all from app `github-actions`, `id 15368`. `ci / gate`
+is the UI's *display* form, `workflow / job`. Requiring the literal string `ci / gate`
+would require a check that never reports, and GitHub would hold it pending forever. That
+is the same failure this project already documented for workflow-level `paths:` filters,
+arriving by a different door. Pin `integration_id: 15368` so the requirement cannot be
+satisfied by a same-named check from another app.
+
+The corrected payload is prepared but **not applied**.
+
+**3. A consequence worth weighing before step 5.** The existing ruleset has
+`bypass_actors: []` and reports `current_user_can_bypass: "never"`. Adding
+`required_status_checks` to it therefore creates enforcement with **no override for
+anyone, including the maintainer**. Given that the suite is still intermittently red and
+`autostart.rs`'s category-3 site has no answer, a flaky `gate` would not merely be noisy
+— it would be unbypassable. Either accept that, or add a deliberate `bypass_actors`
+entry as part of the same change rather than discovering the need during an incident.
+That is a maintainer's call and is recorded here rather than made.
