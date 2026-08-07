@@ -2523,7 +2523,7 @@ Everything the previous session listed remains open and is not restated here,
 
 | | |
 |---|---|
-| arca `main` | `b705b9c` after arca#54 merged; the tag is at `77b293e`, one merge behind, deliberately |
+| arca `main` | moves independently of the pin — verify it. The tag stays at `77b293e` and is deliberately BEHIND `main`: arca#54 and arca#55 both landed after it and neither touches the engine contract, so neither warrants a bump. Do not count the gap; it grows. |
 | arca tag | `gascan-engine-proto-v1` → commit `77b293e`, tag object `35d2196` |
 | gascan pin | tag `gascan-engine-proto-v1`, revision `77b293edd1369c60100045183245ae091f71c39e` |
 
