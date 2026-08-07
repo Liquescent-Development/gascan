@@ -2294,16 +2294,24 @@ still standing would have drawn a false conclusion about where the work ended up
 
 | | |
 |---|---|
-| gascan `main` | `6e5cc7d` |
+| gascan `main` | `920c225` — see the caveat below |
 | arca `main` | `a974f17` |
 
-Three PRs landed, each a true merge commit:
+**A document cannot record the SHA of the commit that records it.** `6e5cc7d` was
+written here, then #61 merged and made it `920c225`, and writing `920c225` moves it
+again. The arca figure is stable because nothing further landed there. **Verify gascan's
+with `git log --oneline -1`; treat any SHA written here as the last content-bearing
+merge, not as the tip.** This is recorded once so the next person does not spend a
+round chasing it, as this session did twice.
+
+Four PRs landed, each a true merge commit:
 
 | PR | Contents | Merge commit |
 |---|---|---|
 | **arca#52** | `proto/arca/engine/v1/engine.proto` — the artifact | `a974f17` |
 | **gascan#59** | Design doc, roadmap, two in-place corrections, this session record | `042a281` |
 | **gascan#60** | Kickoff refreshed to P3.2, with the pin blocker named | `6e5cc7d` |
+| **gascan#61** | Session close; the superseded handover block struck through | `920c225` |
 
 `Vas-Solutus/arca#50` remains open. It is the deliberately-unfixed broadcast-allocation
 issue, not a PR.
