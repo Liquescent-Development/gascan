@@ -1610,3 +1610,46 @@ this project.
 - **The `ssh-keygen` rejection** — `KeygenOutcome` in place, awaiting a recurrence.
 - **`autostart.rs:802`'s vacuous pass** — analysed in the previous section; the fix is
   mechanical (wait on process exit, not a 1s wall clock) and was **not** applied.
+
+### The `ssh-keygen` rejection is narrowed to one invocation — 2026-08-06 (night)
+
+Last session's `KeygenOutcome` instrumentation paid off twice tonight, and the answer is
+**not** where the previous note assumed. **VERIFIED** by running the real binary:
+
+| Invocation (`env -i /usr/bin/ssh-keygen …`) | Exit |
+|---|---|
+| `-y -f /dev/null` → `Load key "/dev/null": invalid format` | **255** |
+| `-y -f /dev/fd/9` (descriptor absent) → `Bad file descriptor` | **255** |
+| `-y -f <valid key>` (control) | 0 |
+| `-q -t ed25519 -N "" -C gascan-managed -f <fresh path>` (control) | 0 |
+| same, target already exists → `Overwrite (y/n)?` then EOF | 1 |
+| same, parent directory missing → `Saving key … failed` | 1 |
+
+**255 is an argument/usage rejection, not a filesystem error** — the generate path's
+failures exit **1**. So `KeygenRejected(Code(255))` (`identity.rs:424`) can only be the
+**public-key derivation** at `identity.rs:275-293`, `ssh-keygen -y -f /dev/fd/<N>`, which
+reads the private key through a descriptor duplicated by
+`rustix::io::fcntl_dupfd_cloexec(private_file, 3)` and mapped in with `fd_mappings`. The
+generate call at `identity.rs:164` is excluded by its own exit codes.
+
+Two candidate causes remain, and both fit a failure that only appears under load:
+
+1. **The descriptor never reached the child** — `Bad file descriptor`. The dup targets
+   the lowest free fd **≥ 3**, and fd numbers are process-global, so under a
+   multithreaded tokio runtime with concurrent spawns fd 3 is contended.
+2. **The child read the wrong bytes** — `invalid format`.
+
+**They are distinguished by a single line of stderr, which the error throws away.**
+`run_configured_ssh_keygen` keeps only a `Sha256` of stderr behind `#[cfg(test)]`
+(`identity.rs:407-414`), which cannot reach a `gascand` spawned as a real binary — the
+same gap `KeygenOutcome` was created to close, one level further in. **Next step: carry a
+bounded, redacted stderr prefix (or at minimum discriminate those two known messages) in
+`KeygenOutcome`.** That single line decides between the two hypotheses; guessing between
+them without it would repeat the mistake this project has already paid for twice.
+
+**Reproduced locally**, so this one is not CI-only:
+`cargo test --workspace` on `main` + both open PRs gave **1078 passed, 1 failed, 22
+ignored** across 47 binaries, the failure being
+`ssh_image_apply_preserves_fingerprints_while_accepting_new_inspected_automatic_port`
+with `SshConfigUnsafe(KeygenRejected(Code(255)))` — the same error CI hit in run
+`31136420663`.
