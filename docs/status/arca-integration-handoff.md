@@ -1500,3 +1500,156 @@ anyone, including the maintainer**. Given that the suite is still intermittently
 — it would be unbypassable. Either accept that, or add a deliberate `bypass_actors`
 entry as part of the same change rather than discovering the need during an incident.
 That is a maintainer's call and is recorded here rather than made.
+
+## Session of 2026-08-06 (night) — the sequence completed; `ci / gate` is required
+
+All five steps of the previous handoff's order of operations are done. Every claim below
+carries its run ID, SHA or API response.
+
+### What landed
+
+| Step | Result | Anchor |
+|---|---|---|
+| 1. `gate` green on `8ded364` | **VERIFIED** | run `31129682364`, `gate` job `92717021965` = `success` |
+| 2. Merge #48 `--merge` | **VERIFIED** | `c87787cca1b0d9f617e9e58ec74a989b7336a029`, parents `e6ef8c0` + `8ded364` |
+| 3. Task 6 Step 7 (skipped topology) | **VERIFIED** | run `31131481000`: `gate` `success`, `rust` **skipped**, `engine` **skipped** |
+| 4. Merge #50 | **VERIFIED** | `4852b04786404cb2e6d2fd0e5ee4a22398e7325a`, two parents |
+| 5. Task 8 ruleset + enforcement | **VERIFIED** | run `31134223492`, `gate` job `92729989072` = `failure`, `mergeStateStatus: BLOCKED` |
+
+`ci.yml` is on `main` and `engine-pin.yml` is gone (`git cat-file -e origin/main:.github/workflows/engine-pin.yml` fails). Both directions of the gate are now proven on real runners: green with every job running (`31129682364`), green with `rust` and `engine` `skipped` (`31131481000`), and red propagating (`31134223492`).
+
+### The ruleset, as actually applied
+
+Ruleset `20492137` (`main protection`) was **`PUT`**, not `POST`ed — no second ruleset
+was created. **The endpoint is `PUT`; `PATCH` returns 404.** That cost one round trip.
+
+Final state, from the API's own response: `required_status_checks` =
+`[{"context": "gate", "integration_id": 15368}]`, `strict_required_status_checks_policy:
+false`; `pull_request.allowed_merge_methods` = `["merge"]`; `deletion`,
+`non_fast_forward` and `required_signatures` preserved; `enforcement: active`.
+
+**`bypass_actors`** = `[{"actor_type": "OrganizationAdmin", "bypass_mode": "always"}]`,
+added *after* the blocking proof, deliberately. Had it gone on first, a red PR might have
+reported mergeable **to me**, and "bypass works" would have been indistinguishable from
+"enforcement is broken". Applying it bare, proving `BLOCKED`, then granting bypass keeps
+the two claims independent. GitHub normalises `actor_id` to `null` for this actor type.
+
+> **Correction, recorded in place.** I predicted #51's `mergeStateStatus` would change
+> once the bypass landed. **It did not** — it stayed `BLOCKED` while
+> `current_user_can_bypass` went `"never"` → `"always"`. `mergeStateStatus` reports the
+> *branch policy* and is viewer-independent; it does not account for who may override.
+> **Practical consequence: `gh pr view` and the web UI will keep saying `BLOCKED` on a
+> flaky PR even though an org admin can merge it.** `BLOCKED` is not evidence the bypass
+> is missing — `current_user_can_bypass` is the signal that answers that question.
+
+The override was **not** tested by merging #51, which deliberately broke `cargo fmt`;
+proving an API-stated fact by putting broken formatting on `main` is not worth it. #51 is
+`CLOSED` and its branch deleted.
+
+### The flake is real on CI, and it is not event-dependent
+
+**VERIFIED, and this is the strongest evidence the project has.** `8ded364` and
+`c87787c` have the **same tree hash**, `2c7de3044efbb8c05c9864feb1d0ad7b1031f01d`
+(`git rev-parse <sha>^{tree}`). The PR run checked out `refs/pull/48/merge`, whose tree
+equals `8ded364`'s because `e6ef8c0` is a direct parent. Same content, no caching (D8),
+same pinned toolchain, both `macos-26`, 18 minutes apart:
+
+| Run | Commit | Event | `rust` |
+|---|---|---|---|
+| `31129682364` | `8ded364` | pull_request | success |
+| `31130737502` | `c87787c` | push | **failure** |
+| `31131820848` | `4852b04` | push | success |
+
+**1 failure in 3.** No rate is claimed from n=3 — what is established is that it is
+**non-zero on CI**, on identical input, which no local measurement could have shown.
+
+**A push/pull_request divergence was hypothesised and ruled out.** `ci.yml` contains
+exactly five `if:` conditions (lines 38, 64, 79, 97, 113). Only two behaviours depend on
+the event: `runtime-probe` is PR-only (`ci.yml:97` — which fully explains its `skipped`
+on push versus `failure` on pull_request), and `ci-detect-changes.sh` forces all three
+areas true on non-PR events because a push has no reliable base. Neither touches the
+`rust` job's body, which contains **zero** conditionals. The same code ran the same way
+and diverged.
+
+**Maintainer's decision:** accept the flakiness for now, re-run flaky jobs, and keep
+watching for the cause. The `OrganizationAdmin` bypass exists so a flake — or another
+Actions outage in which no run can even be created — cannot wedge the repository.
+
+### The failure named a new site, and it said nothing
+
+`autostart.rs` passed **16/16** in the failing run, including
+`accepted_socket_without_http2_cannot_block_initial_probe` and
+`explicit_state_path_bypasses_default_migration`. Task C's fixes are holding. The failure
+was `doctor_human_output_names_each_check` at `doctor.rs:763:5` — and it printed an
+**empty message**, because the assertion's message was the child's `stderr` while
+human-mode `doctor` writes its report to **stdout**.
+
+Four of the six sites in that file already reported status, stdout and stderr; two had
+drifted onto the bare-`stderr` form, and one of those is the site that failed. All six
+are now consolidated onto one `describe_output` helper (`947a058`), which also names the
+exit status — `ExitStatus`'s `Debug` prints a plain exit code 1 as
+`unix_wait_status(256)`.
+
+**Mutation-verified**, not merely compiled: with the assertion forced false, the message
+is now `exit code 0, stdout=Gascan is ready\n  Host  2/2 checks passed…, stderr=`. The
+identical failure previously printed nothing. `cargo fmt --all --check` rc=0,
+`cargo clippy --workspace --all-targets -- -D warnings` rc=0,
+`cargo test -p gascan-e2e --test doctor` **11 passed** (full module path, so the
+silent-zero-tests trap does not apply).
+
+That is the **fourth** time this session's family of work has hit "a diagnostic existed
+but could not reach the path that failed". It remains the highest-yield class of fix in
+this project.
+
+### Still open, unchanged
+
+- **`autostart.rs:767`** — reclassified above as a relational bound whose clock starts
+  before `spawn()`. Three options are written up; **the design decision is still open**.
+- **The publish-window race** — still a hypothesis, still not fixed, `validate_file_stat`
+  still sharpened for the next occurrence.
+- **The `ssh-keygen` rejection** — `KeygenOutcome` in place, awaiting a recurrence.
+- **`autostart.rs:802`'s vacuous pass** — analysed in the previous section; the fix is
+  mechanical (wait on process exit, not a 1s wall clock) and was **not** applied.
+
+### The `ssh-keygen` rejection is narrowed to one invocation — 2026-08-06 (night)
+
+Last session's `KeygenOutcome` instrumentation paid off twice tonight, and the answer is
+**not** where the previous note assumed. **VERIFIED** by running the real binary:
+
+| Invocation (`env -i /usr/bin/ssh-keygen …`) | Exit |
+|---|---|
+| `-y -f /dev/null` → `Load key "/dev/null": invalid format` | **255** |
+| `-y -f /dev/fd/9` (descriptor absent) → `Bad file descriptor` | **255** |
+| `-y -f <valid key>` (control) | 0 |
+| `-q -t ed25519 -N "" -C gascan-managed -f <fresh path>` (control) | 0 |
+| same, target already exists → `Overwrite (y/n)?` then EOF | 1 |
+| same, parent directory missing → `Saving key … failed` | 1 |
+
+**255 is an argument/usage rejection, not a filesystem error** — the generate path's
+failures exit **1**. So `KeygenRejected(Code(255))` (`identity.rs:424`) can only be the
+**public-key derivation** at `identity.rs:275-293`, `ssh-keygen -y -f /dev/fd/<N>`, which
+reads the private key through a descriptor duplicated by
+`rustix::io::fcntl_dupfd_cloexec(private_file, 3)` and mapped in with `fd_mappings`. The
+generate call at `identity.rs:164` is excluded by its own exit codes.
+
+Two candidate causes remain, and both fit a failure that only appears under load:
+
+1. **The descriptor never reached the child** — `Bad file descriptor`. The dup targets
+   the lowest free fd **≥ 3**, and fd numbers are process-global, so under a
+   multithreaded tokio runtime with concurrent spawns fd 3 is contended.
+2. **The child read the wrong bytes** — `invalid format`.
+
+**They are distinguished by a single line of stderr, which the error throws away.**
+`run_configured_ssh_keygen` keeps only a `Sha256` of stderr behind `#[cfg(test)]`
+(`identity.rs:407-414`), which cannot reach a `gascand` spawned as a real binary — the
+same gap `KeygenOutcome` was created to close, one level further in. **Next step: carry a
+bounded, redacted stderr prefix (or at minimum discriminate those two known messages) in
+`KeygenOutcome`.** That single line decides between the two hypotheses; guessing between
+them without it would repeat the mistake this project has already paid for twice.
+
+**Reproduced locally**, so this one is not CI-only:
+`cargo test --workspace` on `main` + both open PRs gave **1078 passed, 1 failed, 22
+ignored** across 47 binaries, the failure being
+`ssh_image_apply_preserves_fingerprints_while_accepting_new_inspected_automatic_port`
+with `SshConfigUnsafe(KeygenRejected(Code(255)))` — the same error CI hit in run
+`31136420663`.
