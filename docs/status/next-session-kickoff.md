@@ -25,7 +25,10 @@ specifically so P5.2 does not re-derive it.
 
 **STATE:**
 
-  gascan  `main` `6e5cc7d`, clean, ZERO open PRs.
+  gascan  `main` clean, ZERO open PRs. **Confirm the SHA with `git log --oneline -1`**
+          rather than trusting this line: the last content-bearing merge was `920c225`
+          (#61), and a documentation commit that records a SHA is invalidated by its
+          own merge. Do not chase it; verify it.
           Ruleset 20492137: deletion, non_fast_forward, required_signatures,
           pull_request with allowed_merge_methods ["merge"], bypass
           OrganizationAdmin. NO required_status_checks — keep it that way.
