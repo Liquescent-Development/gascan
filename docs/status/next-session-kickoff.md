@@ -7,10 +7,10 @@ Paste the block below to start the next agent. It is written to be read cold.
 Continue the Arca integration. Work happens in `~/code/gascan` and `~/code/arca`.
 
 Read `~/code/gascan/docs/status/arca-integration-handoff.md`, starting at
-"## Session of 2026-08-07 (later)" and reading to the end. Then read
-`docs/superpowers/specs/2026-08-07-arca-engine-proto-design.md` in full — it is the
-design for the file you will be generating from, and §9's type mapping exists
-specifically so P5.2 does not re-derive it.
+"## Session of 2026-08-07 (later still)" and reading to the end. Then read
+`docs/superpowers/specs/2026-08-07-arca-engine-codegen-design.md` — it describes the
+build machinery you will be extending, and its §3 explains why the Rust build reaches
+Arca the way it does, which is not obvious from the code alone.
 
 **THE GOVERNING DECISION, still binding:**
 
@@ -19,86 +19,121 @@ specifically so P5.2 does not re-derive it.
   Do not spend this session on CI stability. We make CI stable after the product
   works with Arca as a backend, not before.
 
-  Last VERIFIED green at `6f88e79`: 1377 passed, 0 failed, 22 ignored, rc=0. The
-  2026-08-07 (later) session was documentation-only and did not re-run it, so that
-  figure is carried, not re-measured. Re-measure before relying on it.
+  Last VERIFIED green: **1381 passed, 0 failed, 22 ignored, rc=0**, measured
+  2026-08-07 with `--no-fail-fast` against the bumped pin. That is the carried 1377
+  plus `gascan-engine-proto`'s 4 new tests, so the number moved for an accounted
+  reason. Re-measure before relying on it.
 
 **STATE:**
 
-  gascan  `main` clean, ZERO open PRs. **Confirm the SHA with `git log --oneline -1`**
-          rather than trusting this line: the last content-bearing merge was `920c225`
-          (#61), and a documentation commit that records a SHA is invalidated by its
-          own merge. Do not chase it; verify it.
+  gascan  `main`. **Confirm the SHA with `git log --oneline -1`** rather than
+          trusting any SHA written in the docs: a documentation commit that records
+          a tip is invalidated by its own merge. This has cost two sessions a round
+          already. Do not chase it; verify it.
           Ruleset 20492137: deletion, non_fast_forward, required_signatures,
           pull_request with allowed_merge_methods ["merge"], bypass
           OrganizationAdmin. NO required_status_checks — keep it that way.
-  arca    `main` `a974f17`, clean. **No longer untouched** — the engine proto
-          landed there 2026-08-07 (#52).
-          Pin: `engine/arca-pin.json` -> tag `gascan-engine-ip-internal`,
-          revision `d66c320c09e1dfc4f37aafa1fb27e36aa5cabe5d`. The annotated tag
-          OBJECT is `dfdf8b9`; the commit is `d66c320c`. Do not confuse them.
+  arca    `main`. Also verify.
+  Pin:    `engine/arca-pin.json` -> tag `gascan-engine-proto-v1`, revision
+          `77b293edd1369c60100045183245ae091f71c39e`. The annotated tag OBJECT is
+          `35d2196`; the commit is `77b293e`. Do not confuse them.
+          **The tag is the stable anchor** — signed, and asserted by two scripts to
+          equal the pin's revision.
   Open:   Vas-Solutus/arca#50 (broadcast-allocation defect, deliberately unfixed).
 
-**WHAT LANDED LAST SESSION: P3.1, and U4 is RESOLVED.**
+**WHAT LANDED LAST SESSION: P3.2. P3 IS COMPLETE.**
 
-  `arca/proto/arca/engine/v1/engine.proto` — package `arca.engine.v1`, service
-  `SandboxEngine`, 11 RPCs, on Arca `main`. **P4 and P5 are now unblocked**; the
-  roadmap's fan-out point is open. Nothing implements the proto and codegen is
-  wired into neither build.
+  Its exit — *proto exists, both sides generate, nothing implements it yet* — now
+  holds in all three clauses.
 
-  **The proto is a PUBLISHED CONTRACT and it is now on `main`.** Its compatibility
-  burden started at that commit. Field numbers are never reused; removals become
-  `reserved`; the major version is the package path. Changing a shipped field is
-  not a fix, it is a new package.
+  - Arca has `Sources/SandboxEngineProto/`, a target of generated server code that
+    `swift build` compiles. Nothing conforms to it.
+  - Gas Can has `crates/gascan-engine-proto`, a generated client. Nothing calls it.
+  - `scripts/sync-arca-proto.sh` reaches the proto across the signed pin at build
+    time. **The proto is NOT vendored into Gas Can and must not become vendored** —
+    a second copy of a published contract is a copy that drifts.
 
-**YOUR TASK: P3.2** — codegen wired both sides, Swift server and Rust client.
+  **The pin moved for the first time.** If you bump it again: the tag must be
+  ANNOTATED and SIGNED, never lightweight, which means the 1Password SSH agent must
+  be unlocked EARLY rather than forty minutes in. Probe it with an actual signature
+  (`ssh-keygen -Y sign`); `ssh-add -l` succeeding proves nothing.
 
-  Both generators are VERIFIED to run against the file already (design doc §12), so
-  this is wiring, not discovery. What is NOT yet known is how Gas Can's build
-  reaches the file, which is the trap below.
+**YOUR TASK: the fan-out is open. P4 and P5 both run from here.**
 
-  P3's exit is "proto exists, both sides generate, nothing implements it yet." Two
-  of three are done.
+  P3 was the fan-out point and it is now behind you. Pick with the maintainer:
 
-**THE FIRST THING THAT WILL BLOCK YOU, VERIFIED 2026-08-07:**
-
-  **The proto is ABSENT at the pinned Arca revision.** The pin resolves to
-  `d66c320c`; the proto landed later, at `89916f5`/`a974f17`.
-
-    git cat-file -e d66c320c…:proto/arca/engine/v1/engine.proto   ->   fails
-
-  So Gas Can's build cannot see `engine.proto` until Arca is re-tagged and
-  `engine/arca-pin.json` is bumped. That tag must be an ANNOTATED, SIGNED tag —
-  never lightweight — which means the 1Password SSH agent must be unlocked. See the
-  signing trap below. Decide the tag name before you start; the existing one
-  (`gascan-engine-ip-internal`) describes the change that earned it, so a new name
-  describing this one is the established pattern.
+  - **P5.2 — `gascan-arca`**, the client that implements `RuntimeBackend` over the
+    generated stubs. The type mapping is ALREADY DERIVED, in
+    `docs/superpowers/specs/2026-08-07-arca-engine-proto-design.md` §9. It exists
+    specifically so this step does not re-derive it. Read it before writing a line.
+  - **P4 — Docker removal** in Arca.
+  - **P3.3 — publish and version the proto**, which carries the `buf breaking`
+    check. Still inert: `buf` is not installed and Arca has no CI (P2.3 open). What
+    it needs is recorded rather than pretended — a checked-in `FileDescriptorSet`
+    and a `buf breaking` invocation in Arca's CI. **Note `gascan-engine-proto`
+    already exposes `FILE_DESCRIPTOR_SET`**, so half of that exists.
 
 **DO NOT:**
   - Re-enable a required status check, or work on CI stability.
-  - Redesign the proto. It is published. If you find a genuine defect in it, say so
-    and treat it as a contract change with a cost, not an edit.
-  - Resolve U5 or U6 — genuine spec gaps that belong to P5.4 and P6.3.
+  - Redesign the proto. It is published and now pinned by tag. A genuine defect in
+    it is a contract change with a cost, not an edit.
+  - Vendor the proto into Gas Can, or add a second parser of `arca-pin.json`.
+    `sync-arca-proto.sh` owns what "the pinned contract" means; `build.rs`
+    deliberately reads only its stdout.
+  - Generate a Rust **server**. Arca serves this contract. The first thing to
+    implement a Rust server would be a test double that made a wrong client look
+    correct.
+  - Resolve U5 or U6 — genuine spec gaps belonging to P5.4 and P6.3.
   - "Finish" P1. It is `partial by necessity`; its binary half is booked against
     P5.1 and P4.3.
   - Squash- or rebase-merge either repo. Commit to main. Both are forbidden.
 
-**STILL OPEN, none of it this session's task:**
+**STILL OPEN, none of it the next task:**
   - D4 — delete `runtime-probe` from `ci.yml`. Spec §7.2 says the job is temporary
     and "then deleted"; §11.5 recorded its VERIFIED answer. It is the ONLY failing
-    check on a clean docs PR (VERIFIED on #59) and makes every workflow run report
-    `conclusion: failure`. Real, but CI work.
+    check and makes every workflow run report `conclusion: failure`. Real, but CI work.
+    **It does NOT block `gate`.** VERIFIED 2026-08-07 on run `31209969877`:
+    `runtime-probe: failure` alongside `gate: success`. `gate`'s `needs` is
+    `[changes, rust, contracts, engine]` (`ci.yml:111`) and `runtime-probe` is
+    deliberately excluded, so its step name — "Require every job to have succeeded
+    or been skipped" — is broader than what it checks. D4 is noise at the run level,
+    not a blocked gate. **Also note `runtime-probe` reports `skipped` on `push` and
+    `failure` on `pull_request`**, so a green run on `main` is not evidence that D4
+    resolved itself.
   - D5 — `stash@{0}` `f6356f9` holds EXACTLY ONE file, `.superpowers/sdd/progress.md`,
     which is gitignored. No tracked content. Dropping it is the maintainer's call.
-  - D7 — how the health check should treat mode `0200`. `validate_file_stat` reports
-    the daemon's own not-yet-published record (created inert at 0200, published by
-    chmod to 0600) as "unsafe". Mechanism VERIFIED 2026-08-07; the remedy is a design
-    choice: retry, treat-as-absent, or wait. NEEDS A MAINTAINER DECISION.
+  - D7 — how the health check should treat mode `0200`. `validate_file_stat`
+    (`daemon.rs:3057`) reports a `0200` file as "unsafe" because it compares against
+    `FILE_MODE` alone. NEEDS A MAINTAINER DECISION, and **do not reach for a blanket
+    retry** — VERIFIED 2026-08-07 by reading the code, `0200` is TWO states and only
+    one of them ever resolves:
+
+      is_instance_tombstone      (daemon.rs:2708)  mode 0200, size == 0
+        an inert placeholder; publication is in flight and WILL complete
+
+      is_interrupted_tombstone   (daemon.rs:2633)  mode 0200, size > 0
+        a daemon wrote the record and died before chmod to 0600. NEVER resolves.
+
+    A blanket retry turns the second case from an immediate, diagnosable failure into
+    a timeout — you burn the health window and then report "did not become healthy"
+    instead of "a previous daemon died mid-publication". Any retry must be narrowed to
+    the exact inert shape (regular file, uid matches, nlink 1, mode 0200, **size 0**),
+    with every other deviation still failing immediately.
+
+    **INSTRUMENT BEFORE CHANGING BEHAVIOUR.** `validate_file_stat` never looks at size
+    and does not report it, so the existing evidence cannot distinguish the two cases:
+    run `31209969877` passed this test and run `31209575561` failed it
+    (`autostart.rs:396`, job `92969028088`), and neither log records size. Make it say more first — this is the project's
+    highest-yield habit and the remedy is currently a guess without it.
+  - **`scripts/generate-grpc.sh` rewrites six `.pb.go` files inside the
+    `containerization` submodule**, which is a SEPARATE REPOSITORY. arca#54 was
+    scoped to Swift and reverted them. Whether this script should regenerate another
+    repository's output at all is unanswered and unscheduled.
   - The `ssh-keygen` descriptor defect. NOT FIXED, deliberately deferred. Cause class
     VERIFIED (`Bad file descriptor`, parent descriptor intact at fork); mechanism
     unknown. `crates/gascand/tests/ssh_identity_concurrency.rs` reproduces it under
     load and will announce a recurrence. **Its reproduction rate on a healthy machine
-    is now UNKNOWN** — see the Spotlight trap.
+    is UNKNOWN** — see the Spotlight trap.
   - `autostart.rs`'s symlink test (`daemon_attest_rejects_a_symlink_…`) still fails
     OPEN: both reader timeouts yield an empty buffer and the assertion is that the
     buffer is empty. The fix is mechanical (wait on process exit — the test already
@@ -112,37 +147,47 @@ specifically so P5.2 does not re-derive it.
     that. Real work; nobody has scheduled it.
 
 **TRAPS, all paid for already:**
-  - **GENERATE A PROTO BEFORE YOU COMMIT IT; DO NOT REVIEW IT BY READING.** A `oneof`
-    named `result` emits seven `pub enum Result` types in Rust that shadow
-    `std::result::Result` at every use site. Caught 2026-08-07 only by running
-    `tonic_build` and grepping the output. A `oneof`'s NAME is not on the wire, so the
-    rename was free before publication and would be a breaking change after it.
+  - **THE PIN NOW DRIVES THE RUST BUILD.** `engine/arca-pin.json` decides which
+    revision `gascan-engine-proto` generates from. `scripts/ci-classify-paths.sh`
+    maps `engine/*` to `rust=true` AND `engine=true` for exactly this reason. It
+    mapped to `engine` alone until 2026-08-07, which would have let a pin bump ship
+    a client generated from the wrong revision **and report green**.
+  - **`mv dir existing-dir` DOES NOT FAIL** — it moves the source inside the target.
+    This is why `sync-arca-proto.sh` publishes through an atomic `mkdir` claim. If
+    you write another cache, do not reach for a bare `mv`.
   - **A generator that emits an empty module also exits 0.** Grep the output for the
-    symbols you expect, then COMPILE it. `cargo build` on the generated module is the
-    real witness; `protoc` returning 0 is not.
-  - **`protoc-gen-grpc-swift` must be 1.27.0** to match Arca's `grpc-swift` dependency
-    — `arca/scripts/generate-grpc.sh:39` enforces this. The installed one is 1.27.0
-    (VERIFIED 2026-08-07), alongside `protoc` 35.1 and `protoc-gen-swift` 1.38.1.
-    Gas Can's Rust side uses vendored protoc via `protoc_bin_vendored`
-    (`crates/gascan-proto/build.rs:4`), so the two sides do NOT share a protoc.
-  - **The proto size gate is DECLARATION LINES, not raw lines** (restated 2026-08-07).
-    Raw count compares commenting style: the engine proto is 483 raw but 275
-    declaration lines against `gascan.proto`'s 240/200, with 11 RPCs against 14.
-    Threshold stays 400.
+    symbols you expect, then COMPILE it. Both sides now do: `swift build` compiles
+    `SandboxEngineProto`, and `gascan-engine-proto`'s tests name types so an empty
+    module fails to compile. A descriptor-set check catches the other half — a
+    service that lost a method still compiles for callers that never used it.
+  - **DO NOT REVIEW A PROTO BY READING IT.** A `oneof` named `result` emits seven
+    `pub enum Result` types in Rust that shadow `std::result::Result`. Caught only by
+    running the generator. A `oneof`'s NAME is not on the wire, so the rename was
+    free before publication and is a breaking change now.
+  - **`protoc-gen-grpc-swift` must be 1.27.0** to match Arca's `grpc-swift`
+    dependency — `arca/scripts/generate-grpc.sh:39` enforces it. Installed: 1.27.0,
+    alongside `protoc` 35.1 and `protoc-gen-swift` 1.38.1 (VERIFIED 2026-08-07). Gas
+    Can's Rust side uses vendored protoc via `protoc_bin_vendored`, so the two sides
+    do NOT share a protoc and neither inherits the other's constraint.
+  - **Arca's checked-in generated Swift WAS stale against its protos**, and not only
+    on formatting — `filesystem` was missing 4 RPCs entirely. arca#54 fixed the Swift.
+    **The lesson is the one that matters: one file was sampled and four were
+    described.** Verify the instrument, not only the result.
+  - **The proto size gate is DECLARATION LINES, not raw lines.** The engine proto is
+    483 raw but 275 declaration lines against `gascan.proto`'s 240/200, with 11 RPCs
+    against 14. Threshold stays 400.
   - **THE LATENCY PROBE IN OLDER NOTES IS WRONG. DO NOT TIME A SHELL SCRIPT.** A
     `#!/bin/sh` script measured 0.005s while a freshly built Rust binary measured
     32.8s AT THE SAME INSTANT. The correct probe copies a built test binary to a
-    BRAND-NEW path and times that — a new path matters, an already-evaluated binary
-    is cheaper. Two lines, and the only form that sees the effect:
+    BRAND-NEW path and times that:
       `cp target/debug/deps/store-* /tmp/probe && time /tmp/probe --list`
-  - `~/code` IS EXCLUDED FROM SPOTLIGHT INDEXING, and that is what took a workspace
-    run from 37 failures to 0. If measurements suddenly go strange, verify it is still
-    excluded: `mdfind -onlyin /Users/kiener/code -name Cargo.toml` must return NOTHING.
+  - `~/code` IS EXCLUDED FROM SPOTLIGHT INDEXING, and that took a workspace run from
+    37 failures to 0. If measurements go strange, verify it is still excluded:
+    `mdfind -onlyin /Users/kiener/code -name Cargo.toml` must return NOTHING.
   - **The `ssh-keygen` defect's "load dependence" was characterised BEFORE that fix.**
     That load was partly Spotlight. Re-measure before assuming it behaves as recorded.
-  - `cargo test --workspace` STOPS after the first failing binary — later binaries
-    never run, so one unrelated flake hides everything after it. **Use
-    `--no-fail-fast`.**
+  - `cargo test --workspace` STOPS after the first failing binary — one unrelated
+    flake hides everything after it. **Use `--no-fail-fast`.**
   - `cargo test <name>` without the full module path silently runs ZERO tests and
     exits 0. Always confirm the "running N tests" line.
   - A mutation test that does not flip is not a test. Forcing the predicate false MUST
@@ -154,8 +199,7 @@ specifically so P5.2 does not re-derive it.
   - The maintainer often has OTHER cargo builds running for other projects. Machine
     state is not yours alone; check before claiming two runs are comparable.
   - Capture exit codes directly, never through a pipe: `if cmd; then rc=0; else rc=$?; fi`.
-    This bit once more on 2026-08-07 — `${PIPESTATUS[0]}` after an `if` block reads
-    empty.
+    `${PIPESTATUS[0]}` after an `if` block reads empty.
   - `RUSTUP_TOOLCHAIN=1.95.0` is exported in this environment and overrides
     `rust-toolchain.toml`. Prefix `env -u RUSTUP_TOOLCHAIN` to be certain.
   - `cargo clippy --fix` is NOT safe here — it emitted invalid Rust at service.rs:2694
@@ -171,7 +215,7 @@ specifically so P5.2 does not re-derive it.
   - A required check's context is the BARE JOB NAME (`gate`), not the UI's `ci / gate`.
   - `mergeStateStatus` reports branch policy and is VIEWER-INDEPENDENT. It stays
     BLOCKED even for an actor who can bypass. `current_user_can_bypass` answers
-    "may I override this". A docs-only PR reads `UNSTABLE` because of D4 alone.
+    "may I override this".
   - A workflow-level `paths:` filter cannot back a required check — GitHub leaves it
     Pending forever. A JOB reporting `skipped` satisfies it.
   - `actions/checkout` defaults to `fetch-depth: 1`; release-script-contract.sh
@@ -187,8 +231,7 @@ specifically so P5.2 does not re-derive it.
     (README.md:130-134, Makefile:123-124).
   - Signing goes through the 1Password SSH agent. "communication with agent failed"
     means locked — ASK THE USER. `ssh-add -l` succeeding proves nothing. Never fall
-    back to `--no-gpg-sign` or a lightweight tag. **This will matter this session:**
-    the pin bump needs a signed annotated tag.
+    back to `--no-gpg-sign` or a lightweight tag.
   - The permission classifier refuses `gh pr merge` and repo-admin `gh api` calls. Ask
     the user to run them with `!`. NEVER route around a refusal with a different tool
     performing the same irreversible action.
@@ -198,16 +241,16 @@ specifically so P5.2 does not re-derive it.
   - Past-tense claims carry their anchor inline — command, SHA, file:line, exit code —
     or they come out. Rules may ship bare; events may not.
   - Record corrections in place, struck through with a pointer. Do not quietly edit a
-    superseded conclusion away. Several are still visible on purpose — two more were
-    added 2026-08-07, in the backend spec and the contract.
+    superseded conclusion away. Several are still visible on purpose — one was added
+    2026-08-07 in the codegen spec, where a sample of one file was generalised to four.
   - When something is hard to diagnose, MAKE IT SAY MORE BEFORE GUESSING BETTER. This
     is the highest-yield habit in this project.
-  - **Verify the instrument, not only the result.** Two measuring instruments were
-    confidently wrong on 2026-08-07, and the size gate turned out to be a third — it
-    measured commenting style rather than surface. Instruments drift silently; the
-    anchor a gate was calibrated against grew 28% while the quoted figure did not.
+  - **Verify the instrument, not only the result.** Three instruments have now been
+    confidently wrong here: the exec-latency probe, the proto size gate, and a
+    one-file sample of a four-file diff. Instruments drift silently.
   - Before attributing an intermittent failure to the product, CHECK WHAT THE MACHINE
     WAS DOING. A Spotlight setting accounted for 37 of 38 failures.
-  - Prefer an A/B you can run over an argument you find convincing.
+  - **Prefer an A/B you can run over an argument you find convincing.** P3.2's whole
+    design turned on one measurement: 1.3 GB versus 108 KB for the same provenance.
   - `docs/superpowers/` is TRACKED and committed. `.superpowers/` (dot-prefixed) is
     gitignored scaffolding. Two different paths; do not conflate them.

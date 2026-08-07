@@ -2348,3 +2348,187 @@ measurement — recorded as such.
 **The kickoff was refreshed without being asked.** It still read "YOUR TASK: P3.1" and
 would have sent the next agent to redo finished work; leaving it stale seemed worse than
 the scope stretch. Merged as #60.
+
+---
+
+## Session of 2026-08-07 (later still) — P3.2 done, the pin moved for the first time
+
+### What landed
+
+**P3 is complete.** Its exit was *proto exists, both sides generate, nothing
+implements it yet*, and all three clauses now hold.
+
+| | |
+|---|---|
+| **arca#53** | `Sources/SandboxEngineProto/`, its own target, generated server code, an engine arm in `generate-grpc.sh` that fails rather than skips. Merge commit `77b293e` — the commit the tag names. |
+| **arca#54** | The stale checked-in Swift regenerated (Swift only) — found while doing #53, kept out of it. Merge commit `b705b9c`, which lands *after* the tag and does not disturb it. |
+| **gascan#63** | `scripts/sync-arca-proto.sh`, `crates/gascan-engine-proto`, the pin bump, five dependent consumers, the design spec. Merge commit `cb329aa`. |
+| **Tag** | `gascan-engine-proto-v1`, annotated and signed, at `77b293e`. Tag **object** `35d2196`; the commit is `77b293e`. Do not confuse them. |
+
+Design and full reasoning: `docs/superpowers/specs/2026-08-07-arca-engine-codegen-design.md`.
+
+**The pin moved for the first time since it was created.** `engine/arca-pin.json`
+now reads tag `gascan-engine-proto-v1`, revision
+`77b293edd1369c60100045183245ae091f71c39e`. The previous pin
+(`gascan-engine-ip-internal` → `d66c320c`) did not carry the proto, which was the
+blocker the last session predicted and this one re-confirmed twice.
+
+### The measurement that decided the design
+
+The obvious way for Gas Can's build to reach the proto is
+`scripts/build-arca-engine.sh`, which already crosses this pin. It cannot be used:
+it clones full history, initialises a submodule and ends in `swift build`.
+**VERIFIED: its cache `.artifacts/arca-engine/arca` is 1.3 GB** (`du -sh`).
+Nothing that expensive can sit in front of `cargo build`.
+
+The useful question was whether **provenance** costs 1.3 GB or whether only the
+**build** did. **VERIFIED 2026-08-07:**
+
+| Step | Result |
+|---|---|
+| `git fetch --depth 1 --filter=blob:none origin tag <tag>` into an empty repo | **rc=0, 1s, 108 KB** |
+| `verify-tag` against `engine/allowed-signers` on that shallow repo | **rc=0**, `Good "git" signature for richard@liquescent.dev` |
+| `rev-parse refs/tags/<tag>^{}` on it | resolves, so the tag→revision assertion survives |
+
+**A cheaper fetch is not a weaker claim; it is the same claim over fewer bytes.**
+`sync-arca-proto.sh` makes the same three assertions as the build script and
+materialises only `proto/` — a **16 KB** extract against 1.3 GB.
+
+Without that A/B the honest options were a vendored copy or a manual prerequisite
+step, and both were worse. This is the "prefer an A/B you can run" convention
+paying for itself the same way §12 of the P3.1 design did.
+
+### Two decisions taken with the maintainer before drafting
+
+| # | Decision | Consequence |
+|---|---|---|
+| 1 | The Rust build reaches the proto **across the pin at build time**, `build.rs` invoking the sync script | No vendored copy, so no second copy of a contract to drift. Cost, stated not hidden: `build.rs` touches the network on a cold cache, so a fully offline first build fails. |
+| 2 | Generated Swift lives in **its own target**, `SandboxEngineProto` | P3.1's decision 4 one layer up — a published contract is not a `ContainerBridge` internal — and it keeps the contract out of the target P4.3 exists to slim. |
+
+### Things worth not re-deriving
+
+**`build.rs` does not parse the pin.** The script already owns what "the pinned
+contract" means; a second parser in Rust would be free to disagree. `build.rs`
+reads only the script's stdout, and touches `arca-pin.json` solely as a
+`rerun-if-changed` input.
+
+**The extract cache is keyed by revision**, so a pin bump cannot be served by a
+stale extract and no invalidation logic has to be trusted.
+
+**Publication needed a claim, not a bare `mv`.** `mv dir existing-dir` does not
+fail — it moves the source *inside* the target — so a lost race would have
+produced `.artifacts/arca-proto/<rev>/tree/` silently and every later build would
+have read a path that does not exist. `mkdir` is atomic, so a claim directory
+picks one winner; the loser waits, **bounded at 60s**, because a claim whose
+holder died must surface as an error rather than a build that hangs.
+
+**Absence is diagnosed before extraction.** `git archive` on a missing path says
+`pathspec did not match any files`, which is true and useless. The check is
+`cat-file -e` on the exact path first, so the failure names the revision and the
+expectation — which is what the next pin bump will need.
+
+**The new `generate-grpc.sh` arm fails where the others skip.** The three existing
+arms guard protos inside a submodule that may legitimately be absent. This one is
+tracked at Arca's root, so an absent file means a broken tree, and exiting 0 there
+would let a consumer pin a revision whose server code was never regenerated.
+
+### The consumer nobody would have found by running CI
+
+**`scripts/ci-classify-paths.sh` mapped `engine/*` to `engine=true` alone.** That
+was correct only while nothing in Rust read the pin. It now decides the Rust
+build's codegen input, so a pin bump that did not run `rust` would have shipped a
+client generated from the wrong revision **and reported green**. The classifier
+now sets `rust=true` as well, and `tests/ci/classify-paths-contract.sh` asserts it.
+
+The other four moved for ordinary reasons and are listed in the design spec §5.
+`tests/release/source-input-contract.sh`'s fixture seed was **read out of the pin
+design §4.4 rather than rediscovered** — that document recorded the knock-on when
+the pin was built, and it was still accurate.
+
+### Verification
+
+Exit codes captured directly, never through a pipe.
+
+| Check | Result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | **rc=0 — 1381 passed, 0 failed, 22 ignored** |
+| `cargo clippy -p gascan-engine-proto --all-targets -- -D warnings` | **rc=0** |
+| `cargo fmt --all --check` | **rc=0** |
+| `swift build --target SandboxEngineProto` | **rc=0**, 11.75s |
+| `swift build` (all Arca targets, post-regeneration) | **rc=0**, 0 errors |
+| `sync-arca-proto.sh`, real pin | **rc=0**, 3s, 16 KB |
+| `sync-arca-proto.sh`, **pre-bump** pin | **rc=65**, the absent proto reported as its own designed failure |
+| `generate-grpc.sh` with the engine proto absent | **rc=66**, guest-arm skips unchanged at 6 |
+| Swift generation idempotent | sha256 over both files unchanged on a second run |
+| `tests/ci/classify-paths-contract.sh` | **rc=0** |
+| `tests/release/source-input-contract.sh` | **rc=0** |
+
+**1381 is the carried 1377 plus exactly this crate's 4 new tests**, so the bar
+moved for a reason that is accounted for rather than mysterious.
+
+**Both surface tests were shown to flip.** Dropping `PrepareImage` from the
+expected set fails with `unexpected: ["PrepareImage"] / found 11 methods, expected
+10`; referencing a message the generator does not emit fails to compile with
+`E0425`. A mutation test that does not flip is not a test.
+
+**The Rust arm was validated before the tag existed**, against a throwaway signed
+tag over a `file://` URL — a shape the pin schema already permits
+(`test("^(https|file)://")`). The throwaway tag was local-only, never pushed, and
+was deleted (`git ls-remote` confirms absent). An annotated signed tag is the one
+artifact in this sequence that should not be cut twice.
+
+### A correction, recorded in place
+
+**"The Arca regeneration is entirely `nonisolated` annotations" was WRONG.** It
+was read off `wireguard.pb.swift` and generalised to four files, and it was said
+to the maintainer, who approved the work on that description.
+
+Against the raw diff: `wireguard` and `process` are annotation churn, but
+`filesystem` carries **8 message types and 4 RPCs that were never generated at
+all** — `StatPath`, `CreateVolumeOverlay`, `CreateDirectMount`,
+`GenerateHostsFile`. The committed Swift was generated from an **older
+`filesystem.proto`**, not merely by an older plugin.
+
+It is left visible because it is the same failure as the exec-latency probe and
+the size gate: **trusting a sample that measures something adjacent to the
+question.** One file was read and four were described. The maintainer was told
+before the work was committed, and chose to take all four; arca#54 names the four
+RPCs explicitly rather than calling itself a refresh.
+
+### Still open — none of it was this session's task
+
+Everything the previous session listed remains open and is not restated here,
+**except** that the engine-proto pin blocker is now resolved. Additionally:
+
+- **`generate-grpc.sh` rewrites six `.pb.go` files inside the `containerization`
+  submodule**, a separate repository. arca#54 was scoped to Swift and reverted
+  those. Whether this script should regenerate another repository's output at all
+  is unanswered and unscheduled.
+- **D4 is unchanged.** `runtime-probe` still fails on every run.
+- **D7 now has a CI reproduction, which it did not before.** On gascan#63's first
+  run (`31209575561`, job `92969028088`, macos-26), `gascan-e2e`'s
+  `explicit_state_path_bypasses_default_migration` failed with
+  `protected runtime file is unsafe: mode is not 0600 (mode 0200, links 1, uid 501,
+  expected uid 501)` at `crates/gascan-e2e/tests/autostart.rs:396`. That is the D7
+  mechanism verbatim — the daemon's own record, created inert at 0200 and published
+  by chmod to 0600, read mid-flight. The same suite was green locally at
+  1381/0/22 in the same session, so it is timing-dependent and the hosted runner
+  hits the window more often than this machine does. **It still needs a maintainer
+  decision** (retry, treat-as-absent, or wait); what changed is that it can now be
+  reproduced somewhere other than by luck.
+
+### Final state
+
+**VERIFIED.** Both repositories clean.
+
+| | |
+|---|---|
+| arca `main` | `b705b9c` after arca#54 merged; the tag is at `77b293e`, one merge behind, deliberately |
+| arca tag | `gascan-engine-proto-v1` → commit `77b293e`, tag object `35d2196` |
+| gascan pin | tag `gascan-engine-proto-v1`, revision `77b293edd1369c60100045183245ae091f71c39e` |
+
+**A document cannot record the SHA of the commit that records it** — the caveat
+the last session paid for twice still applies. Verify both tips with
+`git log --oneline -1`. The **tag** is stable and is the thing to trust: it is
+signed, it is asserted to equal the pin's revision, and `arca#54` lands after it
+without disturbing it.
