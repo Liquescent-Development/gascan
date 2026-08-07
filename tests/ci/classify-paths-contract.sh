@@ -40,13 +40,21 @@ expect 'README runs contracts only' \
   'README.md' \
   'rust=false contracts=true engine=false'
 
-expect 'the pin runs engine only' \
+expect 'the pin runs engine and rust, because the pin decides the client codegen input' \
   'engine/arca-pin.json' \
-  'rust=false contracts=false engine=true'
+  'rust=true contracts=false engine=true'
+
+expect 'the allowed-signers file runs engine and rust for the same reason' \
+  'engine/allowed-signers' \
+  'rust=true contracts=false engine=true'
 
 expect 'the engine build script runs engine and contracts' \
   'scripts/build-arca-engine.sh' \
   'rust=false contracts=true engine=true'
+
+expect 'the proto sync script runs rust and contracts' \
+  'scripts/sync-arca-proto.sh' \
+  'rust=true contracts=true engine=false'
 
 expect 'another script runs contracts only' \
   'scripts/produce-gascamp-bundle.sh' \
