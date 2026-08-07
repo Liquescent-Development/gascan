@@ -1902,7 +1902,8 @@ document.** None of them block P3.1.
 | D3 | `gascan-e2e/tests/fake_backend.rs` flake | local-suite-green bar | newly recorded this session, uninstrumented |
 | D4 | Delete `runtime-probe` from `ci.yml` | nothing; cosmetic but persistent | spec §7.2 says the job is temporary; §11.5 recorded its VERIFIED answer |
 | D5 | `stash@{0}` `f6356f9` — keep or drop | nothing | **ANSWERED below**; maintainer's call whether to drop |
-| D6 | The flaky suite as one shared cause | the local-suite bar, eventually | mechanism in spec §11.7 |
+| D6 | The flaky suite as one shared cause | the local-suite bar, eventually | **largely answered**: Spotlight indexing `target/` was the dominant cause; excluding `~/code` took a workspace run from 37 failures to 1 |
+| D7 | How the health check should treat modes `0200` (inert / tombstoned) | nothing yet; it is a real flake | mechanism now VERIFIED, remedy is a design choice |
 
 **D5 is answered.** `git stash show --name-only stash@{0}` lists **exactly one file**:
 `.superpowers/sdd/progress.md`, and `git check-ignore -v` confirms `.gitignore:1:.superpowers/`
@@ -1993,3 +1994,63 @@ and it is the only form that sees the effect.
 the whole suite. That is the maintainer's call, not mine — it is a system setting.
 **This is now the leading candidate for D6**, and it is a much cheaper hypothesis than
 the `--test-threads` oversubscription one, which remains unmeasured.
+
+### Spotlight was the cause, and the suite came back — 2026-08-07
+
+**The maintainer excluded `~/code` from Spotlight indexing** (107 repos, 40 build trees;
+`~/code/gascan/target` alone is 18 GB across 174,739 files). Verified in effect:
+`mdfind -onlyin /Users/kiener/code -name Cargo.toml` returns **nothing**.
+
+**VERIFIED, comparing whole runs with the corrected probe:**
+
+| | cold exec after a full workspace run | failures |
+|---|---|---|
+| Before the exclusion | **7.818 s** | **37** |
+| After the exclusion | **0.188 s** | **1** |
+
+**Two confounds, stated rather than buried.** (1) The maintainer had concurrent `cargo`
+builds for other projects running during the earlier measurements, so machine state was
+never as controlled as "same load" claimed — this is a third candidate for the
+long-unexplained latency swings, alongside Spotlight and Gatekeeper, and it means the
+`6/28 vs 0/28` descriptor A/B, though large and taken back-to-back with matching CPU
+readings, is not airtight. (2) Adding a path to the privacy list makes macOS **delete**
+the existing index for it, and that teardown is itself expensive: the `probe_before` in
+the bracketed run read **40.389 s** because it was taken during exactly that, which is
+why the before/after pair inside one run is not the comparison that matters.
+
+**The Gatekeeper half is untouched by the exclusion.** `syspolicyd` was at 42.5% in the
+first slow window and 33.7% after the suite went green. It is not currently breaking
+anything, but a Spotlight exclusion does not address it and it should not be assumed gone.
+
+**D3 and D1 are verified against a full workspace run**: 1376 passed, 1 failed, 22
+ignored — identical to the two runs taken before either change.
+
+### The publish-window race is no longer a hypothesis
+
+The single remaining failure was `doctor_uses_the_callers_workspace_after_the_daemon_launch_directory_is_deleted`
+(`gascan-e2e/tests/doctor.rs:782`):
+
+```
+started daemon did not become healthy and current (state Unsafe):
+protected runtime file is unsafe: mode is not 0600
+  (mode 0200, links 1, uid 501, expected uid 501)
+```
+
+`validate_file_stat` (`crates/gascan/src/daemon.rs:3057`) named which of its four
+conditions fired and carried the observed value, which is the whole reason this is
+legible. Its own doc comment at `daemon.rs:3050-3056` had already written down what the
+value means: **"mode 0200 is the daemon's own not-yet-published record (`gascand` creates
+it inert and publishes by chmod-ing to 0600)"**. `INSTANCE_TOMBSTONE_MODE` is the same
+`0o200` (`daemon.rs:18`, applied at `:1373`).
+
+So the reader observed the record **inside the publish window** and reported a legitimate
+transient daemon state as tampering. That is the mechanism the previous session
+hypothesised, now with an instance captured and the condition named.
+
+**Not fixed, and deliberately so** — the previous instruction was not to fix it on a
+single unreproduced sighting, and the remedy is a design question rather than a
+mechanical one: the health-check path must distinguish "inert, not yet published" and
+"tombstoned" from "unsafe", and decide whether that means retry, treat-as-absent, or
+wait. **This is a new entry for the decision register.** The instrumentation that made it
+legible was added two sessions ago and cost nothing to carry until it fired —
+instrumentation compounds.
