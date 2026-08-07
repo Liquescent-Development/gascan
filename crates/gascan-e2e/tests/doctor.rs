@@ -309,7 +309,7 @@ impl UpgradeEnvironment {
             let output = self
                 .cli_with_daemon(&["daemon", "status", "--json"], daemon)
                 .output()?;
-            let last_status = describe_output(&output);
+            let last_status = gascan_e2e::describe_output(&output);
             if output.status.success() {
                 let status: serde_json::Value = serde_json::from_slice(&output.stdout)?;
                 if status["state"] == "running" && status["running_version"] == expected {
@@ -401,38 +401,14 @@ fn doctor(json: bool) -> Result<std::process::Output, Box<dyn std::error::Error>
     Ok(env.cli(args).output()?)
 }
 
-/// Render a child's outcome in full: how it ended, and both streams.
-///
-/// Four sites in this file spelled this out by hand and two reported only
-/// `stderr`. Human-mode `doctor` writes its report to stdout, so those two
-/// produced an *empty* assertion message on failure — which is exactly what CI
-/// run 31130737502 printed when `doctor_human_output_names_each_check` failed.
-/// Naming it once keeps the six from drifting apart again.
-fn describe_output(output: &std::process::Output) -> String {
-    format!(
-        "{}, stdout={}, stderr={}",
-        describe_status(&output.status),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
-}
-
-/// Say whether the child exited, was signalled, or produced no status at all.
-/// `ExitStatus`'s `Debug` form prints the raw wait status, so a plain exit code
-/// 1 reads as `unix_wait_status(256)`.
-fn describe_status(status: &std::process::ExitStatus) -> String {
-    use std::os::unix::process::ExitStatusExt as _;
-    match (status.code(), status.signal()) {
-        (Some(code), _) => format!("exit code {code}"),
-        (None, Some(signal)) => format!("killed by signal {signal}"),
-        (None, None) => "no exit status".to_owned(),
-    }
-}
-
 #[test]
 fn doctor_json_contains_stable_checks_and_remedies() -> TestResult {
     let output = doctor(true)?;
-    assert!(output.status.success(), "{}", describe_output(&output));
+    assert!(
+        output.status.success(),
+        "{}",
+        gascan_e2e::describe_output(&output)
+    );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     let checks = report["checks"].as_array().ok_or("checks missing")?;
     assert!(checks.iter().any(|check| check["id"] == "runtime.offline"));
@@ -448,7 +424,11 @@ fn doctor_json_recovers_an_outdated_compatible_daemon() -> TestResult {
     let old_pid = env.pid()?;
 
     let output = env.cli(&["doctor", "--json"]).output()?;
-    assert!(output.status.success(), "{}", describe_output(&output));
+    assert!(
+        output.status.success(),
+        "{}",
+        gascan_e2e::describe_output(&output)
+    );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     assert!(report["checks"].is_array());
     env.reap_fixture()?;
@@ -517,7 +497,7 @@ fn doctor_recovers_after_atomic_installed_daemon_replacement() -> TestResult {
     assert!(
         output.status.success(),
         "upgrade recovery failed: {}",
-        describe_output(&output)
+        gascan_e2e::describe_output(&output)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     assert!(report["checks"].is_array());
@@ -594,7 +574,11 @@ fn doctor_recovers_a_legacy_daemon_through_double_attested_sigterm() -> TestResu
     assert!(before["running_version"].is_null());
 
     let output = env.cli(&["doctor", "--json"]).output()?;
-    assert!(output.status.success(), "{}", describe_output(&output));
+    assert!(
+        output.status.success(),
+        "{}",
+        gascan_e2e::describe_output(&output)
+    );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     assert!(report["checks"].is_array());
     env.reap_fixture()?;
@@ -765,7 +749,11 @@ fn unsafe_socket_symlink_fails_closed() -> TestResult {
 #[test]
 fn doctor_human_output_names_each_check() -> TestResult {
     let output = doctor(false)?;
-    assert!(output.status.success(), "{}", describe_output(&output));
+    assert!(
+        output.status.success(),
+        "{}",
+        gascan_e2e::describe_output(&output)
+    );
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.contains("Gascan is ready"));
     assert!(stdout.contains("Host"));

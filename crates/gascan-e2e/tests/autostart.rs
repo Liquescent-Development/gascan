@@ -12,9 +12,12 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 /// spawn real daemons while `cargo test --workspace` runs several test binaries
 /// at once, and a child that has not been scheduled yet is not a failed child.
 ///
-/// This does not apply to the deadline in
-/// `accepted_socket_without_http2_cannot_block_initial_probe`, where the elapsed
-/// time *is* the assertion.
+/// `accepted_socket_without_http2_cannot_block_initial_probe` used to be the
+/// exception, because its elapsed time *was* the assertion. It no longer is:
+/// its peer holds the connection until released rather than for a fixed three
+/// seconds, so the property is the order of two events and this ceiling bounds
+/// only the hang. There is now no test in this file where a duration is the
+/// property.
 const CHILD_HANG_CEILING: std::time::Duration = std::time::Duration::from_secs(60);
 
 struct Environment {
@@ -769,20 +772,27 @@ fn accepted_socket_without_http2_cannot_block_initial_probe() -> TestResult {
     let listener = std::os::unix::net::UnixListener::bind(&socket)?;
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
     let held_socket = socket.clone();
+    // The peer is the observer. It reports that the CLI reached it, then holds
+    // the accepted connection open until this test releases it -- never on a
+    // timer. So "the CLI finished while a peer still held the socket" is true by
+    // the order of the statements below rather than by comparing two durations,
+    // and there is no constant here that can drift against another one.
+    let (accepted, accepted_signal) = std::sync::mpsc::channel::<()>();
+    let (release, release_signal) = std::sync::mpsc::channel::<()>();
     let holder = std::thread::spawn(move || -> std::io::Result<()> {
         let (stream, _) = listener.accept()?;
         std::fs::remove_file(held_socket)?;
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        let _ = accepted.send(());
+        // Blocks until the test sends; the peer never lets go on its own.
+        let _ = release_signal.recv();
         drop(stream);
         Ok(())
     });
-    let started = std::time::Instant::now();
-    let mut command = env.command();
-    let mut cli = command
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-    let deadline = started + std::time::Duration::from_secs(2);
+    let mut cli = env.command().spawn()?;
+    // CHILD_HANG_CEILING bounds a hang, not the property. A CLI that blocks on
+    // the mute peer never finishes at all, so the failure this guards against is
+    // unbounded waiting -- and the message says which property was lost.
+    let deadline = std::time::Instant::now() + CHILD_HANG_CEILING;
     let status = loop {
         if let Some(status) = cli.try_wait()? {
             break status;
@@ -790,12 +800,19 @@ fn accepted_socket_without_http2_cannot_block_initial_probe() -> TestResult {
         if std::time::Instant::now() >= deadline {
             cli.kill()?;
             let _ = cli.wait()?;
-            return Err("initial readiness probe exceeded its bound".into());
+            return Err("the CLI never finished while a peer held an accepted \
+                        but silent socket open; the initial readiness probe blocked on it"
+                .into());
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
-    assert!(status.success());
-    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert!(status.success(), "{}", gascan_e2e::describe_status(&status));
+    // Not vacuous: the peer must actually have accepted the CLI's connection,
+    // otherwise the CLI could have passed without ever probing the socket.
+    accepted_signal
+        .recv_timeout(CHILD_HANG_CEILING)
+        .map_err(|_| "the CLI exited without ever connecting to the withholding socket")?;
+    drop(release);
     holder
         .join()
         .map_err(|_| "withholding socket thread panicked")??;

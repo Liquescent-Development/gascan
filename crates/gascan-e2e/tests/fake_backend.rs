@@ -411,7 +411,7 @@ fn complete_cli_lifecycle_uses_daemon_api() -> TestResult {
         Some(42)
     );
     let apply = env.invoke(&["apply", env.root()?, "--json"])?;
-    assert!(apply.status.success());
+    let apply = gascan_e2e::succeeded(apply);
     assert!(
         apply
             .stdout
@@ -420,7 +420,7 @@ fn complete_cli_lifecycle_uses_daemon_api() -> TestResult {
             .all(|line| serde_json::from_slice::<serde_json::Value>(line).is_ok())
     );
     let down = env.invoke(&["down"])?;
-    assert!(down.status.success());
+    let down = gascan_e2e::succeeded(down);
     assert_static_lifecycle_output(
         &String::from_utf8(down.stderr)?,
         "Stopping sandbox",
@@ -432,7 +432,7 @@ fn complete_cli_lifecycle_uses_daemon_api() -> TestResult {
         "stopped"
     );
     let destroy = env.invoke(&["destroy", "--yes"])?;
-    assert!(destroy.status.success());
+    let destroy = gascan_e2e::succeeded(destroy);
     assert_static_lifecycle_output(
         &String::from_utf8(destroy.stderr)?,
         "Destroying sandbox",
@@ -452,13 +452,13 @@ fn destroyed_tombstones_require_list_all() -> TestResult {
         .ok_or("non UTF-8 second root")?
         .to_owned();
 
-    assert!(env.invoke(&["up", &first_root])?.status.success());
+    let _ = gascan_e2e::succeeded(env.invoke(&["up", &first_root])?);
     let first_status = env.invoke(&["status", "--json"])?;
     let first_id = serde_json::from_slice::<serde_json::Value>(&first_status.stdout)?["sandbox_id"]
         .as_str()
         .ok_or("first sandbox id missing")?
         .to_owned();
-    assert!(env.invoke(&["up", &second_root])?.status.success());
+    let _ = gascan_e2e::succeeded(env.invoke(&["up", &second_root])?);
 
     let initial = env.invoke(&["list", "--json"])?;
     let initial = serde_json::from_slice::<Vec<serde_json::Value>>(&initial.stdout)?;
@@ -478,14 +478,10 @@ fn destroyed_tombstones_require_list_all() -> TestResult {
         .cloned()
         .ok_or("second sandbox id missing")?;
 
-    assert!(
-        env.invoke(&["--sandbox", &first_id, "destroy", "--yes"])?
-            .status
-            .success()
-    );
+    let _ = gascan_e2e::succeeded(env.invoke(&["--sandbox", &first_id, "destroy", "--yes"])?);
 
     let ordinary_human = env.invoke(&["list"])?;
-    assert!(ordinary_human.status.success());
+    let ordinary_human = gascan_e2e::succeeded(ordinary_human);
     let ordinary_human = String::from_utf8(ordinary_human.stdout)?;
     assert!(ordinary_human.contains(&second_id));
     assert!(!ordinary_human.contains(&first_id));
@@ -493,13 +489,13 @@ fn destroyed_tombstones_require_list_all() -> TestResult {
     assert!(!ordinary_human.contains("Absent"));
 
     let ordinary_json = env.invoke(&["list", "--json"])?;
-    assert!(ordinary_json.status.success());
+    let ordinary_json = gascan_e2e::succeeded(ordinary_json);
     let ordinary_json = serde_json::from_slice::<Vec<serde_json::Value>>(&ordinary_json.stdout)?;
     assert_eq!(ordinary_json.len(), 1);
     assert_eq!(ordinary_json[0]["sandbox_id"], second_id);
 
     let all_human = env.invoke(&["list", "--all"])?;
-    assert!(all_human.status.success());
+    let all_human = gascan_e2e::succeeded(all_human);
     let all_human = String::from_utf8(all_human.stdout)?;
     assert!(all_human.contains(&first_id));
     assert!(all_human.contains(&second_id));
@@ -507,7 +503,7 @@ fn destroyed_tombstones_require_list_all() -> TestResult {
     assert!(!all_human.contains("Absent"));
 
     let all_json = env.invoke(&["list", "--all", "--json"])?;
-    assert!(all_json.status.success());
+    let all_json = gascan_e2e::succeeded(all_json);
     let all_json = serde_json::from_slice::<Vec<serde_json::Value>>(&all_json.stdout)?;
     assert_eq!(
         all_json
@@ -522,22 +518,18 @@ fn destroyed_tombstones_require_list_all() -> TestResult {
         .ok_or("destroyed sandbox missing from --all JSON")?;
     assert_eq!(first["actual_state"], "absent");
 
-    assert!(
-        env.invoke(&["--sandbox", &second_id, "destroy", "--yes"])?
-            .status
-            .success()
-    );
+    let _ = gascan_e2e::succeeded(env.invoke(&["--sandbox", &second_id, "destroy", "--yes"])?);
     let empty_human = env.invoke(&["list"])?;
-    assert!(empty_human.status.success());
+    let empty_human = gascan_e2e::succeeded(empty_human);
     assert_eq!(empty_human.stdout, b"No sandboxes found.\n");
     let empty_json = env.invoke(&["list", "--json"])?;
-    assert!(empty_json.status.success());
+    let empty_json = gascan_e2e::succeeded(empty_json);
     assert!(serde_json::from_slice::<Vec<serde_json::Value>>(&empty_json.stdout)?.is_empty());
     assert_eq!(env.invoke(&["status"])?.status.code(), Some(64));
 
-    assert!(env.invoke(&["up", &first_root])?.status.success());
+    let _ = gascan_e2e::succeeded(env.invoke(&["up", &first_root])?);
     let recreated = env.invoke(&["status", "--json"])?;
-    assert!(recreated.status.success());
+    let recreated = gascan_e2e::succeeded(recreated);
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&recreated.stdout)?["sandbox_id"],
         first_id
@@ -581,10 +573,10 @@ fn progress_stderr_pty_child_has_non_tty_stdin_and_tty_stderr() -> TestResult {
 #[test]
 fn tty_stderr_lifecycle_progress_updates_in_place_and_finishes_cleanly() -> TestResult {
     let env = Environment::new()?;
-    assert!(env.invoke(&["doctor", "--json"])?.status.success());
+    let _ = gascan_e2e::succeeded(env.invoke(&["doctor", "--json"])?);
     for no_color in [false, true] {
         let (status, output) = invoke_with_stderr_pty(&env, &["up", env.root()?], no_color)?;
-        assert!(status.success());
+        gascan_e2e::status_succeeded(&(status));
         let stderr = String::from_utf8(output)?;
         // The success marker is emitted as "\u{1b}[32m✓\u{1b}[0m" when color is on
         // (crates/gascan/src/presentation.rs:636-642), so an SGR reset sits between
@@ -622,12 +614,10 @@ fn tty_stderr_lifecycle_progress_updates_in_place_and_finishes_cleanly() -> Test
 #[test]
 fn interactive_streamed_operation_failure_clears_spinner_before_error() -> TestResult {
     let env = Environment::new()?;
-    assert!(
+    let _ = gascan_e2e::succeeded(
         env.command(&["doctor", "--json"])
             .env("GASCAN_FAKE_PROVISION_FAIL", "1")
-            .output()?
-            .status
-            .success()
+            .output()?,
     );
     let (status, output) = invoke_with_stderr_pty(&env, &["up", env.root()?], false)?;
 
@@ -666,7 +656,7 @@ fn interactive_streamed_operation_failure_clears_spinner_before_error() -> TestR
 #[test]
 fn binary_stdin_stdout_stderr_and_environment_are_exact() -> TestResult {
     let env = Environment::new()?;
-    assert!(env.invoke(&["up", env.root()?])?.status.success());
+    let _ = gascan_e2e::succeeded(env.invoke(&["up", env.root()?])?);
     let mut child = env
         .command(&["run", "--", "fake-echo-stdin"])
         .stdin(Stdio::piped())
@@ -718,7 +708,7 @@ fn binary_stdin_stdout_stderr_and_environment_are_exact() -> TestResult {
 fn unbounded_piped_stdin_gets_early_output_and_cancels_promptly() -> TestResult {
     use std::io::Read as _;
     let env = Environment::new()?;
-    assert!(env.invoke(&["up", env.root()?])?.status.success());
+    let _ = gascan_e2e::succeeded(env.invoke(&["up", env.root()?])?);
     let mut producer = Command::new("yes").stdout(Stdio::piped()).spawn()?;
     let producer_stdout = producer.stdout.take().ok_or("producer stdout missing")?;
     let mut cli = env
@@ -755,7 +745,7 @@ fn unbounded_piped_stdin_gets_early_output_and_cancels_promptly() -> TestResult 
 #[test]
 fn environment_teardown_terminates_its_exact_live_daemon() -> TestResult {
     let env = Environment::new()?;
-    assert!(env.invoke(&["doctor", "--json"])?.status.success());
+    let _ = gascan_e2e::succeeded(env.invoke(&["doctor", "--json"])?);
     let socket = env.runtime_root.join("gascan/gascand.sock");
     assert!(std::os::unix::net::UnixStream::connect(&socket).is_ok());
     env.shutdown_daemon()?;
@@ -781,7 +771,7 @@ fn durable_controller_state_survives_daemon_replacement() -> TestResult {
         daemon_stderr
     );
     let listed = env.legacy_command(&["list", "--json"]).output()?;
-    assert!(listed.status.success());
+    let listed = gascan_e2e::succeeded(listed);
     let records = serde_json::from_slice::<Vec<serde_json::Value>>(&listed.stdout)?;
     let sandbox_id = records
         .first()
@@ -869,19 +859,15 @@ fn two_unrelated_sandboxes_require_explicit_selection() -> TestResult {
     let env = Environment::new()?;
     let second = tempfile::tempdir()?;
     let second_root = second.path().to_str().ok_or("non UTF-8 root")?;
-    assert!(env.invoke(&["up", env.root()?])?.status.success());
-    assert!(env.invoke(&["up", second_root])?.status.success());
+    let _ = gascan_e2e::succeeded(env.invoke(&["up", env.root()?])?);
+    let _ = gascan_e2e::succeeded(env.invoke(&["up", second_root])?);
     let list = env.invoke(&["list", "--json"])?;
     let values = serde_json::from_slice::<Vec<serde_json::Value>>(&list.stdout)?;
     assert_eq!(values.len(), 2);
     assert_eq!(env.invoke(&["status"])?.status.code(), Some(64));
     for value in values {
         let id = value["sandbox_id"].as_str().ok_or("sandbox id missing")?;
-        assert!(
-            env.invoke(&["--sandbox", id, "status", "--json"])?
-                .status
-                .success()
-        );
+        let _ = gascan_e2e::succeeded(env.invoke(&["--sandbox", id, "status", "--json"])?);
     }
     Ok(())
 }
@@ -920,14 +906,9 @@ fn daemon_idle_restart_uses_independent_fake_runtime_truth() -> TestResult {
 #[test]
 fn daemon_kill_and_restart_preserve_runtime_truth() -> TestResult {
     let env = Environment::new()?;
-    assert!(env.invoke(&["up", env.root()?])?.status.success());
+    let _ = gascan_e2e::succeeded(env.invoke(&["up", env.root()?])?);
     let pid = std::fs::read_to_string(env.runtime_root.join("daemon.pid"))?;
-    assert!(
-        Command::new("kill")
-            .args(["-KILL", pid.trim()])
-            .status()?
-            .success()
-    );
+    gascan_e2e::status_succeeded(&(Command::new("kill").args(["-KILL", pid.trim()]).status()?));
     std::thread::sleep(std::time::Duration::from_millis(100));
     assert_eq!(
         env.invoke(&["run", "--", "fake-exit", "31"])?.status.code(),
@@ -939,10 +920,10 @@ fn daemon_kill_and_restart_preserve_runtime_truth() -> TestResult {
 #[test]
 fn default_shell_and_inspection_confirmation_are_stable() -> TestResult {
     let env = Environment::new()?;
-    assert!(env.invoke(&["up", env.root()?])?.status.success());
-    assert!(env.invoke(&["shell"])?.status.success());
-    assert!(env.invoke(&["logs"])?.status.success());
-    assert!(env.invoke(&["doctor", "--json"])?.status.success());
+    let _ = gascan_e2e::succeeded(env.invoke(&["up", env.root()?])?);
+    let _ = gascan_e2e::succeeded(env.invoke(&["shell"])?);
+    let _ = gascan_e2e::succeeded(env.invoke(&["logs"])?);
+    let _ = gascan_e2e::succeeded(env.invoke(&["doctor", "--json"])?);
     let status = String::from_utf8(env.invoke(&["status"])?.stdout)?;
     let sandbox_id = status
         .strip_prefix("Sandbox: ")
@@ -1022,8 +1003,8 @@ fn configure_with_multiple_sandboxes_stops_before_piped_token_read() -> TestResu
     env.start_daemon_without_capture()?;
     let second = tempfile::tempdir()?;
     let second_root = second.path().to_str().ok_or("non UTF-8 root")?;
-    assert!(env.invoke(&["up", env.root()?])?.status.success());
-    assert!(env.invoke(&["up", second_root])?.status.success());
+    let _ = gascan_e2e::succeeded(env.invoke(&["up", env.root()?])?);
+    let _ = gascan_e2e::succeeded(env.invoke(&["up", second_root])?);
 
     let output = env
         .command(&[
@@ -1049,13 +1030,13 @@ fn configure_with_multiple_sandboxes_stops_before_piped_token_read() -> TestResu
 fn configure_with_stopped_sandbox_stops_before_piped_token_read() -> TestResult {
     let env = Environment::new()?;
     env.start_daemon_without_capture()?;
-    assert!(env.invoke(&["up", env.root()?])?.status.success());
+    let _ = gascan_e2e::succeeded(env.invoke(&["up", env.root()?])?);
     let status = env.invoke(&["status", "--json"])?;
     let sandbox_id = serde_json::from_slice::<serde_json::Value>(&status.stdout)?["sandbox_id"]
         .as_str()
         .ok_or("sandbox id missing")?
         .to_owned();
-    assert!(env.invoke(&["down"])?.status.success());
+    let _ = gascan_e2e::succeeded(env.invoke(&["down"])?);
 
     let output = env
         .command(&[
@@ -1084,7 +1065,7 @@ fn real_pty_large_output_waits_for_capacity_without_exiting() -> TestResult {
     use rustix_openpty::rustix;
     let _signal_guard = signal_test_guard()?;
     let env = Environment::new()?;
-    assert!(env.invoke(&["up", env.root()?])?.status.success());
+    let _ = gascan_e2e::succeeded(env.invoke(&["up", env.root()?])?);
     let pty = rustix_openpty::openpty(None, None)?;
     let saved = normalized_termios(&pty.user)?;
     let stdin = std::fs::File::from(rustix::io::dup(&pty.user)?);
@@ -1136,7 +1117,7 @@ fn real_pty_resize_signals_and_terminal_restoration_are_exact() -> TestResult {
     use rustix_openpty::rustix;
     let _signal_guard = signal_test_guard()?;
     let env = Environment::new()?;
-    assert!(env.invoke(&["up", env.root()?])?.status.success());
+    let _ = gascan_e2e::succeeded(env.invoke(&["up", env.root()?])?);
     for (signal, expected) in [
         (rustix::process::Signal::INT, 130),
         (rustix::process::Signal::TERM, 143),
@@ -1193,7 +1174,7 @@ fn real_pty_success_nonzero_and_connection_error_restore_terminal() -> TestResul
     use rustix_openpty::rustix;
     let _signal_guard = signal_test_guard()?;
     let env = Environment::new()?;
-    assert!(env.invoke(&["up", env.root()?])?.status.success());
+    let _ = gascan_e2e::succeeded(env.invoke(&["up", env.root()?])?);
     assert_eq!(
         run_pty_to_eof(&env, &["shell", "--", "fake-exit", "0"])?
             .status
@@ -1218,12 +1199,7 @@ fn real_pty_success_nonzero_and_connection_error_restore_terminal() -> TestResul
         .spawn()?;
     std::thread::sleep(std::time::Duration::from_millis(150));
     let pid = std::fs::read_to_string(env.runtime_root.join("daemon.pid"))?;
-    assert!(
-        Command::new("kill")
-            .args(["-KILL", pid.trim()])
-            .status()?
-            .success()
-    );
+    gascan_e2e::status_succeeded(&(Command::new("kill").args(["-KILL", pid.trim()]).status()?));
     drop(pty.controller);
     let output = child.wait_with_output()?;
     assert_eq!(output.status.code(), Some(70));
@@ -1235,7 +1211,7 @@ fn real_pty_success_nonzero_and_connection_error_restore_terminal() -> TestResul
 async fn attach_tokens_are_one_use_atomic_and_mismatch_safe() -> TestResult {
     use gascan_proto::v1;
     let env = Environment::new()?;
-    assert!(env.invoke(&["up", env.root()?])?.status.success());
+    let _ = gascan_e2e::succeeded(env.invoke(&["up", env.root()?])?);
     let mut client = api_client(env.runtime_root.clone()).await?;
     let id = client
         .list(v1::ListRequest {})
@@ -1383,12 +1359,8 @@ async fn attach_tokens_are_one_use_atomic_and_mismatch_safe() -> TestResult {
 async fn logs_since_and_follow_emit_new_byte_exact_records_then_cancel() -> TestResult {
     use gascan_proto::v1;
     let env = Environment::new()?;
-    assert!(env.invoke(&["up", env.root()?])?.status.success());
-    assert!(
-        env.invoke(&["run", "--", "fake-stdout", "before-marker"])?
-            .status
-            .success()
-    );
+    let _ = gascan_e2e::succeeded(env.invoke(&["up", env.root()?])?);
+    let _ = gascan_e2e::succeeded(env.invoke(&["run", "--", "fake-stdout", "before-marker"])?);
     let since_millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis()
@@ -1402,11 +1374,7 @@ async fn logs_since_and_follow_emit_new_byte_exact_records_then_cancel() -> Test
         tokio::task::yield_now().await;
     }
     let since = since_millis.to_string();
-    assert!(
-        env.invoke(&["run", "--", "fake-stdout", "after-marker"])?
-            .status
-            .success()
-    );
+    let _ = gascan_e2e::succeeded(env.invoke(&["run", "--", "fake-stdout", "after-marker"])?);
     let filtered = env.invoke(&["logs", "--since-millis", &since])?;
     assert!(
         !filtered
@@ -1452,7 +1420,7 @@ async fn logs_since_and_follow_emit_new_byte_exact_records_then_cancel() -> Test
         .take()
         .ok_or("stdin missing")?
         .write_all(b"follow\0record")?;
-    assert!(child.wait()?.success());
+    gascan_e2e::status_succeeded(&(child.wait()?));
     let appended = tokio::time::timeout(std::time::Duration::from_secs(2), follow.message())
         .await??
         .ok_or("follow record missing")?;
@@ -1472,7 +1440,7 @@ async fn follow_logs_emit_exactly_one_terminal_for_shutdown_or_backend_error() -
         if fail_backend {
             start.env("GASCAN_FAKE_LOGS_FAIL_AFTER_MS", "500");
         }
-        assert!(start.output()?.status.success());
+        let _ = gascan_e2e::succeeded(start.output()?);
         let mut client = api_client(env.runtime_root.clone()).await?;
         let id = client
             .list(v1::ListRequest {})
@@ -1531,12 +1499,10 @@ async fn follow_logs_emit_exactly_one_terminal_for_shutdown_or_backend_error() -
 async fn cancelling_follow_logs_releases_daemon_activity_without_terminal() -> TestResult {
     use gascan_proto::v1;
     let env = Environment::new()?;
-    assert!(
+    let _ = gascan_e2e::succeeded(
         env.command(&["up", env.root()?])
             .env("GASCAN_IDLE_TIMEOUT_MS", "300")
-            .output()?
-            .status
-            .success()
+            .output()?,
     );
     let mut client = api_client(env.runtime_root.clone()).await?;
     let id = client
@@ -1574,12 +1540,10 @@ async fn cancelling_follow_logs_releases_daemon_activity_without_terminal() -> T
 async fn slow_up_returns_live_operation_and_survives_disconnect() -> TestResult {
     use gascan_proto::v1;
     let env = Environment::new()?;
-    assert!(
+    let _ = gascan_e2e::succeeded(
         env.command(&["doctor", "--json"])
             .env("GASCAN_FAKE_PROVISION_DELAY_MS", "600")
-            .output()?
-            .status
-            .success()
+            .output()?,
     );
     let mut client = api_client(env.runtime_root.clone()).await?;
     let response = tokio::time::timeout(
@@ -1607,12 +1571,10 @@ async fn slow_up_returns_live_operation_and_survives_disconnect() -> TestResult 
 async fn post_begin_failure_keeps_operation_id_and_streams_failed_terminal() -> TestResult {
     use gascan_proto::v1;
     let env = Environment::new()?;
-    assert!(
+    let _ = gascan_e2e::succeeded(
         env.command(&["doctor", "--json"])
             .env("GASCAN_FAKE_PROVISION_FAIL", "1")
-            .output()?
-            .status
-            .success()
+            .output()?,
     );
     let mut client = api_client(env.runtime_root.clone()).await?;
     let mut events = client
@@ -1641,12 +1603,10 @@ async fn post_begin_failure_keeps_operation_id_and_streams_failed_terminal() -> 
 async fn pre_begin_rpc_failures_keep_stable_statuses() -> TestResult {
     use gascan_proto::v1;
     let env = Environment::new()?;
-    assert!(
+    let _ = gascan_e2e::succeeded(
         env.command(&["doctor", "--json"])
             .env("GASCAN_FAKE_PROVISION_DELAY_MS", "600")
-            .output()?
-            .status
-            .success()
+            .output()?,
     );
     let mut client = api_client(env.runtime_root.clone()).await?;
     let missing = gascan_core::sandbox::SandboxId::test("missing").to_string();
@@ -1729,13 +1689,11 @@ async fn pre_begin_rpc_failures_keep_stable_statuses() -> TestResult {
     );
 
     let doctor_failure = Environment::new()?;
-    assert!(
+    let _ = gascan_e2e::succeeded(
         doctor_failure
             .command(&["doctor", "--json"])
             .env("GASCAN_FAKE_CAPABILITIES_FAIL", "1")
-            .output()?
-            .status
-            .success()
+            .output()?,
     );
     let failing = Environment::new()?;
     let unavailable = failing
