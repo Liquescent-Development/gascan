@@ -2272,14 +2272,71 @@ follow, and a follow mode is the first step back toward a general container API.
 to an earlier `Run`; here the stream that starts the exec is the stream that carries it,
 so the binding is the connection.
 
-### State at handover
+### ~~State at handover~~ — SUPERSEDED, written before the merges; see "Final state" below
 
-- gascan `design/arca-engine-proto` at `f1e4dda`, branched from `main` `9a8efe3`.
-- arca `feat/engine-proto` at `89916f5`, branched from `main` `7da8f77`.
-- **Neither is merged and neither has a PR yet.** Both `main`s are untouched.
+- ~~gascan `design/arca-engine-proto` at `f1e4dda`, branched from `main` `9a8efe3`.~~
+- ~~arca `feat/engine-proto` at `89916f5`, branched from `main` `7da8f77`.~~
+- ~~**Neither is merged and neither has a PR yet.** Both `main`s are untouched.~~
 - The Arca pin is unchanged: tag `gascan-engine-ip-internal` → `d66c320c`. P3.1 adds a
   file to Arca and does not move the pin, because nothing in Gas Can builds against it
-  yet — that is P3.2.
+  yet — that is P3.2. **Still true, and it is the next session's first blocker.**
 - The local suite was not re-run: no Rust source changed in Gas Can this session, only
   documentation. The bar recorded at session close (1377 passed / 0 failed / 22 ignored
-  at `6f88e79`) is not restated as though re-measured.
+  at `6f88e79`) is not restated as though re-measured. **Still true.**
+
+The branch lines are struck through rather than deleted because the block was accurate
+when written and everything merged afterwards. A reader who found "neither is merged"
+still standing would have drawn a false conclusion about where the work ended up.
+
+### Final state, 2026-08-07 (later)
+
+**VERIFIED.** Everything merged, both repositories clean, **zero open PRs in either**.
+
+| | |
+|---|---|
+| gascan `main` | `6e5cc7d` |
+| arca `main` | `a974f17` |
+
+Three PRs landed, each a true merge commit:
+
+| PR | Contents | Merge commit |
+|---|---|---|
+| **arca#52** | `proto/arca/engine/v1/engine.proto` — the artifact | `a974f17` |
+| **gascan#59** | Design doc, roadmap, two in-place corrections, this session record | `042a281` |
+| **gascan#60** | Kickoff refreshed to P3.2, with the pin blocker named | `6e5cc7d` |
+
+`Vas-Solutus/arca#50` remains open. It is the deliberately-unfixed broadcast-allocation
+issue, not a PR.
+
+**On every gascan PR this session, `runtime-probe` was the ONLY failing check** —
+`gate`, `contracts` and `changes` passed and `engine`/`rust` correctly skipped on a
+docs-only change. That is **D4**, and it is now confirmed on three independent runs
+rather than assumed from one.
+
+### The blocker the next session hits first, VERIFIED
+
+**The engine proto is absent at the pinned Arca revision.**
+
+```
+git cat-file -e d66c320c09e1dfc4f37aafa1fb27e36aa5cabe5d:proto/arca/engine/v1/engine.proto
+  ->  fails
+```
+
+The proto landed at `89916f5`/`a974f17`; `engine/arca-pin.json` resolves to `d66c320c`,
+which is an ancestor of Arca's `main` (`git merge-base --is-ancestor`, exit 0). So Gas
+Can's build cannot see `engine.proto` until Arca is re-tagged and the pin is bumped, and
+**that tag must be annotated and signed** — never lightweight — which means the 1Password
+SSH agent has to be unlocked early rather than forty minutes in.
+
+This was found by checking rather than by assuming, and it is the whole reason the
+kickoff leads with it.
+
+### Two judgment calls the maintainer should feel free to reverse
+
+**The proto size gate was restated as declaration lines**, threshold unchanged at 400,
+and that restatement is written into the roadmap. It is a change to a rule, not a
+measurement — recorded as such.
+
+**The kickoff was refreshed without being asked.** It still read "YOUR TASK: P3.1" and
+would have sent the next agent to redo finished work; leaving it stale seemed worse than
+the scope stretch. Merged as #60.
