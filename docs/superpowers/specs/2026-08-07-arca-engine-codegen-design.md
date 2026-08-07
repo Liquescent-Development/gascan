@@ -232,16 +232,32 @@ artifact in this sequence that should not be cut twice.
 
 ## 8. Found and deliberately not fixed
 
-**Arca's checked-in generated Swift is stale against the installed plugins.**
-Running `scripts/generate-grpc.sh` rewrites **four tracked files** under
+**Arca's checked-in generated Swift is stale against the protos it is generated
+from.** Running `scripts/generate-grpc.sh` rewrites **four tracked files** under
 `Sources/ContainerBridge/Generated/` and **six `.pb.go` files** in the
-`containerization` submodule. **VERIFIED** by running it: the diff is entirely
-`nonisolated` annotations introduced by `protoc-gen-swift` 1.38.1.
+`containerization` submodule.
 
-That drift predates this change. It was reverted out of the branch rather than
-carried along beneath a codegen-wiring commit, and regenerating it deliberately —
-which also means deciding whether the submodule's Go output should be regenerated
-by this script at all — is its own change and nobody has scheduled it.
+~~**VERIFIED** by running it: the diff is entirely `nonisolated` annotations
+introduced by `protoc-gen-swift` 1.38.1.~~ **WRONG, corrected 2026-08-07.** That
+claim came from sampling `wireguard.pb.swift` and generalising to four files.
+**VERIFIED** against the raw diff, the drift is two different things:
+
+| File | Change |
+|---|---|
+| `wireguard.pb.swift`, `process.pb.swift` | `nonisolated` annotations, as described |
+| `filesystem.pb.swift`, `filesystem.grpc.swift` | **8 message types and 4 RPCs that were never generated at all** — `StatPath`, `CreateVolumeOverlay`, `CreateDirectMount`, `GenerateHostsFile` |
+
+So the committed output was not merely formatted by an older plugin; it was
+generated from an **older `filesystem.proto`** and is missing real surface. The
+error is left visible rather than edited away because it is the same mistake the
+exec-latency probe and the proto size gate both made — trusting a sample that
+measures something adjacent to the question. One file was read and four were
+described.
+
+That drift predates this change. It was reverted out of the codegen-wiring branch
+rather than carried along beneath it, and landed separately in **arca#54**, Swift
+only. Whether `generate-grpc.sh` should be regenerating another repository's Go
+output at all is a real question that PR does not answer.
 
 ## 9. Deliberately not done
 
