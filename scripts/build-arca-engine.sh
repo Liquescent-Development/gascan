@@ -98,6 +98,15 @@ git -C "$checkout" -c 'url.https://github.com/.insteadOf=git@github.com:' \
 # stdout and corrupt the checkout path this script contracts to print there.
 git -C "$checkout" submodule foreach --quiet --recursive git clean -qffdx
 
-swift build --package-path "$checkout" --configuration release --target ContainerBridge >&2
+# Targets, not products, deliberately — ContainerBridge is the line that changes
+# when P5.1 lands an engine executable.
+#
+# SandboxEngineProto is the generated server code for the contract this pin
+# exists to carry. Building it here is what makes the pin's claim checkable from
+# this side: crates/gascan-engine-proto generates a client from the same revision
+# and compiles it, so without this the pinned server half would be the only end
+# of the contract nothing ever compiled.
+swift build --package-path "$checkout" --configuration release \
+  --target ContainerBridge --target SandboxEngineProto >&2
 
 printf '%s\n' "$checkout"

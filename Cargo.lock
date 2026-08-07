@@ -543,6 +543,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gascan-engine-proto"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "prost-build",
+ "prost-types",
+ "protoc-bin-vendored",
+ "tonic",
+ "tonic-build",
+]
+
+[[package]]
 name = "gascan-inherited-fd"
 version = "0.1.0"
 dependencies = [

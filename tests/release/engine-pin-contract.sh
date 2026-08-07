@@ -37,10 +37,12 @@ git -C "$subupstream" config user.email engine@example.invalid
 git -C "$subupstream" add -A
 git -C "$subupstream" -c commit.gpgsign=false commit -qm seed
 
-# An upstream repository standing in for Arca. It carries a Package.swift with a
-# target named ContainerBridge so the build step has something real to compile.
+# An upstream repository standing in for Arca. It carries a Package.swift with
+# targets named ContainerBridge and SandboxEngineProto, because those are the two
+# the build script names. A fixture that declares fewer targets than the script
+# builds does not exercise the script; it just fails differently.
 upstream=$fixture/upstream
-mkdir -p "$upstream/Sources/ContainerBridge"
+mkdir -p "$upstream/Sources/ContainerBridge" "$upstream/Sources/SandboxEngineProto"
 cat >"$upstream/Package.swift" <<'PACKAGE'
 // swift-tools-version: 6.2
 import PackageDescription
@@ -51,11 +53,16 @@ let package = Package(
         .target(
             name: "ContainerBridge",
             dependencies: [.product(name: "EngineSupport", package: "containerization")]
-        )
+        ),
+        // Stands in for Arca's generated engine-contract server code. Dependency
+        // free on purpose: the contract under test is that the pin builds the
+        // target, not what the generated code imports.
+        .target(name: "SandboxEngineProto")
     ]
 )
 PACKAGE
 printf 'public let engineFixture = 1\n' >"$upstream/Sources/ContainerBridge/Fixture.swift"
+printf 'public let sandboxEngineProtoFixture = 1\n' >"$upstream/Sources/SandboxEngineProto/Fixture.swift"
 git -C "$upstream" init -q
 git -C "$upstream" config user.name fixture
 git -C "$upstream" config user.email engine@example.invalid

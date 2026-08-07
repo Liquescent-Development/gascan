@@ -234,7 +234,7 @@ payoff that justified merging.
 | Step | Work | Status |
 |---|---|---|
 | P3.1 | Define the engine proto. Derived from `RuntimeBackend`; constrained by contract §4 (what must be inexpressible) and §5 (what must be expressible). Resolve **U4**. | ✅ **Done 2026-08-07.** `arca/proto/arca/engine/v1/engine.proto`, package `arca.engine.v1`, 11 RPCs. Design in `docs/superpowers/specs/2026-08-07-arca-engine-proto-design.md`. U4 resolved below. |
-| P3.2 | Codegen wired both sides — Swift server, Rust client. | Both generators VERIFIED to run against the file (P3.1 §12); neither is wired into a build. |
+| P3.2 | Codegen wired both sides — Swift server, Rust client. | ✅ **Done 2026-08-07.** Swift: `SandboxEngineProto`, its own target in Arca, `swift build` rc=0. Rust: `crates/gascan-engine-proto`, generated across the pin at build time by `scripts/sync-arca-proto.sh`, client only. Pin bumped to `gascan-engine-proto-v1` → `77b293e`. Design in `docs/superpowers/specs/2026-08-07-arca-engine-codegen-design.md`. |
 | P3.3 | **Added 2026-08-05.** Publish and version the proto as Arca's contract to its consumers. It lives in Arca, per "Arca owns the wire protocol". | Open. Carries the `buf breaking` check, which P3.1 deliberately did not fake — `buf` is absent from this machine and Arca has no CI, so a check added now would be inert. |
 
 **Exit:** proto exists, both sides generate, nothing implements it yet.

@@ -24,8 +24,18 @@ while IFS= read -r path; do
       engine=true
       contracts=true
       ;;
+    # Run by crates/gascan-engine-proto's build script, so a change to it changes
+    # what the Rust build generates.
+    scripts/sync-arca-proto.sh)
+      rust=true
+      contracts=true
+      ;;
+    # The pin decides which revision of the engine contract the Rust client is
+    # generated from, so bumping it rebuilds the client. It fired `engine` alone
+    # until 2026-08-07, which was correct only while nothing in Rust read it.
     engine/*)
       engine=true
+      rust=true
       ;;
     crates/*|Cargo.toml|Cargo.lock|rust-toolchain.toml|proto/*)
       rust=true
