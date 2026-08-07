@@ -1923,3 +1923,73 @@ should not be made one; ruleset `20492137` carries `deletion`, `non_fast_forward
 `OrganizationAdmin` bypass. A green `cargo test --workspace` on this machine is the bar.
 The `autostart.rs` symlink test (`daemon_attest_rejects_a_symlink_…`) still fails **open**;
 its fix is mechanical, needs no decision, and is a good warm-up task for whoever wants one.
+
+## Session of 2026-08-07 (continued) — the latency probe was measuring the wrong thing
+
+### D3 resolved: `fake_backend.rs` failures now say what the child printed
+
+**Maintainer's decision: instrument it.** Done, and the scope was larger than the three
+observed failures. A parser that strips string literals and looks for a top-level comma
+found **50** `assert!` blocks in `crates/gascan-e2e/tests/fake_backend.rs` asserting
+`.success()` with **no message at all** — including all three that failed today
+(`:625`, `:1087`, `:1475`). An earlier count of 14 was wrong because it skipped any block
+containing a string literal, which excluded two of the three.
+
+`describe_output`/`describe_status` moved from `tests/doctor.rs` into
+`crates/gascan-e2e/src/lib.rs`, joined by `succeeded(Output) -> Output` and
+`status_succeeded(&ExitStatus)`, both `#[track_caller]`. Every test binary in this crate
+defines its own `Environment`, so a shared helper had to live in the lib rather than be
+copied a third time. `succeeded` returns the output so a bare
+`assert!(x.status.success())` becomes `succeeded(x)` without the caller naming a
+temporary; where the value is used afterwards it rebinds (`let x = succeeded(x);`).
+
+**Mutation-verified.** Pointing the `up` in
+`real_pty_large_output_waits_for_capacity_without_exiting` at a nonexistent root now
+prints
+`exit code 64, stdout=, stderr=Error: cannot use `/nonexistent-root-for-mutation` as a
+project root: No such file or directory (os error 2)`
+at `fake_backend.rs:1064` — the call site, because of `#[track_caller]`. The same failure
+previously printed `assertion failed: env.invoke(...)?.status.success()` and nothing else.
+`cargo test -p gascan-e2e --test fake_backend --test doctor` passed 3/3 after the rewrite;
+`cargo fmt` and `clippy -D warnings` clean.
+
+### The exec-latency probe is invalid, and every comparison made with it was blind
+
+> **Correction to a load-bearing convention.** The trap reads: *"Before comparing any two
+> test runs, measure it: write a fresh script, `time` it."* **A shell script cannot see
+> this phenomenon.** Measured within one minute, on this machine:
+>
+> | What was executed | Time |
+> |---|---|
+> | `#!/bin/sh` script — what the trap prescribes | **0.005 s** |
+> | Rust test binary already executed once | **14.2 s** |
+> | The same bytes copied to a brand-new path | **32.8 s** |
+> | Another new path | **23.5 s** |
+>
+> Three orders of magnitude apart, at the same instant. Every "both arms saw the same
+> machine state" check made with the script probe was measuring something immune to the
+> effect it was written to detect.
+
+**The named cause is macOS's own security and indexing daemons over freshly built
+binaries.** `top -l 2 -o cpu` during the slow window: `syspolicyd` **42.5%**, then
+`spotlightknowledged` **193.7%**, `corespotlightd` 27.1%, `XprotectService` 16.5% — with
+the machine reporting 65% *idle* CPU and a load average of 8.10. Gatekeeper evaluates
+unsigned, newly written Mach-O files, and Spotlight indexes `target/`. As the indexers
+settled, cold exec fell from 32.8 s to **0.753 s** while the script stayed at 0.005 s.
+
+**This is very likely the long-unexplained instability**, including the `~30 s` figure
+recorded earlier. It also explains a run in this session that was abandoned after 10
+minutes: **10 failures, every one in `autostart.rs`** — the daemon-spawn tests, whose
+budgets are seconds — followed by a hang in `attach_bridge`. That run was environmental.
+The same tree had already passed `1376 passed, 1 failed` **twice**, and no `gascand`,
+`arca` or stray `cargo` process was alive at the time (checked by `ps`, not assumed).
+
+**The correct probe** is to `cp` a built test binary to a new path and `time` it — a new
+path matters, because an already-evaluated binary is cheaper than a fresh one. Two lines,
+and it is the only form that sees the effect.
+
+**Not applied, because it changes the machine rather than the repository:** excluding
+`target/` from Spotlight indexing is the obvious mitigation and would plausibly stabilise
+the whole suite. That is the maintainer's call, not mine — it is a system setting.
+**This is now the leading candidate for D6**, and it is a much cheaper hypothesis than
+the `--test-threads` oversubscription one, which remains unmeasured.
