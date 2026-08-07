@@ -89,24 +89,10 @@ Arca the way it does, which is not obvious from the code alone.
   - Squash- or rebase-merge either repo. Commit to main. Both are forbidden.
 
 **STILL OPEN, none of it the next task:**
-  - D4 — delete `runtime-probe` from `ci.yml`. Spec §7.2 says the job is temporary
-    and "then deleted"; §11.5 recorded its VERIFIED answer. It is the ONLY failing
-    check and makes every workflow run report `conclusion: failure`. Real, but CI work.
-    **It does NOT block `gate`.** VERIFIED 2026-08-07 on run `31209969877`:
-    `runtime-probe: failure` alongside `gate: success`. `gate`'s `needs` is
-    `[changes, rust, contracts, engine]` (`ci.yml:111`) and `runtime-probe` is
-    deliberately excluded, so its step name — "Require every job to have succeeded
-    or been skipped" — is broader than what it checks. D4 is noise at the run level,
-    not a blocked gate. **Also note `runtime-probe` reports `skipped` on `push` and
-    `failure` on `pull_request`**, so a green run on `main` is not evidence that D4
-    resolved itself.
-  - D5 — `stash@{0}` `f6356f9` holds EXACTLY ONE file, `.superpowers/sdd/progress.md`,
-    which is gitignored. No tracked content. Dropping it is the maintainer's call.
-  - D7 — how the health check should treat mode `0200`. `validate_file_stat`
-    (`daemon.rs:3057`) reports a `0200` file as "unsafe" because it compares against
-    `FILE_MODE` alone. NEEDS A MAINTAINER DECISION, and **do not reach for a blanket
-    retry** — VERIFIED 2026-08-07 by reading the code, `0200` is TWO states and only
-    one of them ever resolves:
+  - D7 — **half done.** The instrument landed 2026-08-07; the remedy did not.
+    `validate_file_stat` (`daemon.rs:3057`) now names which of the two `0200`
+    states it saw and reports size in every case. **`0200` is TWO states and only
+    one of them ever resolves** — this module already split on it:
 
       is_instance_tombstone      (daemon.rs:2708)  mode 0200, size == 0
         an inert placeholder; publication is in flight and WILL complete
@@ -114,17 +100,26 @@ Arca the way it does, which is not obvious from the code alone.
       is_interrupted_tombstone   (daemon.rs:2633)  mode 0200, size > 0
         a daemon wrote the record and died before chmod to 0600. NEVER resolves.
 
-    A blanket retry turns the second case from an immediate, diagnosable failure into
-    a timeout — you burn the health window and then report "did not become healthy"
-    instead of "a previous daemon died mid-publication". Any retry must be narrowed to
-    the exact inert shape (regular file, uid matches, nlink 1, mode 0200, **size 0**),
-    with every other deviation still failing immediately.
+    **What remains: the narrowed retry**, which the maintainer approved in
+    principle. It must be scoped to the exact inert shape (regular file, uid
+    matches, nlink 1, mode 0200, **size 0**), with every other deviation still
+    failing immediately. A blanket retry turns the interrupted case from an
+    immediate diagnosable failure into a timeout — you burn the health window and
+    then report "did not become healthy" instead of "a previous daemon died
+    mid-publication".
 
-    **INSTRUMENT BEFORE CHANGING BEHAVIOUR.** `validate_file_stat` never looks at size
-    and does not report it, so the existing evidence cannot distinguish the two cases:
-    run `31209969877` passed this test and run `31209575561` failed it
-    (`autostart.rs:396`, job `92969028088`), and neither log records size. Make it say more first — this is the project's
-    highest-yield habit and the remedy is currently a guess without it.
+    The next CI occurrence will now say which state fired. Run `31209969877`
+    passed this test and run `31209575561` failed it (`autostart.rs:396`, job
+    `92969028088`) — neither log recorded size, which is exactly what the
+    instrument fixes.
+  - **`scripts/generate-grpc.sh` rewrites six `.pb.go` files inside the
+    `containerization` submodule**, which is a SEPARATE REPOSITORY. The Go arms
+    were removed from Arca's script 2026-08-07 (option A), so this is CLOSED for
+    the collateral damage. **What remains is the root cause**: nothing notices when
+    Arca's checked-in Swift falls behind a submodule proto bump, which is how it
+    came to be missing four RPCs. The remedy is a "generated code is current" check
+    — run the generator, `git diff --exit-code` — and it is **booked against P2.3**
+    because Arca has no CI and a check added now would be inert.
   - **`scripts/generate-grpc.sh` rewrites six `.pb.go` files inside the
     `containerization` submodule**, which is a SEPARATE REPOSITORY. arca#54 was
     scoped to Swift and reverted them. Whether this script should regenerate another
@@ -146,7 +141,26 @@ Arca the way it does, which is not obvious from the code alone.
     still says `Sources/DockerAPI/` is deleted (`:57-66`, `:199`). The reversal negates
     that. Real work; nobody has scheduled it.
 
+**CLOSED 2026-08-07, do not reopen:**
+  - **D4 — `runtime-probe` is DELETED** from `ci.yml`. It asked a settled question
+    (hosted `macos-26` has no `container` binary, exit 127) on every pull request and
+    failed every time. `scripts/apple-test-preflight.sh` is KEPT — it is the local
+    Apple preflight, referenced by six plan documents, and is not CI-specific.
+  - **D5 — the stash is DROPPED**, commit `01db66d`, on the maintainer's explicit
+    ruling. **The old description of it was WRONG**: it claimed "EXACTLY ONE file,
+    `.superpowers/sdd/progress.md`, no tracked content". It actually held THREE files
+    — `progress.md`, `task-2-report.md`, `task-4-report.md` — all marked `M`, so all
+    tracked when it was made. The content was SDD scaffolding for work that shipped
+    long ago (PR #13, release 0.1.20), which is why dropping it was still right. The
+    commit stays reachable from the reflog until gc.
+
 **TRAPS, all paid for already:**
+  - **`gate` DOES NOT MEAN "everything passed".** Its `needs` is
+    `[changes, rust, contracts, engine]`, so any job outside that list can be red
+    while `gate` is green — VERIFIED on run `31209969877`, where `runtime-probe`
+    failed and `gate` succeeded. The step is named "Require every job to have
+    succeeded or been skipped", which is broader than what it checks. If you add a
+    job and want it to block, add it to `needs`.
   - **THE PIN NOW DRIVES THE RUST BUILD.** `engine/arca-pin.json` decides which
     revision `gascan-engine-proto` generates from. `scripts/ci-classify-paths.sh`
     maps `engine/*` to `rust=true` AND `engine=true` for exactly this reason. It
@@ -204,9 +218,12 @@ Arca the way it does, which is not obvious from the code alone.
     `rust-toolchain.toml`. Prefix `env -u RUSTUP_TOOLCHAIN` to be certain.
   - `cargo clippy --fix` is NOT safe here — it emitted invalid Rust at service.rs:2694
     and dropped needed parentheses in an SSH host-key check at ssh/manager.rs:647.
-  - `crates/gascand` denies `clippy::panic`, `clippy::expect_used`, `clippy::unwrap_used`
-    **including in its own tests**, and forbids `unsafe_code`. Write test helpers that
-    return `Result`, not ones that `panic!`/`expect`.
+  - `crates/gascand` **and `crates/gascan`** deny `clippy::panic`,
+    `clippy::expect_used`, `clippy::unwrap_used` **including in their own tests**
+    (`gascan/src/lib.rs:2`), and forbid `unsafe_code`. Write test helpers that return
+    `Result`, not ones that `panic!`/`expect`. This bit again 2026-08-07: a new test
+    used `expect_err` and `cargo clippy --all-targets` rejected it, which `cargo test`
+    alone would not have caught.
   - In `gascan-e2e`, assert child success with `gascan_e2e::succeeded(output)` —
     a bare `assert!(x.status.success())` reports nothing.
   - Repository rulesets update with **PUT**. `PATCH` on

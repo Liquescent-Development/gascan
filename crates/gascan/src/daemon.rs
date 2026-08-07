@@ -7293,9 +7293,14 @@ mod tests {
             // Stat the path rather than open it: a 0200 file cannot be opened
             // O_RDONLY, and the production paths that hit this stat too.
             let stat = rustix::fs::stat(&path)?;
-            Ok(super::validate_file_stat(&stat, uid)
-                .expect_err("a non-0600 mode must not validate")
-                .to_string())
+            // Returns Result rather than expect-ing: this crate denies
+            // clippy::expect_used in its own tests (lib.rs:2).
+            match super::validate_file_stat(&stat, uid) {
+                Ok(()) => Err(io::Error::other(format!(
+                    "mode {mode:04o} must not validate as safe"
+                ))),
+                Err(error) => Ok(error.to_string()),
+            }
         };
 
         let inert = describe("inert", b"", 0o200)?;
