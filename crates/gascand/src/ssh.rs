@@ -160,6 +160,159 @@ impl std::fmt::Display for KeygenOutcome {
     }
 }
 
+/// The longest redacted `ssh-keygen` diagnostic that is allowed to travel with
+/// an error. `ssh-keygen`'s own messages are single short lines; the bound
+/// exists so a pathological child cannot inflate a log entry.
+const MAX_KEYGEN_MESSAGE_CHARS: usize = 200;
+
+/// What `ssh-keygen` wrote to stderr, reduced to a single bounded line with the
+/// pathnames it was given replaced.
+///
+/// `ssh-keygen` echoes back only the file argument it was handed, so replacing
+/// exactly those strings removes the sole caller-specific content without
+/// guessing at what a path looks like. Everything that survives comes from
+/// `ssh-keygen`'s own fixed message table.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct KeygenMessage(String);
+
+impl KeygenMessage {
+    /// Reduce raw child stderr to a redacted single line.
+    ///
+    /// Redaction happens before truncation so that a pathname cannot be cut in
+    /// half and partially survive.
+    #[must_use]
+    pub fn redacted(stderr: &[u8], sensitive: &[String]) -> Self {
+        let mut text = String::from_utf8_lossy(stderr).into_owned();
+        for secret in sensitive {
+            if !secret.is_empty() {
+                text = text.replace(secret.as_str(), "<path>");
+            }
+        }
+        let mut line = String::new();
+        let mut pending_space = false;
+        let mut truncated = false;
+        for character in text.chars() {
+            let printable = matches!(character, ' '..='~');
+            if !printable || character == ' ' {
+                pending_space = !line.is_empty();
+                continue;
+            }
+            if line.chars().count() >= MAX_KEYGEN_MESSAGE_CHARS {
+                truncated = true;
+                break;
+            }
+            if pending_space {
+                line.push(' ');
+                pending_space = false;
+            }
+            line.push(character);
+        }
+        if truncated {
+            line.push('…');
+        }
+        Self(line)
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// What the parent's copy of a mapped descriptor number referred to just after
+/// the child was forked.
+///
+/// A child that cannot open `/dev/fd/<N>` while the parent still holds N on the
+/// intended file was failed by the spawn. One that finds N holding a different
+/// file, or closed, was failed by something else in this process reusing the
+/// number -- which is the only way a descriptor the parent owns can change
+/// identity underneath it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MappedDescriptor {
+    /// No descriptor was mapped into this invocation.
+    #[default]
+    None,
+    /// The number still referred to the intended file.
+    Intact,
+    /// The number referred to a different file.
+    Replaced,
+    /// The number was no longer open.
+    Closed,
+}
+
+impl std::fmt::Display for MappedDescriptor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::None => "no mapped descriptor",
+            Self::Intact => "parent descriptor intact",
+            Self::Replaced => "parent descriptor replaced",
+            Self::Closed => "parent descriptor closed",
+        })
+    }
+}
+
+/// A refusal by `ssh-keygen`: how it ended, and what it said about why.
+///
+/// The two are carried together because neither answers the question alone.
+/// Exit 255 is `ssh-keygen`'s argument/usage rejection and is shared by
+/// "the descriptor was not there" and "the bytes behind it were not a key";
+/// only the message separates them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeygenRejection {
+    outcome: KeygenOutcome,
+    message: KeygenMessage,
+    descriptor: MappedDescriptor,
+}
+
+impl KeygenRejection {
+    #[must_use]
+    pub const fn new(
+        outcome: KeygenOutcome,
+        message: KeygenMessage,
+        descriptor: MappedDescriptor,
+    ) -> Self {
+        Self {
+            outcome,
+            message,
+            descriptor,
+        }
+    }
+
+    #[must_use]
+    pub const fn outcome(&self) -> KeygenOutcome {
+        self.outcome
+    }
+
+    #[must_use]
+    pub const fn message(&self) -> &KeygenMessage {
+        &self.message
+    }
+
+    #[must_use]
+    pub const fn descriptor(&self) -> MappedDescriptor {
+        self.descriptor
+    }
+}
+
+impl std::fmt::Display for KeygenRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.message.is_empty() {
+            write!(formatter, "{}, no diagnostic output", self.outcome)?;
+        } else {
+            write!(formatter, "{}: {}", self.outcome, self.message.as_str())?;
+        }
+        if self.descriptor != MappedDescriptor::None {
+            write!(formatter, " [{}]", self.descriptor)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SshError {
     #[error("{0}")]
@@ -178,9 +331,11 @@ pub enum SshError {
     /// available only through a `#[cfg(test)]` `eprintln!`, which never reaches
     /// a `gascand` spawned by an end-to-end test -- so a real rejection was
     /// observed once with no way to tell a key that is genuinely bad from a
-    /// `ssh-keygen` that was killed or never ran.
+    /// `ssh-keygen` that was killed or never ran. The status alone then proved
+    /// insufficient too: exit 255 excluded one call site but not either cause
+    /// at the remaining one, so the redacted message travels with it.
     #[error("ssh-keygen rejected the managed key ({0})")]
-    KeygenRejected(KeygenOutcome),
+    KeygenRejected(KeygenRejection),
 }
 
 impl SshError {
