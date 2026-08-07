@@ -463,6 +463,16 @@ script needs. And the wait loop never checks whether the child is still alive, s
 it cannot distinguish "slow" from "dead"; the failure reports an empty `stderr`
 either way. That diagnostic gap should be closed before or alongside any fix.
 
+> ~~**Consequence: §8 step 3 (the ruleset) must not proceed until this is fixed.**~~
+> **Superseded 2026-08-06 (night).** The ruleset was applied and `ci / gate` is now a
+> required check on ruleset `20492137`, with enforcement proven — run `31134223492`,
+> `gate` job `92729989072` = `failure`, `mergeStateStatus: BLOCKED`. The flakiness is
+> **not** resolved: it was reproduced on CI across two runs of a byte-identical tree
+> (`2c7de30…`), `31129682364` green and `31130737502` red. The maintainer's decision was
+> to accept it for now, re-run flaky jobs, and keep watching, with an
+> `OrganizationAdmin` bypass on the ruleset so a flake cannot wedge the repository.
+> See the handoff's "Session of 2026-08-06 (night)".
+
 **Consequence: §8 step 3 (the ruleset) must not proceed until this is fixed.** A
 required `ci / gate` over a suite with this failure rate would block merges for
 reasons unrelated to the change under review. Reducing parallelism or adding

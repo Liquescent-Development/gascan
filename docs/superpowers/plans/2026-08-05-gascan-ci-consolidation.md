@@ -1165,7 +1165,29 @@ gh run list -L 3 --json workflowName,conclusion,headSha \
 Expected: PR B's merge commit on `origin/main`, rulesets still `[]`, and a recent
 `ci` run with `conclusion=success`.
 
-- [ ] **Step 2: Hand the ruleset call to the maintainer**
+- [x] **Step 2: Hand the ruleset call to the maintainer**
+
+> **DONE 2026-08-06, and the command below is wrong in three ways.** Do not copy it.
+> What actually worked, run by the maintainer with `!`:
+>
+> ```
+> gh api -X PUT repos/Liquescent-Development/gascan/rulesets/20492137 --input <payload.json>
+> ```
+>
+> 1. **`PUT`, not `POST`/`PATCH`.** Ruleset `20492137` (`main protection`) already
+>    existed — Step 1's "rulesets still `[]`" expectation was stale — so this had to
+>    update it, not create a second ruleset over the same `~DEFAULT_BRANCH`. `PATCH`
+>    on that path returns **404**. `PUT` replaces the rules array wholesale, so the
+>    payload must restate `deletion`, `non_fast_forward`, `required_signatures` and
+>    `pull_request` alongside the new rule.
+> 2. **The context is `gate`, not `ci / gate`.** VERIFIED on `64ee3ee`: check runs are
+>    named by bare job name. `ci / gate` is the UI's `workflow / job` display form, and
+>    requiring that literal string would require a check that never reports — the
+>    pending-forever failure this plan already warns about for `paths:` filters.
+>    `integration_id: 15368` pins it to the GitHub Actions app.
+> 3. **`bypass_actors` must be applied *after* the Step 4 blocking proof**, never
+>    before, or a red PR may report mergeable to the very account running the test and
+>    "bypass works" becomes indistinguishable from "enforcement is broken".
 
 This is an irreversible repository-administration change and the permission classifier
 may refuse it. **Ask the maintainer to run it**, prefixed with `!`:
@@ -1214,7 +1236,21 @@ gh pr view --json mergeable,mergeStateStatus -q '{mergeable,mergeStateStatus}'
 ```
 
 Expected: `mergeStateStatus` is `BLOCKED`. **A ruleset that does not block is not
-enforcement** — if it reports `CLEAN`, the ruleset is misconfigured. Then:
+enforcement** — if it reports `CLEAN`, the ruleset is misconfigured.
+
+> **DONE 2026-08-06.** PR #51 on `ci/verify-enforcement`, head `aa133cd`: run
+> `31134223492`, `rust` job `92729941496` = `failure` at the *Formatting* step,
+> `gate` job `92729989072` = `failure`, and `mergeStateStatus: BLOCKED`. It also
+> reported `BLOCKED` *before* any check had concluded, so the requirement blocks both
+> when unreported and when red. PR closed, branch deleted; it was never merged.
+>
+> **Do not verify the override by merging the red PR.** It deliberately breaks
+> `cargo fmt`, so a misconfiguration would put that on `main` — the exact outcome this
+> step exists to prevent. Note also that `mergeStateStatus` stays `BLOCKED` even for an
+> actor who *can* bypass: it reports branch policy and is viewer-independent.
+> `current_user_can_bypass` is the field that answers "may I override this".
+
+Then:
 
 ```bash
 gh pr close ci/verify-enforcement --delete-branch
