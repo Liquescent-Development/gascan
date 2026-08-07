@@ -2153,3 +2153,133 @@ descriptor number was well reasoned: it replaces a passive assumption with an ac
 `dup2` that fails loudly. It was also 6 failures in 28 against 0 in 28. The reasoning was
 not sloppy; it was simply not evidence. The A/B cost one iteration and is now recorded at
 the call site so the next person does not re-derive the same appealing wrong answer.
+
+## Session of 2026-08-07 (later) — P3.1 done, U4 resolved, and Arca written to for the first time in six sessions
+
+### What landed
+
+The engine proto exists. `arca/proto/arca/engine/v1/engine.proto`, package
+`arca.engine.v1`, service `SandboxEngine`, **11 RPCs**, on Arca branch
+`feat/engine-proto` at `89916f5`. Design and reasoning in
+`docs/superpowers/specs/2026-08-07-arca-engine-proto-design.md`, on Gas Can branch
+`design/arca-engine-proto` at `f1e4dda`.
+
+**U4 is RESOLVED**, so **P4 and P5 are unblocked** — the roadmap's fan-out point is
+open. Nothing implements the proto and codegen is wired into neither build; that is P3.2,
+and P3's exit was deliberately modest.
+
+Four decisions were taken by the maintainer before drafting, and each is load-bearing:
+
+| # | Decision | Consequence |
+|---|---|---|
+| 1 | v1 expresses today's `RuntimeBackend` surface only | P6's peer channels and egress policy are **`reserved` blocks, not fields**. A capability nothing enforces is a surface that exists and is undefended. |
+| 2 | Outcomes travel as a typed result in the response body, uniformly | Forced by `Create`: a create failing after two of three volumes must report those two or they leak, and a gRPC status cannot carry them. Costs ~9 messages of plumbing, knowingly. |
+| 3 | The image is a structured digest | `ImageDigest { repository, sha256_hex }` — a tag is not a field, so a mutable reference is unconstructible rather than rejected. |
+| 4 | The file lives at Arca's repository root | `proto/arca/engine/v1/`, not beside the two guest-facing protos in `Sources/ContainerBridge/proto/`. A published contract is not a `ContainerBridge` internal. |
+
+### Two things came out of running the generators, not from reading the file
+
+**The result `oneof` is named `outcome`, because `result` generated seven
+`pub enum Result` types.** Each shadows `std::result::Result` at every use site the
+P5.2 client must write. A `oneof`'s *name* is not on the wire — only its member
+fields are — so the rename was free then and would have been a breaking change to a
+published contract later. VERIFIED 2026-08-07 by regenerating: **0 `pub enum Result`,
+7 `pub enum Outcome`**. Reading the file would not have found this.
+
+**The size gate fires on the wrong metric.** VERIFIED 2026-08-07:
+
+| | engine proto | `proto/gascan/v1/gascan.proto` |
+|---|---|---|
+| Raw lines | **483** | 240 |
+| Declaration lines | **275** | 200 |
+| RPCs | **11** | 14 |
+
+The roadmap's gate is *"past roughly 400 lines, something Docker-shaped has crept back
+in"*. **Breached as written, met as intended** — 208 of the 483 lines are comment or
+blank against the calibrating file's 40, so raw line count compares commenting style,
+not surface. By RPC count the engine proto is *smaller* than the API the gate was
+calibrated against. Both numbers are recorded rather than the flattering one; taking
+only the second would have repeated the exec-latency probe's mistake of trusting an
+instrument that measures something adjacent to the question.
+
+The gate is restated in the roadmap as **declaration lines, threshold unchanged at
+400**. At 275 there is real headroom and the next added message will be felt.
+
+### Verification — every claim above has a command behind it
+
+Exit codes captured directly, never through a pipe. One `rc` was initially lost to a
+pipe and re-taken.
+
+| Check | Result |
+|---|---|
+| `protoc --proto_path=proto --descriptor_set_out=…` | **rc=0**, 6.6 KB descriptor |
+| Swift server: `--swift_out` + `--grpc-swift_out=Client=false,Server=true` | **rc=0**, `engine.pb.swift` 3,366 lines, `engine.grpc.swift` 487 |
+| Rust client: scratch crate, `tonic_build` 0.12 / `prost_build` 0.13, `cargo build` | **rc=0**, 1,655 generated lines |
+
+Toolchain: `protoc` 35.1, `protoc-gen-swift` 1.38.1, `protoc-gen-grpc-swift` **1.27.0**
+— exactly the version `arca/scripts/generate-grpc.sh:39` demands to match Arca's
+`grpc-swift` pin, so **P3.2 inherits no version conflict.**
+
+**The generator was verified, not only its exit code.** A generator that silently emits
+an empty module also exits 0, so the Rust output was grepped for `SandboxEngineClient`
+and `SandboxEngineServer` (both present) and then *compiled*. Compilation is the
+stronger witness, which is why the Rust arm builds rather than merely generates. This is
+the "verify the instrument" convention applied before it had a chance to cost anything.
+
+### Corrections made in place
+
+- `2026-08-04-arca-sandbox-backend.md:31` said **"the ten `RuntimeBackend` methods"**.
+  It is **eleven** (`runtime.rs:991-1008`). The omission was `prepare_image` — the one
+  method that would grow a registry client if nobody were watching it.
+- `2026-08-04-sandbox-engine-contract.md:89` calibrated against **"188 lines of proto
+  and 12 RPCs"**. `proto/gascan/v1/gascan.proto` is **240 lines and 14 RPCs** at
+  `9a8efe3` (VERIFIED, `wc -l`) — it grew 28% while the quoted figure did not. The
+  anchor a size gate is derived from drifting is itself the phenomenon the gate exists
+  to catch.
+
+### What the proto deliberately does not do
+
+- **U5 is not resolved.** `PrepareImage` materialises a rootfs for content the engine
+  *already holds*; absent content is a failure and never a fetch. How it comes to hold
+  it stays **P5.4's**, and the roadmap calls it a genuine spec gap. Answering it here by
+  adding a source field would have resolved a spec gap by accident, in the one file
+  whose compatibility burden makes a wrong answer expensive.
+- **U6 is not resolved.** The peer-channel block is `reserved`, not designed.
+- **No `buf` check.** `which buf` → not found (VERIFIED 2026-08-07) and Arca has no CI,
+  so a mechanical breaking-change check added now would be inert. It is recorded as
+  P3.3's, not faked as done.
+- **`arca/Documentation/SANDBOX_ENGINE_PIVOT.md` is not rewritten.** It predates the
+  2026-08-05 reversal and still says `Sources/DockerAPI/` is deleted (`:57-66`, `:199`),
+  which the reversal negates. Real work, and not P3.1's.
+
+### Three shape decisions worth not re-deriving
+
+**Ownership labels cross the wire; classification does not.** `OwnerLabels` is stored
+verbatim, echoed back, never interpreted. `ResourceOwnership::{GasCanOwned, Foreign,
+Mismatched}` is a judgment *about* labels and stays in the consumer — where it already
+lives for the other backend (`gascan-apple`'s `inventory()`, `backend.rs:54`). An engine
+deciding "this one is yours" would be deciding a policy question inside the component
+the policy boundary exists to constrain. `RemovalProof` gets **no wire form at all**:
+it is an `Arc`-identity capability unforgeable only in-process, and serialising it would
+convert a compile-time guarantee into a bearer token.
+
+**`ListResources` returns unlabelled resources too.** Gas Can's drift detection depends
+on seeing foreign ones, so filtering engine-side would break it silently.
+
+**`Logs` has no `follow` field, and `Exec` has no session token.** The trait has no
+follow, and a follow mode is the first step back toward a general container API.
+`gascan.proto:228` needs a session token because `Attach` is a *separate* stream binding
+to an earlier `Run`; here the stream that starts the exec is the stream that carries it,
+so the binding is the connection.
+
+### State at handover
+
+- gascan `design/arca-engine-proto` at `f1e4dda`, branched from `main` `9a8efe3`.
+- arca `feat/engine-proto` at `89916f5`, branched from `main` `7da8f77`.
+- **Neither is merged and neither has a PR yet.** Both `main`s are untouched.
+- The Arca pin is unchanged: tag `gascan-engine-ip-internal` → `d66c320c`. P3.1 adds a
+  file to Arca and does not move the pin, because nothing in Gas Can builds against it
+  yet — that is P3.2.
+- The local suite was not re-run: no Rust source changed in Gas Can this session, only
+  documentation. The bar recorded at session close (1377 passed / 0 failed / 22 ignored
+  at `6f88e79`) is not restated as though re-measured.

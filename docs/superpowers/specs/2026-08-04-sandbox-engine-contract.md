@@ -86,10 +86,18 @@ Interaction: exec with TTY and signal forwarding, logs with a since-timestamp.
 Declaration: capabilities, including version, bind mounts, named volumes, tty,
 signals, loopback publish, resource limits, and network isolation.
 
-For calibration: Gas Can's entire north-facing API is 188 lines of proto and 12
+~~For calibration: Gas Can's entire north-facing API is 188 lines of proto and 12
 RPCs (`proto/gascan/v1/gascan.proto`). The engine protocol should land in the
 same neighbourhood. If it grows past roughly double that, something Docker-shaped
-has crept back in.
+has crept back in.~~
+
+**Calibration refreshed 2026-08-07.** `proto/gascan/v1/gascan.proto` is **240 lines
+with 14 RPCs** at `9a8efe3` (VERIFIED, `wc -l`), not 188 and 12 — it grew 28% while
+the figure quoted here did not. The intent is unchanged, but the metric is: compare
+**declaration lines**, excluding comments and blanks, because raw line count
+compares commenting style rather than surface. On that metric the north-facing API
+is 200 lines and the delivered engine proto is 275, with 11 RPCs against 14. See
+`2026-08-07-arca-engine-proto-design.md` §11.
 
 ## 6. Peer channels
 

@@ -27,8 +27,15 @@ preserved is the *seam*: `gascan-apple` is testable without Apple `container`
 installed because `CommandRunner` is a trait. `gascan-arca` needs the equivalent —
 a transport trait — so its tests do not require a running Arca.
 
-Expected shape: a transport trait, a thin type mapping, and the ten
+Expected shape: a transport trait, a thin type mapping, and the ~~ten~~ **eleven**
 `RuntimeBackend` methods. Materially smaller than `gascan-apple`.
+
+**Corrected 2026-08-07.** `runtime.rs:991-1008` lists eleven: `capabilities`,
+`inspect`, `create`, `prepare_image`, `create_container`, `start`, `stop`,
+`remove`, `exec`, `logs`, `list_resources`. The one the count dropped is
+`prepare_image` — the method that would grow a registry client if nobody were
+watching it (contract §4). The type mapping P5.2 needs is written out in
+`2026-08-07-arca-engine-proto-design.md` §9 so it is not re-derived.
 
 ## 2. Network model
 
