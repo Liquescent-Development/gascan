@@ -92,6 +92,14 @@ Arca the way it does, which is not obvious from the code alone.
   - D4 — delete `runtime-probe` from `ci.yml`. Spec §7.2 says the job is temporary
     and "then deleted"; §11.5 recorded its VERIFIED answer. It is the ONLY failing
     check and makes every workflow run report `conclusion: failure`. Real, but CI work.
+    **It does NOT block `gate`.** VERIFIED 2026-08-07 on run `31209969877`:
+    `runtime-probe: failure` alongside `gate: success`. `gate`'s `needs` is
+    `[changes, rust, contracts, engine]` (`ci.yml:111`) and `runtime-probe` is
+    deliberately excluded, so its step name — "Require every job to have succeeded
+    or been skipped" — is broader than what it checks. D4 is noise at the run level,
+    not a blocked gate. **Also note `runtime-probe` reports `skipped` on `push` and
+    `failure` on `pull_request`**, so a green run on `main` is not evidence that D4
+    resolved itself.
   - D5 — `stash@{0}` `f6356f9` holds EXACTLY ONE file, `.superpowers/sdd/progress.md`,
     which is gitignored. No tracked content. Dropping it is the maintainer's call.
   - D7 — how the health check should treat mode `0200`. `validate_file_stat` reports
