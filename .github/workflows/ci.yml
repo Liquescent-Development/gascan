@@ -93,21 +93,6 @@ jobs:
   # Temporary. Settles whether a hosted runner carries an Apple container runtime,
   # replacing a PLAN claim in the design spec with a measurement. Deliberately
   # outside gate's needs, so it can never block a merge. Removed once recorded.
-  runtime-probe:
-    if: github.event_name == 'pull_request'
-    runs-on: macos-26
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Probe for an Apple container runtime
-        run: |
-          set -eu
-          uname -s
-          uname -m
-          sw_vers
-          ./scripts/apple-test-preflight.sh
-
   gate:
     needs: [changes, rust, contracts, engine]
     if: always()

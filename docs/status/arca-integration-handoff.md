@@ -2523,7 +2523,7 @@ Everything the previous session listed remains open and is not restated here,
 
 | | |
 |---|---|
-| arca `main` | `b705b9c` after arca#54 merged; the tag is at `77b293e`, one merge behind, deliberately |
+| arca `main` | moves independently of the pin — verify it. The tag stays at `77b293e` and is deliberately BEHIND `main`: arca#54 and arca#55 both landed after it and neither touches the engine contract, so neither warrants a bump. Do not count the gap; it grows. |
 | arca tag | `gascan-engine-proto-v1` → commit `77b293e`, tag object `35d2196` |
 | gascan pin | tag `gascan-engine-proto-v1`, revision `77b293edd1369c60100045183245ae091f71c39e` |
 
@@ -2532,3 +2532,107 @@ the last session paid for twice still applies. Verify both tips with
 `git log --oneline -1`. The **tag** is stable and is the thing to trust: it is
 signed, it is asserted to equal the pin's revision, and `arca#54` lands after it
 without disturbing it.
+
+---
+
+## Session addendum, 2026-08-07 — D4, D5 and D7 ruled on; the Go-generation boundary fixed
+
+Four open items were put to the maintainer with options and a recommendation.
+All four were decided. Recorded here because three of the four turned out to
+rest on a description that was wrong.
+
+### D7 — the instrument landed, the remedy did not
+
+**The description was wrong and it nearly drove the fix.** Every prior record
+said mode `0200` was one condition: "the daemon's own not-yet-published record".
+Reading the code says otherwise, and this module already knew:
+
+| Predicate | Shape | Resolves? |
+|---|---|---|
+| `is_instance_tombstone` (`daemon.rs:2708`) | mode `0200`, **size 0** | yes — publication in flight |
+| `is_interrupted_tombstone` (`daemon.rs:2633`) | mode `0200`, **size > 0** | **never** — died before `chmod` |
+
+The maintainer asked "D7 should retry rather than just give up, would you agree?"
+The honest answer was *partly*: a blanket retry converts the interrupted case
+from an immediate diagnosable failure into a timeout, reporting "did not become
+healthy" instead of "a previous daemon died mid-publication".
+
+`validate_file_stat` (`daemon.rs:3057`) now names which state it saw and reports
+**size in every case**, including the ordinary wrong-mode one. Size is the field
+that separates the two, and its absence is precisely why the CI evidence was
+unusable: job `92969028088` failed while the same suite was green locally at
+1381/0/22, and no log could say which state fired.
+
+**No behaviour change. This is the instrument, not the remedy.** The narrowed
+retry — scoped to the exact inert shape, everything else still failing
+immediately — is approved in principle and remains to be written.
+
+Wording is observational first, interpretive second, because `validate_file_stat`
+also guards the **lifecycle lock** (`daemon.rs:118,153`), not only the instance
+record, so "tombstone" would be inaccurate at some call sites.
+
+### D4 — `runtime-probe` deleted
+
+It booted a hosted `macos-26` runner to ask whether it has an Apple container
+runtime. Settled and recorded: it does not (exit 127). Spec §7.2 always called
+the job temporary and "then deleted".
+
+**It gated nothing** — `gate`'s `needs` is `[changes, rust, contracts, engine]`
+and this job was deliberately excluded, VERIFIED on run `31209969877` where
+`runtime-probe: failure` sat beside `gate: success`. Its only effect was that
+every PR run reported `conclusion: failure`, and a signal that is always red is
+one people stop reading.
+
+`scripts/apple-test-preflight.sh` is **kept** — local Apple preflight, referenced
+by six plan documents, not CI-specific. Verified with the check the plan itself
+prescribes (`2026-08-05-gascan-ci-consolidation.md:1132`).
+
+### D5 — stash dropped, and its description was wrong
+
+Dropped on the maintainer's explicit ruling: commit `01db66d`, reachable from the
+reflog until gc.
+
+~~"`stash@{0}` holds EXACTLY ONE file, `.superpowers/sdd/progress.md`. No tracked
+content."~~ **WRONG on both counts, corrected 2026-08-07.** `git stash show
+--name-status` reports **three** files — `progress.md`, `task-2-report.md`,
+`task-4-report.md` — all marked `M`, so all *tracked* when the stash was made;
+`.superpowers/` was gitignored later. The content was substantial, ~77 lines added
+to `progress.md` alone.
+
+Dropping was still right — it is SDD scaffolding for work that shipped long ago
+(PR #13, release 0.1.20), and scaffolding is disposable by this project's own
+convention — but **the recommendation had been resting on a false premise for
+several sessions.** A backup-then-drop was recommended; the maintainer chose to
+drop outright, which is their call, and the SHA is recorded instead.
+
+### The Go-generation boundary — arca#55
+
+`generate-grpc.sh` wrote Go into `containerization/vminitd/extensions/arca-services`,
+which belongs to **a different repository**. That repository already regenerates
+its own Go with each proto change (`4cc6163` lands an RPC and its generated Go
+together), so Arca's script was redoing work its owner does, and the only
+observable effect was a dirty submodule someone had to notice and revert.
+
+**VERIFIED after the change:** `./scripts/generate-grpc.sh` → rc=0, and
+`git -C containerization status --porcelain` → **empty**. Before it, that same
+command modified four tracked Swift files and six `.pb.go` files across two
+repositories.
+
+**The root cause is NOT fixed and is booked against P2.3.** Nothing in Arca runs
+when the submodule's protos move, which is how the Swift came to be missing four
+RPCs. The remedy is a "generated code is current" check — run the generator, then
+`git diff --exit-code` — deliberately not added now for the same reason `buf` was
+not: Arca has no CI, so it would be inert, and **an inert check is worse than a
+recorded one because it reads as coverage.**
+
+### The pattern across all four
+
+Three of these four items were described wrongly before this session looked at
+them: `0200` as one state, the stash as one untracked file, and the Arca
+regeneration as annotation churn. Each description was plausible, each had
+survived several sessions, and each would have produced a wrong action —
+a blanket retry, a confident drop, and a "trivial" approval.
+
+The common cause is not carelessness about facts; it is **describing an aggregate
+after examining one member of it.** The kickoff now lists that as the third
+instrument to have been confidently wrong here.

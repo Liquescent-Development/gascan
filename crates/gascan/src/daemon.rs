@@ -3050,10 +3050,21 @@ fn file_identity_at(
 /// Four distinct faults shared one message, so a report of "ownership, type,
 /// links, or mode is unsafe" could not say which had fired. That matters
 /// because they are not equally alarming: a link count of zero means the record
-/// was unlinked while it was open, and mode 0200 is the daemon's own
-/// not-yet-published record (`gascand` creates it inert and publishes by
-/// chmod-ing to 0600), whereas a foreign owner is a genuine tampering signal.
-/// Name the fault and carry the observed values.
+/// was unlinked while it was open, whereas a foreign owner is a genuine
+/// tampering signal. Name the fault and carry the observed values.
+///
+/// ~~Mode 0200 is the daemon's own not-yet-published record.~~ **Corrected
+/// 2026-08-07: 0200 is two states, and only one of them resolves.** `gascand`
+/// creates the file inert at 0200 and publishes it by chmod-ing to 0600, so
+/// 0200 with an empty file is a publication in flight. But 0200 with *content*
+/// is a daemon that wrote its record and died before publishing, which never
+/// becomes 0600 on its own. The distinction already exists in this module —
+/// `is_instance_tombstone` and `is_interrupted_tombstone` split on exactly this
+/// — and reporting them identically is what left a caller unable to tell a race
+/// it should wait out from a corpse it should not.
+///
+/// Size is therefore reported in every case, because it is the field that
+/// separates them and its absence made a CI failure unattributable.
 fn validate_file_stat(stat: &rustix::fs::Stat, expected_uid: u32) -> io::Result<()> {
     let mode = Mode::from_raw_mode(stat.st_mode).bits() & 0o777;
     let fault = if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
@@ -3062,6 +3073,10 @@ fn validate_file_stat(stat: &rustix::fs::Stat, expected_uid: u32) -> io::Result<
         "owned by another user"
     } else if stat.st_nlink != 1 {
         "link count is not one"
+    } else if mode == INSTANCE_TOMBSTONE_MODE && stat.st_size == 0 {
+        "mode is 0200 and the file is empty: not yet published"
+    } else if mode == INSTANCE_TOMBSTONE_MODE {
+        "mode is 0200 and the file has content: written but never published"
     } else if mode != FILE_MODE {
         "mode is not 0600"
     } else {
@@ -3070,8 +3085,8 @@ fn validate_file_stat(stat: &rustix::fs::Stat, expected_uid: u32) -> io::Result<
     Err(io::Error::new(
         io::ErrorKind::PermissionDenied,
         format!(
-            "protected runtime file is unsafe: {fault} (mode {mode:04o}, links {}, uid {}, expected uid {expected_uid})",
-            stat.st_nlink, stat.st_uid
+            "protected runtime file is unsafe: {fault} (mode {mode:04o}, size {}, links {}, uid {}, expected uid {expected_uid})",
+            stat.st_size, stat.st_nlink, stat.st_uid
         ),
     ))
 }
@@ -7257,5 +7272,67 @@ mod tests {
     #[test]
     fn attestation_rejects_pid_outside_platform_range() {
         assert!(checked_pid(u32::MAX).is_err());
+    }
+
+    /// Mode 0200 is two states, and the report has to say which one it saw.
+    ///
+    /// An inert tombstone (size 0) is a publication in flight and will become
+    /// 0600 on its own. An interrupted tombstone (size > 0) is a daemon that
+    /// wrote its record and died before publishing, and will never resolve. The
+    /// old report said only "mode is not 0600" for both, which named the one
+    /// field the two states share and omitted the one that separates them.
+    #[test]
+    fn unsafe_file_report_distinguishes_the_two_tombstone_shapes() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let uid = rustix::process::geteuid().as_raw();
+
+        let describe = |name: &str, contents: &[u8], mode: u32| -> io::Result<String> {
+            let path = root(&temp)?.join(name);
+            fs::write(&path, contents)?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode))?;
+            // Stat the path rather than open it: a 0200 file cannot be opened
+            // O_RDONLY, and the production paths that hit this stat too.
+            let stat = rustix::fs::stat(&path)?;
+            // Returns Result rather than expect-ing: this crate denies
+            // clippy::expect_used in its own tests (lib.rs:2).
+            match super::validate_file_stat(&stat, uid) {
+                Ok(()) => Err(io::Error::other(format!(
+                    "mode {mode:04o} must not validate as safe"
+                ))),
+                Err(error) => Ok(error.to_string()),
+            }
+        };
+
+        let inert = describe("inert", b"", 0o200)?;
+        let interrupted = describe("interrupted", b"partial record", 0o200)?;
+        let plainly_wrong = describe("group-readable", b"published", 0o640)?;
+
+        assert!(
+            inert.contains("not yet published"),
+            "an inert tombstone must be named as one: {inert}"
+        );
+        assert!(
+            interrupted.contains("never published"),
+            "an interrupted tombstone must be named as one: {interrupted}"
+        );
+        assert_ne!(
+            inert, interrupted,
+            "the two 0200 states must not produce the same report"
+        );
+
+        // Size is the field that separates them, so every report carries it --
+        // including the ordinary wrong-mode case, whose absence of size is what
+        // made the CI evidence unusable.
+        for report in [&inert, &interrupted, &plainly_wrong] {
+            assert!(
+                report.contains("size "),
+                "every unsafe-file report must state size: {report}"
+            );
+        }
+        assert!(
+            plainly_wrong.contains("mode is not 0600"),
+            "a mode that is not a tombstone at all keeps the plain fault: {plainly_wrong}"
+        );
+        Ok(())
     }
 }
