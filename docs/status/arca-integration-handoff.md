@@ -1653,3 +1653,90 @@ ignored** across 47 binaries, the failure being
 `ssh_image_apply_preserves_fingerprints_while_accepting_new_inspected_automatic_port`
 with `SshConfigUnsafe(KeygenRejected(Code(255)))` — the same error CI hit in run
 `31136420663`.
+
+### The required check was turned on, and then turned back off — the decision that closed the session
+
+**The gate became required and then stopped being required, deliberately, within about
+two hours.** Both halves are recorded because the reversal is the useful part.
+
+`ci / gate` was made required on ruleset `20492137`, and enforcement was proven (run
+`31134223492`, `gate` job `92729989072` = `failure`, `mergeStateStatus: BLOCKED`). The
+suite could not carry it. Measured that night — **7 `rust` executions, 2 green, 5 red,
+across 4 distinct tests in 3 crates**, each re-run surfacing a different one:
+
+| Run | `rust` | Failing test |
+|---|---|---|
+| `31129682364` | green | — |
+| `31130737502` | red | `doctor_human_output_names_each_check` (gascan-e2e) |
+| `31131820848` | green | — |
+| `31134866220` att. 1 | red | `presentation::tests::interactive_progress_replaces_message_and_finishes_with_checkmark` |
+| `31134866220` att. 2 | red | the same test again |
+| `31136420663` att. 1 | red | `complete_unknown_policy_matching_observed_ssh_up_establishes_policy` (gascand) |
+| `31136420663` att. 2 | red | `provision_and_health_kill_point_phase_matrix_has_exact_recovery_status` (`reconcile.rs:965`) |
+
+**Maintainer's decision, and it governs the next session:** *"Can we just skip CI and
+test locally until this thing is built? We are letting a perfect CI system get in the way
+of actually working on this thing."* And: *"For now if it passes the suite on this
+machine, it's a pass, we can make CI stable once we have completed everything else and we
+know it works with Arca as a backend."*
+
+Ruleset `20492137` was re-`PUT` without `required_status_checks`. It now carries
+`deletion`, `non_fast_forward`, `required_signatures` and `pull_request` with
+`allowed_merge_methods: ["merge"]`, plus an `OrganizationAdmin` bypass. Both open PRs
+went `BLOCKED` → `UNSTABLE` and merged. **CI still runs and still reports; it does not
+gate.** Do not re-require it without being asked.
+
+> **Note on the endpoint**, since it cost a round trip: repository rulesets are updated
+> with **`PUT`**, not `PATCH`. `PATCH` on `/repos/{owner}/{repo}/rulesets/{id}` returns
+> **404**. `PUT` replaces the `rules` array wholesale, so every rule being kept must be
+> restated in the payload.
+
+### What landed on `main`
+
+| PR | Merge commit | Contents |
+|---|---|---|
+| #48 | `c87787cca1b0d9f617e9e58ec74a989b7336a029` | the consolidated pipeline; `engine-pin.yml` folded in as the `engine` job |
+| #50 | `4852b04786404cb2e6d2fd0e5ee4a22398e7325a` | P2.1 record, U3 resolved |
+| #53 | `ee3be3b490433eeeca65c226f8dad28424d868e2` | `presentation.rs` condition-based waiting |
+| #52 | `9623f4be53e773c93bdedf2a5ceca76941017f81` | `doctor.rs` diagnostics, Task 8 corrections, this record |
+
+All four are true merge commits with two parents each. `main` is `9623f4b`.
+
+### The local suite, which is now the bar
+
+**VERIFIED.** `cargo test --workspace` on `main` + both fixes:
+**1078 passed, 1 failed, 22 ignored, 47 binaries.** The single failure is the
+`ssh-keygen` issue narrowed in the section above — `ssh-keygen -y -f /dev/fd/<N>` at
+`identity.rs:275-293`, exit 255, two candidate causes separated by one line of stderr the
+error currently discards.
+
+**That is the first thing to fix next session**, and it is product work rather than CI
+work: it is the only locally reproducible failure, and it sits in the managed-SSH path
+that P3 and P5 both depend on.
+
+### Closing thoughts, 2026-08-06 (night)
+
+**The pipeline kept paying, and then started charging.** It surfaced two release
+contracts that encoded one developer Mac as the definition of correctness, and it
+produced the `ssh-keygen` reproduction that is now nearly solved. Then it was made
+blocking over a suite with a measured red rate, and the rest of the session went to
+servicing the gate rather than the integration. Both facts are true at once. The error
+was not building the pipeline; it was making it load-bearing before the suite could hold
+the load, and then continuing to fix individual tests after the third distinct failure
+should have said the cause was shared.
+
+**Six times tonight a diagnostic could not reach the path that failed** — the doctor
+assertion printing an empty stderr, the bare `assert!` in `presentation.rs`, and the
+`ssh-keygen` stderr reduced to a `Sha256` behind `#[cfg(test)]`, among others. Two were
+fixed and mutation-verified. The `KeygenOutcome` added *last* session is what made
+tonight's narrowing possible at all: it turned "ssh-keygen failed, unknown why" into
+"exit 255", and exit 255 turned out to exclude an entire call site. **Instrumentation
+compounds; guesses do not.**
+
+**What I got wrong, recorded rather than smoothed over.** I asserted a 16.7 ms margin
+between a 12 Hz redraw and a 100 ms sleep as the cause of the `presentation.rs` flake;
+setting the sleep to **0 ms** and watching it pass 10/10 disproved it outright. I
+predicted #51's `mergeStateStatus` would change once the bypass landed; it stayed
+`BLOCKED`, because that field reports branch policy and is viewer-independent. And I told
+the maintainer "five distinct tests" when it was five failing *executions* of **four**
+distinct tests. The first two are corrected in place above; the third is corrected here.
