@@ -1376,6 +1376,45 @@ mod tests {
         assert_eq!(progress.finish_success(), None);
     }
 
+    /// Wait until the drawn terminal satisfies `predicate`, and return that exact
+    /// snapshot so the caller asserts against what it actually waited for.
+    ///
+    /// `ProgressDrawTarget` renders on indicatif's schedule rather than on the
+    /// calling thread, so reading `contents()` straight after an update races the
+    /// draw. These tests used to sleep 100ms and hope. That number was wrong in
+    /// both directions: inert locally — the test passes 10/10 with the sleep set
+    /// to **0** — and load-bearing on CI, where the same assertion failed twice
+    /// consecutively (run `31134866220`, attempts 1 and 2). There is no correct
+    /// duration to pick, which is the point: wait for the condition instead.
+    ///
+    /// `HANG_CEILING` bounds a hang. It is not a deadline the test asserts
+    /// against, and it is deliberately far larger than any plausible draw so that
+    /// a loaded runner cannot cross it while the code is behaving. Crossing it
+    /// means the draw never arrived — a real failure — and the message carries
+    /// what was on screen instead of leaving the reader to guess.
+    fn drawn(
+        terminal: &InMemoryTerm,
+        expectation: &str,
+        predicate: impl Fn(&str) -> bool,
+    ) -> String {
+        const HANG_CEILING: Duration = Duration::from_secs(10);
+        const POLL: Duration = Duration::from_millis(10);
+
+        let deadline = std::time::Instant::now() + HANG_CEILING;
+        loop {
+            let contents = terminal.contents();
+            if predicate(&contents) {
+                return contents;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "terminal never {expectation} within {HANG_CEILING:?}; \
+                 last contents were {contents:?}"
+            );
+            std::thread::sleep(POLL);
+        }
+    }
+
     #[test]
     fn interactive_progress_replaces_message_and_finishes_with_checkmark() {
         let terminal = InMemoryTerm::new(4, 80);
@@ -1392,24 +1431,30 @@ mod tests {
         );
         assert_eq!(initial, None);
 
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(terminal.contents().contains("Preparing sandbox"));
+        let initial_draw = drawn(&terminal, "drew the initial message", |contents| {
+            contents.contains("Preparing sandbox")
+        });
         assert!(
-            terminal
-                .contents()
+            initial_draw
                 .chars()
                 .any(|character| { "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(character) })
         );
 
         assert_eq!(progress.update(&event("validated")), None);
-        std::thread::sleep(Duration::from_millis(100));
-        let updated = terminal.contents();
-        assert!(updated.contains("Validating configuration"));
+        // Wait only for the new message, then assert the rest against that same
+        // snapshot: the replacement is supposed to be atomic within one draw, so
+        // waiting for the old message to disappear separately would hide a real
+        // defect where both are briefly on screen.
+        let updated = drawn(&terminal, "replaced the message", |contents| {
+            contents.contains("Validating configuration")
+        });
         assert!(!updated.contains("Preparing sandbox"));
         assert_eq!(updated.lines().count(), 1);
 
         assert_eq!(progress.finish_success(), None);
-        assert_eq!(terminal.contents(), "✓ Sandbox is running");
+        drawn(&terminal, "drew the completion line", |contents| {
+            contents == "✓ Sandbox is running"
+        });
     }
 
     #[test]
@@ -1427,12 +1472,13 @@ mod tests {
             ProgressDrawTarget::term_like_with_hz(Box::new(terminal.clone()), 12),
         );
         assert_eq!(initial, None);
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(!terminal.contents().is_empty());
+        drawn(&terminal, "drew the initial message", |contents| {
+            !contents.is_empty()
+        });
 
         drop(progress);
 
-        assert_eq!(terminal.contents(), "");
+        drawn(&terminal, "cleared on drop", str::is_empty);
     }
 
     #[test]
