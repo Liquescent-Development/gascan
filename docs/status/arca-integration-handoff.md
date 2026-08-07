@@ -1901,8 +1901,17 @@ document.** None of them block P3.1.
 | D2 | How much further to chase the `ssh-keygen` descriptor defect | P3/P5 only if it worsens | mechanism unknown; cause class VERIFIED |
 | D3 | `gascan-e2e/tests/fake_backend.rs` flake | local-suite-green bar | newly recorded this session, uninstrumented |
 | D4 | Delete `runtime-probe` from `ci.yml` | nothing; cosmetic but persistent | spec §7.2 says the job is temporary; §11.5 recorded its VERIFIED answer |
-| D5 | `stash@{0}` `f6356f9` — what it holds | nothing | **nobody has established this; it is a question for the maintainer, not a task** |
+| D5 | `stash@{0}` `f6356f9` — keep or drop | nothing | **ANSWERED below**; maintainer's call whether to drop |
 | D6 | The flaky suite as one shared cause | the local-suite bar, eventually | mechanism in spec §11.7 |
+
+**D5 is answered.** `git stash show --name-only stash@{0}` lists **exactly one file**:
+`.superpowers/sdd/progress.md`, and `git check-ignore -v` confirms `.gitignore:1:.superpowers/`
+matches it. The stash therefore holds **no tracked content at all** — it is an append to the
+gitignored SDD progress log from the 0.1.20 release era, recording task-completion notes for
+signed-release-distribution, actionable-errors and release-driver. By this project's own
+convention (`docs/superpowers/` is tracked; `.superpowers/` is disposable scaffolding) there is
+nothing in it to lose. It was left in place rather than dropped, because dropping it is not mine
+to do.
 
 **U4, U5 and U6 are not in this register.** They are design work inside the roadmap —
 U4 belongs to P3.1 and is next session's actual subject; U5 belongs to P5.4 and U6 to
