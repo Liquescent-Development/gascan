@@ -1895,6 +1895,10 @@ document.** None of them block P3.1.
 
 ### Decision register — what is waiting on the maintainer
 
+> **SUPERSEDED.** D1, D2, D3 and D6 were all decided or answered after this table was
+> written. It is kept because the maintainer decided from *this* list; the current state
+> is the register at the end of this document.
+
 | # | Decision | Blocks | State |
 |---|---|---|---|
 | D1 | `autostart.rs:767` — which of three options | nothing; test currently passes | three options written up above, none applied |
@@ -2080,3 +2084,72 @@ confounded observation.
 the suite went green. If timing flakes return *without* `corespotlightd` being hot,
 Gatekeeper is the place to look. And the publish-window race (**D7**) did not fire in this
 run — it is intermittent, not fixed.
+
+## Session close, 2026-08-07 — the bar is met and the next subject is P3.1
+
+### Final state
+
+**VERIFIED.** `main` is `6f88e79`, clean, **zero open PRs**.
+`cargo test --workspace --no-fail-fast` **rc=0: 1377 passed, 0 failed, 22 ignored**, with
+cold-binary exec flat across the run (0.247 s → 0.184 s). By the governing decision this
+**is** a pass, and it is the first unqualified one in this family of sessions.
+
+`arca` is `7da8f77`, clean, and has now been **untouched for five sessions**. The pin still
+resolves through tag `gascan-engine-ip-internal` to commit
+`d66c320c09e1dfc4f37aafa1fb27e36aa5cabe5d`; the annotated tag *object* is `dfdf8b9` and is
+a different thing. Arca's `main` is deliberately ahead of the pin. **P3 is where that
+changes** — the proto lives in Arca, so the next session is the first to write there.
+
+Three PRs landed today, each a true merge commit: **#55** (the `ssh-keygen` rejection names
+its own cause; the appealing fix disproved), **#56** (D3, D1, the probe correction),
+**#57** (the Spotlight confirmation).
+
+### Decision register — current
+
+| # | Decision | State |
+|---|---|---|
+| D1 | `autostart.rs:767` | **RESOLVED** — option 2, via the peer rather than a new CLI event (#56) |
+| D2 | Chasing the `ssh-keygen` descriptor defect | **DECIDED: defer.** Amplifier is in the suite and will announce a recurrence |
+| D3 | `fake_backend.rs` silent failures | **RESOLVED** — 50 sites instrumented (#56) |
+| D4 | Delete `runtime-probe` from `ci.yml` | **OPEN.** Real, cosmetic, and CI work — so deferred by the governing decision |
+| D5 | `stash@{0}` `f6356f9` | **ANSWERED**: one gitignored file, no tracked content. Dropping it is the maintainer's call |
+| D6 | The flaky suite as one shared cause | **ANSWERED**: Spotlight indexing `target/`. Excluding `~/code` took a run from 37 failures to 0 |
+| D7 | How the health check should treat mode `0200` | **OPEN, new.** Mechanism VERIFIED; the remedy is a design choice |
+
+### Closing thoughts, 2026-08-07
+
+**Two measuring instruments were confidently wrong, and neither was caught by reasoning.**
+The project's exec-latency probe timed a shell script — 0.005 s while a freshly built
+binary took 32.8 s at the same instant — so every "both arms saw the same machine state"
+check made with it was blind. My own descriptor witness compared `st_dev` through
+`/dev/fd`, which Darwin synthesises, so it reported `Replaced` on **every** rejection and
+would have sent the next session hunting a descriptor stomp that never happened. Both were
+found by testing the instrument itself against a known answer. **Verify the instrument,
+not only the result** is the lesson this session paid for, and it generalises past this
+repository.
+
+**The environment was a larger cause than the code.** A Spotlight setting took a workspace
+run from 37 failures to 0. Three sessions of "flaky suite" work were, in substantial part,
+chasing a macOS indexer. The caution is specific: **before attributing an intermittent
+failure to the product, check what the machine was doing.** That is cheap and it was
+skipped for a long time.
+
+**Which puts one earlier conclusion back in play.** The `ssh-keygen` descriptor defect was
+characterised as *load-dependent* — it never reproduced idle and reproduced readily under
+load. That load was, at least partly, Spotlight. The `6/28 vs 0/28` A/B still stands, since
+both arms ran back to back under the same conditions, but **the defect's reproduction rate
+on a healthy machine is now unknown**. Re-measure it before assuming it behaves as
+recorded. It may be far rarer, and it may not reproduce at all.
+
+**Instrumentation kept compounding, across sessions.** `KeygenOutcome` (added two sessions
+ago) narrowed the failure to one call site; the redacted message added this session
+answered which of two causes it was on the *first* reproduction; and `validate_file_stat`'s
+four-way fault naming — added for a race that had been seen exactly once and would not
+reproduce — fired today and turned that hypothesis into a mechanism. None of it was
+expensive, and none of it required knowing in advance which one would pay.
+
+**The fix that lost is worth remembering as a shape.** Mapping the child to a fixed
+descriptor number was well reasoned: it replaces a passive assumption with an active
+`dup2` that fails loudly. It was also 6 failures in 28 against 0 in 28. The reasoning was
+not sloppy; it was simply not evidence. The A/B cost one iteration and is now recorded at
+the call site so the next person does not re-derive the same appealing wrong answer.
