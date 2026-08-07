@@ -466,3 +466,7 @@ pub const fn validate_api_major(requested: u32) -> Result<(), HandshakeRejection
         })
     }
 }
+
+
+
+   
