@@ -1,6 +1,7 @@
 use super::{
-    FileIdentity, ManagedSshDiagnostic, ManagedSshDiagnosticKind, PRIVATE_MODE, PUBLIC_MODE,
-    SshError, SshPaths, StateDirectory, maximum_managed_file_bytes, random_staging_name,
+    FileIdentity, KeygenMessage, KeygenOutcome, KeygenRejection, ManagedSshDiagnostic,
+    ManagedSshDiagnosticKind, MappedDescriptor, PRIVATE_MODE, PUBLIC_MODE, SshError, SshPaths,
+    StateDirectory, maximum_managed_file_bytes, random_staging_name,
 };
 use base64::Engine as _;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -8,7 +9,8 @@ use command_fds::{CommandFdExt, FdMapping};
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::fs::File;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::MetadataExt as _;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -19,6 +21,33 @@ const PUBLIC_KEY_NAME: &str = "identity_ed25519.pub";
 const SSH_KEYGEN: &str = "/usr/bin/ssh-keygen";
 const KEYGEN_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_SUBPROCESS_OUTPUT: usize = 16 * 1024;
+/// The lowest descriptor number the private key's duplicate may occupy, keeping
+/// it clear of the standard streams.
+const LOWEST_PRIVATE_FD: RawFd = 3;
+
+/// The two numbers a mapped descriptor has: the one this process holds, and the
+/// one the child is told to read from.
+///
+/// They are currently the same number, and that is the crux of the outstanding
+/// `Bad file descriptor` rejection: when they are equal, `command_fds` only
+/// clears `FD_CLOEXEC`, so the child depends on the parent's allocation
+/// surviving `exec` rather than on a descriptor actively installed for it.
+/// Naming them separately is what lets a diagnostic say which one it means.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DescriptorMapping {
+    parent_fd: RawFd,
+    child_fd: RawFd,
+}
+
+impl DescriptorMapping {
+    pub(crate) const fn parent_fd(self) -> RawFd {
+        self.parent_fd
+    }
+
+    pub(crate) const fn child_fd(self) -> RawFd {
+        self.child_fd
+    }
+}
 
 /// A validated managed SSH identity.
 ///
@@ -161,17 +190,23 @@ async fn generate(directory: &StateDirectory) -> Result<(), SshError> {
     let public_stage = format!("{private_stage}.pub");
     let mut guard = StagingGuard::new(directory, [&private_stage, &public_stage]);
     let output_path = directory.resolved_path(&private_stage)?;
-    let output = run_ssh_keygen(vec![
-        OsString::from("-q"),
-        OsString::from("-t"),
-        OsString::from("ed25519"),
-        OsString::from("-N"),
-        OsString::new(),
-        OsString::from("-C"),
-        OsString::from("gascan-managed"),
-        OsString::from("-f"),
-        output_path.into_os_string(),
-    ])
+    let output = KeygenInvocation::new(
+        vec![
+            OsString::from("-q"),
+            OsString::from("-t"),
+            OsString::from("ed25519"),
+            OsString::from("-N"),
+            OsString::new(),
+            OsString::from("-C"),
+            OsString::from("gascan-managed"),
+            OsString::from("-f"),
+            output_path.as_os_str().to_owned(),
+        ],
+        // Lossy on both sides: `KeygenMessage` decodes the child's stderr the
+        // same way, so a non-UTF-8 pathname still matches itself.
+        vec![output_path.to_string_lossy().into_owned()],
+    )
+    .run()
     .await?;
     if !output.is_empty() {
         return Err(SshError::KeygenOutput);
@@ -238,7 +273,7 @@ async fn validate_pair_with_spawn_hook<F, G>(
 ) -> Result<ParsedPublicKey, SshError>
 where
     F: FnOnce() -> Result<(), SshError>,
-    G: FnOnce(i32) -> Result<(), SshError>,
+    G: FnOnce(DescriptorMapping) -> Result<(), SshError>,
 {
     let (private_file, private_identity) = directory.open_file(private_name, PRIVATE_MODE)?;
     let (public_bytes, public_identity) = directory.read_file(
@@ -266,22 +301,41 @@ async fn derive_public_key_with_spawn_hook<F>(
     before_spawn: F,
 ) -> Result<Vec<u8>, SshError>
 where
-    F: FnOnce(i32) -> Result<(), SshError>,
+    F: FnOnce(DescriptorMapping) -> Result<(), SshError>,
 {
-    let inherited = rustix::io::fcntl_dupfd_cloexec(private_file, 3)
+    // The child is given the parent's own descriptor number, so `command_fds`
+    // maps it by clearing `FD_CLOEXEC` rather than by `dup2`.
+    //
+    // Pinning the child to a fixed low number instead was tried and MEASURED
+    // WORSE: mapping to child descriptor 3 failed 6 times in 28 amplifier runs
+    // under load, against 0 in 28 for this scheme, on the same machine
+    // back to back. Do not "fix" this by choosing the child's number again
+    // without re-running that comparison.
+    let inherited = rustix::io::fcntl_dupfd_cloexec(private_file, LOWEST_PRIVATE_FD)
         .map_err(|error| SshError::io("duplicate managed SSH private descriptor", error))?;
-    let parent_fd = inherited.as_raw_fd();
-    let descriptor_path = format!("/dev/fd/{parent_fd}");
-    let mut command = ssh_keygen_command(vec![
-        OsString::from("-y"),
-        OsString::from("-f"),
-        OsString::from(descriptor_path),
-    ]);
-    command
+    let mapping = DescriptorMapping {
+        parent_fd: inherited.as_raw_fd(),
+        child_fd: inherited.as_raw_fd(),
+    };
+    let parent_path = format!("/dev/fd/{}", mapping.parent_fd());
+    let child_path = format!("/dev/fd/{}", mapping.child_fd());
+    // The descriptor pathname is not secret -- it is a small integer -- and it
+    // is exactly the discriminator between "the descriptor was missing" and
+    // "the bytes behind it were not a key", so it is deliberately not redacted.
+    let mut invocation = KeygenInvocation::new(
+        vec![
+            OsString::from("-y"),
+            OsString::from("-f"),
+            OsString::from(child_path),
+        ],
+        Vec::new(),
+    );
+    invocation
+        .command_mut()
         .as_std_mut()
         .fd_mappings(vec![FdMapping {
             parent_fd: inherited,
-            child_fd: parent_fd,
+            child_fd: mapping.child_fd(),
         }])
         .map_err(|error| {
             SshError::io(
@@ -289,8 +343,12 @@ where
                 std::io::Error::other(error),
             )
         })?;
-    before_spawn(parent_fd)?;
-    run_configured_ssh_keygen(command).await
+    // Watches the parent's number, not the child's: a parent number that stops
+    // referring to the private key is the one thing that would explain the
+    // child being handed the wrong descriptor.
+    invocation.watch_descriptor(DescriptorWitness::record(private_file, &parent_path)?);
+    before_spawn(mapping)?;
+    invocation.run().await
 }
 
 fn require_unchanged(
@@ -365,65 +423,128 @@ fn validate_ed25519_blob(blob: &[u8]) -> Result<(), SshError> {
     Ok(())
 }
 
-async fn run_ssh_keygen(args: Vec<OsString>) -> Result<Vec<u8>, SshError> {
-    run_configured_ssh_keygen(ssh_keygen_command(args)).await
+/// One `ssh-keygen` run together with the argument strings that must not appear
+/// in a diagnostic.
+///
+/// Both live in a single value so that adding a pathname argument without also
+/// registering it for redaction is not expressible.
+struct KeygenInvocation {
+    command: Command,
+    sensitive: Vec<String>,
+    witness: Option<DescriptorWitness>,
 }
 
-fn ssh_keygen_command(args: Vec<OsString>) -> Command {
-    let mut child = Command::new(SSH_KEYGEN);
-    child
-        .args(args)
-        .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    child
+/// The identity a mapped descriptor number was expected to keep.
+///
+/// Recorded from the file itself, then re-read from the bare number once the
+/// child exists. Only another part of this process closing and reusing the
+/// number can make the two disagree, so a disagreement names the culprit.
+struct DescriptorWitness {
+    path: String,
+    inode: u64,
 }
 
-async fn run_configured_ssh_keygen(mut command: Command) -> Result<Vec<u8>, SshError> {
-    let mut child = command
-        .spawn()
-        .map_err(|error| SshError::io("start bounded ssh-keygen", error))?;
-    drop(command);
-    let stdout = child.stdout.take().ok_or(SshError::KeygenOutput)?;
-    let stderr = child.stderr.take().ok_or(SshError::KeygenOutput)?;
-    let completed = tokio::time::timeout(KEYGEN_TIMEOUT, async {
-        tokio::try_join!(child.wait(), read_bounded(stdout), read_bounded(stderr))
-    })
-    .await;
-    let (status, stdout, stderr) = match completed {
-        Ok(result) => result.map_err(|error| SshError::io("run bounded ssh-keygen", error))?,
-        Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            return Err(SshError::KeygenTimeout);
+impl DescriptorWitness {
+    fn record(file: &File, path: &str) -> Result<Self, SshError> {
+        let stat = rustix::fs::fstat(file)
+            .map_err(|error| SshError::io("inspect managed SSH private descriptor", error))?;
+        Ok(Self {
+            path: path.to_owned(),
+            inode: stat.st_ino,
+        })
+    }
+
+    /// Resolves the same `/dev/fd` pathname the child was given, so the parent's
+    /// answer and the child's are about the same thing.
+    ///
+    /// Compares the inode only. Darwin's `fdesc` filesystem reports the real
+    /// inode through `/dev/fd/<N>` but substitutes its own `st_dev`, so
+    /// comparing the device would report every descriptor as replaced --
+    /// measured: `stat` of a file directly and through its own `/dev/fd` entry
+    /// agree on `st_ino` and disagree on `st_dev`.
+    fn observe(&self) -> MappedDescriptor {
+        match std::fs::metadata(&self.path) {
+            Err(_) => MappedDescriptor::Closed,
+            Ok(metadata) if metadata.ino() == self.inode => MappedDescriptor::Intact,
+            Ok(_) => MappedDescriptor::Replaced,
         }
-    };
-    if stdout.len() > MAX_SUBPROCESS_OUTPUT || stderr.len() > MAX_SUBPROCESS_OUTPUT {
-        return Err(SshError::KeygenOutput);
     }
-    if !status.success() {
-        #[cfg(test)]
-        eprintln!(
-            "ssh-keygen rejection: code={:?} stdout_bytes={} stderr_bytes={} stderr_sha256={:x}",
-            status.code(),
-            stdout.len(),
-            stderr.len(),
-            Sha256::digest(&stderr)
-        );
-        // The outcome travels with the error rather than only through the
-        // `#[cfg(test)]` line above, which cannot reach a `gascand` that an
-        // end-to-end test spawned as a real binary.
-        use std::os::unix::process::ExitStatusExt as _;
-        let outcome = match (status.code(), status.signal()) {
-            (Some(code), _) => crate::ssh::KeygenOutcome::Code(code),
-            (None, Some(signal)) => crate::ssh::KeygenOutcome::Signal(signal),
-            (None, None) => crate::ssh::KeygenOutcome::NoStatus,
+}
+
+impl KeygenInvocation {
+    fn new(args: Vec<OsString>, sensitive: Vec<String>) -> Self {
+        let mut command = Command::new(SSH_KEYGEN);
+        command
+            .args(args)
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        Self {
+            command,
+            sensitive,
+            witness: None,
+        }
+    }
+
+    fn command_mut(&mut self) -> &mut Command {
+        &mut self.command
+    }
+
+    fn watch_descriptor(&mut self, witness: DescriptorWitness) {
+        self.witness = Some(witness);
+    }
+
+    async fn run(mut self) -> Result<Vec<u8>, SshError> {
+        let mut child = self
+            .command
+            .spawn()
+            .map_err(|error| SshError::io("start bounded ssh-keygen", error))?;
+        // Observed here, while the mapping still owns the number and the child
+        // has just been forked: this is the last instant at which the parent's
+        // view can still explain the child's.
+        let descriptor = self
+            .witness
+            .as_ref()
+            .map_or(MappedDescriptor::None, DescriptorWitness::observe);
+        drop(self.command);
+        let stdout = child.stdout.take().ok_or(SshError::KeygenOutput)?;
+        let stderr = child.stderr.take().ok_or(SshError::KeygenOutput)?;
+        let completed = tokio::time::timeout(KEYGEN_TIMEOUT, async {
+            tokio::try_join!(child.wait(), read_bounded(stdout), read_bounded(stderr))
+        })
+        .await;
+        let (status, stdout, stderr) = match completed {
+            Ok(result) => result.map_err(|error| SshError::io("run bounded ssh-keygen", error))?,
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(SshError::KeygenTimeout);
+            }
         };
-        return Err(SshError::KeygenRejected(outcome));
+        if stdout.len() > MAX_SUBPROCESS_OUTPUT || stderr.len() > MAX_SUBPROCESS_OUTPUT {
+            return Err(SshError::KeygenOutput);
+        }
+        if !status.success() {
+            // Status and message both travel with the error. Neither reaches a
+            // `gascand` spawned as a real binary any other way, and exit 255 is
+            // shared by every argument-level refusal, so the status alone
+            // cannot say which one happened.
+            use std::os::unix::process::ExitStatusExt as _;
+            let outcome = match (status.code(), status.signal()) {
+                (Some(code), _) => KeygenOutcome::Code(code),
+                (None, Some(signal)) => KeygenOutcome::Signal(signal),
+                (None, None) => KeygenOutcome::NoStatus,
+            };
+            return Err(SshError::KeygenRejected(KeygenRejection::new(
+                outcome,
+                KeygenMessage::redacted(&stderr, &self.sensitive),
+                descriptor,
+            )));
+        }
+        Ok(stdout)
     }
-    Ok(stdout)
 }
 
 async fn read_bounded<R>(reader: R) -> Result<Vec<u8>, std::io::Error>
@@ -471,13 +592,126 @@ impl Drop for StagingGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PRIVATE_KEY_NAME, PUBLIC_KEY_NAME, SshError, ensure_host_identity,
+        KeygenInvocation, PRIVATE_KEY_NAME, PUBLIC_KEY_NAME, SshError, ensure_host_identity,
         validate_pair_with_spawn_hook,
     };
-    use crate::ssh::SshPaths;
+    use crate::ssh::{KeygenOutcome, SshPaths};
+    use std::ffi::OsString;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::process::{Command, Stdio};
+
+    async fn rejection_of(
+        target: &str,
+        sensitive: Vec<String>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let result = KeygenInvocation::new(
+            vec![
+                OsString::from("-y"),
+                OsString::from("-f"),
+                OsString::from(target),
+            ],
+            sensitive,
+        )
+        .run()
+        .await;
+        let error = match result {
+            Ok(_) => return Err("ssh-keygen accepted a target that is not a private key".into()),
+            Err(error) => error,
+        };
+        let SshError::KeygenRejected(rejection) = error else {
+            return Err(format!("unexpected error from ssh-keygen: {error}").into());
+        };
+        assert_eq!(
+            rejection.outcome(),
+            KeygenOutcome::Code(255),
+            "ssh-keygen argument rejection changed exit status: {rejection}"
+        );
+        Ok(rejection.message().as_str().to_owned())
+    }
+
+    /// Both candidate causes of the observed `KeygenRejected(Code(255))` exit
+    /// with the same status; only stderr tells them apart. This pins that the
+    /// message survives to the error, and that the two remain distinguishable.
+    #[tokio::test]
+    async fn keygen_rejection_separates_a_missing_descriptor_from_unreadable_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let absent = rejection_of("/dev/fd/999", Vec::new()).await?;
+        let unreadable = rejection_of("/dev/null", Vec::new()).await?;
+        assert!(
+            absent.contains("Bad file descriptor"),
+            "absent descriptor did not name itself: {absent}"
+        );
+        assert!(
+            unreadable.contains("invalid format"),
+            "unreadable key did not name itself: {unreadable}"
+        );
+        assert_ne!(absent, unreadable);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn keygen_message_replaces_the_pathname_it_was_given()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let target = directory.path().join("not-a-key");
+        fs::write(&target, b"not a private key\n")?;
+        // 0644 makes `ssh-keygen` emit its multi-line unprotected-key banner
+        // instead of the parse failure this test is about.
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
+        let path = target.to_string_lossy().into_owned();
+        let message = rejection_of(&path, vec![path.clone()]).await?;
+        assert!(
+            !message.contains(&path),
+            "pathname survived redaction: {message}"
+        );
+        assert!(
+            message.contains("<path>") && message.contains("invalid format"),
+            "redacted message lost its diagnostic: {message}"
+        );
+        Ok(())
+    }
+
+    /// The child must read the key from a descriptor this code installed at a
+    /// number the parent also holds, and never one of the standard streams.
+    ///
+    /// This records the scheme that MEASURED BETTER, not an ideal. Giving the
+    /// child a number of our own choosing is the obvious-looking alternative and
+    /// it lost the comparison badly (6 failures in 28 under load, against 0 in
+    /// 28 here). If this assertion is ever changed, the comparison has to be
+    /// re-run rather than reasoned about.
+    #[tokio::test]
+    async fn the_child_is_given_the_descriptor_number_the_parent_holds()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let managed = tempfile::tempdir()?;
+        let managed_home = managed.path().canonicalize()?;
+        let paths = SshPaths::for_environment(None, Some(managed_home.as_os_str()))?;
+        let expected = ensure_host_identity(&paths).await?;
+
+        let directory = crate::ssh::StateDirectory::open(&paths)?;
+        let parsed = validate_pair_with_spawn_hook(
+            &directory,
+            PRIVATE_KEY_NAME,
+            PUBLIC_KEY_NAME,
+            || Ok(()),
+            |mapping| {
+                assert_eq!(
+                    mapping.parent_fd(),
+                    mapping.child_fd(),
+                    "the child was given a descriptor number the parent does not hold"
+                );
+                assert!(
+                    mapping.child_fd() >= super::LOWEST_PRIVATE_FD,
+                    "the private descriptor landed on a standard stream: {}",
+                    mapping.child_fd()
+                );
+                Ok(())
+            },
+        )
+        .await?;
+        assert_eq!(parsed.normalized, expected.public_key());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn private_key_descriptor_is_inherited_only_by_the_intended_child()
@@ -515,7 +749,8 @@ mod tests {
                 )
                 .map_err(|error| SshError::io("secure replacement private key", error))
             },
-            |parent_fd| {
+            |mapping| {
+                let parent_fd = mapping.parent_fd();
                 let output = Command::new("/bin/cat")
                     .arg(format!("/dev/fd/{parent_fd}"))
                     .env_clear()

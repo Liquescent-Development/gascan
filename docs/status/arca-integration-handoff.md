@@ -1740,3 +1740,186 @@ predicted #51's `mergeStateStatus` would change once the bypass landed; it staye
 `BLOCKED`, because that field reports branch policy and is viewer-independent. And I told
 the maintainer "five distinct tests" when it was five failing *executions* of **four**
 distinct tests. The first two are corrected in place above; the third is corrected here.
+
+## Session of 2026-08-07 — the `ssh-keygen` rejection said what it was, and the obvious fix lost
+
+`ci / gate` was left non-required throughout, per the governing decision. No CI work was
+done. PR #54 was already merged at session start (`70bd9ba`, the merge commit of
+`docs/close-2026-08-06`); `main` began and ends this session as a descendant of it.
+
+### The instrumentation paid off on the first reproduction
+
+`KeygenOutcome` alone could not separate the two candidate causes, because both exit
+**255**. `SshError::KeygenRejected` now carries a `KeygenRejection`: the outcome, a
+**bounded redacted `KeygenMessage`**, and a `MappedDescriptor` witness.
+
+Redaction replaces the exact pathname strings the invocation was given, rather than
+guessing at what a path looks like — `ssh-keygen` only ever echoes back its own file
+argument, so that removes the sole caller-specific content and leaves its fixed message
+table intact. **Mutation-verified**: with a deliberately unreadable key at mode 0644 the
+message came back as
+`@@@… WARNING: UNPROTECTED PRIVATE KEY FILE! @@@… Permissions 0644 for '<path>' are too…`
+— redaction, whitespace collapsing and the 200-character bound all visible in one line.
+
+**VERIFIED, and it settles the question the last session left open.** Reproduced by
+looping five gascand test binaries (`apply_setup ssh_config ssh_identity lifecycle
+reconcile`) while a full workspace run loaded the machine — **run 5 of 8**:
+
+```
+Unpublished(KeygenRejected(KeygenRejection {
+  outcome: Code(255),
+  message: KeygenMessage("/dev/fd/7: Bad file descriptor") }))
+```
+in `ssh_config::rejects_symlink_hard_link_fifo_and_unsafe_generated_targets`.
+
+**Cause (a) is confirmed and cause (b) is excluded.** The descriptor never reached the
+child. The child did not read wrong bytes.
+
+### The second witness says the parent was fine
+
+`MappedDescriptor` re-resolves the parent's own `/dev/fd/<N>` immediately after `spawn()`
+returns — while the mapping still owns the descriptor, and the last instant at which the
+parent's view can still explain the child's. Every captured occurrence reads
+**`parent descriptor intact`**.
+
+> **Correction, recorded in place.** The witness first compared `st_dev` *and* `st_ino`
+> and therefore reported **`Replaced`** on every single rejection. That was my bug, not
+> evidence. **Measured**: `stat` of a file directly and through its own `/dev/fd/<N>`
+> entry agree on `st_ino` and **disagree on `st_dev`** — Darwin's `fdesc` filesystem
+> reports the real inode but substitutes its own device. The witness now compares the
+> inode only. Any earlier `Replaced` reading is void.
+
+So: the parent held the private key at that number when the child was forked, and the
+child still could not open it. **The loss is in the fork/exec path, not a parent-side
+descriptor stomp.**
+
+### The obvious fix was tried, measured, and reverted
+
+`command_fds` maps `parent_fd == child_fd` by merely clearing `FD_CLOEXEC`, which leaves
+the child depending on the parent's allocation surviving `exec`. Giving the child a fixed
+number instead (3) makes `command_fds` take its `dup2` branch, which *installs* the
+descriptor and fails loudly if it cannot. That reasoning is sound and the result is
+**wrong**.
+
+| Arm | Scheme | Amplifier failures under load |
+|---|---|---|
+| A | child descriptor pinned to 3 | **6 / 28** |
+| B | child descriptor = parent's number (shipped) | **0 / 28** |
+
+Same machine, same background load (`top -l 2`: 44.1% user for A, 44.5% for B), same
+amplifier parameters, built and run back to back. Arm A also failed **twice in a single
+`cargo test --workspace --no-fail-fast` run**, including inside the amplifier at round 3
+of 4. **The change was reverted.** The comment at `identity.rs`
+`derive_public_key_with_spawn_hook` records the measurement so the next person does not
+re-derive the same appealing wrong answer.
+
+**This is the third time this project has paid for a plausible mechanism.** The
+difference is that this one cost one A/B instead of a session, because the amplifier
+existed to measure it.
+
+### What made the measurement possible
+
+`crates/gascand/tests/ssh_identity_concurrency.rs` — concurrent identity derivation on a
+multi-threaded runtime, with descriptor churn and unrelated `fork`/`exec` traffic from
+other threads, driving both `ensure_host_identity` and the
+`open_revalidated_identity` route that runs its spawn on a scoped thread inside a freshly
+built runtime. Tunable by `GASCAN_IDENTITY_STRESS_ROUNDS` / `_WIDTH`.
+
+It does **not** reproduce the defect on an idle machine (0 failures in ~15 000 spawns);
+it reproduces under load. A failure of this test is the known defect, not a new flake,
+and its header says so.
+
+### Where the defect stands — NOT FIXED
+
+**The mechanism is still unknown, and the rejection is still possible.** What is now
+established, each with its anchor above:
+
+- It is `Bad file descriptor`, not bad key bytes. **VERIFIED.**
+- The parent's descriptor was intact at fork. **VERIFIED.**
+- Pinning the child's descriptor number is worse, not better. **VERIFIED, 6/28 vs 0/28.**
+- `std` wires the child's stdio **before** running `pre_exec` closures, so the mapping is
+  the last thing to happen before `exec` and nothing in `std` can undo it. **VERIFIED**
+  by a standalone probe: a `pre_exec` writing to descriptor 1 landed inside the captured
+  pipe, ahead of the child's own output.
+
+The open question is therefore narrow: **what closes, or fails to deliver, a descriptor
+that is open and non-`FD_CLOEXEC` in the child at the moment `execve` is called?** The
+next step is a minimal standalone reproduction — the production spawn shape with
+`/bin/sh -c 'ls -1 /dev/fd'` as the child — which arm A's ~20% failure rate makes cheap
+to obtain, and which would answer it directly rather than by argument.
+
+### Suite state
+
+**VERIFIED.** `cargo test --workspace --no-fail-fast`, twice, after the revert:
+**1376 passed, 1 failed, 22 ignored** both times, with **zero** `Keygen` occurrences.
+`ssh_image_apply_preserves_fingerprints_while_accepting_new_inspected_automatic_port` —
+last session's single reproducible failure — **passes**.
+
+`--no-fail-fast` matters and is new: without it `cargo test --workspace` stops at the
+first failing binary, so an early flake hides every later binary, including the gascand
+ones this session needed. The first hunt lost a whole run to exactly that.
+
+The one remaining failure is a **different** and previously unrecorded flake, in
+`gascan-e2e/tests/fake_backend.rs`, and it was a different test each time:
+`real_pty_large_output_waits_for_capacity_without_exiting` (`:1087`),
+`interactive_streamed_operation_failure_clears_spinner_before_error` (`:625`),
+`follow_logs_emit_exactly_one_terminal_for_shutdown_or_backend_error` (`:1475`). All
+three are bare `assert!`s that print nothing — the same "a diagnostic existed but could
+not reach the path that failed" family, now the fifth occurrence. Note that the two
+`real_pty_*` "signal test mutex poisoned" errors seen alongside the first are
+**consequences** of it poisoning a shared mutex, not three independent failures.
+Per the governing decision this belongs to the flaky-suite family and was left alone.
+
+### Closing the session — the next one starts on the roadmap
+
+Everything above is defect and instrumentation work. It is finished and parked. **The
+next session's subject is `docs/superpowers/plans/2026-08-04-arca-integration-roadmap.md`,
+starting at P3.1.**
+
+**Why P3.1 is the next thing.** P3 is the fan-out point: P4 and P5 both depend on it, and
+its exit is deliberately modest — *"proto exists, both sides generate, nothing implements
+it yet."* P1 is `partial by necessity` and stays that way; its binary half is booked
+against P5.1 and P4.3 and must not be "finished" opportunistically. So nothing else is
+unblocked, and P3.1 carries **U4** with it.
+
+**What P3.1 needs before code.** The proto is derived from `RuntimeBackend`, constrained
+by contract §4 (what must be *inexpressible*) and §5 (what must be *expressible*), and —
+per the 2026-08-05 weight increase — it is a **published contract with more than one
+consumer over time**, so its compatibility burden is real from the first commit. It lives
+in Arca. Note that `arca` has been untouched for four sessions and is still `main
+7da8f77`, clean; the pin resolves via tag `gascan-engine-ip-internal` to commit
+`d66c320c` (the annotated tag *object* is `dfdf8b9` — different thing).
+
+**Open decisions are collected in the register below rather than scattered through this
+document.** None of them block P3.1.
+
+### Decision register — what is waiting on the maintainer
+
+| # | Decision | Blocks | State |
+|---|---|---|---|
+| D1 | `autostart.rs:767` — which of three options | nothing; test currently passes | three options written up above, none applied |
+| D2 | How much further to chase the `ssh-keygen` descriptor defect | P3/P5 only if it worsens | mechanism unknown; cause class VERIFIED |
+| D3 | `gascan-e2e/tests/fake_backend.rs` flake | local-suite-green bar | newly recorded this session, uninstrumented |
+| D4 | Delete `runtime-probe` from `ci.yml` | nothing; cosmetic but persistent | spec §7.2 says the job is temporary; §11.5 recorded its VERIFIED answer |
+| D5 | `stash@{0}` `f6356f9` — keep or drop | nothing | **ANSWERED below**; maintainer's call whether to drop |
+| D6 | The flaky suite as one shared cause | the local-suite bar, eventually | mechanism in spec §11.7 |
+
+**D5 is answered.** `git stash show --name-only stash@{0}` lists **exactly one file**:
+`.superpowers/sdd/progress.md`, and `git check-ignore -v` confirms `.gitignore:1:.superpowers/`
+matches it. The stash therefore holds **no tracked content at all** — it is an append to the
+gitignored SDD progress log from the 0.1.20 release era, recording task-completion notes for
+signed-release-distribution, actionable-errors and release-driver. By this project's own
+convention (`docs/superpowers/` is tracked; `.superpowers/` is disposable scaffolding) there is
+nothing in it to lose. It was left in place rather than dropped, because dropping it is not mine
+to do.
+
+**U4, U5 and U6 are not in this register.** They are design work inside the roadmap —
+U4 belongs to P3.1 and is next session's actual subject; U5 belongs to P5.4 and U6 to
+P6.3. They are not maintainer decisions to be made in advance of that work.
+
+**Explicitly still true and unchanged:** `ci / gate` is **not** a required check and
+should not be made one; ruleset `20492137` carries `deletion`, `non_fast_forward`,
+`required_signatures` and `pull_request` with `allowed_merge_methods: ["merge"]`, plus an
+`OrganizationAdmin` bypass. A green `cargo test --workspace` on this machine is the bar.
+The `autostart.rs` symlink test (`daemon_attest_rejects_a_symlink_…`) still fails **open**;
+its fix is mechanical, needs no decision, and is a good warm-up task for whoever wants one.
