@@ -2054,3 +2054,29 @@ mechanical one: the health-check path must distinguish "inert, not yet published
 wait. **This is a new entry for the decision register.** The instrumentation that made it
 legible was added two sessions ago and cost nothing to carry until it fired —
 instrumentation compounds.
+
+### The confirmation run, which removes the confound — 2026-08-07
+
+The measurement above was taken while Spotlight was still tearing down its index and
+while the maintainer had concurrent `cargo` builds running, so it could not separate the
+exclusion from those. A second run on merged `main` (`780efbd`), with neither in flight,
+is clean:
+
+| | cold exec before run → after run | result |
+|---|---|---|
+| Before the exclusion | 0.235 s → **7.818 s** | 37 failed |
+| After the exclusion | 0.247 s → **0.184 s** | **0 failed** |
+
+**`cargo test --workspace --no-fail-fast` rc=0: 1377 passed, 0 failed, 22 ignored.** Zero
+`Keygen` occurrences. This is the first fully green workspace run in this family of
+sessions, and by the governing decision — *"if it passes the suite on this machine, it's
+a pass"* — **the bar is met on `main`**.
+
+The within-run comparison is what matters: exec latency stayed **flat** across an entire
+workspace run rather than degrading 33×. D6's conclusion no longer rests on a single
+confounded observation.
+
+**Still true:** `syspolicyd` is untouched by a Spotlight exclusion and sat at 33.7% after
+the suite went green. If timing flakes return *without* `corespotlightd` being hot,
+Gatekeeper is the place to look. And the publish-window race (**D7**) did not fire in this
+run — it is intermittent, not fixed.
