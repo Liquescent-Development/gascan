@@ -102,10 +102,29 @@ Arca the way it does, which is not obvious from the code alone.
     resolved itself.
   - D5 — `stash@{0}` `f6356f9` holds EXACTLY ONE file, `.superpowers/sdd/progress.md`,
     which is gitignored. No tracked content. Dropping it is the maintainer's call.
-  - D7 — how the health check should treat mode `0200`. `validate_file_stat` reports
-    the daemon's own not-yet-published record (created inert at 0200, published by
-    chmod to 0600) as "unsafe". Mechanism VERIFIED 2026-08-07; the remedy is a design
-    choice: retry, treat-as-absent, or wait. NEEDS A MAINTAINER DECISION.
+  - D7 — how the health check should treat mode `0200`. `validate_file_stat`
+    (`daemon.rs:3057`) reports a `0200` file as "unsafe" because it compares against
+    `FILE_MODE` alone. NEEDS A MAINTAINER DECISION, and **do not reach for a blanket
+    retry** — VERIFIED 2026-08-07 by reading the code, `0200` is TWO states and only
+    one of them ever resolves:
+
+      is_instance_tombstone      (daemon.rs:2708)  mode 0200, size == 0
+        an inert placeholder; publication is in flight and WILL complete
+
+      is_interrupted_tombstone   (daemon.rs:2633)  mode 0200, size > 0
+        a daemon wrote the record and died before chmod to 0600. NEVER resolves.
+
+    A blanket retry turns the second case from an immediate, diagnosable failure into
+    a timeout — you burn the health window and then report "did not become healthy"
+    instead of "a previous daemon died mid-publication". Any retry must be narrowed to
+    the exact inert shape (regular file, uid matches, nlink 1, mode 0200, **size 0**),
+    with every other deviation still failing immediately.
+
+    **INSTRUMENT BEFORE CHANGING BEHAVIOUR.** `validate_file_stat` never looks at size
+    and does not report it, so the existing evidence cannot distinguish the two cases:
+    run `31209969877` passed this test and run `31209575561` failed it
+    (`autostart.rs:396`, job `92969028088`), and neither log records size. Make it say more first — this is the project's
+    highest-yield habit and the remedy is currently a guess without it.
   - **`scripts/generate-grpc.sh` rewrites six `.pb.go` files inside the
     `containerization` submodule**, which is a SEPARATE REPOSITORY. arca#54 was
     scoped to Swift and reverted them. Whether this script should regenerate another
