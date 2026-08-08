@@ -1,8 +1,11 @@
 use gascan_core::runtime::{
-    CreateRequest, ExecRequest, MANAGED_BY, OwnershipMetadata, RecreateRequest, RemoveRequest,
-    ResourceIdentity, ResourceKind, RuntimeBindMount, RuntimeError, RuntimeNetwork, RuntimePort,
-    RuntimeResource, RuntimeResourceLimits, RuntimeUser, RuntimeVolume, immutable_image_identity,
+    ContainerState, CreateRequest, ExecRequest, MANAGED_BY, NetworkIsolation, OwnershipMetadata,
+    RecreateRequest, RemoveRequest, ResourceIdentity, ResourceKind, RuntimeBindMount,
+    RuntimeCapabilities, RuntimeError, RuntimeNetwork, RuntimePort, RuntimeResource,
+    RuntimeResourceLimits, RuntimeSandbox, RuntimeUser, RuntimeVersion, RuntimeVolume,
+    SandboxLabel, classify_resource_ownership, immutable_image_identity, immutable_image_reference,
 };
+use gascan_core::sandbox::SandboxId;
 use gascan_engine_proto::v1;
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
@@ -285,10 +288,220 @@ pub(crate) fn exec_start(request: &ExecRequest) -> v1::ExecStart {
     }
 }
 
+/// A response whose `oneof` is unset. proto3 makes that representable, and it
+/// means the engine sent a message this client cannot interpret.
+pub(crate) fn missing_outcome(operation: &str) -> RuntimeError {
+    invalid_output(operation, "response carried no outcome")
+}
+
+pub(crate) fn runtime_capabilities(
+    capabilities: &v1::Capabilities,
+) -> Result<RuntimeCapabilities, RuntimeError> {
+    let version = capabilities
+        .engine_version
+        .as_ref()
+        .ok_or_else(|| invalid_output("capabilities", "response carried no engine version"))?;
+    let offline = match v1::Isolation::try_from(capabilities.offline) {
+        Ok(v1::Isolation::Proven) => NetworkIsolation::Proven,
+        Ok(v1::Isolation::Unsupported) => NetworkIsolation::Unsupported,
+        Ok(v1::Isolation::Unverified) => NetworkIsolation::Unverified,
+        Ok(v1::Isolation::Unspecified) | Err(_) => {
+            return Err(invalid_output(
+                "capabilities",
+                format!("offline isolation {} is not a value", capabilities.offline),
+            ));
+        }
+    };
+    // contract_minor is deliberately read and dropped: this client populates no
+    // additive fields yet, so knowing which it may find tells it nothing.
+    Ok(RuntimeCapabilities {
+        version: RuntimeVersion::new(
+            u64::from(version.major),
+            u64::from(version.minor),
+            u64::from(version.patch),
+        ),
+        bind_mounts: capabilities.project_mount,
+        named_volumes: capabilities.named_volumes,
+        tty: capabilities.tty,
+        signals: capabilities.signals,
+        loopback_publish: capabilities.loopback_publish,
+        resource_limits: capabilities.resource_limits,
+        offline,
+    })
+}
+
+/// Reassembles the canonical reference, then asserts it is one.
+///
+/// The result is deterministic, which is what lets the daemon compare one
+/// observation against another by exact string.
+pub(crate) fn runtime_image(image: Option<&v1::ImageDigest>) -> Result<String, RuntimeError> {
+    let image =
+        image.ok_or_else(|| invalid_output("inspect", "response carried no image digest"))?;
+    let reference = format!("{}@sha256:{}", image.repository, image.sha256_hex);
+    if !immutable_image_reference(&reference) {
+        return Err(invalid_output(
+            "inspect",
+            format!("engine image {reference:?} is not a named sha256 digest reference"),
+        ));
+    }
+    Ok(reference)
+}
+
+/// Loopback is not on the wire because it is the only case, so it is restored
+/// here. Every construction site in the policy compiler uses the same address,
+/// so this round-trips exactly.
+pub(crate) fn runtime_ports(ports: &[v1::PortMapping]) -> Result<Vec<RuntimePort>, RuntimeError> {
+    let mut seen = BTreeSet::new();
+    ports
+        .iter()
+        .map(|port| {
+            let host_port = u16::try_from(port.host_port).map_err(|_| {
+                invalid_output(
+                    "inspect",
+                    format!("host port {} is out of range", port.host_port),
+                )
+            })?;
+            let guest_port = u16::try_from(port.guest_port).map_err(|_| {
+                invalid_output(
+                    "inspect",
+                    format!("guest port {} is out of range", port.guest_port),
+                )
+            })?;
+            if host_port == 0 || guest_port == 0 {
+                return Err(invalid_output(
+                    "inspect",
+                    format!("port 0 is not a mapping: {host_port}:{guest_port}"),
+                ));
+            }
+            if !seen.insert(host_port) {
+                return Err(invalid_output(
+                    "inspect",
+                    format!("host port {host_port} is published twice"),
+                ));
+            }
+            Ok(RuntimePort {
+                host_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                host_port,
+                guest_port,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn runtime_sandbox(sandbox: &v1::Sandbox) -> Result<RuntimeSandbox, RuntimeError> {
+    let id = SandboxId::try_from(sandbox.sandbox_id.clone()).map_err(|error| {
+        invalid_output(
+            "inspect",
+            format!("sandbox id {:?} is invalid: {error}", sandbox.sandbox_id),
+        )
+    })?;
+    let image = runtime_image(sandbox.image.as_ref())?;
+    let state = match v1::SandboxState::try_from(sandbox.state) {
+        Ok(v1::SandboxState::Creating) => ContainerState::Creating,
+        Ok(v1::SandboxState::Running) => ContainerState::Running,
+        Ok(v1::SandboxState::Stopped) => ContainerState::Stopped,
+        Ok(v1::SandboxState::Unspecified) | Err(_) => {
+            return Err(RuntimeError::UnknownActualState {
+                resource: id.to_string(),
+                state: sandbox.state.to_string(),
+            });
+        }
+    };
+    // A sandbox must be labelled, as the Apple backend also requires: an
+    // unlabelled container is not one this client may claim to own.
+    let owner = sandbox.owner.as_ref().ok_or_else(|| {
+        invalid_output("inspect", format!("sandbox {id} carries no owner labels"))
+    })?;
+    let sandbox_id = SandboxId::try_from(owner.sandbox_id.clone()).map_err(|error| {
+        invalid_output(
+            "inspect",
+            format!("sandbox {id} has an invalid sandbox-id label: {error}"),
+        )
+    })?;
+    if sandbox_id != id {
+        return Err(RuntimeError::OwnershipMismatch {
+            resource: id.to_string(),
+        });
+    }
+    let ownership = OwnershipMetadata {
+        managed_by: owner.managed_by.clone(),
+        sandbox_id,
+    };
+    Ok(RuntimeSandbox::observed(
+        id,
+        image,
+        state,
+        ownership,
+        runtime_ports(&sandbox.ports)?,
+    ))
+}
+
+pub(crate) fn runtime_resource(resource: &v1::Resource) -> Result<RuntimeResource, RuntimeError> {
+    let identity = resource
+        .identity
+        .as_ref()
+        .ok_or_else(|| invalid_output("list_resources", "resource carried no identity"))?;
+    let kind = match v1::ResourceKind::try_from(identity.kind) {
+        Ok(v1::ResourceKind::Container) => ResourceKind::Container,
+        Ok(v1::ResourceKind::Volume) => ResourceKind::Volume,
+        Ok(v1::ResourceKind::Network) => ResourceKind::Network,
+        Ok(v1::ResourceKind::Unspecified) | Err(_) => {
+            return Err(invalid_output(
+                "list_resources",
+                format!("resource kind {} is not a value", identity.kind),
+            ));
+        }
+    };
+    let core_identity = ResourceIdentity::new(kind, identity.name.clone())?;
+    let owner = resource.owner.as_ref();
+    // An unparseable label is Mismatched, not a failed call: ListResources
+    // returns every resource the engine holds so that drift detection can see
+    // them, and one malformed foreign label must not hide the rest.
+    let parsed = owner.and_then(|owner| SandboxId::try_from(owner.sandbox_id.clone()).ok());
+    let label = match (owner, &parsed) {
+        (None, _) => SandboxLabel::Absent,
+        (Some(_), Some(id)) => SandboxLabel::Parsed(id),
+        (Some(_), None) => SandboxLabel::Unparseable,
+    };
+    let ownership = classify_resource_ownership(
+        kind,
+        &identity.name,
+        owner.map(|owner| owner.managed_by.as_str()),
+        label,
+    );
+    // Some(id) whenever OUR label parsed, including when the resource is
+    // Mismatched. **CORRECTED 2026-08-08 — this file previously said
+    // `match ownership { GasCanOwned => parsed, _ => None }`, which is the exact
+    // rule Task 1's fix round reverted as a regression.** `gascan-apple`'s
+    // `inspect.rs` reports the claimed id for a mismatched resource because the
+    // reconciler at `gascand/src/service.rs:3001-3012` finds it by that claim.
+    // The two backends MUST agree here — a divergence is what Task 1 exists to
+    // prevent, and it would mean one backend reports an ownership mismatch that
+    // the other silently drops.
+    let sandbox_id = if owner.map(|owner| owner.managed_by.as_str()) == Some(MANAGED_BY) {
+        parsed
+    } else {
+        None
+    };
+    Ok(RuntimeResource::discovered(
+        core_identity,
+        sandbox_id,
+        ownership,
+    ))
+}
+
+pub(crate) fn runtime_resources(
+    resources: &[v1::Resource],
+) -> Result<Vec<RuntimeResource>, RuntimeError> {
+    resources.iter().map(runtime_resource).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gascan_core::runtime::{ResourceOwnership, RuntimeBindMount, RuntimePort};
+    use gascan_core::runtime::{
+        ContainerState, NetworkIsolation, ResourceOwnership, RuntimeBindMount, RuntimePort,
+    };
     use gascan_core::sandbox::SandboxId;
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -463,6 +676,297 @@ mod tests {
                 .expect_err("one remove call carries one sandbox's labels")
                 .code(),
             "invalid_state",
+        );
+    }
+
+    fn wire_owner(sandbox_id: &str) -> v1::OwnerLabels {
+        v1::OwnerLabels {
+            managed_by: "gascan".to_owned(),
+            sandbox_id: sandbox_id.to_owned(),
+        }
+    }
+
+    #[test]
+    fn capabilities_rename_project_mount_and_widen_the_version() {
+        let capabilities = runtime_capabilities(&v1::Capabilities {
+            engine_version: Some(v1::Version {
+                major: 1,
+                minor: 2,
+                patch: 3,
+            }),
+            contract_minor: 0,
+            project_mount: true,
+            named_volumes: true,
+            tty: true,
+            signals: true,
+            loopback_publish: true,
+            resource_limits: true,
+            offline: v1::Isolation::Proven as i32,
+        })
+        .expect("a fully specified capability set maps");
+
+        assert_eq!(
+            capabilities.version,
+            gascan_core::runtime::RuntimeVersion::new(1, 2, 3)
+        );
+        assert!(
+            capabilities.bind_mounts,
+            "project_mount is Gas Can's bind_mounts"
+        );
+        assert_eq!(capabilities.offline, NetworkIsolation::Proven);
+    }
+
+    #[test]
+    fn an_unspecified_isolation_or_absent_version_is_refused() {
+        let unspecified = v1::Capabilities {
+            engine_version: Some(v1::Version {
+                major: 1,
+                minor: 0,
+                patch: 0,
+            }),
+            contract_minor: 0,
+            project_mount: true,
+            named_volumes: true,
+            tty: true,
+            signals: true,
+            loopback_publish: true,
+            resource_limits: true,
+            offline: v1::Isolation::Unspecified as i32,
+        };
+        assert_eq!(
+            runtime_capabilities(&unspecified)
+                .expect_err("unspecified is not a value")
+                .code(),
+            "invalid_output",
+        );
+
+        let versionless = v1::Capabilities {
+            engine_version: None,
+            ..unspecified
+        };
+        assert_eq!(
+            runtime_capabilities(&versionless)
+                .expect_err("no version")
+                .code(),
+            "invalid_output",
+        );
+    }
+
+    #[test]
+    fn an_image_digest_reassembles_into_a_canonical_reference() {
+        let image = runtime_image(Some(&v1::ImageDigest {
+            repository: "registry.example/workspace".to_owned(),
+            sha256_hex: DIGEST.to_owned(),
+        }))
+        .expect("a digest reassembles");
+        assert_eq!(image, format!("registry.example/workspace@sha256:{DIGEST}"));
+    }
+
+    #[test]
+    fn a_malformed_digest_is_refused_rather_than_concatenated() {
+        assert_eq!(
+            runtime_image(Some(&v1::ImageDigest {
+                repository: "registry.example/workspace".to_owned(),
+                sha256_hex: "not-a-digest".to_owned(),
+            }))
+            .expect_err("a short digest is not a reference")
+            .code(),
+            "invalid_output",
+        );
+        assert_eq!(
+            runtime_image(None).expect_err("no image at all").code(),
+            "invalid_output",
+        );
+    }
+
+    #[test]
+    fn inbound_ports_regain_the_loopback_address_they_never_sent() {
+        let ports = runtime_ports(&[v1::PortMapping {
+            host_port: 22222,
+            guest_port: 22,
+        }])
+        .expect("a port maps");
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].host_address, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!((ports[0].host_port, ports[0].guest_port), (22222, 22));
+    }
+
+    #[test]
+    fn an_out_of_range_zero_or_duplicated_inbound_port_is_refused() {
+        for ports in [
+            vec![v1::PortMapping {
+                host_port: 65_536,
+                guest_port: 22,
+            }],
+            vec![v1::PortMapping {
+                host_port: 22222,
+                guest_port: 70_000,
+            }],
+            vec![v1::PortMapping {
+                host_port: 0,
+                guest_port: 22,
+            }],
+            vec![v1::PortMapping {
+                host_port: 22222,
+                guest_port: 0,
+            }],
+            vec![
+                v1::PortMapping {
+                    host_port: 22222,
+                    guest_port: 22,
+                },
+                v1::PortMapping {
+                    host_port: 22222,
+                    guest_port: 80,
+                },
+            ],
+        ] {
+            assert_eq!(
+                runtime_ports(&ports).expect_err("must fail closed").code(),
+                "invalid_output",
+                "ports: {ports:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_sandbox_maps_and_its_labels_must_agree_with_its_id() {
+        let id = gascan_core::sandbox::SandboxId::test("observed");
+        let sandbox = v1::Sandbox {
+            sandbox_id: id.as_str().to_owned(),
+            image: Some(v1::ImageDigest {
+                repository: "registry.example/workspace".to_owned(),
+                sha256_hex: DIGEST.to_owned(),
+            }),
+            state: v1::SandboxState::Running as i32,
+            owner: Some(wire_owner(id.as_str())),
+            ports: Vec::new(),
+        };
+        let observed = runtime_sandbox(&sandbox).expect("a labelled running sandbox maps");
+        assert_eq!(observed.state, ContainerState::Running);
+        assert_eq!(observed.ownership.managed_by, "gascan");
+
+        let disagreeing = v1::Sandbox {
+            owner: Some(wire_owner(
+                gascan_core::sandbox::SandboxId::test("other").as_str(),
+            )),
+            ..sandbox.clone()
+        };
+        assert_eq!(
+            runtime_sandbox(&disagreeing)
+                .expect_err("labels must describe this sandbox")
+                .code(),
+            "ownership_mismatch",
+        );
+
+        let unlabelled = v1::Sandbox {
+            owner: None,
+            ..sandbox.clone()
+        };
+        assert_eq!(
+            runtime_sandbox(&unlabelled)
+                .expect_err("a sandbox must be labelled")
+                .code(),
+            "invalid_output",
+        );
+
+        let stateless = v1::Sandbox {
+            state: v1::SandboxState::Unspecified as i32,
+            ..sandbox
+        };
+        assert_eq!(
+            runtime_sandbox(&stateless)
+                .expect_err("unspecified is not a state")
+                .code(),
+            "unknown_actual_state",
+        );
+    }
+
+    #[test]
+    fn a_resource_is_classified_by_the_shared_rule() {
+        let id = gascan_core::sandbox::SandboxId::test("owned");
+        let container = v1::Resource {
+            identity: Some(v1::ResourceIdentity {
+                kind: v1::ResourceKind::Container as i32,
+                name: id.as_str().to_owned(),
+            }),
+            owner: Some(wire_owner(id.as_str())),
+        };
+        assert_eq!(
+            runtime_resource(&container).expect("maps").ownership(),
+            ResourceOwnership::GasCanOwned,
+        );
+
+        let unlabelled = v1::Resource {
+            owner: None,
+            ..container.clone()
+        };
+        assert_eq!(
+            runtime_resource(&unlabelled).expect("maps").ownership(),
+            ResourceOwnership::Foreign,
+            "ListResources returns unlabelled resources on purpose; they are not an error",
+        );
+
+        let unparseable = v1::Resource {
+            owner: Some(v1::OwnerLabels {
+                managed_by: "gascan".to_owned(),
+                sandbox_id: "not a valid id".to_owned(),
+            }),
+            ..container.clone()
+        };
+        assert_eq!(
+            runtime_resource(&unparseable).expect("maps").ownership(),
+            ResourceOwnership::Mismatched,
+            "one malformed label must not blind the consumer to the rest of the inventory",
+        );
+
+        let kindless = v1::Resource {
+            identity: Some(v1::ResourceIdentity {
+                kind: v1::ResourceKind::Unspecified as i32,
+                name: id.as_str().to_owned(),
+            }),
+            ..container.clone()
+        };
+        assert_eq!(
+            runtime_resource(&kindless)
+                .expect_err("unspecified is not a kind")
+                .code(),
+            "invalid_output",
+        );
+
+        let identityless = v1::Resource {
+            identity: None,
+            ..container
+        };
+        assert_eq!(
+            runtime_resource(&identityless)
+                .expect_err("a resource with no identity is not addressable")
+                .code(),
+            "invalid_output",
+        );
+    }
+
+    #[test]
+    fn a_mismatched_resource_still_reports_the_sandbox_id_it_claims() {
+        // Parity with gascan-apple's inspect.rs, which reports the claimed id for a
+        // mismatched resource because the reconciler finds it by that claim. If the
+        // two backends disagree here, one reports an ownership mismatch the other
+        // drops -- the divergence Task 1's shared classifier exists to prevent.
+        let claimed = gascan_core::sandbox::SandboxId::test("claimed");
+        let collision = v1::Resource {
+            identity: Some(v1::ResourceIdentity {
+                kind: v1::ResourceKind::Container as i32,
+                name: "a-name-that-is-not-the-label".to_owned(),
+            }),
+            owner: Some(wire_owner(claimed.as_str())),
+        };
+        let resource = runtime_resource(&collision).expect("a collision still maps");
+        assert_eq!(resource.ownership(), ResourceOwnership::Mismatched);
+        assert_eq!(
+            resource
+                .sandbox_id()
+                .map(gascan_core::sandbox::SandboxId::as_str),
+            Some(claimed.as_str()),
         );
     }
 }
