@@ -3716,7 +3716,7 @@ impl EngineTransport for ChannelTransport {
 }
 ```
 
-Add `tokio-stream.workspace = true` to `[dependencies]` in `crates/gascan-arca/Cargo.toml` — `ReceiverStream` comes from it, and it is already a workspace dependency. Update `lib.rs`:
+`ReceiverStream` comes from `tokio-stream`. **Corrected 2026-08-08 (second session): it is ALREADY in `[dependencies]` in `crates/gascan-arca/Cargo.toml` — Task 2 put it there.** Verify that with `grep -n tokio-stream crates/gascan-arca/Cargo.toml` and add nothing; a second key in the same table is a manifest error, not a no-op. Update `lib.rs`:
 
 ```rust
 mod backend;
@@ -3744,8 +3744,24 @@ Expected: PASS, all tests from Tasks 2-8, zero failures.
 
 - [ ] **Step 4: Clippy, fmt, and commit**
 
+**Added 2026-08-08 (second session): this step was titled "Clippy, fmt, and commit" while
+containing neither command.** A step whose name promises more than its body delivers is the
+same defect as a test whose name does, and it matters here because Task 8 restored the plain
+gate — an implementer guessing at the command would most likely re-add `-A dead_code`, which
+is now wrong. The gate is plain, with nothing allowed:
+
 ```bash
-git add crates/gascan-arca Cargo.toml
+if env -u RUSTUP_TOOLCHAIN cargo clippy -p gascan-arca --all-targets -- -D warnings; then rc=0; else rc=$?; fi
+echo "clippy rc=$rc"
+```
+
+Expected: **rc=0 with nothing allowed.** `-A dead_code` must NOT appear; `exec_start` gained
+its caller in Task 8, so if `dead_code` fires now it is reporting something true about the
+code rather than about this plan's ordering. Then `env -u RUSTUP_TOOLCHAIN cargo fmt --all --check`,
+expected rc=0. Then commit:
+
+```bash
+git add crates/gascan-arca
 git commit -m "feat: dial the engine over a Unix socket with tonic
 
 Follows the daemon client's existing UDS dial rather than inventing an
