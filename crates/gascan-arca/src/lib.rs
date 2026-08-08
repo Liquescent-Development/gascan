@@ -9,8 +9,10 @@
 //! decisions specific to this crate in
 //! `docs/superpowers/specs/2026-08-08-gascan-arca-backend-design.md`.
 
+mod backend;
 mod error;
 mod translate;
 mod transport;
 
+pub use backend::ArcaBackend;
 pub use transport::{EngineTransport, ExecStream, LogsStream, TransportError};
