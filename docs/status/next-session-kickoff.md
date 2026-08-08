@@ -6,8 +6,12 @@
 > the conventions. Both are current as of `149fa41`; if they ever disagree, the SDD
 > ledger at `.superpowers/sdd/2026-08-08-gascan-arca/progress.md` settles it.
 
-The block below is kept for reference and is still accurate. It is written to be read
-cold.
+**SUPERSEDED IN PART, 2026-08-08 (second session): P5.2 IS COMPLETE.** All ten tasks
+landed and the branch measured green at `a9cb67c` — 1433 passed, 0 failed, 22 ignored,
+with the workspace clippy gate passing and nothing allowed. The block below still
+describes P5.2 as half-finished and lists Tasks 6-10 as remaining; **that part is stale
+and START-HERE governs**. What is still worth reading here is the trap list and the
+closing thoughts, which is why this file is kept rather than rewritten.
 
 ---
 
