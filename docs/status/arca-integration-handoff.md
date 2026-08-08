@@ -2679,10 +2679,34 @@ hard as you checked the defect.**
 `cargo clippy -p gascan-arca --all-targets -- -D warnings -A dead_code` **rc=0**;
 `cargo fmt --all --check` **rc=0**. Every commit signed, `%G?` = `G`.
 
-**The workspace suite has NOT been re-measured on this branch.** A 2-minute
-attempt timed out; that is a tooling limit, not a failure. Task 10 owns the
-measurement, and its accounting figure (47) is explicitly a convenience — **the
-SDD ledger is the authority**, because reviews added tests four separate times.
+**The workspace suite IS measured on this branch and it is GREEN. VERIFIED
+2026-08-08 at `139ee72`:** `cargo test --workspace --no-fail-fast` → **rc=0, 1410
+passed, 0 failed, 22 ignored**, 74 binaries, 0 failed binaries.
+
+**The increment is accounted for rather than merely larger:** 1382 (baseline at
+`5ad7ea9`) + 21 (`gascan-arca --lib`) + 2 (`transport_contract`) + 4
+(`gascan-core resource_ownership`) + 1 (`gascan-apple`'s mismatched-container
+pinning test) = **1410**.
+
+**An earlier run of that same suite at that same commit reported rc=101 with 59
+failures, and it was contention, not the product.** Every failure was in a
+`gascand`/`gascan-e2e` binary that spawns daemons and binds sockets; the log
+carried `elapsed=342.183846042s` for a single autostart and
+`AddrInUse: "daemon socket is live"`. It overlapped subagent cargo builds. **Do
+not run the full workspace suite while subagents are running cargo.** Partial
+reads of that run at 302 and 329 passed showed zero failures and read as
+reassuring only because the failures came later — one more instrument narrower
+than the claim it appeared to support.
+
+**That failing run was NOT a D7 occurrence even though it contained the D7
+test's name.** Its message was `did not become healthy and current (state
+Stopped)`, not `mode is not 0600 (mode 0200 ...)`, and `0200` appeared exactly
+once in the entire log. **Check the message, never the test name** — reading the
+name alone would have produced a confident, wrong report that D7 had finally
+fired, and unblocked a retry that is still correctly blocked.
+
+Task 10's accounting figure (47) remains a convenience — **the SDD ledger is the
+authority**, because reviews added tests four separate times.
 
 ### Signing and transport moved OFF 1Password, for this repository only
 

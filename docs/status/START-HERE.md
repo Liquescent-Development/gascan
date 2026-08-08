@@ -49,11 +49,30 @@ Extend the test to all twelve variants, and require a flip: transpose `resource`
 `message` in the fixture for at least two newly covered variants, confirm the test
 fails, then restore.
 
-**2. Re-measure the workspace suite.** The last verified figure (1382 passed, 22
-ignored at `5ad7ea9`) PREDATES this branch. A two-minute attempt timed out and a
-later background run reached 329 passed / 0 failed without completing — neither is a
-result. Run it with a long timeout and capture the exit code directly, never through
-a pipe. Task 10 owns the authoritative measurement.
+**2. Nothing — the workspace suite is already measured and GREEN on this branch.**
+**VERIFIED 2026-08-08 at `139ee72`: `cargo test --workspace --no-fail-fast` → rc=0,
+1410 passed, 0 failed, 22 ignored, 74 binaries, 0 failed binaries.**
+
+**The increment accounts for itself exactly, which is the check that matters:** 1382
+(baseline at `5ad7ea9`) + 21 (`gascan-arca --lib`: translate 16, error 5) + 2
+(`transport_contract`) + 4 (`gascan-core resource_ownership`) + 1 (`gascan-apple`'s
+mismatched-container pinning test) = **1410**. Not merely larger — equal to the
+baseline plus the sum of what this branch added.
+
+**Re-measure anyway at Task 10, and read this first, because it cost a false alarm.**
+An earlier run of the same suite at the same commit reported **rc=101 with 59
+failures** across 10 `gascand`/`gascan-e2e` binaries. That run overlapped subagent
+cargo builds, and the log carried `elapsed=342.183846042s` for one autostart plus
+`AddrInUse: "daemon socket is live"`. **Never run the full workspace suite while
+subagents are running cargo** — the daemon and e2e tiers spawn real processes and bind
+sockets, so they starve and report as product failures. Partial reads of that run at
+302 and 329 passed showed 0 failures and looked reassuring only because the failures
+came later.
+
+**That failing run was NOT a D7 occurrence**, though it contained the D7 test's name.
+Its text was `did not become healthy and current (state Stopped)`, not the signature
+`mode is not 0600 (mode 0200 ...)`, and "0200" appeared once in the whole log. Check
+the message, never the test name.
 
 ## Six things that will cost you if you learn them the hard way
 

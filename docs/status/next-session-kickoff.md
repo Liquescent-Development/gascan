@@ -37,13 +37,22 @@ its design. Read the design's §4.6 and §5 before touching any mapping code.
   every increment is accounted for rather than merely larger. `scripts/ci-run-release-contracts.sh`
   was **15/15, rc=0** at the same point. Re-measure before relying on either.
 
-  **THAT FIGURE PREDATES THE `feat/gascan-arca` BRANCH AND HAS NOT BEEN RE-MEASURED
-  ON IT.** A 2-minute attempt on 2026-08-08 timed out — a tooling limit, not a
-  failure. Per-crate figures WERE measured and are green: `gascan-arca --lib` **21
-  passed rc=0**, and `gascan-apple` plus `gascan-core` full suites clean. Task 10 of
-  the plan owns the workspace measurement. **Its accounting total is a convenience,
-  not an authority** — reviews added tests four separate times and moved it from 39
-  to 47. Recount from the ledger.
+  **RE-MEASURED ON `feat/gascan-arca` AND GREEN. VERIFIED 2026-08-08 at `139ee72`:
+  rc=0, 1410 passed, 0 failed, 22 ignored**, 74 binaries. The increment accounts for
+  itself: 1382 + 21 (`gascan-arca --lib`) + 2 (`transport_contract`) + 4
+  (`gascan-core resource_ownership`) + 1 (`gascan-apple` pinning test) = 1410.
+
+  **An earlier run of the same suite at the same commit said rc=101 / 59 failures, and
+  it was CONTENTION.** It overlapped subagent cargo builds; the log shows
+  `elapsed=342.183846042s` for one autostart and `AddrInUse: "daemon socket is live"`.
+  **Never run the full workspace suite while subagents run cargo** — the daemon and
+  e2e tiers spawn processes and bind sockets, starve, and report as product failures.
+  **It was NOT a D7 occurrence** despite containing the D7 test's name: the message
+  was `did not become healthy and current (state Stopped)`, not `mode 0200`. Check
+  messages, not test names.
+
+  Task 10's accounting total is a convenience, not an authority — reviews moved it
+  from 39 to 47. Recount from the ledger.
 
 **STATE:**
 
