@@ -2636,3 +2636,143 @@ a blanket retry, a confident drop, and a "trivial" approval.
 The common cause is not carelessness about facts; it is **describing an aggregate
 after examining one member of it.** The kickoff now lists that as the third
 instrument to have been confidently wrong here.
+
+---
+
+## Session of 2026-08-08 — P5.2 under way: Tasks 1-5 of 10 landed, and the plan was the defect source
+
+### What landed
+
+**P5.2 is HALF DONE and executing under subagent-driven development.** Branch
+`feat/gascan-arca`, pushed. Five of ten planned tasks are complete with their
+reviews clean; five remain, and every remaining brief is staged and audited.
+
+| Artifact | Commit |
+|---|---|
+| Design spec, `docs/superpowers/specs/2026-08-08-gascan-arca-backend-design.md` | `372961a` |
+| Implementation plan, `docs/superpowers/plans/2026-08-08-gascan-arca.md` | `749c619` |
+| Task 1 — shared ownership rule published from `gascan-core` | `c980c7b` + fix `34eba01` |
+| Task 2 — `gascan-arca` crate and its `EngineTransport` seam | `fd02093` |
+| Task 3 — outbound mapping | `09050c3` + fix `0140511` |
+| Task 4 — inbound mapping | `a82e110` |
+| Task 5 — `EngineError` code table | `15251ae` |
+
+**VERIFIED figures, measured per crate rather than assumed:** `gascan-arca --lib`
+**21 passed, rc=0**; `gascan-apple` and `gascan-core` full suites clean;
+`cargo clippy -p gascan-arca --all-targets -- -D warnings -A dead_code` **rc=0**;
+`cargo fmt --all --check` **rc=0**. Every commit signed, `%G?` = `G`.
+
+**The workspace suite has NOT been re-measured on this branch.** A 2-minute
+attempt timed out; that is a tooling limit, not a failure. Task 10 owns the
+measurement, and its accounting figure (47) is explicitly a convenience — **the
+SDD ledger is the authority**, because reviews added tests four separate times.
+
+### Signing and transport moved OFF 1Password, for this repository only
+
+The maintainer was remote and could not unlock 1Password. Nothing global changed.
+
+| | |
+|---|---|
+| Key | `~/.ssh/gascan-signing`, ed25519, no passphrase — **forced**, since a passphrase would need the unlocking this exists to avoid |
+| GitHub | registered as a **signing** key, id `1101452` |
+| `user.signingkey` | `~/.ssh/gascan-signing`, `--local`. **A file PATH, not a literal key string — that is the whole mechanism.** `ssh-keygen` signs straight from the private key and consults no agent; the global config holds a literal key and still needs one |
+| Transport | `remote.origin.url` → https, `credential.https://github.com.helper` → `!gh auth git-credential`, both `--local` |
+| Also | `tag.gpgsign true` locally |
+
+**VERIFIED 2026-08-08 four ways, each with `env -u SSH_AUTH_SOCK` so the agent
+could not silently help:** `ssh-keygen -Y sign` rc=0; `-Y verify` returned
+`Good "git" signature`; a real commit reported `%G?` = `G` with fingerprint
+`SHA256:q6m/eNE…`; and GitHub reported `verified: true, reason: valid` on a pushed
+probe commit, since removed.
+
+Two facts read rather than assumed: `gh` holds `admin:ssh_signing_key` but **not**
+`admin:public_key`, which is why transport went to HTTPS instead of a second SSH
+key — it avoided a web-UI trip entirely. And the ruleset targets
+`~DEFAULT_BRANCH` only (`gh api /repos/.../rulesets/20492137`), so
+`required_signatures` gates `main`, not feature branches.
+
+**Unscheduled consequence, flagged not fixed:** a release tag cut from this
+machine while 1Password is locked will be signed by `gascan-signing`, and
+`engine/allowed-signers` — tracked, checked by `sync-arca-proto.sh` — knows only
+the 1Password key. P5.2 cuts no tags, so nothing is blocked.
+
+### The finding that matters: six defects, all in plan text, none in implementation
+
+**Every single defect this session came from the plan or spec I wrote, and not one
+came from an implementer's code.** That is worth stating plainly because it
+inverts where the review effort belongs.
+
+| Defect | Found by | Cost |
+|---|---|---|
+| `sandbox_id` became `None` for a `Mismatched` resource, breaking the reconciler's unfiltered `.find()` at `service.rs:3001-3012` and silently dropping an `OwnershipMismatch` finding | Task 1's implementer, which **flagged instead of complying** | 1 fix round |
+| The clippy gate: `-D warnings` cannot pass while `translate.rs` precedes its Task 6 consumer (17 lib / 13 lib-test `dead_code`) | Task 3's implementer, which **escalated instead of guessing** | 1 plan amendment |
+| Two of six refusals implemented but **untested** — read-only volume, mixed-sandbox remove | Task 3's reviewer, which traced it to the brief rather than blaming the implementer | 1 fix round |
+| **The same reverted rule still sitting in Task 4's brief**, ready to be reintroduced in the other backend | Pre-dispatch audit | 0 — caught before dispatch |
+| A round-trip test asserting only `code()`, blind to a transposed error field | Pre-dispatch audit | 0 |
+| Task 6: `create_container` and `remove` untested, and a test **named** `start_stop_…` that never called `stop` | Pre-dispatch audit | 0 |
+| Task 8: **no drop-cancellation test**, though the spec's §7 requires one | Pre-dispatch audit | 0 |
+
+**The lesson is the cheap end.** Three review rounds were spent on the first three;
+the last four cost nothing because the brief was audited before an implementer saw
+it. Auditing a brief takes minutes. A review round costs a dispatch, a fix, and a
+re-review.
+
+**The second lesson is that the instrument keeps being narrower than the claim** —
+five times, in five different costumes: a `grep | head -10` that returned exactly
+ten and read as complete; a test asserting `code()` while appearing to verify a
+mapping; a test **name** promising `stop`; stale test-count figures; and a grep
+for flip evidence whose pattern could not match the format the evidence was in,
+which nearly produced a false accusation against an implementer that had done the
+work correctly.
+
+### Corrections recorded in place, not edited away
+
+- **`995b413`** — the clippy gate is `-D warnings -A dead_code` for Tasks 3-7,
+  **on the command line only, never as an attribute**. An `#[allow(dead_code)]`
+  outlives the condition that justified it; a flag cannot rot. Task 8 restores the
+  plain gate because `exec_start` is the last function to gain a caller; Task 10's
+  workspace gate was always unconditional.
+- **`14bac45`** — Task 4's brief no longer carries the backend-splitting rule.
+- **`942fe9f`** — **every `crates/gascan-core/src/runtime.rs` line number in the
+  new design spec is STALE.** Task 1 added 58 lines to that file. Measured:
+  `from_resources` 944 → **1001**, `discovered` 503 → **554**,
+  `RuntimeError::code` 1056 → **1113**, `trait RuntimeBackend` 990 → **1047**.
+  The old numbers are deliberately kept — they are correct against `cf13a74` — with
+  a table of re-derived anchors beside them. **Cite symbols, not lines.**
+- **`cf13a74`** — the kickoff's "signing goes through 1Password" trap, struck
+  through with the new mechanism and its verification.
+
+### Still open, and none of it blocking
+
+- **Tasks 6-10 remain.** Task 6 is the largest (backend + fake + the sealed-request
+  `PolicyCompiler` fixture, 11 tests); 7 is `logs`; 8 is `exec` including the new
+  cancellation test; 9 is the `tonic` arm, which **ships with no tests by the
+  maintainer's explicit ruling** because the only thing that could answer it is a
+  Rust server, which is forbidden; 10 is mutation flips plus the workspace gate.
+- **Five deferred minors**, recorded in the ledger for the final whole-branch
+  review to triage. One is flagged as arguably under-rated: `runtime_sandbox`'s
+  unparseable-owner-label branch refuses correctly but has **no test**, and nothing
+  later in the plan covers it — the same class Task 3's review rated Important.
+- **One audit finding identified and deliberately NOT fixed**, so it is visible
+  rather than silently skipped: Task 7 has no test for a mid-stream
+  `TransportError` (as distinct from an engine error chunk), nor for a `LogsChunk`
+  with an unset `outcome`. Both paths exist in the specified code.
+- **D7 is untouched, on purpose.** No `0200` occurrence has fired since the
+  instrument landed. Note that a docs-only CI run **skips `rust` and `engine`
+  entirely** (`31262534703`), so a green docs run is not evidence about D7 at all.
+  Run `31262577806` was the first D7-capable run after the instrument; its result
+  was not collected. **Do not write the narrowed retry until a run names the state.**
+
+### Two process observations worth carrying
+
+**Subagents go idle without reporting.** It happened three times — an implementer
+mid-fix-round, and two reviewers. Silence was never treated as success: each time,
+`git log` and greps established the real state, and once the implementer had done
+nothing beyond an uncommitted edit. **Trust `git log`, not a report** — one
+implementer also claimed a nudge of mine was "stale" when direct verification at
+the time showed otherwise.
+
+**The cheap model tier worked where the plan carried complete code.** Task 5 ran
+on the cheapest tier and produced a clean result on the first pass, because its
+brief was transcription plus verification. Tasks needing judgment about existing
+code stayed a tier up.

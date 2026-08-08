@@ -7,10 +7,15 @@ Paste the block below to start the next agent. It is written to be read cold.
 Continue the Arca integration. Work happens in `~/code/gascan` and `~/code/arca`.
 
 Read `~/code/gascan/docs/status/arca-integration-handoff.md`, starting at
-"## Session of 2026-08-07 (later still)" and reading to the end. Then read
-`docs/superpowers/specs/2026-08-07-arca-engine-codegen-design.md` — it describes the
-build machinery you will be extending, and its §3 explains why the Rust build reaches
-Arca the way it does, which is not obvious from the code alone.
+"## Session of 2026-08-08" and reading to the end — that is the session you are
+continuing, and it is the shortest path to the current state. Then read
+**`.superpowers/sdd/2026-08-08-gascan-arca/progress.md`**, the SDD ledger: it names
+every commit, every deferred finding and every ruling, and it is the authority where
+this document and the plan disagree with it.
+
+Then read `docs/superpowers/plans/2026-08-08-gascan-arca.md` — the plan you are
+executing — and `docs/superpowers/specs/2026-08-08-gascan-arca-backend-design.md`,
+its design. Read the design's §4.6 and §5 before touching any mapping code.
 
 **THE GOVERNING DECISION, still binding:**
 
@@ -25,12 +30,25 @@ Arca the way it does, which is not obvious from the code alone.
   every increment is accounted for rather than merely larger. `scripts/ci-run-release-contracts.sh`
   was **15/15, rc=0** at the same point. Re-measure before relying on either.
 
+  **THAT FIGURE PREDATES THE `feat/gascan-arca` BRANCH AND HAS NOT BEEN RE-MEASURED
+  ON IT.** A 2-minute attempt on 2026-08-08 timed out — a tooling limit, not a
+  failure. Per-crate figures WERE measured and are green: `gascan-arca --lib` **21
+  passed rc=0**, and `gascan-apple` plus `gascan-core` full suites clean. Task 10 of
+  the plan owns the workspace measurement. **Its accounting total is a convenience,
+  not an authority** — reviews added tests four separate times and moved it from 39
+  to 47. Recount from the ledger.
+
 **STATE:**
 
-  gascan  `main`. **Confirm the SHA with `git log --oneline -1`** rather than
-          trusting any SHA written in the docs: a documentation commit that records
-          a tip is invalidated by its own merge. This has cost two sessions a round
-          already. Do not chase it; verify it.
+  gascan  **`feat/gascan-arca`, NOT `main`** — P5.2 is mid-flight on it and it is
+          pushed. **Confirm the SHA and the branch with `git log --oneline -1` and
+          `git rev-parse --abbrev-ref HEAD`** rather than trusting any SHA written in
+          the docs: a documentation commit that records a tip is invalidated by its
+          own merge. This has cost two sessions a round already. Do not chase it;
+          verify it.
+          **Signing and transport on this repo no longer use 1Password** — see the
+          struck-through trap below for the mechanism and its verification. Commit
+          with `env -u SSH_AUTH_SOCK git commit` if the agent is unreachable.
           Ruleset 20492137: deletion, non_fast_forward, required_signatures,
           pull_request with allowed_merge_methods ["merge"], bypass
           OrganizationAdmin. NO required_status_checks — keep it that way.
@@ -42,7 +60,21 @@ Arca the way it does, which is not obvious from the code alone.
           equal the pin's revision.
   Open:   Vas-Solutus/arca#50 (broadcast-allocation defect, deliberately unfixed).
 
-**WHAT LANDED LAST SESSION: P3.2. P3 IS COMPLETE.**
+**WHAT LANDED 2026-08-08: HALF OF P5.2. FIVE OF TEN TASKS.**
+
+  Branch **`feat/gascan-arca`**, pushed, tree clean. `crates/gascan-arca` exists with
+  the transport seam, both halves of the mapping, and the error table. Tasks 1-5
+  complete with clean reviews; **Tasks 6-10 remain and every brief is staged and
+  audited** in `.superpowers/sdd/2026-08-08-gascan-arca/`.
+
+  Commits: `c980c7b`+`34eba01` (Task 1), `fd02093` (2), `09050c3`+`0140511` (3),
+  `a82e110` (4), `15251ae` (5). Interleaved `docs:` commits are plan corrections and
+  are listed in the handoff.
+
+  **Resume by running the SDD skill against the existing ledger.** It records which
+  tasks are done; do not re-dispatch them.
+
+**WHAT LANDED 2026-08-07: P3.2. P3 IS COMPLETE.**
 
   Its exit — *proto exists, both sides generate, nothing implements it yet* — now
   holds in all three clauses.
@@ -59,14 +91,39 @@ Arca the way it does, which is not obvious from the code alone.
   be unlocked EARLY rather than forty minutes in. Probe it with an actual signature
   (`ssh-keygen -Y sign`); `ssh-add -l` succeeding proves nothing.
 
-**YOUR TASK: the fan-out is open. P4 and P5 both run from here.**
+**YOUR TASK: finish P5.2. Tasks 6-10 of the plan, in order.**
 
-  P3 was the fan-out point and it is now behind you. Pick with the maintainer:
+  This is not a fan-out any more — it is an execution queue with five items and a
+  written plan. Continue with `superpowers:subagent-driven-development` against the
+  existing ledger.
 
-  - **P5.2 — `gascan-arca`**, the client that implements `RuntimeBackend` over the
-    generated stubs. The type mapping is ALREADY DERIVED, in
-    `docs/superpowers/specs/2026-08-07-arca-engine-proto-design.md` §9. It exists
-    specifically so this step does not re-derive it. Read it before writing a line.
+  - **Task 6** is the largest: `ArcaBackend`, the fake transport, the sealed-request
+    `PolicyCompiler` fixture, 11 tests. `CreateRequest` cannot be constructed outside
+    `gascan-core` — the fixture builds one through `PolicyCompiler::compile`, copying
+    `gascan-apple/tests/backend_fake_runner.rs`.
+  - **Task 7** `logs`, **Task 8** `exec` (including the drop-cancellation test that
+    nothing else can detect), **Task 9** the `tonic` arm, **Task 10** mutation flips
+    plus the workspace gate.
+  - **Task 9 ships with NO tests, by the maintainer's explicit ruling.** The only
+    thing that could answer it is a Rust server, which is forbidden. Do not
+    re-litigate it; the compiler checking it against `EngineTransport` is the stated
+    assurance and the plan says so rather than dressing it up as coverage.
+  - **The maintainer pre-ruled three shapes as plan-mandated**, so tell reviewers
+    rather than looping on them: Task 6's temporary `exec`/`logs` stubs, Task 10
+    committing nothing, and Task 3's deliberately non-compiling first file.
+
+  After Task 10: final whole-branch review, then
+  `superpowers:finishing-a-development-branch`. **Merge only, never squash or rebase,
+  and only via a PR.**
+
+**AFTER P5.2, the fan-out reopens:**
+
+  - **P5.3 — extract the conformance suite** from `fake_runtime.rs` and run it against
+    the fake, apple and arca backends. This is the natural successor: P5.2 leaves
+    `gascan-arca` tested against a fake transport only, and P5.3 is what makes
+    "both backends behave the same" systematic instead of a matter of having read the
+    right file. Several parity properties are currently defended by single tests that
+    P5.3 should absorb.
   - **P4 — Docker removal** in Arca.
   - **P3.3 — publish and version the proto**, which carries the `buf breaking`
     check. Still inert: `buf` is not installed and Arca has no CI (P2.3 open). What
@@ -154,6 +211,45 @@ Arca the way it does, which is not obvious from the code alone.
     tracked when it was made. The content was SDD scaffolding for work that shipped
     long ago (PR #13, release 0.1.20), which is why dropping it was still right. The
     commit stays reachable from the reflog until gc.
+
+**TRAPS ADDED 2026-08-08, all paid for:**
+  - **THE PLAN WAS THE DEFECT SOURCE, NOT THE IMPLEMENTERS.** All six defects that
+    session came from plan or spec text; none came from an implementer's code. Three
+    cost review rounds; the other three cost nothing because the brief was audited
+    **before** dispatch. **Audit every brief before you dispatch it.** Minutes against
+    a dispatch-plus-fix-plus-re-review.
+  - **`cargo clippy -- -D warnings` CANNOT PASS for `gascan-arca` until Task 8.**
+    `translate.rs` arrives before its consumer, so rustc's `dead_code` fires — 17 lib,
+    13 lib-test, VERIFIED. The gate for Tasks 3-7 is `-D warnings -A dead_code`,
+    **on the command line only. NEVER add `#[allow(dead_code)]` to the source** — an
+    attribute outlives the condition that justified it and hides a genuinely dead
+    function later. Task 8 restores the plain gate; Task 10's workspace gate is
+    unconditional.
+  - **EVERY `crates/gascan-core/src/runtime.rs` LINE NUMBER IN THE 2026-08-08 DESIGN
+    SPEC IS STALE.** Task 1 added 58 lines. `from_resources` 944→**1001**,
+    `discovered` 503→**554**, `RuntimeError::code` 1056→**1113**, `trait
+    RuntimeBackend` 990→**1047**. The old numbers are kept on purpose (correct against
+    `cf13a74`) with a table beside them. **Cite symbols, not lines; when a citation
+    and the code disagree, the code wins.**
+  - **THE TWO BACKENDS MUST AGREE ON `sandbox_id` FOR A `Mismatched` RESOURCE.** Both
+    report the id it claims: `owner.managed_by == MANAGED_BY ? parsed : None`. The
+    rule `match ownership { GasCanOwned => parsed, _ => None }` is WRONG and was
+    reverted twice — once after shipping in `gascan-apple`, once caught in Task 4's
+    brief before shipping. The reconciler at `gascand/src/service.rs:3001-3012` finds
+    a mismatched container **by that claim with no ownership filter**, so withholding
+    it silently drops an `OwnershipMismatch` finding. A parity test defends it.
+  - **A DOCS-ONLY CI RUN SKIPS `rust` AND `engine` ENTIRELY** (VERIFIED, run
+    `31262534703`). So a green docs run is **not evidence about D7**, or about
+    anything in Rust. Check which jobs actually ran before drawing a conclusion.
+  - **SUBAGENTS GO IDLE WITHOUT REPORTING.** Three times in one session — an
+    implementer mid-fix-round and two reviewers. **Never read silence as success.**
+    `git log` and a grep for the expected symbol establish the real state; once, an
+    implementer had done nothing beyond an uncommitted edit. Do not accept a report's
+    self-description either: one claimed a nudge was "stale" when direct verification
+    showed the work had not landed.
+  - **`ls` IS ALIASED** to something that rejects a trailing-slash path argument
+    (`invalid value ... for '--icons'`). Use `find` or `git ls-files` in scripted
+    checks rather than `ls`.
 
 **TRAPS, all paid for already:**
   - **`gate` DOES NOT MEAN "everything passed".** Its `needs` is
@@ -306,29 +402,44 @@ Arca the way it does, which is not obvious from the code alone.
 
 ---
 
-**CLOSING THOUGHTS FROM THE PREVIOUS SESSION — read once, then get to work.**
+**CLOSING THOUGHTS FROM THE 2026-08-08 SESSION — read once, then get to work.**
 
-The wiring in P3.2 was the easy part. What nearly cost correctness, four times, was
-believing a confident sentence written by an earlier session. The single habit that
-caught all four was the same: **before describing a set, look at every member of it.**
-One proto file was read and four were described; one stash entry was quoted and three
-files were in it. That is not carelessness about facts — it is generalising from a
-sample, and it is the failure this project keeps rediscovering under new names.
+**The plan was the defect source. Not one of the six defects came from an
+implementer's code; all six came from text I wrote.** Three were caught by the loop
+and cost a review round each. The other three cost nothing, because I audited the
+brief before dispatching it. If you take one habit from this session, take that one:
+**read the brief you are about to hand over, as an adversary, before you hand it
+over.** The most alarming find was Task 4's brief still instructing an implementer to
+write the exact rule that had been reverted as a regression two tasks earlier — a
+defect that had already been "fixed" once, waiting in a document to be reintroduced
+in the other backend.
 
-The corollary is cheap and worth adopting: when the maintainer asks you to explain an
-open item, treat the explaining as the verification. Twice on 2026-08-07 the act of
-writing a plain-language summary is what surfaced that the underlying entry was false.
+**The instrument was narrower than the claim, five times, in five costumes.** A
+`grep | head -10` that returned exactly ten and read as complete. A test asserting
+`code()` while appearing to verify a whole mapping. A test *named*
+`start_stop_and_prepare_image_report_an_ack` that never called `stop`. Test-count
+figures that went stale as reviews added tests. And a grep for flip evidence whose
+pattern could not match the format the evidence was in, which nearly had me accuse an
+implementer of skipping a verification it had performed correctly. This project's
+standing lesson is "verify the instrument, not only the result." It keeps arriving in
+new clothing. **Prefer reading the artifact to pattern-matching it.**
 
-**One thing is deliberately unfinished, and it is not a loose end — it is a decision
-point.** D7's narrowed retry is approved in principle and unwritten. The instrument
-landed instead, because the evidence could not distinguish the two `0200` states and a
-blanket retry would have converted a diagnosable crash into a timeout. The next CI
-occurrence will now say which state fired. **Do not write the retry until you have
-that.** If you are tempted to skip the wait because the reasoning seems sound, that is
-precisely the moment this document exists to interrupt.
+**Silence is not success.** Three subagents went idle mid-job without reporting. Every
+time, `git log` and a grep for the expected symbol told the truth, and once the truth
+was that nothing had landed beyond an uncommitted edit. A subagent's self-report is
+evidence, not a finding — one of them told me my nudge was stale when verification at
+the time showed otherwise.
 
-**On picking the next task:** P5.2 (`gascan-arca`) is the highest-value step and its
-type mapping is already derived — read the P3.1 design §9 before writing a line, since
-it exists specifically so you do not re-derive it. P4 and P3.3 are genuine
-alternatives. Ask the maintainer rather than assuming; the fan-out means there is no
-single obvious next move, and that is by design.
+**What is deliberately unfinished, and why it is not a loose end.** Task 7 has no test
+for a mid-stream `TransportError` or an unset `LogsChunk.outcome`. I found both, fixed
+neither, and wrote them into the ledger — because a gap you can see is worth more than
+a gap you patched without deciding whether it belongs to this task. Rule on it; do not
+inherit it silently. The same applies to the five deferred minors: one of them,
+`runtime_sandbox`'s untested unparseable-label branch, is the same class a reviewer
+rated *Important* earlier in the session, and nothing later in the plan covers it.
+
+**D7 is still the one thing you must not do early.** No `0200` occurrence has fired
+since the instrument landed, and a docs-only run tells you nothing because it skips
+`rust` entirely. The retry is approved in principle and remains unwritten. If the
+reasoning feels sound enough to skip the wait, that is the moment this document exists
+to interrupt.
