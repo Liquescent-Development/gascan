@@ -2817,3 +2817,151 @@ the time showed otherwise.
 on the cheapest tier and produced a clean result on the first pass, because its
 brief was transcription plus verification. Tasks needing judgment about existing
 code stayed a tier up.
+
+## Session of 2026-08-08 (second) — P5.2 complete: Tasks 5-10, and six instruments that were narrower than their claims
+
+### What landed
+
+**P5.2 IS DONE.** Tasks 5 through 10 closed, the final whole-branch review returned
+`request_changes` with two must-fix findings, both were fixed with mutation proofs, and
+the fix wave's re-review returned **merge**.
+
+**VERIFIED at `a9cb67c`, measured alone on an idle machine:** `cargo test --workspace
+--no-fail-fast` → **rc=0, 1433 passed, 0 failed, 22 ignored**; `cargo clippy --workspace
+--all-targets -- -D warnings` → rc=0 **with nothing allowed**; `cargo fmt --all --check`
+→ rc=0; `./scripts/ci-run-release-contracts.sh` → rc=0, **15/15**. Every commit signed,
+`%G?` = `G`.
+
+| Artifact | Commit |
+|---|---|
+| Task 5 fix — field placement for all 12 error codes | `3c5d310` |
+| Task 6 — `ArcaBackend` and the nine unary methods | `27c43c6` + `5f10d01` + `0cff066` |
+| Task 7 — `logs` | `b51fd57` + `56f6581` |
+| Task 8 — `exec`, and the plain clippy gate restored | `844a412` + `6ca97d8` |
+| Task 9 — `ChannelTransport`, the `tonic` arm | `8f849ec` + `10821dd` |
+| Task 10 — mutation flips and the workspace gate | no commits, by design |
+| Final fix wave | `7437889` + `a9cb67c` |
+
+### The plan was the defect source again, and auditing briefs caught four before dispatch
+
+**Not one defect came from an implementer's code.** Four came out of plan text and were
+caught by auditing the brief before dispatch; two of those would have failed their own
+task's tests.
+
+- **Task 6's brief validated both create paths with `CreateOutcome::new`.** That is wrong
+  in both directions: `new` requires the container *and* the managed network, so the
+  container-only response a recreate must answer with would have been rejected — the
+  task's own test would have failed — and `new` also *accepts* volumes and a network, so
+  a recreate that rebuilt resources the caller asked it to retain would have passed
+  silently. The brief's own test comment already named `for_recreate` while its code
+  called `new`; the contradiction was inside the document. Fixed with a `CreatePath` enum
+  and a paired test that feeds a full topology to `create_container` and requires a
+  refusal. The implementer later collapsed it back on purpose and measured: **two** tests
+  fail, one per direction.
+- **Task 8's staged brief was stale and omitted the drop-cancellation test entirely** —
+  the test the previous session added precisely because "without it the whole cancellation
+  path could be dead and every other exec test would still pass". A staged brief is a
+  cache of the plan and goes stale whenever the plan is amended. **Re-extract every brief
+  immediately before dispatch.**
+- **Task 9's Step 4 was titled "Clippy, fmt, and commit" and contained neither command**,
+  which mattered because Task 8 restores the plain gate — an implementer guessing would
+  most likely have re-added `-A dead_code`. It also said to add `tokio-stream`, which was
+  already a dependency, where a duplicate key is a manifest error rather than a no-op.
+- **Task 10 said nothing about running the suite alone**, which is how this session lost
+  a measurement.
+
+### Six instruments narrower than their claims, and what each cost
+
+This is the defect this project keeps paying for. Six instances in one session, each
+convincing until checked.
+
+| Instrument | What it actually checked | Caught by |
+|---|---|---|
+| Task 5's field-placement test | 4 of 12 error codes | inherited finding |
+| Task 6's capabilities fixture, all `true` | could not tell the rename from a hardcoded `true` | task review |
+| …its "fix", alternating `T,F,T,F,T,F` | still blind to 6 of 15 transpositions, and **no fixture anywhere set `project_mount: false`** | re-review |
+| Task 6's "must reach the engine exactly once" | `calls.first()` — a duplicate passed | task review |
+| Task 7's error-chunk test | scripted `command_failed`, the very variant a hardcode would produce | task review |
+| **Task 8's drop-cancellation test** | **nothing — every exit was cancellation-independent** | the implementer, under the required flip |
+
+The last is the deepest: that test was itself added, by the previous session's audit, **as
+the fix for a missing test**, and it could not fail for its stated reason. `drop(session)`
+drops the input sender as well as calling `cancel()`, so the pump exits via
+`inputs.recv() → None` with no cancellation involved; and `ExecSession::live` drops the
+watch sender, so `changed()` resolves `Err` forever and the guards never break but always
+resolve the select arm — which is why the *other* four tests failed under the briefed
+flip. Coverage by accident of a dropped-sender side effect. The implementer kept the test
+with an honest comment, added a sixth that holds the session open so cancellation is the
+pump's only available exit, and designed an isolating flip (`mem::forget(cancellation)`)
+under which exactly one test fails.
+
+### The final review found what ten tasks of review had missed
+
+**Seven of `v1::CreateRequest`'s eleven fields were pinned by nothing.** Reducing
+`create_request` to empty vectors, `resources: None`, `network: None`, `user: Root`,
+`init: false` left the crate at 48 passed — a mutation that ships the workspace **as root,
+with no init reaper, no resource limits and no network**. Two blind spots met: the backend
+test asserted only `sandbox_id` and two `is_some()` checks, and `create_request` was never
+called from a unit test at all, only its leaves — three of which were untested because
+they are infallible. The fix asserts all eight remaining fields, and the fixer went past
+the brief: it argued that gutting all seven at once only proves the first assertion, and
+ran **seven single-field mutations** as well.
+
+**And `runtime_sandbox`'s unparseable-label refusal was untested**, exactly as the Task 4
+note had feared. Replacing it with `.unwrap_or_else(|_| id.clone())` also left 48 green.
+Since `managed_by` is copied verbatim with no `MANAGED_BY` check on either backend, that
+`?` **is** the ownership guard on the inspect path. The mutant's own output is the
+argument: it returned `OwnershipMetadata { managed_by: "gascan", sandbox_id:
+SandboxId("observed-…") }` fabricated from a label of `"not a valid id"`.
+
+### The parity this branch exists to protect holds
+
+Both backends agree that a `Mismatched` resource still reports the `sandbox_id` it claims,
+each defended by its own test, and the reverted rule would fail both. The reviewer also
+established that the two crates agree on the **severity split** — inspect *refuses* an
+unparseable label while list/inventory downgrades it to `Mismatched` and continues — and
+that the `gascan-core` extraction is behaviour-preserving in `gascan-apple`, checked case
+by case, including that the dropped `annotation == id.as_str()` guard was always true
+because `SandboxId::try_from` stores its string verbatim.
+
+**What it did not do: share the rule.** It is still duplicated verbatim in both backends,
+each with a comment warning the two must not diverge. The classifier was extracted; the
+rule was not. P5.3 is the natural home.
+
+### Measurement, and how it was got wrong first
+
+A workspace measurement was **discarded** this session. Three suites ran concurrently
+against one target directory — two of them mine, launched at the same output path after I
+wrongly concluded the first had not started, plus one from another Claude session — and
+the result was rc=101 with 59 failures across ten `gascand`/`gascan-e2e` binaries, none
+real. My own diagnostic had truncated the shared output file with `>` before I reasoned
+from it. Run alone, the same suite takes **93 seconds**.
+
+Task 10 then found the instrument itself was wrong: **counting `test result:` lines
+overcounts**, because three of the 76 come from child processes re-executing a binary with
+a filter. They are identifiable — a plain `cargo test --workspace` applies no filter, so
+genuine targets report `0 filtered out`. Summing only those gives 73 lines for 73 targets.
+
+### Two sessions on one branch
+
+Another Claude session worked this repository throughout, and it cost real friction: a fix
+commit's parent was that session's docs commit rather than the previous task's head, so a
+review package silently contained someone else's work until the commit count gave it away;
+and late in the session two agents wrote to the same file, one running `git checkout
+<path>` to undo its own edit — **which discards every uncommitted change to that path**.
+No work was lost, but only because it was checked. The cause was mine: a tracker task
+owned by the reviewer carried controller instructions, so it began work already assigned
+elsewhere.
+
+### Conventions worth carrying
+
+- **Derive a review base from `git log -1 --format='%p'`, never from the previous task's
+  head**, when more than one writer touches the branch.
+- **Verify the controller's claims too.** My fix-wave dispatch asserted the fixture
+  "already produces a request with all of them populated"; `ports` was empty, and had the
+  fixer trusted me the assertion would have been vacuous — the exact defect the wave
+  existed to close.
+- **Prose outran its numbers twice**, and a reviewer caught it both times by reading the
+  figures rather than the sentence: a fixture comment claiming to catch any flag swap, and
+  an A/B proof described as showing truncation when its own counts were the expected final
+  ones. Corrections were recorded in place rather than edited away.

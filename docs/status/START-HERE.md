@@ -3,166 +3,160 @@
 This file is the session entry point. It is written to be read cold, and it is
 addressed to you, the agent. Follow it as instructions — there is nothing to paste.
 
-Written 2026-08-08 at commit `149fa41`, branch `feat/gascan-arca`.
+Written 2026-08-08 at commit `a9cb67c`, branch `feat/gascan-arca`.
 
 ---
 
-Continue the Arca integration. Work happens in `~/code/gascan` and `~/code/arca`.
+**P5.2 IS COMPLETE.** All ten tasks landed, the final whole-branch review returned
+`request_changes`, both must-fix findings were fixed with mutation proofs, and the fix
+wave's re-review returned **merge**. The branch is pushed and ready.
 
-You are RESUMING an in-flight execution, not starting one. P5.2 is half done on
-branch `feat/gascan-arca`, pushed, at `149fa41`. Do not start from `main`, do not
-re-plan, and do not re-dispatch completed tasks.
+**VERIFIED at `a9cb67c`, measured alone on an otherwise idle machine:**
 
-Read, in this order:
+| Gate | Result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | **rc=0 — 1433 passed, 0 failed, 22 ignored** |
+| `cargo clippy --workspace --all-targets -- -D warnings` | rc=0, **nothing allowed** |
+| `cargo fmt --all --check` | rc=0 |
+| `./scripts/ci-run-release-contracts.sh` | rc=0, **15/15** |
 
-1. `~/code/gascan/.superpowers/sdd/2026-08-08-gascan-arca/progress.md` — the SDD
-   ledger. Start at `=== ROTATION POINT` and read the CORRECTION entry after it.
-   This file is the AUTHORITY wherever any other document disagrees with it: it
-   names every commit, every ruling, and every deferred finding. It is gitignored,
-   so it exists only on this machine.
-2. `docs/status/next-session-kickoff.md` — read the whole thing, but the
-   **TRAPS ADDED 2026-08-08** block and the **CLOSING THOUGHTS** are the parts that
-   were paid for.
-3. `docs/status/arca-integration-handoff.md`, from `## Session of 2026-08-08`.
-4. `docs/superpowers/plans/2026-08-08-gascan-arca.md` — the plan you are executing.
-   Its Global Constraints bind every task.
-5. `docs/superpowers/specs/2026-08-08-gascan-arca-backend-design.md` — the design.
-   Read §4.6 and §5 before touching mapping code, and heed the stale-line-number
-   warning in its header.
+1433 accounts for itself: 1432 measured at `10821dd`, plus the one test the final fix
+wave added. **Count only `test result:` lines reporting `0 filtered out`** — see the
+instrument trap below.
 
-Then re-enter `superpowers:subagent-driven-development` against the EXISTING ledger.
+## If the branch is not yet merged, that is your first task
 
-**STATE:** Tasks 1-4 complete with clean reviews. Task 5 implemented and reviewed but
-NOT complete — one open Important finding. Tasks 6-10 pending, all briefs staged and
-already audited.
+Use `superpowers:finishing-a-development-branch`. **Merge only — never squash, never
+rebase, and only via a PR. Never commit to `main`.** Both repositories forbid squash-
+and rebase-merge. The permission classifier refuses `gh pr merge`; ask the maintainer to
+run it with `!`.
 
-## Do these two things first
+## What P5.2 built
 
-**1. Close Task 5.** Dispatch it as fix round 1/5. Its field-placement test in
-`crates/gascan-arca/src/error.rs` asserts rendered text for only 4 of the 12 accepted
-error codes, so a `resource`↔`message` transposition in any of the other eight
-(`ownership_mismatch`, `foreign_resource_refused`, `not_found`, `command_io`,
-`invalid_output`, `invalid_state`, `resource_conflict`, `helper_error`) passes all
-five tests, because `code()` does not depend on which string fills which field. All
-eight were hand-verified correct, so this is a coverage gap and not a live bug.
-Extend the test to all twelve variants, and require a flip: transpose `resource` and
-`message` in the fixture for at least two newly covered variants, confirm the test
-fails, then restore.
+`crates/gascan-arca` implements `gascan_core::runtime::RuntimeBackend` over Arca's
+published gRPC engine contract, behind an `EngineTransport` seam stated in **wire types**,
+so every mapping is tested without a live engine. It also extracted the shared ownership
+classifier into `gascan-core`, which `gascan-apple` now uses too.
 
-**2. Nothing — the workspace suite is already measured and GREEN on this branch.**
-**VERIFIED 2026-08-08 at `139ee72`: `cargo test --workspace --no-fail-fast` → rc=0,
-1410 passed, 0 failed, 22 ignored, 74 binaries, 0 failed binaries.**
+`ChannelTransport` (the real `tonic` arm) **ships with no tests, by explicit ruling** —
+the only thing that could answer it is a live engine or a Rust server, and a Rust server
+is forbidden here because a test double would make a wrong client look correct. The
+compiler checking it against `EngineTransport` is the stated assurance. Do not
+re-litigate this and do not "fix" it by adding a double.
 
-**The increment accounts for itself exactly, which is the check that matters:** 1382
-(baseline at `5ad7ea9`) + 21 (`gascan-arca --lib`: translate 16, error 5) + 2
-(`transport_contract`) + 4 (`gascan-core resource_ownership`) + 1 (`gascan-apple`'s
-mismatched-container pinning test) = **1410**. Not merely larger — equal to the
-baseline plus the sum of what this branch added.
+## What to do next
 
-**Re-measure anyway at Task 10, and read this first, because it cost a false alarm.**
-An earlier run of the same suite at the same commit reported **rc=101 with 59
-failures** across 10 `gascand`/`gascan-e2e` binaries. That run overlapped subagent
-cargo builds, and the log carried `elapsed=342.183846042s` for one autostart plus
-`AddrInUse: "daemon socket is live"`. **Never run the full workspace suite while
-subagents are running cargo** — the daemon and e2e tiers spawn real processes and bind
-sockets, so they starve and report as product failures. Partial reads of that run at
-302 and 329 passed showed 0 failures and looked reassuring only because the failures
-came later.
+**Nothing in `gascan-arca` is wired to anything yet.** Nothing outside the crate
+references `gascan_arca` or `ChannelTransport::connect`. That is expected — wiring is
+P5.1 — but do not assume it is done.
 
-**That failing run was NOT a D7 occurrence**, though it contained the D7 test's name.
-Its text was `did not become healthy and current (state Stopped)`, not the signature
-`mode is not 0600 (mode 0200 ...)`, and "0200" appeared once in the whole log. Check
-the message, never the test name.
+- **P5.1 — wire the backend to the daemon.** This is where every unverifiable claim in
+  Task 9 gets answered. Read "What P5.1 will discover" below **before** you start.
+- **P5.3 — extract the conformance suite** from `fake_runtime.rs` and run it against the
+  fake, apple and arca backends. Several parity properties are defended by single tests
+  that P5.3 should absorb — including the one below.
+- **P4** — Docker removal in Arca. **P3.3** — publish and version the proto (`buf
+  breaking`); still inert because `buf` is not installed and Arca has no CI (P2.3).
 
-## Six things that will cost you if you learn them the hard way
+### The one piece of cohesion work this branch left half done
 
-**THE PLAN HAS BEEN THE DEFECT SOURCE, NOT THE IMPLEMENTERS.** All six defects last
-session came from plan or spec text; none from implementation code. Three cost a
-review round each; three cost nothing because the brief was audited before dispatch.
-**AUDIT EVERY BRIEF BEFORE YOU DISPATCH IT.** It is the highest-yield habit in this
-work, and it is why Tasks 6-10's briefs already carry fixes.
+**The `sandbox_id`-claim rule is duplicated verbatim in both backends** —
+`gascan-arca/src/translate.rs` (`runtime_resource`) and `gascan-apple/src/inspect.rs` —
+each with a long comment warning that the two must not diverge, and each with its own
+test. The classifier was extracted to `gascan-core`; **the rule this branch exists to
+protect was not.** It has been reverted twice as a regression. Sharing it — a core
+function returning `(Option<SandboxId>, ResourceOwnership)` — would replace two comments
+and two tests with one definition. P5.3 is the natural home.
 
-**THE INSTRUMENT KEEPS BEING NARROWER THAN THE CLAIM** — six times last session, most
-recently when the FIX for a narrow test was itself narrow (4 of 12). Check a fix as
-hard as you checked the defect. Prefer reading an artifact to grepping it: one grep
-nearly produced a false accusation against an implementer that had done the work
-correctly.
+### What P5.1 will discover, recorded so it is not discovered the hard way
 
-**`cargo clippy -- -D warnings` CANNOT PASS for `gascan-arca` until Task 8**, because
-`translate.rs` arrives before its consumer and rustc's `dead_code` fires (17 lib, 13
-lib-test, verified). Use `-D warnings -A dead_code` for Tasks 5, 6 and 7, **ON THE
-COMMAND LINE ONLY**. Never add `#[allow(dead_code)]` to the source — an attribute
-outlives the condition that justified it. Task 8 restores the plain gate; Task 10's
-workspace gate is unconditional. This lives in the plan's Global Constraints, which
-the brief extraction does NOT include, so **you must state it in each dispatch**.
+- **The client half-close may arrive as `RST_STREAM`, not a clean half-close.** Dropping
+  `ExecStream` drops the sender, which ends the request stream — but dropping `streaming`
+  *resets* the h2 stream, so a real engine may see a reset where the fake sees a clean
+  close. Same outcome, different wire event. **Whether Arca treats a mid-exec reset as
+  cancellation or as an error is unanswered**, and the exec cancellation test pins the
+  outcome against the fake and structurally cannot see the difference.
+- **Exec teardown is engine-paced where it is not bounded.** Both relay tasks are now
+  bounded on `Sender::closed()`, but a real engine still decides when its own half ends.
+- **Everything on the wire is unverified**: that Arca accepts this client's `Exec` framing
+  frame for frame, that `LogsChunk` ordering and end-of-stream behave as the contract
+  describes, that a real server ignores the placeholder authority, and every error path
+  through `connect` — no socket was ever dialed.
 
-**EVERY `crates/gascan-core/src/runtime.rs` LINE NUMBER in the 2026-08-08 design spec
-is stale by ~50-57 lines**: Task 1 added 58 lines. `from_resources` 944→1001,
-`discovered` 503→554, `RuntimeError::code` 1056→1113, `trait RuntimeBackend`
-990→1047. Cite symbols, not lines. When a citation and the code disagree, the code
-wins.
+## Traps that will cost you if you learn them the hard way
 
-**THE TWO BACKENDS MUST AGREE ON `sandbox_id` FOR A `Mismatched` RESOURCE.** Both
-report the id it claims: `owner.managed_by == MANAGED_BY ? parsed : None`. The rule
-`match ownership { GasCanOwned => parsed, _ => None }` is WRONG and was reverted
-twice — once after shipping in `gascan-apple`, once caught in Task 4's brief before
-shipping. `gascand/src/service.rs:3001-3012` finds a mismatched container BY that
-claim with no ownership filter, so withholding it silently drops an
-`OwnershipMismatch` finding. A parity test defends it; do not "simplify" it back.
+**COUNTING `test result:` LINES OVERCOUNTS THE WORKSPACE.** The log has 76 such lines but
+only 73 targets. Three come from **child processes** that re-exec a test binary with a
+filter, and they are identifiable because a plain `cargo test --workspace` applies no
+filter — so every genuine target reports `0 filtered out` while a child re-run reports a
+non-zero count. Sum only the `0 filtered out` lines, and check that the count of them
+equals the target count.
 
-**SUBAGENTS GO IDLE WITHOUT REPORTING** — three times last session, including an
-implementer that had done nothing beyond an uncommitted edit. **NEVER read silence as
-success:** check `git log` and grep for the expected symbol. Do not take a subagent's
-self-description at face value either; one claimed a nudge was stale when direct
-verification showed the work had not landed.
+**NEVER RUN THE WORKSPACE SUITE WHILE ANY SUBAGENT IS RUNNING CARGO.** Run it alone, after
+`pgrep -fl "cargo test"` comes back empty, writing to a path nothing else shares. Three
+concurrent suites against one target directory produced **rc=101 with 59 failures** across
+ten `gascand`/`gascan-e2e` binaries, none of them real: those tiers spawn daemons and bind
+sockets, so they starve each other (`AddrInUse`, one `autostart` at 342s). Run alone it
+takes **93 seconds**. Partial reads at 302 and 329 passed looked reassuring only because
+the failures came later.
 
-## Environment
+**`git checkout <path>` IS NOT A PERSONAL UNDO IN A SHARED TREE.** It discards every
+uncommitted change to that path, including another agent's in-flight work. Two agents
+collided in this tree on 2026-08-08 doing exactly this. Check `git status` for a
+concurrent writer first, and undo your own edits with a targeted edit.
 
-`RUSTUP_TOOLCHAIN=1.95.0` is exported and overrides `rust-toolchain.toml` — prefix
-every cargo command with `env -u RUSTUP_TOOLCHAIN`. Use `--no-fail-fast`. Confirm the
-`running N tests` line, because a bare test name silently runs zero and exits 0.
-`cargo clippy --fix` is prohibited here; `cargo fmt` is fine. `ls` is aliased to
-something that rejects trailing-slash paths — use `find` or `git ls-files`.
+**NEVER PUT CONTROLLER STEPS IN A TASK OWNED BY A SUBAGENT.** The task tracker is an
+instruction surface, not a status board. A task reading "dispatch the final reviewer…"
+while owned by the final reviewer caused it to start work already assigned elsewhere.
 
-**SIGNING AND TRANSPORT NO LONGER USE 1PASSWORD ON THIS REPO.** `user.signingkey` is
-`~/.ssh/gascan-signing`, a file PATH, which is why no agent is needed; transport is
-HTTPS via `gh`'s credential helper. All `--local`; global config untouched. Commit
-with `env -u SSH_AUTH_SOCK git commit`. **NEVER `--no-gpg-sign`** and never a
-lightweight tag. Verify `%G?` is `G`. No co-author trailer and no AI-tool mention in
-any commit message.
+**A STAGED BRIEF IS A CACHE AND IT GOES STALE.** Re-extract every brief immediately before
+dispatch. A brief staged one session earlier was missing the drop-cancellation test its own
+audit had added — dispatching it would have silently dropped the single most important test
+in that task.
 
-## Rulings already made — do not re-litigate
+**THE INSTRUMENT KEEPS BEING NARROWER THAN THE CLAIM.** This is the defect this project
+pays for over and over; it cost six fix rounds across four tasks in one session. Every
+instance looked convincing until someone checked: a test asserting `code()` while appearing
+to verify a whole mapping; a fixture alternating `T,F,T,F,T,F` that still could not see half
+its transpositions; a test *named* `start_stop_…` that never called `stop`; a
+drop-cancellation test whose every exit was cancellation-independent, so no mutation of the
+wiring could fail it; and a report whose prose outran its own numbers, twice. **Check a fix
+as hard as you checked the defect, and prefer reading an artifact to grepping it.**
 
-**Task 9 ships with NO tests.** The only thing that could answer it is a Rust server,
-which is forbidden; the compiler checking it against `EngineTransport` is the stated
-assurance, and the plan says exactly that rather than dressing it up as coverage.
+**A GREEN FIGURE YOU CANNOT ACCOUNT FOR IS NOT A PASS.** Account for every increment against
+a per-target table you can re-derive by reading `running N tests` lines. A per-task estimate
+went stale three times in one session.
 
-**Three shapes are plan-mandated**, so tell reviewers up front instead of looping on
-them: Task 6's temporary `exec`/`logs` stubs, Task 10 committing nothing, and Task 3's
-deliberately non-compiling first file.
+**SUBAGENTS GO IDLE WITHOUT REPORTING** — nine times in one session, twice after committing
+but before writing the report. **Never read silence as success:** `git log` and a grep for
+the expected symbol establish the real state. A nudge has always retrieved the work intact.
 
-## Two items deliberately left open — rule on them, do not inherit them silently
+**`RUSTUP_TOOLCHAIN=1.95.0` is exported** and overrides `rust-toolchain.toml` — prefix every
+cargo command with `env -u RUSTUP_TOOLCHAIN`. Use `--no-fail-fast`. Confirm the `running N
+tests` line, because a bare test name silently runs zero and exits 0. `cargo clippy --fix`
+is prohibited here. `ls` is aliased to something that rejects trailing-slash paths — use
+`find` or `git ls-files`.
 
-**Task 7** has no test for a mid-stream `TransportError` (as distinct from an engine
-error chunk), nor for a `LogsChunk` with an unset `outcome`. Both paths exist in the
-specified code. They were found, neither was fixed, and both were recorded so the
-decision is yours.
+**SIGNING AND TRANSPORT DO NOT USE 1PASSWORD ON THIS REPO.** `user.signingkey` is
+`~/.ssh/gascan-signing`, a file PATH, which is why no agent is needed; transport is HTTPS via
+`gh`'s credential helper. All `--local`. Commit with `env -u SSH_AUTH_SOCK git commit`.
+**NEVER `--no-gpg-sign`** and never a lightweight tag. Verify `%G?` is `G`. No co-author
+trailer and no AI-tool mention in any commit message.
 
-**Five deferred minors** are listed in the ledger for the final whole-branch review to
-triage. One is arguably under-rated: `runtime_sandbox`'s unparseable-owner-label
-branch refuses correctly but has no test, and nothing later in the plan covers it —
-the same class an earlier review rated Important.
+**A DOCS-ONLY CI RUN SKIPS `rust` AND `engine` ENTIRELY** (VERIFIED, run `31262534703`), so a
+green docs run is not evidence about anything in Rust.
 
 ## Do not write D7's narrowed retry
 
-No `0200` occurrence has fired since the instrument landed. A docs-only CI run skips
-the `rust` and `engine` jobs entirely (VERIFIED, run `31262534703`), so a green docs
-run proves nothing about D7. The retry is approved in principle and stays unwritten
-until a run names which of the two `0200` states fired.
+No `0200` occurrence has fired since the instrument landed. The retry is approved in
+principle and stays unwritten until a run names which of the two `0200` states fired. A
+failing run containing the D7 test's *name* is not a D7 occurrence — check the message
+(`mode 0200 …`), never the test name.
 
-## After Task 10
+## Where the detail lives
 
-Final whole-branch review on the most capable model, pointed at the ledger's
-deferred-minor and parked lines, then `superpowers:finishing-a-development-branch`.
-**Merge only — never squash, never rebase, and only via a PR. Never commit to
-`main`.**
+`docs/status/arca-integration-handoff.md`, from `## Session of 2026-08-08 (second)`, and
+`docs/status/next-session-kickoff.md` for the full trap list. The SDD ledger at
+`.superpowers/sdd/2026-08-08-gascan-arca/progress.md` recorded every ruling and deviation
+during execution; it is deleted once the branch merges, because git history is the record
+from then on.
