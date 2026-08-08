@@ -63,9 +63,20 @@ its design. Read the design's §4.6 and §5 before touching any mapping code.
 **WHAT LANDED 2026-08-08: HALF OF P5.2. FIVE OF TEN TASKS.**
 
   Branch **`feat/gascan-arca`**, pushed, tree clean. `crates/gascan-arca` exists with
-  the transport seam, both halves of the mapping, and the error table. Tasks 1-5
-  complete with clean reviews; **Tasks 6-10 remain and every brief is staged and
-  audited** in `.superpowers/sdd/2026-08-08-gascan-arca/`.
+  the transport seam, both halves of the mapping, and the error table.
+
+  **Tasks 1-4 are complete with clean reviews. TASK 5 IS NOT — it is implemented and
+  reviewed, but carries one OPEN IMPORTANT FINDING.** Close it before Task 6.
+  Its field-placement test asserts rendered text for only **4 of the 12** accepted
+  error codes, so a `resource`↔`message` transposition in any of the other eight
+  (`ownership_mismatch`, `foreign_resource_refused`, `not_found`, `command_io`,
+  `invalid_output`, `invalid_state`, `resource_conflict`, `helper_error`) passes all
+  five tests — `code()` does not depend on which string fills which field. All eight
+  were hand-verified correct, so it is a coverage gap, not a live bug. Extend the test
+  to all twelve and flip two of the newly covered ones to prove it catches a swap.
+
+  **Tasks 6-10 remain and every brief is staged and audited** in
+  `.superpowers/sdd/2026-08-08-gascan-arca/`.
 
   Commits: `c980c7b`+`34eba01` (Task 1), `fd02093` (2), `09050c3`+`0140511` (3),
   `a82e110` (4), `15251ae` (5). Interleaved `docs:` commits are plan corrections and
