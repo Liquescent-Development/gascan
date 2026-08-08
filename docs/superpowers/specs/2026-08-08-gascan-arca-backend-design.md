@@ -18,6 +18,28 @@ Every claim below is marked **VERIFIED** with the command, file:line or exit cod
 that establishes it, or **PLAN** if nothing has been run yet. Rules ship bare;
 events do not.
 
+> **Every `crates/gascan-core/src/runtime.rs` line number in this document is
+> anchored to `cf13a74` and is now STALE.** Added 2026-08-08, after a re-reviewer
+> checked a symbol instead of trusting a citation and found the drift.
+> §3.1's own extraction added **58 lines** to that file, so citations below it are
+> off by roughly 50-57. Re-derived and VERIFIED 2026-08-08:
+>
+> | Symbol | Cited here | Actually |
+> |---|---|---|
+> | `RuntimeSandbox::observed` | 264 | **315** |
+> | `RuntimeResource::discovered` | 503 | **554** |
+> | `ExecSession::live_cancellable` | 381 | **432** |
+> | `CreateFailure::from_created_evidence` | 767 | **824** |
+> | `RuntimeError::code` (on `CreateFailure`) | 809 | **866** |
+> | `RemoveRequest::from_resources` | 944 | **1001** |
+> | `trait RuntimeBackend` | 990 | **1047** |
+>
+> The numbers are left in place rather than rewritten, because they were accurate
+> when written and a reader diffing against `cf13a74` needs them to match. **Find
+> symbols by name; when a citation and the code disagree, the code wins.** This is
+> the "a document cannot record the SHA of the commit that records it" caveat in
+> another costume: a line number is a claim about a file that keeps moving.
+
 ## 1. Scope
 
 P5.2 implements `RuntimeBackend` over the generated client, behind a transport
