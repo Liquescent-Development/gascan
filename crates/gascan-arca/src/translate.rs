@@ -127,12 +127,9 @@ pub(crate) fn port_mappings(ports: &[RuntimePort]) -> Result<Vec<v1::PortMapping
         .collect()
 }
 
-pub(crate) const fn resource_limits(limits: &RuntimeResourceLimits) -> v1::ResourceLimits {
+pub(crate) fn resource_limits(limits: &RuntimeResourceLimits) -> v1::ResourceLimits {
     v1::ResourceLimits {
-        cpus: match limits.cpus {
-            Some(cpus) => Some(cpus as u32),
-            None => None,
-        },
+        cpus: limits.cpus.map(u32::from),
         memory_bytes: limits.memory_bytes,
         disk_bytes: limits.disk_bytes,
         process_count: limits.process_count,
@@ -291,7 +288,8 @@ pub(crate) fn exec_start(request: &ExecRequest) -> v1::ExecStart {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gascan_core::runtime::{RuntimeBindMount, RuntimePort};
+    use gascan_core::runtime::{ResourceOwnership, RuntimeBindMount, RuntimePort};
+    use gascan_core::sandbox::SandboxId;
     use std::net::{IpAddr, Ipv4Addr};
 
     const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -395,6 +393,74 @@ mod tests {
         assert_eq!(
             port_mappings(std::slice::from_ref(&routable))
                 .expect_err("loopback is implied, so a routable address cannot be honoured")
+                .code(),
+            "invalid_state",
+        );
+    }
+
+    #[test]
+    fn a_read_only_volume_is_refused_rather_than_silently_made_writable() {
+        let volume = RuntimeVolume {
+            name: "workspace-data".to_owned(),
+            target: "/workspace/.data".into(),
+            writable: true,
+            capacity_bytes: 1 << 30,
+            ownership: OwnershipMetadata {
+                managed_by: "gascan".to_owned(),
+                sandbox_id: SandboxId::test("volumes"),
+            },
+        };
+        let wire = volumes(std::slice::from_ref(&volume)).expect("a writable volume maps");
+        assert_eq!(wire.len(), 1);
+        assert_eq!(wire[0].name, "workspace-data");
+        assert_eq!(wire[0].guest_path, "/workspace/.data");
+        assert_eq!(wire[0].capacity_bytes, 1 << 30);
+
+        let read_only = RuntimeVolume {
+            writable: false,
+            ..volume
+        };
+        assert_eq!(
+            volumes(std::slice::from_ref(&read_only))
+                .expect_err("the contract has no field for a read-only volume")
+                .code(),
+            "invalid_state",
+        );
+    }
+
+    #[test]
+    fn a_remove_request_spanning_two_sandboxes_is_refused() {
+        let first = SandboxId::test("first");
+        let second = SandboxId::test("second");
+        let resource = |id: &SandboxId, name: &str| {
+            RuntimeResource::discovered(
+                ResourceIdentity::new(ResourceKind::Volume, name).expect("a valid identity"),
+                Some(id.clone()),
+                ResourceOwnership::GasCanOwned,
+            )
+        };
+
+        let single = RemoveRequest::from_resources(vec![
+            resource(&first, "first-data"),
+            resource(&first, "first-cache"),
+        ])
+        .expect("one sandbox's resources");
+        let wire = remove_request(&single).expect("a single-sandbox request maps");
+        assert_eq!(wire.resources.len(), 2);
+        assert_eq!(
+            wire.owner.as_ref().map(|owner| owner.sandbox_id.as_str()),
+            Some(first.as_str()),
+            "the call carries the one sandbox's labels",
+        );
+
+        let mixed = RemoveRequest::from_resources(vec![
+            resource(&first, "first-data"),
+            resource(&second, "second-data"),
+        ])
+        .expect("core permits a mixed request; only the wire cannot express one");
+        assert_eq!(
+            remove_request(&mixed)
+                .expect_err("one remove call carries one sandbox's labels")
                 .code(),
             "invalid_state",
         );
