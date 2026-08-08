@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use gascan_core::runtime::{
-    CreateFailure, CreateOutcome, CreateRequest, ExecRequest, ExecSession, RecreateRequest,
-    RemoveRequest, RuntimeBackend, RuntimeCapabilities, RuntimeError, RuntimeResource,
-    RuntimeSandbox,
+    CreateFailure, CreateOutcome, CreateRequest, ExecCancellation, ExecInput, ExecOutput,
+    ExecRequest, ExecSession, RecreateRequest, RemoveRequest, RuntimeBackend, RuntimeCapabilities,
+    RuntimeError, RuntimeResource, RuntimeSandbox,
 };
 use gascan_core::sandbox::SandboxId;
 use gascan_engine_proto::v1;
@@ -218,10 +218,130 @@ impl<T: EngineTransport> RuntimeBackend for ArcaBackend<T> {
         ack("remove", response)
     }
 
-    async fn exec(&self, _request: ExecRequest) -> Result<ExecSession, RuntimeError> {
-        Err(RuntimeError::UnsupportedCapability {
-            capability: "exec lands in the next task".to_owned(),
-        })
+    /// Opens a session and pumps it until it ends.
+    ///
+    /// The initial `stdin` buffer is sent only when non-empty, and no `Close` is
+    /// forged: the consumer sends `ExecInput::Close` when it means to. Both
+    /// match the Apple backend, so a caller cannot tell the two apart by their
+    /// framing.
+    async fn exec(&self, request: ExecRequest) -> Result<ExecSession, RuntimeError> {
+        let initial_stdin = request.stdin.clone();
+        let stream = self
+            .transport
+            .exec(translate::exec_start(&request))
+            .await
+            .map_err(TransportError::into_runtime_error)?;
+        let (to_engine, mut from_engine) = stream.split();
+
+        let (input, mut inputs) = tokio::sync::mpsc::channel(16);
+        let (outputs, output) = tokio::sync::mpsc::channel(32);
+        let (cancellation, mut cancelled) = ExecCancellation::channel();
+
+        tokio::spawn(async move {
+            if !initial_stdin.is_empty() {
+                let frame = v1::ExecClientFrame {
+                    frame: Some(v1::exec_client_frame::Frame::Stdin(initial_stdin)),
+                };
+                tokio::select! {
+                    result = to_engine.send(frame) => {
+                        if result.is_err() {
+                            let _ = outputs
+                                .send(Err(RuntimeError::CommandIo {
+                                    operation: "exec_input".to_owned(),
+                                    message: "the engine closed the stream".to_owned(),
+                                }))
+                                .await;
+                            return;
+                        }
+                    }
+                    result = cancelled.changed() => {
+                        if result.is_ok() && *cancelled.borrow() { return; }
+                    }
+                }
+            }
+
+            loop {
+                tokio::select! {
+                    result = cancelled.changed() => {
+                        if result.is_ok() && *cancelled.borrow() { break; }
+                    }
+                    next = inputs.recv() => {
+                        let Some(next) = next else { break };
+                        let frame = v1::ExecClientFrame {
+                            frame: Some(match next {
+                                ExecInput::Stdin(bytes) => {
+                                    v1::exec_client_frame::Frame::Stdin(bytes)
+                                }
+                                ExecInput::Resize { columns, rows } => {
+                                    v1::exec_client_frame::Frame::Resize(v1::Resize {
+                                        columns,
+                                        rows,
+                                    })
+                                }
+                                ExecInput::Signal(signal) => {
+                                    v1::exec_client_frame::Frame::Signal(signal)
+                                }
+                                ExecInput::Close => {
+                                    v1::exec_client_frame::Frame::Close(v1::Close {})
+                                }
+                            }),
+                        };
+                        let delivered = tokio::select! {
+                            result = to_engine.send(frame) => result.is_ok(),
+                            result = cancelled.changed() => {
+                                if result.is_ok() && *cancelled.borrow() { break; }
+                                continue;
+                            }
+                        };
+                        if !delivered {
+                            let _ = outputs
+                                .send(Err(RuntimeError::CommandIo {
+                                    operation: "exec_input".to_owned(),
+                                    message: "the engine closed the stream".to_owned(),
+                                }))
+                                .await;
+                            break;
+                        }
+                    }
+                    next = from_engine.recv() => {
+                        let (mapped, terminal) = match next {
+                            None => break,
+                            Some(Err(error)) => (Err(error.into_runtime_error()), true),
+                            Some(Ok(frame)) => match frame.frame {
+                                Some(v1::exec_server_frame::Frame::Stdout(bytes)) => {
+                                    (Ok(ExecOutput::Stdout(bytes)), false)
+                                }
+                                Some(v1::exec_server_frame::Frame::Stderr(bytes)) => {
+                                    (Ok(ExecOutput::Stderr(bytes)), false)
+                                }
+                                Some(v1::exec_server_frame::Frame::Exit(exit)) => (
+                                    Ok(ExecOutput::Exit {
+                                        code: exit.code,
+                                        signal: exit.signal,
+                                    }),
+                                    true,
+                                ),
+                                Some(v1::exec_server_frame::Frame::Error(error)) => {
+                                    (Err(error::engine_error("exec", &error)), true)
+                                }
+                                None => (Err(translate::missing_outcome("exec")), true),
+                            },
+                        };
+                        let delivered = tokio::select! {
+                            result = outputs.send(mapped) => result.is_ok(),
+                            result = cancelled.changed() => {
+                                !(result.is_ok() && *cancelled.borrow())
+                            }
+                        };
+                        if !delivered || terminal {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(ExecSession::live_cancellable(input, output, cancellation))
     }
 
     /// Concatenates the chunk stream into the one buffer the trait returns.

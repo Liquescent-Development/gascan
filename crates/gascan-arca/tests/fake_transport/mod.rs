@@ -15,6 +15,13 @@ pub struct FakeEngine {
     pub list_resources: Mutex<Option<v1::ListResourcesResponse>>,
     /// Chunks the next `logs` call streams, in order.
     pub logs_chunks: Mutex<Vec<Result<v1::LogsChunk, TransportError>>>,
+    /// Frames the next `exec` call streams back, in order.
+    pub exec_frames: Mutex<Vec<Result<v1::ExecServerFrame, TransportError>>>,
+    /// Frames the client sent, captured by the fake's pump.
+    pub exec_sent: std::sync::Arc<Mutex<Vec<v1::ExecClientFrame>>>,
+    /// Set when the client→engine stream closes, which is how cancellation is
+    /// observable from the engine's side.
+    pub exec_client_stream_closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub calls: Mutex<Vec<Call>>,
 }
 
@@ -46,12 +53,6 @@ impl FakeEngine {
             .expect("test lock")
             .take()
             .ok_or_else(|| TransportError::rpc(operation, "the test scripted no response"))
-    }
-
-    pub fn ok_ack() -> v1::AckResponse {
-        v1::AckResponse {
-            outcome: Some(v1::ack_response::Outcome::Ok(v1::Ack {})),
-        }
     }
 
     pub fn engine_error(code: &str) -> v1::EngineError {
@@ -120,8 +121,39 @@ impl EngineTransport for FakeEngine {
         Self::take(&self.ack, "remove")
     }
 
-    async fn exec(&self, _start: v1::ExecStart) -> Result<ExecStream, TransportError> {
-        Err(TransportError::rpc("exec", "this fake scripts no exec"))
+    async fn exec(&self, start: v1::ExecStart) -> Result<ExecStream, TransportError> {
+        self.exec_sent
+            .lock()
+            .expect("test lock")
+            .push(v1::ExecClientFrame {
+                frame: Some(v1::exec_client_frame::Frame::Start(start)),
+            });
+
+        let frames = std::mem::take(&mut *self.exec_frames.lock().expect("test lock"));
+        let (server, from_server) = tokio::sync::mpsc::channel(frames.len().max(1));
+        for frame in frames {
+            server.send(frame).await.expect("the receiver is alive");
+        }
+
+        let (to_server, mut client_frames) = tokio::sync::mpsc::channel(16);
+        let sent = std::sync::Arc::clone(&self.exec_sent);
+        let closed = std::sync::Arc::clone(&self.exec_client_stream_closed);
+        tokio::spawn(async move {
+            // The engine holds its half open for as long as the session lives: a
+            // real engine does not half-close because it has nothing to say yet.
+            // Dropping `server` with the fake's `exec` instead would end the
+            // server stream immediately, which reads to the pump as the session
+            // ending and makes every scripted-frame test a race.
+            let _server = server;
+            while let Some(frame) = client_frames.recv().await {
+                sent.lock().expect("test lock").push(frame);
+            }
+            // The pump dropped its sender. From the engine's side that is what
+            // cancellation looks like, so it is the only observable this fake needs.
+            closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        Ok(ExecStream::new(to_server, from_server))
     }
 
     async fn logs(&self, request: v1::LogsRequest) -> Result<LogsStream, TransportError> {
@@ -141,42 +173,4 @@ impl EngineTransport for FakeEngine {
         self.record(Call::ListResources);
         Self::take(&self.list_resources, "list_resources")
     }
-}
-
-/// A policy-validated `CreateRequest`, which is the only kind that exists.
-///
-/// `CreateRequest`'s fields are `pub(crate)` to `gascan-core` and it derives no
-/// `Deserialize`, so `PolicyCompiler` is the only construction path — there is
-/// deliberately no fixture constructor. This mirrors `request_with_manifest` in
-/// `gascan-apple/tests/backend_fake_runner.rs`, which solves the same problem the
-/// same way. The `TempDir` must outlive the request: the compiled request names
-/// its canonical root.
-pub fn policy_request(name: &str) -> (tempfile::TempDir, gascan_core::runtime::CreateRequest) {
-    use camino::Utf8Path;
-    use gascan_core::manifest::Manifest;
-    use gascan_core::policy::PolicyCompiler;
-    use gascan_core::runtime::{NetworkIsolation, RuntimeCapabilities, RuntimeVersion};
-    use gascan_core::sandbox::SandboxSpec;
-
-    let root = tempfile::tempdir().expect("a temporary project root");
-    let path = Utf8Path::from_path(root.path()).expect("a utf-8 temporary path");
-    std::fs::write(
-        path.join("gascan.toml"),
-        "version = 1\nnetwork = 'networked'\n",
-    )
-    .expect("a manifest");
-    let spec = SandboxSpec::from_root(name, path, Manifest::load(path).expect("a manifest"))
-        .expect("a spec");
-    let capabilities = RuntimeCapabilities {
-        version: RuntimeVersion::new(1, 1, 0),
-        bind_mounts: true,
-        named_volumes: true,
-        tty: true,
-        signals: true,
-        loopback_publish: true,
-        resource_limits: true,
-        offline: NetworkIsolation::Proven,
-    };
-    let request = PolicyCompiler::compile(spec, &capabilities).expect("a validated request");
-    (root, request)
 }

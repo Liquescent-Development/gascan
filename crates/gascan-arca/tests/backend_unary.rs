@@ -22,6 +22,51 @@ fn owner(id: &SandboxId) -> v1::OwnerLabels {
     }
 }
 
+/// The one `Ack` shape the engine returns for a success with nothing to say.
+fn ok_ack() -> v1::AckResponse {
+    v1::AckResponse {
+        outcome: Some(v1::ack_response::Outcome::Ok(v1::Ack {})),
+    }
+}
+
+/// A policy-validated `CreateRequest`, which is the only kind that exists.
+///
+/// `CreateRequest`'s fields are `pub(crate)` to `gascan-core` and it derives no
+/// `Deserialize`, so `PolicyCompiler` is the only construction path — there is
+/// deliberately no fixture constructor. This mirrors `request_with_manifest` in
+/// `gascan-apple/tests/backend_fake_runner.rs`, which solves the same problem the
+/// same way. The `TempDir` must outlive the request: the compiled request names
+/// its canonical root.
+fn policy_request(name: &str) -> (tempfile::TempDir, gascan_core::runtime::CreateRequest) {
+    use camino::Utf8Path;
+    use gascan_core::manifest::Manifest;
+    use gascan_core::policy::PolicyCompiler;
+    use gascan_core::runtime::{NetworkIsolation, RuntimeCapabilities, RuntimeVersion};
+    use gascan_core::sandbox::SandboxSpec;
+
+    let root = tempfile::tempdir().expect("a temporary project root");
+    let path = Utf8Path::from_path(root.path()).expect("a utf-8 temporary path");
+    std::fs::write(
+        path.join("gascan.toml"),
+        "version = 1\nnetwork = 'networked'\n",
+    )
+    .expect("a manifest");
+    let spec = SandboxSpec::from_root(name, path, Manifest::load(path).expect("a manifest"))
+        .expect("a spec");
+    let capabilities = RuntimeCapabilities {
+        version: RuntimeVersion::new(1, 1, 0),
+        bind_mounts: true,
+        named_volumes: true,
+        tty: true,
+        signals: true,
+        loopback_publish: true,
+        resource_limits: true,
+        offline: NetworkIsolation::Proven,
+    };
+    let request = PolicyCompiler::compile(spec, &capabilities).expect("a validated request");
+    (root, request)
+}
+
 #[tokio::test]
 async fn capabilities_reads_the_engine_and_renames_project_mount() {
     let engine = FakeEngine::default();
@@ -133,7 +178,7 @@ async fn start_stop_and_prepare_image_report_an_ack() {
     let id = SandboxId::test("lifecycle");
 
     let starting = FakeEngine::default();
-    *starting.ack.lock().expect("test lock") = Some(FakeEngine::ok_ack());
+    *starting.ack.lock().expect("test lock") = Some(ok_ack());
     let backend = ArcaBackend::new(starting);
     backend.start(&id).await.expect("an ack is success");
     assert_eq!(
@@ -145,7 +190,7 @@ async fn start_stop_and_prepare_image_report_an_ack() {
 
     // stop, which this test's name promises and an earlier draft did not deliver.
     let stopping = FakeEngine::default();
-    *stopping.ack.lock().expect("test lock") = Some(FakeEngine::ok_ack());
+    *stopping.ack.lock().expect("test lock") = Some(ok_ack());
     let backend = ArcaBackend::new(stopping);
     backend.stop(&id).await.expect("an ack is success");
     assert_eq!(
@@ -263,7 +308,7 @@ fn created_for(request: &gascan_core::runtime::CreateRequest) -> v1::Created {
 
 #[tokio::test]
 async fn create_sends_the_compiled_request_and_reports_what_was_made() {
-    let (_root, request) = fake_transport::policy_request("creating");
+    let (_root, request) = policy_request("creating");
     let engine = FakeEngine::default();
     *engine.create.lock().expect("test lock") = Some(v1::CreateResponse {
         outcome: Some(v1::create_response::Outcome::Created(created_for(&request))),
@@ -294,7 +339,7 @@ async fn create_sends_the_compiled_request_and_reports_what_was_made() {
 
 #[tokio::test]
 async fn a_created_naming_a_resource_outside_the_request_is_refused() {
-    let (_root, request) = fake_transport::policy_request("creating");
+    let (_root, request) = policy_request("creating");
     let mut created = created_for(&request);
     created.created.push(v1::Resource {
         identity: Some(v1::ResourceIdentity {
@@ -322,7 +367,7 @@ async fn a_created_naming_a_resource_outside_the_request_is_refused() {
 
 #[tokio::test]
 async fn a_partial_create_keeps_the_evidence_and_the_engines_reason() {
-    let (_root, request) = fake_transport::policy_request("creating");
+    let (_root, request) = policy_request("creating");
     let engine = FakeEngine::default();
     *engine.create.lock().expect("test lock") = Some(v1::CreateResponse {
         outcome: Some(v1::create_response::Outcome::Failed(v1::CreateFailed {
@@ -367,7 +412,7 @@ async fn a_malformed_resource_blames_the_rpc_that_actually_carried_it() {
             created: vec![malformed()],
         })),
     });
-    let (_root, request) = fake_transport::policy_request("creating");
+    let (_root, request) = policy_request("creating");
     let failure = ArcaBackend::new(creating)
         .create(request)
         .await
@@ -391,7 +436,7 @@ async fn a_malformed_resource_blames_the_rpc_that_actually_carried_it() {
             created: vec![malformed()],
         })),
     });
-    let (_root, request) = fake_transport::policy_request("recreating");
+    let (_root, request) = policy_request("recreating");
     let retained = gascan_core::runtime::RetainedResources::new(&request, retained_for(&request))
         .expect("the retained set matches the requested topology exactly");
     let recreate =
@@ -467,7 +512,7 @@ fn retained_for(
 async fn create_container_sends_the_retained_resources_and_rebuilds_only_the_container() {
     use gascan_core::runtime::{RecreateRequest, RetainedResources};
 
-    let (_root, request) = fake_transport::policy_request("recreating");
+    let (_root, request) = policy_request("recreating");
     let retained = RetainedResources::new(&request, retained_for(&request))
         .expect("the retained set matches the requested topology exactly");
     let recreate = RecreateRequest::new(request.clone(), retained).expect("a recreate request");
@@ -519,7 +564,7 @@ async fn create_container_sends_the_retained_resources_and_rebuilds_only_the_con
 async fn a_recreate_answered_with_the_whole_topology_is_refused() {
     use gascan_core::runtime::{RecreateRequest, RetainedResources};
 
-    let (_root, request) = fake_transport::policy_request("recreating");
+    let (_root, request) = policy_request("recreating");
     let retained = RetainedResources::new(&request, retained_for(&request))
         .expect("the retained set matches the requested topology exactly");
     let recreate = RecreateRequest::new(request.clone(), retained).expect("a recreate request");
@@ -568,7 +613,7 @@ async fn remove_names_exactly_the_resources_and_surfaces_an_ack_error() {
     };
 
     let engine = FakeEngine::default();
-    *engine.ack.lock().expect("test lock") = Some(FakeEngine::ok_ack());
+    *engine.ack.lock().expect("test lock") = Some(ok_ack());
     let backend = ArcaBackend::new(engine);
     backend.remove(build()).await.expect("an ack is success");
 
