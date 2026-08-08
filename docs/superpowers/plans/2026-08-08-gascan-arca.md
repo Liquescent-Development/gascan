@@ -20,6 +20,7 @@ Design: `docs/superpowers/specs/2026-08-08-gascan-arca-backend-design.md` (appro
 - **Capture exit codes directly, never through a pipe:** `if cmd; then rc=0; else rc=$?; fi`. `${PIPESTATUS[0]}` after an `if` block reads empty.
 - **Never count with a truncating pipe.** Use `grep -c`. A `grep | head -10` that returns ten lines looks exactly like a complete answer; this plan's own spec carries a correction for that.
 - **`cargo clippy --fix` is NOT safe in this repository.** It has emitted invalid Rust here. Fix lints by hand.
+- **The clippy gate for Tasks 3-7 is `-D warnings -A dead_code`; the plain gate returns at Task 8.** **Added 2026-08-08 after Task 3 hit it.** `translate.rs`'s mapping functions have no caller until `ArcaBackend` wires them in at Task 6, and `exec_start`'s caller does not exist until Task 8, so rustc's `dead_code` fires and `-D warnings` promotes it to an error — 17 errors on the lib target, 13 on the lib-test target, VERIFIED. **Allow it on the command line; never with an attribute in the source.** An `#[allow(dead_code)]` outlives the condition that justified it, so a genuinely dead function added later becomes invisible; a flag on one command cannot rot that way. VERIFIED 2026-08-08: `cargo clippy -p gascan-arca --all-targets -- -D warnings -A dead_code` → **rc=0**, so `dead_code` is the only lint firing and every other lint stays hard-gated. Task 8 restores the plain `-D warnings` because `exec` is the last function to acquire a caller, and Task 10 runs the workspace-wide gate with nothing allowed. The gate is deferred to the point where it can pass honestly, not weakened.
 - **`crates/gascan-arca` does NOT deny `clippy::panic`/`unwrap_used`/`expect_used`** — those are per-crate lints on `gascan` and `gascand` only, and this crate matches `gascan-apple` instead. `unsafe_code` is forbidden workspace-wide.
 - **Do not vendor the proto, and do not add a second parser of `engine/arca-pin.json`.** `scripts/sync-arca-proto.sh` owns what the pinned contract means.
 - **Do not generate or write a Rust server**, not even as a test double.
@@ -664,7 +665,8 @@ The test's `#[async_trait::async_trait]` needs the crate in scope for the test t
 - [ ] **Step 7: Clippy, fmt, and commit**
 
 Run: `env -u RUSTUP_TOOLCHAIN cargo clippy -p gascan-arca --all-targets -- -D warnings` and `env -u RUSTUP_TOOLCHAIN cargo fmt --all --check`
-Expected: both rc=0.
+
+Expected: both rc=0. This task needs no `-A dead_code` — everything it introduces has a caller, either the trait's own test or the trait itself. **VERIFIED: Task 2 passed the plain gate.** The `dead_code` problem starts at Task 3, where `translate.rs` arrives ahead of its consumer.
 
 ```bash
 git add Cargo.toml crates/gascan-arca
@@ -1110,7 +1112,9 @@ If `resource_limits` will not compile as `const fn` because of the `as u32` cast
 
 - [ ] **Step 5: Clippy, fmt, and commit**
 
-Run: `env -u RUSTUP_TOOLCHAIN cargo clippy -p gascan-arca --all-targets -- -D warnings` and `env -u RUSTUP_TOOLCHAIN cargo fmt --all --check`
+Run: `env -u RUSTUP_TOOLCHAIN cargo clippy -p gascan-arca --all-targets -- -D warnings -A dead_code` and `env -u RUSTUP_TOOLCHAIN cargo fmt --all --check`
+
+`-A dead_code` per the Global Constraints: these functions have no caller until Task 6. Do not add an allow attribute to the source.
 
 ```bash
 git add crates/gascan-arca
@@ -3071,7 +3075,18 @@ Expected: PASS, `running 7 tests`.
 
 If `a_non_empty_stdin_buffer_is_sent_once_and_no_close_is_forged` or `live_input_reaches_the_engine_as_its_own_frame` is flaky, the 50ms sleep is the cause — it waits for the fake's capture task. Replace the sleep with a poll that waits for the expected frame count, bounded and then asserted. **Do not lengthen the sleep**; a wall-clock wait is the failure mode `autostart.rs`'s symlink test already has in this repository.
 
-- [ ] **Step 6: Clippy, fmt, and commit**
+- [ ] **Step 6: Restore the full clippy gate, fmt, and commit**
+
+**This task restores the plain gate.** `exec_start` was the last mapping function without a caller, and this task gives it one, so `-A dead_code` is no longer needed and must not be used:
+
+```bash
+if env -u RUSTUP_TOOLCHAIN cargo clippy -p gascan-arca --all-targets -- -D warnings; then rc=0; else rc=$?; fi
+echo "clippy rc=$rc"
+```
+
+Expected: **rc=0 with nothing allowed.** If `dead_code` still fires, a mapping function this plan wrote is genuinely unreachable — find out which and why rather than re-adding the flag, because at this point the lint is telling you something true about the code instead of about the plan's ordering.
+
+Then `env -u RUSTUP_TOOLCHAIN cargo fmt --all --check`, and commit:
 
 ```bash
 git add crates/gascan-arca
