@@ -136,9 +136,14 @@ const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 ///
 /// A bounded poll on the condition, never a fixed sleep: the frames cross a
 /// channel into the fake's capture task, so a wall-clock wait either flakes
-/// under load or pays its worst case on every run. It returns whatever was
-/// captured when the bound runs out rather than panicking, so a shortfall is
-/// reported by the caller's assertion, with the frames it did get.
+/// under load or pays its worst case on every run.
+///
+/// This one fails *open* — a bound expiry returns whatever was captured rather
+/// than panicking — and [`settled`] fails *closed*. The asymmetry follows the
+/// shape of what each one's callers assert. Here they assert positively, naming
+/// frames they expect, so a short list fails their assertion anyway and the
+/// caller reports the shortfall along with the frames it did get. `settled`'s
+/// callers assert negatively, and a short list would satisfy them.
 async fn captured(sent: &SentFrames, count: usize) -> Vec<v1::ExecClientFrame> {
     for _ in 0..POLLS {
         let frames = sent.lock().expect("test lock").clone();
@@ -156,14 +161,25 @@ async fn captured(sent: &SentFrames, count: usize) -> Vec<v1::ExecClientFrame> {
 /// list is final. That is what an assertion of the form "and nothing else was
 /// sent" needs; [`captured`] cannot supply it, because a frame count that has
 /// been reached says nothing about a frame still in flight.
+///
+/// It fails *closed*, unlike [`captured`]: a bound expiry panics rather than
+/// handing back a partial list. Both callers assert negatively — `frames.len()
+/// == 1`, and that no `Close` was forged — and a truncated list satisfies those
+/// vacuously. Returning early would let them report "nothing extra was sent"
+/// when what happened is "we stopped looking before it could be".
 async fn settled(closed: &StreamClosed, sent: &SentFrames) -> Vec<v1::ExecClientFrame> {
     for _ in 0..POLLS {
         if closed.load(std::sync::atomic::Ordering::SeqCst) {
-            break;
+            return sent.lock().expect("test lock").clone();
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
-    sent.lock().expect("test lock").clone()
+    panic!(
+        "the client→engine stream never closed within {:?}, so the {} captured frame(s) \
+         are not final and every assertion that follows would pass for the wrong reason",
+        POLL_INTERVAL * u32::try_from(POLLS).expect("the bound fits a u32"),
+        sent.lock().expect("test lock").len(),
+    );
 }
 
 #[tokio::test]

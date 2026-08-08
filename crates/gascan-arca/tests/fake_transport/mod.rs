@@ -139,11 +139,20 @@ impl EngineTransport for FakeEngine {
         let sent = std::sync::Arc::clone(&self.exec_sent);
         let closed = std::sync::Arc::clone(&self.exec_client_stream_closed);
         tokio::spawn(async move {
-            // The engine holds its half open for as long as the session lives: a
-            // real engine does not half-close because it has nothing to say yet.
-            // Dropping `server` with the fake's `exec` instead would end the
-            // server stream immediately, which reads to the pump as the session
-            // ending and makes every scripted-frame test a race.
+            // Load-bearing, despite looking like a formality. The engine holds
+            // its half open for as long as the session lives, because a real
+            // engine does not half-close merely because it has nothing to say
+            // yet. Letting `server` drop with the fake's `exec` would end the
+            // server stream immediately, which the pump reads as the session
+            // ending — a cancellation-independent way out of its select.
+            //
+            // Two things break if this line goes. Every scripted-frame test
+            // becomes a race between the server's frames and the consumer's
+            // input. And `cancelling_a_held_session_closes_the_stream_to_the_engine`
+            // stops isolating anything: it would still pass, but through that
+            // other exit, so it would no longer notice a backend that ignored
+            // cancellation entirely. Its leading `!closed` assertion does not
+            // guard against this — that one races.
             let _server = server;
             while let Some(frame) = client_frames.recv().await {
                 sent.lock().expect("test lock").push(frame);
