@@ -3828,7 +3828,24 @@ Expected: PASS. Confirm `git status --short` is clean apart from untracked scrat
 
 - [ ] **Step 5: Run the whole workspace, which is the bar**
 
-Run, capturing the code directly rather than through a pipe:
+**RUN IT ALONE. Added 2026-08-08 (second session), after a measurement was thrown away.**
+Before starting, confirm no other cargo test is running on this machine:
+
+```bash
+pgrep -fl "cargo test" || echo "clear"
+```
+
+Expect `clear`. This is not a formality. Three workspace suites once ran concurrently
+against one target directory here — two launched by one controller at the same output
+path, plus one from another Claude session — and the result was `rc=101` with 59 failures
+across ten `gascand` and `gascan-e2e` binaries, none of them real. Those tiers spawn real
+daemons and bind sockets, so they starve each other and report it as product failure
+(`AddrInUse: "daemon socket is live"`, one `autostart` at 342 seconds). Partial reads at
+302 and 329 passed looked reassuring precisely because the failures came later. **Do not
+run this while any subagent is running cargo, and write the output to a path no other run
+shares.**
+
+Then run, capturing the code directly rather than through a pipe:
 
 ```bash
 if env -u RUSTUP_TOOLCHAIN cargo test --workspace --no-fail-fast; then rc=0; else rc=$?; fi
@@ -3837,7 +3854,24 @@ echo "rc=$rc"
 
 Expected: **rc=0.** The last verified figure before this work was **1382 passed, 0 failed, 22 ignored** at `5ad7ea9`, and it must be **re-measured** rather than trusted — it predates this branch.
 
-Record the new figures and **account for the increase against the tests this plan adds**: 5 (Task 1 — 4 unit plus the mismatched-container pinning test its review added) + 2 (Task 2) + 16 (Tasks 3-4) + 5 (Task 5) + 12 (Task 6) + 5 (Task 7) + 5 (Task 8) = **50**.
+Record the new figures and **account for the increase against the tests this plan adds**.
+**Restated 2026-08-08 (second session) as MEASURED PER-TARGET counts rather than
+per-task estimates**, because two fix rounds moved tests between tasks and the per-task
+attribution stopped matching anything you can run:
+
+| Where | Count | Confirm with |
+|---|---|---|
+| `gascan-arca` `--lib` (translate + error) | 22 | `cargo test -p gascan-arca --lib` |
+| `gascan-arca` `--test backend_unary` | 13 | Task 6 plus its two fix rounds |
+| `gascan-arca` `--test transport_contract` | 2 | Task 2 |
+| `gascan-arca` `--test backend_streams` | 10 | 5 logs (Task 7) + 5 exec (Task 8) |
+| `gascan-core` / `gascan-apple` (Task 1) | 5 | 4 `resource_ownership` + 1 `inspect` pinning test |
+| **Total this plan adds** | **52** | |
+
+Every figure above except `backend_streams`'s exec half was measured on this branch, not
+estimated. **Re-derive the first four by running `cargo test -p gascan-arca --no-fail-fast`
+and reading the four `running N tests` lines**, rather than trusting this table — that is
+the whole point, and the table has now been wrong three times.
 
 **This figure has moved twice and will move again if a review adds a test — recount from the ledger rather than trusting this line.** It was 39 when the plan was written: Task 1's review added one pinning test, Task 3's review added two refusal tests, and Task 4 gained a parity test. The ledger records every such addition at the task that made it, so it is the authority and this number is a convenience.
 
