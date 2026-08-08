@@ -2644,8 +2644,25 @@ instrument to have been confidently wrong here.
 ### What landed
 
 **P5.2 is HALF DONE and executing under subagent-driven development.** Branch
-`feat/gascan-arca`, pushed. Five of ten planned tasks are complete with their
-reviews clean; five remain, and every remaining brief is staged and audited.
+`feat/gascan-arca`, pushed. Tasks 1-4 are complete with clean reviews. **Task 5 is
+implemented and reviewed but has ONE OPEN IMPORTANT FINDING — it is NOT complete.**
+Five tasks remain, and every remaining brief is staged and audited.
+
+**Task 5's open finding, and it must be closed before Task 6 is marked done.** Its
+field-placement test asserts rendered text for only **4 of the 12** accepted error
+codes. The other eight — `ownership_mismatch`, `foreign_resource_refused`,
+`not_found`, `command_io`, `invalid_output`, `invalid_state`, `resource_conflict`,
+`helper_error` — have no such assertion, so a `resource`↔`message` transposition in
+any of them passes all five tests, because `code()` is unaffected by which string
+fills which field. The reviewer hand-verified all eight are correct today, so this is
+a coverage gap and not a live bug. The fix: extend the test to all twelve, and flip
+at least two of the newly covered variants to prove it catches a swap.
+
+**That finding is the sixth instance of an instrument narrower than its claim, and
+the first where the narrow instrument was the FIX for a narrow instrument.** The
+field-placement test exists because a pre-dispatch audit caught the round-trip test
+asserting only `code()`. The fix for that gap was itself partial. **Check a fix as
+hard as you checked the defect.**
 
 | Artifact | Commit |
 |---|---|
