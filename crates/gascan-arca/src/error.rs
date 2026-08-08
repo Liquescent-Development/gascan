@@ -136,40 +136,73 @@ mod tests {
 
     #[test]
     fn the_fields_land_where_each_variant_expects_them() {
-        // `code()` alone cannot catch a transposition. `unknown_actual_state` carries
-        // the wire's message as its `state` and `invalid_resource_identity` carries
-        // the wire's resource as its `name`, so swapping the two inputs would still
-        // report the correct code and pass the round-trip test above. These assert
-        // the rendered text, which is where a swap becomes visible.
-        let state = engine_error("inspect", &wire("unknown_actual_state")).to_string();
-        assert!(state.contains("code-a1b2c3d4e5f6"), "resource: {state}");
-        assert!(
-            state.contains("the engine said so"),
-            "state carries the message: {state}"
-        );
+        // `code()` alone cannot catch a transposition: it depends only on which
+        // match arm fired, not on which wire field ended up in which struct
+        // field. Asserting the full rendered string for every accepted code is
+        // what makes a `resource`<->`message` swap visible -- two variants
+        // (`resource_conflict`, `invalid_state`) carry both fields, so a
+        // `contains` check would still pass even if the two were transposed;
+        // only the exact string, with each field in its place, catches that.
+        let resource = "code-a1b2c3d4e5f6";
+        let message = "the engine said so";
+        let cases = [
+            ("command_io", "op", format!("op: {message}")),
+            (
+                "command_failed",
+                "op",
+                format!("op failed with exit code None: {message}"),
+            ),
+            (
+                "invalid_output",
+                "op",
+                format!("invalid output from op: {message}"),
+            ),
+            (
+                "helper_error",
+                "op",
+                format!("op helper error helper_error: {message}"),
+            ),
+            (
+                "unsupported_capability",
+                "op",
+                format!("unsupported capability: {message}"),
+            ),
+            (
+                "ownership_mismatch",
+                "op",
+                format!("resource ownership mismatch: {resource}"),
+            ),
+            (
+                "foreign_resource_refused",
+                "op",
+                format!("refusing to remove foreign resource: {resource}"),
+            ),
+            (
+                "invalid_resource_identity",
+                "op",
+                format!("invalid resource identity: {resource:?}"),
+            ),
+            (
+                "resource_conflict",
+                "op",
+                format!("resource conflict for {resource}: {message}"),
+            ),
+            ("not_found", "op", format!("resource not found: {resource}")),
+            (
+                "invalid_state",
+                "op",
+                format!("invalid state for {resource}: {message}"),
+            ),
+            (
+                "unknown_actual_state",
+                "op",
+                format!("unknown actual state for {resource}: {message}"),
+            ),
+        ];
 
-        let identity = engine_error("remove", &wire("invalid_resource_identity")).to_string();
-        assert!(
-            identity.contains("code-a1b2c3d4e5f6"),
-            "the resource is the invalid name: {identity}",
-        );
-
-        let capability = engine_error("capabilities", &wire("unsupported_capability")).to_string();
-        assert!(
-            capability.contains("the engine said so"),
-            "the message is the capability: {capability}",
-        );
-
-        // The RPC name is the operation for the variants the wire cannot supply one
-        // for, and the message becomes the stderr rather than being dropped.
-        let failed = engine_error("create", &wire("command_failed")).to_string();
-        assert!(
-            failed.contains("create"),
-            "the rpc is the operation: {failed}"
-        );
-        assert!(
-            failed.contains("the engine said so"),
-            "the message is the stderr: {failed}"
-        );
+        for (code, rpc, expected) in cases {
+            let rendered = engine_error(rpc, &wire(code)).to_string();
+            assert_eq!(rendered, expected, "code {code} rendered unexpectedly");
+        }
     }
 }
