@@ -224,14 +224,36 @@ impl<T: EngineTransport> RuntimeBackend for ArcaBackend<T> {
         })
     }
 
+    /// Concatenates the chunk stream into the one buffer the trait returns.
+    ///
+    /// A mid-stream error discards what arrived. The signature has no way to say
+    /// "here is some of it, and also it broke", and returning a short log beside
+    /// a swallowed error would make a truncated log indistinguishable from a
+    /// complete one.
     async fn logs(
         &self,
-        _id: &SandboxId,
-        _since_millis: Option<i64>,
+        id: &SandboxId,
+        since_millis: Option<i64>,
     ) -> Result<Vec<u8>, RuntimeError> {
-        Err(RuntimeError::UnsupportedCapability {
-            capability: "logs lands in the next task".to_owned(),
-        })
+        let mut stream = self
+            .transport
+            .logs(v1::LogsRequest {
+                sandbox_id: id.to_string(),
+                since_unix_millis: since_millis,
+            })
+            .await
+            .map_err(TransportError::into_runtime_error)?;
+        let mut buffer = Vec::new();
+        while let Some(chunk) = stream.recv().await {
+            match chunk.map_err(TransportError::into_runtime_error)?.outcome {
+                Some(v1::logs_chunk::Outcome::Data(data)) => buffer.extend_from_slice(&data),
+                Some(v1::logs_chunk::Outcome::Error(error)) => {
+                    return Err(error::engine_error("logs", &error));
+                }
+                None => return Err(translate::missing_outcome("logs")),
+            }
+        }
+        Ok(buffer)
     }
 
     async fn list_resources(&self) -> Result<Vec<RuntimeResource>, RuntimeError> {

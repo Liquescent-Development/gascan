@@ -13,6 +13,8 @@ pub struct FakeEngine {
     pub prepare_image: Mutex<Option<v1::PrepareImageResponse>>,
     pub ack: Mutex<Option<v1::AckResponse>>,
     pub list_resources: Mutex<Option<v1::ListResourcesResponse>>,
+    /// Chunks the next `logs` call streams, in order.
+    pub logs_chunks: Mutex<Vec<Result<v1::LogsChunk, TransportError>>>,
     pub calls: Mutex<Vec<Call>>,
 }
 
@@ -26,6 +28,7 @@ pub enum Call {
     Start(v1::StartRequest),
     Stop(v1::StopRequest),
     Remove(v1::RemoveRequest),
+    Logs(v1::LogsRequest),
     ListResources,
 }
 
@@ -121,8 +124,14 @@ impl EngineTransport for FakeEngine {
         Err(TransportError::rpc("exec", "this fake scripts no exec"))
     }
 
-    async fn logs(&self, _request: v1::LogsRequest) -> Result<LogsStream, TransportError> {
-        Err(TransportError::rpc("logs", "this fake scripts no logs"))
+    async fn logs(&self, request: v1::LogsRequest) -> Result<LogsStream, TransportError> {
+        self.record(Call::Logs(request));
+        let chunks = std::mem::take(&mut *self.logs_chunks.lock().expect("test lock"));
+        let (sender, receiver) = tokio::sync::mpsc::channel(chunks.len().max(1));
+        for chunk in chunks {
+            sender.send(chunk).await.expect("the receiver is alive");
+        }
+        Ok(LogsStream::new(receiver))
     }
 
     async fn list_resources(
