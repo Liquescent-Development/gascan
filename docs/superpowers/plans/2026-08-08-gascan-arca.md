@@ -2172,6 +2172,16 @@ async fn start_stop_and_prepare_image_report_an_ack() {
         [Call::Start(v1::StartRequest { sandbox_id: id.as_str().to_owned() })],
     );
 
+    // stop, which this test's name promises and an earlier draft did not deliver.
+    let stopping = FakeEngine::default();
+    *stopping.ack.lock().expect("test lock") = Some(FakeEngine::ok_ack());
+    let backend = ArcaBackend::new(stopping);
+    backend.stop(&id).await.expect("an ack is success");
+    assert_eq!(
+        backend.into_transport().calls(),
+        [Call::Stop(v1::StopRequest { sandbox_id: id.as_str().to_owned() })],
+    );
+
     let preparing = FakeEngine::default();
     *preparing.prepare_image.lock().expect("test lock") = Some(v1::PrepareImageResponse {
         outcome: Some(v1::prepare_image_response::Outcome::Ok(v1::Ack {})),
@@ -2356,6 +2366,130 @@ async fn a_partial_create_keeps_the_evidence_and_the_engines_reason() {
         1,
         "losing partial-create evidence leaks resources nothing later knows to look for",
     );
+}
+
+/// The retained set a recreate needs: every volume and the managed network, but
+/// NOT the container, which is the thing being rebuilt.
+///
+/// Derived from the request rather than hardcoded, because `RetainedResources::new`
+/// requires an exact match against the request's topology and the manifest decides
+/// how many volumes that is.
+fn retained_for(request: &gascan_core::runtime::CreateRequest) -> Vec<gascan_core::runtime::RuntimeResource> {
+    use gascan_core::runtime::{ResourceIdentity, ResourceKind, ResourceOwnership, RuntimeResource};
+
+    let mut retained: Vec<RuntimeResource> = request
+        .volumes()
+        .iter()
+        .map(|volume| {
+            RuntimeResource::discovered(
+                ResourceIdentity::new(ResourceKind::Volume, volume.name.clone())
+                    .expect("a policy-compiled volume name is valid"),
+                Some(request.id().clone()),
+                ResourceOwnership::GasCanOwned,
+            )
+        })
+        .collect();
+    if let Some(name) = request.network().managed_name() {
+        retained.push(RuntimeResource::discovered(
+            ResourceIdentity::new(ResourceKind::Network, name.to_owned())
+                .expect("a policy-compiled network name is valid"),
+            Some(request.id().clone()),
+            ResourceOwnership::GasCanOwned,
+        ));
+    }
+    retained
+}
+
+#[tokio::test]
+async fn create_container_sends_the_retained_resources_and_rebuilds_only_the_container() {
+    use gascan_core::runtime::{RecreateRequest, RetainedResources};
+
+    let (_root, request) = fake_transport::policy_request("recreating");
+    let retained = RetainedResources::new(&request, retained_for(&request))
+        .expect("the retained set matches the requested topology exactly");
+    let recreate = RecreateRequest::new(request.clone(), retained).expect("a recreate request");
+    let expected_retained = retained_for(&request).len();
+
+    // A recreate's outcome is the container alone -- CreateOutcome::for_recreate
+    // rejects anything else.
+    let engine = FakeEngine::default();
+    *engine.create.lock().expect("test lock") = Some(v1::CreateResponse {
+        outcome: Some(v1::create_response::Outcome::Created(v1::Created {
+            created: vec![v1::Resource {
+                identity: Some(v1::ResourceIdentity {
+                    kind: v1::ResourceKind::Container as i32,
+                    name: request.id().as_str().to_owned(),
+                }),
+                owner: Some(owner(request.id())),
+            }],
+        })),
+    });
+
+    let backend = ArcaBackend::new(engine);
+    let outcome = backend
+        .create_container(recreate)
+        .await
+        .expect("a container-only Created maps");
+    assert_eq!(outcome.created().len(), 1, "a recreate rebuilds the container alone");
+
+    let calls = backend.into_transport().calls();
+    let Some(Call::CreateContainer(sent)) = calls.first() else {
+        panic!("create_container must reach the engine exactly once: {calls:?}");
+    };
+    assert!(sent.create.is_some(), "the compiled request travels with it");
+    assert_eq!(
+        sent.retained.len(),
+        expected_retained,
+        "every retained resource is named, or the engine would recreate it",
+    );
+}
+
+#[tokio::test]
+async fn remove_names_exactly_the_resources_and_surfaces_an_ack_error() {
+    use gascan_core::runtime::{
+        RemoveRequest, ResourceIdentity, ResourceKind, ResourceOwnership, RuntimeResource,
+    };
+
+    let id = SandboxId::test("removing");
+    let resource = |name: &str| {
+        RuntimeResource::discovered(
+            ResourceIdentity::new(ResourceKind::Volume, name).expect("a valid identity"),
+            Some(id.clone()),
+            ResourceOwnership::GasCanOwned,
+        )
+    };
+    let build = || {
+        RemoveRequest::from_resources(vec![resource("removing-data"), resource("removing-cache")])
+            .expect("two owned resources")
+    };
+
+    let engine = FakeEngine::default();
+    *engine.ack.lock().expect("test lock") = Some(FakeEngine::ok_ack());
+    let backend = ArcaBackend::new(engine);
+    backend.remove(build()).await.expect("an ack is success");
+
+    let calls = backend.into_transport().calls();
+    let Some(Call::Remove(sent)) = calls.first() else {
+        panic!("remove must reach the engine exactly once: {calls:?}");
+    };
+    assert_eq!(sent.resources.len(), 2, "exactly the named resources, no predicate form");
+    assert_eq!(
+        sent.owner.as_ref().map(|owner| owner.sandbox_id.as_str()),
+        Some(id.as_str()),
+    );
+
+    // The error arm of an Ack response, which nothing else exercises.
+    let refusing = FakeEngine::default();
+    *refusing.ack.lock().expect("test lock") = Some(v1::AckResponse {
+        outcome: Some(v1::ack_response::Outcome::Error(FakeEngine::engine_error(
+            "foreign_resource_refused",
+        ))),
+    });
+    let error = ArcaBackend::new(refusing)
+        .remove(build())
+        .await
+        .expect_err("the engine refused");
+    assert_eq!(error.code(), "foreign_resource_refused");
 }
 ```
 
@@ -2608,7 +2742,7 @@ pub use transport::{EngineTransport, ExecStream, LogsStream, TransportError};
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `env -u RUSTUP_TOOLCHAIN cargo test -p gascan-arca --test backend_unary`
-Expected: PASS, `running 9 tests`.
+Expected: PASS, `running 11 tests`. **Updated 2026-08-08:** was 9, before a pre-dispatch audit found that `create_container` and `remove` had no test at all and that the lifecycle test never called `stop` despite its name.
 
 - [ ] **Step 5: Clippy, fmt, and commit**
 
@@ -3517,7 +3651,7 @@ echo "rc=$rc"
 
 Expected: **rc=0.** The last verified figure before this work was **1382 passed, 0 failed, 22 ignored** at `5ad7ea9`, and it must be **re-measured** rather than trusted — it predates this branch.
 
-Record the new figures and **account for the increase against the tests this plan adds**: 5 (Task 1 — 4 unit plus the mismatched-container pinning test its review added) + 2 (Task 2) + 16 (Tasks 3-4) + 5 (Task 5) + 9 (Task 6) + 3 (Task 7) + 4 (Task 8) = **44**.
+Record the new figures and **account for the increase against the tests this plan adds**: 5 (Task 1 — 4 unit plus the mismatched-container pinning test its review added) + 2 (Task 2) + 16 (Tasks 3-4) + 5 (Task 5) + 11 (Task 6) + 3 (Task 7) + 4 (Task 8) = **46**.
 
 **This figure has moved twice and will move again if a review adds a test — recount from the ledger rather than trusting this line.** It was 39 when the plan was written: Task 1's review added one pinning test, Task 3's review added two refusal tests, and Task 4 gained a parity test. The ledger records every such addition at the task that made it, so it is the authority and this number is a convenience.
 
