@@ -25,6 +25,10 @@ fn owner(id: &SandboxId) -> v1::OwnerLabels {
 #[tokio::test]
 async fn capabilities_reads_the_engine_and_renames_project_mount() {
     let engine = FakeEngine::default();
+    // The flags alternate rather than being uniformly true. Six `true`s cannot
+    // tell the `project_mount -> bind_mounts` rename from a hardcoded `true`, and
+    // cannot see a transposition between any two of them; alternating makes every
+    // flag differ from both of its neighbours, so a swap changes an assertion.
     *engine.capabilities.lock().expect("test lock") = Some(v1::CapabilitiesResponse {
         outcome: Some(v1::capabilities_response::Outcome::Capabilities(
             v1::Capabilities {
@@ -35,11 +39,11 @@ async fn capabilities_reads_the_engine_and_renames_project_mount() {
                 }),
                 contract_minor: 0,
                 project_mount: true,
-                named_volumes: true,
+                named_volumes: false,
                 tty: true,
-                signals: true,
+                signals: false,
                 loopback_publish: true,
-                resource_limits: true,
+                resource_limits: false,
                 offline: v1::Isolation::Proven as i32,
             },
         )),
@@ -49,8 +53,15 @@ async fn capabilities_reads_the_engine_and_renames_project_mount() {
         .capabilities()
         .await
         .expect("a fully specified capability set maps");
-    assert!(capabilities.bind_mounts);
+    assert!(
+        capabilities.bind_mounts,
+        "project_mount is Gas Can's bind_mounts"
+    );
+    assert!(!capabilities.named_volumes);
+    assert!(capabilities.tty);
+    assert!(!capabilities.signals);
     assert!(capabilities.loopback_publish);
+    assert!(!capabilities.resource_limits);
 }
 
 #[tokio::test]
@@ -265,7 +276,7 @@ async fn create_sends_the_compiled_request_and_reports_what_was_made() {
     assert_eq!(outcome.created().len(), expected_resources);
 
     let calls = backend.into_transport().calls();
-    let Some(Call::Create(sent)) = calls.first() else {
+    let [Call::Create(sent)] = calls.as_slice() else {
         panic!("create must reach the engine exactly once: {calls:?}");
     };
     assert_eq!(sent.sandbox_id, request.id().as_str());
@@ -333,6 +344,84 @@ async fn a_partial_create_keeps_the_evidence_and_the_engines_reason() {
         failure.created().len(),
         1,
         "losing partial-create evidence leaks resources nothing later knows to look for",
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_resource_blames_the_rpc_that_actually_carried_it() {
+    // `Resource` is returned by ListResources, Create, and CreateContainer alike,
+    // so the operation name in the diagnostic has to be threaded from the call
+    // site. When it was hardcoded, a malformed resource in a create response read
+    // "invalid output from list_resources" and pointed an operator at an RPC that
+    // was never made.
+    let malformed = || v1::Resource {
+        identity: None,
+        owner: None,
+    };
+
+    let creating = FakeEngine::default();
+    *creating.create.lock().expect("test lock") = Some(v1::CreateResponse {
+        outcome: Some(v1::create_response::Outcome::Created(v1::Created {
+            created: vec![malformed()],
+        })),
+    });
+    let (_root, request) = fake_transport::policy_request("creating");
+    let failure = ArcaBackend::new(creating)
+        .create(request)
+        .await
+        .expect_err("a resource with no identity is not addressable");
+    assert_eq!(failure.code(), "invalid_output");
+    let rendered = failure.to_string();
+    assert!(
+        rendered.contains("from create:"),
+        "a create must blame create: {rendered}",
+    );
+    assert!(
+        !rendered.contains("list_resources"),
+        "naming an RPC that was never called sends an operator to the wrong place: {rendered}",
+    );
+
+    // The same resource on the same response type, reached through the other
+    // create path, must blame that path instead.
+    let recreating = FakeEngine::default();
+    *recreating.create.lock().expect("test lock") = Some(v1::CreateResponse {
+        outcome: Some(v1::create_response::Outcome::Created(v1::Created {
+            created: vec![malformed()],
+        })),
+    });
+    let (_root, request) = fake_transport::policy_request("recreating");
+    let retained = gascan_core::runtime::RetainedResources::new(&request, retained_for(&request))
+        .expect("the retained set matches the requested topology exactly");
+    let recreate =
+        gascan_core::runtime::RecreateRequest::new(request, retained).expect("a recreate request");
+    let rendered = ArcaBackend::new(recreating)
+        .create_container(recreate)
+        .await
+        .expect_err("a resource with no identity is not addressable")
+        .to_string();
+    assert!(
+        rendered.contains("from create_container:"),
+        "a recreate must blame create_container: {rendered}",
+    );
+
+    // And list_resources, which is where the hardcoded name came from, still
+    // blames itself.
+    let listing = FakeEngine::default();
+    *listing.list_resources.lock().expect("test lock") = Some(v1::ListResourcesResponse {
+        outcome: Some(v1::list_resources_response::Outcome::Resources(
+            v1::ResourceList {
+                resources: vec![malformed()],
+            },
+        )),
+    });
+    let rendered = ArcaBackend::new(listing)
+        .list_resources()
+        .await
+        .expect_err("a resource with no identity is not addressable")
+        .to_string();
+    assert!(
+        rendered.contains("from list_resources:"),
+        "an inventory must blame list_resources: {rendered}",
     );
 }
 
@@ -410,7 +499,7 @@ async fn create_container_sends_the_retained_resources_and_rebuilds_only_the_con
     );
 
     let calls = backend.into_transport().calls();
-    let Some(Call::CreateContainer(sent)) = calls.first() else {
+    let [Call::CreateContainer(sent)] = calls.as_slice() else {
         panic!("create_container must reach the engine exactly once: {calls:?}");
     };
     assert!(
@@ -482,7 +571,7 @@ async fn remove_names_exactly_the_resources_and_surfaces_an_ack_error() {
     backend.remove(build()).await.expect("an ack is success");
 
     let calls = backend.into_transport().calls();
-    let Some(Call::Remove(sent)) = calls.first() else {
+    let [Call::Remove(sent)] = calls.as_slice() else {
         panic!("remove must reach the engine exactly once: {calls:?}");
     };
     assert_eq!(

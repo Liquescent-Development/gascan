@@ -84,7 +84,7 @@ fn create_outcome(
 ) -> Result<CreateOutcome, CreateFailure> {
     match response.outcome {
         Some(v1::create_response::Outcome::Created(created)) => {
-            let resources = translate::runtime_resources(&created.created)
+            let resources = translate::runtime_resources(operation, &created.created)
                 .map_err(CreateFailure::from_source)?;
             path.outcome(resources).map_err(CreateFailure::from_source)
         }
@@ -93,7 +93,7 @@ fn create_outcome(
                 || translate::missing_outcome(operation),
                 |error| error::engine_error(operation, error),
             );
-            let resources = translate::runtime_resources(&failed.created)
+            let resources = translate::runtime_resources(operation, &failed.created)
                 .map_err(CreateFailure::from_source)?;
             Err(CreateFailure::from_created_evidence(
                 path.request(),
@@ -242,7 +242,7 @@ impl<T: EngineTransport> RuntimeBackend for ArcaBackend<T> {
             .map_err(TransportError::into_runtime_error)?;
         match response.outcome {
             Some(v1::list_resources_response::Outcome::Resources(list)) => {
-                translate::runtime_resources(&list.resources)
+                translate::runtime_resources("list_resources", &list.resources)
             }
             Some(v1::list_resources_response::Outcome::Error(error)) => {
                 Err(error::engine_error("list_resources", &error))

@@ -436,18 +436,26 @@ pub(crate) fn runtime_sandbox(sandbox: &v1::Sandbox) -> Result<RuntimeSandbox, R
     ))
 }
 
-pub(crate) fn runtime_resource(resource: &v1::Resource) -> Result<RuntimeResource, RuntimeError> {
+/// `operation` is the RPC whose response carried this resource, not the RPC that
+/// happens to list them. `ListResources`, `Create`, and `CreateContainer` all
+/// return `Resource`, so a hardcoded name here would report an RPC the caller
+/// never made — a malformed resource in a create response would blame
+/// `list_resources` and send an operator looking in the wrong place.
+pub(crate) fn runtime_resource(
+    operation: &str,
+    resource: &v1::Resource,
+) -> Result<RuntimeResource, RuntimeError> {
     let identity = resource
         .identity
         .as_ref()
-        .ok_or_else(|| invalid_output("list_resources", "resource carried no identity"))?;
+        .ok_or_else(|| invalid_output(operation, "resource carried no identity"))?;
     let kind = match v1::ResourceKind::try_from(identity.kind) {
         Ok(v1::ResourceKind::Container) => ResourceKind::Container,
         Ok(v1::ResourceKind::Volume) => ResourceKind::Volume,
         Ok(v1::ResourceKind::Network) => ResourceKind::Network,
         Ok(v1::ResourceKind::Unspecified) | Err(_) => {
             return Err(invalid_output(
-                "list_resources",
+                operation,
                 format!("resource kind {} is not a value", identity.kind),
             ));
         }
@@ -491,9 +499,13 @@ pub(crate) fn runtime_resource(resource: &v1::Resource) -> Result<RuntimeResourc
 }
 
 pub(crate) fn runtime_resources(
+    operation: &str,
     resources: &[v1::Resource],
 ) -> Result<Vec<RuntimeResource>, RuntimeError> {
-    resources.iter().map(runtime_resource).collect()
+    resources
+        .iter()
+        .map(|resource| runtime_resource(operation, resource))
+        .collect()
 }
 
 #[cfg(test)]
@@ -688,6 +700,9 @@ mod tests {
 
     #[test]
     fn capabilities_rename_project_mount_and_widen_the_version() {
+        // Alternating flags, not six `true`s: a uniform fixture cannot tell the
+        // `project_mount -> bind_mounts` rename from a hardcoded `true`, and
+        // cannot see a transposition between any two of the six.
         let capabilities = runtime_capabilities(&v1::Capabilities {
             engine_version: Some(v1::Version {
                 major: 1,
@@ -696,11 +711,11 @@ mod tests {
             }),
             contract_minor: 0,
             project_mount: true,
-            named_volumes: true,
+            named_volumes: false,
             tty: true,
-            signals: true,
+            signals: false,
             loopback_publish: true,
-            resource_limits: true,
+            resource_limits: false,
             offline: v1::Isolation::Proven as i32,
         })
         .expect("a fully specified capability set maps");
@@ -713,6 +728,11 @@ mod tests {
             capabilities.bind_mounts,
             "project_mount is Gas Can's bind_mounts"
         );
+        assert!(!capabilities.named_volumes);
+        assert!(capabilities.tty);
+        assert!(!capabilities.signals);
+        assert!(capabilities.loopback_publish);
+        assert!(!capabilities.resource_limits);
         assert_eq!(capabilities.offline, NetworkIsolation::Proven);
     }
 
@@ -893,7 +913,9 @@ mod tests {
             owner: Some(wire_owner(id.as_str())),
         };
         assert_eq!(
-            runtime_resource(&container).expect("maps").ownership(),
+            runtime_resource("list_resources", &container)
+                .expect("maps")
+                .ownership(),
             ResourceOwnership::GasCanOwned,
         );
 
@@ -902,7 +924,9 @@ mod tests {
             ..container.clone()
         };
         assert_eq!(
-            runtime_resource(&unlabelled).expect("maps").ownership(),
+            runtime_resource("list_resources", &unlabelled)
+                .expect("maps")
+                .ownership(),
             ResourceOwnership::Foreign,
             "ListResources returns unlabelled resources on purpose; they are not an error",
         );
@@ -915,7 +939,9 @@ mod tests {
             ..container.clone()
         };
         assert_eq!(
-            runtime_resource(&unparseable).expect("maps").ownership(),
+            runtime_resource("list_resources", &unparseable)
+                .expect("maps")
+                .ownership(),
             ResourceOwnership::Mismatched,
             "one malformed label must not blind the consumer to the rest of the inventory",
         );
@@ -928,7 +954,7 @@ mod tests {
             ..container.clone()
         };
         assert_eq!(
-            runtime_resource(&kindless)
+            runtime_resource("list_resources", &kindless)
                 .expect_err("unspecified is not a kind")
                 .code(),
             "invalid_output",
@@ -939,7 +965,7 @@ mod tests {
             ..container
         };
         assert_eq!(
-            runtime_resource(&identityless)
+            runtime_resource("list_resources", &identityless)
                 .expect_err("a resource with no identity is not addressable")
                 .code(),
             "invalid_output",
@@ -960,7 +986,8 @@ mod tests {
             }),
             owner: Some(wire_owner(claimed.as_str())),
         };
-        let resource = runtime_resource(&collision).expect("a collision still maps");
+        let resource =
+            runtime_resource("list_resources", &collision).expect("a collision still maps");
         assert_eq!(resource.ownership(), ResourceOwnership::Mismatched);
         assert_eq!(
             resource
