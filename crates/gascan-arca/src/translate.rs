@@ -939,6 +939,33 @@ mod tests {
             "invalid_output",
         );
 
+        // The label-equals-id check IS the ownership guard on this path:
+        // `managed_by` is copied verbatim with no MANAGED_BY check on either
+        // backend, so an unparseable label that is tolerated instead of refused
+        // yields an OwnershipMetadata whose sandbox_id is the sandbox's own id and
+        // whose managed_by is whatever the engine claimed -- ownership fabricated
+        // out of a garbage label, which the equality check below can never catch
+        // because an unparseable label can never equal a parsed id.
+        //
+        // The regression is a specific one, not a hypothetical: `runtime_resource`
+        // sixty lines below deliberately uses `.ok()` and carries on, because
+        // ListResources must return foreign resources rather than fail on them.
+        // Anyone unifying the two idioms would write `.unwrap_or_else(|_| id.clone())`
+        // here and see every other test still pass.
+        let unparseable = v1::Sandbox {
+            owner: Some(v1::OwnerLabels {
+                managed_by: "gascan".to_owned(),
+                sandbox_id: "not a valid id".to_owned(),
+            }),
+            ..sandbox.clone()
+        };
+        assert_eq!(
+            runtime_sandbox(&unparseable)
+                .expect_err("a label that does not parse cannot be shown to describe this sandbox")
+                .code(),
+            "invalid_output",
+        );
+
         let stateless = v1::Sandbox {
             state: v1::SandboxState::Unspecified as i32,
             ..sandbox

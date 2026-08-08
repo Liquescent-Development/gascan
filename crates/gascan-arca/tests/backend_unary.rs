@@ -46,9 +46,18 @@ fn policy_request(name: &str) -> (tempfile::TempDir, gascan_core::runtime::Creat
 
     let root = tempfile::tempdir().expect("a temporary project root");
     let path = Utf8Path::from_path(root.path()).expect("a utf-8 temporary path");
+    // The two published ports are load-bearing, not decoration. Every other field
+    // of the wire request is populated by a bare manifest -- three managed volumes,
+    // the workspace environment, default cpu and memory limits -- but `ports` is
+    // empty unless the manifest declares some, and an assertion over an empty
+    // `ports` cannot tell a correct mapping from one that sends none at all. Two
+    // are declared rather than one so that order is observable; a declared port
+    // publishes to the same number on both sides, so a host/guest transposition is
+    // not observable here and `translate::tests::ports_widen_to_uint32_and_keep_their_order`
+    // stays the test that pins it.
     std::fs::write(
         path.join("gascan.toml"),
-        "version = 1\nnetwork = 'networked'\n",
+        "version = 1\nnetwork = 'networked'\n[ports]\napi = 9090\nweb = 8080\n",
     )
     .expect("a manifest");
     let spec = SandboxSpec::from_root(name, path, Manifest::load(path).expect("a manifest"))
@@ -335,6 +344,140 @@ async fn create_sends_the_compiled_request_and_reports_what_was_made() {
         sent.owner.is_some(),
         "labels are how the engine recognises us later"
     );
+}
+
+/// Every field of the wire `CreateRequest`, pinned against the request it was
+/// compiled from.
+///
+/// `create_sends_the_compiled_request_and_reports_what_was_made` above checks the
+/// three fields that identify the call; this one is the reason the other eight
+/// cannot be silently dropped. They were: reducing `translate::create_request` to
+/// `volumes: Vec::new(), ports: Vec::new(), environment: Vec::new(),
+/// resources: None, network: None, user: Root, init: false` left the whole crate
+/// green, which is a workspace sent to the engine as root, with no init reaper, no
+/// limits, no network, no volumes, no ports and no environment. `create_request`
+/// has no unit test of its own -- the translate tests exercise its leaf helpers --
+/// so the assembled struct is only observable from here.
+///
+/// Expectations derive from the request wherever the manifest decides the value,
+/// for the same reason `created_for` and `retained_for` derive their sets: a
+/// hardcoded volume name or environment table would pin this test to today's
+/// policy defaults rather than to the mapping. Where the value is fixed by the
+/// fixture's manifest -- the user, the init reaper -- it is asserted literally, so
+/// that a change of default has to be looked at rather than absorbed.
+#[tokio::test]
+async fn create_sends_every_field_of_the_compiled_request() {
+    let (_root, request) = policy_request("creating");
+    let engine = FakeEngine::default();
+    *engine.create.lock().expect("test lock") = Some(v1::CreateResponse {
+        outcome: Some(v1::create_response::Outcome::Created(created_for(&request))),
+    });
+
+    let backend = ArcaBackend::new(engine);
+    backend
+        .create(request.clone())
+        .await
+        .expect("a well-formed Created maps");
+    let calls = backend.into_transport().calls();
+    let [Call::Create(sent)] = calls.as_slice() else {
+        panic!("create must reach the engine exactly once: {calls:?}");
+    };
+
+    // Each derived expectation is guarded against being empty. An assertion that
+    // two empty collections match is satisfied by a mapping that sends nothing,
+    // which is the exact defect this test exists to catch.
+    assert!(
+        !request.volumes().is_empty(),
+        "the fixture must publish volumes or the volume assertion proves nothing",
+    );
+    let expected_volumes: Vec<v1::Volume> = request
+        .volumes()
+        .iter()
+        .map(|volume| v1::Volume {
+            name: volume.name.clone(),
+            guest_path: volume.target.to_string(),
+            capacity_bytes: volume.capacity_bytes,
+        })
+        .collect();
+    assert_eq!(
+        sent.volumes, expected_volumes,
+        "every managed volume goes over with its name, guest path and capacity",
+    );
+
+    assert!(
+        !request.ports().is_empty(),
+        "the fixture must publish ports or the port assertion proves nothing",
+    );
+    let expected_ports: Vec<v1::PortMapping> = request
+        .ports()
+        .iter()
+        .map(|port| v1::PortMapping {
+            host_port: u32::from(port.host_port),
+            guest_port: u32::from(port.guest_port),
+        })
+        .collect();
+    assert_eq!(
+        sent.ports, expected_ports,
+        "published ports go over in order"
+    );
+
+    assert!(
+        !request.environment().is_empty(),
+        "the fixture must carry environment or the environment assertion proves nothing",
+    );
+    let expected_environment: Vec<v1::EnvironmentVariable> = request
+        .environment()
+        .iter()
+        .map(|(name, value)| v1::EnvironmentVariable {
+            name: name.clone(),
+            value: value.clone(),
+        })
+        .collect();
+    assert_eq!(
+        sent.environment, expected_environment,
+        "the guest environment is the workspace's toolchain configuration; dropping it \
+         silently changes where every tool writes",
+    );
+
+    let limits = request.resources();
+    assert!(
+        limits.cpus.is_some() && limits.memory_bytes.is_some(),
+        "the fixture must carry limits or the resources assertion proves nothing",
+    );
+    assert_eq!(
+        sent.resources,
+        Some(v1::ResourceLimits {
+            cpus: limits.cpus.map(u32::from),
+            memory_bytes: limits.memory_bytes,
+            disk_bytes: limits.disk_bytes,
+            process_count: limits.process_count,
+        }),
+        "an absent `resources` is an unbounded sandbox, not a defaulted one",
+    );
+
+    let gascan_core::runtime::RuntimeNetwork::Networked { name } = request.network() else {
+        panic!(
+            "the fixture manifest asks for a networked sandbox: {:?}",
+            request.network()
+        );
+    };
+    assert_eq!(
+        sent.network,
+        Some(v1::Network {
+            mode: Some(v1::network::Mode::NetworkedName(name.clone())),
+        }),
+        "the managed network is named on the wire; an absent one is not offline, it is unstated",
+    );
+
+    // Literal, because the manifest declares neither: these are the policy
+    // defaults, and running as root or without an init reaper must never become
+    // the quiet outcome of a mapping change.
+    assert_eq!(
+        sent.user,
+        v1::User::Workspace as i32,
+        "the default manifest runs as the workspace user, not root",
+    );
+    assert!(sent.init, "the init reaper is on by default");
 }
 
 #[tokio::test]
