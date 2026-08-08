@@ -2961,6 +2961,9 @@ Add to `FakeEngine`:
     pub exec_frames: Mutex<Vec<Result<v1::ExecServerFrame, TransportError>>>,
     /// Frames the client sent, captured by the fake's pump.
     pub exec_sent: std::sync::Arc<Mutex<Vec<v1::ExecClientFrame>>>,
+    /// Set when the client→engine stream closes, which is how cancellation is
+    /// observable from the engine's side.
+    pub exec_client_stream_closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ```
 
 and replace the `exec` stub:
@@ -2982,10 +2985,14 @@ and replace the `exec` stub:
 
         let (to_server, mut client_frames) = tokio::sync::mpsc::channel(16);
         let sent = std::sync::Arc::clone(&self.exec_sent);
+        let closed = std::sync::Arc::clone(&self.exec_client_stream_closed);
         tokio::spawn(async move {
             while let Some(frame) = client_frames.recv().await {
                 sent.lock().expect("test lock").push(frame);
             }
+            // The pump dropped its sender. From the engine's side that is what
+            // cancellation looks like, so it is the only observable this fake needs.
+            closed.store(true, std::sync::atomic::Ordering::SeqCst);
         });
 
         Ok(ExecStream::new(to_server, from_server))
@@ -3136,7 +3143,48 @@ async fn a_server_error_frame_is_terminal_and_carries_its_code() {
         "an error frame ends the session; nothing after it is delivered",
     );
 }
+
+#[tokio::test]
+async fn dropping_the_session_cancels_the_pump_and_closes_the_stream() {
+    // The reason `ExecSession::live_cancellable` exists. Without this test the whole
+    // cancellation path could be dead and every other exec test would still pass,
+    // while a dropped session left an exec running in the guest forever.
+    let engine = FakeEngine::default();
+    // No server frames: the pump has nothing to deliver, so it sits in its select
+    // and cancellation is the only thing that can end it.
+    let closed = std::sync::Arc::clone(&engine.exec_client_stream_closed);
+
+    let session = ArcaBackend::new(engine)
+        .exec(ExecRequest::fixture(SandboxId::test("execing"), ["/bin/sleep"]))
+        .await
+        .expect("opens");
+    assert!(
+        !closed.load(std::sync::atomic::Ordering::SeqCst),
+        "the stream is live while the session is held",
+    );
+
+    drop(session);
+
+    // A bounded poll on the condition, not a fixed sleep. `autostart.rs` already
+    // has a test that fails open because it waited on a wall clock instead of the
+    // thing it cared about; do not repeat that here.
+    let mut observed = false;
+    for _ in 0..200 {
+        if closed.load(std::sync::atomic::Ordering::SeqCst) {
+            observed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        observed,
+        "dropping the session must cancel the pump and close the stream to the engine, \
+         or a dropped exec leaves guest work running with nothing to reap it",
+    );
+}
 ```
+
+**Prove this one flips too.** Swap `ExecSession::live_cancellable(input, output, cancellation)` for `ExecSession::live(input, output)` — which drops the cancellation channel on the floor — and confirm this test fails while the other four still pass. That contrast is the point: it demonstrates the test detects exactly the wiring it exists to defend, and that the other tests cannot.
 
 - [ ] **Step 3: Run the tests to verify they fail**
 
@@ -3278,7 +3326,7 @@ Add to the imports in `backend.rs`: `ExecCancellation, ExecInput, ExecOutput`. R
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `env -u RUSTUP_TOOLCHAIN cargo test -p gascan-arca --test backend_streams`
-Expected: PASS, `running 7 tests`.
+Expected: PASS, `running 8 tests` — 3 logs plus 5 exec. **Updated 2026-08-08:** was 7, before a pre-dispatch audit found no drop-cancellation test despite the design spec's §7 requiring one.
 
 If `a_non_empty_stdin_buffer_is_sent_once_and_no_close_is_forged` or `live_input_reaches_the_engine_as_its_own_frame` is flaky, the 50ms sleep is the cause — it waits for the fake's capture task. Replace the sleep with a poll that waits for the expected frame count, bounded and then asserted. **Do not lengthen the sleep**; a wall-clock wait is the failure mode `autostart.rs`'s symlink test already has in this repository.
 
@@ -3651,7 +3699,7 @@ echo "rc=$rc"
 
 Expected: **rc=0.** The last verified figure before this work was **1382 passed, 0 failed, 22 ignored** at `5ad7ea9`, and it must be **re-measured** rather than trusted — it predates this branch.
 
-Record the new figures and **account for the increase against the tests this plan adds**: 5 (Task 1 — 4 unit plus the mismatched-container pinning test its review added) + 2 (Task 2) + 16 (Tasks 3-4) + 5 (Task 5) + 11 (Task 6) + 3 (Task 7) + 4 (Task 8) = **46**.
+Record the new figures and **account for the increase against the tests this plan adds**: 5 (Task 1 — 4 unit plus the mismatched-container pinning test its review added) + 2 (Task 2) + 16 (Tasks 3-4) + 5 (Task 5) + 11 (Task 6) + 3 (Task 7) + 5 (Task 8) = **47**.
 
 **This figure has moved twice and will move again if a review adds a test — recount from the ledger rather than trusting this line.** It was 39 when the plan was written: Task 1's review added one pinning test, Task 3's review added two refusal tests, and Task 4 gained a parity test. The ledger records every such addition at the task that made it, so it is the authority and this number is a convenience.
 
