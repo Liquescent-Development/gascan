@@ -3311,7 +3311,7 @@ async fn dropping_the_session_cancels_the_pump_and_closes_the_stream() {
 - [ ] **Step 3: Run the tests to verify they fail**
 
 Run: `env -u RUSTUP_TOOLCHAIN cargo test -p gascan-arca --test backend_streams`
-Expected: FAIL — the four new tests fail at `.exec(...)`, which still returns `UnsupportedCapability`. The three `logs` tests still pass.
+Expected: FAIL — the five new tests fail at `.exec(...)`, which still returns `UnsupportedCapability`. The five `logs` tests still pass.
 
 - [ ] **Step 4: Replace the stub with the pump**
 
@@ -3448,7 +3448,7 @@ Add to the imports in `backend.rs`: `ExecCancellation, ExecInput, ExecOutput`. R
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `env -u RUSTUP_TOOLCHAIN cargo test -p gascan-arca --test backend_streams`
-Expected: PASS, `running 8 tests` — 3 logs plus 5 exec. **Updated 2026-08-08:** was 7, before a pre-dispatch audit found no drop-cancellation test despite the design spec's §7 requiring one.
+Expected: PASS, `running 10 tests` — 5 logs plus 5 exec. **Updated 2026-08-08:** was 7, before a pre-dispatch audit found no drop-cancellation test despite the design spec's §7 requiring one. **Updated again 2026-08-08 (second session):** was 8, before Task 7 gained the mid-stream-`TransportError` and unset-`outcome` tests, which land in this same file.
 
 If `a_non_empty_stdin_buffer_is_sent_once_and_no_close_is_forged` or `live_input_reaches_the_engine_as_its_own_frame` is flaky, the 50ms sleep is the cause — it waits for the fake's capture task. Replace the sleep with a poll that waits for the expected frame count, bounded and then asserted. **Do not lengthen the sleep**; a wall-clock wait is the failure mode `autostart.rs`'s symlink test already has in this repository.
 
