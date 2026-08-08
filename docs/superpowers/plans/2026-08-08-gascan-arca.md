@@ -2410,8 +2410,9 @@ async fn create_container_sends_the_retained_resources_and_rebuilds_only_the_con
     let recreate = RecreateRequest::new(request.clone(), retained).expect("a recreate request");
     let expected_retained = retained_for(&request).len();
 
-    // A recreate's outcome is the container alone -- CreateOutcome::for_recreate
-    // rejects anything else.
+    // A recreate's outcome is the container alone, which is why this path calls
+    // `CreateOutcome::for_recreate` and not `CreateOutcome::new`. The paired test
+    // below feeds it a full topology and requires a refusal.
     let engine = FakeEngine::default();
     *engine.create.lock().expect("test lock") = Some(v1::CreateResponse {
         outcome: Some(v1::create_response::Outcome::Created(v1::Created {
@@ -2441,6 +2442,37 @@ async fn create_container_sends_the_retained_resources_and_rebuilds_only_the_con
         sent.retained.len(),
         expected_retained,
         "every retained resource is named, or the engine would recreate it",
+    );
+}
+
+#[tokio::test]
+async fn a_recreate_answered_with_the_whole_topology_is_refused() {
+    use gascan_core::runtime::{RecreateRequest, RetainedResources};
+
+    let (_root, request) = fake_transport::policy_request("recreating");
+    let retained = RetainedResources::new(&request, retained_for(&request))
+        .expect("the retained set matches the requested topology exactly");
+    let recreate = RecreateRequest::new(request.clone(), retained).expect("a recreate request");
+
+    // A full create outcome -- the container, every volume, and the managed
+    // network -- is precisely what `CreateOutcome::new` accepts and what
+    // `for_recreate` must refuse. That makes this the one test that can tell the
+    // two constructors apart, and it is why `create_container` does not reuse
+    // `create`'s: sharing them would silently accept a recreate that rebuilt
+    // resources the caller asked it to retain.
+    let engine = FakeEngine::default();
+    *engine.create.lock().expect("test lock") = Some(v1::CreateResponse {
+        outcome: Some(v1::create_response::Outcome::Created(created_for(&request))),
+    });
+
+    let failure = ArcaBackend::new(engine)
+        .create_container(recreate)
+        .await
+        .expect_err("a recreate rebuilds the container and nothing else");
+    assert_eq!(failure.code(), "invalid_state");
+    assert!(
+        failure.to_string().contains("exactly the requested container"),
+        "the refusal must name the recreate contract: {failure}",
     );
 }
 
@@ -2543,39 +2575,70 @@ fn ack(operation: &str, response: v1::AckResponse) -> Result<(), RuntimeError> {
     }
 }
 
-impl<T: EngineTransport> ArcaBackend<T> {
-    /// Both create paths answer with the same response type, so they share this.
-    ///
-    /// A resource that fails to map is a hard failure rather than a filtered
-    /// list: a malformed `Resource` has no identity this client can act on, so
-    /// it could not be removed even if it were reported, and the fact an
-    /// operator needs is that the engine sent something malformed.
-    fn create_outcome(
-        request: &CreateRequest,
-        operation: &str,
-        response: v1::CreateResponse,
-    ) -> Result<CreateOutcome, CreateFailure> {
-        match response.outcome {
-            Some(v1::create_response::Outcome::Created(created)) => {
-                let resources = translate::runtime_resources(&created.created)
-                    .map_err(CreateFailure::from_source)?;
-                CreateOutcome::new(request, resources).map_err(CreateFailure::from_source)
-            }
-            Some(v1::create_response::Outcome::Failed(failed)) => {
-                let source = failed.error.as_ref().map_or_else(
-                    || translate::missing_outcome(operation),
-                    |error| error::engine_error(operation, error),
-                );
-                let resources = translate::runtime_resources(&failed.created)
-                    .map_err(CreateFailure::from_source)?;
-                Err(CreateFailure::from_created_evidence(
-                    request, resources, source,
-                ))
-            }
-            None => Err(CreateFailure::from_source(translate::missing_outcome(
-                operation,
-            ))),
+/// Which create path answered, so the `Created` arm is validated by the
+/// constructor that belongs to it.
+///
+/// `create` and `create_container` share a response type but not a contract: a
+/// create must answer with the whole requested topology, while a recreate must
+/// answer with the container and nothing else. `gascan-core` states that
+/// difference as two constructors, and this enum is how one response handler
+/// keeps both. The other two arms — a partial failure and an unset oneof — are
+/// identical for both paths and stay shared.
+enum CreatePath<'a> {
+    Create(&'a CreateRequest),
+    Recreate(&'a RecreateRequest),
+}
+
+impl CreatePath<'_> {
+    /// The compiled request underneath, which the failure arms are stated over.
+    fn request(&self) -> &CreateRequest {
+        match self {
+            Self::Create(request) => request,
+            Self::Recreate(request) => request.create(),
         }
+    }
+
+    fn outcome(&self, created: Vec<RuntimeResource>) -> Result<CreateOutcome, RuntimeError> {
+        match self {
+            Self::Create(request) => CreateOutcome::new(request, created),
+            Self::Recreate(request) => CreateOutcome::for_recreate(request, created),
+        }
+    }
+}
+
+/// Both create paths answer with the same response type, so they share this.
+///
+/// A resource that fails to map is a hard failure rather than a filtered
+/// list: a malformed `Resource` has no identity this client can act on, so
+/// it could not be removed even if it were reported, and the fact an
+/// operator needs is that the engine sent something malformed.
+fn create_outcome(
+    path: CreatePath<'_>,
+    operation: &str,
+    response: v1::CreateResponse,
+) -> Result<CreateOutcome, CreateFailure> {
+    match response.outcome {
+        Some(v1::create_response::Outcome::Created(created)) => {
+            let resources =
+                translate::runtime_resources(&created.created).map_err(CreateFailure::from_source)?;
+            path.outcome(resources).map_err(CreateFailure::from_source)
+        }
+        Some(v1::create_response::Outcome::Failed(failed)) => {
+            let source = failed.error.as_ref().map_or_else(
+                || translate::missing_outcome(operation),
+                |error| error::engine_error(operation, error),
+            );
+            let resources =
+                translate::runtime_resources(&failed.created).map_err(CreateFailure::from_source)?;
+            Err(CreateFailure::from_created_evidence(
+                path.request(),
+                resources,
+                source,
+            ))
+        }
+        None => Err(CreateFailure::from_source(translate::missing_outcome(
+            operation,
+        ))),
     }
 }
 
@@ -2625,7 +2688,7 @@ impl<T: EngineTransport> RuntimeBackend for ArcaBackend<T> {
             .create(wire)
             .await
             .map_err(|error| CreateFailure::from_source(error.into_runtime_error()))?;
-        Self::create_outcome(&request, "create", response)
+        create_outcome(CreatePath::Create(&request), "create", response)
     }
 
     async fn prepare_image(&self, image: &str) -> Result<(), RuntimeError> {
@@ -2656,7 +2719,11 @@ impl<T: EngineTransport> RuntimeBackend for ArcaBackend<T> {
             .create_container(wire)
             .await
             .map_err(|error| CreateFailure::from_source(error.into_runtime_error()))?;
-        Self::create_outcome(request.create(), "create_container", response)
+        create_outcome(
+            CreatePath::Recreate(&request),
+            "create_container",
+            response,
+        )
     }
 
     async fn start(&self, id: &SandboxId) -> Result<(), RuntimeError> {
@@ -2737,12 +2804,26 @@ pub use backend::ArcaBackend;
 pub use transport::{EngineTransport, ExecStream, LogsStream, TransportError};
 ```
 
+**Amended 2026-08-08 (second session), before any implementer saw this task.** An
+earlier draft shared one `create_outcome` across both create paths and validated
+the `Created` arm with `CreateOutcome::new` for each. That is wrong twice over.
+`CreateOutcome::new` requires the container **and** the managed network to be
+present, so the container-only response a recreate must answer with would have
+been rejected outright — the `create_container` test above would have failed at
+`expect("a container-only Created maps")`. And in the other direction it is too
+permissive: `new` accepts volumes and a network in the outcome, so a recreate
+that rebuilt resources the caller asked it to retain would have been accepted
+silently. `gascan-core` states the difference as two constructors,
+`CreateOutcome::new` and `CreateOutcome::for_recreate`; `CreatePath` is how one
+response handler honours both without duplicating the failure arms. Do not
+collapse it back.
+
 **The two `UnsupportedCapability` stubs are temporary and Tasks 7 and 8 replace them.** They exist only so this task compiles and its tests run; do not leave them in place, and do not add a test that asserts on them.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `env -u RUSTUP_TOOLCHAIN cargo test -p gascan-arca --test backend_unary`
-Expected: PASS, `running 11 tests`. **Updated 2026-08-08:** was 9, before a pre-dispatch audit found that `create_container` and `remove` had no test at all and that the lifecycle test never called `stop` despite its name.
+Expected: PASS, `running 12 tests`. **Updated 2026-08-08:** was 9, before a pre-dispatch audit found that `create_container` and `remove` had no test at all and that the lifecycle test never called `stop` despite its name. **Updated again 2026-08-08 (second session):** was 11, before a second pre-dispatch audit found that the recreate path validated its `Created` with `CreateOutcome::new`, which accepts a full topology — see the amendment note in Step 3.
 
 - [ ] **Step 5: Clippy, fmt, and commit**
 
@@ -2864,6 +2945,39 @@ async fn a_mid_stream_error_discards_the_partial_buffer() {
 }
 
 #[tokio::test]
+async fn a_transport_fault_mid_stream_is_not_a_short_read() {
+    let engine = FakeEngine::default();
+    *engine.logs_chunks.lock().expect("test lock") = vec![
+        data(b"this much arrived"),
+        Err(gascan_arca::TransportError::rpc("logs", "the stream broke")),
+    ];
+
+    let error = ArcaBackend::new(engine)
+        .logs(&SandboxId::test("logging"), None)
+        .await
+        .expect_err("a broken transport is a failure, not a short read");
+    assert_eq!(
+        error.code(),
+        "command_io",
+        "a transport fault is I/O against the engine, and stays distinct from the \
+         engine-error chunk the test above covers",
+    );
+}
+
+#[tokio::test]
+async fn a_chunk_carrying_no_outcome_is_refused() {
+    let engine = FakeEngine::default();
+    *engine.logs_chunks.lock().expect("test lock") =
+        vec![data(b"this much arrived"), Ok(v1::LogsChunk { outcome: None })];
+
+    let error = ArcaBackend::new(engine)
+        .logs(&SandboxId::test("logging"), None)
+        .await
+        .expect_err("an unset oneof is not a chunk");
+    assert_eq!(error.code(), "invalid_output");
+}
+
+#[tokio::test]
 async fn an_empty_log_is_empty_rather_than_an_error() {
     let engine = FakeEngine::default();
     assert!(
@@ -2922,7 +3036,15 @@ In `crates/gascan-arca/src/backend.rs`, replace the `logs` stub with:
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `env -u RUSTUP_TOOLCHAIN cargo test -p gascan-arca --test backend_streams`
-Expected: PASS, `running 3 tests`.
+Expected: PASS, `running 5 tests`. **Updated 2026-08-08 (second session):** was 3. The
+previous session's audit found that neither a mid-stream `TransportError` nor a
+`LogsChunk` with an unset `outcome` had a test, recorded both rather than fixing them,
+and left the decision open. Ruling: both are added here. Each is a refusal path in code
+this task writes, the fake already injects both with no new machinery (`logs_chunks` is
+a `Vec<Result<..>>`, so an `Err` element is a transport fault), and an
+implemented-but-untested refusal is precisely the class Task 3's review rated
+**Important** — which cost a full fix round. Two small tests now is the cheap end of
+that trade.
 
 - [ ] **Step 6: Clippy, fmt, and commit**
 
@@ -3699,7 +3821,7 @@ echo "rc=$rc"
 
 Expected: **rc=0.** The last verified figure before this work was **1382 passed, 0 failed, 22 ignored** at `5ad7ea9`, and it must be **re-measured** rather than trusted — it predates this branch.
 
-Record the new figures and **account for the increase against the tests this plan adds**: 5 (Task 1 — 4 unit plus the mismatched-container pinning test its review added) + 2 (Task 2) + 16 (Tasks 3-4) + 5 (Task 5) + 11 (Task 6) + 3 (Task 7) + 5 (Task 8) = **47**.
+Record the new figures and **account for the increase against the tests this plan adds**: 5 (Task 1 — 4 unit plus the mismatched-container pinning test its review added) + 2 (Task 2) + 16 (Tasks 3-4) + 5 (Task 5) + 12 (Task 6) + 5 (Task 7) + 5 (Task 8) = **50**.
 
 **This figure has moved twice and will move again if a review adds a test — recount from the ledger rather than trusting this line.** It was 39 when the plan was written: Task 1's review added one pinning test, Task 3's review added two refusal tests, and Task 4 gained a parity test. The ledger records every such addition at the task that made it, so it is the authority and this number is a convenience.
 
