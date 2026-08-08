@@ -19,10 +19,11 @@ Arca the way it does, which is not obvious from the code alone.
   Do not spend this session on CI stability. We make CI stable after the product
   works with Arca as a backend, not before.
 
-  Last VERIFIED green: **1381 passed, 0 failed, 22 ignored, rc=0**, measured
-  2026-08-07 with `--no-fail-fast` against the bumped pin. That is the carried 1377
-  plus `gascan-engine-proto`'s 4 new tests, so the number moved for an accounted
-  reason. Re-measure before relying on it.
+  Last VERIFIED green: **1382 passed, 0 failed, 22 ignored, rc=0**, measured
+  2026-08-07 with `--no-fail-fast` at `5ad7ea9`. That is the long-carried 1377, plus
+  `gascan-engine-proto`'s 4 surface tests, plus 1 for D7's tombstone-report test — so
+  every increment is accounted for rather than merely larger. `scripts/ci-run-release-contracts.sh`
+  was **15/15, rc=0** at the same point. Re-measure before relying on either.
 
 **STATE:**
 
@@ -161,6 +162,9 @@ Arca the way it does, which is not obvious from the code alone.
     failed and `gate` succeeded. The step is named "Require every job to have
     succeeded or been skipped", which is broader than what it checks. If you add a
     job and want it to block, add it to `needs`.
+    **Do not go looking for `runtime-probe`** — it was deleted the same day (D4). The
+    run is cited because it is the evidence; the lesson is about `needs`, not about
+    that job.
   - **THE PIN NOW DRIVES THE RUST BUILD.** `engine/arca-pin.json` decides which
     revision `gascan-engine-proto` generates from. `scripts/ci-classify-paths.sh`
     maps `engine/*` to `rust=true` AND `engine=true` for exactly this reason. It
