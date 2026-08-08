@@ -19,10 +19,11 @@ Arca the way it does, which is not obvious from the code alone.
   Do not spend this session on CI stability. We make CI stable after the product
   works with Arca as a backend, not before.
 
-  Last VERIFIED green: **1381 passed, 0 failed, 22 ignored, rc=0**, measured
-  2026-08-07 with `--no-fail-fast` against the bumped pin. That is the carried 1377
-  plus `gascan-engine-proto`'s 4 new tests, so the number moved for an accounted
-  reason. Re-measure before relying on it.
+  Last VERIFIED green: **1382 passed, 0 failed, 22 ignored, rc=0**, measured
+  2026-08-07 with `--no-fail-fast` at `5ad7ea9`. That is the long-carried 1377, plus
+  `gascan-engine-proto`'s 4 surface tests, plus 1 for D7's tombstone-report test — so
+  every increment is accounted for rather than merely larger. `scripts/ci-run-release-contracts.sh`
+  was **15/15, rc=0** at the same point. Re-measure before relying on either.
 
 **STATE:**
 
@@ -161,6 +162,9 @@ Arca the way it does, which is not obvious from the code alone.
     failed and `gate` succeeded. The step is named "Require every job to have
     succeeded or been skipped", which is broader than what it checks. If you add a
     job and want it to block, add it to `needs`.
+    **Do not go looking for `runtime-probe`** — it was deleted the same day (D4). The
+    run is cited because it is the evidence; the lesson is about `needs`, not about
+    that job.
   - **THE PIN NOW DRIVES THE RUST BUILD.** `engine/arca-pin.json` decides which
     revision `gascan-engine-proto` generates from. `scripts/ci-classify-paths.sh`
     maps `engine/*` to `rust=true` AND `engine=true` for exactly this reason. It
@@ -271,3 +275,40 @@ Arca the way it does, which is not obvious from the code alone.
     design turned on one measurement: 1.3 GB versus 108 KB for the same provenance.
   - `docs/superpowers/` is TRACKED and committed. `.superpowers/` (dot-prefixed) is
     gitignored scaffolding. Two different paths; do not conflate them.
+  - **TRUST THIS DOCUMENT'S SHAPE; VERIFY ITS FACTS.** It is right about what matters
+    and what to avoid. It has been repeatedly wrong about specifics, because entries
+    get written once and then carried. On 2026-08-07 alone, FOUR inherited
+    descriptions were wrong: mode `0200` as one state (it is two), the D5 stash as one
+    untracked file (three, tracked), the Arca regeneration as annotation churn (it
+    added 4 RPCs), and a `gate` that "requires every job" (it requires four). Each was
+    plausible, each had survived several sessions, and each would have produced a
+    wrong action. **Before acting on an entry here, re-run the check it rests on.**
+
+---
+
+**CLOSING THOUGHTS FROM THE PREVIOUS SESSION — read once, then get to work.**
+
+The wiring in P3.2 was the easy part. What nearly cost correctness, four times, was
+believing a confident sentence written by an earlier session. The single habit that
+caught all four was the same: **before describing a set, look at every member of it.**
+One proto file was read and four were described; one stash entry was quoted and three
+files were in it. That is not carelessness about facts — it is generalising from a
+sample, and it is the failure this project keeps rediscovering under new names.
+
+The corollary is cheap and worth adopting: when the maintainer asks you to explain an
+open item, treat the explaining as the verification. Twice on 2026-08-07 the act of
+writing a plain-language summary is what surfaced that the underlying entry was false.
+
+**One thing is deliberately unfinished, and it is not a loose end — it is a decision
+point.** D7's narrowed retry is approved in principle and unwritten. The instrument
+landed instead, because the evidence could not distinguish the two `0200` states and a
+blanket retry would have converted a diagnosable crash into a timeout. The next CI
+occurrence will now say which state fired. **Do not write the retry until you have
+that.** If you are tempted to skip the wait because the reasoning seems sound, that is
+precisely the moment this document exists to interrupt.
+
+**On picking the next task:** P5.2 (`gascan-arca`) is the highest-value step and its
+type mapping is already derived — read the P3.1 design §9 before writing a line, since
+it exists specifically so you do not re-derive it. P4 and P3.3 are genuine
+alternatives. Ask the maintainer rather than assuming; the fan-out means there is no
+single obvious next move, and that is by design.
