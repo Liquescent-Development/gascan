@@ -1,6 +1,13 @@
 # Kickoff — next session
 
-Paste the block below to start the next agent. It is written to be read cold.
+> **The session entry point is now `docs/status/START-HERE.md`.** Point a new agent at
+> that file and tell it to follow the instructions; it needs nothing pasted. This
+> document is what START-HERE sends it to read — the traps, the still-open items, and
+> the conventions. Both are current as of `149fa41`; if they ever disagree, the SDD
+> ledger at `.superpowers/sdd/2026-08-08-gascan-arca/progress.md` settles it.
+
+The block below is kept for reference and is still accurate. It is written to be read
+cold.
 
 ---
 
