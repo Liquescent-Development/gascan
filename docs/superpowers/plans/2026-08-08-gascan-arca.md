@@ -1715,6 +1715,36 @@ mod tests {
         assert_eq!(error.code(), "command_io");
         assert!(error.to_string().contains("socket closed"));
     }
+
+    #[test]
+    fn the_fields_land_where_each_variant_expects_them() {
+        // `code()` alone cannot catch a transposition. `unknown_actual_state` carries
+        // the wire's message as its `state` and `invalid_resource_identity` carries
+        // the wire's resource as its `name`, so swapping the two inputs would still
+        // report the correct code and pass the round-trip test above. These assert
+        // the rendered text, which is where a swap becomes visible.
+        let state = engine_error("inspect", &wire("unknown_actual_state")).to_string();
+        assert!(state.contains("code-a1b2c3d4e5f6"), "resource: {state}");
+        assert!(state.contains("the engine said so"), "state carries the message: {state}");
+
+        let identity = engine_error("remove", &wire("invalid_resource_identity")).to_string();
+        assert!(
+            identity.contains("code-a1b2c3d4e5f6"),
+            "the resource is the invalid name: {identity}",
+        );
+
+        let capability = engine_error("capabilities", &wire("unsupported_capability")).to_string();
+        assert!(
+            capability.contains("the engine said so"),
+            "the message is the capability: {capability}",
+        );
+
+        // The RPC name is the operation for the variants the wire cannot supply one
+        // for, and the message becomes the stderr rather than being dropped.
+        let failed = engine_error("create", &wire("command_failed")).to_string();
+        assert!(failed.contains("create"), "the rpc is the operation: {failed}");
+        assert!(failed.contains("the engine said so"), "the message is the stderr: {failed}");
+    }
 }
 ```
 
@@ -1796,7 +1826,7 @@ pub(crate) fn engine_error(operation: &str, error: &v1::EngineError) -> RuntimeE
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `env -u RUSTUP_TOOLCHAIN cargo test -p gascan-arca --lib error::`
-Expected: PASS, `running 4 tests`.
+Expected: PASS, `running 5 tests`. **Updated 2026-08-08:** was 4, before the field-placement test was added.
 
 - [ ] **Step 5: Clippy, fmt, and commit**
 
@@ -3487,7 +3517,7 @@ echo "rc=$rc"
 
 Expected: **rc=0.** The last verified figure before this work was **1382 passed, 0 failed, 22 ignored** at `5ad7ea9`, and it must be **re-measured** rather than trusted — it predates this branch.
 
-Record the new figures and **account for the increase against the tests this plan adds**: 5 (Task 1 — 4 unit plus the mismatched-container pinning test its review added) + 2 (Task 2) + 16 (Tasks 3-4) + 4 (Task 5) + 9 (Task 6) + 3 (Task 7) + 4 (Task 8) = **43**.
+Record the new figures and **account for the increase against the tests this plan adds**: 5 (Task 1 — 4 unit plus the mismatched-container pinning test its review added) + 2 (Task 2) + 16 (Tasks 3-4) + 5 (Task 5) + 9 (Task 6) + 3 (Task 7) + 4 (Task 8) = **44**.
 
 **This figure has moved twice and will move again if a review adds a test — recount from the ledger rather than trusting this line.** It was 39 when the plan was written: Task 1's review added one pinning test, Task 3's review added two refusal tests, and Task 4 gained a parity test. The ledger records every such addition at the task that made it, so it is the authority and this number is a convenience.
 
