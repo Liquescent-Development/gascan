@@ -250,9 +250,29 @@ Arca the way it does, which is not obvious from the code alone.
     (arca#47). The `docker` CLI here points at a stopped Colima socket; Arca is its own
     daemon — start it on `/tmp/arca.sock` and set `DOCKER_HOST` accordingly
     (README.md:130-134, Makefile:123-124).
-  - Signing goes through the 1Password SSH agent. "communication with agent failed"
-    means locked — ASK THE USER. `ssh-add -l` succeeding proves nothing. Never fall
-    back to `--no-gpg-sign` or a lightweight tag.
+  - ~~Signing goes through the 1Password SSH agent. "communication with agent failed"
+    means locked — ASK THE USER.~~ **CHANGED 2026-08-08 for THIS REPOSITORY ONLY.**
+    Gas Can now signs with a repo-local key and pushes over HTTPS, so **neither
+    signing nor pushing touches 1Password here**. Every other repository still uses
+    the agent, and nothing global was changed.
+      `user.signingkey` = `~/.ssh/gascan-signing` — a **file path**, not a literal
+      key string. That is the whole trick: `ssh-keygen` signs straight from the
+      private key, so no agent is consulted. The global config still holds a literal
+      key string, which does need one.
+      Transport is `remote.origin.url` = **https**, with
+      `credential.https://github.com.helper` = `!gh auth git-credential`. All of it
+      is `git config --local`; inspect with `git config --local --list`.
+    **VERIFIED 2026-08-08**, four ways, each with the agent explicitly disabled via
+    `env -u SSH_AUTH_SOCK`: `ssh-keygen -Y sign` rc=0; `-Y verify` returned
+    `Good "git" signature`; a real commit reported `%G?` = `G` with fingerprint
+    `SHA256:q6m/eNE…`; and GitHub reported `verified: true, reason: valid` on a
+    pushed probe commit (since removed).
+    Still true, and still absolute: **never fall back to `--no-gpg-sign` or a
+    lightweight tag.** `tag.gpgsign` is now `true` locally so a signed tag is the
+    default here.
+    The ruleset targets `~DEFAULT_BRANCH` only (VERIFIED via
+    `gh api /repos/.../rulesets/20492137`), so `required_signatures` gates `main`,
+    not feature branches.
   - The permission classifier refuses `gh pr merge` and repo-admin `gh api` calls. Ask
     the user to run them with `!`. NEVER route around a refusal with a different tool
     performing the same irreversible action.
