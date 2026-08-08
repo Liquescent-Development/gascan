@@ -5,8 +5,9 @@ use std::{
 
 use gascan_core::{
     runtime::{
-        ContainerState, OwnershipMetadata, ResourceIdentity, ResourceKind, ResourceOwnership,
-        RuntimeError, RuntimeResource, RuntimeSandbox,
+        ContainerState, MANAGED_BY_LABEL, OwnershipMetadata, ResourceIdentity, ResourceKind,
+        ResourceOwnership, RuntimeError, RuntimeResource, RuntimeSandbox, SANDBOX_ID_LABEL,
+        SandboxLabel, classify_resource_ownership,
     },
     sandbox::SandboxId,
 };
@@ -14,9 +15,6 @@ use serde::Deserialize;
 
 use crate::{AppleCommandBuilder, CommandRunner, CommandSpec};
 
-const MANAGED_BY_LABEL: &str = "dev.gascan.managed-by";
-const SANDBOX_ID_LABEL: &str = "dev.gascan.sandbox-id";
-const MANAGED_BY_GASCAN: &str = "gascan";
 const CONTAINER_NOT_FOUND_EXIT_CODE: i32 = 1;
 
 pub struct AppleInspector<R> {
@@ -87,8 +85,25 @@ where
             .map(|record| {
                 let name = record.configuration.id;
                 map_state(&name, &record.status.state)?;
-                let (sandbox_id, ownership) =
-                    classify_inventory_ownership(&name, &record.configuration.labels);
+                let labels = &record.configuration.labels;
+                let parsed = labels
+                    .get(SANDBOX_ID_LABEL)
+                    .and_then(|value| SandboxId::try_from(value.clone()).ok());
+                let label = match (labels.get(SANDBOX_ID_LABEL), &parsed) {
+                    (None, _) => SandboxLabel::Absent,
+                    (Some(_), Some(id)) => SandboxLabel::Parsed(id),
+                    (Some(_), None) => SandboxLabel::Unparseable,
+                };
+                let ownership = classify_resource_ownership(
+                    ResourceKind::Container,
+                    &name,
+                    labels.get(MANAGED_BY_LABEL).map(String::as_str),
+                    label,
+                );
+                let sandbox_id = match ownership {
+                    ResourceOwnership::GasCanOwned => parsed,
+                    _ => None,
+                };
                 let identity = ResourceIdentity::new(ResourceKind::Container, name)?;
                 Ok(RuntimeResource::discovered(identity, sandbox_id, ownership))
             })
@@ -251,26 +266,6 @@ fn map_state(id: impl std::fmt::Display, state: &str) -> Result<ContainerState, 
             resource: id.to_string(),
             state: state.to_owned(),
         }),
-    }
-}
-
-fn classify_inventory_ownership(
-    name: &str,
-    labels: &BTreeMap<String, String>,
-) -> (Option<SandboxId>, ResourceOwnership) {
-    let manager = labels.get(MANAGED_BY_LABEL).map(String::as_str);
-    let sandbox = labels.get(SANDBOX_ID_LABEL).map(String::as_str);
-    match (manager, sandbox) {
-        (Some(MANAGED_BY_GASCAN), Some(annotation)) => {
-            match SandboxId::try_from(annotation.to_owned()) {
-                Ok(id) if id.as_str() == name => (Some(id), ResourceOwnership::GasCanOwned),
-                Ok(id) => (Some(id), ResourceOwnership::Mismatched),
-                Err(_) => (None, ResourceOwnership::Mismatched),
-            }
-        }
-        (None, None) => (None, ResourceOwnership::Foreign),
-        (Some(manager), _) if manager != MANAGED_BY_GASCAN => (None, ResourceOwnership::Foreign),
-        _ => (None, ResourceOwnership::Mismatched),
     }
 }
 

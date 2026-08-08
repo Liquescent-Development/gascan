@@ -51,6 +51,57 @@ pub struct OwnershipMetadata {
     pub sandbox_id: SandboxId,
 }
 
+/// The `managed_by` value Gas Can attaches to everything it creates.
+pub const MANAGED_BY: &str = "gascan";
+/// Label key carrying [`MANAGED_BY`].
+pub const MANAGED_BY_LABEL: &str = "dev.gascan.managed-by";
+/// Label key carrying the owning sandbox's id.
+pub const SANDBOX_ID_LABEL: &str = "dev.gascan.sandbox-id";
+
+/// The three states a sandbox-id label can be in, as the classifier sees it.
+///
+/// `Unparseable` is distinct from `Absent` on purpose: a present-but-invalid
+/// label is evidence of a collision or of another tool's label, not of an
+/// unlabelled resource. Parsing happens in the caller, which keeps the decision
+/// about whether a parse failure is fatal where it belongs — `AppleInspector`
+/// treats it as `Mismatched` and continues, while the volume and network listing
+/// fails the whole call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SandboxLabel<'a> {
+    Absent,
+    Unparseable,
+    Parsed(&'a SandboxId),
+}
+
+/// Decides whether a labelled runtime resource is ours, foreign, or mismatched.
+///
+/// This is the consumer's judgment and it stays in the consumer: an engine that
+/// decided "this one is yours" would be answering a policy question inside the
+/// component the policy boundary exists to constrain.
+///
+/// The rule is per kind. A container is named by its sandbox id, so a container
+/// whose name disagrees with its label is `Mismatched`. A volume or network is
+/// not, so its name carries no ownership information.
+pub fn classify_resource_ownership(
+    kind: ResourceKind,
+    name: &str,
+    managed_by: Option<&str>,
+    sandbox: SandboxLabel<'_>,
+) -> ResourceOwnership {
+    match (managed_by, sandbox) {
+        (Some(MANAGED_BY), SandboxLabel::Parsed(id)) => {
+            if kind == ResourceKind::Container && id.as_str() != name {
+                ResourceOwnership::Mismatched
+            } else {
+                ResourceOwnership::GasCanOwned
+            }
+        }
+        (None, SandboxLabel::Absent) => ResourceOwnership::Foreign,
+        (Some(manager), _) if manager != MANAGED_BY => ResourceOwnership::Foreign,
+        _ => ResourceOwnership::Mismatched,
+    }
+}
+
 /// A policy-validated request accepted by [`RuntimeBackend::create`].
 ///
 /// Its nested request-shape types remain public for backend inspection, but
@@ -644,7 +695,13 @@ pub fn same_immutable_image(left: &str, right: &str) -> bool {
     left == right
 }
 
-fn immutable_image_identity(image: &str) -> Option<(&str, &str)> {
+/// Splits an immutable reference into its tag-stripped repository and its digest.
+///
+/// This is the pair a structured wire digest needs, and it is the same pair
+/// [`same_immutable_image`] compares by — so a caller that canonicalises through
+/// this function is canonicalising consistently with every comparison in the
+/// workspace.
+pub fn immutable_image_identity(image: &str) -> Option<(&str, &str)> {
     if !immutable_image_reference(image) {
         return None;
     }

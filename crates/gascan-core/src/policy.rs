@@ -1,6 +1,6 @@
 use crate::manifest::{NetworkMode, Storage, UserMode};
 use crate::runtime::{
-    CreateRequest, NetworkIsolation, OwnershipMetadata, ResourceIdentity, ResourceKind,
+    CreateRequest, MANAGED_BY, NetworkIsolation, OwnershipMetadata, ResourceIdentity, ResourceKind,
     RuntimeBindMount, RuntimeCapabilities, RuntimeError, RuntimeNetwork, RuntimePort,
     RuntimeResourceLimits, RuntimeUser, RuntimeVolume, immutable_image_reference,
 };
@@ -19,7 +19,6 @@ pub const DEFAULT_DISK_BYTES: u64 = 64 * 1024_u64.pow(3);
 pub const MAX_DISK_BYTES: u64 = 512 * 1024_u64.pow(3);
 pub const DEFAULT_PROCESS_COUNT: u32 = 1_024;
 
-const MANAGED_BY: &str = "gascan";
 const WORKSPACE_IMAGE: &str = include_str!("../../../images/workspace/approved-image.txt");
 pub const WORKSPACE_HOME: &str = "/home/workspace";
 pub const TOOLS_ROOT: &str = "/home/workspace/.local";
