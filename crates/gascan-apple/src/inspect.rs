@@ -5,8 +5,8 @@ use std::{
 
 use gascan_core::{
     runtime::{
-        ContainerState, MANAGED_BY_LABEL, OwnershipMetadata, ResourceIdentity, ResourceKind,
-        ResourceOwnership, RuntimeError, RuntimeResource, RuntimeSandbox, SANDBOX_ID_LABEL,
+        ContainerState, MANAGED_BY, MANAGED_BY_LABEL, OwnershipMetadata, ResourceIdentity,
+        ResourceKind, RuntimeError, RuntimeResource, RuntimeSandbox, SANDBOX_ID_LABEL,
         SandboxLabel, classify_resource_ownership,
     },
     sandbox::SandboxId,
@@ -100,10 +100,16 @@ where
                     labels.get(MANAGED_BY_LABEL).map(String::as_str),
                     label,
                 );
-                let sandbox_id = match ownership {
-                    ResourceOwnership::GasCanOwned => parsed,
-                    _ => None,
-                };
+                // Some(id) whenever OUR label parsed, including when the name disagrees
+                // and the resource is therefore Mismatched: the reconciler at
+                // gascand/src/service.rs:3001-3012 finds the mismatched container by
+                // the id it claims, and reports nothing if that claim is withheld.
+                let sandbox_id =
+                    if labels.get(MANAGED_BY_LABEL).map(String::as_str) == Some(MANAGED_BY) {
+                        parsed
+                    } else {
+                        None
+                    };
                 let identity = ResourceIdentity::new(ResourceKind::Container, name)?;
                 Ok(RuntimeResource::discovered(identity, sandbox_id, ownership))
             })
