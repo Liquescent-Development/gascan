@@ -698,42 +698,91 @@ mod tests {
         }
     }
 
-    #[test]
-    fn capabilities_rename_project_mount_and_widen_the_version() {
-        // Alternating flags, not six `true`s: a uniform fixture cannot tell the
-        // `project_mount -> bind_mounts` rename from a hardcoded `true`, and
-        // cannot see a transposition between any two of the six.
-        let capabilities = runtime_capabilities(&v1::Capabilities {
+    /// A capability set with every flag off, which the one-hot test below raises
+    /// one at a time.
+    fn no_capabilities() -> v1::Capabilities {
+        v1::Capabilities {
             engine_version: Some(v1::Version {
                 major: 1,
                 minor: 2,
                 patch: 3,
             }),
             contract_minor: 0,
-            project_mount: true,
+            project_mount: false,
             named_volumes: false,
-            tty: true,
+            tty: false,
             signals: false,
-            loopback_publish: true,
+            loopback_publish: false,
             resource_limits: false,
             offline: v1::Isolation::Proven as i32,
-        })
-        .expect("a fully specified capability set maps");
+        }
+    }
 
+    #[test]
+    fn capabilities_widen_the_version_and_carry_the_isolation_verdict() {
+        let capabilities = runtime_capabilities(&no_capabilities())
+            .expect("a capability set with no optional flags still maps");
         assert_eq!(
             capabilities.version,
             gascan_core::runtime::RuntimeVersion::new(1, 2, 3)
         );
-        assert!(
-            capabilities.bind_mounts,
-            "project_mount is Gas Can's bind_mounts"
-        );
-        assert!(!capabilities.named_volumes);
-        assert!(capabilities.tty);
-        assert!(!capabilities.signals);
-        assert!(capabilities.loopback_publish);
-        assert!(!capabilities.resource_limits);
         assert_eq!(capabilities.offline, NetworkIsolation::Proven);
+    }
+
+    #[test]
+    fn each_capability_flag_maps_to_exactly_one_field() {
+        // No single fixture can separate six booleans, whatever mix of `true` and
+        // `false` it uses: any two flags that share a value can be transposed
+        // invisibly, and an all-true fixture cannot tell a mapped field from a
+        // hardcoded `true` at all. So each flag is raised alone and all six fields
+        // are read every time. That pins the `project_mount -> bind_mounts` rename
+        // five times over -- five of the six cases require `bind_mounts` to be
+        // false -- and any transposition lights up the wrong field.
+        type Raise = fn(&mut v1::Capabilities);
+        type Read = fn(&RuntimeCapabilities) -> bool;
+
+        let flags: [(&str, Raise, Read); 6] = [
+            (
+                "project_mount -> bind_mounts",
+                |wire| wire.project_mount = true,
+                |mapped| mapped.bind_mounts,
+            ),
+            (
+                "named_volumes",
+                |wire| wire.named_volumes = true,
+                |mapped| mapped.named_volumes,
+            ),
+            ("tty", |wire| wire.tty = true, |mapped| mapped.tty),
+            (
+                "signals",
+                |wire| wire.signals = true,
+                |mapped| mapped.signals,
+            ),
+            (
+                "loopback_publish",
+                |wire| wire.loopback_publish = true,
+                |mapped| mapped.loopback_publish,
+            ),
+            (
+                "resource_limits",
+                |wire| wire.resource_limits = true,
+                |mapped| mapped.resource_limits,
+            ),
+        ];
+
+        for (raised, raise, _) in flags {
+            let mut wire = no_capabilities();
+            raise(&mut wire);
+            let mapped = runtime_capabilities(&wire).expect("a one-hot capability set maps");
+            for (read_back, _, read) in flags {
+                assert_eq!(
+                    read(&mapped),
+                    raised == read_back,
+                    "the wire set {raised} alone, so {read_back} must be {}",
+                    raised == read_back,
+                );
+            }
+        }
     }
 
     #[test]

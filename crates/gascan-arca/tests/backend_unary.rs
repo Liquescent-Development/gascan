@@ -25,10 +25,12 @@ fn owner(id: &SandboxId) -> v1::OwnerLabels {
 #[tokio::test]
 async fn capabilities_reads_the_engine_and_renames_project_mount() {
     let engine = FakeEngine::default();
-    // The flags alternate rather than being uniformly true. Six `true`s cannot
-    // tell the `project_mount -> bind_mounts` rename from a hardcoded `true`, and
-    // cannot see a transposition between any two of them; alternating makes every
-    // flag differ from both of its neighbours, so a swap changes an assertion.
+    // ONE representative case, not an exhaustive check of the mapping. This test's
+    // job is that the Capabilities arm is read at all and the mapping is reached;
+    // the field-by-field pin -- every flag raised alone, all six fields read each
+    // time -- is `translate::tests::each_capability_flag_maps_to_exactly_one_field`,
+    // which is where a transposition or a hardcoded `true` is caught. The fixture
+    // raises `project_mount` alone so the assertions below are not vacuous.
     *engine.capabilities.lock().expect("test lock") = Some(v1::CapabilitiesResponse {
         outcome: Some(v1::capabilities_response::Outcome::Capabilities(
             v1::Capabilities {
@@ -40,9 +42,9 @@ async fn capabilities_reads_the_engine_and_renames_project_mount() {
                 contract_minor: 0,
                 project_mount: true,
                 named_volumes: false,
-                tty: true,
+                tty: false,
                 signals: false,
-                loopback_publish: true,
+                loopback_publish: false,
                 resource_limits: false,
                 offline: v1::Isolation::Proven as i32,
             },
@@ -52,15 +54,15 @@ async fn capabilities_reads_the_engine_and_renames_project_mount() {
     let capabilities = ArcaBackend::new(engine)
         .capabilities()
         .await
-        .expect("a fully specified capability set maps");
+        .expect("a capability set maps");
     assert!(
         capabilities.bind_mounts,
         "project_mount is Gas Can's bind_mounts"
     );
     assert!(!capabilities.named_volumes);
-    assert!(capabilities.tty);
+    assert!(!capabilities.tty);
     assert!(!capabilities.signals);
-    assert!(capabilities.loopback_publish);
+    assert!(!capabilities.loopback_publish);
     assert!(!capabilities.resource_limits);
 }
 
