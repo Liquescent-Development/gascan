@@ -25,6 +25,7 @@ impl ChannelTransport {
     /// The authority is a placeholder that the connector ignores, which is the
     /// same shape the daemon client already uses for its own socket.
     pub async fn connect(socket: PathBuf) -> Result<Self, TransportError> {
+        let dialed = socket.clone();
         let channel = Endpoint::from_static("http://[::]:50051")
             .connect_with_connector(service_fn(move |_| {
                 let socket = socket.clone();
@@ -34,7 +35,12 @@ impl ChannelTransport {
                 }
             }))
             .await
-            .map_err(|error| TransportError::rpc("connect", error.to_string()))?;
+            .map_err(|error| {
+                TransportError::rpc(
+                    "connect",
+                    format!("{}: {}", dialed.display(), source_chain(&error)),
+                )
+            })?;
         Ok(Self {
             client: SandboxEngineClient::new(channel),
         })
@@ -43,6 +49,32 @@ impl ChannelTransport {
     fn client(&self) -> SandboxEngineClient<Channel> {
         self.client.clone()
     }
+}
+
+/// Renders an error together with everything it was caused by.
+///
+/// `tonic::transport::Error` renders `Kind::Transport` as the fixed string
+/// `transport error` (`tonic-0.12.3/src/transport/error.rs:52`), and that is
+/// the kind every dial failure carries, so the `io::Error` that tells a missing
+/// socket apart from a path that is not a socket is reachable only through
+/// `source()`. `crates/gascan/src/client.rs` walks the same chain for the same
+/// reason, in `definitely_inert_connect_error`.
+fn source_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut rendered = error.to_string();
+    let mut last = rendered.clone();
+    let mut cause = error.source();
+    while let Some(error) = cause {
+        let text = error.to_string();
+        // A boxed source re-renders the error it wraps verbatim, so a chain can
+        // repeat itself. Say each distinct cause once.
+        if text != last {
+            rendered.push_str(": ");
+            rendered.push_str(&text);
+            last = text;
+        }
+        cause = error.source();
+    }
+    rendered
 }
 
 fn status(operation: &str, status: tonic::Status) -> TransportError {
@@ -152,17 +184,25 @@ impl EngineTransport for ChannelTransport {
         let (from_engine, inbound) = mpsc::channel(32);
         tokio::spawn(async move {
             loop {
-                match streaming.message().await {
-                    Ok(Some(frame)) => {
-                        if from_engine.send(Ok(frame)).await.is_err() {
+                tokio::select! {
+                    // Dropping the in-flight `message()` future is safe here
+                    // for one reason and only that reason: this branch is
+                    // reached when the last receiver is gone, so there is
+                    // nobody left to deliver the message to and the RPC is
+                    // being abandoned on purpose. Nothing is resumed after it.
+                    () = from_engine.closed() => break,
+                    message = streaming.message() => match message {
+                        Ok(Some(frame)) => {
+                            if from_engine.send(Ok(frame)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(error) => {
+                            let _ = from_engine.send(Err(status("exec", error))).await;
                             break;
                         }
-                    }
-                    Ok(None) => break,
-                    Err(error) => {
-                        let _ = from_engine.send(Err(status("exec", error))).await;
-                        break;
-                    }
+                    },
                 }
             }
         });
@@ -181,17 +221,26 @@ impl EngineTransport for ChannelTransport {
         let (sender, receiver) = mpsc::channel(32);
         tokio::spawn(async move {
             loop {
-                match streaming.message().await {
-                    Ok(Some(chunk)) => {
-                        if sender.send(Ok(chunk)).await.is_err() {
+                tokio::select! {
+                    // As in `exec`: dropping the in-flight `message()` future
+                    // is safe because this branch means the receiver is gone
+                    // and the task is terminating. It matters more here —
+                    // `logs` has no half-close to prompt the engine, so
+                    // without this an abandoned call holds the stream open for
+                    // as long as the container stays quiet.
+                    () = sender.closed() => break,
+                    message = streaming.message() => match message {
+                        Ok(Some(chunk)) => {
+                            if sender.send(Ok(chunk)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(error) => {
+                            let _ = sender.send(Err(status("logs", error))).await;
                             break;
                         }
-                    }
-                    Ok(None) => break,
-                    Err(error) => {
-                        let _ = sender.send(Err(status("logs", error))).await;
-                        break;
-                    }
+                    },
                 }
             }
         });
