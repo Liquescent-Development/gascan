@@ -349,15 +349,23 @@ async fn create_sends_the_compiled_request_and_reports_what_was_made() {
 /// Every field of the wire `CreateRequest`, pinned against the request it was
 /// compiled from.
 ///
+/// `v1::CreateRequest` has eleven fields.
 /// `create_sends_the_compiled_request_and_reports_what_was_made` above checks the
-/// three fields that identify the call; this one is the reason the other eight
-/// cannot be silently dropped. They were: reducing `translate::create_request` to
+/// three that identify the call -- `sandbox_id`, `project`, `owner` -- and this
+/// test checks the other eight: `image`, `volumes`, `ports`, `environment`,
+/// `resources`, `network`, `user`, `init`. Each of those eight has been mutated
+/// alone and fails alone, so the count above is a measured claim rather than a
+/// description of intent; if a field is added to the wire type, it belongs here
+/// and this comment's arithmetic has to change with it.
+///
+/// They needed it. Reducing `translate::create_request` to
 /// `volumes: Vec::new(), ports: Vec::new(), environment: Vec::new(),
 /// resources: None, network: None, user: Root, init: false` left the whole crate
 /// green, which is a workspace sent to the engine as root, with no init reaper, no
-/// limits, no network, no volumes, no ports and no environment. `create_request`
-/// has no unit test of its own -- the translate tests exercise its leaf helpers --
-/// so the assembled struct is only observable from here.
+/// limits, no network, no volumes, no ports and no environment; `image: None` left
+/// it green too. `create_request` has no unit test of its own -- the translate
+/// tests exercise its leaf helpers -- so the assembled struct is only observable
+/// from here.
 ///
 /// Expectations derive from the request wherever the manifest decides the value,
 /// for the same reason `created_for` and `retained_for` derive their sets: a
@@ -382,6 +390,32 @@ async fn create_sends_every_field_of_the_compiled_request() {
     let [Call::Create(sent)] = calls.as_slice() else {
         panic!("create must reach the engine exactly once: {calls:?}");
     };
+
+    // `image` is the eighth field, and it was pinned by nothing: `image: None`
+    // left the whole crate green, because `translate.rs`'s
+    // `an_image_reference_splits_into_repository_and_digest_and_drops_the_tag`
+    // tests the `image_digest` helper in isolation and never asks whether its
+    // result reaches the wire.
+    //
+    // The expectation is derived through `immutable_image_identity` rather than by
+    // splitting the reference here, because the approved workspace image carries a
+    // tag *and* a digest -- `...workspace:da2ca493...@sha256:84f6b685...` -- and the
+    // repository is the name with the tag stripped. Re-deriving that rule in the
+    // test would duplicate production logic and fail the moment the two drifted,
+    // which is the opposite of what a pin should do. The split itself is pinned by
+    // the leaf test named above; this assertion pins that the split's result is
+    // what gets sent, which is the part nothing covered.
+    let (expected_repository, expected_sha256_hex) =
+        gascan_core::runtime::immutable_image_identity(request.image())
+            .expect("the compiled request names an immutable image");
+    assert_eq!(
+        sent.image,
+        Some(v1::ImageDigest {
+            repository: expected_repository.to_owned(),
+            sha256_hex: expected_sha256_hex.to_owned(),
+        }),
+        "an absent image is not a defaulted image; the engine would have nothing to run",
+    );
 
     // Each derived expectation is guarded against being empty. An assertion that
     // two empty collections match is satisfied by a mapping that sends nothing,
