@@ -1343,11 +1343,44 @@ Append to the `mod tests` block in `crates/gascan-arca/src/translate.rs`:
                 kind: v1::ResourceKind::Unspecified as i32,
                 name: id.as_str().to_owned(),
             }),
-            ..container
+            ..container.clone()
         };
         assert_eq!(
             runtime_resource(&kindless).expect_err("unspecified is not a kind").code(),
             "invalid_output",
+        );
+
+        let identityless = v1::Resource {
+            identity: None,
+            ..container
+        };
+        assert_eq!(
+            runtime_resource(&identityless)
+                .expect_err("a resource with no identity is not addressable")
+                .code(),
+            "invalid_output",
+        );
+    }
+
+    #[test]
+    fn a_mismatched_resource_still_reports_the_sandbox_id_it_claims() {
+        // Parity with gascan-apple's inspect.rs, which reports the claimed id for a
+        // mismatched resource because the reconciler finds it by that claim. If the
+        // two backends disagree here, one reports an ownership mismatch the other
+        // drops -- the divergence Task 1's shared classifier exists to prevent.
+        let claimed = gascan_core::sandbox::SandboxId::test("claimed");
+        let collision = v1::Resource {
+            identity: Some(v1::ResourceIdentity {
+                kind: v1::ResourceKind::Container as i32,
+                name: "a-name-that-is-not-the-label".to_owned(),
+            }),
+            owner: Some(wire_owner(claimed.as_str())),
+        };
+        let resource = runtime_resource(&collision).expect("a collision still maps");
+        assert_eq!(resource.ownership(), ResourceOwnership::Mismatched);
+        assert_eq!(
+            resource.sandbox_id().map(gascan_core::sandbox::SandboxId::as_str),
+            Some(claimed.as_str()),
         );
     }
 ```
@@ -1542,9 +1575,19 @@ pub(crate) fn runtime_resource(
         owner.map(|owner| owner.managed_by.as_str()),
         label,
     );
-    let sandbox_id = match ownership {
-        ResourceOwnership::GasCanOwned => parsed,
-        ResourceOwnership::Foreign | ResourceOwnership::Mismatched => None,
+    // Some(id) whenever OUR label parsed, including when the resource is
+    // Mismatched. **CORRECTED 2026-08-08 — this file previously said
+    // `match ownership { GasCanOwned => parsed, _ => None }`, which is the exact
+    // rule Task 1's fix round reverted as a regression.** `gascan-apple`'s
+    // `inspect.rs` reports the claimed id for a mismatched resource because the
+    // reconciler at `gascand/src/service.rs:3001-3012` finds it by that claim.
+    // The two backends MUST agree here — a divergence is what Task 1 exists to
+    // prevent, and it would mean one backend reports an ownership mismatch that
+    // the other silently drops.
+    let sandbox_id = if owner.map(|owner| owner.managed_by.as_str()) == Some(MANAGED_BY) {
+        parsed
+    } else {
+        None
     };
     Ok(RuntimeResource::discovered(core_identity, sandbox_id, ownership))
 }
@@ -1559,7 +1602,7 @@ pub(crate) fn runtime_resources(
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `env -u RUSTUP_TOOLCHAIN cargo test -p gascan-arca --lib`
-Expected: PASS, `running 13 tests`.
+Expected: PASS, `running 16 tests` — Task 3's 7 plus this task's 9. **Updated 2026-08-08:** was `13`, from Task 3's original 5 plus 8 here, before Task 3's review added two refusal tests and this task gained the mismatched-resource parity test.
 
 - [ ] **Step 5: Clippy, fmt, and commit**
 
@@ -3444,7 +3487,11 @@ echo "rc=$rc"
 
 Expected: **rc=0.** The last verified figure before this work was **1382 passed, 0 failed, 22 ignored** at `5ad7ea9`, and it must be **re-measured** rather than trusted — it predates this branch.
 
-Record the new figures and **account for the increase against the tests this plan adds**: 4 (Task 1) + 2 (Task 2) + 13 (Tasks 3-4) + 4 (Task 5) + 9 (Task 6) + 3 (Task 7) + 4 (Task 8) = **39**. A total that is merely larger is not accounted for; a total that equals the re-measured baseline plus 39 is. If it does not match, find out why before claiming a pass — an unaccounted difference has twice been a real defect in this project.
+Record the new figures and **account for the increase against the tests this plan adds**: 5 (Task 1 — 4 unit plus the mismatched-container pinning test its review added) + 2 (Task 2) + 16 (Tasks 3-4) + 4 (Task 5) + 9 (Task 6) + 3 (Task 7) + 4 (Task 8) = **43**.
+
+**This figure has moved twice and will move again if a review adds a test — recount from the ledger rather than trusting this line.** It was 39 when the plan was written: Task 1's review added one pinning test, Task 3's review added two refusal tests, and Task 4 gained a parity test. The ledger records every such addition at the task that made it, so it is the authority and this number is a convenience.
+
+A total that is merely larger is not accounted for; a total that equals the re-measured baseline plus the ledger's sum is. If it does not match, find out why before claiming a pass — an unaccounted difference has twice been a real defect in this project.
 
 - [ ] **Step 6: Clippy over all targets, and fmt**
 
