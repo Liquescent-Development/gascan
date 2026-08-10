@@ -1,0 +1,26 @@
+[package]
+name = "gascan-arca"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+gascan-core = { path = "../gascan-core" }
+gascan-engine-proto = { path = "../gascan-engine-proto" }
+hyper-util.workspace = true
+prost.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tower.workspace = true
+
+[dev-dependencies]
+camino.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
+[lints]
+workspace = true

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use camino::Utf8PathBuf;
 use gascan_core::runtime::{
-    CreateRequest, OwnershipMetadata, RecreateRequest, RuntimeNetwork, RuntimePort,
+    CreateRequest, MANAGED_BY, OwnershipMetadata, RecreateRequest, RuntimeNetwork, RuntimePort,
     RuntimeResourceLimits, RuntimeUser,
 };
 use gascan_core::sandbox::SandboxId;
@@ -12,7 +12,6 @@ use thiserror::Error;
 
 use crate::CommandSpec;
 
-const MANAGED_BY: &str = "gascan";
 const WORKSPACE_TARGET: &str = "/workspace";
 
 #[derive(Clone)]

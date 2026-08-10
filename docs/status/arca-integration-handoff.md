@@ -2636,3 +2636,332 @@ a blanket retry, a confident drop, and a "trivial" approval.
 The common cause is not carelessness about facts; it is **describing an aggregate
 after examining one member of it.** The kickoff now lists that as the third
 instrument to have been confidently wrong here.
+
+---
+
+## Session of 2026-08-08 — P5.2 under way: Tasks 1-5 of 10 landed, and the plan was the defect source
+
+### What landed
+
+**P5.2 is HALF DONE and executing under subagent-driven development.** Branch
+`feat/gascan-arca`, pushed. Tasks 1-4 are complete with clean reviews. **Task 5 is
+implemented and reviewed but has ONE OPEN IMPORTANT FINDING — it is NOT complete.**
+Five tasks remain, and every remaining brief is staged and audited.
+
+**Task 5's open finding, and it must be closed before Task 6 is marked done.** Its
+field-placement test asserts rendered text for only **4 of the 12** accepted error
+codes. The other eight — `ownership_mismatch`, `foreign_resource_refused`,
+`not_found`, `command_io`, `invalid_output`, `invalid_state`, `resource_conflict`,
+`helper_error` — have no such assertion, so a `resource`↔`message` transposition in
+any of them passes all five tests, because `code()` is unaffected by which string
+fills which field. The reviewer hand-verified all eight are correct today, so this is
+a coverage gap and not a live bug. The fix: extend the test to all twelve, and flip
+at least two of the newly covered variants to prove it catches a swap.
+
+**That finding is the sixth instance of an instrument narrower than its claim, and
+the first where the narrow instrument was the FIX for a narrow instrument.** The
+field-placement test exists because a pre-dispatch audit caught the round-trip test
+asserting only `code()`. The fix for that gap was itself partial. **Check a fix as
+hard as you checked the defect.**
+
+| Artifact | Commit |
+|---|---|
+| Design spec, `docs/superpowers/specs/2026-08-08-gascan-arca-backend-design.md` | `372961a` |
+| Implementation plan, `docs/superpowers/plans/2026-08-08-gascan-arca.md` | `749c619` |
+| Task 1 — shared ownership rule published from `gascan-core` | `c980c7b` + fix `34eba01` |
+| Task 2 — `gascan-arca` crate and its `EngineTransport` seam | `fd02093` |
+| Task 3 — outbound mapping | `09050c3` + fix `0140511` |
+| Task 4 — inbound mapping | `a82e110` |
+| Task 5 — `EngineError` code table | `15251ae` |
+
+**VERIFIED figures, measured per crate rather than assumed:** `gascan-arca --lib`
+**21 passed, rc=0**; `gascan-apple` and `gascan-core` full suites clean;
+`cargo clippy -p gascan-arca --all-targets -- -D warnings -A dead_code` **rc=0**;
+`cargo fmt --all --check` **rc=0**. Every commit signed, `%G?` = `G`.
+
+**The workspace suite IS measured on this branch and it is GREEN. VERIFIED
+2026-08-08 at `139ee72`:** `cargo test --workspace --no-fail-fast` → **rc=0, 1410
+passed, 0 failed, 22 ignored**, 74 binaries, 0 failed binaries.
+
+**The increment is accounted for rather than merely larger:** 1382 (baseline at
+`5ad7ea9`) + 21 (`gascan-arca --lib`) + 2 (`transport_contract`) + 4
+(`gascan-core resource_ownership`) + 1 (`gascan-apple`'s mismatched-container
+pinning test) = **1410**.
+
+**An earlier run of that same suite at that same commit reported rc=101 with 59
+failures, and it was contention, not the product.** Every failure was in a
+`gascand`/`gascan-e2e` binary that spawns daemons and binds sockets; the log
+carried `elapsed=342.183846042s` for a single autostart and
+`AddrInUse: "daemon socket is live"`. It overlapped subagent cargo builds. **Do
+not run the full workspace suite while subagents are running cargo.** Partial
+reads of that run at 302 and 329 passed showed zero failures and read as
+reassuring only because the failures came later — one more instrument narrower
+than the claim it appeared to support.
+
+**That failing run was NOT a D7 occurrence even though it contained the D7
+test's name.** Its message was `did not become healthy and current (state
+Stopped)`, not `mode is not 0600 (mode 0200 ...)`, and `0200` appeared exactly
+once in the entire log. **Check the message, never the test name** — reading the
+name alone would have produced a confident, wrong report that D7 had finally
+fired, and unblocked a retry that is still correctly blocked.
+
+Task 10's accounting figure (47) remains a convenience — **the SDD ledger is the
+authority**, because reviews added tests four separate times.
+
+### Signing and transport moved OFF 1Password, for this repository only
+
+The maintainer was remote and could not unlock 1Password. Nothing global changed.
+
+| | |
+|---|---|
+| Key | `~/.ssh/gascan-signing`, ed25519, no passphrase — **forced**, since a passphrase would need the unlocking this exists to avoid |
+| GitHub | registered as a **signing** key, id `1101452` |
+| `user.signingkey` | `~/.ssh/gascan-signing`, `--local`. **A file PATH, not a literal key string — that is the whole mechanism.** `ssh-keygen` signs straight from the private key and consults no agent; the global config holds a literal key and still needs one |
+| Transport | `remote.origin.url` → https, `credential.https://github.com.helper` → `!gh auth git-credential`, both `--local` |
+| Also | `tag.gpgsign true` locally |
+
+**VERIFIED 2026-08-08 four ways, each with `env -u SSH_AUTH_SOCK` so the agent
+could not silently help:** `ssh-keygen -Y sign` rc=0; `-Y verify` returned
+`Good "git" signature`; a real commit reported `%G?` = `G` with fingerprint
+`SHA256:q6m/eNE…`; and GitHub reported `verified: true, reason: valid` on a pushed
+probe commit, since removed.
+
+Two facts read rather than assumed: `gh` holds `admin:ssh_signing_key` but **not**
+`admin:public_key`, which is why transport went to HTTPS instead of a second SSH
+key — it avoided a web-UI trip entirely. And the ruleset targets
+`~DEFAULT_BRANCH` only (`gh api /repos/.../rulesets/20492137`), so
+`required_signatures` gates `main`, not feature branches.
+
+**Unscheduled consequence, flagged not fixed:** a release tag cut from this
+machine while 1Password is locked will be signed by `gascan-signing`, and
+`engine/allowed-signers` — tracked, checked by `sync-arca-proto.sh` — knows only
+the 1Password key. P5.2 cuts no tags, so nothing is blocked.
+
+### The finding that matters: six defects, all in plan text, none in implementation
+
+**Every single defect this session came from the plan or spec I wrote, and not one
+came from an implementer's code.** That is worth stating plainly because it
+inverts where the review effort belongs.
+
+| Defect | Found by | Cost |
+|---|---|---|
+| `sandbox_id` became `None` for a `Mismatched` resource, breaking the reconciler's unfiltered `.find()` at `service.rs:3001-3012` and silently dropping an `OwnershipMismatch` finding | Task 1's implementer, which **flagged instead of complying** | 1 fix round |
+| The clippy gate: `-D warnings` cannot pass while `translate.rs` precedes its Task 6 consumer (17 lib / 13 lib-test `dead_code`) | Task 3's implementer, which **escalated instead of guessing** | 1 plan amendment |
+| Two of six refusals implemented but **untested** — read-only volume, mixed-sandbox remove | Task 3's reviewer, which traced it to the brief rather than blaming the implementer | 1 fix round |
+| **The same reverted rule still sitting in Task 4's brief**, ready to be reintroduced in the other backend | Pre-dispatch audit | 0 — caught before dispatch |
+| A round-trip test asserting only `code()`, blind to a transposed error field | Pre-dispatch audit | 0 |
+| Task 6: `create_container` and `remove` untested, and a test **named** `start_stop_…` that never called `stop` | Pre-dispatch audit | 0 |
+| Task 8: **no drop-cancellation test**, though the spec's §7 requires one | Pre-dispatch audit | 0 |
+
+**The lesson is the cheap end.** Three review rounds were spent on the first three;
+the last four cost nothing because the brief was audited before an implementer saw
+it. Auditing a brief takes minutes. A review round costs a dispatch, a fix, and a
+re-review.
+
+**The second lesson is that the instrument keeps being narrower than the claim** —
+five times, in five different costumes: a `grep | head -10` that returned exactly
+ten and read as complete; a test asserting `code()` while appearing to verify a
+mapping; a test **name** promising `stop`; stale test-count figures; and a grep
+for flip evidence whose pattern could not match the format the evidence was in,
+which nearly produced a false accusation against an implementer that had done the
+work correctly.
+
+### Corrections recorded in place, not edited away
+
+- **`995b413`** — the clippy gate is `-D warnings -A dead_code` for Tasks 3-7,
+  **on the command line only, never as an attribute**. An `#[allow(dead_code)]`
+  outlives the condition that justified it; a flag cannot rot. Task 8 restores the
+  plain gate because `exec_start` is the last function to gain a caller; Task 10's
+  workspace gate was always unconditional.
+- **`14bac45`** — Task 4's brief no longer carries the backend-splitting rule.
+- **`942fe9f`** — **every `crates/gascan-core/src/runtime.rs` line number in the
+  new design spec is STALE.** Task 1 added 58 lines to that file. Measured:
+  `from_resources` 944 → **1001**, `discovered` 503 → **554**,
+  `RuntimeError::code` 1056 → **1113**, `trait RuntimeBackend` 990 → **1047**.
+  The old numbers are deliberately kept — they are correct against `cf13a74` — with
+  a table of re-derived anchors beside them. **Cite symbols, not lines.**
+- **`cf13a74`** — the kickoff's "signing goes through 1Password" trap, struck
+  through with the new mechanism and its verification.
+
+### Still open, and none of it blocking
+
+- **Tasks 6-10 remain.** Task 6 is the largest (backend + fake + the sealed-request
+  `PolicyCompiler` fixture, 11 tests); 7 is `logs`; 8 is `exec` including the new
+  cancellation test; 9 is the `tonic` arm, which **ships with no tests by the
+  maintainer's explicit ruling** because the only thing that could answer it is a
+  Rust server, which is forbidden; 10 is mutation flips plus the workspace gate.
+- **Five deferred minors**, recorded in the ledger for the final whole-branch
+  review to triage. One is flagged as arguably under-rated: `runtime_sandbox`'s
+  unparseable-owner-label branch refuses correctly but has **no test**, and nothing
+  later in the plan covers it — the same class Task 3's review rated Important.
+- **One audit finding identified and deliberately NOT fixed**, so it is visible
+  rather than silently skipped: Task 7 has no test for a mid-stream
+  `TransportError` (as distinct from an engine error chunk), nor for a `LogsChunk`
+  with an unset `outcome`. Both paths exist in the specified code.
+- **D7 is untouched, on purpose.** No `0200` occurrence has fired since the
+  instrument landed. Note that a docs-only CI run **skips `rust` and `engine`
+  entirely** (`31262534703`), so a green docs run is not evidence about D7 at all.
+  Run `31262577806` was the first D7-capable run after the instrument; its result
+  was not collected. **Do not write the narrowed retry until a run names the state.**
+
+### Two process observations worth carrying
+
+**Subagents go idle without reporting.** It happened three times — an implementer
+mid-fix-round, and two reviewers. Silence was never treated as success: each time,
+`git log` and greps established the real state, and once the implementer had done
+nothing beyond an uncommitted edit. **Trust `git log`, not a report** — one
+implementer also claimed a nudge of mine was "stale" when direct verification at
+the time showed otherwise.
+
+**The cheap model tier worked where the plan carried complete code.** Task 5 ran
+on the cheapest tier and produced a clean result on the first pass, because its
+brief was transcription plus verification. Tasks needing judgment about existing
+code stayed a tier up.
+
+## Session of 2026-08-08 (second) — P5.2 complete: Tasks 5-10, and six instruments that were narrower than their claims
+
+### What landed
+
+**P5.2 IS DONE.** Tasks 5 through 10 closed, the final whole-branch review returned
+`request_changes` with two must-fix findings, both were fixed with mutation proofs, and
+the fix wave's re-review returned **merge**.
+
+**VERIFIED at `a9cb67c`, measured alone on an idle machine:** `cargo test --workspace
+--no-fail-fast` → **rc=0, 1433 passed, 0 failed, 22 ignored**; `cargo clippy --workspace
+--all-targets -- -D warnings` → rc=0 **with nothing allowed**; `cargo fmt --all --check`
+→ rc=0; `./scripts/ci-run-release-contracts.sh` → rc=0, **15/15**. Every commit signed,
+`%G?` = `G`.
+
+| Artifact | Commit |
+|---|---|
+| Task 5 fix — field placement for all 12 error codes | `3c5d310` |
+| Task 6 — `ArcaBackend` and the nine unary methods | `27c43c6` + `5f10d01` + `0cff066` |
+| Task 7 — `logs` | `b51fd57` + `56f6581` |
+| Task 8 — `exec`, and the plain clippy gate restored | `844a412` + `6ca97d8` |
+| Task 9 — `ChannelTransport`, the `tonic` arm | `8f849ec` + `10821dd` |
+| Task 10 — mutation flips and the workspace gate | no commits, by design |
+| Final fix wave | `7437889` + `a9cb67c` |
+
+### The plan was the defect source again, and auditing briefs caught four before dispatch
+
+**Not one defect came from an implementer's code.** Four came out of plan text and were
+caught by auditing the brief before dispatch; two of those would have failed their own
+task's tests.
+
+- **Task 6's brief validated both create paths with `CreateOutcome::new`.** That is wrong
+  in both directions: `new` requires the container *and* the managed network, so the
+  container-only response a recreate must answer with would have been rejected — the
+  task's own test would have failed — and `new` also *accepts* volumes and a network, so
+  a recreate that rebuilt resources the caller asked it to retain would have passed
+  silently. The brief's own test comment already named `for_recreate` while its code
+  called `new`; the contradiction was inside the document. Fixed with a `CreatePath` enum
+  and a paired test that feeds a full topology to `create_container` and requires a
+  refusal. The implementer later collapsed it back on purpose and measured: **two** tests
+  fail, one per direction.
+- **Task 8's staged brief was stale and omitted the drop-cancellation test entirely** —
+  the test the previous session added precisely because "without it the whole cancellation
+  path could be dead and every other exec test would still pass". A staged brief is a
+  cache of the plan and goes stale whenever the plan is amended. **Re-extract every brief
+  immediately before dispatch.**
+- **Task 9's Step 4 was titled "Clippy, fmt, and commit" and contained neither command**,
+  which mattered because Task 8 restores the plain gate — an implementer guessing would
+  most likely have re-added `-A dead_code`. It also said to add `tokio-stream`, which was
+  already a dependency, where a duplicate key is a manifest error rather than a no-op.
+- **Task 10 said nothing about running the suite alone**, which is how this session lost
+  a measurement.
+
+### Six instruments narrower than their claims, and what each cost
+
+This is the defect this project keeps paying for. Six instances in one session, each
+convincing until checked.
+
+| Instrument | What it actually checked | Caught by |
+|---|---|---|
+| Task 5's field-placement test | 4 of 12 error codes | inherited finding |
+| Task 6's capabilities fixture, all `true` | could not tell the rename from a hardcoded `true` | task review |
+| …its "fix", alternating `T,F,T,F,T,F` | still blind to 6 of 15 transpositions, and **no fixture anywhere set `project_mount: false`** | re-review |
+| Task 6's "must reach the engine exactly once" | `calls.first()` — a duplicate passed | task review |
+| Task 7's error-chunk test | scripted `command_failed`, the very variant a hardcode would produce | task review |
+| **Task 8's drop-cancellation test** | **nothing — every exit was cancellation-independent** | the implementer, under the required flip |
+
+The last is the deepest: that test was itself added, by the previous session's audit, **as
+the fix for a missing test**, and it could not fail for its stated reason. `drop(session)`
+drops the input sender as well as calling `cancel()`, so the pump exits via
+`inputs.recv() → None` with no cancellation involved; and `ExecSession::live` drops the
+watch sender, so `changed()` resolves `Err` forever and the guards never break but always
+resolve the select arm — which is why the *other* four tests failed under the briefed
+flip. Coverage by accident of a dropped-sender side effect. The implementer kept the test
+with an honest comment, added a sixth that holds the session open so cancellation is the
+pump's only available exit, and designed an isolating flip (`mem::forget(cancellation)`)
+under which exactly one test fails.
+
+### The final review found what ten tasks of review had missed
+
+**Seven of `v1::CreateRequest`'s eleven fields were pinned by nothing.** Reducing
+`create_request` to empty vectors, `resources: None`, `network: None`, `user: Root`,
+`init: false` left the crate at 48 passed — a mutation that ships the workspace **as root,
+with no init reaper, no resource limits and no network**. Two blind spots met: the backend
+test asserted only `sandbox_id` and two `is_some()` checks, and `create_request` was never
+called from a unit test at all, only its leaves — three of which were untested because
+they are infallible. The fix asserts all eight remaining fields, and the fixer went past
+the brief: it argued that gutting all seven at once only proves the first assertion, and
+ran **seven single-field mutations** as well.
+
+**And `runtime_sandbox`'s unparseable-label refusal was untested**, exactly as the Task 4
+note had feared. Replacing it with `.unwrap_or_else(|_| id.clone())` also left 48 green.
+Since `managed_by` is copied verbatim with no `MANAGED_BY` check on either backend, that
+`?` **is** the ownership guard on the inspect path. The mutant's own output is the
+argument: it returned `OwnershipMetadata { managed_by: "gascan", sandbox_id:
+SandboxId("observed-…") }` fabricated from a label of `"not a valid id"`.
+
+### The parity this branch exists to protect holds
+
+Both backends agree that a `Mismatched` resource still reports the `sandbox_id` it claims,
+each defended by its own test, and the reverted rule would fail both. The reviewer also
+established that the two crates agree on the **severity split** — inspect *refuses* an
+unparseable label while list/inventory downgrades it to `Mismatched` and continues — and
+that the `gascan-core` extraction is behaviour-preserving in `gascan-apple`, checked case
+by case, including that the dropped `annotation == id.as_str()` guard was always true
+because `SandboxId::try_from` stores its string verbatim.
+
+**What it did not do: share the rule.** It is still duplicated verbatim in both backends,
+each with a comment warning the two must not diverge. The classifier was extracted; the
+rule was not. P5.3 is the natural home.
+
+### Measurement, and how it was got wrong first
+
+A workspace measurement was **discarded** this session. Three suites ran concurrently
+against one target directory — two of them mine, launched at the same output path after I
+wrongly concluded the first had not started, plus one from another Claude session — and
+the result was rc=101 with 59 failures across ten `gascand`/`gascan-e2e` binaries, none
+real. My own diagnostic had truncated the shared output file with `>` before I reasoned
+from it. Run alone, the same suite takes **93 seconds**.
+
+Task 10 then found the instrument itself was wrong: **counting `test result:` lines
+overcounts**, because three of the 76 come from child processes re-executing a binary with
+a filter. They are identifiable — a plain `cargo test --workspace` applies no filter, so
+genuine targets report `0 filtered out`. Summing only those gives 73 lines for 73 targets.
+
+### Two sessions on one branch
+
+Another Claude session worked this repository throughout, and it cost real friction: a fix
+commit's parent was that session's docs commit rather than the previous task's head, so a
+review package silently contained someone else's work until the commit count gave it away;
+and late in the session two agents wrote to the same file, one running `git checkout
+<path>` to undo its own edit — **which discards every uncommitted change to that path**.
+No work was lost, but only because it was checked. The cause was mine: a tracker task
+owned by the reviewer carried controller instructions, so it began work already assigned
+elsewhere.
+
+### Conventions worth carrying
+
+- **Derive a review base from `git log -1 --format='%p'`, never from the previous task's
+  head**, when more than one writer touches the branch.
+- **Verify the controller's claims too.** My fix-wave dispatch asserted the fixture
+  "already produces a request with all of them populated"; `ports` was empty, and had the
+  fixer trusted me the assertion would have been vacuous — the exact defect the wave
+  existed to close.
+- **Prose outran its numbers twice**, and a reviewer caught it both times by reading the
+  figures rather than the sentence: a fixture comment claiming to catch any flag swap, and
+  an A/B proof described as showing truncation when its own counts were the expected final
+  ones. Corrections were recorded in place rather than edited away.

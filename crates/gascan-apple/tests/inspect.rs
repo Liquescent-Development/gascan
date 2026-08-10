@@ -162,6 +162,26 @@ async fn mixed_list_classifies_owned_foreign_and_mismatched_resources() {
 }
 
 #[tokio::test]
+async fn a_mismatched_container_still_reports_the_sandbox_id_it_claims() {
+    let resources = inspector(output(include_bytes!(
+        "fixtures/container-list-mixed-1.0.json"
+    )))
+    .list_resources()
+    .await
+    .unwrap();
+    let collision = resources
+        .iter()
+        .find(|resource| resource.name() == "collision-222222222222")
+        .expect("the fixture carries a name/label collision");
+    assert_eq!(collision.ownership(), ResourceOwnership::Mismatched);
+    assert_eq!(
+        collision.sandbox_id().map(SandboxId::as_str),
+        Some("other-333333333333"),
+        "the reconciler finds a mismatched container by the id it claims",
+    );
+}
+
+#[tokio::test]
 async fn foreign_container_names_do_not_have_to_be_valid_sandbox_ids() {
     let resources = inspector(output(
         br#"[{"configuration":{"id":"bleh","labels":{}},"status":{"state":"stopped"}}]"#,

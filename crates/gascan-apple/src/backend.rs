@@ -4,9 +4,10 @@ use async_trait::async_trait;
 use gascan_core::{
     runtime::{
         ContainerState, CreateFailure, CreateOutcome, CreateRequest, ExecCancellation, ExecInput,
-        ExecOutput, ExecRequest, ExecSession, RecreateRequest, RemoveRequest, ResourceIdentity,
-        ResourceKind, ResourceOwnership, RuntimeBackend, RuntimeCapabilities, RuntimeError,
-        RuntimeResource, RuntimeSandbox,
+        ExecOutput, ExecRequest, ExecSession, MANAGED_BY, MANAGED_BY_LABEL, RecreateRequest,
+        RemoveRequest, ResourceIdentity, ResourceKind, ResourceOwnership, RuntimeBackend,
+        RuntimeCapabilities, RuntimeError, RuntimeResource, RuntimeSandbox, SANDBOX_ID_LABEL,
+        SandboxLabel, classify_resource_ownership,
     },
     sandbox::SandboxId,
 };
@@ -16,10 +17,6 @@ use crate::{
     AppleAttach, AppleCommandBuilder, AppleInspector, AppleProbe, AttachInput, AttachOutput,
     CommandRunner, CommandSpec, TranslationError,
 };
-
-const MANAGED_BY: &str = "gascan";
-const MANAGED_BY_LABEL: &str = "dev.gascan.managed-by";
-const SANDBOX_ID_LABEL: &str = "dev.gascan.sandbox-id";
 
 pub struct AppleBackend<R> {
     runner: R,
@@ -78,7 +75,18 @@ impl<R: CommandRunner + Clone> AppleBackend<R> {
                 .map(|value| SandboxId::try_from(value.clone()))
                 .transpose()
                 .map_err(|error| invalid_output("container volume list", error.to_string()))?;
-            let ownership = classify(sandbox_id.as_ref(), &record.configuration.labels);
+            let ownership = classify_resource_ownership(
+                ResourceKind::Volume,
+                &record.id,
+                record
+                    .configuration
+                    .labels
+                    .get(MANAGED_BY_LABEL)
+                    .map(String::as_str),
+                sandbox_id
+                    .as_ref()
+                    .map_or(SandboxLabel::Absent, SandboxLabel::Parsed),
+            );
             let identity = ResourceIdentity::new(ResourceKind::Volume, record.id)?;
             resources.push(RuntimeResource::discovered(identity, sandbox_id, ownership));
         }
@@ -105,7 +113,18 @@ impl<R: CommandRunner + Clone> AppleBackend<R> {
                 .map(|value| SandboxId::try_from(value.clone()))
                 .transpose()
                 .map_err(|error| invalid_output("container network list", error.to_string()))?;
-            let ownership = classify(sandbox_id.as_ref(), &record.configuration.labels);
+            let ownership = classify_resource_ownership(
+                ResourceKind::Network,
+                &record.id,
+                record
+                    .configuration
+                    .labels
+                    .get(MANAGED_BY_LABEL)
+                    .map(String::as_str),
+                sandbox_id
+                    .as_ref()
+                    .map_or(SandboxLabel::Absent, SandboxLabel::Parsed),
+            );
             let identity = ResourceIdentity::new(ResourceKind::Network, record.id)?;
             resources.push(RuntimeResource::discovered(identity, sandbox_id, ownership));
         }
@@ -645,21 +664,6 @@ struct NetworkConfiguration {
     name: String,
     #[serde(default)]
     labels: BTreeMap<String, String>,
-}
-
-fn classify(id: Option<&SandboxId>, labels: &BTreeMap<String, String>) -> ResourceOwnership {
-    match (
-        labels.get(MANAGED_BY_LABEL).map(String::as_str),
-        labels.get(SANDBOX_ID_LABEL),
-        id,
-    ) {
-        (Some(MANAGED_BY), Some(annotation), Some(id)) if annotation == id.as_str() => {
-            ResourceOwnership::GasCanOwned
-        }
-        (None, None, None) => ResourceOwnership::Foreign,
-        (Some(manager), _, _) if manager != MANAGED_BY => ResourceOwnership::Foreign,
-        _ => ResourceOwnership::Mismatched,
-    }
 }
 
 fn translation_error(error: TranslationError) -> RuntimeError {
