@@ -2965,3 +2965,15 @@ elsewhere.
   figures rather than the sentence: a fixture comment claiming to catch any flag swap, and
   an A/B proof described as showing truncation when its own counts were the expected final
   ones. Corrections were recorded in place rather than edited away.
+
+### Merged
+
+**PR #67 merged to `main` as `bd412b4` on 2026-08-10**, a true merge commit with parents
+`c9211e2` and `1d59933` — verified as a merge rather than a squash or rebase, both of
+which the rulesets forbid. `main` had not advanced since the branch point, so
+`bd412b4`'s tree is **byte-identical** to the verified tip `1d59933` and the figures
+above describe `main` as it stands rather than a commit that no longer exists.
+
+The SDD ledger for this plan was deleted on merge, which is its intended lifecycle.
+Everything durable was folded into this document first; `git log --oneline c9211e2..bd412b4`
+carries the rest.

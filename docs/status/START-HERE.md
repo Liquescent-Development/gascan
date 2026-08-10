@@ -3,15 +3,19 @@
 This file is the session entry point. It is written to be read cold, and it is
 addressed to you, the agent. Follow it as instructions — there is nothing to paste.
 
-Written 2026-08-08 at commit `a9cb67c`, branch `feat/gascan-arca`.
+Written 2026-08-10, describing `main` at commit `bd412b4`.
 
 ---
 
-**P5.2 IS COMPLETE.** All ten tasks landed, the final whole-branch review returned
-`request_changes`, both must-fix findings were fixed with mutation proofs, and the fix
-wave's re-review returned **merge**. The branch is pushed and ready.
+**P5.2 IS COMPLETE AND MERGED.** All ten tasks landed, the final whole-branch review
+returned `request_changes`, both must-fix findings were fixed with mutation proofs, the
+fix wave's re-review returned **merge**, and PR #67 merged to `main` as `bd412b4` on
+2026-08-10 — a true merge commit with two parents, not a squash or a rebase.
 
-**VERIFIED at `a9cb67c`, measured alone on an otherwise idle machine:**
+**There is nothing to finish on that branch. Do not re-run P5.2, and do not look for the
+SDD ledger — it was deleted on merge, because git history is the record now.**
+
+**VERIFIED on the merged tree, measured alone on an otherwise idle machine:**
 
 | Gate | Result |
 |---|---|
@@ -20,16 +24,23 @@ wave's re-review returned **merge**. The branch is pushed and ready.
 | `cargo fmt --all --check` | rc=0 |
 | `./scripts/ci-run-release-contracts.sh` | rc=0, **15/15** |
 
-1433 accounts for itself: 1432 measured at `10821dd`, plus the one test the final fix
-wave added. **Count only `test result:` lines reporting `0 filtered out`** — see the
-instrument trap below.
+Those figures were measured at `1d59933`, and **`bd412b4`'s tree is byte-identical to
+it** (`git diff 1d59933 bd412b4` is empty) because `main` had not advanced since the
+branch point — so they describe `main` as it stands, rather than a commit that no longer
+exists. **Re-measure anyway before you rely on them**; they are true of `bd412b4` and
+nothing later.
 
-## If the branch is not yet merged, that is your first task
+1433 accounts for itself: 1382 baseline at `5ad7ea9` plus 53 this branch added,
+method-independent. **Count only `test result:` lines reporting `0 filtered out`** — see
+the instrument trap below.
 
-Use `superpowers:finishing-a-development-branch`. **Merge only — never squash, never
-rebase, and only via a PR. Never commit to `main`.** Both repositories forbid squash-
-and rebase-merge. The permission classifier refuses `gh pr merge`; ask the maintainer to
-run it with `!`.
+## Merging, when you get there
+
+**Merge only — never squash, never rebase, and only via a PR. Never commit to `main`.**
+Both repositories forbid squash- and rebase-merge. The permission classifier refuses
+`gh pr merge`; ask the maintainer to run it with `!`. Use
+`superpowers:finishing-a-development-branch` to present the options rather than choosing
+for them.
 
 ## What P5.2 built
 
@@ -156,7 +167,10 @@ failing run containing the D7 test's *name* is not a D7 occurrence — check the
 ## Where the detail lives
 
 `docs/status/arca-integration-handoff.md`, from `## Session of 2026-08-08 (second)`, and
-`docs/status/next-session-kickoff.md` for the full trap list. The SDD ledger at
-`.superpowers/sdd/2026-08-08-gascan-arca/progress.md` recorded every ruling and deviation
-during execution; it is deleted once the branch merges, because git history is the record
-from then on.
+`docs/status/next-session-kickoff.md` for the full trap list.
+
+The SDD ledger that recorded every ruling and deviation during P5.2's execution
+(`.superpowers/sdd/2026-08-08-gascan-arca/progress.md`) **was deleted when the branch
+merged** — that is the intended lifecycle, not a loss. Everything durable from it was
+folded into the handoff before deletion. If you need execution detail it does not carry,
+`git log --oneline c9211e2..bd412b4` and the commit messages are the record.
