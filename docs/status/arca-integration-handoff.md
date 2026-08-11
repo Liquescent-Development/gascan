@@ -2977,3 +2977,125 @@ above describe `main` as it stands rather than a commit that no longer exists.
 The SDD ledger for this plan was deleted on merge, which is its intended lifecycle.
 Everything durable was folded into this document first; `git log --oneline c9211e2..bd412b4`
 carries the rest.
+
+## Session of 2026-08-10/11 — P5.1 milestone 1: the engine exists and serves
+
+**Read `docs/superpowers/specs/2026-08-10-p5-1-engine-service-and-wiring-design.md` first.** It
+carries every decision and its rationale. This section carries only what that document cannot:
+what happened, what is unfinished, and what will bite the next session.
+
+### What P5.1 turned out to be
+
+Three documents named P5.1 differently and the difference was a whole deliverable. The roadmap
+(`:374`) and this handoff (`:885`) said "implement the engine service in Swift"; START-HERE said
+"wire the backend to the daemon". **It is both**, and the design document supersedes the narrower
+readings. The Swift engine did not exist — at Arca `e68ac5c`, `Sources/SandboxEngineProto/` held
+two generated files and `Package.swift:84-87` said so deliberately. Wiring `gascand` alone could
+not have answered a single claim `START-HERE` recorded as unverified, because nothing was
+listening on the other end of the socket.
+
+Milestone 1 of four. The plan is
+`docs/superpowers/plans/2026-08-10-p5-1-milestone-1-engine-skeleton.md`; milestones 2-4 are
+outlined at its end and are to be planned when their predecessor lands, not before.
+
+### State
+
+**Arca** (`~/code/arca`, branch `feat/sandbox-engine`, **not pushed, no PR**):
+
+| Commit | What |
+|---|---|
+| `bc03394` | `ArcaEngine` target and its fixed twelve-code error vocabulary |
+| `8fa86ca` | The eleven-method service surface; every method answers rather than throwing |
+| `5956c49` | Identity and owner-label rules |
+| `a4f11c3` | `Capabilities`, claiming only what the build implements |
+| `c08e668` | `Inspect`, with an absent arm and exact digests |
+| `d25b2b3` | `ListResources`, labelled resources and unlabelled alike |
+| `e74aff0` | `EngineServer` over a Unix socket, and the `arca-engine` executable |
+| `8fc1ca5` | Constrain grpc-swift-2 below 2.4 — see the blocker below |
+
+All seven task commits passed an independent review that verified claims against source rather
+than accepting the implementer's word. 27 tests pass (`swift test --filter ArcaEngineTests`).
+
+**THE ENGINE GENUINELY RUNS.** VERIFIED by running it: `swift run arca-engine --socket-path …
+--state-root …` logged `engine listening` and created the socket as `srw-------` (0600, owner
+`kiener`). That is the thing which did not exist anywhere before this session.
+
+**Gas Can** (`~/code/gascan`, branch `docs/p5-1-engine-design`): design doc `33d37f9`, naming
+precondition `4981b39`, plan `77ff591`, signing-constraint correction `b36d18f`. Task 8's edit to
+`scripts/build-arca-engine.sh` was in progress at handoff. Tasks 9, 10 and 11 are untouched.
+
+### THE BLOCKER THAT MUST NOT BE FORGOTTEN
+
+**Gas Can's committed `engine/arca-pin.json` still names `gascan-engine-proto-v1` at `77b293e` —
+a revision with no engine.** Everything above was built against a *development* pin at
+`.artifacts/arca-dev-pin.json`, which names a `file:///Users/kiener/code/arca` URL and a local
+`gascan-engine-dev` tag. `.artifacts/` is gitignored, so none of that is committed, and it is
+worthless on any other machine.
+
+Before anything merges: push `feat/sandbox-engine` to `Vas-Solutus/arca`, create a real signed
+tag there, and bump `engine/arca-pin.json` to it. Until then CI (`.github/workflows/ci.yml:91`)
+builds the pre-engine revision.
+
+### The dependency defect Gas Can's pinned build exposed
+
+`swift build --product arca-engine` failed from a clean checkout with:
+
+```
+error: Disabled default traits by package 'grpc-swift-2' on package 'swift-protobuf'
+that declares no traits.
+```
+
+grpc-swift-2 2.4.2 declares `traits: []` on swift-protobuf 1.32.0, which declares none; Swift
+6.3.3 rejects that combination. **It only appears when building an executable product from a
+clean checkout** — library-target builds resolve fine, which is why it stayed hidden until the
+pinned build began producing a binary rather than merely compiling targets. Fixed in `8fc1ca5` by
+a root-level constraint pinning grpc-swift-2 to `"2.3.0"..<"2.4.0"`; the whole package builds
+clean at 2.3.0 (VERIFIED, `swift build --configuration release` exit 0, zero errors).
+
+**Unexplained, and set aside deliberately:** the source tree resolves 2.4.2 successfully while an
+identical clean clone of the same revision does not. `diff -rq` between them shows only docs,
+build artifacts, and an empty `containerization/.local/integration-cache`. Whatever the mechanism,
+it means *the source tree is not a reliable predictor of what the pinned build will do.* Verify
+against a clean clone, not against `~/code/arca`.
+
+### Traps this session paid for
+
+**THE PLAN'S SWIFT WAS WRONG NINE TIMES, AND THE HEDGES ARE WHY IT COST NOTHING.** Every block the
+plan marked "a best reading, not verified" — with the exact command to confirm it — turned out
+wrong, and each surfaced as a directed correction instead of a fix round. `Container.state` is a
+struct, not a string; `Container.image` is top-level; `ContainerSummary` has `names: [String]`;
+**those names carry a leading `/`** which would have made every owned container look unrelated to
+its sandbox and broken drift detection silently; ContainerBridge has seven status strings and
+`"stopped"` is not one of them; `swift build --product` and `--target` are mutually exclusive; a
+permissions assertion mis-parsed because `&` binds tighter than `??`; a stale-socket test fixture
+created a regular file, which the code under test correctly refuses to unlink, so the test would
+have failed against the property it existed to prove; `syncShutdownGracefully()` is `noasync` and
+the test never compiled; and `sun_path` is capped at 103 bytes, which `NSTemporaryDirectory()`
+paths exceed. **Write plans that say where you are guessing.**
+
+**AN IDLE NOTIFICATION IS NOT DEATH, AND AN EMPTY AGENT ROSTER IS NOT PROOF OF DEATH.** A Task 7
+implementer went idle mid-work with its output uncommitted; `ListAgents` reported no reachable
+agents; a replacement was dispatched and the two collided in the same files. The second caught it
+from one file changing between two Reads and stopped to ask, which is the only reason it cost
+nothing. **Check file mtimes before re-dispatching a task whose work is already on disk.**
+
+**1PASSWORD ANSWERS `ssh-add -l` WITHOUT APPROVAL BUT REFUSES TO SIGN WITHOUT IT.** "The agent
+lists the key" is not evidence that signing will work. This produced two wrong diagnoses — first
+that the key was missing from the machine entirely, then that a reachable agent meant a working
+one. Signing in Arca needs a human at the keyboard.
+
+**SIGNING IS INVERTED BETWEEN THE TWO REPOSITORIES.** Gas Can's key is a file path, so commits
+need `env -u SSH_AUTH_SOCK`. Arca's key lives in 1Password, so commits need the agent and
+`env -u SSH_AUTH_SOCK` breaks them. One rule for both aborts every commit in one of them.
+
+**A SUBAGENT CANNOT SUSTAIN A MULTI-MINUTE BACKGROUND BUILD.** Two attempts died when the
+subagent's session paused, the second leaving the build script's `mkdir` lock held — and that lock
+fails closed by design, so every later run exited 75 until it was cleared. Long builds belong in
+the controller session, whose background tasks survive across turns.
+
+### For Task 9, before it is written
+
+The 103-byte `sun_path` limit applies to the Rust live harness too. Its socket lives under
+`tempfile::tempdir()`, which on macOS is `/var/folders/<…>/T/<…>`; a measured path came to 74
+bytes, so there is headroom but not much. Build the socket path under a short root and assert its
+length before binding, rather than meeting the limit as a mystery bind failure.
