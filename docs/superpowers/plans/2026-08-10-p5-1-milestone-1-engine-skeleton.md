@@ -16,7 +16,11 @@ Every task's requirements implicitly include this section.
 
 - **Repositories.** Arca work is in `~/code/arca`; Gas Can work is in `~/code/gascan`. They are separate git repositories with separate branches and separate PRs.
 - **Never commit to `main`** in either repository. Work on a branch; land via PR; **merge only — never squash, never rebase.**
-- **Commit with `env -u SSH_AUTH_SOCK git commit`.** `user.signingkey` is a file path (`~/.ssh/gascan-signing`), so no agent is needed. **Never `--no-gpg-sign`.** Verify `git log --format='%G?' -1` prints `G`. No co-author trailer and no mention of any AI tool in any commit message.
+- **Signing differs by repository, and getting it backwards breaks every commit.**
+  - **Gas Can:** commit with `env -u SSH_AUTH_SOCK git commit`. `user.signingkey` is a file path (`~/.ssh/gascan-signing`), so no agent is needed.
+  - **Arca:** commit with plain `git commit`. `user.signingkey` is a literal public key held in 1Password, so signing **requires** `SSH_AUTH_SOCK` — stripping it makes every commit abort with `unable to sign`.
+  - Signing may block on a 1Password approval prompt. A commit that fails with `unable to sign` is waiting for that approval, not misconfigured; ask rather than working around it.
+  - **Never `--no-gpg-sign`**, and never a lightweight tag. Verify `git log --format='%G?' -1` prints `G`. No co-author trailer and no mention of any AI tool in any commit message.
 - **`RUSTUP_TOOLCHAIN=1.95.0` is exported and overrides `rust-toolchain.toml`.** Prefix every cargo command with `env -u RUSTUP_TOOLCHAIN`. Use `--no-fail-fast`. Confirm the `running N tests` line — a mistyped test name silently runs zero and exits 0. `cargo clippy --fix` is prohibited in this repository.
 - **`ls` is aliased to something that rejects trailing-slash paths.** Use `find` or `git ls-files`.
 - **`ArcaEngine` must not depend on `DockerAPI` or `ArcaDaemon`.** Task 11 makes this checkable; do not add the edge to make something compile.
