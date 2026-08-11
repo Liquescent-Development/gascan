@@ -1,5 +1,16 @@
 # Kickoff — next session
 
+> **SUPERSEDED 2026-08-11. DO NOT FOLLOW THIS DOCUMENT'S INSTRUCTIONS.**
+>
+> It tells you to finish P5.2, which merged as `bd412b4` on 2026-08-10. It names
+> `feat/gascan-arca`, which no longer exists, and an SDD ledger at
+> `.superpowers/sdd/2026-08-08-gascan-arca/progress.md`, which was deleted on merge.
+>
+> **`docs/status/START-HERE.md` is the entry point**, and
+> `docs/status/arca-integration-handoff.md` (from `## Session of 2026-08-10/11`) is the
+> current record. This file is retained only for the historical traps below that have
+> not been restated elsewhere; every claim it makes about *state* is wrong.
+
 > **The session entry point is now `docs/status/START-HERE.md`.** Point a new agent at
 > that file and tell it to follow the instructions; it needs nothing pasted. This
 > document is what START-HERE sends it to read — the traps, the still-open items, and

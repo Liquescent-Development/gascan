@@ -1593,10 +1593,20 @@ use std::time::Duration;
 /// It kills streams, resets mid-exec, and kills the engine under an open
 /// call, and a supervisor whose job is to react to exactly those events
 /// would be fighting the tests. Supervision is exercised by `gascan-e2e`.
+static SOCKET_SEQUENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 pub struct LiveEngine {
     child: tokio::process::Child,
     socket: Utf8PathBuf,
+    socket_root: Utf8PathBuf,
     _root: tempfile::TempDir,
+}
+
+impl Drop for LiveEngine {
+    /// The socket root is outside the `TempDir`, so nothing else removes it.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.socket_root);
+    }
 }
 
 impl LiveEngine {
@@ -1612,9 +1622,29 @@ impl LiveEngine {
         );
         let root = tempfile::tempdir().unwrap();
         let path = Utf8Path::from_path(root.path()).unwrap().to_owned();
-        let socket = path.join("engine.sock");
         let state = path.join("state");
         std::fs::create_dir_all(&state).unwrap();
+
+        // The socket does NOT live under the temp dir, and that is deliberate.
+        // `sun_path` is capped at 103 bytes (swift-nio asserts it explicitly in
+        // NIOCore/SocketAddresses.swift), and macOS temp dirs are
+        // /var/folders/<...>/T/<...> -- a measured path came to 74 bytes, which
+        // fits but leaves little room. Arca's own tests hit this exact wall
+        // during Task 7 and had to move to /tmp. Build the socket path under a
+        // short root and assert the length rather than meeting the cap as a
+        // mystery bind failure.
+        let socket_root = Utf8PathBuf::from(format!(
+            "/tmp/gascan-arca-live-{}-{}",
+            std::process::id(),
+            SOCKET_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&socket_root).unwrap();
+        let socket = socket_root.join("engine.sock");
+        assert!(
+            socket.as_str().len() <= 103,
+            "socket path is {} bytes, over sun_path's 103-byte cap: {socket}",
+            socket.as_str().len()
+        );
 
         let child = tokio::process::Command::new(&binary)
             .arg("--socket-path")
@@ -1628,6 +1658,7 @@ impl LiveEngine {
         let engine = Self {
             child,
             socket,
+            socket_root,
             _root: root,
         };
         engine.await_socket().await;
