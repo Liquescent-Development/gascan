@@ -20,7 +20,7 @@ tower.workspace = true
 [dev-dependencies]
 camino.workspace = true
 tempfile = "3"
-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "process", "rt", "rt-multi-thread", "sync", "time"] }
 
 [lints]
 workspace = true
