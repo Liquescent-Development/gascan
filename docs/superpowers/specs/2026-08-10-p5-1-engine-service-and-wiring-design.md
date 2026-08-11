@@ -218,9 +218,19 @@ fails validation client-side, so this is a hard interface.
   (`crates/gascan-core/src/runtime.rs:55`) and `sandbox_id` equal to the request's id,
   stored verbatim and never interpreted (`engine.proto:144-148`).
 
-**Unverified and to be checked before implementation:** whether `ContainerBridge`'s
-container-name validation accepts every `SandboxId` shape. If it does not, that is a
-constraint on the naming rule and must be resolved before the create path is written.
+**RESOLVED 2026-08-10 — no constraint.** A `SandboxId` is `<slug>-<12 lowercase hex>`,
+the slug being lowercase ASCII alphanumerics with single interior hyphens, no leading or
+trailing hyphen and no `--` (`crates/gascan-core/src/sandbox.rs:168-198`). ContainerBridge
+applies no container-name grammar validation: `createContainer(name: String?)` takes the
+string as given (`Sources/ContainerBridge/ContainerManager.swift:1514-1516`), and the only
+two `CharacterSet` uses in that file are unrelated — a CPU-set parser at `:1615` and hex
+short-ID prefix matching at `:1933` (VERIFIED, `grep -n "CharacterSet\|NSRegular\|regex"`
+reports exactly those two).
+
+The hyphen is load-bearing and must stay. `resolveContainerID` treats any 4-63 character
+all-hex string as a short container ID (`ContainerManager.swift:1930-1934`); `-` is not in
+that character set, so a sandbox id cannot be misread as one. A future id format without a
+hyphen would collide silently.
 
 ## 5. Per-RPC behaviour
 
