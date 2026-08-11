@@ -3021,8 +3021,20 @@ than accepting the implementer's word. 27 tests pass (`swift test --filter ArcaE
 `kiener`). That is the thing which did not exist anywhere before this session.
 
 **Gas Can** (`~/code/gascan`, branch `docs/p5-1-engine-design`): design doc `33d37f9`, naming
-precondition `4981b39`, plan `77ff591`, signing-constraint correction `b36d18f`. Task 8's edit to
-`scripts/build-arca-engine.sh` was in progress at handoff. Tasks 9, 10 and 11 are untouched.
+precondition `4981b39`, plan `77ff591`, signing-constraint correction `b36d18f`, handoff
+`ba15c51`, and Task 8 as `f75d069`. Tasks 9, 10 and 11 are untouched.
+
+`f75d069` is the one task in this plan that was **never task-reviewed** — it was verified by the
+controller end to end (shellcheck clean, exit 0, exactly two stdout lines, 27 tests, binary runs)
+but no independent reviewer looked at it. Dispatch one before trusting it the way the other seven
+can be trusted.
+
+A tenth plan defect surfaced there, and it is the nastiest class: **a green suite reported as a
+failed build.** `swift test --configuration release` passes all 27 tests, then SwiftPM launches
+the swift-testing runner by invoking an executable target with `--test-bundle-path`; Arca's
+`Arca` command is an ArgumentParser program, rejects the unknown option, and the script exits
+non-zero. Anyone reading the exit code alone would conclude the engine's tests were broken. Fixed
+with `--disable-swift-testing`, since the package has no swift-testing tests.
 
 ### THE BLOCKER THAT MUST NOT BE FORGOTTEN
 

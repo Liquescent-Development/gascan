@@ -38,15 +38,20 @@ methods answer `unsupported_capability` until later milestones.
 
 ### Gas Can — `~/code/gascan`, branch `docs/p5-1-engine-design`
 
-Design, plan, and corrections committed (`33d37f9`, `4981b39`, `77ff591`, `b36d18f`).
-Task 8 (the build script) was mid-flight at handoff. **Tasks 9, 10 and 11 are untouched**
-— the live-test harness, live coverage of the three implemented RPCs, and the contract
-test asserting `ArcaEngine` reaches neither `DockerAPI` nor `ArcaDaemon`.
+Design, plan, and corrections committed (`33d37f9`, `4981b39`, `77ff591`, `b36d18f`), and
+**Task 8 committed as `f75d069`** — `scripts/build-arca-engine.sh` now builds the engine
+product, runs its tests inside the verified clean checkout, and prints the binary path as a
+second stdout line. VERIFIED end to end by the controller: shellcheck clean, exit 0, exactly
+two stdout lines, 27 tests, and the binary runs. **It has NOT been task-reviewed** — every
+other task in this plan passed an independent review and this one has not.
+
+**Tasks 9, 10 and 11 are untouched** — the live-test harness, live coverage of the three
+implemented RPCs, and the contract test asserting `ArcaEngine` reaches neither `DockerAPI`
+nor `ArcaDaemon`.
 
 ## What to do next
 
-1. Finish and review Task 8 if it is not committed. Check `git status` and
-   `git log --oneline -3` before assuming either way.
+1. Dispatch a task review for Task 8 (`f75d069`), the one task that never got one.
 2. Tasks 9, 10, 11 from the plan. Use `superpowers:subagent-driven-development`.
 3. Then milestone 2, which is outlined at the end of the plan and is to be *planned* when
    milestone 1 lands — not before, because its tasks depend on what milestone 1 found.
