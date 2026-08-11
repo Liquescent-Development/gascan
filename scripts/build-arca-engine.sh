@@ -98,15 +98,44 @@ git -C "$checkout" -c 'url.https://github.com/.insteadOf=git@github.com:' \
 # stdout and corrupt the checkout path this script contracts to print there.
 git -C "$checkout" submodule foreach --quiet --recursive git clean -qffdx
 
-# Targets, not products, deliberately — ContainerBridge is the line that changes
-# when P5.1 lands an engine executable.
+# The engine product, plus SandboxEngineProto so the generated server half is
+# proven to build rather than merely proven to have been emitted —
+# crates/gascan-engine-proto generates a client from the same revision, so
+# without this the pinned server end would be the only one nothing compiled.
 #
-# SandboxEngineProto is the generated server code for the contract this pin
-# exists to carry. Building it here is what makes the pin's claim checkable from
-# this side: crates/gascan-engine-proto generates a client from the same revision
-# and compiles it, so without this the pinned server half would be the only end
-# of the contract nothing ever compiled.
+# ContainerBridge is no longer named: arca-engine reaches it transitively, and
+# naming it separately would hide the day that edge disappears.
+#
+# Two invocations, not one: `swift build` rejects --product and --target in
+# the same call ("mutually exclusive"), and arca-engine is selected by
+# product while SandboxEngineProto has no product of its own to select by.
+# Both share the same .build directory, so the second call is incremental.
 swift build --package-path "$checkout" --configuration release \
-  --target ContainerBridge --target SandboxEngineProto >&2
+  --product arca-engine >&2
+swift build --package-path "$checkout" --configuration release \
+  --target SandboxEngineProto >&2
 
-printf '%s\n' "$checkout"
+# Arca has no CI, so nothing else ever runs the engine's own tests and they
+# would rot unnoticed. This is a clean checkout of the signed tag, which makes
+# it the right place: it proves the pinned engine passes its own suite rather
+# than proving a developer's working tree did.
+#
+# --configuration release, matching the build above: leaving this unconfigured
+# would make SwiftPM build the whole package a second time in debug, and this
+# package vendors containerization, so that would be a very expensive mistake.
+#
+# --disable-swift-testing because the package has no swift-testing tests, and
+# in release SwiftPM launches that runner by invoking an executable target with
+# --test-bundle-path. Arca's `Arca` executable is an ArgumentParser command, so
+# it rejects the unknown option and the run exits non-zero with every XCTest
+# passing -- a green suite reported as a failed build.
+swift test --package-path "$checkout" --configuration release \
+  --disable-swift-testing --filter ArcaEngineTests >&2
+
+binary=$checkout/.build/release/arca-engine
+[[ -x $binary ]] || {
+  printf 'engine build produced no executable at %s\n' "$binary" >&2
+  exit 70
+}
+
+printf '%s\n%s\n' "$checkout" "$binary"
