@@ -122,6 +122,24 @@ git -C "$upstream" tag unsigned-tag "$pinned"
 git -C "$upstream" -c "user.signingKey=$fixture/intruder" \
   tag -s -m 'intruder' wrong-signer-tag "$pinned"
 
+# The two halves of the resolution-ambiguity attack, described at the verify-tag
+# call in scripts/build-arca-engine.sh. Git resolves a bare name by trying
+# $GIT_DIR/<name>, then refs/<name>, and only then refs/tags/<name>, so an
+# unqualified name in the signature gate and a refs/tags/ name in the identity
+# gate can land on two different objects.
+#
+# Slash half: a signed refs/tags/ambiguous on the good commit, and an unsigned
+# lightweight refs/tags/tags/ambiguous on the drifted one. A pin naming
+# "tags/ambiguous" with the drifted revision satisfies both gates while the
+# signature that was checked belongs to an object with no relation to the tree.
+# `git fetch --tags` brings both refs down, so this needs no local write access.
+git -C "$upstream" tag -s -m 'ambiguity bait' ambiguous "$pinned"
+git -C "$upstream" tag tags/ambiguous "$drifted"
+
+# Shadow half: an unsigned lightweight tag on the drifted commit, whose bare name
+# a planted refs/<name> in the cache can shadow. Needs no slash at all.
+git -C "$upstream" tag shadowed "$drifted"
+
 # file:// and not a bare path: the script constrains .url to schemes git cannot
 # turn into a command, so the fixture must speak one of them. git clone accepts
 # file:// against a local path unchanged.
@@ -191,6 +209,29 @@ run_case wrong-signer "$fixture/pin-wrong-signer.json" 65
 # 65 — pinned revision absent from the repository
 write_pin "$fixture/pin-absent.json" engine-baseline 0000000000000000000000000000000000000000
 run_case absent-revision "$fixture/pin-absent.json" 65
+
+# 64 — a .tag that is a path. Upstream really does carry the tag pair this names,
+# so the refusal is the pin schema's and not an accident of the fixture: every
+# other gate would pass. Rejected before any git command runs, which is why the
+# code is 64 and not 65.
+write_pin "$fixture/pin-slash.json" tags/ambiguous "$drifted"
+run_case slash-tag "$fixture/pin-slash.json" 64
+
+# 65 — a ref planted at refs/<tag> in the warm cache must not be what gets its
+# signature checked. This is the half the .tag constraint above cannot reach: the
+# name carries no slash, so the pin is well-formed, and only the refs/tags/
+# qualification in the signature gate refuses it.
+#
+# Two runs against one cache. The first is a plain rejection whose only job is to
+# leave a clone behind -- the script clones before it verifies -- and the second
+# runs against that clone with the shadowing ref in place. Without the
+# qualification the second run exits 0 having compiled the drifted commit, which
+# is the whole defect stated as an exit code.
+write_pin "$fixture/pin-shadow.json" shadowed "$drifted"
+run_case shadowed-ref "$fixture/pin-shadow.json" 65
+git -C "$fixture/cache-shadowed-ref/arca" update-ref refs/shadowed \
+  "$(git -C "$upstream" rev-parse --verify refs/tags/ambiguous)"
+run_case shadowed-ref "$fixture/pin-shadow.json" 65
 
 # 0 — well-formed pin, signed tag, tag resolves to the pinned revision
 run_case good "$fixture/pin-good.json" 0

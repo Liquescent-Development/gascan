@@ -21,11 +21,17 @@ done
   printf 'engine allowed-signers file is missing: %s\n' "$allowed_signers" >&2
   exit 64
 }
+# .tag is constrained to characters that cannot form a path. A tag name
+# containing a slash is legal to git, and "tags/foo" as a pin would name two
+# different objects to two different resolvers -- see the note on the
+# verify-tag call below. The refs/tags/ qualification there is the real fix;
+# this is the second lock on the same door, and it is the one that fails early
+# and names the pin file.
 jq -e '
   (.schema == 1) and
   (.name | type == "string" and length > 0) and
   (.url | type == "string" and length > 0 and test("^(https|file)://")) and
-  (.tag | type == "string" and length > 0) and
+  (.tag | type == "string" and test("^[A-Za-z0-9._-]+$")) and
   (.revision | type == "string" and test("^[0-9a-f]{40}$"))
 ' "$pin_file" >/dev/null 2>&1 || {
   printf 'engine pin file is malformed: %s\n' "$pin_file" >&2
@@ -47,7 +53,16 @@ mkdir "$lock" || {
   printf 'engine cache is in use or its lock is stale: %s\n' "$lock" >&2
   exit 75
 }
-trap 'rmdir "$lock"' EXIT
+# The status is captured and re-raised because a bare `trap 'rmdir ...' EXIT`
+# makes the trap's own status the script's. MEASURED: `bash -c 'set -euo
+# pipefail; d=$(mktemp -d); trap "rmdir \"$d\"" EXIT; touch "$d/x"; exit 65'`
+# exits 1, not 65, and leaves the directory. Any stray entry under the lock -- a
+# .DS_Store, an NFS sillyrename -- would therefore collapse every documented exit
+# code (64, 65, 69, 70, 75) to 1 AND strand the lock, which fails closed for
+# every later run. `|| true` on the rmdir because a lock we cannot remove must
+# not rewrite the exit code of the thing that actually failed.
+status=0
+trap 'status=$?; rmdir "$lock" 2>/dev/null || true; exit "$status"' EXIT
 [[ -d $checkout/.git ]] || git clone --quiet "$url" "$checkout"
 git -C "$checkout" remote set-url origin "$url"
 # --force accepts a moved tag deliberately. A moved tag is not silently trusted:
@@ -61,8 +76,22 @@ git -C "$checkout" cat-file -e "${revision}^{commit}" 2>/dev/null || {
   printf 'pinned revision is absent from %s after fetch: %s\n' "$url" "$revision" >&2
   exit 65
 }
+# refs/tags/ANYWHERE A TAG NAME APPEARS. Naming the tag unqualified here while
+# qualifying it below let the signature gate and the identity gate resolve two
+# different objects: git tries $GIT_DIR/<name>, then refs/<name>, and only then
+# refs/tags/<name>. REPRODUCED against a fixture repository -- with an annotated,
+# properly signed refs/tags/foo and an unsigned lightweight refs/tags/tags/foo on
+# an attacker's commit, a pin naming "tags/foo" passed all three gates: the
+# unqualified name resolved to the good tag for verification while
+# refs/tags/tags/foo^{} resolved to the attacker's commit, which is what got
+# compiled. `git fetch --tags` brings both refs down, so no local write access is
+# needed. A ref planted at refs/<tag> in the warm cache shadows refs/tags/<tag>
+# the same way and needs no slash at all.
+#
+# The tree handed to the compiler was already proven to be the tag's. Which tag
+# was signed was not.
 git -C "$checkout" -c "gpg.ssh.allowedSignersFile=$allowed_signers" \
-  verify-tag "$tag" >/dev/null || {
+  verify-tag "refs/tags/${tag}" >/dev/null || {
   printf 'engine pin tag signature does not verify against %s: %s\n' \
     "$allowed_signers" "$tag" >&2
   exit 65
