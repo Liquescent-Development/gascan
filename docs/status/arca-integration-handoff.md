@@ -3253,3 +3253,102 @@ because the ledger is deleted on merge.
   after the claim was made. A concurrency artifact is indistinguishable from a real failure
   *except* by checking the precondition, so record the output of `pgrep -fl "cargo test"` rather
   than asserting the machine was idle.
+
+## Session of 2026-08-12 — two adversarial reviews, and what they broke
+
+Tasks 9, 10 and 11 landed, Task 8 got the review it never had, the pin became real, and both
+PRs opened green. Then an independent adversarial review of each PR — fresh context, framed to
+refute rather than confirm — found a Critical in each. Full reports, with file:line, a
+reproduced failure scenario and a fix for every finding:
+
+- `docs/status/adversarial-review-gascan-pr69.md` — Critical 1, Important 5, Minor 6
+- `docs/status/adversarial-review-arca-pr56.md` — Critical 1, Important 6, Minor 8
+
+Both reports also record what was attacked and **held**. That half matters: it says what not to
+re-litigate. On Arca, no Swift error escapes any of the eleven provider methods (all walked,
+plus a live 64 KiB-stdin exec attack over five runs); the twelve-code table is exact and
+`injected_failure`/`unsupported_version` appear nowhere; there is no `DockerAPI`/`ArcaDaemon`
+edge at any depth, verified independently of our own script; `sun_path` overflow throws rather
+than traps; the target has no mutable state and builds clean under Swift 6 strict concurrency.
+On Gas Can, the exact errno renderings were printed rather than substring-matched; all eight
+unimplemented methods answer in the `oneof` including both streaming arms; the killed-engine
+test genuinely isolates its property (the counterfactual — engine alive, socket removed — still
+succeeds, so the kill is what makes it fail); `1435 + 28 = 1463` matches the real test census.
+
+### What the milestone actually proved, and what it did not
+
+It proved the wire: a real engine accepts the placeholder authority `http://[::]:50051`; a
+missing socket renders `No such file or directory (os error 2)` and a non-socket
+`Socket operation on non-socket (os error 38)`, both naming the dialed path through
+`source_chain`; unimplemented methods answer in the response `oneof`, never as a gRPC status;
+every capability flag is false and `offline` is `Unverified`.
+
+It did **not** prove that `Inspect` and `ListResources` work. They are wired, they answer
+well-formed responses, and they are structurally incapable of reporting a resource under any
+input (Arca C1). The live tests that cover them assert absent-and-empty against a fresh state
+root — the one condition under which the answer is right for the wrong reason.
+
+### The instrument defect, eight times in one session
+
+Every failed check in this session came back green, or red, for a reason unrelated to what it
+claimed to test. Recorded because the pattern is the point, not any individual instance:
+
+1. A proof probe pointed at `/bin/false`, which does not exist on macOS — it failed fast and
+   red from `spawn`'s error arm, never reaching the code under test.
+2. A leaked-directory check using `find /tmp`, which reports nothing because `/tmp` is a
+   symlink and `find` will not follow one given as a start path. Two directories had leaked
+   while it reported none (`find /tmp -maxdepth 1` → 1 entry; `/private/tmp` → 1551).
+3. A verification pass that ran clippy every time and `cargo fmt` never, while CI's first step
+   is formatting. The branch read green through three reviews with that gate red.
+4. A "reproduces on a quiet machine" claim made while another repository's suite was running.
+5. A contract rooted at the library target `ArcaEngine` while the artifact that ships is the
+   `arca-engine` executable — measured: the single-root form printed PASS against a manifest
+   with `DockerAPI` linked into the executable.
+6. `swift test --filter <no match>` exits 0 having run zero tests — in the one script standing
+   between a signed tag and a shipped binary.
+7. A controller instruction specifying a guard on an *empty filtered listing*, when
+   `swift test list` silently ignores `--filter` and returns the full listing — the guard as
+   specified could never have fired. The implementer built the working form and recorded the
+   wrong reason for it.
+8. The forbidden-name list in `engine-targets-check.sh`, filed as a cosmetic deferred minor,
+   is a vacuity: renaming `DockerAPI` upstream makes the check print PASS while the edge
+   exists. Executed.
+
+**The rule that would have caught all eight: when a check passes, ask what else could have made
+it pass.** A red result deserves the same question.
+
+### Three unreal-failure events, all the same cause
+
+A workspace run reporting 92 failures across 12 targets was not real, and neither was a later
+one reporting 42. Both were CPU starvation from *another repository's* concurrent suites — not
+a shared-target-directory effect, since that repo has its own. Discriminated by running one
+failing target alone (`gascand --test doctor_state`: 36 passed, 0 failed, 0.79s, against 6
+failures moments earlier in the full run) and by a baseline worktree at the merge-base showing
+the same target green under identical load. Run alone, the suite is **exit 0, 1435 passed,
+0 failed, 28 ignored**, which re-derives from the 1433/22 anchor at `a9cb67c` plus 2 passing
+and 2 ignored from Task 9 and 4 ignored from Task 10.
+
+`docs/status/START-HERE.md` already warned about this. It is now three occurrences; treat a red
+daemon tier under load as unproven until a single-target run agrees.
+
+### The pin, no longer a lie
+
+`engine/arca-pin.json` names tag `gascan-engine-m1` at `f5fde96` on
+`https://github.com/Vas-Solutus/arca.git`. The tag is annotated (`git cat-file -t` → `tag`),
+signed, and verifies against `engine/allowed-signers`. A build from that pin was run end to end:
+exit 0, exactly two stdout lines, the engine's own 27 tests passing, binary executable, with the
+cache checkout's remote at the https URL rather than the `file://` development pin every earlier
+green build on this branch used. CI then did it independently on a clean runner (run
+`31559382607`): 27 tests, the targets check passing, and the live tier reporting
+`running 6 tests` with real engines logging `engine listening`.
+
+Caveat that survives: Gas Can C1 means the *gate* protecting that pin is bypassable in general,
+even though this particular tag was verified by hand.
+
+### Still open, and needing the maintainer
+
+- Arca's `feat/sandbox-engine` has nine commits and no review beyond the per-task ones written
+  as they landed. The adversarial review is the first outside look at it.
+- Arca C1's fix is a design decision, not a mechanical change — see START-HERE.
+- Arca commits need a human at the keyboard: the key is 1Password-held and `env -u SSH_AUTH_SOCK`
+  aborts every one of them. Gas Can is the exact opposite and needs that flag.

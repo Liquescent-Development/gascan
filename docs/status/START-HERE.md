@@ -59,17 +59,59 @@ landed without a review.
 
 ## What to do next
 
-1. **Open the PR.** The branch is complete and both CI failures the final review found are
-   addressed: the pin is real (below), and `tests/release/engine-pin-contract.sh`'s fixture
-   declares the targets the build script now names — that one is VERIFIED, the contract
-   prints `PASS: Gas Can engine pin contract` at exit 0. The `engine` job against the new
-   pin has **not** been run end to end from a clean cache; the first CI run is the first
-   time that happens, so watch it rather than assuming it.
-2. **Open Arca's PR too, or decide not to.** `feat/sandbox-engine` is pushed and tagged but
-   unmerged, with no PR. Gas Can pins the *tag*, so nothing breaks while that is true — but
-   the tag is the only reference keeping the revision alive.
-3. Then milestone 2, which is outlined at the end of the plan and is to be *planned* when
-   milestone 1 lands — not before, because its tasks depend on what milestone 1 found.
+**Both PRs are open, CI is green on both, and NEITHER MAY MERGE.** An independent adversarial
+review of each found one Critical apiece, both reproduced end to end rather than argued. The
+maintainer has asked for **every Critical and Important** to be fixed.
+
+| | |
+|---|---|
+| Gas Can PR | https://github.com/Liquescent-Development/gascan/pull/69 |
+| Arca PR | https://github.com/Vas-Solutus/arca/pull/56 |
+| Findings, Gas Can | `docs/status/adversarial-review-gascan-pr69.md` — Critical 1, Important 5, Minor 6 |
+| Findings, Arca | `docs/status/adversarial-review-arca-pr56.md` — Critical 1, Important 6, Minor 8 |
+
+Read both reports. They carry file:line, a reproduced failure scenario, and a fix for each
+finding, plus a section on what was attacked and *held* — which is as load-bearing as the
+findings, because it says what not to re-litigate.
+
+**The two Criticals, because they are the ones that change what you believe:**
+
+1. **Gas Can — the signed-pin gate can verify a different object than the one it compiles.**
+   `scripts/build-arca-engine.sh:64` calls `verify-tag "$tag"` unqualified while `:70`
+   resolves `refs/tags/${tag}` qualified. Git tries `refs/<name>` before `refs/tags/<name>`,
+   so the signature gate and the identity gate can resolve different objects. REPRODUCED:
+   with `refs/tags/foo` (annotated, good) and `refs/tags/tags/foo` (lightweight, evil),
+   unqualified `tags/foo^{commit}` resolves to the good commit while
+   `refs/tags/tags/foo^{}` resolves to the evil one — all three gates pass and the evil
+   commit is compiled. The one-word fix is `verify-tag "refs/tags/${tag}"`; also constrain
+   `.tag` in the pin schema. `scripts/sync-arca-proto.sh:82` has the same pattern and is
+   immune only by accident. **The current pin is not exploited** — `gascan-engine-m1` has no
+   slash and was verified independently — but fix this before trusting the gate again.
+2. **Arca — `Inspect` and `ListResources` can never report anything, for the life of the
+   process.** Not restart-scoped, and not only containers. `initialize()` is never called
+   (`Sources/arca-engine/ArcaEngineCommand.swift:40-56`, comments only); the sole insertion
+   sites for `ContainerManager.containers` are `:382` (inside `initialize()`) and `:1883`
+   (inside `createContainer`, which answers `unsupported_capability`). Volumes and networks
+   are equally blind. PROVEN LIVE: a state root seeded from a real `~/.arca/state.db`
+   (1 container, 2 networks) still yields `ListResources = Ok([])`. The danger is semantic —
+   `Absent` means "it is not there", so a reconciler creates a duplicate sandbox.
+   **This is a design decision for the maintainer, not a mechanical fix:** either call
+   `initialize()` this milestone, or make these two answer `unsupported_capability` like the
+   other eight rather than answer a confident falsehood. Do not leave it as is. Whichever
+   way it goes, the PR body and this file must stop calling those three methods implemented.
+
+**Three findings correct things this repository currently asserts.** Fix the records with the
+code: the "hardcoded forbidden-name pair" in `engine-targets-check.sh` is not cosmetic (a
+rename of `DockerAPI` upstream makes the check print PASS while the edge exists — executed);
+`ci-classify-paths.sh` routes the live tier on its *test files* but not on its *subject*, so
+editing `crates/gascan-arca/src/channel.rs` skips the engine job entirely; and
+`ci-classify-paths.sh:35` says "four of its six tests" where the truth is 8 tests / 6 ignored,
+contradicting `ci.yml:137-139`.
+
+Then milestone 2, which is outlined at the end of the plan and is to be *planned* when
+milestone 1 lands — not before, because its tasks depend on what milestone 1 found. Note that
+Arca Critical 1 is exactly the `ContainerManager.initialize()` question milestone 2 was
+already expected to revisit; it has arrived early and with teeth.
 
 ## The pin is real now
 
