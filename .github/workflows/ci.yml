@@ -101,7 +101,7 @@ jobs:
       # engine-targets-check.sh needs an Arca tree, and this job is the only one
       # that has one. `head -1` and not `tail`: the script prints checkout then
       # binary, in its closing `printf '%s\n%s\n' "$checkout" "$binary"`
-      # (scripts/build-arca-engine.sh:179 -- re-derive with `grep -n "printf '%s"`
+      # (scripts/build-arca-engine.sh:208 -- re-derive with `grep -n "printf '%s"`
       # rather than trusting the number, it has gone stale twice). The pipeline would
       # otherwise mask a build failure behind head's exit status, so the script's
       # stdout goes to a file first and its own status is what gates the step.
@@ -126,7 +126,7 @@ jobs:
       # way Arca's own tests were rotting before the engine build script existed.
       #
       # `tail -1` and not `head`: the script prints checkout then binary, in the same
-      # closing printf the step above cites (scripts/build-arca-engine.sh:179), and
+      # closing printf the step above cites (scripts/build-arca-engine.sh:208), and
       # that step consumes the first line. The binary is guarded before use -- for the
       # same reason the checkout is --
       # an empty or bogus second line would otherwise reach the test harness as a
@@ -134,10 +134,20 @@ jobs:
       # DIRECTORY satisfies `-x`: a script that printed only its checkout line would
       # otherwise hand the test harness a directory and fail somewhere far from here.
       #
-      # `running 6 tests` is the expectation: six #[ignore] attributes exist across
-      # crates/gascan-arca/tests/live (2 in connect.rs, 4 in read_rpcs.rs), so
-      # `-- --ignored` selects exactly those six. A smaller number means tests were
-      # dropped; cargo would report it and not fail on its own.
+      # `running 4 tests` is the expectation: four #[ignore] attributes exist across
+      # crates/gascan-arca/tests/live (2 in connect.rs, 2 in read_rpcs.rs), so
+      # `-- --ignored` selects exactly those four. MEASURED at this revision:
+      # `cargo test -p gascan-arca --test live` reports `running 6 tests` and
+      # `2 passed; 0 failed; 4 ignored`.
+      #
+      # A smaller number means tests were dropped, and this step cannot see that:
+      # `cargo test -- --ignored` exits 0 on `running 0 tests`. What actually
+      # closes it is scripts/ci-check-ignored-tests.sh, which diffs the whole
+      # ignored set against tests/ci/expected-ignored-tests.txt and fails in
+      # either direction -- and any edit under crates/gascan-arca fires `rust` as
+      # well as `engine`, so that guard runs whenever this step's input changes.
+      # The number above is a reader's orientation, not a gate; the gate is the
+      # baseline file.
       - name: The live tier, against the engine just built
         run: |
           set -eu
@@ -149,9 +159,12 @@ jobs:
           GASCAN_ARCA_ENGINE_BIN=$binary \
             cargo test -p gascan-arca --test live --no-fail-fast -- --ignored
 
-  # Temporary. Settles whether a hosted runner carries an Apple container runtime,
-  # replacing a PLAN claim in the design spec with a measurement. Deliberately
-  # outside gate's needs, so it can never block a merge. Removed once recorded.
+  # The required check. Every sentence of the comment that used to stand here was
+  # false of this job: it described the temporary `runtime-probe` job, deleted in
+  # 37e3ec0, as "deliberately outside gate's needs, so it can never block a
+  # merge". This job is permanent, is the required check, and exists to block
+  # merges -- and it is the block a reader reaches for when asking what gates the
+  # engine job.
   gate:
     needs: [changes, rust, contracts, engine]
     if: always()
