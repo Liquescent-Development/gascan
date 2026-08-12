@@ -36,11 +36,14 @@ done
   printf 'engine allowed-signers file is missing: %s\n' "$allowed_signers" >&2
   exit 64
 }
+# .tag admits no path characters, matching scripts/build-arca-engine.sh. The two
+# scripts read the same pin file and must agree on what a valid one is, or a pin
+# this script accepts is one the build refuses.
 jq -e '
   (.schema == 1) and
   (.name | type == "string" and length > 0) and
   (.url | type == "string" and length > 0 and test("^(https|file)://")) and
-  (.tag | type == "string" and length > 0) and
+  (.tag | type == "string" and test("^[A-Za-z0-9._-]+$")) and
   (.revision | type == "string" and test("^[0-9a-f]{40}$"))
 ' "$pin_file" >/dev/null 2>&1 || {
   printf 'engine pin file is malformed: %s\n' "$pin_file" >&2
@@ -78,8 +81,15 @@ git -C "$work" remote add origin "$url"
 # lazily from the promisor remote when the checkout below reads them.
 git -C "$work" fetch --quiet --depth 1 --filter=blob:none origin "tag" "$tag"
 
+# Fully qualified, for the reason spelled out at the same call in
+# scripts/build-arca-engine.sh: an unqualified name resolves by a different rule
+# than the refs/tags/ form used two lines down, so the object whose signature is
+# checked need not be the object whose identity is checked. This call was immune
+# only by accident -- `git init` plus a single `fetch origin tag <tag>` leaves
+# exactly one ref that could match -- and immune by accident is not a property
+# anything downstream should rest on.
 git -C "$work" -c "gpg.ssh.allowedSignersFile=$allowed_signers" \
-  verify-tag "$tag" >/dev/null || {
+  verify-tag "refs/tags/${tag}" >/dev/null || {
   printf 'engine pin tag signature does not verify against %s: %s\n' \
     "$allowed_signers" "$tag" >&2
   exit 65

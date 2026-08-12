@@ -96,7 +96,24 @@ cargo metadata --locked --no-deps --format-version 1 \
   | jq -er '.packages[] | select(.name == "gascan") | .version'
 cargo check --locked --workspace --all-targets
 for c in tests/release/*-contract.sh; do bash "$c" >/dev/null || echo "FAIL $c"; done
+out=$(mktemp)
+./scripts/build-arca-engine.sh >"$out"
+./tests/release/engine-targets-check.sh "$(head -1 "$out")"
 ```
+
+The engine build writes to a file before anything reads it. The obvious one-liner
+— `engine-targets-check.sh "$(./scripts/build-arca-engine.sh | head -1)"` — takes
+its status from `head`, so a failed engine build is discarded: the script's
+diagnostics all go to stderr, the substitution yields the empty string, and the
+releaser sees `swift package describe --package-path ""` fail on a missing
+manifest. A misleading error, at the release gate, for a build that never
+succeeded. `ci.yml`'s engine job avoids the same trap the same way, and this file
+used to demonstrate it.
+
+`engine-targets-check.sh` is named `-check` rather than `-contract` precisely so
+the glob above skips it: it takes an Arca checkout, and every script that glob
+matches is run with no arguments. Run it separately, as shown. CI does the same
+thing in `ci.yml`'s `engine` job, which is the only job with an Arca tree.
 
 **Commit the bump before running the contracts.** Two of them clone `HEAD` for
 their behavioral cases while reading the working tree for their source

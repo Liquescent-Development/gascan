@@ -24,6 +24,45 @@ while IFS= read -r path; do
       engine=true
       contracts=true
       ;;
+    # Runs in the engine job, because that is the only job with an Arca tree to
+    # inspect. Without this it would fall through to tests/* and fire contracts
+    # alone, so a change to the check would never run the check.
+    tests/release/engine-targets-check.sh)
+      engine=true
+      contracts=true
+      ;;
+    # The live tier and its subject. Most of the tier is #[ignore]d, so `cargo
+    # test --workspace` in the rust job compiles those tests but never runs them;
+    # the only place they execute is the engine job's live-tier step, which needs
+    # a built engine. (The exact counts live in .github/workflows/ci.yml, beside
+    # the step that asserts them. Restating them here is what let the two records
+    # drift apart.)
+    #
+    # The whole crate and not only tests/live: an earlier version fired `engine`
+    # on the live tests but let their subject fall through to crates/* and fire
+    # `rust` alone. So editing crates/gascan-arca/src/channel.rs -- the file that
+    # owns the placeholder authority http://[::]:50051, the Unix connector and
+    # source_chain() -- skipped the engine job entirely, `gate` accepted the
+    # skip, and the change merged without the live tier ever running. The
+    # properties only that tier can prove (a real server accepts the placeholder
+    # authority; a real engine's unsupported_capability arrives as an outcome and
+    # not a status) were unguarded for changes to the code implementing them.
+    # gascan-engine-proto for the same reason: it is the generated client the
+    # tier drives.
+    #
+    # Cargo.toml and Cargo.lock too, and this one costs real time knowingly: the
+    # engine job is a cold Swift build of the pinned Arca tree, and nothing
+    # caches it, so every dependency bump now pays for one. It is in because a
+    # tonic or hyper bump is the likeliest way to break exactly the transport
+    # properties nothing else exercises -- a bump that compiles everywhere and
+    # only fails against a real socket is this tier's whole reason to exist.
+    #
+    # rust as well in every case, because the rust job still compiles the tier
+    # and still runs the tests that are not ignored.
+    crates/gascan-arca/*|crates/gascan-engine-proto/*|Cargo.toml|Cargo.lock)
+      engine=true
+      rust=true
+      ;;
     # Run by crates/gascan-engine-proto's build script, so a change to it changes
     # what the Rust build generates.
     scripts/sync-arca-proto.sh)
@@ -37,7 +76,7 @@ while IFS= read -r path; do
       engine=true
       rust=true
       ;;
-    crates/*|Cargo.toml|Cargo.lock|rust-toolchain.toml|proto/*)
+    crates/*|rust-toolchain.toml|proto/*)
       rust=true
       ;;
     tests/*|packaging/*|scripts/*|docs/*|images/*|helpers/*|README.md|LICENSE|.gitignore|.shellcheckrc|.github/*)
