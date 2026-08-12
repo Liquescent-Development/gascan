@@ -3,19 +3,27 @@
 This file is the session entry point. It is written to be read cold, and it is
 addressed to you, the agent. Follow it as instructions — there is nothing to paste.
 
-Written 2026-08-11, describing two branches in flight.
+Written 2026-08-11 for two branches in flight; rewritten 2026-08-12, after both merged.
 
 ---
 
 ## Where the work is
 
-**P5.1 milestone 1 is in progress across two repositories, on two unmerged branches.**
+**P5.1 milestone 1 is DONE and MERGED in both repositories. There is nothing in
+flight.** Start a new branch for whatever comes next.
 
 | | |
 |---|---|
+| Gas Can | PR #69 merged as `58f26aa`, 2026-08-12 |
+| Arca | PR #56 merged as `cc316b65`, 2026-08-12 |
 | Design | `docs/superpowers/specs/2026-08-10-p5-1-engine-service-and-wiring-design.md` |
 | Plan | `docs/superpowers/plans/2026-08-10-p5-1-milestone-1-engine-skeleton.md` |
 | Detail | `docs/status/arca-integration-handoff.md`, from `## Session of 2026-08-10/11` |
+
+Both are real merge commits, not squashes — `git rev-list --parents -n 1` reports two
+parents for each — so every commit message below is still reachable by SHA. VERIFIED
+with `git merge-base --is-ancestor`: `b3390b8` is an ancestor of Arca's `origin/main`
+and `351a646` of Gas Can's.
 
 **Read the design document before touching anything.** Every decision taken — offline
 reported `PROVEN` the way `gascan-apple` earns it, image ingress as an engine subcommand,
@@ -26,68 +34,77 @@ meaning cancellation — is recorded there with its reasoning.
 service"; an earlier START-HERE said "wire the backend to the daemon". It is both, and
 the design document supersedes the narrower readings.
 
-### Arca — `~/code/arca`, branch `feat/sandbox-engine`, **pushed, but no PR and not merged**
+### What shipped
 
-Seven task commits `bc03394..e74aff0`, a dependency fix `8fc1ca5`, a comment fix
-`f5fde96`, and two commits answering the adversarial review — `16abeec` (Inspect and
-ListResources) and `b3390b8` (the socket path and the shutdown path). All reviewed.
-**30 tests pass** (`swift test --filter ArcaEngineTests`, exit 0); it was 27 before the
-review commits added three to `EngineServerTests`.
+**Arca** (`~/code/arca`, now on `main`) — seven task commits `bc03394..e74aff0`, a
+dependency fix `8fc1ca5`, a comment fix `f5fde96`, and two answering the adversarial
+review: `16abeec` (Inspect and ListResources) and `b3390b8` (the socket path and the
+shutdown path). **30 tests pass** (`swift test --filter ArcaEngineTests`, exit 0); it was
+27 before the review added three to `EngineServerTests`.
 
-The branch is on `Vas-Solutus/arca` and carries the signed annotated tag
-**`gascan-engine-m1.1` at `b3390b8`** — the tag Gas Can's `engine/arca-pin.json` names.
-The older `gascan-engine-m1` at `f5fde96` is still pushed and still valid; it was left
-where it was rather than moved, because moving a pushed signed tag rewrites what an
-already-verified pin resolved to. **There is still no PR merged**, so `main` in Arca has
-no engine in it; the tags are the only thing holding those revisions reachable.
-
-**The engine genuinely runs** — VERIFIED by running it: `swift run arca-engine
---socket-path … --state-root …` logs `engine listening` and creates the socket
-`srw-------`. **`Capabilities` is the one implemented method; the other ten answer
-`unsupported_capability`.** `Inspect` and `ListResources` used to be counted as real and
-are not: the process calls `initialize()` on no manager, so both could return exactly one
-answer — `absent` and an empty list — under every input. Answering `absent` without having
-looked is what makes a reconciler create a duplicate of a running sandbox, so both now
-refuse. The reasoning is in `SandboxEngineService.swift` on each method and in
-`ArcaEngineCommand.run()`.
-
-### Gas Can — `~/code/gascan`, branch `docs/p5-1-engine-design`
-
-Design, plan, and corrections committed (`33d37f9`, `4981b39`, `77ff591`, `b36d18f`), then
-**Tasks 8 through 11 and the whole-branch fix wave. All four tasks are complete and all
-four were independently reviewed**, including Task 8, which was the one task that had
-landed without a review.
+**Gas Can** (`~/code/gascan`, now on `main`) — design and plan (`33d37f9`, `4981b39`,
+`77ff591`, `b36d18f`), Tasks 8-11, then the review wave `140b274..351a646`.
 
 | Task | Commit | What |
 |---|---|---|
 | 8 | `f75d069`, `ddb4f6a` | `scripts/build-arca-engine.sh` builds the engine product, runs its tests in the verified clean checkout, and prints the binary path as a second stdout line |
 | 9 | `cb81024` | the live harness — a real engine on a real socket, and the `connect` error paths |
-| 10 | `2fe3711` | live coverage of `Capabilities`, `Inspect` and `ListResources` — since replaced, see below |
+| 10 | `2fe3711` | live coverage of the read RPCs — since replaced, see below |
 | 11 | `c0e0cc8`, `aebf558`, `fb50d4c` | `tests/release/engine-targets-check.sh` — neither `arca-engine` nor `ArcaEngine` reaches `DockerAPI` or `ArcaDaemon` |
-
-Then the **review wave**, which is the current tip. See below.
 
 **1435 tests pass, 0 fail, 26 ignored** across 74 targets reporting `0 filtered out`
 (`cargo test --workspace --no-fail-fast`, exit 0). It was 28 ignored: the live tier's
 `Inspect` and `ListResources` tests folded into one that covers all ten unimplemented
 methods, so the tier went from 8 tests / 6 ignored to 6 / 4, and nothing else moved.
 
+### What the engine actually does, which is less than it sounds
+
+**`Capabilities` is the ONE implemented method. The other ten answer
+`unsupported_capability`.** The engine runs — VERIFIED by running it: `arca-engine
+--socket-path … --state-root …` logs `engine listening` and creates the socket
+`srw-------`, and Gas Can's live tier drives all eleven over a real socket.
+
+`Inspect` and `ListResources` were counted as real until 2026-08-12 and are not. The
+process calls `initialize()` on no manager, so each could return exactly one answer under
+every input — `absent`, and an empty list. Answering `absent` without having looked is
+what makes a reconciler create a duplicate of a running sandbox; an empty `ResourceList`
+is a confident report of a clean host, which is the report that hides a leak. Both now
+refuse instead. The reasoning is on each method in `SandboxEngineService.swift` and in
+`ArcaEngineCommand.run()`.
+
 ## What to do next
 
-**Every Critical and Important from both adversarial reviews is fixed.** The Minors are
-not, and are the work list.
+Three things are open, in the order I would take them.
+
+1. **Plan milestone 2.** It is outlined at the end of the plan and was deliberately left
+   unplanned until milestone 1 landed, because its tasks depend on what milestone 1
+   found. It now has a concrete first task it did not have before: give `ContainerBridge`
+   a read-only load path that neither starts a VM nor writes, and restore `Inspect` and
+   `ListResources` on top of it. Arca's I3, I4 and I5 (below) are the known defects that
+   path must fix before either method reports anything.
+2. **The Minors** — 6 in Gas Can, 8 in Arca. Cheap, well-specified, and each carries its
+   own reproduction in the review reports.
+3. **D7's narrowed retry**, which is now unblocked by evidence. See its section below.
+   The maintainer's ruling on 2026-08-12 was: separate PR, after the merge — not folded
+   into unrelated work.
+
+### The adversarial reviews
+
+**Every Critical and Important from both is fixed.** The Minors are not, and are item 2
+above.
 
 | | |
 |---|---|
-| Gas Can PR | https://github.com/Liquescent-Development/gascan/pull/69 |
-| Arca PR | https://github.com/Vas-Solutus/arca/pull/56 |
+| Gas Can PR | https://github.com/Liquescent-Development/gascan/pull/69 (merged) |
+| Arca PR | https://github.com/Vas-Solutus/arca/pull/56 (merged) |
 | Findings, Gas Can | `docs/status/adversarial-review-gascan-pr69.md` — Critical 1, Important 5, Minor 6 |
 | Findings, Arca | `docs/status/adversarial-review-arca-pr56.md` — Critical 1, Important 6, Minor 8 |
 
-Read both reports before touching either repository. They carry file:line, a reproduced
-failure scenario, and a fix for each finding, plus a section on what was attacked and
-*held* — which is as load-bearing as the findings, because it says what not to
-re-litigate. **Read the "attacked and could not break" sections too.**
+Both report files are left exactly as written, recording what was observed at `39be145`
+and `f5fde96`; each carries a status header saying what has since been fixed. They hold
+file:line, a reproduced failure scenario, and a fix for each finding, plus a section on
+what was attacked and *held* — which is as load-bearing as the findings, because it says
+what not to re-litigate. **Read the "attacked and could not break" sections too.**
 
 **What the two Criticals turned out to be, because they change what you believe:**
 
@@ -112,19 +129,14 @@ re-litigate. **Read the "attacked and could not break" sections too.**
    Milestone 2 gives ContainerBridge a read-only load path that neither starts a VM nor
    writes, and restores both methods.
 
-**What is left: the Minors, 6 in Gas Can and 8 in Arca.** Two Gas Can Minors were taken
-along the way because they were load-bearing for an Important — M1 (the `runtime-probe`
-comment orphaned onto `gate`) and M2 (the EXIT trap that collapsed every documented exit
-code to 1, which the new pin-contract cases assert exactly). M3 (the `/tmp` socket-root
-leak), M4 (the product check being narrower than its comment — the comment now says so),
-M5 and M6 remain, as do all eight Arca Minors.
+**Which Minors are left.** Two Gas Can Minors were taken along the way because they were
+load-bearing for an Important — M1 (the `runtime-probe` comment orphaned onto `gate`) and
+M2 (the EXIT trap that collapsed every documented exit code to 1, which the new
+pin-contract cases assert exactly). M3 (the `/tmp` socket-root leak), M4 (the product
+check being narrower than its comment — the comment now says so, rather than the check
+being widened), M5 and M6 remain, as do all eight Arca Minors.
 
-Then milestone 2, which is outlined at the end of the plan and is to be *planned* when
-milestone 1 lands — not before, because its tasks depend on what milestone 1 found. The
-`ContainerManager.initialize()` question it was already expected to revisit now has an
-answer to build on rather than an open decision.
-
-## The pin is real now
+## The pin is real, and now on Arca's main
 
 **`engine/arca-pin.json` names the signed annotated tag `gascan-engine-m1.1` at
 `b3390b80528f425be0109298d6a95dd863747c5d` on `https://github.com/Vas-Solutus/arca.git`.**
@@ -136,7 +148,15 @@ building something old. It does not fail any more. Do not reintroduce the old wo
 **VERIFIED end to end against this pin**, not merely resolved: `./scripts/build-arca-engine.sh`
 exits 0 in 6m00s from a cold clone — signature verified against `engine/allowed-signers`,
 tag target matched, clean checkout, `Executed 30 tests, with 0 failures` — and prints the
-checkout and binary paths. The live tier then passes 4/4 against that binary.
+checkout and binary paths. The live tier then passes 4/4 against that binary. CI's
+`engine` job did the same twice on a hosted runner in run `31621889316` (14m42s the
+second time), which is the only automated verification Arca has at all — see the CI
+section below.
+
+Since PR #56 merged, `b3390b8` is an ancestor of Arca's `main`, so the pinned revision no
+longer depends on a tag alone to stay reachable. The older `gascan-engine-m1` at
+`f5fde96` is still pushed and still valid; it was left where it was rather than moved,
+because moving a pushed signed tag rewrites what an already-verified pin resolved to.
 
 The engine build step is `.github/workflows/ci.yml:108` — re-derive that anchor with
 `grep -n 'Build the pinned Arca engine' .github/workflows/ci.yml` rather than trusting it.
@@ -218,10 +238,29 @@ checked the defect, and prefer reading an artifact to grepping it.**
 re-executing a test binary with a filter. Sum only the lines reporting `0 filtered out`,
 and check that their count equals the target count.
 
-**NEVER RUN THE WORKSPACE SUITE WHILE ANY SUBAGENT IS RUNNING CARGO.** Run it alone, after
-`pgrep -fl "cargo test"` comes back empty. Concurrent suites against one target directory
-produced **rc=101 with 59 failures**, none of them real: those tiers spawn daemons and bind
-sockets, so they starve each other. Run alone it takes **93 seconds**.
+**NEVER RUN THE WORKSPACE SUITE WHILE ANY OTHER CARGO IS RUNNING — NOT JUST A SUBAGENT'S.**
+Run it alone, after `pgrep -fl "cargo test"` comes back empty. Concurrent suites against one
+target directory produced **rc=101 with 59 failures**, none of them real: those tiers spawn
+daemons and bind sockets, so they starve each other. Run alone it takes **93 seconds**.
+
+**It is not only subagents, and not only this repository.** On 2026-08-12 another Claude
+session was looping full `cargo test --workspace` cycles in an unrelated repo
+(`capsule-os-worktrees/worker`) on the same machine, and this repo's suite failed three
+times in a row while it ran. `pgrep` ancestry named the owner every time. **Read the
+ancestry before assuming a stray cargo is yours, and never `pkill` it.**
+
+**The failure count scales with the load, which is how you recognise it.** Measured that
+day in this repo, same tree, same commit `351a646`: 2 concurrent cargo processes → **21
+failures / 2 targets**; 3 processes → **37 / 5**; 3 processes with the run stretched
+longer → **41 / 9**. Then every one of those 9 targets run *alone under the same
+contention* → **318 passed, 0 failed, rc=0 for all nine**
+(`gascan-apple/backend_fake_runner`, `gascan-e2e/{apple_apply,autostart,doctor}`,
+`gascand/{daemon_idle,doctor_state,lifecycle,reconcile,ssh_config}`).
+
+**`-- --test-threads=N` DOES NOT HELP; IT MAKES IT WORSE.** Bounding per-binary
+parallelism to survive a loaded machine stretches the run, which overlaps *more* of the
+neighbour's load — that is the 41-failure row above. Wait for a quiet machine, or verify
+by isolation. Do not tune your way out of it.
 
 **AND IT HAPPENED AGAIN, AT 92 FAILURES, AND WAS NEARLY BELIEVED.** Task 10 raised a
 blocker on `rc=101, 92 failures across 12 targets`, every one of them a tier that spawns a
@@ -254,10 +293,50 @@ is prohibited here. `ls` is aliased to something that rejects trailing-slash pat
 **A DOCS-ONLY CI RUN SKIPS `rust` AND `engine` ENTIRELY** (VERIFIED, run `31262534703`), so a
 green docs run is not evidence about anything in Rust.
 
-## D7 has fired, and it named the state that a retry cannot fix
+## CI: what to expect, so you do not spend a session on it
 
-**The first `0200` occurrence landed on 2026-08-12.** The instrument did exactly what it
-was built for. Verbatim, from `cargo test --workspace --no-fail-fast` on this branch:
+**`ci / gate` is NOT a required check and does not block merging.** VERIFIED 2026-08-12:
+ruleset `20492137` carries `deletion`, `non_fast_forward`, `required_signatures` and
+`pull_request`, and **zero** `required_status_checks`; PR #69 read
+`mergeable=MERGEABLE, mergeStateStatus=UNSTABLE` and merged. `allowed_merge_methods` is
+`["merge"]` — merge commits only, never squash.
+
+**The `rust` job fails about 38% of the time on `main`, on a different test each time.**
+Measured by reading the `rust` conclusion of every run in
+`gh run list --workflow=ci.yml --branch main --limit 15`: of the 13 that completed, 8
+green and 5 red, and the five reds were five distinct tests. PR #69's `rust` job then
+failed **four consecutive times** — `pty_resize_driver_drains_chatty_child_without_
+backpressure_timeout` (twice, missing a hard 2s wall-clock bound by 100ms and by **2.3ms**),
+`concurrent_clients_converge_on_one_private_daemon` (D7, above), and
+`same_image_apply_recreates_explicit_ssh_as_automatic`.
+
+**One failure mode reproduced verbatim across branches, five days apart**, which is the
+proof it is not a given branch's doing: `main`'s `31203816056` and PR #69's third attempt
+both died as `KeygenRejected(KeygenRejection { outcome: Code(255), message:
+KeygenMessage("/dev/fd/<N>: Bad file descriptor"), descriptor: Intact })`, fd 18 and fd 24,
+both ending `error: test failed, to rerun pass \`-p gascand --test apply_setup\``.
+
+**How to decide whether a red `rust` is yours.** Do not argue from probability — check the
+diff. `git diff <merge-base>..HEAD -- crates/<the failing crate>/` empty means your branch
+cannot have caused it, and that is a proof rather than an estimate. It was empty for
+`crates/gascan-e2e/` throughout P5.1.
+
+**The standing rule: a green local `cargo test --workspace` is the bar. CI reports but
+must not gate, and flake-chasing waits** until someone is asked to do it. There are at
+least three distinct root causes to fix when that day comes — the PTY wall-clock bound,
+D7's `0200` window, and the keygen `/dev/fd` descriptor.
+
+**Arca has NO CI AT ALL.** `gh pr checks 56` reported "no checks reported on the
+'feat/sandbox-engine' branch", and `.github/workflows` does not exist in that repository.
+Gas Can's `engine` job — which builds Arca from the signed tag and runs its 30 tests in a
+clean checkout — is the only automated thing that ever exercises Arca. Any earlier
+statement in this file that "CI is green on both" was wrong.
+
+## D7 has fired, and the retry is now justified — write it
+
+**The first `0200` occurrences landed on 2026-08-12, and there were two.** The instrument
+did exactly what it was built for: it named which state fired. Verbatim, the local one,
+from `cargo test --workspace --no-fail-fast`:
 
 ```
 ---- daemon_stderr_sink_survives_the_launching_cli stdout ----
@@ -267,28 +346,40 @@ content: written but never published (mode 0200, size 375, links 1, uid 501, exp
 uid 501)
 ```
 
-Read the message, not the test name — that was always the rule, and here it pays. Of the
-two `0200` states `crates/gascan/src/daemon.rs:3077-3079` distinguishes, the one that
-fired is **"has content: written but never published", size 375**. Its own doc comment
-(`:3057-3064`) says that state is "a daemon that wrote its record and died before
-publishing, which never becomes 0600 on its own" — a corpse, not a publication in flight.
+And in CI, run `31621889316`'s second `rust` attempt, a different test with the same
+fault — `concurrent_clients_converge_on_one_private_daemon`, **size 382**, which is two
+clients racing to autostart one daemon.
 
-**So the evidence that unblocks the retry is also evidence against it.** A retry resolves
-the empty-file state, which is a race worth waiting out. It cannot resolve this one. The
-retry stays unwritten, and the decision now belongs to the maintainer with an observation
-under it rather than without one.
+Read the message, not the test name. Of the two `0200` states
+`crates/gascan/src/daemon.rs:3077-3079` distinguishes, both occurrences were **"has
+content: written but never published"**.
 
-Two cautions on this observation, both load-bearing:
+**CORRECTION, recorded because it reverses the first reading of this evidence.** The doc
+comment at `:3057-3064` calls that state "a daemon that wrote its record and died before
+publishing, which never becomes 0600 on its own" — a corpse. On that basis this file
+briefly said the evidence argued *against* the retry. **The code says otherwise, and the
+code wins:**
 
-- **It did not reproduce.** The run that produced it was contended — another repository's
-  `cargo test --workspace` was running on the same machine throughout (`pgrep` recorded,
-  pid 4969). The re-run reports exit 0 with **0 occurrences of `mode is 0200`**. So this
-  is a real occurrence of the state, not a reliable reproducer of it.
-- **It is not this branch's doing.** Nothing here touches `gascand`, the runtime record,
-  or `crates/gascan`. The same contended run also failed
-  `doctor_recovers_a_legacy_daemon_through_double_attested_sigterm` with
-  `ParseIntError { kind: Empty }`, which is the ordinary shape of the contention trap
-  recorded above, and which also did not reproduce.
+- `is_interrupted_tombstone` (`:2633-2639`) is *defined* as 0200 with `st_size > 0`. It is
+  a named, expected state the supervisor knows how to handle, not an unrecoverable one.
+- `retire_held_record` (`:1372-1375`) resolves it — and **produces it transiently itself**:
+  it `fchmod`s to `INSTANCE_TOMBSTONE_MODE` *first* and `ftruncate`s to 0 *second*, so
+  between those two syscalls the file is 0200-with-content on disk.
+
+So 0200-with-content is reachable as a publication in flight, `validate_file_stat` rejects
+it as a hard `PermissionDenied`, and a client that reads during that window fails its
+autostart. That is a race worth waiting out — exactly what the narrowed retry is for.
+**The condition this file set ("stays unwritten until a run names which of the two `0200`
+states fired") is met, and it points toward the retry.** Maintainer's ruling 2026-08-12:
+write it in its own PR, not folded into unrelated work.
+
+Two cautions that remain true:
+
+- **It is load-dependent and does not reproduce on demand.** Both occurrences happened
+  under contention (local: another repo's suite, pid 4969 recorded by `pgrep`; CI: a
+  hosted runner). Quiet re-runs report **0 occurrences of `mode is 0200`**.
+- **It predates the engine work.** Nothing in P5.1 touches `gascand`, the runtime record,
+  or `crates/gascan`.
 
 ## P5.2 is done
 
