@@ -1,5 +1,16 @@
 # Adversarial review — Arca PR #56 (`feat/sandbox-engine`, head `f5fde96`)
 
+> **Status: the Critical and every Important are resolved at `b3390b8`; the eight Minors
+> are not.** C1 took option (b) — `Inspect` and `ListResources` answer
+> `unsupported_capability` — which **dissolved I3, I4 and I5**: all three are properties
+> of answers that no longer exist, and each is recorded on the method it belonged to so
+> that whoever restores those methods must fix them first. I1, I2 and I6 were fixed
+> directly. Option (a) was rejected on evidence this review had not reached: the restore
+> loop inside `initialize()` *writes*, marking persisted `running` containers exited with
+> code 137, so an engine sharing a live daemon's state root would declare that daemon's
+> containers dead. This file is left as written — it records what was observed at
+> `f5fde96`. What changed is in gascan's `docs/status/START-HERE.md`.
+
 Reviewed against merge-base `e68ac5c`. Working tree `/Users/kiener/code/arca`, plus the
 consumer at `/Users/kiener/code/gascan`.
 

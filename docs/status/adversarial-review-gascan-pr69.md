@@ -1,5 +1,13 @@
 # Adversarial review — Gas Can PR #69 (`docs/p5-1-engine-design`, 9665107..39be145)
 
+> **Status: C1 and I1–I5 are fixed on this branch; the six Minors are not.** M1 and M2
+> were taken as well, because they were load-bearing for the rest — M2's EXIT trap
+> collapsed every documented exit code to 1, and the new pin-contract cases assert exact
+> codes. M4's overclaiming comment was corrected in place rather than the check widened;
+> the finding itself stands. This file is left as written: it records what was observed at
+> `39be145`, and rewriting it would destroy the evidence. What changed, and what it was
+> checked against, is in `docs/status/START-HERE.md`.
+
 Reviewer stance: find what is wrong. Prior "this is good" reviews treated as claims to attack.
 
 **Counts: 1 Critical, 5 Important, 6 Minor.** Nine claims/properties attacked and held — listed at

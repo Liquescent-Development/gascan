@@ -28,18 +28,28 @@ the design document supersedes the narrower readings.
 
 ### Arca — `~/code/arca`, branch `feat/sandbox-engine`, **pushed, but no PR and not merged**
 
-Seven task commits `bc03394..e74aff0`, a dependency fix `8fc1ca5`, and a comment fix
-`f5fde96`. All reviewed. 27 tests pass.
+Seven task commits `bc03394..e74aff0`, a dependency fix `8fc1ca5`, a comment fix
+`f5fde96`, and two commits answering the adversarial review — `16abeec` (Inspect and
+ListResources) and `b3390b8` (the socket path and the shutdown path). All reviewed.
+**30 tests pass** (`swift test --filter ArcaEngineTests`, exit 0); it was 27 before the
+review commits added three to `EngineServerTests`.
 
-The branch is now on `Vas-Solutus/arca` and carries the signed annotated tag
-**`gascan-engine-m1` at `f5fde96`** — the tag Gas Can's `engine/arca-pin.json` names.
-**There is still no PR and nothing is merged**, so `main` in Arca has no engine in it; the
-tag is the only thing holding that revision reachable.
+The branch is on `Vas-Solutus/arca` and carries the signed annotated tag
+**`gascan-engine-m1.1` at `b3390b8`** — the tag Gas Can's `engine/arca-pin.json` names.
+The older `gascan-engine-m1` at `f5fde96` is still pushed and still valid; it was left
+where it was rather than moved, because moving a pushed signed tag rewrites what an
+already-verified pin resolved to. **There is still no PR merged**, so `main` in Arca has
+no engine in it; the tags are the only thing holding those revisions reachable.
 
 **The engine genuinely runs** — VERIFIED by running it: `swift run arca-engine
 --socket-path … --state-root …` logs `engine listening` and creates the socket
-`srw-------`. `Capabilities`, `Inspect` and `ListResources` are real; the other eight
-methods answer `unsupported_capability` until later milestones.
+`srw-------`. **`Capabilities` is the one implemented method; the other ten answer
+`unsupported_capability`.** `Inspect` and `ListResources` used to be counted as real and
+are not: the process calls `initialize()` on no manager, so both could return exactly one
+answer — `absent` and an empty list — under every input. Answering `absent` without having
+looked is what makes a reconciler create a duplicate of a running sandbox, so both now
+refuse. The reasoning is in `SandboxEngineService.swift` on each method and in
+`ArcaEngineCommand.run()`.
 
 ### Gas Can — `~/code/gascan`, branch `docs/p5-1-engine-design`
 
@@ -52,16 +62,20 @@ landed without a review.
 |---|---|---|
 | 8 | `f75d069`, `ddb4f6a` | `scripts/build-arca-engine.sh` builds the engine product, runs its tests in the verified clean checkout, and prints the binary path as a second stdout line |
 | 9 | `cb81024` | the live harness — a real engine on a real socket, and the `connect` error paths |
-| 10 | `2fe3711` | live coverage of `Capabilities`, `Inspect` and `ListResources` |
+| 10 | `2fe3711` | live coverage of `Capabilities`, `Inspect` and `ListResources` — since replaced, see below |
 | 11 | `c0e0cc8`, `aebf558`, `fb50d4c` | `tests/release/engine-targets-check.sh` — neither `arca-engine` nor `ArcaEngine` reaches `DockerAPI` or `ArcaDaemon` |
 
-**1435 tests pass, 0 fail, 28 ignored** (`cargo test --workspace`, run alone, exit 0).
+Then the **review wave**, which is the current tip. See below.
+
+**1435 tests pass, 0 fail, 26 ignored** across 74 targets reporting `0 filtered out`
+(`cargo test --workspace --no-fail-fast`, exit 0). It was 28 ignored: the live tier's
+`Inspect` and `ListResources` tests folded into one that covers all ten unimplemented
+methods, so the tier went from 8 tests / 6 ignored to 6 / 4, and nothing else moved.
 
 ## What to do next
 
-**Both PRs are open, CI is green on both, and NEITHER MAY MERGE.** An independent adversarial
-review of each found one Critical apiece, both reproduced end to end rather than argued. The
-maintainer has asked for **every Critical and Important** to be fixed.
+**Every Critical and Important from both adversarial reviews is fixed.** The Minors are
+not, and are the work list.
 
 | | |
 |---|---|
@@ -70,68 +84,72 @@ maintainer has asked for **every Critical and Important** to be fixed.
 | Findings, Gas Can | `docs/status/adversarial-review-gascan-pr69.md` — Critical 1, Important 5, Minor 6 |
 | Findings, Arca | `docs/status/adversarial-review-arca-pr56.md` — Critical 1, Important 6, Minor 8 |
 
-Read both reports. They carry file:line, a reproduced failure scenario, and a fix for each
-finding, plus a section on what was attacked and *held* — which is as load-bearing as the
-findings, because it says what not to re-litigate.
+Read both reports before touching either repository. They carry file:line, a reproduced
+failure scenario, and a fix for each finding, plus a section on what was attacked and
+*held* — which is as load-bearing as the findings, because it says what not to
+re-litigate. **Read the "attacked and could not break" sections too.**
 
-**The two Criticals, because they are the ones that change what you believe:**
+**What the two Criticals turned out to be, because they change what you believe:**
 
-1. **Gas Can — the signed-pin gate can verify a different object than the one it compiles.**
-   `scripts/build-arca-engine.sh:64` calls `verify-tag "$tag"` unqualified while `:70`
-   resolves `refs/tags/${tag}` qualified. Git tries `refs/<name>` before `refs/tags/<name>`,
-   so the signature gate and the identity gate can resolve different objects. REPRODUCED:
-   with `refs/tags/foo` (annotated, good) and `refs/tags/tags/foo` (lightweight, evil),
-   unqualified `tags/foo^{commit}` resolves to the good commit while
-   `refs/tags/tags/foo^{}` resolves to the evil one — all three gates pass and the evil
-   commit is compiled. The one-word fix is `verify-tag "refs/tags/${tag}"`; also constrain
-   `.tag` in the pin schema. `scripts/sync-arca-proto.sh:82` has the same pattern and is
-   immune only by accident. **The current pin is not exploited** — `gascan-engine-m1` has no
-   slash and was verified independently — but fix this before trusting the gate again.
-2. **Arca — `Inspect` and `ListResources` can never report anything, for the life of the
-   process.** Not restart-scoped, and not only containers. `initialize()` is never called
-   (`Sources/arca-engine/ArcaEngineCommand.swift:40-56`, comments only); the sole insertion
-   sites for `ContainerManager.containers` are `:382` (inside `initialize()`) and `:1883`
-   (inside `createContainer`, which answers `unsupported_capability`). Volumes and networks
-   are equally blind. PROVEN LIVE: a state root seeded from a real `~/.arca/state.db`
-   (1 container, 2 networks) still yields `ListResources = Ok([])`. The danger is semantic —
-   `Absent` means "it is not there", so a reconciler creates a duplicate sandbox.
-   **This is a design decision for the maintainer, not a mechanical fix:** either call
-   `initialize()` this milestone, or make these two answer `unsupported_capability` like the
-   other eight rather than answer a confident falsehood. Do not leave it as is. Whichever
-   way it goes, the PR body and this file must stop calling those three methods implemented.
+1. **Gas Can — the signed-pin gate could verify a different object than the one it
+   compiled.** `verify-tag "$tag"` unqualified beside `refs/tags/${tag}` qualified: git
+   tries `refs/<name>` before `refs/tags/<name>`, so the signature gate and the identity
+   gate could land on different objects. Fixed by qualifying every tag name in both
+   `build-arca-engine.sh` and `sync-arca-proto.sh`, and by constraining `.tag` in the pin
+   schema to `^[A-Za-z0-9._-]+$`. **The old pin was never exploited** — `gascan-engine-m1`
+   has no slash and was verified independently.
+   `tests/release/engine-pin-contract.sh` now carries both halves of the attack as
+   negative cases, and **both were confirmed to catch it**: against the unfixed script
+   `slash-tag` exits 0 (the attacker's commit is compiled) and so does `shadowed-ref`.
+2. **Arca — `Inspect` and `ListResources` could never report anything.** Resolved by
+   option (b): both now answer `unsupported_capability`. Calling `initialize()` was
+   rejected for this milestone on evidence the review had not reached — its restore loop
+   *writes*, marking every persisted `running` container exited with code 137
+   (`ContainerManager.swift:316-338`), so an engine pointed at a live `ArcaDaemon`'s state
+   root would declare that daemon's containers dead; and `NetworkManager.initialize()`
+   ends in `createDefaultNetworks()`, which creates a vmnet network. **This dissolved
+   Arca's I3, I4 and I5** — all three are properties of answers that no longer exist.
+   Milestone 2 gives ContainerBridge a read-only load path that neither starts a VM nor
+   writes, and restores both methods.
 
-**Three findings correct things this repository currently asserts.** Fix the records with the
-code: the "hardcoded forbidden-name pair" in `engine-targets-check.sh` is not cosmetic (a
-rename of `DockerAPI` upstream makes the check print PASS while the edge exists — executed);
-`ci-classify-paths.sh` routes the live tier on its *test files* but not on its *subject*, so
-editing `crates/gascan-arca/src/channel.rs` skips the engine job entirely; and
-`ci-classify-paths.sh:35` says "four of its six tests" where the truth is 8 tests / 6 ignored,
-contradicting `ci.yml:137-139`.
+**What is left: the Minors, 6 in Gas Can and 8 in Arca.** Two Gas Can Minors were taken
+along the way because they were load-bearing for an Important — M1 (the `runtime-probe`
+comment orphaned onto `gate`) and M2 (the EXIT trap that collapsed every documented exit
+code to 1, which the new pin-contract cases assert exactly). M3 (the `/tmp` socket-root
+leak), M4 (the product check being narrower than its comment — the comment now says so),
+M5 and M6 remain, as do all eight Arca Minors.
 
 Then milestone 2, which is outlined at the end of the plan and is to be *planned* when
-milestone 1 lands — not before, because its tasks depend on what milestone 1 found. Note that
-Arca Critical 1 is exactly the `ContainerManager.initialize()` question milestone 2 was
-already expected to revisit; it has arrived early and with teeth.
+milestone 1 lands — not before, because its tasks depend on what milestone 1 found. The
+`ContainerManager.initialize()` question it was already expected to revisit now has an
+answer to build on rather than an open decision.
 
 ## The pin is real now
 
-**`engine/arca-pin.json` names the signed annotated tag `gascan-engine-m1` at
-`f5fde96224937e4617b8dac9ae5eeea837089420` on `https://github.com/Vas-Solutus/arca.git`.**
+**`engine/arca-pin.json` names the signed annotated tag `gascan-engine-m1.1` at
+`b3390b80528f425be0109298d6a95dd863747c5d` on `https://github.com/Vas-Solutus/arca.git`.**
 This resolves the blocker earlier versions of this file recorded, which said the pin named
 `gascan-engine-proto-v1` at `77b293e` — a revision with no engine in it, against which
 `swift build --product arca-engine` exits 1, so CI's `engine` job *failed* rather than
 building something old. It does not fail any more. Do not reintroduce the old wording.
 
+**VERIFIED end to end against this pin**, not merely resolved: `./scripts/build-arca-engine.sh`
+exits 0 in 6m00s from a cold clone — signature verified against `engine/allowed-signers`,
+tag target matched, clean checkout, `Executed 30 tests, with 0 failures` — and prints the
+checkout and binary paths. The live tier then passes 4/4 against that binary.
+
 The engine build step is `.github/workflows/ci.yml:108` — re-derive that anchor with
 `grep -n 'Build the pinned Arca engine' .github/workflows/ci.yml` rather than trusting it.
 It has drifted on every single pass over this file so far; assume it has drifted again.
+The `printf` anchor inside `ci.yml`'s own comments had drifted from `:179` to `:208` and
+was corrected the same way — `grep -n "printf '%s" scripts/build-arca-engine.sh`.
 
 `.artifacts/arca-dev-pin.json` still exists as a *development* pin naming a
 `file:///Users/kiener/code/arca` URL and a local `gascan-engine-dev` tag. `.artifacts/` is
 gitignored and worthless on any other machine — it is a convenience, no longer a
-substitute. It trails Arca HEAD by one commit (`8fc1ca5` against `f5fde96`), so **any
-rebuild from it must first move the local tag** (`git tag -f -s`) and update its revision,
-or `build-arca-engine.sh`'s tag-target assertion rejects it — correctly.
+substitute. It now trails Arca HEAD by three commits, so **any rebuild from it must first
+move the local tag** (`git tag -f -s`) and update its revision, or
+`build-arca-engine.sh`'s tag-target assertion rejects it — correctly.
 
 ## What milestone 1 answered
 
@@ -236,12 +254,41 @@ is prohibited here. `ls` is aliased to something that rejects trailing-slash pat
 **A DOCS-ONLY CI RUN SKIPS `rust` AND `engine` ENTIRELY** (VERIFIED, run `31262534703`), so a
 green docs run is not evidence about anything in Rust.
 
-## Do not write D7's narrowed retry
+## D7 has fired, and it named the state that a retry cannot fix
 
-No `0200` occurrence has fired since the instrument landed. The retry is approved in
-principle and stays unwritten until a run names which of the two `0200` states fired. A
-failing run containing the D7 test's *name* is not a D7 occurrence — check the message
-(`mode 0200 …`), never the test name.
+**The first `0200` occurrence landed on 2026-08-12.** The instrument did exactly what it
+was built for. Verbatim, from `cargo test --workspace --no-fail-fast` on this branch:
+
+```
+---- daemon_stderr_sink_survives_the_launching_cli stdout ----
+daemon start failed: stdout=, stderr=Error: started daemon did not become healthy and
+current (state Unsafe): protected runtime file is unsafe: mode is 0200 and the file has
+content: written but never published (mode 0200, size 375, links 1, uid 501, expected
+uid 501)
+```
+
+Read the message, not the test name — that was always the rule, and here it pays. Of the
+two `0200` states `crates/gascan/src/daemon.rs:3077-3079` distinguishes, the one that
+fired is **"has content: written but never published", size 375**. Its own doc comment
+(`:3057-3064`) says that state is "a daemon that wrote its record and died before
+publishing, which never becomes 0600 on its own" — a corpse, not a publication in flight.
+
+**So the evidence that unblocks the retry is also evidence against it.** A retry resolves
+the empty-file state, which is a race worth waiting out. It cannot resolve this one. The
+retry stays unwritten, and the decision now belongs to the maintainer with an observation
+under it rather than without one.
+
+Two cautions on this observation, both load-bearing:
+
+- **It did not reproduce.** The run that produced it was contended — another repository's
+  `cargo test --workspace` was running on the same machine throughout (`pgrep` recorded,
+  pid 4969). The re-run reports exit 0 with **0 occurrences of `mode is 0200`**. So this
+  is a real occurrence of the state, not a reliable reproducer of it.
+- **It is not this branch's doing.** Nothing here touches `gascand`, the runtime record,
+  or `crates/gascan`. The same contended run also failed
+  `doctor_recovers_a_legacy_daemon_through_double_attested_sigterm` with
+  `ParseIntError { kind: Empty }`, which is the ordinary shape of the contention trap
+  recorded above, and which also did not reproduce.
 
 ## P5.2 is done
 
