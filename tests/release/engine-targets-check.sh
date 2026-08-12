@@ -39,19 +39,32 @@ done
 # targets, so the instrument covers both.
 roots='["arca-engine", "ArcaEngine"]'
 
+# The names the roots must not reach, in one place because two things read them:
+# the liveness guard immediately below and the `forbidden` predicate in the walk.
+# Two copies of a list like this is how one of them silently stops matching.
+banned='["DockerAPI", "ArcaDaemon"]'
+
 describe=$(swift package describe --package-path "$checkout" --type json)
 
 # A renamed root would make every assertion below vacuously true, so the roots
-# are required to exist before their closures are believed.
-missing=$(printf '%s' "$describe" | jq -r --argjson roots "$roots" '
+# are required to exist before their closures are believed. The forbidden names
+# need exactly the same guard for exactly the same reason, and did not have it:
+# they are matched by literal string, against names nothing required to be
+# present. EXECUTED against a scratch package whose only change was renaming
+# DockerAPI to DockerHTTPAPI -- with the engine still reaching it, this script
+# printed `PASS: neither arca-engine nor ArcaEngine reaches DockerAPI or
+# ArcaDaemon` and exited 0. Arca is a separate repository whose renames Gas Can
+# does not review, so that is not a hypothetical.
+missing=$(printf '%s' "$describe" | jq -r --argjson roots "$roots" --argjson banned "$banned" '
   [.targets[].name] as $names
-  | [$roots[] | select(. as $root | $names | index($root) | not)]
+  | [($roots + $banned)[] | select(. as $wanted | $names | index($wanted) | not)]
   | join(" ")
 ')
 
 if [ -n "$missing" ]; then
-  printf 'check root target(s) absent from the manifest: %s\n' "$missing" >&2
-  printf 'the roots were renamed, or the manifest shape changed.\n' >&2
+  printf 'target(s) this check depends on are absent from the manifest: %s\n' "$missing" >&2
+  printf 'the roots or the forbidden targets were renamed, or the manifest\n' >&2
+  printf 'shape changed; this check is not measuring anything.\n' >&2
   exit 65
 fi
 
@@ -68,22 +81,26 @@ fi
 #
 # Product dependencies are checked but not walked: `describe` reports only this
 # package's targets, so there is nothing to walk into. Checking them costs one
-# line and closes the day someone moves DockerAPI into its own SwiftPM package,
-# after which a target-only check would go silently green.
+# line and catches the day someone moves DockerAPI into its own SwiftPM package
+# *under the same name*, after which a target-only check would go silently
+# green. It does not catch a rename on the way out -- a product called
+# ArcaDockerKit re-exporting the same code passes -- and the liveness guard
+# above cannot help here, because a forbidden product need not exist today.
+# Stated rather than implied, so nobody reads this line as more than it is.
 #
 # MANIFEST_SHAPE_CHANGED rather than an empty result when the positive control
 # fails: if `target_dependencies` is ever renamed or dropped, every adjacency
 # list becomes [] and every closure collapses to its root, which is a green run
 # that proves nothing. The root-existence guard above does not catch it, because
 # the root names still exist. A known-true edge must therefore be present.
-findings=$(printf '%s' "$describe" | jq -r --argjson roots "$roots" '
+findings=$(printf '%s' "$describe" | jq -r --argjson roots "$roots" --argjson banned "$banned" '
   ({targets: [], products: []}) as $empty
   | (reduce .targets[] as $target ({};
       .[$target.name] = {
         targets: ($target.target_dependencies // []),
         products: ($target.product_dependencies // [])
       })) as $graph
-  | def forbidden($name): $name == "DockerAPI" or $name == "ArcaDaemon";
+  | def forbidden($name): ($banned | index($name)) != null;
     def search($frontier; $seen):
       if ($frontier | length) == 0 then []
       else ($frontier[0]) as $path
