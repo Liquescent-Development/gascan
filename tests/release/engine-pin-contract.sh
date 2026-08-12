@@ -37,12 +37,19 @@ git -C "$subupstream" config user.email engine@example.invalid
 git -C "$subupstream" add -A
 git -C "$subupstream" -c commit.gpgsign=false commit -qm seed
 
-# An upstream repository standing in for Arca. It carries a Package.swift with
-# targets named ContainerBridge and SandboxEngineProto, because those are the two
-# the build script names. A fixture that declares fewer targets than the script
+# An upstream repository standing in for Arca. It carries a Package.swift naming
+# everything the build script names: the arca-engine executable product it builds,
+# the SandboxEngineProto target it builds beside it, and the ArcaEngineTests target
+# its test gate filters on. A fixture that declares fewer targets than the script
 # builds does not exercise the script; it just fails differently.
+#
+# No `products:` array, matching Arca (Package.swift:11-34): `swift build --product
+# arca-engine` has to resolve through SwiftPM's implicit executable product here for
+# the same reason it does there, or the contract would exercise a shape production
+# does not have.
 upstream=$fixture/upstream
-mkdir -p "$upstream/Sources/ContainerBridge" "$upstream/Sources/SandboxEngineProto"
+mkdir -p "$upstream/Sources/ContainerBridge" "$upstream/Sources/SandboxEngineProto" \
+  "$upstream/Sources/arca-engine" "$upstream/Tests/ArcaEngineTests"
 cat >"$upstream/Package.swift" <<'PACKAGE'
 // swift-tools-version: 6.2
 import PackageDescription
@@ -57,12 +64,39 @@ let package = Package(
         // Stands in for Arca's generated engine-contract server code. Dependency
         // free on purpose: the contract under test is that the pin builds the
         // target, not what the generated code imports.
-        .target(name: "SandboxEngineProto")
+        .target(name: "SandboxEngineProto"),
+        // The artifact the script actually ships. It reaches ContainerBridge, and
+        // through it the submodule, so the executable build is what pulls the
+        // planted-contamination proof's sources through the compiler.
+        .executableTarget(
+            name: "arca-engine",
+            dependencies: ["ContainerBridge", "SandboxEngineProto"]
+        ),
+        .testTarget(name: "ArcaEngineTests", dependencies: ["ContainerBridge"])
     ]
 )
 PACKAGE
 printf 'public let engineFixture = 1\n' >"$upstream/Sources/ContainerBridge/Fixture.swift"
 printf 'public let sandboxEngineProtoFixture = 1\n' >"$upstream/Sources/SandboxEngineProto/Fixture.swift"
+cat >"$upstream/Sources/arca-engine/main.swift" <<'MAIN'
+import ContainerBridge
+import SandboxEngineProto
+
+print(engineFixture + sandboxEngineProtoFixture)
+MAIN
+# A real assertion and not an empty test body: the script's gate proves the pinned
+# engine passes its own suite, so a fixture whose suite cannot fail would leave the
+# gate's failing direction unexercised.
+cat >"$upstream/Tests/ArcaEngineTests/EngineFixtureTests.swift" <<'TEST'
+import ContainerBridge
+import XCTest
+
+final class EngineFixtureTests: XCTestCase {
+    func testTheFixtureTargetIsTheOneThatWasBuilt() {
+        XCTAssertEqual(engineFixture, 1)
+    }
+}
+TEST
 git -C "$upstream" init -q
 git -C "$upstream" config user.name fixture
 git -C "$upstream" config user.email engine@example.invalid
