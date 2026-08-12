@@ -80,9 +80,9 @@ This resolves the blocker earlier versions of this file recorded, which said the
 `swift build --product arca-engine` exits 1, so CI's `engine` job *failed* rather than
 building something old. It does not fail any more. Do not reintroduce the old wording.
 
-The engine build step is `.github/workflows/ci.yml:106` — re-derive that anchor with
-`grep -n 'Build the pinned Arca engine' .github/workflows/ci.yml` rather than trusting it,
-because it has moved twice already.
+The engine build step is `.github/workflows/ci.yml:108` — re-derive that anchor with
+`grep -n 'Build the pinned Arca engine' .github/workflows/ci.yml` rather than trusting it.
+It has drifted on every single pass over this file so far; assume it has drifted again.
 
 `.artifacts/arca-dev-pin.json` still exists as a *development* pin naming a
 `file:///Users/kiener/code/arca` URL and a local `gascan-engine-dev` tag. `.artifacts/` is

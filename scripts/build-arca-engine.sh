@@ -146,9 +146,16 @@ swift build --package-path "$checkout" --configuration release \
 # so a listing with no ArcaEngineTests entry is exactly the case where the filter
 # would match nothing. Parsing the human-readable run output was considered and
 # rejected as a more brittle contract that can drift silently across Swift versions,
-# which is the decay class this guard exists to close. (`--list-tests --filter` is
-# not the form: Swift 6.3.3 deprecates --list-tests in favour of `swift test list`,
-# which rejects --filter with "Unknown option".)
+# which is the decay class this guard exists to close.
+#
+# The whole listing is grepped, and NO --filter is passed to it, because the obvious
+# form -- filter the listing and fail when it comes back empty -- CANNOT WORK.
+# MEASURED on Swift 6.3.3: `swift test list --disable-swift-testing --filter
+# ZZZNoSuchSuiteName` exits 0 and prints the full UNFILTERED listing; `swift test
+# list` accepts --filter and silently ignores it. So a filtered-listing guard would
+# never fire. ("Unknown option '--filter'" belongs to the other form: `swift test
+# --list-tests --filter`, which exits 64 and warns that --list-tests is deprecated in
+# favour of `swift test list`. Neither form takes a filter usefully.)
 #
 # The listing builds the test targets, so the run below is incremental against it.
 listed=$(swift test list --package-path "$checkout" --configuration release \

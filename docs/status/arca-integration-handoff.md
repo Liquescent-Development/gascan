@@ -3083,7 +3083,7 @@ ContainerBridge --target SandboxEngineProto`, both of which exist at `77b293e` â
 branch from Task 8 onward. A reader who believed the old wording would have scheduled the pin
 bump as tidy-up rather than as a merge blocker. Say what a stale pin *does*, not what it names.
 
-The engine build step is **`.github/workflows/ci.yml:106`**. Two earlier versions of this document
+The engine build step is **`.github/workflows/ci.yml:108`**. Two earlier versions of this document
 anchored it at `:91`, which Task 11 moved to `:96` and the live-tier step moved again â€” re-derive
 it with `grep -n 'Build the pinned Arca engine' .github/workflows/ci.yml` rather than trusting any
 number written here.

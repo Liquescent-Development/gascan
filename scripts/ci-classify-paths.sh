@@ -31,6 +31,17 @@ while IFS= read -r path; do
       engine=true
       contracts=true
       ;;
+    # The live tier. Four of its six tests are #[ignore]d, so `cargo test
+    # --workspace` in the rust job compiles them but never runs them; the only place
+    # they execute is the engine job's live-tier step, which needs a built engine.
+    # Without this these would fall through to crates/* and fire rust alone, so a
+    # change to the live tests would never run the live tests -- the same hole the
+    # engine-targets-check.sh case above closes. rust as well, because the rust job
+    # still compiles them and still runs the two that are not ignored.
+    crates/gascan-arca/tests/live.rs|crates/gascan-arca/tests/live/*)
+      engine=true
+      rust=true
+      ;;
     # Run by crates/gascan-engine-proto's build script, so a change to it changes
     # what the Rust build generates.
     scripts/sync-arca-proto.sh)

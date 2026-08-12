@@ -60,6 +60,18 @@ expect 'another tests/release path still runs contracts only' \
   'tests/release/engine-pin-contract.sh' \
   'rust=false contracts=true engine=false'
 
+expect 'the live tier runs engine and rust, because only the engine job runs its ignored tests' \
+  'crates/gascan-arca/tests/live/read_rpcs.rs' \
+  'rust=true contracts=false engine=true'
+
+expect 'the live tier target root does too' \
+  'crates/gascan-arca/tests/live.rs' \
+  'rust=true contracts=false engine=true'
+
+expect 'another crate test path still runs rust only' \
+  'crates/gascan-arca/tests/backend_unary.rs' \
+  'rust=true contracts=false engine=false'
+
 expect 'the proto sync script runs rust and contracts' \
   'scripts/sync-arca-proto.sh' \
   'rust=true contracts=true engine=false'
