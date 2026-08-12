@@ -3000,7 +3000,8 @@ outlined at its end and are to be planned when their predecessor lands, not befo
 
 ### State
 
-**Arca** (`~/code/arca`, branch `feat/sandbox-engine`, **not pushed, no PR**):
+**Arca** (`~/code/arca`, branch `feat/sandbox-engine`, **pushed to `Vas-Solutus/arca`, but no PR
+and not merged**):
 
 | Commit | What |
 |---|---|
@@ -3011,10 +3012,20 @@ outlined at its end and are to be planned when their predecessor lands, not befo
 | `c08e668` | `Inspect`, with an absent arm and exact digests |
 | `d25b2b3` | `ListResources`, labelled resources and unlabelled alike |
 | `e74aff0` | `EngineServer` over a Unix socket, and the `arca-engine` executable |
-| `8fc1ca5` | Constrain grpc-swift-2 below 2.4 — see the blocker below |
+| `8fc1ca5` | Constrain grpc-swift-2 below 2.4 — see the dependency defect below |
+| `f5fde96` | `Package.swift:111` named `tests/release/engine-targets-contract.sh`, a path that stopped existing when Gas Can renamed it to `engine-targets-check.sh`. Comment only |
 
 All seven task commits passed an independent review that verified claims against source rather
 than accepting the implementer's word. 27 tests pass (`swift test --filter ArcaEngineTests`).
+
+The branch carries the signed annotated tag **`gascan-engine-m1` at `f5fde96`**, which is what
+Gas Can's `engine/arca-pin.json` pins. **`git ls-remote https://github.com/Vas-Solutus/arca.git
+'refs/tags/gascan-engine-m1*'`** returns the tag object `b9ca374` and `gascan-engine-m1^{}` →
+`f5fde96224937e4617b8dac9ae5eeea837089420`, so it is annotated rather than lightweight and
+dereferences to the pinned revision; `git verify-tag` against `engine/allowed-signers` reports
+`Good "git" signature for richard@liquescent.dev`. **There is still no PR and nothing is merged**
+— Arca's `main` has no engine in it, and the tag is the only thing keeping that revision
+reachable. Deleting it is this design's revocation channel and would strand Gas Can's pin.
 
 **THE ENGINE GENUINELY RUNS.** VERIFIED by running it: `swift run arca-engine --socket-path …
 --state-root …` logged `engine listening` and created the socket as `srw-------` (0600, owner
@@ -3022,31 +3033,99 @@ than accepting the implementer's word. 27 tests pass (`swift test --filter ArcaE
 
 **Gas Can** (`~/code/gascan`, branch `docs/p5-1-engine-design`): design doc `33d37f9`, naming
 precondition `4981b39`, plan `77ff591`, signing-constraint correction `b36d18f`, handoff
-`ba15c51`, and Task 8 as `f75d069`. Tasks 9, 10 and 11 are untouched.
+`ba15c51`, then Tasks 8-11 and a whole-branch fix wave.
 
-`f75d069` is the one task in this plan that was **never task-reviewed** — it was verified by the
-controller end to end (shellcheck clean, exit 0, exactly two stdout lines, 27 tests, binary runs)
-but no independent reviewer looked at it. Dispatch one before trusting it the way the other seven
-can be trusted.
+| Task | Commit | What |
+|---|---|---|
+| 8 | `f75d069`, guard in `ddb4f6a` | `scripts/build-arca-engine.sh` builds the `arca-engine` product, runs `ArcaEngineTests` inside the verified clean checkout, and prints the binary path as a second stdout line |
+| 9 | `cb81024` | the live harness — a real engine on a real socket — and the `connect` error paths |
+| 10 | `2fe3711` | live coverage of `Capabilities`, `Inspect` and `ListResources` |
+| 11 | `c0e0cc8`, `aebf558`, `fb50d4c` | `tests/release/engine-targets-check.sh` — neither `arca-engine` nor `ArcaEngine` reaches `DockerAPI` or `ArcaDaemon` |
+
+**All four were independently reviewed**, including Task 8, which earlier versions of this
+document flagged as the one task that had landed without a review. That review is what settled
+the `--filter` finding recorded below.
+
+**Workspace suite: 1435 passed / 0 failed / 28 ignored, exit 0**, `cargo test --workspace`
+run alone. Re-derivable rather than merely reported: 1433 passed / 22 ignored at `a9cb67c`,
+plus 2 passing and 2 ignored from Task 9 and 4 ignored from Task 10.
 
 A tenth plan defect surfaced there, and it is the nastiest class: **a green suite reported as a
 failed build.** `swift test --configuration release` passes all 27 tests, then SwiftPM launches
 the swift-testing runner by invoking an executable target with `--test-bundle-path`; Arca's
 `Arca` command is an ArgumentParser program, rejects the unknown option, and the script exits
 non-zero. Anyone reading the exit code alone would conclude the engine's tests were broken. Fixed
-with `--disable-swift-testing`, since the package has no swift-testing tests.
+with `--disable-swift-testing`.
 
-### THE BLOCKER THAT MUST NOT BE FORGOTTEN
+**The reason for that flag is narrower than it first looked, and the wrong reason was written down
+here.** This document previously said "since the package has no swift-testing tests". That is
+false: `git -C ~/code/arca grep -ln '^import Testing'` returns **15 files**, across `ArcaIPTests`
+and `ArcaTests`. The true reason is that **`ArcaEngineTests` is pure XCTest**, so the flag skips
+nothing the build script intends to run, while release configuration would otherwise launch the
+swift-testing runner by invoking an executable target with `--test-bundle-path`. The distinction
+matters because the false reason is the one that would justify keeping the flag the day someone
+adds a `@Test` to `ArcaEngineTests` — at which point the flag would start silently skipping the
+engine's own tests.
 
-**Gas Can's committed `engine/arca-pin.json` still names `gascan-engine-proto-v1` at `77b293e` —
-a revision with no engine.** Everything above was built against a *development* pin at
-`.artifacts/arca-dev-pin.json`, which names a `file:///Users/kiener/code/arca` URL and a local
-`gascan-engine-dev` tag. `.artifacts/` is gitignored, so none of that is committed, and it is
-worthless on any other machine.
+### THE BLOCKER THAT WAS, AND IS RESOLVED
 
-Before anything merges: push `feat/sandbox-engine` to `Vas-Solutus/arca`, create a real signed
-tag there, and bump `engine/arca-pin.json` to it. Until then CI (`.github/workflows/ci.yml:91`)
-builds the pre-engine revision.
+**`engine/arca-pin.json` now names the signed annotated tag `gascan-engine-m1` at
+`f5fde96224937e4617b8dac9ae5eeea837089420`** on `https://github.com/Vas-Solutus/arca.git`,
+bumped in `752b75c`.
+
+The blocker this section used to record was worse than it was written up as. It said the pin
+named `gascan-engine-proto-v1` at `77b293e` and that "until then CI builds the pre-engine
+revision". **CI did not build it — CI *failed*.** `77b293e`'s manifest declares no `products:`
+array and no target named `arca-engine` or `ArcaEngine` (`git -C ~/code/arca show
+77b293e:Package.swift`), so `swift build --product arca-engine` exits 1 with `error: no product
+named 'arca-engine'`. The `engine` job was green on `main` — where the script named `--target
+ContainerBridge --target SandboxEngineProto`, both of which exist at `77b293e` — and red on this
+branch from Task 8 onward. A reader who believed the old wording would have scheduled the pin
+bump as tidy-up rather than as a merge blocker. Say what a stale pin *does*, not what it names.
+
+The engine build step is **`.github/workflows/ci.yml:106`**. Two earlier versions of this document
+anchored it at `:91`, which Task 11 moved to `:96` and the live-tier step moved again — re-derive
+it with `grep -n 'Build the pinned Arca engine' .github/workflows/ci.yml` rather than trusting any
+number written here.
+
+`.artifacts/arca-dev-pin.json` remains as a *development* pin naming a
+`file:///Users/kiener/code/arca` URL and a local `gascan-engine-dev` tag. `.artifacts/` is
+gitignored, so none of it is committed and it is worthless on any other machine — it is now a
+convenience rather than a substitute. It names revision `8fc1ca5` and so trails Arca HEAD
+(`f5fde96`) by one commit. Harmless as it stands, since the pin and the local tag still agree with
+each other and `f5fde96` changes only a manifest comment — but **any rebuild from the dev pin must
+first move the local tag** (`git tag -f -s`) and update the pin's revision to match, or
+`build-arca-engine.sh`'s tag-target assertion (`:74-78`) rejects it, correctly.
+
+### What the `engine` job runs now, and what it costs
+
+The whole-branch review found the live tier — the milestone's headline deliverable — running
+nowhere automatically: CI never set `GASCAN_ARCA_ENGINE_BIN` and never passed `--ignored`, so
+four of the six live tests executed only by hand and would have rotted the way Arca's own tests
+were rotting before Task 8. **Decided and wired, not deferred** (`7f46edd`): the `engine` job now
+runs `cargo test -p gascan-arca --test live --no-fail-fast -- --ignored` against the binary it
+just built, taken from the build script's **second** stdout line. Six `#[ignore]` attributes exist
+across `crates/gascan-arca/tests/live` (2 in `connect.rs`, 4 in `read_rpcs.rs`), so that run
+reports `running 6 tests`.
+
+Guarding the path is `test -f` **and** `test -x`, not `-x` alone: a directory satisfies `-x`, so
+a script that printed only its checkout line would otherwise hand the harness a directory and fail
+somewhere far from the cause.
+
+`timeout-minutes` went 45 → 90 in the same commit. `--filter` selects which tests *run*; SwiftPM
+still *builds* every test target, so the job now release-compiles all of Arca's test targets on
+top of the `arca-engine` product against a vendored `containerization`, where before this branch
+it compiled two library targets. The live tier adds a cold cargo build on top of that. 90 is
+headroom rather than a measured bound — no cold-runner time has been recorded.
+
+**A regression this branch introduced and nearly merged.** Task 8's build-script change broke
+`tests/release/engine-pin-contract.sh`: its synthetic fixture declared only `ContainerBridge` and
+`SandboxEngineProto`, the two targets the *old* script named, so the contract's positive case got
+`error: no product named 'arca-engine'` and exit 1 — reddening the `contracts` job, which `gate`
+requires. Nothing caught it because Task 8's diff touched only the script, the consumer that broke
+was a file Task 8 never opened, and `ci-run-release-contracts.sh` was correctly forbidden during
+the session for engine-cache lock reasons. **When a script grows a new requirement, grep for its
+fixtures.**
 
 ### The dependency defect Gas Can's pinned build exposed
 
@@ -3105,9 +3184,72 @@ subagent's session paused, the second leaving the build script's `mkdir` lock he
 fails closed by design, so every later run exited 75 until it was cleared. Long builds belong in
 the controller session, whose background tasks survive across turns.
 
-### For Task 9, before it is written
+### For Task 9, before it is written — now answered, kept for the reasoning
 
 The 103-byte `sun_path` limit applies to the Rust live harness too. Its socket lives under
 `tempfile::tempdir()`, which on macOS is `/var/folders/<…>/T/<…>`; a measured path came to 74
 bytes, so there is headroom but not much. Build the socket path under a short root and assert its
-length before binding, rather than meeting the limit as a mystery bind failure.
+length before binding, rather than meeting the limit as a mystery bind failure. **Task 9 did
+exactly that, and the shipped harness's socket path measures 41 bytes of the 103.**
+
+### What milestone 1 answered
+
+The design document's §9 lists the claims this milestone existed to settle. These are the answers,
+each an observation rather than an inference. They live here and not only in the SDD ledger,
+because the ledger is deleted on merge.
+
+- **A real engine accepts the client's placeholder authority `http://[::]:50051`.** The client
+  dials a Unix socket and sends an HTTP/2 `:authority` that names nothing; the question was
+  whether a real server half would reject it. It does not.
+
+- **A missing socket and a path that is not a socket render differently, and both name the
+  path.** Missing: `connect: engine transport failure: <path>: transport error: No such file or
+  directory (os error 2)`. A regular file at the same path: `… Socket operation on non-socket
+  (os error 38)`. Distinct errno, both naming the dialed path, and — the load-bearing part —
+  both carrying the io cause *past* tonic's opaque `transport error`. So `source_chain`
+  (`crates/gascan-arca/src/channel.rs:62-78`) does what its doc comment claims. These two tests
+  are deliberately **not** `#[ignore]`d: they need only a `TempDir`, and the `rust` job runs on
+  `macos-26` (`.github/workflows/ci.yml:39`), which is what makes the asserted errno strings
+  legitimate.
+
+- **The engine claimed nothing it had not earned.** Every capability flag came back `false` and
+  `offline` came back `Unverified`. `Unverified` is engine truth and not a proto3 default:
+  `translate.rs:304-310` rejects the zero value `Isolation::Unspecified` as `InvalidOutput`, so
+  the assertion cannot be satisfied by a default-valued message.
+
+- **The engine's first-ever execution costs ~997ms against ~10ms warm**, and that overran the
+  plan's 30s harness bound on a loaded machine — the first live run *failed* on it. The bound was
+  not simply widened: the harness now calls `try_wait()` inside `await_socket`, so a dead child
+  is reported immediately with its exit status instead of burning the bound telling the slow
+  story, and the bound then went to 120s for cold start. The early-exit path was proved capable
+  of firing rather than assumed: observed `engine exited with exit status: 1 before accepting a
+  connection on /tmp/gascan-arca-live-69933-0/engine.sock` in **361ms**. A CI box builds and then
+  first-runs the engine, which is exactly the cold shape.
+
+- **`swift test --filter <no match>` exits 0 having run nothing.** Measured in the pinned
+  checkout: `swift test --configuration release --disable-swift-testing --filter
+  ZZZNoSuchSuiteName` → **exit 0**, `Executed 0 tests, with 0 failures`, and only `warning: No
+  matching test cases were run` on stderr. So `scripts/build-arca-engine.sh`'s test gate would
+  have reported success having verified nothing the day `ArcaEngineTests` was renamed — silently,
+  in the one script standing between a signed tag and a shipped binary. Guarded in `ddb4f6a` with
+  a `swift test list` check, because the listing is a machine-readable contract where "Executed N
+  tests" is prose that can drift across Swift versions.
+
+- **A workspace run reporting 92 failures across 12 targets was not real**, and it was raised as
+  a blocker before it was settled. It is the same concurrent-cargo starvation artifact recorded
+  under "Measurement, and how it was got wrong first" above, where the precedent was 59 failures:
+  every failing target was a tier that spawns a daemon or a helper process and binds sockets.
+  Settled by three measurements rather than by argument. (a) At the merge-base `9665107`, same
+  machine, same outside contention: `cargo test -p gascand --test daemon_idle` → `running 11
+  tests`, 11 passed, exit 0. (b) The same command at the branch tip: `running 11 tests`, 11
+  passed, exit 0 — so the target reported failing 9/11 three times is green on both commits when
+  nothing else in this repo is running cargo. (c) The full suite with no other Gas Can cargo
+  process: `cargo test --workspace --no-fail-fast` → **exit 0, 1435 passed / 0 failed / 28
+  ignored**, counted with `awk` over the raw log and summing only the `test result:` lines
+  reporting `0 filtered out`.
+
+  **The report's claim that it "reproduces on a quiet machine" was the actual defect.** The
+  machine was not quiet — another repository's suite was running throughout, both before and
+  after the claim was made. A concurrency artifact is indistinguishable from a real failure
+  *except* by checking the precondition, so record the output of `pgrep -fl "cargo test"` rather
+  than asserting the machine was idle.

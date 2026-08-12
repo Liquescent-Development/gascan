@@ -381,8 +381,16 @@ direction.
 
 ## 9. The claims this answers
 
-`START-HERE:83-95` records these as unverified. Each gets an answer produced by a command,
-recorded with that command.
+`START-HERE`'s **"What P5.1 will discover"** section records these as unverified — the
+section as it stood at `9665107`, before this branch rewrote that file. Cited by section
+name and not by line range on purpose: the range this once carried (`:83-95`) already
+drifted onto unrelated text when `START-HERE` was rewritten in `ba15c51`, which is the
+exact defect §10 exists to complain about.
+
+Each gets an answer produced by a command, recorded with that command. Milestone 1
+answered the last two rows; `docs/status/arca-integration-handoff.md` carries those
+answers with their anchors, because this table's own scaffolding is disposable and that
+document is not.
 
 | Claim | Answered by |
 |---|---|

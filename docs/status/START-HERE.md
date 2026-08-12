@@ -26,10 +26,15 @@ meaning cancellation — is recorded there with its reasoning.
 service"; an earlier START-HERE said "wire the backend to the daemon". It is both, and
 the design document supersedes the narrower readings.
 
-### Arca — `~/code/arca`, branch `feat/sandbox-engine`, NOT pushed, no PR
+### Arca — `~/code/arca`, branch `feat/sandbox-engine`, **pushed, but no PR and not merged**
 
-Seven task commits `bc03394..e74aff0` plus a dependency fix `8fc1ca5`. All reviewed. 27
-tests pass.
+Seven task commits `bc03394..e74aff0`, a dependency fix `8fc1ca5`, and a comment fix
+`f5fde96`. All reviewed. 27 tests pass.
+
+The branch is now on `Vas-Solutus/arca` and carries the signed annotated tag
+**`gascan-engine-m1` at `f5fde96`** — the tag Gas Can's `engine/arca-pin.json` names.
+**There is still no PR and nothing is merged**, so `main` in Arca has no engine in it; the
+tag is the only thing holding that revision reachable.
 
 **The engine genuinely runs** — VERIFIED by running it: `swift run arca-engine
 --socket-path … --state-root …` logs `engine listening` and creates the socket
@@ -38,35 +43,73 @@ methods answer `unsupported_capability` until later milestones.
 
 ### Gas Can — `~/code/gascan`, branch `docs/p5-1-engine-design`
 
-Design, plan, and corrections committed (`33d37f9`, `4981b39`, `77ff591`, `b36d18f`), and
-**Task 8 committed as `f75d069`** — `scripts/build-arca-engine.sh` now builds the engine
-product, runs its tests inside the verified clean checkout, and prints the binary path as a
-second stdout line. VERIFIED end to end by the controller: shellcheck clean, exit 0, exactly
-two stdout lines, 27 tests, and the binary runs. **It has NOT been task-reviewed** — every
-other task in this plan passed an independent review and this one has not.
+Design, plan, and corrections committed (`33d37f9`, `4981b39`, `77ff591`, `b36d18f`), then
+**Tasks 8 through 11 and the whole-branch fix wave. All four tasks are complete and all
+four were independently reviewed**, including Task 8, which was the one task that had
+landed without a review.
 
-**Tasks 9, 10 and 11 are untouched** — the live-test harness, live coverage of the three
-implemented RPCs, and the contract test asserting `ArcaEngine` reaches neither `DockerAPI`
-nor `ArcaDaemon`.
+| Task | Commit | What |
+|---|---|---|
+| 8 | `f75d069`, `ddb4f6a` | `scripts/build-arca-engine.sh` builds the engine product, runs its tests in the verified clean checkout, and prints the binary path as a second stdout line |
+| 9 | `cb81024` | the live harness — a real engine on a real socket, and the `connect` error paths |
+| 10 | `2fe3711` | live coverage of `Capabilities`, `Inspect` and `ListResources` |
+| 11 | `c0e0cc8`, `aebf558`, `fb50d4c` | `tests/release/engine-targets-check.sh` — neither `arca-engine` nor `ArcaEngine` reaches `DockerAPI` or `ArcaDaemon` |
+
+**1435 tests pass, 0 fail, 28 ignored** (`cargo test --workspace`, run alone, exit 0).
 
 ## What to do next
 
-1. Dispatch a task review for Task 8 (`f75d069`), the one task that never got one.
-2. Tasks 9, 10, 11 from the plan. Use `superpowers:subagent-driven-development`.
+1. **Open the PR.** The branch is complete and both CI failures the final review found are
+   addressed: the pin is real (below), and `tests/release/engine-pin-contract.sh`'s fixture
+   declares the targets the build script now names — that one is VERIFIED, the contract
+   prints `PASS: Gas Can engine pin contract` at exit 0. The `engine` job against the new
+   pin has **not** been run end to end from a clean cache; the first CI run is the first
+   time that happens, so watch it rather than assuming it.
+2. **Open Arca's PR too, or decide not to.** `feat/sandbox-engine` is pushed and tagged but
+   unmerged, with no PR. Gas Can pins the *tag*, so nothing breaks while that is true — but
+   the tag is the only reference keeping the revision alive.
 3. Then milestone 2, which is outlined at the end of the plan and is to be *planned* when
    milestone 1 lands — not before, because its tasks depend on what milestone 1 found.
 
-## THE THING THAT MUST NOT BE FORGOTTEN
+## The pin is real now
 
-**`engine/arca-pin.json` still names `gascan-engine-proto-v1` at `77b293e` — a revision
-with no engine in it.** Everything built this session used a *development* pin at
-`.artifacts/arca-dev-pin.json`, naming a `file:///Users/kiener/code/arca` URL and a local
-`gascan-engine-dev` tag. `.artifacts/` is gitignored: none of it is committed, and it is
-worthless on any other machine.
+**`engine/arca-pin.json` names the signed annotated tag `gascan-engine-m1` at
+`f5fde96224937e4617b8dac9ae5eeea837089420` on `https://github.com/Vas-Solutus/arca.git`.**
+This resolves the blocker earlier versions of this file recorded, which said the pin named
+`gascan-engine-proto-v1` at `77b293e` — a revision with no engine in it, against which
+`swift build --product arca-engine` exits 1, so CI's `engine` job *failed* rather than
+building something old. It does not fail any more. Do not reintroduce the old wording.
 
-Before anything merges: push `feat/sandbox-engine` to `Vas-Solutus/arca`, create a real
-signed tag there, and bump `engine/arca-pin.json`. Until then CI
-(`.github/workflows/ci.yml:91`) builds the pre-engine revision.
+The engine build step is `.github/workflows/ci.yml:106` — re-derive that anchor with
+`grep -n 'Build the pinned Arca engine' .github/workflows/ci.yml` rather than trusting it,
+because it has moved twice already.
+
+`.artifacts/arca-dev-pin.json` still exists as a *development* pin naming a
+`file:///Users/kiener/code/arca` URL and a local `gascan-engine-dev` tag. `.artifacts/` is
+gitignored and worthless on any other machine — it is a convenience, no longer a
+substitute. It trails Arca HEAD by one commit (`8fc1ca5` against `f5fde96`), so **any
+rebuild from it must first move the local tag** (`git tag -f -s`) and update its revision,
+or `build-arca-engine.sh`'s tag-target assertion rejects it — correctly.
+
+## What milestone 1 answered
+
+These were unverified before this branch. Each is now an observation, and the anchors are
+in `docs/status/arca-integration-handoff.md`.
+
+- **A real engine accepts the client's placeholder authority `http://[::]:50051`.**
+- **A missing socket and a non-socket render differently, and both name the path.**
+  Missing: `No such file or directory (os error 2)`. A regular file: `Socket operation on
+  non-socket (os error 38)`. Both carry the io cause past tonic's opaque `transport error`,
+  so `source_chain` (`crates/gascan-arca/src/channel.rs:62-78`) does what it claims.
+- **The engine claimed nothing it had not earned** — every capability flag came back
+  `false` and `offline` came back `Unverified`.
+- **The measured socket path is 41 bytes of `sun_path`'s 103.** Headroom, but the harness
+  asserts the length before binding rather than meeting the cap as a mystery bind failure.
+- **The engine's first-ever execution costs ~997ms against ~10ms warm**, which overran the
+  plan's 30s harness bound. The harness now reports a dead child immediately via
+  `try_wait()` and waits 120s.
+- **`swift test --filter <no match>` exits 0 having run nothing.** Guarded now, in
+  `scripts/build-arca-engine.sh`.
 
 ## Traps that will cost you if you learn them the hard way
 
@@ -119,6 +162,15 @@ and check that their count equals the target count.
 `pgrep -fl "cargo test"` comes back empty. Concurrent suites against one target directory
 produced **rc=101 with 59 failures**, none of them real: those tiers spawn daemons and bind
 sockets, so they starve each other. Run alone it takes **93 seconds**.
+
+**AND IT HAPPENED AGAIN, AT 92 FAILURES, AND WAS NEARLY BELIEVED.** Task 10 raised a
+blocker on `rc=101, 92 failures across 12 targets`, every one of them a tier that spawns a
+daemon or a helper. It was the same artifact. Settled by measurement rather than argument:
+`cargo test -p gascand --test daemon_idle` is `running 11 tests`, 11 passed, exit 0 on
+*both* the merge-base `9665107` and the branch tip under the same contention, and the full
+suite run alone is exit 0 with **1435 passed / 0 failed / 28 ignored**. **A report claiming
+"it reproduces on a quiet machine" is not evidence the machine was quiet** — check
+`pgrep -fl "cargo test"` yourself and record the output.
 
 **`git checkout <path>` IS NOT A PERSONAL UNDO IN A SHARED TREE.** It discards every
 uncommitted change to that path, including another agent's in-flight work. Check
