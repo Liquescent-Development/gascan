@@ -52,6 +52,14 @@ expect 'the engine build script runs engine and contracts' \
   'scripts/build-arca-engine.sh' \
   'rust=false contracts=true engine=true'
 
+expect 'the engine targets check runs engine and contracts, not contracts alone' \
+  'tests/release/engine-targets-check.sh' \
+  'rust=false contracts=true engine=true'
+
+expect 'another tests/release path still runs contracts only' \
+  'tests/release/engine-pin-contract.sh' \
+  'rust=false contracts=true engine=false'
+
 expect 'the proto sync script runs rust and contracts' \
   'scripts/sync-arca-proto.sh' \
   'rust=true contracts=true engine=false'

@@ -24,6 +24,13 @@ while IFS= read -r path; do
       engine=true
       contracts=true
       ;;
+    # Runs in the engine job, because that is the only job with an Arca tree to
+    # inspect. Without this it would fall through to tests/* and fire contracts
+    # alone, so a change to the check would never run the check.
+    tests/release/engine-targets-check.sh)
+      engine=true
+      contracts=true
+      ;;
     # Run by crates/gascan-engine-proto's build script, so a change to it changes
     # what the Rust build generates.
     scripts/sync-arca-proto.sh)

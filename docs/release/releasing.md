@@ -96,7 +96,13 @@ cargo metadata --locked --no-deps --format-version 1 \
   | jq -er '.packages[] | select(.name == "gascan") | .version'
 cargo check --locked --workspace --all-targets
 for c in tests/release/*-contract.sh; do bash "$c" >/dev/null || echo "FAIL $c"; done
+./tests/release/engine-targets-check.sh "$(./scripts/build-arca-engine.sh | head -1)"
 ```
+
+`engine-targets-check.sh` is named `-check` rather than `-contract` precisely so
+the glob above skips it: it takes an Arca checkout, and every script that glob
+matches is run with no arguments. Run it separately, as shown. CI does the same
+thing in `ci.yml`'s `engine` job, which is the only job with an Arca tree.
 
 **Commit the bump before running the contracts.** Two of them clone `HEAD` for
 their behavioral cases while reading the working tree for their source

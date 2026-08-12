@@ -87,8 +87,26 @@ jobs:
           swift --version
           sw_vers
 
+      # The checkout path is captured rather than discarded because
+      # engine-targets-check.sh needs an Arca tree, and this job is the only one
+      # that has one. `head -1` and not `tail`: the script prints checkout then
+      # binary (scripts/build-arca-engine.sh:141). The pipeline would otherwise
+      # mask a build failure behind head's exit status, so the script's stdout
+      # goes to a file first and its own status is what gates the step.
       - name: Build the pinned Arca engine
-        run: ./scripts/build-arca-engine.sh
+        run: |
+          set -eu
+          ./scripts/build-arca-engine.sh >"$RUNNER_TEMP/engine-build.out"
+          cat "$RUNNER_TEMP/engine-build.out"
+          checkout=$(head -1 "$RUNNER_TEMP/engine-build.out")
+          test -d "$checkout" || {
+            printf 'build-arca-engine.sh printed no usable checkout path: %s\n' "$checkout" >&2
+            exit 1
+          }
+          printf 'ARCA_CHECKOUT=%s\n' "$checkout" >>"$GITHUB_ENV"
+
+      - name: The engine must not reach DockerAPI
+        run: ./tests/release/engine-targets-check.sh "$ARCA_CHECKOUT"
 
   # Temporary. Settles whether a hosted runner carries an Apple container runtime,
   # replacing a PLAN claim in the design spec with a measurement. Deliberately
