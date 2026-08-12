@@ -124,11 +124,42 @@ swift build --package-path "$checkout" --configuration release \
 # would make SwiftPM build the whole package a second time in debug, and this
 # package vendors containerization, so that would be a very expensive mistake.
 #
-# --disable-swift-testing because the package has no swift-testing tests, and
-# in release SwiftPM launches that runner by invoking an executable target with
-# --test-bundle-path. Arca's `Arca` executable is an ArgumentParser command, so
-# it rejects the unknown option and the run exits non-zero with every XCTest
-# passing -- a green suite reported as a failed build.
+# --disable-swift-testing because ArcaEngineTests is pure XCTest, so the flag skips
+# nothing this script intends to run -- while in release configuration SwiftPM
+# launches the swift-testing runner by invoking an executable target with
+# --test-bundle-path. Arca's `Arca` executable is an ArgumentParser command, so it
+# rejects the unknown option and the run exits non-zero with every XCTest passing --
+# a green suite reported as a failed build. The rest of the package DOES carry
+# swift-testing tests (15 files across ArcaIPTests and ArcaTests import Testing), so
+# "the package has no swift-testing tests" would be a false reason for this flag.
+#
+# The listing guard exists because `swift test --filter` exits 0 when the filter
+# matches nothing. VERIFIED in the pinned checkout: `--filter ZZZNoSuchSuiteName`
+# exits 0 reporting `Executed 0 tests, with 0 failures` and only `warning: No
+# matching test cases were run` on stderr. Without the guard the gate below reports
+# success having verified nothing the day ArcaEngineTests is renamed or moved --
+# silently, in the one script standing between a signed tag and a shipped binary.
+#
+# `swift test list` and not the "Executed N tests" output: the listing is a
+# machine-readable contract -- one `Module.Suite/test` identifier per line on stdout,
+# build progress on stderr -- and `--filter` matches against those same identifiers,
+# so a listing with no ArcaEngineTests entry is exactly the case where the filter
+# would match nothing. Parsing the human-readable run output was considered and
+# rejected as a more brittle contract that can drift silently across Swift versions,
+# which is the decay class this guard exists to close. (`--list-tests --filter` is
+# not the form: Swift 6.3.3 deprecates --list-tests in favour of `swift test list`,
+# which rejects --filter with "Unknown option".)
+#
+# The listing builds the test targets, so the run below is incremental against it.
+listed=$(swift test list --package-path "$checkout" --configuration release \
+  --disable-swift-testing) || {
+  printf 'could not list the pinned engine tests in %s\n' "$checkout" >&2
+  exit 70
+}
+grep -q '^ArcaEngineTests\.' <<<"$listed" || {
+  printf 'the test gate matched no tests: %s declares no ArcaEngineTests\n' "$checkout" >&2
+  exit 70
+}
 swift test --package-path "$checkout" --configuration release \
   --disable-swift-testing --filter ArcaEngineTests >&2
 
