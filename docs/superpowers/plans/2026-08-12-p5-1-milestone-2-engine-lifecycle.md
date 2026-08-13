@@ -1259,6 +1259,45 @@ four corrections:
    an unentitled binary: unsigned, `initialize()` dies at `VmnetNetwork()` and the engine never
    creates a socket.
 
+### The daemon-vs-engine divergence audit, closed rather than incidental
+
+Three findings of one class had surfaced by accident, so the enumeration was finished deliberately.
+`grep -rn "public func set[A-Z]" Sources/ContainerBridge/*.swift` returns **eight** collaborator
+setters in the whole module — six on `ContainerManager`, one each on `ImageManager` and
+`NetworkManager`; `VolumeManager` and `ExecManager` have none, taking everything by initializer.
+**The daemon calls seven, the engine calls two, and one is called by neither.** Six divergences,
+three silent, one to fix.
+
+**Fix first — `setPortMapManager`, already routed to Task 11.** `ContainerManager.swift:2482` is a
+three-way `if let` chain with **no `else`**, so `Start` completes and reports success having
+published nothing; `:2730` and `:3058` guard teardown the same way. `networkManager` is now set,
+so this is the only missing conjunct. It hits Task 11 and Task 12, and Task 7 as well — `Inspect`
+would report bindings that were never published, which is worse than reporting none.
+
+**Silent but CORRECT, do not "fix" — `setHealthChecker` and `setEventEmitter`.** Both are invisible
+when unset, and `engine.proto:38-48` lists eleven RPCs with no health or events method and no
+health field anywhere. There is no engine answer a null collaborator makes wrong, and wiring an
+`EventManager` would build toward a surface `tests/release/engine-targets-check.sh` requires the
+engine not to have. Health becomes a watch item only if a later milestone reports it through
+`Inspect`.
+
+**TWO THINGS THE ENGINE MUST CONTINUE NOT TO DO.** Recorded because "mirror the daemon" is the
+obvious way to close the item above, and it would import both:
+
+1. **`applyRestartPolicies()` calls `startContainer` and boots VMs.** In an engine it would
+   **resurrect sandboxes the consumer believes stopped, before the socket binds** — the consumer
+   would never see the transition, and reconcile would meet running containers it did not start.
+2. **The daemon's deletion of Apple's `initfs.ext4` and vminit image** is precisely the destructive
+   shared-store behaviour the private root exists to avoid.
+
+**No consequence:** `imageManager.initialize()` is a no-op — two log lines and a comment saying
+"ImageStore is already initialized in init()".
+
+**Two non-divergences, recorded so nobody chases them:** `setSharedVmnetNetwork` writes a property
+with **no reader anywhere** in `ContainerBridge` (dead code), and the engine's wire-after-initialize
+ordering is safe — none of the five collaborator names appears anywhere in `loadPersistedState()`
+(`ContainerManager.swift:316-490`), so `portMapManager` can be set beside the other two.
+
 **One unpinned observation, recorded because Landing 5 restarts engines in a loop.** In 13 engine
 shutdowns the reviewer saw `ERROR: Cannot schedule tasks on an EventLoop that has already shut
 down` **once**, under a concurrent pair receiving SIGTERM (exit was still 0). Six further
