@@ -1177,6 +1177,45 @@ git log --format='%h %G? %s' -1
 
 ---
 
+### Task 6b: Sign `arca-engine`, because unsigned it cannot start a container
+
+**Added 2026-08-13 by maintainer ruling**, after Task 6's Step 1 measured it.
+
+`ContainerManager.initialize()` constructs `Containerization.VmnetNetwork()`, which requires the
+`com.apple.security.virtualization` entitlement. **Nothing signs `arca-engine`.** Arca's
+`Makefile` `codesign:` target covers `$(BINARY)` and `$(TEST_HELPER)` only, and `arca-engine`
+appears nowhere in that file (VERIFIED: `grep -n 'arca-engine' Makefile` returns nothing).
+
+Unentitled, the failure is loud but misleading: `vmnet_return_t(rawValue: 1002)`, which the SDK
+header (`vmnet.framework/Versions/A/Headers/vmnet.h:144`) labels `VMNET_MEM_FAILURE`. It is not a
+memory failure. The process exits and never creates a socket. Signed ad-hoc with the existing
+`Arca.entitlements`, the same binary initializes all three managers and serves.
+
+**This reaches further than Arca.** `scripts/build-arca-engine.sh` builds `--product arca-engine`
+and ships that binary to the live tier, unsigned — so the engine Gas Can hands its own tests
+cannot start a container.
+
+**Both repositories, ad-hoc for now:**
+
+1. **Arca** — add `arca-engine` to the `codesign:` target alongside the existing two binaries, so
+   a developer building it by hand gets a working engine instead of a misleading
+   `VMNET_MEM_FAILURE` to debug.
+2. **Gas Can** — `scripts/build-arca-engine.sh` signs the binary it produces, with
+   `Arca.entitlements` taken **from the verified checkout** it already has. Ad-hoc (`--sign -`)
+   needs no certificate, so it works on a hosted runner. Sign after the build and **before** the
+   binary path is printed, so no caller can receive an unsigned path.
+
+**Real Developer ID signing is milestone 4's**, with the rest of packaging. Ad-hoc is sufficient
+for the gate and the live tier and is not sufficient for a shipped `.pkg`; say so in the script's
+comment so milestone 4 does not mistake this for done.
+
+**Prove it fails.** A test or contract case must fail when the signing step is removed —
+otherwise this is another instrument that cannot fail. The honest check is behavioural: an
+unsigned engine exits non-zero without creating its socket, so assert on that rather than on
+`codesign -d` output, which proves the command ran and not that it worked.
+
+---
+
 ## Landings 3-5
 
 These tasks are named, scoped and ordered, but their steps are **not** written out in bite-sized detail, and that is deliberate rather than an omission. Landing 2's Task 6 is the first time anything in this project constructs a `VmnetNetwork` or runs `initialize()` against a private root. What it finds decides the shape of everything below — most sharply whether the vmnet `host` network collides with a live `ArcaDaemon`'s.
