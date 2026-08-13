@@ -17,7 +17,7 @@ branch; continue on these two.**
 | | |
 |---|---|
 | Arca | `feat/engine-state-ownership`, HEAD `db6bedc`, based on `cc316b65` |
-| Gas Can | `docs/p5-1-milestone-2-design`, HEAD `fe54d68`, based on `6847d1e` |
+| Gas Can | `docs/p5-1-milestone-2-design`, based on `6847d1e` — **HEAD is whatever commit last touched this file**, so read it with `git log -1`, do not trust a SHA written here |
 | Design | `docs/superpowers/specs/2026-08-12-p5-1-milestone-2-engine-lifecycle-design.md` |
 | Plan | `docs/superpowers/plans/2026-08-12-p5-1-milestone-2-engine-lifecycle.md` |
 | Parent design | `docs/superpowers/specs/2026-08-10-p5-1-engine-service-and-wiring-design.md` |
