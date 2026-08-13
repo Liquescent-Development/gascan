@@ -1224,6 +1224,39 @@ These tasks are named, scoped and ordered, but their steps are **not** written o
 
 **Expand each landing into full steps immediately before starting it**, using the findings recorded in Task 6.
 
+### What Task 6 actually found, and what it changes below
+
+Task 6 ran and its review reproduced every measurement. The private-root model **holds**: the
+isolation probes came back empty, and the vmnet `host` network does not collide — two concurrent
+engines on separate state roots took distinct auto-allocated subnets, because the `host` name is a
+row in each engine's own `state.db` and `VmnetNetworkBackend`'s `isDefault` guard reads a
+per-instance dictionary, not a host-wide namespace. **Landings 3-5 proceed as designed**, with
+four corrections:
+
+1. **Landing 3 — Tasks 7 and 8 must seed state through `loadPersistedState()`, not a stub.** It is
+   the only VM-free writer of `ContainerManager.containers`, it needs no entitlement, and using it
+   exercises the real restore path rather than a replica.
+2. **Landing 4 — Task 11 gains a new first step: cross-wire the managers.** The engine never calls
+   `containerManager.setNetworkManager(_:)` or `setVolumeManager(_:)`; `ArcaDaemon` does, at
+   `ArcaDaemon.swift:236` and `:262`. Without them `ContainerManager.swift:1741` throws
+   `volumeManagerNotAvailable` for any container with anonymous volumes, `:2427` skips network
+   auto-attachment, and — worst — `:4129` `cleanupVolumesForContainer` **returns silently** when
+   `volumeManager` is nil, so `Remove` leaks volumes while reporting success. Task 6's fix round
+   closes this, but Task 11 must not assume it: verify the wiring before writing `Create`.
+3. **Task 14 — `named_volumes` cannot be flipped until that wiring exists.** A flag whose
+   machinery is unwired is a claim with no instrument, which §5 already forbids.
+4. **Landing 5 reorders — signing (Task 6b) lands BEFORE the live tier.** No live test runs against
+   an unentitled binary: unsigned, `initialize()` dies at `VmnetNetwork()` and the engine never
+   creates a socket.
+
+**One unpinned observation, recorded because Landing 5 restarts engines in a loop.** In 13 engine
+shutdowns the reviewer saw `ERROR: Cannot schedule tasks on an EventLoop that has already shut
+down` **once**, under a concurrent pair receiving SIGTERM (exit was still 0). Six further
+shutdowns, four with `SWIFTNIO_STRICT=1`, were clean. `serve()`'s own docstring
+(`ArcaEngineCommand.swift:116-136`) claims this fixed, and NIO upgrades it to a forced crash under
+strict mode. Not this milestone's doing — `serve()` is untouched — but a 1-in-13 shutdown fault is
+a flaky live tier waiting to happen, and it should be chased before Task 13 rather than after.
+
 ### Landing 3 — `Inspect` and `ListResources`
 
 **Task 7 — `Inspect`.** Replace the `notImplemented` body at `SandboxEngineService.swift`. Three arms: sandbox, `Absent`, error. Two constraints from the adversarial review, both of which the obvious implementation reintroduces:
