@@ -509,6 +509,48 @@ git log --format='%h %G? %s' -1
 
 ---
 
+### Task 3b: The remaining `try?` swallows on the same backend
+
+**Added 2026-08-12 by maintainer ruling**, after Task 3's review found two more swallows of the
+identical shape. Task 3 fixed `listNetworks`; these are its twins, and one is worse than the
+original because it gates a **deletion** rather than a listing.
+
+**Files:**
+- Modify: `~/code/arca/Sources/ContainerBridge/NetworkManager.swift` — `getNetworkAttachments` and `getContainerNetworks`
+- Modify: `~/code/arca/Sources/DockerAPI/Handlers/NetworkHandlers.swift` — the prune path
+- Test: `~/code/arca/Tests/ArcaEngineTests/ListFilterTests.swift` (extend)
+
+**Re-derive every line number before editing.** Task 3 shifted this file; the review read
+`getNetworkAttachments` around `:571-577` and `getContainerNetworks` around `:625` at `8b3e16f`,
+while the implementer's earlier report cited `:530-534` and `:578` pre-change. Locate them with
+`grep -n 'func getNetworkAttachments\|func getContainerNetworks' Sources/ContainerBridge/NetworkManager.swift`.
+
+**Order matters — take the prune gate first.**
+
+1. **`getNetworkAttachments`** swallows with `try?` and returns `[:]`, which is indistinguishable
+   from "nothing attached". `NetworkHandlers.swift`'s prune path reads it as the "skip networks
+   with active containers" gate. Failure: a transient store failure on `getNetworkContainers`
+   while `listNetworks` succeeds → `docker network prune` **deletes an in-use network** and
+   reports success. Task 3 narrowed this — a *total* backend failure now makes `listNetworks`
+   throw and prune bail — so only partial failure remains, which is the harder case to notice.
+2. **`getContainerNetworks`** swallows the same way and feeds `getWireGuardClient`, which reads
+   an empty result as "not attached to any WireGuard network".
+
+**Widening `BridgeNetworkLister` is a decision, not a drive-by.** Task 3's seam covers listing
+only. If these need injection, decide deliberately whether the protocol grows or a second seam is
+better, and say which in the report. Prefer `package` visibility over `public`, per the ruling on
+`loadPersistedState()`.
+
+**Prove each guard can fail**, separately, the way Task 3 did: induce the backend failure, assert
+the call throws rather than returning an empty collection, revert that guard alone, confirm red,
+restore. A test covering only one of the two methods leaves the other unproven.
+
+**For the prune gate specifically, assert on the deletion**, not only on the thrown error: a test
+that proves `getNetworkAttachments` throws does not prove prune declines to delete. The property
+that matters is that an in-use network survives a partial store failure.
+
+---
+
 ## Landing 2 — engine startup
 
 ### Task 4: The three path options, validated before anything is constructed
