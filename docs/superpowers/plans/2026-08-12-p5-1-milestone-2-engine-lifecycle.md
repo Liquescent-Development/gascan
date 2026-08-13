@@ -1243,6 +1243,16 @@ four corrections:
    auto-attachment, and — worst — `:4129` `cleanupVolumesForContainer` **returns silently** when
    `volumeManager` is nil, so `Remove` leaks volumes while reporting success. Task 6's fix round
    closes this, but Task 11 must not assume it: verify the wiring before writing `Create`.
+
+   **A fourth setter of the same class is still unwired: `setPortMapManager`.** The daemon sets it
+   (`ArcaDaemon.swift:278`); the engine does not. `ContainerManager.swift:2482` guards
+   `if let portMapManager` before `publishPorts`, and `:2730`/`:3058` do the same before
+   `unpublishPorts` — so an unwired engine **starts a container with published ports, publishes
+   nothing, and reports success.** Pre-existing rather than introduced by Task 6, and outside that
+   task's finding, but it lands on work already scheduled: Task 7 maps real ports, Task 11 has
+   ports publishing on loopback, and `loopback_publish` is one of Task 14's capability flips.
+   Wire it in Task 11 beside the other two, and test it the same way — drive `Start` and assert a
+   port is **actually published**, not that the setter was called.
 3. **Task 14 — `named_volumes` cannot be flipped until that wiring exists.** A flag whose
    machinery is unwired is a claim with no instrument, which §5 already forbids.
 4. **Landing 5 reorders — signing (Task 6b) lands BEFORE the live tier.** No live test runs against
