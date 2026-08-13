@@ -587,6 +587,13 @@ gate fails if either disappears.
 turn and confirm the script exits non-zero naming the missing one. A guard that fires only for the
 suite it was originally written for is the same defect in a new place.
 
+**Convert all of `NetworkPruneGateTests`, including the third test Task 3b's fix round adds.**
+That round is closing a hole the reviewer measured: deleting `if !attachments.isEmpty { continue }`
+from `NetworkHandlers.swift:606` leaves every test green, because both original prune tests pin
+"the read *failed* → don't delete" and neither pins "the read *succeeded and was non-empty* →
+don't delete" — which is what the gate exists for. **Converting before that lands would enshrine
+a suite that still misses the gate's normal path.** Sequence this task after Task 3b closes.
+
 Gas Can commits use `env -u SSH_AUTH_SOCK git commit`; Arca commits use the plain form. This task
 touches **both repositories**, so the signing rule flips partway through it.
 
