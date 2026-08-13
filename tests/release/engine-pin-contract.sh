@@ -39,18 +39,26 @@ git -C "$subupstream" -c commit.gpgsign=false commit -qm seed
 
 # An upstream repository standing in for Arca. It carries a Package.swift naming
 # everything the build script names: the arca-engine executable product it builds,
-# the SandboxEngineProto target it builds beside it, and the ArcaEngineTests target
-# its test gate filters on. A fixture that declares fewer targets than the script
+# the SandboxEngineProto target it builds beside it, and the two test targets its
+# test gate filters on. A fixture that declares fewer targets than the script
 # builds does not exercise the script; it just fails differently.
 #
 # No `products:` array, matching Arca (Package.swift:11-34): `swift build --product
 # arca-engine` has to resolve through SwiftPM's implicit executable product here for
 # the same reason it does there, or the contract would exercise a shape production
 # does not have.
+#
+# Package.swift and the prune suite are written through functions, and the suite
+# names are arguments, because the negative cases below need a tree in which
+# exactly one of the two gated suites is absent. Substituting into a quoted
+# heredoc rather than interpolating one: the comments carry backticks, which an
+# unquoted heredoc would run as commands.
 upstream=$fixture/upstream
 mkdir -p "$upstream/Sources/ContainerBridge" "$upstream/Sources/SandboxEngineProto" \
-  "$upstream/Sources/arca-engine" "$upstream/Tests/ArcaEngineTests"
-cat >"$upstream/Package.swift" <<'PACKAGE'
+  "$upstream/Sources/arca-engine" "$upstream/Tests/ArcaEngineTests" \
+  "$upstream/Tests/ArcaTests"
+write_package() {
+  sed -e "s/@ENGINE_TESTS@/$1/" -e "s/@ARCA_TESTS@/$2/" >"$upstream/Package.swift" <<'PACKAGE'
 // swift-tools-version: 6.2
 import PackageDescription
 let package = Package(
@@ -72,10 +80,17 @@ let package = Package(
             name: "arca-engine",
             dependencies: ["ContainerBridge", "SandboxEngineProto"]
         ),
-        .testTarget(name: "ArcaEngineTests", dependencies: ["ContainerBridge"])
+        .testTarget(name: "@ENGINE_TESTS@", dependencies: ["ContainerBridge"]),
+        // Stands in for Arca's ArcaTests, which owns the DockerAPI-side prune
+        // gate test. A separate target and not another class in the engine suite:
+        // the whole reason the gate names two suites is that these are two
+        // targets, and a fixture with one would not exercise that.
+        .testTarget(name: "@ARCA_TESTS@", dependencies: ["ContainerBridge"])
     ]
 )
 PACKAGE
+}
+write_package ArcaEngineTests ArcaTests
 printf 'public let engineFixture = 1\n' >"$upstream/Sources/ContainerBridge/Fixture.swift"
 printf 'public let sandboxEngineProtoFixture = 1\n' >"$upstream/Sources/SandboxEngineProto/Fixture.swift"
 cat >"$upstream/Sources/arca-engine/main.swift" <<'MAIN'
@@ -97,6 +112,22 @@ final class EngineFixtureTests: XCTestCase {
     }
 }
 TEST
+# XCTest and not swift-testing, matching the suite it stands in for: the script
+# passes --disable-swift-testing, so a `@Test` here would be listed by nothing and
+# run by nothing, and the fixture would pass while proving the opposite.
+write_prune_suite() {
+  sed -e "s/@PRUNE_SUITE@/$1/" >"$upstream/Tests/ArcaTests/NetworkPruneGateTests.swift" <<'TEST'
+import ContainerBridge
+import XCTest
+
+final class @PRUNE_SUITE@: XCTestCase {
+    func testTheFixtureTargetIsTheOneThatWasBuilt() {
+        XCTAssertEqual(engineFixture, 1)
+    }
+}
+TEST
+}
+write_prune_suite NetworkPruneGateTests
 git -C "$upstream" init -q
 git -C "$upstream" config user.name fixture
 git -C "$upstream" config user.email engine@example.invalid
@@ -139,6 +170,36 @@ git -C "$upstream" tag tags/ambiguous "$drifted"
 # Shadow half: an unsigned lightweight tag on the drifted commit, whose bare name
 # a planted refs/<name> in the cache can shadow. Needs no slash at all.
 git -C "$upstream" tag shadowed "$drifted"
+
+# Two commits in which exactly one of the two gated suites is absent, so both
+# halves of the listing guard can be shown to fire, and to fire naming the suite
+# that went. Everything else about each tree is well-formed -- the pin, the
+# signature, the products, the other suite -- so the only thing left to fail on
+# is the guard.
+#
+# A guard that fired only for the suite it was first written for would be the
+# defect it exists to prevent, moved one suite over: `swift test --filter` exits
+# 0 when it matches nothing, so the gate would report success having run half of
+# what it names.
+#
+# The renames are past the anchor in each pattern, not before it: the engine half
+# keeps the `ArcaEngineTests` prefix and loses the `.` after it, and the prune
+# half keeps its target and renames only the class. A guard grepping for bare
+# substrings would pass both of these.
+git -C "$upstream" mv Tests/ArcaEngineTests Tests/ArcaEngineTestsRenamed
+write_package ArcaEngineTestsRenamed ArcaTests
+git -C "$upstream" add -A
+git -C "$upstream" -c commit.gpgsign=false commit -qm 'engine suite renamed'
+engine_suite_gone=$(git -C "$upstream" rev-parse --verify HEAD)
+git -C "$upstream" tag -s -m 'engine suite renamed' engine-suite-gone "$engine_suite_gone"
+
+git -C "$upstream" mv Tests/ArcaEngineTestsRenamed Tests/ArcaEngineTests
+write_package ArcaEngineTests ArcaTests
+write_prune_suite NetworkPruneGateTestsRenamed
+git -C "$upstream" add -A
+git -C "$upstream" -c commit.gpgsign=false commit -qm 'prune suite renamed'
+prune_suite_gone=$(git -C "$upstream" rev-parse --verify HEAD)
+git -C "$upstream" tag -s -m 'prune suite renamed' prune-suite-gone "$prune_suite_gone"
 
 # file:// and not a bare path: the script constrains .url to schemes git cannot
 # turn into a command, so the fixture must speak one of them. git clone accepts
@@ -232,6 +293,33 @@ run_case shadowed-ref "$fixture/pin-shadow.json" 65
 git -C "$fixture/cache-shadowed-ref/arca" update-ref refs/shadowed \
   "$(git -C "$upstream" rev-parse --verify refs/tags/ambiguous)"
 run_case shadowed-ref "$fixture/pin-shadow.json" 65
+
+# 70 — the listing guard, each half proven on its own. Nothing else about either
+# tree is wrong: the pin is well-formed, the tag verifies and resolves, the
+# products build, and the other suite is present and passing. The only thing
+# left to fail on is the suite the gate names and the tree does not have.
+#
+# The message is asserted and not just the exit code, anchored at end of line so
+# each half is distinguishable from the other. `swift test --filter` exits 0 when
+# it matches nothing, so a gate naming two suites and checking one would report a
+# success it had not earned -- and an operator reading "declares no
+# ArcaEngineTests" while ArcaEngineTests is right there would be sent to the
+# wrong repository.
+write_pin "$fixture/pin-engine-gone.json" engine-suite-gone "$engine_suite_gone"
+run_case engine-suite-gone "$fixture/pin-engine-gone.json" 70
+grep -q 'declares no ArcaEngineTests$' "$fixture/engine-suite-gone.out" || {
+  printf 'the listing guard did not name the missing ArcaEngineTests\n' >&2
+  cat "$fixture/engine-suite-gone.out" >&2
+  exit 1
+}
+
+write_pin "$fixture/pin-prune-gone.json" prune-suite-gone "$prune_suite_gone"
+run_case prune-suite-gone "$fixture/pin-prune-gone.json" 70
+grep -q 'declares no ArcaTests\.NetworkPruneGateTests$' "$fixture/prune-suite-gone.out" || {
+  printf 'the listing guard did not name the missing ArcaTests.NetworkPruneGateTests\n' >&2
+  cat "$fixture/prune-suite-gone.out" >&2
+  exit 1
+}
 
 # 0 — well-formed pin, signed tag, tag resolves to the pinned revision
 run_case good "$fixture/pin-good.json" 0

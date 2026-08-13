@@ -149,12 +149,23 @@ swift build --package-path "$checkout" --configuration release \
 # it the right place: it proves the pinned engine passes its own suite rather
 # than proving a developer's working tree did.
 #
+# Two suites, not one. ArcaEngineTests cannot reach the `docker network prune`
+# attachment gate: NetworkHandlers is in DockerAPI, ArcaEngineTests depends only
+# on ArcaEngine, and tests/release/engine-targets-check.sh exists to keep that
+# edge from ever appearing. So the test that proves prune declines to delete an
+# in-use network lives in ArcaTests, and until it was named here nothing ran it.
+#
+# The named suite and NOT all of ArcaTests: that target also holds integration
+# tests that want a live daemon and VMs, which have no business in a release
+# gate. Widening this to `ArcaTests` would trade a gate that runs too little for
+# one that cannot run at all.
+#
 # --configuration release, matching the build above: leaving this unconfigured
 # would make SwiftPM build the whole package a second time in debug, and this
 # package vendors containerization, so that would be a very expensive mistake.
 #
-# --disable-swift-testing because ArcaEngineTests is pure XCTest, so the flag skips
-# nothing this script intends to run -- while in release configuration SwiftPM
+# --disable-swift-testing because both filtered suites are pure XCTest, so the flag
+# skips nothing this script intends to run -- while in release configuration SwiftPM
 # launches the swift-testing runner by invoking an executable target with
 # --test-bundle-path. Arca's `Arca` executable is an ArgumentParser command, so it
 # rejects the unknown option and the run exits non-zero with every XCTest passing --
@@ -192,12 +203,28 @@ listed=$(swift test list --package-path "$checkout" --configuration release \
   printf 'could not list the pinned engine tests in %s\n' "$checkout" >&2
   exit 70
 }
-grep -q '^ArcaEngineTests\.' <<<"$listed" || {
-  printf 'the test gate matched no tests: %s declares no ArcaEngineTests\n' "$checkout" >&2
-  exit 70
+
+# Each filtered suite is asserted separately, and each names itself when it is
+# the one that went missing. A single grep matching either, or one message
+# naming both, would let the DockerAPI-side suite vanish behind a still-present
+# ArcaEngineTests -- the same hole this guard was written to close, reopened one
+# suite over. The patterns are anchored past the suite name (`\.` for the target,
+# `/` for the class) so a renamed-but-prefixed leftover cannot satisfy them.
+require_listed() {
+  grep -q "$2" <<<"$listed" || {
+    printf 'the test gate matched no tests: %s declares no %s\n' "$checkout" "$1" >&2
+    exit 70
+  }
 }
+require_listed ArcaEngineTests '^ArcaEngineTests\.'
+require_listed ArcaTests.NetworkPruneGateTests '^ArcaTests\.NetworkPruneGateTests/'
+# Two --filter flags and not one alternation: SwiftPM unions repeated --filter,
+# and keeping them separate means each pattern is the same string as the guard's,
+# minus the anchors, rather than a regex that has to be read twice.
 swift test --package-path "$checkout" --configuration release \
-  --disable-swift-testing --filter ArcaEngineTests >&2
+  --disable-swift-testing \
+  --filter ArcaEngineTests \
+  --filter 'ArcaTests\.NetworkPruneGateTests' >&2
 
 binary=$checkout/.build/release/arca-engine
 [[ -x $binary ]] || {
