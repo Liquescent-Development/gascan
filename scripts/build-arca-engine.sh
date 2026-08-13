@@ -6,7 +6,7 @@ pin_file=${GASCAN_ARCA_PIN_FILE:-$repo_root/engine/arca-pin.json}
 cache_root=${GASCAN_ARCA_ENGINE_CACHE:-$repo_root/.artifacts/arca-engine}
 allowed_signers=${GASCAN_ARCA_ALLOWED_SIGNERS:-$repo_root/engine/allowed-signers}
 
-for command in git jq swift; do
+for command in codesign git jq swift; do
   command -v "$command" >/dev/null || {
     printf 'required command is unavailable: %s\n' "$command" >&2
     exit 69
@@ -252,5 +252,48 @@ binary=$checkout/.build/release/arca-engine
   printf 'engine build produced no executable at %s\n' "$binary" >&2
   exit 70
 }
+
+# An unsigned engine cannot start a container, so an unsigned binary is not a
+# build product this script may hand to a caller. ContainerManager.initialize()
+# constructs a Containerization.VmnetNetwork, and vmnet refuses that without
+# com.apple.security.virtualization. MEASURED on the real engine with the
+# signature as the only variable: unentitled it exits 1 on `failed to create
+# vmnet network with status vmnet_return_t(rawValue: 1002)` and never creates
+# its socket -- and 1002 is VMNET_MEM_FAILURE in vmnet.h, so the diagnostic
+# sends whoever meets it looking for a memory fault. Signed, the same binary
+# initialises all three managers and serves.
+#
+# Here and not at build time: this is the last step before the path is printed,
+# so no caller can be handed an unsigned path, and it is after `swift test`,
+# which shares the .build directory and would discard a signature applied
+# earlier by relinking the executable.
+#
+# The entitlements come from the checkout this script has already verified --
+# the same signed tag whose tree was compiled -- and from nowhere else. A copy
+# living in Gas Can would be a second thing to keep in step with Arca's, and it
+# is Arca's engine that has to hold these entitlements.
+#
+# Ad-hoc (`--sign -`) because it needs no certificate and no keychain, which is
+# what makes it work on a hosted CI runner. AD-HOC IS SUFFICIENT FOR THE RELEASE
+# GATE AND FOR THE LIVE TIER, WHICH RUN THE ENGINE ON THE MACHINE THAT BUILT IT.
+# IT IS NOT SUFFICIENT FOR A SHIPPED .pkg: a distributed binary needs a real
+# Developer ID identity and notarisation, which is milestone 4's work with the
+# rest of packaging. Do not read this line as that being done.
+#
+# `--options runtime --timestamp` matches the invocation Arca's own Makefile
+# codesign target uses, so switching `-` for a Developer ID here is the only
+# edit that migration needs. Both flags are inert for an ad-hoc signature, which
+# carries no CMS blob to timestamp: MEASURED, `codesign -dvvv` reports the same
+# `flags=0x10002(adhoc,runtime)` and no Timestamp field with and without.
+entitlements=$checkout/Arca.entitlements
+[[ -f $entitlements ]] || {
+  printf 'the pinned engine carries no entitlements file: %s\n' "$entitlements" >&2
+  exit 70
+}
+# >&2 because stdout is this script's contract with its caller -- two lines, the
+# checkout and the binary -- and codesign is chatty on a warm cache ("replacing
+# existing signature").
+codesign --force --sign - --options runtime --timestamp \
+  --entitlements "$entitlements" "$binary" >&2
 
 printf '%s\n%s\n' "$checkout" "$binary"

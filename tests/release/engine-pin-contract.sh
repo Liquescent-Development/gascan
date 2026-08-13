@@ -4,7 +4,13 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "$0")/../.." && pwd -P)
 script=$repo_root/scripts/build-arca-engine.sh
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/gascan-engine-pin-contract.XXXXXX")
-trap 'rm -rf "$fixture"' EXIT
+# A second and deliberately short directory, for the one thing that cannot live
+# under $fixture: the socket the engine case below binds. An AF_UNIX address is
+# capped at sun_path's 104 bytes, and $fixture under a macOS TMPDIR spends ~81
+# of those before the filename. MEASURED: the engine refused a 111-byte path
+# with `--socket-path is 111 bytes and sun_path holds 104`. /tmp costs 4.
+socket_dir=$(mktemp -d /tmp/gascan-engine-socket.XXXXXX)
+trap 'rm -rf "$fixture" "$socket_dir"' EXIT
 
 # A local signing identity, so the positive case needs no network and no real key.
 ssh-keygen -q -t ed25519 -N '' -C engine@example.invalid -f "$fixture/key"
@@ -93,9 +99,90 @@ PACKAGE
 write_package ArcaEngineTests ArcaTests
 printf 'public let engineFixture = 1\n' >"$upstream/Sources/ContainerBridge/Fixture.swift"
 printf 'public let sandboxEngineProtoFixture = 1\n' >"$upstream/Sources/SandboxEngineProto/Fixture.swift"
+# The entitlements the build script signs with, under the name Arca gives them
+# (Arca's Makefile: `ENTITLEMENTS = Arca.entitlements`), because the script reads
+# them out of the checkout by that name. One key and not the five Arca carries:
+# this is the one the engine cannot start a container without, and a fixture
+# copy of the other four would be four more things to keep in step for nothing.
+cat >"$upstream/Arca.entitlements" <<'ENTITLEMENTS'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.virtualization</key>
+    <true/>
+</dict>
+</plist>
+ENTITLEMENTS
+# The fixture engine refuses to serve without the entitlement the build script
+# signs it with, and refuses BEFORE it creates its socket -- which is the shape
+# of the real failure it stands in for. ContainerManager.initialize() constructs
+# a Containerization.VmnetNetwork; unentitled, the real engine exits 1 on
+# `vmnet_return_t(rawValue: 1002)` with no socket ever created.
+#
+# vmnet is NOT called here, deliberately. MEASURED on a standalone probe:
+# vmnet_start_interface answers 1001 from a `swift build` binary and 1000 from
+# the same binary ad-hoc signed with these entitlements -- so it would work as a
+# probe on this machine. But a hosted runner that cannot create a vmnet
+# interface at all would then fail this case for a reason with nothing to do
+# with the signature, and a release gate that goes red for the environment is a
+# gate people learn to ignore. What is asked instead is the kernel's view of
+# THIS process's entitlements, which is environment-independent and which
+# nothing but a real signature can satisfy -- not a `codesign -d` reading of the
+# file on disk, which would prove the command ran rather than that it worked.
+#
+# It binds and exits rather than serving: the property is that the engine got
+# far enough to create its socket, and a fixture that stayed up would need the
+# case below to background it and reap it for no gain.
 cat >"$upstream/Sources/arca-engine/main.swift" <<'MAIN'
 import ContainerBridge
+import Darwin
+import Foundation
 import SandboxEngineProto
+import Security
+
+func refuse(_ message: String, _ status: Int32) -> Never {
+    FileHandle.standardError.write(Data("arca-engine: \(message)\n".utf8))
+    exit(status)
+}
+
+let entitlement = "com.apple.security.virtualization"
+guard let task = SecTaskCreateFromSelf(nil),
+      SecTaskCopyValueForEntitlement(task, entitlement as CFString, nil) != nil
+else {
+    refuse("this process holds no \(entitlement); refusing to serve", 1)
+}
+
+var arguments = CommandLine.arguments.dropFirst().makeIterator()
+var requested: String?
+while let argument = arguments.next() {
+    if argument == "--socket-path" { requested = arguments.next() }
+}
+guard let socketPath = requested else {
+    refuse("no --socket-path", 64)
+}
+
+var address = sockaddr_un()
+address.sun_family = sa_family_t(AF_UNIX)
+let capacity = MemoryLayout.size(ofValue: address.sun_path)
+let pathBytes = Array(socketPath.utf8)
+guard pathBytes.count < capacity else {
+    refuse("--socket-path is \(pathBytes.count) bytes and sun_path holds \(capacity)", 64)
+}
+withUnsafeMutableBytes(of: &address.sun_path) { destination in
+    destination.copyBytes(from: pathBytes)
+    destination[pathBytes.count] = 0
+}
+
+let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
+guard descriptor >= 0 else { refuse("socket() failed with errno \(errno)", 70) }
+let bound = withUnsafePointer(to: &address) { pointer in
+    pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+    }
+}
+guard bound == 0 else { refuse("bind() failed with errno \(errno)", 70) }
+guard listen(descriptor, 1) == 0 else { refuse("listen() failed with errno \(errno)", 70) }
 
 print(engineFixture + sandboxEngineProtoFixture)
 MAIN
@@ -246,6 +333,23 @@ git -C "$upstream" add -A
 git -C "$upstream" -c commit.gpgsign=false commit -qm 'prune suite fails'
 prune_suite_fails=$(git -C "$upstream" rev-parse --verify HEAD)
 git -C "$upstream" tag -s -m 'prune suite fails' prune-suite-fails "$prune_suite_fails"
+
+# A tree that is well-formed in every way but one: it declares no
+# Arca.entitlements. The pin verifies, both suites are present and pass, the
+# products build -- so the only thing left to refuse it is the signing step's
+# guard, and a script that had quietly stopped signing would print a path here
+# instead.
+#
+# Arca owns that file and Gas Can does not review its renames, so this is the
+# same class of decay as the listing guard above, one repository over. The
+# prune suite is restored first because the commit above left it failing, and a
+# failing suite would end the run a long way before the guard.
+write_prune_suite NetworkPruneGateTests 1
+git -C "$upstream" rm -q Arca.entitlements
+git -C "$upstream" add -A
+git -C "$upstream" -c commit.gpgsign=false commit -qm 'entitlements gone'
+entitlements_gone=$(git -C "$upstream" rev-parse --verify HEAD)
+git -C "$upstream" tag -s -m 'entitlements gone' entitlements-gone "$entitlements_gone"
 
 # file:// and not a bare path: the script constrains .url to schemes git cannot
 # turn into a command, so the fixture must speak one of them. git clone accepts
@@ -416,10 +520,54 @@ run_case prune-suite-fails "$fixture/pin-prune-fails.json" nonzero
 assert_failing_suite_reported prune-suite-fails \
   'the ArcaTests.NetworkPruneGateTests half of the gate ran'
 
+# 70 — the pinned engine declares no entitlements file, so the script cannot
+# sign what it built. It must refuse rather than print an unsigned path: an
+# engine signed without com.apple.security.virtualization exits on the first
+# vmnet call and never serves, and the caller would meet that a long way from
+# here.
+write_pin "$fixture/pin-entitlements-gone.json" entitlements-gone "$entitlements_gone"
+run_case entitlements-gone "$fixture/pin-entitlements-gone.json" 70
+grep -q 'carries no entitlements file' "$fixture/entitlements-gone.out" || {
+  printf 'the entitlements guard did not name the file it could not find\n' >&2
+  cat "$fixture/entitlements-gone.out" >&2
+  exit 1
+}
+
 # 0 — well-formed pin, signed tag, tag resolves to the pinned revision
 run_case good "$fixture/pin-good.json" 0
 grep -q 'cache-good' "$fixture/good.out" || {
   printf 'success case did not print the checkout path\n' >&2
+  exit 1
+}
+
+# The binary the script printed must be able to serve, and unsigned it cannot.
+# The engine reaches Containerization.VmnetNetwork before it binds anything, and
+# vmnet refuses without com.apple.security.virtualization -- so an unsigned
+# engine exits non-zero having created no socket, which is what this asserts
+# against. The fixture engine refuses on the same terms and in the same order
+# (Sources/arca-engine/main.swift above), so deleting the codesign step from
+# scripts/build-arca-engine.sh turns this case red.
+#
+# Behavioural on purpose. A `codesign -d --entitlements -` reading of the file
+# proves the command ran, not that the process got the capability, so it would
+# stay green on a binary that cannot start.
+#
+# `tail -1` because the script prints the checkout first and the binary second.
+# The socket goes in $socket_dir -- short enough for sun_path, and outside the
+# cache the runs below clean.
+engine_binary=$(tail -1 "$fixture/good.out")
+engine_socket=$socket_dir/engine.sock
+engine_status=0
+"$engine_binary" --socket-path "$engine_socket" >"$fixture/engine-run.out" 2>&1 ||
+  engine_status=$?
+[[ $engine_status == 0 ]] || {
+  printf 'the engine the script printed refused to serve: exit %s\n' "$engine_status" >&2
+  cat "$fixture/engine-run.out" >&2
+  exit 1
+}
+[[ -S $engine_socket ]] || {
+  printf 'the engine the script printed created no socket at %s\n' "$engine_socket" >&2
+  cat "$fixture/engine-run.out" >&2
   exit 1
 }
 
