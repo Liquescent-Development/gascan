@@ -105,8 +105,10 @@ At this milestone's scope the engine needs all three to do anything it claims. R
 therefore fail-fast, and the alternative — an engine that starts and answers
 `unsupported_capability` for everything that matters — is the state C1 was raised against.
 
-The refusal names which input is missing and the path tried. `gascan doctor` reports the same
-facts as "the sandbox engine", per parent design §2.5.
+The refusal names which input is missing and the path tried. **Surfacing that refusal through
+`gascan doctor` is milestone 4's**, not this one: doctor reads engine facts through the daemon
+wiring that milestone owns (parent design §2.5). What this milestone owes milestone 4 is a
+refusal message worth surfacing.
 
 ### 2.4 The engine's image store is its own, which is also how `initfs.ext4` stops being shared
 
