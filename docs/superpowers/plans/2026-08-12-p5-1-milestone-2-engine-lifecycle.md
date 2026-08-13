@@ -1396,7 +1396,139 @@ resources so a filter that drops everything is distinguishable from one that dro
 
 **Task 8 — `ListResources`.** Containers via `listContainers(all: true, includeInternal: true)` (Task 2), volumes via `VolumeManager.listVolumes()`, networks via `NetworkManager.listNetworks()` (Task 3, now throwing). Unlabelled and internal resources are reported, never filtered.
 
-### Landing 4 — image ingress and lifecycle
+### Landing 4 — image ingress and lifecycle (EXPANDED 2026-08-13, from Tasks 6-8's findings)
+
+Anchors re-derived at Arca `0a99bf3` (Landing 3 complete). **Re-derive again before editing** — every
+one below moved under Landing 3, and `listResources` alone moved `:268` → `:363` under Task 7.
+
+| What | Where, at `0a99bf3` |
+|---|---|
+| `ImageManager.loadFromOCILayout(directory:)` | `Sources/ContainerBridge/ImageManager.swift:57` |
+| `ContainerManager.createContainer(...)` | `ContainerManager.swift:1589` |
+| `startContainer(id:)` / `stopContainer(id:timeout:)` / `removeContainer(id:force:removeVolumes:)` | `:2067` / `:2684` / `:2995` |
+| `VolumeManager.createVolume(...)` | `VolumeManager.swift:97` |
+| `NetworkManager.createNetwork(...)` | `NetworkManager.swift:363` |
+| `setPortMapManager(_:)` | `ContainerManager.swift:232` |
+| `PortMapManager`, a `public actor` | `Sources/ContainerBridge/PortMapManager.swift:15` |
+| the daemon's construction of it | `ArcaDaemon.swift:274-279` |
+| `ArcaEngineCommand`, an `AsyncParsableCommand` | **`Sources/arca-engine/ArcaEngineCommand.swift:10`** |
+
+**The plan's earlier port anchors are all stale.** It cites `:2482`, `:2730`, `:3058`; the guards are
+at **`:2494`, `:2742`, `:3070`**.
+
+#### The port-publishing chain, which is longer than this plan has said
+
+The divergence audit recorded one missing conjunct — `setPortMapManager` unwired. **Read on disk at
+`0a99bf3`, there are three silent no-`else` gates between "a container with port bindings starts" and
+"a port is actually published", and wiring the setter closes only the first:**
+
+1. **`portMapManager == nil`** (`ContainerManager.swift:2494`). The known one. Still unwired in the
+   engine; `ArcaDaemon.swift:278` sets it.
+2. **`getWireGuardClient(containerID:)` returns nil** (`NetworkManager.swift:819-833`), and the
+   `if let wireguardClient` around the publish has **no `else`** either. It returns nil when there is
+   no WireGuard backend, **when the container is attached to no WireGuard network**, or when there is
+   no native container.
+3. **The `catch` at `ContainerManager.swift:2534-2541` swallows by design** — its comment is "Don't
+   fail container start on port mapping errors". A publish that throws is logged, and
+   `nativeContainer.start()` proceeds to mark the container `running`.
+
+**Gate 2 is the one that decides whether Landing 4 can flip `loopback_publish` at all**, and the
+answer is yes, but only via the right network. VERIFIED: `NetworkManager.initialize()` constructs the
+WireGuard backend itself at `NetworkManager.swift:252-265`, so the engine has had one since Task 6;
+and `createDefaultNetworks()` (`:297-330`) creates **two** networks — `bridge` (driver `bridge`,
+WireGuard-backed, `isDefault: true`) and `host` (driver `vmnet`). So a container attached to the
+default `bridge` network gets a client and can publish; one attached only to `host`/vmnet cannot, and
+fails silently at gate 2.
+
+**Consequence for Task 11:** "wire `setPortMapManager`" is necessary and **not sufficient**. The test
+the plan already demands — drive `Start` and assert a port is *actually published*, not that the
+setter was called — is what catches gates 2 and 3, and it is the only thing that can.
+
+**Consequence for Task 14:** `loopback_publish` may be flipped only once that test exists and passes.
+Three swallowing gates mean an engine can report a successful start, an `Inspect` naming the binding
+(Task 7 reports what the store holds, by design), and publish nothing — with every check green.
+
+**A best reading, NOT verified — confirm before relying on it.** Whether `Create`'s containers are
+auto-attached to `bridge` was not established. The auto-attach path and its `networkMode == "host"`
+skip are near `ContainerManager.swift:856` and in the `startContainer` region; the plan's earlier
+`:2427` citation is stale. Confirm with `grep -n 'networkMode' Sources/ContainerBridge/ContainerManager.swift`
+and by reading the attach call inside `startContainer` before writing Task 11's network step.
+
+#### What Landing 3 changed that Landing 4 inherits
+
+- **`Inspect` reports what the store holds**, including bindings that were never published. That is
+  deliberate (drift detection compares against the store), and it means `Inspect` **cannot** be used
+  as evidence that Task 11's publishing works. Task 11 needs an independent observation.
+- **`ListResources` reports unlabelled and internal resources, `owner` unset when unlabelled.**
+  `Remove` (Task 12) refuses on a label mismatch — do not reuse `ListResources`' reporting posture as
+  `Remove`'s authorisation posture; they answer different questions, exactly as `Inspect` and
+  `ListResources` do.
+- **`resourceMessage` / `containerResourceName` exist and are tested** (`EngineTranslation.swift:167`,
+  `:177`). `Create` and `Remove` report `Resource`s too — use them, do not write new mapping.
+- **The engine's error vocabulary is the twelve of `EngineErrors.swift:17-30`.** `Create`'s partial
+  failure is not an exception to it: `CreateFailed.created` carries what succeeded *beside* an
+  `EngineError`, it does not replace one.
+
+#### Routed findings that land in this landing
+
+- **Task 7 review, Minor 4 → Tasks 11 and 12.** The wire's `sandbox_id` reaches
+  `resolveContainerID` unvalidated, which prefix-matches pure-hex 4-63 char strings against Docker
+  IDs and returns `matches.sorted().first` (`ContainerManager.swift:2005-2023`). A valid Gas Can
+  sandbox id always contains a hyphen (`crates/gascan-core/src/sandbox.rs:168-198`) so it cannot take
+  that path, and nothing in the engine enforces that. **Harmless while the operation is read-only;
+  it stops being harmless the moment `Start`, `Stop` and `Remove` act on the match.**
+- **Task 6 divergence audit — two things the engine must keep NOT doing**, because "mirror the
+  daemon" is the obvious way to close a wiring gap and would import both: `applyRestartPolicies()`
+  boots VMs for sandboxes the consumer believes stopped, before the socket binds; and the daemon's
+  deletion of Apple's shared `initfs.ext4` is what the private root exists to avoid.
+
+#### Task 9 — `arca-engine image load --oci-layout <dir>`
+
+Over `ImageManager.loadFromOCILayout` (`ImageManager.swift:57`), for workspace images. Distinct from
+`--vminit-layout`, which Task 5 handles at startup; **do not merge them** — two concerns, two
+mechanisms, no install-time ordering step.
+
+**Structural constraint, and it decides where the code goes.** `ArcaEngineCommand` lives in the
+**executable** target (`Sources/arca-engine/`), and a test target cannot import an executable — that
+is why `EnginePaths` and `EngineManagers` live in `ArcaEngine` instead. **A subcommand whose logic
+sits in the executable is logic no test can reach.** Put the loading logic in `ArcaEngine` and let the
+subcommand be a thin shell over it, the way `run()` is over `EngineManagers`.
+
+Task 5's `EngineStartup` already loads an OCI layout and validates its markers; check whether that is
+reusable before writing a second loader, and say which you chose and why.
+
+#### Task 10 — `PrepareImage`
+
+Hold-or-fail. Look the digest up, materialise the rootfs, fail when absent. **Never pulls** — a
+fallback to `ImageManager.pullImage` puts registry credentials back inside the component the policy
+boundary exists to constrain. `not_found` is the code for absent; `unsupported_capability` is not.
+
+#### Task 11 — `Create`
+
+**Step 0, before any `Create` code: cross-wire `setPortMapManager`** beside the two `wireCollaborators()`
+already sets, and prove it behaviourally. Read the three-gate section above first — the setter is the
+smallest part of the problem.
+
+Then volumes → network → container, in that order, because whatever succeeded before a failure must be
+reported in `CreateFailed.created` (`engine.proto:279-286`) or it leaks with nothing knowing to look
+for it. Offline means no network attachment. Container name **equals the sandbox id**. Ports publish on
+loopback.
+
+**The partial-failure test is the one that matters** and it must assert the *contents* of
+`CreateFailed.created`, not that it is non-empty — the collection-assertion defect shape that Task 8's
+review measured, one landing earlier.
+
+#### Task 12 — `Start`, `Stop`, `Remove`
+
+`Remove` refuses any resource whose stored labels differ from the caller's — `ownership_mismatch`, and
+`foreign_resource_refused` for one carrying no labels at all, matching what Task 7 established for
+`Inspect`. **`removeContainer(id:force:removeVolumes:)` takes `removeVolumes`**, and
+`cleanupVolumesForContainer` returns silently when `volumeManager` is nil — wired since Task 6, so the
+hazard is closed, but the test must drive the volume deletion rather than trust the wiring.
+
+Carry Minor 4 above into both `Start` and `Remove`.
+
+### Landing 4 — original outline, superseded by the expansion above
 
 **Task 9 — `arca-engine image load --oci-layout <dir>`.** Over `ImageManager.loadFromOCILayout`, for workspace images. Distinct from `--vminit-layout`, which Task 5 already handles at startup; do not merge them.
 
