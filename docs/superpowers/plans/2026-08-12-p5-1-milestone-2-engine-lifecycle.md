@@ -254,6 +254,14 @@ At `:247`, replace the hardcoded path:
         )
 ```
 
+**SUPERSEDED 2026-08-12 by review, maintainer ruled the reviewer governs.** The two blocks
+below duplicate the engine's path derivation between production and test support, and that
+duplication is itself the defect: a test built on a hand-copy exercises a replica of the
+wiring rather than the wiring, so changing the engine's root leaves the suite green. Derive
+both paths in **one shared function** — `enginePaths(stateRoot:)` — called by
+`ArcaEngineCommand` and `TestSupport` alike, and assert on that function. Later tasks must
+not reintroduce the copy.
+
 `Tests/ArcaEngineTests/TestSupport.swift:28` — same shape, against the throwaway root already built there:
 
 ```swift
@@ -913,6 +921,8 @@ In `ArcaEngineCommand.swift`, after `validateEngineInputs` and after `imageManag
 ```
 
 Then **delete the long comment block at `:38-73`** explaining why `initialize()` is not called — it documents a decision this milestone reverses — and replace it with a short note that the engine owns its state root, citing the design.
+
+**Also carried into this task by Task 1's review (Minor 3):** `ArcaDaemon.swift:97-98` still hand-derives `~/Library/Application Support/com.apple.containerization/initfs.ext4` in order to delete it — the exact re-derivation Task 1's new comment says the file avoids, sitting 70 lines above it. Task 1 left it because its behaviour had to stay fixed. Bind it to the resolved store instead, so the daemon names its image store once rather than three times by three mechanisms.
 
 - [ ] **Step 6: Run the tests to verify they pass**
 
