@@ -997,6 +997,12 @@ public func loadVminit(
 }
 ```
 
+**Carried in from Task 4's review:** `EngineStartupError.unexpectedVminitReference` is the one
+error case naming neither an option nor a path — it renders as `"the vminit layout holds X, not Y"`.
+It is unused until this task, where it becomes user-visible for the first time. Give it the
+`--vminit-layout` option name and the layout path, matching the other two cases: a refusal that
+does not say what to fix is a worse failure than a crash.
+
 - [ ] **Step 5: Call it from `run()` before any manager is constructed**
 
 In `ArcaEngineCommand.swift`, after `validateEngineInputs` and after `imageManager` is built but before `ContainerManager` is constructed:
