@@ -551,6 +551,47 @@ that matters is that an in-use network survives a partial store failure.
 
 ---
 
+### Task 3c: Make the gate actually run the DockerAPI-side tests
+
+**Added 2026-08-12 by maintainer ruling.** Task 3b's prune-deletion test — the one guarding a
+bug that deletes an in-use network — lives in `Tests/ArcaTests/` and **nothing ever runs it.**
+
+The bind is structural and the placement is correct: `NetworkHandlers` is in `DockerAPI`,
+`ArcaEngineTests` depends only on `ArcaEngine`, and Gas Can's `tests/release/engine-targets-check.sh`
+exists to assert the engine never reaches `DockerAPI`. The test cannot move into `ArcaEngineTests`
+without breaking the property this milestone protects.
+
+**Two changes are needed, and the second alone is not enough.** VERIFIED 2026-08-12: the suite
+uses `import Testing` (swift-testing), and `swift test list --disable-swift-testing` — the gate's
+own invocation at `scripts/build-arca-engine.sh:190-191` — returns **zero** matches for it. So
+widening the filter by itself yields a gate that looks broader and still runs nothing new.
+
+1. **Arca — convert `Tests/ArcaTests/NetworkPruneGateTests.swift` to XCTest.** The rest of the
+   suite is XCTest and the gate's contract is built on `swift test list` identifiers under
+   `--disable-swift-testing`. Preserve both tests exactly, including the control
+   ("an unused network *is* pruned") that stops the survival assertion passing vacuously.
+   Confirm afterwards that `swift test list --disable-swift-testing | grep NetworkPruneGate`
+   returns a match — that is the check that this task did anything at all.
+2. **Gas Can — widen `scripts/build-arca-engine.sh`.** The filter at `:199-200` becomes a regex
+   covering `ArcaEngineTests` and the named DockerAPI-side suite. Filter the *named suite*, not
+   all of `ArcaTests`: that target holds integration tests needing a live daemon and VMs, which
+   must not enter the gate.
+
+**The listing guard is the delicate part.** `:195-198` exists because `swift test --filter` exits
+0 when it matches nothing — the guard fails the build when the listing has no `ArcaEngineTests`
+entry. Widening the filter without widening the guard reintroduces exactly the hole the guard was
+written to close, for the new suite. **Assert both suites are present, independently**, so the
+gate fails if either disappears.
+
+**Prove the guard can fail, both halves separately.** Rename each suite in a scratch checkout in
+turn and confirm the script exits non-zero naming the missing one. A guard that fires only for the
+suite it was originally written for is the same defect in a new place.
+
+Gas Can commits use `env -u SSH_AUTH_SOCK git commit`; Arca commits use the plain form. This task
+touches **both repositories**, so the signing rule flips partway through it.
+
+---
+
 ## Landing 2 — engine startup
 
 ### Task 4: The three path options, validated before anything is constructed
