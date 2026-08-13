@@ -1009,6 +1009,25 @@ Record the full output. If it fails, that failure is the task's real content —
 
 then pass the bindings to `SandboxEngineService(...)` rather than fresh expressions.
 
+**Two deferred minors from Task 1's review land here, because this step rewrites the exact
+wiring they describe:**
+
+- **Minor A — the parameter assignment is still duplicated.** `EnginePaths` unified the
+  *derivation*, but which derived path goes to which constructor argument is spelt twice:
+  `ArcaEngineCommand.swift:83-90` and `TestSupport.swift:49-58`. Swapping
+  `imageStoreRoot: paths.layerCache` in the command alone leaves all 34 tests green,
+  because the test drives a parallel wiring over a shared derivation. **Hoist into one
+  factory that returns the built managers**, called by both the command and `TestSupport`
+  — that is this step's real deliverable, not merely local `let` bindings.
+- **Minor B — the path assertions do not separate the paths.** Setting
+  `layerCache = stateRoot/"images"` passes all four tests: `ContainerBridgePathsTests.swift:36,50`
+  check only `hasPrefix(root.path)` and `:64` checks `hasPrefix(root.path + "/")`. The image
+  store and the layer cache would then be the same directory — a live failure mode, the
+  OverlayFS layer cache writing into the content store. **Assert the six `EnginePaths`
+  values are pairwise distinct** (two lines; the type is `Equatable`). Do **not** fix this
+  by restating the derivation in the test — that reintroduces the tautology Task 1's review
+  removed. Also add the missing trailing slash at `:36,50`.
+
 - [ ] **Step 3: Add the initialize calls, ordered**
 
 In `run()`, after the vminit load and before `EngineServer.start`:
