@@ -217,7 +217,7 @@ behaviour after the reason for it has gone.
 |---|---|---|---|
 | 1 | `ContainerManager` takes an image-store root and passes it as `root:` to `Containerization.ContainerManager` | §2.4 — isolates `initfs.ext4` and fixes the two-stores defect | `ArcaDaemon` passes the default root explicitly |
 | 2 | `ContainerManager` takes the layer-cache path | `:247` hardcodes `~/.arca/layers`, so a `dev.gascan`-rooted engine would still write into Arca's tree | `ArcaDaemon` passes `~/.arca/layers` explicitly |
-| 3 | `listContainers` gains `includeInternal: Bool` | review I3a — `showInternal` is false unless a label filter mentions `com.arca.internal` (`:531`), and `:556` then drops every container labelled `com.arca.internal=true` | Docker surface passes `false` |
+| 3 | `listContainers` gains `includeInternal: Bool` | review I3a — `showInternal` is false unless a label filter mentions `com.arca.internal` (`:531`), and `:556` then drops every container labelled `com.arca.internal=true` | three Docker sites pass `false`; `docker ps` (`ContainerHandlers.swift:72`) passes the filter-derived value, since it turns internal containers on today and must keep doing so |
 | 4 | `listNetworks()` becomes `throws` and propagates the backend error | review I3b — `NetworkManager.swift:553` swallows a WireGuard-backend failure with `try?`, turning a real failure into a clean empty answer | Docker surface handles or propagates |
 | 5 | `ExecManager.signalExec(execID:signal:)` | parent design §3.1 — **milestone 3, not this one** | none yet |
 

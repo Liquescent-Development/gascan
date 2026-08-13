@@ -228,9 +228,11 @@ At `:247`, replace the hardcoded path:
         let containerManager = ContainerManager(
             imageManager: imageManager,
             kernelPath: config.kernelPath,
-            imageStoreRoot: FileManager.default.urls(
-                for: .applicationSupportDirectory, in: .userDomainMask
-            )[0].appendingPathComponent("com.apple.containerization"),
+            // ImageStore.default.path rather than a re-derivation of Apple's
+            // path: re-deriving it would silently diverge the day Apple changes
+            // it, and a hand-rolled `urls(for:in:)[0]` traps on an empty array
+            // where ImageStore.defaultRoot() throws.
+            imageStoreRoot: ImageStore.default.path,
             layerCachePath: URL(
                 fileURLWithPath: NSString(string: "~/.arca/layers").expandingTildeInPath
             ),
