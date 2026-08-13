@@ -101,7 +101,7 @@ jobs:
       # engine-targets-check.sh needs an Arca tree, and this job is the only one
       # that has one. `head -1` and not `tail`: the script prints checkout then
       # binary, in its closing `printf '%s\n%s\n' "$checkout" "$binary"`
-      # (scripts/build-arca-engine.sh:235 -- re-derive with `grep -n "printf '%s"`
+      # (scripts/build-arca-engine.sh:256 -- re-derive with `grep -n "printf '%s"`
       # rather than trusting the number, it has gone stale twice). The pipeline would
       # otherwise mask a build failure behind head's exit status, so the script's
       # stdout goes to a file first and its own status is what gates the step.
@@ -126,7 +126,7 @@ jobs:
       # way Arca's own tests were rotting before the engine build script existed.
       #
       # `tail -1` and not `head`: the script prints checkout then binary, in the same
-      # closing printf the step above cites (scripts/build-arca-engine.sh:235), and
+      # closing printf the step above cites (scripts/build-arca-engine.sh:256), and
       # that step consumes the first line. The binary is guarded before use -- for the
       # same reason the checkout is --
       # an empty or bogus second line would otherwise reach the test harness as a

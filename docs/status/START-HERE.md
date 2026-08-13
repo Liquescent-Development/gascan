@@ -153,6 +153,21 @@ checkout and binary paths. The live tier then passes 4/4 against that binary. CI
 second time), which is the only automated verification Arca has at all — see the CI
 section below.
 
+**That measurement stands as the record it is, and the gate is red right now anyway.**
+Milestone 2 Task 3c widened the gate's test filter to cover `ArcaTests.NetworkPruneGateTests`
+— the suite that proves `docker network prune` declines to delete an in-use network, which
+`ArcaEngineTests` structurally cannot reach — and widened the listing guard beside it, so
+the gate fails rather than silently running less than it names. `gascan-engine-m1.1` /
+`b3390b8` carries no such suite: `git grep -l NetworkPruneGateTests b3390b8 -- Tests` exits
+1 in `~/code/arca`. **So `./scripts/build-arca-engine.sh` now exits 70 against the current
+pin** — `the test gate matched no tests: … declares no ArcaTests.NetworkPruneGateTests` —
+and CI's `engine` job is red with it. That is the guard working, not a regression in it.
+It clears when the pin moves to a signed tag carrying Arca `fede19c` (the XCTest
+conversion of that suite). **Do not bump the pin ad hoc to make CI green.** The bump
+belongs with the milestone's one signed tag, once the Arca branch merges; a pin moved to
+an untagged or mid-branch revision buys a green check by giving up the trust model
+`engine/allowed-signers` exists to enforce.
+
 Since PR #56 merged, `b3390b8` is an ancestor of Arca's `main`, so the pinned revision no
 longer depends on a tag alone to stay reachable. The older `gascan-engine-m1` at
 `f5fde96` is still pushed and still valid; it was left where it was rather than moved,

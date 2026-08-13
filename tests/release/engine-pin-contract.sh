@@ -102,32 +102,48 @@ MAIN
 # A real assertion and not an empty test body: the script's gate proves the pinned
 # engine passes its own suite, so a fixture whose suite cannot fail would leave the
 # gate's failing direction unexercised.
-cat >"$upstream/Tests/ArcaEngineTests/EngineFixtureTests.swift" <<'TEST'
+#
+# Each suite asserts against a value the caller supplies, and each carries a
+# message naming ITSELF. Both halves are needed to pin execution rather than
+# listing: `expected` is what lets a tree be built in which exactly one of the two
+# suites fails, and the distinct message is what proves the failure came from that
+# suite and not from the guard or the other one. Identical assertions in both --
+# which is what these were -- would make the two indistinguishable in the output,
+# and a `--filter` that had stopped selecting the second suite would look exactly
+# like one that still did.
+write_engine_suite() {
+  sed -e "s/@EXPECTED@/$1/" >"$upstream/Tests/ArcaEngineTests/EngineFixtureTests.swift" <<'TEST'
 import ContainerBridge
 import XCTest
 
 final class EngineFixtureTests: XCTestCase {
-    func testTheFixtureTargetIsTheOneThatWasBuilt() {
-        XCTAssertEqual(engineFixture, 1)
+    func testTheEngineSuiteRan() {
+        XCTAssertEqual(engineFixture, @EXPECTED@, "the ArcaEngineTests half of the gate ran")
     }
 }
 TEST
+}
+write_engine_suite 1
 # XCTest and not swift-testing, matching the suite it stands in for: the script
 # passes --disable-swift-testing, so a `@Test` here would be listed by nothing and
 # run by nothing, and the fixture would pass while proving the opposite.
 write_prune_suite() {
-  sed -e "s/@PRUNE_SUITE@/$1/" >"$upstream/Tests/ArcaTests/NetworkPruneGateTests.swift" <<'TEST'
+  sed -e "s/@PRUNE_SUITE@/$1/" -e "s/@EXPECTED@/$2/" \
+    >"$upstream/Tests/ArcaTests/NetworkPruneGateTests.swift" <<'TEST'
 import ContainerBridge
 import XCTest
 
 final class @PRUNE_SUITE@: XCTestCase {
-    func testTheFixtureTargetIsTheOneThatWasBuilt() {
-        XCTAssertEqual(engineFixture, 1)
+    func testThePruneSuiteRan() {
+        XCTAssertEqual(
+            engineFixture, @EXPECTED@,
+            "the ArcaTests.NetworkPruneGateTests half of the gate ran"
+        )
     }
 }
 TEST
 }
-write_prune_suite NetworkPruneGateTests
+write_prune_suite NetworkPruneGateTests 1
 git -C "$upstream" init -q
 git -C "$upstream" config user.name fixture
 git -C "$upstream" config user.email engine@example.invalid
@@ -195,11 +211,41 @@ git -C "$upstream" tag -s -m 'engine suite renamed' engine-suite-gone "$engine_s
 
 git -C "$upstream" mv Tests/ArcaEngineTestsRenamed Tests/ArcaEngineTests
 write_package ArcaEngineTests ArcaTests
-write_prune_suite NetworkPruneGateTestsRenamed
+write_prune_suite NetworkPruneGateTestsRenamed 1
 git -C "$upstream" add -A
 git -C "$upstream" -c commit.gpgsign=false commit -qm 'prune suite renamed'
 prune_suite_gone=$(git -C "$upstream" rev-parse --verify HEAD)
 git -C "$upstream" tag -s -m 'prune suite renamed' prune-suite-gone "$prune_suite_gone"
+
+# Two more trees, in which both suites are present and listed and exactly one of
+# them FAILS. These pin that the script EXECUTES each suite, which the listing
+# guard cannot: the guard proves a suite was declared, and a filter that selected
+# only one of the two would satisfy it exactly as well as one that selected both.
+#
+# The concrete decay this closes: `swift test` unions repeated --filter today,
+# MEASURED on Swift 6.3.3 at 46 tests against the real Arca tree. CI runs macos-26
+# with an unpinned toolchain (.github/workflows/ci.yml:80), so that is not the
+# Swift that gates releases. A SwiftPM in which the last --filter wins instead
+# would leave every other case here green while the gate ran 3 of 46 tests.
+#
+# Both directions, not just the second suite: a case that only ever fired for the
+# prune half would leave the engine half's execution resting on the same argument
+# it just refused to accept for the other one.
+# The prune class is restored here: the commit above left it renamed, and a tree
+# missing a suite would trip the listing guard long before anything ran.
+write_prune_suite NetworkPruneGateTests 1
+write_engine_suite 2
+git -C "$upstream" add -A
+git -C "$upstream" -c commit.gpgsign=false commit -qm 'engine suite fails'
+engine_suite_fails=$(git -C "$upstream" rev-parse --verify HEAD)
+git -C "$upstream" tag -s -m 'engine suite fails' engine-suite-fails "$engine_suite_fails"
+
+write_engine_suite 1
+write_prune_suite NetworkPruneGateTests 2
+git -C "$upstream" add -A
+git -C "$upstream" -c commit.gpgsign=false commit -qm 'prune suite fails'
+prune_suite_fails=$(git -C "$upstream" rev-parse --verify HEAD)
+git -C "$upstream" tag -s -m 'prune suite fails' prune-suite-fails "$prune_suite_fails"
 
 # file:// and not a bare path: the script constrains .url to schemes git cannot
 # turn into a command, so the fixture must speak one of them. git clone accepts
@@ -223,11 +269,24 @@ run_case() {
   GASCAN_ARCA_ALLOWED_SIGNERS=$signers \
   GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=protocol.file.allow GIT_CONFIG_VALUE_0=always \
     bash "$script" >"$fixture/$label.out" 2>&1 || actual=$?
-  [[ $actual == "$expected" ]] || {
-    printf 'case %s: expected exit %s, got %s\n' "$label" "$expected" "$actual" >&2
-    cat "$fixture/$label.out" >&2
-    exit 1
-  }
+  # `nonzero` and not a pinned code for the failing-suite cases below: the exit
+  # there is `swift test`'s own, which this repository does not define and a
+  # toolchain is free to change. Those cases assert WHICH suite reported the
+  # failure from the captured output, which is the property, rather than pinning
+  # a number that would make the contract brittle for no gain.
+  if [[ $expected == nonzero ]]; then
+    [[ $actual != 0 ]] || {
+      printf 'case %s: expected a non-zero exit, got 0\n' "$label" >&2
+      cat "$fixture/$label.out" >&2
+      exit 1
+    }
+  else
+    [[ $actual == "$expected" ]] || {
+      printf 'case %s: expected exit %s, got %s\n' "$label" "$expected" "$actual" >&2
+      cat "$fixture/$label.out" >&2
+      exit 1
+    }
+  fi
 }
 
 # The well-formed pin, written up front because the missing-file cases below
@@ -320,6 +379,42 @@ grep -q 'declares no ArcaTests\.NetworkPruneGateTests$' "$fixture/prune-suite-go
   cat "$fixture/prune-suite-gone.out" >&2
   exit 1
 }
+
+# non-zero — each filtered suite is EXECUTED, proven one half at a time. Both
+# suites are present and listed in these two trees, so the listing guard passes
+# and the only thing left to fail on is the test run itself.
+#
+# The listing guard cannot reach this. It proves a suite was declared; a --filter
+# that had stopped selecting one of the two would satisfy it exactly as well as
+# one that still selected both, and every other case in this file would stay
+# green while the release gate ran a fraction of what it names.
+#
+# Three assertions per case, and all three are needed: a non-zero exit, the
+# failing suite's own message present, and the listing guard's message ABSENT.
+# Without the third, a case could pass on exit 70 -- the guard firing for an
+# unrelated reason -- having never run a test at all.
+assert_failing_suite_reported() {
+  local label=$1 message=$2
+  grep -q "$message" "$fixture/$label.out" || {
+    printf 'case %s: the failing suite did not report itself: %s\n' "$label" "$message" >&2
+    cat "$fixture/$label.out" >&2
+    exit 1
+  }
+  ! grep -q 'the test gate matched no tests' "$fixture/$label.out" || {
+    printf 'case %s: failed at the listing guard, so no suite was ever run\n' "$label" >&2
+    cat "$fixture/$label.out" >&2
+    exit 1
+  }
+}
+
+write_pin "$fixture/pin-engine-fails.json" engine-suite-fails "$engine_suite_fails"
+run_case engine-suite-fails "$fixture/pin-engine-fails.json" nonzero
+assert_failing_suite_reported engine-suite-fails 'the ArcaEngineTests half of the gate ran'
+
+write_pin "$fixture/pin-prune-fails.json" prune-suite-fails "$prune_suite_fails"
+run_case prune-suite-fails "$fixture/pin-prune-fails.json" nonzero
+assert_failing_suite_reported prune-suite-fails \
+  'the ArcaTests.NetworkPruneGateTests half of the gate ran'
 
 # 0 — well-formed pin, signed tag, tag resolves to the pinned revision
 run_case good "$fixture/pin-good.json" 0

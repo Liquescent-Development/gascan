@@ -204,27 +204,48 @@ listed=$(swift test list --package-path "$checkout" --configuration release \
   exit 70
 }
 
-# Each filtered suite is asserted separately, and each names itself when it is
-# the one that went missing. A single grep matching either, or one message
-# naming both, would let the DockerAPI-side suite vanish behind a still-present
+# One pattern per suite, used BOTH as the listing assertion and as the filter, so
+# the two cannot drift. A guard asserting a suite the filter does not select --
+# or a filter selecting a suite the guard does not assert -- reads as covered and
+# is not, and a comment claiming the two agree is not a mechanism.
+#
+# Anchored, and the anchor is doing work in both roles. `--filter` is an
+# unanchored substring regex, so a bare `ArcaEngineTests` would silently pull a
+# future `ArcaEngineTestsIntegration` target into the release gate -- a
+# daemon-requiring suite, run on a runner with no daemon, failing a long way from
+# its cause -- and the guard, which only checks presence, could not see it. `\.`
+# anchors the engine half on its target; `/` anchors the prune half on its class,
+# because that suite's target keeps its name when only the class moves.
+# MEASURED on Swift 6.3.3: both patterns as --filter select 46 tests, the same
+# 43 + 3 the unanchored pair selected.
+engine_suite='^ArcaEngineTests\.'
+prune_suite='^ArcaTests\.NetworkPruneGateTests/'
+
+# Each suite is asserted separately, and each names itself when it is the one
+# that went missing. A single grep matching either, or one message naming both,
+# would let the DockerAPI-side suite vanish behind a still-present
 # ArcaEngineTests -- the same hole this guard was written to close, reopened one
-# suite over. The patterns are anchored past the suite name (`\.` for the target,
-# `/` for the class) so a renamed-but-prefixed leftover cannot satisfy them.
+# suite over.
 require_listed() {
   grep -q "$2" <<<"$listed" || {
     printf 'the test gate matched no tests: %s declares no %s\n' "$checkout" "$1" >&2
     exit 70
   }
 }
-require_listed ArcaEngineTests '^ArcaEngineTests\.'
-require_listed ArcaTests.NetworkPruneGateTests '^ArcaTests\.NetworkPruneGateTests/'
+require_listed ArcaEngineTests "$engine_suite"
+require_listed ArcaTests.NetworkPruneGateTests "$prune_suite"
 # Two --filter flags and not one alternation: SwiftPM unions repeated --filter,
-# and keeping them separate means each pattern is the same string as the guard's,
-# minus the anchors, rather than a regex that has to be read twice.
+# which keeps each pattern identical to the guard's rather than a regex that has
+# to be read twice. That union is a property of the toolchain and not of this
+# script, and CI's toolchain is unpinned, so it is pinned from the outside:
+# tests/release/engine-pin-contract.sh runs a tree in which only the SECOND
+# suite fails and requires this script to report it. The day a SwiftPM makes the
+# last --filter win instead, that case goes red rather than this gate quietly
+# running 3 of 46 tests.
 swift test --package-path "$checkout" --configuration release \
   --disable-swift-testing \
-  --filter ArcaEngineTests \
-  --filter 'ArcaTests\.NetworkPruneGateTests' >&2
+  --filter "$engine_suite" \
+  --filter "$prune_suite" >&2
 
 binary=$checkout/.build/release/arca-engine
 [[ -x $binary ]] || {
