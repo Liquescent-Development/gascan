@@ -290,9 +290,12 @@ entitlements=$checkout/Arca.entitlements
   printf 'the pinned engine carries no entitlements file: %s\n' "$entitlements" >&2
   exit 70
 }
-# >&2 because stdout is this script's contract with its caller -- two lines, the
-# checkout and the binary -- and codesign is chatty on a warm cache ("replacing
-# existing signature").
+# >&2 is defence in depth and not a fix for anything observed. Stdout is this
+# script's contract with its caller -- two lines, the checkout and the binary --
+# and every other command here is redirected for that reason. MEASURED: codesign
+# writes `replacing existing signature` to stderr and 0 bytes to stdout, on a
+# cold cache and a warm one. The redirect stays so that a codesign that starts
+# saying something on stdout cannot corrupt the contract.
 codesign --force --sign - --options runtime --timestamp \
   --entitlements "$entitlements" "$binary" >&2
 
