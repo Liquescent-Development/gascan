@@ -1306,7 +1306,89 @@ shutdowns, four with `SWIFTNIO_STRICT=1`, were clean. `serve()`'s own docstring
 strict mode. Not this milestone's doing — `serve()` is untouched — but a 1-in-13 shutdown fault is
 a flaky live tier waiting to happen, and it should be chased before Task 13 rather than after.
 
-### Landing 3 — `Inspect` and `ListResources`
+### Landing 3 — `Inspect` and `ListResources` (EXPANDED 2026-08-13, from Task 6's findings)
+
+Anchors re-derived at Arca `db6bedc`. Re-derive again before editing — this file has moved under
+every task so far.
+
+| What | Where, at `db6bedc` |
+|---|---|
+| `inspect` returning `notImplemented` | `SandboxEngineService.swift:130-131` |
+| `listResources` returning `notImplemented` | `:268-269` |
+| The stale comment read as spec | `:245-267` |
+| `convertPortBindingsToMappings` — **`private`** | `ContainerManager.swift:944` |
+| Inspect's entry point | `ContainerManager.getContainer(id:) async throws -> Container?` `:808` |
+| Volumes | `VolumeManager.listVolumes(filters:) async throws` `:245` |
+| Digest split, status map | `EngineTranslation.swift:27`, `:40-47` |
+
+**Seed through `loadPersistedState()`, never a stub.** It is `package func`, VM-free, needs no
+entitlement, and is the only writer of `ContainerManager.containers` reachable without a kernel.
+`Tests/ArcaEngineTests/CrashRecoveryTests.swift` is the worked example. A stub would exercise a
+replica of the wiring — the defect Task 1's review removed and Task 3's review re-found.
+
+**Delete the comment at `:245-267` in whichever task lands first.** It states in the present tense
+that `listContainers` drops internal containers and that both defects "must be fixed in
+`ContainerBridge` before this method reports anything". Both were fixed in Tasks 2 and 3. Whoever
+writes `ListResources` reads that block as their specification and will either re-fix a fixed thing
+or miss that they must now pass `includeInternal: true` explicitly.
+
+#### Task 7 — `Inspect`
+
+**Three arms** — sandbox, `Absent`, error — because "it is not there" and "I could not tell" demand
+opposite behaviour from a reconciler (`engine.proto:354-357`).
+
+**Order is the whole fix for review I5.** Read the owner labels **first**. The removed body ran the
+digest check first, so a container created from a tag under a colliding name made
+`imageDigest(fromReference:)` return nil and the engine answered `invalid_output` — the code
+`crates/gascan-arca/src/error.rs` reserves for "the engine sent me something I cannot interpret".
+That tells the consumer the engine is broken when the truth is a foreign resource, and
+`foreign_resource_refused` / `ownership_mismatch` exist for exactly this.
+
+**Ports are review I4.** `convertPortBindingsToMappings` is `private`; widen it to `package` — not
+`public`, per the `loadPersistedState()` ruling. `crates/gascan-arca/src/translate.rs:436-437`
+reads an empty list as "publishes nothing", not "unknown", so a hardcoded `[]` is a fabricated
+value every port-drift comparison then runs against.
+
+**The trap:** `setPortMapManager` is still unwired (see the divergence audit above). Until Task 11
+wires it, a container's *stored* `hostConfig.portBindings` can name bindings that were never
+published. `Inspect` must report what the store holds — that is what drift detection compares —
+but the test must not be written in a way that implies publication was verified.
+
+Tests, each proved failable by reverting that guard alone:
+- a sandbox with owner labels and a digest reference round-trips, ports included;
+- a container with **no** gascan labels is refused as foreign, **not** as `invalid_output`;
+- a container created from a **tag** under a colliding name takes the same foreign arm — this is
+  the ordering test, and it must fail if the digest check moves back in front;
+- an absent id answers `Absent`, and that arm is distinguishable from the error arm;
+- a sandbox publishing 8080→80 reports one mapping, not zero.
+
+#### Task 8 — `ListResources`
+
+Containers via `listContainers(all: true, includeInternal: true)`, volumes via
+`VolumeManager.listVolumes()`, networks via `NetworkManager.listNetworks()` — which **throws** now,
+so a backend failure surfaces as `command_io` rather than a short list.
+
+**Unlabelled and internal resources are reported, never filtered.** `engine.proto:387-391` is
+"every resource the engine holds, labelled or not", because the consumer's drift and leak detection
+depends on seeing them. Filtering engine-side breaks it silently, which is why Task 2 added an
+explicit flag rather than a substring-matched filter.
+
+Tests:
+- a container labelled `com.arca.internal=true` **appears**;
+- an unlabelled container appears;
+- a volume and a network appear, seeded through `StateStore` and read back through the real path;
+- a `listNetworks()` backend failure surfaces as an error arm, not an empty list — reuse the
+  `BridgeNetworkLister` seam Task 3 built, and mutate the **production default** to prove it;
+- an engine holding nothing answers with an empty list rather than an error, and that assertion is
+  distinguishable from the failure above.
+
+**The eighth-finding watch for this landing:** every test here asserts on a *collection*. The
+recurring defect has twice been an assertion that could not tell "held one back" from "held
+everything back" — `isEmpty` in Task 2, and the one-sided prune pair in Task 3b. **Assert
+equality on the whole expected set**, not membership or non-emptiness, and seed at least two
+resources so a filter that drops everything is distinguishable from one that drops the right thing.
+
+### Landing 3 — original outline, superseded by the expansion above
 
 **Task 7 — `Inspect`.** Replace the `notImplemented` body at `SandboxEngineService.swift`. Three arms: sandbox, `Absent`, error. Two constraints from the adversarial review, both of which the obvious implementation reintroduces:
 - **Read the owner labels BEFORE the image-digest check** (review I5). A container under a colliding name created from a tag makes `imageDigest(fromReference:)` (`EngineTranslation.swift:27`) return nil; answering `invalid_output` there tells the consumer the engine is broken when the truth is a foreign resource. `foreign_resource_refused` and `ownership_mismatch` exist for this.
