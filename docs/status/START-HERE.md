@@ -3,36 +3,73 @@
 This file is the session entry point. It is written to be read cold, and it is
 addressed to you, the agent. Follow it as instructions — there is nothing to paste.
 
-Written 2026-08-11 for two branches in flight; rewritten 2026-08-12, after both merged.
+Written 2026-08-11 for two branches in flight; rewritten 2026-08-12 after both merged;
+rewritten again 2026-08-13, mid-milestone-2, with two branches in flight and unmerged.
 
 ---
 
 ## Where the work is
 
-**P5.1 milestone 1 is DONE and MERGED in both repositories. There is nothing in
-flight.** Start a new branch for whatever comes next.
+**P5.1 milestone 2 is HALF DONE, on branches, NOT merged.** Landings 1 and 2 are complete —
+nine tasks, every one reviewed clean. Landings 3, 4 and 5 remain. **Do not start a new
+branch; continue on these two.**
 
 | | |
 |---|---|
-| Gas Can | PR #69 merged as `58f26aa`, 2026-08-12 |
-| Arca | PR #56 merged as `cc316b65`, 2026-08-12 |
-| Design | `docs/superpowers/specs/2026-08-10-p5-1-engine-service-and-wiring-design.md` |
-| Plan | `docs/superpowers/plans/2026-08-10-p5-1-milestone-1-engine-skeleton.md` |
-| Detail | `docs/status/arca-integration-handoff.md`, from `## Session of 2026-08-10/11` |
+| Arca | `feat/engine-state-ownership`, HEAD `db6bedc`, based on `cc316b65` |
+| Gas Can | `docs/p5-1-milestone-2-design`, HEAD `fe54d68`, based on `6847d1e` |
+| Design | `docs/superpowers/specs/2026-08-12-p5-1-milestone-2-engine-lifecycle-design.md` |
+| Plan | `docs/superpowers/plans/2026-08-12-p5-1-milestone-2-engine-lifecycle.md` |
+| Parent design | `docs/superpowers/specs/2026-08-10-p5-1-engine-service-and-wiring-design.md` |
 
-Both are real merge commits, not squashes — `git rev-list --parents -n 1` reports two
-parents for each — so every commit message below is still reachable by SHA. VERIFIED
-with `git merge-base --is-ancestor`: `b3390b8` is an ancestor of Arca's `origin/main`
-and `351a646` of Gas Can's.
+Neither branch is pushed. Both trees are clean. `ArcaEngineTests` reports
+`Executed 63 tests, with 0 failures`; `tests/release/engine-pin-contract.sh` PASSes;
+`scripts/ci-run-release-contracts.sh` reports 15/15.
 
-**Read the design document before touching anything.** Every decision taken — offline
-reported `PROVEN` the way `gascan-apple` earns it, image ingress as an engine subcommand,
-the engine as a launchd job `gascand` dials rather than supervises, a mid-exec reset
-meaning cancellation — is recorded there with its reasoning.
+**Read the milestone-2 design before touching anything**, then the plan. The design records
+why the engine owns a private state root and why that made `initialize()` safe when milestone 1
+had rejected it. The plan carries the landings, and landings 3-5 were expanded *after* Task 6
+ran, so they reflect what the machine actually does rather than what the code appeared to say.
 
-**P5.1 is both halves.** The roadmap and the older handoff say "implement the engine
-service"; an earlier START-HERE said "wire the backend to the daemon". It is both, and
-the design document supersedes the narrower readings.
+### What milestone 2 has landed
+
+| Task | Arca | Gas Can |
+|---|---|---|
+| 1 `ContainerManager` takes its storage roots | `8fd2757`..`1ff4304` | — |
+| 2 `listContainers` gains `includeInternal` | `bd80701`..`4b34bfc` | — |
+| 3 `listNetworks` throws | `8b3e16f`..`1201f4a` | — |
+| 3b the prune-gate swallows | `493e5ce`..`1c6a851` | — |
+| 3c the gate runs DockerAPI-side tests | `fede19c` | `142d199`..`cd00388` |
+| 4 the three path options | `b93ef76`..`029c01d` | — |
+| 5 vminit into the engine's own store | `e1b5d9a`..`595a450` | — |
+| 6 `initialize()` before serving | `a0796c4`..`85b5023` | — |
+| 6b sign the engine | `014c84b`..`db6bedc` | `a45edd4`..`c8e2c5b` |
+
+**Tasks 3b, 3c and 6b were not in the approved plan.** Each was added on a maintainer ruling
+after a review found something real: a `try?` that let `docker network prune` delete an in-use
+network, a gate that could not see the test guarding it, and an engine that could not start a
+container because nothing signed it.
+
+### The milestone's thesis, and that it now holds
+
+Milestone 1 rejected calling `initialize()` because `ContainerManager`'s restore loop **writes** —
+a persisted `running` container is marked exited/137 and written back (`ContainerManager.swift:317`,
+write at `:333`). Against a state root shared with a live `ArcaDaemon` that declares the daemon's
+containers dead.
+
+**That hazard belongs to sharing a root, not to writing.** The engine now owns
+`~/Library/Application Support/dev.gascan/engine/`, and against its own root the same write is
+correct. VERIFIED by running it: the isolation probes —
+`/usr/bin/find ~/.arca -newermt '-5 minutes'` and the same over
+`~/Library/Application Support/com.apple.containerization` — came back **empty**, three separate
+times, cross-checked with `-newer <marker>`. The engine built its own 512MB `initfs.ext4` inside
+its own state root and never touched Apple's.
+
+**The vmnet `host` network does not collide.** Two concurrent engines on different state roots
+took `192.168.93.0/24` and `192.168.95.0/24`, both listening, allocation released on exit. The
+`host` name is a row in each engine's own `state.db`, and `VmnetNetworkBackend`'s `isDefault`
+guard reads a per-instance dictionary — not a host-wide namespace. **Limit:** no live `ArcaDaemon`
+was run alongside; that case is inference from the identical code path, not observation.
 
 ### What shipped
 
@@ -74,19 +111,55 @@ refuse instead. The reasoning is on each method in `SandboxEngineService.swift` 
 
 ## What to do next
 
-Three things are open, in the order I would take them.
+**Resume the milestone at Landing 3, Task 7 — `Inspect`.** The plan's Landing 3 section was
+expanded on 2026-08-13 with anchors re-derived at `db6bedc`, and it carries the tests, the two
+review findings the restored method must not reintroduce, and a trap. Landing 4 and Landing 5
+are named and constrained but **not** stepped out; expand each immediately before starting it,
+the way Landing 3 was.
 
-1. **Plan milestone 2.** It is outlined at the end of the plan and was deliberately left
-   unplanned until milestone 1 landed, because its tasks depend on what milestone 1
-   found. It now has a concrete first task it did not have before: give `ContainerBridge`
-   a read-only load path that neither starts a VM nor writes, and restore `Inspect` and
-   `ListResources` on top of it. Arca's I3, I4 and I5 (below) are the known defects that
-   path must fix before either method reports anything.
-2. **The Minors** — 6 in Gas Can, 8 in Arca. Cheap, well-specified, and each carries its
-   own reproduction in the review reports.
-3. **D7's narrowed retry**, which is now unblocked by evidence. See its section below.
-   The maintainer's ruling on 2026-08-12 was: separate PR, after the merge — not folded
-   into unrelated work.
+Remaining: Task 7 `Inspect`, Task 8 `ListResources`, Task 9 `image load`, Task 10 `PrepareImage`,
+Task 11 `Create`, Task 12 `Start`/`Stop`/`Remove`, Task 13 the live tier, Task 14 the capability
+flips, Task 15 the workspace suite run alone.
+
+**Four things Task 6 found that change the remaining work.** They are in the plan; they are
+repeated here because missing one is expensive:
+
+1. **Landing 3 seeds through `loadPersistedState()`, never a stub.** It is `package func`,
+   VM-free, needs no entitlement, and is the only writer of `ContainerManager.containers`
+   reachable without a kernel. `Tests/ArcaEngineTests/CrashRecoveryTests.swift` is the example.
+2. **Task 11 must cross-wire the managers before `Create` is written.** The engine calls
+   `setVolumeManager` and `setNetworkManager` as of Task 6, but **`setPortMapManager` is still
+   unwired**. `ContainerManager.swift:2482` guards `publishPorts` behind it with no `else`, so an
+   unwired engine **starts a container with published ports, publishes nothing, and reports
+   success**. `:2730`/`:3058` guard teardown the same way.
+3. **Task 14's `named_volumes` and `loopback_publish` cannot be flipped** until that wiring
+   exists. A flag whose machinery is unwired is a claim with no instrument.
+4. **Signing precedes the live tier.** Task 6b landed it; do not reorder Task 13 ahead of it.
+   Unsigned, `initialize()` dies at `VmnetNetwork()` and the engine never creates a socket.
+
+**Two things the engine must keep NOT doing.** "Mirror `ArcaDaemon`" is the obvious way to close
+a wiring gap and it would import both:
+
+- **`applyRestartPolicies()` calls `startContainer` and boots VMs.** In an engine that resurrects
+  sandboxes the consumer believes stopped, *before the socket binds* — the consumer never sees the
+  transition and reconcile meets containers it did not start.
+- **The daemon's deletion of Apple's `initfs.ext4`** is the shared-store behaviour the private
+  root exists to avoid.
+
+Deliberately correct as-is: `setHealthChecker` and `setEventEmitter` are silent when unset, and the
+proto has no health or events surface. Wiring an `EventManager` would build toward one
+`tests/release/engine-targets-check.sh` requires the engine **not** to have.
+
+### Still open, not started
+
+- **The Minors** — 6 in Gas Can, 8 in Arca, from the milestone-1 adversarial reviews. Two Gas Can
+  Minors were taken along the way. Each carries its own reproduction in the review reports.
+- **D7's narrowed retry.** Unblocked by evidence; maintainer's ruling 2026-08-12 was a separate PR,
+  not folded into unrelated work. See its section below.
+- **Milestone 2's own deferred minors** live in the plan and in
+  `.superpowers/sdd/2026-08-12-p5-1-milestone-2-engine-lifecycle/progress.md`. That ledger is
+  disposable scaffolding — anything in it that must outlive the milestone belongs here or in the
+  handoff.
 
 ### The adversarial reviews
 
@@ -126,8 +199,18 @@ what not to re-litigate. **Read the "attacked and could not break" sections too.
    root would declare that daemon's containers dead; and `NetworkManager.initialize()`
    ends in `createDefaultNetworks()`, which creates a vmnet network. **This dissolved
    Arca's I3, I4 and I5** — all three are properties of answers that no longer exist.
-   Milestone 2 gives ContainerBridge a read-only load path that neither starts a VM nor
-   writes, and restores both methods.
+
+   **SUPERSEDED 2026-08-13.** That paragraph ended "milestone 2 gives ContainerBridge a
+   read-only load path that neither starts a VM nor writes". **That framing is retired and
+   the reasoning behind it was incomplete.** The hazard belongs to *sharing a state root*,
+   not to writing: given a private root the same crash-recovery write is correct, because a
+   container the engine's own StateStore records as `running` at startup died with the
+   previous engine process. And the read-only path could not have survived the milestone
+   regardless — `createContainer` guards on `nativeManager` (`:1584`) and `startContainer`
+   does too (`:2005`), so landing `Create` lands a VM-starting writer. Milestone 2 gives the
+   engine its own state root and runs `initialize()` in full. **I3 and I4 are fixed on their
+   merits** (Tasks 2 and 3); **I5's ordering fix returns with `Inspect`** in Task 7 — they
+   were dissolved, not solved, and the answers they were properties of are coming back.
 
 **Which Minors are left.** Two Gas Can Minors were taken along the way because they were
 load-bearing for an Important — M1 (the `runtime-probe` comment orphaned onto `gate`) and
@@ -207,6 +290,59 @@ in `docs/status/arca-integration-handoff.md`.
   `scripts/build-arca-engine.sh`.
 
 ## Traps that will cost you if you learn them the hard way
+
+**THE DEFECT THIS MILESTONE FOUND EIGHT TIMES IS A TEST THAT PASSES WHILE PROVING NOTHING.**
+Every task in landings 1-2 shipped one on the first attempt, and every one was caught by a
+reviewer's mutation rather than by reading the diff. In order of increasing subtlety:
+
+1. an assertion that was a **tautology** — `containerizationRoot()` returned the value the test
+   handed the initializer;
+2. a **one-sided** assertion — `XCTAssertTrue(hidden.isEmpty)` could not distinguish "hid the
+   internal container" from "hid **every** container";
+3. a **stub-driven** test that stayed green when only the production default was dropped;
+4. a pair pinning the **failure path** while leaving the gate's **normal path** unpinned —
+   "the read failed → don't delete" was proved, "the read said in-use → don't delete" was not;
+5. six well-formed tests proving a **function** and never that `run()` **called** it;
+6. an assertion on `--kernel-path` in stderr satisfied by **ArgumentParser's usage line**, printed
+   on any parse error before `run()` is entered;
+7. a conjunct **implied by its sibling** — `contains("arca-vminit:latest") && contains("vminit:latest")`,
+   where the second string is a substring of the first, so the "which was found" half asserted
+   nothing;
+8. a signing step whose only proof would have been `codesign -d` output — which proves the command
+   ran, not that the binary works.
+
+**The two rules that catch these: mutate the PRODUCTION DEFAULT, not the seam; and mutate the CALL
+SITE, not only the function.** A test that drives an injected stub proves the stub. In Task 3 a
+reviewer dropped only the production default while leaving the stub path intact — the stub-driven
+test stayed green and only the test that installed nothing caught it.
+
+**A REVIEWER THAT CANNOT MAKE A FIX FAIL SHOULD SAY SO, INCLUDING AGAINST ITSELF.** Task 6b's
+reviewer filed an Important finding backed by a real measurement, the fix landed, and it then
+retracted the finding with a second measurement — its first had run `swift build --build-tests`
+directly, which strips signatures, where `make test` never does. The fix was kept as defence in
+depth and the commit subject asserting a relink that does not happen was corrected by a following
+commit. **A fix you cannot make fail is either unnecessary or unprovable, and both deserve saying.**
+
+**`arca-engine` CANNOT START A CONTAINER UNSIGNED, AND THE ERROR LIES.** `initialize()` constructs
+`Containerization.VmnetNetwork()`, which needs `com.apple.security.virtualization`. Unentitled it
+throws `vmnet_return_t(rawValue: 1002)` — the SDK header labels that `VMNET_MEM_FAILURE`; the
+cause is the entitlement, not memory. The process exits and **never creates a socket**. Task 6b
+signs it in Arca's `Makefile` and in `scripts/build-arca-engine.sh` (ad-hoc `--sign -`, which needs
+no certificate). **Ad-hoc is sufficient for the gate and the live tier and NOT for a shipped
+`.pkg`** — Developer ID signing is milestone 4's.
+
+**LINE ANCHORS IN `SandboxEngineService.swift`, `ContainerManager.swift` AND
+`NetworkManager.swift` MOVED UNDER EVERY SINGLE TASK.** `getNetworkAttachments` was cited at four
+different lines across one landing. The `printf` in `build-arca-engine.sh` moved four times, twice
+inside commits whose own comments say "re-derive rather than trusting the number, it has gone stale
+twice". **Re-derive every anchor immediately before editing**, and re-derive again after your own
+edits if you cite them.
+
+**A SUBAGENT WILL FLIP THE SHARED TASK TRACKER TO `completed` BEFORE ANY REVIEW EXISTS.** It
+happened twice. The tracker is an instruction surface, not a status board — the ledger is
+authoritative. **And an idle notification is not a result:** three times a subagent went idle with
+its work committed and only its return message missing. **Check `git log`, the working tree, and
+the report file before re-dispatching anything.**
 
 **SIGNING IS INVERTED BETWEEN THE TWO REPOSITORIES.** Gas Can's `user.signingkey` is a file
 PATH (`~/.ssh/gascan-signing`), so commit with `env -u SSH_AUTH_SOCK git commit`. **Arca's
