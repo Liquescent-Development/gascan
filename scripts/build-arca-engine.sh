@@ -216,8 +216,13 @@ listed=$(swift test list --package-path "$checkout" --configuration release \
 # its cause -- and the guard, which only checks presence, could not see it. `\.`
 # anchors the engine half on its target; `/` anchors the prune half on its class,
 # because that suite's target keeps its name when only the class moves.
-# MEASURED on Swift 6.3.3: both patterns as --filter select 46 tests, the same
-# 43 + 3 the unanchored pair selected.
+# The property that matters is that anchoring changed nothing about WHICH tests
+# run -- the anchored pair selects the same set as the unanchored pair did.
+# MEASURED on Swift 6.3.3 at Arca `fede19c`, when this guard was written: both
+# forms selected 46 tests, 43 + 3. The count is not the claim and has moved since
+# (Landing 3 and 4 add tests to ArcaEngineTests); re-derive it with
+# `swift test list --disable-swift-testing --filter '^ArcaEngineTests\.'` rather
+# than trusting a number written here.
 engine_suite='^ArcaEngineTests\.'
 prune_suite='^ArcaTests\.NetworkPruneGateTests/'
 
