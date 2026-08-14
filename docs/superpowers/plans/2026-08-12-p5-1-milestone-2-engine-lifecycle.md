@@ -1657,7 +1657,14 @@ already agree, and only the proto is silent.** That is an argument for writing t
 3. The partial-failure case, asserting the **contents** of `CreateFailed.created`, not that it is
    non-empty — the collection-assertion defect shape Task 8's review measured.
 4. The published-port test, per the section above. **This is the landing's load-bearing test.**
-5. Register every new test in `tests/ci/expected-ignored-tests.txt`, sorted. `ci-check-ignored-tests.sh:23`
+5. **`Remove` of a RUNNING container — routed here from Task 12's review.** `removeContainer`'s
+   `containerRunning` refusal shipped **untested**, because a container in state `running` is
+   unreachable VM-free: `loadPersistedState()` recovers every persisted `running` row as exited/137
+   before a test can observe it. Task 12 declined to write a test that would have exercised the recovery
+   path while reading as the refusal — the right call, and it makes this Task 13's. The refusal becomes
+   reachable the moment containers actually run. **This is a destructive path with no instrument until
+   this test exists.**
+6. Register every new test in `tests/ci/expected-ignored-tests.txt`, sorted. `ci-check-ignored-tests.sh:23`
    derives the actual set with `cargo test --workspace -- --ignored --list` piped through
    `sed -n 's/: test$//p' | sort` and diffs it **both ways**, so an unregistered addition and a vanished
    test both fail. The file is a flat sorted list of `module::test` names across the whole workspace — it

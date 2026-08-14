@@ -209,13 +209,32 @@ capability flips, Task 15 the workspace suite run alone.
    machinery is unproved is a claim with no instrument, and here the machinery has three ways to
    silently do nothing.
 
-### A contract defect for milestone 4's design pass
+### Two contract defects for milestone 4's design pass
 
-**The contract permits a combination no engine can honour.** `engine.proto`'s `Network` is a `oneof`
+**1. The contract permits a combination no engine can honour.** `engine.proto`'s `Network` is a `oneof`
 of `offline`/`networked_name`, and `ports` is a separate `repeated` field on `CreateRequest`, so
 offline-plus-ports is expressible and nothing says which wins. Task 11 refuses it with
 `unsupported_capability`. **The proto and the design should say what happens rather than leaving each
 engine to decide** — this is feedback for milestone 4, and it dies in a Swift comment otherwise.
+
+Sharpened 2026-08-14: **three components already agree** — the proto permits it, Gas Can's
+`compile_ports` (`crates/gascan-core/src/policy.rs:436-438`) refuses it as `OfflinePortsForbidden`
+before a request is built, and Arca's engine refuses it. Only the proto is silent. That is an argument
+for writing the rule down, not for leaving it.
+
+**2. `Remove` cannot report a partial deletion, because `AckResponse` has nowhere to put one.** Found by
+Task 12's review. `CreateFailed` carries `repeated Resource created = 1` precisely so a partial create
+does not leak with nothing knowing to look for it. **`AckResponse` is a bare `oneof { Ack ok; EngineError
+error }`** — so a `Remove` that deletes the container and then fails on the volume is indistinguishable
+on the wire from one that did nothing, and the consumer's recorded state diverges from reality with no
+signal. `RuntimeBackend::remove` returns `Result<(), RuntimeError>`, so Gas Can could not carry it
+either.
+
+**Severity is bounded, which is why it is not a blocker:** Task 12's `Remove` validates *every* resource
+before deleting *any*, so authorisation failures delete nothing; only a mid-deletion manager failure
+produces a partial; nothing retries `Remove` (all six `gascand` call sites are single-shot); and
+`ListResources` plus reconcile can rediscover the truth. **Do not fix it in the engine — it is a contract
+change.**
 
 **Four things Task 6 found that change the remaining work.** They are in the plan; they are
 repeated here because missing one is expensive:
