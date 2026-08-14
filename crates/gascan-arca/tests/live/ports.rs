@@ -1,11 +1,10 @@
 use crate::common::{
-    LiveEngine, base_oci_layout, layout_running, policy_request_from_manifest,
-    reserved_loopback_port,
+    LiveEngine, answering, await_state, base_oci_layout, layout_running,
+    policy_request_from_manifest, read_from_loopback, reserved_loopback_port,
 };
 use camino::Utf8Path;
 use gascan_arca::ArcaBackend;
 use gascan_core::runtime::{ContainerState, RemoveRequest, RuntimeBackend};
-use std::io::Read as _;
 use std::time::Duration;
 
 /// A published port must be reachable from this process, and nothing weaker
@@ -70,10 +69,7 @@ async fn a_published_port_is_reachable_from_the_test_process() {
     let port = reserved_loopback_port();
     let token = format!("gascan-live-{port}");
     let images = tempfile::tempdir().expect("a temporary layout root");
-    // `while :;` and not a single accept: the connection below is the first
-    // this responder ever serves, but a retry after a refused connect must
-    // find it still listening rather than gone.
-    let responder = format!("while :; do echo {token} | nc -l -p {port}; done");
+    let responder = answering(port, &format!("echo {token}"));
     let layout = layout_running(
         &base_oci_layout(),
         Utf8Path::from_path(images.path()).expect("a utf-8 path"),
@@ -127,20 +123,13 @@ async fn a_published_port_is_reachable_from_the_test_process() {
     backend.stop(request.id()).await.expect("stop must answer");
     // Stopped rather than removed-then-asserted: the point already landed
     // above, and a running container cannot be removed.
-    let mut settled = false;
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    while std::time::Instant::now() < deadline {
-        let seen = backend
-            .inspect(request.id())
-            .await
-            .expect("inspect answers");
-        if seen.map(|sandbox| sandbox.state) == Some(ContainerState::Stopped) {
-            settled = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    assert!(settled, "the sandbox must stop so that it can be removed");
+    await_state(
+        &backend,
+        &request,
+        ContainerState::Stopped,
+        Duration::from_secs(120),
+    )
+    .await;
     backend
         .remove(
             RemoveRequest::from_resources(created.created().to_vec())
@@ -150,43 +139,4 @@ async fn a_published_port_is_reachable_from_the_test_process() {
         .expect("remove must delete the sandbox");
 
     engine.kill().await;
-}
-
-/// Connects to `127.0.0.1:<port>` until something answers, and returns what it
-/// said.
-///
-/// Retried rather than attempted once: `Start` returns before the guest's own
-/// PID 1 has run the image's `Cmd`, so the first connects are refused by a host
-/// proxy with nothing behind it yet. The bound is what makes this a test and
-/// not a wait -- a publish that never happens fails here, naming the port.
-async fn read_from_loopback(port: u16, bound: Duration) -> String {
-    let deadline = std::time::Instant::now() + bound;
-    let mut last = String::from("never attempted");
-    while std::time::Instant::now() < deadline {
-        let attempt = tokio::task::spawn_blocking(move || {
-            let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-            let mut stream =
-                std::net::TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
-            stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-            let mut answer = String::new();
-            stream.read_to_string(&mut answer)?;
-            Ok::<String, std::io::Error>(answer)
-        })
-        .await
-        .expect("the blocking connect task must not panic");
-        match attempt {
-            Ok(answer) if !answer.trim().is_empty() => return answer,
-            Ok(_) => last = "connected and read nothing".to_owned(),
-            Err(error) => last = error.to_string(),
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    panic!(
-        "nothing answered on 127.0.0.1:{port} within {:.1}s; last attempt: {last}. \
-         If this reads `connected and read nothing`, the engine publishing nothing \
-         and an unrelated process having taken {port} between the reservation and \
-         the Create are INDISTINGUISHABLE from here -- both accept and stay silent. \
-         Check what is listening on {port} before treating this as a publish failure",
-        bound.as_secs_f64()
-    );
 }

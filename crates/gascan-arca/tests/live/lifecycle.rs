@@ -1,12 +1,12 @@
 use crate::common::{
-    LiveEngine, base_oci_layout, layout_running, policy_request_for_image,
+    LiveEngine, await_state, base_oci_layout, layout_running, policy_request_for_image,
     policy_request_from_manifest,
 };
 use camino::{Utf8Path, Utf8PathBuf};
 use gascan_arca::ArcaBackend;
 use gascan_core::policy::PolicyCompiler;
 use gascan_core::runtime::{
-    ContainerState, CreateRequest, RemoveRequest, ResourceKind, RuntimeBackend, RuntimeResource,
+    ContainerState, RemoveRequest, ResourceKind, RuntimeBackend, RuntimeResource,
 };
 use std::time::Duration;
 
@@ -73,39 +73,6 @@ fn describe_all(resources: &[RuntimeResource]) -> Vec<String> {
         .collect();
     described.sort();
     described
-}
-
-/// Waits for `Inspect` to report `state`, or says what it reported instead.
-///
-/// A bounded poll and not a sleep: `Start` boots a real virtual machine, so the
-/// transition is not synchronous with the `Ack`, and a fixed sleep would be
-/// either slower than it needs to be or flaky on a loaded machine. The bound is
-/// a failure to report rather than a condition to wait out.
-async fn await_state(
-    backend: &ArcaBackend<gascan_arca::ChannelTransport>,
-    request: &CreateRequest,
-    state: ContainerState,
-    bound: Duration,
-) {
-    let started = std::time::Instant::now();
-    let mut last = None;
-    while started.elapsed() < bound {
-        let seen = backend
-            .inspect(request.id())
-            .await
-            .expect("inspect of a created sandbox must answer");
-        if seen.as_ref().map(|sandbox| sandbox.state) == Some(state) {
-            return;
-        }
-        last = seen;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    panic!(
-        "{} did not reach {state:?} within {:.1}s; inspect last reported {:?}",
-        request.id(),
-        bound.as_secs_f64(),
-        last.map(|sandbox| sandbox.state),
-    );
 }
 
 /// The whole contract over one real container: create, start, inspect, stop,

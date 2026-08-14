@@ -440,6 +440,127 @@ pub fn reserved_loopback_port() -> u16 {
         .port()
 }
 
+/// A `/bin/sh` program that answers every TCP connection on `port` with what
+/// `report` prints.
+///
+/// **The published port is the only channel out of an Arca guest this build
+/// has.** `Exec` and `Logs` are milestone 3's and both answer
+/// `unsupported_capability` here (`read_rpcs.rs`), and `Inspect` reports what
+/// the STORE holds rather than what the guest sees. So every test that needs a
+/// fact *from inside* the sandbox -- what is mounted, how much memory the
+/// kernel found -- reads it the way `ports.rs` reads its token, and takes the
+/// same dependency on a working publish. That coupling is stated in each of
+/// those tests rather than hidden: a broken publish fails them all, and
+/// `ports.rs` is what says whether the publish is the cause.
+///
+/// `while :;` and not a single accept: the first connection a test makes is
+/// usually the first this responder ever serves, but a retry after a refused
+/// connect must find it still listening rather than gone.
+pub fn answering(port: u16, report: &str) -> String {
+    format!("while :; do {report} | nc -l -p {port}; done")
+}
+
+/// The lines of one `---name---` section of a guest's answer.
+///
+/// **Guests send raw text and the reading is done here.** A `Cmd` baked into an
+/// OCI layout cannot be run under a debugger or covered by a test, so a shell
+/// program that computed its own summary would put the one step most likely to
+/// be wrong in the one place nothing can check -- and a summary that came out
+/// wrong is indistinguishable from the thing it summarised being wrong. Every
+/// guest here prints `/proc/mounts`, `df` or `/proc/meminfo` verbatim under a
+/// marker, and each caller's assertion carries the whole answer into its own
+/// failure message.
+pub fn report_section<'a>(report: &'a str, name: &str) -> Vec<&'a str> {
+    let marker = format!("---{name}---");
+    report
+        .lines()
+        .skip_while(|line| line.trim() != marker)
+        .skip(1)
+        .take_while(|line| !line.trim().starts_with("---"))
+        .filter(|line| !line.trim().is_empty())
+        .collect()
+}
+
+/// Connects to `127.0.0.1:<port>` until something answers, and returns what it
+/// said.
+///
+/// Retried rather than attempted once: `Start` returns before the guest's own
+/// PID 1 has run the image's `Cmd`, so the first connects are refused by a host
+/// proxy with nothing behind it yet. The bound is what makes this a test and
+/// not a wait -- a publish that never happens fails here, naming the port.
+pub async fn read_from_loopback(port: u16, bound: Duration) -> String {
+    use std::io::Read as _;
+
+    let deadline = std::time::Instant::now() + bound;
+    let mut last = String::from("never attempted");
+    while std::time::Instant::now() < deadline {
+        let attempt = tokio::task::spawn_blocking(move || {
+            let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            let mut stream =
+                std::net::TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
+            stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+            let mut answer = String::new();
+            stream.read_to_string(&mut answer)?;
+            Ok::<String, std::io::Error>(answer)
+        })
+        .await
+        .expect("the blocking connect task must not panic");
+        match attempt {
+            Ok(answer) if !answer.trim().is_empty() => return answer,
+            Ok(_) => last = "connected and read nothing".to_owned(),
+            Err(error) => last = error.to_string(),
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    panic!(
+        "nothing answered on 127.0.0.1:{port} within {:.1}s; last attempt: {last}. \
+         If this reads `connected and read nothing`, the engine publishing nothing \
+         and an unrelated process having taken {port} between the reservation and \
+         the Create are INDISTINGUISHABLE from here -- both accept and stay silent. \
+         Check what is listening on {port} before treating this as a publish failure",
+        bound.as_secs_f64()
+    );
+}
+
+/// Waits for `Inspect` to report `state`, or says what it reported instead.
+///
+/// A bounded poll and not a sleep: `Start` boots a real virtual machine, so the
+/// transition is not synchronous with the `Ack`, and a fixed sleep would be
+/// either slower than it needs to be or flaky on a loaded machine. The bound is
+/// a failure to report rather than a condition to wait out.
+///
+/// **This reads the store's opinion and nothing else**, which is all it is for:
+/// sequencing a test's own teardown, since a running container cannot be
+/// removed. No claim in this tier rests on it.
+pub async fn await_state(
+    backend: &gascan_arca::ArcaBackend<ChannelTransport>,
+    request: &gascan_core::runtime::CreateRequest,
+    state: gascan_core::runtime::ContainerState,
+    bound: Duration,
+) {
+    use gascan_core::runtime::RuntimeBackend as _;
+
+    let started = std::time::Instant::now();
+    let mut last = None;
+    while started.elapsed() < bound {
+        let seen = backend
+            .inspect(request.id())
+            .await
+            .expect("inspect of a created sandbox must answer");
+        if seen.as_ref().map(|sandbox| sandbox.state) == Some(state) {
+            return;
+        }
+        last = seen;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!(
+        "{} did not reach {state:?} within {:.1}s; inspect last reported {:?}",
+        request.id(),
+        bound.as_secs_f64(),
+        last.map(|sandbox| sandbox.state),
+    );
+}
+
 /// A policy-validated `CreateRequest`, which is the only kind that exists.
 ///
 /// `CreateRequest`'s fields are `pub(crate)` to `gascan-core` and it derives no
@@ -574,6 +695,34 @@ pub fn layout_running(
     tag: &str,
     command: &[&str],
 ) -> Utf8PathBuf {
+    layout_running_with_directories(base, destination, tag, command, &[])
+}
+
+/// The same, with a layer of its own creating each of `directories`.
+///
+/// **A mount target that does not exist in the image is not mounted, and
+/// nothing says so.** MEASURED against this engine: a sandbox whose three
+/// managed volumes target `/home/workspace/.local`, `.cache` and `.config` on a
+/// stock alpine rootfs starts successfully, `Inspect` reports it running, and
+/// the guest's `/proc/partitions` shows all three block devices attached at
+/// exactly their declared sizes -- `vdd` 262144 blocks, `vde` 524288, `vdf`
+/// 1048576 -- while `/proc/mounts` lists none of them and `/home` is empty. The
+/// engine logs no warning. `/workspace` mounts on the same guest, so the
+/// difference is the depth: `/workspace` needs one directory under `/` and
+/// `/home/workspace/.local` needs two under an existing `/home`.
+///
+/// The production workspace image creates all three
+/// (`images/workspace/Dockerfile:142-143`), so this is what the tier needs to
+/// resemble it. Ancestors are derived rather than demanded from the caller: a
+/// list that named a leaf and forgot its parent would reproduce the very
+/// failure this exists to remove.
+pub fn layout_running_with_directories(
+    base: &Utf8Path,
+    destination: &Utf8Path,
+    tag: &str,
+    command: &[&str],
+    directories: &[&str],
+) -> Utf8PathBuf {
     use serde_json::{Value, json};
 
     copy_tree(base, destination);
@@ -596,6 +745,32 @@ pub fn layout_running(
     // would run as arguments to something else.
     config["config"]["Cmd"] = json!(command);
     config["config"]["Entrypoint"] = Value::Null;
+
+    if !directories.is_empty() {
+        // The layer goes on top, and `diff_ids` is appended in the same
+        // position: the two lists are parallel by ordinal, so a layer added to
+        // one and not the other describes a rootfs the image does not have.
+        let archive = directory_archive(directories);
+        let diff_id = format!(
+            "sha256:{:x}",
+            <sha2::Sha256 as sha2::Digest>::digest(&archive)
+        );
+        let compressed = gzip(&archive);
+        let digest = write_bytes(destination, &compressed);
+        manifest["layers"]
+            .as_array_mut()
+            .unwrap_or_else(|| panic!("{base}'s manifest has no layers array"))
+            .push(json!({
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": digest,
+                "size": compressed.len(),
+            }));
+        config["rootfs"]["diff_ids"]
+            .as_array_mut()
+            .unwrap_or_else(|| panic!("{base}'s config has no rootfs.diff_ids array"))
+            .push(json!(diff_id));
+    }
+
     let config_blob = write_blob(destination, &config);
     manifest["config"]["digest"] = json!(config_blob.0);
     manifest["config"]["size"] = json!(config_blob.1);
@@ -617,6 +792,116 @@ pub fn layout_running(
     )
     .unwrap_or_else(|error| panic!("could not write {destination}/index.json: {error}"));
     destination.to_owned()
+}
+
+/// A POSIX `ustar` archive holding `directories` and every ancestor of each.
+///
+/// Written by hand rather than with a crate, and it is 40 lines because a
+/// directory entry is a header and no data at all. The alternative was a
+/// `tar` dependency for the one thing this tier needs from it, or shelling out
+/// to the host's `tar` -- which on macOS writes AppleDouble entries into the
+/// archive unless told not to, and would put a host tool's defaults inside the
+/// image under test.
+///
+/// Mode 0755 and root ownership, which is what the workspace image gives these
+/// same three directories before it hands two of them to the `workspace` group
+/// (`images/workspace/Dockerfile:142-143`). The tier's guests run as root, so
+/// nothing here needs the finer ownership and asserting it would be asserting
+/// against a fixture.
+fn directory_archive(directories: &[&str]) -> Vec<u8> {
+    let mut names: Vec<String> = Vec::new();
+    for directory in directories {
+        let mut ancestor = String::new();
+        for component in directory.trim_matches('/').split('/') {
+            ancestor.push_str(component);
+            ancestor.push('/');
+            if !names.contains(&ancestor) {
+                names.push(ancestor.clone());
+            }
+        }
+    }
+
+    let mut archive = Vec::new();
+    for name in &names {
+        let mut header = [0_u8; 512];
+        assert!(
+            name.len() < 100,
+            "{name} does not fit a ustar header's 100-byte name field"
+        );
+        header[..name.len()].copy_from_slice(name.as_bytes());
+        // Every numeric field is octal, NUL-terminated, and zero-padded to one
+        // less than its width. `chksum` is the exception: it is spaces while
+        // the sum is taken, then six digits, a NUL and a space.
+        header[100..108].copy_from_slice(b"0000755\0"); // mode
+        header[108..116].copy_from_slice(b"0000000\0"); // uid
+        header[116..124].copy_from_slice(b"0000000\0"); // gid
+        header[124..136].copy_from_slice(b"00000000000\0"); // size
+        header[136..148].copy_from_slice(b"00000000000\0"); // mtime
+        header[148..156].copy_from_slice(b"        "); // chksum, while summing
+        header[156] = b'5'; // typeflag: directory
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        header[265..269].copy_from_slice(b"root");
+        header[297..301].copy_from_slice(b"root");
+        let sum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+        let checksum = format!("{sum:06o}\0 ");
+        header[148..156].copy_from_slice(checksum.as_bytes());
+        archive.extend_from_slice(&header);
+    }
+    // Two zero blocks end the archive, then the whole thing is padded to a
+    // 10240-byte record. Both are what `tar` itself writes.
+    archive.extend_from_slice(&[0_u8; 1024]);
+    archive.resize(archive.len().div_ceil(10240) * 10240, 0);
+    archive
+}
+
+/// `data` in gzip form, with every deflate block stored rather than compressed.
+///
+/// A stored block is the one deflate encoding that needs no compressor: five
+/// bytes of header and the bytes themselves. The layer this wraps is a few
+/// kilobytes of mostly zeroes, so the size costs nothing, and the media type
+/// the manifest declares is the same `tar+gzip` the base layout's own layer
+/// carries -- the unpacker takes exactly the path it already takes.
+fn gzip(data: &[u8]) -> Vec<u8> {
+    // Magic, deflate, no flags, no mtime, no extra flags, unix.
+    let mut out = vec![0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0x03];
+    let mut chunks = data.chunks(0xffff).peekable();
+    if data.is_empty() {
+        out.extend_from_slice(&[0x01, 0, 0, 0xff, 0xff]);
+    }
+    while let Some(chunk) = chunks.next() {
+        let length = u16::try_from(chunk.len()).expect("a chunk is at most 0xffff bytes");
+        out.push(u8::from(chunks.peek().is_none())); // BFINAL, BTYPE = stored
+        out.extend_from_slice(&length.to_le_bytes());
+        out.extend_from_slice(&(!length).to_le_bytes());
+        out.extend_from_slice(chunk);
+    }
+    out.extend_from_slice(&crc32(data).to_le_bytes());
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "gzip's ISIZE is defined as the length modulo 2^32"
+    )]
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    out
+}
+
+/// The CRC-32 gzip's trailer carries, computed a bit at a time.
+///
+/// No table: this runs over a few kilobytes once per test, and a table would be
+/// a second thing to get right.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffff_u32;
+    for byte in data {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
 }
 
 fn digest_of(descriptor: &serde_json::Value) -> &str {
@@ -646,13 +931,19 @@ fn read_json(path: &Utf8Path) -> serde_json::Value {
 /// rendering would name content the layout does not contain, and the engine
 /// verifies blobs it loads.
 fn write_blob(layout: &Utf8Path, value: &serde_json::Value) -> (String, usize) {
+    let bytes = serde_json::to_vec(value).expect("a blob serialises");
+    let digest = write_bytes(layout, &bytes);
+    (digest, bytes.len())
+}
+
+/// Writes `bytes` under their own digest, and returns it.
+fn write_bytes(layout: &Utf8Path, bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
 
-    let bytes = serde_json::to_vec(value).expect("a blob serialises");
-    let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
+    let digest = format!("sha256:{:x}", Sha256::digest(bytes));
     let path = blob_path(layout, &digest);
-    std::fs::write(&path, &bytes).unwrap_or_else(|error| panic!("could not write {path}: {error}"));
-    (digest, bytes.len())
+    std::fs::write(&path, bytes).unwrap_or_else(|error| panic!("could not write {path}: {error}"));
+    digest
 }
 
 fn copy_tree(from: &Utf8Path, to: &Utf8Path) {
