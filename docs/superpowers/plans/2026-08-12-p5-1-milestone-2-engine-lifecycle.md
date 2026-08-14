@@ -1538,7 +1538,7 @@ Carry Minor 4 above into both `Start` and `Remove`.
 
 **Task 12 — `Start`, `Stop`, `Remove`.** `Remove` refuses any resource whose stored labels differ from the caller's.
 
-### Landing 5 — Gas Can live tier and capability flips (EXPANDED 2026-08-14, before Task 13)
+### Landing 5 — Gas Can live tier and capability flips (EXPANDED 2026-08-13, before Task 13)
 
 Anchors re-derived at Gas Can `4ae9aa9` and Arca `68ae0af`. **Re-derive again before editing.**
 
@@ -1715,7 +1715,7 @@ must not be read as having tested it.**
 #### Task 15 — the workspace suite, run alone
 
 Unchanged from the outline below, with one addition learned this session: `pgrep -fl "cargo test"`
-returning a hit does **not** mean the process is yours. On 2026-08-14 the hit was another Claude session's
+returning a hit does **not** mean the process is yours. On 2026-08-13 the hit was another Claude session's
 `cargo test --workspace` under `capsule-os-worktrees/worker`, reached through `herdr`. **Read the ancestry
 with `ps -o pid,ppid,command`, never `pkill`, and wait.**
 

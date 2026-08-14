@@ -4,49 +4,67 @@ This file is the session entry point. It is written to be read cold, and it is
 addressed to you, the agent. Follow it as instructions — there is nothing to paste.
 
 Written 2026-08-11 for two branches in flight; rewritten 2026-08-12 after both merged;
-rewritten again 2026-08-13, mid-milestone-2, with two branches in flight and unmerged.
+rewritten 2026-08-13 mid-milestone-2; rewritten again 2026-08-13 (evening) with **Landing 4
+complete and Landing 5 the whole of what remains.**
 
 ---
 
 ## Where the work is
 
-**P5.1 milestone 2 is MOSTLY DONE, on branches, NOT merged.** Landings 1, 2 and 3 are complete —
-eleven tasks, every one reviewed clean. Landing 4 is three-quarters done: Tasks 9 and 10 complete,
-**Task 11 (`Create`) is mid-review-loop with a re-review in flight** (see below). Task 12 and all of
-Landing 5 remain. **Do not start a new branch; continue on these two.**
+**P5.1 milestone 2: LANDINGS 1-4 ARE COMPLETE. Only Landing 5 remains.** Twelve tasks, every one
+reviewed. **Nothing is merged and nothing is pushed. Do not start a new branch; continue on these two.**
 
 | | |
 |---|---|
-| Arca | `feat/engine-state-ownership`, HEAD `68ae0af`, based on `cc316b65` — 35 commits |
-| Gas Can | `docs/p5-1-milestone-2-design`, based on `6847d1e` — **HEAD is whatever commit last touched this file**, so read it with `git log -1`, do not trust a SHA written here |
+| Arca | `feat/engine-state-ownership`, HEAD `9db2f7d`, based on `cc316b65` — 37 commits |
+| Gas Can | `docs/p5-1-milestone-2-design`, based on `6847d1e` — **HEAD is whatever commit last touched this file**, so read it with `git log -1`, do not trust a SHA written here — 27+ commits |
 | Design | `docs/superpowers/specs/2026-08-12-p5-1-milestone-2-engine-lifecycle-design.md` |
 | Plan | `docs/superpowers/plans/2026-08-12-p5-1-milestone-2-engine-lifecycle.md` |
 | Parent design | `docs/superpowers/specs/2026-08-10-p5-1-engine-service-and-wiring-design.md` |
+| Governing roadmap | `docs/superpowers/plans/2026-08-04-arca-integration-roadmap.md` — P0-P8; P0-P4 done, P5 current |
 
-Neither branch is pushed. Both trees were clean at handoff. `ArcaEngineTests` reports
-**`Executed 137 tests, with 0 failures`** (63 at the start of Landing 3);
-`swift test --filter ArcaTests.NetworkPruneGateTests` reports 3/3.
+**Both suites were run and verified on 2026-08-13 evening, both trees clean:**
 
-### FIRST THING TO DO: read what landed while you were not here
+| | |
+|---|---|
+| `swift test --filter ArcaEngineTests` | `Executed 147 tests, with 0 failures` |
+| `swift test --filter ArcaTests.NetworkPruneGateTests` | `Executed 3 tests, with 0 failures` |
+| `env -u RUSTUP_TOOLCHAIN cargo test --workspace --no-fail-fast` | exit 0 — **1435 passed / 0 failed / 26 ignored across exactly 74 targets** reporting `0 filtered out` |
 
-**A re-review of Task 11's fix round 3 was running when this file was written.** Its verdict is at
-`.superpowers/sdd/2026-08-12-p5-1-milestone-2-engine-lifecycle/task-11-fix3-rereview.md`. **Read
-that file before doing anything to Task 11.** If it is absent, the reviewer died without writing —
-check `git log`, the working tree and `git status --short --untracked-files=all` in `~/code/arca`
-before re-dispatching, because six subagents this session went idle with their work already
-committed and only the return message missing.
+### FIRST THING TO DO
 
-That review was asked three things, in priority order: (1) whether the round-3 refactor changed any
-resolution that worked before — it rewrote `ImageManager.resolveImage`'s mechanism, which **Arca's
-Docker surface depends on**; (2) whether arm precedence survived; (3) whether the commit message's
-closing assertion — *"Each claim in this commit had its falsifying mutation run before the claim was
-written"* — is itself true. If (3) is false it is the seventh instance of this task's defining
-pattern, and the most instructive one.
+**Nothing is mid-flight. There is no review to collect and no fix round open.** Task 11 closed after
+four fix rounds; Task 12 passed review with no fix round. Both verdicts are in the ledger.
 
-**Read the milestone-2 design before touching anything**, then the plan. The design records
-why the engine owns a private state root and why that made `initialize()` safe when milestone 1
-had rejected it. The plan carries the landings, and landings 3-5 were expanded *after* Task 6
-ran, so they reflect what the machine actually does rather than what the code appeared to say.
+**Start by expanding nothing and reading two things:** the milestone-2 design, then the plan's
+**Landing 5 expansion** (committed at Gas Can `4e40438`, amended by `f8c5ca1` and `1726c77`). Landing 5
+is already stepped out — **do not re-expand it** — and it is the only landing left.
+
+The design records why the engine owns a private state root and why that made `initialize()` safe when
+milestone 1 had rejected it. The plan carries the landings; 3, 4 and 5 were all expanded *after* the
+task that preceded them ran, so they reflect what the machine actually does rather than what the code
+appeared to say.
+
+### THE ONE THING THAT MATTERS MOST ABOUT THE CURRENT STATE
+
+**Eight of the eleven RPCs are implemented, and NOTHING HAS EVER BEEN EXECUTED END TO END.** All 147
+Arca tests are VM-free unit tests. **No container has ever been created, started, stopped or removed by
+this engine.** Specifically, and each measured rather than assumed:
+
+- **`Start` is entirely unproven.** `startContainer` is unreachable without a VM — it throws
+  `notInitialized` first. The one test that drives it says so in its own name
+  (`testStartOfAnOwnedSandboxReachesStartContainerAndStopsOnlyForWantOfAVM`).
+- **Port publishing has three silent gates** and is provable only from the live tier.
+- **`Remove` of a RUNNING container is untested** — that state is unreachable VM-free, because
+  `loadPersistedState()` recovers every persisted `running` row as exited/137 first.
+- **The live tier cannot spawn the branch engine at all** (missing two required arguments).
+- **Every capability flag is still `false`.** The engine claims nothing it has not earned.
+
+**Landing 5 exists precisely to close this gap, and Task 13 is a step change in kind, not just the next
+item.** It is the first task needing a real engine process, a real kernel and a real VM.
+
+The three RPCs still answering `unsupported_capability` are **`CreateContainer`, `Exec` and `Logs`**
+(`SandboxEngineService.swift:636`, `:988`, `:998`). `Exec` and `Logs` are milestone 3's.
 
 ### What milestone 2 has landed
 
@@ -65,12 +83,18 @@ ran, so they reflect what the machine actually does rather than what the code ap
 | 8 `ListResources` | `40078e7`..`40a1d55` | — |
 | 9 `image load` subcommand | `40a1d55`..`65650b2` | `0fa74fe` |
 | 10 `PrepareImage` | `65650b2`..`05b909a` | — |
-| 11 `Create` — **IN REVIEW LOOP** | `05b909a`..`68ae0af` | — |
+| 11 `Create` — closed after 4 fix rounds | `05b909a`..`7511957` | — |
+| 12 `Start`, `Stop`, `Remove` — passed review, no fix round | `7511957`..`9db2f7d` | `1726c77` |
 
 **Tasks 3b, 3c and 6b were not in the approved plan.** Each was added on a maintainer ruling
 after a review found something real: a `try?` that let `docker network prune` delete an in-use
 network, a gate that could not see the test guarding it, and an engine that could not start a
 container because nothing signed it.
+
+**Task 11 cost four fix rounds and every one was the same defect** — a claim that outran the code.
+Seven instances across commit messages, source comments and reports; **every one caught by a reviewer
+running a mutation, none by reading.** Task 12 shipped none, which is the first task this milestone
+that did not. The rule that changed it is in the traps section below.
 
 ### The milestone's thesis, and that it now holds
 
@@ -116,12 +140,17 @@ shutdown path). **30 tests pass** (`swift test --filter ArcaEngineTests`, exit 0
 `Inspect` and `ListResources` tests folded into one that covers all ten unimplemented
 methods, so the tier went from 8 tests / 6 ignored to 6 / 4, and nothing else moved.
 
-### What the engine actually does — SUPERSEDED 2026-08-14, see below first
+### What the engine actually does
 
-**As of `68ae0af` FIVE of the eleven are implemented: `Capabilities`, `Inspect`, `ListResources`,
-`PrepareImage` and `Create`** (the last still in its review loop). There is also an
-`arca-engine image load --oci-layout <dir>` subcommand. The other six answer
-`unsupported_capability`.
+**As of `9db2f7d` EIGHT of the eleven are implemented: `Capabilities`, `Inspect`, `ListResources`,
+`PrepareImage`, `Create`, `Start`, `Stop` and `Remove`.** There is also an
+`arca-engine image load --state-root <R> --oci-layout <L>` subcommand. **Only `CreateContainer`, `Exec`
+and `Logs` answer `unsupported_capability`** (`SandboxEngineService.swift:636`, `:988`, `:998`);
+`Exec` and `Logs` are milestone 3's.
+
+**Read the "NOTHING HAS EVER BEEN EXECUTED END TO END" section at the top before you believe any of
+that means the engine works.** Eight implemented means eight that return the right answers to VM-free
+unit tests.
 
 **Three things Landings 3-4 established that change what you should believe:**
 
@@ -157,22 +186,43 @@ is a confident report of a clean host, which is the report that hides a leak. Bo
 refuse instead. The reasoning is on each method in `SandboxEngineService.swift` and in
 `ArcaEngineCommand.run()`.
 
-## What to do next
+## What to do next — Landing 5, and Task 13 first
 
-**Resume by closing Task 11's review loop** — read `task-11-fix3-rereview.md` first (see the top of
-this file). Task 11 has had three fix rounds; the cap is five, and the ledger records every round.
+**Landing 5 is already expanded. Do not re-expand it.** Gas Can `4e40438`, amended by `f8c5ca1` (the
+image-load seam) and `1726c77` (Task 12's routed findings). Read that section of the plan and follow it.
 
-Then: **Task 12** (`Start`/`Stop`/`Remove`), then **Landing 5** — which is named and constrained but
-**not stepped out. Expand it immediately before starting**, the way Landings 3 and 4 were. Landing 4's
-expansion is committed at Gas Can `4376b9f`.
+Remaining: **Task 13** the live tier, **Task 14** the capability flips, **Task 15** the workspace suite
+run alone.
 
-Remaining: Task 11 close-out, Task 12 `Start`/`Stop`/`Remove`, Task 13 the live tier, Task 14 the
-capability flips, Task 15 the workspace suite run alone.
+### Task 13's first hour, in order, because the rest is blocked behind it
+
+The plan has the detail. The order matters and is not obvious:
+
+1. **Make the spawn work and prove it** against a **branch-built** engine, before writing any RPC test.
+   `crates/gascan-arca/tests/live/common/mod.rs:79-86` passes only `--socket-path` and `--state-root`;
+   the branch engine also requires `--kernel-path` and `--vminit-layout`. Get
+   `a_real_engine_accepts_the_placeholder_authority` green and record the command and output.
+2. **Establish that `image load` then `Create` actually works.** Verified by reading only:
+   `arca-engine image load --state-root <R> --oci-layout <L>` needs no kernel and serves nothing, so the
+   tier can seed the engine's own store. **Whether a `Create` against the loaded image then succeeds is
+   NOT established, and every lifecycle test in the landing is blocked behind it.** Worth an hour, not a
+   fix round.
+3. Only then the lifecycle tests, the partial-failure case, and the published-port test.
+
+**The two artifacts the spawn needs are host state that neither repo produces:**
+
+| Option | Path on this machine | What |
+|---|---|---|
+| `--kernel-path` | `~/.arca/vmlinux` | symlink into an installed `Arca.app`, 28,248,576 bytes |
+| `--vminit-layout` | `~/.arca/vminit` | an OCI layout, 178 MB |
+
+Pass them the way `GASCAN_ARCA_ENGINE_BIN` is passed — environment variable, absent means `panic!` with
+a directive message. **No hardcoded `~/.arca`, no guessing fallback.**
 
 ### Three things that will decide Landing 5, established by measurement
 
 1. **THE LIVE TIER CANNOT SPAWN THE *BRANCH* ENGINE. IT SPAWNS THE PINNED ONE FINE.**
-   **CORRECTED 2026-08-14** — earlier text here said "cannot spawn an engine, and has not since Task
+   **CORRECTED 2026-08-13** — earlier text here said "cannot spawn an engine, and has not since Task
    4", unqualified, and that is too strong in a way that changes Task 13's shape.
    `crates/gascan-arca/tests/live/common/mod.rs:79-86` passes only `--socket-path` and
    `--state-root`. At the **pinned** revision `b3390b8` the engine declares exactly those two plus
@@ -217,7 +267,7 @@ offline-plus-ports is expressible and nothing says which wins. Task 11 refuses i
 `unsupported_capability`. **The proto and the design should say what happens rather than leaving each
 engine to decide** — this is feedback for milestone 4, and it dies in a Swift comment otherwise.
 
-Sharpened 2026-08-14: **three components already agree** — the proto permits it, Gas Can's
+Sharpened 2026-08-13: **three components already agree** — the proto permits it, Gas Can's
 `compile_ports` (`crates/gascan-core/src/policy.rs:436-438`) refuses it as `OfflinePortsForbidden`
 before a request is built, and Arca's engine refuses it. Only the proto is silent. That is an argument
 for writing the rule down, not for leaving it.
@@ -405,6 +455,59 @@ in `docs/status/arca-integration-handoff.md`.
   `scripts/build-arca-engine.sh`.
 
 ## Traps that will cost you if you learn them the hard way
+
+### Added 2026-08-13 evening. These five are new, and four cost real time the day they were found.
+
+**A GATE THAT TWO PLACES ENFORCE IS A GATE NO TEST MEASURES.** Task 12's implementer wrote its
+sandbox-id validation into *both* `lifecycleAck` and `lifecycleRefusal`, one belt-and-braces call apart.
+**Deleting either copy left `Executed 147 tests, with 0 failures`, because the other caught it.**
+Reading could never have found this — both copies were correct. It was found by mutating one and
+getting a green suite. The fix was to put it in exactly one place, before the store read; the reasoning
+is recorded at `EngineLifecycle.swift:83-91`. **When a guard is duplicated "for safety", the duplicate
+does not add safety, it removes the instrument.**
+
+**N IDENTICAL FIXTURES ARE NOT N SAMPLES. VARY WHAT THE ORDER DEPENDS ON.** This ledger recommended
+"twenty independent stores, because the failure is per-process" from round 2 of Task 11 onward, and it
+was written into two doc comments and several dispatch briefs. **It is wrong as stated.** Rebuilding an
+identical store twenty times in one process gives *one* enumeration order, because the order is a
+function of the data. Measured under a controlled experiment — twenty iterations and a fresh store per
+iteration held constant, only the tag-name salt varied: **unsalted 60% catch rate, salted 100%.** Round
+3's reviewer had measured the symptom (39 of 40, where truly independent samples would miss ~1.6 times
+in a million, so the iterations had to be correlated); round 4 found the cause.
+
+**A-THEN-B ON A DRIFTING MACHINE IS NOT A CONTROLLED COMPARISON.** Three separate agents were misled by
+this in one day. The worst: Task 12's implementer saw five consecutive `SIGBUS` runs, bisected, watched
+unmodified HEAD go green twice, and concluded its own change was the cause — **the identical tree then
+ran 8/8 green once load fell from 5.58 to 3.74.** The technique that works is round 3's: it needed to
+compare two resolver algorithms, so it **transplanted the old one beside the new one as
+`probeResolveLegacy` and drove both against one store in one process, interleaved read by read.** When
+a before/after would be confounded by environment, put both behaviours in one binary or interleave them.
+
+**A RED FIGURE YOU CANNOT ACCOUNT FOR IS NOT A FAILURE, EITHER — CHECK THE INSTRUMENT BEFORE THE
+SUBJECT.** The standing rule is "a green figure you cannot account for is not a pass". Its mirror bit on
+2026-08-13: a bad `awk` field offset summed the workspace suite as **542 passed across 24 targets**
+against a 1435/74 baseline, which read as a serious regression. The suite was fine; the arithmetic was
+not. Re-extracted with an explicit `sed -E 's/.*ok\. ([0-9]+) passed; .../'` it is exact. **The
+per-target baseline is what made the mismatch visible in seconds — keep recording it.**
+
+**SUBAGENTS DIE WITH A FRAGMENT RETURN AND LEAVE MUTATIONS IN THE WORKING TREE. FOUR OF SIX DID ON
+2026-08-13.** This is a different failure from the previously-recorded "idle with work committed": the
+return message is a half-sentence, the report file may be complete or absent, and **the tree is dirty
+with a reviewer's mutation that must not be mistaken for a fix.** Two left the tree dirty mid-mutation.
+**Always, before anything else: `git status --short --untracked-files=all`, read any diff you find, and
+`git stash push -m` it rather than `git checkout --` it** — you may need to know what it was. Two such
+stashes exist in `~/code/arca` right now (`stash@{0}` five simultaneous Task-12 review mutations,
+`stash@{1}` a Task-11 precedence inversion); both are discardable. **When an agent dies mid-review,
+finishing its work directly is often faster than re-dispatching** — the last two verdicts of milestone 2
+are controller adjudications for exactly this reason, and both are labelled as such in their files.
+
+**THE MACHINE'S MEMORY IS THE HIDDEN VARIABLE.** 24 GB installed, and on 2026-08-13 it was carrying
+~8 GB of swap and 7.8 GB in the compressor, with Firefox alone at 11.25 GB across 38 processes.
+`swift test` died with `SIGSEGV`/`SIGBUS` intermittently and one run was OOM-killed with exit 137.
+**None of it was code.** Check `sysctl vm.swapusage` and `top -l 1 -o mem -n 20` before believing a
+crash, and note that `ps -A` output is filtered under this harness — `top` and `ps aux` are not.
+
+---
 
 **THE DEFECT'S NEXT FORM IS A CLAIM THAT OUTRUNS THE CODE, AND TASK 11 PRODUCED SIX.** Round 1 of its
 review found three: the commit message and report each said offline-plus-ports was refused (it was
