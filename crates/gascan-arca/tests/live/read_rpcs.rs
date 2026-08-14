@@ -1,8 +1,7 @@
 use crate::common::{LiveEngine, policy_request, retained_for};
 use gascan_arca::ArcaBackend;
 use gascan_core::runtime::{
-    ExecRequest, NetworkIsolation, RecreateRequest, RemoveRequest, ResourceIdentity, ResourceKind,
-    ResourceOwnership, RetainedResources, RuntimeBackend, RuntimeResource,
+    ExecRequest, NetworkIsolation, RecreateRequest, RetainedResources, RuntimeBackend,
 };
 use gascan_core::sandbox::SandboxId;
 
@@ -34,20 +33,24 @@ async fn capabilities_report_only_what_this_engine_build_implements() {
 ///
 /// A gRPC status would reach the consumer as an unreachable engine, which is a
 /// different fact from "this build cannot do that" and would send a reconciler
-/// down the wrong path. That is the PR's claim, and until now it was asserted
-/// for one method out of the ten: a comment reading "the eight unimplemented
-/// methods must ANSWER" sat above a body that called only `start`. The two
-/// streaming methods were the ones that mattered most, because their error
-/// arrives in a different message entirely -- `LogsChunk.outcome.error` and
+/// down the wrong path. That is the PR's claim, and it was once asserted for
+/// one method out of ten: a comment reading "the eight unimplemented methods
+/// must ANSWER" sat above a body that called only `start`. The two streaming
+/// methods were the ones that mattered most, because their error arrives in a
+/// different message entirely -- `LogsChunk.outcome.error` and
 /// `ExecServerFrame.frame.error` -- and nothing in this tier touched either. A
 /// regression that made `Logs` answer with a status would have passed.
 ///
-/// Ten, not eight. `Inspect` and `ListResources` joined the list: an engine
-/// that loads no state cannot report an absence or an emptiness, and answering
-/// `Absent` without having looked is what makes a reconciler create a duplicate
-/// of a running sandbox. When a later milestone loads state, they leave this
-/// list and get real assertions -- and this test's own count must drop to eight
-/// on that day, which is why the count is asserted rather than implied.
+/// **THREE, and it was ten. The count is asserted rather than implied precisely
+/// so that this happens.** Milestone 2 implemented `Inspect`, `ListResources`,
+/// `PrepareImage`, `Create`, `Start`, `Stop` and `Remove`, and the old list
+/// FAILED against the branch engine the day the first one landed: `expect_err`
+/// on `Inspect` got a perfectly good `absent`. That failure is the mechanism
+/// working. `CreateContainer` is the one method left that is neither streaming
+/// nor milestone 3's -- `Exec` and `Logs` are.
+///
+/// A method that becomes real leaves this list and gets real assertions: for
+/// the seven that already did, they are in `lifecycle.rs` and `ports.rs`.
 #[tokio::test]
 #[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN"]
 async fn every_unimplemented_method_answers_unsupported_capability_not_a_transport_fault() {
@@ -55,38 +58,18 @@ async fn every_unimplemented_method_answers_unsupported_capability_not_a_transpo
     let backend = backend(&engine).await;
     let id = SandboxId::test("never-created");
 
-    // Held for the whole test: the compiled requests name canonical roots that
-    // must still exist when the calls are made.
-    let (_create_root, create) = policy_request("never-created");
+    // Held for the whole test: the compiled request names a canonical root that
+    // must still exist when the call is made.
     let (_recreate_root, recreate_create) = policy_request("never-recreated");
     let retained = RetainedResources::new(&recreate_create, retained_for(&recreate_create))
         .expect("the retained set matches the requested topology exactly");
     let recreate = RecreateRequest::new(recreate_create, retained).expect("a recreate request");
-    let remove = RemoveRequest::from_resources(vec![RuntimeResource::discovered(
-        ResourceIdentity::new(ResourceKind::Volume, "never-created-data")
-            .expect("a valid identity"),
-        Some(id.clone()),
-        ResourceOwnership::GasCanOwned,
-    )])
-    .expect("one owned resource");
 
-    // Each arm reduces to the wire code, so the ten shapes -- Option, unit,
-    // CreateFailure, ExecSession, Vec<u8>, Vec<RuntimeResource> -- become one
-    // comparable list. `CreateFailure` carries its code separately from
-    // `RuntimeError` because a partial create must report what it made.
+    // Each arm reduces to the wire code, so the three shapes -- CreateFailure,
+    // ExecSession, Vec<u8> -- become one comparable list. `CreateFailure`
+    // carries its code separately from `RuntimeError` because a partial create
+    // must report what it made.
     let answers: Vec<(&str, String)> = vec![
-        (
-            "Inspect",
-            backend.inspect(&id).await.expect_err("Inspect").code().to_owned(),
-        ),
-        (
-            "ListResources",
-            backend.list_resources().await.expect_err("ListResources").code().to_owned(),
-        ),
-        (
-            "Create",
-            backend.create(create).await.expect_err("Create").code().to_owned(),
-        ),
         (
             "CreateContainer",
             backend
@@ -96,58 +79,39 @@ async fn every_unimplemented_method_answers_unsupported_capability_not_a_transpo
                 .code()
                 .to_owned(),
         ),
-        (
-            "PrepareImage",
-            backend
-                .prepare_image("registry.example/workspace@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        ("Exec", {
+            // Exec is the one that does not refuse at the call. The session
+            // OPENS -- `exec()` returns Ok -- and the refusal arrives as the
+            // stream's first frame, because the engine's answer lives in
+            // `ExecServerFrame.frame.error` rather than in a response
+            // outcome. MEASURED here: an earlier draft of this test called
+            // `expect_err` on `exec()` itself and failed with a perfectly
+            // healthy `ExecSession`. Anything that asserts against the call
+            // and not the frame is testing the wrong half.
+            let mut session = backend
+                .exec(ExecRequest::fixture(id.clone(), ["true"]))
                 .await
-                .expect_err("PrepareImage")
-                .code()
-                .to_owned(),
-        ),
-        (
-            "Start",
-            backend.start(&id).await.expect_err("Start").code().to_owned(),
-        ),
-        (
-            "Stop",
-            backend.stop(&id).await.expect_err("Stop").code().to_owned(),
-        ),
-        (
-            "Remove",
-            backend.remove(remove).await.expect_err("Remove").code().to_owned(),
-        ),
-        (
-            "Exec",
-            {
-                // Exec is the one that does not refuse at the call. The session
-                // OPENS -- `exec()` returns Ok -- and the refusal arrives as the
-                // stream's first frame, because the engine's answer lives in
-                // `ExecServerFrame.frame.error` rather than in a response
-                // outcome. MEASURED here: an earlier draft of this test called
-                // `expect_err` on `exec()` itself and failed with a perfectly
-                // healthy `ExecSession`. Anything that asserts against the call
-                // and not the frame is testing the wrong half.
-                let mut session = backend
-                    .exec(ExecRequest::fixture(id.clone(), ["true"]))
-                    .await
-                    .expect("Exec opens a session; the refusal is its first frame");
-                match session.next().await {
-                    Some(Err(error)) => error.code().to_owned(),
-                    other => panic!("Exec's first frame must be an error, got {other:?}"),
-                }
-            },
-        ),
+                .expect("Exec opens a session; the refusal is its first frame");
+            match session.next().await {
+                Some(Err(error)) => error.code().to_owned(),
+                other => panic!("Exec's first frame must be an error, got {other:?}"),
+            }
+        }),
         (
             "Logs",
-            backend.logs(&id, None).await.expect_err("Logs").code().to_owned(),
+            backend
+                .logs(&id, None)
+                .await
+                .expect_err("Logs")
+                .code()
+                .to_owned(),
         ),
     ];
 
     assert_eq!(
         answers.len(),
-        10,
-        "this build implements one of the eleven contract methods; \
+        3,
+        "this build implements eight of the eleven contract methods; \
          a method that becomes real must leave this list"
     );
     for (rpc, code) in &answers {
