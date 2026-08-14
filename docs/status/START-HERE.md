@@ -10,21 +10,38 @@ rewritten again 2026-08-13, mid-milestone-2, with two branches in flight and unm
 
 ## Where the work is
 
-**P5.1 milestone 2 is HALF DONE, on branches, NOT merged.** Landings 1 and 2 are complete —
-nine tasks, every one reviewed clean. Landings 3, 4 and 5 remain. **Do not start a new
-branch; continue on these two.**
+**P5.1 milestone 2 is MOSTLY DONE, on branches, NOT merged.** Landings 1, 2 and 3 are complete —
+eleven tasks, every one reviewed clean. Landing 4 is three-quarters done: Tasks 9 and 10 complete,
+**Task 11 (`Create`) is mid-review-loop with a re-review in flight** (see below). Task 12 and all of
+Landing 5 remain. **Do not start a new branch; continue on these two.**
 
 | | |
 |---|---|
-| Arca | `feat/engine-state-ownership`, HEAD `db6bedc`, based on `cc316b65` |
+| Arca | `feat/engine-state-ownership`, HEAD `68ae0af`, based on `cc316b65` — 35 commits |
 | Gas Can | `docs/p5-1-milestone-2-design`, based on `6847d1e` — **HEAD is whatever commit last touched this file**, so read it with `git log -1`, do not trust a SHA written here |
 | Design | `docs/superpowers/specs/2026-08-12-p5-1-milestone-2-engine-lifecycle-design.md` |
 | Plan | `docs/superpowers/plans/2026-08-12-p5-1-milestone-2-engine-lifecycle.md` |
 | Parent design | `docs/superpowers/specs/2026-08-10-p5-1-engine-service-and-wiring-design.md` |
 
-Neither branch is pushed. Both trees are clean. `ArcaEngineTests` reports
-`Executed 63 tests, with 0 failures`; `tests/release/engine-pin-contract.sh` PASSes;
-`scripts/ci-run-release-contracts.sh` reports 15/15.
+Neither branch is pushed. Both trees were clean at handoff. `ArcaEngineTests` reports
+**`Executed 137 tests, with 0 failures`** (63 at the start of Landing 3);
+`swift test --filter ArcaTests.NetworkPruneGateTests` reports 3/3.
+
+### FIRST THING TO DO: read what landed while you were not here
+
+**A re-review of Task 11's fix round 3 was running when this file was written.** Its verdict is at
+`.superpowers/sdd/2026-08-12-p5-1-milestone-2-engine-lifecycle/task-11-fix3-rereview.md`. **Read
+that file before doing anything to Task 11.** If it is absent, the reviewer died without writing —
+check `git log`, the working tree and `git status --short --untracked-files=all` in `~/code/arca`
+before re-dispatching, because six subagents this session went idle with their work already
+committed and only the return message missing.
+
+That review was asked three things, in priority order: (1) whether the round-3 refactor changed any
+resolution that worked before — it rewrote `ImageManager.resolveImage`'s mechanism, which **Arca's
+Docker surface depends on**; (2) whether arm precedence survived; (3) whether the commit message's
+closing assertion — *"Each claim in this commit had its falsifying mutation run before the claim was
+written"* — is itself true. If (3) is false it is the seventh instance of this task's defining
+pattern, and the most instructive one.
 
 **Read the milestone-2 design before touching anything**, then the plan. The design records
 why the engine owns a private state root and why that made `initialize()` safe when milestone 1
@@ -44,6 +61,11 @@ ran, so they reflect what the machine actually does rather than what the code ap
 | 5 vminit into the engine's own store | `e1b5d9a`..`595a450` | — |
 | 6 `initialize()` before serving | `a0796c4`..`85b5023` | — |
 | 6b sign the engine | `014c84b`..`db6bedc` | `a45edd4`..`c8e2c5b` |
+| 7 `Inspect` | `db6bedc`..`40078e7` | — |
+| 8 `ListResources` | `40078e7`..`40a1d55` | — |
+| 9 `image load` subcommand | `40a1d55`..`65650b2` | `0fa74fe` |
+| 10 `PrepareImage` | `65650b2`..`05b909a` | — |
+| 11 `Create` — **IN REVIEW LOOP** | `05b909a`..`68ae0af` | — |
 
 **Tasks 3b, 3c and 6b were not in the approved plan.** Each was added on a maintainer ruling
 after a review found something real: a `try?` that let `docker network prune` delete an in-use
@@ -94,9 +116,35 @@ shutdown path). **30 tests pass** (`swift test --filter ArcaEngineTests`, exit 0
 `Inspect` and `ListResources` tests folded into one that covers all ten unimplemented
 methods, so the tier went from 8 tests / 6 ignored to 6 / 4, and nothing else moved.
 
-### What the engine actually does, which is less than it sounds
+### What the engine actually does — SUPERSEDED 2026-08-14, see below first
 
-**`Capabilities` is the ONE implemented method. The other ten answer
+**As of `68ae0af` FIVE of the eleven are implemented: `Capabilities`, `Inspect`, `ListResources`,
+`PrepareImage` and `Create`** (the last still in its review loop). There is also an
+`arca-engine image load --oci-layout <dir>` subcommand. The other six answer
+`unsupported_capability`.
+
+**Three things Landings 3-4 established that change what you should believe:**
+
+1. **`Inspect` reports what the STORE holds, deliberately** — including port bindings that were
+   never published, because that is what drift detection compares against. **So `Inspect` can never
+   be evidence that anything was actually done.** An engine can report a successful `Create`, a
+   successful `Start`, and an `Inspect` naming a port, while publishing nothing, with every check
+   green.
+2. **`ListResources` reports unlabelled and internal resources with `owner` unset**, while `Inspect`
+   *refuses* an unlabelled container as `foreign_resource_refused`. That looks inconsistent and is
+   not: one reports what is held, the other answers about a specific claimed sandbox. **Do not
+   "fix" the difference.**
+3. **`ImageManager.resolveImage` was widened** to accept `repository@sha256:<hex>`, because
+   `createContainer` uses ONE string both to resolve and to *record*, `startContainer` re-resolves
+   that recorded string after a restart, and `Inspect` must parse it as a digest reference. One
+   field, three constraints, and the third forces the form the first two rejected. **This changed
+   Arca's Docker surface**: `docker run|rmi|inspect repo@sha256:...` now works where it threw.
+   Deliberate, accounted for in `ba1900f`'s and `de8c880`'s messages.
+
+The older text below described the milestone-1 state and is kept for its reasoning about *why*
+`Inspect` and `ListResources` were once refused.
+
+**`Capabilities` WAS the ONE implemented method. The other ten answered
 `unsupported_capability`.** The engine runs — VERIFIED by running it: `arca-engine
 --socket-path … --state-root …` logs `engine listening` and creates the socket
 `srw-------`, and Gas Can's live tier drives all eleven over a real socket.
@@ -111,15 +159,50 @@ refuse instead. The reasoning is on each method in `SandboxEngineService.swift` 
 
 ## What to do next
 
-**Resume the milestone at Landing 3, Task 7 — `Inspect`.** The plan's Landing 3 section was
-expanded on 2026-08-13 with anchors re-derived at `db6bedc`, and it carries the tests, the two
-review findings the restored method must not reintroduce, and a trap. Landing 4 and Landing 5
-are named and constrained but **not** stepped out; expand each immediately before starting it,
-the way Landing 3 was.
+**Resume by closing Task 11's review loop** — read `task-11-fix3-rereview.md` first (see the top of
+this file). Task 11 has had three fix rounds; the cap is five, and the ledger records every round.
 
-Remaining: Task 7 `Inspect`, Task 8 `ListResources`, Task 9 `image load`, Task 10 `PrepareImage`,
-Task 11 `Create`, Task 12 `Start`/`Stop`/`Remove`, Task 13 the live tier, Task 14 the capability
-flips, Task 15 the workspace suite run alone.
+Then: **Task 12** (`Start`/`Stop`/`Remove`), then **Landing 5** — which is named and constrained but
+**not stepped out. Expand it immediately before starting**, the way Landings 3 and 4 were. Landing 4's
+expansion is committed at Gas Can `4376b9f`.
+
+Remaining: Task 11 close-out, Task 12 `Start`/`Stop`/`Remove`, Task 13 the live tier, Task 14 the
+capability flips, Task 15 the workspace suite run alone.
+
+### Three things that will decide Landing 5, established by measurement
+
+1. **THE LIVE TIER CANNOT SPAWN AN ENGINE, AND HAS NOT SINCE TASK 4.**
+   `crates/gascan-arca/tests/live/common/mod.rs:79-86` passes only `--socket-path` and
+   `--state-root`; Task 4 made `--kernel-path` and `--vminit-layout` **required**. Measured against
+   both the pre- and post-Task-9 binaries: `Missing expected argument '--kernel-path'`, exit 64.
+   **Nobody noticed because every live test is `#[ignore]`d, so nothing runs them** — a tier that
+   cannot start its subject and a tier nobody runs look identical from outside. **Task 13 must fix
+   the spawn AND run the tier at least once**, or it keeps proving nothing.
+2. **PORT PUBLISHING HAS THREE SILENT GATES, and Task 11 closes only the first.**
+   (a) `portMapManager == nil` — now wired; (b) `getWireGuardClient` returns nil and the `if let`
+   around the publish has **no `else`** — it returns nil when the container is on no WireGuard
+   network; (c) the `catch` swallows by design ("Don't fail container start on port mapping errors")
+   and the container is still marked running. Gate 2 is passable: `createDefaultNetworks()` makes a
+   WireGuard-backed `bridge` (`isDefault`) and a vmnet `host`, and auto-attach fires for
+   `networkMode` empty/`default`/`bridge`, skipping `none`/`host`. **So an offline sandbox with ports
+   publishes nothing** — Task 11 refuses that combination rather than accepting it.
+   **Publication is provable ONLY from the live tier**: `publishPorts` takes a non-optional
+   `WireGuardClient` built against a booted VM, and the one VM-free path that reaches the gate is a
+   no-op that would pass with the setter unwired. Task 11 deliberately did not write that test.
+   **Task 13's shape, already worked out:** create a sandbox with a `PortMapping`, `Start`, then
+   connect to `127.0.0.1:<host_port>` from the test process. Nothing weaker distinguishes a
+   published port from a stored binding.
+3. **TASK 14 MAY NOT FLIP `loopback_publish` UNTIL THAT TEST EXISTS AND PASSES.** A flag whose
+   machinery is unproved is a claim with no instrument, and here the machinery has three ways to
+   silently do nothing.
+
+### A contract defect for milestone 4's design pass
+
+**The contract permits a combination no engine can honour.** `engine.proto`'s `Network` is a `oneof`
+of `offline`/`networked_name`, and `ports` is a separate `repeated` field on `CreateRequest`, so
+offline-plus-ports is expressible and nothing says which wins. Task 11 refuses it with
+`unsupported_capability`. **The proto and the design should say what happens rather than leaving each
+engine to decide** — this is feedback for milestone 4, and it dies in a Swift comment otherwise.
 
 **Four things Task 6 found that change the remaining work.** They are in the plan; they are
 repeated here because missing one is expensive:
@@ -290,6 +373,56 @@ in `docs/status/arca-integration-handoff.md`.
   `scripts/build-arca-engine.sh`.
 
 ## Traps that will cost you if you learn them the hard way
+
+**THE DEFECT'S NEXT FORM IS A CLAIM THAT OUTRUNS THE CODE, AND TASK 11 PRODUCED SIX.** Round 1 of its
+review found three: the commit message and report each said offline-plus-ports was refused (it was
+accepted, and a test *pinned* the acceptance), that every refusal was asserted by exact string
+equality (collapsing seven messages to the literal `"unsupported"` left all 123 tests green), and
+that a destructive `docker rmi` change was "Docker's own semantics" (it is not). Round 2 added three
+more: a tie-break sort pinned by no test — **deleting it entirely left 137 tests green** — a claim
+that resolution no longer depends on enumeration order which was **false for two of the four resolver
+arms**, and a measured rate borrowed from a different fixture.
+
+**Every one was caught by a reviewer running a mutation. None was caught by reading.**
+
+**The rule that would have caught all six, now standing for this project:** before writing a claim
+into a commit message, a source comment, or a report, ask **what mutation would falsify it, and
+whether a test already fails under that mutation.** If none does, write the test or write the weaker
+claim. A commit message asserting a property the suite cannot demonstrate is worse than silence,
+because the next person greps for it and stops looking.
+
+**REPORT A MUTATION BY COMPOSITION — WHICH TESTS SURVIVE, BY NAME — NEVER BY COUNT.** Task 10's
+round-1 report read a *rising* failure count as evidence its new test was load-bearing. The count had
+risen for an unrelated reason and that test was the one test in the file proving nothing; two
+reports asserted it before a third measured which tests actually survived.
+
+**A NONDETERMINISM IS NOT FIXED BY RUNNING IT MORE TIMES — RESTRUCTURE SO THE FAILURE IS FORCED.**
+Task 11 shipped an `rmi` guard that threw on 2 of 5 runs, and in one run `getImage` and `deleteImage`
+resolved the same string to different rows *inside one process*. Three of five runs looked fine. The
+fix was to remove the order dependence at its root (one pass per arm, not one pass per row) and to
+prove it with a test that builds 20 independent stores per run and reads one store 25 times: 10
+consecutive runs, 10 GREEN, and 0 GREEN / 10 RED with the old arrangement restored. **Looping fresh
+fixtures inside the test is what converts an N-in-5 flake into a deterministic failure.**
+
+**A SUBAGENT WILL GO IDLE WITH ITS WORK STAGED AND UNCOMMITTED.** It happened once with **1755 lines
+in the index**, alongside SourceKit diagnostics showing real-looking compile errors — a combination
+that reads as an agent stopped mid-edit with broken code. Measuring said the opposite: `swift build`
+exit 0, `Executed 123 tests, with 0 failures`. **The diagnostics were stale editor state.** Check
+`git status --short --untracked-files=all`, `git diff --cached --stat`, and then actually build,
+before concluding anything. Six subagents this session went idle with committed work and only the
+return message missing.
+
+**SOURCEKIT DIAGNOSTICS IN THIS REPO ARE ROUTINELY STALE AND SOMETIMES NAME FILES THAT NO LONGER
+EXIST.** Reviewers write transient `ZZ*Probe*.swift` files and delete them; a diagnostic captured
+mid-life outlives the file. Four of those appeared this session and all four were already gone.
+**Check with `/usr/bin/find` and `git status --untracked-files=all` rather than trusting or
+dismissing a diagnostic** — and note `find` is intercepted by the rtk hook for compound predicates,
+so use the absolute path.
+
+**SENDING A DECISION IS NOT THE SAME AS THE DECISION ARRIVING.** A maintainer approval crossed with a
+subagent's messages **twice**; it reported itself blocked while the approval sat unread in its
+mailbox, and about an hour was lost. Recording an approval in the ledger is not evidence the agent
+received it. **For anything blocking, confirm the recipient acted on it.**
 
 **THE DEFECT THIS MILESTONE FOUND EIGHT TIMES IS A TEST THAT PASSES WHILE PROVING NOTHING.**
 Every task in landings 1-2 shipped one on the first attempt, and every one was caught by a
