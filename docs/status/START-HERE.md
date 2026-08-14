@@ -5,7 +5,9 @@ addressed to you, the agent. Follow it as instructions — there is nothing to p
 
 Written 2026-08-11 for two branches in flight; rewritten 2026-08-12 after both merged;
 rewritten 2026-08-13 mid-milestone-2; rewritten again 2026-08-13 (evening) with **Landing 4
-complete and Landing 5 the whole of what remains.**
+complete and Landing 5 the whole of what remains**; updated 2026-08-13 (late) after Task 13's first
+hour, which **proved the spawn, got `Create` working end to end for the first time, and cost two
+unplanned Arca fixes on the way** — Tasks 13a and 13b.
 
 ---
 
@@ -47,9 +49,16 @@ appeared to say.
 
 ### THE ONE THING THAT MATTERS MOST ABOUT THE CURRENT STATE
 
-**Eight of the eleven RPCs are implemented, and NOTHING HAS EVER BEEN EXECUTED END TO END.** All 147
-Arca tests are VM-free unit tests. **No container has ever been created, started, stopped or removed by
-this engine.** Specifically, and each measured rather than assumed:
+**UPDATED 2026-08-13 (late). `Create` NOW WORKS END TO END, AND IT DID NOT BEFORE.** The sentence this
+section led with for two days — "nothing has ever been executed end to end" — is retired for `Create`
+and still true for everything after it. Measured by the controller from Gas Can's live tier against a
+branch-built, ad-hoc-signed engine: a real engine on a real socket, its store seeded with `arca-engine
+image load`, then `PrepareImage` → `Ok` and `Create` → `Ok` with three volumes, a network and **a
+container**. That was the first container this engine has ever created, and closing it took two
+unplanned Arca fixes (Tasks 13a and 13b below).
+
+**`Start`, `Stop` and `Remove` HAVE STILL NEVER RUN.** Read the rest of this section as still true of
+them. Each measured rather than assumed:
 
 - **`Start` is entirely unproven.** `startContainer` is unreachable without a VM — it throws
   `notInitialized` first. The one test that drives it says so in its own name
@@ -57,7 +66,9 @@ this engine.** Specifically, and each measured rather than assumed:
 - **Port publishing has three silent gates** and is provable only from the live tier.
 - **`Remove` of a RUNNING container is untested** — that state is unreachable VM-free, because
   `loadPersistedState()` recovers every persisted `running` row as exited/137 first.
-- **The live tier cannot spawn the branch engine at all** (missing two required arguments).
+- ~~**The live tier cannot spawn the branch engine at all**~~ — **FIXED and proven**, Gas Can `776a71c`.
+  It passes all four options now, with `--kernel-path` and `--vminit-layout` arriving as
+  `GASCAN_ARCA_KERNEL_PATH` and `GASCAN_ARCA_VMINIT_LAYOUT`.
 - **Every capability flag is still `false`.** The engine claims nothing it has not earned.
 
 **Landing 5 exists precisely to close this gap, and Task 13 is a step change in kind, not just the next
@@ -85,11 +96,20 @@ The three RPCs still answering `unsupported_capability` are **`CreateContainer`,
 | 10 `PrepareImage` | `65650b2`..`05b909a` | — |
 | 11 `Create` — closed after 4 fix rounds | `05b909a`..`7511957` | — |
 | 12 `Start`, `Stop`, `Remove` — passed review, no fix round | `7511957`..`9db2f7d` | `1726c77` |
+| 13 the live tier's spawn, proven | — | `776a71c` |
+| 13a the create path's container directory | `9db2f7d`..`1a78ef3` | — |
+| 13b the container log directory | `1a78ef3`..`5e52aae` | — |
 
-**Tasks 3b, 3c and 6b were not in the approved plan.** Each was added on a maintainer ruling
-after a review found something real: a `try?` that let `docker network prune` delete an in-use
-network, a gate that could not see the test guarding it, and an engine that could not start a
-container because nothing signed it.
+**Tasks 3b, 3c, 6b, 13a and 13b were not in the approved plan.** Each was added on a maintainer ruling
+after a review — or, for 13a, a controller spike — found something real: a `try?` that let
+`docker network prune` delete an in-use network, a gate that could not see the test guarding it, an
+engine that could not start a container because nothing signed it, a hardcoded container directory that
+broke `Create` and wrote into Apple's shared store, and a log directory that did the same to
+ArcaDaemon's. **The last two are both Task 1 misses of the same shape** — a path that should have been
+rooted when `ContainerManager` gained its roots and was not.
+
+**`ContainerBridge` now derives no state root it was not given.** That claim is Task 13b's and is worth
+re-running rather than trusting, with the greps recorded in its ledger entry.
 
 **Task 11 cost four fix rounds and every one was the same defect** — a claim that outran the code.
 Seven instances across commit messages, source comments and reports; **every one caught by a reviewer
@@ -110,6 +130,28 @@ correct. VERIFIED by running it: the isolation probes —
 `~/Library/Application Support/com.apple.containerization` — came back **empty**, three separate
 times, cross-checked with `-newer <marker>`. The engine built its own 512MB `initfs.ext4` inside
 its own state root and never touched Apple's.
+
+**THAT MEASUREMENT IS NARROWER THAN IT READS, AND CREATING A CONTAINER BROKE IT — 2026-08-13.** Those
+probes ran when **no container had ever been created**, so they measured startup and nothing else. The
+moment a container was created, two paths wrote outside the state root, and both are now fixed:
+
+- **The container directory.** `ContainerManager.swift:1144` hardcoded
+  `~/Library/Application Support/com.apple.containerization` while `getRootfsPath` derived the same
+  directory from `manager.imageStore.path`. Task 1 moved one and not the other. **This also broke
+  `Create` outright**, with `NSPOSIXErrorDomain Code=2` — Apple's manager, rooted at the private store,
+  found no directory. Fixed in Arca `9b29399`, adjudicated in `1a78ef3`.
+- **The container log directory.** `ContainerLogManager` derived
+  `~/Library/Application Support/com.apple.arca/logs` for itself and took no root at all, so every
+  engine wrote container stdout/stderr into ArcaDaemon's one shared directory **and deleted out of it on
+  remove**. Fixed in Arca `5e52aae` (Task 13b).
+
+**The re-measurement, and it is the one to quote:** with the fix, creating a container leaves Apple's
+shared `containers/` directory count **unchanged (253 → 253)** and puts the directory under the
+engine's own `<state-root>/images/containers/`. With `manager.imageStore.path` swapped for
+`ImageStore.default.path`, the same run drives the count **253 → 254**, leaves the engine's own
+directory empty, and fails `Create` — while **`swift test --filter ArcaEngineTests` stays at 149
+passing**. **That pair is the whole argument for the live tier: Arca's suite cannot see this, and
+nothing in that repository can.**
 
 **The vmnet `host` network does not collide.** Two concurrent engines on different state roots
 took `192.168.93.0/24` and `192.168.95.0/24`, both listening, allocation released on exit. The
@@ -194,20 +236,46 @@ image-load seam) and `1726c77` (Task 12's routed findings). Read that section of
 Remaining: **Task 13** the live tier, **Task 14** the capability flips, **Task 15** the workspace suite
 run alone.
 
-### Task 13's first hour, in order, because the rest is blocked behind it
+### Task 13's first hour is DONE. Both steps came back, and step 2 cost two Arca fixes.
 
-The plan has the detail. The order matters and is not obvious:
+**Do not redo this.** Steps 1 and 2 below are complete and recorded; step 3 is what remains.
 
-1. **Make the spawn work and prove it** against a **branch-built** engine, before writing any RPC test.
-   `crates/gascan-arca/tests/live/common/mod.rs:79-86` passes only `--socket-path` and `--state-root`;
-   the branch engine also requires `--kernel-path` and `--vminit-layout`. Get
-   `a_real_engine_accepts_the_placeholder_authority` green and record the command and output.
-2. **Establish that `image load` then `Create` actually works.** Verified by reading only:
-   `arca-engine image load --state-root <R> --oci-layout <L>` needs no kernel and serves nothing, so the
-   tier can seed the engine's own store. **Whether a `Create` against the loaded image then succeeds is
-   NOT established, and every lifecycle test in the landing is blocked behind it.** Worth an hour, not a
-   fix round.
-3. Only then the lifecycle tests, the partial-failure case, and the published-port test.
+1. **DONE — the spawn works**, Gas Can `776a71c`. `connect::a_real_engine_accepts_the_placeholder_authority`
+   → `1 passed` against a branch-built engine. Seen to fail: dropping the two new arguments gives
+   `Missing expected argument '--kernel-path'`, `engine exited with exit status: 64`, reported in 0.06s
+   by `await_socket`'s `try_wait()`.
+   **The module prefix in the filter is load-bearing** — `-- --ignored <bare name> --exact` reports
+   `running 0 tests` and exits 0. Use `connect::<name>`.
+2. **DONE — `image load` works, and `Create` now works, but only after Tasks 13a and 13b.**
+   `arca-engine image load --state-root <R> --oci-layout <L>` → exit 0, no kernel, no socket. The layout
+   was built with the installed `skopeo`:
+   `skopeo copy --override-os linux --override-arch arm64 docker://docker.io/library/alpine:3.20
+   oci:/tmp/alpine-oci:alpine:3.20`. Then `PrepareImage` → `Ok`, `Create` → `Ok`.
+   **THE DIGEST A REQUEST MUST NAME IS THE STORE'S, NOT THE LAYOUT'S.** The store re-wraps what it
+   loads: the layout's `index.json` carries manifest `sha256:45e09956…` and
+   `<state-root>/images/state.json` records `alpine:3.20` → `sha256:a019d0ba…` as an image **index**. A
+   test deriving the digest from the layout it loaded names content the store does not hold. Read
+   `state.json`. `policy_request_for_image` (`common/mod.rs`) is the seam, over
+   `PolicyCompiler::compile_for_image`.
+3. **What remains**: the lifecycle tests, the partial-failure case, and the published-port test.
+
+**Two things step 2 turned up that change Task 13's remaining shape:**
+
+- **`read_rpcs::every_unimplemented_method_answers_unsupported_capability_not_a_transport_fault`
+  ALREADY FAILS** against the branch engine — `Inspect: None` at `read_rpcs.rs:80`, because it calls
+  `expect_err` and the branch engine now implements `Inspect` and answers `absent`. The test asserts its
+  own count is 10 precisely so this would fire, and says so in its own doc comment. **The count is now
+  3**: `CreateContainer`, `Exec`, `Logs`. Rewriting it is Task 13's.
+- **`CreateRequest` CARRIES NO ARGV, so the published-port test cannot supply its own responder.**
+  `engine.proto:254-271` has no command or entrypoint field, and
+  `SandboxEngineService.swift:356-357` passes `entrypoint: nil, command: nil` **deliberately** — the
+  image's own config decides what runs. The environment is no way in either:
+  `policy.rs:246` sets it from `guest_environment()`, a fixed map, so a manifest cannot inject a port.
+  **The plan's Landing 5 expansion assumed `gascan-apple`'s `guest_argv` technique transfers with only
+  the port changed. It does not.** Maintainer's ruling 2026-08-13: **the tier builds its own OCI layout**
+  — reserve a port by binding `127.0.0.1:0`, then write a layout whose config carries
+  `Cmd = sh -c '…nc -l -p <reserved>'`. That keeps the ephemeral-port reservation and needs no network
+  at test time.
 
 **The two artifacts the spawn needs are host state that neither repo produces:**
 
@@ -221,7 +289,12 @@ a directive message. **No hardcoded `~/.arca`, no guessing fallback.**
 
 ### Three things that will decide Landing 5, established by measurement
 
-1. **THE LIVE TIER CANNOT SPAWN THE *BRANCH* ENGINE. IT SPAWNS THE PINNED ONE FINE.**
+1. **~~THE LIVE TIER CANNOT SPAWN THE *BRANCH* ENGINE~~ — FIXED 2026-08-13, Gas Can `776a71c`.** The
+   diagnosis below is kept because its *consequence* still stands: `build-arca-engine.sh` builds the
+   pin, the pin bump belongs to milestone 4, and **CI still cannot run Task 13's tests this milestone.**
+   `#[ignore]` remains the correct state, and "run the tier at least once" still means a local run
+   against a branch build, recorded with its command and output.
+   **THE LIVE TIER CANNOT SPAWN THE *BRANCH* ENGINE. IT SPAWNS THE PINNED ONE FINE.**
    **CORRECTED 2026-08-13** — earlier text here said "cannot spawn an engine, and has not since Task
    4", unqualified, and that is too strong in a way that changes Task 13's shape.
    `crates/gascan-arca/tests/live/common/mod.rs:79-86` passes only `--socket-path` and
@@ -455,6 +528,30 @@ in `docs/status/arca-integration-handoff.md`.
   `scripts/build-arca-engine.sh`.
 
 ## Traps that will cost you if you learn them the hard way
+
+### Added 2026-08-13 late, from Task 13's first hour.
+
+**A MEASUREMENT'S SCOPE IS WHATEVER IT COULD REACH, NOT WHAT ITS SENTENCE SAYS.** This file recorded
+"the isolation probes came back empty, three separate times, cross-checked" — true, careful, and
+**taken when no container had ever been created**. It read as "the engine is isolated". It meant "the
+engine's *startup* is isolated". Creating one container broke it in two places at once. **When you
+write a measurement down, write what it could not have observed** — the three-times cross-check made
+the claim feel stronger while the gap was in what was never exercised at all, and repetition cannot
+close that kind of gap.
+
+**A GUARD THE SUITE CANNOT FALSIFY IS WORTH SHIPPING ONLY IF IT SAYS SO IN ITS OWN NAME.** Task 13a's
+call site needs a kernel and a VM, so its guards read the source as text. One was named
+`...NeverNamesApplesSharedStore` — and swapping `manager.imageStore.path` for `ImageStore.default.path`
+restores the defect **exactly** while leaving `Executed 149 tests, with 0 failures`. The assertion was
+fine; the **name** was the overclaim, and a name is what the next person greps. Renamed to
+`...CarriesNoLiteralPathToApplesSharedStore`, with both evasion vectors written into the doc comment
+beside their measured results.
+
+**WHEN A REPOSITORY STRUCTURALLY CANNOT TEST SOMETHING, SAY WHICH REPOSITORY CAN — AND RUN IT.** The
+same mutation that leaves Arca green at 149 drives Gas Can's live `Create` to `NSPOSIXErrorDomain
+Code=2`, empties the engine's own `containers/`, and grows Apple's shared store by one. Both halves are
+now recorded on both sides. **An honest "this proves nothing about runtime" is only half the work; the
+other half is running the thing that does.**
 
 ### Added 2026-08-13 evening. These five are new, and four cost real time the day they were found.
 
