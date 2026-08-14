@@ -306,10 +306,20 @@ refuse instead. The reasoning is on each method in `SandboxEngineService.swift` 
 
 ## What is left, now that the implementation is done
 
-**Two decisions are open and both are the maintainer's.** Neither is a code change anyone should make
-unprompted.
+**RULED 2026-08-14: BOTH OF THESE ARE TO BE FIXED.** They were written up as open questions and the
+maintainer closed them the same day — "seems like we need to fix both of the things you left alone".
+They are the next session's work, and **they are both Arca-side.**
 
-### OPEN RULING 1 — named volumes are attached but never mounted
+**Take them in this order, and spike the first one before planning it.** The volume defect is the one
+with real unknowns; the shutdown crash is bounded. Milestone 2's own tasks are done, so these are
+follow-on work on the same branches — **do not start a new branch.**
+
+**Before either: this session's method is what found them, and it is worth repeating.** Both were
+discovered by driving the real thing and measuring the result, not by reading. Every claim that
+outran the code this session was caught by a reviewer running a mutation. Keep dispatching a fresh Opus
+implementer per task and an Opus reviewer after each.
+
+### RULED — FIX IT — named volumes are attached but never mounted
 
 **`capabilities.namedVolumes` is `false` and that is deliberate.** The engine creates all three volumes,
 formats each as EXT4 at its declared capacity, resolves each, builds a `Mount.block` for each, logs
@@ -340,9 +350,42 @@ assembly.
 
 **Gas Can cannot dodge the branch.** A capacity selects `block`, no capacity selects `local`, and
 `policy.rs` compiles a capacity for all three volumes from `Storage`, whose every field must be greater
-than zero. **So the ruling is either an Arca fix or a change to what Gas Can declares.**
+than zero. **So the fix is Arca-side.**
 
-### OPEN RULING 2 — the engine aborts on its own graceful-shutdown path
+#### What the next session needs before it plans this, and must establish FIRST
+
+**THE DECIDING QUESTION IS WHETHER THE FIX IS HOST-SIDE OR GUEST-SIDE, AND IT CHANGES THE COST BY AN
+ORDER OF MAGNITUDE.** Establish it before writing anything — the same way Task 13's first hour
+established that `image load` then `Create` worked, which turned what would have been a fix round into
+an hour.
+
+- **Host-side** — Arca's Swift arranges the mount differently, e.g. passing `destination: ""` and
+  telling the guest where to put it, as its own OverlayFS mounts already do. Cheap, and testable in the
+  existing loop: rebuild `arca-engine`, re-sign, re-run the live tier.
+- **Guest-side** — `vminitd` has to honour a real destination for a block mount. **This means rebuilding
+  the vminit OCI image**, and that is a different kind of day: `assets/README.md` records Go 1.24+, the
+  Swift Static Linux SDK, ~10 GB of disk and **20-25 minutes** per build, and the running engine takes
+  vminit through `--vminit-layout`, so a rebuilt image has to be loaded before anything can be
+  re-measured.
+
+**The source you need is present, which is the good news.** `vminitd` is a submodule at
+`containerization/vminitd/Sources/` — not a vendored binary — and it carries an
+`ArcaBoot.swift`, which is the obvious first place to look for how the guest decides what to mount.
+`assets/README.md` describes vminit as `/sbin/vminitd` plus Arca's own Go services.
+
+**Note this cuts against the current hypothesis, so treat the hypothesis as unproven.** It says nothing
+in the boot sequence knows about a real destination — but the framework comment
+"Empty to prevent auto-mount by framework" implies a non-empty destination **would** be auto-mounted.
+Both readings fit the measurement. **Do not start from either; measure which.**
+
+**The instrument already exists and will tell you the moment you succeed.**
+`mounts::the_managed_volumes_are_attached_to_the_guest_but_this_engine_mounts_none_of_them` fails the
+day the guest mounts them, and its failure message is the instruction list: flip
+`capabilities.namedVolumes`, replace it with the positive test it describes, and update
+`read_rpcs::capabilities_report_only_what_this_engine_build_implements`. **Task 14's rule still binds —
+the flag flips only when a live test drives the capability**, so the positive test comes first.
+
+### RULED — FIX IT — the engine aborts on its own graceful-shutdown path
 
 Once containers have been created, `SIGTERM` sometimes ends in a crash rather than a clean stop:
 
@@ -358,7 +401,21 @@ it changed no outcome. An engine that created **no** container exits cleanly. **
 deliberately does not assert the exit status** — `LiveEngine::kill`'s comment records why, and that
 blindness is bounded to the shutdown window because a crash any earlier surfaces as a transport error or
 through `await_socket`'s `try_wait()`. **An operator stopping the engine sees a crash**, so it is a real
-defect; it is not this milestone's to fix.
+defect.
+
+**How to work on it, and the trap in it.** It is ~19%, so **a single clean shutdown proves nothing** —
+this project's own rule is that a green figure you cannot account for is not a pass, and here the green
+figure occurs four times in five by chance. Drive it in a loop and report the rate, before and after,
+**in one run each** rather than across a drifting machine.
+
+**The obvious instrument does not currently exist and should be the first thing built**: the live tier
+deliberately does not assert the engine's exit status (`LiveEngine::kill`, with its reasoning recorded
+there). Once the crash is fixed, **that refusal should be inverted into an assertion** — otherwise the
+fix ships with nothing that can ever fail if it regresses. The comment says so in place.
+
+The shape is a SwiftNIO teardown ordering problem — `QuiescingHelper` is completing a promise on an
+`EventLoop` that has already gone — and it only happens once containers have been created, which points
+at something container-scoped outliving the group's shutdown.
 
 ### Then: the merge, and the pin
 
@@ -464,10 +521,10 @@ each failing in ~0.15s); no `/var/db/vmnet*` or `dhcpd_leases`; 203 GB free.
 `host` network with an **auto-allocated** subnet — `192.168.93.0/24`, `.95` and `.119` were observed —
 and roughly fifteen engines were started. The pool is per-boot.
 
-The worktree at `/tmp/arca-pre13a` is left in place so the comparison can be re-run cheaply after a
-reboot; if both binaries then listen, the diagnosis is confirmed from both directions. Remove it with
-`git worktree remove /tmp/arca-pre13a`. It needed `git submodule update --init --recursive` to build —
-`containerization` is a submodule at `f02cdf9`.
+The worktree used for that comparison has been removed; `git worktree list` in `~/code/arca` shows only
+the main tree. **If you ever need to build Arca at another revision in a worktree, it needs
+`git submodule update --init --recursive` first** — `containerization` is a submodule at `f02cdf9` and
+the build fails with `containerization/Package.swift doesn't exist` without it.
 
 **What is NOT blocked:** anything Arca-side and VM-free, and any Gas Can work that does not spawn a
 serving engine — **including the OCI-layout writer the published-port test needs**, which is pure file
