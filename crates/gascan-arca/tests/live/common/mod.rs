@@ -326,6 +326,20 @@ impl LiveEngine {
     /// is exactly the race `a_call_against_a_killed_engine_fails_rather_than_hanging`
     /// must not have. Closing the pipe is the one signal the wrapper is built
     /// around, and `wait` then returns only once the engine itself is reaped.
+    ///
+    /// **The exit STATUS is deliberately not asserted, and that is a real blind
+    /// spot rather than an oversight.** Arca's engine aborts on its own
+    /// graceful-shutdown path once containers have been created --
+    /// `Cannot schedule tasks on an EventLoop that has already shut down`, then
+    /// `NIOExtras/QuiescingHelper.swift:141: Fatal error: leaking promise`, then
+    /// `Trace/BPT trap: 5` -- MEASURED at **6 crashes in 32 shutdowns** across one
+    /// review. Every one happened strictly after the test's assertions, so
+    /// asserting a clean status here would fail runs whose subject behaved
+    /// correctly, against a defect this tier does not own. **The blindness is
+    /// bounded to the shutdown window**: a crash any earlier surfaces as a
+    /// transport error mid-call or through `await_socket`'s `try_wait()`, and
+    /// both of those paths are exercised. Routed to milestone 4 with the other
+    /// Arca-side findings; assert the status here once it is fixed.
     pub async fn kill(mut self) {
         drop(self.child.stdin.take());
         let stopped = tokio::time::timeout(Duration::from_secs(30), self.child.wait()).await;

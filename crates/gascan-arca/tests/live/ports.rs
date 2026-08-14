@@ -182,7 +182,11 @@ async fn read_from_loopback(port: u16, bound: Duration) -> String {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     panic!(
-        "nothing answered on 127.0.0.1:{port} within {:.1}s; last attempt: {last}",
+        "nothing answered on 127.0.0.1:{port} within {:.1}s; last attempt: {last}. \
+         If this reads `connected and read nothing`, the engine publishing nothing \
+         and an unrelated process having taken {port} between the reservation and \
+         the Create are INDISTINGUISHABLE from here -- both accept and stay silent. \
+         Check what is listening on {port} before treating this as a publish failure",
         bound.as_secs_f64()
     );
 }

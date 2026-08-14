@@ -34,10 +34,23 @@ const MANIFEST: &str = "version = 1\nnetwork = 'networked'\nuser = 'root'\n";
 /// `running` and acted on while it is.
 ///
 /// `sh -c 'while :; do sleep 1; done'` rather than the base image's own `Cmd`.
-/// Alpine's is `/bin/sh`, which exits immediately with no tty attached, so a
-/// sandbox started from it is `exited` before `Inspect` can see it run -- and
-/// `Remove` would then never meet the `containerRunning` refusal this file
-/// exists to reach.
+/// Alpine's is `/bin/sh`, which exits immediately with no tty attached.
+///
+/// CORRECTED after review, because the first version of this comment claimed
+/// more than the engine does. It said `Remove` "would then never meet the
+/// `containerRunning` refusal this file exists to reach". **It meets it fine.**
+/// MEASURED, with this `Cmd` replaced by `sh -c 'exit 0'`: the engine logs
+/// `Background monitor: container exited exit_code=0` and the subsequent
+/// `Remove` is still refused `invalid_state`, because the refusal reads the
+/// PERSISTED state and nothing writes the guest's exit back to it. Every
+/// assertion in `remove_refuses_a_running_container_rather_than_destroying_it`
+/// passed against an already-exited container.
+///
+/// **What a long-running `Cmd` is actually for is the teardown.** Under that
+/// mutation both tests failed at their own cleanup `stop`, with
+/// `CancellationError()` -- stopping a container whose PID 1 has gone. So this
+/// image keeps the tests' cleanup honest; it is not what makes the refusal
+/// reachable.
 fn staying_up(destination: &Utf8Path) -> Utf8PathBuf {
     layout_running(
         &base_oci_layout(),
@@ -115,10 +128,20 @@ async fn await_state(
 /// instrument that can see a publish. And `Inspect` reports what the STORE
 /// holds, deliberately, because that is what drift detection compares against:
 /// the `Running` here is the store's opinion and not an observation of the
-/// guest. What turns that opinion into evidence is
-/// `remove_refuses_a_running_container_rather_than_destroying_it`, which acts
-/// on the same state and gets a refusal only a genuinely running container
-/// produces.
+/// guest.
+///
+/// **`ports.rs` IS THE ONLY TEST THAT TURNS THAT OPINION INTO EVIDENCE**, because
+/// it is the only one that reads bytes the guest itself produced.
+///
+/// CORRECTED after review. This comment used to name
+/// `remove_refuses_a_running_container_rather_than_destroying_it` as what makes
+/// the `Running` real, "a refusal only a genuinely running container produces".
+/// **That is false, and it was a claim resting on another claim rather than on a
+/// measurement.** That refusal reads the same persisted state this `Inspect`
+/// reads, and nothing writes the guest's exit back into it: MEASURED, a
+/// container whose PID 1 had already exited was still refused `invalid_state`,
+/// and this test's own `await_state(Running)` still passed against it. Two reads
+/// of one opinion do not corroborate each other.
 #[tokio::test]
 #[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN, a kernel, a vminit \
             layout and a base OCI layout; the pinned engine implements none of these RPCs"]
