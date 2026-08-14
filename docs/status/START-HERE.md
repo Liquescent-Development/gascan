@@ -108,8 +108,37 @@ broke `Create` and wrote into Apple's shared store, and a log directory that did
 ArcaDaemon's. **The last two are both Task 1 misses of the same shape** — a path that should have been
 rooted when `ContainerManager` gained its roots and was not.
 
-**`ContainerBridge` now derives no state root it was not given.** That claim is Task 13b's and is worth
-re-running rather than trusting, with the greps recorded in its ledger entry.
+**A CLAIM THIS FILE BRIEFLY CARRIED AND WHICH IS FALSE: "`ContainerBridge` now derives no state root it
+was not given."** Task 13b reported it, this file repeated it, and 13b's reviewer disproved it within the
+hour. **Do not restore it.** The true, narrower form:
+
+> `ContainerLogManager` was the last `ContainerBridge` path a caller could not root **at all** — it took
+> no parameter, so the derivation was unreachable from outside. **Three defaulted path parameters
+> remain**, each falling back to an unrooted location that gets written to:
+> `VolumeManager.volumesBasePath` (`VolumeManager.swift:51`, defaulting to `~/.arca/volumes`, which
+> `initialize()` then creates), `ImageManager.imageStorePath` (`ImageManager.swift:16`, defaulting to
+> Apple's shared store), and `ArcaConfig`'s `~/.arca` defaults (`Config.swift:29-30`, `:42`).
+
+**No engine caller relies on any of them** — `EngineManagers.swift:71-74` and `:111` pass explicitly —
+so this is pre-existing and not an engine defect. But `ArcaDaemon.swift:271` passes `nil` with the
+comment `// Use default ~/.arca/volumes`, and **`ArcaTestHelper/main.swift:43` calls
+`try ImageManager(logger: logger)` omitting the argument entirely**, so a live in-package caller already
+takes Apple's shared store by default. Design §3's "none takes a default" is not yet true of
+`ContainerBridge` as a whole; it is true of everything this milestone touched.
+
+**The grep that finds these and that a `urls(for:in:)`-shaped search misses**, because
+`VolumeManager`'s fallback is spelt `NSString(...).expandingTildeInPath` with no `FileManager` call and
+no `Application Support` in it:
+
+```bash
+grep -rn --include='*.swift' -E '(Path|path|Root|root|Dir|dir|URL|url)[A-Za-z]*:\s*(String|URL)\?\s*=\s*nil|(Path|path|Root|root|Dir|dir):\s*(String|URL)\s*=\s*"' Sources/ContainerBridge/
+```
+
+**The lesson is worth more than the finding: an exhaustiveness claim is only as good as the search that
+backs it, and a search built from the shape of the bug you just fixed will miss the ones spelt
+differently.** Task 13b's greps looked for `FileManager.default.urls`, `expandingTildeInPath` and
+`Application Support` — the vocabulary of the defect it had in hand — and found nine hits it could
+account for. The grep above looks for the *shape of the seam* instead, and finds three more.
 
 **Task 11 cost four fix rounds and every one was the same defect** — a claim that outran the code.
 Seven instances across commit messages, source comments and reports; **every one caught by a reviewer
