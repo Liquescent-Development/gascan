@@ -265,11 +265,65 @@ image-load seam) and `1726c77` (Task 12's routed findings). Read that section of
 Remaining: **Task 13** the live tier, **Task 14** the capability flips, **Task 15** the workspace suite
 run alone.
 
-### BLOCKED SINCE ~21:45 ON 2026-08-13 — THE HOST STOPPED GRANTING vmnet NETWORKS
+### WHEN THE ENGINE DIES WITH vmnet 1001, FORCE-QUIT `InternetSharing`. RESOLVED 2026-08-14.
 
-**`Error: failed to create vmnet network with status vmnet_return_t(rawValue: 1001)`**, and the engine
-exits before binding a socket. **Every live test is blocked behind this**, so the rest of Task 13 cannot
-proceed until it clears. **The fix is almost certainly a reboot, which is the maintainer's call.**
+**`Error: failed to create vmnet network with status vmnet_return_t(rawValue: 1001)`**, engine exits
+before binding a socket, every live test blocked. It cost about an hour on 2026-08-13/14 and it will
+recur, because the tier starts an engine per test.
+
+**THE FIX: force-quit the `InternetSharing` process** (Activity Monitor, or by PID — **never
+`pkill -f`**). Immediately afterwards `container-network-vmnet` processes appear and the engine starts
+in 2s. **The maintainer suggested this twice before it was tried; both times the agent's evidence said
+there was nothing to restart, and both times the evidence was wrong.**
+
+**`sudo launchctl kickstart -k system/com.apple.NetworkSharing` DOES NOT WORK** — `150: Operation not
+permitted while System Integrity Protection is engaged`. The launchd service is not the lever; the
+`InternetSharing` process is.
+
+**Confirmed from both directions by an interleaved comparison**, the same four-run matrix before and
+after, alternating the pre-13a binary `9db2f7d` with the current one:
+
+| | before | after |
+|---|---|---|
+| pre-13a, run 1 | `vmnet 1001` | **LISTENING**, `192.168.69.0/24` |
+| current, run 1 | `vmnet 1001` | **LISTENING**, `192.168.69.0/24` |
+| pre-13a, run 2 | `vmnet 1001` | **LISTENING**, `192.168.69.0/24` |
+| current, run 2 | `vmnet 1001` | **LISTENING**, `192.168.69.0/24` |
+
+`Create` then succeeded again, with the container directory under the engine's own store and Apple's
+shared store unchanged across the run.
+
+**FOUR HYPOTHESES THAT WERE WRONG, recorded because each cost time and each looked reasonable:**
+
+1. **"Subnet exhaustion across the session."** Wrong. All four post-fix runs took **the same**
+   `192.168.69.0/24`, so allocations are released on exit. The pool was never the problem.
+2. **"Memory pressure."** Wrong, and it is the more embarrassing one — see the instrument note below.
+3. **"Nothing is running, so there is nothing to restart."** Wrong, because the instrument was broken.
+4. **"Tasks 13a/13b broke it."** Correctly ruled out, and this is the one piece of reasoning that
+   held: the interleaved comparison exonerated them before any time was spent bisecting.
+
+**A leaked engine was found on the way and is a real bug, though NOT the cause.** `arca-engine` PID
+10260, started **Mon Aug 10 22:21:27**, orphaned to PID 1 — a live-tier engine that outlived the run
+that spawned it by four days. Killing it changed nothing. **`kill_on_drop(true)` does not save you when
+the parent is killed rather than dropped, and nothing in the tier reaps a survivor.** Worth fixing, and
+worth checking for before blaming the host.
+
+### TWO INSTRUMENTS IN THIS FILE WERE WRONG AND BOTH PRODUCED CONFIDENT FALSE CONCLUSIONS
+
+**`ps aux` IS FILTERED HERE TOO — REDIRECT TO A FILE.** This file used to say `ps -A` is filtered but
+`top` and `ps aux` are not. **Measured: `ps aux | wc -l` returned `31` on a machine with ~830
+processes**, and the same pipeline later returned `832`, so it is intermittent rather than absent. That
+truncation is what hid the four-day-old leaked engine and produced a confident "nothing is running to
+restart". **`ps aux > file` then read the file was reliable every time.** Check the instrument: compare
+the line count against `top -l 1 | grep '^Processes'` before believing a negative result.
+
+**`vm.swapusage` AND `top`'s "unused" DO NOT MEASURE MEMORY PRESSURE. USE `memory_pressure`.** This file
+told you to check `sysctl vm.swapusage` and `top` before believing a crash. Following it produced
+"320 MB unused, 5.5 GB swap, 6.3 GB compressor — the machine is starved", which was **false**:
+`memory_pressure` reported **`System-wide memory free percentage: 56%`** at that exact moment. macOS
+keeps "unused" near zero by design, and swap and the compressor are a **high-water mark** that is never
+proactively reclaimed — they describe last night, not now. The largest process on the box was 625 MB.
+**Swap tells you what happened; `memory_pressure` tells you what is happening.**
 
 **IT IS 1001, NOT 1002 — DO NOT DIAGNOSE IT AS THE SIGNING TRAP.** This file records 1002 (the SDK's
 `VMNET_MEM_FAILURE`) as the *unsigned binary* failure. This is a different value, and the binary is
@@ -676,8 +730,16 @@ are controller adjudications for exactly this reason, and both are labelled as s
 **THE MACHINE'S MEMORY IS THE HIDDEN VARIABLE.** 24 GB installed, and on 2026-08-13 it was carrying
 ~8 GB of swap and 7.8 GB in the compressor, with Firefox alone at 11.25 GB across 38 processes.
 `swift test` died with `SIGSEGV`/`SIGBUS` intermittently and one run was OOM-killed with exit 137.
-**None of it was code.** Check `sysctl vm.swapusage` and `top -l 1 -o mem -n 20` before believing a
-crash, and note that `ps -A` output is filtered under this harness — `top` and `ps aux` are not.
+**None of it was code.**
+
+**CORRECTED 2026-08-14 — THE INSTRUMENTS NAMED HERE ARE BOTH WRONG.** This paragraph used to end
+"check `sysctl vm.swapusage` and `top -l 1 -o mem -n 20` ... and note that `ps -A` output is filtered
+under this harness — `top` and `ps aux` are not." Following that produced two confident false
+conclusions in one hour. **Use `memory_pressure` for pressure**, not swap or `top`'s "unused" — swap
+and the compressor are a high-water mark that macOS never proactively reclaims, so they describe the
+worst moment of the session rather than the current one. **And `ps aux` is filtered here too** —
+redirect it to a file. Both corrections are written up with their measurements in the vmnet section
+above.
 
 ---
 
