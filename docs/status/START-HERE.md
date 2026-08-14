@@ -13,8 +13,24 @@ unplanned Arca fixes on the way** — Tasks 13a and 13b.
 
 ## Where the work is
 
-**P5.1 milestone 2: LANDINGS 1-4 ARE COMPLETE. Only Landing 5 remains.** Twelve tasks, every one
-reviewed. **Nothing is merged and nothing is pushed. Do not start a new branch; continue on these two.**
+**P5.1 MILESTONE 2 IS IMPLEMENTATION-COMPLETE. All five landings, fifteen tasks, every one reviewed.**
+Twelve were planned; five were added on maintainer rulings after a review or a spike found something
+real — 3b, 3c, 6b, and this session's **13a** and **13b**. **Nothing is merged and nothing is pushed.
+Do not start a new branch; continue on these two.**
+
+**What that means and does not mean.** The engine now creates, starts, inspects, stops and removes a
+real sandbox in a real VM, and a published port is reachable from a test process. **It does not mean
+the milestone is closed** — see "What is left" below: three capability claims are earned and one is
+refused on a measured defect that needs a ruling, and the branches still have to merge.
+
+### The three things a new session most needs to know
+
+1. **`Create`, `Start`, `Stop`, `Remove` and a published port ALL WORK END TO END, measured.** The
+   sentence this file led with for two days — "nothing has ever been executed end to end" — is retired.
+2. **`named_volumes` IS REFUSED, on a defect confirmed twice.** The engine attaches block volumes the
+   guest never mounts. Do not "fix" the flag; read the section below.
+3. **If the engine dies with `vmnet_return_t(rawValue: 1001)`, force-quit `InternetSharing`.** It cost
+   an hour before anyone tried it.
 
 | | |
 |---|---|
@@ -25,13 +41,41 @@ reviewed. **Nothing is merged and nothing is pushed. Do not start a new branch; 
 | Parent design | `docs/superpowers/specs/2026-08-10-p5-1-engine-service-and-wiring-design.md` |
 | Governing roadmap | `docs/superpowers/plans/2026-08-04-arca-integration-roadmap.md` — P0-P8; P0-P4 done, P5 current |
 
-**Both suites were run and verified on 2026-08-13 evening, both trees clean:**
+**Re-run and verified 2026-08-14 at the end of the milestone, both trees clean:**
 
 | | |
 |---|---|
-| `swift test --filter ArcaEngineTests` | `Executed 147 tests, with 0 failures` |
+| `swift test --filter ArcaEngineTests` | `Executed 151 tests, with 0 failures` |
 | `swift test --filter ArcaTests.NetworkPruneGateTests` | `Executed 3 tests, with 0 failures` |
-| `env -u RUSTUP_TOOLCHAIN cargo test --workspace --no-fail-fast` | exit 0 — **1435 passed / 0 failed / 26 ignored across exactly 74 targets** reporting `0 filtered out` |
+| `env -u RUSTUP_TOOLCHAIN cargo test --workspace --no-fail-fast` | exit 0 — **1436 passed / 0 failed / 33 ignored across exactly 74 targets** reporting `0 filtered out` |
+| the live tier, with its four env vars | `tests/live.rs`: **14 passed / 0 failed / 0 filtered out** |
+
+**The workspace deltas against the old 1435 / 26 / 74 baseline are accounted for rather than accepted**,
+which is the standing rule: **ignored +7** are exactly the seven new live tests now named in
+`tests/ci/expected-ignored-tests.txt`; **passed +1** is
+`supervision::a_supervised_child_dies_when_its_parent_stops_holding_the_pipe`, which deliberately
+carries **no** `#[ignore]` because it needs no engine and so runs in ordinary CI; **targets +0** because
+the new files are modules of the existing `live` target. `pgrep -fl "cargo test"` was empty and
+recorded; three `test result:` lines with a non-zero filtered-out count were excluded as the
+overcounting trap requires.
+
+**The live tier's four environment variables** — none defaulted, absent is a `panic!` with a directive:
+
+```bash
+export GASCAN_ARCA_ENGINE_BIN=~/code/arca/.build/arm64-apple-macosx/debug/arca-engine
+export GASCAN_ARCA_KERNEL_PATH=$HOME/.arca/vmlinux
+export GASCAN_ARCA_VMINIT_LAYOUT=$HOME/.arca/vminit
+export GASCAN_ARCA_BASE_OCI_LAYOUT=/tmp/alpine-oci   # skopeo copy --override-os linux \
+    # --override-arch arm64 docker://docker.io/library/alpine:3.20 oci:/tmp/alpine-oci:alpine:3.20
+```
+
+**The engine must be ad-hoc signed or it never creates a socket:**
+
+```bash
+cd ~/code/arca && swift build --product arca-engine && codesign --force --sign - \
+  --options runtime --timestamp --entitlements Arca.entitlements \
+  .build/arm64-apple-macosx/debug/arca-engine
+```
 
 ### FIRST THING TO DO
 
@@ -99,6 +143,9 @@ The three RPCs still answering `unsupported_capability` are **`CreateContainer`,
 | 13 the live tier's spawn, proven | — | `776a71c` |
 | 13a the create path's container directory | `9db2f7d`..`1a78ef3` | — |
 | 13b the container log directory | `1a78ef3`..`5e52aae` | — |
+| 13 the lifecycle and the published port | — | `1020002`, `288b75c` |
+| 14 the capability flips — **three of four** | `5e52aae`..`6c77bb8` | `782de04`, `1ce26d6` |
+| 15 the workspace suite, run alone | — | — |
 
 **Tasks 3b, 3c, 6b, 13a and 13b were not in the approved plan.** Each was added on a maintainer ruling
 after a review — or, for 13a, a controller spike — found something real: a `try?` that let
@@ -257,7 +304,69 @@ is a confident report of a clean host, which is the report that hides a leak. Bo
 refuse instead. The reasoning is on each method in `SandboxEngineService.swift` and in
 `ArcaEngineCommand.run()`.
 
-## What to do next — Landing 5, and Task 13 first
+## What is left, now that the implementation is done
+
+**Two decisions are open and both are the maintainer's.** Neither is a code change anyone should make
+unprompted.
+
+### OPEN RULING 1 — named volumes are attached but never mounted
+
+**`capabilities.namedVolumes` is `false` and that is deliberate.** The engine creates all three volumes,
+formats each as EXT4 at its declared capacity, resolves each, builds a `Mount.block` for each, logs
+`Configured volume mounts mount_count=4 total_mounts=13`, starts the container — **and the guest mounts
+none of them**, with no warning and no error.
+
+**Measured twice, by two agents, independently.** With 256 MiB / 512 MiB / 1 GiB volumes,
+`/proc/partitions` shows the three devices at exactly `262144`, `524288` and `1048576` 1K-blocks — so
+the request and the images are correct — while `/proc/mounts` names none of the three targets. The
+reviewer checked **all 18 mount lines** and found them mounted nowhere else either. **The obvious
+explanation was ruled out**: the tier adds an image layer, `/home/workspace/{.local,.cache,.config}` are
+confirmed present in the guest, and nothing changes.
+
+**A NEGATIVE INSTRUMENT GUARDS IT**, which is what stops the false flag reading as an oversight:
+`mounts::the_managed_volumes_are_attached_to_the_guest_but_this_engine_mounts_none_of_them` re-checks
+through `list_resources` that the store really holds all three, asserts a **positive control** (`/` is
+mounted, so the parser demonstrably sees mounts at all), then asserts no target is mounted. **Its
+failure message instructs whoever makes it fail to flip the flag and delete the test.**
+
+**The hypothesis, labelled as a reading of the source and NOT a second measurement.** Every block mount
+Arca builds for itself passes `destination: ""` — commented "Empty to prevent auto-mount by framework" —
+and is mounted by vminitd at a hardcoded `/mnt/writable` or `/mnt/layer{index}`
+(`OverlayFS/OverlayFSMounter.swift:69-105`); a volume takes the other branch and passes a real
+destination (`ContainerManager.swift:3943-3949`). The reviewer strengthened it: **`/workspace` IS a real
+destination that IS honoured, via virtiofs**, so the failure is specific to **block + destination**.
+It also confirmed the mounts reach `containerConfig.mounts`, so the loss is downstream of config
+assembly.
+
+**Gas Can cannot dodge the branch.** A capacity selects `block`, no capacity selects `local`, and
+`policy.rs` compiles a capacity for all three volumes from `Storage`, whose every field must be greater
+than zero. **So the ruling is either an Arca fix or a change to what Gas Can declares.**
+
+### OPEN RULING 2 — the engine aborts on its own graceful-shutdown path
+
+Once containers have been created, `SIGTERM` sometimes ends in a crash rather than a clean stop:
+
+```
+[arca_engine] shutting down gracefully
+ERROR: Cannot schedule tasks on an EventLoop that has already shut down.
+NIOExtras/QuiescingHelper.swift:141: Fatal error: leaking promise created at (… line: 141)
+Trace/BPT trap: 5
+```
+
+**Measured at 6 crashes in 32 shutdowns (~19%)**, every one strictly **after** the test's assertions, so
+it changed no outcome. An engine that created **no** container exits cleanly. **The live tier
+deliberately does not assert the exit status** — `LiveEngine::kill`'s comment records why, and that
+blindness is bounded to the shutdown window because a crash any earlier surfaces as a transport error or
+through `await_socket`'s `try_wait()`. **An operator stopping the engine sees a crash**, so it is a real
+defect; it is not this milestone's to fix.
+
+### Then: the merge, and the pin
+
+Both branches are unmerged and unpushed. **The pin bump belongs to milestone 4** and needs a signed tag
+carrying Arca `fede19c`; `./scripts/build-arca-engine.sh` exits 70 against the current pin **by design**
+(see the pin section). **Do not bump it ad hoc to make CI green.**
+
+## The superseded plan for Landing 5, kept for its reasoning
 
 **Landing 5 is already expanded. Do not re-expand it.** Gas Can `4e40438`, amended by `f8c5ca1` (the
 image-load seam) and `1726c77` (Task 12's routed findings). Read that section of the plan and follow it.
