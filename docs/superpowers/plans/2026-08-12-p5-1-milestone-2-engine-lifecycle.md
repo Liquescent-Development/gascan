@@ -1663,13 +1663,26 @@ already agree, and only the proto is silent.** That is an argument for writing t
    test both fail. The file is a flat sorted list of `module::test` names across the whole workspace — it
    held 26 entries at `4ae9aa9`.
 
-**An image must be in the engine's private store before `Create` can succeed, and this plan has not said
-how it gets there.** Task 9 shipped `arca-engine image load --oci-layout <dir>`; the engine's state root
-is created fresh per test by `common/mod.rs:47-50`. **A best reading, NOT verified — confirm before
-relying on it:** the tier must run `image load` against the same `--state-root` before or after spawning,
-and needs an OCI layout of a small image carrying a shell and `nc`. Establish this **first**, alongside
-step 1 — if it does not work, every lifecycle test in this landing is blocked, and that is worth
-discovering in an hour rather than in a fix round.
+**An image must be in the engine's private store before `Create` can succeed, and the seam for it
+exists.** The engine's state root is created fresh per test at `common/mod.rs:47-50`, so every test
+starts with an empty store.
+
+**Verified by reading the source, NOT by running it** (`Sources/arca-engine/ArcaEngineCommand.swift:37-57`
+and `Sources/arca-engine/ImageCommand.swift:67-84`, at Arca `68ae0af`):
+
+- `arca-engine` is a command **group** whose `defaultSubcommand` is `ServeCommand`. **So the tier's
+  existing argv shape still works** — `arca-engine --socket-path …` needs no literal `serve`. Only the
+  two new required options have to be added.
+- `arca-engine image load --state-root <R> --oci-layout <L>` requires **exactly those two** options
+  (`--log-level` defaults). It takes **no** `--kernel-path` and **no** `--vminit-layout`, and it serves
+  nothing. So the tier can seed the engine's own store by running it against the same temp `--state-root`
+  before spawning the server, with no VM and no kernel involved.
+
+**What is NOT established: that a load then a `Create` against the loaded image actually succeeds**, and
+what OCI layout to use — it needs a small image carrying a shell and `nc` for the published-port test.
+Establish both **first, alongside step 1**, and record the commands. If loading does not work, every
+lifecycle test in this landing is blocked, and that is worth discovering in an hour rather than in a fix
+round.
 
 #### Task 14 — capability flips
 
