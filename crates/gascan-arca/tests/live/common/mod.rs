@@ -20,6 +20,22 @@ impl Drop for SocketRoot {
     }
 }
 
+/// Reads a required path from the environment, or panics saying how to get one.
+///
+/// Absence is a panic and never a skip, for the reason
+/// `GASCAN_ARCA_ENGINE_BIN` was given one: a live test that silently skips is a
+/// live test nobody notices has stopped running.
+///
+/// It deliberately does NOT check that the path exists. The engine validates
+/// its own three inputs and refuses to start naming which one is missing and
+/// the path it tried (design §2.3), and a second copy of that check here would
+/// be a guard no test can measure -- delete either copy and the other still
+/// catches it. What this owes the reader is the variable's absence, which the
+/// engine cannot report because it never runs.
+fn required_path(variable: &str, what: &str, directive: &str) -> String {
+    std::env::var(variable).unwrap_or_else(|_| panic!("{variable} must name {what}; {directive}"))
+}
+
 /// An engine process on a temporary socket, killed when the test ends.
 ///
 /// The live tier drives the engine directly rather than through `gascand`.
@@ -40,9 +56,21 @@ impl LiveEngine {
     /// live test that silently skips is a live test nobody notices has stopped
     /// running.
     pub async fn start() -> Self {
-        let binary = std::env::var("GASCAN_ARCA_ENGINE_BIN").expect(
-            "GASCAN_ARCA_ENGINE_BIN must name a built arca-engine; \
-             run scripts/build-arca-engine.sh and use its second output line",
+        let binary = required_path(
+            "GASCAN_ARCA_ENGINE_BIN",
+            "a built arca-engine",
+            "run scripts/build-arca-engine.sh and use its second output line",
+        );
+        let kernel = required_path(
+            "GASCAN_ARCA_KERNEL_PATH",
+            "the vmlinux the engine boots guests with",
+            "an installed Arca.app carries one at \
+             Contents/Resources/vmlinux; ~/.arca/vmlinux symlinks it",
+        );
+        let vminit = required_path(
+            "GASCAN_ARCA_VMINIT_LAYOUT",
+            "an OCI layout holding arca-vminit:latest",
+            "an installed Arca.app populates ~/.arca/vminit",
         );
         let root = tempfile::tempdir().unwrap();
         let path = Utf8Path::from_path(root.path()).unwrap().to_owned();
@@ -76,11 +104,22 @@ impl LiveEngine {
             socket.as_str().len()
         );
 
+        // All four options, none defaulted. The engine made `--kernel-path` and
+        // `--vminit-layout` required when it took ownership of its own state
+        // root, and a tier passing only the first two spawns nothing: MEASURED
+        // against the branch binary as `Missing expected argument
+        // '--kernel-path'`, exit 64. Every live test here was `#[ignore]`d, so
+        // nothing ran them and nothing noticed -- a tier that cannot start its
+        // subject and a tier nobody runs look identical from outside.
         let child = tokio::process::Command::new(&binary)
             .arg("--socket-path")
             .arg(socket.as_str())
             .arg("--state-root")
             .arg(state.as_str())
+            .arg("--kernel-path")
+            .arg(&kernel)
+            .arg("--vminit-layout")
+            .arg(&vminit)
             .kill_on_drop(true)
             .spawn()
             .unwrap_or_else(|error| panic!("could not spawn {binary}: {error}"));
@@ -166,6 +205,19 @@ impl LiveEngine {
 /// The `TempDir` must outlive the request: the compiled request names its
 /// canonical root.
 pub fn policy_request(name: &str) -> (tempfile::TempDir, gascan_core::runtime::CreateRequest) {
+    policy_request_for_image(name, gascan_core::policy::PolicyCompiler::workspace_image())
+}
+
+/// The same request, against an image the engine's own store actually holds.
+///
+/// `PolicyCompiler::compile` pins the approved workspace image, which no engine
+/// under test has: the live tier seeds a store with `arca-engine image load` and
+/// must then ask for what it seeded. `compile_for_image` is the existing seam
+/// for exactly this and needs no widening.
+pub fn policy_request_for_image(
+    name: &str,
+    image: &str,
+) -> (tempfile::TempDir, gascan_core::runtime::CreateRequest) {
     use gascan_core::manifest::Manifest;
     use gascan_core::policy::PolicyCompiler;
     use gascan_core::runtime::{NetworkIsolation, RuntimeCapabilities, RuntimeVersion};
@@ -194,7 +246,8 @@ pub fn policy_request(name: &str) -> (tempfile::TempDir, gascan_core::runtime::C
         resource_limits: true,
         offline: NetworkIsolation::Proven,
     };
-    let request = PolicyCompiler::compile(spec, &capabilities).expect("a validated request");
+    let request =
+        PolicyCompiler::compile_for_image(spec, &capabilities, image).expect("a validated request");
     (root, request)
 }
 

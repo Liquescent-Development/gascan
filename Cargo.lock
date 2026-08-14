@@ -504,6 +504,7 @@ dependencies = [
  "gascan-engine-proto",
  "hyper-util",
  "prost",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
