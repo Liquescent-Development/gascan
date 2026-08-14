@@ -1620,6 +1620,41 @@ reserved port>`, not `8080`. An implementer who copies `guest_argv` unchanged ge
 on 8080 while the engine publishes the reserved port, and the test fails for a reason that looks like a
 publishing bug and is not.
 
+#### **CORRECTED 2026-08-13 — `guest_argv` DOES NOT TRANSFER AT ALL, AND THE PARAGRAPH ABOVE UNDERSTATES IT**
+
+The paragraph above assumes the tier can choose what the guest runs, as `gascan-apple` does. **It
+cannot. `CreateRequest` carries no argv**, and this was verified in three places rather than inferred:
+
+- `engine.proto:254-271` — `CreateRequest` has `sandbox_id`, `image`, `project`, `volumes`, `ports`,
+  `environment`, `resources`, `network`, `user`, `init`, `owner`. **No command, no entrypoint.**
+- `SandboxEngineService.swift:356-357` passes `entrypoint: nil, command: nil` to
+  `createContainer` **deliberately** — the image's own config decides what runs.
+- The environment is not a way in either. `policy.rs:246` sets it from `guest_environment()`, a fixed
+  workspace map plus two SSH keys, with **no manifest passthrough** — so a port cannot be injected as a
+  variable and read by a baked-in `Cmd`.
+
+`gascan-apple` can do this because it drives Apple's `container` CLI, which takes an argv
+(`common/mod.rs:679-691` builds one). The engine contract deliberately does not: it creates a
+*workspace*, not an arbitrary command.
+
+**MAINTAINER'S RULING 2026-08-13 — the tier builds its own OCI layout.** The responder is baked into the
+image's `Cmd`, and because the port must therefore be known at image-build time, the image is built
+*during the test*: reserve a port by binding `127.0.0.1:0`, then write a layout whose config carries
+`Cmd = ["sh", "-c", "…nc -l -p <reserved>…"]`, and `arca-engine image load` it. This keeps the
+ephemeral-port reservation that avoids collisions and needs no network at test time.
+
+Rejected: a fixed port baked into a maintainer-prepared layout named by an env var. It collides with
+whatever else is listening, and it adds a third host precondition nothing in either repo produces.
+Rejected: shelling out to `skopeo` at test time — a tool and a network dependency, which is exactly what
+the `--kernel-path` and `--vminit-layout` variables exist to avoid.
+
+**Established by measurement, so the implementer does not have to.** A layout built with
+`skopeo copy --override-os linux --override-arch arm64 docker://docker.io/library/alpine:3.20
+oci:/tmp/alpine-oci:alpine:3.20` loads cleanly and a `Create` against it succeeds. **The digest the
+request must name is the STORE'S, not the layout's** — the store re-wraps what it ingests, recording
+`alpine:3.20` as an image *index* under a different digest than the layout's manifest. Read
+`<state-root>/images/state.json`. `policy_request_for_image` (Gas Can `776a71c`) is the seam.
+
 `policy_request` (`:168-199`) writes a two-line manifest today; it needs a `[ports]` table and a
 parameter for the port. Keep it the only construction path — the comment at `:159-161` records why
 (`CreateRequest`'s fields are `pub(crate)` and it derives no `Deserialize`), and that reason still holds.
@@ -1649,7 +1684,18 @@ already agree, and only the proto is silent.** That is an argument for writing t
 
 #### Task 13 — the live tier
 
-1. **Spawn first, and prove the spawn before writing any RPC test.** Add the two variables, pass all four
+**Steps 1 and the image-load question are DONE (controller, 2026-08-13). Do not redo them.** Step 1
+landed as Gas Can `776a71c`; the load-then-`Create` question came back yes, but only after two unplanned
+Arca fixes — **Task 13a** (`9b29399`, adjudicated `1a78ef3`), the create path's container directory, and
+**Task 13b** (`5e52aae`), the container log directory. Both were Task 1 misses of the same shape.
+
+**One existing test already fails and is Task 13's to rewrite.**
+`read_rpcs::every_unimplemented_method_answers_unsupported_capability_not_a_transport_fault` calls
+`expect_err` on `Inspect`, which the branch engine now implements — it answers `absent`. The test
+asserts its own count is 10 so that this would fire, and its doc comment says so. **The count is now
+3**: `CreateContainer`, `Exec`, `Logs`.
+
+1. ~~**Spawn first, and prove the spawn before writing any RPC test.**~~ **DONE.** Add the two variables, pass all four
    options, and get one existing ignored test (`a_real_engine_accepts_the_placeholder_authority`) green
    against a **branch-built** engine. Record the command and the output. Until that passes, every test
    below is unrunnable and unreviewable.
