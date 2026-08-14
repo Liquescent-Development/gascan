@@ -171,13 +171,26 @@ capability flips, Task 15 the workspace suite run alone.
 
 ### Three things that will decide Landing 5, established by measurement
 
-1. **THE LIVE TIER CANNOT SPAWN AN ENGINE, AND HAS NOT SINCE TASK 4.**
+1. **THE LIVE TIER CANNOT SPAWN THE *BRANCH* ENGINE. IT SPAWNS THE PINNED ONE FINE.**
+   **CORRECTED 2026-08-14** — earlier text here said "cannot spawn an engine, and has not since Task
+   4", unqualified, and that is too strong in a way that changes Task 13's shape.
    `crates/gascan-arca/tests/live/common/mod.rs:79-86` passes only `--socket-path` and
-   `--state-root`; Task 4 made `--kernel-path` and `--vminit-layout` **required**. Measured against
-   both the pre- and post-Task-9 binaries: `Missing expected argument '--kernel-path'`, exit 64.
+   `--state-root`. At the **pinned** revision `b3390b8` the engine declares exactly those two plus
+   `--log-level` — three `@Option`s, the last with a default
+   (`git show b3390b8:Sources/arca-engine/ArcaEngineCommand.swift`). **So the tier spawns the pinned
+   engine correctly, and the recorded 4/4 live pass measured a working tier.** On the branch,
+   `ArcaEngineCommand.swift:68-84` makes `--kernel-path` and `--vminit-layout` required; measured
+   against both the pre- and post-Task-9 branch binaries: `Missing expected argument
+   '--kernel-path'`, exit 64.
    **Nobody noticed because every live test is `#[ignore]`d, so nothing runs them** — a tier that
-   cannot start its subject and a tier nobody runs look identical from outside. **Task 13 must fix
-   the spawn AND run the tier at least once**, or it keeps proving nothing.
+   cannot start its subject and a tier nobody runs look identical from outside.
+   **The consequence for Task 13:** `build-arca-engine.sh` builds the pin, the pin bump belongs to
+   milestone 4, and the pinned engine has no lifecycle RPCs — so **CI cannot run Task 13's tests this
+   milestone at all**, and `#[ignore]` is the correct state rather than a quarantine. "Run the tier at
+   least once" means a **local run against a branch build, recorded with its command and output**.
+   The spawn also needs two artifacts nothing in the repo produces: `~/.arca/vmlinux` (a symlink to an
+   installed `Arca.app`, 28,248,576 bytes) and `~/.arca/vminit` (a 178 MB OCI layout). Landing 5's
+   expansion carries the rest.
 2. **PORT PUBLISHING HAS THREE SILENT GATES, and Task 11 closes only the first.**
    (a) `portMapManager == nil` — now wired; (b) `getWireGuardClient` returns nil and the `if let`
    around the publish has **no `else`** — it returns nil when the container is on no WireGuard
