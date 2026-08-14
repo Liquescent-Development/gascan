@@ -1538,7 +1538,168 @@ Carry Minor 4 above into both `Start` and `Remove`.
 
 **Task 12 — `Start`, `Stop`, `Remove`.** `Remove` refuses any resource whose stored labels differ from the caller's.
 
-### Landing 5 — Gas Can live tier and capability flips
+### Landing 5 — Gas Can live tier and capability flips (EXPANDED 2026-08-14, before Task 13)
+
+Anchors re-derived at Gas Can `4ae9aa9` and Arca `68ae0af`. **Re-derive again before editing.**
+
+| What | Where |
+|---|---|
+| the live tier's spawn | `crates/gascan-arca/tests/live/common/mod.rs:79-86` |
+| `policy_request`, the only `CreateRequest` construction path | same file, `:168-199` |
+| `retained_for` | same file, `:209-237` |
+| the engine's CLI options | Arca `Sources/arca-engine/ArcaEngineCommand.swift:68-84` |
+| the capability flags Task 14 flips | Arca `Sources/ArcaEngine/SandboxEngineService.swift:102`, `:103`, `:106`, `:107` |
+| `compile_ports` | `crates/gascan-core/src/policy.rs:431-466` |
+| the `loopback_publish` policy gate | `crates/gascan-core/src/policy.rs:414` |
+| the ignored-test registry and its check | `tests/ci/expected-ignored-tests.txt`, `scripts/ci-check-ignored-tests.sh:23-34` |
+| the published-port technique to copy | `crates/gascan-apple/tests/live/resources.rs:76-123` |
+| its in-guest responder | `crates/gascan-apple/tests/live/common/mod.rs:679-691`, image at `:21` |
+
+#### The spawn is not broken the way this plan has said, and the difference decides Task 13
+
+Earlier text here and in `docs/status/START-HERE.md` says the live tier "cannot spawn an engine, and has
+not since Task 4". **Measured, that is too strong, and the correction matters.**
+
+`common/mod.rs:79-86` passes `--socket-path` and `--state-root` and nothing else. At the **pinned**
+revision `b3390b8`, `ArcaEngineCommand` declares exactly `--socket-path`, `--state-root` and
+`--log-level` (`git show b3390b8:Sources/arca-engine/ArcaEngineCommand.swift`, three `@Option`s, the
+last with a default). **So the tier spawns the pinned engine correctly**, and the recorded 4/4 live pass
+against the pin-built binary was a real measurement of a working tier, not an accident.
+
+On the branch, `ArcaEngineCommand.swift:68-84` declares `socketPath`, `stateRoot`, `kernelPath` and
+`vminitLayout` as non-optional `String` with no defaults — four required options. **The tier cannot spawn
+the branch engine** — the only engine that implements `Create` (Task 11), and the only one that will
+carry `Start`, `Stop` and `Remove` once Task 12 lands. None of the four exists at the pin.
+
+**The consequence, and it is the shape of this whole landing.** `scripts/build-arca-engine.sh` builds the
+**pin**, and the pin bump belongs to milestone 4 (a signed tag carrying Arca `fede19c`; see
+START-HERE). So for the whole of milestone 2:
+
+- Task 13's new tests can only run against a **locally built branch engine**, named through
+  `GASCAN_ARCA_ENGINE_BIN`.
+- **CI cannot run them, and will not be able to until the pin moves.** The `engine` job builds the pin,
+  and the pinned engine has no lifecycle RPCs to drive.
+- Therefore `#[ignore]` here is not a quarantine to be apologised for — it is the only correct state,
+  and **"Task 13 must run the tier at least once" means a local run recorded by the controller with its
+  command and output, not a green check.** A tier that cannot start its subject and a tier nobody runs
+  look identical from outside; only a recorded run distinguishes them.
+
+#### The two artifacts the spawn now needs, and where they come from
+
+`--kernel-path` and `--vminit-layout` name real files, and `build-arca-engine.sh` does not produce
+them — its last line prints exactly two paths, the checkout and the binary (`:307`). Measured on this
+machine:
+
+| Option | Path | What it is |
+|---|---|---|
+| `--kernel-path` | `~/.arca/vmlinux` | a symlink to `/Applications/Arca.app/Contents/Resources/vmlinux`, **28,248,576 bytes**, `Linux kernel ARM64 boot executable Image` |
+| `--vminit-layout` | `~/.arca/vminit` | an OCI layout — `blobs/`, `index.json`, `ingest/`, `oci-layout` — **178 MB** |
+
+**The kernel comes from an installed `Arca.app`, not from a build.** That is a host precondition the
+tier must state rather than discover: `make kernel` in Arca builds one via `scripts/build-kernel.sh`, and
+neither building a kernel nor shipping 178 MB of vminit belongs in a test run.
+
+**Take the shape already used for the binary**: two more environment variables, absent → `panic!` with a
+directive message naming how to get one, exactly as `GASCAN_ARCA_ENGINE_BIN` does at `:43-46` ("a live
+test that silently skips is a live test nobody notices has stopped running"). Do **not** hardcode
+`~/.arca/...` and do **not** add a fallback that guesses — the standing rule on this project is fail
+fast, and a guessed kernel path fails later and less legibly than an absent variable.
+
+#### Port publication: what the live tier can and cannot express
+
+`compile_ports` (`policy.rs:431-466`) sets, for each declared manifest port,
+`host_address = 127.0.0.1`, and **`host_port` and `guest_port` both equal the declared value.** There is
+no allocation and no mapping.
+
+**So the apple tier's technique transfers but not verbatim.**
+`crates/gascan-apple/tests/live/resources.rs:76-79` reserves an ephemeral port by binding
+`127.0.0.1:0` and dropping the listener, then maps it to a fixed guest `8080` (`common/mod.rs:55`). Here
+the guest port is forced equal to the host port, so **the reserved port must be written into
+`gascan.toml`'s `[ports]` and the in-guest responder must listen on that same port** — `nc -l -p <the
+reserved port>`, not `8080`. An implementer who copies `guest_argv` unchanged gets a container listening
+on 8080 while the engine publishes the reserved port, and the test fails for a reason that looks like a
+publishing bug and is not.
+
+`policy_request` (`:168-199`) writes a two-line manifest today; it needs a `[ports]` table and a
+parameter for the port. Keep it the only construction path — the comment at `:159-161` records why
+(`CreateRequest`'s fields are `pub(crate)` and it derives no `Deserialize`), and that reason still holds.
+
+**The proof of publication is the one from START-HERE and nothing weaker**: `Create` with a
+`PortMapping`, `Start`, then connect to `127.0.0.1:<port>` **from the test process** and read a response
+the guest produced. `Inspect` cannot serve — it reports what the store holds, including bindings never
+published (Landing 3). This test is the only instrument that sees past the three silent gates in the
+port-publishing chain above, and Task 14 may not flip `loopback_publish` until it exists and passes.
+
+#### **Task 11's offline-plus-ports refusal is NOT reachable from the live tier**
+
+`compile_ports:436-438` refuses `NetworkMode::Offline` with a non-empty `[ports]` as
+`PolicyError::OfflinePortsForbidden`, **before any request is built.** Gas Can's policy compiler already
+forbids the combination Task 11 teaches the engine to refuse, and `policy_request` is the only way the
+live tier can make a `CreateRequest`.
+
+**Do not try to test that refusal from the live tier, and do not weaken `policy_request` to make it
+possible.** The engine's refusal is defence in depth against a *non-Gas-Can* client, it is already pinned
+by an Arca-side test from Task 11's fix round 1, and that is the right place for it. Record this in the
+task, because "the engine refuses X" plus "the live tier does not cover X" reads as a gap and is not one.
+
+This also sharpens the contract defect START-HERE routes to milestone 4: the proto permits
+offline-plus-ports, Gas Can's compiler forbids it, and Arca's engine refuses it — **three components
+already agree, and only the proto is silent.** That is an argument for writing the rule into
+`engine.proto`, not for leaving each engine to decide.
+
+#### Task 13 — the live tier
+
+1. **Spawn first, and prove the spawn before writing any RPC test.** Add the two variables, pass all four
+   options, and get one existing ignored test (`a_real_engine_accepts_the_placeholder_authority`) green
+   against a **branch-built** engine. Record the command and the output. Until that passes, every test
+   below is unrunnable and unreviewable.
+2. **Then** create → start → inspect → stop → remove over a real socket.
+3. The partial-failure case, asserting the **contents** of `CreateFailed.created`, not that it is
+   non-empty — the collection-assertion defect shape Task 8's review measured.
+4. The published-port test, per the section above. **This is the landing's load-bearing test.**
+5. Register every new test in `tests/ci/expected-ignored-tests.txt`, sorted. `ci-check-ignored-tests.sh:23`
+   derives the actual set with `cargo test --workspace -- --ignored --list` piped through
+   `sed -n 's/: test$//p' | sort` and diffs it **both ways**, so an unregistered addition and a vanished
+   test both fail. The file is a flat sorted list of `module::test` names across the whole workspace — it
+   held 26 entries at `4ae9aa9`.
+
+**An image must be in the engine's private store before `Create` can succeed, and this plan has not said
+how it gets there.** Task 9 shipped `arca-engine image load --oci-layout <dir>`; the engine's state root
+is created fresh per test by `common/mod.rs:47-50`. **A best reading, NOT verified — confirm before
+relying on it:** the tier must run `image load` against the same `--state-root` before or after spawning,
+and needs an OCI layout of a small image carrying a shell and `nc`. Establish this **first**, alongside
+step 1 — if it does not work, every lifecycle test in this landing is blocked, and that is worth
+discovering in an hour rather than in a fix round.
+
+#### Task 14 — capability flips
+
+The four flips are **not contiguous** — `projectMount` `:102`, `namedVolumes` `:103`, `loopbackPublish`
+`:106`, `resourceLimits` `:107`, with `tty` `:104` and `signals` `:105` **in between them and staying
+false**, and `offline` at `:108`. Editing a range rather than four lines is how `tty` and `signals` get
+flipped by accident. The comment at `:81-88` already records that every flag is still false deliberately
+and that `loopback_publish` "is exactly the claim this build cannot support".
+
+`project_mount`, `named_volumes`, `loopback_publish`, `resource_limits` become true. `tty` and `signals`
+stay false (milestone 3); `offline` stays `ISOLATION_UNVERIFIED` (milestone 4).
+
+**A flag flips only when a live test drives the capability it names**, and for `loopback_publish` that
+means the connect-from-the-test-process test of Task 13, passing, in a recorded run. A flag set ahead of
+its test is a claim with no instrument — and here the machinery behind the flag has three documented ways
+to silently do nothing.
+
+Note the client-side coupling: `policy.rs:414` refuses to compile a request declaring ports when the
+runtime does not claim `loopback_publish`. The live tier's `policy_request` hardcodes every capability
+true (`common/mod.rs:187-196`) and so bypasses this, deliberately — **it does not test the gate, and
+must not be read as having tested it.**
+
+#### Task 15 — the workspace suite, run alone
+
+Unchanged from the outline below, with one addition learned this session: `pgrep -fl "cargo test"`
+returning a hit does **not** mean the process is yours. On 2026-08-14 the hit was another Claude session's
+`cargo test --workspace` under `capsule-os-worktrees/worker`, reached through `herdr`. **Read the ancestry
+with `ps -o pid,ppid,command`, never `pkill`, and wait.**
+
+### Landing 5 — original outline, superseded by the expansion above
 
 **Task 13 — live tier.** `crates/gascan-arca/tests/live/` gains create → start → inspect → stop → remove over a real socket, a partial-failure case asserting `CreateFailed.created`, and `Inspect` reporting real ports. Every test `#[ignore]`d with a reason and registered in `tests/ci/expected-ignored-tests.txt`, or `scripts/ci-check-ignored-tests.sh` fails in either direction.
 
