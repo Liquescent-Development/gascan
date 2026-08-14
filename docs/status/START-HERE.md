@@ -265,6 +265,52 @@ image-load seam) and `1726c77` (Task 12's routed findings). Read that section of
 Remaining: **Task 13** the live tier, **Task 14** the capability flips, **Task 15** the workspace suite
 run alone.
 
+### BLOCKED SINCE ~21:45 ON 2026-08-13 — THE HOST STOPPED GRANTING vmnet NETWORKS
+
+**`Error: failed to create vmnet network with status vmnet_return_t(rawValue: 1001)`**, and the engine
+exits before binding a socket. **Every live test is blocked behind this**, so the rest of Task 13 cannot
+proceed until it clears. **The fix is almost certainly a reboot, which is the maintainer's call.**
+
+**IT IS 1001, NOT 1002 — DO NOT DIAGNOSE IT AS THE SIGNING TRAP.** This file records 1002 (the SDK's
+`VMNET_MEM_FAILURE`) as the *unsigned binary* failure. This is a different value, and the binary is
+signed: `codesign -d --entitlements -` reports `com.apple.security.virtualization = true`. It is also
+not the test harness — it reproduces running the engine straight from a shell with the same four
+options, dying at `Initializing Containerization.ContainerManager`, where `initialize()` constructs
+`VmnetNetwork()`.
+
+**SETTLED BY A CONTROLLED COMPARISON, NOT BY ARGUMENT.** A-then-B on a drifting machine proves nothing,
+so the pre-13a engine was built at `9db2f7d` in a worktree and both binaries were run **interleaved in
+one window**:
+
+```
+round1 pre-13a (9db2f7d): VMNET FAIL -> vmnet_return_t(rawValue: 1001)
+round1 current (07f62b9): VMNET FAIL -> vmnet_return_t(rawValue: 1001)
+round2 pre-13a (9db2f7d): VMNET FAIL -> vmnet_return_t(rawValue: 1001)
+round2 current (07f62b9): VMNET FAIL -> vmnet_return_t(rawValue: 1001)
+```
+
+`9db2f7d` started engines successfully all evening, including the run that created the first container.
+**So the host is the cause and Tasks 13a and 13b are exonerated. Do not bisect this further.**
+
+Ruled out, each measured: no `arca-engine` processes (`ps aux`); no leaked interfaces (`ifconfig -l`
+shows only `bridge0`); Apple's container daemon not running (`container system status` →
+`apiserver is not running and not registered with launchd`); not transient (four consecutive attempts,
+each failing in ~0.15s); no `/var/db/vmnet*` or `dhcpd_leases`; 203 GB free.
+
+**Working hypothesis: host vmnet subnet exhaustion across the session.** Every engine start creates a
+`host` network with an **auto-allocated** subnet — `192.168.93.0/24`, `.95` and `.119` were observed —
+and roughly fifteen engines were started. The pool is per-boot.
+
+The worktree at `/tmp/arca-pre13a` is left in place so the comparison can be re-run cheaply after a
+reboot; if both binaries then listen, the diagnosis is confirmed from both directions. Remove it with
+`git worktree remove /tmp/arca-pre13a`. It needed `git submodule update --init --recursive` to build —
+`containerization` is a submodule at `f02cdf9`.
+
+**What is NOT blocked:** anything Arca-side and VM-free, and any Gas Can work that does not spawn a
+serving engine — **including the OCI-layout writer the published-port test needs**, which is pure file
+construction and can be exercised against `arca-engine image load`, a subcommand that binds no socket,
+starts no VM and needs no vmnet.
+
 ### Task 13's first hour is DONE. Both steps came back, and step 2 cost two Arca fixes.
 
 **Do not redo this.** Steps 1 and 2 below are complete and recorded; step 3 is what remains.
