@@ -49,7 +49,11 @@ fn only_line<'a>(report: &'a str, section: &str) -> &'a str {
 /// allowance, which is the `cpuOverhead: 1` the sibling backend's own fixture
 /// records (`gascan-apple/tests/live/resources.rs:18`). MEASURED likewise, a
 /// 1GiB sandbox reports `MemTotal: 1125564 kB`, *larger* than the GiB it asked
-/// for, while a 3GiB one reports `3118360 kB`, smaller. VM sizing tracks the
+/// for, while a 3GiB one reports about `3118360 kB`, smaller. **`MemTotal` is
+/// not even stable across boots** -- Task 14's reviewer measured the 3GiB case
+/// at `3118352`, `3118360` and `3118364 kB` over four boots, which is the second
+/// reason it cannot be asserted on. The cgroup values below were exact and
+/// identical across all four. VM sizing tracks the
 /// request loosely and in both directions; the cgroup tracks it exactly,
 /// because the cgroup is the limit.
 ///

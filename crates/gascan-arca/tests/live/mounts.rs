@@ -71,6 +71,37 @@ async fn start_and_read(
     (created.created().to_vec(), GuestReport { text })
 }
 
+/// Waits for the guest to write `path` on the host side of the project mount.
+///
+/// The guest writes it at boot and the host has no signal for when that
+/// happened, so this polls. It exists so the guest -> host direction can be
+/// asserted **without** a working publish -- see the ordering note in
+/// `the_project_root_is_readable_in_the_guest_and_writable_back_to_the_host`.
+///
+/// The panic carries the last io error rather than just the path: "no such
+/// file" and "permission denied" are different findings, and a mount that
+/// appeared read-only would otherwise read as a mount that never appeared.
+async fn await_host_file(path: &Utf8Path, bound: Duration) -> String {
+    let started = std::time::Instant::now();
+    // Declared without an initialiser: every path through the match below
+    // assigns it before the assert reads it, and a placeholder here is a value
+    // no run can ever observe -- which clippy says, correctly.
+    let mut last;
+    loop {
+        match std::fs::read_to_string(path) {
+            Ok(text) if !text.trim().is_empty() => return text,
+            Ok(_) => last = String::from("present but empty"),
+            Err(error) => last = error.to_string(),
+        }
+        assert!(
+            started.elapsed() < bound,
+            "the guest wrote nothing back to {path} within {:.1}s; last attempt: {last}",
+            bound.as_secs_f64()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// Stops and removes what [`start_and_read`] made.
 ///
 /// Not a `Drop`: a sandbox left running holds a virtual machine, `Remove`
@@ -126,10 +157,19 @@ async fn tear_down(
 ///
 /// **It shares `ports.rs`'s dependency on a working publish for the read half**,
 /// because a published port is the only channel out of an Arca guest this build
-/// has -- see `common::answering`. The write half is the independent one.
-/// MEASURED: with `translate.rs`'s `ports:` emptied, this test fails with
-/// `Connection refused` alongside `ports.rs` and `limits.rs`, so a publish
-/// regression reddens four tests and `ports.rs` is the one that names the cause.
+/// has -- see `common::answering`. MEASURED: with `translate.rs`'s `ports:`
+/// emptied, this test fails with `Connection refused` alongside `ports.rs` and
+/// `limits.rs`, so a publish regression reddens four tests and `ports.rs` is the
+/// one that names the cause.
+///
+/// **The write half does NOT depend on a publish, and is asserted FIRST so that
+/// it genuinely does not.** CORRECTED after review: this comment used to call it
+/// "the independent one" while the code read it *after* `read_from_loopback`,
+/// so a publish outage panicked before it ever ran. Independent in what it
+/// observes is not independent in whether it executes, and the reviewer proved
+/// the difference by emptying `binds` at the engine's own `createContainer` call
+/// site -- the test died on `Connection refused` and never reached the disk
+/// assertion at all.
 ///
 /// **SEEN TO FAIL, twice, and the second one is what earns it a place.**
 ///
@@ -190,21 +230,43 @@ async fn the_project_root_is_readable_in_the_guest_and_writable_back_to_the_host
 
     std::fs::write(host_root.join(TO_GUEST), &token).expect("the host must seed the project root");
 
-    let (created, report) = start_and_read(&backend, &request, port).await;
-    tear_down(&backend, &request, created).await;
-    assert_eq!(
-        report.text.trim(),
-        token,
-        "the guest must serve the bytes the host wrote into the project root"
-    );
+    let created = backend
+        .create(request.clone())
+        .await
+        .expect("create must succeed against a seeded store");
+    backend
+        .start(request.id())
+        .await
+        .expect("start must boot the sandbox");
 
-    let written = std::fs::read_to_string(host_root.join(FROM_GUEST)).unwrap_or_else(|error| {
-        panic!("the guest wrote nothing back to {host_root}/{FROM_GUEST}: {error}")
-    });
+    // THE GUEST -> HOST DIRECTION IS ASSERTED FIRST, AND THE ORDER IS THE POINT.
+    //
+    // It used to run after `read_from_loopback`, which made it unreachable
+    // whenever publishing broke: the loopback read panics, and the direction
+    // that needs no publish at all never got tested. MEASURED by Task 14's
+    // reviewer -- with `binds` emptied at the engine's `createContainer` call
+    // site the test died on `Connection refused` and never reached this
+    // assertion. An instrument that only runs when an unrelated capability is
+    // healthy is not independent, however independent what it observes may be.
+    //
+    // Polled rather than read once, because the guest writes this at boot and
+    // the host has no signal for when that happened. This is the only wait in
+    // the test that is not a publish.
+    let written = await_host_file(&host_root.join(FROM_GUEST), Duration::from_secs(180)).await;
     assert_eq!(
         written.trim(),
         MARK,
         "a writable project mount must carry the guest's write back to the host"
+    );
+
+    let report = GuestReport {
+        text: read_from_loopback(port, Duration::from_secs(180)).await,
+    };
+    tear_down(&backend, &request, created.created().to_vec()).await;
+    assert_eq!(
+        report.text.trim(),
+        token,
+        "the guest must serve the bytes the host wrote into the project root"
     );
 
     engine.kill().await;
@@ -341,6 +403,19 @@ async fn the_managed_volumes_are_attached_to_the_guest_but_this_engine_mounts_no
             volume.name
         );
     }
+
+    // POSITIVE CONTROL, and this test is worthless without it. Every assertion
+    // below turns on `mount_at` returning `None`, so a `mounts` section that
+    // came back empty -- a guest command edited to stop emitting it, a parser
+    // that silently matched nothing -- would pass all three vacuously and
+    // report a defect that no longer exists. Prove the instrument can see a
+    // mount before trusting it not to see three.
+    assert!(
+        report.mount_at("/").is_some(),
+        "the mount parser resolved nothing at /, so it can see no mounts at all \
+         and the absences below prove nothing. The guest reported:\n{}",
+        report.text
+    );
 
     for (target, _) in &expected {
         assert!(
