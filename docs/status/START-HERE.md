@@ -1023,6 +1023,24 @@ reduction.
   `signals` are the two capability flags still `false`, correctly, and this is what earns them.
   It also takes carried follow-ups (a) and (b) below. **It is Arca-side Swift plus live tests** —
   Gas Can's half is already built and tested, verified 2026-08-15 (design §2.1).
+- **Milestone 4 — and it now owns a MEASURED ENGINE DEFECT, ruled here 2026-08-15.**
+  **`arca-engine` dies with exit 143 if SIGTERM lands during startup**, in the window between
+  `bind` returning an already-listening server and `signal(number, SIG_IGN)` at
+  `ArcaEngineCommand.swift:381`. In that window the signal takes its default disposition and kills
+  the process; the engine's only deliberate exit is `Foundation.exit(status)` (`:339`) with 0 or 1,
+  so **143 = 128+15 can only ever mean this.** **MEASURED, forced rather than waited for:** spawning
+  the engine and signalling immediately gives **12/12** exit-143; signalling after the socket appears
+  plus 300ms gives **0/12**, interleaved in one process against one binary. Naturally it fires about
+  **2 in 440** and is load-dependent, which is why the live tier's `shutdown::…with_nothing_holding_
+  a_connection` arm goes red intermittently — that workload has zero slack between the connect
+  succeeding and the signal, while the other two build a transport or boot a VM first.
+  **It belongs to milestone 4 because the launchd plist is what makes it production-reachable**, and
+  **the fix is a design change, not a one-liner**: the handler closure captures the engine, and a
+  bare `SIG_IGN` before a resumed dispatch source would make a startup SIGTERM a silent no-op, which
+  is worse than dying. **A SECOND WINDOW IS REASONED AND NOT MEASURED** — between `signal(…,
+  SIG_IGN)` (`:381`) and `source.resume()` (`:447`) libdispatch has not yet registered the kevent, so
+  a signal there is lost outright and the tier would report `"the engine ignored SIGTERM"`, which
+  would read as a shutdown defect rather than a startup one.
 - **Milestone 4 — everything that makes it a product.** Daemon wiring and `BackendSelection::Arca`,
   the launchd plist, installer changes, `gascan doctor` surfacing engine facts, the offline proof that
   moves `offline` off `ISOLATION_UNVERIFIED`, the **pin bump** with its signed tag, and the decision on
@@ -1196,6 +1214,51 @@ in `docs/status/arca-integration-handoff.md`.
   `scripts/build-arca-engine.sh`.
 
 ## Traps that will cost you if you learn them the hard way
+
+### Added 2026-08-15, from milestone 3's first two tasks.
+
+**A SUBAGENT RUNNING `swift test` IN ARCA SILENTLY BREAKS THE LIVE TIER FOR WHOEVER IS RUNNING IT.**
+`swift test` re-links `arca-engine` and re-signs it ad-hoc, **stripping the entitlements**, so a tier
+run in flight starts failing with `vmnet_return_t(rawValue: 1002)` — and this file's own trap says
+1002 means an unsigned binary, which is correct and which makes the diagnosis land on the wrong
+suspect. It cost two tier runs. **Two agents in one checkout collide over BUILD ARTIFACTS, not only
+over source**: `git status` was clean throughout, neither agent wrote a file the other touched, and
+the failure surfaced hundreds of engines away.
+**The rule is not "do not dispatch during a tier run" — that was tried and was too narrow. It is:
+send NOTHING to any agent while the tier runs, because a message wakes an idle agent and an awake
+agent builds. An idle agent is not a quiescent one.** Re-sign **unconditionally** before every tier
+run, **assert the entitlement is present** rather than trusting `codesign` to have exited 0, and
+capture the binary's mtime before and after so the cause identifies itself.
+
+**A NONDETERMINISM IS SETTLED BY FORCING IT, AND THIS IS THE CHEAPEST EXAMPLE THIS PROJECT HAS.**
+A 2-in-440 exit-143 flake in the live tier was turned into **12/12 vs 0/12** in about a minute by
+spawning `arca-engine` directly and varying only when SIGTERM was sent — no cargo, no VM, no test
+edit, both arms interleaved in one process against one binary. **Reach for the forced version before
+the bigger sweep.** A clean 440-engine re-run would have been weak evidence at that rate; the forced
+version is decisive.
+
+**CHECK THE INSTRUMENT BEFORE THE SUBJECT — TWICE MORE, BOTH NEARLY PRODUCING FALSE CONCLUSIONS.**
+A `git diff | grep | grep | grep` pipeline returned **empty** for a commit that provably changed
+three lines, which would have read as "no code changed at all"; redirecting the diff to a file and
+grepping that found them immediately, the same fix this file already records for `ps aux`. And a
+spike script used `status` as a shell variable — **read-only in zsh** — so it captured no exit codes
+at all and printed a tidy `0/12` and `0/12`, which read as *disconfirming* the hypothesis it was
+built to test. **A green figure you cannot account for is not a pass, and that applies to a figure of
+zero.**
+
+**A CLAIM CAN BE OVERTAKEN BY ITS OWN FIX.** A comment saying "this file is the only cover for X" was
+true when written and false within the same fix round, because that round closed the gap elsewhere.
+The correction then went one step too far and gave away a property nothing else had, and the
+re-correction over-claimed in a third direction. **All five instances came from editing a sentence to
+match a change rather than re-deriving what was true after it.** The instruction now written into the
+source is `Re-derive. Do not edit.`
+
+**A CITATION WHOSE RANGE STOPS MID-CLAIM UNDERSTATES RATHER THAN MISSTATES, WHICH IS WHY IT SURVIVES
+REVIEW.** Twice in one milestone: `runtime.rs:893-918` for a claim that ends at `:922`, and
+`NetworkManager.swift:297-338` for a function spanning `:297-358` whose third relevant line is at
+`:349`. The reader who follows a short range finds support and stops looking. **Check where the claim
+ends, not where the function starts.**
+
 
 ### Added 2026-08-14 late, from the shutdown fix.
 
