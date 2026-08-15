@@ -16,20 +16,23 @@ the merge.**
 
 ## Where the work is
 
-**P5.1 MILESTONE 2 IS COMPLETE. BOTH RULINGS CLOSED, BOTH REVIEW ROUNDS DONE, NOTHING OPEN — THE
-MERGE IS ALL THAT REMAINS**, and it has an order the section at the end of this file spells out
-(submodule first, or every clone breaks). All five landings, every task reviewed.
+**P5.1 MILESTONE 2 IS DONE AND MERGED — 2026-08-15.** Both rulings closed, both review rounds done,
+nothing open. Gas Can `main` at merge commit `e968ae1` (PR #71), Arca `main` at `b3ffdf5` (PR #57),
+submodule `containerization` at `3f68806` on `merge/upstream-main`, reachable from its own remote so a
+fresh clone resolves. **Both are true merge commits — two parents each, nothing squashed** — so the
+per-task history this file cites by SHA is intact. All five landings, every task reviewed.
 Twelve were planned; **nine** were added on maintainer rulings after a review, a spike or a
 measurement found something real — 3b, 3c, 6b, 13a, 13b, the two follow-ons that closed the rulings
 (**16** named volumes, **17** the shutdown crash), and the two review rounds over tasks 13-17 (**18**
 and **19**), which between them found a Critical, seven Importants and seventeen Minors in work that
-had shipped unreviewed. The table below is authoritative for which is which. **Nothing is merged and
-nothing is pushed. Do not start a new branch; continue on these three — Gas Can, Arca, and Arca's
-`containerization` submodule.**
+had shipped unreviewed. The table below is authoritative for which is which. **Everything is merged
+and pushed. Start the next piece of work on a fresh branch off `main`.**
 
 **What that means and does not mean.** The engine now creates, starts, inspects, stops and removes a
 real sandbox in a real VM, and a published port is reachable from a test process. **Both maintainer
-rulings are now closed on measurements.** What is left is the merge.
+rulings are closed on measurements, and both branches are merged.** What is left is milestone 3 --
+and one scoping question that has to be settled before it can be planned. See "what comes after the
+merge".
 
 ### The three things a new session most needs to know
 
@@ -191,6 +194,7 @@ The three RPCs still answering `unsupported_capability` are **`CreateContainer`,
 | 17 the shutdown crash, and the rate instrument — **follow-on, after the ruling** | `9fac267` | `3290af6` |
 | 18 the review of 13-17, and its 1 Critical / 6 Important / 7 Minor | `c68bd0a`, submodule `30b9c8f` | `53925e5` |
 | 19 the re-review of 18's fixes, and its 1 Important / 10 Minor | `8a26e15`, submodule `3f68806` | `455f328` |
+| — the merge | `b3ffdf5` (PR #57) | `e968ae1` (PR #71) |
 
 **Tasks 3b, 3c, 6b, 13a and 13b were not in the approved plan.** Each was added on a maintainer ruling
 after a review — or, for 13a, a controller spike — found something real: a `try?` that let
@@ -699,39 +703,32 @@ and both targets pass alone (28/28 and 25/25). The third run is exit 0 with zero
 signature. Load averages were 4.4-5.9 throughout, which is the condition this file records these
 failures scaling with. **Three of the three known root causes have now been seen on this machine.**
 
-### THE MERGE IS THE WHOLE OF WHAT REMAINS
+### THE MERGE IS DONE — 2026-08-15, and the order it needed is worth keeping
 
-**Milestone 2 is implementation-complete, both rulings are closed, and both rounds of review are
-done. Nothing is open. Three repositories are unmerged and unpushed**, and they have an order:
+| | branch | merged as |
+|---|---|---|
+| submodule `containerization` | `merge/upstream-main` @ `3f68806` | pushed, not a PR — it is a fork branch |
+| Arca | `feat/engine-state-ownership`, 46 commits | `b3ffdf5`, PR #57 |
+| Gas Can | `docs/p5-1-milestone-2-design`, 48 commits | `e968ae1`, PR #71 |
 
-| | branch | at | ahead of `main` |
-|---|---|---|---|
-| 1. submodule `containerization` | `merge/upstream-main` | `3f68806` | 3 commits, `ca47c87`..`3f68806` |
-| 2. Arca | `feat/engine-state-ownership` | `8a26e15` | 46 |
-| 3. Gas Can | `docs/p5-1-milestone-2-design` | — read with `git log -1` | 48 |
+**THE SUBMODULE HAD TO GO FIRST, and it will again.** Arca's tree records a `containerization`
+pointer; merged before that commit is reachable on
+`git@github.com:Vas-Solutus/arca-containerization.git`, Arca's `main` names a submodule revision
+nobody can fetch and every clone breaks at `git submodule update --init --recursive`. Verified after
+the fact: `git ls-tree origin/main containerization` is `3f68806`, and
+`git branch -r --contains 3f68806` in the submodule lists `origin/merge/upstream-main`.
 
-**THE SUBMODULE MUST BE PUSHED FIRST.** Arca's tree records a `containerization` pointer at
-`3f68806`; pushed before that commit is reachable on its own remote
-(`git@github.com:Vas-Solutus/arca-containerization.git`), Arca's `main` names a submodule revision
-nobody else can fetch, and every clone breaks at `git submodule update`.
+**Merge commits, never squash.** `allowed_merge_methods` is `["merge"]`, and both landed with two
+parents. A squash would have destroyed the per-task history dozens of sections here cite by SHA.
 
-```bash
-cd ~/code/arca/containerization && git push origin merge/upstream-main
-cd ~/code/arca             && git push -u origin feat/engine-state-ownership
-cd ~/code/gascan           && git push -u origin docs/p5-1-milestone-2-design
-```
-
-Then one PR per repository, **merged with a merge commit and never squashed** —
-`allowed_merge_methods` is `["merge"]`, and squashing a 46-commit branch would destroy the per-task
-history every section of this file cites by SHA.
-
-**EXPECT CI'S `engine` JOB TO BE RED, AND DO NOT FIX IT.** `./scripts/build-arca-engine.sh` exits 70
-against the current pin **by design**: the gate now requires `ArcaTests.NetworkPruneGateTests`, which
-`gascan-engine-m1.1` / `b3390b8` does not carry. **The pin bump belongs to milestone 4** and needs a
-signed tag carrying Arca `fede19c`. Bumping it to an untagged or mid-branch revision buys a green
-check by giving up the trust model `engine/allowed-signers` exists to enforce. `ci / gate` is not a
-required check and does not block merging (VERIFIED 2026-08-12, ruleset `20492137`, zero
-`required_status_checks`), and Arca has no CI at all.
+**Gas Can's PR read `mergeable=MERGEABLE, mergeStateStatus=UNSTABLE` and merged anyway**, exactly as
+PR #69 did: `ci / gate` is not a required check (ruleset `20492137` carries zero
+`required_status_checks`), and **CI's `engine` job is red by design** —
+`./scripts/build-arca-engine.sh` exits 70 because the gate now requires
+`ArcaTests.NetworkPruneGateTests`, which the pinned `gascan-engine-m1.1` / `b3390b8` does not carry.
+**Do not bump the pin to make it green.** The bump belongs to milestone 4 and needs a signed tag
+carrying Arca `fede19c`; a pin moved to an untagged or mid-branch revision buys a green check by
+giving up the trust model `engine/allowed-signers` exists to enforce. Arca still has no CI at all.
 
 ## The superseded plan for Landing 5, kept for its reasoning
 
