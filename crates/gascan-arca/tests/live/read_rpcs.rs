@@ -13,7 +13,7 @@ async fn backend(engine: &LiveEngine) -> ArcaBackend<gascan_arca::ChannelTranspo
 
 /// What the engine claims, read over the wire, flag by flag.
 ///
-/// **The four negatives are as load-bearing as the three positives, and this
+/// **The three negatives are as load-bearing as the four positives, and this
 /// test exists mostly for them.** A flag that turns true before its capability
 /// works makes `PolicyCompiler` compile a request the engine cannot honour --
 /// `policy.rs` gates on what the runtime CLAIMS, refusing with
@@ -22,22 +22,20 @@ async fn backend(engine: &LiveEngine) -> ArcaBackend<gascan_arca::ChannelTranspo
 /// that comes up wrong.
 ///
 /// **Nothing here corroborates a single flag.** It reads what the engine says.
-/// What makes the three positives honest is elsewhere in this tier, and each
+/// What makes the four positives honest is elsewhere in this tier, and each
 /// one names its instrument:
 ///
 /// - `bind_mounts` (`project_mount` on the wire; see `translate.rs:323`, the
 ///   same capability under two names) by
 ///   `mounts::the_project_root_is_readable_in_the_guest_and_writable_back_to_the_host`.
+/// - `named_volumes` by
+///   `mounts::the_managed_volumes_are_mounted_at_their_declared_targets_and_writable`.
 /// - `loopback_publish` by `ports::a_published_port_is_reachable_from_the_test_process`.
 /// - `resource_limits` by
 ///   `limits::the_requested_cpu_and_memory_limits_are_the_guests_own_cgroup_limits`.
 ///
 /// And each negative names why it is one:
 ///
-/// - `named_volumes` by
-///   `mounts::the_managed_volumes_are_attached_to_the_guest_but_this_engine_mounts_none_of_them`,
-///   which measures the engine attaching all three volumes as block devices and
-///   mounting none of them.
 /// - `tty` and `signals` are milestone 3's, with `Exec` --
 ///   `every_unimplemented_method_answers_unsupported_capability_not_a_transport_fault`
 ///   below still lists it among the three this build refuses.
@@ -49,6 +47,13 @@ async fn backend(engine: &LiveEngine) -> ArcaBackend<gascan_arca::ChannelTranspo
 /// milestone 2, and milestone 4 has no authority to turn on `named_volumes`,
 /// `tty` or `signals`, which belong to an Arca fix and to milestone 3. What
 /// milestone 4 owns is `offline`.
+///
+/// `named_volumes` moved fourth, when Arca stopped identifying its OverlayFS
+/// block devices by counting `/dev/vd` letters and started reading a role out of
+/// each image's ext4 volume label. The negative that held it down --
+/// `the_managed_volumes_are_attached_to_the_guest_but_this_engine_mounts_none_of_them`
+/// -- failed on that build, exactly as its message said it would, and its
+/// replacement is the positive named above.
 #[tokio::test]
 #[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN"]
 async fn capabilities_report_only_what_this_engine_build_implements() {
@@ -56,7 +61,7 @@ async fn capabilities_report_only_what_this_engine_build_implements() {
     let capabilities = backend(&engine).await.capabilities().await.unwrap();
 
     assert!(capabilities.bind_mounts);
-    assert!(!capabilities.named_volumes);
+    assert!(capabilities.named_volumes);
     assert!(!capabilities.tty);
     assert!(!capabilities.signals);
     assert!(capabilities.loopback_publish);
