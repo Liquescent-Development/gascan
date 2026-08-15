@@ -1024,11 +1024,18 @@ reduction.
   It also takes carried follow-ups (a) and (b) below. **It is Arca-side Swift plus live tests** —
   Gas Can's half is already built and tested, verified 2026-08-15 (design §2.1).
 - **Milestone 4 — and it now owns a MEASURED ENGINE DEFECT, ruled here 2026-08-15.**
-  **`arca-engine` dies with exit 143 if SIGTERM lands during startup**, in the window between
-  `bind` returning an already-listening server and `signal(number, SIG_IGN)` at
-  `ArcaEngineCommand.swift:381`. In that window the signal takes its default disposition and kills
-  the process; the engine's only deliberate exit is `Foundation.exit(status)` (`:339`) with 0 or 1,
-  so **143 = 128+15 can only ever mean this.** **MEASURED, forced rather than waited for:** spawning
+  **`arca-engine` dies with exit 143 if SIGTERM lands during startup.** **CORRECTED within the hour
+  by Task 2's implementer, and the first version of this entry understated it in exactly the way the
+  citation trap below describes.** The window is **not** bind-to-`SIG_IGN`: SIGTERM's disposition is
+  default from `exec`, so **the whole of startup is inside it** — argument validation, the vminit
+  load, and all three `initialize()` calls including the one that constructs a real `VmnetNetwork`.
+  Bind-to-`SIG_IGN` is merely the part a *client* can observe, because no socket exists before bind;
+  the forced spike's "immediately after spawn" arm was hitting the large part, not the sliver. The
+  window closes at `signal(number, SIG_IGN)` — **re-derive that line rather than trusting a number
+  here; it has already moved once, from `:381` to `:434`, under a comment-only commit.** In the
+  window the signal takes its default disposition and kills the process; the engine's only deliberate
+  exit is `Foundation.exit(status)` with 0 or 1, so **143 = 128+15 is always the kernel and never the
+  engine** — and it is not the pre-fix 133. **MEASURED, forced rather than waited for:** spawning
   the engine and signalling immediately gives **12/12** exit-143; signalling after the socket appears
   plus 300ms gives **0/12**, interleaved in one process against one binary. Naturally it fires about
   **2 in 440** and is load-dependent, which is why the live tier's `shutdown::…with_nothing_holding_
