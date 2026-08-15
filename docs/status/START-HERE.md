@@ -430,14 +430,22 @@ block device's size behind it, and a write and readback, with `/home/workspace` 
 NOT be a mount point. The capacities stay unequal (256 MiB / 512 MiB / 1 GiB) so a volume mounted at
 another's target is caught by size. The old negative test is deleted.
 
+**ITEM 1 BELOW WAS RIGHT, AND A REVIEWER TURNED IT INTO A CRITICAL. IT IS NOW FIXED** — see the review
+section at the end of this file. The stale-layer-cache hazard was real, the documented mitigation named
+**the wrong directory**, and the live tier **structurally could not see it**. The list is kept as
+written because predicting it and then not chasing it is the lesson.
+
 **FOUR THINGS WERE NOT VERIFIED and are the first place to look if this misbehaves:**
 
 1. **A stale layer cache.** Every run used a fresh temp layout, so freshly-labelled layers. Layer images
    under `~/.arca/layers/{digest}/layer.ext4` written *before* this change carry no label and the new
    guest ignores them. Both commit messages say to clear that directory; **nobody has exercised what
    happens if you do not.** This is the most likely thing to bite in real use.
+   — **CLOSED. The cache is now validated on every hit rather than trusted, so an unlabelled entry
+   costs one unpack instead of a silently wrong rootfs.**
 2. **The two new `exit(1)` paths in `ArcaBoot`** — an unreadable superblock, and "more than one
-   `arca.writable` device" — are on the container boot path and were never driven.
+   `arca.writable` device" — are on the container boot path and were never driven. **A third has been
+   added since, and is equally undriven: a writable device present with no layers.**
 3. **Two of the three mutations the implementer claimed** (widening the OCI filter back; swapping
    capacities at the `createContainer` handoff) were not independently reproduced. The load-bearing one
    was.
@@ -535,6 +543,90 @@ a real process besides. `ArcaEngineTests` is 151 passing before and after, which
    change was not.
 4. **Nothing measured a client with an actually in-flight RPC** across a shutdown. Every held
    connection here was idle.
+
+### THE REVIEW OF TASKS 13-17, AND WHAT IT CHANGED — 2026-08-14 (late)
+
+**Tasks 13 through 17 shipped with no independent review** — the SDD ledger holds review artefacts
+through task 12 and stops, 13a/13b were controller adjudications, and 17 had none at all. Two Opus
+reviewers were dispatched, partitioned by repository so they could not collide on each other's build
+locks, with the live tier reserved for the controller because it needs both repos at once. **Neither
+came back clean.** Arca: 1 Critical, 2 Important, 1 Minor. Gas Can: 4 Important, 6 Minor.
+
+**Every finding below is fixed.** Reports are in the session scratchpad; the durable content is here.
+
+**THE CRITICAL WAS THE ONE THIS FILE PREDICTED AND DID NOT CHASE.** The list above says a stale layer
+cache "is the most likely thing to bite in real use", and it was:
+
+- `OverlayFSUnpacker` writes the role label only where it FORMATS a layer, and it formats only on a
+  cache MISS. So the cache-HIT branch returned pre-label images unexamined, the guest's classifier
+  dropped them with `is not an Arca role, leaving it alone`, and the rootfs was built from a subset of
+  its image — or from none of it, with `Start` still succeeding. **A stale image is a perfectly valid
+  ext4 filesystem, which is why nothing refused it: the only thing wrong with it is an absence.**
+- **The documented mitigation named the wrong directory.** "Clear `~/.arca/layers`" is ArcaDaemon's
+  cache; the engine's is `<state-root>/layers` (`EnginePaths.layerCache`). An operator following it
+  would have cleared a directory the engine never reads.
+- **The live tier structurally could not catch it.** Every live engine gets a fresh temp state root, so
+  every layer is always a cache miss. `1d453cf`'s green 14/14 was fully consistent with the defect.
+
+Fixed by validating the label on every cache hit and reformatting what fails — a 16-byte superblock
+read, not a scan. `ArcaBlockDeviceRole.role(ofImageAt:)` is the predicate, and
+`LayerCacheRoleTests` (4 tests) drives it against real formatted images; **mutating it to trust the
+cache fails all four**. The guest also stops degrading silently: a writable device with no layers is now
+`exit(1)` rather than a container booted on the wrong rootfs. **Nothing drives that path** and it says
+so in place. **Checked on this machine: no layer cache exists at all, so nothing was mis-mounting here.**
+
+**BOTH REVIEWERS INDEPENDENTLY FOUND THE SAME DEFECT IN TASK 17, FROM OPPOSITE SIDES.** The engine
+exited `EXIT_SUCCESS` both when a drain completed and when it gave up at the ten-second grace, so
+`shutdown.rs` — which counts `!status.success()` — could not tell 96 completed drains from 96 that
+timed out, **in the instrument that produced the fix's own numbers.** The grace path now exits **1**
+and the operator's escalation still exits **0**; MEASURED, three for three and two for two. That is one
+byte and one guard, deliberately not a second timing assertion beside it: a gate two places enforce is a
+gate no test measures.
+
+**THE HANG THIS FILE RECORDED AS AN ACCEPTED LIMIT WAS RATED IMPORTANT, AND THE REVIEWER WAS RIGHT.**
+Nothing but the first signal completed `quiesced`, so a listening socket closing for any other reason
+left the process waiting forever **while holding the flock** — which is exactly what makes
+`EngineServer.start` refuse the path to a successor. An engine that can neither serve nor be replaced is
+worse than the exit it replaced. It now logs and exits non-zero. Reachability is still unmeasured.
+
+**A CLAIM OF MINE WAS FALSIFIED BY A REVIEWER WRITING THE TEST I SAID COULD NOT BE WRITTEN.** `serve()`
+carried, in bold, "NOTHING IN THIS REPOSITORY CAN PROVE ANY OF IT". The reviewer wrote a probe against
+`EngineServer.start` and `SandboxEngineService.forTesting()` and ran it **20 times, 20 passes**. The
+accept race I cited is real but it is *setup, not assertion*, and it fails safe. The comment now states
+the narrower truth: **the premise is provable here and is not yet pinned; the call site is not, and
+privacy was never what stopped it** — `EngineProcess.swift` already spawns this binary — **vmnet is.**
+
+**CARRIED, NOT DONE:** adopting that probe permanently, and moving the shutdown wait out of the
+executable into `ArcaEngine` (`runUntilQuiesced`) so task 17 gets the fails-before/passes-after test it
+still lacks. Both were scoped out deliberately. **Reverting `9fac267` still leaves `swift test` at 155
+passing**, and Gas Can's live tier remains the only thing that catches it.
+
+**THE SAMPLE SIZE WAS JUSTIFIED WITH A RATE TWO OF THE THREE WORKLOADS DO NOT HAVE.** `ITERATIONS = 32`
+was argued from the original mixed 19%; the per-workload pre-fix rates are 1/96, 5/96 and 12/32, and at
+1/96 a sweep of 32 comes up clean **71% of the time against a broken engine** — worse than the sweep of
+5 the same comment rejected. Each workload now gets the count that puts a false green under 1% against
+its own rate: **440 / 96 / 32**. Re-measured after the fix: **0/440, 0/96, 0/32**, 568 engines, and
+because the grace path now exits non-zero those zeros mean the drains *completed*.
+
+**Two smaller corrections worth keeping.** `shutdown.rs` claimed its three workloads were a controlled
+comparison rather than A-then-B; they are three tests in one binary that run strictly in sequence, so
+they are the regression guard and the interleaved comparison lives in the commit messages. And
+`41ac39a`'s message says the tier is "12 carrying `#[ignore]` and 2 running in ordinary CI" — it is
+**11 and 3** (`connect.rs` has two non-ignored tests, plus `supervision`). Commit messages are
+immutable; the correction lives here.
+
+**Verified after every fix, both trees clean:**
+
+| | |
+|---|---|
+| `swift test --filter ArcaEngineTests` | `Executed 155 tests, with 0 failures` — 151 plus `LayerCacheRoleTests` |
+| `swift test --filter ArcaTests.NetworkPruneGateTests` | `Executed 3 tests, with 0 failures` |
+| the live tier, `-- --ignored --test-threads=1` | **14 passed / 0 failed**, 214s, 568 engines stopped |
+| `cargo test --workspace --no-fail-fast` | exit 0 — **1436 / 0 / 36 across 74 targets** |
+| `cargo fmt --all --check`, `clippy --workspace --all-targets`, the ignored gate | clean |
+
+**The guest was rebuilt** (`make vminit-rebuild`, **42 seconds**, confirming the 41s on record and not
+the "20-25 minutes" this file once predicted), so the live tier's 14/14 measures the new `ArcaBoot`.
 
 ### THE MERGE IS THE WHOLE OF WHAT REMAINS
 

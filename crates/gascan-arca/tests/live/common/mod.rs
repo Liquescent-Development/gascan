@@ -80,8 +80,16 @@ pub fn base_oci_layout() -> Utf8PathBuf {
 /// /tmp/gascan-arca-live-23172-0/engine.sock`, in 0.26s.
 ///
 /// `SIGTERM` and no escalation, because escalation would need a `sleep` this
-/// wrapper cannot reliably reap. MEASURED: `arca-engine` exits **0.00s** after
-/// `SIGTERM`, with status 1.
+/// wrapper cannot reliably reap.
+///
+/// **This used to end "MEASURED: `arca-engine` exits 0.00s after `SIGTERM`,
+/// with status 1", and that had gone stale in a way that mattered.** It
+/// described a build with no graceful-shutdown path at all. If it were still
+/// true, [`LiveEngine::kill`]'s assertion would fail every test in this tier,
+/// every run. MEASURED against the current engine instead: one `SIGTERM` exits
+/// **0** once the accepted connections have drained, **1** if they have not
+/// drained within the engine's ten-second grace, and a crash arrives here as
+/// **133**. The wrapper propagates each verbatim -- see the `wait` note below.
 ///
 /// **What this does NOT guarantee**, and each of these leaks an engine exactly
 /// as before: the wrapper itself being `SIGKILL`ed, a `kill -9` delivered to

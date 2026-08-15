@@ -8,14 +8,22 @@
 //! the whole distribution, so the number it prints is a rate rather than a
 //! sample.
 //!
-//! **The three workloads are a controlled comparison and not three copies of one
-//! test.** The defect was reported as happening "once containers have been
-//! created", and that description names a correlate rather than a cause. These
-//! vary one thing at a time -- whether anything ever connected, whether a client
-//! channel is still open when the signal lands, and whether a container was
-//! created and removed first -- so a rate that differs between them says which
-//! of the three is load-bearing. Running them A-then-B on a drifting machine
-//! would not: each is its own single run of its own `iterations`.
+//! **The three workloads are a REGRESSION GUARD, not the comparison that
+//! produced the finding**, and an earlier version of this paragraph claimed
+//! otherwise. It said they were "a controlled comparison ... running them
+//! A-then-B on a drifting machine would not [say which variable is
+//! load-bearing]" -- but they are three `#[tokio::test]` functions in one
+//! binary, and run the documented way they execute strictly one after another
+//! over tens of minutes, which is A-then-B exactly. The comparison that
+//! disproved "it only happens once containers have been created" interleaved
+//! two engine BINARIES by hand, round by round; it is recorded in Gas Can
+//! `3290af6` and Arca `9fac267`, and nothing in this file reproduces it.
+//!
+//! What the three do give, independently and without needing to be compared, is
+//! coverage of the conditions the defect was thought to require: no held
+//! connection, a held client channel, and a container created and removed. Each
+//! passes or fails on its own rate. Re-deriving the comparison would need one
+//! test that interleaves the workloads round-robin inside a single loop.
 //!
 //! **They are deliberately not `#[ignore]`-free and not fast.** The container
 //! workload boots a real virtual machine per iteration.
@@ -39,22 +47,17 @@ const TAG: &str = "gascan-live-shutdown:latest";
 /// under test.
 const MANIFEST: &str = "version = 1\nnetwork = 'networked'\nuser = 'root'\n";
 
-/// How many engines each test stops.
-///
-/// **32 is the recorded baseline's own denominator**, so a zero here is directly
-/// comparable to the 6-in-32 that opened this. It is also enough for a zero to
-/// mean something: at the recorded 19% a clean sweep of 32 happens 0.11% of the
-/// time, where a sweep of 5 happens 37% of the time and would prove nothing.
-const ITERATIONS: usize = 32;
-
 /// What one engine is put through before its pipe closes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Workload {
-    /// Started and stopped, with nothing holding a connection.
+    /// Started and stopped, with nothing deliberately holding a connection.
     ///
-    /// Not "nothing ever connected": `await_socket` dials the engine to decide
-    /// it is up and drops each probe, so even this engine has accepted and
-    /// closed connections. What it has never had is one still open.
+    /// Not "nothing ever connected", and not even "nothing still connected":
+    /// `await_socket` dials the engine to decide it is up and drops each probe,
+    /// and nothing here waits for the engine to finish reaping the last one
+    /// before the signal lands. So this workload is *no connection is held on
+    /// purpose*, which is weaker than the name suggests and is why its measured
+    /// pre-fix rate (1/96) is the lowest of the three.
     Untouched,
     /// A client channel opened and still held when the signal lands.
     OpenChannel,
@@ -64,6 +67,40 @@ enum Workload {
     /// the tests the 6-in-32 was measured across do: `ports.rs` and
     /// `lifecycle.rs` both remove before they kill.
     RemovedContainer,
+}
+
+impl Workload {
+    /// How many engines this workload stops, and it differs per workload
+    /// because the rates do.
+    ///
+    /// **A sample size is only justified against the rate it has to detect, and
+    /// one number for all three was wrong.** The figure this file used to carry
+    /// -- 32, because "at the recorded 19% a clean sweep of 32 happens 0.11% of
+    /// the time" -- took the ORIGINAL mixed observation (6-in-32) and applied it
+    /// to three workloads whose own measured pre-fix rates are 1/96, 5/96 and
+    /// 12/32. At 1/96 a sweep of 32 comes up all clean **71% of the time**,
+    /// against a broken engine: worse than the sweep of 5 that same comment
+    /// rejected as proving nothing.
+    ///
+    /// So each workload gets the count that puts a false green under 1% against
+    /// its own rate, `(1 - p)^n < 0.01`:
+    ///
+    /// | workload | pre-fix rate | n | false green |
+    /// |---|---|---|---|
+    /// | `Untouched` | 1/96 = 0.0104 | 440 | 0.99% |
+    /// | `OpenChannel` | 5/96 = 0.0521 | 96 | 0.60% |
+    /// | `RemovedContainer` | 12/32 = 0.375 | 32 | 0.0000% |
+    ///
+    /// The two cheap workloads can afford theirs precisely because they boot no
+    /// virtual machine: 440 engines that never create a container still cost
+    /// less than 32 that do.
+    fn iterations(self) -> usize {
+        match self {
+            Self::Untouched => 440,
+            Self::OpenChannel => 96,
+            Self::RemovedContainer => 32,
+        }
+    }
 }
 
 impl fmt::Display for Workload {
@@ -119,14 +156,28 @@ impl fmt::Display for Report {
 /// Sequential on purpose. Concurrent engines contend for vmnet subnets and for
 /// the machine, which would make the rate a measurement of the load rather than
 /// of the engine.
-async fn rate(workload: Workload, iterations: usize) -> Report {
-    let images = tempfile::tempdir().expect("a temporary layout root");
-    let layout = staying_up(Utf8Path::from_path(images.path()).expect("a utf-8 path"));
+async fn rate(workload: Workload) -> Report {
+    let iterations = workload.iterations();
+
+    // **Only the container workload needs an image, and the other two used to
+    // build one anyway.** That made the control -- whose whole job is to go red
+    // only when the shutdown path itself is broken -- able to fail because
+    // `GASCAN_ARCA_BASE_OCI_LAYOUT` was unset or a blob would not copy. A
+    // control that can fail for a fixture reason is a weaker control.
+    //
+    // The `TempDir` is bound alongside the path because it owns the directory
+    // the path names, and dropping it would delete the layout mid-run.
+    let images = (workload == Workload::RemovedContainer).then(|| {
+        let directory = tempfile::tempdir().expect("a temporary layout root");
+        let layout = staying_up(Utf8Path::from_path(directory.path()).expect("a utf-8 path"));
+        (directory, layout)
+    });
+    let layout = images.as_ref().map(|(_directory, layout)| layout.as_path());
 
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut unclean = 0;
     for _ in 0..iterations {
-        let status = one_shutdown(workload, &layout).await;
+        let status = one_shutdown(workload, layout).await;
         if !status.success() {
             unclean += 1;
         }
@@ -152,7 +203,7 @@ fn staying_up(destination: &Utf8Path) -> Utf8PathBuf {
 }
 
 /// Drives one engine through `workload` and returns the status it exited with.
-async fn one_shutdown(workload: Workload, layout: &Utf8Path) -> ExitStatus {
+async fn one_shutdown(workload: Workload, layout: Option<&Utf8Path>) -> ExitStatus {
     match workload {
         Workload::Untouched => LiveEngine::start().await.stop().await,
         Workload::OpenChannel => {
@@ -163,6 +214,7 @@ async fn one_shutdown(workload: Workload, layout: &Utf8Path) -> ExitStatus {
             engine.stop().await
         }
         Workload::RemovedContainer => {
+            let layout = layout.expect("the container workload builds a layout");
             let engine = LiveEngine::start_with_images(&[layout]).await;
             let backend = ArcaBackend::new(engine.transport().await);
             let (_root, request) =
@@ -219,10 +271,10 @@ async fn one_shutdown(workload: Workload, layout: &Utf8Path) -> ExitStatus {
 /// has nothing to do with what those vary. It is here for that reason and not
 /// because anyone doubts it.
 #[tokio::test]
-#[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN, a kernel, a vminit \
-            layout and a base OCI layout; stops 32 engines and takes minutes"]
+#[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN, a kernel and a \
+            vminit layout; no image, and so no base OCI layout"]
 async fn the_engine_exits_cleanly_with_nothing_holding_a_connection() {
-    let report = rate(Workload::Untouched, ITERATIONS).await;
+    let report = rate(Workload::Untouched).await;
     println!("{report}");
     assert_eq!(report.unclean, 0, "{report}");
 }
@@ -234,10 +286,10 @@ async fn the_engine_exits_cleanly_with_nothing_holding_a_connection() {
 /// socket is the other candidate, and it needs no container at all. A rate here
 /// that matches the container workload's says the container was a correlate.
 #[tokio::test]
-#[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN, a kernel, a vminit \
-            layout and a base OCI layout; stops 32 engines and takes minutes"]
+#[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN, a kernel and a \
+            vminit layout; no image, and so no base OCI layout"]
 async fn the_engine_exits_cleanly_with_a_client_channel_still_open() {
-    let report = rate(Workload::OpenChannel, ITERATIONS).await;
+    let report = rate(Workload::OpenChannel).await;
     println!("{report}");
     assert_eq!(report.unclean, 0, "{report}");
 }
@@ -251,9 +303,9 @@ async fn the_engine_exits_cleanly_with_a_client_channel_still_open() {
 /// workloads above exist beside it rather than inside it.
 #[tokio::test]
 #[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN, a kernel, a vminit \
-            layout and a base OCI layout; boots 32 virtual machines and takes tens of minutes"]
+            layout and a base OCI layout; boots 32 virtual machines"]
 async fn the_engine_exits_cleanly_after_a_container_has_been_created() {
-    let report = rate(Workload::RemovedContainer, ITERATIONS).await;
+    let report = rate(Workload::RemovedContainer).await;
     println!("{report}");
     assert_eq!(report.unclean, 0, "{report}");
 }

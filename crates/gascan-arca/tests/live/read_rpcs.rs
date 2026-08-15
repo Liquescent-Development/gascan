@@ -82,8 +82,13 @@ async fn capabilities_report_only_what_this_engine_build_implements() {
 /// `ExecServerFrame.frame.error` -- and nothing in this tier touched either. A
 /// regression that made `Logs` answer with a status would have passed.
 ///
-/// **THREE, and it was ten. The count is asserted rather than implied precisely
-/// so that this happens.** Milestone 2 implemented `Inspect`, `ListResources`,
+/// **THREE, and it was ten. What forces a newly-implemented method out of this
+/// list is the `expect_err` on each entry, and NOT the length assertion below
+/// -- which is a tautology and was described here as the mechanism.** `answers`
+/// is a `vec![]` literal, so its length is three by construction and no engine
+/// behaviour can change it; the assertion cannot fail except by someone editing
+/// the literal, which is visible in the diff anyway. It is kept as an executable
+/// comment and is labelled as one. Milestone 2 implemented `Inspect`, `ListResources`,
 /// `PrepareImage`, `Create`, `Start`, `Stop` and `Remove`, and the old list
 /// FAILED against the branch engine the day the first one landed: `expect_err`
 /// on `Inspect` got a perfectly good `absent`. That failure is the mechanism
@@ -149,6 +154,9 @@ async fn every_unimplemented_method_answers_unsupported_capability_not_a_transpo
         ),
     ];
 
+    // A tautology, kept as an executable comment: `answers` is a literal, so
+    // this cannot fail. The `expect_err` on each entry above is what actually
+    // fails when a method becomes real -- see the doc comment.
     assert_eq!(
         answers.len(),
         3,
