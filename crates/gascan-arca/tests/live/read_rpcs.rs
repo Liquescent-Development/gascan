@@ -1,8 +1,6 @@
-use crate::common::{LiveEngine, policy_request, retained_for};
+use crate::common::LiveEngine;
 use gascan_arca::ArcaBackend;
-use gascan_core::runtime::{
-    ExecRequest, NetworkIsolation, RecreateRequest, RetainedResources, RuntimeBackend,
-};
+use gascan_core::runtime::{ExecRequest, NetworkIsolation, RuntimeBackend};
 use gascan_core::sandbox::SandboxId;
 
 /// The backend over a real engine, not a fake. Everything below goes through
@@ -38,7 +36,7 @@ async fn backend(engine: &LiveEngine) -> ArcaBackend<gascan_arca::ChannelTranspo
 ///
 /// - `tty` and `signals` are milestone 3's, with `Exec` --
 ///   `every_unimplemented_method_answers_unsupported_capability_not_a_transport_fault`
-///   below still lists it among the three this build refuses.
+///   below still lists it among the two this build refuses.
 /// - `offline` stays `Unverified` until milestone 4's proof exercise.
 ///
 /// CORRECTED: this test used to assert every flag false and its comment said
@@ -82,26 +80,33 @@ async fn capabilities_report_only_what_this_engine_build_implements() {
 /// `ExecServerFrame.frame.error` -- and nothing in this tier touched either. A
 /// regression that made `Logs` answer with a status would have passed.
 ///
-/// **THREE, and it was ten. What forces a newly-implemented method out of this
-/// list is the assertion on each entry -- the `expect_err` on `CreateContainer`
-/// and `Logs`, and the `panic!` on `Exec`'s first frame -- and NOT the length
+/// **TWO, and it was ten. What forces a newly-implemented method out of this
+/// list is the assertion on each entry -- the `expect_err` on `Logs`, and the
+/// `panic!` on `Exec`'s first frame -- and NOT the length
 /// assertion below, which is a tautology and was described here as the
 /// mechanism.** `Exec` refuses in the stream rather than at the call, for the
 /// reason given four lines above, so it has no `expect_err` at all; an earlier
 /// version of this paragraph said "the `expect_err` on each entry" and was
 /// wrong for a third of the list. `answers`
-/// is a `vec![]` literal, so its length is three by construction and no engine
+/// is a `vec![]` literal, so its length is two by construction and no engine
 /// behaviour can change it; the assertion cannot fail except by someone editing
 /// the literal, which is visible in the diff anyway. It is kept as an executable
 /// comment and is labelled as one. Milestone 2 implemented `Inspect`, `ListResources`,
 /// `PrepareImage`, `Create`, `Start`, `Stop` and `Remove`, and the old list
 /// FAILED against the branch engine the day the first one landed: `expect_err`
 /// on `Inspect` got a perfectly good `absent`. That failure is the mechanism
-/// working. `CreateContainer` is the one method left that is neither streaming
-/// nor milestone 3's -- `Exec` and `Logs` are.
+/// working.
+///
+/// **`CreateContainer` left this list when milestone 3's Task 1 implemented
+/// it**, and the two that remain are exactly the streaming pair: `Exec` and
+/// `Logs`. Its entry would not merely have gone stale, it would have failed --
+/// the engine now answers a retained resource it does not hold with `not_found`,
+/// which `expect_err` accepts and the `unsupported_capability` comparison below
+/// rejects. That is the same mechanism `Inspect` demonstrated.
 ///
 /// A method that becomes real leaves this list and gets real assertions: for
-/// the seven that already did, they are in `lifecycle.rs` and `ports.rs`.
+/// the eight that already did, they are in `lifecycle.rs`, `ports.rs` and
+/// `recreate.rs`.
 #[tokio::test]
 #[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN"]
 async fn every_unimplemented_method_answers_unsupported_capability_not_a_transport_fault() {
@@ -109,27 +114,9 @@ async fn every_unimplemented_method_answers_unsupported_capability_not_a_transpo
     let backend = backend(&engine).await;
     let id = SandboxId::test("never-created");
 
-    // Held for the whole test: the compiled request names a canonical root that
-    // must still exist when the call is made.
-    let (_recreate_root, recreate_create) = policy_request("never-recreated");
-    let retained = RetainedResources::new(&recreate_create, retained_for(&recreate_create))
-        .expect("the retained set matches the requested topology exactly");
-    let recreate = RecreateRequest::new(recreate_create, retained).expect("a recreate request");
-
-    // Each arm reduces to the wire code, so the three shapes -- CreateFailure,
-    // ExecSession, Vec<u8> -- become one comparable list. `CreateFailure`
-    // carries its code separately from `RuntimeError` because a partial create
-    // must report what it made.
+    // Each arm reduces to the wire code, so the two shapes -- ExecSession and
+    // Vec<u8> -- become one comparable list.
     let answers: Vec<(&str, String)> = vec![
-        (
-            "CreateContainer",
-            backend
-                .create_container(recreate)
-                .await
-                .expect_err("CreateContainer")
-                .code()
-                .to_owned(),
-        ),
         ("Exec", {
             // Exec is the one that does not refuse at the call. The session
             // OPENS -- `exec()` returns Ok -- and the refusal arrives as the
@@ -161,12 +148,12 @@ async fn every_unimplemented_method_answers_unsupported_capability_not_a_transpo
 
     // A tautology, kept as an executable comment: `answers` is a literal, so
     // this cannot fail. What actually fails when a method becomes real is the
-    // assertion on each entry above -- `expect_err` for `CreateContainer` and
-    // `Logs`, the `panic!` on the first frame for `Exec` -- see the doc comment.
+    // assertion on each entry above -- `expect_err` for `Logs`, the `panic!` on
+    // the first frame for `Exec` -- see the doc comment.
     assert_eq!(
         answers.len(),
-        3,
-        "this build implements eight of the eleven contract methods; \
+        2,
+        "this build implements nine of the eleven contract methods; \
          a method that becomes real must leave this list"
     );
     for (rpc, code) in &answers {

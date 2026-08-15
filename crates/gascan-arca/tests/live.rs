@@ -12,6 +12,8 @@ mod mounts;
 mod ports;
 #[path = "live/read_rpcs.rs"]
 mod read_rpcs;
+#[path = "live/recreate.rs"]
+mod recreate;
 #[path = "live/shutdown.rs"]
 mod shutdown;
 #[path = "live/supervision.rs"]

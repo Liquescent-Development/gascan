@@ -600,7 +600,8 @@ pub async fn await_state(
     );
 }
 
-/// A policy-validated `CreateRequest`, which is the only kind that exists.
+/// A policy-validated `CreateRequest`, which is the only kind that exists,
+/// against an image the engine's own store actually holds.
 ///
 /// `CreateRequest`'s fields are `pub(crate)` to `gascan-core` and it derives no
 /// `Deserialize`, so `PolicyCompiler` is the only construction path -- there is
@@ -609,18 +610,20 @@ pub async fn await_state(
 /// the fake transport. The two cannot share code: each `tests/*.rs` is its own
 /// crate, and this one is reachable only from the live tier.
 ///
-/// The `TempDir` must outlive the request: the compiled request names its
-/// canonical root.
-pub fn policy_request(name: &str) -> (tempfile::TempDir, gascan_core::runtime::CreateRequest) {
-    policy_request_for_image(name, gascan_core::policy::PolicyCompiler::workspace_image())
-}
-
-/// The same request, against an image the engine's own store actually holds.
-///
 /// `PolicyCompiler::compile` pins the approved workspace image, which no engine
 /// under test has: the live tier seeds a store with `arca-engine image load` and
 /// must then ask for what it seeded. `compile_for_image` is the existing seam
 /// for exactly this and needs no widening.
+///
+/// **There is no unpinned variant any more.** A `policy_request(name)` taking
+/// the approved workspace image stood here until `read_rpcs.rs` stopped calling
+/// `create_container` against a sandbox that was never created -- see that
+/// file's note on `CreateContainer` leaving the unimplemented list -- and it was
+/// then the only caller. Every request this tier builds now names an image the
+/// test seeded, which is the only kind an engine under test can honour.
+///
+/// The `TempDir` must outlive the request: the compiled request names its
+/// canonical root.
 pub fn policy_request_for_image(
     name: &str,
     image: &str,
