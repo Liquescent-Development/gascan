@@ -7,22 +7,25 @@ Written 2026-08-11 for two branches in flight; rewritten 2026-08-12 after both m
 rewritten 2026-08-13 mid-milestone-2; rewritten again 2026-08-13 (evening) with **Landing 4
 complete and Landing 5 the whole of what remains**; updated 2026-08-13 (late) after Task 13's first
 hour, which **proved the spawn, got `Create` working end to end for the first time, and cost two
-unplanned Arca fixes on the way** — Tasks 13a and 13b; **rewritten 2026-08-14 (evening) after the
-named-volume defect was fixed and committed, leaving the shutdown crash as the only open ruling.**
+unplanned Arca fixes on the way** — Tasks 13a and 13b; rewritten 2026-08-14 (evening) after the
+named-volume defect was fixed and committed; **rewritten again 2026-08-14 (late) after the
+graceful-shutdown crash was fixed, which was the last open ruling. Nothing is open. What remains is
+the merge.**
 
 ---
 
 ## Where the work is
 
-**P5.1 MILESTONE 2 IS IMPLEMENTATION-COMPLETE. All five landings, fifteen tasks, every one reviewed.**
-Twelve were planned; five were added on maintainer rulings after a review or a spike found something
-real — 3b, 3c, 6b, and this session's **13a** and **13b**. **Nothing is merged and nothing is pushed.
-Do not start a new branch; continue on these two.**
+**P5.1 MILESTONE 2 IS COMPLETE AND BOTH RULINGS ARE CLOSED. All five landings, every task reviewed.**
+Twelve were planned; **seven** were added on maintainer rulings after a review, a spike or a
+measurement found something real — 3b, 3c, 6b, 13a, 13b, and the two follow-ons that closed the
+rulings, **16** (named volumes) and **17** (the shutdown crash). The table below is authoritative for
+which is which. **Nothing is merged and nothing is pushed. Do not start a new branch; continue on
+these two.**
 
 **What that means and does not mean.** The engine now creates, starts, inspects, stops and removes a
-real sandbox in a real VM, and a published port is reachable from a test process. **It does not mean
-the milestone is closed** — see "What is left" below: three capability claims are earned and one is
-refused on a measured defect that needs a ruling, and the branches still have to merge.
+real sandbox in a real VM, and a published port is reachable from a test process. **Both maintainer
+rulings are now closed on measurements.** What is left is the merge.
 
 ### The three things a new session most needs to know
 
@@ -30,10 +33,15 @@ refused on a measured defect that needs a ruling, and the branches still have to
    sentence this file led with for two days — "nothing has ever been executed end to end" — is retired.
 2. **`named_volumes` IS NOW TRUE and the defect behind it is FIXED** (2026-08-14 evening, Arca
    `1d453cf` / submodule `ca47c87`, Gas Can `41ac39a`). All four capability flags this milestone
-   planned are claimed. **The only open ruling is the graceful-shutdown crash.**
-3. **If the engine dies with `vmnet_return_t(rawValue: 1001)`, force-quit `InternetSharing`.** It cost
+   planned are claimed.
+3. **THE GRACEFUL-SHUTDOWN CRASH IS FIXED, and the thing this file said about it for two days was
+   wrong.** It did NOT need a container: an engine that created none still crashed 1 time in 96. The
+   engine waited on its LISTENING socket closing instead of on its ACCEPTED connections draining, so
+   it shut its event-loop group down under live channels. **12/32 → 0/32** on the container case;
+   **6/192 → 0/192** interleaved. Every live test now asserts a clean exit status.
+4. **If the engine dies with `vmnet_return_t(rawValue: 1001)`, force-quit `InternetSharing`.** It cost
    an hour before anyone tried it.
-4. **The `containerization` submodule moved to `ca47c87`.** Any worktree build, and anything that
+5. **The `containerization` submodule moved to `ca47c87`.** Any worktree build, and anything that
    rebuilds the guest, must use that revision — `f02cdf9` predates the volume fix and a guest built
    from it measures the old behaviour.
 
@@ -47,22 +55,33 @@ refused on a measured defect that needs a ruling, and the branches still have to
 | Parent design | `docs/superpowers/specs/2026-08-10-p5-1-engine-service-and-wiring-design.md` |
 | Governing roadmap | `docs/superpowers/plans/2026-08-04-arca-integration-roadmap.md` — P0-P8; P0-P4 done, P5 current |
 
-**Re-run and verified 2026-08-14 at the end of the milestone, both trees clean:**
+**Re-run and verified 2026-08-14 (late), after the shutdown fix, both trees clean:**
 
 | | |
 |---|---|
 | `swift test --filter ArcaEngineTests` | `Executed 151 tests, with 0 failures` |
 | `swift test --filter ArcaTests.NetworkPruneGateTests` | `Executed 3 tests, with 0 failures` |
-| `env -u RUSTUP_TOOLCHAIN cargo test --workspace --no-fail-fast` | exit 0 — **1436 passed / 0 failed / 33 ignored across exactly 74 targets** reporting `0 filtered out` |
-| the live tier, with its four env vars | `tests/live.rs`: **14 passed / 0 failed / 0 filtered out** |
+| `env -u RUSTUP_TOOLCHAIN cargo test --workspace --no-fail-fast` | exit 0 — **1436 passed / 0 failed / 36 ignored across exactly 74 targets** reporting `0 filtered out` |
+| the live tier, `-- --ignored --test-threads=1` | **14 passed / 0 failed**, 84s, 3 non-ignored filtered out |
+| `cargo fmt --all --check` | exit 0 |
+| `cargo clippy --workspace --all-targets` | no errors |
+| `scripts/ci-check-ignored-tests.sh` | `36 ignored test(s), matching the baseline` |
 
-**The workspace deltas against the old 1435 / 26 / 74 baseline are accounted for rather than accepted**,
-which is the standing rule: **ignored +7** are exactly the seven new live tests now named in
-`tests/ci/expected-ignored-tests.txt`; **passed +1** is
-`supervision::a_supervised_child_dies_when_its_parent_stops_holding_the_pipe`, which deliberately
-carries **no** `#[ignore]` because it needs no engine and so runs in ordinary CI; **targets +0** because
-the new files are modules of the existing `live` target. `pgrep -fl "cargo test"` was empty and
-recorded; three `test result:` lines with a non-zero filtered-out count were excluded as the
+**The workspace deltas are accounted for rather than accepted**, which is the standing rule.
+Against the 1436 / 33 / 74 baseline of the same morning: **ignored +3**, exactly
+`shutdown::the_engine_exits_cleanly_{after_a_container_has_been_created,with_a_client_channel_still_open,with_nothing_holding_a_connection}`,
+all three added to `tests/ci/expected-ignored-tests.txt`; **passed +0** because all three are
+`#[ignore]`d; **targets +0** because `shutdown.rs` is a module of the existing `live` target.
+Against the older 1435 / 26 baseline the earlier reconciliation still stands, below.
+
+**The first of those two workspace runs was RED and it was not this branch.** It failed
+`daemon_start_identity_is_stable_across_caller_locale_and_timezone` with **`mode is 0200 ... written
+but never published`** — D7, the third recorded occurrence, and the section below is about it.
+Settled the way this file requires rather than by probability: `git diff 6847d1e..HEAD --
+crates/gascan-e2e/ crates/gascan/ crates/gascand/` is **empty**, so the branch cannot have caused it,
+and `cargo test -p gascan-e2e --test autostart` alone is **16 passed, 0 failed**. The re-run above is
+exit 0 with **zero** occurrences of `mode is 0200`. `pgrep -fl "cargo test"` was empty and recorded
+before each run; `test result:` lines with a non-zero filtered-out count were excluded as the
 overcounting trap requires.
 
 **The live tier's four environment variables** — none defaulted, absent is a `panic!` with a directive:
@@ -157,6 +176,7 @@ The three RPCs still answering `unsupported_capability` are **`CreateContainer`,
 | 14 the capability flips — **three of four** | `5e52aae`..`6c77bb8` | `782de04`, `1ce26d6` |
 | 15 the workspace suite, run alone | — | — |
 | 16 named volumes mount, and the fourth flag — **follow-on, after the ruling** | `1d453cf`, submodule `ca47c87` | `41ac39a` |
+| 17 the shutdown crash, and the rate instrument — **follow-on, after the ruling** | `9fac267` | `3290af6` |
 
 **Tasks 3b, 3c, 6b, 13a and 13b were not in the approved plan.** Each was added on a maintainer ruling
 after a review — or, for 13a, a controller spike — found something real: a `try?` that let
@@ -165,6 +185,10 @@ engine that could not start a container because nothing signed it, a hardcoded c
 broke `Create` and wrote into Apple's shared store, and a log directory that did the same to
 ArcaDaemon's. **The last two are both Task 1 misses of the same shape** — a path that should have been
 rooted when `ContainerManager` gained its roots and was not.
+
+**Tasks 16 and 17 were not in the plan either**, and neither came from a review: each closed one of the
+two maintainer rulings of 2026-08-14, and each was found by driving the real thing rather than by
+reading. Both sections below record them.
 
 **A CLAIM THIS FILE BRIEFLY CARRIED AND WHICH IS FALSE: "`ContainerBridge` now derives no state root it
 was not given."** Task 13b reported it, this file repeated it, and 13b's reviewer disproved it within the
@@ -317,15 +341,14 @@ refuse instead. The reasoning is on each method in `SandboxEngineService.swift` 
 
 ## What is left, now that the implementation is done
 
-**RULED 2026-08-14: BOTH OF THESE WERE TO BE FIXED. ONE NOW IS.** The maintainer closed both as open
+**RULED 2026-08-14: BOTH OF THESE WERE TO BE FIXED. BOTH NOW ARE.** The maintainer closed both as open
 questions the same day — "seems like we need to fix both of the things you left alone".
 
-**The named-volume defect is FIXED, verified and committed** (2026-08-14 evening). Its section below is
-kept as a record and is marked CLOSED; do not work it again. **The shutdown crash is still open and is
-the next session's work.** Both are Arca-side, and both are follow-on work on the existing branches —
-**do not start a new branch.**
+**Both sections below are kept as records and are marked CLOSED; do not work either again.** The
+named-volume defect was fixed on 2026-08-14 evening, the graceful-shutdown crash late the same day.
+**Nothing is open. The remaining work is the merge and the pin, and the pin belongs to milestone 4.**
 
-**Before either: this session's method is what found them, and it is worth repeating.** Both were
+**The method is what found both, and it is worth repeating.** Both were
 discovered by driving the real thing and measuring the result, not by reading. Every claim that
 outran the code was caught by a mutation. Keep dispatching a fresh Opus implementer per task and an
 Opus reviewer after each — **and read "when a subagent goes quiet" in the traps section before you
@@ -420,81 +443,109 @@ another's target is caught by size. The old negative test is deleted.
    was.
 4. **Label collision and prefix behaviour** were reviewed by reading only.
 
-### RULED — FIX IT — the engine aborts on its own graceful-shutdown path — **THIS IS THE OPEN WORK**
+### CLOSED 2026-08-14 — the engine exits cleanly, and it was never about containers
 
-**This is what the next session does.** It is the only one of the two rulings still open. Reproduced
-again on 2026-08-14 during the volume work, unprompted, in a run whose tests all passed — which is
-consistent with everything below and adds no new information beyond "still there".
+**FIXED, verified and committed.** Arca `Sources/arca-engine/ArcaEngineCommand.swift` and
+`Sources/ArcaEngine/EngineServer.swift`; Gas Can `crates/gascan-arca/tests/live/shutdown.rs` and
+`live/common/mod.rs`. **Nothing here is open work.** The section is kept because the diagnosis
+overturned two things this file asserted, and because the instrument it produced is now permanent.
 
-#### The map, gathered 2026-08-14 by reading only — NONE of it is measured
+**What it was.** `serve()` awaited `engine.onClose` — which is the **LISTENING** channel's
+`closeFuture`. `ServerQuiescingHelper` closes that listener *synchronously* when a shutdown begins,
+before the connections it has just asked to quiesce have gone. So `run()` shut the event-loop group
+down under still-registered channels; each channel's `closeFuture` callback then tried to schedule
+`ChannelCollector.channelRemoved` on a loop that no longer existed (`Cannot schedule tasks on an
+EventLoop that has already shut down`), the collector therefore never reached `shutdownCompleted()`,
+and it deallocated still holding the promise it mints at `QuiescingHelper.swift:141` — `Fatal error:
+leaking promise`, `Trace/BPT trap: 5`, exit 133.
 
-Treat every item as a hypothesis. It is recorded to save a fresh session the search, not to point at an
-answer.
+**The fix is one line of behaviour: wait for the ACCEPTED connections, not for the listening socket.**
+`initiateGracefulShutdown` is handed a promise instead of `nil`, and `serve()` awaits that.
 
-- **There are SEVEN `MultiThreadedEventLoopGroup`s in the engine's process**, and six are
-  container-scoped, which fits "only crashes once containers have been created" exactly:
-  `TCPProxy.swift:37` (2 threads), `UDPProxy.swift:45`, `FilesystemClient.swift:43`,
-  `ProcessControlClient.swift:44`, `WireGuardClient.swift:46`, `OverlayFSClient.swift:56`, plus the
-  engine's own at `ArcaEngineCommand.swift:185`.
-- **`TCPProxy` tears its own group down correctly** (`TCPProxy.swift:79-82`), so it is not a naive leak.
-  But **`TCPProxyHandler` builds its outbound connection with `ClientBootstrap(group: context.eventLoop)`
-  (`TCPProxy.swift:156`)** — a client channel riding the *server* group's event loop. An outbound
-  connect still pending when that group shuts down is the shape of the reported error. This is the
-  single most promising lead and it is **unverified**.
-- **A fix for this exact crash class already landed and is documented** at
-  `ArcaEngineCommand.swift:191-210`: `serve()` was split out of `run()` so that objects holding event
-  loops are released *before* the group shuts down, verified under `SWIFTNIO_STRICT=1`. **Read that
-  comment before proposing anything** — it records three alternatives that were each measured and each
-  still crashed: awaiting teardown inside a `Task.detached`, dropping the redundant close, and swapping
-  the async `shutdownGracefully()` for a blocking `syncShutdownGracefully()` on a Dispatch thread. So
-  the residual is a second instance of a known shape, and the obvious fixes are already known dead.
+**THE CLAIM THIS FILE CARRIED FOR TWO DAYS — "it only happens once containers have been created" — IS
+FALSE, and every hypothesis built on it was wrong.** An engine that never created a container still
+crashed **1 time in 96**. The container was a correlate: it widens the window, it does not change the
+bug. In particular the item this file called **"the single most promising lead"** —
+`TCPProxyHandler`'s `ClientBootstrap(group: context.eventLoop)` at `TCPProxy.swift:156` — is **not on
+the path at all**: `TCPProxy` runs on its own group, and the crash reproduces with no container, no
+proxy and no VM. The "seven event-loop groups" map was a search of the wrong space.
 
-#### Build the rate instrument FIRST, before touching anything
+**The measurements, all from `shutdown.rs`, 32 engines per figure**, two binaries built from the same
+file and run **interleaved** rather than A-then-B:
 
-**At ~19% a single clean shutdown proves nothing, and four in five will be clean by chance.** The first
-deliverable is something that reports the crash rate from one run — a loop that starts an engine,
-creates a container, `SIGTERM`s it and records the exit status, N times, printing the count. Report
-before and after **in one run each**, never A-then-B across a drifting machine.
+| workload | before | after |
+|---|---|---|
+| nothing holding a connection | 1 / 96 | **0 / 96** |
+| a client channel still open | 5 / 96 | **0 / 96** |
+| a container created and removed | 12 / 32 (**38%**) | **0 / 32** |
 
-`LiveEngine::kill` (`crates/gascan-arca/tests/live/common/mod.rs:343`) drops stdin and waits **without
-asserting the exit status**, and its comment records why. **Once the crash is fixed that refusal should
-be inverted into an assertion**, or the fix ships with nothing that can fail if it regresses.
+**The mutation that says the fix is the ordering and not the promise.** A third binary that passes the
+promise in and *still* awaits `onClose` — promise made, never waited on — runs at **22/32 (69%)**,
+worse than the original, and the leaked promise simply changes address: it stops being the
+collector's at `QuiescingHelper.swift:141` and becomes `ArcaEngineCommand.swift`'s own. The `Cannot
+schedule tasks` line is unchanged throughout. **Passing a promise moves the bookkeeping; awaiting it
+moves the bug.**
 
-Once containers have been created, `SIGTERM` sometimes ends in a crash rather than a clean stop:
+**THE FASTEST REPRODUCTION NEEDS NO VM, NO CONTAINER AND NO CARGO** — connect a raw socket to the
+engine, send nothing, and `SIGTERM` once. Against the pre-fix binary the process ended on that first
+signal **5 times out of 5**, crashing in 4 of them. Roughly seven seconds per sample.
 
-```
-[arca_engine] shutting down gracefully
-ERROR: Cannot schedule tasks on an EventLoop that has already shut down.
-NIOExtras/QuiescingHelper.swift:141: Fatal error: leaking promise created at (… line: 141)
-Trace/BPT trap: 5
-```
+**A SECOND DEFECT THE FIX EXPOSED, AND IT IS THE INTERESTING ONE.** The handler's doc comment said the
+escalation existed because "a graceful shutdown waits for in-flight RPCs". **It did not.** The wait was
+on the listening socket, so one signal always ended the process whatever a client was doing, and the
+second signal had nothing to force — a comment describing a behaviour the code had never had. Making
+the wait real made that comment true and made two more things necessary:
 
-**Measured at 6 crashes in 32 shutdowns (~19%)**, every one strictly **after** the test's assertions, so
-it changed no outcome. An engine that created **no** container exits cleanly. **The live tier
-deliberately does not assert the exit status** — `LiveEngine::kill`'s comment records why, and that
-blindness is bounded to the shutdown window because a crash any earlier surfaces as a transport error or
-through `await_socket`'s `try_wait()`. **An operator stopping the engine sees a crash**, so it is a real
-defect.
+- **The drain is bounded to 10s**, because quiescing cannot close everything it asks to close.
+  grpc-swift turns `ChannelShouldQuiesceEvent` into a GOAWAY only for a connection whose protocol it
+  has finished negotiating; one that has been **accepted and has sent nothing** is in no protocol, so
+  nothing closes it and the drain waits on it forever. That is not theoretical — with the drain
+  unbounded, `shutdown::the_engine_exits_cleanly_with_a_client_channel_still_open` **hung past its 30s
+  bound** once in roughly 200 engines, a tonic channel whose HTTP/2 preface had not been exchanged
+  when the signal landed. MEASURED with the bound: exits at **10.0-10.1s**, three for three.
+- **The escalation now forces the exit** — it releases the socket path and ends the process, because
+  returning would either wait on the very thing being escalated past or shut the group down under live
+  channels. MEASURED: second signal exits 0 and the socket is gone, five for five.
 
-**How to work on it, and the trap in it.** It is ~19%, so **a single clean shutdown proves nothing** —
-this project's own rule is that a green figure you cannot account for is not a pass, and here the green
-figure occurs four times in five by chance. Drive it in a loop and report the rate, before and after,
-**in one run each** rather than across a drifting machine.
+**10 SECONDS IS A POLICY AND NOTHING MEASURES IT.** It is chosen against the two clocks that already
+bound the process from outside — the live tier's 30s and launchd's 20s `ExitTimeOut` — so that the
+engine is what decides. An ordinary drain completes in milliseconds.
 
-**The obvious instrument does not currently exist and should be the first thing built**: the live tier
-deliberately does not assert the engine's exit status (`LiveEngine::kill`, with its reasoning recorded
-there). Once the crash is fixed, **that refusal should be inverted into an assertion** — otherwise the
-fix ships with nothing that can ever fail if it regresses. The comment says so in place.
+**The instrument is permanent, and the refusal is inverted.** `LiveEngine::stop()` returns the exit
+status; **`LiveEngine::kill()` now asserts it**, so a regression fails whichever of the tier's tests
+meets it first rather than waiting for the one module built to look for it. `shutdown.rs` says how
+*often*, `kill()` says *whether*. Its three workloads vary one thing at a time on purpose: a rate that
+differs between them is what says which variable is load-bearing, and it is what disproved the
+container.
 
-The shape is a SwiftNIO teardown ordering problem — `QuiescingHelper` is completing a promise on an
-`EventLoop` that has already gone — and it only happens once containers have been created, which points
-at something container-scoped outliving the group's shutdown.
+**NOTHING IN ARCA CAN TEST ANY OF THIS, and a test was attempted rather than assumed away.** The claim
+is about two futures of a running server with an accepted connection outliving its listener, and no
+unit test can hold one there: a connection grpc-swift has finished configuring is closed by the same
+GOAWAY quiescing sends, and a raw socket it has not finished configuring cannot be **observed** to
+have been accepted — so either fixture decides the assertion by a race. `serve()` is private and needs
+a real process besides. `ArcaEngineTests` is 151 passing before and after, which is exactly the point.
 
-### Then: the merge, and the pin
+**WHAT WAS NOT VERIFIED, and is the first place to look if this misbehaves:**
 
-Both branches are unmerged and unpushed. **The pin bump belongs to milestone 4** and needs a signed tag
-carrying Arca `fede19c`; `./scripts/build-arca-engine.sh` exits 70 against the current pin **by design**
-(see the pin section). **Do not bump it ad hoc to make CI green.**
+1. **The 10s bound has never been hit by anything but the raw-socket fixture.** No real client has
+   been observed to need it.
+2. **The escalation path's `releaseSocketPath()` error branch** — a socket that cannot be unlinked —
+   was never driven.
+3. **`SWIFTNIO_STRICT=1` was not re-run.** The earlier `serve()` split was verified under it; this
+   change was not.
+4. **Nothing measured a client with an actually in-flight RPC** across a shutdown. Every held
+   connection here was idle.
+
+### THE MERGE IS THE WHOLE OF WHAT REMAINS
+
+**Both branches are unmerged and unpushed, and nothing else is open.** Arca
+`feat/engine-state-ownership` at `9fac267`, Gas Can `docs/p5-1-milestone-2-design` — read both with
+`git log -1` rather than trusting a SHA here.
+
+**The pin bump belongs to milestone 4** and needs a signed tag carrying Arca `fede19c`;
+`./scripts/build-arca-engine.sh` exits 70 against the current pin **by design** (see the pin section).
+**Do not bump it ad hoc to make CI green.** `allowed_merge_methods` is `["merge"]` — merge commits
+only, never squash.
 
 ## The superseded plan for Landing 5, kept for its reasoning
 
@@ -901,6 +952,34 @@ in `docs/status/arca-integration-handoff.md`.
   `scripts/build-arca-engine.sh`.
 
 ## Traps that will cost you if you learn them the hard way
+
+### Added 2026-08-14 late, from the shutdown fix.
+
+**A CORRELATE WRITTEN DOWN AS A CONDITION SENDS THE NEXT SESSION TO THE WRONG PLACE, AND THIS FILE DID
+IT.** "It only happens once containers have been created" was an honest observation — every crash
+anyone had seen came from a run that made one. Recorded as a *condition*, it produced a map of the
+engine's seven event-loop groups, six of them container-scoped, and named a `TCPProxy` line as "the
+single most promising lead". **`TCPProxy` is not on the path at all.** The cheapest experiment in the
+world — run it *without* the thing — had never been run, and it took ten seconds: an engine that
+created no container crashes 1 time in 96. **Before building a map from a correlate, try removing it.**
+
+**A THING THAT ALWAYS HAPPENS UNDER TEST IS NOT THEREFORE A THING THAT HAPPENS.** The same section
+said an engine that created no container "exits cleanly", stated flatly. It was a summary of runs
+nobody had counted. **A negative claim needs a denominator as much as a positive one does** — and once
+this one had one (96), it inverted.
+
+**MAKING A WAIT REAL MAKES EVERY TIMEOUT AROUND IT LOAD-BEARING FOR THE FIRST TIME.** The engine's
+shutdown handler carried a paragraph explaining why the second signal existed — "a graceful shutdown
+waits for in-flight RPCs" — and the code had never waited for anything: it watched the listening socket,
+which closes synchronously. Fixing that turned a decorative escalation path into one that had to work,
+and exposed a second defect underneath (a drain that grpc-swift cannot always finish). **When you make
+a comment true for the first time, everything it justified has to be re-checked, because none of it was
+ever exercised.**
+
+**A COMMENT DESCRIBING BEHAVIOUR IS A CLAIM, AND IT ROTS THE SAME WAY A REPORT DOES.** Both false claims
+above lived in doc comments, which are the one place this project had not been mutating. The rule
+already standing — *ask what mutation would falsify it* — applies to prose about behaviour, not just to
+commit messages and reports.
 
 ### Added 2026-08-13 late, from Task 13's first hour.
 
