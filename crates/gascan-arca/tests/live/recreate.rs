@@ -105,16 +105,30 @@ fn appending_and_reporting(destination: &Utf8Path, port: u16) -> Utf8PathBuf {
 /// else. `retained_for` puts the managed network in the retained set
 /// (`common/mod.rs:699-706`), so it is the retained network and not a fresh one.
 ///
-/// **Three: the data survives**, which is the headline above and the only one of
-/// the three the test's name announces.
+/// **Three: the data survives A RECREATE THROUGH THE ARCA BACKEND**, which is the
+/// headline above and the only one of the three the test's name announces. The
+/// scope is the load-bearing half of that sentence: data survival across a
+/// recreate is NOT unique to this test.
+/// `gascan-apple::storage::bind_mount_is_exact_and_named_volume_persists`
+/// (`crates/gascan-apple/tests/live/storage.rs:140`) proves it in the same
+/// write -> recreate -> read-back shape, over a `recreate_container()`
+/// (`gascan-apple/tests/live/common/mod.rs:182-187`) that really does
+/// `delete_container` then `create_container`. What is unique here is the path:
+/// a `CreateContainer` RPC carrying a `retained` set, against a real engine that
+/// verifies it. The property is shared; the mechanism under test is not.
 ///
-/// CORRECTED TWICE, and the pair is worth more than either correction. Round 2's
-/// version claimed this was the only cover for the guard's held half -- true when
-/// written, false within the same round, once `hold(network:)` made that half
-/// reachable VM-free. Round 3's first attempt then narrowed the claim to (Two)
-/// alone and **silently dropped (One)**, which no other test in either repository
-/// has. Over-claiming and under-claiming came from the same habit: editing the
-/// sentence to match what changed instead of re-deriving what is true afterwards.
+/// MEASURED GREEN, 2026-08-15, against Arca `a3ff5c9` / Gas Can `533097f`:
+/// this test passed in a full live-tier run of 15 tests, 15 passed.
+///
+/// CORRECTED THREE TIMES, and the sequence is worth more than any of the
+/// corrections. Round 2 claimed this was the only cover for the guard's held half
+/// -- true when written, false within the same round, once `hold(network:)` made
+/// that half reachable VM-free. Round 3 then narrowed to (Two) alone and
+/// **silently dropped (One)**, which nothing else in either repository has. Round
+/// 4 found (Three) **over-claimed again**, against a peer test in the same ignored
+/// baseline. Over-claim, under-claim, over-claim -- all three from one habit:
+/// editing the sentence to match what changed instead of re-deriving what is true
+/// afterwards. **Re-derive. Do not edit.**
 ///
 /// **What this does NOT prove.** Nothing about the refusal path: an engine that
 /// checked no retained resource at all passes this test, because everything this

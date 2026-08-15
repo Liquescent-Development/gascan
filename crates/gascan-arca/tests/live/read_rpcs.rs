@@ -104,6 +104,13 @@ async fn capabilities_report_only_what_this_engine_build_implements() {
 /// which `expect_err` accepts and the `unsupported_capability` comparison below
 /// rejects. That is the same mechanism `Inspect` demonstrated.
 ///
+/// That last sentence is a counterfactual and stays one -- the old arm was never
+/// run against the new engine. **What IS measured is this list as it now stands:**
+/// both tests in this file passed against Arca `a3ff5c9` / Gas Can `533097f` on
+/// 2026-08-15, in a full live-tier run of 15 tests, 15 passed. Until that run the
+/// claim that `CreateContainer` had left the list cleanly was derived from the
+/// implementation; it is now observed.
+///
 /// A method that becomes real leaves this list and gets real assertions: for
 /// the eight that already did, they are in `lifecycle.rs`, `ports.rs` and
 /// `recreate.rs`.
