@@ -75,29 +75,46 @@ fn appending_and_reporting(destination: &Utf8Path, port: u16) -> Utf8PathBuf {
 /// rebuilding a resource that already existed, and the first boot's line would
 /// be gone.
 ///
-/// **THIS TEST IS THE ONLY THING STANDING BEHIND A RECREATE ONTO A REAL
-/// NETWORK.** Arca's `reusedTopologyRefusal` requires every resource the rebuilt
-/// container mounts -- volumes *and* the managed network -- to be held by the
-/// engine and owned by the caller. `ArcaEngineTests` now covers both directions
-/// of that guard, refused and held, but it can only do so against a `null`-driver
-/// network: `preparedEngine()` initialises no `NetworkManager`, so a `bridge`
-/// network cannot be created there at all
-/// (`CreateTests.PreparedEngine.hold(network:)` records why `null` is the one
-/// driver that reaches the store without a backend). That fixture answers the two
-/// questions the guard asks and nothing else.
+/// **THREE THINGS ARE TRUE ONLY HERE. Deleting this test removes all three, and
+/// two of them are not what its name suggests.**
 ///
-/// **What only this test can say is that the network the container reattaches to
-/// still WORKS.** The rebuilt container below must start and answer on its
-/// published port, which per `ports.rs` requires a live WireGuard-backed network
-/// -- so a recreate that passed the guard and then attached the container to
-/// nothing usable fails here and nowhere else. `retained_for` puts the managed
-/// network in the retained set (`common/mod.rs:699-706`), so this really is the
-/// retained network and not a fresh one.
+/// **One: a REAL ENGINE'S answer is put through `for_recreate`.**
+/// `ArcaBackend::create_container` (`crates/gascan-arca/src/backend.rs:176-188`)
+/// routes the response through `create_outcome(CreatePath::Recreate(..))` ->
+/// `validate_recreated_container`, so the `.expect(..)` on the `create_container`
+/// call below **panics if a real engine ever reports the whole topology**.
+/// `backend_unary::a_recreate_answered_with_the_whole_topology_is_refused`
+/// (`tests/backend_unary.rs:740`) proves the *client* refuses such an answer, but
+/// it does so against a **fake** transport -- it can never observe what a real
+/// engine sends. Nothing Arca-side can either: every path in `ArcaEngineTests`
+/// dies at the uninitialised `ContainerManager`, so the success payload is
+/// unreachable there by construction. This call is the only place those two meet.
+/// A later reader replacing that `expect` with something that reports a "clearer"
+/// error must know that the validation goes with it.
 ///
-/// CORRECTED in fix round 2. An earlier version of this paragraph claimed to be
-/// the only cover for the guard's held half. That was true when written and
-/// stopped being true in the same round, when `hold(network:)` made the held half
-/// reachable VM-free.
+/// **Two: the network the container reattaches to still WORKS.** Arca's
+/// `reusedTopologyRefusal` requires the managed network to be held and owned, and
+/// `ArcaEngineTests` now covers both directions of that guard -- but only against
+/// a `null`-driver network, because `preparedEngine()` initialises no
+/// `NetworkManager` (`CreateTests.PreparedEngine.hold(network:)` records why
+/// `null` is the one driver reaching the store without a backend). A `null`
+/// network attaches nothing to containers by construction. The rebuilt container
+/// below must start and answer on its published port, which per `ports.rs`
+/// requires a live WireGuard-backed network, so a recreate that satisfied the
+/// guard and then attached the container to nothing usable fails here and nowhere
+/// else. `retained_for` puts the managed network in the retained set
+/// (`common/mod.rs:699-706`), so it is the retained network and not a fresh one.
+///
+/// **Three: the data survives**, which is the headline above and the only one of
+/// the three the test's name announces.
+///
+/// CORRECTED TWICE, and the pair is worth more than either correction. Round 2's
+/// version claimed this was the only cover for the guard's held half -- true when
+/// written, false within the same round, once `hold(network:)` made that half
+/// reachable VM-free. Round 3's first attempt then narrowed the claim to (Two)
+/// alone and **silently dropped (One)**, which no other test in either repository
+/// has. Over-claiming and under-claiming came from the same habit: editing the
+/// sentence to match what changed instead of re-deriving what is true afterwards.
 ///
 /// **What this does NOT prove.** Nothing about the refusal path: an engine that
 /// checked no retained resource at all passes this test, because everything this
@@ -175,11 +192,14 @@ async fn a_recreate_reuses_its_retained_volumes_rather_than_rebuilding_them() {
         .create_container(recreate)
         .await
         .expect("CreateContainer must rebuild the container against retained resources");
-    // Kept for the failure message, not for the evidence: `CreateOutcome
-    // ::for_recreate` runs `validate_recreated_container`, which already requires
-    // exactly one container, so a whole-topology answer would have made the
-    // `expect` above panic first. The claim this test carries is the boot count
-    // below, not this line.
+    // **The `expect` above is the load-bearing half of this pair, not this
+    // assertion.** `CreateOutcome::for_recreate` runs
+    // `validate_recreated_container` inside `create_container`, so a real engine
+    // answering with the whole topology panics there rather than reaching here --
+    // and that panic is the only check of a real engine's payload against that
+    // validation anywhere (see (One) in the doc comment). This line cannot fail
+    // after it and is kept for the failure message alone; do not read it as the
+    // thing standing guard, and do not remove the `expect` for a tidier error.
     assert_eq!(
         rebuilt.created().len(),
         1,
