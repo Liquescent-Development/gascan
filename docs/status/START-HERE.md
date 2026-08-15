@@ -30,9 +30,9 @@ and pushed. Start the next piece of work on a fresh branch off `main`.**
 
 **What that means and does not mean.** The engine now creates, starts, inspects, stops and removes a
 real sandbox in a real VM, and a published port is reachable from a test process. **Both maintainer
-rulings are closed on measurements, and both branches are merged.** What is left is milestone 3 --
-and one scoping question that has to be settled before it can be planned. See "what comes after the
-merge".
+rulings are closed on measurements, and both branches are merged.** What is left is milestone 3.
+**Its scoping question is settled and it is designed** — see "what comes after the merge" and
+`docs/superpowers/specs/2026-08-15-p5-1-milestone-3-rpc-surface-design.md`.
 
 ### The three things a new session most needs to know
 
@@ -119,12 +119,21 @@ cd ~/code/arca && swift build --product arca-engine && codesign --force --sign -
 
 ### FIRST THING TO DO
 
-**Nothing is mid-flight. There is no review to collect and no fix round open.** Task 11 closed after
-four fix rounds; Task 12 passed review with no fix round. Both verdicts are in the ledger.
+**UPDATED 2026-08-15. Nothing is mid-flight. Milestone 2 is merged and milestone 3 is designed.**
 
-**Start by expanding nothing and reading two things:** the milestone-2 design, then the plan's
-**Landing 5 expansion** (committed at Gas Can `4e40438`, amended by `f8c5ca1` and `1726c77`). Landing 5
-is already stepped out — **do not re-expand it** — and it is the only landing left.
+**Read `docs/superpowers/specs/2026-08-15-p5-1-milestone-3-rpc-surface-design.md`, then write its
+implementation plan.** That design is approved; do not re-brainstorm it. It carries six pieces —
+`CreateContainer`, `Exec`, `Logs`, `ExecManager.signalExec`, and carried follow-ups (a) and (b) —
+in a stated order, with §5 fixing what proves each one.
+
+**Two things in it will save a session each.** It is **Arca-side Swift plus live tests**: Gas Can's
+half is already implemented and tested, so no Gas Can PR is on the critical path (§2.1). And the
+live-tier fixtures are one call each to affordances milestone 2 already built —
+`layout_running` (`crates/gascan-arca/tests/live/common/mod.rs:710`) writes a one-image OCI layout
+running any command, which is what both `Exec` and `Logs` need (§5.2).
+
+**The everything-below-here for milestone 2 is history now.** The paragraphs on Landing 5, Task 13's
+first hour and the two maintainer rulings are kept for their reasoning, not as current state.
 
 The design records why the engine owns a private state root and why that made `initialize()` safe when
 milestone 1 had rejected it. The plan carries the landings; 3, 4 and 5 were all expanded *after* the
@@ -163,7 +172,10 @@ correct and still governs where a new test belongs. **Read them as history, not 
 item.** It is the first task needing a real engine process, a real kernel and a real VM.
 
 The three RPCs still answering `unsupported_capability` are **`CreateContainer`, `Exec` and `Logs`**
-(`SandboxEngineService.swift:636`, `:988`, `:998`). `Exec` and `Logs` are milestone 3's.
+(`SandboxEngineService.swift:674`, `:1023`, `:1033` — re-derived 2026-08-15; the `:636`, `:988`,
+`:998` this file carried until then were stale on all three). **All three are milestone 3's**, ruled
+2026-08-15 — see the design at
+`docs/superpowers/specs/2026-08-15-p5-1-milestone-3-rpc-surface-design.md`.
 
 ### What milestone 2 has landed
 
@@ -316,8 +328,8 @@ methods, so the tier went from 8 tests / 6 ignored to 6 / 4, and nothing else mo
 **As of `9db2f7d` EIGHT of the eleven are implemented: `Capabilities`, `Inspect`, `ListResources`,
 `PrepareImage`, `Create`, `Start`, `Stop` and `Remove`.** There is also an
 `arca-engine image load --state-root <R> --oci-layout <L>` subcommand. **Only `CreateContainer`, `Exec`
-and `Logs` answer `unsupported_capability`** (`SandboxEngineService.swift:636`, `:988`, `:998`);
-`Exec` and `Logs` are milestone 3's.
+and `Logs` answer `unsupported_capability`** (`SandboxEngineService.swift:674`, `:1023`, `:1033`,
+re-derived 2026-08-15); **all three are milestone 3's.**
 
 **Read the "NOTHING HAS EVER BEEN EXECUTED END TO END" section at the top before you believe any of
 that means the engine works.** Eight implemented means eight that return the right answers to VM-free
@@ -1006,9 +1018,11 @@ reduction.
 
 **P5.1's own milestones: 1 skeleton (merged), 2 lifecycle (this one), 3, 4.**
 
-- **Milestone 3 — `Exec`, `Logs`, and `ExecManager.signalExec`.** Design §3 change 5 and the
-  milestone-2 design's out-of-scope list both name it. `tty` and `signals` are the two capability
-  flags still `false`, correctly, and this is what earns them.
+- **Milestone 3 — `CreateContainer`, `Exec`, `Logs`, and `ExecManager.signalExec`.** DESIGNED
+  2026-08-15: `docs/superpowers/specs/2026-08-15-p5-1-milestone-3-rpc-surface-design.md`. `tty` and
+  `signals` are the two capability flags still `false`, correctly, and this is what earns them.
+  It also takes carried follow-ups (a) and (b) below. **It is Arca-side Swift plus live tests** —
+  Gas Can's half is already built and tested, verified 2026-08-15 (design §2.1).
 - **Milestone 4 — everything that makes it a product.** Daemon wiring and `BackendSelection::Arca`,
   the launchd plist, installer changes, `gascan doctor` surfacing engine facts, the offline proof that
   moves `offline` off `ISOLATION_UNVERIFIED`, the **pin bump** with its signed tag, and the decision on
@@ -1017,23 +1031,33 @@ reduction.
   proto permitting offline-plus-ports with no stated winner, and `AckResponse` being unable to express
   a partial `Remove`.
 
-**`CreateContainer` HAS NO MILESTONE, AND IT NEEDS ONE.** It is the third RPC still answering
-`unsupported_capability`, and this file has been listing it beside `Exec` and `Logs` while assigning
-only those two to milestone 3. It is "recreate the container of an existing sandbox, reusing what is
-retained", and **`gascand` calls it in three places** — `service.rs:1699`, `:1778`, `:4314`, the
-image-replace and rollback paths. **P5's exit criterion is "`gascan-arca` passes conformance and
-existing `gascan-e2e`", which cannot happen while it refuses.** Decide where it belongs before
-milestone 3 is planned; it may change that milestone's shape.
+**`CreateContainer` IS MILESTONE 3'S FIRST TASK — RULED 2026-08-15. This is closed; do not
+re-litigate it.** It is "recreate the container of an existing sandbox, reusing what is retained"
+(`engine.proto:296-302`), and **P5's exit criterion is "`gascan-arca` passes conformance and existing
+`gascan-e2e`", which cannot happen while it refuses.** It goes first because it reuses machinery
+`Create` already has and flips no capability flag.
+
+**THE CALL-SITE COUNT THIS FILE CARRIED WAS WRONG, AND IT IS THE KIND OF ERROR THAT SIZES A TASK
+WRONG.** It said "`gascand` calls it in three places — `service.rs:1699`, `:1778`, `:4314`".
+**There are two production call sites**, both on the image-replace path: `:1699` (`rollback_image`)
+and `:1778` (`replace_image`). **`:4314` is not a call path** — it is inside
+`#[cfg(test)] mod storage_tests`, which opens at `:4252`, in a `MutableCapabilitiesRuntime` test
+double that delegates straight to `FakeRuntime`. Verified 2026-08-15 with
+`awk 'NR<=4315 && /^(mod|#\[cfg\(test\)\])/'` over `crates/gascand/src/service.rs`.
 
 ### Still open, not started
 
-- **Three follow-ups this milestone's reviews named and deliberately did not take.** Each is small,
-  each closes a stated gap, and each is written up where it lives: **(a)** move the shutdown wait out
-  of the executable into `ArcaEngine` (`runUntilQuiesced`) so task 17 gets a fails-before/passes-after
-  test — reverting the fix still leaves `swift test` green; **(b)** a test that
-  `unpackLayerToCache` actually calls `cachedLayerIsReusable`, which needs an `Image` fixture; **(c)**
-  the host telling the guest how many layers it attached, so "no layers" and "layers I could not
-  identify" stop being the same observation.
+- **Three follow-ups this milestone's reviews named and deliberately did not take. ASSIGNED
+  2026-08-15.** Each is small, each closes a stated gap, and each is written up where it lives:
+  **(a)** move the shutdown wait out of the executable into `ArcaEngine` (`runUntilQuiesced`) so
+  task 17 gets a fails-before/passes-after test — reverting the fix still leaves `swift test` green;
+  **(b)** a test that `unpackLayerToCache` actually calls `cachedLayerIsReusable`, which needs an
+  `Image` fixture; **(c)** the host telling the guest how many layers it attached, so "no layers" and
+  "layers I could not identify" stop being the same observation.
+  **(a) and (b) are milestone 3's** — both host-side Swift, both touching code that milestone does
+  not, so neither collides. **(c) is milestone 4's**, because it needs a `containerization` submodule
+  change, a `make vminit-rebuild` and a guest-side measurement, and milestone 4's pin bump already
+  forces a submodule decision.
 - **The Minors** — 6 in Gas Can, 8 in Arca, from the milestone-1 adversarial reviews. Two Gas Can
   Minors were taken along the way. Each carries its own reproduction in the review reports.
 - **D7's narrowed retry.** Unblocked by evidence; maintainer's ruling 2026-08-12 was a separate PR,
