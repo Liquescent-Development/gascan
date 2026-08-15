@@ -85,8 +85,30 @@ retained resources is caught by a test that exists today.
 `engine.proto:296-302` defines the request as a `CreateRequest` plus `repeated Resource retained`,
 with the engine creating the container only and everything in `retained` already existing.
 
-The engine reads its own store to confirm each retained resource is present and owned before it
-builds the container, and refuses with `not_found` naming the missing one otherwise.
+**AMENDED 2026-08-15, after Task 1's review measured that the original wording did not achieve its
+own stated purpose.** The paragraph below said "confirm each retained resource is present and
+owned". A reviewer showed that verifies the wrong list: the container mounts
+`request.create.volumes` and attaches `request.create.network`, while `retained` is a separate
+field, so a request with `retained: []` and populated `create.volumes` passed the guard untouched
+and built the container — **the exact silent failure this section exists to prevent.** Task 1's
+first implementation shipped that, and the test written to prove the guard asserted the bypass as
+intended behaviour.
+
+**The engine verifies the topology the container will actually mount.** It iterates
+`request.create.volumes` plus the managed name from `request.create.network`, and requires each to
+be **both held by the engine and named in `retained`**, refusing with `not_found` naming the
+missing one, or `ownership_mismatch` / `foreign_resource_refused` when it is held by someone else.
+
+This is not a contract change: the wire format is untouched, and `engine.proto` does not forbid an
+engine refusing more than the minimum. It makes `retained` an assertion the caller must match rather
+than the sole source of truth.
+
+**Gas Can already enforces the same correspondence client-side** — `validate_retained_resources`
+(`crates/gascan-core/src/runtime.rs:893-918`) requires every retained resource to be an expected
+volume or the expected network, owned by Gas Can, matching the sandbox id, non-duplicated, and
+**exactly count-equal** to the requested topology. So this guard is defence in depth against a
+non-Gas-Can or buggy client, not a fix for a reachable Gas Can bug. It is still required: an engine
+guard that is bypassed by under-populating a list is not a guard.
 
 **The reason is that the alternative failure is silent.** A container attached to a volume the
 engine no longer holds starts anyway and the mount is simply absent — which is the exact shape of
