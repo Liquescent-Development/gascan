@@ -7,7 +7,8 @@ Written 2026-08-11 for two branches in flight; rewritten 2026-08-12 after both m
 rewritten 2026-08-13 mid-milestone-2; rewritten again 2026-08-13 (evening) with **Landing 4
 complete and Landing 5 the whole of what remains**; updated 2026-08-13 (late) after Task 13's first
 hour, which **proved the spawn, got `Create` working end to end for the first time, and cost two
-unplanned Arca fixes on the way** — Tasks 13a and 13b.
+unplanned Arca fixes on the way** — Tasks 13a and 13b; **rewritten 2026-08-14 (evening) after the
+named-volume defect was fixed and committed, leaving the shutdown crash as the only open ruling.**
 
 ---
 
@@ -27,15 +28,20 @@ refused on a measured defect that needs a ruling, and the branches still have to
 
 1. **`Create`, `Start`, `Stop`, `Remove` and a published port ALL WORK END TO END, measured.** The
    sentence this file led with for two days — "nothing has ever been executed end to end" — is retired.
-2. **`named_volumes` IS REFUSED, on a defect confirmed twice.** The engine attaches block volumes the
-   guest never mounts. Do not "fix" the flag; read the section below.
+2. **`named_volumes` IS NOW TRUE and the defect behind it is FIXED** (2026-08-14 evening, Arca
+   `1d453cf` / submodule `ca47c87`, Gas Can `41ac39a`). All four capability flags this milestone
+   planned are claimed. **The only open ruling is the graceful-shutdown crash.**
 3. **If the engine dies with `vmnet_return_t(rawValue: 1001)`, force-quit `InternetSharing`.** It cost
    an hour before anyone tried it.
+4. **The `containerization` submodule moved to `ca47c87`.** Any worktree build, and anything that
+   rebuilds the guest, must use that revision — `f02cdf9` predates the volume fix and a guest built
+   from it measures the old behaviour.
 
 | | |
 |---|---|
-| Arca | `feat/engine-state-ownership`, HEAD `9db2f7d`, based on `cc316b65` — 37 commits |
-| Gas Can | `docs/p5-1-milestone-2-design`, based on `6847d1e` — **HEAD is whatever commit last touched this file**, so read it with `git log -1`, do not trust a SHA written here — 27+ commits |
+| Arca | `feat/engine-state-ownership`, HEAD `1d453cf`, based on `cc316b65` — **read it with `git log -1`; the SHA here has gone stale on every pass over this file** |
+| Arca submodule | `containerization` on branch `merge/upstream-main`, HEAD **`ca47c87`** — carries the guest (`vminitd`) and the EXT4 label code. **Not `f02cdf9`; that predates the volume fix.** |
+| Gas Can | `docs/p5-1-milestone-2-design`, based on `6847d1e` — **HEAD is whatever commit last touched this file**, so read it with `git log -1`, do not trust a SHA written here — 28+ commits |
 | Design | `docs/superpowers/specs/2026-08-12-p5-1-milestone-2-engine-lifecycle-design.md` |
 | Plan | `docs/superpowers/plans/2026-08-12-p5-1-milestone-2-engine-lifecycle.md` |
 | Parent design | `docs/superpowers/specs/2026-08-10-p5-1-engine-service-and-wiring-design.md` |
@@ -101,8 +107,10 @@ image load`, then `PrepareImage` → `Ok` and `Create` → `Ok` with three volum
 container**. That was the first container this engine has ever created, and closing it took two
 unplanned Arca fixes (Tasks 13a and 13b below).
 
-**`Start`, `Stop` and `Remove` HAVE STILL NEVER RUN.** Read the rest of this section as still true of
-them. Each measured rather than assumed:
+**SUPERSEDED — `Start`, `Stop` and `Remove` ALL RUN NOW**, driven end to end by the live tier
+(`lifecycle::create_start_inspect_stop_and_remove_drive_a_real_container`, among others). The bullets
+below are kept because their *reasoning* about what a VM-free test can and cannot reach is still
+correct and still governs where a new test belongs. **Read them as history, not as current state.**
 
 - **`Start` is entirely unproven.** `startContainer` is unreachable without a VM — it throws
   `notInitialized` first. The one test that drives it says so in its own name
@@ -113,7 +121,9 @@ them. Each measured rather than assumed:
 - ~~**The live tier cannot spawn the branch engine at all**~~ — **FIXED and proven**, Gas Can `776a71c`.
   It passes all four options now, with `--kernel-path` and `--vminit-layout` arriving as
   `GASCAN_ARCA_KERNEL_PATH` and `GASCAN_ARCA_VMINIT_LAYOUT`.
-- **Every capability flag is still `false`.** The engine claims nothing it has not earned.
+- ~~**Every capability flag is still `false`.**~~ — **SUPERSEDED.** `project_mount`, `loopback_publish`,
+  `resource_limits` and (since 2026-08-14) `named_volumes` are all `true`, each earned by a live test
+  that fails without it. `tty` and `signals` remain `false`, correctly: nothing drives them.
 
 **Landing 5 exists precisely to close this gap, and Task 13 is a step change in kind, not just the next
 item.** It is the first task needing a real engine process, a real kernel and a real VM.
@@ -146,6 +156,7 @@ The three RPCs still answering `unsupported_capability` are **`CreateContainer`,
 | 13 the lifecycle and the published port | — | `1020002`, `288b75c` |
 | 14 the capability flips — **three of four** | `5e52aae`..`6c77bb8` | `782de04`, `1ce26d6` |
 | 15 the workspace suite, run alone | — | — |
+| 16 named volumes mount, and the fourth flag — **follow-on, after the ruling** | `1d453cf`, submodule `ca47c87` | `41ac39a` |
 
 **Tasks 3b, 3c, 6b, 13a and 13b were not in the approved plan.** Each was added on a maintainer ruling
 after a review — or, for 13a, a controller spike — found something real: a `try?` that let
@@ -306,86 +317,148 @@ refuse instead. The reasoning is on each method in `SandboxEngineService.swift` 
 
 ## What is left, now that the implementation is done
 
-**RULED 2026-08-14: BOTH OF THESE ARE TO BE FIXED.** They were written up as open questions and the
-maintainer closed them the same day — "seems like we need to fix both of the things you left alone".
-They are the next session's work, and **they are both Arca-side.**
+**RULED 2026-08-14: BOTH OF THESE WERE TO BE FIXED. ONE NOW IS.** The maintainer closed both as open
+questions the same day — "seems like we need to fix both of the things you left alone".
 
-**Take them in this order, and spike the first one before planning it.** The volume defect is the one
-with real unknowns; the shutdown crash is bounded. Milestone 2's own tasks are done, so these are
-follow-on work on the same branches — **do not start a new branch.**
+**The named-volume defect is FIXED, verified and committed** (2026-08-14 evening). Its section below is
+kept as a record and is marked CLOSED; do not work it again. **The shutdown crash is still open and is
+the next session's work.** Both are Arca-side, and both are follow-on work on the existing branches —
+**do not start a new branch.**
 
 **Before either: this session's method is what found them, and it is worth repeating.** Both were
 discovered by driving the real thing and measuring the result, not by reading. Every claim that
-outran the code this session was caught by a reviewer running a mutation. Keep dispatching a fresh Opus
-implementer per task and an Opus reviewer after each.
+outran the code was caught by a mutation. Keep dispatching a fresh Opus implementer per task and an
+Opus reviewer after each — **and read "when a subagent goes quiet" in the traps section before you
+dispatch anything**, because that cost a duplicate agent on 2026-08-14.
 
-### RULED — FIX IT — named volumes are attached but never mounted
+### CLOSED 2026-08-14 — named volumes are mounted, and `named_volumes` is true
 
-**`capabilities.namedVolumes` is `false` and that is deliberate.** The engine creates all three volumes,
-formats each as EXT4 at its declared capacity, resolves each, builds a `Mount.block` for each, logs
-`Configured volume mounts mount_count=4 total_mounts=13`, starts the container — **and the guest mounts
-none of them**, with no warning and no error.
+**FIXED, verified and committed.** Arca `1d453cf` (outer) and `ca47c87` (the `containerization`
+submodule, on branch `merge/upstream-main`); Gas Can `41ac39a`. **Nothing here is open work.** The
+section is kept because the way it was diagnosed is worth more than the fix, and because two confident
+hypotheses were wrong in instructive ways.
 
-**Measured twice, by two agents, independently.** With 256 MiB / 512 MiB / 1 GiB volumes,
-`/proc/partitions` shows the three devices at exactly `262144`, `524288` and `1048576` 1K-blocks — so
-the request and the images are correct — while `/proc/mounts` names none of the three targets. The
-reviewer checked **all 18 mount lines** and found them mounted nowhere else either. **The obvious
-explanation was ruled out**: the tier adds an image layer, `/home/workspace/{.local,.cache,.config}` are
-confirmed present in the guest, and nothing changes.
+**What it actually was, and it is NOT what this file predicted for two days.**
+`ArcaBoot.prepareOverlayFS` decided what a virtio-blk device was by *counting*: it mounted `/dev/vdb`
+as the writable layer, then walked `/dev/vdc` upward until a device was missing and called everything
+it found a read-only OverlayFS layer. Named volumes are attached *after* the image layers, so it
+swallowed them — mounting all three **read-only as overlay lowerdirs of the container's own rootfs**.
+Measured from the guest console with a two-layer image and 256 MiB / 512 MiB / 1 GiB volumes:
 
-**A NEGATIVE INSTRUMENT GUARDS IT**, which is what stops the false flag reading as an oversight:
-`mounts::the_managed_volumes_are_attached_to_the_guest_but_this_engine_mounts_none_of_them` re-checks
-through `list_resources` that the store really holds all three, asserts a **positive control** (`/` is
-mounted, so the parser demonstrably sees mounts at all), then asserts no target is mounted. **Its
-failure message instructs whoever makes it fail to flip the flag and delete the test.**
+```
+vminitd: detected 5 OverlayFS layer block devices
+EXT4-fs (vde): mounted filesystem ... ro without journal.   <- the 256 MiB volume
+EXT4-fs (vdf): mounted filesystem ... ro without journal.   <- the 512 MiB volume
+EXT4-fs (vdg): mounted filesystem ... ro without journal.   <- the 1 GiB volume
+```
 
-**The hypothesis, labelled as a reading of the source and NOT a second measurement.** Every block mount
-Arca builds for itself passes `destination: ""` — commented "Empty to prevent auto-mount by framework" —
-and is mounted by vminitd at a hardcoded `/mnt/writable` or `/mnt/layer{index}`
-(`OverlayFS/OverlayFSMounter.swift:69-105`); a volume takes the other branch and passes a real
-destination (`ContainerManager.swift:3943-3949`). The reviewer strengthened it: **`/workspace` IS a real
-destination that IS honoured, via virtiofs**, so the failure is specific to **block + destination**.
-It also confirmed the mounts reach `containerConfig.mounts`, so the loss is downstream of config
-assembly.
+Separately, `LinuxContainer.swift:797` (host code, in the engine) dropped **every** mount whose source
+began `/dev/vd` from the container's OCI spec, so `vmexec` never saw the volumes either — it reported
+`mountToRootfs: processing 8 mounts` and none of them were volumes.
 
-**Gas Can cannot dodge the branch.** A capacity selects `block`, no capacity selects `local`, and
-`policy.rs` compiles a capacity for all three volumes from `Storage`, whose every field must be greater
-than zero. **So the fix is Arca-side.**
+**So the earlier measurement was true and its interpretation was wrong.** "The reviewer checked all 18
+mount lines and found them mounted nowhere" was correct — `/mnt/layer{N}` lives in the VM's *root* mount
+namespace, outside the container's rootfs, so from inside the container they are invisible. They were
+mounted the whole time, just not as themselves and not anywhere reachable. **A negative result inside
+one namespace says nothing about another.**
 
-#### What the next session needs before it plans this, and must establish FIRST
+**Two hypotheses this file carried were both wrong**, and neither could have been settled by reading:
 
-**THE DECIDING QUESTION IS WHETHER THE FIX IS HOST-SIDE OR GUEST-SIDE, AND IT CHANGES THE COST BY AN
-ORDER OF MAGNITUDE.** Establish it before writing anything — the same way Task 13's first hour
-established that `image load` then `Create` worked, which turned what would have been a fix round into
-an hour.
+1. **"A real destination that nothing in the boot sequence honours."** Wrong — nothing ever got as far
+   as a destination.
+2. **"The `/dev/vd` skip at `Server+GRPC.swift:659` is the mechanism."** Also wrong, and it was the
+   controller's own first conclusion from the source. That branch logged **zero** times: `vmexec`
+   mounts OCI spec entries directly and never goes through that RPC. **The guest console log
+   (`<state-root>/images/containers/<id>/bootlog.log`, which captures hvc0) is what settled it**, and it
+   is the instrument to reach for first on anything guest-side.
 
-- **Host-side** — Arca's Swift arranges the mount differently, e.g. passing `destination: ""` and
-  telling the guest where to put it, as its own OverlayFS mounts already do. Cheap, and testable in the
-  existing loop: rebuild `arca-engine`, re-sign, re-run the live tier.
-- **Guest-side** — `vminitd` has to honour a real destination for a block mount. **This means rebuilding
-  the vminit OCI image**, and that is a different kind of day: `assets/README.md` records Go 1.24+, the
-  Swift Static Linux SDK, ~10 GB of disk and **20-25 minutes** per build, and the running engine takes
-  vminit through `--vminit-layout`, so a rebuilt image has to be loaded before anything can be
-  re-measured.
+**The fix: identity travels with the artifact.** `EXT4.Formatter` writes an `ArcaBlockDeviceRole` into
+the ext4 superblock's `s_volume_name` (`arca.writable`, `arca.layer`); the guest reads it back and
+mounts only what carries a role it recognises. Count and order stop mattering. Volumes are formatted
+with no label (`VolumeManager.swift:192`), so the guest leaves them alone and `vmexec` mounts them from
+the OCI spec at the destination the host chose. The host filter now drops only mounts with an **empty
+destination**, which is the host's own statement of intent rather than a guess about the source.
 
-**The source you need is present, which is the good news.** `vminitd` is a submodule at
-`containerization/vminitd/Sources/` — not a vendored binary — and it carries an
-`ArcaBoot.swift`, which is the obvious first place to look for how the guest decides what to mount.
-`assets/README.md` describes vminit as `/sbin/vminitd` plus Arca's own Go services.
+**THE COST ESTIMATE IN THIS FILE WAS WRONG BY TWO ORDERS OF MAGNITUDE, AND IT DELAYED THIS FOR TWO
+SESSIONS.** It priced a guest-side fix at "a different kind of day — Go 1.24+, the Swift Static Linux
+SDK, ~10 GB of disk and 20-25 minutes per build". Measured on this machine:
 
-**Note this cuts against the current hypothesis, so treat the hypothesis as unproven.** It says nothing
-in the boot sequence knows about a real destination — but the framework comment
-"Empty to prevent auto-mount by framework" implies a non-empty destination **would** be auto-mounted.
-Both readings fit the measurement. **Do not start from either; measure which.**
+| | this file said | measured 2026-08-14 |
+|---|---|---|
+| Swift Static Linux SDK | needs installing | **already installed** — `swift sdk list` shows 6.2 and 6.3 |
+| Go | 1.24+ needed | 1.26.3 present |
+| `make vminit-rebuild` | 20-25 min | **41 seconds**, and it writes straight to `~/.arca/vminit` |
+| Reproducibility | unknown | an unmodified rebuild reproduces the deployed guest **exactly** |
 
-**The instrument already exists and will tell you the moment you succeed.**
-`mounts::the_managed_volumes_are_attached_to_the_guest_but_this_engine_mounts_none_of_them` fails the
-day the guest mounts them, and its failure message is the instruction list: flip
-`capabilities.namedVolumes`, replace it with the positive test it describes, and update
-`read_rpcs::capabilities_report_only_what_this_engine_build_implements`. **Task 14's rule still binds —
-the flag flips only when a live test drives the capability**, so the positive test comes first.
+The 20-25 minutes is `make build-assets`, which also builds the kernel. **Check `swift sdk list` before
+believing any cost estimate in this file.**
 
-### RULED — FIX IT — the engine aborts on its own graceful-shutdown path
+**THE TWO HALVES CANNOT SHIP SEPARATELY, and this was measured.** With the host half applied and the
+guest reverted to the pre-fix vminit, the host leaves each volume in the OCI spec while the old guest
+has already claimed the same device read-only, so `vmexec` fails the second mount with **errno 16
+(EBUSY)** and `Start` fails outright: `8 passed; 6 failed`, including `ports::`, `limits::` and
+`mounts::the_project_root_...`, which have nothing to do with volumes. **Host-only is worse than
+neither** — it converts a silent misidentification into a failure to start. A bisect landing between
+them meets a broken engine.
+
+**The instrument now is the positive test.**
+`mounts::the_managed_volumes_are_mounted_at_their_declared_targets_and_writable` asserts the mount, the
+block device's size behind it, and a write and readback, with `/home/workspace` as a control that must
+NOT be a mount point. The capacities stay unequal (256 MiB / 512 MiB / 1 GiB) so a volume mounted at
+another's target is caught by size. The old negative test is deleted.
+
+**FOUR THINGS WERE NOT VERIFIED and are the first place to look if this misbehaves:**
+
+1. **A stale layer cache.** Every run used a fresh temp layout, so freshly-labelled layers. Layer images
+   under `~/.arca/layers/{digest}/layer.ext4` written *before* this change carry no label and the new
+   guest ignores them. Both commit messages say to clear that directory; **nobody has exercised what
+   happens if you do not.** This is the most likely thing to bite in real use.
+2. **The two new `exit(1)` paths in `ArcaBoot`** — an unreadable superblock, and "more than one
+   `arca.writable` device" — are on the container boot path and were never driven.
+3. **Two of the three mutations the implementer claimed** (widening the OCI filter back; swapping
+   capacities at the `createContainer` handoff) were not independently reproduced. The load-bearing one
+   was.
+4. **Label collision and prefix behaviour** were reviewed by reading only.
+
+### RULED — FIX IT — the engine aborts on its own graceful-shutdown path — **THIS IS THE OPEN WORK**
+
+**This is what the next session does.** It is the only one of the two rulings still open. Reproduced
+again on 2026-08-14 during the volume work, unprompted, in a run whose tests all passed — which is
+consistent with everything below and adds no new information beyond "still there".
+
+#### The map, gathered 2026-08-14 by reading only — NONE of it is measured
+
+Treat every item as a hypothesis. It is recorded to save a fresh session the search, not to point at an
+answer.
+
+- **There are SEVEN `MultiThreadedEventLoopGroup`s in the engine's process**, and six are
+  container-scoped, which fits "only crashes once containers have been created" exactly:
+  `TCPProxy.swift:37` (2 threads), `UDPProxy.swift:45`, `FilesystemClient.swift:43`,
+  `ProcessControlClient.swift:44`, `WireGuardClient.swift:46`, `OverlayFSClient.swift:56`, plus the
+  engine's own at `ArcaEngineCommand.swift:185`.
+- **`TCPProxy` tears its own group down correctly** (`TCPProxy.swift:79-82`), so it is not a naive leak.
+  But **`TCPProxyHandler` builds its outbound connection with `ClientBootstrap(group: context.eventLoop)`
+  (`TCPProxy.swift:156`)** — a client channel riding the *server* group's event loop. An outbound
+  connect still pending when that group shuts down is the shape of the reported error. This is the
+  single most promising lead and it is **unverified**.
+- **A fix for this exact crash class already landed and is documented** at
+  `ArcaEngineCommand.swift:191-210`: `serve()` was split out of `run()` so that objects holding event
+  loops are released *before* the group shuts down, verified under `SWIFTNIO_STRICT=1`. **Read that
+  comment before proposing anything** — it records three alternatives that were each measured and each
+  still crashed: awaiting teardown inside a `Task.detached`, dropping the redundant close, and swapping
+  the async `shutdownGracefully()` for a blocking `syncShutdownGracefully()` on a Dispatch thread. So
+  the residual is a second instance of a known shape, and the obvious fixes are already known dead.
+
+#### Build the rate instrument FIRST, before touching anything
+
+**At ~19% a single clean shutdown proves nothing, and four in five will be clean by chance.** The first
+deliverable is something that reports the crash rate from one run — a loop that starts an engine,
+creates a container, `SIGTERM`s it and records the exit status, N times, printing the count. Report
+before and after **in one run each**, never A-then-B across a drifting machine.
+
+`LiveEngine::kill` (`crates/gascan-arca/tests/live/common/mod.rs:343`) drops stdin and waits **without
+asserting the exit status**, and its comment records why. **Once the crash is fixed that refusal should
+be inverted into an assertion**, or the fix ships with nothing that can fail if it regresses.
 
 Once containers have been created, `SIGTERM` sometimes ends in a crash rather than a clean stop:
 
@@ -523,8 +596,11 @@ and roughly fifteen engines were started. The pool is per-boot.
 
 The worktree used for that comparison has been removed; `git worktree list` in `~/code/arca` shows only
 the main tree. **If you ever need to build Arca at another revision in a worktree, it needs
-`git submodule update --init --recursive` first** — `containerization` is a submodule at `f02cdf9` and
-the build fails with `containerization/Package.swift doesn't exist` without it.
+`git submodule update --init --recursive` first** — `containerization` is a submodule and the build
+fails with `containerization/Package.swift doesn't exist` without it. **Its HEAD is now `ca47c87`, not
+the `f02cdf9` this file recorded until 2026-08-14**: `f02cdf9` predates the named-volume fix, so a
+guest built from it silently measures the old behaviour. Re-derive the pointer with
+`git -C ~/code/arca submodule status` rather than trusting any SHA written here.
 
 **What is NOT blocked:** anything Arca-side and VM-free, and any Gas Can work that does not spawn a
 serving engine — **including the OCI-layout writer the published-port test needs**, which is pure file
@@ -666,7 +742,9 @@ repeated here because missing one is expensive:
    unwired engine **starts a container with published ports, publishes nothing, and reports
    success**. `:2730`/`:3058` guard teardown the same way.
 3. **Task 14's `named_volumes` and `loopback_publish` cannot be flipped** until that wiring
-   exists. A flag whose machinery is unwired is a claim with no instrument.
+   exists. A flag whose machinery is unwired is a claim with no instrument. **SATISFIED — both are
+   now `true`**, `loopback_publish` at Task 14 and `named_volumes` on 2026-08-14, each with a live
+   test that fails without it. The rule it states still binds for any future flag.
 4. **Signing precedes the live tier.** Task 6b landed it; do not reorder Task 13 ahead of it.
    Unsigned, `initialize()` dies at `VmnetNetwork()` and the engine never creates a socket.
 
@@ -892,6 +970,55 @@ stashes exist in `~/code/arca` right now (`stash@{0}` five simultaneous Task-12 
 `stash@{1}` a Task-11 precedence inversion); both are discardable. **When an agent dies mid-review,
 finishing its work directly is often faster than re-dispatching** — the last two verdicts of milestone 2
 are controller adjudications for exactly this reason, and both are labelled as such in their files.
+
+**THE GUEST CONSOLE LOG IS THE INSTRUMENT FOR ANYTHING INSIDE THE VM, AND IT IS EASY TO MISS.**
+Apple's `ContainerManager` points every container's boot log at
+`<state-root>/images/containers/<id>/bootlog.log` (`Containerization/ContainerManager.swift:317`), and
+`CHVirtualMachineInstance.swift:617` captures `hvc0` into it — so it carries the kernel's device
+enumeration, `vminitd`'s own logging and `vmexec`'s mount-by-mount trace. On 2026-08-14 it overturned
+**two** confident source readings in ten minutes, one of them the controller's own, and it is what
+turned "the guest mounts none of them" into "the guest mounts all three, read-only, as overlay
+lowerdirs".
+
+**Two obstacles, both solved, and the fix is in `stash@{0}` in `~/code/gascan`:**
+
+1. The live harness puts its state root in a `tempfile::TempDir` that is removed when the test ends,
+   taking the log with it. The stash makes the state root persist under `/tmp/gascan-spike-state-*`.
+2. `Remove` empties the container directory, so even a persisted state root loses the log at teardown.
+   The stash snapshots it to `/tmp/gascan-spike-bootlogs/` **before** teardown.
+
+It is marked `SPIKE PATCH -- NOT FOR COMMIT`. **`common/mod.rs`'s half still applies; `mounts.rs`'s
+half does not**, because that file was rewritten — take the harness half with
+`git checkout stash@{0} -- crates/gascan-arca/tests/live/common/mod.rs` and re-add the snapshot by hand
+(the natural place is `start_and_read`, which both mount tests go through). **Making this a permanent,
+committed affordance of the live tier is worth doing and has not been done.**
+
+**WHEN A SUBAGENT GOES QUIET — THE PROCEDURE, because the warning alone did not work.** This file
+already said "an empty agent roster is not proof of death" and "check file mtimes before re-dispatching".
+The controller read that, checked mtimes, found both trees clean and an empty roster **three minutes
+after dispatch**, concluded the agent had died, and re-dispatched. It had not died; it had not yet
+written anything. Two agents then edited one working tree, and the second one's first file duplicated a
+type name and mismatched an enum case's arity — a build break that would have read as the first agent's
+own bug. It was caught only because that agent noticed and stopped after one file.
+
+**The check is not "is there work on disk" but "is there work on disk NOW and also several minutes from
+now".** An agent that has produced nothing is indistinguishable from a dead one at any single instant.
+Before re-dispatching: sample `git status --short --untracked-files=all` in every repo **twice, at least
+five minutes apart**, and only conclude death if both are empty AND the roster is still empty. There are
+no worktrees here, so two agents in one tree is always a collision.
+
+**AND DO NOT SPLIT A TASK BY FILE TO LET TWO AGENTS RUN.** It was considered and correctly rejected on
+2026-08-14: the Gas Can half of the volume work looks file-disjoint from the Arca half, but the new
+test can only be seen to fail and then pass against a rebuilt engine and vminit — the contended
+resources. **Split on the resource the measurement depends on, not on files.** Two agents rebuilding
+`~/.arca/vminit` produce two green runs that were never measuring the same thing.
+
+**A STASH DOES NOT KEEP APPLYING AFTER THE FILE IT PATCHES IS REWRITTEN.** The bootlog spike stash was
+applied against a `mounts.rs` its hunks no longer fitted; the apply failed and left the file **in a
+conflicted `UU` state**, which is a mutation in a tree that otherwise held staged work. Recovered with
+`git checkout HEAD -- <file>`. Take one file at a time with
+`git checkout stash@{N} -- <path>` when the stash is partly stale, and check `git status` after every
+stash operation rather than assuming a failed apply changed nothing.
 
 **THE MACHINE'S MEMORY IS THE HIDDEN VARIABLE.** 24 GB installed, and on 2026-08-13 it was carrying
 ~8 GB of swap and 7.8 GB in the compressor, with Firefox alone at 11.25 GB across 38 processes.
