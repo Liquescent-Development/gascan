@@ -1618,6 +1618,27 @@ autostart. That is a race worth waiting out — exactly what the narrowed retry 
 states fired") is met, and it points toward the retry.** Maintainer's ruling 2026-08-12:
 write it in its own PR, not folded into unrelated work.
 
+**D7'S RATE HAS GONE UP SHARPLY, AND THAT IS THE STRONGEST ARGUMENT YET FOR WRITING THE RETRY.** This
+section was written after **two** occurrences on 2026-08-12. **2026-08-15 added three more**, all the
+same `written but never published` state, each in a different test:
+
+| run | test |
+|---|---|
+| during task 17 | `daemon_start_identity_is_stable_across_caller_locale_and_timezone` |
+| after the re-review fixes | `environment_teardown_terminates_its_exact_live_daemon` |
+| on merged `main` | `durable_controller_state_survives_daemon_replacement` |
+
+**Read the tests as a set rather than individually: three different ones, one state.** That is the
+signature of a race in the runtime record, not of three flaky tests. Each target passed alone
+immediately afterwards (28/28, 16/16, 28/28) and a re-run of the whole suite was exit 0 with zero
+occurrences, so isolation still exonerates the branch every time — but the cost of doing that
+exoneration is now paid on roughly every second workspace run. Load averages were 3.2-5.9 throughout,
+which is the condition this file records these scaling with.
+
+**The keygen fault fired once the same day too** —
+`KeygenMessage("/dev/fd/22: Bad file descriptor")` in `gascand --test apply_setup`, the third of the
+three known root causes. All three have now been seen on this machine.
+
 Two cautions that remain true:
 
 - **It is load-dependent and does not reproduce on demand.** Both occurrences happened
