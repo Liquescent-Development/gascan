@@ -75,20 +75,29 @@ fn appending_and_reporting(destination: &Utf8Path, port: u16) -> Utf8PathBuf {
 /// rebuilding a resource that already existed, and the first boot's line would
 /// be gone.
 ///
-/// **THIS TEST IS THE ONLY THING STANDING BEHIND THE ENGINE'S NETWORK GUARD IN
-/// THE HELD DIRECTION, AND IT CANNOT BE REPLACED BY A SWIFT TEST.** Arca's
-/// `reusedTopologyRefusal` requires every retained resource -- volumes *and* the
-/// managed network -- to be held by the engine and owned by the caller.
-/// `ArcaEngineTests` covers the network's refused half
-/// (`CreateTests.testCreateContainerRefusesAManagedNetworkTheEngineDoesNotHold`),
-/// but not the held half: `preparedEngine()` leaves `NetworkManager`
-/// uninitialised deliberately, so `getNetworkByName` returns nil for *every*
-/// name and "the engine holds this network" is unreachable in that target by
-/// construction. Here it is reachable and load-bearing: `retained_for` puts the
-/// managed network in the retained set (`common/mod.rs:699-706`), so a guard that
-/// wrongly refused a network it does hold would fail the `create_container` call
-/// below outright. **Deleting this test removes the only evidence that half of
-/// the guard works.**
+/// **THIS TEST IS THE ONLY THING STANDING BEHIND A RECREATE ONTO A REAL
+/// NETWORK.** Arca's `reusedTopologyRefusal` requires every resource the rebuilt
+/// container mounts -- volumes *and* the managed network -- to be held by the
+/// engine and owned by the caller. `ArcaEngineTests` now covers both directions
+/// of that guard, refused and held, but it can only do so against a `null`-driver
+/// network: `preparedEngine()` initialises no `NetworkManager`, so a `bridge`
+/// network cannot be created there at all
+/// (`CreateTests.PreparedEngine.hold(network:)` records why `null` is the one
+/// driver that reaches the store without a backend). That fixture answers the two
+/// questions the guard asks and nothing else.
+///
+/// **What only this test can say is that the network the container reattaches to
+/// still WORKS.** The rebuilt container below must start and answer on its
+/// published port, which per `ports.rs` requires a live WireGuard-backed network
+/// -- so a recreate that passed the guard and then attached the container to
+/// nothing usable fails here and nowhere else. `retained_for` puts the managed
+/// network in the retained set (`common/mod.rs:699-706`), so this really is the
+/// retained network and not a fresh one.
+///
+/// CORRECTED in fix round 2. An earlier version of this paragraph claimed to be
+/// the only cover for the guard's held half. That was true when written and
+/// stopped being true in the same round, when `hold(network:)` made the held half
+/// reachable VM-free.
 ///
 /// **What this does NOT prove.** Nothing about the refusal path: an engine that
 /// checked no retained resource at all passes this test, because everything this
