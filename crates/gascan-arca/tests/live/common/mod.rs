@@ -327,24 +327,55 @@ impl LiveEngine {
     /// must not have. Closing the pipe is the one signal the wrapper is built
     /// around, and `wait` then returns only once the engine itself is reaped.
     ///
-    /// **The exit STATUS is deliberately not asserted, and that is a real blind
-    /// spot rather than an oversight.** Arca's engine aborts on its own
-    /// graceful-shutdown path once containers have been created --
+    /// **The exit status IS asserted, and until 2026-08-14 it deliberately was
+    /// not.** Arca's engine aborted on its own graceful-shutdown path --
     /// `Cannot schedule tasks on an EventLoop that has already shut down`, then
     /// `NIOExtras/QuiescingHelper.swift:141: Fatal error: leaking promise`, then
-    /// `Trace/BPT trap: 5` -- MEASURED at **6 crashes in 32 shutdowns** across one
-    /// review. Every one happened strictly after the test's assertions, so
-    /// asserting a clean status here would fail runs whose subject behaved
-    /// correctly, against a defect this tier does not own. **The blindness is
-    /// bounded to the shutdown window**: a crash any earlier surfaces as a
-    /// transport error mid-call or through `await_socket`'s `try_wait()`, and
-    /// both of those paths are exercised. Routed to milestone 4 with the other
-    /// Arca-side findings; assert the status here once it is fixed.
-    pub async fn kill(mut self) {
+    /// `Trace/BPT trap: 5`, arriving here as exit 133. Every one happened
+    /// strictly after its test's assertions, so asserting then would have failed
+    /// runs whose subject behaved correctly. The engine now waits for its
+    /// ACCEPTED connections rather than for its listening socket (Arca's
+    /// `ArcaEngineCommand.serve`), and `shutdown.rs` measured the change: **6
+    /// crashes in 192 before, 0 in 192 after**, interleaved.
+    ///
+    /// **This assertion is what stops that regressing**, and it is here rather
+    /// than only in `shutdown.rs` because every test in this tier stops an
+    /// engine: a regression fails whichever test meets it first, at whatever
+    /// rate it comes back at, instead of waiting for the one module built to
+    /// look for it. `shutdown.rs` is what says how *often*; this says *whether*.
+    ///
+    /// A failure here is about the shutdown and nothing before it. A crash any
+    /// earlier surfaces as a transport error mid-call or through
+    /// `await_socket`'s `try_wait()`, and both of those paths are exercised.
+    pub async fn kill(self) {
+        let socket = self.socket.clone();
+        let status = self.stop().await;
+        assert!(
+            status.success(),
+            "the engine on {socket} exited with {status} rather than cleanly. \
+             Exit 133 is `Trace/BPT trap: 5` -- the graceful-shutdown abort; run \
+             `shutdown::the_engine_exits_cleanly_after_a_container_has_been_created` \
+             to see it as a rate rather than as one sample"
+        );
+    }
+
+    /// Stops the engine and reports the status it exited with.
+    ///
+    /// **Closing stdin rather than killing the child, and the difference
+    /// matters.** The child is [`SUPERVISOR`], not the engine: killing it would
+    /// leave the engine running until the watcher noticed the pipe close, which
+    /// is exactly the race `a_call_against_a_killed_engine_fails_rather_than_hanging`
+    /// must not have. Closing the pipe is the one signal the wrapper is built
+    /// around, and `wait` then returns only once the engine itself is reaped.
+    ///
+    /// The status is the engine's own and not the wrapper's: [`SUPERVISOR`]
+    /// ends `wait "$enginepid"; status=$?; ...; exit "$status"`, so an engine
+    /// killed by a signal arrives here as the shell's `128 + signo`.
+    pub async fn stop(mut self) -> std::process::ExitStatus {
         drop(self.child.stdin.take());
         let stopped = tokio::time::timeout(Duration::from_secs(30), self.child.wait()).await;
         match stopped {
-            Ok(Ok(_)) => {}
+            Ok(Ok(status)) => status,
             Ok(Err(error)) => panic!("could not wait on the engine supervisor: {error}"),
             // The wrapper is still up 30s after the pipe closed, so its watcher
             // did not run or the engine ignored `SIGTERM`. Say so rather than
