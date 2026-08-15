@@ -104,9 +104,10 @@ engine refusing more than the minimum. It makes `retained` an assertion the call
 than the sole source of truth.
 
 **Gas Can already enforces the same correspondence client-side** — `validate_retained_resources`
-(`crates/gascan-core/src/runtime.rs:893-918`) requires every retained resource to be an expected
-volume or the expected network, owned by Gas Can, matching the sandbox id, non-duplicated, and
-**exactly count-equal** to the requested topology. So this guard is defence in depth against a
+(`crates/gascan-core/src/runtime.rs:893-923`) requires every retained resource to be an expected
+volume or the expected network, owned by Gas Can, matching the sandbox id and non-duplicated
+(`:904-916`), and **exactly count-equal** to the requested topology (`:917-922`, refusing with
+`invalid_state` and "retained resources do not exactly match the requested topology"). So this guard is defence in depth against a
 non-Gas-Can or buggy client, not a fix for a reachable Gas Can bug. It is still required: an engine
 guard that is bypassed by under-populating a list is not a guard.
 
