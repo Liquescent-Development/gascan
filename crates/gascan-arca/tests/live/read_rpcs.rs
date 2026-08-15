@@ -83,8 +83,13 @@ async fn capabilities_report_only_what_this_engine_build_implements() {
 /// regression that made `Logs` answer with a status would have passed.
 ///
 /// **THREE, and it was ten. What forces a newly-implemented method out of this
-/// list is the `expect_err` on each entry, and NOT the length assertion below
-/// -- which is a tautology and was described here as the mechanism.** `answers`
+/// list is the assertion on each entry -- the `expect_err` on `CreateContainer`
+/// and `Logs`, and the `panic!` on `Exec`'s first frame -- and NOT the length
+/// assertion below, which is a tautology and was described here as the
+/// mechanism.** `Exec` refuses in the stream rather than at the call, for the
+/// reason given four lines above, so it has no `expect_err` at all; an earlier
+/// version of this paragraph said "the `expect_err` on each entry" and was
+/// wrong for a third of the list. `answers`
 /// is a `vec![]` literal, so its length is three by construction and no engine
 /// behaviour can change it; the assertion cannot fail except by someone editing
 /// the literal, which is visible in the diff anyway. It is kept as an executable
@@ -155,8 +160,9 @@ async fn every_unimplemented_method_answers_unsupported_capability_not_a_transpo
     ];
 
     // A tautology, kept as an executable comment: `answers` is a literal, so
-    // this cannot fail. The `expect_err` on each entry above is what actually
-    // fails when a method becomes real -- see the doc comment.
+    // this cannot fail. What actually fails when a method becomes real is the
+    // assertion on each entry above -- `expect_err` for `CreateContainer` and
+    // `Logs`, the `panic!` on the first frame for `Exec` -- see the doc comment.
     assert_eq!(
         answers.len(),
         3,

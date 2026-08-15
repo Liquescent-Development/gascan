@@ -55,17 +55,25 @@ rulings are now closed on measurements.** What is left is the merge.
 | Parent design | `docs/superpowers/specs/2026-08-10-p5-1-engine-service-and-wiring-design.md` |
 | Governing roadmap | `docs/superpowers/plans/2026-08-04-arca-integration-roadmap.md` — P0-P8; P0-P4 done, P5 current |
 
-**Re-run and verified 2026-08-14 (late), after the shutdown fix, both trees clean:**
+**THIS IS THE CURRENT TABLE. Re-run and verified 2026-08-14 (late), after the review of tasks 13-17
+and every fix BOTH ROUNDS produced — Arca `c68bd0a`..HEAD with submodule `30b9c8f`..HEAD, Gas Can
+`53925e5`..HEAD. Both trees clean:**
 
 | | |
 |---|---|
-| `swift test --filter ArcaEngineTests` | `Executed 151 tests, with 0 failures` |
+| `swift test --filter ArcaEngineTests` | `Executed 160 tests, with 0 failures` — 151, plus 6 `LayerCacheRoleTests` and 3 `ShutdownObserverTests` |
 | `swift test --filter ArcaTests.NetworkPruneGateTests` | `Executed 3 tests, with 0 failures` |
 | `env -u RUSTUP_TOOLCHAIN cargo test --workspace --no-fail-fast` | exit 0 — **1436 passed / 0 failed / 36 ignored across exactly 74 targets** reporting `0 filtered out` |
-| the live tier, `-- --ignored --test-threads=1` | **14 passed / 0 failed**, 84s, 3 non-ignored filtered out |
+| the live tier, `-- --ignored --test-threads=1` | **14 passed / 0 failed**, 216s, 3 non-ignored filtered out |
 | `cargo fmt --all --check` | exit 0 |
 | `cargo clippy --workspace --all-targets` | no errors |
 | `scripts/ci-check-ignored-tests.sh` | `36 ignored test(s), matching the baseline` |
+| `make vminit-rebuild` | 42s — the guest carries the new `ArcaBoot`, so the tier's 14/14 measures it |
+
+**The earlier figures this table carried — 151 tests and an 84s tier — were measured against Arca
+`9fac267`, before the review round.** They were left standing when the review section was added 560
+lines below with different numbers, so the page briefly carried two "current" tables that disagreed.
+That is the exact failure this milestone keeps writing traps about, in the file that holds the traps.
 
 **The workspace deltas are accounted for rather than accepted**, which is the standing rule.
 Against the 1436 / 33 / 74 baseline of the same morning: **ignored +3**, exactly
@@ -572,7 +580,7 @@ cache "is the most likely thing to bite in real use", and it was:
 Fixed by validating the label on every cache hit and reformatting what fails — a 16-byte superblock
 read, not a scan. `ArcaBlockDeviceRole.role(ofImageAt:)` is the predicate, and
 `LayerCacheRoleTests` (4 tests) drives it against real formatted images; **mutating it to trust the
-cache fails all four**. The guest also stops degrading silently: a writable device with no layers is now
+cache fails three of the four; the fourth is the control, which passes by construction and must** -- the summary line's "4 failures" counts assertions, not tests. The guest also stops degrading silently: a writable device with no layers is now
 `exit(1)` rather than a container booted on the wrong rootfs. **Nothing drives that path** and it says
 so in place. **Checked on this machine: no layer cache exists at all, so nothing was mis-mounting here.**
 
@@ -620,14 +628,71 @@ immutable; the correction lives here.
 
 | | |
 |---|---|
-| `swift test --filter ArcaEngineTests` | `Executed 155 tests, with 0 failures` — 151 plus `LayerCacheRoleTests` |
+| `swift test --filter ArcaEngineTests` | `Executed 160 tests, with 0 failures` — 151, plus 6 `LayerCacheRoleTests` and 3 `ShutdownObserverTests` |
 | `swift test --filter ArcaTests.NetworkPruneGateTests` | `Executed 3 tests, with 0 failures` |
-| the live tier, `-- --ignored --test-threads=1` | **14 passed / 0 failed**, 214s, 568 engines stopped |
+| the live tier, `-- --ignored --test-threads=1` | **14 passed / 0 failed**, 214s — **579 engines stopped**, 568 of them in `shutdown.rs` and one in each of the other 11 |
 | `cargo test --workspace --no-fail-fast` | exit 0 — **1436 / 0 / 36 across 74 targets** |
 | `cargo fmt --all --check`, `clippy --workspace --all-targets`, the ignored gate | clean |
 
 **The guest was rebuilt** (`make vminit-rebuild`, **42 seconds**, confirming the 41s on record and not
 the "20-25 minutes" this file once predicted), so the live tier's 14/14 measures the new `ArcaBoot`.
+
+### THE RE-REVIEW OF THE FIX ROUND — 2026-08-14 (late)
+
+**Both fix rounds were re-reviewed before merging, because this project's own record says a fix round
+is where the next defect lives**: Task 11 ran four rounds and rounds 2 and 3 each found NEW defects in
+the previous round's fixes. That held again. **Every round-1 finding is closed**, two of them pinned by
+the compiler rather than by prose, and the re-review produced **1 Important and 10 Minor** of its own,
+all now fixed.
+
+**THE IMPORTANT IS THE ONE THIS FILE KEEPS WRITING TRAPS ABOUT, AND I SHIPPED IT ANYWAY.** The
+stale-cache fix was tested by `LayerCacheRoleTests`, which pinned the **predicate** and not the
+**decision**. A reviewer bypassed the check at its call site — `if true || cachedRole == .overlayLayer`,
+the pre-fix behaviour exactly — and `swift test` stayed at **155 passing**. The live tier could not see
+it either, and for the same structural reason the original defect could not be seen: every live engine
+gets a fresh temp state root, so the cache is always empty and the branch is never entered. **So every
+mutation of the call site left everything green, and the commit disclosed the equivalent gap for task
+17 twice in bold while saying nothing about this one. The asymmetry was the finding.**
+`OverlayFSUnpacker.cachedLayerIsReusable` and `discardCachedLayer` now carry the decision, two tests
+drive them over a real `{cache}/{digest}/layer.ext4` layout, and the same bypass mutation now fails.
+**What is still unmeasured — that `unpackLayerToCache` calls them — is written where it lives.**
+
+**A GUARD I ADDED COULD HAVE REFUSED A LEGITIMATE BOOT, and my justification for it was false.** The
+guest's new `exit(1)` was defended as "a writable overlay with no layers is not a shape the host ever
+builds deliberately". Nothing refuses a zero-layer manifest, so a `FROM scratch` image or an OCI
+artifact produces exactly that shape on purpose. Such a container now dies where before it booted on
+the bare initfs — **both are wrong**, since its rootfs should be empty and vminitd's is not, and the
+refusal is the better of the two because it is loud. The real fix is for the host to tell the guest how
+many layers it attached, so the two cases can be distinguished at all. **Carried, not done.**
+
+**The shutdown observer is now measured.** `ShutdownObserverTests` drives the graceful path with a peer
+holding the drain open (the guard must NOT fire), a control with nothing recorded (it must), and an
+inverted-order case asserting that recording after the close loses the race — so the ordering the guard
+rests on is load-bearing rather than incidental. `ShutdownRequests` moved from `private` in the
+executable into `ArcaEngine` for it: the reviewer's probe had to re-declare the type, and **a test that
+drives a re-declaration proves the re-declaration**, which is a shape this project has shipped before.
+
+**Four smaller ones, each the same class.** "Mutating the predicate fails all four" was three of four —
+the fourth is the control and passes by construction, and the summary line counts assertions rather
+than tests. A comment still said the mutation leaves `swift test` "at 151 passing" in the commit that
+took it to 155. Two more comments still named `~/.arca/layers` as the layer cache after the commit
+message said they had all been corrected. And the widened mount filter now logs what it drops, because
+"no runtime could honour it anyway" and "it vanishes without a word" are not the same outcome.
+
+**A latent race the fix introduced, fixed with it:** two concurrent creates over one stale layer digest
+could both reach the discard, and the loser's `removeItem` would throw `ENOENT` out of the RPC. Already
+gone is now treated as the outcome it wanted; **everything else is rethrown**, because an entry that
+survives is handed to the guest unlabelled.
+
+**D7 FIRED TWICE MORE, AND SO DID THE KEYGEN FAULT — neither is this branch.** Two consecutive workspace
+runs went red on two DIFFERENT documented flakes: `mode is 0200 ... written but never published` in
+`gascan-e2e` (fourth recorded occurrence, a new test —
+`environment_teardown_terminates_its_exact_live_daemon`), then
+`KeygenMessage("/dev/fd/22: Bad file descriptor")` in `gascand`. Both crates are untouched by this
+branch — `git diff 6847d1e..HEAD -- crates/gascan-e2e/ crates/gascan/ crates/gascand/` is **empty** —
+and both targets pass alone (28/28 and 25/25). The third run is exit 0 with zero occurrences of either
+signature. Load averages were 4.4-5.9 throughout, which is the condition this file records these
+failures scaling with. **Three of the three known root causes have now been seen on this machine.**
 
 ### THE MERGE IS THE WHOLE OF WHAT REMAINS
 

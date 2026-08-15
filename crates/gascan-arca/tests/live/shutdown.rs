@@ -25,6 +25,14 @@
 //! passes or fails on its own rate. Re-deriving the comparison would need one
 //! test that interleaves the workloads round-robin inside a single loop.
 //!
+//! **A clean count here means "the drains COMPLETED" only against Arca
+//! `c68bd0a` or later.** Every assertion below reduces to `ExitStatus::success`,
+//! and until that commit the engine exited 0 both when a drain finished and when
+//! it gave up at its ten-second grace -- so against an older engine these zeros
+//! mean only "did not crash", which is what they were originally built to say.
+//! Nothing on this side pins which engine is under test: `GASCAN_ARCA_ENGINE_BIN`
+//! names whatever the operator built.
+//!
 //! **They are deliberately not `#[ignore]`-free and not fast.** The container
 //! workload boots a real virtual machine per iteration.
 
@@ -87,9 +95,17 @@ impl Workload {
     ///
     /// | workload | pre-fix rate | n | false green |
     /// |---|---|---|---|
-    /// | `Untouched` | 1/96 = 0.0104 | 440 | 0.99% |
-    /// | `OpenChannel` | 5/96 = 0.0521 | 96 | 0.60% |
-    /// | `RemovedContainer` | 12/32 = 0.375 | 32 | 0.0000% |
+    /// | `Untouched` | 1/96 = 0.0104 | 440 | 0.9978% |
+    /// | `OpenChannel` | 5/96 = 0.0521 | 96 | 0.5888% |
+    /// | `RemovedContainer` | 12/32 = 0.375 | 32 | 0.0000294% |
+    ///
+    /// **440 is the smallest n that clears the bar** -- 439 gives 1.0083% -- which is a
+    /// stronger statement than a rounded figure and is why it is written out
+    /// rather than shortened. The first version of this table rounded 0.9978%
+    /// down to "0.99%" and 0.5888% up to "0.60%", which is the same
+    /// truncate-rather-than-round error the round before it was corrected for.
+    /// **Two consecutive rounds got a probability in this file wrong; print
+    /// what the expression evaluates to.**
     ///
     /// The two cheap workloads can afford theirs precisely because they boot no
     /// virtual machine: 440 engines that never create a container still cost
@@ -100,6 +116,18 @@ impl Workload {
             Self::OpenChannel => 96,
             Self::RemovedContainer => 32,
         }
+    }
+
+    /// Whether this workload needs an image loaded into the engine's store.
+    ///
+    /// Here rather than at the two places that care, because they are two
+    /// copies of one rule otherwise: `rate` decides whether to build a layout
+    /// and `one_shutdown` assumes the same set when it unwraps one. A workload
+    /// added to the second and not the first would panic inside the live tier,
+    /// which is the most expensive place in this repository to discover
+    /// anything.
+    fn needs_image(self) -> bool {
+        matches!(self, Self::RemovedContainer)
     }
 }
 
@@ -167,7 +195,7 @@ async fn rate(workload: Workload) -> Report {
     //
     // The `TempDir` is bound alongside the path because it owns the directory
     // the path names, and dropping it would delete the layout mid-run.
-    let images = (workload == Workload::RemovedContainer).then(|| {
+    let images = workload.needs_image().then(|| {
         let directory = tempfile::tempdir().expect("a temporary layout root");
         let layout = staying_up(Utf8Path::from_path(directory.path()).expect("a utf-8 path"));
         (directory, layout)
@@ -272,7 +300,7 @@ async fn one_shutdown(workload: Workload, layout: Option<&Utf8Path>) -> ExitStat
 /// because anyone doubts it.
 #[tokio::test]
 #[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN, a kernel and a \
-            vminit layout; no image, and so no base OCI layout"]
+            vminit layout; no image, and so no base OCI layout; stops 440 engines"]
 async fn the_engine_exits_cleanly_with_nothing_holding_a_connection() {
     let report = rate(Workload::Untouched).await;
     println!("{report}");
@@ -287,7 +315,7 @@ async fn the_engine_exits_cleanly_with_nothing_holding_a_connection() {
 /// that matches the container workload's says the container was a correlate.
 #[tokio::test]
 #[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN, a kernel and a \
-            vminit layout; no image, and so no base OCI layout"]
+            vminit layout; no image, and so no base OCI layout; stops 96 engines"]
 async fn the_engine_exits_cleanly_with_a_client_channel_still_open() {
     let report = rate(Workload::OpenChannel).await;
     println!("{report}");
