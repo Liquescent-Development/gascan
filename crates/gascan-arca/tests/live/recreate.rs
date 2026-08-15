@@ -75,6 +75,21 @@ fn appending_and_reporting(destination: &Utf8Path, port: u16) -> Utf8PathBuf {
 /// rebuilding a resource that already existed, and the first boot's line would
 /// be gone.
 ///
+/// **THIS TEST IS THE ONLY THING STANDING BEHIND THE ENGINE'S NETWORK GUARD IN
+/// THE HELD DIRECTION, AND IT CANNOT BE REPLACED BY A SWIFT TEST.** Arca's
+/// `reusedTopologyRefusal` requires every retained resource -- volumes *and* the
+/// managed network -- to be held by the engine and owned by the caller.
+/// `ArcaEngineTests` covers the network's refused half
+/// (`CreateTests.testCreateContainerRefusesAManagedNetworkTheEngineDoesNotHold`),
+/// but not the held half: `preparedEngine()` leaves `NetworkManager`
+/// uninitialised deliberately, so `getNetworkByName` returns nil for *every*
+/// name and "the engine holds this network" is unreachable in that target by
+/// construction. Here it is reachable and load-bearing: `retained_for` puts the
+/// managed network in the retained set (`common/mod.rs:699-706`), so a guard that
+/// wrongly refused a network it does hold would fail the `create_container` call
+/// below outright. **Deleting this test removes the only evidence that half of
+/// the guard works.**
+///
 /// **What this does NOT prove.** Nothing about the refusal path: an engine that
 /// checked no retained resource at all passes this test, because everything this
 /// names is genuinely held.
@@ -151,6 +166,11 @@ async fn a_recreate_reuses_its_retained_volumes_rather_than_rebuilding_them() {
         .create_container(recreate)
         .await
         .expect("CreateContainer must rebuild the container against retained resources");
+    // Kept for the failure message, not for the evidence: `CreateOutcome
+    // ::for_recreate` runs `validate_recreated_container`, which already requires
+    // exactly one container, so a whole-topology answer would have made the
+    // `expect` above panic first. The claim this test carries is the boot count
+    // below, not this line.
     assert_eq!(
         rebuilt.created().len(),
         1,
