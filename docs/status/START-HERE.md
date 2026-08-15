@@ -186,6 +186,7 @@ The three RPCs still answering `unsupported_capability` are **`CreateContainer`,
 | 16 named volumes mount, and the fourth flag — **follow-on, after the ruling** | `1d453cf`, submodule `ca47c87` | `41ac39a` |
 | 17 the shutdown crash, and the rate instrument — **follow-on, after the ruling** | `9fac267` | `3290af6` |
 | 18 the review of 13-17, and its 1 Critical / 6 Important / 7 Minor | `c68bd0a`, submodule `30b9c8f` | `53925e5` |
+| 19 the re-review of 18's fixes, and its 1 Important / 10 Minor | `8a26e15`, submodule `3f68806` | `455f328` |
 
 **Tasks 3b, 3c, 6b, 13a and 13b were not in the approved plan.** Each was added on a maintainer ruling
 after a review — or, for 13a, a controller spike — found something real: a `try?` that let
@@ -697,7 +698,7 @@ failures scaling with. **Three of the three known root causes have now been seen
 ### THE MERGE IS THE WHOLE OF WHAT REMAINS
 
 **Both branches are unmerged and unpushed, and nothing else is open.** Arca
-`feat/engine-state-ownership` at `c68bd0a` (submodule `30b9c8f`), Gas Can
+`feat/engine-state-ownership` at `8a26e15` (submodule `3f68806`), Gas Can
 `docs/p5-1-milestone-2-design` — read both with
 `git log -1` rather than trusting a SHA here.
 
