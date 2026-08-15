@@ -4,7 +4,13 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "$0")/../.." && pwd -P)
 script=$repo_root/scripts/build-arca-engine.sh
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/gascan-engine-pin-contract.XXXXXX")
-trap 'rm -rf "$fixture"' EXIT
+# A second and deliberately short directory, for the one thing that cannot live
+# under $fixture: the socket the engine case below binds. An AF_UNIX address is
+# capped at sun_path's 104 bytes, and $fixture under a macOS TMPDIR spends ~81
+# of those before the filename. MEASURED: the engine refused a 111-byte path
+# with `--socket-path is 111 bytes and sun_path holds 104`. /tmp costs 4.
+socket_dir=$(mktemp -d /tmp/gascan-engine-socket.XXXXXX)
+trap 'rm -rf "$fixture" "$socket_dir"' EXIT
 
 # A local signing identity, so the positive case needs no network and no real key.
 ssh-keygen -q -t ed25519 -N '' -C engine@example.invalid -f "$fixture/key"
@@ -39,18 +45,26 @@ git -C "$subupstream" -c commit.gpgsign=false commit -qm seed
 
 # An upstream repository standing in for Arca. It carries a Package.swift naming
 # everything the build script names: the arca-engine executable product it builds,
-# the SandboxEngineProto target it builds beside it, and the ArcaEngineTests target
-# its test gate filters on. A fixture that declares fewer targets than the script
+# the SandboxEngineProto target it builds beside it, and the two test targets its
+# test gate filters on. A fixture that declares fewer targets than the script
 # builds does not exercise the script; it just fails differently.
 #
 # No `products:` array, matching Arca (Package.swift:11-34): `swift build --product
 # arca-engine` has to resolve through SwiftPM's implicit executable product here for
 # the same reason it does there, or the contract would exercise a shape production
 # does not have.
+#
+# Package.swift and the prune suite are written through functions, and the suite
+# names are arguments, because the negative cases below need a tree in which
+# exactly one of the two gated suites is absent. Substituting into a quoted
+# heredoc rather than interpolating one: the comments carry backticks, which an
+# unquoted heredoc would run as commands.
 upstream=$fixture/upstream
 mkdir -p "$upstream/Sources/ContainerBridge" "$upstream/Sources/SandboxEngineProto" \
-  "$upstream/Sources/arca-engine" "$upstream/Tests/ArcaEngineTests"
-cat >"$upstream/Package.swift" <<'PACKAGE'
+  "$upstream/Sources/arca-engine" "$upstream/Tests/ArcaEngineTests" \
+  "$upstream/Tests/ArcaTests"
+write_package() {
+  sed -e "s/@ENGINE_TESTS@/$1/" -e "s/@ARCA_TESTS@/$2/" >"$upstream/Package.swift" <<'PACKAGE'
 // swift-tools-version: 6.2
 import PackageDescription
 let package = Package(
@@ -72,31 +86,151 @@ let package = Package(
             name: "arca-engine",
             dependencies: ["ContainerBridge", "SandboxEngineProto"]
         ),
-        .testTarget(name: "ArcaEngineTests", dependencies: ["ContainerBridge"])
+        .testTarget(name: "@ENGINE_TESTS@", dependencies: ["ContainerBridge"]),
+        // Stands in for Arca's ArcaTests, which owns the DockerAPI-side prune
+        // gate test. A separate target and not another class in the engine suite:
+        // the whole reason the gate names two suites is that these are two
+        // targets, and a fixture with one would not exercise that.
+        .testTarget(name: "@ARCA_TESTS@", dependencies: ["ContainerBridge"])
     ]
 )
 PACKAGE
+}
+write_package ArcaEngineTests ArcaTests
 printf 'public let engineFixture = 1\n' >"$upstream/Sources/ContainerBridge/Fixture.swift"
 printf 'public let sandboxEngineProtoFixture = 1\n' >"$upstream/Sources/SandboxEngineProto/Fixture.swift"
+# The entitlements the build script signs with, under the name Arca gives them
+# (Arca's Makefile: `ENTITLEMENTS = Arca.entitlements`), because the script reads
+# them out of the checkout by that name. One key and not the five Arca carries:
+# this is the one the engine cannot start a container without, and a fixture
+# copy of the other four would be four more things to keep in step for nothing.
+cat >"$upstream/Arca.entitlements" <<'ENTITLEMENTS'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.virtualization</key>
+    <true/>
+</dict>
+</plist>
+ENTITLEMENTS
+# The fixture engine refuses to serve without the entitlement the build script
+# signs it with, and refuses BEFORE it creates its socket -- which is the shape
+# of the real failure it stands in for. ContainerManager.initialize() constructs
+# a Containerization.VmnetNetwork; unentitled, the real engine exits 1 on
+# `vmnet_return_t(rawValue: 1002)` with no socket ever created.
+#
+# vmnet is NOT called here, deliberately. MEASURED on a standalone probe:
+# vmnet_start_interface answers 1001 from a `swift build` binary and 1000 from
+# the same binary ad-hoc signed with these entitlements -- so it would work as a
+# probe on this machine. But a hosted runner that cannot create a vmnet
+# interface at all would then fail this case for a reason with nothing to do
+# with the signature, and a release gate that goes red for the environment is a
+# gate people learn to ignore. What is asked instead is the kernel's view of
+# THIS process's entitlements, which is environment-independent and which
+# nothing but a real signature can satisfy -- not a `codesign -d` reading of the
+# file on disk, which would prove the command ran rather than that it worked.
+#
+# It binds and exits rather than serving: the property is that the engine got
+# far enough to create its socket, and a fixture that stayed up would need the
+# case below to background it and reap it for no gain.
 cat >"$upstream/Sources/arca-engine/main.swift" <<'MAIN'
 import ContainerBridge
+import Darwin
+import Foundation
 import SandboxEngineProto
+import Security
+
+func refuse(_ message: String, _ status: Int32) -> Never {
+    FileHandle.standardError.write(Data("arca-engine: \(message)\n".utf8))
+    exit(status)
+}
+
+let entitlement = "com.apple.security.virtualization"
+guard let task = SecTaskCreateFromSelf(nil),
+      SecTaskCopyValueForEntitlement(task, entitlement as CFString, nil) != nil
+else {
+    refuse("this process holds no \(entitlement); refusing to serve", 1)
+}
+
+var arguments = CommandLine.arguments.dropFirst().makeIterator()
+var requested: String?
+while let argument = arguments.next() {
+    if argument == "--socket-path" { requested = arguments.next() }
+}
+guard let socketPath = requested else {
+    refuse("no --socket-path", 64)
+}
+
+var address = sockaddr_un()
+address.sun_family = sa_family_t(AF_UNIX)
+let capacity = MemoryLayout.size(ofValue: address.sun_path)
+let pathBytes = Array(socketPath.utf8)
+guard pathBytes.count < capacity else {
+    refuse("--socket-path is \(pathBytes.count) bytes and sun_path holds \(capacity)", 64)
+}
+withUnsafeMutableBytes(of: &address.sun_path) { destination in
+    destination.copyBytes(from: pathBytes)
+    destination[pathBytes.count] = 0
+}
+
+let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
+guard descriptor >= 0 else { refuse("socket() failed with errno \(errno)", 70) }
+let bound = withUnsafePointer(to: &address) { pointer in
+    pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+    }
+}
+guard bound == 0 else { refuse("bind() failed with errno \(errno)", 70) }
+guard listen(descriptor, 1) == 0 else { refuse("listen() failed with errno \(errno)", 70) }
 
 print(engineFixture + sandboxEngineProtoFixture)
 MAIN
 # A real assertion and not an empty test body: the script's gate proves the pinned
 # engine passes its own suite, so a fixture whose suite cannot fail would leave the
 # gate's failing direction unexercised.
-cat >"$upstream/Tests/ArcaEngineTests/EngineFixtureTests.swift" <<'TEST'
+#
+# Each suite asserts against a value the caller supplies, and each carries a
+# message naming ITSELF. Both halves are needed to pin execution rather than
+# listing: `expected` is what lets a tree be built in which exactly one of the two
+# suites fails, and the distinct message is what proves the failure came from that
+# suite and not from the guard or the other one. Identical assertions in both --
+# which is what these were -- would make the two indistinguishable in the output,
+# and a `--filter` that had stopped selecting the second suite would look exactly
+# like one that still did.
+write_engine_suite() {
+  sed -e "s/@EXPECTED@/$1/" >"$upstream/Tests/ArcaEngineTests/EngineFixtureTests.swift" <<'TEST'
 import ContainerBridge
 import XCTest
 
 final class EngineFixtureTests: XCTestCase {
-    func testTheFixtureTargetIsTheOneThatWasBuilt() {
-        XCTAssertEqual(engineFixture, 1)
+    func testTheEngineSuiteRan() {
+        XCTAssertEqual(engineFixture, @EXPECTED@, "the ArcaEngineTests half of the gate ran")
     }
 }
 TEST
+}
+write_engine_suite 1
+# XCTest and not swift-testing, matching the suite it stands in for: the script
+# passes --disable-swift-testing, so a `@Test` here would be listed by nothing and
+# run by nothing, and the fixture would pass while proving the opposite.
+write_prune_suite() {
+  sed -e "s/@PRUNE_SUITE@/$1/" -e "s/@EXPECTED@/$2/" \
+    >"$upstream/Tests/ArcaTests/NetworkPruneGateTests.swift" <<'TEST'
+import ContainerBridge
+import XCTest
+
+final class @PRUNE_SUITE@: XCTestCase {
+    func testThePruneSuiteRan() {
+        XCTAssertEqual(
+            engineFixture, @EXPECTED@,
+            "the ArcaTests.NetworkPruneGateTests half of the gate ran"
+        )
+    }
+}
+TEST
+}
+write_prune_suite NetworkPruneGateTests 1
 git -C "$upstream" init -q
 git -C "$upstream" config user.name fixture
 git -C "$upstream" config user.email engine@example.invalid
@@ -140,6 +274,83 @@ git -C "$upstream" tag tags/ambiguous "$drifted"
 # a planted refs/<name> in the cache can shadow. Needs no slash at all.
 git -C "$upstream" tag shadowed "$drifted"
 
+# Two commits in which exactly one of the two gated suites is absent, so both
+# halves of the listing guard can be shown to fire, and to fire naming the suite
+# that went. Everything else about each tree is well-formed -- the pin, the
+# signature, the products, the other suite -- so the only thing left to fail on
+# is the guard.
+#
+# A guard that fired only for the suite it was first written for would be the
+# defect it exists to prevent, moved one suite over: `swift test --filter` exits
+# 0 when it matches nothing, so the gate would report success having run half of
+# what it names.
+#
+# The renames are past the anchor in each pattern, not before it: the engine half
+# keeps the `ArcaEngineTests` prefix and loses the `.` after it, and the prune
+# half keeps its target and renames only the class. A guard grepping for bare
+# substrings would pass both of these.
+git -C "$upstream" mv Tests/ArcaEngineTests Tests/ArcaEngineTestsRenamed
+write_package ArcaEngineTestsRenamed ArcaTests
+git -C "$upstream" add -A
+git -C "$upstream" -c commit.gpgsign=false commit -qm 'engine suite renamed'
+engine_suite_gone=$(git -C "$upstream" rev-parse --verify HEAD)
+git -C "$upstream" tag -s -m 'engine suite renamed' engine-suite-gone "$engine_suite_gone"
+
+git -C "$upstream" mv Tests/ArcaEngineTestsRenamed Tests/ArcaEngineTests
+write_package ArcaEngineTests ArcaTests
+write_prune_suite NetworkPruneGateTestsRenamed 1
+git -C "$upstream" add -A
+git -C "$upstream" -c commit.gpgsign=false commit -qm 'prune suite renamed'
+prune_suite_gone=$(git -C "$upstream" rev-parse --verify HEAD)
+git -C "$upstream" tag -s -m 'prune suite renamed' prune-suite-gone "$prune_suite_gone"
+
+# Two more trees, in which both suites are present and listed and exactly one of
+# them FAILS. These pin that the script EXECUTES each suite, which the listing
+# guard cannot: the guard proves a suite was declared, and a filter that selected
+# only one of the two would satisfy it exactly as well as one that selected both.
+#
+# The concrete decay this closes: `swift test` unions repeated --filter today,
+# MEASURED on Swift 6.3.3 at 46 tests against the real Arca tree. CI runs macos-26
+# with an unpinned toolchain (.github/workflows/ci.yml:80), so that is not the
+# Swift that gates releases. A SwiftPM in which the last --filter wins instead
+# would leave every other case here green while the gate ran 3 of 46 tests.
+#
+# Both directions, not just the second suite: a case that only ever fired for the
+# prune half would leave the engine half's execution resting on the same argument
+# it just refused to accept for the other one.
+# The prune class is restored here: the commit above left it renamed, and a tree
+# missing a suite would trip the listing guard long before anything ran.
+write_prune_suite NetworkPruneGateTests 1
+write_engine_suite 2
+git -C "$upstream" add -A
+git -C "$upstream" -c commit.gpgsign=false commit -qm 'engine suite fails'
+engine_suite_fails=$(git -C "$upstream" rev-parse --verify HEAD)
+git -C "$upstream" tag -s -m 'engine suite fails' engine-suite-fails "$engine_suite_fails"
+
+write_engine_suite 1
+write_prune_suite NetworkPruneGateTests 2
+git -C "$upstream" add -A
+git -C "$upstream" -c commit.gpgsign=false commit -qm 'prune suite fails'
+prune_suite_fails=$(git -C "$upstream" rev-parse --verify HEAD)
+git -C "$upstream" tag -s -m 'prune suite fails' prune-suite-fails "$prune_suite_fails"
+
+# A tree that is well-formed in every way but one: it declares no
+# Arca.entitlements. The pin verifies, both suites are present and pass, the
+# products build -- so the only thing left to refuse it is the signing step's
+# guard, and a script that had quietly stopped signing would print a path here
+# instead.
+#
+# Arca owns that file and Gas Can does not review its renames, so this is the
+# same class of decay as the listing guard above, one repository over. The
+# prune suite is restored first because the commit above left it failing, and a
+# failing suite would end the run a long way before the guard.
+write_prune_suite NetworkPruneGateTests 1
+git -C "$upstream" rm -q Arca.entitlements
+git -C "$upstream" add -A
+git -C "$upstream" -c commit.gpgsign=false commit -qm 'entitlements gone'
+entitlements_gone=$(git -C "$upstream" rev-parse --verify HEAD)
+git -C "$upstream" tag -s -m 'entitlements gone' entitlements-gone "$entitlements_gone"
+
 # file:// and not a bare path: the script constrains .url to schemes git cannot
 # turn into a command, so the fixture must speak one of them. git clone accepts
 # file:// against a local path unchanged.
@@ -162,11 +373,24 @@ run_case() {
   GASCAN_ARCA_ALLOWED_SIGNERS=$signers \
   GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=protocol.file.allow GIT_CONFIG_VALUE_0=always \
     bash "$script" >"$fixture/$label.out" 2>&1 || actual=$?
-  [[ $actual == "$expected" ]] || {
-    printf 'case %s: expected exit %s, got %s\n' "$label" "$expected" "$actual" >&2
-    cat "$fixture/$label.out" >&2
-    exit 1
-  }
+  # `nonzero` and not a pinned code for the failing-suite cases below: the exit
+  # there is `swift test`'s own, which this repository does not define and a
+  # toolchain is free to change. Those cases assert WHICH suite reported the
+  # failure from the captured output, which is the property, rather than pinning
+  # a number that would make the contract brittle for no gain.
+  if [[ $expected == nonzero ]]; then
+    [[ $actual != 0 ]] || {
+      printf 'case %s: expected a non-zero exit, got 0\n' "$label" >&2
+      cat "$fixture/$label.out" >&2
+      exit 1
+    }
+  else
+    [[ $actual == "$expected" ]] || {
+      printf 'case %s: expected exit %s, got %s\n' "$label" "$expected" "$actual" >&2
+      cat "$fixture/$label.out" >&2
+      exit 1
+    }
+  fi
 }
 
 # The well-formed pin, written up front because the missing-file cases below
@@ -233,10 +457,117 @@ git -C "$fixture/cache-shadowed-ref/arca" update-ref refs/shadowed \
   "$(git -C "$upstream" rev-parse --verify refs/tags/ambiguous)"
 run_case shadowed-ref "$fixture/pin-shadow.json" 65
 
+# 70 — the listing guard, each half proven on its own. Nothing else about either
+# tree is wrong: the pin is well-formed, the tag verifies and resolves, the
+# products build, and the other suite is present and passing. The only thing
+# left to fail on is the suite the gate names and the tree does not have.
+#
+# The message is asserted and not just the exit code, anchored at end of line so
+# each half is distinguishable from the other. `swift test --filter` exits 0 when
+# it matches nothing, so a gate naming two suites and checking one would report a
+# success it had not earned -- and an operator reading "declares no
+# ArcaEngineTests" while ArcaEngineTests is right there would be sent to the
+# wrong repository.
+write_pin "$fixture/pin-engine-gone.json" engine-suite-gone "$engine_suite_gone"
+run_case engine-suite-gone "$fixture/pin-engine-gone.json" 70
+grep -q 'declares no ArcaEngineTests$' "$fixture/engine-suite-gone.out" || {
+  printf 'the listing guard did not name the missing ArcaEngineTests\n' >&2
+  cat "$fixture/engine-suite-gone.out" >&2
+  exit 1
+}
+
+write_pin "$fixture/pin-prune-gone.json" prune-suite-gone "$prune_suite_gone"
+run_case prune-suite-gone "$fixture/pin-prune-gone.json" 70
+grep -q 'declares no ArcaTests\.NetworkPruneGateTests$' "$fixture/prune-suite-gone.out" || {
+  printf 'the listing guard did not name the missing ArcaTests.NetworkPruneGateTests\n' >&2
+  cat "$fixture/prune-suite-gone.out" >&2
+  exit 1
+}
+
+# non-zero — each filtered suite is EXECUTED, proven one half at a time. Both
+# suites are present and listed in these two trees, so the listing guard passes
+# and the only thing left to fail on is the test run itself.
+#
+# The listing guard cannot reach this. It proves a suite was declared; a --filter
+# that had stopped selecting one of the two would satisfy it exactly as well as
+# one that still selected both, and every other case in this file would stay
+# green while the release gate ran a fraction of what it names.
+#
+# Three assertions per case, and all three are needed: a non-zero exit, the
+# failing suite's own message present, and the listing guard's message ABSENT.
+# Without the third, a case could pass on exit 70 -- the guard firing for an
+# unrelated reason -- having never run a test at all.
+assert_failing_suite_reported() {
+  local label=$1 message=$2
+  grep -q "$message" "$fixture/$label.out" || {
+    printf 'case %s: the failing suite did not report itself: %s\n' "$label" "$message" >&2
+    cat "$fixture/$label.out" >&2
+    exit 1
+  }
+  ! grep -q 'the test gate matched no tests' "$fixture/$label.out" || {
+    printf 'case %s: failed at the listing guard, so no suite was ever run\n' "$label" >&2
+    cat "$fixture/$label.out" >&2
+    exit 1
+  }
+}
+
+write_pin "$fixture/pin-engine-fails.json" engine-suite-fails "$engine_suite_fails"
+run_case engine-suite-fails "$fixture/pin-engine-fails.json" nonzero
+assert_failing_suite_reported engine-suite-fails 'the ArcaEngineTests half of the gate ran'
+
+write_pin "$fixture/pin-prune-fails.json" prune-suite-fails "$prune_suite_fails"
+run_case prune-suite-fails "$fixture/pin-prune-fails.json" nonzero
+assert_failing_suite_reported prune-suite-fails \
+  'the ArcaTests.NetworkPruneGateTests half of the gate ran'
+
+# 70 — the pinned engine declares no entitlements file, so the script cannot
+# sign what it built. It must refuse rather than print an unsigned path: an
+# engine signed without com.apple.security.virtualization exits on the first
+# vmnet call and never serves, and the caller would meet that a long way from
+# here.
+write_pin "$fixture/pin-entitlements-gone.json" entitlements-gone "$entitlements_gone"
+run_case entitlements-gone "$fixture/pin-entitlements-gone.json" 70
+grep -q 'carries no entitlements file' "$fixture/entitlements-gone.out" || {
+  printf 'the entitlements guard did not name the file it could not find\n' >&2
+  cat "$fixture/entitlements-gone.out" >&2
+  exit 1
+}
+
 # 0 — well-formed pin, signed tag, tag resolves to the pinned revision
 run_case good "$fixture/pin-good.json" 0
 grep -q 'cache-good' "$fixture/good.out" || {
   printf 'success case did not print the checkout path\n' >&2
+  exit 1
+}
+
+# The binary the script printed must be able to serve, and unsigned it cannot.
+# The engine reaches Containerization.VmnetNetwork before it binds anything, and
+# vmnet refuses without com.apple.security.virtualization -- so an unsigned
+# engine exits non-zero having created no socket, which is what this asserts
+# against. The fixture engine refuses on the same terms and in the same order
+# (Sources/arca-engine/main.swift above), so deleting the codesign step from
+# scripts/build-arca-engine.sh turns this case red.
+#
+# Behavioural on purpose. A `codesign -d --entitlements -` reading of the file
+# proves the command ran, not that the process got the capability, so it would
+# stay green on a binary that cannot start.
+#
+# `tail -1` because the script prints the checkout first and the binary second.
+# The socket goes in $socket_dir -- short enough for sun_path, and outside the
+# cache the runs below clean.
+engine_binary=$(tail -1 "$fixture/good.out")
+engine_socket=$socket_dir/engine.sock
+engine_status=0
+"$engine_binary" --socket-path "$engine_socket" >"$fixture/engine-run.out" 2>&1 ||
+  engine_status=$?
+[[ $engine_status == 0 ]] || {
+  printf 'the engine the script printed refused to serve: exit %s\n' "$engine_status" >&2
+  cat "$fixture/engine-run.out" >&2
+  exit 1
+}
+[[ -S $engine_socket ]] || {
+  printf 'the engine the script printed created no socket at %s\n' "$engine_socket" >&2
+  cat "$fixture/engine-run.out" >&2
   exit 1
 }
 

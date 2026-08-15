@@ -19,6 +19,9 @@ tower.workspace = true
 
 [dev-dependencies]
 camino.workspace = true
+rustix.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "process", "rt", "rt-multi-thread", "sync", "time"] }
 

@@ -6,7 +6,7 @@ pin_file=${GASCAN_ARCA_PIN_FILE:-$repo_root/engine/arca-pin.json}
 cache_root=${GASCAN_ARCA_ENGINE_CACHE:-$repo_root/.artifacts/arca-engine}
 allowed_signers=${GASCAN_ARCA_ALLOWED_SIGNERS:-$repo_root/engine/allowed-signers}
 
-for command in git jq swift; do
+for command in codesign git jq swift; do
   command -v "$command" >/dev/null || {
     printf 'required command is unavailable: %s\n' "$command" >&2
     exit 69
@@ -149,12 +149,23 @@ swift build --package-path "$checkout" --configuration release \
 # it the right place: it proves the pinned engine passes its own suite rather
 # than proving a developer's working tree did.
 #
+# Two suites, not one. ArcaEngineTests cannot reach the `docker network prune`
+# attachment gate: NetworkHandlers is in DockerAPI, ArcaEngineTests depends only
+# on ArcaEngine, and tests/release/engine-targets-check.sh exists to keep that
+# edge from ever appearing. So the test that proves prune declines to delete an
+# in-use network lives in ArcaTests, and until it was named here nothing ran it.
+#
+# The named suite and NOT all of ArcaTests: that target also holds integration
+# tests that want a live daemon and VMs, which have no business in a release
+# gate. Widening this to `ArcaTests` would trade a gate that runs too little for
+# one that cannot run at all.
+#
 # --configuration release, matching the build above: leaving this unconfigured
 # would make SwiftPM build the whole package a second time in debug, and this
 # package vendors containerization, so that would be a very expensive mistake.
 #
-# --disable-swift-testing because ArcaEngineTests is pure XCTest, so the flag skips
-# nothing this script intends to run -- while in release configuration SwiftPM
+# --disable-swift-testing because both filtered suites are pure XCTest, so the flag
+# skips nothing this script intends to run -- while in release configuration SwiftPM
 # launches the swift-testing runner by invoking an executable target with
 # --test-bundle-path. Arca's `Arca` executable is an ArgumentParser command, so it
 # rejects the unknown option and the run exits non-zero with every XCTest passing --
@@ -192,17 +203,105 @@ listed=$(swift test list --package-path "$checkout" --configuration release \
   printf 'could not list the pinned engine tests in %s\n' "$checkout" >&2
   exit 70
 }
-grep -q '^ArcaEngineTests\.' <<<"$listed" || {
-  printf 'the test gate matched no tests: %s declares no ArcaEngineTests\n' "$checkout" >&2
-  exit 70
+
+# One pattern per suite, used BOTH as the listing assertion and as the filter, so
+# the two cannot drift. A guard asserting a suite the filter does not select --
+# or a filter selecting a suite the guard does not assert -- reads as covered and
+# is not, and a comment claiming the two agree is not a mechanism.
+#
+# Anchored, and the anchor is doing work in both roles. `--filter` is an
+# unanchored substring regex, so a bare `ArcaEngineTests` would silently pull a
+# future `ArcaEngineTestsIntegration` target into the release gate -- a
+# daemon-requiring suite, run on a runner with no daemon, failing a long way from
+# its cause -- and the guard, which only checks presence, could not see it. `\.`
+# anchors the engine half on its target; `/` anchors the prune half on its class,
+# because that suite's target keeps its name when only the class moves.
+# The property that matters is that anchoring changed nothing about WHICH tests
+# run -- the anchored pair selects the same set as the unanchored pair did.
+# MEASURED on Swift 6.3.3 at Arca `fede19c`, when this guard was written: both
+# forms selected 46 tests, 43 + 3. The count is not the claim and has moved since
+# (Landing 3 and 4 add tests to ArcaEngineTests); re-derive it with
+# `swift test list --disable-swift-testing --filter '^ArcaEngineTests\.'` rather
+# than trusting a number written here.
+engine_suite='^ArcaEngineTests\.'
+prune_suite='^ArcaTests\.NetworkPruneGateTests/'
+
+# Each suite is asserted separately, and each names itself when it is the one
+# that went missing. A single grep matching either, or one message naming both,
+# would let the DockerAPI-side suite vanish behind a still-present
+# ArcaEngineTests -- the same hole this guard was written to close, reopened one
+# suite over.
+require_listed() {
+  grep -q "$2" <<<"$listed" || {
+    printf 'the test gate matched no tests: %s declares no %s\n' "$checkout" "$1" >&2
+    exit 70
+  }
 }
+require_listed ArcaEngineTests "$engine_suite"
+require_listed ArcaTests.NetworkPruneGateTests "$prune_suite"
+# Two --filter flags and not one alternation: SwiftPM unions repeated --filter,
+# which keeps each pattern identical to the guard's rather than a regex that has
+# to be read twice. That union is a property of the toolchain and not of this
+# script, and CI's toolchain is unpinned, so it is pinned from the outside:
+# tests/release/engine-pin-contract.sh runs a tree in which only the SECOND
+# suite fails and requires this script to report it. The day a SwiftPM makes the
+# last --filter win instead, that case goes red rather than this gate quietly
+# running 3 of 46 tests.
 swift test --package-path "$checkout" --configuration release \
-  --disable-swift-testing --filter ArcaEngineTests >&2
+  --disable-swift-testing \
+  --filter "$engine_suite" \
+  --filter "$prune_suite" >&2
 
 binary=$checkout/.build/release/arca-engine
 [[ -x $binary ]] || {
   printf 'engine build produced no executable at %s\n' "$binary" >&2
   exit 70
 }
+
+# An unsigned engine cannot start a container, so an unsigned binary is not a
+# build product this script may hand to a caller. ContainerManager.initialize()
+# constructs a Containerization.VmnetNetwork, and vmnet refuses that without
+# com.apple.security.virtualization. MEASURED on the real engine with the
+# signature as the only variable: unentitled it exits 1 on `failed to create
+# vmnet network with status vmnet_return_t(rawValue: 1002)` and never creates
+# its socket -- and 1002 is VMNET_MEM_FAILURE in vmnet.h, so the diagnostic
+# sends whoever meets it looking for a memory fault. Signed, the same binary
+# initialises all three managers and serves.
+#
+# Here and not at build time: this is the last step before the path is printed,
+# so no caller can be handed an unsigned path, and it is after `swift test`,
+# which shares the .build directory and would discard a signature applied
+# earlier by relinking the executable.
+#
+# The entitlements come from the checkout this script has already verified --
+# the same signed tag whose tree was compiled -- and from nowhere else. A copy
+# living in Gas Can would be a second thing to keep in step with Arca's, and it
+# is Arca's engine that has to hold these entitlements.
+#
+# Ad-hoc (`--sign -`) because it needs no certificate and no keychain, which is
+# what makes it work on a hosted CI runner. AD-HOC IS SUFFICIENT FOR THE RELEASE
+# GATE AND FOR THE LIVE TIER, WHICH RUN THE ENGINE ON THE MACHINE THAT BUILT IT.
+# IT IS NOT SUFFICIENT FOR A SHIPPED .pkg: a distributed binary needs a real
+# Developer ID identity and notarisation, which is milestone 4's work with the
+# rest of packaging. Do not read this line as that being done.
+#
+# `--options runtime --timestamp` matches the invocation Arca's own Makefile
+# codesign target uses, so switching `-` for a Developer ID here is the only
+# edit that migration needs. Both flags are inert for an ad-hoc signature, which
+# carries no CMS blob to timestamp: MEASURED, `codesign -dvvv` reports the same
+# `flags=0x10002(adhoc,runtime)` and no Timestamp field with and without.
+entitlements=$checkout/Arca.entitlements
+[[ -f $entitlements ]] || {
+  printf 'the pinned engine carries no entitlements file: %s\n' "$entitlements" >&2
+  exit 70
+}
+# >&2 is defence in depth and not a fix for anything observed. Stdout is this
+# script's contract with its caller -- two lines, the checkout and the binary --
+# and every other command here is redirected for that reason. MEASURED: codesign
+# writes `replacing existing signature` to stderr and 0 bytes to stdout, on a
+# cold cache and a warm one. The redirect stays so that a codesign that starts
+# saying something on stdout cannot corrupt the contract.
+codesign --force --sign - --options runtime --timestamp \
+  --entitlements "$entitlements" "$binary" >&2
 
 printf '%s\n%s\n' "$checkout" "$binary"

@@ -92,7 +92,15 @@ async fn a_real_engine_accepts_the_placeholder_authority() {
 async fn a_call_against_a_killed_engine_fails_rather_than_hanging() {
     let engine = LiveEngine::start().await;
     let transport = engine.transport().await;
-    engine.kill().await;
+
+    // `stop()` and not `kill()`, and it is the only place in this tier that
+    // needs the distinction. This is the one test that stops its engine BEFORE
+    // its assertions rather than after -- stopping the engine is its fixture,
+    // not its teardown -- and `kill()` asserts a clean exit status. So a
+    // shutdown regression would fail here, on this line, and the property this
+    // test exists for would never be exercised at all. The status is still
+    // asserted, below, once the subject has been measured.
+    let status = engine.stop().await;
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(10),
@@ -107,5 +115,10 @@ async fn a_call_against_a_killed_engine_fails_rather_than_hanging() {
     assert!(
         result.is_err(),
         "a dead engine must not answer successfully"
+    );
+    assert!(
+        status.success(),
+        "the engine exited with {status} rather than cleanly; \
+         see shutdown.rs, which measures that as a rate"
     );
 }
