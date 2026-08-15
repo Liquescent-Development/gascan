@@ -16,12 +16,16 @@ the merge.**
 
 ## Where the work is
 
-**P5.1 MILESTONE 2 IS COMPLETE AND BOTH RULINGS ARE CLOSED. All five landings, every task reviewed.**
-Twelve were planned; **seven** were added on maintainer rulings after a review, a spike or a
-measurement found something real — 3b, 3c, 6b, 13a, 13b, and the two follow-ons that closed the
-rulings, **16** (named volumes) and **17** (the shutdown crash). The table below is authoritative for
-which is which. **Nothing is merged and nothing is pushed. Do not start a new branch; continue on
-these two.**
+**P5.1 MILESTONE 2 IS COMPLETE. BOTH RULINGS CLOSED, BOTH REVIEW ROUNDS DONE, NOTHING OPEN — THE
+MERGE IS ALL THAT REMAINS**, and it has an order the section at the end of this file spells out
+(submodule first, or every clone breaks). All five landings, every task reviewed.
+Twelve were planned; **nine** were added on maintainer rulings after a review, a spike or a
+measurement found something real — 3b, 3c, 6b, 13a, 13b, the two follow-ons that closed the rulings
+(**16** named volumes, **17** the shutdown crash), and the two review rounds over tasks 13-17 (**18**
+and **19**), which between them found a Critical, seven Importants and seventeen Minors in work that
+had shipped unreviewed. The table below is authoritative for which is which. **Nothing is merged and
+nothing is pushed. Do not start a new branch; continue on these three — Gas Can, Arca, and Arca's
+`containerization` submodule.**
 
 **What that means and does not mean.** The engine now creates, starts, inspects, stops and removes a
 real sandbox in a real VM, and a published port is reachable from a test process. **Both maintainer
@@ -697,15 +701,37 @@ failures scaling with. **Three of the three known root causes have now been seen
 
 ### THE MERGE IS THE WHOLE OF WHAT REMAINS
 
-**Both branches are unmerged and unpushed, and nothing else is open.** Arca
-`feat/engine-state-ownership` at `8a26e15` (submodule `3f68806`), Gas Can
-`docs/p5-1-milestone-2-design` — read both with
-`git log -1` rather than trusting a SHA here.
+**Milestone 2 is implementation-complete, both rulings are closed, and both rounds of review are
+done. Nothing is open. Three repositories are unmerged and unpushed**, and they have an order:
 
-**The pin bump belongs to milestone 4** and needs a signed tag carrying Arca `fede19c`;
-`./scripts/build-arca-engine.sh` exits 70 against the current pin **by design** (see the pin section).
-**Do not bump it ad hoc to make CI green.** `allowed_merge_methods` is `["merge"]` — merge commits
-only, never squash.
+| | branch | at | ahead of `main` |
+|---|---|---|---|
+| 1. submodule `containerization` | `merge/upstream-main` | `3f68806` | 3 commits, `ca47c87`..`3f68806` |
+| 2. Arca | `feat/engine-state-ownership` | `8a26e15` | 46 |
+| 3. Gas Can | `docs/p5-1-milestone-2-design` | — read with `git log -1` | 48 |
+
+**THE SUBMODULE MUST BE PUSHED FIRST.** Arca's tree records a `containerization` pointer at
+`3f68806`; pushed before that commit is reachable on its own remote
+(`git@github.com:Vas-Solutus/arca-containerization.git`), Arca's `main` names a submodule revision
+nobody else can fetch, and every clone breaks at `git submodule update`.
+
+```bash
+cd ~/code/arca/containerization && git push origin merge/upstream-main
+cd ~/code/arca             && git push -u origin feat/engine-state-ownership
+cd ~/code/gascan           && git push -u origin docs/p5-1-milestone-2-design
+```
+
+Then one PR per repository, **merged with a merge commit and never squashed** —
+`allowed_merge_methods` is `["merge"]`, and squashing a 46-commit branch would destroy the per-task
+history every section of this file cites by SHA.
+
+**EXPECT CI'S `engine` JOB TO BE RED, AND DO NOT FIX IT.** `./scripts/build-arca-engine.sh` exits 70
+against the current pin **by design**: the gate now requires `ArcaTests.NetworkPruneGateTests`, which
+`gascan-engine-m1.1` / `b3390b8` does not carry. **The pin bump belongs to milestone 4** and needs a
+signed tag carrying Arca `fede19c`. Bumping it to an untagged or mid-branch revision buys a green
+check by giving up the trust model `engine/allowed-signers` exists to enforce. `ci / gate` is not a
+required check and does not block merging (VERIFIED 2026-08-12, ruleset `20492137`, zero
+`required_status_checks`), and Arca has no CI at all.
 
 ## The superseded plan for Landing 5, kept for its reasoning
 
@@ -972,8 +998,45 @@ Deliberately correct as-is: `setHealthChecker` and `setEventEmitter` are silent 
 proto has no health or events surface. Wiring an `EventManager` would build toward one
 `tests/release/engine-targets-check.sh` requires the engine **not** to have.
 
+### WHAT COMES AFTER THE MERGE, in the order the roadmap puts it
+
+**Read `docs/superpowers/plans/2026-08-04-arca-integration-roadmap.md` for the phase map. P0-P4 are
+done and P5 is current.** P5 has four steps: **P5.1** the engine service (in progress, four
+milestones), **P5.2** the `gascan-arca` crate (done, merged `bd412b4`), **P5.3** the conformance suite
+extracted from `fake_runtime.rs` and run against fake/apple/arca, and **P5.4** resolving U5 — how image
+digests reach the engine without registry access. P6 is the network model, P7 the cutover, P8 fork
+reduction.
+
+**P5.1's own milestones: 1 skeleton (merged), 2 lifecycle (this one), 3, 4.**
+
+- **Milestone 3 — `Exec`, `Logs`, and `ExecManager.signalExec`.** Design §3 change 5 and the
+  milestone-2 design's out-of-scope list both name it. `tty` and `signals` are the two capability
+  flags still `false`, correctly, and this is what earns them.
+- **Milestone 4 — everything that makes it a product.** Daemon wiring and `BackendSelection::Arca`,
+  the launchd plist, installer changes, `gascan doctor` surfacing engine facts, the offline proof that
+  moves `offline` off `ISOLATION_UNVERIFIED`, the **pin bump** with its signed tag, and the decision on
+  how the 27 MB kernel and 163 MB vminit ship (constrained by design §2.6 to the `--kernel-path` /
+  `--vminit-layout` seam). **Its design pass also owes the two contract defects** recorded below: the
+  proto permitting offline-plus-ports with no stated winner, and `AckResponse` being unable to express
+  a partial `Remove`.
+
+**`CreateContainer` HAS NO MILESTONE, AND IT NEEDS ONE.** It is the third RPC still answering
+`unsupported_capability`, and this file has been listing it beside `Exec` and `Logs` while assigning
+only those two to milestone 3. It is "recreate the container of an existing sandbox, reusing what is
+retained", and **`gascand` calls it in three places** — `service.rs:1699`, `:1778`, `:4314`, the
+image-replace and rollback paths. **P5's exit criterion is "`gascan-arca` passes conformance and
+existing `gascan-e2e`", which cannot happen while it refuses.** Decide where it belongs before
+milestone 3 is planned; it may change that milestone's shape.
+
 ### Still open, not started
 
+- **Three follow-ups this milestone's reviews named and deliberately did not take.** Each is small,
+  each closes a stated gap, and each is written up where it lives: **(a)** move the shutdown wait out
+  of the executable into `ArcaEngine` (`runUntilQuiesced`) so task 17 gets a fails-before/passes-after
+  test — reverting the fix still leaves `swift test` green; **(b)** a test that
+  `unpackLayerToCache` actually calls `cachedLayerIsReusable`, which needs an `Image` fixture; **(c)**
+  the host telling the guest how many layers it attached, so "no layers" and "layers I could not
+  identify" stop being the same observation.
 - **The Minors** — 6 in Gas Can, 8 in Arca, from the milestone-1 adversarial reviews. Two Gas Can
   Minors were taken along the way. Each carries its own reproduction in the review reports.
 - **D7's narrowed retry.** Unblocked by evidence; maintainer's ruling 2026-08-12 was a separate PR,
