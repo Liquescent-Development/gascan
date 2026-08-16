@@ -90,17 +90,29 @@ impl Sandbox {
     }
 
     /// Opens an exec. The session is live: nothing has been read from it.
+    ///
+    /// **Bounded, and this is the await that has to be.** It is the one that hung
+    /// for ten minutes against the engine before `acceptRPC`: tonic does not hand
+    /// its caller a stream until the response headers arrive, so an engine that
+    /// says nothing leaves the test here, upstream of every other bound in this
+    /// file. A regression of that one line must fail with a message that names
+    /// this call, not sit silently until the harness is killed.
     async fn exec(&self, argv: &[&str], tty: bool, stdin: &[u8]) -> ExecSession {
-        self.backend
-            .exec(ExecRequest {
-                id: self.request.id().clone(),
-                argv: argv.iter().map(|part| (*part).to_owned()).collect(),
-                stdin: stdin.to_vec(),
-                environment: BTreeMap::new(),
-                tty,
-            })
-            .await
-            .unwrap_or_else(|error| panic!("Exec must open a session for {argv:?}: {error}"))
+        let opening = self.backend.exec(ExecRequest {
+            id: self.request.id().clone(),
+            argv: argv.iter().map(|part| (*part).to_owned()).collect(),
+            stdin: stdin.to_vec(),
+            environment: BTreeMap::new(),
+            tty,
+        });
+        match tokio::time::timeout(Duration::from_secs(60), opening).await {
+            Err(_) => panic!(
+                "Exec did not open a session for {argv:?} within 60s; the engine accepts the \
+                 RPC before it has anything to say, so this is where a missing acceptRPC lands"
+            ),
+            Ok(Err(error)) => panic!("Exec must open a session for {argv:?}: {error}"),
+            Ok(Ok(session)) => session,
+        }
     }
 
     /// Stops the sandbox and asserts the engine's own exit status.
@@ -173,11 +185,18 @@ async fn drain(session: &mut ExecSession, bound: Duration) -> Completed {
 
 /// Sends one client frame under a bound.
 ///
-/// **Bounded because an unbounded `send` here hid a defect once.** The first run
+/// **Bounded because an unbounded await here hid a defect once.** The first run
 /// of this file sat for ten minutes with no panic at all: `drain`'s bound had
-/// not been reached because the test was still upstream of it, in a `send`, and
-/// an await with no bound cannot say which one it was. Every await in this file
-/// is bounded now, for that reason.
+/// not been reached because the test was still upstream of it, and an await with
+/// no bound cannot say which one it was.
+///
+/// **Every await that touches a live session is bounded: this one, `drain`,
+/// `refusal`, `read_until`, and `Sandbox::exec`.** `Sandbox::boot`'s calls are
+/// deliberately NOT -- `start_with_images`, `prepare_image`, `create` and `start`
+/// keep the bounds the rest of this tier uses, `await_state`'s 180s among them,
+/// so that a boot failure reads the same here as in `lifecycle.rs`. An earlier
+/// version of this comment claimed every await in the file was bounded, which
+/// was false of the very call that had hung.
 async fn send(session: &mut ExecSession, input: ExecInput, bound: Duration) {
     let described = format!("{input:?}");
     match tokio::time::timeout(bound, session.send(input)).await {
@@ -251,12 +270,14 @@ async fn read_until(session: &mut ExecSession, marker: &str, bound: Duration) ->
 /// **`Exit.signal` is asserted to be 0 and that is not a placeholder.** Nothing
 /// on the engine's path carries a signal number: the guest reaps with `wait4`
 /// and collapses the status to `128 + N` for a signalled process
-/// (`ContainerizationOS/Command.swift:306-315`), and `ExitStatus` has one field
-/// (`ExitStatus.swift:21-25`). gascan's Apple backend reports the same zero
+/// (`ContainerizationOS/Command.swift:306-315`), and `ExitStatus` carries no
+/// signal number at all -- only `exitCode` and `exitedAt`
+/// (`ExitStatus.swift:23`, `:25`). gascan's Apple backend reports the same zero
 /// (`gascan-apple/src/backend.rs:604`). A signal delivered to a guest process is
 /// therefore observed in `code`, which is what the third test below does.
 ///
-/// UNRUN as written -- see the run note at the end of the file.
+/// RUN, against Arca `af22685` on 2026-08-16: the full live tier reported
+/// `19 passed; 0 failed` in 244.60s, these three among them.
 #[tokio::test]
 #[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN, a kernel, a vminit \
             layout and a base OCI layout"]
@@ -324,7 +345,8 @@ async fn exec_carries_both_streams_and_the_commands_own_exit_status() {
 /// satisfiable by an accident: a build that always allocated a terminal would
 /// pass the tty half, and one that never did would pass the control.
 ///
-/// UNRUN as written -- see the run note at the end of the file.
+/// RUN, against Arca `af22685` on 2026-08-16: the full live tier reported
+/// `19 passed; 0 failed` in 244.60s, these three among them.
 #[tokio::test]
 #[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN, a kernel, a vminit \
             layout and a base OCI layout"]
@@ -383,7 +405,8 @@ async fn a_tty_exec_gives_the_guest_a_terminal_and_merges_stderr_into_stdout() {
 /// Linux signal map has no entry for is refused as `invalid_state` naming it,
 /// never coerced to a default.
 ///
-/// UNRUN as written -- see the run note at the end of the file.
+/// RUN, against Arca `af22685` on 2026-08-16: the full live tier reported
+/// `19 passed; 0 failed` in 244.60s, these three among them.
 #[tokio::test]
 #[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN, a kernel, a vminit \
             layout and a base OCI layout"]

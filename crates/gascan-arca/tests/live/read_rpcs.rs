@@ -2,6 +2,7 @@ use crate::common::LiveEngine;
 use gascan_arca::ArcaBackend;
 use gascan_core::runtime::{ExecRequest, NetworkIsolation, RuntimeBackend};
 use gascan_core::sandbox::SandboxId;
+use std::time::Duration;
 
 /// The backend over a real engine, not a fake. Everything below goes through
 /// ChannelTransport and the real gRPC stack.
@@ -112,13 +113,22 @@ async fn exec_refuses_in_its_own_frame_rather_than_as_a_transport_status() {
 
     // The session OPENS -- `exec()` returns Ok -- and the answer arrives as the
     // stream's first frame.
-    let mut session = backend
-        .exec(ExecRequest::fixture(id.clone(), ["true"]))
-        .await
-        .expect("Exec opens a session; the refusal is its first frame");
-    let code = match session.next().await {
-        Some(Err(error)) => error.code().to_owned(),
-        other => panic!("Exec's first frame must be an error, got {other:?}"),
+    //
+    // **Both awaits are bounded, because the defect this test guards makes them
+    // hang rather than fail.** A handler that threw instead of sending produces
+    // no first frame, and an engine that never accepts the RPC never returns a
+    // stream at all; unbounded, either one stalls this test forever, and under
+    // `--test-threads=1` it stalls the whole tier with it. A test that hangs
+    // instead of failing is not a guard.
+    let opening = backend.exec(ExecRequest::fixture(id.clone(), ["true"]));
+    let mut session = match tokio::time::timeout(Duration::from_secs(60), opening).await {
+        Err(_) => panic!("Exec did not open a session within 60s"),
+        Ok(result) => result.expect("Exec opens a session; the refusal is its first frame"),
+    };
+    let code = match tokio::time::timeout(Duration::from_secs(60), session.next()).await {
+        Err(_) => panic!("Exec sent no first frame within 60s; a refusal must be answered"),
+        Ok(Some(Err(error))) => error.code().to_owned(),
+        Ok(other) => panic!("Exec's first frame must be an error, got {other:?}"),
     };
     assert_eq!(
         code, "not_found",
