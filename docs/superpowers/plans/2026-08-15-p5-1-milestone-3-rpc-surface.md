@@ -805,6 +805,32 @@ git commit
 
 ## Task 6: `Exec`, then `tty` and `signals`
 
+**EXPANDED 2026-08-16, after Task 5's fix rounds. Requirements rather than step-level code, for the reason recorded on Task 4. Re-derive every anchor — this file has drifted under five tasks.**
+
+**Verified at expansion time:**
+
+| | |
+|---|---|
+| `exec` handler | `SandboxEngineService.swift:1184` — re-derive; it was `:1023` when this plan was written and `:1178` two tasks ago |
+| `Writer` | `containerization/Sources/Containerization/IO/Writer.swift:20` — exactly `func write(_ data: Data) throws` and `func close() throws` |
+| `ReaderStream` | `containerization/Sources/Containerization/IO/ReaderStream.swift:20` — exactly `func stream() -> AsyncStream<Data>` |
+| `startExec` | `ExecManager.swift:117`, taking `stdin: ReaderStream?`, `stdout: Writer?`, `stderr: Writer?` |
+| `signalExec` | added by Task 4 — `signalExec(execID:signal: Int32)`, validating through the repository's own signal map |
+
+**THE SEAM IS ALREADY BUILT AND PROVEN — DO NOT INVENT A NEW ONE.** Task 5 established it in this same file and its comment states the rule: *a test target cannot construct a `GRPCAsyncResponseStreamWriter`, so the inner method carries the logic and the protocol method only supplies the writer.* `Exec` takes the same shape: an inner method over a sink and a frame source, with the grpc-swift method a thin adapter. **Task 4's review is the counter-example to keep in mind** — a seam invented rather than reused replaced a compile-time guarantee with a wiring nothing checked, and 177 green tests did not notice.
+
+**The two adapters are the testable surface, and both protocols are two-method.** A `Writer` that emits `ExecServerFrame.stdout`/`.stderr`, and a `ReaderStream` fed by client `stdin` frames. These are pure value transformations with no VM in them, and they are where the logic must live — `Exec` end to end needs a booted container (`ExecManager.swift:139`).
+
+**Requirements carried from the design, unchanged:** first frame must be `ExecStart` and exactly one per stream, any other first frame a protocol error; `stdin`→process, `resize`→`resizeExec`, `signal`→`signalExec`, `close`→close stdin; on exit send `Exit{code, signal}` and end cleanly; a mid-exec client reset is **cancellation** — kill the guest process, reap the exec instance, emit nothing. **Serialize the response stream:** two independent `Writer`s feed one `GRPCAsyncResponseStreamWriter`, so sends go through a single actor; an interleaved frame reads as a flake. **Refuse unknown signal numbers** as `invalid_state` naming the number. **With `tty` set there is no stderr stream** — `startExec` sets `processConfig.terminal` and then sets stderr only when that is false.
+
+**THE REQUIREMENT TASK 4 LEFT HERE, AND IT IS THE ONE MOST EASILY MISSED.** Deleting `process.kill` outright leaves Arca's suite green — the acceptance test there protects the **guard**, not the **send**. So **`exec.rs` must assert an observable effect on the guest process** — an exit status, a handler running, a wait returning — **not that `signalExec` returned.** It is written at `ExecManager.swift:377-392`; read it.
+
+**The `Logs` precedent to reuse rather than rediscover:** refuse an unlabelled or foreign container **before resolving anything**, with `containerNameRefusal`. Task 5 found that `resolveContainerID` prefix-matches any pure-hex string of four or more characters, and that the argument excusing `Inspect` does not carry to a method whose payload has no labels for the consumer to check. **`Exec` carries bytes too.**
+
+**The capability flips are the milestone's exit gate.** `tty` is earned by a live test asserting stderr arrives **merged into stdout** — which happens only when the process really is a terminal, so the merge is proof rather than restatement. `signals` is earned by the delivery assertion above. **Neither flips until its live test passes**, and `read_rpcs.rs`'s unimplemented-method count reaches zero.
+
+
+
 **Files:** create `~/code/arca/Sources/ArcaEngine/ExecSession.swift`; modify `Sources/ArcaEngine/SandboxEngineService.swift` (`exec` at `:1023`) and `Sources/ArcaEngine/CapabilitiesTests`' subject; create `~/code/gascan/crates/gascan-arca/tests/live/exec.rs`; modify `crates/gascan-arca/tests/live/read_rpcs.rs` (`:125`).
 
 **Requirements, all from design §2.6-2.7 and §3.2:**
