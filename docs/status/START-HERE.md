@@ -9,22 +9,38 @@ complete and Landing 5 the whole of what remains**; updated 2026-08-13 (late) af
 hour, which **proved the spawn, got `Create` working end to end for the first time, and cost two
 unplanned Arca fixes on the way** — Tasks 13a and 13b; rewritten 2026-08-14 (evening) after the
 named-volume defect was fixed and committed; **rewritten again 2026-08-14 (late) after the
-graceful-shutdown crash was fixed, which was the last open ruling. Nothing is open. What remains is
-the merge.**
+graceful-shutdown crash was fixed, which was the last open ruling; **rewritten 2026-08-16 (late)
+after MILESTONE 3 MERGED. Nothing is open. What remains is milestone 4, which is designed by nobody
+yet.**
 
 ---
 
 ## Where the work is
 
-**P5.1 MILESTONE 3 IS CODE-COMPLETE — 2026-08-16. SIX OF SIX TASKS DONE, BOTH PULL REQUESTS OPEN,
-NOTHING BLOCKED.** Arca **#58**, Gas Can **#75**. This section is the current state; everything below
-it about milestone 2 is history kept for its reasoning.
+**P5.1 MILESTONE 3 IS MERGED — 2026-08-16. SIX OF SIX TASKS DONE, BOTH PULL REQUESTS LANDED, NOTHING
+OPEN, NOTHING IN FLIGHT.**
+
+| | merged as | |
+|---|---|---|
+| Arca | **`5e11704`** | PR #58, from `feat/engine-rpc-surface` |
+| Gas Can | **`da211d3`** | PR #75, from `docs/p5-1-milestone-3-design` |
+| Submodule | **`3f68806`** | `containerization` on `merge/upstream-main`; it did NOT move this milestone, and both PRs left the pointer untouched |
+
+**Both are true merge commits — `git rev-list --parents -n1` returns three SHAs for each, so nothing
+was squashed** and the per-task history this file cites is intact. **Start the next piece of work on
+a fresh branch off `main`.** Verify every SHA above with `git log -1` rather than trusting one
+written here; this file has gone stale on its own SHAs six times.
+
+**WHAT TO DO NEXT: MILESTONE 4, and it needs a design before it needs code.** Its scope is in "what
+comes after the merge" below. It is the last of P5.1's four milestones and it is the one that makes
+this a product. **Do not start coding it — brainstorm and design it first**, the way milestones 2 and
+3 were, both of which caught false premises in their own design documents before anything was built.
 
 ### THE PRE-MERGE REVIEW ROUND, AND THE THREE DEFECTS IT COST — 2026-08-16 (late)
 
 **Both PRs were reviewed before merge and both were BLOCKED by it. Three engine defects and one
-false test came out, and none of them was visible to a passing suite.** Arca `06a5162` and the Gas
-Can commit that follows this line are what closed them.
+false test came out, and none of them was visible to a passing suite** — Arca's was 221/0 green with
+all three present. Arca `06a5162` and Gas Can `1a16158` are what closed them.
 
 1. **The ten-second teardown bound was inert.** `completes()` raced `Task.value` against a sleep;
    `Task.value` is not cancellation-aware and `withTaskGroup` drains every child, so the race
@@ -67,12 +83,16 @@ belongs to milestone 4. Anything below this line saying three RPCs refuse, or th
 
 | | |
 |---|---|
-| Arca | `feat/engine-rpc-surface`, based on `b3ffdf5` (main) — **read HEAD with `git log -1`** |
-| Gas Can | `docs/p5-1-milestone-3-design`, based on `e9468d8` (main) — same |
-| Submodule | `containerization` at **`3f68806`, and it must NOT move this milestone** |
-| Design | `docs/superpowers/specs/2026-08-15-p5-1-milestone-3-rpc-surface-design.md` |
-| Plan | `docs/superpowers/plans/2026-08-15-p5-1-milestone-3-rpc-surface.md` — **fully expanded, all six tasks** |
-| Ledger | `.superpowers/sdd/2026-08-15-p5-1-milestone-3-rpc-surface/progress.md` — disposable; anything that must outlive the milestone is here instead |
+| Design | `docs/superpowers/specs/2026-08-15-p5-1-milestone-3-rpc-surface-design.md` — **three of its premises were false; see below** |
+| Plan | `docs/superpowers/plans/2026-08-15-p5-1-milestone-3-rpc-surface.md` — all six tasks, and one ruling in it was reversed (`:757`) |
+| Ledger | `.superpowers/sdd/2026-08-15-p5-1-milestone-3-rpc-surface/` — disposable scaffolding, untracked, 21MB |
+
+**THE LEDGER WAS NOT DELETED, AND THE INSTRUCTION TO DELETE IT HAS NEVER ONCE BEEN FOLLOWED.** This
+file has said "delete it when the branch merges" since milestone 1. All four ledgers are still on
+disk — `2026-08-05-arca-engine-pin` (300K), `2026-08-10-…-milestone-1` (1.0M),
+`2026-08-12-…-milestone-2` (2.0M), `2026-08-15-…-milestone-3` (21M). **Either delete them as a set or
+stop writing the instruction**; a rule that four successors have declined to follow is telling you
+something. Nothing in them is load-bearing: everything that must outlive a milestone is in this file.
 
 **Milestone 3 is "finish the RPC surface", and that scope was a ruling, not the original plan.**
 `CreateContainer` had no milestone; it was the third RPC answering `unsupported_capability`, and
@@ -87,6 +107,11 @@ first task.
 | 4 | `ExecManager.signalExec` | **done** — 1 review round |
 | 5 | `Logs` | **done** — 2 fix rounds, re-review clean, live test **run and passing**; 2 Minors deferred (below) |
 | 6 | `Exec`, then the `tty` and `signals` flips | **done** — 4 VM-free mutations run, 2 live mutations run, **1 review round: 3 behavioural defects found and fixed**, live tier 20/20 |
+| 7 | the pre-merge review of both PRs, and its **3 engine defects + 1 false test** | **done** — Arca `06a5162`, Gas Can `1a16158`; 2 controller mutations run, failing disjoint sets; live tier 21/21 |
+
+**Task 7 was not planned.** It is the pre-merge review round, added because the PRs were reviewed
+before merging rather than after. **It found more real defects than any single task in this
+milestone**, in code that had already passed six task-level reviews and a 20/20 live tier.
 
 **SUPERSEDED THE SAME DAY — read the next paragraph before believing this one.** It said: both
 branches are pushed, Arca `feat/engine-rpc-surface` on `git@github.com:Vas-Solutus/arca.git` and Gas
@@ -148,21 +173,18 @@ pass over this file, and this milestone has already proved that four times — i
 very section, which said "neither branch is pushed" for the twenty minutes between writing it and
 pushing them.
 
-**SUPERSEDED — the two pull requests are open.** Arca **#58**, Gas Can **#75**, both opened
-2026-08-16 (late). This paragraph said opening them was the only open item; the pre-merge review
-above then found three engine defects and one false test, so it was not.
+**SUPERSEDED TWICE IN ONE DAY, AND BOTH SUPERSESSIONS ARE INSTRUCTIVE.** This paragraph first said
+opening the two pull requests was the only open item; the pre-merge review then found three engine
+defects and one false test, so it was not. It then said to merge them; **they are merged** — Arca
+`5e11704` (#58) and Gas Can `da211d3` (#75), 2026-08-16 (late), both true merge commits.
 
-**What a successor should do first: MERGE THEM, Arca first.** Every task is done, every one has its
-live evidence, both PRs have been reviewed and every finding fixed or explicitly carried, the live
-tier is 21/21 and the Arca suite 228/0. **Merge commits only — `allowed_merge_methods` is
-`["merge"]`, never squash.** `ci / gate` is not a required check and does not block; the `engine`
-job is red by design against the unbumped pin. Re-check that the `containerization` submodule has
-not moved before Arca's merge — it has not this milestone, and it is at `3f68806`, identical on
-`origin/main` and the branch tip, so the PR does not move the pointer at all.
-
-**Then delete `.superpowers/sdd/2026-08-15-p5-1-milestone-3-rpc-surface/`** — disposable scaffolding,
-untracked, and everything that must outlive the milestone is in this file. **Then milestone 4**, whose
-scope is below and which has gained a second shutdown defect from this round.
+**The merge rules, kept because they apply again next milestone:** merge commits only,
+`allowed_merge_methods` is `["merge"]`, never squash. `ci / gate` is not a required check and does
+not block. The `engine` job is red by design against the unbumped pin — **do not bump the pin to
+make it green**; that is milestone 4's and it needs a signed tag. Re-check the `containerization`
+submodule before any Arca merge: this time it was identical on `origin/main` and the branch tip, so
+the PR moved no pointer, but a pointer that moves late is how a fresh clone breaks at
+`git submodule update --init --recursive`.
 
 ### TASK 6 WAS REVIEWED AND THE REVIEW FOUND THREE REAL DEFECTS — 2026-08-16 (late)
 
@@ -1425,6 +1447,18 @@ reduction.
   `--vminit-layout` seam). **Its design pass also owes the two contract defects** recorded below: the
   proto permitting offline-plus-ports with no stated winner, and `AckResponse` being unable to express
   a partial `Remove`.
+- **Milestone 4 — A SECOND SHUTDOWN DEFECT, MEASURED 2026-08-16 (late) and distinct from the exit-143
+  one above.** `shutdown::the_engine_exits_cleanly_with_a_client_channel_still_open` fails about **1
+  shutdown in 288** with **`exit status: 1`** — the engine's own deliberate error exit, not the
+  kernel's 143, and a **different test** from the startup race. **Do not fold the two together.**
+  **Attributed by measurement rather than by argument**, because the engine changed in the same round
+  and the empty-diff exoneration was therefore unavailable: the identical signature
+  (`95 x exit status: 0, 1 x exit status: 1`) reproduced on `8679113` with **none** of milestone 3's
+  final fixes applied — 1 of 288 — and did not appear with them — 0 of 288. **So it is pre-existing.**
+  One event cannot distinguish "unchanged" from "improved" and no such claim is made. The two frozen,
+  separately-signed engine binaries used for that comparison were built by stashing the working tree
+  and restoring it, with every changed file verified byte-identical afterwards; **that is the method
+  to reuse** when a change to the thing under test rules out the usual diff-based exoneration.
 
 **`CreateContainer` IS MILESTONE 3'S FIRST TASK — RULED 2026-08-15. This is closed; do not
 re-litigate it.** It is "recreate the container of an existing sandbox, reusing what is retained"
