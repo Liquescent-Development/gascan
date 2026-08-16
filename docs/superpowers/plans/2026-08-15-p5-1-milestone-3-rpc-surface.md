@@ -738,11 +738,30 @@ git commit
 
 ## Task 4: `ExecManager.signalExec(execID:signal:)`
 
-**Files:** modify `~/code/arca/Sources/ContainerBridge/ExecManager.swift`; test in `~/code/arca/Tests/` under whichever target covers `ContainerBridge`.
+**EXPANDED 2026-08-16, after Task 3 landed, as this plan requires. Every fact below was verified against the tree at that point; re-derive the anchors before editing.**
 
-**Interfaces:** consumes `ExecInfo.process: LinuxProcess?` (`ExecManager.swift:18`) and `LinuxProcess.kill(_ signal: Signal)` (`containerization/Sources/Containerization/LinuxProcess.swift:315`). Produces `public func signalExec(execID: String, signal: Signal) async throws`.
+**Deliberately expanded to requirements rather than to step-level code, and that is an evidence-backed choice.** Task 1's brief carried full Swift and three of its details were wrong — a test fixture that did not exist, `VolumeManager` typed as a plain object when it is an `actor`, and six anchors that were five. Tasks 2 and 3 received requirement-level briefs and produced stronger work, because the implementer re-derived from the code rather than transcribing the controller's guesses. **Write the code from the source, not from this document.**
 
-**Requirements:** no defaulted parameter (global constraint). An unknown exec id throws `ExecManagerError.execNotFound`, matching `resizeExec`'s existing shape at `:255`. **`ContainerBridge` is shared with Arca's Docker surface, so this change has a second consumer** — check `Sources/DockerAPI/` before changing any existing signature.
+**Files:** modify `~/code/arca/Sources/ContainerBridge/ExecManager.swift`; test under `~/code/arca/Tests/ArcaTests/` (verified: `ArcaTests` imports `ContainerBridge`, e.g. `NetworkPruneGateTests.swift`).
+
+**Interfaces:**
+- Consumes: `ExecManager.execInstances: [String: ExecInfo]` (private, `:39`); `ExecInfo.process: LinuxProcess?` (`:18`); `LinuxProcess.kill(_ signal: Signal) async throws` (`containerization/Sources/Containerization/LinuxProcess.swift:315`); `ExecManagerError` (`:359`, cases `execNotFound`, `execAlreadyRunning`, `containerNotFound`, `containerNotRunning`, `invalidCommand`, `startFailed`).
+- Produces: `public func signalExec(execID: String, signal: Signal) async throws`.
+
+**`Signal` is verified and it decides the design.** `containerization/Sources/Containerization/Signal.swift:28` — `public struct Signal: RawRepresentable, Hashable, Sendable` with `public let rawValue: Int32`. **Its `init(rawValue:)` at `:31` is NOT failable**, so `Signal(rawValue: 999)` constructs happily and validation cannot come from the initializer. The repository's own validating path is `init(_ name: String, from map: [String: Int32] = Signal.linux)` (`:35`), which **throws `SignalError.invalidSignal` for a number absent from the map** — 73 named signals are defined. **Use the repository's validation rather than inventing a second one.**
+
+**Requirements:**
+
+1. **No defaulted parameter** (global constraint).
+2. **An unknown exec id throws `ExecManagerError.execNotFound`**, matching `resizeExec`'s shape at `:256-258`.
+3. **A signal for an exec whose process has not started MUST NOT be silently ignored — and this is where `signalExec` deliberately departs from `resizeExec`.** `resizeExec` returns silently in that case (`:270-273`), which is correct for a resize: a window size that arrives early is genuinely unimportant. **A signal that goes nowhere while the caller is told nothing is precisely this project's recurring defect** — the same shape as an engine that publishes no ports and reports success, and as a guest mount that is silently absent. Throw. `containerNotRunning` is the closest existing case; adding one is acceptable if it reads better, but do not add a case that duplicates an existing meaning.
+4. **`ContainerBridge` is shared with Arca's Docker surface, so this change has a second consumer.** Check `Sources/DockerAPI/` before changing any existing signature.
+
+**Testing, and the split is honest rather than convenient.** `createExec` populates `ExecInfo` with `process` still nil; `startExec` sets it and requires a native container (`:139`). So:
+- **VM-free, in `ArcaTests`:** an unknown exec id throws `execNotFound`; an exec that exists but has not started throws rather than returning silently (requirement 3); an out-of-range signal number is refused.
+- **Not reachable VM-free:** that a signal actually reaches a guest process. That belongs to Task 6's live `exec.rs`, and **the `signals` capability flag does not flip until it passes there.**
+
+**Acceptance:** deleting the not-started guard must fail a named test. A `signalExec` that silently returns when `process` is nil is the defect requirement 3 exists to prevent, and it must not be able to ship green.
 
 ## Task 5: `Logs`, and the two things it makes load-bearing
 
