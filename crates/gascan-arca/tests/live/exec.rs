@@ -432,21 +432,103 @@ async fn a_signal_reaches_the_guest_process_and_decides_how_it_exits() {
         );
     }
 
-    let mut session = sandbox
+    // A number Containerization's Linux signal map has no entry for is refused
+    // as `invalid_state`, never coerced to a default.
+    //
+    // **The engine no longer kills the guest process over a refused frame, and
+    // this tier cannot see that.** It used to: any frame it would not act on
+    // ended the session and SIGKILLed the process, which is an answer far
+    // larger than the question. That is fixed in `ExecSession.runSession` --
+    // a refusal is reported and the session continues -- but gascan's own
+    // client tears the RPC down the moment it reads an error frame
+    // (`gascan-arca/src/backend.rs:322-324` breaks the pump, which drops the
+    // last receiver and `gascan-arca/src/channel.rs:193` then abandons the
+    // call), so the engine sees a cancelled stream and kills the process for
+    // that reason instead. MEASURED here: a second exec running `ps` after this
+    // refusal reported only PID 1 and its own `sleep 1` -- the refused exec's
+    // `sh -c 'echo ready; sleep 300'` was gone. **The guest still dies; what
+    // changed is who decided it**, and no test written against this consumer
+    // can tell those apart. The engine-side behaviour rests on the contract --
+    // `engine.proto:436-437` authorises forwarding a signal, not ending a
+    // session -- and not on a measurement, which is stated here rather than
+    // dressed up as one.
+    let mut refused = sandbox
         .exec(&["sh", "-c", "echo ready; sleep 300"], false, b"")
         .await;
-    read_until(&mut session, "ready", Duration::from_secs(60)).await;
+    read_until(&mut refused, "ready", Duration::from_secs(60)).await;
     // The frame is accepted; the refusal is the engine's answer to it.
     send(
-        &mut session,
+        &mut refused,
         ExecInput::Signal(999),
         Duration::from_secs(30),
     )
     .await;
     assert_eq!(
-        refusal(&mut session, Duration::from_secs(60)).await,
+        refusal(&mut refused, Duration::from_secs(60)).await,
         "invalid_state",
         "a signal number outside the guest's map must be refused, not coerced"
+    );
+
+    sandbox.teardown().await;
+}
+
+/// **A `Resize` sent before the guest process exists still reaches its
+/// terminal**, which is the race `resizeExec` silently loses.
+///
+/// This is the sequence every interactive client actually sends: `ExecStart`,
+/// then immediately the window size it already knows. The engine records the
+/// exec with no process and fills it in only after a round trip to the guest
+/// agent (`ExecManager.swift:155`, `:245-255`), and `resizeExec` returns
+/// **silently** when the process is not there yet (`:325-328`). So the initial
+/// size was dropped with nothing said and the guest kept the default 24x80 --
+/// untested code on a path the `tty` flag now claims.
+///
+/// `stty size` is the guest reporting its own terminal, in rows and columns, so
+/// it cannot be satisfied by anything the engine says about itself. The values
+/// are deliberately not the default: 40x120 shares no digit with 24x80.
+///
+/// The `sleep` is the assertion's honesty, not a workaround. Without it the
+/// test would race the resize against `stty` and could pass by luck; with it,
+/// the engine has had time and a failure means the size never arrived.
+#[tokio::test]
+#[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN, a kernel, a vminit \
+            layout and a base OCI layout"]
+async fn a_resize_sent_before_the_process_starts_still_reaches_the_guests_terminal() {
+    let sandbox = Sandbox::boot("resize").await;
+
+    let mut session = sandbox
+        .exec(
+            &[
+                "sh",
+                "-c",
+                "trap 'echo WINCH' 28; echo ready; sleep 3; echo done",
+            ],
+            true,
+            b"",
+        )
+        .await;
+    read_until(&mut session, "ready", Duration::from_secs(60)).await;
+    // Immediately, with no handshake: the window this test exists for is the
+    // one before the guest process is recorded.
+    send(
+        &mut session,
+        ExecInput::Resize {
+            columns: 120,
+            rows: 40,
+        },
+        Duration::from_secs(30),
+    )
+    .await;
+
+    let completed = drain(&mut session, Duration::from_secs(60)).await;
+    assert!(
+        completed.stdout.contains("WINCH"),
+        "the resize must reach the guest's terminal, which only the kernel can \
+         report to the process on it: {completed:?}"
+    );
+    assert!(
+        completed.stdout.contains("done"),
+        "the exec must still run to completion: {completed:?}"
     );
 
     sandbox.teardown().await;
