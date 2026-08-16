@@ -104,10 +104,46 @@ pass over this file, and this milestone has already proved that four times — i
 very section, which said "neither branch is pushed" for the twenty minutes between writing it and
 pushing them.
 
-**What a successor should do first: commit Arca (see the signing block below), push both branches,
-then open the two pull requests.** Every task is done and every one has its live evidence. Before
-opening Arca's, re-check that the `containerization` submodule has not moved — it has not this
-milestone, and it is at `3f68806`.
+**What a successor should do first: open the two pull requests. That is the only open item.** Every
+task is done, every one has its live evidence, task 6 has been reviewed and its findings fixed, and
+both branches are committed, signed and pushed. Before opening Arca's, re-check that the
+`containerization` submodule has not moved — it has not this milestone, and it is at `3f68806`.
+
+### TASK 6 WAS REVIEWED AND THE REVIEW FOUND THREE REAL DEFECTS — 2026-08-16 (late)
+
+**All three were in code that had already passed a 19/19 live tier**, which is the point worth
+carrying: the tier proved `Exec` works, not that it behaves well when a client does something
+unusual.
+
+1. **A frame the engine would not act on ended the exec and SIGKILLed the guest.** One unmapped
+   signal number destroyed a healthy process. Now a refusal is reported and the session continues;
+   only a protocol violation or a client reset ends it.
+2. **A signal arriving before `startExec` recorded the process was fatal** — Ctrl-C in the first
+   tens of milliseconds refused the exec before the shell ran. Now held for the process, per task
+   4's ruling that a signal must never vanish silently.
+3. **An unbounded wait plus a best-effort kill could hold the RPC handler forever.** Now bounded
+   once the session has decided to end.
+
+**THE FIX FOR (2) WAS WRONG IN A WAY ONLY A LIVE TEST COULD SEE.** It waited only when the call
+*threw* `execNotStarted` — which `signalExec` does and **`resizeExec` does not**, returning silently
+in the identical situation (`ExecManager.swift:325-328`). So resize was still dropped while the
+wrapper looked like it covered both. The new
+`exec::a_resize_sent_before_the_process_starts_still_reaches_the_guests_terminal` caught it, and the
+instrument was checked before the subject: the same test with a readiness handshake in front of the
+resize passed, so the trap was sound and the window was real.
+
+**Two things from that round that will save a successor real time:**
+
+- **`ReportFindings` does not exist in a subagent's tool set.** The first reviewer was told to report
+  through it, could not, and went idle twice having produced nothing. The controller has that tool;
+  a subagent does not. **Do not require a subagent to report through a tool without checking it has
+  one** — ask for the fields in its reply instead.
+- **The entitlement trap bit the controller within the hour of citing it to a subagent.** A single
+  `swift test` run *after* re-signing failed all five of the next tier's tests with `engine exited
+  with exit status: 1 before accepting a connection`. MEASURED: `codesign -d --entitlements -`
+  reported **0** matches for `com.apple.security.virtualization` before re-signing and **1** after,
+  and the same tests passed with nothing else changed. **Re-sign after the last `swift test`, not
+  before it.**
 
 ### WHAT TASK 6 FOUND, AND IT IS THE ENTRY TO READ FIRST
 
@@ -235,9 +271,9 @@ Both trees clean. It replaces the 2026-08-14 table, which is kept below it as hi
 |---|---|
 | `swift test --disable-swift-testing --filter ArcaEngineTests` | `Executed 221 tests, with 0 failures` — 204 before task 6, plus 17 `ExecTests` |
 | `swift test --disable-swift-testing --filter ArcaTests.NetworkPruneGateTests` | `Executed 3 tests, with 0 failures` |
-| `env -u RUSTUP_TOOLCHAIN cargo test --workspace --no-fail-fast` | **74 targets / 1435 passed / 1 failed / 41 ignored**, the one failure being D7 — see the accounting below |
-| the live tier, `-- --ignored --test-threads=1` | **19 passed / 0 failed**, 244.60s, 3 non-ignored filtered out |
-| `scripts/ci-check-ignored-tests.sh` | `41 ignored test(s), matching the baseline` |
+| `env -u RUSTUP_TOOLCHAIN cargo test --workspace --no-fail-fast` | **74 targets / 1435 passed / 1 failed / 42 ignored** — see the accounting below; the one failure is a different `gascan-e2e` test on every run |
+| the live tier, `-- --ignored --test-threads=1` | **20 passed / 0 failed**, 234.34s, 3 non-ignored filtered out — 19 before the review round, plus the resize test |
+| `scripts/ci-check-ignored-tests.sh` | `42 ignored test(s), matching the baseline` |
 
 **The deltas, accounted for rather than accepted.** Against the branch as it stood after task 5:
 **ignored +3** — `exec::` gains three and `read_rpcs::` swaps a retired name for a new one, so +4
@@ -245,14 +281,27 @@ added and −1 removed; **passed +0**, because all three new live tests are `#[i
 **targets +0**, because `exec.rs` is a module of the existing `live` target. Passed plus failed is
 **1436**, which is the plan's baseline exactly.
 
-**THE ONE FAILURE IS D7 AND IT IS EXONERATED THE WAY THIS FILE REQUIRES, NOT BY PROBABILITY.**
-`daemon_stderr_sink_survives_the_launching_cli` failed with `mode is 0200 and the file has content:
-written but never published (mode 0200, size 375 …)` — **the same test and the same size as the
-first occurrence this file ever recorded**, on 2026-08-12. `git diff e9468d8..HEAD --
-crates/gascan-e2e/ crates/gascan/ crates/gascand/` is **empty** and there is nothing uncommitted in
-those crates, so the branch cannot have caused it; `cargo test -p gascan-e2e --test autostart` alone
-is **16 passed, 0 failed** with **zero** occurrences of `mode is 0200`. A preceding workspace run had
-been killed at a ten-minute bound minutes earlier, which is the contention this fault scales with.
+**THREE WORKSPACE RUNS, THREE DIFFERENT SINGLE FAILURES, ALL IN `crates/gascan-e2e`, ALL EXONERATED
+THE WAY THIS FILE REQUIRES — BY DIFF AND ISOLATION, NOT BY PROBABILITY.** Read them as a set, which
+is the same reading that identified D7: different tests, one crate, one load condition.
+
+| run | test | how it failed |
+|---|---|---|
+| 1 | `daemon_stderr_sink_survives_the_launching_cli` | D7 — `mode is 0200 … written but never published (mode 0200, size 375 …)`, **the same test and the same size as the first occurrence this file ever recorded**, 2026-08-12 |
+| 2 | `daemon_kill_and_restart_preserve_runtime_truth` | `state Unsafe: interrupted daemon instance descriptor changed while opening it` |
+| 3 | `no_sandbox_status_error_is_actionable_and_keeps_usage_exit` | `left: Some(70), right: Some(64)` — a daemon that failed to start, so the CLI returned the wrong exit code |
+
+`git diff e9468d8..HEAD -- crates/gascan-e2e/ crates/gascan/ crates/gascand/` is **empty** and
+nothing is uncommitted in those crates, so the branch cannot have caused any of them. Each target
+passes alone: `autostart` **16/16** with zero occurrences of `mode is 0200`, `fake_backend`
+**28/28**, twice. Load averages were 3.3-4.9 throughout, which is the condition this file records
+these scaling with.
+
+**Do not read this as three green runs.** It is one accounted-for failure per run, exonerated
+individually. **A clean local `cargo test --workspace` was not achieved on this branch**, and the
+standing rule that a green local workspace is the bar is therefore met only by isolation, which is
+weaker. The three root causes this file already names are the place to start when someone is asked
+to fix them.
 
 ---
 
