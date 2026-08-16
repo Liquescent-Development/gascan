@@ -40,13 +40,35 @@ first task.
 | 2 | `runUntilQuiesced` | **done** — 2 review rounds, live `shutdown::` 3/3 |
 | 3 | the `unpackLayerToCache` call test | **done** — 3 review rounds |
 | 4 | `ExecManager.signalExec` | **done** — 1 review round |
-| 5 | `Logs` | **implemented, 2 fix rounds, re-review in flight; ITS LIVE TEST IS UNRUN** |
-| 6 | `Exec`, then the `tty` and `signals` flips | **not started; the plan is expanded and ready** |
+| 5 | `Logs` | **done** — 2 fix rounds, re-review clean, live test **run and passing**; 2 Minors deferred (below) |
+| 6 | `Exec`, then the `tty` and `signals` flips | **NOT STARTED; the plan is expanded and ready** |
 
-**What a successor should do first:** finish task 5's re-review, **run the live tier** (task 5's
-`logs.rs` has never been executed, and `streamLogs` changed the handler's shape — "the wire contract
-is identical" is a *derivation*), then take task 6 from the plan. Task 6 is a clean start; nothing is
-half-done in it.
+**NEITHER BRANCH IS PUSHED.** Both are local only, on this machine. Arca
+`feat/engine-rpc-surface` at `2248035`, Gas Can `docs/p5-1-milestone-3-design` at `b3fe718`, both
+trees clean. **Verify with `git log -1` rather than trusting these SHAs — they go stale on every pass
+over this file, and this milestone has already proved that four times.**
+
+**What a successor should do first: take task 6 from the plan.** Nothing is half-done, nothing is
+blocked, and the plan's task-6 section was expanded against the seam task 5 proved. Tasks 1-5 all
+have their live evidence.
+
+**Three things carried, none of them blocking task 6:**
+
+1. **Task 5's two deferred Minors, with the fix already worked out.**
+   `LogReader.swift:164` (`unreadableTimestamp`) and `LogWriter.swift:221` (`unknownEncoding`) each
+   put an **unbounded `String`** from a decoded entry onto the wire — the same defect the round fixed
+   for a third arm. Measured at 300,028 and 300,043 characters against 580 for the fixed path. One
+   line each through the existing helper; `ContainerLogCodec.quoted` is `private` and needs a
+   `String` overload or `internal` visibility, while `quotedLineLimit` is already public and tested.
+   Rated Minor because reaching them needs a crafted `combined.log` in the engine's state root —
+   **but `LogReader` exists to handle the foreign-file case, so "needs a foreign file" is this
+   component's threat model rather than an exemption.**
+2. **The open attribution question on the drain grace** — see the falsified limit recorded in the
+   shutdown section below. First observation of the 10s grace firing against a real client;
+   **attribution is open and must be measured, not assumed.**
+3. **The SDD ledger** at `.superpowers/sdd/2026-08-15-p5-1-milestone-3-rpc-surface/progress.md` holds
+   the per-round detail and every report. **It is disposable scaffolding** — everything that must
+   outlive the milestone is already in this file. Delete it when the branch merges.
 
 ### WHAT MILESTONE 3 HAS COST AND BOUGHT SO FAR — read this before writing a spec
 
