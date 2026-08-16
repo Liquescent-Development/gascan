@@ -294,6 +294,12 @@ never pulls.
 `offline` stays `ISOLATION_UNVERIFIED` until milestone 4's proof exercise. A flag is flipped
 only when a live test drives the capability it names.
 
+**Both flipped on 2026-08-16 with milestone 3's task 6, and the rule above held for both.**
+`tty` is earned by
+`exec::a_tty_exec_gives_the_guest_a_terminal_and_merges_stderr_into_stdout` and `signals` by
+`exec::a_signal_reaches_the_guest_process_and_decides_how_it_exits`; each was SEEN TO FAIL
+against a one-line mutation of the engine. `offline` is now the only flag still false.
+
 ## 6. Error handling
 
 Unchanged from parent design §6, restated because it is the part a new method most easily
@@ -368,6 +374,12 @@ answered wrongly" are never confused.
 ## 9. Out of scope
 
 - **`Exec` and `Logs`** — milestone 3, including `signalExec` (§3, change 5).
+  **CORRECTED 2026-08-16, when milestone 3 finished: that list was two thirds of what
+  milestone 3 actually carried.** `CreateContainer` was ruled into it on 2026-08-15 as its
+  first task — it had no milestone at all, and P5's exit criterion cannot be met while a
+  contract method answers `unsupported_capability`. Milestone 3 shipped `CreateContainer`,
+  `runUntilQuiesced`, `signalExec`, `Logs` and `Exec`, and with `Exec` **all eleven methods
+  answer for real**.
 - **Daemon wiring, packaging, the launchd plist, and the offline proof** — milestone 4.
 - **Which mechanism ships the large artifacts** — milestone 4, constrained by §2.6.
 - **P5.3 conformance**, **U5**, **P6's network model**, and the duplicated `sandbox_id`-claim

@@ -482,15 +482,18 @@ pub fn reserved_loopback_port() -> u16 {
 /// A `/bin/sh` program that answers every TCP connection on `port` with what
 /// `report` prints.
 ///
-/// **The published port is the only channel out of an Arca guest this build
-/// has.** `Exec` and `Logs` are milestone 3's and both answer
-/// `unsupported_capability` here (`read_rpcs.rs`), and `Inspect` reports what
-/// the STORE holds rather than what the guest sees. So every test that needs a
-/// fact *from inside* the sandbox -- what is mounted, how much memory the
-/// kernel found -- reads it the way `ports.rs` reads its token, and takes the
-/// same dependency on a working publish. That coupling is stated in each of
-/// those tests rather than hidden: a broken publish fails them all, and
-/// `ports.rs` is what says whether the publish is the cause.
+/// **The published port is how the tests below this line read the guest, and
+/// it was once the only channel there was.** `Exec` and `Logs` landed in
+/// milestone 3 and both answer for real now (`exec.rs`, `logs.rs`), so a new
+/// test that wants a fact from inside the sandbox has a second option; the
+/// paragraph that said they refuse was true until this branch and is not now.
+/// `Inspect` still reports what the STORE holds rather than what the guest
+/// sees, so it remains no evidence about the guest. The existing callers --
+/// what is mounted, how much memory the kernel found -- still read it the way
+/// `ports.rs` reads its token, and take the same dependency on a working
+/// publish. That coupling is stated in each of those tests rather than hidden:
+/// a broken publish fails them all, and `ports.rs` is what says whether the
+/// publish is the cause.
 ///
 /// `while :;` and not a single accept: the first connection a test makes is
 /// usually the first this responder ever serves, but a retry after a refused
@@ -600,7 +603,8 @@ pub async fn await_state(
     );
 }
 
-/// A policy-validated `CreateRequest`, which is the only kind that exists.
+/// A policy-validated `CreateRequest`, which is the only kind that exists,
+/// against an image the engine's own store actually holds.
 ///
 /// `CreateRequest`'s fields are `pub(crate)` to `gascan-core` and it derives no
 /// `Deserialize`, so `PolicyCompiler` is the only construction path -- there is
@@ -609,18 +613,20 @@ pub async fn await_state(
 /// the fake transport. The two cannot share code: each `tests/*.rs` is its own
 /// crate, and this one is reachable only from the live tier.
 ///
-/// The `TempDir` must outlive the request: the compiled request names its
-/// canonical root.
-pub fn policy_request(name: &str) -> (tempfile::TempDir, gascan_core::runtime::CreateRequest) {
-    policy_request_for_image(name, gascan_core::policy::PolicyCompiler::workspace_image())
-}
-
-/// The same request, against an image the engine's own store actually holds.
-///
 /// `PolicyCompiler::compile` pins the approved workspace image, which no engine
 /// under test has: the live tier seeds a store with `arca-engine image load` and
 /// must then ask for what it seeded. `compile_for_image` is the existing seam
 /// for exactly this and needs no widening.
+///
+/// **There is no unpinned variant any more.** A `policy_request(name)` taking
+/// the approved workspace image stood here until `read_rpcs.rs` stopped calling
+/// `create_container` against a sandbox that was never created -- see that
+/// file's note on `CreateContainer` leaving the unimplemented list -- and it was
+/// then the only caller. Every request this tier builds now names an image the
+/// test seeded, which is the only kind an engine under test can honour.
+///
+/// The `TempDir` must outlive the request: the compiled request names its
+/// canonical root.
 pub fn policy_request_for_image(
     name: &str,
     image: &str,

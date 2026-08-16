@@ -1,9 +1,8 @@
-use crate::common::{LiveEngine, policy_request, retained_for};
+use crate::common::LiveEngine;
 use gascan_arca::ArcaBackend;
-use gascan_core::runtime::{
-    ExecRequest, NetworkIsolation, RecreateRequest, RetainedResources, RuntimeBackend,
-};
+use gascan_core::runtime::{ExecRequest, NetworkIsolation, RuntimeBackend};
 use gascan_core::sandbox::SandboxId;
+use std::time::Duration;
 
 /// The backend over a real engine, not a fake. Everything below goes through
 /// ChannelTransport and the real gRPC stack.
@@ -34,11 +33,13 @@ async fn backend(engine: &LiveEngine) -> ArcaBackend<gascan_arca::ChannelTranspo
 /// - `resource_limits` by
 ///   `limits::the_requested_cpu_and_memory_limits_are_the_guests_own_cgroup_limits`.
 ///
-/// And each negative names why it is one:
+/// - `tty` by
+///   `exec::a_tty_exec_gives_the_guest_a_terminal_and_merges_stderr_into_stdout`.
+/// - `signals` by
+///   `exec::a_signal_reaches_the_guest_process_and_decides_how_it_exits`.
 ///
-/// - `tty` and `signals` are milestone 3's, with `Exec` --
-///   `every_unimplemented_method_answers_unsupported_capability_not_a_transport_fault`
-///   below still lists it among the three this build refuses.
+/// And the one remaining negative names why it is one:
+///
 /// - `offline` stays `Unverified` until milestone 4's proof exercise.
 ///
 /// CORRECTED: this test used to assert every flag false and its comment said
@@ -46,7 +47,8 @@ async fn backend(engine: &LiveEngine) -> ArcaBackend<gascan_arca::ChannelTranspo
 /// forward reference was wrong in both directions -- three flags moved here in
 /// milestone 2, and milestone 4 has no authority to turn on `named_volumes`,
 /// `tty` or `signals`, which belong to an Arca fix and to milestone 3. What
-/// milestone 4 owns is `offline`.
+/// milestone 4 owns is `offline`, and it is now the only one left: `tty` and
+/// `signals` moved with milestone 3's `Exec`.
 ///
 /// `named_volumes` moved fourth, when Arca stopped identifying its OverlayFS
 /// block devices by counting `/dev/vd` letters and started reading a role out of
@@ -62,117 +64,75 @@ async fn capabilities_report_only_what_this_engine_build_implements() {
 
     assert!(capabilities.bind_mounts);
     assert!(capabilities.named_volumes);
-    assert!(!capabilities.tty);
-    assert!(!capabilities.signals);
+    assert!(capabilities.tty);
+    assert!(capabilities.signals);
     assert!(capabilities.loopback_publish);
     assert!(capabilities.resource_limits);
     assert_eq!(capabilities.offline, NetworkIsolation::Unverified);
 }
 
-/// Every method this build does not implement must ANSWER, and every one of
-/// them must answer the same way.
+/// **The list of unimplemented methods is EMPTY, and this is what replaced it.**
 ///
-/// A gRPC status would reach the consumer as an unreachable engine, which is a
-/// different fact from "this build cannot do that" and would send a reconciler
-/// down the wrong path. That is the PR's claim, and it was once asserted for
-/// one method out of ten: a comment reading "the eight unimplemented methods
-/// must ANSWER" sat above a body that called only `start`. The two streaming
-/// methods were the ones that mattered most, because their error arrives in a
-/// different message entirely -- `LogsChunk.outcome.error` and
-/// `ExecServerFrame.frame.error` -- and nothing in this tier touched either. A
-/// regression that made `Logs` answer with a status would have passed.
+/// The property the old test carried is still worth keeping and is not asserted
+/// anywhere else: an engine answer must arrive **in the message's own outcome**,
+/// never as a gRPC status. A status reaches the consumer as an unreachable
+/// engine, which is a different fact from "that could not be done" and sends a
+/// reconciler down the wrong path (`engine.proto:52-58`).
 ///
-/// **THREE, and it was ten. What forces a newly-implemented method out of this
-/// list is the assertion on each entry -- the `expect_err` on `CreateContainer`
-/// and `Logs`, and the `panic!` on `Exec`'s first frame -- and NOT the length
-/// assertion below, which is a tautology and was described here as the
-/// mechanism.** `Exec` refuses in the stream rather than at the call, for the
-/// reason given four lines above, so it has no `expect_err` at all; an earlier
-/// version of this paragraph said "the `expect_err` on each entry" and was
-/// wrong for a third of the list. `answers`
-/// is a `vec![]` literal, so its length is three by construction and no engine
-/// behaviour can change it; the assertion cannot fail except by someone editing
-/// the literal, which is visible in the diff anyway. It is kept as an executable
-/// comment and is labelled as one. Milestone 2 implemented `Inspect`, `ListResources`,
-/// `PrepareImage`, `Create`, `Start`, `Stop` and `Remove`, and the old list
-/// FAILED against the branch engine the day the first one landed: `expect_err`
-/// on `Inspect` got a perfectly good `absent`. That failure is the mechanism
-/// working. `CreateContainer` is the one method left that is neither streaming
-/// nor milestone 3's -- `Exec` and `Logs` are.
+/// `Exec` is where that property is most easily lost, which is why it is the one
+/// method kept here. Its error does not live in a response outcome at all -- it
+/// lives in `ExecServerFrame.frame.error`, one frame inside a stream -- so a
+/// handler that threw instead of sending would produce a transport fault that no
+/// other test in this tier would notice. MEASURED when this file still tested
+/// the refusal: an earlier draft called `expect_err` on `exec()` itself and
+/// failed with a perfectly healthy `ExecSession`, because the session opens
+/// before the engine has said anything. **Anything asserting against the call
+/// and not the frame is testing the wrong half.**
 ///
-/// A method that becomes real leaves this list and gets real assertions: for
-/// the seven that already did, they are in `lifecycle.rs` and `ports.rs`.
+/// **What changed and why the old shape had to go.** Until milestone 3 this test
+/// held a list of methods that answered `unsupported_capability`, and each
+/// method that became real left it: `Inspect`, `ListResources`, `PrepareImage`,
+/// `Create`, `Start`, `Stop` and `Remove` in milestone 2, `CreateContainer` in
+/// task 1, `Logs` in task 5, and `Exec` in task 6. **A list of length zero
+/// asserts nothing**, and the length check that guarded it was a tautology over
+/// a `vec![]` literal -- it said so in its own comment. What forced a method out
+/// was always the per-entry assertion, so with no entries left the whole
+/// structure is gone and the surviving property is asserted directly.
+///
+/// The refusal below is `not_found` rather than `unsupported_capability`: the
+/// sandbox was never created, and that is now what `Exec` says about one. The
+/// codes this engine may use at all are a closed table
+/// (`gascan-arca/src/error.rs:20-55`), so a status or an unrecognised code
+/// arrives as `invalid_output` and fails here either way.
 #[tokio::test]
 #[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN"]
-async fn every_unimplemented_method_answers_unsupported_capability_not_a_transport_fault() {
+async fn exec_refuses_in_its_own_frame_rather_than_as_a_transport_status() {
     let engine = LiveEngine::start().await;
     let backend = backend(&engine).await;
     let id = SandboxId::test("never-created");
 
-    // Held for the whole test: the compiled request names a canonical root that
-    // must still exist when the call is made.
-    let (_recreate_root, recreate_create) = policy_request("never-recreated");
-    let retained = RetainedResources::new(&recreate_create, retained_for(&recreate_create))
-        .expect("the retained set matches the requested topology exactly");
-    let recreate = RecreateRequest::new(recreate_create, retained).expect("a recreate request");
-
-    // Each arm reduces to the wire code, so the three shapes -- CreateFailure,
-    // ExecSession, Vec<u8> -- become one comparable list. `CreateFailure`
-    // carries its code separately from `RuntimeError` because a partial create
-    // must report what it made.
-    let answers: Vec<(&str, String)> = vec![
-        (
-            "CreateContainer",
-            backend
-                .create_container(recreate)
-                .await
-                .expect_err("CreateContainer")
-                .code()
-                .to_owned(),
-        ),
-        ("Exec", {
-            // Exec is the one that does not refuse at the call. The session
-            // OPENS -- `exec()` returns Ok -- and the refusal arrives as the
-            // stream's first frame, because the engine's answer lives in
-            // `ExecServerFrame.frame.error` rather than in a response
-            // outcome. MEASURED here: an earlier draft of this test called
-            // `expect_err` on `exec()` itself and failed with a perfectly
-            // healthy `ExecSession`. Anything that asserts against the call
-            // and not the frame is testing the wrong half.
-            let mut session = backend
-                .exec(ExecRequest::fixture(id.clone(), ["true"]))
-                .await
-                .expect("Exec opens a session; the refusal is its first frame");
-            match session.next().await {
-                Some(Err(error)) => error.code().to_owned(),
-                other => panic!("Exec's first frame must be an error, got {other:?}"),
-            }
-        }),
-        (
-            "Logs",
-            backend
-                .logs(&id, None)
-                .await
-                .expect_err("Logs")
-                .code()
-                .to_owned(),
-        ),
-    ];
-
-    // A tautology, kept as an executable comment: `answers` is a literal, so
-    // this cannot fail. What actually fails when a method becomes real is the
-    // assertion on each entry above -- `expect_err` for `CreateContainer` and
-    // `Logs`, the `panic!` on the first frame for `Exec` -- see the doc comment.
+    // The session OPENS -- `exec()` returns Ok -- and the answer arrives as the
+    // stream's first frame.
+    //
+    // **Both awaits are bounded, because the defect this test guards makes them
+    // hang rather than fail.** A handler that threw instead of sending produces
+    // no first frame, and an engine that never accepts the RPC never returns a
+    // stream at all; unbounded, either one stalls this test forever, and under
+    // `--test-threads=1` it stalls the whole tier with it. A test that hangs
+    // instead of failing is not a guard.
+    let opening = backend.exec(ExecRequest::fixture(id.clone(), ["true"]));
+    let mut session = match tokio::time::timeout(Duration::from_secs(60), opening).await {
+        Err(_) => panic!("Exec did not open a session within 60s"),
+        Ok(result) => result.expect("Exec opens a session; the refusal is its first frame"),
+    };
+    let code = match tokio::time::timeout(Duration::from_secs(60), session.next()).await {
+        Err(_) => panic!("Exec sent no first frame within 60s; a refusal must be answered"),
+        Ok(Some(Err(error))) => error.code().to_owned(),
+        Ok(other) => panic!("Exec's first frame must be an error, got {other:?}"),
+    };
     assert_eq!(
-        answers.len(),
-        3,
-        "this build implements eight of the eleven contract methods; \
-         a method that becomes real must leave this list"
+        code, "not_found",
+        "Exec must refuse a sandbox that was never created in its own frame, \
+         naming what was wrong: got {code}"
     );
-    for (rpc, code) in &answers {
-        assert_eq!(
-            code, "unsupported_capability",
-            "{rpc} must answer in its outcome, not as a status: got {code}"
-        );
-    }
 }
