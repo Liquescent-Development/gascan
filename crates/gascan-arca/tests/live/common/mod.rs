@@ -482,15 +482,18 @@ pub fn reserved_loopback_port() -> u16 {
 /// A `/bin/sh` program that answers every TCP connection on `port` with what
 /// `report` prints.
 ///
-/// **The published port is the only channel out of an Arca guest this build
-/// has.** `Exec` and `Logs` are milestone 3's and both answer
-/// `unsupported_capability` here (`read_rpcs.rs`), and `Inspect` reports what
-/// the STORE holds rather than what the guest sees. So every test that needs a
-/// fact *from inside* the sandbox -- what is mounted, how much memory the
-/// kernel found -- reads it the way `ports.rs` reads its token, and takes the
-/// same dependency on a working publish. That coupling is stated in each of
-/// those tests rather than hidden: a broken publish fails them all, and
-/// `ports.rs` is what says whether the publish is the cause.
+/// **The published port is how the tests below this line read the guest, and
+/// it was once the only channel there was.** `Exec` and `Logs` landed in
+/// milestone 3 and both answer for real now (`exec.rs`, `logs.rs`), so a new
+/// test that wants a fact from inside the sandbox has a second option; the
+/// paragraph that said they refuse was true until this branch and is not now.
+/// `Inspect` still reports what the STORE holds rather than what the guest
+/// sees, so it remains no evidence about the guest. The existing callers --
+/// what is mounted, how much memory the kernel found -- still read it the way
+/// `ports.rs` reads its token, and take the same dependency on a working
+/// publish. That coupling is stated in each of those tests rather than hidden:
+/// a broken publish fails them all, and `ports.rs` is what says whether the
+/// publish is the cause.
 ///
 /// `while :;` and not a single accept: the first connection a test makes is
 /// usually the first this responder ever serves, but a retry after a refused

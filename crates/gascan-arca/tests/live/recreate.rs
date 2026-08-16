@@ -141,7 +141,7 @@ fn appending_and_reporting(destination: &Utf8Path, port: u16) -> Utf8PathBuf {
 /// cause.
 #[tokio::test]
 #[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN, a kernel, a vminit \
-            layout and a base OCI layout; the pinned engine implements none of these RPCs"]
+            layout and a base OCI layout"]
 async fn a_recreate_reuses_its_retained_volumes_rather_than_rebuilding_them() {
     let port = reserved_loopback_port();
     let images = tempfile::tempdir().expect("a temporary layout root");

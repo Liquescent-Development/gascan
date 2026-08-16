@@ -85,12 +85,13 @@ fn now_millis() -> i64 {
 /// forbids and this engine does not have. Nothing about a log large enough to
 /// need more than one chunk -- four short lines are one frame, and where the
 /// engine splits is asserted in Arca's own `LogsTests`. And it says nothing
-/// about `Exec`, which is still the one method this build refuses; see
-/// `read_rpcs.rs`.
+/// about `Exec`, which `exec.rs` covers -- no method in this build answers
+/// `unsupported_capability` any more; see `read_rpcs.rs`.
 ///
-/// UNRUN as written. Every claim above is a derivation from the contract and
-/// from Arca's implementation, not an observation: the live tier is the
-/// maintainer's to run, and this test has never been executed.
+/// RUN, against Arca `8679113` on 2026-08-16: the full live tier reported
+/// `20 passed; 0 failed` in 234.34s, this test among them. An earlier version
+/// of this paragraph said the test had never been executed, and was left
+/// standing after the run that executed it.
 #[tokio::test]
 #[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN, a kernel, a vminit \
             layout and a base OCI layout"]

@@ -288,7 +288,7 @@ VM-free, in `ArcaEngineTests`:
 
 Everything needing a booted container. **The fixtures are one call each to affordances milestone 2
 already built**: `layout_running(base, destination, tag, command)`
-(`crates/gascan-arca/tests/live/common/mod.rs:710`) writes a one-image OCI layout running any
+(`crates/gascan-arca/tests/live/common/mod.rs:737`) writes a one-image OCI layout running any
 command, `report_section` (`:512`) parses a guest's text answer, and `read_from_loopback` (`:530`)
 reads a published port.
 

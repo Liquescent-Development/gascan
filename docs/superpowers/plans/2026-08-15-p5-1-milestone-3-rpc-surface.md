@@ -754,7 +754,16 @@ git commit
 
 1. **No defaulted parameter** (global constraint).
 2. **An unknown exec id throws `ExecManagerError.execNotFound`**, matching `resizeExec`'s shape at `:256-258`.
-3. **A signal for an exec whose process has not started MUST NOT be silently ignored — and this is where `signalExec` deliberately departs from `resizeExec`.** `resizeExec` returns silently in that case (`:270-273`), which is correct for a resize: a window size that arrives early is genuinely unimportant. **A signal that goes nowhere while the caller is told nothing is precisely this project's recurring defect** — the same shape as an engine that publishes no ports and reports success, and as a guest mount that is silently absent. Throw. `containerNotRunning` is the closest existing case; adding one is acceptable if it reads better, but do not add a case that duplicates an existing meaning.
+3. **A signal for an exec whose process has not started MUST NOT be silently ignored — and this is where `signalExec` deliberately departs from `resizeExec`.** `resizeExec` returns silently in that case (`:270-273`).
+
+   > **THIS RULING WAS REVERSED, 2026-08-16, and the reversal is the point of task 6's review round.**
+   > The sentence that stood here said the silent return "is correct for a resize: a window size that
+   > arrives early is genuinely unimportant." That is false, and a live test caught it: an interactive
+   > client sends its window size immediately after `ExecStart`, so the early resize is the ONLY resize
+   > most sessions ever send, and dropping it leaves the guest on the default 24x80. The engine now
+   > holds a resize for the process exactly as it holds a signal (Arca `8679113`), and
+   > `exec::a_resize_sent_before_the_process_starts_still_reaches_the_guests_terminal` is the
+   > instrument. Read requirement 3 as applying to both verbs. **A signal that goes nowhere while the caller is told nothing is precisely this project's recurring defect** — the same shape as an engine that publishes no ports and reports success, and as a guest mount that is silently absent. Throw. `containerNotRunning` is the closest existing case; adding one is acceptable if it reads better, but do not add a case that duplicates an existing meaning.
 4. **`ContainerBridge` is shared with Arca's Docker surface, so this change has a second consumer.** Check `Sources/DockerAPI/` before changing any existing signature.
 
 **Testing, and the split is honest rather than convenient.** `createExec` populates `ExecInfo` with `process` still nil; `startExec` sets it and requires a native container (`:139`). So:

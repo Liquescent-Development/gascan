@@ -233,25 +233,29 @@ async fn refusal(session: &mut ExecSession, bound: Duration) -> String {
 /// refusal instead of the signal.
 async fn read_until(session: &mut ExecSession, marker: &str, bound: Duration) -> String {
     let started = Instant::now();
-    let mut stdout = Vec::new();
+    // `seen`, not `stdout`: both streams land here, so a marker that appeared
+    // only on stderr would satisfy this function. Every current caller sends
+    // its marker to fd 1; name the buffer for what it holds so a future one
+    // that does not cannot be misread as a stdout assertion.
+    let mut seen = Vec::new();
     loop {
         let remaining = bound.saturating_sub(started.elapsed());
         match tokio::time::timeout(remaining, session.next()).await {
             Err(_) => panic!(
-                "{marker:?} never arrived within {:.1}s; stdout held {:?}",
+                "{marker:?} never arrived within {:.1}s; the exec's output held {:?}",
                 bound.as_secs_f64(),
-                String::from_utf8_lossy(&stdout)
+                String::from_utf8_lossy(&seen)
             ),
             Ok(None) => panic!("the exec stream ended before {marker:?} arrived"),
             Ok(Some(Err(error))) => panic!("the engine refused the exec: {error}"),
             Ok(Some(Ok(ExecOutput::Stdout(bytes)))) => {
-                stdout.extend_from_slice(&bytes);
-                let text = String::from_utf8_lossy(&stdout).into_owned();
+                seen.extend_from_slice(&bytes);
+                let text = String::from_utf8_lossy(&seen).into_owned();
                 if text.contains(marker) {
                     return text;
                 }
             }
-            Ok(Some(Ok(ExecOutput::Stderr(bytes)))) => stdout.extend_from_slice(&bytes),
+            Ok(Some(Ok(ExecOutput::Stderr(bytes)))) => seen.extend_from_slice(&bytes),
             Ok(Some(Ok(ExecOutput::Exit { code, signal }))) => {
                 panic!("the exec exited (code {code}, signal {signal}) before {marker:?} arrived")
             }
@@ -441,7 +445,7 @@ async fn a_signal_reaches_the_guest_process_and_decides_how_it_exits() {
     // larger than the question. That is fixed in `ExecSession.runSession` --
     // a refusal is reported and the session continues -- but gascan's own
     // client tears the RPC down the moment it reads an error frame
-    // (`gascan-arca/src/backend.rs:322-324` breaks the pump, which drops the
+    // (`gascan-arca/src/backend.rs:324-326` breaks the pump, which drops the
     // last receiver and `gascan-arca/src/channel.rs:193` then abandons the
     // call), so the engine sees a cancelled stream and kills the process for
     // that reason instead. MEASURED here: a second exec running `ps` after this
@@ -483,13 +487,34 @@ async fn a_signal_reaches_the_guest_process_and_decides_how_it_exits() {
 /// size was dropped with nothing said and the guest kept the default 24x80 --
 /// untested code on a path the `tty` flag now claims.
 ///
-/// `stty size` is the guest reporting its own terminal, in rows and columns, so
-/// it cannot be satisfied by anything the engine says about itself. The values
-/// are deliberately not the default: 40x120 shares no digit with 24x80.
+/// **The instrument is a SIGWINCH trap, not a size readout, and that was
+/// arrived at by measurement.** MEASURED at `f59bbe2`: busybox `stty` cannot
+/// read the inherited descriptor in this image -- `stty size` reports
+/// `stty: standard input` and `stty -F /dev/pts/0` reports `Not a tty` -- while
+/// `ls -l /proc/self/fd` shows fds 0, 1 and 2 all on `/dev/pts/0` and `tty`
+/// prints it. The terminal is real; stty simply cannot read it here. A trap on
+/// signal 28 observes the terminal EVENT, which only the kernel delivers to a
+/// process on that pty and no engine can fake by describing itself.
 ///
-/// The `sleep` is the assertion's honesty, not a workaround. Without it the
-/// test would race the resize against `stty` and could pass by luck; with it,
-/// the engine has had time and a failure means the size never arrived.
+/// **THE DIMENSIONS ARE NOT ASSERTED, AND NOTHING IN EITHER REPOSITORY ASSERTS
+/// THEM.** This test would pass with `height` and `width` swapped at the
+/// `resizeExec` call. It proves delivery, not fidelity. Closing that needs a
+/// way to read the size from inside this image, which the measurement above
+/// says busybox does not give us.
+///
+/// **NO HANDSHAKE, and that is the whole test.** Reading any guest output first
+/// -- an `echo ready` before the resize -- closes the pre-start window, because
+/// output cannot reach this process until after the host has recorded the exec.
+/// A handshake variant was committed here at `f59bbe2` and it was the CONTROL:
+/// that commit's own message records it PASSING against the broken engine,
+/// while the no-handshake form failed with stdout `"done\r\n"` and no WINCH.
+/// Do not put a read in front of the resize to steady this test; a flake here
+/// is a finding about the engine's readiness wait, not a reason to re-close the
+/// window.
+///
+/// The `sleep` holds the guest open long enough for a late resize to still be
+/// observed, so a failure means the size never arrived rather than that the
+/// process left early.
 #[tokio::test]
 #[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN, a kernel, a vminit \
             layout and a base OCI layout"]
@@ -498,18 +523,14 @@ async fn a_resize_sent_before_the_process_starts_still_reaches_the_guests_termin
 
     let mut session = sandbox
         .exec(
-            &[
-                "sh",
-                "-c",
-                "trap 'echo WINCH' 28; echo ready; sleep 3; echo done",
-            ],
+            &["sh", "-c", "trap 'echo WINCH' 28; sleep 3; echo done"],
             true,
             b"",
         )
         .await;
-    read_until(&mut session, "ready", Duration::from_secs(60)).await;
     // Immediately, with no handshake: the window this test exists for is the
-    // one before the guest process is recorded.
+    // one before the guest process is recorded, and any read of guest output
+    // here would close it. See the note above.
     send(
         &mut session,
         ExecInput::Resize {
@@ -530,6 +551,59 @@ async fn a_resize_sent_before_the_process_starts_still_reaches_the_guests_termin
         completed.stdout.contains("done"),
         "the exec must still run to completion: {completed:?}"
     );
+
+    sandbox.teardown().await;
+}
+
+/// **A client that resets inside the `startExec` window must not leave its
+/// guest process running.**
+///
+/// This is design §3.2 requirement 7 -- "a mid-exec client reset is
+/// cancellation: kill the guest process, reap the exec instance, emit nothing"
+/// -- and until this test nothing in either repository drove it against a real
+/// engine. `backend_streams.rs` proves gascan SENDS the reset, over a fake
+/// transport; it can never observe what the engine does with one.
+///
+/// **The window is the point, so there is no handshake.** `Sandbox::exec`
+/// returns as soon as the engine accepts the RPC, which it does before it has
+/// anything to say, so the drop below lands while `startExec` is still inside
+/// its round trip to the guest agent. In that window the engine's `forceKill`
+/// asks `signalExec` to kill an exec whose process it has not recorded yet.
+///
+/// **This test cannot GUARANTEE it lands in the window** -- it is a race
+/// against a VM boot's worth of scheduling, and a reset that lands after the
+/// process is recorded takes the path that already worked. It is written to
+/// hit the window, not proven to. A pass is therefore weaker evidence than a
+/// failure: a failure means the guest outlived its stream, which is the defect.
+///
+/// The probe is a second exec running `ps`, which reports the guest's own
+/// process table -- an effect inside the sandbox, not a call that returned.
+#[tokio::test]
+#[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN, a kernel, a vminit \
+            layout and a base OCI layout"]
+async fn a_reset_before_the_process_starts_still_kills_the_guest() {
+    let sandbox = Sandbox::boot("reset").await;
+
+    // The reset, with nothing read from the session first.
+    let session = sandbox.exec(&["sh", "-c", "sleep 3600"], false, b"").await;
+    drop(session);
+
+    // The engine bounds its own teardown at 10s; allow that plus margin before
+    // calling the process orphaned.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut probe = sandbox.exec(&["ps"], false, b"").await;
+        let seen = drain(&mut probe, Duration::from_secs(60)).await;
+        if !seen.stdout.contains("sleep 3600") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the guest process outlived the stream that started it; the sandbox's own \
+             process table still holds it after 30s: {seen:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 
     sandbox.teardown().await;
 }

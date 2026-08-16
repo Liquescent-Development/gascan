@@ -16,9 +16,48 @@ the merge.**
 
 ## Where the work is
 
-**P5.1 MILESTONE 3 IS CODE-COMPLETE — 2026-08-16. SIX OF SIX TASKS DONE, NOTHING MERGED, NOTHING
-BLOCKED. WHAT REMAINS IS THE TWO PULL REQUESTS.** This section is the current state; everything
-below it about milestone 2 is history kept for its reasoning.
+**P5.1 MILESTONE 3 IS CODE-COMPLETE — 2026-08-16. SIX OF SIX TASKS DONE, BOTH PULL REQUESTS OPEN,
+NOTHING BLOCKED.** Arca **#58**, Gas Can **#75**. This section is the current state; everything below
+it about milestone 2 is history kept for its reasoning.
+
+### THE PRE-MERGE REVIEW ROUND, AND THE THREE DEFECTS IT COST — 2026-08-16 (late)
+
+**Both PRs were reviewed before merge and both were BLOCKED by it. Three engine defects and one
+false test came out, and none of them was visible to a passing suite.** Arca `06a5162` and the Gas
+Can commit that follows this line are what closed them.
+
+1. **The ten-second teardown bound was inert.** `completes()` raced `Task.value` against a sleep;
+   `Task.value` is not cancellation-aware and `withTaskGroup` drains every child, so the race
+   returned exactly when the work it bounded returned. The `Exec` handler could still hang forever.
+2. **`forceKill` discarded the SIGKILL in the `startExec` window.** `execNotStarted` can only mean
+   "not started yet" — `ExecManager` assigns `process` once (`ExecManager.swift:316`) and never
+   clears it — so the log line "it may already have exited" said the one thing it cannot mean.
+3. **A real client reset ran no teardown at all**, and only a VM could show it. A reset does not
+   arrive as a stream failure: gascan's relay breaks on its own cancellation and drops the sender,
+   which reaches the engine as an ordinary end of input, so `clientReset` read **false** and the
+   session went into `await execution.value` — the one wait cancellation cannot interrupt. MEASURED:
+   an exec of `sh -c "sleep 3600"` whose client dropped the session left `sleep 3600` in the guest's
+   process table 30s later; 58 execs started and 57 deleted across that test region.
+
+**THE FOURTH FINDING IS THE ONE TO READ TWICE, BECAUSE IT IS ABOUT A TEST AND NOT A DEFECT.** The
+resize test shipped **the control instead of the subject**. `f59bbe2`'s own message records that the
+variant *with* a readiness handshake **passed against the broken engine** — and that is the variant
+that was committed, under the name
+`a_resize_sent_before_the_process_starts_still_reaches_the_guests_terminal`. Reverting the engine fix
+would have left both repositories green. **A test named for a window that closes the window before
+testing it is worse than no test**, because the name is what a successor trusts. The handshake is
+gone; the test now sends the resize with nothing read, and it passes against the fixed engine.
+
+**Two process lessons, both paid for:**
+
+- **A subagent dispatched in the background can go idle having delivered nothing.** Of four review
+  and fix agents dispatched this way, one answered a retrieval request with a full review, one
+  answered nothing across three probes, and two went silent after their work was already on disk.
+  **Implementation output survives a lost report; a review does not.** Dispatch reviewers
+  synchronously; a fixer may go in the background because the code is durable.
+- **Verify a fix's test by mutation yourself rather than trusting the report.** Both engine
+  mutations were re-run by the controller and fail **disjoint** sets of tests, which is what proves
+  neither test rides on the other's fix. That check is what the resize test failed.
 
 **ALL ELEVEN CONTRACT METHODS NOW ANSWER FOR REAL.** `unsupported_capability` appears nowhere in
 this engine's answers. `tty` and `signals` are `true`, each earned by a live test that was SEEN TO
@@ -109,10 +148,21 @@ pass over this file, and this milestone has already proved that four times — i
 very section, which said "neither branch is pushed" for the twenty minutes between writing it and
 pushing them.
 
-**What a successor should do first: open the two pull requests. That is the only open item.** Every
-task is done, every one has its live evidence, task 6 has been reviewed and its findings fixed, and
-both branches are committed, signed and pushed. Before opening Arca's, re-check that the
-`containerization` submodule has not moved — it has not this milestone, and it is at `3f68806`.
+**SUPERSEDED — the two pull requests are open.** Arca **#58**, Gas Can **#75**, both opened
+2026-08-16 (late). This paragraph said opening them was the only open item; the pre-merge review
+above then found three engine defects and one false test, so it was not.
+
+**What a successor should do first: MERGE THEM, Arca first.** Every task is done, every one has its
+live evidence, both PRs have been reviewed and every finding fixed or explicitly carried, the live
+tier is 21/21 and the Arca suite 228/0. **Merge commits only — `allowed_merge_methods` is
+`["merge"]`, never squash.** `ci / gate` is not a required check and does not block; the `engine`
+job is red by design against the unbumped pin. Re-check that the `containerization` submodule has
+not moved before Arca's merge — it has not this milestone, and it is at `3f68806`, identical on
+`origin/main` and the branch tip, so the PR does not move the pointer at all.
+
+**Then delete `.superpowers/sdd/2026-08-15-p5-1-milestone-3-rpc-surface/`** — disposable scaffolding,
+untracked, and everything that must outlive the milestone is in this file. **Then milestone 4**, whose
+scope is below and which has gained a second shutdown defect from this round.
 
 ### TASK 6 WAS REVIEWED AND THE REVIEW FOUND THREE REAL DEFECTS — 2026-08-16 (late)
 
@@ -169,14 +219,20 @@ would release it. Fixed with one line, `await context.acceptRPC(headers: [:])`.
 2. **The first ten-minute hang produced no diagnostic at all**, because the test was blocked in an
    await with no bound — `backend.exec()` itself. `drain`'s 60-second bound was never reached
    because the test never got that far. **A bound on the wrong await tells you nothing.** Every await
-   in `exec.rs` is bounded now.
+   **that touches a live session** is bounded now — `Sandbox::exec`, `drain`, `send`, `refusal` and
+   `read_until`. **`Sandbox::boot`'s are deliberately NOT**, so a boot failure reads the same here as
+   in `lifecycle.rs` (`exec.rs:186-198`). This sentence read "every await in `exec.rs` is bounded now"
+   until 2026-08-16, which `f8e3f79` had already retracted **in the file itself** — the retraction did
+   not propagate here, and two later edits to this section left it standing.
 3. **Arca's suite is at 221 passing with and without the fix.** Only the live tier can see it.
 
 **A PLAN PREMISE WAS FALSE AND IT CHANGED WHAT THE LIVE TEST ASSERTS.** The plan said `signals`
 would be earned by "reading the number back in `Exit.signal`". **Nothing carries a signal number
 across the guest boundary:** vminitd reaps with `wait4` and `Command.toExitStatus` collapses the
-status to `128 + N` (`ContainerizationOS/Command.swift:306-315`), and `ExitStatus` has one field
-(`ExitStatus.swift:21-25`). gascan's Apple backend reports `signal: 0` for the same reason
+status to `128 + N` (`ContainerizationOS/Command.swift:306-315`), and **`ExitStatus` carries no signal
+number** — its two fields are `exitCode` (`ExitStatus.swift:23`) and `exitedAt` (`:25`). This file said
+"one field" until 2026-08-16; Arca `008dfe5` had already corrected that overstatement on the engine
+side and the correction did not propagate here. gascan's Apple backend reports `signal: 0` for the same reason
 (`gascan-apple/src/backend.rs:604`), so reporting anything else would also make the two backends
 distinguishable by their framing. **`Exit.signal` is 0 and delivery is observed in `code`** — 143
 for SIGTERM and 137 for SIGKILL, asserted with two numbers so an engine that hardcoded one fails.
@@ -269,24 +325,57 @@ rulings are closed on measurements, and both branches are merged.** What is left
 | Parent design | `docs/superpowers/specs/2026-08-10-p5-1-engine-service-and-wiring-design.md` |
 | Governing roadmap | `docs/superpowers/plans/2026-08-04-arca-integration-roadmap.md` — P0-P8; P0-P4 done, P5 current |
 
-**THIS IS THE CURRENT TABLE — re-run and verified 2026-08-16 (late), after milestone 3's task 6.
-Both trees clean. It replaces the 2026-08-14 table, which is kept below it as history:**
+**THIS IS THE CURRENT TABLE — re-run and verified 2026-08-16 (late), after the PRE-MERGE REVIEW
+ROUND and its three engine fixes (Arca `06a5162`). Both trees clean. It replaces the table taken
+after task 6, whose figures are given in the right-hand column so the deltas are visible:**
 
-| | |
-|---|---|
-| `swift test --disable-swift-testing --filter ArcaEngineTests` | `Executed 221 tests, with 0 failures` — 204 before task 6, plus 17 `ExecTests` |
-| `swift test --disable-swift-testing --filter ArcaTests.NetworkPruneGateTests` | `Executed 3 tests, with 0 failures` |
-| `env -u RUSTUP_TOOLCHAIN cargo test --workspace --no-fail-fast` | **74 targets / 1435 passed / 1 failed / 42 ignored** — see the accounting below; the one failure is a different `gascan-e2e` test on every run |
-| the live tier, `-- --ignored --test-threads=1` | **20 passed / 0 failed**, 234.34s, 3 non-ignored filtered out — 19 before the review round, plus the resize test |
-| `scripts/ci-check-ignored-tests.sh` | `42 ignored test(s), matching the baseline` |
+| | | after task 6 |
+|---|---|---|
+| `swift test --disable-swift-testing --filter ArcaEngineTests` | `Executed 228 tests, with 0 failures` | 221 — +4 `ExecTeardownTests`, +3 cancellation tests |
+| `swift test --disable-swift-testing --filter ArcaTests.NetworkPruneGateTests` | `Executed 3 tests, with 0 failures` | 3 |
+| the live tier, `-- --ignored --test-threads=1` | **21 passed / 0 failed**, 289.04s, 3 non-ignored filtered out | 20 / 234.34s — plus the reset test |
+| `env -u RUSTUP_TOOLCHAIN cargo test --workspace --no-fail-fast` | **74 targets / 1435 passed / 1 failed / 43 ignored**, counting only the 77 `test result:` lines whose filtered-out count is 0, as the overcounting trap requires | 74 / 1435 / 1 / 42 |
+| `scripts/ci-check-ignored-tests.sh` | `43 ignored test(s), matching the baseline` | 42 |
+| `cargo fmt --all --check` | exit 0 | — |
+| `cargo clippy --workspace --all-targets` | no issues found | — |
+
+**The live tier went RED before it went green, and that is the entry worth keeping.** The first run
+after the fixes was **19 passed / 2 failed**: the new reset test, which had found defect 3 above, and
+`shutdown::the_engine_exits_cleanly_with_a_client_channel_still_open`. The second run, after defect 3
+was closed, is the 21/21 in the table.
+
+**A SECOND SHUTDOWN DEFECT IS NOW CHARACTERISED, AND IT IS NOT THE KNOWN ONE.**
+`shutdown::the_engine_exits_cleanly_with_a_client_channel_still_open` fails about **1 shutdown in
+288** with `exit status: 1` — the engine's own deliberate error exit, not the kernel's 143. **It is a
+different test and a different exit code from the exit-143 startup race** this file records
+elsewhere; do not fold the two together. **Attributed by measurement rather than by argument**, since
+the engine changed and the empty-diff exoneration was therefore unavailable: the identical signature
+(`95 x exit status: 0, 1 x exit status: 1`) reproduced on `8679113` with **none** of the fixes
+applied, 1 of 288 shutdowns, and did not appear with them, 0 of 288. **So it is pre-existing.** One
+event cannot distinguish "unchanged" from "improved" and no such claim is made. **Milestone 4's**,
+with the other shutdown race.
 
 **The deltas, accounted for rather than accepted.** Against the branch as it stood after task 5:
-**ignored +3** — `exec::` gains three and `read_rpcs::` swaps a retired name for a new one, so +4
-added and −1 removed; **passed +0**, because all three new live tests are `#[ignore]`d;
+**ignored +4** — `exec::` gains **four** and `read_rpcs::` swaps a retired name for a new one, so +5
+added and −1 removed; **passed +0**, because all four new live tests are `#[ignore]`d;
 **targets +0**, because `exec.rs` is a module of the existing `live` target. Passed plus failed is
 **1436**, which is the plan's baseline exactly.
 
-**THREE WORKSPACE RUNS, THREE DIFFERENT SINGLE FAILURES, ALL IN `crates/gascan-e2e`, ALL EXONERATED
+**MEASURED 2026-08-16 from the baseline file at each commit**, because this paragraph said "+3" and
+"all three" for a day after the table above it was updated to 42:
+`git show <sha>:tests/ci/expected-ignored-tests.txt | grep -c .` gives **38** at `b2b7a0e` (task 5),
+**41** at `faf35ed` (task 6), **42** at `f59bbe2` (the review round). 38 → 42 is +4. The stale figure
+was written at `faf35ed`, when +3 was correct, and left standing when `f59bbe2` added the resize test
+and updated the table four lines above it. **That is the sixth self-falsifying claim this milestone,
+and the second in this very section.**
+
+**The fix round of 2026-08-16 (late) adds one more**, `exec::a_reset_before_the_process_starts_still_
+kills_the_guest`, taking the baseline to **43** — `scripts/ci-check-ignored-tests.sh` reports
+`43 ignored test(s), matching the baseline`. **The live tier has NOT been re-run since**, so the
+20/20 in the table above predates both that test and the engine fixes it exists to catch. Do not
+quote it as covering them.
+
+**FOUR WORKSPACE RUNS, FOUR DIFFERENT SINGLE FAILURES, ALL IN `crates/gascan-e2e`, ALL EXONERATED
 THE WAY THIS FILE REQUIRES — BY DIFF AND ISOLATION, NOT BY PROBABILITY.** Read them as a set, which
 is the same reading that identified D7: different tests, one crate, one load condition.
 
@@ -295,6 +384,7 @@ is the same reading that identified D7: different tests, one crate, one load con
 | 1 | `daemon_stderr_sink_survives_the_launching_cli` | D7 — `mode is 0200 … written but never published (mode 0200, size 375 …)`, **the same test and the same size as the first occurrence this file ever recorded**, 2026-08-12 |
 | 2 | `daemon_kill_and_restart_preserve_runtime_truth` | `state Unsafe: interrupted daemon instance descriptor changed while opening it` |
 | 3 | `no_sandbox_status_error_is_actionable_and_keeps_usage_exit` | `left: Some(70), right: Some(64)` — a daemon that failed to start, so the CLI returned the wrong exit code |
+| 4 | `accepted_socket_without_http2_cannot_block_initial_probe` | `panicked at crates/gascan-e2e/tests/autostart.rs:809:5: exit code 70` — 2026-08-16 (late), the fourth distinct test and the second to surface a bare exit 70 |
 
 `git diff e9468d8..HEAD -- crates/gascan-e2e/ crates/gascan/ crates/gascand/` is **empty** and
 nothing is uncommitted in those crates, so the branch cannot have caused any of them. Each target
@@ -302,11 +392,17 @@ passes alone: `autostart` **16/16** with zero occurrences of `mode is 0200`, `fa
 **28/28**, twice. Load averages were 3.3-4.9 throughout, which is the condition this file records
 these scaling with.
 
-**Do not read this as three green runs.** It is one accounted-for failure per run, exonerated
-individually. **A clean local `cargo test --workspace` was not achieved on this branch**, and the
-standing rule that a green local workspace is the bar is therefore met only by isolation, which is
-weaker. The three root causes this file already names are the place to start when someone is asked
-to fix them.
+**Do not read this as four green runs.** It is one accounted-for failure per run, exonerated
+individually. **A clean local `cargo test --workspace` has never been achieved on this branch**, and
+the standing rule that a green local workspace is the bar is therefore met only by isolation, which
+is weaker. The root causes this file already names are the place to start when someone is asked to
+fix them.
+
+**Run 4's exoneration, 2026-08-16 (late), and it is the same shape as the other three.** The diff
+above is still empty and `git status --porcelain` over those three crates is still empty, so the
+branch cannot have caused it; `cargo test -p gascan-e2e --test autostart` alone is
+**`16 passed; 0 failed`**. Four runs, four distinct tests, one crate. **That the failing test is
+different every time is the finding** — a branch-caused failure does not wander.
 
 ---
 
@@ -377,7 +473,7 @@ in a stated order, with §5 fixing what proves each one.
 **Two things in it will save a session each.** It is **Arca-side Swift plus live tests**: Gas Can's
 half is already implemented and tested, so no Gas Can PR is on the critical path (§2.1). And the
 live-tier fixtures are one call each to affordances milestone 2 already built —
-`layout_running` (`crates/gascan-arca/tests/live/common/mod.rs:710`) writes a one-image OCI layout
+`layout_running` (`crates/gascan-arca/tests/live/common/mod.rs:737`) writes a one-image OCI layout
 running any command, which is what both `Exec` and `Logs` need (§5.2).
 
 **The everything-below-here for milestone 2 is history now.** The paragraphs on Landing 5, Task 13's
