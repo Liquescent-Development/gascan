@@ -47,7 +47,7 @@ first task.
 | 3 | the `unpackLayerToCache` call test | **done** — 3 review rounds |
 | 4 | `ExecManager.signalExec` | **done** — 1 review round |
 | 5 | `Logs` | **done** — 2 fix rounds, re-review clean, live test **run and passing**; 2 Minors deferred (below) |
-| 6 | `Exec`, then the `tty` and `signals` flips | **done** — 4 VM-free mutations run, 2 live mutations run, live tier 19/19 |
+| 6 | `Exec`, then the `tty` and `signals` flips | **done** — 4 VM-free mutations run, 2 live mutations run, **1 review round: 3 behavioural defects found and fixed**, live tier 20/20 |
 
 **SUPERSEDED THE SAME DAY — read the next paragraph before believing this one.** It said: both
 branches are pushed, Arca `feat/engine-rpc-surface` on `git@github.com:Vas-Solutus/arca.git` and Gas
@@ -57,9 +57,14 @@ when written and task 6 has moved both since.
 
 **RESOLVED, AND BOTH BRANCHES ARE PUSHED AGAIN — 2026-08-16 (late).** The maintainer unlocked
 1Password, the same probe then exited 0, and Arca's task-6 commit went in as `af22685` with `%G?` =
-`G`. **Verified with `git ls-remote --heads`: Arca `feat/engine-rpc-surface` at `af22685`, Gas Can
-`docs/p5-1-milestone-3-design` at `e7e0f72`, both matching their local HEADs, both trees clean.**
-Read HEAD with `git log -1` rather than trusting either SHA here.
+`G`.
+
+**BOTH BRANCHES HAVE MOVED SINCE, and the SHAs in the sentence above are the task-6 commits, not the
+branch tips.** The review round added two commits to each. **As of the last push:
+Arca `feat/engine-rpc-surface` at `8679113`, Gas Can `docs/p5-1-milestone-3-design` at `281c6bd`**,
+both verified with `git ls-remote --heads` against their local HEADs, both trees clean.
+**Read HEAD with `git log -1` rather than trusting any SHA here** — this is the fifth time a SHA in
+this file has gone stale under a following commit, and the fifth time is not the last.
 
 **The block below is kept because the failure is worth recognising on sight, not because it is
 current.** It cost nothing this time only because the probe is one command.
