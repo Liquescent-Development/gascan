@@ -16,7 +16,62 @@ the merge.**
 
 ## Where the work is
 
-**P5.1 MILESTONE 2 IS DONE AND MERGED — 2026-08-15.** Both rulings closed, both review rounds done,
+**P5.1 MILESTONE 3 IS IN FLIGHT — 2026-08-16. FIVE OF SIX TASKS DONE, NOTHING MERGED, NOTHING
+BLOCKED.** This section is the current state; everything below it about milestone 2 is history kept
+for its reasoning.
+
+| | |
+|---|---|
+| Arca | `feat/engine-rpc-surface`, based on `b3ffdf5` (main) — **read HEAD with `git log -1`** |
+| Gas Can | `docs/p5-1-milestone-3-design`, based on `e9468d8` (main) — same |
+| Submodule | `containerization` at **`3f68806`, and it must NOT move this milestone** |
+| Design | `docs/superpowers/specs/2026-08-15-p5-1-milestone-3-rpc-surface-design.md` |
+| Plan | `docs/superpowers/plans/2026-08-15-p5-1-milestone-3-rpc-surface.md` — **fully expanded, all six tasks** |
+| Ledger | `.superpowers/sdd/2026-08-15-p5-1-milestone-3-rpc-surface/progress.md` — disposable; anything that must outlive the milestone is here instead |
+
+**Milestone 3 is "finish the RPC surface", and that scope was a ruling, not the original plan.**
+`CreateContainer` had no milestone; it was the third RPC answering `unsupported_capability`, and
+**P5's exit criterion cannot be met while it refuses.** Ruled 2026-08-15 into milestone 3 as its
+first task.
+
+| Task | What | State |
+|---|---|---|
+| 1 | `CreateContainer` | **done** — 3 review rounds, live tier 15/15 |
+| 2 | `runUntilQuiesced` | **done** — 2 review rounds, live `shutdown::` 3/3 |
+| 3 | the `unpackLayerToCache` call test | **done** — 3 review rounds |
+| 4 | `ExecManager.signalExec` | **done** — 1 review round |
+| 5 | `Logs` | **implemented, 2 fix rounds, re-review in flight; ITS LIVE TEST IS UNRUN** |
+| 6 | `Exec`, then the `tty` and `signals` flips | **not started; the plan is expanded and ready** |
+
+**What a successor should do first:** finish task 5's re-review, **run the live tier** (task 5's
+`logs.rs` has never been executed, and `streamLogs` changed the handler's shape — "the wire contract
+is identical" is a *derivation*), then take task 6 from the plan. Task 6 is a clean start; nothing is
+half-done in it.
+
+### WHAT MILESTONE 3 HAS COST AND BOUGHT SO FAR — read this before writing a spec
+
+**Three premises in the milestone-3 DESIGN DOCUMENT were false, and all three were caught by
+implementers before they were built on.** They are listed here rather than quietly fixed because the
+design is committed and a reader will meet it:
+
+1. **§2.2 as written verified the wrong list.** It said confirm each *retained* resource; the
+   container mounts `create.volumes`, a separate field, so `retained: []` bypassed the guard
+   entirely — **the exact silent failure §2.2 exists to prevent**. Amended in Gas Can `474d195`.
+2. **§2.5's "nothing has ever parsed those lines back" is FALSE.** Three call sites parse container
+   log entries — two in `DockerAPI`, one in `ArcaDaemon` — all with a default-options
+   `ISO8601DateFormatter`, which **cannot parse a fractional-seconds stamp**, and all three `continue`
+   past what they cannot parse. **The change the design ruled would have made Arca's Docker surface
+   report every container as having said nothing.**
+3. **`combined.log` was never written by anything.** Seven references, all derivations or
+   registrations, no writer. **A `Logs` reading it as designed would have returned an empty log for
+   every container**, and a test using a real writer would have agreed.
+
+**The pattern: every one was found by an implementer re-deriving from the source instead of
+transcribing the brief.** Which is also why the plan's later tasks were expanded to *requirements*
+rather than step-level code — see the note on task 4 in the plan, which records that the one
+step-level brief contained three wrong details and the requirement-level ones did not.
+
+ Both rulings closed, both review rounds done,
 nothing open. Gas Can `main` at merge commit `e968ae1` (PR #71), Arca `main` at `b3ffdf5` (PR #57),
 submodule `containerization` at `3f68806` on `merge/upstream-main`, reachable from its own remote so a
 fresh clone resolves. **Both are true merge commits — two parents each, nothing squashed** — so the
@@ -1023,6 +1078,17 @@ reduction.
   `signals` are the two capability flags still `false`, correctly, and this is what earns them.
   It also takes carried follow-ups (a) and (b) below. **It is Arca-side Swift plus live tests** —
   Gas Can's half is already built and tested, verified 2026-08-15 (design §2.1).
+- **Milestone 4 also owns three defects milestone 3 found and correctly did not fix.**
+  **(a) `ContainerManager.parseSignal` (`ContainerManager.swift:2882-2911`) is wrong in both halves.**
+  Its name branch maps 13 signals and **silently defaults anything unrecognised to SIGKILL** with only
+  a `logger.warning`; its numeric branch (`:2889-2891`) has **no range check**, so
+  `docker kill --signal 999` forwards 999 unvalidated. **Reachable today from Arca's Docker surface.**
+  **(b) `EXT4.Formatter.unpack` accepts a blob that is not the archive its media type declares and
+  produces an empty filesystem rather than refusing** — in production that turns a mis-typed or
+  corrupt layer into a valid, correctly labelled, **empty** `layer.ext4`, which is this project's own
+  defect signature reached through the miss path. Upstream in the frozen submodule.
+  **(c) Single-layer blindness in the layer-cache tests** — they use a one-layer fixture, so a
+  multi-layer defect is invisible. Needs a multi-layer fixture.
 - **Milestone 4 — and it now owns a MEASURED ENGINE DEFECT, ruled here 2026-08-15.**
   **`arca-engine` dies with exit 143 if SIGTERM lands during startup.** **CORRECTED within the hour
   by Task 2's implementer, and the first version of this entry understated it in exactly the way the
@@ -1221,6 +1287,66 @@ in `docs/status/arca-integration-handoff.md`.
   `scripts/build-arca-engine.sh`.
 
 ## Traps that will cost you if you learn them the hard way
+
+### Added 2026-08-16, from milestone 3's tasks 3-5. Every one was measured.
+
+**A TEST CLASS ANYWHERE IN `ArcaTests` EXCEPT `NetworkPruneGateTests` IS NOT RUN BY THE RELEASE
+GATE.** `scripts/build-arca-engine.sh:226-227,250-253` filters on `^ArcaEngineTests\.` and
+`^ArcaTests\.NetworkPruneGateTests/` and nothing else. **Measured: a task's acceptance suite sitting
+in `ArcaTests` gave a gate run of 175 tests with none of the new ones in it; moved to
+`ArcaEngineTests`, 180.** The acceptance test for that task would not have gated a release. **Put
+Swift tests in `ArcaEngineTests`.** Note also that **`swift test list --filter` ignores its filter**
+and will mislead you — use real runs.
+
+**`grep "^    public func \|^    private func "` IS BLIND TO `package func`, AND THIS REPOSITORY USES
+`package` PRECISELY FOR TEST REACHABILITY.** Measured on `ContainerManager.swift`: 61 functions found,
+63 with the corrected scan, exactly **2** `package func`s and **both invisible** — including
+`loadPersistedState()`, whose own comment says it is `package` so tests can drive it. **A reachability
+question answered with that grep gets the opposite answer.** It produced a false premise that survived
+into a source comment, a commit message and a report.
+
+**`ContainerBridge`'s LOG WRITER HAS CONSUMERS IN TWO OTHER MODULES AND NONE OF THEM IS IN THE GATE'S
+FILTER.** `DockerAPI/Handlers/ContainerHandlers.swift` and `ArcaDaemon/DockerRawStreamUpgrader.swift`
+parse what `LogWriter.swift` writes. **Two fixes in two review rounds each cost `docker logs`
+something** — one dropped U+2028/U+2029/U+0085 from container output, the other silently lost a
+restore case. Both were green in the gate. **Changing that file is a cross-module change wearing a
+single-file diff.**
+
+**`ssh-add -l` ANSWERING IS NOT EVIDENCE THAT SIGNING WILL WORK, AND THERE IS A ONE-COMMAND PROBE.**
+A locked 1Password enumerates its keys happily and refuses to sign — listing needs no authorisation,
+using one does. **Check before attempting a commit, not after:**
+
+```bash
+echo test | ssh-keygen -Y sign -n git -f <(git config --get user.signingkey)
+```
+
+It reproduces the failure **without creating a commit object**. The failure is
+`Couldn't sign message (signer): communication with agent failed`, and it is **not** the
+`env -u SSH_AUTH_SOCK` trap — that is Gas Can's rule, and Arca's key needs the agent.
+
+**A DERIVATION LABELLED AS A DERIVATION CAN STILL BE WRONG.** An implementer carefully marked a
+peak-memory bound `O(readWindow + chunkByteLimit)` as a derivation rather than a measurement — the
+right instinct and this project's own rule — **and it was measurably false for one input class.**
+Labelling a claim correctly does not make it true; it makes the failure honest. **A derivation still
+has to be checked.**
+
+**A TEST THAT SIZES ITS FIXTURE FROM THE CONSTANT IT TESTS PINS NOTHING.** It moves with the thing it
+is supposed to catch. Measured: restoring the circular fixture and mutating the constant to 7 gives
+`("0") is less than ("2")` — vacuously green. **Size fixtures from literals.**
+
+**A CLAIM CAN BE OVERTAKEN BY ITS OWN FIX, AND THE CORRECTION CAN OVERSHOOT.** One task produced
+over-claim → under-claim → over-claim in three rounds, all from *editing a sentence to match a change
+rather than re-deriving what was true after it*. The instruction now written into that source is
+**`Re-derive. Do not edit.`**
+
+**A DEFENCE IN DEPTH THAT NO MUTATION CAN FALSIFY IS A CLAIM, NOT A DEFENCE.** An implementer
+declined to add a second belt-and-braces guard on the grounds that with the real fix in place the
+second guard would be unfalsifiable, and this project does not ship those. **That reasoning was
+reviewed and upheld.**
+
+**MAKING AN ERROR UNREPRESENTABLE BEATS DETECTING IT.** Task 2's defect was closed by removing the
+parameter that allowed it, so the mutation became a **compile error** rather than a failing test.
+Reviewed and upheld as strictly stronger.
 
 ### Added 2026-08-15, from milestone 3's first two tasks.
 
