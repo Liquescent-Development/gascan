@@ -43,10 +43,20 @@ first task.
 | 5 | `Logs` | **done** — 2 fix rounds, re-review clean, live test **run and passing**; 2 Minors deferred (below) |
 | 6 | `Exec`, then the `tty` and `signals` flips | **NOT STARTED; the plan is expanded and ready** |
 
-**NEITHER BRANCH IS PUSHED.** Both are local only, on this machine. Arca
-`feat/engine-rpc-surface` at `2248035`, Gas Can `docs/p5-1-milestone-3-design` at `b3fe718`, both
-trees clean. **Verify with `git log -1` rather than trusting these SHAs — they go stale on every pass
-over this file, and this milestone has already proved that four times.**
+**BOTH BRANCHES ARE PUSHED — 2026-08-16.** Arca `feat/engine-rpc-surface` on
+`git@github.com:Vas-Solutus/arca.git`; Gas Can `docs/p5-1-milestone-3-design` on
+`https://github.com/Liquescent-Development/gascan.git`. Verified with `git ls-remote --heads` against
+the local HEADs, matching exactly. Both trees clean.
+
+**Neither is a PR yet, and the `containerization` submodule has NOT moved this milestone** — so
+milestone 2's hard-won rule that the submodule must be pushed and reachable *before* Arca's merge
+does not bite here. **Re-check it before opening Arca's PR anyway**, because a submodule pointer that
+moves late is exactly how a fresh clone breaks at `git submodule update --init --recursive`.
+
+**Verify every SHA with `git log -1` rather than trusting one written here.** They go stale on every
+pass over this file, and this milestone has already proved that four times — including once in this
+very section, which said "neither branch is pushed" for the twenty minutes between writing it and
+pushing them.
 
 **What a successor should do first: take task 6 from the plan.** Nothing is half-done, nothing is
 blocked, and the plan's task-6 section was expanded against the seam task 5 proved. Tasks 1-5 all
