@@ -36,7 +36,7 @@ async fn backend(engine: &LiveEngine) -> ArcaBackend<gascan_arca::ChannelTranspo
 ///
 /// - `tty` and `signals` are milestone 3's, with `Exec` --
 ///   `every_unimplemented_method_answers_unsupported_capability_not_a_transport_fault`
-///   below still lists it among the two this build refuses.
+///   below lists it as the one method this build still refuses.
 /// - `offline` stays `Unverified` until milestone 4's proof exercise.
 ///
 /// CORRECTED: this test used to assert every flag false and its comment said
@@ -80,15 +80,14 @@ async fn capabilities_report_only_what_this_engine_build_implements() {
 /// `ExecServerFrame.frame.error` -- and nothing in this tier touched either. A
 /// regression that made `Logs` answer with a status would have passed.
 ///
-/// **TWO, and it was ten. What forces a newly-implemented method out of this
-/// list is the assertion on each entry -- the `expect_err` on `Logs`, and the
-/// `panic!` on `Exec`'s first frame -- and NOT the length
-/// assertion below, which is a tautology and was described here as the
-/// mechanism.** `Exec` refuses in the stream rather than at the call, for the
-/// reason given four lines above, so it has no `expect_err` at all; an earlier
-/// version of this paragraph said "the `expect_err` on each entry" and was
-/// wrong for a third of the list. `answers`
-/// is a `vec![]` literal, so its length is two by construction and no engine
+/// **ONE, and it was ten. What forces a newly-implemented method out of this
+/// list is the assertion on each entry -- the `panic!` on `Exec`'s first frame
+/// -- and NOT the length assertion below, which is a tautology and was
+/// described here as the mechanism.** `Exec` refuses in the stream rather than
+/// at the call, for the reason given four lines above, so it has no
+/// `expect_err` at all; an earlier version of this paragraph said "the
+/// `expect_err` on each entry" and was wrong for a third of the list. `answers`
+/// is a `vec![]` literal, so its length is one by construction and no engine
 /// behaviour can change it; the assertion cannot fail except by someone editing
 /// the literal, which is visible in the diff anyway. It is kept as an executable
 /// comment and is labelled as one. Milestone 2 implemented `Inspect`, `ListResources`,
@@ -98,22 +97,27 @@ async fn capabilities_report_only_what_this_engine_build_implements() {
 /// working.
 ///
 /// **`CreateContainer` left this list when milestone 3's Task 1 implemented
-/// it**, and the two that remain are exactly the streaming pair: `Exec` and
-/// `Logs`. Its entry would not merely have gone stale, it would have failed --
+/// it.** Its entry would not merely have gone stale, it would have failed --
 /// the engine now answers a retained resource it does not hold with `not_found`,
 /// which `expect_err` accepts and the `unsupported_capability` comparison below
 /// rejects. That is the same mechanism `Inspect` demonstrated.
 ///
 /// That last sentence is a counterfactual and stays one -- the old arm was never
-/// run against the new engine. **What IS measured is this list as it now stands:**
-/// both tests in this file passed against Arca `a3ff5c9` / Gas Can `533097f` on
-/// 2026-08-15, in a full live-tier run of 15 tests, 15 passed. Until that run the
-/// claim that `CreateContainer` had left the list cleanly was derived from the
-/// implementation; it is now observed.
+/// run against the new engine. **What WAS measured is the list as it stood with
+/// two entries:** both tests in this file passed against Arca `a3ff5c9` / Gas
+/// Can `533097f` on 2026-08-15, in a full live-tier run of 15 tests, 15 passed.
+///
+/// **`Logs` left this list when milestone 3's Task 5 implemented it, and the
+/// list has not been run since.** Its arm would fail rather than go stale, by
+/// the same mechanism: against a sandbox that was never created the engine now
+/// answers `not_found`, which `expect_err` accepts and the
+/// `unsupported_capability` comparison rejects. That, too, is a derivation and
+/// not an observation -- the old arm was never run against the new engine. What
+/// `Logs` does instead is asserted in `logs.rs`, which is itself unrun.
 ///
 /// A method that becomes real leaves this list and gets real assertions: for
-/// the eight that already did, they are in `lifecycle.rs`, `ports.rs` and
-/// `recreate.rs`.
+/// the nine that already did, they are in `lifecycle.rs`, `ports.rs`,
+/// `recreate.rs` and `logs.rs`.
 #[tokio::test]
 #[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN"]
 async fn every_unimplemented_method_answers_unsupported_capability_not_a_transport_fault() {
@@ -121,46 +125,36 @@ async fn every_unimplemented_method_answers_unsupported_capability_not_a_transpo
     let backend = backend(&engine).await;
     let id = SandboxId::test("never-created");
 
-    // Each arm reduces to the wire code, so the two shapes -- ExecSession and
-    // Vec<u8> -- become one comparable list.
-    let answers: Vec<(&str, String)> = vec![
-        ("Exec", {
-            // Exec is the one that does not refuse at the call. The session
-            // OPENS -- `exec()` returns Ok -- and the refusal arrives as the
-            // stream's first frame, because the engine's answer lives in
-            // `ExecServerFrame.frame.error` rather than in a response
-            // outcome. MEASURED here: an earlier draft of this test called
-            // `expect_err` on `exec()` itself and failed with a perfectly
-            // healthy `ExecSession`. Anything that asserts against the call
-            // and not the frame is testing the wrong half.
-            let mut session = backend
-                .exec(ExecRequest::fixture(id.clone(), ["true"]))
-                .await
-                .expect("Exec opens a session; the refusal is its first frame");
-            match session.next().await {
-                Some(Err(error)) => error.code().to_owned(),
-                other => panic!("Exec's first frame must be an error, got {other:?}"),
-            }
-        }),
-        (
-            "Logs",
-            backend
-                .logs(&id, None)
-                .await
-                .expect_err("Logs")
-                .code()
-                .to_owned(),
-        ),
-    ];
+    // Each arm reduces to the wire code, so a list of unlike shapes becomes one
+    // comparable list. It holds one arm now that `Logs` has left it; the shape
+    // is kept because the next method to be refused joins it here.
+    let answers: Vec<(&str, String)> = vec![("Exec", {
+        // Exec is the one that does not refuse at the call. The session
+        // OPENS -- `exec()` returns Ok -- and the refusal arrives as the
+        // stream's first frame, because the engine's answer lives in
+        // `ExecServerFrame.frame.error` rather than in a response
+        // outcome. MEASURED here: an earlier draft of this test called
+        // `expect_err` on `exec()` itself and failed with a perfectly
+        // healthy `ExecSession`. Anything that asserts against the call
+        // and not the frame is testing the wrong half.
+        let mut session = backend
+            .exec(ExecRequest::fixture(id.clone(), ["true"]))
+            .await
+            .expect("Exec opens a session; the refusal is its first frame");
+        match session.next().await {
+            Some(Err(error)) => error.code().to_owned(),
+            other => panic!("Exec's first frame must be an error, got {other:?}"),
+        }
+    })];
 
     // A tautology, kept as an executable comment: `answers` is a literal, so
     // this cannot fail. What actually fails when a method becomes real is the
-    // assertion on each entry above -- `expect_err` for `Logs`, the `panic!` on
-    // the first frame for `Exec` -- see the doc comment.
+    // assertion on each entry above -- the `panic!` on the first frame for
+    // `Exec` -- see the doc comment.
     assert_eq!(
         answers.len(),
-        2,
-        "this build implements nine of the eleven contract methods; \
+        1,
+        "this build implements ten of the eleven contract methods; \
          a method that becomes real must leave this list"
     );
     for (rpc, code) in &answers {

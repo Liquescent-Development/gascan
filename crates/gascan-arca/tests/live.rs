@@ -6,6 +6,8 @@ mod connect;
 mod lifecycle;
 #[path = "live/limits.rs"]
 mod limits;
+#[path = "live/logs.rs"]
+mod logs;
 #[path = "live/mounts.rs"]
 mod mounts;
 #[path = "live/ports.rs"]
