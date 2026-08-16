@@ -145,6 +145,33 @@ The engine already knows its revision — `ArcaVersion.gitCommit`
 (`Sources/ContainerBridge/Version.swift:16-18`), injected by the Makefile into
 `BuildInfo.generated.swift`. It has never been on the wire.
 
+**AMENDED 2026-08-16, before any code: that value cannot be used as it stands, and the
+amendment is part of this decision rather than an implementation detail.** MEASURED:
+`Sources/ContainerBridge/BuildInfo.generated.swift` **is tracked in git**
+(`git ls-files --error-unmatch` matches), records `gitCommit = "d572c7a"` — a **7-character
+short hash** — and was last written 13 Aug, while Arca HEAD is `5e11704`. It drifted through
+the whole of milestone 3 without anything noticing, because nothing reads it that matters.
+And `scripts/build-arca-engine.sh` never runs `make`: it calls `swift build --product
+arca-engine` (`:142-143`) against the tree it checked out. **So a Gas Can release build
+compiles whatever stale constant happens to be committed**, and a gate reading it would
+compare against a value bearing no relation to the tree that was built — matching nothing in
+the safe case and the wrong tree in the unsafe one.
+
+Three requirements follow, and the gate is not honest without all three:
+
+1. **The revision on the wire is the full 40-character hash**, matching the form
+   `engine/arca-pin.json` already records and `build-arca-engine.sh:35` already validates.
+   A 7-character prefix is not an identity.
+2. **`build-arca-engine.sh` regenerates the build info after checking out the pinned
+   revision**, so the compiled constant describes the tree actually built rather than the
+   tree someone last ran `make` against.
+3. **The script then asserts the regenerated revision equals the pinned revision**, and fails
+   the build if it does not. This is strictly stronger than anything the script checks today
+   and it is what makes the engine's self-report trustworthy enough to be worth comparing.
+
+Requirement 3 is the load-bearing one. Without it the engine still self-reports, and §2.3's
+whole point is that it must not be taken on trust.
+
 **Not chosen: an engine-side revision gate.** One constant and one branch in `ArcaEngine`,
 no contract movement — and self-certification. The component being judged would issue its own
 verdict, which is the shape this project's boundary rules exist to avoid.
