@@ -2,6 +2,8 @@
 mod common;
 #[path = "live/connect.rs"]
 mod connect;
+#[path = "live/exec.rs"]
+mod exec;
 #[path = "live/lifecycle.rs"]
 mod lifecycle;
 #[path = "live/limits.rs"]
