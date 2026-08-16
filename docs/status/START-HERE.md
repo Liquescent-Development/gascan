@@ -68,10 +68,15 @@ then attempted once and failed the same way — **`fatal: failed to write commit
 object created, `git log -1` still `2248035`**, with all four files staged in the index. Nothing is
 lost and nothing is half-applied.
 
-**What a successor must do: unlock 1Password at the keyboard, then `git commit` in `~/code/arca`.**
-The message is already written into the staged commit attempt's input; if it is gone, the ledger
-entry for task 6 carries every figure it cited. **Never `--no-gpg-sign`.** Verify `%G?` is `G`
-afterwards.
+**What a successor must do: unlock 1Password at the keyboard, then**
+
+```bash
+cd ~/code/arca && git commit -F \
+  ~/code/gascan/.superpowers/sdd/2026-08-15-p5-1-milestone-3-rpc-surface/arca-task6-commit-message.txt
+```
+
+The message is saved there verbatim, with every figure it cites, because a staged index is not a
+durable place to keep prose. **Never `--no-gpg-sign`.** Verify `%G?` is `G` afterwards.
 
 **Gas Can's half IS committed and signed** — `faf35ed`, `test(arca): drive Exec live, and retire the
 unimplemented-method list`, verified `%G?` = `G`. **Neither branch has been pushed since task 6.**
