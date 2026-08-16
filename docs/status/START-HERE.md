@@ -620,8 +620,20 @@ a real process besides. `ArcaEngineTests` is 151 passing before and after, which
 
 **WHAT WAS NOT VERIFIED, and is the first place to look if this misbehaves:**
 
-1. **The 10s bound has never been hit by anything but the raw-socket fixture.** No real client has
-   been observed to need it.
+1. ~~**The 10s bound has never been hit by anything but the raw-socket fixture.** No real client has
+   been observed to need it.~~ **FALSIFIED 2026-08-16, and this is the first observation of it.**
+   A live `shutdown::the_engine_exits_cleanly_with_a_client_channel_still_open` run against Task 5's
+   `2248035` came back **2 of 96 not clean: 94 × exit 0, 1 × exit 1, 1 × exit 143.** Exactly one
+   engine logged `connections did not drain within the grace period; closing anyway`, `grace=10 s`.
+   **That is the grace path firing against a real tonic client, which milestone 2 recorded as never
+   having happened** — and it exits 1 precisely because milestone 2's re-review made it do so, to
+   distinguish a timed-out drain from a completed one. The instrument worked.
+   **Attribution is OPEN and must not be assumed.** The workload creates no container, so Task 5's
+   log-writer changes have no obvious path into it; the machine had been under sustained load for
+   hours; and 1 in 96 is one sample. **Do not conclude it is environmental without measuring** — the
+   controlled shape is two binaries interleaved, per this file's standing rule.
+   The `1 × exit 143` in the same run is the **known** pre-existing startup race recorded above, not
+   a second new thing.
 2. **The escalation path's `releaseSocketPath()` error branch** — a socket that cannot be unlinked —
    was never driven.
 3. **`SWIFTNIO_STRICT=1` was not re-run.** The earlier `serve()` split was verified under it; this
