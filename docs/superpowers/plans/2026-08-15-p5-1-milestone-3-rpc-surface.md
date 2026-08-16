@@ -765,6 +765,25 @@ git commit
 
 ## Task 5: `Logs`, and the two things it makes load-bearing
 
+**EXPANDED 2026-08-16, after Task 4 landed. Requirements rather than step-level code, for the reason stated on Task 4. Every anchor below re-derived at that point — they have drifted under four tasks already.**
+
+**Verified anchors, replacing the stale ones this plan carried:**
+
+| | |
+|---|---|
+| `logs` handler | `SandboxEngineService.swift:1188` (was `:1033`) |
+| `exec` handler | `SandboxEngineService.swift:1178` (was `:1023`) |
+| `createLogEntry` | `LogWriter.swift:72`; the `ISO8601DateFormatter()` at `:73`; the hand-rolled escaping at `:77`; the interpolated JSON at `:84` |
+| `LogPaths` | `LogWriter.swift:114-116`; files created at `:149-151` as `stdout.log`, `stderr.log`, `combined.log` |
+| `getLogPaths(dockerID:)` | `LogWriter.swift:173`, returns `LogPaths?` |
+| the engine's log root | `EnginePaths.logsRoot` (`:78`), `= stateRoot/logs` (`:93`), passed at `EngineManagers.swift:67` |
+
+**How the handler reaches the log, and it needs no new seam.** `ContainerManager.logManager` is a `nonisolated public let` (`ContainerManager.swift:28`) — deliberately so, per its own comment — so `logs` can call `containerManager.logManager.getLogPaths(dockerID:)` without awaiting the actor. **Do not add a seam for this; one already exists and Task 4's review is a reminder that a seam replaces a compile-time guarantee with a wiring nothing checks.**
+
+**A warning from Task 4 that applies directly here.** `ContainerManager.swift:188-202` records that this constructor takes a **root** rather than a ready-made `ContainerLogManager`, on purpose, and that an init which ignored a `logManager:` argument failed its test. Read that comment before changing anything about how the log manager is built.
+
+
+
 **Files:** create `~/code/arca/Sources/ArcaEngine/LogReader.swift`; modify `Sources/ContainerBridge/LogWriter.swift` and `Sources/ArcaEngine/SandboxEngineService.swift` (`logs` at `:1033`); create `~/code/gascan/crates/gascan-arca/tests/live/logs.rs`.
 
 **Requirements, all from design §2.3-2.5:**
