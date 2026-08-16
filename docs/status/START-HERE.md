@@ -55,8 +55,17 @@ Can `docs/p5-1-milestone-3-design` on `https://github.com/Liquescent-Development
 verified with `git ls-remote --heads` against the local HEADs and both trees clean. That was true
 when written and task 6 has moved both since.
 
-**ARCA'S TASK-6 WORK IS WRITTEN, VERIFIED AND STAGED — AND IT IS NOT COMMITTED. 1PASSWORD REFUSES
-TO SIGN.** This is the trap this file already records, and it behaved exactly as recorded: the probe
+**RESOLVED, AND BOTH BRANCHES ARE PUSHED AGAIN — 2026-08-16 (late).** The maintainer unlocked
+1Password, the same probe then exited 0, and Arca's task-6 commit went in as `af22685` with `%G?` =
+`G`. **Verified with `git ls-remote --heads`: Arca `feat/engine-rpc-surface` at `af22685`, Gas Can
+`docs/p5-1-milestone-3-design` at `e7e0f72`, both matching their local HEADs, both trees clean.**
+Read HEAD with `git log -1` rather than trusting either SHA here.
+
+**The block below is kept because the failure is worth recognising on sight, not because it is
+current.** It cost nothing this time only because the probe is one command.
+
+**Arca's task-6 work was written, verified and staged — and would not commit. 1Password refused to
+sign.** The trap this file already records, behaving exactly as recorded: the probe
 
 ```bash
 cd ~/code/arca && echo test | ssh-keygen -Y sign -n git -f <(git config --get user.signingkey)
@@ -78,8 +87,12 @@ cd ~/code/arca && git commit -F \
 The message is saved there verbatim, with every figure it cites, because a staged index is not a
 durable place to keep prose. **Never `--no-gpg-sign`.** Verify `%G?` is `G` afterwards.
 
-**Gas Can's half IS committed and signed** — `faf35ed`, `test(arca): drive Exec live, and retire the
-unimplemented-method list`, verified `%G?` = `G`. **Neither branch has been pushed since task 6.**
+Gas Can's half was committed and signed throughout — `faf35ed`, `test(arca): drive Exec live, and
+retire the unimplemented-method list`, `%G?` = `G` — because **signing is inverted between the two
+repositories** and only Arca's key needs the agent. ~~Neither branch has been pushed since task
+6.~~ **Both are pushed; see the resolution above.** That struck-through sentence was true for the
+twenty minutes between writing it and the maintainer unlocking 1Password, which is the second time
+this section has falsified itself about pushing in two days.
 
 **Neither is a PR yet, and the `containerization` submodule has NOT moved this milestone** — so
 milestone 2's hard-won rule that the submodule must be pushed and reachable *before* Arca's merge
