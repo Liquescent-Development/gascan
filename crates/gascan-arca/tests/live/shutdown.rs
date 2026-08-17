@@ -126,6 +126,23 @@ impl Workload {
     /// period`. Against the fix (`SilentConnectionQuiescer`): **0 of 1324**,
     /// slowest shutdown **0.11s**.
     ///
+    /// **Every "false green" in the table above is conditional on the rate beside
+    /// it, and for `OpenChannel` the data disputes that rate.** 0.9999% is what
+    /// `(1 - p)^1324` evaluates to at p = 1/288; it is not a property of the
+    /// instrument. At that p a run of 1324 against a broken engine should have
+    /// produced about 4.6 failures and it produced 1 --
+    /// `P(X <= 1 | lambda = 4.597) = 5.6%`, a low-tail outcome. Pooling both
+    /// pre-fix runs, 2 events in 288 + 1324 = 1612 shutdowns, estimates
+    /// p ~ 1/806, at which `(1 - p)^1324 = 19%`. So the honest reading of the
+    /// clean 1324 is "consistent with fixed", not "99% sure".
+    ///
+    /// **This does not weaken the fix, because the fix is not proved here.** It
+    /// is proved by `a_silent_peer_does_not_hold_the_drain`, which is
+    /// deterministic, and by three Arca unit tests whose mutations kill them one
+    /// apiece. A rate test that cannot fail cheaply is a monitor, not a proof,
+    /// and quoting this number as one is the error the module docstring opens by
+    /// rejecting.
+    ///
     /// The two cheap workloads can afford theirs precisely because they boot no
     /// virtual machine: 1324 engines that never create a container cost 383.34s,
     /// against 210.67s for the 32 that do.
@@ -379,7 +396,8 @@ async fn the_engine_exits_cleanly_with_nothing_holding_a_connection() {
 /// that matches the container workload's says the container was a correlate.
 #[tokio::test]
 #[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN, a kernel and a \
-            vminit layout; no image, and so no base OCI layout; stops 96 engines"]
+            vminit layout; no image, and so no base OCI layout; stops 1324 engines, \
+            which took 383s"]
 async fn the_engine_exits_cleanly_with_a_client_channel_still_open() {
     let report = rate(Workload::OpenChannel).await;
     println!("{report}");
@@ -407,7 +425,7 @@ async fn the_engine_exits_cleanly_with_a_client_channel_still_open() {
 /// The mechanism is read out of the vendored source rather than inferred.
 /// `ServerQuiescingHelper` counts an accepted channel from the moment it is
 /// accepted, and `GRPCServerPipelineConfigurator` -- the only handler in that
-/// channel's pipeline before its first byte arrives (grpc-swift 1.23's
+/// channel's pipeline before its first byte arrives (grpc-swift 1.27's
 /// `Server.configureAcceptedChannel`) -- handles only `TLSUserEvent` in its
 /// `userInboundEventTriggered` and forwards everything else untouched. Nothing
 /// acted on `ChannelShouldQuiesceEvent` and there was nothing downstream yet to
