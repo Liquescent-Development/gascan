@@ -186,16 +186,31 @@ And on `CreateRequest.ports` (`:259`):
 
 - [ ] **Step 4: Add the full-length revision accessor**
 
-`ArcaVersion.gitCommit` is a 7-character short hash and **must not be widened in place** — `ArcaDaemon` renders it in its `Server` header (`Sources/ArcaDaemon/HTTPHandler.swift:189`). Add a sibling named `buildRevision` carrying the full id, sourced from the same generated file, and leave `gitCommit` alone:
+`ArcaVersion.gitCommit` is a 7-character short hash and **must not be widened in place**, because it has live display consumers on Arca's Docker surface: `Sources/DockerAPI/Handlers/SystemHandlers.swift:35` and `:54` put it in the `GitCommit` field of Docker's `/version` and `/info` responses.
+
+**CORRECTED 2026-08-16 by Task 1's implementer.** This plan first cited `Sources/ArcaDaemon/HTTPHandler.swift:189` as the consumer. That line is `ArcaVersion.serverHeader`, which is `"Arca/\(version)"` — the semver, not the commit. The conclusion was right and the anchor was wrong, which is the failure mode this project keeps writing traps about, reproduced here by the controller who wrote the trap.
+
+Add a sibling named `buildRevision` carrying the full id, sourced from the same generated file, and leave `gitCommit` alone:
 
 ```swift
 /// The full 40-character revision, for the capability gate. Distinct from
-/// `gitCommit`, which is a 7-character display value ArcaDaemon puts in a
-/// header: a prefix is not an identity and must not be used as one.
+/// `gitCommit`, which is a 7-character display value Docker's `/version`
+/// returns as `GitCommit` -- once for the engine component and once at the
+/// top level (`Sources/DockerAPI/Handlers/SystemHandlers.swift:35`, `:54`,
+/// both inside `handleVersion()`): a prefix is not an identity and must
+/// not be used as one, and widening `gitCommit` in place would change what
+/// those two payloads report.
 public static var buildRevision: String {
     ArcaBuildInfo.buildRevision
 }
 ```
+
+**This comment is the only in-tree record of why `gitCommit` must not be widened**, so it has to name consumers that exist — and this plan got that wrong twice before the text above survived checking.
+
+1. It first named `ArcaDaemon`'s `Server` header (`HTTPHandler.swift:189`). That line renders `serverHeader`, which is `"Arca/\(version)"` — the semver, not the commit. A maintainer following it would find `gitCommit` absent and conclude widening was safe.
+2. The correction then said `/version` **and** `/info`. Also false. VERIFIED: `handleVersion()` opens at `SystemHandlers.swift:24` and `handleInfo()` at `:66`, so both call sites (`:35`, `:54`) are inside `handleVersion()`; `SystemInfoResponse` (`:291`) declares no `GitCommit` field, and `awk 'NR>=289 && /gitCommit|GitCommit/'` returns nothing.
+
+**The lesson is in the third version's shape, not in the first two being wrong.** It names `handleVersion()` beside the line numbers, so the anchor still resolves after the lines drift — which they will. Prefer a symbol a reader can `grep` over a number that decays silently.
 
 - [ ] **Step 5: Regenerate the checked-in Swift, and the build info**
 
@@ -308,7 +323,15 @@ Expected: the two refusal tests fail (`999` returns `999`, `BOGUS` returns `9`);
 
 - [ ] **Step 3: Make the refusal explicit**
 
-Decide the valid range from the platform rather than from a literal in this plan — `1...SIGRTMAX` where available, otherwise `1..<NSIG`. Re-derive it; do not copy a bound from here. Both branches refuse rather than default, and the error names the offending input.
+**CORRECTED 2026-08-16 by Task 2's implementer — this step first said to derive the range from "the platform, `1...SIGRTMAX` where available, otherwise `1..<NSIG`", and that instruction was wrong twice over.** Arca runs on macOS, where `SIGRTMAX` does not exist, so the rule always lands on `NSIG` — which is 32 on Darwin, giving `1...31`. But the number `parseSignal` returns is handed to a **Linux guest**, and the two do not share a numbering (Darwin's `SIGUSR1` is 30, Linux's is 10; Darwin's `SIGSTOP` is 17, Linux's is 19). Bounding a Linux signal by the host's signal count validates against a space the value does not live in, and it refuses 34-64 — the Linux real-time signals the guest genuinely accepts and that `docker kill --signal 34` legitimately asks for.
+
+**Derive the range from `Containerization.Signal.linux`**, the dependency's own table: `Set(Containerization.Signal.linux.values)` yields `1...31` ∪ `34...64`, correctly excluding the 32/33 RTMIN gap. That is not a copied literal, which is what "do not copy a bound from here" was guarding against. **It is also already this repository's answer to the same question** — `ExecManager.signalExec` validates against the same map (`ExecManager.swift:442`: "the right map because `LinuxProcess.kill` sends…"), and `ExecSignalTests` documents 32 and 33 as its test values because they are the two numbers a range written as `1...64` would wrongly admit. The brief's rule would have left the container-kill and exec paths disagreeing.
+
+Both branches refuse rather than default, and the error names the offending input — the original string the caller typed, not the `SIG`-stripped form, because that is what the 400 quotes back.
+
+**`package` alone is not enough: use `nonisolated package func`.** `ContainerManager` is a `public actor` (`ContainerManager.swift:14`), so a merely-`package` method is actor-isolated and reachable only as `try await`, while `XCTAssertThrowsError` takes a non-async `@autoclosure`. The file already uses `nonisolated` deliberately for `logManager`, `imageStoreRoot` and `layerCachePath`.
+
+**One table for names and numbers widens the accepted names beyond the original thirteen** — `parseSignal("ABRT")` returns 6 rather than being refused. **RULED 2026-08-16: keep the widening.** Validating numbers against the Linux table while refusing names outside a hand-written thirteen would accept `--signal 6` and refuse `--signal ABRT` for the same signal. It also matches Docker, which accepts the full table. This is a deliberate behaviour change on Arca's Docker surface, covered by a test that — unlike the thirteen-name guard — does fail against the unfixed code.
 
 - [ ] **Step 4: Fix the call sites**
 
@@ -349,7 +372,13 @@ The window is **the whole of startup**, not bind-to-`SIG_IGN`: SIGTERM's disposi
 
 **Measure the second window, which has never been measured by anyone.** Between `signal(number, SIG_IGN)` and `source.resume()` the disposition is already `SIG_IGN` but libdispatch has not registered the kevent, so a signal there is lost outright and the live tier would report `"the engine ignored SIGTERM"` — reading as a shutdown defect rather than a startup one. Measure it before and after the fix. Report the numbers whichever way they come out.
 
-**Acceptance:** the forced instrument that produced 12/12 versus 0/12 is re-run and reports 0/12 on the immediately-after-spawn arm, with both arms interleaved in one process against one binary. A naturally-occurring rate (~2 in 440) is not an acceptance criterion — it cannot distinguish a fix from luck at that sample size.
+**Acceptance:** the forced instrument is re-run and reports **0/12 on the arm that signals inside the engine's own startup** — after its state database exists and before its socket does — with the arms interleaved in one process against one binary. A naturally-occurring rate (~2 in 440) is not an acceptance criterion; it cannot distinguish a fix from luck at that sample size.
+
+**CORRECTED 2026-08-16 by Task 3's implementer, who measured the criterion this plan first wrote and showed it unachievable.** It originally demanded 0/12 on the **immediately-after-spawn** arm. That arm signals into `dyld`, not into the engine: instrumenting the load with `clock_gettime(CLOCK_MONOTONIC)` across 8 spawns of a warm binary linking 40 libraries measured **10-13ms between `posix_spawn` returning and the engine's first instruction** (one cold-inode outlier at 732ms). `posix_spawn` returns as soon as the child exists, so a parent signalling immediately signals into that interval every time. **No code inside the process can run there and no disposition it sets can apply**, so that arm reads 12/12 before and after the fix, and always will.
+
+**The only thing that closes the loader window is the launcher**, and only half of it is Arca's. A signal blocked between `fork` and `exec` is *pending* rather than fatal and survives the loader; the engine's `arca_signal_capture_install` ends with `sigprocmask(SIG_UNBLOCK, …)`, so a pending signal is delivered the instant the handler exists. That unblock is independently a correctness fix — an engine spawned with SIGTERM already blocked would otherwise install a perfect handler and be unkillable. **The launcher's half is not implemented and is a decision for Task 11:** `common::SUPERVISOR` is a `/bin/sh` wrapper and a shell cannot set a signal mask, while doing it in Rust needs `Command::pre_exec`, which the Gas Can workspace's `unsafe_code = "forbid"` rules out.
+
+The implementer did not change the instrument to make the number move, which would have made the criterion pass by changing the measurement.
 
 ---
 
