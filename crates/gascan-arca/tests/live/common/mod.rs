@@ -13,11 +13,116 @@ static SOCKET_SEQUENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::Atomic
 /// directory has an owner from the moment it is created: `start()` can still
 /// panic on the `sun_path` assert or on a failed spawn, and those unwind
 /// through this rather than leaving an orphan under `/tmp`.
-struct SocketRoot(Utf8PathBuf);
+pub struct SocketRoot(Utf8PathBuf);
+
+impl SocketRoot {
+    /// A fresh root under `/tmp`, distinct from every other one this process
+    /// has made.
+    ///
+    /// The socket does NOT live under a `TempDir`, and that is deliberate.
+    /// `sun_path` is capped at 103 bytes (swift-nio asserts it explicitly in
+    /// `NIOCore/SocketAddresses.swift`), and macOS temp dirs are
+    /// `/var/folders/<...>/T/<...>` -- a measured path came to 74 bytes, which
+    /// fits but leaves little room. Arca's own tests hit this exact wall during
+    /// Task 7 and had to move to `/tmp`.
+    pub fn fresh() -> Self {
+        let path = Utf8PathBuf::from(format!(
+            "/tmp/gascan-arca-live-{}-{}",
+            std::process::id(),
+            SOCKET_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        // `create_dir`, not `create_dir_all`: this must fail if the directory
+        // already exists. An interrupted run leaves one behind, and a recycled
+        // pid would otherwise adopt it -- along with a stale `engine.sock` that
+        // makes the bind fail. Say which of those happened.
+        std::fs::create_dir(&path)
+            .unwrap_or_else(|error| panic!("could not create socket root {path}: {error}"));
+        Self(path)
+    }
+
+    /// The socket path inside this root, asserted to fit `sun_path`.
+    ///
+    /// The assertion is here rather than at the callers so a path that meets
+    /// the cap says so, rather than arriving as a mystery bind failure.
+    pub fn socket(&self) -> Utf8PathBuf {
+        let socket = self.0.join("engine.sock");
+        assert!(
+            socket.as_str().len() <= 103,
+            "socket path is {} bytes, over sun_path's 103-byte cap: {socket}",
+            socket.as_str().len()
+        );
+        socket
+    }
+}
 
 impl Drop for SocketRoot {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The three paths named by the environment that any engine in this tier needs.
+///
+/// One type rather than three `required_path` calls per spawn site, because
+/// there are two such sites now -- [`LiveEngine::start_with_images`] and the
+/// forced startup instrument -- and a second copy of the three variable names
+/// and their directives is a second thing to keep in step with the engine's
+/// options.
+pub struct EngineInputs {
+    /// `GASCAN_ARCA_ENGINE_BIN`.
+    pub binary: String,
+    /// `GASCAN_ARCA_KERNEL_PATH`.
+    pub kernel: String,
+    /// `GASCAN_ARCA_VMINIT_LAYOUT`.
+    pub vminit: String,
+}
+
+impl EngineInputs {
+    pub fn from_environment() -> Self {
+        Self {
+            binary: required_path(
+                "GASCAN_ARCA_ENGINE_BIN",
+                "a built arca-engine",
+                "run scripts/build-arca-engine.sh and use its second output line",
+            ),
+            kernel: required_path(
+                "GASCAN_ARCA_KERNEL_PATH",
+                "the vmlinux the engine boots guests with",
+                "an installed Arca.app carries one at \
+                 Contents/Resources/vmlinux; ~/.arca/vmlinux symlinks it",
+            ),
+            vminit: required_path(
+                "GASCAN_ARCA_VMINIT_LAYOUT",
+                "an OCI layout holding arca-vminit:latest",
+                "an installed Arca.app populates ~/.arca/vminit",
+            ),
+        }
+    }
+
+    /// The `serve` invocation Gas Can ships: all four options, none defaulted.
+    ///
+    /// The engine made `--kernel-path` and `--vminit-layout` required when it
+    /// took ownership of its own state root, and a tier passing only the first
+    /// two spawns nothing: MEASURED against the branch binary as `Missing
+    /// expected argument '--kernel-path'`, exit 64. Every live test here was
+    /// `#[ignore]`d, so nothing ran them and nothing noticed -- a tier that
+    /// cannot start its subject and a tier nobody runs look identical from
+    /// outside.
+    pub fn serve_arguments<'a>(
+        &'a self,
+        socket: &'a Utf8Path,
+        state: &'a Utf8Path,
+    ) -> Vec<&'a str> {
+        vec![
+            "--socket-path",
+            socket.as_str(),
+            "--state-root",
+            state.as_str(),
+            "--kernel-path",
+            &self.kernel,
+            "--vminit-layout",
+            &self.vminit,
+        ]
     }
 }
 
@@ -166,81 +271,23 @@ impl LiveEngine {
     /// no VM and needs no kernel, so the store is seeded by running the same
     /// binary to completion **before** the server is spawned.
     pub async fn start_with_images(layouts: &[&Utf8Path]) -> Self {
-        let binary = required_path(
-            "GASCAN_ARCA_ENGINE_BIN",
-            "a built arca-engine",
-            "run scripts/build-arca-engine.sh and use its second output line",
-        );
-        let kernel = required_path(
-            "GASCAN_ARCA_KERNEL_PATH",
-            "the vmlinux the engine boots guests with",
-            "an installed Arca.app carries one at \
-             Contents/Resources/vmlinux; ~/.arca/vmlinux symlinks it",
-        );
-        let vminit = required_path(
-            "GASCAN_ARCA_VMINIT_LAYOUT",
-            "an OCI layout holding arca-vminit:latest",
-            "an installed Arca.app populates ~/.arca/vminit",
-        );
+        let inputs = EngineInputs::from_environment();
         let root = tempfile::tempdir().unwrap();
         let path = Utf8Path::from_path(root.path()).unwrap().to_owned();
         let state = path.join("state");
         std::fs::create_dir_all(&state).unwrap();
 
         for layout in layouts {
-            load_image(&binary, &state, layout).await;
+            load_image(&inputs.binary, &state, layout).await;
         }
         let images = stored_images(&state);
 
-        // The socket does NOT live under the temp dir, and that is deliberate.
-        // `sun_path` is capped at 103 bytes (swift-nio asserts it explicitly in
-        // NIOCore/SocketAddresses.swift), and macOS temp dirs are
-        // /var/folders/<...>/T/<...> -- a measured path came to 74 bytes, which
-        // fits but leaves little room. Arca's own tests hit this exact wall
-        // during Task 7 and had to move to /tmp. Build the socket path under a
-        // short root and assert the length rather than meeting the cap as a
-        // mystery bind failure.
-        let socket_root = Utf8PathBuf::from(format!(
-            "/tmp/gascan-arca-live-{}-{}",
-            std::process::id(),
-            SOCKET_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        // `create_dir`, not `create_dir_all`: this must fail if the directory
-        // already exists. An interrupted run leaves one behind, and a recycled
-        // pid would otherwise adopt it -- along with a stale `engine.sock` that
-        // makes the bind fail. Say which of those happened.
-        std::fs::create_dir(&socket_root)
-            .unwrap_or_else(|error| panic!("could not create socket root {socket_root}: {error}"));
-        let socket_root = SocketRoot(socket_root);
-        let socket = socket_root.0.join("engine.sock");
-        assert!(
-            socket.as_str().len() <= 103,
-            "socket path is {} bytes, over sun_path's 103-byte cap: {socket}",
-            socket.as_str().len()
-        );
+        let socket_root = SocketRoot::fresh();
+        let socket = socket_root.socket();
 
-        // All four options, none defaulted. The engine made `--kernel-path` and
-        // `--vminit-layout` required when it took ownership of its own state
-        // root, and a tier passing only the first two spawns nothing: MEASURED
-        // against the branch binary as `Missing expected argument
-        // '--kernel-path'`, exit 64. Every live test here was `#[ignore]`d, so
-        // nothing ran them and nothing noticed -- a tier that cannot start its
-        // subject and a tier nobody runs look identical from outside.
-        let child = supervised(
-            &binary,
-            &[
-                "--socket-path",
-                socket.as_str(),
-                "--state-root",
-                state.as_str(),
-                "--kernel-path",
-                &kernel,
-                "--vminit-layout",
-                &vminit,
-            ],
-        )
-        .spawn()
-        .unwrap_or_else(|error| panic!("could not spawn {binary}: {error}"));
+        let child = supervised(&inputs.binary, &inputs.serve_arguments(&socket, &state))
+            .spawn()
+            .unwrap_or_else(|error| panic!("could not spawn {}: {error}", inputs.binary));
 
         let mut engine = Self {
             child,

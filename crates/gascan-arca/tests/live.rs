@@ -20,5 +20,7 @@ mod read_rpcs;
 mod recreate;
 #[path = "live/shutdown.rs"]
 mod shutdown;
+#[path = "live/startup.rs"]
+mod startup;
 #[path = "live/supervision.rs"]
 mod supervision;
