@@ -138,8 +138,12 @@ impl Workload {
     ///
     /// **This does not weaken the fix, because the fix is not proved here.** It
     /// is proved by `a_silent_peer_does_not_hold_the_drain`, which is
-    /// deterministic, and by three Arca unit tests whose mutations kill them one
-    /// apiece. A rate test that cannot fail cheaply is a monitor, not a proof,
+    /// deterministic, and by three Arca unit tests -- one per mechanism of
+    /// `SilentConnectionQuiescer` -- each of which a different mutation of that
+    /// handler turns red. (Dropping its `!spoke` guard turns a fourth test red
+    /// too, in `ShutdownObserverTests`; the matrix on
+    /// `testAnAcceptedConnectionThatHasSaidNothingDoesNotHoldTheDrain` has the
+    /// measured rows.) A rate test that cannot fail cheaply is a monitor, not a proof,
     /// and quoting this number as one is the error the module docstring opens by
     /// rejecting.
     ///
