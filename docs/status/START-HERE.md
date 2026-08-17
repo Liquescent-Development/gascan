@@ -38,6 +38,40 @@ it, so any SHA in this row is wrong the moment it is written — which is how th
 stale six times, twice inside the paragraph warning about staleness. Arca's is safe to state
 because this rewrite does not touch that repository.
 
+**BOTH PULL REQUESTS ARE OPEN AS DRAFTS, AND NEITHER HAS BEEN REVIEWED OR PASSED CI.**
+
+| | PR |
+|---|---|
+| Arca | https://github.com/Vas-Solutus/arca/pull/59 |
+| Gas Can | https://github.com/Liquescent-Development/gascan/pull/77 |
+
+**Do not read "every task review came back clean" as "the PRs passed review." They are different
+claims and only the first is true.** `gh pr view --json reviewDecision` is empty on both; no review
+has been requested or submitted. Tasks 1-4 each passed a *task-scoped* gate — does this diff match
+its brief and is it well built — which asks nothing about whether the four are coherent together.
+
+**Milestone 3 measured exactly that gap:** its unplanned pre-merge review round found **three
+engine defects and one false test**, more than any single task in that milestone, in code that had
+already passed six task-level reviews and a 20/20 live tier. The whole-branch review belongs after
+all fifteen tasks and has not happened.
+
+**CI:** Gas Can's `changes` job passes; `contracts`, `engine` and `rust` had not finished when this
+was written. **The `engine` job is red by design against the unbumped pin — do not bump the pin to
+make it green**, that is task 9 and it needs task 8's signed tag. Arca reports **no checks at all**;
+it has no CI (P2.3 unstarted).
+
+### TWO THINGS TO DO BEFORE RUNNING ANYTHING
+
+1. **The engine binary carries no `virtualization` entitlement right now.**
+   `codesign -d --entitlements - .build/debug/arca-engine` prints only
+   `com.apple.security.get-task-allow`. A `swift test` relinked it after the last signing, which is
+   the documented strip. **Re-sign before the live tier**, and verify
+   `codesign -d --entitlements - <bin> 2>&1 | grep -c virtualization` prints `1`.
+2. **`t4fix/SilentConnections.swift.orig` in the session scratchpad holds the SWALLOW MUTATION, not
+   the original.** The repository is correct — restoration was by `git checkout --`, both trees are
+   clean, and the handler hashes to `ce19f68e…`. But a reader trusting that filename would
+   reinstall the defect this milestone just fixed.
+
 Gas Can's branch carries the design and plan commits too, so it is the one to PR for the docs.
 Neither has a PR yet. The `containerization` submodule has **not** moved (`3f68806`) — Tasks 6
 and 7 will move it, and milestone 2's rule then binds: **push it and make it reachable before
@@ -50,7 +84,7 @@ Arca's merge.**
 | 1 | `Capabilities` carries the build revision, `contract_minor = 1`, the offline-plus-ports rule into the proto | **done**, 1 fix round |
 | 2 | `parseSignal` refuses what it cannot map | **done**, 1 fix round |
 | 3 | the startup SIGTERM race (exit 143) | **done**, 1 fix round |
-| 4 | the client-channel shutdown defect (exit 1) | **fix round delivered; scoped re-review outstanding** |
+| 4 | the client-channel shutdown defect (exit 1) | **done**, 1 fix round |
 | 5 | multi-layer layer-cache fixture | not started |
 | 6 | `EXT4.Formatter.unpack` refuses a mistyped blob — submodule | not started |
 | 7 | the host reports the attached layer count — submodule | not started |
