@@ -9,13 +9,123 @@ complete and Landing 5 the whole of what remains**; updated 2026-08-13 (late) af
 hour, which **proved the spawn, got `Create` working end to end for the first time, and cost two
 unplanned Arca fixes on the way** — Tasks 13a and 13b; rewritten 2026-08-14 (evening) after the
 named-volume defect was fixed and committed; **rewritten again 2026-08-14 (late) after the
-graceful-shutdown crash was fixed, which was the last open ruling; **rewritten 2026-08-16 (late)
-after MILESTONE 3 MERGED. Nothing is open. What remains is milestone 4, which is designed by nobody
-yet.**
+graceful-shutdown crash was fixed, which was the last open ruling; rewritten 2026-08-16 (late)
+after MILESTONE 3 MERGED; **rewritten 2026-08-17 after MILESTONE 4 WAS DESIGNED, PLANNED, AND
+HALF OF ITS FIRST LANDING BUILT. The sentence this file carried for a day — "milestone 4 is
+designed by nobody yet" — is retired.**
+
+---
+
+## MILESTONE 4 IS DESIGNED, PLANNED, AND IN FLIGHT — 2026-08-17
+
+**Read these three, in this order, before anything else.**
+
+| | |
+|---|---|
+| Design | `docs/superpowers/specs/2026-08-16-p5-1-milestone-4-product-wiring-design.md` — approved; §2.1 and §2.3 supersede the parent design |
+| Plan | `docs/superpowers/plans/2026-08-16-p5-1-milestone-4-product-wiring.md` — 15 tasks in 4 landings; **three of its instructions were wrong and are corrected in place with the measurements** |
+| Ledger | `.superpowers/sdd/2026-08-16-p5-1-milestone-4-product-wiring/progress.md` — **the authoritative record of what is done.** Every task's commits, every deferred minor, every correction. Untracked; git-ignored. Read it before re-dispatching anything. |
+
+**BOTH BRANCHES ARE PUSHED. Verify with `git log -1`, not with the SHAs below.**
+
+| | branch | head | ahead of main |
+|---|---|---|---|
+| Arca | `feat/milestone-4-engine` | `ea9bcbc` | 10 |
+| Gas Can | `feat/milestone-4-product-wiring` | **read it — this file's own commit moves it** | 9 + this rewrite |
+
+**Gas Can's head is deliberately not written here.** The commit that rewrote this section changes
+it, so any SHA in this row is wrong the moment it is written — which is how this file has gone
+stale six times, twice inside the paragraph warning about staleness. Arca's is safe to state
+because this rewrite does not touch that repository.
+
+Gas Can's branch carries the design and plan commits too, so it is the one to PR for the docs.
+Neither has a PR yet. The `containerization` submodule has **not** moved (`3f68806`) — Tasks 6
+and 7 will move it, and milestone 2's rule then binds: **push it and make it reachable before
+Arca's merge.**
+
+### Landing 1 — Arca and the submodule, sealed with one signed tag
+
+| Task | What | State |
+|---|---|---|
+| 1 | `Capabilities` carries the build revision, `contract_minor = 1`, the offline-plus-ports rule into the proto | **done**, 1 fix round |
+| 2 | `parseSignal` refuses what it cannot map | **done**, 1 fix round |
+| 3 | the startup SIGTERM race (exit 143) | **done**, 1 fix round |
+| 4 | the client-channel shutdown defect (exit 1) | **fix round delivered; scoped re-review outstanding** |
+| 5 | multi-layer layer-cache fixture | not started |
+| 6 | `EXT4.Formatter.unpack` refuses a mistyped blob — submodule | not started |
+| 7 | the host reports the attached layer count — submodule | not started |
+
+Arca's suite is at **240 tests, 0 failures** (`swift test --disable-swift-testing --filter
+ArcaEngineTests`), verified by the controller rather than by report. Landings 2-4 (the signed tag,
+the pin bump, Gas Can wiring, the offline proof) are not started.
+
+### The four defects milestone 4 has closed so far
+
+1. **`Capabilities` had nothing identifying the build**, so `offline` could not be gated the way
+   Apple's is. Field 20 carries the full 40-character revision; `contract_minor` is 1.
+2. **`parseSignal` promoted anything unrecognised to SIGKILL** and range-checked nothing. It now
+   delegates to `Containerization.Signal.init(_:from:)`, which the exec path already used.
+3. **A SIGTERM during startup killed the engine** (exit 143 = 128+15, always the kernel). Forced
+   instrument: **12/12 → 0/12** on the engine's own window.
+4. **A silent peer held the ten-second drain open.** MEASURED over 1324 shutdowns:
+   `1323 x exit 0, 1 x exit 1` before, `1324 x exit 0` after; slowest **10.01s → 0.11s**.
+   **The exit-1 was the drain grace firing** — caught in the engine's own log, closing the
+   attribution question carried since milestone 3, on a code path whose docstring said "Nothing
+   measures this number."
+
+### FIVE THINGS THAT WILL COST A SUCCESSOR REAL TIME
+
+1. **`ps -A` CANNOT ENUMERATE THE PROCESS TABLE ON THIS HOST.** MEASURED 2026-08-17:
+   `ps -A | wc -l` → **31**; `launchctl list | wc -l` → **544**; `ps -p $$ -o pid,comm` finds the
+   calling shell (`4248 /bin/zsh`) while `ps -A | grep -c "^ *$$ "` → **0**. **So no
+   `ps | grep` absence check is evidence of anything here, for any process.** This cost the
+   milestone hours: every engine start was failing with `vmnet_return_t(rawValue: 1001)`, a
+   subagent ran `ps -Ao pid,comm | grep -iE "InternetSharing|bootpd"`, got nothing, concluded the
+   standing remedy did not apply, diagnosed "the vmnet automatic subnet pool is exhausted", and
+   escalated for root and a reboot. The controller ran the same impossible check and endorsed it.
+   **Force-quitting InternetSharing was the whole fix.** Use `launchctl list | grep -iE
+   "sharing|vmnet"`.
+2. **THE `vmnet` REMEDY IN THIS FILE IS CORRECT. DO NOT RETIRE IT.** It nearly was, on the strength
+   of that false negative.
+3. **NEVER GIVE SUBAGENTS NAMES WHERE ONE IS A PREFIX OF ANOTHER.** `SendMessage` resolved
+   `m4-task4` to the newer `m4-task4-review` and rejects full agent IDs (`to must be a bare
+   teammate name`), so a fix brief reached the *reviewer*, which began implementing its own
+   findings against the live checkout. Recoverable only because the real implementer noticed the
+   tree moving under it and refused to commit.
+4. **REVIEWS MUST BE WRITTEN TO A FILE BEFORE THE REPLY.** Every subagent reply this session was
+   lost in transit; every file survived. One review was lost outright before this was adopted.
+   `run_in_background: false` does **not** prevent it.
+5. **THE PLAN'S OWN INSTRUCTIONS WERE WRONG THREE TIMES**, each caught by an implementer
+   re-deriving from source: a false `gitCommit` consumer (wrong twice), a signal range derived from
+   the host platform when the number goes to a Linux guest, and an acceptance criterion that was
+   physically unachievable because it signalled into 10-13ms of `dyld`. All three are corrected in
+   the plan with their measurements. **Re-derive; do not transcribe.**
+
+### What later tasks have already inherited
+
+- **Task 9** — `BuildInfo.generated.swift` is tracked and self-corrects **only under `make`**
+  (`Makefile:56`); a bare `swift build` compiles the stale committed value. And `Makefile:224`
+  stamps `git rev-parse HEAD` regardless of a dirty tree, so the guard refuses to *stub* an
+  identity but not to *mis-state* one. Both bear on the revision assertion.
+- **Task 10** — nothing pins `capabilities.buildRevision` to `ArcaVersion.buildRevision`; a
+  well-formed 40-character literal would pass the suite. Task 10's gate compares that exact value.
+- **Task 11** — closing the loader window needs the **launcher** to block SIGTERM between `fork`
+  and `exec`. The engine's half is done. Gas Can's cannot currently be written: `common::SUPERVISOR`
+  is a `/bin/sh` wrapper and a shell cannot set a signal mask, while `Command::pre_exec` is ruled
+  out by the workspace's `unsafe_code = "forbid"`.
+- **Any rate work** — size the instrument to the rate it must detect. At p = 1/288, **n = 1324**
+  (`ln(0.01)/ln(287/288) = 1323.985`; 1323 gives 1.0034%). And note the caveat: that confidence is
+  *conditional on p*, which the observed data disputes — pooling both pre-fix runs gives
+  p̂ ≈ 1/806, at which `(1-p)^1324 = 19%`.
 
 ---
 
 ## Where the work is
+
+**EVERYTHING FROM HERE DOWN PREDATES 2026-08-17 AND DESCRIBES MILESTONE 3 AND EARLIER.** It is kept
+for its reasoning, which is still good, and for the traps, which still bite. **It is not current
+state** — the section above is. In particular, anything below saying milestone 4 is undesigned, or
+that nothing is in flight, is stale.
 
 **P5.1 MILESTONE 3 IS MERGED — 2026-08-16. SIX OF SIX TASKS DONE, BOTH PULL REQUESTS LANDED, NOTHING
 OPEN, NOTHING IN FLIGHT.**
@@ -31,10 +141,12 @@ was squashed** and the per-task history this file cites is intact. **Start the n
 a fresh branch off `main`.** Verify every SHA above with `git log -1` rather than trusting one
 written here; this file has gone stale on its own SHAs six times.
 
-**WHAT TO DO NEXT: MILESTONE 4, and it needs a design before it needs code.** Its scope is in "what
-comes after the merge" below. It is the last of P5.1's four milestones and it is the one that makes
-this a product. **Do not start coding it — brainstorm and design it first**, the way milestones 2 and
-3 were, both of which caught false premises in their own design documents before anything was built.
+~~**WHAT TO DO NEXT: MILESTONE 4, and it needs a design before it needs code.**~~ **DONE — see the
+milestone-4 section at the top of this file.** It was designed, planned, and its first landing is
+half built. Its design caught two false premises in the *parent* design before anything was built,
+and its plan then carried three wrong instructions of its own, each caught by an implementer
+re-deriving from source. The scope paragraph below is still the right description of what milestone
+4 covers; it is only the "start by designing it" instruction that is spent.
 
 ### THE PRE-MERGE REVIEW ROUND, AND THE THREE DEFECTS IT COST — 2026-08-16 (late)
 
