@@ -249,8 +249,76 @@ pub struct LiveEngine {
     /// under, mapped to the digest the STORE recorded rather than the one the
     /// layout carried. See [`LiveEngine::image`].
     images: BTreeMap<String, String>,
+    /// The task draining this engine's own stdout and stderr. See [`Diagnostics`].
+    diagnostics: tokio::task::JoinHandle<String>,
     _socket_root: SocketRoot,
     _root: tempfile::TempDir,
+}
+
+/// How one engine ended, and what it said on the way.
+///
+/// **The status alone cannot say WHY an engine exited non-zero, and until this
+/// type existed nothing here could.** `arca-engine` has exactly two deliberate
+/// failure exits, both `EXIT_FAILURE` and so both `exit status: 1` from outside:
+/// a drain that ran out of its ten-second grace, and a listening socket that
+/// closed with no shutdown requested (Arca's `ArcaEngineCommand.releaseAndExit`
+/// callers). They are different defects with different fixes and the byte does
+/// not distinguish them -- but each logs its own line first, and those lines are
+/// what [`Diagnostics`] carries here.
+pub struct EngineExit {
+    pub status: std::process::ExitStatus,
+    /// Everything the engine wrote to stdout and stderr over its whole life.
+    ///
+    /// Both streams because the two things worth reading arrive on different
+    /// ones: swift-log's default handler writes the engine's own lines to
+    /// stdout, and a Swift crash trace -- the exit-133 abort this tier already
+    /// reasons about -- goes to stderr.
+    pub diagnostics: String,
+    /// How long the engine took from its pipe closing to being reaped.
+    ///
+    /// **Recorded because the grace period is a deadline and a status byte only
+    /// says whether it was missed.** A run whose slowest shutdown is
+    /// milliseconds has orders of magnitude of headroom; one whose slowest is
+    /// 9.9s is a green that was about to go red, and the two are
+    /// indistinguishable from `ExitStatus::success` alone.
+    pub took: Duration,
+}
+
+/// Reads a child's stdout and stderr to EOF, interleaved as they arrive.
+///
+/// **A reader task rather than a read after `wait`, because the pipe is a
+/// bounded buffer.** An engine that wrote more than a pipeful with nothing
+/// draining it would block in `write` forever, and the test waiting for it would
+/// hang rather than fail -- a deadlock introduced into every test in this tier
+/// by a helper meant only to explain failures in one of them.
+///
+/// The two streams are concatenated in arrival order per stream and not
+/// globally, which is enough for what reads this: the engine's own log lines are
+/// all on stdout, so their order among themselves is preserved.
+struct Diagnostics;
+
+impl Diagnostics {
+    /// Takes both pipes off `child` and drains them until the engine is gone.
+    fn draining(child: &mut tokio::process::Child) -> tokio::task::JoinHandle<String> {
+        use tokio::io::AsyncReadExt as _;
+
+        let mut out = child.stdout.take().expect("the engine's stdout is piped");
+        let mut err = child.stderr.take().expect("the engine's stderr is piped");
+        tokio::spawn(async move {
+            let mut spoken = Vec::new();
+            let mut shouted = Vec::new();
+            // Concurrently, so neither pipe can fill while the other is being
+            // read: reading one to EOF first is the same deadlock this type
+            // exists to avoid, one stream along.
+            let (spoke, shouted_result) =
+                tokio::join!(out.read_to_end(&mut spoken), err.read_to_end(&mut shouted));
+            spoke.expect("reading the engine's stdout must succeed");
+            shouted_result.expect("reading the engine's stderr must succeed");
+            let mut both = String::from_utf8_lossy(&spoken).into_owned();
+            both.push_str(&String::from_utf8_lossy(&shouted));
+            both
+        })
+    }
 }
 
 impl LiveEngine {
@@ -285,14 +353,18 @@ impl LiveEngine {
         let socket_root = SocketRoot::fresh();
         let socket = socket_root.socket();
 
-        let child = supervised(&inputs.binary, &inputs.serve_arguments(&socket, &state))
+        let mut child = supervised(&inputs.binary, &inputs.serve_arguments(&socket, &state))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap_or_else(|error| panic!("could not spawn {}: {error}", inputs.binary));
+        let diagnostics = Diagnostics::draining(&mut child);
 
         let mut engine = Self {
             child,
             socket,
             images,
+            diagnostics,
             _socket_root: socket_root,
             _root: root,
         };
@@ -367,6 +439,16 @@ impl LiveEngine {
         }
     }
 
+    /// The path this engine is listening on.
+    ///
+    /// Exposed so a test can dial the engine as something other than a gRPC
+    /// client. Everything in this tier that speaks the protocol goes through
+    /// [`Self::transport`]; what needs this is the case that deliberately does
+    /// NOT speak it.
+    pub fn socket(&self) -> &Utf8Path {
+        &self.socket
+    }
+
     pub async fn transport(&self) -> ChannelTransport {
         ChannelTransport::connect(self.socket.as_std_path().to_owned())
             .await
@@ -404,13 +486,16 @@ impl LiveEngine {
     /// `await_socket`'s `try_wait()`, and both of those paths are exercised.
     pub async fn kill(self) {
         let socket = self.socket.clone();
-        let status = self.stop().await;
+        let exit = self.stop().await;
         assert!(
-            status.success(),
-            "the engine on {socket} exited with {status} rather than cleanly. \
+            exit.status.success(),
+            "the engine on {socket} exited with {} rather than cleanly, after {:.2}s. \
              Exit 133 is `Trace/BPT trap: 5` -- the graceful-shutdown abort; run \
              `shutdown::the_engine_exits_cleanly_after_a_container_has_been_created` \
-             to see it as a rate rather than as one sample"
+             to see it as a rate rather than as one sample. The engine said:\n{}",
+            exit.status,
+            exit.took.as_secs_f64(),
+            exit.diagnostics,
         );
     }
 
@@ -426,10 +511,15 @@ impl LiveEngine {
     /// The status is the engine's own and not the wrapper's: [`SUPERVISOR`]
     /// ends `wait "$enginepid"; status=$?; ...; exit "$status"`, so an engine
     /// killed by a signal arrives here as the shell's `128 + signo`.
-    pub async fn stop(mut self) -> std::process::ExitStatus {
+    ///
+    /// The diagnostics are collected AFTER the wait, because the reader task
+    /// ends when both pipes reach EOF and they reach it when the last process
+    /// holding the write end is gone.
+    pub async fn stop(mut self) -> EngineExit {
+        let signalled = std::time::Instant::now();
         drop(self.child.stdin.take());
         let stopped = tokio::time::timeout(Duration::from_secs(30), self.child.wait()).await;
-        match stopped {
+        let status = match stopped {
             Ok(Ok(status)) => status,
             Ok(Err(error)) => panic!("could not wait on the engine supervisor: {error}"),
             // The wrapper is still up 30s after the pipe closed, so its watcher
@@ -439,6 +529,16 @@ impl LiveEngine {
                 "the engine supervisor for {} did not exit within 30s of its pipe closing",
                 self.socket
             ),
+        };
+        let took = signalled.elapsed();
+        let diagnostics = self
+            .diagnostics
+            .await
+            .expect("the task draining the engine's output must not panic");
+        EngineExit {
+            status,
+            diagnostics,
+            took,
         }
     }
 }
