@@ -45,8 +45,9 @@
 //! between `fork` and `exec`, which makes anything arriving during the load
 //! pending rather than fatal; the engine unblocks it once its handler is
 //! installed (`ArcaSignalCapture`), and Arca's
-//! `ShutdownSignalsTests.testCaptureDeliversASignalThatWasBlockedBeforeIt`
-//! drives that half in-process. **There is deliberately no arm for it here.**
+//! `ShutdownSignalsTests.testCaptureUnblocksASignalTheProcessInherited`
+//! (`Tests/ArcaEngineTests/ShutdownSignalsTests.swift`) drives that half
+//! in-process. **There is deliberately no arm for it here.**
 //! It needs `Command::pre_exec`, and this workspace sets `unsafe_code =
 //! "forbid"`; relaxing a workspace-wide safety lint to add one arm to one
 //! `#[ignore]`d test is a worse trade than proving the same property where the
