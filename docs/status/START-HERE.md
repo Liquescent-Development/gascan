@@ -20,11 +20,13 @@ Everything above the `Where the work is` heading is current; everything below it
 | Evidence, now durable | `~/code/arca/Documentation/EVIDENCE-layer-cache-poisoning.md` — **committed**, see below |
 
 **EVERY SHA BELOW WAS READ WITH `git log -1` / `git ls-remote` AT THE MOMENT THIS WAS
-WRITTEN. Re-verify anyway — this file has gone stale on its own SHAs repeatedly.**
+WRITTEN. Re-verify anyway — this file has gone stale on its own SHAs repeatedly, and the
+first draft of THIS table went stale the moment it was committed, which is why the Gas Can
+row no longer carries a number.**
 
 | | branch | head | pushed |
 |---|---|---|---|
-| Gas Can | `feat/milestone-4-product-wiring` | `629ca27` | yes, `ls-remote` matches |
+| Gas Can | `feat/milestone-4-product-wiring` | **run `git log -1`** — every edit to this file moves it. The last commit that changed code is `629ca27` (Task 13) | yes |
 | Arca | `feat/milestone-4-engine` | `e14be74` | yes, `ls-remote` matches |
 | `containerization` submodule | `merge/upstream-main` | `6304122` | yes, `ls-remote` matches |
 
