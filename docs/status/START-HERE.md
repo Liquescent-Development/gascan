@@ -3,13 +3,13 @@
 This file is the session entry point. It is written to be read cold, and it is
 addressed to you, the agent. Follow it as instructions — there is nothing to paste.
 
-Rewritten 2026-08-18 after **ITEMS 1, 2a AND 2b WERE IMPLEMENTED, REVIEWED, AND FIXED, AND
-BOTH PULL REQUESTS LEFT DRAFT.** Everything above the `Where the work is` heading is current;
-everything below it is history.
+Rewritten 2026-08-18 after **MILESTONE 4 MERGED.** Both pull requests are merged as true merge
+commits. Everything above the `Where the work is` heading is current; everything below it is
+history.
 
 ---
 
-## MILESTONE 4 IS CODE-COMPLETE AND BOTH PRs ARE OPEN FOR REVIEW. THE OFFLINE PROOF REFUTED.
+## MILESTONE 4 IS MERGED. THE OFFLINE PROOF REFUTED, AND THAT IS THE RESULT THAT SHIPPED.
 
 **Read these four, in this order.**
 
@@ -24,11 +24,15 @@ everything below it is history.
 on its own SHAs repeatedly, including inside a single edit three lines below its own warning
 about it. That is why no head SHA is written here: every edit to this file moves it.
 
-| | branch | head | pushed |
+| | merged into `main` as | merge commit | parents |
 |---|---|---|---|
-| Gas Can | `feat/milestone-4-product-wiring` | **run `git log -1`** | verify with `ls-remote` |
-| Arca | `feat/milestone-4-engine` | `ae92360` — **it DID move**: three fixes a pre-merge review found, on top of `e14be74` | yes, `ls-remote` matched |
-| `containerization` submodule | `merge/upstream-main` | `6304122` — did not move; `git ls-remote git@github.com:Vas-Solutus/arca-containerization.git refs/heads/merge/upstream-main` returns it | yes |
+| Gas Can | #77 | `d65801d` | `7e8bb5c` + `6600201` — three SHAs, verified with `git rev-list --parents -n1` |
+| Arca | #59 | `6460a210` | `5e11704` + `ae92360` — three SHAs, likewise |
+| `containerization` submodule | — | `6304122`, unchanged | `git ls-remote git@github.com:Vas-Solutus/arca-containerization.git refs/heads/merge/upstream-main` returns it |
+
+**Merged `main` was verified green after the fact, not before**: `cargo fmt --all --check` 0,
+`cargo clippy --workspace --all-targets -- -D warnings` 0, `cargo test --workspace` **1496
+passed, 0 failed, 49 ignored**, run at `d65801d`.
 
 **The tag `gascan-engine-m4` and its release are published and verified. They were NOT re-cut
 and must not be.** The signed tag object is `d143a66`, pointing at commit `c545612`; the
@@ -50,13 +54,15 @@ written. `crates/gascan-arca/tests/live/network.rs`'s
 weaken it to make the tier green. Reaching `Proven` is Arca work, not a re-tag of this tree.
 **The fail-closed default is what the evidence vindicates.**
 
-### WHERE THINGS STAND: BOTH PRs ARE OUT OF DRAFT, NEITHER IS MERGED
+### WHERE THINGS STAND: BOTH MERGED
 
-- **Gas Can #77**, "P5.1 milestone 4: the Arca engine wired into the product, and the offline
-  proof that refuted". Ready for review. Description rewritten to match its contents.
-- **Arca #59**, "P5.1 milestone 4, landing 1: the engine's half, sealed by gascan-engine-m4".
-  Ready for review. Its old description was wrong about three things and all three are
-  corrected: tasks 5-7 ARE done, the submodule DID move to `6304122`, and the tag is published.
+- **Gas Can #77** — "the Arca engine wired into the product, and the offline proof that
+  refuted". Merged `d65801d`.
+- **Arca #59** — "landing 1: the engine's half, sealed by gascan-engine-m4". Merged `6460a210`.
+
+Both descriptions were rewritten to match their contents before either left draft. Arca's had
+been wrong about three things: tasks 5-7 ARE done, the submodule DID move to `6304122`, and the
+tag is published.
 
   **A fifth review was run against `4134b54..e14be74`**, because the landing review had covered
   only `5e11704..4134b54` and three commits landed after it — including the ~4,600-line kernel
@@ -67,8 +73,14 @@ weaken it to make the tier green. Reaching `Proven` is Arca work, not a re-tag o
   the doc said it built. **Two are NOT fixed and are real**: the kernel toolchain is unpinned,
   and the required-config assertion checks a text file rather than the built artefact.
 
-**Merge Arca first, then Gas Can.** Both as **true merge commits** — `git rev-list --parents
--n1` must return three SHAs; `allowed_merge_methods` is `["merge"]`, never squash.
+**Arca merged first, then Gas Can**, both as true merge commits. The ruleset that enforces it
+is `main protection` on each repository — `allowed_merge_methods: ["merge"]` plus
+`required_signatures`, and **no required status checks**, which is why the by-design red
+`engine` job did not block. There is no classic branch protection on either `main`; querying
+that endpoint returns 404 and tells you nothing.
+
+**The next milestone starts from `main` in both repositories.** The open items below are what
+it inherits.
 
 ### WHAT LANDED THIS SESSION
 
@@ -97,13 +109,16 @@ deleted every backend's store** — this milestone's own harm, reintroduced at u
 made deterministic rather than accidental. It refuses now, and reads which backend was
 enumerated from the daemon's instance record rather than owning a second copy of the rule.
 
-**All four review files are committed at `docs/status/review-*.md`**, unedited, including the
-findings that were deliberately NOT fixed and why.
+**All five review files are committed at `docs/status/review-*.md`**, unedited, including the
+findings that were deliberately NOT fixed and why. The fifth, `review-arca-tail.md`, exists
+because the Arca landing review had covered `5e11704..4134b54` and three commits landed after
+it; it found three things worth fixing and two — an unpinned kernel toolchain, and a
+required-config assertion that checks a text file rather than the built artefact — that are
+real, unfixed, and narrow the reproducibility claim until they are done.
 
 ### WHAT IS OPEN
 
-1. **NEITHER PR IS MERGED.** That is the next action. Arca first.
-2. **THE DAEMON INSTANCE RECORD HAS A PUBLISH RACE, AND IT IS THE MOST EXPENSIVE THING IN THE
+1. **THE DAEMON INSTANCE RECORD HAS A PUBLISH RACE, AND IT IS THE MOST EXPENSIVE THING IN THE
    TEST LOOP.** `write_instance_record` (`crates/gascand/src/socket.rs`) does `write_all`, then
    `sync_all`, then `fchmod(0600)`. Across that fsync the file is mode 0200 **with content** —
    which `crates/gascan/src/daemon.rs`'s `validate_file_stat` classifies as "written but never
@@ -116,25 +131,25 @@ findings that were deliberately NOT fixed and why.
    runs on 2026-08-18, each in a different test, each time in code the session's diff did not
    touch, and each time passing in isolation. **This is why the suite needs diff-plus-isolation
    exoneration.** Worth its own task; it was left unfixed as outside the three decided items.
-3. **(2c) A PRODUCTION STDERR DESTINATION FOR THE DAEMON IS STILL DEFERRED**, as its own
+2. **(2c) A PRODUCTION STDERR DESTINATION FOR THE DAEMON IS STILL DEFERRED**, as its own
    decision with a privacy dimension — a daemon log holds sandbox names, project paths and
    guest output. (2a) and (2b) have landed, which was the precondition. Raise it with the
    maintainer with a concrete proposal for where the file lives, its mode, how it is bounded
    and what is redacted. **Do not decide it alone.**
-4. **~60 deferred Minor findings** with rulings in the ledger, plus the minors in this
+3. **~60 deferred Minor findings** with rulings in the ledger, plus the minors in this
    session's four review files and the previous whole-landing review. Task 6 M3 and Task 7 O1
    are still open.
-5. **The process-level legacy-migration coverage was dropped and nothing replaced it.**
+4. **The process-level legacy-migration coverage was dropped and nothing replaced it.**
    `ae75595` narrowed it and its admission was a category slip, corrected in `de14a94`. A
    regression in the Apple path's `main.rs` wiring would be caught by no test in the suite.
-6. **A guest that refuses at boot is loud in the guest and silent to the host** — `Start` never
+5. **A guest that refuses at boot is loud in the guest and silent to the host** — `Start` never
    returns and the only diagnostic is in `bootlog.log`.
-7. **The guest-side ordering instrument** at
+6. **The guest-side ordering instrument** at
    `.superpowers/sdd/.../carry-layer_report-live-test.rs` is **git-ignored**. Land it in the
    live tier before it is lost.
-8. **One untested ordering, labelled as such in the code**: in `crates/gascand/src/engine.rs`,
+7. **One untested ordering, labelled as such in the code**: in `crates/gascand/src/engine.rs`,
    swapping the exit-status and timeout checks leaves the supervisor suite green.
-9. **A pre-existing stash is on the stack and is not ours.** Leave it.
+8. **A pre-existing stash is on the stack and is not ours.** Leave it.
 
 ### WHAT WAS RUN, AND WHAT CI DOES WITH IT
 
