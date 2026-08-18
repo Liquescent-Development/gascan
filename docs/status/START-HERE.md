@@ -25,7 +25,7 @@ inside a single edit, three lines below its own warning about it.**
 
 | | branch | head | pushed |
 |---|---|---|---|
-| Gas Can | `feat/milestone-4-product-wiring` | **run `git log -1`** — every edit to this file moves it. The last commit that changed code is `3882a52` (the review fixes) | yes, `ls-remote` matched |
+| Gas Can | `feat/milestone-4-product-wiring` | **run `git log -1`** — every edit to this file moves it, which is why no number is written here. The last commit touching `crates/` is `3882a52` (the review fixes); the last touching anything outside `docs/` is `68b9881` (`.github/workflows/ci.yml`) | yes, `ls-remote` matched |
 | Arca | `feat/milestone-4-engine` | `e14be74` — **did not move this session** | yes, `ls-remote` matched |
 | `containerization` submodule | `merge/upstream-main` | `6304122` — did not move | yes |
 
