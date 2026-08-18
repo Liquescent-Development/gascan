@@ -11,8 +11,7 @@ use gascan_core::runtime::{RuntimeBackend, RuntimeError};
 use gascand::{
     BackendSelection, ControllerStateError, ControllerStatePaths, Daemon, DaemonConfig,
     DoctorState, ErrorDiagnostics, ProvisionRequest, ProvisionResolution, Provisioner, SandboxApi,
-    SandboxService, ServiceError, SocketPaths, SshPaths, Store, backend_selection,
-    open_controller_store,
+    SandboxService, ServiceError, SocketPaths, SshPaths, Store, open_controller_store,
 };
 use std::{sync::Arc, time::Duration};
 
@@ -252,11 +251,19 @@ async fn run(
     };
     drop(startup_diagnostic);
     let e2e_ssh_paths = e2e_ssh_paths()?;
-    #[cfg(debug_assertions)]
-    let fake_requested = std::env::var_os(gascand::TEST_FAKE_BACKEND_ENV).is_some();
-    #[cfg(not(debug_assertions))]
-    let fake_requested = false;
-    match backend_selection(fake_requested) {
+    // One shared reader, in gascan-core, because `gascan` resolves the same
+    // question to decide which daemon it will talk to. Two copies of this could
+    // disagree with each other while each stayed self-consistent.
+    let selection = gascand::backend_from_environment()?;
+    // Built once, from the selection that was actually resolved, so an arm
+    // cannot record a backend other than the one it constructs. Passing a
+    // literal per arm would have made that a convention rather than a fact.
+    let daemon_runtime = DaemonRuntime {
+        paths,
+        idle_timeout,
+        backend: selection,
+    };
+    match selection {
         BackendSelection::Apple => {
             let doctor = DoctorState::refreshing(Duration::from_secs(60), production_doctor_report);
             let attach = gascan_apple::AppleAttach::configured_from_environment()?;
@@ -264,8 +271,51 @@ async fn run(
             run_daemon(
                 AppleBackend::with_attach(runner, attach),
                 store,
-                paths,
-                idle_timeout,
+                daemon_runtime,
+                ConfiguredProvisioner {
+                    delay: Duration::ZERO,
+                    fail: false,
+                    rollback_failure_runtime: None,
+                },
+                doctor,
+                DaemonSshConfig {
+                    e2e_paths: e2e_ssh_paths,
+                    refresh_doctor: true,
+                },
+            )
+            .await
+        }
+        BackendSelection::Arca => {
+            // The socket is undefaulted. Its absence is a startup error naming
+            // the variable, not a guessed path: a default would make a typo in
+            // the socket path indistinguishable from not having set one, and
+            // where the engine listens is Arca's choice rather than Gas Can's
+            // to assume.
+            let socket = std::env::var_os(gascand::ENGINE_SOCKET_ENV).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "{} selects the Arca engine backend, so {} must name its socket",
+                        gascand::ARCA_BACKEND_ENV,
+                        gascand::ENGINE_SOCKET_ENV
+                    ),
+                )
+            })?;
+            let transport =
+                gascan_arca::ChannelTransport::connect(std::path::PathBuf::from(socket)).await?;
+            // KNOWN WRONG, AND OWNED BY THE NEXT TASK. `production_doctor_report`
+            // pairs every fact with hardcoded Apple prose -- "install Apple
+            // container 1.1.0 in PATH", "run `container system start` and
+            // retry" -- so an Arca daemon with a dead engine socket currently
+            // tells the user to install Apple container. The remedy has to
+            // become the responsibility of the backend that produced the fact.
+            // It is wired to Apple's here only so that this arm is reachable
+            // and testable before that lands; it is not a decision.
+            let doctor = DoctorState::refreshing(Duration::from_secs(60), production_doctor_report);
+            run_daemon(
+                gascan_arca::ArcaBackend::new(transport),
+                store,
+                daemon_runtime,
                 ConfiguredProvisioner {
                     delay: Duration::ZERO,
                     fail: false,
@@ -288,7 +338,7 @@ async fn run(
             let provision_fail = std::env::var_os("GASCAN_FAKE_PROVISION_FAIL").is_some();
             let fake_state_path = std::env::var_os("GASCAN_FAKE_STATE_PATH")
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| paths.directory().join("fake-runtime.json"));
+                .unwrap_or_else(|| daemon_runtime.paths.directory().join("fake-runtime.json"));
             let runtime = FakeRuntime::persistent(
                 gascan_core::fake_runtime::fixture_capabilities(),
                 fake_state_path,
@@ -315,8 +365,7 @@ async fn run(
             run_daemon(
                 runtime.clone(),
                 store,
-                paths,
-                idle_timeout,
+                daemon_runtime,
                 ConfiguredProvisioner {
                     delay: provision_delay,
                     fail: provision_fail,
@@ -446,11 +495,23 @@ fn controller_state_paths(
     ControllerStatePaths::for_user(paths.directory())
 }
 
+/// What the daemon needs to describe itself: where it listens, how long it
+/// waits, and which backend it drives.
+///
+/// Grouped rather than passed as three parameters because `DaemonConfig::new`
+/// consumes exactly these three together, and because adding the backend put
+/// `run_daemon` one argument over clippy's limit -- a signal worth taking
+/// rather than silencing, since the three had already drifted into a set.
+struct DaemonRuntime {
+    paths: SocketPaths,
+    idle_timeout: Duration,
+    backend: BackendSelection,
+}
+
 async fn run_daemon<B: RuntimeBackend + 'static>(
     runtime: B,
     store: Store,
-    paths: SocketPaths,
-    idle_timeout: Duration,
+    daemon: DaemonRuntime,
     provisioner: ConfiguredProvisioner,
     doctor: DoctorState,
     ssh: DaemonSshConfig,
@@ -481,7 +542,7 @@ async fn run_daemon<B: RuntimeBackend + 'static>(
     let _ = ssh.e2e_paths;
     let service = Arc::new(service);
     let _ = service.reconcile().await?;
-    let config = DaemonConfig::new(paths, idle_timeout);
+    let config = DaemonConfig::new(daemon.paths, daemon.idle_timeout, daemon.backend);
     #[cfg(debug_assertions)]
     let config = configure_e2e_daemon(config)?;
     let error_diagnostics = if std::env::var_os(gascand::TEST_ERROR_DIAGNOSTICS_ENV).is_some() {

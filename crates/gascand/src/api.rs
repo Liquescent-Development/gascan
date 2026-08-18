@@ -3,6 +3,7 @@ use crate::{
     SandboxService, ServiceError, SocketPaths, UpRequest as ServiceUpRequest,
 };
 use camino::Utf8PathBuf;
+use gascan_core::backend::BackendSelection;
 use gascan_core::doctor::{DoctorCheckId, DoctorFact, DoctorStatus};
 use gascan_core::manifest::Manifest;
 use gascan_core::runtime::{RuntimeBackend, immutable_image_reference};
@@ -32,6 +33,14 @@ struct DaemonInstanceRecord {
     start_identity: String,
     instance_token: String,
     release_version: String,
+    /// Which backend this daemon actually runs.
+    ///
+    /// Beside `release_version` because it answers the same question for the
+    /// same reason: a client must not talk to a daemon it did not ask for.
+    /// Without it, `GASCAN_ARCA_BACKEND=1 gascan up` followed by a plain
+    /// `gascan ps` inside the idle window silently reaches the Arca daemon and
+    /// reports its sandboxes as though they were Apple's.
+    backend: String,
     started_at: DaemonInstanceTimestamp,
 }
 
@@ -84,6 +93,7 @@ fn write_daemon_instance_record(
         start_identity: identity.start_identity.clone(),
         instance_token: identity.instance_token.clone(),
         release_version: identity.release_version.clone(),
+        backend: identity.backend.as_str().to_owned(),
         started_at: DaemonInstanceTimestamp {
             seconds: identity.started_at.seconds,
             nanos: identity.started_at.nanos,
@@ -100,11 +110,12 @@ struct DaemonIdentity {
     start_identity: String,
     instance_token: String,
     release_version: String,
+    backend: BackendSelection,
     started_at: prost_types::Timestamp,
 }
 
 impl DaemonIdentity {
-    fn current() -> io::Result<Self> {
+    fn current(backend: BackendSelection) -> io::Result<Self> {
         let pid = std::process::id();
         let instance_token = fresh_token()?;
         let started_at = std::time::SystemTime::now()
@@ -116,6 +127,7 @@ impl DaemonIdentity {
             start_identity: process_start_identity(pid)?,
             instance_token,
             release_version: env!("CARGO_PKG_VERSION").to_owned(),
+            backend,
             started_at: prost_types::Timestamp {
                 seconds: i64::try_from(started_at.as_secs()).map_err(io::Error::other)?,
                 nanos: started_at.subsec_nanos() as i32,
@@ -227,9 +239,22 @@ impl Default for ActivityTracker {
     }
 }
 impl ActivityTracker {
+    /// A tracker for the Apple backend.
+    ///
+    /// Kept as the parameterless constructor because every caller that does not
+    /// name a backend is exercising the Apple or fake path, and threading a
+    /// value through fifteen test call sites that all pass the same one would
+    /// be noise rather than information. `DaemonConfig::new` -- the only
+    /// production path -- takes the backend explicitly and cannot fall through
+    /// to this default.
     #[must_use]
     pub fn new() -> Self {
-        let identity = DaemonIdentity::current().unwrap_or_else(|error| {
+        Self::for_backend(BackendSelection::Apple)
+    }
+
+    #[must_use]
+    pub fn for_backend(backend: BackendSelection) -> Self {
+        let identity = DaemonIdentity::current(backend).unwrap_or_else(|error| {
             eprintln!("daemon identity creation failed: {error}");
             std::process::abort()
         });
@@ -383,11 +408,11 @@ pub struct DaemonConfig {
 }
 impl DaemonConfig {
     #[must_use]
-    pub fn new(paths: SocketPaths, idle_timeout: Duration) -> Self {
+    pub fn new(paths: SocketPaths, idle_timeout: Duration, backend: BackendSelection) -> Self {
         Self {
             paths,
             idle_timeout,
-            activity: ActivityTracker::new(),
+            activity: ActivityTracker::for_backend(backend),
             shutdown_timeout: Duration::from_secs(2),
         }
     }
@@ -2269,7 +2294,7 @@ mod tests {
     use tokio_stream::StreamExt;
 
     #[test]
-    fn daemon_instance_record_serializes_release_and_start_timestamp() {
+    fn daemon_instance_record_serializes_release_backend_and_start_timestamp() {
         let value = serde_json::to_value(DaemonInstanceRecord {
             pid: 7,
             owner_token: "owner".to_owned(),
@@ -2277,6 +2302,7 @@ mod tests {
             start_identity: "start".to_owned(),
             instance_token: "instance".to_owned(),
             release_version: "0.1.11".to_owned(),
+            backend: "arca".to_owned(),
             started_at: DaemonInstanceTimestamp {
                 seconds: 1_785_263_800,
                 nanos: 123_000_000,
@@ -2284,8 +2310,23 @@ mod tests {
         })
         .unwrap_or_default();
         assert_eq!(value["release_version"], "0.1.11");
+        // The key name and the value are BOTH pinned. The client reads this
+        // field out of a file this crate writes, and the two agree on a string:
+        // renaming the key or restyling the value would leave every client
+        // seeing an unrecorded backend and refusing every daemon.
+        assert_eq!(value["backend"], "arca");
         assert_eq!(value["started_at"]["seconds"], 1_785_263_800_i64);
         assert_eq!(value["started_at"]["nanos"], 123_000_000);
+    }
+
+    /// The record's spelling of each backend is what the client compares
+    /// against, so it is pinned here rather than left to `as_str`'s definition.
+    #[test]
+    fn every_backend_records_a_stable_name() {
+        assert_eq!(super::BackendSelection::Apple.as_str(), "apple");
+        assert_eq!(super::BackendSelection::Arca.as_str(), "arca");
+        #[cfg(debug_assertions)]
+        assert_eq!(super::BackendSelection::Fake.as_str(), "fake");
     }
 
     async fn run_attach_bridge<S>(

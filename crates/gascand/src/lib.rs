@@ -2,29 +2,18 @@
 #![deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 #[cfg(debug_assertions)]
-pub const TEST_FAKE_BACKEND_ENV: &str = "GASCAN_TEST_FAKE_BACKEND";
+pub use gascan_core::backend::FAKE_BACKEND_ENV as TEST_FAKE_BACKEND_ENV;
 pub const TEST_ERROR_DIAGNOSTICS_ENV: &str = "GASCAN_TEST_ERROR_DIAGNOSTICS";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BackendSelection {
-    Apple,
-    #[cfg(debug_assertions)]
-    Fake,
-}
-
-#[cfg(debug_assertions)]
-pub const fn backend_selection(fake_requested: bool) -> BackendSelection {
-    if fake_requested {
-        BackendSelection::Fake
-    } else {
-        BackendSelection::Apple
-    }
-}
-
-#[cfg(not(debug_assertions))]
-pub const fn backend_selection(_fake_requested: bool) -> BackendSelection {
-    BackendSelection::Apple
-}
+// The selection moved to gascan-core when a second release backend arrived.
+// `gascan` does not depend on `gascand`, and the client now has to know which
+// backend it expects in order to refuse a daemon running another -- so the rule
+// has to sit where both can reach it. Re-exported here because this is still
+// where the daemon's callers look for it.
+pub use gascan_core::backend::{
+    ARCA_BACKEND_ENV, AmbiguousBackend, BackendSelection, ENGINE_SOCKET_ENV,
+    backend_from_environment, backend_selection,
+};
 
 mod api;
 mod controller_state;

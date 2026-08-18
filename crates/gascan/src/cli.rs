@@ -1113,6 +1113,7 @@ fn supervisor_error_for_action(
         crate::daemon::SupervisorError::ExitTimeout { .. } => "daemon_exit_timeout",
         crate::daemon::SupervisorError::TombstoneBusy { .. } => "daemon_lifecycle_busy",
         crate::daemon::SupervisorError::TombstoneChanged { .. } => "daemon_lifecycle_changed",
+        crate::daemon::SupervisorError::BackendMismatch { .. } => "daemon_backend_mismatch",
     };
     CliError::DaemonOperation {
         code: code.to_owned(),

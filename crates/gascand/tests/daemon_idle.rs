@@ -49,7 +49,11 @@ async fn leases_and_operations_hold_idle_shutdown_open() -> TestResult {
 async fn daemon_exits_when_idle_and_removes_only_its_socket() -> TestResult {
     let temp = TempDir::new()?;
     let paths = SocketPaths::from_runtime_root(temp.path().canonicalize()?.join("runtime"));
-    let config = DaemonConfig::new(paths.clone(), Duration::from_millis(20));
+    let config = DaemonConfig::new(
+        paths.clone(),
+        Duration::from_millis(20),
+        gascand::BackendSelection::Apple,
+    );
     Daemon::serve_idle(config).await?;
     assert!(!paths.socket().exists());
     Ok(())
