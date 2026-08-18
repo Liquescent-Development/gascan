@@ -1,7 +1,31 @@
 {
-  "schema": 1,
+  "schema": 2,
   "name": "arca",
   "url": "https://github.com/Vas-Solutus/arca.git",
-  "tag": "gascan-engine-m1.1",
-  "revision": "b3390b80528f425be0109298d6a95dd863747c5d"
+  "tag": "gascan-engine-m4",
+  "revision": "c545612b056e028d5885968a7b9f586d694f994c",
+  "artifacts": {
+    "kernel": {
+      "asset": "vmlinux-arm64.gz",
+      "url": "https://github.com/Vas-Solutus/arca/releases/download/gascan-engine-m4/vmlinux-arm64.gz",
+      "bytes": 9092349,
+      "sha256": "8a30e10d9e40dcc44396049753a3a26be74cbc77a78afca819cf8f1c13f8597a",
+      "content": {
+        "kind": "gzip-member",
+        "bytes": 28248576,
+        "sha256": "49e0f08165409769e5ae2abbe3414198c2907a15e7e20a5f3971aa7a0de33394"
+      }
+    },
+    "vminit": {
+      "asset": "vminit-oci-arm64.tar.gz",
+      "url": "https://github.com/Vas-Solutus/arca/releases/download/gascan-engine-m4/vminit-oci-arm64.tar.gz",
+      "bytes": 73739738,
+      "sha256": "51602e72883e49e4be1e27a690bf8c13b0a66cba381725cf8ea4888ec4e369be",
+      "content": {
+        "kind": "oci-manifest",
+        "bytes": 478,
+        "sha256": "cf74cd41bd430d9d8935d36c1749d9c05f19a43842f4a4cff0d01de3832222c2"
+      }
+    }
+  }
 }

@@ -189,6 +189,14 @@ pub(crate) struct DaemonInstanceRecord {
     pub(crate) start_identity: String,
     pub(crate) instance_token: String,
     pub(crate) release_version: String,
+    /// Which backend the running daemon was started on.
+    ///
+    /// Read from the record and not from the wire: the endpoint identity exists
+    /// to attest that the process answering is the process the record names,
+    /// and the backend is a different question -- WHICH runtime that process
+    /// drives. Putting it on the wire would have meant a proto field carrying a
+    /// value the client already has a trustworthy copy of.
+    pub(crate) backend: String,
     pub(crate) started_at: InstanceTimestamp,
 }
 
@@ -301,7 +309,14 @@ pub(crate) enum SupervisorError {
         state: DaemonState,
         detail: Option<String>,
     },
-    ControllerStartup {
+    /// A diagnostic the daemon wrote before it could serve.
+    ///
+    /// Named for the channel and not for the controller store. It carried only
+    /// `controller_state_*` codes when it was `ControllerStartup`, and it now
+    /// also carries the Arca arm's environment and engine failures -- a variant
+    /// named for one of its cases is how the next reader concludes the others
+    /// cannot happen.
+    DaemonStartup {
         code: String,
         message: String,
     },
@@ -320,6 +335,19 @@ pub(crate) enum SupervisorError {
     },
     TombstoneChanged {
         detail: String,
+    },
+    /// The running daemon drives a different backend than this client asked for.
+    ///
+    /// An error and NOT a `DaemonState::Outdated`-style recovery. Outdated stops
+    /// the daemon and starts a replacement, which is right for a version skew --
+    /// the old daemon is superseded. A backend difference is not skew: the
+    /// running daemon may be supervising live sandboxes on a runtime this client
+    /// never asked about, and tearing it down to satisfy an environment variable
+    /// would destroy work the user did not ask to lose. Naming both and stopping
+    /// leaves the choice where it belongs.
+    BackendMismatch {
+        running: String,
+        expected: &'static str,
     },
 }
 
@@ -350,7 +378,7 @@ impl std::fmt::Display for SupervisorError {
                     .as_deref()
                     .map_or_else(String::new, |detail| format!(": {detail}"))
             ),
-            Self::ControllerStartup { code, message } => {
+            Self::DaemonStartup { code, message } => {
                 write!(formatter, "{code}: {message}")
             }
             Self::GracefulTimeout { identity } => write!(
@@ -376,6 +404,10 @@ impl std::fmt::Display for SupervisorError {
             Self::TombstoneChanged { detail } => {
                 write!(formatter, "daemon publication residue changed: {detail}")
             }
+            Self::BackendMismatch { running, expected } => write!(
+                formatter,
+                "the running daemon uses the {running} backend and this command expects {expected};                  stop it with `gascan daemon stop` or clear the backend environment to match it"
+            ),
         }
     }
 }
@@ -389,11 +421,12 @@ impl SupervisorError {
             | Self::Outdated { .. }
             | Self::InvalidState { .. }
             | Self::Readiness { .. }
-            | Self::ControllerStartup { .. }
+            | Self::DaemonStartup { .. }
             | Self::IdentityChanged { .. }
             | Self::ExitTimeout { .. }
             | Self::TombstoneBusy { .. }
-            | Self::TombstoneChanged { .. } => None,
+            | Self::TombstoneChanged { .. }
+            | Self::BackendMismatch { .. } => None,
         }
     }
 }
@@ -522,20 +555,34 @@ impl DaemonStartupMonitor {
             else {
                 continue;
             };
-            if !matches!(
-                diagnostic.code.as_str(),
-                "controller_state_conflict"
-                    | "controller_state_unsafe"
-                    | "controller_state_invalid"
-                    | "controller_state_migration_failed"
-            ) || diagnostic.message.trim().is_empty()
-                || diagnostic.owner_token != source.owner_token
+            // The whitelist is `gascan_core`'s, not a copy of it. It used
+            // to be four literals here and four more in
+            // `ControllerStateError::code()`, which is how a writer can add a
+            // code the reader silently drops.
+            let Some(code) =
+                gascan_core::startup_diagnostic::StartupCode::from_wire(&diagnostic.code)
+            else {
+                continue;
+            };
+            if diagnostic.message.trim().is_empty() || diagnostic.owner_token != source.owner_token
             {
                 continue;
             }
-            return Ok(Some(SupervisorError::ControllerStartup {
-                code: diagnostic.code,
-                message: diagnostic.message,
+            // **The whitelist bounds the code; nothing bounded the message.**
+            // It is assembled from `io::Error` and `EngineError` Display
+            // output, which embeds paths and OS error strings, so an
+            // environment naming a socket with an ESC sequence reaches this
+            // process's stderr as cursor control. Sanitized here, beside the
+            // whitelist, because this is the side that does not trust the
+            // writer -- and truncated rather than discarded, so a long message
+            // still names its cause instead of becoming a readiness timeout.
+            let message = gascan_core::startup_diagnostic::sanitize_message(&diagnostic.message);
+            if message.trim().is_empty() {
+                continue;
+            }
+            return Ok(Some(SupervisorError::DaemonStartup {
+                code: code.as_str().to_owned(),
+                message,
             }));
         }
         Ok(None)
@@ -563,12 +610,40 @@ pub(crate) struct SupervisorTimeouts {
 }
 
 impl Default for SupervisorTimeouts {
+    /// The Apple-backed bounds. A daemon on that backend starts no engine.
     fn default() -> Self {
         Self {
             readiness: Duration::from_secs(15),
             shutdown: Duration::from_secs(15),
             poll: Duration::from_millis(25),
         }
+    }
+}
+
+impl SupervisorTimeouts {
+    /// The bounds for the backend this process is configured for.
+    ///
+    /// **An Arca-backed daemon must bring an engine up before it can serve**,
+    /// and that is a cold VM-capable binary loading a 73MB vminit layout, not a
+    /// process that binds a socket and returns. Waiting on it with the Apple
+    /// bound made `gascan up` fail on a correctly configured host, and made the
+    /// daemon's own `NotListening` error -- which names the socket -- unable to
+    /// reach a user at all, because the client always abandoned first.
+    ///
+    /// **An unresolvable backend takes the default and does not report.** Both
+    /// backends requested at once is a real error and it is raised where it can
+    /// be acted on -- `backend_from_environment` in the daemon, and
+    /// `require_matching_backend` in the client. Choosing a timeout is not the
+    /// place to raise it a third time, and a timeout that returned a `Result`
+    /// would put that error in front of the one the user needs.
+    pub(crate) fn for_environment() -> Self {
+        let mut timeouts = Self::default();
+        if gascan_core::backend::backend_from_environment()
+            == Ok(gascan_core::backend::BackendSelection::Arca)
+        {
+            timeouts.readiness = gascan_core::backend::ENGINE_BACKED_DAEMON_READINESS;
+        }
+        timeouts
     }
 }
 
@@ -714,6 +789,12 @@ fn signaling_record(identity: &DaemonIdentity) -> DaemonInstanceRecord {
             .release_version
             .clone()
             .unwrap_or_else(|| "legacy".to_owned()),
+        // This record is synthesised from a wire identity purely to address a
+        // signal at an attested process; nothing on this path reads the
+        // backend, and the wire identity does not carry one. A placeholder that
+        // matches no real selection is honest about that -- copying the client's
+        // own expectation in would manufacture agreement that was never checked.
+        backend: "endpoint-attested".to_owned(),
         started_at: identity.started_at.clone().unwrap_or(InstanceTimestamp {
             seconds: 1,
             nanos: 0,
@@ -1902,7 +1983,7 @@ pub(crate) async fn start() -> Result<LifecycleOutcome, SupervisorError> {
         &crate::client::TonicEndpoint,
         &OsProcessInspector,
         &crate::client::TokioDaemonSpawner,
-        SupervisorTimeouts::default(),
+        SupervisorTimeouts::for_environment(),
     )
     .await
 }
@@ -1916,7 +1997,7 @@ pub(crate) async fn stop(force: bool) -> Result<LifecycleOutcome, SupervisorErro
         &OsProcessInspector,
         &OsAttestedProcessSignaler,
         StopMode::Explicit { force },
-        SupervisorTimeouts::default(),
+        SupervisorTimeouts::for_environment(),
     )
     .await
 }
@@ -1930,7 +2011,10 @@ pub(crate) async fn restart(force: bool) -> Result<LifecycleOutcome, SupervisorE
         &OsProcessInspector,
         &crate::client::TokioDaemonSpawner,
         &OsAttestedProcessSignaler,
-        ShutdownPolicy::new(StopMode::Explicit { force }, SupervisorTimeouts::default()),
+        ShutdownPolicy::new(
+            StopMode::Explicit { force },
+            SupervisorTimeouts::for_environment(),
+        ),
     )
     .await
 }
@@ -1945,7 +2029,7 @@ pub(crate) async fn connect_current_or_recover()
         &OsProcessInspector,
         &crate::client::TokioDaemonSpawner,
         &OsAttestedProcessSignaler,
-        SupervisorTimeouts::default(),
+        SupervisorTimeouts::for_environment(),
     )
     .await
 }
@@ -1964,7 +2048,7 @@ where
         &OsProcessInspector,
         &crate::client::TokioDaemonSpawner,
         &OsAttestedProcessSignaler,
-        SupervisorTimeouts::default(),
+        SupervisorTimeouts::for_environment(),
         observer,
     )
     .await
@@ -1988,6 +2072,41 @@ fn supervisor_context() -> Result<(DaemonPaths, PathBuf), SupervisorError> {
     Ok((paths, executable))
 }
 
+/// Refuses a daemon running a backend this client did not ask for.
+///
+/// **The comparison is against the daemon's own recorded answer, not against a
+/// second reading of the environment.** `gascand` writes what it actually
+/// constructed; this reads what was written. An implementation that re-derived
+/// the running daemon's backend from the environment would agree with itself
+/// perfectly and detect nothing, because the environment it read would be this
+/// process's, not the daemon's.
+///
+/// A record with no backend at all is refused rather than waved through. That
+/// state means a daemon older than this field, and "assume it matches" is the
+/// answer that lets exactly the silent cross-backend connection this exists to
+/// stop happen once more.
+fn require_matching_backend(record: Option<&DaemonInstanceRecord>) -> Result<(), SupervisorError> {
+    let expected = gascan_core::backend::backend_from_environment()
+        .map_err(|error| SupervisorError::Io(io::Error::other(error.to_string())))?
+        .as_str();
+    let running = match record {
+        Some(record) => record.backend.as_str(),
+        None => {
+            return Err(SupervisorError::BackendMismatch {
+                running: "unrecorded".to_owned(),
+                expected,
+            });
+        }
+    };
+    if running == expected {
+        return Ok(());
+    }
+    Err(SupervisorError::BackendMismatch {
+        running: running.to_owned(),
+        expected,
+    })
+}
+
 fn connected_outcome<C>(
     mut inspected: Inspection<C>,
     transition: DaemonTransition,
@@ -1998,6 +2117,13 @@ fn connected_outcome<C>(
             detail: inspected.status.detail,
         });
     }
+    // Here and not in `inspect_with`, because this is the single funnel through
+    // which a caller is handed a working connection -- both the fast path that
+    // finds a Current daemon and every arm that starts or recovers one end up
+    // here. Refusing further up would also make `gascan daemon status` unable to
+    // describe a daemon it is merely reporting on, which is the one command that
+    // should still be able to see it.
+    require_matching_backend(inspected.record.as_ref())?;
     let identity = inspected
         .status
         .identity
@@ -3388,6 +3514,7 @@ mod tests {
             start_identity: "start-identity".to_owned(),
             instance_token: "11".repeat(32),
             release_version: env!("CARGO_PKG_VERSION").to_owned(),
+            backend: "apple".to_owned(),
             started_at: InstanceTimestamp {
                 seconds: 1_785_263_800,
                 nanos: 123_000_000,
@@ -3429,7 +3556,7 @@ mod tests {
             .ok_or("controller diagnostic missing")?;
         assert!(matches!(
             error,
-            SupervisorError::ControllerStartup { code, message }
+            SupervisorError::DaemonStartup { code, message }
                 if code == "controller_state_unsafe"
                     && message == "application directory mode is unsafe"
         ));
@@ -3499,7 +3626,7 @@ mod tests {
         };
         assert!(matches!(
             error,
-            SupervisorError::ControllerStartup { ref code, ref message }
+            SupervisorError::DaemonStartup { ref code, ref message }
                 if code == "controller_state_unsafe"
                     && message == "trusted inherited descriptor"
         ));
@@ -4627,6 +4754,7 @@ mod tests {
                 start_identity: "spawned-start".to_owned(),
                 instance_token: "44".repeat(32),
                 release_version: self.release_version.clone(),
+                backend: "apple".to_owned(),
                 started_at: InstanceTimestamp {
                     seconds: 1_785_263_900,
                     nanos: 456_000_000,
@@ -4683,6 +4811,7 @@ mod tests {
                 start_identity: "delayed-publication-start".to_owned(),
                 instance_token: "45".repeat(32),
                 release_version: env!("CARGO_PKG_VERSION").to_owned(),
+                backend: "apple".to_owned(),
                 started_at: InstanceTimestamp {
                     seconds: 1_785_263_901,
                     nanos: 456_000_000,
@@ -4709,8 +4838,24 @@ mod tests {
             let gate = self.gate.clone();
             let publisher = std::thread::spawn(move || -> io::Result<()> {
                 gate.wait_for_connected_probe()?;
-                fs::write(&instance_path, serde_json::to_vec(&published)?)?;
-                fs::set_permissions(&instance_path, fs::Permissions::from_mode(0o600))
+                // **Staged and renamed, not written and then chmod-ed.**
+                // `fs::write` creates at the umask -- 0644 on a default CI
+                // runner -- so a write followed by `set_permissions` leaves a
+                // window in which the record exists at the final path with
+                // content and the wrong mode. The readiness loop polls that
+                // path, and `validate_file_stat` reports "mode is not 0600" as
+                // `Readiness { state: Unsafe }`, which is terminal. MEASURED:
+                // this test failed exactly that way on a `macos-26` runner
+                // while passing locally, because the window is a scheduling
+                // accident rather than anything the test means to exercise.
+                //
+                // The rename is atomic, so no observer sees a partially
+                // published record -- which is what the production publisher
+                // achieves by creating the file inert and chmod-ing it last.
+                let staged = instance_path.with_extension("publishing");
+                fs::write(&staged, serde_json::to_vec(&published)?)?;
+                fs::set_permissions(&staged, fs::Permissions::from_mode(0o600))?;
+                fs::rename(&staged, &instance_path)
             });
             *self
                 .publisher
@@ -5800,6 +5945,7 @@ mod tests {
                     .release_version
                     .clone()
                     .unwrap_or_else(|| "legacy".to_owned()),
+                backend: "apple".to_owned(),
                 started_at: identity.started_at.clone().unwrap_or(InstanceTimestamp {
                     seconds: 1,
                     nanos: 0,
@@ -6486,6 +6632,7 @@ mod tests {
                 start_identity: "replacement-start".to_owned(),
                 instance_token: "88".repeat(32),
                 release_version: env!("CARGO_PKG_VERSION").to_owned(),
+                backend: "apple".to_owned(),
                 started_at: InstanceTimestamp {
                     seconds: 1_785_264_000,
                     nanos: 789_000_000,
@@ -6606,6 +6753,97 @@ mod tests {
         assert_eq!(outcome.daemon.identity, endpoint_identity(&expected));
         assert!(spawner.launches()?.is_empty());
         assert_eq!(signaler.signals.load(AtomicOrdering::Acquire), 0);
+        Ok(())
+    }
+
+    /// **A daemon on another backend is refused, and neither stopped nor
+    /// reused.**
+    ///
+    /// The scenario is `GASCAN_ARCA_BACKEND=1 gascan up` followed by a plain
+    /// `gascan ps` inside the idle window. Everything about the running daemon
+    /// is healthy and current -- same executable, same process, a validated
+    /// connection -- so every other gate in this file passes it. The only thing
+    /// wrong is which runtime it drives, and before the record carried that,
+    /// nothing could tell.
+    ///
+    /// **The two negative assertions are the point.** Refusing is easy to get
+    /// right and easy to get right in the wrong way: routing this through
+    /// `DaemonState::Outdated`, which is what the version-skew path does, would
+    /// satisfy "the client does not talk to the wrong daemon" by STOPPING that
+    /// daemon and starting a replacement -- destroying sandboxes the user never
+    /// asked to lose. So the spawner must be untouched and the signaler must
+    /// never have fired.
+    #[tokio::test]
+    async fn a_daemon_on_another_backend_is_refused_and_left_running() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        let mut expected = record(&executable);
+        // The test process sets no backend environment, so this client expects
+        // Apple. The daemon says Arca.
+        expected.backend = "arca".to_owned();
+        write_record(&paths, &expected)?;
+        let inspector = MutableInspector::new(Some(process_for(&endpoint_identity(&expected))));
+        let endpoint = MutableEndpoint::new(connected(endpoint_identity(&expected)));
+        let spawner = FakeSpawner::current(endpoint.clone(), inspector.clone());
+        let signaler = NeverSignaler::default();
+
+        let outcome: Result<ConnectionOutcome<()>, SupervisorError> =
+            connect_current_or_recover_with(
+                &paths,
+                &executable,
+                &endpoint,
+                &inspector,
+                &spawner,
+                &signaler,
+                test_timeouts(),
+            )
+            .await;
+
+        let error = match outcome {
+            Err(error) => error,
+            Ok(_) => {
+                return Err("a daemon on another backend must not be connected to".into());
+            }
+        };
+        // The behavioural assertions come first so that a wrong implementation
+        // is reported by what it DID rather than by what it said. An
+        // implementation that classifies the mismatch as `Outdated` -- the
+        // shape reached for by copying the version-skew path beside it -- also
+        // ends in an error, so message assertions alone would call that a pass
+        // for the wrong reason.
+        //
+        // Stated honestly: neither of these two fired when that mutation was
+        // run against this fixture. `NeverSignaler` makes the recovery path
+        // fail before it can stop or spawn anything, so the mutation is caught
+        // one assertion further down, on the error type. They are kept because
+        // they pin the property that matters -- a mismatch must not destroy a
+        // running daemon -- against a fixture that could later grow a signaler
+        // which succeeds, and they cost nothing. They are not, today, what
+        // catches that mutation.
+        assert!(
+            spawner.launches()?.is_empty(),
+            "a backend mismatch must not start a second daemon"
+        );
+        assert_eq!(
+            signaler.signals.load(AtomicOrdering::Acquire),
+            0,
+            "a backend mismatch must not stop the daemon that is already running"
+        );
+
+        assert!(matches!(error, SupervisorError::BackendMismatch { .. }));
+        let message = error.to_string();
+        // Both names, because either alone leaves the user unable to act: the
+        // running backend without the expected one does not say what they asked
+        // for, and the expected one alone does not say what is already there.
+        assert!(
+            message.contains("arca"),
+            "the refusal must name the running backend: {message}"
+        );
+        assert!(
+            message.contains("apple"),
+            "the refusal must name the expected backend: {message}"
+        );
         Ok(())
     }
 

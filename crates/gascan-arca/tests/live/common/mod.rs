@@ -1,5 +1,11 @@
 use camino::{Utf8Path, Utf8PathBuf};
+// The OCI layout builders moved to `gascan-oci-fixture` when the
+// daemon-on-engine tier in `gascan-e2e` came to need exactly them, and neither
+// tier can import the other's `tests/` tree. Re-exported here under the names
+// this tier already uses, so the move is not also a rename at fifteen call
+// sites.
 use gascan_arca::ChannelTransport;
+pub use gascan_oci_fixture::{layout_running, layout_running_with_directories};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -13,11 +19,116 @@ static SOCKET_SEQUENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::Atomic
 /// directory has an owner from the moment it is created: `start()` can still
 /// panic on the `sun_path` assert or on a failed spawn, and those unwind
 /// through this rather than leaving an orphan under `/tmp`.
-struct SocketRoot(Utf8PathBuf);
+pub struct SocketRoot(Utf8PathBuf);
+
+impl SocketRoot {
+    /// A fresh root under `/tmp`, distinct from every other one this process
+    /// has made.
+    ///
+    /// The socket does NOT live under a `TempDir`, and that is deliberate.
+    /// `sun_path` is capped at 103 bytes (swift-nio asserts it explicitly in
+    /// `NIOCore/SocketAddresses.swift`), and macOS temp dirs are
+    /// `/var/folders/<...>/T/<...>` -- a measured path came to 74 bytes, which
+    /// fits but leaves little room. Arca's own tests hit this exact wall during
+    /// Task 7 and had to move to `/tmp`.
+    pub fn fresh() -> Self {
+        let path = Utf8PathBuf::from(format!(
+            "/tmp/gascan-arca-live-{}-{}",
+            std::process::id(),
+            SOCKET_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        // `create_dir`, not `create_dir_all`: this must fail if the directory
+        // already exists. An interrupted run leaves one behind, and a recycled
+        // pid would otherwise adopt it -- along with a stale `engine.sock` that
+        // makes the bind fail. Say which of those happened.
+        std::fs::create_dir(&path)
+            .unwrap_or_else(|error| panic!("could not create socket root {path}: {error}"));
+        Self(path)
+    }
+
+    /// The socket path inside this root, asserted to fit `sun_path`.
+    ///
+    /// The assertion is here rather than at the callers so a path that meets
+    /// the cap says so, rather than arriving as a mystery bind failure.
+    pub fn socket(&self) -> Utf8PathBuf {
+        let socket = self.0.join("engine.sock");
+        assert!(
+            socket.as_str().len() <= 103,
+            "socket path is {} bytes, over sun_path's 103-byte cap: {socket}",
+            socket.as_str().len()
+        );
+        socket
+    }
+}
 
 impl Drop for SocketRoot {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The three paths named by the environment that any engine in this tier needs.
+///
+/// One type rather than three `required_path` calls per spawn site, because
+/// there are two such sites now -- [`LiveEngine::start_with_images`] and the
+/// forced startup instrument -- and a second copy of the three variable names
+/// and their directives is a second thing to keep in step with the engine's
+/// options.
+pub struct EngineInputs {
+    /// `GASCAN_ARCA_ENGINE_BIN`.
+    pub binary: String,
+    /// `GASCAN_ARCA_KERNEL_PATH`.
+    pub kernel: String,
+    /// `GASCAN_ARCA_VMINIT_LAYOUT`.
+    pub vminit: String,
+}
+
+impl EngineInputs {
+    pub fn from_environment() -> Self {
+        Self {
+            binary: required_path(
+                "GASCAN_ARCA_ENGINE_BIN",
+                "a built arca-engine",
+                "run scripts/build-arca-engine.sh and use its second output line",
+            ),
+            kernel: required_path(
+                "GASCAN_ARCA_KERNEL_PATH",
+                "the vmlinux the engine boots guests with",
+                "an installed Arca.app carries one at \
+                 Contents/Resources/vmlinux; ~/.arca/vmlinux symlinks it",
+            ),
+            vminit: required_path(
+                "GASCAN_ARCA_VMINIT_LAYOUT",
+                "an OCI layout holding arca-vminit:latest",
+                "an installed Arca.app populates ~/.arca/vminit",
+            ),
+        }
+    }
+
+    /// The `serve` invocation Gas Can ships: all four options, none defaulted.
+    ///
+    /// The engine made `--kernel-path` and `--vminit-layout` required when it
+    /// took ownership of its own state root, and a tier passing only the first
+    /// two spawns nothing: MEASURED against the branch binary as `Missing
+    /// expected argument '--kernel-path'`, exit 64. Every live test here was
+    /// `#[ignore]`d, so nothing ran them and nothing noticed -- a tier that
+    /// cannot start its subject and a tier nobody runs look identical from
+    /// outside.
+    pub fn serve_arguments<'a>(
+        &'a self,
+        socket: &'a Utf8Path,
+        state: &'a Utf8Path,
+    ) -> Vec<&'a str> {
+        vec![
+            "--socket-path",
+            socket.as_str(),
+            "--state-root",
+            state.as_str(),
+            "--kernel-path",
+            &self.kernel,
+            "--vminit-layout",
+            &self.vminit,
+        ]
     }
 }
 
@@ -144,8 +255,76 @@ pub struct LiveEngine {
     /// under, mapped to the digest the STORE recorded rather than the one the
     /// layout carried. See [`LiveEngine::image`].
     images: BTreeMap<String, String>,
+    /// The task draining this engine's own stdout and stderr. See [`Diagnostics`].
+    diagnostics: tokio::task::JoinHandle<String>,
     _socket_root: SocketRoot,
     _root: tempfile::TempDir,
+}
+
+/// How one engine ended, and what it said on the way.
+///
+/// **The status alone cannot say WHY an engine exited non-zero, and until this
+/// type existed nothing here could.** `arca-engine` has exactly two deliberate
+/// failure exits, both `EXIT_FAILURE` and so both `exit status: 1` from outside:
+/// a drain that ran out of its ten-second grace, and a listening socket that
+/// closed with no shutdown requested (Arca's `ArcaEngineCommand.releaseAndExit`
+/// callers). They are different defects with different fixes and the byte does
+/// not distinguish them -- but each logs its own line first, and those lines are
+/// what [`Diagnostics`] carries here.
+pub struct EngineExit {
+    pub status: std::process::ExitStatus,
+    /// Everything the engine wrote to stdout and stderr over its whole life.
+    ///
+    /// Both streams because the two things worth reading arrive on different
+    /// ones: swift-log's default handler writes the engine's own lines to
+    /// stdout, and a Swift crash trace -- the exit-133 abort this tier already
+    /// reasons about -- goes to stderr.
+    pub diagnostics: String,
+    /// How long the engine took from its pipe closing to being reaped.
+    ///
+    /// **Recorded because the grace period is a deadline and a status byte only
+    /// says whether it was missed.** A run whose slowest shutdown is
+    /// milliseconds has orders of magnitude of headroom; one whose slowest is
+    /// 9.9s is a green that was about to go red, and the two are
+    /// indistinguishable from `ExitStatus::success` alone.
+    pub took: Duration,
+}
+
+/// Reads a child's stdout and stderr to EOF, interleaved as they arrive.
+///
+/// **A reader task rather than a read after `wait`, because the pipe is a
+/// bounded buffer.** An engine that wrote more than a pipeful with nothing
+/// draining it would block in `write` forever, and the test waiting for it would
+/// hang rather than fail -- a deadlock introduced into every test in this tier
+/// by a helper meant only to explain failures in one of them.
+///
+/// The two streams are concatenated in arrival order per stream and not
+/// globally, which is enough for what reads this: the engine's own log lines are
+/// all on stdout, so their order among themselves is preserved.
+struct Diagnostics;
+
+impl Diagnostics {
+    /// Takes both pipes off `child` and drains them until the engine is gone.
+    fn draining(child: &mut tokio::process::Child) -> tokio::task::JoinHandle<String> {
+        use tokio::io::AsyncReadExt as _;
+
+        let mut out = child.stdout.take().expect("the engine's stdout is piped");
+        let mut err = child.stderr.take().expect("the engine's stderr is piped");
+        tokio::spawn(async move {
+            let mut spoken = Vec::new();
+            let mut shouted = Vec::new();
+            // Concurrently, so neither pipe can fill while the other is being
+            // read: reading one to EOF first is the same deadlock this type
+            // exists to avoid, one stream along.
+            let (spoke, shouted_result) =
+                tokio::join!(out.read_to_end(&mut spoken), err.read_to_end(&mut shouted));
+            spoke.expect("reading the engine's stdout must succeed");
+            shouted_result.expect("reading the engine's stderr must succeed");
+            let mut both = String::from_utf8_lossy(&spoken).into_owned();
+            both.push_str(&String::from_utf8_lossy(&shouted));
+            both
+        })
+    }
 }
 
 impl LiveEngine {
@@ -166,86 +345,32 @@ impl LiveEngine {
     /// no VM and needs no kernel, so the store is seeded by running the same
     /// binary to completion **before** the server is spawned.
     pub async fn start_with_images(layouts: &[&Utf8Path]) -> Self {
-        let binary = required_path(
-            "GASCAN_ARCA_ENGINE_BIN",
-            "a built arca-engine",
-            "run scripts/build-arca-engine.sh and use its second output line",
-        );
-        let kernel = required_path(
-            "GASCAN_ARCA_KERNEL_PATH",
-            "the vmlinux the engine boots guests with",
-            "an installed Arca.app carries one at \
-             Contents/Resources/vmlinux; ~/.arca/vmlinux symlinks it",
-        );
-        let vminit = required_path(
-            "GASCAN_ARCA_VMINIT_LAYOUT",
-            "an OCI layout holding arca-vminit:latest",
-            "an installed Arca.app populates ~/.arca/vminit",
-        );
+        let inputs = EngineInputs::from_environment();
         let root = tempfile::tempdir().unwrap();
         let path = Utf8Path::from_path(root.path()).unwrap().to_owned();
         let state = path.join("state");
         std::fs::create_dir_all(&state).unwrap();
 
         for layout in layouts {
-            load_image(&binary, &state, layout).await;
+            gascan_oci_fixture::load_image(&inputs.binary, &state, layout);
         }
-        let images = stored_images(&state);
+        let images = gascan_oci_fixture::stored_images(&state);
 
-        // The socket does NOT live under the temp dir, and that is deliberate.
-        // `sun_path` is capped at 103 bytes (swift-nio asserts it explicitly in
-        // NIOCore/SocketAddresses.swift), and macOS temp dirs are
-        // /var/folders/<...>/T/<...> -- a measured path came to 74 bytes, which
-        // fits but leaves little room. Arca's own tests hit this exact wall
-        // during Task 7 and had to move to /tmp. Build the socket path under a
-        // short root and assert the length rather than meeting the cap as a
-        // mystery bind failure.
-        let socket_root = Utf8PathBuf::from(format!(
-            "/tmp/gascan-arca-live-{}-{}",
-            std::process::id(),
-            SOCKET_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        // `create_dir`, not `create_dir_all`: this must fail if the directory
-        // already exists. An interrupted run leaves one behind, and a recycled
-        // pid would otherwise adopt it -- along with a stale `engine.sock` that
-        // makes the bind fail. Say which of those happened.
-        std::fs::create_dir(&socket_root)
-            .unwrap_or_else(|error| panic!("could not create socket root {socket_root}: {error}"));
-        let socket_root = SocketRoot(socket_root);
-        let socket = socket_root.0.join("engine.sock");
-        assert!(
-            socket.as_str().len() <= 103,
-            "socket path is {} bytes, over sun_path's 103-byte cap: {socket}",
-            socket.as_str().len()
-        );
+        let socket_root = SocketRoot::fresh();
+        let socket = socket_root.socket();
 
-        // All four options, none defaulted. The engine made `--kernel-path` and
-        // `--vminit-layout` required when it took ownership of its own state
-        // root, and a tier passing only the first two spawns nothing: MEASURED
-        // against the branch binary as `Missing expected argument
-        // '--kernel-path'`, exit 64. Every live test here was `#[ignore]`d, so
-        // nothing ran them and nothing noticed -- a tier that cannot start its
-        // subject and a tier nobody runs look identical from outside.
-        let child = supervised(
-            &binary,
-            &[
-                "--socket-path",
-                socket.as_str(),
-                "--state-root",
-                state.as_str(),
-                "--kernel-path",
-                &kernel,
-                "--vminit-layout",
-                &vminit,
-            ],
-        )
-        .spawn()
-        .unwrap_or_else(|error| panic!("could not spawn {binary}: {error}"));
+        let mut child = supervised(&inputs.binary, &inputs.serve_arguments(&socket, &state))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|error| panic!("could not spawn {}: {error}", inputs.binary));
+        let diagnostics = Diagnostics::draining(&mut child);
 
         let mut engine = Self {
             child,
             socket,
             images,
+            diagnostics,
             _socket_root: socket_root,
             _root: root,
         };
@@ -255,21 +380,10 @@ impl LiveEngine {
 
     /// The immutable reference naming what the store holds under `tag`.
     ///
-    /// **THE DIGEST A REQUEST MUST NAME IS THE STORE'S, NOT THE LAYOUT'S.** The
-    /// store re-wraps what it ingests: a layout whose `index.json` carries
-    /// manifest `sha256:45e09956…` is recorded in
-    /// `<state-root>/images/state.json` as an image *index* under
-    /// `sha256:a019d0ba…`. A test that derived the digest from the layout it
-    /// loaded would name content the engine does not hold, and hear
-    /// `not_found` from a store that has the image.
+    /// The store's digest and not the layout's, for the reason
+    /// [`gascan_oci_fixture::stored_image_reference`] records.
     pub fn image(&self, tag: &str) -> String {
-        let digest = self.images.get(tag).unwrap_or_else(|| {
-            panic!(
-                "the engine's store holds no image tagged {tag}; it holds {:?}",
-                self.images.keys().collect::<Vec<_>>()
-            )
-        });
-        format!("{}@{digest}", repository_of(tag))
+        gascan_oci_fixture::stored_image_reference(&self.images, tag)
     }
 
     /// Waits for the socket to appear, then for a connection to succeed.
@@ -320,6 +434,16 @@ impl LiveEngine {
         }
     }
 
+    /// The path this engine is listening on.
+    ///
+    /// Exposed so a test can dial the engine as something other than a gRPC
+    /// client. Everything in this tier that speaks the protocol goes through
+    /// [`Self::transport`]; what needs this is the case that deliberately does
+    /// NOT speak it.
+    pub fn socket(&self) -> &Utf8Path {
+        &self.socket
+    }
+
     pub async fn transport(&self) -> ChannelTransport {
         ChannelTransport::connect(self.socket.as_std_path().to_owned())
             .await
@@ -357,13 +481,16 @@ impl LiveEngine {
     /// `await_socket`'s `try_wait()`, and both of those paths are exercised.
     pub async fn kill(self) {
         let socket = self.socket.clone();
-        let status = self.stop().await;
+        let exit = self.stop().await;
         assert!(
-            status.success(),
-            "the engine on {socket} exited with {status} rather than cleanly. \
+            exit.status.success(),
+            "the engine on {socket} exited with {} rather than cleanly, after {:.2}s. \
              Exit 133 is `Trace/BPT trap: 5` -- the graceful-shutdown abort; run \
              `shutdown::the_engine_exits_cleanly_after_a_container_has_been_created` \
-             to see it as a rate rather than as one sample"
+             to see it as a rate rather than as one sample. The engine said:\n{}",
+            exit.status,
+            exit.took.as_secs_f64(),
+            exit.diagnostics,
         );
     }
 
@@ -379,10 +506,15 @@ impl LiveEngine {
     /// The status is the engine's own and not the wrapper's: [`SUPERVISOR`]
     /// ends `wait "$enginepid"; status=$?; ...; exit "$status"`, so an engine
     /// killed by a signal arrives here as the shell's `128 + signo`.
-    pub async fn stop(mut self) -> std::process::ExitStatus {
+    ///
+    /// The diagnostics are collected AFTER the wait, because the reader task
+    /// ends when both pipes reach EOF and they reach it when the last process
+    /// holding the write end is gone.
+    pub async fn stop(mut self) -> EngineExit {
+        let signalled = std::time::Instant::now();
         drop(self.child.stdin.take());
         let stopped = tokio::time::timeout(Duration::from_secs(30), self.child.wait()).await;
-        match stopped {
+        let status = match stopped {
             Ok(Ok(status)) => status,
             Ok(Err(error)) => panic!("could not wait on the engine supervisor: {error}"),
             // The wrapper is still up 30s after the pipe closed, so its watcher
@@ -392,74 +524,17 @@ impl LiveEngine {
                 "the engine supervisor for {} did not exit within 30s of its pipe closing",
                 self.socket
             ),
+        };
+        let took = signalled.elapsed();
+        let diagnostics = self
+            .diagnostics
+            .await
+            .expect("the task draining the engine's output must not panic");
+        EngineExit {
+            status,
+            diagnostics,
+            took,
         }
-    }
-}
-
-/// Seeds one OCI layout into an engine state root, before any engine serves it.
-///
-/// Failure is a panic carrying the subcommand's own output: a test whose store
-/// is empty fails later as a `not_found` from `Create`, which reads as an
-/// engine defect and is not one.
-async fn load_image(binary: &str, state: &Utf8Path, layout: &Utf8Path) {
-    let output = tokio::process::Command::new(binary)
-        .arg("image")
-        .arg("load")
-        .arg("--state-root")
-        .arg(state.as_str())
-        .arg("--oci-layout")
-        .arg(layout.as_str())
-        .output()
-        .await
-        .unwrap_or_else(|error| panic!("could not run {binary} image load: {error}"));
-    assert!(
-        output.status.success(),
-        "{binary} image load --state-root {state} --oci-layout {layout} exited with {}\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr),
-    );
-}
-
-/// Every tag the engine's own image store records, mapped to its digest.
-///
-/// Read from the store rather than from the layout, for the reason
-/// [`LiveEngine::image`] records. An absent file is an empty store, which is
-/// what an engine started with no layouts has.
-fn stored_images(state: &Utf8Path) -> BTreeMap<String, String> {
-    let path = state.join("images").join("state.json");
-    let Ok(source) = std::fs::read_to_string(&path) else {
-        return BTreeMap::new();
-    };
-    let parsed: BTreeMap<String, serde_json::Value> = serde_json::from_str(&source)
-        .unwrap_or_else(|error| panic!("could not parse the engine's image store {path}: {error}"));
-    parsed
-        .into_iter()
-        .map(|(tag, descriptor)| {
-            let digest = descriptor
-                .get("digest")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_else(|| panic!("{path} records {tag} with no digest: {descriptor}"))
-                .to_owned();
-            (tag, digest)
-        })
-        .collect()
-}
-
-/// The repository half of a reference, split the way both sides of the wire do.
-///
-/// The rule is `immutable_image_identity`'s
-/// (`crates/gascan-core/src/runtime.rs`), mirrored by Arca's
-/// `ImageIdentity.repository(of:)`: drop anything from `@sha256:` onward, then
-/// drop a tag -- the last `:` that comes *after* the last `/`, so the port in
-/// `registry.example:5000/repo` is not mistaken for one. `heldImageReferences`
-/// compares the request's repository against the store's, so a split that
-/// disagreed with Arca's would be refused as `not_found` for content the
-/// engine holds.
-fn repository_of(reference: &str) -> &str {
-    let reference = reference.split_once("@sha256:").map_or(reference, |a| a.0);
-    match reference.rfind(':') {
-        Some(colon) if !reference[colon..].contains('/') => &reference[..colon],
-        _ => reference,
     }
 }
 
@@ -711,301 +786,4 @@ pub fn retained_for(
         ));
     }
     retained
-}
-
-/// A one-image OCI layout that runs `command`, written beside a base layout.
-///
-/// **`CreateRequest` carries no argv, so this is the only way the tier can
-/// decide what a sandbox runs.** `engine.proto`'s `CreateRequest` has no
-/// command and no entrypoint field, and `SandboxEngineService` passes
-/// `entrypoint: nil, command: nil` deliberately -- the image's own config
-/// decides. The environment is no way in either: `policy.rs` sets it from
-/// `guest_environment()`, a fixed map with no manifest passthrough. So
-/// `gascan-apple`'s `guest_argv` technique does not transfer at all, and the
-/// published-port test's responder has to be baked into an image. The port it
-/// listens on is therefore known only at image-build time, which is why the
-/// image is built during the test rather than prepared by a maintainer.
-///
-/// This is not an image builder. It reuses the base layout's layers verbatim
-/// and writes three small blobs: a config with a new `Cmd`, a manifest naming
-/// that config, and an index naming that manifest under `tag`. The rootfs is
-/// untouched, so the `diff_ids` still describe it.
-///
-/// The base layout's `index.json` must name exactly one manifest. Anything
-/// else would make "which image is this derived from" a choice this function
-/// would have to guess at.
-pub fn layout_running(
-    base: &Utf8Path,
-    destination: &Utf8Path,
-    tag: &str,
-    command: &[&str],
-) -> Utf8PathBuf {
-    layout_running_with_directories(base, destination, tag, command, &[])
-}
-
-/// The same, with a layer of its own creating each of `directories`.
-///
-/// **A mount target that does not exist in the image is not mounted, and
-/// nothing says so.** MEASURED against this engine: a sandbox whose three
-/// managed volumes target `/home/workspace/.local`, `.cache` and `.config` on a
-/// stock alpine rootfs starts successfully, `Inspect` reports it running, and
-/// the guest's `/proc/partitions` shows all three block devices attached at
-/// exactly their declared sizes -- `vdd` 262144 blocks, `vde` 524288, `vdf`
-/// 1048576 -- while `/proc/mounts` lists none of them and `/home` is empty. The
-/// engine logs no warning. `/workspace` mounts on the same guest, so the
-/// difference is the depth: `/workspace` needs one directory under `/` and
-/// `/home/workspace/.local` needs two under an existing `/home`.
-///
-/// The production workspace image creates all three
-/// (`images/workspace/Dockerfile:142-143`), so this is what the tier needs to
-/// resemble it. Ancestors are derived rather than demanded from the caller: a
-/// list that named a leaf and forgot its parent would reproduce the very
-/// failure this exists to remove.
-pub fn layout_running_with_directories(
-    base: &Utf8Path,
-    destination: &Utf8Path,
-    tag: &str,
-    command: &[&str],
-    directories: &[&str],
-) -> Utf8PathBuf {
-    use serde_json::{Value, json};
-
-    copy_tree(base, destination);
-
-    let index: Value = read_json(&destination.join("index.json"));
-    let manifests = index["manifests"]
-        .as_array()
-        .unwrap_or_else(|| panic!("{base}/index.json has no manifests array"));
-    assert_eq!(
-        manifests.len(),
-        1,
-        "{base}/index.json must name exactly one manifest; it names {}",
-        manifests.len()
-    );
-    let mut manifest: Value = read_json(&blob_path(destination, digest_of(&manifests[0])));
-    let mut config: Value = read_json(&blob_path(destination, digest_of(&manifest["config"])));
-
-    // `Entrypoint` is cleared as well as `Cmd` being set. A base image that
-    // carried one would prepend it to the command below, and the responder
-    // would run as arguments to something else.
-    config["config"]["Cmd"] = json!(command);
-    config["config"]["Entrypoint"] = Value::Null;
-
-    if !directories.is_empty() {
-        // The layer goes on top, and `diff_ids` is appended in the same
-        // position: the two lists are parallel by ordinal, so a layer added to
-        // one and not the other describes a rootfs the image does not have.
-        let archive = directory_archive(directories);
-        let diff_id = format!(
-            "sha256:{:x}",
-            <sha2::Sha256 as sha2::Digest>::digest(&archive)
-        );
-        let compressed = gzip(&archive);
-        let digest = write_bytes(destination, &compressed);
-        manifest["layers"]
-            .as_array_mut()
-            .unwrap_or_else(|| panic!("{base}'s manifest has no layers array"))
-            .push(json!({
-                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
-                "digest": digest,
-                "size": compressed.len(),
-            }));
-        config["rootfs"]["diff_ids"]
-            .as_array_mut()
-            .unwrap_or_else(|| panic!("{base}'s config has no rootfs.diff_ids array"))
-            .push(json!(diff_id));
-    }
-
-    let config_blob = write_blob(destination, &config);
-    manifest["config"]["digest"] = json!(config_blob.0);
-    manifest["config"]["size"] = json!(config_blob.1);
-    let manifest_blob = write_blob(destination, &manifest);
-
-    std::fs::write(
-        destination.join("index.json"),
-        serde_json::to_vec(&json!({
-            "schemaVersion": 2,
-            "mediaType": "application/vnd.oci.image.index.v1+json",
-            "manifests": [{
-                "mediaType": manifest["mediaType"],
-                "digest": manifest_blob.0,
-                "size": manifest_blob.1,
-                "annotations": { "org.opencontainers.image.ref.name": tag },
-            }],
-        }))
-        .expect("an index serialises"),
-    )
-    .unwrap_or_else(|error| panic!("could not write {destination}/index.json: {error}"));
-    destination.to_owned()
-}
-
-/// A POSIX `ustar` archive holding `directories` and every ancestor of each.
-///
-/// Written by hand rather than with a crate, and it is 40 lines because a
-/// directory entry is a header and no data at all. The alternative was a
-/// `tar` dependency for the one thing this tier needs from it, or shelling out
-/// to the host's `tar` -- which on macOS writes AppleDouble entries into the
-/// archive unless told not to, and would put a host tool's defaults inside the
-/// image under test.
-///
-/// Mode 0755 and root ownership, which is what the workspace image gives these
-/// same three directories before it hands two of them to the `workspace` group
-/// (`images/workspace/Dockerfile:142-143`). The tier's guests run as root, so
-/// nothing here needs the finer ownership and asserting it would be asserting
-/// against a fixture.
-fn directory_archive(directories: &[&str]) -> Vec<u8> {
-    let mut names: Vec<String> = Vec::new();
-    for directory in directories {
-        let mut ancestor = String::new();
-        for component in directory.trim_matches('/').split('/') {
-            ancestor.push_str(component);
-            ancestor.push('/');
-            if !names.contains(&ancestor) {
-                names.push(ancestor.clone());
-            }
-        }
-    }
-
-    let mut archive = Vec::new();
-    for name in &names {
-        let mut header = [0_u8; 512];
-        assert!(
-            name.len() < 100,
-            "{name} does not fit a ustar header's 100-byte name field"
-        );
-        header[..name.len()].copy_from_slice(name.as_bytes());
-        // Every numeric field is octal, NUL-terminated, and zero-padded to one
-        // less than its width. `chksum` is the exception: it is spaces while
-        // the sum is taken, then six digits, a NUL and a space.
-        header[100..108].copy_from_slice(b"0000755\0"); // mode
-        header[108..116].copy_from_slice(b"0000000\0"); // uid
-        header[116..124].copy_from_slice(b"0000000\0"); // gid
-        header[124..136].copy_from_slice(b"00000000000\0"); // size
-        header[136..148].copy_from_slice(b"00000000000\0"); // mtime
-        header[148..156].copy_from_slice(b"        "); // chksum, while summing
-        header[156] = b'5'; // typeflag: directory
-        header[257..263].copy_from_slice(b"ustar\0");
-        header[263..265].copy_from_slice(b"00");
-        header[265..269].copy_from_slice(b"root");
-        header[297..301].copy_from_slice(b"root");
-        let sum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
-        let checksum = format!("{sum:06o}\0 ");
-        header[148..156].copy_from_slice(checksum.as_bytes());
-        archive.extend_from_slice(&header);
-    }
-    // Two zero blocks end the archive, then the whole thing is padded to a
-    // 10240-byte record. Both are what `tar` itself writes.
-    archive.extend_from_slice(&[0_u8; 1024]);
-    archive.resize(archive.len().div_ceil(10240) * 10240, 0);
-    archive
-}
-
-/// `data` in gzip form, with every deflate block stored rather than compressed.
-///
-/// A stored block is the one deflate encoding that needs no compressor: five
-/// bytes of header and the bytes themselves. The layer this wraps is a few
-/// kilobytes of mostly zeroes, so the size costs nothing, and the media type
-/// the manifest declares is the same `tar+gzip` the base layout's own layer
-/// carries -- the unpacker takes exactly the path it already takes.
-fn gzip(data: &[u8]) -> Vec<u8> {
-    // Magic, deflate, no flags, no mtime, no extra flags, unix.
-    let mut out = vec![0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0x03];
-    let mut chunks = data.chunks(0xffff).peekable();
-    if data.is_empty() {
-        out.extend_from_slice(&[0x01, 0, 0, 0xff, 0xff]);
-    }
-    while let Some(chunk) = chunks.next() {
-        let length = u16::try_from(chunk.len()).expect("a chunk is at most 0xffff bytes");
-        out.push(u8::from(chunks.peek().is_none())); // BFINAL, BTYPE = stored
-        out.extend_from_slice(&length.to_le_bytes());
-        out.extend_from_slice(&(!length).to_le_bytes());
-        out.extend_from_slice(chunk);
-    }
-    out.extend_from_slice(&crc32(data).to_le_bytes());
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "gzip's ISIZE is defined as the length modulo 2^32"
-    )]
-    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-    out
-}
-
-/// The CRC-32 gzip's trailer carries, computed a bit at a time.
-///
-/// No table: this runs over a few kilobytes once per test, and a table would be
-/// a second thing to get right.
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffff_u32;
-    for byte in data {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            crc = if crc & 1 == 1 {
-                (crc >> 1) ^ 0xedb8_8320
-            } else {
-                crc >> 1
-            };
-        }
-    }
-    !crc
-}
-
-fn digest_of(descriptor: &serde_json::Value) -> &str {
-    descriptor["digest"]
-        .as_str()
-        .unwrap_or_else(|| panic!("an OCI descriptor with no digest: {descriptor}"))
-}
-
-fn blob_path(layout: &Utf8Path, digest: &str) -> Utf8PathBuf {
-    let (algorithm, hex) = digest
-        .split_once(':')
-        .unwrap_or_else(|| panic!("{digest} is not an OCI digest"));
-    layout.join("blobs").join(algorithm).join(hex)
-}
-
-fn read_json(path: &Utf8Path) -> serde_json::Value {
-    let source =
-        std::fs::read(path).unwrap_or_else(|error| panic!("could not read {path}: {error}"));
-    serde_json::from_slice(&source)
-        .unwrap_or_else(|error| panic!("could not parse {path} as json: {error}"))
-}
-
-/// Writes `value` as a content-addressed blob, returning its digest and size.
-///
-/// The bytes that are hashed are the bytes that are written -- one
-/// serialisation, used for both -- because a digest taken over a second
-/// rendering would name content the layout does not contain, and the engine
-/// verifies blobs it loads.
-fn write_blob(layout: &Utf8Path, value: &serde_json::Value) -> (String, usize) {
-    let bytes = serde_json::to_vec(value).expect("a blob serialises");
-    let digest = write_bytes(layout, &bytes);
-    (digest, bytes.len())
-}
-
-/// Writes `bytes` under their own digest, and returns it.
-fn write_bytes(layout: &Utf8Path, bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-
-    let digest = format!("sha256:{:x}", Sha256::digest(bytes));
-    let path = blob_path(layout, &digest);
-    std::fs::write(&path, bytes).unwrap_or_else(|error| panic!("could not write {path}: {error}"));
-    digest
-}
-
-fn copy_tree(from: &Utf8Path, to: &Utf8Path) {
-    std::fs::create_dir_all(to).unwrap_or_else(|error| panic!("could not create {to}: {error}"));
-    let entries = std::fs::read_dir(from)
-        .unwrap_or_else(|error| panic!("could not read the base layout {from}: {error}"));
-    for entry in entries {
-        let entry = entry.expect("a directory entry");
-        let name = entry.file_name();
-        let name = name.to_str().expect("a utf-8 layout entry name");
-        let source = from.join(name);
-        let target = to.join(name);
-        if entry.file_type().expect("a file type").is_dir() {
-            copy_tree(&source, &target);
-        } else {
-            std::fs::copy(&source, &target)
-                .unwrap_or_else(|error| panic!("could not copy {source} to {target}: {error}"));
-        }
-    }
 }

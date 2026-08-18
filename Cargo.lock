@@ -455,6 +455,7 @@ name = "gascan"
 version = "0.1.20"
 dependencies = [
  "base64",
+ "camino",
  "clap",
  "command-fds",
  "console",
@@ -469,6 +470,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "sha2",
  "signal-hook",
  "tempfile",
  "tokio",
@@ -502,6 +504,7 @@ dependencies = [
  "camino",
  "gascan-core",
  "gascan-engine-proto",
+ "gascan-oci-fixture",
  "hyper-util",
  "prost",
  "rustix",
@@ -523,6 +526,7 @@ dependencies = [
  "base64",
  "camino",
  "nix",
+ "plist",
  "rustix",
  "serde",
  "serde_json",
@@ -544,8 +548,10 @@ dependencies = [
  "console",
  "gascan",
  "gascan-apple",
+ "gascan-arca",
  "gascan-core",
  "gascan-inherited-fd",
+ "gascan-oci-fixture",
  "gascan-proto",
  "gascand",
  "hyper-util",
@@ -581,6 +587,17 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "rustix",
+ "tempfile",
+]
+
+[[package]]
+name = "gascan-oci-fixture"
+version = "0.1.20"
+dependencies = [
+ "camino",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -604,6 +621,7 @@ dependencies = [
  "camino",
  "command-fds",
  "gascan-apple",
+ "gascan-arca",
  "gascan-core",
  "gascan-inherited-fd",
  "gascan-proto",
@@ -611,7 +629,6 @@ dependencies = [
  "http-body-util",
  "hyper-util",
  "nix",
- "plist",
  "prost",
  "prost-types",
  "rusqlite",

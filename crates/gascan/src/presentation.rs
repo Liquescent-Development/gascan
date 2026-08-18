@@ -967,7 +967,8 @@ mod tests {
 
     #[test]
     fn passing_ssh_doctor_facts_are_compact_and_hide_success_details() {
-        let report = gascan_core::doctor::DoctorFacts::all_supported_for_tests().into_report();
+        let report = gascan_core::doctor::DoctorFacts::all_supported_for_tests()
+            .into_report(&gascan_core::doctor::AppleRemedies);
         let checks = report
             .checks
             .into_iter()

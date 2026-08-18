@@ -61,11 +61,20 @@ jq -e --arg revision "$expected_revision" --arg version "$expected_version" '
     source_revision: $revision,
     version: $version
   } and
-  (.engine | keys == ["name", "revision", "tag", "url"]) and
+  (.engine | keys == ["artifacts", "name", "revision", "tag", "url"]) and
   (.engine.name | type == "string" and length > 0) and
   (.engine.url | startswith("https://")) and
   (.engine.tag | type == "string" and length > 0) and
   (.engine.revision | test("^[0-9a-f]{40}$")) and
+  (.engine.artifacts | keys == ["kernel", "vminit"]) and
+  all(.engine.artifacts[];
+    (.asset | test("^[A-Za-z0-9._-]+$")) and
+    (.url | startswith("https://")) and
+    (.bytes | type == "number" and . > 0) and
+    (.sha256 | test("^[0-9a-f]{64}$")) and
+    (.content.kind | . == "gzip-member" or . == "oci-manifest") and
+    (.content.bytes | type == "number" and . > 0) and
+    (.content.sha256 | test("^[0-9a-f]{64}$"))) and
   (.files | map(.path) == ["usr/local/bin/gascan", "usr/local/bin/gascan-apple-attach", "usr/local/bin/gascand"]) and
   all(.files[]; (.sha256 | test("^[0-9a-f]{64}$")))
 ' "$manifest" >/dev/null || { printf 'build manifest is invalid\n' >&2; exit 65; }

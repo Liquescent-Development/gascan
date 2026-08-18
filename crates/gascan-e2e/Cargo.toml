@@ -19,6 +19,9 @@ clap.workspace = true
 console.workspace = true
 gascan-core = { path = "../gascan-core" }
 gascan-apple = { path = "../gascan-apple" }
+# The e2e daemon binary is built from ../gascand/src/main.rs, so it needs every
+# crate that file names -- including the Arca backend arm.
+gascan-arca = { path = "../gascan-arca" }
 gascan-proto = { path = "../gascan-proto" }
 gascan = { path = "../gascan" }
 gascan-inherited-fd.workspace = true
@@ -36,6 +39,7 @@ tower.workspace = true
 
 [dev-dependencies]
 camino.workspace = true
+gascan-oci-fixture.workspace = true
 command-fds.workspace = true
 serde.workspace = true
 tempfile = "3"

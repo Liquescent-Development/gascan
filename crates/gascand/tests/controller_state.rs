@@ -1,3 +1,4 @@
+use gascan_core::backend::BackendSelection;
 use gascand::{
     ControllerStatePaths, MigrationFault, Store, open_controller_store,
     open_controller_store_with_fault,
@@ -34,6 +35,7 @@ impl ControllerFixture {
             &home,
             &runtime,
             rustix::process::geteuid().as_raw(),
+            BackendSelection::Apple,
         )?;
         Ok(Self {
             _temp: temp,
@@ -41,6 +43,12 @@ impl ControllerFixture {
             runtime,
             paths,
         })
+    }
+
+    fn legacy_database(&self) -> &Path {
+        self.paths
+            .legacy_database()
+            .expect("the shared scope always has a legacy database")
     }
 
     fn controller_directory(&self) -> PathBuf {
@@ -76,7 +84,7 @@ impl ControllerFixture {
 
     fn capture_active_files(&self) -> Result<BTreeMap<PathBuf, Vec<u8>>, std::io::Error> {
         let mut files = BTreeMap::new();
-        for database in [self.paths.durable_database(), self.paths.legacy_database()] {
+        for database in [self.paths.durable_database(), self.legacy_database()] {
             for path in active_database_files(database) {
                 if path.exists() {
                     let contents = fs::read(&path)?;
@@ -98,7 +106,7 @@ fn default_paths_split_durable_state_from_runtime_ipc() -> TestResult {
             .join("Library/Application Support/dev.gascan/controller/state.sqlite3")
     );
     assert_eq!(
-        fixture.paths.legacy_database(),
+        fixture.legacy_database(),
         fixture.runtime.join("state.sqlite3")
     );
     Ok(())
@@ -111,7 +119,7 @@ fn fresh_open_creates_only_a_private_durable_store() -> TestResult {
     assert!(store.list_sandboxes()?.is_empty());
     assert_private_directory(&fixture.controller_directory(), 0o700)?;
     assert_private_file(fixture.paths.durable_database(), 0o600)?;
-    assert!(!fixture.paths.legacy_database().exists());
+    assert!(!fixture.legacy_database().exists());
     Ok(())
 }
 
@@ -126,9 +134,14 @@ fn paths_reject_relative_and_parent_components() -> TestResult {
         (fixture.home.join("../home"), fixture.runtime.clone()),
         (fixture.home.clone(), fixture.runtime.join("../runtime")),
     ] {
-        let error = ControllerStatePaths::for_home_and_runtime(&home, &runtime, uid)
-            .expect_err("non-normal path must be rejected");
-        assert_eq!(error.code(), "controller_state_invalid");
+        let error = ControllerStatePaths::for_home_and_runtime(
+            &home,
+            &runtime,
+            uid,
+            BackendSelection::Apple,
+        )
+        .expect_err("non-normal path must be rejected");
+        assert_eq!(error.code().as_str(), "controller_state_invalid");
     }
     Ok(())
 }
@@ -142,7 +155,7 @@ fn open_rejects_symlinked_managed_components() -> TestResult {
     std::os::unix::fs::symlink(&target, application_support.join("dev.gascan"))?;
 
     let error = failed_open(&fixture.paths)?;
-    assert_eq!(error.code(), "controller_state_unsafe");
+    assert_eq!(error.code().as_str(), "controller_state_unsafe");
     assert!(!target.join("controller/state.sqlite3").exists());
     Ok(())
 }
@@ -155,7 +168,7 @@ fn open_rejects_non_regular_database() -> TestResult {
     fs::create_dir(fixture.paths.durable_database())?;
 
     let error = failed_open(&fixture.paths)?;
-    assert_eq!(error.code(), "controller_state_unsafe");
+    assert_eq!(error.code().as_str(), "controller_state_unsafe");
     Ok(())
 }
 
@@ -163,11 +176,15 @@ fn open_rejects_non_regular_database() -> TestResult {
 fn open_rejects_foreign_expected_owner() -> TestResult {
     let fixture = ControllerFixture::new()?;
     let foreign_uid = rustix::process::geteuid().as_raw().saturating_add(1);
-    let paths =
-        ControllerStatePaths::for_home_and_runtime(&fixture.home, &fixture.runtime, foreign_uid)?;
+    let paths = ControllerStatePaths::for_home_and_runtime(
+        &fixture.home,
+        &fixture.runtime,
+        foreign_uid,
+        BackendSelection::Apple,
+    )?;
 
     let error = failed_open(&paths)?;
-    assert_eq!(error.code(), "controller_state_unsafe");
+    assert_eq!(error.code().as_str(), "controller_state_unsafe");
     Ok(())
 }
 
@@ -178,7 +195,7 @@ fn open_rejects_unsafe_managed_directory_and_database_modes() -> TestResult {
     create_private_directory(&application_directory)?;
     fs::set_permissions(&application_directory, fs::Permissions::from_mode(0o755))?;
     let error = failed_open(&fixture.paths)?;
-    assert_eq!(error.code(), "controller_state_unsafe");
+    assert_eq!(error.code().as_str(), "controller_state_unsafe");
 
     fs::set_permissions(&application_directory, fs::Permissions::from_mode(0o700))?;
     create_private_directory(&fixture.controller_directory())?;
@@ -188,7 +205,7 @@ fn open_rejects_unsafe_managed_directory_and_database_modes() -> TestResult {
         fs::Permissions::from_mode(0o644),
     )?;
     let error = failed_open(&fixture.paths)?;
-    assert_eq!(error.code(), "controller_state_unsafe");
+    assert_eq!(error.code().as_str(), "controller_state_unsafe");
     Ok(())
 }
 
@@ -204,7 +221,7 @@ fn open_rejects_writable_home_library_and_application_support_ancestors() -> Tes
         fs::set_permissions(&path, fs::Permissions::from_mode(0o722))?;
 
         let error = failed_open(&fixture.paths)?;
-        assert_eq!(error.code(), "controller_state_unsafe");
+        assert_eq!(error.code().as_str(), "controller_state_unsafe");
     }
     Ok(())
 }
@@ -232,7 +249,7 @@ fn open_rejects_special_bits_on_managed_paths() -> TestResult {
     create_private_directory(&application_directory)?;
     fs::set_permissions(&application_directory, fs::Permissions::from_mode(0o1700))?;
     let error = failed_open(&fixture.paths)?;
-    assert_eq!(error.code(), "controller_state_unsafe");
+    assert_eq!(error.code().as_str(), "controller_state_unsafe");
 
     fs::set_permissions(&application_directory, fs::Permissions::from_mode(0o700))?;
     create_private_directory(&fixture.controller_directory())?;
@@ -242,14 +259,14 @@ fn open_rejects_special_bits_on_managed_paths() -> TestResult {
         fs::Permissions::from_mode(0o1600),
     )?;
     let error = failed_open(&fixture.paths)?;
-    assert_eq!(error.code(), "controller_state_unsafe");
+    assert_eq!(error.code().as_str(), "controller_state_unsafe");
     Ok(())
 }
 
 #[test]
 fn migration_legacy_only_preserves_logical_content() -> TestResult {
     let fixture = ControllerFixture::new()?;
-    fixture.seed_store(fixture.paths.legacy_database(), "legacy")?;
+    fixture.seed_store(fixture.legacy_database(), "legacy")?;
 
     let store = open_controller_store(&fixture.paths)?;
     assert_eq!(store.list_sandboxes()?.len(), 1);
@@ -257,7 +274,7 @@ fn migration_legacy_only_preserves_logical_content() -> TestResult {
         store.list_sandboxes()?[0].id.as_str(),
         "legacy-aaaaaaaaaaaa"
     );
-    assert!(!fixture.paths.legacy_database().exists());
+    assert!(!fixture.legacy_database().exists());
     assert_private_file(fixture.paths.durable_database(), 0o600)?;
     assert!(migration_backups(&fixture)?.iter().any(|path| {
         path.file_name()
@@ -275,7 +292,7 @@ fn migration_legacy_only_preserves_logical_content() -> TestResult {
 #[test]
 fn migration_backup_remains_recoverable_after_staging_reads_the_source() -> TestResult {
     let fixture = ControllerFixture::new()?;
-    fixture.seed_store(fixture.paths.legacy_database(), "recoverable")?;
+    fixture.seed_store(fixture.legacy_database(), "recoverable")?;
 
     open_controller_store(&fixture.paths)?;
     let backup = migration_backup_database(&fixture)?;
@@ -292,14 +309,11 @@ fn migration_includes_committed_uncheckpointed_wal_content() -> TestResult {
     let fixture = ControllerFixture::new()?;
     fs::create_dir(&fixture.runtime)?;
     fs::set_permissions(&fixture.runtime, fs::Permissions::from_mode(0o700))?;
-    let store = Store::open(fixture.paths.legacy_database())?;
+    let store = Store::open(fixture.legacy_database())?;
     drop(store);
-    fs::set_permissions(
-        fixture.paths.legacy_database(),
-        fs::Permissions::from_mode(0o600),
-    )?;
+    fs::set_permissions(fixture.legacy_database(), fs::Permissions::from_mode(0o600))?;
     let connection = Connection::open_with_flags(
-        fixture.paths.legacy_database(),
+        fixture.legacy_database(),
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
@@ -308,14 +322,13 @@ fn migration_includes_committed_uncheckpointed_wal_content() -> TestResult {
         "INSERT INTO sandboxes (id, canonical_root, desired_state, actual_state, updated_at_millis) VALUES ('wal-aaaaaaaaaaaa', '/workspace/wal', 'running', 'stopped', 9)",
         [],
     )?;
-    for path in active_database_files(fixture.paths.legacy_database()) {
+    for path in active_database_files(fixture.legacy_database()) {
         if path.exists() {
             fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         }
     }
     assert!(
         fixture
-            .paths
             .legacy_database()
             .with_extension("sqlite3-wal")
             .exists()
@@ -334,23 +347,17 @@ fn migration_includes_committed_uncheckpointed_wal_content() -> TestResult {
 #[test]
 fn migration_recovers_and_archives_a_hot_rollback_journal() -> TestResult {
     let fixture = ControllerFixture::new()?;
-    fixture.seed_store(fixture.paths.legacy_database(), "journal")?;
+    fixture.seed_store(fixture.legacy_database(), "journal")?;
     let status = Command::new(std::env::current_exe()?)
         .arg("--exact")
         .arg("hot_journal_crash_helper")
         .arg("--nocapture")
-        .env(
-            "GASCAN_TEST_HOT_JOURNAL_PATH",
-            fixture.paths.legacy_database(),
-        )
+        .env("GASCAN_TEST_HOT_JOURNAL_PATH", fixture.legacy_database())
         .status()?;
     assert!(!status.success());
-    let journal = PathBuf::from(format!(
-        "{}-journal",
-        fixture.paths.legacy_database().display()
-    ));
+    let journal = PathBuf::from(format!("{}-journal", fixture.legacy_database().display()));
     assert!(journal.exists());
-    for path in active_database_files(fixture.paths.legacy_database()) {
+    for path in active_database_files(fixture.legacy_database()) {
         if path.exists() {
             fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         }
@@ -411,7 +418,7 @@ fn migration_durable_only_opens_without_creating_legacy_state() -> TestResult {
         store.list_sandboxes()?[0].id.as_str(),
         "durable-aaaaaaaaaaaa"
     );
-    assert!(!fixture.paths.legacy_database().exists());
+    assert!(!fixture.legacy_database().exists());
     Ok(())
 }
 
@@ -419,21 +426,19 @@ fn migration_durable_only_opens_without_creating_legacy_state() -> TestResult {
 fn migration_identical_dual_state_archives_legacy() -> TestResult {
     let fixture = ControllerFixture::new()?;
     fixture.seed_store(fixture.paths.durable_database(), "same")?;
-    fixture.seed_store(fixture.paths.legacy_database(), "same")?;
+    fixture.seed_store(fixture.legacy_database(), "same")?;
 
     let store = open_controller_store(&fixture.paths)?;
     assert_eq!(store.list_sandboxes()?[0].id.as_str(), "same-aaaaaaaaaaaa");
-    assert!(!fixture.paths.legacy_database().exists());
+    assert!(!fixture.legacy_database().exists());
     assert!(
         !fixture
-            .paths
             .legacy_database()
             .with_extension("sqlite3-wal")
             .exists()
     );
     assert!(
         !fixture
-            .paths
             .legacy_database()
             .with_extension("sqlite3-shm")
             .exists()
@@ -445,9 +450,9 @@ fn migration_identical_dual_state_archives_legacy() -> TestResult {
 fn conflicting_active_databases_are_untouched() -> TestResult {
     let fixture = ControllerFixture::new()?;
     fixture.seed_store(fixture.paths.durable_database(), "durable")?;
-    fixture.seed_store(fixture.paths.legacy_database(), "legacy")?;
+    fixture.seed_store(fixture.legacy_database(), "legacy")?;
     let durable = Connection::open(fixture.paths.durable_database())?;
-    let legacy = Connection::open(fixture.paths.legacy_database())?;
+    let legacy = Connection::open(fixture.legacy_database())?;
     for connection in [&durable, &legacy] {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "wal_autocheckpoint", 0)?;
@@ -456,10 +461,7 @@ fn conflicting_active_databases_are_untouched() -> TestResult {
             [],
         )?;
     }
-    for database in [
-        fixture.paths.durable_database(),
-        fixture.paths.legacy_database(),
-    ] {
+    for database in [fixture.paths.durable_database(), fixture.legacy_database()] {
         for path in active_database_files(database) {
             if path.exists() {
                 fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
@@ -471,7 +473,7 @@ fn conflicting_active_databases_are_untouched() -> TestResult {
     let before = fixture.capture_active_files()?;
 
     let error = failed_open(&fixture.paths)?;
-    assert_eq!(error.code(), "controller_state_conflict");
+    assert_eq!(error.code().as_str(), "controller_state_conflict");
     assert!(error.to_string().contains("No data was changed"));
     assert_eq!(fixture.capture_active_files()?, before);
     drop(durable);
@@ -482,7 +484,7 @@ fn conflicting_active_databases_are_untouched() -> TestResult {
 #[test]
 fn migration_backup_name_collision_never_overwrites() -> TestResult {
     let fixture = ControllerFixture::new()?;
-    fixture.seed_store(fixture.paths.legacy_database(), "legacy")?;
+    fixture.seed_store(fixture.legacy_database(), "legacy")?;
     fs::create_dir_all(fixture.controller_directory())?;
     fs::set_permissions(
         fixture.controller_directory(),
@@ -509,15 +511,12 @@ fn migration_rejects_malformed_legacy_schema_without_publishing_durable_state() 
     let fixture = ControllerFixture::new()?;
     fs::create_dir(&fixture.runtime)?;
     fs::set_permissions(&fixture.runtime, fs::Permissions::from_mode(0o700))?;
-    fs::write(fixture.paths.legacy_database(), b"not sqlite")?;
-    fs::set_permissions(
-        fixture.paths.legacy_database(),
-        fs::Permissions::from_mode(0o600),
-    )?;
+    fs::write(fixture.legacy_database(), b"not sqlite")?;
+    fs::set_permissions(fixture.legacy_database(), fs::Permissions::from_mode(0o600))?;
     let before = fixture.capture_active_files()?;
 
     let error = failed_open(&fixture.paths)?;
-    assert_eq!(error.code(), "controller_state_migration_failed");
+    assert_eq!(error.code().as_str(), "controller_state_migration_failed");
     assert_eq!(fixture.capture_active_files()?, before);
     assert!(!fixture.paths.durable_database().exists());
     Ok(())
@@ -537,7 +536,7 @@ fn migration_rejects_malformed_durable_schema_without_touching_it() -> TestResul
     let before = fs::read(fixture.paths.durable_database())?;
 
     let error = failed_open(&fixture.paths)?;
-    assert_eq!(error.code(), "controller_state_migration_failed");
+    assert_eq!(error.code().as_str(), "controller_state_migration_failed");
     assert_eq!(fs::read(fixture.paths.durable_database())?, before);
     Ok(())
 }
@@ -578,7 +577,7 @@ fn migration_refuses_unsafe_abandoned_temp_without_removing_it() -> TestResult {
     fs::set_permissions(&abandoned, fs::Permissions::from_mode(0o644))?;
 
     let error = failed_open(&fixture.paths)?;
-    assert_eq!(error.code(), "controller_state_unsafe");
+    assert_eq!(error.code().as_str(), "controller_state_unsafe");
     assert_eq!(fs::read(abandoned)?, b"unsafe");
     Ok(())
 }
@@ -586,19 +585,19 @@ fn migration_refuses_unsafe_abandoned_temp_without_removing_it() -> TestResult {
 #[test]
 fn migration_archives_legacy_sidecars() -> TestResult {
     let fixture = ControllerFixture::new()?;
-    fixture.seed_store(fixture.paths.legacy_database(), "legacy")?;
-    let connection = Connection::open(fixture.paths.legacy_database())?;
+    fixture.seed_store(fixture.legacy_database(), "legacy")?;
+    let connection = Connection::open(fixture.legacy_database())?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "wal_autocheckpoint", 0)?;
     connection.execute("UPDATE sandboxes SET updated_at_millis = 11", [])?;
-    for path in active_database_files(fixture.paths.legacy_database()) {
+    for path in active_database_files(fixture.legacy_database()) {
         if path.exists() {
             fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         }
     }
 
     open_controller_store(&fixture.paths)?;
-    for path in active_database_files(fixture.paths.legacy_database()) {
+    for path in active_database_files(fixture.legacy_database()) {
         assert!(!path.exists());
     }
     let names = migration_backups(&fixture)?
@@ -626,19 +625,19 @@ fn migration_fault_boundaries_recover_without_losing_legacy_content() -> TestRes
         MigrationFault::AfterLegacyMoveBeforeValidation,
     ] {
         let fixture = ControllerFixture::new()?;
-        fixture.seed_store(fixture.paths.legacy_database(), "legacy")?;
+        fixture.seed_store(fixture.legacy_database(), "legacy")?;
         let error = match open_controller_store_with_fault(&fixture.paths, fault) {
             Ok(_) => return Err(std::io::Error::other("fault did not interrupt migration").into()),
             Err(error) => error,
         };
-        assert_eq!(error.code(), "controller_state_migration_failed");
+        assert_eq!(error.code().as_str(), "controller_state_migration_failed");
 
         let recovered = open_controller_store(&fixture.paths)?;
         assert_eq!(
             recovered.list_sandboxes()?[0].id.as_str(),
             "legacy-aaaaaaaaaaaa"
         );
-        assert!(!fixture.paths.legacy_database().exists());
+        assert!(!fixture.legacy_database().exists());
     }
     Ok(())
 }
@@ -646,8 +645,8 @@ fn migration_fault_boundaries_recover_without_losing_legacy_content() -> TestRes
 #[test]
 fn interrupted_post_move_archive_is_recovered_before_state_selection() -> TestResult {
     let fixture = ControllerFixture::new()?;
-    fixture.seed_store(fixture.paths.legacy_database(), "legacy")?;
-    let legacy_before = fs::read(fixture.paths.legacy_database())?;
+    fixture.seed_store(fixture.legacy_database(), "legacy")?;
+    let legacy_before = fs::read(fixture.legacy_database())?;
     let status = Command::new(std::env::current_exe()?)
         .arg("--exact")
         .arg("archive_transaction_crash_helper")
@@ -656,7 +655,7 @@ fn interrupted_post_move_archive_is_recovered_before_state_selection() -> TestRe
         .env("GASCAN_TEST_ARCHIVE_RUNTIME", &fixture.runtime)
         .status()?;
     assert!(!status.success());
-    assert!(!fixture.paths.legacy_database().exists());
+    assert!(!fixture.legacy_database().exists());
 
     let durable = Connection::open(fixture.paths.durable_database())?;
     durable.execute(
@@ -671,13 +670,13 @@ fn interrupted_post_move_archive_is_recovered_before_state_selection() -> TestRe
 
     let error = failed_open(&fixture.paths)?;
     assert_eq!(
-        error.code(),
+        error.code().as_str(),
         "controller_state_conflict",
         "unexpected recovery error: {error:?}"
     );
-    assert_eq!(fs::read(fixture.paths.legacy_database())?, legacy_before);
+    assert_eq!(fs::read(fixture.legacy_database())?, legacy_before);
     let repeated = failed_open(&fixture.paths)?;
-    assert_eq!(repeated.code(), "controller_state_conflict");
+    assert_eq!(repeated.code().as_str(), "controller_state_conflict");
     Ok(())
 }
 
@@ -693,6 +692,7 @@ fn archive_transaction_crash_helper() {
         Path::new(&home),
         Path::new(&runtime),
         rustix::process::geteuid().as_raw(),
+        BackendSelection::Apple,
     ) else {
         std::process::exit(2);
     };
@@ -718,7 +718,7 @@ fn malformed_archive_transaction_is_refused_without_mutation() -> TestResult {
     fs::set_permissions(&unexpected, fs::Permissions::from_mode(0o600))?;
 
     let error = failed_open(&fixture.paths)?;
-    assert_eq!(error.code(), "controller_state_unsafe");
+    assert_eq!(error.code().as_str(), "controller_state_unsafe");
     assert_eq!(fs::read(unexpected)?, b"do not touch");
     Ok(())
 }
@@ -727,9 +727,9 @@ fn malformed_archive_transaction_is_refused_without_mutation() -> TestResult {
 fn ambiguous_archive_transactions_are_refused_without_mutation() -> TestResult {
     let fixture = ControllerFixture::new()?;
     fixture.seed_store(fixture.paths.durable_database(), "same")?;
-    fixture.seed_store(fixture.paths.legacy_database(), "same")?;
+    fixture.seed_store(fixture.legacy_database(), "same")?;
     let before = fixture.capture_active_files()?;
-    let metadata = fs::symlink_metadata(fixture.paths.legacy_database())?;
+    let metadata = fs::symlink_metadata(fixture.legacy_database())?;
     let marker = format!(
         "GASCAN_LEGACY_ARCHIVE_V1\nstate.sqlite3\t{}\t{}\n",
         metadata.dev(),
@@ -749,7 +749,7 @@ fn ambiguous_archive_transactions_are_refused_without_mutation() -> TestResult {
     }
 
     let error = failed_open(&fixture.paths)?;
-    assert_eq!(error.code(), "controller_state_unsafe");
+    assert_eq!(error.code().as_str(), "controller_state_unsafe");
     assert_eq!(fixture.capture_active_files()?, before);
     Ok(())
 }
@@ -825,5 +825,79 @@ fn assert_private_file(path: &Path, mode: u32) -> TestResult {
     assert!(metadata.file_type().is_file());
     assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
     assert_eq!(metadata.permissions().mode() & 0o777, mode);
+    Ok(())
+}
+
+/// **The scope directory is defended exactly as the controller directory is.**
+///
+/// Every other test in this file constructs its paths with
+/// `BackendSelection::Apple`, which by design never creates a scope child --
+/// so `controller/<backend>` arrived with the safety contract this file exists
+/// to pin asserted nowhere. It is a directory a daemon creates and then trusts
+/// a database inside, on the same terms as its parent.
+#[test]
+fn a_scoped_store_refuses_a_symlinked_scope_directory() -> TestResult {
+    let fixture = ControllerFixture::new()?;
+    let paths = ControllerStatePaths::for_home_and_runtime(
+        &fixture.home,
+        &fixture.runtime,
+        rustix::process::geteuid().as_raw(),
+        BackendSelection::Arca,
+    )?;
+    let application = fixture.home.join("Library/Application Support/dev.gascan");
+    create_private_directory(&application)?;
+    create_private_directory(&fixture.controller_directory())?;
+    let target = fixture.home.join("scope-target");
+    create_private_directory(&target)?;
+    std::os::unix::fs::symlink(&target, fixture.controller_directory().join("arca"))?;
+
+    let error = failed_open(&paths)?;
+    assert_eq!(error.code().as_str(), "controller_state_unsafe");
+    assert!(
+        !target.join("state.sqlite3").exists(),
+        "a symlinked scope directory was followed and written through"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_scoped_store_refuses_a_world_readable_scope_directory() -> TestResult {
+    let fixture = ControllerFixture::new()?;
+    let paths = ControllerStatePaths::for_home_and_runtime(
+        &fixture.home,
+        &fixture.runtime,
+        rustix::process::geteuid().as_raw(),
+        BackendSelection::Arca,
+    )?;
+    let application = fixture.home.join("Library/Application Support/dev.gascan");
+    create_private_directory(&application)?;
+    create_private_directory(&fixture.controller_directory())?;
+    let scope = fixture.controller_directory().join("arca");
+    create_private_directory(&scope)?;
+    fs::set_permissions(&scope, fs::Permissions::from_mode(0o755))?;
+
+    let error = failed_open(&paths)?;
+    assert_eq!(error.code().as_str(), "controller_state_unsafe");
+
+    // The same directory at 0700 opens, so the refusal above is the mode and
+    // not the mere existence of the child.
+    fs::set_permissions(&scope, fs::Permissions::from_mode(0o700))?;
+    let store = open_controller_store(&paths)?;
+    assert!(store.list_sandboxes()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_scoped_store_refuses_a_foreign_owner() -> TestResult {
+    let fixture = ControllerFixture::new()?;
+    let foreign_uid = rustix::process::geteuid().as_raw().saturating_add(1);
+    let paths = ControllerStatePaths::for_home_and_runtime(
+        &fixture.home,
+        &fixture.runtime,
+        foreign_uid,
+        BackendSelection::Arca,
+    )?;
+    let error = failed_open(&paths)?;
+    assert_eq!(error.code().as_str(), "controller_state_unsafe");
     Ok(())
 }

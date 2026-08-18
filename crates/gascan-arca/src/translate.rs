@@ -294,6 +294,72 @@ pub(crate) fn missing_outcome(operation: &str) -> RuntimeError {
     invalid_output(operation, "response carried no outcome")
 }
 
+/// The engine build whose network isolation has been observed, not assumed.
+///
+/// `None` means no build is certified, so no engine can claim `Proven`.
+///
+/// **THE EVIDENCE EXISTS AND IT REFUTES.** `docs/evidence/2026-08-18-arca-engine-offline.md`
+/// records the offline proof run against the engine `engine/arca-pin.json`
+/// names, revision `c545612b`: the guest of an `offline` sandbox carried a
+/// vmnet `eth0` with a default route and a resolver, and reached a test-owned
+/// host endpoint, a public IP and public DNS -- as guest root and as the
+/// sandbox user, before and after a guest-root mutation attempt. Thirteen
+/// violations, against a positive control in which every one of those probes
+/// succeeded on a networked sandbox, and with the compiled request asserted to
+/// carry `RuntimeNetwork::Offline` before anything was observed.
+///
+/// So this is not "unproven pending a measurement". **For revision `c545612b`,
+/// `Proven` is false**, and the standing instrument is
+/// `gascan-arca`'s `network::an_offline_sandbox_has_no_egress_at_either_privilege_level`,
+/// which asserts the property and therefore fails today by design. It turns
+/// green on the build that earns this constant.
+///
+/// Setting this without a recorded observation would be the "claim with no
+/// instrument" defect this project has written traps about since milestone 1.
+/// Setting it against THIS observation would be worse.
+///
+/// `Option<&str>` and not `&str`: an empty-string sentinel would certify an
+/// engine that reported an empty revision, which is exactly what a build with a
+/// broken or missing build-info generator does. `None` can match nothing.
+///
+/// This does NOT move with `engine/arca-pin.json`. The pin says which engine
+/// gets built; this says which engine has been proven. They are the same value
+/// only when the proof was run against the pinned build, and conflating them
+/// would make every pin bump silently re-certify.
+pub(crate) const CERTIFIED_ENGINE_REVISION: Option<&'static str> = None;
+
+/// Decides whether the engine's own `Proven` is worth believing.
+///
+/// **The judgement lives with the consumer, deliberately.** The alternative --
+/// an engine-side gate -- has the component being judged issuing its own
+/// verdict, which is the shape this project's boundary rules exist to avoid.
+/// The proto states the same rule for ownership: deciding whether a labelled
+/// resource is yours "is the consumer's judgment and it stays there".
+///
+/// This mirrors the precedent Gas Can already trusts:
+/// `gascan-apple/src/probe.rs:47` gates on `self.commit == APPLE_1_1_COMMIT`,
+/// a constant held here and compared against what the runtime reports about
+/// itself.
+///
+/// **Only `Proven` is gated, and the other two pass through unchanged.** The
+/// gate exists to refuse an unearned POSITIVE claim. `Unsupported` and
+/// `Unverified` are both already fail-closed at `policy.rs:419-425`, but they
+/// fail closed with DIFFERENT errors -- `OfflineUnsupported { version }` names
+/// the engine version, `OfflineUnavailable` does not -- so collapsing
+/// `Unsupported` into `Unverified` would discard a diagnostic without making
+/// anything safer. Downgrading a negative claim is not caution, it is loss.
+///
+/// An engine reporting no revision at all cannot be certified, and it reaches
+/// that outcome through the same comparison rather than a special case: `None`
+/// equals nothing, and a `Some` constant is a 40-character hex string that the
+/// empty string cannot equal.
+fn certified_isolation(build_revision: &str) -> NetworkIsolation {
+    match CERTIFIED_ENGINE_REVISION {
+        Some(certified) if certified == build_revision => NetworkIsolation::Proven,
+        _ => NetworkIsolation::Unverified,
+    }
+}
+
 pub(crate) fn runtime_capabilities(
     capabilities: &v1::Capabilities,
 ) -> Result<RuntimeCapabilities, RuntimeError> {
@@ -302,7 +368,7 @@ pub(crate) fn runtime_capabilities(
         .as_ref()
         .ok_or_else(|| invalid_output("capabilities", "response carried no engine version"))?;
     let offline = match v1::Isolation::try_from(capabilities.offline) {
-        Ok(v1::Isolation::Proven) => NetworkIsolation::Proven,
+        Ok(v1::Isolation::Proven) => certified_isolation(&capabilities.build_revision),
         Ok(v1::Isolation::Unsupported) => NetworkIsolation::Unsupported,
         Ok(v1::Isolation::Unverified) => NetworkIsolation::Unverified,
         Ok(v1::Isolation::Unspecified) | Err(_) => {
@@ -715,6 +781,22 @@ mod tests {
             loopback_publish: false,
             resource_limits: false,
             offline: v1::Isolation::Proven as i32,
+            // **Empty deliberately, and it is an input to the gate rather
+            // than a placeholder.** An engine whose build-info generator is
+            // broken reports exactly this, and `certified_isolation` must
+            // refuse it through the same comparison every other revision takes
+            // -- `None` equals nothing, and a `Some` constant is 40 hex
+            // characters the empty string cannot equal. That is what
+            // `an_uncertified_engine_cannot_claim_proven_and_its_refusals_are_left_alone`
+            // exercises below.
+            //
+            // CORRECTED: this comment used to say "nothing reads it yet" and
+            // that the certified-revision comparison was "still to come". Both
+            // were false in the tree the comment shipped in -- the gate is
+            // `certified_isolation` in this file, its call site is in
+            // `runtime_capabilities` in this file, and the test that earns it
+            // is forty lines below this line.
+            build_revision: String::new(),
         }
     }
 
@@ -726,7 +808,72 @@ mod tests {
             capabilities.version,
             gascan_core::runtime::RuntimeVersion::new(1, 2, 3)
         );
-        assert_eq!(capabilities.offline, NetworkIsolation::Proven);
+        // `Unverified` even though the fixture engine says `Proven`, because it
+        // reports no build revision and `CERTIFIED_ENGINE_REVISION` is `None`.
+        // This assertion used to read `Proven` and passing it through is what
+        // the gate below exists to stop, so it moved rather than being deleted:
+        // the version half of this test is still what it was for.
+        assert_eq!(capabilities.offline, NetworkIsolation::Unverified);
+    }
+
+    /// **An engine's `Proven` is not believed unless its build revision is the
+    /// certified one, and no revision is certified yet.**
+    ///
+    /// The parameterisation is over what the ENGINE claims, holding the
+    /// certified constant fixed at its real value. That is the direction that
+    /// matters: the gate's job is that no engine talks its way to `Proven`, and
+    /// a test that reached inside to substitute a constant would be testing a
+    /// comparison rather than the shipped decision.
+    ///
+    /// The three engine claims are covered separately because they are not
+    /// symmetric. `Proven` must be downgraded. `Unsupported` and `Unverified`
+    /// must pass through UNCHANGED -- both already refuse an offline sandbox at
+    /// `policy.rs:419-425`, but with different errors, so folding `Unsupported`
+    /// into `Unverified` would lose the one that names the engine version. A
+    /// gate written as "downgrade unless certified" without that distinction
+    /// passes the first case and quietly fails the third.
+    #[test]
+    fn an_uncertified_engine_cannot_claim_proven_and_its_refusals_are_left_alone() {
+        assert_eq!(
+            CERTIFIED_ENGINE_REVISION, None,
+            "no engine build is certified until the offline evidence exists;              this test's other assertions assume that state"
+        );
+
+        let claiming = |isolation: v1::Isolation, revision: &str| {
+            let mut capabilities = no_capabilities();
+            capabilities.offline = isolation as i32;
+            capabilities.build_revision = revision.to_owned();
+            runtime_capabilities(&capabilities)
+                .expect("a well-formed capability set maps")
+                .offline
+        };
+
+        // A real 40-character revision, and the one the pin currently names, so
+        // this is the strongest case available: an engine that exists, that the
+        // build gate would accept, and that still cannot claim proof.
+        let pinned = "c545612b056e028d5885968a7b9f586d694f994c";
+        assert_eq!(
+            claiming(v1::Isolation::Proven, pinned),
+            NetworkIsolation::Unverified
+        );
+        // The empty revision a build with a broken build-info generator reports.
+        // It reaches the same outcome through the same comparison rather than a
+        // special case -- which is why the constant is an Option and not an
+        // empty-string sentinel that this input would have matched.
+        assert_eq!(
+            claiming(v1::Isolation::Proven, ""),
+            NetworkIsolation::Unverified
+        );
+
+        assert_eq!(
+            claiming(v1::Isolation::Unsupported, pinned),
+            NetworkIsolation::Unsupported,
+            "a negative claim must not be rewritten into a weaker one"
+        );
+        assert_eq!(
+            claiming(v1::Isolation::Unverified, pinned),
+            NetworkIsolation::Unverified
+        );
     }
 
     #[test]
@@ -801,6 +948,7 @@ mod tests {
             loopback_publish: true,
             resource_limits: true,
             offline: v1::Isolation::Unspecified as i32,
+            build_revision: String::new(),
         };
         assert_eq!(
             runtime_capabilities(&unspecified)

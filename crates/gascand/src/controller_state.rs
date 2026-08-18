@@ -1,4 +1,5 @@
 use crate::{Store, StoreError};
+use gascan_core::backend::BackendSelection;
 #[cfg(target_os = "macos")]
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 use rusqlite::{Connection, OpenFlags, backup::Backup};
@@ -58,47 +59,118 @@ pub enum ControllerStateError {
 }
 
 impl ControllerStateError {
+    /// The startup diagnostic code this error reports as.
+    ///
+    /// Drawn from `gascan_core::startup_diagnostic` rather than spelled here,
+    /// because the CLI's read side whitelists the same strings. They used to be
+    /// two independent sets of literals, and a code added to one but not the
+    /// other is a diagnostic that is written, validated, and then discarded
+    /// without a trace.
     #[must_use]
-    pub const fn code(&self) -> &'static str {
+    pub const fn code(&self) -> gascan_core::startup_diagnostic::StartupCode {
+        use gascan_core::startup_diagnostic::code;
         match self {
-            Self::Invalid(_) => "controller_state_invalid",
-            Self::Unsafe(_) => "controller_state_unsafe",
-            Self::Conflict { .. } => "controller_state_conflict",
-            Self::Migration(_) | Self::Store(_) => "controller_state_migration_failed",
+            Self::Invalid(_) => code::CONTROLLER_STATE_INVALID,
+            Self::Unsafe(_) => code::CONTROLLER_STATE_UNSAFE,
+            Self::Conflict { .. } => code::CONTROLLER_STATE_CONFLICT,
+            Self::Migration(_) | Self::Store(_) => code::CONTROLLER_STATE_MIGRATION_FAILED,
         }
+    }
+}
+
+/// The controller directory a backend's store lives under.
+///
+/// **The shared scope is Apple's, and scoping it would have been the same harm
+/// this scoping exists to prevent.** Every install that predates backend
+/// selection keeps its records at the unscoped path, and their Apple containers
+/// keep running whether or not a daemon can still see the records; moving Apple
+/// under a child would orphan all of them silently. The unscoped path IS the
+/// Apple path, historically and by default.
+///
+/// The legacy runtime database is the shared scope's for the same reason, and
+/// the reason is a date rather than an argument: the durable store landed in
+/// `9c6933e` on 2026-08-04 and the first non-Apple backend in `7f9e8e6` on
+/// 2026-08-17, which `git merge-base --is-ancestor 9c6933e 7f9e8e6` confirms is
+/// the order. No non-Apple daemon has ever existed to write either location, so
+/// a scoped daemon that migrated the legacy database would be adopting Apple's
+/// records -- and `gascan destroy` would then drop a record whose container is
+/// still running, which is exactly the case this scoping closes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ControllerScope {
+    /// The unscoped `controller/` directory, and the only scope that owns the
+    /// legacy runtime database.
+    Shared { legacy_database: PathBuf },
+    /// A `controller/<backend>/` child. It has no legacy database: no daemon on
+    /// this backend has ever written one.
+    Backend(&'static str),
+}
+
+/// The controller directory child a backend's store lives in, if any.
+///
+/// `as_str()` and not a literal, because this directory name and the backend
+/// name in the daemon instance record must be the same string. Two spellings
+/// could drift, and a daemon that reported one backend while opening another's
+/// store is the failure the whole scoping exists to make impossible.
+const fn scope_directory(backend: BackendSelection) -> Option<&'static str> {
+    match backend {
+        BackendSelection::Apple => None,
+        other => Some(other.as_str()),
     }
 }
 
 #[derive(Debug)]
 pub struct ControllerStatePaths {
+    /// The account home, kept rather than counted back out of
+    /// `durable_database`. It used to be `durable_database.ancestors().nth(5)`,
+    /// which is one short as soon as the path gains a scope child -- and the
+    /// symptom was an account home of `~/Library` looking for `Library/Library`
+    /// inside it. A stored value cannot be off by a component.
+    home: PathBuf,
     durable_database: PathBuf,
-    legacy_database: PathBuf,
+    scope: ControllerScope,
     expected_uid: u32,
 }
 
 impl ControllerStatePaths {
-    pub fn for_user(runtime_directory: &Path) -> Result<Self, ControllerStateError> {
+    pub fn for_user(
+        runtime_directory: &Path,
+        backend: BackendSelection,
+    ) -> Result<Self, ControllerStateError> {
         let home = gascan_core::account::effective_account_home().map_err(|error| {
             ControllerStateError::Invalid(format!("effective account home is unavailable: {error}"))
         })?;
-        Self::for_home_and_runtime(&home, runtime_directory, geteuid().as_raw())
+        Self::for_home_and_runtime(&home, runtime_directory, geteuid().as_raw(), backend)
     }
 
     pub fn for_home_and_runtime(
         home: &Path,
         runtime_directory: &Path,
         expected_uid: u32,
+        backend: BackendSelection,
     ) -> Result<Self, ControllerStateError> {
         validate_absolute_normal_path(home, "account home")?;
         validate_absolute_normal_path(runtime_directory, "runtime directory")?;
+        let controller = home
+            .join("Library")
+            .join("Application Support")
+            .join(APPLICATION_ID)
+            .join(CONTROLLER_DIRECTORY);
+        let (durable_database, scope) = match scope_directory(backend) {
+            None => (
+                controller.join(DATABASE_NAME),
+                ControllerScope::Shared {
+                    legacy_database: runtime_directory.join(DATABASE_NAME),
+                },
+            ),
+            Some(child) => (
+                controller.join(child).join(DATABASE_NAME),
+                ControllerScope::Backend(child),
+            ),
+        };
         Ok(Self {
-            durable_database: home
-                .join("Library")
-                .join("Application Support")
-                .join(APPLICATION_ID)
-                .join(CONTROLLER_DIRECTORY)
-                .join(DATABASE_NAME),
-            legacy_database: runtime_directory.join(DATABASE_NAME),
+            home: home.to_path_buf(),
+            durable_database,
+            scope,
             expected_uid,
         })
     }
@@ -108,9 +180,38 @@ impl ControllerStatePaths {
         &self.durable_database
     }
 
+    /// The legacy runtime database, which only the shared scope has.
     #[must_use]
-    pub fn legacy_database(&self) -> &Path {
-        &self.legacy_database
+    pub fn legacy_database(&self) -> Option<&Path> {
+        match &self.scope {
+            ControllerScope::Shared { legacy_database } => Some(legacy_database),
+            ControllerScope::Backend(_) => None,
+        }
+    }
+
+    /// The legacy runtime database on a path already known to have one.
+    ///
+    /// Every production caller is inside legacy handling that a `None` scope
+    /// returned from before it began, so the error is unreachable rather than a
+    /// fallback -- and it is an error rather than a panic because this crate
+    /// denies `clippy::panic` and because nothing here is worth aborting a
+    /// daemon over that a startup diagnostic cannot say out loud. The tests
+    /// below reach it as the shared scope, where it always succeeds.
+    fn legacy_database_required(&self) -> Result<&Path, ControllerStateError> {
+        self.legacy_database().ok_or_else(|| {
+            ControllerStateError::Invalid(
+                "a backend-scoped controller store has no legacy database".to_owned(),
+            )
+        })
+    }
+
+    /// The `controller/` child this store lives in, if it is scoped.
+    #[must_use]
+    const fn scope_child(&self) -> Option<&'static str> {
+        match self.scope {
+            ControllerScope::Shared { .. } => None,
+            ControllerScope::Backend(child) => Some(child),
+        }
     }
 }
 
@@ -174,7 +275,13 @@ struct LegacyOrphans {
 fn open_legacy_state(
     paths: &ControllerStatePaths,
 ) -> Result<Option<LegacyState>, ControllerStateError> {
-    let parent = paths.legacy_database().parent().ok_or_else(|| {
+    // A scoped store has no legacy database to find, so it never reads the
+    // shared runtime directory -- not to migrate it and not to refuse on its
+    // leftovers. Apple's sidecars are not an Arca daemon's business.
+    let Some(legacy_database) = paths.legacy_database() else {
+        return Ok(None);
+    };
+    let parent = legacy_database.parent().ok_or_else(|| {
         ControllerStateError::Invalid("legacy database has no parent directory".to_owned())
     })?;
     let Some(directories) = open_existing_directory_chain(parent)? else {
@@ -215,7 +322,13 @@ fn open_legacy_state(
 fn open_legacy_orphans(
     paths: &ControllerStatePaths,
 ) -> Result<Option<LegacyOrphans>, ControllerStateError> {
-    let parent = paths.legacy_database().parent().ok_or_else(|| {
+    // A scoped store has no legacy database to find, so it never reads the
+    // shared runtime directory -- not to migrate it and not to refuse on its
+    // leftovers. Apple's sidecars are not an Arca daemon's business.
+    let Some(legacy_database) = paths.legacy_database() else {
+        return Ok(None);
+    };
+    let parent = legacy_database.parent().ok_or_else(|| {
         ControllerStateError::Invalid("legacy database has no parent directory".to_owned())
     })?;
     let Some(directories) = open_existing_directory_chain(parent)? else {
@@ -313,7 +426,7 @@ where
     if entry_exists(&controller.descriptor, DATABASE_NAME)? {
         return Err(ControllerStateError::Conflict {
             durable: paths.durable_database().to_path_buf(),
-            legacy: paths.legacy_database().to_path_buf(),
+            legacy: paths.legacy_database_required()?.to_path_buf(),
         });
     }
     rustix::fs::renameat(
@@ -427,7 +540,7 @@ where
     if !identical {
         return Err(ControllerStateError::Conflict {
             durable: paths.durable_database().to_path_buf(),
-            legacy: paths.legacy_database().to_path_buf(),
+            legacy: paths.legacy_database_required()?.to_path_buf(),
         });
     }
     before_archive()?;
@@ -1167,7 +1280,10 @@ struct RecoveredArchiveTransaction {
 fn recover_legacy_archive_transactions(
     paths: &ControllerStatePaths,
 ) -> Result<(), ControllerStateError> {
-    let parent = paths.legacy_database().parent().ok_or_else(|| {
+    let Some(legacy_database) = paths.legacy_database() else {
+        return Ok(());
+    };
+    let parent = legacy_database.parent().ok_or_else(|| {
         ControllerStateError::Invalid("legacy database has no parent directory".to_owned())
     })?;
     let Some(directories) = open_existing_directory_chain(parent)? else {
@@ -2335,9 +2451,9 @@ fn validate_legacy_binding(
     legacy: &LegacyState,
 ) -> Result<(), ControllerStateError> {
     let current =
-        open_existing_directory_chain(paths.legacy_database().parent().ok_or_else(|| {
-            ControllerStateError::Invalid("legacy database has no parent".to_owned())
-        })?)?
+        open_existing_directory_chain(paths.legacy_database_required()?.parent().ok_or_else(
+            || ControllerStateError::Invalid("legacy database has no parent".to_owned()),
+        )?)?
         .ok_or_else(|| {
             ControllerStateError::Unsafe(
                 "legacy database directory changed during migration".to_owned(),
@@ -2425,23 +2541,28 @@ struct StateAncestorDirectories {
     application_support: OwnedFd,
 }
 
+/// The open directory chain the store sits at the bottom of.
+///
+/// The ancestors are held as a list rather than as named fields because the
+/// chain is one link longer for a scoped store than for the shared one, and
+/// every use of them is the same use: they are the descriptors a mutation
+/// monitor watches and a rename fsyncs. Naming them individually made the
+/// length part of the type, which is what a scope child cannot be.
 struct ControllerDirectory {
-    home: OwnedFd,
-    library: OwnedFd,
-    application_support: OwnedFd,
-    application: OwnedFd,
+    /// Home, Library, Application Support, `dev.gascan`, and -- for a scoped
+    /// store -- `controller`, outermost first.
+    ancestors: Vec<OwnedFd>,
+    /// The directory the database lives in: `controller` for the shared store,
+    /// `controller/<backend>` for a scoped one.
     descriptor: OwnedFd,
 }
 
 impl ControllerDirectory {
-    fn descriptors(&self) -> [&OwnedFd; 5] {
-        [
-            &self.home,
-            &self.library,
-            &self.application_support,
-            &self.application,
-            &self.descriptor,
-        ]
+    fn descriptors(&self) -> Vec<&OwnedFd> {
+        self.ancestors
+            .iter()
+            .chain(std::iter::once(&self.descriptor))
+            .collect()
     }
 }
 
@@ -2455,17 +2576,33 @@ fn open_controller_directory(
         paths.expected_uid,
         "application directory",
     )?;
-    let descriptor = ensure_private_child_directory(
+    let controller_directory = ensure_private_child_directory(
         &application_directory,
         CONTROLLER_DIRECTORY,
         paths.expected_uid,
         "controller directory",
     )?;
+    let mut chain = vec![
+        ancestors.home,
+        ancestors.library,
+        ancestors.application_support,
+        application_directory,
+    ];
+    let descriptor = match paths.scope_child() {
+        None => controller_directory,
+        Some(child) => {
+            let scoped = ensure_private_child_directory(
+                &controller_directory,
+                child,
+                paths.expected_uid,
+                "backend controller directory",
+            )?;
+            chain.push(controller_directory);
+            scoped
+        }
+    };
     Ok(ControllerDirectory {
-        home: ancestors.home,
-        library: ancestors.library,
-        application_support: ancestors.application_support,
-        application: application_directory,
+        ancestors: chain,
         descriptor,
     })
 }
@@ -2496,22 +2633,40 @@ fn open_existing_controller_directory(
         true,
         "controller directory",
     )?;
+    let mut chain = vec![
+        ancestors.home,
+        ancestors.library,
+        ancestors.application_support,
+        application_directory,
+    ];
+    let descriptor = match paths.scope_child() {
+        None => controller_directory,
+        Some(child) => {
+            let scoped = open_existing_child_directory(
+                &controller_directory,
+                OsStr::new(child),
+                "backend controller directory",
+            )?;
+            validate_directory(
+                &scoped,
+                paths.expected_uid,
+                true,
+                "backend controller directory",
+            )?;
+            chain.push(controller_directory);
+            scoped
+        }
+    };
     Ok(ControllerDirectory {
-        home: ancestors.home,
-        library: ancestors.library,
-        application_support: ancestors.application_support,
-        application: application_directory,
-        descriptor: controller_directory,
+        ancestors: chain,
+        descriptor,
     })
 }
 
 fn open_state_ancestor_directories(
     paths: &ControllerStatePaths,
 ) -> Result<StateAncestorDirectories, ControllerStateError> {
-    let home = paths.durable_database.ancestors().nth(5).ok_or_else(|| {
-        ControllerStateError::Invalid("durable database has no account home".to_owned())
-    })?;
-    let home_directory = open_existing_directory(home, "account home")?;
+    let home_directory = open_existing_directory(&paths.home, "account home")?;
     validate_directory(&home_directory, paths.expected_uid, false, "account home")?;
 
     let library = open_existing_child_directory(&home_directory, OsStr::new("Library"), "Library")?;
@@ -2632,7 +2787,7 @@ impl DatabaseMutationMonitor {
         directory: &ControllerDirectory,
         databases: &[&PrivateDatabase],
     ) -> Result<Self, ControllerStateError> {
-        let mut descriptors = directory.descriptors().to_vec();
+        let mut descriptors = directory.descriptors();
         descriptors.extend(databases.iter().map(|database| &database.descriptor));
         Self::from_descriptors(&descriptors)
     }
@@ -2642,7 +2797,7 @@ impl DatabaseMutationMonitor {
         database: &PrivateDatabase,
         sidecars: &BTreeMap<String, PrivateDatabase>,
     ) -> Result<Self, ControllerStateError> {
-        let mut descriptors = directory.descriptors().to_vec();
+        let mut descriptors = directory.descriptors();
         descriptors.push(&database.descriptor);
         descriptors.extend(sidecars.values().map(|sidecar| &sidecar.descriptor));
         Self::from_descriptors_with_directory_write(&descriptors, &directory.descriptor)
@@ -2653,7 +2808,7 @@ impl DatabaseMutationMonitor {
         database: &PrivateDatabase,
         sidecars: &BTreeMap<String, PrivateDatabase>,
     ) -> Result<Self, ControllerStateError> {
-        let mut descriptors = directory.descriptors().to_vec();
+        let mut descriptors = directory.descriptors();
         descriptors.push(&database.descriptor);
         descriptors.extend(sidecars.values().map(|sidecar| &sidecar.descriptor));
         Self::from_descriptors(&descriptors)
@@ -2664,7 +2819,7 @@ impl DatabaseMutationMonitor {
         database: &PrivateDatabase,
         sidecars: &BTreeMap<String, PrivateDatabase>,
     ) -> Result<Self, ControllerStateError> {
-        let mut descriptors = directory.descriptors().to_vec();
+        let mut descriptors = directory.descriptors();
         descriptors.push(&database.descriptor);
         descriptors.extend(sidecars.values().map(|sidecar| &sidecar.descriptor));
         let mut write_descriptors = vec![
@@ -3116,6 +3271,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     fn seed_test_store(path: &Path, label: &str) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(parent) = path.parent() {
             if !parent.exists() {
@@ -3149,8 +3306,12 @@ mod tests {
         let runtime = root.join("runtime");
         fs::create_dir(&runtime)?;
         fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))?;
-        let paths =
-            ControllerStatePaths::for_home_and_runtime(&home, &runtime, geteuid().as_raw())?;
+        let paths = ControllerStatePaths::for_home_and_runtime(
+            &home,
+            &runtime,
+            geteuid().as_raw(),
+            BackendSelection::Apple,
+        )?;
         let application = application_support.join(APPLICATION_ID);
         let controller = application.join(CONTROLLER_DIRECTORY);
         fs::create_dir(&application)?;
@@ -3158,7 +3319,7 @@ mod tests {
         fs::create_dir(&controller)?;
         fs::set_permissions(&controller, fs::Permissions::from_mode(0o700))?;
         seed_test_store(paths.durable_database(), "same")?;
-        seed_test_store(paths.legacy_database(), "same")?;
+        seed_test_store(paths.legacy_database_required()?, "same")?;
         Ok(paths)
     }
 
@@ -3175,11 +3336,166 @@ mod tests {
         let runtime = root.join("runtime");
         fs::create_dir(&runtime)?;
         fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))?;
-        let paths =
-            ControllerStatePaths::for_home_and_runtime(&home, &runtime, geteuid().as_raw())?;
+        let paths = ControllerStatePaths::for_home_and_runtime(
+            &home,
+            &runtime,
+            geteuid().as_raw(),
+            BackendSelection::Apple,
+        )?;
         let _controller = open_controller_directory(&paths)?;
-        seed_test_store(paths.legacy_database(), "legacy")?;
+        seed_test_store(paths.legacy_database_required()?, "legacy")?;
         Ok(paths)
+    }
+
+    /// Builds the account home and runtime directory a real install has, then
+    /// resolves the paths for one backend. Nothing under `dev.gascan` is
+    /// created: opening the store is what creates it, and which directories it
+    /// creates is the thing under test.
+    fn scoped_paths(
+        root: &Path,
+        backend: BackendSelection,
+    ) -> Result<ControllerStatePaths, Box<dyn std::error::Error>> {
+        let home = root.join("home");
+        let library = home.join("Library");
+        let application_support = library.join("Application Support");
+        let runtime = root.join("runtime");
+        for directory in [&home, &library, &application_support, &runtime] {
+            if !directory.exists() {
+                fs::create_dir_all(directory)?;
+            }
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(ControllerStatePaths::for_home_and_runtime(
+            &home,
+            &runtime,
+            geteuid().as_raw(),
+            backend,
+        )?)
+    }
+
+    fn controller_root(root: &Path) -> PathBuf {
+        root.join("home")
+            .join("Library")
+            .join("Application Support")
+            .join(APPLICATION_ID)
+            .join(CONTROLLER_DIRECTORY)
+    }
+
+    /// **Apple keeps the unscoped path, and scoping it would have been the
+    /// harm.** Every install that predates backend selection has its records
+    /// here and its containers still running; a child directory would orphan
+    /// all of them at once, silently.
+    #[test]
+    fn apple_keeps_the_unscoped_path_and_owns_the_legacy_database() -> TestResult {
+        let temp = TempDir::new()?;
+        let root = temp.path().canonicalize()?;
+        let paths = scoped_paths(&root, BackendSelection::Apple)?;
+        assert_eq!(
+            paths.durable_database(),
+            controller_root(&root).join(DATABASE_NAME)
+        );
+        assert_eq!(
+            paths.legacy_database(),
+            Some(root.join("runtime").join(DATABASE_NAME).as_path())
+        );
+        assert_eq!(paths.scope_child(), None);
+        Ok(())
+    }
+
+    /// Every backend that is not Apple lives under a child of `controller/`,
+    /// and the child is the same string the daemon instance record carries.
+    /// Two spellings could drift, and a daemon that reported one backend while
+    /// opening another's store is what the scoping exists to prevent.
+    #[test]
+    fn every_other_backend_is_scoped_under_its_own_instance_record_name() -> TestResult {
+        let temp = TempDir::new()?;
+        let root = temp.path().canonicalize()?;
+        for backend in [BackendSelection::Arca, BackendSelection::Fake] {
+            let paths = scoped_paths(&root, backend)?;
+            assert_eq!(paths.scope_child(), Some(backend.as_str()));
+            assert_eq!(
+                paths.durable_database(),
+                controller_root(&root)
+                    .join(backend.as_str())
+                    .join(DATABASE_NAME),
+                "{backend:?} did not land under its own child"
+            );
+            assert_eq!(
+                paths.legacy_database(),
+                None,
+                "{backend:?} claimed a legacy database it never wrote"
+            );
+        }
+        Ok(())
+    }
+
+    /// **A scoped daemon does not adopt, migrate, delete or refuse on the
+    /// legacy runtime database.** It is Apple's: the durable store landed in
+    /// `9c6933e` (2026-08-04) and the first non-Apple backend in `7f9e8e6`
+    /// (2026-08-17), so no other backend has ever written one.
+    ///
+    /// Refusing matters as much as adopting. `open_legacy_orphans` turns a
+    /// stray sidecar into `ControllerStateError::Unsafe`, and Apple's leftover
+    /// WAL must not stop an Arca daemon from starting.
+    #[test]
+    fn a_scoped_store_leaves_the_legacy_database_untouched() -> TestResult {
+        let temp = TempDir::new()?;
+        let root = temp.path().canonicalize()?;
+        let apple = scoped_paths(&root, BackendSelection::Apple)?;
+        let legacy = apple.legacy_database_required()?.to_path_buf();
+        seed_test_store(&legacy, "apple-legacy")?;
+        let orphan = PathBuf::from(format!("{}-wal", legacy.display()));
+        fs::write(&orphan, b"apple's leftover write-ahead log")?;
+        fs::set_permissions(&orphan, fs::Permissions::from_mode(0o600))?;
+        let before = fs::read(&legacy)?;
+
+        let arca = scoped_paths(&root, BackendSelection::Arca)?;
+        let store = open_controller_store(&arca)?;
+        assert_eq!(store.list_sandboxes()?.len(), 0);
+        drop(store);
+
+        assert!(arca.durable_database().is_file());
+        assert!(!apple.durable_database().exists());
+        assert_eq!(fs::read(&legacy)?, before);
+        assert_eq!(fs::read(&orphan)?, b"apple's leftover write-ahead log");
+        Ok(())
+    }
+
+    /// Two backends on the same account keep two stores, and neither can see
+    /// the other's records. This is the whole point: `reconcile()` on a store
+    /// full of another backend's sandboxes raises `MissingOwned`, and
+    /// `gascan destroy` then drops a record whose container is still running.
+    #[test]
+    fn two_backends_on_one_account_do_not_see_each_others_records() -> TestResult {
+        let temp = TempDir::new()?;
+        let root = temp.path().canonicalize()?;
+
+        // Opened first so that `open_controller_store` is what creates the
+        // directories, then seeded through the file it created.
+        let apple = scoped_paths(&root, BackendSelection::Apple)?;
+        drop(open_controller_store(&apple)?);
+        seed_test_store(apple.durable_database(), "apple")?;
+
+        let arca = scoped_paths(&root, BackendSelection::Arca)?;
+        let arca_store = open_controller_store(&arca)?;
+        assert!(
+            arca_store.list_sandboxes()?.is_empty(),
+            "the Arca store adopted Apple's records"
+        );
+        drop(arca_store);
+        seed_test_store(arca.durable_database(), "arca")?;
+
+        assert_ne!(apple.durable_database(), arca.durable_database());
+        for (paths, expected) in [(&apple, "apple-aaaaaaaaaaaa"), (&arca, "arca-aaaaaaaaaaaa")] {
+            let store = open_controller_store(paths)?;
+            let ids = store
+                .list_sandboxes()?
+                .into_iter()
+                .map(|record| record.id.as_str().to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(ids, vec![expected.to_owned()]);
+        }
+        Ok(())
     }
 
     fn assert_snapshot_post_consumption_aba_refused(
@@ -3233,7 +3549,7 @@ mod tests {
         suffix: Option<&str>,
     ) -> Result<Option<Connection>, Box<dyn std::error::Error>> {
         if suffix == Some("-wal") {
-            let connection = Connection::open(paths.legacy_database())?;
+            let connection = Connection::open(paths.legacy_database_required()?)?;
             connection.pragma_update(None, "journal_mode", "WAL")?;
             connection.pragma_update(None, "wal_autocheckpoint", 0)?;
             connection.execute("UPDATE sandboxes SET updated_at_millis = 9", [])?;
@@ -3241,17 +3557,20 @@ mod tests {
                 fs::set_permissions(
                     PathBuf::from(format!(
                         "{}{sidecar_suffix}",
-                        paths.legacy_database().display()
+                        paths.legacy_database_required()?.display()
                     )),
                     fs::Permissions::from_mode(0o600),
                 )?;
             }
             Ok(Some(connection))
         } else if suffix == Some("-journal") {
-            let connection = Connection::open(paths.legacy_database())?;
+            let connection = Connection::open(paths.legacy_database_required()?)?;
             connection.pragma_update(None, "journal_mode", "PERSIST")?;
             connection.execute("UPDATE sandboxes SET updated_at_millis = 9", [])?;
-            let journal = PathBuf::from(format!("{}-journal", paths.legacy_database().display()));
+            let journal = PathBuf::from(format!(
+                "{}-journal",
+                paths.legacy_database_required()?.display()
+            ));
             fs::set_permissions(&journal, fs::Permissions::from_mode(0o600))?;
             Ok(Some(connection))
         } else {
@@ -3440,13 +3759,16 @@ mod tests {
         let temp = TempDir::new()?;
         let root = temp.path().canonicalize()?;
         let paths = seeded_legacy_paths(&root)?;
-        let connection = Connection::open(paths.legacy_database())?;
+        let connection = Connection::open(paths.legacy_database_required()?)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "wal_autocheckpoint", 0)?;
         connection.execute("UPDATE sandboxes SET updated_at_millis = 8", [])?;
         for suffix in ["-wal", "-shm"] {
             fs::set_permissions(
-                PathBuf::from(format!("{}{suffix}", paths.legacy_database().display())),
+                PathBuf::from(format!(
+                    "{}{suffix}",
+                    paths.legacy_database_required()?.display()
+                )),
                 fs::Permissions::from_mode(0o600),
             )?;
         }
@@ -3484,7 +3806,10 @@ mod tests {
         let temp = TempDir::new()?;
         let root = temp.path().canonicalize()?;
         let paths = seeded_legacy_paths(&root)?;
-        let journal = PathBuf::from(format!("{}-journal", paths.legacy_database().display()));
+        let journal = PathBuf::from(format!(
+            "{}-journal",
+            paths.legacy_database_required()?.display()
+        ));
         fs::write(&journal, b"ignored legacy journal")?;
         fs::set_permissions(&journal, fs::Permissions::from_mode(0o600))?;
         let controller = open_existing_controller_directory(&paths)?;
@@ -3517,8 +3842,11 @@ mod tests {
         let temp = TempDir::new()?;
         let root = temp.path().canonicalize()?;
         let paths = seeded_legacy_paths(&root)?;
-        fs::remove_file(paths.legacy_database())?;
-        let orphan = PathBuf::from(format!("{}-wal", paths.legacy_database().display()));
+        fs::remove_file(paths.legacy_database_required()?)?;
+        let orphan = PathBuf::from(format!(
+            "{}-wal",
+            paths.legacy_database_required()?.display()
+        ));
         fs::write(&orphan, b"original orphan")?;
         fs::set_permissions(&orphan, fs::Permissions::from_mode(0o600))?;
         let replacement = root.join("replacement-orphan");
@@ -3555,8 +3883,11 @@ mod tests {
         let temp = TempDir::new()?;
         let root = temp.path().canonicalize()?;
         let paths = seeded_legacy_paths(&root)?;
-        fs::remove_file(paths.legacy_database())?;
-        let orphan = PathBuf::from(format!("{}-wal", paths.legacy_database().display()));
+        fs::remove_file(paths.legacy_database_required()?)?;
+        let orphan = PathBuf::from(format!(
+            "{}-wal",
+            paths.legacy_database_required()?.display()
+        ));
         fs::write(&orphan, b"original orphan")?;
         fs::set_permissions(&orphan, fs::Permissions::from_mode(0o600))?;
         let controller = open_existing_controller_directory(&paths)?;
@@ -3586,7 +3917,7 @@ mod tests {
         assert_eq!(fs::read(&orphan)?, b"original orphan");
         let quarantine = fs::read_dir(
             paths
-                .legacy_database()
+                .legacy_database_required()?
                 .parent()
                 .ok_or_else(|| std::io::Error::other("legacy database has no parent"))?,
         )?
@@ -3615,14 +3946,16 @@ mod tests {
         durable_connection.pragma_update(None, "journal_mode", "WAL")?;
         durable_connection.pragma_update(None, "wal_autocheckpoint", 0)?;
         durable_connection.execute("UPDATE sandboxes SET updated_at_millis = 8", [])?;
-        let legacy_connection = Connection::open(paths.legacy_database())?;
+        let legacy_connection = Connection::open(paths.legacy_database_required()?)?;
         legacy_connection.pragma_update(None, "journal_mode", "WAL")?;
         legacy_connection.pragma_update(None, "wal_autocheckpoint", 0)?;
         legacy_connection.execute("UPDATE sandboxes SET updated_at_millis = 8", [])?;
-        let legacy_family = std::iter::once(paths.legacy_database().to_path_buf())
-            .chain(["-wal", "-shm"].map(|suffix| {
-                PathBuf::from(format!("{}{suffix}", paths.legacy_database().display()))
-            }))
+        let legacy = paths.legacy_database_required()?;
+        let legacy_family = std::iter::once(legacy.to_path_buf())
+            .chain(
+                ["-wal", "-shm"]
+                    .map(|suffix| PathBuf::from(format!("{}{suffix}", legacy.display()))),
+            )
             .map(|path| {
                 fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
                 Ok((path.clone(), fs::read(path)?))
@@ -3666,7 +3999,7 @@ mod tests {
         durable_connection.pragma_update(None, "journal_mode", "WAL")?;
         durable_connection.pragma_update(None, "wal_autocheckpoint", 0)?;
         durable_connection.execute("UPDATE sandboxes SET updated_at_millis = 8", [])?;
-        let legacy_connection = Connection::open(paths.legacy_database())?;
+        let legacy_connection = Connection::open(paths.legacy_database_required()?)?;
         legacy_connection.execute("UPDATE sandboxes SET updated_at_millis = 8", [])?;
         drop(legacy_connection);
         let durable_wal = PathBuf::from(format!("{}-wal", paths.durable_database().display()));
@@ -3674,7 +4007,7 @@ mod tests {
         for sidecar in [&durable_wal, &durable_shm] {
             fs::set_permissions(sidecar, fs::Permissions::from_mode(0o600))?;
         }
-        let legacy_before = fs::read(paths.legacy_database())?;
+        let legacy_before = fs::read(paths.legacy_database_required()?)?;
         let displaced = root.join("displaced-durable-wal");
 
         let result = open_controller_store_with_before_dual_archive(&paths, || {
@@ -3687,7 +4020,7 @@ mod tests {
             Ok(())
         });
         assert!(matches!(result, Err(ControllerStateError::Unsafe(_))));
-        assert_eq!(fs::read(paths.legacy_database())?, legacy_before);
+        assert_eq!(fs::read(paths.legacy_database_required()?)?, legacy_before);
         drop(durable_connection);
         Ok(())
     }
@@ -3699,7 +4032,7 @@ mod tests {
             let temp = TempDir::new()?;
             let root = temp.path().canonicalize()?;
             let paths = seeded_dual_paths(&root)?;
-            let legacy_before = fs::read(paths.legacy_database())?;
+            let legacy_before = fs::read(paths.legacy_database_required()?)?;
             let sidecar = PathBuf::from(format!("{}{suffix}", paths.durable_database().display()));
 
             let result = open_controller_store_with_final_dual_unlink_hook(&paths, || {
@@ -3711,7 +4044,7 @@ mod tests {
             });
 
             assert!(matches!(result, Err(ControllerStateError::Unsafe(_))));
-            assert_eq!(fs::read(paths.legacy_database())?, legacy_before);
+            assert_eq!(fs::read(paths.legacy_database_required()?)?, legacy_before);
         }
         Ok(())
     }
@@ -3722,7 +4055,7 @@ mod tests {
         let temp = TempDir::new()?;
         let root = temp.path().canonicalize()?;
         let paths = seeded_dual_paths(&root)?;
-        let legacy_before = fs::read(paths.legacy_database())?;
+        let legacy_before = fs::read(paths.legacy_database_required()?)?;
         let replacement = root.join("outer-validation-replacement.sqlite3");
         let replacement_store = Store::open(&replacement)?;
         drop(replacement_store);
@@ -3738,7 +4071,7 @@ mod tests {
         });
 
         assert!(matches!(result, Err(ControllerStateError::Unsafe(_))));
-        assert_eq!(fs::read(paths.legacy_database())?, legacy_before);
+        assert_eq!(fs::read(paths.legacy_database_required()?)?, legacy_before);
         Ok(())
     }
 
@@ -3757,8 +4090,12 @@ mod tests {
         let runtime = root.join("runtime");
         fs::create_dir(&runtime)?;
         fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))?;
-        let paths =
-            ControllerStatePaths::for_home_and_runtime(&home, &runtime, geteuid().as_raw())?;
+        let paths = ControllerStatePaths::for_home_and_runtime(
+            &home,
+            &runtime,
+            geteuid().as_raw(),
+            BackendSelection::Apple,
+        )?;
         let application = application_support.join(APPLICATION_ID);
         let controller = application.join(CONTROLLER_DIRECTORY);
         fs::create_dir(&application)?;
@@ -3766,8 +4103,8 @@ mod tests {
         fs::create_dir(&controller)?;
         fs::set_permissions(&controller, fs::Permissions::from_mode(0o700))?;
         seed_test_store(paths.durable_database(), "same")?;
-        seed_test_store(paths.legacy_database(), "same")?;
-        let legacy_before = fs::read(paths.legacy_database())?;
+        seed_test_store(paths.legacy_database_required()?, "same")?;
+        let legacy_before = fs::read(paths.legacy_database_required()?)?;
         let replacement = root.join("replacement.sqlite3");
         let replacement_store = Store::open(&replacement)?;
         drop(replacement_store);
@@ -3782,7 +4119,7 @@ mod tests {
             Ok(())
         });
         assert!(matches!(result, Err(ControllerStateError::Unsafe(_))));
-        assert_eq!(fs::read(paths.legacy_database())?, legacy_before);
+        assert_eq!(fs::read(paths.legacy_database_required()?)?, legacy_before);
         Ok(())
     }
 
@@ -3802,6 +4139,7 @@ mod tests {
             &home,
             &root.join("runtime"),
             geteuid().as_raw(),
+            BackendSelection::Apple,
         )?;
         let controller = open_controller_directory(&paths)?;
         let name = ".state.sqlite3.migration-source-41";
@@ -3845,6 +4183,7 @@ mod tests {
             &home,
             &root.join("runtime"),
             geteuid().as_raw(),
+            BackendSelection::Apple,
         )?;
         let controller = open_controller_directory(&paths)?;
         let abandoned = controller_path(&paths, ".state.sqlite3.migration-source-51");
@@ -3894,6 +4233,7 @@ mod tests {
             &home,
             &root.join("runtime"),
             geteuid().as_raw(),
+            BackendSelection::Apple,
         )?;
         let controller = open_controller_directory(&paths)?;
         let name = ".state.sqlite3.migration-source-52";
@@ -3949,6 +4289,7 @@ mod tests {
             &home,
             &root.join("runtime"),
             geteuid().as_raw(),
+            BackendSelection::Apple,
         )?;
         let controller = open_controller_directory(&paths)?;
         let name = ".state.sqlite3.migration-source-53";
@@ -4006,6 +4347,7 @@ mod tests {
             &home,
             &root.join("runtime"),
             geteuid().as_raw(),
+            BackendSelection::Apple,
         )?;
         let replacement = root.join("replacement.sqlite3");
         fs::write(&replacement, b"")?;
@@ -4024,7 +4366,7 @@ mod tests {
             }
             Err(error) => error,
         };
-        assert_eq!(error.code(), "controller_state_unsafe");
+        assert_eq!(error.code().as_str(), "controller_state_unsafe");
         assert_eq!(fs::metadata(&replacement)?.len(), 0);
         Ok(())
     }
@@ -4045,6 +4387,7 @@ mod tests {
             &home,
             &root.join("runtime"),
             geteuid().as_raw(),
+            BackendSelection::Apple,
         )?;
         let controller = paths
             .durable_database()
@@ -4067,7 +4410,7 @@ mod tests {
             }
             Err(error) => error,
         };
-        assert_eq!(error.code(), "controller_state_unsafe");
+        assert_eq!(error.code().as_str(), "controller_state_unsafe");
         Ok(())
     }
 
@@ -4088,6 +4431,7 @@ mod tests {
             &home,
             &root.join("runtime"),
             geteuid().as_raw(),
+            BackendSelection::Apple,
         )?;
         let replacement = root.join("replacement.sqlite3");
         fs::write(&replacement, b"")?;
@@ -4119,7 +4463,7 @@ mod tests {
             }
             Err(error) => error,
         };
-        assert_eq!(error.code(), "controller_state_unsafe");
+        assert_eq!(error.code().as_str(), "controller_state_unsafe");
         Ok(())
     }
 
@@ -4139,6 +4483,7 @@ mod tests {
             &home,
             &root.join("runtime"),
             geteuid().as_raw(),
+            BackendSelection::Apple,
         )?;
         let application = application_support.join(APPLICATION_ID);
         let displaced = root.join("displaced-application");
@@ -4180,7 +4525,7 @@ mod tests {
             }
             Err(error) => error,
         };
-        assert_eq!(error.code(), "controller_state_unsafe");
+        assert_eq!(error.code().as_str(), "controller_state_unsafe");
         Ok(())
     }
 }

@@ -99,6 +99,47 @@ PACKAGE
 write_package ArcaEngineTests ArcaTests
 printf 'public let engineFixture = 1\n' >"$upstream/Sources/ContainerBridge/Fixture.swift"
 printf 'public let sandboxEngineProtoFixture = 1\n' >"$upstream/Sources/SandboxEngineProto/Fixture.swift"
+
+# Arca's gen-buildinfo target, in the shape the build script now runs. The
+# revision expression is an argument so that "the generator lies about which
+# tree it built" is expressible below -- which is the only way to show that the
+# script's assertion is load-bearing rather than a tautology. In the honest
+# form, `git rev-parse HEAD` inside a detached checkout of the pinned revision
+# can only ever yield the pinned revision, so an honest fixture proves nothing
+# about the assertion.
+#
+# A tab-indented recipe, written through a quoted heredoc: make requires the
+# tab, and the printf carries a literal one.
+write_buildinfo_makefile() {
+  printf 'REVISION = %s\n' "$1" >"$upstream/Makefile"
+  cat >>"$upstream/Makefile" <<'MAKEFILE'
+.PHONY: gen-buildinfo
+gen-buildinfo:
+	@echo "Generating build info..."
+	@printf '// AUTO-GENERATED FILE - DO NOT EDIT\n' > Sources/ContainerBridge/BuildInfo.generated.swift
+	@printf 'public struct ArcaBuildInfo {\n' >> Sources/ContainerBridge/BuildInfo.generated.swift
+	@printf '    public static let buildRevision = "%s"\n' '$(REVISION)' >> Sources/ContainerBridge/BuildInfo.generated.swift
+	@printf '}\n' >> Sources/ContainerBridge/BuildInfo.generated.swift
+MAKEFILE
+}
+write_buildinfo_makefile '$(shell git rev-parse HEAD)'
+
+# The committed BuildInfo.generated.swift is DELIBERATELY STALE, and it is
+# tracked, because that is the state the real one was found in: Arca's recorded
+# 5e1170495400b25f6334c6d8ddda5d3521b7cfd8 while the tag being pinned was
+# c545612b056e028d5885968a7b9f586d694f994c, and before that it drifted through a
+# whole milestone unnoticed. A fixture that committed the correct revision would
+# pass whether or not the script regenerates anything.
+#
+# Forty f's, so it is a well-formed revision that no tree can ever have: a stale
+# value that happened to match some other fixture commit would make a passing
+# case ambiguous.
+cat >"$upstream/Sources/ContainerBridge/BuildInfo.generated.swift" <<'BUILDINFO'
+// AUTO-GENERATED FILE - DO NOT EDIT
+public struct ArcaBuildInfo {
+    public static let buildRevision = "ffffffffffffffffffffffffffffffffffffffff"
+}
+BUILDINFO
 # The entitlements the build script signs with, under the name Arca gives them
 # (Arca's Makefile: `ENTITLEMENTS = Arca.entitlements`), because the script reads
 # them out of the checkout by that name. One key and not the five Arca carries:
@@ -351,12 +392,80 @@ git -C "$upstream" -c commit.gpgsign=false commit -qm 'entitlements gone'
 entitlements_gone=$(git -C "$upstream" rev-parse --verify HEAD)
 git -C "$upstream" tag -s -m 'entitlements gone' entitlements-gone "$entitlements_gone"
 
+# Two trees for the build-revision assertion, which is the load-bearing half of
+# regenerating BuildInfo.generated.swift: regeneration alone only changes WHICH
+# unverified value gets compiled.
+#
+# Arca.entitlements is restored from the pinned commit first, because the tree
+# above deleted it and the signing gate would otherwise end these runs before
+# the assertion they exist to reach.
+git -C "$upstream" checkout -q "$pinned" -- Arca.entitlements
+
+# A generator that lies about which tree it built. This is the ONLY way to
+# exercise the assertion: in an honest tree `git rev-parse HEAD` inside a
+# detached checkout of the pinned revision can only ever return the pinned
+# revision, so an honest fixture would pass with the assertion deleted.
+#
+# A well-formed 40-character revision that is not the pinned one, and not any
+# other commit in this fixture, so a pass cannot be an accident of collision.
+write_buildinfo_makefile 0123456789abcdef0123456789abcdef01234567
+git -C "$upstream" add -A
+git -C "$upstream" -c commit.gpgsign=false commit -qm 'buildinfo lies'
+buildinfo_lies=$(git -C "$upstream" rev-parse --verify HEAD)
+git -C "$upstream" tag -s -m 'buildinfo lies' buildinfo-lies "$buildinfo_lies"
+
+# No generator at all. `make gen-buildinfo` fails outright, which is a different
+# failure from a generator that runs and produces the wrong answer -- and it is
+# the one that happens the day Arca renames the target. It has to be loud: a
+# script that shrugged here would silently fall back to compiling whatever stale
+# constant is committed, which is precisely the state this task found.
+git -C "$upstream" rm -q Makefile
+git -C "$upstream" add -A
+git -C "$upstream" -c commit.gpgsign=false commit -qm 'buildinfo generator gone'
+buildinfo_gone=$(git -C "$upstream" rev-parse --verify HEAD)
+git -C "$upstream" tag -s -m 'buildinfo generator gone' buildinfo-gone "$buildinfo_gone"
+
+# The artifact block is constant across every case here. This script gates
+# scripts/build-arca-engine.sh, which compiles a tree and never downloads an
+# asset, so no case below turns on an artifact's digest -- but schema 2 requires
+# the block, and a fixture that omitted it would fail every case for the wrong
+# reason. The digests are the published gascan-engine-m4 ones so that a reader
+# comparing this file to engine/arca-pin.json sees the same values; nothing here
+# depends on that, and write_pin_artifacts exists so a case CAN vary them.
+pin_artifacts() {
+  jq -n --arg asset_url "file://$upstream" '{
+    kernel: {
+      asset: "vmlinux-arm64.gz",
+      url: ($asset_url + "/vmlinux-arm64.gz"),
+      bytes: 9092349,
+      sha256: "8a30e10d9e40dcc44396049753a3a26be74cbc77a78afca819cf8f1c13f8597a",
+      content: {
+        kind: "gzip-member",
+        bytes: 28248576,
+        sha256: "49e0f08165409769e5ae2abbe3414198c2907a15e7e20a5f3971aa7a0de33394"
+      }
+    },
+    vminit: {
+      asset: "vminit-oci-arm64.tar.gz",
+      url: ($asset_url + "/vminit-oci-arm64.tar.gz"),
+      bytes: 73739738,
+      sha256: "51602e72883e49e4be1e27a690bf8c13b0a66cba381725cf8ea4888ec4e369be",
+      content: {
+        kind: "oci-manifest",
+        bytes: 478,
+        sha256: "cf74cd41bd430d9d8935d36c1749d9c05f19a43842f4a4cff0d01de3832222c2"
+      }
+    }
+  }'
+}
+
 # file:// and not a bare path: the script constrains .url to schemes git cannot
 # turn into a command, so the fixture must speak one of them. git clone accepts
 # file:// against a local path unchanged.
 write_pin() {
   jq -n --arg url "file://$upstream" --arg tag "$2" --arg rev "$3" \
-    '{schema: 1, name: "arca", url: $url, tag: $tag, revision: $rev}' >"$1"
+    --argjson artifacts "$(pin_artifacts)" \
+    '{schema: 2, name: "arca", url: $url, tag: $tag, revision: $rev, artifacts: $artifacts}' >"$1"
 }
 
 run_case() {
@@ -401,15 +510,76 @@ write_pin "$fixture/pin-good.json" engine-baseline "$pinned"
 write_pin "$fixture/pin-short.json" engine-baseline deadbeef
 run_case short-revision "$fixture/pin-short.json" 64
 
-jq -n '{schema: 1, name: "arca", url: "x", tag: "y"}' >"$fixture/pin-nokey.json"
+jq -n '{schema: 2, name: "arca", url: "x", tag: "y"}' >"$fixture/pin-nokey.json"
 run_case missing-revision "$fixture/pin-nokey.json" 64
 
 # 64 — a .url git would execute rather than fetch. ext:: runs its argument as a
 # command, so an unconstrained URL is arbitrary execution at clone time.
-jq -n --arg rev "$pinned" \
-  '{schema: 1, name: "arca", url: "ext::sh -c touch% /dev/null", tag: "engine-baseline", revision: $rev}' \
+jq -n --arg rev "$pinned" --argjson artifacts "$(pin_artifacts)" \
+  '{schema: 2, name: "arca", url: "ext::sh -c touch% /dev/null", tag: "engine-baseline", revision: $rev, artifacts: $artifacts}' \
   >"$fixture/pin-exec-url.json"
 run_case exec-url "$fixture/pin-exec-url.json" 64
+
+# 64 — the schema-2 artifact block, one refusal per clause that can go wrong
+# without being obviously wrong. Every case starts from pin-good.json and edits
+# ONE field, so a case that stops failing names the clause that stopped holding
+# rather than "something about artifacts".
+#
+# These gate a block this script never reads: build-arca-engine.sh compiles a
+# tree and downloads no asset. They are here anyway because the schema file is
+# shared with scripts/sync-arca-proto.sh and with the fetch, and this is the
+# contract that runs it. A digest the fetch would reject must be refused at pin
+# validation, where the message names the pin file, and not after ~83MB.
+write_artifact_pin() {
+  local label=$1 filter=$2
+  jq "$filter" "$fixture/pin-good.json" >"$fixture/pin-$label.json"
+  run_case "$label" "$fixture/pin-$label.json" 64
+}
+write_artifact_pin artifacts-absent 'del(.artifacts)'
+write_artifact_pin artifacts-array '.artifacts = []'
+# One artifact present and the other missing. A schema that checked
+# `.artifacts | type == "object"` and stopped would pass this, and the fetch
+# would then fail at the point of use with the pin already accepted.
+write_artifact_pin vminit-absent 'del(.artifacts.vminit)'
+write_artifact_pin kernel-absent 'del(.artifacts.kernel)'
+# A truncated download is refused by byte length before its digest is computed,
+# which is the cheaper and clearer of the two refusals -- so the length has to
+# be a length. 0, negative and fractional each pass `type == "number"`.
+write_artifact_pin bytes-zero '.artifacts.kernel.bytes = 0'
+write_artifact_pin bytes-negative '.artifacts.kernel.bytes = -1'
+write_artifact_pin bytes-fractional '.artifacts.kernel.bytes = 9092349.5'
+write_artifact_pin bytes-string '.artifacts.kernel.bytes = "9092349"'
+# Uppercase hex is the realistic malformed digest: shasum prints lowercase and
+# every comparison downstream is a string compare, so a pasted uppercase digest
+# would match nothing while looking correct to a reader.
+write_artifact_pin sha256-uppercase '.artifacts.kernel.sha256 |= ascii_upcase'
+write_artifact_pin sha256-short '.artifacts.kernel.sha256 = "8a30e10d"'
+# .content is the identity that survives repackaging. `tar czf` is not
+# reproducible, so the vminit asset's own sha256 dies the moment anyone
+# repackages the same bytes; a pin that lost .content would still verify a fresh
+# download and would silently stop being able to say WHAT it downloaded.
+write_artifact_pin content-absent 'del(.artifacts.vminit.content)'
+write_artifact_pin content-bytes-zero '.artifacts.vminit.content.bytes = 0'
+write_artifact_pin content-sha256-short '.artifacts.vminit.content.sha256 = "cf74cd41"'
+# An unrecognised kind is a content check no consumer can perform. Refusing it
+# here fails closed; accepting it would defer the failure to a fetch that has
+# already spent the download.
+write_artifact_pin content-kind-unknown '.artifacts.vminit.content.kind = "zip"'
+write_artifact_pin content-kind-absent 'del(.artifacts.vminit.content.kind)'
+# .asset names the file on disk, so a path in it escapes the artifact directory.
+write_artifact_pin asset-traversal '.artifacts.kernel.asset = "../vmlinux-arm64.gz"'
+write_artifact_pin asset-slash '.artifacts.kernel.asset = "sub/vmlinux-arm64.gz"'
+# The asset URL is validated separately from the git URL -- a release asset is
+# not served by the git endpoint -- so it needs its own refusal of a scheme that
+# is a command rather than a transport.
+write_artifact_pin asset-url-exec '.artifacts.kernel.url = "ext::sh -c touch% /dev/null"'
+
+# 64 — schema 1 itself. The bump is not cosmetic: a schema-1 pin carries no
+# digests at all, so accepting one would mean a build gated on a pin the fetch
+# cannot use. This is also the case that fails if only ONE of the two scripts is
+# moved to schema 2, which is the mistake the shared schema file exists to make
+# impossible.
+write_artifact_pin schema-1 '.schema = 1'
 
 # 64 — neither file exists; both are one mistyped environment variable away.
 run_case missing-pin-file "$fixture/pin-does-not-exist.json" 64
@@ -433,6 +603,31 @@ run_case wrong-signer "$fixture/pin-wrong-signer.json" 65
 # 65 — pinned revision absent from the repository
 write_pin "$fixture/pin-absent.json" engine-baseline 0000000000000000000000000000000000000000
 run_case absent-revision "$fixture/pin-absent.json" 65
+
+# 65 — the compiled build revision is not the pinned revision. Capabilities
+# field 20 carries this constant and gascan-arca decides Proven versus
+# Unverified by comparing it against a certified one, so an engine that
+# self-reports a revision unrelated to the tree it was built from makes that
+# gate worth nothing: it matches nothing in the safe case and the wrong tree in
+# the unsafe one.
+#
+# 65 and not 70: the tree is intact and the build could proceed. What is wrong
+# is the pinned input's own claim about itself, which is the same class as a tag
+# resolving to the wrong commit.
+write_pin "$fixture/pin-buildinfo-lies.json" buildinfo-lies "$buildinfo_lies"
+run_case buildinfo-lies "$fixture/pin-buildinfo-lies.json" 65
+grep -q '0123456789abcdef0123456789abcdef01234567' "$fixture/buildinfo-lies.out" || {
+  printf 'case buildinfo-lies: the refusal did not name the revision that was compiled\n' >&2
+  cat "$fixture/buildinfo-lies.out" >&2
+  exit 1
+}
+
+# 70 — the pinned tree has no build-info generator. The failure mode this
+# refuses is silence: a script that tolerated a missing generator would compile
+# whatever stale constant is committed, which is the exact state Arca's tree was
+# found in and the reason this step exists.
+write_pin "$fixture/pin-buildinfo-gone.json" buildinfo-gone "$buildinfo_gone"
+run_case buildinfo-gone "$fixture/pin-buildinfo-gone.json" 70
 
 # 64 — a .tag that is a path. Upstream really does carry the tag pair this names,
 # so the refusal is the pin schema's and not an accident of the fixture: every
@@ -599,8 +794,29 @@ for stale in Sources/ContainerBridge/Planted.swift .build/poison \
     exit 1
   }
 done
-git -C "$warm" diff --quiet || {
-  printf 'warm cache carried a tracked modification into the build\n' >&2
+# The build-info regeneration writes a TRACKED file inside the verified
+# checkout, so "no tracked file differs after the run" is no longer the
+# property. Excluding that path from `git diff --quiet` would be silencing a
+# check to make a step pass; what is asserted instead is strictly stronger than
+# what stood here before: EXACTLY ONE tracked file differs, it is the generated
+# build info and nothing else, and it holds the PINNED revision rather than the
+# deliberately stale one the fixture commits.
+#
+# Leaving the checkout dirty is deliberate and self-healing: the next run's
+# `git checkout --detach --force` resets tracked files before anything reads
+# them. The alternative -- restoring the file after the build -- would leave the
+# cache claiming a revision the binary beside it does not have, which is the
+# exact disagreement this whole step exists to remove.
+modified=$(git -C "$warm" diff --name-only)
+[[ $modified == Sources/ContainerBridge/BuildInfo.generated.swift ]] || {
+  printf 'warm cache tracked modifications were not exactly the build info: %s\n' \
+    "${modified:-<none>}" >&2
+  exit 1
+}
+grep -q "buildRevision = \"$pinned\"" \
+  "$warm/Sources/ContainerBridge/BuildInfo.generated.swift" || {
+  printf 'the warm cache build info does not name the pinned revision %s\n' "$pinned" >&2
+  cat "$warm/Sources/ContainerBridge/BuildInfo.generated.swift" >&2
   exit 1
 }
 git -C "$warm" submodule foreach --quiet --recursive git diff --quiet || {

@@ -5,14 +5,16 @@ use gascan_apple::{
     AppleBackend, AppleCompatibility, AppleProbe, AppleReleaseEvidence, AppleSystemStatus,
     CommandRunner, CommandSpec, ProcessRunner,
 };
-use gascan_core::doctor::{DoctorFact, DoctorFacts, DoctorReport, DoctorStatus};
+use gascan_core::doctor::{
+    AppleRemedies, ArcaRemedies, DoctorFact, DoctorFacts, DoctorReport, DoctorStatus, host,
+};
 use gascan_core::fake_runtime::FakeRuntime;
 use gascan_core::runtime::{RuntimeBackend, RuntimeError};
+use gascan_core::startup_diagnostic::{StartupCode, code as codes};
 use gascand::{
     BackendSelection, ControllerStateError, ControllerStatePaths, Daemon, DaemonConfig,
     DoctorState, ErrorDiagnostics, ProvisionRequest, ProvisionResolution, Provisioner, SandboxApi,
-    SandboxService, ServiceError, SocketPaths, SshPaths, Store, backend_selection,
-    open_controller_store,
+    SandboxService, ServiceError, SocketPaths, SshPaths, Store, open_controller_store,
 };
 use std::{sync::Arc, time::Duration};
 
@@ -241,31 +243,57 @@ async fn run(
         .map_or(Duration::from_secs(300), Duration::from_millis);
     let paths = SocketPaths::for_user()?;
     paths.prepare_directory()?;
+    // One shared reader, in gascan-core, because `gascan` resolves the same
+    // question to decide which daemon it will talk to. Two copies of this could
+    // disagree with each other while each stayed self-consistent.
+    //
+    // **Resolved before the store is opened, and that order is load-bearing.**
+    // The store is scoped by backend, so a daemon that opened it first would
+    // have to open it unscoped and then discover which backend it was -- which
+    // is the state that let an Arca daemon read Apple's records and report
+    // Apple's containers as its own.
+    let selection = gascand::backend_from_environment()?;
+    // **Held across the backend arm, not dropped once the store is open.**
+    //
+    // It used to be dropped right here, which made the controller store the
+    // only thing a failing daemon could explain. Everything the Arca arm does
+    // afterwards -- reading three undefaulted variables, locating the fetched
+    // boot artifacts, bringing an engine up, opening a channel on its socket --
+    // could report only to the `Stdio::null()` stderr the CLI gives a
+    // production daemon, so all of it reached the user as a readiness timeout.
+    // The descriptor is already unlinked, so holding it open costs one fd and
+    // changes nothing a reader sees.
     let store = match std::env::var_os("GASCAN_STATE_PATH") {
         Some(path) => Store::open(std::path::PathBuf::from(path))?,
         None => {
-            let state = controller_state_paths(&paths)
+            let state = controller_state_paths(&paths, selection)
                 .map_err(|error| controller_startup_error(error, startup_diagnostic.as_mut()))?;
             open_controller_store(&state)
                 .map_err(|error| controller_startup_error(error, startup_diagnostic.as_mut()))?
         }
     };
-    drop(startup_diagnostic);
     let e2e_ssh_paths = e2e_ssh_paths()?;
-    #[cfg(debug_assertions)]
-    let fake_requested = std::env::var_os(gascand::TEST_FAKE_BACKEND_ENV).is_some();
-    #[cfg(not(debug_assertions))]
-    let fake_requested = false;
-    match backend_selection(fake_requested) {
+    // Built once, from the selection that was actually resolved, so an arm
+    // cannot record a backend other than the one it constructs. Passing a
+    // literal per arm would have made that a convention rather than a fact.
+    let daemon_runtime = DaemonRuntime {
+        paths,
+        idle_timeout,
+        backend: selection,
+    };
+    match selection {
         BackendSelection::Apple => {
-            let doctor = DoctorState::refreshing(Duration::from_secs(60), production_doctor_report);
+            let doctor = DoctorState::refreshing(
+                Duration::from_secs(60),
+                &AppleRemedies,
+                production_doctor_report,
+            );
             let attach = gascan_apple::AppleAttach::configured_from_environment()?;
             let runner = E2eProcessRunner::configured_from_environment()?;
             run_daemon(
                 AppleBackend::with_attach(runner, attach),
                 store,
-                paths,
-                idle_timeout,
+                daemon_runtime,
                 ConfiguredProvisioner {
                     delay: Duration::ZERO,
                     fail: false,
@@ -276,6 +304,110 @@ async fn run(
                     e2e_paths: e2e_ssh_paths,
                     refresh_doctor: true,
                 },
+                startup_diagnostic,
+            )
+            .await
+        }
+        BackendSelection::Arca => {
+            // The socket is undefaulted. Its absence is a startup error naming
+            // the variable, not a guessed path: a default would make a typo in
+            // the socket path indistinguishable from not having set one, and
+            // where the engine listens is Arca's choice rather than Gas Can's
+            // to assume.
+            //
+            // **The message goes on the startup diagnostic channel, not to
+            // stderr.** The CLI gives a production daemon `Stdio::null()`, so
+            // until this arm wrote through the channel every one of these
+            // reached the user as a generic readiness timeout -- including
+            // `GASCAN_ENGINE_SOCKET must name its socket`, which names its own
+            // remedy. Task 13 built the doctor fact that says to run `gascan
+            // engine fetch`; Task 11's startup ordering made it unreachable in
+            // exactly the state it describes.
+            let required = |name: &str, what: &str| -> Result<std::path::PathBuf, std::io::Error> {
+                std::env::var_os(name)
+                    .map(std::path::PathBuf::from)
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!(
+                                "{} selects the Arca engine backend, so {name} must name {what}",
+                                gascand::ARCA_BACKEND_ENV
+                            ),
+                        )
+                    })
+            };
+            // `startup_error` with the diagnostic borrowed once, rather than a
+            // second body doing the same thing: the closure exists only because
+            // `?` needs a value and the borrow cannot be re-taken per call.
+            let mut reported = |code: StartupCode, error: &dyn std::fmt::Display| {
+                startup_error(code, &error, startup_diagnostic.as_mut())
+            };
+            // The kernel and the vminit layout are NOT read from the
+            // environment, and that asymmetry is deliberate. They are Gas Can's
+            // own installation: `gascan engine fetch` verifies and writes them
+            // to exactly these paths, and `engine_artifact_fact()` below reports
+            // on the same two. A second source for them would let the doctor
+            // report one pair while the spawn used another -- a daemon booting
+            // guests on a kernel nobody checked, described by a check that
+            // passed.
+            //
+            // The state root IS read from the environment, undefaulted like the
+            // socket and for the same reason `ENGINE_SOCKET_ENV` gives: an
+            // engine this daemon ADOPTS was pointed at a state root by whoever
+            // started it, and a spawning daemon that guessed a different one
+            // would write a second, divergent store that nothing compares.
+            let artifacts = gascan_core::engine_artifacts::ArtifactPaths::for_user()
+                .map_err(|error| reported(codes::ENGINE_ARTIFACTS_UNAVAILABLE, &error))?;
+            let launch = gascand::EngineLaunch {
+                executable: required(gascand::ENGINE_BIN_ENV, "the engine executable")
+                    .map_err(|error| reported(codes::ENGINE_ENVIRONMENT_INCOMPLETE, &error))?,
+                socket: required(gascand::ENGINE_SOCKET_ENV, "its socket")
+                    .map_err(|error| reported(codes::ENGINE_ENVIRONMENT_INCOMPLETE, &error))?,
+                state_root: required(gascand::ENGINE_STATE_ROOT_ENV, "its state root")
+                    .map_err(|error| reported(codes::ENGINE_ENVIRONMENT_INCOMPLETE, &error))?,
+                kernel: artifacts.kernel(),
+                vminit: artifacts.vminit(),
+            };
+            // Dial first, spawn on a miss. An engine that survived this
+            // daemon's predecessor is adopted rather than duplicated, which is
+            // what makes `service.reconcile()` below able to re-adopt the
+            // sandboxes it is still running.
+            gascand::ensure_engine(
+                &launch,
+                &gascand::TokioEngineSpawner,
+                gascand::EngineReadiness::default(),
+            )
+            .await
+            .map_err(|error| reported(error.code(), &error))?;
+            let transport = gascan_arca::ChannelTransport::connect(launch.socket)
+                .await
+                .map_err(|error| reported(codes::ENGINE_TRANSPORT_UNAVAILABLE, &error))?;
+            // The collector re-reads the engine on every refresh, so it holds a
+            // clone of the transport rather than a snapshot of its answers. A
+            // report cached from startup would keep saying the engine answers
+            // long after it stopped.
+            let doctor = {
+                let transport = transport.clone();
+                let engine_binary = launch.executable.clone();
+                DoctorState::refreshing(Duration::from_secs(60), &ArcaRemedies, move || {
+                    arca_doctor_report(transport.clone(), engine_binary.clone())
+                })
+            };
+            run_daemon(
+                gascan_arca::ArcaBackend::new(transport),
+                store,
+                daemon_runtime,
+                ConfiguredProvisioner {
+                    delay: Duration::ZERO,
+                    fail: false,
+                    rollback_failure_runtime: None,
+                },
+                doctor,
+                DaemonSshConfig {
+                    e2e_paths: e2e_ssh_paths,
+                    refresh_doctor: true,
+                },
+                startup_diagnostic,
             )
             .await
         }
@@ -288,7 +420,7 @@ async fn run(
             let provision_fail = std::env::var_os("GASCAN_FAKE_PROVISION_FAIL").is_some();
             let fake_state_path = std::env::var_os("GASCAN_FAKE_STATE_PATH")
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| paths.directory().join("fake-runtime.json"));
+                .unwrap_or_else(|| daemon_runtime.paths.directory().join("fake-runtime.json"));
             let runtime = FakeRuntime::persistent(
                 gascan_core::fake_runtime::fixture_capabilities(),
                 fake_state_path,
@@ -315,8 +447,7 @@ async fn run(
             run_daemon(
                 runtime.clone(),
                 store,
-                paths,
-                idle_timeout,
+                daemon_runtime,
                 ConfiguredProvisioner {
                     delay: provision_delay,
                     fail: provision_fail,
@@ -324,11 +455,14 @@ async fn run(
                         .is_some()
                         .then_some(runtime),
                 },
-                DoctorState::ready(DoctorFacts::all_supported_for_tests().into_report()),
+                DoctorState::ready(
+                    DoctorFacts::all_supported_for_tests().into_report(&AppleRemedies),
+                ),
                 DaemonSshConfig {
                     e2e_paths: e2e_ssh_paths,
                     refresh_doctor: refresh_ssh_doctor,
                 },
+                startup_diagnostic,
             )
             .await
         }
@@ -369,17 +503,33 @@ impl StartupDiagnostic {
     }
 }
 
-fn report_controller_startup_error(
-    error: &ControllerStateError,
+/// Reports a startup failure on the channel the CLI is watching.
+///
+/// Takes a code and a message rather than one error type. It used to take
+/// `&ControllerStateError`, which is why the store was the only thing that
+/// could explain a daemon that failed to start: every other startup failure
+/// -- a required engine variable that is not set, an engine that never bound
+/// its socket, an engine that exited on a bad argv -- went to the
+/// `Stdio::null()` stderr the CLI gives a production daemon and reached the
+/// user as a generic readiness timeout.
+///
+/// The code is a [`StartupCode`], so it is one the reader accepts by
+/// construction. It used to be a `&str` guarded by a `debug_assert!`, which is
+/// compiled out of the builds users run: an unlisted code was then written,
+/// passed every provenance check, and dropped by the whitelist without a trace.
+fn report_startup_error(
+    code: StartupCode,
+    message: &str,
     startup_diagnostic: Option<&mut StartupDiagnostic>,
 ) {
+    let code = code.as_str();
     let owner_token = std::env::var("GASCAN_DAEMON_OWNER_TOKEN").ok();
     let diagnostic = owner_token.as_ref().map(|owner_token| {
         format!(
             "GASCAN_CONTROLLER_STARTUP_ERROR {}\n",
             serde_json::json!({
-                "code": error.code(),
-                "message": error.to_string(),
+                "code": code,
+                "message": message,
                 "owner_token": owner_token,
             })
         )
@@ -390,47 +540,54 @@ fn report_controller_startup_error(
         }
         eprint!("{diagnostic}");
     } else {
-        eprintln!("{}: {}", error.code(), error);
+        eprintln!("{code}: {message}");
     }
+}
+
+/// Reports a startup failure and returns it, so a call site can `?` on it.
+///
+/// The message is rendered here rather than kept as a typed source, because
+/// what crosses the channel is a string and a code; a `source()` nobody can
+/// read on the other side is a chain that ends at this process.
+fn startup_error<E: std::fmt::Display>(
+    code: StartupCode,
+    error: &E,
+    startup_diagnostic: Option<&mut StartupDiagnostic>,
+) -> StartupError {
+    let message = error.to_string();
+    report_startup_error(code, &message, startup_diagnostic);
+    StartupError { code, message }
 }
 
 fn controller_startup_error(
     source: ControllerStateError,
     startup_diagnostic: Option<&mut StartupDiagnostic>,
-) -> ControllerStartupError {
-    report_controller_startup_error(&source, startup_diagnostic);
-    ControllerStartupError::from(source)
+) -> StartupError {
+    startup_error(source.code(), &source, startup_diagnostic)
 }
 
+/// A startup failure that was reported on the diagnostic channel.
+///
+/// Carries the same code the CLI will print, so a daemon whose diagnostic never
+/// arrived -- an old CLI, a closed descriptor -- still exits with the code in
+/// its own message rather than with a bare description.
 #[derive(Debug)]
-struct ControllerStartupError {
-    code: &'static str,
-    source: ControllerStateError,
+struct StartupError {
+    code: StartupCode,
+    message: String,
 }
 
-impl std::fmt::Display for ControllerStartupError {
+impl std::fmt::Display for StartupError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}: {}", self.code, self.source)
+        write!(formatter, "{}: {}", self.code, self.message)
     }
 }
 
-impl std::error::Error for ControllerStartupError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
-
-impl From<ControllerStateError> for ControllerStartupError {
-    fn from(source: ControllerStateError) -> Self {
-        Self {
-            code: source.code(),
-            source,
-        }
-    }
-}
+impl std::error::Error for StartupError {}
 
 fn controller_state_paths(
     paths: &SocketPaths,
+    backend: BackendSelection,
 ) -> Result<ControllerStatePaths, ControllerStateError> {
     #[cfg(debug_assertions)]
     if option_env!("CARGO_BIN_NAME") == Some("gascan-e2e-daemon") {
@@ -441,20 +598,44 @@ fn controller_state_paths(
             std::path::Path::new(&home),
             paths.directory(),
             rustix::process::geteuid().as_raw(),
+            backend,
         );
     }
-    ControllerStatePaths::for_user(paths.directory())
+    ControllerStatePaths::for_user(paths.directory(), backend)
 }
 
+/// What the daemon needs to describe itself: where it listens, how long it
+/// waits, and which backend it drives.
+///
+/// Grouped rather than passed as three parameters because `DaemonConfig::new`
+/// consumes exactly these three together, and because adding the backend put
+/// `run_daemon` one argument over clippy's limit -- a signal worth taking
+/// rather than silencing, since the three had already drifted into a set.
+struct DaemonRuntime {
+    paths: SocketPaths,
+    idle_timeout: Duration,
+    backend: BackendSelection,
+}
+
+/// Serves until the daemon stops, and releases the startup channel first.
+///
+/// **The diagnostic is taken by value and dropped here, not by each arm.**
+/// Every backend reaches this function and nothing that can still be reported
+/// on that channel happens after it, so a fourth arm cannot forget to release
+/// the descriptor -- and forgetting is not harmless: `gascan` treats the
+/// descriptor staying open as startup still being in progress, and
+/// `successful_daemon_closes_inherited_startup_diagnostic_descriptor` is the
+/// only thing that would notice.
 async fn run_daemon<B: RuntimeBackend + 'static>(
     runtime: B,
     store: Store,
-    paths: SocketPaths,
-    idle_timeout: Duration,
+    daemon: DaemonRuntime,
     provisioner: ConfiguredProvisioner,
     doctor: DoctorState,
     ssh: DaemonSshConfig,
+    startup_diagnostic: Option<StartupDiagnostic>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    drop(startup_diagnostic);
     let candidate_image = if option_env!("CARGO_BIN_NAME") == Some("gascan-e2e-daemon") {
         std::env::var("GASCAN_E2E_CANDIDATE_IMAGE").ok()
     } else {
@@ -481,7 +662,7 @@ async fn run_daemon<B: RuntimeBackend + 'static>(
     let _ = ssh.e2e_paths;
     let service = Arc::new(service);
     let _ = service.reconcile().await?;
-    let config = DaemonConfig::new(paths, idle_timeout);
+    let config = DaemonConfig::new(daemon.paths, daemon.idle_timeout, daemon.backend);
     #[cfg(debug_assertions)]
     let config = configure_e2e_daemon(config)?;
     let error_diagnostics = if std::env::var_os(gascand::TEST_ERROR_DIAGNOSTICS_ENV).is_some() {
@@ -538,8 +719,10 @@ fn e2e_ssh_paths() -> Result<Option<SshPaths>, Box<dyn std::error::Error>> {
 
 async fn production_doctor_report() -> DoctorReport {
     let mut facts = DoctorFacts::unavailable("evidence was not collected");
-    facts.architecture = architecture_fact(std::env::consts::ARCH);
-    facts.macos = macos_fact();
+    // The same functions the CLI calls when no daemon answers. One
+    // implementation, two call sites: a host measured twice must not be
+    // described two ways.
+    host::HostFacts::collect(BackendSelection::Apple, None, None).apply_account_scoped(&mut facts);
 
     let probe = AppleProbe::new(ProcessRunner);
     let cli = probe.release_evidence().await;
@@ -554,7 +737,130 @@ async fn production_doctor_report() -> DoctorReport {
     }
     apply_runtime_evidence(&mut facts, cli, service);
     facts.workspace = DoctorFact::unknown("workspace access is evaluated for each Doctor request");
-    facts.into_report()
+    facts.into_report(&AppleRemedies)
+}
+
+/// The Arca engine's doctor evidence.
+///
+/// **This replaces the Apple report the Arca arm was temporarily wired to.**
+/// That report pairs every fact with prose naming Apple's runtime, so an
+/// Arca-backed daemon with a dead engine socket told the user to install Apple
+/// container -- advice that would have changed nothing.
+///
+/// Every runtime fact here comes from ONE `Capabilities` call, not from probing
+/// the engine five ways. The engine answers that call or it does not, and a
+/// report that asked five questions would give five chances to describe a dead
+/// engine differently.
+async fn arca_doctor_report(
+    transport: gascan_arca::ChannelTransport,
+    engine_binary: std::path::PathBuf,
+) -> DoctorReport {
+    let mut facts = DoctorFacts::unavailable("engine evidence was not collected");
+    facts.workspace = DoctorFact::unknown("workspace access is evaluated for each Doctor request");
+    // Architecture, macOS, the engine executable and the engine's boot
+    // artifacts, all measured by `gascan_core::doctor::host` -- the same
+    // functions `gascan doctor` calls itself when this daemon cannot start.
+    // They were four bodies in this file, which is what kept the doctor silent
+    // about a host whose daemon had not come up.
+    let host = host::HostFacts::collect(BackendSelection::Arca, Some(&engine_binary), None);
+    host.apply_account_scoped(&mut facts);
+    host.apply_process_scoped(&mut facts);
+    // `Capabilities` carries no state-root field, so this daemon cannot measure
+    // the engine's disk. Saying so is better than measuring a directory Gas Can
+    // chose and calling it the engine's.
+    facts.state_storage =
+        DoctorFact::warning("the engine does not report its state root over the contract");
+    facts.image_storage =
+        DoctorFact::warning("the engine does not report its image filesystem over the contract");
+
+    match gascan_arca::ArcaBackend::new(transport)
+        .engine_report()
+        .await
+    {
+        Ok(report) => {
+            apply_engine_capabilities(&mut facts, &report.capabilities);
+            facts.version = engine_revision_fact(&report.build_revision);
+        }
+        Err(error) => {
+            facts.service =
+                DoctorFact::fail(format!("the engine did not answer Capabilities: {error}"));
+        }
+    }
+    facts.into_report(&ArcaRemedies)
+}
+
+/// The engine's revision against the one whose isolation has been proven.
+///
+/// **This is what makes an `offline: UNVERIFIED` legible rather than
+/// mysterious.** Without it a user sees offline sandboxes refused and has no
+/// way to tell a stale engine build from a capability the engine lacks.
+fn engine_revision_fact(build_revision: &str) -> DoctorFact {
+    let certified = gascan_arca::certified_engine_revision();
+    match certified {
+        Some(certified) if certified == build_revision => DoctorFact::pass(format!(
+            "engine build {build_revision} is the certified revision"
+        )),
+        Some(certified) => DoctorFact::warning(format!(
+            "engine build {build_revision} is not the certified revision {certified}, \
+             so offline sandboxes are refused"
+        )),
+        None => DoctorFact::warning(format!(
+            "engine build {build_revision} cannot be certified: this Gas Can build records no \
+             proven engine revision, so offline sandboxes are refused"
+        )),
+    }
+}
+
+/// Turns one `Capabilities` answer into the runtime facts.
+///
+/// The capability flags are reported as the ENGINE's claims, which is all they
+/// are. `offline` in particular has already passed through the certification
+/// gate by the time it arrives here, so a `Warning` on it means the engine
+/// claimed proof that this build does not certify -- not that the engine is
+/// broken.
+fn apply_engine_capabilities(
+    facts: &mut DoctorFacts,
+    capabilities: &gascan_core::runtime::RuntimeCapabilities,
+) {
+    use gascan_core::runtime::NetworkIsolation;
+    facts.service = DoctorFact::pass("the engine answered Capabilities on its socket");
+    // `version` is NOT set here. The caller sets it from the engine's
+    // REVISION, because `ArcaVersion.version` is Arca's product string and does
+    // not move per engine change -- two materially different engine builds are
+    // indistinguishable by it, which is exactly why field 20 exists.
+    // The contract is what this client and that engine agree on, and the engine
+    // answering a request this build encoded is the evidence for it. There is
+    // no second source to cross-check against, and inventing one would be the
+    // Apple report's shape without Apple's out-of-band matrix behind it.
+    facts.schema = DoctorFact::pass("the engine answered this build's contract");
+
+    let flag = |present: bool, what: &str| {
+        if present {
+            DoctorFact::pass(format!("the engine reports {what}"))
+        } else {
+            DoctorFact::fail(format!("the engine does not report {what}"))
+        }
+    };
+    facts.bind_mounts = flag(capabilities.bind_mounts, "bind mounts");
+    facts.named_volumes = flag(capabilities.named_volumes, "named volumes");
+    facts.tty = flag(capabilities.tty, "TTY support");
+    facts.signals = flag(capabilities.signals, "signal delivery");
+    facts.loopback_publish = flag(capabilities.loopback_publish, "loopback publication");
+    facts.resource_limits = flag(capabilities.resource_limits, "resource limits");
+    facts.offline = match capabilities.offline {
+        NetworkIsolation::Proven => {
+            DoctorFact::pass("offline isolation is proven for this engine build")
+        }
+        // A warning and not a failure: offline sandboxes are refused, but every
+        // other sandbox shape works. Failing here would make an uncertified
+        // engine look unusable when it is merely unproven for one mode.
+        NetworkIsolation::Unverified => DoctorFact::warning(
+            "this engine build has no recorded offline-isolation proof; offline sandboxes are refused",
+        ),
+        NetworkIsolation::Unsupported => {
+            DoctorFact::warning("this engine does not implement offline isolation")
+        }
+    };
 }
 
 fn apply_runtime_evidence(
@@ -794,14 +1100,6 @@ fn gate2_evidence(evidence: &str) -> String {
     )
 }
 
-fn architecture_fact(architecture: &str) -> DoctorFact {
-    if architecture == "aarch64" {
-        DoctorFact::pass("current process target is aarch64")
-    } else {
-        DoctorFact::fail(format!("current process target is {architecture}"))
-    }
-}
-
 fn apply_cli_error(facts: &mut DoctorFacts, error: &gascan_core::runtime::RuntimeError) {
     use gascan_core::runtime::RuntimeError;
     match error {
@@ -823,37 +1121,6 @@ fn apply_cli_error(facts: &mut DoctorFacts, error: &gascan_core::runtime::Runtim
 
 fn service_error_fact(error: &gascan_core::runtime::RuntimeError) -> DoctorFact {
     DoctorFact::fail(format!("structured system status failed: {error}"))
-}
-
-fn macos_fact() -> DoctorFact {
-    macos_fact_at(std::path::Path::new(
-        "/System/Library/CoreServices/SystemVersion.plist",
-    ))
-}
-
-fn macos_fact_at(path: &std::path::Path) -> DoctorFact {
-    let result = plist::Value::from_file(path).ok().and_then(|value| {
-        value
-            .as_dictionary()
-            .and_then(|dictionary| dictionary.get("ProductVersion"))
-            .and_then(plist::Value::as_string)
-            .map(str::to_owned)
-    });
-    match result {
-        Some(version)
-            if version
-                .split('.')
-                .next()
-                .and_then(|major| major.parse::<u64>().ok())
-                .is_some_and(|major| major >= 26) =>
-        {
-            DoctorFact::pass(format!("SystemVersion.plist ProductVersion is {version}"))
-        }
-        Some(version) => DoctorFact::fail(format!(
-            "SystemVersion.plist ProductVersion is {version}; macOS 26+ required"
-        )),
-        None => DoctorFact::fail("could not parse ProductVersion from SystemVersion.plist"),
-    }
 }
 
 fn storage_fact(path: &std::path::Path, label: &str) -> DoctorFact {
@@ -1374,27 +1641,9 @@ mod doctor_tests {
     #[test]
     fn host_architecture_mismatch_fails() {
         assert_eq!(
-            architecture_fact("x86_64").status,
+            host::architecture_fact("x86_64").status,
             gascan_core::doctor::DoctorStatus::Fail
         );
-    }
-
-    #[test]
-    fn plist_product_version_is_structured_and_requires_26()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let temp = tempfile::tempdir()?;
-        let path = temp.path().join("SystemVersion.plist");
-        let mut dictionary = plist::Dictionary::new();
-        dictionary.insert(
-            "ProductVersion".to_owned(),
-            plist::Value::String("25.9".to_owned()),
-        );
-        plist::Value::Dictionary(dictionary).to_file_xml(&path)?;
-        assert_eq!(
-            macos_fact_at(&path).status,
-            gascan_core::doctor::DoctorStatus::Fail
-        );
-        Ok(())
     }
 
     #[test]

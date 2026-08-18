@@ -12,6 +12,8 @@ mod limits;
 mod logs;
 #[path = "live/mounts.rs"]
 mod mounts;
+#[path = "live/network.rs"]
+mod network;
 #[path = "live/ports.rs"]
 mod ports;
 #[path = "live/read_rpcs.rs"]
@@ -20,5 +22,7 @@ mod read_rpcs;
 mod recreate;
 #[path = "live/shutdown.rs"]
 mod shutdown;
+#[path = "live/startup.rs"]
+mod startup;
 #[path = "live/supervision.rs"]
 mod supervision;

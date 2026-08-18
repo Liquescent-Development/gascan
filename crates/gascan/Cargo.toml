@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+camino.workspace = true
 base64.workspace = true
 clap.workspace = true
 command-fds.workspace = true
@@ -30,5 +31,6 @@ tower.workspace = true
 workspace = true
 
 [dev-dependencies]
+sha2.workspace = true
 rustix-openpty = "0.2"
 tempfile = "3"

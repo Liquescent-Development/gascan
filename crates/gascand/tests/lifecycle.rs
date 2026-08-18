@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
-use gascan_core::doctor::{DoctorFacts, DoctorStatus};
+use gascan_core::doctor::{AppleRemedies, DoctorFacts, DoctorStatus};
 use gascan_core::fake_runtime::{FailureBoundary, FakeRuntime};
 use gascan_core::manifest::Manifest;
 use gascan_core::policy::PolicyCompiler;
@@ -1748,7 +1748,7 @@ async fn managed_ssh_diagnostics_do_not_gate_runtime_readiness() -> TestResult {
         ("ssh.identity", DoctorStatus::Fail),
         ("ssh.config", DoctorStatus::Unknown),
     ] {
-        let mut report = DoctorFacts::all_supported_for_tests().into_report();
+        let mut report = DoctorFacts::all_supported_for_tests().into_report(&AppleRemedies);
         let check = report
             .checks
             .iter_mut()
@@ -1772,7 +1772,7 @@ async fn immutable_and_transport_prerequisites_still_gate_runtime_readiness() ->
     let temp = tempfile::tempdir()?;
     let root = Utf8Path::from_path(temp.path()).ok_or("utf8 root")?;
     for id in ["host.architecture", "ssh.client", "ssh.native_publish"] {
-        let mut report = DoctorFacts::all_supported_for_tests().into_report();
+        let mut report = DoctorFacts::all_supported_for_tests().into_report(&AppleRemedies);
         let check = report
             .checks
             .iter_mut()

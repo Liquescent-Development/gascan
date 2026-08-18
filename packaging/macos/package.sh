@@ -84,7 +84,15 @@ done
 # the pinned Arca tree and fails the release if it does not verify, but nothing
 # from that tree is installed. This block records which tree was compiled, so a
 # shipped package names its engine provenance even though it carries no engine.
-engine_json=$(jq -cS '{name, url, tag, revision}' "$repo_root/engine/arca-pin.json")
+# .artifacts as well as the four provenance keys, because the pin now records
+# what the engine's boot artifacts must hash to and a shipped package should
+# name the artifacts it expects as precisely as it names the tree it gated on.
+# The fetch reads the pin; a user holding only an installed package reads this.
+#
+# Copied wholesale rather than reshaped: the pin's artifact block is already the
+# schema the fetch validates, and a second shape here would be a second thing to
+# keep in step with engine/arca-pin-schema.jq.
+engine_json=$(jq -cS '{name, url, tag, revision, artifacts}' "$repo_root/engine/arca-pin.json")
 jq -nS \
   --arg architecture arm64 \
   --arg source_revision "$revision" \

@@ -57,7 +57,7 @@ async fn backend(engine: &LiveEngine) -> ArcaBackend<gascan_arca::ChannelTranspo
 /// -- failed on that build, exactly as its message said it would, and its
 /// replacement is the positive named above.
 #[tokio::test]
-#[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN"]
+#[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN, plus GASCAN_ARCA_KERNEL_PATH and GASCAN_ARCA_VMINIT_LAYOUT: EngineInputs::from_environment reads all three and panics on any absence"]
 async fn capabilities_report_only_what_this_engine_build_implements() {
     let engine = LiveEngine::start().await;
     let capabilities = backend(&engine).await.capabilities().await.unwrap();
@@ -69,6 +69,73 @@ async fn capabilities_report_only_what_this_engine_build_implements() {
     assert!(capabilities.loopback_publish);
     assert!(capabilities.resource_limits);
     assert_eq!(capabilities.offline, NetworkIsolation::Unverified);
+}
+
+/// **The engine's self-report is checked against the pin, over the wire.**
+///
+/// `engine/arca-pin.json` names a signed Arca tag and the revision it must
+/// resolve to; `scripts/build-arca-engine.sh` compiles that tree, regenerates
+/// `BuildInfo.generated.swift` inside it, and refuses to build if the
+/// regenerated constant is not the pinned one. That is a build-time assertion
+/// on generated Swift source. This is the run-time half: what the engine
+/// actually puts on the wire in field 20.
+///
+/// **The two halves are not redundant, and the gap between them is the whole
+/// reason field 20 exists.** The build gate reads a file the compiler is about
+/// to read; this reads what a running process says about itself. An engine
+/// binary that predates the pin bump -- the state
+/// `GASCAN_ARCA_ENGINE_BIN` is in every time someone forgets to rebuild --
+/// passes the build gate trivially, because the build gate never ran, and
+/// fails here.
+///
+/// MEASURED when this was written: before the pin moved to schema 2, the
+/// committed `BuildInfo.generated.swift` recorded
+/// `5e1170495400b25f6334c6d8ddda5d3521b7cfd8` while the tag being pinned was
+/// `c545612b056e028d5885968a7b9f586d694f994c`, and it had drifted through the
+/// whole of milestone 3 unnoticed -- because nothing read it that mattered.
+///
+/// The raw transport and not `ArcaBackend::capabilities()`: `translate.rs` maps
+/// the wire message onto `gascan_core`'s `RuntimeCapabilities`, which does not
+/// carry a revision. Asserting through the backend would require inventing that
+/// surface here, ahead of the task that owns it.
+///
+/// The pin is read at run time rather than baked in with `include_str!` so that
+/// a pin bump cannot leave a stale expectation compiled into this test. This is
+/// NOT the certified-revision constant -- that is a separate, deliberate
+/// judgement about which engine build has had its isolation proven, and it does
+/// not move with the pin.
+#[tokio::test]
+#[ignore = "requires the engine BUILT FROM THE PIN by scripts/build-arca-engine.sh, named by GASCAN_ARCA_ENGINE_BIN, plus GASCAN_ARCA_KERNEL_PATH and GASCAN_ARCA_VMINIT_LAYOUT"]
+async fn the_engine_reports_the_revision_the_pin_names() {
+    let engine = LiveEngine::start().await;
+    let transport = engine.transport().await;
+
+    let response = gascan_arca::EngineTransport::capabilities(
+        &transport,
+        gascan_engine_proto::v1::CapabilitiesRequest {},
+    )
+    .await
+    .expect("a real engine must answer Capabilities");
+
+    let capabilities = match response.outcome {
+        Some(gascan_engine_proto::v1::capabilities_response::Outcome::Capabilities(
+            capabilities,
+        )) => capabilities,
+        other => panic!("the engine answered Capabilities with {other:?}"),
+    };
+
+    let pin_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../engine/arca-pin.json");
+    let pin: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(pin_path).expect("the pin file is readable"))
+            .expect("the pin file is JSON");
+    let pinned = pin["revision"]
+        .as_str()
+        .expect("the pin carries a revision");
+
+    assert_eq!(
+        capabilities.build_revision, pinned,
+        "the engine under GASCAN_ARCA_ENGINE_BIN was not built from the pinned revision"
+    );
 }
 
 /// **The list of unimplemented methods is EMPTY, and this is what replaced it.**
@@ -105,7 +172,7 @@ async fn capabilities_report_only_what_this_engine_build_implements() {
 /// (`gascan-arca/src/error.rs:20-55`), so a status or an unrecognised code
 /// arrives as `invalid_output` and fails here either way.
 #[tokio::test]
-#[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN"]
+#[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN, plus GASCAN_ARCA_KERNEL_PATH and GASCAN_ARCA_VMINIT_LAYOUT: EngineInputs::from_environment reads all three and panics on any absence"]
 async fn exec_refuses_in_its_own_frame_rather_than_as_a_transport_status() {
     let engine = LiveEngine::start().await;
     let backend = backend(&engine).await;

@@ -202,16 +202,17 @@ revision=$(git -C "$repo_root" rev-parse --verify HEAD)
 sha_gascan=$(shasum -a 256 "$fixture_root/usr/local/bin/gascan" | awk '{print $1}')
 sha_attach=$(shasum -a 256 "$fixture_root/usr/local/bin/gascan-apple-attach" | awk '{print $1}')
 sha_gascand=$(shasum -a 256 "$fixture_root/usr/local/bin/gascand" | awk '{print $1}')
+# **The engine block is derived from the real pin with package.sh's own jq
+# program, never hand-written.** A hand-written block is why a packager that
+# started emitting `artifacts` could disagree with verify-package.sh's key list
+# while every contract stayed green.
+engine_json=$(jq -cS '{name, url, tag, revision, artifacts}' "$repo_root/engine/arca-pin.json")
 jq -n --arg rev "$revision" --arg ver "$version" \
+  --argjson engine "$engine_json" \
   --arg s1 "$sha_gascan" --arg s2 "$sha_attach" --arg s3 "$sha_gascand" '
 {
   architecture: "arm64",
-  engine: {
-    name: "arca",
-    revision: "b20be7c865978759026d233e2d012ec8dc393b27",
-    tag: "gascan-engine-baseline",
-    url: "https://github.com/Vas-Solutus/arca.git"
-  },
+  engine: $engine,
   files: [
     {path: "usr/local/bin/gascan", sha256: $s1},
     {path: "usr/local/bin/gascan-apple-attach", sha256: $s2},

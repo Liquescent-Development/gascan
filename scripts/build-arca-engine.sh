@@ -5,8 +5,16 @@ repo_root=$(cd "$(dirname "$0")/.." && pwd -P)
 pin_file=${GASCAN_ARCA_PIN_FILE:-$repo_root/engine/arca-pin.json}
 cache_root=${GASCAN_ARCA_ENGINE_CACHE:-$repo_root/.artifacts/arca-engine}
 allowed_signers=${GASCAN_ARCA_ALLOWED_SIGNERS:-$repo_root/engine/allowed-signers}
+# Not overridable. The pin file is, because the release contract drives this
+# script with fixture pins, but the schema is what decides whether a pin is
+# well-formed -- an override would let a caller weaken the gate rather than
+# exercise it.
+pin_schema=$repo_root/engine/arca-pin-schema.jq
 
-for command in codesign git jq swift; do
+# make, for gen-buildinfo below. It is Arca's Makefile that owns the shape of
+# BuildInfo.generated.swift, and regenerating it here by hand would be a second
+# copy of that shape, silently emitting the old one the day Arca changes it.
+for command in codesign git jq make swift; do
   command -v "$command" >/dev/null || {
     printf 'required command is unavailable: %s\n' "$command" >&2
     exit 69
@@ -21,19 +29,16 @@ done
   printf 'engine allowed-signers file is missing: %s\n' "$allowed_signers" >&2
   exit 64
 }
-# .tag is constrained to characters that cannot form a path. A tag name
-# containing a slash is legal to git, and "tags/foo" as a pin would name two
-# different objects to two different resolvers -- see the note on the
-# verify-tag call below. The refs/tags/ qualification there is the real fix;
-# this is the second lock on the same door, and it is the one that fails early
-# and names the pin file.
-jq -e '
-  (.schema == 1) and
-  (.name | type == "string" and length > 0) and
-  (.url | type == "string" and length > 0 and test("^(https|file)://")) and
-  (.tag | type == "string" and test("^[A-Za-z0-9._-]+$")) and
-  (.revision | type == "string" and test("^[0-9a-f]{40}$"))
-' "$pin_file" >/dev/null 2>&1 || {
+# The schema is a file, and both this script and sync-arca-proto.sh validate
+# against that same file. The two read the same pin and must agree on what a
+# valid one is, or a pin this script accepts is one the proto sync refuses.
+# Through schema 1 that agreement was two copies of one jq program and a comment
+# asking a maintainer to keep them in step, which is not a mechanism.
+[[ -f $pin_schema ]] || {
+  printf 'engine pin schema is missing: %s\n' "$pin_schema" >&2
+  exit 64
+}
+jq -e --from-file "$pin_schema" "$pin_file" >/dev/null 2>&1 || {
   printf 'engine pin file is malformed: %s\n' "$pin_file" >&2
   exit 64
 }
@@ -126,6 +131,64 @@ git -C "$checkout" -c 'url.https://github.com/.insteadOf=git@github.com:' \
 # --quiet suppresses foreach's "Entering ..." line, which would otherwise land on
 # stdout and corrupt the checkout path this script contracts to print there.
 git -C "$checkout" submodule foreach --quiet --recursive git clean -qffdx
+
+# Sources/ContainerBridge/BuildInfo.generated.swift is TRACKED, and what is
+# committed is whatever tree someone last ran `make` against. MEASURED at the
+# time this was written: it recorded 5e1170495400b25f6334c6d8ddda5d3521b7cfd8
+# while the tag being pinned was c545612b056e028d5885968a7b9f586d694f994c -- and
+# it had drifted through the whole of milestone 3 before that, because nothing
+# read it that mattered. This script compiled that constant and never ran make.
+#
+# Field 20 of Capabilities now carries it (SandboxEngineService.swift:182 ->
+# ArcaVersion.buildRevision -> ArcaBuildInfo.buildRevision), and gascan-arca
+# decides Proven versus Unverified by comparing it against a certified constant.
+# A gate reading a stale constant matches nothing in the safe case and the wrong
+# tree in the unsafe one, so regeneration is what makes the self-report worth
+# comparing at all.
+#
+# Here and not earlier: `git clean -qffdx` above does not touch it (it is
+# tracked), but `git checkout --detach --force` on the NEXT run resets it, so
+# the dirt this leaves in the cache is self-healing and no cleanliness check is
+# being silenced to accommodate it. Nothing between here and `swift build` reads
+# the working tree's status.
+#
+# make and not an inline heredoc: the Makefile owns the shape of that file, and
+# a copy of it here would keep emitting the old shape the day Arca changes it.
+# >&2 because gen-buildinfo echoes progress, and stdout is this script's
+# contract with its caller.
+make -C "$checkout" gen-buildinfo >&2 || {
+  printf 'could not regenerate the pinned engine build info in %s\n' "$checkout" >&2
+  exit 70
+}
+
+# THIS ASSERTION IS THE POINT OF THE REGENERATION ABOVE. Without it the engine
+# still self-reports its revision and the capability gate is worth nothing --
+# regenerating merely changes which unverified value gets compiled.
+#
+# The generated source and not the built binary: this runs before `swift build`,
+# so a mismatch costs no compile, and the constant the compiler will read is
+# exactly the one asserted here. The engine is separately observed to report
+# this value at run time, which is the acceptance for this task and not
+# something a build gate can stand in for.
+#
+# Anchored on the full 40-character form. `buildRevision` is deliberately
+# distinct from `gitCommit`, which is a 7-character display value Docker's
+# /version returns; a prefix is not an identity and a pattern that admitted one
+# would let a seven-character match pass for a forty-character claim.
+build_info=$checkout/Sources/ContainerBridge/BuildInfo.generated.swift
+[[ -f $build_info ]] || {
+  printf 'the pinned engine generated no build info at %s\n' "$build_info" >&2
+  exit 70
+}
+# The `|| true` keeps a no-match from ending the script under `set -e` before
+# the comparison below can report WHICH value was found. A grep that matches
+# nothing yields an empty string, which fails the comparison and prints it.
+built_revision=$(sed -n 's/.*buildRevision = "\([0-9a-f]\{40\}\)".*/\1/p' "$build_info" | head -1 || true)
+[[ $built_revision == "$revision" ]] || {
+  printf 'the pinned engine compiles build revision %s, not the pinned revision %s (%s)\n' \
+    "${built_revision:-<none found>}" "$revision" "$build_info" >&2
+  exit 65
+}
 
 # The engine product, plus SandboxEngineProto so the generated server half is
 # proven to build rather than merely proven to have been emitted —

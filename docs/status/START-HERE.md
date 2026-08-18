@@ -3,19 +3,255 @@
 This file is the session entry point. It is written to be read cold, and it is
 addressed to you, the agent. Follow it as instructions — there is nothing to paste.
 
-Written 2026-08-11 for two branches in flight; rewritten 2026-08-12 after both merged;
-rewritten 2026-08-13 mid-milestone-2; rewritten again 2026-08-13 (evening) with **Landing 4
-complete and Landing 5 the whole of what remains**; updated 2026-08-13 (late) after Task 13's first
-hour, which **proved the spawn, got `Create` working end to end for the first time, and cost two
-unplanned Arca fixes on the way** — Tasks 13a and 13b; rewritten 2026-08-14 (evening) after the
-named-volume defect was fixed and committed; **rewritten again 2026-08-14 (late) after the
-graceful-shutdown crash was fixed, which was the last open ruling; **rewritten 2026-08-16 (late)
-after MILESTONE 3 MERGED. Nothing is open. What remains is milestone 4, which is designed by nobody
-yet.**
+Rewritten 2026-08-18 after **ITEMS 1, 2a AND 2b WERE IMPLEMENTED, REVIEWED, AND FIXED, AND
+BOTH PULL REQUESTS LEFT DRAFT.** Everything above the `Where the work is` heading is current;
+everything below it is history.
 
 ---
 
+## MILESTONE 4 IS CODE-COMPLETE AND BOTH PRs ARE OPEN FOR REVIEW. THE OFFLINE PROOF REFUTED.
+
+**Read these four, in this order.**
+
+| | |
+|---|---|
+| Design | `docs/superpowers/specs/2026-08-16-p5-1-milestone-4-product-wiring-design.md` |
+| Plan | `docs/superpowers/plans/2026-08-16-p5-1-milestone-4-product-wiring.md` |
+| **The offline evidence** | `docs/evidence/2026-08-18-arca-engine-offline.md` — **read this before touching anything about offline** |
+| Ledger | `.superpowers/sdd/2026-08-16-p5-1-milestone-4-product-wiring/progress.md` — untracked, git-ignored |
+
+**RE-VERIFY EVERY SHA BELOW WITH `git log -1` AND `git ls-remote`.** This file has gone stale
+on its own SHAs repeatedly, including inside a single edit three lines below its own warning
+about it. That is why no head SHA is written here: every edit to this file moves it.
+
+| | branch | head | pushed |
+|---|---|---|---|
+| Gas Can | `feat/milestone-4-product-wiring` | **run `git log -1`** | verify with `ls-remote` |
+| Arca | `feat/milestone-4-engine` | `ae92360` — **it DID move**: three fixes a pre-merge review found, on top of `e14be74` | yes, `ls-remote` matched |
+| `containerization` submodule | `merge/upstream-main` | `6304122` — did not move; `git ls-remote git@github.com:Vas-Solutus/arca-containerization.git refs/heads/merge/upstream-main` returns it | yes |
+
+**The tag `gascan-engine-m4` and its release are published and verified. They were NOT re-cut
+and must not be.** The signed tag object is `d143a66`, pointing at commit `c545612`; the
+release carries `vmlinux-arm64.gz` (9,092,349 bytes) and `vminit-oci-arm64.tar.gz`
+(73,739,738 bytes), and `engine/arca-pin.json` names that revision and both assets by
+transport digest and content digest.
+
+### THE HEADLINE, UNCHANGED: THE OFFLINE PROOF REFUTED. `CERTIFIED_ENGINE_REVISION` STAYS `None`.
+
+**MEASURED against the pinned engine `c545612b`: an `offline` sandbox has full internet
+egress.** Thirteen violations, against a positive control in which every probe succeeded on a
+networked sandbox, and with `Sandbox::boot` asserting the compiled `CreateRequest` carried
+`RuntimeNetwork::Offline` before anything was observed.
+
+Do not set the constant. Do not change `capabilities.offline` from `.unverified`. The plan's
+Task 15 acceptance pair is **UNREACHABLE** and its instructions must not be followed as
+written. `crates/gascan-arca/tests/live/network.rs`'s
+`an_offline_sandbox_has_no_egress_at_either_privilege_level` **FAILS BY DESIGN** — do not
+weaken it to make the tier green. Reaching `Proven` is Arca work, not a re-tag of this tree.
+**The fail-closed default is what the evidence vindicates.**
+
+### WHERE THINGS STAND: BOTH PRs ARE OUT OF DRAFT, NEITHER IS MERGED
+
+- **Gas Can #77**, "P5.1 milestone 4: the Arca engine wired into the product, and the offline
+  proof that refuted". Ready for review. Description rewritten to match its contents.
+- **Arca #59**, "P5.1 milestone 4, landing 1: the engine's half, sealed by gascan-engine-m4".
+  Ready for review. Its old description was wrong about three things and all three are
+  corrected: tasks 5-7 ARE done, the submodule DID move to `6304122`, and the tag is published.
+
+  **A fifth review was run against `4134b54..e14be74`**, because the landing review had covered
+  only `5e11704..4134b54` and three commits landed after it — including the ~4,600-line kernel
+  recipe. It is committed at `docs/status/review-arca-tail.md`. No Critical, and **nothing
+  required re-cutting the tag**: every published digest verifies. Three findings were fixed in
+  Arca `ae92360` — a stale `vmlinux` that defeated the post-build guard, a release document
+  naming the wrong commit for the tag, and a `make build-assets` recipe that did not build what
+  the doc said it built. **Two are NOT fixed and are real**: the kernel toolchain is unpinned,
+  and the required-config assertion checks a text file rather than the built artefact.
+
+**Merge Arca first, then Gas Can.** Both as **true merge commits** — `git rev-list --parents
+-n1` must return three SHAs; `allowed_merge_methods` is `["merge"]`, never squash.
+
+### WHAT LANDED THIS SESSION
+
+| | What | Commit |
+|---|---|---|
+| Item 1 | the backend-scoped controller store | `ae75595` |
+| Item 2a | every Arca startup failure reaches the user by name | `f081e61` |
+| Item 2b | `gascan doctor` answers without a daemon | `fb7d4b0` |
+| Hardening | the doctor status crossed the wire through two hand-written tables | `0bf6d75` |
+| Review fixes | nine defects four reviewers found | `de14a94` |
+| The reviews | committed verbatim | `436c5b4` |
+
+**Each item was proven by mutation**, and each commit message records the mutations and their
+results. `de14a94` also **corrects four claims in `ae75595`'s own message** that the review
+showed do not reproduce — read that block before trusting any number in `ae75595`.
+
+**The review found a Critical.** `gascan doctor` replaced a live daemon's answer about its own
+engine: `runtime.cli` is measured from `GASCAN_ENGINE_BIN`, which is per-process, and the host
+facts were applied unconditionally. A shell without the variable turned a healthy check into a
+failure while the user's sandboxes ran on that engine; a shell with a newer path masked the
+daemon's honest report of a deleted one. **No test could have caught it** — the e2e harness
+sets the variable on the CLI and the spawner forwards it, so the two always agree there.
+
+**It also found that `uninstall.sh --remove-data` destroyed one backend's sandboxes and then
+deleted every backend's store** — this milestone's own harm, reintroduced at uninstall time and
+made deterministic rather than accidental. It refuses now, and reads which backend was
+enumerated from the daemon's instance record rather than owning a second copy of the rule.
+
+**All four review files are committed at `docs/status/review-*.md`**, unedited, including the
+findings that were deliberately NOT fixed and why.
+
+### WHAT IS OPEN
+
+1. **NEITHER PR IS MERGED.** That is the next action. Arca first.
+2. **THE DAEMON INSTANCE RECORD HAS A PUBLISH RACE, AND IT IS THE MOST EXPENSIVE THING IN THE
+   TEST LOOP.** `write_instance_record` (`crates/gascand/src/socket.rs`) does `write_all`, then
+   `sync_all`, then `fchmod(0600)`. Across that fsync the file is mode 0200 **with content** —
+   which `crates/gascan/src/daemon.rs`'s `validate_file_stat` classifies as "written but never
+   published", a terminal `PermissionDenied`, while the daemon is alive and about to publish.
+   The 2026-08-07 comment there says 0200-with-content "never becomes 0600 on its own"; that is
+   false, and it is the whole defect.
+
+   **PROBED DETERMINISTICALLY** through the existing `before_descriptor_commit` hook (a
+   temporary test, since reverted): `mode=0200 size=9 nlink=1`. It failed **four** workspace
+   runs on 2026-08-18, each in a different test, each time in code the session's diff did not
+   touch, and each time passing in isolation. **This is why the suite needs diff-plus-isolation
+   exoneration.** Worth its own task; it was left unfixed as outside the three decided items.
+3. **(2c) A PRODUCTION STDERR DESTINATION FOR THE DAEMON IS STILL DEFERRED**, as its own
+   decision with a privacy dimension — a daemon log holds sandbox names, project paths and
+   guest output. (2a) and (2b) have landed, which was the precondition. Raise it with the
+   maintainer with a concrete proposal for where the file lives, its mode, how it is bounded
+   and what is redacted. **Do not decide it alone.**
+4. **~60 deferred Minor findings** with rulings in the ledger, plus the minors in this
+   session's four review files and the previous whole-landing review. Task 6 M3 and Task 7 O1
+   are still open.
+5. **The process-level legacy-migration coverage was dropped and nothing replaced it.**
+   `ae75595` narrowed it and its admission was a category slip, corrected in `de14a94`. A
+   regression in the Apple path's `main.rs` wiring would be caught by no test in the suite.
+6. **A guest that refuses at boot is loud in the guest and silent to the host** — `Start` never
+   returns and the only diagnostic is in `bootlog.log`.
+7. **The guest-side ordering instrument** at
+   `.superpowers/sdd/.../carry-layer_report-live-test.rs` is **git-ignored**. Land it in the
+   live tier before it is lost.
+8. **One untested ordering, labelled as such in the code**: in `crates/gascand/src/engine.rs`,
+   swapping the exit-status and timeout checks leaves the supervisor suite green.
+9. **A pre-existing stash is on the stack and is not ours.** Leave it.
+
+### WHAT WAS RUN, AND WHAT CI DOES WITH IT
+
+Every CI step, run locally and alone at `436c5b4`:
+
+| Step | Result |
+|---|---|
+| `cargo fmt --all --check` | exit 0 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0 |
+| `cargo test --workspace` | **1496 passed, 0 failed, 49 ignored** |
+| `scripts/ci-check-ignored-tests.sh` | 49, matching the baseline |
+| `scripts/ci-run-release-contracts.sh` | **15 contracts, status 0** |
+
+The `gascan-arca` live tier was last run at `3882a52` — **24 passed, 1 failed in 568s**, the
+failure being the offline test that fails by design, with the engine's `virtualization`
+entitlement verified as `1` before the run. **It was not re-run after `3882a52`**, because
+nothing since touches an engine code path and re-running it needs a rebuilt, re-signed engine.
+
+**CI'S `engine` JOB IS RED, AND IT WAS RED BEFORE THIS MILESTONE.** Its live-tier step sets
+only `GASCAN_ARCA_ENGINE_BIN`; the tier needs four variables and absence is a `panic!`, never a
+skip. `cargo test -p gascan-arca --test live -- --list --ignored` reports **25 tests**.
+
+**CORRECTION, MEASURED ON CI AT `436c5b4`: the long-standing claim that "only the 5 in
+`connect.rs` and `read_rpcs.rs` need nothing but the binary" IS FALSE, and the remedy it
+implies does not work.** That run produced `0 passed; 25 failed` with only
+`GASCAN_ARCA_ENGINE_BIN` set, and the five in question panicked on
+`GASCAN_ARCA_KERNEL_PATH` like the rest. The reason is `EngineInputs::from_environment`
+(`crates/gascan-arca/tests/live/common/mod.rs:86-105`), which every `LiveEngine` goes through
+and which reads **three** variables unconditionally; `base_oci_layout()` reads the fourth.
+
+**An `#[ignore]` reason is not a requirements list**, and those five said only
+`GASCAN_ARCA_ENGINE_BIN` while needing three. They now name all three. I had "verified" the old
+claim by reading the ignore reasons rather than the harness, which is how a false statement
+survives a check — the check has to touch the thing that decides, and here CI did.
+
+**Do not make that job green by deleting tests, and do not try to select a subset — there is no
+subset that runs on the binary alone.** It needs a runner with the artifacts.
+
+### SEVEN THINGS THAT WILL COST A SUCCESSOR REAL TIME
+
+1. **`ps -A` CANNOT ENUMERATE THE PROCESS TABLE ON THIS HOST.** Measured: 31 entries against
+   `launchctl list`'s 544, and it omits even the calling shell. **No `ps | grep` absence check
+   is evidence of anything here.** To find an engine, read `<socket>.lock`, which holds its pid
+   (`Sources/ArcaEngine/EngineServer.swift:551`) — **never `pkill -f`**, which destroyed a
+   session's shells once. If an engine dies with `vmnet_return_t(rawValue: 1001)`, force-quit
+   `InternetSharing`.
+2. **A UNIX SOCKET PATH IS 104 BYTES AND THE ENGINE REFUSES A LONGER ONE** rather than
+   truncating. MEASURED: an engine given a socket under a deep scratch path initialised every
+   manager and then died on `unixDomainSocketPathTooLong`, having bound nothing. Both e2e tiers
+   use `/private/tmp` and one-letter names for that reason —
+   `crates/gascan-e2e/tests/arca_startup.rs` included, where the daemon refuses a longer one
+   with `path must be shorter than SUN_LEN` before it spawns anything.
+3. **`--disable-swift-testing` IS NOT PORTABLE BETWEEN THE REPOSITORIES.** On the submodule it
+   runs **0 tests and exits 0** — a false green. The submodule's suite is plain `swift test`.
+4. **THE ENGINE LOSES ITS ENTITLEMENT TO EVERY `swift test`.** Re-sign after the last one and
+   verify `codesign -d --entitlements - <bin> 2>&1 | grep -c virtualization` prints `1`. This
+   is why no Swift suite was re-run this session and why no fresh Arca test count is quoted:
+   the counts in the tests carry their own anchors instead.
+5. **NEVER GIVE SUBAGENTS NAMES WHERE ONE IS A PREFIX OF ANOTHER**, and **REQUIRE EVERY REVIEW
+   TO BE WRITTEN TO A FILE BEFORE THE REPLY.** MEASURED a third time on 2026-08-18: all four
+   reviewers went idle without ever delivering a reply, and **all four files survived**. The
+   file is the deliverable; the reply is not.
+6. **NEVER RUN THE WORKSPACE SUITE BESIDE ANOTHER CARGO OR CONTRACT JOB**, and note that a
+   solo run is internally parallel too — see open item 2, which is why. Exonerate by diff PLUS
+   isolation, never by probability.
+7. **A REVIEW'S SCOPE IS NOT THE PR'S SCOPE UNLESS SOMEONE CHECKED.** Arca's landing review
+   covered `5e11704..4134b54`; three commits landed after it, one of them ~4,600 lines of
+   kernel recipe, and no review had covered them until one was run before merging. Check what a
+   review's own header says it read before treating a PR as reviewed.
+8. **A TEST FIXTURE THAT WRITES THEN CHMODS RACES ITS OWN READER.** `rust` went red on CI at
+   `436c5b4` while green locally: `DelayedPublicationSpawner` did `fs::write` then
+   `set_permissions(0o600)` from a spawned thread, and `fs::write` creates at the umask, so the
+   readiness poller could see the record at **0644** and report `Readiness { state: Unsafe }`,
+   which is terminal. REPRODUCED deterministically by widening the window with a 20ms sleep.
+   Fixed by staging and renaming. **The production publisher has the same shape** — see open
+   item 2 — and the two other spawner fixtures do not, because they run synchronously inside
+   `spawn()` before any poller starts.
+
+### THE LIVE TIER'S ENVIRONMENT, AND THE DAEMON'S IS THREE
+
+The `gascan-arca` live tier needs four, all undefaulted — absent means `panic!`:
+
+```
+GASCAN_ARCA_ENGINE_BIN      second line of scripts/build-arca-engine.sh
+GASCAN_ARCA_KERNEL_PATH     ~/Library/Application Support/dev.gascan/engine/vmlinux
+GASCAN_ARCA_VMINIT_LAYOUT   ~/Library/Application Support/dev.gascan/engine/vminit
+GASCAN_ARCA_BASE_OCI_LAYOUT an OCI layout with one small linux/arm64 image carrying sh and nc
+```
+
+The `gascan-e2e` arca tier needs only the **first and last**: the daemon resolves the kernel
+and vminit itself, from what `gascan engine fetch` installed, which is the point.
+
+**The daemon's own environment is THREE:** `GASCAN_ENGINE_BIN`, `GASCAN_ENGINE_SOCKET` and
+`GASCAN_ENGINE_STATE_ROOT`, all undefaulted and all required when `GASCAN_ARCA_BACKEND` is set.
+Since this session, **each one's absence reaches the user by name** rather than as a readiness
+timeout, and `gascan doctor` answers with real host facts even when the daemon cannot start.
+`crates/gascan-e2e/tests/arca_startup.rs` is the instrument, and it needs no engine at all.
+
+### WHERE THE CONTROLLER STORE LIVES NOW
+
+**Scoped by backend, except Apple.** `~/Library/Application Support/dev.gascan/controller/`
+holds `state.sqlite3` for Apple and `<backend>/state.sqlite3` for every other backend, named
+with `BackendSelection::as_str()` so the directory and the daemon instance record cannot drift.
+Apple stays unscoped because moving it would orphan every existing install's records while
+their containers kept running.
+
+The legacy runtime database is Apple's alone, and the reason is a date: `9c6933e` landed the
+durable store on 2026-08-04, `7f9e8e6` landed the first non-Apple backend on 2026-08-17, and
+`git merge-base --is-ancestor 9c6933e 7f9e8e6` confirms the order. A scoped store does not read
+that location at all — not to migrate it, and not to refuse on its leftover sidecars.
+
 ## Where the work is
+
+**EVERYTHING FROM HERE DOWN PREDATES 2026-08-17 AND DESCRIBES MILESTONE 3 AND EARLIER.** It is kept
+for its reasoning, which is still good, and for the traps, which still bite. **It is not current
+state** — the section above is. In particular, anything below saying milestone 4 is undesigned, or
+that nothing is in flight, is stale.
 
 **P5.1 MILESTONE 3 IS MERGED — 2026-08-16. SIX OF SIX TASKS DONE, BOTH PULL REQUESTS LANDED, NOTHING
 OPEN, NOTHING IN FLIGHT.**
@@ -31,10 +267,12 @@ was squashed** and the per-task history this file cites is intact. **Start the n
 a fresh branch off `main`.** Verify every SHA above with `git log -1` rather than trusting one
 written here; this file has gone stale on its own SHAs six times.
 
-**WHAT TO DO NEXT: MILESTONE 4, and it needs a design before it needs code.** Its scope is in "what
-comes after the merge" below. It is the last of P5.1's four milestones and it is the one that makes
-this a product. **Do not start coding it — brainstorm and design it first**, the way milestones 2 and
-3 were, both of which caught false premises in their own design documents before anything was built.
+~~**WHAT TO DO NEXT: MILESTONE 4, and it needs a design before it needs code.**~~ **DONE — see the
+milestone-4 section at the top of this file.** It was designed, planned, and its first landing is
+half built. Its design caught two false premises in the *parent* design before anything was built,
+and its plan then carried three wrong instructions of its own, each caught by an implementer
+re-deriving from source. The scope paragraph below is still the right description of what milestone
+4 covers; it is only the "start by designing it" instruction that is spent.
 
 ### THE PRE-MERGE REVIEW ROUND, AND THE THREE DEFECTS IT COST — 2026-08-16 (late)
 

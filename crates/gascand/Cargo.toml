@@ -10,6 +10,7 @@ camino.workspace = true
 gascan-core = { path = "../gascan-core" }
 gascan-inherited-fd.workspace = true
 gascan-apple = { path = "../gascan-apple" }
+gascan-arca = { path = "../gascan-arca" }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -26,7 +27,6 @@ base64.workspace = true
 command-fds.workspace = true
 nix.workspace = true
 prost-types.workspace = true
-plist.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
