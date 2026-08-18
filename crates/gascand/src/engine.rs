@@ -116,13 +116,13 @@ impl EngineError {
     /// outside. Reported through the startup diagnostic channel they arrive
     /// named, with the message this type already writes.
     #[must_use]
-    pub const fn code(&self) -> &'static str {
-        use gascan_core::startup_diagnostic as codes;
+    pub const fn code(&self) -> gascan_core::startup_diagnostic::StartupCode {
+        use gascan_core::startup_diagnostic::code;
         match self {
-            Self::ForeignSocket { .. } => codes::ENGINE_SOCKET_FOREIGN,
-            Self::NotListening { .. } => codes::ENGINE_NOT_LISTENING,
-            Self::Exited { .. } => codes::ENGINE_EXITED,
-            Self::Io(_) => codes::ENGINE_SUPERVISION_IO,
+            Self::ForeignSocket { .. } => code::ENGINE_SOCKET_FOREIGN,
+            Self::NotListening { .. } => code::ENGINE_NOT_LISTENING,
+            Self::Exited { .. } => code::ENGINE_EXITED,
+            Self::Io(_) => code::ENGINE_SUPERVISION_IO,
         }
     }
 }
@@ -339,6 +339,17 @@ impl EngineSpawner for TokioEngineSpawner {
     fn spawn(&self, launch: &EngineLaunch) -> io::Result<SpawnedEngine> {
         let child = tokio::process::Command::new(&launch.executable)
             .args(launch.serve_arguments())
+            // **The engine gets neither half of the startup diagnostic
+            // channel.** The daemon now holds that descriptor across this
+            // spawn, and `tokio::process` inherits the whole environment. The
+            // descriptor itself is `CLOEXEC` -- `gascan-inherited-fd` sets it
+            // on claim, and `the_claimed_descriptor_is_close_on_exec` pins that
+            // -- but the owner token is what makes a diagnostic line
+            // believable, and the engine has no business holding it. Removing
+            // both here closes the forgery independently of the fd flag, so
+            // neither control is load-bearing alone.
+            .env_remove(gascan_inherited_fd::STARTUP_DIAGNOSTIC_ENV)
+            .env_remove("GASCAN_DAEMON_OWNER_TOKEN")
             // The engine outlives this daemon deliberately, so it must not be
             // reaped when the handle is dropped. `kill_on_drop` defaults to
             // false; it is named here because turning it on would silently

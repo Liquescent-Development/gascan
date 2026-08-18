@@ -15,7 +15,12 @@
 
 use super::DoctorFact;
 use crate::backend::BackendSelection;
+use camino::Utf8Path;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
+
+/// The system OpenSSH client, whose presence is a fixed absolute path's stat.
+pub const SYSTEM_SSH_CLIENT: &str = "/usr/bin/ssh";
 
 /// Is this process running on the architecture the product supports?
 #[must_use]
@@ -140,60 +145,169 @@ pub fn engine_binary_fact(engine_binary: Option<&Path>) -> DoctorFact {
     }
 }
 
+/// Can the caller reach the workspace it named?
+///
+/// A `canonicalize` and a `metadata` on a path the caller already holds. The
+/// daemon computes this from the path the CLI sends it, so the CLI computing it
+/// directly is the same measurement with one fewer hop -- and it is the CLI's
+/// own working directory, which the CLI knows with more authority than anyone.
+#[must_use]
+pub fn workspace_fact(path: &Utf8Path) -> DoctorFact {
+    let metadata = path
+        .canonicalize()
+        .map_err(|error| error.to_string())
+        .and_then(|path| std::fs::metadata(path).map_err(|error| error.to_string()));
+    match metadata {
+        Ok(metadata) if metadata.is_dir() => DoctorFact::pass("workspace directory is accessible"),
+        Ok(_) => DoctorFact::fail("workspace is not a directory"),
+        Err(error) => DoctorFact::fail(format!("workspace is inaccessible: {error}")),
+    }
+}
+
+/// Is the system OpenSSH client present and executable?
+///
+/// `ssh.identity` and `ssh.config` are the daemon's -- they read the controller
+/// store. `ssh.client` is not: it is a stat of [`SYSTEM_SSH_CLIENT`], and a
+/// report that blamed a daemon's startup failure for the state of
+/// `/usr/bin/ssh` would be saying something false.
+#[must_use]
+pub fn ssh_client_fact(client: &Path) -> DoctorFact {
+    match std::fs::symlink_metadata(client) {
+        Ok(metadata)
+            if metadata.file_type().is_file() && metadata.permissions().mode() & 0o111 != 0 =>
+        {
+            DoctorFact::pass("system OpenSSH client is executable")
+        }
+        Ok(_) => DoctorFact::fail(format!(
+            "system OpenSSH client at {} is not a regular executable",
+            client.display()
+        )),
+        Err(error) => DoctorFact::fail(format!(
+            "system OpenSSH client at {} is unavailable: {error}",
+            client.display()
+        )),
+    }
+}
+
 /// What this host can say about itself with no daemon running.
 ///
-/// Which facts those are depends on the backend, and that is not a detail: the
-/// Arca backend's `runtime.cli` is an engine executable this account can stat
-/// and its `runtime.kernel` is a digest check over files this account owns,
-/// while Apple's are answers only the `container` CLI can give. A collector
-/// that reported Apple's two from the host would be inventing them.
+/// **Split by provenance, not by convenience.** The distinction that matters is
+/// whether a fact is the same in any process this account runs, or whether it is
+/// scoped to the environment of the process that measured it -- because a report
+/// assembled from a live daemon must not have the daemon's answers replaced by a
+/// second process's reading of a different variable.
+///
+/// Which facts exist at all depends on the backend, and that is not a detail
+/// either: the Arca backend's `runtime.cli` is an engine executable this account
+/// can stat and its `runtime.kernel` is a digest check over files this account
+/// owns, while Apple's are answers only the `container` CLI can give. A
+/// collector that reported Apple's two from the host would be inventing them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostFacts {
+    /// This process's compiled target. Every process of this build agrees.
     pub architecture: DoctorFact,
+    /// A plist on this host. Every process on it agrees.
     pub macos: DoctorFact,
-    /// The engine executable, for backends that have one.
-    pub engine_binary: Option<DoctorFact>,
+    /// The caller's workspace, when the caller named one. The daemon measures
+    /// the path the CLI sent it, so the CLI's own reading is the same
+    /// measurement one hop earlier. `None` where the caller supplies this fact
+    /// from elsewhere, which is what the daemon does from its RPC request.
+    pub workspace: Option<DoctorFact>,
+    /// A stat of [`SYSTEM_SSH_CLIENT`], a fixed absolute path.
+    pub ssh_client: DoctorFact,
     /// The engine's fetched boot artifacts, for backends that have them.
+    /// Resolved through the passwd database by euid, so every process of this
+    /// account agrees.
     pub engine_artifacts: Option<DoctorFact>,
+    /// The engine executable, for backends that have one.
+    ///
+    /// **The one process-scoped fact here.** It is whatever `GASCAN_ENGINE_BIN`
+    /// names in THIS process, and a daemon that is already running was launched
+    /// from whatever it named in ITS process. See [`Self::apply_process_scoped`].
+    pub engine_binary: Option<DoctorFact>,
 }
 
 impl HostFacts {
     /// Measures everything this host can answer for `backend`.
     #[must_use]
-    pub fn collect(backend: BackendSelection, engine_binary: Option<&Path>) -> Self {
+    pub fn collect(
+        backend: BackendSelection,
+        engine_binary: Option<&Path>,
+        workspace: Option<&Utf8Path>,
+    ) -> Self {
         let engine_backed = matches!(backend, BackendSelection::Arca);
         Self {
             architecture: current_architecture_fact(),
             macos: macos_fact(),
-            engine_binary: engine_backed.then(|| engine_binary_fact(engine_binary)),
+            workspace: workspace.map(workspace_fact),
+            ssh_client: ssh_client_fact(Path::new(SYSTEM_SSH_CLIENT)),
             engine_artifacts: engine_backed.then(engine_artifact_fact),
+            engine_binary: engine_backed.then(|| engine_binary_fact(engine_binary)),
         }
     }
 
-    /// Writes these facts into `facts`, leaving every other field alone.
+    /// Writes the facts that are the same in any process of this account.
     ///
-    /// Applied whether or not a daemon answered. When one did, the values are
-    /// equal by construction -- same functions, same host, same account -- and
-    /// applying them unconditionally is what keeps that true rather than
-    /// assumed: there is no branch in which the host half comes from somewhere
-    /// else.
-    pub fn apply(self, facts: &mut super::DoctorFacts) {
-        facts.architecture = self.architecture;
-        facts.macos = self.macos;
-        if let Some(engine_binary) = self.engine_binary {
-            facts.cli = engine_binary;
+    /// Applied whether or not a daemon answered. For these the values really are
+    /// equal by construction: none of them takes an input from the process
+    /// environment. The architecture is compiled in, the macOS version is a
+    /// plist on this host, and the artifact digests resolve through the passwd
+    /// database by euid -- and `client.rs` refuses any daemon whose socket peer
+    /// uid differs from `geteuid()`, so the account is shared too.
+    pub fn apply_account_scoped(&self, facts: &mut super::DoctorFacts) {
+        facts.architecture = self.architecture.clone();
+        facts.macos = self.macos.clone();
+        if let Some(engine_artifacts) = &self.engine_artifacts {
+            facts.kernel = engine_artifacts.clone();
         }
-        if let Some(engine_artifacts) = self.engine_artifacts {
-            facts.kernel = engine_artifacts;
+    }
+
+    /// Writes the facts measured from whoever is assembling the report.
+    ///
+    /// The workspace is the caller's own directory and `/usr/bin/ssh` is an
+    /// absolute path; neither needs a daemon, and a report that blamed a
+    /// daemon's startup failure for the state of either would be saying
+    /// something false. The daemon does not use this: it replaces both from its
+    /// own request and its own SSH paths after the report is built.
+    pub fn apply_caller_scoped(&self, facts: &mut super::DoctorFacts) {
+        if let Some(workspace) = &self.workspace {
+            facts.workspace = workspace.clone();
+        }
+        facts.ssh_client = self.ssh_client.clone();
+    }
+
+    /// Writes the engine-executable fact. **Only valid when no daemon answered.**
+    ///
+    /// `GASCAN_ENGINE_BIN` is per-process and mutable, and a running daemon was
+    /// launched from whatever it named in the launching shell. Applying this
+    /// over a daemon's answer replaces a statement about the engine that is
+    /// actually running with a statement about whatever this shell happens to
+    /// export -- which fails two ways, both silent:
+    ///
+    /// - a shell without the variable turns a healthy `runtime.cli` into
+    ///   "GASCAN_ENGINE_BIN must name the engine executable" and flips the exit
+    ///   code, while the user's sandboxes are running on that very engine;
+    /// - a shell with a *newer* path masks the daemon's honest
+    ///   "engine executable unavailable at /old/build/arca-engine", which is the
+    ///   exact condition [`engine_binary_fact`] exists to catch.
+    ///
+    /// Where a daemon answered, its `runtime.cli` is the authority. Where none
+    /// did, this reading is the only one there is.
+    pub fn apply_process_scoped(&self, facts: &mut super::DoctorFacts) {
+        if let Some(engine_binary) = &self.engine_binary {
+            facts.cli = engine_binary.clone();
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{HostFacts, architecture_fact, engine_binary_fact, macos_fact_at};
+    use super::{
+        HostFacts, architecture_fact, engine_binary_fact, macos_fact_at, ssh_client_fact,
+        workspace_fact,
+    };
     use crate::backend::BackendSelection;
-    use crate::doctor::DoctorStatus;
+    use crate::doctor::{DoctorFact, DoctorFacts, DoctorStatus};
 
     #[test]
     fn only_aarch64_passes() {
@@ -207,11 +321,60 @@ mod tests {
         assert_eq!(fact.status, DoctorStatus::Fail);
     }
 
-    /// An absent `GASCAN_ENGINE_BIN` is a named failure and not a pass.
+    /// The threshold, tested in the crate that implements it.
     ///
-    /// The daemon reports this as a startup diagnostic; the doctor has to be
-    /// able to say the same thing without one, because the daemon that would
-    /// have said it is the daemon that could not start.
+    /// It used to be asserted only from `gascand`, which meant `cargo test -p
+    /// gascan-core` passed with a broken `>= 26` comparison.
+    #[test]
+    fn the_macos_threshold_is_twenty_six() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        for (version, expected) in [
+            ("25.9", DoctorStatus::Fail),
+            ("26.0", DoctorStatus::Pass),
+            ("26.6.1", DoctorStatus::Pass),
+            ("27.0", DoctorStatus::Pass),
+        ] {
+            let path = temp.path().join("SystemVersion.plist");
+            let mut dictionary = plist::Dictionary::new();
+            dictionary.insert(
+                "ProductVersion".to_owned(),
+                plist::Value::String(version.to_owned()),
+            );
+            plist::Value::Dictionary(dictionary).to_file_xml(&path)?;
+            assert_eq!(
+                macos_fact_at(&path).status,
+                expected,
+                "ProductVersion {version}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_missing_workspace_is_inaccessible_and_a_file_is_not_a_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf())
+            .map_err(|_| "non-UTF-8 temp dir")?;
+        assert_eq!(workspace_fact(&root).status, DoctorStatus::Pass);
+        let file = root.join("a-file");
+        std::fs::write(&file, b"")?;
+        assert_eq!(workspace_fact(&file).status, DoctorStatus::Fail);
+        assert_eq!(
+            workspace_fact(&root.join("absent")).status,
+            DoctorStatus::Fail
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_missing_ssh_client_fails_and_names_its_path() {
+        let fact = ssh_client_fact(std::path::Path::new("/nonexistent/ssh"));
+        assert_eq!(fact.status, DoctorStatus::Fail);
+        assert!(fact.detail.contains("/nonexistent/ssh"));
+    }
+
+    /// An absent `GASCAN_ENGINE_BIN` is a named failure and not a pass.
     #[test]
     fn an_unset_engine_binary_names_the_variable() {
         let fact = engine_binary_fact(None);
@@ -224,24 +387,46 @@ mod tests {
     /// be inventing an answer the host cannot give.
     #[test]
     fn only_the_engine_backend_contributes_engine_facts() {
-        let apple = HostFacts::collect(BackendSelection::Apple, None);
+        let apple = HostFacts::collect(BackendSelection::Apple, None, None);
         assert_eq!(apple.engine_binary, None);
         assert_eq!(apple.engine_artifacts, None);
-        let arca = HostFacts::collect(BackendSelection::Arca, None);
+        let arca = HostFacts::collect(BackendSelection::Arca, None, None);
         assert!(arca.engine_binary.is_some());
         assert!(arca.engine_artifacts.is_some());
     }
 
-    /// `apply` writes the host half and nothing else, so a runtime fact a
-    /// daemon supplied cannot be overwritten by a host that never measured it.
+    /// **The account-scoped facts never touch `runtime.cli`.**
+    ///
+    /// This is the regression guard for the defect the split exists to close: a
+    /// daemon is running, it answered `runtime.cli` about the engine it was
+    /// actually launched from, and this process's `GASCAN_ENGINE_BIN` says
+    /// something else -- or nothing. Overwriting the daemon's answer turned a
+    /// healthy engine into a missing one, and masked a genuinely missing one.
     #[test]
-    fn apply_leaves_every_runtime_fact_alone() {
-        let mut facts = crate::doctor::DoctorFacts::unavailable("not collected");
-        facts.service = crate::doctor::DoctorFact::pass("the engine answered");
-        HostFacts::collect(BackendSelection::Apple, None).apply(&mut facts);
+    fn the_account_scoped_facts_leave_a_daemons_engine_answer_alone() {
+        let mut facts = DoctorFacts::unavailable("not collected");
+        facts.cli = DoctorFact::pass("engine executable present at /opt/arca/bin/arca-engine");
+        facts.service = DoctorFact::pass("the engine answered");
+        HostFacts::collect(BackendSelection::Arca, None, None).apply_account_scoped(&mut facts);
+        assert_eq!(
+            facts.cli.detail, "engine executable present at /opt/arca/bin/arca-engine",
+            "the CLI's own GASCAN_ENGINE_BIN overwrote the daemon's answer"
+        );
         assert_eq!(facts.service.status, DoctorStatus::Pass);
         assert_eq!(facts.architecture.status, DoctorStatus::Pass);
-        assert_eq!(facts.cli.status, DoctorStatus::Unknown);
-        assert_eq!(facts.kernel.status, DoctorStatus::Unknown);
+        assert!(facts.kernel.detail.contains("engine artifacts"));
+    }
+
+    /// The process-scoped fact is applied only when it is asked for, and it is
+    /// the only thing it writes.
+    #[test]
+    fn the_process_scoped_fact_writes_only_the_engine_executable() {
+        let mut facts = DoctorFacts::unavailable("not collected");
+        facts.service = DoctorFact::pass("the engine answered");
+        HostFacts::collect(BackendSelection::Arca, None, None).apply_process_scoped(&mut facts);
+        assert_eq!(facts.cli.status, DoctorStatus::Fail);
+        assert!(facts.cli.detail.contains(crate::backend::ENGINE_BIN_ENV));
+        assert_eq!(facts.service.status, DoctorStatus::Pass);
+        assert_eq!(facts.architecture.status, DoctorStatus::Unknown);
     }
 }

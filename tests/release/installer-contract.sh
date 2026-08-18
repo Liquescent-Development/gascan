@@ -250,10 +250,16 @@ prepare_uninstall_roots() {
   # every other backend keeps one under a child named for it. Seeded here so
   # both the preserve message and the removal are asserted against a controller
   # directory the shape a real multi-backend install has.
-  mkdir -p "$fixture_scoped_controller_root"
-  chmod 0700 "$fixture_scoped_controller_root"
-  printf 'fixture scoped controller state\n' >"$fixture_scoped_controller_root/state.sqlite3"
-  printf 'fixture runtime state\n' >"$fixture_runtime_root/daemon-instance.json"
+  if [[ ${fixture_seed_scoped_store:-true} == true ]]; then
+    mkdir -p "$fixture_scoped_controller_root"
+    chmod 0700 "$fixture_scoped_controller_root"
+    printf 'fixture scoped controller state\n' >"$fixture_scoped_controller_root/state.sqlite3"
+  fi
+  # A real instance record, not a sentinel string: `uninstall.sh` reads the
+  # backend out of it to know WHICH controller store the `gascan list` it just
+  # ran was enumerating, and refuses to delete any other backend's store.
+  printf '{"backend":"%s"}\n' "${fixture_daemon_backend:-apple}" \
+    >"$fixture_runtime_root/daemon-instance.json"
 }
 
 run_uninstall() {
@@ -302,12 +308,49 @@ for condition in attested-start observed-start executable empty-token; do
   ! grep -q '^sudo:' "$log"
 done
 export FIXTURE_ATTESTED_START=START FIXTURE_OBSERVED_START=START FIXTURE_ATTESTED_EXECUTABLE=/usr/local/bin/gascand FIXTURE_ATTESTED_TOKEN=TOKEN
+# Only the enumerated store exists here, which is the state in which removal is
+# allowed to proceed. The refusal that guards the other state is asserted below.
+fixture_seed_scoped_store=false
+prepare_uninstall_roots
 run_uninstall --remove-data >/dev/null
 ! /bin/kill -0 "$daemon_pid" 2>/dev/null; daemon_pid=
 grep -qx 'gascan:list --json' "$log"
 grep -qx 'gascan:list --all --json' "$log"
 [[ ! -e $fixture_controller_root && ! -L $fixture_controller_root ]]
-[[ ! -e $fixture_scoped_controller_root && ! -L $fixture_scoped_controller_root ]]
+fixture_seed_scoped_store=true
+
+# **A store this run did not enumerate is a refusal, not a deletion.**
+#
+# The destroy stage reads one backend's records; the removal is an `rm -rf` of
+# the whole controller directory. Before this refusal, uninstalling from a plain
+# shell after work under GASCAN_ARCA_BACKEND destroyed Apple's sandboxes
+# correctly and deleted Arca's records while the engine kept those sandboxes
+# running, unreferenced.
+prepare_uninstall_roots
+mkdir -p "$untargeted_controller_root" "$untargeted_runtime_root"
+printf 'do-not-remove-controller\n' >"$untargeted_controller_root/developer-sentinel"
+printf 'do-not-remove-runtime\n' >"$untargeted_runtime_root/developer-sentinel"
+export FIXTURE_DAEMON_PID=999999 FIXTURE_SANDBOX_JSON='[]' FIXTURE_ALL_SANDBOX_JSON='[]'
+refusal_output=$(run_uninstall --remove-data 2>&1) && {
+  printf 'unenumerated controller store was deleted rather than refused\n' >&2
+  exit 1
+}
+grep -Fq 'refusing to remove data' <<<"$refusal_output"
+grep -Fq "$fixture_scoped_controller_root/state.sqlite3" <<<"$refusal_output"
+[[ -f $fixture_scoped_controller_root/state.sqlite3 ]]
+[[ -f $fixture_controller_root/state.sqlite3 ]]
+
+# With that backend selected, its own store is the enumerated one and the
+# Apple store beside it becomes the one that is refused -- the rule is
+# symmetric, not a special case for Apple.
+fixture_daemon_backend=arca
+prepare_uninstall_roots
+refusal_output=$(run_uninstall --remove-data 2>&1) && {
+  printf 'unenumerated Apple store was deleted rather than refused\n' >&2
+  exit 1
+}
+grep -Fq "$fixture_controller_root/state.sqlite3" <<<"$refusal_output"
+fixture_daemon_backend=apple
 [[ ! -e $fixture_runtime_root && ! -L $fixture_runtime_root ]]
 assert_untargeted_sentinels
 if grep '^ps-env:' "$log" | grep -vx 'ps-env:C:C:UTC'; then
@@ -315,6 +358,10 @@ if grep '^ps-env:' "$log" | grep -vx 'ps-env:C:C:UTC'; then
   exit 1
 fi
 
+# Back to a single enumerated store, so the legs below exercise destruction
+# rather than the refusal the two legs above pin.
+fixture_seed_scoped_store=false
+prepare_uninstall_roots
 : >"$log"; export FIXTURE_DAEMON_PID=999999 FIXTURE_SANDBOX_JSON='[{"sandbox_id":"one"},{"sandbox_id":"two"}]' FIXTURE_ALL_SANDBOX_JSON='[{"sandbox_id":"one","actual_state":"absent"},{"sandbox_id":"two","actual_state":"absent"}]'
 run_uninstall --remove-data >/dev/null
 grep -qx 'gascan:--sandbox one destroy --yes' "$log"

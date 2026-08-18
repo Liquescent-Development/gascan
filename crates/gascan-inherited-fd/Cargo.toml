@@ -12,3 +12,6 @@ rustix.workspace = true
 [lints.rust]
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
+
+[dev-dependencies]
+tempfile = "3"

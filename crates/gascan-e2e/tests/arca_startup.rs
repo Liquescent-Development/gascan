@@ -270,6 +270,18 @@ fn doctor_reports_real_host_facts_and_names_the_runtime_cause() -> TestResult {
         );
     }
 
+    // **Nothing that never needed a daemon is blamed on one.** The workspace
+    // is a stat of the CLI's own directory and `ssh.client` is a stat of
+    // `/usr/bin/ssh`; a report that told the user the engine environment was
+    // why `/usr/bin/ssh` could not be checked would be saying something false.
+    for id in ["workspace.access", "ssh.client"] {
+        let fact = check(id)?;
+        assert!(
+            !fact["detail"].as_str().unwrap_or_default().contains(code),
+            "{id} blames the daemon's startup cause for a fact measured here: {fact}"
+        );
+    }
+
     // The remedies are the engine backend's. An Arca user told to install
     // Apple container is the defect `DoctorRemedies` exists to close, and the
     // CLI now assembles this report itself -- a second place that could get it
@@ -312,9 +324,15 @@ fn the_engine_artifact_check_is_answered_without_a_daemon() -> TestResult {
         !detail.contains(code),
         "runtime.kernel fell through to the daemon's cause instead of being measured: {kernel}"
     );
+    // Asserted on the REMEDY, not on the detail's prose. The detail depends on
+    // what this developer's account actually has installed -- `engine_artifact_fact`
+    // has three branches and the digest-mismatch one returns the error's own
+    // string, which need not mention "engine artifacts" at all. The remedy is
+    // the same in every failing branch and is the thing the check exists to say.
+    let remedy = kernel["remedy"].as_str().unwrap_or_default();
     assert!(
-        detail.contains("engine artifacts"),
-        "runtime.kernel is not the artifact check: {kernel}"
+        remedy.contains("gascan engine fetch") || remedy.contains("engine/arca-pin.json"),
+        "runtime.kernel does not carry the artifact remedy: {kernel}"
     );
     Ok(())
 }

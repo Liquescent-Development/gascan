@@ -455,6 +455,7 @@ name = "gascan"
 version = "0.1.20"
 dependencies = [
  "base64",
+ "camino",
  "clap",
  "command-fds",
  "console",
@@ -586,6 +587,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "rustix",
+ "tempfile",
 ]
 
 [[package]]
@@ -627,7 +629,6 @@ dependencies = [
  "http-body-util",
  "hyper-util",
  "nix",
- "plist",
  "prost",
  "prost-types",
  "rusqlite",

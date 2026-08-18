@@ -141,7 +141,7 @@ fn paths_reject_relative_and_parent_components() -> TestResult {
             BackendSelection::Apple,
         )
         .expect_err("non-normal path must be rejected");
-        assert_eq!(error.code(), "controller_state_invalid");
+        assert_eq!(error.code().as_str(), "controller_state_invalid");
     }
     Ok(())
 }
@@ -155,7 +155,7 @@ fn open_rejects_symlinked_managed_components() -> TestResult {
     std::os::unix::fs::symlink(&target, application_support.join("dev.gascan"))?;
 
     let error = failed_open(&fixture.paths)?;
-    assert_eq!(error.code(), "controller_state_unsafe");
+    assert_eq!(error.code().as_str(), "controller_state_unsafe");
     assert!(!target.join("controller/state.sqlite3").exists());
     Ok(())
 }
@@ -168,7 +168,7 @@ fn open_rejects_non_regular_database() -> TestResult {
     fs::create_dir(fixture.paths.durable_database())?;
 
     let error = failed_open(&fixture.paths)?;
-    assert_eq!(error.code(), "controller_state_unsafe");
+    assert_eq!(error.code().as_str(), "controller_state_unsafe");
     Ok(())
 }
 
@@ -184,7 +184,7 @@ fn open_rejects_foreign_expected_owner() -> TestResult {
     )?;
 
     let error = failed_open(&paths)?;
-    assert_eq!(error.code(), "controller_state_unsafe");
+    assert_eq!(error.code().as_str(), "controller_state_unsafe");
     Ok(())
 }
 
@@ -195,7 +195,7 @@ fn open_rejects_unsafe_managed_directory_and_database_modes() -> TestResult {
     create_private_directory(&application_directory)?;
     fs::set_permissions(&application_directory, fs::Permissions::from_mode(0o755))?;
     let error = failed_open(&fixture.paths)?;
-    assert_eq!(error.code(), "controller_state_unsafe");
+    assert_eq!(error.code().as_str(), "controller_state_unsafe");
 
     fs::set_permissions(&application_directory, fs::Permissions::from_mode(0o700))?;
     create_private_directory(&fixture.controller_directory())?;
@@ -205,7 +205,7 @@ fn open_rejects_unsafe_managed_directory_and_database_modes() -> TestResult {
         fs::Permissions::from_mode(0o644),
     )?;
     let error = failed_open(&fixture.paths)?;
-    assert_eq!(error.code(), "controller_state_unsafe");
+    assert_eq!(error.code().as_str(), "controller_state_unsafe");
     Ok(())
 }
 
@@ -221,7 +221,7 @@ fn open_rejects_writable_home_library_and_application_support_ancestors() -> Tes
         fs::set_permissions(&path, fs::Permissions::from_mode(0o722))?;
 
         let error = failed_open(&fixture.paths)?;
-        assert_eq!(error.code(), "controller_state_unsafe");
+        assert_eq!(error.code().as_str(), "controller_state_unsafe");
     }
     Ok(())
 }
@@ -249,7 +249,7 @@ fn open_rejects_special_bits_on_managed_paths() -> TestResult {
     create_private_directory(&application_directory)?;
     fs::set_permissions(&application_directory, fs::Permissions::from_mode(0o1700))?;
     let error = failed_open(&fixture.paths)?;
-    assert_eq!(error.code(), "controller_state_unsafe");
+    assert_eq!(error.code().as_str(), "controller_state_unsafe");
 
     fs::set_permissions(&application_directory, fs::Permissions::from_mode(0o700))?;
     create_private_directory(&fixture.controller_directory())?;
@@ -259,7 +259,7 @@ fn open_rejects_special_bits_on_managed_paths() -> TestResult {
         fs::Permissions::from_mode(0o1600),
     )?;
     let error = failed_open(&fixture.paths)?;
-    assert_eq!(error.code(), "controller_state_unsafe");
+    assert_eq!(error.code().as_str(), "controller_state_unsafe");
     Ok(())
 }
 
@@ -473,7 +473,7 @@ fn conflicting_active_databases_are_untouched() -> TestResult {
     let before = fixture.capture_active_files()?;
 
     let error = failed_open(&fixture.paths)?;
-    assert_eq!(error.code(), "controller_state_conflict");
+    assert_eq!(error.code().as_str(), "controller_state_conflict");
     assert!(error.to_string().contains("No data was changed"));
     assert_eq!(fixture.capture_active_files()?, before);
     drop(durable);
@@ -516,7 +516,7 @@ fn migration_rejects_malformed_legacy_schema_without_publishing_durable_state() 
     let before = fixture.capture_active_files()?;
 
     let error = failed_open(&fixture.paths)?;
-    assert_eq!(error.code(), "controller_state_migration_failed");
+    assert_eq!(error.code().as_str(), "controller_state_migration_failed");
     assert_eq!(fixture.capture_active_files()?, before);
     assert!(!fixture.paths.durable_database().exists());
     Ok(())
@@ -536,7 +536,7 @@ fn migration_rejects_malformed_durable_schema_without_touching_it() -> TestResul
     let before = fs::read(fixture.paths.durable_database())?;
 
     let error = failed_open(&fixture.paths)?;
-    assert_eq!(error.code(), "controller_state_migration_failed");
+    assert_eq!(error.code().as_str(), "controller_state_migration_failed");
     assert_eq!(fs::read(fixture.paths.durable_database())?, before);
     Ok(())
 }
@@ -577,7 +577,7 @@ fn migration_refuses_unsafe_abandoned_temp_without_removing_it() -> TestResult {
     fs::set_permissions(&abandoned, fs::Permissions::from_mode(0o644))?;
 
     let error = failed_open(&fixture.paths)?;
-    assert_eq!(error.code(), "controller_state_unsafe");
+    assert_eq!(error.code().as_str(), "controller_state_unsafe");
     assert_eq!(fs::read(abandoned)?, b"unsafe");
     Ok(())
 }
@@ -630,7 +630,7 @@ fn migration_fault_boundaries_recover_without_losing_legacy_content() -> TestRes
             Ok(_) => return Err(std::io::Error::other("fault did not interrupt migration").into()),
             Err(error) => error,
         };
-        assert_eq!(error.code(), "controller_state_migration_failed");
+        assert_eq!(error.code().as_str(), "controller_state_migration_failed");
 
         let recovered = open_controller_store(&fixture.paths)?;
         assert_eq!(
@@ -670,13 +670,13 @@ fn interrupted_post_move_archive_is_recovered_before_state_selection() -> TestRe
 
     let error = failed_open(&fixture.paths)?;
     assert_eq!(
-        error.code(),
+        error.code().as_str(),
         "controller_state_conflict",
         "unexpected recovery error: {error:?}"
     );
     assert_eq!(fs::read(fixture.legacy_database())?, legacy_before);
     let repeated = failed_open(&fixture.paths)?;
-    assert_eq!(repeated.code(), "controller_state_conflict");
+    assert_eq!(repeated.code().as_str(), "controller_state_conflict");
     Ok(())
 }
 
@@ -718,7 +718,7 @@ fn malformed_archive_transaction_is_refused_without_mutation() -> TestResult {
     fs::set_permissions(&unexpected, fs::Permissions::from_mode(0o600))?;
 
     let error = failed_open(&fixture.paths)?;
-    assert_eq!(error.code(), "controller_state_unsafe");
+    assert_eq!(error.code().as_str(), "controller_state_unsafe");
     assert_eq!(fs::read(unexpected)?, b"do not touch");
     Ok(())
 }
@@ -749,7 +749,7 @@ fn ambiguous_archive_transactions_are_refused_without_mutation() -> TestResult {
     }
 
     let error = failed_open(&fixture.paths)?;
-    assert_eq!(error.code(), "controller_state_unsafe");
+    assert_eq!(error.code().as_str(), "controller_state_unsafe");
     assert_eq!(fixture.capture_active_files()?, before);
     Ok(())
 }
@@ -825,5 +825,79 @@ fn assert_private_file(path: &Path, mode: u32) -> TestResult {
     assert!(metadata.file_type().is_file());
     assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
     assert_eq!(metadata.permissions().mode() & 0o777, mode);
+    Ok(())
+}
+
+/// **The scope directory is defended exactly as the controller directory is.**
+///
+/// Every other test in this file constructs its paths with
+/// `BackendSelection::Apple`, which by design never creates a scope child --
+/// so `controller/<backend>` arrived with the safety contract this file exists
+/// to pin asserted nowhere. It is a directory a daemon creates and then trusts
+/// a database inside, on the same terms as its parent.
+#[test]
+fn a_scoped_store_refuses_a_symlinked_scope_directory() -> TestResult {
+    let fixture = ControllerFixture::new()?;
+    let paths = ControllerStatePaths::for_home_and_runtime(
+        &fixture.home,
+        &fixture.runtime,
+        rustix::process::geteuid().as_raw(),
+        BackendSelection::Arca,
+    )?;
+    let application = fixture.home.join("Library/Application Support/dev.gascan");
+    create_private_directory(&application)?;
+    create_private_directory(&fixture.controller_directory())?;
+    let target = fixture.home.join("scope-target");
+    create_private_directory(&target)?;
+    std::os::unix::fs::symlink(&target, fixture.controller_directory().join("arca"))?;
+
+    let error = failed_open(&paths)?;
+    assert_eq!(error.code().as_str(), "controller_state_unsafe");
+    assert!(
+        !target.join("state.sqlite3").exists(),
+        "a symlinked scope directory was followed and written through"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_scoped_store_refuses_a_world_readable_scope_directory() -> TestResult {
+    let fixture = ControllerFixture::new()?;
+    let paths = ControllerStatePaths::for_home_and_runtime(
+        &fixture.home,
+        &fixture.runtime,
+        rustix::process::geteuid().as_raw(),
+        BackendSelection::Arca,
+    )?;
+    let application = fixture.home.join("Library/Application Support/dev.gascan");
+    create_private_directory(&application)?;
+    create_private_directory(&fixture.controller_directory())?;
+    let scope = fixture.controller_directory().join("arca");
+    create_private_directory(&scope)?;
+    fs::set_permissions(&scope, fs::Permissions::from_mode(0o755))?;
+
+    let error = failed_open(&paths)?;
+    assert_eq!(error.code().as_str(), "controller_state_unsafe");
+
+    // The same directory at 0700 opens, so the refusal above is the mode and
+    // not the mere existence of the child.
+    fs::set_permissions(&scope, fs::Permissions::from_mode(0o700))?;
+    let store = open_controller_store(&paths)?;
+    assert!(store.list_sandboxes()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_scoped_store_refuses_a_foreign_owner() -> TestResult {
+    let fixture = ControllerFixture::new()?;
+    let foreign_uid = rustix::process::geteuid().as_raw().saturating_add(1);
+    let paths = ControllerStatePaths::for_home_and_runtime(
+        &fixture.home,
+        &fixture.runtime,
+        foreign_uid,
+        BackendSelection::Arca,
+    )?;
+    let error = failed_open(&paths)?;
+    assert_eq!(error.code().as_str(), "controller_state_unsafe");
     Ok(())
 }

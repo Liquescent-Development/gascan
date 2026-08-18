@@ -120,6 +120,75 @@ gascan_uninstall_remove_absolute_private_child() {
   )
 }
 
+# Which controller store the CLI that just answered was actually reading.
+#
+# Taken from the daemon's own instance record rather than re-derived from the
+# environment: backend selection lives in Rust (`gascan_core::backend`) so that
+# the client and the daemon cannot disagree about it, and a second copy of the
+# rule here would be a third answer nobody reconciles.
+gascan_uninstall_enumerated_store() {
+  local runtime_root instance backend controller_root
+  if [[ -n ${XDG_RUNTIME_DIR:-} ]]; then
+    runtime_root=$XDG_RUNTIME_DIR/gascan
+  else
+    runtime_root=$(gascan_user_runtime_root)
+  fi
+  instance=$runtime_root/daemon-instance.json
+  [[ -f $instance ]] || return 1
+  backend=$(jq -er '.backend | select(type == "string" and length > 0)' "$instance") || return 1
+  controller_root=$(gascan_user_controller_root)
+  # The unscoped path is Apple's, historically and by default; every other
+  # backend keeps its store under a child named for it.
+  if [[ $backend == apple ]]; then
+    printf '%s/state.sqlite3\n' "$controller_root"
+  else
+    printf '%s/%s/state.sqlite3\n' "$controller_root" "$backend"
+  fi
+}
+
+# **Refuse to delete a store whose sandboxes were never destroyed.**
+#
+# `--remove-data` is a two-stage contract: destroy every owned sandbox through
+# `gascan`, then delete the controller directory. Since the store was scoped by
+# backend, stage one reads ONE backend's records while stage two's `rm -rf` of
+# `controller/` takes every backend's with it. A user who had run work under
+# `GASCAN_ARCA_BACKEND` and then uninstalled from a plain shell would have had
+# their Apple records destroyed properly and their Arca records deleted while
+# the engine kept those sandboxes running, unreferenced -- which is the exact
+# harm the scoping exists to prevent, reintroduced at uninstall time and made
+# deterministic rather than accidental.
+#
+# Refusing rather than destroying blind: this script cannot select another
+# backend without owning a second copy of the selection rule, and destroying
+# through the wrong one is worse than stopping.
+gascan_uninstall_assert_every_store_enumerated() {
+  local enumerated controller_root store stores=() unenumerated=()
+  controller_root=$(gascan_user_controller_root)
+  for store in "$controller_root"/state.sqlite3 "$controller_root"/*/state.sqlite3; do
+    [[ -e $store ]] || continue
+    stores+=("$store")
+  done
+  # Nothing to lose, or one store which is necessarily the one the `gascan list`
+  # above enumerated. A fresh install that never started a daemon has no
+  # instance record to read, and refusing to uninstall it would be absurd.
+  [[ ${#stores[@]} -le 1 ]] && return 0
+  enumerated=$(gascan_uninstall_enumerated_store) || {
+    printf 'refusing to remove data: more than one controller store exists and the running\n' >&2
+    printf 'daemon did not record which backend it serves\n' >&2
+    printf '  %s\n' "${stores[@]}" >&2
+    return 65
+  }
+  for store in "${stores[@]}"; do
+    [[ $store == "$enumerated" ]] && continue
+    unenumerated+=("$store")
+  done
+  [[ ${#unenumerated[@]} -eq 0 ]] && return 0
+  printf 'refusing to remove data: these controller stores hold sandboxes this run did not destroy\n' >&2
+  printf '  %s\n' "${unenumerated[@]}" >&2
+  printf 'Destroy them first by re-running with that backend selected, then run --remove-data again.\n' >&2
+  return 65
+}
+
 gascan_uninstall_remove_controller_data() {
   local expected_uid=$1 controller_root controller_parent status
   controller_root=$(gascan_user_controller_root)
@@ -209,6 +278,12 @@ else
     printf 'gascan is required to remove owned data safely\n' >&2
     exit 69
   }
+  # Before anything is destroyed, so a refusal costs nothing.
+  gascan list --json >/dev/null || {
+    printf 'gascan could not report its sandbox inventory\n' >&2
+    exit 65
+  }
+  gascan_uninstall_assert_every_store_enumerated || exit $?
   sandbox_json=$(gascan list --json)
   jq -e '
     type == "array" and

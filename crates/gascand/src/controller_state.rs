@@ -67,13 +67,13 @@ impl ControllerStateError {
     /// other is a diagnostic that is written, validated, and then discarded
     /// without a trace.
     #[must_use]
-    pub const fn code(&self) -> &'static str {
-        use gascan_core::startup_diagnostic as codes;
+    pub const fn code(&self) -> gascan_core::startup_diagnostic::StartupCode {
+        use gascan_core::startup_diagnostic::code;
         match self {
-            Self::Invalid(_) => codes::CONTROLLER_STATE_INVALID,
-            Self::Unsafe(_) => codes::CONTROLLER_STATE_UNSAFE,
-            Self::Conflict { .. } => codes::CONTROLLER_STATE_CONFLICT,
-            Self::Migration(_) | Self::Store(_) => codes::CONTROLLER_STATE_MIGRATION_FAILED,
+            Self::Invalid(_) => code::CONTROLLER_STATE_INVALID,
+            Self::Unsafe(_) => code::CONTROLLER_STATE_UNSAFE,
+            Self::Conflict { .. } => code::CONTROLLER_STATE_CONFLICT,
+            Self::Migration(_) | Self::Store(_) => code::CONTROLLER_STATE_MIGRATION_FAILED,
         }
     }
 }
@@ -4366,7 +4366,7 @@ mod tests {
             }
             Err(error) => error,
         };
-        assert_eq!(error.code(), "controller_state_unsafe");
+        assert_eq!(error.code().as_str(), "controller_state_unsafe");
         assert_eq!(fs::metadata(&replacement)?.len(), 0);
         Ok(())
     }
@@ -4410,7 +4410,7 @@ mod tests {
             }
             Err(error) => error,
         };
-        assert_eq!(error.code(), "controller_state_unsafe");
+        assert_eq!(error.code().as_str(), "controller_state_unsafe");
         Ok(())
     }
 
@@ -4463,7 +4463,7 @@ mod tests {
             }
             Err(error) => error,
         };
-        assert_eq!(error.code(), "controller_state_unsafe");
+        assert_eq!(error.code().as_str(), "controller_state_unsafe");
         Ok(())
     }
 
@@ -4525,7 +4525,7 @@ mod tests {
             }
             Err(error) => error,
         };
-        assert_eq!(error.code(), "controller_state_unsafe");
+        assert_eq!(error.code().as_str(), "controller_state_unsafe");
         Ok(())
     }
 }

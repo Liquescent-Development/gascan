@@ -27,7 +27,6 @@ base64.workspace = true
 command-fds.workspace = true
 nix.workspace = true
 prost-types.workspace = true
-plist.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

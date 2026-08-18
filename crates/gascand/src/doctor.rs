@@ -5,10 +5,8 @@ use crate::ssh::{
 };
 use crate::store::{ActualState, SshResolution, Store};
 use crate::{ServiceError, SshPaths};
-use camino::Utf8Path;
 use gascan_core::doctor::{DoctorFact, DoctorStatus};
 use gascan_core::sandbox::SandboxId;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -259,17 +257,12 @@ fn ready_or_diagnostic_identity_fact<E: std::fmt::Display>(
 }
 
 /// Inspect the caller-provided workspace for a single Doctor request.
-pub(crate) fn workspace_fact(path: &Utf8Path) -> DoctorFact {
-    let metadata = path
-        .canonicalize()
-        .map_err(|error| error.to_string())
-        .and_then(|path| std::fs::metadata(path).map_err(|error| error.to_string()));
-    match metadata {
-        Ok(metadata) if metadata.is_dir() => DoctorFact::pass("workspace directory is accessible"),
-        Ok(_) => DoctorFact::fail("workspace is not a directory"),
-        Err(error) => DoctorFact::fail(format!("workspace is inaccessible: {error}")),
-    }
-}
+/// The caller's workspace, measured by `gascan_core::doctor::host`.
+///
+/// Re-exported rather than implemented here. `gascan doctor` measures the same
+/// fact in its own process when no daemon answers, and two implementations of a
+/// `canonicalize` and a `metadata` would be two things to keep true.
+pub(crate) use gascan_core::doctor::host::workspace_fact;
 
 pub async fn ssh_doctor_facts(store: &Store, native_publish: bool) -> SshDoctorFacts {
     const SSH_CLIENT: &str = "/usr/bin/ssh";
@@ -683,23 +676,11 @@ fn native_publish_fact(native_publish: bool) -> DoctorFact {
     }
 }
 
-fn ssh_client_fact(client: &Path) -> DoctorFact {
-    match std::fs::symlink_metadata(client) {
-        Ok(metadata)
-            if metadata.file_type().is_file() && metadata.permissions().mode() & 0o111 != 0 =>
-        {
-            DoctorFact::pass("system OpenSSH client is executable")
-        }
-        Ok(_) => DoctorFact::fail(format!(
-            "system OpenSSH client at {} is not a regular executable",
-            client.display()
-        )),
-        Err(error) => DoctorFact::fail(format!(
-            "system OpenSSH client at {} is unavailable: {error}",
-            client.display()
-        )),
-    }
-}
+/// The system OpenSSH client, measured by `gascan_core::doctor::host`.
+///
+/// Re-exported for the reason [`workspace_fact`] is: a stat of a fixed absolute
+/// path needs no daemon, and `gascan doctor` says so itself when none answers.
+use gascan_core::doctor::host::ssh_client_fact;
 
 async fn validate_openssh_config(client: &Path, paths: &SshPaths) -> DoctorFact {
     let config = paths.config();
@@ -759,6 +740,7 @@ async fn validate_openssh_config(client: &Path, paths: &SshPaths) -> DoctorFact 
 mod tests {
     use super::*;
     use crate::{ServiceError, SshError, ensure_host_identity, publish_openssh_files};
+    use std::os::unix::fs::PermissionsExt as _;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 

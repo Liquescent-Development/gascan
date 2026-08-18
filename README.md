@@ -63,8 +63,15 @@ report.
 
 Gas Can keeps its per-user controller inventory, operation history, and
 destroyed-sandbox tombstones at
-`~/Library/Application Support/dev.gascan/controller/state.sqlite3`. Socket and
-daemon-lifecycle files remain transient under the runtime directory. On the
+`~/Library/Application Support/dev.gascan/controller/state.sqlite3`. **That path
+is the Apple backend's**; every other backend keeps its own store at
+`.../controller/<backend>/state.sqlite3`, so a daemon on one backend can never
+read or destroy records belonging to another. Apple stays on the unscoped path
+because that is where every install predating backend selection already keeps
+its records. `./packaging/macos/uninstall.sh` names every store it preserved,
+and refuses `--remove-data` while a store exists whose sandboxes that run did
+not destroy. Socket and daemon-lifecycle files remain transient under the
+runtime directory. On the
 first startup after this layout change, Gas Can automatically migrates a safe
 legacy runtime database to the durable location. If both active databases
 contain different records, it refuses to choose or merge them; it leaves both

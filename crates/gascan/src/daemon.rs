@@ -559,15 +559,30 @@ impl DaemonStartupMonitor {
             // to be four literals here and four more in
             // `ControllerStateError::code()`, which is how a writer can add a
             // code the reader silently drops.
-            if !gascan_core::startup_diagnostic::is_accepted(&diagnostic.code)
-                || diagnostic.message.trim().is_empty()
-                || diagnostic.owner_token != source.owner_token
+            let Some(code) =
+                gascan_core::startup_diagnostic::StartupCode::from_wire(&diagnostic.code)
+            else {
+                continue;
+            };
+            if diagnostic.message.trim().is_empty() || diagnostic.owner_token != source.owner_token
             {
                 continue;
             }
+            // **The whitelist bounds the code; nothing bounded the message.**
+            // It is assembled from `io::Error` and `EngineError` Display
+            // output, which embeds paths and OS error strings, so an
+            // environment naming a socket with an ESC sequence reaches this
+            // process's stderr as cursor control. Sanitized here, beside the
+            // whitelist, because this is the side that does not trust the
+            // writer -- and truncated rather than discarded, so a long message
+            // still names its cause instead of becoming a readiness timeout.
+            let message = gascan_core::startup_diagnostic::sanitize_message(&diagnostic.message);
+            if message.trim().is_empty() {
+                continue;
+            }
             return Ok(Some(SupervisorError::DaemonStartup {
-                code: diagnostic.code,
-                message: diagnostic.message,
+                code: code.as_str().to_owned(),
+                message,
             }));
         }
         Ok(None)

@@ -10,7 +10,7 @@ use gascan_core::doctor::{
 };
 use gascan_core::fake_runtime::FakeRuntime;
 use gascan_core::runtime::{RuntimeBackend, RuntimeError};
-use gascan_core::startup_diagnostic as codes;
+use gascan_core::startup_diagnostic::{StartupCode, code as codes};
 use gascand::{
     BackendSelection, ControllerStateError, ControllerStatePaths, Daemon, DaemonConfig,
     DoctorState, ErrorDiagnostics, ProvisionRequest, ProvisionResolution, Provisioner, SandboxApi,
@@ -336,10 +336,11 @@ async fn run(
                         )
                     })
             };
-            let mut reported = |code: &'static str, error: &dyn std::fmt::Display| {
-                let message = error.to_string();
-                report_startup_error(code, &message, startup_diagnostic.as_mut());
-                StartupError { code, message }
+            // `startup_error` with the diagnostic borrowed once, rather than a
+            // second body doing the same thing: the closure exists only because
+            // `?` needs a value and the borrow cannot be re-taken per call.
+            let mut reported = |code: StartupCode, error: &dyn std::fmt::Display| {
+                startup_error(code, &error, startup_diagnostic.as_mut())
             };
             // The kernel and the vminit layout are NOT read from the
             // environment, and that asymmetry is deliberate. They are Gas Can's
@@ -512,17 +513,16 @@ impl StartupDiagnostic {
 /// `Stdio::null()` stderr the CLI gives a production daemon and reached the
 /// user as a generic readiness timeout.
 ///
-/// The code must be one `gascan_core::startup_diagnostic` accepts; anything
-/// else is written, validated, and then dropped by the reader.
+/// The code is a [`StartupCode`], so it is one the reader accepts by
+/// construction. It used to be a `&str` guarded by a `debug_assert!`, which is
+/// compiled out of the builds users run: an unlisted code was then written,
+/// passed every provenance check, and dropped by the whitelist without a trace.
 fn report_startup_error(
-    code: &str,
+    code: StartupCode,
     message: &str,
     startup_diagnostic: Option<&mut StartupDiagnostic>,
 ) {
-    debug_assert!(
-        gascan_core::startup_diagnostic::is_accepted(code),
-        "{code} is not an accepted startup diagnostic code"
-    );
+    let code = code.as_str();
     let owner_token = std::env::var("GASCAN_DAEMON_OWNER_TOKEN").ok();
     let diagnostic = owner_token.as_ref().map(|owner_token| {
         format!(
@@ -550,7 +550,7 @@ fn report_startup_error(
 /// what crosses the channel is a string and a code; a `source()` nobody can
 /// read on the other side is a chain that ends at this process.
 fn startup_error<E: std::fmt::Display>(
-    code: &'static str,
+    code: StartupCode,
     error: &E,
     startup_diagnostic: Option<&mut StartupDiagnostic>,
 ) -> StartupError {
@@ -573,7 +573,7 @@ fn controller_startup_error(
 /// its own message rather than with a bare description.
 #[derive(Debug)]
 struct StartupError {
-    code: &'static str,
+    code: StartupCode,
     message: String,
 }
 
@@ -722,7 +722,7 @@ async fn production_doctor_report() -> DoctorReport {
     // The same functions the CLI calls when no daemon answers. One
     // implementation, two call sites: a host measured twice must not be
     // described two ways.
-    host::HostFacts::collect(BackendSelection::Apple, None).apply(&mut facts);
+    host::HostFacts::collect(BackendSelection::Apple, None, None).apply_account_scoped(&mut facts);
 
     let probe = AppleProbe::new(ProcessRunner);
     let cli = probe.release_evidence().await;
@@ -762,7 +762,9 @@ async fn arca_doctor_report(
     // functions `gascan doctor` calls itself when this daemon cannot start.
     // They were four bodies in this file, which is what kept the doctor silent
     // about a host whose daemon had not come up.
-    host::HostFacts::collect(BackendSelection::Arca, Some(&engine_binary)).apply(&mut facts);
+    let host = host::HostFacts::collect(BackendSelection::Arca, Some(&engine_binary), None);
+    host.apply_account_scoped(&mut facts);
+    host.apply_process_scoped(&mut facts);
     // `Capabilities` carries no state-root field, so this daemon cannot measure
     // the engine's disk. Saying so is better than measuring a directory Gas Can
     // chose and calling it the engine's.
@@ -1642,24 +1644,6 @@ mod doctor_tests {
             host::architecture_fact("x86_64").status,
             gascan_core::doctor::DoctorStatus::Fail
         );
-    }
-
-    #[test]
-    fn plist_product_version_is_structured_and_requires_26()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let temp = tempfile::tempdir()?;
-        let path = temp.path().join("SystemVersion.plist");
-        let mut dictionary = plist::Dictionary::new();
-        dictionary.insert(
-            "ProductVersion".to_owned(),
-            plist::Value::String("25.9".to_owned()),
-        );
-        plist::Value::Dictionary(dictionary).to_file_xml(&path)?;
-        assert_eq!(
-            host::macos_fact_at(&path).status,
-            gascan_core::doctor::DoctorStatus::Fail
-        );
-        Ok(())
     }
 
     #[test]

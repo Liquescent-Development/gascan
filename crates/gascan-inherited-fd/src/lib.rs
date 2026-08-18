@@ -3,7 +3,13 @@
 use std::os::fd::{FromRawFd as _, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const STARTUP_DIAGNOSTIC_FD_ENV: &str = "GASCAN_CONTROLLER_STARTUP_FD";
+/// The descriptor the CLI hands a daemon it spawns.
+///
+/// Public so that a process spawning a child while holding the channel can
+/// remove it from that child's environment. `TokioEngineSpawner` does, because
+/// the daemon now holds the descriptor across the engine spawn.
+pub const STARTUP_DIAGNOSTIC_ENV: &str = "GASCAN_CONTROLLER_STARTUP_FD";
+const STARTUP_DIAGNOSTIC_FD_ENV: &str = STARTUP_DIAGNOSTIC_ENV;
 static CLAIMED: AtomicBool = AtomicBool::new(false);
 
 /// Claims the launcher's exact inherited startup-diagnostic descriptor.
@@ -129,6 +135,46 @@ mod tests {
             error.raw_os_error(),
             Some(rustix::io::Errno::BADF.raw_os_error())
         );
+        Ok(())
+    }
+
+    /// **The claimed descriptor must be close-on-exec.**
+    ///
+    /// It became load-bearing when the daemon started holding the channel
+    /// across the engine spawn: `tokio::process` inherits every descriptor that
+    /// is not `CLOEXEC`, so without this flag the engine would hold a writable
+    /// descriptor on the diagnostic file -- and with `GASCAN_DAEMON_OWNER_TOKEN`
+    /// in its environment it would have both halves of the forgery control.
+    /// `TokioEngineSpawner` now strips the token and the fd variable as well,
+    /// so neither control is load-bearing alone; this pins the flag, which the
+    /// two neighbouring tests do not.
+    #[test]
+    #[allow(unsafe_code)]
+    fn the_claimed_descriptor_is_close_on_exec() -> TestResult {
+        const MODE: &str = "cloexec";
+        if std::env::var(CHILD_MODE).as_deref() != Ok(MODE) {
+            return run_isolated("tests::the_claimed_descriptor_is_close_on_exec", MODE);
+        }
+        let file = tempfile::tempfile()?;
+        let raw = <std::fs::File as std::os::fd::AsRawFd>::as_raw_fd(&file);
+        // Cleared first, so a pass cannot come from an inherited default rather
+        // than from the claim setting it.
+        rustix::io::fcntl_setfd(&file, rustix::io::FdFlags::empty())?;
+        assert!(!rustix::io::fcntl_getfd(&file)?.contains(rustix::io::FdFlags::CLOEXEC));
+        // SAFETY: The isolated test process has no application threads.
+        unsafe {
+            std::env::set_var(STARTUP_DIAGNOSTIC_FD_ENV, raw.to_string());
+        }
+        // SAFETY: The isolated process is single-threaded at this boundary and
+        // `file` is the sole owner of `raw`; the claimed descriptor is leaked
+        // below so the two owners never both close it.
+        let claimed = unsafe { take_startup_diagnostic() }?.ok_or("descriptor was not claimed")?;
+        assert!(
+            rustix::io::fcntl_getfd(&claimed)?.contains(rustix::io::FdFlags::CLOEXEC),
+            "the claimed descriptor would be inherited by every child this process spawns"
+        );
+        std::mem::forget(claimed);
+        drop(file);
         Ok(())
     }
 

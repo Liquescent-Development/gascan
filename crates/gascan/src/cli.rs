@@ -417,10 +417,15 @@ async fn execute_doctor(json: bool) -> Result<i32, CliError> {
     let backend = gascan_core::backend::backend_from_environment()
         .map_err(|error| CliError::Runtime(error.to_string()))?;
     let engine_binary = std::env::var_os(gascan_core::backend::ENGINE_BIN_ENV).map(PathBuf::from);
-    let host_facts = host::HostFacts::collect(backend, engine_binary.as_deref());
+    let current_directory = std::env::current_dir();
+    let workspace = current_directory
+        .as_ref()
+        .ok()
+        .and_then(|path| camino::Utf8Path::from_path(path));
+    let host_facts = host::HostFacts::collect(backend, engine_binary.as_deref(), workspace);
     let remedies = gascan_core::doctor::remedies_for(backend);
 
-    let request = doctor_request(std::env::current_dir());
+    let request = doctor_request(current_directory);
     let response = match connect_with_recovery_progress_reporting(json).await {
         Ok(mut connected) => connected
             .daemon
@@ -445,9 +450,18 @@ async fn execute_doctor(json: bool) -> Result<i32, CliError> {
             }
             facts
         }
-        Err(detail) => DoctorFacts::runtime_unreachable(detail.clone()),
+        Err(detail) => {
+            let mut facts = DoctorFacts::runtime_unreachable(detail.clone());
+            // Only where no daemon answered. `GASCAN_ENGINE_BIN` is
+            // process-scoped, and a running daemon was launched from whatever
+            // it named in ITS shell; this reading is the authority only when
+            // there is no other.
+            host_facts.apply_process_scoped(&mut facts);
+            facts
+        }
     };
-    host_facts.apply(&mut facts);
+    host_facts.apply_account_scoped(&mut facts);
+    host_facts.apply_caller_scoped(&mut facts);
     let report = facts.into_report(remedies);
 
     let checks = report

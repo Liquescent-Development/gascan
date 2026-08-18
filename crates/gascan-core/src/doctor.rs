@@ -609,16 +609,37 @@ impl DoctorReport {
 mod report_shape_tests {
     use super::{DoctorCheckId, DoctorFact, DoctorFacts, DoctorStatus};
 
-    /// **`field_mut` and `into_report` must agree about every check.**
+    /// **All four hand-written tables must agree about every check.**
     ///
-    /// They are two hand-written tables over the same twenty-one variants, and
-    /// a variant one of them forgets is a check whose answer is silently
-    /// dropped -- by the CLI, on the way from a daemon that measured it
-    /// correctly. Marking each id in turn and reading it back is what makes the
-    /// two tables one fact.
+    /// `as_str`, `from_name`, `ALL` and `field_mut` are four transcriptions of
+    /// one list of twenty-one variants, and a variant any one of them forgets
+    /// is a check whose answer is silently dropped -- by the CLI, on the way
+    /// from a daemon that measured it correctly.
+    ///
+    /// `from_name` is the one that had no test at all, and it is the CLI's
+    /// ingest path: rename a check in `as_str` and forget the `from_name` arm,
+    /// and every unit test still passes because `as_str` is self-consistent,
+    /// while at run time the daemon's answer is thrown away and the check
+    /// renders as "the daemon did not report this check".
     #[test]
     fn every_check_id_round_trips_through_a_fact() {
+        // A count `ALL` cannot drift from silently. `std::mem::variant_count`
+        // is unstable, so a variant added to the enum and to `field_mut` -- and
+        // mapped onto an existing `DoctorFacts` field, which forces no struct
+        // change -- would otherwise leave `ALL` and `into_report` both at 21
+        // and this test green while the check does not exist.
+        assert_eq!(
+            DoctorCheckId::ALL.len(),
+            21,
+            "a check was added or removed; update ALL and this count together"
+        );
         for id in DoctorCheckId::ALL {
+            assert_eq!(
+                DoctorCheckId::from_name(id.as_str()),
+                Some(id),
+                "{} does not survive as_str -> from_name",
+                id.as_str()
+            );
             let mut facts = DoctorFacts::unavailable("not collected");
             *facts.field_mut(id) = DoctorFact::pass(format!("marked {}", id.as_str()));
             let report = facts.into_report(&super::AppleRemedies);
