@@ -1,3 +1,5 @@
+pub mod host;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -47,6 +49,37 @@ pub enum DoctorCheckId {
 }
 
 impl DoctorCheckId {
+    /// Every check a report carries, in the order [`DoctorFacts::into_report`]
+    /// emits them.
+    ///
+    /// Written out rather than derived, and paid for by
+    /// `every_check_id_round_trips_through_a_fact`: a new variant missing from
+    /// here is a check `DoctorFacts::field_mut` was never asked about, which is
+    /// how a daemon's answer to it would be dropped on the way through the CLI.
+    pub const ALL: [Self; 21] = [
+        Self::HostArchitecture,
+        Self::HostMacos,
+        Self::RuntimeCli,
+        Self::RuntimeVersion,
+        Self::RuntimeService,
+        Self::RuntimeKernel,
+        Self::RuntimeSchema,
+        Self::StorageState,
+        Self::StorageImages,
+        Self::WorkspaceAccess,
+        Self::RuntimeBindMounts,
+        Self::RuntimeNamedVolumes,
+        Self::RuntimeTty,
+        Self::RuntimeSignals,
+        Self::RuntimeLoopbackPublish,
+        Self::RuntimeResourceLimits,
+        Self::RuntimeOffline,
+        Self::SshClient,
+        Self::SshIdentity,
+        Self::SshConfig,
+        Self::SshNativePublish,
+    ];
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::HostArchitecture => "host.architecture",
@@ -178,6 +211,75 @@ pub struct DoctorFacts {
 }
 
 impl DoctorFacts {
+    /// Every fact a daemon would have supplied, as a named failure.
+    ///
+    /// **Not `unavailable`, and the difference is the point.** `Unknown` reads
+    /// as "not measured yet"; a daemon that could not be reached is a measured
+    /// state with a cause, and `gascan doctor` must exit non-zero for it. The
+    /// host half is overwritten afterwards by
+    /// [`host::HostFacts::apply`](crate::doctor::host::HostFacts::apply), so
+    /// what remains failing is exactly what needed a daemon.
+    pub fn runtime_unreachable(detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        let fact = || DoctorFact::fail(detail.clone());
+        Self {
+            architecture: fact(),
+            macos: fact(),
+            cli: fact(),
+            version: fact(),
+            service: fact(),
+            kernel: fact(),
+            schema: fact(),
+            state_storage: fact(),
+            image_storage: fact(),
+            workspace: fact(),
+            bind_mounts: fact(),
+            named_volumes: fact(),
+            tty: fact(),
+            signals: fact(),
+            loopback_publish: fact(),
+            resource_limits: fact(),
+            offline: fact(),
+            ssh_client: fact(),
+            ssh_identity: fact(),
+            ssh_config: fact(),
+            ssh_native_publish: fact(),
+        }
+    }
+
+    /// The field answering `id`, so a report can be taken apart and put back
+    /// together.
+    ///
+    /// The inverse of [`Self::into_report`]'s pairing, kept beside it and
+    /// pinned to it by `every_check_id_round_trips_through_a_fact`. The CLI
+    /// needs it because it rebuilds a daemon's report in order to overwrite the
+    /// host half with facts it measured itself.
+    pub const fn field_mut(&mut self, id: DoctorCheckId) -> &mut DoctorFact {
+        match id {
+            DoctorCheckId::HostArchitecture => &mut self.architecture,
+            DoctorCheckId::HostMacos => &mut self.macos,
+            DoctorCheckId::RuntimeCli => &mut self.cli,
+            DoctorCheckId::RuntimeVersion => &mut self.version,
+            DoctorCheckId::RuntimeService => &mut self.service,
+            DoctorCheckId::RuntimeKernel => &mut self.kernel,
+            DoctorCheckId::RuntimeSchema => &mut self.schema,
+            DoctorCheckId::StorageState => &mut self.state_storage,
+            DoctorCheckId::StorageImages => &mut self.image_storage,
+            DoctorCheckId::WorkspaceAccess => &mut self.workspace,
+            DoctorCheckId::RuntimeBindMounts => &mut self.bind_mounts,
+            DoctorCheckId::RuntimeNamedVolumes => &mut self.named_volumes,
+            DoctorCheckId::RuntimeTty => &mut self.tty,
+            DoctorCheckId::RuntimeSignals => &mut self.signals,
+            DoctorCheckId::RuntimeLoopbackPublish => &mut self.loopback_publish,
+            DoctorCheckId::RuntimeResourceLimits => &mut self.resource_limits,
+            DoctorCheckId::RuntimeOffline => &mut self.offline,
+            DoctorCheckId::SshClient => &mut self.ssh_client,
+            DoctorCheckId::SshIdentity => &mut self.ssh_identity,
+            DoctorCheckId::SshConfig => &mut self.ssh_config,
+            DoctorCheckId::SshNativePublish => &mut self.ssh_native_publish,
+        }
+    }
+
     pub fn unavailable(detail: impl Into<String>) -> Self {
         let detail = detail.into();
         let fact = || DoctorFact::unknown(detail.clone());
@@ -306,6 +408,25 @@ impl DoctorFacts {
 /// cannot depend on the backend crates.
 pub trait DoctorRemedies: Send + Sync {
     fn remedy(&self, id: DoctorCheckId) -> &'static str;
+}
+
+/// The remedy prose a backend owns.
+///
+/// The one place a `BackendSelection` becomes a `DoctorRemedies`. Both `gascand`
+/// and `gascan` need the mapping now that the CLI assembles the report when no
+/// daemon answers, and a second copy of it is how one of them starts handing
+/// out the other backend's advice -- the exact defect `DoctorRemedies` exists
+/// to close.
+#[must_use]
+pub fn remedies_for(backend: crate::backend::BackendSelection) -> &'static dyn DoctorRemedies {
+    match backend {
+        // The fake backend is a fabricated Apple runtime and its remedies are
+        // Apple's, which is what `gascand`'s fake arm already assumed.
+        #[cfg(debug_assertions)]
+        crate::backend::BackendSelection::Fake => &AppleRemedies,
+        crate::backend::BackendSelection::Apple => &AppleRemedies,
+        crate::backend::BackendSelection::Arca => &ArcaRemedies,
+    }
 }
 
 /// Apple's remedies, unchanged from when they were `into_report`'s hardcoded
@@ -481,5 +602,57 @@ impl DoctorReport {
                 && DoctorCheckId::from_name(&check.id)
                     .is_none_or(|id| id.role() == DoctorCheckRole::ReadinessPrerequisite)
         })
+    }
+}
+
+#[cfg(test)]
+mod report_shape_tests {
+    use super::{DoctorCheckId, DoctorFact, DoctorFacts, DoctorStatus};
+
+    /// **`field_mut` and `into_report` must agree about every check.**
+    ///
+    /// They are two hand-written tables over the same twenty-one variants, and
+    /// a variant one of them forgets is a check whose answer is silently
+    /// dropped -- by the CLI, on the way from a daemon that measured it
+    /// correctly. Marking each id in turn and reading it back is what makes the
+    /// two tables one fact.
+    #[test]
+    fn every_check_id_round_trips_through_a_fact() {
+        for id in DoctorCheckId::ALL {
+            let mut facts = DoctorFacts::unavailable("not collected");
+            *facts.field_mut(id) = DoctorFact::pass(format!("marked {}", id.as_str()));
+            let report = facts.into_report(&super::AppleRemedies);
+            let check = report.check(id.as_str());
+            assert!(
+                check.is_some(),
+                "{} is missing from the report",
+                id.as_str()
+            );
+            let Some(check) = check else { continue };
+            assert_eq!(
+                check.detail,
+                format!("marked {}", id.as_str()),
+                "{} answers a different field than field_mut writes",
+                id.as_str()
+            );
+            assert_eq!(check.status, DoctorStatus::Pass);
+            assert_eq!(
+                report.checks.len(),
+                DoctorCheckId::ALL.len(),
+                "the report and DoctorCheckId::ALL disagree about how many checks exist"
+            );
+        }
+    }
+
+    /// A daemon that could not be reached fails every check, and says why.
+    #[test]
+    fn an_unreachable_runtime_fails_every_check_with_its_cause() {
+        let report = DoctorFacts::runtime_unreachable("engine_exited: the engine exited")
+            .into_report(&super::ArcaRemedies);
+        assert!(!report.is_ready());
+        for check in &report.checks {
+            assert_eq!(check.status, DoctorStatus::Fail, "{} passed", check.id);
+            assert!(check.detail.contains("engine_exited"), "{}", check.id);
+        }
     }
 }

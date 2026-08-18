@@ -514,7 +514,7 @@ the daemon's working directory.
 | `gascan logs [--follow] [--since-millis <n>]` | Stream sandbox logs. |
 | `gascan down [--json]` | Stop the sandbox without deleting state. |
 | `gascan destroy --yes [--json]` | Delete the sandbox and volumes. |
-| `gascan doctor [--json]` | Report host, runtime, and capability facts. |
+| `gascan doctor [--json]` | Report host, runtime, and capability facts. Answers without a daemon: the host facts are measured in place, and the runtime facts carry the daemon's own reason for not starting. |
 
 `--sandbox <id>` is accepted on every command.
 

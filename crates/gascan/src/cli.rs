@@ -391,6 +391,153 @@ fn resolve_project_root(project_root: &str) -> Result<String, CliError> {
         })
 }
 
+/// `gascan doctor`, which has to work when the daemon does not.
+///
+/// **Not a fallback that silently degrades.** The facts are split by who can
+/// measure them. The host half -- architecture, macOS, and for an engine-backed
+/// daemon the engine executable and the artifacts `gascan engine fetch`
+/// installed -- is measured here, in this process, in every case; it never
+/// depended on a daemon and only ever sat behind one because that is where the
+/// report happened to be assembled. The runtime half is asked of the daemon.
+///
+/// When no daemon answers, the runtime half becomes an explicit named failure
+/// carrying the daemon's own startup diagnostic as its detail -- which is what
+/// makes the report say `engine_environment_incomplete: ... GASCAN_ENGINE_BIN
+/// must name the engine executable` rather than `the daemon could not be
+/// reached`, and what makes `engine_artifact_fact`'s "run `gascan engine
+/// fetch`" reachable in exactly the state it describes.
+///
+/// The host facts are applied over the daemon's report as well as under a dead
+/// one. They are equal by construction -- the same `gascan_core::doctor::host`
+/// functions, the same host, the same account -- and applying them in both
+/// paths is what keeps that a fact rather than an assumption.
+async fn execute_doctor(json: bool) -> Result<i32, CliError> {
+    use gascan_core::doctor::{DoctorCheckId, DoctorFacts, DoctorStatus, host};
+
+    let backend = gascan_core::backend::backend_from_environment()
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
+    let engine_binary = std::env::var_os(gascan_core::backend::ENGINE_BIN_ENV).map(PathBuf::from);
+    let host_facts = host::HostFacts::collect(backend, engine_binary.as_deref());
+    let remedies = gascan_core::doctor::remedies_for(backend);
+
+    let request = doctor_request(std::env::current_dir());
+    let response = match connect_with_recovery_progress_reporting(json).await {
+        Ok(mut connected) => connected
+            .daemon
+            .connection
+            .api
+            .doctor(request)
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|status| status.message().to_owned()),
+        Err(error) if doctor_reports_rather_than_raises(&error) => Err(error.to_string()),
+        Err(error) => return Err(supervisor_error(error)),
+    };
+
+    let mut facts = match &response {
+        Ok(response) => {
+            let mut facts = DoctorFacts::unavailable("the daemon did not report this check");
+            for capability in &response.capabilities {
+                let Some(id) = DoctorCheckId::from_name(&capability.name) else {
+                    continue;
+                };
+                *facts.field_mut(id) = capability_fact(capability);
+            }
+            facts
+        }
+        Err(detail) => DoctorFacts::runtime_unreachable(detail.clone()),
+    };
+    host_facts.apply(&mut facts);
+    let report = facts.into_report(remedies);
+
+    let checks = report
+        .checks
+        .iter()
+        .map(|check| DoctorCheck {
+            id: check.id.clone(),
+            status: doctor_status_name(check.status).to_owned(),
+            detail: check.detail.clone(),
+            remedy: check.remedy.clone(),
+        })
+        .collect::<Vec<_>>();
+    if json {
+        let rendered = checks
+            .iter()
+            .map(|check| {
+                serde_json::json!({
+                    "id": check.id,
+                    "status": check.status,
+                    "detail": check.detail,
+                    "remedy": check.remedy,
+                })
+            })
+            .collect::<Vec<_>>();
+        println!("{}", serde_json::json!({"checks": rendered}));
+    } else {
+        print!(
+            "{}",
+            render_human_doctor(&checks, OutputCapabilities::for_stdout())
+        );
+    }
+    Ok(
+        if report.checks.iter().all(|check| {
+            check.status == DoctorStatus::Pass || check.status == DoctorStatus::Warning
+        }) {
+            0
+        } else {
+            EXIT_RUNTIME
+        },
+    )
+}
+
+/// One capability from the daemon, as the fact it was before the wire.
+///
+/// The remedy is taken from the response rather than re-derived, so a per-fact
+/// remedy the daemon attached -- `engine_artifact_fact`'s "run `gascan engine
+/// fetch`" is the one that matters -- survives the round trip instead of being
+/// replaced by the backend default.
+fn capability_fact(capability: &v1::Capability) -> gascan_core::doctor::DoctorFact {
+    use gascan_core::doctor::{DoctorFact, DoctorStatus};
+    let detail: serde_json::Value = serde_json::from_str(&capability.detail)
+        .unwrap_or_else(|_| serde_json::json!({"detail": capability.detail, "remedy": ""}));
+    let field = |name: &str| {
+        detail
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned()
+    };
+    let status = match detail.get("status").and_then(serde_json::Value::as_str) {
+        Some("pass") => DoctorStatus::Pass,
+        Some("warning") => DoctorStatus::Warning,
+        Some("fail") => DoctorStatus::Fail,
+        Some("unknown") => DoctorStatus::Unknown,
+        _ if capability.available => DoctorStatus::Pass,
+        _ => DoctorStatus::Fail,
+    };
+    let fact = DoctorFact {
+        status,
+        detail: field("detail"),
+        remedy: None,
+    };
+    let remedy = field("remedy");
+    if remedy.is_empty() {
+        fact
+    } else {
+        fact.with_remedy(remedy)
+    }
+}
+
+const fn doctor_status_name(status: gascan_core::doctor::DoctorStatus) -> &'static str {
+    use gascan_core::doctor::DoctorStatus;
+    match status {
+        DoctorStatus::Pass => "pass",
+        DoctorStatus::Warning => "warning",
+        DoctorStatus::Fail => "fail",
+        DoctorStatus::Unknown => "unknown",
+    }
+}
+
 fn doctor_request(current_directory: std::io::Result<PathBuf>) -> v1::DoctorRequest {
     let workspace_result = match current_directory {
         Ok(path) if path.is_absolute() => match path.to_str() {
@@ -458,6 +605,14 @@ pub async fn execute() -> Result<i32, CliError> {
     if let Command::Engine { command } = &arguments.command {
         return execute_engine(command);
     }
+    // Handled before the daemon connection for the reason directly above, which
+    // applies to the doctor even more directly than it does to the fetch: this
+    // is the command a user runs BECAUSE the daemon will not start, so making
+    // it depend on a daemon makes the diagnosis depend on the thing being
+    // diagnosed.
+    if let Command::Doctor { json } = &arguments.command {
+        return execute_doctor(*json).await;
+    }
     let configure_io = if let Command::Configure { command } = &arguments.command {
         let io = TerminalPrompter::new().map_err(configure_cli_error)?;
         preflight_configure(command, io.stdin_is_terminal(), io.stderr_is_terminal())?;
@@ -465,8 +620,6 @@ pub async fn execute() -> Result<i32, CliError> {
     } else {
         None
     };
-    let doctor_request = matches!(&arguments.command, Command::Doctor { .. })
-        .then(|| doctor_request(std::env::current_dir()));
     let connected = connect_with_recovery_progress(command_uses_json(&arguments.command)).await?;
     let mut client = connected.daemon.connection;
     match arguments.command {
@@ -595,64 +748,8 @@ pub async fn execute() -> Result<i32, CliError> {
             render_list(&sandboxes, json)?;
             Ok(0)
         }
-        Command::Doctor { json } => {
-            let request = doctor_request.ok_or_else(|| {
-                CliError::Runtime("Doctor request was not prepared before connecting".to_owned())
-            })?;
-            let doctor = client.api.doctor(request).await?.into_inner();
-            let checks = doctor
-                .capabilities
-                .iter()
-                .map(|capability| {
-                    let detail: serde_json::Value = serde_json::from_str(&capability.detail)
-                        .unwrap_or_else(
-                            |_| serde_json::json!({"detail": capability.detail, "remedy": ""}),
-                        );
-                    DoctorCheck {
-                        id: capability.name.clone(),
-                        status: detail
-                            .get("status")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or(if capability.available { "pass" } else { "fail" })
-                            .to_owned(),
-                        detail: detail
-                            .get("detail")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("")
-                            .to_owned(),
-                        remedy: detail
-                            .get("remedy")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("")
-                            .to_owned(),
-                    }
-                })
-                .collect::<Vec<_>>();
-            if json {
-                let checks = checks
-                    .iter()
-                    .map(|check| {
-                        serde_json::json!({
-                            "id": check.id,
-                            "status": check.status,
-                            "detail": check.detail,
-                            "remedy": check.remedy,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                println!("{}", serde_json::json!({"checks": checks}));
-            } else {
-                print!(
-                    "{}",
-                    render_human_doctor(&checks, OutputCapabilities::for_stdout())
-                );
-            }
-            Ok(if doctor.findings.is_empty() {
-                0
-            } else {
-                EXIT_RUNTIME
-            })
-        }
+        // Returned above, before the daemon connection.
+        Command::Doctor { .. } => Ok(0),
         Command::Run { argv } => run(&mut client, arguments.sandbox, argv, false).await,
         Command::Shell { argv } => run(&mut client, arguments.sandbox, argv, true).await,
         Command::Logs {
@@ -1095,16 +1192,50 @@ impl<Output: RecoveryOutputSink + Send> crate::daemon::DaemonLifecycleObserver
 async fn connect_with_recovery_progress(
     json: bool,
 ) -> Result<crate::daemon::ConnectionOutcome<Client>, CliError> {
+    connect_with_recovery_progress_reporting(json)
+        .await
+        .map_err(supervisor_error)
+}
+
+/// [`connect_with_recovery_progress`] with the supervisor's own error kept.
+///
+/// `gascan doctor` is the one caller that has to tell one failure from another:
+/// a daemon that could not be brought up is something it describes, and a
+/// daemon holding work open is something it must raise. Mapping to `CliError`
+/// first would erase the distinction.
+async fn connect_with_recovery_progress_reporting(
+    json: bool,
+) -> Result<crate::daemon::ConnectionOutcome<Client>, crate::daemon::SupervisorError> {
     let mut observer = CliRecoveryObserver::new(
         json,
         OutputCapabilities::for_stderr(),
         TerminalRecoveryOutput,
     );
-    let connected = crate::daemon::connect_current_or_recover_observing(&mut observer)
-        .await
-        .map_err(supervisor_error)?;
+    let connected = crate::daemon::connect_current_or_recover_observing(&mut observer).await?;
     observer.finish();
     Ok(connected)
+}
+
+/// Whether the doctor should describe this failure instead of raising it.
+///
+/// **Only the two that mean nothing came up to answer.** `DaemonStartup` is a
+/// daemon that reported a cause and exited -- the case this whole split exists
+/// for -- and `Readiness` is one that came up and never became healthy. In both
+/// the user's next question is "what is wrong with this host", which is the
+/// report.
+///
+/// Every other supervisor failure carries its own remedy and must reach the
+/// user as an error. A `GracefulTimeout` says to retry with `--force`; folding
+/// it into a report would bury the one thing the user can do, leave the held
+/// operation running, and print a page of host facts about a daemon that is
+/// perfectly alive. `doctor_recovery_does_not_force_a_held_durable_operation`
+/// asserts exactly that, and it is the test that caught this being wrong.
+const fn doctor_reports_rather_than_raises(error: &crate::daemon::SupervisorError) -> bool {
+    matches!(
+        error,
+        crate::daemon::SupervisorError::DaemonStartup { .. }
+            | crate::daemon::SupervisorError::Readiness { .. }
+    )
 }
 
 fn supervisor_error(error: crate::daemon::SupervisorError) -> CliError {

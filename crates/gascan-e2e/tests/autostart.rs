@@ -419,6 +419,16 @@ fn explicit_state_path_bypasses_default_migration() -> TestResult {
     Ok(())
 }
 
+/// **The controller store's own error reaches the user on every start path.**
+///
+/// It reaches them through each path's own output, which is not the same
+/// channel for all three. `gascan daemon start` and `gascan daemon restart`
+/// raise it as an error on stderr. `gascan doctor` no longer does: it is
+/// answered before the daemon connection now, so a daemon that cannot start is
+/// something it REPORTS -- real host facts, and the daemon's own cause carried
+/// as the detail of every check that needed one. Asserting stderr for all
+/// three would be asserting that the doctor still fails the way the thing it
+/// diagnoses fails.
 #[test]
 fn controller_state_errors_survive_all_daemon_start_paths() -> TestResult {
     let env = ControllerErrorEnvironment::new()?;
@@ -430,23 +440,62 @@ fn controller_state_errors_survive_all_daemon_start_paths() -> TestResult {
         let output = env.command(arguments).output()?;
         assert!(
             !output.status.success(),
-            "unsafe controller state was accepted"
+            "unsafe controller state was accepted by {arguments:?}"
         );
-        let stderr = String::from_utf8(output.stderr)?;
+        let stderr = String::from_utf8(output.stderr.clone())?;
+        let reported = if arguments[0] == "doctor" {
+            assert!(
+                stderr.is_empty(),
+                "doctor raised instead of reporting: {stderr}"
+            );
+            String::from_utf8(output.stdout.clone())?
+        } else {
+            stderr.clone()
+        };
         assert!(
-            stderr.contains("controller_state_unsafe"),
-            "controller error code was lost for {arguments:?}: {stderr}"
+            reported.contains("controller_state_unsafe"),
+            "controller error code was lost for {arguments:?}: {reported}"
         );
         assert!(
-            stderr.contains("application directory") && stderr.contains("mode is unsafe"),
-            "actionable controller error was lost for {arguments:?}: {stderr}"
+            reported.contains("application directory") && reported.contains("mode is unsafe"),
+            "actionable controller error was lost for {arguments:?}: {reported}"
         );
-        assert!(!stderr.contains("backend_unavailable"));
+        assert!(!reported.contains("backend_unavailable"));
         assert!(
             !env.runtime_root
                 .join("gascan/daemon-startup-error.json")
                 .exists(),
             "controller startup diagnostic path remained after {arguments:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The doctor's report survives an unsafe controller store with real host facts.
+///
+/// The sibling above asserts the cause is not lost. This asserts the other half
+/// of the split: the facts that never needed a daemon are still measured, so
+/// the report a user reads in this state is a diagnosis and not an apology.
+#[test]
+fn doctor_keeps_its_host_facts_when_the_controller_store_is_unsafe() -> TestResult {
+    let env = ControllerErrorEnvironment::new()?;
+    let output = env.command(&["doctor", "--json"]).output()?;
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let checks = report["checks"]
+        .as_array()
+        .ok_or("doctor report has no checks")?;
+    for id in ["host.architecture", "host.macos"] {
+        let check = checks
+            .iter()
+            .find(|check| check["id"] == id)
+            .ok_or_else(|| format!("{id} is missing"))?;
+        assert_eq!(check["status"], "pass", "{id}: {check}");
+        assert!(
+            !check["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("controller_state_unsafe"),
+            "{id} carried the daemon's cause instead of being measured: {check}"
         );
     }
     Ok(())

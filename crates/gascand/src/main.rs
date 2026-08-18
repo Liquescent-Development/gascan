@@ -6,7 +6,7 @@ use gascan_apple::{
     CommandRunner, CommandSpec, ProcessRunner,
 };
 use gascan_core::doctor::{
-    AppleRemedies, ArcaRemedies, DoctorFact, DoctorFacts, DoctorReport, DoctorStatus,
+    AppleRemedies, ArcaRemedies, DoctorFact, DoctorFacts, DoctorReport, DoctorStatus, host,
 };
 use gascan_core::fake_runtime::FakeRuntime;
 use gascan_core::runtime::{RuntimeBackend, RuntimeError};
@@ -719,8 +719,10 @@ fn e2e_ssh_paths() -> Result<Option<SshPaths>, Box<dyn std::error::Error>> {
 
 async fn production_doctor_report() -> DoctorReport {
     let mut facts = DoctorFacts::unavailable("evidence was not collected");
-    facts.architecture = architecture_fact(std::env::consts::ARCH);
-    facts.macos = macos_fact();
+    // The same functions the CLI calls when no daemon answers. One
+    // implementation, two call sites: a host measured twice must not be
+    // described two ways.
+    host::HostFacts::collect(BackendSelection::Apple, None).apply(&mut facts);
 
     let probe = AppleProbe::new(ProcessRunner);
     let cli = probe.release_evidence().await;
@@ -754,33 +756,13 @@ async fn arca_doctor_report(
     engine_binary: std::path::PathBuf,
 ) -> DoctorReport {
     let mut facts = DoctorFacts::unavailable("engine evidence was not collected");
-    facts.architecture = architecture_fact(std::env::consts::ARCH);
-    facts.macos = macos_fact();
     facts.workspace = DoctorFact::unknown("workspace access is evaluated for each Doctor request");
-
-    // The binary is checked on disk rather than inferred from the engine
-    // answering. A running engine proves an engine ran; it does not prove that
-    // GASCAN_ENGINE_BIN still names one, and the next daemon start is what
-    // discovers that it does not.
-    facts.cli = match std::fs::metadata(&engine_binary) {
-        Ok(metadata) if metadata.is_file() => DoctorFact::pass(format!(
-            "engine executable present at {}",
-            engine_binary.display()
-        )),
-        Ok(_) => DoctorFact::fail(format!("{} is not a file", engine_binary.display())),
-        Err(error) => DoctorFact::fail(format!(
-            "engine executable unavailable at {}: {error}",
-            engine_binary.display()
-        )),
-    };
-
-    // The kernel fact is the artifacts' digest check, not a presence check.
-    // A doctor that only looked for the files would report a moved pin, a
-    // truncated download and a corrupted one all as healthy -- which is the
-    // entire class of failure the digests exist to catch. It runs the SAME
-    // verification the fetch runs, deliberately, so the two cannot disagree
-    // about whether what is installed is usable.
-    facts.kernel = engine_artifact_fact();
+    // Architecture, macOS, the engine executable and the engine's boot
+    // artifacts, all measured by `gascan_core::doctor::host` -- the same
+    // functions `gascan doctor` calls itself when this daemon cannot start.
+    // They were four bodies in this file, which is what kept the doctor silent
+    // about a host whose daemon had not come up.
+    host::HostFacts::collect(BackendSelection::Arca, Some(&engine_binary)).apply(&mut facts);
     // `Capabilities` carries no state-root field, so this daemon cannot measure
     // the engine's disk. Saying so is better than measuring a directory Gas Can
     // chose and calling it the engine's.
@@ -803,44 +785,6 @@ async fn arca_doctor_report(
         }
     }
     facts.into_report(&ArcaRemedies)
-}
-
-/// Are the engine's boot artifacts installed and still what the pin describes?
-///
-/// The remedy names `gascan engine fetch` in every failing case, which is the
-/// pattern the product already uses for a prerequisite the installer cannot
-/// satisfy. It is a per-fact remedy rather than the backend default because it
-/// is specific to what was observed: a missing artifact and a moved pin need
-/// the same command but the user should be told which happened.
-fn engine_artifact_fact() -> DoctorFact {
-    use gascan_core::engine_artifacts::{ArtifactError, ArtifactPaths, Pin};
-    let pin = match Pin::compiled_in() {
-        Ok(pin) => pin,
-        // Not reachable through a released binary -- a malformed pin fails this
-        // crate's own tests -- but reported rather than unwrapped, because this
-        // is the command a user reaches for when nothing else works.
-        Err(error) => return DoctorFact::fail(error.to_string()),
-    };
-    let paths = match ArtifactPaths::for_user() {
-        Ok(paths) => paths,
-        Err(error) => return DoctorFact::fail(error.to_string()),
-    };
-    match gascan_core::engine_artifacts::verify_installed(&paths, &pin) {
-        Ok(()) => DoctorFact::pass(format!(
-            "engine artifacts under {} match {}",
-            paths.root().display(),
-            pin.tag
-        )),
-        Err(ArtifactError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            DoctorFact::fail(format!(
-                "engine artifacts are not installed under {}",
-                paths.root().display()
-            ))
-            .with_remedy("run `gascan engine fetch`")
-        }
-        Err(error) => DoctorFact::fail(error.to_string())
-            .with_remedy("run `gascan engine fetch` to reinstall the artifacts this build expects"),
-    }
 }
 
 /// The engine's revision against the one whose isolation has been proven.
@@ -1154,14 +1098,6 @@ fn gate2_evidence(evidence: &str) -> String {
     )
 }
 
-fn architecture_fact(architecture: &str) -> DoctorFact {
-    if architecture == "aarch64" {
-        DoctorFact::pass("current process target is aarch64")
-    } else {
-        DoctorFact::fail(format!("current process target is {architecture}"))
-    }
-}
-
 fn apply_cli_error(facts: &mut DoctorFacts, error: &gascan_core::runtime::RuntimeError) {
     use gascan_core::runtime::RuntimeError;
     match error {
@@ -1183,37 +1119,6 @@ fn apply_cli_error(facts: &mut DoctorFacts, error: &gascan_core::runtime::Runtim
 
 fn service_error_fact(error: &gascan_core::runtime::RuntimeError) -> DoctorFact {
     DoctorFact::fail(format!("structured system status failed: {error}"))
-}
-
-fn macos_fact() -> DoctorFact {
-    macos_fact_at(std::path::Path::new(
-        "/System/Library/CoreServices/SystemVersion.plist",
-    ))
-}
-
-fn macos_fact_at(path: &std::path::Path) -> DoctorFact {
-    let result = plist::Value::from_file(path).ok().and_then(|value| {
-        value
-            .as_dictionary()
-            .and_then(|dictionary| dictionary.get("ProductVersion"))
-            .and_then(plist::Value::as_string)
-            .map(str::to_owned)
-    });
-    match result {
-        Some(version)
-            if version
-                .split('.')
-                .next()
-                .and_then(|major| major.parse::<u64>().ok())
-                .is_some_and(|major| major >= 26) =>
-        {
-            DoctorFact::pass(format!("SystemVersion.plist ProductVersion is {version}"))
-        }
-        Some(version) => DoctorFact::fail(format!(
-            "SystemVersion.plist ProductVersion is {version}; macOS 26+ required"
-        )),
-        None => DoctorFact::fail("could not parse ProductVersion from SystemVersion.plist"),
-    }
 }
 
 fn storage_fact(path: &std::path::Path, label: &str) -> DoctorFact {
@@ -1734,7 +1639,7 @@ mod doctor_tests {
     #[test]
     fn host_architecture_mismatch_fails() {
         assert_eq!(
-            architecture_fact("x86_64").status,
+            host::architecture_fact("x86_64").status,
             gascan_core::doctor::DoctorStatus::Fail
         );
     }
@@ -1751,7 +1656,7 @@ mod doctor_tests {
         );
         plist::Value::Dictionary(dictionary).to_file_xml(&path)?;
         assert_eq!(
-            macos_fact_at(&path).status,
+            host::macos_fact_at(&path).status,
             gascan_core::doctor::DoctorStatus::Fail
         );
         Ok(())

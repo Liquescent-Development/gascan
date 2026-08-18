@@ -525,6 +525,7 @@ dependencies = [
  "base64",
  "camino",
  "nix",
+ "plist",
  "rustix",
  "serde",
  "serde_json",

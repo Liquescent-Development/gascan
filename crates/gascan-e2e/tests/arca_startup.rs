@@ -182,3 +182,139 @@ fn an_engine_that_cannot_be_spawned_reaches_the_user_as_an_engine_error() -> Tes
     );
     Ok(())
 }
+
+/// **`gascan doctor` answers when the daemon cannot start.**
+///
+/// This is the acceptance for the pair. The host half of the report is real --
+/// measured in the CLI's own process, by the same
+/// `gascan_core::doctor::host` functions the daemon calls -- and every check
+/// that needed a daemon carries the daemon's own startup diagnostic as its
+/// detail, rather than "the daemon could not be reached".
+///
+/// Doctor used to sit behind `connect_with_recovery_progress`, which is the
+/// defect in one sentence: the command a user runs BECAUSE the daemon will not
+/// start required the daemon to start. `gascan engine fetch` already had this
+/// early return and its comment already stated the principle -- "Requiring a
+/// daemon here would make the remedy depend on the thing it repairs".
+#[test]
+fn doctor_reports_real_host_facts_and_names_the_runtime_cause() -> TestResult {
+    let environment = ArcaStartup::new()?;
+    let output = environment
+        .command(&["doctor", "--json"])
+        .env_remove(gascand::ENGINE_BIN_ENV)
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "doctor passed with no daemon and no engine"
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        format!(
+            "doctor produced no JSON report ({error}): stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })?;
+    let checks = report["checks"]
+        .as_array()
+        .ok_or("doctor report has no checks")?;
+    let check = |id: &str| -> TestResult<serde_json::Value> {
+        checks
+            .iter()
+            .find(|check| check["id"] == id)
+            .cloned()
+            .ok_or_else(|| format!("{id} is missing from the report").into())
+    };
+
+    // The host half is measured, not guessed, and passing here means this
+    // machine really is an aarch64 host on macOS 26+ -- which is what the
+    // daemon would have said had it started.
+    for id in ["host.architecture", "host.macos"] {
+        let fact = check(id)?;
+        assert_eq!(fact["status"], "pass", "{id}: {fact}");
+        assert!(
+            fact["detail"]
+                .as_str()
+                .is_some_and(|detail| !detail.is_empty()),
+            "{id} carries no evidence: {fact}"
+        );
+    }
+
+    // The engine executable is a host fact too, and it names the variable
+    // rather than repeating the daemon's diagnostic: the CLI measured it.
+    let engine_binary = check("runtime.cli")?;
+    assert_eq!(engine_binary["status"], "fail");
+    assert!(
+        engine_binary["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains(gascand::ENGINE_BIN_ENV)),
+        "runtime.cli does not name the variable: {engine_binary}"
+    );
+
+    // Everything that needed a daemon carries the daemon's own cause. Asserted
+    // over every such check and not just one, because a report that named the
+    // cause once and said "unknown" everywhere else is the degraded fallback
+    // this deliberately is not.
+    let code = gascan_core::startup_diagnostic::ENGINE_ENVIRONMENT_INCOMPLETE;
+    for id in [
+        "runtime.version",
+        "runtime.service",
+        "runtime.schema",
+        "storage.state",
+        "storage.images",
+    ] {
+        let fact = check(id)?;
+        assert_eq!(fact["status"], "fail", "{id}: {fact}");
+        assert!(
+            fact["detail"].as_str().is_some_and(|d| d.contains(code)),
+            "{id} does not carry the daemon's cause: {fact}"
+        );
+    }
+
+    // The remedies are the engine backend's. An Arca user told to install
+    // Apple container is the defect `DoctorRemedies` exists to close, and the
+    // CLI now assembles this report itself -- a second place that could get it
+    // wrong.
+    for check_value in checks {
+        let remedy = check_value["remedy"].as_str().unwrap_or_default();
+        assert!(
+            !remedy.contains("Apple container"),
+            "{} carries Apple's remedy on the Arca backend: {remedy}",
+            check_value["id"]
+        );
+    }
+    Ok(())
+}
+
+/// The engine's artifacts are reported by the CLI, with their own remedy.
+///
+/// `engine_artifact_fact` is the check Task 13 built to say `run gascan engine
+/// fetch`, and Task 11's startup ordering made it unreachable in exactly the
+/// state it describes: a daemon that cannot start because the artifacts are
+/// missing cannot be asked whether the artifacts are missing.
+#[test]
+fn the_engine_artifact_check_is_answered_without_a_daemon() -> TestResult {
+    let environment = ArcaStartup::new()?;
+    let output = environment
+        .command(&["doctor", "--json"])
+        .env_remove(gascand::ENGINE_BIN_ENV)
+        .output()?;
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let kernel = report["checks"]
+        .as_array()
+        .ok_or("doctor report has no checks")?
+        .iter()
+        .find(|check| check["id"] == "runtime.kernel")
+        .cloned()
+        .ok_or("runtime.kernel is missing from the report")?;
+    let detail = kernel["detail"].as_str().unwrap_or_default();
+    let code = gascan_core::startup_diagnostic::ENGINE_ENVIRONMENT_INCOMPLETE;
+    assert!(
+        !detail.contains(code),
+        "runtime.kernel fell through to the daemon's cause instead of being measured: {kernel}"
+    );
+    assert!(
+        detail.contains("engine artifacts"),
+        "runtime.kernel is not the artifact check: {kernel}"
+    );
+    Ok(())
+}

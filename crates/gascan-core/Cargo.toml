@@ -17,6 +17,7 @@ toml.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 rustix.workspace = true
 nix.workspace = true
+plist.workspace = true
 
 [dev-dependencies]
 sha2.workspace = true
