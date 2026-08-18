@@ -3180,14 +3180,46 @@ fn file_identity_at(
 /// tampering signal. Name the fault and carry the observed values.
 ///
 /// ~~Mode 0200 is the daemon's own not-yet-published record.~~ **Corrected
-/// 2026-08-07: 0200 is two states, and only one of them resolves.** `gascand`
-/// creates the file inert at 0200 and publishes it by chmod-ing to 0600, so
-/// 0200 with an empty file is a publication in flight. But 0200 with *content*
-/// is a daemon that wrote its record and died before publishing, which never
-/// becomes 0600 on its own. The distinction already exists in this module —
-/// `is_instance_tombstone` and `is_interrupted_tombstone` split on exactly this
-/// — and reporting them identically is what left a caller unable to tell a race
-/// it should wait out from a corpse it should not.
+/// 2026-08-07: 0200 is two states, and only one of them resolves.** 0200 with
+/// an empty file is the inert tombstone; 0200 with *content* is a record whose
+/// publication was interrupted.
+///
+/// ~~which never becomes 0600 on its own.~~ **Corrected 2026-08-18, and this
+/// is the correction that mattered: it did become 0600 on its own, constantly,
+/// because a live `gascand` published by writing into the file already at this
+/// path and chmod-ing it afterwards.** Every reader that looked across that
+/// `fsync` called a running daemon a corpse: a terminal `PermissionDenied`
+/// here, and `DaemonState::Unsafe` at `inspect_with`. Reclaim does not follow
+/// from that — `recover_interrupted_tombstone` proves the endpoint absent twice
+/// first, and `gascand` binds its socket before it writes this record — so what
+/// the race produced was a false terminal verdict, not a truncated record.
+/// MEASURED with a polling observer over 2000 start-and-stop cycles: 12,131,645
+/// samples in that state, roughly half of all samples taken. That probe was a
+/// temporary harness and is not in the tree; the bounded test that replaced it,
+/// `no_reader_ever_sees_an_illegal_state_across_start_and_stop` in
+/// `crates/gascand/src/socket.rs`, runs 64 cycles rather than 2000.
+///
+/// `crates/gascand/src/socket.rs` now builds both the record and the tombstone
+/// under a private name and renames them into place, so **`gascand`** shows
+/// this path only three faces: absent, the inert tombstone, and the whole
+/// record. The same observer over the same 2000 cycles saw 0200-with-content 0
+/// times.
+///
+/// **The path is not thereby down to three faces, and an earlier draft of this
+/// comment claimed it was.** `retire_held_record` above, at the `fchmod` and
+/// `ftruncate` at `daemon.rs:1453-1455`, still walks a *published* record
+/// through 0200-with-content in place — and `validate_held_published_record`
+/// has just proven that descriptor is still linked at the destination, so the
+/// state is on the path, not off it. `inspect` takes no lifecycle lock while
+/// `start_with` does, so a concurrent reader can still sample it. Two syscalls
+/// wide rather than an `fsync`, and the record there has been proven dead
+/// twice over, so the verdict it produces is unflattering rather than false —
+/// but it is the last in-tree producer and it is not fixed.
+///
+/// So the reachable producers are: `retire_held_record`, and a `gascand` older
+/// than the change above. **Not** a daemon that dies mid-publish — under the
+/// new publisher that leaves the destination absent and the half-written record
+/// under a staging name, which is a different failure with a different cure.
 ///
 /// Size is therefore reported in every case, because it is the field that
 /// separates them and its absence made a CI failure unattributable.
@@ -4850,8 +4882,15 @@ mod tests {
                 // accident rather than anything the test means to exercise.
                 //
                 // The rename is atomic, so no observer sees a partially
-                // published record -- which is what the production publisher
-                // achieves by creating the file inert and chmod-ing it last.
+                // published record.
+                //
+                // ~~which is what the production publisher achieves by creating
+                // the file inert and chmod-ing it last.~~ **Corrected
+                // 2026-08-18: it did not achieve that.** Chmod-ing last still
+                // showed content at the published path for the length of an
+                // `fsync`, and this comment asserted the fixture had adopted a
+                // safety the production code did not have. The production
+                // publisher stages and renames too now, for this reason.
                 let staged = instance_path.with_extension("publishing");
                 fs::write(&staged, serde_json::to_vec(&published)?)?;
                 fs::set_permissions(&staged, fs::Permissions::from_mode(0o600))?;

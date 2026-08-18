@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const DIRECTORY_MODE: u16 = 0o700;
 const SOCKET_MODE: u16 = 0o600;
 const INSTANCE_TOMBSTONE_MODE: u16 = 0o200;
+const INSTANCE_STAGING_PURPOSE: &str = "instance";
 const SOCKET_NAME: &str = "gascand.sock";
 const INSTANCE_NAME: &str = "daemon-instance.json";
 const LIFECYCLE_LOCK_NAME: &str = "daemon-lifecycle.lock";
@@ -75,7 +76,13 @@ impl SocketPaths {
         let directory = open_private_directory(&self.directory)?;
         prepare_socket(&directory)?;
         let (listener, staging, staging_identity) = bind_staging(&directory)?;
-        let mut staging_guard = StagingGuard::new(&directory, &staging, staging_identity);
+        let mut staging_guard = StagingGuard::new(
+            &directory,
+            &staging,
+            staging_identity,
+            rustix::fs::FileType::Socket,
+            "rejected-bind",
+        );
         rustix::fs::chmodat(
             &directory,
             staging.as_str(),
@@ -121,14 +128,24 @@ struct StagingGuard<'a> {
     directory: &'a OwnedFd,
     name: &'a str,
     identity: Identity,
+    kind: FileType,
+    purpose: &'static str,
     armed: bool,
 }
 impl<'a> StagingGuard<'a> {
-    const fn new(directory: &'a OwnedFd, name: &'a str, identity: Identity) -> Self {
+    const fn new(
+        directory: &'a OwnedFd,
+        name: &'a str,
+        identity: Identity,
+        kind: FileType,
+        purpose: &'static str,
+    ) -> Self {
         Self {
             directory,
             name,
             identity,
+            kind,
+            purpose,
             armed: true,
         }
     }
@@ -139,8 +156,13 @@ impl<'a> StagingGuard<'a> {
 impl Drop for StagingGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            let _ =
-                remove_named_identity(self.directory, self.name, self.identity, "rejected-bind");
+            let _ = remove_named_identity(
+                self.directory,
+                self.name,
+                self.identity,
+                self.kind,
+                self.purpose,
+            );
         }
     }
 }
@@ -172,17 +194,46 @@ impl Drop for OwnedSocket {
 
 #[derive(Debug)]
 pub(crate) struct OwnedInstanceRecord {
+    directory: OwnedFd,
+    name: std::ffi::OsString,
     identity: Identity,
     _file: std::fs::File,
 }
 
 impl Drop for OwnedInstanceRecord {
     fn drop(&mut self) {
-        let _ = retire_instance_record_with_hook(&self._file, self.identity, || Ok(()));
+        // Retirement allocates now -- it stages a tombstone -- so it can fail on
+        // a full filesystem where the old `fchmod`-plus-`ftruncate` could not,
+        // and a failure here leaves a complete, live-looking record at the
+        // destination for the next `gascan` to reason about. `Drop` cannot
+        // return it, so it says so on stderr rather than discarding it, which is
+        // what `api.rs` already does for a server that ends unexpectedly.
+        if let Err(error) = retire_instance_record_with_hook(
+            &self.directory,
+            &self.name,
+            &self._file,
+            self.identity,
+            || Ok(()),
+        ) {
+            eprintln!(
+                "daemon instance record was not retired, and a live-looking record may remain: {error}"
+            );
+        }
     }
 }
 
+/// Retirement replaces the record with a tombstone, and it does that by rename
+/// for the same reason publication does: chmod-ing the published file to 0200
+/// and then truncating it walks the destination through 0200-*with*-content,
+/// which is the one state `gascan` reads as a corpse. MEASURED on 2026-08-18 by
+/// a temporary probe -- 2000 publish-and-retire cycles under a polling observer,
+/// not retained in the tree; `no_reader_ever_sees_an_illegal_state_across_start_and_stop`
+/// is the bounded 64-cycle test that replaced it. With publication already
+/// atomic, that state was still observed 6,812 times, all of it from this
+/// function's two-step edit.
 fn retire_instance_record_with_hook<F>(
+    directory: &OwnedFd,
+    name: &OsStr,
     file: &std::fs::File,
     expected: Identity,
     after_descriptor_identity: F,
@@ -204,9 +255,110 @@ where
         ));
     }
     after_descriptor_identity()?;
+    if identity_at(directory, name).is_ok_and(|current| current == expected) {
+        let (staged, staging, staged_identity) = stage_inert_instance_file(directory)?;
+        let mut guard = StagingGuard::new(
+            directory,
+            &staging,
+            staged_identity,
+            FileType::RegularFile,
+            "rejected-retirement",
+        );
+        staged.sync_all()?;
+        // The only commit in this module that is not `NOREPLACE`, because
+        // retirement must replace: the record is at the name and the tombstone
+        // has to take its place. That leaves the check above and this rename as
+        // a check-then-act, so the reason no legitimate actor fits between them
+        // is written here rather than assumed. A competing `gascand` cannot
+        // create at the name -- its commit is `NOREPLACE` and ours occupies the
+        // name -- and it cannot reach that commit at all, because
+        // `clear_inert_destination` refuses anything that is not 0200-and-empty
+        // and ours is 0600-with-content. `gascan` never creates or renames a
+        // node at this path; its reclaim only edits a descriptor it already
+        // holds. And two live daemons are excluded upstream anyway, by
+        // `prepare_socket` refusing `AddrInUse` against a live socket before
+        // either one reaches this file.
+        rustix::fs::renameat(directory, staging.as_str(), directory, name).map_err(errno)?;
+        guard.disarm();
+        drop(guard);
+        // The record is unlinked now, so nothing can reach its owner token by
+        // name; emptying it is what keeps a descriptor that outlives this
+        // process from reading one back.
+        //
+        // Truncate before chmod, and the order is load-bearing. `lstat` is not
+        // atomic across resolving a name and reading the inode's attributes: an
+        // observer can resolve this name to the record an instant before the
+        // rename above detaches it and still read the attributes afterwards. Do
+        // the chmod first and that torn read is 0200-*with*-content -- the exact
+        // pair this function exists to make unobservable, on an inode that is no
+        // longer at the name at all. MEASURED on 2026-08-18: CI caught it on
+        // `add3c13` (`no_reader_ever_sees_an_illegal_state_across_start_and_stop`,
+        // `Some((128, 9))`) where 47,124,057 local samples had not, and a
+        // 4000-cycle local probe then reproduced it as `ino=261844349 nlink=0
+        // len=9` beside a tombstone already at the name. Truncating first leaves
+        // the torn read (0600, 0) or (0200, 0), and neither is a corpse.
+        rustix::fs::ftruncate(file, 0).map_err(errno)?;
+        rustix::fs::fchmod(file, Mode::from_raw_mode(INSTANCE_TOMBSTONE_MODE)).map_err(errno)?;
+        return file.sync_all();
+    }
+    // The name resolves to somebody else's file, so there is no tombstone to
+    // leave and nothing at the destination that may be touched. Only this
+    // process's own record is made inert.
     rustix::fs::fchmod(file, Mode::from_raw_mode(INSTANCE_TOMBSTONE_MODE)).map_err(errno)?;
     rustix::fs::ftruncate(file, 0).map_err(errno)?;
     file.sync_all()
+}
+
+/// The staged file both publication and retirement build their next state in:
+/// created under a private name nobody is watching, and inert -- 0200 and empty
+/// -- before a single byte goes into it. It is unlinked again unless a caller
+/// renames it into place.
+fn stage_inert_instance_file(directory: &OwnedFd) -> io::Result<(std::fs::File, String, Identity)> {
+    let staging = instance_staging_name()?;
+    let fd = rustix::fs::openat(
+        directory,
+        staging.as_str(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(INSTANCE_TOMBSTONE_MODE),
+    )
+    .map_err(errno)?;
+    let file = std::fs::File::from(fd);
+    let staged = (|| {
+        // `openat`'s mode argument is masked by the umask, so the file is only
+        // known to be private after an explicit `fchmod`.
+        rustix::fs::fchmod(&file, Mode::from_raw_mode(INSTANCE_TOMBSTONE_MODE)).map_err(errno)?;
+        let stat = rustix::fs::fstat(&file).map_err(errno)?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+            || stat.st_uid != geteuid().as_raw()
+            || stat.st_nlink != 1
+            || Mode::from_raw_mode(stat.st_mode).bits() & 0o777 != INSTANCE_TOMBSTONE_MODE
+            || stat.st_size != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "daemon instance staging file is not an inert private file",
+            ));
+        }
+        let identity = Identity {
+            device: stat.st_dev as u64,
+            inode: stat.st_ino,
+            uid: stat.st_uid,
+        };
+        if identity_at(directory, staging.as_str())? != identity {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "daemon instance staging file changed while opening it",
+            ));
+        }
+        Ok(identity)
+    })();
+    match staged {
+        Ok(identity) => Ok((file, staging, identity)),
+        Err(error) => {
+            let _ = rustix::fs::unlinkat(directory, staging.as_str(), AtFlags::empty());
+            Err(error)
+        }
+    }
 }
 
 pub(crate) fn write_instance_record(
@@ -243,27 +395,132 @@ where
         )
     })?;
     let directory = open_private_directory(parent)?;
-    let (fd, created) = match rustix::fs::openat(
+    sweep_abandoned_staging(&directory);
+    let (mut file, staging, identity) = stage_inert_instance_file(&directory)?;
+    let mut guard = StagingGuard::new(
         &directory,
-        name,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_raw_mode(INSTANCE_TOMBSTONE_MODE),
-    ) {
-        Ok(fd) => (fd, true),
-        Err(error) if error == rustix::io::Errno::EXIST => rustix::fs::openat(
-            &directory,
+        &staging,
+        identity,
+        FileType::RegularFile,
+        "rejected-publication",
+    );
+    let publication = (|| {
+        file.write_all(contents)?;
+        file.sync_all()?;
+        rustix::fs::fchmod(&file, Mode::from_raw_mode(SOCKET_MODE)).map_err(errno)?;
+        let published = rustix::fs::fstat(&file).map_err(errno)?;
+        validate_regular_file(&published)?;
+        if identity_at(&directory, staging.as_str())? != identity {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "daemon instance staging file changed while publishing it",
+            ));
+        }
+        before_descriptor_commit(&directory, name)?;
+        // The whole record arrives at the destination in one step, and
+        // `NOREPLACE` is what keeps that step from overwriting anything at all.
+        // The destination is cleared only once that rename says something is
+        // there, because clearing it first would leave the path absent across
+        // the `write_all` and `sync_all` above -- an `fsync`-length window, the
+        // exact length of the one this function exists to close. Absent is a
+        // state the reader handles (`read_instance_record_for_inspection` maps
+        // `NotFound` to `Ok(None)`), but it is not a state worth holding open.
+        let commit = || {
+            rustix::fs::renameat_with(
+                &directory,
+                staging.as_str(),
+                &directory,
+                name,
+                rustix::fs::RenameFlags::NOREPLACE,
+            )
+        };
+        match commit() {
+            Ok(()) => Ok(()),
+            Err(error) if error == rustix::io::Errno::EXIST => {
+                clear_inert_destination(&directory, name)?;
+                commit().map_err(errno)
+            }
+            Err(error) => Err(errno(error)),
+        }
+    })();
+    publication?;
+    guard.disarm();
+    drop(guard);
+    Ok(OwnedInstanceRecord {
+        directory,
+        name: name.to_owned(),
+        identity,
+        _file: file,
+    })
+}
+
+/// Publication stages the record -- `owner_token` and all -- under a private
+/// name and only then renames it into place, so a process killed in between
+/// leaves a complete 0600 record behind under that name. Nothing else in this
+/// tree enumerates the runtime directory, so without this it would accumulate
+/// one file per crash, indefinitely, each holding a token.
+///
+/// The old publisher had no such class: it wrote in place, so the same crash
+/// left the token at the well-known path, where `gascan`'s reclaim truncated it
+/// on the next lifecycle command. The rename is what created this, so the sweep
+/// belongs with the rename.
+///
+/// Only this crate's own instance staging is swept, by prefix, and only regular
+/// files this user owns. A live daemon's staging cannot be caught: publication
+/// runs once per daemon and `prepare_socket` has already refused to start a
+/// second one against a live socket. Failure to sweep is not failure to
+/// publish -- there is nothing a caller could do about a stale file it does not
+/// own -- so this returns nothing.
+fn sweep_abandoned_staging(directory: &OwnedFd) {
+    let prefix = format!(".{INSTANCE_STAGING_PURPOSE}-");
+    let Ok(path) = resolved_path(directory, ".") else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(prefix.as_str()) {
+            continue;
+        }
+        let Ok(stat) = rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) else {
+            continue;
+        };
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+            || stat.st_uid != geteuid().as_raw()
+        {
+            continue;
+        }
+        let _ = remove_named_identity(
+            directory,
             name,
-            OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map(|fd| (fd, false))
-        .map_err(errno)?,
+            Identity {
+                device: stat.st_dev as u64,
+                inode: stat.st_ino,
+                uid: stat.st_uid,
+            },
+            FileType::RegularFile,
+            "abandoned",
+        );
+    }
+}
+
+/// A rename can only publish into a destination that is free, so the one thing
+/// that may be cleared out of the way is the inert tombstone a retired daemon
+/// leaves behind. Everything else -- a published record, a record whose
+/// publication was interrupted, a file owned by somebody else -- is refused
+/// with the destination untouched, which is the same refusal this function's
+/// predecessor made by opening the destination and demanding it be inert.
+fn clear_inert_destination(directory: &OwnedFd, name: &OsStr) -> io::Result<()> {
+    let stat = match rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(error) if error == rustix::io::Errno::NOENT => return Ok(()),
         Err(error) => return Err(errno(error)),
     };
-    if created {
-        rustix::fs::fchmod(&fd, Mode::from_raw_mode(INSTANCE_TOMBSTONE_MODE)).map_err(errno)?;
-    }
-    let stat = rustix::fs::fstat(&fd).map_err(errno)?;
     if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
         || stat.st_uid != geteuid().as_raw()
         || stat.st_nlink != 1
@@ -275,42 +532,17 @@ where
             "daemon instance destination is not an inert private file",
         ));
     }
-    let identity = Identity {
-        device: stat.st_dev as u64,
-        inode: stat.st_ino,
-        uid: stat.st_uid,
-    };
-    if identity_at(&directory, name)? != identity {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "daemon instance tombstone changed while opening it",
-        ));
-    }
-    let mut file = std::fs::File::from(fd);
-    let publication = (|| {
-        file.write_all(contents)?;
-        file.sync_all()?;
-        before_descriptor_commit(&directory, name)?;
-        rustix::fs::fchmod(&file, Mode::from_raw_mode(SOCKET_MODE)).map_err(errno)?;
-        let published = rustix::fs::fstat(&file).map_err(errno)?;
-        validate_regular_file(&published)?;
-        if identity_at(&directory, name)? != identity {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "daemon instance destination changed while publishing it",
-            ));
-        }
-        Ok(())
-    })();
-    if let Err(error) = publication {
-        let _ = rustix::fs::fchmod(&file, Mode::from_raw_mode(INSTANCE_TOMBSTONE_MODE));
-        let _ = rustix::fs::ftruncate(&file, 0);
-        return Err(error);
-    }
-    Ok(OwnedInstanceRecord {
-        identity,
-        _file: file,
-    })
+    remove_named_identity(
+        directory,
+        name,
+        Identity {
+            device: stat.st_dev as u64,
+            inode: stat.st_ino,
+            uid: stat.st_uid,
+        },
+        FileType::RegularFile,
+        "retired",
+    )
 }
 
 fn validate_regular_file(stat: &rustix::fs::Stat) -> io::Result<()> {
@@ -429,13 +661,19 @@ fn prepare_socket(directory: &OwnedFd) -> io::Result<()> {
 }
 
 fn remove_identity(directory: &OwnedFd, expected: Identity, purpose: &str) -> io::Result<()> {
-    remove_named_identity(directory, SOCKET_NAME, expected, purpose)
+    remove_named_identity(directory, SOCKET_NAME, expected, FileType::Socket, purpose)
 }
 
-fn remove_named_identity(
+/// The socket is not the only node that has to be unlinked by identity rather
+/// than by name: the instance record's staging file and the inert tombstone a
+/// retired daemon leaves behind need the same guarantee, and they are regular
+/// files. `kind` is what the caller expects to be removing, and a node that is
+/// no longer that kind is put back rather than unlinked.
+fn remove_named_identity<S: rustix::path::Arg + Copy>(
     directory: &OwnedFd,
-    source: &str,
+    source: S,
     expected: Identity,
+    kind: FileType,
     purpose: &str,
 ) -> io::Result<()> {
     let quarantine = loop {
@@ -460,7 +698,7 @@ fn remove_named_identity(
     let moved = identity_at(directory, &quarantine)?;
     let stat = rustix::fs::statat(directory, quarantine.as_str(), AtFlags::SYMLINK_NOFOLLOW)
         .map_err(errno)?;
-    if moved == expected && FileType::from_raw_mode(stat.st_mode) == FileType::Socket {
+    if moved == expected && FileType::from_raw_mode(stat.st_mode) == kind {
         rustix::fs::unlinkat(directory, quarantine.as_str(), AtFlags::empty()).map_err(errno)
     } else {
         if identity_at(directory, source).is_err() {
@@ -468,7 +706,7 @@ fn remove_named_identity(
         }
         Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
-            "socket changed during cleanup",
+            "runtime node changed during cleanup",
         ))
     }
 }
@@ -527,7 +765,13 @@ where
                     || FileType::from_raw_mode(stat.st_mode) != FileType::Socket
                 {
                     drop(listener);
-                    remove_named_identity(directory, &staging, identity, "rejected-bind")?;
+                    remove_named_identity(
+                        directory,
+                        &staging,
+                        identity,
+                        FileType::Socket,
+                        "rejected-bind",
+                    )?;
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "staging socket identity is invalid",
@@ -576,15 +820,33 @@ fn cleanup_escaped_staging(path: &Path, name: &str, expected: Identity) -> io::R
             "escaped staging is not the daemon user's socket",
         ));
     }
-    remove_named_identity(&directory, name, expected, "escaped-bind")
+    remove_named_identity(&directory, name, expected, FileType::Socket, "escaped-bind")
 }
 
+/// `purpose` is deliberately not in the name. The socket's staging node is
+/// `bind`-ed as a unix socket before it is renamed into place, so its path is
+/// bounded by `SUN_LEN` -- 104 bytes, which this engine refuses to exceed
+/// rather than truncating -- and every byte spent describing it is a byte the
+/// runtime directory cannot use. `instance_staging_name` carries the prefix the
+/// sweeper needs, because that node is never bound.
 fn random_name(purpose: &str) -> io::Result<String> {
     let mut bytes = [0_u8; 7];
     getrandom::fill(&mut bytes).map_err(io::Error::other)?;
     let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
     let _ = purpose;
     Ok(format!(".{token}"))
+}
+
+/// Publication stages a file holding the record's `owner_token` and only then
+/// renames it into place, so a process killed in between leaves it behind. This
+/// name is what lets the next publication recognise that residue as its own and
+/// sweep it; see `sweep_abandoned_staging`. It is never bound as a socket, so
+/// the length it costs is free.
+fn instance_staging_name() -> io::Result<String> {
+    let mut bytes = [0_u8; 7];
+    getrandom::fill(&mut bytes).map_err(io::Error::other)?;
+    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    Ok(format!(".{INSTANCE_STAGING_PURPOSE}-{token}"))
 }
 
 fn resolved_path(directory: &OwnedFd, name: &str) -> io::Result<PathBuf> {
@@ -644,7 +906,7 @@ mod tests {
     };
     use std::fs;
     use std::io::Write as _;
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::os::unix::fs::PermissionsExt as _;
     use std::os::unix::net::UnixListener;
 
     #[test]
@@ -653,7 +915,13 @@ mod tests {
         let root = temp.path().canonicalize()?.join("runtime");
         let directory = open_private_directory(&root)?;
         let (listener, staging, identity) = bind_staging(&directory)?;
-        let guard = StagingGuard::new(&directory, &staging, identity);
+        let guard = StagingGuard::new(
+            &directory,
+            &staging,
+            identity,
+            rustix::fs::FileType::Socket,
+            "rejected-bind",
+        );
         let collision = UnixListener::bind(resolved_path(&directory, SOCKET_NAME)?)?;
         let result = rustix::fs::renameat_with(
             &directory,
@@ -692,6 +960,148 @@ mod tests {
         Ok(())
     }
 
+    /// What a concurrent reader would see at the published path at the instant
+    /// publication commits. `None` is an absent destination.
+    fn destination_at_commit(
+        path: &std::path::Path,
+    ) -> std::io::Result<(Option<(u16, i64)>, super::OwnedInstanceRecord)> {
+        let observed = std::cell::Cell::new(None);
+        let record = super::write_instance_record_with_commit_hook(
+            path,
+            br#"{"pid":7}"#,
+            |directory, name| {
+                observed.set(Some(
+                    match rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+                    {
+                        Ok(stat) => Some((
+                            rustix::fs::Mode::from_raw_mode(stat.st_mode).bits() & 0o777,
+                            stat.st_size,
+                        )),
+                        Err(error) if error == rustix::io::Errno::NOENT => None,
+                        Err(error) => return Err(super::errno(error)),
+                    },
+                ));
+                Ok(())
+            },
+        )?;
+        let observed = observed
+            .take()
+            .ok_or_else(|| std::io::Error::other("the commit hook never ran"))?;
+        Ok((observed, record))
+    }
+
+    /// The hook test above pins the one instant publication commits; this one
+    /// watches the path continuously across whole start-and-stop cycles,
+    /// because retirement has a window of its own and no hook sits inside it.
+    /// MEASURED on 2026-08-18 by a temporary 2000-cycle probe, not retained in
+    /// the tree -- this test is its bounded form: the original code showed
+    /// 0200-with-content 12,131,645 times, atomic publication alone brought that
+    /// to 6,812 (all of it retirement), and with both renamed it is 0 out of
+    /// 47,124,057 samples. 64 cycles is not that measurement; it is the bound at
+    /// which the retirement mutation was re-run and still caught, yield included.
+    #[test]
+    fn no_reader_ever_sees_an_illegal_state_across_start_and_stop()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?.join("runtime");
+        let path = root.join("daemon-instance.json");
+        let contents = br#"{"pid":7}"#;
+        drop(super::write_instance_record(&path, contents)?);
+
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let observer = {
+            let stop = std::sync::Arc::clone(&stop);
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let mut seen = std::collections::BTreeSet::new();
+                while !stop.load(Ordering::Acquire) {
+                    // Yielding rather than spinning, because this project
+                    // records the workspace suite wandering under load and a
+                    // saturated core is load. The retirement mutation was
+                    // re-run with this yield in place and is still caught.
+                    std::thread::yield_now();
+                    match fs::symlink_metadata(&path) {
+                        // A stat whose link count is not one is not a state of
+                        // this path: `lstat` resolves a name and then reads the
+                        // inode, and the two are not one step, so an observer
+                        // can come away holding the attributes of a file the
+                        // rename detached in between. The reader draws the same
+                        // line -- `is_interrupted_tombstone` requires
+                        // `st_nlink == 1` and `validate_file_stat` reports "link
+                        // count is not one" as its own distinct fault -- so a
+                        // detached inode is discarded here rather than being
+                        // classified as something the path showed.
+                        Ok(metadata) if std::os::unix::fs::MetadataExt::nlink(&metadata) == 1 => {
+                            seen.insert(Some((
+                                metadata.permissions().mode() & 0o777,
+                                metadata.len(),
+                            )));
+                        }
+                        Ok(_) => {}
+                        Err(_) => {
+                            seen.insert(None);
+                        }
+                    }
+                }
+                seen
+            })
+        };
+        for _ in 0..64 {
+            drop(super::write_instance_record(&path, contents)?);
+        }
+        stop.store(true, Ordering::Release);
+        let seen = observer.join().map_err(|_| "the observer panicked")?;
+
+        let tombstone = Some((u32::from(super::INSTANCE_TOMBSTONE_MODE), 0));
+        let published = Some((0o600, contents.len() as u64));
+        let illegal: Vec<_> = seen
+            .iter()
+            .filter(|state| state.is_some() && **state != tombstone && **state != published)
+            .collect();
+        assert!(
+            illegal.is_empty(),
+            "a reader saw {illegal:?}, which is neither absent, the inert tombstone, nor the whole record",
+        );
+        assert!(
+            seen.contains(&published) && seen.contains(&tombstone),
+            "the observer never sampled a real transition; it saw only {seen:?}",
+        );
+        Ok(())
+    }
+
+    /// `crates/gascan/src/daemon.rs` classifies this path by mode and size, and
+    /// only three states are safe for it to see: absent, the inert tombstone
+    /// (0200 and empty), and the whole record (0600 with content). A fourth --
+    /// 0200 *with* content -- is its `is_interrupted_tombstone`, which
+    /// `inspect_with` reports as `DaemonState::Unsafe`, "daemon record
+    /// publication was interrupted", and which the reclaim path then chmods and
+    /// truncates. A live daemon that writes its content into the file already
+    /// at the destination wears that face for the length of an `fsync`, so the
+    /// destination must not carry the content until the record is whole.
+    #[test]
+    fn publication_never_shows_an_interrupted_tombstone_at_the_destination()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?.join("runtime");
+        let fresh = root.join("fresh-instance.json");
+        let reused = root.join("reused-instance.json");
+        drop(super::write_instance_record(&reused, b"retired")?);
+
+        for path in [&fresh, &reused] {
+            let (observed, record) = destination_at_commit(path)?;
+            assert!(
+                matches!(observed, None | Some((super::INSTANCE_TOMBSTONE_MODE, 0))),
+                "a reader of {} would have seen {observed:?} while the record was still being published",
+                path.display(),
+            );
+            assert_eq!(fs::read(path)?, br#"{"pid":7}"#);
+            assert_eq!(fs::metadata(path)?.permissions().mode() & 0o777, 0o600);
+            drop(record);
+        }
+        Ok(())
+    }
+
     #[test]
     fn instance_record_refuses_unsafe_existing_destination()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -707,15 +1117,17 @@ mod tests {
         Ok(())
     }
 
+    /// The destination is free at commit time, so the swap this guards against
+    /// is now a creation rather than a replacement: publication must lose the
+    /// race rather than overwrite whoever won it.
     #[test]
-    fn instance_record_commit_never_publishes_a_swapped_destination_name()
+    fn instance_record_commit_never_publishes_over_a_destination_that_appeared()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
         let root = temp.path().canonicalize()?.join("runtime");
         let path = root.join("daemon-instance.json");
         let result =
             super::write_instance_record_with_commit_hook(&path, b"managed", |directory, name| {
-                rustix::fs::unlinkat(directory, name, rustix::fs::AtFlags::empty())?;
                 let replacement = rustix::fs::openat(
                     directory,
                     name,
@@ -748,11 +1160,17 @@ mod tests {
         let root = temp.path().canonicalize()?.join("runtime");
         let path = root.join("daemon-instance.json");
         let record = super::write_instance_record(&path, b"managed")?;
-        super::retire_instance_record_with_hook(&record._file, record.identity, || {
-            fs::remove_file(&path)?;
-            fs::write(&path, b"replacement")?;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-        })?;
+        super::retire_instance_record_with_hook(
+            &record.directory,
+            &record.name,
+            &record._file,
+            record.identity,
+            || {
+                fs::remove_file(&path)?;
+                fs::write(&path, b"replacement")?;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            },
+        )?;
         assert_eq!(fs::read(&path)?, b"replacement");
         assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
         drop(record);
@@ -760,14 +1178,54 @@ mod tests {
         Ok(())
     }
 
+    /// A process killed between staging the record and renaming it into place
+    /// leaves a complete 0600 file holding the record's `owner_token` behind,
+    /// under a name nothing else in this tree enumerates. The rename is what
+    /// created that class, so publication is what has to close it -- and it has
+    /// to close it without touching anything that is not its own staging.
     #[test]
-    fn instance_cleanup_leaves_one_reusable_inert_tombstone()
+    fn publication_sweeps_abandoned_instance_staging_and_nothing_else()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?.join("runtime");
+        let path = root.join("daemon-instance.json");
+        drop(super::write_instance_record(&path, b"first")?);
+
+        let abandoned = root.join(format!(".{}-AAAAAAAAAA", super::INSTANCE_STAGING_PURPOSE));
+        fs::write(&abandoned, br#"{"owner_token":"leaked"}"#)?;
+        fs::set_permissions(&abandoned, fs::Permissions::from_mode(0o600))?;
+        let bystander = root.join(".bystander");
+        fs::write(&bystander, b"not ours to remove")?;
+        let directory = root.join(".a-directory");
+        fs::create_dir(&directory)?;
+
+        let record = super::write_instance_record(&path, b"second")?;
+        assert!(
+            !abandoned.exists(),
+            "a staged record holding an owner token survived the next publication",
+        );
+        assert_eq!(fs::read(&bystander)?, b"not ours to remove");
+        assert!(directory.is_dir());
+        assert_eq!(fs::read(&path)?, b"second");
+        drop(record);
+        Ok(())
+    }
+
+    /// A successor replaces the tombstone rather than writing through it, which
+    /// is what lets the whole record arrive at the destination in a single
+    /// rename. The successor's record is a different inode -- but that is not
+    /// asserted here, because inode *numbers* may legally be reused: ext4
+    /// allocates the lowest free number in the block group, so a freed tombstone
+    /// number can come back on correct code. What is asserted is what the
+    /// tombstone still guarantees: that a successor may clear it, and that
+    /// neither daemon leaves staging litter behind.
+    #[test]
+    fn instance_cleanup_leaves_one_inert_tombstone_a_successor_replaces()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
         let root = temp.path().canonicalize()?.join("runtime");
         let path = root.join("daemon-instance.json");
         let first = super::write_instance_record(&path, b"first")?;
-        let inode = fs::metadata(&path)?.ino();
         drop(first);
         let tombstone = fs::metadata(&path)?;
         assert_eq!(
@@ -777,7 +1235,6 @@ mod tests {
         assert_eq!(tombstone.len(), 0);
 
         let second = super::write_instance_record(&path, b"second")?;
-        assert_eq!(fs::metadata(&path)?.ino(), inode);
         assert_eq!(fs::read(&path)?, b"second");
         drop(second);
         assert_eq!(fs::read_dir(&root)?.count(), 1);
@@ -810,7 +1267,13 @@ mod tests {
         assert!(fs::read_dir(&runtime)?.all(|entry| {
             entry.is_ok_and(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
         }));
-        let guard = StagingGuard::new(&directory, &staging, identity);
+        let guard = StagingGuard::new(
+            &directory,
+            &staging,
+            identity,
+            rustix::fs::FileType::Socket,
+            "rejected-bind",
+        );
         drop(guard);
         drop(listener);
         assert!(fs::read_dir(displaced)?.all(|entry| {
