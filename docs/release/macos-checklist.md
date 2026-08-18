@@ -210,9 +210,16 @@ also verify local Rust, npm, Go, Python, and Ruby installs and XDG configuration
 fixture and sandbox created for these checks remains release-smoke-owned and
 must be removed by its recorded cleanup path.
 
-The durable host controller database is exactly
-`~/Library/Application Support/dev.gascan/controller/state.sqlite3`. On first
-startup, Gas Can automatically migrates a safe legacy runtime database there.
+**The durable host controller database is scoped by backend.** The Apple
+backend's is exactly
+`~/Library/Application Support/dev.gascan/controller/state.sqlite3`; every other
+backend keeps its own at `.../controller/<backend>/state.sqlite3`, where
+`<backend>` is the same name the daemon instance record carries. Apple stays on
+the unscoped path because that is where every install that predates backend
+selection already keeps its records, and moving them would orphan sandboxes
+whose containers are still running. On first startup, Gas Can automatically
+migrates a safe legacy runtime database into the Apple store -- and only into
+the Apple store, because no other backend has ever written one.
 If both active databases differ, it refuses to choose or merge them and leaves
 both unchanged for explicit recovery. The on-demand socket and daemon lifecycle
 files live under `${XDG_RUNTIME_DIR}/gascan` when `XDG_RUNTIME_DIR` is set,
@@ -294,7 +301,8 @@ host, or partial output.
 The default removes only package-owned binaries, documentation, and the
 package receipt. It deliberately preserves every sandbox, Apple volume, cache,
 and durable controller-state file, including
-`~/Library/Application Support/dev.gascan/controller/state.sqlite3`.
+`~/Library/Application Support/dev.gascan/controller/state.sqlite3` and every
+per-backend store beside it. It names each one it preserved on stdout.
 
 ```sh
 ./packaging/macos/uninstall.sh --remove-data

@@ -227,6 +227,7 @@ grep -qx "sudo:installer -pkg $fixture/test.pkg -target /" "$log"
 fixture_user_home=$fixture/uninstall-home
 fixture_runtime_base=$fixture/uninstall-runtime
 fixture_controller_root="$fixture_user_home/Library/Application Support/dev.gascan/controller"
+fixture_scoped_controller_root=$fixture_controller_root/arca
 fixture_runtime_root=$fixture_runtime_base/gascan
 untargeted_user_home=$fixture/untargeted-home
 untargeted_runtime_base=$fixture/untargeted-runtime
@@ -245,6 +246,13 @@ prepare_uninstall_roots() {
     "$fixture_runtime_base" \
     "$fixture_runtime_root"
   printf 'fixture controller state\n' >"$fixture_controller_root/state.sqlite3"
+  # The store is scoped by backend: the unscoped database above is Apple's and
+  # every other backend keeps one under a child named for it. Seeded here so
+  # both the preserve message and the removal are asserted against a controller
+  # directory the shape a real multi-backend install has.
+  mkdir -p "$fixture_scoped_controller_root"
+  chmod 0700 "$fixture_scoped_controller_root"
+  printf 'fixture scoped controller state\n' >"$fixture_scoped_controller_root/state.sqlite3"
   printf 'fixture runtime state\n' >"$fixture_runtime_root/daemon-instance.json"
 }
 
@@ -269,9 +277,13 @@ export HOME=$untargeted_user_home XDG_RUNTIME_DIR=$untargeted_runtime_base
 export FIXTURE_DAEMON_PID=999999 FIXTURE_SANDBOX_JSON='[]' FIXTURE_ALL_SANDBOX_JSON='[]'
 preserve_output=$(run_uninstall)
 grep -Fqx "Preserved durable controller state: $fixture_controller_root/state.sqlite3" <<<"$preserve_output"
+# The scoped store is named too. A message that listed only the unscoped path
+# would tell a user backing up before a reinstall that they had everything.
+grep -Fqx "Preserved durable controller state: $fixture_scoped_controller_root/state.sqlite3" <<<"$preserve_output"
 grep -Fq 'Reinstall Gas Can to recover these sandboxes and volumes.' <<<"$preserve_output"
 grep -Fq './packaging/macos/uninstall.sh --remove-data' <<<"$preserve_output"
 [[ -f $fixture_controller_root/state.sqlite3 ]]
+[[ -f $fixture_scoped_controller_root/state.sqlite3 ]]
 [[ -f $fixture_runtime_root/daemon-instance.json ]]
 assert_untargeted_sentinels
 
@@ -295,6 +307,7 @@ run_uninstall --remove-data >/dev/null
 grep -qx 'gascan:list --json' "$log"
 grep -qx 'gascan:list --all --json' "$log"
 [[ ! -e $fixture_controller_root && ! -L $fixture_controller_root ]]
+[[ ! -e $fixture_scoped_controller_root && ! -L $fixture_scoped_controller_root ]]
 [[ ! -e $fixture_runtime_root && ! -L $fixture_runtime_root ]]
 assert_untargeted_sentinels
 if grep '^ps-env:' "$log" | grep -vx 'ps-env:C:C:UTC'; then
@@ -413,14 +426,17 @@ export FIXTURE_FOREIGN_STAT_PATH=
 
 safe_fixture_user_home=$fixture_user_home
 safe_fixture_controller_root=$fixture_controller_root
+safe_fixture_scoped_controller_root=$fixture_scoped_controller_root
 mkdir -p "$fixture/home-ancestor-target"
 ln -s "$fixture/home-ancestor-target" "$fixture/symlink-home-parent"
 fixture_user_home=$fixture/symlink-home-parent/uninstall-home
 fixture_controller_root="$fixture_user_home/Library/Application Support/dev.gascan/controller"
+fixture_scoped_controller_root=$fixture_controller_root/arca
 prepare_uninstall_roots
 expect_unsafe_removal_refused 'symlinked ancestor above HOME'
 fixture_user_home=$safe_fixture_user_home
 fixture_controller_root=$safe_fixture_controller_root
+fixture_scoped_controller_root=$safe_fixture_scoped_controller_root
 
 safe_fixture_runtime_base=$fixture_runtime_base
 safe_fixture_runtime_root=$fixture_runtime_root

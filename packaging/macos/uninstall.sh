@@ -190,8 +190,18 @@ esac
 
 if [[ $remove_data == false ]]; then
   printf 'Preserving all sandboxes, volumes, caches, and user state.\n'
+  gascan_preserved_controller_root=$(gascan_user_controller_root)
   printf 'Preserved durable controller state: %s/state.sqlite3\n' \
-    "$(gascan_user_controller_root)"
+    "$gascan_preserved_controller_root"
+  # One store per backend since the controller store was scoped: the unscoped
+  # database above is the Apple backend's, and every other backend keeps its own
+  # under a child named for it. Enumerated rather than described with a
+  # placeholder, so a user backing these up before reinstalling is told the
+  # paths that exist rather than the shape they take.
+  for gascan_preserved_scoped in "$gascan_preserved_controller_root"/*/state.sqlite3; do
+    [[ -e $gascan_preserved_scoped ]] || continue
+    printf 'Preserved durable controller state: %s\n' "$gascan_preserved_scoped"
+  done
   printf 'Reinstall Gas Can to recover these sandboxes and volumes.\n'
   printf 'To remove them explicitly, run ./packaging/macos/uninstall.sh --remove-data\n'
 else

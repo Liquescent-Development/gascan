@@ -120,9 +120,16 @@ impl ExplicitStateEnvironment {
         self.explicit_root.path().join("chosen-controller.sqlite3")
     }
 
+    /// The store this environment's daemon would open if `GASCAN_STATE_PATH`
+    /// were not set.
+    ///
+    /// Scoped by backend, and this environment sets `GASCAN_TEST_FAKE_BACKEND`.
+    /// Naming the unscoped path here would make the assertion that it is never
+    /// created pass for the wrong reason -- no daemon on this backend writes
+    /// there any more.
     fn default_database(&self) -> std::path::PathBuf {
         self.account_home
-            .join("Library/Application Support/dev.gascan/controller/state.sqlite3")
+            .join("Library/Application Support/dev.gascan/controller/fake/state.sqlite3")
     }
 
     fn command(&self, arguments: &[&str]) -> Command {

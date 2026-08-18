@@ -117,7 +117,21 @@ impl DurableEnvironment {
         self.runtime_root.join("gascan/state.sqlite3")
     }
 
+    /// Where this environment's daemon actually keeps its records.
+    ///
+    /// Under `controller/fake/`, because the store is scoped by backend and
+    /// this environment sets `GASCAN_TEST_FAKE_BACKEND`. The unscoped path is
+    /// Apple's -- see [`shared_database`].
     fn durable_database(&self) -> std::path::PathBuf {
+        self.account_home
+            .join("Library/Application Support/dev.gascan/controller/fake/state.sqlite3")
+    }
+
+    /// The unscoped path, which belongs to the Apple backend.
+    ///
+    /// No fake-backend daemon may read it, write it, or migrate anything into
+    /// it. Named here so the tests can assert that it stays untouched.
+    fn shared_database(&self) -> std::path::PathBuf {
         self.account_home
             .join("Library/Application Support/dev.gascan/controller/state.sqlite3")
     }
@@ -753,32 +767,113 @@ fn environment_teardown_terminates_its_exact_live_daemon() -> TestResult {
     Ok(())
 }
 
+/// **A scoped daemon leaves the shared store and the legacy database alone.**
+///
+/// The unscoped `controller/state.sqlite3` and the legacy
+/// `<runtime>/state.sqlite3` are both Apple's, and this environment's daemon
+/// runs the fake backend. Before the store was scoped, that daemon opened the
+/// unscoped path and MIGRATED the legacy database into it -- adopting records
+/// it had never written, whose containers another backend was still running.
+///
+/// The legacy database is seeded through a daemon that was pointed at it
+/// explicitly, so the bytes asserted below are bytes a real store wrote.
+#[test]
+fn a_scoped_daemon_neither_adopts_nor_deletes_another_backends_store() -> TestResult {
+    let env = DurableEnvironment::new()?;
+    let legacy_project = tempfile::tempdir()?;
+    let seeded = env
+        .legacy_command(&[
+            "up",
+            legacy_project.path().to_str().ok_or("non UTF-8 root")?,
+        ])
+        .output()?;
+    let daemon_stderr = std::fs::read_to_string(env.runtime_root.join("daemon.stderr"))
+        .unwrap_or_else(|error| format!("<unavailable: {error}>"));
+    assert!(
+        seeded.status.success(),
+        "legacy startup failed: stdout={}, stderr={}, daemon_stderr={}",
+        String::from_utf8_lossy(&seeded.stdout),
+        String::from_utf8_lossy(&seeded.stderr),
+        daemon_stderr
+    );
+    let listed = gascan_e2e::succeeded(env.legacy_command(&["list", "--json"]).output()?);
+    let legacy_records = serde_json::from_slice::<Vec<serde_json::Value>>(&listed.stdout)?;
+    assert_eq!(legacy_records.len(), 1);
+    let legacy_sandbox_id = legacy_records[0]["sandbox_id"]
+        .as_str()
+        .ok_or("legacy sandbox record missing")?
+        .to_owned();
+    let stopped = env.legacy_command(&["daemon", "stop", "--json"]).output()?;
+    assert!(
+        stopped.status.success(),
+        "legacy daemon stop failed: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    env.privatize_legacy_database_family()?;
+    let legacy_bytes = std::fs::read(env.legacy_database())?;
+
+    let started = env.command(&["daemon", "start", "--json"]).output()?;
+    let daemon_stderr = std::fs::read_to_string(env.runtime_root.join("daemon.stderr"))
+        .unwrap_or_else(|error| format!("<unavailable: {error}>"));
+    assert!(
+        started.status.success(),
+        "scoped daemon start failed: stdout={}, stderr={}, daemon_stderr={}",
+        String::from_utf8_lossy(&started.stdout),
+        String::from_utf8_lossy(&started.stderr),
+        daemon_stderr
+    );
+    assert!(
+        env.durable_database().is_file(),
+        "the fake backend's store was not created at {}",
+        env.durable_database().display()
+    );
+    assert!(
+        !env.shared_database().exists(),
+        "a fake-backend daemon wrote the Apple backend's unscoped store"
+    );
+    assert_eq!(
+        std::fs::read(env.legacy_database())?,
+        legacy_bytes,
+        "a fake-backend daemon changed the legacy database it does not own"
+    );
+    let scoped = gascan_e2e::succeeded(env.command(&["list", "--json"]).output()?);
+    let scoped_records = serde_json::from_slice::<Vec<serde_json::Value>>(&scoped.stdout)?;
+    assert!(
+        scoped_records.is_empty(),
+        "the scoped store adopted {} record(s) it never wrote, including {legacy_sandbox_id}",
+        scoped_records.len()
+    );
+    env.shutdown_daemon()?;
+    Ok(())
+}
+
 #[test]
 fn durable_controller_state_survives_daemon_replacement() -> TestResult {
     use std::os::unix::fs::PermissionsExt as _;
 
     let env = DurableEnvironment::new()?;
-    let mut initial =
-        env.legacy_command(&["up", env.root.path().to_str().ok_or("non UTF-8 root")?]);
-    let initial = initial.output()?;
+    let initial = env
+        .command(&["up", env.root.path().to_str().ok_or("non UTF-8 root")?])
+        .output()?;
     let daemon_stderr = std::fs::read_to_string(env.runtime_root.join("daemon.stderr"))
         .unwrap_or_else(|error| format!("<unavailable: {error}>"));
     assert!(
         initial.status.success(),
-        "legacy startup failed: stdout={}, stderr={}, daemon_stderr={}",
+        "durable startup failed: stdout={}, stderr={}, daemon_stderr={}",
         String::from_utf8_lossy(&initial.stdout),
         String::from_utf8_lossy(&initial.stderr),
         daemon_stderr
     );
-    let listed = env.legacy_command(&["list", "--json"]).output()?;
+    let listed = env.command(&["list", "--json"]).output()?;
     let listed = gascan_e2e::succeeded(listed);
     let records = serde_json::from_slice::<Vec<serde_json::Value>>(&listed.stdout)?;
     let sandbox_id = records
         .first()
         .and_then(|record| record["sandbox_id"].as_str())
-        .ok_or("legacy sandbox record missing")?
+        .ok_or("durable sandbox record missing")?
         .to_owned();
     assert_eq!(records.len(), 1);
+    assert!(env.durable_database().is_file());
 
     let fake_state =
         serde_json::from_slice::<serde_json::Value>(&std::fs::read(env.fake_resource_state())?)?;
@@ -793,26 +888,6 @@ fn durable_controller_state_survives_daemon_replacement() -> TestResult {
         })
         .cloned()
         .ok_or("fake managed-volume marker missing")?;
-
-    let stopped = env.legacy_command(&["daemon", "stop", "--json"]).output()?;
-    assert!(
-        stopped.status.success(),
-        "legacy daemon stop failed: {}",
-        String::from_utf8_lossy(&stopped.stderr)
-    );
-    env.privatize_legacy_database_family()?;
-    let started = env.command(&["daemon", "start", "--json"]).output()?;
-    let daemon_stderr = std::fs::read_to_string(env.runtime_root.join("daemon.stderr"))
-        .unwrap_or_else(|error| format!("<unavailable: {error}>"));
-    assert!(
-        started.status.success(),
-        "durable daemon start failed: stdout={}, stderr={}, daemon_stderr={}",
-        String::from_utf8_lossy(&started.stdout),
-        String::from_utf8_lossy(&started.stderr),
-        daemon_stderr
-    );
-    assert!(env.durable_database().is_file());
-    assert!(!env.legacy_database().exists());
 
     let restarted = env.command(&["daemon", "restart", "--json"]).output()?;
     assert!(

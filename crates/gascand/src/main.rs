@@ -242,10 +242,20 @@ async fn run(
         .map_or(Duration::from_secs(300), Duration::from_millis);
     let paths = SocketPaths::for_user()?;
     paths.prepare_directory()?;
+    // One shared reader, in gascan-core, because `gascan` resolves the same
+    // question to decide which daemon it will talk to. Two copies of this could
+    // disagree with each other while each stayed self-consistent.
+    //
+    // **Resolved before the store is opened, and that order is load-bearing.**
+    // The store is scoped by backend, so a daemon that opened it first would
+    // have to open it unscoped and then discover which backend it was -- which
+    // is the state that let an Arca daemon read Apple's records and report
+    // Apple's containers as its own.
+    let selection = gascand::backend_from_environment()?;
     let store = match std::env::var_os("GASCAN_STATE_PATH") {
         Some(path) => Store::open(std::path::PathBuf::from(path))?,
         None => {
-            let state = controller_state_paths(&paths)
+            let state = controller_state_paths(&paths, selection)
                 .map_err(|error| controller_startup_error(error, startup_diagnostic.as_mut()))?;
             open_controller_store(&state)
                 .map_err(|error| controller_startup_error(error, startup_diagnostic.as_mut()))?
@@ -253,10 +263,6 @@ async fn run(
     };
     drop(startup_diagnostic);
     let e2e_ssh_paths = e2e_ssh_paths()?;
-    // One shared reader, in gascan-core, because `gascan` resolves the same
-    // question to decide which daemon it will talk to. Two copies of this could
-    // disagree with each other while each stayed self-consistent.
-    let selection = gascand::backend_from_environment()?;
     // Built once, from the selection that was actually resolved, so an arm
     // cannot record a backend other than the one it constructs. Passing a
     // literal per arm would have made that a convention rather than a fact.
@@ -525,6 +531,7 @@ impl From<ControllerStateError> for ControllerStartupError {
 
 fn controller_state_paths(
     paths: &SocketPaths,
+    backend: BackendSelection,
 ) -> Result<ControllerStatePaths, ControllerStateError> {
     #[cfg(debug_assertions)]
     if option_env!("CARGO_BIN_NAME") == Some("gascan-e2e-daemon") {
@@ -535,9 +542,10 @@ fn controller_state_paths(
             std::path::Path::new(&home),
             paths.directory(),
             rustix::process::geteuid().as_raw(),
+            backend,
         );
     }
-    ControllerStatePaths::for_user(paths.directory())
+    ControllerStatePaths::for_user(paths.directory(), backend)
 }
 
 /// What the daemon needs to describe itself: where it listens, how long it
