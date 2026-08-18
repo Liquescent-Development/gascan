@@ -284,8 +284,21 @@ where
         // The record is unlinked now, so nothing can reach its owner token by
         // name; emptying it is what keeps a descriptor that outlives this
         // process from reading one back.
-        rustix::fs::fchmod(file, Mode::from_raw_mode(INSTANCE_TOMBSTONE_MODE)).map_err(errno)?;
+        //
+        // Truncate before chmod, and the order is load-bearing. `lstat` is not
+        // atomic across resolving a name and reading the inode's attributes: an
+        // observer can resolve this name to the record an instant before the
+        // rename above detaches it and still read the attributes afterwards. Do
+        // the chmod first and that torn read is 0200-*with*-content -- the exact
+        // pair this function exists to make unobservable, on an inode that is no
+        // longer at the name at all. MEASURED on 2026-08-18: CI caught it on
+        // `add3c13` (`no_reader_ever_sees_an_illegal_state_across_start_and_stop`,
+        // `Some((128, 9))`) where 47,124,057 local samples had not, and a
+        // 4000-cycle local probe then reproduced it as `ino=261844349 nlink=0
+        // len=9` beside a tombstone already at the name. Truncating first leaves
+        // the torn read (0600, 0) or (0200, 0), and neither is a corpse.
         rustix::fs::ftruncate(file, 0).map_err(errno)?;
+        rustix::fs::fchmod(file, Mode::from_raw_mode(INSTANCE_TOMBSTONE_MODE)).map_err(errno)?;
         return file.sync_all();
     }
     // The name resolves to somebody else's file, so there is no tombstone to
@@ -1009,12 +1022,23 @@ mod tests {
                     // re-run with this yield in place and is still caught.
                     std::thread::yield_now();
                     match fs::symlink_metadata(&path) {
-                        Ok(metadata) => {
+                        // A stat whose link count is not one is not a state of
+                        // this path: `lstat` resolves a name and then reads the
+                        // inode, and the two are not one step, so an observer
+                        // can come away holding the attributes of a file the
+                        // rename detached in between. The reader draws the same
+                        // line -- `is_interrupted_tombstone` requires
+                        // `st_nlink == 1` and `validate_file_stat` reports "link
+                        // count is not one" as its own distinct fault -- so a
+                        // detached inode is discarded here rather than being
+                        // classified as something the path showed.
+                        Ok(metadata) if std::os::unix::fs::MetadataExt::nlink(&metadata) == 1 => {
                             seen.insert(Some((
                                 metadata.permissions().mode() & 0o777,
                                 metadata.len(),
                             )));
                         }
+                        Ok(_) => {}
                         Err(_) => {
                             seen.insert(None);
                         }

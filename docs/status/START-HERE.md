@@ -180,6 +180,13 @@ the one that needs a decision rather than an implementation, and **must not be d
    narrower — a rename rather than an fsync — but the shape is unchanged: **every narrow window
    is a terminal verdict waiting for a loaded machine.**
 
+   **CI FOUND WHAT 47 MILLION LOCAL SAMPLES DID NOT — read trap 9.** The first pushed version of
+   this fix failed CI's `rust` job on `no_reader_ever_sees_an_illegal_state_across_start_and_stop`
+   with `Some((128, 9))`, and the cause was retirement chmod-ing the outgoing record before
+   truncating it: harmless in principle because the rename has already unlinked it, observable in
+   practice because `lstat` tears between resolving a name and reading the inode. Truncating
+   first fixed it, and a 4000-cycle probe then saw 0 of 87,277,118 samples.
+
    **One window was introduced by the fix and is benign today:** `clear_inert_destination` unlinks
    the tombstone, so `daemon.rs:2852` can now return `ENOENT` where it could not before.
    `read_instance_record_for_inspection` maps `NotFound` to `Ok(None)`, so `inspect_with` is
@@ -260,7 +267,7 @@ survives a check — the check has to touch the thing that decides, and here CI 
 **Do not make that job green by deleting tests, and do not try to select a subset — there is no
 subset that runs on the binary alone.** It needs a runner with the artifacts.
 
-### EIGHT THINGS THAT WILL COST A SUCCESSOR REAL TIME
+### NINE THINGS THAT WILL COST A SUCCESSOR REAL TIME
 
 1. **`ps -A` CANNOT ENUMERATE THE PROCESS TABLE ON THIS HOST.** Measured: 31 entries against
    `launchctl list`'s 544, and it omits even the calling shell. **No `ps | grep` absence check
@@ -308,6 +315,28 @@ subset that runs on the binary alone.** It needs a runner with the artifacts.
    content at the published path for the length of an `fsync`; the comment credited production
    with a safety it did not have. Corrected in place. **A fixture comment that describes
    production is a claim about code it cannot see, and this one was wrong for eleven days.**
+
+9. **`lstat` IS NOT ATOMIC ACROSS RESOLVING A NAME AND READING THE INODE, AND A TORN READ LOOKS
+   EXACTLY LIKE A DEFECT.** MEASURED 2026-08-18 on `add3c13`: CI's `rust` job failed
+   `no_reader_ever_sees_an_illegal_state_across_start_and_stop` with `Some((128, 9))` —
+   0200-with-content — on code where that state was believed impossible, after **47,124,057 local
+   samples had seen it zero times**. A 4000-cycle local probe then caught it as
+   `ino=261844349 nlink=0 len=9`, beside a directory listing showing a *different* inode already
+   at the name. **`nlink=0`**: the observer had resolved the name to the outgoing record and read
+   its attributes after the rename detached it.
+
+   Two things follow, and both are worth keeping. **A stat whose link count is not one is not a
+   state of the path** — the reader already draws that line, `is_interrupted_tombstone` requires
+   `st_nlink == 1` and `validate_file_stat` reports "link count is not one" as its own fault — so
+   a checker of these states has to draw it too or it will report torn reads as corpses. And
+   **anything done to an inode after it is unlinked is still observable through a torn read**, so
+   `retire_instance_record_with_hook` truncates before it chmods: get that order wrong and the
+   torn read is the exact pair the whole change exists to eliminate. With the order right the
+   probe saw 0 of **87,277,118** samples, `nlink` ignored entirely.
+
+   **The general lesson is the one this file keeps paying for: a green local run of any size is
+   not proof.** 47 million samples said the state was gone. One CI run said otherwise, and CI was
+   right.
 
 ### THE LIVE TIER'S ENVIRONMENT, AND THE DAEMON'S IS THREE
 
