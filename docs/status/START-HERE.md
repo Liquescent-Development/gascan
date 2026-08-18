@@ -135,6 +135,35 @@ only the engine can judge.**
 `docs/status/whole-landing-review-milestone-4.md`**, with a table of what was fixed and what
 was not. The unaddressed Minors are in there; nothing is left in a scratchpad.
 
+### WHAT WAS RUN, AND WHAT CI DOES WITH IT
+
+Every CI step, run locally, alone, at `3882a52`:
+
+| Step | Result |
+|---|---|
+| `cargo fmt --all --check` | exit 0 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0 |
+| `cargo test --workspace` | **1461 passed, 0 failed, 49 ignored** |
+| `scripts/ci-check-ignored-tests.sh` | 49, matching the baseline |
+| `scripts/ci-run-release-contracts.sh` | **15 contracts, status 0** |
+
+**The `gascan-arca` live tier, all four variables set, `--test-threads=1`:
+24 passed, 1 failed in 568s.** The one failure is
+`network::an_offline_sandbox_has_no_egress_at_either_privilege_level`, which fails by design.
+The engine's virtualization entitlement was verified as `1` before the run and no `swift test`
+was run this session, so it was not stripped.
+
+**CI'S `engine` JOB IS RED, AND IT WAS RED BEFORE THIS SESSION.** Its live-tier step sets only
+`GASCAN_ARCA_ENGINE_BIN`; the tier needs four variables, and absence is a `panic!` and never a
+skip. MEASURED under exactly that environment:
+`lifecycle::create_start_inspect_stop_and_remove_drive_a_real_container` — a test that predates
+this session — fails in 0.00s on `GASCAN_ARCA_BASE_OCI_LAYOUT must name an OCI layout ...`.
+Of the **25** ignored tests in that target, only the **5** in `connect.rs` and `read_rpcs.rs`
+need nothing but the binary. The step's own comment claimed "four #[ignore] attributes exist";
+that has been false since milestone 2 and is now corrected in `.github/workflows/ci.yml`.
+**Do not make that job green by deleting tests.** It needs a runner with the artifacts, or a
+step that selects the five that need none.
+
 ### SIX THINGS THAT WILL COST A SUCCESSOR REAL TIME
 
 1. **`ps -A` CANNOT ENUMERATE THE PROCESS TABLE ON THIS HOST.** Measured: 31 entries against

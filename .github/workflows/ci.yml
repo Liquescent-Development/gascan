@@ -134,11 +134,29 @@ jobs:
       # DIRECTORY satisfies `-x`: a script that printed only its checkout line would
       # otherwise hand the test harness a directory and fail somewhere far from here.
       #
-      # `running 4 tests` is the expectation: four #[ignore] attributes exist across
-      # crates/gascan-arca/tests/live (2 in connect.rs, 2 in read_rpcs.rs), so
-      # `-- --ignored` selects exactly those four. MEASURED at this revision:
-      # `cargo test -p gascan-arca --test live` reports `running 6 tests` and
-      # `2 passed; 0 failed; 4 ignored`.
+      # **THIS STEP FAILS, AND IT FAILED BEFORE MILESTONE 4'S LIVE TIER GREW.** It
+      # sets ONE variable, and the tier needs four. MEASURED at this revision:
+      # `-- --ignored` selects **25** tests, of which only the **5** in connect.rs
+      # and read_rpcs.rs need nothing but the binary. Every other one begins with
+      # `required_path`, whose absence is a `panic!` and never a skip -- so
+      # `lifecycle::create_start_inspect_stop_and_remove_drive_a_real_container`
+      # fails on `GASCAN_ARCA_BASE_OCI_LAYOUT must name an OCI layout ...` in
+      # 0.00s, and so do the rest.
+      #
+      # The comment that stood here said "`running 4 tests` is the expectation:
+      # four #[ignore] attributes exist across crates/gascan-arca/tests/live (2 in
+      # connect.rs, 2 in read_rpcs.rs)". That was true when it was written and has
+      # been false since milestone 2 put a kernel behind most of this tier. It is
+      # left recorded rather than deleted because a reader who finds this step red
+      # deserves to know it is the ENVIRONMENT and not a regression.
+      #
+      # **What this needs is a runner with a kernel, a vminit layout and a base OCI
+      # layout, or a step that selects only the five tests that need neither.**
+      # Do not "fix" it by deleting tests or by widening the filter blindly:
+      # `network::an_offline_sandbox_has_no_egress_at_either_privilege_level`
+      # asserts a property the pinned engine does NOT satisfy and fails BY DESIGN
+      # even with the full environment -- see
+      # docs/evidence/2026-08-18-arca-engine-offline.md.
       #
       # A smaller number means tests were dropped, and this step cannot see that:
       # `cargo test -- --ignored` exits 0 on `running 0 tests`. What actually
