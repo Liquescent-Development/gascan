@@ -106,6 +106,27 @@ impl std::fmt::Display for EngineError {
     }
 }
 
+impl EngineError {
+    /// The startup diagnostic code this error reports as.
+    ///
+    /// Every one of these used to reach a user as a generic readiness timeout:
+    /// the CLI gives the production daemon a `Stdio::null()` stderr, so an
+    /// engine that never bound its socket, or a socket owned by somebody else,
+    /// or an engine that exited on a bad argv, all read identically from
+    /// outside. Reported through the startup diagnostic channel they arrive
+    /// named, with the message this type already writes.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        use gascan_core::startup_diagnostic as codes;
+        match self {
+            Self::ForeignSocket { .. } => codes::ENGINE_SOCKET_FOREIGN,
+            Self::NotListening { .. } => codes::ENGINE_NOT_LISTENING,
+            Self::Exited { .. } => codes::ENGINE_EXITED,
+            Self::Io(_) => codes::ENGINE_SUPERVISION_IO,
+        }
+    }
+}
+
 impl std::error::Error for EngineError {}
 
 impl From<io::Error> for EngineError {

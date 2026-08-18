@@ -59,13 +59,21 @@ pub enum ControllerStateError {
 }
 
 impl ControllerStateError {
+    /// The startup diagnostic code this error reports as.
+    ///
+    /// Drawn from `gascan_core::startup_diagnostic` rather than spelled here,
+    /// because the CLI's read side whitelists the same strings. They used to be
+    /// two independent sets of literals, and a code added to one but not the
+    /// other is a diagnostic that is written, validated, and then discarded
+    /// without a trace.
     #[must_use]
     pub const fn code(&self) -> &'static str {
+        use gascan_core::startup_diagnostic as codes;
         match self {
-            Self::Invalid(_) => "controller_state_invalid",
-            Self::Unsafe(_) => "controller_state_unsafe",
-            Self::Conflict { .. } => "controller_state_conflict",
-            Self::Migration(_) | Self::Store(_) => "controller_state_migration_failed",
+            Self::Invalid(_) => codes::CONTROLLER_STATE_INVALID,
+            Self::Unsafe(_) => codes::CONTROLLER_STATE_UNSAFE,
+            Self::Conflict { .. } => codes::CONTROLLER_STATE_CONFLICT,
+            Self::Migration(_) | Self::Store(_) => codes::CONTROLLER_STATE_MIGRATION_FAILED,
         }
     }
 }

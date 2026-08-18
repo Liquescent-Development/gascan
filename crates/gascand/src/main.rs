@@ -10,6 +10,7 @@ use gascan_core::doctor::{
 };
 use gascan_core::fake_runtime::FakeRuntime;
 use gascan_core::runtime::{RuntimeBackend, RuntimeError};
+use gascan_core::startup_diagnostic as codes;
 use gascand::{
     BackendSelection, ControllerStateError, ControllerStatePaths, Daemon, DaemonConfig,
     DoctorState, ErrorDiagnostics, ProvisionRequest, ProvisionResolution, Provisioner, SandboxApi,
@@ -252,6 +253,16 @@ async fn run(
     // is the state that let an Arca daemon read Apple's records and report
     // Apple's containers as its own.
     let selection = gascand::backend_from_environment()?;
+    // **Held across the backend arm, not dropped once the store is open.**
+    //
+    // It used to be dropped right here, which made the controller store the
+    // only thing a failing daemon could explain. Everything the Arca arm does
+    // afterwards -- reading three undefaulted variables, locating the fetched
+    // boot artifacts, bringing an engine up, opening a channel on its socket --
+    // could report only to the `Stdio::null()` stderr the CLI gives a
+    // production daemon, so all of it reached the user as a readiness timeout.
+    // The descriptor is already unlinked, so holding it open costs one fd and
+    // changes nothing a reader sees.
     let store = match std::env::var_os("GASCAN_STATE_PATH") {
         Some(path) => Store::open(std::path::PathBuf::from(path))?,
         None => {
@@ -261,7 +272,6 @@ async fn run(
                 .map_err(|error| controller_startup_error(error, startup_diagnostic.as_mut()))?
         }
     };
-    drop(startup_diagnostic);
     let e2e_ssh_paths = e2e_ssh_paths()?;
     // Built once, from the selection that was actually resolved, so an arm
     // cannot record a backend other than the one it constructs. Passing a
@@ -294,6 +304,7 @@ async fn run(
                     e2e_paths: e2e_ssh_paths,
                     refresh_doctor: true,
                 },
+                startup_diagnostic,
             )
             .await
         }
@@ -303,6 +314,15 @@ async fn run(
             // the socket path indistinguishable from not having set one, and
             // where the engine listens is Arca's choice rather than Gas Can's
             // to assume.
+            //
+            // **The message goes on the startup diagnostic channel, not to
+            // stderr.** The CLI gives a production daemon `Stdio::null()`, so
+            // until this arm wrote through the channel every one of these
+            // reached the user as a generic readiness timeout -- including
+            // `GASCAN_ENGINE_SOCKET must name its socket`, which names its own
+            // remedy. Task 13 built the doctor fact that says to run `gascan
+            // engine fetch`; Task 11's startup ordering made it unreachable in
+            // exactly the state it describes.
             let required = |name: &str, what: &str| -> Result<std::path::PathBuf, std::io::Error> {
                 std::env::var_os(name)
                     .map(std::path::PathBuf::from)
@@ -315,6 +335,11 @@ async fn run(
                             ),
                         )
                     })
+            };
+            let mut reported = |code: &'static str, error: &dyn std::fmt::Display| {
+                let message = error.to_string();
+                report_startup_error(code, &message, startup_diagnostic.as_mut());
+                StartupError { code, message }
             };
             // The kernel and the vminit layout are NOT read from the
             // environment, and that asymmetry is deliberate. They are Gas Can's
@@ -331,11 +356,14 @@ async fn run(
             // started it, and a spawning daemon that guessed a different one
             // would write a second, divergent store that nothing compares.
             let artifacts = gascan_core::engine_artifacts::ArtifactPaths::for_user()
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
+                .map_err(|error| reported(codes::ENGINE_ARTIFACTS_UNAVAILABLE, &error))?;
             let launch = gascand::EngineLaunch {
-                executable: required(gascand::ENGINE_BIN_ENV, "the engine executable")?,
-                socket: required(gascand::ENGINE_SOCKET_ENV, "its socket")?,
-                state_root: required(gascand::ENGINE_STATE_ROOT_ENV, "its state root")?,
+                executable: required(gascand::ENGINE_BIN_ENV, "the engine executable")
+                    .map_err(|error| reported(codes::ENGINE_ENVIRONMENT_INCOMPLETE, &error))?,
+                socket: required(gascand::ENGINE_SOCKET_ENV, "its socket")
+                    .map_err(|error| reported(codes::ENGINE_ENVIRONMENT_INCOMPLETE, &error))?,
+                state_root: required(gascand::ENGINE_STATE_ROOT_ENV, "its state root")
+                    .map_err(|error| reported(codes::ENGINE_ENVIRONMENT_INCOMPLETE, &error))?,
                 kernel: artifacts.kernel(),
                 vminit: artifacts.vminit(),
             };
@@ -348,8 +376,11 @@ async fn run(
                 &gascand::TokioEngineSpawner,
                 gascand::EngineReadiness::default(),
             )
-            .await?;
-            let transport = gascan_arca::ChannelTransport::connect(launch.socket).await?;
+            .await
+            .map_err(|error| reported(error.code(), &error))?;
+            let transport = gascan_arca::ChannelTransport::connect(launch.socket)
+                .await
+                .map_err(|error| reported(codes::ENGINE_TRANSPORT_UNAVAILABLE, &error))?;
             // The collector re-reads the engine on every refresh, so it holds a
             // clone of the transport rather than a snapshot of its answers. A
             // report cached from startup would keep saying the engine answers
@@ -375,6 +406,7 @@ async fn run(
                     e2e_paths: e2e_ssh_paths,
                     refresh_doctor: true,
                 },
+                startup_diagnostic,
             )
             .await
         }
@@ -429,6 +461,7 @@ async fn run(
                     e2e_paths: e2e_ssh_paths,
                     refresh_doctor: refresh_ssh_doctor,
                 },
+                startup_diagnostic,
             )
             .await
         }
@@ -469,17 +502,34 @@ impl StartupDiagnostic {
     }
 }
 
-fn report_controller_startup_error(
-    error: &ControllerStateError,
+/// Reports a startup failure on the channel the CLI is watching.
+///
+/// Takes a code and a message rather than one error type. It used to take
+/// `&ControllerStateError`, which is why the store was the only thing that
+/// could explain a daemon that failed to start: every other startup failure
+/// -- a required engine variable that is not set, an engine that never bound
+/// its socket, an engine that exited on a bad argv -- went to the
+/// `Stdio::null()` stderr the CLI gives a production daemon and reached the
+/// user as a generic readiness timeout.
+///
+/// The code must be one `gascan_core::startup_diagnostic` accepts; anything
+/// else is written, validated, and then dropped by the reader.
+fn report_startup_error(
+    code: &str,
+    message: &str,
     startup_diagnostic: Option<&mut StartupDiagnostic>,
 ) {
+    debug_assert!(
+        gascan_core::startup_diagnostic::is_accepted(code),
+        "{code} is not an accepted startup diagnostic code"
+    );
     let owner_token = std::env::var("GASCAN_DAEMON_OWNER_TOKEN").ok();
     let diagnostic = owner_token.as_ref().map(|owner_token| {
         format!(
             "GASCAN_CONTROLLER_STARTUP_ERROR {}\n",
             serde_json::json!({
-                "code": error.code(),
-                "message": error.to_string(),
+                "code": code,
+                "message": message,
                 "owner_token": owner_token,
             })
         )
@@ -490,44 +540,50 @@ fn report_controller_startup_error(
         }
         eprint!("{diagnostic}");
     } else {
-        eprintln!("{}: {}", error.code(), error);
+        eprintln!("{code}: {message}");
     }
+}
+
+/// Reports a startup failure and returns it, so a call site can `?` on it.
+///
+/// The message is rendered here rather than kept as a typed source, because
+/// what crosses the channel is a string and a code; a `source()` nobody can
+/// read on the other side is a chain that ends at this process.
+fn startup_error<E: std::fmt::Display>(
+    code: &'static str,
+    error: &E,
+    startup_diagnostic: Option<&mut StartupDiagnostic>,
+) -> StartupError {
+    let message = error.to_string();
+    report_startup_error(code, &message, startup_diagnostic);
+    StartupError { code, message }
 }
 
 fn controller_startup_error(
     source: ControllerStateError,
     startup_diagnostic: Option<&mut StartupDiagnostic>,
-) -> ControllerStartupError {
-    report_controller_startup_error(&source, startup_diagnostic);
-    ControllerStartupError::from(source)
+) -> StartupError {
+    startup_error(source.code(), &source, startup_diagnostic)
 }
 
+/// A startup failure that was reported on the diagnostic channel.
+///
+/// Carries the same code the CLI will print, so a daemon whose diagnostic never
+/// arrived -- an old CLI, a closed descriptor -- still exits with the code in
+/// its own message rather than with a bare description.
 #[derive(Debug)]
-struct ControllerStartupError {
+struct StartupError {
     code: &'static str,
-    source: ControllerStateError,
+    message: String,
 }
 
-impl std::fmt::Display for ControllerStartupError {
+impl std::fmt::Display for StartupError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}: {}", self.code, self.source)
+        write!(formatter, "{}: {}", self.code, self.message)
     }
 }
 
-impl std::error::Error for ControllerStartupError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
-
-impl From<ControllerStateError> for ControllerStartupError {
-    fn from(source: ControllerStateError) -> Self {
-        Self {
-            code: source.code(),
-            source,
-        }
-    }
-}
+impl std::error::Error for StartupError {}
 
 fn controller_state_paths(
     paths: &SocketPaths,
@@ -561,6 +617,15 @@ struct DaemonRuntime {
     backend: BackendSelection,
 }
 
+/// Serves until the daemon stops, and releases the startup channel first.
+///
+/// **The diagnostic is taken by value and dropped here, not by each arm.**
+/// Every backend reaches this function and nothing that can still be reported
+/// on that channel happens after it, so a fourth arm cannot forget to release
+/// the descriptor -- and forgetting is not harmless: `gascan` treats the
+/// descriptor staying open as startup still being in progress, and
+/// `successful_daemon_closes_inherited_startup_diagnostic_descriptor` is the
+/// only thing that would notice.
 async fn run_daemon<B: RuntimeBackend + 'static>(
     runtime: B,
     store: Store,
@@ -568,7 +633,9 @@ async fn run_daemon<B: RuntimeBackend + 'static>(
     provisioner: ConfiguredProvisioner,
     doctor: DoctorState,
     ssh: DaemonSshConfig,
+    startup_diagnostic: Option<StartupDiagnostic>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    drop(startup_diagnostic);
     let candidate_image = if option_env!("CARGO_BIN_NAME") == Some("gascan-e2e-daemon") {
         std::env::var("GASCAN_E2E_CANDIDATE_IMAGE").ok()
     } else {

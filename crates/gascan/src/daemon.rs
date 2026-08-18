@@ -309,7 +309,14 @@ pub(crate) enum SupervisorError {
         state: DaemonState,
         detail: Option<String>,
     },
-    ControllerStartup {
+    /// A diagnostic the daemon wrote before it could serve.
+    ///
+    /// Named for the channel and not for the controller store. It carried only
+    /// `controller_state_*` codes when it was `ControllerStartup`, and it now
+    /// also carries the Arca arm's environment and engine failures -- a variant
+    /// named for one of its cases is how the next reader concludes the others
+    /// cannot happen.
+    DaemonStartup {
         code: String,
         message: String,
     },
@@ -371,7 +378,7 @@ impl std::fmt::Display for SupervisorError {
                     .as_deref()
                     .map_or_else(String::new, |detail| format!(": {detail}"))
             ),
-            Self::ControllerStartup { code, message } => {
+            Self::DaemonStartup { code, message } => {
                 write!(formatter, "{code}: {message}")
             }
             Self::GracefulTimeout { identity } => write!(
@@ -414,7 +421,7 @@ impl SupervisorError {
             | Self::Outdated { .. }
             | Self::InvalidState { .. }
             | Self::Readiness { .. }
-            | Self::ControllerStartup { .. }
+            | Self::DaemonStartup { .. }
             | Self::IdentityChanged { .. }
             | Self::ExitTimeout { .. }
             | Self::TombstoneBusy { .. }
@@ -548,18 +555,17 @@ impl DaemonStartupMonitor {
             else {
                 continue;
             };
-            if !matches!(
-                diagnostic.code.as_str(),
-                "controller_state_conflict"
-                    | "controller_state_unsafe"
-                    | "controller_state_invalid"
-                    | "controller_state_migration_failed"
-            ) || diagnostic.message.trim().is_empty()
+            // The whitelist is `gascan_core`'s, not a copy of it. It used
+            // to be four literals here and four more in
+            // `ControllerStateError::code()`, which is how a writer can add a
+            // code the reader silently drops.
+            if !gascan_core::startup_diagnostic::is_accepted(&diagnostic.code)
+                || diagnostic.message.trim().is_empty()
                 || diagnostic.owner_token != source.owner_token
             {
                 continue;
             }
-            return Ok(Some(SupervisorError::ControllerStartup {
+            return Ok(Some(SupervisorError::DaemonStartup {
                 code: diagnostic.code,
                 message: diagnostic.message,
             }));
@@ -3535,7 +3541,7 @@ mod tests {
             .ok_or("controller diagnostic missing")?;
         assert!(matches!(
             error,
-            SupervisorError::ControllerStartup { code, message }
+            SupervisorError::DaemonStartup { code, message }
                 if code == "controller_state_unsafe"
                     && message == "application directory mode is unsafe"
         ));
@@ -3605,7 +3611,7 @@ mod tests {
         };
         assert!(matches!(
             error,
-            SupervisorError::ControllerStartup { ref code, ref message }
+            SupervisorError::DaemonStartup { ref code, ref message }
                 if code == "controller_state_unsafe"
                     && message == "trusted inherited descriptor"
         ));

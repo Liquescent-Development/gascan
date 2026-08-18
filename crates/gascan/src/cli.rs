@@ -1141,7 +1141,7 @@ fn supervisor_error_for_action(
     if let crate::daemon::SupervisorError::Client(error) = error {
         return CliError::Client(error);
     }
-    if let crate::daemon::SupervisorError::ControllerStartup { code, message } = error {
+    if let crate::daemon::SupervisorError::DaemonStartup { code, message } = error {
         return CliError::DaemonOperation {
             message: format!("{code}: {message}"),
             code,
@@ -1159,8 +1159,8 @@ fn supervisor_error_for_action(
         crate::daemon::SupervisorError::Outdated { .. } => "daemon_outdated",
         crate::daemon::SupervisorError::InvalidState { .. } => "daemon_invalid_state",
         crate::daemon::SupervisorError::Readiness { .. } => "daemon_readiness_failed",
-        crate::daemon::SupervisorError::ControllerStartup { .. } => {
-            unreachable!("controller startup errors returned above")
+        crate::daemon::SupervisorError::DaemonStartup { .. } => {
+            unreachable!("daemon startup diagnostics returned above")
         }
         crate::daemon::SupervisorError::GracefulTimeout { .. } => {
             "daemon_graceful_shutdown_timeout"

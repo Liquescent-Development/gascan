@@ -13,3 +13,4 @@ pub mod policy;
 pub mod provision;
 pub mod runtime;
 pub mod sandbox;
+pub mod startup_diagnostic;
