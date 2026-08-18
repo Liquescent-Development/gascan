@@ -18,7 +18,7 @@ history.
 | Design | `docs/superpowers/specs/2026-08-16-p5-1-milestone-4-product-wiring-design.md` |
 | Plan | `docs/superpowers/plans/2026-08-16-p5-1-milestone-4-product-wiring.md` |
 | **The offline evidence** | `docs/evidence/2026-08-18-arca-engine-offline.md` — **read this before touching anything about offline** |
-| Ledger | `.superpowers/sdd/2026-08-16-p5-1-milestone-4-product-wiring/progress.md` — untracked, git-ignored |
+| Ledger | `.superpowers/sdd/2026-08-16-p5-1-milestone-4-product-wiring/progress.md` — untracked and git-ignored **by the maintainer's decision, confirmed 2026-08-18. Do not commit it.** It holds ~170KB of rulings and deferred-finding dispositions and exists only on this machine; that is intended. |
 
 **RE-VERIFY EVERY SHA BELOW WITH `git log -1` AND `git ls-remote`.** This file has gone stale
 on its own SHAs repeatedly, including inside a single edit three lines below its own warning
@@ -33,6 +33,12 @@ about it. That is why no head SHA is written here: every edit to this file moves
 **Merged `main` was verified green after the fact, not before**: `cargo fmt --all --check` 0,
 `cargo clippy --workspace --all-targets -- -D warnings` 0, `cargo test --workspace` **1496
 passed, 0 failed, 49 ignored**, run at `d65801d`.
+
+**The three milestone-4 branches were deleted after merging** — Gas Can
+`feat/milestone-4-product-wiring` and `docs/milestone-4-merged`, Arca `feat/milestone-4-engine`
+— each confirmed an ancestor of its `main` with `git merge-base --is-ancestor` first. Both
+repositories are on `main` with clean worktrees. **Start from `main`; there is no branch to
+check out.** Other stale branches predate this milestone and were deliberately left alone.
 
 **The tag `gascan-engine-m4` and its release are published and verified. They were NOT re-cut
 and must not be.** The signed tag object is `d143a66`, pointing at commit `c545612`; the
@@ -116,6 +122,15 @@ it; it found three things worth fixing and two — an unpinned kernel toolchain,
 required-config assertion that checks a text file rather than the built artefact — that are
 real, unfixed, and narrow the reproducibility claim until they are done.
 
+### THE ONE THING TO DO NEXT
+
+**Fix the daemon instance record's publish race — open item 1 below.** The maintainer chose it
+on 2026-08-18 in preference to anything else on the list. It is the highest-value item because
+it is the only one that costs every full-suite run, its shape is already proven by the fixture
+fix that shipped, and it is contained.
+
+Everything else on the list is carried state, not an assignment.
+
 ### WHAT IS OPEN
 
 1. **THE DAEMON INSTANCE RECORD HAS A PUBLISH RACE, AND IT IS THE MOST EXPENSIVE THING IN THE
@@ -127,10 +142,22 @@ real, unfixed, and narrow the reproducibility claim until they are done.
    false, and it is the whole defect.
 
    **PROBED DETERMINISTICALLY** through the existing `before_descriptor_commit` hook (a
-   temporary test, since reverted): `mode=0200 size=9 nlink=1`. It failed **four** workspace
-   runs on 2026-08-18, each in a different test, each time in code the session's diff did not
-   touch, and each time passing in isolation. **This is why the suite needs diff-plus-isolation
-   exoneration.** Worth its own task; it was left unfixed as outside the three decided items.
+   temporary test, since reverted): `mode=0200 size=9 nlink=1`. It failed **five** workspace
+   runs on 2026-08-18 — the fifth on merged `main` at `8417070`, in
+   `doctor_recovers_after_atomic_installed_daemon_replacement` — each in a different test, each
+   time in code that session's diff did not touch, and each time passing in isolation (2/2 both
+   times). **This is why the suite needs diff-plus-isolation exoneration.**
+
+   **THE MAINTAINER LEFT THIS FOR YOU, DELIBERATELY, ON 2026-08-18.** It is the first open item
+   because it is the highest-value one. The fix is contained and the shape is already proven:
+   `DelayedPublicationSpawner` in `crates/gascan/src/daemon.rs` had the same write-then-chmod
+   race and was fixed by staging beside the path and renaming, which is atomic. The production
+   publisher wants the equivalent — publish by rename, or keep the file inert until it is whole
+   — plus the `validate_file_stat` comment corrected, since it asserts 0200-with-content "never
+   becomes 0600 on its own" and that is the false premise the whole defect rests on.
+
+   **Verify by mutation**, the project's rule: widening the window with a sleep reproduced the
+   fixture case deterministically, and the same technique will reproduce this one.
 2. **(2c) A PRODUCTION STDERR DESTINATION FOR THE DAEMON IS STILL DEFERRED**, as its own
    decision with a privacy dimension — a daemon log holds sandbox names, project paths and
    guest output. (2a) and (2b) have landed, which was the precondition. Raise it with the
