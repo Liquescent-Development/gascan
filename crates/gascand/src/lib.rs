@@ -11,13 +11,14 @@ pub const TEST_ERROR_DIAGNOSTICS_ENV: &str = "GASCAN_TEST_ERROR_DIAGNOSTICS";
 // has to sit where both can reach it. Re-exported here because this is still
 // where the daemon's callers look for it.
 pub use gascan_core::backend::{
-    ARCA_BACKEND_ENV, AmbiguousBackend, BackendSelection, ENGINE_SOCKET_ENV,
+    ARCA_BACKEND_ENV, AmbiguousBackend, BackendSelection, ENGINE_BIN_ENV, ENGINE_SOCKET_ENV,
     backend_from_environment, backend_selection,
 };
 
 mod api;
 mod controller_state;
 mod doctor;
+mod engine;
 mod reconcile;
 mod service;
 mod socket;
@@ -33,6 +34,10 @@ pub use controller_state::{
     open_controller_store_with_fault,
 };
 pub use doctor::{SshDoctorFacts, ssh_doctor_facts, ssh_doctor_facts_for_paths};
+pub use engine::{
+    EngineError, EngineLaunch, EngineReadiness, EngineSpawner, SpawnedEngine, TokioEngineSpawner,
+    ensure_engine,
+};
 pub use socket::{OwnedSocket, PeerUid, PeerUidMismatch, SocketPaths, validate_peer_uid};
 pub use ssh::{
     ActiveSsh, GenerationCleanup, HostIdentity, ManagedSshHost, PortReservation, PreparedSshCreate,

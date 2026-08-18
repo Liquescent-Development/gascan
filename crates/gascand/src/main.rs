@@ -291,18 +291,34 @@ async fn run(
             // the socket path indistinguishable from not having set one, and
             // where the engine listens is Arca's choice rather than Gas Can's
             // to assume.
-            let socket = std::env::var_os(gascand::ENGINE_SOCKET_ENV).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "{} selects the Arca engine backend, so {} must name its socket",
-                        gascand::ARCA_BACKEND_ENV,
-                        gascand::ENGINE_SOCKET_ENV
-                    ),
-                )
-            })?;
-            let transport =
-                gascan_arca::ChannelTransport::connect(std::path::PathBuf::from(socket)).await?;
+            let required = |name: &str, what: &str| -> Result<std::path::PathBuf, std::io::Error> {
+                std::env::var_os(name)
+                    .map(std::path::PathBuf::from)
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!(
+                                "{} selects the Arca engine backend, so {name} must name {what}",
+                                gascand::ARCA_BACKEND_ENV
+                            ),
+                        )
+                    })
+            };
+            let launch = gascand::EngineLaunch {
+                executable: required(gascand::ENGINE_BIN_ENV, "the engine executable")?,
+                socket: required(gascand::ENGINE_SOCKET_ENV, "its socket")?,
+            };
+            // Dial first, spawn on a miss. An engine that survived this
+            // daemon's predecessor is adopted rather than duplicated, which is
+            // what makes `service.reconcile()` below able to re-adopt the
+            // sandboxes it is still running.
+            gascand::ensure_engine(
+                &launch,
+                &gascand::TokioEngineSpawner,
+                gascand::EngineReadiness::default(),
+            )
+            .await?;
+            let transport = gascan_arca::ChannelTransport::connect(launch.socket).await?;
             // KNOWN WRONG, AND OWNED BY THE NEXT TASK. `production_doctor_report`
             // pairs every fact with hardcoded Apple prose -- "install Apple
             // container 1.1.0 in PATH", "run `container system start` and

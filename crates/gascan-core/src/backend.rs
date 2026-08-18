@@ -59,6 +59,15 @@ pub const ARCA_BACKEND_ENV: &str = "GASCAN_ARCA_BACKEND";
 /// engine's state root is Arca's to choose rather than Gas Can's to assume.
 pub const ENGINE_SOCKET_ENV: &str = "GASCAN_ENGINE_SOCKET";
 
+/// The engine executable the supervisor spawns when nothing is listening.
+///
+/// Undefaulted for the same reason as the socket, and for one more: the `.pkg`
+/// carries no engine payload -- `packaging/macos/package.sh` states that the
+/// engine is a build gate and not a payload -- so there is no installed path to
+/// default to. Guessing one would produce "no such file" from a path the user
+/// never chose.
+pub const ENGINE_BIN_ENV: &str = "GASCAN_ENGINE_BIN";
+
 /// The environment variable that selects the fabricating test runtime.
 ///
 /// `#[cfg(debug_assertions)]` here as well as at every read of it, so that the
