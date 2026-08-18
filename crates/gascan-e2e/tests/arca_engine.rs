@@ -150,3 +150,68 @@ fn a_daemon_spawned_engine_runs_a_sandbox_through_up_exec_logs_restart_and_down(
     env.success(["--sandbox", env.id(), "destroy", "--yes"])?;
     Ok(())
 }
+
+/// **The refusal that is standing between a user and a sandbox that leaks.**
+///
+/// `crates/gascan-arca/tests/live/network.rs` MEASURED, against the engine
+/// `engine/arca-pin.json` names, that a sandbox created with
+/// `Network { mode: Offline }` is attached to a vmnet interface with a default
+/// route and a resolver, and reaches a test-owned host endpoint, a public IP
+/// and public DNS -- as guest root and as the sandbox user, before and after a
+/// guest-root mutation attempt. Thirteen violations, against a positive control
+/// in which every one of those probes succeeded on a networked sandbox.
+///
+/// **So `NetworkIsolation::Proven` is not merely unearned for this engine, it
+/// is false**, and `CERTIFIED_ENGINE_REVISION` stays `None`. This test is the
+/// product-level half of that: it asserts that the refusal a user actually
+/// meets is the one the evidence requires, through `gascan up` on a real
+/// daemon on a real engine.
+///
+/// **It is deliberately not a unit test of `validate_capabilities`.** That
+/// function is already covered, and what is uncovered is the chain from an
+/// engine that self-reports `offline: UNVERIFIED`, through
+/// `runtime_capabilities`'s gate, into the policy compiler, into an exit code
+/// and a message. Every link in that chain is what makes the refusal reach a
+/// person.
+#[test]
+#[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN, a base OCI layout \
+            named by GASCAN_ARCA_BASE_OCI_LAYOUT, and the boot artifacts gascan engine fetch \
+            installs"]
+fn an_offline_manifest_is_refused_because_no_engine_build_is_certified() -> TestResult {
+    let env = ArcaE2e::new("arca-offline", "offline")?;
+    let root = env.root().to_str().ok_or("non-UTF-8 root")?.to_owned();
+
+    let refused = env.invoke(["up", &root])?;
+    assert!(
+        !refused.status.success(),
+        "`gascan up` on an offline manifest SUCCEEDED against an uncertified engine; \
+         the sandbox that produced is not isolated -- stdout={} stderr={}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let said = String::from_utf8_lossy(&refused.stdout).into_owned()
+        + &String::from_utf8_lossy(&refused.stderr);
+    // The whole cause, not just the code. Both halves are load-bearing and each
+    // catches a different break: `offline` is lost when `service_status` drops
+    // the variant into its generic `invalid_request` arm, and `gascan doctor`
+    // is lost when the refusal names a problem with no next step. A user told
+    // only that something is invalid has nowhere to go.
+    for required in ["offline", "gascan doctor"] {
+        assert!(
+            said.contains(required),
+            "the refusal reached the user without {required:?}, so it sends them nowhere: {said}"
+        );
+    }
+    eprintln!("offline refusal: {said}");
+
+    // Nothing was created. A refusal that left a container behind would be a
+    // sandbox the user believes does not exist.
+    let listed = env.success(["list", "--json"])?;
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout)?;
+    assert_eq!(
+        listed.as_array().map(Vec::len),
+        Some(0),
+        "a refused offline `up` left a sandbox behind: {listed}"
+    );
+    Ok(())
+}

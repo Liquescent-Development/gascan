@@ -296,11 +296,27 @@ pub(crate) fn missing_outcome(operation: &str) -> RuntimeError {
 
 /// The engine build whose network isolation has been observed, not assumed.
 ///
-/// `None` means no build is certified, so no engine can claim `Proven`. That is
-/// the state until the offline evidence exists under `docs/evidence/` -- the
-/// recorded observation is what licenses setting this, and setting it without
-/// one is the "claim with no instrument" defect this project has written traps
-/// about since milestone 1.
+/// `None` means no build is certified, so no engine can claim `Proven`.
+///
+/// **THE EVIDENCE EXISTS AND IT REFUTES.** `docs/evidence/2026-08-18-arca-engine-offline.md`
+/// records the offline proof run against the engine `engine/arca-pin.json`
+/// names, revision `c545612b`: the guest of an `offline` sandbox carried a
+/// vmnet `eth0` with a default route and a resolver, and reached a test-owned
+/// host endpoint, a public IP and public DNS -- as guest root and as the
+/// sandbox user, before and after a guest-root mutation attempt. Thirteen
+/// violations, against a positive control in which every one of those probes
+/// succeeded on a networked sandbox, and with the compiled request asserted to
+/// carry `RuntimeNetwork::Offline` before anything was observed.
+///
+/// So this is not "unproven pending a measurement". **For revision `c545612b`,
+/// `Proven` is false**, and the standing instrument is
+/// `gascan-arca`'s `network::an_offline_sandbox_has_no_egress_at_either_privilege_level`,
+/// which asserts the property and therefore fails today by design. It turns
+/// green on the build that earns this constant.
+///
+/// Setting this without a recorded observation would be the "claim with no
+/// instrument" defect this project has written traps about since milestone 1.
+/// Setting it against THIS observation would be worse.
 ///
 /// `Option<&str>` and not `&str`: an empty-string sentinel would certify an
 /// engine that reported an empty revision, which is exactly what a build with a

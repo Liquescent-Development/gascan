@@ -543,7 +543,18 @@ pub enum PolicyError {
     ResourceLimitsUnavailable,
     #[error("runtime cannot publish ports exclusively on loopback")]
     LoopbackPublishUnavailable,
-    #[error("runtime cannot prove offline network isolation")]
+    /// The runtime claims nothing about isolation, or claims it from a build
+    /// nobody has certified.
+    ///
+    /// The message names `gascan doctor` rather than the engine revision,
+    /// because the revision is only meaningful beside the certified constant
+    /// and doctor is where both are already reported -- `EngineReport` exposes
+    /// `build_revision` for exactly that purpose and for no other.
+    #[error(
+        "this runtime cannot prove that an offline sandbox has no network; \
+         use networked mode, or run `gascan doctor` to see which engine build is running \
+         and which one has been certified"
+    )]
     OfflineUnavailable,
     #[error(
         "hard offline isolation has not been verified with Apple Container {version_major}.{version_minor}.{version_patch}; use networked mode or install the certified 1.1.0 release",

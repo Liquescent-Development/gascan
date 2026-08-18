@@ -971,8 +971,22 @@ fn service_status(error: ServiceError) -> tonic::Status {
         ServiceError::Policy(gascan_core::policy::PolicyError::DiskControlUnsupported) => {
             tonic::Status::invalid_argument(error_code::DISK_CONTROL_UNSUPPORTED)
         }
+        // **Both offline refusals, not just Apple's.** This arm carried
+        // `OfflineUnsupported` alone, and that was survivable only while the
+        // other variant was unreachable: on Apple, 1.1.0 reports `Proven` and
+        // anything else reports `Unsupported`, so nothing ever produced
+        // `OfflineUnavailable`. The Arca revision gate makes it the NORMAL
+        // outcome -- every uncertified engine yields `Unverified`, which is
+        // exactly this error. MEASURED through `gascan up` on an offline
+        // manifest against a real Arca daemon before this line changed: the
+        // user's whole diagnostic was `Error: invalid_request`.
+        //
+        // The two are deliberately still distinct errors carrying distinct
+        // prose -- that distinction is the correction Task 10 recorded, and
+        // collapsing them here would discard it a second time, one layer down.
         ServiceError::Policy(
-            error @ gascan_core::policy::PolicyError::OfflineUnsupported { .. },
+            error @ (gascan_core::policy::PolicyError::OfflineUnsupported { .. }
+            | gascan_core::policy::PolicyError::OfflineUnavailable),
         ) => {
             let code = error.code();
             let cause = error.to_string();
@@ -3558,6 +3572,38 @@ mod tests {
         let direct = service_status(ServiceError::Policy(PolicyError::DiskControlUnsupported));
         assert_eq!(direct.code(), tonic::Code::InvalidArgument);
         assert_eq!(direct.message(), error_code::DISK_CONTROL_UNSUPPORTED);
+    }
+
+    /// **The Arca-side refusal keeps its cause too.**
+    ///
+    /// Its sibling below covers Apple's `OfflineUnsupported`. This one covers
+    /// the variant the Arca revision gate actually produces, and it is the one
+    /// that was falling through to `invalid_request`: MEASURED through
+    /// `gascan up` on an offline manifest against a real daemon on a real
+    /// engine, the user's entire diagnostic was `Error: invalid_request`.
+    #[test]
+    fn uncertified_offline_policy_rejection_preserves_its_code_and_cause() {
+        let status = service_status(ServiceError::Policy(PolicyError::OfflineUnavailable));
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(status.message(), "offline_unavailable");
+        let cause = gascan_proto::error_detail::decode_message(status.details());
+        assert!(
+            cause.is_some(),
+            "the refusal must carry a cause, not just a code"
+        );
+        let cause = cause.unwrap_or_default();
+        // The cause and not its wording: what this arm owes is that SOMETHING
+        // other than the stable code reaches the client. The wording is the
+        // error type's, and the e2e pass is what proves it arrives intact.
+        assert_ne!(
+            cause, "offline_unavailable",
+            "the client received the stable code as its cause, which explains nothing"
+        );
+        assert!(
+            cause.contains("offline"),
+            "the cause must name what was refused: {cause}"
+        );
     }
 
     #[test]

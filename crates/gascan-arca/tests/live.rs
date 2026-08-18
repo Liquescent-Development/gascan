@@ -12,6 +12,8 @@ mod limits;
 mod logs;
 #[path = "live/mounts.rs"]
 mod mounts;
+#[path = "live/network.rs"]
+mod network;
 #[path = "live/ports.rs"]
 mod ports;
 #[path = "live/read_rpcs.rs"]
