@@ -715,6 +715,12 @@ mod tests {
             loopback_publish: false,
             resource_limits: false,
             offline: v1::Isolation::Proven as i32,
+            // Empty, because nothing reads it yet and a plausible-looking
+            // revision here would be a claim this test does not make. Field 20
+            // arrived with the schema-2 pin; the certified-revision comparison
+            // that turns it into a Proven/Unverified verdict is still to come,
+            // and the tests that earn it belong with it rather than here.
+            build_revision: String::new(),
         }
     }
 
@@ -801,6 +807,7 @@ mod tests {
             loopback_publish: true,
             resource_limits: true,
             offline: v1::Isolation::Unspecified as i32,
+            build_revision: String::new(),
         };
         assert_eq!(
             runtime_capabilities(&unspecified)

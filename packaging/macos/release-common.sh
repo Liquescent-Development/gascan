@@ -36,8 +36,8 @@ gascan_assert_release_inputs_clean() {
   fi
   for path in Cargo.toml Cargo.lock rust-toolchain.toml scripts/build-apple-attach-helper.sh \
     scripts/workspace-image-source-digest.sh scripts/build-arca-engine.sh \
-    scripts/sync-arca-proto.sh engine/arca-pin.json engine/allowed-signers LICENSE \
-    images/workspace; do
+    scripts/sync-arca-proto.sh engine/arca-pin.json engine/arca-pin-schema.jq \
+    engine/allowed-signers LICENSE images/workspace; do
     git -C "$repo" ls-files --error-unmatch -- "$path" >/dev/null 2>&1 || {
       printf 'release source input is not tracked (%s): %s\n' "$label" "$path" >&2
       return 65
@@ -48,7 +48,7 @@ gascan_assert_release_inputs_clean() {
       crates helpers proto engine packaging/macos scripts/build-apple-attach-helper.sh \
       scripts/build-arca-engine.sh scripts/sync-arca-proto.sh images/workspace \
       ':(exclude)helpers/apple-attach/.build/**' |
-      awk '/^images\/workspace\// || /\.(rs|swift|toml|proto|sh|json)$/ || /(^|\/)Package\.swift$/ { print; exit }'
+      awk '/^images\/workspace\// || /\.(rs|swift|toml|proto|sh|json|jq)$/ || /(^|\/)Package\.swift$/ { print; exit }'
   )
   if [[ -n $ignored_source ]]; then
     printf 'ignored release source input exists (%s): %s\n' "$label" "$ignored_source" >&2

@@ -20,6 +20,9 @@ repo_root=$(cd "$(dirname "$0")/.." && pwd -P)
 pin_file=${GASCAN_ARCA_PIN_FILE:-$repo_root/engine/arca-pin.json}
 cache_root=${GASCAN_ARCA_PROTO_CACHE:-$repo_root/.artifacts/arca-proto}
 allowed_signers=${GASCAN_ARCA_ALLOWED_SIGNERS:-$repo_root/engine/allowed-signers}
+# Not overridable, for the reason build-arca-engine.sh gives: the pin file is a
+# fixture surface, the schema that judges it is not.
+pin_schema=$repo_root/engine/arca-pin-schema.jq
 
 for command in git jq; do
   command -v "$command" >/dev/null || {
@@ -36,16 +39,16 @@ done
   printf 'engine allowed-signers file is missing: %s\n' "$allowed_signers" >&2
   exit 64
 }
-# .tag admits no path characters, matching scripts/build-arca-engine.sh. The two
+# The same schema file scripts/build-arca-engine.sh validates against. The two
 # scripts read the same pin file and must agree on what a valid one is, or a pin
-# this script accepts is one the build refuses.
-jq -e '
-  (.schema == 1) and
-  (.name | type == "string" and length > 0) and
-  (.url | type == "string" and length > 0 and test("^(https|file)://")) and
-  (.tag | type == "string" and test("^[A-Za-z0-9._-]+$")) and
-  (.revision | type == "string" and test("^[0-9a-f]{40}$"))
-' "$pin_file" >/dev/null 2>&1 || {
+# this script accepts is one the build refuses -- and through schema 1 that
+# agreement was two copies of one jq program, which is a promise rather than a
+# mechanism. Reading one file makes disagreement impossible instead of unlikely.
+[[ -f $pin_schema ]] || {
+  printf 'engine pin schema is missing: %s\n' "$pin_schema" >&2
+  exit 64
+}
+jq -e --from-file "$pin_schema" "$pin_file" >/dev/null 2>&1 || {
   printf 'engine pin file is malformed: %s\n' "$pin_file" >&2
   exit 64
 }

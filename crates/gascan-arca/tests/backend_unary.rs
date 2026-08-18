@@ -101,6 +101,8 @@ async fn capabilities_reads_the_engine_and_renames_project_mount() {
                 loopback_publish: false,
                 resource_limits: false,
                 offline: v1::Isolation::Proven as i32,
+                // See translate::tests::no_capabilities on why this is empty.
+                build_revision: String::new(),
             },
         )),
     });
