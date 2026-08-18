@@ -3,205 +3,174 @@
 This file is the session entry point. It is written to be read cold, and it is
 addressed to you, the agent. Follow it as instructions — there is nothing to paste.
 
-Rewritten 2026-08-17 (late) after **LANDING 1 OF MILESTONE 4 WAS COMPLETED, WHOLE-LANDING
-REVIEWED, FIXED, AND PUSHED — AND TASK 8 WAS PREPARED BUT DELIBERATELY NOT PUBLISHED.**
+Rewritten 2026-08-18 after **TASKS 8 THROUGH 13 WERE COMPLETED, VERIFIED AND PUSHED.**
 Everything above the `Where the work is` heading is current; everything below it is history.
 
 ---
 
-## MILESTONE 4: LANDING 1 IS DONE AND PUSHED. LANDING 2 IS PREPARED AND WAITING ON ONE COMMAND.
+## MILESTONE 4: LANDINGS 2 AND 3 ARE DONE. TASKS 14 AND 15 REMAIN, THEN THE WHOLE-LANDING REVIEW.
 
 **Read these four, in this order.**
 
 | | |
 |---|---|
 | Design | `docs/superpowers/specs/2026-08-16-p5-1-milestone-4-product-wiring-design.md` |
-| Plan | `docs/superpowers/plans/2026-08-16-p5-1-milestone-4-product-wiring.md` — **corrected in place five times now, each with its measurement** |
-| Ledger | `.superpowers/sdd/2026-08-16-p5-1-milestone-4-product-wiring/progress.md` — **the authoritative record.** Untracked, git-ignored, ~200 lines added this session |
-| Task 8 prep | `.superpowers/sdd/.../task-8-report.md` — everything the tag and release need, already measured |
+| Plan | `docs/superpowers/plans/2026-08-16-p5-1-milestone-4-product-wiring.md` |
+| Ledger | `.superpowers/sdd/2026-08-16-p5-1-milestone-4-product-wiring/progress.md` — untracked, git-ignored |
+| Evidence, now durable | `~/code/arca/Documentation/EVIDENCE-layer-cache-poisoning.md` — **committed**, see below |
 
-**ALL THREE REPOSITORIES ARE PUSHED. Verify with `git log -1`, never with a SHA written here.**
+**EVERY SHA BELOW WAS READ WITH `git log -1` / `git ls-remote` AT THE MOMENT THIS WAS
+WRITTEN. Re-verify anyway — this file has gone stale on its own SHAs repeatedly.**
 
 | | branch | head | pushed |
 |---|---|---|---|
-| Arca | `feat/milestone-4-engine` | `c545612` | yes, verified by `ls-remote` |
-| `containerization` submodule | `merge/upstream-main` | `6304122` | yes, verified by `ls-remote` |
-| Gas Can | `feat/milestone-4-product-wiring` | **read it — this file's own commit moves it** | yes |
+| Gas Can | `feat/milestone-4-product-wiring` | `629ca27` | yes, `ls-remote` matches |
+| Arca | `feat/milestone-4-engine` | `e14be74` | yes, `ls-remote` matches |
+| `containerization` submodule | `merge/upstream-main` | `6304122` | yes, `ls-remote` matches |
 
-**MILESTONE 2'S REACHABILITY RULE IS DISCHARGED.** The submodule pointer moved
-(`3f68806` → `6304122`) and was pushed **first**; the pointer inside Arca's pushed commit was then
-confirmed to resolve against the submodule's own remote. A fresh clone will not break at
-`git submodule update --init --recursive`. **It was verified, not assumed.**
+**Arca's branch head is ABOVE the published tag, and that is correct.** The tag
+`gascan-engine-m4` is the annotated object `d143a661`, resolving to commit `c545612b`. The pin
+names the tag. `e14be74` is one docs commit on top and does not move the pin.
 
-### THE ONE THING TO DO NEXT
+### THE TAG AND THE RELEASE ARE PUBLISHED AND VERIFIED. DO NOT REDO THEM.
 
-**Cut the signed tag `gascan-engine-m4` on Arca `c545612b`, then publish two assets.** Everything
-it needs is measured and staged; nothing is left to decide.
+`gascan-engine-m4` is signed, pushed, and **verified from a clean clone** against
+`engine/allowed-signers` — `git verify-tag` reported a good ED25519 signature, exit 0. The
+release carries both assets. Every digest was re-measured from the staged files AND again
+from a fresh `gh release download`; GitHub's own reported asset digests agree.
 
-**Tag `c545612b`, NOT `4134b54`.** An earlier brief said `4134b54`; that was wrong and the
-implementer caught it. The recipe pin and the GPL material live in `6f9e0d9` and `c545612`, which
-are *above* `4134b54`, so tagging `4134b54` would publish a release whose tree contains neither —
-exactly what the plan forbids. The drafted tag message is in the Task 8 report and names
-`c545612b`.
+An independent cross-check worth keeping: the pin's **inner** digests match this host's
+live-tier artifacts exactly. `~/.arca/vmlinux` hashes to `49e0f081…` at 28,248,576 bytes, and
+`~/.arca/vminit/index.json` names `sha256:cf74cd41…` at 478. The published assets are the ones
+Landing 1 tested against.
 
-**The two assets are staged at `~/.arca/release/gascan-engine-m4/`** and must be uploaded as those
-exact files:
+`sha256:a61c4cd9…` remains a superseded vminit digest. It appears in no tracked file anywhere.
 
-| asset | bytes | sha256 |
+### THE ONE THING TO DO NEXT: TASK 14, THEN TASK 15, THEN THE WHOLE-LANDING REVIEW.
+
+**Task 14** — a `gascan-e2e` daemon-on-engine pass: `gascan up`, exec, logs, `gascan down`,
+plus a `gascand` restart proving reconcile adopts a surviving sandbox. That adoption property
+is what Task 11's dial-first supervisor rests on.
+
+**Task 15** — the offline proof and the certified constant. **THE ORDER IS THE WHOLE POINT.**
+
+1. Run the offline proof against the pinned engine. The shape already exists and is hardened:
+   `packaging/macos/release-smoke.sh:1015-1037` asserts six ways that an offline sandbox has
+   no egress — a test-owned host endpoint, a public IP, and public DNS, each as the sandbox
+   user and again as guest root.
+2. Record it under `docs/evidence/<dated>-arca-engine-offline.md`, pinned to the exact Arca
+   revision.
+3. **Only then** set the constant. It is `CERTIFIED_ENGINE_REVISION` in
+   `crates/gascan-arca/src/translate.rs`, and it is `Option<&'static str> = None` today.
+   `None` was chosen over an empty-string sentinel deliberately: an empty sentinel would
+   certify an engine that reports an empty revision, which is exactly what a build with a
+   broken build-info generator does.
+4. Acceptance: with the constant set, a live `Capabilities` yields `Proven`; with it altered
+   by ONE CHARACTER, the same engine yields `Unverified`. **That pair is the instrument.**
+   Setting the constant without the recorded evidence is the "claim with no instrument"
+   defect this project has written traps about since milestone 1.
+
+**Then the whole-landing review, which is not optional.** It found a Critical that seven
+task-scoped gates could not see, and that is now two milestones running.
+
+### WHAT LANDED THIS SESSION, AND THE ONE DEPARTURE FROM THE PLAN
+
+| Task | What | Commit |
 |---|---|---|
-| `vmlinux-arm64.gz` | 9,092,349 | `8a30e10d9e40dcc44396049753a3a26be74cbc77a78afca819cf8f1c13f8597a` |
-| `vminit-oci-arm64.tar.gz` | 73,739,738 | `51602e72883e49e4be1e27a690bf8c13b0a66cba381725cf8ea4888ec4e369be` |
+| 8 | the signed tag and the published release | tag `d143a661` |
+| 9 | pin schema 2, both digests per asset, the build-revision gate | `28cc656` |
+| 10 | `BackendSelection::Arca`, the client's backend refusal, the revision gate | `7f9e8e6` |
+| 11 | the engine supervisor — dial first, spawn on miss | `dec40d8` |
+| 12 | doctor remedies moved to the backend | `6d57f78` |
+| 13 | `gascan engine fetch`, verified twice, and its two doctor facts | `629ca27` |
+| — | the SDD ledger problem, resolved | Arca `e14be74` |
 
-**Record BOTH digests per asset, not one.** `tar czf` is not reproducible — entry order, mtimes and
-the gzip header vary run to run — so the tarball digest identifies *that file* and dies the moment
-anyone repackages. The identity that survives repackaging is the inner one:
+**THE ONE DEPARTURE, AND IT IS MEASURED.** The plan says the revision gate must "downgrade to
+`NetworkIsolation::Unverified` unless `build_revision` equals the certified constant". Taken
+literally that rewrites `Unsupported` too. Both are already fail-closed at
+`policy.rs:419-425`, but with DIFFERENT errors — `OfflineUnsupported { version }` names the
+engine version and `OfflineUnavailable` does not — so collapsing them discards a diagnostic
+and adds no safety. **Only the positive claim is gated.** A mutation implementing the plan's
+literal wording is caught by exactly the assertion that correction added, and by nothing else.
 
-- kernel: uncompressed `vmlinux` is 28,248,576 bytes, sha256
-  `49e0f08165409769e5ae2abbe3414198c2907a15e7e20a5f3971aa7a0de33394`
-- vminit: OCI manifest digest **`sha256:cf74cd41bd430d9d8935d36c1749d9c05f19a43842f4a4cff0d01de3832222c2`**, manifest size 478
+### THE SDD LEDGER PROBLEM IS RESOLVED, AND THE RULE THAT REPLACED IT
 
-**`sha256:a61c4cd9…` IS A SUPERSEDED VMINIT DIGEST. NEVER PUBLISH IT.** It was correct for about
-an hour before the Landing 1 fix wave forced a rebuild. It appears in no tracked file in any of the
-three repositories — only in git-ignored scaffolding.
+`Documentation/EVIDENCE-layer-cache-poisoning.md` is **committed in Arca** and carries the
+failing-before run verbatim, the two-mutation matrix with its disjoint failing sets, the
+restoration checksums, and the discarded first mutation attempt. Both docstrings in
+`Tests/ArcaEngineTests/LayerCacheRoleTests.swift` now point at it. `git grep "fix report"`
+finds nothing in either repository.
 
-**The exact sequence, with everything already measured:**
+**The rule, settled with the maintainer:** any measurement a committed docstring cites goes
+into a tracked file at the moment the docstring is written. `Documentation/.gitignore` ignores
+`*.md` with an allowlist, so `!EVIDENCE-*.md` sits beside `!RELEASE-ARTIFACTS-*.md`.
 
-```bash
-# 1. The tag. The message is drafted and names all seven tasks, the submodule
-#    pointer, both suites and all four digests.
-cd ~/code/arca && git tag -s gascan-engine-m4 -F \
-  ~/code/gascan/.superpowers/sdd/2026-08-16-p5-1-milestone-4-product-wiring/task-8-tag-message.txt \
-  c545612b
-git push origin gascan-engine-m4
+Note honestly: this landed ABOVE the published tag, so the tagged tree still carries the
+dangling citation. Re-tagging was not considered — the release is public and downloadable.
 
-# 2. Verify from a CLEAN CLONE, never the working tree.
-cd $(mktemp -d) && git clone git@github.com:Vas-Solutus/arca.git a && cd a
-git config gpg.ssh.allowedSignersFile ~/code/gascan/engine/allowed-signers
-git verify-tag gascan-engine-m4          # must report a good signature
+### SIX THINGS THAT WILL COST A SUCCESSOR REAL TIME
 
-# 3. The release and its two assets, uploaded as these exact files.
-gh release create gascan-engine-m4 --repo Vas-Solutus/arca --verify-tag \
-  ~/.arca/release/gascan-engine-m4/vmlinux-arm64.gz \
-  ~/.arca/release/gascan-engine-m4/vminit-oci-arm64.tar.gz
-```
-
-**If `task-8-tag-message.txt` is gone** — it lives in git-ignored scaffolding — reconstruct it from
-`~/code/arca/Documentation/RELEASE-ARTIFACTS-gascan-engine-m4.md`, which is **committed at
-`c545612`** and carries the same digests and caveats.
-
-**The GPL material is already committed and durable**, in Arca at `6f9e0d9`: the whole upstream
-recipe vendored under `kernel/recipe/` with `kernel/recipe.sha256` and `kernel/recipe.env` pinning
-it, and a 144-line `kernel/README.md` holding the written offer, the source URL and sums, and the
-non-reproducibility caveat. **Nothing about the GPL obligation is left to do before publishing.**
-
-**Then verify the tag from a CLEAN CLONE**, not the working tree, because the working tree's git
-config is not what a user has. Arca's signing key was checked against
-`~/code/gascan/engine/allowed-signers` and they match exactly, so this should pass — if it does
-not, that is a real finding.
-
-### THE GPL OBLIGATION IS DISCHARGED, AND THE ANSWER IS BETTER THAN THE PLAN FEARED
-
-**Settled with the maintainer 2026-08-17, who reviewed the analysis and authorised proceeding.**
-
-- The kernel is **Linux 6.14.9**, unmodified upstream source from `cdn.kernel.org`, built with
-  Apple's `containerization` recipe at **`452f354b`** (tags `0.20.0`/`0.20.1`) — recovered, not
-  guessed, by hashing the on-disk build tree's blobs against the submodule's full clone of
-  `apple/containerization`.
-- **`build-kernel.sh` never modified the config.** The plan and an earlier brief both said it
-  enables `CONFIG_TUN` and `CONFIG_WIREGUARD`; it *would have* if they were unset, and they were
-  already set upstream. Proven two ways: the on-disk `config-arm64` is byte-identical to an
-  upstream git blob (a `sed`-edited file could not be), and `sed -i.bak` left no `.bak`. **So there
-  is no Arca modification anywhere in the kernel build** — corresponding source is upstream Linux +
-  upstream Apple config + upstream Apple scripts. That is a *stronger* position, not a weaker one.
-- **kernel.org's published sha256 for `linux-6.14.9.tar.xz` matches the on-disk tarball exactly.**
-  Note honestly what was not done: the sums file is PGP clear-signed and **the signature was not
-  verified** — no keyring on this host.
-- **Deferring the download to install time does NOT avoid the obligation.** It follows who serves
-  the bytes. Task 8 uploads to Arca's own release and Task 13 fetches from there.
-- **It forces no licence change.** Gas Can is already `AGPL-3.0-only` (`Cargo.toml:7`, all ten
-  crates). Arca's AGPL does not reach Gas Can either: separate processes over gRPC on a Unix
-  socket, and `crates/gascan-arca` vendors no Swift.
-- **The kernel build is NOT bit-reproducible** — the shipped `vmlinux` and a rebuild are the same
-  size with different sha256s. Say so; do not imply reproducibility.
-
-### LANDING 1 — ALL SEVEN TASKS, THEN A WHOLE-LANDING REVIEW THAT EARNED ITS SEAT
-
-| Task | What | State |
-|---|---|---|
-| 1 | `Capabilities` carries the build revision, `contract_minor = 1` | done |
-| 2 | `parseSignal` refuses what it cannot map | done |
-| 3 | the startup SIGTERM race (exit 143) | done |
-| 4 | the client-channel shutdown defect (exit 1) | done |
-| 5 | multi-layer layer-cache fixture | done, 1 fix round |
-| 6 | `EXT4.Formatter.unpack` refuses a mistyped blob — submodule | done, 1 fix round |
-| 7 | the host reports the attached layer count — submodule + guest | done, **3** fix rounds |
-| — | **the whole-landing review, its Critical, and the fix wave** | done, verdict **READY** |
-
-Suites at `c545612`: Arca **250 / 0** (`swift test --disable-swift-testing --filter
-ArcaEngineTests`), submodule **616 / 0** (plain `swift test`), `ArcaTests.NetworkPruneGateTests`
-**3 / 0**, and a real container created/started/inspected/stopped/removed against the rebuilt guest.
-
-**THE WHOLE-LANDING REVIEW FOUND A CRITICAL THAT SEVEN TASK-SCOPED GATES COULD NOT SEE, WHICH IS
-THE SECOND MILESTONE RUNNING THAT THIS HAS HAPPENED. DO NOT SKIP IT NEXT TIME.**
-
-Task 6 made a mistyped layer *throw* — correctly. But the formatter was already pointed at the
-final cache path and a deferred `close()` wrote the superblock **and the volume label**, so the
-refusal left a valid, correctly-labelled, **empty** `layer.ext4` in the cache. The next create's
-reuse predicate tests **the label alone**, so it hit. Task 7's count guard could not see it: the
-poisoned device is labelled, *is* counted, and resolves `.complete`. **The first create failed
-loudly; every create after it booted a container on a rootfs built from none of that layer, with
-`Start` succeeding.**
-
-It was **confirmed by measurement, not argument** — the regression test run against unfixed code
-showed the retry *succeeding*, in both the one-layer and three-layer shapes. Fixed by unpacking to
-a sibling staging path and promoting with `rename(2)` only after `close()` returns; `close()` is
-deliberately no longer deferred, because it is the commit point.
-
-### FIVE THINGS THAT WILL COST A SUCCESSOR REAL TIME
-
-1. **`ps -A` CANNOT ENUMERATE THE PROCESS TABLE ON THIS HOST.** Measured: `ps -A | wc -l` = **31**
-   against `launchctl list | wc -l` = **544**, and `ps -A` omits even the calling shell. **No
-   `ps | grep` absence check is evidence of anything here.** Use
-   `launchctl list | grep -iE "sharing|vmnet"`. This cost hours and produced a wrong escalation for
-   root and a reboot when force-quitting `InternetSharing` was the entire fix. **That vmnet remedy
-   is correct — do not retire it.**
-2. **`--disable-swift-testing` IS NOT PORTABLE BETWEEN THE REPOSITORIES.** Arca's tests are XCTest;
-   **every submodule test is swift-testing**, so that flag runs **0 tests and exits 0** there — a
-   false green. Verified: `rg -l "import XCTest" Tests/` → 0 files, `rg -l "^import Testing"` → 67,
-   8 test targets under one root. **The submodule's suite is plain `swift test`.**
+1. **`ps -A` CANNOT ENUMERATE THE PROCESS TABLE ON THIS HOST.** Measured: 31 entries against
+   `launchctl list`'s 544, and it omits even the calling shell. **No `ps | grep` absence check
+   is evidence of anything here.** Use `launchctl list | grep -iE "sharing|vmnet"`. If an
+   engine dies with `vmnet_return_t(rawValue: 1001)`, force-quit `InternetSharing`. **That
+   remedy is correct — do not retire it.**
+2. **`--disable-swift-testing` IS NOT PORTABLE BETWEEN THE REPOSITORIES.** Every submodule
+   test is swift-testing, so that flag runs **0 tests and exits 0** there — a false green. The
+   submodule's suite is plain `swift test` (616/0); Arca's is the filtered form.
 3. **`make vminit-rebuild` IS DESTRUCTIVE BEFORE IT IS VERIFIED.** `Makefile:192-195` is
-   `rm -rf ~/.arca/vminit` *then* the build. It failed once on a stopped service and left this host
-   with no vminit layout at all — which is what `GASCAN_ARCA_VMINIT_LAYOUT` names for the whole live
-   tier. **Check `container system status` first, and back the layout up**, as was done this
-   session.
-4. **THE ENGINE LOSES ITS ENTITLEMENT TO EVERY `swift test`.** Re-sign **after** the last one and
+   `rm -rf ~/.arca/vminit` *then* the build. Check `container system status` first and back
+   the layout up.
+4. **THE ENGINE LOSES ITS ENTITLEMENT TO EVERY `swift test`.** Re-sign after the last one and
    verify `codesign -d --entitlements - <bin> 2>&1 | grep -c virtualization` prints `1`.
-5. **NEVER GIVE SUBAGENTS NAMES WHERE ONE IS A PREFIX OF ANOTHER**, and **REQUIRE EVERY REVIEW TO
-   BE WRITTEN TO A FILE BEFORE THE REPLY.** This session dispatched **eleven** subagents and
-   **every single reply was lost in transit** — eleven for eleven. **Every file survived.** The
-   file-first contract is the only reason any of this work exists.
+5. **NEVER GIVE SUBAGENTS NAMES WHERE ONE IS A PREFIX OF ANOTHER**, and **REQUIRE EVERY REVIEW
+   TO BE WRITTEN TO A FILE BEFORE THE REPLY.** Eleven of eleven subagent replies were lost in
+   transit in an earlier session; every file survived.
+6. **NEVER RUN THE WORKSPACE SUITE BESIDE ANOTHER CARGO OR CONTRACT JOB.** Measured across
+   four runs this session: run alone it is 1442/1448/1451/1456 passed, 0 failed. Run beside
+   `ci-run-release-contracts.sh` it produced two failures, and a later contended run produced
+   **two different ones**. The mechanism is file descriptors, not timing — the captured cause
+   was `ssh-keygen ... /dev/fd/17: Bad file descriptor [parent descriptor intact]`. **The
+   plan's §7.6 blames `gascan-e2e` alone; that is too narrow — `gascand` tests wander the same
+   way.** Exonerate by diff plus isolation, never by probability.
 
 ### WHAT IS OPEN
 
-- **Task 8's tag and publish** — the one command, above.
-- **Tasks 9-15** — the pin bump (schema 2, carrying *both* digests per asset), Gas Can wiring, the
-  artifact fetch, the offline proof. Untouched.
-- **~60 deferred Minor findings**, all in the ledger with rulings. The two the whole-landing review
-  said to fix **before Landing 2 publishes**: Task 6 M3 (a test that can stop testing without going
-  red, guarding the clause whose failure mode is *false refusal of sound layers*) and Task 7 O1
-  (the cloud-hypervisor path, where four consecutive hops are pinned by nothing).
-- **A defect worth its own task:** a guest that refuses at boot is loud in the guest and **silent to
-  the host** — `Start` never returns and the only diagnostic is inside `bootlog.log`.
-- **The guest-side ordering instrument** measured overlay stacking and was then deleted. Preserved
-  at `.superpowers/sdd/.../carry-layer_report-live-test.rs`, which is **git-ignored**. Land it in
+- **Tasks 14 and 15**, above.
+- **The whole-landing review**, which is not optional.
+- **The ignored-test baseline is 46**, reconciled from 43. Two of the three additions were
+  Landing 1 live tests that had never been baselined (`682bab0`, `ab8aa59`), so that CI gate
+  had been red on this branch since Landing 1; the third is Task 9's build-revision test.
+- **~60 deferred Minor findings** with rulings in the ledger. The two the whole-landing review
+  said to fix before Landing 2 publishes — Task 6 M3 and Task 7 O1 — are **still open**.
+- **A defect worth its own task:** a guest that refuses at boot is loud in the guest and
+  **silent to the host** — `Start` never returns and the only diagnostic is in `bootlog.log`.
+- **The guest-side ordering instrument** is preserved at
+  `.superpowers/sdd/.../carry-layer_report-live-test.rs`, which is **git-ignored**. Land it in
   Gas Can's live tier before it is lost.
-- **THE SDD LEDGER PROBLEM IS NOW LOAD-BEARING, NOT COSMETIC.** Two committed test docstrings cite
-  "this landing's fix report" for the measurements that justify the Critical's fix — and that file
-  lives in git-ignored scaffolding in *another repository*. **The evidence for this landing's most
-  important fix has no durable home in any shipped repo.** This file has said "delete the ledger
-  when the branch merges" since milestone 1; there are now **five** on disk and none has ever been
-  deleted. Either delete them as a set, or stop writing the instruction — but resolve the citations
-  first.
+- **One untested ordering, labelled as such in the code.** In
+  `crates/gascand/src/engine.rs`, swapping the exit-status and timeout checks leaves the whole
+  supervisor suite green. It is kept as reasoning, not as a tested property, and says so.
+- **A pre-existing stash is on the stack and is not ours**: `stash@{0}: spike: persist live
+  state root + snapshot guest bootlog (volumes defect, 2026-08-14)`. Leave it. Note that
+  `refs/stash` reads `ff06265` today while `landing-1-fix-report.md` recorded `27f83037`; the
+  single entry's message is unchanged and nothing this session touched it, so treat the
+  recorded SHA as stale rather than the stash as altered.
+
+### THE LIVE TIER NEEDS FOUR ENVIRONMENT VARIABLES, AND TWO ARE NOW FETCHABLE
+
+All four are undefaulted; absent means `panic!`. `gascan engine fetch` now produces two of
+them, verified against the pin:
+
+```
+GASCAN_ARCA_ENGINE_BIN      second line of scripts/build-arca-engine.sh
+GASCAN_ARCA_KERNEL_PATH     ~/Library/Application Support/dev.gascan/engine/vmlinux
+GASCAN_ARCA_VMINIT_LAYOUT   ~/Library/Application Support/dev.gascan/engine/vminit
+GASCAN_ARCA_BASE_OCI_LAYOUT an OCI layout with one small linux/arm64 image carrying sh and nc
+```
+
+The daemon's own two are `GASCAN_ENGINE_BIN` and `GASCAN_ENGINE_SOCKET`, both undefaulted for
+the same reason and both required when `GASCAN_ARCA_BACKEND` is set.
 
 ---
 
