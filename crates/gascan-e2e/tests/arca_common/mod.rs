@@ -410,8 +410,14 @@ impl ArcaE2e {
     /// would reach every engine on the machine including ones this test did not
     /// start.
     pub fn engine_pid(&self) -> Option<u32> {
-        let lock = self.engine_socket.with_extension("sock.lock");
-        std::fs::read_to_string(lock)
+        // The path Arca builds, byte for byte: `socketPath + ".lock"`
+        // (`Sources/ArcaEngine/EngineServer.swift:551`). NOT
+        // `with_extension("sock.lock")`, which happens to be right only because
+        // this socket is named `e.sock`; rename it to `engine` and that form
+        // appends rather than replaces, and this silently reads nothing.
+        let mut lock = self.engine_socket.clone().into_os_string();
+        lock.push(".lock");
+        std::fs::read_to_string(std::path::PathBuf::from(lock))
             .ok()?
             .trim()
             .parse::<u32>()

@@ -43,13 +43,17 @@ pub struct EngineReadiness {
 }
 
 impl Default for EngineReadiness {
-    /// A bound, not a retry policy: it exists so a hung engine surfaces as an
-    /// error naming the socket rather than as a daemon that never finishes
-    /// starting. The child is checked for having exited on every tick as well,
-    /// so a dead engine ends the wait long before this does.
+    /// The bound is `gascan_core::backend::ENGINE_READINESS`, and it is there
+    /// rather than here because the client has to know it too: its own wait
+    /// must outlast this one, or this one's error -- the one that names the
+    /// socket -- is produced for a client that has already given up. That is
+    /// what a 20s bound here against the client's 15s did.
+    ///
+    /// 20s was also under a cold engine start this repository had already
+    /// measured as failing at 30s. See the constant for the measurement.
     fn default() -> Self {
         Self {
-            timeout: Duration::from_secs(20),
+            timeout: gascan_core::backend::ENGINE_READINESS,
             poll: Duration::from_millis(25),
         }
     }

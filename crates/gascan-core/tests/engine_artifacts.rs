@@ -398,3 +398,78 @@ fn the_compiled_in_pin_parses_and_names_both_artifacts() -> TestResult {
     }
     Ok(())
 }
+
+/// **The artifact directories are private, whether this run made them or found
+/// them.**
+///
+/// `create_dir_all` applies the process umask, which is `022` on a default
+/// macOS host, so every directory the fetch made arrived `0755`. MEASURED on
+/// the machine where this was written, after `gascan engine fetch` had run:
+/// `dev.gascan` and `dev.gascan/controller` were `700` and
+/// `dev.gascan/engine` was `755`.
+///
+/// **Two consumers require exactly `0700` and neither repairs.** `gascand`'s
+/// `ensure_private_child_directory` `fchmod`s only a directory it created and
+/// then validates the mode, so a `dev.gascan` this fetch made at `0755` stops
+/// the daemon from starting on either backend -- and running the fetch before
+/// the first daemon start is the documented order, because the fetch is the
+/// doctor's remedy for a daemon that cannot start.
+/// `packaging/macos/uninstall.sh` refuses a private child that is not `0700`,
+/// with exit 65, after the controller and runtime data are already gone.
+///
+/// The repair half is asserted as well as the create half, because every host
+/// that already ran the fetch is in the broken state and nothing else fixes it.
+#[test]
+fn the_artifact_directories_are_private_when_created_and_when_repaired() -> TestResult {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fn mode_of(path: &Path) -> Result<u32, Box<dyn std::error::Error>> {
+        Ok(std::fs::metadata(path)?.permissions().mode() & 0o7777)
+    }
+
+    // Created. The root's parent is named `dev.gascan` so the walk this
+    // exercises is the production one: the chain is tightened up to and
+    // including `dev.gascan`, and no further.
+    let fixture = build_fixture()?;
+    let support = fixture.root.join("Application Support");
+    std::fs::create_dir_all(&support)?;
+    let dev_gascan = support.join("dev.gascan");
+    let paths = ArtifactPaths::under_application_support(&support);
+    let tools = FakeTools::new(&fixture, Fault::None);
+    fetch(&paths, &fixture.pin, &tools)?;
+
+    assert_eq!(mode_of(paths.root())?, 0o700, "the engine directory");
+    assert_eq!(mode_of(&dev_gascan)?, 0o700, "the dev.gascan directory");
+
+    // Repaired. This is the state a host that already ran the old fetch is in.
+    for path in [dev_gascan.as_path(), paths.root()] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    assert_eq!(
+        mode_of(paths.root())?,
+        0o755,
+        "the fixture's own precondition"
+    );
+
+    fetch(&paths, &fixture.pin, &tools)?;
+    assert_eq!(
+        mode_of(paths.root())?,
+        0o700,
+        "the engine directory, repaired"
+    );
+    assert_eq!(
+        mode_of(&dev_gascan)?,
+        0o700,
+        "the dev.gascan directory, repaired"
+    );
+
+    // Above `dev.gascan` is the account's own -- `Library` and `Application
+    // Support` are macOS's, and tightening them would be this crate reaching
+    // outside itself.
+    assert_ne!(
+        mode_of(&support)?,
+        0o700,
+        "the fetch tightened a directory above dev.gascan, which is not its to own"
+    );
+    Ok(())
+}

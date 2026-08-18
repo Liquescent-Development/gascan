@@ -129,7 +129,7 @@ write_fake cpio '
 mkdir -p usr/local/bin usr/local/share/gascan
 : >usr/local/bin/gascan; : >usr/local/bin/gascan-apple-attach; : >usr/local/bin/gascand
 printf license >usr/local/share/gascan/LICENSE; printf config >usr/local/share/gascan/default-gascan.toml
-printf "%s\\n" "{\"architecture\":\"arm64\",\"engine\":{\"name\":\"arca\",\"revision\":\"b20be7c865978759026d233e2d012ec8dc393b27\",\"tag\":\"gascan-engine-baseline\",\"url\":\"https://github.com/Vas-Solutus/arca.git\"},\"files\":[{\"path\":\"usr/local/bin/gascan\",\"sha256\":\"$FIXTURE_MANIFEST_HASH\"},{\"path\":\"usr/local/bin/gascan-apple-attach\",\"sha256\":\"$FIXTURE_MANIFEST_HASH\"},{\"path\":\"usr/local/bin/gascand\",\"sha256\":\"$FIXTURE_MANIFEST_HASH\"}],\"product\":\"Gas Can\",\"schema\":2,\"source_revision\":\"$FIXTURE_REVISION\",\"version\":\"0.1.0\"}" >usr/local/share/gascan/build-manifest.json'
+printf "%s\\n" "{\"architecture\":\"arm64\",\"engine\":$FIXTURE_ENGINE_JSON,\"files\":[{\"path\":\"usr/local/bin/gascan\",\"sha256\":\"$FIXTURE_MANIFEST_HASH\"},{\"path\":\"usr/local/bin/gascan-apple-attach\",\"sha256\":\"$FIXTURE_MANIFEST_HASH\"},{\"path\":\"usr/local/bin/gascand\",\"sha256\":\"$FIXTURE_MANIFEST_HASH\"}],\"product\":\"Gas Can\",\"schema\":2,\"source_revision\":\"$FIXTURE_REVISION\",\"version\":\"0.1.0\"}" >usr/local/share/gascan/build-manifest.json'
 write_fake shasum 'printf "%s  %s\\n" "$FIXTURE_OBSERVED_HASH" "$3"'
 write_fake lipo 'echo "$FIXTURE_ARCHS"'
 write_fake sudo 'printf "sudo:%s\\n" "$*" >>"$FIXTURE_LOG"'
@@ -178,6 +178,14 @@ elif [[ $1 == list ]]; then printf "%s\\n" "$FIXTURE_SANDBOX_JSON"; fi'
 export PATH="$fixture/bin:/usr/bin:/bin:/usr/sbin:/sbin" FIXTURE_LOG=$log FIXTURE_REVISION=$revision FIXTURE_HASH=$hash
 export GASCAN_EXPECTED_SOURCE_REVISION=$revision GASCAN_EXPECTED_VERSION=0.1.0
 export FIXTURE_PACKAGE_ID=dev.gascan.pkg FIXTURE_VERSION=0.1.0
+# **Derived from the real pin with package.sh's own jq program, never
+# hand-written.** A hand-written engine block is why a packager that started
+# emitting `artifacts` could disagree with verify-package.sh's key list while
+# every contract stayed green: both fixtures satisfied the old shape and the
+# real packager did not, and nothing in *-contract.sh builds a package from the
+# real pin.
+FIXTURE_ENGINE_JSON=$(jq -cS '{name, url, tag, revision, artifacts}' "$repo_root/engine/arca-pin.json")
+export FIXTURE_ENGINE_JSON
 export FIXTURE_MANIFEST_HASH=$hash FIXTURE_OBSERVED_HASH=$hash FIXTURE_ARCHS=arm64
 export FIXTURE_OBSERVED_EXECUTABLE=/usr/local/bin/gascand FIXTURE_OBSERVED_START=START
 export FIXTURE_ATTESTED_EXECUTABLE=/usr/local/bin/gascand FIXTURE_ATTESTED_START=START FIXTURE_ATTESTED_TOKEN=TOKEN

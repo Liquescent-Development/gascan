@@ -15,7 +15,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
-use gascan_core::doctor::{AppleRemedies, DoctorFact, DoctorFacts, DoctorReport};
+use gascan_core::doctor::{AppleRemedies, DoctorFact, DoctorFacts, DoctorRemedies, DoctorReport};
 use gascan_core::manifest::ManifestError;
 use gascan_core::policy::{
     CACHE_ROOT, CARGO_HOME, CONFIG_ROOT, ControlPlanePolicy, MISE_GLOBAL_CONFIG_FILE,
@@ -286,55 +286,88 @@ enum DoctorSource {
     },
 }
 
+/// The doctor's evidence source, and the remedy table its FALLBACKS use.
+///
+/// **The remedies are carried, not hardcoded, because the fallbacks manufacture
+/// a report rather than receiving one.** `arca_doctor_report` ends in
+/// `into_report(&ArcaRemedies)`, so a collector that RETURNS is already right.
+/// A collector that times out or is abandoned is replaced here, and the
+/// replacement used to be paired with `AppleRemedies` unconditionally --
+/// telling the user of an Arca daemon to "install Apple container 1.1.0 in
+/// PATH" and, for the offline check, to "install a supported Apple container
+/// release with proven offline isolation".
+///
+/// That is exactly the defect `arca_doctor_report` was written to fix, on the
+/// path most likely to be taken: nothing bounds the `Capabilities` RPC, so a
+/// wedged or mid-boot engine reaches the timeout rather than the return.
+///
+/// `ready` takes no remedies and needs none -- a report handed in whole has its
+/// own, and there is no fallback to manufacture.
 #[derive(Clone)]
 pub struct DoctorState {
     source: DoctorSource,
+    /// Consulted only when a report has to be manufactured.
+    remedies: &'static dyn DoctorRemedies,
 }
 
 pub struct DoctorCompleter {
     sender: tokio::sync::watch::Sender<Option<DoctorReport>>,
 }
 
-fn doctor_timeout_report(timeout: std::time::Duration) -> DoctorReport {
+fn doctor_timeout_report(
+    timeout: std::time::Duration,
+    remedies: &'static dyn DoctorRemedies,
+) -> DoctorReport {
     DoctorFacts::unavailable(format!(
         "runtime evidence collector exceeded its {} second bound",
         timeout.as_secs()
     ))
-    .into_report(&AppleRemedies)
+    .into_report(remedies)
 }
 
 impl DoctorState {
     pub fn ready(report: DoctorReport) -> Self {
         Self {
             source: DoctorSource::Fixed(report),
+            // Never consulted: `Fixed` returns the report it was given.
+            remedies: &AppleRemedies,
         }
     }
 
-    pub fn pending() -> (Self, DoctorCompleter) {
+    pub fn pending(remedies: &'static dyn DoctorRemedies) -> (Self, DoctorCompleter) {
         let (sender, receiver) = tokio::sync::watch::channel(None);
         (
             Self {
                 source: DoctorSource::Pending(receiver),
+                remedies,
             },
             DoctorCompleter { sender },
         )
     }
 
-    pub fn collect<F>(timeout: std::time::Duration, collector: F) -> Self
+    pub fn collect<F>(
+        timeout: std::time::Duration,
+        remedies: &'static dyn DoctorRemedies,
+        collector: F,
+    ) -> Self
     where
         F: std::future::Future<Output = DoctorReport> + Send + 'static,
     {
-        let (state, completer) = Self::pending();
+        let (state, completer) = Self::pending(remedies);
         tokio::spawn(async move {
             let report = tokio::time::timeout(timeout, collector)
                 .await
-                .unwrap_or_else(|_| doctor_timeout_report(timeout));
+                .unwrap_or_else(|_| doctor_timeout_report(timeout, remedies));
             completer.complete(report);
         });
         state
     }
 
-    pub fn refreshing<C, F>(timeout: std::time::Duration, collector: C) -> Self
+    pub fn refreshing<C, F>(
+        timeout: std::time::Duration,
+        remedies: &'static dyn DoctorRemedies,
+        collector: C,
+    ) -> Self
     where
         C: Fn() -> F + Send + Sync + 'static,
         F: Future<Output = DoctorReport> + Send + 'static,
@@ -344,6 +377,7 @@ impl DoctorState {
                 timeout,
                 collector: Arc::new(move || Box::pin(collector())),
             },
+            remedies,
         }
     }
 
@@ -360,14 +394,14 @@ impl DoctorState {
                         return DoctorFacts::unavailable(
                             "runtime evidence collection was abandoned",
                         )
-                        .into_report(&AppleRemedies);
+                        .into_report(self.remedies);
                     }
                 }
             }
             DoctorSource::Refreshing { timeout, collector } => {
                 tokio::time::timeout(*timeout, collector())
                     .await
-                    .unwrap_or_else(|_| doctor_timeout_report(*timeout))
+                    .unwrap_or_else(|_| doctor_timeout_report(*timeout, self.remedies))
             }
         }
     }

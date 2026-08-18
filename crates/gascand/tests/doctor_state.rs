@@ -1,4 +1,4 @@
-use gascan_core::doctor::{AppleRemedies, DoctorFact, DoctorFacts};
+use gascan_core::doctor::{AppleRemedies, ArcaRemedies, DoctorFact, DoctorFacts};
 use gascan_core::fake_runtime::FakeRuntime;
 use gascan_core::manifest::Manifest;
 use gascan_core::sandbox::SandboxId;
@@ -412,7 +412,7 @@ fn write_obsolete_generation(
 
 #[tokio::test]
 async fn pending_doctor_callers_converge_on_one_completed_report() {
-    let (state, completer) = DoctorState::pending();
+    let (state, completer) = DoctorState::pending(&AppleRemedies);
     let left = tokio::spawn({
         let state = state.clone();
         async move { state.report().await }
@@ -432,7 +432,7 @@ async fn pending_doctor_callers_converge_on_one_completed_report() {
 
 #[tokio::test]
 async fn abandoned_doctor_collection_fails_closed() {
-    let (state, completer) = DoctorState::pending();
+    let (state, completer) = DoctorState::pending(&AppleRemedies);
     drop(completer);
     let report = state.report().await;
     assert!(report.checks.iter().all(|check| {
@@ -444,7 +444,7 @@ async fn abandoned_doctor_collection_fails_closed() {
 #[tokio::test(start_paused = true)]
 async fn producer_timeout_is_cached_for_late_and_concurrent_callers() {
     let expected = DoctorFacts::all_supported_for_tests().into_report(&AppleRemedies);
-    let state = DoctorState::collect(Duration::from_secs(60), {
+    let state = DoctorState::collect(Duration::from_secs(60), &AppleRemedies, {
         let expected = expected.clone();
         async move {
             tokio::time::sleep(Duration::from_secs(61)).await;
@@ -478,7 +478,7 @@ async fn producer_timeout_is_cached_for_late_and_concurrent_callers() {
 #[tokio::test]
 async fn refreshing_doctor_state_collects_fresh_evidence_for_each_report() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let state = DoctorState::refreshing(Duration::from_secs(1), {
+    let state = DoctorState::refreshing(Duration::from_secs(1), &AppleRemedies, {
         let calls = Arc::clone(&calls);
         move || {
             let calls = Arc::clone(&calls);
@@ -1497,4 +1497,60 @@ async fn ssh_doctor_truncates_multibyte_diagnostics_at_a_utf8_boundary() -> Test
             .is_char_boundary(facts.config.detail.len())
     );
     Ok(())
+}
+
+/// **A doctor that times out must speak for the backend it was watching.**
+///
+/// `arca_doctor_report` ends in `into_report(&ArcaRemedies)`, so a collector
+/// that RETURNS was always right. The fallbacks manufacture a report instead,
+/// and every one of them paired it with `AppleRemedies` unconditionally -- so
+/// the user of an Arca daemon whose engine was wedged was told to "install
+/// Apple container 1.1.0 in PATH", which is the exact defect
+/// `arca_doctor_report` exists to fix, on the path most likely to be taken:
+/// nothing bounds the `Capabilities` RPC, so a wedged or mid-boot engine
+/// reaches the timeout rather than the return.
+///
+/// Both fallbacks are covered, because they are separate code paths: the
+/// timeout in `Refreshing`, and the abandoned collector in `Pending`.
+#[tokio::test(start_paused = true)]
+async fn a_doctor_fallback_uses_the_backends_own_remedies_and_never_apples() {
+    let timed_out = DoctorState::refreshing(Duration::from_secs(60), &ArcaRemedies, || async {
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        DoctorFacts::all_supported_for_tests().into_report(&ArcaRemedies)
+    });
+    let report = timed_out.report().await;
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|check| check.detail.contains("exceeded its 60 second bound")),
+        "the timeout fallback was not taken, so this proves nothing: {report:?}"
+    );
+    for check in &report.checks {
+        assert!(
+            !check.remedy.contains("Apple container"),
+            "an Arca daemon's timeout remedy names Apple's runtime: {:?} -> {:?}",
+            check.id,
+            check.remedy
+        );
+    }
+
+    let (abandoned, completer) = DoctorState::pending(&ArcaRemedies);
+    drop(completer);
+    let report = abandoned.report().await;
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|check| check.detail.contains("was abandoned")),
+        "the abandoned fallback was not taken, so this proves nothing: {report:?}"
+    );
+    for check in &report.checks {
+        assert!(
+            !check.remedy.contains("Apple container"),
+            "an Arca daemon's abandoned-collection remedy names Apple's runtime: {:?} -> {:?}",
+            check.id,
+            check.remedy
+        );
+    }
 }

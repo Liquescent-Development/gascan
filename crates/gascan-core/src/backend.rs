@@ -85,6 +85,42 @@ pub const ENGINE_STATE_ROOT_ENV: &str = "GASCAN_ENGINE_STATE_ROOT";
 /// never chose.
 pub const ENGINE_BIN_ENV: &str = "GASCAN_ENGINE_BIN";
 
+/// How long a daemon waits for an engine it spawned to bind its socket.
+///
+/// **Measured, not chosen.** `crates/gascan-arca/tests/live/common/mod.rs`'s
+/// `await_socket` records that "a binary's first execution is far slower than
+/// its later ones: a freshly built `arca-engine` measured 997ms on a fresh
+/// inode against 10ms warm, and freshly linked test binaries on the same
+/// machine took ~50s each to start under load. **30s failed on a cold
+/// engine.**" That tier settled on 120s. The daemon's own bound was 20s, which
+/// is under a start this repository had already measured as failing at 30s, so
+/// a correctly configured host with a cold engine failed `gascan up`.
+///
+/// A bound, not a retry policy: it exists so a hung engine surfaces as an error
+/// naming the socket rather than as a daemon that never finishes starting. The
+/// child is checked for having exited on every tick, so a dead engine ends the
+/// wait long before this does -- which is what keeps widening it cheap.
+pub const ENGINE_READINESS: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long a client waits for a daemon that must bring an engine up first.
+///
+/// **It MUST exceed [`ENGINE_READINESS`], and `readiness_bounds_are_ordered`
+/// asserts it.** The client's bound was 15s against the daemon's 20s, so the
+/// client always abandoned first and `EngineError::NotListening` -- the daemon's
+/// own error, the one that names the socket it waited on -- could not reach a
+/// user by construction. What a user saw instead was a generic
+/// `SupervisorError::Readiness`.
+///
+/// Both constants live here, in a crate `gascan` and `gascand` both depend on
+/// while neither depends on the other, for the reason [`ARCA_BACKEND_ENV`]
+/// gives: two processes that must agree cannot each keep their own copy.
+///
+/// **This is not the bound for an Apple-backed daemon**, which starts no engine
+/// and whose 15s default stays as it is. Applying this to every backend would
+/// make an Apple daemon that never becomes healthy take two and a half minutes
+/// to say so.
+pub const ENGINE_BACKED_DAEMON_READINESS: std::time::Duration = std::time::Duration::from_secs(150);
+
 /// The environment variable that selects the fabricating test runtime.
 ///
 /// `#[cfg(debug_assertions)]` here as well as at every read of it, so that the
@@ -149,4 +185,33 @@ pub fn backend_from_environment() -> Result<BackendSelection, AmbiguousBackend> 
     #[cfg(not(debug_assertions))]
     let fake_requested = false;
     backend_selection(fake_requested, std::env::var_os(ARCA_BACKEND_ENV).is_some())
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::{ENGINE_BACKED_DAEMON_READINESS, ENGINE_READINESS};
+
+    /// **The client must outlast the daemon it is waiting on.**
+    ///
+    /// If it does not, the daemon's own error is produced for a client that has
+    /// already gone, and every engine startup failure reaches the user as a
+    /// generic readiness timeout instead of one naming the socket. That was the
+    /// state of the two bounds when this test was written: the client's 15s
+    /// against the daemon's 20s.
+    ///
+    /// The margin is asserted, not just the ordering. Equal bounds race, and a
+    /// margin under the poll interval is the same as none.
+    #[test]
+    fn readiness_bounds_are_ordered() {
+        assert!(
+            ENGINE_BACKED_DAEMON_READINESS > ENGINE_READINESS,
+            "the client ({ENGINE_BACKED_DAEMON_READINESS:?}) must outlast the daemon's \
+             engine wait ({ENGINE_READINESS:?}), or the daemon's specific error is produced \
+             for a client that has already abandoned it"
+        );
+        assert!(
+            ENGINE_BACKED_DAEMON_READINESS - ENGINE_READINESS >= std::time::Duration::from_secs(10),
+            "the margin between the two bounds is under 10s, which a slow tick can close"
+        );
+    }
 }

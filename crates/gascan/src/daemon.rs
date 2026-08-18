@@ -589,12 +589,40 @@ pub(crate) struct SupervisorTimeouts {
 }
 
 impl Default for SupervisorTimeouts {
+    /// The Apple-backed bounds. A daemon on that backend starts no engine.
     fn default() -> Self {
         Self {
             readiness: Duration::from_secs(15),
             shutdown: Duration::from_secs(15),
             poll: Duration::from_millis(25),
         }
+    }
+}
+
+impl SupervisorTimeouts {
+    /// The bounds for the backend this process is configured for.
+    ///
+    /// **An Arca-backed daemon must bring an engine up before it can serve**,
+    /// and that is a cold VM-capable binary loading a 73MB vminit layout, not a
+    /// process that binds a socket and returns. Waiting on it with the Apple
+    /// bound made `gascan up` fail on a correctly configured host, and made the
+    /// daemon's own `NotListening` error -- which names the socket -- unable to
+    /// reach a user at all, because the client always abandoned first.
+    ///
+    /// **An unresolvable backend takes the default and does not report.** Both
+    /// backends requested at once is a real error and it is raised where it can
+    /// be acted on -- `backend_from_environment` in the daemon, and
+    /// `require_matching_backend` in the client. Choosing a timeout is not the
+    /// place to raise it a third time, and a timeout that returned a `Result`
+    /// would put that error in front of the one the user needs.
+    pub(crate) fn for_environment() -> Self {
+        let mut timeouts = Self::default();
+        if gascan_core::backend::backend_from_environment()
+            == Ok(gascan_core::backend::BackendSelection::Arca)
+        {
+            timeouts.readiness = gascan_core::backend::ENGINE_BACKED_DAEMON_READINESS;
+        }
+        timeouts
     }
 }
 
@@ -1934,7 +1962,7 @@ pub(crate) async fn start() -> Result<LifecycleOutcome, SupervisorError> {
         &crate::client::TonicEndpoint,
         &OsProcessInspector,
         &crate::client::TokioDaemonSpawner,
-        SupervisorTimeouts::default(),
+        SupervisorTimeouts::for_environment(),
     )
     .await
 }
@@ -1948,7 +1976,7 @@ pub(crate) async fn stop(force: bool) -> Result<LifecycleOutcome, SupervisorErro
         &OsProcessInspector,
         &OsAttestedProcessSignaler,
         StopMode::Explicit { force },
-        SupervisorTimeouts::default(),
+        SupervisorTimeouts::for_environment(),
     )
     .await
 }
@@ -1962,7 +1990,10 @@ pub(crate) async fn restart(force: bool) -> Result<LifecycleOutcome, SupervisorE
         &OsProcessInspector,
         &crate::client::TokioDaemonSpawner,
         &OsAttestedProcessSignaler,
-        ShutdownPolicy::new(StopMode::Explicit { force }, SupervisorTimeouts::default()),
+        ShutdownPolicy::new(
+            StopMode::Explicit { force },
+            SupervisorTimeouts::for_environment(),
+        ),
     )
     .await
 }
@@ -1977,7 +2008,7 @@ pub(crate) async fn connect_current_or_recover()
         &OsProcessInspector,
         &crate::client::TokioDaemonSpawner,
         &OsAttestedProcessSignaler,
-        SupervisorTimeouts::default(),
+        SupervisorTimeouts::for_environment(),
     )
     .await
 }
@@ -1996,7 +2027,7 @@ where
         &OsProcessInspector,
         &crate::client::TokioDaemonSpawner,
         &OsAttestedProcessSignaler,
-        SupervisorTimeouts::default(),
+        SupervisorTimeouts::for_environment(),
         observer,
     )
     .await

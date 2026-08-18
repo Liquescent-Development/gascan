@@ -36,6 +36,14 @@ use sha2::{Digest as _, Sha256};
 /// step for no gain.
 const PINNED: &str = include_str!("../../../engine/arca-pin.json");
 
+/// The mode every directory this module owns carries.
+///
+/// `0o700` and not the umask's answer, and it is the SAME value `gascand`'s
+/// `controller_state::DIRECTORY_MODE` requires and `packaging/macos/uninstall.sh`
+/// refuses to delete without. Those two are the consumers; this is the producer,
+/// and it was the only one of the three that did not name a mode.
+const PRIVATE_MODE: u32 = 0o700;
+
 /// What the pin says an artifact must be.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct Artifact {
@@ -169,28 +177,131 @@ impl From<io::Error> for ArtifactError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArtifactPaths {
     root: PathBuf,
+    /// The directories this instance may create or tighten, outermost first.
+    ///
+    /// **Enumerated and never derived by walking up from `root`.** A walk has
+    /// to know where to stop, and the only honest stopping rule is the one the
+    /// constructor already knows: `for_user` owns `dev.gascan` and its `engine`
+    /// child, and `under` owns exactly the directory it was handed. A first
+    /// version of this derived the chain by climbing until it saw a component
+    /// named `dev.gascan`, which for any other root climbed to `/` and set
+    /// about chmod'ing the filesystem.
+    owned: Vec<PathBuf>,
 }
 
 impl ArtifactPaths {
+    /// One directory, owned by the caller's choosing. Nothing above it is this
+    /// instance's to create or tighten.
     #[must_use]
     pub fn under(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            owned: vec![root.clone()],
+            root,
+        }
+    }
+
+    /// The production layout: `<support>/dev.gascan/engine`, owning both.
+    ///
+    /// `dev.gascan` is owned because on a machine where `gascan engine fetch`
+    /// runs before the first daemon start -- the documented order, since the
+    /// fetch is the doctor's remedy for a daemon that cannot start -- this is
+    /// what creates it, and `gascand` will refuse to start unless it is `0700`.
+    /// Above it, `Library` and `Application Support` are macOS's own.
+    #[must_use]
+    pub fn under_application_support(support: &Path) -> Self {
+        let container = support.join("dev.gascan");
+        let root = container.join("engine");
+        Self {
+            owned: vec![container, root.clone()],
+            root,
+        }
     }
 
     pub fn for_user() -> Result<Self, ArtifactError> {
         let home = crate::account::effective_account_home()
             .map_err(|error| ArtifactError::Io(io::Error::other(error.to_string())))?;
-        Ok(Self::under(
-            home.join("Library")
-                .join("Application Support")
-                .join("dev.gascan")
-                .join("engine"),
+        Ok(Self::under_application_support(
+            &home.join("Library").join("Application Support"),
         ))
     }
 
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Creates the artifact root, and every parent this crate owns, at `0700`.
+    ///
+    /// **`create_dir_all` alone was a defect, and it reached beyond this file.**
+    /// It applies the process umask, which is `022` on a default macOS host, so
+    /// the directories arrived `0755`. MEASURED on the machine this was written
+    /// on, after `gascan engine fetch` had run: `dev.gascan` and
+    /// `dev.gascan/controller` were `700` and `dev.gascan/engine` was `755`.
+    ///
+    /// Two consumers require exactly `0700` and neither repairs:
+    ///
+    /// - `gascand`'s `ensure_private_child_directory` `fchmod`s only a
+    ///   directory it CREATED, then validates the mode. So on a machine where
+    ///   `gascan engine fetch` ran before the first daemon start -- which is the
+    ///   documented order, since the fetch is the doctor's remedy for a daemon
+    ///   that cannot start -- `create_dir_all` makes `dev.gascan` itself `0755`
+    ///   and the daemon then refuses to start on EITHER backend, with a message
+    ///   that says "ownership, type, or mode is unsafe" and does not isolate
+    ///   which.
+    /// - `packaging/macos/uninstall.sh`'s private-child check requires `0700`
+    ///   and refuses otherwise with 65, after the controller and runtime data
+    ///   have already been removed.
+    ///
+    /// **It repairs as well as creates**, because every host that has already
+    /// run the fetch is in the broken state and nothing else will fix it. Only
+    /// a directory this account owns is tightened; anything else is an error
+    /// rather than a chmod of a path that is not ours. What it may touch at all
+    /// is the enumerated `owned` list and nothing above it.
+    pub fn prepare_private_root(&self) -> Result<(), ArtifactError> {
+        for path in &self.owned {
+            Self::create_or_tighten(path)?;
+        }
+        Ok(())
+    }
+
+    /// One directory at `0700`, created with that mode or tightened to it.
+    ///
+    /// `DirBuilder::mode` and not `create_dir_all` followed by
+    /// `set_permissions`: the latter leaves a window in which the directory
+    /// exists group- and world-readable, and this is the directory a kernel
+    /// image is about to be written into.
+    fn create_or_tighten(path: &Path) -> Result<(), ArtifactError> {
+        use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+
+        match std::fs::DirBuilder::new().mode(PRIVATE_MODE).create(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(ArtifactError::Io(error)),
+        }
+
+        // `symlink_metadata` and not `metadata`: a symlink planted here would
+        // otherwise be followed, and the mode reported would be the target's.
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.is_dir() {
+            return Err(ArtifactError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a directory", path.display()),
+            )));
+        }
+        if metadata.uid() != rustix::process::getuid().as_raw() {
+            return Err(ArtifactError::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} is owned by uid {} and not by this account",
+                    path.display(),
+                    metadata.uid()
+                ),
+            )));
+        }
+        if metadata.permissions().mode() & 0o7777 != PRIVATE_MODE {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(PRIVATE_MODE))?;
+        }
+        Ok(())
     }
 
     /// The uncompressed kernel, which is what `GASCAN_ARCA_KERNEL_PATH` names.
@@ -430,14 +541,21 @@ pub fn fetch<R: ToolRunner>(
     pin: &Pin,
     runner: &R,
 ) -> Result<Fetched, ArtifactError> {
-    std::fs::create_dir_all(paths.root())?;
+    paths.prepare_private_root()?;
     let staging = paths.root().join(".staging");
     // A leftover staging directory is from a run that was killed rather than
     // one that failed, since every failure below removes it. It is discarded
     // rather than resumed: resuming would mean trusting bytes whose provenance
     // this run cannot establish.
     let _ = std::fs::remove_dir_all(&staging);
-    std::fs::create_dir_all(&staging)?;
+    // The staging directory holds unverified bytes and is private for the same
+    // reason its parent is.
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .mode(PRIVATE_MODE)
+            .create(&staging)?;
+    }
 
     let result = fetch_into(&staging, paths, pin, runner);
     let _ = std::fs::remove_dir_all(&staging);

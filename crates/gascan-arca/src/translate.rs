@@ -781,11 +781,21 @@ mod tests {
             loopback_publish: false,
             resource_limits: false,
             offline: v1::Isolation::Proven as i32,
-            // Empty, because nothing reads it yet and a plausible-looking
-            // revision here would be a claim this test does not make. Field 20
-            // arrived with the schema-2 pin; the certified-revision comparison
-            // that turns it into a Proven/Unverified verdict is still to come,
-            // and the tests that earn it belong with it rather than here.
+            // **Empty deliberately, and it is an input to the gate rather
+            // than a placeholder.** An engine whose build-info generator is
+            // broken reports exactly this, and `certified_isolation` must
+            // refuse it through the same comparison every other revision takes
+            // -- `None` equals nothing, and a `Some` constant is 40 hex
+            // characters the empty string cannot equal. That is what
+            // `an_uncertified_engine_cannot_claim_proven_and_its_refusals_are_left_alone`
+            // exercises below.
+            //
+            // CORRECTED: this comment used to say "nothing reads it yet" and
+            // that the certified-revision comparison was "still to come". Both
+            // were false in the tree the comment shipped in -- the gate is
+            // `certified_isolation` in this file, its call site is in
+            // `runtime_capabilities` in this file, and the test that earns it
+            // is forty lines below this line.
             build_revision: String::new(),
         }
     }

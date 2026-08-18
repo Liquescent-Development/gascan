@@ -267,7 +267,11 @@ async fn run(
     };
     match selection {
         BackendSelection::Apple => {
-            let doctor = DoctorState::refreshing(Duration::from_secs(60), production_doctor_report);
+            let doctor = DoctorState::refreshing(
+                Duration::from_secs(60),
+                &AppleRemedies,
+                production_doctor_report,
+            );
             let attach = gascan_apple::AppleAttach::configured_from_environment()?;
             let runner = E2eProcessRunner::configured_from_environment()?;
             run_daemon(
@@ -347,7 +351,7 @@ async fn run(
             let doctor = {
                 let transport = transport.clone();
                 let engine_binary = launch.executable.clone();
-                DoctorState::refreshing(Duration::from_secs(60), move || {
+                DoctorState::refreshing(Duration::from_secs(60), &ArcaRemedies, move || {
                     arca_doctor_report(transport.clone(), engine_binary.clone())
                 })
             };
