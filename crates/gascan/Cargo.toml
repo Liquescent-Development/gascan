@@ -30,5 +30,6 @@ tower.workspace = true
 workspace = true
 
 [dev-dependencies]
+sha2.workspace = true
 rustix-openpty = "0.2"
 tempfile = "3"

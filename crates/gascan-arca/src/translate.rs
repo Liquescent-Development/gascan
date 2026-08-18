@@ -310,7 +310,7 @@ pub(crate) fn missing_outcome(operation: &str) -> RuntimeError {
 /// gets built; this says which engine has been proven. They are the same value
 /// only when the proof was run against the pinned build, and conflating them
 /// would make every pin bump silently re-certify.
-pub(crate) const CERTIFIED_ENGINE_REVISION: Option<&str> = None;
+pub(crate) const CERTIFIED_ENGINE_REVISION: Option<&'static str> = None;
 
 /// Decides whether the engine's own `Proven` is worth believing.
 ///

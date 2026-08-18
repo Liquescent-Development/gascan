@@ -97,6 +97,15 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// The engine's boot artifacts.
+    ///
+    /// A subcommand group rather than a top-level `fetch`, because "fetch" on
+    /// its own says nothing about what is fetched, and this is where later
+    /// engine operations belong.
+    Engine {
+        #[command(subcommand)]
+        command: EngineCommand,
+    },
     Ssh {
         #[arg(last = true)]
         argv: Vec<OsString>,
@@ -109,6 +118,16 @@ enum Command {
         #[command(subcommand)]
         command: Option<ConfigureCommand>,
     },
+}
+
+#[derive(Subcommand)]
+enum EngineCommand {
+    /// Download and verify the engine's kernel and vminit artifacts.
+    ///
+    /// **Never runs implicitly.** An ~83MB download must not surprise someone
+    /// who typed `gascan up`, so nothing else invokes this: `gascan doctor`
+    /// reports the artifacts as missing and names this command as the remedy.
+    Fetch,
 }
 
 #[derive(Subcommand)]
@@ -431,6 +450,14 @@ pub async fn execute() -> Result<i32, CliError> {
     if let Command::SshConfig { command } = arguments.command {
         return execute_ssh_config(command);
     }
+    // Handled BEFORE the daemon connection, and deliberately so. Fetching the
+    // engine's artifacts is a purely local operation against this user's own
+    // directory, and it is exactly what someone runs when the daemon cannot
+    // start -- because its engine has no kernel. Requiring a daemon here would
+    // make the remedy depend on the thing it repairs.
+    if let Command::Engine { command } = &arguments.command {
+        return execute_engine(command);
+    }
     let configure_io = if let Command::Configure { command } = &arguments.command {
         let io = TerminalPrompter::new().map_err(configure_cli_error)?;
         preflight_configure(command, io.stdin_is_terminal(), io.stderr_is_terminal())?;
@@ -445,6 +472,8 @@ pub async fn execute() -> Result<i32, CliError> {
     match arguments.command {
         Command::DaemonAttest => Ok(0),
         Command::Daemon { .. } => Ok(0),
+        // Returned above, before the daemon connection.
+        Command::Engine { .. } => Ok(0),
         Command::Configure { command } => {
             let io = configure_io.ok_or_else(|| {
                 CliError::Runtime("configuration terminal was not initialized".to_owned())
@@ -912,6 +941,32 @@ fn daemon_command_uses_json(command: &DaemonCommand) -> bool {
     }
 }
 
+/// `gascan engine fetch`.
+///
+/// Prints where each artifact landed, because the two environment variables the
+/// live tier reads -- `GASCAN_ARCA_KERNEL_PATH` and `GASCAN_ARCA_VMINIT_LAYOUT`
+/// -- are undefaulted, so the paths are what a caller has to know next.
+fn execute_engine(command: &EngineCommand) -> Result<i32, CliError> {
+    let EngineCommand::Fetch = command;
+    let pin = gascan_core::engine_artifacts::Pin::compiled_in()
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
+    let paths = gascan_core::engine_artifacts::ArtifactPaths::for_user()
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
+    let fetched = gascan_core::engine_artifacts::fetch(
+        &paths,
+        &pin,
+        &gascan_core::engine_artifacts::SystemTools,
+    )
+    .map_err(|error| CliError::Runtime(error.to_string()))?;
+    println!(
+        "engine artifacts verified against {} ({})",
+        pin.tag, pin.revision
+    );
+    println!("kernel: {}", fetched.kernel.display());
+    println!("vminit: {}", fetched.vminit.display());
+    Ok(0)
+}
+
 fn command_uses_json(command: &Command) -> bool {
     match command {
         Command::Up { json, .. }
@@ -923,6 +978,7 @@ fn command_uses_json(command: &Command) -> bool {
         | Command::Doctor { json } => *json,
         Command::Daemon { command } => daemon_command_uses_json(command),
         Command::DaemonAttest
+        | Command::Engine { .. }
         | Command::Shell { .. }
         | Command::Run { .. }
         | Command::Logs { .. }

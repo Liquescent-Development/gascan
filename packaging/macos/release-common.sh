@@ -10,6 +10,10 @@ gascan_user_controller_root() {
   printf '%s/Library/Application Support/dev.gascan/controller\n' "$HOME"
 }
 
+gascan_user_engine_root() {
+  printf '%s/Library/Application Support/dev.gascan/engine\n' "$HOME"
+}
+
 gascan_verify_release_source() {
   local repo=$1 revision=$2 version=$3 tag object_type target
   git -C "$repo" verify-commit "$revision" >/dev/null 2>&1 && return 0

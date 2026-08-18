@@ -107,6 +107,57 @@ fn create_outcome(
     }
 }
 
+/// What the engine says about itself, alongside what it can do.
+///
+/// `RuntimeCapabilities` deliberately carries no revision: the certification
+/// gate resolves inside this crate and the revision never needs to leave it for
+/// normal operation. `gascan doctor` is the exception -- it has to EXPLAIN why
+/// offline sandboxes are refused, and "this engine build is not the certified
+/// one" is unsayable without the value. So it is exposed here, once, for that
+/// purpose, rather than widening the type every consumer uses.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EngineReport {
+    pub capabilities: RuntimeCapabilities,
+    pub build_revision: String,
+}
+
+/// The engine build whose network isolation has been observed.
+///
+/// `None` until the offline evidence exists. Exposed so `gascan doctor` can
+/// name the revision it is comparing against instead of reporting an
+/// unexplained refusal.
+#[must_use]
+pub const fn certified_engine_revision() -> Option<&'static str> {
+    translate::CERTIFIED_ENGINE_REVISION
+}
+
+impl<T: EngineTransport> ArcaBackend<T> {
+    /// Capabilities and the engine's own revision, from ONE call.
+    ///
+    /// One call and not two, because the two answers must describe the same
+    /// engine: separate calls could straddle an engine restart and report a
+    /// revision that has nothing to do with the flags beside it.
+    pub async fn engine_report(&self) -> Result<EngineReport, RuntimeError> {
+        let response = self
+            .transport
+            .capabilities(v1::CapabilitiesRequest {})
+            .await
+            .map_err(TransportError::into_runtime_error)?;
+        match response.outcome {
+            Some(v1::capabilities_response::Outcome::Capabilities(capabilities)) => {
+                Ok(EngineReport {
+                    capabilities: translate::runtime_capabilities(&capabilities)?,
+                    build_revision: capabilities.build_revision,
+                })
+            }
+            Some(v1::capabilities_response::Outcome::Error(error)) => {
+                Err(error::engine_error("capabilities", &error))
+            }
+            None => Err(translate::missing_outcome("capabilities")),
+        }
+    }
+}
+
 #[async_trait]
 impl<T: EngineTransport> RuntimeBackend for ArcaBackend<T> {
     async fn capabilities(&self) -> Result<RuntimeCapabilities, RuntimeError> {

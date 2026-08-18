@@ -132,6 +132,28 @@ gascan_uninstall_remove_controller_data() {
   }
 }
 
+# The engine's fetched boot artifacts. Removed under --remove-data with the
+# other per-user state, and through the same guarded helper the controller
+# directory uses: it refuses a path that is not an absolute private child of
+# $HOME owned by this uid, which is what keeps an `rm -rf` of ~83MB from ever
+# being pointed somewhere else by a hostile HOME.
+#
+# The cask's `uninstall delete:` list is deliberately NOT extended. It does not
+# remove per-user state today, and making the artifacts the one exception would
+# mean a `brew uninstall` silently deleted a download the user would have to
+# repeat.
+gascan_uninstall_remove_engine_data() {
+  local expected_uid=$1 engine_root engine_parent status
+  engine_root=$(gascan_user_engine_root)
+  engine_parent=${engine_root%/engine}
+  gascan_uninstall_remove_absolute_private_child \
+    "$engine_parent" engine "$expected_uid" "$HOME" true || {
+    status=$?
+    [[ $status == 2 ]] && return 0
+    return "$status"
+  }
+}
+
 gascan_uninstall_remove_runtime_data() {
   local expected_uid=$1 runtime_parent runtime_root runtime_child user_base status
   if [[ -n ${XDG_RUNTIME_DIR:-} ]]; then
@@ -212,6 +234,7 @@ if [[ $remove_data == true ]]; then
   expected_uid=$(id -u)
   gascan_uninstall_remove_runtime_data "$expected_uid" || exit $?
   gascan_uninstall_remove_controller_data "$expected_uid" || exit $?
+  gascan_uninstall_remove_engine_data "$expected_uid" || exit $?
 fi
 sudo rm -f \
   /usr/local/bin/gascan \

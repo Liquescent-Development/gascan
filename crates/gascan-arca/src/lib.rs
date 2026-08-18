@@ -15,6 +15,6 @@ mod error;
 mod translate;
 mod transport;
 
-pub use backend::ArcaBackend;
+pub use backend::{ArcaBackend, EngineReport, certified_engine_revision};
 pub use channel::ChannelTransport;
 pub use transport::{EngineTransport, ExecStream, LogsStream, TransportError};

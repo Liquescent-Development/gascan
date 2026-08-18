@@ -4,6 +4,7 @@
 pub mod account;
 pub mod backend;
 pub mod doctor;
+pub mod engine_artifacts;
 pub mod fake_runtime;
 pub mod gascamp;
 pub mod hex;

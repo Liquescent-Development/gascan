@@ -676,13 +676,13 @@ async fn arca_doctor_report(
         )),
     };
 
-    // The artifact digests are NOT verified here. Recording them as passing
-    // would be a claim with no instrument; recording them as unknown would make
-    // the daemon permanently unready and the backend unusable. A warning is
-    // what is actually true: unverified.
-    facts.kernel = DoctorFact::warning(
-        "engine boot artifacts are not verified against engine/arca-pin.json by this build",
-    );
+    // The kernel fact is the artifacts' digest check, not a presence check.
+    // A doctor that only looked for the files would report a moved pin, a
+    // truncated download and a corrupted one all as healthy -- which is the
+    // entire class of failure the digests exist to catch. It runs the SAME
+    // verification the fetch runs, deliberately, so the two cannot disagree
+    // about whether what is installed is usable.
+    facts.kernel = engine_artifact_fact();
     // `Capabilities` carries no state-root field, so this daemon cannot measure
     // the engine's disk. Saying so is better than measuring a directory Gas Can
     // chose and calling it the engine's.
@@ -691,18 +691,80 @@ async fn arca_doctor_report(
     facts.image_storage =
         DoctorFact::warning("the engine does not report its image filesystem over the contract");
 
-    match gascan_core::runtime::RuntimeBackend::capabilities(&gascan_arca::ArcaBackend::new(
-        transport,
-    ))
-    .await
+    match gascan_arca::ArcaBackend::new(transport)
+        .engine_report()
+        .await
     {
-        Ok(capabilities) => apply_engine_capabilities(&mut facts, &capabilities),
+        Ok(report) => {
+            apply_engine_capabilities(&mut facts, &report.capabilities);
+            facts.version = engine_revision_fact(&report.build_revision);
+        }
         Err(error) => {
             facts.service =
                 DoctorFact::fail(format!("the engine did not answer Capabilities: {error}"));
         }
     }
     facts.into_report(&ArcaRemedies)
+}
+
+/// Are the engine's boot artifacts installed and still what the pin describes?
+///
+/// The remedy names `gascan engine fetch` in every failing case, which is the
+/// pattern the product already uses for a prerequisite the installer cannot
+/// satisfy. It is a per-fact remedy rather than the backend default because it
+/// is specific to what was observed: a missing artifact and a moved pin need
+/// the same command but the user should be told which happened.
+fn engine_artifact_fact() -> DoctorFact {
+    use gascan_core::engine_artifacts::{ArtifactError, ArtifactPaths, Pin};
+    let pin = match Pin::compiled_in() {
+        Ok(pin) => pin,
+        // Not reachable through a released binary -- a malformed pin fails this
+        // crate's own tests -- but reported rather than unwrapped, because this
+        // is the command a user reaches for when nothing else works.
+        Err(error) => return DoctorFact::fail(error.to_string()),
+    };
+    let paths = match ArtifactPaths::for_user() {
+        Ok(paths) => paths,
+        Err(error) => return DoctorFact::fail(error.to_string()),
+    };
+    match gascan_core::engine_artifacts::verify_installed(&paths, &pin) {
+        Ok(()) => DoctorFact::pass(format!(
+            "engine artifacts under {} match {}",
+            paths.root().display(),
+            pin.tag
+        )),
+        Err(ArtifactError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            DoctorFact::fail(format!(
+                "engine artifacts are not installed under {}",
+                paths.root().display()
+            ))
+            .with_remedy("run `gascan engine fetch`")
+        }
+        Err(error) => DoctorFact::fail(error.to_string())
+            .with_remedy("run `gascan engine fetch` to reinstall the artifacts this build expects"),
+    }
+}
+
+/// The engine's revision against the one whose isolation has been proven.
+///
+/// **This is what makes an `offline: UNVERIFIED` legible rather than
+/// mysterious.** Without it a user sees offline sandboxes refused and has no
+/// way to tell a stale engine build from a capability the engine lacks.
+fn engine_revision_fact(build_revision: &str) -> DoctorFact {
+    let certified = gascan_arca::certified_engine_revision();
+    match certified {
+        Some(certified) if certified == build_revision => DoctorFact::pass(format!(
+            "engine build {build_revision} is the certified revision"
+        )),
+        Some(certified) => DoctorFact::warning(format!(
+            "engine build {build_revision} is not the certified revision {certified}, \
+             so offline sandboxes are refused"
+        )),
+        None => DoctorFact::warning(format!(
+            "engine build {build_revision} cannot be certified: this Gas Can build records no \
+             proven engine revision, so offline sandboxes are refused"
+        )),
+    }
 }
 
 /// Turns one `Capabilities` answer into the runtime facts.
@@ -718,10 +780,10 @@ fn apply_engine_capabilities(
 ) {
     use gascan_core::runtime::NetworkIsolation;
     facts.service = DoctorFact::pass("the engine answered Capabilities on its socket");
-    facts.version = DoctorFact::pass(format!(
-        "engine reports version {}.{}.{}",
-        capabilities.version.major, capabilities.version.minor, capabilities.version.patch
-    ));
+    // `version` is NOT set here. The caller sets it from the engine's
+    // REVISION, because `ArcaVersion.version` is Arca's product string and does
+    // not move per engine change -- two materially different engine builds are
+    // indistinguishable by it, which is exactly why field 20 exists.
     // The contract is what this client and that engine agree on, and the engine
     // answering a request this build encoded is the evidence for it. There is
     // no second source to cross-check against, and inventing one would be the
