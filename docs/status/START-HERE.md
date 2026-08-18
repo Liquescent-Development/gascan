@@ -124,40 +124,68 @@ real, unfixed, and narrow the reproducibility claim until they are done.
 
 ### THE ONE THING TO DO NEXT
 
-**Fix the daemon instance record's publish race — open item 1 below.** The maintainer chose it
-on 2026-08-18 in preference to anything else on the list. It is the highest-value item because
-it is the only one that costs every full-suite run, its shape is already proven by the fixture
-fix that shipped, and it is contained.
+**DONE, on a branch, not yet merged — `fix/daemon-instance-publish-race`.** Verify the head with
+`git log -1` and `git ls-remote`; do not trust a SHA written here. Open item 1 below now records
+what is left rather than what to do, and **what is left is real** — see its residual section.
 
-Everything else on the list is carried state, not an assignment.
+**The next assignment is the maintainer's to choose, and this file does not choose it.** The
+list below is carried state. If you want a recommendation: item 1's residual (`retire_held_record`
+still walks the destination through 0200-with-content, the last in-tree producer of the state
+this milestone removed from `gascand`) is the natural continuation and is contained; item 2c is
+the one that needs a decision rather than an implementation, and **must not be decided alone**.
 
 ### WHAT IS OPEN
 
-1. **THE DAEMON INSTANCE RECORD HAS A PUBLISH RACE, AND IT IS THE MOST EXPENSIVE THING IN THE
-   TEST LOOP.** `write_instance_record` (`crates/gascand/src/socket.rs`) does `write_all`, then
-   `sync_all`, then `fchmod(0600)`. Across that fsync the file is mode 0200 **with content** —
-   which `crates/gascan/src/daemon.rs`'s `validate_file_stat` classifies as "written but never
-   published", a terminal `PermissionDenied`, while the daemon is alive and about to publish.
-   The 2026-08-07 comment there says 0200-with-content "never becomes 0600 on its own"; that is
-   false, and it is the whole defect.
+1. **THE DAEMON INSTANCE RECORD'S PUBLISH RACE IS FIXED, ON A BRANCH. WHAT REMAINS IS THE
+   READER'S HALF, AND IT IS NOT FIXED.**
 
-   **PROBED DETERMINISTICALLY** through the existing `before_descriptor_commit` hook (a
-   temporary test, since reverted): `mode=0200 size=9 nlink=1`. It failed **five** workspace
-   runs on 2026-08-18 — the fifth on merged `main` at `8417070`, in
-   `doctor_recovers_after_atomic_installed_daemon_replacement` — each in a different test, each
-   time in code that session's diff did not touch, and each time passing in isolation (2/2 both
-   times). **This is why the suite needs diff-plus-isolation exoneration.**
+   **What it was.** `write_instance_record` (`crates/gascand/src/socket.rs`) created the record
+   at its final path inert — 0200, empty — wrote the content, `sync_all`-ed, then chmod-ed to
+   0600. Across that fsync the path was mode 0200 **with content**, which
+   `crates/gascan/src/daemon.rs`'s `validate_file_stat` calls "written but never published" and
+   `inspect_with` turns into `DaemonState::Unsafe`. Retirement had the mirror-image bug: `Drop`
+   chmod-ed to 0200 and then truncated, walking out through the same state.
 
-   **THE MAINTAINER LEFT THIS FOR YOU, DELIBERATELY, ON 2026-08-18.** It is the first open item
-   because it is the highest-value one. The fix is contained and the shape is already proven:
-   `DelayedPublicationSpawner` in `crates/gascan/src/daemon.rs` had the same write-then-chmod
-   race and was fixed by staging beside the path and renaming, which is atomic. The production
-   publisher wants the equivalent — publish by rename, or keep the file inert until it is whole
-   — plus the `validate_file_stat` comment corrected, since it asserts 0200-with-content "never
-   becomes 0600 on its own" and that is the false premise the whole defect rests on.
+   **MEASURED**, one polling observer against 2000 publish-and-retire cycles, in a temporary
+   probe not retained in the tree: the original showed 0200-with-content **12,131,645 of
+   24,438,995 samples — about half of every sample taken**; with publication renamed, **6,812 of
+   31,664,387**, all of it retirement; with both renamed, **0 of 47,124,057**. Both are now
+   staged under a private name and renamed into place, which is what `SocketPaths::bind` in that
+   same file already did for the socket. The bounded 64-cycle form of that probe is committed as
+   `no_reader_ever_sees_an_illegal_state_across_start_and_stop`.
 
-   **Verify by mutation**, the project's rule: widening the window with a sleep reproduced the
-   fixture case deterministically, and the same technique will reproduce this one.
+   **THE HEADLINE CORRECTION, AND DO NOT LOSE IT: THE PATH IS NOT DOWN TO THREE FACES.** A first
+   draft of the `validate_file_stat` comment claimed it was, and two independent reviewers caught
+   it. `gascan`'s own reclaim, `retire_held_record` (`crates/gascan/src/daemon.rs:1453-1455`),
+   still does `fchmod(0200)` then `ftruncate(0)` on a **published** record that
+   `validate_held_published_record` has just proven is still linked at the destination. So the
+   destination still goes 0600-with-content → **0200-with-content** → 0200-empty on the
+   `recover_stale_published_record` path — the ordinary "previous daemon was SIGKILLed, next
+   `gascan start` cleans up" path. And `inspect` (`daemon.rs:1966`) takes **no** lifecycle lock
+   while `start_with` (`:1171`) does, so a concurrent `gascan status` can still sample it.
+
+   It is two syscalls wide rather than an `fsync`, and the record there has been proven dead
+   twice over, so the verdict it produces is unflattering rather than false. **That is why it was
+   not folded into the same change**: `validate_retired_tombstone` (`:1548`) requires the held
+   descriptor's inode to still be *at the name* and requires `st_nlink == 1`, and a rename
+   unlinks it — so staging-and-renaming there means rewriting that validation against the new
+   tombstone rather than the old descriptor. That is a design change to the reclaim protocol, not
+   a mechanical one.
+
+   **Also true, and also not fixed: the reader has no retryable verdict.** Every disagreement
+   between two of its observations is terminal. `validate_instance_tombstone`
+   (`daemon.rs:2842-2880`) re-opens the tombstone by name and returns a terminal
+   `PermissionDenied` if a successor published in between; `open_published_record` (`:2611`)
+   reports a legitimate concurrent *stop* as `Unsafe`. Both are pre-existing and both are now
+   narrower — a rename rather than an fsync — but the shape is unchanged: **every narrow window
+   is a terminal verdict waiting for a loaded machine.**
+
+   **One window was introduced by the fix and is benign today:** `clear_inert_destination` unlinks
+   the tombstone, so `daemon.rs:2852` can now return `ENOENT` where it could not before.
+   `read_instance_record_for_inspection` maps `NotFound` to `Ok(None)`, so `inspect_with` is
+   unaffected; only `read_attested_instance` (`:937`) propagates it, and that has no non-test
+   callers yet. **It will matter when Task 6 wires it.**
+
 2. **(2c) A PRODUCTION STDERR DESTINATION FOR THE DAEMON IS STILL DEFERRED**, as its own
    decision with a privacy dimension — a daemon log holds sandbox names, project paths and
    guest output. (2a) and (2b) have landed, which was the precondition. Raise it with the
@@ -177,6 +205,23 @@ Everything else on the list is carried state, not an assignment.
 7. **One untested ordering, labelled as such in the code**: in `crates/gascand/src/engine.rs`,
    swapping the exit-status and timeout checks leaves the supervisor suite green.
 8. **A pre-existing stash is on the stack and is not ours.** Leave it.
+9. **SIX FILE-PROTOCOL VALUES ARE DECLARED INDEPENDENTLY IN BOTH CRATES, AND ONE OF THEM DOES
+   NOT EVEN SHARE A NAME.** Found by review on 2026-08-18. `DIRECTORY_MODE` 0o700
+   (`gascand/src/socket.rs:14`, `gascan/src/daemon.rs:16`); 0o600, which is `SOCKET_MODE` in one
+   (`socket.rs:15`) and `FILE_MODE` in the other (`daemon.rs:17`) — **which is how a duplicate
+   survives review: nothing greps it up**; `INSTANCE_TOMBSTONE_MODE` 0o200 (`:16`, `:18`);
+   `SOCKET_NAME` (`:17`, `:19`); `INSTANCE_NAME` (`:18`, `:20`); `LIFECYCLE_LOCK_NAME` (`:19`,
+   `:21`).
+
+   The publish-race fix **makes this mildly worse**, and that is worth stating plainly: it adds a
+   stronger unwritten rule — the instance path shows exactly three faces — asserted by a test in
+   `gascand` and consumed by a classifier in `gascan`, with nothing mechanically connecting them.
+   Change `gascan`'s `INSTANCE_TOMBSTONE_MODE` and `gascand`'s tests still pass while the
+   classification silently breaks, which is the exact failure that cost five workspace runs.
+
+   `crates/gascan-core` is already a path dependency of **both** (`gascan/Cargo.toml:15`,
+   `gascand/Cargo.toml:10`), so the shared home exists and costs no new crate. **Its own commit**
+   — folding it into a fix buries the fix under a cross-crate move.
 
 ### WHAT WAS RUN, AND WHAT CI DOES WITH IT
 
@@ -215,7 +260,7 @@ survives a check — the check has to touch the thing that decides, and here CI 
 **Do not make that job green by deleting tests, and do not try to select a subset — there is no
 subset that runs on the binary alone.** It needs a runner with the artifacts.
 
-### SEVEN THINGS THAT WILL COST A SUCCESSOR REAL TIME
+### EIGHT THINGS THAT WILL COST A SUCCESSOR REAL TIME
 
 1. **`ps -A` CANNOT ENUMERATE THE PROCESS TABLE ON THIS HOST.** Measured: 31 entries against
    `launchctl list`'s 544, and it omits even the calling shell. **No `ps | grep` absence check
@@ -240,8 +285,10 @@ subset that runs on the binary alone.** It needs a runner with the artifacts.
    reviewers went idle without ever delivering a reply, and **all four files survived**. The
    file is the deliverable; the reply is not.
 6. **NEVER RUN THE WORKSPACE SUITE BESIDE ANOTHER CARGO OR CONTRACT JOB**, and note that a
-   solo run is internally parallel too — see open item 2, which is why. Exonerate by diff PLUS
-   isolation, never by probability.
+   solo run is internally parallel too — see open item 1, which is why. Exonerate by diff PLUS
+   isolation, never by probability. **Corrected 2026-08-18: this said "open item 2", which is the
+   deferred stderr destination. The race is open item 1. Trap 8 below carried the same wrong
+   pointer, and the heading above said SEVEN over a list of eight.**
 7. **A REVIEW'S SCOPE IS NOT THE PR'S SCOPE UNLESS SOMEONE CHECKED.** Arca's landing review
    covered `5e11704..4134b54`; three commits landed after it, one of them ~4,600 lines of
    kernel recipe, and no review had covered them until one was run before merging. Check what a
@@ -251,9 +298,16 @@ subset that runs on the binary alone.** It needs a runner with the artifacts.
    `set_permissions(0o600)` from a spawned thread, and `fs::write` creates at the umask, so the
    readiness poller could see the record at **0644** and report `Readiness { state: Unsafe }`,
    which is terminal. REPRODUCED deterministically by widening the window with a 20ms sleep.
-   Fixed by staging and renaming. **The production publisher has the same shape** — see open
-   item 2 — and the two other spawner fixtures do not, because they run synchronously inside
-   `spawn()` before any poller starts.
+   Fixed by staging and renaming. ~~**The production publisher has the same shape** — see open
+   item 2~~ — **it did, and it was fixed the same way on 2026-08-18; see open item 1. The
+   pointer said item 2, which is a different item.** The two other spawner fixtures do not have
+   the shape, because they run synchronously inside `spawn()` before any poller starts.
+
+   **The fixture's own comment claimed its rename was "what the production publisher achieves by
+   creating the file inert and chmod-ing it last." It was not.** Chmod-ing last still showed
+   content at the published path for the length of an `fsync`; the comment credited production
+   with a safety it did not have. Corrected in place. **A fixture comment that describes
+   production is a claim about code it cannot see, and this one was wrong for eleven days.**
 
 ### THE LIVE TIER'S ENVIRONMENT, AND THE DAEMON'S IS THREE
 
@@ -687,6 +741,16 @@ is the same reading that identified D7: different tests, one crate, one load con
 | 2 | `daemon_kill_and_restart_preserve_runtime_truth` | `state Unsafe: interrupted daemon instance descriptor changed while opening it` |
 | 3 | `no_sandbox_status_error_is_actionable_and_keeps_usage_exit` | `left: Some(70), right: Some(64)` — a daemon that failed to start, so the CLI returned the wrong exit code |
 | 4 | `accepted_socket_without_http2_cannot_block_initial_probe` | `panicked at crates/gascan-e2e/tests/autostart.rs:809:5: exit code 70` — 2026-08-16 (late), the fourth distinct test and the second to surface a bare exit 70 |
+
+**UPDATED 2026-08-18: runs 1 and 2 are attributed and their cause is fixed; runs 3 and 4 are
+NOT, and this fix must not absorb credit it has not earned.** Run 1 is the publish race
+directly. Run 2 is the same defect seen through a different door: "interrupted daemon instance
+descriptor changed while opening it" is `crates/gascan/src/daemon.rs:2732`, inside
+`open_interrupted_tombstone`, which is reachable **only** when the path is 0200-with-content —
+so making that state unreachable from `gascand` closes it. Runs 3 and 4 remain unattributed;
+both are bare exit 70 from a daemon that failed to start, and nothing measured this session ties
+them to this defect. **If a workspace run goes red on either of those two tests again, it is not
+this defect and the trap note below still applies to it.**
 
 `git diff e9468d8..HEAD -- crates/gascan-e2e/ crates/gascan/ crates/gascand/` is **empty** and
 nothing is uncommitted in those crates, so the branch cannot have caused any of them. Each target

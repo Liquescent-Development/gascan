@@ -3194,16 +3194,32 @@ fn file_identity_at(
 /// first, and `gascand` binds its socket before it writes this record — so what
 /// the race produced was a false terminal verdict, not a truncated record.
 /// MEASURED with a polling observer over 2000 start-and-stop cycles: 12,131,645
-/// samples in that state, roughly half of all samples taken. It cost five
-/// workspace runs and one CI run before it was named.
+/// samples in that state, roughly half of all samples taken. That probe was a
+/// temporary harness and is not in the tree; the bounded test that replaced it,
+/// `no_reader_ever_sees_an_illegal_state_across_start_and_stop` in
+/// `crates/gascand/src/socket.rs`, runs 64 cycles rather than 2000.
 ///
 /// `crates/gascand/src/socket.rs` now builds both the record and the tombstone
-/// under a private name and renames them into place, so this path shows only
-/// three faces: absent, the inert tombstone, and the whole record. The same
-/// observer over the same 2000 cycles saw 0200-with-content 0 times. The
-/// classification below is therefore right about what it means again — an
-/// interrupted publication really is a corpse — and it is reachable only from a
-/// daemon that died mid-publish or from one older than that change.
+/// under a private name and renames them into place, so **`gascand`** shows
+/// this path only three faces: absent, the inert tombstone, and the whole
+/// record. The same observer over the same 2000 cycles saw 0200-with-content 0
+/// times.
+///
+/// **The path is not thereby down to three faces, and an earlier draft of this
+/// comment claimed it was.** `retire_held_record` above, at the `fchmod` and
+/// `ftruncate` at `daemon.rs:1453-1455`, still walks a *published* record
+/// through 0200-with-content in place — and `validate_held_published_record`
+/// has just proven that descriptor is still linked at the destination, so the
+/// state is on the path, not off it. `inspect` takes no lifecycle lock while
+/// `start_with` does, so a concurrent reader can still sample it. Two syscalls
+/// wide rather than an `fsync`, and the record there has been proven dead
+/// twice over, so the verdict it produces is unflattering rather than false —
+/// but it is the last in-tree producer and it is not fixed.
+///
+/// So the reachable producers are: `retire_held_record`, and a `gascand` older
+/// than the change above. **Not** a daemon that dies mid-publish — under the
+/// new publisher that leaves the destination absent and the half-written record
+/// under a staging name, which is a different failure with a different cure.
 ///
 /// Size is therefore reported in every case, because it is the field that
 /// separates them and its absence made a CI failure unattributable.
