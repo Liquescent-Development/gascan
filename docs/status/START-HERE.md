@@ -163,16 +163,27 @@ only the engine can judge.**
       failures reachable without it; this is about everything after startup, and it is a
       separate decision with a privacy dimension. **Do not fold it into (a) or (b).**
 
-3. **~60 deferred Minor findings** with rulings in the ledger, plus the minors in this
+3. **BOTH PULL REQUESTS ARE OPEN AS DRAFTS AND THEIR TITLES DESCRIBE LANDING 1 ONLY.**
+   Gas Can **#77**, "P5.1 milestone 4: design, plan, and landing 1's Gas Can half"; Arca
+   **#59**, "P5.1 milestone 4, landing 1: the engine's half (tasks 1-4 of 7)". The Gas Can
+   branch now carries all fifteen tasks and the whole-landing review, so both the title and
+   the body are wrong about their own contents. **Arca's branch did not move this milestone
+   past `e14be74`** — check whether #59 has anything left to say before merging it. Neither
+   may be taken out of draft until its description matches what it contains, and the milestone
+   acceptance requires both to be reviewed **synchronously** and merged as **true merge
+   commits** (`git rev-list --parents -n1` returns three SHAs; `allowed_merge_methods` is
+   `["merge"]`, never squash).
+
+4. **~60 deferred Minor findings** with rulings in the ledger, plus the minors in this
    session's four review files (see below). The two the previous whole-landing review said to
    fix before Landing 2 publishes — Task 6 M3 and Task 7 O1 — are **still open**.
-4. **A guest that refuses at boot is loud in the guest and silent to the host** — `Start`
+5. **A guest that refuses at boot is loud in the guest and silent to the host** — `Start`
    never returns and the only diagnostic is in `bootlog.log`. Worth its own task.
-5. **The guest-side ordering instrument** at `.superpowers/sdd/.../carry-layer_report-live-test.rs`
+6. **The guest-side ordering instrument** at `.superpowers/sdd/.../carry-layer_report-live-test.rs`
    is **git-ignored**. Land it in Gas Can's live tier before it is lost.
-6. **One untested ordering, labelled as such in the code**: in `crates/gascand/src/engine.rs`,
+7. **One untested ordering, labelled as such in the code**: in `crates/gascand/src/engine.rs`,
    swapping the exit-status and timeout checks leaves the supervisor suite green.
-7. **A pre-existing stash is on the stack and is not ours.** Leave it.
+8. **A pre-existing stash is on the stack and is not ours.** Leave it.
 
 **All four reviews are committed verbatim at
 `docs/status/whole-landing-review-milestone-4.md`**, with a table of what was fixed and what
