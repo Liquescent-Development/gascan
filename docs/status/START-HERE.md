@@ -3,12 +3,12 @@
 This file is the session entry point. It is written to be read cold, and it is
 addressed to you, the agent. Follow it as instructions — there is nothing to paste.
 
-Rewritten 2026-08-18 after **TASKS 8 THROUGH 13 WERE COMPLETED, VERIFIED AND PUSHED.**
+Rewritten 2026-08-18 after **TASKS 14 AND 15 AND THE WHOLE-LANDING REVIEW WERE COMPLETED.**
 Everything above the `Where the work is` heading is current; everything below it is history.
 
 ---
 
-## MILESTONE 4: LANDINGS 2 AND 3 ARE DONE. TASKS 14 AND 15 REMAIN, THEN THE WHOLE-LANDING REVIEW.
+## MILESTONE 4: ALL FIFTEEN TASKS ARE DONE. THE OFFLINE PROOF REFUTED, AND THAT IS THE RESULT.
 
 **Read these four, in this order.**
 
@@ -16,153 +16,152 @@ Everything above the `Where the work is` heading is current; everything below it
 |---|---|
 | Design | `docs/superpowers/specs/2026-08-16-p5-1-milestone-4-product-wiring-design.md` |
 | Plan | `docs/superpowers/plans/2026-08-16-p5-1-milestone-4-product-wiring.md` |
+| **The offline evidence** | `docs/evidence/2026-08-18-arca-engine-offline.md` — **read this before touching anything about offline** |
 | Ledger | `.superpowers/sdd/2026-08-16-p5-1-milestone-4-product-wiring/progress.md` — untracked, git-ignored |
-| Evidence, now durable | `~/code/arca/Documentation/EVIDENCE-layer-cache-poisoning.md` — **committed**, see below |
 
 **EVERY SHA BELOW WAS READ WITH `git log -1` / `git ls-remote` AT THE MOMENT THIS WAS
-WRITTEN. Re-verify anyway — this file has gone stale on its own SHAs repeatedly, and the
-first draft of THIS table went stale the moment it was committed, which is why the Gas Can
-row no longer carries a number.**
+WRITTEN. Re-verify anyway — this file has gone stale on its own SHAs repeatedly, including
+inside a single edit, three lines below its own warning about it.**
 
 | | branch | head | pushed |
 |---|---|---|---|
-| Gas Can | `feat/milestone-4-product-wiring` | **run `git log -1`** — every edit to this file moves it. The last commit that changed code is `629ca27` (Task 13) | yes |
-| Arca | `feat/milestone-4-engine` | `e14be74` | yes, `ls-remote` matches |
-| `containerization` submodule | `merge/upstream-main` | `6304122` | yes, `ls-remote` matches |
+| Gas Can | `feat/milestone-4-product-wiring` | **run `git log -1`** — every edit to this file moves it. The last commit that changed code is `3882a52` (the review fixes) | yes, `ls-remote` matched |
+| Arca | `feat/milestone-4-engine` | `e14be74` — **did not move this session** | yes, `ls-remote` matched |
+| `containerization` submodule | `merge/upstream-main` | `6304122` — did not move | yes |
 
-**Arca's branch head is ABOVE the published tag, and that is correct.** The tag
-`gascan-engine-m4` is the annotated object `d143a661`, resolving to commit `c545612b`. The pin
-names the tag. `e14be74` is one docs commit on top and does not move the pin.
+**The tag `gascan-engine-m4` and its release are published and verified. They were NOT
+re-cut this session and do not need to be.** See "the offline proof refuted" below.
 
-### THE TAG AND THE RELEASE ARE PUBLISHED AND VERIFIED. DO NOT REDO THEM.
+### THE HEADLINE: THE OFFLINE PROOF WAS RUN AND IT FAILED. `CERTIFIED_ENGINE_REVISION` STAYS `None`.
 
-`gascan-engine-m4` is signed, pushed, and **verified from a clean clone** against
-`engine/allowed-signers` — `git verify-tag` reported a good ED25519 signature, exit 0. The
-release carries both assets. Every digest was re-measured from the staged files AND again
-from a fresh `gh release download`; GitHub's own reported asset digests agree.
+Task 15's order held — the evidence first, then the constant. The evidence says no.
 
-An independent cross-check worth keeping: the pin's **inner** digests match this host's
-live-tier artifacts exactly. `~/.arca/vmlinux` hashes to `49e0f081…` at 28,248,576 bytes, and
-`~/.arca/vminit/index.json` names `sha256:cf74cd41…` at 478. The published assets are the ones
-Landing 1 tested against.
+**MEASURED against the pinned engine `c545612b`: an `offline` sandbox has full internet
+egress.** It carries a vmnet `eth0` with a default route and a resolver on its gateway, and
+reaches a test-owned host endpoint, `1.1.1.1` over HTTP, and public DNS — as guest root and
+as the sandbox user, before and after a guest-root attempt to add an interface and a default
+route. **Thirteen violations.** `nslookup example.com` returned real addresses. Parent design
+§2.1 defines offline as no network attachment at all, no vmnet and no WireGuard.
 
-`sha256:a61c4cd9…` remains a superseded vminit digest. It appears in no tracked file anywhere.
+Two things make that a finding and not a broken probe. Every probe was first run against a
+**networked** sandbox from the same image and every one succeeded. And `Sandbox::boot`
+asserts the compiled `CreateRequest` carries `RuntimeNetwork::Offline` before anything is
+observed, so a manifest that silently compiled to `Networked` is not what was measured.
 
-### THE ONE THING TO DO NEXT: TASK 14, THEN TASK 15, THEN THE WHOLE-LANDING REVIEW.
+**So for `c545612b`, `Proven` is not unproven — it is false.** The plan's acceptance pair
+("with the constant set a live `Capabilities` yields `Proven`") is **UNREACHABLE**, and
+`docs/superpowers/plans/...md`'s Task 15 instructions must not be followed as written. Do not
+set the constant. Do not change the engine's `capabilities.offline` from `.unverified`.
 
-**Task 14** — a `gascan-e2e` daemon-on-engine pass: `gascan up`, exec, logs, `gascan down`,
-plus a `gascand` restart proving reconcile adopts a surviving sandbox. That adoption property
-is what Task 11's dial-first supervisor rests on.
+`crates/gascan-arca/tests/live/network.rs`'s
+`an_offline_sandbox_has_no_egress_at_either_privilege_level` **asserts the property and
+therefore FAILS BY DESIGN today.** Its ignore reason says so. Do not weaken it to make the
+tier green — it turns green on an engine that attaches nothing, and that engine is the one
+that earns the constant. **Reaching `Proven` is Arca work, not a re-tag of the same tree.**
 
-**Task 15** — the offline proof and the certified constant. **THE ORDER IS THE WHOLE POINT.**
+**The fail-closed default is what the evidence vindicates**, and it holds end to end:
+`gascan up` on an offline manifest is refused, and
+`gascan-e2e`'s `an_offline_manifest_is_refused_because_no_engine_build_is_certified` is the
+standing instrument.
 
-1. Run the offline proof against the pinned engine. The shape already exists and is hardened:
-   `packaging/macos/release-smoke.sh:1015-1037` asserts six ways that an offline sandbox has
-   no egress — a test-owned host endpoint, a public IP, and public DNS, each as the sandbox
-   user and again as guest root.
-2. Record it under `docs/evidence/<dated>-arca-engine-offline.md`, pinned to the exact Arca
-   revision.
-3. **Only then** set the constant. It is `CERTIFIED_ENGINE_REVISION` in
-   `crates/gascan-arca/src/translate.rs`, and it is `Option<&'static str> = None` today.
-   `None` was chosen over an empty-string sentinel deliberately: an empty sentinel would
-   certify an engine that reports an empty revision, which is exactly what a build with a
-   broken build-info generator does.
-4. Acceptance: with the constant set, a live `Capabilities` yields `Proven`; with it altered
-   by ONE CHARACTER, the same engine yields `Unverified`. **That pair is the instrument.**
-   Setting the constant without the recorded evidence is the "claim with no instrument"
-   defect this project has written traps about since milestone 1.
+### WHAT LANDED THIS SESSION
 
-**Then the whole-landing review, which is not optional.** It found a Critical that seven
-task-scoped gates could not see, and that is now two milestones running.
-
-### WHAT LANDED THIS SESSION, AND THE ONE DEPARTURE FROM THE PLAN
-
-| Task | What | Commit |
+| | What | Commit |
 |---|---|---|
-| 8 | the signed tag and the published release | tag `d143a661` |
-| 9 | pin schema 2, both digests per asset, the build-revision gate | `28cc656` |
-| 10 | `BackendSelection::Arca`, the client's backend refusal, the revision gate | `7f9e8e6` |
-| 11 | the engine supervisor — dial first, spawn on miss | `dec40d8` |
-| 12 | doctor remedies moved to the backend | `6d57f78` |
-| 13 | `gascan engine fetch`, verified twice, and its two doctor facts | `629ca27` |
-| — | the SDD ledger problem, resolved | Arca `e14be74` |
+| Task 14 | the daemon-on-engine e2e pass, and the spawner defect it found | `cd3e2a5` |
+| Task 15 | the offline proof, its refutation, and the refusal a user actually meets | `fd05780` |
+| Review | five defects across four reviewers | `3882a52` |
 
-**THE ONE DEPARTURE, AND IT IS MEASURED.** The plan says the revision gate must "downgrade to
-`NetworkIsolation::Unverified` unless `build_revision` equals the certified constant". Taken
-literally that rewrites `Unsupported` too. Both are already fail-closed at
-`policy.rs:419-425`, but with DIFFERENT errors — `OfflineUnsupported { version }` names the
-engine version and `OfflineUnavailable` does not — so collapsing them discards a diagnostic
-and adds no safety. **Only the positive claim is gated.** A mutation implementing the plan's
-literal wording is caught by exactly the assertion that correction added, and by nothing else.
+**Task 14 found a Critical.** `TokioEngineSpawner` passed the engine `--socket-path` and
+nothing else; `arca-engine` requires four options and exits **64** on `Missing expected
+argument '--state-root'`. The spawn arm of `ensure_engine` could never have succeeded on any
+host. All nine of Task 11's supervisor and backend-selection tests stayed green through it,
+because every spawner there is a fixture that never runs an engine. **The argv is a contract
+only the engine can judge.**
 
-### THE SDD LEDGER PROBLEM IS RESOLVED, AND THE RULE THAT REPLACED IT
+**The whole-landing review found five more, two of them by two reviewers independently:**
 
-`Documentation/EVIDENCE-layer-cache-poisoning.md` is **committed in Arca** and carries the
-failing-before run verbatim, the two-mutation matrix with its disjoint failing sets, the
-restoration checksums, and the discarded first mutation attempt. Both docstrings in
-`Tests/ArcaEngineTests/LayerCacheRoleTests.swift` now point at it. `git grep "fix report"`
-finds nothing in either repository.
+1. **Every package build failed.** `package.sh` emitted `artifacts` in the manifest's engine
+   block; `verify-package.sh` still required exactly four keys, and jq's `keys` is sorted.
+   The contract suite could not see it because both fixtures **hand-wrote** the old block.
+   They now derive it from the real pin with `package.sh`'s own jq program.
+2. **`gascan engine fetch` left its directory at 0755**, which both `gascand` and
+   `uninstall.sh` refuse. On a fresh host where the fetch runs first — the documented order —
+   the daemon could not start on either backend.
+3. **A doctor that timed out spoke for the wrong backend**, telling Arca users to install
+   Apple container. That is the exact defect `arca_doctor_report` exists to fix, on the path
+   most likely to be taken.
+4. **The client abandoned the daemon before the daemon abandoned the engine** (15s vs 20s),
+   so the daemon's socket-naming error could not reach a user by construction — and both were
+   under a cold start this repository had already measured as failing at 30s.
+5. A comment said the revision gate was "still to come" in the file that defines it.
 
-**The rule, settled with the maintainer:** any measurement a committed docstring cites goes
-into a tracked file at the moment the docstring is written. `Documentation/.gitignore` ignores
-`*.md` with an allowlist, so `!EVIDENCE-*.md` sits beside `!RELEASE-ARTIFACTS-*.md`.
+### WHAT IS OPEN, AND THE FIRST ONE NEEDS A DECISION BEFORE CODE
 
-Note honestly: this landed ABOVE the published tag, so the tagged tree still carries the
-dangling citation. Re-tagging was not considered — the release is public and downloadable.
+1. **THE CONTROLLER STORE IS NOT BACKEND-SCOPED, AND THE MISMATCH MESSAGE STEERS USERS INTO
+   IT.** `grep -c backend crates/gascand/src/store.rs crates/gascand/src/controller_state.rs`
+   returns `0` and `0`. Task 10 closed the *concurrent* case; the *persistent* case is open.
+   Create sandbox A on Apple, set `GASCAN_ARCA_BACKEND`, and `gascan ps` refuses with
+   `BackendMismatch` — whose message says "stop it with `gascan daemon stop`". Do that, and
+   the Arca daemon opens **the same** database and reports A as running. `reconcile()` does
+   raise `MissingOwned(A)` and `main.rs:589` discards the whole report (`let _ =`).
+   `gascan destroy A` then removes the record while the Apple container keeps running,
+   unreferenced. **Options:** a backend-scoped store path; a backend column per record with
+   filtering; or a `reconcile()` consumer that quarantines `MissingOwned`. **Recommendation:**
+   the backend-scoped path — it is the only one that cannot be half-applied, and it needs no
+   migration because a record under the wrong backend was never valid. **Do not pick one
+   without the maintainer.**
+2. **Every Arca startup failure goes to a null stderr.** `main.rs:254` drops the startup
+   diagnostic before the backend match; `client.rs` sets the daemon's stderr to
+   `Stdio::null()` in production (`GASCAN_DAEMON_STDERR_PATH` is test-only). So the engine's
+   own `--kernel-path names nothing that exists` and the daemon's carefully worded
+   `GASCAN_ENGINE_SOCKET must name its socket` both vanish, and the user sees a generic
+   readiness timeout. **Aggravating and cross-task:** Task 13 built the right remedy —
+   `engine_artifact_fact()` says "run `gascan engine fetch`" — and Task 11's startup ordering
+   makes it unreachable in exactly the state it describes, because `gascan doctor` connects to
+   the daemon first and the daemon cannot start without the artifacts.
+3. **~60 deferred Minor findings** with rulings in the ledger, plus the minors in this
+   session's four review files (see below). The two the previous whole-landing review said to
+   fix before Landing 2 publishes — Task 6 M3 and Task 7 O1 — are **still open**.
+4. **A guest that refuses at boot is loud in the guest and silent to the host** — `Start`
+   never returns and the only diagnostic is in `bootlog.log`. Worth its own task.
+5. **The guest-side ordering instrument** at `.superpowers/sdd/.../carry-layer_report-live-test.rs`
+   is **git-ignored**. Land it in Gas Can's live tier before it is lost.
+6. **One untested ordering, labelled as such in the code**: in `crates/gascand/src/engine.rs`,
+   swapping the exit-status and timeout checks leaves the supervisor suite green.
+7. **A pre-existing stash is on the stack and is not ours.** Leave it.
+
+**All four reviews are committed verbatim at
+`docs/status/whole-landing-review-milestone-4.md`**, with a table of what was fixed and what
+was not. The unaddressed Minors are in there; nothing is left in a scratchpad.
 
 ### SIX THINGS THAT WILL COST A SUCCESSOR REAL TIME
 
 1. **`ps -A` CANNOT ENUMERATE THE PROCESS TABLE ON THIS HOST.** Measured: 31 entries against
    `launchctl list`'s 544, and it omits even the calling shell. **No `ps | grep` absence check
-   is evidence of anything here.** Use `launchctl list | grep -iE "sharing|vmnet"`. If an
-   engine dies with `vmnet_return_t(rawValue: 1001)`, force-quit `InternetSharing`. **That
-   remedy is correct — do not retire it.**
-2. **`--disable-swift-testing` IS NOT PORTABLE BETWEEN THE REPOSITORIES.** Every submodule
-   test is swift-testing, so that flag runs **0 tests and exits 0** there — a false green. The
-   submodule's suite is plain `swift test` (616/0); Arca's is the filtered form.
-3. **`make vminit-rebuild` IS DESTRUCTIVE BEFORE IT IS VERIFIED.** `Makefile:192-195` is
-   `rm -rf ~/.arca/vminit` *then* the build. Check `container system status` first and back
-   the layout up.
+   is evidence of anything here.** If an engine dies with `vmnet_return_t(rawValue: 1001)`,
+   force-quit `InternetSharing`. To find an engine, read `<socket>.lock`, which holds its pid
+   (`Sources/ArcaEngine/EngineServer.swift:551`) — never `pkill -f`.
+2. **A UNIX SOCKET PATH IS 104 BYTES AND THE ENGINE REFUSES A LONGER ONE** rather than
+   truncating. MEASURED: an engine given a socket under a deep scratch path initialised every
+   manager and then died on `unixDomainSocketPathTooLong`, having bound nothing. The e2e tier
+   uses `/private/tmp` and one-letter names for that reason.
+3. **`--disable-swift-testing` IS NOT PORTABLE BETWEEN THE REPOSITORIES.** On the submodule it
+   runs **0 tests and exits 0** — a false green. The submodule's suite is plain `swift test`.
 4. **THE ENGINE LOSES ITS ENTITLEMENT TO EVERY `swift test`.** Re-sign after the last one and
    verify `codesign -d --entitlements - <bin> 2>&1 | grep -c virtualization` prints `1`.
 5. **NEVER GIVE SUBAGENTS NAMES WHERE ONE IS A PREFIX OF ANOTHER**, and **REQUIRE EVERY REVIEW
-   TO BE WRITTEN TO A FILE BEFORE THE REPLY.** Eleven of eleven subagent replies were lost in
-   transit in an earlier session; every file survived.
-6. **NEVER RUN THE WORKSPACE SUITE BESIDE ANOTHER CARGO OR CONTRACT JOB.** Measured across
-   four runs this session: run alone it is 1442/1448/1451/1456 passed, 0 failed. Run beside
-   `ci-run-release-contracts.sh` it produced two failures, and a later contended run produced
-   **two different ones**. The mechanism is file descriptors, not timing — the captured cause
-   was `ssh-keygen ... /dev/fd/17: Bad file descriptor [parent descriptor intact]`. **The
-   plan's §7.6 blames `gascan-e2e` alone; that is too narrow — `gascand` tests wander the same
-   way.** Exonerate by diff plus isolation, never by probability.
+   TO BE WRITTEN TO A FILE BEFORE THE REPLY.** MEASURED again this session: **all four**
+   reviewers went idle without ever delivering a reply, and **all four files survived**. The
+   file is the deliverable; the reply is not.
+6. **NEVER RUN THE WORKSPACE SUITE BESIDE ANOTHER CARGO OR CONTRACT JOB.** Run alone this
+   session: 1457, 1458 and 1461 passed, 0 failed. One contended run produced **two** failures,
+   both in `crates/gascan-e2e/tests/fake_backend.rs`, exonerated by diff plus isolation
+   (28/28 alone) and never by probability. `gascand` tests wander the same way.
 
-### WHAT IS OPEN
+### THE LIVE TIER'S ENVIRONMENT, AND THE DAEMON'S IS NOW THREE
 
-- **Tasks 14 and 15**, above.
-- **The whole-landing review**, which is not optional.
-- **The ignored-test baseline is 46**, reconciled from 43. Two of the three additions were
-  Landing 1 live tests that had never been baselined (`682bab0`, `ab8aa59`), so that CI gate
-  had been red on this branch since Landing 1; the third is Task 9's build-revision test.
-- **~60 deferred Minor findings** with rulings in the ledger. The two the whole-landing review
-  said to fix before Landing 2 publishes — Task 6 M3 and Task 7 O1 — are **still open**.
-- **A defect worth its own task:** a guest that refuses at boot is loud in the guest and
-  **silent to the host** — `Start` never returns and the only diagnostic is in `bootlog.log`.
-- **The guest-side ordering instrument** is preserved at
-  `.superpowers/sdd/.../carry-layer_report-live-test.rs`, which is **git-ignored**. Land it in
-  Gas Can's live tier before it is lost.
-- **One untested ordering, labelled as such in the code.** In
-  `crates/gascand/src/engine.rs`, swapping the exit-status and timeout checks leaves the whole
-  supervisor suite green. It is kept as reasoning, not as a tested property, and says so.
-- **A pre-existing stash is on the stack and is not ours**: `stash@{0}: spike: persist live
-  state root + snapshot guest bootlog (volumes defect, 2026-08-14)`. Leave it. Note that
-  `refs/stash` reads `ff06265` today while `landing-1-fix-report.md` recorded `27f83037`; the
-  single entry's message is unchanged and nothing this session touched it, so treat the
-  recorded SHA as stale rather than the stash as altered.
-
-### THE LIVE TIER NEEDS FOUR ENVIRONMENT VARIABLES, AND TWO ARE NOW FETCHABLE
-
-All four are undefaulted; absent means `panic!`. `gascan engine fetch` now produces two of
-them, verified against the pin:
+The `gascan-arca` live tier needs four, all undefaulted — absent means `panic!`:
 
 ```
 GASCAN_ARCA_ENGINE_BIN      second line of scripts/build-arca-engine.sh
@@ -171,10 +170,15 @@ GASCAN_ARCA_VMINIT_LAYOUT   ~/Library/Application Support/dev.gascan/engine/vmin
 GASCAN_ARCA_BASE_OCI_LAYOUT an OCI layout with one small linux/arm64 image carrying sh and nc
 ```
 
-The daemon's own two are `GASCAN_ENGINE_BIN` and `GASCAN_ENGINE_SOCKET`, both undefaulted for
-the same reason and both required when `GASCAN_ARCA_BACKEND` is set.
+The `gascan-e2e` arca tier needs only the **first and last** of those: the daemon resolves the
+kernel and vminit itself, from what `gascan engine fetch` installed, which is the point.
 
----
+**The daemon's own environment is now THREE, not two:** `GASCAN_ENGINE_BIN`,
+`GASCAN_ENGINE_SOCKET` and **`GASCAN_ENGINE_STATE_ROOT`**, all undefaulted and all required
+when `GASCAN_ARCA_BACKEND` is set. The state root is undefaulted because the supervisor dials
+before it spawns, so a daemon routinely adopts an engine some earlier process pointed at a
+state root of its choosing; a guessed default would name a second store nothing reconciles
+against the first.
 
 ## Where the work is
 
