@@ -455,7 +455,7 @@ async fn execute_doctor(json: bool) -> Result<i32, CliError> {
         .iter()
         .map(|check| DoctorCheck {
             id: check.id.clone(),
-            status: doctor_status_name(check.status).to_owned(),
+            status: doctor_status_name(check.status),
             detail: check.detail.clone(),
             remedy: check.remedy.clone(),
         })
@@ -507,14 +507,18 @@ fn capability_fact(capability: &v1::Capability) -> gascan_core::doctor::DoctorFa
             .unwrap_or("")
             .to_owned()
     };
-    let status = match detail.get("status").and_then(serde_json::Value::as_str) {
-        Some("pass") => DoctorStatus::Pass,
-        Some("warning") => DoctorStatus::Warning,
-        Some("fail") => DoctorStatus::Fail,
-        Some("unknown") => DoctorStatus::Unknown,
-        _ if capability.available => DoctorStatus::Pass,
-        _ => DoctorStatus::Fail,
-    };
+    // Deserialised through `DoctorStatus`'s own impl rather than matched on
+    // four literals. The daemon serialises it with that impl, so a renamed
+    // variant stays a round trip instead of silently falling through to
+    // `available` -- which would report every Warning as a Pass.
+    let status = detail
+        .get("status")
+        .and_then(|status| serde_json::from_value::<DoctorStatus>(status.clone()).ok())
+        .unwrap_or(if capability.available {
+            DoctorStatus::Pass
+        } else {
+            DoctorStatus::Fail
+        });
     let fact = DoctorFact {
         status,
         detail: field("detail"),
@@ -528,14 +532,18 @@ fn capability_fact(capability: &v1::Capability) -> gascan_core::doctor::DoctorFa
     }
 }
 
-const fn doctor_status_name(status: gascan_core::doctor::DoctorStatus) -> &'static str {
-    use gascan_core::doctor::DoctorStatus;
-    match status {
-        DoctorStatus::Pass => "pass",
-        DoctorStatus::Warning => "warning",
-        DoctorStatus::Fail => "fail",
-        DoctorStatus::Unknown => "unknown",
-    }
+/// The wire spelling of a status, for the presentation layer and `--json`.
+///
+/// Serialised through `DoctorStatus`'s own impl, for the reason
+/// [`capability_fact`] deserialises through it: this string is what
+/// `render_doctor` groups on and what a `--json` consumer reads, and a
+/// hand-written table beside a `#[serde(rename_all)]` is two spellings that can
+/// disagree. `doctor_status_names_match_the_wire` pins them together.
+fn doctor_status_name(status: gascan_core::doctor::DoctorStatus) -> String {
+    serde_json::to_value(status)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 fn doctor_request(current_directory: std::io::Result<PathBuf>) -> v1::DoctorRequest {
@@ -1870,6 +1878,42 @@ fn confirm_destroy() -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The status the report renders is the status the daemon sent.**
+    ///
+    /// `render_doctor` groups on these exact strings -- `"pass"`, `"warning"`
+    /// -- and a `--json` consumer reads them. Both directions now go through
+    /// `DoctorStatus`'s serde impl, and this asserts the round trip so a
+    /// renamed variant is a failing test rather than every Warning quietly
+    /// arriving as a Pass through `capability_fact`'s `available` fallback.
+    #[test]
+    fn doctor_status_names_match_the_wire() {
+        use gascan_core::doctor::DoctorStatus;
+        for (status, expected) in [
+            (DoctorStatus::Pass, "pass"),
+            (DoctorStatus::Warning, "warning"),
+            (DoctorStatus::Fail, "fail"),
+            (DoctorStatus::Unknown, "unknown"),
+        ] {
+            assert_eq!(doctor_status_name(status), expected);
+            let capability = v1::Capability {
+                name: "runtime.service".to_owned(),
+                // Deliberately the WRONG availability for every status, so a
+                // fallback to `available` cannot produce the right answer.
+                available: !status.is_available(),
+                detail: serde_json::json!({
+                    "detail": "d",
+                    "remedy": "r",
+                    "status": status,
+                })
+                .to_string(),
+            };
+            let fact = capability_fact(&capability);
+            assert_eq!(fact.status, status, "{expected} did not round trip");
+            assert_eq!(fact.detail, "d");
+            assert_eq!(fact.remedy.as_deref(), Some("r"));
+        }
+    }
 
     #[test]
     fn ordinary_list_filters_absent_records() {
