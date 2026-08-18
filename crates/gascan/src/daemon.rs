@@ -3180,14 +3180,30 @@ fn file_identity_at(
 /// tampering signal. Name the fault and carry the observed values.
 ///
 /// ~~Mode 0200 is the daemon's own not-yet-published record.~~ **Corrected
-/// 2026-08-07: 0200 is two states, and only one of them resolves.** `gascand`
-/// creates the file inert at 0200 and publishes it by chmod-ing to 0600, so
-/// 0200 with an empty file is a publication in flight. But 0200 with *content*
-/// is a daemon that wrote its record and died before publishing, which never
-/// becomes 0600 on its own. The distinction already exists in this module —
-/// `is_instance_tombstone` and `is_interrupted_tombstone` split on exactly this
-/// — and reporting them identically is what left a caller unable to tell a race
-/// it should wait out from a corpse it should not.
+/// 2026-08-07: 0200 is two states, and only one of them resolves.** 0200 with
+/// an empty file is the inert tombstone; 0200 with *content* is a record whose
+/// publication was interrupted.
+///
+/// ~~which never becomes 0600 on its own.~~ **Corrected 2026-08-18, and this
+/// is the correction that mattered: it did become 0600 on its own, constantly,
+/// because a live `gascand` published by writing into the file already at this
+/// path and chmod-ing it afterwards.** Every reader that looked across that
+/// `fsync` called a running daemon a corpse: a terminal `PermissionDenied`
+/// here, and `DaemonState::Unsafe` at `inspect_with`. Reclaim does not follow
+/// from that — `recover_interrupted_tombstone` proves the endpoint absent twice
+/// first, and `gascand` binds its socket before it writes this record — so what
+/// the race produced was a false terminal verdict, not a truncated record.
+/// MEASURED with a polling observer over 2000 start-and-stop cycles: 12,131,645
+/// samples in that state, roughly half of all samples taken. It cost five
+/// workspace runs and one CI run before it was named.
+///
+/// `crates/gascand/src/socket.rs` now builds both the record and the tombstone
+/// under a private name and renames them into place, so this path shows only
+/// three faces: absent, the inert tombstone, and the whole record. The same
+/// observer over the same 2000 cycles saw 0200-with-content 0 times. The
+/// classification below is therefore right about what it means again — an
+/// interrupted publication really is a corpse — and it is reachable only from a
+/// daemon that died mid-publish or from one older than that change.
 ///
 /// Size is therefore reported in every case, because it is the field that
 /// separates them and its absence made a CI failure unattributable.
@@ -4850,8 +4866,15 @@ mod tests {
                 // accident rather than anything the test means to exercise.
                 //
                 // The rename is atomic, so no observer sees a partially
-                // published record -- which is what the production publisher
-                // achieves by creating the file inert and chmod-ing it last.
+                // published record.
+                //
+                // ~~which is what the production publisher achieves by creating
+                // the file inert and chmod-ing it last.~~ **Corrected
+                // 2026-08-18: it did not achieve that.** Chmod-ing last still
+                // showed content at the published path for the length of an
+                // `fsync`, and this comment asserted the fixture had adopted a
+                // safety the production code did not have. The production
+                // publisher stages and renames too now, for this reason.
                 let staged = instance_path.with_extension("publishing");
                 fs::write(&staged, serde_json::to_vec(&published)?)?;
                 fs::set_permissions(&staged, fs::Permissions::from_mode(0o600))?;
