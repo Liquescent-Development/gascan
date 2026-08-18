@@ -39,6 +39,7 @@ tower.workspace = true
 
 [dev-dependencies]
 camino.workspace = true
+gascan-oci-fixture.workspace = true
 command-fds.workspace = true
 serde.workspace = true
 tempfile = "3"

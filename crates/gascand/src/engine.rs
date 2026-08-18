@@ -111,10 +111,52 @@ impl From<io::Error> for EngineError {
 }
 
 /// What a spawner needs to start an engine.
+///
+/// **All four paths, because the engine requires all four.** `arca-engine
+/// --help` says it in its own words: "All four of those options are required
+/// and none is defaulted, because a default is how a process silently ends up
+/// pointed at another product's state". MEASURED against the pinned engine with
+/// only `--socket-path` given -- the argv this struct used to describe -- it
+/// exits **64** on `Missing expected argument '--state-root <state-root>'` and
+/// binds nothing, so the spawn arm of [`ensure_engine`] could never succeed.
+///
+/// That defect survived Task 11's whole suite because every test there spawns
+/// through a fixture: a counting spawner, a spawner that runs `/usr/bin/false`,
+/// a spawner that binds the socket itself. **Not one of them runs the engine**,
+/// and the argv is a contract only the engine can judge. The instrument that
+/// judges it is the daemon-on-engine pass in `gascan-e2e`, which drives a real
+/// `gascan up` through a daemon that spawned its own engine.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineLaunch {
     pub executable: PathBuf,
     pub socket: PathBuf,
+    /// `--state-root`: where the engine keeps containers, images and volumes.
+    pub state_root: PathBuf,
+    /// `--kernel-path`: the uncompressed vmlinux guests boot.
+    pub kernel: PathBuf,
+    /// `--vminit-layout`: the OCI layout holding `arca-vminit:latest`.
+    pub vminit: PathBuf,
+}
+
+impl EngineLaunch {
+    /// The `serve` invocation, in the engine's own required order.
+    ///
+    /// A method and not four `.arg()` calls at the spawn site, so that the one
+    /// place that knows the engine's command line is the one place a reader has
+    /// to check against `arca-engine serve --help`.
+    #[must_use]
+    pub fn serve_arguments(&self) -> [&std::ffi::OsStr; 8] {
+        [
+            "--socket-path".as_ref(),
+            self.socket.as_os_str(),
+            "--state-root".as_ref(),
+            self.state_root.as_os_str(),
+            "--kernel-path".as_ref(),
+            self.kernel.as_os_str(),
+            "--vminit-layout".as_ref(),
+            self.vminit.as_os_str(),
+        ]
+    }
 }
 
 /// Starting an engine process, behind a trait so the miss arm is testable.
@@ -271,8 +313,7 @@ pub struct TokioEngineSpawner;
 impl EngineSpawner for TokioEngineSpawner {
     fn spawn(&self, launch: &EngineLaunch) -> io::Result<SpawnedEngine> {
         let child = tokio::process::Command::new(&launch.executable)
-            .arg("--socket-path")
-            .arg(&launch.socket)
+            .args(launch.serve_arguments())
             // The engine outlives this daemon deliberately, so it must not be
             // reaped when the handle is dropped. `kill_on_drop` defaults to
             // false; it is named here because turning it on would silently

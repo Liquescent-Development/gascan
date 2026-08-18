@@ -306,9 +306,28 @@ async fn run(
                         )
                     })
             };
+            // The kernel and the vminit layout are NOT read from the
+            // environment, and that asymmetry is deliberate. They are Gas Can's
+            // own installation: `gascan engine fetch` verifies and writes them
+            // to exactly these paths, and `engine_artifact_fact()` below reports
+            // on the same two. A second source for them would let the doctor
+            // report one pair while the spawn used another -- a daemon booting
+            // guests on a kernel nobody checked, described by a check that
+            // passed.
+            //
+            // The state root IS read from the environment, undefaulted like the
+            // socket and for the same reason `ENGINE_SOCKET_ENV` gives: an
+            // engine this daemon ADOPTS was pointed at a state root by whoever
+            // started it, and a spawning daemon that guessed a different one
+            // would write a second, divergent store that nothing compares.
+            let artifacts = gascan_core::engine_artifacts::ArtifactPaths::for_user()
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
             let launch = gascand::EngineLaunch {
                 executable: required(gascand::ENGINE_BIN_ENV, "the engine executable")?,
                 socket: required(gascand::ENGINE_SOCKET_ENV, "its socket")?,
+                state_root: required(gascand::ENGINE_STATE_ROOT_ENV, "its state root")?,
+                kernel: artifacts.kernel(),
+                vminit: artifacts.vminit(),
             };
             // Dial first, spawn on a miss. An engine that survived this
             // daemon's predecessor is adopted rather than duplicated, which is

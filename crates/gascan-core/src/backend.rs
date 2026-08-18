@@ -59,6 +59,23 @@ pub const ARCA_BACKEND_ENV: &str = "GASCAN_ARCA_BACKEND";
 /// engine's state root is Arca's to choose rather than Gas Can's to assume.
 pub const ENGINE_SOCKET_ENV: &str = "GASCAN_ENGINE_SOCKET";
 
+/// The state root the engine is given when this daemon spawns it.
+///
+/// Undefaulted for the reason [`ENGINE_SOCKET_ENV`] states and one more that is
+/// specific to it. The supervisor dials before it spawns, so a daemon routinely
+/// ADOPTS an engine some earlier process started and pointed at a state root of
+/// that process's choosing. A guessed default would be right only when this
+/// daemon happened to be the one that spawned, and on every other start it would
+/// name a second, empty store that nothing reconciles against the first --
+/// sandboxes that exist reported as missing, with no error anywhere.
+///
+/// Distinct from the kernel and the vminit layout, which are NOT environment
+/// variables: those are Gas Can's own installation, written and verified by
+/// `gascan engine fetch` at paths `ArtifactPaths` owns, and read from there by
+/// both the spawn and the doctor fact so the two cannot describe different
+/// files.
+pub const ENGINE_STATE_ROOT_ENV: &str = "GASCAN_ENGINE_STATE_ROOT";
+
 /// The engine executable the supervisor spawns when nothing is listening.
 ///
 /// Undefaulted for the same reason as the socket, and for one more: the `.pkg`

@@ -12,7 +12,7 @@ pub const TEST_ERROR_DIAGNOSTICS_ENV: &str = "GASCAN_TEST_ERROR_DIAGNOSTICS";
 // where the daemon's callers look for it.
 pub use gascan_core::backend::{
     ARCA_BACKEND_ENV, AmbiguousBackend, BackendSelection, ENGINE_BIN_ENV, ENGINE_SOCKET_ENV,
-    backend_from_environment, backend_selection,
+    ENGINE_STATE_ROOT_ENV, backend_from_environment, backend_selection,
 };
 
 mod api;

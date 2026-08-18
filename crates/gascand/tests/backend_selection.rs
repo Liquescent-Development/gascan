@@ -51,4 +51,11 @@ fn backend_environment_names_are_stable() {
     assert_eq!(gascand::TEST_FAKE_BACKEND_ENV, "GASCAN_TEST_FAKE_BACKEND");
     assert_eq!(gascand::ARCA_BACKEND_ENV, "GASCAN_ARCA_BACKEND");
     assert_eq!(gascand::ENGINE_SOCKET_ENV, "GASCAN_ENGINE_SOCKET");
+    assert_eq!(gascand::ENGINE_BIN_ENV, "GASCAN_ENGINE_BIN");
+    assert_eq!(
+        gascand::ENGINE_STATE_ROOT_ENV,
+        "GASCAN_ENGINE_STATE_ROOT",
+        "the state root is part of the daemon's documented environment; renaming it \
+         silently points a spawned engine at a store nothing else reads"
+    );
 }

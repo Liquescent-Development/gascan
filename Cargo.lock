@@ -503,6 +503,7 @@ dependencies = [
  "camino",
  "gascan-core",
  "gascan-engine-proto",
+ "gascan-oci-fixture",
  "hyper-util",
  "prost",
  "rustix",
@@ -548,6 +549,7 @@ dependencies = [
  "gascan-arca",
  "gascan-core",
  "gascan-inherited-fd",
+ "gascan-oci-fixture",
  "gascan-proto",
  "gascand",
  "hyper-util",
@@ -583,6 +585,16 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "rustix",
+]
+
+[[package]]
+name = "gascan-oci-fixture"
+version = "0.1.20"
+dependencies = [
+ "camino",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

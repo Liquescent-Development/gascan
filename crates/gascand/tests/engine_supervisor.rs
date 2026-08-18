@@ -68,7 +68,43 @@ fn launch(socket: PathBuf) -> EngineLaunch {
     EngineLaunch {
         executable: PathBuf::from("/nonexistent/arca-engine"),
         socket,
+        state_root: PathBuf::from("/nonexistent/state"),
+        kernel: PathBuf::from("/nonexistent/vmlinux"),
+        vminit: PathBuf::from("/nonexistent/vminit"),
     }
+}
+
+/// **The four options the engine requires, in the argv this daemon builds.**
+///
+/// Read this test for what it is: it compares one hand-written list against
+/// another, so it CANNOT discover that the engine wants a fifth option or a
+/// different spelling. What it does is hold the pairing of flag to field still.
+/// MEASURED against the pinned engine, `--socket-path` alone exits **64** on
+/// `Missing expected argument '--state-root <state-root>'`, and no test in this
+/// file could see that, because every spawner here is a fixture that never runs
+/// an engine. **The instrument for the argv itself is the daemon-on-engine pass
+/// in `gascan-e2e`**, which spawns the real binary and then uses it.
+#[test]
+fn the_serve_arguments_name_every_path_the_engine_requires() {
+    let launch = launch(PathBuf::from("/nonexistent/engine.sock"));
+    let arguments: Vec<&str> = launch
+        .serve_arguments()
+        .iter()
+        .map(|argument| argument.to_str().unwrap_or("<non-utf8>"))
+        .collect();
+    assert_eq!(
+        arguments,
+        [
+            "--socket-path",
+            "/nonexistent/engine.sock",
+            "--state-root",
+            "/nonexistent/state",
+            "--kernel-path",
+            "/nonexistent/vmlinux",
+            "--vminit-layout",
+            "/nonexistent/vminit",
+        ]
+    );
 }
 
 /// **A live engine is adopted, not duplicated.**
