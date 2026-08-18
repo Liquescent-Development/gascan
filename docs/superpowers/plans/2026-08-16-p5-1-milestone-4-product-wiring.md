@@ -450,7 +450,8 @@ This needs a **`make vminit-rebuild` and a guest-side measurement** — reading 
 
 - [ ] `swift test --disable-swift-testing --filter ArcaEngineTests` — 0 failures, count accounted for against 228
 - [ ] `swift test --disable-swift-testing --filter ArcaTests.NetworkPruneGateTests` — 3 tests, 0 failures
-- [ ] `make vminit-rebuild` succeeds and the new vminit digest is recorded
+- [ ] **The submodule's suite is plain `swift test` with NO flags.** `--disable-swift-testing` is **not portable between the two repositories and is a false green on the submodule**: every submodule test is swift-testing, so that form runs **0 tests and exits 0**. VERIFIED 2026-08-17 at submodule `da99347`: `rg -l "import XCTest" Tests/` → **0 files**, `rg -l "^import Testing" Tests/` → **67 files**, and all 8 test targets live under one `./Tests` root. Arca's tests are XCTest, so the flag is correct there and only there.
+- [ ] `make vminit-rebuild` succeeds and the new vminit digest is recorded. **This target is destructive before it is verified** — `Makefile:192-195` is `rm -rf ~/.arca/vminit` *followed by* the build, with no backup and no rollback, and the build reaches `container build`, which needs a launchd service. MEASURED 2026-08-17: it failed with `XPC connection error: Connection invalid` and left the host with **no vminit layout at all**, which is what `GASCAN_ARCA_VMINIT_LAYOUT` names for the whole live tier. Recovered with `container system start` (`container system status` had reported `apiserver is not running and not registered with launchd`). Check that service before running it.
 - [ ] The live tier runs against a branch-built, **re-signed** engine; record the command and its output
 - [ ] `codesign -d --entitlements - <bin> 2>&1 | grep -c virtualization` prints `1`, checked **after** the last `swift test`
 - [ ] Every fix in Tasks 2-7 has two recorded mutations failing disjoint test sets
@@ -480,7 +481,16 @@ This needs a **`make vminit-rebuild` and a guest-side measurement** — reading 
 | vminit layer | 186,967,040 bytes, mediaType `application/vnd.oci.image.layer.v1.tar`, uncompressed |
 | vminit layout, all files | 186,968,171 bytes across 3 blobs, no orphans |
 
-**The GPL obligation is this task's to discharge, and it is not optional.** `vmlinux` is a Linux kernel binary; distributing it as a release asset carries a corresponding-source obligation. On the development machine it is a symlink into `/Applications/Arca.app/Contents/Resources/vmlinux` and **this plan has not traced its build provenance**. Establish where that kernel is built from and publish the source offer alongside the asset. Do not publish the asset first and resolve this after.
+**The GPL obligation is this task's to discharge, and it is not optional.** `vmlinux` is a Linux kernel binary; distributing it as a release asset carries a corresponding-source obligation. Do not publish the asset first and resolve this after.
+
+**PROVENANCE TRACED 2026-08-17 — the sentence that stood here, "this plan has not traced its build provenance", is retired.** `scripts/build-kernel.sh` clones `https://github.com/apple/containerization.git`, takes its `kernel/` recipe and `config-arm64`, **enables `CONFIG_TUN=y` and `CONFIG_WIREGUARD=y`** (`:42-63`), and runs Apple's build. Output is `~/.arca/vmlinux`, gzipped by `Makefile:235` into `assets/vmlinux-arm64.gz` and installed by `Makefile:361` into `Arca.app/Contents/Resources/vmlinux`. VERIFIED: `~/.arca/vmlinux` is a symlink to that path, **28,248,576 bytes**, matching the figure above exactly.
+
+**Two consequences, both settled with the maintainer 2026-08-17:**
+
+- **The obligation is real, narrow, and does not reach Gas Can's code.** Only the *config* changed, so corresponding source is **upstream Linux at a pinned ref + the `config-arm64` actually used + the build scripts** — GPLv2 §3 counts "the scripts used to control compilation and installation", which is `build-kernel.sh` plus Apple's `kernel/` Makefile. Everything needed already exists in the repo except the pin. It does not force any licence change: Gas Can is already `AGPL-3.0-only` (`Cargo.toml:7`, all ten crates via `license.workspace = true`).
+- **Deferring the download to install time does NOT avoid it.** The obligation follows *who serves the bytes*, not when. This task uploads `vmlinux` to Arca's own release and Task 13 fetches it from there by digest, so the project is the distributor either way. It would only be avoided if the bytes came from a third party discharging it — unavailable here, because the config changes make this binary the project's own and no upstream artifact is byte-identical to it. Note the project **already** distributes it inside the DMG today, so this task adds a channel rather than creating the exposure.
+
+**BLOCKER THIS TASK MUST CLEAR FIRST, and it is an engineering defect independent of licensing.** `scripts/build-kernel.sh:30` is `git clone --depth 1` of `main` with **no pinned commit**, so the recipe — and therefore the kernel version — is whatever `main` was on the day it ran. **The shipped kernel is not reproducible and its corresponding source is not determinable from the repository.** Pin that clone before publishing; it fixes reproducibility and the licensing paperwork in one move.
 
 ---
 
