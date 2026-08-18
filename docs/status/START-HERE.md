@@ -64,6 +64,36 @@ anyone repackages. The identity that survives repackaging is the inner one:
 an hour before the Landing 1 fix wave forced a rebuild. It appears in no tracked file in any of the
 three repositories — only in git-ignored scaffolding.
 
+**The exact sequence, with everything already measured:**
+
+```bash
+# 1. The tag. The message is drafted and names all seven tasks, the submodule
+#    pointer, both suites and all four digests.
+cd ~/code/arca && git tag -s gascan-engine-m4 -F \
+  ~/code/gascan/.superpowers/sdd/2026-08-16-p5-1-milestone-4-product-wiring/task-8-tag-message.txt \
+  c545612b
+git push origin gascan-engine-m4
+
+# 2. Verify from a CLEAN CLONE, never the working tree.
+cd $(mktemp -d) && git clone git@github.com:Vas-Solutus/arca.git a && cd a
+git config gpg.ssh.allowedSignersFile ~/code/gascan/engine/allowed-signers
+git verify-tag gascan-engine-m4          # must report a good signature
+
+# 3. The release and its two assets, uploaded as these exact files.
+gh release create gascan-engine-m4 --repo Vas-Solutus/arca --verify-tag \
+  ~/.arca/release/gascan-engine-m4/vmlinux-arm64.gz \
+  ~/.arca/release/gascan-engine-m4/vminit-oci-arm64.tar.gz
+```
+
+**If `task-8-tag-message.txt` is gone** — it lives in git-ignored scaffolding — reconstruct it from
+`~/code/arca/Documentation/RELEASE-ARTIFACTS-gascan-engine-m4.md`, which is **committed at
+`c545612`** and carries the same digests and caveats.
+
+**The GPL material is already committed and durable**, in Arca at `6f9e0d9`: the whole upstream
+recipe vendored under `kernel/recipe/` with `kernel/recipe.sha256` and `kernel/recipe.env` pinning
+it, and a 144-line `kernel/README.md` holding the written offer, the source URL and sums, and the
+non-reproducibility caveat. **Nothing about the GPL obligation is left to do before publishing.**
+
 **Then verify the tag from a CLEAN CLONE**, not the working tree, because the working tree's git
 config is not what a user has. Arca's signing key was checked against
 `~/code/gascan/engine/allowed-signers` and they match exactly, so this should pass — if it does
