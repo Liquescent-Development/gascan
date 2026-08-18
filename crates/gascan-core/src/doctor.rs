@@ -234,124 +234,222 @@ impl DoctorFacts {
         }
     }
 
-    pub fn into_report(self) -> DoctorReport {
+    /// Builds the report, taking the remedy prose from the backend that
+    /// produced these facts.
+    ///
+    /// The `(id, fact)` pairing stays here because it is structural -- which
+    /// field answers which check -- while the prose is the backend's. Before
+    /// this the two were one table, which is why every backend got Apple's
+    /// advice.
+    pub fn into_report(self, remedies: &dyn DoctorRemedies) -> DoctorReport {
         let entries = [
-            (
-                DoctorCheckId::HostArchitecture,
-                self.architecture,
-                "run gascan on Apple silicon",
-            ),
-            (
-                DoctorCheckId::HostMacos,
-                self.macos,
-                "upgrade this host to macOS 26 or newer",
-            ),
-            (
-                DoctorCheckId::RuntimeCli,
-                self.cli,
-                "install Apple container 1.1.0 in PATH",
-            ),
-            (
-                DoctorCheckId::RuntimeVersion,
-                self.version,
-                "install the supported Apple container 1.1.0 release",
-            ),
-            (
-                DoctorCheckId::RuntimeService,
-                self.service,
-                "run `container system start` and retry",
-            ),
-            (
-                DoctorCheckId::RuntimeKernel,
-                self.kernel,
-                "run `container system start`, install its recommended kernel, and retry",
-            ),
-            (
-                DoctorCheckId::RuntimeSchema,
-                self.schema,
-                "install matching Apple container 1.1.0 CLI and service components",
-            ),
-            (
-                DoctorCheckId::StorageState,
-                self.state_storage,
-                "free disk space in the Apple container application root",
-            ),
-            (
-                DoctorCheckId::StorageImages,
-                self.image_storage,
-                "free disk space on the Apple application/state/image filesystem",
-            ),
-            (
-                DoctorCheckId::WorkspaceAccess,
-                self.workspace,
-                "grant gascan read/write access to the canonical workspace",
-            ),
-            (
-                DoctorCheckId::RuntimeBindMounts,
-                self.bind_mounts,
-                "install a supported Apple container release with bind-mount support",
-            ),
-            (
-                DoctorCheckId::RuntimeNamedVolumes,
-                self.named_volumes,
-                "install a supported Apple container release with named-volume support",
-            ),
-            (
-                DoctorCheckId::RuntimeTty,
-                self.tty,
-                "install a supported Apple container release with TTY support",
-            ),
-            (
-                DoctorCheckId::RuntimeSignals,
-                self.signals,
-                "install a supported Apple container release with signal support",
-            ),
-            (
-                DoctorCheckId::RuntimeLoopbackPublish,
-                self.loopback_publish,
-                "install a supported Apple container release with loopback publication support",
-            ),
-            (
-                DoctorCheckId::RuntimeResourceLimits,
-                self.resource_limits,
-                "install a supported Apple container release with resource-limit support",
-            ),
-            (
-                DoctorCheckId::RuntimeOffline,
-                self.offline,
-                "install a supported Apple container release with proven offline isolation",
-            ),
-            (
-                DoctorCheckId::SshClient,
-                self.ssh_client,
-                "install the system OpenSSH client at /usr/bin/ssh",
-            ),
-            (
-                DoctorCheckId::SshIdentity,
-                self.ssh_identity,
-                "restore the matching managed SSH identity and safe permissions; otherwise destroy and recreate affected sandboxes",
-            ),
-            (
-                DoctorCheckId::SshConfig,
-                self.ssh_config,
-                "remove unsafe generated SSH config state, then run `gascan up`",
-            ),
-            (
-                DoctorCheckId::SshNativePublish,
-                self.ssh_native_publish,
-                "install a supported Apple container release with loopback publication support",
-            ),
+            (DoctorCheckId::HostArchitecture, self.architecture),
+            (DoctorCheckId::HostMacos, self.macos),
+            (DoctorCheckId::RuntimeCli, self.cli),
+            (DoctorCheckId::RuntimeVersion, self.version),
+            (DoctorCheckId::RuntimeService, self.service),
+            (DoctorCheckId::RuntimeKernel, self.kernel),
+            (DoctorCheckId::RuntimeSchema, self.schema),
+            (DoctorCheckId::StorageState, self.state_storage),
+            (DoctorCheckId::StorageImages, self.image_storage),
+            (DoctorCheckId::WorkspaceAccess, self.workspace),
+            (DoctorCheckId::RuntimeBindMounts, self.bind_mounts),
+            (DoctorCheckId::RuntimeNamedVolumes, self.named_volumes),
+            (DoctorCheckId::RuntimeTty, self.tty),
+            (DoctorCheckId::RuntimeSignals, self.signals),
+            (DoctorCheckId::RuntimeLoopbackPublish, self.loopback_publish),
+            (DoctorCheckId::RuntimeResourceLimits, self.resource_limits),
+            (DoctorCheckId::RuntimeOffline, self.offline),
+            (DoctorCheckId::SshClient, self.ssh_client),
+            (DoctorCheckId::SshIdentity, self.ssh_identity),
+            (DoctorCheckId::SshConfig, self.ssh_config),
+            (DoctorCheckId::SshNativePublish, self.ssh_native_publish),
         ];
         DoctorReport {
             checks: entries
                 .into_iter()
-                .map(|(id, fact, default_remedy)| DoctorCheck {
+                .map(|(id, fact)| DoctorCheck {
                     id: id.as_str().to_owned(),
                     status: fact.status,
                     detail: fact.detail,
-                    remedy: fact.remedy.unwrap_or_else(|| default_remedy.to_owned()),
+                    remedy: fact
+                        .remedy
+                        .unwrap_or_else(|| remedies.remedy(id).to_owned()),
                 })
                 .collect(),
+        }
+    }
+}
+
+/// The remedy prose for each check, owned by the backend that produced the fact.
+///
+/// **`DoctorFacts::into_report` used to pair every fact with hardcoded Apple
+/// prose.** An Arca-backed daemon whose engine socket was dead told the user to
+/// "install Apple container 1.1.0 in PATH" -- advice that is not merely
+/// unhelpful but actively misdirecting, since installing it would change
+/// nothing.
+///
+/// A trait with one implementation per backend, and NOT a `match` on the
+/// backend inside `into_report`: the report builder should not know how many
+/// backends exist, and a scattered match is how the third backend gets Apple's
+/// prose in the two arms someone forgets.
+///
+/// Each implementation matches EXHAUSTIVELY on `DoctorCheckId`, so a new check
+/// is a compile error in every backend rather than a check that silently falls
+/// back to someone else's advice. That is stronger than the test that asserts
+/// coverage, and it is why this returns `&'static str` rather than an `Option`.
+///
+/// Both implementations live here rather than in the backend crates. The prose
+/// is user-facing product copy, not runtime behaviour, and keeping the sets
+/// side by side is what makes "does the Arca set still mention Apple?"
+/// answerable by reading one file -- and testable from `gascan-core`, which
+/// cannot depend on the backend crates.
+pub trait DoctorRemedies: Send + Sync {
+    fn remedy(&self, id: DoctorCheckId) -> &'static str;
+}
+
+/// Apple's remedies, unchanged from when they were `into_report`'s hardcoded
+/// table. This is the reference set and its wording is deliberately untouched.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AppleRemedies;
+
+impl DoctorRemedies for AppleRemedies {
+    fn remedy(&self, id: DoctorCheckId) -> &'static str {
+        match id {
+            DoctorCheckId::HostArchitecture => "run gascan on Apple silicon",
+            DoctorCheckId::HostMacos => "upgrade this host to macOS 26 or newer",
+            DoctorCheckId::RuntimeCli => "install Apple container 1.1.0 in PATH",
+            DoctorCheckId::RuntimeVersion => "install the supported Apple container 1.1.0 release",
+            DoctorCheckId::RuntimeService => "run `container system start` and retry",
+            DoctorCheckId::RuntimeKernel => {
+                "run `container system start`, install its recommended kernel, and retry"
+            }
+            DoctorCheckId::RuntimeSchema => {
+                "install matching Apple container 1.1.0 CLI and service components"
+            }
+            DoctorCheckId::StorageState => {
+                "free disk space in the Apple container application root"
+            }
+            DoctorCheckId::StorageImages => {
+                "free disk space on the Apple application/state/image filesystem"
+            }
+            DoctorCheckId::WorkspaceAccess => {
+                "grant gascan read/write access to the canonical workspace"
+            }
+            DoctorCheckId::RuntimeBindMounts => {
+                "install a supported Apple container release with bind-mount support"
+            }
+            DoctorCheckId::RuntimeNamedVolumes => {
+                "install a supported Apple container release with named-volume support"
+            }
+            DoctorCheckId::RuntimeTty => {
+                "install a supported Apple container release with TTY support"
+            }
+            DoctorCheckId::RuntimeSignals => {
+                "install a supported Apple container release with signal support"
+            }
+            DoctorCheckId::RuntimeLoopbackPublish => {
+                "install a supported Apple container release with loopback publication support"
+            }
+            DoctorCheckId::RuntimeResourceLimits => {
+                "install a supported Apple container release with resource-limit support"
+            }
+            DoctorCheckId::RuntimeOffline => {
+                "install a supported Apple container release with proven offline isolation"
+            }
+            DoctorCheckId::SshClient => "install the system OpenSSH client at /usr/bin/ssh",
+            DoctorCheckId::SshIdentity => {
+                "restore the matching managed SSH identity and safe permissions; otherwise destroy and recreate affected sandboxes"
+            }
+            DoctorCheckId::SshConfig => {
+                "remove unsafe generated SSH config state, then run `gascan up`"
+            }
+            DoctorCheckId::SshNativePublish => {
+                "install a supported Apple container release with loopback publication support"
+            }
+        }
+    }
+}
+
+/// The Arca engine's remedies.
+///
+/// **No string here names Apple's runtime**, and a test asserts it. Under this
+/// backend there is no `container` CLI to install and no `container system
+/// start` to run: the five runtime checks describe the engine executable, the
+/// version it reports, whether its socket answers `Capabilities`, its kernel
+/// artifact, and the contract minor it speaks.
+///
+/// The host and SSH checks keep Apple's wording because they are not about
+/// either runtime -- an arm64 host and `/usr/bin/ssh` are the same requirement
+/// whichever engine is driving -- and rewording them would be churn that made
+/// the two sets harder to compare, not easier.
+///
+/// Capability remedies say the engine build does not implement the capability
+/// rather than naming a release to install, because there is no released engine
+/// to name: the `.pkg` carries no engine payload, so "install a supported
+/// release" would be advice the user cannot act on.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ArcaRemedies;
+
+impl DoctorRemedies for ArcaRemedies {
+    fn remedy(&self, id: DoctorCheckId) -> &'static str {
+        match id {
+            DoctorCheckId::HostArchitecture => "run gascan on Apple silicon",
+            DoctorCheckId::HostMacos => "upgrade this host to macOS 26 or newer",
+            DoctorCheckId::RuntimeCli => {
+                "set GASCAN_ENGINE_BIN to a built arca-engine; scripts/build-arca-engine.sh prints its path"
+            }
+            DoctorCheckId::RuntimeVersion => {
+                "rebuild the engine from the revision in engine/arca-pin.json with scripts/build-arca-engine.sh"
+            }
+            DoctorCheckId::RuntimeService => {
+                "check that GASCAN_ENGINE_SOCKET names a socket this user owns, then run `gascan daemon restart`"
+            }
+            DoctorCheckId::RuntimeKernel => {
+                "fetch the engine artifacts recorded in engine/arca-pin.json, then run `gascan daemon restart`"
+            }
+            DoctorCheckId::RuntimeSchema => {
+                "the engine speaks a contract this build does not; rebuild it from engine/arca-pin.json"
+            }
+            DoctorCheckId::StorageState => "free disk space in the engine state root",
+            DoctorCheckId::StorageImages => "free disk space on the engine image filesystem",
+            DoctorCheckId::WorkspaceAccess => {
+                "grant gascan read/write access to the canonical workspace"
+            }
+            DoctorCheckId::RuntimeBindMounts => {
+                "this engine build does not implement bind mounts; rebuild it from engine/arca-pin.json"
+            }
+            DoctorCheckId::RuntimeNamedVolumes => {
+                "this engine build does not implement named volumes; rebuild it from engine/arca-pin.json"
+            }
+            DoctorCheckId::RuntimeTty => {
+                "this engine build does not implement TTY support; rebuild it from engine/arca-pin.json"
+            }
+            DoctorCheckId::RuntimeSignals => {
+                "this engine build does not implement signal delivery; rebuild it from engine/arca-pin.json"
+            }
+            DoctorCheckId::RuntimeLoopbackPublish => {
+                "this engine build does not implement loopback publication; rebuild it from engine/arca-pin.json"
+            }
+            DoctorCheckId::RuntimeResourceLimits => {
+                "this engine build does not implement resource limits; rebuild it from engine/arca-pin.json"
+            }
+            // Deliberately does not promise that rebuilding helps. Isolation is
+            // gated on the engine's revision matching a CERTIFIED one, and an
+            // uncertified build stays uncertified however often it is rebuilt.
+            DoctorCheckId::RuntimeOffline => {
+                "this engine build has no recorded offline-isolation proof, so offline sandboxes are refused"
+            }
+            DoctorCheckId::SshClient => "install the system OpenSSH client at /usr/bin/ssh",
+            DoctorCheckId::SshIdentity => {
+                "restore the matching managed SSH identity and safe permissions; otherwise destroy and recreate affected sandboxes"
+            }
+            DoctorCheckId::SshConfig => {
+                "remove unsafe generated SSH config state, then run `gascan up`"
+            }
+            DoctorCheckId::SshNativePublish => {
+                "this engine build does not implement loopback publication; rebuild it from engine/arca-pin.json"
+            }
         }
     }
 }

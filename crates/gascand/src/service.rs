@@ -15,7 +15,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
-use gascan_core::doctor::{DoctorFact, DoctorFacts, DoctorReport};
+use gascan_core::doctor::{AppleRemedies, DoctorFact, DoctorFacts, DoctorReport};
 use gascan_core::manifest::ManifestError;
 use gascan_core::policy::{
     CACHE_ROOT, CARGO_HOME, CONFIG_ROOT, ControlPlanePolicy, MISE_GLOBAL_CONFIG_FILE,
@@ -300,7 +300,7 @@ fn doctor_timeout_report(timeout: std::time::Duration) -> DoctorReport {
         "runtime evidence collector exceeded its {} second bound",
         timeout.as_secs()
     ))
-    .into_report()
+    .into_report(&AppleRemedies)
 }
 
 impl DoctorState {
@@ -360,7 +360,7 @@ impl DoctorState {
                         return DoctorFacts::unavailable(
                             "runtime evidence collection was abandoned",
                         )
-                        .into_report();
+                        .into_report(&AppleRemedies);
                     }
                 }
             }
@@ -3495,12 +3495,13 @@ fn replace_doctor_fact(report: &mut DoctorReport, id: &str, fact: DoctorFact) {
 
 #[cfg(debug_assertions)]
 fn default_doctor_report() -> DoctorReport {
-    DoctorFacts::all_supported_for_tests().into_report()
+    DoctorFacts::all_supported_for_tests().into_report(&AppleRemedies)
 }
 
 #[cfg(not(debug_assertions))]
 fn default_doctor_report() -> DoctorReport {
-    DoctorFacts::unavailable("no production doctor evidence was supplied").into_report()
+    DoctorFacts::unavailable("no production doctor evidence was supplied")
+        .into_report(&AppleRemedies)
 }
 
 impl ServiceError {

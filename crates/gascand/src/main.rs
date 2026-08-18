@@ -5,7 +5,9 @@ use gascan_apple::{
     AppleBackend, AppleCompatibility, AppleProbe, AppleReleaseEvidence, AppleSystemStatus,
     CommandRunner, CommandSpec, ProcessRunner,
 };
-use gascan_core::doctor::{DoctorFact, DoctorFacts, DoctorReport, DoctorStatus};
+use gascan_core::doctor::{
+    AppleRemedies, ArcaRemedies, DoctorFact, DoctorFacts, DoctorReport, DoctorStatus,
+};
 use gascan_core::fake_runtime::FakeRuntime;
 use gascan_core::runtime::{RuntimeBackend, RuntimeError};
 use gascand::{
@@ -319,15 +321,17 @@ async fn run(
             )
             .await?;
             let transport = gascan_arca::ChannelTransport::connect(launch.socket).await?;
-            // KNOWN WRONG, AND OWNED BY THE NEXT TASK. `production_doctor_report`
-            // pairs every fact with hardcoded Apple prose -- "install Apple
-            // container 1.1.0 in PATH", "run `container system start` and
-            // retry" -- so an Arca daemon with a dead engine socket currently
-            // tells the user to install Apple container. The remedy has to
-            // become the responsibility of the backend that produced the fact.
-            // It is wired to Apple's here only so that this arm is reachable
-            // and testable before that lands; it is not a decision.
-            let doctor = DoctorState::refreshing(Duration::from_secs(60), production_doctor_report);
+            // The collector re-reads the engine on every refresh, so it holds a
+            // clone of the transport rather than a snapshot of its answers. A
+            // report cached from startup would keep saying the engine answers
+            // long after it stopped.
+            let doctor = {
+                let transport = transport.clone();
+                let engine_binary = launch.executable.clone();
+                DoctorState::refreshing(Duration::from_secs(60), move || {
+                    arca_doctor_report(transport.clone(), engine_binary.clone())
+                })
+            };
             run_daemon(
                 gascan_arca::ArcaBackend::new(transport),
                 store,
@@ -389,7 +393,9 @@ async fn run(
                         .is_some()
                         .then_some(runtime),
                 },
-                DoctorState::ready(DoctorFacts::all_supported_for_tests().into_report()),
+                DoctorState::ready(
+                    DoctorFacts::all_supported_for_tests().into_report(&AppleRemedies),
+                ),
                 DaemonSshConfig {
                     e2e_paths: e2e_ssh_paths,
                     refresh_doctor: refresh_ssh_doctor,
@@ -631,7 +637,124 @@ async fn production_doctor_report() -> DoctorReport {
     }
     apply_runtime_evidence(&mut facts, cli, service);
     facts.workspace = DoctorFact::unknown("workspace access is evaluated for each Doctor request");
-    facts.into_report()
+    facts.into_report(&AppleRemedies)
+}
+
+/// The Arca engine's doctor evidence.
+///
+/// **This replaces the Apple report the Arca arm was temporarily wired to.**
+/// That report pairs every fact with prose naming Apple's runtime, so an
+/// Arca-backed daemon with a dead engine socket told the user to install Apple
+/// container -- advice that would have changed nothing.
+///
+/// Every runtime fact here comes from ONE `Capabilities` call, not from probing
+/// the engine five ways. The engine answers that call or it does not, and a
+/// report that asked five questions would give five chances to describe a dead
+/// engine differently.
+async fn arca_doctor_report(
+    transport: gascan_arca::ChannelTransport,
+    engine_binary: std::path::PathBuf,
+) -> DoctorReport {
+    let mut facts = DoctorFacts::unavailable("engine evidence was not collected");
+    facts.architecture = architecture_fact(std::env::consts::ARCH);
+    facts.macos = macos_fact();
+    facts.workspace = DoctorFact::unknown("workspace access is evaluated for each Doctor request");
+
+    // The binary is checked on disk rather than inferred from the engine
+    // answering. A running engine proves an engine ran; it does not prove that
+    // GASCAN_ENGINE_BIN still names one, and the next daemon start is what
+    // discovers that it does not.
+    facts.cli = match std::fs::metadata(&engine_binary) {
+        Ok(metadata) if metadata.is_file() => DoctorFact::pass(format!(
+            "engine executable present at {}",
+            engine_binary.display()
+        )),
+        Ok(_) => DoctorFact::fail(format!("{} is not a file", engine_binary.display())),
+        Err(error) => DoctorFact::fail(format!(
+            "engine executable unavailable at {}: {error}",
+            engine_binary.display()
+        )),
+    };
+
+    // The artifact digests are NOT verified here. Recording them as passing
+    // would be a claim with no instrument; recording them as unknown would make
+    // the daemon permanently unready and the backend unusable. A warning is
+    // what is actually true: unverified.
+    facts.kernel = DoctorFact::warning(
+        "engine boot artifacts are not verified against engine/arca-pin.json by this build",
+    );
+    // `Capabilities` carries no state-root field, so this daemon cannot measure
+    // the engine's disk. Saying so is better than measuring a directory Gas Can
+    // chose and calling it the engine's.
+    facts.state_storage =
+        DoctorFact::warning("the engine does not report its state root over the contract");
+    facts.image_storage =
+        DoctorFact::warning("the engine does not report its image filesystem over the contract");
+
+    match gascan_core::runtime::RuntimeBackend::capabilities(&gascan_arca::ArcaBackend::new(
+        transport,
+    ))
+    .await
+    {
+        Ok(capabilities) => apply_engine_capabilities(&mut facts, &capabilities),
+        Err(error) => {
+            facts.service =
+                DoctorFact::fail(format!("the engine did not answer Capabilities: {error}"));
+        }
+    }
+    facts.into_report(&ArcaRemedies)
+}
+
+/// Turns one `Capabilities` answer into the runtime facts.
+///
+/// The capability flags are reported as the ENGINE's claims, which is all they
+/// are. `offline` in particular has already passed through the certification
+/// gate by the time it arrives here, so a `Warning` on it means the engine
+/// claimed proof that this build does not certify -- not that the engine is
+/// broken.
+fn apply_engine_capabilities(
+    facts: &mut DoctorFacts,
+    capabilities: &gascan_core::runtime::RuntimeCapabilities,
+) {
+    use gascan_core::runtime::NetworkIsolation;
+    facts.service = DoctorFact::pass("the engine answered Capabilities on its socket");
+    facts.version = DoctorFact::pass(format!(
+        "engine reports version {}.{}.{}",
+        capabilities.version.major, capabilities.version.minor, capabilities.version.patch
+    ));
+    // The contract is what this client and that engine agree on, and the engine
+    // answering a request this build encoded is the evidence for it. There is
+    // no second source to cross-check against, and inventing one would be the
+    // Apple report's shape without Apple's out-of-band matrix behind it.
+    facts.schema = DoctorFact::pass("the engine answered this build's contract");
+
+    let flag = |present: bool, what: &str| {
+        if present {
+            DoctorFact::pass(format!("the engine reports {what}"))
+        } else {
+            DoctorFact::fail(format!("the engine does not report {what}"))
+        }
+    };
+    facts.bind_mounts = flag(capabilities.bind_mounts, "bind mounts");
+    facts.named_volumes = flag(capabilities.named_volumes, "named volumes");
+    facts.tty = flag(capabilities.tty, "TTY support");
+    facts.signals = flag(capabilities.signals, "signal delivery");
+    facts.loopback_publish = flag(capabilities.loopback_publish, "loopback publication");
+    facts.resource_limits = flag(capabilities.resource_limits, "resource limits");
+    facts.offline = match capabilities.offline {
+        NetworkIsolation::Proven => {
+            DoctorFact::pass("offline isolation is proven for this engine build")
+        }
+        // A warning and not a failure: offline sandboxes are refused, but every
+        // other sandbox shape works. Failing here would make an uncertified
+        // engine look unusable when it is merely unproven for one mode.
+        NetworkIsolation::Unverified => DoctorFact::warning(
+            "this engine build has no recorded offline-isolation proof; offline sandboxes are refused",
+        ),
+        NetworkIsolation::Unsupported => {
+            DoctorFact::warning("this engine does not implement offline isolation")
+        }
+    };
 }
 
 fn apply_runtime_evidence(
