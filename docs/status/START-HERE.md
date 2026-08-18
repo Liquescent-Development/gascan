@@ -27,7 +27,7 @@ about it. That is why no head SHA is written here: every edit to this file moves
 | | branch | head | pushed |
 |---|---|---|---|
 | Gas Can | `feat/milestone-4-product-wiring` | **run `git log -1`** | verify with `ls-remote` |
-| Arca | `feat/milestone-4-engine` | `e14be74` — did not move this session | yes |
+| Arca | `feat/milestone-4-engine` | `ae92360` — **it DID move**: three fixes a pre-merge review found, on top of `e14be74` | yes, `ls-remote` matched |
 | `containerization` submodule | `merge/upstream-main` | `6304122` — did not move; `git ls-remote git@github.com:Vas-Solutus/arca-containerization.git refs/heads/merge/upstream-main` returns it | yes |
 
 **The tag `gascan-engine-m4` and its release are published and verified. They were NOT re-cut
@@ -57,6 +57,15 @@ weaken it to make the tier green. Reaching `Proven` is Arca work, not a re-tag o
 - **Arca #59**, "P5.1 milestone 4, landing 1: the engine's half, sealed by gascan-engine-m4".
   Ready for review. Its old description was wrong about three things and all three are
   corrected: tasks 5-7 ARE done, the submodule DID move to `6304122`, and the tag is published.
+
+  **A fifth review was run against `4134b54..e14be74`**, because the landing review had covered
+  only `5e11704..4134b54` and three commits landed after it — including the ~4,600-line kernel
+  recipe. It is committed at `docs/status/review-arca-tail.md`. No Critical, and **nothing
+  required re-cutting the tag**: every published digest verifies. Three findings were fixed in
+  Arca `ae92360` — a stale `vmlinux` that defeated the post-build guard, a release document
+  naming the wrong commit for the tag, and a `make build-assets` recipe that did not build what
+  the doc said it built. **Two are NOT fixed and are real**: the kernel toolchain is unpinned,
+  and the required-config assertion checks a text file rather than the built artefact.
 
 **Merge Arca first, then Gas Can.** Both as **true merge commits** — `git rev-list --parents
 -n1` must return three SHAs; `allowed_merge_methods` is `["merge"]`, never squash.
