@@ -225,18 +225,29 @@ fn doctor_reports_real_host_facts_and_names_the_runtime_cause() -> TestResult {
             .ok_or_else(|| format!("{id} is missing from the report").into())
     };
 
-    // The host half is measured, not guessed, and passing here means this
-    // machine really is an aarch64 host on macOS 26+ -- which is what the
-    // daemon would have said had it started.
-    for id in ["host.architecture", "host.macos"] {
+    // **The host half is measured, and the assertion is that it was measured
+    // -- not that this machine passes.** Asserting `pass` here would encode
+    // "the test host is aarch64 on macOS 26+" into a test about whether the
+    // CLI can answer without a daemon, so the same correct code would fail on
+    // an Intel host or an older macOS for a reason it does not test. What must
+    // be true everywhere is that these facts carry their own evidence rather
+    // than the daemon's cause.
+    let code = gascan_core::startup_diagnostic::ENGINE_ENVIRONMENT_INCOMPLETE;
+    for (id, evidence) in [
+        ("host.architecture", "current process target is"),
+        ("host.macos", "ProductVersion"),
+    ] {
         let fact = check(id)?;
-        assert_eq!(fact["status"], "pass", "{id}: {fact}");
+        let detail = fact["detail"].as_str().unwrap_or_default();
         assert!(
-            fact["detail"]
-                .as_str()
-                .is_some_and(|detail| !detail.is_empty()),
-            "{id} carries no evidence: {fact}"
+            !detail.contains(code),
+            "{id} carries the daemon's cause instead of a measurement: {fact}"
         );
+        assert!(
+            detail.contains(evidence),
+            "{id} was not measured here: {fact}"
+        );
+        assert_ne!(fact["status"], "unknown", "{id} was not evaluated: {fact}");
     }
 
     // The engine executable is a host fact too, and it names the variable
@@ -254,7 +265,6 @@ fn doctor_reports_real_host_facts_and_names_the_runtime_cause() -> TestResult {
     // over every such check and not just one, because a report that named the
     // cause once and said "unknown" everywhere else is the degraded fallback
     // this deliberately is not.
-    let code = gascan_core::startup_diagnostic::ENGINE_ENVIRONMENT_INCOMPLETE;
     for id in [
         "runtime.version",
         "runtime.service",

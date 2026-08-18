@@ -67,7 +67,7 @@ async fn connect_distinguishes_a_path_that_is_not_a_socket() {
 /// The client dials with the placeholder authority `http://[::]:50051`, which
 /// the connector ignores. Whether a real server accepts it was unverified.
 #[tokio::test]
-#[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN"]
+#[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN, plus GASCAN_ARCA_KERNEL_PATH and GASCAN_ARCA_VMINIT_LAYOUT: EngineInputs::from_environment reads all three and panics on any absence"]
 async fn a_real_engine_accepts_the_placeholder_authority() {
     let engine = LiveEngine::start().await;
     let transport = engine.transport().await;
@@ -88,7 +88,7 @@ async fn a_real_engine_accepts_the_placeholder_authority() {
 /// An engine that dies under an open connection must surface as a transport
 /// failure, not as a hang.
 #[tokio::test]
-#[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN"]
+#[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN, plus GASCAN_ARCA_KERNEL_PATH and GASCAN_ARCA_VMINIT_LAYOUT: EngineInputs::from_environment reads all three and panics on any absence"]
 async fn a_call_against_a_killed_engine_fails_rather_than_hanging() {
     let engine = LiveEngine::start().await;
     let transport = engine.transport().await;

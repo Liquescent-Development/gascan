@@ -4838,8 +4838,24 @@ mod tests {
             let gate = self.gate.clone();
             let publisher = std::thread::spawn(move || -> io::Result<()> {
                 gate.wait_for_connected_probe()?;
-                fs::write(&instance_path, serde_json::to_vec(&published)?)?;
-                fs::set_permissions(&instance_path, fs::Permissions::from_mode(0o600))
+                // **Staged and renamed, not written and then chmod-ed.**
+                // `fs::write` creates at the umask -- 0644 on a default CI
+                // runner -- so a write followed by `set_permissions` leaves a
+                // window in which the record exists at the final path with
+                // content and the wrong mode. The readiness loop polls that
+                // path, and `validate_file_stat` reports "mode is not 0600" as
+                // `Readiness { state: Unsafe }`, which is terminal. MEASURED:
+                // this test failed exactly that way on a `macos-26` runner
+                // while passing locally, because the window is a scheduling
+                // accident rather than anything the test means to exercise.
+                //
+                // The rename is atomic, so no observer sees a partially
+                // published record -- which is what the production publisher
+                // achieves by creating the file inert and chmod-ing it last.
+                let staged = instance_path.with_extension("publishing");
+                fs::write(&staged, serde_json::to_vec(&published)?)?;
+                fs::set_permissions(&staged, fs::Permissions::from_mode(0o600))?;
+                fs::rename(&staged, &instance_path)
             });
             *self
                 .publisher

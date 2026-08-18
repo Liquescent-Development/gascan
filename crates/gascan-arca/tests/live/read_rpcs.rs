@@ -57,7 +57,7 @@ async fn backend(engine: &LiveEngine) -> ArcaBackend<gascan_arca::ChannelTranspo
 /// -- failed on that build, exactly as its message said it would, and its
 /// replacement is the positive named above.
 #[tokio::test]
-#[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN"]
+#[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN, plus GASCAN_ARCA_KERNEL_PATH and GASCAN_ARCA_VMINIT_LAYOUT: EngineInputs::from_environment reads all three and panics on any absence"]
 async fn capabilities_report_only_what_this_engine_build_implements() {
     let engine = LiveEngine::start().await;
     let capabilities = backend(&engine).await.capabilities().await.unwrap();
@@ -105,7 +105,7 @@ async fn capabilities_report_only_what_this_engine_build_implements() {
 /// judgement about which engine build has had its isolation proven, and it does
 /// not move with the pin.
 #[tokio::test]
-#[ignore = "requires the engine BUILT FROM THE PIN by scripts/build-arca-engine.sh, named by GASCAN_ARCA_ENGINE_BIN"]
+#[ignore = "requires the engine BUILT FROM THE PIN by scripts/build-arca-engine.sh, named by GASCAN_ARCA_ENGINE_BIN, plus GASCAN_ARCA_KERNEL_PATH and GASCAN_ARCA_VMINIT_LAYOUT"]
 async fn the_engine_reports_the_revision_the_pin_names() {
     let engine = LiveEngine::start().await;
     let transport = engine.transport().await;
@@ -172,7 +172,7 @@ async fn the_engine_reports_the_revision_the_pin_names() {
 /// (`gascan-arca/src/error.rs:20-55`), so a status or an unrecognised code
 /// arrives as `invalid_output` and fails here either way.
 #[tokio::test]
-#[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN"]
+#[ignore = "requires a built arca-engine named by GASCAN_ARCA_ENGINE_BIN, plus GASCAN_ARCA_KERNEL_PATH and GASCAN_ARCA_VMINIT_LAYOUT: EngineInputs::from_environment reads all three and panics on any absence"]
 async fn exec_refuses_in_its_own_frame_rather_than_as_a_transport_status() {
     let engine = LiveEngine::start().await;
     let backend = backend(&engine).await;
