@@ -106,20 +106,63 @@ only the engine can judge.**
    the Arca daemon opens **the same** database and reports A as running. `reconcile()` does
    raise `MissingOwned(A)` and `main.rs:589` discards the whole report (`let _ =`).
    `gascan destroy A` then removes the record while the Apple container keeps running,
-   unreferenced. **Options:** a backend-scoped store path; a backend column per record with
-   filtering; or a `reconcile()` consumer that quarantines `MissingOwned`. **Recommendation:**
-   the backend-scoped path — it is the only one that cannot be half-applied, and it needs no
-   migration because a record under the wrong backend was never valid. **Do not pick one
-   without the maintainer.**
-2. **Every Arca startup failure goes to a null stderr.** `main.rs:254` drops the startup
-   diagnostic before the backend match; `client.rs` sets the daemon's stderr to
-   `Stdio::null()` in production (`GASCAN_DAEMON_STDERR_PATH` is test-only). So the engine's
-   own `--kernel-path names nothing that exists` and the daemon's carefully worded
+   unreferenced.
+
+   **DECIDED WITH THE MAINTAINER, 2026-08-18: the backend-scoped store path.** The other two
+   options considered were a per-record backend column with filtering, and a `reconcile()`
+   consumer that quarantines `MissingOwned`; the path was chosen because it cannot be
+   half-applied — there is no query anywhere that can forget to filter.
+
+   **CORRECTION, and read this before implementing.** The recommendation as first written
+   said the change "needs no migration because a record under the wrong backend was never
+   valid". **That is false for Apple.** Apple's records at today's unscoped path are valid and
+   are the only ones any existing install has, so scoping every backend uniformly would orphan
+   them — silently, while their containers keep running, which is the same class of harm this
+   item exists to close. **Keep Apple on the existing unscoped path and scope only the other
+   backends**, which is defensible on its own terms rather than as a compatibility shim: the
+   unscoped path IS the Apple path, historically and by default, and no non-Apple daemon has
+   ever been entitled to write there. `packaging/macos/uninstall.sh` walks the controller
+   directory and will need to know about the new child.
+
+2. **EVERY ARCA STARTUP FAILURE GOES TO A NULL STDERR, AND `gascan doctor` IS BEHIND THE
+   DAEMON THAT CANNOT START.** `main.rs:254` drops the startup diagnostic before the backend
+   match; `client.rs` gives the daemon `Stdio::null()` in production
+   (`GASCAN_DAEMON_STDERR_PATH` is test-only). So the engine's own
+   `--kernel-path names nothing that exists` and the daemon's own
    `GASCAN_ENGINE_SOCKET must name its socket` both vanish, and the user sees a generic
-   readiness timeout. **Aggravating and cross-task:** Task 13 built the right remedy —
-   `engine_artifact_fact()` says "run `gascan engine fetch`" — and Task 11's startup ordering
-   makes it unreachable in exactly the state it describes, because `gascan doctor` connects to
-   the daemon first and the daemon cannot start without the artifacts.
+   readiness timeout. Task 13 built the right remedy — `engine_artifact_fact()` says "run
+   `gascan engine fetch`" — and Task 11's startup ordering makes it unreachable in exactly the
+   state it describes.
+
+   **RECOMMENDED SHAPE, in three parts, each independently landable and each small.** No new
+   plumbing is needed for the first two: the channel already exists and is already hardened.
+
+   a. **Stop dropping the diagnostic, and widen the code table.** The unlinked-fd channel the
+      CLI already passes the daemon is validated on read for owner uid, mode, `nlink == 0`,
+      a size bound, an owner-token match, **and a closed whitelist of four
+      `controller_state_*` codes** (`crates/gascan/src/daemon.rs:544-563`). Move
+      `drop(startup_diagnostic)` (`main.rs:254`) below the backend arm, write the Arca arm's
+      `required(...)` failures and every `EngineError` through the same writer, and add their
+      codes to that table. The whitelist being closed is a feature — widening it is the
+      deliberate act, and the reviewer's finding is that nothing has ever widened it.
+
+   b. **Give `gascan doctor` the same early return `gascan engine fetch` has.** `cli.rs:458`
+      returns for `Command::Engine` *before* `connect_with_recovery_progress`, and its comment
+      states the principle verbatim: "Requiring a daemon here would make the remedy depend on
+      the thing it repairs." That is exactly doctor's situation. Do **not** make this a
+      fallback that silently degrades: split the facts by who can measure them. `architecture_fact`,
+      `macos_fact`, `engine_artifact_fact` and the engine-binary presence check are all pure
+      host-side today and sit in `gascand/src/main.rs` only because that is where the report is
+      assembled. Move them to `gascan_core::doctor`, which both crates already depend on, have
+      the CLI collect them itself, and ask the daemon only for the runtime facts. A dead daemon
+      then yields a report with real host facts and an explicit, named failure for the runtime
+      ones — carrying (a)'s diagnostic as its detail.
+
+   c. **Decide whether the production daemon should have a stderr destination at all.**
+      `GASCAN_DAEMON_STDERR_PATH` exists and is test-only. (a) and (b) make the *startup*
+      failures reachable without it; this is about everything after startup, and it is a
+      separate decision with a privacy dimension. **Do not fold it into (a) or (b).**
+
 3. **~60 deferred Minor findings** with rulings in the ledger, plus the minors in this
    session's four review files (see below). The two the previous whole-landing review said to
    fix before Landing 2 publishes — Task 6 M3 and Task 7 O1 — are **still open**.
