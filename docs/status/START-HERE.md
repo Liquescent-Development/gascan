@@ -124,9 +124,25 @@ real, unfixed, and narrow the reproducibility claim until they are done.
 
 ### THE ONE THING TO DO NEXT
 
-**DONE, on a branch, not yet merged — `fix/daemon-instance-publish-race`.** Verify the head with
-`git log -1` and `git ls-remote`; do not trust a SHA written here. Open item 1 below now records
-what is left rather than what to do, and **what is left is real** — see its residual section.
+**DONE AND MERGED — PR #80, merge commit `025b922`, a true merge (`git rev-list --parents -n1`
+returns three SHAs). The branch `fix/daemon-instance-publish-race` was deleted after
+`git merge-base --is-ancestor` confirmed it.** All four CI checks passed on the merged head
+`c44720a` — `rust`, `contracts`, `changes`, `gate` — with `engine` **skipped** rather than red,
+because the diff touches no engine path.
+
+**Merged `main` was verified after the fact and it is NOT a clean run — read it the way this
+file requires.** `cargo test --workspace` at `025b922` gave **981 passed, 1 failed**:
+`doctor_human_output_names_each_check`, on `ssh-keygen rejected the managed key (exit status
+255: /dev/fd/19: Bad file descriptor [parent descriptor intact])` — mechanism 1, the
+descriptor flake, verbatim and still open. Exonerated by diff PLUS isolation, not by
+probability: `git diff --name-only a8c37a3 025b922` touches only `crates/gascan/src/daemon.rs`,
+`crates/gascand/src/socket.rs` and three files under `docs/`, so neither `crates/gascan-e2e`
+nor any ssh path is in it; and the test passes alone, 2/2. **The stronger anchor is that
+`git diff c44720a 025b922` is empty** — merged `main`'s tree is byte-identical to the branch
+head, which ran **1499 passed, 0 failed, 49 ignored** with fmt 0, clippy 0, 49 ignored matching
+baseline and 15 contracts at status 0. Verify every SHA here with `git log -1` and
+`git ls-remote`; do not trust one written in this file. Open item 1 below now records what is
+left rather than what to do, and **what is left is real** — see its residual section.
 
 **The next assignment is the maintainer's to choose, and this file does not choose it.** The
 list below is carried state. If you want a recommendation: item 1's residual (`retire_held_record`
@@ -136,8 +152,8 @@ the one that needs a decision rather than an implementation, and **must not be d
 
 ### WHAT IS OPEN
 
-1. **THE DAEMON INSTANCE RECORD'S PUBLISH RACE IS FIXED, ON A BRANCH. WHAT REMAINS IS THE
-   READER'S HALF, AND IT IS NOT FIXED.**
+1. **THE DAEMON INSTANCE RECORD'S PUBLISH RACE IS FIXED AND MERGED (`025b922`). WHAT REMAINS IS
+   THE READER'S HALF, AND IT IS NOT FIXED.**
 
    **What it was.** `write_instance_record` (`crates/gascand/src/socket.rs`) created the record
    at its final path inert — 0200, empty — wrote the content, `sync_all`-ed, then chmod-ed to
