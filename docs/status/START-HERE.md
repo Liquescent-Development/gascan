@@ -64,6 +64,22 @@ that earns the constant. **Reaching `Proven` is Arca work, not a re-tag of the s
 `gascan-e2e`'s `an_offline_manifest_is_refused_because_no_engine_build_is_certified` is the
 standing instrument.
 
+### THE ONE THING TO DO NEXT: ITEM 1, THEN ITEM 2a, THEN 2b, THEN THE TWO PULL REQUESTS.
+
+Both items are **already decided** — see `WHAT IS OPEN` below for each one's full statement,
+its correction, and its acceptance. In order, and the order matters:
+
+1. **The backend-scoped controller store.** Apple stays on the existing unscoped path; only
+   the other backends are scoped. Scoping Apple too would orphan every existing install's
+   records while their containers kept running.
+2. **(2a) The startup diagnostic**, which is what gives every later failure a cause worth
+   reading. Then **(2b) doctor's early return and the host/runtime fact split**, which needs
+   (2a) to have something to report. **(2c) is deferred and is not this session's work.**
+3. **The two pull requests**, neither of which may leave draft until its description matches
+   what it contains.
+
+**Nothing here requires an engine rebuild, a new tag, a release, or a pin bump.**
+
 ### WHAT LANDED THIS SESSION
 
 | | What | Commit |
@@ -96,7 +112,12 @@ only the engine can judge.**
    under a cold start this repository had already measured as failing at 30s.
 5. A comment said the revision gate was "still to come" in the file that defines it.
 
-### WHAT IS OPEN, AND THE FIRST ONE NEEDS A DECISION BEFORE CODE
+### WHAT IS OPEN. ITEMS 1 AND 2 ARE DECIDED AND ARE THE NEXT SESSION'S WORK.
+
+**Both were decided with the maintainer on 2026-08-18 and neither needs re-litigating.** What
+each still needs is implementing, and each carries a correction or a constraint that is easy
+to miss — read them whole before writing code. Everything from item 3 down is carried state,
+not this session's work.
 
 1. **THE CONTROLLER STORE IS NOT BACKEND-SCOPED, AND THE MISMATCH MESSAGE STEERS USERS INTO
    IT.** `grep -c backend crates/gascand/src/store.rs crates/gascand/src/controller_state.rs`
@@ -134,8 +155,16 @@ only the engine can judge.**
    `gascan engine fetch`" — and Task 11's startup ordering makes it unreachable in exactly the
    state it describes.
 
-   **RECOMMENDED SHAPE, in three parts, each independently landable and each small.** No new
-   plumbing is needed for the first two: the channel already exists and is already hardened.
+   **DECIDED WITH THE MAINTAINER, 2026-08-18: do (a) and (b). (c) is deferred as its own
+   decision and is NOT part of this work.** The maintainer's words were that doctor and stderr
+   output are important, and then agreement with the shape below — which is (a) and (b) now,
+   (c) held back until they land. Three parts, each independently landable and each small. No
+   new plumbing is needed for the first two: the channel already exists and is already
+   hardened.
+
+   **Land (a) before (b).** (b)'s reduced report is only worth reading if it can carry a real
+   cause, and (a) is what produces one; done the other way round, (b) ships a doctor that
+   correctly reports "the daemon could not be reached" and cannot say why.
 
    a. **Stop dropping the diagnostic, and widen the code table.** The unlinked-fd channel the
       CLI already passes the daemon is validated on read for owner uid, mode, `nlink == 0`,
@@ -158,10 +187,23 @@ only the engine can judge.**
       then yields a report with real host facts and an explicit, named failure for the runtime
       ones — carrying (a)'s diagnostic as its detail.
 
-   c. **Decide whether the production daemon should have a stderr destination at all.**
-      `GASCAN_DAEMON_STDERR_PATH` exists and is test-only. (a) and (b) make the *startup*
-      failures reachable without it; this is about everything after startup, and it is a
-      separate decision with a privacy dimension. **Do not fold it into (a) or (b).**
+   c. **DEFERRED, NOT DROPPED — whether the production daemon should have a stderr
+      destination at all.** `GASCAN_DAEMON_STDERR_PATH` exists and is test-only. (a) and (b)
+      make the *startup* failures reachable without it; this is about everything AFTER
+      startup, and it is a separate decision with a privacy dimension — a daemon log holds
+      sandbox names, project paths and guest output. **Do not fold it into (a) or (b), and do
+      not decide it alone.** Raise it with the maintainer once (a) and (b) have landed, with a
+      concrete proposal for where the file lives, what its mode is, how it is bounded and what
+      is redacted.
+
+   **Acceptance for (a) and (b), and it is one pair, not two.** With `GASCAN_ARCA_BACKEND` set
+   and `GASCAN_ENGINE_STATE_ROOT` unset — or the artifacts absent — `gascan up` must fail
+   naming the actual cause, and `gascan doctor` must return a report in which the host-side
+   facts are real and the runtime facts carry that same cause. Both are reachable today
+   through `gascan-e2e`'s arca tier, which already builds a real daemon on a real engine:
+   `crates/gascan-e2e/tests/arca_engine.rs` and its harness are the place to assert it.
+   **Prove each by mutation** — the project's rule, and the one that caught every fix this
+   milestone.
 
 3. **BOTH PULL REQUESTS ARE OPEN AS DRAFTS AND THEIR TITLES DESCRIBE LANDING 1 ONLY.**
    Gas Can **#77**, "P5.1 milestone 4: design, plan, and landing 1's Gas Can half"; Arca
