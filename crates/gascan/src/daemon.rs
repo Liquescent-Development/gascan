@@ -1086,7 +1086,30 @@ where
     E: DaemonEndpoint,
     P: ProcessInspector,
 {
-    let record = read_instance_record_for_inspection(paths);
+    observe_once_with_hook(paths, expected_executable, endpoint, inspector, || Ok(())).await
+}
+
+/// One observation, with the record read's tombstone window exposed.
+///
+/// The hook is how a test reaches the join this file could otherwise not defend:
+/// a `raced()` failure is produced inside a validator, and the `Unsafe` verdict
+/// built from it has to carry the marker out. Every observation in production
+/// passes a no-op, so nothing here behaves differently for it -- the same shape
+/// `read_instance_record_with_hook` and `open_private_directory_with_create_hook`
+/// already use in this file.
+async fn observe_once_with_hook<E, P, F>(
+    paths: &DaemonPaths,
+    expected_executable: &Path,
+    endpoint: &E,
+    inspector: &P,
+    before_tombstone_validation: F,
+) -> Result<Inspection<E::Connection>, SupervisorError>
+where
+    E: DaemonEndpoint,
+    P: ProcessInspector,
+    F: FnOnce() -> io::Result<()>,
+{
+    let record = read_instance_record_for_inspection_with_hook(paths, before_tombstone_validation);
     let interrupted_tombstone = if record.is_err() {
         match open_interrupted_tombstone(paths) {
             Ok(tombstone) => tombstone,
@@ -2964,7 +2987,22 @@ fn read_instance_record(paths: &DaemonPaths) -> io::Result<Option<DaemonInstance
 fn read_instance_record_for_inspection(
     paths: &DaemonPaths,
 ) -> io::Result<Option<DaemonInstanceRecord>> {
-    match read_instance_record_with_hook_and_directory_mode(paths, || Ok(()), false) {
+    read_instance_record_for_inspection_with_hook(paths, || Ok(()))
+}
+
+fn read_instance_record_for_inspection_with_hook<F>(
+    paths: &DaemonPaths,
+    before_tombstone_validation: F,
+) -> io::Result<Option<DaemonInstanceRecord>>
+where
+    F: FnOnce() -> io::Result<()>,
+{
+    match read_instance_record_with_hook_and_directory_mode(
+        paths,
+        || Ok(()),
+        before_tombstone_validation,
+        false,
+    ) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         result => result,
     }
@@ -3131,16 +3169,30 @@ fn read_instance_record_with_hook<F>(
 where
     F: FnOnce() -> io::Result<()>,
 {
-    read_instance_record_with_hook_and_directory_mode(paths, between_identity_and_open, true)
+    read_instance_record_with_hook_and_directory_mode(
+        paths,
+        between_identity_and_open,
+        || Ok(()),
+        true,
+    )
 }
 
-fn read_instance_record_with_hook_and_directory_mode<F>(
+/// Two windows, two hooks, and only one of them can fire on any one call: an
+/// instance path is either a tombstone -- in which case this returns after
+/// validating it and `between_identity_and_open` is never reached -- or a record
+/// to be read. They are separate parameters rather than one because they mean
+/// different things to the caller that injects into them, and because firing the
+/// existing hook in the tombstone branch would silently move the injection point
+/// of every test that already uses it.
+fn read_instance_record_with_hook_and_directory_mode<F, G>(
     paths: &DaemonPaths,
     between_identity_and_open: F,
+    before_tombstone_validation: G,
     create_directory: bool,
 ) -> io::Result<Option<DaemonInstanceRecord>>
 where
     F: FnOnce() -> io::Result<()>,
+    G: FnOnce() -> io::Result<()>,
 {
     let (parent, name) = instance_parent_and_name(paths.instance())?;
     let directory = open_private_directory_with_mode(parent, paths.expected_uid, create_directory)?;
@@ -3150,6 +3202,12 @@ where
         Err(error) => return Err(errno(error)),
     };
     if is_instance_tombstone(&initial_stat, paths.expected_uid) {
+        // The window `validate_instance_tombstone` exists to catch: the stat is
+        // taken, and the name can be renamed over before the validator opens it.
+        // Production passes a no-op here; a test passes the rename, which is the
+        // only way a `raced()` failure from that validator can be driven through
+        // `observe_once` without a second thread and a clock.
+        before_tombstone_validation()?;
         validate_instance_tombstone(&directory, name, &initial_stat, paths.expected_uid)?;
         return Ok(None);
     }
@@ -3919,10 +3977,10 @@ mod tests {
         ProcessInspector, ProcessSignaler, ShutdownPolicy, StopMode, SupervisorError,
         SupervisorTimeouts, checked_pid, coherent_process_identity,
         connect_current_or_recover_with, connect_current_or_recover_with_observer, inspect_with,
-        is_raced, open_interrupted_tombstone, open_published_record, race_marker, raced,
-        read_attested_instance, read_instance_record_with_hook, restart_with, retire_held_record,
-        retry_while_raced, signal_attested_with, signal_attested_with_deadline, signal_identity,
-        start_with, stop_with, wait_for_exit_until,
+        is_raced, observe_once_with_hook, open_interrupted_tombstone, open_published_record,
+        race_marker, raced, read_attested_instance, read_instance_record_with_hook, restart_with,
+        retire_held_record, retry_while_raced, signal_attested_with, signal_attested_with_deadline,
+        signal_identity, start_with, stop_with, wait_for_exit_until,
     };
     #[cfg(target_os = "macos")]
     use super::{inspect_process_with, parse_lsof_executable};
@@ -3964,6 +4022,15 @@ mod tests {
         fs::write(paths.instance(), serde_json::to_vec(record)?)?;
         fs::set_permissions(paths.instance(), fs::Permissions::from_mode(0o600))?;
         Ok(())
+    }
+
+    /// An inert tombstone: 0200 and empty, the state a publication in flight
+    /// leaves at the instance path. Written through one helper because both halves
+    /// are what distinguish it from the interrupted tombstone, and a test that
+    /// gets the size wrong exercises the other state without saying so.
+    fn write_inert_tombstone(path: &Path, mode: u32) -> io::Result<()> {
+        fs::write(path, b"")?;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
     }
 
     #[test]
@@ -8357,8 +8424,7 @@ mod tests {
         let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
         paths.prepare_directory()?;
         let tombstone_mode = u32::from(INSTANCE_TOMBSTONE_MODE);
-        fs::write(paths.instance(), b"")?;
-        fs::set_permissions(paths.instance(), fs::Permissions::from_mode(tombstone_mode))?;
+        write_inert_tombstone(paths.instance(), tombstone_mode)?;
         let (parent, name) = super::instance_parent_and_name(paths.instance())?;
         let directory = super::open_private_directory_with_mode(parent, paths.expected_uid, false)?;
         let stale = rustix::fs::statat(&directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
@@ -8367,8 +8433,7 @@ mod tests {
         // inode is allocated while the original still holds one: the two cannot
         // collide, and the substitution needs no timing to be real.
         let staged = paths.instance().with_extension("staged");
-        fs::write(&staged, b"")?;
-        fs::set_permissions(&staged, fs::Permissions::from_mode(tombstone_mode))?;
+        write_inert_tombstone(&staged, tombstone_mode)?;
         fs::rename(&staged, paths.instance())?;
 
         let error =
@@ -8440,6 +8505,69 @@ mod tests {
             1,
             "an unclassified failure must be terminal on the first observation"
         );
+        Ok(())
+    }
+    /// The join the retry depends on: a `raced()` failure produced inside a
+    /// validator has to reach the `Inspection` as a marker, or the retry above is
+    /// dead code no matter how well it is tested on its own.
+    ///
+    /// This drives that join through `observe_once` with a real race: the instance
+    /// path is an inert tombstone, and the hook renames a *different* tombstone
+    /// over the name in the window between the record read's `statat` and
+    /// `validate_instance_tombstone`'s `openat` -- the same substitution a
+    /// publisher's rename makes, sequenced synchronously inside one thread so no
+    /// clock decides the outcome.
+    ///
+    /// `open_interrupted_tombstone` then reports `Ok(None)`, because the
+    /// replacement is empty and an interrupted record has content, so the verdict
+    /// is built from the record read's failure -- and that verdict must say it was
+    /// raced.
+    #[tokio::test]
+    async fn a_raced_validator_failure_reaches_the_inspection_as_a_marker() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        paths.prepare_directory()?;
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let endpoint = MutableEndpoint::new(EndpointProbe::AbsentOrInert);
+        let inspector = MutableInspector::new(None);
+        let tombstone_mode = u32::from(INSTANCE_TOMBSTONE_MODE);
+        write_inert_tombstone(paths.instance(), tombstone_mode)?;
+
+        let instance = paths.instance().to_path_buf();
+        let inspected = observe_once_with_hook(&paths, &executable, &endpoint, &inspector, || {
+            // Staged and renamed, so the replacement's inode is allocated while
+            // the original still holds one and the two cannot collide by reuse.
+            let staged = instance.with_extension("staged");
+            write_inert_tombstone(&staged, tombstone_mode)?;
+            fs::rename(&staged, &instance)
+        })
+        .await?;
+
+        assert_eq!(inspected.status.state, DaemonState::Unsafe);
+        let raced = inspected
+            .raced_detail()
+            .ok_or("a tombstone renamed over under the reader must reach the retry as a race")?;
+        assert_eq!(raced, "daemon instance tombstone changed while opening it");
+        Ok(())
+    }
+
+    /// The same observation with nothing substituted settles, so the marker above
+    /// is the race and not the shape of the fixture.
+    #[tokio::test]
+    async fn an_untouched_tombstone_observation_carries_no_marker() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let paths = DaemonPaths::from_runtime_root(root(&temp)?.join("runtime"));
+        paths.prepare_directory()?;
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let endpoint = MutableEndpoint::new(EndpointProbe::AbsentOrInert);
+        let inspector = MutableInspector::new(None);
+        write_inert_tombstone(paths.instance(), u32::from(INSTANCE_TOMBSTONE_MODE))?;
+
+        let inspected =
+            observe_once_with_hook(&paths, &executable, &endpoint, &inspector, || Ok(())).await?;
+
+        assert_eq!(inspected.status.state, DaemonState::Stopped);
+        assert_eq!(inspected.raced_detail(), None);
         Ok(())
     }
 }
